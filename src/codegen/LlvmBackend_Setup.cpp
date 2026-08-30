@@ -24288,13 +24288,26 @@ bool Emitter::isSynthesizedRecordDeserializeCall(
 void Emitter::collectValueLikeChoiceCallResultReleaseEligible(
         const std::vector<std::unique_ptr<ast::Stmt>>& body) {
     valueLikeChoiceCallResultReleaseEligible_.clear();
-    std::vector<const ast::LocalDecl*> candidates;
+    // fix #3427 hole 2 (§21.1 / §9.8 / §28.9, v0.286): the candidate vector
+    // was `const ast::LocalDecl*`, and the scan below matched only
+    // `dynamic_cast<const ast::LocalDecl*>(s)`, so a §21.1 runtime `const`
+    // bound to a `Msg.Deserialize(d)` call (`const v := Msg.Deserialize(d);`)
+    // was never added as a candidate: the escape walk never ran for it and
+    // valueLikeChoiceCallResultReleaseEligible_ never admitted it, so the
+    // synthesized-Deserialize choice's string fields were never released at
+    // scope end. Widened to `const ast::Node*` + `localDeclInitView`, the
+    // same authority collectBorrowingArrayFreeEligible already reads (fix
+    // #2802/#3402) — the consumer (LlvmBackend_Setup.cpp ~14307,
+    // `lowerLocalDecl`) already keys the eligibility set by node-pointer
+    // identity alone and is unaffected by the node's concrete kind.
+    std::vector<const ast::Node*> candidates;
     std::function<void(const ast::Stmt*)> scan = [&](const ast::Stmt* s) {
         if (!s) return;
-        if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s)) {
-            if (!ld->isUsing && ld->initializer) {
-                if (auto* call = dynamic_cast<const ast::CallExpr*>(
-                        ld->initializer.get())) {
+        {
+            LocalDeclInitView v = localDeclInitView(s);
+            if (v.init && !v.isUsing) {
+                if (auto* call =
+                        dynamic_cast<const ast::CallExpr*>(v.init)) {
                     if (isSynthesizedValueLikeChoiceDeserializeCall(call)) {
                         // The resolved local type (declared annotation, or
                         // — for an inferred `var v := Msg.Deserialize(d)` —
@@ -24309,15 +24322,15 @@ void Emitter::collectValueLikeChoiceCallResultReleaseEligible(
                         // not handle, matching #2425's own nullable
                         // exclusion.
                         const sema::TypeRef* tr = nullptr;
-                        if (ld->type) tr = ctx_.resolvedType(*ld->type);
-                        if (!tr) tr = ctx_.exprType(*ld->initializer);
+                        if (v.type) tr = ctx_.resolvedType(*v.type);
+                        if (!tr) tr = ctx_.exprType(*v.init);
                         if (tr && !tr->nullable &&
                             tr->kind == sema::TypeRef::Kind::Named &&
                             tr->declaration &&
                             tr->declaration->kind ==
                                 ast::TypeDeclKind::Choice &&
                             choiceHasStringFields(tr->declaration))
-                            candidates.push_back(ld);
+                            candidates.push_back(s);
                     }
                 }
             }
