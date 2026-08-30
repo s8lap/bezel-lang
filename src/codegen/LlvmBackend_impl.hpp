@@ -6750,6 +6750,32 @@ private:
     // classPropertyByName deliberately skips indexers; this fills an indexer's
     // slot with the concrete class's getter/setter so a derived override fills
     // the base-introduced slot, while keeping overloaded indexers distinct.
+    //
+    // fix (census row 12, §11.2/§23.4): this now applies `indexerCandidateWireable`
+    // exactly the way `findIndexer` (LlvmBackend_Assign.cpp, the itable-route
+    // twin) already does — an unwireable match (an imported ABSTRACT indexer,
+    // or one declared directly on an interface) does not terminate the walk;
+    // the search continues up `baseClassOf` for a candidate this route can
+    // actually install a function for. Before this, a match on `indexerSlotKey`
+    // returned immediately regardless of wireability, so a concrete class that
+    // inherits (without overriding) an unimplemented IMPORTED abstract-class
+    // indexer got that unwireable PropertySymbol installed as `impl` here.
+    // `ensureIndexerGetterFn`/`-SetterFn` (LlvmBackend_Assign.cpp) already
+    // decline it safely via their OWN independent guard in
+    // `importedVirtualAccessorSlotFn` (its `for (auto mod : ps->modifiers) if
+    // (mod == "abstract") return nullptr;`), so this alone was not observed to
+    // change the null-slot OUTCOME for that two-level shape (measured: SIGSEGV
+    // either way — see the regression test's header for the probe). What this
+    // DOES fix, matching the itable route's own #2437/#2442/#2449 history: a
+    // closer-but-unwireable match no longer SHADOWS a wireable answer further
+    // up the chain (the itable route hit exactly this shape three times before
+    // `indexerCandidateWireable`'s skip-and-continue existed). See the census
+    // row's own audit note — "precisely why the itable route is safe and the
+    // vtable route is not" — and the filed issue for the SEMA-side half (a
+    // concrete class inheriting an unoverridden abstract CLASS indexer is not
+    // rejected the way an unimplemented INTERFACE indexer obligation is,
+    // §12.5 / TypeResolution_Checks.cpp's `ifaceIndexerObligations` loop,
+    // which is scoped to `curIsIface` only).
     sema::PropertySymbol* classIndexerMatching(const sema::TypeSymbol* cls,
                                                const sema::PropertySymbol* proto) {
         if (!proto) return nullptr;
@@ -6761,7 +6787,9 @@ private:
                 bool isStatic = false;
                 for (auto mod : ps->modifiers)
                     if (mod == "static") { isStatic = true; break; }
-                if (!isStatic && indexerSlotKey(ps) == want) return ps;
+                if (isStatic || indexerSlotKey(ps) != want) continue;
+                if (!indexerCandidateWireable(ps)) continue;  // keep searching up
+                return ps;
             }
             t = baseClassOf(t);
         }
