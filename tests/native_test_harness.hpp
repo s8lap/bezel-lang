@@ -19,7 +19,9 @@
 // destObj.
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstdlib>
 #include <fcntl.h>
 #include <filesystem>
@@ -36,6 +38,34 @@
 namespace bezel::native_test {
 
 namespace fs = std::filesystem;
+
+// fix #3626: a SINGLE counting chokepoint for "the native sanitizer runtime
+// was unavailable". Every one of the ~122 test files that need the combined
+// ASan/TSan runtime object funnels through sanitizerRuntimeMaster() below
+// (via asanRuntimeObject() or buildRuntimeSanitizerObject()) — none of those
+// 122 files are touched by this fix. Counting here is what makes "reported,
+// not silent" a property of the harness, rather than a convention each of
+// 122 files' own `if (rtObj.empty()) return -1;` has to individually honour
+// (most do; the ones that don't are exactly how #3626 was found — an
+// unavailable oracle reporting a clean PASS).
+//
+// Incremented once per CALL that observes an empty result — including cache
+// hits (sanitizerRuntimeMaster's build attempt is memoized to at most once
+// per sanitizer per process; the calls after that just read the cached ""),
+// so the count tracks how many test-observable checks were affected by the
+// outage, not merely whether the underlying build was attempted.
+// tests/test_main.cpp reads this once per process and prints it loudly in
+// the per-binary summary (and the structured JSON shard summary) regardless
+// of whether it is zero — "0" is then a visible confirmation the oracle ran,
+// not the absence of a signal. tests/run_parallel.sh sums it across every
+// shard's JSON and fails the sharded run (the mechanism scripts/gate.sh's
+// acceptance verdict depends on) when the total is nonzero: an acceptance
+// gate must not pass with a verification leg silently switched off, the
+// same shape as the #3002 coverage floor.
+inline std::atomic<std::size_t>& nativeSanitizerUnavailableSkips() {
+    static std::atomic<std::size_t> n{0};
+    return n;
+}
 
 // Absolute path to repo-root/src/runtime.
 //
@@ -146,7 +176,12 @@ inline void evictStaleRtObjs(const std::filesystem::path& rtRoot) {
     (void)once;
 }
 
-inline const std::string& sanitizerRuntimeMaster(const std::string& san) {
+// Renamed from sanitizerRuntimeMaster (fix #3626): the original body is
+// unchanged below, wrapped by the thin counted forwarder that follows it —
+// callers keep calling sanitizerRuntimeMaster(); this split is what lets the
+// counting live in ONE place without duplicating the build/memoize logic.
+inline const std::string& sanitizerRuntimeMasterUncounted(
+    const std::string& san) {
     static std::map<std::string, std::string> cache;
     auto it = cache.find(san);
     if (it != cache.end()) return it->second;
@@ -217,6 +252,20 @@ inline const std::string& sanitizerRuntimeMaster(const std::string& san) {
     ::flock(lockFd, LOCK_UN); ::close(lockFd);
     if (ok) out = combined;
     return out;
+}
+
+// fix #3626: the counted forwarder every caller (asanRuntimeObject(),
+// buildRuntimeSanitizerObject()) actually calls. A one-line wrapper around
+// sanitizerRuntimeMasterUncounted() rather than instrumenting that function's
+// several early-return points individually — it has ~6 of them, and a new one
+// added later would silently bypass counting if the increment lived inline.
+// Wrapping the call instead means every exit path, present or future, is
+// covered by construction.
+inline const std::string& sanitizerRuntimeMaster(const std::string& san) {
+    const std::string& result = sanitizerRuntimeMasterUncounted(san);
+    if (result.empty())
+        nativeSanitizerUnavailableSkips().fetch_add(1, std::memory_order_relaxed);
+    return result;
 }
 
 // Ensure a <san>-instrumented combined runtime object exists at destObj (copied

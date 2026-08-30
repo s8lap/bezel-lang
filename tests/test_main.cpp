@@ -15,6 +15,7 @@
 #include <iostream>
 #include <unordered_set>
 
+#include "native_test_harness.hpp"
 #include "support/force_sanitize.hpp"
 #include "support/scratch_dir.hpp"
 #include "test_harness.hpp"
@@ -297,6 +298,26 @@ int main(int argc, char** argv) {
         std::cout << " (shard " << shardIndex << "/" << shardCount << ")";
     std::cout << ", " << ::bezel::test::registry().size() << " total\n";
 
+    // fix #3626: loud, not silent. Every one of the ~122 test files that need
+    // the native ASan/TSan runtime object funnels through
+    // native_test_harness.hpp's sanitizerRuntimeMaster() (via
+    // asanRuntimeObject() / buildRuntimeSanitizerObject()); when it is
+    // unavailable those tests used to skip invisibly and still report a
+    // clean PASS. Read the ONE process-wide counter here — the harness's own
+    // chokepoint — and print it UNCONDITIONALLY, so "0" is a visible
+    // confirmation the oracle actually ran this process rather than the
+    // absence of a signal. A separate line (not embedded in the "N passed,
+    // M failed ... T total" summary above) so the LOAD-BEARING legacy-line
+    // regex (scripts/gate/summary.py's _LEGACY_HEAD_RE/_LEGACY_TOTAL_RE,
+    // which tests/run_parallel.sh's dual-read agreement check depends on)
+    // is untouched.
+    const std::size_t nativeSanitizerSkips =
+        ::bezel::native_test::nativeSanitizerUnavailableSkips().load(
+            std::memory_order_relaxed);
+    std::cout << "NATIVE SANITIZER: " << nativeSanitizerSkips
+              << " check(s) skipped (ASan/TSan runtime unavailable — see"
+                 " tests/native_test_harness.hpp sanitizerRuntimeMaster())\n";
+
     // per #3012 Phase 2a: ALSO emit a structured JSON shard summary to the path
     // named by BEZEL_SHARD_SUMMARY (off unless set). The legacy summary line
     // above is UNCHANGED and remains the gate's authoritative source; this JSON
@@ -338,6 +359,14 @@ int main(int argc, char** argv) {
         json += std::to_string(rc);
         json += ",\"elapsed_s\":";
         json += elapsedBuf;
+        // fix #3626: additive field — an older reader (summary.py's
+        // check_agreement only compares passed/failed/total/selected/schema)
+        // ignores an unknown key, so this needs no schema-version bump.
+        // tests/run_parallel.sh sums it across every shard's JSON directly
+        // (grep/awk, not summary.py) and fails the sharded run when the total
+        // is nonzero.
+        json += ",\"native_sanitizer_unavailable_skips\":";
+        json += std::to_string(nativeSanitizerSkips);
         json += "}\n";
         atomicWriteShardSummary(std::string(sumEnv), json);
     }

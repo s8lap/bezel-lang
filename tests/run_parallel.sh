@@ -444,7 +444,42 @@ fi
 # by test_main.cpp as the fallback the assertion compares against; removing
 # that dual-emit + the legacy line is the post-N-gates ratchet (per #3012).
 
-if [[ "$shard_rc" -ne 0 || "$total_fail" -ne 0 || "$count_ok" -eq 0 || "$summary_ok" -eq 0 || "$subset_empty" -eq 1 ]]; then
+# ── native sanitizer oracle floor (#3626) ───────────────────────────────────
+# Every shard's structured JSON summary now carries
+# native_sanitizer_unavailable_skips (test_main.cpp, sourced from the ONE
+# harness chokepoint: tests/native_test_harness.hpp's sanitizerRuntimeMaster).
+# Sum it across every shard here — directly from the raw JSON via grep/awk,
+# NOT through scripts/gate/summary.py's account()/merge(), which do not know
+# this field — deliberately narrow so this fix does not touch that heavily
+# self-tested machinery or its schema. A missing field on an older/foreign
+# JSON degrades to 0, never a parse error.
+#
+# Printed UNCONDITIONALLY (mirrors test_main.cpp's own per-process line): "0"
+# is then a visible confirmation the oracle ran across the whole sharded run,
+# not the absence of a signal. A nonzero total fails the run — same shape as
+# the #3002 coverage floor: an acceptance gate (scripts/gate.sh runs this
+# script; a nonzero exit here becomes a GATE FAILURE) must not pass with a
+# verification leg silently switched off. This does NOT abort a plain
+# developer run of a single binary (test_main.cpp's own exit code is
+# unaffected — see native_test_harness.hpp's file comment); it is enforced
+# only where run_parallel.sh's exit status is load-bearing, i.e. the gate.
+sanitizer_unavailable_total=$(grep -aho '"native_sanitizer_unavailable_skips":[0-9]*' \
+    "$logdir"/summary.*.json 2>/dev/null \
+    | grep -oE '[0-9]+$' | awk '{t+=$1} END{print t+0}')
+sanitizer_unavailable_total="${sanitizer_unavailable_total:-0}"
+echo "NATIVE SANITIZER (all shards): $sanitizer_unavailable_total check(s) skipped (ASan/TSan runtime unavailable)"
+if [[ "$sanitizer_unavailable_total" -gt 0 ]]; then
+    echo "############################################################"
+    echo "## GATE FAILURE: native sanitizer oracle UNAVAILABLE for $sanitizer_unavailable_total check(s)"
+    echo "##   The ASan/TSan combined runtime object could not be built, so those"
+    echo "##   checks silently could not be verified (#3626) — an acceptance run"
+    echo "##   must not pass with this verification leg switched off. See"
+    echo "##   tests/native_test_harness.hpp sanitizerRuntimeMaster() and the"
+    echo "##   per-shard logs in $logdir for the underlying toolchain error."
+    echo "############################################################"
+fi
+
+if [[ "$shard_rc" -ne 0 || "$total_fail" -ne 0 || "$count_ok" -eq 0 || "$summary_ok" -eq 0 || "$subset_empty" -eq 1 || "$sanitizer_unavailable_total" -gt 0 ]]; then
     exit 1
 fi
 exit 0
