@@ -84,23 +84,20 @@ bool Emitter::containsAwait(const std::vector<std::unique_ptr<ast::Stmt>>& stmts
         } else if (auto* fs = dynamic_cast<const ast::ForStmt*>(s.get())) {
             // §30.7: an `await for` itself contains an await (MoveNextAsync).
             if (fs->isAwait) return true;
-            // #2251 / #3587: `fs->iterable` (`for x in EXPR do`) is
-            // DELIBERATELY not scanned here. It undercounts a genuine
-            // `await` there (MEASURED live: a cross-thread hang, `timeout
-            // 10` -> exit 124) — but counting it is NOT a safe fix on its
-            // own: probing it (an async method awaiting the ITERABLE, e.g.
-            // `for x in (await GetArr()) do …`) with the count corrected
-            // turns the hang into a NONDETERMINISTIC segfault / silent-
-            // wrong-value race (5 runs: exit 139, 139, 139, 139, 0 — the
-            // exit-0 run's return value was 0, not the correct 6), because
-            // `lowerFor`/`lowerArrayFor` (LlvmBackend_Stmts.cpp — held by
-            // another lane this run) does not itself support a suspend
-            // inside the iterable position: the loop's iteration-state setup
-            // is not spill/dominance-safe across the state-machine's basic
-            // blocks. Fixing the count alone converts a loud, deterministic
-            // hang into a quiet, nondeterministic wrong answer — a strictly
-            // worse trade (CLAUDE.md §6c) — so it is intentionally left
-            // uncounted here pending a real lowering fix. See issue #3622.
+            // fix #3622 (§21.5 / §30.2 / §30.7, v0.286): `fs->iterable`
+            // (`for x in EXPR do`) IS now scanned — it undercounted a genuine
+            // `await` there (MEASURED: a cross-thread hang, `timeout 10` ->
+            // exit 124, the #441/#2226 shape). Landing the count alone was
+            // rejected once already (CLAUDE.md §6c): it traded the hang for a
+            // NONDETERMINISTIC segfault/silent-wrong-value race, because the
+            // awaited task's Pattern A result (#3070's `deferTaskFree`) was
+            // freed at the iterable expression's own K8 full-expression
+            // boundary — before the loop body ever read it. That is now
+            // fixed too (`lowerAwait`'s `deferToScopeOnly`, gated on
+            // `deferredRecvScopeBoundInit_`, LlvmBackend_Async.cpp): the
+            // reclaim defers to the loop's own enclosing scope instead, so
+            // both halves land together as CLAUDE.md §6c requires.
+            if (exprContainsAwait(fs->iterable.get())) return true;
             if (containsAwait(fs->body)) return true;
         } else if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s.get())) {
             if (exprContainsAwait(ws->condition.get())) return true;
@@ -213,11 +210,11 @@ static unsigned countAwaits(const std::vector<std::unique_ptr<ast::Stmt>>& stmts
             // clause is lowered the same way (the token is evaluated and then
             // discarded), so it carries the same single suspend point.
             if (fs->isAwait) n += 1;
-            // #2251 / #3587: `fs->iterable` deliberately NOT counted — see
-            // the `containsAwait` bool sibling above for the full rationale
-            // (a naive count fix here is UNSAFE: it trades a deterministic
-            // hang for a nondeterministic segfault/wrong-value race, because
-            // the lowering does not support a suspend in iterable position).
+            // fix #3622 (§21.5 / §30.2 / §30.7, v0.286): `fs->iterable` is
+            // now counted too — see the `containsAwait` bool sibling above
+            // for the full rationale, and `lowerAwait`'s `deferToScopeOnly`
+            // for the accompanying lowering fix that makes counting it safe.
+            n += countAwaitsInExpr(fs->iterable.get());
             n += countAwaits(fs->body);
         }
         else if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s.get())) {
@@ -3552,8 +3549,56 @@ llvm::Value* Emitter::lowerAwait(const ast::UnaryExpr& un) {
     // Reclaiming those rows here would double-free.
     bool freeOnFault = asyncChainedReturn_ &&
         dynamic_cast<const ast::CallExpr*>(un.operand.get()) != nullptr;
+    // fix #3622 (§21.5 for-statement / §29.2 / §30.5 / §28.3, v0.286): a
+    // for-in's iterable is itself a §29.2 SCOPE-BOUND consumer — the
+    // desugaring binds it to `using var __source`, disposed at the LOOP's own
+    // scope end, not at the iterable sub-expression's own K8 full-expression
+    // boundary (LlvmBackend_Exprs.cpp's lowerExpr wrapper flushes
+    // `awaitedTaskTemps_` the moment `for`'s SOURCE finishes lowering — before
+    // the loop body ever runs). §30.5's "disposed at the expression's end,
+    // after every use of the borrow" therefore does NOT hold for `for x in
+    // (await Producer()) do ... end`: the borrow's uses (the loop body) live
+    // OUTSIDE that boundary. Flushing there anyway frees the awaited task —
+    // and, via its Pattern A result_disposer (#1503), the borrowed
+    // class/collection result WITH it — before the loop reads it.
+    //
+    // MEASURED (with only #3622's ForStmt::iterable counting fix applied, no
+    // lowering fix): `for var x in (await GetArr()) do total := total + x;
+    // end;` (GetArr returns Task<Array<int>>, [1,2,3]) — 8 runs, `timeout
+    // 10`: 3x SIGSEGV (exit 139), 5x silent WRONG VALUE (exit 0, not the
+    // correct 6) — a heap-use-after-free race on the array, freed the instant
+    // the K8 boundary fires, exactly matching #3070's own pre-fix symptom for
+    // the "used beyond the confining expression" shape.
+    //
+    // `deferredRecvScopeBoundInit_` (fix #3377) already carries exactly "the
+    // for-in iterable currently being lowered" (also `using var`
+    // initializers, which are equally scope-bound and unaffected here since
+    // their own borrow is confined to the `using var`'s own scope already).
+    // Reusing it — rather than adding a second, narrower "am I inside a
+    // for-loop's source" predicate — is CLAUDE.md §6: extend the existing
+    // authority. `forEachAwaitSite` (fix #3587) is the shared both-sources
+    // await-site walk; using it to test membership (rather than a fresh
+    // dynamic_cast chain) keeps this from becoming a third copy of that walk.
+    // The result: `deferTaskFree` awaits inside a for-loop's SOURCE keep
+    // their `disposeStack_` scope-end reclaim (registerAwaitedTaskTemp's
+    // first half — never skipped) but skip the premature K8-boundary flush;
+    // the loop's own enclosing block scope, which by construction contains
+    // the whole for-statement (source AND body), reclaims the task — and,
+    // through it, the borrowed result — no earlier than the loop finishes.
+    // Never applies to a for-loop's BODY (a disjoint AST subtree the walk
+    // below does not visit), so per-iteration K8 semantics there (§30.5
+    // "loop_body_reclaims_per_iteration") are untouched.
+    bool deferToScopeOnly = false;
+    if (deferTaskFree && deferredRecvScopeBoundInit_) {
+        bezel::common::forEachAwaitSite(
+            deferredRecvScopeBoundInit_,
+            [&](const ast::UnaryExpr* ue) {
+                if (ue == &un) deferToScopeOnly = true;
+            });
+    }
     return emitAwaitSuspend(task, resultTy, freeTaskAfter, takeResultAfter,
-                            markSpentAfter, deferTaskFree, freeOnFault);
+                            markSpentAfter, deferTaskFree, freeOnFault,
+                            /*onFault=*/{}, deferToScopeOnly);
 }
 
 
@@ -3571,7 +3616,8 @@ llvm::Value* Emitter::emitAwaitSuspend(llvm::Value* task, llvm::Type* resultTy,
                                        bool markSpentAfter,
                                        bool deferTaskFree,
                                        bool freeOnFault,
-                                       const std::function<void()>& onFault) {
+                                       const std::function<void()>& onFault,
+                                       bool deferToScopeOnly) {
     if (!task) return nullptr;
 
     // Store the awaited task into the frame's pending-task slot so the resumed
@@ -3874,9 +3920,16 @@ llvm::Value* Emitter::emitAwaitSuspend(llvm::Value* task, llvm::Type* resultTy,
             // SAME full expression (`Use2(await P(), await Q())`) suspends
             // between the store here and the boundary read, and a resume may run
             // on a different thread's stack (§30.13).
+            // fix #3622 (§21.5 / §29.2 / §30.5, v0.286): `deferToScopeOnly`
+            // (set for an await inside a for-loop's iterable — see this
+            // function's header comment) still parks the slot and still
+            // registers the disposeStack_ scope-end reclaim below; it only
+            // withholds the K8-boundary queue entry, so the borrow survives
+            // past the source expression's own boundary for the loop body to
+            // read.
             llvm::AllocaInst* taskSlot = entryAlloca(ptrTy());
             builder_.CreateStore(awaitedTask, taskSlot);
-            registerAwaitedTaskTemp(taskSlot);
+            registerAwaitedTaskTemp(taskSlot, deferToScopeOnly);
             if (smStateStruct_) asyncHandlerSpillSlots_.push_back(taskSlot);
         } else {
             auto* freeTaskFn = declareC("bz_task_free",
@@ -3907,13 +3960,22 @@ llvm::Value* Emitter::emitAwaitSuspend(llvm::Value* task, llvm::Type* resultTy,
 // (2) The temp is queued for the next full-expression boundary, where
 //     flushAwaitedTaskTemps frees it and NULLS the slot — after which the entry
 //     from (1) is a null-guarded no-op on every subsequent edge.
-void Emitter::registerAwaitedTaskTemp(llvm::AllocaInst* slot) {
+//
+// fix #3622 (§21.5 / §29.2 / §30.5, v0.286): `deferToScopeOnly=true` skips
+// step (2) — the temp is registered ONLY on disposeStack_, so it is reclaimed
+// no earlier than its enclosing scope ends, never at a K8 boundary that
+// precedes the borrow's actual uses (a for-loop's iterable position; see
+// emitAwaitSuspend's header comment). Step (1) always runs regardless, so the
+// exception-edge and scope-end reclaim are unaffected either way.
+void Emitter::registerAwaitedTaskTemp(llvm::AllocaInst* slot,
+                                      bool deferToScopeOnly) {
     if (!slot) return;
     if (!disposeStack_.empty()) {
         Disposal d{slot, nullptr};
         d.awaitedTaskTemp = true;
         disposeStack_.back().push_back(d);
     }
+    if (deferToScopeOnly) return;
     awaitedTaskTemps_.push_back({slot, currentFn_});
 }
 

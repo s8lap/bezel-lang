@@ -10846,13 +10846,25 @@ private:
     // `DisposeAsync` completes by throwing") has no other place to put it.
     // A parameter, not emitter state, so no nested emission can see a stale
     // value (rules §13). Empty for every await that has no such obligation.
+    // deferToScopeOnly=true (fix #3622 / §21.5 / §29.2 / §30.5 + §28.3,
+    // v0.286): `deferTaskFree`'s K8 full-expression-boundary reclaim
+    // (registerAwaitedTaskTemp -> flushAwaitedTaskTemps) is SKIPPED — the
+    // task (and, through its Pattern A result_disposer, the borrowed result)
+    // is left to the ordinary `disposeStack_` scope-end reclaim instead. Set
+    // by `lowerAwait` for an await inside a for-loop's iterable position:
+    // that source expression is its own K8 boundary, but the loop BODY that
+    // reads its borrowed result lives outside it, so flushing there is a
+    // use-after-free. The scope-end reclaim is later (bounded over-live, not
+    // a leak) but never earlier than the loop finishes, since the enclosing
+    // block scope necessarily contains the whole for-statement.
     llvm::Value* emitAwaitSuspend(llvm::Value* task, llvm::Type* resultTy,
                                   bool freeTaskAfter,
                                   bool takeResultAfter = false,
                                   bool markSpentAfter = false,
                                   bool deferTaskFree = false,
                                   bool freeOnFault = false,
-                                  const std::function<void()>& onFault = {});
+                                  const std::function<void()>& onFault = {},
+                                  bool deferToScopeOnly = false);
 
     // §28.12 / §30 (`await using` normal-exit path): call DisposeAsync() on `obj`
     // stdlib §6.10 (v0.175, #808): emit the TaskScope disposal for one scope
@@ -13491,7 +13503,11 @@ private:
     // registers the null-guarded bz_task_free on disposeStack_ (covering the
     // exception edge and acting as the conservative backstop) and queues it for
     // the next full-expression boundary.
-    void registerAwaitedTaskTemp(llvm::AllocaInst* slot);
+    // deferToScopeOnly (fix #3622, v0.286): register the disposeStack_
+    // scope-end reclaim only, skipping the K8-boundary queue — see the
+    // definition's header comment.
+    void registerAwaitedTaskTemp(llvm::AllocaInst* slot,
+                                 bool deferToScopeOnly = false);
     // The K8 full-expression boundary discharge: bz_task_free each queued task
     // and NULL its slot.
     void flushAwaitedTaskTemps();
