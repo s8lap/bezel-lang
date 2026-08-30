@@ -20119,14 +20119,27 @@ bool Emitter::returnedStringLocalOwnsPlusOne(const ast::Expr* e) const {
     if (!stringLocalCandidates_.count(declNode)) return false;
     // A producer-initialized non-nullable string local transferred the
     // producer's +1 into its slot. (Borrow locals are exactly stringBorrowAll_;
-    // a non-using string LocalDecl whose initializer is a +1 producer is the
+    // a non-using string local whose initializer is a +1 producer is the
     // producer case — its +1 lives in the slot whether or not it escapes.)
-    auto* ld = dynamic_cast<const ast::LocalDecl*>(loc->decl);
-    if (ld && !ld->isUsing && ld->initializer &&
-        isPlusOneStringProducer(ld->initializer.get())) {
+    //
+    // fix #3614 (§21.1 / §28.9, v0.286): read the producer/isUsing/type triple
+    // through the shared `localDeclInitView` instead of re-deriving it via a
+    // LocalDecl-only dynamic_cast. stringLocalCandidates_ has admitted a §21.1
+    // runtime `const` local (ast::LocalConstDecl) since fix #3416
+    // (collectStringReleaseEligible above already scans through
+    // localDeclInitView), but THIS consumer still cast loc->decl to
+    // `const ast::LocalDecl*` directly — null for a LocalConstDecl — so it
+    // fell through to `return false` for every const candidate. The caller
+    // then treated the return as a fresh +0 needing a mint, re-minting a
+    // second reference to a string the producer already left a +1 for in the
+    // slot: the producer's +1 is never transferred and leaks. `isUsing` is
+    // always false for a `const` (LocalDeclInitView's documented contract, a
+    // `const` can never be a `using var`), so the isUsing guard is unaffected.
+    LocalDeclInitView view = localDeclInitView(loc->decl);
+    if (view.init && !view.isUsing && isPlusOneStringProducer(view.init)) {
         const sema::TypeRef* lt = nullptr;
-        if (ld->type) lt = ctx_.resolvedType(*ld->type);
-        if (!lt) lt = ctx_.exprType(*ld->initializer);
+        if (view.type) lt = ctx_.resolvedType(*view.type);
+        if (!lt) lt = ctx_.exprType(*view.init);
         return lt && !lt->nullable &&
                lt->kind == sema::TypeRef::Kind::Primitive &&
                lt->primitive == sema::PrimitiveType::String;
