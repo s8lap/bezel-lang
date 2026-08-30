@@ -591,39 +591,21 @@ void Resolver::checkTypeMethodBodies(TypeSymbol* t) {
 
 void Resolver::checkEnumRestrictions() {
     if (!ctx_.module()) return;
-    // fix #3044 (§10.4, v0.242): the §10.5 loop below walks MODULE-LEVEL enums
-    // only, so a NESTED enum escapes every check in it. Widening the whole loop
-    // is a broader §10.5 change than this fix owns, but the
-    // `FromUnderlyingOrNull` reject cannot be left out: `enumTypeNamedBy` and
-    // `tryLowerEnumFromUnderlyingOrNull` both resolve a NestedTypeSymbol, so a
-    // nested enum's own declaration of that name would be silently shadowed by
-    // the compiler-provided member at every call site — precisely the outcome
-    // §10.4's "no user declaration may override or overload it" exists to
-    // prevent. (That the other §10.5 restrictions still skip nested enums is a
-    // separate, pre-existing gap.)
-    for (Symbol* child : ctx_.module()->children) {
-        auto* outer = dynamic_cast<TypeSymbol*>(child);
-        if (!outer || outer->kind == ast::TypeDeclKind::Enum) continue;
-        for (Symbol* m : outer->members) {
-            auto* nts = dynamic_cast<NestedTypeSymbol*>(m);
-            if (!nts || !nts->type ||
-                nts->type->kind != ast::TypeDeclKind::Enum)
-                continue;
-            for (Symbol* nm : nts->type->members) {
-                if (nm->name != "FromUnderlyingOrNull") continue;
-                ctx_.diagnostics().report(
-                    Severity::Error, nm->declLoc,
-                    std::string("enum `") + std::string(nts->type->name) +
-                    "` may not declare a member named `FromUnderlyingOrNull` — "
-                    "it is the compiler-provided static member every enum "
-                    "carries, and no user declaration may override or overload "
-                    "it (§10.4)");
-            }
-        }
-    }
-    for (Symbol* child : ctx_.module()->children) {
-        auto* t = dynamic_cast<TypeSymbol*>(child);
-        if (!t || t->kind != ast::TypeDeclKind::Enum) continue;
+    // fix #3601 (§10.4 / §10.5 / §11.6, v0.286): the two module-children-only
+    // loops this replaced used to reach only MODULE-LEVEL enums (§10.5's
+    // restriction set) or exactly one level of nesting (fix #3044's
+    // `FromUnderlyingOrNull` carve-out) -- so a nested enum escaped §10.5
+    // entirely (depth 1) and an enum nested two levels down escaped even the
+    // carve-out (depth 2, issue 3601's second measured axis). Routing the
+    // whole check through the shared recursive walker (fix #3574,
+    // forEachTypeAndNested) closes both gaps together: every enum at every
+    // nesting depth now gets the FULL §10.5 restriction set, including the
+    // `FromUnderlyingOrNull` carve-out below -- so the old separate
+    // module-children-only `FromUnderlyingOrNull` loop is retired outright
+    // rather than kept alongside this one, which would double-report a
+    // module-level enum's violation (this loop already covers depth 0).
+    forEachTypeAndNested([&](TypeSymbol* t) {
+        if (t->kind != ast::TypeDeclKind::Enum) return;
         for (Symbol* m : t->members) {
             auto bad = [&](std::string_view what) {
                 ctx_.diagnostics().report(
@@ -782,7 +764,7 @@ void Resolver::checkEnumRestrictions() {
                 running = val + 1;
             }
         }
-    }
+    });
 }
 
 void Resolver::checkGenericConstraintConsistency() {
