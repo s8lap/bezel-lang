@@ -1938,28 +1938,26 @@ void Resolver::checkClosedHierarchyLeafVisibility() {
     // set is local to its declaring module, §11.7; cross-module subclasses
     // are rejected at the base's inheritance site, TypeResolution_Names.
     // cpp:717). Nested classes are included — a nested class can extend a
-    // top-level `closed` root.
-    // NOT `forEachTypeAndNested` (fix #3574): this walk stops DESCENDING at a
-    // non-class nested type, so a class nested inside a nested record is
-    // deliberately outside the leaf set it builds here. Routing it through the
-    // shared walk would widen that set — a separate §11.7 question with its own
-    // repair (issue filed), not part of #3574's one-level-walk family.
+    // top-level `closed` root, at ANY nesting depth and through nested types
+    // of ANY kind: §11.6 states "Nested types in records are permitted but
+    // uncommon", so a class may be declared inside a nested record (or
+    // interface / enum / choice), and such a class is a leaf just like one
+    // declared directly inside a class.
+    // fix #3599 (§19.6 / §11.7 / §11.6, v0.286): this used to be a
+    // hand-rolled `collectNested` that stopped DESCENDING as soon as it met a
+    // non-class nested type, so a class nested inside a nested record was
+    // silently excluded from `localClasses` -- the §19.6 cross-module
+    // exhaustiveness guard never saw it, letting a concrete `internal` leaf
+    // of a public `closed` root escape the guard entirely (issue 3599's
+    // repro). Routing through the shared recursive walker (fix #3574,
+    // forEachTypeAndNested) and filtering to `kind == Class` inside the
+    // callback closes that hole: the walker DESCENDS through nested types of
+    // every kind unconditionally and only the PUSH is filtered, matching the
+    // shape `collectHidingCheckClasses` already used.
     std::vector<TypeSymbol*> localClasses;
-    std::function<void(TypeSymbol*)> collectNested = [&](TypeSymbol* parent) {
-        for (Symbol* m : parent->members) {
-            auto* nt = dynamic_cast<NestedTypeSymbol*>(m);
-            if (!nt || !nt->type) continue;
-            if (nt->type->kind != ast::TypeDeclKind::Class) continue;
-            localClasses.push_back(nt->type);
-            collectNested(nt->type);
-        }
-    };
-    for (Symbol* child : ctx_.module()->children) {
-        auto* t = dynamic_cast<TypeSymbol*>(child);
-        if (!t || t->kind != ast::TypeDeclKind::Class) continue;
-        localClasses.push_back(t);
-        collectNested(t);
-    }
+    forEachTypeAndNested([&](TypeSymbol* t) {
+        if (t->kind == ast::TypeDeclKind::Class) localClasses.push_back(t);
+    });
     // For each public closed root, walk every concrete (non-abstract,
     // non-`closed`) descendant in this module and check visibility.
     // Abstract and `closed` intermediates have no instances and need no
