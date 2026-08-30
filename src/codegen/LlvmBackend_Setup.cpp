@@ -21955,6 +21955,34 @@ struct StringEscapeWalker {
             return;
         }
         if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(s)) {
+            // fix #3427 hole 3 (§21.1 / §28.9 / §28.11, v0.286): #1871's
+            // VIEW-ALIAS relaxation, for §21.1's `const` spelling of the same
+            // binding. Binding the target array directly into a pure-
+            // `IEnumerable<T>` VIEW `const` that was independently proven
+            // never to escape (safeViewAliases) is a BORROW exactly as for
+            // the `var` arm above: the view wrapper borrows the array's
+            // backing (wrapArrayAsIEnumerable) and its scope-end Dispose
+            // frees only the wrapper struct, never the backing (§28.11), so
+            // the binding does not taint the array. Only in
+            // borrowingArrayMode, and only for the exact `const v :=
+            // <array-identifier>` shape, mirroring the `LocalDecl` arm's
+            // check byte-for-byte.
+            //
+            // Without this arm the `const` view fell straight through to the
+            // unconditional `expr(lc->value.get(), /*safeRead=*/false)`
+            // below, tainting the array as escaped on EVERY const-view
+            // binding: collectSafeViewAliases (this same fix) now admits a
+            // const view into its `out` set, but until this arm existed no
+            // LocalConstDecl-shaped statement ever consulted that set, so the
+            // admission was inert — the array's own scope-end
+            // bz_array_free/bz_dict_free never armed. Measured 30248 B / 597
+            // allocs leaked (`const rows := arr; for var r in rows { ... }`
+            // shape, `arr` never reclaimed because the const view binding
+            // kept tainting it as an escape).
+            if (borrowingArrayMode && safeViewAliases &&
+                safeViewAliases->count(static_cast<const void*>(lc)) &&
+                isTargetIdent(lc->value.get()))
+                return;
             // fix #3416 (§21.1 / §28.9, v0.283): #2764's BORROW-ALIAS
             // relaxation, for §21.1's `const` spelling of the same binding.
             // `const other := built;` is a plain local-to-local string COPY and
@@ -25605,26 +25633,42 @@ void Emitter::collectSafeViewAliases(
         const std::vector<std::unique_ptr<ast::Stmt>>& body,
         const ast::Node* arrLd,
         std::unordered_set<const void*>& out) {
-    std::vector<const ast::LocalDecl*> views;
+    // fix #3427 hole 3 (§21.1 / §28.9 / §28.11, v0.286): `views` was
+    // `const ast::LocalDecl*` and the scan below matched only
+    // `dynamic_cast<const ast::LocalDecl*>(s)`, so a §21.1 runtime `const`
+    // view (`const view: IEnumerable<T> := arr;`) was never recognized as a
+    // safe alias of `arrLd` — its escape walk never ran and `out` never
+    // admitted it. That is the SAFE direction on its own (a missed safe view
+    // just makes the array's OWN escape walk conservatively treat the const
+    // binding as an unrecognized use — see the caller's
+    // `StringEscapeWalker`/`safeViewAliases` — so a missed const view could
+    // only ever cost a false-negative reclaim, never a UAF); measured
+    // 30248 B / 597 allocs leaked because the missed view forced the walk to
+    // treat the const binding as an ordinary (non-safe) read, which used to
+    // read as an escape. Widened to `const ast::Node*` + `localDeclInitView`
+    // — the same authority collectBorrowingArrayFreeEligible reads (fix
+    // #2802/#3402) — so a const view is admitted identically to a `var` one.
+    std::vector<const ast::Node*> views;
     std::function<void(const ast::Stmt*)> scan = [&](const ast::Stmt* s) {
         if (!s) return;
-        if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s)) {
-            if (!ld->isUsing && ld->initializer && ld->type) {
-                if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
-                        ld->initializer.get())) {
+        {
+            LocalDeclInitView v = localDeclInitView(s);
+            if (v.init && !v.isUsing && v.type) {
+                if (auto* id =
+                        dynamic_cast<const ast::IdentifierExpr*>(v.init)) {
                     auto* loc =
                         dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*id));
                     if (loc && loc->decl &&
                         static_cast<const void*>(loc->decl) ==
                             static_cast<const void*>(arrLd)) {
-                        const sema::TypeRef* dt = ctx_.resolvedType(*ld->type);
+                        const sema::TypeRef* dt = ctx_.resolvedType(*v.type);
                         // fix #3419 (§29.2, v0.283): read the shared head classifier.
                         if (dt && dt->kind == sema::TypeRef::Kind::Named &&
                             !dt->declaration && dt->astNode && dt->astNode->name &&
                             !dt->astNode->name->parts.empty() &&
                             common::isSyncIterFormatEnumerableHead(
                                 dt->headName()))
-                            views.push_back(ld);
+                            views.push_back(s);
                     }
                 }
             }
@@ -25655,7 +25699,7 @@ void Emitter::collectSafeViewAliases(
     // A view qualifies only if it never escapes. Run the escape walk in
     // borrowingArrayMode so a for-in over the view (the common consumer) is a
     // borrow-read; everything else (return/store/capture/owned-arg) still escapes.
-    for (const ast::LocalDecl* v : views) {
+    for (const ast::Node* v : views) {
         StringEscapeWalker w{ctx_, static_cast<const void*>(v)};
         w.borrowingArrayMode = true;
         for (auto& s : body) { w.stmt(s.get()); if (w.escaped) break; }
