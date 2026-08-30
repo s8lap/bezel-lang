@@ -1456,11 +1456,10 @@ struct SourceFile : Node {
 // lowering, and (new here) the §22.5 binding publication for a `this(...)`
 // chain to a primary constructor. Each carried its own copy of the same
 // six-line dynamic_cast walk, which is the duplicated-classification shape.
-// `Emitter::chainCallOf`, `Emitter`'s `ctorChainsViaThis` and
-// `ExprTC::publishPrimaryCtorChainBinding` read this one;
-// `Resolver::isChainCall` and `DefiniteAssignment::getChainingCall` still hold
-// their own and are filed to converge here (they were left alone only to keep
-// this fix's cherry-pick footprint off files other lanes are rewriting).
+// `Emitter::chainCallOf`, `Emitter`'s `ctorChainsViaThis`,
+// `ExprTC::publishPrimaryCtorChainBinding`, `Resolver::isChainCall`
+// (TypeResolution_Checks.cpp) and `MethodDA::getChainingCall`
+// (DefiniteAssignment.cpp, fix #3624) all read this one now.
 // Returns the chain `CallExpr` and sets `isThis`, or null when `s` is not a
 // chain call.
 inline const CallExpr* chainCallOfStmt(const Stmt& s, bool& isThis) {

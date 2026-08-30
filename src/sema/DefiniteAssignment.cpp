@@ -386,17 +386,13 @@ public:
         // unassigned (the body must assign it).
         std::size_t startIdx = 0;
         bool isThisChain = false;
-        if (const ast::CallExpr* chain = getChainingCall(cd)) {
+        if (const ast::CallExpr* chain = getChainingCall(cd, isThisChain)) {
             startIdx = 1;
             inChainingPosition_ = true;
             for (const auto& a : chain->args) visitCallArg(a);
             inChainingPosition_ = false;
-            if (auto* cid = dynamic_cast<const ast::IdentifierExpr*>(
-                    chain->callee.get())) {
-                if (cid->name == "this") {
-                    isThisChain = true;
-                    for (auto n : fieldsNeedingInit_) assignedFields_.insert(n);
-                }
+            if (isThisChain) {
+                for (auto n : fieldsNeedingInit_) assignedFields_.insert(n);
             }
         }
         // fix #2187 / §22.8: seed initializer-carrying readonly fields as
@@ -491,12 +487,8 @@ public:
         }
         std::size_t startIdx = 0;
         bool isThisChain = false;
-        if (const ast::CallExpr* chain = getChainingCall(cd)) {
+        if (getChainingCall(cd, isThisChain)) {
             startIdx = 1;
-            if (auto* cid = dynamic_cast<const ast::IdentifierExpr*>(
-                    chain->callee.get())) {
-                if (cid->name == "this") isThisChain = true;
-            }
         }
         if (!isThisChain) {
             for (auto n : readonlyInitialized)
@@ -1755,18 +1747,16 @@ private:
 
     // The `base(...)`/`this(...)` chaining call, if this constructor has one —
     // the body's first ExpressionStmt of a CallExpr on `this`/`base`
-    // (Node.hpp). Null otherwise (implicit `base()`).
-    static const ast::CallExpr* getChainingCall(const ast::ConstructorDecl& cd) {
+    // (Node.hpp). Null otherwise (implicit `base()`). `isThis` is set true
+    // for `this(...)`, false for `base(...)` (written only when a chain call
+    // is returned) — fix #3624: forwards to the ONE §12.8 chain-call
+    // recognizer (`ast::chainCallOfStmt`, Node.hpp) so callers no longer
+    // re-derive the this/base discrimination with a second `dynamic_cast` on
+    // the callee.
+    static const ast::CallExpr* getChainingCall(const ast::ConstructorDecl& cd,
+                                                bool& isThis) {
         if (cd.body.empty() || !cd.body.front()) return nullptr;
-        auto* es =
-            dynamic_cast<const ast::ExpressionStmt*>(cd.body.front().get());
-        if (!es || !es->expr) return nullptr;
-        auto* call = dynamic_cast<const ast::CallExpr*>(es->expr.get());
-        if (!call || !call->callee) return nullptr;
-        auto* id =
-            dynamic_cast<const ast::IdentifierExpr*>(call->callee.get());
-        if (id && (id->name == "this" || id->name == "base")) return call;
-        return nullptr;
+        return ast::chainCallOfStmt(*cd.body.front(), isThis);
     }
 
     // §22.7 rule 1: report a synchronous `this`-observation that is not admitted

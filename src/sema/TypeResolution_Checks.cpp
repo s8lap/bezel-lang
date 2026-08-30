@@ -311,22 +311,14 @@ void Resolver::checkConstructorChains() {
 }
 
 bool Resolver::isChainCall(const ast::Stmt* s, bool* isThis) {
-    auto* es = dynamic_cast<const ast::ExpressionStmt*>(s);
-    if (!es || !es->expr) return false;
-    auto* call = dynamic_cast<const ast::CallExpr*>(es->expr.get());
-    if (!call || !call->callee) return false;
-    auto* id = dynamic_cast<const ast::IdentifierExpr*>(
-        call->callee.get());
-    if (!id) return false;
-    if (id->name == "this") {
-        if (isThis) *isThis = true;
-        return true;
-    }
-    if (id->name == "base") {
-        if (isThis) *isThis = false;
-        return true;
-    }
-    return false;
+    // fix #3624: forward to the ONE §12.8 chain-call recognizer (Node.hpp) --
+    // this used to be its own six-line dynamic_cast walk.
+    if (!s) return false;
+    bool chainIsThis = false;
+    const ast::CallExpr* chain = ast::chainCallOfStmt(*s, chainIsThis);
+    if (!chain) return false;
+    if (isThis) *isThis = chainIsThis;
+    return true;
 }
 
 void Resolver::checkTypeConstructorChains(TypeSymbol* t) {
