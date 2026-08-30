@@ -954,25 +954,54 @@ void Resolver::checkTypeConsts(TypeSymbol* t) {
             // are shared with the local-`const` fault check (ExprTypecheck.cpp)
             // so both const forms agree on exactly one "fits"/"div-by-zero"
             // definition (ConstFold.hpp).
+            //
+            // fix #3635 (§6.1 / Appendix C.11, v0.286): walk `t`'s own members
+            // AND its class base chain, so a bare name naming an INHERITED
+            // const resolves here too. Before this fix the walk covered only
+            // `t->members`; `fix #3619` deliberately DECLINED to fold this
+            // closure into the shared `resolveConstIdentInScope` (which already
+            // has this same walk) because the two differ in what happens on an
+            // unfoldable match — `resolveConstIdentInScope` falls through to
+            // let a same-named symbol further up shadow it, while this closure
+            // (kept here, unchanged) returns immediately once ANY level of the
+            // chain has a matching name, foldable or not. That contract is
+            // preserved: the widening is *which levels get searched*, not
+            // *what happens on a match*. Reachable: `Derived : Base` where
+            // `Derived`'s own const references `Base`'s by bare name — measured
+            // silently accepting an overflowing value (and, independently, a
+            // division by an inherited zero const) before this fix, since both
+            // `foldIntConst` below and `containsConstDivByZero` in the nullopt
+            // arm share this one `resolve`.
             std::function<std::optional<long long>(std::string_view, int)>
                 resolve = [&](std::string_view name,
                               int depth) -> std::optional<long long> {
-                for (Symbol* sm : t->members) {
-                    auto* scs = dynamic_cast<ConstMemberSymbol*>(sm);
-                    if (!scs || scs->name != name) continue;
-                    if (auto* scd =
-                            dynamic_cast<const ast::ConstDecl*>(scs->decl))
-                        if (scd->value)
-                            return foldIntConst(*scd->value, resolve, depth + 1);
-                    // fix #3230 (§17.14 / §15.1 / §22.12; family M11 of
-                    // umbrella #3152): an imported sibling const has no AST
-                    // TypeDecl (the symbol is reconstructed from metadata),
-                    // so the `scd->value` arm above returns nullopt and the
-                    // §6.1 / Appendix C.11 range check below silently no-ops.
-                    // Fall back to the typed value the loader populated
-                    // (parseImportedConstIntText in ModuleLoader.cpp).
-                    if (scs->intValue) return *scs->intValue;
-                    return std::nullopt;
+                for (TypeSymbol* ts = t; ts;) {
+                    for (Symbol* sm : ts->members) {
+                        auto* scs = dynamic_cast<ConstMemberSymbol*>(sm);
+                        if (!scs || scs->name != name) continue;
+                        if (auto* scd =
+                                dynamic_cast<const ast::ConstDecl*>(scs->decl))
+                            if (scd->value)
+                                return foldIntConst(*scd->value, resolve,
+                                                     depth + 1);
+                        // fix #3230 (§17.14 / §15.1 / §22.12; family M11 of
+                        // umbrella #3152): an imported sibling const has no AST
+                        // TypeDecl (the symbol is reconstructed from
+                        // metadata), so the `scd->value` arm above returns
+                        // nullopt and the §6.1 / Appendix C.11 range check
+                        // below silently no-ops. Fall back to the typed value
+                        // the loader populated (parseImportedConstIntText in
+                        // ModuleLoader.cpp).
+                        if (scs->intValue) return *scs->intValue;
+                        return std::nullopt;
+                    }
+                    TypeSymbol* nb = nullptr;
+                    for (TypeSymbol* base : ts->baseTypes)
+                        if (base && base->kind == ast::TypeDeclKind::Class) {
+                            nb = base;
+                            break;
+                        }
+                    ts = nb;
                 }
                 return std::nullopt;
             };
