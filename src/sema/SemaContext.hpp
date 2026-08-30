@@ -192,12 +192,22 @@ public:
     //
     // Unlike `patternSymbols_`/`lambdaParams_`, this table needs NO entry in
     // ModuleLoader's body-reconstruction remap loops: it is read only by
-    // `checkPureBodies`, which — like `typecheckExpressions` — runs once per
-    // compiled `SourceFile` on the driver's own `SemaContext` and never on a
-    // ModuleLoader-reparsed imported generic body (`checkPureBodies` has
-    // exactly one caller, `Driver.cpp`). Same reasoning fix #3583 gives for
-    // `newExprPositionalBindings_`: the statement lives only at the call
-    // site, in the importer's own AST.
+    // `checkPureBodies`, which is invoked from exactly 3 call sites, all in
+    // `Driver.cpp`, always with the driver's own top-level `SemaContext` —
+    // never with `ModuleLoader`'s `freshCtx` (0 occurrences of
+    // `checkPureBodies` in ModuleLoader.cpp). ⚠ Unlike
+    // `newExprPositionalBindings_`'s `new`-site half, the WRITE here CAN
+    // reach a reparsed dependency body: `a += b` / `t++` inside an imported
+    // generic method/ctor/dtor body populates `freshCtx.stmtOperatorSymbols_`
+    // exactly as it would the driver's own context, because
+    // `ExprTypecheck.cpp`'s resolution runs unconditionally inside
+    // `typecheckExpressions`. It is the READ, not the write, that never
+    // reaches it: `checkPureBodies` walks only `ctx.module()`'s own declared
+    // types (`forEachTypeAndNested`), never a dependency's re-parsed AST, so
+    // `freshCtx`'s copy of this table is never consulted by anything. See
+    // the `semacontext_ast_side_table_snapshot_test.cpp` entry for the full
+    // argument, including a pre-existing, orthogonal gap this exposes for
+    // generic pure methods.
     void setStmtOperatorSymbol(const ast::Stmt* s, Symbol* sym) {
         stmtOperatorSymbols_[s] = sym;
     }
