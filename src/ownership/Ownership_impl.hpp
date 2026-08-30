@@ -1149,6 +1149,23 @@ private:
     // `states_` and `fieldMovedFrom_` (the lambda body is its own scope) and
     // descends into the lambda's stmts and any nested lambdas.
     void applyUsingVarBorrowPinInLambdaBody(const ast::LambdaExpr& lam);
+    // fix #3571 (§28.3 SB01-B / §31.1, v0.286): the ONE traversal reaching
+    // every `return E;` statement in a body without crossing a nested lambda
+    // (a pure statement walk never enters a lambda body, which lives inside a
+    // LambdaExpr expression) — the 7 statement forms `ReturnStmt`, `IfStmt`
+    // (`ifBranch.body` + `elifBranches` + `elseBody`), `WhileStmt`, `ForStmt`,
+    // `DoEndBlock`, `TryStmt` (`body` + `catches[].body` + `finallyBody`), and
+    // `CaseStmt` (`arms[].stmts`). Previously hand-copied three times —
+    // `collectReturnDirectLambdas`, the local `scanReturns` inside
+    // `checkOneLambdaTaskFamilyBorrowReturn`, and `scanCatchBorrowClosureReturns`
+    // — differing only in the leaf action; `fn` is that leaf, invoked once per
+    // `return`'s VALUE expression (never called when `rs->value` is null, i.e.
+    // a bare `return;`). One place to add a statement form; one place to decide
+    // a future `CaseArmBodyKind::Expression` arm (this walk, like all three
+    // copies before it, reaches only `arm.stmts`, not `arm.exprBody` — #3571).
+    void scanReturnsIn(
+        const ast::Stmt& s,
+        const std::function<void(const ast::Expr&)>& fn) const;
     // §28.3 SB01-B (#1929): collect the lambdas that are the DIRECT value of a
     // `return E;` in a block body (mirroring the return traversal), so the block
     // driver can apply the enclosing declared return type only to those.
@@ -1429,11 +1446,10 @@ private:
     void checkClosureEscapesOnReturn(const ast::Expr& e,
                                      bool catchBorrowLegOnly = false);
 
-    // Per-statement walker for `checkCatchBorrowClosureEscapesInOneLambda`:
-    // reaches every `return E;` in one lambda body without crossing a nested
-    // lambda (a nested lambda's returns belong to it and are reached when the
-    // flat collect list gets to it). Mirrors `collectReturnDirectLambdas`
-    // node-for-node.
+    // Per-statement driver for `checkCatchBorrowClosureEscapesInOneLambda`:
+    // fires `checkClosureEscapesOnReturn` on every `return E;` reachable in one
+    // lambda body without crossing a nested lambda. fix #3571: a thin
+    // `scanReturnsIn` wrapper — was its own copy of the traversal.
     void scanCatchBorrowClosureReturns(const ast::Stmt& s);
 
 

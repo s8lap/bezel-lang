@@ -7325,62 +7325,76 @@ void MethodOwnership::checkLambdaTaskFamilyBorrowReturns(
             *lam, returnDirect.count(lam) ? expectedReturnFnType : nullptr);
 }
 
-// §28.3 SB01-B (v0.190, #1929): collect every lambda that is the DIRECT value
-// of a `return E;` statement reachable in this body without crossing a nested
-// lambda (a pure statement walk never enters a lambda body, which lives inside
-// a LambdaExpr expression). Mirrors the block driver's own return traversal
-// (`scanReturns` in checkOneLambdaTaskFamilyBorrowReturn) node-for-node, so it
-// reaches exactly the returns that walk classifies. // per §28.3 SB01-B
-void MethodOwnership::collectReturnDirectLambdas(
+// fix #3571 (§28.3 SB01-B / §31.1, v0.286): the ONE traversal reaching every
+// `return E;` statement in a body without crossing a nested lambda (a pure
+// statement walk never enters a lambda body, which lives inside a LambdaExpr
+// expression). `fn` is invoked once per `return`'s VALUE expression (a bare
+// `return;` — `rs->value == nullptr` — is not visited at all). See the
+// declaration in Ownership_impl.hpp for the full rationale and the 7
+// statement forms; this replaces the three node-for-node-identical copies
+// (`collectReturnDirectLambdas`, `checkOneLambdaTaskFamilyBorrowReturn`'s
+// local `scanReturns`, and `scanCatchBorrowClosureReturns`) that used to
+// each hand-walk this shape.
+void MethodOwnership::scanReturnsIn(
         const ast::Stmt& s,
-        std::unordered_set<const ast::LambdaExpr*>& out) const {
+        const std::function<void(const ast::Expr&)>& fn) const {
     if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&s)) {
-        if (rs->value)
-            if (auto* lam =
-                    dynamic_cast<const ast::LambdaExpr*>(rs->value.get()))
-                out.insert(lam);
+        if (rs->value) fn(*rs->value);
         return;
     }
     if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&s)) {
         for (const auto& bs : ifs->ifBranch.body)
-            if (bs) collectReturnDirectLambdas(*bs, out);
+            if (bs) scanReturnsIn(*bs, fn);
         for (const auto& el : ifs->elifBranches)
             for (const auto& bs : el.body)
-                if (bs) collectReturnDirectLambdas(*bs, out);
+                if (bs) scanReturnsIn(*bs, fn);
         for (const auto& bs : ifs->elseBody)
-            if (bs) collectReturnDirectLambdas(*bs, out);
+            if (bs) scanReturnsIn(*bs, fn);
         return;
     }
     if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&s)) {
         for (const auto& bs : ws->body)
-            if (bs) collectReturnDirectLambdas(*bs, out);
+            if (bs) scanReturnsIn(*bs, fn);
         return;
     }
     if (auto* fs = dynamic_cast<const ast::ForStmt*>(&s)) {
         for (const auto& bs : fs->body)
-            if (bs) collectReturnDirectLambdas(*bs, out);
+            if (bs) scanReturnsIn(*bs, fn);
         return;
     }
     if (auto* db = dynamic_cast<const ast::DoEndBlock*>(&s)) {
         for (const auto& bs : db->body)
-            if (bs) collectReturnDirectLambdas(*bs, out);
+            if (bs) scanReturnsIn(*bs, fn);
         return;
     }
     if (auto* trys = dynamic_cast<const ast::TryStmt*>(&s)) {
         for (const auto& bs : trys->body)
-            if (bs) collectReturnDirectLambdas(*bs, out);
+            if (bs) scanReturnsIn(*bs, fn);
         for (const auto& arm : trys->catches)
-            if (arm.body) collectReturnDirectLambdas(*arm.body, out);
+            if (arm.body) scanReturnsIn(*arm.body, fn);
         for (const auto& bs : trys->finallyBody)
-            if (bs) collectReturnDirectLambdas(*bs, out);
+            if (bs) scanReturnsIn(*bs, fn);
         return;
     }
     if (auto* cs = dynamic_cast<const ast::CaseStmt*>(&s)) {
         for (const auto& arm : cs->arms)
             for (const auto& bs : arm.stmts)
-                if (bs) collectReturnDirectLambdas(*bs, out);
+                if (bs) scanReturnsIn(*bs, fn);
         return;
     }
+}
+
+// §28.3 SB01-B (v0.190, #1929): collect every lambda that is the DIRECT value
+// of a `return E;` statement reachable in this body without crossing a nested
+// lambda. fix #3571: a thin `scanReturnsIn` leaf — was its own copy of the
+// traversal. // per §28.3 SB01-B
+void MethodOwnership::collectReturnDirectLambdas(
+        const ast::Stmt& s,
+        std::unordered_set<const ast::LambdaExpr*>& out) const {
+    scanReturnsIn(s, [&out](const ast::Expr& re) {
+        if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(&re))
+            out.insert(lam);
+    });
 }
 
 // §28.3 SB01-B (v0.190, #1919): the `=>` expression-body sibling — an
@@ -7464,56 +7478,14 @@ void MethodOwnership::checkCatchBorrowClosureEscapesInOneLambda(
         if (s) scanCatchBorrowClosureReturns(*s);
 }
 
-// Mirrors `collectReturnDirectLambdas` node-for-node so this walk reaches
-// exactly the returns that traversal classifies — including a `try`/`catch`
-// arm body, which is the shape this fix exists for. // per §31.1 v0.283
+// fix #3571: a thin `scanReturnsIn` leaf, firing `checkClosureEscapesOnReturn`
+// on every `return`'s value — including a `try`/`catch` arm body, which is
+// the shape this fix exists for. Was its own copy of the traversal, mirroring
+// `collectReturnDirectLambdas` node-for-node. // per §31.1 v0.283
 void MethodOwnership::scanCatchBorrowClosureReturns(const ast::Stmt& s) {
-    if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&s)) {
-        if (rs->value)
-            checkClosureEscapesOnReturn(*rs->value,
-                                        /*catchBorrowLegOnly=*/true);
-        return;
-    }
-    if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&s)) {
-        for (const auto& bs : ifs->ifBranch.body)
-            if (bs) scanCatchBorrowClosureReturns(*bs);
-        for (const auto& el : ifs->elifBranches)
-            for (const auto& bs : el.body)
-                if (bs) scanCatchBorrowClosureReturns(*bs);
-        for (const auto& bs : ifs->elseBody)
-            if (bs) scanCatchBorrowClosureReturns(*bs);
-        return;
-    }
-    if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&s)) {
-        for (const auto& bs : ws->body)
-            if (bs) scanCatchBorrowClosureReturns(*bs);
-        return;
-    }
-    if (auto* fs = dynamic_cast<const ast::ForStmt*>(&s)) {
-        for (const auto& bs : fs->body)
-            if (bs) scanCatchBorrowClosureReturns(*bs);
-        return;
-    }
-    if (auto* db = dynamic_cast<const ast::DoEndBlock*>(&s)) {
-        for (const auto& bs : db->body)
-            if (bs) scanCatchBorrowClosureReturns(*bs);
-        return;
-    }
-    if (auto* trys = dynamic_cast<const ast::TryStmt*>(&s)) {
-        for (const auto& bs : trys->body)
-            if (bs) scanCatchBorrowClosureReturns(*bs);
-        for (const auto& arm : trys->catches)
-            if (arm.body) scanCatchBorrowClosureReturns(*arm.body);
-        for (const auto& bs : trys->finallyBody)
-            if (bs) scanCatchBorrowClosureReturns(*bs);
-        return;
-    }
-    if (auto* cs = dynamic_cast<const ast::CaseStmt*>(&s)) {
-        for (const auto& arm : cs->arms)
-            for (const auto& bs : arm.stmts)
-                if (bs) scanCatchBorrowClosureReturns(*bs);
-        return;
-    }
+    scanReturnsIn(s, [this](const ast::Expr& re) {
+        checkClosureEscapesOnReturn(re, /*catchBorrowLegOnly=*/true);
+    });
 }
 
 void MethodOwnership::checkLambdaTaskFamilyBorrowReturnsExpr(
@@ -8457,58 +8429,10 @@ void MethodOwnership::checkOneLambdaTaskFamilyBorrowReturn(
     }
     // Block body: check every `return EXPR` reachable without crossing a nested
     // lambda. A nested lambda's returns belong to it and are checked when the
-    // collector reaches it separately; a pure statement walk never enters a
-    // nested lambda body (those live inside a LambdaExpr, an expression).
-    // // per §28.3
-    std::function<void(const ast::Stmt&)> scanReturns =
-        [&](const ast::Stmt& s) {
-            if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&s)) {
-                if (rs->value) classifyReturn(*rs->value);
-                return;
-            }
-            if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&s)) {
-                for (const auto& bs : ifs->ifBranch.body)
-                    if (bs) scanReturns(*bs);
-                for (const auto& el : ifs->elifBranches)
-                    for (const auto& bs : el.body)
-                        if (bs) scanReturns(*bs);
-                for (const auto& bs : ifs->elseBody)
-                    if (bs) scanReturns(*bs);
-                return;
-            }
-            if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&s)) {
-                for (const auto& bs : ws->body)
-                    if (bs) scanReturns(*bs);
-                return;
-            }
-            if (auto* fs = dynamic_cast<const ast::ForStmt*>(&s)) {
-                for (const auto& bs : fs->body)
-                    if (bs) scanReturns(*bs);
-                return;
-            }
-            if (auto* db = dynamic_cast<const ast::DoEndBlock*>(&s)) {
-                for (const auto& bs : db->body)
-                    if (bs) scanReturns(*bs);
-                return;
-            }
-            if (auto* trys = dynamic_cast<const ast::TryStmt*>(&s)) {
-                for (const auto& bs : trys->body)
-                    if (bs) scanReturns(*bs);
-                for (const auto& arm : trys->catches)
-                    if (arm.body) scanReturns(*arm.body);
-                for (const auto& bs : trys->finallyBody)
-                    if (bs) scanReturns(*bs);
-                return;
-            }
-            if (auto* cs = dynamic_cast<const ast::CaseStmt*>(&s)) {
-                for (const auto& arm : cs->arms)
-                    for (const auto& bs : arm.stmts)
-                        if (bs) scanReturns(*bs);
-                return;
-            }
-        };
+    // collector reaches it separately. fix #3571: `scanReturnsIn` is the
+    // shared traversal — was its own copy here. // per §28.3
     for (const auto& s : lam.stmts)
-        if (s) scanReturns(*s);
+        if (s) scanReturnsIn(*s, classifyReturn);
 }
 
 // §28.3 (v0.180, #1547): a STATIC method has no receiver, so the borrow-
