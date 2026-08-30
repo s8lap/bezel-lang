@@ -1785,10 +1785,6 @@ llvm::Function* Emitter::genericInstEnsureInitFn(
         *module_, i64(), /*isConstant=*/false,
         llvm::GlobalValue::LinkOnceODRLinkage,
         llvm::ConstantInt::get(i64(), 0), "bz$" + base + "$initowner");
-    genericInstInitStateGV_[key] = stateGV;
-    genericInstInitExcGV_[key] = excGV;
-    genericInstInitOwnerGV_[key] = ownerTidGV;
-
     auto* voidFnTy = llvm::FunctionType::get(
         llvm::Type::getVoidTy(llvm_), {}, /*isVarArg=*/false);
     auto* fn = llvm::Function::Create(

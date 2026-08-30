@@ -2321,7 +2321,7 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
 
     // --- Dispose(ptr self) -> void ---
     // §29.7 (#623): Declare now so the vtable can reference it; real body is
-    // emitted after Resume emission (once smIterFinallyAtState_ is populated).
+    // emitted after Resume emission (once smIterCleanupAtState_ is populated).
     auto* disposeFn = llvm::Function::Create(
         llvm::FunctionType::get(llvm::Type::getVoidTy(llvm_), {ptrTy()}, false),
         llvm::Function::InternalLinkage, prefix + "Dispose", module_.get());
@@ -2683,9 +2683,6 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
         disposeStack_.clear(); loopStack_.clear(); finallyStack_.clear();
         // §29.7 (#623): clear the finally-chain tracking for this async iterator.
         finallyBodyStack_.clear();
-        smIterFinallyAtState_.clear();
-        smIterDisposalsAtState_.clear();  // #821 (async)
-        smIterEnumFramesAtState_.clear();  // §29.7 (#944): no stale entries
         smIterCleanupAtState_.clear();     // fix #1567: no stale unified entries
         smIterEnumFrameSlot_.clear();      // §29.7 (#944)
         propagateBB_ = nullptr; unwindTarget_ = nullptr;
@@ -2711,9 +2708,9 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
         // fix argues in full (LlvmBackend_Iterators.cpp emitIteratorMethod): the
         // bind and the scope-end release of a local declared inside the yielding
         // loop land in consecutive ADVANCES, one each, and the abandonment path
-        // is covered by the yield handler's smIterCleanupAtState_/
-        // smIterDisposalsAtState_ snapshot, which the async Dispose replays with
-        // the frame locals restored. // per §29.7, §30.7
+        // is covered by the yield handler's smIterCleanupAtState_ snapshot
+        // (issue 3579), which the async Dispose replays with the frame locals
+        // restored. // per §29.7, §30.7
         collectStringReleaseEligible(*ci.stmts);
         stringReleaseEligibleFn_ = resumeFn;
         // narrow #3553 / #422 / §27.5 / §28.9 / §30.7: one more member of the
@@ -2960,9 +2957,10 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
             // #821 / §29.7 (async): on NORMAL completion (the async iterator body
             // runs off its end), dispose the `using var` resources still active
             // at the end before reporting done. The abandonment path — Dispose
-            // while suspended at a yield — is handled by smIterDisposalsAtState_
-            // in the Dispose body below. State is set to -1 so a later advance /
-            // Dispose stays a no-op → each resource is disposed exactly once.
+            // while suspended at a yield — is handled by smIterCleanupAtState_
+            // (issue 3579) in the Dispose body below. State is set to -1 so a
+            // later advance / Dispose stays a no-op → each resource is disposed
+            // exactly once.
             emitDisposals(disposeStack_.back());
             // fix #2627 / §29.1 v0.236: dispose-then-null current_val before
             // marking state -1 on normal completion. Reachable via the manual
@@ -3005,7 +3003,7 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
     }
 
     // --- Dispose(ptr self) -> void (real body, §29.7 #623) ---
-    // Emitted after Resume so smIterFinallyAtState_ is populated.
+    // Emitted after Resume so smIterCleanupAtState_ is populated.
     // §29.7: runs finally clauses active at the suspension point, then frees
     // the spill area and the frame.  Finally bodies are run synchronously
     // (await-in-finally-on-Dispose is not yet supported; §29.7 allows the
@@ -3436,9 +3434,6 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
             emitFreeAndReturn();
         }
 
-        smIterFinallyAtState_.clear();
-        smIterDisposalsAtState_.clear();  // #821
-        smIterEnumFramesAtState_.clear();  // §29.7 (#944)
         smIterCleanupAtState_.clear();     // fix #1567 §29.7/§28.10 (v0.182)
         smIterEnumFrameSlot_.clear();      // §29.7 (#944)
         finallyBodyStack_.clear();

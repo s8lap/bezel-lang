@@ -3614,73 +3614,22 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 }
             }
             unsigned nextState = ++smNextSuspendState_;
-            // §29.7 (#623): snapshot the active finally-body chain so the
-            // Dispose function can re-run finally clauses when the iterator
-            // is disposed while suspended at this yield point.  The state
-            // index stored in the frame when the consumer resumes from this
-            // yield is `nextState`; Dispose switches on that value.
-            if (!finallyBodyStack_.empty()) {
-                smIterFinallyAtState_[nextState] =
-                    std::vector<const std::vector<std::unique_ptr<ast::Stmt>>*>(
-                        finallyBodyStack_.begin(), finallyBodyStack_.end());
-            }
-            // #821 / §29.7: snapshot the `using var` (owned-resource) disposals
-            // active at this yield so Dispose can run them when the iterator is
-            // disposed while suspended here. Each using-var local is spilled to
-            // the frame and restored in Dispose; record its decl node (reverse-
-            // mapped from the Disposal's slot) so Dispose can rebind the slot.
-            // Skip non-using-var entries: caught-exception borrows (never live
-            // across a yield) and unwind-only plain-`var` owned locals (§29.7
-            // disposes using-var only). Outermost-first; Dispose runs in reverse.
-            {
-                std::vector<std::pair<const ast::Node*, Disposal>> active;
-                // §29.7 (#944): for-in implicit enumerator/source frames active
-                // here (iterEnumDispose disposals wired to a frame field). They
-                // have no decl node, so they are tracked by FRAME FIELD INDEX in a
-                // parallel map; Dispose GEPs the field and disposes via slot 1.
-                std::vector<unsigned> activeFrames;
-                for (const auto& level : disposeStack_) {
-                    for (const Disposal& d : level) {
-                        if (d.caughtException || d.unwindOnly) continue;
-                        if (d.iterEnumDispose) {
-                            auto* a = llvm::dyn_cast_or_null<llvm::AllocaInst>(
-                                d.slot);
-                            auto fit = a ? smIterEnumFrameSlot_.find(a)
-                                         : smIterEnumFrameSlot_.end();
-                            if (a && fit != smIterEnumFrameSlot_.end()) {
-                                activeFrames.push_back(fit->second);
-                                continue;  // tracked by field, not by node
-                            }
-                            // An iterEnumDispose with no frame field (e.g. a
-                            // for-in not inside this suspending iterator body)
-                            // cannot be live across this yield — skip.
-                            continue;
-                        }
-                        const ast::Node* node = nullptr;
-                        for (const auto& [n, s] : locals_)
-                            if (s == d.slot) { node = n; break; }
-                        if (node) active.emplace_back(node, d);
-                    }
-                }
-                if (!active.empty())
-                    smIterDisposalsAtState_[nextState] = std::move(active);
-                if (!activeFrames.empty())
-                    smIterEnumFramesAtState_[nextState] = std::move(activeFrames);
-            }
             // fix #1567 / §29.7/§28.10 (v0.182): build the ONE establishment-
             // ordered cleanup stack for this suspend state — using-var disposals,
             // for-in enumerator-frame disposals, and finally bodies in the single
-            // order they were established. The SYNC iterator Dispose consumes this
-            // and runs it in exact reverse (§28.10: one establishment-ordered
-            // stack, no category-ordered phases); the category-split maps above
-            // remain for the async iterator Dispose (a separate follow-up). A
-            // finally established when the dispose-stack had depth d sits, in
-            // establishment order, immediately before scope d (after every scope
-            // < d, before every scope >= d), so early Dispose runs it AFTER its
-            // own try body's using-var disposals and BEFORE the enclosing scopes'
-            // — reverse establishment, matching the exception edge. finallyStack_
-            // is outermost-first (increasing disposeDepthAtEntry) and parallel to
-            // finallyBodyStack_.
+            // order they were established. Both the SYNC iterator Dispose and
+            // (since fix #1598) the ASYNC iterator Dispose consume this SAME map
+            // (`smIterCleanupAtState_`) and run it in exact reverse (§28.10: one
+            // establishment-ordered stack, no category-ordered phases; issue
+            // 3579 removed the write-only category-split maps this comment used
+            // to describe as still feeding the async path — they never did,
+            // after #1598). A finally established when the dispose-stack had
+            // depth d sits, in establishment order, immediately before scope d
+            // (after every scope < d, before every scope >= d), so early Dispose
+            // runs it AFTER its own try body's using-var disposals and BEFORE
+            // the enclosing scopes' — reverse establishment, matching the
+            // exception edge. finallyStack_ is outermost-first (increasing
+            // disposeDepthAtEntry) and parallel to finallyBodyStack_.
             {
                 std::vector<IterCleanup> actions;
                 std::size_t finIdx = 0;
@@ -7927,8 +7876,9 @@ bool Emitter::lowerIEnumerableBuiltinFor(const ast::ForStmt& fs) {
     // NOT only the alloca-keyed spill area Dispose cannot reach. Wire the
     // enumerator alloca to that field (smAllocaToField_ → the per-yield spill
     // saves/restores it) and record slot→field in smIterEnumFrameSlot_ so the
-    // yield snapshot logs this frame in smIterEnumFramesAtState_ for every suspend
-    // state inside the loop. The for-in's OWN loop-exit disposal (emitDisposals at
+    // yield snapshot logs this frame's cleanup action into smIterCleanupAtState_
+    // (fix #1567; issue 3579) for every suspend state inside the loop. The
+    // for-in's OWN loop-exit disposal (emitDisposals at
     // endBB) and break/return paths dispose it on a normal exit; the state-machine
     // Dispose disposes it ONLY when suspended inside the loop — exactly once on
     // every exit (discriminated by the suspend state).

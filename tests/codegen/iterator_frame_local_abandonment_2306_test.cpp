@@ -5,9 +5,9 @@
 // §29.7's pass runs "the pending cleanup actions active at the point of
 // suspension … in reverse order of establishment, exactly as if the body had
 // exited at the suspension point". Today the frame-teardown visit recognises
-// only `using var` (#821 / smIterDisposalsAtState_) and the `owned`-parameter
-// state-keyed disposal (#2154 / #2217) — a plain owned `var` L that sema
-// flagged `autoDropAtScopeEnd == false` (it IS discharged by some path,
+// only `using var` (#821 / smIterCleanupAtState_, issue 3579) and the
+// `owned`-parameter state-keyed disposal (#2154 / #2217) — a plain owned `var`
+// L that sema flagged `autoDropAtScopeEnd == false` (it IS discharged by some path,
 // typically `yield return L;` on an owning iterator, #1863) was left without a
 // frame-teardown disposition at all. Abandoning while L is undischarged leaks
 // L; the dispatch must be keyed on the suspension state, plus an "established"

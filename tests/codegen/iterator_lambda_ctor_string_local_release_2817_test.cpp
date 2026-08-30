@@ -583,8 +583,8 @@ const char* kAsyncLambdaSaveRestore =
 // (R) / (S) ABANDONMENT. The consumer `break`s after 3 of 50 elements, 20 times,
 // so the iterator is Disposed while SUSPENDED at a yield and the scope-end
 // release inside MoveNext is never reached. The yield handler snapshots the
-// disposals live at that suspend (smIterCleanupAtState_ / smIterDisposalsAtState_
-// — a Disposal{stringRelease} is neither `caughtException` nor `unwindOnly`, and
+// disposals live at that suspend (smIterCleanupAtState_, issue 3579 — a
+// Disposal{stringRelease} is neither `caughtException` nor `unwindOnly`, and
 // its slot is in locals_, so it IS recorded) and Dispose replays them with the
 // frame locals restored. Exactly once on either exit: Dispose stamps the DISPOSED
 // sentinel so no later MoveNext can resume past the yield. §29.7 / §30.7.

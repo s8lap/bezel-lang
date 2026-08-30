@@ -12203,17 +12203,19 @@ llvm::Function* Emitter::buildSpecializedMethodFn(
     // The CLEAN SLATE the moves used to provide is kept explicitly below: the
     // guard only saves, so the containers the helper must not inherit are
     // cleared by name, exactly the four the moves used to empty. What is NOT on
-    // the frame list (smIterEnumFramesAtState_, smIterCleanupAtState_,
-    // asyncHandlerSpillSlots_) keeps its own move-out save.
+    // the frame list (smIterCleanupAtState_, asyncHandlerSpillSlots_) keeps its
+    // own move-out save.
     SmFrameSaveScope smFrameSave(*this);
     smStateBBs_.clear();
     smLocalFields_.clear();
     smForInSrcFields_.clear();
     smAllocaToField_.clear();
-    auto savedSmIterEnumFrames = std::move(smIterEnumFramesAtState_);
     // fix #1567: preserve the outer iterator's unified establishment-ordered
-    // cleanup snapshot across a nested SM emission (parallel to the enum-frame
-    // save above).
+    // cleanup snapshot across a nested SM emission. (Issue 3579 removed this
+    // save's sibling for the write-only smIterEnumFramesAtState_/
+    // smIterDisposalsAtState_/smIterFinallyAtState_ maps — they never had one,
+    // an asymmetry #3505/#3551 record; deleting the dead maps removes it
+    // rather than requiring a new save to match.)
     auto savedSmIterCleanup = std::move(smIterCleanupAtState_);
     auto savedAsyncHandlerSpill = std::move(asyncHandlerSpillSlots_);
     // #1062: RESET the SM scalars to their fresh top-level values before the
@@ -12484,7 +12486,6 @@ llvm::Function* Emitter::buildSpecializedMethodFn(
     // Restore the caller's state-machine context (#1060 / #1061).
     // fix #3505: the frame itself is restored by smFrameSave's destructor when
     // this function returns; only the members outside it are by hand.
-    smIterEnumFramesAtState_ = std::move(savedSmIterEnumFrames);
     smIterCleanupAtState_ = std::move(savedSmIterCleanup);  // fix #1567
     asyncHandlerSpillSlots_ = std::move(savedAsyncHandlerSpill);
 

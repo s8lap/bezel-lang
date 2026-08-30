@@ -17,8 +17,9 @@
 //
 // Fix: collectSuspendLocals reserves dedicated frame fields for such a for-in's
 // enumerator and loop-owned source; the lowering wires them through those fields
-// and records each live frame per suspend state (smIterEnumFramesAtState_); the
-// iterator Dispose, for a suspend state inside the loop, GEPs the field, loads,
+// and records each live frame's cleanup action per suspend state
+// (smIterCleanupAtState_, issue 3579); the iterator Dispose, for a suspend
+// state inside the loop, GEPs the field, loads,
 // null-guards, dispatches the iterator-vtable slot-1 Dispose, then nulls the
 // field. Exactly once: the loop's OWN scope-exit / break disposal handles every
 // other exit (never both — the suspend state discriminates).

@@ -774,7 +774,7 @@ static void collectYieldStatesForOwnedLocals(
         if (!ok) return;
         if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s.get())) {
             // Only plain (non-`using`) locals are in scope — `using var` has its
-            // own disposal path (#821 / smIterDisposalsAtState_) and an
+            // own disposal path (#821 / smIterCleanupAtState_, issue 3579) and an
             // autoDropAtScopeEnd plain `var` is the affine-never-discharged
             // case whose disposal runs unconditionally at scope end. The type
             // gate (class/interface vs. collection/task/subscription) is
@@ -1248,7 +1248,7 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
 
     // --- Dispose(ptr self) -> void ---
     // §29.7 (#623): the real Dispose is emitted AFTER MoveNext so we know
-    // which yield states have active finally chains (smIterFinallyAtState_).
+    // which yield states have active cleanup actions (smIterCleanupAtState_).
     // Declare the function now so the vtable can reference it; fill the body
     // below after MoveNext emission.
     auto* disposeFn = llvm::Function::Create(
@@ -1527,9 +1527,6 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         disposeStack_.clear(); loopStack_.clear(); finallyStack_.clear();
         // §29.7 (#623): clear the finally-chain tracking for this iterator.
         finallyBodyStack_.clear();
-        smIterFinallyAtState_.clear();
-        smIterDisposalsAtState_.clear();  // #821
-        smIterEnumFramesAtState_.clear();  // §29.7 (#944)
         smIterCleanupAtState_.clear();     // fix #1567 §29.7/§28.10 (v0.182)
         smIterEnumFrameSlot_.clear();      // §29.7 (#944)
         propagateBB_ = nullptr; unwindTarget_ = nullptr;
@@ -1772,9 +1769,10 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
             // #821 / §29.7: on NORMAL completion (the body runs off its end), the
             // `using var` resources active at the end must be disposed before the
             // iterator reports done. (The abandonment path — Dispose while still
-            // suspended at a yield — is handled by smIterDisposalsAtState_ in the
-            // Dispose function below.) State is set to -1 (iteration logically
-            // complete; the frame is STILL ALLOCATED and still owes disposal).
+            // suspended at a yield — is handled by smIterCleanupAtState_ (issue
+            // 3579) in the Dispose function below.) State is set to -1
+            // (iteration logically complete; the frame is STILL ALLOCATED and
+            // still owes disposal).
             // The consumer's subsequent Dispose() proceeds (the Dispose-entry guard
             // tests the disposed sentinel -2, NOT this -1), frees the frame, and
             // disposes owned params — but its state switch hits the default (-1)
@@ -1915,7 +1913,7 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
     }
 
     // --- Dispose(ptr self) -> void (real body, §29.7 #623) ---
-    // Emitted after MoveNext so smIterFinallyAtState_ is populated.
+    // Emitted after MoveNext so smIterCleanupAtState_ is populated.
     // If the iterator was suspended inside a try/finally, run the finally
     // chains (innermost first) before freeing the frame.  A second Dispose
     // is a no-op per §28.2/§29.7: the entry guard tests the DISPOSED sentinel
@@ -2225,7 +2223,8 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         // current_val frame field — BUT ONLY if the enumerator actually owns it
         // (current_val_owned == 1, set when the yielded expression was a `new`).
         // Using-var locals and owned params carry owned==0 and are disposed by
-        // their own mechanisms (smIterDisposalsAtState_ / disposeOwnedParams).
+        // their own mechanisms (smIterCleanupAtState_, issue 3579 /
+        // disposeOwnedParams).
         // Null-guarded: current_val==null ⟹ never yielded / already cleaned up.
         // Runs for BOTH source (disposeOwned=true) and clone (disposeOwned=false)
         // Dispose: the source's current_val is always null (GetEnumerator resets
@@ -2558,9 +2557,6 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
                     /*releaseClosures=*/false);
 
     // Clear the per-iterator finally / disposal tracking.
-    smIterFinallyAtState_.clear();
-    smIterDisposalsAtState_.clear();  // #821
-    smIterEnumFramesAtState_.clear();  // §29.7 (#944)
     smIterCleanupAtState_.clear();     // fix #1567 §29.7/§28.10 (v0.182)
     smIterEnumFrameSlot_.clear();      // §29.7 (#944)
     finallyBodyStack_.clear();

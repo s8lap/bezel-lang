@@ -683,20 +683,6 @@ private:
     const std::vector<ast::ContractClause>* ensuresClauses_ = nullptr;
     std::string ensuresTypeName_;
     std::string ensuresMemberName_;
-    // §22.16 (v0.250, #3038): pointer identity of the synthetic LocalSymbol
-    // sema binds to the contextual keyword `result` inside an `ensures`
-    // clause. Set by sema through `ctx_.setExprSymbol` (the same heap
-    // address is reused across every `result` reference, see
-    // ExprTypecheck_impl.hpp's `syntheticResultLocal`). When the
-    // IdentifierExpr path in lowerExpr sees this symbol it loads from
-    // `ensuresResultSlot_` instead of going through localSlot — the
-    // synthetic symbol has no entry in `locals_` (it is not a declared
-    // local with a stack slot) but it is the §22.16 "borrow of the
-    // returned value" that the existing `ensuresResultSlot_` already
-    // materialises. Null when the currently-emitting function is not a
-    // value-returning method (so a stray `result` outside ensures would
-    // never reach codegen — the sema path rejects it).
-    const sema::LocalSymbol* ensuresResultSymbol_ = nullptr;
     // §22.16 (v0.250, #3038): one frame slot per `old(E)` operand in the
     // currently-armed ensures epilogue. The slot is allocated in the
     // function's entry block by `captureOldOperands` (called from the
@@ -1064,16 +1050,6 @@ private:
     std::map<GenericInstKey, GenericInstArgs> genericInstArgsOf_;
     std::map<GenericInstKey, llvm::Function*> genericInstSfinitFns_;
     std::map<GenericInstKey, llvm::Function*> genericInstEnsureInitFns_;
-    std::map<GenericInstKey, llvm::GlobalVariable*> genericInstInitStateGV_;
-    std::map<GenericInstKey, llvm::GlobalVariable*> genericInstInitExcGV_;
-    // #1513 / #1391 / §22.12 rule 1: per-instantiation owner-thread global —
-    // the per-instantiation counterpart of initOwnerGV_ above, recorded by
-    // whichever thread's CAS wins the 0(uninit)->1(in-progress) claim in
-    // genericInstEnsureInitFn, so a same-thread re-entrant touch (proceed) can
-    // be told apart from a genuine cross-domain touch (block via
-    // bz_static_init_wait) exactly as emitEnsureInitFns does for the per-type
-    // case.
-    std::map<GenericInstKey, llvm::GlobalVariable*> genericInstInitOwnerGV_;
     // Reverse lookup: a per-instantiation static-field global (as returned by
     // staticFieldGlobal) to the (type, typeArgMangle) key that owns it, so a
     // static-access call site can find/build the right ensureinit function
@@ -1920,45 +1896,12 @@ private:
     std::vector<const std::vector<std::unique_ptr<ast::Stmt>>*>
         finallyBodyStack_;
 
-    // §29.7 (#623): per-yield-state → snapshot of the finallyBodyStack_ at
-    // the moment of that yield (outermost first).  Populated at each
-    // `yield return` inside an iterator body; consumed by emitIteratorMethod
-    // to build the real Dispose function.
-    std::unordered_map<unsigned,
-        std::vector<const std::vector<std::unique_ptr<ast::Stmt>>*>>
-        smIterFinallyAtState_;
-
-    // #821 / §29.7: per-yield-state → the `using var` (owned-resource) disposals
-    // active at that yield, recorded as (decl-node, Disposal). The local is
-    // spilled to the frame and restored in Dispose; the recorded decl-node lets
-    // Dispose rebind the Disposal's slot to the restored alloca and run it. This
-    // is the using-var analogue of smIterFinallyAtState_ — §29 says `using var`
-    // compiles to try/finally, but the codegen tracks it via disposeStack_, so
-    // the iterator Dispose needs this parallel record to honour §29.7's "Dispose
-    // every using var active at the point of suspension."
-    std::unordered_map<unsigned,
-        std::vector<std::pair<const ast::Node*, Disposal>>>
-        smIterDisposalsAtState_;
-
-    // §29.7 (#944): per-yield-state → the frame field indices holding live
-    // iterator-format enumerator/source frames (a for-in's GetEnumerator clone
-    // and, for a loop-owned CallExpr/NewExpr iterable, its source IEnumERABLE)
-    // active at that yield. Unlike a `using var` (a named LocalDecl restored via
-    // localFields/locals_), these implicit for-in resources have no decl node, so
-    // they are tracked by FRAME FIELD INDEX directly: the yield snapshot records
-    // the index of each such resource live in the surrounding scope, and the
-    // iterator Dispose (for a suspend state in this map) GEPs the field, loads the
-    // frame ptr, null-guards, and disposes it via iterator-vtable slot 1 (then
-    // nulls the field). This disposes the inner enumerator/source EXACTLY when the
-    // enclosing iterator is abandoned while suspended inside the loop — the loop's
-    // own scope-exit / break disposal handles every other exit (never both,
-    // discriminated by the suspend state). Outermost-first; Dispose runs reverse.
-    std::unordered_map<unsigned, std::vector<unsigned>> smIterEnumFramesAtState_;
     // §29.7 (#944): maps an iterator-format enumerator/source disposal slot
     // (an `iterEnumDispose` Disposal's alloca) → its frame field index, for the
     // for-in resources wired to a dedicated frame field in the current iterator
-    // body. The yield snapshot consults this to record live frames in
-    // smIterEnumFramesAtState_. Reset per iterator body.
+    // body. The yield snapshot consults this to record live frames into
+    // smIterCleanupAtState_ (as an IterCleanup::Kind::EnumFrame entry). Reset
+    // per iterator body.
     std::unordered_map<llvm::AllocaInst*, unsigned> smIterEnumFrameSlot_;
 
     // fix #1567 / §29.7/§28.10 (v0.182): per-yield-state → the ONE
@@ -1973,9 +1916,11 @@ private:
     // and after its own try-body's. The pre-v0.182 code ran all using-var
     // disposals, then all finally bodies (category phases), inverting the order
     // for a finally that touched an enclosing `using var` — a use-after-dispose.
-    // This replaces the three category-split maps above for the SYNC iterator
-    // Dispose; those maps remain for the async-iterator Dispose (its ordering is
-    // tracked as a separate follow-up).
+    // BOTH the sync AND (since fix #1598) the async iterator Dispose consume
+    // this ONE map; issue 3579 deleted the three write-only category-split maps
+    // (smIterFinallyAtState_, smIterDisposalsAtState_, smIterEnumFramesAtState_)
+    // that used to sit above this one and whose comments incorrectly claimed
+    // they still fed the async Dispose.
     struct IterCleanup {
         enum class Kind { Disposal, EnumFrame, Finally };
         Kind kind;
@@ -11018,9 +10963,9 @@ private:
     // instead of a list somebody must remember to maintain: a member added here
     // is cleared AND saved, and a member added to only one of them cannot exist.
     // Anything that is NOT part of the retracted frame (asyncHandlerSpillSlots_,
-    // smIterEnumFramesAtState_, smIterCleanupAtState_, the §30.5 Pattern A
-    // return flags) is deliberately absent: those are saved where they are
-    // needed, by name, because they are not `clearSmFrame()`'s business.
+    // smIterCleanupAtState_, the §30.5 Pattern A return flags) is deliberately
+    // absent: those are saved where they are needed, by name, because they are
+    // not `clearSmFrame()`'s business.
     //
     // The aliases exist only so a member type containing a comma can be passed
     // as a single macro argument.

@@ -1120,10 +1120,11 @@ BEZEL_TEST(codegen_excdisp_821, iterator_two_using_vars_disposed) {
 
 // --------------------------------------------------------------------------
 // [N] §29.7 / §30.7 — the ASYNC iterator sibling of [821]. The async iterator's
-// generated Dispose only re-ran explicit try/finally chains (smIterFinallyAt-
-// State_) and its MoveNextAsync normal-completion path freed the frame without
-// disposing active using-vars → leak. The fix ports the smIterDisposalsAtState_
-// handling (sync iterator's Dispose + normal-completion) into the async path.
+// generated Dispose only re-ran explicit try/finally chains and its
+// MoveNextAsync normal-completion path freed the frame without disposing
+// active using-vars → leak. The fix ports the using-var disposal handling
+// (sync iterator's Dispose + normal-completion; unified onto
+// smIterCleanupAtState_ by fix #1567/#1598, issue 3579) into the async path.
 // --------------------------------------------------------------------------
 
 // Full async iteration to completion: the using-var r is disposed once
@@ -1149,8 +1150,8 @@ BEZEL_TEST(codegen_excdisp_821, async_iterator_using_var_full_iteration_disposed
 }
 
 // Early break: the async consumer stops after the first yield; the async
-// iterator's Dispose disposes the still-active using-var (R.count = 1) via the
-// union of smIterFinallyAtState_ + smIterDisposalsAtState_.
+// iterator's Dispose disposes the still-active using-var (R.count = 1) via
+// smIterCleanupAtState_ (issue 3579).
 const char* kAsyncIterUsingVarEarlyBreak =
     "module M; "
     "class R public static count: int := 0; "
