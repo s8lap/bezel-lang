@@ -310,11 +310,16 @@ bool PureBodyWalker::recordSynthesizedCallIsPure(
     // confirms the call shape.
     if (rec->kind != ast::TypeDeclKind::Record) return false;
     if (outIsSynthesizedRecordMember) *outIsSynthesizedRecordMember = true;
-    if (rec->hasPositionalFields)
+    // fix #3631 (§9.1 / §9.2, v0.286): route through the ONE both-sources
+    // positional-record accessor (see its doc comment in Symbol.hpp) rather
+    // than re-deriving the `hasPositionalFields` / AST-decl-fallback shape
+    // here. BEHAVIOR-FREE: this site already checked `hasPositionalFields`
+    // first with the same `ast::TypeDecl` fallback, so `recordIsPositional`
+    // admits exactly what the inline check admitted, nothing more — pure
+    // mechanical dedup, verified byte-for-byte against the old inline form
+    // before routing (§6b).
+    if (recordIsPositional(rec))
         return isPositionalRecordEqualityBearing(rec, ctx_);
-    if (auto* td = dynamic_cast<const ast::TypeDecl*>(rec->decl))
-        if (td->hasPositionalFields)
-            return isPositionalRecordEqualityBearing(rec, ctx_);
     return isAutoEqualityBearingBodyRecord(rec, ctx_);
 }
 
@@ -406,10 +411,14 @@ bool PureBodyWalker::recordConstructionIsPure(const ast::NewExpr& ne) {
     if (rec->kind != ast::TypeDeclKind::Record) return false;
     // CLASS-IDENTITY: a positional record has a synthesized ctor whose
     // purity is the record-class's auto-hashable classification.
-    const bool isPositional =
-        rec->hasPositionalFields ||
-        (dynamic_cast<const ast::TypeDecl*>(rec->decl) &&
-         dynamic_cast<const ast::TypeDecl*>(rec->decl)->hasPositionalFields);
+    //
+    // fix #3631 (§9.1 / §9.2, v0.286): route through the ONE both-sources
+    // positional-record accessor rather than re-deriving the
+    // `hasPositionalFields` / AST-decl-fallback shape here (see Symbol.hpp's
+    // doc comment on `recordIsPositional`). BEHAVIOR-FREE: this site already
+    // read `hasPositionalFields` first with the identical `ast::TypeDecl`
+    // fallback, so this is a pure mechanical dedup, not a widening (§6b).
+    const bool isPositional = recordIsPositional(rec);
     const std::size_t arity = ne.args.size();
     const ConstructorSymbol* userCtor =
         findUserCtorByArity(rec, arity);

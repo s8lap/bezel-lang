@@ -20069,13 +20069,14 @@ void ExprTC::checkEqualityMemberUseSite(TypeSymbol* targetType,
         // §9.2 (v0.156)/§9.3 (v0.158, #1383): a direct `.Equals(...)`/
         // `.GetHashCode()` on a body / combined-form record that is not
         // auto-hashable and declares no explicit `=`/`<>` overloads is
-        // a compile error. The `positional` flag uses `hasPositionalFields`
-        // first (covers imported records per #501), then falls back to the
-        // local `ast::TypeDecl` for any record that has one.
-        bool positional = targetType->hasPositionalFields;
-        if (!positional)
-            if (auto* td = dynamic_cast<const ast::TypeDecl*>(targetType->decl))
-                positional = td->hasPositionalFields;
+        // a compile error.
+        //
+        // fix #3631 (§9.1 / §9.2, v0.286): the `positional` flag is now the
+        // ONE both-sources accessor (Symbol.hpp's `recordIsPositional`) — it
+        // already covers imported records via `hasPositionalFields` first,
+        // falling back to the local `ast::TypeDecl` for any record that has
+        // one; this call site re-derived exactly that shape inline.
+        bool positional = recordIsPositional(targetType);
         bool isEq = positional
                         ? isPositionalRecordEqualityBearing(targetType, ctx_)
                         : isAutoEqualityBearingBodyRecord(targetType, ctx_);

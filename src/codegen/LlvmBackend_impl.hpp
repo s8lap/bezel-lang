@@ -6014,12 +6014,15 @@ private:
     // One predicate, every caller, so the two sources cannot be read apart
     // again. Mirrors `sema::isAutoEqualityBearingBodyRecord`'s own guard
     // (SymbolCollection.cpp) rather than re-deriving it.
+    //
+    // fix #3631 (§9.1 / §9.2, v0.286): this used to hold its own copy of the
+    // both-sources check (byte-for-byte identical to `sema::recordIsPositional`
+    // in Symbol.hpp/SymbolCollection.cpp) — it predates the sema-side accessor
+    // #3600 promoted. Now delegates, so codegen and sema share ONE body, not
+    // just one contract; the explicit `sema::` qualifier disambiguates from
+    // this member function of the same name.
     bool recordIsPositional(const sema::TypeSymbol* rec) const {
-        if (!rec) return false;
-        if (rec->hasPositionalFields) return true;
-        if (auto* td = dynamic_cast<const ast::TypeDecl*>(rec->decl))
-            return td->hasPositionalFields;
-        return false;
+        return sema::recordIsPositional(rec);
     }
 
     // §9.1 / §9.2: does `rec` carry the SYNTHESIZED value-semantics package —
