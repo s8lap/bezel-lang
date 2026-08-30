@@ -23,6 +23,17 @@
 
 namespace bezel::common {
 
+// fix #3634 (§22.10 v0.180 / #3205, v0.286) — see the header declaration for
+// the fact/mechanism argument. Relocated VERBATIM from codegen's
+// `Emitter::isCapturedOwnedPrimaryParam` (LlvmBackend_impl.hpp), which is now
+// a one-line delegating wrapper around this — the #2654 pattern. Not one
+// token of the condition changed; this is a behaviour-preserving extraction.
+bool isCapturedOwnedPrimaryParam(const sema::FieldSymbol* fs) {
+    return fs->posParam && fs->parent &&
+           fs->parent->kind == ast::TypeDeclKind::Class &&
+           fs->posParam->modifier == "owned" && !fs->posParamInitRef;
+}
+
 // §28.9 "Trivial-dispose classes" (v0.237) / §22.5 (#1684) — see the header.
 // Relocated VERBATIM from ExprTC::isNonTrivialDisposeClass (#2654); not one
 // line of classification logic changed, so every existing sema consumer keeps
@@ -111,22 +122,24 @@ bool isNonTrivialDisposeClass(const sema::TypeSymbol* decl,
                 break;
             }
             if (fs->posParam) {
-                // fix #3205 (§22.10 v0.254): mirror the codegen
-                // isCapturedOwnedPrimaryParam predicate widening — gate on
-                // `!posParamInitRef` only, so a NEVER-referenced `owned`
-                // primary-ctor parameter is also counted as non-trivial-
-                // dispose storage here. See the codegen predicate's comment
-                // for the four-case truth table. Walked AFTER the inline-
-                // array arm above so a primary-ctor parameter whose type
+                // fix #3205 (§22.10 v0.254) / fix #3634: `isCapturedOwnedPrimaryParam`
+                // (declared above) is the widened `!posParamInitRef`-only gate,
+                // so a NEVER-referenced `owned` primary-ctor parameter is also
+                // counted as non-trivial-dispose storage here. See that
+                // predicate's declaration comment for the fact/mechanism
+                // argument and #3205's four-case truth table. Walked AFTER the
+                // inline-array arm above so a primary-ctor parameter whose type
                 // is `[N owned]T?` is also caught (#2666); record positional
                 // fields skip the inline-array leg via `fieldAstTy == null`
                 // for the `record` parent (their type resolves to the
                 // param's type, but the inline-array arm above rejects first
                 // for owning records — rejected separately).
-                if (fs->parent &&
-                    fs->parent->kind == ast::TypeDeclKind::Class &&
-                    fs->posParam->modifier == "owned" &&
-                    !fs->posParamInitRef) {
+                //
+                // Before #3634 this repeated the condition inline
+                // (character-identical to codegen's own copy); it now calls
+                // the ONE shared predicate both consumers share, so a future
+                // widening of one edits both from a single site.
+                if (isCapturedOwnedPrimaryParam(fs)) {
                     reject = true;
                     break;
                 }

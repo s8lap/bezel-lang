@@ -29,6 +29,7 @@
 #include "codegen/LlvmBackend.hpp"
 #include "common/BuiltinRegistry.hpp"  // #1414 stage 3: builtin name registry
 #include "common/IntLiteral.hpp"       // #2936: the one integer-literal parser
+#include "common/OwnershipFacts.hpp"   // fix #3634: common::isCapturedOwnedPrimaryParam
 #include "sema/SemaContext.hpp"
 #include "sema/TypeResolution.hpp"  // typeRefEqual — §2.8.3 rule 4 exact type identity
 #include "sema/GenericParams.hpp"  // fix #3530: sema::genericParamNames (both-sources walk, #3143)
@@ -9595,11 +9596,16 @@ private:
     // dropping" surface, and the spec's intent excludes it. The §22.10
     // enumeration gap is filed as a spec amendment candidate (gh issue,
     // parent #3205).
+    //
+    // fix #3634: this is now a one-line delegating wrapper around
+    // `common::isCapturedOwnedPrimaryParam` (OwnershipFacts.hpp/.cpp) — the
+    // #2654 pattern — so this classification test and the inline arm inside
+    // `common::isNonTrivialDisposeClass` (which used to carry the identical
+    // condition, verbatim, per #3205) share ONE body. See that header's
+    // fix-#3634 comment for the fact/mechanism argument settling why the
+    // shared body lives in `common` rather than only here.
     static bool isCapturedOwnedPrimaryParam(const sema::FieldSymbol* fs) {
-        return fs->posParam && fs->parent &&
-               fs->parent->kind == ast::TypeDeclKind::Class &&
-               fs->posParam->modifier == "owned" &&
-               !fs->posParamInitRef;
+        return common::isCapturedOwnedPrimaryParam(fs);
     }
 
     // §22.10 (v0.180) / #1594: the resolved declared type of a captured `owned`

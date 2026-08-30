@@ -28,6 +28,18 @@
 //     Pop/Dequeue-on-`OwningStack`/`OwningQueue` and TakeCurrent-on-owning-
 //     enumerator guards below are per-method operand pairings, NOT a reusable
 //     name table, so they stay inline — see OwnershipFacts.cpp.)
+//   * fix #3634: a predicate is SHAPE, not MECHANISM, when it is a pure read
+//     of a Symbol/AST node's OWN fields (no Emitter state, no LLVM type, no
+//     disposerFns_/vtable-slot/unwind lookup) and answers a yes/no
+//     CLASSIFICATION question about that node — "is this a captured `owned`
+//     primary-ctor param slot?", not "which function/slot implements it?".
+//     That a shape fact is later CONSUMED by a mechanism decision (which
+//     capture slot to allocate, which vtable route to install) does not
+//     retroactively make the fact itself mechanism — by that reading almost
+//     every predicate in this file would qualify, since codegen consumes all
+//     of them.  `isCapturedOwnedPrimaryParam` (below, added by #3634) is the
+//     worked example: it takes only a `FieldSymbol*` and touches none of the
+//     mechanism state named above.
 //
 // Phase A is a BEHAVIOUR-PRESERVING extraction: every classification result is
 // byte-identical to the pre-refactor wrappers.  The drift fixes (#1388, #1415)
@@ -57,6 +69,7 @@ class SemaContext;
 struct TypeRef;
 struct Symbol;
 struct TypeSymbol;
+struct FieldSymbol;
 }  // namespace bezel::sema
 
 namespace bezel::common {
@@ -136,15 +149,38 @@ using TypeParamResolver =
 // in BOTH directions on real inputs; its own comment is the record of why.
 // See #3588 for the full per-copy exclusion diff.
 //
-// ONE ARM of this predicate is still spelled twice: the captured `owned`
-// primary-ctor parameter test (§22.10) is character-identical to codegen's
-// `Emitter::isCapturedOwnedPrimaryParam` (LlvmBackend_impl.hpp), whose own
-// comment says the two "must agree" because a captured slot is
-// non-trivial-dispose exactly when its generated Dispose has a slot to walk
-// (#3205's measured leak).  #3588 did NOT collapse that pair, because moving
-// the codegen predicate here would cross this file's own MECHANISM/EXPRESSION-
-// SHAPE boundary (lines 22-25) and that is a decision to argue, not to take in
-// passing.  Filed with the shape and the boundary question as issue 3634.
+// fix #3634 (§22.10 / §28.9, v0.286): the captured `owned` primary-ctor
+// parameter arm below used to be a SECOND spelling of codegen's
+// `Emitter::isCapturedOwnedPrimaryParam` (LlvmBackend_impl.hpp) — character-
+// identical, per #3205's own comment there, because a captured slot is
+// non-trivial-dispose EXACTLY when its generated Dispose has a slot to walk:
+// the trivial-dispose verdict and the capture decision are the same fact
+// asked twice.  #3588 declined to collapse the pair in passing, because doing
+// so silently would cross this file's own MECHANISM/EXPRESSION-SHAPE boundary
+// (lines 22-25 as they stood then) without arguing it — filed as issue 3634.
+//
+// THE ARGUMENT (settling 3634): `isCapturedOwnedPrimaryParam` below is FACT,
+// not MECHANISM.  It reads exactly `fs->posParam`, `fs->parent->kind`,
+// `fs->posParam->modifier` and `fs->posParamInitRef` — four AST/Symbol-level
+// fields on the argument itself.  It touches no Emitter state, no LLVM type,
+// no disposerFns_, no vtable/itable slot, no unwind bookkeeping — none of the
+// MECHANISM vocabulary lines 22-25 name.  What codegen does with the answer
+// (allocate a capture field, walk it in the generated Dispose, choose a
+// runtime-vs-vtable Dispose route) IS mechanism and stays entirely in
+// codegen; only the classification test — "is this FieldSymbol a captured
+// `owned` primary-ctor param?" — moves here, exactly the shape this core
+// already holds for every other classification in this file (including its
+// OWN prior copy of this same arm, two paragraphs below, which was already
+// living in `common` unnamed before this fix gave it a name).  So naming and
+// sharing it does not newly cross the boundary: the boundary comment above
+// (see the #3634 bullet) is amended to say so explicitly, so a future
+// predicate can be checked against the same worked example rather than
+// re-litigating the question.
+//
+// `capturedOwnedPrimaryParamType` (codegen, LlvmBackend_impl.hpp) is
+// DELIBERATELY NOT moved alongside it: it calls `ctx_.resolvedType(...)`, an
+// Emitter/SemaContext operation with no argument-only equivalent here, so it
+// stays exactly where the #3205 comment already puts it.
 //
 // Cycle-guarded (mirrors the #1624 precedent) so a malformed base-type graph
 // that survives error recovery cannot hang the compiler.
@@ -188,6 +224,18 @@ enum class ImportedDisposeVerdict { Consult, Ignore };
 bool isNonTrivialDisposeClass(
     const sema::TypeSymbol* decl,
     ImportedDisposeVerdict importedVerdict = ImportedDisposeVerdict::Consult);
+
+// fix #3634 (§22.10 v0.180 / #3205, v0.286): is `fs` a captured `owned`
+// CLASS primary-constructor parameter — one whose value is NOT consumed by
+// an owned-field initializer or the inheritance clause's base call
+// (`!posParamInitRef`), and therefore flows into a compiler-generated
+// `owned` capture field that the generated `Dispose()` (§28.4) must walk?
+// See the isNonTrivialDisposeClass comment above ("fix #3634") for the
+// fact/mechanism argument that settles why this lives here rather than
+// staying codegen-only, and `Emitter::isCapturedOwnedPrimaryParam`
+// (LlvmBackend_impl.hpp) — now a one-line delegating wrapper, the #2654
+// pattern — for the codegen consumer and #3205's leak history.
+bool isCapturedOwnedPrimaryParam(const sema::FieldSymbol* fs);
 
 // Shared shape-recognition: if the callee of `call` resolves to a user
 // `ast::MethodDecl` (a MethodSymbol whose `decl` is a MethodDecl), return it;
