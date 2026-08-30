@@ -133,6 +133,36 @@ BEZEL_TEST(builtin_registry_snapshot, sync_iter_format_enumerable_head_set) {
     for (auto n : kSnapshot) BEZEL_EXPECT_TRUE(isIterFormatEnumerableHead(n));
 }
 
+// --- isSyncOwningIterableInterfaceHead (#3606, §29.1/§29.3): the SYNCHRONOUS
+//     half of isOwningIterableInterfaceHead — the two owning iterator-method
+//     RETURN heads (producer side), a different §29 family from the
+//     isSyncIterFormatEnumerableHead pair above (the §29.2 for-in SOURCE
+//     protocol, consumer side; see #3606's issue body on why these are not
+//     unified together). NOT a migration snapshot — new with #3606, which
+//     retired the two hand-written `retName == "IOwningEnumerable" ||
+//     retName == "IOwningEnumerator"` copies in LlvmBackend_Iterators.cpp.
+//     The negatives carry the load: the two ASYNC owning heads must stay OUT
+//     (they take `await for` / the async iterator emitter in
+//     LlvmBackend_Async.cpp, a disjoint lowering path) and the two non-owning
+//     iterable heads must stay OUT (they keep the borrowing/non-destructive
+//     Current contract).
+BEZEL_TEST(builtin_registry_snapshot, sync_owning_iterable_interface_head_set) {
+    static constexpr std::array<std::string_view, 2> kSnapshot = {
+        "IOwningEnumerable", "IOwningEnumerator",
+    };
+    for (auto n : kSnapshot)
+        BEZEL_EXPECT_TRUE(isSyncOwningIterableInterfaceHead(n));
+    // The async owning twins and the two non-owning iterable heads stay out.
+    for (std::string_view n : {"IOwningAsyncEnumerable", "IOwningAsyncEnumerator",
+                               "IEnumerable", "IEnumerator",
+                               "IAsyncEnumerable", "IAsyncEnumerator",
+                               "Task", "OwningTask", "OwningArray",
+                               "Shared", "ChannelSender", ""})
+        BEZEL_EXPECT_FALSE(isSyncOwningIterableInterfaceHead(n));
+    // The sync-owning pair is a subset of the four-name owning-iterable set.
+    for (auto n : kSnapshot) BEZEL_EXPECT_TRUE(isOwningIterableInterfaceHead(n));
+}
+
 // --- isBuiltinForInEnumerableHead (#3468, §29.2, stdlib §4.12–§4.13): the
 //     family gate of the builtin `for-in` desugaring. NOT a migration snapshot
 //     — the table is new with #3468, which retired the two hand-written copies

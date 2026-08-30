@@ -107,6 +107,15 @@ constexpr std::array<std::string_view, 2> kSyncIterFormatEnumerableHeads = {
     "IEnumerable", "IOwningEnumerable",
 };
 
+// fix #3606 / §29.1 / §29.3: the SYNCHRONOUS half of
+// `kOwningIterableInterfaceHeads` above — the two owning iterator-method
+// return heads whose declared shape carries the §29.1 owning contract. The
+// two async owning heads are excluded (they take the async iterator emitter,
+// a disjoint lowering path in `LlvmBackend_Async.cpp`).
+constexpr std::array<std::string_view, 2> kSyncOwningIterableInterfaceHeads = {
+    "IOwningEnumerable", "IOwningEnumerator",
+};
+
 // fix #3468 / §29.2 / stdlib §4.12–§4.13 / §4.5 / §4.14: the SIX iteration-
 // interface heads the §29.2 builtin `for-in` desugaring
 // (`Emitter::lowerIEnumerableBuiltinFor`) handles — the two iterator-format
@@ -683,6 +692,12 @@ bool isIterFormatEnumerableHead(std::string_view head) {
 // The synchronous half of the above. // per §29.2, #3419
 bool isSyncIterFormatEnumerableHead(std::string_view head) {
     return contains(kSyncIterFormatEnumerableHeads, head);
+}
+
+// fix #3606 / §29.1 / §29.3: the synchronous half of
+// `isOwningIterableInterfaceHead` above.
+bool isSyncOwningIterableInterfaceHead(std::string_view head) {
+    return contains(kSyncOwningIterableInterfaceHeads, head);
 }
 
 // fix #3468 / §29.2: the iteration-interface heads the builtin for-in

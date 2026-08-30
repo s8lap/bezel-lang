@@ -964,8 +964,9 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
     // disposeYieldedVal owning-branch, and the owned-local scan below all apply,
     // so the frame implements the §29.1 owning contract. Mirrors the async
     // isOwningIter extension landed under #2591 (IOwningAsyncEnumerator).
-    bool isOwningIter = (retName == "IOwningEnumerable" ||
-                         retName == "IOwningEnumerator");
+    // fix #3606: consult the shared sync-owning-iterable-head authority
+    // instead of a hand-spelled copy of the two-name list.
+    bool isOwningIter = common::isSyncOwningIterableInterfaceHead(retName);
 
     // §29.8 (#2154/#2217): narrow CLONE-DISPOSES-CAPTURES prototype. The
     // ownership pass records a yield state only when the complete body is a
@@ -1107,7 +1108,9 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         elemSemaTy->declaration != nullptr &&
         (elemSemaTy->declaration->kind == ast::TypeDeclKind::Class ||
          elemSemaTy->declaration->kind == ast::TypeDeclKind::Interface)) {
-        if (retName != "IOwningEnumerable" && retName != "IOwningEnumerator")
+        // fix #3606: shared sync-owning-iterable-head authority (see
+        // isOwningIter above) rather than a second hand-spelled copy.
+        if (!common::isSyncOwningIterableInterfaceHead(retName))
             elemIsOwnedClass = true;
     }
     // fix #2738 / §28.3 / §29.2 (v0.282): non-nullable `string` element kind. The

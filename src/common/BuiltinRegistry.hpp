@@ -103,6 +103,21 @@ bool isIterFormatEnumerableHead(std::string_view head);
 // with a synchronous enumerator. // per §29.2 / stdlib §4.12–§4.13, #3419
 bool isSyncIterFormatEnumerableHead(std::string_view head);
 
+// fix #3606 / §29.1 / §29.3: the SYNCHRONOUS half of
+// `isOwningIterableInterfaceHead` — `IOwningEnumerable<T>` and
+// `IOwningEnumerator<T>`, the two owning iterator-method return heads whose
+// declared shape puts the frame under the §29.1 owning contract (TakeCurrent,
+// the disposeYieldedVal owning branch, and the owned-local yield-state scan
+// all apply). The two ASYNC owning heads (`IOwningAsyncEnumerable<T>`,
+// `IOwningAsyncEnumerator<T>`) are deliberately excluded — they take `await
+// for` and the async iterator emitter (`LlvmBackend_Async.cpp`), a disjoint
+// lowering path — as are the two non-owning heads (`IEnumerable<T>`,
+// `IEnumerator<T>`), which keep the borrowing/non-destructive Current
+// contract. Exactly analogous to `isSyncIterFormatEnumerableHead` above,
+// which is the sync half of the sibling (non-owning-restricted) grid
+// question. // per §29.1 / §29.3, #3606
+bool isSyncOwningIterableInterfaceHead(std::string_view head);
+
 // fix #3468 / §29.2 / stdlib §4.12–§4.13 / §4.5 / §4.14: the SIX iteration-
 // interface heads the §29.2 builtin `for-in` desugaring handles —
 // `IEnumerable<T>` and `IOwningEnumerable<T>` (the iterator-format enumerables)
