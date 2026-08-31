@@ -82,19 +82,19 @@ int lowerToObject(const std::string& source, const std::string& objPath) {
     bezel::Lexer lexer(source, diags);
     bezel::Parser parser(lexer, diags);
     auto unit = parser.parseCompilationUnit();
-    if (!unit) return -1;
+    if (!unit) return -2;
     bezel::sema::SemaContext ctx(diags);
     bezel::sema::collectSymbols(*unit, ctx);
     bezel::sema::resolveTypes(*unit, ctx);
     bezel::sema::typecheckExpressions(*unit, ctx);
     bezel::sema::checkDefiniteAssignment(*unit, ctx);
     bezel::ownership::checkOwnership(*unit, ctx);
-    if (diags.hasErrors()) return -1;
+    if (diags.hasErrors()) return -2;
     llvm::LLVMContext llvmCtx;
     auto module = bezel::codegen::emitModule(*unit, ctx, llvmCtx);
-    if (!module) return -1;
+    if (!module) return -2;
     std::string err;
-    if (!bezel::codegen::emitObjectFile(*module, objPath, err)) return -1;
+    if (!bezel::codegen::emitObjectFile(*module, objPath, err)) return -2;
     return 0;
 }
 
@@ -105,7 +105,7 @@ int runUnderAsan(const std::string& source, int expectedExitCode) {
     std::string stem = unique_stem("bezel_549");
     std::string objPath = (dir / (stem + ".o")).string();
     std::string exe     = (dir / stem).string();
-    if (lowerToObject(source, objPath) != 0) return -1;
+    if (lowerToObject(source, objPath) != 0) return -2;
     auto cleanup = [&] {
         std::remove(objPath.c_str());
         std::remove(exe.c_str());
@@ -113,23 +113,27 @@ int runUnderAsan(const std::string& source, int expectedExitCode) {
     std::string linkCmd = "clang++ -fsanitize=address -g " + objPath + " " +
                           rtObj + " -lm -lpthread -lstdc++ -o " + exe +
                           " > /dev/null 2>&1";
-    if (std::system(linkCmd.c_str()) != 0) { cleanup(); return -1; }
+    if (std::system(linkCmd.c_str()) != 0) { cleanup(); return -3; }
     std::string runCmd = "ASAN_OPTIONS=detect_leaks=1:exitcode=99 " + exe +
                          " > /dev/null 2>&1";
     int status = std::system(runCmd.c_str());
     cleanup();
-    if (status == -1) return -1;
+    if (status == -1) return -4;
     if (!WIFEXITED(status)) return 1;
     int code = WEXITSTATUS(status);
     if (code == 99) return 1;
     return (code == expectedExitCode) ? 0 : 1;
 }
 
-// Assert: JIT-correct AND ASan-clean.  Skips ASan leg when toolchain absent.
+// Assert: JIT-correct AND ASan-clean.  Skips ASan leg when toolchain absent;
+// a -2/-3/-4 return from runUnderAsan (test PROGRAM broken — parse/typecheck/
+// emit/link/system()) is a HARD failure: the row must not silently PASS as the
+// indistinguishable-from-toolchain-skip path #3626 closed at the harness level.
 void expectValueAndAsanClean(const std::string& source, int expectedExitCode) {
     BEZEL_EXPECT_EQ(run(source), expectedExitCode);
     int a = runUnderAsan(source, expectedExitCode);
-    if (a == -1) return;
+    if (a == -1) return;          // toolchain unavailable: SKIP (#3626)
+    BEZEL_EXPECT_TRUE(a >= 0);    // -2 program-compile / -3 link / -4 system() → FAIL (#3633)
     BEZEL_EXPECT_EQ(a, 0);
 }
 

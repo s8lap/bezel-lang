@@ -145,12 +145,12 @@ int runUnderAsan(const std::string& source) {
     std::string linkCmd = "clang++ -fsanitize=address -g " + objPath + " " +
                           rtObj + " -lm -lpthread -lstdc++ -o " + exe +
                           " > /dev/null 2>&1";
-    if (std::system(linkCmd.c_str()) != 0) { cleanup(); return -2; }
+    if (std::system(linkCmd.c_str()) != 0) { cleanup(); return -3; }
     std::string runCmd =
         "ASAN_OPTIONS=detect_leaks=1:exitcode=99 " + exe + " > /dev/null 2>&1";
     int status = std::system(runCmd.c_str());
     cleanup();
-    if (status == -1) return -2;
+    if (status == -1) return -4;
     if (WIFEXITED(status) && WEXITSTATUS(status) == 99) return 1;  // sanitizer hit
     return 0;                                                       // clean
 }

@@ -92,19 +92,19 @@ int runUnderASan(const std::string& source) {
         bezel::Lexer lexer(source, diags);
         bezel::Parser parser(lexer, diags);
         auto unit = parser.parseCompilationUnit();
-        if (!unit) return -1;
+        if (!unit) return -2;
         bezel::sema::SemaContext ctx(diags);
         bezel::sema::collectSymbols(*unit, ctx);
         bezel::sema::resolveTypes(*unit, ctx);
         bezel::sema::typecheckExpressions(*unit, ctx);
         bezel::sema::checkDefiniteAssignment(*unit, ctx);
         bezel::ownership::checkOwnership(*unit, ctx);
-        if (diags.hasErrors()) return -1;
+        if (diags.hasErrors()) return -2;
         llvm::LLVMContext llvmCtx;
         auto module = bezel::codegen::emitModule(*unit, ctx, llvmCtx);
-        if (!module) return -1;
+        if (!module) return -2;
         std::string err;
-        if (!bezel::codegen::emitObjectFile(*module, objPath, err)) return -1;
+        if (!bezel::codegen::emitObjectFile(*module, objPath, err)) return -2;
     }
 
     auto cleanup = [&] {
@@ -114,13 +114,13 @@ int runUnderASan(const std::string& source) {
     std::string linkCmd = "clang++ -fsanitize=address -g " + objPath + " " +
                           rtObj + " -lm -lpthread -lstdc++ -o " + exe +
                           " > /dev/null 2>&1";
-    if (std::system(linkCmd.c_str()) != 0) { cleanup(); return -1; }
+    if (std::system(linkCmd.c_str()) != 0) { cleanup(); return -3; }
     std::string runCmd =
         std::string("ASAN_OPTIONS=detect_leaks=1:exitcode=99 ") + exe +
         " > /dev/null 2>&1";
     int status = std::system(runCmd.c_str());
     cleanup();
-    if (status == -1) return -1;
+    if (status == -1) return -4;
     if (WIFEXITED(status) && WEXITSTATUS(status) == 99) return 1;
     return 0;
 }
@@ -427,7 +427,8 @@ BEZEL_TEST(owned_drain_bound_2167, asan_ownedarray_full_drain_no_crash_spec_4_5)
         "  end; "
         "end; "
         "return 0;"));
-    if (asan == -1) return;
+    if (asan == -1) return;            // toolchain unavailable: SKIP (#3626)
+    BEZEL_EXPECT_TRUE(asan >= 0);      // -2 program-compile / -3 link / -4 system() → FAIL (#3633)
     BEZEL_EXPECT_EQ(asan, 0);
 }
 
@@ -445,7 +446,8 @@ BEZEL_TEST(owned_drain_bound_2167, asan_owningstack_full_drain_no_crash_spec_4_7
         "  end; "
         "end; "
         "return 0;"));
-    if (asan == -1) return;
+    if (asan == -1) return;            // toolchain unavailable: SKIP (#3626)
+    BEZEL_EXPECT_TRUE(asan >= 0);      // -2 program-compile / -3 link / -4 system() → FAIL (#3633)
     BEZEL_EXPECT_EQ(asan, 0);
 }
 
@@ -462,7 +464,8 @@ BEZEL_TEST(owned_drain_bound_2167, asan_owningqueue_full_drain_no_crash_spec_4_1
         "  end; "
         "end; "
         "return 0;"));
-    if (asan == -1) return;
+    if (asan == -1) return;            // toolchain unavailable: SKIP (#3626)
+    BEZEL_EXPECT_TRUE(asan >= 0);      // -2 program-compile / -3 link / -4 system() → FAIL (#3633)
     BEZEL_EXPECT_EQ(asan, 0);
 }
 
@@ -480,7 +483,8 @@ BEZEL_TEST(owned_drain_bound_2167, asan_owninglinkedlist_full_drain_no_crash_spe
         "  end; "
         "end; "
         "return 0;"));
-    if (asan == -1) return;
+    if (asan == -1) return;            // toolchain unavailable: SKIP (#3626)
+    BEZEL_EXPECT_TRUE(asan >= 0);      // -2 program-compile / -3 link / -4 system() → FAIL (#3633)
     BEZEL_EXPECT_EQ(asan, 0);
 }
 
@@ -497,7 +501,8 @@ BEZEL_TEST(owned_drain_bound_2167, asan_owningset_full_drain_no_crash_spec_4_10)
         "  end; "
         "end; "
         "return 0;"));
-    if (asan == -1) return;
+    if (asan == -1) return;            // toolchain unavailable: SKIP (#3626)
+    BEZEL_EXPECT_TRUE(asan >= 0);      // -2 program-compile / -3 link / -4 system() → FAIL (#3633)
     BEZEL_EXPECT_EQ(asan, 0);
 }
 
@@ -517,6 +522,7 @@ BEZEL_TEST(owned_drain_bound_2167, asan_ownedarray_partial_drain_break_no_crash_
         "  end; "
         "end; "
         "return 0;"));
-    if (asan == -1) return;
+    if (asan == -1) return;            // toolchain unavailable: SKIP (#3626)
+    BEZEL_EXPECT_TRUE(asan >= 0);      // -2 program-compile / -3 link / -4 system() → FAIL (#3633)
     BEZEL_EXPECT_EQ(asan, 0);
 }

@@ -130,18 +130,18 @@ int runUnderAsan(const std::string& source, bool detectLeaks) {
         std::remove(objPath.c_str());
         std::remove(exe.c_str());
     };
-    if (!lowerToObject(source, objPath)) { cleanup(); return -1; }
+    if (!lowerToObject(source, objPath)) { cleanup(); return -2; }
     std::string linkCmd = "clang++ -fsanitize=address -g " + objPath + " " +
                           rtObj + " -lm -lpthread -lstdc++ -o " + exe +
                           " > /dev/null 2>&1";
-    if (std::system(linkCmd.c_str()) != 0) { cleanup(); return -1; }
+    if (std::system(linkCmd.c_str()) != 0) { cleanup(); return -3; }
     std::string opts = detectLeaks ? "detect_leaks=1" : "detect_leaks=0";
     std::string runCmd = "ASAN_OPTIONS=" + opts +
                          ":exitcode=99:abort_on_error=0 " + exe +
                          " > /dev/null 2>&1";
     int status = std::system(runCmd.c_str());
     cleanup();
-    if (status == -1) return -1;
+    if (status == -1) return -4;
     if (!WIFEXITED(status)) return 99;
     return WEXITSTATUS(status);
 }
