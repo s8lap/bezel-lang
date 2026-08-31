@@ -4804,63 +4804,34 @@ Emitter::NestedBodyScope::NestedBodyScope(Emitter& e)
       retNode_(e.currentReturnTypeNode_),
       lamRet_(e.currentLambdaReturnSemaTy_),
       accessorRetNode_(e.accessorReturnTypeNode_),   // #2703
-      accessorRetFn_(e.accessorReturnTypeFn_),       // #2703
-      smKind_(e.smKind_),
-      smStateStruct_(e.smStateStruct_),
-      smSelf_(e.smSelf_),
-      smStateGEP_(e.smStateGEP_),
-      smParkedStateGEP_(e.smParkedStateGEP_),   // fix #3531
-      smStateBBs_(std::move(e.smStateBBs_)),
-      smDoneBB_(e.smDoneBB_),
-      smNextSuspendState_(e.smNextSuspendState_),
-      smLocalFields_(std::move(e.smLocalFields_)),
-      smForInSrcFields_(std::move(e.smForInSrcFields_)),
-      smAllocaToField_(std::move(e.smAllocaToField_)),
-      iterCurrentValField_(e.iterCurrentValField_),
-      iterElemTy_(e.iterElemTy_),
-      iterElemSemaTy_(e.iterElemSemaTy_),
-      iterElemIsOwnedClass_(e.iterElemIsOwnedClass_),
-      iterCurrentValOwnedField_(e.iterCurrentValOwnedField_),
-      asyncOuterTaskField_(e.asyncOuterTaskField_),
-      asyncPendingTaskField_(e.asyncPendingTaskField_),
-      asyncSpillPtrField_(e.asyncSpillPtrField_),
+      accessorRetFn_(e.accessorReturnTypeFn_)        // #2703
+// fix #3551 (§29.3 / §30.1 / §30.7, v0.286): the suspend/resume frame members
+// (save+clear at ctor, restore at dtor) are generated from
+// BEZEL_SM_FRAME_MEMBERS so a member added to the macro is handled in all
+// three places by construction — the per-member hand-maintained list this
+// used to be is gone, and the half-mand asymmetry #3505 catalogues is
+// therefore structurally impossible here.
+#define BEZEL_SM_FRAME_NBSCOPE_INIT(TYPE, MEMBER, NEUTRAL) , MEMBER(e.MEMBER)
+      BEZEL_SM_FRAME_MEMBERS(BEZEL_SM_FRAME_NBSCOPE_INIT)
+#undef BEZEL_SM_FRAME_NBSCOPE_INIT
+      ,
       emittingDisposerBody_(e.emittingDisposerBody_),
       disposerEntryExc_(e.disposerEntryExc_),
       currentCaughtName_(e.currentCaughtName_),
       caughtExcArmTarget_(e.caughtExcArmTarget_),
       expectedFunctionType_(e.expectedFunctionType_),
-      lastCallGenericSubst_(std::move(e.lastCallGenericSubst_)),
+      lastCallGenericSubst_(e.lastCallGenericSubst_),
       inlinedAccessorEnd_(e.inlinedAccessorEnd_),
       asyncChainedReturn_(e.asyncChainedReturn_),
       asyncBorrowedReturn_(e.asyncBorrowedReturn_),
-      pendingOwnedParams_(std::move(e.pendingOwnedParams_)),
-      pendingArgsDisposal_(std::move(e.pendingArgsDisposal_)),
+      pendingOwnedParams_(e.pendingOwnedParams_),
+      pendingArgsDisposal_(e.pendingArgsDisposal_),
       genericSubstSemaTy_(e.genericSubstSemaTy_) {   // COPY: inherited, not cleared
-    // The moved-from containers above are left in a valid-but-unspecified
-    // state by `std::move`, so clear each explicitly.
+    // Clear the non-frame emitter state a nested body must not INHERIT.
     e.currentReturnTypeNode_     = nullptr;
     e.currentLambdaReturnSemaTy_ = nullptr;
     e.accessorReturnTypeNode_    = nullptr;              // #2703
     e.accessorReturnTypeFn_      = nullptr;              // #2703
-    e.smKind_                    = SuspendKind::Yield;   // no neutral value
-    e.smStateStruct_             = nullptr;
-    e.smSelf_                    = nullptr;
-    e.smStateGEP_                = nullptr;
-    e.smParkedStateGEP_          = nullptr;   // fix #3531
-    e.smStateBBs_.clear();
-    e.smDoneBB_                  = nullptr;
-    e.smNextSuspendState_        = 0;
-    e.smLocalFields_.clear();
-    e.smForInSrcFields_.clear();
-    e.smAllocaToField_.clear();
-    e.iterCurrentValField_       = 0;
-    e.iterElemTy_                = nullptr;
-    e.iterElemSemaTy_            = nullptr;
-    e.iterElemIsOwnedClass_      = false;
-    e.iterCurrentValOwnedField_  = 0;
-    e.asyncOuterTaskField_       = 0;
-    e.asyncPendingTaskField_     = 0;
-    e.asyncSpillPtrField_        = 0;
     e.emittingDisposerBody_      = false;
     e.disposerEntryExc_          = nullptr;
     e.currentCaughtName_         = {};
@@ -4872,6 +4843,16 @@ Emitter::NestedBodyScope::NestedBodyScope(Emitter& e)
     e.asyncBorrowedReturn_       = false;
     e.pendingOwnedParams_.clear();
     e.pendingArgsDisposal_.reset();
+    // Clear the saved+restored frame to its neutral values. Generated from
+    // BEZEL_SM_FRAME_MEMBERS so a member added to the macro is cleared in
+    // lockstep with the ctor-init and the dtor-restore above. SuspendKind
+    // has no neutral value (its three values are all valid `kind`s), and
+    // `Yield` is what `smStateGEPHere`'s second gate at Stmts.cpp ~3620
+    // admits (`smKind_ == Yield || smKind_ == AsyncYield`); see #2702 item
+    // on the smStateGEP_ reset.
+#define BEZEL_SM_FRAME_NBSCOPE_CLEAR(TYPE, MEMBER, NEUTRAL) e.MEMBER = NEUTRAL;
+    BEZEL_SM_FRAME_MEMBERS(BEZEL_SM_FRAME_NBSCOPE_CLEAR)
+#undef BEZEL_SM_FRAME_NBSCOPE_CLEAR
     // genericSubstSemaTy_ is intentionally left as-is (see the note above):
     // saved so a nested body's writes do not desynchronise it from
     // genericSubst_, but NOT cleared, because the body must resolve its type
@@ -4879,29 +4860,19 @@ Emitter::NestedBodyScope::NestedBodyScope(Emitter& e)
 }
 
 Emitter::NestedBodyScope::~NestedBodyScope() {
+    // Restore the saved frame. Generated from BEZEL_SM_FRAME_MEMBERS so a
+    // member added to the macro is restored here by construction — and
+    // `iterIsOwningIter_` (#2621) is one of those members, so the
+    // uninitialised struct-field-write that the pre-#3551 hand list missed
+    // cannot happen on a folded scope.
+#define BEZEL_SM_FRAME_NBSCOPE_RESTORE(TYPE, MEMBER, NEUTRAL) \
+    e_.MEMBER = std::move(MEMBER);
+    BEZEL_SM_FRAME_MEMBERS(BEZEL_SM_FRAME_NBSCOPE_RESTORE)
+#undef BEZEL_SM_FRAME_NBSCOPE_RESTORE
     e_.currentReturnTypeNode_     = retNode_;
     e_.currentLambdaReturnSemaTy_ = lamRet_;
     e_.accessorReturnTypeNode_    = accessorRetNode_;   // #2703
     e_.accessorReturnTypeFn_      = accessorRetFn_;     // #2703
-    e_.smKind_                    = smKind_;
-    e_.smStateStruct_             = smStateStruct_;
-    e_.smSelf_                    = smSelf_;
-    e_.smStateGEP_                = smStateGEP_;
-    e_.smParkedStateGEP_          = smParkedStateGEP_;  // fix #3531
-    e_.smStateBBs_                = std::move(smStateBBs_);
-    e_.smDoneBB_                  = smDoneBB_;
-    e_.smNextSuspendState_        = smNextSuspendState_;
-    e_.smLocalFields_             = std::move(smLocalFields_);
-    e_.smForInSrcFields_          = std::move(smForInSrcFields_);
-    e_.smAllocaToField_           = std::move(smAllocaToField_);
-    e_.iterCurrentValField_       = iterCurrentValField_;
-    e_.iterElemTy_                = iterElemTy_;
-    e_.iterElemSemaTy_            = iterElemSemaTy_;
-    e_.iterElemIsOwnedClass_      = iterElemIsOwnedClass_;
-    e_.iterCurrentValOwnedField_  = iterCurrentValOwnedField_;
-    e_.asyncOuterTaskField_       = asyncOuterTaskField_;
-    e_.asyncPendingTaskField_     = asyncPendingTaskField_;
-    e_.asyncSpillPtrField_        = asyncSpillPtrField_;
     e_.emittingDisposerBody_      = emittingDisposerBody_;
     e_.disposerEntryExc_          = disposerEntryExc_;
     e_.currentCaughtName_         = currentCaughtName_;

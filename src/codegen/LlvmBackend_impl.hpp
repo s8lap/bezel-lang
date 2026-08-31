@@ -11417,45 +11417,38 @@ private:
         // rather than depending on a second mechanism.)
         const ast::Type*     accessorRetNode_;
         llvm::Function*      accessorRetFn_;
-        // --- suspend/resume frame (#2170 + #2701 + #2702) ---
-        SuspendKind          smKind_;
-        llvm::StructType*    smStateStruct_;
-        llvm::Value*         smSelf_;
-        llvm::Value*         smStateGEP_;
-        // fix #3531: smStateGEP_'s partner. This scope is NOT generated
-        // from BEZEL_SM_FRAME_MEMBERS (#3505 converted clearSmFrame and
-        // SmFrameSaveScope, not this one), so the pair has to be kept by
-        // hand here — and it must be a PAIR: smStateGEPHere() and
-        // smParkedStateGEPHere() are read together on the same edge, so
-        // saving one without the other is the very asymmetry #3505 is
-        // about. Noted as a follow-up on issue 3505.
-        llvm::Value*         smParkedStateGEP_;
-        std::vector<llvm::BasicBlock*> smStateBBs_;
-        llvm::BasicBlock*    smDoneBB_;
-        unsigned             smNextSuspendState_;
-        std::unordered_map<const ast::Node*, unsigned>     smLocalFields_;
-        std::unordered_map<const ast::Node*, unsigned>     smForInSrcFields_;
-        SmFrameAllocaFieldMap                             smAllocaToField_;
-        // --- iterator-specific frame state ---
-        unsigned             iterCurrentValField_;
-        llvm::Type*          iterElemTy_;
-        const sema::TypeRef* iterElemSemaTy_;
-        bool                 iterElemIsOwnedClass_;
-        unsigned             iterCurrentValOwnedField_;
-        // fix #2621 / §29.1 (v0.236): true when the return type is an
-        // IOwningEnumerable<T> / IOwningEnumerator<T> — the enumerator
-        // ALWAYS owns the most-recently-yielded value (the §29.1 contract:
-        // ownership transfers only at TakeCurrent). Mutually exclusive with
-        // iterElemIsOwnedClass_ (a plain IEnumerable<owned T>): for the
-        // borrowing head the previous-current_val dispose at the YieldStmt
-        // store is owned-flag-gated, for the owning head it must be
-        // UNCONDITIONAL on non-null. Read by the YieldStmt handler in
-        // lowerStmt (LlvmBackend_Stmts.cpp).
-        bool                 iterIsOwningIter_;
-        // --- async-specific frame state ---
-        unsigned             asyncOuterTaskField_;
-        unsigned             asyncPendingTaskField_;
-        unsigned             asyncSpillPtrField_;
+        // --- suspend/resume frame (#2170 + #2701 + #2702 + #3505 + #3531 + #3551) ---
+        // fix #3551 (§29.3 / §30.1 / §30.7, v0.286): generated from
+        // `BEZEL_SM_FRAME_MEMBERS` so adding a member to the macro cannot
+        // drift between save / clear / restore. The half-mand asymmetry
+        // #3505 catalogues is structurally impossible here — a member added
+        // to the macro below is declared, saved at ctor, cleared to its
+        // neutral value while the nested body emits, and restored at dtor,
+        // in lockstep. Every BEZEL_SM_FRAME_MEMBERS member is folded:
+        // `smParamCellField_`, `smLocalPreBoxField_`, `smRestoredParamSlots_`,
+        // `smCellFrameFn_`, `asyncResultTy_`, `asyncResultSemaType_`,
+        // `asyncPatternAResultDisposer_`, `asyncOwnedParamFrame_` and
+        // `asyncResumeFn_` were deliberately omitted by the pre-#3551
+        // hand-maintained list; their consumers are all gated on
+        // `smStateStruct_ && smSelf_` (or `currentFn_ == smCellFrameFn_`),
+        // both of which this scope clears, so leaving them inherited was
+        // load-bearing only by accident. Folding them is strictly defensive
+        // and is the structural version of the #2702 reasoning above; if
+        // any of them turn out to be deliberately INHERITED for a
+        // specific nested body site, fold that site onto SmFrameSaveScope
+        // instead and document why. // fix #2621 / §29.1 (v0.236) on the
+        // `iterIsOwningIter_` member specifically: the YieldStmt handler's
+        // gate is `smKind_ == Yield && iterIsOwningIter_ && iterElemTy_->
+        // isPointerTy()` — the second and third are written here, so leaving
+        // `iterIsOwningIter_` uninitialised (no in-class default, no member-
+        // init) would have the dtor write garbage back to the outer body's
+        // owning-iterator bit on every nested emission, and a subsequent
+        // `yield return` in the iterator could read garbage and skip the
+        // displaced-current_val dispose (§29.1 owning protocol). Folding it
+        // here is the fix.
+#define BEZEL_SM_FRAME_NBSCOPE_DECL(TYPE, MEMBER, NEUTRAL) TYPE MEMBER;
+        BEZEL_SM_FRAME_MEMBERS(BEZEL_SM_FRAME_NBSCOPE_DECL)
+#undef BEZEL_SM_FRAME_NBSCOPE_DECL
         // --- destructor-body context (#2702 item 2) ---
         bool                 emittingDisposerBody_;
         llvm::Value*         disposerEntryExc_;
