@@ -203,16 +203,26 @@ BEZEL_TEST(ownedarray_forin_using_var_1287,
 // Robust double-free pin (subprocess-isolated ASan). Without the fix the array
 // cascade re-disposes each already-freed element → ASan heap-use-after-free
 // (returns 1); with the fix each element is disposed once (returns 0).
+//
+// runUnderASan returns 0 (clean), 1 (sanitizer fired), -1 (toolchain missing →
+// SKIP). The sibling pattern in owned_drain_639_test.cpp /
+// owning_enumerator_1349_test.cpp handles -1 with an early `return` — early-
+// returning from a BEZEL_TEST body keeps `currentTestFailed()` false, so the
+// harness reports a clean PASS. The bare `BEZEL_EXPECT_EQ(..., 0)` form used
+// here would instead report a FAIL on -1, mis-diagnosing the unavailable
+// toolchain as a real double-free (#3613). Mirror the sibling pattern.
 BEZEL_TEST(ownedarray_forin_using_var_1287,
            direct_forin_using_var_no_double_free_asan_spec_28_11) {
-    BEZEL_EXPECT_EQ(runUnderASan(makeProgram(
+    int rc = runUnderASan(makeProgram(
         "  using var arr := new OwningArray<R>(); "
         "  arr.Add(new R()); "
         "  arr.Add(new R()); "
         "  for var item in arr do "
         "    using var u := item; "
         "  end; "
-    )), 0);
+    ));
+    if (rc == -1) return;  // toolchain unavailable — skip
+    BEZEL_EXPECT_EQ(rc, 0);  // 0 = ASan clean (no leak, no double-free)
 }
 
 // ===========================================================================
