@@ -23931,6 +23931,93 @@ bool Emitter::outVarStringReleaseEligible(const ast::IdentifierExpr* id) {
 }
 
 
+// fix #3621 / §9.7 / §28.9 / §2.8.3 rule 4 (v0.286): is MethodSymbol `ms`
+// PROVABLY a "fresh record factory" for record `recTs` on the IMPORTED side?
+// Companion / sibling to isProvablyFreshRecordFactoryMethod (below) for the
+// LOCAL path. The local path proves freshness by walking the callee's
+// ast::MethodDecl body and demanding the entire body be exactly `return
+// new P(...)` (or the expression-bodied twin); that walk is null for an
+// IMPORTED method, whose `ms->decl` is null (the AST lives in the exporter,
+// not the importer — the importer sees only a wire metadata
+// reconstruction, see ModuleLoader.cpp ~4280 and MetaMember ~479). Without
+// this companion the cross-module twin of every locally-admitted factory
+// is rejected by isProvablyFreshRecordFactoryMethod and the callee-minted
+// +1 on every string field leaks at the caller's scope end — measured at
+// 8290 B / 400 allocations over 200 iterations in the issue's repro.
+//
+// The signature-only admission is BOUNDED by four guards:
+//
+//   (a) `ms->isStatic` — an instance method could capture `this.f` and
+//       return a borrow of a still-live owner field; a static method has
+//       no `this` (and so no instance-field-borrow path). The same trade
+//       is documented on the local check, which only ever sees the body,
+//       not the parent's static fields, so this is the SYMBOL-SIDE twin.
+//
+//   (b) `ms->genericParams.empty()` — a generic factory's
+//       per-instantiation body is not visible to the importer outside the
+//       §14.1 generic surface (MetaMember::methodBodyText is empty for
+//       non-generic types per the schema-v5 comment at MetaMember.hpp:~508,
+//       and even for generic types is only a textual fallback the importer
+//       cannot statically reason about here). A generic-class
+//       instantiation-aware walk is a strict superset of this fix's scope.
+//
+//   (c) the wire-side RETURN TYPE (`ctx.importedReturnType(ms)`) IS exactly
+//       `recTs` (same Named kind, same declaration) — so the factory's
+//       contract is "I return this very record type" and any +1 minted at
+//       construction is associated with this record type's release.
+//
+//   (d) `recTs` has NO user-declared (ConstructorSymbol) member — the
+//       compiler-generated primary ctor is therefore the ONLY construction
+//       path for any `recTs` value the factory could produce (the
+//       ConstructorSymbol arm iterates `recTs->members`, which the wire
+//       metadata populates symmetrically with the local AST walk; #3141's
+//       same-symbol-side field-list fix is the pattern). When the primary
+//       ctor is the only path, every freshly-constructed `recTs` carries
+//       whatever +1 each field had at construction, and the caller's
+//       scope-end release (the recordStringFields Disposal at
+//       ~14275–14293) is provably the SOLE owner of those +1s — no double-
+//       free, no UAF, balanced against the callee-side construction.
+//
+// UNSAFE admit case NOT guarded (follow-up filed): `=> staticField` — a
+// static factory reading a static-field of type `recTs` and returning
+// that field (a borrow of the static storage's +1, not a freshly-minted
+// one). The guard would require the importer to walk the enclosing
+// class's own static-storage members for a recTs-typed one, a strictly
+// larger surface than the local check reasons about; deliberately out of
+// scope, with a #3621 follow-up issue for the closure. The common case
+// `=> new Pt(args...)` (a primary ctor with +1 string producers) IS
+// admitted — and that is the case the issue's repro and the vast majority
+// of user-written factories fit.
+//
+// Returns false for locals (`ms->decl != nullptr`); those go through
+// isProvablyFreshRecordFactoryMethod, which has the body-walk proof.
+static bool isProvablyFreshImportedRecordFactoryMethod_(
+        const sema::MethodSymbol* ms, const sema::TypeSymbol* recTs,
+        sema::SemaContext& ctx) {
+    if (!ms || !recTs) return false;
+    if (ms->decl) return false;  // locals: let isProvablyFreshRecordFactoryMethod handle.
+    // Guard (a): must be static. mirrors Emitter::isStaticMethod's body
+    // (LlvmBackend_impl.hpp:2964) which is private — duplicated locally
+    // rather than reaching into Emitter's privates.
+    bool isStatic = ms->isOperator;  // §25: operators are always static
+    for (auto mod : ms->modifiers) {
+        if (mod == "static") { isStatic = true; break; }
+    }
+    if (!isStatic) return false;
+    if (!ms->genericParams.empty()) return false;  // guard (b)
+    const sema::TypeRef* ret = ctx.importedReturnType(ms);
+    if (!ret) return false;
+    if (ret->kind != sema::TypeRef::Kind::Named || ret->declaration != recTs)
+        return false;  // guard (c)
+    if (recTs->kind != ast::TypeDeclKind::Record) return false;
+    for (const sema::Symbol* m : recTs->members) {
+        if (dynamic_cast<const sema::ConstructorSymbol*>(m))
+            return false;  // guard (d): explicit ctor — opaque, disqualifies
+    }
+    return true;
+}
+
+
 // fix #1747 / §28.9 / §9.7 / §28.3: walk the function body and classify
 // every plain-`var` record-call-result LocalDecl — a `var p := <call>` whose
 // initializer is a CallExpr returning a record with at least one `string`
@@ -24020,10 +24107,62 @@ void Emitter::collectRecordCallResultReleaseEligible(
                         // caught by re-running #2425's own nested-choice-
                         // in-record round-trip test against this fix (it
                         // regressed to a 60-byte leak without this branch).
+                        //
+                        // fix #3621 / §9.7 / §28.9 / §2.8.3 rule 4
+                        // (v0.286): ALSO admit an IMPORTED static factory
+                        // whose return type matches the record (the importer's
+                        // own static type signature — the wire-side
+                        // `MetaMember::type` published by ModuleMetadata as
+                        // the method's return type) and whose record has no
+                        // explicit ctor — the SYMBOL-SIDE mirror of the
+                        // local isFreshRecordConstructionOfExactType's
+                        // "primary ctor is the only construction path"
+                        // argument. isProvablyFreshRecordFactoryMethod
+                        // returns false here solely because ms->decl is
+                        // null for any imported MethodSymbol (no
+                        // ast::MethodDecl body for the importer to walk),
+                        // so the cross-module twin of any factory the
+                        // local check admitted (a `=> new Pt(...)` body)
+                        // is incorrectly rejected, leaking the callee-
+                        // minted +1 on every string field at the caller's
+                        // scope end — measured 8290 B / 400 allocations
+                        // over 200 iterations (issue body, verbatim).
+                        // The signature-only admission is BOUNDED by:
+                        //   (a) ms->isStatic — an instance method could
+                        //       capture `this.f` and return a borrow of
+                        //       an owner-still-live field; a static method
+                        //       has no `this` (so no instance-field
+                        //       borrow path);
+                        //   (b) ms->genericParams.empty() — a generic
+                        //       factory's per-instantiation body is not
+                        //       visible to the importer (no wire
+                        //       methodBodyText outside the §14.1 generic
+                        //       surface), so any soundness argument
+                        //       would need an instantiation-aware walk
+                        //       that this fix does not attempt;
+                        //   (c) the wire return type IS exactly recTs —
+                        //       so the factory returns the SAME record
+                        //       type we are trying to release;
+                        //   (d) recTs has no user-declared
+                        //       (ConstructorSymbol) member — the primary
+                        //       ctor is therefore the only construction
+                        //       path for any recTs value the factory
+                        //       could produce, so the caller is the sole
+                        //       owner of any newly-minted +1.
+                        // The unsafe admit case `=> staticField` (a
+                        // static-field read on the enclosing class) is
+                        // deliberately NOT guarded against — it would
+                        // require the importer to walk the enclosing
+                        // class's own static-storage members, a strictly
+                        // larger surface than the local check reasons
+                        // about. The trade is documented in the commit
+                        // body and a follow-up issue tracks the closure.
                         const auto* ms = dynamic_cast<const sema::MethodSymbol*>(
                             ctx_.exprSymbol(*call->callee));
                         if ((ms &&
-                             isProvablyFreshRecordFactoryMethod(ms, tr->declaration)) ||
+                             (isProvablyFreshRecordFactoryMethod(ms, tr->declaration) ||
+                              isProvablyFreshImportedRecordFactoryMethod_(
+                                  ms, tr->declaration, ctx_))) ||
                             isSynthesizedRecordDeserializeCall(call, tr->declaration))
                             candidates.push_back(s);
                     }
