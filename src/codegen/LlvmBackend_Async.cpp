@@ -2120,6 +2120,15 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
     // into the module). Spans MoveNextAsync AND the Dispose body — the
     // Dispose body re-publishes the members it reads just-in-time.
     StateMachineFrameScope smFrameScope(*this);
+    // fix #3507 (§27.5 / §28.9 / §30.7 / §31.2, v0.286): the async-ITERATOR
+    // spelling of the save/restore #3500 added to the sync iterator. emitAsyncIteratorMethod
+    // is reached mid-emission of an OUTER body by instantiateGenericSpecialization
+    // (LlvmBackend_Calls2.cpp ~L12266) and would otherwise leave the §27.5
+    // closure/capture-cell eligibility sets poisoned for whatever the outer
+    // body lowered next. CaptureReclaimSetScope covers all four tokens the new
+    // pre-scan block below re-establishes (closureReleaseEligible, boxCapture,
+    // cellFreeEligible, plus the three sibling sets). // per §27.5, §28.9
+    CaptureReclaimSetScope captureReclaimScope(*this);
     smKind_ = SuspendKind::AsyncYield;
 
     // §29.6 / §30.7 (#554): check for FORBIDDEN suspend positions in this async
@@ -2757,6 +2766,55 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
         // above already rely on. // per §27.5, §28.9
         collectClosureReleaseEligible(*ci.stmts);
         closureReleaseEligibleFn_ = resumeFn;
+        // fix #3507 (§27.5 / §28.9 / §30.7 / §31.2, v0.286): the surviving
+        // half of narrow #3553 — `emitAsyncIteratorMethod` re-established the
+        // CLOSURE release above but never re-established the CAPTURE-CELL free
+        // eligibility chain. Every scope-end reclaim family is keyed to the
+        // function its pre-scan analysed (`currentFn_ == <family>Fn_`), and the
+        // async body lowers with currentFn_ == resumeFn while Setup pinned
+        // these tokens to the ENTRY fn. So lowerLambda pushed nothing into
+        // lastLambdaCapturedCells_ for an async-iterator body, and every
+        // captured local's cell was reclaimed by nobody.
+        //
+        // Measured on the issue's exact repro (async iterator with a lambda
+        // capturing a `catch`-arm binding, 200 enumerations under ASan/LSan):
+        // a DIRECT leak of 1600 B / 200 allocations, every cell allocated in
+        // `bz$asynciter$M.C$Gen$Resume` and reaching `domain_drain`. The
+        // exception object that the cell holds is in turn unreachable: each
+        // unfreed cell keeps a refcount on the InvalidOperationException, so
+        // the catch-arm reclamation §31.2 prescribes cannot run on a path
+        // where the arm body lifts the binding into a captured lambda. The
+        // leak vanishes once this block is in place (post-fix: 0 B / 0
+        // allocations).
+        //
+        // This is the async-ITERATOR spelling of the same re-establishment
+        // #1416/#1418 made for an async method's resume fn (the `--- Resume:`
+        // block of emitAsyncMethod above, the same shape verbatim minus the
+        // moveNextFn/resumeFn substitution), and the surviving twin of #3500's
+        // sync-iterator block — which established it for MoveNext (see
+        // LlvmBackend_Iterators.cpp ~L1612). The sync iterator twin of the
+        // same program is clean without this change, which isolates the
+        // missing analysis to the async-iterator resume fn.
+        //
+        // Dependency order is the documented one at every other site:
+        // collectCellFreeEligible consumes closureReleaseEligible_, so it
+        // runs last. The Dispose body below lowers with currentFn_ ==
+        // targetFn, so these tokens do not match there and nothing new arms in
+        // it — the same scoping the four re-establishments above already rely
+        // on. // per §27.5, §28.9, §31.2
+        boxCaptureLocals_.clear();
+        singleCaptureLocals_.clear();          // #694
+        assignedCaptureVars_.clear();          // fix #2706
+        definitelyEscapingLambdas_.clear();    // #694
+        boxCaptureLocalsFn_ = resumeFn;
+        cellFreeEligible_.clear();
+        unwindUnsafeCellFree_.clear();         // fix #2334
+        sharedCellEnvdtorFreeOwner_.clear();   // fix #3426
+        cellFreeEligibleFn_ = resumeFn;
+        collectBoxCaptureLocals(*ci.stmts);
+        collectDefinitelyEscapingLambdas(*ci.stmts);
+        // Must run AFTER collectClosureReleaseEligible (uses its result).
+        collectCellFreeEligible(*ci.stmts);
         auto* entry = llvm::BasicBlock::Create(llvm_, "entry", resumeFn);
         builder_.SetInsertPoint(entry);
 
