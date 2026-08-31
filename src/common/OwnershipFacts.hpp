@@ -225,6 +225,64 @@ bool isNonTrivialDisposeClass(
     const sema::TypeSymbol* decl,
     ImportedDisposeVerdict importedVerdict = ImportedDisposeVerdict::Consult);
 
+// fix #3632 (§28.9 v0.286): the §28.9 "no `owned` fields OF NON-TRIVIAL-DISPOSE
+// TYPE" recursive clause, which the predicate above cannot implement because
+// reading a field's RESOLVED TypeRef (its post-substitution genericArgs
+// included, §3.6 rule 2) requires a `SemaContext`. This overload takes the
+// resolver hook the existing API cannot, walks each non-static `owned` field
+// of the holder, resolves the field's TypeRef through `ctx`, and recurses
+// into the field type — so an `owned inner: Inner?` field whose `Inner`
+// itself classifies trivial-dispose (no destructor, no non-trivial-dispose
+// `owned` field, no owning-inline-array, trivial-dispose base) does NOT
+// disqualify the holder, exactly as §28.9's first ceremony-exemption bullet
+// requires.
+//
+// WHY THIS IS AN OVERLOAD, NOT A REPLACEMENT. Five call sites use the
+// `TypeSymbol`-taking form above (§21.9's `ExpressionStmt` arm, §15.4's
+// borrowing-family literal gate, §28.10's vacuous-pin lint, the §28.3
+// auto-drop warning gate, and the §22.15 throw carve-out — the exporter
+// `ModuleMetadataBuilder::convertTypeDecl` is a sixth). Three of those
+// live in files this lane does not own (`ExprTypecheck*.cpp` is L1,
+// `Ownership*.cpp` is W2-L2, `ModuleMetadataBuilder.cpp` is shared);
+// threading a `SemaContext*` through every call site is a coordinated
+// second step that this PR deliberately does NOT make. The widening's
+// SAFE direction keeps the overload's pre-fix semantics — any non-static
+// `owned` field disqualifies when the resolver hook is missing — because
+// the rejected direction is a deterministic "free a value the spec says
+// is null-obligation-bearing". Once a call site opts in by passing
+// `ctx`, the new arm checks the field's TYPE.
+//
+// PER-INSTANTIATION (§3.6 rule 2). `OwningBox<T>` qualifies per the
+// §28.9 example as trivial-dispose only when the substituted T is
+// trivial-dispose; the uninstantiated `T` (a bare type-parameter Named
+// TypeRef with no `declaration`, not a user record's auto-field) is read
+// post-substitution through `rt->genericArgs`, matching the §9.7 / #2145
+// `RecordSubstEnv` discipline and #3145's both-sources rule. A bare
+// parameter that does not resolve through `genericArgs` keeps the
+// conservative reading — uninstantiated-still-generic stays rejecting,
+// because per-instantiation reclassification at a use site can only
+// RELAX it.
+//
+// COINDUCTION. The walk carries an in-progress path set of `TypeSymbol*`
+// through both the BASE chain and the FIELD-type recursion; re-entry of
+// a TypeSymbol already on the path answers "trivially trivial-dispose"
+// (return false) — which is the coinductive fixpoint. The pre-#3632 cycle
+// guard on the BASE chain alone (line 50) happens to coincide because
+// `break` with `reject == false` and a return-false are the same
+// outcome; the §28.9 spec text says explicitly "the property is
+// evaluated coinductively", so the new entry point reads as written.
+//
+// WIDENING SCOPE. Only `isOwned && !isStatic` is widened to
+// `isNonTrivialDisposeClass(fieldType)`. The destructor arm and the
+// inline-array arm are spec-stated disqualifications and stay as-is; an
+// `owned` field whose declared type is itself an owning-inline-array
+// (`[N owned]T`) still disqualifies, because the field storage has its
+// own disposal work (the `OwningBox<[3 owned]Cell>` shape).
+bool isNonTrivialDisposeClass(
+    const sema::TypeRef* rt,
+    const sema::SemaContext& ctx,
+    ImportedDisposeVerdict importedVerdict = ImportedDisposeVerdict::Consult);
+
 // fix #3634 (§22.10 v0.180 / #3205, v0.286): is `fs` a captured `owned`
 // CLASS primary-constructor parameter — one whose value is NOT consumed by
 // an owned-field initializer or the inheritance clause's base call

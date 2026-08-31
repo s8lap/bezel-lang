@@ -34,11 +34,16 @@ bool isCapturedOwnedPrimaryParam(const sema::FieldSymbol* fs) {
            fs->posParam->modifier == "owned" && !fs->posParamInitRef;
 }
 
-// §28.9 "Trivial-dispose classes" (v0.237) / §22.5 (#1684) — see the header.
-// Relocated VERBATIM from ExprTC::isNonTrivialDisposeClass (#2654); not one
-// line of classification logic changed, so every existing sema consumer keeps
-// byte-identical behaviour and the ownership pass's §28.3 auto-drop gate now
-// shares this single copy.
+// §28.9 "Trivial-dispose classes" (v0.286) — see the header. This is the
+// pre-#3632 (TypeSymbol-only) entry point. It cannot read a field's RESOLVED
+// TypeRef without a `SemaContext`, so its `owned`-field arm is the
+// pre-recursive-clause reading: any non-static `owned` field disqualifies.
+// That is the SAFE direction (a wrong "non-trivial" frees a no-op Dispose;
+// a wrong "trivial" leaks, §6c), and it preserves byte-identical behaviour
+// for every caller that does not opt into the new TypeRef+SemaContext
+// overload below. The widening (issue 3632) lives in the TypeRef overload;
+// callers that thread the active `SemaContext` see it; every existing
+// caller keeps the conservative reading.
 bool isNonTrivialDisposeClass(const sema::TypeSymbol* decl,
                               ImportedDisposeVerdict importedVerdict) {
     bool reject = false;
@@ -168,6 +173,207 @@ bool isNonTrivialDisposeClass(const sema::TypeSymbol* decl,
         cur = nextBase;
     }
     return reject;
+}
+
+namespace {
+
+// fix #3632 (§28.9 v0.286, §3.6 rule 2): the §28.9 "no `owned` fields of
+// NON-TRIVIAL-DISPOSE TYPE" recursive clause, walked coinductively.
+// `inProgress` is the PATH set (§6 / #1624 / #2159 — re-entry answers
+// trivially trivial-dispose, then erases on exit so a sibling field's
+// re-classification on the same TypeRef gets the full fresh verdict).
+// Path semantics are essential: a `Holder<X>` and `Holder<Y>` both walk
+// through the same `Inner` TypeRef on different paths, and an outer
+// enclosing generic must NOT eat a sibling-frame re-classification.
+bool isNonTrivialDisposeClassImpl(
+    const sema::TypeRef* rt,
+    const sema::SemaContext& ctx,
+    common::ImportedDisposeVerdict importedVerdict,
+    std::unordered_set<const sema::TypeSymbol*>& inProgress);
+
+// §3.6 rule 2 / §9.7 / #2145: substitute a bare type-parameter field
+// reference (`owned field: T`) through `decl`'s `genericParams` ×
+// `rt->genericArgs` — the §28.9 example `OwningBox<T>` reads the field
+// type as `T`, resolves the parameter via the holder's genericArgs, and
+// classifies the substituted type (`OwningBox<Connection>` →
+// non-trivial-dispose iff `Connection` is). Returns rt unchanged when
+// the substitution does not apply (a concrete, non-parameter type —
+// the immediate-fix shape `class K { owned inner: Inner? }`, where
+// `Inner?` has a declaration and is not a bare parameter).
+const sema::TypeRef* substitutedTrivialDisposeFieldType(
+    const sema::TypeSymbol* decl,
+    const sema::TypeRef* rt,
+    const sema::TypeRef* fieldTy) {
+    if (!decl || !fieldTy) return fieldTy;
+    // Only a bare type-parameter reference (Named, declaration-null,
+    // argument-less, head naming one of `decl`'s genericParams) needs
+    // substitution; a concrete type is a no-op. The shape matches
+    // `substitutedChoicePayloadType` (§35.4) and the §9.7 record walk's
+    // bare-parameter recognizer (#2145).
+    if (fieldTy->kind != sema::TypeRef::Kind::Named || fieldTy->declaration)
+        return fieldTy;
+    if (!fieldTy->astNode || !fieldTy->astNode->name ||
+        fieldTy->astNode->name->parts.empty())
+        return fieldTy;
+    if (decl->genericParams.empty() || rt->genericArgs.size() != decl->genericParams.size())
+        return fieldTy;
+    const std::string_view head = fieldTy->headName();
+    for (std::size_t i = 0; i < decl->genericParams.size(); ++i) {
+        const sema::Symbol* gp = decl->genericParams[i];
+        if (!gp || gp->name != head) continue;
+        const sema::TypeRef* arg = rt->genericArgs[i];
+        if (arg && arg != fieldTy) return arg;
+        return fieldTy;  // uninstantiated — keep the conservative reading.
+    }
+    return fieldTy;
+}
+
+bool isNonTrivialDisposeClassImpl(
+    const sema::TypeRef* rt,
+    const sema::SemaContext& ctx,
+    common::ImportedDisposeVerdict importedVerdict,
+    std::unordered_set<const sema::TypeSymbol*>& inProgress) {
+    if (!rt) return false;
+    if (rt->kind != sema::TypeRef::Kind::Named) return false;
+    sema::TypeSymbol* decl = rt->declaration;
+    if (!decl) return false;  // bare generic parameter — uninstantiated
+    if (decl->kind != ast::TypeDeclKind::Class) return false;
+    // §28.9 coinductive walk: re-entry of any TypeSymbol already on the
+    // current classification path answers trivially trivial-dispose. The
+    // path set is shared across the BASE chain and the FIELD-type
+    // recursion, so a `Holder<X>` and `Holder<Y>` walking through the same
+    // `Inner` TypeRef on different paths each get the full fresh verdict;
+    // only a genuinely cyclic cluster (e.g. `A { owned b: B? } class B {
+    // owned a: A? }`) hits the path. PATH semantics — insert on entry,
+    // erase on exit — match the §9.7 record-walk and §35.4 choice-walk
+    // discipline (#1611, #2159). The previous `visitedBase`-only cycle
+    // guard (#1624) on the BASE chain alone happened to coincide because
+    // `break` with `reject == false` is a return-false; this set makes the
+    // answer load-bearing — and extends it across the FIELD-type
+    // recursion the original guard did not see.
+    if (!inProgress.insert(decl).second) return false;
+    bool reject = false;
+    const std::size_t kMaxWalk = 4096;
+    std::size_t walked = 0;
+    sema::TypeSymbol* cur = decl;
+    while (cur && !reject) {
+        // PATH set entry — already-checked above for `decl`; here for any
+        // base-class step. The early `decl` insert handles the recursion
+        // guard for the `decl → field's type class → back to decl` shape;
+        // the loop's insert here handles a `decl → base → ...` chain.
+        if (cur != decl && !inProgress.insert(cur).second) break;
+        if (++walked > kMaxWalk) break;
+        // fix #3191: imported classes consult the carried §3.6 verdict FIRST.
+        if (importedVerdict == common::ImportedDisposeVerdict::Consult &&
+            cur->importedNonTrivialDispose) {
+            reject = true;
+            break;
+        }
+        for (sema::Symbol* m : cur->members) {
+            if (dynamic_cast<sema::DestructorSymbol*>(m)) { reject = true; break; }
+            auto* fs = dynamic_cast<sema::FieldSymbol*>(m);
+            if (!fs) continue;
+            // fix #2666 / §15.1.1: an owning-inline-array field disqualifies
+            // — the AST `arrayOwned` flag is read directly (no ctx needed).
+            const ast::Type* fieldAstTy = nullptr;
+            if (fs->posParam) fieldAstTy = fs->posParam->type.get();
+            else if (auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl))
+                fieldAstTy = fd->type.get();
+            if (fieldAstTy && fieldAstTy->kind == ast::TypeKind::InlineArray &&
+                fieldAstTy->arrayOwned) { reject = true; break; }
+            if (fs->posParam) {
+                // fix #3205 / §22.10: a captured `owned` primary-ctor parameter
+                // disqualifies regardless of type — its generated capture field
+                // walks in the generated Dispose (the #3634 fact/mechanism).
+                if (fs->parent && fs->parent->kind == ast::TypeDeclKind::Class &&
+                    fs->posParam->modifier == "owned" && !fs->posParamInitRef) {
+                    reject = true;
+                    break;
+                }
+                continue;
+            }
+            // A `static owned` field (§22.12 rule 4) is disposed at process
+            // exit, not by this instance's Dispose — exclude (§22.13).
+            bool isStatic = false, isOwned = false;
+            for (auto mod : fs->modifiers) {
+                if (mod == "static") isStatic = true;
+                if (mod == "owned") isOwned = true;
+            }
+            if (!isOwned || isStatic) continue;
+            // fix #3632 (§28.9 / §3.6 rule 2, v0.286): the recursive clause.
+            // An `owned` field of TRIVIAL-dispose type does NOT disqualify —
+            // the disposal cascade over it runs no user code, exactly what
+            // §28.9 asserts. Resolve the field's TypeRef through ctx, apply
+            // per-instantiation substitution when the field's declared type
+            // is a bare `T` (a `OwningBox<T>` over `Connection` reads the
+            // substituted `Connection`, not the uninstantiated `T`), and
+            // recurse. The recursive call uses the field's resolved TypeRef
+            // (it carries the substituted genericArgs for any nested generic
+            // field type, the §9.7 / #2145 record-walk discipline).
+            const sema::TypeRef* fieldTy =
+                sema::storageComponentType(fs, ctx);
+            if (!fieldTy) continue;  // unknown → conservative-skip (no false reject)
+            fieldTy = substitutedTrivialDisposeFieldType(cur, rt, fieldTy);
+            // Only class/interface TypeRefs count toward the §28.9. A record,
+            // enum, primitive, function, unit, inline-array is OUT by kind;
+            // a Nullable<Inner> reads as Inner (the nullable flag is on the
+            // TypeRef) — the recursion into Inner decides its verdict; a
+            // null fieldTy (unresolved) is conservative-skip.
+            if (fieldTy->kind != sema::TypeRef::Kind::Named) continue;
+            if (!fieldTy->declaration) {
+                // A still-bare parameter that did not resolve (the holder
+                // itself is uninstantiated OR the substitution didn't apply).
+                // Conservatively reject — the safe direction; per-instantiation
+                // reclassification at a use site can only RELAX (§28.9 note:
+                // #2183's mirror).
+                reject = true;
+                break;
+            }
+            sema::TypeSymbol* fieldDecl = fieldTy->declaration;
+            if (fieldDecl->kind != ast::TypeDeclKind::Class &&
+                fieldDecl->kind != ast::TypeDeclKind::Interface) continue;
+            if (isNonTrivialDisposeClassImpl(fieldTy, ctx, importedVerdict,
+                                              inProgress)) {
+                reject = true;
+                break;
+            }
+        }
+        sema::TypeSymbol* nextBase = nullptr;
+        for (sema::TypeSymbol* b : cur->baseTypes)
+            if (b && b->kind == ast::TypeDeclKind::Class) {
+                nextBase = b;
+                break;
+            }
+        // PATH semantics — erase the CURRENT frame's `cur` from the set on
+        // exit so a sibling frame's re-classification (or a base-class step)
+        // sees it fresh. The field-type recursion above has its OWN
+        // push/pop (#2159's model).
+        const sema::TypeSymbol* leaving = cur;
+        cur = nextBase;
+        inProgress.erase(leaving);
+    }
+    // FALL-THROUGH cleanup — `cur == nullptr`, the loop terminated normally.
+    // (The rejecting path already broke out without erasing; the
+    // classification result is `reject == false` so any leftover entry is
+    // harmless at call site, but erase for cleanness' sake.)
+    if (cur) inProgress.erase(cur);
+    inProgress.erase(decl);
+    return reject;
+}
+
+}  // namespace
+
+// §28.9 — the TypeRef+SemaContext entry point. Used by callers that can
+// resolve a field's RESOLVED TypeRef (and so do per-instantiation
+// substitution for generics, §3.6 rule 2). Seeds a fresh in-progress PATH
+// set. See the header for the rationale and the §3.6 / §28.9 / §21.9 /
+// §22.15 / §28.3 call-site migration that must follow.
+bool isNonTrivialDisposeClass(
+    const sema::TypeRef* rt,
+    const sema::SemaContext& ctx,
+    ImportedDisposeVerdict importedVerdict) {
+    std::unordered_set<const sema::TypeSymbol*> inProgress;
+    return isNonTrivialDisposeClassImpl(rt, ctx, importedVerdict, inProgress);
 }
 
 const ast::MethodDecl* calleeMethodDecl(const ast::CallExpr& call,
