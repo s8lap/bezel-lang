@@ -3298,13 +3298,25 @@ bool ExprTC::primitiveBoxesIntoBuiltinIface(PrimitiveType fromPrim,
     // IEquatable must NOT trigger the §8.6 primitive-boxing predicate — the
     // boxing lowering (§22.6 / §5.1) is built-in specific, and a user
     // interface with that name is a perfectly ordinary user contract.
-    // `declaration->moduleName.empty()` is the discriminator the rest of
-    // the front-end adopted after #2995/#2997: a builtinClassSym leaves it
-    // empty, SymbolCollection (local) and ModuleLoader (imported) populate
-    // it on every real TypeSymbol. Without this gate a user IComparable<T>
-    // reaches the codegen path and the compiler SEGFAULTs trying to box a
-    // primitive into a non-builtin interface.
-    if (!to->declaration->moduleName.empty()) return false;
+    // fix #3543 follow-up: the discriminator the rest of the front-end
+    // adopted after #2995/#2997 was `declaration->moduleName.empty()` —
+    // a builtinClassSym left it empty, SymbolCollection (local) and
+    // ModuleLoader (imported) populated it on every real TypeSymbol.
+    // #3543 (§2.8.3 rule 3, v0.286) inverted that discriminator by
+    // populating `moduleName = "System"` (or `"System.Collections.Generic"`
+    // for IEqualityComparer) on the synthesized iface so `mangledTypeName`
+    // mints the qualified `td$System.IComparable` head and the
+    // LinkOnceODR-merging linker stops colliding two same-named user
+    // types. Without THIS follow-up that change made the predicate reject
+    // legitimate primitive boxing (the regression tests
+    // tests/sema/primitive_boxes_into_builtin_iface_2765_test.cpp's
+    // `int_iequatable_and_icomparable_int_accepted` arm and the
+    // tests/codegen/box_inline_array_2804_test.cpp arms pin this).
+    // `isSynthesizedBuiltinInterface` is the by-identity flag
+    // SemaContext::builtinInterfaceSym sets (#3139) just BEFORE the #3543
+    // moduleName assignment (SemaContext.hpp:1309/:1520), so it survives
+    // the inversion.
+    if (!to->declaration->isSynthesizedBuiltinInterface) return false;
     bool isCmp = to->declaration->name == "IComparable";
     bool isEq  = to->declaration->name == "IEquatable";
     if (!isCmp && !isEq) return false;
@@ -3832,10 +3844,12 @@ void ExprTC::checkAssignable(TypeRef* from, TypeRef* to,
         //     `Object → IEquatable<MyClass>`, `Object → SomeClass`, the
         //     §27.6 function-typed re-type) is untouched.
         // A USER interface named `IEquatable`/`IComparable` is excluded by
-        // `moduleName.empty()`, the same discriminator #3022 adopted.
+        // `isSynthesizedBuiltinInterface` (#3139), the discriminator that
+        // replaces the pre-#3543 `moduleName.empty()` test #3022 adopted —
+        // see the rationale at ExprTypecheck.cpp:3307.
         bool toIsObjectKeyedBuiltinIface =
             to->kind == TypeRef::Kind::Named &&
-            to->declaration && to->declaration->moduleName.empty() &&
+            to->declaration && to->declaration->isSynthesizedBuiltinInterface &&
             (to->declaration->name == "IEquatable" ||
              to->declaration->name == "IComparable") &&
             to->genericArgs.size() == 1 && to->genericArgs[0] &&
@@ -3997,12 +4011,13 @@ void ExprTC::checkAssignable(TypeRef* from, TypeRef* to,
         to->kind   == TypeRef::Kind::Named &&  to->declaration &&
         to->declaration->kind == ast::TypeDeclKind::Interface &&
         to->declaration->name == "IReadOnlySpan" &&
-        // fix #3022 (§11.3, v0.240): only the §4.16 BUILTIN interface has
-        // moduleName.empty() — SymbolCollection (local) and ModuleLoader
-        // (imported) populate moduleName on every real TypeSymbol. Without
-        // this gate a user interface named IReadOnlySpan is wrongly admitted
-        // as the §4.16 target.
-        to->declaration->moduleName.empty()) {
+        // fix #3022 (§11.3, v0.240) + #3543 follow-up: only the §4.16 BUILTIN
+        // interface passes this gate; `isSynthesizedBuiltinInterface` (#3139)
+        // replaces the pre-#3543 `moduleName.empty()` test (see
+        // ExprTypecheck.cpp:3307 for the rationale on the inversion).
+        // Without this gate a user interface named IReadOnlySpan is wrongly
+        // admitted as the §4.16 target.
+        to->declaration->isSynthesizedBuiltinInterface) {
         std::string_view fromN = namedTypeSimpleName(from);
         if (fromN == "ArraySpan" || fromN == "ReadOnlyArraySpan" ||
             fromN == "Span"      || fromN == "ReadOnlySpan") {

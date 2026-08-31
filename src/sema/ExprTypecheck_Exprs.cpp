@@ -948,7 +948,25 @@ void ExprTC::checkBuiltinClosedConstructorSurface(const ast::NewExpr& ne) {
         ne.type ? ctx_.resolvedType(*ne.type) : ctx_.exprType(ne);
     if (!rt || rt->kind != TypeRef::Kind::Named) return;
     const TypeSymbol* rd = rt->declaration;
-    if (rd && (rd->decl || !rd->moduleName.empty())) return;   // a USER type
+    // fix #3543 (§2.8.3 rule 3, v0.286) follow-up: the discriminator the
+    // rest of the front-end adopted after #2995/#2997 was `moduleName.empty()`
+    // — pre-#3543 a builtinClassSym left it empty, SymbolCollection (local)
+    // and ModuleLoader (imported) populated it on every real TypeSymbol.
+    // #3543 inverted that discriminator for the synthesized iface by
+    // populating moduleName=`System`/`System.Collections.Generic` on the
+    // synthesized iface TypeSymbol; `isSynthesizedBuiltinInterface` (#3139)
+    // is the by-identity flag set on the same synthesized iface just BEFORE
+    // the #3543 moduleName assignment, and survives the inversion. After
+    // this fix a USER type still returns (`decl != nullptr` OR
+    // `!isSynthesizedBuiltinInterface`); a synthesized builtin iface
+    // (`decl == nullptr` AND `isSynthesizedBuiltinInterface`) falls through
+    // to the per-name checks, which silently no-op for it (none of
+    // `kNoConstructorBuiltins` / `kPositionalCtorOnlyBuiltinRecords` /
+    // `kBuiltinCtorLoweredByNameHeads` name a synthesized iface head), so
+    // the only behavior delta is that a synthesized iface is now processed
+    // (silently) instead of being skipped — user-observable behavior is
+    // identical (no diagnostic is produced either way).
+    if (rd && (rd->decl || !rd->isSynthesizedBuiltinInterface)) return;   // a USER type
     std::string n = rd ? std::string(rd->name) : std::string(rt->headName());
     if (n.empty()) return;
     if (isEnclosingGenericTypeParamName(n)) return;            // §14.2 shape

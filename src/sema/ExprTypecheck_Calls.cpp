@@ -254,13 +254,14 @@ bool ExprTC::implicitlyConvertible(const TypeRef* from, const TypeRef* to) {
         to->kind   == TypeRef::Kind::Named &&  to->declaration &&
         to->declaration->kind == ast::TypeDeclKind::Interface &&
         to->declaration->name == "IReadOnlySpan" &&
-        // fix #3022 (§11.3, v0.240): only the §4.16 BUILTIN interface has
-        // moduleName.empty() — SymbolCollection (local) and ModuleLoader
-        // (imported) populate moduleName on every real TypeSymbol. Without
-        // this gate a user interface named IReadOnlySpan would be admitted
-        // as the §4.16 target and codegen would box a span through a
-        // non-existent vtable.
-        to->declaration->moduleName.empty()) {
+        // fix #3022 (§11.3, v0.240) + #3543 follow-up: only the §4.16 BUILTIN
+        // interface passes this gate; `isSynthesizedBuiltinInterface` (#3139)
+        // replaces the pre-#3543 `moduleName.empty()` test (see
+        // ExprTypecheck.cpp:3307 for the rationale on the inversion).
+        // Without this gate a user interface named IReadOnlySpan would be
+        // admitted as the §4.16 target and codegen would box a span
+        // through a non-existent vtable.
+        to->declaration->isSynthesizedBuiltinInterface) {
         // Inline name extraction (callsNamedTypeSimpleName is defined later).
         std::string_view fromN;
         if (from->astNode && from->astNode->name &&
@@ -4381,16 +4382,17 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 !recvTy->astNode->name->parts.empty())
                                 spanHead = recvTy->headName();
                         } else if (!recvTy->declaration->decl ||
-                                   // fix #3022 (§11.3, v0.240): gate the
-                                   // IReadOnlySpan builtinClassSym match on
-                                   // moduleName.empty() so a USER interface
-                                   // named IReadOnlySpan (local or imported)
-                                   // does not get the §4.16 span-receiver
-                                   // typing — SymbolCollection and
-                                   // ModuleLoader populate moduleName on
-                                   // every real TypeSymbol.
+                                   // fix #3022 (§11.3, v0.240) + #3543 follow-up:
+                                   // gate the IReadOnlySpan builtinClassSym match
+                                   // on `isSynthesizedBuiltinInterface` (#3139)
+                                   // so a USER interface named IReadOnlySpan
+                                   // (local or imported) does not get the §4.16
+                                   // span-receiver typing. Replaces the
+                                   // pre-#3543 `moduleName.empty()` test — see
+                                   // ExprTypecheck.cpp:3307 for the rationale on
+                                   // the inversion.
                                    (recvTy->declaration->name == "IReadOnlySpan" &&
-                                    recvTy->declaration->moduleName.empty())) {
+                                    recvTy->declaration->isSynthesizedBuiltinInterface)) {
                             spanHead = recvTy->declaration->name;
                         }
                     }

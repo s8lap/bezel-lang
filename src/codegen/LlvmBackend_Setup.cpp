@@ -4824,12 +4824,19 @@ void Emitter::declareVtables() {
                 llvm::ConstantInt::get(llvm::Type::getInt64Ty(llvm_), 1),
                 ptrTy()));
             auto* itabArrTy = llvm::ArrayType::get(ptrTy(), itabElems.size());
+            // fix #3543 (§2.8.3 rule 3, v0.286): mint-qualify the itab name
+            // with `mangledTypeName` for BOTH the class and the interface (was
+            // `std::string(ts->name) + "$" + std::string(iface->name)` — the
+            // SIMPLE names only). Two enclosing types with the same simple
+            // name (e.g. `Outer1.Ord` and `Outer2.Ord`) each implementing the
+            // same simple-named interface (e.g. user-declared `IFoo`) would
+            // otherwise emit identical `itab$Ord$IFoo` and collide.
             auto* itabGV = new llvm::GlobalVariable(
                 *module_, itabArrTy, /*isConstant=*/true,
                 llvm::GlobalValue::InternalLinkage,
                 llvm::ConstantArray::get(itabArrTy, itabElems),
-                "itab$" + std::string(ts->name) + "$" +
-                    std::string(iface->name));
+                "itab$" + mangledTypeName(ts) + "$" +
+                    mangledTypeName(iface));
             itables_[{ts, iface}] = itabGV;
 
             // Append td$I and itab$C$I to the itmap pair list.
@@ -4844,11 +4851,17 @@ void Emitter::declareVtables() {
         // Null terminator.
         itmapElems.push_back(llvm::ConstantPointerNull::get(ptrTy()));
         auto* itmapArrTy = llvm::ArrayType::get(ptrTy(), itmapElems.size());
+        // fix #3543 (§2.8.3 rule 3, v0.286): mint-qualify the itmap name
+        // with `mangledTypeName(ts)` (was `std::string(ts->name)`) — see the
+        // itab$ sibling comment above for the full rationale. The itmap is
+        // also InternalLinkage today (#3536-style benign-by-accident) but
+        // its $N-name + LLVM auto-unique is a debugging hazard the
+        // qualification closes (#2928's reason).
         auto* itmapGV = new llvm::GlobalVariable(
             *module_, itmapArrTy, /*isConstant=*/true,
             llvm::GlobalValue::InternalLinkage,
             llvm::ConstantArray::get(itmapArrTy, itmapElems),
-            "itmap$" + std::string(ts->name));
+            "itmap$" + mangledTypeName(ts));
         itmaps_[ts] = itmapGV;
 
         // Build vtable (CG35-itable + §8.6/§8.5 #417 + §9.6 #946): [0]=td$C,
@@ -6924,11 +6937,19 @@ llvm::GlobalVariable* Emitter::buildImportedGenericVtable(
                 ptrTy());
             auto* itabArrTy =
                 llvm::ArrayType::get(ptrTy(), itabElems.size());
+            // fix #3543 (§2.8.3 rule 3, v0.286): mint-qualify the itab name
+            // for the spec-instantiation path with `mangledTypeName` for BOTH
+            // the class and the interface (was `tsName + "$" + iface->name` —
+            // the SIMPLE names). The $specN suffix disambiguates per-module
+            // instantiations but cannot disambiguate cross-module if two
+            // modules both happen to hit $spec0 for the same (class, iface)
+            // — qualification closes that.
             auto* itabGV = new llvm::GlobalVariable(
                 *module_, itabArrTy, /*isConstant=*/true,
                 llvm::GlobalValue::InternalLinkage,
                 llvm::ConstantArray::get(itabArrTy, itabElems),
-                "itab$" + tsName + "$" + std::string(iface->name) + suffix);
+                "itab$" + mangledTypeName(ts) + "$" +
+                    mangledTypeName(iface) + suffix);
             itmapElems.push_back(
                 llvm::cast<llvm::Constant>(descIt->second));
             itmapElems.push_back(
@@ -6937,11 +6958,13 @@ llvm::GlobalVariable* Emitter::buildImportedGenericVtable(
     }
     itmapElems.push_back(llvm::ConstantPointerNull::get(ptrTy()));
     auto* itmapArrTy = llvm::ArrayType::get(ptrTy(), itmapElems.size());
+    // fix #3543: see the itab$ sibling comment above for the rationale. The
+    // itmap is per-class and uses only the class name.
     auto* itmapGV = new llvm::GlobalVariable(
         *module_, itmapArrTy, /*isConstant=*/true,
         llvm::GlobalValue::InternalLinkage,
         llvm::ConstantArray::get(itmapArrTy, itmapElems),
-        "itmap$" + tsName + suffix);
+        "itmap$" + mangledTypeName(ts) + suffix);
 
     // --- (c) Specialized disposer ---
     // emitSpecializedDisposer builds BOTH the public Dispose (run-once flag
@@ -7063,9 +7086,14 @@ llvm::GlobalVariable* Emitter::buildImportedGenericVtable(
         // would otherwise uniquify the InternalLinkage name to
         // `bz$tostr$GTs12.1`, and this family's whole trail is which function
         // name appears in the faulting / mis-answering frame.
+        // fix #3543 (§2.8.3 rule 3, v0.286): mint-qualify with the owning
+        // class's `mangledTypeName` (was `tsName` = the simple name) so two
+        // enclosing types with the same simple name (e.g. `Outer1.Ord` and
+        // `Outer2.Ord`) do not emit the SAME `bz$tostr$Ord<suffix>`. The
+        // shape is otherwise identical to #3536's `bz$iter$` family fix.
         auto* thunk = llvm::Function::Create(
             llvm::FunctionType::get(ptrTy(), {ptrTy()}, /*isVarArg=*/false),
-            llvm::Function::InternalLinkage, "bz$tostr$" + tsName + suffix,
+            llvm::Function::InternalLinkage, "bz$tostr$" + mangledTypeName(ts) + suffix,
             module_.get());
         emitClassToStringThunkBody(ts, thunk, t3);
         elems[kToStringSlot] = llvm::cast<llvm::Constant>(thunk);
@@ -7076,10 +7104,11 @@ llvm::GlobalVariable* Emitter::buildImportedGenericVtable(
     // class vtable, so an Object-typed receiver of this specialization dispatches.
     if (llvm::Function* t4 =
             layoutSpecializedSlotTarget(classSlotEqualsImpl(ts))) {
+        // fix #3543: see the bz$tostr$ sibling above.
         auto* thunk = llvm::Function::Create(
             llvm::FunctionType::get(i1(), {ptrTy(), ptrTy()},
                                     /*isVarArg=*/false),
-            llvm::Function::InternalLinkage, "bz$eq$" + tsName + suffix,
+            llvm::Function::InternalLinkage, "bz$eq$" + mangledTypeName(ts) + suffix,
             module_.get());
         emitClassEqualsThunkBody(thunk, t4);
         elems[kEqualsSlot] = llvm::cast<llvm::Constant>(thunk);
@@ -7088,9 +7117,10 @@ llvm::GlobalVariable* Emitter::buildImportedGenericVtable(
     }
     if (llvm::Function* t5 =
             layoutSpecializedSlotTarget(classSlotHashCodeImpl(ts))) {
+        // fix #3543: see the bz$tostr$ sibling above.
         auto* thunk = llvm::Function::Create(
             llvm::FunctionType::get(i32(), {ptrTy()}, /*isVarArg=*/false),
-            llvm::Function::InternalLinkage, "bz$hash$" + tsName + suffix,
+            llvm::Function::InternalLinkage, "bz$hash$" + mangledTypeName(ts) + suffix,
             module_.get());
         emitClassHashCodeThunkBody(thunk, t5);
         elems[kGetHashCodeSlot] = llvm::cast<llvm::Constant>(thunk);
@@ -7811,12 +7841,15 @@ llvm::GlobalVariable* Emitter::specializedVtableFor(const sema::TypeSymbol* ts) 
                     patchSlot(/*isSet=*/true, sit2->second);
             }
             auto* newItabArrTy = llvm::ArrayType::get(ptrTy(), newItabElems.size());
+            // fix #3543: see the §2.8.3 rule 3 itab$ sibling comment at
+            // line 4831 (the class-vtable itab$) for the rationale. The shape
+            // here is the imported-generic-instantiation re-emit twin.
             auto* newItabGV = new llvm::GlobalVariable(
                 *module_, newItabArrTy, /*isConstant=*/true,
                 llvm::GlobalValue::InternalLinkage,
                 llvm::ConstantArray::get(newItabArrTy, newItabElems),
-                "itab$" + std::string(ts->name) + "$" +
-                    std::string(iface->name) + suffix);
+                "itab$" + mangledTypeName(ts) + "$" +
+                    mangledTypeName(iface) + suffix);
             auto dit = descArray_.find(iface);
             if (dit != descArray_.end()) {
                 newItmapElems.push_back(llvm::cast<llvm::Constant>(dit->second));
@@ -7827,11 +7860,14 @@ llvm::GlobalVariable* Emitter::specializedVtableFor(const sema::TypeSymbol* ts) 
         newItmapElems.push_back(llvm::ConstantPointerNull::get(ptrTy()));
         auto* newItmapArrTy =
             llvm::ArrayType::get(ptrTy(), newItmapElems.size());
+        // fix #3543: see the §2.8.3 rule 3 itmap$ sibling comment at
+        // line 4851 (the class-vtable itmap$) for the rationale. The shape
+        // here is the imported-generic-instantiation re-emit twin.
         specItmapGV = new llvm::GlobalVariable(
             *module_, newItmapArrTy, /*isConstant=*/true,
             llvm::GlobalValue::InternalLinkage,
             llvm::ConstantArray::get(newItmapArrTy, newItmapElems),
-            "itmap$" + std::string(ts->name) + suffix);
+            "itmap$" + mangledTypeName(ts) + suffix);
     }
 
     // (c) fix #2906: the VIRTUAL METHOD slots proved above to hold a body
@@ -7915,23 +7951,28 @@ llvm::GlobalVariable* Emitter::specializedVtableFor(const sema::TypeSymbol* ts) 
             continue;
         llvm::Function* thunk = nullptr;
         if (os.slot == kToStringSlot) {
+            // fix #3543: mint-qualify with `mangledTypeName(ts)` (was
+            // `std::string(ts->name)`) — see the §2.8.3 rule 3 comment at
+            // the spec-instantiation twin site above for the full rationale.
             thunk = llvm::Function::Create(
                 llvm::FunctionType::get(ptrTy(), {ptrTy()}, /*isVarArg=*/false),
                 llvm::Function::InternalLinkage,
-                "bz$tostr$" + std::string(ts->name) + suffix, module_.get());
+                "bz$tostr$" + mangledTypeName(ts) + suffix, module_.get());
             emitClassToStringThunkBody(ts, thunk, specTarget);
         } else if (os.slot == kEqualsSlot) {
+            // fix #3543: see the kToStringSlot twin above.
             thunk = llvm::Function::Create(
                 llvm::FunctionType::get(i1(), {ptrTy(), ptrTy()},
                                         /*isVarArg=*/false),
                 llvm::Function::InternalLinkage,
-                "bz$eq$" + std::string(ts->name) + suffix, module_.get());
+                "bz$eq$" + mangledTypeName(ts) + suffix, module_.get());
             emitClassEqualsThunkBody(thunk, specTarget);
         } else if (os.slot == kGetHashCodeSlot) {
+            // fix #3543: see the kToStringSlot twin above.
             thunk = llvm::Function::Create(
                 llvm::FunctionType::get(i32(), {ptrTy()}, /*isVarArg=*/false),
                 llvm::Function::InternalLinkage,
-                "bz$hash$" + std::string(ts->name) + suffix, module_.get());
+                "bz$hash$" + mangledTypeName(ts) + suffix, module_.get());
             emitClassHashCodeThunkBody(thunk, specTarget);
         }
         if (thunk) elems[os.slot] = llvm::cast<llvm::Constant>(thunk);
@@ -31601,9 +31642,15 @@ llvm::Constant* Emitter::classToStringThunk(const sema::TypeSymbol* ts) {
     sema::MethodSymbol* userToStr = classSlotToStringImpl(ts);
 
     auto* fnTy = llvm::FunctionType::get(ptrTy(), {ptrTy()}, /*isVarArg=*/false);
+    // fix #3543 (§2.8.3 rule 3, v0.286): mint-qualify the thunk name with
+    // `mangledTypeName(ts)` (was `std::string(ts->name)`) so two enclosing
+    // types with the same simple name (`Outer1.Ord` and `Outer2.Ord`) do
+    // not emit the SAME `bz$tostr$Ord`. InternalLinkage so this is
+    // #3536-style benign-by-accident, but a misleading stack frame in a
+    // crash makes the bug harder to diagnose — see the bz$iter$ precedent.
     auto* thunk = llvm::Function::Create(
         fnTy, llvm::Function::InternalLinkage,
-        "bz$tostr$" + std::string(ts->name), module_.get());
+        "bz$tostr$" + mangledTypeName(ts), module_.get());
     classToStringFns_[ts] = thunk;
     llvm::Function* target = nullptr;
     if (userToStr)
@@ -31696,9 +31743,10 @@ llvm::Constant* Emitter::classEqualsThunk(const sema::TypeSymbol* ts) {
 
     auto* fnTy = llvm::FunctionType::get(i1(), {ptrTy(), ptrTy()},
                                          /*isVarArg=*/false);
+    // fix #3543: see the bz$tostr$ twin comment above for the rationale.
     auto* thunk = llvm::Function::Create(
         fnTy, llvm::Function::InternalLinkage,
-        "bz$eq$" + std::string(ts->name), module_.get());
+        "bz$eq$" + mangledTypeName(ts), module_.get());
     classEqualsFns_[ts] = thunk;
     llvm::Function* target = nullptr;
     if (userEq)
@@ -31765,9 +31813,10 @@ llvm::Constant* Emitter::classHashCodeThunk(const sema::TypeSymbol* ts) {
     sema::MethodSymbol* userHash = classSlotHashCodeImpl(ts);
 
     auto* fnTy = llvm::FunctionType::get(i32(), {ptrTy()}, /*isVarArg=*/false);
+    // fix #3543: see the bz$tostr$ twin comment above for the rationale.
     auto* thunk = llvm::Function::Create(
         fnTy, llvm::Function::InternalLinkage,
-        "bz$hash$" + std::string(ts->name), module_.get());
+        "bz$hash$" + mangledTypeName(ts), module_.get());
     classHashCodeFns_[ts] = thunk;
     llvm::Function* target = nullptr;
     if (userHash)

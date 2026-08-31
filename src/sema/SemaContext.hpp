@@ -1307,6 +1307,13 @@ inline TypeSymbol* SemaContext::builtinInterfaceSym(std::string_view name) {
         // can tell a base that names one of these from a USER type of the same
         // name without a second hand-listed copy of the name set.
         ts->isSynthesizedBuiltinInterface = true;
+        // fix #3543 (§2.8.3 rule 3, v0.286): populate the owning module so
+        // `mangledTypeName` renders the head descriptor `td$<I>` qualified.
+        // Without this, the head `td$IComparable` is a bare weak LinkOnceODR
+        // global whose name cannot distinguish two linked modules that each
+        // name a same-named user type `IComparable` (LinkOnceODR ODR-merges by
+        // name; the resulting ambiguity was filed for issue #3543).
+        ts->moduleName = "System";
         builtinInterfaceCache_[key] = ts;
         return ts;
     }
@@ -1511,6 +1518,19 @@ inline TypeSymbol* SemaContext::builtinInterfaceSym(std::string_view name) {
 
     // #3139: see the sibling assignment in the §11.8 branch above.
     ts->isSynthesizedBuiltinInterface = true;
+    // fix #3543 (§2.8.3 rule 3, v0.286): populate the owning module so
+    // `mangledTypeName` renders the head descriptor `td$<I>` qualified.
+    // IComparable / IEquatable live in `System`; IReadOnlySpan lives in
+    // `System` (auto-imported stdlib §2 / §4.16); IEqualityComparer lives in
+    // `System.Collections.Generic` (stdlib §4.5). Without this, the head
+    // `td$IComparable` was a bare weak LinkOnceODR global whose name could
+    // not distinguish two linked modules that each name a same-named user
+    // type (issue #3543). The two arms share the same fix premise — a
+    // synthesized iface's `moduleName` is empty by construction, but the
+    // ODR-merging linker needs the module qualifier to be a name-stable
+    // unique identity.
+    ts->moduleName = (name == "IEqualityComparer") ? "System.Collections.Generic"
+                                                  : "System";
     builtinInterfaceCache_[key] = ts;
     return ts;
 }
