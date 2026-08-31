@@ -275,10 +275,20 @@ bool isNonTrivialDisposeClassImpl(
             if (!fs) continue;
             // fix #2666 / §15.1.1: an owning-inline-array field disqualifies
             // — the AST `arrayOwned` flag is read directly (no ctx needed).
+            // Gate the AST cast on `fs->decl != nullptr` (an IMPORTED field
+            // symbol has decl == nullptr per ModuleLoader's policy, #3149).
+            // Imports are already short-circuited above via the Consult arm
+            // of `importedNonTrivialDispose` (the exporter runs the same
+            // predicate and carries the verdict across the wire, #3191).
             const ast::Type* fieldAstTy = nullptr;
             if (fs->posParam) fieldAstTy = fs->posParam->type.get();
-            else if (auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl))
-                fieldAstTy = fd->type.get();
+            else if (fs->decl) {
+                // SEAM-ACCESSOR: both-sources (symbol-side `fs->decl`-gate
+                // above; AST side the FieldDecl cast here; import path dead
+                // via Consult arm — see Layout.cpp:1509/#3149 for template).
+                if (auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl))
+                    fieldAstTy = fd->type.get();
+            }
             if (fieldAstTy && fieldAstTy->kind == ast::TypeKind::InlineArray &&
                 fieldAstTy->arrayOwned) { reject = true; break; }
             if (fs->posParam) {
