@@ -12189,6 +12189,142 @@ void ExprTC::checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t) {
             // keep that fall-through to preserve the existing import-side
             // behavior (don't widen it here either).
             return;
+        } else if (ctx_.isImported(t) && hasExplicitCtor && !ne.args.empty()) {
+            // fix #3625 (§22.5 / §22.7 / §22.10 / §2.8.3 rule 4, v0.286) — the
+            // SEMANTIC half. The wire format's `convertClassDecl` /
+            // `ModuleMetadataBuilder.cpp` already carries every
+            // `ConstructorSymbol` (the convenience ctor rides alongside the
+            // primary's positional fields; the loader's
+            // `MetaMemberKind::Constructor` arm at `ModuleLoader.cpp:956`
+            // reconstructs each one into the imported class's `members`),
+            // so the import-side asymmetry the LOCAL deferral above hides
+            // (local combined → sema defers and `lowerNew`'s `ctorForArgs`
+            // resolves against the explicit ctor) is a SEMANTIC lookup gap:
+            // sema's imported arm at line 12176 routed the call through
+            // `checkPositionalNewArgsFromSymbols` (which checks the
+            // PRIMARY's positional fields) and never saw the imported
+            // convenience ctor. Measured: `new WithConv(6)` against
+            // `class WithConv(a: int, b: string)` + `constructor(x: int)
+            // this(x, "conv")` was REJECTED with
+            // "required parameter `b` is not supplied (§22.5)", naming a
+            // constructor the user did not call; the single-module twin
+            // compiles and prints `6\nconv`.
+            //
+            // The fix: probe each explicit ctor against `bindArgsToParams`
+            // BEFORE the primary-field check. `bindArgsToParams` runs over
+            // `FormalsView::of(*cs)` so the SAME rule, the SAME five §22.5
+            // diagnostics, and the SAME side-table publication that
+            // `checkImportedNewExprArgs` already uses apply — one body, not
+            // a parallel vocabulary. The exact-match path (one ctor accepts
+            // the call) runs the binder a second time with `emit=true` to
+            // publish diagnostics + the side-table binding; the
+            // §5.1 per-argument assignability check is the same
+            // `checkImportedNewExprArgs` already does for the no-primary-ctor
+            // imported case. ZERO matches falls through to the primary-field
+            // check below (preserving the (2) path `new WithConv(7,
+            // "direct")` — two args against a one-arg convenience ctor —
+            // and every pre-existing imported primary-ctor call). TWO+
+            // matches (overloaded explicit ctors) DEFER, mirroring the
+            // local twin's pre-#3586 cross-module overload deferral in
+            // `checkImportedNewExprArgs` (the overload-aware §22.6 ranking
+            // for imported ctors is a wider change — file separately).
+            //
+            // ⚠ Loud→quiet transition: the codegen half (`emitChainCall`'s
+            // `this(...)`-to-primary arm in `LlvmBackend_impl.hpp`,
+            // L3's #3551 just landed on the same file) is the FOLLOW-UP —
+            // an imported ctor body is not carried in the wire metadata
+            // (Foundation C blocker, #662), so `lowerNew`'s imported arm at
+            // `LlvmBackend_Exprs2.cpp:5846` calls `declareImportedInit(t)`
+            // and silently zero-initializes. This fix is the SEMANTIC accept
+            // the §22.5 rule mandates; the silent-zero runtime is the cost
+            // of a correct-as-specified sema rule until the codegen half
+            // lands. Filed as follow-up #3649.
+            std::vector<ConstructorSymbol*> ctors;
+            for (Symbol* m : t->members) {
+                auto* cs = dynamic_cast<ConstructorSymbol*>(m);
+                if (cs && !cs->isStatic) ctors.push_back(cs);
+            }
+            const std::string desc =
+                std::string("`new ") + std::string(t->name) + "`";
+            int arityMatches = 0;
+            ConstructorSymbol* boundCs = nullptr;
+            for (ConstructorSymbol* cs : ctors) {
+                BindResult b = bindArgsToParams(
+                    sema::FormalsView::of(*cs), ne.args, ne.span.begin,
+                    desc, /*emit=*/false);
+                if (b.ok) {
+                    arityMatches++;
+                    boundCs = cs;
+                }
+            }
+            if (arityMatches == 1 && boundCs) {
+                // Re-run with emit=true — publishes the §22.5 side-table
+                // binding (the same one `checkImportedNewExprArgs` and
+                // `checkPositionalNewArgsFromSymbols` publish) and the
+                // diagnostic if anything later turns out to be wrong.
+                BindResult b = bindArgsToParams(
+                    sema::FormalsView::of(*boundCs), ne.args, ne.span.begin,
+                    desc, /*emit=*/true);
+                if (!b.ok) return;  // binder reported; no cascade
+                ctx_.setNewExprPositionalBinding(&ne, b.paramToArg);
+                // §5.1 per-argument assignability — the same walk
+                // `checkImportedNewExprArgs` performs for the
+                // no-primary-ctor imported arm at line 12780, so a
+                // rejected §5.1 binding reads identically across the
+                // two paths. Defaults that did not survive the wire
+                // get the same "not materializable" diagnostic the
+                // imported-only arm emits (#3082).
+                const std::size_t nparams = boundCs->params.size();
+                for (std::size_t j = 0; j < nparams; ++j) {
+                    if (b.paramToArg[j] < 0) {
+                        if (!sema::importedDefaultTextIsMaterializable(
+                                sema::formalParamDefaultText(*boundCs, j)))
+                            ctx_.diagnostics().report(
+                                Severity::Error, ne.span.begin,
+                                desc + ": parameter `" +
+                                    std::string(sema::formalParamName(
+                                        *boundCs, j)) +
+                                    "` of an imported constructor "
+                                    "declares a default the dependency's "
+                                    "metadata did not carry as a "
+                                    "compile-time value, so it cannot be "
+                                    "materialized here — pass the "
+                                    "argument explicitly (§22.5, #3082)");
+                        continue;
+                    }
+                    auto* p = dynamic_cast<ParameterSymbol*>(
+                        boundCs->params[j]);
+                    if (!p || !p->resolvedDeclType) continue;
+                    const ast::CallArgument& a =
+                        ne.args[static_cast<std::size_t>(b.paramToArg[j])];
+                    if (!a.value) continue;
+                    checkAssignable(ctx_.exprType(*a.value),
+                                    p->resolvedDeclType,
+                                    a.value->span.begin,
+                                    desc + ": argument " +
+                                        std::to_string(j + 1),
+                                    a.value.get());  // per §7.4 / §27.6 (#1191)
+                }
+                return;
+            }
+            if (arityMatches > 1) {
+                return;  // overloaded explicit ctors — defer
+            }
+            // 0 matches — no explicit ctor matched the call. The CASCADE's
+            // `else if` structure does NOT fall through to the primary-only
+            // branch on its own — we entered this `else if`, so the rest of
+            // the chain is skipped and control falls out of the entire
+            // `if (t->hasPositionalFields)` block. The imported primary-ctor
+            // check must therefore run HERE explicitly, before we exit, so
+            // the (2) path `new WithConv(7, "direct")` (two args against a
+            // one-arg convenience ctor — the convenience probe fails, the
+            // primary probe below accepts) preserves the pre-fix behaviour
+            // for the imported primary-ctor case. The same call site as the
+            // `else if (!ne.args.empty() && !recordPositionalFieldSymbols(t)
+            // .empty())` arm one arm down — running here keeps the cascade's
+            // left-to-right semantics intact.
+            checkPositionalNewArgsFromSymbols(ne, t);
+            return;
         } else if (!ctx_.isImported(t) && !recordPositionalFieldSymbols(t).empty()) {
             // LOCAL primary-only (no explicit ctor with matching arity): run
             // the §22.5 check via `checkPositionalNewArgsFromSymbols`. This
