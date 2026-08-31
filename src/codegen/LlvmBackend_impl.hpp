@@ -1167,6 +1167,30 @@ private:
         // holds the object pointer (via its alloca); `cls` is the static class
         // when known (dispatch is dynamic regardless).
         bool unwindOnly = false;
+        // fix #3604 (§29.7 / §28.3 / §29.2, v0.286): the per-iteration
+        // AUTO-DROP of an `IOwningEnumerable<T>` `for var x in seq` loop
+        // variable (§29.2 / §28.3 plain-owned-local rule on every body-exit
+        // edge, including fall-through / break / continue / return / throw).
+        // The runtime emission is `unwindOnly` (line 8035 in
+        // LlvmBackend_Stmts.cpp) — that flag is correct for endBB / break /
+        // throw / return (every one is an isUnwind=true emitDisposals path,
+        // which is what an `unwindOnly` entry fires on) — but the §29.7
+        // abandonment snapshot ("cleanup actions active at the point of
+        // suspension, in reverse order of establishment, exactly as if the
+        // body had exited at the suspension point") SKIPS `unwindOnly`
+        // entries, so on this one edge the auto-drop never reaches Dispose.
+        // That is the leak #3604 measures. This flag carves the loop-element
+        // entry OUT of the snapshot's unwindOnly exemption (the snapshot is
+        // the only consumer that reads it — endBB / break / throw / return are
+        // unaffected, so the auto-drop still fires only on the unwind path
+        // for every OTHER consumer and the §28.3 / §29.2 normal-exit
+        // discharge-by-program is unchanged). Exactly-once on §29.7 is
+        // guaranteed by the same arg the iterEnumDispose fix (#3468) makes:
+        // Dispose stamps the DISPOSED sentinel (-2) before replaying the
+        // stack, so no MoveNext can resume past the yield and reach the
+        // loop's own disposal; the snapshot's auto-drop is therefore the
+        // SOLE disposal of the element on this edge.
+        bool forInAutoDrop = false;
         // §30.15 / §28.13 / §28.3 (#1957): like `unwindOnly`, but for a
         // TYPE-SPECIFIC builtin disposal (channelSender / channel / sharedHandle)
         // rather than the generic vtable dispatch. Set for an `owned`

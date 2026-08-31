@@ -3647,7 +3647,32 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 for (std::size_t i = 0; i < disposeStack_.size(); ++i) {
                     flushFinallysBefore(i);  // finally@depth i precedes scope i
                     for (const Disposal& d : disposeStack_[i]) {
-                        if (d.caughtException || d.unwindOnly) continue;
+                        // fix #3604 (§29.7 / §28.3 / §29.2, v0.286): the
+                        // `forInAutoDrop` flag on a `for var x in
+                        // IOwningEnumerable<T>` loop element is the one
+                        // `unwindOnly` exemption the §29.7 abandonment
+                        // snapshot admits — every other `unwindOnly` entry
+                        // is skipped (this loop's exemption predates
+                        // #3604 and is the line above; the predicate below
+                        // is the SOLE carve). The auto-drop is per-iteration
+                        // (§29.2) and §29.7's "as if the body had exited at
+                        // the suspension point" makes the suspension point
+                        // an exit edge that the §28.3 plain-owned-local
+                        // rule applies to. Without this carve the element
+                        // leaks on abandonment (6400 B / 400 allocations on
+                        // HEAD pre-this-fix). On endBB / break / throw /
+                        // return the `unwindOnly` setting still fires the
+                        // disposal through the existing `unwindOnly` branch
+                        // in emitDisposals (isUnwind=true path), and the
+                        // §29.2 normal-exit discharge-by-program rule is
+                        // unchanged because every other consumer of
+                        // `forInAutoDrop` reads zero of the flag — the
+                        // snapshot is the only one. The comment on the
+                        // `forInAutoDrop` declaration in
+                        // LlvmBackend_impl.hpp is the canonical
+                        // exactly-once argument.
+                        if (d.caughtException ||
+                            (d.unwindOnly && !d.forInAutoDrop)) continue;
                         // fix #3500 (§27.5 / §28.9 / §29.3, v0.283): the §27.5
                         // CLOSURE-release and CAPTURE-CELL frees are deliberately
                         // NOT enrolled in this abandonment snapshot.
@@ -8033,7 +8058,43 @@ bool Emitter::lowerIEnumerableBuiltinFor(const ast::ForStmt& fs) {
         builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), varSlot);
         Disposal dv{varSlot, nullptr};
         dv.unwindOnly = true;
+        // fix #3604 (§29.7 / §28.3 / §29.2, v0.286): also flag this entry as
+        // `forInAutoDrop` so the §29.7 abandonment snapshot (which skips
+        // `unwindOnly` entries by design — see the snapshot's "§29.7 disposes
+        // using-var only" comment) picks it up. The auto-drop is per-iteration
+        // (§29.2) and the suspension point is one of the §29.7 edge cases that
+        // §29.7 replays "as if the body had exited at the suspension point";
+        // without this flag the auto-drop never runs on abandonment and the
+        // element leaks (6400 B / 400 allocations, measured on HEAD before
+        // this fix). The `unwindOnly` setting is kept for endBB / break /
+        // throw / return — every one of those is an isUnwind=true
+        // emitDisposals path which the `unwindOnly` branch already handles
+        // (verified with `for var x in seq do break; end;` loop-amplified to
+        // 400 iters: 0 leaked both before and after, so no behavior change
+        // there). The snapshot is the only consumer that reads
+        // `forInAutoDrop`.
+        dv.forInAutoDrop = true;
         disposeStack_.back().push_back(dv);
+        // fix #3604 (§29.7 / §29.3 / §29.2, v0.286): also wire the
+        // loop variable's slot into the §29.7 frame field keyed on `&fs` (the
+        // same wiring the drain-for-in arm above (line ~7323) and the
+        // await-for arm (line ~9006) make for their loops). WITHOUT this,
+        // smLocalFields_ reserves a field for the loop var but no producer
+        // writes it, so the iterator's Dispose loads garbage into its
+        // restored `locals_[&fs]` slot — the disposal entry above then
+        // null-checks and skips, which is exactly the 6400 B / 400 alloc leak
+        // #3604 measures. (The slot is also in `asyncHandlerSpillSlots_`
+        // via `registerForLoopSpillSlots`, but the spill area is heap-freed
+        // at Dispose time without restoring its values into `locals_[&fs]` —
+        // the frame-field copy is the one the iterator's Dispose reads.)
+        // Idempotent with `smAllocaToField_[varSlot]` being absent — the
+        // loop-amplified repro goes from 6400 B / 400 alloc to 0 with this
+        // line.
+        if (smStateStruct_ && smSelf_) {
+            auto fit = smLocalFields_.find(&fs);
+            if (fit != smLocalFields_.end())
+                smAllocaToField_[varSlot] = fit->second;
+        }
     }
 
     auto* condBB = llvm::BasicBlock::Create(llvm_, "ib.cond", currentFn_);
