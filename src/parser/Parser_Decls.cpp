@@ -1868,6 +1868,18 @@ std::unique_ptr<ast::Member> Parser::parseInterfaceMember() {
         advance();  // past `operator`
         auto op = std::make_unique<ast::OperatorDecl>();
         op->visibility = ast::Visibility::None;  // implicit public (§10.1)
+        // fix #3629 (§22.15 / §11.8, v0.286): the pre-keyword prefix scanned
+        // `pureMod` (line 1655) for every interface member kind. The other three
+        // branches push it into a modifier list; IfaceOperator follows the
+        // class-side `parseOperatorDeclBody` path and folds `pure` into the
+        // dedicated `ast::OperatorDecl::isPure` bool — the channel `collectMember`
+        // (SymbolCollection.cpp) and `ModuleMetadataBuilder::convertMember` both
+        // read. Without this assignment the local symbol reads `isPure=false`,
+        // the wire carries `MetaMember::isPure=false`, and an importer sees an
+        // unpure operator even though the source declared it `pure`. The error
+        // path for an interface event at `:1758` is intentionally distinct:
+        // §22.15 rejects `pure` on events with a hard diagnostic.
+        op->isPure = pureMod;
         op->opToken = current_.text;
         advance();  // past the OpToken
         if (!consumePunctuator("(")) {
