@@ -2714,11 +2714,34 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                                     auto* ps = dynamic_cast<PropertySymbol*>(
                                         lookupMember(ctr->declaration, ".this"));
                                     if (!ps || !ps->isIndexer) continue;
-                                    auto* pd =
-                                        dynamic_cast<const ast::PropertyDecl*>(
-                                            ps->decl);
-                                    if (!pd || !pd->type) continue;
-                                    if (auto* rt = ctx_.resolvedType(*pd->type)) {
+                                    TypeRef* rt = nullptr;
+                                    // fix #3620 (§14.2 / §23.4 / §2.5,
+                                    // v0.286): an IMPORTED constraint
+                                    // interface's indexer has no
+                                    // `ast::PropertyDecl` (ModuleLoader
+                                    // reconstructs only the PropertySymbol +
+                                    // `indexerParams` ParameterSymbols, no AST
+                                    // crosses the artifact boundary — §2.5),
+                                    // so `ps->decl == nullptr` and the prior
+                                    // `if (!pd || !pd->type) continue` guard
+                                    // abandoned the whole constraint path for
+                                    // any imported interface. Fall back to
+                                    // `ctx_.importedMemberType(ps)` (the same
+                                    // side table the IndexExpr sibling site
+                                    // ~500 lines below reads from in its
+                                    // own `if (pd) … else importedMemberType`
+                                    // arm), so a constraint indexer is typed
+                                    // for an imported interface exactly the
+                                    // same way as for a local one.
+                                    if (auto* pd =
+                                            dynamic_cast<const ast::PropertyDecl*>(
+                                                ps->decl)) {
+                                        if (pd->type)
+                                            rt = ctx_.resolvedType(*pd->type);
+                                    } else {
+                                        rt = ctx_.importedMemberType(ps);
+                                    }
+                                    if (rt) {
                                         ctx_.setExprType(
                                             &e, substituteMemberType(
                                                     rt, ix->target.get(),
@@ -2729,27 +2752,12 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                                         // accessor call too — invalidate a
                                         // mutably-captured local's narrowing
                                         // (#1566). fix #3616: ask the symbol,
-                                        // not the decl. The ANSWER is unchanged
-                                        // here today — the `if (!pd ||
-                                        // !pd->type) continue` guard above means
-                                        // `pd` is non-null by the time this
-                                        // line runs, and an indexer is never
-                                        // auto — so this is a spelling change,
-                                        // made so all three §7.4 sites ask the
-                                        // one accessor and this one cannot
-                                        // become the next silent `if (auto* pd
-                                        // = …)`. That guard is separately
-                                        // suspect (`ps->decl` is null for every
-                                        // IMPORTED indexer, and the sibling
-                                        // IndexExpr site ~500 lines below falls
-                                        // back to `ctx_.importedMemberType(ps)`
-                                        // where this one gives up), but a
-                                        // repro distinguishing the imported
-                                        // from the local case could not be
-                                        // built — both fail identically at
-                                        // codegen on an unrelated #2491
-                                        // degrade — so it is recorded as an
-                                        // open observation, not fixed here.
+                                        // not the decl. Mirrors the IndexExpr
+                                        // sibling site (§7.4 path now also
+                                        // fires for the imported constraint
+                                        // interface case the `if (!pd ||
+                                        // !pd->type) continue` guard used to
+                                        // silently skip).
                                         if (propertyAccessRunsUserCode(ps, ctx_))
                                             invalidateCapturedNarrowings();
                                         return true;
