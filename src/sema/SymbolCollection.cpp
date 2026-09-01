@@ -1111,16 +1111,19 @@ bool propertyGetterIsPure(const PropertySymbol* ps) {
     // classification direction the bug measured; for a LOCAL property
     // it agrees with the AST walk but skips a redundant `dynamic_cast`.
     // SEAM-ACCESSOR: the accessor-level arm of the getter-purity predicate.
+    // Both sides of the module boundary populate this slot from the same
+    // source (`pd->accessors` locally in SymbolCollection's PropertyDecl
+    // arm; `MetaMember::accessorIsPure` on the wire in ModuleLoader's
+    // PropertySymbol / Indexer arms, #3618's 19th scalar), so the
+    // dynamic_cast-based AST walk that used to live below would have
+    // answered "no" for every imported symbol — the silent-wrong-
+    // classification direction #3618 fixed — and is now removed. A
+    // future code path that constructs a PropertySymbol without setting
+    // `accessorIsPure` will fail loudly (this predicate returns false,
+    // §22.15 rule 6 rejects the read at the impure call site) rather
+    // than silently agree with an AST walk that #3618 already proved
+    // unsound across the seam.
     if (ps->accessorIsPure) return true;
-    // Defense in depth: any PropertySymbol built by a path that did not
-    // set `accessorIsPure` (a future synthetic AST node, the
-    // `parseAndAttachPropertyBody` re-parse path that attaches a fresh
-    // PropertyDecl but does NOT re-run collectMember) still walks the
-    // AST directly. Cheap and consistent with the propertyGetterIsPure
-    // contract pre-#3618.
-    if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl))
-        for (const auto& a : pd->accessors)
-            if (a.isPure && !a.isSet) return true;
     return false;
 }
 
