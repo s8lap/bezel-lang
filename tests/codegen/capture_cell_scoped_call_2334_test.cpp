@@ -209,21 +209,33 @@ BEZEL_TEST(capture_cell_scoped_call_2334, ievent_subscribe_no_leak) {
         1);
 }
 
-// CONTROL: TaskScope.Spawn on a using-var TaskScope receiver WITHOUT a local
-// capture (lambda body references no captured local). The pre-scan's special
-// case fires collectLambdaCaptures on an empty capture set, so the fix
+// CONTROL: TaskScope.Spawn on an await-using-var TaskScope receiver WITHOUT a
+// local capture (lambda body references no captured local). The pre-scan's
+// special case fires collectLambdaCaptures on an empty capture set, so the fix
 // machinery runs but the cell-free-eligible set is empty — exercises the
-// non-interference of the fix's consumeLastLambdaCapturedCells path with
-// the ordinary capture-free Spawn lambda. Regression guard against
-// accidentally breaking the no-capture shape while widening the fix.
+// non-interference of the fix's consumeLastLambdaCapturedCells path with the
+// ordinary capture-free Spawn lambda. Regression guard against accidentally
+// breaking the no-capture shape while widening the fix.
 // (Async shape — same as the original #2334 regression-guard control test.)
+//
+// TaskScope REQUIRES `await using var` per stdlib §6.10 (v0.175, #808): a
+// synchronous destructor cannot await the drain. The pre-#3633 file's
+// `using var scope` was a compile error ever since v0.175, but the broken
+// program was silently swallowed by the conflated -1 (runUnderAsanWithOptions
+// returned -1 for any non-clean path including a parse/sema/emit failure on
+// the test program). #3633 split -1 into per-cause codes (-2 broken program,
+// -3 link failure, -4 system() failure) so this row now loud-fails — which
+// is the entire point of #3633. The fix is on the TEST PROGRAM, not the
+// harness: change `using var scope` to `await using var scope` (the shape
+// every sibling test in taskscope_asan_2334_test.cpp /
+// taskscope_asan_808_test.cpp already uses).
 BEZEL_TEST(capture_cell_scoped_call_2334, taskscope_spawn_no_local_capture_regression_guard) {
     expectAsanClean(
         std::string("module M; import System.Threading;") +
         "class Prog "
         "  public static method Always(): bool => true; "
         "  public static async method Run(): Task "
-        "    using var scope := new TaskScope(); "
+        "    await using var scope := new TaskScope(); "
         "    scope.Spawn(async lambda() => do await Task.Delay(1); end); "
         "    await scope.Join(); "
         "  end Run; "
