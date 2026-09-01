@@ -1730,10 +1730,13 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
             // it at (both run inside this scope, one immediately after the
             // other), so the two cannot disagree.
             bool declaredShallower = false;
+            std::size_t declScopeDepth = 0;
             {
                 auto ddit = declScopeDepth_.find(static_cast<const void*>(decl));
-                declaredShallower = ddit != declScopeDepth_.end() &&
-                                    ddit->second < disposeStack_.size();
+                if (ddit != declScopeDepth_.end()) {
+                    declaredShallower = ddit->second < disposeStack_.size();
+                    declScopeDepth = ddit->second;
+                }
             }
             bool guardedOk = !wasGuardedLocal || isPatternBinding ||
                              loopStack_.empty() || declaredShallower;
@@ -1744,6 +1747,87 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
                 lce.unwindUnsafe = unwindUnsafeCellFree_.count(
                                        static_cast<const void*>(decl)) != 0;
                 lastLambdaCapturedCells_.push_back(lce);
+            }
+            // fix #3508 (§27.5 / §28.9, v0.286): the #969/#3403 depth guard
+            // at the CONSUMER refuses to free a captured cell at the inner
+            // lambda's scope when the captured local was declared in an OUTER
+            // scope (the read-after-inner-block hazard: the local's slot is
+            // read THROUGH the cell after the inner block exits, when the
+            // local outlives the inner block). For a SYNC lambda capture
+            // behind an `if` (no async, no catch-arm, no loop), the lambda is
+            // non-escaping (`cellFreeEligible_` says so) and `loopStack_
+            // .empty()` says the guarded cell is allocated exactly once per
+            // invocation. Move the free to the OWNER scope via
+            // `boxedCellFreeDeferred` — the same machinery `consumeLast
+            // LambdaCapturedCells` already uses for case-arm pattern
+            // bindings, and it is sound for the same reason: every closure
+            // holding the cell is dead by the owner's scope end (cellFree
+            // Eligible_'s pre-scan), and the deferred fires AFTER every
+            // reads-through-cell disposal in that scope (#1017 SECOND PASS in
+            // LlvmBackend_Disposal.cpp) so the cell has no reader and no env
+            // when the free runs. The local `k` of the issue's repro
+            //
+            //     var k := n*2; if … then var g := lambda() => k; s := g();
+            //     end if; return s + k;
+            //
+            // leaks 2000 B / 500 without this; 0 with it.
+            //
+            // The existing path's `lastLambdaCapturedCells_.push_back(lce)`
+            // is kept; the consumer's depth guard skips it (continue, not
+            // free) for declaredShallower, leaving only this deferred free to
+            // fire. No double-free: the deferred is gated on
+            // `!alreadyDeferred` — the same dedup the consumer uses — and the
+            // owner-scope read of `k` through the cell happens BEFORE the
+            // deferred (at scope END), so no UAF on the local's own post-block
+            // reads.
+            //
+            // Narrowing gates: !alreadyBoxed (a 2nd capture reuses the cell
+            // and goes through the already-boxed path; that branch's owner is
+            // named by sharedCellEnvdtorFreeOwner_, not here), !isForVar
+            // (for-var captures reuse the cell across iterations; the
+            // #3498 widening keeps the existing leak in that shape), and
+            // !isPatternBinding (the consumer's depth-skip branch already
+            // handles pattern bindings with its own deferral; this is the
+            // outer-local analogue). loopStack_.empty() narrows to the
+            // one-cell-per-invocation shape (a non-empty loop allocates
+            // per-iteration guarded cells; deferring to owner scope would
+            // only free the LAST iteration's cell).
+            if (declaredShallower && loopStack_.empty() &&
+                !alreadyBoxed && !isForVar && !isPatternBinding &&
+                currentFn_ == cellFreeEligibleFn_ &&
+                cellFreeEligible_.count(static_cast<const void*>(decl)) &&
+                declScopeDepth > 0) {
+                std::size_t ownerScopeIdx = declScopeDepth - 1;
+                // The owner's `disposeStack_` slot must exist; the depth was
+                // recorded at the local's declaration when that scope was
+                // pushed, so it is on stack today.
+                if (ownerScopeIdx < disposeStack_.size()) {
+                    bool alreadyDeferred = false;
+                    for (const auto& existing : disposeStack_[ownerScopeIdx])
+                        if (existing.slot == newSlot &&
+                            existing.boxedCellFreeDeferred) {
+                            alreadyDeferred = true;
+                            break;
+                        }
+                    if (!alreadyDeferred) {
+                        Disposal dcd{newSlot, nullptr};
+                        dcd.boxedCellFreeDeferred = true;
+                        // fix #2334: mirror the TaskScope.Spawn unwind-
+                        // unsafety of `lce.unwindUnsafe` (set above) onto
+                        // the deferred entry so its `skipCellFreeOnUnwind`
+                        // modifier matches.
+                        dcd.skipCellFreeOnUnwind =
+                            unwindUnsafeCellFree_.count(
+                                static_cast<const void*>(decl)) != 0;
+                        disposeStack_[ownerScopeIdx].push_back(dcd);
+                        if (inlineN > 0) {
+                            Disposal da{newSlot, nullptr};
+                            da.inlineOwnedArrayCell = true;
+                            da.inlineSlotCount = inlineN;
+                            disposeStack_[ownerScopeIdx].push_back(da);
+                        }
+                    }
+                }
             }
         }
         // #429/#672: resolve sema type for retain/release classification.
