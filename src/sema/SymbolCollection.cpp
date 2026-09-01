@@ -265,6 +265,19 @@ Symbol* collectMemberImpl(const ast::Member& m, TypeSymbol& parent,
                 sym->accessorIsPure = true;
                 break;
             }
+        // fix #3630 narrow (§22.15 v0.286, over-reject follow-up): LOCAL
+        // twin of the ModuleLoader Property case's
+        // `p->isAutoProperty = mm.isAutoProperty`. The exporter writes
+        // `out.isAutoProperty` for a non-static, non-abstract auto-property
+        // (bodyKind == Auto, no static/abstract modifier — see
+        // ModuleMetadataBuilder.cpp's PropertySymbol arm); the LOCAL sema
+        // arm mirrors it via `hasAstAutoPropertyDecl`, the same predicate
+        // the storage-classification code paths use. Without this,
+        // `propertyGetterIsPure` answers "false" for a LOCAL auto-property
+        // and #3630's MemberAccessExpr arm over-rejects the read in a pure
+        // body — the regression measured on xmod_pure_ctor_chain_3174.t5b
+        // and xmod_record_sibling_ctor_3219.t1b.
+        sym->isAutoProperty = hasAstAutoPropertyDecl(sym);
         // fix #3140 (§9.8, family F2 of umbrella #3152): an auto-property's
         // `serialized` clause — the second of the two storage-bearing sites the
         // A.4 grammar admits it on — onto the SYMBOL, for the same reason the
@@ -1124,6 +1137,19 @@ bool propertyGetterIsPure(const PropertySymbol* ps) {
     // than silently agree with an AST walk that #3618 already proved
     // unsound across the seam.
     if (ps->accessorIsPure) return true;
+    // fix #3630 narrow (§22.15 v0.286, over-reject follow-up): an
+    // auto-property's getter is the synthesized `return backing-field`
+    // shape, which is pure-by-construction. Without this arm, a pure body
+    // reading an auto-property (the overwhelmingly common record shape
+    // `record R { public readonly property X: int; }`) is over-rejected by
+    // #3630's MemberAccessExpr arm — the regression measured on
+    // xmod_pure_ctor_chain_3174.t5 and xmod_record_sibling_ctor_3219.t1b.
+    // `ps->isAutoProperty` is set in the LOCAL SymbolCollection PropertyDecl
+    // arm from `hasAstAutoPropertyDecl(sym)` and in the IMPORTED ModuleLoader
+    // Property/Indexer arms from `MetaMember::isAutoProperty` (#2478's 13th
+    // wire scalar), so the predicate is identical on both sides of the
+    // module boundary.
+    if (ps->isAutoProperty) return true;
     return false;
 }
 

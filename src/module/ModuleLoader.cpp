@@ -1056,6 +1056,17 @@ struct Loader {
                 // null for an imported PropertySymbol, so the walk would
                 // have answered "no").
                 p->accessorIsPure = mm.accessorIsPure;
+                // fix #3630 narrow (§22.15 v0.286, over-reject follow-up):
+                // carry the existing `MetaMember::isAutoProperty` wire bit
+                // (#2478's 13th scalar) onto the importer-side
+                // `PropertySymbol::isAutoProperty` so the imported arm of
+                // `propertyGetterIsPure` admits an auto-property's getter
+                // (the synthesized `return backing-field` shape is pure-
+                // by-construction). Without this, #3630's MemberAccessExpr
+                // arm over-rejects every read of an imported auto-property
+                // inside a pure body — the regression measured on
+                // xmod_pure_ctor_chain_3174.t5 and xmod_record_sibling_ctor_3219.
+                p->isAutoProperty = mm.isAutoProperty;
                 // fix #2467 (§9.2/§2.5, v0.235): mirror the Field case's
                 // constValues_ carriage above — an auto-property's
                 // constant-foldable initializer (ModuleMetadataBuilder.cpp's
@@ -1144,6 +1155,13 @@ struct Loader {
                 // PropertySymbols with `isIndexer = true`, mirror of the
                 // hasSetter/hasGetter/etc. twin above).
                 p->accessorIsPure = mm.accessorIsPure;
+                // fix #3630 narrow: twin of the Property case above — an
+                // indexer's auto-property bit rides `mm.isAutoProperty` too.
+                // (The exporter excludes indexers, so this is always false
+                // here; carried for predicate symmetry — `propertyGetterIsPure`
+                // consults a single `ps->isAutoProperty` field regardless of
+                // `ps->isIndexer`.)
+                p->isAutoProperty = mm.isAutoProperty;
                 applyBehavior(p);
                 return p;
             }

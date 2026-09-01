@@ -716,6 +716,20 @@ struct PropertySymbol : MemberSymbol {
     // SemaContext.hpp) keeps its old admission behavior — `propertyGetter
     // IsPure`'s `memberIsPure` arm is what those shims rely on.
     bool accessorIsPure = false;
+    // fix #3630 narrow (over-reject follow-up, §22.15 v0.286): whether this
+    // property's GETTER is a synthesized auto-property (no declared
+    // accessor list). Synthesized getters just return the backing field
+    // and are pure-by-construction, so `propertyGetterIsPure` admits
+    // them. Set on BOTH sides — SymbolCollection's PropertyDecl arm
+    // fills it from `hasAstAutoPropertyDecl(sym)`; ModuleLoader's
+    // Property and Indexer cases fill it from `MetaMember::isAutoProperty`
+    // (the wire channel added alongside `accessorIsPure` in #3618).
+    // Without this, fix #3630's MemberAccessExpr arm over-rejects every
+    // read of an auto-property inside a pure body (LOCAL: the AST walk
+    // fallback returned `false`; IMPORTED: no signal at all — the
+    // regression measured on xmod_pure_ctor_chain_3174.t5 and
+    // xmod_record_sibling_ctor_3219.t1b).
+    bool isAutoProperty = false;
 };
 
 struct EventSymbol : MemberSymbol {};
