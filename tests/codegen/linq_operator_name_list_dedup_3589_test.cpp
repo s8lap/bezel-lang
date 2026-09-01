@@ -32,16 +32,18 @@
 //      arm..." wording; PASS-WITH: the collection-specific "no member"
 //      wording).
 //
-// `OfType`, `Reversed`, `Sorted`, and `ForEach` are DELIBERATELY still
-// admitted by every list this fix touches (see the BuiltinRegistry.hpp
-// comments): `OfType` for fix #3559's diagnostic-routing reason (a bare/call
-// reference should get the v0.284-removal wording, not a generic
-// "no member"); `Reversed`/`Sorted` because they are real Array<T> §4.4
-// native methods (not §5, but real); `ForEach` because it has a genuine (if
-// currently broken — issue #3636) codegen lowering, so removing its
-// acceptance would silently swap one diagnostic for another rather than fix
-// anything. This file pins that none of those four regressed to the "no
-// member" wording either.
+// `OfType`, `Reversed`, and `Sorted` are DELIBERATELY still admitted by
+// every list this fix touches (see the BuiltinRegistry.hpp comments):
+// `OfType` for fix #3559's diagnostic-routing reason (a bare/call reference
+// should get the v0.284-removal wording, not a generic "no member");
+// `Reversed`/`Sorted` because they are real Array<T> §4.4 native methods
+// (not §5, but real). fix #3636 RETIRED `ForEach` from every list this fix
+// touches: it is NOT a stdlib §5 instance member (the only documented
+// `ForEach` is the unrelated static `Parallel.ForEach`), and the broken
+// codegen path's malformed IR finally had to be retired, with a clean
+// "no member ... (§22.5 / §4.x)" diagnostic taking its place. This file
+// pins that none of the three remaining names regressed to the "no member"
+// wording either.
 
 #include "support/aot_support.hpp"   // runAot — AOT test harness
 #include "support/codegen_support.hpp"

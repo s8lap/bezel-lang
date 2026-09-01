@@ -610,10 +610,15 @@ constexpr std::array<std::string_view, 4> kBuiltinNamedArgTableHeads = {
 };
 
 // fix #3589 (stdlib §5 / §9.6): see the header — the string-receiver LINQ
-// exemption gate. 38 names; two independent hand-spellings (the `.` and `?.`
+// exemption gate. 37 names; two independent hand-spellings (the `.` and `?.`
 // member-access gates) were found byte-identical, confirming they answer the
-// one question.
-constexpr std::array<std::string_view, 38> kStringLinqOperatorMemberNames = {
+// one question. fix #3636 removed `ForEach`: instance `.ForEach(...)` is NOT
+// in stdlib §5 (the only documented `ForEach` is the unrelated static
+// `Parallel.ForEach`), the broken-by-IR-verifier codegen arm at
+// `LlvmBackend_Calls.cpp` was retired in the same fix, and the builtin-
+// collection twin (`kBuiltinCollectionLinqOperatorNames` below) already
+// excluded `ForEach` — so the two tables are now consistent on this name.
+constexpr std::array<std::string_view, 37> kStringLinqOperatorMemberNames = {
     "Where",     "Select",     "SelectMany", "Skip",
     "Take",      "TakeWhile",  "SkipWhile",  "Distinct",
     "OrderBy",   "OrderByDescending",        "ThenBy",
@@ -624,7 +629,7 @@ constexpr std::array<std::string_view, 38> kStringLinqOperatorMemberNames = {
     "Last",      "Single",     "ElementAt",  "FirstOrNull",
     "LastOrNull", "SingleOrNull",            "ToArray",
     "ToSet",     "ToDictionary",             "GroupBy",
-    "Aggregate", "ForEach",
+    "Aggregate",
 };
 
 // fix #3589 (stdlib §5): see the header — the builtin-collection-family

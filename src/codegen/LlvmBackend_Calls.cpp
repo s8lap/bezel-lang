@@ -1920,7 +1920,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         m == "Count" || m == "Sum" || m == "Aggregate" || m == "Average" ||
         m == "Min" || m == "Max" || m == "First" || m == "Single" ||
         m == "Last" || m == "ElementAt" || m == "Any" || m == "All" ||
-        m == "ForEach" || m == "Contains" || m == "IndexOf" ||
+        m == "Contains" || m == "IndexOf" ||
         // stdlib §5 *OrNull variants (lazy source → materialize, then check):
         m == "FirstOrNull" || m == "LastOrNull" || m == "SingleOrNull";
     // issue #995 / stdlib §5 / §29.11: a vtable-backed IEnumerable<T> receiver
@@ -2586,38 +2586,6 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             if (relCl) emitClosureRelease(closure);  // #422: inline-lambda transient
             freeLazyTemp();  // FINDING [5]: release materialized lazy snapshot
             return phi;
-        }
-
-        // per §5 LINQ: .ForEach(fn: (T)->())
-        if (m == "ForEach" && call.args.size() == 1 && call.args[0].value) {
-            const bool relCl = argIsInlineLambda(0);
-            auto* unitRef = ctx_.makeTypeRef();
-            unitRef->kind = sema::TypeRef::Kind::Unit;
-            llvm::Value* closure = lowerLinqLambda(call.args[0].value.get(), unitRef);
-            if (!closure) return nullptr;
-            llvm::Type* elemTy = getElemTy();
-            auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
-            llvm::Value* len = builder_.CreateCall(lenFn, {recv});
-            auto* idxSlot = entryAlloca(i64());
-            builder_.CreateStore(builder_.getInt64(0), idxSlot);
-            auto* condBB = llvm::BasicBlock::Create(llvm_, "fe.c", currentFn_);
-            auto* bodyBB = llvm::BasicBlock::Create(llvm_, "fe.b", currentFn_);
-            auto* endBB  = llvm::BasicBlock::Create(llvm_, "fe.e", currentFn_);
-            builder_.CreateBr(condBB);
-            builder_.SetInsertPoint(condBB);
-            llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot);
-            builder_.CreateCondBr(builder_.CreateICmpSLT(idx, len), bodyBB, endBB);
-            builder_.SetInsertPoint(bodyBB);
-            auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
-            llvm::Value* ep = builder_.CreateCall(ptrFn, {recv, idx, builder_.getInt64(esz)});
-            llvm::Value* el = builder_.CreateLoad(elemTy, ep);
-            callClosure(closure, el, llvm::Type::getVoidTy(llvm_));
-            builder_.CreateStore(builder_.CreateAdd(idx, builder_.getInt64(1)), idxSlot);
-            builder_.CreateBr(condBB);
-            builder_.SetInsertPoint(endBB);
-            if (relCl) emitClosureRelease(closure);  // #422: inline-lambda transient
-            freeLazyTemp();  // FINDING [5]: release materialized lazy snapshot
-            return llvm::ConstantInt::get(i32(), 0);
         }
 
         // per §5 LINQ: .Count(pred: (T)->bool): int

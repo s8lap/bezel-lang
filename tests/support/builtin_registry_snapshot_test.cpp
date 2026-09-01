@@ -803,30 +803,37 @@ BEZEL_TEST(builtin_registry_snapshot, keyword_alias_builtin_set) {
 //     LINQ exemption gate. NOT a migration snapshot in the usual sense — the
 //     table collapses two hand-spellings a #3589 measurement found were
 //     byte-identical (the `.` member-access gate and its `?.` mirror), so
-//     this pins the union those two already agreed on. The negatives matter
-//     more than usual here: `ElementAtOrNull`/`MinOrNull`/`MaxOrNull`/
-//     `Contains`/`OfType` are real (or, for `OfType`, formerly real) stdlib
-//     §5/§5.1 names that stay OUT of this particular table — issue #3444
-//     tracks whether the first three should be added, but only after their
-//     string/IEnumerable<char> lowering is exercised end-to-end, which this
-//     fix does not do.
+//     this pins the union those two already agreed on. fix #3636 RETIRED
+//     `ForEach` from this gate: instance `.ForEach(...)` is NOT a stdlib §5
+//     member (the only documented `ForEach` is the unrelated static
+//     `Parallel.ForEach`), the codegen arm emitted malformed IR (LLVM
+//     verifier: "Instruction has a name, but provides a void value!"), and
+//     the builtin-collection twin table (`kBuiltinCollectionLinqOperatorNames`,
+//     see below) already excluded `ForEach` — so the two tables now agree.
+//     The negatives matter more than usual here: `ElementAtOrNull`/
+//     `MinOrNull`/`MaxOrNull`/`Contains`/`OfType`/`ForEach` are real (or, for
+//     `OfType`, formerly real) stdlib §5/§5.1 names that stay OUT of this
+//     particular table — issue #3444 tracks whether the first three should
+//     be added, but only after their string/IEnumerable<char> lowering is
+//     exercised end-to-end, which this fix does not do.
 BEZEL_TEST(builtin_registry_snapshot, string_linq_operator_member_name_set) {
-    static constexpr std::array<std::string_view, 38> kSnapshot = {
+    static constexpr std::array<std::string_view, 37> kSnapshot = {
         "Where", "Select", "SelectMany", "Skip", "Take", "TakeWhile",
         "SkipWhile", "Distinct", "OrderBy", "OrderByDescending", "ThenBy",
         "ThenByDescending", "Concat", "Zip", "Union", "Intersect", "Except",
         "Reverse", "Any", "All", "Count", "Sum", "Min", "Max", "Average",
         "First", "Last", "Single", "ElementAt", "FirstOrNull", "LastOrNull",
         "SingleOrNull", "ToArray", "ToSet", "ToDictionary", "GroupBy",
-        "Aggregate", "ForEach",
+        "Aggregate",
     };
     for (auto n : kSnapshot) BEZEL_EXPECT_TRUE(isStringLinqOperatorMemberName(n));
     // Real stdlib §5/§5.1 names deliberately absent from THIS table (#3444's
-    // still-open widening question), plus the retired `OfType` and a
-    // near-neighbour typo.
+    // still-open widening question), plus `ForEach` retired by #3636 (not a
+    // stdlib §5 instance member — only the static `Parallel.ForEach`
+    // exists), plus the retired `OfType` and a near-neighbour typo.
     for (std::string_view n : {"ElementAtOrNull", "MinOrNull", "MaxOrNull",
                                "Contains", "OfType", "ToList", "Sorted",
-                               "Reversed", ""})
+                               "Reversed", "ForEach", ""})
         BEZEL_EXPECT_FALSE(isStringLinqOperatorMemberName(n));
 }
 

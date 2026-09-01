@@ -5302,11 +5302,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 // that fix's commit records the membership lists are
                                 // deliberately left so a bare/call reference gets
                                 // the specific removal diagnostic rather than a
-                                // generic "no member" one. `ForEach` is kept though
-                                // undeclared in stdlib §5: it has a real (if
-                                // currently broken — issue 3636) codegen lowering,
-                                // so removing it here would silently swap one
-                                // diagnostic for another rather than fix anything.
+                                // generic "no member" one.
                                 //
                                 // fix #3589: `Append`/`SequenceEqual`/`Join`/
                                 // `AsReadOnly`/`ToList` were REMOVED from this list.
@@ -5345,7 +5341,6 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 mm == "Intersect" || mm == "Except" || mm == "Zip" ||
                                 mm == "OfType" ||
                                 mm == "Reversed" || mm == "Sorted" ||
-                                mm == "ForEach" ||
                                 mm == "ToArray" || mm == "ToSet" ||
                                 mm == "ToDictionary";
                         };
@@ -5457,11 +5452,18 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 mm == "MoveNext" || mm == "MoveNextAsync" ||
                                 // borrowing LINQ operators (§5). See the
                                 // allowedOwningMethod copy above for why
-                                // `Reversed`/`Sorted`/`OfType`/`ForEach` stay
-                                // and `Append`/`SequenceEqual`/`Join`/
-                                // `AsReadOnly`/`ToList` were removed
-                                // (fix #3589) — same reasoning, same receiver
-                                // family union.
+                                // `Reversed`/`Sorted`/`OfType` stay and
+                                // `Append`/`SequenceEqual`/`Join`/
+                                // `AsReadOnly`/`ToList`/`ForEach` were
+                                // removed (fix #3589 + #3636) — same
+                                // reasoning, same receiver family union.
+                                // `ForEach` is removed because it is NOT in
+                                // stdlib §5 at all (the only documented form
+                                // is the unrelated static `Parallel.ForEach`):
+                                // admitting it here silently routed a doomed
+                                // call to a malformed-IR codegen path
+                                // (`for #3636: Instruction has a name, but
+                                // provides a void value!`).
                                 mm == "Where" || mm == "Select" ||
                                 mm == "SelectMany" || mm == "Skip" ||
                                 mm == "Take" ||
@@ -5479,7 +5481,6 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 mm == "Intersect" || mm == "Except" || mm == "Zip" ||
                                 mm == "OfType" ||
                                 mm == "Reversed" || mm == "Sorted" ||
-                                mm == "ForEach" ||
                                 mm == "ToArray" || mm == "ToSet" ||
                                 mm == "ToDictionary";
                         };
@@ -13124,7 +13125,7 @@ TypeRef* ExprTC::linqLambdaElementType(const ast::Expr* callee) {
     bool elemLambda =
         m == "Where" || m == "Select" || m == "Count" || m == "Any" ||
         m == "All" || m == "First" || m == "Last" || m == "Single" ||
-        m == "OrderBy" || m == "OrderByDescending" || m == "ForEach" ||
+        m == "OrderBy" || m == "OrderByDescending" ||
         m == "Min" || m == "Max" || m == "Sum" ||
         m == "TakeWhile" || m == "SkipWhile" || m == "SelectMany" ||
         m == "Average" ||
