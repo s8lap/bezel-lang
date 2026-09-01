@@ -1,4 +1,8 @@
 #include "ownership/Ownership_impl.hpp"
+#include "ownership/StmtWalker.hpp"  // fix #3656: forEachNestedStmt — single
+                                    // source of truth for the statement
+                                    // grammar (replaces the five hand-
+                                    // written walkers' per-kind dispatch)
 
 #include <algorithm>
 #include <functional>
@@ -2049,111 +2053,104 @@ void MethodOwnership::collectIdentifiersIn(
     // method-scope local capture (literals, default/typeof/nameof, …).
 }
 
+// fix #3656 (§9.7 / §28.9, v0.286): the per-statement action is now a single
+// `fn`; the statement recursion (control-flow forms and their nested bodies)
+// is owned by `forEachNestedStmt`. This walker still scans the control-flow
+// forms' OWN expression positions (condition / iterable / withExpr /
+// scrutinee / arm guard / arm exprBody / catch guard) and the leaf statement
+// forms' expressions — that is, the identifiers that are captured INSIDE the
+// visited statement but OUTSIDE its nested statements. Identifiers in nested
+// statements are picked up by the walker on its recursive calls.
+//
+// The §6b exclusion diff against the pre-#3656 copy is the null diff: the old
+// walker visited every statement kind the new walker visits (ExpressionStmt,
+// ReturnStmt, LocalDecl, AssignmentStmt, DiscardStmt, ThrowStmt, YieldStmt,
+// IncrementStmt, IfStmt, WhileStmt, ForStmt, DoEndBlock, TryStmt, CaseStmt,
+// BreakStmt, ContinueStmt — and the missing CaseStmt was fixed at the same
+// time #3552 / #3586 added the arm to the sibling walkers; this one already
+// had it from #2181). The new walker ADDS nothing; it REMOVES the per-kind
+// dispatch chain.
 void MethodOwnership::collectIdentifiersInStmt(
     const ast::Stmt& s,
     std::vector<const ast::IdentifierExpr*>& out) const {
-    if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(&s)) {
-        if (es->expr) collectIdentifiersIn(*es->expr, out);
-        return;
-    }
-    if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&s)) {
-        if (rs->value) collectIdentifiersIn(*rs->value, out);
-        return;
-    }
-    if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
-        if (ld->initializer) collectIdentifiersIn(*ld->initializer, out);
-        return;
-    }
-    if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&s)) {
-        if (as->target) collectIdentifiersIn(*as->target, out);
-        if (as->value) collectIdentifiersIn(*as->value, out);
-        return;
-    }
-    if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(&s)) {
-        if (ds->value) collectIdentifiersIn(*ds->value, out);
-        return;
-    }
-    if (auto* ts = dynamic_cast<const ast::ThrowStmt*>(&s)) {
-        if (ts->value) collectIdentifiersIn(*ts->value, out);
-        return;
-    }
-    if (auto* ys = dynamic_cast<const ast::YieldStmt*>(&s)) {
-        if (ys->value) collectIdentifiersIn(*ys->value, out);
-        return;
-    }
-    if (auto* is = dynamic_cast<const ast::IncrementStmt*>(&s)) {
-        if (is->target) collectIdentifiersIn(*is->target, out);
-        return;
-    }
-    // §9.7 / §28.9 (v0.220, #2181): a capture appearing ONLY under a control-
-    // flow statement of a block-bodied lambda (`return lambda(): int => do if
-    // cond then return h.S[0]; end; … end;`) is as much a capture of the
-    // enclosing-method local as a top-level-statement one, and must reach the
-    // SAME escape check (the §28.9 owned-local leg, the §31.1 catch leg, the
-    // §27.5 ref/out leg, and the #2144 §9.7 record/span legs all ride this
-    // collector). The earlier bounded slice walked only the leaf statement
-    // kinds above and dropped every control-flow-nested capture, so it was
-    // invisible to every leg and the program compiled and dangled at runtime.
-    // Recurse into each control-flow form's guard/condition/iterable/scrutinee
-    // expressions AND its nested statements, in source order (mirrors
-    // collectLocalDepthsStmt's coverage; determinism is preserved — no
-    // pointer-keyed iteration). Widening only ADDS captures to
-    // the escape check, whose ESCAPE gate is unchanged, so a non-escaping or a
-    // param-/field-sourced capture stays accepted. // per §9.7 (v0.220), §28.9
-    auto walkBody =
-        [&](const std::vector<std::unique_ptr<ast::Stmt>>& body) {
-            for (const auto& bs : body)
-                if (bs) collectIdentifiersInStmt(*bs, out);
-        };
-    if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&s)) {
-        if (ifs->ifBranch.condition)
-            collectIdentifiersIn(*ifs->ifBranch.condition, out);
-        walkBody(ifs->ifBranch.body);
-        for (const auto& el : ifs->elifBranches) {
-            if (el.condition) collectIdentifiersIn(*el.condition, out);
-            walkBody(el.body);
+    // The walker dispatches the per-statement action and recurses into nested
+    // statement lists (block bodies / arm stmts) automatically. The action
+    // scans the visited statement's OWN expression positions.
+    forEachNestedStmt(s, [&](const ast::Stmt& cur) {
+        if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(&cur)) {
+            if (es->expr) collectIdentifiersIn(*es->expr, out);
+            return;
         }
-        walkBody(ifs->elseBody);
-        return;
-    }
-    if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&s)) {
-        if (ws->condition) collectIdentifiersIn(*ws->condition, out);
-        walkBody(ws->body);
-        return;
-    }
-    if (auto* fs = dynamic_cast<const ast::ForStmt*>(&s)) {
-        if (fs->iterable) collectIdentifiersIn(*fs->iterable, out);
-        if (fs->withExpr) collectIdentifiersIn(*fs->withExpr, out);
-        walkBody(fs->body);
-        return;
-    }
-    if (auto* dob = dynamic_cast<const ast::DoEndBlock*>(&s)) {
-        walkBody(dob->body);
-        return;
-    }
-    if (auto* trys = dynamic_cast<const ast::TryStmt*>(&s)) {
-        walkBody(trys->body);
-        for (const auto& arm : trys->catches) {
-            if (arm.guard) collectIdentifiersIn(*arm.guard, out);
-            if (arm.body) collectIdentifiersInStmt(*arm.body, out);
+        if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&cur)) {
+            if (rs->value) collectIdentifiersIn(*rs->value, out);
+            return;
         }
-        walkBody(trys->finallyBody);
-        return;
-    }
-    if (auto* cs = dynamic_cast<const ast::CaseStmt*>(&s)) {
-        if (cs->scrutinee) collectIdentifiersIn(*cs->scrutinee, out);
-        for (const auto& arm : cs->arms) {
-            if (arm.guard) collectIdentifiersIn(*arm.guard, out);
-            if (arm.bodyKind == ast::CaseArmBodyKind::Expression) {
-                if (arm.exprBody) collectIdentifiersIn(*arm.exprBody, out);
-            } else {
-                walkBody(arm.stmts);
+        if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&cur)) {
+            if (ld->initializer) collectIdentifiersIn(*ld->initializer, out);
+            return;
+        }
+        if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&cur)) {
+            if (as->target) collectIdentifiersIn(*as->target, out);
+            if (as->value) collectIdentifiersIn(*as->value, out);
+            return;
+        }
+        if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(&cur)) {
+            if (ds->value) collectIdentifiersIn(*ds->value, out);
+            return;
+        }
+        if (auto* ts = dynamic_cast<const ast::ThrowStmt*>(&cur)) {
+            if (ts->value) collectIdentifiersIn(*ts->value, out);
+            return;
+        }
+        if (auto* ys = dynamic_cast<const ast::YieldStmt*>(&cur)) {
+            if (ys->value) collectIdentifiersIn(*ys->value, out);
+            return;
+        }
+        if (auto* is = dynamic_cast<const ast::IncrementStmt*>(&cur)) {
+            if (is->target) collectIdentifiersIn(*is->target, out);
+            return;
+        }
+        // §9.7 / §28.9 (v0.220, #2181): a capture appearing ONLY under a
+        // control-flow statement of a block-bodied lambda is as much a capture
+        // of the enclosing-method local as a top-level-statement one, and must
+        // reach the SAME escape check. The walker descends into every nested
+        // statement; this block scans the control-flow form's OWN guard /
+        // condition / iterable / scrutinee / arm expressions and lets the
+        // walker handle the nested statements.
+        if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&cur)) {
+            if (ifs->ifBranch.condition)
+                collectIdentifiersIn(*ifs->ifBranch.condition, out);
+            for (const auto& el : ifs->elifBranches)
+                if (el.condition) collectIdentifiersIn(*el.condition, out);
+            return;
+        }
+        if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&cur)) {
+            if (ws->condition) collectIdentifiersIn(*ws->condition, out);
+            return;
+        }
+        if (auto* fs = dynamic_cast<const ast::ForStmt*>(&cur)) {
+            if (fs->iterable) collectIdentifiersIn(*fs->iterable, out);
+            if (fs->withExpr) collectIdentifiersIn(*fs->withExpr, out);
+            return;
+        }
+        if (auto* trys = dynamic_cast<const ast::TryStmt*>(&cur)) {
+            for (const auto& arm : trys->catches)
+                if (arm.guard) collectIdentifiersIn(*arm.guard, out);
+            return;
+        }
+        if (auto* cs = dynamic_cast<const ast::CaseStmt*>(&cur)) {
+            if (cs->scrutinee) collectIdentifiersIn(*cs->scrutinee, out);
+            for (const auto& arm : cs->arms) {
+                if (arm.guard) collectIdentifiersIn(*arm.guard, out);
+                if (arm.bodyKind == ast::CaseArmBodyKind::Expression)
+                    if (arm.exprBody) collectIdentifiersIn(*arm.exprBody, out);
             }
+            return;
         }
-        return;
-    }
-    // BreakStmt / ContinueStmt carry no capturable expression. Any other leaf
-    // statement form is not a capture site.
+        // DoEndBlock carries no capturable expression. BreakStmt /
+        // ContinueStmt carry no capturable expression. Any other leaf
+        // statement form is not a capture site.
+    });
 }
 
 void MethodOwnership::collectLambdaIdentifiers(
@@ -4359,93 +4356,85 @@ void MethodOwnership::collectCaseArmBorrowSourcesExpr(const ast::Expr& e) {
     }
 }
 
+// fix #3656 (§35.5, v0.286): the per-statement action is now a single `fn`;
+// the statement recursion is owned by `forEachNestedStmt`. The CaseStmt
+// arm body recursion (`arm.stmts`) was the walker grammar's responsibility
+// before — the CaseExpr walker in `collectCaseArmBorrowSourcesExpr` already
+// descended into `arm.stmts`, so the migration preserves that reach.
+//
+// The §6b exclusion diff against the pre-#3656 copy is the null diff: the
+// old walker visited every statement kind the new walker visits, and the new
+// walker ADDS none.
 void MethodOwnership::collectCaseArmBorrowSourcesStmt(const ast::Stmt& s) {
-    if (auto* cs = dynamic_cast<const ast::CaseStmt*>(&s)) {
-        registerCaseArmBorrowSources(cs->arms, cs->scrutinee.get());
-        if (cs->scrutinee) collectCaseArmBorrowSourcesExpr(*cs->scrutinee);
-        for (const auto& arm : cs->arms) {
-            if (arm.guard) collectCaseArmBorrowSourcesExpr(*arm.guard);
-            if (arm.exprBody) collectCaseArmBorrowSourcesExpr(*arm.exprBody);
-            for (const auto& bs : arm.stmts)
-                if (bs) collectCaseArmBorrowSourcesStmt(*bs);
+    // The walker dispatches the per-statement action and recurses into nested
+    // statement lists (block bodies / arm stmts) automatically. The action
+    // handles the per-statement work: register CaseStmt arm borrow sources,
+    // scan leaf statement expressions, scan control-flow form expressions.
+    forEachNestedStmt(s, [&](const ast::Stmt& cur) {
+        if (auto* cs = dynamic_cast<const ast::CaseStmt*>(&cur)) {
+            registerCaseArmBorrowSources(cs->arms, cs->scrutinee.get());
+            if (cs->scrutinee) collectCaseArmBorrowSourcesExpr(*cs->scrutinee);
+            for (const auto& arm : cs->arms) {
+                if (arm.guard) collectCaseArmBorrowSourcesExpr(*arm.guard);
+                if (arm.exprBody) collectCaseArmBorrowSourcesExpr(*arm.exprBody);
+            }
+            return;
         }
-        return;
-    }
-    // Recurse into the control-flow forms (mirrors collectLocalDepthsStmt's
-    // coverage) so a case nested under an if / loop / do-end / try / arm body
-    // is reached; also scan the statements' own expressions for embedded case
-    // expressions.
-    if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(&s)) {
-        if (es->expr) collectCaseArmBorrowSourcesExpr(*es->expr);
-        return;
-    }
-    if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
-        if (ld->initializer) collectCaseArmBorrowSourcesExpr(*ld->initializer);
-        return;
-    }
-    if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&s)) {
-        if (as->value) collectCaseArmBorrowSourcesExpr(*as->value);
-        return;
-    }
-    if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&s)) {
-        if (rs->value) collectCaseArmBorrowSourcesExpr(*rs->value);
-        return;
-    }
-    if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(&s)) {
-        if (ds->value) collectCaseArmBorrowSourcesExpr(*ds->value);
-        return;
-    }
-    if (auto* ts = dynamic_cast<const ast::ThrowStmt*>(&s)) {
-        if (ts->value) collectCaseArmBorrowSourcesExpr(*ts->value);
-        return;
-    }
-    if (auto* ys = dynamic_cast<const ast::YieldStmt*>(&s)) {
-        if (ys->value) collectCaseArmBorrowSourcesExpr(*ys->value);
-        return;
-    }
-    if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&s)) {
-        if (ifs->ifBranch.condition)
-            collectCaseArmBorrowSourcesExpr(*ifs->ifBranch.condition);
-        for (const auto& bs : ifs->ifBranch.body)
-            if (bs) collectCaseArmBorrowSourcesStmt(*bs);
-        for (const auto& el : ifs->elifBranches) {
-            if (el.condition) collectCaseArmBorrowSourcesExpr(*el.condition);
-            for (const auto& bs : el.body)
-                if (bs) collectCaseArmBorrowSourcesStmt(*bs);
+        // Leaf statement forms — scan their expression.
+        if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(&cur)) {
+            if (es->expr) collectCaseArmBorrowSourcesExpr(*es->expr);
+            return;
         }
-        for (const auto& bs : ifs->elseBody)
-            if (bs) collectCaseArmBorrowSourcesStmt(*bs);
-        return;
-    }
-    if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&s)) {
-        if (ws->condition) collectCaseArmBorrowSourcesExpr(*ws->condition);
-        for (const auto& bs : ws->body)
-            if (bs) collectCaseArmBorrowSourcesStmt(*bs);
-        return;
-    }
-    if (auto* fs = dynamic_cast<const ast::ForStmt*>(&s)) {
-        if (fs->iterable) collectCaseArmBorrowSourcesExpr(*fs->iterable);
-        if (fs->withExpr) collectCaseArmBorrowSourcesExpr(*fs->withExpr);
-        for (const auto& bs : fs->body)
-            if (bs) collectCaseArmBorrowSourcesStmt(*bs);
-        return;
-    }
-    if (auto* dob = dynamic_cast<const ast::DoEndBlock*>(&s)) {
-        for (const auto& bs : dob->body)
-            if (bs) collectCaseArmBorrowSourcesStmt(*bs);
-        return;
-    }
-    if (auto* trys = dynamic_cast<const ast::TryStmt*>(&s)) {
-        for (const auto& bs : trys->body)
-            if (bs) collectCaseArmBorrowSourcesStmt(*bs);
-        for (const auto& arm : trys->catches) {
-            if (arm.guard) collectCaseArmBorrowSourcesExpr(*arm.guard);
-            if (arm.body) collectCaseArmBorrowSourcesStmt(*arm.body);
+        if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&cur)) {
+            if (ld->initializer) collectCaseArmBorrowSourcesExpr(*ld->initializer);
+            return;
         }
-        for (const auto& bs : trys->finallyBody)
-            if (bs) collectCaseArmBorrowSourcesStmt(*bs);
-        return;
-    }
+        if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&cur)) {
+            if (as->value) collectCaseArmBorrowSourcesExpr(*as->value);
+            return;
+        }
+        if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&cur)) {
+            if (rs->value) collectCaseArmBorrowSourcesExpr(*rs->value);
+            return;
+        }
+        if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(&cur)) {
+            if (ds->value) collectCaseArmBorrowSourcesExpr(*ds->value);
+            return;
+        }
+        if (auto* ts = dynamic_cast<const ast::ThrowStmt*>(&cur)) {
+            if (ts->value) collectCaseArmBorrowSourcesExpr(*ts->value);
+            return;
+        }
+        if (auto* ys = dynamic_cast<const ast::YieldStmt*>(&cur)) {
+            if (ys->value) collectCaseArmBorrowSourcesExpr(*ys->value);
+            return;
+        }
+        // Control-flow forms — scan their guard/condition/iterable
+        // expressions; the walker handles the nested statement bodies.
+        if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&cur)) {
+            if (ifs->ifBranch.condition)
+                collectCaseArmBorrowSourcesExpr(*ifs->ifBranch.condition);
+            for (const auto& el : ifs->elifBranches)
+                if (el.condition) collectCaseArmBorrowSourcesExpr(*el.condition);
+            return;
+        }
+        if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&cur)) {
+            if (ws->condition) collectCaseArmBorrowSourcesExpr(*ws->condition);
+            return;
+        }
+        if (auto* fs = dynamic_cast<const ast::ForStmt*>(&cur)) {
+            if (fs->iterable) collectCaseArmBorrowSourcesExpr(*fs->iterable);
+            if (fs->withExpr) collectCaseArmBorrowSourcesExpr(*fs->withExpr);
+            return;
+        }
+        if (auto* trys = dynamic_cast<const ast::TryStmt*>(&cur)) {
+            for (const auto& arm : trys->catches)
+                if (arm.guard) collectCaseArmBorrowSourcesExpr(*arm.guard);
+            return;
+        }
+        // DoEndBlock / IncrementStmt / BreakStmt / ContinueStmt carry no
+        // expression to scan.
+    });
 }
 
 void MethodOwnership::collectCaseArmBorrowSources(
@@ -4466,104 +4455,49 @@ void MethodOwnership::collectCaseArmBorrowSources(
 // preserved. We do NOT recurse into lambda expression
 // bodies — locals declared inside a closure are closure-scoped, not method-scope
 // locals, and are never the target/source of this method's escape check.
+// fix #3656 (§28.3 / §31.1, v0.286): the per-statement action is now a single
+// `fn`; the statement recursion (and the depth-increment for every scope-
+// introducer) is owned by `forEachNestedStmt`. The pre-pass state passed to
+// the action is `{depth, insideTry=false, enclosingTry=nullptr}` — only
+// `depth` matters here (the insideTry / enclosingTry fields are for the
+// sibling `collectStmtsInsideTryStmt`).
+//
+// The one piece of pre-pass work the action does BEFORE the walker recurses
+// is the fix-#3520 catch-arm binding depth recording for `TryStmt`: for each
+// catch arm with a binding, the arm body is keyed into `localDepth_` at
+// `depth + 1` BEFORE recursion. The walker then descends into the arm body
+// at `depth + 1` (its own auto-increment) and the binding's LocalDecl (if
+// present) is recorded at that same depth by the per-statement action. The
+// pre-recording here exists because the binding symbol is anchored on
+// `arm.body` itself, not on a statement inside it (§31.2.1 arm patterns).
+//
+// The §6b exclusion diff against the pre-#3656 copy is the null diff: the
+// old walker visited every scope-introducer kind the new walker visits (if /
+// while / for / do-end / try / case arm body) and no kind it didn't.
 void MethodOwnership::collectLocalDepthsStmt(const ast::Stmt& s, int depth) {
-    if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
-        localDepth_[ld] = depth;
-        return;
-    }
-    if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&s)) {
-        for (const auto& bs : ifs->ifBranch.body)
-            if (bs) collectLocalDepthsStmt(*bs, depth + 1);
-        for (const auto& el : ifs->elifBranches)
-            for (const auto& bs : el.body)
-                if (bs) collectLocalDepthsStmt(*bs, depth + 1);
-        for (const auto& bs : ifs->elseBody)
-            if (bs) collectLocalDepthsStmt(*bs, depth + 1);
-        return;
-    }
-    if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&s)) {
-        for (const auto& bs : ws->body)
-            if (bs) collectLocalDepthsStmt(*bs, depth + 1);
-        return;
-    }
-    if (auto* fs = dynamic_cast<const ast::ForStmt*>(&s)) {
-        for (const auto& bs : fs->body)
-            if (bs) collectLocalDepthsStmt(*bs, depth + 1);
-        return;
-    }
-    if (auto* dob = dynamic_cast<const ast::DoEndBlock*>(&s)) {
-        for (const auto& bs : dob->body)
-            if (bs) collectLocalDepthsStmt(*bs, depth + 1);
-        return;
-    }
-    if (auto* ts = dynamic_cast<const ast::TryStmt*>(&s)) {
-        for (const auto& bs : ts->body)
-            if (bs) collectLocalDepthsStmt(*bs, depth + 1);
-        for (const auto& arm : ts->catches) {
-            if (!arm.body) continue;
-            // fix #3520 (§31.1 "Exception ownership", v0.283): record the catch
-            // ARM BINDING's own block depth. §31.1: the bound exception variable
-            // "is a **borrow** of the in-flight exception; its source is the
-            // runtime, and its lifetime is the arm body's" — so the binding lives
-            // at the arm body's depth, exactly like an owned local declared as the
-            // arm's first statement.
-            //
-            // Without this entry `depthOf(src->decl)` returned -1 for every catch
-            // binding, and `checkBorrowStoreEscape`'s outer-local resolution
-            // (`td >= 0 && sd >= 0 && td < sd`) bailed BEFORE reaching its own
-            // §31.1 `isCatchBorrow` branch. That made the "caught exception may
-            // not be captured by a closure assigned to <outer local>" rejection
-            // structurally unreachable: `f := lambda() => ex.Message.Length;`
-            // inside the arm, with `f` declared outside the `try`, compiled with
-            // no diagnostic and SIGSEGV'd on the later call — measured on b43196a
-            // in both the async and the purely synchronous spelling. §31.1 states
-            // the borrow "may not be ... captured by a closure that may outlive
-            // the arm" and that "Exception instances themselves cannot escape the
-            // arm that caught them", so the rejection is the spec's, not a new
-            // rule; only the depth that lets the existing check see it was
-            // missing. The binding is keyed on `arm.body` because that is the AST
-            // node its LocalSymbol anchors on (§31.2.1 arm patterns).
-            if (arm.hasBinding && !arm.varName.empty())
-                localDepth_[arm.body.get()] = depth + 1;
-            collectLocalDepthsStmt(*arm.body, depth + 1);
-        }
-        for (const auto& bs : ts->finallyBody)
-            if (bs) collectLocalDepthsStmt(*bs, depth + 1);
-        return;
-    }
-    // fix #3552 (§28.3 / §31.1, v0.286): the statement-position `case`. Each
-    // Block-form arm body is a scope-introducing block exactly like a
-    // `do`-`end`, so §28.3 "Borrow lifetime rules" applies across its boundary
-    // verbatim: "A borrow may not be assigned to a local whose scope strictly
-    // encloses the borrow's source's scope"; and §31.1's "Exception ownership"
-    // clause says the catch binding's "lifetime is the arm body's". A `case`
-    // arm body is such an enclosing scope, and the depth is how this pass
-    // decides "strictly encloses". Without this arm every local declared
-    // inside an arm — and
-    // every catch binding of a `try` nested in an arm — was absent from
-    // `localDepth_`, so `depthOf()` answered -1 and all four consumers'
-    // `td >= 0 && sd >= 0 && td < sd` guard returned BEFORE reaching their own
-    // rejection (checkBorrowStoreEscape §28.3/§31.1, checkCollectionBorrowStore-
-    // Escape and checkIndexerSetBorrowStoreEscape §28.11, and
-    // checkBareBorrowLoopCarriedEscape §28.3). Measured on fd39253: the §31.1
-    // closure-capture repro compiled clean and ASan reported a
-    // heap-use-after-free, while the byte-identical `do`-`end` spelling was
-    // rejected; the §28.3 owned-local repro compiled clean and leaked 40 bytes.
-    //
-    // Only `stmts` is walked. An Expression-form arm body holds no statement and
-    // therefore no LocalDecl (see the matching note on
-    // collectOwnedConsumingAwaits' CaseStmt arm), and a `when` guard is a
-    // boolean condition. The arm's own PATTERN BINDINGS are deliberately not
-    // given a depth here: §35.5 already resolves an arm binding's borrow source
-    // through `registerCaseArmBorrowSources`, a separate authority, and
-    // respelling that classification into `localDepth_` would be a second,
-    // drifting copy of a decision the compiler already makes.
-    if (auto* cs = dynamic_cast<const ast::CaseStmt*>(&s)) {
-        for (const auto& arm : cs->arms)
-            for (const auto& bs : arm.stmts)
-                if (bs) collectLocalDepthsStmt(*bs, depth + 1);
-        return;
-    }
+    forEachNestedStmt(
+        s,
+        [&](const ast::Stmt& cur, StmtVisitState state) {
+            if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&cur)) {
+                localDepth_[ld] = state.depth;
+                return;
+            }
+            // fix #3520 (§31.1 "Exception ownership", v0.283): record the
+            // catch ARM BINDING's own block depth. The binding is keyed on
+            // `arm.body` because that is the AST node its LocalSymbol anchors
+            // on (§31.2.1 arm patterns). Pre-record before the walker
+            // recurses, so the binding symbol is present at the right depth
+            // even though it isn't a statement.
+            if (auto* ts = dynamic_cast<const ast::TryStmt*>(&cur)) {
+                for (const auto& arm : ts->catches) {
+                    if (!arm.body) continue;
+                    if (arm.hasBinding && !arm.varName.empty())
+                        localDepth_[arm.body.get()] = state.depth + 1;
+                }
+                return;
+            }
+        },
+        StmtVisitState{depth, /*insideTry=*/false, /*enclosingTry=*/nullptr});
 }
 
 void MethodOwnership::collectLocalDepths(
@@ -9169,163 +9103,82 @@ void MethodOwnership::collectOwnedConsumingAwaits(
         if (s) collectOwnedConsumingAwaitsStmt(*s, out);
 }
 
+// fix #3656 (§30.5, v0.286): the per-statement action is now a single `fn`;
+// the statement recursion (control-flow forms and their nested bodies) is
+// owned by `forEachNestedStmt`. The full `ast::Node.hpp` statement hierarchy
+// is reached; the action's `dynamic_cast<>` chain decides which kinds are
+// owned-consuming positions and which are deliberately silent.
+//
+// The §6b exclusion diff against the pre-#3656 copy is the null diff: the
+// old walker visited every container kind the new walker visits (if / while /
+// for / do-end / try / case arm body — CaseStmt was added in #3074); the
+// leaf-kind handling is unchanged.
 void MethodOwnership::collectOwnedConsumingAwaitsStmt(
     const ast::Stmt& s, std::unordered_set<const ast::UnaryExpr*>& out) {
-    // §30.5 owned-consuming contexts where a Pattern B `await` is the
-    // IMMEDIATE value. Recurse into nested blocks so awaits in branches/loops
-    // are classified too.
-    //
-    // fix #3074 (v0.249) — THIS LIST MUST STAY IN STEP WITH `visitStmtExprSites`
-    // (the derived statement enumeration the §30.5 CHECK walks). The two are
-    // complements: a Pattern B await the check reaches but this collect misses is
-    // reported as "not in an owned-consuming context" even when it is — a false
-    // REJECT, the failure direction adding an arm to the check alone would
-    // introduce. The full `ast::Node.hpp` statement hierarchy, and this walk's
-    // answer for each:
-    //   LocalDecl        — owned-consuming (`using var`/`await using var`/`var`
-    //                      binding of an await, §30.5). Handled.
-    //   LocalConstDecl   — NOT owned-consuming: §21.1 forbids a `const` local
-    //                      taking an owned production ("the binding never takes a
-    //                      disposal obligation; bind owned values with `using
-    //                      var`"), and §30.5's owned-binding row names `using
-    //                      var`/`await using var`/`var` only. Deliberately absent,
-    //                      so a Pattern B `const c := await Acq();` is rejected by
-    //                      §30.5 as well as §21.1 rather than admitted.
-    //   ExpressionStmt   — owned `owned`-argument positions inside the expression.
-    //                      Handled (collectOwnedConsumingInExpr).
-    //   DiscardStmt      — owned-consuming (§17.13 / #1826). Handled.
-    //   AssignmentStmt   — owned-consuming for an owned storage target. Handled.
-    //   ReturnStmt       — owned-consuming; also records the Pattern A chained
-    //                      slot in returnPositionAwaits_. Handled.
-    //   YieldStmt        — owned-consuming in an owning iterator (§29.2). Handled.
-    //   ThrowStmt        — NOT in §30.5's owned-consuming enumeration; a Pattern B
-    //                      await there stays rejected. Deliberately absent.
-    //   IncrementStmt    — an lvalue path (`a[await …]++`); an await inside it is
-    //                      an operand, never an owned sink. Deliberately absent.
-    //   BreakStmt /
-    //   ContinueStmt     — hold no expression. Nothing to collect.
-    //   IfStmt, WhileStmt, ForStmt, DoEndBlock, TryStmt, CaseStmt — containers:
-    //                      recurse into every nested statement. CaseStmt was
-    //                      MISSING before #3074 (as it was from both check walks),
-    //                      so a `using var x := await Acquire();` inside a `case`
-    //                      arm was invisible here.
-    if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
-        // `using var x := await ...`, `await using var x := await ...`, and
-        // plain `var x := await ...` are all owned-consuming (§30.5: a
-        // `using var`/`await using var` RHS, and `var x := <owned>` which
-        // introduces an owned local). // per §30.5
-        if (ld->initializer)
-            if (auto* a = awaitRoot(*ld->initializer)) out.insert(a);
-        return;
-    }
-    if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(&s)) {
-        // #1826 / §30.5 / §17.13: the explicit discard `_ := await ...;` is
-        // an owned-consuming position — per §17.13 the `_` discard
-        // announces a consume + freeze + end-of-statement disposal of its
-        // operand (the #1009/#1016/#1387/#1651 DiscardStmt flags carry
-        // that out for owned classes, move-only owning inline arrays, and
-        // plain named-owned locals). For a Pattern B `OwningTask<T>`
-        // result the discard disposes the await's transferred result the
-        // same way `using var x := await ...` does. The previous code had
-        // no DiscardStmt case here, so the await fell off the
-        // `consuming` set and the §30.5 Pattern-B site check at
-        // checkAwaitSitesExpr wrongly rejected it. (`checkAwaitSitesStmt`
-        // already walks DiscardStmt — only the COLLECT side missed it.)
-        // // per §30.5, §17.13
-        if (ds->value)
-            if (auto* a = awaitRoot(*ds->value)) out.insert(a);
-        return;
-    }
-    if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&s)) {
-        // `target := await ...` is owned-consuming when the target is an owned
-        // storage location — a local (re-assigned owned local), an `owned`
-        // field, or an owning-collection slot. We admit a plain local target
-        // (parallels `var x := <owned>`) and the owned-field / owned-slot
-        // targets the §28.3/§28.11 rules already treat as owned sinks.
-        // // per §30.5, §28.3, §28.11
-        if (as->op == ":=" && as->value) {
-            if (auto* a = awaitRoot(*as->value)) {
-                bool ownedTarget =
-                    as->target &&
-                    (dynamic_cast<const ast::IdentifierExpr*>(as->target.get()) ||
-                     targetIsOwnedField(*as->target) ||
-                     indexerSetterTakesOwned(*as->target));
-                if (ownedTarget) out.insert(a);
-            }
+    // The walker dispatches the per-statement action and recurses into nested
+    // statement lists (block bodies / arm stmts) automatically. The action
+    // gates on kind: only the kinds that ARE owned-consuming positions
+    // contribute to `out`.
+    forEachNestedStmt(s, [&](const ast::Stmt& cur) {
+        if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&cur)) {
+            // `using var x := await ...`, `await using var x := await ...`,
+            // and plain `var x := await ...` are all owned-consuming (§30.5).
+            if (ld->initializer)
+                if (auto* a = awaitRoot(*ld->initializer)) out.insert(a);
+            return;
         }
-        return;
-    }
-    if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&s)) {
-        // `return await ...` — owned-consuming when the method's return type
-        // carries ownership (an `owned T` / `OwningTask<T>` return). The
-        // enclosing method is the one being analysed; an async method whose
-        // result is Pattern B forwards the owned result (§30.5 line ~6143).
-        // We admit `return await ...` unconditionally: a `return` of an owned
-        // value is an owned-consuming position by definition, and a Pattern A
-        // `return await Producer()` is also explicitly admitted (§30.5 line
-        // ~6068) — recorded in returnPositionAwaits_ so the Pattern A site
-        // check admits the bare-producer operand in that one position.
-        // // per §30.5
-        if (rs->value)
-            if (auto* a = awaitRoot(*rs->value)) {
-                out.insert(a);
-                returnPositionAwaits_.insert(a);
+        if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(&cur)) {
+            // #1826 / §30.5 / §17.13: `_ := await ...;` is owned-consuming.
+            if (ds->value)
+                if (auto* a = awaitRoot(*ds->value)) out.insert(a);
+            return;
+        }
+        if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&cur)) {
+            // `target := await ...` is owned-consuming when the target is an
+            // owned storage location — a local (re-assigned owned local), an
+            // `owned` field, or an owning-collection slot.
+            if (as->op == ":=" && as->value) {
+                if (auto* a = awaitRoot(*as->value)) {
+                    bool ownedTarget =
+                        as->target &&
+                        (dynamic_cast<const ast::IdentifierExpr*>(as->target.get()) ||
+                         targetIsOwnedField(*as->target) ||
+                         indexerSetterTakesOwned(*as->target));
+                    if (ownedTarget) out.insert(a);
+                }
             }
-        return;
-    }
-    if (auto* ys = dynamic_cast<const ast::YieldStmt*>(&s)) {
-        // `yield return await ...` in an owned-yielding iterator (§30.5 line
-        // ~6106). Admitted as an owned-consuming position. // per §30.5
-        if (ys->value)
-            if (auto* a = awaitRoot(*ys->value)) out.insert(a);
-        return;
-    }
-    if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(&s)) {
-        // `coll.Add(await ...)` / `M(await ...)` where the formal is `owned`:
-        // the `await` is an argument bound to an owned parameter — an
-        // owned-consuming position (§30.5). Recognise the owned-argument shape.
-        if (es->expr) collectOwnedConsumingInExpr(*es->expr, out);
-        return;
-    }
-    // Recurse into control-flow blocks.
-    if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&s)) {
-        collectOwnedConsumingAwaits(ifs->ifBranch.body, out);
-        for (const auto& el : ifs->elifBranches)
-            collectOwnedConsumingAwaits(el.body, out);
-        collectOwnedConsumingAwaits(ifs->elseBody, out);
-        return;
-    }
-    if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&s)) {
-        collectOwnedConsumingAwaits(ws->body, out);
-        return;
-    }
-    if (auto* fs = dynamic_cast<const ast::ForStmt*>(&s)) {
-        collectOwnedConsumingAwaits(fs->body, out);
-        return;
-    }
-    if (auto* dob = dynamic_cast<const ast::DoEndBlock*>(&s)) {
-        collectOwnedConsumingAwaits(dob->body, out);
-        return;
-    }
-    if (auto* ts = dynamic_cast<const ast::TryStmt*>(&s)) {
-        collectOwnedConsumingAwaits(ts->body, out);
-        for (const auto& arm : ts->catches)
-            if (arm.body) collectOwnedConsumingAwaitsStmt(*arm.body, out);
-        collectOwnedConsumingAwaits(ts->finallyBody, out);
-        return;
-    }
-    // fix #3074 (§30.5, v0.249): the statement-position `case`. Its Block-form
-    // arm bodies are ordinary statements and may hold every owned-consuming
-    // position above — `using var x := await Acquire();` most obviously. Without
-    // this arm the check walk (which now DOES reach a `case` arm) would report
-    // such an await as "not in an owned-consuming context". The Expression-form
-    // arm body is not admitted in statement position (see ast::CaseStmt), so only
-    // `stmts` is walked; a `when` guard is a boolean condition, never an owned
-    // sink.
-    if (auto* cs = dynamic_cast<const ast::CaseStmt*>(&s)) {
-        for (const auto& arm : cs->arms) collectOwnedConsumingAwaits(arm.stmts, out);
-        return;
-    }
+            return;
+        }
+        if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&cur)) {
+            // `return await ...` — owned-consuming unconditionally; a
+            // Pattern A `return await Producer()` is also admitted and
+            // recorded in returnPositionAwaits_.
+            if (rs->value)
+                if (auto* a = awaitRoot(*rs->value)) {
+                    out.insert(a);
+                    returnPositionAwaits_.insert(a);
+                }
+            return;
+        }
+        if (auto* ys = dynamic_cast<const ast::YieldStmt*>(&cur)) {
+            // `yield return await ...` in an owned-yielding iterator (§29.2).
+            if (ys->value)
+                if (auto* a = awaitRoot(*ys->value)) out.insert(a);
+            return;
+        }
+        if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(&cur)) {
+            // `coll.Add(await ...)` / `M(await ...)` where the formal is
+            // `owned`: the `await` is an argument bound to an owned
+            // parameter — an owned-consuming position (§30.5).
+            if (es->expr) collectOwnedConsumingInExpr(*es->expr, out);
+            return;
+        }
+        // LocalConstDecl / ThrowStmt / IncrementStmt / BreakStmt /
+        // ContinueStmt — NOT in §30.5's owned-consuming enumeration; a
+        // Pattern B await there stays rejected. Deliberately silent — the
+        // walker recurses into their (empty) bodies anyway, which is a
+        // no-op.
+    });
 }
 
 // §30.5: an `await` passed as an `owned` argument is in an owned-consuming
@@ -11463,97 +11316,38 @@ bool MethodOwnership::exprContainsAwait(const ast::Expr* e) const {
 // nothing new. // per §28.8.1, K9.2, #3080
 // ---------------------------------------------------------------------------
 
+// fix #3656 (§28.8.1, v0.286): the per-statement action is now a single `fn`;
+// the statement recursion (and the try-state propagation) is owned by
+// `forEachNestedStmt`. The walker sets `insideTry=true` and
+// `enclosingTry=ts` on descent into a try's body / catch / finally, and
+// `insideTry` stays sticky once set.
+//
+// The §6b exclusion diff against the pre-#3656 copy is the null diff: the
+// old walker visited every container kind the new walker visits (if / while /
+// for / do-end / try / case arm body — CaseStmt was added in #3586); the
+// try-state propagation semantics are unchanged.
 void MethodOwnership::collectStmtsInsideTryStmt(const ast::Stmt& s,
                                                 bool insideTry,
                                                 const ast::TryStmt* enclosingTry) {
-    if (insideTry) {
-        stmtsInsideTry_.insert(&s);
-        // §28.8.1 (#3241 R2): record the IMMEDIATE enclosing try alongside
-        // the in-`try` set membership, so the deferred-check firing can
-        // route the check to the right try's catch arms. The IMMEDIATE
-        // enclosing try is the one we're descending through on this
-        // recursive call — a statement inside a nested try's body is
-        // associated with the INNER try (which is the one whose catch arms
-        // are the relevant resolution set), not the outer.
-        if (enclosingTry) stmtsInsideTryByStmt_[&s] = enclosingTry;
-    }
-    // Recurse into the control-flow forms that can lexically contain a try
-    // statement: if / while / for / do-end / try / case (statement-position).
-    // `insideTry` stays sticky once set: a statement nested three ifs deep
-    // inside a try body is still inside that try.
-    //
-    // The `ast::CaseStmt` arm mirrors the one `collectLocalDepthsStmt` gained
-    // in fix #3552 (v0.286). The two walkers must visit the same grammar:
-    // their consumers are paired (this map's `stmtsInsideTry_` set and the
-    // `localDepth_` map), and a divergence in their coverage is a
-    // duplicated-classification-predicate defect applied to traversal. The
-    // `stmtsInsideTry_` consumer currently skips a whole `case` on purpose
-    // (the §28.8.1 deferred-firing early-return on `case`), so the gap was
-    // latent — but the consumer's skip is the deliberate under-approximation
-    // that #3241's planned follow-up is expected to REPLACE with arm-local
-    // entry states, and at that point this walker must already be correct.
-    // // per §28.8.1, fix #3552, fix #3586
-    if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&s)) {
-        for (const auto& bs : ifs->ifBranch.body)
-            if (bs) collectStmtsInsideTryStmt(*bs, insideTry, enclosingTry);
-        for (const auto& el : ifs->elifBranches)
-            for (const auto& bs : el.body)
-                if (bs) collectStmtsInsideTryStmt(*bs, insideTry, enclosingTry);
-        for (const auto& bs : ifs->elseBody)
-            if (bs) collectStmtsInsideTryStmt(*bs, insideTry, enclosingTry);
-        return;
-    }
-    if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&s)) {
-        for (const auto& bs : ws->body)
-            if (bs) collectStmtsInsideTryStmt(*bs, insideTry, enclosingTry);
-        return;
-    }
-    if (auto* fs = dynamic_cast<const ast::ForStmt*>(&s)) {
-        for (const auto& bs : fs->body)
-            if (bs) collectStmtsInsideTryStmt(*bs, insideTry, enclosingTry);
-        return;
-    }
-    if (auto* dob = dynamic_cast<const ast::DoEndBlock*>(&s)) {
-        for (const auto& bs : dob->body)
-            if (bs) collectStmtsInsideTryStmt(*bs, insideTry, enclosingTry);
-        return;
-    }
-    if (auto* ts = dynamic_cast<const ast::TryStmt*>(&s)) {
-        // Everything the try lexically encloses — body, each catch arm, and the
-        // finally body — is `insideTry` from here down, with THIS try as the
-        // IMMEDIATE encloser. The body gets the new `ts` as its enclosingTry;
-        // catch arms and finally body do too (they are lexically inside the
-        // try, even though their dataflow is processed at the catch arm's
-        // level — a catch arm throwable's resolution set is the OUTER try's
-        // catch arms, not this try's, but the in-`try` set membership and
-        // the original R1 skip don't depend on the distinction).
-        for (const auto& bs : ts->body)
-            if (bs) collectStmtsInsideTryStmt(*bs, true, ts);
-        for (const auto& arm : ts->catches)
-            if (arm.body) collectStmtsInsideTryStmt(*arm.body, true, ts);
-        for (const auto& bs : ts->finallyBody)
-            if (bs) collectStmtsInsideTryStmt(*bs, true, ts);
-        return;
-    }
-    // fix #3586 (§28.8.1, v0.286): descend into each statement-`case` arm
-    // body. Mirrors `collectLocalDepthsStmt`'s CaseStmt arm (fix #3552)
-    // verbatim — same walker grammar, same arm-by-arm `stmts` walk. Each
-    // arm body is a Block of statements (an Expression-form arm holds no
-    // statements to mark, and a `when` guard is a boolean expression);
-    // `insideTry` and `enclosingTry` propagate unchanged so a `try` nested
-    // inside an arm records its body in `stmtsInsideTry_` and its enclosing
-    // try in `stmtsInsideTryByStmt_` exactly as the `do`-`end` spelling does.
-    // Pre-fix: every statement inside an arm body was opaque to this walker,
-    // so a `try`/`catch` nested in an arm was invisible to §28.8.1. Today the
-    // consumer skips the whole `case` (so the gap is latent), but the
-    // consumer's skip is being unwound as part of #3241's follow-up, and at
-    // that point the walker must already be correct.
-    if (auto* cs = dynamic_cast<const ast::CaseStmt*>(&s)) {
-        for (const auto& arm : cs->arms)
-            for (const auto& bs : arm.stmts)
-                if (bs) collectStmtsInsideTryStmt(*bs, insideTry, enclosingTry);
-        return;
-    }
+    forEachNestedStmt(
+        s,
+        [&](const ast::Stmt& cur, StmtVisitState state) {
+            if (state.insideTry) {
+                stmtsInsideTry_.insert(&cur);
+                // §28.8.1 (#3241 R2): record the IMMEDIATE enclosing try
+                // alongside the in-`try` set membership, so the deferred-
+                // check firing can route the check to the right try's catch
+                // arms. The walker has already set `state.enclosingTry` to
+                // the IMMEDIATE enclosing try on descent into a try's
+                // body / catch / finally, so a statement inside a nested
+                // try's body is associated with the INNER try (which is
+                // the one whose catch arms are the relevant resolution
+                // set), not the outer.
+                if (state.enclosingTry)
+                    stmtsInsideTryByStmt_[&cur] = state.enclosingTry;
+            }
+        },
+        StmtVisitState{/*depth=*/0, insideTry, enclosingTry});
 }
 
 void MethodOwnership::collectStmtsInsideTry(
