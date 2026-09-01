@@ -1057,7 +1057,31 @@ void Emitter::emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,
     bool isInstance = !isStaticMethod(ms);
     // fix #3536: qualify with the owning class — see the identical rationale
     // at the sync-iterator mint (LlvmBackend_Iterators.cpp, `emitIteratorMethod`).
-    std::string prefix = std::string("bz$async$") + mangledTypeName(ms->parent) +
+    std::string prefix = std::string("bz$async$") +
+                         [this, ms]() -> std::string {
+                             // fix #3639: see LlvmBackend_Iterators.cpp
+                             // `emitIteratorMethod`'s identical lambda for the
+                             // full rationale. The body MUST stay identical
+                             // at all three emit sites (iterator + async
+                             // method + async iterator) — these three sites
+                             // are the "one qualifier" the issue itself names,
+                             // and a future extraction to a single header-side
+                             // shared authority is a local rename rather
+                             // than a three-site audit only if they stay in
+                             // lock-step today.
+                             if (isExtensionMethod(ms)) {
+                                 const ast::ExtensionDecl* ed = ms->extensionDecl;
+                                 if (ed && ed->targetType) {
+                                     if (const sema::TypeRef* rt = ctx_.resolvedType(*ed->targetType);
+                                         rt && rt->declaration)
+                                         return mangledTypeName(rt->declaration);
+                                     if (ed->targetType->name && !ed->targetType->name->parts.empty())
+                                         return std::string(ed->targetType->name->parts.back());
+                                 }
+                                 return "";
+                             }
+                             return mangledTypeName(ms->parent);
+                         }() +
                          "$" + std::string(ms->name) + "$";
 
     // --- Resume(ptr completedTask, ptr frame) -> void ---
@@ -2257,7 +2281,26 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
     bool isInstance = !isStaticMethod(ms);
     // fix #3536: qualify with the owning class — see the identical rationale
     // at the sync-iterator mint (LlvmBackend_Iterators.cpp, `emitIteratorMethod`).
-    std::string prefix = std::string("bz$asynciter$") + mangledTypeName(ms->parent) +
+    std::string prefix = std::string("bz$asynciter$") +
+                         [this, ms]() -> std::string {
+                             // fix #3639: see LlvmBackend_Iterators.cpp
+                             // `emitIteratorMethod`'s identical lambda for the
+                             // full rationale. Body MUST stay identical at
+                             // all three emit sites — keep in lock-step with
+                             // emitIteratorMethod / emitAsyncMethod.
+                             if (isExtensionMethod(ms)) {
+                                 const ast::ExtensionDecl* ed = ms->extensionDecl;
+                                 if (ed && ed->targetType) {
+                                     if (const sema::TypeRef* rt = ctx_.resolvedType(*ed->targetType);
+                                         rt && rt->declaration)
+                                         return mangledTypeName(rt->declaration);
+                                     if (ed->targetType->name && !ed->targetType->name->parts.empty())
+                                         return std::string(ed->targetType->name->parts.back());
+                                 }
+                                 return "";
+                             }
+                             return mangledTypeName(ms->parent);
+                         }() +
                          "$" + std::string(ms->name) + "$";
 
     // §29.7 (#2574): the LOCAL counterpart of the async iterator's owned-

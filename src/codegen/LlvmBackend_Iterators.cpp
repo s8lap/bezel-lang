@@ -1179,7 +1179,42 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
     // already applied to eleven sibling mints in LlvmBackend_Assign.cpp),
     // the second class would silently reuse the first class's MoveNext /
     // Current / Dispose over its own, differently-shaped frame.
-    std::string prefix = std::string("bz$iter$") + mangledTypeName(ms->parent) +
+    std::string prefix = std::string("bz$iter$") +
+                         [this, ms]() -> std::string {
+                             // fix #3639: extension iterator/async mints
+                             // collide after #3536 because `mangledTypeName(nullptr)`
+                             // = "" for an extension (ms->parent is null — see
+                             // Emitter::isExtensionMethod's doc comment at
+                             // LlvmBackend_impl.hpp ~L6098). Qualify by the
+                             // extension's receiver type (`ms->extensionDecl->
+                             // targetType`) so two extensions with the same
+                             // method name on different receiver types mint
+                             // distinct prefixes. Mirrors `functionName`'s
+                             // isExtensionMethod branch at LlvmBackend_Setup.cpp
+                             // ~L93: prefer the resolved TypeRef's declaration
+                             // (`functionName`'s #1488 path), fall back to the
+                             // bare AST name parts for a primitive target like
+                             // `extension int` whose TypeRef has no declaration.
+                             // For an ordinary class method this is just
+                             // `mangledTypeName(ms->parent)` — no widening vs
+                             // #3536. The SAME qualifier is applied at the two
+                             // sibling Async sites (emitAsyncMethod /
+                             // emitAsyncIteratorMethod) with the same body so a
+                             // future extraction to one shared authority is
+                             // mechanical rather than three-site.
+                             if (isExtensionMethod(ms)) {
+                                 const ast::ExtensionDecl* ed = ms->extensionDecl;
+                                 if (ed && ed->targetType) {
+                                     if (const sema::TypeRef* rt = ctx_.resolvedType(*ed->targetType);
+                                         rt && rt->declaration)
+                                         return mangledTypeName(rt->declaration);
+                                     if (ed->targetType->name && !ed->targetType->name->parts.empty())
+                                         return std::string(ed->targetType->name->parts.back());
+                                 }
+                                 return "";
+                             }
+                             return mangledTypeName(ms->parent);
+                         }() +
                          "$" + std::string(ms->name) + "$";
 
     // §29.7 (#2306): finish the local pre-pass now that `frame` is built.
