@@ -12201,16 +12201,21 @@ private:
     // the using-var's normal-exit-and-unwind path.
     bool registerOwningChoiceDisposal(const ast::LocalDecl* ld);
 
-    // §29.11 (#943): if `ld` is a plain (non-`using`) `var` whose value is a
-    // vtable-backed re-iterable IEnumerable<T>/IOwningEnumerable<T> (the result of
-    // a yield iterator method, or an array/user-class wrapped into one), register
-    // a scope-end disposal of that source via the iterator-format slot-1 Dispose
-    // (iterEnumDispose) and return true. The for-in loop over such a source clones
-    // a fresh enumerator per iteration and leaves the source alive (so a second
-    // loop replays), so the SOURCE itself must be disposed once at scope end here.
-    // Returns false for any other local (the caller falls through to the normal
+    // §29.11 (#943): if `declNode` is a plain (non-`using`) local-declaration
+    // (LocalDecl OR a §21.1 runtime `const` LocalConstDecl — fix #3640) whose
+    // value is a vtable-backed re-iterable IEnumerable<T>/IOwningEnumerable<T>
+    // (the result of a yield iterator method, or an array/user-class wrapped into
+    // one), register a scope-end disposal of that source via the iterator-format
+    // slot-1 Dispose (iterEnumDispose) and return true. The for-in loop over such
+    // a source clones a fresh enumerator per iteration and leaves the source
+    // alive (so a second loop replays), so the SOURCE itself must be disposed
+    // once at scope end here. The init/type/isUsing triple is read through
+    // `Emitter::localDeclInitView` (#3402's shared authority), so a §21.1
+    // runtime `const` with an IEnumerable-typed wrapper initializer (a BORROW,
+    // which §21.1 explicitly admits) is recognized identically. Returns false
+    // for any other local (the caller falls through to the normal
     // using/task/unwind registration chain).
-    bool registerIterableSourceDisposal(const ast::LocalDecl* ld);
+    bool registerIterableSourceDisposal(const ast::Node* declNode);
 
     // §28.11 / #889: the set of LocalDecl nodes that RECEIVED ownership of a
     // moved-out owned element via an `out owned` argument (e.g.

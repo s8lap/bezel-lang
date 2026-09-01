@@ -109,12 +109,9 @@
 
 #include <string>
 
-#include "support/Diagnostic.hpp"     // DiagnosticEngine / Diagnostic
 #include "support/aot_support.hpp"   // runAotChecked — AOT+ASan
 #include "test_harness.hpp"
 
-using bezel::Diagnostic;
-using bezel::DiagnosticEngine;
 using bezel::test::runAotChecked;
 
 namespace {
@@ -127,33 +124,6 @@ namespace {
 std::string run(const std::string& src) {
     auto r = runAotChecked(src);
     return r.ran ? r.stdoutText : std::string("<did-not-run>");
-}
-
-// Parse the "SUMMARY: AddressSanitizer: NNNN byte(s) leaked in MMM
-// allocation(s)." line's byte count out of a JitResult's diagnostics.
-// aot_support.hpp's runAotCheckedImpl embeds the raw sanitizer report text
-// (up to 8192 chars) in a single Severity::Error diagnostic whenever the
-// sanitizer fires (leak OR crash), so this scans every reported message for
-// that one line. Returns -1 if no such SUMMARY line is present — a
-// crash/UAF/double-free report has a different shape (no "byte(s) leaked"
-// line), and so does a front-end/compile failure unrelated to the sanitizer;
-// both must be told apart from "leaked fewer bytes than the threshold" by
-// the caller, not silently folded into a plausible-looking small number.
-long summaryLeakedBytes(const DiagnosticEngine& diags) {
-    static const std::string kMarker = "SUMMARY: AddressSanitizer: ";
-    for (const Diagnostic& d : diags.diagnostics()) {
-        auto pos = d.message.find(kMarker);
-        if (pos == std::string::npos) continue;
-        pos += kMarker.size();
-        auto end = d.message.find(" byte", pos);
-        if (end == std::string::npos || end <= pos) continue;
-        try {
-            return std::stol(d.message.substr(pos, end - pos));
-        } catch (...) {
-            return -1;
-        }
-    }
-    return -1;
 }
 
 // The issue's own repro, parameterized on the view local's keyword.
@@ -189,29 +159,26 @@ BEZEL_TEST(const_local_safe_view_alias_3427,
     BEZEL_EXPECT_EQ(run(program("var")), "60300\n");
 }
 
-// ── THE FIXED HALF, under the STRICT oracle with a byte-count assertion
-// (issue #3640 tracks the residual wrapper-frame leak that keeps this
-// program off a bare runAotChecked pass). `r.ran` stays `false` here on
-// BOTH sides of this commit's src/ hunk — the residual is real and is not
-// hidden — so the fix is proven by the LEAKED-BYTE COUNT dropping below a
-// threshold that separates "array backing leaks too" (pre-fix, ~30400 B)
-// from "only the wrapper frame leaks" (post-fix, ~6368 B), not by `r.ran`
-// flipping to true. `stdoutText` is still asserted directly: an unsound
-// over-eager reclaim of the array while `v` is still iterating it (the
-// failure mode this fix's own soundness argument rules out) would either
-// crash before the loop finishes (wrong/truncated stdout) or show up as a
-// heap-use-after-free/double-free report instead of a leak SUMMARY line
-// (caught by the `leaked >= 0` assertion below).
-// per §21.1, §28.9, §28.11 (issue #3427; residual issue #3640)
+// ── THE FIXED HALF — under the STRICT oracle. fix #3640 (Register iterable
+// disposal for §21.1 const views) closed the residual wrapper-frame leak
+// `Emitter::registerIterableSourceDisposal` had on the LocalConstDecl arm
+// (the LocalDecl arm of `lowerStmt` already disposed; the LocalConstDecl arm
+// silently dropped the registration, leaking ~6368 B / 199 allocs — exactly
+// #3392's 32-B borrowing wrapper frame measurement). With #3640 landed the
+// same program is now fully LSan-clean: this row's oracle reverts from a
+// threshold-byte assertion (`r.ran == false`, `leaked < 10000`) to the plain
+// strict pass (`r.ran == true`) — the FAIL-WITHOUT/PASS-WITH proof moved to
+// `tests/codegen/const_local_enumerable_view_disposal_3640_test.cpp`'s
+// `const_ienumerable_view_wrapper_reclaimed_spec_21_1_29_11` row, which is
+// the load-bearing regression test for this exact shape. `stdoutText` is
+// still asserted directly: an unsound over-eager reclaim of the array while
+// `v` is still iterating it would either crash before the loop finishes
+// (wrong/truncated stdout) or show up as a heap-use-after-free/double-free
+// — both observed by the strict oracle.
+// per §21.1, §28.9, §28.11 (issue #3427; residual closed by #3640)
 BEZEL_TEST(const_local_safe_view_alias_3427,
-           const_view_leaked_bytes_below_array_backing_threshold_spec_21_1_28_9) {
+           const_view_array_backing_and_wrapper_reclaimed_spec_21_1_28_9) {
     auto r = runAotChecked(program("const"));
+    BEZEL_EXPECT_TRUE(r.ran);                // fix #3640: residual closed
     BEZEL_EXPECT_EQ(r.stdoutText, "60300\n");
-    BEZEL_EXPECT_FALSE(r.ran);  // issue #3640: still red post-fix, by design
-    long leaked = summaryLeakedBytes(r.diagnostics);
-    BEZEL_EXPECT_TRUE(leaked >= 0);     // a real leak SUMMARY was found (not
-                                        // a crash/UAF report of a different
-                                        // shape, and not a compile reject)
-    BEZEL_EXPECT_TRUE(leaked < 10000);  // ~6368 B post-fix, < the ~30400 B
-                                        // pre-fix combined leak
 }

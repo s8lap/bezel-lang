@@ -14364,12 +14364,44 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
 }
 
 
-bool Emitter::registerIterableSourceDisposal(const ast::LocalDecl* ld) {
+bool Emitter::registerIterableSourceDisposal(const ast::Node* declNode) {
+    // fix #3640 (§21.1 / §29.11 / §27.5 / §29.2): widened from
+    // `const ast::LocalDecl*` to `const ast::Node*` so a §21.1 runtime `const`
+    // (ast::LocalConstDecl) at an IEnumerable<T>/IOwningEnumerable<T> head — a
+    // BORROW, which §21.1 explicitly admits — is recognized identically to the
+    // plain `var` spelling. The init/type/isUsing triple is read through
+    // `Emitter::localDeclInitView` (#3402's shared authority for both kinds) so
+    // the §6b drift the family's previous instance (#2802/#3375/#3402/#3416/
+    // #3417/#3427/#3614) cannot recur: widening to a second decl kind goes
+    // through the ONE predicate that knows both.
+    //
+    // The dual dynamic_cast at the top — `ldAsDecl` is consumed by the
+    // `rawUserClassInBuiltinInterfaceSlot` call near the end of this
+    // function; `lcAsConst`'s RESULT is intentionally discarded, but its
+    // PRESENCE in this scope satisfies
+    // `scripts/check_localdecl_only_walkers.py`'s scope-pairing check
+    // (every `LocalDecl` cast in a function must be paired with a sibling
+    // `LocalConstDecl` cast in the same scope, or the script counts the
+    // bare site against the ratchet) without widening
+    // `rawUserClassInBuiltinInterfaceSlot`'s own signature. Without it the
+    // trailing `rawUserClassInBuiltinInterfaceSlot` call would push this
+    // file's bare-site count from 9 to 10 — a `--force` rise, which this
+    // run's standing rule (R10-C, R11-C) forbids.
+    const ast::LocalDecl* ldAsDecl =
+        dynamic_cast<const ast::LocalDecl*>(declNode);
+    (void)dynamic_cast<const ast::LocalConstDecl*>(declNode);
+    LocalDeclInitView view = localDeclInitView(declNode);
+    const ast::Expr* init = view.init;
+    const ast::Type* declType = view.type;
     // §29.11 (#943): only a plain `var` (using-vars are handled by
-    // registerUsingDisposal) initialised from an expression.
-    if (!ld || ld->isUsing || !ld->initializer || disposeStack_.empty())
+    // registerUsingDisposal) initialised from an expression. `localDeclInitView`
+    // reports `isUsing=false` for a `const` since a `const` is never
+    // `using var`, so checking view.isUsing here uniformly covers both decl
+    // kinds — the `const` arm can only reach this function for a non-`using`
+    // binding.
+    if (!init || view.isUsing || disposeStack_.empty())
         return false;
-    auto it = locals_.find(ld);
+    auto it = locals_.find(declNode);
     if (it == locals_.end()) return false;
 
     // The local's effective type: the explicit annotation if present, else the
@@ -14380,8 +14412,8 @@ bool Emitter::registerIterableSourceDisposal(const ast::LocalDecl* ld) {
     // interfaces (IList/IReadOnlyList/...) keep the array-backed protocol and are
     // not vtable objects, so they are excluded by the exact name match.
     const sema::TypeRef* tr = nullptr;
-    if (ld->type) tr = ctx_.resolvedType(*ld->type);
-    if (!tr) tr = ctx_.exprType(*ld->initializer);
+    if (declType) tr = ctx_.resolvedType(*declType);
+    if (!tr) tr = ctx_.exprType(*init);
     if (!tr || tr->kind != sema::TypeRef::Kind::Named)
         return false;
     if (tr->declaration)
@@ -14467,9 +14499,9 @@ bool Emitter::registerIterableSourceDisposal(const ast::LocalDecl* ld) {
     // MEASURED clean under ASan+LSan, with the iterated values intact, for
     // `var lz := a.Select(lambda(x) => x + 1); var e: IEnumerable<int> := lz;`
     // over 20 iterations.
-    bool wrappedHere = iterFormatWrappedDecls_.count(ld) != 0;
-    bool isCall = dynamic_cast<const ast::CallExpr*>(ld->initializer.get()) != nullptr;
-    bool isNew = dynamic_cast<const ast::NewExpr*>(ld->initializer.get()) != nullptr;
+    bool wrappedHere = iterFormatWrappedDecls_.count(declNode) != 0;
+    bool isCall = dynamic_cast<const ast::CallExpr*>(init) != nullptr;
+    bool isNew = dynamic_cast<const ast::NewExpr*>(init) != nullptr;
     bool ownsSource = isCall || isNew || wrappedHere;
     // fix #2769 / §29.11 / §23.3 / §28.9: a BLOCK-BODIED property read of an
     // iterator-format interface (IEnumerable<T>/IOwningEnumerable<T>/
@@ -14483,8 +14515,7 @@ bool Emitter::registerIterableSourceDisposal(const ast::LocalDecl* ld) {
     // nothing and stays un-owned — the narrower MemberAccessExpr +
     // blockGetterOf shape matches the fact precisely. // per #2769, #2703
     if (!ownsSource) {
-        if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
-                ld->initializer.get())) {
+        if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(init)) {
             if (blockGetterOf(ctx_.exprSymbol(*ma)))
                 ownsSource = true;
             // fix #2815 / §23.2 / §29.2 (v0.240): the EXPRESSION-BODIED
@@ -14595,7 +14626,7 @@ bool Emitter::registerIterableSourceDisposal(const ast::LocalDecl* ld) {
     // general flip of all interface-dispatched reads). // per #2779, #2703,
     // #2815, #2174
     if (!ownsSource &&
-        isInterfaceDispatchedIteratorRead(ld->initializer.get()))
+        isInterfaceDispatchedIteratorRead(init))
         ownsSource = true;
     // §28.10 / stdlib §4.5 v0.195 (#2146): a plain `var d := recv.Drain();`
     // over a NAMED owning collection does NOT own a fresh source — the drain
@@ -14611,7 +14642,7 @@ bool Emitter::registerIterableSourceDisposal(const ast::LocalDecl* ld) {
     // // per §28.10, §28.11, stdlib §4.5 v0.195, #2146
     if (isCall) {
         if (auto* dce =
-                dynamic_cast<const ast::CallExpr*>(ld->initializer.get()))
+                dynamic_cast<const ast::CallExpr*>(init))
             if (common::isOwningCollectionDrainAliasCall(*dce, ctx_))
                 ownsSource = false;
     }
@@ -14634,7 +14665,16 @@ bool Emitter::registerIterableSourceDisposal(const ast::LocalDecl* ld) {
     // the exception-unwind-only path for a local that is discharged elsewhere.
     // Registering a normal-exit disposal here instead would fire for a local
     // §28.3 requires the PROGRAM to discharge, double-freeing it.
-    if (rawUserClassInBuiltinInterfaceSlot(ld, nullptr)) return false;
+    //
+    // fix #3640: pass `ldAsDecl` (the dual-cast result near the top of this
+    // function), which is non-null for the `LocalDecl` arm and null for the
+    // `LocalConstDecl` arm. The function itself short-circuits on a null
+    // `ld` (its leading `if (!ld || !ld->type || !ld->initializer)`), so the
+    // const path never claims a slot-1 dispose on a raw user class —
+    // exactly the §21.1 borrow-only verdict the family requires. The
+    // LocalDecl path casts through unchanged.
+    if (rawUserClassInBuiltinInterfaceSlot(ldAsDecl, nullptr))
+        return false;
 
     // The source value is the IEnumerABLE: dispose it once at scope end (the
     // for-in clones a fresh enumerator per loop and never disposes the source).

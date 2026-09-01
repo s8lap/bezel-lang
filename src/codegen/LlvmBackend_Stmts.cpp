@@ -298,6 +298,31 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
             if (lit != locals_.end())
                 loopBodyDeclaredSlots_.insert(lit->second);
         }
+        if (diverged_) return true;  // CG40: diverging initializer
+        // fix #3640 (§21.1 / §29.11 / §27.5 / §29.2): a §21.1 runtime `const`
+        // bound to a vtable-backed re-iterable IEnumerable<T>/IOwningEnumerable<T>
+        // source (an array/user-class WRAPPED into one — `wrapArrayAsIEnumerable`
+        // et al. mint a fresh 32-B `{vtable, arr, idx, esz}` borrowing wrapper
+        // frame at the decl site) is BINDING a borrow, which §21.1 EXPLICITLY
+        // admits. The wrapper frame's scope-end disposal was previously routed
+        // ONLY through the LocalDecl arm's `registerIterableSourceDisposal` call,
+        // so the const arm silently dropped the registration → measured leak
+        // of 6368 B / 199 allocs (32 B per wrapper frame, #3392's own
+        // measurement) for `const v: IEnumerable<int> := arr;` repeated across a
+        // loop. `registerIterableSourceDisposal` was widened from
+        // `const ast::LocalDecl*` to `const ast::Node*` (#3640) so it accepts
+        // either decl kind; the LocalConstDecl arm now mirrors the LocalDecl
+        // arm's call here so the SAME chain runs for both. Mirrored exactly to
+        // avoid the §6b drift that has already produced seven instances of this
+        // defect family (#2802/#3375/#3402/#3416/#3417/#3427/#3614).
+        // per #3640, #3402, #3384, #3419, #942
+        if (registerIterableSourceDisposal(lc)) return false;
+        // A `const` cannot bind an OWNED production (an owning choice, a
+        // move-only inline array, a task frame — §21.1); the
+        // registerInlineOwnedArrayDisposal / registerOwningChoiceDisposal /
+        // task-disposal chain is therefore legitimately unreachable from the
+        // const arm and is intentionally NOT mirrored (per §21.1 admission
+        // boundary).
         return diverged_;  // CG40
     }
     if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&s)) {
