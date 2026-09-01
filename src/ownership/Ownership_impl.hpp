@@ -477,6 +477,17 @@ public:
     // header comment for the rationale and the #2666 walk-through.
     bool localIsTrivialDisposeNewBinding(const ast::LocalDecl& ld);
 
+    // §28.8.1 / fix #3586 — test-only accessor: true when `s` was recorded
+    // as lexically inside a `try` by collectStmtsInsideTry. Exposed so the
+    // walker-coverage regression tests for fix #3586 can verify the CaseStmt
+    // arm directly; the consumer of `stmtsInsideTry_` (§28.8.1's deferred-
+    // firing path) currently skips a whole `case` on purpose, so the gap is
+    // latent and otherwise untestable. Read-only — the walker is the only
+    // mutator. // per §28.8.1
+    bool isStmtInsideTry(const ast::Stmt* s) const {
+        return stmtsInsideTry_.count(s) > 0;
+    }
+
 private:
     sema::SemaContext& ctx_;
     std::unordered_map<sema::Symbol*, LocalOwnership> states_;

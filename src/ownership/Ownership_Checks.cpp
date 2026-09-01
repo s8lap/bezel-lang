@@ -11449,21 +11449,21 @@ void MethodOwnership::collectStmtsInsideTryStmt(const ast::Stmt& s,
         if (enclosingTry) stmtsInsideTryByStmt_[&s] = enclosingTry;
     }
     // Recurse into the control-flow forms that can lexically contain a try
-    // statement: if / while / for / do-end / try. `insideTry` stays sticky once
-    // set: a statement nested three ifs deep inside a try body is still inside
-    // that try.
+    // statement: if / while / for / do-end / try / case (statement-position).
+    // `insideTry` stays sticky once set: a statement nested three ifs deep
+    // inside a try body is still inside that try.
     //
-    // ⚠ `ast::CaseStmt` is NOT among them, so a `try` nested in a statement-
-    // `case` arm leaves its children unmarked. That is currently MOOT for this
-    // map's §28.8.1 consumer, which skips a whole `case` on purpose (see the
-    // long note at `firePendingInTryChecks`' CaseStmt early-return: the CFG
-    // appends a `case` as one opaque node, so judging its arms against the
-    // pre-`case` entry state would falsely reject). It is recorded rather than
-    // fixed because the two facts are independent: if a future consumer reads
-    // `stmtsInsideTry_` without that skip, this gap becomes live. This comment
-    // previously read "mirrors collectLocalDepthsStmt's structure"; fix #3552
-    // gave that walker a CaseStmt arm, which would have left the claim false.
-    // // per §28.8.1
+    // The `ast::CaseStmt` arm mirrors the one `collectLocalDepthsStmt` gained
+    // in fix #3552 (v0.286). The two walkers must visit the same grammar:
+    // their consumers are paired (this map's `stmtsInsideTry_` set and the
+    // `localDepth_` map), and a divergence in their coverage is a
+    // duplicated-classification-predicate defect applied to traversal. The
+    // `stmtsInsideTry_` consumer currently skips a whole `case` on purpose
+    // (the §28.8.1 deferred-firing early-return on `case`), so the gap was
+    // latent — but the consumer's skip is the deliberate under-approximation
+    // that #3241's planned follow-up is expected to REPLACE with arm-local
+    // entry states, and at that point this walker must already be correct.
+    // // per §28.8.1, fix #3552, fix #3586
     if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&s)) {
         for (const auto& bs : ifs->ifBranch.body)
             if (bs) collectStmtsInsideTryStmt(*bs, insideTry, enclosingTry);
@@ -11504,6 +11504,25 @@ void MethodOwnership::collectStmtsInsideTryStmt(const ast::Stmt& s,
             if (arm.body) collectStmtsInsideTryStmt(*arm.body, true, ts);
         for (const auto& bs : ts->finallyBody)
             if (bs) collectStmtsInsideTryStmt(*bs, true, ts);
+        return;
+    }
+    // fix #3586 (§28.8.1, v0.286): descend into each statement-`case` arm
+    // body. Mirrors `collectLocalDepthsStmt`'s CaseStmt arm (fix #3552)
+    // verbatim — same walker grammar, same arm-by-arm `stmts` walk. Each
+    // arm body is a Block of statements (an Expression-form arm holds no
+    // statements to mark, and a `when` guard is a boolean expression);
+    // `insideTry` and `enclosingTry` propagate unchanged so a `try` nested
+    // inside an arm records its body in `stmtsInsideTry_` and its enclosing
+    // try in `stmtsInsideTryByStmt_` exactly as the `do`-`end` spelling does.
+    // Pre-fix: every statement inside an arm body was opaque to this walker,
+    // so a `try`/`catch` nested in an arm was invisible to §28.8.1. Today the
+    // consumer skips the whole `case` (so the gap is latent), but the
+    // consumer's skip is being unwound as part of #3241's follow-up, and at
+    // that point the walker must already be correct.
+    if (auto* cs = dynamic_cast<const ast::CaseStmt*>(&s)) {
+        for (const auto& arm : cs->arms)
+            for (const auto& bs : arm.stmts)
+                if (bs) collectStmtsInsideTryStmt(*bs, insideTry, enclosingTry);
         return;
     }
 }
