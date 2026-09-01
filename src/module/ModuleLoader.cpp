@@ -585,60 +585,57 @@ struct Loader {
     // member scope and has its own fresh member scope for its own members.
     sema::TypeSymbol* reconstructTypeSymbol(const MetaTypeDecl& td,
                                             sema::TypeSymbol& parent) {
-        auto* t = ctx.makeImportedSymbol<sema::TypeSymbol>();
-        t->name = ctx.internString(td.name);
-        t->kind = fromMetaTypeDeclKind(td.kind);
-        t->visibility = fromMetaVisibility(td.visibility);
-        t->modifiers = intern(td.modifiers);
-        t->scope = parent.memberScope;
-        t->memberScope = ctx.newScope();
-        // #1488: a nested type declares in the same module as its enclosing
-        // type (§11.6 — nesting is not a separate module), so it inherits the
-        // parent's already-populated moduleName rather than needing its own
-        // MetaModule lookup.
-        t->moduleName = parent.moduleName;
-        // fix #3529 (§11.6 / §2.8.3 rule 3, v0.283): the OTHER half of rule 3's
-        // identity, populated from the same place and for the same reason. The
-        // enclosing type's qualified name IS this type's enclosing-type path,
-        // and because reconstructTypeSymbol recurses through convertMember with
-        // `*t` as the new parent, a deeper `A.B.C` composes here exactly as
-        // SymbolCollection composes it locally. Nothing new goes on the wire:
-        // the metadata already nests a MetaTypeDecl inside its enclosing
-        // MetaMember, so the path is structural and no schema bump is needed.
-        // The two sides must agree or a nested type's external declaration in
-        // the importer names a symbol the exporter never defined.
-        t->enclosingTypePath = parent.qualifiedTypeName();
-        // fix #3540 (§11.6 / §2.8.3 rule 3 / §2.8.2, v0.285): enter this nested
-        // type into `localTypes` so a member signature that names it resolves.
-        // Nothing ever did — `loadMetadataPass1` walks `md.types`, i.e. the
-        // TOP-LEVEL types only, and this symbol does not exist until now — so
-        // `lookupNamed` returned null for every `Outer.Box`-typed parameter of
-        // an imported member, the TypeRef kept `declaration == nullptr`, and
-        // codegen took the i32 default. The consumer could not be compiled at
-        // all: a `ptr` argument against an `i32` parameter, reported as
-        // "Call parameter type does not match function signature!" from the IR
-        // verifier rather than as any language rule.
+        // fix #3581 (§11.6 / §2.8.3 rule 3 / §2.8.2, v0.286): reuse the
+        // pass-1 shell created by `registerNestedTypeShells` so any
+        // TypeRef whose `declaration` was bound to the shell (during a
+        // CROSS-module consumer's pass-2 convert, or during a
+        // SAME-module earlier-sibling pass-2 convert, where the lookup
+        // found the shell in `importedByModule_` / `localTypes`
+        // respectively) keeps pointing at the same address after the
+        // upgrade. Creating a NEW symbol here would orphan the
+        // TypeRef's `declaration` on a now-unreachable shell object
+        // whose `qualifiedTypeName()` (correct) is the only thing the
+        // metadata reader has — codegen would then read the SHELL's
+        // empty `members` / `baseTypes` and treat the type as i32 (the
+        // silent truncation #495 records).
         //
-        // The key is the QUALIFIED name and must be. §2.8.3 rule 3 identifies a
-        // type by "its declaring module name, its qualified type name
-        // (including any enclosing-type path, §11.6), and its generic arity",
-        // and #3529 is the record of `Outer1.Ord` and `Outer2.Ord` being two
-        // unrelated types under that rule. Keying on the simple name would make
-        // one of them answer for the other — #3529's collision moved from the
-        // linker into the importer's type table, which is strictly worse than
-        // the null. `qualifiedTypeName()` is the one authority for the spelling
-        // and is exactly what `ModuleMetadataBuilder::convertType` now writes
-        // into `MetaType::namedName`; both sides call the same function, so the
-        // writer and the reader cannot drift.
-        //
-        // Registered HERE, before this type's own members are converted further
-        // down, so a nested type's members can name it — `Plus(other:
-        // Outer.Box)` on `Outer.Box` is the issue's repro. Anything converted
-        // earlier is picked up by `resolvePendingNamed` at the end of pass 2.
-        //
-        // A nested key always contains '.', which no top-level key can, so this
-        // cannot shadow a `md.types` entry registered by pass 1.
-        localTypes[t->qualifiedTypeName()] = t;
+        // We look up the shell by its QUALIFIED name in BOTH tables —
+        // `localTypes` for the SAME-module walk (this loader's
+        // `registerNestedTypeShells` wrote the same module's nested
+        // shells there), and `importedByModule_` as a backstop in case
+        // a future caller doesn't pre-register locally.
+        const std::string_view tdName = ctx.internString(td.name);
+        std::string qn;
+        qn.reserve(parent.qualifiedTypeName().size() + 1 + tdName.size());
+        qn = parent.qualifiedTypeName();
+        if (!qn.empty()) qn += '.';
+        qn += std::string(tdName);
+        sema::TypeSymbol* t = nullptr;
+        if (auto it = localTypes.find(qn); it != localTypes.end() && it->second)
+            t = it->second;
+        if (!t)
+            t = ctx.lookupImportedTypeByName(qn);
+        sema::TypeSymbol* fresh = nullptr;
+        if (!t) {
+            // Defensive: no shell was pre-registered (e.g. the recursive
+            // walker was bypassed). Create one so the rest of the path
+            // remains well-defined; this is the pre-#3581 shape and
+            // works as long as no cross-module consumer has already
+            // bound a ref to a SHELL with a different address (it
+            // hasn't, because there was no shell to bind to).
+            fresh = ctx.makeImportedSymbol<sema::TypeSymbol>();
+            t = fresh;
+            t->name = tdName;
+            t->kind = fromMetaTypeDeclKind(td.kind);
+            t->visibility = fromMetaVisibility(td.visibility);
+            t->modifiers = intern(td.modifiers);
+            t->scope = parent.memberScope;
+            t->memberScope = ctx.newScope();
+            t->moduleName = parent.moduleName;
+            t->enclosingTypePath = parent.qualifiedTypeName();
+            localTypes[t->qualifiedTypeName()] = t;
+            ctx.registerImportedType(parent.moduleName, t);
+        }
         // §9.2 (issue #501): propagate positional-record flag.
         t->hasPositionalFields = td.hasPositionalFields;
         // fix #2950 (§12 / §31.4 / §2.8.3 rule 4, v0.240): restore the built-in
@@ -3822,6 +3819,45 @@ bool metadataDescriptionsAgree(const ModuleMetadata& lhs,
     return a == b;
 }
 
+// fix #3581 (§11.6 / §2.8.3 rule 3 / §2.8.2, v0.286): register a §11.6
+// NESTED type's shell in BOTH the per-loader `localTypes` map AND the
+// SemaContext-wide cross-module `importedByModule_` table, recursively
+// (because a nested type can itself contain nested types). Pre-#3581 only
+// the module's TOP-LEVEL types were registered in `importedByModule_` and
+// nested shells were created only later in pass 2's `reconstructTypeSymbol`
+// — too late for a cross-module consumer whose pass 2 walks first (the
+// issue's three test rows). Pass 1 pre-registers the shell, and pass 2's
+// `reconstructTypeSymbol` mutates it in place so the TypeRef's declaration
+// pointer is preserved across the shell→full upgrade.
+static void registerNestedTypeShells(
+    const MetaTypeDecl& td, sema::SemaContext& ctx, sema::TypeSymbol& parent,
+    std::unordered_map<std::string, sema::TypeSymbol*>& localTypes) {
+    for (const MetaMember& mm : td.members) {
+        if (mm.kind != MetaMemberKind::NestedType || !mm.nestedType) continue;
+        const MetaTypeDecl& ntd = *mm.nestedType;
+        auto* t = ctx.makeImportedSymbol<sema::TypeSymbol>();
+        t->name = ctx.internString(ntd.name);
+        t->kind = fromMetaTypeDeclKind(ntd.kind);
+        t->visibility = fromMetaVisibility(ntd.visibility);
+        t->modifiers.clear();
+        for (const std::string& m : ntd.modifiers)
+            t->modifiers.push_back(ctx.internString(m));
+        t->scope = parent.memberScope;
+        t->memberScope = ctx.newScope();
+        // §9.2 (schema v4, issue #501): positional-record flag.
+        t->hasPositionalFields = ntd.hasPositionalFields;
+        // #1488 / §2.8.3 rule 3: a nested type declares in the same module
+        // as its enclosing type (§11.6 — nesting is not a separate module).
+        t->moduleName = parent.moduleName;
+        // fix #3529 (§11.6 / §2.8.3 rule 3, v0.283): enclosing-type path.
+        t->enclosingTypePath = parent.qualifiedTypeName();
+        localTypes[t->qualifiedTypeName()] = t;
+        ctx.registerImportedType(parent.moduleName, t);
+        // Recurse: a §11.6 type may itself contain nested types.
+        registerNestedTypeShells(ntd, ctx, *t, localTypes);
+    }
+}
+
 // §2.5 / #1487 — Pass 1: create a TypeSymbol shell per exported type AND
 // register it globally, so a cross-reference (a member/base whose type is a
 // sibling or a type from ANOTHER dependency) resolves by name in pass 2
@@ -3890,6 +3926,16 @@ static void loadMetadataPass1(
         localTypes[td.name] = t;
         created.push_back(t);
         ctx.registerImportedType(md.moduleName, t);
+        // fix #3581: register this type's §11.6 NESTED-type shells in both
+        // `localTypes` and the SemaContext's cross-module `importedByModule_`
+        // table so cross-module consumers (TMidC's pass 2 looking up
+        // TBase.Outer.Box when the deps were listed `--import tmidc.o
+        // --import tbase.o`, putting TMidC's pass 2 BEFORE TBase's pass 2)
+        // can resolve nested types by qualified name from pass 1 onwards.
+        // Pass 2's `reconstructTypeSymbol` mutates those shells in place so
+        // the TypeRef's `declaration` pointer, which was bound to the shell
+        // at convert-time, points to the populated symbol by codegen time.
+        registerNestedTypeShells(td, ctx, *t, localTypes);
     }
 }
 

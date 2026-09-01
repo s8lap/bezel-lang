@@ -426,10 +426,46 @@ public:
         return raw;
     }
 
-    // Register an imported, exported top-level TypeSymbol under its module's
-    // §2.1 dotted name. One module may export many types.
+    // Register an imported TypeSymbol under its module's §2.1 dotted name.
+    // One module may export many types. Called for both top-level types (in
+    // `ModuleLoader::loadMetadataPass1`) and §11.6 NESTED types (in
+    // `ModuleLoader::reconstructTypeSymbol`, where the full type is built
+    // and published under its qualified name).
+    //
+    // fix #3581 (§11.6 / §2.8.3 rule 3 / §2.8.2, v0.286): the match key
+    // matters. Pre-#3581 only TOP-LEVEL types were registered, and the
+    // cross-module lookup matched on the SIMPLE name — so an `Outer.Box`
+    // reference in a DEPENDENCY's signature (Mid importing Base, Mid's
+    // `Make` returning `owned Outer.Box`) could not bind through this
+    // table: `registerImportedType` had never seen Base.Outer.Box and
+    // `lookupImportedTypeByName("Outer.Box")` walked a vector that held
+    // only Outer, with `Outer.name == "Outer"` mismatching the qualified
+    // `Outer.Box`. The TypeRef's `declaration` stayed null and codegen took
+    // the i32 default (#495's silent truncation), so the consumer's binary
+    // was built but every `Outer.Box`-typed parameter was passed as a
+    // 32-bit argument. Now: the writer (top-level pass 1; nested pass 2)
+    // and the reader (`lookupImportedTypeByName`, also #3581) both key on
+    // `qualifiedTypeName()`, the one authority on the surface form, so a
+    // nested-type lookup succeeds iff the corresponding nested type has
+    // been registered.
+    //
+    // The upgrade-by-qualified-name branch below is defensive: the current
+    // call sites (pass 1 for top-level, `reconstructTypeSymbol` for
+    // nested) only write each qualified name once, so a slot to upgrade
+    // never appears in practice. It exists to keep the table free of
+    // duplicate qualified entries if a future caller ever does write twice
+    // (a second copy would either shadow the first, wasting the lookup,
+    // or pin a stale symbol in place).
     void registerImportedType(const std::string& moduleName, TypeSymbol* t) {
-        importedByModule_[moduleName].push_back(t);
+        auto& vec = importedByModule_[moduleName];
+        const std::string qn = t->qualifiedTypeName();
+        for (TypeSymbol*& slot : vec) {
+            if (slot && slot->qualifiedTypeName() == qn) {
+                slot = t;
+                return;
+            }
+        }
+        vec.push_back(t);
     }
 
     // §26 / §2.5 (#735): register an imported `public extension T` block under
@@ -486,19 +522,64 @@ public:
         return it == importedByModule_.end() ? nullptr : &it->second;
     }
 
-    // §2.5 / §12 / §11.3 (issue #1223): resolve a short type name across ALL
-    // already-loaded modules. Used by the module loader when a MetaType::Named
+    // §2.5 / §12 / §11.3 (issue #1223, fix #3581): resolve a type name across
+    // ALL already-loaded modules. Used by the module loader when a MetaType::Named
     // refers to a type from a different module (e.g. a base class exported by
     // module A, referenced in module B's `Extended: Base` metadata). The local
     // `localTypes` map only covers the current module being loaded; cross-module
-    // base references must fall back to this search. Returns the first match; in
-    // a well-formed program each public type name is unique across the import
-    // closure (the spec forbids ambiguous top-level names within a module, and
-    // inter-module conflicts are a separate error), so first-match is correct.
+    // base references must fall back to this search.
+    //
+    // fix #3581 (§11.6 / §2.8.3 rule 3, v0.286): the MATCH KEY IS THE QUALIFIED
+    // TYPE NAME, not the simple name. §2.8.3 rule 3 identifies a type by "its
+    // declaring module name, its qualified type name (including any enclosing-
+    // type path, §11.6), and its generic arity"; pre-#3581 the matching was on
+    // `t->name` (the simple identifier) and `registerImportedType` was called
+    // for top-level types only — so an `Outer.Box` reference could never bind
+    // through this path because no entry carried `Outer.Box` AND no entry's
+    // simple name was `Outer.Box`. The TypeRef's `declaration` stayed null and
+    // codegen took the i32 default (#495's silent truncation). Matching on
+    // `qualifiedTypeName()` (the same authority #3529 introduced for the
+    // emitted symbol namespace and #3540 for the same-module type resolution)
+    // makes the key byte-identical to what the loader's `localTypes` already
+    // uses, so the writer and reader cannot drift.
+    //
+    // Keying on the simple name would not be an option: #3529 is the record of
+    // `Outer1.Box` and `Outer2.Box` being two unrelated types under rule 3,
+    // and with differing layouts a mismatch is unsound, not merely wrong — one
+    // type's `bz.string*` would be read as the other's `int`.
+    //
+    // For §11.6 nested types specifically, this is the path that turns a
+    // pre-#3581 silently-truncating reference into a 64-bit-pointer-passing
+    // reference: the cross-module dep's `reconstructTypeSymbol` runs in
+    // dependency order BEFORE the consumer's pass 2, and by that point it
+    // has published the FULL nested type into `importedByModule_` (under
+    // its qualified name, also #3581 in `reconstructTypeSymbol`) so the
+    // consumer's `lookupNamed("Outer.Box")` finds a populated symbol rather
+    // than a shell or null. (Same-module siblings in the #3540 sense — a
+    // `Outer.A.Combine(b: Outer.B)` where `B` is declared LATER in `Outer`
+    // — go through the `pendingNamed` + `resolvePendingNamed` path, NOT
+    // this one, because pass 1 does not pre-register nested shells in
+    // `importedByModule_`: pre-registering would satisfy `lookupNamed` too
+    // early for the same-module sibling case and leave the ref pointing at
+    // an incomplete shell that subsequent `reconstructTypeSymbol` calls
+    // can no longer upgrade through the ref pointer. The pass-2-side
+    // registration publishers into a table that always holds the populated
+    // symbol — pass 1's `loadMetadataPass1` only writes `md.types`, never
+    // nested shells.)
+    //
+    // Returns the first match; in a well-formed program each qualified name is
+    // unique across the import closure (the spec forbids ambiguous top-level
+    // names within a module and inter-module top-level conflicts are a
+    // separate error, and a nested name's enclosing-type path scopes it under
+    // a unique enclosing top-level), so first-match is correct. A top-level
+    // type's `qualifiedTypeName()` is its simple name (its `enclosingTypePath`
+    // is empty), so the byte shape of every pre-#3581 lookup is unchanged for
+    // every top-level and builtin reference — only the NEWLY-reachable nested
+    // population is affected.
     TypeSymbol* lookupImportedTypeByName(std::string_view name) const {
         for (const auto& [modName, types] : importedByModule_) {
             for (TypeSymbol* t : types) {
-                if (t && t->name == name) return t;
+                if (t && t->qualifiedTypeName() == name) return t;
             }
         }
         return nullptr;
