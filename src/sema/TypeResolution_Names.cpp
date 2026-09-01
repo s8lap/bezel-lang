@@ -1566,6 +1566,89 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
             // Sema slice 3+ will treat generic-param TypeRefs specially.
             ref.kind = TypeRef::Kind::Named;
             ref.declaration = nullptr;
+            // fix #3584 (§11.6 / §14.1, v0.286): a nested type declared
+            // inside a generic enclosing class (`class Outer<T> { class Tag {
+            // _v: T } }`) silently uses the enclosing class's type parameter
+            // T. The compiler previously accepted it, but `classStruct`
+            // produced an UNSPECIALIZED layout with `_v` lowered to the i32
+            // placeholder — every instantiation of `Outer.Tag` (Outer<int>.Tag,
+            // Outer<string>.Tag, …) shared the same struct, so the first
+            // instantiation's layout was the one every subsequent store
+            // corrupted. A `string` payload read back as a ptr-shaped `int`
+            // (4423056 in the issue's repro); an `owned` payload would be a
+            // use-after-free-class defect rather than a wrong-value bug.
+            //
+            // Detect the violation here: if the current type is a nested
+            // type (its `enclosingTypePath` is non-empty) and the referenced
+            // name is NOT one of its OWN generic-parameter names, the name
+            // resolves through a parent scope to the enclosing class's
+            // parameter — the bug. A method's own generic-parameter names
+            // (currentMethodGenericParams_) are allowed so a generic method
+            // inside a nested type can still name its own type parameters;
+            // naming the enclosing class's `T` from such a method is the
+            // same violation and is caught by the same test.
+            //
+            // The spec is silent on the spelling (§11.6 / §14.1 / §2.8.3
+            // rule 3 — A.5 admits no argument list on an enclosing
+            // segment), and the only spec-adjacent precedent is the local
+            // type's "may not reference an enclosing generic parameter"
+            // restriction. Until a per-instantiation spelling lands, a
+            // clear diagnostic at the DECLARATION site is the sound fix —
+            // the alternative is silent corruption at runtime.
+            if (currentOuterType_ &&
+                !currentOuterType_->enclosingTypePath.empty()) {
+                bool isOwnParam = false;
+                for (const sema::Symbol* gp :
+                     currentOuterType_->genericParams) {
+                    if (gp && gp->name == first) {
+                        isOwnParam = true;
+                        break;
+                    }
+                }
+                if (!isOwnParam && currentMethodGenericParams_) {
+                    for (const auto& gp : *currentMethodGenericParams_) {
+                        if (gp.name == first) {
+                            isOwnParam = true;
+                            break;
+                        }
+                    }
+                }
+                if (!isOwnParam) {
+                    // Walk the scope chain to find the owning type for the
+                    // diagnostic. `scope->names` carries generic-param
+                    // markers as nullptr; the scope that owns the marker is
+                    // the type whose body introduced it. We don't have a
+                    // direct scope→type mapping, so we approximate: the
+                    // enclosing type's name is `currentOuterType_->enclosingTypePath`,
+                    // which is populated for both local and imported types
+                    // (#3529 §2.8.3 rule 3). That path is the LAST segment
+                    // of the dotted nesting chain (the immediate parent
+                    // type), which is where the binding lives for the
+                    // common single-level nesting case. Multi-level
+                    // nesting (`A.B.C` referencing `A`'s T) is named by the
+                    // same path: it's still the immediate parent that owns
+                    // the binding we walked through.
+                    ctx_.diagnostics().report(
+                        Severity::Error, t.span.begin,
+                        std::string("nested type `") +
+                            std::string(currentOuterType_->name) +
+                            "` references type parameter `" +
+                            std::string(first) +
+                            "` of its enclosing type `" +
+                            std::string(
+                                currentOuterType_->enclosingTypePath) +
+                            "` \xe2\x80\x94 a nested type may not use "
+                            "the enclosing type's type parameters "
+                            "(\xc2\xa7""11.6 / \xc2\xa7""14.1, v0.286; "
+                            "see issue #3584). Move `Tag` to module "
+                            "scope, declare `Tag` as its own generic "
+                            "(`class Tag<U>`) and pass `T` through, or "
+                            "make the enclosing class carry the field "
+                            "instead of the nested type");
+                    ref.kind = TypeRef::Kind::Error;
+                    return;
+                }
+            }
             return;
         }
         // Slice S24 (§2.3): always-available built-in type names
