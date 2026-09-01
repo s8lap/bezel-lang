@@ -3569,12 +3569,18 @@ llvm::Value* Emitter::boxedStorage(llvm::AllocaInst* slot, llvm::Type*& elemTy) 
             // predicate below did not change, the world underneath it did.
             //
             // What is still declined: anything the predicate cannot see a field
-            // for, including a catch-arm binding's holder, which `fix #3503`
-            // makes heap-persistent through the handler SPILL area rather than
-            // through a frame field — so it is declined by a predicate that
-            // asks about fields, not because it fails to survive. That decline
-            // is now conservative rather than load-bearing; narrowing it wants
-            // its own measurement, not an assumption from this comment.
+            // for. A catch-arm binding's holder WAS declined here because its
+            // fall-back address (the binding's OWN alloca) is moved into the
+            // handler SPILL AREA rather than a frame field — so it failed the
+            // `frame field` predicate only. `fix #3506` admits it as a third
+            // branch of `syncSurvivesSuspend`, recording the fact at read-time
+            // while `asyncHandlerSpillSlots_` still names the slot. The fixup
+            // side relaxes DECLINE 2 to also accept a `GetElementPtrInst` in
+            // the read's own function (the spill-area GEP the demotion RAUWs
+            // the alloca into — computed in `entry.spillcont` which dominates
+            // every state block). Together the two admits close the
+            // conditional-capture-in-awaiting-arm shape (#3506) without
+            // widening the predicate generically.
             //
             // The reason to decline when in doubt is unchanged: addressing a
             // slot that did NOT round-trip after a resume turns a loud SIGSEGV
@@ -3583,7 +3589,24 @@ llvm::Value* Emitter::boxedStorage(llvm::AllocaInst* slot, llvm::Type*& elemTy) 
             if (smStateStruct_ && smSelf_) {
                 p.syncSurvivesSuspend =
                     smAllocaToField_.count(syncIt->second) != 0 ||
-                    smRestoredParamSlots_.count(syncIt->second) != 0;
+                    smRestoredParamSlots_.count(syncIt->second) != 0 ||
+                    // `fix #3506` (§27.5 / §30.9 / §31.2): a catch-arm binding
+                    // whose arm awaits is registered in `asyncHandlerSpillSlots_`
+                    // by `lowerTry`; `promoteDemotedSlotsToFrame` then RAUWs
+                    // the slot into a GEP into the calloc'd spill area. The
+                    // spill area is heap-persistent for the frame's lifetime,
+                    // and the GEP is computed in `entry.spillcont` which
+                    // dominates every state block — so addressing it reads a
+                    // genuine round-tripped value, exactly as the frame-field
+                    // branch does. The membership test runs BEFORE
+                    // `fixupSuspendDominance` clears the vector, so it sees
+                    // the slot the same way `promoteDemotedSlotsToFrame`
+                    // will. Admitting here is necessary; the matching relax of
+                    // DECLINE 2 below is also necessary.
+                    std::find(asyncHandlerSpillSlots_.begin(),
+                              asyncHandlerSpillSlots_.end(),
+                              syncIt->second) !=
+                        asyncHandlerSpillSlots_.end();
             }
             pendingHolderReads_.push_back(std::move(p));
         }
@@ -3625,16 +3648,25 @@ void Emitter::fixupCapturedCellHolderReads() {
         auto* ld = llvm::dyn_cast_or_null<llvm::Instruction>(
             static_cast<llvm::Value*>(p.load));
         if (!ld || !ld->getParent() || !ld->getFunction()) continue;
-        // DECLINE 2 — the fall-back slot is gone or is no longer an alloca of
-        // this function. promoteDemotedSlotsToFrame RAUWs and ERASES every
-        // asyncHandlerSpillSlots_ entry, and a catch-arm binding that awaits
-        // inside the arm is registered there — the same alloca cellVarSyncSlot_
-        // recorded. Reading a raw pointer here produced malformed IR once LLVM
-        // recycled the freed alloca into another function; a same-function
-        // recycle would have verified clean and addressed the wrong storage.
-        auto* sync = llvm::dyn_cast_or_null<llvm::AllocaInst>(
+        // DECLINE 2 — the fall-back slot is gone, has been moved out of this
+        // function, or is now a value the lowered read cannot address.
+        // Originally: "must be an AllocaInst of this function" — that is what
+        // `fix #3484 (follow-up)`'s D2 needed because the original alloca's
+        // memory was being recycled into another function's alloca, producing
+        // malformed IR. `fix #3506` widens the ADMISSION to also accept a
+        // `GetElementPtrInst` in the read's own function: that is the
+        // post-RAUW form of a slot in `asyncHandlerSpillSlots_`, computed in
+        // `entry.spillcont` which dominates every state block, and whose
+        // pointee is the heap-persistent spill area. `WeakTrackingVH` still
+        // nulls on true deletion, so a destroyed GEP still declines.
+        // Anything else (a constant, a phi, an unrelated instruction) is
+        // declined exactly as before.
+        auto* syncInst = llvm::dyn_cast_or_null<llvm::Instruction>(
             static_cast<llvm::Value*>(p.syncSlot));
-        if (!sync || sync->getFunction() != ld->getFunction()) continue;
+        if (!syncInst || !syncInst->getParent() ||
+            syncInst->getFunction() != ld->getFunction()) continue;
+        if (!llvm::isa<llvm::AllocaInst>(syncInst) &&
+            !llvm::isa<llvm::GetElementPtrInst>(syncInst)) continue;
         // DECLINE 3 — inside a state machine, the fall-back slot is not restored
         // across a suspension, so addressing it after a resume would read a
         // fresh-stack alloca: a plausible WRONG VALUE in place of a loud SIGSEGV,
@@ -3648,7 +3680,11 @@ void Emitter::fixupCapturedCellHolderReads() {
         for (const PendingHolderRead* p : reads) {
             auto* ld = llvm::cast<llvm::Instruction>(
                 static_cast<llvm::Value*>(p->load));
-            auto* sync = llvm::cast<llvm::AllocaInst>(
+            // `sync` may be the original `AllocaInst` or its post-RAUW GEP
+            // form (the matched DECLINE 2 above already accepted both); an
+            // `Instruction` is sufficient here because we only pass it as a
+            // pointer-typed operand to `CreateSelect`.
+            auto* sync = llvm::cast<llvm::Instruction>(
                 static_cast<llvm::Value*>(p->syncSlot));
             // Dominated by any completion point of this holder's boxing ⇒ the
             // cell is allocated on every path that reaches this read. Leave the
