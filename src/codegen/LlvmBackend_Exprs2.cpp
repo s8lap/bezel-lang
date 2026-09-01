@@ -5972,10 +5972,84 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
         // form is deferred there, #3163 — but widening the imported arm to
         // match a deferred local shape is not this fix's business, and keeping
         // the guard leaves every imported shape that works today bit-identical.)
-        if (!hasAnyConstructor(t))
-            storePrimaryCtorPositionalArgs(
-                t, obj, st, ne.args, ctx_.positionalBinding(ne), savedSubst,
-                savedSemaTy, currentThis_);
+        //
+        // fix #3625 codegen half (§22.8 step 0 / §22.10 / §2.8.3 rule 4, v0.286):
+        // the `!hasAnyConstructor(t)` gate ABOVE was the bug. With the gate,
+        // an imported class with BOTH a primary ctor AND an explicit
+        // convenience ctor, called via the (2) shape — `new WithConv(7,
+        // "direct")` against `class WithConv(a: int, b: string) +
+        // constructor(x: int) this(x, "conv")` — bound sema to the PRIMARY
+        // (sema's #3625 W3-L1 fix's fall-through arm), so `ctorForArgs(t,
+        // ne.args)` returned null (the primary has no ConstructorSymbol —
+        // only the convenience ctor does, and its arity is 1). With no
+        // matching ctor, the imported-ctor call block at line 6411 emitted
+        // the #2658 "no constructor call could be lowered" warning and
+        // returned `obj` without ever populating the field slots, so the
+        // instance kept its calloc-zero values (`a=0`, `b=""`) — a
+        // §22.10/§22.5 silent wrong value, the codegen half of #3625.
+        //
+        // The gate's "second, unasked-for write" concern was unfounded. For
+        // the (1) shape — `new WithConv(6)` binding to the convenience ctor —
+        // the explicit `bz$<Type>$ctor` body inlines the chain call
+        // `this(x, "conv")`, which in turn inlines the primary ctor's body
+        // (the same `storePrimaryCtorPositionalArgs` helper, now run against
+        // the chain args). The chain's writes overwrite this importer-side
+        // step 0 with the SAME primary-field values, so the importer-side
+        // write is wasted but never incorrect — exactly the posture the
+        // LOCAL arm above already takes (#3583). For the (2) shape, the
+        // importer-side step 0 is the ONLY place the primary ctor's body
+        // runs, and removing the gate is what makes it run.
+        //
+        // The gate is removed for `hasAnyConstructor(t)` only. The
+        // no-explicit-ctor path was always correct (the gate let it through,
+        // and the pre-existing #3162 behavior is unchanged). The shape this
+        // widens to is exactly one family: an imported non-generic class
+        // whose explicit ctor DOES NOT match the call's arity (so the
+        // convenience-bound path at line 6411 does not fire) AND whose
+        // primary ctor arity DOES match (so sema binds to primary via the
+        // §22.5/§22.10 fall-through in `checkNewExprArgs`). Sema's published
+        // `ctx_.positionalBinding(ne)` is the primary-vs-arg pairing in that
+        // case, so `storePrimaryCtorPositionalArgs` writes the right values.
+        //
+        // The follow-up shape — an imported class with BOTH primary ctor AND
+        // an explicit ctor AND a field initializer (`class WithInit(a: int,
+        // b: string) { public x: int := 42; public constructor(x: int)
+        // this(x, "conv"); }`) — still misses step 2 (field initializer) for
+        // the (2) shape because `bz$<T>$init` is vtable-only for a
+        // has-explicit-ctor class (#3162 measured this same gap on the local
+        // side and #3163 deferred the wider fix). Filed as #3649; not in
+        // this commit's scope (the issue's measured repro has no field
+        // initializer, so step 0 is the only thing the codegen-side needs to
+        // restore).
+        //
+        // The `!hasAnyConstructor(t)` gate IS REMOVED: step 0 now runs for
+        // has-explicit-ctor imported classes too. The gate's "second,
+        // unasked-for write" concern was unfounded. For the (1) shape —
+        // `new WithConv(6)` binding to the convenience ctor — the explicit
+        // `bz$<Type>$ctor` body inlines the chain call `this(x, "conv")`,
+        // which in turn inlines the primary ctor's body (the same
+        // `storePrimaryCtorPositionalArgs` helper, now run against the chain
+        // args). The chain's writes overwrite this importer-side step 0 with
+        // the SAME primary-field values, so the importer-side write is wasted
+        // but never incorrect — exactly the posture the LOCAL arm above
+        // already takes (#3583 unconditionally runs step 0 for any
+        // non-chains-via-this call, which is true for both shapes). For the
+        // (2) shape, the importer-side step 0 is the ONLY place the primary
+        // ctor's body runs, and removing the gate is what makes it run.
+        //
+        // The shape this widens to is exactly one family: an imported
+        // non-generic class whose explicit ctor DOES NOT match the call's
+        // arity (so the convenience-bound path at line 6411 does not fire)
+        // AND whose primary ctor arity DOES match (so sema binds to primary
+        // via the §22.5/§22.10 fall-through in `checkNewExprArgs`). Sema's
+        // published `ctx_.positionalBinding(ne)` is the primary-vs-arg
+        // pairing in that case, so `storePrimaryCtorPositionalArgs` writes
+        // the right values. The no-explicit-ctor path was already correct
+        // (the gate let it through, and the pre-existing #3162 behavior is
+        // unchanged).
+        storePrimaryCtorPositionalArgs(
+            t, obj, st, ne.args, ctx_.positionalBinding(ne), savedSubst,
+            savedSemaTy, currentThis_);
         llvm::Function* initFn = declareImportedInit(t);
         builder_.CreateCall(initFn, {obj});
     } else if (importedGenericNoBody || importedGenericWithBody) {
@@ -6983,12 +7057,38 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
         // genuinely ctor-less imported type (U6/U9 pin both directions).
         // The `cs == nullptr` case is a REAL residual, not merely an unwarned
         // one — the defaulted call is still not lowered. That is FILED.
+        //
+        // fix #3625 codegen half (§22.10 / §22.5 / §2.8.3 rule 4, v0.286):
+        // suppress the #2658 warning when the importer-side step 0
+        // (`storePrimaryCtorPositionalArgs` at line 6024, called for
+        // has-explicit-ctor imported classes too) populated at least one
+        // primary-parameter field. The warning text — "every field it assigns
+        // keeps its default" — is FALSE for that case: the §22.8 step 0
+        // stores ran, so the primary-parameter fields hold the call's args,
+        // not calloc-zero. Without the suppress, the (2) shape of the issue's
+        // repro (`new WithConv(7, "direct")` against the imported primary +
+        // convenience ctor) would still print correctly but would emit the
+        // misleading warning, defeating the spec rule the (sema) W3-L1 half
+        // of #3625 reinstated. Computed inline: the step 0 actually stored
+        // arguments iff `t->hasPositionalFields` (the early-return gate inside
+        // `storePrimaryCtorPositionalArgs`) AND `!ne.args.empty()` (no args,
+        // no stores — a degenerate case the no-warning branch handles), AND
+        // the call bound to primary (not to a convenience ctor). The third
+        // test reuses the `cs == nullptr` check from above: a null
+        // `ctorForArgs` result is exactly "no explicit ctor matched the
+        // call's arity", which for an imported has-primary-ctor class is
+        // exactly the (2) shape (sema bound to primary via §22.5/§22.10
+        // fall-through). The combination is the precise predicate.
         bool importedTypeHasCtor = false;
         if (rt && rt->declaration)
             for (sema::Symbol* m : rt->declaration->members)
                 if (auto* c = dynamic_cast<sema::ConstructorSymbol*>(m))
                     if (!c->isStatic) { importedTypeHasCtor = true; break; }
+        const bool importerStep0Populated =
+            ctx_.isImported(t) && t->hasPositionalFields && !cs &&
+            !ne.args.empty();
         if (importedTypeHasCtor && !emittedImportedCtorCall &&
+            !importerStep0Populated &&
             !ctx_.diagnostics().hasErrors()) {
             ctx_.diagnostics().report(
                 Severity::Warning, ne.span.begin,
