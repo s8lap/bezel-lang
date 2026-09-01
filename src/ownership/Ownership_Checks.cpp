@@ -10,6 +10,10 @@
 #include "common/AwaitScan.hpp"  // fix #3587: the shared await-site walk
 #include "common/BuiltinRegistry.hpp"  // #1985: isBuiltinExceptionName
 #include "common/OwnershipFacts.hpp"  // #1801: bare-type-parameter source set
+#include "common/PatternAResultCollection.hpp"  // fix #3638: the both-sides
+                                                // §30.5 Pattern A
+                                                // intrinsic-collection result
+                                                // membership test
 
 namespace bezel::ownership {
 
@@ -8813,10 +8817,35 @@ static bool taskResultArgIsClass(const sema::TypeRef* arg) {
     if (arg->astNode && arg->astNode->name &&
         arg->astNode->name->parts.size() == 1) {
         std::string_view an = arg->headName();
-        if (an == "OwningArray" || an == "OwningStack" ||
-            an == "OwningQueue" || an == "OwningLinkedList" ||
-            an == "OwningDictionary" || an == "OwningSet")
-            return true;
+        // fix #3638 (§30.5 / §28.3, v0.286): the ONE both-sides membership
+        // test for "is this Pattern A result an intrinsic collection whose
+        // heap backing the task owns and frees at teardown?".
+        //
+        // The hand-written `Owning*`-collection list that used to stand here
+        // (and which this call subsumes — the six owning collection heads are
+        // members of `kPatternAResultCollectionHeads`) recognized only the
+        // OWNING family. Codegen's `patternAResultCollectionDisposer`
+        // (`LlvmBackend_Disposal.cpp`, fix #2279 v0.236) has recognized the
+        // BORROWING intrinsic collections too since v0.236, so a
+        // `Task<Array<int>>` result had its `bz_array_t*` backing freed at the
+        // K8 teardown boundary while this gate reported the await
+        // `ValueResult` — no §30.5 confinement enforced, and an unconfined
+        // `var arr := await GetArr();` compiled with zero diagnostics and then
+        // read freed memory. Measured on the pre-fix compiler over ten runs of
+        // one binary: 5x exit=0 printing `0` for an expected `6`, 5x SIGSEGV,
+        // 0 correct. Widening the gate makes `awaitTaskKind` report PatternA,
+        // which makes `checkAwaitSitesExpr` demand the same
+        // syntactically-visible owning source it already demands of a
+        // class-typed result — the diagnostic that was missing.
+        //
+        // Routed through `common::isPatternAResultCollectionHead` rather than
+        // extending the list in place: the drift between two spellings of one
+        // classification IS the defect (LANE_RULES §6), and that header
+        // carries the §6b exclusion diff against codegen's computation
+        // (notably: `OwningTask` and `FrozenArray` stay OUT, so sema's
+        // admitted set is a subset of what codegen actually disposes and the
+        // widening cannot false-reject). // per §30.5, #3638
+        if (common::isPatternAResultCollectionHead(an)) return true;
         // §30.5 / stdlib §6.2/§6.3/§6.11 (#1785): the async sync-primitive
         // acquisitions produce a Pattern B `OwningTask<G>` whose result G is a
         // built-in CLASS synthesized with a NULL declaration — the same null-
