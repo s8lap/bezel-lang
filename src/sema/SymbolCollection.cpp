@@ -249,6 +249,22 @@ Symbol* collectMemberImpl(const ast::Member& m, TypeSymbol& parent,
             sym->indexerParams =
                 collectParams(pd->indexerParams, ctx, scope);
         }
+        // fix #3618 (§22.15 "Purity attaches to the getter"): the
+        // accessor-level `pure get` marker. Mirrors
+        // `propertyGetterIsPure`'s own accessor arm — any accessor with
+        // `isPure && !isSet`. Storing it on the symbol means
+        // `propertyGetterIsPure` has a same-shape fallback for the LOCAL
+        // side (the AST walk would agree), and — critically — gives the
+        // IMPORTED side a place to receive the same fact from the wire
+        // (ModuleLoader Property case sets `sym->accessorIsPure =
+        // mm.accessorIsPure`). Indexer's PropertyAccessor list is the
+        // parallel shape — `get`/`set` are members of the same vector —
+        // so this loop covers indexers identically.
+        for (const auto& a : pd->accessors)
+            if (a.isPure && !a.isSet) {
+                sym->accessorIsPure = true;
+                break;
+            }
         // fix #3140 (§9.8, family F2 of umbrella #3152): an auto-property's
         // `serialized` clause — the second of the two storage-bearing sites the
         // A.4 grammar admits it on — onto the SYMBOL, for the same reason the
@@ -1077,19 +1093,31 @@ bool constructorIsPure(const ConstructorSymbol* cs) {
     return memberIsPure(cs);
 }
 
-// §22.15 "Purity attaches to the getter" (v0.286, fix #3609): see the contract
-// in sema/Symbol.hpp. Strictly wider than `memberIsPure` — the accessor-level
-// `pure get` marker is a channel the property's modifier list does not carry.
+// §22.15 "Purity attaches to the getter" (v0.286, fix #3609; fix #3618).
+// See the contract in sema/Symbol.hpp. Strictly wider than `memberIsPure` —
+// the accessor-level `pure get` marker is a channel the property's modifier
+// list does not carry.
 bool propertyGetterIsPure(const PropertySymbol* ps) {
     if (!ps) return false;
     if (memberIsPure(ps)) return true;
-    // Unlike the arms in `memberIsPure` this one has NO symbol-side counterpart
-    // to fall back on — `MetaMember` carries no per-accessor purity slot — so
-    // for an imported property it answers a silent "no". That is a real seam
-    // gap (issue 3618) rather than a sanctioned import-answers-elsewhere read;
-    // it is exempted anyway because dropping the arm would be strictly worse —
-    // it is what makes a `pure get` body get walked at all.
+    // fix #3618: `PropertySymbol::accessorIsPure` is the symbol-side
+    // counterpart to the wire's `MetaMember::accessorIsPure` (#3618's
+    // 19th scalar) AND the same field populated locally by
+    // SymbolCollection's PropertyDecl arm from `pd->accessors` — same
+    // answer on both sides of the module boundary, exactly the seam the
+    // original predicate left open (see the SEAM-ACCESSOR comment that
+    // used to live below). For an imported property the AST walk below
+    // would have answered "no" (`ps->decl == nullptr`), the silent-wrong-
+    // classification direction the bug measured; for a LOCAL property
+    // it agrees with the AST walk but skips a redundant `dynamic_cast`.
     // SEAM-ACCESSOR: the accessor-level arm of the getter-purity predicate.
+    if (ps->accessorIsPure) return true;
+    // Defense in depth: any PropertySymbol built by a path that did not
+    // set `accessorIsPure` (a future synthetic AST node, the
+    // `parseAndAttachPropertyBody` re-parse path that attaches a fresh
+    // PropertyDecl but does NOT re-run collectMember) still walks the
+    // AST directly. Cheap and consistent with the propertyGetterIsPure
+    // contract pre-#3618.
     if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl))
         for (const auto& a : pd->accessors)
             if (a.isPure && !a.isSet) return true;

@@ -1038,6 +1038,24 @@ struct Loader {
                 // `sema::hasAstAutoPropertyDecl` always returns false here
                 // (no ast::PropertyDecl crosses the boundary).
                 propIsAutoStorage_[p] = mm.isAutoProperty;
+                // fix #3618 (§22.15 / §2.8.2): the accessor-level `pure get`
+                // marker — the spelling §22.15 FORCES on every read-write
+                // block-form property (TypeResolution_Checks.cpp:11524
+                // REJECTS property-level `pure` on a Block bodyKind with a
+                // setter, citing "use per-accessor `pure get` instead"). The
+                // property-level `pure` (read-only/expression-bodied shape)
+                // already crosses the wire via `member->isPure` (set above by
+                // `applyBehavior` reading `mm.isPure`); this slot covers the
+                // accessor spelling that NEVER appears in the property's
+                // modifier list. Without it the importer-side
+                // `propertyGetterIsPure` returned `false` on every imported
+                // `pure get` while the exporter's own compilation of the
+                // character-identical source returned `true` — silent
+                // cross-module wrong answer to §22.15 rule 6. Consulted via
+                // `propertyGetterIsPure` ahead of the AST walk (the AST is
+                // null for an imported PropertySymbol, so the walk would
+                // have answered "no").
+                p->accessorIsPure = mm.accessorIsPure;
                 // fix #2467 (§9.2/§2.5, v0.235): mirror the Field case's
                 // constValues_ carriage above — an auto-property's
                 // constant-foldable initializer (ModuleMetadataBuilder.cpp's
@@ -1117,6 +1135,15 @@ struct Loader {
                 // setterVisibility above, not because an indexer can occupy
                 // a storage slot.
                 propIsAutoStorage_[p] = mm.isAutoProperty;
+                // fix #3618 (§22.15 / §2.8.2): accessor-level `pure get`
+                // twin of the Property case above — an indexer's `pure get`
+                // getter also rides `MetaMember::accessorIsPure` and
+                // reaches the importer here (the symbol-side fallback the
+                // Property case above puts on `p->accessorIsPure` is the
+                // same field on the imported PropertySymbol — indexers are
+                // PropertySymbols with `isIndexer = true`, mirror of the
+                // hasSetter/hasGetter/etc. twin above).
+                p->accessorIsPure = mm.accessorIsPure;
                 applyBehavior(p);
                 return p;
             }

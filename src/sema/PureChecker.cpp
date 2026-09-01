@@ -214,11 +214,21 @@ bool PureBodyWalker::callTargetIsPure(Symbol* calleeSym) {
     // cannot drift away from it again.
     if (auto* cs = dynamic_cast<ConstructorSymbol*>(calleeSym))
         return constructorIsPure(cs);
-    // Property/indexer accessor calls — pure-classification (auto-getter)
-    // lands later. For Slice 2, treat as not-yet-pure (admit, since
-    // classifying them as impure would reject bodies the spec admits and
-    // the classification slice must land before this rule can fire).
-    if (dynamic_cast<PropertySymbol*>(calleeSym)) return true;
+    // Property/indexer accessor reads — §22.15 rule 6's accessor-read arm. Tight
+    // before #3630 this arm admitted EVERY property read unconditionally, on
+    // the rationale that pure-classification (auto-getters, record-synthesized
+    // members) lands later. With #3609 the declared-purity check
+    // (`propertyGetterIsPure` — both spellings: property-level `pure`, the
+    // accessor-level `pure get`) is now both-sources — local AST via the
+    // `pd->accessors` walk, imported via the new `ps->accessorIsPure` slot
+    // populated by `ModuleLoader` from `MetaMember::accessorIsPure` (#3618) —
+    // so the declared side of rule 6 can fire here without depending on the
+    // still-deferred classification side. The MemberAccessExpr site in
+    // `checkExpr` is the OTHER arm (the property READ spelling — `c.Value`
+    // inside a pure body); together they close the accessor-read arm on
+    // every spelling of an accessor reach.
+    if (auto* ps = dynamic_cast<PropertySymbol*>(calleeSym))
+        return propertyGetterIsPure(ps);
     // Intrinsic / builtin calls (no AST decl) are admitted — §22.15
     // "Intrinsic purity (the stdlib contract)" trusts stdlib markers, and
     // Slice 4 covers the stdlib annotation wave.
@@ -1113,6 +1123,33 @@ void PureBodyWalker::checkExpr(const ast::Expr* e) {
         return;
     }
     if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(e)) {
+        // §22.15 rule 6 accessor-read arm (fix #3630, v0.286): a property READ
+        // spelled as `c.Value` (a MemberAccessExpr, NOT a CallExpr — property
+        // getters are NOT spelled as `c.Value()` in Bezel) is a call to the
+        // property's getter accessor. The CALL-shape case `c.Foo()` reaches
+        // `callTargetIsPure` via the CallExpr arm above; this is the
+        // MEMBER-ACCESS shape, which the previous implementation silently
+        // admitted by descending only into the target. Resolve the
+        // MemberAccessExpr's member via `ctx_.exprSymbol` — ExprTypecheck
+        // populates it from `resolveMemberAccess` (ExprTypecheck_Exprs.cpp
+        // ~3437, which mirrors the call-resolution path). For an INDEXER read
+        // (`obj[i]`, the IndexExpr arm below), the route through here is NOT
+        // taken — indexer reads are themselves IndexExpr nodes, and the
+        // property-side predicate `propertyGetterIsPure` does not (yet)
+        // classify indexers by indexer-parameter purity under rule 6 (the
+        // indexer arm is filed separately — see the brief). A non-property
+        // member (field, method-of-target-as-value, etc.) is NOT this rule's
+        // concern — field reads are the frame's responsibility, and methods
+        // are reached via CallExpr, never MemberAccessExpr.
+        if (auto* ps = dynamic_cast<PropertySymbol*>(ctx_.exprSymbol(*e))) {
+            if (!propertyGetterIsPure(ps)) {
+                reportPureViolation(
+                    e->span.begin, "accessor read",
+                    std::string("the resolved target `") +
+                        std::string(ps->name) +
+                        "` is not pure-declared (§22.15 rule 6 / #3630)");
+            }
+        }
         checkExpr(ma->target.get());
         return;
     }

@@ -251,6 +251,14 @@ void hashMember(std::uint64_t& h, const MetaMember& m) {
     // way isPositional does above or a consumer's staleness check cannot
     // see the change (§2.8.3 rule 3).
     hashBool(h, m.posParamBodyRef);
+    // fix #3618 (§22.15/§2.8.3 rule 3): accessorIsPure is part of a Property
+    // (or Indexer) member's §22.15 signature identity — a library adding (or
+    // removing) `pure get` from a property's getter changes its cross-module
+    // rule 6 classification on the importer side. Folds unconditionally, the
+    // same shape isEventStatic/isEventAsync do for events above (the field
+    // defaults to `false` for every non-Property/Indexer kind, matching the
+    // emission's `0u : 0u` for those kinds — see emitMember's 19th slot).
+    hashBool(h, m.accessorIsPure);
     hashU64(h, m.contracts.size());
     for (const MetaContractRecord& c : m.contracts) hashContract(h, c);
     hashType(h, m.type);
@@ -556,6 +564,11 @@ MetaMember::MetaMember(const MetaMember& o)
       hasGetter(o.hasGetter), isEventStatic(o.isEventStatic),
       isEventAsync(o.isEventAsync), isPositional(o.isPositional),
       posParamBodyRef(o.posParamBodyRef),
+      // fix #3618 (§22.15 / §2.8.3 rule 3): accessorIsPure is part of
+      // a Property's §22.15 identity — same copy role as posParamBodyRef
+      // above; the gtest equality / MetaMember copy ctor path needs it for
+      // the symbol-table snapshot tests (ModuleMetadata_test.cpp).
+      accessorIsPure(o.accessorIsPure),
       contracts(o.contracts),
       genericParams(o.genericParams), params(o.params),
       isOperator(o.isOperator), returnOwned(o.returnOwned),
@@ -584,6 +597,9 @@ MetaMember& MetaMember::operator=(const MetaMember& o) {
         isEventStatic = o.isEventStatic; isEventAsync = o.isEventAsync;
         isPositional = o.isPositional;
         posParamBodyRef = o.posParamBodyRef;
+        // fix #3618 (§22.15 / §2.8.3 rule 3): same shape as posParamBodyRef
+        // above.
+        accessorIsPure = o.accessorIsPure;
         contracts = o.contracts;
         genericParams = o.genericParams; params = o.params;
         isOperator = o.isOperator; returnOwned = o.returnOwned;
@@ -637,6 +653,13 @@ bool MetaMember::operator==(const MetaMember& o) const {
            // §22.10 primary-ctor parameter Field's signature identity — see
            // the hashMember comment above.
            posParamBodyRef == o.posParamBodyRef &&
+           // fix #3618 (§22.15/§2.8.3 rule 3): accessorIsPure is part of
+           // a Property's §22.15 rule 6 accessor-read identity — a library
+           // flipping a `pure get` to a plain getter (or vice versa) changes
+           // the importer's rule 6 classification and so is a §2.8.3 rule 3
+           // signature change. See hashMember for why it must compare when
+           // it differs.
+           accessorIsPure == o.accessorIsPure &&
            contracts == o.contracts &&
            genericParams == o.genericParams && params == o.params &&
            isOperator == o.isOperator && returnOwned == o.returnOwned &&
@@ -898,7 +921,17 @@ void emitMember(llvm::BitstreamWriter& w, const MetaMember& m) {
     // trailing scalar — same additive shape; a pre-#3221 reader's `sc.size()
     // < 18` gate never looks past index 17, so it is unaffected. See the
     // posParamBodyRef field comment in ModuleMetadata.hpp.
-    llvm::SmallVector<std::uint64_t, 18> sc{
+    // fix #3618 (§22.15 / §2.8.2): accessorIsPure is a 19th trailing scalar
+    // for Property/Indexer members ONLY — a pre-#3618 reader's `sc.size() < 19`
+    // gate skips it. A #3618 reader given a pre-#3618 blob reads the missing
+    // 19th as the field default `false` — the same "not accessor-pure"
+    // classification a stale dependency already exhibits today. (NOTE: this
+    // is UNCONDITIONALLY appended for every kind — a pre-#3618 reader stops
+    // at sc[17], so the writer can emit it for ALL kinds without risk of an
+    // off-by-one read on a stale-format blob. The guard sits in
+    // readMemberBody's branch on `sc.size() >= 19`, matching the same shape
+    // as the 15th/16th isEventStatic/isEventAsync events-only fields above.)
+    llvm::SmallVector<std::uint64_t, 20> sc{
         static_cast<std::uint64_t>(m.kind),
         static_cast<std::uint64_t>(m.visibility),
         m.isOperator ? 1u : 0u,
@@ -917,6 +950,9 @@ void emitMember(llvm::BitstreamWriter& w, const MetaMember& m) {
         m.isEventAsync ? 1u : 0u,
         m.isPositional ? 1u : 0u,
         m.posParamBodyRef ? 1u : 0u,
+        // 19th: #3618 (always emitted, ignored for non-Property/Indexer
+        // members by the reader's `sc.size() >= 19` branch below).
+        m.accessorIsPure ? 1u : 0u,
     };
     w.EmitRecord(REC_SCALARS, sc);
     emitString(w, m.name);
@@ -1747,6 +1783,18 @@ bool readMemberBody(Reader& r, MetaMember& m) {
     // direction the bug measured, so a stale dependency degrades to its own
     // pre-fix behavior rather than guessing).
     m.posParamBodyRef = sc.size() >= 18 && sc[17] != 0;
+    // fix #3618 (§22.15 / §2.8.2 / §2.8.3 rule 4): 19th scalar. A pre-#3618
+    // blob has at most 18 scalars; accessorIsPure defaults to `false` — the
+    // SAME "not accessor-pure" classification a stale dependency already
+    // exhibits today (its `pure get` getter is a silent non-pure getter from
+    // the importer's perspective, exactly the direction the bug measures —
+    // a stale library is recompiled per §2.8.5 to pick the fix up). Ignored
+    // for every kind but Property/Indexer; the reader extracts it for ALL
+    // kinds and the producer side drops it into the struct, which the
+    // consumer's `propertyGetterIsPure` (SymbolCollection.cpp /
+    // sema/Symbol.hpp) keys off the PropertySymbol reconstruction alone, so
+    // non-property kinds see no behavior change.
+    m.accessorIsPure = sc.size() >= 19 && sc[18] != 0;
     if (!expectString(r, m.name)) return false;
     if (!readStringList(r, m.modifiers)) return false;
     if (!readType(r, m.type)) return false;

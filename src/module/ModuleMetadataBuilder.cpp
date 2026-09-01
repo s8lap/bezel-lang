@@ -1485,6 +1485,28 @@ bool convertMember(const sema::MemberSymbol& m, bool inInterface,
                 sv = pd->autoAccessorVis;
             }
             out.setterVisibility = toMetaVisibility(sv, inInterface);
+            // fix #3618 (§22.15 / §2.8.2 / §2.8.3 rule 4): whether this
+            // Property's GETTER ACCESSOR is declared `pure get` (§22.15 "Purity
+            // attaches to the getter"). Computed exactly as the LOCAL predicate
+            // `propertyGetterIsPure`'s accessor arm does — any accessor with
+            // `isPure && !isSet`. Note the two spellings of a pure getter are
+            // *independent* and *non-overlapping*: `pure property P` (read-
+            // only / expression-bodied shape) rides `out.isPure` / `member-
+            // >isPure` via `applyBehavior`/`hasModifier` at the top of
+            // `convertMember`; `property P { pure get }` (read-write block-
+            // form, the shape §22.15 FORCES here per
+            // TypeResolution_Checks.cpp:11524) rides this bit. A well-formed
+            // property never carries both at once; the importer-side
+            // `propertyGetterIsPure` OR-folds them. Applied to BOTH the
+            // Property and Indexer arms (an indexer can also be a `pure get`
+            // and the rule-6 accessor-read arm applies — see the Property
+            // case note in the issue body).
+            out.accessorIsPure = false;
+            for (const auto& a : pd->accessors)
+                if (a.isPure && !a.isSet) {
+                    out.accessorIsPure = true;
+                    break;
+                }
             // §14.1 / §23 / §23.1 / §23.3 / §23.4 / §2.5 / §2.8.2 /
             // §2.8.3 rule 4 (fix #2893, v0.240): export the FULL
             // PropertyDecl source text (from the visibility/modifier

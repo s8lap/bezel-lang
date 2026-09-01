@@ -700,6 +700,22 @@ struct DestructorSymbol : MemberSymbol {};
 struct PropertySymbol : MemberSymbol {
     bool isIndexer = false;
     std::vector<Symbol*> indexerParams; // empty when !isIndexer
+    // §22.15 "Where `pure` may appear" / "Purity attaches to the getter"
+    // (#3618, v0.286): whether this property's GETTER ACCESSOR is declared
+    // `pure get`. Set on BOTH sides — SymbolCollection's PropertyDecl arm
+    // fills it from `pd->accessors` (any accessor with `isPure && !isSet`)
+    // and ModuleLoader's Property case fills it from `MetaMember::accessorIsPure`
+    // (the wire channel #3618 adds, mirroring the SYMBOL-SIDE channel
+    // `MemberSymbol::isPure` has had since #3609). Consulted AHEAD of the
+    // `ps->decl` AST-walk by `propertyGetterIsPure` — for a LOCAL symbol
+    // that path returns identically (the AST walk would agree); for an
+    // IMPORTED symbol the AST walk is null and would have answered "no",
+    // the silent-wrong-classification direction the bug measured. Defaults
+    // to `false` so a future PropertySymbol built by something other than
+    // SymbolCollection/ModuleLoader (e.g. a builtin-interface shim in
+    // SemaContext.hpp) keeps its old admission behavior — `propertyGetter
+    // IsPure`'s `memberIsPure` arm is what those shims rely on.
+    bool accessorIsPure = false;
 };
 
 struct EventSymbol : MemberSymbol {};

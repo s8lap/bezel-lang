@@ -221,6 +221,27 @@ inline constexpr std::uint32_t kMetadataMagic = 0x644D7A42; // 'B','z','M','d' L
 // through sema to a raw linker error (undefined `...$propget`) instead of a
 // clean §22.3/§23 rejection; see checkRefOutPropertyOperand's `!pd` branch
 // (ExprTypecheck.cpp) for the consuming side.
+//
+// §22.15 (#3618, additive within v7): MetaMember::accessorIsPure — whether
+// a property or indexer's GETTER ACCESSOR is declared `pure get` (§22.15
+// "Where `pure` may appear" / "Purity attaches to the getter"). A 19th
+// trailing scalar in MEMBER_BLOCK's REC_SCALARS. NO bump for the same reason
+// as #2461's hasGetter — the slot only ADDS a trailing scalar a pre-#3618
+// reader's `sc.size() < 18` gate never reaches; a v7+ reader given a
+// pre-#3618 blob (at most 18 scalars) reads the missing 19th as the field
+// default `false` (the same "not accessor-pure" classification a stale
+// dependency already exhibits today — its imported `pure get` is a silent
+// non-pure getter from the importer's perspective, exactly the direction the
+// bug measures). Closes the #3618 seam where the property-level `pure`
+// (read-only / expression-bodied shape) crossed the wire via
+// `MetaMember::isPure` but the accessor-level `pure get` (read-write
+// block-form shape — §22.15's REQUIRED spelling there, see
+// TypeResolution_Checks.cpp:11524) had no slot, so the importer answered
+// `false` on every imported block-form pure getter while the exporter
+// answered `true` on the character-identical source. Consulted by
+// `propertyGetterIsPure` (semantically equivalent to `memberIsPure` for
+// properties across BOTH spellings), which feeds §22.15 rule 6's
+// accessor-read arm.
 inline constexpr std::uint32_t kSchemaVersion = 7;
 
 // §2.5 / §2.8.2 (issue #3198, v0.254): the producer's content-revision
@@ -827,6 +848,47 @@ struct MetaMember {
     // counted as no storage, so the #2364 guard slipped on the same shape).
     // Ignored for every kind but Field.
     bool posParamBodyRef = false;
+
+    // §22.15 / §2.8.2 (fix #3618, additive within v7 — same shape as
+    // hasSetter/hasGetter/isAutoProperty above): for a Property (or Indexer)
+    // member, whether its GETTER ACCESSOR declares `pure get` (§22.15 "Where
+    // `pure` may appear" / "Purity attaches to the getter").
+    //
+    // WHY THIS BIT EXISTS. The PROPERTY-level `pure` marker rides
+    // `ast::PropertyDecl::modifiers`, so the wire's `out.isPure` (line 1006
+    // in ModuleMetadataBuilder.cpp, `hasModifier(m.modifiers, "pure")`)
+    // carries it. The ACCESSOR-level `pure get` marker does NOT: it lives in
+    // `ast::PropertyAccessor::isPure` (a sibling of `isSet`), never in a
+    // modifier list. §22.15 FORCES `pure get` for a read-write block-form
+    // property — `TypeResolution_Checks.cpp:11524` REJECTS property-level
+    // `pure` on a `Block` bodyKind with a setter — so the accessor spelling
+    // is not exotic; it is the shape every settable block-form property
+    // carries.
+    //
+    // The PropertySymbol arm in convertMember never read the accessor list,
+    // so the bit never crossed the wire. Downstream: `propertyGetterIsPure`
+    // (sema/SymbolCollection.cpp, added by #3609) sees the accessor arm only
+    // via a `dynamic_cast<const ast::PropertyDecl*>(ps->decl)` walk — null
+    // for every imported PropertySymbol — so it answered `false` for every
+    // imported `pure get`. The cross-module twin was a silent non-pure getter;
+    // tightening §22.15 rule 6's accessor-read arm (#3630) would have
+    // rejected a CHARACTER-IDENTICAL exporter-side getter. This bit closes
+    // exactly that seam: the importer records the accessor-level purity
+    // alongside the property-level one, and `propertyGetterIsPure` consults
+    // it ahead of the AST walk so the imported case answers identically to
+    // the local one.
+    //
+    // COMPUTED once by the exporter mirroring
+    // `propertyGetterIsPure`'s accessor arm (any accessor with `isPure &&
+    // !isSet`). Ignored for every kind but Property/Indexer; a pre-#3618 blob
+    // has no 19th scalar; this defaults to `false` — the SAME classification
+    // an old dependency already exhibits today (its `pure get` getter is a
+    // silent non-pure getter from the importer's perspective, exactly the
+    // silent-failure direction the bug measures). No schema bump: the bump
+    // rule reserves a bump for a change that makes an OLD reader
+    // misinterpret an EXISTING field; this only ADDS a trailing scalar the
+    // pre-#3618 reader's `sc.size() < 18` gate never looks past.
+    bool accessorIsPure = false;
 
     // fix #3202 (§22.10 "primary constructors" / §22.5 "Optional parameters
     // and named arguments" / §2.8.3 rule 4; spec v0.254) — the §22.10
