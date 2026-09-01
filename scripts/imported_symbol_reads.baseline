@@ -57,5 +57,5 @@
 7    src/sema/PureChecker.cpp
 5    src/sema/StaticInitCycles.cpp
 5    src/sema/SymbolCollection.cpp
-51   src/sema/TypeResolution_Checks.cpp
+53   src/sema/TypeResolution_Checks.cpp
 3    src/sema/TypeResolution_Names.cpp

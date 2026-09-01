@@ -4452,6 +4452,57 @@ void Resolver::checkHidingAndOverride() {
                             "` must be declared `pure` — purity is never "
                             "dropped down an override chain (\xC2\xA7""22.15)");
                     }
+                    // fix #3611 (§22.16 / §12.1, v0.286): "Clauses bind
+                    // overrides and implementations ([§12.1], [§11.2]): they
+                    // are inherited, never restated; an override or
+                    // implementation may add `ensures` clauses and may not
+                    // declare `requires` clauses." The two halves are wired
+                    // here together: REJECT a `requires` the override
+                    // declared (the "never restated" half), then COPY the
+                    // base's `requires` clauses onto the override's symbol
+                    // for codegen to lower in the prologue (the "inherited"
+                    // half — without it, the override's prologue would be
+                    // empty and a `d.Half(-4)` call would bypass the base's
+                    // `requires(x > 0)` and divide a negative number).
+                    // Ensures inheritance is intentionally NOT widened here
+                    // (a separate spec question; this lane is contract-clause
+                    // inheritance, not clause-merging). Local bases only —
+                    // imported bases have no AST on `base->decl` and the
+                    // cross-module direct call is already covered by the
+                    // exporter's own prologue (brief probe 1).
+                    // SEAM-DEBT: #3611 contract-clause inheritance — the
+                    // `requires`-on-override rejection and the base's
+                    // requires-copy both need the AST nodes' clause
+                    // vectors; `MemberSymbol` does not carry the AST-shaped
+                    // `contractClauses`, so the dynamic_cast is unavoidable
+                    // until a clause-shaped field is added to MemberSymbol.
+                    if (auto* dMD = dynamic_cast<const ast::MethodDecl*>(ms->decl)) {
+                        for (const auto& c : dMD->contractClauses) {
+                            if (c.kind == ast::ContractClause::Kind::Requires) {
+                                ctx_.diagnostics().report(
+                                    Severity::Error, c.loc,
+                                    std::string("override of `") +
+                                    std::string(ms->name) +
+                                    "` may not declare a `requires` clause — "
+                                    "requires are inherited from the base "
+                                    "member, never restated (\xC2\xA7""22.16)");
+                            }
+                        }
+                    }
+                    // SEAM-DEBT: #3611 contract-clause inheritance — see the
+                    // marker 19 lines above; the base-side read is the
+                    // second half of the same pair (override rejection +
+                    // base-copy).
+                    if (auto* bMD = dynamic_cast<const ast::MethodDecl*>(base->decl)) {
+                        ms->inheritedRequiresClauses.reserve(
+                            ms->inheritedRequiresClauses.size() +
+                            bMD->contractClauses.size());
+                        for (const auto& c : bMD->contractClauses) {
+                            if (c.kind == ast::ContractClause::Kind::Requires) {
+                                ms->inheritedRequiresClauses.push_back(&c);
+                            }
+                        }
+                    }
                 }
             } else {
                 ctx_.diagnostics().report(

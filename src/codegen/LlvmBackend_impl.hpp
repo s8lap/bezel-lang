@@ -2116,6 +2116,14 @@ private:
     // carries the ORIGINAL MethodSymbol* being specialized so lowerWith can find
     // the parent TypeSymbol without requiring specFn to be in methodFns_.
     sema::MethodSymbol* currentSpecMethodSymbol_ = nullptr;
+    // fix #3611 (§22.16, v0.286): the method (or constructor) currently being
+    // emitted, so `emitRequiresPrologue` can rebind inherited-clause
+    // `IdentifierExpr`s against the OVERRIDE's parameter symbols (the
+    // sema-resolved bindings still point at the BASE's symbols — the cross-
+    // compilation handoff, see LlvmBackend_Setup.cpp at the rebinding helper).
+    // Set in `emitFunctionBody` / `emitConstructorBody` and cleared at exit;
+    // null between methods.
+    sema::MethodSymbol* currentMethod_ = nullptr;
 
     // #817 / §14.2: true ONLY while emitting the UNSPECIALIZED generic TEMPLATE
     // body of a generic-class / generic method (emitFunctionBody). The template
@@ -7309,7 +7317,7 @@ private:
     // Source-text-in-message is deferred (recorded decision; the message
     // carries kind + qualified member name for this slice).
     void emitRequiresPrologue(
-        const std::vector<ast::ContractClause>& clauses,
+        const std::vector<const ast::ContractClause*>& clauses,
         std::string_view typeName, std::string_view memberName);
 
     // §22.16 (v0.203, #2053) Slice 4b: arm the single-exit ensures epilogue

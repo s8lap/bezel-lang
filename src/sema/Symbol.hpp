@@ -623,6 +623,24 @@ struct MemberSymbol : Symbol {
     // and already has that reader (ModuleMetadataBuilder.cpp:858-864). Kept, not
     // deleted, so implementing 3611 does not have to re-derive the carriage.
     std::vector<ContractRecord> contractRecords;
+    // fix #3611 (§22.16, v0.286): the BASE member's `requires` clauses that
+    // this override must inherit (§22.16 "Clauses bind overrides and
+    // implementations ([§12.1], [§11.2]): they are inherited, never restated;
+    // an override or implementation may add `ensures` clauses and may not
+    // declare `requires` clauses"). Non-owning pointers into the base
+    // MethodDecl's `contractClauses` (filtered to kind==Requires) — the
+    // base's AST lives for the whole compile (it is owned by the
+    // ModuleDecl/ModuleSymbol), so this is safe for the duration of
+    // compilation. Populated by `TypeResolution_Checks.cpp` at the same
+    // override-validation site that rejects an override's own `requires`
+    // (the two halves of §22.16's "inherited, never restated" — one read
+    // direction is the inheritance, the other is the rejection). LOCAL bases
+    // only for this slice; cross-module override inheritance (the imported
+    // base, where the AST is absent and only the textual `contractRecords`
+    // survive) is left as a follow-up because the cross-module direct call
+    // is already covered callee-side (the brief's probe 1 — measured:
+    // the exporter's compiled prologue fires from the callee).
+    std::vector<const ast::ContractClause*> inheritedRequiresClauses;
     // fix #3140 (§9.8, family F2 of umbrella #3152): this storage member's
     // `serialized` clause — `skip`, `optional`, and the `"<name>"` wire rename.
     //

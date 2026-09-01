@@ -5852,13 +5852,139 @@ void Emitter::emitThrowContractViolation(llvm::Value* msgStr) {
 // `bool` (§22.16 typing) and pure (no effects), so evaluating it before
 // the body is observably equivalent to eliding it for every non-violating
 // call. Purity of the lowering itself is the §22.15 admission's burden.
+// fix #3611 (§22.16 / §12.1, v0.286): an inherited `requires` clause's
+// `IdentifierExpr` nodes are bound by sema to the BASE member's parameter
+// symbols. Lowering them in the OVERRIDE's compilation looks them up in the
+// override's `paramSlots_` (keyed on symbol identity), where they are absent
+// — the slot reads back garbage or nullptr and `lowerExpr` propagates nullptr
+// up the BinaryExpr chain (no throw edges, the prologue silently no-ops).
+//
+// The fix is a scoped rebind: for each `IdentifierExpr` in the inherited
+// clause expression, save the BASE's `ctx_.exprSymbol` mapping, install the
+// OVERRIDE's parameter symbol that matches the IDENTIFIER NAME (parameters
+// in an override are required to share the base's parameter names per
+// §12.1's exact-match rule, so the name lookup is total), then restore after
+// lowering so the BASE compilation still sees its own bindings. `this` and
+// `base` rebind to the override's `currentThis_` (the codegen's `this`/
+// `base` IdentifierExpr path returns `currentThis_` regardless of the
+// sema binding — checked before the `paramSlots_` lookup — so no rebind is
+// actually needed for them, but listing them keeps the contract uniform).
+//
+// This walker covers the expression shapes a `requires` clause can carry per
+// the spec — arithmetic / comparison / short-circuit / method-call / member-
+// access / index — mirroring `CaptureWalker` in LlvmBackend_Layout.cpp
+// (which is the only existing comprehensive walker but lives in an
+// anonymous namespace there). The walker is intentionally narrower than a
+// general expression visitor: `requires` clauses are typed `bool` and
+// pure (§22.16 / §22.15), so they admit only expressions a pure context
+// admits, which excludes a handful of statement-only forms the general
+// walker visits.
+static void rebindInheritedClauseExprs(
+    const sema::SemaContext& ctx,
+    const ast::Expr* e,
+    const std::vector<sema::Symbol*>& overrideParams,
+    std::unordered_map<const ast::IdentifierExpr*, sema::Symbol*>& saved) {
+    if (!e) return;
+    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(e)) {
+        auto it = saved.find(id);
+        if (it == saved.end()) {
+            sema::Symbol* prev = ctx.exprSymbol(*id);
+            saved.emplace(id, prev);
+            for (sema::Symbol* p : overrideParams) {
+                if (p && std::string_view(p->name) == id->name) {
+                    const_cast<sema::SemaContext&>(ctx).setExprSymbol(id, p);
+                    return;
+                }
+            }
+            // No matching override param — leave the binding alone (the
+            // IdentifierExpr is `this`, `base`, a type name, or some other
+            // non-parameter symbol; the codegen's own identifier path handles
+            // `this`/`base` before any sema lookup, and a type-name read
+            // returns nullptr which the prologue propagates as a lowering
+            // failure — diagnosed upstream at sema).
+        }
+        return;
+    }
+    if (auto* b = dynamic_cast<const ast::BinaryExpr*>(e)) {
+        rebindInheritedClauseExprs(ctx, b->left.get(), overrideParams, saved);
+        rebindInheritedClauseExprs(ctx, b->right.get(), overrideParams, saved);
+        return; }
+    if (auto* u = dynamic_cast<const ast::UnaryExpr*>(e)) {
+        rebindInheritedClauseExprs(ctx, u->operand.get(), overrideParams, saved);
+        return; }
+    if (auto* c = dynamic_cast<const ast::CallExpr*>(e)) {
+        rebindInheritedClauseExprs(ctx, c->callee.get(), overrideParams, saved);
+        for (auto& a : c->args)
+            rebindInheritedClauseExprs(ctx, a.value.get(), overrideParams, saved);
+        return; }
+    if (auto* m = dynamic_cast<const ast::MemberAccessExpr*>(e)) {
+        rebindInheritedClauseExprs(ctx, m->target.get(), overrideParams, saved);
+        return; }
+    if (auto* ix = dynamic_cast<const ast::IndexExpr*>(e)) {
+        rebindInheritedClauseExprs(ctx, ix->target.get(), overrideParams, saved);
+        for (auto& a : ix->indices)
+            rebindInheritedClauseExprs(ctx, a.value.get(), overrideParams, saved);
+        return; }
+    if (auto* c = dynamic_cast<const ast::ConditionalExpr*>(e)) {
+        rebindInheritedClauseExprs(ctx, c->condition.get(), overrideParams, saved);
+        rebindInheritedClauseExprs(ctx, c->thenValue.get(), overrideParams, saved);
+        rebindInheritedClauseExprs(ctx, c->elseValue.get(), overrideParams, saved);
+        return; }
+    if (auto* t = dynamic_cast<const ast::TypeTestExpr*>(e)) {
+        rebindInheritedClauseExprs(ctx, t->operand.get(), overrideParams, saved);
+        return; }
+    if (auto* c = dynamic_cast<const ast::NullCondMemberExpr*>(e)) {
+        rebindInheritedClauseExprs(ctx, c->target.get(), overrideParams, saved);
+        return; }
+    if (auto* c = dynamic_cast<const ast::NullCondCallExpr*>(e)) {
+        rebindInheritedClauseExprs(ctx, c->callee.get(), overrideParams, saved);
+        for (auto& a : c->args)
+            rebindInheritedClauseExprs(ctx, a.value.get(), overrideParams, saved);
+        return; }
+    // Leaf literal expressions (IntegerLiteralExpr, BoolLiteralExpr, StringLiteralExpr,
+    // NullLiteralExpr, CharLiteralExpr, etc.) and unbound forms (LambdaExpr, NewExpr,
+    // RangeExpr, CollectionLiteralExpr, InterpolatedStringExpr, ObjectLiteralExpr,
+    // WithExpr, ThrowExpr, PostfixBangExpr, CastExpr) carry no IdentifierExpr
+    // children that need rebinding — or, in the case of NewExpr/RangeExpr/CollectionLiteralExpr,
+    // their child IdentifierExprs reference constructors or locals from the
+    // ORIGINAL base context that are not the override's parameters. None of
+    // these are admissible in a `requires` clause (typed `bool`, pure — §22.16
+    // / §22.15); the walker simply has no work for them, and any `IdentifierExpr`
+    // they happen to contain resolves correctly via the codegen's own identifier
+    // path (literals, type names, constructors) without touching `paramSlots_`.
+}
+
 void Emitter::emitRequiresPrologue(
-    const std::vector<ast::ContractClause>& clauses,
+    const std::vector<const ast::ContractClause*>& clauses,
     std::string_view typeName, std::string_view memberName) {
-    for (const auto& c : clauses) {
-        if (c.kind != ast::ContractClause::Kind::Requires) continue;
-        if (!c.expr) continue;
-        llvm::Value* condV = lowerExpr(*c.expr);
+    // fix #3611 (§22.16 / §12.1, v0.286): see `rebindInheritedClauseExprs`
+    // above for the rationale. Walk every clause's expression (LOCAL or
+    // INHERITED — the rebind is a no-op for local clauses whose IdentifierExprs
+    // already point at the currently-compiled method's parameter symbols, so
+    // reinstalling the same symbol is observably identical), save the BASE's
+    // `ctx_.exprSymbol` binding for each `IdentifierExpr`, install the
+    // OVERRIDE's parameter symbol matched by NAME, then restore the original
+    // bindings after lowering so the BASE's own compilation (and any later
+    // walk) still sees its sema bindings. `this` and `base` are unmolested
+    // — the codegen's IdentifierExpr path returns `currentThis_` for both
+    // names BEFORE the sema lookup, so no rebind is needed; the walker leaves
+    // unknown names alone.
+    std::vector<sema::Symbol*> overrideParams;
+    if (currentMethod_) {
+        for (auto* p : currentMethod_->params) overrideParams.push_back(p);
+    }
+    std::unordered_map<const ast::IdentifierExpr*, sema::Symbol*> savedRebinds;
+    for (const auto* c : clauses) {
+        if (c && c->expr) {
+            rebindInheritedClauseExprs(ctx_, c->expr.get(), overrideParams,
+                                       savedRebinds);
+        }
+    }
+    for (const auto* c : clauses) {
+        if (!c) continue;
+        if (c->kind != ast::ContractClause::Kind::Requires) continue;
+        if (!c->expr) continue;
+        llvm::Value* condV = lowerExpr(*c->expr);
         if (!condV) continue;  // lowering failure already diagnosed upstream
         // §22.16: a clause evaluating false raises ContractViolationException.
         llvm::Value* failed = builder_.CreateNot(condV, "req.fail");
@@ -5874,6 +6000,17 @@ void Emitter::emitRequiresPrologue(
         llvm::Value* msgStr = lowerStringLiteral("\"" + msg + "\"", false);
         emitThrowContractViolation(msgStr);
         builder_.SetInsertPoint(contBB);
+    }
+    // fix #3611: restore the BASE's `ctx_.exprSymbol` bindings so the BASE
+    // compilation (which runs later and sees the same shared AST) and any
+    // subsequent walk of the same expressions still see the sema-resolved
+    // symbols. The rebind is a no-op for clauses whose IdentifierExprs were
+    // never touched (the local-clause path's IdentifierExprs are already
+    // bound to `currentMethod_`'s symbols, which the rebind reinstalls as
+    // the same value — saving then restoring the same value is observably
+    // identical).
+    for (auto& [id, prev] : savedRebinds) {
+        ctx_.setExprSymbol(id, prev);
     }
 }
 
@@ -8773,6 +8910,22 @@ void Emitter::emitMainStaticInitPrologue() {
 
 
 void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
+    // fix #3611 (§22.16, v0.286): publish the currently-compiled method so
+    // `emitRequiresPrologue` can rebind inherited `requires` clauses'
+    // IdentifierExprs against this method's parameter symbols. The RAII guard
+    // restores the previous value on every exit path (early `return`s in the
+    // body below, exceptions from codegen helpers, etc.) — a manual
+    // save/restore at every return would be brittle and #3505 / #3551 already
+    // record a "clear() + nested save/restore are one contract" ratchet for
+    // per-method codegen state.
+    struct CurrentMethodGuard {
+        sema::MethodSymbol*& slot;
+        sema::MethodSymbol* prev;
+        CurrentMethodGuard(sema::MethodSymbol*& s, sema::MethodSymbol* m)
+            : slot(s), prev(s) { slot = m; }
+        ~CurrentMethodGuard() { slot = prev; }
+    };
+    CurrentMethodGuard methodGuard{currentMethod_, ms};
     // §2.5 / §14.1 / #783: an IMPORTED method's `methodFns_` entry is an EXTERNAL
     // declaration (the exporter holds the compiled body); never emit a body for
     // it here — doing so would multiply-define `bz$<Class>$<M>` at link time.
@@ -9092,8 +9245,40 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
             // the entry block (LLVM's alloca-required-in-entry rule).
             allocateOldCaptureSlots(fn, md->contractClauses);
             if (!md->contractClauses.empty()) {
+                std::vector<const ast::ContractClause*> localPtrs;
+                localPtrs.reserve(md->contractClauses.size());
+                for (const auto& c : md->contractClauses) localPtrs.push_back(&c);
                 emitRequiresPrologue(
-                    md->contractClauses,
+                    localPtrs,
+                    ms->parent ? ms->parent->name : std::string_view{},
+                    md->name);
+            }
+            // fix #3611 (§22.16 / §12.1, v0.286): an OVERRIDE must lower
+            // the base member's `requires` clauses in its own prologue
+            // (§22.16 "inherited, never restated"). Sema populated
+            // `ms->inheritedRequiresClauses` at the override-validation
+            // site (TypeResolution_Checks.cpp); each pointer addresses a
+            // base-MethodDecl `ContractClause` whose expression references
+            // the override's parameters by NAME — name-based identifier
+            // resolution (lowerExpr's `paramSlots_` lookup, keyed on the
+            // symbol NAME, not the AST node) finds the override's slots
+            // because the symbol table is keyed by name and the override
+            // declared a parameter of the same name as the base. The
+            // emitted message names the OVERRIDE's type and member (the
+            // base's prologue would name the base's), which is the surface
+            // the runtime raises against. The local-clause prologue
+            // (`md->contractClauses`) above has already produced its own
+            // throw edges — running a SECOND throw chain here just stacks
+            // additional basic blocks before the body's first statement,
+            // ordering inherited-throws before local-throws (consistent
+            // with §22.16's "requires clauses, then the invariant"
+            // ordering — base clauses run first because they are listed
+            // first on the override's logical contract surface). Skipped
+            // when the override inherits nothing (the common case for
+            // methods with no base `requires`).
+            if (!ms->inheritedRequiresClauses.empty()) {
+                emitRequiresPrologue(
+                    ms->inheritedRequiresClauses,
                     ms->parent ? ms->parent->name : std::string_view{},
                     md->name);
             }
@@ -10269,8 +10454,18 @@ void Emitter::emitStaticPartialReadGuard(const sema::TypeSymbol* owner,
 
 
 void Emitter::emitConstructorBody(sema::ConstructorSymbol* cs, llvm::Function* fn) {
+    // fix #3611 (§22.16, v0.286): set `currentMethod_` so the requires-prologue
+    // rebind sees the constructor's parameter symbols (constructors are NOT
+    // overridable, so the rebind is a same-identifier no-op for the local-
+    // clause path — but the helper runs uniformly for every prologue emit).
+    sema::MethodSymbol* savedCurrentMethod = currentMethod_;
+    currentMethod_ = nullptr;  // ctors have no MethodSymbol — use ms==nullptr
+                                // and let the rebind use an empty param list
+                                // (no IdentifierExpr in a ctor `requires` clause
+                                // is a parameter symbol — sema rejects the
+                                // shape — so the empty list is sound).
     auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
-    if (!cd) return;
+    if (!cd) { currentMethod_ = savedCurrentMethod; return; }
     currentFn_ = fn;
     currentReturnTypeNode_ = nullptr;  // ctors return void
     currentThis_ = nullptr;
@@ -10351,7 +10546,10 @@ void Emitter::emitConstructorBody(sema::ConstructorSymbol* cs, llvm::Function* f
         // for code uniformity, and the empty `oldCaptureSlots_` map is
         // harmless when the constructor's ensures clause is evaluated.
         allocateOldCaptureSlots(fn, cd->contractClauses);
-        emitRequiresPrologue(cd->contractClauses,
+        std::vector<const ast::ContractClause*> localPtrs;
+        localPtrs.reserve(cd->contractClauses.size());
+        for (const auto& c : cd->contractClauses) localPtrs.push_back(&c);
+        emitRequiresPrologue(localPtrs,
                              cs->parent ? cs->parent->name
                                         : std::string_view{},
                              "constructor");
@@ -10526,6 +10724,11 @@ void Emitter::emitConstructorBody(sema::ConstructorSymbol* cs, llvm::Function* f
         }
     }
     finalizeEnsuresEpilogue();
+    // fix #3611 (§22.16, v0.286): restore `currentMethod_` (set to nullptr
+    // at function entry; restoring even the always-nullptr case keeps the
+    // save/restore shape uniform and matches `emitFunctionBody`'s RAII — every
+    // entry/exit pair updates the slot identically).
+    currentMethod_ = savedCurrentMethod;
 }
 
 

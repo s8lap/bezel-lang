@@ -63,5 +63,6 @@
 7    src/sema/PureChecker.cpp
 5    src/sema/StaticInitCycles.cpp
 5    src/sema/SymbolCollection.cpp
-51   src/sema/TypeResolution_Checks.cpp
+53   src/sema/TypeResolution_Checks.cpp
+# +2 for #3611 contract-clause inheritance (override-rejection + base-copy); both carry // SEAM-DEBT: #3611
 3    src/sema/TypeResolution_Names.cpp
