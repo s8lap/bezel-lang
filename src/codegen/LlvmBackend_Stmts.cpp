@@ -6299,6 +6299,11 @@ bool Emitter::emitGenericKeyTableFor(const ast::ForStmt& fs,
                                      const sema::TypeRef* elemTyRef,
                                      bool sorted) {
     if (!tableObj || !elemTyRef) return false;
+    // This helper also lowers dict-backed Set iteration. Do not admit its
+    // cross-suspend spill registration for that non-Keys caller (#3602).
+    bool registerSpill = false;
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(fs.iterable.get()))
+        registerSpill = ma->member == "Keys";
     llvm::Type* elemTy = lowerTypeRef(elemTyRef);
     if (!elemTy) return false;
 
@@ -6337,6 +6342,9 @@ bool Emitter::emitGenericKeyTableFor(const ast::ForStmt& fs,
     builder_.CreateStore(builder_.getInt64(0), idxSlot);
     auto* varSlot = entryAlloca(elemTy);
     locals_[&fs] = varSlot;
+    if (registerSpill)
+        registerForLoopSpillSlots(fs, {dictEpochSlot, keysOutSlot, cntSlot,
+                                       idxSlot, varSlot});
 
     auto* condBB = llvm::BasicBlock::Create(llvm_, "gk.cond", currentFn_);
     auto* bodyBB = llvm::BasicBlock::Create(llvm_, "gk.body", currentFn_);
@@ -6477,6 +6485,8 @@ bool Emitter::lowerDictKeysFor(const ast::ForStmt& fs) {
     builder_.CreateStore(builder_.getInt64(0), idxSlot);
     auto* varSlot = entryAlloca(ptrTy());  // loop var is a string-object pointer
     locals_[&fs] = varSlot;
+    registerForLoopSpillSlots(fs, {dkEpochSlot, keysOutSlot, lensOutSlot,
+                                   cntSlot, idxSlot, varSlot});
     // #1058 / §28/§4.8: initialise to null so the endBB break-path release is
     // null-safe when the loop body is never entered (cnt == 0).
     builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), varSlot);
@@ -6629,6 +6639,8 @@ bool Emitter::lowerDictValuesFor(const ast::ForStmt& fs) {
     // issue #539: nullable value types lower to a tagged struct — same: valLlvm.
     auto* varSlot = entryAlloca(valLlvm);
     locals_[&fs] = varSlot;
+    registerForLoopSpillSlots(fs, {dvEpochSlot, valsOutSlot, cntSlot,
+                                   idxSlot, varSlot});
 
     auto* condBB = llvm::BasicBlock::Create(llvm_, "dv.cond", currentFn_);
     auto* bodyBB = llvm::BasicBlock::Create(llvm_, "dv.body", currentFn_);
