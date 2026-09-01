@@ -1914,15 +1914,30 @@ void Resolver::checkClosedHierarchyLeafVisibility() {
     // its leaf set is local-only and the cross-module guarantee does not
     // apply. (`isExportedType` requires Public; an internal root is not
     // exported, period.)
+    //
+    // fix #3637 (§19.6 / §11.7 / §11.6, v0.286): the root collection used
+    // to walk only `ctx_.module()->children` (top-level only), so a `closed`
+    // root nested inside a public class was silently skipped -- the WHOLE
+    // §19.6 leaf-visibility check below ran against an empty root set and
+    // produced no diagnostic, letting a concrete `internal` leaf escape.
+    // §11.6 states "Nested types in records are permitted but uncommon" and
+    // nested classes are equally legal (the canonical example: a public
+    // outer class owning a public `closed` root that drives a cross-module
+    // `case`); the root-collection half of #3599 was explicitly deferred
+    // (cbb7be5's body says "the closed-ROOT collection ... stays restricted
+    // to top-level public classes -- that is a separate, narrower question
+    // from the leaf side this issue is about, and is flagged as issue
+    // 3599's follow-up rather than folded in here"). Routing through the
+    // shared recursive walker (fix #3574, `forEachTypeAndNested`) and
+    // filtering to `kind == Class && typeIsClosed && visibility == Public`
+    // inside the callback mirrors fix #3599's leaf-side shape exactly.
     std::vector<TypeSymbol*> closedRoots;
-    for (Symbol* child : ctx_.module()->children) {
-        auto* t = dynamic_cast<TypeSymbol*>(child);
-        if (!t) continue;
-        if (t->kind != ast::TypeDeclKind::Class) continue;
-        if (!typeIsClosed(t)) continue;
-        if (t->visibility != ast::Visibility::Public) continue;
+    forEachTypeAndNested([&](TypeSymbol* t) {
+        if (t->kind != ast::TypeDeclKind::Class) return;
+        if (!typeIsClosed(t)) return;
+        if (t->visibility != ast::Visibility::Public) return;
         closedRoots.push_back(t);
-    }
+    });
     if (closedRoots.empty()) return;
     // Enumerate every class declared in this module (a closed root's leaf
     // set is local to its declaring module, §11.7; cross-module subclasses
