@@ -431,11 +431,25 @@ if compgen -G "$logdir/aotstats.*.txt" > /dev/null 2>&1; then
       match($0, /link-hits=[0-9]+/)   { lh += substr($0, RSTART+10, RLENGTH-10) }
       match($0, /store_failures=[0-9]+/){ sf += substr($0, RSTART+15, RLENGTH-15) }
       match($0, /store_fsyncs=[0-9]+/){ fy += substr($0, RSTART+13, RLENGTH-13) }
+      # per #3669: the two fields the fsync-free store mode reports. Without
+      # them the aggregate DROPS the only evidence issue 3690 needs from a real
+      # gate log: that the mode engaged (store_fsync_skipped>0) and that no
+      # entry failed verification (verify_rejects==0). Both patterns are
+      # unambiguous against the fields above. store_fsync_skipped= cannot match
+      # /store_fsyncs=/ because the character after store_fsync is _ and not s,
+      # and verify_rejects= contains none of hits= / misses= / store_failures=.
+      # APPENDED before the trailing shards_reporting= meta field; no existing
+      # field is renamed or reordered, so the three greps at gate.sh:1084-1089
+      # return byte-identical values over the new line.
+      # NOTE: no apostrophes below or above -- this awk program is inside a
+      # single-quoted shell string and one would terminate it.
+      match($0, /store_fsync_skipped=[0-9]+/){ fk += substr($0, RSTART+20, RLENGTH-20) }
+      match($0, /verify_rejects=[0-9]+/){ vr += substr($0, RSTART+15, RLENGTH-15) }
       { n++ }
       END {
         if (n == 0) exit 0
-        printf "[aot-cache] hits=%d misses=%d (%d%% hit) exe-key-hits=%d obj-hits=%d link-hits=%d store_failures=%d store_fsyncs=%d shards_reporting=%d\n",
-               h, m, (h+m) ? (100*h/(h+m)) : 0, eh, oh, lh, sf, fy, n
+        printf "[aot-cache] hits=%d misses=%d (%d%% hit) exe-key-hits=%d obj-hits=%d link-hits=%d store_failures=%d store_fsyncs=%d store_fsync_skipped=%d verify_rejects=%d shards_reporting=%d\n",
+               h, m, (h+m) ? (100*h/(h+m)) : 0, eh, oh, lh, sf, fy, fk, vr, n
       }' "$logdir"/aotstats.*.txt 2>/dev/null || true
 fi
 

@@ -88,6 +88,7 @@
 #include <array>
 #include <atomic>
 #include <cerrno>
+#include <charconv>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -96,6 +97,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -1419,6 +1421,19 @@ struct CacheStats {
     // actually ran on the install path — the regression test pins the mechanism.
     std::atomic<std::uint64_t> storeFailures{0};
     std::atomic<std::uint64_t> storeFsyncs{0};
+    // per #3669: renames that SKIPPED the #3009 durability fsync because
+    // BEZEL_AOT_STORE_FSYNC=0 was in force. A no-fsync storeToCache bumps this
+    // TWICE (the entry's own rename and its size-sidecar's rename), so it is a
+    // "how much durability was traded away" signal, not a store count.
+    std::atomic<std::uint64_t> storeFsyncSkipped{0};
+    // per #3669: cache entries REJECTED on read because their size sidecar
+    // disagreed with the entry's actual size (a torn/short entry). Deliberately
+    // NOT called `verify_misses` on the [aot-cache] line: gate.sh:1086 sums the
+    // shard log with an UNANCHORED `grep -aoE 'misses=[0-9]+'`, so a field
+    // spelled `verify_misses=` would be silently added into the gate's reported
+    // AOT miss total. `verify_rejects=` cannot collide with any of the three
+    // fields the gate greps (hits= / misses= / store_failures=).
+    std::atomic<std::uint64_t> verifyRejects{0};
     std::atomic<int> lastStoreErrno{0};
 };
 inline CacheStats& cacheStats() {
@@ -1449,6 +1464,21 @@ inline std::string cacheStatsFile() {
     return (e && *e) ? std::string(e) : std::string{};
 }
 
+// per #3669: is the #3009 store fsync in force? DEFAULT YES — the env unset (or
+// set to anything but "0") gives exactly the #3009 behaviour, byte for byte, so
+// no normal run changes. `BEZEL_AOT_STORE_FSYNC=0` trades the store's
+// durability for its cost (~21k data fsyncs + as many directory fsyncs per ASan
+// gate pass, measured 2026-09-02) and is compensated by verify-on-read below.
+//
+// Read FRESH on every call — deliberately NOT a memoised static — so a test can
+// setenv/unsetenv and exercise both modes inside one process. The read is a
+// getenv per cache-store rename (three per cold test), which is noise beside the
+// rename it guards.
+inline bool storeFsyncEnabled() {
+    const char* e = std::getenv("BEZEL_AOT_STORE_FSYNC");
+    return !(e && std::string(e) == "0");
+}
+
 // per #3009: fsync the temp file's DATA, then atomically rename it into place,
 // then best-effort fsync the target directory so the rename itself is durable.
 // Returns the rename's error_code (empty on success); on rename failure the
@@ -1458,24 +1488,103 @@ inline std::string cacheStatsFile() {
 // entries in 53,703, but a cheap durability fix). Shared by storeToCache (cache
 // install) and the BEZEL_AOT_CACHE_STATS_FILE sink (#3014). storeFsyncs is the
 // mechanism pin the #3009 regression test asserts against.
+//
+// per #3669: `doFsync` selects the mode and DEFAULTS to storeFsyncEnabled(), so
+// every existing two-argument call site keeps the #3009 behaviour unchanged. The
+// default argument is evaluated at each call (not once), which is what lets a
+// test flip the env mid-process. It is spelled `doFsync`, not `fsync`, because
+// the body calls ::fsync and a parameter of that name shadows it.
 inline std::error_code durableRename(const std::string& tmp,
-                                     const std::string& dst) {
-    if (int fd = ::open(tmp.c_str(), O_RDONLY | O_CLOEXEC); fd >= 0) {
-        while (::fsync(fd) != 0 && errno == EINTR) {}
-        ::close(fd);
-        cacheStats().storeFsyncs.fetch_add(1, std::memory_order_relaxed);
+                                     const std::string& dst,
+                                     bool doFsync = storeFsyncEnabled()) {
+    if (doFsync) {
+        if (int fd = ::open(tmp.c_str(), O_RDONLY | O_CLOEXEC); fd >= 0) {
+            while (::fsync(fd) != 0 && errno == EINTR) {}
+            ::close(fd);
+            cacheStats().storeFsyncs.fetch_add(1, std::memory_order_relaxed);
+        }
+    } else {
+        cacheStats().storeFsyncSkipped.fetch_add(1, std::memory_order_relaxed);
     }
     std::error_code ec;
     fs::rename(tmp, dst, ec);  // atomic install (same filesystem)
     if (ec) { std::error_code e2; fs::remove(tmp, e2); return ec; }
     // Best-effort directory fsync (some filesystems refuse; harmless — the data
-    // fsync above is what prevents a truncated entry).
-    if (int dfd = ::open(fs::path(dst).parent_path().string().c_str(),
-                         O_RDONLY | O_DIRECTORY | O_CLOEXEC); dfd >= 0) {
-        while (::fsync(dfd) != 0 && errno == EINTR) {}
-        ::close(dfd);
+    // fsync above is what prevents a truncated entry). Skipped with the data
+    // fsync when !doFsync: fsyncing the directory alone would make the rename
+    // durable over data blocks that may not be, which is the #3009 hazard
+    // itself, and would keep most of the cost.
+    if (doFsync) {
+        if (int dfd = ::open(fs::path(dst).parent_path().string().c_str(),
+                             O_RDONLY | O_DIRECTORY | O_CLOEXEC); dfd >= 0) {
+            while (::fsync(dfd) != 0 && errno == EINTR) {}
+            ::close(dfd);
+        }
     }
     return {};
+}
+
+// per #3669: the size sidecar for a cache entry. `<entry>.sz` holds the decimal
+// byte count the entry had when it was stored; installFromCache treats a
+// disagreement as a torn entry (a MISS) instead of running it. This is the
+// verification that replaces the durability BEZEL_AOT_STORE_FSYNC=0 gives up.
+//
+// The `.sz` suffix cannot collide with an entry name: entries are 64-hex keys
+// (exeEntryPath/objEntryPath/linkEntryPath below), and a sidecar's own basename
+// therefore never parses as a key.
+inline std::string cacheSidecarPath(const std::string& entry) {
+    return entry + ".sz";
+}
+
+// per #3669: record `src`'s byte size in `<entry>.sz`, atomically (temp in the
+// SAME directory, then rename) and WITHOUT an fsync — the sidecar is a
+// verification aid, not a durability claim, so a sidecar lost to the same power
+// cut that tore the entry simply degrades to the pre-#3669 "trust the entry"
+// behaviour rather than making anything worse.
+//
+// Best-effort throughout: on any failure no sidecar is left, and an entry with
+// no sidecar is trusted exactly as today. The temp is named with the `.tmp.`
+// prefix so maybeGcCache's orphan reaper (#3003) covers it.
+inline void writeSizeSidecar(const std::string& src, const std::string& entry) {
+    std::error_code ec;
+    const std::uintmax_t sz = fs::file_size(src, ec);
+    if (ec) return;
+    static std::atomic<std::uint64_t> ctr{0};
+    const std::string dir = fs::path(entry).parent_path().string();
+    const std::string tmp =
+        dir + "/.tmp.sz." + std::to_string(::getpid()) + "." +
+        std::to_string(ctr.fetch_add(1, std::memory_order_relaxed));
+    {
+        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+        if (!f) { std::error_code e2; fs::remove(tmp, e2); return; }
+        f << sz;
+        f.close();
+        if (!f) { std::error_code e2; fs::remove(tmp, e2); return; }
+    }
+    durableRename(tmp, cacheSidecarPath(entry), /*doFsync=*/false);
+}
+
+// per #3669: read the size recorded in `sidecarPath`. nullopt when the sidecar
+// is absent, unreadable, empty or malformed — every one of which means "no
+// verifiable claim about this entry", i.e. trust it as before #3669. Only a
+// sidecar that parses cleanly can reject an entry.
+inline std::optional<std::uintmax_t> readSizeSidecar(
+    const std::string& sidecarPath) {
+    std::ifstream f(sidecarPath, std::ios::binary);
+    if (!f) return std::nullopt;
+    std::string text((std::istreambuf_iterator<char>(f)), {});
+    while (!text.empty() &&
+           (text.back() == '\n' || text.back() == '\r' || text.back() == ' '))
+        text.pop_back();
+    if (text.empty()) return std::nullopt;
+    // std::from_chars, not stoull: no exceptions (LLVM's flags can carry
+    // -fno-exceptions) and it rejects overflow by error code rather than throw.
+    std::uintmax_t v = 0;
+    const auto* first = text.data();
+    const auto* last = text.data() + text.size();
+    const auto res = std::from_chars(first, last, v);
+    if (res.ec != std::errc{} || res.ptr != last) return std::nullopt;
+    return v;
 }
 
 // per #3014: atomically write `content` to `path` (temp in the same dir, then
@@ -1500,7 +1609,15 @@ inline void atomicWriteStats(const std::string& path,
         f.close();
         if (!f) { std::error_code e2; fs::remove(tmp, e2); return; }
     }
-    durableRename(tmp, path);  // fsync + atomic rename + dir fsync
+    // per #3669: PIN the fsync explicitly rather than inheriting
+    // durableRename's new default. This sink is not a cache entry: it is written
+    // once per process at exit, there is no verify-on-read for it (no size
+    // sidecar, and its reader is a grep, not an executable), and gate telemetry
+    // reads it after the run. Letting BEZEL_AOT_STORE_FSYNC=0 reach it would
+    // have silently dropped the #3014 sink's durability too — a widening beyond
+    // what #3669 asks for, at zero measurable saving (one fsync per process
+    // against ~21k per gate pass).
+    durableRename(tmp, path, /*doFsync=*/true);  // fsync + atomic rename + dir fsync
 }
 
 // per #3014: emit the [aot-cache] stats line NOW to the selected sink:
@@ -1521,14 +1638,23 @@ inline void emitCacheStatsNow() {
     const unsigned long long lh = s.linkHits.load(std::memory_order_relaxed);
     const unsigned long long sf = s.storeFailures.load(std::memory_order_relaxed);
     const unsigned long long fy = s.storeFsyncs.load(std::memory_order_relaxed);
+    const unsigned long long fsk =
+        s.storeFsyncSkipped.load(std::memory_order_relaxed);   // #3669
+    const unsigned long long vr =
+        s.verifyRejects.load(std::memory_order_relaxed);        // #3669
     const int lse = s.lastStoreErrno.load(std::memory_order_relaxed);
     char buf[640];
     const int n = std::snprintf(buf, sizeof(buf),
         "[aot-cache] hits=%llu misses=%llu (%.0f%% hit) "
         "exe-key-hits=%llu obj-hits=%llu link-hits=%llu "
-        "store_failures=%llu store_fsyncs=%llu store_errno=%d dir=%s\n",
+        "store_failures=%llu store_fsyncs=%llu store_errno=%d "
+        // per #3669: APPENDED, never reordered — gate.sh:1084-1089 greps this
+        // line field-by-field (`hits=` anchored on the [aot-cache] prefix,
+        // `misses=`, `store_failures=`), so a new field it does not name is
+        // invisible to it. Neither name contains any of those three tokens.
+        "store_fsync_skipped=%llu verify_rejects=%llu dir=%s\n",
         h, m, (h + m) ? 100.0 * h / (h + m) : 0.0, eh, oh, lh, sf, fy, lse,
-        cacheDir().c_str());
+        fsk, vr, cacheDir().c_str());
     if (n < 0) return;
     // Clamp to the bytes snprintf actually wrote (it returns the would-be size,
     // which can exceed the buffer on truncation).
@@ -1571,6 +1697,39 @@ inline void ensureStatsAtExit() {
 inline bool installFromCache(const std::string& cachePath,
                              const std::string& exePath) {
     std::error_code ec;
+    // per #3669: VERIFY-ON-READ, before the entry is linked anywhere. When the
+    // entry carries a size sidecar — written only by a store that skipped the
+    // #3009 durability fsync — a size disagreement means a torn/short entry.
+    // Treat it as a MISS: evict entry AND sidecar and return false, which every
+    // caller already handles by running the real compile (cachedCompile's three
+    // lookups all fall through on false). That preserves exactly the property
+    // #3009 bought — a hit never runs a truncated executable — by verification
+    // instead of durability.
+    //
+    // An entry WITHOUT a parseable sidecar is trusted exactly as before #3669:
+    // it was stored WITH the fsync, so there is nothing to verify against.
+    //
+    // The check is deliberately NOT conditioned on THIS reader's own
+    // BEZEL_AOT_STORE_FSYNC. The store is shared between the gate (which opts
+    // in) and lane/agent_check runs (which do not), so an entry written without
+    // the fsync must be verified by whoever reads it, not only by a reader in
+    // the same mode. The price on the default path is one open() that ENOENTs
+    // per install — the ONLY syscall #3669 adds to a default-mode run, and it
+    // can only ever turn a hit into a miss (a real compile), never a wrong
+    // product. A vanished entry is left to the hardlink below to fail on, so
+    // that race is not miscounted as a verification reject.
+    const std::string sidecar = cacheSidecarPath(cachePath);
+    if (const std::optional<std::uintmax_t> want = readSizeSidecar(sidecar)) {
+        std::error_code e1;
+        const std::uintmax_t got = fs::file_size(cachePath, e1);
+        if (!e1 && got != *want) {
+            cacheStats().verifyRejects.fetch_add(1, std::memory_order_relaxed);
+            std::error_code e2;
+            fs::remove(cachePath, e2);
+            fs::remove(sidecar, e2);
+            return false;
+        }
+    }
     fs::create_hard_link(cachePath, exePath, ec);
     if (ec) {
         ec.clear();
@@ -1628,7 +1787,23 @@ inline void storeToCache(const std::string& exePath,
     // (and best-effort fsyncs the cache dir) so a crash between the copy and the
     // rename-in-cache-dir cannot leave a partial/truncated entry serving a
     // future hit.
-    const std::error_code rec = durableRename(tmp, cachePath);
+    //
+    // per #3669: with BEZEL_AOT_STORE_FSYNC=0 that durability is traded for its
+    // cost and replaced by verify-on-read, so record the entry's size in a
+    // sidecar FIRST. Order matters: a sidecar without its entry is inert (the
+    // lookup misses on the absent entry), whereas an entry without its sidecar
+    // is merely trusted — the pre-#3669 state. The mode is sampled ONCE here and
+    // handed to durableRename so the sidecar and the rename cannot disagree if a
+    // concurrent test flips the env between the two.
+    //
+    // The sidecar is written ONLY in no-fsync mode, on purpose: the default path
+    // must stay byte-for-byte today's syscall sequence (this header is compiled
+    // into every test TU and the store runs on every cold test). The cost is
+    // that an entry stored under the fsync is not size-verified — which is the
+    // pre-#3669 contract, and sound, because that store WAS durable.
+    const bool doFsync = storeFsyncEnabled();
+    if (!doFsync) writeSizeSidecar(tmp, cachePath);
+    const std::error_code rec = durableRename(tmp, cachePath, doFsync);
     if (rec) {
         // per #3014: the rename itself failed — count it too (durableRename has
         // already removed the temp).
@@ -1706,6 +1881,26 @@ inline void maybeGcCache() {
                 total += sz;   // young temp: counts against the cap, not reaped
                 continue;
             }
+            // per #3669: `<key>.sz` size sidecars are ordinary files here, so
+            // they are counted and are eligible for eviction like any entry.
+            // Two consequences, deliberately not special-cased:
+            //   * the file COUNT roughly doubles for entries stored in no-fsync
+            //     mode (the BYTES do not — a sidecar is <8 bytes, so the GB cap
+            //     this loop enforces is unaffected). That inflates the cold/warm
+            //     classifier's `cache_n` (scripts/gate/cold.py count_cache, a
+            //     `find -L -type f` count) by up to 2x, so its
+            //     COLD_CACHE_THRESHOLD of 2000 files stops meaning 2000 entries
+            //     and starts meaning ~1000. This is NOT fail-safe by itself —
+            //     it biases the verdict toward WARM, whose ceiling (900s) is the
+            //     TIGHTER one. It is bounded, though: the misjudgement band is
+            //     only 1000-2000 real entries, far below a populated gate store
+            //     (102,299 measured in #3000) and far above a fresh one, and the
+            //     count is one of THREE OR'd cold signals — a genuinely cold
+            //     store almost always also trips `identity_changed` or
+            //     `marker_changed`, which force COLD on their own.
+            //   * a sidecar may be reaped before its entry, which degrades that
+            //     entry to the pre-#3669 "trusted, unverified" state — i.e. to
+            //     exactly the fsync-mode contract, never to something weaker.
             total += sz;
             ents.push_back({it->path().string(), sz, mt});
         }
