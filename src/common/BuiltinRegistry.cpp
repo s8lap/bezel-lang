@@ -107,6 +107,29 @@ constexpr std::array<std::string_view, 2> kSyncIterFormatEnumerableHeads = {
     "IEnumerable", "IOwningEnumerable",
 };
 
+// #3419 / §29.2: the four ITERATOR-FORMAT ENUMERATOR heads — the complement
+// of `kIterFormatEnumerableHeads` within the eight iterator/enumerator heads.
+// An enumerator is what a §29.2 wrap PRODUCES (the MoveNext/Current/
+// TakeCurrent vtable contract), so a receiver already typed at one of these
+// four is the vtable-backed object the wrap machinery hands out, not
+// something a wrap decision is made about. See the header for the routing/
+// dispatch sites (MoveNext, TakeCurrent, MoveNextAsync, explicit Dispose,
+// the declaration-less §8.3 identity-Equals/GetHashCode fallback) that ask
+// this question rather than the wrap-eligibility one above.
+constexpr std::array<std::string_view, 4> kIterFormatEnumeratorHeads = {
+    "IEnumerator", "IOwningEnumerator",
+    "IAsyncEnumerator", "IOwningAsyncEnumerator",
+};
+
+// The SYNCHRONOUS half of the above — the two heads the vtable-slot MoveNext
+// / TakeCurrent / explicit-Dispose dispatch sites admit. The async twins take
+// the MoveNextAsync vtable shape and its own dispatch (`LlvmBackend_Async.cpp`),
+// a disjoint lowering path. Exactly analogous to `kSyncIterFormatEnumerableHeads`
+// above, the sync half of the sibling (Enumerable-format) question.
+constexpr std::array<std::string_view, 2> kSyncIterFormatEnumeratorHeads = {
+    "IEnumerator", "IOwningEnumerator",
+};
+
 // fix #3606 / §29.1 / §29.3: the SYNCHRONOUS half of
 // `kOwningIterableInterfaceHeads` above — the two owning iterator-method
 // return heads whose declared shape carries the §29.1 owning contract. The
@@ -745,6 +768,17 @@ bool isIterFormatEnumerableHead(std::string_view head) {
 // The synchronous half of the above. // per §29.2, #3419
 bool isSyncIterFormatEnumerableHead(std::string_view head) {
     return contains(kSyncIterFormatEnumerableHeads, head);
+}
+
+// #3419 / §29.2: the four iterator-format ENUMERATOR heads — the complement
+// of isIterFormatEnumerableHead. // per §29.2, #3419
+bool isIterFormatEnumeratorHead(std::string_view head) {
+    return contains(kIterFormatEnumeratorHeads, head);
+}
+
+// The synchronous half of the above. // per §29.2, #3419
+bool isSyncIterFormatEnumeratorHead(std::string_view head) {
+    return contains(kSyncIterFormatEnumeratorHeads, head);
 }
 
 // fix #3606 / §29.1 / §29.3: the synchronous half of

@@ -4087,8 +4087,13 @@ llvm::Value* Emitter::explicitDisposeOwnedReceiverSlot(
                     // sole reclaim path and must free + null that slot.  The async
                     // spelling was previously omitted, so await-for ran only the
                     // destructor and leaked the transferred element's heap block.
-                    if (inm == "IOwningEnumerable" ||
-                        inm == "IOwningAsyncEnumerable")
+                    // narrow #3419: routed onto the shared enumerable-wrap-grid
+                    // authorities — the OWNING half of the iterator-format
+                    // ENUMERABLE heads (IOwningEnumerable, IOwningAsyncEnumerable;
+                    // §6b: identical admission set to the two-name literal chain
+                    // this replaces, both directions).
+                    if (common::isIterFormatEnumerableHead(inm) &&
+                        common::isOwningIterableInterfaceHead(inm))
                         return lvalueAddr(receiver, slotTy);
                 }
                 return nullptr;
@@ -5804,13 +5809,17 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
             if (ma->member == "GetEnumerator" && ma->target) {
                 const sema::TypeRef* recvTy = ctx_.exprType(*ma->target);
                 const sema::TypeRef* resultTy = ctx_.exprType(call);
+                // narrow #3419: routed onto the shared enumerable-wrap-grid
+                // authority — the SYNC half of the iterator-format ENUMERATOR
+                // heads (IEnumerator, IOwningEnumerator; §6b: identical
+                // admission set to the two-name literal chain this replaces).
                 bool resultIsEnumeratorSentinel =
                     resultTy && resultTy->kind == sema::TypeRef::Kind::Named &&
                     !resultTy->declaration && resultTy->astNode &&
                     resultTy->astNode->name &&
                     !resultTy->astNode->name->parts.empty() &&
-                    (resultTy->headName() == "IEnumerator" ||
-                     resultTy->headName() == "IOwningEnumerator");
+                    common::isSyncIterFormatEnumeratorHead(
+                        resultTy->headName());
                 if (resultIsEnumeratorSentinel && recvTy &&
                         recvTy->kind == sema::TypeRef::Kind::Named &&
                         recvTy->declaration &&
@@ -6277,19 +6286,43 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                 // (kArrayBackedCollections), no matching vtable shape, so
                 // the §8.3 default is direct pointer identity /
                 // bz_obj_identity_hash, not a vtable dispatch.
-                bool isBuiltinIdentityRecv =
+                // narrow #3419: this chain conflated TWO axes of the
+                // enumerable-wrap grid — the declared-head axis and the
+                // source-family axis. Split them rather than inventing one
+                // authority for both (§6b: the split's union is name-for-name
+                // identical to the eight-name chain it replaces, both
+                // directions).
+                bool isBuiltinIdentityHeadCandidate =
                     recvTy && recvTy->kind == K::Named &&
                     !recvTy->declaration && recvTy->astNode &&
                     recvTy->astNode->name &&
-                    !recvTy->astNode->name->parts.empty() &&
-                    (recvTy->headName() == "IEnumerator" ||
-                     recvTy->headName() == "IAsyncEnumerator" ||
-                     recvTy->headName() == "Array" ||
+                    !recvTy->astNode->name->parts.empty();
+                // Declared-head half: the two NON-OWNING iterator-format
+                // ENUMERATOR heads (IEnumerator, IAsyncEnumerator) — routed
+                // onto the shared authority.
+                bool isBuiltinIdentityIterHead =
+                    isBuiltinIdentityHeadCandidate &&
+                    common::isIterFormatEnumeratorHead(recvTy->headName()) &&
+                    !common::isOwningIterableInterfaceHead(recvTy->headName());
+                // Source-family half: NOT routed. This is a THIRD question,
+                // neither `isArrayEnumeratorWrapSourceName` (which ALSO
+                // admits `OwningBuffer` — routing here would silently widen
+                // this identity fallback to OwningBuffer receivers) nor
+                // `isArrayBackedCollectionName` (which additionally admits
+                // `OwningBuffer`/`Set`/`OwningSet`/`SortedSet`/`FrozenArray`).
+                // Left as its own explicit list per the brief's guidance for
+                // a genuinely-third question; see #3683 (filed) for whether
+                // OwningBuffer's absence here is itself a latent gap.
+                bool isBuiltinIdentityArrayFamily =
+                    isBuiltinIdentityHeadCandidate &&
+                    (recvTy->headName() == "Array" ||
                      recvTy->headName() == "OwningArray" ||
                      recvTy->headName() == "Stack" ||
                      recvTy->headName() == "OwningStack" ||
                      recvTy->headName() == "Queue" ||
                      recvTy->headName() == "OwningQueue");
+                bool isBuiltinIdentityRecv =
+                    isBuiltinIdentityIterHead || isBuiltinIdentityArrayFamily;
                 if (isBuiltinIdentityRecv) {
                     llvm::Value* recv = lowerExpr(*ma->target);
                     if (isEqualsCall) {
@@ -6841,14 +6874,17 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                 call.callee.get())) {
             if (ma->member == "MoveNext" && ma->target && call.args.empty()) {
                 const sema::TypeRef* recvTy = ctx_.exprType(*ma->target);
+                // narrow #3419: routed onto the shared enumerable-wrap-grid
+                // authority — the SYNC half of the iterator-format ENUMERATOR
+                // heads (IEnumerator, IOwningEnumerator; §6b: identical
+                // admission set to the two-name literal chain this replaces).
                 bool isBuiltinEnumerator =
                     recvTy &&
                     recvTy->kind == sema::TypeRef::Kind::Named &&
                     !recvTy->declaration &&
                     recvTy->astNode && recvTy->astNode->name &&
                     !recvTy->astNode->name->parts.empty() &&
-                    (recvTy->headName() == "IEnumerator" ||
-                     recvTy->headName() == "IOwningEnumerator");
+                    common::isSyncIterFormatEnumeratorHead(recvTy->headName());
                 if (isBuiltinEnumerator) {
                     llvm::Value* recv = lowerExpr(*ma->target);
                     if (recv && recv->getType()->isPointerTy()) {
@@ -6877,14 +6913,19 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
             if (ma->member == "TakeCurrent" && ma->target &&
                     call.args.empty()) {
                 const sema::TypeRef* recvTy = ctx_.exprType(*ma->target);
+                // narrow #3419: routed onto the shared enumerable-wrap-grid
+                // authorities — the OWNING half of the iterator-format
+                // ENUMERATOR heads (IOwningEnumerator, IOwningAsyncEnumerator;
+                // §6b: identical admission set to the two-name literal chain
+                // this replaces, both directions).
                 bool isOwningEnumerator =
                     recvTy &&
                     recvTy->kind == sema::TypeRef::Kind::Named &&
                     !recvTy->declaration &&
                     recvTy->astNode && recvTy->astNode->name &&
                     !recvTy->astNode->name->parts.empty() &&
-                    (recvTy->headName() == "IOwningEnumerator" ||
-                     recvTy->headName() == "IOwningAsyncEnumerator");
+                    common::isIterFormatEnumeratorHead(recvTy->headName()) &&
+                    common::isOwningIterableInterfaceHead(recvTy->headName());
                 if (isOwningEnumerator) {
                     llvm::Value* recv = lowerExpr(*ma->target);
                     if (recv && recv->getType()->isPointerTy()) {
@@ -7056,14 +7097,19 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
             if (ma->member == "MoveNextAsync" && ma->target &&
                     call.args.empty()) {
                 const sema::TypeRef* recvTy = ctx_.exprType(*ma->target);
+                // narrow #3419: routed onto the shared enumerable-wrap-grid
+                // authorities — the ASYNC half of the iterator-format
+                // ENUMERATOR heads (IAsyncEnumerator, IOwningAsyncEnumerator;
+                // §6b: identical admission set to the two-name literal chain
+                // this replaces, both directions).
                 bool isAsyncEnumerator =
                     recvTy &&
                     recvTy->kind == sema::TypeRef::Kind::Named &&
                     !recvTy->declaration &&
                     recvTy->astNode && recvTy->astNode->name &&
                     !recvTy->astNode->name->parts.empty() &&
-                    (recvTy->headName() == "IAsyncEnumerator" ||
-                     recvTy->headName() == "IOwningAsyncEnumerator");
+                    common::isIterFormatEnumeratorHead(recvTy->headName()) &&
+                    !common::isSyncIterFormatEnumeratorHead(recvTy->headName());
                 if (isAsyncEnumerator) {
                     llvm::Value* recv = lowerExpr(*ma->target);
                     if (recv && recv->getType()->isPointerTy()) {
@@ -7104,14 +7150,19 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                 call.callee.get())) {
             if (ma->member == "GetAsyncEnumerator" && ma->target) {
                 const sema::TypeRef* recvTy = ctx_.exprType(*ma->target);
+                // narrow #3419: routed onto the shared enumerable-wrap-grid
+                // authorities — the ASYNC half of the iterator-format
+                // ENUMERABLE heads (IAsyncEnumerable, IOwningAsyncEnumerable;
+                // §6b: identical admission set to the two-name literal chain
+                // this replaces, both directions).
                 bool isAsyncEnumerable =
                     recvTy &&
                     recvTy->kind == sema::TypeRef::Kind::Named &&
                     !recvTy->declaration &&
                     recvTy->astNode && recvTy->astNode->name &&
                     !recvTy->astNode->name->parts.empty() &&
-                    (recvTy->headName() == "IAsyncEnumerable" ||
-                     recvTy->headName() == "IOwningAsyncEnumerable");
+                    common::isIterFormatEnumerableHead(recvTy->headName()) &&
+                    !common::isSyncIterFormatEnumerableHead(recvTy->headName());
                 if (isAsyncEnumerable) {
                     llvm::Value* src = lowerExpr(*ma->target);
                     if (!src) return nullptr;
@@ -7186,7 +7237,12 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                 {
                     auto* recvTy = ctx_.exprType(*ma->target);
                     std::string_view ebn = builtinTypeName(recvTy);
-                    if (ebn == "IEnumerator" || ebn == "IOwningEnumerator") {
+                    // narrow #3419: routed onto the shared enumerable-wrap-
+                    // grid authority — the SYNC half of the iterator-format
+                    // ENUMERATOR heads (IEnumerator, IOwningEnumerator; §6b:
+                    // identical admission set to the two-name literal chain
+                    // this replaces).
+                    if (common::isSyncIterFormatEnumeratorHead(ebn)) {
                         llvm::Value* obj = lowerExpr(*ma->target);
                         if (obj && obj->getType()->isPointerTy()) {
                             // §28.2 / §29.7: idempotent disposal — a *repeated*
@@ -13730,9 +13786,16 @@ llvm::Value* Emitter::tryBuildOwningEnumeratorForBuiltinSource(
         const ast::Expr* targetExpr, const sema::TypeRef* recvTy) {
     if (!targetExpr || !recvTy) return nullptr;
 
+    // A THIRD question from the grid's source-family axis (#3419 method,
+    // §6 / §6b): neither `isArrayEnumeratorWrapSourceName` (includes the
+    // non-owning Array/Stack/Queue this OWNING-only helper must reject, and
+    // omits OwningSet) nor `isArrayBackedCollectionName` (additionally
+    // Set/SortedSet/FrozenArray) matches this exact 4-name owning-only set.
     auto builtinArrayBackedHead = [](const sema::TypeRef* t) -> bool {
         if (!t || t->kind != sema::TypeRef::Kind::Named) return false;
         std::string_view h = t->headName();
+        // GRID-DEBT: #3419 see the helper's own comment above — a third,
+        // owning-only source-family question left unrouted.
         return h == "OwningArray" || h == "OwningSet" ||
                h == "OwningQueue" || h == "OwningBuffer";
     };

@@ -103,6 +103,27 @@ bool isIterFormatEnumerableHead(std::string_view head);
 // with a synchronous enumerator. // per §29.2 / stdlib §4.12–§4.13, #3419
 bool isSyncIterFormatEnumerableHead(std::string_view head);
 
+// #3419 / §29.2: the four ITERATOR-FORMAT ENUMERATOR heads — `IEnumerator<T>`,
+// `IOwningEnumerator<T>`, `IAsyncEnumerator<T>`, `IOwningAsyncEnumerator<T>`.
+// The complement of `isIterFormatEnumerableHead` within the eight iterator/
+// enumerator heads: an enumerator is what a §29.2 wrap PRODUCES (the
+// MoveNext/Current/TakeCurrent vtable contract), not a declared head a value
+// is coerced TO, so a receiver typed at one of these four is already the
+// vtable-backed object the wrap machinery hands out — routing/dispatch sites
+// (MoveNext, TakeCurrent, MoveNextAsync, explicit Dispose, the declaration-
+// less §8.3 identity-Equals/GetHashCode fallback) ask this question, never
+// the wrap-eligibility one `isIterFormatEnumerableHead` answers.
+// per §29.2, #3419
+bool isIterFormatEnumeratorHead(std::string_view head);
+
+// The SYNCHRONOUS half of `isIterFormatEnumeratorHead` — `IEnumerator<T>` and
+// `IOwningEnumerator<T>`. The async twins (`IAsyncEnumerator<T>`,
+// `IOwningAsyncEnumerator<T>`) take the MoveNextAsync vtable shape and its own
+// dispatch (`LlvmBackend_Async.cpp`), a disjoint lowering path. Exactly
+// analogous to `isSyncIterFormatEnumerableHead` above, which is the sync half
+// of the sibling (Enumerable-format) question. // per §29.2 / §29.3, #3419
+bool isSyncIterFormatEnumeratorHead(std::string_view head);
+
 // fix #3606 / §29.1 / §29.3: the SYNCHRONOUS half of
 // `isOwningIterableInterfaceHead` — `IOwningEnumerable<T>` and
 // `IOwningEnumerator<T>`, the two owning iterator-method return heads whose

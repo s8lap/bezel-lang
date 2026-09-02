@@ -190,6 +190,8 @@ AUTHORITY_HEADER = ROOT / 'src' / 'common' / 'BuiltinRegistry.hpp'
 REQUIRED_AUTHORITIES = (
     'isIterFormatEnumerableHead',
     'isSyncIterFormatEnumerableHead',
+    'isIterFormatEnumeratorHead',
+    'isSyncIterFormatEnumeratorHead',
     'isArrayEnumeratorWrapSourceName',
     'isIterableInterfaceHead',
     'isIteratorFormatDispatchHead',

@@ -133,6 +133,53 @@ BEZEL_TEST(builtin_registry_snapshot, sync_iter_format_enumerable_head_set) {
     for (auto n : kSnapshot) BEZEL_EXPECT_TRUE(isIterFormatEnumerableHead(n));
 }
 
+// --- isIterFormatEnumeratorHead (#3419, §29.2): the ENUMERATOR-format axis,
+//     the complement of isIterFormatEnumerableHead within the eight iterator/
+//     enumerator heads. NOT a migration snapshot — new with this lane's
+//     #3419 residue pass, which retired eight independent two-name copies in
+//     LlvmBackend_Calls2.cpp (MoveNext/TakeCurrent/MoveNextAsync/explicit-
+//     Dispose dispatch and the declaration-less §8.3 identity-Equals/
+//     GetHashCode fallback).
+BEZEL_TEST(builtin_registry_snapshot, iter_format_enumerator_head_set) {
+    static constexpr std::array<std::string_view, 4> kSnapshot = {
+        "IEnumerator", "IOwningEnumerator",
+        "IAsyncEnumerator", "IOwningAsyncEnumerator",
+    };
+    for (auto n : kSnapshot) BEZEL_EXPECT_TRUE(isIterFormatEnumeratorHead(n));
+    // The four ENUMERABLE heads (the sibling axis) and the surrounding
+    // non-iterator heads must stay out.
+    for (std::string_view n : {"IEnumerable", "IOwningEnumerable",
+                               "IAsyncEnumerable", "IOwningAsyncEnumerable",
+                               "IReadOnlyCollection", "IReadOnlyList",
+                               "ICollection", "IList", "IOwningCollection",
+                               "IOwningList", "IGrouping", "Array", ""})
+        BEZEL_EXPECT_FALSE(isIterFormatEnumeratorHead(n));
+    // It is exactly the ENUMERATOR half of the eight-name §28.3 announced set,
+    // and disjoint from isIterFormatEnumerableHead (the two axes partition
+    // the eight-name set).
+    for (auto n : kSnapshot) {
+        BEZEL_EXPECT_TRUE(isIterableInterfaceHead(n));
+        BEZEL_EXPECT_FALSE(isIterFormatEnumerableHead(n));
+    }
+}
+
+BEZEL_TEST(builtin_registry_snapshot, sync_iter_format_enumerator_head_set) {
+    static constexpr std::array<std::string_view, 2> kSnapshot = {
+        "IEnumerator", "IOwningEnumerator",
+    };
+    for (auto n : kSnapshot)
+        BEZEL_EXPECT_TRUE(isSyncIterFormatEnumeratorHead(n));
+    // The ASYNC twins must stay out: they take the MoveNextAsync vtable
+    // shape and its own dispatch (LlvmBackend_Async.cpp), a disjoint
+    // lowering path.
+    for (std::string_view n : {"IAsyncEnumerator", "IOwningAsyncEnumerator",
+                               "IEnumerable", "IOwningEnumerable",
+                               "IReadOnlyList", "IList", "Array", ""})
+        BEZEL_EXPECT_FALSE(isSyncIterFormatEnumeratorHead(n));
+    // The sync pair is a subset of the four-name enumerator-format set.
+    for (auto n : kSnapshot) BEZEL_EXPECT_TRUE(isIterFormatEnumeratorHead(n));
+}
+
 // --- isSyncOwningIterableInterfaceHead (#3606, §29.1/§29.3): the SYNCHRONOUS
 //     half of isOwningIterableInterfaceHead — the two owning iterator-method
 //     RETURN heads (producer side), a different §29 family from the

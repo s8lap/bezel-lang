@@ -15,7 +15,6 @@
 #         Authority: common::isIterFormatEnumerableHead /
 #         isSyncIterFormatEnumerableHead / isIterableInterfaceHead.
 1    src/codegen/LlvmBackend_Async.cpp
-8    src/codegen/LlvmBackend_Calls2.cpp
 1    src/codegen/LlvmBackend_Exprs.cpp
 1    src/codegen/LlvmBackend_Setup.cpp
 2    src/codegen/LlvmBackend_impl.hpp
