@@ -77,17 +77,26 @@
 //     ⚠ If #3541 lands, these programs go LSan-CLEAN and every abandoned row
 //     fails on `EXPECT_FALSE(r.ran)`. That is intended: retire the residue
 //     assertion and assert cleanliness instead.
-//   * Every row asserts a value that DEPENDS ON THE UNBOXED PAYLOAD: the body
-//     yields `x.V + f()` where `f` is the capturing lambda, so a wrong unbox
-//     that happened not to crash still changes the printed sum. #3539's own
-//     repro adds a stronger one — `Cell.n` is bumped by the constructor and
-//     dropped by the destructor, so its printed `0` is dispose-exactly-once
-//     over 200 abandoned rounds.
+//   * WHAT EACH ORACLE ACTUALLY COVERS — stated precisely, because it is easy
+//     to overclaim here. The printed sum is computed inside MoveNext, BEFORE
+//     any Dispose runs, so it cannot witness a wrong Dispose-side unbox. What
+//     it does witness is the MoveNext-side half: the body yields `x.V + f()`
+//     where `f` reads the captured `seq` THROUGH the §27.5 cell, so a wrong
+//     read there changes the number rather than merely crashing. The
+//     Dispose-side half is covered by the other three oracles instead —
+//     generated-code ASan (the wild jump / heap-buffer-overflow faults at the
+//     access), the EXACT residue count (`in 600 allocation(s)`: a dropped or
+//     mis-aimed §29.7 disposal moves it, in either direction), and, in
+//     #3539's own repro, `Cell.n` — bumped by the constructor and dropped by
+//     the destructor, so its printed `0` is a dispose-exactly-once statement
+//     about the abandonment Dispose itself over all 200 rounds.
+//     Each row asserts its FULL stdout, not a substring, so a value cannot
+//     pass by being a prefix of a wrong one.
 //   * Every program amplifies to 200 rounds so no leak can hide as a
 //     still-stack-reachable single allocation.
 //
 // Spec authority: §29.7 *Disposal of partially-consumed iterators*, §27.5
-// *Closures and captured variables*, §28.9 (v0.286).
+// *Closures*, §28.9 *Runtime-managed types* (v0.286).
 // Related: #3539, #3541, #3468, #3500, #3484, #808, #1462.
 
 #include <iostream>
@@ -175,8 +184,8 @@ std::string program(bool useUsingSeq, bool abandon) {
 // `seq.Count()` is 2, so the two yields are 3+2=5 and 4+2=6.
 //   abandoned  : Run() == 5              -> 200 * 5   = 1000
 //   drained    : Run() == 5*100 + 6 = 506 -> 200 * 506 = 101200
-const char* kAbandonedOut = "t=1000";
-const char* kDrainedOut = "t=101200";
+const char* kAbandonedOut = "t=1000\n";
+const char* kDrainedOut = "t=101200\n";
 
 // ── the #3539 shape: a plain `using var` CLASS local captured by a lambda ────
 // No iterator-format value anywhere; the captured local's disposal is the
@@ -223,8 +232,8 @@ std::string usingVarCaptureProgram(bool abandon) {
 
 // abandoned: Run() == 7        -> 200 * 7 = 1400
 // drained  : Run() == 7 + 2    -> 200 * 9 = 1800
-const char* kCaptureAbandonedOut = "t=1400";
-const char* kCaptureDrainedOut = "t=1800";
+const char* kCaptureAbandonedOut = "t=1400\n";
+const char* kCaptureDrainedOut = "t=1800\n";
 
 
 // ── the ASYNC mirror of the #3603 shape ─────────────────────────────────────
@@ -310,11 +319,21 @@ const char* kIssue3539Repro =
     "  end Main;\n"
     "end C;\n";
 
+// `expectStdout` is the program's COMPLETE stdout, compared for equality. A
+// `find()` here would be a weaker pin than it looks: every expected value is a
+// prefix of a wrong one an off-by-a-round or an extra-iteration bug produces
+// (`t=1000` inside `t=10000`, `t=1400` inside `t=14000`).
+void expectStdoutExactly(const JitResult& r, const char* expectStdout) {
+    if (r.stdoutText != expectStdout)
+        std::cout << "    [stdout] " << r.stdoutText;
+    BEZEL_EXPECT_TRUE(r.stdoutText == expectStdout);
+}
+
 void expectRanCleanly(const JitResult& r, const char* expectOut) {
     if (!r.ran) dumpDiagnostics(r);
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
-    BEZEL_EXPECT_TRUE(r.stdoutText.find(expectOut) != std::string::npos);
+    expectStdoutExactly(r, expectOut);
 }
 
 // The abandoned-path oracle: the program computes the right answer, and what
@@ -326,7 +345,7 @@ void expectRanCleanly(const JitResult& r, const char* expectOut) {
 void expectValueAndOnlyThe3541Residue(const JitResult& r,
                                       const char* expectOut,
                                       const char* expectAllocs) {
-    BEZEL_EXPECT_TRUE(r.stdoutText.find(expectOut) != std::string::npos);
+    expectStdoutExactly(r, expectOut);
     BEZEL_EXPECT_FALSE(r.ran);   // LeakSanitizer fired on the #3541 residue
     std::string report;
     for (const auto& d : r.diagnostics.diagnostics()) report += d.message;
@@ -404,19 +423,20 @@ BEZEL_TEST(iter_lambda_captured_iter_format_local_unbox_3603,
     expectRanCleanly(r, kDrainedOut);
 }
 
-// ── #3539's own repro, with its dispose-exactly-once oracle ─────────────────
-// LSan is off (the #3541 residue is 11200 B / 600 here — `Cell` 24 B, closure
-// 40 B, env 16 B per round), but the `Cell.n == 0` line IS a
-// dispose-exactly-once oracle in its own right: it would print 200 if the
-// disposal were dropped and would have crashed if it ran over the cell.
+// ── issue 3539's own repro, with its dispose-exactly-once oracle ───────────
+// LeakSanitizer is ON here, like every other row: the residue is pinned rather
+// than tolerated (11200 B in the same 600 allocations — `Cell` 24 B + closure
+// 40 B + env 16 B per round; the `Cell` is in the set here and the
+// iterator-format wrapper is not, because this shape has no iterator-format
+// local at all). On top of that, `Cell.n == 0` is a dispose-exactly-once
+// oracle in its own right: it would print 200 if the disposal were dropped,
+// and the program would have crashed if the disposal had run over the cell.
 BEZEL_TEST(iter_lambda_captured_iter_format_local_unbox_3603,
            issue_3539_repro_disposes_captured_using_var_exactly_once_27_5) {
     JitResult r = runAotChecked(kIssue3539Repro);
     // "1400" = 200 rounds x the single yielded 7; "0" = every Cell destructed,
     // i.e. the captured `using var` was disposed exactly once on every one of
     // the 200 abandoned rounds. Pre-fix: heap-buffer-overflow in CloneDispose.
-    // The residue here is 11200 B (Cell 24 B + closure 40 B + env 16 B) in the
-    // same 600 allocations.
     expectValueAndOnlyThe3541Residue(r, "1400\n0\n", kResidue3541);
 }
 
