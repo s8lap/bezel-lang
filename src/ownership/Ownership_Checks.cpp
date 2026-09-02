@@ -2089,6 +2089,19 @@ void MethodOwnership::collectIdentifiersInStmt(
             if (ld->initializer) collectIdentifiersIn(*ld->initializer, out);
             return;
         }
+        // fix #3591 (§21.1, v0.286): §21.1's runtime `const` is a SEPARATE AST
+        // node (LocalConstDecl) from `var`'s LocalDecl. Without this arm, an
+        // identifier referenced only inside a `const` local's initializer
+        // inside a lambda body (e.g. `const m := ex.Message;` capturing a
+        // catch-bound `ex`) was never collected as a capture, so the §31.1
+        // "returned closure captures the caught exception" check (and every
+        // other consumer of collectLambdaIdentifiers) silently missed it —
+        // measured: `return lambda() => do const m := ex.Message; return m;
+        // end;` compiled clean where the `var m` spelling correctly rejects.
+        if (auto* lcd = dynamic_cast<const ast::LocalConstDecl*>(&cur)) {
+            if (lcd->value) collectIdentifiersIn(*lcd->value, out);
+            return;
+        }
         if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&cur)) {
             if (as->target) collectIdentifiersIn(*as->target, out);
             if (as->value) collectIdentifiersIn(*as->value, out);
@@ -2504,6 +2517,18 @@ void MethodOwnership::scanCapturedOwnedConsumeStmt(const ast::Stmt& s,
     if (const auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
         if (ld->initializer)
             scanCapturedOwnedConsumeExpr(*ld->initializer, insideLambda);
+        return;
+    }
+    // fix #3591 (§21.1 / §28.3 v0.184, v0.286): §21.1's runtime `const` is a
+    // SEPARATE AST node (LocalConstDecl). Without this arm, a captured-owned
+    // consume inside a `const` local's initializer (`const y := Sink(owned
+    // r);` inside a closure) was never scanned, so the §28.3 v0.184 "cannot
+    // transfer captured owned binding" check never fired — measured: the
+    // identical `var y := Sink(owned r);` form is correctly rejected, while
+    // the `const y := ...` form compiled clean and double-disposed `r` (the
+    // exact #1958 shape, one binding-form later).
+    if (const auto* lcd = dynamic_cast<const ast::LocalConstDecl*>(&s)) {
+        if (lcd->value) scanCapturedOwnedConsumeExpr(*lcd->value, insideLambda);
         return;
     }
     if (const auto* as = dynamic_cast<const ast::AssignmentStmt*>(&s)) {
@@ -4478,6 +4503,23 @@ void MethodOwnership::collectLocalDepthsStmt(const ast::Stmt& s, int depth) {
     forEachNestedStmt(
         s,
         [&](const ast::Stmt& cur, StmtVisitState state) {
+            // #3591 tested: localDepth_'s FOUR readers (checkBorrowStore
+            // Escape, checkCollectionBorrowStoreEscape,
+            // checkIndexerSetBorrowStoreEscape — this file — and
+            // checkBareBorrowLoopCarriedEscape, Ownership.cpp:3730, review-
+            // found) query it ONLY on an owned-tracked/owned-scope-bound
+            // source (via ownedLocalBorrowSource/isOwnedTrackedLocal/
+            // isEscapeBoundLocal) or a mutating-collection/indexer receiver
+            // — never on the assignment TARGET (never `const`, §21.1). A
+            // `const` can never be any of those (§21.1 forbids binding an
+            // owned production or an owning collection), so this map is
+            // never queried on a LocalConstDecl. Verified: `const cur :=
+            // localObj;` (a scope-bound `using var` alias) still misses its
+            // escape check, but for an UNRELATED upstream reason
+            // (borrowSourceForExpr never resolves a const holder's own
+            // source) that reproduces identically with or without this arm
+            // — filed as a new issue, out of this file.
+            // LOCALDECL-ONLY: #3591 see above
             if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&cur)) {
                 localDepth_[ld] = state.depth;
                 return;
@@ -5948,7 +5990,7 @@ void MethodOwnership::joinInto(std::unordered_map<sema::Symbol*, LocalOwnership>
     }
 }
 
-sema::LocalSymbol* MethodOwnership::findLocalSymbol(const ast::LocalDecl& ld) {
+sema::LocalSymbol* MethodOwnership::findLocalSymbol(const ast::Node& ld) {
     // Walk all collected symbols and find the LocalSymbol whose
     // decl matches. Sema slice 3b created these on demand.
     for (const auto& s : ctx_.symbols()) {
@@ -6243,6 +6285,30 @@ void MethodOwnership::collectBorrowUsesStmt(const ast::Stmt& s) {
         // plain args, so consuming a contributing source while the result is live
         // must freeze exactly as a live span over that source does.
         collectBareTypeParamCallBorrowSource(*ld);
+        return;
+    }
+    // fix #3591 (§28.3 v0.180 #1741, v0.286): §21.1's runtime `const` is a
+    // SEPARATE AST node (LocalConstDecl). §21.1 explicitly admits a `const`
+    // binding a borrow ("the binding is then a borrow carrying the
+    // initializer's source-liveness constraints, exactly as a plain unmarked
+    // `var` alias"), so a borrow read inside a `const` local's initializer
+    // must feed the SAME consume-site-freeze liveness pre-scan a `var`'s does.
+    // Without this arm the read was never recorded — measured: `var y := w;
+    // using var w2 := move w; const z := y.V;` (a later USE of `y`, the
+    // holder of `w`, via a `const`) compiled clean where the identical `var
+    // z := y.V;` form correctly freezes the `move w` with "the borrow held
+    // by `y` is still live" (§28.3/§28.7/§30.14 v0.180).
+    //
+    // Scope (recorded, not fixed here): `collectRecordBorrowSource` /
+    // `collectBareTypeParamCallBorrowSource` take `const ast::LocalDecl&`
+    // specifically (record-typed / bare-type-param-result locals) — #3427
+    // already found the shape of a live gap that pattern would close (a
+    // `const` bound to a borrow-bearing RECORD/choice value, e.g. `const rec
+    // := MakeRecord(span);`, is §21.1-admissible and plausibly under-tracked
+    // the same way) but widening those two additionally is unverified here;
+    // filed as a follow-up (issue in this lane's report) rather than guessed.
+    if (auto* lcd = dynamic_cast<const ast::LocalConstDecl*>(&s)) {
+        if (lcd->value) recordBorrowUseExpr(*lcd->value);
         return;
     }
     if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(&s)) {
@@ -8875,7 +8941,31 @@ bool MethodOwnership::awaitOperandIsOwningLocation(
             // `var t := producer()` is a LocalDecl WITH an initializer — NOT an
             // owning location.
             const auto* ld = dynamic_cast<const ast::LocalDecl*>(ls->decl);
-            if (!ld) return true;            // iteration variable (or similar)
+            if (!ld) {
+                // fix #3591 (§21.1 / §30.5, v0.286): §21.1's runtime `const` is
+                // a SEPARATE AST node (LocalConstDecl) from `var`'s LocalDecl,
+                // so it also fails the cast above and used to fall into the
+                // "iteration variable (or similar)" catch-all — unconditionally
+                // ADMITTED regardless of what the const's initializer actually
+                // is. §21.1 forbids a `const` from ever binding a fresh
+                // Task-family MINT (an owned production), so an admitted
+                // const-bound Task<T> operand can only be a borrowed ALIAS —
+                // recurse through its initializer exactly as the `var t2 := t;`
+                // alias case below does, instead of assuming admission. Measured:
+                // `const t := arr[0]; await t;` over a non-owning `Array<Task<
+                // Res>>` (not an owning-collection slot, so indexerSetterTakes
+                // Owned is false) wrongly compiled clean where the identical
+                // `var t := arr[0]; await t;` form is correctly rejected
+                // ("awaiting a class-typed `Task<T>` (Pattern A) requires...").
+                if (const auto* lcd =
+                        dynamic_cast<const ast::LocalConstDecl*>(ls->decl)) {
+                    if (lcd->value && depth < 64)
+                        return awaitOperandIsOwningLocation(*lcd->value,
+                                                            depth + 1);
+                    return false;
+                }
+                return true;            // iteration variable (or similar)
+            }
             if (!ld->initializer) return true;  // `var t: Task<T>;` slot, owned by scope
             // SB01-C1 (§30.5 "A reference to a plain owned local of static type
             // `Task<T>`", v0.184 resolving #1533; the caller-side v0.190 SB-01
@@ -9120,9 +9210,22 @@ void MethodOwnership::collectOwnedConsumingAwaitsStmt(
     // gates on kind: only the kinds that ARE owned-consuming positions
     // contribute to `out`.
     forEachNestedStmt(s, [&](const ast::Stmt& cur) {
+        // `using var x := await ...`, `await using var x := await ...`,
+        // and plain `var x := await ...` are all owned-consuming (§30.5).
+        // #3591 tested: `out` (the Pattern-B "owned-consuming" set) is
+        // consulted ONLY by checkAwaitSitesExpr's `AwaitTaskKind::PatternB`
+        // arm, and `OwningTask<T>` is declared `where T: class` (§30.3's own
+        // grammar block: "public class OwningTask<T>: Task where T:
+        // class"), so every Pattern B await unwraps a CLASS-typed owned
+        // production — categorically §21.1-rejected for `const` ("must not
+        // take an owned production") before this dataflow ever runs. Already
+        // pinned by an existing test: await_site_stmt_walk_3074_test.cpp's
+        // `const_bind_of_pattern_b_await_rejected_21_1` asserts `const c :=
+        // await p.MakeOwned();` is rejected with that exact §21.1 message,
+        // and that fix's own comment records the CaseStmt arm was added
+        // deliberately WITHOUT a LocalConstDecl one for this reason.
+        // LOCALDECL-ONLY: #3591 see above
         if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&cur)) {
-            // `using var x := await ...`, `await using var x := await ...`,
-            // and plain `var x := await ...` are all owned-consuming (§30.5).
             if (ld->initializer)
                 if (auto* a = awaitRoot(*ld->initializer)) out.insert(a);
             return;
@@ -9749,6 +9852,14 @@ bool MethodOwnership::deferredActivationArgIsPlainRefParam(
 // its real owner outlives the enclosing frame. // per §28.3 v0.196
 bool MethodOwnership::localIsOwnedObligation(const sema::LocalSymbol* ls) const {
     if (!ls) return false;
+    // #3591 tested: a `const` local can never be an owned obligation (§21.1:
+    // "never takes a disposal obligation") — it can't be `using`, can't
+    // `becomesOwnedViaReassign` (single-assignment, never reassigned at all),
+    // and `ls->autoDropAtScopeEnd` (the fallback below) is set only by
+    // Ownership.cpp's affine-auto-drop / `out owned` machinery, neither of
+    // which ever fires for a const-backed symbol. So the `!ld` fallback
+    // already returns the correct answer (false) for a LocalConstDecl.
+    // LOCALDECL-ONLY: #3591 see above
     if (const auto* ld = dynamic_cast<const ast::LocalDecl*>(ls->decl)) {
         if (ld->isUsing) return !ld->usingVarSourceIsBorrow;
         return ld->autoDropAtScopeEnd || ld->becomesOwnedViaReassign;
@@ -10024,6 +10135,26 @@ void MethodOwnership::checkDeferredActivationTempSitesStmt(
     if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
         if (ld->initializer)
             checkDeferredActivationTempSitesExpr(*ld->initializer, true);
+        return;
+    }
+    // fix #3591 (§28.3 / stdlib §5 #1917/#1915, v0.286): §21.1's runtime
+    // `const` is a SEPARATE AST node (LocalConstDecl). checkDeferredActivation
+    // TempSitesExpr is a general recursive walker — its per-CallExpr checks
+    // (checkLazySelectMintingSelector / checkMinMaxMintingSelector /
+    // checkBorrowingTaskArrayLiteral) fire on EVERY CallExpr reached, not just
+    // an "escaping" top-level one — so a `const` statement whose initializer
+    // is itself §21.1-admissible (a value type, e.g. `.Count()`/`.Sum()`) but
+    // CONTAINS a nested minting-selector call was never walked into at all.
+    // Measured: `const n := items.Select(lambda(x) => new Box(x)).Count();`
+    // compiled clean (leaking one Box per element) where the identical `var n
+    // := ...` form is correctly rejected ("a lazy `Select` selector that
+    // mints a fresh owned value per element..."). `escaping` is passed `true`
+    // to match the LocalDecl arm above; §21.1 forbids a `const` from ever
+    // binding a top-level minting call itself, so that half of the escaping
+    // gate stays structurally unreachable here — only the unconditional
+    // per-CallExpr checks are newly reached, which is the actual gap.
+    if (auto* lcd = dynamic_cast<const ast::LocalConstDecl*>(&s)) {
+        if (lcd->value) checkDeferredActivationTempSitesExpr(*lcd->value, true);
         return;
     }
     if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(&s)) {
@@ -10851,6 +10982,17 @@ void MethodOwnership::annotateSuspendLocals(const flow::CFG& cfg) {
         if (flow::CFG::hasAwaitSites(order[idx])) lastAwaitIdx = idx;
     for (idx = 0; idx <= lastAwaitIdx && idx < order.size(); ++idx) {
         for (const ast::Stmt* st : order[idx]->stmts) {
+            // #3591 tested: suspendLocalDecls_ feeds ONLY handleLocalDecl's
+            // owned-local "dispose on every completion path across a
+            // suspend" annotation (see this function's own header comment) —
+            // a `const` local is never owned/disposed (§21.1), so it needs
+            // no such annotation; codegen's frame-storage layout for values
+            // live across a suspend is a separate mechanism this set does
+            // not gate. Verified: a `const` declared before an `await` and
+            // read after resume (`const x := 41; var y := await t; return x
+            // + y;`) correctly survives the suspend and prints the right
+            // value with no leak/corruption, with or without this arm.
+            // LOCALDECL-ONLY: #3591 see above
             if (auto* ld = dynamic_cast<const ast::LocalDecl*>(st))
                 suspendLocalDecls_.insert(ld);
         }
@@ -10871,6 +11013,24 @@ const ast::LocalDecl* MethodOwnership::awaitedOwnedTaskLocalRoot(
     if (!id) return nullptr;
     auto* ls = dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*id));
     if (!ls || ls->isUsing) return nullptr;
+    // #3591 review follow-up: the ORIGINAL note here ("a const can never be
+    // the root, definitionally") was a non-sequitur for THIS use — this cast
+    // is on the CURRENT HOP of the alias chain (`id`), not the eventual
+    // root, so a const-bound intermediate hop (`var t := Producer(); const
+    // t2 := t; await t2;`) genuinely stops the walk here without reaching
+    // `t`. Measured, this does NOT diverge from `var t2 := t;`: the caller
+    // (`collectBorrowAwaitedOwnedTaskDecls_`'s consumer, the endState hard-
+    // reject gate ~Ownership.cpp:949) ORs this function's result with a
+    // SEPARATE, alias-independent check — `declInitializerIsOwnedTaskMint`
+    // (Ownership.cpp:952, this file's own SB01-D2 below) — which inspects
+    // `t`'s OWN initializer directly and admits the auto-drop "whether or
+    // not it is ever awaited" (that function's own comment). So `t` stays
+    // protected through `t2` regardless of whether this alias-walk reaches
+    // it, and the const/var spellings give an identical diagnostic. This is
+    // a REAL independent safety net, not evidence the recursion gap here is
+    // harmless in general — if `declInitializerIsOwnedTaskMint` is ever
+    // narrowed, this site should be re-triaged.
+    // LOCALDECL-ONLY: #3591 see above
     auto* ld = dynamic_cast<const ast::LocalDecl*>(ls->decl);
     if (!ld || !ld->initializer) return nullptr;
     // A bare-identifier initializer is a borrowed alias — follow it to the
@@ -12090,6 +12250,28 @@ bool MethodOwnership::suspSourceIsFrameResident(const ast::Expr& init) {
             if (ld->initializer &&
                 producerState(*ld->initializer) == OwnershipState::Owned)
                 return true;
+        // fix #3591 review follow-up (§21.1, v0.286): a `const` local at the
+        // ROOT of an alias chain that is itself NOT a borrow-bearing
+        // record/span (so walkSuspStmts never registered it in suspCands_
+        // above) still needs its OWN classification recursed through —
+        // exactly the `var t2 := t;` alias recursion §21.1 says a `const`
+        // gets "exactly as a plain unmarked var alias" gets. Measured: `using
+        // var buf := new OwningBuffer<int>(4); const sp := buf.AsSpan(); var
+        // sp2 := sp; await ...; return sp2.Length;` FALSELY REJECTED
+        // ("borrow's source is not frame-resident") before this arm, because
+        // `sp`'s own `ls->decl` is a LocalConstDecl and fell straight to the
+        // `return false` below with no recursion — where the identical `var
+        // sp := buf.AsSpan();` twin is accepted (walkSuspStmts's LocalDecl
+        // registration arm calls this same function on `buf.AsSpan()`
+        // directly, which resolves via `identifierRoot` to the using-var
+        // `buf` and returns true two lines above `ls->isUsing`). A `const`
+        // whose OWN value is itself a fresh non-frame-resident source (e.g.
+        // a caller-side field/parameter chain) still correctly falls through
+        // to `return false` at the bottom of the recursive call — this arm
+        // only restores the alias-recursion `var` already had, not a wider
+        // admission.
+        if (auto* lcd = dynamic_cast<const ast::LocalConstDecl*>(ls->decl))
+            if (lcd->value) return suspSourceIsFrameResident(*lcd->value);
         return false;
     }
     // `this`, a field reached through `this`, or a module/global — caller-side.
@@ -12318,9 +12500,36 @@ void MethodOwnership::walkSuspStmts(
             if (exprContainsAwait(incs->target.get())) markCrossed(s);
             continue;
         }
+        // fix #3591 review follow-up (§21.1, v0.286): a `const` local of
+        // borrow-bearing record/span type was never REGISTERED as a
+        // suspension candidate at all (only its reads/await-crossing were
+        // scanned) — so a DIRECT read of a const-bound span after a
+        // suspension was never checked against its source's frame residency,
+        // and any const-rooted alias chain had no transitive suspCands_
+        // entry to inherit from. §21.1: "the binding is then a borrow
+        // carrying the initializer's source-liveness constraints, exactly as
+        // a plain unmarked `var` alias" — mirrors the `var` registration arm
+        // above verbatim (a `const` can never be `using`, so the `!ld->
+        // isUsing` guard there is unconditionally true here).
         if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(s)) {
             checkReads(lc->value.get());
-            if (exprContainsAwait(lc->value.get())) markCrossed(s);
+            if (lc->value && exprContainsAwait(lc->value.get())) markCrossed(s);
+            if (sema::LocalSymbol* ls = findLocalSymbol(*lc)) {
+                const sema::TypeRef* lt =
+                    ls->declType
+                        ? ls->declType
+                        : (lc->value ? ctx_.exprType(*lc->value) : nullptr);
+                if (isBorrowBearingRecordOrSpan(lt)) {
+                    SuspCandidate c;
+                    c.name = lc->name;
+                    c.frameResident =
+                        lc->value && suspSourceIsFrameResident(*lc->value);
+                    suspCands_[ls] = c;
+                    suspInScope_.insert(ls);
+                    declaredHere.push_back(ls);
+                    crossed.erase(ls);  // a fresh binding has not yet crossed
+                }
+            }
             continue;
         }
         if (auto* ys = dynamic_cast<const ast::YieldStmt*>(s)) {
@@ -13065,8 +13274,15 @@ MethodOwnership::ScopedBound MethodOwnership::chainHeadRec(const ast::Expr* e) {
         if (symIsOwnedField(sym)) return {K::This, nullptr};
         // A `using var`/`await using var` local chain head (form 4 with a
         // local head, and the form-5 receiver).
+        //
+        // #3591 tested: this cast is doubly-guarded by `ls->isUsing` — a
+        // `const` local is never `using`/`await using` (§21.1: a different
+        // keyword and a different, never-owned binding form), so `ls->isUsing`
+        // is always false for a LocalConstDecl-backed symbol and this cast is
+        // never reached for one, regardless of this arm.
         if (auto* ls = dynamic_cast<sema::LocalSymbol*>(sym))
             if (ls->isUsing)
+                // LOCALDECL-ONLY: #3591 see above
                 if (auto* ld = dynamic_cast<const ast::LocalDecl*>(ls->decl))
                     return {K::UsingLocal, ld};
         return {};  // plain local, parameter, static — no bound
@@ -15139,6 +15355,23 @@ void MethodOwnership::checkCallBoundedTaskSettlement(
             }
             return;
         }
+        // fix #3591 (§28.14 v0.179, v0.286): §21.1's runtime `const` is a
+        // SEPARATE AST node (LocalConstDecl). `processValueExpr`'s `await`
+        // branch is how a pending call-bounded-task item gets DISCHARGED
+        // (`dischargeAwaitOperand`) when the await is bound to a name, not
+        // just consumed bare — without this arm a `const r := await t;` never
+        // discharged `t`'s open item. Measured: `var t := cb(); const r :=
+        // await t;` falsely rejected with "the task minted by invoking
+        // call-bounded parameter `cb` here is not awaited to settlement"
+        // where the identical `var r := await t;` form correctly discharges
+        // it and compiles clean.
+        if (auto* lcd = dynamic_cast<const ast::LocalConstDecl*>(&s)) {
+            if (lcd->value) {
+                sema::LocalSymbol* ls = findLocalSymbol(*lcd);
+                processValueExpr(*lcd->value, open, ls);
+            }
+            return;
+        }
         if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&s)) {
             if (as->op != ":=" || !as->target) return;
             // A FIELD may be referenced bare (no `this.` qualifier) and so
@@ -15584,6 +15817,24 @@ void MethodOwnership::taskScopeUsageScanStmt(const ast::Stmt& s,
                                    sawDelegation);
         return;
     }
+    // fix #3591 (stdlib §6.10 v0.175, v0.286): §21.1's runtime `const` is a
+    // SEPARATE AST node (LocalConstDecl). A TaskScope itself can never be
+    // `const`-bound (§21.1 forbids binding its fresh `new TaskScope()` mint),
+    // but this statement-wide scan is looking for OTHER statements that
+    // reference the scope BY NAME — a delegating call argument or an `await
+    // <name>.Join()` — which a `const`-bound statement can perfectly well
+    // contain (e.g. `const x := Helper(scope);`). Without this arm such a
+    // statement was never scanned. Measured: `const x := Prog.Helper(scope);`
+    // (delegating `scope` as a plain call argument, the exact §6.10
+    // "delegation" admission) falsely rejected with "`await scope.Join()` is
+    // missing on the normal path" where the identical `var x := ...` form is
+    // correctly recognized as delegation and compiles clean.
+    if (auto* lcd = dynamic_cast<const ast::LocalConstDecl*>(&s)) {
+        if (lcd->value)
+            taskScopeUsageScanExpr(*lcd->value, name, sawAwaitJoin,
+                                   sawDelegation);
+        return;
+    }
     if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(&s)) {
         if (es->expr)
             taskScopeUsageScanExpr(*es->expr, name, sawAwaitJoin,
@@ -15711,6 +15962,37 @@ void MethodOwnership::checkTaskScopeConsumption(
             }
             return;
         }
+        // fix #3591 review follow-up (stdlib §6.10 v0.175, v0.286): a
+        // `const` local is NEVER `using`/`await using` (a different keyword,
+        // §21.1) — so a TaskScope-typed `const` (whether a fresh `new
+        // TaskScope()` mint, itself already rejected on a DIFFERENT ground
+        // by the §21.1 owned-production check, or a bare BORROW alias of an
+        // existing scope, `const s2 := scope;`) is unconditionally in the
+        // "wrong binding form" bucket the `var` sibling arm rejects two
+        // arms up. Measured: `const s2 := scope;` alongside a correctly
+        // `await`-joined `scope` compiled CLEAN before this arm, where the
+        // identical `var s2 := scope;` form was already correctly rejected
+        // ("TaskScope bound to a plain `var`") — mirror that rejection here
+        // rather than silently admitting a second, unchecked name for the
+        // same scope object (stdlib §6.10 names `await using` as the SOLE
+        // consuming form; a const alias creates no new obligation but its
+        // very existence is the form violation the existing rule already
+        // polices for every non-await-using spelling).
+        if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(&s)) {
+            const bool isTS =
+                (lc->type && typeRefIsTaskScope(ctx_.resolvedType(*lc->type))) ||
+                (lc->value && exprTypeIsTaskScope(*lc->value));
+            if (isTS) {
+                report(Severity::Error, lc->span.begin,
+                       std::string("`") + std::string(lc->name) +
+                           "` is a TaskScope bound to a `const` — a "
+                           "TaskScope may only be consumed by `await using` "
+                           "(stdlib §6.10, v0.175); a `const` alias creates "
+                           "a second unchecked name for the same scope and "
+                           "cannot await the drain of its children");
+            }
+            return;
+        }
         if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(&s)) {
             if (ds->value && exprTypeIsTaskScope(*ds->value)) {
                 report(Severity::Error, ds->value->span.begin,
@@ -15828,9 +16110,16 @@ void MethodOwnership::handleMarkedArmTransfer(const ast::MarkedTransferExpr& mt)
             "v0.209)");
         return;
     }
+    // #3591 tested: unreachable for a `const` — the early `st->state !=
+    // OwnershipState::Owned` return above already rejects the marker for
+    // ANY non-Owned-state symbol, and a `const` local's state can never BE
+    // OwnershipState::Owned (§21.1: "never takes a disposal obligation" —
+    // no producer/dataflow path ever marks a const-backed symbol Owned), so
+    // this line is only ever reached with `sym` already known-Owned, which a
+    // LocalConstDecl-backed symbol structurally cannot be.
     auto* ls = dynamic_cast<sema::LocalSymbol*>(sym);
-    const ast::LocalDecl* ld =
-        ls ? dynamic_cast<const ast::LocalDecl*>(ls->decl) : nullptr;
+    // LOCALDECL-ONLY: #3591 see above
+    const ast::LocalDecl* ld = ls ? dynamic_cast<const ast::LocalDecl*>(ls->decl) : nullptr;
     const bool classValued =
         ls && ls->declType &&
         ls->declType->kind == sema::TypeRef::Kind::Named &&
@@ -15989,7 +16278,14 @@ void MethodOwnership::processMarkedArmConstruct(const ast::Expr& e) {
         // §28.3 (#1900): arm-transfer-consumed re-poisons a previously-
         // restored local, mirroring markMovedByName.
         definitelyRestoredLocals_.erase(sym);
+        // #3591 tested: `sym` here ranges only over `consumedCount`, built
+        // exclusively from `armTransferConsumed_` entries pushed by
+        // handleMarkedArmTransfer (this file) — and THAT function only ever
+        // pushes a symbol whose `st->state == OwnershipState::Owned` at the
+        // marker (see its own LOCALDECL-ONLY note). A `const`-backed symbol's
+        // state can never be Owned (§21.1), so `sym` can never be one here.
         if (auto* ls = dynamic_cast<sema::LocalSymbol*>(sym))
+            // LOCALDECL-ONLY: #3591 see above
             if (auto* ld = dynamic_cast<const ast::LocalDecl*>(ls->decl))
                 const_cast<ast::LocalDecl*>(ld)->dischargedByArmTransfer =
                     true;

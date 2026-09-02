@@ -2299,7 +2299,13 @@ private:
     // `states_` (which the caller has set to the block's entry state).
     void processBlock(const flow::CFGBlock& block);
 
-    sema::LocalSymbol* findLocalSymbol(const ast::LocalDecl& ld);
+    // fix #3591 (§21.1, v0.286): widened from `const ast::LocalDecl&` to
+    // `const ast::Node&` — the body only ever compares `ls->decl == &ld` by
+    // pointer identity, never reads a LocalDecl-specific field, so admitting
+    // a `LocalConstDecl` (or any other decl-anchor node, e.g. a `BindClause`)
+    // is safe by construction; every existing call site passes a
+    // `LocalDecl&`, which upcasts implicitly, so this is source-compatible.
+    sema::LocalSymbol* findLocalSymbol(const ast::Node& ld);
 
     // §29.2 (#834): seed the iteration variable of `fs` as Owned at the loop
     // body entry when its iterable resolves to an owning enumerable, so the
