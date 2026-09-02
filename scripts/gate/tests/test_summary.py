@@ -843,9 +843,17 @@ class FormatFailureBannerTest(unittest.TestCase):
         # the real culprit (the test that ran and FAILED) alongside the
         # preserved last-[RUN] attribution. The new line is conditional and
         # byte-identical for the common no-FAIL case (#3018 byte-stability pin).
+        #
+        # fix #3668: the shard here is a GENUINE crash — it is in
+        # missing_summary_shards, i.e. it printed no completion summary, so its
+        # last [ RUN ] really may be where it died. The fixture used to pass an
+        # EMPTY missing_summary_shards, which describes a shard that COMPLETED
+        # its slice; that case now takes the "completed its slice" wording (see
+        # test_completed_shard_with_a_fail_does_not_get_a_died_on_line). Making
+        # the fixture say what its name claims is the whole update.
         out = summary.format_failure_banner(
             ran=8, expected=10, nbin=1, undercount_bins=[],
-            subset_empty=False, missing_summary_shards=[], njobs=2,
+            subset_empty=False, missing_summary_shards=["sema/5"], njobs=2,
             crashed_culprits=[("sema/5", "sema_zero_one_reject_1424.last_one")],
             crashed_log_failures=[("sema/5", ["sema_other.actual_failure"])])
         self.assertIn("died on: sema_zero_one_reject_1424.last_one", out)
@@ -873,6 +881,123 @@ class FormatFailureBannerTest(unittest.TestCase):
             crashed_culprits=[("sema/5", "sema_zero_one_reject_1424.last_one")])
         self.assertIn("died on: sema_zero_one_reject_1424.last_one", out)
         self.assertNotIn("actual FAIL:", out)
+
+
+class CompletedShardNotADiedOnVictimTest(unittest.TestCase):
+    """fix #3668: a shard that RAN ITS WHOLE SLICE and exited nonzero because
+    one test FAILED must not stamp its last (passing) test as `died on:`.
+
+    Measured shape (Run 10 cycle-1 ASan gate at a9ca834, shard module/7):
+    RUN=190, OK=189, FAIL=1, a printed `189 passed, 1 failed` summary and a
+    SHARD_ELAPSED marker — a shard that completed, not one that died. The
+    banner nevertheless printed
+    `died on: xmod_with_replacement_type_3177....`, arbitration turned that
+    `died on:` into a suspect, re-ran the (passing) suite five times under
+    ASan and stamped an innocent test FLAKY.
+
+    The distinguishing fact is one account() already computes: a shard that
+    printed no completion summary is in `missing_summary_shards`; a shard that
+    completed is not. The banner is the consumer that must read it —
+    `extract_crash_culprit`'s last-[ RUN ] contract (#1608) is untouched.
+    """
+
+    # The measured names, kept verbatim so the pin reads as the incident.
+    INNOCENT = ("xmod_with_replacement_type_3177."
+                "imported_positional_record_with_target_is_type_checked_9_5")
+    REAL = ("xmod_abstract_class_indexer_unoverridden_row12."
+            "cross_module_indexer_row12")
+
+    def _banner(self, missing):
+        return summary.format_failure_banner(
+            ran=1522, expected=1523, nbin=6,
+            undercount_bins=["module: ran 1522 of 1523 registered"],
+            subset_empty=False, missing_summary_shards=missing, njobs=48,
+            crashed_culprits=[("module/7", self.INNOCENT)],
+            crashed_log_failures=[("module/7", [self.REAL])])
+
+    def test_completed_shard_with_a_fail_does_not_get_a_died_on_line(self):
+        out = self._banner(missing=[])
+        # The false accusation is gone...
+        self.assertNotIn("died on:", out)
+        self.assertNotIn(self.INNOCENT, out)
+        # ...and the shard line names the test that actually failed.
+        self.assertIn("##   shard module/7 exited nonzero — completed its "
+                      "slice; actual FAIL: " + self.REAL, out)
+
+    def test_crashed_shard_with_a_fail_keeps_both_lines(self):
+        # The shard that genuinely died (no completion summary) is unchanged:
+        # `died on:` is still emitted, because for a real crash the last
+        # [ RUN ] victim CAN be the culprit and arbitration must still see it
+        # (arbitration.py deliberately arbitrates died-on victims).
+        out = self._banner(missing=["module/7"])
+        self.assertIn("##   shard module/7 exited nonzero — died on: "
+                      + self.INNOCENT, out)
+        self.assertIn("##   shard module/7 actual FAIL: " + self.REAL, out)
+
+    def test_completed_shard_without_a_fail_keeps_died_on(self):
+        # LOUD -> QUIET is a rejected trade: a shard that completed its slice
+        # and STILL exited nonzero with no [ FAIL ] line (a teardown exit(70),
+        # an atexit abort) has no real culprit to name, so the last-[ RUN ]
+        # attribution stays — it is the only marker arbitration would have.
+        out = summary.format_failure_banner(
+            ran=1523, expected=1523, nbin=6, undercount_bins=[],
+            subset_empty=False, missing_summary_shards=[], njobs=48,
+            crashed_culprits=[("module/7", self.INNOCENT)],
+            crashed_log_failures=[("module/7", [])])
+        self.assertIn("died on: " + self.INNOCENT, out)
+
+    def test_load_bearing_literals_survive(self):
+        # The banner header + the 'shard crash / undercount' literal
+        # (gate_full_cycle.sh:79, gate.sh:106) are unaffected by the rewording.
+        out = self._banner(missing=[])
+        self.assertIn("## GATE FAILURE: shard crash / undercount — result is "
+                      "NOT trustworthy", out)
+        self.assertIn("##   shard module/7 exited nonzero", out)
+
+    def test_two_shards_one_completed_one_crashed(self):
+        # Mixed run: only the completed shard is reworded; the crashed one is
+        # byte-identical to today, so a real crash is never quietened.
+        out = summary.format_failure_banner(
+            ran=100, expected=200, nbin=2, undercount_bins=[],
+            subset_empty=False, missing_summary_shards=["codegen/3"], njobs=16,
+            crashed_culprits=[("module/7", self.INNOCENT),
+                              ("codegen/3", "codegen_x.victim")],
+            crashed_log_failures=[("module/7", [self.REAL]),
+                                  ("codegen/3", ["codegen_y.real"])])
+        self.assertIn("##   shard module/7 exited nonzero — completed its "
+                      "slice; actual FAIL: " + self.REAL, out)
+        self.assertIn("##   shard codegen/3 exited nonzero — died on: "
+                      "codegen_x.victim", out)
+        self.assertIn("##   shard codegen/3 actual FAIL: codegen_y.real", out)
+        # Exactly ONE died-on line survives — the crashed shard's.
+        self.assertEqual(sum(1 for ln in out.splitlines() if "died on:" in ln),
+                         1)
+
+    def test_cli_end_to_end_from_a_real_completed_shard_log(self):
+        # The whole path run_parallel actually walks: a real shard log with
+        # every [ RUN ] terminated, one [ FAIL ], and a completion summary.
+        # --missing-summary is empty (the shard wrote its summary), so the CLI
+        # must reach the same verdict as the formatter above.
+        import subprocess
+        with tempfile.TemporaryDirectory() as d:
+            _write_log(d, "module", 7,
+                       "[ RUN  ] {r}\n[ FAIL ] {r} (12 ms)\n"
+                       "[ RUN  ] {i}\n[  OK  ] {i} (7 ms)\n"
+                       "189 passed, 1 failed (shard 7/8), 1523 total\n"
+                       "SHARD_ELAPSED 30.85\n".format(r=self.REAL,
+                                                       i=self.INNOCENT))
+            env = dict(os.environ)
+            root = os.path.join(os.path.dirname(__file__), "..", "..")
+            env["PYTHONPATH"] = root
+            out = subprocess.run(
+                [sys.executable, "-m", "gate.summary", "format-failure",
+                 "--ran", "1522", "--expected", "1523", "--nbin", "1",
+                 "--njobs", "8", "--crashed", "module/7", "--logdir", d],
+                capture_output=True, text=True, env=env, cwd=root)
+            self.assertEqual(out.returncode, 0, out.stderr)
+            self.assertNotIn("died on:", out.stdout)
+            self.assertIn("completed its slice; actual FAIL: " + self.REAL,
+                          out.stdout)
 
 
 class FormatCLITest(unittest.TestCase):

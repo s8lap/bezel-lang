@@ -669,6 +669,19 @@ def format_failure_banner(ran, expected, nbin, undercount_bins, subset_empty,
     emitted — the new line is conditional, so the existing banner is
     byte-identical for the common no-FAIL case.
 
+    fix #3668: a shard that COMPLETED its slice (it wrote a summary, so it is
+    NOT in `missing_summary_shards`) and exited nonzero WITH a `[ FAIL ]` did
+    not die on anything — it ran every test and one of them failed. For that
+    shard the banner emits ONE line naming the real failure and NO `died on:`
+    line at all, because `died on:` is exactly what arbitration.py turns into
+    a re-run suspect (`parse_crashed`), and the last [ RUN ] of a completed
+    shard is a PASSING test. Every other shape is unchanged: a shard with no
+    completion summary keeps both lines (for a real crash the last-[ RUN ]
+    victim CAN be the culprit), and a completed shard with NO `[ FAIL ]` keeps
+    its `died on:` line — silencing that one would leave arbitration with no
+    marker at all, i.e. the return-2/distrust path, which is not an
+    improvement on a false accusation.
+
     `timed_out_shards` (optional, narrow #3222) is the list of shard_ids that
     account() reclassified as ceiling-killed (rc in {124,137} AND elapsed
     near BEZEL_SHARD_TIMEOUT). They are surfaced as a SEPARATE block BEFORE
@@ -728,7 +741,29 @@ def format_failure_banner(ran, expected, nbin, undercount_bins, subset_empty,
         for sid, fs in crashed_log_failures:
             if fs:
                 failures_by_id[sid] = fs
+    # fix #3668: a shard that COMPLETED its slice did not "die on" anything.
+    # missing_summary_shards is account()'s own record of which shards printed
+    # no completion summary, so `shard_id not in no_summary` IS the completed
+    # signal — no second, drifting spelling of a decision account() makes.
+    no_summary = set(missing_summary_shards or ())
     for shard_id, culprit in crashed_culprits:
+        completed_fails = failures_by_id.get(shard_id)
+        if completed_fails and shard_id not in no_summary:
+            # The measured #3668 shape: the shard ran every test (RUN==OK+FAIL)
+            # and printed its summary, then exited nonzero because ONE test
+            # FAILED. Its last [ RUN ] is simply the last test in the slice —
+            # a PASSING one — and printing that as `died on:` made
+            # arbitration.py:parse_crashed adopt an innocent suite as a
+            # suspect, re-run it 5x under ASan and stamp it FLAKY. Name the
+            # test that actually failed and emit NO `died on:` line: the
+            # `[ FAIL ]` marker arbitration needs is still in the same log
+            # (run_parallel.sh:317-322 prints it under `--- failing tests ---`
+            # from the very lines this list was harvested from), so invariant 4
+            # (no marker => return 2 => distrust) is untouched.
+            lines.append("##   shard %s exited nonzero — completed its slice; "
+                         "actual FAIL: %s"
+                         % (shard_id, " ".join(completed_fails)))
+            continue
         lines.append("##   shard %s exited nonzero — died on: %s"
                      % (shard_id, culprit or "<none>"))
         # Per #3018: surface the actual [FAIL] lines (the test that ran and

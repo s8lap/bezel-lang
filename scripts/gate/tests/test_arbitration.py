@@ -29,6 +29,7 @@ import unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from gate import arbitration as arb  # noqa: E402
+from gate import summary  # noqa: E402  (fix #3668 banner cross-check)
 
 
 def _fail_line(test):
@@ -92,6 +93,75 @@ class ParseTest(unittest.TestCase):
     def test_parse_summary_no_match_is_zero(self):
         self.assertEqual(arb._parse_summary_last("nothing here\n"), 0)
         self.assertEqual(arb._parse_summary_last(""), 0)
+
+
+class BannerToSuspectTest(unittest.TestCase):
+    """fix #3668: the shard-log text the gate feeds `arbitrate` is
+    run_parallel's own output — the `--- failing tests ---` block plus the
+    GATE FAILURE banner. This pins the JOIN between the two modules: what
+    summary.format_failure_banner writes is what arbitration.parse_* reads.
+
+    Before the fix, a shard that ran its whole slice and failed ONE test still
+    got a `died on: <last passing test>` line, so parse_crashed handed
+    arbitration an innocent suspect; it was re-run 5x under ASan, passed, and
+    was stamped FLAKY (Run 10 cycle-1, shard module/7). arbitration.py itself
+    is unchanged — its `[ FAIL ]` parsing already yields the real suspect —
+    so the join is the whole repair.
+    """
+
+    INNOCENT = ("xmod_with_replacement_type_3177."
+                "imported_positional_record_with_target_is_type_checked_9_5")
+    REAL = ("xmod_abstract_class_indexer_unoverridden_row12."
+            "cross_module_indexer_row12")
+
+    def _gate_log(self, missing):
+        """run_parallel's output shape: the failing-test block it always
+        prints when any shard log carries a [ FAIL ] line
+        (tests/run_parallel.sh:317-322), then the banner."""
+        banner = summary.format_failure_banner(
+            ran=1522, expected=1523, nbin=6,
+            undercount_bins=["module: ran 1522 of 1523 registered"],
+            subset_empty=False, missing_summary_shards=missing, njobs=48,
+            crashed_culprits=[("module/7", self.INNOCENT)],
+            crashed_log_failures=[("module/7", [self.REAL])])
+        return "--- failing tests ---\n" + _fail_line(self.REAL) + "\n" + banner
+
+    def test_completed_shard_contributes_no_crash_suspect(self):
+        log = self._gate_log(missing=[])
+        # No died-on victim at all => the innocent suite is never re-run.
+        self.assertEqual(arb.parse_crashed(log), [])
+        # ...but the marker arbitration needs is still there: the REAL test.
+        self.assertEqual(arb.parse_failed(log), [self.REAL])
+
+    def test_completed_shard_arbitrates_only_the_real_suite(self):
+        # End-to-end through arbitrate(): exactly one suite is re-run, the
+        # failing one, and a suite that fails alone is a REAL regression.
+        rec = _RunSuiteRecorder({arb._suite_name(self.REAL): False})
+        res = arb.arbitrate(self._gate_log(missing=[]), run_suite=rec)
+        self.assertEqual(res.verdict, arb.ARB_REAL)
+        self.assertEqual(res.fail_suites, [arb._suite_name(self.REAL)])
+        self.assertEqual(res.crash_suites, [])
+        self.assertNotIn(arb._suite_name(self.INNOCENT), rec.calls)
+
+    def test_crashed_shard_still_contributes_its_died_on_suspect(self):
+        # The narrowing must not blind arbitration to a REAL crash: a shard
+        # with no completion summary keeps its died-on victim as a suspect,
+        # because for a true crash the victim can be the culprit.
+        log = self._gate_log(missing=["module/7"])
+        self.assertEqual(arb.parse_crashed(log), [self.INNOCENT])
+        self.assertEqual(arb.parse_failed(log), [self.REAL])
+
+    def test_marker_never_disappears_so_verdict_two_is_not_manufactured(self):
+        # Invariant 4: a nonzero exit with NO crash/FAIL marker returns 2 and
+        # BAILs the gate. Suppressing the died-on line must not create that
+        # state — the [ FAIL ] line is always present in the same log
+        # (run_parallel greps the same `^[ FAIL ]` lines the banner's
+        # actual-FAIL list came from), so a suspect always remains.
+        rec = _RunSuiteRecorder()
+        res = arb.arbitrate(self._gate_log(missing=[]), run_suite=rec)
+        self.assertNotEqual(res.verdict, arb.ARB_UNTRUSTWORTHY)
+        self.assertEqual(res.verdict, arb.ARB_FLAKY)
+        self.assertEqual(res.last_suspects, 1)
 
 
 class ArbRunSuiteTest(unittest.TestCase):
