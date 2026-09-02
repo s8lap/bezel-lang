@@ -859,6 +859,73 @@ static void collectYieldStatesForOwnedLocals(
 }
 
 
+// fix #3603 / #3539 (§29.7 / §27.5 / §28.9, v0.286) — the shared restore step
+// for a `Dispose` / `CloneDispose` body; see the declaration in
+// LlvmBackend_impl.hpp for why the sync and async iterators share it.
+//
+// A LAMBDA-CAPTURED local's frame field is a CELL POINTER, not the local's
+// value: §27.5 (#808) rebinds such a local's storage to a shared heap cell
+// (`boxLocalSlot`) and `collectSuspendLocals` widens its frame field to
+// pointer width so the HOLDER — not the value — round-trips a suspension.
+// Storing that field verbatim into a fresh alloca and binding `locals_[node]`
+// to it makes every later reader of this local read the CELL as if it were the
+// value: the snapshot disposals the per-state cleanup switch rebinds via
+// `d.slot = lit->second`, and any `finally` body that names the local.
+//
+// Rather than open-code an unbox here, tell the ONE authority that already
+// answers "this slot holds a cell, the value is inside it" — `cellVars_`,
+// consulted by `boxedStorage` (LlvmBackend_Layout.cpp) at every boxed read and
+// write. The unbox then happens LAZILY, at each point of use inside the
+// per-state cleanup chain, instead of unconditionally here where a
+// never-started iterator (state 0, calloc-zeroed field) would dereference null.
+//
+// The holder is made NON-NULL first, so `boxedStorage`'s unconditional
+// `load ptr, holder` is always a load of real storage: when the frame field is
+// null — §27.5's "the capture site never ran", the guarded-boxing state #3484
+// exists for — the holder is pointed at a function-local copy of the frame's
+// PRE-BOX field (`localPreBoxFields`, reserved by `buildStateMachineFrame` for
+// exactly this node and spilled beside the holder at every suspend). That is
+// the same fall-back storage `fixupCapturedCellHolderReads` selects for an
+// exposed holder read in the body, reached here through the frame because the
+// pre-boxing alloca itself does not cross into this function. Nothing writes
+// back: the frame is freed before this function returns, so the copy's only
+// job is to be a legal, correctly typed address for the disposal's load and
+// its post-disposal null store.
+//
+// The capture test is `localPreBoxFields`, NOT `frameCapturedLocals_`: the
+// frame records the fact structurally at build time, so it cannot be clobbered
+// by a nested lambda's emission between the frame build and this Dispose body,
+// and the field's own element type is the local's precise pre-boxing type (the
+// #461 overflow is why it is not `ptr`).
+void Emitter::restoreFrameLocalIntoSlot(const StateMachineFrame& frame,
+                                        const ast::Node* node,
+                                        unsigned fieldIdx, llvm::Value* self) {
+    llvm::Type* lty = frame.bodyLocals[fieldIdx - frame.localStart].second;
+    llvm::Value* fptr =
+        builder_.CreateStructGEP(frame.structTy, self, fieldIdx);
+    llvm::Value* val = builder_.CreateLoad(lty, fptr);
+    llvm::AllocaInst* slot = entryAlloca(lty);
+    auto pbIt = frame.localPreBoxFields.find(node);
+    if (lty == ptrTy() && pbIt != frame.localPreBoxFields.end()) {
+        llvm::Type* origTy = frame.structTy->getElementType(pbIt->second);
+        llvm::Value* pbGEP = builder_.CreateStructGEP(
+            frame.structTy, self, pbIt->second, "cl.preboxf");
+        llvm::AllocaInst* pbSlot = entryAlloca(origTy);
+        builder_.CreateStore(builder_.CreateLoad(origTy, pbGEP, "cl.prebox"),
+                             pbSlot);
+        llvm::Value* isNull = builder_.CreateICmpEQ(
+            val, llvm::ConstantPointerNull::get(ptrTy()), "cl.isnull");
+        builder_.CreateStore(
+            builder_.CreateSelect(isNull, pbSlot, val, "cl.storage"), slot);
+        cellVars_[slot] = origTy;
+    } else {
+        // A non-captured local's field IS the local's value; unchanged.
+        builder_.CreateStore(val, slot);
+    }
+    locals_[node] = slot;
+}
+
+
 void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
                          const CallableInfo& ci) {
     if (!ci.stmts) return;
@@ -2078,16 +2145,8 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
 
         // Restore suspend-locals from the frame so finally bodies that
         // reference iterator-body locals round-trip correctly.
-        for (auto& [node, fieldIdx] : frame.localFields) {
-            llvm::Type* lty =
-                frame.bodyLocals[fieldIdx - frame.localStart].second;
-            llvm::Value* fptr = builder_.CreateStructGEP(
-                stateStructTy, self, fieldIdx);
-            llvm::Value* val = builder_.CreateLoad(lty, fptr);
-            auto* slot = entryAlloca(lty);
-            builder_.CreateStore(val, slot);
-            locals_[node] = slot;
-        }
+        for (auto& [node, fieldIdx] : frame.localFields)
+            restoreFrameLocalIntoSlot(frame, node, fieldIdx, self);
 
         auto* freeFn = declareC("free", llvm::Type::getVoidTy(llvm_), {ptrTy()});
 

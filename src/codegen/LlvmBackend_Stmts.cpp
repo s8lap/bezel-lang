@@ -3781,6 +3781,37 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                         // a path that already corrupts memory is the same
                         // leak-to-use-after-free trade this filter exists to
                         // avoid. 3539 first, then 3541.
+                        //
+                        // ⚠ UPDATE — fix #3603 / issue 3539 (§29.7 / §27.5,
+                        // v0.286). 3539 IS NOW REPAIRED: the `iterEnumDispose`
+                        // arm of `emitDisposals` reads its slot through
+                        // `boxedStorage`, and this Dispose's restore loop
+                        // registers a captured local's holder in `cellVars_`
+                        // so the same authority unboxes it. "3539 first, then
+                        // 3541" is therefore satisfied — AND 3541 IS STILL NOT
+                        // SAFE. Deleting these three lines on top of that
+                        // repair was MEASURED in this lane:
+                        //
+                        //   using var r := new R(7);
+                        //   var f: () -> int := lambda() => r.V;
+                        //   yield return f();        // consumer `break`s
+                        //
+                        // becomes `AddressSanitizer: SEGV on unknown address
+                        // 0x000000000000 ... in bz$iter$M.Src$Gen$CloneDispose`
+                        // — a NULL dereference, NOT the mis-typed-slot wild
+                        // jump 3539 was — on all three abandonment shapes
+                        // probed, while the full-drain and the
+                        // throw-after-yield shapes stayed clean. So a THIRD
+                        // defect sits behind this filter and 3541 needs its own
+                        // root-cause pass, not an unblocking.
+                        //
+                        // What the filter COSTS is now pinned rather than only
+                        // described: the `abandoned_leak_is_only_the_3541_residue`
+                        // row of tests/codegen/
+                        // iter_lambda_captured_iter_format_local_unbox_3603_test.cpp
+                        // asserts the abandonment residue is EXACTLY the three
+                        // §27.5 allocations per round (closure + env + cell),
+                        // so removing this filter cannot go unnoticed.
                         if (d.closureRelease || d.boxedCellFree ||
                             d.boxedCellFreeDeferred || d.inlineOwnedArrayCell)
                             continue;
@@ -3837,36 +3868,40 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                         const ast::Node* node = nullptr;
                         for (const auto& [n, s] : locals_)
                             if (s == d.slot) { node = n; break; }
-                        // ⚠ fix #3468, NARROW EXCLUSION: a LAMBDA-CAPTURED
-                        // iterator-format local keeps its pre-existing leak
-                        // rather than gaining a wild dispatch. §27.5 (#808)
-                        // rebinds a captured local's frame field to a shared
-                        // CELL POINTER (boxLocalSlot), and the Dispose
-                        // function's restore loop copies that field verbatim
-                        // into `locals_[node]` — so the slot this path would
-                        // dispose holds the CELL, not the object, and the
-                        // slot-1 dispatch loads a "vtable" out of the cell
-                        // header. MEASURED on this tree: an `IEnumerable<T>`
-                        // local captured by a lambda, in an iterator abandoned
-                        // by `break`, is 38400 B / 1600 allocations LEAKED
-                        // without the arm above and an ASan SEGV with it.
-                        // Trading a leak for a wild jump is strictly worse —
-                        // #1462 did exactly that on this seam and was reverted
-                        // — so the capture case is excluded here and filed
-                        // separately. It is the same hazard issue 3539 already
-                        // records for an ordinary captured `using var` on this
-                        // path (heap-buffer-overflow in CloneDispose), and the
-                        // repair belongs in the RESTORE (teach it to unbox),
-                        // not in arming more frees over a boxed slot.
+                        // fix #3603 / #3539 (§29.7 / §27.5 / §28.9, v0.286):
+                        // the fix-#3468 narrow exclusion that sat here
+                        // (`d.iterEnumDispose && frameCapturedLocals_.count(
+                        // node)` -> `continue`) kept a LAMBDA-CAPTURED
+                        // iterator-format local's abandonment disposal
+                        // deliberately DISABLED, preserving a leak rather than
+                        // arming a wild jump: §27.5 (#808) rebinds such a
+                        // local's storage to a §27.5 CELL, and the slot-1
+                        // dispatch read a "vtable" out of the cell header.
                         //
-                        // Scoped to `d.iterEnumDispose` so the pre-existing
-                        // behaviour of every other Disposal kind here is
-                        // byte-for-byte unchanged: this guard can only decline
-                        // an entry THIS COMMIT would have newly added.
-                        if (node && d.iterEnumDispose &&
-                            frameCapturedLocals_.count(
-                                static_cast<const void*>(node)))
-                            continue;
+                        // The wild jump was never this snapshot's to fix. Its
+                        // cause was that the `iterEnumDispose` arm of
+                        // `emitDisposals` (LlvmBackend_Disposal.cpp) read its
+                        // slot RAW instead of through `boxedStorage`, the one
+                        // authority that answers "where does the object a
+                        // disposal slot names actually live" — so the SAME
+                        // wild jump fired on MoveNext's own scope exit, with
+                        // this exclusion fully in force and no abandonment
+                        // anywhere (measured on r12-cycle-1: ASan SEGV, "PC is
+                        // at a non-executable region", for `var seq:
+                        // IEnumerable<T> := coll;` captured by a lambda, on
+                        // BOTH the abandon and the full-drain edge). That arm
+                        // now asks `boxedStorage` like its siblings, which
+                        // also fixes #3539's `using var` twin
+                        // (heap-buffer-overflow in `CloneDispose`) because
+                        // both reach the identical mis-typed slot.
+                        //
+                        // With the slot-1 dispatch sound, the exclusion has no
+                        // remaining justification and is retired: the entry it
+                        // declined was one this snapshot had already collected
+                        // and would otherwise DROP, so re-admitting it can only
+                        // add a missing disposal, never duplicate one (the
+                        // exactly-once argument in the #3468 comment above is
+                        // unchanged and covers it verbatim).
                         if (node) {
                             IterCleanup act;
                             act.kind = IterCleanup::Kind::Disposal;

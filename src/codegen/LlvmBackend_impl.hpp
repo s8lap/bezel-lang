@@ -10455,6 +10455,25 @@ private:
         unsigned parkedStateField = 0;
     };
 
+    // fix #3603 / #3539 (§29.7 / §27.5 / §28.9, v0.286): bind `locals_[node]`
+    // for ONE suspend-local restored out of a state-machine frame inside a
+    // `Dispose` / `CloneDispose` body, and mark the restored holder as a §27.5
+    // capture cell when the frame says the local is one.
+    //
+    // ONE spelling, TWO call sites — `emitIteratorMethod`'s
+    // `emitDisposeBody` (LlvmBackend_Iterators.cpp) and
+    // `emitAsyncIteratorMethod`'s disposeFn (LlvmBackend_Async.cpp). Those two
+    // are the ONLY places that rebuild a body local into a FRESH alloca
+    // instead of restoring into the body's own slot (`emitAwaitSuspend` and
+    // the yield handler both store back through `smSpillsInFrameOrder()`, so
+    // the slot's `cellVars_` membership survives them untouched), and they
+    // were byte-identical copies of each other. Keeping them one function is
+    // what stops the async half from drifting back to the broken shape the
+    // sync half was fixed out of.
+    void restoreFrameLocalIntoSlot(const StateMachineFrame& frame,
+                                   const ast::Node* node, unsigned fieldIdx,
+                                   llvm::Value* self);
+
     // Pre-scan a method body to collect all LocalDecl/ForStmt nodes and their
     // types — the locals that must survive across a suspend point (a `yield`
     // or, for async, an `await`). Returns {node, llvmType} pairs. Kind-

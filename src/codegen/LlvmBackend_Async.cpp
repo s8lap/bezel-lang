@@ -3184,16 +3184,12 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
 
         // Restore suspend-locals from the frame so finally bodies that
         // reference iterator-body locals round-trip correctly.
-        for (auto& [node, fieldIdx] : frame.localFields) {
-            llvm::Type* lty =
-                frame.bodyLocals[fieldIdx - frame.localStart].second;
-            llvm::Value* fptr = builder_.CreateStructGEP(
-                stateStructTy, self, fieldIdx);
-            llvm::Value* val = builder_.CreateLoad(lty, fptr);
-            auto* slot = entryAlloca(lty);
-            builder_.CreateStore(val, slot);
-            locals_[node] = slot;
-        }
+        // fix #3603 / #3539 (§29.7 / §27.5 / §28.9, v0.286): the ASYNC half of
+        // the same restore. This block was a byte-identical copy of the sync
+        // iterator's, including its §27.5 capture-cell defect; both now call
+        // the one `restoreFrameLocalIntoSlot`.
+        for (auto& [node, fieldIdx] : frame.localFields)
+            restoreFrameLocalIntoSlot(frame, node, fieldIdx, self);
 
         // §29.7 (#2574): load the suspension state ONCE, before any branch
         // sets it to -1, so disposeOwnedLocals (inside emitFreeAndReturn) can

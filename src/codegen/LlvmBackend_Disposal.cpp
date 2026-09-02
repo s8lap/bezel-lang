@@ -6310,7 +6310,31 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
         // Call Dispose(self) via slot 1 (which runs pending finally blocks inside
         // the state machine and sets state=-1) then free the heap frame.
         if (it->iterEnumDispose) {
-            llvm::Value* obj = builder_.CreateLoad(ptrTy(), it->slot);
+            // fix #3603 / #3539 (§29.7 / §27.5 / §28.9, v0.286): ask
+            // `boxedStorage` for the address that actually HOLDS the object,
+            // exactly as the `dynamicDispose` / class / `asyncDispose` arms
+            // of this same loop already do. This arm was the ONE disposal arm
+            // that read `it->slot` RAW — a second, drifting spelling of the
+            // question "given a disposal slot, where does the object live?"
+            // that `boxedStorage` is the single authority for.
+            //
+            // The drift is only observable for a §27.5 (#808) LAMBDA-CAPTURED
+            // local: `boxLocalSlot` rebinds such a local's storage to a
+            // ptr-alloca holding a shared heap CELL, and the object lives
+            // INSIDE the cell. The raw load therefore produced the CELL
+            // pointer, and the slot-1 dispatch below read a "vtable" out of
+            // the cell header and jumped through it — a wild jump (measured
+            // on r12-cycle-1: `AddressSanitizer: SEGV ... PC is at a
+            // non-executable region` in `bz$iter$<M>$MoveNext`, for
+            // `var seq: IEnumerable<T> := coll;` and the `using var` twin
+            // alike, on both the abandonment and the full-drain edge).
+            //
+            // For every NON-captured slot `boxedStorage` returns the slot
+            // itself and emits no instruction, so this arm's IR is
+            // byte-for-byte unchanged for them.
+            llvm::Type* ety = nullptr;
+            llvm::Value* addr = boxedStorage(it->slot, ety);
+            llvm::Value* obj = builder_.CreateLoad(ptrTy(), addr);
             llvm::Value* isNull = builder_.CreateICmpEQ(
                 obj, llvm::ConstantPointerNull::get(ptrTy()));
             auto* dispBB = llvm::BasicBlock::Create(llvm_, "iter.dispose",
@@ -6327,9 +6351,11 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
             auto* dispTy = llvm::FunctionType::get(
                 llvm::Type::getVoidTy(llvm_), {ptrTy()}, false);
             builder_.CreateCall(dispTy, dispFnPtr, {obj});
-            // Dispose now freed the frame — null the slot.
+            // Dispose now freed the frame — null the storage (the cell's
+            // payload for a captured local, the slot itself otherwise), so a
+            // second disposal through the same storage is a no-op.
             builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()),
-                                 it->slot);
+                                 addr);
             builder_.CreateBr(contBB);
             builder_.SetInsertPoint(contBB);
             continue;
