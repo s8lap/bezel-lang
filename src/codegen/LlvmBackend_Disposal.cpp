@@ -2,6 +2,7 @@
 #include "sema/GenericParams.hpp"  // fix #3143: the ONE both-sources generic-param walk (§14.1/§12.9/§2.5)
 
 #include "common/OwnershipFacts.hpp"  // §28.1 per-instantiation owned-marker erasure (#2047)
+#include "common/PatternAResultCollection.hpp"  // fix #3657/#3658: the ONE both-sides §30.5 Pattern A collection-membership table (§30.5/§28.3, #3638)
 
 // This translation unit holds the definitions of Emitter's §28 disposal /
 // unwind / auto-drop member functions, extracted mechanically from
@@ -4054,6 +4055,90 @@ llvm::Function* Emitter::taskElementDisposerThunk(const sema::TypeRef* taskTy) {
 // value-side disposer (genericArgs[1]). Returns null when `resultCollTy` is
 // not an intrinsic collection — the caller falls back to the existing
 // class-result path which is correct for plain classes.
+//
+// fix #3657 / #3658 (§30.5 / §28.3, v0.286): MEMBERSHIP — "is `resultCollTy`
+// one of these intrinsic collections at all?" — now comes from the shared
+// closed table `common::isPatternAResultCollectionHead`
+// (common/PatternAResultCollection.hpp, #3638), not from the open-ended
+// `common::isOwningPrefixedName(collName)` fallback that used to stand here.
+// That fallback matched ANY name starting with "Owning" — including
+// `OwningTask` — so a `Task<OwningTask<U>>` result entered this array-backed
+// free path and was freed with `bz_array_free` over a task object, even
+// though this file's own `patternAResultDisposerFor` (LlvmBackend_Async.cpp)
+// documents (MEASURED: sixteen lines past its call to this function) that a nested
+// Task-family result is BORROWED, not OWNED and must not be disposed here
+// (fix #1889 / #776 / #777) — that guard was unreachable for `OwningTask`
+// because this function returned non-null first. KIND DISPATCH — which
+// runtime free fn and which per-element disposer a MEMBER gets — is
+// UNCHANGED (isLL/isDict/isBuffer and the isOwningColl element-family flag
+// below still decide that exactly as before); only the gate that decides
+// whether a name is a member at all has moved onto the shared table, so it
+// now agrees BY CONSTRUCTION with the ownership-side `taskResultArgIsClass`
+// (Ownership_Checks.cpp), which has read the same table since #3638.
+//
+// §6b exclusion diff — every name the old open-ended fallback admitted that
+// the shared table does not, and what handles it now:
+//   * `OwningTask` — the #3657 defect above. Now excluded at the gate below;
+//     falls through in `patternAResultDisposerFor` to the pre-existing
+//     `isTaskTypeName(tElem)` check (already there, already correct for
+//     `Task<Task<U>>` — plain `Task` was never `Owning*`-prefixed, so it
+//     never reached this array-free path), which returns null: the outer
+//     task's teardown does NOT dispose the inner task. That is not a new
+//     leak — it is the exact same "borrowed, not owned" contract
+//     `Task<Task<U>>` has always gotten, extended to `Task<OwningTask<U>>`.
+//     Proven by `nested_owning_task_result_use_after_free_3657` and its
+//     loop-amplified sibling `nested_owning_task_result_amplified_200x_3657`
+//     in tests/codegen/pattern_a_task_result_collection_membership_3657_
+//     3658_test.cpp: LSan-clean, correct value, over 200 produce/await
+//     iterations.
+//   * `OwningTaskCompletionSource` — also `Owning*`-prefixed, also not
+//     isLL/isDict/isBuffer, so the old fallback admitted it too, and (MEASURED
+//     with a debug probe against the pre-fix build) it really did reach this
+//     function's array-free-thunk construction with `collName ==
+//     "OwningTaskCompletionSource"`. Empirically, though, exercising a
+//     `Task<OwningTaskCompletionSource<T>>` result through that wrong thunk
+//     did NOT crash and did NOT leak in 5/5 runs (`bz_array_free`'s `free()`
+//     on the base pointer apparently satisfied the allocator here — this is
+//     UB that happened not to fault on this input, not a proof of
+//     correctness). Now excluded at the gate below; falls through to
+//     `elementPolicyFor`, which has NO special case for
+//     TaskCompletionSource/OwningTaskCompletionSource (unlike its
+//     Shared/Weak/IGrouping/Subscription/owning-builtin-collection/Task-
+//     family siblings, each of which gets a dedicated arm in
+//     LlvmBackend_ElementPolicy.cpp routing to the type's real release
+//     function) and reports the default Value category — so post-fix the
+//     outer task's teardown deterministically LEAKS the
+//     `OwningTaskCompletionSource` result (MEASURED: 208 bytes/instance,
+//     runAotChecked LSan report, reproduces 5/5). A real fix belongs in
+//     LlvmBackend_ElementPolicy.cpp: add a TaskCompletionSource/
+//     OwningTaskCompletionSource arm that calls `emitTcsRelease` — the SAME
+//     function this file's `bn == "TaskCompletionSource" || bn ==
+//     "OwningTaskCompletionSource"` builtin-dispose arm already uses for a
+//     `using var tcs := new OwningTaskCompletionSource<T>()` local (line
+//     ~2578), so the release mechanism exists; `elementPolicyFor` just never
+//     learned to reach it for a collection-element or Pattern-A-result slot.
+//     Out of scope for #3657/#3658's membership-routing fix (a different
+//     file's function needs the new arm); filed as #3685 with both
+//     measurements rather than silently shipped. Per §6c: this trades
+//     UB-with-no-observed-symptom-here for a deterministic, LSan-detectable
+//     leak — strictly MORE diagnosable, not less, even though neither is the
+//     correct final answer.
+//   * Nothing else: every other `Owning*`-prefixed stdlib name
+//     (`OwningArray`/`OwningStack`/`OwningQueue`/`OwningSet`/
+//     `OwningDictionary`/`OwningLinkedList`/`OwningBuffer`) is one of the 15
+//     table members and behaves exactly as before — including a separately-
+//     filed (#3684), PRE-EXISTING, fix-unrelated `OwningBuffer` gap (MEASURED
+//     identical on this fix and its parent: a `Task<OwningBuffer<T>>` result
+//     leaks its `bz_array_alloc_count_n` backing at task teardown; the
+//     `isBuffer` kind-dispatch flag below is set by the literal `collName ==
+//     "OwningBuffer"` test, never by the membership gate, so this fix cannot
+//     have changed it). A user class literally named e.g. `OwningBox` (the
+//     spec §28.9 example type) is unaffected in either direction — it has a
+//     real `declaration`, so it never reached this function at all (the
+//     guard just below rejects any `resultCollTy->declaration != nullptr`),
+//     before or after this fix. `OwningSortedDictionary` does not exist in
+//     this stdlib revision (the stdlib's own §4.17 prose says so) — there is
+//     no such type to construct a `Task<OwningSortedDictionary<K,V>>` from.
 llvm::Function* Emitter::patternAResultCollectionDisposer(
     const sema::TypeRef* resultCollTy) {
     // Cache hit.
@@ -4076,12 +4161,27 @@ llvm::Function* Emitter::patternAResultCollectionDisposer(
     }
     collName = resultCollTy->headName();
 
-    // Map the collection kind to (free-fn, family-for-element-policy). The
-    // runtime free fns accept a null per-element disposer for value-typed
-    // elements (bz_array_free skips the dispose loop) and for borrowing
-    // elements (the array only borrows its elements per §28.11). For a
-    // borrowing collection of strings, stringElementReleaseThunk is the
-    // right disposer (the +1 retained at insert must be released at free).
+    // fix #3657 / #3658 (§30.5 / §28.3, v0.286): MEMBERSHIP — is `collName`
+    // one of the 15 §30.5 Pattern A intrinsic-collection heads at all? — is
+    // now the ONE both-sides answer, `common::isPatternAResultCollectionHead`
+    // (common/PatternAResultCollection.hpp, #3638), not the open-ended
+    // `common::isOwningPrefixedName(collName)` fallback the KIND DISPATCH
+    // below used to also (mis)use for this question. See the §6b exclusion
+    // diff in the function's header comment above for exactly what this
+    // excludes that the old fallback admitted (`OwningTask`,
+    // `OwningTaskCompletionSource`) and what handles each now.
+    if (!common::isPatternAResultCollectionHead(collName)) {
+        return nullptr;
+    }
+
+    // KIND DISPATCH — reached only for an agreed member — decides which
+    // runtime free fn and which per-element-disposer FAMILY a member gets.
+    // UNCHANGED by #3657/#3658: the runtime free fns accept a null
+    // per-element disposer for value-typed elements (bz_array_free skips the
+    // dispose loop) and for borrowing elements (the array only borrows its
+    // elements per §28.11). For a borrowing collection of strings,
+    // stringElementReleaseThunk is the right disposer (the +1 retained at
+    // insert must be released at free).
     bool isLL          = (collName == "OwningLinkedList" || collName == "LinkedList");
     bool isDict        = (collName == "Dictionary" || collName == "OwningDictionary" ||
                           collName == "SortedDictionary");
@@ -4100,8 +4200,11 @@ llvm::Function* Emitter::patternAResultCollectionDisposer(
         isOwningColl = common::isOwningPrefixedName(collName);
     }
     if (!isLL && !isDict && !isBuffer && !isOwningColl) {
-        // Not a recognized intrinsic collection. Fall through to the
-        // class-result path; the caller returns null in that case.
+        // Unreachable for any name that passed the membership gate above (all
+        // 15 table members set one of these four flags) — kept as a
+        // defense-in-depth check against a FUTURE table/kind-dispatch drift
+        // (a name added to the table without a matching kind-dispatch arm),
+        // which is exactly the failure mode this whole fix exists to end.
         return nullptr;
     }
     // OwningBuffer is NOT value-owning by element kind — its `T` is value-
