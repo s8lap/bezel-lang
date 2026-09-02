@@ -63,14 +63,33 @@ directory. Every test here FAILED at the parent commit (af4f73b) except the
 two marked GUARD in their docstrings, which pin a contract the change now
 leans on (the GATE_CANARY=0 knob itself dates from #2100) rather than the
 change itself; the sharpen pins failed at a5772aa.
+
+FIX #3667 / FIX #3674 (section 5 below). A shard killed at BEZEL_SHARD_TIMEOUT
+writes no summary; run_parallel exited before its banner; gate_arbitrate found
+no marker in a log that was never allowed to carry one; the verdict was FAIL
+and the cycle BAILed — although the kill left the AOT bincache ~95% warm and a
+retry costs ~310 s plain / ~500 s ASan against a ~2230 s cycle plus a relaunch.
+gate.summary (narrow #3667 / sharpen #3668) classifies that shape; the pins in
+section 5 cover the bash that maps its exit 0 onto the EXISTING rc=3 RETRY
+contract (and nothing else onto anything), bounds the ceiling-only retries at
+three in run_until_trustworthy, swaps the never-matching shard_times harvest
+for the `shard-times` CLI, and puts `actual FAIL` into the condensing grep so
+the culprit a completed shard names reaches the reader (#3674). The gate.sh
+pins drive the EXTRACTED rc!=0 block and gate_shard_logdir() against the REAL
+gate.summary over a fixture logdir, so the 0/1/2 contract is exercised, not
+just spelled. Every section-5 test FAILED at e9a10c7 except the two marked
+GUARD.
 """
 
 import json
 import os
 import pathlib
 import re
+import shlex
 import subprocess
+import sys
 import tempfile
+import time
 import unittest
 
 HERE = pathlib.Path(__file__).resolve().parent
@@ -78,6 +97,12 @@ SCRIPTS = HERE.parent.parent          # scripts/
 GATE_SH = SCRIPTS / "gate.sh"
 CYCLE_SH = SCRIPTS / "gate_full_cycle.sh"
 GATE_PKG = SCRIPTS / "gate"
+RP_SH = SCRIPTS.parent / "tests" / "run_parallel.sh"
+
+# Section 5 builds run-summary fixtures for the REAL classifier; the schema
+# string comes from the module so the fixture cannot drift from it.
+sys.path.insert(0, str(SCRIPTS))
+from gate import summary as _summary  # noqa: E402
 
 # Variables the cycle now exports; a test runner's environment must not leak
 # them into a harness (an operator's exported GATE_CANARY=0 would otherwise
@@ -590,6 +615,449 @@ class GateShCanaryKnobTest(unittest.TestCase):
         self.assertTrue(any('_sto_label="ASan"' in l for _, l in lines),
                         "gate.sh must set _sto_label=\"ASan\" on the ASan pass — "
                         "the ceiling line is the observed-evidence carrier")
+
+
+# ---------------------------------------------------------------------------
+# 5. fix #3667 / fix #3674: the ceiling-only RETRY and its bound, the
+#    shard_times harvest, and `actual FAIL` in the condensed shard log.
+# ---------------------------------------------------------------------------
+
+# The phrase gate.sh prints on the ceiling-only path and gate_full_cycle.sh
+# greps to count those retries. One spelling, pinned on both sides.
+_CEIL_PHRASE = "ceiling-killed shard(s) only"
+_RC_BLOCK_START = 'if [ "$rc" -ne 0 ]; then\n'
+_ARB_CALL = 'gate_arbitrate "$S/gate_shard.log"'
+
+
+def _cycle_functions(tc):
+    """The REAL _legacy_rc_decision() and run_until_trustworthy() bodies,
+    extracted verbatim from gate_full_cycle.sh by sentinel, with the same
+    structural controls RunUntilTrustworthyExportsTest applies."""
+    text = CYCLE_SH.read_text()
+    legacy, _ = _slice(text, "_legacy_rc_decision() {", "\n}\n", "_legacy_rc_decision")
+    loop, _ = _slice(text, "run_until_trustworthy() {", "\n  return 99\n}\n",
+                     "run_until_trustworthy")
+    tc.assertIn('scripts/gate.sh "$@"', loop)
+    tc.assertIn("gate.cycle classify", loop)
+    tc.assertIn("accept)", loop)
+    tc.assertIn("echo bail", legacy)
+    return legacy, loop
+
+
+_STUB_GATE_SH_CEILING = r"""#!/usr/bin/env bash
+# Stub gate.sh for the #3667 retry-bound pins: every call is a ceiling-only
+# retry — print the line gate.sh prints on that path, write a REAL rc=3
+# verdict through gate.verdict, exit 3. PIN_GREEN_AFTER=<n> makes every call
+# after the n-th a clean pass instead (the negative control). The call number
+# comes from the record file, not from BEZEL_GATE_ATTEMPT.
+printf '%s\n' "${BEZEL_GATE_ATTEMPT:-}" >> "$PIN_RECORD"
+n=$(wc -l < "$PIN_RECORD")
+rc=3
+if [ -n "${PIN_GREEN_AFTER:-}" ] && [ "$n" -gt "$PIN_GREEN_AFTER" ]; then rc=0; fi
+if [ "$rc" -eq 3 ]; then
+  echo "   shard_arbitration rc=3 (ceiling-killed only)"
+  echo "== gate: RETRY — sharded suite: ceiling-killed shard(s) only, no FAIL/crash (see $PIN_TMP/gate_shard.log) =="
+fi
+PYTHONPATH=scripts python3 -m gate.verdict write --path "$GATE_VERDICT_FILE" --rc "$rc" || exit 1
+exit "$rc"
+"""
+
+_CEIL_LOOP_HARNESS = r"""
+set -u
+cd "$PIN_TMP"
+say() { echo "SAY $*"; }
+sleep() { :; }
+CYCLE_LOG=/dev/null
+MAX_ATTEMPTS=%(max_attempts)d
+%(legacy)s
+%(loop)s
+run_until_trustworthy "$PIN_TMP/pin.log" "plain"
+echo "RUN_UNTIL_TRUSTWORTHY_RC=$?"
+"""
+
+
+class CeilingOnlyRetryBoundTest(unittest.TestCase):
+    """gate_full_cycle.sh run_until_trustworthy: a ceiling-only retry (gate.sh
+    exit 3 carrying the `ceiling-killed shard(s) only` line) is retried twice
+    and BAILed (return 1) on the third. MAX_ATTEMPTS is 40: a machine that
+    cannot finish a shard inside the ceiling must not grind through 40
+    warm-cache re-runs of the whole suite before anyone hears about it."""
+
+    def _run(self, green_after=None, max_attempts=5):
+        legacy, loop = _cycle_functions(self)
+        with tempfile.TemporaryDirectory() as tmp:
+            sd = _layout(tmp)
+            stub = sd / "gate.sh"
+            stub.write_text(_STUB_GATE_SH_CEILING)
+            stub.chmod(0o755)
+            rec = pathlib.Path(tmp) / "record.txt"
+            env = _clean_env(tmp)
+            env["PIN_TMP"] = tmp
+            env["PIN_RECORD"] = str(rec)
+            if green_after is not None:
+                env["PIN_GREEN_AFTER"] = str(green_after)
+            r = _bash(_CEIL_LOOP_HARNESS % {
+                "legacy": legacy, "loop": loop, "max_attempts": max_attempts},
+                tmp, env)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            records = rec.read_text().splitlines() if rec.exists() else []
+            verdicts = {}
+            for i in range(1, max_attempts + 1):
+                vf = pathlib.Path(tmp) / ("pin.attempt%d.verdict.json" % i)
+                if vf.exists():
+                    verdicts[i] = json.loads(vf.read_text())["verdict"]
+            kept = sorted(p.name for p in pathlib.Path(tmp).glob("pin.attempt*.log"))
+            return r.stdout, records, verdicts, kept
+
+    def test_third_ceiling_only_retry_bails_with_rc_1(self):
+        out, records, verdicts, kept = self._run()
+        self.assertIn(
+            "RUN_UNTIL_TRUSTWORTHY_RC=1", out,
+            "the third ceiling-only retry must BAIL with return 1 (fix #3667); "
+            "got:\n" + out)
+        self.assertEqual(
+            records, ["1", "2", "3"],
+            "exactly three attempts — two retries and the bail — not "
+            "MAX_ATTEMPTS (5 in this harness, 40 in production)")
+        self.assertEqual(
+            verdicts, {1: "retry", 2: "retry", 3: "retry"},
+            "every attempt's verdict is the EXISTING rc=3 RETRY — never pass")
+        self.assertEqual(
+            kept, ["pin.attempt1.log", "pin.attempt2.log", "pin.attempt3.log"],
+            "the evidence of every attempt is kept aside (#3001), the bailed "
+            "one included")
+        says = [ln for ln in out.splitlines() if ln.startswith("SAY ")]
+        retries = [s for s in says if "CEILING-KILLED SHARD(S) ONLY" in s and "ceiling-only retry " in s]
+        self.assertEqual(len(retries), 2,
+                         "two ceiling-only retry lines expected:\n" + "\n".join(says))
+        bail = [s for s in says if "CEILING-KILLED SHARD(S) ONLY" in s and "giving up" in s]
+        self.assertEqual(len(bail), 1,
+                         "one ceiling-only bail line expected:\n" + "\n".join(says))
+        self.assertEqual(
+            [s for s in says if "COVERAGE SHORT" in s], [],
+            "a ceiling-only retry is not a coverage short and must not be "
+            "labelled as one")
+        self.assertEqual(
+            [s for s in says if "no trustworthy run in" in s], [],
+            "the ceiling-only bound, not MAX_ATTEMPTS, must end the loop")
+
+    def test_two_ceiling_only_retries_then_green_is_accepted(self):
+        """GUARD: the bound is three, not two — a run that clears on its
+        third attempt is accepted exactly as any retry->pass sequence is.
+        (Passes at e9a10c7 too: there the two retries are labelled COVERAGE
+        SHORT, and the third attempt is still accepted.)"""
+        out, records, verdicts, kept = self._run(green_after=2)
+        self.assertIn("RUN_UNTIL_TRUSTWORTHY_RC=0", out, out)
+        self.assertEqual(records, ["1", "2", "3"])
+        self.assertEqual(verdicts, {1: "retry", 2: "retry", 3: "pass"})
+        self.assertEqual(kept, ["pin.attempt1.log", "pin.attempt2.log"],
+                         "only the distrusted attempts are copied aside")
+
+
+class GateShCeilingOnlyWiringTest(unittest.TestCase):
+    """Source pins on gate.sh's shard phase: the classifier is consulted
+    before arbitration with BOTH log inputs, the only exit it can add is the
+    existing rc=3, and the shard_times harvest is the CLI."""
+
+    def _rc_block(self):
+        text = GATE_SH.read_text()
+        block, _ = _slice(text, _RC_BLOCK_START, "\nfi\n", "rc!=0 block")
+        self.assertIn(_ARB_CALL, block, "guard: the rc!=0 block must still arbitrate")
+        return block
+
+    def test_ceiling_only_classifier_runs_before_arbitration_with_both_logs(self):
+        block = self._rc_block()
+        code = "\n".join(ln for _, ln in _code_lines(block))
+        self.assertEqual(
+            code.count("run-summary ceiling-only"), 1,
+            "gate.sh's rc!=0 block must call `python3 -m gate.summary "
+            "run-summary ceiling-only` exactly once (fix #3667):\n" + code)
+        self.assertLess(
+            code.find("run-summary ceiling-only"), code.find(_ARB_CALL),
+            "the classifier must run BEFORE gate_arbitrate: arbitration finds "
+            "no marker in a ceiling-killed run's log and returns 2 -> FAIL -> BAIL")
+        self.assertIn('--shard-log "$S/gate_shard.log"', code,
+                      "the gate log must be passed as --shard-log")
+        self.assertIn("--shard-logs-dir", code,
+                      "the kept per-shard logdir must be passed as --shard-logs-dir "
+                      "(the gate log alone misses a [ FAIL ] a shard printed before "
+                      "run_parallel's early exit — sharpen #3668 case (a))")
+        self.assertIn("rec_ran shard_arbitration 3", code,
+                      "telemetry must record the ceiling-only outcome as rc=3")
+        self.assertIn(_CEIL_PHRASE, code,
+                      "the retry line must carry the phrase gate_full_cycle.sh counts")
+        self.assertIn("CANNOT CLASSIFY", code,
+                      "the classifier's exit 2 must be said aloud — it is not "
+                      "collapsed into 1 (reviewer guidance, c1-b)")
+
+    def test_the_only_exit_the_block_can_take_is_3_after_setting_failed_phase(self):
+        block = self._rc_block()
+        lines = _code_lines(block)
+        exits = [(n, ln) for n, ln in lines if re.search(r"\bexit\s+\S+", ln)]
+        codes = sorted({re.search(r"\bexit\s+(\S+)", ln).group(1).rstrip(";")
+                        for _, ln in exits})
+        self.assertEqual(
+            codes, ["3"],
+            "the rc!=0 block may add ONE verdict, rc=3 = the existing RETRY "
+            "contract (verdict.py verdict_from_rc); found exits: %r" % exits)
+        phase = [n for n, ln in lines if ln.lstrip().startswith("FAILED_PHASE=") and _CEIL_PHRASE in ln]
+        self.assertEqual(len(phase), 1, "FAILED_PHASE must name the ceiling-only retry")
+        self.assertLess(phase[0], exits[0][0],
+                        "FAILED_PHASE must be set BEFORE exit 3 — the EXIT trap "
+                        "writes the verdict from it")
+
+    def test_shard_times_harvest_uses_the_cli(self):
+        lines = [(n, ln) for n, ln in _code_lines(GATE_SH.read_text())
+                 if ln.startswith("SHARD_TIMES=$(")]
+        self.assertEqual(len(lines), 1, "guard: one SHARD_TIMES harvest line")
+        n, ln = lines[0]
+        self.assertIn(
+            "gate.summary shard-times", ln,
+            "gate.sh:%d must harvest shard_times via `python3 -m gate.summary "
+            "shard-times` — the grep it replaces was anchored `s$` and never "
+            "matched run_parallel's ` (ceiling 1800s, 0.7%%)` suffix, so every "
+            "telemetry record carried shard_times=[] (narrow #3667): %s" % (n, ln))
+        self.assertNotIn("[0-9.]+s$", ln, "the anchored regex must be gone")
+
+
+_CEIL_BLOCK_HARNESS = r"""
+set -u
+cd "$PIN_TMP"
+S="$PIN_TMP/S"
+GATE_RUN_SUMMARY="$S/gate_run_summary.json"
+GATE_SHARD_STAMP="$S/gate_shard.stamp"
+rec_ran() { echo "REC_RAN $*"; }
+now() { echo 0; }
+fail() { echo "FAIL $*"; exit 1; }
+gate_arbitrate() { echo "ARB $*"; ARB_LAST_SUSPECTS=0; return 0; }
+ASAN=0
+ARB_SUSPECTS=0
+FAILED_PHASE=""
+rc=1
+@@HELPER@@
+@@BLOCK@@
+echo "AFTER_RC_BLOCK failed_phase=[${FAILED_PHASE:-}]"
+"""
+
+
+class GateShCeilingOnlyFunctionalTest(unittest.TestCase):
+    """Drive gate.sh's EXTRACTED rc!=0 block plus gate_shard_logdir() against
+    the REAL gate.summary classifier over a fixture logdir, so the 0/1/2
+    contract is exercised end to end: 0 -> exit 3 with the phrase and no
+    arbitration; 1 -> arbitrate as before; 2 -> say CANNOT CLASSIFY and
+    arbitrate as before."""
+
+    def _fixture(self, tmp, *, kept_line=True, kept_fail=False,
+                 gate_fail=False, summary=True, stale_fail_dir=False):
+        S = pathlib.Path(tmp) / "S"
+        S.mkdir()
+        root = pathlib.Path(tmp) / "shard-logs"
+        root.mkdir()
+        stamp = S / "gate_shard.stamp"
+        stamp.touch()
+        now = time.time()
+        os.utime(stamp, (now - 60, now - 60))          # touched before the run
+        if stale_fail_dir:
+            # A PREVIOUS gate's kept logs, older than the stamp, carrying a
+            # [ FAIL ]. The measured shape: /var/tmp/bezel-scratch/shard-logs
+            # held 249 kept runs on 2026-09-03, 217 of them with a [ FAIL ].
+            old = root / "20260809-011922-rc1"
+            old.mkdir()
+            (old / "shard.codegen.0.log").write_text(
+                "[ RUN  ] old.t\n[ FAIL ] old.t (1 ms)\nSHARD_ELAPSED 3.00\n")
+            os.utime(old, (now - 120, now - 120))
+        kept, keep_msg = self._keep_via_run_parallel(tmp, root, {
+            "shard.codegen.0.log":
+                "[ RUN  ] a.b\n"
+                + ("[ FAIL ] a.b (11 ms)\n" if kept_fail else "")
+                + "SHARD_ELAPSED 1782.00\n",
+            "shard.codegen.1.log":
+                "[ RUN  ] c.d\n[  OK  ] c.d\n5 passed, 0 failed (shard 1/2), 10 total\n"
+                "SHARD_ELAPSED 12.34\n",
+        })                                               # mtime = now > stamp
+        lines = [
+            "Running 1 test binaries x 2 slices = 2 shards, 2 at a time (of 16 cores)...",
+            "shard codegen/0 TIMED OUT at the per-shard ceiling (BEZEL_SHARD_TIMEOUT=#3222)",
+        ]
+        if gate_fail:
+            lines += ["--- failing tests ---", "[ FAIL ] a.b (11 ms)"]
+        lines += ["shard codegen.0: 1795.50s (ceiling 1800s, 99.8%)",
+                  "shard codegen.1: 12.34s (ceiling 1800s, 0.7%)"]
+        if kept_line:
+            # The producer's own line (run_parallel.sh's _rp_keep, run for real
+            # above): it names the ROOT only, never the timestamped subdir.
+            lines.append(keep_msg)
+        (S / "gate_shard.log").write_text("\n".join(lines) + "\n")
+        if summary:
+            (S / "gate_run_summary.json").write_text(json.dumps({
+                "schema": _summary.RUN_SCHEMA,
+                "timed_out_shards": ["codegen/0"],
+                "crashed_shards": [],
+                "subset_empty": False,
+                "missing_summary_shards": ["codegen/0"],
+            }))
+        return kept
+
+    def _keep_via_run_parallel(self, tmp, root, logs):
+        """Produce the kept logdir and the `KEPT in` line with
+        tests/run_parallel.sh's REAL _rp_keep trap (extracted by sentinel and
+        run with rc=1 and BEZEL_SHARD_LOG_KEEP=root), so the wording
+        gate_shard_logdir() parses is the producer's own, not a copy of it —
+        a drift there must fail these pins, not silently downgrade the
+        classifier to a gate-log-only scan. Returns (kept_dir, line)."""
+        keep_fn, _ = _slice(RP_SH.read_text(), "_rp_keep() {", "\n}\n", "_rp_keep")
+        self.assertIn("BEZEL_SHARD_LOG_KEEP", keep_fn, "guard: not the keep trap")
+        logdir = pathlib.Path(tmp) / "bezel_shards.pin"
+        logdir.mkdir()
+        for name, content in logs.items():
+            (logdir / name).write_text(content)
+        env = _clean_env(tmp)
+        env["BEZEL_SHARD_LOG_KEEP"] = str(root)
+        r = _bash("set -u\nlogdir=%s\n%s\nfalse\n_rp_keep\n"
+                  % (shlex.quote(str(logdir)), keep_fn), tmp, env)
+        self.assertEqual(r.returncode, 1, "guard: _rp_keep returns the rc it saw:\n" + r.stdout + r.stderr)
+        lines = [ln for ln in r.stderr.splitlines() if "KEPT" in ln]
+        self.assertEqual(len(lines), 1, "guard: _rp_keep announces the kept root once:\n" + r.stderr)
+        subdirs = [p for p in root.iterdir() if p.is_dir() and p.name.endswith("-rc1")
+                   and p.stat().st_mtime > time.time() - 30]
+        self.assertEqual(len(subdirs), 1, "guard: _rp_keep moved the logdir under root once: %r"
+                         % sorted(p.name for p in root.iterdir()))
+        self.assertFalse(logdir.exists(), "guard: the original logdir was moved, not copied")
+        return subdirs[0], lines[0]
+
+    def _run(self, tmp):
+        text = GATE_SH.read_text()
+        helper, _ = _slice(text, "gate_shard_logdir() {", "\n}\n", "gate_shard_logdir")
+        block, _ = _slice(text, _RC_BLOCK_START, "\nfi\n", "rc!=0 block")
+        self.assertIn(_ARB_CALL, block, "guard: extracted block lacks the arbitration call")
+        _layout(tmp)
+        env = _clean_env(tmp)
+        env["PIN_TMP"] = tmp
+        script = _CEIL_BLOCK_HARNESS.replace("@@HELPER@@", helper).replace("@@BLOCK@@", block)
+        return _bash(script, tmp, env)
+
+    def test_ceiling_only_run_exits_3_with_the_phrase_and_never_arbitrates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            kept = self._fixture(tmp)
+            r = self._run(tmp)
+            self.assertEqual(r.returncode, 3,
+                             "a ceiling-only run must take the rc=3 RETRY exit:\n" + r.stdout + r.stderr)
+            self.assertIn("REC_RAN shard_arbitration 3 ceiling-killed only", r.stdout)
+            self.assertIn(_CEIL_PHRASE, r.stdout,
+                          "the retry line gate_full_cycle.sh counts is missing:\n" + r.stdout)
+            self.assertIn(str(kept), r.stdout,
+                          "the retry line must name the per-shard logdir it consulted")
+            self.assertNotIn("ARB ", r.stdout, "arbitration must not run on the retry path")
+            self.assertNotIn("AFTER_RC_BLOCK", r.stdout, "exit 3 must leave the block")
+
+    def test_a_fail_only_in_the_kept_shard_log_is_not_retried(self):
+        """sharpen #3668 case (a): the gate log is clean (run_parallel exited
+        before its failing-tests block) and the [ FAIL ] lives only in the
+        kept per-shard log. Only a located --shard-logs-dir can see it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            self._fixture(tmp, kept_fail=True)
+            r = self._run(tmp)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertIn("ARB ", r.stdout, "not ceiling-only -> arbitrate as before")
+            self.assertNotIn("REC_RAN shard_arbitration 3", r.stdout)
+            self.assertNotIn(_CEIL_PHRASE, r.stdout)
+            self.assertIn("AFTER_RC_BLOCK", r.stdout)
+
+    def test_a_fail_in_the_gate_log_is_not_retried(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._fixture(tmp, gate_fail=True)
+            r = self._run(tmp)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertIn("ARB ", r.stdout)
+            self.assertNotIn(_CEIL_PHRASE, r.stdout)
+
+    def test_missing_run_summary_cannot_classify_says_so_and_arbitrates(self):
+        """The classifier's exit 2 is a third answer: not retried, not
+        silently treated as 'no' — said aloud, then today's path."""
+        with tempfile.TemporaryDirectory() as tmp:
+            self._fixture(tmp, summary=False)
+            r = self._run(tmp)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertIn("CANNOT CLASSIFY", r.stdout,
+                          "exit 2 must be logged, not collapsed into 1:\n" + r.stdout)
+            self.assertIn("ARB ", r.stdout)
+            self.assertNotIn(_CEIL_PHRASE, r.stdout)
+            self.assertIn("AFTER_RC_BLOCK", r.stdout)
+
+    def test_no_kept_line_classifies_on_the_gate_log_alone_and_says_so(self):
+        """No `per-shard logs KEPT in` line (the mv failed, or the logs were
+        reaped): the flag is omitted and the log says so; the summary and
+        the gate log still decide (gate.summary: reaped logs are no evidence,
+        not a defect)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            self._fixture(tmp, kept_line=False)
+            r = self._run(tmp)
+            self.assertEqual(r.returncode, 3, r.stdout + r.stderr)
+            self.assertIn("per-shard logs not located", r.stdout,
+                          "omitting --shard-logs-dir must be said in the log:\n" + r.stdout)
+            self.assertIn(_CEIL_PHRASE, r.stdout)
+            self.assertNotIn("ARB ", r.stdout)
+
+    def test_a_previous_gates_kept_logs_are_not_this_runs_evidence(self):
+        """run_parallel names only the ROOT (`…/shard-logs/`), which holds
+        every non-clean run ever kept — 249 on this box, 217 with a
+        [ FAIL ]. The block must hand the classifier THIS run's subdir (newer
+        than the stamp), never the root or an older sibling: a stale FAIL
+        would otherwise make every ceiling-only run 'not retryable'."""
+        with tempfile.TemporaryDirectory() as tmp:
+            kept = self._fixture(tmp, stale_fail_dir=True)
+            r = self._run(tmp)
+            self.assertEqual(r.returncode, 3,
+                             "an OLDER kept run's [ FAIL ] must not veto this run's "
+                             "retry:\n" + r.stdout + r.stderr)
+            self.assertIn(str(kept), r.stdout)
+            self.assertNotIn("20260809-011922-rc1", r.stdout)
+            self.assertNotIn("ARB ", r.stdout)
+
+
+class CondensedShardLogTest(unittest.TestCase):
+    """fix #3674: gate.sh condenses the shard log for the reader with one
+    grep alternation. Neither the #3018 `##   shard X actual FAIL: <test>`
+    line nor the #3668 `… completed its slice; actual FAIL: <test>` line
+    matched it, so a completed-shard failure showed the banner and the
+    failing-tests header and named no test."""
+
+    # Issue #3674's verify fixture plus the #3018 wording and a died-on line.
+    FIXTURE = (
+        "## GATE FAILURE: shard crash / undercount\n"
+        "##   shard module/7 exited nonzero — completed its slice; actual FAIL: a.b\n"
+        "##   shard sema/5 exited nonzero — died on: c.d\n"
+        "##   shard sema/5 actual FAIL: old.t\n"
+        "--- failing tests ---\n"
+        "[ FAIL ] a.b (11 ms)\n"
+        "TOTAL: 20148 passed\n")
+
+    def _grep_line(self):
+        lines = [(n, ln) for n, ln in _code_lines(GATE_SH.read_text())
+                 if "grep -E" in ln and "## GATE FAILURE" in ln and "died on" in ln]
+        self.assertEqual(len(lines), 1, "guard: one condensing grep expected in gate.sh")
+        return lines[0]
+
+    def test_alternation_carries_actual_fail(self):
+        n, ln = self._grep_line()
+        self.assertIn("actual FAIL", ln,
+                      "gate.sh:%d must add `actual FAIL` to the condensing grep "
+                      "(fix #3674): %s" % (n, ln))
+
+    def test_the_3674_fixture_names_the_culprit(self):
+        n, ln = self._grep_line()
+        with tempfile.TemporaryDirectory() as tmp:
+            (pathlib.Path(tmp) / "gate_shard.log").write_text(self.FIXTURE)
+            r = _bash("S=%s\n%s\n" % (shlex.quote(tmp), ln.strip()), tmp, _clean_env(tmp))
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertIn("completed its slice; actual FAIL: a.b", r.stdout,
+                          "the #3668 culprit line must survive condensation:\n" + r.stdout)
+            self.assertIn("##   shard sema/5 actual FAIL: old.t", r.stdout,
+                          "the #3018 culprit line must survive condensation")
+            # GUARD: what already surfaced keeps surfacing.
+            for keep in ("## GATE FAILURE: shard crash / undercount",
+                         "died on: c.d", "--- failing tests ---", "TOTAL: 20148 passed"):
+                self.assertIn(keep, r.stdout)
 
 
 if __name__ == "__main__":

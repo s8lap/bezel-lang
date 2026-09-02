@@ -562,6 +562,30 @@ gate_arbitrate() { # $1 = sharded-run log  →  returns 0|1|2; sets ARB_LAST_SUS
   return "$_verdict"
 }
 
+# fix #3667: the per-shard logs run_parallel KEPT for THIS run. On a nonzero
+# exit run_parallel's _rp_keep trap (tests/run_parallel.sh:101-115) moves its
+# logdir to ${BEZEL_SHARD_LOG_KEEP:-/var/tmp/bezel-scratch/shard-logs}/<YYYYmmdd-
+# HHMMSS>-rc<N> and says only the ROOT on stderr — `per-shard logs KEPT in
+# <root>/ (see #3010)` — which lands in the sharded-run log. So: read the root
+# off that line, then take the newest `*-rc*` directory under it that is NEWER
+# than the stamp gate.sh touched before launching run_parallel. Never the root
+# itself and never an older sibling: the root holds every non-clean run ever
+# kept (measured 2026-09-03: 249 directories, 217 of them carrying a `[ FAIL ]`
+# in some shard log), so a scan over it would veto every future ceiling-only
+# retry with a failure from a run that is not this one. Echoes the directory,
+# or nothing (no KEPT line — the logs were reaped or the mv failed; or nothing
+# newer than the stamp); the caller then classifies on the gate log alone and
+# says so. gate.summary documents reaped logs as "no evidence, not a defect"
+# (ceiling_only_failure). Never fails.
+gate_shard_logdir() { # $1 = sharded-run log, $2 = stamp file → echoes the kept logdir, or nothing
+  local log="$1" stamp="$2" root d
+  root=$(sed -n 's/.*per-shard logs KEPT in \(.*\)\/ (see #3010).*/\1/p' "$log" 2>/dev/null | tail -1)
+  [ -n "$root" ] && [ -d "$root" ] && [ -n "$stamp" ] && [ -f "$stamp" ] || return 0
+  d=$(find "$root" -mindepth 1 -maxdepth 1 -type d -name '*-rc*' -newer "$stamp" 2>/dev/null | sort | tail -1)
+  [ -n "$d" ] && printf '%s\n' "$d"
+  return 0
+}
+
 echo "== gate[1/5]: reconfigure (glob any new test files) =="
 # Snapshot the compiler-archive mtime BEFORE any build work: comparing after
 # the build phase tells us whether the k2 cache identity changed this gate
@@ -880,6 +904,9 @@ rm -f "$MEMPEAK_OUT" 2>/dev/null || true   # never source a PRIOR gate's numbers
 if [ -x scripts/gate/mempeak.sh ]; then
   MEMPEAK_PID=$(scripts/gate/mempeak.sh start "$MEMPEAK_OUT" 2 2>/dev/null || true)
 fi
+# fix #3667: stamp the launch so gate_shard_logdir() (below) can pick the
+# per-shard logdir run_parallel keeps for THIS run and never a previous gate's.
+GATE_SHARD_STAMP="$S/gate_shard.stamp"; : > "$GATE_SHARD_STAMP"
 "$DH" suite "${SHARD_ENV[@]}" tests/run_parallel.sh ${GATE_SHARDS:-} >"$S/gate_shard.log" 2>&1; rc=$?
 if [ -n "${MEMPEAK_PID:-}" ]; then
   scripts/gate/mempeak.sh stop "$MEMPEAK_PID" 2>/dev/null || true
@@ -896,10 +923,21 @@ rec_ran shard "$rc" "$SHARD_NOTE"
 # Harvest run_parallel's own aggregate wall + shard count + per-shard times (obs only).
 SHARD_COUNT=$(grep -oE 'across [0-9]+ shards' "$S/gate_shard.log" | grep -oE '[0-9]+' | tail -1); SHARD_COUNT=${SHARD_COUNT:-0}
 SHARD_REPORTED_S=$(grep -oE 'across [0-9]+ shards, [0-9]+s' "$S/gate_shard.log" | grep -oE '[0-9]+s' | tr -d 's' | tail -1); SHARD_REPORTED_S=${SHARD_REPORTED_S:-0}
-# Shard labels are "<group>.<index>" since the per-area split (they used to be
-# a bare index); observation only, but keep the harvest working.
-SHARD_TIMES=$(grep -oE '^shard [A-Za-z0-9_]+\.[0-9]+: [0-9.]+s$' "$S/gate_shard.log" | sed -E 's/^.*: ([0-9.]+)s$/\1/' | paste -sd, -)
-grep -E 'TOTAL:|## GATE FAILURE|died on|--- failing' "$S/gate_shard.log" || true
+# fix #3667: the harvest is gate.summary's `shard-times` CLI. The grep it
+# replaces was anchored `s$`, and run_parallel.sh:388 appends ` (ceiling 1800s,
+# 0.7%)` whenever BEZEL_SHARD_TIMEOUT is set — which a gate run ALWAYS sets
+# (the ceiling block above) — so it never matched a line and every telemetry
+# record ever written carried `"shard_times":[]`. Same key, same comma-joined
+# shape; the CLI emits the RAW seconds tokens (`1795.50`, not a re-rendered
+# float) because telemetry.py wraps each verbatim as a RawNumber. Empty on an
+# unreadable log, exactly as before (observation only — never fails a gate).
+SHARD_TIMES=$(PYTHONPATH=scripts python3 -m gate.summary shard-times "$S/gate_shard.log" 2>/dev/null || true)
+# fix #3674: `actual FAIL` joins the alternation so the culprit a COMPLETED
+# shard names — `##   shard X exited nonzero — completed its slice; actual
+# FAIL: <test>` (#3668) and the older `##   shard X actual FAIL: <test>`
+# (#3018) — reaches the reader. Before, a completed-shard failure condensed to
+# the banner and the `--- failing tests ---` header and named no test at all.
+grep -E 'TOTAL:|## GATE FAILURE|died on|actual FAIL|--- failing' "$S/gate_shard.log" || true
 # ASan on (--full / GATE_FAST_ASAN=1): a fired generated-code sanitizer report is
 # DETERMINISTIC evidence of a memory error — fail hard here, independent of the
 # flake arbitration (which re-runs a suspect alone and, absent this, could clear
@@ -921,6 +959,44 @@ if [ "$ASAN" -eq 1 ]; then
 fi
 if [ "$rc" -ne 0 ]; then
   PHASE_T0=$(now)  # the flake-arbitration re-runs are their own (exceptional) phase
+  # fix #3667: a run whose ONLY defect is a per-shard ceiling kill is RETRYABLE
+  # infra, not a red suite. The kill leaves the AOT bincache ~95% warm, so a
+  # retry costs ~310 s plain / ~500 s ASan against a fresh ~2230 s cycle plus a
+  # relaunch — and until now gate_arbitrate found no marker in a log
+  # run_parallel never let carry one, returned 2, the verdict was FAIL and the
+  # cycle BAILed. The classifier is gate.summary's ceiling_only_failure — a
+  # conjunction (a ceiling kill AND no crash AND no empty subset AND every
+  # missing summary explained by the kill AND no `[ FAIL ]` in the gate log or
+  # this run's kept per-shard logs). Its exit codes: 0 RETRYABLE (never a
+  # generic success), 1 not, 2 CANNOT CLASSIFY. 2 is NOT collapsed into 1: it is
+  # said aloud and falls through to arbitration exactly as before, so an
+  # unreadable input can never silently pick either answer.
+  #
+  # The retry rides the EXISTING rc=3 contract (verdict.py verdict_from_rc:
+  # 3 -> RETRY; cycle.py classify: retry -> RETRY; gate_full_cycle.sh's retry
+  # branch), through the same path the coverage floor's exit 3 takes below: set
+  # FAILED_PHASE and exit — the EXIT trap (gate_finish -> gate_write_verdict)
+  # writes gate-verdict.json from the rc, so the file says RETRY, never PASS.
+  # gate_full_cycle.sh greps the phrase `ceiling-killed shard(s) only` to bound
+  # these retries at three (a box that cannot finish a shard must not loop
+  # MAX_ATTEMPTS times); keep the wording in step with it.
+  _ceil_dir=$(gate_shard_logdir "$S/gate_shard.log" "${GATE_SHARD_STAMP:-}")
+  _ceil_args=(--shard-log "$S/gate_shard.log")
+  if [ -n "$_ceil_dir" ]; then
+    _ceil_args+=(--shard-logs-dir "$_ceil_dir")
+  else
+    echo "   ceiling-only classifier: per-shard logs not located (no KEPT line, or nothing newer than the launch stamp) — scanning the gate log alone"
+  fi
+  PYTHONPATH=scripts python3 -m gate.summary run-summary ceiling-only "$GATE_RUN_SUMMARY" "${_ceil_args[@]}" \
+    2>"$S/gate_ceiling.err"; _ceil_rc=$?
+  case "$_ceil_rc" in
+    0) rec_ran shard_arbitration 3 "ceiling-killed only"
+       echo "== gate: RETRY — sharded suite: ceiling-killed shard(s) only, no FAIL/crash${_ceil_dir:+ (per-shard logs: $_ceil_dir)} (see $S/gate_shard.log) =="
+       FAILED_PHASE="sharded suite — ceiling-killed shard(s) only, no FAIL/crash (retry)"
+       exit 3 ;;
+    1) ;;  # not ceiling-only (a crash, a FAIL, an unexplained gap): arbitrate as before
+    *) echo "   ceiling-only classifier: CANNOT CLASSIFY (rc=$_ceil_rc: $(tr '\n' ' ' <"$S/gate_ceiling.err" 2>/dev/null | cut -c1-240)) — arbitrating as before" ;;
+  esac
   # Shared arbitrate() (see its definition above for the full rationale, #1861/
   # #2100). With serial gone (#1861) THIS is the authoritative re-check: a
   # suspect that passes alone within 5 tries is a sharding flake and the gate

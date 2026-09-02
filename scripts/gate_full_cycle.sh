@@ -270,12 +270,14 @@ trap 'rc=$?; write_cycle_verdict "$rc" || true; exit $rc' EXIT
 #   pass (+trustworthy) -> accept   rc==0, no undercount
 #   refused             -> retry    rc==2: preflight, builders active (transient)
 #   retry               -> retry    rc==3: coverage short (#3002)
+#                                  or ceiling-killed shard(s) only (#3667) —
+#                                  the latter bounded at three, then bail
 #   poisoned            -> retry    rc==0 + undercount distrust (#3001)
 #   fail                -> bail     rc==1: real regression
 run_until_trustworthy() {
   local log="$1"; shift
   local mode_desc="${1:-plain}"; shift || true
-  local i rc v_verdict v_rc dec old_dec reason _oracle _canary
+  local i rc v_verdict v_rc dec old_dec reason _oracle _canary _ceil
   # fix #3666: tell each gate.sh attempt WHICH attempt it is and WHICH oracle
   # the cycle intends (plain, or asan for --full), and turn the canary OFF on
   # the ASan oracle. Measured over 46 gate.sh runs: the canary caught nothing
@@ -292,6 +294,8 @@ run_until_trustworthy() {
   _oracle=plain
   case " $* " in *" --full "*) _oracle=asan ;; esac
   _canary="${GATE_CANARY:-1}"; [ "$_oracle" = asan ] && _canary=0
+  # fix #3667: ceiling-only retries seen so far (bounded at three, below).
+  _ceil=0
   for i in $(seq 1 "$MAX_ATTEMPTS"); do
     # BEZEL_GATE_CYCLE=1 tells gate.sh that a DUAL-oracle run is driving it, so
     # it suppresses its "this is one oracle, not an acceptance verdict" note
@@ -375,6 +379,23 @@ run_until_trustworthy() {
         # three times in a row and left nothing to look at. Keep the canonical
         # path at the LAST attempt (callers grep it) and copy each aside.
         cp -f "$log" "${log%.log}.attempt${i}.log" 2>/dev/null || true
+        # fix #3667: a ceiling-only retry — gate.sh exit 3 because the run's
+        # ONLY defect was a shard killed at BEZEL_SHARD_TIMEOUT (no FAIL, no
+        # crash) — is bounded at THREE. Two retries ride the warm bincache and
+        # clear a cold-cache or contention kill; a third says this machine
+        # cannot finish a shard inside the ceiling, and MAX_ATTEMPTS (40) more
+        # warm re-runs of the whole suite will not change that. Bail with 1 so
+        # the cycle reports a failure, never a verdict. The phrase is the one
+        # gate.sh prints on its `== gate: RETRY — …` line; keep them in step.
+        if grep -q 'ceiling-killed shard(s) only' "$log" 2>/dev/null; then
+          _ceil=$((_ceil + 1))
+          if [ "$_ceil" -ge 3 ]; then
+            say "$mode_desc attempt $i: CEILING-KILLED SHARD(S) ONLY for the third time — a shard cannot finish inside the ceiling on this machine; giving up instead of a fourth attempt (log kept: ${log%.log}.attempt${i}.log)"
+            return 1
+          fi
+          say "$mode_desc attempt $i: CEILING-KILLED SHARD(S) ONLY (no FAIL/crash; ceiling-only retry $_ceil of 2) — retrying on the warm bincache (log kept: ${log%.log}.attempt${i}.log)"
+          sleep 60; continue
+        fi
         if [ "$reason" = retry ]; then
           say "$mode_desc attempt $i: COVERAGE SHORT — $(grep -oE '[0-9]+ of [0-9]+ gtests ran' "$log" | tail -1) — retrying (log kept: ${log%.log}.attempt${i}.log)"
         else
