@@ -16283,6 +16283,28 @@ private:
     // failure. Pinning the helper as the only spelling is what keeps the next
     // sibling site from regressing in this exact shape.
     std::string enumMachineryElementName(llvm::Type* elemTy) const;
+
+    // §29.2 / §28.9 / stdlib §4.6 / §4.7 — fix #3663 (v0.286). See
+    // declaration site's definition in LlvmBackend_Assign.cpp for the full
+    // rationale. The LinkedList-family (`llenum`) cache-key element-name
+    // segment — DELIBERATELY NOT `enumMachineryElementName` above, because
+    // `ensureLinkedListEnumMachinery`'s `Current` returns `elemTy` BY VALUE
+    // and an allocSize-only key is MEASURED insufficient here: two struct
+    // element types of the SAME alloc size but a DIFFERENT LAYOUT (e.g. an
+    // all-integer-field record vs one with a `double` field — different
+    // x86-64 SysV ABI aggregate-return classes) silently produce a WRONG
+    // VALUE, not a crash, when they share one `f<allocSize>`-keyed `Current`.
+    // Every struct/class element type in Bezel lowers (`recordStruct` /
+    // `classStruct`, LlvmBackend_Layout.cpp) to a NAMED (identified, not
+    // literal) `llvm::StructType`, unique per declaration and per generic
+    // instantiation (LLVM's own struct-name uniquing is the safety net even
+    // across two same-named declarations in different modules) — so the
+    // struct's own LLVM name already IS full type identity, at no extra
+    // bookkeeping. Integer / pointer / floating-point primitive element
+    // types keep a scalar-width key (a bare primitive, e.g. `LinkedList
+    // <double>`, is not an `llvm::StructType`, so it needs its own arm
+    // rather than falling into the struct arm or the byte-size fallback).
+    std::string linkedListEnumElementName(llvm::Type* elemTy) const;
 };
 
 }  // namespace bezel::codegen

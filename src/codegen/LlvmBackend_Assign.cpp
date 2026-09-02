@@ -9526,6 +9526,54 @@ std::string Emitter::enumMachineryElementName(llvm::Type* elemTy) const {
         (int64_t)module_->getDataLayout().getTypeAllocSize(elemTy));
 }
 
+// §29.2 / §28.9 / stdlib §4.6 / §4.7 — fix #3663 (v0.286). See declaration
+// in LlvmBackend_impl.hpp. The LinkedList-family (`llenum`) cache-key
+// element-name segment. NOT the same alphabet as `enumMachineryElementName`
+// above: `ensureLinkedListEnumMachinery`'s `Current` returns `elemTy` BY
+// VALUE (`FunctionType::get(elemTy, {ptrTy()}, false)`, `CreateRet(CreateLoad
+// (elemTy, vp))`), and MEASURING the same-alloc-size/different-LAYOUT
+// question this issue raised (a `record IntPair(X: int, Y: int)` — 2 ints,
+// x86-64 SysV INTEGER class — paired with a `record OneDouble(V: double)` —
+// one double, SSE class — both 8 B) against an allocSize-only key shows it
+// is NOT sufficient: the second record's for-in silently read the wrong
+// return-register class through the shared, first-creator-typed `Current`
+// (`sum=0` instead of `sum=300` — a WRONG VALUE, not a crash, since both
+// registers are architecturally valid — LANE_RULES §6c "loud -> quiet is a
+// rejected trade" would forbid SHIPPING this as a narrowing; it is instead
+// the reason this key widens past the allocSize scheme). A struct/class
+// element type in Bezel always lowers (`recordStruct`/`classStruct`,
+// LlvmBackend_Layout.cpp) to a NAMED (identified) `llvm::StructType` unique
+// per declaration and per generic instantiation (`recordStruct` folds
+// generic arguments into a `$specN` name; LLVM's own struct-name uniquing —
+// `StructType::create` appends a numeric suffix on a name clash — is the
+// safety net if two distinct declarations ever produced the same raw name),
+// so the struct's own LLVM type name already IS full type identity, at no
+// extra bookkeeping cost.
+std::string Emitter::linkedListEnumElementName(llvm::Type* elemTy) const {
+    if (elemTy->isIntegerTy())
+        return "i" + std::to_string(elemTy->getIntegerBitWidth());
+    if (elemTy->isPointerTy())
+        return "ptr";
+    // A bare floating-point element (`LinkedList<double>`, no wrapping
+    // record) is not an `llvm::StructType` — give it its own scalar-width
+    // arm rather than letting it fall into the struct arm (false, wrong
+    // shape) or the byte-size fallback below (which would collide it with
+    // an equal-size struct, reintroducing exactly the hazard this helper
+    // exists to close).
+    if (elemTy->isFloatingPointTy())
+        return "fp" + std::to_string(elemTy->getPrimitiveSizeInBits());
+    if (elemTy->isStructTy()) {
+        auto* st = llvm::cast<llvm::StructType>(elemTy);
+        if (!st->isLiteral() && st->hasName())
+            return "s$" + st->getName().str();
+    }
+    // Fallback for an anonymous/literal aggregate — not reachable through
+    // any current Bezel value-type lowering (every record/class lowers to a
+    // NAMED struct above), kept only so an unnamed aggregate degrades to
+    // the #3570/#3661 allocSize scheme rather than asserting.
+    return "f" + std::to_string(
+        (int64_t)module_->getDataLayout().getTypeAllocSize(elemTy));
+}
 
 // #2471 (stdlib §4.11 "Iteration order" v0.195; language spec §29.1,
 // agreeing with #2472's for-loop fix, LlvmBackend_Stmts.cpp): the
@@ -10346,9 +10394,30 @@ llvm::Value* Emitter::wrapNestedArrayAsIEnumerable(llvm::Value* arr,
 // so one set per element type per module.
 Emitter::LlEnumMachinery Emitter::ensureLinkedListEnumMachinery(llvm::Type* elemTy) {
     LlEnumMachinery m;
-    std::string elemName = elemTy->isIntegerTy()
-        ? ("i" + std::to_string(elemTy->getIntegerBitWidth()))
-        : (elemTy->isPointerTy() ? "ptr" : "f");
+    // fix #3663 (§29.2 / §28.9 / §4.6 / §4.7, v0.286): the inline cache-key
+    // spelling collapsed every struct element type to `"f"`, so two
+    // different struct element types in one module — e.g. `LinkedList<Point>`
+    // (8 B) and `LinkedList<BigPoint>` (16 B) — shared one
+    // `bz$llenum$f$Current` whose baked-in element type was the first
+    // creator's, the #3570/#3661 shape. MEASURED here, though: an
+    // allocSize-only key (`enumMachineryElementName`, the #3570/#3661/#3662
+    // pattern) is NOT sufficient at this site — `Current` returns `elemTy`
+    // BY VALUE, and two struct types of the SAME alloc size but a DIFFERENT
+    // LAYOUT (a `record IntPair(X: int, Y: int)` vs a `record OneDouble
+    // (V: double)`, both 8 B — different x86-64 SysV ABI aggregate-return
+    // classes) silently produced a WRONG VALUE sharing one `f8`-keyed
+    // `Current` (`sum=0` instead of `sum=300` for the second type's loop),
+    // not a crash. Use the STRONGER `linkedListEnumElementName` key instead
+    // — see its declaration/definition for why the struct's own LLVM type
+    // name (full per-declaration identity) closes this without a mangled
+    // layout string. `enumMachineryElementName`'s contract for its existing
+    // six call sites is UNCHANGED (LANE_RULES §R12: "do not widen the
+    // helper's contract... without stating why") — this is a parallel
+    // helper, not a widening of that one, and the same same-size/
+    // different-layout gap likely exists at those six sites too (`Current`
+    // there also returns `elemTy` by value) but is UNMEASURED and OUT OF
+    // SCOPE for this lane; filed separately (see this fix's commit body).
+    std::string elemName = linkedListEnumElementName(elemTy);
     std::string stName = "llenum." + elemName;
     auto* stTy = llvm::StructType::getTypeByName(llvm_, stName);
     if (!stTy)
@@ -10554,9 +10623,16 @@ llvm::Value* Emitter::wrapOwnedLinkedListAsIEnumerable(
     llvm::StructType* stTy = m.stTy;
     llvm::GlobalVariable* plainVtGV = m.vtGV;
 
-    std::string elemName = elemTy->isIntegerTy()
-        ? ("i" + std::to_string(elemTy->getIntegerBitWidth()))
-        : (elemTy->isPointerTy() ? "ptr" : "f");
+    // fix #3663 (§29.2 / §28.9 / §4.6 / §4.7, v0.286): same collapse as
+    // `ensureLinkedListEnumMachinery` above — MUST use the SAME
+    // `linkedListEnumElementName` helper (not `enumMachineryElementName`),
+    // so the OWNING wrap's `plainPrefix` agrees with the plain machinery's
+    // key for the same element type (they must name the SAME
+    // `bz$llenum$<elemName>$` family so the OWNING vtable's slots 2/3
+    // correctly reuse the plain MoveNext/Current `m` just built — a
+    // mismatched key here would silently rebuild a SECOND, disconnected
+    // "plain" family that the OWNING vtable never points at).
+    std::string elemName = linkedListEnumElementName(elemTy);
     std::string plainPrefix = "bz$llenum$" + elemName + "$";
     std::string prefix = "bz$llenumown$" + elemName + "$";
     auto* voidTy = llvm::Type::getVoidTy(llvm_);
