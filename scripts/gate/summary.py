@@ -164,6 +164,20 @@ def merge(summaries):
     return {"binaries": bins, "total": grand}
 
 
+def paired_summaries(logdir):
+    """The two summary sources keyed by (binary, shard_index): the legacy
+    stderr-line parse and the structured JSON. Either value may be None (that
+    source produced nothing for that shard). ONE pairing, read by both
+    check_agreement and both_absent_shards — the two must never disagree about
+    which shards exist or a shard could be a mismatch in one and invisible in
+    the other."""
+    legacy = {(s["binary"], s["shard_index"]): s["legacy"]
+              for s in read_legacy_summaries(logdir)}
+    structured = {(s["binary"], s["shard_index"]): s["json"]
+                  for s in read_shard_summaries(logdir)}
+    return legacy, structured
+
+
 def check_agreement(logdir):
     """Pair JSON summaries with legacy summaries by (binary, shard_index) and
     compare passed/failed/total (and selected when the legacy line carries
@@ -174,10 +188,7 @@ def check_agreement(logdir):
     Observation-only: this never raises on a malformed input; it records the
     defect as a mismatch string so the caller (run_parallel) can log it
     without affecting its verdict."""
-    legacy = {(s["binary"], s["shard_index"]): s["legacy"]
-              for s in read_legacy_summaries(logdir)}
-    structured = {(s["binary"], s["shard_index"]): s["json"]
-                  for s in read_shard_summaries(logdir)}
+    legacy, structured = paired_summaries(logdir)
     mismatches = []
     keys = sorted(set(legacy) | set(structured))
     for key in keys:
@@ -691,8 +702,56 @@ def any_log_has_fail_marker(paths):
 
 
 def shard_log_paths(logdir):
-    """Every `shard.<name>.<i>.log` in `logdir`, sorted. [] if unreadable."""
-    return sorted(glob.glob(os.path.join(logdir, "shard.*.log")))
+    """The `shard.<name>.<i>.log` files to scan, given the path a caller can
+    ACTUALLY learn. Sorted; [] when none can be found.
+
+    sharpen #3667: the live logdir is an `mktemp -d` that never survives.
+    `_rp_keep` (tests/run_parallel.sh:101-115) MOVES it on failure to
+    `${BEZEL_SHARD_LOG_KEEP:-/var/tmp/bezel-scratch/shard-logs}/<ts>-rc<rc>/`
+    and its one printed message (:108) names only the PARENT. So the only path
+    a caller can hand us is one level ABOVE the logs, and a glob of
+    `<dir>/shard.*.log` returns nothing there — absence of evidence that the
+    caller must not read as evidence of absence. Hence two levels:
+
+      1. `<dir>/shard.*.log` — the live logdir, or a kept run passed directly.
+         When these exist they win outright: the caller named the logdir, so
+         sibling subdirectories are none of our business.
+      2. `<dir>/*/shard.*.log` — the kept PARENT. If several timestamped runs
+         are present (the keep dir accumulates one per failed run until
+         gc_scratch reaps it) only the NEWEST is scanned.
+
+    Newest-wins rather than refuse-on-ambiguity, deliberately. Refusing would
+    make the scan unusable exactly when it is needed — after the second failed
+    gate the parent always holds more than one run — and "unusable" here means
+    the caller falls back to the gate log alone, which is the fail-open shape
+    this function exists to close. The choice is sound because gates serialise
+    (the gate_and_push lockfile), so run N's logdir is written strictly after
+    run N-1's; that ordering holds whether the directory mtime records the move
+    or the last write into it, which is why mtime is safe here despite
+    rename(2) not updating the moved directory's own mtime. The name is the
+    tiebreak: `<ts>-rc<rc>` sorts in time order too.
+
+    RESIDUAL, pinned by test_only_the_newest_kept_run_is_scanned: if the
+    newest run is clean and an OLDER one carried a `[ FAIL ]`, this reports no
+    marker. That is correct — the older run is a different run — but it means
+    the scan answers "did THIS run fail", not "has anything here ever failed".
+    """
+    direct = sorted(glob.glob(os.path.join(logdir, "shard.*.log")))
+    if direct:
+        return direct
+    nested = {}
+    for path in glob.glob(os.path.join(logdir, "*", "shard.*.log")):
+        nested.setdefault(os.path.dirname(path), []).append(path)
+    if not nested:
+        return []
+
+    def _stamp(d):
+        try:
+            return (os.path.getmtime(d), d)
+        except OSError:  # raced away between glob and stat
+            return (0.0, d)
+
+    return sorted(nested[max(nested, key=_stamp)])
 
 
 def ceiling_only_failure(run_summary_path, shard_log_path,
@@ -731,8 +790,9 @@ def ceiling_only_failure(run_summary_path, shard_log_path,
           mismatch — BEFORE the `--- failing tests ---` block at :317-322 — so
           the GATE LOG carries no `[ FAIL ]` line at all and a gate-log-only
           scan sees a clean ceiling kill. Hence `shard_logs_dir`: when the
-          per-shard logs are still on disk (run_parallel's `_rp_keep` trap
-          keeps them on a failure), scan those too. X is also in
+          per-shard logs are still on disk (`_rp_keep` keeps them on a
+          failure, under a timestamped subdirectory — see `shard_log_paths`),
+          scan those too. X is also in
           `missing_summary_shards` and NOT in `timed_out_shards`, so the
           subset conjunct rejects the shape even when the logs are gone.
       (b) rc==0 with NO summary — a shard that exited cleanly having validated
@@ -746,10 +806,22 @@ def ceiling_only_failure(run_summary_path, shard_log_path,
     already in `crashed_shards` and the second conjunct rejects it.
 
     `shard_logs_dir` is optional: None scans only the gate log. When it IS
-    given it must be an existing directory — a caller that asks for the
-    per-shard scan and cannot get it is in the "cannot classify" state, not
-    the "nothing found" state. A directory holding no `shard.*.log` (reaped
-    logs) contributes no evidence and is not itself a defect.
+    given it must be an existing directory that actually yields shard logs —
+    a caller that asks for the per-shard scan and cannot get it is in the
+    "cannot classify" state, never the "nothing found" state.
+
+    sharpen #3667 corrects what the previous revision of this paragraph
+    claimed. It said a directory holding no `shard.*.log` "contributes no
+    evidence and is not itself a defect", which was wrong twice over. First,
+    that IS the common case rather than an edge: `_rp_keep`
+    (tests/run_parallel.sh:101-115) MOVES the logdir to
+    `<keep>/<ts>-rc<rc>/` and prints only the PARENT (:108), so the only path
+    a caller can learn was one level above every log and the glob always came
+    back empty. Second, treating empty as "no evidence" made the whole scan
+    fail open: a run whose nested `shard.codegen.0.log` carried
+    `[ FAIL ] own_branch_disposal.row7` classified as a clean ceiling kill.
+    `shard_log_paths` now searches that nested layout, and an empty result is
+    a hard False / exit 2.
 
     Returns False (never True) when the run summary is missing, unparseable or
     carries the wrong schema, and whenever a log cannot be read: "cannot
@@ -774,7 +846,17 @@ def ceiling_only_failure(run_summary_path, shard_log_path,
     if shard_logs_dir is not None:
         if not os.path.isdir(shard_logs_dir):
             return False  # asked for the scan and could not do it
-        paths += shard_log_paths(shard_logs_dir)
+        found = shard_log_paths(shard_logs_dir)
+        if not found:
+            # sharpen #3667: asked for the per-shard scan and found NOTHING to
+            # scan. That is the same absence-of-evidence shape as a defaulted
+            # --missing-summary: a caller who names a directory holding no
+            # shard logs (the pre-fix kept-parent case, a reaped dir, a typo)
+            # learns nothing, and "learned nothing" must never mean "clean".
+            # Fail closed; the CLI reports it as exit 2 so the caller can tell
+            # it from a confident "no".
+            return False
+        paths += found
     return any_log_has_fail_marker(paths) is False
 
 
@@ -965,11 +1047,9 @@ def both_absent_shards(logdir):
     """Shard IDs ("name/idx") for which NEITHER a JSON nor a legacy summary
     exists — the ceiling-kill shape check_agreement now treats as agreement
     (narrow #3667). Reported by _main_check so "0 mismatches" never reads as
-    "every shard reported in"."""
-    legacy = {(s["binary"], s["shard_index"]): s["legacy"]
-              for s in read_legacy_summaries(logdir)}
-    structured = {(s["binary"], s["shard_index"]): s["json"]
-                  for s in read_shard_summaries(logdir)}
+    "every shard reported in". Shares check_agreement's pairing so the two
+    cannot drift about which shards exist."""
+    legacy, structured = paired_summaries(logdir)
     out = []
     for key in sorted(set(legacy) | set(structured)):
         if legacy.get(key) is None and structured.get(key) is None:
@@ -1134,10 +1214,14 @@ def _main_ceiling_only(argv):
     p.add_argument("--shard-log", required=True,
                    help="the gate's shard log (gate.sh's $S/gate_shard.log)")
     p.add_argument("--shard-logs-dir", default=None,
-                   help="run_parallel's shard logdir; when given, its "
-                        "shard.*.log files are scanned for [ FAIL ] too "
-                        "(the gate log alone can be missing them, see "
-                        "ceiling_only_failure case (a))")
+                   help="run_parallel's shard logdir, OR the kept parent it "
+                        "prints on failure (BEZEL_SHARD_LOG_KEEP, default "
+                        "/var/tmp/bezel-scratch/shard-logs) — the newest "
+                        "timestamped run under it is used. Its shard.*.log "
+                        "files are scanned for [ FAIL ] too, because the gate "
+                        "log alone can be missing them (see "
+                        "ceiling_only_failure case (a)). Naming a directory "
+                        "that yields no shard logs is exit 2, not a pass.")
     args = p.parse_args(argv)
     obj = read_shard_summary(args.run_summary)
     if obj is None or obj.get("schema") != RUN_SCHEMA:
@@ -1150,7 +1234,18 @@ def _main_ceiling_only(argv):
             sys.stderr.write("summary.py ceiling-only: --shard-logs-dir %s is "
                              "not a directory\n" % args.shard_logs_dir)
             return 2
-        paths += shard_log_paths(args.shard_logs_dir)
+        found = shard_log_paths(args.shard_logs_dir)
+        if not found:
+            sys.stderr.write("summary.py ceiling-only: --shard-logs-dir %s "
+                             "holds no shard.*.log (nor any in a single "
+                             "subdirectory) — cannot classify\n"
+                             % args.shard_logs_dir)
+            return 2
+        # Say WHICH kept run was scanned: with the _rp_keep parent the choice
+        # is newest-wins, and a silent choice is an undiagnosable one.
+        sys.stderr.write("summary.py ceiling-only: scanning %d shard log(s) "
+                         "in %s\n" % (len(found), os.path.dirname(found[0])))
+        paths += found
     if any_log_has_fail_marker(paths) is None:
         sys.stderr.write("summary.py ceiling-only: unreadable shard log among "
                          "%s\n" % " ".join(paths))

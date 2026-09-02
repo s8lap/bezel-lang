@@ -1817,6 +1817,94 @@ class CeilingOnlyFailureTest(_CeilingFixture):
             self.assertTrue(summary.ceiling_only_failure(
                 rs, log, shard_logs_dir=d))
 
+    def test_the_kept_parent_layout_is_searched_one_level_deep(self):
+        # sharpen #3667, the reviewer's construction. _rp_keep
+        # (tests/run_parallel.sh:101-115) MOVES the logdir to
+        # <keep>/<ts>-rc<rc>/ and prints only the PARENT (:108) — the live
+        # mktemp logdir never survives, so the ONLY path a caller can learn is
+        # one level above every log. Globbing <dir>/shard.*.log there returned
+        # [], "no logs" was read as "no evidence", and a run whose nested
+        # shard.codegen.0.log carried a [ FAIL ] classified as a clean
+        # ceiling kill.
+        with tempfile.TemporaryDirectory() as parent:
+            run = os.path.join(parent, "20260903-011844-rc1")
+            os.mkdir(run)
+            rs, log = self._build(run, timed_out=True, crashed=False,
+                                  fail_in_log=False, fail_in_shard_log=True)
+            # Passing the run dir itself has always worked...
+            self.assertFalse(summary.ceiling_only_failure(
+                rs, log, shard_logs_dir=run))
+            # ...and now so does the parent, which is the path _rp_keep prints.
+            self.assertFalse(summary.ceiling_only_failure(
+                rs, log, shard_logs_dir=parent))
+
+    def test_the_kept_parent_still_says_yes_on_a_clean_ceiling_kill(self):
+        # The nested search is a widening of the evidence, not a blanket "no".
+        with tempfile.TemporaryDirectory() as parent:
+            run = os.path.join(parent, "20260903-011844-rc1")
+            os.mkdir(run)
+            rs, log = self._build(run, timed_out=True, crashed=False,
+                                  fail_in_log=False)
+            self.assertTrue(summary.ceiling_only_failure(
+                rs, log, shard_logs_dir=parent))
+
+    def test_a_dir_yielding_no_shard_logs_is_not_ceiling_only(self):
+        # The absence-of-evidence rule, same shape as the --missing-summary
+        # fail-open default: a caller who names a directory holding no shard
+        # logs (a reaped run, a typo, the pre-fix kept-parent case) learned
+        # NOTHING, and "learned nothing" must never mean "clean".
+        with tempfile.TemporaryDirectory() as d:
+            rs, log = self._build(d, timed_out=True, crashed=False,
+                                  fail_in_log=False)
+            empty = os.path.join(d, "empty")
+            os.mkdir(empty)
+            self.assertFalse(summary.ceiling_only_failure(
+                rs, log, shard_logs_dir=empty))
+
+    def test_only_the_newest_kept_run_is_scanned(self):
+        # The keep dir accumulates one subdirectory per failed run. Refusing on
+        # ambiguity would make the scan unusable from the second failed gate
+        # onwards — which is the fail-open fallback again — so the NEWEST run
+        # wins. Both directions are pinned, including the residual: an older
+        # run's [ FAIL ] is deliberately NOT reported, because it belongs to a
+        # different run.
+        with tempfile.TemporaryDirectory() as parent:
+            old_run = os.path.join(parent, "20260901-000000-rc1")
+            new_run = os.path.join(parent, "20260903-011844-rc1")
+            os.mkdir(old_run)
+            os.mkdir(new_run)
+            # The OLD run failed; the NEW one is a clean ceiling kill.
+            rs_old, log_old = self._build(old_run, timed_out=True,
+                                          crashed=False, fail_in_log=False,
+                                          fail_in_shard_log=True)
+            rs, log = self._build(new_run, timed_out=True, crashed=False,
+                                  fail_in_log=False)
+            os.utime(old_run, (1_000_000, 1_000_000))
+            os.utime(new_run, (2_000_000, 2_000_000))
+            self.assertTrue(summary.ceiling_only_failure(
+                rs, log, shard_logs_dir=parent))
+            # ...and with the newest carrying the marker, it is seen.
+            os.utime(old_run, (2_000_000, 2_000_000))
+            os.utime(new_run, (1_000_000, 1_000_000))
+            self.assertFalse(summary.ceiling_only_failure(
+                rs, log, shard_logs_dir=parent))
+
+    def test_a_direct_logdir_wins_over_sibling_subdirectories(self):
+        # When the caller names the actual logdir, its own shard.*.log files
+        # are the answer — sibling subdirectories are none of our business.
+        with tempfile.TemporaryDirectory() as d:
+            rs, log = self._build(d, timed_out=True, crashed=False,
+                                  fail_in_log=False)
+            stale = os.path.join(d, "20260101-000000-rc1")
+            os.mkdir(stale)
+            _write_log(stale, "codegen", 0,
+                       "[ FAIL ] stale.row1 (1 ms)\n")
+            self.assertTrue(summary.ceiling_only_failure(
+                rs, log, shard_logs_dir=d))
+            found = summary.shard_log_paths(d)
+            self.assertTrue(found, "the direct logdir must yield its own logs")
+            self.assertEqual({os.path.dirname(x) for x in found}, {d})
+
     def test_a_shard_logs_dir_that_is_not_a_directory_is_not_ceiling_only(self):
         # Asking for the per-shard scan and not getting it is the
         # "cannot classify" state, never "nothing found".
@@ -1924,6 +2012,47 @@ class CeilingOnlyCLITest(_CeilingFixture):
             out = self._cli(["run-summary", "ceiling-only", rs,
                              "--shard-log", log, "--shard-logs-dir", d])
             self.assertEqual(out.returncode, 0, out.stderr + out.stdout)
+
+    def test_exits_one_for_the_kept_parent_holding_a_failing_run(self):
+        # The reviewer's construction end-to-end: run summary says
+        # timed_out=[codegen/0] crashed=[] missing_summary=[codegen/0], and the
+        # nested shard.codegen.0.log carries [ FAIL ] own_branch_disposal.row7.
+        # Before the nested search this exited 0 (retryable) over a red run.
+        with tempfile.TemporaryDirectory() as parent:
+            run = os.path.join(parent, "20260903-011844-rc1")
+            os.mkdir(run)
+            rs, log = self._build(run, timed_out=True, crashed=False,
+                                  fail_in_log=False, fail_in_shard_log=True)
+            out = self._cli(["run-summary", "ceiling-only", rs,
+                             "--shard-log", log, "--shard-logs-dir", parent])
+            self.assertEqual(out.returncode, 1, out.stderr + out.stdout)
+            # and it says which kept run it scanned — a silent choice is an
+            # undiagnosable one.
+            self.assertIn("20260903-011844-rc1", out.stderr)
+
+    def test_exits_zero_for_the_kept_parent_holding_a_clean_ceiling_kill(self):
+        with tempfile.TemporaryDirectory() as parent:
+            run = os.path.join(parent, "20260903-011844-rc1")
+            os.mkdir(run)
+            rs, log = self._build(run, timed_out=True, crashed=False,
+                                  fail_in_log=False)
+            out = self._cli(["run-summary", "ceiling-only", rs,
+                             "--shard-log", log, "--shard-logs-dir", parent])
+            self.assertEqual(out.returncode, 0, out.stderr + out.stdout)
+
+    def test_exits_two_when_the_shard_logs_dir_holds_no_shard_logs(self):
+        # An existing but empty directory is "cannot classify" (2), never a
+        # confident "retryable" (0).
+        with tempfile.TemporaryDirectory() as d:
+            rs, log = self._build(d, timed_out=True, crashed=False,
+                                  fail_in_log=False)
+            empty = os.path.join(d, "empty")
+            os.mkdir(empty)
+            out = self._cli(["run-summary", "ceiling-only", rs,
+                             "--shard-log", log, "--shard-logs-dir", empty])
+            self.assertEqual(out.returncode, 2, out.stderr + out.stdout)
+            self.assertIn("no shard.*.log", out.stderr)
+            self.assertIn(empty, out.stderr)
 
     def test_exits_two_when_the_shard_logs_dir_does_not_exist(self):
         with tempfile.TemporaryDirectory() as d:
