@@ -2153,6 +2153,70 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
     // pre-scan block below re-establishes (closureReleaseEligible, boxCapture,
     // cellFreeEligible, plus the three sibling sets). // per §27.5, §28.9
     CaptureReclaimSetScope captureReclaimScope(*this);
+    // fix #3697 (§28.9 / §28.11 / §30.7, v0.286): the save/restore half of the
+    // borrowing-collection reclaim re-establishment the resume preamble below
+    // adds — LANE_RULES §8's "a clear() on per-lowering state and a save/restore
+    // around nested emission are two halves of ONE contract". Same reason
+    // `CaptureReclaimSetScope` is on the line above: this emitter is reached
+    // mid-emission of an OUTER body by `instantiateGenericSpecialization`
+    // (LlvmBackend_Calls2.cpp ~L12345/L12371), whose `SmFrameSaveScope` does NOT
+    // cover these six sets or their five function tokens, so without this the
+    // outer body would resume lowering with every `borrowing*/dict*/grouping/
+    // set-literal/dict-literal` reclaim keyed to THIS iterator's resumeFn and
+    // would silently skip its own — a leak, in the direction this whole commit
+    // exists to close. Declared local to the member function (which grants it
+    // the function's access to Emitter's private members) rather than beside
+    // CaptureReclaimSetScope in LlvmBackend_impl.hpp because it guards exactly
+    // one call site. // per §28.9, §28.11
+    struct BorrowingReclaimSetScope {
+        explicit BorrowingReclaimSetScope(Emitter& e)
+            : e_(e),
+              borrowingArrayFreeEligible_(e.borrowingArrayFreeEligible_),
+              borrowingArrayFreeEligibleFn_(e.borrowingArrayFreeEligibleFn_),
+              dictMaterializerFreeEligible_(e.dictMaterializerFreeEligible_),
+              dictMaterializerFreeEligibleFn_(e.dictMaterializerFreeEligibleFn_),
+              groupingFreeEligible_(e.groupingFreeEligible_),
+              groupingFreeEligibleFn_(e.groupingFreeEligibleFn_),
+              setLiteralFreeEligible_(e.setLiteralFreeEligible_),
+              setLiteralFreeEligibleFn_(e.setLiteralFreeEligibleFn_),
+              dictLiteralFreeEligible_(e.dictLiteralFreeEligible_),
+              dictLiteralFreeEligibleFn_(e.dictLiteralFreeEligibleFn_),
+              literalTreeAggregateEligible_(e.literalTreeAggregateEligible_) {}
+        ~BorrowingReclaimSetScope() {
+            e_.borrowingArrayFreeEligible_ =
+                std::move(borrowingArrayFreeEligible_);
+            e_.borrowingArrayFreeEligibleFn_ = borrowingArrayFreeEligibleFn_;
+            e_.dictMaterializerFreeEligible_ =
+                std::move(dictMaterializerFreeEligible_);
+            e_.dictMaterializerFreeEligibleFn_ = dictMaterializerFreeEligibleFn_;
+            e_.groupingFreeEligible_ = std::move(groupingFreeEligible_);
+            e_.groupingFreeEligibleFn_ = groupingFreeEligibleFn_;
+            e_.setLiteralFreeEligible_ = std::move(setLiteralFreeEligible_);
+            e_.setLiteralFreeEligibleFn_ = setLiteralFreeEligibleFn_;
+            e_.dictLiteralFreeEligible_ = std::move(dictLiteralFreeEligible_);
+            e_.dictLiteralFreeEligibleFn_ = dictLiteralFreeEligibleFn_;
+            e_.literalTreeAggregateEligible_ =
+                std::move(literalTreeAggregateEligible_);
+        }
+        BorrowingReclaimSetScope(const BorrowingReclaimSetScope&) = delete;
+        BorrowingReclaimSetScope& operator=(const BorrowingReclaimSetScope&) =
+            delete;
+
+    private:
+        Emitter& e_;
+        std::unordered_set<const void*> borrowingArrayFreeEligible_;
+        llvm::Function* borrowingArrayFreeEligibleFn_;
+        std::unordered_set<const void*> dictMaterializerFreeEligible_;
+        llvm::Function* dictMaterializerFreeEligibleFn_;
+        std::unordered_set<const void*> groupingFreeEligible_;
+        llvm::Function* groupingFreeEligibleFn_;
+        std::unordered_set<const void*> setLiteralFreeEligible_;
+        llvm::Function* setLiteralFreeEligibleFn_;
+        std::unordered_set<const void*> dictLiteralFreeEligible_;
+        llvm::Function* dictLiteralFreeEligibleFn_;
+        std::unordered_set<const void*> literalTreeAggregateEligible_;
+    };
+    BorrowingReclaimSetScope borrowingReclaimScope(*this);
     smKind_ = SuspendKind::AsyncYield;
 
     // §29.6 / §30.7 (#554): check for FORBIDDEN suspend positions in this async
@@ -2753,6 +2817,64 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
         // Mirror the synchronous setup. // per §28.3
         unwindIneligibleFn_ = resumeFn;
         collectUnwindIneligible(*ci.stmts);
+        // fix #3697 / #2148 / #2142 / #2143 / #1003 / #1028 / #1930 / §28.9 /
+        // §28.11 / §30.7 (v0.286): the SIXTH member of this emitter's
+        // "re-establish this pass for the resume fn" family, and the last one
+        // the async ITERATOR was still missing. The scope-end reclaim of a
+        // plain `var` borrowing-`Array<T>` / `Set<T>` / `Dictionary<K,V>`
+        // LITERAL, and of a `var` fresh borrowing-array / dict / grouping
+        // MATERIALIZER, is registered in lowerLocalDecl behind
+        // `currentFn_ == borrowingArrayFreeEligibleFn_` (and the four
+        // analogues). The async-iterator body lowers with
+        // currentFn_ == resumeFn while emitFunctionBody left all five keyed to
+        // the ENTRY (factory) fn (LlvmBackend_Setup.cpp ~L9081), so every such
+        // reclaim was silently skipped and the backing leaked on the
+        // iterator's NORMAL-COMPLETION edge.
+        //
+        // This is the async-ITERATOR spelling of the identical block
+        // #2148 added to the sync iterator (LlvmBackend_Iterators.cpp
+        // emitIteratorMethod, ~L1690) and #2132/#2142/#2143 added to
+        // emitAsyncMethod's resume (~L1348 above) and emitAsyncLambda's
+        // (~L1893). All three siblings had it; `emitAsyncIteratorMethod` — the
+        // fourth — never did. Measured on r12-cycle-1 at 200 full drains under
+        // ASan/LeakSanitizer, every SYNC-iterator twin of the same body clean:
+        //
+        //   var xs: Array<int> := [10, 20, 30];        24000 B /  400 allocs
+        //   var parts := "a,b,c,d".Split(",");         51200 B / 2000 allocs
+        //   var d := nums.ToDictionary(sel);          109600 B / 1600 allocs
+        //   var s: Set<int> := [10, 20, 30];           85600 B / 1200 allocs
+        //   var d: Dictionary<string,int> := [...];    84000 B / 1000 allocs
+        //   var g := xs.GroupBy(sel).First();          44000 B / 1200 allocs
+        //
+        // NO NEW PREDICATE: `collectBorrowingArrayFreeEligible` already computes
+        // every fact the five reclaim sites need — one call re-populates all six
+        // sets — it simply was never asked about this body. Re-pin all five fn
+        // keys to resumeFn, exactly as the sync iterator re-pins them to
+        // moveNextFn.
+        //
+        // ABANDONMENT (§29.7) is covered by the same route #2148's sync twin
+        // uses: the yield handler snapshots every live Disposal that is neither
+        // `caughtException` nor `unwindOnly` into `smIterCleanupAtState_` and
+        // Dispose replays it in reverse. These entries are node-keyed
+        // `Disposal`s and are NOT on the §27.5 exclusion list in
+        // LlvmBackend_Stmts.cpp (`closureRelease || boxedCellFree ||
+        // boxedCellFreeDeferred || inlineOwnedArrayCell`), so they enrol, and
+        // they run exactly once for the reason every other entry there relies
+        // on — Dispose stamps the DISPOSED sentinel before running the stack,
+        // exhaustion parks -1, and the throw edge parks -1 (#3531), neither of
+        // which has a case in the switch. Both edges are pinned as rows in the
+        // regression test.
+        //
+        // The Dispose body below lowers with currentFn_ == targetFn, so these
+        // tokens do not match there and nothing arms in it — the same scoping
+        // the other five re-establishments already rely on.
+        // // per §28.9, §28.11, §30.7
+        collectBorrowingArrayFreeEligible(*ci.stmts);
+        borrowingArrayFreeEligibleFn_ = resumeFn;
+        dictMaterializerFreeEligibleFn_ = resumeFn;   // #1028
+        groupingFreeEligibleFn_ = resumeFn;           // #1930
+        setLiteralFreeEligibleFn_ = resumeFn;         // #2142
+        dictLiteralFreeEligibleFn_ = resumeFn;        // #2143
         // fix #2817 / #2807 / #429 / §4.6 / §28.9 / §28.3 / §30.7 (v0.240): the
         // `var` STRING-local refcount analysis must describe the async-ITERATOR
         // resume fn too — the same re-establishment #1896/#1897 made just above
