@@ -89,6 +89,13 @@ static std::string laneLocalAsanObjectOpts() {
     return cached;
 }
 
+// #3653: NOT converted to tests/support/run_under_asan.hpp. Materially
+// different toolchain wiring — uses its own lane-local
+// laneLocalAsanObjectOpts() (building the ASan runtime object at a
+// wtDirOpts()-scoped path, #1414) instead of the shared
+// ::bezel::native_test::asanRuntimeObject(), AND a different return-code
+// contract (passes the raw child exit code through unmodified rather than
+// collapsing to 0/1).
 int runUnderAsanOpts(const std::string& source, bool detectLeaks = true) {
     namespace fs = std::filesystem;
     const std::string& rtObj = laneLocalAsanObjectOpts();

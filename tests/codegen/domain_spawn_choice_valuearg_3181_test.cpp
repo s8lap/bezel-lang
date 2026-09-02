@@ -141,6 +141,15 @@ int compileImportAndRun3181(const std::string& libSrc, const std::string& appSrc
 // regression in the new heap-copy path (double-free, dangling pointer,
 // missed free) shows up under the sanitizer. Mirrors the helper shape
 // in tests/codegen/domain_spawn_lambda_valuearg_1490_test.cpp.
+//
+// #3653: NOT converted to tests/support/run_under_asan.hpp. Despite mirroring
+// domain_spawn_lambda_valuearg_1490's shape closely, this copy's LINK failure
+// path returns the OLD conflated -1 (not #3633's -3), while its own
+// `status == -1` (system() failure) path already returns -4 -- an internally
+// inconsistent, partially-migrated copy, not a clean match to Family B. Filed
+// separately as a latent bug (a link failure here reads as "toolchain
+// unavailable: SKIP" instead of a loud FAIL) — see the issue filed alongside
+// this commit; fixing it is out of scope for a pure dedup.
 int runUnderASan3181(const std::string& source) {
     const std::string& rtObj = ::bezel::native_test::asanRuntimeObject();
     if (rtObj.empty()) return -1;

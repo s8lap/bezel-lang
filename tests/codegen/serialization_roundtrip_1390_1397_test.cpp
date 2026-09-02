@@ -61,6 +61,7 @@
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 #include "native_test_harness.hpp"
+#include "support/run_under_asan.hpp"
 
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
@@ -108,54 +109,8 @@ int compileAndRun(const std::string& source) {
 // ASan places allocations high in the address space, so this is the direct
 // reproduction of the #1390 crash condition without needing a long test prefix.
 int runUnderAsan1390(const std::string& source) {
-    namespace fs = std::filesystem;
-    const std::string& rtObj = ::bezel::native_test::asanRuntimeObject();
-    if (rtObj.empty()) return -1;
-
-    static int counter = 0;
-    auto dir = fs::temp_directory_path();
-    std::string stem = "bezel_1390_asan_" + std::to_string(counter++);
-    std::string objPath = (dir / (stem + ".o")).string();
-    std::string exe     = (dir / stem).string();
-
-    {
-        bezel::DiagnosticEngine diags;
-        bezel::Lexer lexer(source, diags);
-        bezel::Parser parser(lexer, diags);
-        auto unit = parser.parseCompilationUnit();
-        if (!unit) return -2;
-        bezel::sema::SemaContext ctx(diags);
-        bezel::sema::collectSymbols(*unit, ctx);
-        bezel::sema::resolveTypes(*unit, ctx);
-        bezel::sema::typecheckExpressions(*unit, ctx);
-        bezel::sema::checkDefiniteAssignment(*unit, ctx);
-        bezel::ownership::checkOwnership(*unit, ctx);
-        if (diags.hasErrors()) return -2;
-        llvm::LLVMContext llvmCtx;
-        auto module = bezel::codegen::emitModule(*unit, ctx, llvmCtx);
-        if (!module) return -2;
-        std::string err;
-        if (!bezel::codegen::emitObjectFile(*module, objPath, err)) return -2;
-    }
-
-    auto cleanup = [&] {
-        std::remove(objPath.c_str());
-        std::remove(exe.c_str());
-    };
-    std::string linkCmd = "clang++ -fsanitize=address -g " + objPath + " " +
-                          rtObj + " -lm -lpthread -lstdc++ -o " + exe +
-                          " > /dev/null 2>&1";
-    if (std::system(linkCmd.c_str()) != 0) { cleanup(); return -3; }
-    // detect_leaks=0: the program intentionally exercises the serializer only.
-    // exitcode=99 lets us distinguish a sanitizer abort from Main's own code.
-    std::string runCmd =
-        std::string("ASAN_OPTIONS=detect_leaks=0:exitcode=99 ") + exe +
-        " > /dev/null 2>&1";
-    int status = std::system(runCmd.c_str());
-    cleanup();
-    if (status == -1) return -4;
-    if (WIFEXITED(status) && WEXITSTATUS(status) == 99) return 1;  // sanitizer
-    return 0;                                                       // clean
+    // fix #3653: forwards to the ONE shared implementation.
+    return bezel::test::runUnderAsan(source, "bezel_1390_aot", /*detectLeaks=*/false);
 }
 
 // ── #1397: BinarySerializer write → ToBytes → BinaryDeserializer read ─────────

@@ -66,6 +66,7 @@
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/Support/TargetSelect.h"
 #include "native_test_harness.hpp"
+#include "support/run_under_asan.hpp"
 
 extern "C" void bz_flush_static_owned(void);
 
@@ -120,63 +121,13 @@ int run(const std::string& src) {
 
 namespace fs = std::filesystem;
 
-// Per-process unique working dir, under the shared scratch base (never
-// /tmp — see support/scratch_dir.hpp) and reaped at process exit.
-static const std::filesystem::path& wtDir1524() {
-    return wtScratchDir("wt-1524");
-}
-
 // AOT ASan probe (mirrors bounded_channel_809_test.cpp::runUnderAsan): emit an
 // object from `source`, compile the runtime under ASan, link, run with leak
 // detection. Returns 0 (clean), 1 (ASan/LSan hit — leak/double-free/UAF), or
 // -1 when clang++/the sub-compile is unavailable (infra skip, not a failure).
 int runUnderAsan(const std::string& source) {
-    if (std::system("clang++ --version > /dev/null 2>&1") != 0) return -1;
-    auto dir = wtDir1524();
-    std::string stem = unique_stem("bezel_1524_asan");
-    std::string objPath = (dir / (stem + ".o")).string();
-    std::string rtObj   = (dir / (stem + "_rt.o")).string();
-    std::string exe     = (dir / stem).string();
-
-    {
-        bezel::DiagnosticEngine diags;
-        bezel::Lexer lexer(source, diags);
-        bezel::Parser parser(lexer, diags);
-        auto unit = parser.parseCompilationUnit();
-        if (!unit) return -2;
-        bezel::sema::SemaContext ctx(diags);
-        bezel::sema::collectSymbols(*unit, ctx);
-        bezel::sema::resolveTypes(*unit, ctx);
-        bezel::sema::typecheckExpressions(*unit, ctx);
-        bezel::ownership::checkOwnership(*unit, ctx);
-        if (diags.hasErrors()) return -2;
-        auto llvmCtx = std::make_unique<llvm::LLVMContext>();
-        auto module = bezel::codegen::emitModule(*unit, ctx, *llvmCtx,
-                                                 bezel::codegen::CodegenOptions{});
-        if (!module) return -2;
-        std::string err;
-        if (!bezel::codegen::emitObjectFile(*module, objPath, err)) return -2;
-    }
-    auto cleanup = [&] {
-        std::remove(objPath.c_str());
-        std::remove(rtObj.c_str());
-        std::remove(exe.c_str());
-    };
-    if (!::bezel::native_test::buildRuntimeSanitizerObject("address", rtObj)) {
-        cleanup();
-        return -1;
-    }
-    std::string linkCmd = "clang++ -fsanitize=address -g " + objPath + " " +
-                          rtObj + " -lm -lpthread -lstdc++ -o " + exe +
-                          " > /dev/null 2>&1";
-    if (std::system(linkCmd.c_str()) != 0) { cleanup(); return -3; }
-    std::string runCmd =
-        "ASAN_OPTIONS=detect_leaks=1:exitcode=99 " + exe + " > /dev/null 2>&1";
-    int status = std::system(runCmd.c_str());
-    cleanup();
-    if (status == -1) return -4;
-    if (WIFEXITED(status) && WEXITSTATUS(status) == 99) return 1;  // sanitizer hit
-    return 0;                                                       // clean
+    // fix #3653: forwards to the ONE shared implementation.
+    return bezel::test::runUnderAsan(source, "bezel_1524_asan");
 }
 
 // A class item whose destructor bumps a static counter (= disposal counter).

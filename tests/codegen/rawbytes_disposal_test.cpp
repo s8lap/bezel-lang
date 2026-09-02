@@ -91,6 +91,12 @@ int compileAndRun(const std::string& source) {
 //   0  — ran clean: no use-after-free / double-free of the RawBytes allocations.
 //  99  — ASan reported a memory-safety error (the regression we guard against).
 //  -1  — toolchain unavailable / build step failed: SKIP (not a failure).
+//
+// #3653: NOT converted to tests/support/run_under_asan.hpp. A hybrid of the
+// two shared shapes: Family C's ASAN_OPTIONS (detect_leaks=0 +
+// abort_on_error=0) paired with Family B's coarse 0/99 verdict rather than
+// Family C's raw exit-code passthrough. Neither shared function reproduces
+// this exact combination without a behavior change.
 int runUnderAsanNoCorruption(const std::string& source) {
     const std::string& rtObj = ::bezel::native_test::asanRuntimeObject();
     if (rtObj.empty()) return -1;  // toolchain unavailable or compile failed

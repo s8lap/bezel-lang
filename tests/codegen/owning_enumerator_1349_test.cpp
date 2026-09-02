@@ -40,6 +40,7 @@
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 #include "native_test_harness.hpp"
+#include "support/run_under_asan.hpp"
 
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
@@ -96,51 +97,8 @@ int runFull(const std::string& src) {
 // AOT compile → object → link with ASan → run.
 // Returns 0 (clean), 1 (sanitizer fired), -1 (toolchain missing).
 int runUnderASan(const std::string& source) {
-    const std::string& rtObj = ::bezel::native_test::asanRuntimeObject();
-    if (rtObj.empty()) return -1;
-
-    static int counter = 0;
-    auto dir = fs::temp_directory_path();
-    std::string stem = "bezel_1349_asan_" + std::to_string(counter++);
-    std::string objPath = (dir / (stem + ".o")).string();
-    std::string exe     = (dir / stem).string();
-
-    {
-        bezel::DiagnosticEngine diags;
-        bezel::Lexer lexer(source, diags);
-        bezel::Parser parser(lexer, diags);
-        auto unit = parser.parseCompilationUnit();
-        if (!unit) return -2;
-        bezel::sema::SemaContext ctx(diags);
-        bezel::sema::collectSymbols(*unit, ctx);
-        bezel::sema::resolveTypes(*unit, ctx);
-        bezel::sema::typecheckExpressions(*unit, ctx);
-        bezel::sema::checkDefiniteAssignment(*unit, ctx);
-        bezel::ownership::checkOwnership(*unit, ctx);
-        if (diags.hasErrors()) return -2;
-        llvm::LLVMContext llvmCtx;
-        auto module = bezel::codegen::emitModule(*unit, ctx, llvmCtx);
-        if (!module) return -2;
-        std::string err;
-        if (!bezel::codegen::emitObjectFile(*module, objPath, err)) return -2;
-    }
-
-    auto cleanup = [&] {
-        std::remove(objPath.c_str());
-        std::remove(exe.c_str());
-    };
-    std::string linkCmd = "clang++ -fsanitize=address -g " + objPath + " " +
-                          rtObj + " -lm -lpthread -lstdc++ -o " + exe +
-                          " > /dev/null 2>&1";
-    if (std::system(linkCmd.c_str()) != 0) { cleanup(); return -3; }
-    std::string runCmd =
-        std::string("ASAN_OPTIONS=detect_leaks=1:exitcode=99 ") + exe +
-        " > /dev/null 2>&1";
-    int status = std::system(runCmd.c_str());
-    cleanup();
-    if (status == -1) return -4;
-    if (WIFEXITED(status) && WEXITSTATUS(status) == 99) return 1;
-    return 0;
+    // fix #3653: forwards to the ONE shared implementation.
+    return bezel::test::runUnderAsan(source, "bezel_1349_asan");
 }
 
 // Shared counting class for disposal tracking.

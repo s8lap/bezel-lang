@@ -105,6 +105,15 @@ int runFull(const std::string& src) {
 // free detected by ASan in a child process (no shard crash); with the fix each
 // element is disposed exactly once (by the array) and the using var is a no-op
 // borrow-pin.
+//
+// #3653: NOT converted to tests/support/run_under_asan.hpp. This copy predates
+// #3633's per-cause return-code split (abdbe32 explicitly left it untouched as
+// out-of-scope) — every failure path here still returns the OLD conflated -1
+// (toolchain-unavailable, compile failure, link failure and system() failure
+// are indistinguishable), and it uses raw fs::temp_directory_path() + a static
+// counter instead of the wtScratchDir()/unique_stem() discipline every
+// converted copy shares. Folding this in would silently upgrade its skip/fail
+// semantics — a real behavior change, out of scope for a pure dedup.
 int runUnderASan(const std::string& source) {
     const std::string& rtObj = ::bezel::native_test::asanRuntimeObject();
     if (rtObj.empty()) return -1;

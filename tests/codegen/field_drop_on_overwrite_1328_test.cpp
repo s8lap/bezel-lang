@@ -39,6 +39,7 @@
 #include "support/scratch_dir.hpp"
 #include "support/unique_stem.hpp"
 #include "native_test_harness.hpp"
+#include "support/run_under_asan.hpp"
 #include "test_harness.hpp"
 
 #include "llvm/IR/LLVMContext.h"
@@ -48,12 +49,6 @@ using bezel::test::runAot;
 
 namespace {
 namespace fs = std::filesystem;
-
-// Per-process unique working dir, under the shared scratch base (never
-// /tmp — see support/scratch_dir.hpp) and reaped at process exit.
-static const std::filesystem::path& wtDir1328() {
-    return wtScratchDir("wt-1328");
-}
 
 // AOT oracle: drop-on-overwrite (§28.7) is disposal codegen, but the programs
 // must first pass the ownership + definite-assignment passes the JIT skipped.
@@ -69,50 +64,8 @@ int run(const std::string& src) {
 // AOT compile → object → link with ASan → run.
 // Returns 0 (clean), 1 (sanitizer fired), -1 (toolchain missing / compile error).
 int runUnderASan(const std::string& source) {
-    const std::string& rtObj = ::bezel::native_test::asanRuntimeObject();
-    if (rtObj.empty()) return -1;
-
-    auto dir = wtDir1328();
-    std::string stem = unique_stem("bezel_1328_asan");
-    std::string objPath = (dir / (stem + ".o")).string();
-    std::string exe     = (dir / stem).string();
-
-    {
-        bezel::DiagnosticEngine diags;
-        bezel::Lexer lexer(source, diags);
-        bezel::Parser parser(lexer, diags);
-        auto unit = parser.parseCompilationUnit();
-        if (!unit) return -2;
-        bezel::sema::SemaContext ctx(diags);
-        bezel::sema::collectSymbols(*unit, ctx);
-        bezel::sema::resolveTypes(*unit, ctx);
-        bezel::sema::typecheckExpressions(*unit, ctx);
-        bezel::sema::checkDefiniteAssignment(*unit, ctx);
-        bezel::ownership::checkOwnership(*unit, ctx);
-        if (diags.hasErrors()) return -2;
-        llvm::LLVMContext llvmCtx;
-        auto module = bezel::codegen::emitModule(*unit, ctx, llvmCtx);
-        if (!module) return -2;
-        std::string err;
-        if (!bezel::codegen::emitObjectFile(*module, objPath, err)) return -2;
-    }
-
-    auto cleanup = [&] {
-        std::remove(objPath.c_str());
-        std::remove(exe.c_str());
-    };
-    std::string linkCmd = "clang++ -fsanitize=address -g " + objPath + " " +
-                          rtObj + " -lm -lpthread -lstdc++ -o " + exe +
-                          " > /dev/null 2>&1";
-    if (std::system(linkCmd.c_str()) != 0) { cleanup(); return -3; }
-    std::string runCmd =
-        std::string("ASAN_OPTIONS=detect_leaks=1:exitcode=99 ") + exe +
-        " > /dev/null 2>&1";
-    int status = std::system(runCmd.c_str());
-    cleanup();
-    if (status == -1) return -4;
-    if (WIFEXITED(status) && WEXITSTATUS(status) == 99) return 1;
-    return 0;
+    // fix #3653: forwards to the ONE shared implementation.
+    return bezel::test::runUnderAsan(source, "bezel_1328_asan");
 }
 
 // Destructor-counter Cell: _n increments on construct, decrements on dispose.
@@ -140,7 +93,6 @@ const std::string kContainerHdr =
     "end Container; ";
 
 }  // namespace
-
 
 // ===========================================================================
 // Value tests — destructor-counter idiom
@@ -314,7 +266,6 @@ BEZEL_TEST(field_drop_on_overwrite_1328,
         "  return Cell._n; "
         "end Main; end C;"), 0);
 }
-
 
 // ===========================================================================
 // ASan AOT tests — heap correctness (no leak, no double-free)

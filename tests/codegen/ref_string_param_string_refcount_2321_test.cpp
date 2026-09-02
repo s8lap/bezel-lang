@@ -98,6 +98,12 @@ int lowerToObject(const std::string& source, const std::string& objPath) {
 // `crashIsVerifierOnly` treats a non-`WIFEXITED` status (SIGSEGV) as a
 // sanitizer-shape failure too — the program must complete the call chain
 // and return so we can attribute any leak. Returns -1 on toolchain miss.
+//
+// #3653: NOT converted to tests/support/run_under_asan.hpp. Materially
+// different return TYPE (RunResult{verdict,exitCode,stderrText}, not `int`):
+// this pin needs the raw ASan/LSan stderr text to assert leak ATTRIBUTION
+// (the callee's stack frame does/doesn't appear in the report), which none
+// of the three shared shapes capture.
 struct RunResult {
     int verdict;       // 0 = clean, 1 = sanitizer report (leak or crash)
     int exitCode;

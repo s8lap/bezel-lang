@@ -24,6 +24,7 @@
 #include "codegen/LlvmBackend.hpp"
 #include "lexer/Lexer.hpp"
 #include "native_test_harness.hpp"
+#include "support/run_under_asan.hpp"
 #include "ownership/Ownership.hpp"
 #include "parser/Parser.hpp"
 #include "sema/DefiniteAssignment.hpp"
@@ -43,57 +44,12 @@ namespace {
 
 namespace fs = std::filesystem;
 
-// Lower `source` to an object via the real native pipeline; -1 on failure.
-int lowerToObject(const std::string& source, const std::string& objPath) {
-    bezel::DiagnosticEngine diags;
-    bezel::Lexer lexer(source, diags);
-    bezel::Parser parser(lexer, diags);
-    auto unit = parser.parseCompilationUnit();
-    if (!unit) return -2;
-    bezel::sema::SemaContext ctx(diags);
-    bezel::sema::collectSymbols(*unit, ctx);
-    bezel::sema::resolveTypes(*unit, ctx);
-    bezel::sema::typecheckExpressions(*unit, ctx);
-    bezel::sema::checkDefiniteAssignment(*unit, ctx);
-    bezel::ownership::checkOwnership(*unit, ctx);
-    if (diags.hasErrors()) return -2;
-    llvm::LLVMContext llvmCtx;
-    auto module = bezel::codegen::emitModule(*unit, ctx, llvmCtx);
-    if (!module) return -2;
-    std::string err;
-    if (!bezel::codegen::emitObjectFile(*module, objPath, err)) return -2;
-    return 0;
-}
-
 // Compile `source` under ASan + LSan, run it, and check the exit code.
 // Returns 0 (clean), 1 (sanitizer problem or wrong value), -1 (toolchain
 // unavailable: SKIP).
 int runUnderAsan(const std::string& source, int expectedExitCode) {
-    const std::string& rtObj = ::bezel::native_test::asanRuntimeObject();
-    if (rtObj.empty()) return -1;
-    static int counter = 0;
-    auto dir = fs::temp_directory_path();
-    std::string stem = "bezel_tscope808_" + std::to_string(counter++);
-    std::string objPath = (dir / (stem + ".o")).string();
-    std::string exe = (dir / stem).string();
-    if (lowerToObject(source, objPath) != 0) return -2;
-    auto cleanup = [&] {
-        std::remove(objPath.c_str());
-        std::remove(exe.c_str());
-    };
-    std::string linkCmd = "clang++ -fsanitize=address -g " + objPath + " " +
-                          rtObj + " -lm -lpthread -lstdc++ -o " + exe +
-                          " > /dev/null 2>&1";
-    if (std::system(linkCmd.c_str()) != 0) { cleanup(); return -3; }
-    std::string runCmd = "ASAN_OPTIONS=detect_leaks=1:exitcode=99 " + exe +
-                         " > /dev/null 2>&1";
-    int status = std::system(runCmd.c_str());
-    cleanup();
-    if (status == -1) return -4;
-    if (!WIFEXITED(status)) return 1;          // crashed/aborted
-    int code = WEXITSTATUS(status);
-    if (code == 99) return 1;                  // sanitizer reported a problem
-    return (code == expectedExitCode) ? 0 : 1;
+    // fix #3653: forwards to the ONE shared implementation.
+    return bezel::test::runUnderAsanValue(source, expectedExitCode, "bezel_tscope808");
 }
 
 void expectAsanClean(const std::string& source, int expectedExitCode) {

@@ -39,6 +39,7 @@
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 #include "native_test_harness.hpp"
+#include "support/run_under_asan.hpp"
 
 #include <filesystem>
 #include <fstream>
@@ -74,53 +75,8 @@ int run(const std::string& program) {
 
 // Compile, link with ASan, run.  Returns 0 (clean), 1 (sanitizer), -1 (skip).
 int runUnderASan(const std::string& source) {
-    const std::string& rtObj = ::bezel::native_test::asanRuntimeObject();
-    if (rtObj.empty()) return -1;
-
-    static int counter = 0;
-    auto dir = fs::temp_directory_path();
-    std::string stem = "bezel_689_asan_" + std::to_string(counter++);
-    std::string objPath = (dir / (stem + ".o")).string();
-    std::string exe     = (dir / stem).string();
-
-    auto cleanup = [&] {
-        std::remove(objPath.c_str());
-        std::remove(exe.c_str());
-    };
-
-    {
-        bezel::DiagnosticEngine diags;
-        bezel::Lexer lexer(source, diags);
-        bezel::Parser parser(lexer, diags);
-        auto unit = parser.parseCompilationUnit();
-        if (!unit) return -2;
-        bezel::sema::SemaContext ctx(diags);
-        bezel::sema::collectSymbols(*unit, ctx);
-        bezel::sema::resolveTypes(*unit, ctx);
-        bezel::sema::typecheckExpressions(*unit, ctx);
-        bezel::sema::checkDefiniteAssignment(*unit, ctx);
-        bezel::ownership::checkOwnership(*unit, ctx);
-        if (diags.hasErrors()) return -2;
-        llvm::LLVMContext llvmCtx;
-        auto module = bezel::codegen::emitModule(*unit, ctx, llvmCtx);
-        if (!module) return -2;
-        std::string err;
-        if (!bezel::codegen::emitObjectFile(*module, objPath, err)) return -2;
-    }
-
-    std::string linkCmd = "clang++ -fsanitize=address -g " + objPath + " " +
-                          rtObj + " -lm -lpthread -lstdc++ -o " + exe +
-                          " > /dev/null 2>&1";
-    if (std::system(linkCmd.c_str()) != 0) { cleanup(); return -3; }
-
-    // detect_leaks=1: also run LSan on top of ASan.
-    std::string runCmd =
-        "ASAN_OPTIONS=detect_leaks=1:exitcode=99 " + exe + " > /dev/null 2>&1";
-    int status = std::system(runCmd.c_str());
-    cleanup();
-    if (status == -1) return -4;
-    if (WIFEXITED(status) && WEXITSTATUS(status) == 99) return 1;
-    return 0;
+    // fix #3653: forwards to the ONE shared implementation.
+    return bezel::test::runUnderAsan(source, "bezel_689_asan");
 }
 
 // Helper: run both via JIT (logic check) and via ASan native exe (memory check).
@@ -196,7 +152,6 @@ NativeRun runNativeCaptureStderr(const std::string& source) {
 
 } // anonymous namespace
 
-
 // ──────────────────────────────────────────────────────────────────────────────
 // Group 1: Atomic control block churn — clone/release many times.
 // §28.13 v0.140 / #689 Stage 1: counts are now atomic; verify basic lifetime
@@ -265,7 +220,6 @@ BEZEL_TEST(shared_sync_689_contention,
         "end C;";
     expectCleanAndEq(src, 1);
 }
-
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Group 2: Cross-domain Shared<Mutex> — clone, send, both domains use the mutex.
@@ -391,7 +345,6 @@ BEZEL_TEST(shared_sync_689_contention,
     BEZEL_EXPECT_TRUE(r.stderrText.find("boom from async main") !=
                       std::string::npos);
 }
-
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Group 3: TryUpgrade CAS hammer.

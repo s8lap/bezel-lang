@@ -51,6 +51,7 @@
 #include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration, P1)
 #include "support/codegen_support.hpp"
 #include "native_test_harness.hpp"
+#include "support/run_under_asan.hpp"
 #include "test_harness.hpp"
 
 #include "llvm/IR/LLVMContext.h"
@@ -60,12 +61,6 @@ using bezel::test::runAot;
 
 namespace {
 namespace fs = std::filesystem;
-
-// Per-process unique working dir, under the shared scratch base (never
-// /tmp — see support/scratch_dir.hpp) and reaped at process exit.
-static const std::filesystem::path& wtDir1625() {
-    return wtScratchDir("wt-1625");
-}
 
 // JIT run via the in-process pipeline (NOTE: no ownership pass on the codegen
 // AST — see file header). Used only for the sanity cases below that do not
@@ -79,50 +74,8 @@ int run(const std::string& src) {
 // Returns 0 (clean), 1 (sanitizer fired — a leak or memory error), -1
 // (toolchain unavailable / compile error).
 int runUnderASan(const std::string& source) {
-    const std::string& rtObj = ::bezel::native_test::asanRuntimeObject();
-    if (rtObj.empty()) return -1;
-
-    auto dir = wtDir1625();
-    std::string stem = unique_stem("bezel_1625_asan");
-    std::string objPath = (dir / (stem + ".o")).string();
-    std::string exe     = (dir / stem).string();
-
-    {
-        bezel::DiagnosticEngine diags;
-        bezel::Lexer lexer(source, diags);
-        bezel::Parser parser(lexer, diags);
-        auto unit = parser.parseCompilationUnit();
-        if (!unit) return -2;
-        bezel::sema::SemaContext ctx(diags);
-        bezel::sema::collectSymbols(*unit, ctx);
-        bezel::sema::resolveTypes(*unit, ctx);
-        bezel::sema::typecheckExpressions(*unit, ctx);
-        bezel::sema::checkDefiniteAssignment(*unit, ctx);
-        bezel::ownership::checkOwnership(*unit, ctx);
-        if (diags.hasErrors()) return -2;
-        llvm::LLVMContext llvmCtx;
-        auto module = bezel::codegen::emitModule(*unit, ctx, llvmCtx);
-        if (!module) return -2;
-        std::string err;
-        if (!bezel::codegen::emitObjectFile(*module, objPath, err)) return -2;
-    }
-
-    auto cleanup = [&] {
-        std::remove(objPath.c_str());
-        std::remove(exe.c_str());
-    };
-    std::string linkCmd = "clang++ -fsanitize=address -g " + objPath + " " +
-                          rtObj + " -lm -lpthread -lstdc++ -o " + exe +
-                          " > /dev/null 2>&1";
-    if (std::system(linkCmd.c_str()) != 0) { cleanup(); return -3; }
-    std::string runCmd =
-        std::string("ASAN_OPTIONS=detect_leaks=1:exitcode=99 ") + exe +
-        " > /dev/null 2>&1";
-    int status = std::system(runCmd.c_str());
-    cleanup();
-    if (status == -1) return -4;
-    if (WIFEXITED(status) && WEXITSTATUS(status) == 99) return 1;
-    return 0;
+    // fix #3653: forwards to the ONE shared implementation.
+    return bezel::test::runUnderAsan(source, "bezel_1625_asan");
 }
 
 // Destructor-counter Cell: _n increments on construct, decrements on dispose.
@@ -137,7 +90,6 @@ const std::string kCellHdr =
     "end Cell; ";
 
 }  // namespace
-
 
 // ===========================================================================
 // ASan AOT tests — PRIMARY bug pins (run the ownership pass + LeakSanitizer)
@@ -229,7 +181,6 @@ BEZEL_TEST(local_drop_on_overwrite_1625,
     if (rc == -1) return;  // toolchain unavailable — skip
     BEZEL_EXPECT_EQ(rc, 0);  // 0 = ASan clean (no use-after-free)
 }
-
 
 // ===========================================================================
 // JIT sanity tests — cases that do NOT depend on the becomesOwnedViaReassign

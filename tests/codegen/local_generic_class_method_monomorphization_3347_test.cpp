@@ -104,6 +104,14 @@ int run(const std::string& prog) {
 }
 
 // ASan / LSan check: returns 0 = clean, 1 = sanitizer error, -1 = skip.
+//
+// #3653: NOT converted to tests/support/run_under_asan.hpp. This copy
+// predates #3633's per-cause return-code split entirely: every failure path
+// (compile, link, and system() failure alike) still returns the OLD
+// conflated -1, no ASAN_OPTIONS is set explicitly (leak detection depends on
+// the sanitizer's own default rather than a documented detect_leaks=), and
+// it returns the raw WEXITSTATUS(status) rather than a 0/1 verdict. Folding
+// this in would silently change its skip/fail semantics.
 int runUnderAsanLsan(const std::string& source) {
     const std::string& rtObj = ::bezel::native_test::asanRuntimeObject();
     if (rtObj.empty()) return -1;

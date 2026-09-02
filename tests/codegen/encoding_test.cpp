@@ -53,6 +53,7 @@
 #include "support/unique_stem.hpp"
 #include "test_harness.hpp"
 #include "native_test_harness.hpp"
+#include "support/run_under_asan.hpp"
 
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
@@ -62,12 +63,6 @@ using bezel::test::runAot;
 namespace {
 
 namespace fs = std::filesystem;
-
-// Per-process unique working dir, under the shared scratch base (never
-// /tmp — see support/scratch_dir.hpp) and reaped at process exit.
-static const std::filesystem::path& wtDirEnc() {
-    return wtScratchDir("wt-enc");
-}
 
 int run(const std::string& src) {
     auto r = runAot(src);
@@ -93,25 +88,6 @@ bool compileFails(const std::string& source) {
 
 // Lower `source` to an object file via the sema+codegen pipeline; returns true
 // on success (object written to objPath).
-bool lowerToObject(const std::string& source, const std::string& objPath) {
-    bezel::DiagnosticEngine diags;
-    bezel::Lexer lexer(source, diags);
-    bezel::Parser parser(lexer, diags);
-    auto unit = parser.parseCompilationUnit();
-    if (!unit) return false;
-    bezel::sema::SemaContext ctx(diags);
-    bezel::sema::collectSymbols(*unit, ctx);
-    bezel::sema::resolveTypes(*unit, ctx);
-    bezel::sema::typecheckExpressions(*unit, ctx);
-    bezel::sema::checkDefiniteAssignment(*unit, ctx);
-    bezel::ownership::checkOwnership(*unit, ctx);
-    if (diags.hasErrors()) return false;
-    llvm::LLVMContext llvmCtx;
-    auto module = bezel::codegen::emitModule(*unit, ctx, llvmCtx);
-    if (!module) return false;
-    std::string err;
-    return bezel::codegen::emitObjectFile(*module, objPath, err);
-}
 
 // Build + link `source` against an ASan-built runtime and run it under ASan.
 // `detectLeaks` selects leak detection. Returns:
@@ -120,30 +96,8 @@ bool lowerToObject(const std::string& source, const std::string& objPath) {
 //   -1                       if the toolchain is unavailable (SKIP).
 // Uses the memoized ASan runtime object (compiled once per process).
 int runUnderAsan(const std::string& source, bool detectLeaks) {
-    const std::string& rtObj = ::bezel::native_test::asanRuntimeObject();
-    if (rtObj.empty()) return -1;  // toolchain unavailable or compile failed
-    auto dir = wtDirEnc();
-    std::string stem = unique_stem("bezel_enc");
-    std::string objPath = (dir / (stem + ".o")).string();
-    std::string exe     = (dir / stem).string();
-    auto cleanup = [&] {
-        std::remove(objPath.c_str());
-        std::remove(exe.c_str());
-    };
-    if (!lowerToObject(source, objPath)) { cleanup(); return -2; }
-    std::string linkCmd = "clang++ -fsanitize=address -g " + objPath + " " +
-                          rtObj + " -lm -lpthread -lstdc++ -o " + exe +
-                          " > /dev/null 2>&1";
-    if (std::system(linkCmd.c_str()) != 0) { cleanup(); return -3; }
-    std::string opts = detectLeaks ? "detect_leaks=1" : "detect_leaks=0";
-    std::string runCmd = "ASAN_OPTIONS=" + opts +
-                         ":exitcode=99:abort_on_error=0 " + exe +
-                         " > /dev/null 2>&1";
-    int status = std::system(runCmd.c_str());
-    cleanup();
-    if (status == -1) return -4;
-    if (!WIFEXITED(status)) return 99;
-    return WEXITSTATUS(status);
+    // fix #3653: forwards to the ONE shared implementation.
+    return bezel::test::runUnderAsanExitCode(source, "bezel_enc", detectLeaks);
 }
 
 // Assert the value AND that the GetBytes byte-array path is fully leak-free

@@ -50,6 +50,7 @@
 #include "support/unique_stem.hpp"
 #include "test_harness.hpp"
 #include "native_test_harness.hpp"
+#include "support/run_under_asan.hpp"
 
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
@@ -59,12 +60,6 @@ using bezel::test::runAot;
 namespace {
 
 namespace fs = std::filesystem;
-
-// Per-process unique working dir, under the shared scratch base (never
-// /tmp — see support/scratch_dir.hpp) and reaped at process exit.
-static const std::filesystem::path& wtDir466() {
-    return wtScratchDir("wt-466");
-}
 
 // Run the JIT pipeline; return the exit code, or -999 if the program did not
 // run (compile error / JIT failure).
@@ -88,59 +83,12 @@ bool diagContains(const std::string& src, const std::string& needle) {
     return false;
 }
 
-// ---- ASan leg (mirrors linq_refcount_test.cpp) --------------------------
-// Lower `source` to an object via the real native pipeline; -1 on any failure.
-int lowerToObject(const std::string& source, const std::string& objPath) {
-    bezel::DiagnosticEngine diags;
-    bezel::Lexer lexer(source, diags);
-    bezel::Parser parser(lexer, diags);
-    auto unit = parser.parseCompilationUnit();
-    if (!unit) return -2;
-    bezel::sema::SemaContext ctx(diags);
-    bezel::sema::collectSymbols(*unit, ctx);
-    bezel::sema::resolveTypes(*unit, ctx);
-    bezel::sema::typecheckExpressions(*unit, ctx);
-    bezel::sema::checkDefiniteAssignment(*unit, ctx);
-    bezel::ownership::checkOwnership(*unit, ctx);
-    if (diags.hasErrors()) return -2;
-    llvm::LLVMContext llvmCtx;
-    auto module = bezel::codegen::emitModule(*unit, ctx, llvmCtx);
-    if (!module) return -2;
-    std::string err;
-    if (!bezel::codegen::emitObjectFile(*module, objPath, err)) return -2;
-    return 0;
-}
-
 // Compile `source` under ASan + LeakSanitizer, run it, and check the exit code.
 // Returns 0 (clean: correct value, no leak, no UAF/double-free), 1 (sanitizer
 // reported a problem OR wrong value), or -1 (toolchain unavailable: SKIP).
 int runUnderAsan(const std::string& source, int expectedExitCode) {
-    const std::string& rtObj = ::bezel::native_test::asanRuntimeObject();
-    if (rtObj.empty()) return -1;  // toolchain unavailable: skip
-    auto dir = wtDir466();
-    std::string stem = unique_stem("bezel_466rev");
-    std::string objPath = (dir / (stem + ".o")).string();
-    std::string exe     = (dir / stem).string();
-    if (lowerToObject(source, objPath) != 0) return -2;
-    auto cleanup = [&] {
-        std::remove(objPath.c_str());
-        std::remove(exe.c_str());
-    };
-    std::string linkCmd = "clang++ -fsanitize=address -g " + objPath + " " +
-                          rtObj + " -lm -lpthread -lstdc++ -o " + exe +
-                          " > /dev/null 2>&1";
-    if (std::system(linkCmd.c_str()) != 0) { cleanup(); return -3; }
-    // detect_leaks=1 catches leaks; exitcode=99 is ASan's distinct error code
-    // (a UAF/double-free can never be confused with the program's own return).
-    std::string runCmd = "ASAN_OPTIONS=detect_leaks=1:exitcode=99 " + exe +
-                         " > /dev/null 2>&1";
-    int status = std::system(runCmd.c_str());
-    cleanup();
-    if (status == -1) return -4;
-    if (!WIFEXITED(status)) return 1;            // crashed/aborted (the bug!)
-    int code = WEXITSTATUS(status);
-    if (code == 99) return 1;                     // sanitizer reported a problem
-    return (code == expectedExitCode) ? 0 : 1;    // wrong value → failure
+    // fix #3653: forwards to the ONE shared implementation.
+    return bezel::test::runUnderAsanValue(source, expectedExitCode, "bezel_466rev");
 }
 
 // Assert: program is correct under the JIT AND ASan-clean (no leak / no
