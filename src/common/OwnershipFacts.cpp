@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "ast/Node.hpp"
+#include "sema/FieldSymbolAccessors.hpp"
 #include "sema/SemaContext.hpp"
 #include "sema/Symbol.hpp"
 #include "sema/TypeRef.hpp"
@@ -113,13 +114,10 @@ bool isNonTrivialDisposeClass(const sema::TypeSymbol* decl,
             // short-circuit above (`importedNonTrivialDispose`) already
             // covers wire-side fidelity: the exporter runs this same
             // predicate, and the carried verdict is replayed at import.
-            const ast::Type* fieldAstTy = nullptr;
-            if (fs->posParam) {
-                fieldAstTy = fs->posParam->type.get();
-            } else if (auto* fd =
-                           dynamic_cast<const ast::FieldDecl*>(fs->decl)) {
-                fieldAstTy = fd->type.get();
-            }
+            // fix #3650: the ONE both-sources field-declared-type accessor
+            // (src/sema/FieldSymbolAccessors.hpp) replaces this file's own
+            // copy of the AST cast — see that header for the full rationale.
+            const ast::Type* fieldAstTy = sema::fieldDeclTypeOf(fs);
             if (fieldAstTy &&
                 fieldAstTy->kind == ast::TypeKind::InlineArray &&
                 fieldAstTy->arrayOwned) {
@@ -280,15 +278,10 @@ bool isNonTrivialDisposeClassImpl(
             // Imports are already short-circuited above via the Consult arm
             // of `importedNonTrivialDispose` (the exporter runs the same
             // predicate and carries the verdict across the wire, #3191).
-            const ast::Type* fieldAstTy = nullptr;
-            if (fs->posParam) fieldAstTy = fs->posParam->type.get();
-            else if (fs->decl) {
-                // SEAM-ACCESSOR: both-sources (symbol-side `fs->decl`-gate
-                // above; AST side the FieldDecl cast here; import path dead
-                // via Consult arm — see Layout.cpp:1509/#3149 for template).
-                if (auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl))
-                    fieldAstTy = fd->type.get();
-            }
+            // fix #3650 (closes issue 3651's interim SEAM-ACCESSOR marker):
+            // the ONE both-sources field-declared-type accessor, same as the
+            // legacy overload's arm above.
+            const ast::Type* fieldAstTy = sema::fieldDeclTypeOf(fs);
             if (fieldAstTy && fieldAstTy->kind == ast::TypeKind::InlineArray &&
                 fieldAstTy->arrayOwned) { reject = true; break; }
             if (fs->posParam) {

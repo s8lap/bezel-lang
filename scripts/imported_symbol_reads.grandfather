@@ -50,7 +50,7 @@
 59   src/codegen/LlvmBackend_Setup.cpp
 4    src/codegen/LlvmBackend_Stmts.cpp
 21   src/codegen/LlvmBackend_impl.hpp
-2    src/common/OwnershipFacts.cpp
+1    src/common/OwnershipFacts.cpp
 4    src/module/ModuleLoader.cpp
 10   src/module/ModuleMetadataBuilder.cpp
 4    src/ownership/Ownership.cpp

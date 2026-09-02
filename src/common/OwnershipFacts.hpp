@@ -114,7 +114,9 @@ using TypeParamResolver =
 // fix #2666: the owning-inline-array arm of the spec's third disqualifier
 // (`[N owned]T?` / `[N owned]T`, §15.1.1) is tested here directly — read
 // from `fs->posParam->type` for primary-ctor parameters and from the body
-// `FieldDecl`'s type otherwise.  The IMPORTED-class short-circuit
+// `FieldDecl`'s type otherwise, via `sema::fieldDeclTypeOf`
+// (src/sema/FieldSymbolAccessors.hpp, fix #3650) so this file holds no AST
+// cast of its own.  The IMPORTED-class short-circuit
 // (`importedNonTrivialDispose`) above carries the exporter's verdict on the
 // wire; the exporter runs this same predicate.  Callers that previously kept
 // their own inline-array walk (`MethodOwnership::classChainHasOwningInlineArrayField`
