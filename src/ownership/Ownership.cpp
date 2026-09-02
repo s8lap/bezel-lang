@@ -755,13 +755,12 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                 (reassignedLocals.count(sym) == 0 ||
                  reassignedDropCovered_.count(sym) != 0)) {
                 if (auto* ls = dynamic_cast<sema::LocalSymbol*>(sym)) {
-                    if (auto* ld =
                     // LOCALDECL-ONLY: fires only when `st.state == OwnershipState::Owned`
                     // (endState.Owned). A §21.1 `const` local's `states_` entry is never
                     // Owned (visitStmt's LocalConstDecl arm is a no-op: "a const local
                     // carries no obligation"), so `ls->decl` here is always a var
                     // LocalDecl. // per §21.1, #3591
-                            dynamic_cast<const ast::LocalDecl*>(ls->decl)) {
+                    if (auto* ld = dynamic_cast<const ast::LocalDecl*>(ls->decl)) {
                         const_cast<ast::LocalDecl*>(ld)->autoDropAtScopeEnd = true;
                         // §28.9 (v0.237) trivial-dispose exemption, #2654:
                         // "A `new` expression of a trivial-dispose class type
@@ -911,14 +910,13 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                 (reassignedLocals.count(sym) == 0 ||
                  reassignedDropCovered_.count(sym) != 0)) {
                 if (auto* ls = dynamic_cast<sema::LocalSymbol*>(sym)) {
-                    if (auto* ld =
                     // LOCALDECL-ONLY: the async suspend-local twin of the sync gate at :759 --
                     // same reasoning: this arm only fires for a symbol whose `states_` entry ended
                     // Owned, and a runtime `const` local's state is never Owned (§21.1's "never-
                     // owned" binding -- no state transition is ever recorded for LocalConstDecl,
                     // see visitStmt's LocalConstDecl arm). `ls->decl` here is always a var
                     // LocalDecl. // per §21.1, #3591
-                            dynamic_cast<const ast::LocalDecl*>(ls->decl)) {
+                    if (auto* ld = dynamic_cast<const ast::LocalDecl*>(ls->decl)) {
                         // §28.3/§28.11 (#1504): a suspend-local of a
                         // BORROWING-COLLECTION type (isBorrowingCollectionName-
                         // Head — Array<T>/Stack<T>/Queue<T>/Set<T>/
@@ -988,14 +986,13 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
             // arm is a marker-free-position consume; per-path disposal is the
             // language's job).
             if (auto* lsAt = dynamic_cast<sema::LocalSymbol*>(sym)) {
-                if (auto* ldAt =
                 // LOCALDECL-ONLY: `dischargedByArmTransfer` (ast/Node.hpp) is "set by the
                 // ownership pass on a plain `var` owned class/interface local consumed by a
                 // MARKED ARM TRANSFER" -- a marked-arm-transfer consume requires an Owned
                 // production, which a §21.1 `const` local can never bind, so the flag can
                 // never be set on a LocalConstDecl target. `lsAt->decl` here is always a var
                 // LocalDecl. // per §21.1, §28.3 K3.4, #3591
-                        dynamic_cast<const ast::LocalDecl*>(lsAt->decl)) {
+                if (auto* ldAt = dynamic_cast<const ast::LocalDecl*>(lsAt->decl)) {
                     if (ldAt->dischargedByArmTransfer) continue;
                 }
             }
@@ -1129,12 +1126,12 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                 reassignedDropCovered_.count(sym) == 0) continue;
             auto* ls = dynamic_cast<sema::LocalSymbol*>(sym);
             if (!ls) continue;
-            // LOCALDECL-ONLY: `sym` is drawn from `everOwnedPlainLocals_`, which
-            // `handleLocalDecl` (the var-only arm of visitStmt) alone populates -- "record
-            // a plain (non-`using`) owned local" -- so every symbol reaching this loop
-            // already has `ls->decl` pointing at a var LocalDecl by construction; a
-            // LocalConstDecl can never be inserted (§21.1's const is never Owned).
-            // per §21.1, §28.3, #3591
+            // LOCALDECL-ONLY: `sym` is drawn from `everOwnedPlainLocals_`, which has
+            // TWO populators -- `handleLocalDecl` (var arm, this file) and the inline
+            // `out owned var` seed (Ownership_Checks.cpp ~:7310) -- so `ls->decl` here
+            // is either a var LocalDecl (below) or an IdentifierExpr (fifteen lines
+            // down). Neither populator can ever admit a §21.1 `const` local (never
+            // Owned). // per §21.1, §28.3, #3591
             auto* ld = dynamic_cast<const ast::LocalDecl*>(ls->decl);
             if (ld) {
                 // Skip a local already flagged by the endState loop (it reaches the
@@ -1805,10 +1802,12 @@ void scanReassignStmt(const ast::Stmt& s, sema::SemaContext& ctx,
             if (sema::Symbol* sym = ctx.exprSymbol(*id)) out.insert(sym);
         scanReassignExpr(is->target.get(), ctx, out);
     // LOCALDECL-ONLY: scans a var's initializer for embedded `out`/`ref`
-    // reassignment targets; §22.3's v1 bound forbids ANY such target from
-    // being owned state, and `reassignedLocals` matters only where
-    // `st.state == Owned` -- so a const initializer's embedded reassignment
-    // (§21.1) can only ever hit a non-owned recipient. // per §22.3, §21.1, #3591
+    // reassignment targets; `reassignedLocals` matters only where
+    // `st.state == Owned`. A const initializer's embedded `out`/`ref` write
+    // to an owned local is now REJECTED at the call site: visitStmt's
+    // LocalConstDecl arm runs `recordMovesIn(lc->value)` (fix #3591), whose
+    // `checkRefOutOwnedOperand` enforces §22.3's v1 bound there exactly as
+    // for `var` -- so no owned-state target can survive to reach this scan.
     } else if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
         scanReassignExpr(ld->initializer.get(), ctx, out);
     } else if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(&s)) {
@@ -2704,6 +2703,26 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
                     "`using var` (§21.1 / §28.3)");
             }
         }
+        // fix #3591 (LOCALDECL-bare gap, §22.3): the checks above decide only
+        // whether the WHOLE initializer is itself a rejected owned production
+        // (§21.1's top-level rule) — they never walk INTO the initializer's
+        // own sub-expressions the way handleLocalDecl's var twin does via
+        // `recordMovesIn(*ld.initializer)`. That walk is where
+        // `checkRefOutOwnedOperand` lives (recordMovesInArgs' per-argument
+        // loop): the §22.3 v1 bound ("no location of owned state" as a
+        // `ref`/`out` argument) and the §22.3 named-owned-binding `move`
+        // marker validation. Without it, a const initializer's CALL could
+        // silently write through an existing owned local via `out`/`ref`
+        // (measured: `var item := new Res(1); const ok := F.Fill(out item);`
+        // compiled and leaked the displaced value — the `var` twin of the
+        // same call is correctly rejected) or move-consume a named owned
+        // binding with no marker check. Mirroring the var arm's call closes
+        // both: `checkRefOutOwnedOperand` now rejects the `out`/`ref`-owned
+        // shape here exactly as it already does for `var`, and
+        // `scanReassignStmt`'s LocalConstDecl omission (below, #3591) is
+        // correct-by-context because the shape it would have needed to see
+        // can no longer reach it. // per §22.3, §21.1, #3591
+        if (lc->value) recordMovesIn(*lc->value);
         // No state transition: a const local carries no obligation. The
         // narrowing-persistence rule (§7.4) is enforced in sema; the
         // ownership pass treats the binding as a no-op for its analysis.
@@ -6017,12 +6036,11 @@ void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
             // owned, is never reassigned a borrow, so the flag is sound once set.
             if (st.state == OwnershipState::Owned) {
                 if (auto* lsym = dynamic_cast<sema::LocalSymbol*>(sym)) {
-                    if (auto* ld2 =
                     // LOCALDECL-ONLY: this flag setter fires only inside `if (st.state ==
                     // OwnershipState::Owned)` on a symbol that just ADOPTED Owned state via
                     // reassignment -- a §21.1 `const` local can never be reassigned, so `sym`
                     // here is always a var LocalDecl. // per §21.1, §28.7, #3591
-                            dynamic_cast<const ast::LocalDecl*>(lsym->decl))
+                    if (auto* ld2 = dynamic_cast<const ast::LocalDecl*>(lsym->decl))
                         if (ld2->initializer &&
                             dynamic_cast<const ast::NullLiteralExpr*>(
                                 ld2->initializer.get()))
