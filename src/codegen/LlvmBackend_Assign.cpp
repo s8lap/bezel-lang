@@ -7833,8 +7833,14 @@ llvm::Value* Emitter::wrapAsIEnumerableForTarget(
                 setFn, {v, builder_.getInt64((int64_t)ksz)}, "setenum.lazy");
             if (outWrapMade) *outWrapMade = true;
             // fix #2299 / §28.9: free the source set right after the snapshot.
+            // fix #3568: the null value disposer is EXPLICIT here, not a
+            // default — a dict-backed Set's hash table has keys and no values,
+            // so there is no value slot for a disposer to reach. (Its string
+            // KEYS are a separate, pre-existing gap: they are released by
+            // `bz_set_string_keys_release`, a scope-end pass this RETURN
+            // coercion does not run — see freeDictSourceNow's #2710 note.)
             if (srcOwnedByCallee)
-                freeDictSourceNow(v);
+                freeDictSourceNow(v, /*valDisposer=*/nullptr);
             return drainLazyPipelineToOwnedIEnumerable(lazy, targetTy);
         }
     }
@@ -7888,18 +7894,41 @@ llvm::Value* Emitter::wrapAsIEnumerableForTarget(
         // carries end to end. A non-primitive K or V falls through to the
         // historical `return v`, where it keeps failing LOUDLY (the SIGSEGV it
         // produced before #3519) instead of being turned into a wrong answer.
-        if (!dictEntryWrapShapeSupported(targetTy)) return v;
+        //
+        // fix #3568 (§29.2 / §28.9 / §4.8, v0.286): the narrowing existed
+        // because this arm had no way to discharge a non-primitive value's
+        // disposal obligation. It has one now — `dictSnapshotValueDisposers`
+        // splits that obligation into the half the source free discharges and
+        // the half the snapshot's slot-1 Dispose does — so the gate is handed
+        // the SOURCE type and admits every shape those two disposers cover.
+        if (!dictEntryWrapShapeSupported(targetTy, actualTy)) return v;
+        // The two halves are derived TOGETHER, at the one site that decides
+        // both, so a shape can never take one without the other. Both stay null
+        // for a BORROWED source: the source dictionary outlives this coercion
+        // and keeps owning its values, so the snapshot must neither free a box
+        // nor dispose a value.
+        llvm::Function* immediateValDisp = nullptr;
+        llvm::Function* deferredValDisp  = nullptr;
+        if (srcOwnedByCallee)
+            dictSnapshotValueDisposers(actualTy, &immediateValDisp,
+                                       &deferredValDisp);
         llvm::Value* wrap =
             (builtinTypeName(actualTy) == "SortedDictionary")
                 ? wrapSortedDictionaryAsIEnumerable(v, targetTy)
-                : wrapDictionaryAsIEnumerable(v, targetTy);
+                : wrapDictionaryAsIEnumerable(v, targetTy, deferredValDisp);
         // A malformed entry TypeRef (no `DictionaryEntry<K,V>` args) makes the
         // helpers decline; fall through to the historical pass-through rather
         // than claim a frame that was never minted (#3419: a claim wider than
         // the mint double-frees).
         if (wrap) {
             if (outWrapMade) *outWrapMade = true;
-            if (srcOwnedByCallee) freeDictSourceNow(v);
+            // fix #3568: the source free discharges ONLY the storage the
+            // snapshot copied out of the table (the record / nullable-value
+            // box). Everything the snapshot ALIASED is discharged by
+            // `deferredValDisp` at the wrapper's slot-1 Dispose instead —
+            // passing it here would free the objects the caller is about to
+            // iterate.
+            if (srcOwnedByCallee) freeDictSourceNow(v, immediateValDisp);
             return wrap;
         }
         return v;
@@ -8238,11 +8267,107 @@ void Emitter::freeCollectionSourceNow(llvm::Value* v,
 // follow-up — out of #2710's stated scope (Array AND LinkedList); the
 // set-key release lives at the scope-end-disposal layer, not the
 // RETURN-coercion one.
+//
+// fix #3568 (§29.2 / §28.9 / stdlib §4.8, v0.286): the one-argument spelling is
+// now the KEYS-ONLY face and nothing else. It is reached from exactly the two
+// dict-backed `Set` arms (LlvmBackend_Setup.cpp's local-decl mint and — before
+// this commit — the RETURN coercion in this file): a Set's hash table has keys
+// and no values, so there is no value slot a disposer could reach. A REAL
+// dictionary's values are neither disposed nor released by this call, which is
+// the whole of issue 3568; every dictionary caller uses the two-argument
+// overload and states which obligation the free discharges.
 void Emitter::freeDictSourceNow(llvm::Value* v) {
+    freeDictSourceNow(v, /*valDisposer=*/nullptr);
+}
+
+void Emitter::freeDictSourceNow(llvm::Value* v, llvm::Function* valDisposer) {
     if (!v) return;
     auto* fn = declareC("bz_dict_free", llvm::Type::getVoidTy(llvm_),
                         {ptrTy(), ptrTy()});
-    builder_.CreateCall(fn, {v, llvm::ConstantPointerNull::get(ptrTy())});
+    llvm::Value* disp = valDisposer
+        ? llvm::cast<llvm::Value>(valDisposer)
+        : llvm::cast<llvm::Value>(llvm::ConstantPointerNull::get(ptrTy()));
+    builder_.CreateCall(fn, {v, disp});
+}
+
+// fix #3568 (§29.2 / §28.9 / §28.11 / stdlib §4.8, v0.286): see the declaration
+// in LlvmBackend_impl.hpp for the rule. The three arms below are the SAME
+// cascade, in the same order, that the scope-end dictionary disposal already
+// runs at LlvmBackend_Setup.cpp (:15913 and :17266) and the indexer-overwrite
+// path runs at :1297 of this file — `elementPolicyFor(V, owning)`, then
+// `dictValueBoxFreer`, then the #429 borrowing-string release. NO NEW
+// CLASSIFIER: this helper adds only the routing of each arm to the moment that
+// is safe for it, so `*immediateOut ∪ *deferredOut` is exactly the single
+// disposer a scope-end free would have selected for the same dictionary.
+void Emitter::dictSnapshotValueDisposers(const sema::TypeRef* dictTy,
+                                         llvm::Function** immediateOut,
+                                         llvm::Function** deferredOut) {
+    if (immediateOut) *immediateOut = nullptr;
+    if (deferredOut)  *deferredOut  = nullptr;
+    if (!dictTy || !dictTy->astNode || !dictTy->astNode->name ||
+        dictTy->astNode->name->parts.empty())
+        return;
+    // The raw `headName()`, matching `dictValueBoxFreer`'s own spelling and
+    // `dictEntryWrapShapeSupported`'s — see the ⚠ note on that gate for why the
+    // three must read the head the SAME way rather than the cleverest way.
+    std::string_view head = dictTy->headName();
+    // `SortedDictionary` is deliberately absent: its snapshot is minted by
+    // `wrapSortedDictionaryAsIEnumerable` (LlvmBackend_Calls2.cpp), which has
+    // no snapshot-disposer parameter, so `dictEntryWrapShapeSupported` keeps it
+    // on the narrow primitive-only shape and it never reaches here.
+    if (head != "Dictionary" && head != "OwningDictionary") return;
+    const sema::TypeRef* valTy =
+        (dictTy->genericArgs.size() > 1) ? dictTy->genericArgs[1] : nullptr;
+    if (!valTy) return;
+    bool owning = (head == "OwningDictionary");
+
+    // ARM 1 — DEFERRED. An OwningDictionary<K, class/interface> (and the
+    // Shared/Weak/Task/nested-collection handles elementPolicyFor also owns)
+    // stores the object POINTER in the slot, and the snapshot decode aliases
+    // that same pointer (`valDecoded = slotV`). Disposing at the source free
+    // would leave the caller iterating disposed objects — #3568's stated
+    // use-after-free trap. The obligation moves to the snapshot's slot-1
+    // Dispose, which runs at the caller's scope end, after iteration.
+    //
+    // ⚠ This arm is NOT reachable from today's `dictEntryWrapShapeSupported`,
+    // which declines a class/interface V on issue 3563's read-side defect (see
+    // that gate). It is here — first, and in the same order as the scope-end
+    // cascade — deliberately: the ORDER is the load-bearing part. An
+    // OwningDictionary's class value must be answered by `elementPolicyFor`
+    // and never fall through to ARM 3, and the union of the two outputs must
+    // stay equal to the single disposer a scope-end free selects. Measured on
+    // this build with the gate temporarily widened: `OwningDictionary<int,
+    // Item>` iterated 200x is LSan clean and disposes each Item exactly once.
+    if (llvm::Function* owned = elementPolicyFor(valTy, owning).disposerThunk) {
+        if (deferredOut) *deferredOut = owned;
+        return;
+    }
+    // ARM 2 — IMMEDIATE. #401 / #539: a borrowing Dictionary<K, record> and a
+    // Dictionary<K, V?> over a value type heap-BOX each value; the snapshot
+    // decode `CreateLoad`s the struct OUT of that box, so the snapshot owns its
+    // own bytes and the box is dead as soon as the snapshot exists. Freeing it
+    // at the source free is both safe and the only place it can happen — the
+    // snapshot never holds the box pointer to free later.
+    if (llvm::Function* box = dictValueBoxFreer(dictTy)) {
+        if (immediateOut) *immediateOut = box;
+        return;
+    }
+    // ARM 3 — DEFERRED. #429 / §28.9: a borrowing Dictionary<K, string>
+    // co-owns a +1 per stored value, and the decode aliases the same
+    // `bz_string*`. Releasing at the source free can drop the last reference
+    // while the snapshot still points at it; letting the snapshot INHERIT the
+    // table's +1 and release it at slot-1 Dispose keeps the accounting exact
+    // and the bytes alive for the whole iteration. The `!nullable` guard
+    // mirrors the scope-end and freeLinkedListSourceNow spellings — a nullable
+    // string value is never retained at construction, so there is no +1 to
+    // discharge.
+    if (!owning && !valTy->nullable &&
+        valTy->kind == sema::TypeRef::Kind::Primitive &&
+        valTy->primitive == sema::PrimitiveType::String &&
+        elementPolicyFor(valTy, /*owning=*/false).cat ==
+            ElementPolicy::Category::RuntimeManaged) {
+        if (deferredOut) *deferredOut = stringElementReleaseThunk();
+    }
 }
 
 // fix #2299 / §28.9: emit an immediate bz_llist_free(v, ?) for the
@@ -10761,14 +10886,22 @@ llvm::Value* Emitter::wrapOwnedLinkedListAsIEnumerable(
 // pointer pass-through). Iteration order is insertion order (the order
 // bz_dict_keys_*/bz_dict_values_* return), matching §4.8's contract and
 // lowerDictEntryFor's foreach behaviour.
-// fix #3519 (§29.2, v0.283; stdlib §4.8 / §4.17): see the declaration in
-// LlvmBackend_impl.hpp for why this gate exists. It drills the SAME path
-// `wrapDictionaryAsIEnumerable` drills — iEnumTy -> DictionaryEntry<K,V> ->
-// {K, V} — and admits only a NON-NULLABLE PRIMITIVE K and V
-// (`sema::TypeRef::Kind::Primitive` is the classification the front end
-// already computed, not a new one). Records, classes and enums are
-// `Kind::Named` and are declined, because the two defects recorded on the
-// declaration make the wrap produce a wrong answer or a leak for them.
+// fix #3519 (§29.2, v0.283; stdlib §4.8 / §4.17), WIDENED by fix #3568
+// (v0.286): see the declaration in LlvmBackend_impl.hpp for why this gate
+// exists. It drills the SAME path `wrapDictionaryAsIEnumerable` drills —
+// iEnumTy -> DictionaryEntry<K,V> -> {K, V} — reading only classifications the
+// front end already computed (`sema::TypeRef::Kind`, `->nullable`, the
+// declaration's `ast::TypeDeclKind`), never a new one.
+//
+// v0.283 admitted a NON-NULLABLE PRIMITIVE K and V and nothing else, because
+// the arm could not discharge a richer value's disposal obligation: records,
+// classes and nullables leaked (issue 3568) and `x.Value.<member>` failed to
+// lower on the wrapped face (issue 3563). #3568 supplies the missing halves —
+// `dictSnapshotValueDisposers` splits the obligation into the source free and
+// the snapshot's slot-1 Dispose — so the gate now admits every shape those two
+// disposers cover, PROVIDED the caller can name the source dictionary type
+// (see the `srcDictTy` reasoning in the body). Issue 3563 is unaffected and
+// still open: `var p := x.Value;` then `p.<member>` is the working spelling.
 //
 // `Object` IS admitted: `PrimitiveType::Object` is a PrimitiveType ("§4 Object
 // class — treated as a primitive lookup key", `sema/TypeRef.hpp:30`), so
@@ -10776,7 +10909,8 @@ llvm::Value* Emitter::wrapOwnedLinkedListAsIEnumerable(
 // clean (`iters=1`, rc 0, LSan clean) — an `Object`-valued entry carries a
 // borrowed reference the table does not own, so the null value disposer is
 // sound for it exactly as it is for `string`.
-bool Emitter::dictEntryWrapShapeSupported(const sema::TypeRef* iEnumTy) {
+bool Emitter::dictEntryWrapShapeSupported(const sema::TypeRef* iEnumTy,
+                                          const sema::TypeRef* srcDictTy) {
     if (!iEnumTy || iEnumTy->genericArgs.empty() || !iEnumTy->genericArgs[0])
         return false;
     const sema::TypeRef* entryTy = iEnumTy->genericArgs[0];
@@ -10788,19 +10922,115 @@ bool Emitter::dictEntryWrapShapeSupported(const sema::TypeRef* iEnumTy) {
     // `Nullable` member; `nullable` is a `bool` on the SAME TypeRef
     // (`sema/TypeRef.hpp:43`, and Kind::Primitive's own comment reads
     // "PrimitiveType + nullable"). So a `V?` over a primitive is still
-    // `Kind::Primitive` and the kind test alone ADMITS it — measured, a
+    // `Kind::Primitive` and a kind test alone ADMITS it — measured, a
     // `Dictionary<int, int?>` iterated 200x leaked 3200 B in 400 allocations
     // under LSan, which is issue 3568's null-value-disposer leak reached
     // through a second door: `bz_dict_free(d, null)` never releases the boxed
-    // nullable payloads. Declined explicitly here.
-    return entryTy->genericArgs[0]->kind == sema::TypeRef::Kind::Primitive &&
-           entryTy->genericArgs[1]->kind == sema::TypeRef::Kind::Primitive &&
-           !entryTy->genericArgs[0]->nullable &&
-           !entryTy->genericArgs[1]->nullable;
+    // nullable payloads. Every test below therefore spells `->nullable` out
+    // rather than relying on the kind: fix #3568 ADMITS a nullable V (the
+    // source free now passes `valueBoxFreeThunk`, which reclaims exactly those
+    // payloads) and still DECLINES a nullable K.
+    using K = sema::TypeRef::Kind;
+    const sema::TypeRef* keyTy = entryTy->genericArgs[0];
+    const sema::TypeRef* valTy = entryTy->genericArgs[1];
+
+    // The v0.283 answer, kept verbatim: both K and V a NON-NULLABLE primitive.
+    bool primK = keyTy->kind == K::Primitive && !keyTy->nullable;
+    bool primV = valTy->kind == K::Primitive && !valTy->nullable;
+    bool narrow = primK && primV;
+
+    // fix #3568 (§29.2 / §28.9 / §4.8, v0.286). WITHOUT a source dictionary
+    // type this stays the v0.283 answer. That is not conservatism for its own
+    // sake: every shape the widening admits needs a value disposer, and a
+    // disposer can only be derived from the SOURCE type (its head name decides
+    // Dictionary vs OwningDictionary vs SortedDictionary; its genericArgs[1] is
+    // the V the thunk is built from) — the entry's V alone cannot tell an
+    // OwningDictionary's OWNED class value from a Dictionary's BORROWED one,
+    // and those need opposite treatment. A caller that cannot name its source
+    // therefore gets exactly the shapes that need no disposer at all.
+    //
+    // ⚠ The head is read with the RAW `headName()` spelling, guarded on the
+    // astNode — deliberately NOT the alias-aware `builtinTypeName`, even though
+    // the call site uses that one to pick the sorted mint. The invariant that
+    // matters is "this gate admits exactly what `dictSnapshotValueDisposers`
+    // can discharge", and that helper's ARM 2 bottoms out in
+    // `dictValueBoxFreer`, which tests `headName() == "Dictionary"`. Reading
+    // the head more cleverly HERE than the disposer does THERE would admit an
+    // alias-resolved or imported `Dictionary<K, V?>` whose box then has nobody
+    // to free it — a leak newly introduced by a widening, which is the exact
+    // failure mode §6b exists to catch. So both read the same spelling, and an
+    // aliased / imported dictionary TypeRef falls back to the v0.283 answer:
+    // conservative, and byte-identical to today's behaviour for it.
+    if (!srcDictTy || !srcDictTy->astNode || !srcDictTy->astNode->name ||
+        srcDictTy->astNode->name->parts.empty())
+        return narrow;
+    std::string_view head = srcDictTy->headName();
+    // `SortedDictionary` is minted by `wrapSortedDictionaryAsIEnumerable`
+    // (LlvmBackend_Calls2.cpp), which takes no snapshot value disposer, so it
+    // keeps the narrow answer. Widening it belongs with that helper.
+    if (head != "Dictionary" && head != "OwningDictionary") return narrow;
+
+    // A user-declared value type / reference type reached through a resolved
+    // declaration. `declaration == nullptr` on a Named TypeRef is a
+    // COMPILER-KNOWN builtin (Shared<T>, Weak<T>, Task, IGrouping, a nested
+    // Owning* collection, Span/Guid/DateTime...) — each of those has its own
+    // slot policy and none is exercised here, so they stay declined.
+    auto namedDeclKind = [](const sema::TypeRef* t) -> const ast::TypeDeclKind* {
+        if (!t || t->kind != K::Named || !t->declaration) return nullptr;
+        return &t->declaration->kind;
+    };
+
+    // K axis. A non-nullable primitive (the v0.283 set) OR a non-nullable
+    // ENUM: an enum key takes `bz_dict_keys_gen`'s generic-key table, which the
+    // decode loads BY VALUE out of the malloc'd raw-key copy and then frees, so
+    // it carries no ownership into the snapshot. MEASURED (200x, LSan):
+    // `Dictionary<Color, int>` gives `reds=200 total=6000`, clean.
+    //   Still declined on this axis: a NULLABLE key (a tagged struct as a hash
+    // key is a shape this path has never carried) and a class / interface /
+    // choice key. A RECORD key is declined here for a boring reason rather than
+    // a codegen one — §8.3 already requires a hashable key, so the record forms
+    // that reach codegen at all are a narrow subset this commit did not measure.
+    if (!primK) {
+        const ast::TypeDeclKind* kk = namedDeclKind(keyTy);
+        if (keyTy->nullable || !kk || *kk != ast::TypeDeclKind::Enum)
+            return false;
+    }
+
+    // V axis. Admitted:
+    //   * Primitive, NULLABLE OR NOT. The non-nullable half is v0.283's set
+    //     (scalars, `string`, `Object`); the nullable half is new — `int?` is
+    //     the #539 tagged-struct box the decode `CreateLoad`s out by value, and
+    //     `dictSnapshotValueDisposers` now frees that box at the source free.
+    //     MEASURED (200x, LSan): `Dictionary<int, int?>` gives
+    //     `keys=600 present=200`, clean, where the pre-#3568 kind-only gate
+    //     leaked 3200 B in 400 allocations.
+    //   * ENUM. An integer in the slot; nothing to dispose either way.
+    //     MEASURED (200x, LSan): `Dictionary<int, Color>` gives
+    //     `keys=600 total=800`, clean.
+    //
+    // ⚠ A RECORD, CLASS or INTERFACE value stays DECLINED, and the reason is no
+    // longer this issue. #3568's disposal half is solved for them too — ARM 1
+    // and ARM 2 of `dictSnapshotValueDisposers` cover the owned class pointer
+    // and the record box, and an `OwningDictionary<int, Item>` measured LSan
+    // clean at 200x on this build. What is NOT solved is issue 3563: on the
+    // WRAPPED entry face `x.Value.<member>` fails to lower (the #2961 internal,
+    // store dropped), so a valid program that reads a field of a record- or
+    // class-typed value silently computes 0 — measured `n=400 total=0` where
+    // the in-place control gives the right answer. Admitting these shapes would
+    // convert a deterministic SIGSEGV into a QUIET WRONG ANSWER, which is the
+    // trade this arm was narrowed to avoid in the first place. They come in
+    // with 3563, not before it; the gate is one `TypeDeclKind` away.
+    //   A CHOICE value is declined for a third, independent reason: it lowers
+    // to a bare struct that is neither `valRec` nor `valNullableVal`, so the
+    // decode's scalar arm would try to `trunc` an i64 into a struct type.
+    if (valTy->kind == K::Primitive) return true;
+    const ast::TypeDeclKind* vk = namedDeclKind(valTy);
+    return vk && *vk == ast::TypeDeclKind::Enum;
 }
 
 llvm::Value* Emitter::wrapDictionaryAsIEnumerable(
-        llvm::Value* dict, const sema::TypeRef* iEnumTy) {
+        llvm::Value* dict, const sema::TypeRef* iEnumTy,
+        llvm::Function* snapshotValDisposer) {
     if (!dict || !iEnumTy) return nullptr;
     // iEnumTy = IEnumerator<DictionaryEntry<K,V>>; drill into the entry to
     // recover K and V.
@@ -10998,8 +11228,20 @@ llvm::Value* Emitter::wrapDictionaryAsIEnumerable(
     // is a Dictionary-entry-specific owning wrapper whose Dispose walks the
     // array via bz_array_ptr_at and calls bz_string_release on each Key slot
     // at struct offset 0 before freeing the array.
-    if (isStringKey) {
-        return wrapDictionaryEntryArrayAsIEnumerable(arr, iEnumTy, entryStTy, esz);
+    //
+    // fix #3568 (§29.2 / §28.9 / §28.11, v0.286): the same wrapper is now also
+    // the home of the VALUE obligation the snapshot inherited from a
+    // callee-owned source (`snapshotValDisposer`, non-null only for the aliased
+    // shapes — an OwningDictionary's class value, a borrowing
+    // Dictionary<K, string>'s co-owned +1). It has to live here rather than at
+    // the source free for exactly the reason the #2522 key release does: the
+    // entries are {K, V} STRUCTS, so `bz_array_free`'s `void(*)(void*)`
+    // per-slot disposer cannot reach struct field 1, and disposing at the
+    // source free would free the objects the caller is about to iterate.
+    if (isStringKey || snapshotValDisposer) {
+        return wrapDictionaryEntryArrayAsIEnumerable(
+            arr, iEnumTy, entryStTy, esz, /*releaseKey=*/isStringKey,
+            snapshotValDisposer);
     }
     return wrapOwnedArrayAsIEnumerable(arr, iEnumTy);
 }
@@ -11032,15 +11274,28 @@ llvm::Value* Emitter::wrapDictionaryAsIEnumerable(
 // fixed-layout structs so we walk them manually rather than via the
 // per-slot void(*)(void*) hook.
 //
-// Non-string-keyed dictionaries (int/record/enum keys) DO NOT take this
-// path — wrapDictionaryAsIEnumerable keeps the plain wrapOwnedArrayAsIEnumerable
-// for them (the keys are inline bytes with no heap ownership, so the
-// plain null-disposer free is correct).
+// fix #3568 (§29.2 / §28.9 / §28.11, v0.286): the walk is now the general
+// per-entry disposal hook. `releaseKey` (default true — the #2522 contract the
+// SortedDictionary caller in LlvmBackend_Calls2.cpp still wants) says field 0
+// holds a rebuilt ref-counted bz_string* to release; `valDisposer` (default
+// null) is a void(void*) thunk called on field 1 of every entry, non-null only
+// when the snapshot INHERITED the source table's value ownership. The same
+// struct-field argument covers both: bz_array_free's per-slot disposer is a
+// `void(*)(void*)` applied to the SLOT, which for a {K, V} struct array reaches
+// neither field.
+//
+// A non-string-keyed dictionary reaches this path only when `valDisposer` is
+// non-null (`releaseKey` false); with neither obligation
+// wrapDictionaryAsIEnumerable keeps the plain wrapOwnedArrayAsIEnumerable (the
+// keys are inline bytes with no heap ownership, so the plain null-disposer free
+// is correct).
 llvm::Value* Emitter::wrapDictionaryEntryArrayAsIEnumerable(
         llvm::Value* arr,
         const sema::TypeRef* iEnumTy,
         llvm::StructType* entryStTy,
-        int64_t esz) {
+        int64_t esz,
+        bool releaseKey,
+        llvm::Function* valDisposer) {
     // The plain array-enum machinery is keyed on the element TYPE — for
     // Dictionary<string,V> that is DictionaryEntry<string,V> (a struct),
     // so ensureArrayEnumMachinery(<entry struct type>) builds the same
@@ -11071,7 +11326,20 @@ llvm::Value* Emitter::wrapDictionaryEntryArrayAsIEnumerable(
     // would get via the dict-entry wrap, so MoveNext/Current reuse just works.
     std::string elemName = enumMachineryElementName(entryStTy);
     std::string plainPrefix = "bz$arrenum$" + elemName + "$";
-    std::string prefix = "bz$dictentryenumown$" + elemName + "$";
+    // fix #3568 / #3450's cache-key discipline: the Dispose this builds is
+    // SPECIALISED on both obligations, so both are part of the key of every
+    // global keyed by `prefix` (the Dispose, the GetEnumerator clone stamp and
+    // the owning vtable). Without the value-disposer segment two
+    // DictionaryEntry<int, C1> / DictionaryEntry<int, C2> instantiations that
+    // share an entry LAYOUT would also share the first creator's Dispose — the
+    // exact collapse #3570 measured for MoveNext/Current at a shared stride.
+    // The disposer's own symbol name is the key: `elementPolicyFor` hands back
+    // one cached thunk per behaviour (bz$elemDispose, bz$strElemRelease,
+    // bz$valBoxFree), so equal names mean identical Dispose bodies.
+    std::string prefix = "bz$dictentryenumown$" + elemName + "$" +
+                         (releaseKey ? "k1" : "k0");
+    if (valDisposer) prefix += "$" + valDisposer->getName().str();
+    prefix += "$";
 
     // --- Owning Dispose ---
     //   for i in 0..count: bz_string_release(entry[i].Key)
@@ -11120,22 +11388,56 @@ llvm::Value* Emitter::wrapDictionaryEntryArrayAsIEnumerable(
             llvm::Value* entryPtr = b.CreateCall(ptrAtFT, ptrAtFn,
                 {arrPtr, ci2, b.getInt64(esz)}, "de.disp.ep");
 
-            // strPtr = entryPtr->Key (field 0 of the {K, V} struct, K = bz_string*)
-            llvm::Value* strPtr = b.CreateLoad(
-                ptrTy(),
-                b.CreateStructGEP(entryStTy, entryPtr, 0),
-                "de.disp.k");
+            if (releaseKey) {
+                // strPtr = entryPtr->Key (field 0 of the {K, V} struct,
+                // K = bz_string*)
+                llvm::Value* strPtr = b.CreateLoad(
+                    ptrTy(),
+                    b.CreateStructGEP(entryStTy, entryPtr, 0),
+                    "de.disp.k");
 
-            // bz_string_release(strPtr) — null-safe (a null slot would have
-            // leaked only as a stale sentinel; release is null-safe per §8.6).
-            auto* relFn = module_->getOrInsertFunction(
-                "bz_string_release",
-                llvm::FunctionType::get(
-                    llvm::Type::getVoidTy(llvm_), {ptrTy()}, false)).getCallee();
-            b.CreateCall(
-                llvm::FunctionType::get(
-                    llvm::Type::getVoidTy(llvm_), {ptrTy()}, false),
-                relFn, {strPtr});
+                // bz_string_release(strPtr) — null-safe (a null slot would have
+                // leaked only as a stale sentinel; release is null-safe per
+                // §8.6).
+                auto* relFn = module_->getOrInsertFunction(
+                    "bz_string_release",
+                    llvm::FunctionType::get(
+                        llvm::Type::getVoidTy(llvm_), {ptrTy()},
+                        false)).getCallee();
+                b.CreateCall(
+                    llvm::FunctionType::get(
+                        llvm::Type::getVoidTy(llvm_), {ptrTy()}, false),
+                    relFn, {strPtr});
+            }
+
+            // fix #3568 (§29.2 / §28.9 / §28.11, v0.286): valDisposer(field 1).
+            // Field 1 of the entry is the VALUE word the decode aliased out of
+            // the source table — an OwningDictionary's class pointer or a
+            // borrowing Dictionary<K, string>'s co-owned bz_string*. The source
+            // table was freed with a NULL value disposer at the RETURN
+            // coercion precisely so this call is the ONLY one: exactly-once,
+            // and after the caller has finished iterating. Every thunk
+            // elementPolicyFor / stringElementReleaseThunk hands back is
+            // null-safe, so a never-stored slot needs no extra guard here
+            // (mirrors the key release above).
+            //
+            // INVARIANT: field 1 is a POINTER whenever `valDisposer` is
+            // non-null. `dictSnapshotValueDisposers` hands one back only from
+            // ARM 1 (elementPolicyFor's owned-slot rows — class/interface,
+            // Shared/Weak, Task, IGrouping, Subscription, nested owning
+            // collection: every one a `ptrTy()` slot) and ARM 3 (a
+            // `bz_string*`). The `isPointerTy` test states that rather than
+            // assuming it; it can only fail if a future arm hands back a
+            // disposer for a by-value slot, and the right answer for such a
+            // slot is a box free at the SOURCE (ARM 2), never a call on the
+            // struct bytes.
+            if (valDisposer && entryStTy->getElementType(1)->isPointerTy()) {
+                llvm::Value* valPtr = b.CreateLoad(
+                    ptrTy(),
+                    b.CreateStructGEP(entryStTy, entryPtr, 1),
+                    "de.disp.v");
+                b.CreateCall(valDisposer, {valPtr});
+            }
 
             b.CreateStore(
                 b.CreateAdd(ci2, b.getInt64(1)), idxSlot);
@@ -11143,11 +11445,12 @@ llvm::Value* Emitter::wrapDictionaryEntryArrayAsIEnumerable(
         }
 
         b.SetInsertPoint(endBB);
-        // bz_array_free(arr, null) — the entries' string keys have been
-        // released above; the array itself holds no further heap references
-        // at this point (values are int / record / class pointer copies by
-        // value into the slot — NOT retrained copies — so they need no
-        // disposal here; the source dictionary still owns its values).
+        // bz_array_free(arr, null) — the entries' string keys (when
+        // `releaseKey`) and their inherited value obligations (when
+        // `valDisposer`) have been discharged above; the array itself holds no
+        // further heap references at this point. With NEITHER obligation the
+        // slots are int / record / borrowed-pointer copies by value — not
+        // retained copies — and the source dictionary still owns its values.
         auto* freeArrFn = module_->getOrInsertFunction(
             "bz_array_free", llvm::FunctionType::get(
                 llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()}, false))

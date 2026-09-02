@@ -60,9 +60,20 @@
 // Dispose reclaims exactly the snapshot and never the source. A callee-OWNED
 // source is therefore freed at the coercion (`freeDictSourceNow`, #2299's
 // treatment of the dict-backed `Set` arm) — scope-end disposal is not an
-// option, it would race the caller's iteration. `bz_dict_free(d, null)` leaves
-// the values untouched, which is what keeps the snapshot's borrowed value words
-// live for that iteration. At the local-decl face the free is gated on the
+// option, it would race the caller's iteration.
+//
+// ⚠ UPDATED BY fix #3568 (v0.286). This header used to say flatly that
+// "`bz_dict_free(d, null)` leaves the values untouched, which is what keeps the
+// snapshot's borrowed value words live for that iteration". The first half was
+// the DEFECT — a real dictionary's values were then never disposed or released,
+// which for the `string` VALUE of row (I) leaked 14580 B in 800 allocations as
+// soon as the values were built rather than literal. The second half is still
+// exactly right, and is why the fix could not simply pass a non-null disposer
+// here: `Emitter::dictSnapshotValueDisposers` splits the obligation, and only
+// the half the snapshot COPIED OUT (a record / nullable-value box) is
+// discharged at this free. The half the snapshot ALIASED moves to the wrapper's
+// slot-1 Dispose. See `dict_snapshot_value_disposer_3568_test.cpp`.
+// At the local-decl face the free is gated on the
 // initializer being a `new` EXPRESSION, the same alias-rejection gate the
 // Array / Set / LinkedList arms there use: a producer-init IDENTIFIER source is
 // still owned by that identifier and freeing it here would DOUBLE-FREE.
@@ -75,11 +86,19 @@
 // still reachable at exit.
 //
 // ★ WHAT THIS ARM DELIBERATELY DOES **NOT** CLAIM (narrowed on review).
-// The arm admits only `DictionaryEntry<K, V>` where BOTH K and V are a
-// NON-NULLABLE PRIMITIVE — the scalars, `string`, and `Object`. Every other
-// entry shape (class-, record- or enum-typed K or V, and any NULLABLE one)
-// falls through to the historical `return v` and keeps SIGSEGVing exactly as
-// it did before this commit.
+// As of v0.283 the arm admitted only `DictionaryEntry<K, V>` where BOTH K and
+// V are a NON-NULLABLE PRIMITIVE — the scalars, `string`, and `Object`. Every
+// other entry shape (class-, record- or enum-typed K or V, and any NULLABLE
+// one) fell through to the historical `return v` and kept SIGSEGVing exactly as
+// it did before that commit.
+//
+// ⚠ UPDATED BY fix #3568 (v0.286): a NULLABLE primitive V, an ENUM V and an
+// ENUM K are now ADMITTED — the reason they were declined was the missing
+// value disposer, and that is fixed. A record-, class- or interface-typed V is
+// still declined, but on issue 3563 alone now (the read side), not on this
+// file's disposal argument. The rows below are unchanged and unaffected; the
+// widened shapes are covered by
+// `tests/codegen/dict_snapshot_value_disposer_3568_test.cpp`.
 //
 // ⚠ Two boundaries worth stating, because an earlier revision of this header
 // and of the gate's own comment got both wrong in the SAME direction — they
@@ -94,10 +113,13 @@
 //     a separate `bool` on the same TypeRef, so `int?` is `Kind::Primitive`
 //     and a kind-only gate ADMITS it. Measured on the kind-only build,
 //     `Dictionary<int, int?>` at 200x leaked 3200 B in 400 allocations under
-//     LSan — issue 3568's null-value-disposer leak through a second door. The
-//     gate now tests `->nullable` explicitly and that shape is back on the
-//     historical path (rc 139), which is why no row below exercises it: a row
-//     asserting a SIGSEGV would pin a defect as expected behaviour. That is deliberate, and it is the point: measured on the
+//     LSan — issue 3568's null-value-disposer leak through a second door. At
+//     v0.283 the gate tested `->nullable` explicitly and that shape went back
+//     on the historical path (rc 139), which is why no row in THIS file
+//     exercises it. ⚠ fix #3568 (v0.286) ADMITS it, with the box now freed at
+//     the source free; row (D) of
+//     `dict_snapshot_value_disposer_3568_test.cpp` is the pin. The remaining
+//     declines are the record / class / interface VALUE shapes. That is deliberate, and it is the point: measured on the
 // pre-narrowing build, a `Dictionary<int, Item>` at this head returned
 // `t=0` where the in-place control gives `t=10`, and a
 // `Dictionary<int, P>` (record value) leaked 800 B in 200 objects at 200
@@ -110,18 +132,22 @@
 //     lower (the #2961 internal, store dropped -> the wrong answer). It
 //     depends only on `x`'s static type, so it is pre-existing; it was
 //     unreachable behind the SIGSEGV and would have become reachable here.
-//   * issue 3568 — `freeDictSourceNow` passes a NULL value disposer
+//   * issue 3568 — `freeDictSourceNow` passed a NULL value disposer
 //     (`bz_dict_free(d, null)`). It was written for the dict-backed `Set`
 //     arm, where the table has keys and no values; on a real dictionary the
-//     values are never disposed or released, which is the leak above.
-// Widening this arm is blocked on both. Issue 3568 also records the adjacent
-// sema question — stdlib §4.9 declares `OwningDictionary` `: IDisposable`
-// only and says entry iteration is *not provided* on it, yet the coercion
-// type-checks today.
+//     values were never disposed or released, which is the leak above.
+//     ⚠ FIXED in v0.286; see `dict_snapshot_value_disposer_3568_test.cpp`.
+// Widening the remaining shapes is now blocked on 3563 alone. Issue 3568 also
+// records the adjacent sema question — stdlib §4.9 declares
+// `OwningDictionary` `: IDisposable` only and says entry iteration is *not
+// provided* on it, yet the coercion type-checks today.
 //
 // Verified negative on the narrowing itself: rows (F) and (I) pin the two
 // supported edges — a `string` KEY and a `string` VALUE — so a future
 // narrowing that over-tightens to "scalars only" fails loudly here.
+// ⚠ Both use string LITERALS, whose release is a no-op on a sentinel; that is
+// precisely why neither caught issue 3568's leak on the value axis, which only
+// appears once the values are BUILT at run time.
 //
 // COVERAGE.
 //   (A) The issue's repro at the RETURN face, PLAIN build.

@@ -8485,7 +8485,52 @@ private:
     // LinkedList the source is freed here and the caller disposes only the
     // wrapper frame; for dict-backed Set the snapshot is independent).
     void freeCollectionSourceNow(llvm::Value* v, const sema::TypeRef* srcTy);
+    // fix #3568 (§29.2 / §28.9 / stdlib §4.8, v0.286): the KEYS-ONLY face.
+    // `bz_dict_free(d, null)` frees the table and each key copy and touches NO
+    // value slot, which is exactly right for the dict-backed `Set<T>` arms (a
+    // Set's hash table has keys and no values) and WRONG for a real dictionary
+    // whose value slots carry a heap box or a co-owned reference. Every
+    // dictionary caller must therefore use the two-argument overload below and
+    // say which disposer the source free discharges; this one-argument spelling
+    // is retained ONLY for the two `Set` arms in LlvmBackend_Setup.cpp.
     void freeDictSourceNow(llvm::Value* v);
+    // fix #3568: the same free with an EXPLICIT value disposer. `valDisposer`
+    // is the `void(void*)` thunk `bz_dict_free` invokes on every live value
+    // slot; null means "this free discharges no value obligation" — either
+    // there is none, or the obligation was INHERITED by an independent
+    // snapshot and is discharged at that snapshot's slot-1 Dispose instead
+    // (see dictSnapshotValueDisposers).
+    void freeDictSourceNow(llvm::Value* v, llvm::Function* valDisposer);
+
+    // fix #3568 (§29.2 / §28.9 / §28.11 / stdlib §4.8, v0.286): split a
+    // dictionary's ONE value-slot disposal obligation between the two moments a
+    // callee-owned source has after `wrapDictionaryAsIEnumerable` has taken an
+    // independent entry snapshot of it.
+    //
+    // The split is decided by what the SNAPSHOT DECODE did with the slot word,
+    // and by nothing else:
+    //   * the decode LOADED THE VALUE OUT of a heap box (a record value, a
+    //     nullable value type — `denum.vrec` / `denum.vnv` both `CreateLoad`
+    //     the struct by value), so the snapshot holds its own bytes and the box
+    //     is dead the moment the snapshot exists  ->  *immediateOut, passed to
+    //     `freeDictSourceNow` at the source free.
+    //   * the decode ALIASED the slot word (an OwningDictionary's class value,
+    //     a borrowing Dictionary<K, string>'s co-owned +1 — both
+    //     `valDecoded = slotV`), so the snapshot's entries point INTO the
+    //     objects the table owns; discharging at the source free would hand the
+    //     caller an enumerator over freed memory  ->  *deferredOut, installed
+    //     as the snapshot wrap's slot-1 Dispose value disposer. This is the
+    //     same conclusion #3354 (LinkedList) and #3450 (Stack) reached.
+    // The two are mutually exclusive: a slot is either copied out or aliased.
+    //
+    // The three arms reproduce, in order, the SAME cascade the scope-end
+    // dictionary disposal already runs (elementPolicyFor(V, owning) ->
+    // dictValueBoxFreer -> the #429 string-value release); this helper only
+    // routes each arm to the moment that is safe for it, so the UNION of the
+    // two outputs is exactly the disposer a scope-end free would have used.
+    void dictSnapshotValueDisposers(const sema::TypeRef* dictTy,
+                                    llvm::Function** immediateOut,
+                                    llvm::Function** deferredOut);
     void freeLinkedListSourceNow(llvm::Value* v, const sema::TypeRef* srcTy);
 
     // #1916 / #1911 / stdlib §5 / §29.11: drain a lazy LINQ pipeline (bz_lazy_t*)
@@ -8614,23 +8659,56 @@ private:
     // an owning dictionary still disposes each value at its own binder's scope
     // end. `iEnumTy` is the call's result type — `IEnumerable<DictionaryEntry<K,V>>`
     // whose genericArgs[0] gives the entry element type/stride.
+    // fix #3568 (§29.2 / §28.9, v0.286): `snapshotValDisposer` is the value
+    // obligation the SNAPSHOT inherits from the source table (see
+    // dictSnapshotValueDisposers) — non-null only when the caller is about to
+    // free a callee-owned source whose value slots the decode ALIASED. It is
+    // installed on the returned wrapper's slot-1 Dispose, so each value is
+    // disposed once at the CALLER's scope end, after iteration. The default
+    // (null) is the correct answer for every BORROWING face — the explicit
+    // `.GetEnumerator()` call and the local-decl mint both leave the source
+    // dictionary alive and owning its values, so the snapshot must not touch
+    // them.
     llvm::Value* wrapDictionaryAsIEnumerable(
-        llvm::Value* dict, const sema::TypeRef* iEnumTy);
+        llvm::Value* dict, const sema::TypeRef* iEnumTy,
+        llvm::Function* snapshotValDisposer = nullptr);
 
-    // fix #3519 (§29.2, v0.283; stdlib §4.8): the CAPABILITY gate on the
-    // Dictionary arm of the §29.2 wrap grid — true only for the entry shapes
-    // the snapshot+materialise path is PROVEN to carry end to end, which is
-    // `DictionaryEntry<K, V>` with both K and V a NON-NULLABLE PRIMITIVE (the
-    // scalars, `string`, and `Object`). It is not a taste judgement: for a
-    // class-, record- or enum-valued dictionary the materialised entry reaches
-    // the consumer but `x.Value.<member>` fails to lower on the wrapped face
-    // (the #2961 internal, store dropped -> a WRONG ANSWER), and
-    // `freeDictSourceNow`'s `bz_dict_free(d, null)` never disposes or releases
-    // the values -> a leak. Those shapes therefore stay on the historical
-    // fall-through, where they keep failing LOUDLY exactly as they did before
-    // #3519. Converting a SIGSEGV into a silent wrong answer would be the
-    // worse outcome, so the arm claims only what it can carry. See issues
-    // 3563 and 3568.
+    // fix #3519 (§29.2, v0.283; stdlib §4.8), WIDENED by fix #3568 (v0.286):
+    // the CAPABILITY gate on the Dictionary arm of the §29.2 wrap grid — true
+    // only for the entry shapes the snapshot+materialise path is PROVEN to
+    // carry end to end.
+    //
+    // v0.283 answered `DictionaryEntry<K, V>` with both K and V a NON-NULLABLE
+    // PRIMITIVE (the scalars, `string`, and `Object`) and nothing else. That
+    // was not a taste judgement: `freeDictSourceNow`'s `bz_dict_free(d, null)`
+    // never disposed or released the values, so a class-, record- or
+    // nullable-valued dictionary LEAKED (issue 3568), and those shapes stayed
+    // on the historical fall-through where they failed LOUDLY exactly as they
+    // did before #3519 — converting a SIGSEGV into a silent leak would have
+    // been the worse outcome.
+    //
+    // fix #3568 removes THAT reason. `dictSnapshotValueDisposers` splits the
+    // value obligation into the half the source free discharges and the half
+    // the snapshot's slot-1 Dispose does, so the gate now also admits a
+    // NULLABLE primitive V, an ENUM V and an ENUM K — each measured correct
+    // and LSan-clean at 200x.
+    //
+    // It does NOT admit a record-, class- or interface-typed V, and the reason
+    // is now issue 3563 alone: on the WRAPPED entry face `x.Value.<member>`
+    // fails to lower (the #2961 internal, store dropped), so a valid program
+    // reading a field of such a value silently computes 0 while the in-place
+    // control computes the right answer. Converting a deterministic SIGSEGV
+    // into a quiet wrong answer is the trade the arm was narrowed to avoid;
+    // those shapes come in with 3563. Their DISPOSAL is already handled (ARM 1
+    // and ARM 2 below), and an `OwningDictionary<int, Item>` measured LSan
+    // clean at 200x on this build — only the read side is missing.
+    //
+    // Also still declined, each for its own reason spelled out in the body: a
+    // NULLABLE key, a RECORD key (unmeasured — §8.3's hashability rule makes
+    // the reaching subset narrow), a CHOICE value, a Named type with no
+    // declaration (Shared/Weak/Task/nested Owning* collections/value-struct
+    // builtins), and every shape at all when the caller cannot name its source
+    // dictionary type.
     //
     // ⚠ TWO CLASSIFICATIONS THIS GATE DOES **NOT** MAKE, spelled out because an
     // earlier revision of this comment asserted both and the code made
@@ -8651,7 +8729,18 @@ private:
     // decision spelled twice drifts. It reads the SAME `TypeRef` fields
     // `wrapDictionaryAsIEnumerable` itself decodes, so the gate cannot admit a
     // shape the helper then mis-materialises.
-    static bool dictEntryWrapShapeSupported(const sema::TypeRef* iEnumTy);
+    // fix #3568 (§29.2 / §28.9 / §4.8, v0.286): `srcDictTy` is the SOURCE
+    // dictionary's own TypeRef. Without it (the default) the gate answers the
+    // historical v0.283 question only — both K and V a non-nullable primitive —
+    // because the value-slot obligation of every richer shape can only be
+    // derived from the source type (its head name says Dictionary vs
+    // OwningDictionary vs SortedDictionary, and its genericArgs[1] is the V the
+    // disposer is built from). With it, the gate admits the shapes
+    // `dictSnapshotValueDisposers` can discharge. A `SortedDictionary` keeps
+    // the narrow answer: its mint is `wrapSortedDictionaryAsIEnumerable`
+    // (LlvmBackend_Calls2.cpp), which has no snapshot-disposer parameter.
+    bool dictEntryWrapShapeSupported(const sema::TypeRef* iEnumTy,
+                                     const sema::TypeRef* srcDictTy = nullptr);
 
     // fix #2522 (stdlib §4.8/§4.12; language spec §29.1, v0.236): the
     // string-keyed sibling of wrapOwnedArrayAsIEnumerable, used by
@@ -8666,11 +8755,25 @@ private:
     // are reused from the plain array-enum machinery (they don't touch
     // element ownership). `entryStTy`/`esz` describe the materialised
     // {K, V} struct layout used to size the slot walk.
+    //
+    // fix #3568 (§29.2 / §28.9 / §28.11, v0.286): the walk is now the general
+    // per-entry disposal hook, not just the string-key one. `releaseKey` says
+    // whether field 0 holds a rebuilt ref-counted `bz_string*` to release (the
+    // #2522 job); `valDisposer` is a `void(void*)` thunk called on field 1 for
+    // every entry — non-null only when the snapshot INHERITED the source
+    // table's value ownership (see dictSnapshotValueDisposers). Both defaults
+    // reproduce the pre-#3568 contract exactly, which is what the
+    // SortedDictionary caller in LlvmBackend_Calls2.cpp still wants.
+    // Both are part of the cache key of the Dispose / vtable globals this
+    // builds — per #3450, a disposer that varies with the sema element type
+    // must be part of the key of any function it is installed in.
     llvm::Value* wrapDictionaryEntryArrayAsIEnumerable(
         llvm::Value* arr,
         const sema::TypeRef* iEnumTy,
         llvm::StructType* entryStTy,
-        int64_t esz);
+        int64_t esz,
+        bool releaseKey = true,
+        llvm::Function* valDisposer = nullptr);
 
     // fix #2546 (stdlib §4.17/§4.18; language spec §29.1, v0.236):
     // SortedDictionary<K,V>.GetEnumerator() — snapshot+sort+wrap. Same
