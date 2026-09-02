@@ -19382,7 +19382,26 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 else if (m=="Min"||m=="Max"||m=="Clamp") { /* valid, untyped */ }
                 else rejectBuiltinStatic();
             }
-            // Console input methods.
+            // fix #3572 / §2.1 / v0.286: per-class accept-list for Console.
+            // Console is a pure-static utility class with exactly the methods
+            // stdlib §2.1 declares: Write (1-arg), WriteLine (0- or 1-arg),
+            // ReadLine (string?), ReadKey (char), ReadKeyOrNull (char?).
+            // Codegen's `tryLowerConsoleCall` (LlvmBackend_Calls.cpp) handles
+            // only those — and the bug being closed here was the surviving
+            // half of the #1037 missing-reject-fallback family: this arm had
+            // no `else rejectBuiltinStatic()` fallback, so a fully-unknown
+            // `Console.Bogus()` and the v0.284-removed `Console.Clear()` were
+            // both silently accepted by sema, lowered to nothing by codegen,
+            // and the program ran (issue reproducer exits 7 with no output).
+            // Mirror the Convert/Math/BitConverter pattern (#1037, #1038,
+            // #3344): drop a per-class accept-list and reject anything else
+            // with the class's own stdlib-§ diagnostic. Like Math/#3559 the
+            // removal-vs-never-existed distinction matters in principle, but
+            // Console carries no v0.284-specific removal phrasing — the
+            // `Clear` removal is logged in the changelog and the #3559
+            // catch-up, not in this site — so one unknown-static wording
+            // serves both cells; a writer stumbling onto a removed member
+            // gets the §2.1 pointer and can resolve from there.
             if (cls == "Console") {
                 if (m == "ReadLine")
                     ctx_.setExprType(
@@ -19390,7 +19409,20 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                                                    /*nullable=*/true));
                 else if (m == "ReadKey")
                     ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Char));
-                // Write/WriteLine → unit (leave untyped).
+                else if (m == "ReadKeyOrNull")
+                    ctx_.setExprType(
+                        &ma, ctx_.primitiveTypeRef(PrimitiveType::Char,
+                                                   /*nullable=*/true));
+                else if (m == "In" || m == "Out" || m == "Error") {
+                    // §2.1 static readonly properties of TextReader/TextWriter.
+                    // Leave untyped — the chained `Console.Out.Write`/`Error.
+                    // WriteLine` paths resolve via the property's value type
+                    // in TextWriter's own accept-list (typeCall §7.4).
+                }
+                // Write / WriteLine → unit (leave untyped — overload-resolved
+                // in typeCall via the arity check at line 3750).
+                else if (m != "Write" && m != "WriteLine")
+                    rejectBuiltinStatic("§2.1");
             }
             // Random class methods.
             if (cls == "Random") {
