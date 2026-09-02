@@ -236,17 +236,19 @@ NOT the file basename). You do **not** need to know which area binary holds your
 test — it enumerates the binaries (~30 ms each) and runs exactly the ones that
 match, so a filter spanning two areas runs in both. `--area <group>` (e.g.
 `--area sema`) narrows the LINK to one ~50 MB binary instead of all ~600 MB.
-⚠ **It does NOT narrow the compile, for five of the six areas** (#3172, measured
-2026-08-13). `tests/CMakeLists.txt` makes the first group in
-`BEZEL_TEST_GROUPS` the `BEZEL_TEST_PCH_OWNER` and every other group
-`REUSE_FROM`s it — and CMake's `REUSE_FROM` depends on the OWNER TARGET, not
-just its PCH artifact. So `--area module` schedules **2,228 codegen compile
-actions against 30 module ones**; only `--area codegen` is genuinely narrow,
-because it is the owner. An earlier revision of this file claimed the flag was
-"the difference between relinking one ~50 MB binary and all ~600 MB of them" —
-true of the link, false of the compile, and the compile dominates. Use it for
-the link saving and for running only one binary; do not budget for a small
-build. For a single `.bzl`:
+**Since fix #3172 (2026-09-03) `--area` narrows the COMPILE as well as the
+link.** The 12-header PCH is owned by a one-TU object library
+(`bezel_tests_pch`, generated into the build dir) that all six groups
+`REUSE_FROM`, so no group's compile depends on another group's target any more:
+`cmake --build build --target bezel_tests_module -- -n` after touching a codegen
+TU schedules **0** codegen compile actions (it was ~2,228 when codegen owned the
+PCH, measured 2026-08-13). Test TUs are compiled with `-gline-tables-only` (the
+compiler library keeps full `-g`), which roughly halved the six binaries
+(codegen 366 MB → 212 MB). ⚠ An earlier revision of this paragraph documented
+the opposite — that only `--area codegen` was narrow — and it was true until
+#3172 landed; if `--area <group>` ever schedules codegen actions again, the
+owner target has regressed. Budget one full test rebuild for the first gate
+after any change to the test compile flags (the PCH and ccache keys both move). For a single `.bzl`:
 `scripts/agent_check.sh --probe
 FILE.bzl` (or `--probe --asan FILE.bzl` for memory/disposal fixes, with a hang
 timeout); all probe output goes to the scratch dir, never the repo root. It
