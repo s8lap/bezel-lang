@@ -1,8 +1,7 @@
-// Spec-derived regression tests for fix #3428 — `new SortedSet<T>()` with a
-// REFERENCE element type is diagnosed instead of degrading to lowerLocalDecl's
-// #2974 "produced no value" message.
+// Spec-derived regression tests for fix #3428 and its narrowing by fix #2773
+// (B1) — `new SortedSet<T>()` with a REFERENCE element type.
 //
-// AUTHORITY. stdlib §4.18 (v0.283) declares, verbatim:
+// AUTHORITY. stdlib §4.18 (v0.286) declares, verbatim:
 //
 //     public class SortedSet<T>: IReadOnlyCollection<T> where T: IComparable<T>
 //       public constructor();
@@ -14,48 +13,43 @@
 // "for `SortedSet<T>` that identity is `CompareTo`-equality, and adding an
 // equal element leaves the set unmodified".
 //
-// THE DEFECT (measured on 0c5ecd1). A class `Ord: IComparable<Ord>` satisfies
-// the sole constraint, yet
+// THE ORIGINAL #3428 DEFECT (measured on 0c5ecd1, v0.283). A class
+// `Ord: IComparable<Ord>` satisfies the sole constraint, yet
+// `new SortedSet<Ord>()` reported lowerLocalDecl's #2974 degrade —
+// "`new SortedSet(…)` produced no value … matches no documented constructor"
+// — which was FALSE (§4.18 documents a public parameterless constructor).
+// #3428 turned that false #2974 degrade into a TRUTHFUL rejection instead of
+// an implementation, because at the time nothing in this compiler could
+// dispatch a class/interface element's `CompareTo` through the vtable for a
+// SORTED collection.
 //
-//     using var b := new SortedSet<Ord>();
+// WHAT CHANGED (fix #2773 (B1), v0.286). `fix #3488` (SortedDictionary's
+// reference-key ordering) lifted the #1195/#2768 `Array.Sort` comparator
+// thunks into the shared `buildObjectCompareToThunk`, giving EVERY class or
+// interface element with a dispatchable `CompareTo` a real
+// `CompareTo`-through-the-vtable comparator — #3428's stated objection no
+// longer holds for such an element. Fix #2773 (B1):
+//   * `genericBackingType` admits a SortedSet<T> reference element (named
+//     explicitly by `collTy->headName() == "SortedSet"` — `Set`/`OwningSet`
+//     are UNCHANGED and keep their array-backed path, #1070);
+//   * `lowerNew`'s SortedSet arm builds the generic-key table with
+//     `buildSortedObjectKeyIdentity`'s (constant-hash, `CompareTo == 0`) pair
+//     — the same identity `fix #3488` gives `SortedDictionary`'s reference
+//     KEY — so membership is `CompareTo`-equality, not §8.3 reference
+//     identity, honoring "adding an equal element leaves the set unmodified";
+//   * every other SortedSet consumer (`for`-in / `GetEnumerator` via
+//     `wrapSortedSetAsIEnumerable`, `.First`/`.Last`) already dispatches
+//     through `buildSortedKeyComparator`, which itself already routes a
+//     reference key through `buildObjectCompareToThunk` (`fix #3488`) — so
+//     once construction succeeds with the right identity pair, ordering is
+//     free; no change was needed at those sites.
 //
-// reported
-//
-//     `new SortedSet(…)` produced no value, so it cannot initialize this local.
-//     `SortedSet` has no user declaration, so its CONSTRUCTOR surface is exactly
-//     what the standard library documents for it: either `SortedSet` may not be
-//     instantiated at all … or this argument list matches no documented
-//     constructor (#2974)
-//
-// Both readings that message offers are FALSE — §4.18 documents a public
-// parameterless constructor and the constraint is met — so it blamed the
-// program for a compiler gap. The cause: codegen's `lowerNew` Set arm builds
-// the generic-key hash table only when `genericBackingType(…, isSet=true)`
-// returns an element type, and that helper deliberately excludes a class /
-// interface element ("a class/interface SET element keeps its ARRAY-backed
-// linear-scan machinery (emitArrayBackedSetInsert, #1070), a separate and
-// working design"); `SortedSet` is then absent from the Array arm's name list,
-// so the construction fell out of every branch and `lowerNew` returned nullptr.
-//
-// WHY THE FIX IS A REJECTION AND NOT AN IMPLEMENTATION. Routing the arm to the
-// generic-key table — what `SortedDictionary` does for a class KEY, the #2773
-// `hasObjectHeaderEquality` row — compiles, and breaks both halves of §4.18's
-// contract silently:
-//
-//   * membership would key on `Equals`/`GetHashCode`, which for a class is §8.3
-//     reference identity, so two `CompareTo`-equal instances would both be
-//     stored where §4.18 says the set is left unmodified;
-//   * iteration would not be ascending: the sorted-snapshot path needs
-//     `buildSortedKeyComparator`, which returns null for anything that is not an
-//     integer or float LLVM type. There is no `CompareTo`-through-the-vtable
-//     comparator in this compiler.
-//
-// That is not a prediction. The issue calls `SortedDictionary<Ord, int>` the
-// working control; measured on 0c5ecd1 it compiles and then iterates keys added
-// 3, 1, 2 in INSERTION order (3, 1, 2 — not 1, 2, 3), and `FirstKey` SEGVs under
-// ASan. Filed separately; a reference-element ordered collection needs a
-// comparator-keyed backing, not this one. Per the #511 `GetType` / #2722
-// comparer-constructor precedent the deferral is therefore made LOUD.
+// #3428's rejection SURVIVES, narrowed, for the residual case: `Object` (no
+// declaration to search) or a class/interface that declares no dispatchable
+// `CompareTo`. That is a strict NARROWING of the rejection surface — no
+// program that compiled before this fix stops compiling, and no program
+// that was silently wrong becomes silently wrong in a NEW way (§6c: a loud
+// rejection is kept exactly where the alternative would be quiet-wrong).
 //
 // A rejection is asserted on the diagnostic TEXT, never via a coarse
 // `hasErrors()`: `runAot`'s WIFSIGNALED path synthesizes an `Error` diagnostic
@@ -63,12 +57,17 @@
 // rejection from a crash — and `hasErrors()` cannot tell THIS rule from any
 // other error in the program.
 //
-// The second half of this file is the FALSE-REJECT guard. Every element
-// category the generic-key backing does support must still compile AND still
-// produce the right answer, and the untouched `Set<T>` / `OwningSet<T>` arms
-// must still accept a class element. Every row there compiles on the PRE-fix
-// compiler too, which is what makes it a control rather than a restatement of
-// the fix.
+// The ordering/dedup CORRECTNESS surface for the newly-admitted class and
+// interface elements (for-in, GetEnumerator, First/Last, Add/TryAdd/Remove
+// dedup, the §15.4 fresh-store warning) is pinned in
+// tests/codegen/sorted_set_class_element_2773_test.cpp, not here — this file
+// stays scoped to `lowerNew`'s admission/rejection boundary, matching its
+// original #3428 scope.
+//
+// The FALSE-REJECT guard below is unchanged in intent: every element category
+// the generic-key backing already supported must still compile AND still
+// produce the right answer, and `Set<T>`/`OwningSet<T>` must still accept a
+// class element via their own (untouched) array-backed path.
 
 #include <string>
 
@@ -116,7 +115,22 @@ const char* PRELUDE =
     "  public V: int := 0; "
     "  public constructor(v: int) V := v; end constructor; "
     "  public method CompareTo(other: Ord): int return V - other.V; end CompareTo; "
-    "end Ord; ";
+    "end Ord; "
+    // A SELF-comparable interface (`IOrd: IComparable<IOrd>`) — §4.18's
+    // constraint on an INTERFACE element T is `T: IComparable<T>`, which
+    // `IComparable<Ord>` (used bare AS an element type) does NOT satisfy: it
+    // declares `CompareTo(other: Ord): int`, not `CompareTo(other:
+    // IComparable<Ord>): int`, so it is not self-comparable and is exactly
+    // the "no dispatchable CompareTo" residual case, not the accepted one.
+    "interface IOrd: IComparable<IOrd> "
+    "  method Val(): int; "
+    "end IOrd; "
+    "class OrdI: IOrd "
+    "  public V: int := 0; "
+    "  public constructor(v: int) V := v; end constructor; "
+    "  public method Val(): int => V; "
+    "  public method CompareTo(other: IOrd): int return V - other.Val(); end CompareTo; "
+    "end OrdI; ";
 
 std::string prog(const std::string& body) {
     return std::string(PRELUDE) +
@@ -124,78 +138,169 @@ std::string prog(const std::string& body) {
            " end Main; end C;";
 }
 
-// The head of the new diagnostic — stable across the element categories.
+// The head of the RESIDUAL diagnostic (fix #2773 (B1), v0.286) — stable
+// across the two element categories that still reject (`Object`, and a
+// class/interface with no dispatchable `CompareTo`).
 const char* NEEDLE =
-    "`SortedSet<T>` is not yet implemented for a reference element type";
+    "`SortedSet<T>` requires an element type with a dispatchable `CompareTo`";
+
+// The head of the NULLABLE-element diagnostic — a SEPARATE message from
+// NEEDLE above (review fix, post-0c8612d): a nullable reference element is
+// excluded by `genericBackingType`'s pre-existing `!ty->nullable` guard
+// BEFORE any `CompareTo` is ever consulted, so the message must not claim
+// "no dispatchable CompareTo" — that claim would be false whenever the
+// underlying type (e.g. `Ord: IComparable<Ord>`) actually declares one.
+const char* NULLABLE_NEEDLE =
+    "`SortedSet<T>` requires a NON-NULLABLE element type";
 
 }  // namespace
 
-// ── The reference element categories are diagnosed (stdlib §4.18, v0.283) ────
+// ── ACCEPTED as of fix #2773 (B1) (stdlib §4.18, v0.286) ─────────────────────
+//
+// #3428's original filing: a CLASS element declaring `CompareTo` was
+// rejected. Fix #2773 (B1) implements it instead — full ordering/dedup
+// coverage lives in sorted_set_class_element_2773_test.cpp; the rows below
+// pin only that the OLD rejection is gone for the newly-accepted shapes, and
+// that it correctly SURVIVES for the residual ones (§7: a fix that reverses
+// a prior rejection must update the tests that pinned it).
 
-// per stdlib §4.18 (v0.283), #3428: the filed repro, verbatim in shape. A CLASS
-// element that implements `IComparable<T>` — the constraint §4.18 states — is
-// exactly the case the old message called "matches no documented constructor".
-BEZEL_TEST(sorted_set_class_element_3428, class_element_diagnosed) {
-    BEZEL_EXPECT_TRUE(rejectsWith(prog(
+// per stdlib §4.18 (v0.286), fix #2773 (B1): the #3428 filed repro, verbatim
+// in shape, now CONSTRUCTS — `Ord` declares a single-argument `CompareTo`.
+BEZEL_TEST(sorted_set_class_element_3428, class_element_with_compareto_constructs) {
+    BEZEL_EXPECT_EQ(run(prog(
         "  using var b := new SortedSet<Ord>(); "
+        "  return b.Count; ")),
+        0);
+}
+
+// per stdlib §4.18 (v0.286), fix #2773 (B1): a SELF-comparable INTERFACE
+// element (`IOrd: IComparable<IOrd>`) constructs —
+// `buildObjectCompareToThunk`'s interface arm reuses #2768's
+// `ensureIfaceCmpThunk` itable dispatch, selected by the exact
+// `selfComparableIfaceCompareTo` constraint.
+BEZEL_TEST(sorted_set_class_element_3428, interface_element_with_compareto_constructs) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "  using var b := new SortedSet<IOrd>(); "
+        "  return b.Count; ")),
+        0);
+}
+
+// per stdlib §4.18 (v0.286), spec §14.2 (v0.286), review fix (post-0c8612d):
+// a NULLABLE class element (`SortedSet<Ord?>`) is excluded by
+// `genericBackingType`'s pre-existing nullable guard, NOT by a missing
+// `CompareTo` — `Ord` declares exactly one (`CompareTo(other: Ord): int`,
+// the very same declaration `class_element_with_compareto_constructs` above
+// proves is dispatchable). The message must therefore name NULLABILITY as
+// the reason and must NOT claim `Ord` "declares no ... CompareTo" — that
+// claim is false and was the exact defect this row was added to pin.
+BEZEL_TEST(sorted_set_class_element_3428, nullable_class_element_diagnoses_nullability) {
+    auto r = runAot(prog(
+        "  using var b := new SortedSet<Ord?>(); "
+        "  return b.Count; "));
+    BEZEL_EXPECT_FALSE(r.ran);
+    bool foundNullableNeedle = false;
+    bool foundFalseNoCompareToClaim = false;
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        if (d.message.find(NULLABLE_NEEDLE) != std::string::npos)
+            foundNullableNeedle = true;
+        if (d.message.find("`Ord` declares no") != std::string::npos)
+            foundFalseNoCompareToClaim = true;
+    }
+    BEZEL_EXPECT_TRUE(foundNullableNeedle);
+    BEZEL_EXPECT_FALSE(foundFalseNoCompareToClaim);
+}
+
+// per stdlib §4.18 (v0.286), spec §14.2 (v0.286), review fix (post-0c8612d):
+// same shape, a NULLABLE SELF-comparable interface element
+// (`SortedSet<IOrd?>`) — `IOrd` is exactly the interface
+// `interface_element_with_compareto_constructs` above proves constructs when
+// non-nullable, so the message must not claim it "does not declare a
+// SELF-comparable CompareTo" (a DIFFERENT false claim than the class case,
+// since `selfComparableIfaceCompareTo` is never even reached for a nullable
+// element — the nullable guard fires first, in `genericBackingType`).
+BEZEL_TEST(sorted_set_class_element_3428, nullable_interface_element_diagnoses_nullability) {
+    auto r = runAot(prog(
+        "  using var b := new SortedSet<IOrd?>(); "
+        "  return b.Count; "));
+    BEZEL_EXPECT_FALSE(r.ran);
+    bool foundNullableNeedle = false;
+    bool foundFalseNotSelfComparableClaim = false;
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        if (d.message.find(NULLABLE_NEEDLE) != std::string::npos)
+            foundNullableNeedle = true;
+        if (d.message.find("does not declare a SELF-comparable") !=
+            std::string::npos)
+            foundFalseNotSelfComparableClaim = true;
+    }
+    BEZEL_EXPECT_TRUE(foundNullableNeedle);
+    BEZEL_EXPECT_FALSE(foundFalseNotSelfComparableClaim);
+}
+
+// per stdlib §4.18 (v0.286), fix #2773 (B1): `IComparable<Ord>` used BARE as
+// the element type is an interface, but NOT self-comparable — it declares
+// `CompareTo(other: Ord): int`, not `CompareTo(other: IComparable<Ord>): int`
+// — so `selfComparableIfaceCompareTo` finds no match and this shape stays in
+// the residual rejection, distinguishing "is an interface" from "is a
+// SELF-comparable interface" (the actual §4.18 constraint).
+BEZEL_TEST(sorted_set_class_element_3428, non_self_comparable_interface_still_diagnosed) {
+    BEZEL_EXPECT_TRUE(rejectsWith(prog(
+        "  using var b := new SortedSet<IComparable<Ord>>(); "
         "  return b.Count; "),
         NEEDLE));
 }
 
-// per stdlib §4.18 (v0.283), #3428: the message must name the element's
-// category, so the reader can tell this from the sibling `Object` and interface
-// rows without re-running the compiler.
-BEZEL_TEST(sorted_set_class_element_3428, class_element_message_names_category) {
-    BEZEL_EXPECT_TRUE(rejectsWith(prog(
-        "  using var b := new SortedSet<Ord>(); "
-        "  return b.Count; "),
-        "the element type here (`Ord`) is a class type"));
-}
-
-// per stdlib §4.18 (v0.283), #3428: an INTERFACE element reaches the same
-// branch — `hasObjectHeaderEquality`, the predicate this fix reuses, admits
-// "a class, an interface, or `Object`".
-BEZEL_TEST(sorted_set_class_element_3428, interface_element_diagnosed) {
-    BEZEL_EXPECT_TRUE(rejectsWith(prog(
-        "  using var b := new SortedSet<IComparable<Ord>>(); "
-        "  return b.Count; "),
-        "is an interface type"));
-}
-
-// per stdlib §4.18 (v0.283), #3428: `Object` is a Primitive-kind TypeRef, not a
-// Named one, so it takes the other half of `hasObjectHeaderEquality` and would
-// be missed by a `Kind::Named` test.
-BEZEL_TEST(sorted_set_class_element_3428, object_element_diagnosed) {
+// per stdlib §4.18 (v0.286), fix #2773 (B1): `Object` is a Primitive-kind
+// TypeRef (no declaration to search for `CompareTo`) and STILL rejects — the
+// residual case the NEEDLE above targets.
+BEZEL_TEST(sorted_set_class_element_3428, object_element_still_diagnosed) {
     BEZEL_EXPECT_TRUE(rejectsWith(prog(
         "  using var b := new SortedSet<Object>(); "
         "  return b.Count; "),
-        "is the `Object` type"));
+        NEEDLE));
 }
 
-// per stdlib §4.18 (v0.283), #3428: the point of the fix is that the OLD,
-// false message is gone. #2974's text asserts the constructor surface does not
-// admit the call, which for §4.18's documented `public constructor();` is
-// simply untrue.
+// per stdlib §4.18 (v0.286), fix #2773 (B1): a class that implements NO
+// `CompareTo` at all also still rejects — `buildObjectCompareToThunk` finds
+// no method to dispatch, so `elemTy` is nulled back out and `lowerNew` falls
+// to the same rejection block `Object` takes.
+BEZEL_TEST(sorted_set_class_element_3428, class_without_compareto_still_diagnosed) {
+    BEZEL_EXPECT_TRUE(rejectsWith(
+        "module M; class Plain public V: int := 0; "
+        "  public constructor(v: int) V := v; end constructor; "
+        "end Plain; "
+        "class C public static method Main(): int "
+        "  using var b := new SortedSet<Plain>(); "
+        "  return b.Count; "
+        "end Main; end C;",
+        NEEDLE));
+}
+
+// per stdlib §4.18 (v0.286), fix #2773 (B1): the point of #3428's ORIGINAL
+// fix is still true for the residual case — #2974's stale "matches no
+// documented constructor" text must not resurface on the new rejection.
 BEZEL_TEST(sorted_set_class_element_3428, stale_2974_constructor_claim_gone) {
     BEZEL_EXPECT_TRUE(lacks(prog(
-        "  using var b := new SortedSet<Ord>(); "
+        "  using var b := new SortedSet<Object>(); "
         "  return b.Count; "),
         "matches no documented constructor"));
 }
 
-// per stdlib §4.18 (v0.283), #3428: the §15.4 fresh-store shape the issue's
-// "knock-on" section flags — `SortedSet` is absent from both fresh-store sinks'
-// borrowing-family whitelists in Ownership_Checks.cpp. This row PINS that the
-// gap stays DORMANT: the construction is rejected, so no class-element
-// `SortedSet` exists for a fresh store to reach. If a later change makes
-// construction succeed, this row goes red and the whitelists must be widened in
-// the same commit (issues 3395 / 3364).
-BEZEL_TEST(sorted_set_class_element_3428, fresh_store_shape_still_unreachable) {
-    BEZEL_EXPECT_TRUE(rejectsWith(prog(
+// per stdlib §4.18 (v0.286), fix #2773 (B1): the §15.4 fresh-store shape
+// #3428's "knock-on" section flagged is NO LONGER dormant for a
+// CompareTo-bearing class element — construction now succeeds, so the fresh
+// store must draw the mandatory §15.4 warning (Ownership_Checks.cpp's two
+// whitelists were widened in the same commit; the warning ITSELF is pinned in
+// sorted_set_class_element_2773_test.cpp, which uses the ownership-check
+// harness this codegen-oriented file does not link). This row only confirms
+// the program still COMPILES (no error) now that it is a real, non-dormant
+// program — dormancy is gone, per #3428's own note that this row "goes red
+// the moment construction is implemented".
+BEZEL_TEST(sorted_set_class_element_3428, fresh_store_shape_now_reachable) {
+    BEZEL_EXPECT_EQ(run(prog(
         "  using var b := new SortedSet<Ord>(); "
         "  b.Add(new Ord(1)); "
-        "  return b.Count; "),
-        NEEDLE));
+        "  return b.Count; ")),
+        1);
 }
 
 // ── FALSE-REJECT GUARD: every supported element category still works ─────────
