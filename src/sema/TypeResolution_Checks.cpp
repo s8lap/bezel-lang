@@ -4846,8 +4846,32 @@ void Resolver::checkAbstractImplementations() {
                         bool isStaticIdx = false;
                         for (auto mod : ps->modifiers)
                             if (mod == "static") { isStaticIdx = true; break; }
-                        if (curIsIface && !isStaticIdx)
+                        if (curIsIface && !isStaticIdx) {
                             ifaceIndexerObligations.push_back({ps, cur});
+                        } else if (!curIsIface && !isStaticIdx &&
+                                   hasMod(ps, "abstract")) {
+                            // fix #3641 / §12.5: "`abstract` on a member ...
+                            // every concrete subclass must override it" — the
+                            // abstractNames set above only tracks MethodSymbol
+                            // obligations (`if (auto* ms = dynamic_cast<
+                            // MethodSymbol*>(m))`), so a CLASS-declared
+                            // abstract indexer previously reached the
+                            // unconditional `continue` below with NO
+                            // obligation recorded anywhere — a concrete
+                            // subclass that never overrides it compiled clean
+                            // and SIGSEGV'd at the first indexer access
+                            // (codegen's vtable slot for the indexer stays
+                            // `ConstantPointerNull`; #3641's own measured
+                            // repro). Reuse ifaceIndexerObligations/its
+                            // matching loop below rather than inventing a
+                            // parallel structure — the "find a wireable
+                            // matching indexer on t's own members or its base-
+                            // class chain" search (§11.2/§23.4's #2437/#2442/
+                            // #2449 machinery) is exactly the same search a
+                            // §12.5 obligation needs; only the reported
+                            // diagnostic differs by `obl.iface->kind` below.
+                            ifaceIndexerObligations.push_back({ps, cur});
+                        }
                         continue;  // indexers have no name; concrete side is
                                    // matched directly off `t->members` below,
                                    // not tracked through this BFS (mirrors
@@ -5764,13 +5788,34 @@ void Resolver::checkAbstractImplementations() {
             // prevent at this sema gate (the forwarder guards the same
             // `abstract` exclusion; mirrors the codegen mirror at
             // `indexerCandidateWireable`, updated in this same commit).
+            //
+            // fix #3641 / §12.5: the `abstract` exclusion above was only
+            // ever checked on the IMPORTED branch (`cand->decl == nullptr`)
+            // — a LOCAL candidate (`dynamic_cast<const ast::PropertyDecl*>
+            // (cand->decl)` succeeds) returned wireable unconditionally,
+            // never inspecting `cand->modifiers` at all. That was invisible
+            // before this fix because nothing pushed a CLASS-ancestor's own
+            // abstract indexer into any obligation this loop's candidate
+            // search could reach; now that the BFS above records one
+            // (`ifaceIndexerObligations.push_back({ps, cur})` in the
+            // `!curIsIface` arm), a same-module `class Derived: AB` that
+            // never overrides `AB`'s LOCAL abstract indexer would otherwise
+            // walk `Derived`'s base-class chain, land on `AB`'s own
+            // abstract-indexer PropertySymbol (`cand->decl` is a real,
+            // local `ast::PropertyDecl`), and accept it as a "candidate" —
+            // finding the very declaration the obligation is about and
+            // treating it as an implementation of itself. Checking
+            // `abstract` on BOTH branches closes that false ACCEPT; it
+            // cannot reject any previously-valid program, since a genuine
+            // override is never itself declared `abstract` (§12.1 forbids
+            // `abstract override`).
             auto candWireable = [](PropertySymbol* cand) -> bool {
-                if (dynamic_cast<const ast::PropertyDecl*>(cand->decl))
-                    return true;  // local
-                if (cand->decl) return false;  // defensive
                 for (auto mod : cand->modifiers)
                     if (mod == "abstract")
                         return false;
+                if (dynamic_cast<const ast::PropertyDecl*>(cand->decl))
+                    return true;  // local
+                if (cand->decl) return false;  // defensive
                 return !(cand->parent &&
                          cand->parent->kind == ast::TypeDeclKind::Interface);
             };
@@ -5809,23 +5854,78 @@ void Resolver::checkAbstractImplementations() {
                 cur = base;
             }
 
+            // fix #3641 / §12.5: `obl.iface` is no longer always an
+            // INTERFACE — the `!curIsIface` push arm above records a
+            // CLASS-ancestor's abstract indexer here too, reusing this same
+            // candidate search (comment on that push arm explains why). The
+            // two obligation shapes report through different diagnostic
+            // families (§11.2/§23.4 "implements interface" vs. §12.5's
+            // "does not implement inherited abstract member", the same
+            // family the method/property loop above uses), so branch on
+            // which kind of type declared the obligation.
+            const bool obligationIsInterface =
+                (obl.iface->kind == ast::TypeDeclKind::Interface);
+
             if (!candidate) {
-                // #2438: no indexer, own or inherited, matches the
-                // obligation's full parameter list — mirrors #489's "does
-                // not implement interface property" message a few hundred
-                // lines above, adapted for indexers (see the block comment
-                // above this loop for why that check itself isn't reused
-                // directly).
-                ctx_.diagnostics().report(
-                    Severity::Error, t->declLoc,
-                    std::string(kindWord) + " `" + std::string(t->name) +
-                    "` does not implement interface `" +
-                    std::string(obl.iface->name) + "`'s indexer — declare a "
-                    "matching `public property [params]: T` on `" +
-                    std::string(t->name) + "` or an ancestor class, with the "
-                    "same parameter count and types (§11.2 / §23.4)");
+                if (obligationIsInterface) {
+                    // #2438: no indexer, own or inherited, matches the
+                    // obligation's full parameter list — mirrors #489's
+                    // "does not implement interface property" message a few
+                    // hundred lines above, adapted for indexers (see the
+                    // block comment above this loop for why that check
+                    // itself isn't reused directly).
+                    ctx_.diagnostics().report(
+                        Severity::Error, t->declLoc,
+                        std::string(kindWord) + " `" + std::string(t->name) +
+                        "` does not implement interface `" +
+                        std::string(obl.iface->name) + "`'s indexer — "
+                        "declare a matching `public property [params]: T` "
+                        "on `" + std::string(t->name) + "` or an ancestor "
+                        "class, with the same parameter count and types "
+                        "(§11.2 / §23.4)");
+                } else {
+                    // fix #3641 / §12.5 ("`abstract` on a member declares it
+                    // without a body; every concrete subclass must override
+                    // it"): same diagnostic family as the abstractNames
+                    // method/property report above — "indexer" stands in
+                    // for the member name the way `checkPropertyOverrideSig-
+                    // natureMatch`'s own `err` lambda already does for an
+                    // override-signature mismatch (`derived->isIndexer ?
+                    // "indexer" : derived->name`), since an indexer has no
+                    // name to report (§23.4: "An indexer is a property
+                    // whose name is replaced by `[parameters]`").
+                    ctx_.diagnostics().report(
+                        Severity::Error, t->declLoc,
+                        std::string("concrete ") + kindWord + " `" +
+                        std::string(t->name) +
+                        "` does not implement inherited abstract member "
+                        "`indexer` (§12.5)");
+                }
                 continue;
             }
+
+            // fix #3641 / §12.5: for the CLASS-ancestor obligation shape, a
+            // non-null `candidate` already means SOME override was declared
+            // — §12.5's own bar ("every concrete subclass must override
+            // it"), the only obligation this walk exists to enforce for a
+            // class ancestor. Whether that override's OWN accessor set
+            // matches the abstract declaration's is a §12.1 override-
+            // signature question, already checked in full (property TYPE,
+            // visibility, AND accessor presence in both directions) by
+            // `checkPropertyOverrideSignatureMatch`, which runs separately
+            // wherever this override is paired with its base member — see
+            // xmod_indexer_blockform_override_2523_test.cpp's T3/T4, which
+            // pin that mismatch being caught there already. Re-deriving the
+            // same getter/setter comparison here would just be a second,
+            // differently-worded spelling of that same check for indexers
+            // specifically (the §6 duplicated-predicate hazard) — so the
+            // class-ancestor arm stops at "a candidate exists" and leaves
+            // accessor-shape correctness to that existing authority. The
+            // INTERFACE arm keeps the full accessor check below: an
+            // interface member is never paired through the `override`
+            // mechanism at all (structural conformance, not inheritance),
+            // so nothing else checks it.
+            if (!obligationIsInterface) continue;
 
             if (!ifaceHasSetter())
                 continue;  // read-only obligation, candidate found: satisfied
