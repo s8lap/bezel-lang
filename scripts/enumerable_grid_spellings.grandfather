@@ -17,7 +17,6 @@
 1    src/codegen/LlvmBackend_Setup.cpp
 2    src/codegen/LlvmBackend_impl.hpp
 1    src/common/OwnershipFacts.cpp
-5    src/ownership/Ownership.cpp
 2    src/sema/ExprTypecheck.cpp
 5    src/sema/ExprTypecheck_Calls.cpp
 1    src/sema/TypeResolution_Checks.cpp

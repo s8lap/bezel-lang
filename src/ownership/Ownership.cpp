@@ -756,6 +756,11 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                  reassignedDropCovered_.count(sym) != 0)) {
                 if (auto* ls = dynamic_cast<sema::LocalSymbol*>(sym)) {
                     if (auto* ld =
+                    // LOCALDECL-ONLY: fires only when `st.state == OwnershipState::Owned`
+                    // (endState.Owned). A §21.1 `const` local's `states_` entry is never
+                    // Owned (visitStmt's LocalConstDecl arm is a no-op: "a const local
+                    // carries no obligation"), so `ls->decl` here is always a var
+                    // LocalDecl. // per §21.1, #3591
                             dynamic_cast<const ast::LocalDecl*>(ls->decl)) {
                         const_cast<ast::LocalDecl*>(ld)->autoDropAtScopeEnd = true;
                         // §28.9 (v0.237) trivial-dispose exemption, #2654:
@@ -907,6 +912,12 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                  reassignedDropCovered_.count(sym) != 0)) {
                 if (auto* ls = dynamic_cast<sema::LocalSymbol*>(sym)) {
                     if (auto* ld =
+                    // LOCALDECL-ONLY: the async suspend-local twin of the sync gate at :759 --
+                    // same reasoning: this arm only fires for a symbol whose `states_` entry ended
+                    // Owned, and a runtime `const` local's state is never Owned (§21.1's "never-
+                    // owned" binding -- no state transition is ever recorded for LocalConstDecl,
+                    // see visitStmt's LocalConstDecl arm). `ls->decl` here is always a var
+                    // LocalDecl. // per §21.1, #3591
                             dynamic_cast<const ast::LocalDecl*>(ls->decl)) {
                         // §28.3/§28.11 (#1504): a suspend-local of a
                         // BORROWING-COLLECTION type (isBorrowingCollectionName-
@@ -978,6 +989,12 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
             // language's job).
             if (auto* lsAt = dynamic_cast<sema::LocalSymbol*>(sym)) {
                 if (auto* ldAt =
+                // LOCALDECL-ONLY: `dischargedByArmTransfer` (ast/Node.hpp) is "set by the
+                // ownership pass on a plain `var` owned class/interface local consumed by a
+                // MARKED ARM TRANSFER" -- a marked-arm-transfer consume requires an Owned
+                // production, which a §21.1 `const` local can never bind, so the flag can
+                // never be set on a LocalConstDecl target. `lsAt->decl` here is always a var
+                // LocalDecl. // per §21.1, §28.3 K3.4, #3591
                         dynamic_cast<const ast::LocalDecl*>(lsAt->decl)) {
                     if (ldAt->dischargedByArmTransfer) continue;
                 }
@@ -1112,6 +1129,12 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                 reassignedDropCovered_.count(sym) == 0) continue;
             auto* ls = dynamic_cast<sema::LocalSymbol*>(sym);
             if (!ls) continue;
+            // LOCALDECL-ONLY: `sym` is drawn from `everOwnedPlainLocals_`, which
+            // `handleLocalDecl` (the var-only arm of visitStmt) alone populates -- "record
+            // a plain (non-`using`) owned local" -- so every symbol reaching this loop
+            // already has `ls->decl` pointing at a var LocalDecl by construction; a
+            // LocalConstDecl can never be inserted (§21.1's const is never Owned).
+            // per §21.1, §28.3, #3591
             auto* ld = dynamic_cast<const ast::LocalDecl*>(ls->decl);
             if (ld) {
                 // Skip a local already flagged by the endState loop (it reaches the
@@ -1605,6 +1628,12 @@ void collectOutOwnedVarArgs(const ast::Expr* e,
 
 void collectLocalDeclsStmt(const ast::Stmt& s,
                            std::unordered_set<const ast::Node*>& out) {
+    // LOCALDECL-ONLY: this set feeds `dischargeOnExceptionEdge`'s `unwoundDecls`,
+    // which only ever removes a symbol whose flow-state is
+    // `OwnershipState::Owned` ("bool unwind = st.state == OwnershipState::Owned").
+    // A §21.1 runtime `const` local's `states_` entry is never Owned (no state
+    // transition is recorded for LocalConstDecl), so omitting it from this
+    // try-body-scoped set has no observable effect either way. // per §21.1, #3591
     if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
         out.insert(ld);
         // §22.4 / v0.160: also collect `out owned var` inline locals from
@@ -1775,6 +1804,11 @@ void scanReassignStmt(const ast::Stmt& s, sema::SemaContext& ctx,
                 dynamic_cast<const ast::IdentifierExpr*>(is->target.get()))
             if (sema::Symbol* sym = ctx.exprSymbol(*id)) out.insert(sym);
         scanReassignExpr(is->target.get(), ctx, out);
+    // LOCALDECL-ONLY: scans a var's initializer for embedded `out`/`ref`
+    // reassignment targets; §22.3's v1 bound forbids ANY such target from
+    // being owned state, and `reassignedLocals` matters only where
+    // `st.state == Owned` -- so a const initializer's embedded reassignment
+    // (§21.1) can only ever hit a non-owned recipient. // per §22.3, §21.1, #3591
     } else if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
         scanReassignExpr(ld->initializer.get(), ctx, out);
     } else if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(&s)) {
@@ -2463,6 +2497,10 @@ void MethodOwnership::seedOwnedIterVar(const ast::ForStmt& fs) {
 // (Array<T>/IEnumerable<T> borrowing, range, inline array, string, span)
 // returns false, so its iteration variable is left a borrow with no discharge
 // obligation.
+//
+// #3419 class-H: the two-name hand list is the OWNING half of the four
+// iterator-format ENUMERABLE heads -- the intersection of two existing
+// BuiltinRegistry authorities, no new table. // per §29.2, #3419
 bool MethodOwnership::iterableIsOwningEnumerable(const ast::ForStmt& fs) {
     if (!fs.iterable) return false;
     const sema::TypeRef* tt = ctx_.exprType(*fs.iterable);
@@ -2472,7 +2510,8 @@ bool MethodOwnership::iterableIsOwningEnumerable(const ast::ForStmt& fs) {
         head = tt->headName();
     else if (!tt->importedName.empty())
         head = tt->importedName;
-    return head == "IOwningEnumerable" || head == "IOwningAsyncEnumerable";
+    return common::isIterFormatEnumerableHead(head) &&
+           common::isOwningIterableInterfaceHead(head);
 }
 
 // §29.2 (#834): find the LocalSymbol ExprTypecheck created for `fs`'s
@@ -2999,11 +3038,17 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
             // there the bare identifier stays a read (handleDischarge above leaves
             // it Owned) and is left unchanged. Mirrors the ThrowExpr / handleReturn
             // bare-identifier discharge fast-paths. // per §29.1, §29.8
+            //
+            // #3419 class-H: the OWNING half of the four iterator-format
+            // ENUMERABLE heads, same composition as iterableIsOwningEnumerable
+            // above. // per §29.2, #3419
             bool owningIter =
                 returnType_ && returnType_->kind == ast::TypeKind::Named &&
                 returnType_->name && !returnType_->name->parts.empty() &&
-                (returnType_->name->parts.front() == "IOwningEnumerable" ||
-                 returnType_->name->parts.front() == "IOwningAsyncEnumerable");
+                common::isIterFormatEnumerableHead(
+                    returnType_->name->parts.front()) &&
+                common::isOwningIterableInterfaceHead(
+                    returnType_->name->parts.front());
             if (owningIter) {
                 if (const auto* id = dynamic_cast<const ast::IdentifierExpr*>(
                         ys->value.get())) {
@@ -4560,6 +4605,11 @@ bool MethodOwnership::localDropOnOverwriteCovered(const sema::Symbol* sym) {
     // they must keep the discharge error. Mirror that coverage decidably here.
     auto* ls = dynamic_cast<const sema::LocalSymbol*>(sym);
     if (!ls) return false;
+    // LOCALDECL-ONLY: `sym` here is always drawn from `reassignedLocals`
+    // (localDropOnOverwriteCovered's only caller, run()), and a §21.1 `const`
+    // local can never be reassigned ("assignment... are compile errors"), so it
+    // can never enter that set. `ls->decl` is always a var LocalDecl. // per
+    // §21.1, §28.7, #3591
     auto* ld = dynamic_cast<const ast::LocalDecl*>(ls->decl);
     if (!ld) return false;
     // §28.7 / §28.3 (#1625): a plain local that becomes owned via reassignment
@@ -4836,6 +4886,11 @@ bool MethodOwnership::usingVarInitIsRecognizedBorrow(const ast::Expr& init) cons
             // body-scan below on its own (a `new` producer is not receiver-
             // sourced) and is unaffected either way. // per §29.1, §28.10,
             // §28.6, #2443
+            //
+            // #3419 class-H: {IEnumerator, IOwningEnumerator} is the SYNC half
+            // of the iterator-format ENUMERATOR axis (what a §29.2 wrap
+            // PRODUCES, not what it is created for) -- common::
+            // isSyncIterFormatEnumeratorHead. // per §29.2 / §29.3, #3419
             bool isManualGetEnumeratorWrap = false;
             if (md->name == "GetEnumerator") {
                 const sema::TypeRef* resultTy = ctx_.exprType(*ce);
@@ -4844,8 +4899,7 @@ bool MethodOwnership::usingVarInitIsRecognizedBorrow(const ast::Expr& init) cons
                     !resultTy->declaration && resultTy->astNode &&
                     resultTy->astNode->name &&
                     !resultTy->astNode->name->parts.empty() &&
-                    (resultTy->headName() == "IEnumerator" ||
-                     resultTy->headName() == "IOwningEnumerator");
+                    common::isSyncIterFormatEnumeratorHead(resultTy->headName());
             }
             // #2137(b): the scan is the RECEIVER-SOURCED generalization — it
             // accepts, on every return path, a bare `this` (§28.6 "Methods
@@ -5964,6 +6018,10 @@ void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
             if (st.state == OwnershipState::Owned) {
                 if (auto* lsym = dynamic_cast<sema::LocalSymbol*>(sym)) {
                     if (auto* ld2 =
+                    // LOCALDECL-ONLY: this flag setter fires only inside `if (st.state ==
+                    // OwnershipState::Owned)` on a symbol that just ADOPTED Owned state via
+                    // reassignment -- a §21.1 `const` local can never be reassigned, so `sym`
+                    // here is always a var LocalDecl. // per §21.1, §28.7, #3591
                             dynamic_cast<const ast::LocalDecl*>(lsym->decl))
                         if (ld2->initializer &&
                             dynamic_cast<const ast::NullLiteralExpr*>(
@@ -6097,6 +6155,10 @@ void MethodOwnership::handleMarkedOwnedAssignment(const ast::AssignmentStmt& as)
     // local — a moved-from / disposed re-adoption of an owned-initialized local
     // already carries the correct disposal classification from its initializer.
     if (auto* lsym = dynamic_cast<sema::LocalSymbol*>(tsym)) {
+        // LOCALDECL-ONLY: the handleAssignment twin of :5967 -- `tsym` is the target
+        // of an AssignmentStmt, and a §21.1 `const` local can never be an assignment
+        // target ("assignment... are compile errors"), so `lsym->decl` here is always
+        // a var LocalDecl. // per §21.1, §28.7, #3591
         if (auto* ld2 = dynamic_cast<const ast::LocalDecl*>(lsym->decl))
             if (ld2->initializer &&
                 dynamic_cast<const ast::NullLiteralExpr*>(ld2->initializer.get()))
@@ -6925,6 +6987,10 @@ void MethodOwnership::checkDisposeReceiverOwnership(const ast::Expr& recv,
                 // owning collection's DEFAULT (non-Drain) iteration — is left
                 // unenforced (the permissive status quo) rather than risk
                 // over-rejecting a disposable the caller owns. // per §28.6, §28.11
+                // #3419 class-H: {IEnumerable, IEnumerator, IAsyncEnumerable,
+                // IAsyncEnumerator} is the NON-OWNING half of the eight
+                // iterator/enumerator heads -- two existing authorities
+                // intersected, no new table. // per §28.6, §28.11, §29.2, #3419
                 bool trackedBorrowSource = false;
                 if (fs->iterable) {
                     if (const sema::TypeRef* it =
@@ -6939,9 +7005,8 @@ void MethodOwnership::checkDisposeReceiverOwnership(const ast::Expr& recv,
                             } else {
                                 std::string_view h = it->headName();
                                 trackedBorrowSource =
-                                    (h == "IEnumerable" || h == "IEnumerator" ||
-                                     h == "IAsyncEnumerable" ||
-                                     h == "IAsyncEnumerator");
+                                    common::isIterableInterfaceHead(h) &&
+                                    !common::isOwningIterableInterfaceHead(h);
                             }
                         }
                     }
@@ -8908,6 +8973,10 @@ void MethodOwnership::reportBareTypeParamOwnedReturn(const ast::Expr& e) {
 // variable OWNED and are rejected by the owned-local arm; range/span/inline-array/
 // string sources carry no enumeration interface and return null. // per §28.3,
 // §29.1, §29.2 v0.235
+//
+// #3419 class-H: the two-name hand list is the NON-OWNING half of the four
+// iterator-format ENUMERABLE heads -- two existing authorities intersected
+// (set difference), no new table. // per §29.2, #3419
 const ast::ForStmt* MethodOwnership::borrowedIterVarFromInterfaceSource(
     const ast::Expr& e) {
     auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e);
@@ -8923,7 +8992,9 @@ const ast::ForStmt* MethodOwnership::borrowedIterVarFromInterfaceSource(
         head = tt->headName();
     else if (!tt->importedName.empty())
         head = tt->importedName;
-    if (head == "IEnumerable" || head == "IAsyncEnumerable") return fs;
+    if (common::isIterFormatEnumerableHead(head) &&
+        !common::isOwningIterableInterfaceHead(head))
+        return fs;
     return nullptr;
 }
 

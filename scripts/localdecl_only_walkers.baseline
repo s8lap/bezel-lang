@@ -25,7 +25,6 @@
 1    src/codegen/LlvmBackend_Stmts.cpp
 1    src/codegen/LlvmBackend_String.cpp
 1    src/driver/ScopedAwaitBind.cpp
-9    src/ownership/Ownership.cpp
 1    src/ownership/Ownership_Checks.cpp
 1    src/sema/ExprTypecheck_Calls.cpp
 1    src/sema/TypeResolution_Checks.cpp
