@@ -645,4 +645,79 @@ bool isStringLinqOperatorMemberName(std::string_view n);
 // per §5, fix #3589
 bool isBuiltinCollectionLinqOperatorName(std::string_view n);
 
+// fix #3670 (stdlib §5, v0.286): does `m` take a single lambda argument
+// `(T) -> …` seeded with the LINQ receiver's own source element type T, so an
+// un-annotated lambda parameter (`(p) => p.x`) can be typed as T (§27.6's
+// bare-lambda-parameter inference; see `ExprTC::linqLambdaElementType`,
+// the sole caller)?
+//
+// This is a THIRD vocabulary, not a rename of `isBuiltinCollectionLinqOperatorName`
+// or `isStringLinqOperatorMemberName` above: those answer "is `n` a real §5
+// name at all", a name-EXISTENCE question; this answers a lambda-SHAPE
+// question, and the two sets deliberately disagree in both directions.
+// Concrete examples, not an exhaustive account (see stdlib §5's grammar for
+// each operator's exact signature):
+//   * `Distinct`/`Take`/`Skip`/`OfType`/`Reversed`/`Sorted`/`ToArray`/`ToSet`
+//     are real names in the other two tables that take NO lambda at all, so
+//     they are correctly absent here.
+//   * `ToDictionary`'s key-selector overload DOES take a `(T) -> TKey`
+//     lambda and so IS included here, unlike the no-lambda operators above.
+//   * `Count` is included here (its predicate overload
+//     `Count(predicate: (T) -> bool)`, stdlib §5) though it is absent from
+//     `isBuiltinCollectionLinqOperatorName` above — a dedicated property
+//     handler pre-empts the bare `.Count` form on a builtin-collection
+//     receiver before that gate runs, see that table's header — while it IS
+//     present in `isStringLinqOperatorMemberName` (no such property handler
+//     exists for a `string` receiver, per that table's header).
+//   * `GroupBy(key: (T) -> TKey)` also takes a source-element-typed lambda
+//     but is NOT in this table — an asymmetry inherited unchanged from the
+//     pre-#3670 `elemLambda` list this table replaces verbatim; whether that
+//     is a genuine pre-existing gap is a separate question this pure-routing
+//     extraction does not resolve (see fix #3670's commit body).
+// Folding this table into either existing one would silently make every name
+// in the union answer BOTH questions, which is false for most of them —
+// declined per fix #3589's own precedent (its commit left this exact list,
+// then still inline at `linqLambdaElementType`'s `elemLambda`, untouched for
+// the identical reason).
+//
+// Was a fifth hand-spelled ~20-name chain surviving #3589 (issue #3670);
+// moved here unchanged (no name added or removed — this is a pure
+// extraction, not a widening). per §5, fix #3670
+bool isLinqElementLambdaOperatorName(std::string_view m);
+
+// fix #3670 (stdlib §5, v0.286): is `m` one of the LINQ operators that, given
+// a call already past the `isLinqHashableOperator` gate, produce a lazy
+// `IEnumerable<T>` over the UNCHANGED source element type T — i.e. every
+// deferred operator whose typing arm is exactly
+// `ctx_.setExprType(&ce, makeLazyEnumerable(srcElem)); return true;` with no
+// further per-operator computation (see `ExprTC::typeCall`'s
+// `typeLinqOperator`, the sole caller)?
+//
+// A fourth vocabulary: not name existence, not lambda-parameter shape, but
+// "does typing this call require nothing beyond wrapping the source element
+// type unchanged". `Select`/`SelectMany`/`Zip`/`ToDictionary` project to a
+// DIFFERENT element type (the lambda's return type) and so are excluded;
+// `ThenBy`/`ThenByDescending` share this table's exact body
+// (`IOrderedEnumerable<T>` reuses the same lazy sentinel) but are answered by
+// a separate, adjacent `if` in the caller rather than folded in here, since
+// they operate on the `IOrderedEnumerable<T>` receiver rather than a plain
+// LINQ source — kept as their own arm so a reader does not have to cross-
+// reference this table's docstring to see the receiver differs.
+// `*OrNull`/`OfType`/`GroupBy`/aggregate forms compute a genuinely different
+// result type and are handled by their own arms, later in the same function.
+//
+// EXCLUDES `Take`: stdlib §5 declares `Take(count: int): IEnumerable<T>`
+// unconditionally, but fix #1476 (§4.10) carved out `OwningSet<T>.Take(query:
+// T)` — a DIFFERENT, non-LINQ overload name-colliding on the OwningSet
+// receiver — so the caller keeps `Take`'s admission as an explicit
+// `m == "Take" && colName != "OwningSet"` conjunct beside this table rather
+// than baking a receiver-dependent exception into a plain name predicate.
+//
+// Collapses four hand-spelled, byte-identical-bodied `if` arms (11 names:
+// `Where`/`Skip`/`Distinct`, `OrderBy`/`OrderByDescending`,
+// `Concat`/`TakeWhile`/`SkipWhile`, `Union`/`Intersect`/`Except`) that #3670
+// found surviving #3589 as a still-inlined, still-duplicated-in-SHAPE (not
+// name) copy of the same routing decision. per §5, fix #3670
+bool isLinqLazyPassthroughOperatorName(std::string_view m);
+
 }  // namespace bezel::common

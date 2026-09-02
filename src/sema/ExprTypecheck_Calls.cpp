@@ -4622,13 +4622,26 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     // was never disposed (a leak — its Dispose() never ran
                     // because sema thought `taken` was an IEnumerable<T>, not
                     // an R).
-                    if (m == "Where" || m == "Skip" ||
-                        (m == "Take" && colName != "OwningSet") ||
-                        m == "Distinct") {
-                        ctx_.setExprType(&ce, makeLazyEnumerable(srcElem));
-                        return true;
-                    }
-                    if (m == "OrderBy" || m == "OrderByDescending") {
+                    // fix #3670: was four separate hand-spelled `if` arms
+                    // (Where/Skip/Distinct here + the guarded Take;
+                    // OrderBy/OrderByDescending; Concat/TakeWhile/SkipWhile,
+                    // further below by Select/SelectMany/Zip;
+                    // Union/Intersect/Except, further below by ThenBy) —
+                    // found, on inspection, to be byte-identical in BODY
+                    // (each did exactly `ctx_.setExprType(&ce,
+                    // makeLazyEnumerable(srcElem)); return true;`), answering
+                    // one question in four pieces: does `m` produce a lazy
+                    // IEnumerable<T> over the UNCHANGED source element type.
+                    // Merged onto the one predicate that answers it,
+                    // common::isLinqLazyPassthroughOperatorName (see its
+                    // header for why `Take` stays an explicit conjunct here
+                    // rather than folded into the table, and why
+                    // `ThenBy`/`ThenByDescending` — same body, different
+                    // receiver shape — stay their own arm rather than fold in
+                    // too). The other two arms this replaces are DELETED
+                    // below, not left as dead code.
+                    if (common::isLinqLazyPassthroughOperatorName(m) ||
+                        (m == "Take" && colName != "OwningSet")) {
                         ctx_.setExprType(&ce, makeLazyEnumerable(srcElem));
                         return true;
                     }
@@ -4641,11 +4654,10 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         return true;
                     }
                     // stdlib §5 Combination/Slicing: Concat/TakeWhile/SkipWhile
-                    // preserve the source element type T (lazy IEnumerable<T>).
-                    if (m == "Concat" || m == "TakeWhile" || m == "SkipWhile") {
-                        ctx_.setExprType(&ce, makeLazyEnumerable(srcElem));
-                        return true;
-                    }
+                    // preserve the source element type T (lazy IEnumerable<T>)
+                    // — handled by the merged
+                    // common::isLinqLazyPassthroughOperatorName arm above
+                    // (fix #3670; was its own duplicate-bodied `if` here).
                     // stdlib §5 Projection: SelectMany(selector: (T)->IEnum<U>)
                     // flattens to a lazy IEnumerable<U>. The output element type U
                     // is the element type of the selector lambda's return type
@@ -4676,11 +4688,10 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         return true;
                     }
                     // stdlib §5 Set-like lazy: Union/Intersect/Except(other)
-                    // preserve the source element type T (lazy IEnumerable<T>).
-                    if (m == "Union" || m == "Intersect" || m == "Except") {
-                        ctx_.setExprType(&ce, makeLazyEnumerable(srcElem));
-                        return true;
-                    }
+                    // preserve the source element type T (lazy IEnumerable<T>)
+                    // — handled by the merged
+                    // common::isLinqLazyPassthroughOperatorName arm above
+                    // (fix #3670; was its own duplicate-bodied `if` here).
                     // stdlib §5 Ordering: ThenBy/ThenByDescending preserve T,
                     // return IOrderedEnumerable<T> (same lazy sentinel).
                     if (m == "ThenBy" || m == "ThenByDescending") {
@@ -5324,25 +5335,22 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 // the real-receiver uses above) found zero instance
                                 // calls of any of the five on a governed receiver in
                                 // the whole suite.
-                                mm == "Where" || mm == "Select" ||
-                                mm == "SelectMany" || mm == "Skip" ||
-                                mm == "Take" ||
-                                mm == "SkipWhile" || mm == "TakeWhile" ||
-                                mm == "Distinct" || mm == "OrderBy" ||
-                                mm == "OrderByDescending" || mm == "ThenBy" ||
-                                mm == "ThenByDescending" || mm == "GroupBy" ||
-                                mm == "Aggregate" || mm == "All" || mm == "Any" ||
-                                mm == "Average" || mm == "Sum" || mm == "Min" ||
-                                mm == "Max" || mm == "MinOrNull" ||
-                                mm == "MaxOrNull" || mm == "FirstOrNull" ||
-                                mm == "LastOrNull" || mm == "Single" ||
-                                mm == "SingleOrNull" || mm == "ElementAt" ||
-                                mm == "Concat" || mm == "Union" ||
-                                mm == "Intersect" || mm == "Except" || mm == "Zip" ||
-                                mm == "OfType" ||
-                                mm == "Reversed" || mm == "Sorted" ||
-                                mm == "ToArray" || mm == "ToSet" ||
-                                mm == "ToDictionary";
+                                //
+                                // fix #3670: this ~38-name OR-chain was a hand-
+                                // written byte-twin of the one in
+                                // allowedNonOwningMethod below and had drifted from
+                                // stdlib §5 independently of it — now both read the
+                                // shared common::isBuiltinCollectionLinqOperatorName
+                                // table. `Reversed`/`Sorted` stay as an explicit
+                                // addition (see the comment above): they are real
+                                // Array<T> §4.4 copy-forms, not §5, and are not in
+                                // that table. The table additionally admits `First`/
+                                // `Last`, which this lambda already accepts via its
+                                // native-surface arm above (`mm == "First" || mm ==
+                                // "Last"`) — PROVEN inert by the same masking
+                                // argument #3589's own commit made for `ToArray`.
+                                common::isBuiltinCollectionLinqOperatorName(mm) ||
+                                mm == "Reversed" || mm == "Sorted";
                         };
                         if (!allowedOwningMethod(m)) {
                             ctx_.diagnostics().report(
@@ -5464,25 +5472,20 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 // call to a malformed-IR codegen path
                                 // (`for #3636: Instruction has a name, but
                                 // provides a void value!`).
-                                mm == "Where" || mm == "Select" ||
-                                mm == "SelectMany" || mm == "Skip" ||
-                                mm == "Take" ||
-                                mm == "SkipWhile" || mm == "TakeWhile" ||
-                                mm == "Distinct" || mm == "OrderBy" ||
-                                mm == "OrderByDescending" || mm == "ThenBy" ||
-                                mm == "ThenByDescending" || mm == "GroupBy" ||
-                                mm == "Aggregate" || mm == "All" || mm == "Any" ||
-                                mm == "Average" || mm == "Sum" || mm == "Min" ||
-                                mm == "Max" || mm == "MinOrNull" ||
-                                mm == "MaxOrNull" || mm == "FirstOrNull" ||
-                                mm == "LastOrNull" || mm == "Single" ||
-                                mm == "SingleOrNull" || mm == "ElementAt" ||
-                                mm == "Concat" || mm == "Union" ||
-                                mm == "Intersect" || mm == "Except" || mm == "Zip" ||
-                                mm == "OfType" ||
-                                mm == "Reversed" || mm == "Sorted" ||
-                                mm == "ToArray" || mm == "ToSet" ||
-                                mm == "ToDictionary";
+                                //
+                                // fix #3670: this ~38-name OR-chain was a
+                                // byte-twin of allowedOwningMethod's copy
+                                // above — both now read the shared
+                                // common::isBuiltinCollectionLinqOperatorName
+                                // table; see that copy's comment for the
+                                // `Reversed`/`Sorted` and inert-`First`/`Last`
+                                // notes, which apply identically here (this
+                                // lambda's own native-surface arm above
+                                // already admits `First`/`Last`, so the
+                                // table's redundant inclusion of them changes
+                                // nothing observable).
+                                common::isBuiltinCollectionLinqOperatorName(mm) ||
+                                mm == "Reversed" || mm == "Sorted";
                         };
                         if (!allowedNonOwningMethod(m)) {
                             ctx_.diagnostics().report(
@@ -13187,23 +13190,14 @@ TypeRef* ExprTC::linqLambdaElementType(const ast::Expr* callee) {
     // TakeWhile/SkipWhile take `(T) -> bool`; SelectMany takes
     // `(T) -> IEnumerable<U>`; Average takes `(T) -> numeric` — all single-param
     // over the source element T, so they seed the same way.
-    bool elemLambda =
-        m == "Where" || m == "Select" || m == "Count" || m == "Any" ||
-        m == "All" || m == "First" || m == "Last" || m == "Single" ||
-        m == "OrderBy" || m == "OrderByDescending" ||
-        m == "Min" || m == "Max" || m == "Sum" ||
-        m == "TakeWhile" || m == "SkipWhile" || m == "SelectMany" ||
-        m == "Average" ||
-        // stdlib §5 Materialization (#738): ToDictionary's key selector
-        // `(T) -> TKey` is over the same source element T — seed it so an
-        // un-annotated `(x) => x` types its param as T (else the inferred
-        // Dictionary<K,V> result gets a wrong/null key type and an indexed
-        // read mismatches).
-        m == "ToDictionary" ||
-        // stdlib §5 Ordering secondary key (this milestone): ThenBy / ThenByDescending
-        // take a `(T) -> TKey` lambda over the same source element T. The receiver is
-        // IOrderedEnumerable<T> (the lazy sentinel); genericArgs[0] = T.
-        m == "ThenBy" || m == "ThenByDescending";
+    //
+    // fix #3670: was a hand-written ~20-name chain surviving #3589 (that fix
+    // deliberately left it, since it answers a lambda-SHAPE question, not the
+    // name-existence question the two shared LINQ tables answer — see
+    // common::isLinqElementLambdaOperatorName's header for the full
+    // reconciliation against those tables). Now reads that table unchanged —
+    // no name added or removed.
+    bool elemLambda = common::isLinqElementLambdaOperatorName(m);
     if (!elemLambda) return nullptr;
     return linqSourceElementType(ctx_.exprType(*ma->target));
 }

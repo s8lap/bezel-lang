@@ -676,6 +676,29 @@ constexpr std::array<std::string_view, 38> kBuiltinCollectionLinqOperatorNames =
     "ToSet",     "ThenBy",     "ThenByDescending",
 };
 
+// fix #3670 (stdlib §5): see the header — the lambda-parameter-seeding gate.
+// 20 names; a DIFFERENT question from the two tables above (shape, not name
+// existence) — deliberately not merged with either. Extracted unchanged from
+// `linqLambdaElementType`'s `elemLambda` (no name added or removed).
+constexpr std::array<std::string_view, 20> kLinqElementLambdaOperatorNames = {
+    "Where",     "Select",     "Count",      "Any",
+    "All",       "First",      "Last",       "Single",
+    "OrderBy",   "OrderByDescending",        "Min",
+    "Max",       "Sum",        "TakeWhile",  "SkipWhile",
+    "SelectMany", "Average",   "ToDictionary",
+    "ThenBy",    "ThenByDescending",
+};
+
+// fix #3670 (stdlib §5): see the header — the lazy-passthrough-typing gate.
+// 11 names (`Take` excluded on purpose — see the header). Collapses four
+// hand-spelled, byte-identical-bodied `if` arms in `typeLinqOperator` that
+// answered this one question in four pieces.
+constexpr std::array<std::string_view, 11> kLinqLazyPassthroughOperatorNames = {
+    "Where",     "Skip",       "Distinct",   "OrderBy",
+    "OrderByDescending",       "Concat",     "TakeWhile",
+    "SkipWhile", "Union",      "Intersect",  "Except",
+};
+
 }  // namespace
 
 bool isOwningPrefixedName(std::string_view head) {
@@ -1279,5 +1302,13 @@ bool isStringLinqOperatorMemberName(std::string_view n) {
 bool isBuiltinCollectionLinqOperatorName(std::string_view n) {
     return contains(kBuiltinCollectionLinqOperatorNames, n);
 }  // per §5, fix #3589
+
+bool isLinqElementLambdaOperatorName(std::string_view m) {
+    return contains(kLinqElementLambdaOperatorNames, m);
+}  // per §5, fix #3670
+
+bool isLinqLazyPassthroughOperatorName(std::string_view m) {
+    return contains(kLinqLazyPassthroughOperatorNames, m);
+}  // per §5, fix #3670
 
 }  // namespace bezel::common
