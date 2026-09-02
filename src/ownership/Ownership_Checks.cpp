@@ -2651,7 +2651,7 @@ void MethodOwnership::checkCapturedOwnedConsumeInStmt(const ast::Stmt& s) {
 }
 
 void MethodOwnership::checkClosureEscapesOnReturn(const ast::Expr& e,
-                                                  bool catchBorrowLegOnly) {
+                                                  EscapeScope scope) {
     // Gather every lambda appearing in the returned expression. The
     // returned expression is most commonly the lambda itself
     // (`return () => r.V;`), but it may also wrap it (e.g. a conditional).
@@ -2730,14 +2730,16 @@ void MethodOwnership::checkClosureEscapesOnReturn(const ast::Expr& e,
                     "instead)");
                 return;  // one diagnostic per return is enough
             }
-            // fix #3546 (§31.1, v0.283): the lambda-body driver runs this
-            // check as a SYNTACTIC pre-pass, where only the §31.1 leg above
-            // has its input available (a sema-set flag). The legs below read
-            // `states_` / `recordBorrowLocalSource_` / the method's parameter
-            // sets, which describe the METHOD's scope, not the lambda body's
-            // — running them from there would answer the wrong question. See
-            // the header. // per §31.1 v0.283
-            if (catchBorrowLegOnly) continue;
+            // fix #3546 (§31.1, v0.283), narrowed by fix #3564 (§28.9,
+            // v0.286): from `EscapeScope::LambdaBody` the §27.5 leg just
+            // below and the §9.7 leg after it still answer about the WRONG
+            // scope — `isRefOutParam` resolves the enclosing METHOD's
+            // parameter and `recordBorrowLocalSource_` is method-scope
+            // provenance, neither of which the lambda-body seeding supplies.
+            // The §28.9 leg at the bottom is no longer in that set: fix #3564
+            // re-seeds `states_` from the lambda body's own owned
+            // obligations, which is exactly that leg's input. See the header
+            // for the per-leg rationale. // per §31.1, §28.9, v0.286
             // §27.5 / §28.6 (#1217): a `ref` or `out` parameter is a pointer
             // into the CALLER's stack frame (§22.3). The pointer is valid only
             // for the duration of this method call. A closure that captures a
@@ -2746,7 +2748,7 @@ void MethodOwnership::checkClosureEscapesOnReturn(const ast::Expr& e,
             // next invocation. Reject here. A non-escaping ref/out-capturing
             // closure invoked locally (per #1207) is not in this return path
             // and remains accepted.
-            if (isRefOutParam(sym)) {
+            if (scope == EscapeScope::Method && isRefOutParam(sym)) {
                 auto* ps = dynamic_cast<sema::ParameterSymbol*>(sym);
                 report(
                     Severity::Error, id->span.begin,
@@ -2789,7 +2791,7 @@ void MethodOwnership::checkClosureEscapesOnReturn(const ast::Expr& e,
             // construction roots via collectRecordBorrowSource, the arm
             // binding's scrutinee source via collectCaseArmBorrowSources). The
             // diagnostic forks on the carrier kind. // per §35.4, §9.7 (v0.220)
-            {
+            if (scope == EscapeScope::Method) {
                 const sema::TypeRef* capTy = nullptr;
                 if (auto* ls = dynamic_cast<sema::LocalSymbol*>(sym))
                     capTy = ls->declType;
@@ -2860,10 +2862,15 @@ void MethodOwnership::checkClosureEscapesOnReturn(const ast::Expr& e,
                     }
                 }
             }
-            // Resolve against the dataflow-tracked method-scope locals. A
-            // captured lambda parameter is not in `states_`, so it is
-            // naturally excluded; only an enclosing-method local/owned-param
-            // can match.
+            // Resolve against the dataflow-tracked locals of the scope this
+            // call is answering about. A captured lambda parameter is not in
+            // `states_`, so it is naturally excluded. In
+            // `EscapeScope::Method` only an enclosing-method local/owned-param
+            // can match; in `EscapeScope::LambdaBody` (fix #3564, §28.9,
+            // v0.286) `states_` holds ONLY the lambda body's own owned
+            // obligations, seeded by `seedLambdaBodyOwnedLocals`, so a local
+            // declared in the lambda body whose closure escapes that body
+            // matches and a method-scope local deliberately does not.
             auto it = states_.find(sym);
             if (it == states_.end()) continue;
             const LocalOwnership& st = it->second;
@@ -4806,7 +4813,8 @@ void MethodOwnership::checkCatchBorrowEscapesViaNewExpr(
         "`throw;`)");
 }
 
-bool MethodOwnership::checkBorrowStoreEscape(const ast::AssignmentStmt& as) {
+bool MethodOwnership::checkBorrowStoreEscape(const ast::AssignmentStmt& as,
+                                             EscapeScope scope) {
     if (as.op != ":=") return false;
     if (!as.target || !as.value) return false;
 
@@ -4931,7 +4939,19 @@ bool MethodOwnership::checkBorrowStoreEscape(const ast::AssignmentStmt& as) {
     // was unconstructible — its constructor's `v := x;` (a bare implicit-`this`
     // field write) was rejected, while §9.1's synthesized primary constructor
     // for the identical positional record was free to do the same store.
-    if (dest == Dest::Field && storeTargetIsClassField(*as.target)) {
+    // fix #3565 (§9.7 / §31.1, v0.286): this is the ONE leg of this check that
+    // consults no borrow SOURCE — it is a TYPE rule ("a borrow-bearing record
+    // may not be stored in an instance field of a class, unconditionally"),
+    // so unlike every leg below it neither `states_` nor `localDepth_` gates
+    // it and the lambda-body re-seeding neither enables nor scopes it. Running
+    // it from `EscapeScope::LambdaBody` would therefore not be "the same
+    // question answered for a smaller scope" but a DIFFERENT rule newly
+    // reaching a position it never reached before, on this fix's coat-tails.
+    // That gap (a `this.f := someSpan;` inside a lambda body) is real —
+    // measured: rc=0 there, rejected at method level — and is filed as issue
+    // 3701; it is deliberately not widened in here. // per §9.7
+    if (scope == EscapeScope::Method && dest == Dest::Field &&
+        storeTargetIsClassField(*as.target)) {
         const sema::TypeRef* rhsType = ctx_.exprType(*as.value);
         const bool rhsIsRecord = isBorrowBearingRecord(rhsType);
         const bool rhsIsSpan =

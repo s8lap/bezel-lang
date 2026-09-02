@@ -175,6 +175,26 @@ struct CalleeFormals {
 //     try/finally, so it is not reported as leaked on that edge.
 using BlockState = std::unordered_map<sema::Symbol*, LocalOwnership>;
 
+// fix #3564 / #3565 (§28.9 / §31.1 / §27.5, v0.286): WHICH SCOPE an escape
+// check is being asked about. The escape checks below (`checkClosureEscapes
+// OnReturn`, `checkBorrowStoreEscape`) were written for a METHOD body, whose
+// dataflow inputs (`states_`, `localDepth_`, `recordBorrowLocalSource_`, the
+// method's parameter sets) all describe the method's own scope. The
+// lambda-body drivers (`checkLambdaBodyEscapes`, issue 3546's traversal fix
+// extended by 3564/3565) run the SAME checks over a LAMBDA body, whose scope
+// is a different one — so they say so with this argument rather than growing
+// a second, drifting copy of each rule. See `checkOneLambdaBodyEscapes`
+// (Ownership.cpp) for what is seeded, and the two check declarations below
+// for which legs each scope admits and why. // per §28.9, §31.1, v0.286
+enum class EscapeScope {
+    // The enclosing method's own body: every leg, method-scope inputs.
+    Method,
+    // One lambda body, with `states_` / `localDepth_` saved, cleared and
+    // re-seeded from that body alone. Legs whose inputs this seeding does not
+    // supply are skipped rather than allowed to answer about the wrong scope.
+    LambdaBody,
+};
+
 // §28.8.1 (#1125) / §28.6 bullet 2 (#2518): if `e` is a leading force-unwrap
 // `x!` (PostfixBangExpr), return its operand `x`; otherwise return `e`
 // unchanged. Lets the §28.6 / §28.8.1 field-read recognizers see through the
@@ -393,10 +413,50 @@ public:
     // spelling of the rule, and no second spelling of "is this decl a catch-arm
     // binding". Mirrors `checkLambdaTaskFamilyBorrowReturns{,Expr}`'s
     // collect-every-lambda-then-walk-its-own-returns shape. // per §31.1 v0.283
-    void checkCatchBorrowClosureEscapesInLambdaBodies(
+    // fix #3564 / #3565 (§28.9 / §31.1, v0.286): the traversal hole #3546
+    // named was WIDER than its own §31.1 return leg, and the two survivors are
+    // the same hole through two more channels:
+    //   * #3565 — the §31.1 ASSIGNMENT channel (`f := lambda() => ex...;`
+    //     inside a lambda body, `f` declared outside the arm). Rejected at
+    //     method level by `checkBorrowStoreEscape`'s `Dest::OuterLocal` arm
+    //     since fix #3520; inside a lambda body it compiled clean and
+    //     heap-use-after-freed (measured rc=139 / ASan UAF on 5d052b3).
+    //   * #3564 — the §28.9 owned-scope-bound-local RETURN channel (`using var
+    //     r := new R(); return lambda() => r.V();` inside a lambda body).
+    //     Rejected at method level by `checkClosureEscapesOnReturn`'s §28.9
+    //     leg; inside a lambda body it compiled clean and leaked its 56 bytes
+    //     while the returned closure read storage the lambda invocation owns.
+    // Both are closed by giving this driver the lambda body's OWN scope
+    // (`checkOneLambdaBodyEscapes` swaps `states_` / `localDepth_` for a seed
+    // built from that body alone, exactly as `applyUsingVarBorrowPinInLambdas`
+    // swaps `states_` for its pin pre-pass) and then feeding the SAME two
+    // checks with `EscapeScope::LambdaBody`. No third spelling of either rule
+    // and no new predicate: `isCatchBorrow`, `localIsOwnedObligation`,
+    // `collectLocalDepths`, `scanReturnsIn` and `forEachNestedStmt` are all
+    // pre-existing authorities. // per §28.9, §31.1, v0.286
+    void checkLambdaBodyEscapes(
         const std::vector<std::unique_ptr<ast::Stmt>>& body);
-    void checkCatchBorrowClosureEscapesInLambdaBodiesExpr(const ast::Expr& e);
-    void checkCatchBorrowClosureEscapesInOneLambda(const ast::LambdaExpr& lam);
+    void checkLambdaBodyEscapesExpr(const ast::Expr& e);
+    void checkOneLambdaBodyEscapes(const ast::LambdaExpr& lam);
+
+    // fix #3564: seed `states_` with the owned scope-bound locals declared in
+    // ONE lambda body, so `checkClosureEscapesOnReturn`'s §28.9 leg (and
+    // `checkBorrowStoreEscape`'s owned-source legs) can answer about that
+    // body. Resolution goes through `findLocalSymbol` (node-keyed, so it
+    // matches a `LocalConstDecl` too) and `localIsOwnedObligation` — the
+    // existing both-forms authority — rather than a `dynamic_cast<const
+    // ast::LocalDecl*>` walk, which would have been an eighth instance of the
+    // #3591 LocalDecl-only family. Called only inside
+    // `checkOneLambdaBodyEscapes`'s save/clear/restore window.
+    void seedLambdaBodyOwnedLocals(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body);
+
+    // fix #3565: fire `checkBorrowStoreEscape` on every `AssignmentStmt`
+    // reachable in one lambda body without crossing a nested lambda — the
+    // assignment-channel sibling of `scanCatchBorrowClosureReturns`. Rides
+    // `forEachNestedStmt` (the #3656 single statement grammar), so a new
+    // statement kind reaches it with no edit here.
+    void scanLambdaBodyBorrowStores(const ast::Stmt& s);
 
     // #2166 / §28.10 (v0.220): the `using var` borrow-pin classification
     // (`handleLocalDecl`'s `usingVarSourceIsBorrow` flag — see the #2128/#2137
@@ -1431,16 +1491,28 @@ private:
     // scope — a use-after-dispose. Walks the returned expression for any
     // LambdaExpr and diagnoses each offending capture.
     //
-    // `catchBorrowLegOnly` (issue 3546, §31.1, v0.283): run ONLY the §31.1
-    // caught-exception leg and skip the §27.5 ref/out, §9.7 borrow-bearing
-    // record/choice and §28.9 owned-local legs. Set by
-    // `checkCatchBorrowClosureEscapesInLambdaBodies` (declared in the public
-    // section above), whose syntactic pre-pass cannot supply those legs'
-    // inputs: `states_` and `recordBorrowLocalSource_` hold METHOD-scope
-    // locals only, never a lambda body's own, so those legs would silently
-    // answer about the wrong scope. `isCatchBorrow` needs no such input — it
-    // reads a sema-set flag (`sema::LocalSymbol::isCatchBinding`, issue 3521),
-    // so it classifies the captured identifier exactly from there.
+    // `scope` (issue 3546, §31.1, v0.283; widened by fix #3564, v0.286):
+    // `EscapeScope::LambdaBody` says the caller is
+    // `checkOneLambdaBodyEscapes`, asking about ONE LAMBDA BODY rather than
+    // the enclosing method. In that scope:
+    //   * the §31.1 caught-exception leg runs — `isCatchBorrow` reads a
+    //     sema-set flag (`sema::LocalSymbol::isCatchBinding`, issue 3521), so
+    //     it classifies the captured identifier exactly from anywhere;
+    //   * the §28.9 owned-local leg runs (fix #3564) — the caller has cleared
+    //     `states_` and re-seeded it from the lambda body's own owned
+    //     obligations, so `isOwnedTrackedLocal` now answers about the right
+    //     scope. A method-scope local resolves to nothing there, deliberately:
+    //     a closure returned from a lambda leaves only that lambda, and
+    //     whether the LAMBDA outlives the method local is the escape question
+    //     this pre-pass cannot answer (issue 3564 names it; the SIGSEGV it
+    //     still costs is measured and filed as issue 3702);
+    //   * the §27.5 ref/out leg is SKIPPED — `isRefOutParam` would resolve the
+    //     enclosing METHOD's parameter, and whether a closure escaping the
+    //     lambda escapes the method call is exactly the open scoping question
+    //     issue 3564 records as unmeasured;
+    //   * the §9.7 borrow-bearing record / choice / span leg is SKIPPED —
+    //     `recordBorrowLocalSource_` is method-scope provenance and is not
+    //     re-seeded, so it too would answer about the wrong scope.
     //
     // ⚠ That exactness is about CLASSIFYING the identifier, NOT about escape.
     // A `return` inside a lambda leaves only THAT LAMBDA, and whether the
@@ -1454,10 +1526,10 @@ private:
     // so over-approximating "may" is a defensible reading, but it IS a choice
     // the spec did not make for us and it costs a legal program. Issue 3569
     // tracks narrowing it to lambdas whose own value escapes.
-    void checkClosureEscapesOnReturn(const ast::Expr& e,
-                                     bool catchBorrowLegOnly = false);
+    void checkClosureEscapesOnReturn(
+        const ast::Expr& e, EscapeScope scope = EscapeScope::Method);
 
-    // Per-statement driver for `checkCatchBorrowClosureEscapesInOneLambda`:
+    // Per-statement driver for `checkOneLambdaBodyEscapes`:
     // fires `checkClosureEscapesOnReturn` on every `return E;` reachable in one
     // lambda body without crossing a nested lambda. fix #3571: a thin
     // `scanReturnsIn` wrapper — was its own copy of the traversal.
@@ -1680,7 +1752,19 @@ private:
     // Returns true when it reported a diagnostic, so the owned-field borrow
     // check (issue #402) can skip a borrow source #386 has already flagged and
     // avoid a duplicate diagnostic for the same store. // per §28.3
-    bool checkBorrowStoreEscape(const ast::AssignmentStmt& as);
+    // `scope` (fix #3565, §31.1, v0.286): `EscapeScope::LambdaBody` says the
+    // caller is `scanLambdaBodyBorrowStores`, running this check over ONE
+    // lambda body with `states_` / `localDepth_` re-seeded from that body
+    // alone. Every SOURCE-based leg then answers about the lambda body: a
+    // method-scope local is absent from both maps, so the `td >= 0 && sd >= 0`
+    // depth guard and `isOwnedTrackedLocal` both decline it. The one leg that
+    // consults NO source — §9.7's type-based "a borrow-bearing record / span /
+    // choice may not be stored in an instance field of a class" — is therefore
+    // skipped in that scope: it is a different rule with a different input,
+    // and reaching it inside a lambda body is its own (still open) gap, filed
+    // as issue 3701 rather than smuggled in here. // per §31.1, §9.7, v0.286
+    bool checkBorrowStoreEscape(const ast::AssignmentStmt& as,
+                                EscapeScope scope = EscapeScope::Method);
 
     // §9.7 (issue #1251): true when an assignment TARGET classified as a field
     // write names storage owned by a CLASS or INTERFACE instance, as opposed to

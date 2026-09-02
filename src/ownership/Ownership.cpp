@@ -14,6 +14,8 @@
 #include "common/OwnershipFacts.hpp"   // #1414 stage 4: shared ownership-facts core
 #include "flow/CFG.hpp"
 #include "ownership/OwnershipState.hpp"
+#include "ownership/StmtWalker.hpp"  // fix #3565: forEachNestedStmt — the
+                                     // single statement grammar (#3656)
 #include "sema/ConstFold.hpp"   // §15.3 (#1549): fold a constant `move arr[i]` index
 #include "sema/EnumValues.hpp"  // enumHasZeroConstant — §7.9 / §17.11 enum row (#3072)
 #include "sema/SemaContext.hpp"
@@ -1249,7 +1251,7 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
     // caught-exception escape rule — a `return <closure capturing ex>` inside
     // a `try`/`catch` nested in a lambda body is never reached by the
     // dataflow's ReturnStmt arm. // per §31.1 v0.283
-    checkCatchBorrowClosureEscapesInLambdaBodies(body);
+    checkLambdaBodyEscapes(body);
 }
 
 void MethodOwnership::runExprBodyOwningReturnCheck(
@@ -1389,7 +1391,7 @@ void MethodOwnership::runExprBodyOwningReturnCheck(
     checkLambdaTaskFamilyBorrowReturnsExpr(
         exprBody, returnType_ ? ctx_.resolvedType(*returnType_) : nullptr);
     // fix #3546 (§31.1, v0.283): same reachability gap, same position.
-    checkCatchBorrowClosureEscapesInLambdaBodiesExpr(exprBody);
+    checkLambdaBodyEscapesExpr(exprBody);
     // §17.15 / K8.4 (v0.216, #2098): the `=>` sibling of finishBindAtom's
     // escape check. The full ownership dataflow does not run on expression
     // bodies, but checkBindAtomBodyEscape is deliberately self-contained
@@ -7534,35 +7536,165 @@ void MethodOwnership::collectReturnDirectLambdas(
 // it IS a reading the spec did not choose for us, recorded here rather than
 // left silent. Issue 3569 tracks narrowing this to lambdas whose own value
 // escapes. // per §31.1 v0.283
-void MethodOwnership::checkCatchBorrowClosureEscapesInLambdaBodies(
+//
+// fix #3564 / #3565 (v0.286): the traversal hole above was wider than its
+// §31.1 RETURN leg, so this driver is no longer catch-borrow-only and is
+// named for what it does. `checkOneLambdaBodyEscapes` now re-seeds the lambda
+// body's own `states_` / `localDepth_` and runs, in that scope, both the
+// §28.9 owned-local return leg (#3564) and the whole §31.1 / §28.3 assignment
+// channel (#3565). Everything the paragraph above says about the §31.1
+// identifier leg — including its deliberate over-rejection — is unchanged.
+// // per §28.9, §31.1, v0.286
+void MethodOwnership::checkLambdaBodyEscapes(
         const std::vector<std::unique_ptr<ast::Stmt>>& body) {
     std::vector<const ast::LambdaExpr*> lambdas;
     for (const auto& s : body)
         if (s) collectBodyLambdas(*s, lambdas);
     for (const ast::LambdaExpr* lam : lambdas)
-        checkCatchBorrowClosureEscapesInOneLambda(*lam);
+        checkOneLambdaBodyEscapes(*lam);
 }
 
 // The `=> E` sibling — an expression-bodied method/accessor/initializer can
 // embed a lambda exactly as a block body can. // per §31.1 v0.283
-void MethodOwnership::checkCatchBorrowClosureEscapesInLambdaBodiesExpr(
-        const ast::Expr& e) {
+void MethodOwnership::checkLambdaBodyEscapesExpr(const ast::Expr& e) {
     std::vector<const ast::LambdaExpr*> lambdas;
     collectBodyLambdasExpr(e, lambdas);
     for (const ast::LambdaExpr* lam : lambdas)
-        checkCatchBorrowClosureEscapesInOneLambda(*lam);
+        checkOneLambdaBodyEscapes(*lam);
 }
 
-void MethodOwnership::checkCatchBorrowClosureEscapesInOneLambda(
-        const ast::LambdaExpr& lam) {
-    // An expression-bodied lambda's `=> E` IS its returned value.
+// fix #3564 / #3565 (§28.9 / §31.1 / §27.5, v0.286): run one lambda body's
+// escape checks AGAINST THAT LAMBDA BODY'S OWN SCOPE.
+//
+// #3546 could only drive the one leg that needs no scope input at all
+// (`isCatchBorrow` reads a sema-set flag). Its two siblings could not be
+// driven because their inputs — `states_` for §28.9's owned-obligation test,
+// `localDepth_` for §31.1's assignment-channel depth comparison — describe the
+// METHOD's scope, so from here they would silently answer about the wrong one.
+// That left both channels open with the method-level rejection sitting right
+// beside them: measured on this branch's parent, `p5` (a closure over a catch
+// binding assigned to a lambda-body local declared outside the arm) compiled
+// rc=0 and heap-use-after-freed under ASan, and `p3` (a closure over a
+// lambda-body `using var` returned out of the lambda) compiled rc=0, printed
+// a value and leaked 56 bytes — while the byte-identical METHOD-level
+// spellings of both are rejected.
+//
+// The inputs are not unavailable, only un-seeded. So: save `states_` and
+// `localDepth_`, clear them, rebuild BOTH from this lambda body alone, run the
+// checks, restore. The save/clear/restore shape is
+// `applyUsingVarBorrowPinInLambdas`' (#2166), which already walks each lambda
+// body with a fresh `states_` for the same reason; the two seeds are the
+// existing authorities (`collectLocalDepths`, which fix #3520 already taught
+// to record a catch arm binding's depth, and `localIsOwnedObligation` via
+// `seedLambdaBodyOwnedLocals`). Nothing here re-decides "is this a catch
+// binding", "is this an owned obligation" or "does this block enclose that
+// one" — those stay single-spelling.
+//
+// The re-seeding is also what SCOPES the fix: a method-scope local is in
+// neither rebuilt map, so `isOwnedTrackedLocal` declines it and the
+// `td >= 0 && sd >= 0` depth guard bails. A closure that escapes the lambda
+// but captures a METHOD local is therefore still accepted here — deliberately:
+// whether the LAMBDA's own value escapes the method is the analysis this
+// pre-pass does not have, and issue 3564 records it as the open half.
+//
+// Restore is unconditional (both maps are restored on every exit path) because
+// this runs at the END of `run()` for a method body but in the MIDDLE of the
+// member walk for the `=> E` positions, where a later check still reads the
+// method's own state. // per §28.9, §31.1, v0.286
+void MethodOwnership::checkOneLambdaBodyEscapes(const ast::LambdaExpr& lam) {
+    BlockState savedStates = states_;
+    auto savedDepths = localDepth_;
+    states_.clear();
+    localDepth_.clear();
+    // An expression-bodied lambda's `=> E` IS its returned value, and carries
+    // no statements — so there is nothing to seed and no assignment to walk,
+    // and the two maps stay EMPTY for the check below. That is deliberate and
+    // load-bearing: `EscapeScope::LambdaBody` admits the §28.9 leg, and with
+    // an empty `states_` it declines every symbol, so this path behaves
+    // exactly as it did under #3546's `catchBorrowLegOnly`. Running the check
+    // BEFORE the clear would let the §28.9 leg resolve the enclosing METHOD's
+    // locals and reject `lambda(): () -> int => lambda(): int => r.V();` over
+    // a method-scope `using var r` — a program whose escape this pre-pass
+    // cannot decide (issue 3702) and which was accepted before.
     if (lam.exprBody) {
-        checkClosureEscapesOnReturn(*lam.exprBody,
-                                    /*catchBorrowLegOnly=*/true);
+        checkClosureEscapesOnReturn(*lam.exprBody, EscapeScope::LambdaBody);
+        states_ = std::move(savedStates);
+        localDepth_ = std::move(savedDepths);
         return;
     }
+    // Depth 0 is the lambda body itself — the same convention
+    // `collectLocalDepths` uses for a method body, so every consumer's
+    // "strictly encloses" comparison means the same thing here.
+    collectLocalDepths(lam.stmts);
+    seedLambdaBodyOwnedLocals(lam.stmts);
     for (const auto& s : lam.stmts)
         if (s) scanCatchBorrowClosureReturns(*s);
+    for (const auto& s : lam.stmts)
+        if (s) scanLambdaBodyBorrowStores(*s);
+    states_ = std::move(savedStates);
+    localDepth_ = std::move(savedDepths);
+}
+
+// fix #3564 (§28.9 / §28.3, v0.286): seed `states_` with the owned scope-bound
+// locals this lambda body declares, so `checkClosureEscapesOnReturn`'s §28.9
+// leg (and `checkBorrowStoreEscape`'s owned-source legs) can answer about it.
+//
+// Flow-INSENSITIVE by construction: every owned obligation the body declares
+// is seeded before the checks run, rather than incrementally at each
+// statement. That is sound for the question asked, because the only way to
+// reach either check is to CAPTURE or READ the local by name, and a name is
+// not in scope before its declaration — sema rejects that first. The
+// imprecision it does buy is in the other direction (a local consumed by a
+// `move` before the escape site still reads as Owned), which cannot admit an
+// escape, only over-reject one; and capturing a moved-from local is already
+// its own rejection (§28.3).
+//
+// The obligation test is `localIsOwnedObligation`, the SAME predicate the
+// method-level dataflow uses, reached through `findLocalSymbol` — which is
+// keyed on the decl NODE, so it resolves a `LocalConstDecl` as readily as a
+// `LocalDecl` and this walker needs no `dynamic_cast<const ast::LocalDecl*>`
+// of its own (§21.1 then makes the const answer false, in the one authority
+// rather than in an eighth copy of the #3591 LocalDecl-only shape).
+//
+// Ordering is what makes the AST flags this predicate reads trustworthy here.
+// `applyUsingVarBorrowPinInLambdas` (#2166) runs at the TOP of `run()` and
+// calls `handleLocalDecl` on every LocalDecl it finds in a lambda body; this
+// driver runs at the BOTTOM. So by the time we read them, `isUsing` /
+// `usingVarSourceIsBorrow` are settled AND so is `autoDropAtScopeEnd` — which
+// is why a plain `var q := new R();` in a lambda body is seeded too, not only
+// a `using var` (measured: the returned-closure escape over a plain `var` is
+// rejected, alongside the pre-existing §28.3 auto-drop warning on the same
+// local). // per §28.9, §28.3, §21.1, v0.286
+void MethodOwnership::seedLambdaBodyOwnedLocals(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body) {
+    for (const auto& top : body) {
+        if (!top) continue;
+        forEachNestedStmt(*top, [this](const ast::Stmt& cur) {
+            sema::LocalSymbol* ls = findLocalSymbol(cur);
+            if (!ls || !localIsOwnedObligation(ls)) return;
+            LocalOwnership st;
+            st.state = OwnershipState::Owned;
+            st.obligationOrigin = &cur;
+            states_[ls] = st;
+        });
+    }
+}
+
+// fix #3565 (§31.1 / §28.3, v0.286): the ASSIGNMENT-channel sibling of
+// `scanCatchBorrowClosureReturns`. `checkBorrowStoreEscape` is driven from
+// `handleAssignment`, which the dataflow reaches through `visitStmt`'s
+// `AssignmentStmt` arm — and ownership's statement walks never enter a lambda
+// body. So `f := lambda() => ex.Message.Length;` inside a lambda body reached
+// the check through no path at all, while the method-level spelling has been
+// rejected since fix #3520. Rides `forEachNestedStmt`, the #3656 single
+// statement grammar, which never crosses into a nested lambda — a nested
+// lambda's own assignments are walked when the flat lambda list reaches it,
+// with ITS body's seed. // per §31.1, §28.3, v0.286
+void MethodOwnership::scanLambdaBodyBorrowStores(const ast::Stmt& s) {
+    forEachNestedStmt(s, [this](const ast::Stmt& cur) {
+        if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&cur))
+            checkBorrowStoreEscape(*as, EscapeScope::LambdaBody);
+    });
 }
 
 // fix #3571: a thin `scanReturnsIn` leaf, firing `checkClosureEscapesOnReturn`
@@ -7571,7 +7703,7 @@ void MethodOwnership::checkCatchBorrowClosureEscapesInOneLambda(
 // `collectReturnDirectLambdas` node-for-node. // per §31.1 v0.283
 void MethodOwnership::scanCatchBorrowClosureReturns(const ast::Stmt& s) {
     scanReturnsIn(s, [this](const ast::Expr& re) {
-        checkClosureEscapesOnReturn(re, /*catchBorrowLegOnly=*/true);
+        checkClosureEscapesOnReturn(re, EscapeScope::LambdaBody);
     });
 }
 
@@ -9788,7 +9920,7 @@ void checkMember(const ast::Member& m, sema::SemaContext& ctx,
                 *od->exprBody,
                 od->returnType ? ctx.resolvedType(*od->returnType) : nullptr);
             // fix #3546 (§31.1, v0.283): same reachability gap, same position.
-            mo.checkCatchBorrowClosureEscapesInLambdaBodiesExpr(*od->exprBody);
+            mo.checkLambdaBodyEscapesExpr(*od->exprBody);
         }
     } else if (auto* fd = dynamic_cast<const ast::FieldDecl*>(&m)) {
         // #1484 / §28.6: a field INITIALIZER (`f: T := E`) is an ownership-
@@ -9818,7 +9950,7 @@ void checkMember(const ast::Member& m, sema::SemaContext& ctx,
                 *fd->initializer,
                 fd->type ? ctx.resolvedType(*fd->type) : nullptr);
             // fix #3546 (§31.1, v0.283): same reachability gap, same position.
-            mo.checkCatchBorrowClosureEscapesInLambdaBodiesExpr(
+            mo.checkLambdaBodyEscapesExpr(
                 *fd->initializer);
         }
     } else if (auto* nt = dynamic_cast<const ast::NestedTypeMember*>(&m)) {
@@ -9859,7 +9991,7 @@ void checkMember(const ast::Member& m, sema::SemaContext& ctx,
                 *pd->exprBody,
                 pd->type ? ctx.resolvedType(*pd->type) : nullptr);
             // fix #3546 (§31.1, v0.283): same reachability gap, same position.
-            mo.checkCatchBorrowClosureEscapesInLambdaBodiesExpr(*pd->exprBody);
+            mo.checkLambdaBodyEscapesExpr(*pd->exprBody);
         } else if (pd->bodyKind == ast::PropertyBodyKind::Block) {
             for (const auto& acc : pd->accessors) {
                 MethodOwnership mo(ctx);
@@ -9894,10 +10026,10 @@ void checkMember(const ast::Member& m, sema::SemaContext& ctx,
                 // position. Both accessor body shapes.
                 if (acc.bodyKind == ast::PropertyAccessorBodyKind::Expression &&
                     acc.exprBody)
-                    mo.checkCatchBorrowClosureEscapesInLambdaBodiesExpr(
+                    mo.checkLambdaBodyEscapesExpr(
                         *acc.exprBody);
                 else if (acc.bodyKind == ast::PropertyAccessorBodyKind::Block)
-                    mo.checkCatchBorrowClosureEscapesInLambdaBodies(acc.stmts);
+                    mo.checkLambdaBodyEscapes(acc.stmts);
                 if (acc.isSet) continue;  // §28.6 getter-fresh-owned: getters only
                 if (acc.bodyKind == ast::PropertyAccessorBodyKind::Expression &&
                     acc.exprBody) {
