@@ -647,8 +647,8 @@ bool isBuiltinCollectionLinqOperatorName(std::string_view n);
 
 // fix #3670 (stdlib §5, v0.286): does `m` take a single lambda argument
 // `(T) -> …` seeded with the LINQ receiver's own source element type T, so an
-// un-annotated lambda parameter (`(p) => p.x`) can be typed as T (§27.6's
-// bare-lambda-parameter inference; see `ExprTC::linqLambdaElementType`,
+// un-annotated lambda parameter (`(p) => p.x`) can be typed as T (§27.4's
+// parameter-type-inference rule; see `ExprTC::linqLambdaElementType`,
 // the sole caller)?
 //
 // This is a THIRD vocabulary, not a rename of `isBuiltinCollectionLinqOperatorName`
