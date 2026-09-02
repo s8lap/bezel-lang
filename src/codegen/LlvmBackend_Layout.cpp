@@ -1391,7 +1391,70 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
             // a `ptr` (the IR_FAIL "return type does not match operand type").
             // Lower it to a pointer. // per stdlib §5
             if (isLazyEnumerableType(rt)) return ptrTy();
-            return i32();  // other value-kind named — int
+            // fix #3577 (§2.8.3 rule 3, v0.286): the RESIDUE of the path
+            // #3540 closed for the §11.6 case. A `Kind::Named` TypeRef that
+            // survives every prior arm — no Class/Interface/Record
+            // declaration, no builtin name match (DateTime/TimeSpan/Guid/
+            // Range/Span/.../isHeapPointerReferenceBuiltin/builtinVtable_/
+            // lazy-enumerable), no generic-subst binding — and carries an
+            // IMPORTED QUALIFIED PATH NAME (importedName non-empty AND
+            // contains a `.`) is a type from another module that the
+            // loader could not resolve. Silently lowering it to i32 is the
+            // bug: a pointer-sized type (a class or interface) gets
+            // truncated to 32 bits and survives until the IR verifier
+            // happens to catch the type mismatch at a function signature
+            // (#3540), or — the unlucky case in #495 — does not, and is
+            // later stored as a truncated half-pointer in a struct field
+            // (SIGSEGV) or used in a load (SIGABRT). The spec asks for a
+            // diagnostic naming the type (§2.8.3 rule 3, "a build whose
+            // closure contains disagreeing descriptions … is ill-formed,
+            // with a diagnostic naming the artifacts and recommending
+            // recompilation of the dependents"); emit one and return the
+            // i32 placeholder so the caller still has a Type* to thread
+            // through (hasErrors() rejects the module at the end of
+            // emission per #628).
+            //
+            // ⚠ SCOPE: the `.`-contains predicate is the §11.6 QUALIFIED
+            // PATH discriminator the issue's analysis recommends
+            // (verbatim: "A narrower predicate — 'reject when the
+            // unresolved name contains a `.`' — would work for the
+            // nested-type family specifically"). An `importedName`-empty
+            // shape (a bare unbound type parameter `T` in an
+            // UNSPECIALIZED generic-method TEMPLATE body) is intentionally
+            // NOT diagnosed: the template body is emitted as "dead" IR per
+            // #567 and the i32 placeholder is what keeps the template's
+            // signatures consistent with its per-instantiation
+            // specializations (#460). An `importedName`-set but
+            // dot-free shape (a CROSS-MODULE generic-method type parameter
+            // like `T`, where the loader correctly carries the parameter
+            // NAME across the artifact boundary but cannot bind it to a
+            // local declaration — the substitution is applied at the
+            // consumer's monomorphization site, not here) is also NOT
+            // diagnosed: diagnosing it would reject every cross-module
+            // program that uses a generic method on a generic class.
+            // // per §2.8.3 rule 3
+            if (!rt->importedName.empty() &&
+                rt->importedName.find('.') != std::string_view::npos &&
+                !ctx_.diagnostics().hasErrors()) {
+                SourceLocation at = rt->astNode ? rt->astNode->span.begin
+                                                : SourceLocation{};
+                std::string name(!rt->headName().empty()
+                                     ? std::string(rt->headName())
+                                     : std::string("<unnamed>"));
+                ctx_.diagnostics().report(
+                    Severity::Error, at,
+                    std::string("cannot lower imported Named type `") + name +
+                        "`: the type is unresolved at codegen (no "
+                        "declaration matched any builtin arm — DateTime/"
+                        "TimeSpan/Guid/Range/Span/heap-pointer builtins/"
+                        "exception vtable — and no generic substitution "
+                        "applied); §2.8.3 rule 3 requires the artifact "
+                        "interface to carry enough to reconstruct every "
+                        "public signature. Without that, i32 is the silent "
+                        "fallback and a pointer-sized type is truncated to "
+                        "32 bits (#3577, residue of #3540).");
+            }
+            return i32();  // value-kind named — int
         case sema::TypeRef::Kind::InlineArray: {
             // §15.1: [N]T is an LLVM fixed-size array [N x elemType].
             // N is an IntLiteralExpr, or a folded compile-time size (#734:
