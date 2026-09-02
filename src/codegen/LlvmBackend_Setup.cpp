@@ -431,6 +431,9 @@ llvm::Value* Emitter::enumConstantByName(const sema::TypeSymbol* enumTy,
 llvm::Value* Emitter::constMemberValue(const ast::Expr& e) {
     auto* cs = dynamic_cast<sema::ConstMemberSymbol*>(ctx_.exprSymbol(e));
     if (!cs) return nullptr;
+    // SEAM-ACCESSOR: the local-path cast; the imported fallback (all
+    // primitive kinds via foldImportedConstText) is the `if (!cd)
+    // return importedConstValue(e, cs);` line just below. #3152
     auto* cd = dynamic_cast<const ast::ConstDecl*>(cs->decl);
     if (cd && cd->value) {
         llvm::Value* v = lowerExpr(*cd->value);
@@ -808,6 +811,9 @@ void Emitter::declareStatics() {
     for (const auto& sym : ctx_.symbols()) {
         auto* fs = dynamic_cast<const sema::FieldSymbol*>(sym.get());
         if (!fs || !isStaticField(fs)) continue;
+        // SEAM-ACCESSOR: this loop walks ctx_.symbols() only (never
+        // imported); the separate importedSymbols() loop just below
+        // (using ctx_.importedMemberType) handles the cross-module case. #3152
         auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
         llvm::Type* ty = fd ? lowerType(fd->type.get()) : i32();
         std::string cls = fs->parent ? mangledTypeName(fs->parent) : "";
@@ -844,6 +850,10 @@ void Emitter::declareStatics() {
     for (const auto& sym : ctx_.symbols()) {
         auto* ps = dynamic_cast<const sema::PropertySymbol*>(sym.get());
         if (!ps || !isStaticAutoProperty(ps)) continue;
+        // SEAM-ACCESSOR: this loop walks ctx_.symbols() only (never
+        // imported -- SemaContext.hpp keeps importedSymbols_ separate), so
+        // this symbol is always local and its `decl` is never null for an
+        // imported one. #3152
         auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
         llvm::Type* ty = (pd && pd->type) ? lowerType(pd->type.get()) : i32();
         std::string cls = ps->parent ? mangledTypeName(ps->parent) : "";
@@ -876,6 +886,10 @@ void Emitter::declareStatics() {
     for (const auto& sym : ctx_.symbols()) {
         auto* es = dynamic_cast<const sema::EventSymbol*>(sym.get());
         if (!es) continue;
+        // SEAM-ACCESSOR: this loop walks ctx_.symbols() only (never
+        // imported -- SemaContext.hpp keeps importedSymbols_ separate), so
+        // this symbol is always local and its `decl` is never null for an
+        // imported one. #3152
         auto* ed = dynamic_cast<const ast::EventDecl*>(es->decl);
         if (!ed || !ed->isStatic || ed->isAsync) continue;
         std::string cls = es->parent ? std::string(es->parent->name) : "";
@@ -2090,6 +2104,10 @@ void Emitter::declareFunctions() {
     for (const auto& sym : ctx_.symbols()) {
         auto* cs = dynamic_cast<sema::ConstructorSymbol*>(sym.get());
         if (!cs || cs->isStatic) continue;
+        // SEAM-ACCESSOR: this loop walks ctx_.symbols() only (never
+        // imported -- SemaContext.hpp keeps importedSymbols_ separate), so
+        // this symbol is always local and its `decl` is never null for an
+        // imported one. #3152
         auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
         if (!cd) continue;
         std::vector<llvm::Type*> paramTys;
@@ -2143,6 +2161,8 @@ void Emitter::declareFunctions() {
         for (const sema::Symbol* m : t->members) {
             auto* fs = dynamic_cast<const sema::FieldSymbol*>(m);
             if (!fs || !isStaticField(fs)) continue;
+            // SEAM-ACCESSOR: needsRuntimeFieldInit's `t` (its only call site
+            // is the ctx_.symbols() loop just below) is always local. #3152
             auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
             if (!fd || !fd->initializer) continue;
             const ast::Expr* e = fd->initializer.get();
@@ -2176,6 +2196,10 @@ void Emitter::declareFunctions() {
         // (b) User-written cctor.
         if (auto* cs = dynamic_cast<sema::ConstructorSymbol*>(sym.get())) {
             if (!cs->isStatic) continue;
+            // SEAM-ACCESSOR: this loop walks ctx_.symbols() only (never
+            // imported -- SemaContext.hpp keeps importedSymbols_ separate), so
+            // this symbol is always local and its `decl` is never null for an
+            // imported one. #3152
             if (!dynamic_cast<const ast::ConstructorDecl*>(cs->decl)) continue;
             std::string cls = cs->parent ? mangledTypeName(cs->parent) : "";
             auto* fn = llvm::Function::Create(
@@ -2517,6 +2541,9 @@ void Emitter::emitExportedPropertyGetters() {
             // Only public properties are part of the cross-module surface.
             if (ps->visibility != ast::Visibility::Public) continue;
             // Only getters — properties with no getter (setter-only, §22.9) skip.
+            // SEAM-ACCESSOR: ts is drawn from ctx_.symbols() (never
+            // imported), and its `members` are that local type's own collected
+            // members -- never imported. #3152
             auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
             if (!pd) continue;
             // Derive the return type.
@@ -2663,6 +2690,9 @@ void Emitter::emitExportedPropertySetters() {
             if (isStatic) continue;
             // Only public properties are part of the cross-module surface.
             if (ps->visibility != ast::Visibility::Public) continue;
+            // SEAM-ACCESSOR: ts is drawn from ctx_.symbols() (never
+            // imported), and its `members` are that local type's own collected
+            // members -- never imported. #3152
             auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
             if (!pd) continue;
             // Derive the setter's value-parameter type (same as the property's
@@ -2756,6 +2786,9 @@ void Emitter::emitExportedStaticPropertyAccessors() {
             if (!ps || ps->isIndexer) continue;
             if (!isStaticProperty(ps)) continue;
             if (ps->visibility != ast::Visibility::Public) continue;
+            // SEAM-ACCESSOR: ts is drawn from ctx_.symbols() (never
+            // imported), and its `members` are that local type's own collected
+            // members -- never imported. #3152
             auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
             if (!pd) continue;
             llvm::Type* valTy = lowerType(pd->type.get());
@@ -2879,6 +2912,9 @@ void Emitter::emitExportedIndexerGetters() {
             for (auto mod : ps->modifiers) if (mod == "static") isStatic = true;
             if (isStatic) continue;
             if (ps->visibility != ast::Visibility::Public) continue;
+            // SEAM-ACCESSOR: ts is drawn from ctx_.symbols() (never
+            // imported), and its `members` are that local type's own collected
+            // members -- never imported. #3152
             auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
             if (!pd) continue;
             llvm::Type* retTy = lowerType(pd->type.get());
@@ -2965,6 +3001,9 @@ void Emitter::emitExportedIndexerSetters() {
             for (auto mod : ps->modifiers) if (mod == "static") isStatic = true;
             if (isStatic) continue;
             if (ps->visibility != ast::Visibility::Public) continue;
+            // SEAM-ACCESSOR: ts is drawn from ctx_.symbols() (never
+            // imported), and its `members` are that local type's own collected
+            // members -- never imported. #3152
             auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
             if (!pd) continue;
             llvm::Type* valTy = lowerType(pd->type.get());
@@ -3704,6 +3743,9 @@ llvm::Function* Emitter::ensureNullableWideningThunk(
                                           : nullptr);
         }
         if (!pr) {
+            // SEAM-ACCESSOR: symbol-side ps->resolvedDeclType /
+            // ps->declType is consulted first (just above); this AST
+            // cast is only the local-path fallback when neither is set. #3152
             auto* md = dynamic_cast<const ast::MethodDecl*>(implMs->decl);
             if (md && pIdx < md->params.size() && md->params[pIdx].type)
                 pr = ctx_.resolvedType(*md->params[pIdx].type);
@@ -3765,6 +3807,9 @@ llvm::Function* Emitter::ensureNullableWideningThunk(
             }
             // If still null, fall back via the impl method's AST MethodDecl.
             if (!implParamRef) {
+                // SEAM-ACCESSOR: symbol-side ps->resolvedDeclType /
+                // ps->declType is consulted first (just above); this AST
+                // cast is only the local-path fallback when neither is set. #3152
                 auto* md = dynamic_cast<const ast::MethodDecl*>(implMs->decl);
                 if (md && pIdx < md->params.size() && md->params[pIdx].type)
                     implParamRef = ctx_.resolvedType(*md->params[pIdx].type);
@@ -4074,6 +4119,10 @@ void Emitter::declareVtables() {
         for (sema::Symbol* m : ts->members) {
             auto* es = dynamic_cast<sema::EventSymbol*>(m);
             if (!es) continue;
+            // SEAM-ACCESSOR: this loop walks ctx_.symbols() only (never
+            // imported -- SemaContext.hpp keeps importedSymbols_ separate), so
+            // this symbol is always local and its `decl` is never null for an
+            // imported one. #3152
             auto* ed = dynamic_cast<const ast::EventDecl*>(es->decl);
             if (ed && !ed->isAsync) ifaceEventIndex_[es] = idx++;
         }
@@ -5475,6 +5524,8 @@ llvm::Value* Emitter::constValueForPatternName(
     // `ctx_.importedMemberType(cs)` — no expression side is available on a
     // Pattern node.
     auto fold = [&](sema::ConstMemberSymbol* cs) -> llvm::Value* {
+        // SEAM-ACCESSOR: local-path cast; `if (!cs->decl)` two lines
+        // below is the imported fallback via ctx_.importedConstValue. #3152
         auto* cd = dynamic_cast<const ast::ConstDecl*>(cs->decl);
         if (cd && cd->value) return lowerExpr(*cd->value);
         if (!cs->decl) {
@@ -6886,6 +6937,9 @@ llvm::GlobalVariable* Emitter::buildImportedGenericVtable(
                     // today rather than a body compiled for another layout.
                     // Guessing here is the silent-wrong-value direction, which
                     // is why nothing falls back to `methodFns_`.
+                    // SEAM-ACCESSOR: deliberate decl-PRESENCE test ("did the loader
+                    // reconstruct a body"), documented just above -- not a field
+                    // read; #3152 NEEDS-AST-shaped, not a UNIFY.
                     if (!dynamic_cast<const ast::MethodDecl*>(impl->decl))
                         continue;
                     CallableInfo ci;
@@ -6963,6 +7017,9 @@ llvm::GlobalVariable* Emitter::buildImportedGenericVtable(
                     // instantiation (the hazard #2906 removed from
                     // `specializedVtableFor` and did not remove here).
                     if (pimpl->isIndexer &&
+                        // SEAM-ACCESSOR: deliberate decl-PRESENCE test ("did the loader
+                        // reconstruct a body"), documented just above -- not a field
+                        // read; #3152 NEEDS-AST-shaped, not a UNIFY.
                         dynamic_cast<const ast::PropertyDecl*>(pimpl->decl))
                         return false;
                     if (!pimpl->parent) return false;
@@ -7200,6 +7257,9 @@ llvm::GlobalVariable* Emitter::buildImportedGenericVtable(
         if (!user || !user->parent) return nullptr;
         if (!instanceLayoutDiffersFromErasedTemplate(user->parent))
             return nullptr;
+        // SEAM-ACCESSOR: deliberate decl-PRESENCE test ("did the loader
+        // reconstruct a body"), documented at :7229 above -- not a field
+        // read; #3152 NEEDS-AST-shaped, not a UNIFY.
         if (!dynamic_cast<const ast::MethodDecl*>(user->decl)) return nullptr;
         auto mit = methodFns_.find(user);
         if (mit == methodFns_.end() || !mit->second) return nullptr;
@@ -8963,6 +9023,8 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
             }
         }
         if (ms->decl) {
+            // SEAM-ACCESSOR: gated on the outer `if (ms->decl)` just above --
+            // never null when reached; not a bug. #3152
             if (auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl))
                 if (!md->genericParams.empty()) {
                     genericTemplate = true;
@@ -9237,8 +9299,9 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
     // semantics"). Static methods and entry points are admitted — clauses on
     // them evaluate the same way.
     if (ms->decl) {
-        if (auto* md =
-                dynamic_cast<const ast::MethodDecl*>(ms->decl)) {
+        // SEAM-ACCESSOR: gated on the outer `if (ms->decl)` just above --
+        // never null when reached; not a bug. #3152
+        if (auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl)) {
             // §22.16 (v0.250, #3038): allocate one frame slot per
             // `old(E)` CallExpr in the entry block. Must run BEFORE the
             // requires prologue so the allocas are placed at the top of
@@ -10828,8 +10891,14 @@ void Emitter::emitOwnFieldInit(const sema::TypeSymbol* t, llvm::Value* obj,
     }
     for (const sema::Symbol* m : storage) {
         const ast::Expr* init = nullptr;
+        // SEAM-ACCESSOR: emitOwnFieldInit's documented #2874 imported
+        // fallback (ctx_.importedMemberType) runs right after this local
+        // path when m->decl == nullptr. #3152
         if (auto* fd = dynamic_cast<const ast::FieldDecl*>(m->decl))
             init = fd->initializer.get();
+        // SEAM-ACCESSOR: emitOwnFieldInit's documented #2874 imported
+        // fallback (ctx_.importedMemberType) runs right after this local
+        // path when m->decl == nullptr. #3152
         else if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(m->decl))
             init = pd->autoInitializer.get();  // CG33: `property X := v;`
         // fix #2874 (§2.8.2 / §22.8 step 2, v0.240): an IMPORTED generic
@@ -10989,8 +11058,14 @@ void Emitter::emitOwnFieldInit(const sema::TypeSymbol* t, llvm::Value* obj,
             // collection (same bz_array_alloc + bz_array_add as `new`/`.Add`) and
             // store the pointer into the field slot.
             const sema::TypeRef* fieldRt = nullptr;
+            // SEAM-ACCESSOR: emitOwnFieldInit's documented #2874 imported
+            // fallback (ctx_.importedMemberType) runs right after this local
+            // path when m->decl == nullptr. #3152
             if (auto* fd = dynamic_cast<const ast::FieldDecl*>(m->decl))
                 if (fd->type) fieldRt = ctx_.resolvedType(*fd->type);
+            // SEAM-ACCESSOR: emitOwnFieldInit's documented #2874 imported
+            // fallback (ctx_.importedMemberType) runs right after this local
+            // path when m->decl == nullptr. #3152
             if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(m->decl))
                 if (pd->type) fieldRt = ctx_.resolvedType(*pd->type);
             // fix #2874 (§2.8.2 / §22.8, v0.240): for an IMPORTED field
@@ -11074,8 +11149,14 @@ void Emitter::emitOwnFieldInit(const sema::TypeSymbol* t, llvm::Value* obj,
         if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(init);
             cl && cl->isDict && !cl->keys.empty()) {
             const sema::TypeRef* fieldRt = nullptr;
+            // SEAM-ACCESSOR: emitOwnFieldInit's documented #2874 imported
+            // fallback (ctx_.importedMemberType) runs right after this local
+            // path when m->decl == nullptr. #3152
             if (auto* fd = dynamic_cast<const ast::FieldDecl*>(m->decl))
                 if (fd->type) fieldRt = ctx_.resolvedType(*fd->type);
+            // SEAM-ACCESSOR: emitOwnFieldInit's documented #2874 imported
+            // fallback (ctx_.importedMemberType) runs right after this local
+            // path when m->decl == nullptr. #3152
             if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(m->decl))
                 if (pd->type) fieldRt = ctx_.resolvedType(*pd->type);
             // fix #2874 (§2.8.2 / §22.8, v0.240): for an IMPORTED field
@@ -11140,8 +11221,14 @@ void Emitter::emitOwnFieldInit(const sema::TypeSymbol* t, llvm::Value* obj,
         // unchanged (coerceReturnToNullableValue returns it as-is).
         {
             const sema::TypeRef* fieldRt = nullptr;
+            // SEAM-ACCESSOR: emitOwnFieldInit's documented #2874 imported
+            // fallback (ctx_.importedMemberType) runs right after this local
+            // path when m->decl == nullptr. #3152
             if (auto* fd = dynamic_cast<const ast::FieldDecl*>(m->decl))
                 if (fd->type) fieldRt = ctx_.resolvedType(*fd->type);
+            // SEAM-ACCESSOR: emitOwnFieldInit's documented #2874 imported
+            // fallback (ctx_.importedMemberType) runs right after this local
+            // path when m->decl == nullptr. #3152
             if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(m->decl))
                 if (pd->type) fieldRt = ctx_.resolvedType(*pd->type);
             // fix #2874 (§2.8.2 / §22.8, v0.240): for an IMPORTED field
@@ -11187,8 +11274,14 @@ void Emitter::emitOwnFieldInit(const sema::TypeSymbol* t, llvm::Value* obj,
         // on every retain/release helper below.
         if (t->kind == ast::TypeDeclKind::Class) {
             const sema::TypeRef* fieldRt = nullptr;
+            // SEAM-ACCESSOR: emitOwnFieldInit's documented #2874 imported
+            // fallback (ctx_.importedMemberType) runs right after this local
+            // path when m->decl == nullptr. #3152
             if (auto* fd = dynamic_cast<const ast::FieldDecl*>(m->decl))
                 if (fd->type) fieldRt = ctx_.resolvedType(*fd->type);
+            // SEAM-ACCESSOR: emitOwnFieldInit's documented #2874 imported
+            // fallback (ctx_.importedMemberType) runs right after this local
+            // path when m->decl == nullptr. #3152
             if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(m->decl))
                 if (pd->type) fieldRt = ctx_.resolvedType(*pd->type);
             // fix #2874 (§2.8.2 / §22.8, v0.240): for an IMPORTED field
@@ -11301,8 +11394,14 @@ void Emitter::emitOwnFieldInit(const sema::TypeSymbol* t, llvm::Value* obj,
                 isStatic = isStaticField(fs);
             if (!isStatic) {
                 const sema::TypeRef* fieldTy = nullptr;
+                // SEAM-ACCESSOR: emitOwnFieldInit's documented #2874 imported
+                // fallback (ctx_.importedMemberType) runs right after this local
+                // path when m->decl == nullptr. #3152
                 if (auto* fd = dynamic_cast<const ast::FieldDecl*>(m->decl))
                     if (fd->type) fieldTy = ctx_.resolvedType(*fd->type);
+                // SEAM-ACCESSOR: emitOwnFieldInit's documented #2874 imported
+                // fallback (ctx_.importedMemberType) runs right after this local
+                // path when m->decl == nullptr. #3152
                 if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(m->decl))
                     if (pd->type) fieldTy = ctx_.resolvedType(*pd->type);
                 if (!fieldTy && m->decl == nullptr) {
@@ -14224,6 +14323,10 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
     // `eligible ⟹ nulled` invariant stays EXACT; every other initializer is a
     // no-op here. // per §28.3 v0.180 #1978
     if (v && init)
+        // LOCALDECL-ONLY: a §21.1 `const`'s `owned` marker (`const y := owned
+        // x;`) is rejected by sema before codegen (verified: "a const local
+        // ... must not take an owned production"; LocalConstDecl also has no
+        // initializerHasOwnedMarker field) — null here is correct, #3591.
         if (auto* ldNode = dynamic_cast<const ast::LocalDecl*>(declNode))
             if (ldNode->initializerHasOwnedMarker) {
                 nullTransferredOwnedLocalSlot(init);
@@ -14278,6 +14381,10 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
         // Retain: the Object slot now owns an independent +1.
         emitStringRetain(v);
         bool reassigned = objectStringReassignedLocals_.count(
+            // LOCALDECL-ONLY: this set holds only AssignmentStmt TARGETS;
+            // reassigning a §21.1 `const` is a compile error (verified:
+            // rejected before codegen), so it can never hold a const's
+            // identity — null/`.count(nullptr)`==0 is correct, #3591.
             dynamic_cast<const ast::LocalDecl*>(declNode)) != 0;
         llvm::AllocaInst* state = nullptr;
         if (reassigned) {
@@ -14446,11 +14553,22 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
         // null for a borrowing value/class element (only the backing is freed),
         // the string-release thunk for the `Array<string>` co-owned-+1 case.
         // Mirror the using-var collection path (LlvmBackend_Setup.cpp ~6477).
+        // fix #3591 (§21.1 / stdlib §5, v0.286): `declNode` read through the
+        // shared `localDeclInitView` (mirrors the #2802/#3402 pattern this file
+        // already applies to the candidate scan that populates
+        // `borrowingArrayFreeEligible_` itself, LlvmBackend_Setup.cpp ~25355) —
+        // that scan already admits a §21.1 `const` local, so this consumer must
+        // decode both node kinds too. It was `dynamic_cast<const ast::LocalDecl*>
+        // (declNode)`, always null for a `const`, so `rt`/`el` stayed null and
+        // `const arr := src.ToArray();` on a `string` element type got NO
+        // per-element release thunk — the backing bz_array_free still fired
+        // (gated on `borrowingArrayFreeEligible_` alone, not on `ld`), but every
+        // retained-+1 string element leaked. The `var` twin was unaffected (its
+        // own dynamic_cast always succeeds).
+        LocalDeclInitView declView = localDeclInitView(declNode);
         const sema::TypeRef* rt = nullptr;
-        if (auto* ld = dynamic_cast<const ast::LocalDecl*>(declNode)) {
-            if (ld->type) rt = ctx_.resolvedType(*ld->type);
-            if (!rt && ld->initializer) rt = ctx_.exprType(*ld->initializer);
-        }
+        if (declView.type) rt = ctx_.resolvedType(*declView.type);
+        if (!rt && declView.init) rt = ctx_.exprType(*declView.init);
         const sema::TypeRef* el =
             (rt && !rt->genericArgs.empty()) ? rt->genericArgs[0] : nullptr;
         ElementPolicy ep = elementPolicyFor(el, /*owningFamily=*/false);
@@ -17705,6 +17823,10 @@ const sema::TypeSymbol* Emitter::unwindOwnedLocalClass(const ast::LocalDecl* ld)
             auto* ms = dynamic_cast<sema::MethodSymbol*>(
                 ctx_.exprSymbol(*call->callee));
             if (ms) {
+                // SEAM-ACCESSOR: local-path cast; the imported case is
+                // handled via sema::methodReturnsOwned two lines below
+                // (per #3189); `md` itself is only used later for a
+                // LOCAL-only concern (documented there). #3152
                 auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
                 // §28.10 / #707: for imported methods ms->decl is null (the
                 // ModuleLoader attaches no AST MethodDecl); the owned-return
@@ -18371,6 +18493,9 @@ inline bool calleeIsUserMethod(const sema::SemaContext& ctx,
     if (!callee) return false;
     sema::Symbol* s = ctx.exprSymbol(*callee);
     auto* ms = dynamic_cast<sema::MethodSymbol*>(s);
+    // SEAM-ACCESSOR: deliberate decl-PRESENCE test, documented just
+    // above -- an imported method correctly answers false (the safe
+    // conservative-leak direction, not a soundness bug). #3152
     return ms && dynamic_cast<const ast::MethodDecl*>(ms->decl) != nullptr;
 }
 
@@ -18471,6 +18596,9 @@ inline bool newExprRoutesThroughNullingCtor(const sema::SemaContext& ctx,
         auto* cs = dynamic_cast<sema::ConstructorSymbol*>(m);
         if (!cs || cs->isStatic) continue;
         if (cs->params.size() != n->args.size()) continue;
+        // SEAM-ACCESSOR: `ctx.isImported(nt->declaration)` is checked
+        // and returns false two lines above -- nt->declaration, and every
+        // cs drawn from its ->members, is always local here. #3152
         if (dynamic_cast<const ast::ConstructorDecl*>(cs->decl)) return true;
     }
     return false;
@@ -20356,6 +20484,9 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
                     // keeps this const-correct without widening the API):
                     // an expression-bodied property, OR a block-getter with an
                     // expression body.
+                    // SEAM-ACCESSOR: documented 12 lines above -- "an
+                    // imported string-returning property ... correctly
+                    // return false here" (conservative borrow path). #3152
                     auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
                     const ast::Expr* getter = nullptr;
                     if (pd && !pd->isIndexer) {
@@ -20456,6 +20587,8 @@ bool Emitter::isUserMethodStringReturnCall(const ast::Expr* init) const {
     // method's runtime target is some override that IS compiled here and also
     // mints +1 on return, so a declared-string virtual/abstract call is fine; we
     // only require a MethodDecl with a `string` return type.
+    // SEAM-ACCESSOR: local-path cast; `if (ctx_.isImported(ms))` above
+    // returns early for the imported case via ctx_.importedReturnType. #3152
     auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
     if (!md || !md->returnType) return false;
     const sema::TypeRef* rt = ctx_.resolvedType(*md->returnType);
@@ -21630,8 +21763,12 @@ struct StringEscapeWalker {
                 if (ps && ps->modifier == "out") {
                     const sema::TypeRef* fty = ps->resolvedDeclType;
                     if (!fty && ms->decl) {
-                        if (auto* md =
-                                dynamic_cast<const ast::MethodDecl*>(ms->decl))
+                        // SEAM-ACCESSOR: symbol-side ps->resolvedDeclType is
+                        // read first, two lines above (same #3417-precedent
+                        // pattern as ensureNullableWideningThunk); this AST
+                        // cast is only the local-path fallback when it was
+                        // not populated. #3152
+                        if (auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl))
                             if (i < md->params.size() && md->params[i].type)
                                 fty = ctx.resolvedType(*md->params[i].type);
                     }
@@ -22937,6 +23074,8 @@ bool Emitter::isUserMethodClosureReturnCall(const ast::Expr* init) const {
         const sema::TypeRef* rt = ctx_.importedReturnType(ms);
         return rt && rt->kind == sema::TypeRef::Kind::Function;
     }
+    // SEAM-ACCESSOR: local-path cast; `if (ctx_.isImported(ms))` above
+    // returns early for the imported case via ctx_.importedReturnType. #3152
     auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
     if (!md || !md->returnType) return false;
     const sema::TypeRef* rt = ctx_.resolvedType(*md->returnType);
@@ -23477,6 +23616,9 @@ const sema::TypeRef* Emitter::taskFamilyTypeFromField(
     if (!fs->decl) {
         rt = ctx_.importedMemberType(fs);
     } else {
+        // SEAM-ACCESSOR: local-path cast in the `else` arm of the
+        // `!fs->decl` gate just above; the imported case is handled by
+        // the `if` arm. #3152
         auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
         if (!fd || !fd->type) return nullptr;
         rt = ctx_.resolvedType(*fd->type);
@@ -24747,6 +24889,10 @@ bool Emitter::isFreshRecordConstructionOfExactType(
 bool Emitter::isProvablyFreshRecordFactoryMethod(
         const sema::MethodSymbol* ms, const sema::TypeSymbol* recTs) const {
     if (!ms || !recTs) return false;
+    // SEAM-ACCESSOR: the imported case is a SIBLING function, not a gap --
+    // every caller ORs this with isProvablyFreshImportedRecordFactoryMethod_
+    // (see the call site), so `false` here for an imported `ms` (ms->decl
+    // null) is complete, not a missing arm. #3152
     const auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
     if (!md) return false;
     if (md->bodyKind == ast::MethodBodyKind::Expression) {
@@ -26311,9 +26457,18 @@ int Emitter::isObjectStringSource(const ast::Expr* valueExpr) {
     if (!id) return 0;
     auto* loc = dynamic_cast<const sema::LocalSymbol*>(ctx_.exprSymbol(*id));
     if (!loc || !loc->decl) return 0;
-    // Parameter / capture source excluded — caller's reference, not ours.
-    auto* srcLd = dynamic_cast<const ast::LocalDecl*>(loc->decl);
-    if (!srcLd) return 0;
+    // fix #3591 (§21.1 / §28.9 / §28.3, v0.286): read through the shared
+    // `localDeclInitView` (the #3417 pattern this file's bind-time collector
+    // already applies to the same SOURCE question) instead of casting
+    // straight to `ast::LocalDecl*`. It was that bare cast, always null for a
+    // §21.1 `const` source — so `o := s;` reassigning an Object-typed target
+    // `o` from a `const s := "…";` string source got newOstrKind=0 ("not a
+    // string"), silently disarming the release-tracking state bit for a
+    // value that genuinely is a string (the `var s` twin sets the bit
+    // correctly). Parameter / capture sources still excluded: they yield an
+    // all-null view (localDeclInitView's contract), same "not ours" verdict.
+    LocalDeclInitView srcView = localDeclInitView(loc->decl);
+    if (!srcView.init && !srcView.type) return 0;
     return 1;
 }
 
@@ -26958,8 +27113,11 @@ void Emitter::collectBoxReleaseEligible(
                     dynamic_cast<const ast::IdentifierExpr*>(as->target.get())) {
                 auto* tsym = dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*tid));
                 if (tsym)
-                    if (auto* tld =
-                            dynamic_cast<const ast::LocalDecl*>(tsym->decl))
+                    // LOCALDECL-ONLY: `tsym->decl` here is an AssignmentStmt
+                    // TARGET; reassigning a §21.1 `const` is a compile error
+                    // (verified: a const is "not an assignable location"), so
+                    // this cast is never null for a program reaching codegen.
+                    if (auto* tld = dynamic_cast<const ast::LocalDecl*>(tsym->decl))
                         reassignedOpaqueLocals_.insert(tld);
             }
         }
@@ -27116,6 +27274,11 @@ void Emitter::collectObjectStringReleaseEligible(
                 auto* tsym = dynamic_cast<sema::LocalSymbol*>(
                     ctx_.exprSymbol(*tid));
                 if (tsym) {
+                    // LOCALDECL-ONLY: `tsym->decl` is an AssignmentStmt
+                    // TARGET; reassigning a §21.1 `const` is a compile error
+                    // (verified, see the `initializerHasOwnedMarker` marker
+                    // above in this file), so never null for a program
+                    // reaching codegen — #3591.
                     if (auto* tld = dynamic_cast<const ast::LocalDecl*>(
                             tsym->decl)) {
                         if (objectStringBorrowAll_.count(
@@ -27626,6 +27789,24 @@ void Emitter::collectCellFreeEligible(
             if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s)) {
                 if (ld->initializer) walkExpr(ctx, ld->initializer.get(), out);
                 return; }
+            // fix #3591 (§21.1 / §27.5, v0.286): a §21.1 `const` local
+            // declared inside a lambda body is `ast::LocalConstDecl`, a
+            // sibling of `LocalDecl` with no shared base beyond `ast::Stmt`
+            // (initializer field `value`, not `initializer`) — this walk had
+            // no arm for it, so an outer symbol referenced ONLY through a
+            // `const`'s initializer (`const doubled := count * 2;`) was never
+            // added to `out`, and `collectLambdaCaptures` never marked the
+            // outer local's ALREADY-boxed capture cell `cellFreeEligible_`.
+            // The cell (unconditionally allocated by `boxLocalSlot` for every
+            // captured symbol, `LlvmBackend_Exprs2.cpp`) then leaked: measured
+            // 1996 B / 499 allocations under ASan/LSan for a 500-iteration
+            // loop calling a method whose lambda's only reference to a
+            // captured `var` was via such a `const`. Symmetric with the
+            // `LocalDecl` arm above; a `const` is never itself assignable
+            // (§21.1), so only its initializer is walked.
+            if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(s)) {
+                if (lc->value) walkExpr(ctx, lc->value.get(), out);
+                return; }
             if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(s)) {
                 if (as->target) walkExpr(ctx, as->target.get(), out);
                 if (as->value) walkExpr(ctx, as->value.get(), out); return; }
@@ -27801,6 +27982,29 @@ void Emitter::collectCellFreeEligible(
                     if (!s) return;
                     if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s)) {
                         findLamsE(ld->initializer.get()); return; }
+                    // fix #3591 (§21.1 / §27.5 / #1135, v0.286): symmetric with
+                    // the walkStmt LocalConstDecl arm above — a nested lambda
+                    // bound via `const inner := lambda() => x;` inside this
+                    // outer lambda's body was invisible to this
+                    // #1135 escaping-widen walk (no LocalConstDecl arm). This
+                    // widening is SYMMETRY-ONLY, not a proven fix: `var
+                    // outer := lambda() => do const inner := lambda() => x;
+                    // return inner; end; return outer();` leaks 52 B / 3
+                    // allocations under ASan/LSan, but so does the
+                    // BYTE-IDENTICAL `var inner` twin, and so does dropping
+                    // the intermediate binding entirely (`return lambda()
+                    // => x;` directly) — all three measured identical, with
+                    // or without this arm. That is a pre-existing,
+                    // more general leak in a BLOCK-BODIED outer lambda
+                    // returning an escaping nested lambda (the passing
+                    // #1135 tests in closure_capture_test.cpp all use the
+                    // EXPRESSION-bodied spelling, `lambda() => lambda() =>
+                    // x`, never `do...end`) — filed separately as #3704,
+                    // not fixed here. This arm is kept because it cannot
+                    // worsen #3704 and matches the walkStmt arm's shape,
+                    // not because it closes an observable bug.
+                    if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(s)) {
+                        findLamsE(lc->value.get()); return; }
                     if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(s)) {
                         findLamsE(as->target.get()); findLamsE(as->value.get());
                         return; }
@@ -28011,6 +28215,12 @@ void Emitter::collectCellFreeEligible(
                                 if (!boundingLd) {
                                     auto* loc = dynamic_cast<sema::LocalSymbol*>(
                                         ctx.exprSymbol(*ma->target));
+                                    // LOCALDECL-ONLY: this branch only wants a
+                                    // `using var` receiver (guarded by
+                                    // `isUsing` two lines down); a §21.1
+                                    // `const` is never `using` (verified: no
+                                    // `using` prefix exists in the const
+                                    // grammar), so null here is correct, #3591.
                                     boundingLd = loc ? dynamic_cast<const ast::LocalDecl*>(
                                                           loc->decl)
                                                      : nullptr;
@@ -28371,6 +28581,8 @@ void Emitter::collectBoxReturnMethods() {
 
     for (auto& [sym, fn] : methodFns_) {
         if (ctx_.isImported(sym)) continue;
+        // SEAM-ACCESSOR: gated by the `if (ctx_.isImported(...)) continue;`
+        // line just above -- never reached for an imported symbol. #3152
         auto* md = dynamic_cast<const ast::MethodDecl*>(sym->decl);
         if (!md || !md->returnType) continue;
         const sema::TypeRef* rt = ctx_.resolvedType(*md->returnType);
@@ -28464,6 +28676,8 @@ void Emitter::collectObjectStringReturnMethods() {
 
     for (auto& [sym, fn] : methodFns_) {
         if (ctx_.isImported(sym)) continue;
+        // SEAM-ACCESSOR: gated by the `if (ctx_.isImported(...)) continue;`
+        // line just above -- never reached for an imported symbol. #3152
         auto* md = dynamic_cast<const ast::MethodDecl*>(sym->decl);
         if (!md || !md->returnType) continue;
         const sema::TypeRef* rt = ctx_.resolvedType(*md->returnType);
@@ -28676,8 +28890,11 @@ void Emitter::collectBoxStorageFields() {
         // Check field initializers (AST FieldDecl / PropertyDecl initializer).
         for (const sema::Symbol* m : candidates) {
             const ast::Expr* init = nullptr;
+            // SEAM-ACCESSOR: see the note just above -- ts is local, so
+            // every m->decl here is always local. #3152
             if (auto* fd = dynamic_cast<const ast::FieldDecl*>(m->decl))
                 init = fd->initializer.get();
+            // SEAM-ACCESSOR: same reason as the FieldDecl arm just above.
             else if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(m->decl))
                 init = pd->autoInitializer.get();
             if (!init) continue;  // no initializer → calloc-zeroed null → OK
@@ -28697,6 +28914,8 @@ void Emitter::collectBoxStorageFields() {
         // Check all method bodies for stores to these fields.
         for (auto& [msym, fn] : methodFns_) {
             if (ctx_.isImported(msym)) continue;
+            // SEAM-ACCESSOR: gated by the `if (ctx_.isImported(...)) continue;`
+            // line just above -- never reached for an imported symbol. #3152
             auto* md = dynamic_cast<const ast::MethodDecl*>(msym->decl);
             if (!md) continue;
             // Only scan methods that belong to THIS class (ts).
@@ -28707,6 +28926,8 @@ void Emitter::collectBoxStorageFields() {
         // Check all constructor bodies for stores to these fields.
         for (auto& [csym, fn] : ctorFns_) {
             if (ctx_.isImported(csym)) continue;
+            // SEAM-ACCESSOR: gated by the `if (ctx_.isImported(...)) continue;`
+            // line just above -- never reached for an imported symbol. #3152
             auto* cd = dynamic_cast<const ast::ConstructorDecl*>(csym->decl);
             if (!cd) continue;
             if (csym->parent != ts) continue;
@@ -28985,6 +29206,10 @@ bool Emitter::usingVarOwnsClassObjectDynamically(const ast::LocalDecl* ld) {
                     // `sema::methodReturnsOwned` — the same decision, in one
                     // place. `md` stays live below for the #1499 static-factory
                     // body scan, which genuinely needs the AST node.
+                    // SEAM-ACCESSOR: local-path cast; the imported case is
+                    // handled via sema::methodReturnsOwned just below
+                    // (same #3189 pattern as :17825); `md` is only used
+                    // later for a LOCAL-only concern. #3152
                     auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
                     bool isOwned = sema::methodReturnsOwned(*ms, ctx_);
                     // §28.10 / §14.2 (sweep #6): the return type may be a bare
