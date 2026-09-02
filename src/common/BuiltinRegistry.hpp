@@ -160,6 +160,25 @@ bool isBuiltinForInEnumerableHead(std::string_view head);
 // per §29.2 / stdlib §4.4–§4.5 / §4.11 / §4.14, #3419
 bool isArrayEnumeratorWrapSourceName(std::string_view n);
 
+// fix #3419 / §29.2 / §29.11 / §28.6: the SIX iterator-format HEADS the SYNC
+// `using var` admission list recognises — all four iterator-format ENUMERABLE
+// heads (sync + async, owning + non-owning) plus the two sync ENUMERATOR heads
+// (`IEnumerator<T>`, `IOwningEnumerator<T>`). The two ASYNC enumerator heads
+// are excluded because they take the `await using` path (`LlvmBackend_Async.cpp`).
+//
+// `LlvmBackend_Setup.cpp`'s `using var` handling used to spell this six-name
+// list by hand at one site; that was the fifth independent spelling of the
+// enumerable-wrap grid in this run, before the structural fix that #3419 asks
+// for. Every spelling has been the SAME question, so this single predicate is
+// what every consumer should read — sites that ask a DIFFERENT question
+// (routing through MoveNext / TakeCurrent / GetAsyncEnumerator vtable slots)
+// consult narrower subsets and are correctly excluded.
+//
+// A site that genuinely needs a different member subset should NOT extend
+// this predicate — it should add its own, narrower predicate and have the
+// ratchet flag it as drift-risk. // per §29.2 / §29.11 / §28.6, #3419
+bool isIteratorFormatDispatchHead(std::string_view head);
+
 // Array-backed collections (bz_array_t*): the receiver names whose indexer /
 // .Count lower through the bz_array_* runtime.  Backs isCollectionTypeName.
 // per §4.4–§4.7 / §4.14

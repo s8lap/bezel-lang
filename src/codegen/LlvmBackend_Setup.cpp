@@ -15652,12 +15652,14 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
             lt && lt->kind == sema::TypeRef::Kind::Named && !lt->declaration &&
             lt->astNode && lt->astNode->name &&
             !lt->astNode->name->parts.empty() &&
-            (lt->headName() == "IEnumerable" ||
-             lt->headName() == "IOwningEnumerable" ||
-             lt->headName() == "IEnumerator" ||
-             lt->headName() == "IOwningEnumerator" ||
-             lt->headName() == "IAsyncEnumerable" ||       // fix #1525
-             lt->headName() == "IOwningAsyncEnumerable");  // fix #1525
+            // fix #3419: the five prior spellings of the enumerable-wrap grid
+            // were each repaired independently and then drifted again on the
+            // next family member. This sixth spelling (the #3418 site, at the
+            // `using var` admission) now reads the shared authority
+            // (`common::isIteratorFormatDispatchHead`, declared in
+            // src/common/BuiltinRegistry.hpp) instead of carrying its own
+            // six-name copy. // per §29.2 / §29.11 / §28.6, #3419
+            common::isIteratorFormatDispatchHead(lt->headName());
         if (isSyncIterEnum) {
             // fix #3418 (§28.6 / §29.2 / §28.3, v0.283): the `using var` twin
             // of #3384. What stood here was a THIRD, independent spelling of

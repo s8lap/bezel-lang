@@ -163,6 +163,64 @@ BEZEL_TEST(builtin_registry_snapshot, sync_owning_iterable_interface_head_set) {
     for (auto n : kSnapshot) BEZEL_EXPECT_TRUE(isOwningIterableInterfaceHead(n));
 }
 
+// --- isIteratorFormatDispatchHead (#3419, §29.2 / §29.11 / §28.6): the SIX
+//     iterator-format heads the §29.2 SYNC `using var` admission list
+//     recognises — all four iterator-format ENUMERABLE heads (sync + async,
+//     owning + non-owning) plus the two SYNC ENUMERATOR heads. The two ASYNC
+//     enumerator heads are deliberately excluded (they take the `await using`
+//     path).
+//
+//     This predicate is the SIXTH spelling of the enumerable-wrap grid (#3419),
+//     but unlike the five prior point repairs it is the SHARED authority:
+//     `LlvmBackend_Setup.cpp`'s `using var` admission reads it instead of
+//     carrying its own six-name copy. The snapshot below pins the membership
+//     so a future head addition or removal is caught here, not by an
+//     off-by-one leak in the field (#3392, #3418).
+//
+//     NOT a migration snapshot — new with #3419. The pin that carries the
+//     load is the asymmetry around the two async enumerator heads (the
+//     `await using` route) and the surrounding non-iterator heads (the
+//     richer read/collection interfaces take the BUILTIN for-in desugaring,
+//     not the `using var` admission).
+BEZEL_TEST(builtin_registry_snapshot, iterator_format_dispatch_head_set) {
+    static constexpr std::array<std::string_view, 6> kSnapshot = {
+        "IEnumerable", "IOwningEnumerable",
+        "IEnumerator", "IOwningEnumerator",
+        "IAsyncEnumerable", "IOwningAsyncEnumerable",
+    };
+    for (auto n : kSnapshot)
+        BEZEL_EXPECT_TRUE(isIteratorFormatDispatchHead(n));
+    // The two ASYNC enumerator heads stay out - they take `await using`.
+    for (std::string_view n : {"IAsyncEnumerator", "IOwningAsyncEnumerator"})
+        BEZEL_EXPECT_FALSE(isIteratorFormatDispatchHead(n));
+    // Non-iterator heads (the richer read/collection interfaces, the task
+    // family, the collection family) stay out - they reach a different
+    // admission gate (`isBuiltinForInEnumerableHead` for the for-in
+    // desugaring, `isArrayEnumeratorWrapSourceName` for the source family,
+    // etc.).
+    for (std::string_view n : {"IReadOnlyCollection", "IReadOnlyList",
+                               "ICollection", "IList",
+                               "IOwningCollection", "IOwningList",
+                               "IGrouping",
+                               "Array", "OwningArray", "OwningBuffer",
+                               "Stack", "OwningStack", "Queue", "OwningQueue",
+                               "LinkedList", "OwningLinkedList",
+                               "Set", "OwningSet", "SortedSet",
+                               "Dictionary", "OwningDictionary", "SortedDictionary",
+                               "Task", "OwningTask", ""})
+        BEZEL_EXPECT_FALSE(isIteratorFormatDispatchHead(n));
+    // The four iterator-format enumerable heads are the wrap-creator axes;
+    // the sync iter-format enumerable pair is the §29.2 for-in source.
+    for (auto n : kSnapshot) {
+        if (std::string_view(n) != "IEnumerator" &&
+            std::string_view(n) != "IOwningEnumerator") {
+            BEZEL_EXPECT_TRUE(isIterFormatEnumerableHead(n));
+        }
+    }
+    for (std::string_view n : {"IEnumerable", "IOwningEnumerable"})
+        BEZEL_EXPECT_TRUE(isSyncIterFormatEnumerableHead(n));
+}
+
 // --- isBuiltinForInEnumerableHead (#3468, §29.2, stdlib §4.12–§4.13): the
 //     family gate of the builtin `for-in` desugaring. NOT a migration snapshot
 //     — the table is new with #3468, which retired the two hand-written copies

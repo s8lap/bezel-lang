@@ -142,6 +142,31 @@ constexpr std::array<std::string_view, 7> kArrayEnumeratorWrapSources = {
     "Stack", "OwningStack", "Queue", "OwningQueue",
 };
 
+// fix #3419 / §29.2 / §29.11 / §28.6: the SIX iterator-format HEADS that the
+// §29.2 SYNC `using var` admission list recognises — all four iterator-format
+// ENUMERABLE heads (sync + async, owning + non-owning) plus the two sync
+// ENUMERATOR heads (`IEnumerator<T>`, `IOwningEnumerator<T>`). The two ASYNC
+// enumerator heads are deliberately excluded: they take the `await using`
+// path (`LlvmBackend_Async.cpp`), a disjoint lowering.
+//
+// `LlvmBackend_Setup.cpp`'s `using var` handling (the #3418 site) used to spell
+// this six-name list by hand at line 15655; that was the fifth independent
+// spelling of the enumerable-wrap grid in this run (the fifth point repair
+// before the structural fix that #3419 asks for). Every spelling has been the
+// SAME question — "does this `using var` local's declared head admit the sync
+// iterator-format handling?" — so a single predicate is what every consumer
+// should read. Sites that ask a DIFFERENT question (routing through the
+// MoveNext / TakeCurrent / GetAsyncEnumerator vtable slots, etc.) consult
+// narrower head subsets and do NOT use this predicate; the
+// `check_enumerable_grid_spellings` ratchet still flags their chains as
+// classH drift-risk so a future head addition cannot silently miss them.
+// per §29.2 / §29.11 / §28.6, #3419
+constexpr std::array<std::string_view, 6> kIteratorFormatDispatchHeads = {
+    "IEnumerable", "IOwningEnumerable",
+    "IEnumerator", "IOwningEnumerator",
+    "IAsyncEnumerable", "IOwningAsyncEnumerable",
+};
+
 // §4.4–§4.7 / §4.14 / §4.19: the bz_array_t*-backed collections
 // (isCollectionTypeName). LinkedList/OwningLinkedList are bz_llist_t-backed and
 // excluded here. FrozenArray<T> shares the bz_array_t* representation with
@@ -716,6 +741,14 @@ bool isBuiltinForInEnumerableHead(std::string_view head) {
 // per §29.2, #3419
 bool isArrayEnumeratorWrapSourceName(std::string_view n) {
     return contains(kArrayEnumeratorWrapSources, n);
+}
+
+// fix #3419 / §29.2 / §29.11 / §28.6: the six iterator-format HEADS the
+// SYNC `using var` admission recognises. See kIteratorFormatDispatchHeads
+// for the set membership; this is the predicate form (every consumer of the
+// set should call this rather than spell the names). // per §29.2, #3419
+bool isIteratorFormatDispatchHead(std::string_view head) {
+    return contains(kIteratorFormatDispatchHeads, head);
 }
 
 bool isArrayBackedCollectionName(std::string_view n) {

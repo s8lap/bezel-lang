@@ -192,6 +192,7 @@ REQUIRED_AUTHORITIES = (
     'isSyncIterFormatEnumerableHead',
     'isArrayEnumeratorWrapSourceName',
     'isIterableInterfaceHead',
+    'isIteratorFormatDispatchHead',
 )
 
 
