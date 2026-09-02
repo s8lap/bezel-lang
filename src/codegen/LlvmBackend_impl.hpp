@@ -16236,6 +16236,53 @@ private:
         const std::unordered_map<std::string_view, const sema::TypeRef*>&
             outerSemaTy,
         llvm::Value* thisForArgs);
+
+    // §29.2 / §28.9 / stdlib §4.8 — fix #3570 / #3661 / #3662 / #3663 (v0.286).
+    //
+    // The cache-key element-name segment for the four enumerable-machinery
+    // families (arrenum, stackenum, llenum, ienumview) — the segment that
+    // appears in every `bz$<family>$<elemName>$…` function name and every
+    // `<family>.<elemName>` struct-type name.
+    //
+    // PRE-#3570, the pre-fix scheme collapsed every non-integer/non-pointer
+    // element type — notably structs — to the single letter `"f"`:
+    //
+    //     elemTy->isIntegerTy()
+    //         ? ("i" + std::to_string(elemTy->getIntegerBitWidth()))
+    //         : (elemTy->isPointerTy() ? "ptr" : "f");
+    //
+    // So two different STRUCT element types in one module — e.g.
+    // `DictionaryEntry<int,int>` (8 B) and `DictionaryEntry<string,int>` (16 B),
+    // or `Stack<Point>` (8 B) and `Stack<BigPoint>` (16 B) — shared one
+    // `bz$arrenum$f$Current` / `bz$stackenum$f$Current` whose **baked-in
+    // element stride was the first creator's**. `Current` returns the
+    // **first creator's `elemTy`**, not the second's. The second struct type's
+    // iteration silently misread at the wrong stride and the wrong type.
+    //
+    // The §6b unification moved this predicate into ONE helper, and broadened
+    // the `"f"` fallback to `"f<allocSize>"` so distinct struct strides get
+    // distinct machinery. Integer / pointer kinds keep their discriminating
+    // `i<bitwidth>` / `"ptr"` segments; only the fallback broadens. The same
+    // helper now feeds all five call sites that previously spelled the same
+    // expression inline:
+    //
+    //   - `ensureArrayEnumMachinery`            — array family (#3570)
+    //   - `wrapOwnedArrayAsIEnumerable`         — array family (#3570)
+    //   - `wrapDictionaryEntryArrayAsIEnumerable` — array family (#3570)
+    //   - `ensureStackEnumMachinery`            — stack family (#3661)
+    //   - `wrapOwnedStackAsIEnumerator`         — stack family (#3661)
+    //
+    // Sites for the ienumview family (#3662) and llenum family (#3663)
+    // remain inline; the helper exists for them to switch to in their own
+    // lanes — a one-line replacement per site once those are dispatched.
+    //
+    // ORACLE / FAILURE MODE. The Current function is dispatched via a vtable
+    // slot whose `FunctionType` is constructed locally at the call site from
+    // the iteration's `elemTy`. LLVM sees a well-typed call: a wrong stride /
+    // wrong type produces a silent misread or segfault, **not** a verifyModule
+    // failure. Pinning the helper as the only spelling is what keeps the next
+    // sibling site from regressing in this exact shape.
+    std::string enumMachineryElementName(llvm::Type* elemTy) const;
 };
 
 }  // namespace bezel::codegen

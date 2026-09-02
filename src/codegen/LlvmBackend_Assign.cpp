@@ -8600,12 +8600,15 @@ llvm::Value* Emitter::wrapOwnedArrayAsIEnumerable(llvm::Value* arr,
     // first creator's. Suffix the alloc size so each distinct stride gets its
     // own machinery; integer/pointer kinds still keep their discriminating
     // bit-width / `"ptr"` segment.
-    std::string elemName = elemTy->isIntegerTy()
-        ? ("i" + std::to_string(elemTy->getIntegerBitWidth()))
-        : (elemTy->isPointerTy()
-            ? "ptr"
-            : ("f" + std::to_string(
-                  (int64_t)module_->getDataLayout().getTypeAllocSize(elemTy))));
+    //
+    // fix #3570 / §6b unification (v0.286): this site now feeds through the
+    // shared `enumMachineryElementName` helper. The pre-unification spelling
+    // lived inline here AND at `ensureArrayEnumMachinery` AND at
+    // `wrapDictionaryEntryArrayAsIEnumerable`, AND (in #3661) at the stack
+    // twin — five sites, one predicate. Keeping the helper as the single
+    // spelling is what keeps a future sibling site from regressing in this
+    // exact shape.
+    std::string elemName = enumMachineryElementName(elemTy);
     std::string plainPrefix = "bz$arrenum$" + elemName + "$";
     // fix #3450 (v0.283): the disposer is part of the cache key — see
     // `ownedWrapElementDisposer` for why sharing one Dispose across two
@@ -9373,12 +9376,10 @@ Emitter::ArrEnumMachinery Emitter::ensureArrayEnumMachinery(llvm::Type* elemTy) 
     // first creator's. Suffix the alloc size so each distinct stride gets its
     // own machinery; integer/pointer kinds still keep their discriminating
     // bit-width / `"ptr"` segment.
-    std::string elemName = elemTy->isIntegerTy()
-        ? ("i" + std::to_string(elemTy->getIntegerBitWidth()))
-        : (elemTy->isPointerTy()
-            ? "ptr"
-            : ("f" + std::to_string(
-                  (int64_t)module_->getDataLayout().getTypeAllocSize(elemTy))));
+    //
+    // fix #3570 / §6b unification (v0.286): this site now feeds through the
+    // shared `enumMachineryElementName` helper — see the array twin above.
+    std::string elemName = enumMachineryElementName(elemTy);
     std::string stName = "arrenum." + elemName;
     auto* stTy = llvm::StructType::getTypeByName(llvm_, stName);
     if (!stTy) {
@@ -9510,6 +9511,22 @@ Emitter::ArrEnumMachinery Emitter::ensureArrayEnumMachinery(llvm::Type* elemTy) 
     return {stTy, vtGV, esz};
 }
 
+// §29.2 / §28.9 / stdlib §4.8 — fix #3570 / #3661 (v0.286). See declaration in
+// LlvmBackend_impl.hpp. The shared cache-key element-name segment for the
+// four enumerable-machinery families. Integer / pointer kinds keep their
+// discriminating `i<bitwidth>` / `"ptr"` segments; the non-int / non-ptr
+// fallback broadens to `"f<allocSize>"` so distinct struct strides get
+// distinct machinery.
+std::string Emitter::enumMachineryElementName(llvm::Type* elemTy) const {
+    if (elemTy->isIntegerTy())
+        return "i" + std::to_string(elemTy->getIntegerBitWidth());
+    if (elemTy->isPointerTy())
+        return "ptr";
+    return "f" + std::to_string(
+        (int64_t)module_->getDataLayout().getTypeAllocSize(elemTy));
+}
+
+
 // #2471 (stdlib §4.11 "Iteration order" v0.195; language spec §29.1,
 // agreeing with #2472's for-loop fix, LlvmBackend_Stmts.cpp): the
 // REVERSE-order twin of ensureArrayEnumMachinery, for Stack<T>/
@@ -9538,9 +9555,15 @@ Emitter::ArrEnumMachinery Emitter::ensureStackEnumMachinery(llvm::Type* elemTy) 
         esz = (int64_t)module_->getDataLayout().getTypeAllocSize(elemTy);
     else esz = 8;
 
-    std::string elemName = elemTy->isIntegerTy() ?
-        ("i" + std::to_string(elemTy->getIntegerBitWidth())) :
-        (elemTy->isPointerTy() ? "ptr" : "f");
+    // fix #3661 (§29.2 / §28.9 / §4.8, v0.286): the inline cache-key spelling
+    // collapsed every struct element type to `"f"`, so two different struct
+    // element types in one module — e.g. `Stack<Point>` (8 B) and
+    // `Stack<BigPoint>` (16 B) — shared one `bz$stackenum$f$Current` whose
+    // baked-in stride was the first creator's (and whose `Current` returned
+    // the first creator's elemTy). Use the shared helper so each distinct
+    // stride gets its own machinery; integer / pointer kinds still keep their
+    // discriminating bit-width / `"ptr"` segment.
+    std::string elemName = enumMachineryElementName(elemTy);
     std::string stName = "stackenum." + elemName;
     auto* stTy = llvm::StructType::getTypeByName(llvm_, stName);
     if (!stTy) {
@@ -9755,9 +9778,12 @@ llvm::Value* Emitter::wrapOwnedStackAsIEnumerator(llvm::Value* arr,
     // Element-name key (same scheme as ensureStackEnumMachinery) so the
     // owning Dispose / GetEnumerator / vtable are created once per element
     // type and shared across every OWNING Stack wrap in the module.
-    std::string elemName = elemTy->isIntegerTy() ?
-        ("i" + std::to_string(elemTy->getIntegerBitWidth())) :
-        (elemTy->isPointerTy() ? "ptr" : "f");
+    // fix #3661 (§29.2 / §28.9 / §4.8, v0.286): the inline cache-key spelling
+    // collapsed every struct element type to `"f"` — two different struct
+    // element types in one module (e.g. `Stack<Point>` 8 B and `Stack<BigPoint>`
+    // 16 B) shared one `bz$stackenum$f$Current`. Use the shared helper so each
+    // distinct stride gets its own machinery.
+    std::string elemName = enumMachineryElementName(elemTy);
     std::string plainPrefix = "bz$stackenum$" + elemName + "$";
     // fix #3450 (v0.283): the element-type-derived disposer this wrap's
     // slot-1 `bz_array_free` installs — the array twin's #2710 predicate,
@@ -10921,12 +10947,15 @@ llvm::Value* Emitter::wrapDictionaryEntryArrayAsIEnumerable(
     // DictionaryEntry<string,int> = 16 B) get distinct plain MoveNext/Current
     // instances — the pre-fix `"f"` collapse shared one Current at the first
     // creator's stride.
-    std::string elemName = entryStTy->isIntegerTy()
-        ? ("i" + std::to_string(entryStTy->getIntegerBitWidth()))
-        : (entryStTy->isPointerTy()
-            ? "ptr"
-            : ("f" + std::to_string(
-                  (int64_t)module_->getDataLayout().getTypeAllocSize(entryStTy))));
+    //
+    // fix #3570 / §6b unification (v0.286): this site now feeds through the
+    // shared `enumMachineryElementName` helper — see the array twin above.
+    // `entryStTy` is a struct type (always); the helper's integer/pointer
+    // branches never fire here, but using the same spelling keeps the cache
+    // key consistent across the array family — a DictionaryEntry<int,int>
+    // minted via the plain array machinery gets the same `f8` segment it
+    // would get via the dict-entry wrap, so MoveNext/Current reuse just works.
+    std::string elemName = enumMachineryElementName(entryStTy);
     std::string plainPrefix = "bz$arrenum$" + elemName + "$";
     std::string prefix = "bz$dictentryenumown$" + elemName + "$";
 
