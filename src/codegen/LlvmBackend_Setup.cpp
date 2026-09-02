@@ -14808,6 +14808,105 @@ bool Emitter::registerIterableSourceDisposal(const ast::Node* declNode) {
             }
         }
     }
+    // fix #3605 (§29.2 / §29.7 / §29.11, v0.286): the §29.7 abandonment-
+    // snapshot's named-local-source exemption only covered the qualification
+    // of a property read (`this.Seq` MemberAccessExpr, the #2779 path).
+    // Inside the declaring class itself the read is bare `Seq`
+    // (IdentifierExpr resolving to the same PropertySymbol), and
+    // `wrapPropertyArrayAsIEnumerable` (LlvmBackend_Exprs.cpp:6210) wraps
+    // it through the bare-`this` computed-getter arm, recording the FRAME
+    // in `propReadIterWrappedExprs_` keyed on the IdentifierExpr. The
+    // MemberAccessExpr-only claim path above never saw the entry, so this
+    // `var seq: IEnumerable<T> := Seq;` local claimed no slot-1 disposal
+    // — measured 12800 B / 400 on c10-l3 HEAD (#3605's exact
+    // measurement, in `bz$iter$M.Src$Walk$MoveNext`). `isInterfaceDispatched
+    // IteratorRead` does not catch this shape (the receiver is `this`,
+    // not an interface), so extend the existence check to BOTH spellings
+    // of the read in the same `propReadIterWrappedExprs_` keyed lookup.
+    // Mirrors the inner site's own `if (declIsPureIEnum && ...)` shape so
+    // the wrap's pure-IEnumerable verdict and the claim's narrow head
+    // match — the OWNING families (#552/#1177/#1911) are wrapped by their
+    // own call sites and already claimed via `isNew`/`wrappedHere` above.
+    //
+    // PART 2 (§29.2 / §29.7 / §29.11 / §23.4, v0.286): a third spelling of
+    // the same iterator-format property read inside the declaring class —
+    // the indexer form `this[0]`, an IndexExpr resolving to the indexer's
+    // PropertySymbol. `wrapPropertyArrayAsIEnumerable`
+    // (LlvmBackend_Assign.cpp:2301) is the third call site and records the
+    // FRAME in `propReadIterWrappedExprs_` keyed on the IndexExpr, but the
+    // IdentifierExpr-only claim arm below never sees that key — `init`
+    // `dynamic_cast`s to `nullptr`, the wrap entry is unreachable, and the
+    // local claims no slot-1 disposal. MEASURED on c10-l3 HEAD with a
+    // parallel probe (`probe_indexer_3605.bzl`, declaring-class
+    // `var seq: IEnumerable<Item> := this[0];` over an
+    // `property [i: int]: IEnumerable<Item> => _a;`): byte-identical
+    // 12800 B / 400 leak in `bz$iter$M.Src$Walk$MoveNext`, the same frame
+    // the IdentifierExpr spelling leaked. `computedGetterOf` rejects
+    // indexers explicitly (`ps->isIndexer` early-return) so the wider
+    // MemberAccessExpr claim above is also unreachable for this shape;
+    // the indexer's expression-body getter is the §23.4 sibling of the
+    // §23.3 expression-bodied property — same wrap-creator
+    // (`wrapPropertyArrayAsIEnumerable`), same `propReadIterWrappedExprs_`
+    // record. Inline the indexer-allowing expression-body predicate here
+    // so the wrap-creator's verdict is honoured for ALL THREE read spellings
+    // of the declaring-class iterator-format property read. The
+    // block-bodied indexer getter is handled by `wrapAsIEnumerableForTarget`
+    // and recorded identically, but a declaring-class indexer read reaches
+    // the wrap-creator through the same expression-body path the
+    // IdentifierExpr spelling does (the `wrapPropertyArrayAsIEnumerable`
+    // call at LlvmBackend_Assign.cpp:2301 sits on the EXPRESSION-body
+    // arm of `lowerPropertyRead`-for-indexer); the expression-body
+    // narrowing matches the surface this fix actually touches.
+    if (!ownsSource) {
+        // Lift the pure-IEnumerable verdict out of the inner MemberAccessExpr
+        // arm so the bare-identifier / indexer claims below can reuse it.
+        // The set of declarations this admits is identical: a
+        // declaration-less Named iterator-format head
+        // (`IEnumerable<T>` / `IOwningEnumerable<T>`).
+        bool declIsPureIEnum = tr && tr->kind ==
+            sema::TypeRef::Kind::Named && !tr->declaration &&
+            tr->astNode && tr->astNode->name &&
+            !tr->astNode->name->parts.empty() &&
+            common::isSyncIterFormatEnumerableHead(tr->headName());
+        const ast::IdentifierExpr* idInit =
+            dynamic_cast<const ast::IdentifierExpr*>(init);
+        if (idInit) {
+            sema::Symbol* sym = ctx_.exprSymbol(*idInit);
+            // SEAM-DEBT: #3605 — class-3 read on sym->decl via the
+            // IdentifierExpr spelling of the iterator-format property read;
+            // answers wrong-but-quiet for an imported property symbol.
+            // Mitigated by `propReadIterWrappedExprs_.count(init)` — the wrap
+            // only runs when the symbol has been locally emitted.
+            if (sym && dynamic_cast<sema::PropertySymbol*>(sym)) {
+                if (computedGetterOf(sym) && declIsPureIEnum &&
+                    propReadIterWrappedExprs_.count(init))
+                    ownsSource = true;
+            }
+        }
+        if (!ownsSource) {
+            const ast::IndexExpr* ixInit =
+                dynamic_cast<const ast::IndexExpr*>(init);
+            if (ixInit) {
+                sema::Symbol* sym = ctx_.exprSymbol(*ixInit);
+                // SEAM-DEBT: #3605 — class-3 read on sym->decl via the
+                // IndexExpr spelling of the iterator-format indexer read;
+                // answers wrong-but-quiet for an imported indexer symbol.
+                // Mitigated by `propReadIterWrappedExprs_.count(init)`.
+                auto* ps = sym ?
+                    dynamic_cast<sema::PropertySymbol*>(sym) : nullptr;
+                if (ps && ps->isIndexer) {
+                    auto* pd = ps->decl ?
+                        dynamic_cast<const ast::PropertyDecl*>(ps->decl) :
+                        nullptr;
+                    if (pd && pd->isIndexer &&
+                        pd->bodyKind == ast::PropertyBodyKind::Expression &&
+                        declIsPureIEnum &&
+                        propReadIterWrappedExprs_.count(init))
+                        ownsSource = true;
+                }
+            }
+        }
+    }
     // fix #2779 / §29.2 / §29.11 / §23.3 / §28.3 K3 / §28.9 (v0.240): the
     // `var e := s.E;` BOUND spelling through an INTERFACE-typed receiver —
     // the shape the issue's repro exercises. The plain-`var` isCall / isNew /
