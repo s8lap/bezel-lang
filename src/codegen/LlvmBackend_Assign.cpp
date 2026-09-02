@@ -9966,9 +9966,28 @@ llvm::Function* Emitter::ensureIEnumViewFactory(const sema::TypeRef* storedTy,
     bool elemNeedsWrap = nestedIEnumViewNeeded(storedTy, viewTy);
 
     llvm::Type* elemTy = viewElem ? lowerTypeRef(viewElem) : i32();
-    std::string elemName = elemTy->isIntegerTy()
-        ? ("i" + std::to_string(elemTy->getIntegerBitWidth()))
-        : (elemTy->isPointerTy() ? "ptr" : "f");
+    // fix #3662 (§29.2 / §28.9 / §4.8, v0.286): the inline cache-key spelling
+    // collapsed every struct element type to `"f"`, so two different struct
+    // element types reaching the LEAF branch below in one module (e.g. an
+    // `Array<Array<Point>>` and an `Array<Array<BigPoint>>` both coerced to a
+    // doubly-nested `IEnumerable<IEnumerable<T>>`) shared one
+    // `bz$viewfac$P$f` factory whose baked-in machinery (vtable/struct/esz —
+    // via `ensureArrayEnumMachinery`/`ensureStackEnumMachinery`) was the
+    // first creator's. NOTE: fixing #3570/#3661 alone does NOT transitively
+    // fix this — this factory's OWN cache lookup
+    // (`module_->getFunction(name)`) short-circuits BEFORE ever calling the
+    // (correctly keyed) array/stack machinery helper on the second creator's
+    // element type, so the second struct type silently reuses the first
+    // creator's factory body wholesale. Use the shared helper so each
+    // distinct struct stride gets its own factory; integer/pointer kinds
+    // keep their discriminating bit-width/`"ptr"` segments. The NESTED
+    // branch below reuses this same `elemName`, but in practice `elemTy` is
+    // always a pointer there (`viewElem` is itself an `IEnumerable<T>`
+    // interface reference, per `isPureIEnumView`), so the observable struct
+    // collision is confined to the LEAF branch — see the regression test
+    // for the measured repro and the exclusion-diff note in the commit body
+    // for why the brief's "leaf is transitively fixed" premise did not hold.
+    std::string elemName = enumMachineryElementName(elemTy);
 
     // fix #2487 (stdlib §4.11 "Iteration order" v0.195; language spec §29.1,
     // v0.236): the collection whose backing THIS recursion level enumerates
@@ -10067,9 +10086,28 @@ llvm::Function* Emitter::ensureIEnumViewFactory(const sema::TypeRef* storedTy,
         stTy = llvm::StructType::create(
             llvm_, {ptrTy(), ptrTy(), i64(), i64(), ptrTy()}, stName);
 
+    // fix #3662 (§29.2 / §28.9 / §4.8, v0.286): unlike `stName` above (safe to
+    // share — the 5-field {vtable,arr,idx,esz,curInner} struct layout is
+    // IDENTICAL regardless of the inner shape), this prefix drives the
+    // actual Dispose/MoveNext/Current/GetEnumerator/vtable FUNCTION names,
+    // and `Current`'s body (below) bakes a direct call to `innerFac` into
+    // its IR. `elemName` is always `"ptr"` at this nesting level (`viewElem`
+    // is itself an `IEnumerable<T>` interface reference, so `lowerTypeRef`
+    // always returns a pointer type here — see `enumMachineryElementName`'s
+    // pointer arm) REGARDLESS of what the inner element type actually is.
+    // So two different inner shapes reaching this NESTED branch (e.g. an
+    // `Array<Array<Point>>` and an `Array<Array<BigPoint>>` view in one
+    // module) would share one `bz$arrenumnest$ptr$Current`, whose `innerFac`
+    // call is baked in at FIRST creation (`getOrCreate` below returns the
+    // existing function without re-running `fill()` — see LANE_RULES §12,
+    // an anchor/cache hit is a silent miss, not a rebuild) — the SECOND
+    // shape's `Current` silently calls the FIRST shape's `innerFac` on the
+    // wrong-sized backing array. Key on `innerFac`'s own (correctly
+    // per-shape-unique, after the leaf-branch fix above) name instead, the
+    // same discriminator the factory's own `name` (above) already uses.
     std::string prefix = (backingIsStack ? "bz$stackarrenumnest$"
                                          : "bz$arrenumnest$")
-                         + elemName + "$";
+                         + innerFac->getName().str() + "$";
     auto* voidTy = llvm::Type::getVoidTy(llvm_);
     auto getOrCreate = [&](const std::string& fname, llvm::FunctionType* ft,
                            std::function<void(llvm::Function*)> fill)
