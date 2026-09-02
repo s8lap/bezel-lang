@@ -10185,6 +10185,15 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
                                 ce.callee.get())) {
                             if (ma->member == "Abs" ||
+                                // fix #3580 (stdlib §2.2, v0.286): Math.DivRem
+                                // is declared with a polymorphic return type
+                                // matching the argument (int→int, long→long).
+                                // Same shape as Abs: the accept-list below sets
+                                // a placeholder `int`, refined here to long
+                                // when the first arg is long. The numeric
+                                // gate excludes the int-arg case, which stays
+                                // int — exactly what the int overload wants.
+                                ma->member == "DivRem" ||
                                 ma->member == "Min" || ma->member == "Max" ||
                                 ma->member == "Clamp") {
                                 ctx_.setExprType(&ce, argTy);
@@ -19283,6 +19292,20 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                          // v0.284; `PI` was never a documented spelling.
                          m=="Pi"||m=="Tau"||
                          m=="Fmod"||m=="IEEERemainder") setDbl();
+                // fix #3580 (stdlib §2.2, v0.286): Math.DivRem has two
+                // overloads — DivRem(int, int, out int): int and
+                // DivRem(long, long, out long): long — so its return type is
+                // polymorphic (matches the first arg's type, the same shape
+                // Abs/Min/Max/Clamp already use). The setInt() here is the
+                // placeholder the polymorphic-return refinement at the
+                // Min/Max/Clamp site relies on: a long first arg refines it
+                // to long; an int first arg leaves it as int. Codegen arms in
+                // LlvmBackend_Calls.cpp lower the int and long overloads
+                // separately and raise DivideByZeroException on b=0 (§6.1,
+                // paralleling `/`). Not `pure` because of the `out` parameter
+                // (§22.15 — and that is why Min/Max/Clamp are not `pure`
+                // either).
+                else if (m=="DivRem") setInt();
                 // fix #3559 (stdlib §2.2, v0.285): the transcendental block was
                 // REMOVED from the documents at v0.284 (proposal 0121 R3), and
                 // the never-documented `Hypot`/`Cbrt`/`PI` were removed with it

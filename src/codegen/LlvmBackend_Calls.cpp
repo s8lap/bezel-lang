@@ -10291,6 +10291,91 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             }
             return builder_.CreateCall(fn, {a, b}, std::string(m) + ".result");
         }
+        // fix #3580 (stdlib §2.2, v0.286): Math.DivRem(a, b, out remainder)
+        // — returns the quotient and writes the remainder through the `out`
+        // parameter. Two overloads: (int, int, out int): int and
+        // (long, long, out long): long. The return type follows the first
+        // argument (sema's polymorphic-return refinement sets it to long
+        // when the arg is long; int stays int). Semantics follow §6.1, the
+        // same rule `/` already lowers under (LlvmBackend_Exprs.cpp:8885):
+        //   - b = 0          → DivideByZeroException
+        //   - INT_MIN / -1   → OverflowException (signed-result unrepresentable;
+        //                      remainder on that one path is mathematically 0
+        //                      and is forced via a `select`, the same
+        //                      `srem`-safe-on-INT_MIN pattern §6.1 uses)
+        //   - otherwise      → `sdiv` (quotient), `srem` (remainder)
+        // The `out` parameter is resolved the same way Convert.TryToInt32
+        // (just below) resolves its out parameter: a slot pre-created by
+        // `ensureOutVarSlots`, written through `resolveOutAddrWithBracket`,
+        // with `emitAccessorRefArgWriteBacks` flushing any bracket
+        // (`arr[i]` / `obj.Prop` target) on the normal-return edge (#2938).
+        // Not `pure` (§22.15): a pure member declares no `out`.
+        if (m == "DivRem" && call.args.size() == 3 &&
+            call.args[0].value && call.args[1].value &&
+            call.args[2].value) {
+            llvm::Value* a = lowerExpr(*call.args[0].value);
+            llvm::Value* b = lowerExpr(*call.args[1].value);
+            if (!a || !b) return nullptr;
+            // Reject a non-integer arg with the same "not a numeric
+            // primitive this intrinsic handles" wording used for `Fmod`/
+            // `IEEERemainder`/`Sqrt`/`Pow` — except `Math.DivRem` is signed-
+            // integer-only by its declaration, so float/decimal are also
+            // rejected explicitly (no `sitofp`/`fdiv` ladder, unlike the
+            // float-returning Math members).
+            if (!a->getType()->isIntegerTy() || !b->getType()->isIntegerTy()) {
+                ctx_.diagnostics().report(
+                    Severity::Error, call.span.begin,
+                    "`Math.DivRem` requires `int` or `long` arguments "
+                    "(stdlib §2.2)");
+                return nullptr;
+            }
+            // §6.1: zero divisor — emit guard FIRST so the trap fires
+            // before any UB-producing op, mirroring the `/` lowering.
+            emitGuardThrow(builder_.CreateICmpEQ(b, llvm::ConstantInt::get(b->getType(), 0)),
+                           "DivideByZeroException");
+            // §6.1: signed INT_MIN / -1. LLVM `sdiv` on that pair is UB
+            // (LangRef) and x86 IDIV faults (SIGFPE); `srem` is also UB.
+            // The `/` operator raises OverflowException; the `mod` operator
+            // substitutes a 1-divisor and selects 0. DivRem's QUOTIENT
+            // follows `/`; the REMAINDER is mathematically 0 on that path
+            // and is representable, so the same select-to-0 pattern that
+            // `mod` uses applies — but ONLY to the remainder, not the
+            // quotient. The branch is identical for both shapes (both
+            // ucomps must hold), so emit one `isMinNegOne` test and reuse
+            // it for both edges.
+            llvm::Value* minV = llvm::ConstantInt::getSigned(
+                a->getType(),
+                a->getType()->isIntegerTy(64) ? INT64_MIN : INT32_MIN);
+            llvm::Value* negOne = llvm::ConstantInt::getSigned(a->getType(), -1);
+            llvm::Value* isMinNegOne = builder_.CreateAnd(
+                builder_.CreateICmpEQ(a, minV),
+                builder_.CreateICmpEQ(b, negOne));
+            // The quotient's edge matches `/`: raise OverflowException
+            // (sdiv is UB on this path, so we MUST trap before reaching it).
+            emitGuardThrow(isMinNegOne, "OverflowException");
+            llvm::Value* quotient = builder_.CreateSDiv(a, b);
+            // The remainder's edge matches `mod`: substitute a 1-divisor
+            // for srem (avoids the UB), then select 0 as the result.
+            // `1` is representable in both int and long, so CreateSRem
+            // with the safe divisor is well-defined on every input.
+            llvm::Value* safeR = builder_.CreateSelect(
+                isMinNegOne, llvm::ConstantInt::getSigned(b->getType(), 1), b);
+            llvm::Value* remRaw = builder_.CreateSRem(a, safeR);
+            llvm::Value* remainder = builder_.CreateSelect(
+                isMinNegOne, llvm::ConstantInt::get(b->getType(), 0), remRaw);
+            // `out remainder` — same pattern as Convert.TryToInt32 (#2938).
+            llvm::Type* et = nullptr;
+            std::vector<AccessorRefArg> outArgs;
+            llvm::Value* outAddr = resolveOutAddrWithBracket(
+                *call.args[2].value, et, outArgs);
+            if (!outAddr) {
+                emitAccessorRefArgWriteBacks(outArgs, /*emit=*/false);
+                return nullptr;
+            }
+            builder_.CreateStore(remainder, outAddr);
+            emitAccessorRefArgWriteBacks(outArgs, /*emit=*/true);
+            return quotient;
+        }
     }
 
     // §6.1 / §30.8: CancellationToken static properties.
