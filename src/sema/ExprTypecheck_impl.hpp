@@ -2247,6 +2247,25 @@ private:
     void checkPositionalNewArgsFromSymbols(const ast::NewExpr& ne,
                                            TypeSymbol* t);
 
+    // fix #3623 (§5.1 / §22.5 / §22.10 / §22.8 step 0, v0.286): the §5.1
+    // per-slot assignability check, factored out of `checkPositionalNewArgsFromSymbols`
+    // so it runs identically for a `this(...)` chain to a primary constructor
+    // — the §22.8 step-0 TWIN of `new T(...)`, see #3583 — and for the imported
+    // record path. The chain site had no §5.1 check at all (#3583 deliberately
+    // deferred it and filed this issue), so a `this("bad", 1)` against
+    // `class B(n: int, s: string)` reached codegen and ran to SIGSEGV.
+    // `target` is the resolved `TypeRef` of the call target — a `NewExpr`'s
+    // `ne.type` for the `new T(...)` case, `nullptr` for the chain case — and
+    // is used only for the generic-param substitution arm; bare non-generic-
+    // param slots still run `checkAssignable` without it. `t` is the type
+    // symbol the positional fields belong to (the new-target class, or the
+    // enclosing class for a chain); `t->genericParams` drives the substitution
+    // walk exactly as the inlined loop did. See the body in ExprTypecheck_Calls.cpp.
+    void checkPositionalArgsAssignable(
+        const std::vector<const Symbol*>& fields, const BindResult& b,
+        const std::vector<ast::CallArgument>& args,
+        const std::string& desc, const TypeRef* target, const TypeSymbol* t);
+
     // §7 / stdlib §9.6 (#2315): a primitive `string` receiver's builtin
     // instance methods (IndexOf/Contains/StartsWith/EndsWith/LastIndexOf/
     // Replace/Split/Insert/Substring/...) declare NON-nullable `string`/

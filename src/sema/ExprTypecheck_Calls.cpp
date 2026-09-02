@@ -10931,7 +10931,23 @@ void ExprTC::publishPrimaryCtorChainBinding(const ast::ConstructorDecl& cd) {
         std::string(currentType_->name) + "`";
     BindResult b = bindArgsToParams(sema::FormalsView::of(fields), chain->args,
                                     chain->span.begin, desc, /*emit=*/true);
-    if (b.ok) ctx_.setPositionalBinding(chain, b.paramToArg);
+    if (b.ok) {
+        // fix #3623 (§5.1 / §22.5 / §22.10 / §22.8 step 0, v0.286): run the
+        // §5.1 per-slot assignability check the `new T(...)` twin already runs
+        // via `checkPositionalNewArgsFromSymbols` → `checkPositionalArgsAssignable`.
+        // The chain is §22.8 step 0's other call site (#3583), so the binder
+        // output above is exactly what the helper expects — `b.paramToArg[j]`
+        // for each `chain->args` slot, against the same positional field list.
+        // Passing `nullptr` for `target` defers the generic-param substitution
+        // arm only; bare non-generic-param slots still go through
+        // `checkAssignable` and the same `ref`/`out` exact-match check a
+        // `new T(...)` gets, so a `this("bad", 1)` against
+        // `class B(n: int, s: string)` reaches the §5.1 reject here rather
+        // than a wild store at codegen.
+        checkPositionalArgsAssignable(fields, b, chain->args, desc,
+                                      /*target=*/nullptr, currentType_);
+        ctx_.setPositionalBinding(chain, b.paramToArg);
+    }
 }
 
 // §7 / stdlib §9.6 (#2315): see the header comment for the full rationale.
@@ -12726,7 +12742,37 @@ void ExprTC::checkPositionalNewArgsFromSymbols(const ast::NewExpr& ne,
     // here. A nullable spelling of a type parameter (`T?`) defers instead — the
     // substitution would drop the `?` — as does an instantiation whose argument
     // did not resolve. Deferral is per-field and never a false reject.
-    const TypeRef* target = ne.type ? ctx_.resolvedType(*ne.type) : nullptr;
+    checkPositionalArgsAssignable(
+        fields, b, ne.args, desc,
+        ne.type ? ctx_.resolvedType(*ne.type) : nullptr, t);
+}
+
+// fix #3623 (§5.1 / §22.5 / §22.10 / §22.8 step 0, v0.286): the §5.1 per-slot
+// assignability check `checkPositionalNewArgsFromSymbols` runs on each bound
+// argument of a `new T(...)` call against the positional-field list — extracted
+// from `checkPositionalNewArgsFromSymbols` so a `this(...)` chain call (the
+// §22.8 step-0 TWIN of `new T(...)`, see #3583) runs the SAME rule on the SAME
+// binder output. §6b unification lane: the chain path had no §5.1 check at all
+// (#3583 deliberately deferred it and filed this issue), so a `this("bad", 1)`
+// against `class B(n: int, s: string)` reached codegen and ran to SIGSEGV
+// (string stored into int slot; Show() then dereferenced the int). The rule
+// bodies are byte-identical with the inline loop below — same `ref`/`out`
+// exact-match arm, same `out var`/inferred arm, same `checkAssignable` for
+// every other slot, same generic-param substitution through `target`'s
+// generic args. A `target` of `nullptr` (the chain case, where the call has
+// no `NewExpr` target) defers the generic-substitution arm only — bare
+// non-generic-param slots still run the same `checkAssignable`, so a chain
+// through a non-generic primary gets the same coverage a `new T(...)` does.
+//
+// `b.paramToArg[j] == -1` skips unbound slots (same #3202 rationale as below):
+// the binder rejected under-supplied calls at §22.5 already, so an unbound
+// slot reaching this loop means the call was well-bound at §22.5 and the
+// runtime default arm fills the slot — no argument to typecheck.
+// `isDiscard` and a null `value` skip the slot too, mirroring `checkArgsAgainstParams`.
+void ExprTC::checkPositionalArgsAssignable(
+    const std::vector<const Symbol*>& fields, const BindResult& b,
+    const std::vector<ast::CallArgument>& args,
+    const std::string& desc, const TypeRef* target, const TypeSymbol* t) {
     for (std::size_t j = 0; j < fields.size(); ++j) {
         // fix #3202 (§22.10 / §22.5, v0.254): an UNBOUND slot —
         // `b.paramToArg[j] == -1` — means the call site omitted this parameter
@@ -12742,7 +12788,7 @@ void ExprTC::checkPositionalNewArgsFromSymbols(const ast::NewExpr& ne,
         // so a slot that reaches THIS line without an argument is unreachable
         // in a well-formed program.
         if (b.paramToArg[j] == -1) continue;
-        const ast::CallArgument& a = ne.args[static_cast<std::size_t>(b.paramToArg[j])];
+        const ast::CallArgument& a = args[static_cast<std::size_t>(b.paramToArg[j])];
         if (!a.value || a.isDiscard) continue;
         TypeRef* ft = const_cast<TypeRef*>(storageComponentType(fields[j], ctx_));
         if (!ft) continue;
