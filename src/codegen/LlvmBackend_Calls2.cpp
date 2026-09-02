@@ -3862,6 +3862,24 @@ bool Emitter::isSubscriptionExpr(const ast::Expr& e) {
             if (auto* ld = dynamic_cast<const ast::LocalDecl*>(loc->decl)) {
                 if (ld->initializer) return isSubscribeCall(*ld->initializer);
             }
+            // fix #3591 / §21.1: §21.1's runtime `const` is a DIFFERENT AST
+            // node (`ast::LocalConstDecl`, initializer field `value` rather
+            // than `initializer`) — this arm was missing, so `const sub :=
+            // face.Subscribe(...)` through a stored IEvent<T>/AsyncEvent<T>
+            // face (the same "not yet typed as Subscription by sema" gap the
+            // comment above already documents for `var`) was NOT recognized
+            // as a Subscription, and its explicit `.Dispose()` dispatched
+            // through the generic vtable path against Subscription's
+            // vtable-less handle — SIGSEGV (measured: a 200-iteration
+            // `const sub := face.Subscribe(...); sub.Dispose();` loop through
+            // an `IEvent<T>` field crashes; the byte-identical `var` form does
+            // not). Sema does not yet reject this `const` binding under
+            // §21.1's owned-production rule for `Subscribe()` specifically
+            // (a separate, pre-existing gap — not fixed here), so codegen
+            // must recognize the shape it is actually asked to lower.
+            if (auto* lcd = dynamic_cast<const ast::LocalConstDecl*>(loc->decl)) {
+                if (lcd->value) return isSubscribeCall(*lcd->value);
+            }
         }
     }
     return false;
@@ -4048,6 +4066,11 @@ llvm::Value* Emitter::explicitDisposeOwnedReceiverSlot(
             return nullptr;
         }
         if (auto* loc = dynamic_cast<sema::LocalSymbol*>(sym)) {
+            // LOCALDECL-ONLY: this function classifies a slot as one THIS
+            // SCOPE OWNS AND MUST RECLAIM — never true of a `const` local
+            // (§21.1: "never takes a disposal obligation"). A
+            // `LocalConstDecl` falls through to the trailing `return
+            // nullptr` below, the correct answer, not an omission.
             auto* ld = dynamic_cast<const ast::LocalDecl*>(loc->decl);
             if (!ld) {
                 // §22.4 / v0.160 (#1305): `out owned var x` declares x inline;
@@ -13845,6 +13868,10 @@ llvm::Value* Emitter::tryBuildOwningEnumeratorForBuiltinSource(
         if (!sym) return nullptr;
         auto* ls = dynamic_cast<const sema::LocalSymbol*>(sym);
         if (!ls) return nullptr;
+        // LOCALDECL-ONLY: both initializer shapes below (`.Drain()`, a
+        // `new OwningArray<T>()`-family NewExpr) are on §21.1's REJECTED
+        // list for a runtime `const` binding, so a `LocalConstDecl` can
+        // never hold either shape here.
         const auto* ld = dynamic_cast<const ast::LocalDecl*>(ls->decl);
         if (!ld || !ld->initializer) return nullptr;
         // (a) `var x := coll.Drain();` — re-evaluate the underlying coll
