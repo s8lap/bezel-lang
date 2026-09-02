@@ -100,7 +100,11 @@ int run(const std::string& program) {
 // string_producer_leak_1481_1482_test.cpp's runUnderLeakSanitizer.
 int runUnderAsan(const std::string& source) {
     // fix #3653: forwards to the ONE shared implementation.
-    return bezel::test::runUnderAsan(source, "bezel_1605_asan");
+    // detect_leaks=0 (as the pre-#3653 per-file helper had): leak detection is a
+    // deliberately separate concern in this file (see the header note); the rows
+    // pin UAF/double-free only. The #3653 consolidation dropped this argument and
+    // the gate caught it (LSan tripped on the convenience-ctor row).
+    return bezel::test::runUnderAsan(source, "bezel_1605_asan", /*detectLeaks=*/false);
 }
 
 void expectRunsAndAsanClean(const std::string& source, int expectedExitCode) {
