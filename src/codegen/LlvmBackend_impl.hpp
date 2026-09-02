@@ -711,10 +711,21 @@ private:
     // CG3: each local's storage, keyed by its declaration node (a
     // LocalDecl/LocalConstDecl/ParameterSymbol). An IdentifierExpr
     // resolves to a Local/Parameter symbol whose `decl` is that node.
-    std::unordered_map<const ast::Node*, llvm::AllocaInst*> locals_;
-    // CG6: parameter storage, keyed by ParameterSymbol* (params share
-    // their owning method as `decl`, so the decl node can't disambiguate).
-    std::unordered_map<const sema::Symbol*, llvm::AllocaInst*> paramSlots_;
+    // fix #3550 (§27.5 / §30.1, v0.286): MapVector, NOT unordered_map. The
+    // async-lambda frame builder iterates `locals_` to build the FrameCapture
+    // list, which drives the state-machine frame's CAPTURE_START field layout
+    // (LlvmBackend_Async.cpp ~1656). Iterating an unordered_map keyed by a raw
+    // `const ast::Node*` orders by which addresses collide modulo the bucket
+    // count — ASLR-INVARIANT (issue #3550 measured it: 12 malloc'd blocks
+    // printed the identical order across gigabytes of heap-base movement), so
+    // a "compile it N times and diff" oracle cannot see this defect either.
+    // MapVector iterates in INSERTION ORDER (driven by the AST walk), which
+    // is what we want for a deterministic, reproducible frame layout.
+    llvm::MapVector<const ast::Node*, llvm::AllocaInst*> locals_;
+    // fix #3550 (§27.5 / §30.1, v0.286): same reasoning as `locals_` — this
+    // map's iteration builds the parameter half of the FrameCapture list at
+    // LlvmBackend_Async.cpp ~1636. unordered_map → MapVector.
+    llvm::MapVector<const sema::Symbol*, llvm::AllocaInst*> paramSlots_;
     // CG50: a `ref`/`out` parameter — the incoming argument is a pointer to
     // the caller's storage (not a fresh by-value slot), so reads/writes of
     // the parameter go through that pointer. Maps the ParameterSymbol to
@@ -917,7 +928,17 @@ private:
     // registration at every one of paramSlots_'s ~20 population sites.
     std::unordered_map<const void*, std::size_t> declScopeDepth_;
     // CG6: emitted LLVM function for each static method symbol.
-    std::unordered_map<sema::MethodSymbol*, llvm::Function*> methodFns_;
+    // fix #3550 (§23.3 / §23.4 / §30.5 / §28.4, v0.286): MapVector, NOT
+    // unordered_map. The NestedBodyScope comment (LlvmBackend_Assign.cpp ~4665)
+    // documents that the body-emit loop iterates `methodFns_` in POINTER-HASH
+    // order, and that body memoisation (ensurePropertyBlockGetter /
+    // ensureIndexerBlockGetter / ensurePropertyAccessorFn) freezes the first
+    // caller's lowering into the body. Iterating an unordered_map keyed by a
+    // raw `sema::MethodSymbol*` orders by which addresses collide modulo the
+    // bucket count — ASLR-INVARIANT (issue #3550 measured it). MapVector
+    // iterates in INSERTION ORDER (the order in which the per-method fn was
+    // registered), which is AST-walk order and therefore reproducible.
+    llvm::MapVector<sema::MethodSymbol*, llvm::Function*> methodFns_;
     // #1170 / §24.4: cached method-reference thunk per method symbol. A named
     // method reference (`event += OnTick`) must resolve to a STABLE function
     // pointer so `event -= OnTick` removes the subscribed handler by value
