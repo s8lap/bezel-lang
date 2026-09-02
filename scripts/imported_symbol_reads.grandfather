@@ -47,7 +47,7 @@
 7    src/codegen/LlvmBackend_Exprs2.cpp
 3    src/codegen/LlvmBackend_Layout.cpp
 8    src/codegen/LlvmBackend_Serialization.cpp
-58   src/codegen/LlvmBackend_Setup.cpp
+59   src/codegen/LlvmBackend_Setup.cpp
 4    src/codegen/LlvmBackend_Stmts.cpp
 21   src/codegen/LlvmBackend_impl.hpp
 2    src/common/OwnershipFacts.cpp
@@ -64,5 +64,4 @@
 5    src/sema/StaticInitCycles.cpp
 5    src/sema/SymbolCollection.cpp
 53   src/sema/TypeResolution_Checks.cpp
-# +2 for #3611 contract-clause inheritance (override-rejection + base-copy); both carry // SEAM-DEBT: #3611
 3    src/sema/TypeResolution_Names.cpp
