@@ -195,6 +195,31 @@ std::string genericLocal3620(const std::string& iface,
            genericBody3620(iface, read);
 }
 
+// fix #3652 accept-row: the SAME shape as genericBody3620 but with NO
+// mutating lambda, so `s` is never mutably captured — the §7.4 narrowing
+// must survive the `t[0]` accessor call and the program must compile clean.
+// Pins that the #3652 fix invalidates ONLY when a mutable capture is
+// actually present, not unconditionally on every constraint indexer access.
+std::string genericBodyNoLambda3652(const std::string& iface,
+                                    const std::string& read) {
+    return "class C "
+           "  public static method Run<T>(t: T): int where T: " + iface + " "
+           "    var s: string? := \"hi\"; "
+           "    if s <> null then "
+           "      _ := " + read + "; "
+           "      return s.Length; "
+           "    end; "
+           "    return -1; "
+           "  end Run; "
+           "end C; ";
+}
+
+std::string genericLocalNoLambda3652(const std::string& iface,
+                                     const std::string& read) {
+    return std::string("module App; ") + kIdxIfaceDecls3620 +
+           genericBodyNoLambda3652(iface, read);
+}
+
 }  // namespace
 
 // ===========================================================================
@@ -211,8 +236,9 @@ std::string genericLocal3620(const std::string& iface,
 // (T2 below) also accepts it. Post-fix: imported rejects; local STILL
 // accepts — that divergence is a SEPARATE defect (no `tryIndexerConstraint`
 // code path fires the invalidation for a LOCAL generic-constraint indexer
-// either; it's NOT a regression introduced by this fix). See issue 3641
-// filed alongside this commit for the local-twin repair.
+// either; it's NOT a regression introduced by this fix). See issue #3652
+// (renamed here from a stale #3641 cross-citation, #3679) — fixed alongside
+// this comment update; see T2 below for the root cause and the repair.
 // ===========================================================================
 BEZEL_TEST(try_indexer_constraint_imported_iface_3620,
            imported_constraint_indexer_invalidates_capture_spec_7_4_14_2_23_4) {
@@ -223,21 +249,55 @@ BEZEL_TEST(try_indexer_constraint_imported_iface_3620,
 }
 
 // ===========================================================================
-// T2 — LOCAL TWIN: pins the ASYMMETRY that this fix exposes and records it
-// as a SEPARATE defect (#3641). Both pre- and post-fix, the local generic-
-// constraint indexer access does NOT drop the §7.4 narrowing — because
-// `tryIndexerConstraint` is reached, the constraint interface IS typed, the
-// accessor-call invalidation should fire, but somewhere the narrowing fact
-// for `s` survives. The narrow reproducer is the same body as T1 with the
-// `import` line dropped and `IBox` redeclared locally. Pinned here so a
-// future #3641 fix's FAIL-WITHOUT/PASS-WITH differential is mechanical.
+// T2 — LOCAL TWIN, fixed by #3652 (renamed from
+// local_constraint_indexer_known_divergence_see_3641, whose #3641 citation
+// was stale/wrong — #3641 is an unrelated §12.5 abstract-indexer-override
+// defect; see #3679). Was previously asserting the ASYMMETRY: pre- and
+// post-#3620, the local generic-constraint indexer access failed to drop
+// the §7.4 narrowing even though `tryIndexerConstraint` IS reached and the
+// constraint interface IS typed for the local case.
+//
+// ROOT CAUSE (measured with temporary fprintf instrumentation in
+// `ExprTC::invalidateCapturedNarrowings` and `propertyAccessRunsUserCode`,
+// then removed): NOT an ordering defect — `computeMutablyCaptured` is
+// already a full pre-pass over the whole method body, run in
+// `ExprTC::runMethodBody` BEFORE any statement is typechecked (§7.4,
+// #1566), so `mutablyCapturedNames_` already contained `s` (size=1,
+// contains("s")=1) by the time `t[0]` was typechecked. The #3652 issue's
+// filed hypothesis ("typechecks before lambda-visit fills
+// mutablyCapturedNames_") does not hold on this tree — REFUTED by
+// measurement.
+//
+// The real defect: `propertyAccessRunsUserCode(const ast::PropertyDecl*
+// pd)` (ExprTypecheck_Exprs.cpp) switches on `pd->bodyKind` without ever
+// checking `pd->isIndexer`. §23.4 fixes an indexer's body forms to
+// expression-bodied, block-form, or BODY-LESS (an interface member, or an
+// abstract indexer) — there is no auto/backing-field indexer form — but the
+// parser's body-less-property fallback stamps the same default
+// `bodyKind == Auto` used for an ordinary auto-property. `IBox`'s
+// `readonly property [i: int]: int;` therefore measured
+// `bodyKind=Auto, accessors=0, modifiers=[readonly]` (no `abstract` token —
+// an interface member is implicitly abstract, never spelled), so the
+// pre-fix `Auto` case's field-access answer misclassified a REAL
+// interface-dispatched indexer read as a backing-field load and returned
+// false. The SYMBOL overload already had the correct answer for exactly
+// this shape on its imported (`ps->decl == nullptr`) arm
+// (`if (ps->isIndexer) return true;`) — which is why T1 (imported) rejected
+// post-#3620 while T2 (local) did not: the local arm never reached that
+// isIndexer carve-out at all, because `propertyAccessRunsUserCode(pd)`
+// (the AST-only overload the SYMBOL overload delegates to for a non-null
+// `ps->decl`) had no isIndexer check of its own.
+//
+// Fixed by adding an unconditional `if (pd->isIndexer) return true;` ahead
+// of the switch in the AST-only overload, mirroring the SYMBOL overload's
+// existing carve-out and its own comment ("§23.4 — an indexer is never
+// auto, so its accessor is always user code").
 // ===========================================================================
 BEZEL_TEST(try_indexer_constraint_imported_iface_3620,
-           local_constraint_indexer_known_divergence_see_3641) {
+           local_constraint_indexer_invalidates_capture_spec_7_4_3652) {
     auto r = run3620(nullptr, genericLocal3620("IBox", "t[0]"));
     BEZEL_EXPECT_TRUE(r->parsed);
-    BEZEL_EXPECT_TRUE(!sawDiag3620(*r, kNarrowDiag3620));
-    BEZEL_EXPECT_TRUE(!r->diags.hasErrors());
+    BEZEL_EXPECT_TRUE(sawDiag3620(*r, kNarrowDiag3620));
 }
 
 // ===========================================================================
@@ -254,6 +314,22 @@ BEZEL_TEST(try_indexer_constraint_imported_iface_3620,
            imported_auto_property_keeps_capture_narrowing_spec_7_4) {
     ModuleMetadata dep = buildMeta3620(lib3620());
     auto r = run3620(&dep, app3620("ABox", "t.AV"));
+    BEZEL_EXPECT_TRUE(r->parsed);
+    BEZEL_EXPECT_TRUE(!sawDiag3620(*r, kNarrowDiag3620));
+    BEZEL_EXPECT_TRUE(!r->diags.hasErrors());
+}
+
+// ===========================================================================
+// T4 — fix #3652 ACCEPT ROW. The identical local generic-constraint-indexer
+// shape as T2, but with NO mutating lambda in the body — `s` is never
+// mutably captured, so the §7.4 narrowing must survive the `t[0]` accessor
+// call and the program must compile clean. Guards against an over-broad fix
+// that would invalidate a constraint-indexer-adjacent narrowing
+// unconditionally rather than only when a real mutable capture exists.
+// ===========================================================================
+BEZEL_TEST(try_indexer_constraint_imported_iface_3620,
+           local_constraint_indexer_no_capture_keeps_narrowing_spec_7_4_3652) {
+    auto r = run3620(nullptr, genericLocalNoLambda3652("IBox", "t[0]"));
     BEZEL_EXPECT_TRUE(r->parsed);
     BEZEL_EXPECT_TRUE(!sawDiag3620(*r, kNarrowDiag3620));
     BEZEL_EXPECT_TRUE(!r->diags.hasErrors());

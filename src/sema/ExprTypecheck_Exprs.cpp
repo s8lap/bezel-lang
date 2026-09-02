@@ -109,8 +109,31 @@ bool isPromotablePrimitive(PrimitiveType p) {
 //     dispatches to a user override — user code;
 //   - an auto body that is virtual/abstract/override — the runtime accessor may
 //     be a user override with a computed body, so the access can dispatch to it.
-// Indexers are always Expression- or Block-bodied (never auto), so a user
-// indexer access always qualifies.
+//
+// fix #3652 (§23.4 / §7.4, v0.286): §23.4 fixes an indexer's body forms to
+// exactly three — expression-bodied (`=> e`), block-form (`get`/`set` arms),
+// or BODY-LESS (an interface member, or an abstract-class indexer with no
+// accessor list, "write `readonly` before `property` to expose only a
+// getter"). There is no auto/backing-field indexer form in the grammar (a
+// single scalar slot cannot answer per-index reads). The parser's fallback
+// branch (Parser_Decls.cpp) nonetheless stamps the DEFAULT `bodyKind ==
+// Auto` on that body-less form, because "no body" and "auto-property" share
+// one parser arm for ordinary (non-indexer) properties. This function's
+// `Auto` case, added for the ordinary-property auto-body form, was applied
+// unchanged to indexers too: `readonly property [i: int]: int;` (no
+// `abstract`/`virtual`/`override` token — an interface member is implicitly
+// abstract, never spelled) fell to `Auto`'s "pure field access" answer and
+// returned false — an interface/abstract indexer's dispatch to a REAL,
+// user-written implementation was misclassified as a backing-field load, so
+// a `T[i]` access through it never invalidated a mutably-captured narrowing.
+// (The comment directly above this one, before this fix, asserted "Indexers
+// are always Expression- or Block-bodied (never auto)" — that claim was
+// false of the code beneath it; §23.4's body-less interface form is exactly
+// the counterexample, and the SYMBOL overload below already encoded the
+// correct answer for the imported side of the same declaration, which is
+// how the #3652 imported-vs-local asymmetry was diagnosed.) An indexer is
+// never a compiler-synthesized field regardless of `bodyKind`, so the
+// isIndexer check is unconditional, ahead of the switch.
 //
 // ⚠ This overload answers from the AST ALONE and is therefore only half the
 // question — an IMPORTED property has no `ast::PropertyDecl` (§2.5) and lands on
@@ -119,6 +142,12 @@ bool isPromotablePrimitive(PrimitiveType p) {
 // only because the symbol overload delegates to it.
 bool propertyAccessRunsUserCode(const ast::PropertyDecl* pd) {
     if (!pd) return false;
+    // fix #3652: an indexer's accessor always dispatches to a real
+    // implementation (§23.4 admits no auto/backing-field indexer form), so a
+    // `bodyKind == Auto` body-less indexer declaration (the interface /
+    // abstract-class form) still runs user code — mirrors the SYMBOL
+    // overload's own `if (ps->isIndexer) return true;` carve-out below.
+    if (pd->isIndexer) return true;
     switch (pd->bodyKind) {
         case ast::PropertyBodyKind::Expression:
             return true;
