@@ -185,6 +185,26 @@ def check_agreement(logdir):
         leg = legacy.get(key)
         js = structured.get(key)
         where = "{} shard {}".format(name, idx)
+        if js is None and leg is None:
+            # narrow #3667: BOTH sources absent is AGREEMENT on "this shard
+            # produced no summary", not a divergence between two parses. A
+            # shard killed at the per-shard ceiling (run_parallel.sh:168
+            # `timeout -k 10 $BEZEL_SHARD_TIMEOUT`) writes neither — the
+            # harness has no signal handler, so its atexit printer never runs.
+            # Reporting that as a mismatch made run_parallel.sh:243-251 exit 1
+            # BEFORE the format-failure call, suppressing the whole GATE
+            # FAILURE banner (every `died on:` line, `--- failing tests ---`,
+            # the shard-time lines and TOTAL); gate.sh:931 then found no marker
+            # and BAILed a run a warm-cache retry would have cleared.
+            #
+            # This cannot launder an incomplete run into a pass: the shard is
+            # still in account()'s `missing_summary_shards`, still clears
+            # `summary_ok` and `integrity_ok`, the coverage floor
+            # (gate.sh:1057-1067) still forces exit 3 on unrun tests, and the
+            # banner now REACHES the reader so a real crash gets arbitrated.
+            # This layer is the JSON-vs-legacy equivalence check, not the
+            # integrity check.
+            continue
         if js is None:
             mismatches.append("{}: NO JSON summary (file missing/unparseable)"
                               .format(where))
@@ -629,6 +649,104 @@ def extract_log_failures(logdir, shard_id):
     return out
 
 
+# ---------------------------------------------------------------------------
+# narrow #3667 (F6 of docs/research/2026-08-19-gate-performance-audit.md):
+# classify a run whose ONLY defect is a per-shard ceiling kill, and harvest the
+# per-shard wall times the telemetry field has never actually received.
+
+
+def log_has_fail_marker(path):
+    """True iff `path` carries a `^[ FAIL ] <test>` line; None if unreadable.
+
+    The same marker `extract_log_failures` and arbitration.py key on. Split out
+    because `ceiling_only_failure` asks a yes/no question of the GATE log
+    (gate.sh's `$S/gate_shard.log`, which carries run_parallel's
+    `--- failing tests ---` block), not of one shard log."""
+    try:
+        with open(path, errors='replace') as f:
+            for line in f:
+                if _FAIL_LINE_RE.match(line):
+                    return True
+    except OSError:
+        return None
+    return False
+
+
+def ceiling_only_failure(run_summary_path, shard_log_path):
+    """True iff the run's ONLY defect is a ceiling kill — i.e. it is retryable.
+
+    A shard killed at BEZEL_SHARD_TIMEOUT leaves the AOT bincache ~95% warm, so
+    re-running costs ~310 s plain / ~500 s ASan against ~2230 s for a fresh
+    cycle plus a relaunch. Today gate.sh cannot say "retryable infra, not a red
+    suite", so cycle.py:129 classifies the fail as BAIL and the run stops. This
+    predicate is the classifier; the bash that maps it onto the EXISTING
+    `exit 3` RETRY contract (verdict.py:89-111, cycle.py:132) is the surviving
+    half of #3667 and is deliberately not in this commit.
+
+    Conjunctive on purpose — a ceiling kill is only retryable when nothing else
+    went wrong:
+      * `timed_out_shards` non-empty  — something actually hit the ceiling
+        (account()'s own #3222 classification: rc in {124,137} AND elapsed
+        >= 95% of the configured ceiling; this reads that decision rather than
+        re-deriving it);
+      * `crashed_shards` empty        — a real crash is a SUITE defect a retry
+        cannot clear;
+      * `subset_empty` false          — a subset that selected 0 tests (#2100)
+        validated nothing and would select 0 again;
+      * no `[ FAIL ]` in the gate log — a test that RAN and failed is a real
+        regression, whatever else happened.
+
+    Returns False (never True) when the run summary is missing, unparseable or
+    carries the wrong schema, and when the shard log cannot be read: "cannot
+    classify" must never read as "retryable", because an unreadable log could
+    be hiding a `[ FAIL ]`. The CLI reports those inputs as exit 2 so a caller
+    can tell them apart from a confident "no".
+    """
+    obj = read_shard_summary(run_summary_path)
+    if obj is None or obj.get("schema") != RUN_SCHEMA:
+        return False
+    if not obj.get("timed_out_shards"):
+        return False
+    if obj.get("crashed_shards"):
+        return False
+    if obj.get("subset_empty"):
+        return False
+    return log_has_fail_marker(shard_log_path) is False
+
+
+# `shard <group>.<index>: <seconds>s` — the per-shard wall-time line
+# run_parallel.sh:388 prints. NO `$` ANCHOR: when BEZEL_SHARD_TIMEOUT is set
+# the line continues ` (ceiling 1800s, 0.7%)`, and gate.sh:700 ALWAYS sets it
+# for a gate run. gate.sh:901's harvest regex ends in `s$`, so it has never
+# matched a single line and every telemetry record ever written carries
+# `"shard_times":[]` — the per-shard ceiling-margin trend the code claims to
+# harvest has never had data. Group 1 is the raw seconds text; keeping it as
+# TEXT (not a re-rendered float) is what lets the CLI hand telemetry.py the
+# same digits the log carried (telemetry wraps each token verbatim as a
+# RawNumber — no %.2f reformatting).
+_SHARD_TIME_RE = re.compile(r'^shard [A-Za-z0-9_]+\.[0-9]+: ([0-9.]+)s')
+
+
+def shard_time_tokens_from_log(text):
+    """The raw seconds SUBSTRINGS of every per-shard wall-time line, in log
+    order. Text, not floats — see _SHARD_TIME_RE."""
+    return [m.group(1) for m in
+            (_SHARD_TIME_RE.match(line) for line in text.splitlines()) if m]
+
+
+def shard_times_from_log(text):
+    """The per-shard wall times (seconds) from a gate/run_parallel log, in log
+    order. Malformed numbers are skipped rather than raising — this is an
+    observation-only harvest and must never take a gate down."""
+    out = []
+    for tok in shard_time_tokens_from_log(text):
+        try:
+            out.append(float(tok))
+        except ValueError:
+            continue
+    return out
+
+
 def format_phantom_warning(listed, selected):
     """The phantom-name warning line (#2100), or '' if no warning.
 
@@ -903,14 +1021,68 @@ def _main_format_failure(argv):
     return 0
 
 
+def _main_ceiling_only(argv):
+    """`summary.py run-summary ceiling-only <run-summary> --shard-log <log>`
+    — exit 0 when the run's ONLY defect is a ceiling kill (retryable), 1 when
+    it is not, 2 when an input is missing/unparseable (cannot classify).
+
+    Three exit codes, not two, because gate.sh must not treat "I could not
+    read the run summary" as "not retryable, fail hard" without saying so.
+    narrow #3667: the bash that maps exit 0 onto the existing `exit 3` RETRY
+    contract is the surviving half.
+    """
+    import argparse
+    p = argparse.ArgumentParser(prog="summary.py run-summary ceiling-only",
+                                add_help=True)
+    p.add_argument("run_summary", help="the BEZEL_RUN_SUMMARY JSON path")
+    p.add_argument("--shard-log", required=True,
+                   help="the gate's shard log (gate.sh's $S/gate_shard.log)")
+    args = p.parse_args(argv)
+    obj = read_shard_summary(args.run_summary)
+    if obj is None or obj.get("schema") != RUN_SCHEMA:
+        sys.stderr.write("summary.py ceiling-only: no usable run summary at "
+                         "%s\n" % args.run_summary)
+        return 2
+    if log_has_fail_marker(args.shard_log) is None:
+        sys.stderr.write("summary.py ceiling-only: unreadable shard log %s\n"
+                         % args.shard_log)
+        return 2
+    return 0 if ceiling_only_failure(args.run_summary, args.shard_log) else 1
+
+
+def _main_shard_times(argv):
+    """`summary.py shard-times <log>` — print the per-shard wall times as the
+    comma-separated string gate.sh assigns to SHARD_TIMES (telemetry.py's
+    `_shard_times_list` splits it back apart). Exit 2 on an unreadable log."""
+    if len(argv) != 1:
+        sys.stderr.write("usage: summary.py shard-times <log>\n")
+        return 2
+    try:
+        with open(argv[0], errors="replace") as f:
+            text = f.read()
+    except OSError:
+        sys.stderr.write("summary.py shard-times: cannot read %s\n" % argv[0])
+        return 2
+    # Emit the RAW tokens: telemetry wraps each verbatim as a JSON number, so
+    # "1795.50" must not come back as "1795.5".
+    sys.stdout.write(",".join(shard_time_tokens_from_log(text)) + "\n")
+    return 0
+
+
 def _main_run_summary(argv):
     """`summary.py run-summary harvest <path>` — read a BEZEL_RUN_SUMMARY and
     print shell-sourceable rp_run_* assignments for gate.sh. Emits
     rp_run_present=0 when the file is absent/wrong-schema so gate.sh falls back
     to its legacy grep (the grep stays a fallback until N gates prove the JSON
-    path, per the Phase 2c methodology)."""
+    path, per the Phase 2c methodology).
+
+    narrow #3667 adds the sibling `ceiling-only` subcommand (see
+    _main_ceiling_only); `harvest` is unchanged."""
+    if argv and argv[0] == "ceiling-only":
+        return _main_ceiling_only(argv[1:])
     if len(argv) < 2 or argv[0] != "harvest":
-        sys.stderr.write("usage: summary.py run-summary harvest <path>\n")
+        sys.stderr.write("usage: summary.py run-summary "
+                         "{harvest <path>|ceiling-only <path> --shard-log L}\n")
         return 2
     gtests, ran = harvest_run_summary(argv[1])
     if gtests is None:
@@ -940,11 +1112,14 @@ def main(argv):
         return _main_format_failure(argv[2:])
     if len(argv) >= 2 and argv[1] == "run-summary":
         if len(argv) < 3:
-            print("usage: summary.py run-summary harvest <path>", file=sys.stderr)
+            print("usage: summary.py run-summary {harvest <path>|"
+                  "ceiling-only <path> --shard-log L}", file=sys.stderr)
             return 2
         return _main_run_summary(argv[2:])
+    if len(argv) >= 2 and argv[1] == "shard-times":
+        return _main_shard_times(argv[2:])
     print("usage: summary.py {check|account|format-phantom|format-failure|"
-          "run-summary} ...", file=sys.stderr)
+          "run-summary|shard-times} ...", file=sys.stderr)
     return 2
 
 

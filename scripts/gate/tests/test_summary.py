@@ -13,6 +13,7 @@ JSON side uses the same atomic primitive test_main.cpp mirrors.
 
 import json
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -195,6 +196,73 @@ class CheckAgreementTest(unittest.TestCase):
             mm = summary.check_agreement(d)
             self.assertEqual(len(mm), 1)
             self.assertIn("NO legacy summary", mm[0])
+
+    def test_both_absent_is_agreement_not_a_mismatch(self):
+        # narrow #3667: a shard killed at the per-shard ceiling
+        # (tests/run_parallel.sh:168 `timeout -k 10 $BEZEL_SHARD_TIMEOUT`)
+        # writes NEITHER summary — test_main.cpp has no signal handler, so the
+        # atexit printer never runs. Both sources then say the same thing:
+        # "this shard produced no summary". That is AGREEMENT about a defect,
+        # not a disagreement between two parses, and reporting it as a
+        # mismatch made run_parallel.sh:243-251 exit 1 BEFORE format-failure —
+        # suppressing the GATE FAILURE banner, every `died on:` line, the
+        # `--- failing tests ---` block and TOTAL, so gate.sh:931 then failed
+        # with "no crash/FAIL marker" and cycle.py BAILed a retryable run.
+        with tempfile.TemporaryDirectory() as d:
+            _write_log(d, "codegen", 0,
+                       "[ RUN  ] slow.test\n")  # killed mid-test, no summary
+            # No summary.codegen.0.json — the shard never got to write one.
+            self.assertEqual(summary.check_agreement(d), [])
+
+    def test_both_absent_is_still_reported_by_account_as_missing(self):
+        # ...and the defect is NOT laundered: account() still lists the shard
+        # in missing_summary_shards and clears summary_ok, which is what the
+        # banner and the coverage floor read. check_agreement is the
+        # equivalence layer, not the integrity layer.
+        with tempfile.TemporaryDirectory() as d:
+            _write_log(d, "codegen", 0, "[ RUN  ] slow.test\n")
+            with open(os.path.join(d, "rc.codegen.0"), "w") as f:
+                f.write("124")
+            acc = summary.account(d, 1, ["codegen"])
+            self.assertEqual(acc["missing_summary_shards"], ["codegen/0"])
+            self.assertFalse(acc["summary_ok"])
+            self.assertFalse(acc["integrity_ok"])
+
+    def test_one_absent_one_present_still_mismatches_both_ways(self):
+        # The narrowing is EXACTLY the both-absent cell. A shard where one
+        # source has a summary and the other does not is still a real parse
+        # divergence and must stay loud (the two pins below are the
+        # pre-existing asymmetric cases, re-asserted together here so the
+        # 2x2 grid is complete in one place).
+        with tempfile.TemporaryDirectory() as d:
+            _write_log(d, "codegen", 0, self._full_log(5, 0, 20, 0))  # legacy only
+            mm = summary.check_agreement(d)
+            self.assertEqual(len(mm), 1)
+            self.assertIn("NO JSON summary", mm[0])
+        with tempfile.TemporaryDirectory() as d:
+            _write_log(d, "codegen", 0, "no summary line at all\n")   # JSON only
+            _write_json(d, "codegen", 0, {
+                "schema": summary.SCHEMA, "binary": "b", "shard_index": 0,
+                "shard_count": 2, "passed": 5, "failed": 0, "total": 20,
+                "selected": 20, "asan_mode": False, "rc": 0, "elapsed_s": 1.0})
+            mm = summary.check_agreement(d)
+            self.assertEqual(len(mm), 1)
+            self.assertIn("NO legacy summary", mm[0])
+
+    def test_check_cli_exits_zero_when_a_shard_was_killed(self):
+        # The load-bearing consequence: `gate.summary check` is what
+        # run_parallel.sh:243 keys its `exit 1` on. On a ceiling-killed run it
+        # must now exit 0 so the banner block below it is reached.
+        import subprocess
+        with tempfile.TemporaryDirectory() as d:
+            _write_log(d, "codegen", 0, "[ RUN  ] slow.test\n")
+            env = dict(os.environ)
+            root = os.path.join(os.path.dirname(__file__), "..", "..")
+            env["PYTHONPATH"] = root
+            out = subprocess.run(
+                [sys.executable, "-m", "gate.summary", "check", d],
+                capture_output=True, text=True, env=env, cwd=root)
+            self.assertEqual(out.returncode, 0, out.stderr)
 
     def test_subset_selected_compared_only_when_legacy_carries_it(self):
         # selected is compared when the legacy line has it (subset mode)...
@@ -1505,6 +1573,21 @@ class PerShardCeilingRatioLogTest(unittest.TestCase):
             self.assertIn("shard codegen.0: 12.34s", out.stdout)
             self.assertNotIn("ceiling", out.stdout)
 
+    def test_the_real_emitted_lines_are_harvestable(self):
+        # narrow #3667: source-to-consumer. The lines this loop ACTUALLY
+        # prints under the gate's own configuration (BEZEL_SHARD_TIMEOUT is
+        # always set, gate.sh:700) must be readable by the harvest that feeds
+        # the `shard_times` telemetry field. Driving the real bash loop means
+        # a future change to either side fails here rather than silently
+        # emptying the field again.
+        with tempfile.TemporaryDirectory() as d:
+            _write_log(d, "codegen", 0, "SHARD_ELAPSED 1795.50\n")
+            _write_log(d, "codegen", 1, "SHARD_ELAPSED 12.34\n")
+            out = self._run_loop(d, 2, 1800)
+            self.assertEqual(out.returncode, 0, out.stderr)
+            self.assertEqual(summary.shard_times_from_log(out.stdout),
+                             [1795.50, 12.34])
+
     def test_multiple_shards_all_have_ratios(self):
         # The full-suite shape — every shard's ratio is logged, so a reader
         # can spot the slowest shard and the cluster near the ceiling.
@@ -1520,6 +1603,277 @@ class PerShardCeilingRatioLogTest(unittest.TestCase):
                           out.stdout)
             self.assertIn("shard codegen.2: 200.0s (ceiling 1000s, 20.0%)",
                           out.stdout)
+
+
+class _CeilingFixture(_Fixture):
+    """Shared logdir/run-summary/gate-log builder for the #3667 ceiling-only
+    pins. No test methods — the two TestCases below carry them."""
+
+    def _build(self, d, *, timed_out, crashed, fail_in_log, subset_empty=False):
+        """Build a logdir + run-summary JSON + a gate log, and return
+        (run_summary_path, gate_log_path). conc=2: shard 0 carries the
+        ceiling kill, shard 1 the crash."""
+        ceiling = 1800
+        if timed_out:
+            # rc=124 (timeout SIGTERM) + elapsed at 99% of the ceiling, and no
+            # summary at all — exactly what `timeout -k 10` leaves behind.
+            self._shard(d, "codegen", 0, 0, 0, 0, rc=124, write_json=False,
+                        write_log=False, shard_elapsed=ceiling * 0.99)
+        else:
+            self._shard(d, "codegen", 0, 5, 0, 10, rc=0, shard_elapsed=12.0)
+        if crashed:
+            self._shard(d, "codegen", 1, 0, 0, 0, rc=139, write_json=False,
+                        write_log=False, shard_elapsed=3.0)
+        else:
+            self._shard(d, "codegen", 1, 5, 0, 10, rc=0, shard_elapsed=13.0)
+        acc = summary.account(d, 2, ["codegen"], subset=subset_empty,
+                              shard_timeout=ceiling)
+        if subset_empty:
+            # _shard writes `selected` = total; force the empty-subset shape
+            # the #2100 rule exists for.
+            acc["subset_empty"] = True
+        rs = os.path.join(d, "run.json")
+        summary.write_run_summary(rs, acc)
+        log = os.path.join(d, "gate_shard.log")
+        with open(log, "w") as f:
+            f.write("== gate: sharded suite ==\n")
+            if fail_in_log:
+                f.write("--- failing tests ---\n"
+                        "[ FAIL ] own_branch_disposal.row7 (11 ms)\n")
+            f.write("TOTAL: 20 passed\n")
+        return rs, log
+
+
+class CeilingOnlyFailureTest(_CeilingFixture):
+    """narrow #3667: classify a run whose ONLY defect is a ceiling kill.
+
+    A shard killed at BEZEL_SHARD_TIMEOUT leaves the AOT bincache ~95% warm,
+    so a retry costs ~310 s plain / ~500 s ASan against a fresh ~2230 s cycle
+    plus a relaunch. Today gate.sh has no way to say "this is retryable
+    infra, not a red suite", so cycle.py BAILs. This predicate is the
+    classifier; the bash that turns it into `exit 3` (the existing RETRY
+    contract) is the surviving half of #3667.
+
+    The predicate is deliberately conjunctive: a ceiling kill is only
+    retryable when NOTHING ELSE went wrong. Any real crash, any actually
+    failing test, or an empty subset means the run has a defect a retry
+    cannot clear.
+    """
+
+    def test_the_2x2x2_grid_only_ceiling_kill_alone_is_ceiling_only(self):
+        # timed_out x crashed x fail_in_log. Only (yes, no, no) is retryable.
+        for timed_out in (False, True):
+            for crashed in (False, True):
+                for fail_in_log in (False, True):
+                    with tempfile.TemporaryDirectory() as d:
+                        rs, log = self._build(d, timed_out=timed_out,
+                                              crashed=crashed,
+                                              fail_in_log=fail_in_log)
+                        want = timed_out and not crashed and not fail_in_log
+                        got = summary.ceiling_only_failure(rs, log)
+                        self.assertEqual(
+                            got, want,
+                            "timed_out=%s crashed=%s fail=%s" % (
+                                timed_out, crashed, fail_in_log))
+
+    def test_empty_subset_is_never_ceiling_only(self):
+        # #2100: a subset run that selected 0 tests validated NOTHING. A retry
+        # would select 0 again, so it is not a retryable infra defect.
+        with tempfile.TemporaryDirectory() as d:
+            rs, log = self._build(d, timed_out=True, crashed=False,
+                                  fail_in_log=False, subset_empty=True)
+            self.assertFalse(summary.ceiling_only_failure(rs, log))
+
+    def test_missing_run_summary_is_not_ceiling_only(self):
+        with tempfile.TemporaryDirectory() as d:
+            _, log = self._build(d, timed_out=True, crashed=False,
+                                 fail_in_log=False)
+            self.assertFalse(summary.ceiling_only_failure(
+                os.path.join(d, "nope.json"), log))
+
+    def test_wrong_schema_is_not_ceiling_only(self):
+        with tempfile.TemporaryDirectory() as d:
+            rs, log = self._build(d, timed_out=True, crashed=False,
+                                  fail_in_log=False)
+            obj = json.load(open(rs))
+            obj["schema"] = "bezel.run-summary.v0"
+            io.atomic_json_write(rs, obj)
+            self.assertFalse(summary.ceiling_only_failure(rs, log))
+
+    def test_unreadable_shard_log_is_not_ceiling_only(self):
+        # Conservative direction: "cannot classify" must never mean
+        # "retryable" — an unreadable log could be hiding a [ FAIL ].
+        with tempfile.TemporaryDirectory() as d:
+            rs, _ = self._build(d, timed_out=True, crashed=False,
+                                fail_in_log=False)
+            self.assertFalse(summary.ceiling_only_failure(
+                rs, os.path.join(d, "no-such.log")))
+
+
+class CeilingOnlyCLITest(_CeilingFixture):
+    """`python3 -m gate.summary run-summary ceiling-only PATH --shard-log LOG`
+    — exit 0 ceiling-only, 1 not, 2 unusable input. gate.sh (Lane A-2) turns
+    exit 0 into the existing `exit 3` RETRY contract."""
+
+    def _cli(self, args):
+        import subprocess
+        env = dict(os.environ)
+        root = os.path.join(os.path.dirname(__file__), "..", "..")
+        env["PYTHONPATH"] = root
+        return subprocess.run(
+            [sys.executable, "-m", "gate.summary"] + args,
+            capture_output=True, text=True, env=env, cwd=root)
+
+    def test_exits_zero_on_a_ceiling_only_run(self):
+        with tempfile.TemporaryDirectory() as d:
+            rs, log = self._build(d, timed_out=True, crashed=False,
+                                  fail_in_log=False)
+            out = self._cli(["run-summary", "ceiling-only", rs,
+                             "--shard-log", log])
+            self.assertEqual(out.returncode, 0, out.stderr + out.stdout)
+
+    def test_exits_one_when_a_real_crash_is_present(self):
+        with tempfile.TemporaryDirectory() as d:
+            rs, log = self._build(d, timed_out=True, crashed=True,
+                                  fail_in_log=False)
+            out = self._cli(["run-summary", "ceiling-only", rs,
+                             "--shard-log", log])
+            self.assertEqual(out.returncode, 1, out.stderr + out.stdout)
+
+    def test_exits_one_when_a_test_actually_failed(self):
+        with tempfile.TemporaryDirectory() as d:
+            rs, log = self._build(d, timed_out=True, crashed=False,
+                                  fail_in_log=True)
+            out = self._cli(["run-summary", "ceiling-only", rs,
+                             "--shard-log", log])
+            self.assertEqual(out.returncode, 1, out.stderr + out.stdout)
+
+    def test_exits_two_on_a_missing_run_summary(self):
+        with tempfile.TemporaryDirectory() as d:
+            _, log = self._build(d, timed_out=True, crashed=False,
+                                 fail_in_log=False)
+            out = self._cli(["run-summary", "ceiling-only",
+                             os.path.join(d, "nope.json"), "--shard-log", log])
+            self.assertEqual(out.returncode, 2, out.stderr + out.stdout)
+
+    def test_exits_two_on_a_missing_shard_log(self):
+        with tempfile.TemporaryDirectory() as d:
+            rs, _ = self._build(d, timed_out=True, crashed=False,
+                                fail_in_log=False)
+            out = self._cli(["run-summary", "ceiling-only", rs,
+                             "--shard-log", os.path.join(d, "no.log")])
+            self.assertEqual(out.returncode, 2, out.stderr + out.stdout)
+
+    def test_harvest_subcommand_still_works(self):
+        # The old run-summary subcommand is unchanged by the new one.
+        with tempfile.TemporaryDirectory() as d:
+            rs, _ = self._build(d, timed_out=False, crashed=False,
+                                fail_in_log=False)
+            out = self._cli(["run-summary", "harvest", rs])
+            self.assertEqual(out.returncode, 0, out.stderr)
+            self.assertIn("rp_run_present=1", out.stdout)
+
+
+# The regex gate.sh:901 has carried since the per-area split. It is anchored
+# with `s$`, which run_parallel's ceiling suffix defeats — the reason every
+# telemetry record's shard_times is []. Kept here as the WITNESS for the
+# defect, not as a thing to reuse.
+_GATE_SH_ANCHORED_RE = re.compile(r'^shard [A-Za-z0-9_]+\.[0-9]+: [0-9.]+s$')
+
+
+class ShardTimesHarvestTest(unittest.TestCase):
+    """narrow #3667 side finding: `shard_times` is [] in EVERY telemetry
+    record ever written.
+
+    tests/run_parallel.sh prints `shard <group>.<i>: 12.34s` — but appends
+    ` (ceiling 1800s, 0.7%)` whenever BEZEL_SHARD_TIMEOUT is set, which
+    gate.sh:700 ALWAYS sets. gate.sh:901's harvest regex ends in `s$`, so it
+    has never matched a single line, and the per-shard ceiling-margin trend
+    the code claims to harvest has never had data. The fix is the missing
+    anchor; this module owns the parse so it can be pinned.
+    """
+
+    CEILING_LINE = "shard codegen.0: 1795.50s (ceiling 1800s, 99.8%)"
+    BARE_LINE = "shard codegen.1: 12.34s"
+
+    def test_the_old_anchored_regex_is_why_the_harvest_was_empty(self):
+        # The witness: the shape the gate ALWAYS produces does not match.
+        self.assertIsNone(_GATE_SH_ANCHORED_RE.match(self.CEILING_LINE))
+        self.assertIsNotNone(_GATE_SH_ANCHORED_RE.match(self.BARE_LINE))
+
+    def test_harvests_lines_carrying_the_ceiling_suffix(self):
+        self.assertEqual(
+            summary.shard_times_from_log(self.CEILING_LINE + "\n"),
+            [1795.50])
+
+    def test_harvests_the_bare_pre_3222_shape_too(self):
+        # The no-ceiling fallback (BEZEL_SHARD_TIMEOUT unset or 0) must keep
+        # working — the un-anchored regex is a widening, not a swap.
+        self.assertEqual(summary.shard_times_from_log(self.BARE_LINE + "\n"),
+                         [12.34])
+
+    def test_order_is_log_order_and_every_shard_is_kept(self):
+        text = ("shard codegen.0: 100.00s (ceiling 1000s, 10.0%)\n"
+                "shard codegen.1: 150.00s (ceiling 1000s, 15.0%)\n"
+                "shard module.0: 12.34s\n")
+        self.assertEqual(summary.shard_times_from_log(text),
+                         [100.0, 150.0, 12.34])
+
+    def test_ignores_unrelated_lines(self):
+        text = ("TOTAL: 20148 passed\n"
+                "shard codegen.0: 10.00s (ceiling 1800s, 0.6%)\n"
+                "   shard codegen.1: 99.00s\n"          # not anchored at ^
+                "shard codegen: 5.00s\n"                # no .<index>
+                "shard codegen.2 10.00s\n")             # no colon
+        self.assertEqual(summary.shard_times_from_log(text), [10.0])
+
+    def test_empty_log_is_empty_list(self):
+        self.assertEqual(summary.shard_times_from_log(""), [])
+
+    def test_cli_prints_the_comma_separated_list_verbatim(self):
+        # telemetry.py:276 wraps each token as a RawNumber — no reformatting —
+        # so the CLI must emit the digits the log carried, not a re-rendered
+        # float ("1795.50", not "1795.5").
+        import subprocess
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "gate_shard.log")
+            with open(path, "w") as f:
+                f.write(self.CEILING_LINE + "\n" + self.BARE_LINE + "\n")
+            env = dict(os.environ)
+            root = os.path.join(os.path.dirname(__file__), "..", "..")
+            env["PYTHONPATH"] = root
+            out = subprocess.run(
+                [sys.executable, "-m", "gate.summary", "shard-times", path],
+                capture_output=True, text=True, env=env, cwd=root)
+            self.assertEqual(out.returncode, 0, out.stderr)
+            self.assertEqual(out.stdout, "1795.50,12.34\n")
+
+    def test_cli_on_a_log_with_no_shard_lines_prints_an_empty_line(self):
+        # gate.sh assigns SHARD_TIMES from this; telemetry maps "" to [].
+        import subprocess
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "gate_shard.log")
+            with open(path, "w") as f:
+                f.write("TOTAL: 0 passed\n")
+            env = dict(os.environ)
+            root = os.path.join(os.path.dirname(__file__), "..", "..")
+            env["PYTHONPATH"] = root
+            out = subprocess.run(
+                [sys.executable, "-m", "gate.summary", "shard-times", path],
+                capture_output=True, text=True, env=env, cwd=root)
+            self.assertEqual(out.returncode, 0, out.stderr)
+            self.assertEqual(out.stdout, "\n")
+
+    def test_cli_on_a_missing_log_exits_two(self):
+        import subprocess
+        env = dict(os.environ)
+        root = os.path.join(os.path.dirname(__file__), "..", "..")
+        env["PYTHONPATH"] = root
+        out = subprocess.run(
+            [sys.executable, "-m", "gate.summary", "shard-times",
+             "/nonexistent/gate_shard.log"],
+            capture_output=True, text=True, env=env, cwd=root)
+        self.assertEqual(out.returncode, 2)
 
 
 if __name__ == "__main__":
