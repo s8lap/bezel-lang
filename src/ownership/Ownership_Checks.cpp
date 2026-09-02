@@ -5235,9 +5235,18 @@ void MethodOwnership::checkCollectionBorrowStoreEscape(
     if (!tt || tt->kind != sema::TypeRef::Kind::Named || tt->declaration)
         return;
     const std::string_view cn = tt->headName();
+    // fix #2773 (B1) / stdlib §4.18 (v0.286), per issue #3428's own "knock-on"
+    // note: `SortedSet` was absent here ONLY because a class/interface-element
+    // `SortedSet` could not be constructed at all (narrow #3428), so a fresh
+    // borrow store into one was unreachable. Fix #2773 (B1) makes construction
+    // succeed for an element with a dispatchable `CompareTo` — stdlib §4.18
+    // gives `SortedSet<T>` the same borrowing-family value semantics as §4.17
+    // ("the same … value semantics … apply") — so it joins the whitelist in
+    // the same commit that makes it reachable, per #3428's explicit request.
     const bool borrowingFamily =
         cn == "Array" || cn == "Dictionary" || cn == "SortedDictionary" ||
-        cn == "Set" || cn == "Stack" || cn == "Queue" || cn == "LinkedList";
+        cn == "Set" || cn == "SortedSet" || cn == "Stack" || cn == "Queue" ||
+        cn == "LinkedList";
     if (!borrowingFamily) return;
 
     // §28.11 (#1886): the bulk `AddRange` argument is an IEnumerable<T>, not a
@@ -5623,9 +5632,17 @@ bool MethodOwnership::checkIndexerSetBorrowStoreEscape(
     if (!tt || tt->kind != sema::TypeRef::Kind::Named || tt->declaration)
         return false;
     const std::string_view cn = tt->headName();
+    // fix #2773 (B1) / stdlib §4.18 (v0.286): kept symmetric with
+    // `checkCollectionBorrowStoreEscape`'s whitelist above (per issue #3428's
+    // "add `SortedSet` to those two whitelists in the same PR"). Inert for
+    // `SortedSet` exactly as it already is for `Set`: neither stdlib §4.10 nor
+    // §4.18 declares an indexer, so this sink's `IndexExpr` target never
+    // resolves to either — the entry costs nothing and keeps the two sinks'
+    // classification of "the borrowing family" from silently diverging.
     const bool borrowingFamily =
         cn == "Array" || cn == "Dictionary" || cn == "SortedDictionary" ||
-        cn == "Set" || cn == "Stack" || cn == "Queue" || cn == "LinkedList";
+        cn == "Set" || cn == "SortedSet" || cn == "Stack" || cn == "Queue" ||
+        cn == "LinkedList";
     if (!borrowingFamily) return false;
 
     // §15.4 fresh-store warning (v0.243) — the indexer-set half of the shared

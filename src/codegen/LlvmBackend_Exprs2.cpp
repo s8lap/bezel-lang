@@ -4326,57 +4326,65 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                     }
                 }
                 uint64_t ksz = 0;
-                if (const sema::TypeRef* elemTy =
-                        genericBackingType(rt, 0, /*isSet=*/true, &ksz)) {
+                const sema::TypeRef* elemTy =
+                    genericBackingType(rt, 0, /*isSet=*/true, &ksz);
+                // fix #2773 (B1) / stdlib §4.18 (v0.286): `genericBackingType`
+                // now admits a SortedSet<T> reference element (class,
+                // interface) — see its own comment — but construction is
+                // sound only when T actually has a DISPATCHABLE `CompareTo`;
+                // `narrow #3428`'s loud rejection (below) stays in force for
+                // the residual case (`Object`, or a class/interface that
+                // declares none) rather than silently constructing a set
+                // whose ordering and dedup cannot honor §4.18. Null this back
+                // out so that residual case falls to the rejection exactly as
+                // it did before this fix — a strict NARROWING of #3428's
+                // rejection surface, not a new silent-wrong-value path (§6c).
+                if (elemTy && colName == "SortedSet" &&
+                    hasObjectHeaderEquality(elemTy) &&
+                    !buildObjectCompareToThunk(elemTy)) {
+                    elemTy = nullptr;
+                }
+                if (elemTy) {
                     llvm::Function* hashT = buildValueHashTrampoline(elemTy);
                     llvm::Function* eqT   = buildValueEqTrampoline(elemTy);
+                    // fix #2773 (B1) / stdlib §4.18 (v0.286): a SortedSet's
+                    // stored identity for a reference element is
+                    // `CompareTo`-equality ("adding an equal element leaves
+                    // the set unmodified"), not §8.3's `Equals`/
+                    // `GetHashCode` — exactly the same divergence
+                    // `fix #3488` recorded for `SortedDictionary`'s reference
+                    // KEY, and the same fix: `buildSortedObjectKeyIdentity`
+                    // overwrites hashT/eqT with the (constant-hash,
+                    // `CompareTo == 0`) pair when the element carries a
+                    // dispatchable `CompareTo`. Called unconditionally on
+                    // `colName == "SortedSet"`, mirroring the
+                    // `SortedDictionary` call site's own idiom: for a
+                    // scalar/string/record/enum/choice element
+                    // `buildObjectCompareToThunk` inside it returns null
+                    // immediately (not `hasObjectHeaderEquality`), so hashT/
+                    // eqT pass through unchanged and every non-reference
+                    // SortedSet element is byte-identical to before this fix.
+                    if (colName == "SortedSet")
+                        buildSortedObjectKeyIdentity(elemTy, hashT, eqT);
                     auto* allocFn = declareC("bz_dict_alloc_generic", ptrTy(),
                                              {i64(), ptrTy(), ptrTy()});
                     return builder_.CreateCall(allocFn,
                         {builder_.getInt64((int64_t)ksz), hashT, eqT});
                 }
-                // fix #3428 / stdlib §4.18 (v0.283): a REFERENCE element
-                // (class, interface, `Object`) has no generic-key backing —
-                // `genericBackingType`'s `isSet` arm deliberately excludes it
-                // ("a class/interface SET element keeps its ARRAY-backed
-                // linear-scan machinery (emitArrayBackedSetInsert, #1070), a
-                // separate and working design"), and
-                // `SortedSet` is NOT in the Array arm's name list below. So the
-                // construction fell out of every branch, `lowerNew` returned
-                // nullptr, and the user saw lowerLocalDecl's #2974 degrade:
-                // "`new SortedSet(…)` produced no value … either `SortedSet`
-                // may not be instantiated at all … or this argument list
-                // matches no documented constructor". Both readings are FALSE
-                // here — §4.18 declares `public constructor();` and its sole
-                // constraint `where T: IComparable<T>` is satisfied by a class
-                // that implements it — so the message blamed the program for a
-                // compiler gap. `Set`/`OwningSet` are untouched: they DO fall
-                // through to the Array arm, and that path works.
-                //
-                // WHY A REJECTION AND NOT AN IMPLEMENTATION. Wiring this arm to
-                // the generic-key table (what `SortedDictionary` does for a
-                // class KEY, the #2773 `hasObjectHeaderEquality` row) would
-                // compile — and be wrong twice over, silently:
-                //   * §4.18 heads the type "membership by `CompareTo`-equality"
-                //     and says "adding an equal element leaves the set
-                //     unmodified"; the hash table keys on
-                //     `Equals`/`GetHashCode`, which for a class is §8.3
-                //     reference identity, so two `CompareTo`-equal instances
-                //     would both be stored.
-                //   * §4.18 promises "iteration in ascending order", and the
-                //     sorted-snapshot path needs `buildSortedKeyComparator`,
-                //     which returns null for anything that is not an integer or
-                //     float LLVM type — there is no `CompareTo`-through-the-
-                //     vtable comparator in this compiler at all.
-                // MEASURED on 0c5ecd1, the very construction the issue calls a
-                // working control: `SortedDictionary<Ord, int>` with a class key
-                // compiles, then iterates in INSERTION order (3, 1, 2 for keys
-                // added 3, 1, 2) and SEGVs on `FirstKey` under ASan. That is the
-                // outcome this arm would reproduce for `SortedSet`, so per the
-                // #511 `GetType` / #2722 comparer-constructor precedent the
-                // deferral is made LOUD instead. Filed as its own issue rather
-                // than fixed here; a correct reference-element ordered
-                // collection needs a comparator-keyed backing, not this one.
+                // narrow #3428 / stdlib §4.18 (v0.286): the residual case —
+                // a `SortedSet<T>` REFERENCE element (class, interface,
+                // `Object`) with NO dispatchable `CompareTo`. This used to be
+                // EVERY reference element (#3428's original filing, v0.283);
+                // fix #2773 (B1) narrowed it to just this shape once
+                // `buildObjectCompareToThunk` (fix #3488's lift of the
+                // #1195/#2768 `Array.Sort` thunks) gave every OTHER
+                // reference element a real comparator, handled by the
+                // `elemTy` branch above. `SortedSet` is NOT in the Array
+                // arm's name list below, so falling out of both branches
+                // here still means `lowerNew` would return nullptr and the
+                // user would see lowerLocalDecl's #2974 degrade — kept LOUD
+                // instead, per the #511 `GetType` / #2722 comparer-
+                // constructor precedent, exactly as #3428 chose.
                 //
                 // The predicate is `hasObjectHeaderEquality` — the same named
                 // authority `genericBackingType`'s dictionary row uses to
@@ -4384,19 +4392,20 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                 // interface, or `Object`" — rather than a second spelling of
                 // the same classification.
                 if (colName == "SortedSet" && rt->genericArgs.size() == 1) {
-                    const sema::TypeRef* elemTy =
+                    const sema::TypeRef* rejElemTy =
                         resolveTypeParamRef(rt->genericArgs[0]);
-                    if (hasObjectHeaderEquality(elemTy)) {
+                    if (hasObjectHeaderEquality(rejElemTy)) {
                         const bool isObj =
-                            elemTy->kind == sema::TypeRef::Kind::Primitive;
+                            rejElemTy->kind == sema::TypeRef::Kind::Primitive;
                         std::string elemName =
-                            isObj ? "Object" : std::string(elemTy->headName());
+                            isObj ? "Object" : std::string(rejElemTy->headName());
+                        const bool isIface =
+                            !isObj && rejElemTy->declaration->kind ==
+                                          ast::TypeDeclKind::Interface;
                         const char* kindWord =
                             isObj ? "the `Object` type"
-                                  : (elemTy->declaration->kind ==
-                                     ast::TypeDeclKind::Interface
-                                         ? "an interface type"
-                                         : "a class type");
+                                  : (isIface ? "an interface type"
+                                             : "a class type");
                         // The element is named by its HEAD (`headName()`,
                         // the alias-transparent authority) rather than a
                         // reconstructed full spelling: there is no shared
@@ -4405,22 +4414,89 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                         // message describes the head instead of presenting
                         // `SortedSet<IComparable>` as if that were what the
                         // program wrote for `SortedSet<IComparable<Ord>>`.
+
+                        // review fix (post-0c8612d): NULLABILITY is checked
+                        // FIRST and given its OWN message, rather than being
+                        // folded into the class/interface "no dispatchable
+                        // CompareTo" wording below. `genericBackingType`'s
+                        // pre-existing `!ty->nullable` guard
+                        // (LlvmBackend_Calls3.cpp, "Nullable keys and other
+                        // shapes are not wired here") excludes EVERY
+                        // nullable key/element from the generic-key backing
+                        // BEFORE any `CompareTo` is ever consulted — so
+                        // `SortedSet<Ord?>` with `Ord: IComparable<Ord>` (a
+                        // REAL, dispatchable `CompareTo`) reached this same
+                        // block under the OLD wording and was told "`Ord`
+                        // declares no single-argument `CompareTo`", which is
+                        // FALSE: `Ord` declares exactly one — the nullable
+                        // wrapper is what this code path never gets past.
+                        // The accept/reject BOUNDARY here is still correct
+                        // (spec §14.2: `where T: IComparable<T>` is a
+                        // type-bound constraint, and such a constraint
+                        // implies a non-null `T` — a nullable `T` cannot
+                        // itself conform to an interface), only the STATED
+                        // reason was wrong for this shape. Not folded into
+                        // the "no CompareTo" wording below because that
+                        // wording's own consequence clause ("membership
+                        // would fall back to reference identity") describes
+                        // what a WRONG comparator dispatch would do — the
+                        // nullable case never reaches comparator dispatch at
+                        // all, so that clause would not even apply.
+                        if (rejElemTy->nullable) {
+                            ctx_.diagnostics().report(
+                                Severity::Error, ne.span.begin,
+                                "stdlib §4.18: `SortedSet<T>` requires a "
+                                "NON-NULLABLE element type — the element "
+                                "type here (`" + elemName + "?`) is " +
+                                kindWord + ", used nullably. Spec §14.2's "
+                                "`where T: IComparable<T>` type-bound "
+                                "constraint implies a non-null T (a "
+                                "nullable T cannot itself conform to an "
+                                "interface), and this compiler's "
+                                "generic-key backing does not admit a "
+                                "nullable class/interface element/key at "
+                                "all regardless of whether the underlying "
+                                "type declares `CompareTo`. Use a "
+                                "non-nullable element type, or use `Set<T>` "
+                                "(stdlib §4.10) where ordering is not "
+                                "required (#3428).");
+                            return llvm::ConstantPointerNull::get(ptrTy());
+                        }
+                        // The INTERFACE wording is deliberately NOT "declares
+                        // no CompareTo": an interface reaching here can
+                        // perfectly well declare one — `IComparable<Ord>`
+                        // used bare as an element type declares
+                        // `CompareTo(other: Ord): int` — but
+                        // `selfComparableIfaceCompareTo` requires the
+                        // SELF-comparable shape §4.18's `where T:
+                        // IComparable<T>` names (`CompareTo` comparing T
+                        // against T itself), which that is not. Saying "no
+                        // CompareTo" for that shape would be a false claim
+                        // about the program's own source.
                         ctx_.diagnostics().report(
                             Severity::Error, ne.span.begin,
-                            "stdlib §4.18: `SortedSet<T>` is not yet "
-                            "implemented for a reference element type — the "
-                            "element type here (`" + elemName + "`) is " +
-                            kindWord + ", and this compiler has no "
-                            "`CompareTo`-based ordered backing for reference "
-                            "elements. Constructing one would silently break "
-                            "both halves of §4.18's contract (\"membership by "
-                            "`CompareTo`-equality, iteration in ascending "
-                            "order\"): membership would fall back to §8.3 "
-                            "reference identity, so two `CompareTo`-equal "
-                            "instances would both be stored, and iteration "
-                            "would come out in hash order. Use `Set<T>` "
-                            "(stdlib §4.10) where ordering is not required "
-                            "(#3428).");
+                            "stdlib §4.18: `SortedSet<T>` requires an "
+                            "element type with a dispatchable `CompareTo` — "
+                            "the element type here (`" + elemName + "`) is " +
+                            kindWord + ", and " +
+                            (isObj
+                                 ? std::string("`Object` declares no ")
+                             : isIface
+                                 ? (std::string("`") + elemName +
+                                    "` does not declare a SELF-comparable ")
+                                 : (std::string("`") + elemName +
+                                    "` declares no single-argument ")) +
+                            "`CompareTo`. Constructing one would silently "
+                            "break both halves of §4.18's contract "
+                            "(\"membership by `CompareTo`-equality, "
+                            "iteration in ascending order\"): membership "
+                            "would fall back to §8.3 reference identity, so "
+                            "two otherwise-equal instances would both be "
+                            "stored, and iteration would come out in hash "
+                            "order. Implement `CompareTo(other: T): int` "
+                            "(stdlib §2.8's `IComparable<T>`), or use "
+                            "`Set<T>` (stdlib §4.10) where ordering is not "
+                            "required (#3428).");
                         return llvm::ConstantPointerNull::get(ptrTy());
                     }
                 }

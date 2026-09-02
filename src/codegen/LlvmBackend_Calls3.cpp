@@ -375,7 +375,8 @@ const sema::TypeRef* Emitter::genericBackingType(const sema::TypeRef* collTy,
         // (sema rejects a non-value-like one). Stored as the choice struct's
         // bytes; hashed/compared by tag + active payload (build*ChoiceTrampoline).
         eligible = true;
-    else if (!isSet && !ty->nullable && hasObjectHeaderEquality(ty))
+    else if (!ty->nullable && hasObjectHeaderEquality(ty) &&
+             (!isSet || (collTy && collTy->headName() == "SortedSet")))
         // fix #2773 (rows A3/A4) / §3.6 / §8.3 / stdlib §4.8: a DICTIONARY key
         // that carries the §8.3 object header — a class, an interface, or
         // `Object`. §3.6's hashable row admits "every type except (a) a
@@ -403,9 +404,31 @@ const sema::TypeRef* Emitter::genericBackingType(const sema::TypeRef* collTy,
         // — so BUILD mode and READ mode disagreed; converging on generic is
         // what makes the two agree.
         //
-        // `isSet` is excluded deliberately: a class/interface SET element keeps
-        // its ARRAY-backed linear-scan machinery (emitArrayBackedSetInsert,
-        // #1070), a separate and working design.
+        // `isSet` is excluded deliberately for `Set<T>`/`OwningSet<T>`: a
+        // class/interface SET element keeps its ARRAY-backed linear-scan
+        // machinery (emitArrayBackedSetInsert, #1070), a separate and
+        // working design.
+        //
+        // fix #2773 (B1) / stdlib §4.18 (v0.286): `SortedSet<T>` is the ONE
+        // exception, named explicitly (`collTy->headName() == "SortedSet"`)
+        // rather than lifting the `isSet` guard wholesale — `Set`/
+        // `OwningSet` must NOT widen here (that would switch their whole
+        // class-element representation from array- to dict-backed, a blast
+        // radius no test in this fix measures). Unlike `Set`, `SortedSet`
+        // has NO array-backed fallback at all — "SortedSet is hash-backed or
+        // it is nothing" (`narrow #3428`'s own commit body) — so before this
+        // line a class/interface `SortedSet<T>` could not be constructed at
+        // all (#3428 made that a truthful `stdlib §4.18: ... not yet
+        // implemented` rejection rather than the old #2974 degrade). What
+        // changed since #3428: `buildObjectCompareToThunk` (`fix #3488`'s
+        // lift of the #1195/#2768 `Array.Sort` thunks) now gives every
+        // class/interface element with a dispatchable `CompareTo` a
+        // `CompareTo`-through-the-vtable comparator, so #3428's objection —
+        // "there is no such comparator in this compiler" — no longer holds
+        // for an element that actually declares one. `lowerNew` narrows the
+        // #3428 rejection to fire only when `buildObjectCompareToThunk`
+        // returns null (§4.18's `where T: IComparable<T>` going unchecked for
+        // a builtin generic is #3490's open question, unaffected by this fix).
         eligible = true;
     if (!eligible) return nullptr;
     if (byteSize) {
