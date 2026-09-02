@@ -264,6 +264,51 @@ class CheckAgreementTest(unittest.TestCase):
                 capture_output=True, text=True, env=env, cwd=root)
             self.assertEqual(out.returncode, 0, out.stderr)
 
+    def test_check_cli_names_the_shards_that_produced_no_summary(self):
+        # sharpen #3668: the both-absent case is agreement, but silence about
+        # it makes "0 mismatches" read as "every shard reported in". The
+        # success line must say how many produced nothing and point at the
+        # banner that details them.
+        import subprocess
+        with tempfile.TemporaryDirectory() as d:
+            _write_log(d, "codegen", 0, "[ RUN  ] slow.test\n")
+            _write_log(d, "codegen", 1, self._full_log(5, 0, 20, 1))
+            _write_json(d, "codegen", 1, {
+                "schema": summary.SCHEMA, "binary": "b", "shard_index": 1,
+                "shard_count": 2, "passed": 5, "failed": 0, "total": 20,
+                "selected": 20, "asan_mode": False, "rc": 0, "elapsed_s": 1.0})
+            env = dict(os.environ)
+            root = os.path.join(os.path.dirname(__file__), "..", "..")
+            env["PYTHONPATH"] = root
+            out = subprocess.run(
+                [sys.executable, "-m", "gate.summary", "check", d],
+                capture_output=True, text=True, env=env, cwd=root)
+            self.assertEqual(out.returncode, 0, out.stderr)
+            self.assertIn("0 mismatches", out.stdout)
+            self.assertIn("1 shard(s) produced no summary at all", out.stdout)
+            self.assertIn("codegen/0", out.stdout)
+            self.assertNotIn("codegen/1", out.stdout)
+
+    def test_check_cli_success_line_unchanged_when_every_shard_reported(self):
+        import subprocess
+        with tempfile.TemporaryDirectory() as d:
+            _write_log(d, "codegen", 0, self._full_log(5, 0, 20, 0))
+            _write_json(d, "codegen", 0, {
+                "schema": summary.SCHEMA, "binary": "b", "shard_index": 0,
+                "shard_count": 1, "passed": 5, "failed": 0, "total": 20,
+                "selected": 20, "asan_mode": False, "rc": 0, "elapsed_s": 1.0})
+            env = dict(os.environ)
+            root = os.path.join(os.path.dirname(__file__), "..", "..")
+            env["PYTHONPATH"] = root
+            out = subprocess.run(
+                [sys.executable, "-m", "gate.summary", "check", d],
+                capture_output=True, text=True, env=env, cwd=root)
+            self.assertEqual(out.returncode, 0, out.stderr)
+            self.assertEqual(
+                out.stdout,
+                "shard-summary agreement: 0 mismatches over 1 JSON summaries "
+                "(observation-only)\n")
+
     def test_subset_selected_compared_only_when_legacy_carries_it(self):
         # selected is compared when the legacy line has it (subset mode)...
         with tempfile.TemporaryDirectory() as d:
@@ -1060,7 +1105,8 @@ class CompletedShardNotADiedOnVictimTest(unittest.TestCase):
             out = subprocess.run(
                 [sys.executable, "-m", "gate.summary", "format-failure",
                  "--ran", "1522", "--expected", "1523", "--nbin", "1",
-                 "--njobs", "8", "--crashed", "module/7", "--logdir", d],
+                 "--njobs", "8", "--crashed", "module/7",
+                 "--missing-summary", "--logdir", d],
                 capture_output=True, text=True, env=env, cwd=root)
             self.assertEqual(out.returncode, 0, out.stderr)
             self.assertNotIn("died on:", out.stdout)
@@ -1106,10 +1152,29 @@ class FormatCLITest(unittest.TestCase):
             out = self._run_cli(
                 ["format-failure", "--ran", "8", "--expected", "10",
                  "--nbin", "1", "--njobs", "2", "--crashed", "codegen/0",
-                 "--logdir", d])
+                 "--missing-summary", "--logdir", d])
             self.assertEqual(out.returncode, 0, out.stderr)
             self.assertIn("shard crash / undercount", out.stdout)
             self.assertIn("died on: Second.test", out.stdout)
+
+    def test_format_failure_cli_refuses_a_missing_missing_summary(self):
+        # sharpen #3668: --missing-summary is REQUIRED. The completed-shard
+        # suppression keys on ABSENCE from that list, so a defaulted empty
+        # list is a fail-open default: a caller that forgets the flag makes
+        # every genuinely crashed shard read as "completed its slice" and
+        # drops its `died on:` line, which is the suspect arbitration needs.
+        # Forgetting it must be a usage error, not a silent relabelling.
+        with tempfile.TemporaryDirectory() as d:
+            _write_log(d, "codegen", 0,
+                       "[ RUN  ] a.b\n[ FAIL ] a.b (1 ms)\n"
+                       "0 passed, 1 failed (shard 0/1), 1 total\n")
+            out = self._run_cli(
+                ["format-failure", "--ran", "8", "--expected", "10",
+                 "--nbin", "1", "--njobs", "2", "--crashed", "codegen/0",
+                 "--logdir", d])
+            self.assertEqual(out.returncode, 2)
+            self.assertIn("--missing-summary", out.stderr)
+            self.assertEqual(out.stdout, "")
 
     def test_format_failure_cli_no_defect_emits_nothing(self):
         # Per #3012 / Phase 2c: the bash `[[ -n "$_rp_py_failure" ]]` guard
@@ -1118,7 +1183,8 @@ class FormatCLITest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             out = self._run_cli(
                 ["format-failure", "--ran", "10", "--expected", "10",
-                 "--nbin", "2", "--njobs", "4", "--logdir", d])
+                 "--nbin", "2", "--njobs", "4", "--missing-summary",
+                 "--logdir", d])
             self.assertEqual(out.returncode, 0, out.stderr)
             self.assertEqual(out.stdout, "")
 
@@ -1425,7 +1491,7 @@ class TimeoutCLITest(_Fixture):
             _write_log(d, "codegen", 0, "SHARD_ELAPSED 1800.00\n")
             out = self._run_cli([
                 "format-failure", "--ran", "8", "--expected", "10",
-                "--nbin", "1", "--njobs", "2",
+                "--nbin", "1", "--njobs", "2", "--missing-summary",
                 "--timed-out", "codegen/0", "--logdir", d])
             self.assertEqual(out.returncode, 0, out.stderr)
             self.assertIn("TIMED OUT at ceiling", out.stdout)
@@ -1436,7 +1502,7 @@ class TimeoutCLITest(_Fixture):
             _write_log(d, "codegen", 0, "[ RUN  ] Last.Run\n")
             out = self._run_cli([
                 "format-failure", "--ran", "8", "--expected", "10",
-                "--nbin", "1", "--njobs", "2",
+                "--nbin", "1", "--njobs", "2", "--missing-summary",
                 "--crashed", "codegen/0", "--logdir", d])
             self.assertEqual(out.returncode, 0, out.stderr)
             self.assertIn("died on: Last.Run", out.stdout)
@@ -1609,16 +1675,36 @@ class _CeilingFixture(_Fixture):
     """Shared logdir/run-summary/gate-log builder for the #3667 ceiling-only
     pins. No test methods — the two TestCases below carry them."""
 
-    def _build(self, d, *, timed_out, crashed, fail_in_log, subset_empty=False):
+    def _build(self, d, *, timed_out, crashed, fail_in_log, subset_empty=False,
+               fail_in_shard_log=False, unexplained_missing=None):
         """Build a logdir + run-summary JSON + a gate log, and return
-        (run_summary_path, gate_log_path). conc=2: shard 0 carries the
-        ceiling kill, shard 1 the crash."""
+        (run_summary_path, gate_log_path). conc=2 (3 with an
+        `unexplained_missing` shard): shard 0 carries the ceiling kill,
+        shard 1 the crash.
+
+        `fail_in_shard_log` puts a `[ FAIL ]` in the CEILING-KILLED shard's own
+        log while leaving the gate log clean — the shape run_parallel's early
+        exits (:233, :251) produce, where the `--- failing tests ---` block at
+        :317-322 is never reached.
+
+        `unexplained_missing` adds a third shard whose summary is missing for a
+        reason that is NOT a ceiling kill: "asymmetric" = a legacy summary line
+        but no JSON (the mismatch shape); "clean" = rc==0 and no summary at all
+        (a shard that exited fine having validated none of its slice)."""
         ceiling = 1800
+        conc = 2
         if timed_out:
             # rc=124 (timeout SIGTERM) + elapsed at 99% of the ceiling, and no
             # summary at all — exactly what `timeout -k 10` leaves behind.
             self._shard(d, "codegen", 0, 0, 0, 0, rc=124, write_json=False,
                         write_log=False, shard_elapsed=ceiling * 0.99)
+            if fail_in_shard_log:
+                # _shard wrote a marker-only log; rewrite it with a [ FAIL ]
+                # the shard had already printed before the clock ran out.
+                _write_log(d, "codegen", 0,
+                           "[ RUN  ] own_branch_disposal.row7\n"
+                           "[ FAIL ] own_branch_disposal.row7 (11 ms)\n"
+                           "SHARD_ELAPSED {:.2f}\n".format(ceiling * 0.99))
         else:
             self._shard(d, "codegen", 0, 5, 0, 10, rc=0, shard_elapsed=12.0)
         if crashed:
@@ -1626,7 +1712,17 @@ class _CeilingFixture(_Fixture):
                         write_log=False, shard_elapsed=3.0)
         else:
             self._shard(d, "codegen", 1, 5, 0, 10, rc=0, shard_elapsed=13.0)
-        acc = summary.account(d, 2, ["codegen"], subset=subset_empty,
+        if unexplained_missing == "asymmetric":
+            # legacy line present, JSON absent — check_agreement's asymmetric
+            # mismatch, which makes run_parallel exit before the banner.
+            conc = 3
+            self._shard(d, "codegen", 2, 5, 0, 10, rc=0, write_json=False,
+                        shard_elapsed=9.0)
+        elif unexplained_missing == "clean":
+            conc = 3
+            self._shard(d, "codegen", 2, 0, 0, 0, rc=0, write_json=False,
+                        write_log=False, shard_elapsed=9.0)
+        acc = summary.account(d, conc, ["codegen"], subset=subset_empty,
                               shard_timeout=ceiling)
         if subset_empty:
             # _shard writes `selected` = total; force the empty-subset shape
@@ -1675,6 +1771,60 @@ class CeilingOnlyFailureTest(_CeilingFixture):
                             got, want,
                             "timed_out=%s crashed=%s fail=%s" % (
                                 timed_out, crashed, fail_in_log))
+
+    def test_a_missing_summary_no_ceiling_kill_explains_is_not_ceiling_only(self):
+        # sharpen #3668 shape (b): a shard with rc==0 and NO summary validated
+        # none of its slice. It is in neither crashed_shards nor
+        # timed_out_shards, so before the subset conjunct nothing rejected it
+        # and a genuine coverage defect read as retryable infra.
+        with tempfile.TemporaryDirectory() as d:
+            rs, log = self._build(d, timed_out=True, crashed=False,
+                                  fail_in_log=False,
+                                  unexplained_missing="clean")
+            self.assertFalse(summary.ceiling_only_failure(rs, log))
+
+    def test_an_asymmetric_summary_mismatch_is_not_ceiling_only(self):
+        # sharpen #3668 shape (a): a shard with a legacy line but no JSON is
+        # the asymmetric mismatch run_parallel still exits on (:233/:251) —
+        # BEFORE the `--- failing tests ---` block, so the gate log cannot
+        # carry the evidence. The subset conjunct rejects it from the run
+        # summary alone, with no log scan needed.
+        with tempfile.TemporaryDirectory() as d:
+            rs, log = self._build(d, timed_out=True, crashed=False,
+                                  fail_in_log=False,
+                                  unexplained_missing="asymmetric")
+            self.assertFalse(summary.ceiling_only_failure(rs, log))
+
+    def test_a_fail_in_the_shard_log_alone_needs_the_shard_logs_dir(self):
+        # The residual the --shard-logs-dir flag exists for: the ceiling-killed
+        # shard had ALREADY printed a [ FAIL ] before the clock ran out, and
+        # the gate log never got the `--- failing tests ---` block. Scanning
+        # only the gate log says "retryable" (documented residual); scanning
+        # the per-shard logs sees the marker and says "no".
+        with tempfile.TemporaryDirectory() as d:
+            rs, log = self._build(d, timed_out=True, crashed=False,
+                                  fail_in_log=False, fail_in_shard_log=True)
+            self.assertTrue(summary.ceiling_only_failure(rs, log))
+            self.assertFalse(summary.ceiling_only_failure(
+                rs, log, shard_logs_dir=d))
+
+    def test_shard_logs_dir_scan_still_says_yes_on_a_clean_ceiling_kill(self):
+        # The scan is a widening of the evidence, not a blanket "no": a real
+        # ceiling-only run stays retryable with the dir passed.
+        with tempfile.TemporaryDirectory() as d:
+            rs, log = self._build(d, timed_out=True, crashed=False,
+                                  fail_in_log=False)
+            self.assertTrue(summary.ceiling_only_failure(
+                rs, log, shard_logs_dir=d))
+
+    def test_a_shard_logs_dir_that_is_not_a_directory_is_not_ceiling_only(self):
+        # Asking for the per-shard scan and not getting it is the
+        # "cannot classify" state, never "nothing found".
+        with tempfile.TemporaryDirectory() as d:
+            rs, log = self._build(d, timed_out=True, crashed=False,
+                                  fail_in_log=False)
+            self.assertFalse(summary.ceiling_only_failure(
+                rs, log, shard_logs_dir=os.path.join(d, "no-such-dir")))
 
     def test_empty_subset_is_never_ceiling_only(self):
         # #2100: a subset run that selected 0 tests validated NOTHING. A retry
@@ -1747,6 +1897,42 @@ class CeilingOnlyCLITest(_CeilingFixture):
             out = self._cli(["run-summary", "ceiling-only", rs,
                              "--shard-log", log])
             self.assertEqual(out.returncode, 1, out.stderr + out.stdout)
+
+    def test_exits_one_when_a_missing_summary_is_unexplained(self):
+        for shape in ("clean", "asymmetric"):
+            with tempfile.TemporaryDirectory() as d:
+                rs, log = self._build(d, timed_out=True, crashed=False,
+                                      fail_in_log=False,
+                                      unexplained_missing=shape)
+                out = self._cli(["run-summary", "ceiling-only", rs,
+                                 "--shard-log", log])
+                self.assertEqual(out.returncode, 1,
+                                 shape + ": " + out.stderr + out.stdout)
+
+    def test_exits_one_when_only_a_per_shard_log_carries_the_fail(self):
+        with tempfile.TemporaryDirectory() as d:
+            rs, log = self._build(d, timed_out=True, crashed=False,
+                                  fail_in_log=False, fail_in_shard_log=True)
+            out = self._cli(["run-summary", "ceiling-only", rs,
+                             "--shard-log", log, "--shard-logs-dir", d])
+            self.assertEqual(out.returncode, 1, out.stderr + out.stdout)
+
+    def test_exits_zero_with_the_shard_logs_dir_on_a_clean_ceiling_kill(self):
+        with tempfile.TemporaryDirectory() as d:
+            rs, log = self._build(d, timed_out=True, crashed=False,
+                                  fail_in_log=False)
+            out = self._cli(["run-summary", "ceiling-only", rs,
+                             "--shard-log", log, "--shard-logs-dir", d])
+            self.assertEqual(out.returncode, 0, out.stderr + out.stdout)
+
+    def test_exits_two_when_the_shard_logs_dir_does_not_exist(self):
+        with tempfile.TemporaryDirectory() as d:
+            rs, log = self._build(d, timed_out=True, crashed=False,
+                                  fail_in_log=False)
+            out = self._cli(["run-summary", "ceiling-only", rs,
+                             "--shard-log", log, "--shard-logs-dir",
+                             os.path.join(d, "nope")])
+            self.assertEqual(out.returncode, 2, out.stderr + out.stdout)
 
     def test_exits_two_on_a_missing_run_summary(self):
         with tempfile.TemporaryDirectory() as d:

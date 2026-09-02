@@ -672,7 +672,31 @@ def log_has_fail_marker(path):
     return False
 
 
-def ceiling_only_failure(run_summary_path, shard_log_path):
+def any_log_has_fail_marker(paths):
+    """True if ANY of `paths` carries a `^[ FAIL ]` line, False if none does,
+    None if any of them could not be read.
+
+    None is "cannot classify", which every caller must treat as "assume the
+    worst" — an unreadable log could be hiding the very marker being looked
+    for. Short-circuits on the first True."""
+    unreadable = False
+    for path in paths:
+        r = log_has_fail_marker(path)
+        if r is None:
+            unreadable = True
+            continue
+        if r:
+            return True
+    return None if unreadable else False
+
+
+def shard_log_paths(logdir):
+    """Every `shard.<name>.<i>.log` in `logdir`, sorted. [] if unreadable."""
+    return sorted(glob.glob(os.path.join(logdir, "shard.*.log")))
+
+
+def ceiling_only_failure(run_summary_path, shard_log_path,
+                         shard_logs_dir=None):
     """True iff the run's ONLY defect is a ceiling kill — i.e. it is retryable.
 
     A shard killed at BEZEL_SHARD_TIMEOUT leaves the AOT bincache ~95% warm, so
@@ -693,11 +717,42 @@ def ceiling_only_failure(run_summary_path, shard_log_path):
         cannot clear;
       * `subset_empty` false          — a subset that selected 0 tests (#2100)
         validated nothing and would select 0 again;
-      * no `[ FAIL ]` in the gate log — a test that RAN and failed is a real
-        regression, whatever else happened.
+      * every missing summary is EXPLAINED by a ceiling kill, i.e.
+        `missing_summary_shards` is a subset of `timed_out_shards`;
+      * no `[ FAIL ]` in any log examined — a test that RAN and failed is a
+        real regression, whatever else happened.
+
+    sharpen #3668: the last two conjuncts close two shapes that classified as
+    retryable but are not.
+
+      (a) An ASYMMETRIC summary mismatch on shard X (one source present, the
+          other absent) alongside a ceiling kill on shard Y that had already
+          printed a `[ FAIL ]`. run_parallel exits at :233 or :251 on that
+          mismatch — BEFORE the `--- failing tests ---` block at :317-322 — so
+          the GATE LOG carries no `[ FAIL ]` line at all and a gate-log-only
+          scan sees a clean ceiling kill. Hence `shard_logs_dir`: when the
+          per-shard logs are still on disk (run_parallel's `_rp_keep` trap
+          keeps them on a failure), scan those too. X is also in
+          `missing_summary_shards` and NOT in `timed_out_shards`, so the
+          subset conjunct rejects the shape even when the logs are gone.
+      (b) rc==0 with NO summary — a shard that exited cleanly having validated
+          none of its slice. It is in neither `crashed_shards` nor
+          `timed_out_shards`, so before the subset conjunct nothing rejected
+          it. It is a coverage defect, not a ceiling kill, and a retry is not
+          the right response.
+
+    A fifth conjunct `total_fail == 0` was considered and DECLINED as
+    redundant: a shard that completed with failures exits nonzero, so it is
+    already in `crashed_shards` and the second conjunct rejects it.
+
+    `shard_logs_dir` is optional: None scans only the gate log. When it IS
+    given it must be an existing directory — a caller that asks for the
+    per-shard scan and cannot get it is in the "cannot classify" state, not
+    the "nothing found" state. A directory holding no `shard.*.log` (reaped
+    logs) contributes no evidence and is not itself a defect.
 
     Returns False (never True) when the run summary is missing, unparseable or
-    carries the wrong schema, and when the shard log cannot be read: "cannot
+    carries the wrong schema, and whenever a log cannot be read: "cannot
     classify" must never read as "retryable", because an unreadable log could
     be hiding a `[ FAIL ]`. The CLI reports those inputs as exit 2 so a caller
     can tell them apart from a confident "no".
@@ -705,13 +760,22 @@ def ceiling_only_failure(run_summary_path, shard_log_path):
     obj = read_shard_summary(run_summary_path)
     if obj is None or obj.get("schema") != RUN_SCHEMA:
         return False
-    if not obj.get("timed_out_shards"):
+    timed_out = obj.get("timed_out_shards") or []
+    if not timed_out:
         return False
     if obj.get("crashed_shards"):
         return False
     if obj.get("subset_empty"):
         return False
-    return log_has_fail_marker(shard_log_path) is False
+    # Every shard that printed no summary must be one the ceiling killed.
+    if not set(obj.get("missing_summary_shards") or []).issubset(set(timed_out)):
+        return False
+    paths = [shard_log_path]
+    if shard_logs_dir is not None:
+        if not os.path.isdir(shard_logs_dir):
+            return False  # asked for the scan and could not do it
+        paths += shard_log_paths(shard_logs_dir)
+    return any_log_has_fail_marker(paths) is False
 
 
 # `shard <group>.<index>: <seconds>s` — the per-shard wall-time line
@@ -897,6 +961,22 @@ def format_failure_banner(ran, expected, nbin, undercount_bins, subset_empty,
     return "\n".join(lines)
 
 
+def both_absent_shards(logdir):
+    """Shard IDs ("name/idx") for which NEITHER a JSON nor a legacy summary
+    exists — the ceiling-kill shape check_agreement now treats as agreement
+    (narrow #3667). Reported by _main_check so "0 mismatches" never reads as
+    "every shard reported in"."""
+    legacy = {(s["binary"], s["shard_index"]): s["legacy"]
+              for s in read_legacy_summaries(logdir)}
+    structured = {(s["binary"], s["shard_index"]): s["json"]
+                  for s in read_shard_summaries(logdir)}
+    out = []
+    for key in sorted(set(legacy) | set(structured)):
+        if legacy.get(key) is None and structured.get(key) is None:
+            out.append("%s/%d" % key)
+    return out
+
+
 def _main_check(logdir):
     mismatches = check_agreement(logdir)
     n_json = len(read_shard_summaries(logdir))
@@ -913,8 +993,16 @@ def _main_check(logdir):
         # assertion treat a mismatch as a hard failure while the observation
         # call still swallows it with `|| true`.
         return 1
+    # sharpen #3668: a both-absent shard is AGREEMENT (narrow #3667), but
+    # silence about it makes "0 mismatches" read as "every shard reported in".
+    # Say how many produced nothing and point at the banner that details them.
+    absent = both_absent_shards(logdir)
+    note = ""
+    if absent:
+        note = ("; {} shard(s) produced no summary at all — see the banner: {}"
+                .format(len(absent), " ".join(absent)))
     print("shard-summary agreement: 0 mismatches over {} JSON summaries "
-          "(observation-only)".format(n_json))
+          "(observation-only){}".format(n_json, note))
     return 0
 
 
@@ -990,8 +1078,16 @@ def _main_format_failure(argv):
     p.add_argument("--njobs", type=int, required=True, help="total shard count")
     p.add_argument("--undercount", nargs="*", default=[],
                    help="per-binary undercount bin strings")
-    p.add_argument("--missing-summary", nargs="*", default=[],
-                   help="shard IDs (name/idx) that printed no summary")
+    # sharpen #3668: REQUIRED, not defaulted. The completed-shard suppression
+    # keys on ABSENCE from this list, so a caller that omits the flag relabels
+    # every genuinely crashed shard "completed its slice" and drops its
+    # `died on:` line — arbitration then loses a real suspect. A defaulted
+    # empty list is a FAIL-OPEN default for a safety decision; make forgetting
+    # it a usage error instead. run_parallel.sh:364 already passes it always
+    # (an empty bash array expands to zero args, which nargs="*" accepts).
+    p.add_argument("--missing-summary", nargs="*", required=True,
+                   help="shard IDs (name/idx) that printed no summary; pass "
+                        "the flag with no values when none did")
     p.add_argument("--crashed", nargs="*", default=[],
                    help="shard IDs (name/idx) that exited nonzero")
     # narrow #3222: ceiling-killed shards are passed separately so the banner
@@ -1037,17 +1133,31 @@ def _main_ceiling_only(argv):
     p.add_argument("run_summary", help="the BEZEL_RUN_SUMMARY JSON path")
     p.add_argument("--shard-log", required=True,
                    help="the gate's shard log (gate.sh's $S/gate_shard.log)")
+    p.add_argument("--shard-logs-dir", default=None,
+                   help="run_parallel's shard logdir; when given, its "
+                        "shard.*.log files are scanned for [ FAIL ] too "
+                        "(the gate log alone can be missing them, see "
+                        "ceiling_only_failure case (a))")
     args = p.parse_args(argv)
     obj = read_shard_summary(args.run_summary)
     if obj is None or obj.get("schema") != RUN_SCHEMA:
         sys.stderr.write("summary.py ceiling-only: no usable run summary at "
                          "%s\n" % args.run_summary)
         return 2
-    if log_has_fail_marker(args.shard_log) is None:
-        sys.stderr.write("summary.py ceiling-only: unreadable shard log %s\n"
-                         % args.shard_log)
+    paths = [args.shard_log]
+    if args.shard_logs_dir is not None:
+        if not os.path.isdir(args.shard_logs_dir):
+            sys.stderr.write("summary.py ceiling-only: --shard-logs-dir %s is "
+                             "not a directory\n" % args.shard_logs_dir)
+            return 2
+        paths += shard_log_paths(args.shard_logs_dir)
+    if any_log_has_fail_marker(paths) is None:
+        sys.stderr.write("summary.py ceiling-only: unreadable shard log among "
+                         "%s\n" % " ".join(paths))
         return 2
-    return 0 if ceiling_only_failure(args.run_summary, args.shard_log) else 1
+    return 0 if ceiling_only_failure(
+        args.run_summary, args.shard_log,
+        shard_logs_dir=args.shard_logs_dir) else 1
 
 
 def _main_shard_times(argv):

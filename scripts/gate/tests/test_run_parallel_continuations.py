@@ -71,7 +71,13 @@ class FormatFailureArgvTest(unittest.TestCase):
     """The specific call #3300 amputated must carry every REQUIRED flag."""
 
     # Sourced from scripts/gate/summary.py's format-failure parser.
-    REQUIRED = ('--ran', '--expected', '--nbin', '--njobs', '--logdir')
+    # sharpen #3668: --missing-summary joined the required set. The
+    # completed-shard suppression in format_failure_banner keys on ABSENCE
+    # from that list, so a defaulted empty list is a fail-open default: a
+    # caller that forgets the flag relabels every crashed shard "completed
+    # its slice" and drops its `died on:` suspect.
+    REQUIRED = ('--ran', '--expected', '--nbin', '--njobs', '--logdir',
+                '--missing-summary')
 
     def _invocation(self):
         text = SCRIPT.read_text()
