@@ -155,39 +155,44 @@ message(STATUS
 # Everything below is identical for every group; only the source list differs.
 # It lives in a function so the targets cannot drift apart — a group compiled
 # with different flags would be a different oracle.
-set(BEZEL_TEST_TARGETS "")
-set(BEZEL_TEST_PCH_OWNER "")
-function(bezel_add_test_binary group)
-    set(tgt bezel_tests_${group})
-    add_executable(${tgt} ${BEZEL_TEST_ENTRY} ${BEZEL_TEST_SOURCES_${group}})
+#
+# fix #3172: the PCH used to be owned by whichever group configured first
+# (codegen, ~1,357 of ~2,094 TUs) and every other group REUSE_FROM'd it. Per
+# `cmake --help-command target_precompile_headers`, the REUSE_FROM form "adds
+# a dependency such that <target> will depend on <other_target>" — the WHOLE
+# owner target, not just its .pch artifact — so `--area module` scheduled all
+# of codegen's compile actions before its own ~140 (#3172, measured ~2,228
+# codegen actions against 30 module ones). bezel_tests_pch below is a
+# dedicated one-TU OBJECT library that owns the PCH instead: the REUSE_FROM
+# dependency now lands on a target with exactly one (dummy, never-edited)
+# source, so no other group's compile is dragged in by it.
+#
+# The same doc also says REUSE_FROM "requires the same set of compiler
+# options, compiler flags and compiler definitions for both <target> and
+# <other_target>" — so bezel_test_apply_common_compile_settings() below
+# applies the include dirs, link usage-requirements (bezel_core, for the LLVM
+# include dirs the 12 PCH headers need; bezel_warnings for -Wall/-Wextra
+# /-Wpedantic) and compile definitions identically to bezel_tests_pch AND
+# every group target, from ONE place, so they cannot drift apart.
+function(bezel_test_apply_common_compile_settings tgt)
     target_include_directories(${tgt} PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}
         ${CMAKE_SOURCE_DIR}/src)
-    # Precompiled header: the LLVM (+ a few ubiquitous std) headers dominate the
-    # ~209K preprocessed lines every test TU re-parses, and they are identical
-    # across all of them. Precompiling them once cuts the per-TU compile by
-    # ~40%. Only the HEAVY, STABLE headers are listed — deliberately NOT the
-    # bezel sema/codegen headers, which change often: putting a frequently-edited
-    # header in the PCH would invalidate it (and force a full test rebuild) on
-    # every such edit. ONE PCH is built (by the first group) and REUSE_FROM'd by
-    # the rest: per-target PCHs would mean N identical PCH compiles and, worse, a
-    # different `-include-pch` path per target — which is part of the ccache key.
-    # NOTE (machine-local, not tracked): ccache needs `sloppiness =
-    # pch_defines,time_macros` (~/.config/ccache/ccache.conf) to cache PCH
-    # builds — see the build-accelerators note in CLAUDE.md.
-    if(BEZEL_TEST_PCH_OWNER)
-        target_precompile_headers(${tgt} REUSE_FROM ${BEZEL_TEST_PCH_OWNER})
-    else()
-        target_precompile_headers(${tgt} PRIVATE
-            <cstddef> <cstdlib> <functional> <memory>
-            <string> <string_view> <utility> <vector>
-            <llvm/IR/LLVMContext.h>
-            <llvm/IR/Module.h>
-            <llvm/ExecutionEngine/Orc/LLJIT.h>
-            <llvm/ExecutionEngine/Orc/ExecutionUtils.h>)
-        set(BEZEL_TEST_PCH_OWNER ${tgt} PARENT_SCOPE)
-    endif()
     target_link_libraries(${tgt} PRIVATE bezel_core bezel_warnings)
+    # fix #3172: -gline-tables-only, NOT -g0 — the AOT harness still needs a
+    # symbolized backtrace out of a crashing forked test child (file:line),
+    # and -gline-tables-only keeps that while dropping the full variable/type
+    # debug info the RelWithDebInfo build type's plain -g would otherwise
+    # emit for every one of the ~2,094 test TUs. This is a new flag, so it is
+    # a ccache key change — paid once as a full test rebuild, a cache hit on
+    # every build after. Orthogonal to the CMAKE_BUILD_TYPE=RelWithDebInfo /
+    # -DNDEBUG decision above (#3013): that one is about optimization level
+    # and live asserts; this one is only about how much debug info a TEST TU
+    # carries. bezel_core — the compiler library actually under test — is
+    # UNAFFECTED and keeps full `-g`: a crash inside the forked
+    # Driver::compileFile child needs full frames, since that is the code
+    # being tested, not the harness driving it.
+    target_compile_options(${tgt} PRIVATE -gline-tables-only)
     # Teach the AOT harness's content-addressed link-cache
     # (support/aot_support.hpp) the path to libbezel_runtime.a, so it can fold
     # the runtime archive's identity into the cache key (constraint (b)/(d)): a
@@ -235,6 +240,42 @@ function(bezel_add_test_binary group)
         # so a "zero hits expected" ratchet passes having scanned nothing.
         # Same fix: an absolute -D no path-rewriting wrapper touches.
         BEZEL_REPO_ROOT_DIR="${CMAKE_SOURCE_DIR}")
+endfunction()
+
+set(BEZEL_TEST_TARGETS "")
+
+# The PCH owner: one dummy, never-edited TU, written into the BINARY dir (not
+# tests/) so it is invisible to the tests/**/*.cpp glob and the two partition
+# FATAL_ERROR invariants above.
+file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/pch_owner.cpp "// #3172 PCH owner TU\n")
+add_library(bezel_tests_pch OBJECT ${CMAKE_CURRENT_BINARY_DIR}/pch_owner.cpp)
+bezel_test_apply_common_compile_settings(bezel_tests_pch)
+# Precompiled header: the LLVM (+ a few ubiquitous std) headers dominate the
+# ~209K preprocessed lines every test TU re-parses, and they are identical
+# across all of them. Precompiling them once cuts the per-TU compile by
+# ~40%. Only the HEAVY, STABLE headers are listed — deliberately NOT the
+# bezel sema/codegen headers, which change often: putting a frequently-edited
+# header in the PCH would invalidate it (and force a full test rebuild) on
+# every such edit. ONE PCH is built (by this dedicated owner target) and
+# REUSE_FROM'd by every group: per-target PCHs would mean N identical PCH
+# compiles and, worse, a different `-include-pch` path per target — which is
+# part of the ccache key.
+# NOTE (machine-local, not tracked): ccache needs `sloppiness =
+# pch_defines,time_macros` (~/.config/ccache/ccache.conf) to cache PCH
+# builds — see the build-accelerators note in CLAUDE.md.
+target_precompile_headers(bezel_tests_pch PRIVATE
+    <cstddef> <cstdlib> <functional> <memory>
+    <string> <string_view> <utility> <vector>
+    <llvm/IR/LLVMContext.h>
+    <llvm/IR/Module.h>
+    <llvm/ExecutionEngine/Orc/LLJIT.h>
+    <llvm/ExecutionEngine/Orc/ExecutionUtils.h>)
+
+function(bezel_add_test_binary group)
+    set(tgt bezel_tests_${group})
+    add_executable(${tgt} ${BEZEL_TEST_ENTRY} ${BEZEL_TEST_SOURCES_${group}})
+    bezel_test_apply_common_compile_settings(${tgt})
+    target_precompile_headers(${tgt} REUSE_FROM bezel_tests_pch)
     # Force all bezel_runtime object files in, then export-dynamic so a
     # process-symbol-table lookup resolves bz_array_*, bz_dict_*, etc.
     target_link_options(${tgt} PRIVATE
