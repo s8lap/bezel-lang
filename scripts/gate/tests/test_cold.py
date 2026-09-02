@@ -11,6 +11,9 @@ The load-bearing pins the task requires:
 
 Plus: evaluate() returns the ColdResult triple; count_cache fail-safe (0 on a
 missing root); the threshold boundary (1999 cold, 2000 warm).
+  4. (#3690) count_cache counts ENTRIES: the `<entry>.sz` size sidecars a
+     no-fsync-mode store writes (#3669) and in-flight `.tmp.` temps (#3003)
+     are excluded, so cache_n cannot double toward the TIGHTER warm ceiling.
 """
 
 import os
@@ -138,7 +141,9 @@ class CountCacheFindLTest(unittest.TestCase):
 
     def test_invokes_find_with_dash_L(self):
         # The -L must be literal in the argv (auditable), not an os.walk
-        # equivalent: the faithful port of gate.sh:599 is `find -L <root> -type f`.
+        # equivalent: the faithful port of gate.sh:599 is `find -L <root> -type f`
+        # (the #3690 entry-only exclusions follow it; see
+        # CountCacheCountsEntriesOnlyTest.test_argv_excludes_sidecars_and_temps_literally).
         with tempfile.TemporaryDirectory() as d:
             cache = os.path.join(d, "c")
             self._seed(cache, 2)
@@ -185,6 +190,96 @@ class CountCacheFindLTest(unittest.TestCase):
                 with open(os.path.join(cache, name), "wb") as f:
                     f.write(b"x")
             self.assertEqual(cold.count_cache(cache), 3)
+
+
+class CountCacheCountsEntriesOnlyTest(unittest.TestCase):
+    """Pin 4 (#3690): count_cache counts cache ENTRIES, not every file.
+
+    A no-fsync-mode store (BEZEL_AOT_STORE_FSYNC=0, #3669 — the mode the gate
+    runs in since #3690) writes a `<entry>.sz` size sidecar beside every entry.
+    A bare `find -type f` counts both, so cache_n doubles for such entries and
+    COLD_CACHE_THRESHOLD=2000 stops meaning 2000 entries and starts meaning
+    ~1000. That error is NOT fail-safe: it biases the verdict toward WARM, whose
+    900s ceiling is the TIGHTER one — a shard killed at the ceiling on a store
+    that is colder than the count says. In-flight `.tmp.` store temps (#3003)
+    are not entries either. Pin 2's `-L` still holds with the exclusions.
+    """
+
+    def _seed(self, root, n, sidecars=False):
+        os.makedirs(root, exist_ok=True)
+        for i in range(n):
+            entry = os.path.join(root, "%064x" % i)   # entries are 64-hex keys
+            with open(entry, "wb") as f:
+                f.write(b"x")
+            if sidecars:
+                with open(entry + ".sz", "w") as f:
+                    f.write("1")
+
+    def test_size_sidecars_are_not_entries(self):
+        with tempfile.TemporaryDirectory() as d:
+            cache = os.path.join(d, "c")
+            self._seed(cache, 7, sidecars=True)
+            self.assertEqual(cold.count_cache(cache), 7,
+                             "N entries + N `.sz` sidecars must count N, not 2N")
+
+    def test_sidecars_cannot_lift_a_cold_store_over_the_threshold(self):
+        # THE error-direction pin. 1500 real entries is COLD (< 2000). Counted
+        # with their 1500 sidecars the store reads 3000 => WARM => the 900s
+        # ceiling on a store that will miss nearly everything. cache_n is 1500.
+        with tempfile.TemporaryDirectory() as d:
+            cache = os.path.join(d, "c")
+            self._seed(cache, 1500, sidecars=True)
+            r = cold.evaluate(False, cache, False)
+            self.assertEqual(r.cache_n, 1500)
+            self.assertIs(r.cold, True)
+            self.assertEqual(r.ceiling, cold.CEILING_COLD)
+
+    def test_store_temps_are_not_entries(self):
+        # The three temp shapes the harness writes (tests/support/aot_support.hpp:
+        # the entry temp `<key>.tmp.<pid>.<n>`, the copy temp `.tmp.<pid>.<n>`
+        # and the sidecar temp `.tmp.sz.<pid>.<n>`). The store's own GC never
+        # counts them as entries either (#3003).
+        with tempfile.TemporaryDirectory() as d:
+            cache = os.path.join(d, "c")
+            self._seed(cache, 3)
+            for name in ("%064x.tmp.4242.0" % 9, ".tmp.4242.1", ".tmp.sz.4242.2"):
+                with open(os.path.join(cache, name), "wb") as f:
+                    f.write(b"x")
+            self.assertEqual(cold.count_cache(cache), 3)
+
+    def test_symlinked_root_with_sidecars_keeps_the_real_entry_count(self):
+        # #3000 x #3690: the exclusions must not cost the -L. A symlinked root
+        # holding 5 entries + 5 sidecars reads 5 — not 0 and not 10.
+        with tempfile.TemporaryDirectory() as d:
+            real = os.path.join(d, "real-store")
+            self._seed(real, 5, sidecars=True)
+            link = os.path.join(d, "linked-store")
+            os.symlink(real, link)
+            self.assertEqual(cold.count_cache(link), 5)
+
+    def test_argv_excludes_sidecars_and_temps_literally(self):
+        # Auditable in the argv, like the -L: `! -name '*.sz'` and
+        # `! -name '*.tmp.*'` after `-type f`.
+        with tempfile.TemporaryDirectory() as d:
+            cache = os.path.join(d, "c")
+            self._seed(cache, 1)
+            seen = {}
+            real_run = subprocess.run
+
+            def capture(argv, **kw):
+                seen["argv"] = argv
+                return real_run(argv, **kw)
+
+            try:
+                cold.subprocess.run = capture
+                self.assertEqual(cold.count_cache(cache), 1)
+            finally:
+                cold.subprocess.run = real_run
+            argv = seen["argv"]
+            self.assertEqual(argv[:5], ["find", "-L", cache, "-type", "f"], argv)
+            triples = [argv[i:i + 3] for i in range(5, len(argv))]
+            self.assertIn(["!", "-name", "*.sz"], triples, argv)
+            self.assertIn(["!", "-name", "*.tmp.*"], triples, argv)
 
 
 class EvaluateTest(unittest.TestCase):
@@ -294,6 +389,20 @@ class CLITest(unittest.TestCase):
             os.makedirs(cache)
             for i in range(3):
                 open(os.path.join(cache, "e%d" % i), "wb").close()
+            r = self._run_cli(["evaluate", "--cache-root", cache,
+                               "--identity-changed", "0", "--marker-changed", "0"])
+            env = self._eval_sourceable(r)
+            self.assertEqual(env["cache_n"], "3")
+
+    def test_cache_n_excludes_size_sidecars(self):
+        # #3690: the value gate.sh evals is the ENTRY count; the `<entry>.sz`
+        # sidecars a no-fsync-mode store writes (#3669) are not entries.
+        with tempfile.TemporaryDirectory() as d:
+            cache = os.path.join(d, "c")
+            os.makedirs(cache)
+            for i in range(3):
+                open(os.path.join(cache, "e%d" % i), "wb").close()
+                open(os.path.join(cache, "e%d.sz" % i), "wb").close()
             r = self._run_cli(["evaluate", "--cache-root", cache,
                                "--identity-changed", "0", "--marker-changed", "0"])
             env = self._eval_sourceable(r)

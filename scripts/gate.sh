@@ -744,6 +744,30 @@ fi
 # A caller's explicit BEZEL_SHARD_TIMEOUT always wins (see GATE_EXPLICIT_STO).
 sto="$GATE_EXPLICIT_STO"; [ -z "$sto" ] && sto=$ceiling
 SHARD_ENV+=(BEZEL_SHARD_TIMEOUT="$sto")
+# fix #3690: the gate's bincache stores run WITHOUT the #3009 fsync pair
+# (BEZEL_AOT_STORE_FSYNC=0, #3669). The harness compensates with a `<entry>.sz`
+# size sidecar that installFromCache verifies on EVERY read — a size
+# disagreement is a counted miss (`verify_rejects=` on the [aot-cache] line),
+# never a run of a torn executable — so the property #3009 bought survives by
+# verification instead of durability. Measured before the flip:
+# store_fsyncs=27195 on the last ASan pass (2026-09-03), about twice that in
+# fsync(2) calls, ~4% of a cold cycle, paid every cycle (46/46 gates cold).
+# The verification is SIZE-ONLY (a same-size corruption is not caught), which
+# is a slightly weaker guarantee than #3009 shipped, accepted in #3690.
+#
+# PLACEMENT IS LOAD-BEARING. This must FOLLOW the ASan branch above, which
+# REASSIGNS SHARD_ENV (a `+=` up in the seeding block is silently dropped on
+# every --full pass — the pass with ~27k stores), and PRECEDE both run sites
+# (canary and main) so every store the gate makes is in one mode and
+# `store_fsyncs=0` on the aggregate line is a checkable entry criterion.
+# Evidence lives on that line in $S/gate_shard.log (store_fsync_skipped= /
+# verify_rejects=, #3669) and is deliberately NOT a telemetry key
+# (test_telemetry pins the 29-key record). scripts/gate/cold.py count_cache
+# excludes the sidecars, or cache_n would double toward the TIGHTER (warm,
+# 900s) ceiling. gate_arbitrate's re-runs build their own env and so store in
+# the default (fsync) mode; that is harmless — verify-on-read is unconditional
+# on the reader — and costs one fsync pair per arbitrated suspect.
+SHARD_ENV+=(BEZEL_AOT_STORE_FSYNC=0)
 core_note="unchanged"; [ "$core_post" != "$CORE_MTIME_PRE" ] && core_note="rebuilt"
 cold_note="warm-predicted"; [ "$GATE_COLD" -eq 1 ] && cold_note="cold-predicted"
 _sto_label="plain"; [ "$ASAN" -eq 1 ] && _sto_label="ASan"
@@ -753,6 +777,9 @@ _mult_note=""; [ "$ASAN" -eq 1 ] && _mult_note=", x${ASAN_STO_MULT} for ASan (#3
 # --full this line is also the "ASan" evidence assert-asan-ran greps for
 # (via $_sto_label) — it must keep carrying that word.
 echo "   $_sto_label shard ceiling: ${sto}s ($cold_note: core.a $core_note, bincache entries=$cache_n, identity $gate_id_note$_mult_note) attempt=${BEZEL_GATE_ATTEMPT:-standalone}"
+# fix #3690: say which store mode the shards run in, beside the ceiling they
+# run under; `bincache entries=` above is now an ENTRY count (no sidecars).
+echo "   store fsync: OFF (verify-on-read, #3669)"
 
 # lit + FileCheck diagnostic track (tests/lit/): drives the REAL bezelc over .bzl
 # files and matches diagnostics with FileCheck. Fast (~0.1s/test, no JIT) and

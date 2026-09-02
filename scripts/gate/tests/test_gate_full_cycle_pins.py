@@ -79,6 +79,11 @@ pins drive the EXTRACTED rc!=0 block and gate_shard_logdir() against the REAL
 gate.summary over a fixture logdir, so the 0/1/2 contract is exercised, not
 just spelled. Every section-5 test FAILED at e9a10c7 except the two marked
 GUARD.
+
+  6. fix #3690: gate.sh stores without the #3009 fsync pair
+     (SHARD_ENV+=(BEZEL_AOT_STORE_FSYNC=0), #3669) AFTER the ASan branch
+     reassigns SHARD_ENV and BEFORE both run sites, and logs it beside
+     the ceiling line.                             -> GateShStoreFsyncOffTest
 """
 
 import json
@@ -1086,6 +1091,106 @@ class CondensedShardLogTest(unittest.TestCase):
             for keep in ("## GATE FAILURE: shard crash / undercount",
                          "died on: c.d", "--- failing tests ---", "TOTAL: 20148 passed"):
                 self.assertIn(keep, r.stdout)
+
+
+# ---------------------------------------------------------------------------
+# 6. fix #3690: the gate stores without the #3009 fsync pair
+#    (BEZEL_AOT_STORE_FSYNC=0, #3669) and logs that it does.
+# ---------------------------------------------------------------------------
+
+# The exact code line, the ASan branch's REASSIGNMENT it must follow, and the
+# exact log line the next gate's log is read for.
+_STORE_FSYNC_ADD = "SHARD_ENV+=(BEZEL_AOT_STORE_FSYNC=0)"
+_ASAN_REASSIGN = "SHARD_ENV=(env BEZEL_AOT_FORCE_SANITIZE=address)"
+_STORE_FSYNC_LOG = "store fsync: OFF (verify-on-read, #3669)"
+
+
+class GateShStoreFsyncOffTest(unittest.TestCase):
+    """Source pins on the flip (#3690), plus a bash REPLAY of the SHARD_ENV
+    assignment lines in file order.
+
+    The hazard the ordering pins exist for: gate.sh's ASan branch does not
+    extend SHARD_ENV, it REASSIGNS it (`SHARD_ENV=(env BEZEL_AOT_FORCE_SANITIZE=
+    address)`), so a `+=` placed in the block where SHARD_ENV is seeded would be
+    silently dropped on every --full pass — the flag would look set in the
+    source, the plain pass would skip its fsyncs, and the ASan pass (the one
+    with ~27k stores) would keep paying them. The replay proves the flag
+    survives BOTH oracles, and that `env` is still the array's first word
+    (dev_heavy.sh ends in `exec systemd-run ... -- "$@"`, which execs the first
+    word as a FILENAME).
+    """
+
+    def _lines(self):
+        return _code_lines(GATE_SH.read_text())
+
+    def _shard_env_lines(self):
+        """Every CODE line that seeds or extends SHARD_ENV, in file order."""
+        return [(n, ln) for n, ln in self._lines()
+                if re.match(r"\s*SHARD_ENV\+?=\(", ln)]
+
+    def _add_line(self):
+        hits = [n for n, ln in self._shard_env_lines() if ln.strip() == _STORE_FSYNC_ADD]
+        self.assertEqual(len(hits), 1,
+                         "gate.sh must carry exactly one `%s` (fix #3690): %r"
+                         % (_STORE_FSYNC_ADD, hits))
+        return hits[0]
+
+    def test_shard_env_carries_store_fsync_off_exactly_once(self):
+        self._add_line()
+
+    def test_store_fsync_off_follows_the_asan_reassignment(self):
+        reassign = [n for n, ln in self._shard_env_lines()
+                    if ln.strip().startswith(_ASAN_REASSIGN)]
+        self.assertEqual(len(reassign), 1,
+                         "guard: the ASan SHARD_ENV reassignment moved: %r" % reassign)
+        self.assertGreater(self._add_line(), reassign[0],
+                           "the += must come AFTER the ASan branch reassigns "
+                           "SHARD_ENV, or --full silently drops it")
+
+    def test_store_fsync_off_precedes_both_run_sites(self):
+        # canary and main: every store the gate makes is in ONE mode, so
+        # `store_fsyncs=0` on the [aot-cache] aggregate is a checkable criterion.
+        sites = [n for n, ln in self._lines()
+                 if '"${SHARD_ENV[@]}"' in ln and "tests/run_parallel.sh" in ln]
+        self.assertEqual(len(sites), 2,
+                         "guard: two SHARD_ENV run sites expected (canary, main): %r" % sites)
+        add = self._add_line()
+        for n in sites:
+            self.assertLess(add, n, "gate.sh:%d runs the suite before the flag is added" % n)
+
+    def test_replayed_shard_env_keeps_env_first_and_carries_the_flag_in_both_oracles(self):
+        for asan in (0, 1):
+            with self.subTest(asan=asan):
+                lines = [ln for _, ln in self._shard_env_lines()
+                         if asan or not ln.strip().startswith(_ASAN_REASSIGN)]
+                script = ("set -u\nsto=1800\nGATE_RUN_SUMMARY=/dev/null\n"
+                          + "\n".join(lines)
+                          + '\nprintf "%s\\n" "${SHARD_ENV[@]}"\n')
+                r = subprocess.run(["bash", "-c", script],
+                                   capture_output=True, text=True)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                words = r.stdout.splitlines()
+                self.assertEqual(words[:1], ["env"], words)
+                self.assertEqual(words.count("BEZEL_AOT_STORE_FSYNC=0"), 1, words)
+                self.assertEqual("BEZEL_AOT_FORCE_SANITIZE=address" in words,
+                                 bool(asan), words)
+
+    def test_ceiling_block_logs_store_fsync_off_after_the_flag_is_set(self):
+        lines = self._lines()
+        echo = [n for n, ln in lines
+                if ln.lstrip().startswith("echo") and _STORE_FSYNC_LOG in ln]
+        self.assertEqual(len(echo), 1,
+                         "gate.sh must log exactly `%s` once" % _STORE_FSYNC_LOG)
+        ceiling = [n for n, ln in lines
+                   if "shard ceiling:" in ln and ln.lstrip().startswith("echo")]
+        self.assertEqual(len(ceiling), 1)
+        self.assertGreater(echo[0], ceiling[0], "the line belongs with the ceiling echo")
+        self.assertGreater(echo[0], self._add_line(),
+                           "the log must not claim a mode the array does not yet carry")
+        # GUARD: the ASan-evidence grep is a case-insensitive `asan|sanitize`
+        # (gate.cycle assert_asan_ran); this line prints on the PLAIN pass too
+        # and must not manufacture that evidence.
+        self.assertNotRegex(_STORE_FSYNC_LOG, r"(?i)asan|sanitize")
 
 
 if __name__ == "__main__":

@@ -39,6 +39,15 @@ the -L. The count is also oracle-blind: entry filenames are content-addressed,
 so the `sa=` bit is not inspectable; per #2918 the per-oracle marker is what
 forces the cold verdict.
 
+THE EXCLUSIONS (#3690). The count is of ENTRIES: `! -name '*.sz'` drops the
+`<entry>.sz` size sidecars a no-fsync-mode store writes beside every entry
+(BEZEL_AOT_STORE_FSYNC=0, #3669 — the mode the gate runs in since #3690), and
+`! -name '*.tmp.*'` drops in-flight/orphaned store temps (#3003). Without the
+first, cache_n doubles for no-fsync entries and the 2000 threshold means ~1000
+real entries; the error direction is toward WARM, whose 900s ceiling is the
+TIGHTER one — a shard killed at the ceiling on a store colder than the count
+says. Not fail-safe, hence excluded rather than tolerated.
+
 Stdlib only (no pytest). See test_cold.py for the truth-table + find-L pins.
 """
 
@@ -91,18 +100,36 @@ def ceiling(cold):
 
 
 def count_cache(path):
-    """Count the files in the AOT bincache at `path`. per #3000 (gate.sh:599).
+    """Count the ENTRIES in the AOT bincache at `path`. per #3000 (gate.sh:599)
+    and #3690.
 
-    Uses `find -L <path> -type f` — the `-L` is LOAD-BEARING: the default cache
-    root is a SYMLINK (/var/tmp/bezel-scratch/aot-bincache -> /mnt/fast/...),
-    and `find` without `-L` does not traverse a symlinked START POINT, returning
-    0 against a store of 102,299 entries. Returns 0 on any error (the bash
-    `2>/dev/null` swallow); an inaccessible/absent store is cold by signal 2
-    regardless, so 0 here is fail-safe.
+    Uses `find -L <path> -type f ! -name '*.sz' ! -name '*.tmp.*'`.
+
+    The `-L` is LOAD-BEARING: the default cache root is a SYMLINK
+    (/var/tmp/bezel-scratch/aot-bincache -> /mnt/fast/...), and `find` without
+    `-L` does not traverse a symlinked START POINT, returning 0 against a store
+    of 102,299 entries.
+
+    The two `! -name` predicates (#3690) keep the count meaning what
+    COLD_CACHE_THRESHOLD assumes — cache entries, not files:
+      * `<entry>.sz` is the size sidecar a no-fsync-mode store writes beside
+        every entry (BEZEL_AOT_STORE_FSYNC=0, #3669; the gate's mode since
+        #3690). Counting it doubles cache_n for such entries and biases the
+        verdict toward WARM — the TIGHTER (900s) ceiling — on a store that is
+        colder than the count says. The sidecar suffix cannot collide with an
+        entry name (entries are 64-hex keys, aot_support.hpp cacheSidecarPath).
+      * `.tmp.<pid>.<n>`, `<key>.tmp.<pid>.<n>` and `.tmp.sz.<pid>.<n>` are
+        in-flight (or orphaned, #3003) store temps; the harness's own GC never
+        counts them as entries either.
+
+    Returns 0 on any error (the bash `2>/dev/null` swallow); an
+    inaccessible/absent store is cold by signal 2 regardless, so 0 here is
+    fail-safe.
     """
     try:
         out = subprocess.run(
-            ["find", "-L", str(path), "-type", "f"],
+            ["find", "-L", str(path), "-type", "f",
+             "!", "-name", "*.sz", "!", "-name", "*.tmp.*"],
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             check=False,
