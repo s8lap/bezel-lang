@@ -686,17 +686,25 @@ private:
     // dropped or discarded Subscription is the hard error §21.9 / §17.13 require.
     bool isEventSubscribeDrop(const ast::Expr* e);
 
-    // §28.9 / §22.5 (issue #1684): does `decl`'s class chain make it
+    // §28.9 / §22.5 (issue #1684): does `t`'s class chain make it
     // non-trivial-dispose — a destructor, an owning inline array (§15.1.1),
     // or a non-static `owned` field (declared, or a captured `owned`
-    // primary-constructor parameter, §22.10), anywhere from `decl` up through
-    // its base classes? A thin wrapper over `common::isNonTrivialDisposeClass`
-    // since #2654. The paragraph that used to stand here said the §21.9
-    // bare-discard walk in `visitStmt`'s ExpressionStmt arm was "duplicated
-    // rather than shared because that walk is not exposed as a callable
-    // predicate" — that walk is gone, collapsed onto the same shared predicate
-    // by fix #3588, so there is one body and this claim no longer holds.
-    bool isNonTrivialDisposeClass(TypeSymbol* decl) const;
+    // primary-constructor parameter, §22.10, or of a NON-trivial-dispose
+    // type per §28.9's recursive clause), anywhere from `t`'s declaration up
+    // through its base classes? A thin wrapper over
+    // `common::isNonTrivialDisposeClass` since #2654. The paragraph that
+    // used to stand here said the §21.9 bare-discard walk in `visitStmt`'s
+    // ExpressionStmt arm was "duplicated rather than shared because that
+    // walk is not exposed as a callable predicate" — that walk is gone,
+    // collapsed onto the same shared predicate by fix #3588, so there is one
+    // body and this claim no longer holds.
+    //
+    // fix #3647 (§28.9 / §3.6 rule 2, v0.286): takes a `TypeRef` (not a bare
+    // `TypeSymbol`) and adopts the widened `TypeRef+SemaContext` overload,
+    // so this wrapper's callers see the §28.9 recursive clause and §3.6
+    // rule 2's per-instantiation substitution instead of the pre-#3632
+    // conservative "any owned field disqualifies" reading.
+    bool isNonTrivialDisposeClass(const TypeRef* t) const;
 
     // §22.5 v0.184 (issue #1684): is `e` a fresh owned-producing expression —
     // `new T()` or a call to an `owned`-returning method — whose produced

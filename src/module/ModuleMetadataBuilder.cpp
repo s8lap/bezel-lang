@@ -1781,7 +1781,28 @@ MetaTypeDecl convertTypeDecl(const sema::TypeSymbol& t, sema::SemaContext& ctx,
     // the class kinds have one — the predicate's walk is over class members and
     // base classes — and it is a pure read of `t`, which is why the parameter is
     // `const` (see OwnershipFacts.hpp).
-    out.nonTrivialDispose = common::isNonTrivialDisposeClass(&t);
+    //
+    // fix #3647/#3648 (§28.9 / §3.6 rule 2 / §2.8.2, v0.286): adopt the
+    // TypeRef+SemaContext overload here too, so a freshly rebuilt exporter's
+    // carried verdict reflects §28.9's recursive clause ("an `owned` field
+    // whose declared type is itself trivial-dispose does not disqualify the
+    // holder") for downstream consumers, exactly as it now does for a
+    // same-module use. `t` (the TypeSymbol under export) has no TypeRef of
+    // its own here — synthesize a bare one, the same "bare TypeRef {
+    // declaration = decl }" idiom `sema::isAutoEqualityBearingChoice` uses
+    // (SymbolCollection.cpp) for an analogous ad-hoc classification. Empty
+    // `genericArgs` on a GENERIC `t` reproduces the pre-#3647 conservative
+    // reading exactly (§3.6 rule 2 is inherently per-INSTANTIATION — the
+    // exporter describes the declaration, not an instantiation — and the
+    // widened walk's own per-instantiation substitution is a no-op without
+    // genericArgs, falling through to its "still-bare parameter" conservative
+    // reject); the schema field's own contract already promises only
+    // "computed verdicts for non-generic public types" (§2.8.2), so this
+    // matches what generic exports already were.
+    sema::TypeRef selfRef;
+    selfRef.kind = sema::TypeRef::Kind::Named;
+    selfRef.declaration = const_cast<sema::TypeSymbol*>(&t);
+    out.nonTrivialDispose = common::isNonTrivialDisposeClass(&selfRef, ctx);
 
     // fix #3139 (§9.8 / §18.5 / §21.4 / §2.8.2, family F1 of #3152): the
     // BUILT-IN INTERFACE bases, which the `baseTypeRefs` loop above cannot

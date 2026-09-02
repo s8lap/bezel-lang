@@ -98,9 +98,10 @@ private:
     // §22.15 trivial-dispose — the exact inverse of
     // `common::isNonTrivialDisposeClass`, which is what it now calls (#3588).
     // A class is trivial-dispose iff it has no destructor, no owning inline
-    // array (§15.1.1), no captured `owned` primary-ctor parameter (§22.10) and
-    // no non-static `owned` field, anywhere in its base chain.
-    bool isTrivialDisposeClass(TypeSymbol* decl) const;
+    // array (§15.1.1), no captured `owned` primary-ctor parameter (§22.10),
+    // and no non-static `owned` field OF NON-TRIVIAL-DISPOSE TYPE (§28.9's
+    // recursive clause, fix #3647), anywhere in its base chain.
+    bool isTrivialDisposeClass(const TypeRef* rt) const;
 
     // §22.15 rule 6: a call to a member not pure-declared / pure-classified
     // is rejected. Returns true iff admitted.
@@ -172,7 +173,7 @@ private:
     bool inOperatorCalleeIsPure(const ast::BinaryExpr& be) const;
 };
 
-bool PureBodyWalker::isTrivialDisposeClass(TypeSymbol* decl) const {
+bool PureBodyWalker::isTrivialDisposeClass(const TypeRef* rt) const {
     // fix #3588 (§22.15 / §28.9 / §2.8.2, v0.286): ONE body, in `common/`.
     //
     // What stood here was a second, hand-maintained copy of
@@ -192,7 +193,13 @@ bool PureBodyWalker::isTrivialDisposeClass(TypeSymbol* decl) const {
     // fix #3223's whole subject (an imported destructor-bearing exception type
     // must not be admitted at `throw new E()`), and it is the shared
     // predicate's default.
-    return !common::isNonTrivialDisposeClass(decl);
+    //
+    // fix #3647 (§28.9 / §3.6 rule 2, v0.286): the TypeRef+SemaContext
+    // overload — the sole caller (`throwCarveOutAdmits`) already has the
+    // resolved TypeRef (`rt`, from `ctx_.resolvedType(*ne.type)`) in scope,
+    // so this passes it straight through rather than fabricating a synthetic
+    // one; `ctx_` is this walker's own SemaContext member.
+    return !common::isNonTrivialDisposeClass(rt, ctx_);
 }
 
 bool PureBodyWalker::callTargetIsPure(Symbol* calleeSym) {
@@ -670,7 +677,10 @@ bool PureBodyWalker::throwCarveOutAdmits(const ast::NewExpr& ne) {
     }
     TypeSymbol* targetDecl = rt->declaration;
     if (targetDecl->kind != ast::TypeDeclKind::Class) return false;
-    if (!isTrivialDisposeClass(targetDecl)) return false;
+    // fix #3647: pass the resolved TypeRef `rt` itself (not just its
+    // declaration `targetDecl`), so §3.6 rule 2's per-instantiation
+    // substitution can run.
+    if (!isTrivialDisposeClass(rt)) return false;
     // (a) the invoked constructor must be pure. For a `new E(args)` form
     // the constructor is resolved by the typecheck pass; we look it up by
     // walking targetDecl's constructors and matching arity. Slice 2 admits

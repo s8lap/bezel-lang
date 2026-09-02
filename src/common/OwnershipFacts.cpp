@@ -324,11 +324,48 @@ bool isNonTrivialDisposeClassImpl(
             // null fieldTy (unresolved) is conservative-skip.
             if (fieldTy->kind != sema::TypeRef::Kind::Named) continue;
             if (!fieldTy->declaration) {
-                // A still-bare parameter that did not resolve (the holder
-                // itself is uninstantiated OR the substitution didn't apply).
-                // Conservatively reject — the safe direction; per-instantiation
-                // reclassification at a use site can only RELAX (§28.9 note:
-                // #2183's mirror).
+                // fix #3647 (§28.9 / §3.6 rule 2, v0.286): `declaration ==
+                // nullptr` here has TWO causes, not one. (a) a still-bare
+                // parameter that did not resolve (the holder itself is
+                // uninstantiated, or the substitution didn't apply) — truly
+                // unknown, conservative-reject is right. (b) a substitution
+                // that DID apply, onto a real, resolved stdlib builtin with
+                // NO user TypeSymbol at all — `Random`, `StringBuilder`, the
+                // borrowing collections (`TypeResolution_Names.cpp`'s
+                // "nullary stdlib classes: no user TypeDecl" list) — which
+                // is not unresolved, just symbol-less. Measured: `OwningBox
+                // <Random>` (§28.9's own worked "trivial-dispose for generic
+                // class instantiations" example, substituting the spec's
+                // OwningBox<T> at the stdlib's own worked trivial-dispose
+                // type) fell into the (a) branch and rejected, which is
+                // wrong per §3.6 rule 2 — `Random` unambiguously classifies
+                // trivial-dispose (§28.9's own "Standard library classes
+                // that are trivial-dispose include Random" sentence).
+                //
+                // Case (b) is exactly the question
+                // `MethodOwnership::localIsTrivialDisposeNewBinding`
+                // (Ownership.cpp) already answers for a no-TypeSymbol
+                // builtin at the §28.3 auto-drop gate — reuse its authority,
+                // `common::isChainClaimedBuiltinHeadName`, rather than a
+                // second table. That table names exactly the builtins with
+                // NO user TypeDecl that are ALSO trivial-dispose (the eight
+                // borrowing collections, §28.9/§28.11's "they do not own
+                // their elements"; the five vtable-less builtins Random /
+                // Atomic / AtomicInteger / Stopwatch / Buffer; StringBuilder,
+                // fix #2269's own citation of this same §28.9 sentence) — the
+                // Owning* variants are deliberately absent (they DO own
+                // storage, §28.9's non-trivial worked example), so they
+                // still fall through to the conservative reject below,
+                // unchanged. A head name NOT on the table (including one
+                // this compiler has no builtin-registry entry for at all)
+                // stays the (a) conservative reject — this widens ONLY the
+                // classes the existing authority already calls
+                // trivial-dispose, never a class it does not name.
+                if (!fieldTy->headName().empty() &&
+                    common::isChainClaimedBuiltinHeadName(
+                        fieldTy->headName())) {
+                    continue;  // resolved, and trivial-dispose — not a reject
+                }
                 reject = true;
                 break;
             }

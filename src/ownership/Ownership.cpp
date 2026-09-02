@@ -5529,7 +5529,11 @@ bool MethodOwnership::localIsTrivialDisposeNewBinding(const ast::LocalDecl& ld) 
     }
     sema::TypeSymbol* d = t->declaration;
     if (d->kind != ast::TypeDeclKind::Class) return false;
-    if (common::isNonTrivialDisposeClass(d)) return false;
+    // fix #3647 (§28.9 / §3.6 rule 2, v0.286): the TypeRef+SemaContext
+    // overload — `t` is already the resolved TypeRef this arm classified,
+    // so pass it (and `ctx_`) directly rather than just its declaration,
+    // picking up the §28.9 recursive clause here too.
+    if (common::isNonTrivialDisposeClass(t, ctx_)) return false;
     return true;
 }
 

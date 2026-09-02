@@ -11128,8 +11128,12 @@ void ExprTC::runMethodBody(
 // warning gate consults the SAME classification rather than a third inlined
 // copy. This member is a thin delegating wrapper — every call site here is
 // unchanged, and the relocated body is verbatim.
-bool ExprTC::isNonTrivialDisposeClass(TypeSymbol* decl) const {
-    return common::isNonTrivialDisposeClass(decl);
+bool ExprTC::isNonTrivialDisposeClass(const TypeRef* t) const {
+    // fix #3647 (§28.9 / §3.6 rule 2, v0.286): the TypeRef+SemaContext
+    // overload — was TypeSymbol-only (the pre-#3632 conservative reading),
+    // now threads the active `ctx_` through so the §28.9 recursive clause
+    // and §3.6 rule 2's per-instantiation substitution take effect here.
+    return common::isNonTrivialDisposeClass(t, ctx_);
 }
 
 // §22.5 v0.184 (issue #1684): is `e` a fresh owned-producing expression —
@@ -11161,7 +11165,10 @@ bool ExprTC::exprIsOwnedProducerOfNonTrivialDisposeClass(
         t->declaration->isValueBuiltin) {
         return false;
     }
-    return isNonTrivialDisposeClass(t->declaration);
+    // fix #3647: pass the resolved TypeRef itself (not just its
+    // declaration), so the wrapper's widened overload can see this type's
+    // per-instantiation §3.6 rule 2 substitution.
+    return isNonTrivialDisposeClass(t);
 }
 
 // per §15.4 (v0.268, fix #2673): the BORROWING-FAMILY collection heads named
@@ -11211,7 +11218,12 @@ static bool isSec154BorrowingFamilyHead(std::string_view n) {
 // fix #3307: the verdict is OWNED-element-indexed for the owning head, so
 // the caller can reuse it for diagnostic formatting. Splits from
 // `isSec154BorrowingFamilyHead` so the two are independently testable.
-static bool isSec154BuiltinCollectionNonTrivialDispose(const TypeRef* t) {
+// fix #3647 (§28.9 / §3.6 rule 2, v0.286): takes the active `SemaContext`
+// so the OWNED-element verdict below adopts the widened TypeRef+SemaContext
+// overload (the §28.9 recursive clause) instead of the pre-#3632
+// conservative reading. `ctx` threads from the sole caller's `ctx_`.
+static bool isSec154BuiltinCollectionNonTrivialDispose(
+    const TypeRef* t, const SemaContext& ctx) {
     if (!t || t->kind != TypeRef::Kind::Named) return false;
     if (t->declaration) return false;  // user type — verdict lives elsewhere
     if (!t->astNode || !t->astNode->name || t->astNode->name->parts.empty())
@@ -11232,7 +11244,7 @@ static bool isSec154BuiltinCollectionNonTrivialDispose(const TypeRef* t) {
         return false;  // bare `T` / builtin element — verdict needs substitution
     if (elem->declaration->kind != ast::TypeDeclKind::Class) return false;
     if (elem->declaration->isValueBuiltin) return false;
-    return common::isNonTrivialDisposeClass(elem->declaration);
+    return common::isNonTrivialDisposeClass(elem, ctx);
 }
 
 // per §15.4 (v0.268, fix #2673): "For **borrowing-family** targets …, each
@@ -11328,7 +11340,7 @@ void ExprTC::checkBorrowingFamilyLiteralElements(
         const bool isFreshProducer =
             exprIsOwnedProducerOfNonTrivialDisposeClass(*el) ||
             (dynamic_cast<const ast::CollectionLiteralExpr*>(el) &&
-             isSec154BuiltinCollectionNonTrivialDispose(innerTy));
+             isSec154BuiltinCollectionNonTrivialDispose(innerTy, ctx_));
         if (!isFreshProducer) return;
         const TypeRef* t = innerTy;
         // For the nested-literal arm the element TYPE is a builtin collection
@@ -13308,8 +13320,14 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                     const bool producerIsNew =
                         dynamic_cast<const ast::NewExpr*>(es->expr.get()) !=
                         nullptr;
+                    // fix #3647 (§28.9 / §21.9 / §3.6 rule 2, v0.286): the
+                    // TypeRef+SemaContext overload — `t` is already the
+                    // resolved TypeRef classified above, so this site can
+                    // pass it directly and pick up the §28.9 recursive
+                    // clause (an `owned` field whose declared type is
+                    // itself trivial-dispose no longer disqualifies).
                     if (common::isNonTrivialDisposeClass(
-                            t->declaration,
+                            t, ctx_,
                             producerIsNew
                                 ? common::ImportedDisposeVerdict::Consult
                                 : common::ImportedDisposeVerdict::Ignore)) {

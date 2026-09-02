@@ -242,6 +242,52 @@ inline constexpr std::uint32_t kMetadataMagic = 0x644D7A42; // 'B','z','M','d' L
 // `propertyGetterIsPure` (semantically equivalent to `memberIsPure` for
 // properties across BOTH spellings), which feeds §22.15 rule 6's
 // accessor-read arm.
+//
+// §28.9 / §3.6 rule 3 / §2.8.3 rule 3 (fix #3647/#3648, v0.286, DECLINED
+// bump — record the reasoning, not just the decision): #3632 widened the
+// §28.9 trivial-dispose predicate (an `owned` field of trivial-dispose
+// TYPE no longer disqualifies its holder), and #3647 lands that widening
+// at the exporter above (`out.nonTrivialDispose = ...`), so a rebuilt
+// producer's carried MetaTypeDecl::nonTrivialDispose bit can now read
+// `false` where an older producer read `true` for the SAME source. The
+// filed plan for #3648 called this a wire-format change requiring a
+// bump; it is not, by this constant's own rule stated at its header
+// ("reserved for changes that would make an old reader MISINTERPRET an
+// existing field") — the wire SHAPE of `nonTrivialDispose` (one bool, same
+// position) is unchanged; only the exporter's COMPUTED VALUE for it
+// changes, exactly like every other predicate bug fix that touches
+// exported content, none of which bump this constant. Two things make a
+// bump not just unnecessary but pointless here:
+//   1. `nonTrivialDispose` was ALREADY folded into `semanticHash`
+//      (ModuleMetadata.cpp's `hashTypeDecl`, fix #3191/0bb85f1, citing
+//      §2.8.3 rule 3 by name) and is part of `MetaTypeDecl::operator==`
+//      — the §2.8.3 rule 3 "descriptions must agree" staleness check this
+//      field exists to satisfy is keyed on CONTENT comparison across the
+//      artifact closure, not on this schema counter, so it already
+//      detects a diamond where two dependents embed disagreeing
+//      descriptions of one type, unconditionally of this bump.
+//   2. The `Consult` short-circuit that reads the carried verdict
+//      (`TypeSymbol::importedNonTrivialDispose`, OwnershipFacts.cpp) is a
+//      literal bit-trust, not a re-derivation: an old (pre-#3647)
+//      compiler reading a freshly-rebuilt (post-#3647) dependency reads
+//      its correct, relaxed verdict verbatim; a new compiler reading a
+//      STALE (not-yet-rebuilt) dependency reads its old, MORE-conservative
+//      verdict, which is safe by construction (§28.9's widening is
+//      one-directional: non-trivial -> trivial only, never the reverse,
+//      for a fixed structural input) rather than unsound. Neither
+//      direction needs "reject the artifact until it version-matches" —
+//      the recompile-the-world model (§2.8.5) already treats a stale
+//      dependency's over-conservative answer as an ordinary
+//      not-yet-rebuilt inconvenience, same as any other classification
+//      fix.
+// §3.6 rule 3 is the correct citation for "a derived-property flip is
+// part of the public contract" — #3648's filed body cited "§2.8.3 rule 4",
+// which is the runtime-type-identity rule (one copy of static state, one
+// `is`/`catch`/pattern identity) and says nothing about verdict flips;
+// §2.8.3 rule 3 (staleness/disagreement) and §3.6 rule 3 (a flip is a
+// breaking change "exactly as a signature change is") are the two rules
+// that actually apply, and both are already the citations the #3191 fold
+// above carries.
 inline constexpr std::uint32_t kSchemaVersion = 7;
 
 // §2.5 / §2.8.2 (issue #3198, v0.254): the producer's content-revision
