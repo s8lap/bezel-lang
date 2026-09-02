@@ -7004,8 +7004,18 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         // would otherwise type the call as the VALUE type
                         // (`if sd.TryAdd(k, v)` rejected as non-bool; a
                         // string-valued map producing malformed IR).
-                        else if (m == "ContainsKey" || m == "Remove" ||
-                                 m == "TryAdd" ||
+                        //
+                        // fix #3578 / stdlib §4.17 (v0.285): `Contains(key: K):
+                        // bool` (the §4.8 `key in dict` alias) was missing from
+                        // this list. With V = int this was a silent mistyping;
+                        // with V = string the catch-all V-return arm at the
+                        // end of this block typed the call as `string`, and the
+                        // produced `i1` was consumed as `%bz.string*` — IR
+                        // verifier abort: "GEP base pointer is not a vector...",
+                        // "Load operand must be a pointer", and a hard compile
+                        // crash at a `SortedDictionary<int, string>.Contains(k)`.
+                        else if (m == "Contains" || m == "ContainsKey" ||
+                                 m == "Remove" || m == "TryAdd" ||
                                  m == "TryGetValue")
                             ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Bool));
                         // fix #3510 / stdlib §4.17 (v0.285): `GetOrNull(key: K):
