@@ -8592,9 +8592,20 @@ llvm::Value* Emitter::wrapOwnedArrayAsIEnumerable(llvm::Value* arr,
     llvm::StructType* stTy = m.stTy;
     // Element-name key (same scheme as ensureArrayEnumMachinery) so the owning
     // Dispose / GetEnumerator / vtable are created once per element type.
-    std::string elemName = elemTy->isIntegerTy() ?
-        ("i" + std::to_string(elemTy->getIntegerBitWidth())) :
-        (elemTy->isPointerTy() ? "ptr" : "f");
+    // fix #3570 (§29.2 / §28.9 / §4.8, v0.286): the pre-fix scheme collapsed
+    // every non-integer, non-pointer element type (notably structs) to the
+    // single letter `"f"`, so two different struct element types in one module
+    // — e.g. `DictionaryEntry<int,int>` (8 B) and `DictionaryEntry<string,int>`
+    // (16 B) — shared one `bz$arrenum$f$Current` whose baked-in stride was the
+    // first creator's. Suffix the alloc size so each distinct stride gets its
+    // own machinery; integer/pointer kinds still keep their discriminating
+    // bit-width / `"ptr"` segment.
+    std::string elemName = elemTy->isIntegerTy()
+        ? ("i" + std::to_string(elemTy->getIntegerBitWidth()))
+        : (elemTy->isPointerTy()
+            ? "ptr"
+            : ("f" + std::to_string(
+                  (int64_t)module_->getDataLayout().getTypeAllocSize(elemTy))));
     std::string plainPrefix = "bz$arrenum$" + elemName + "$";
     // fix #3450 (v0.283): the disposer is part of the cache key — see
     // `ownedWrapElementDisposer` for why sharing one Dispose across two
@@ -9354,9 +9365,20 @@ Emitter::ArrEnumMachinery Emitter::ensureArrayEnumMachinery(llvm::Type* elemTy) 
 
     // Enumerator struct: { ptr vtable, ptr arr, i64 idx, i64 esz }
     // We use a unique struct name keyed on the element type to allow caching.
-    std::string elemName = elemTy->isIntegerTy() ?
-        ("i" + std::to_string(elemTy->getIntegerBitWidth())) :
-        (elemTy->isPointerTy() ? "ptr" : "f");
+    // fix #3570 (§29.2 / §28.9 / §4.8, v0.286): the pre-fix scheme collapsed
+    // every non-integer, non-pointer element type (notably structs) to the
+    // single letter `"f"`, so two different struct element types in one module
+    // — e.g. `DictionaryEntry<int,int>` (8 B) and `DictionaryEntry<string,int>`
+    // (16 B) — shared one `bz$arrenum$f$Current` whose baked-in stride was the
+    // first creator's. Suffix the alloc size so each distinct stride gets its
+    // own machinery; integer/pointer kinds still keep their discriminating
+    // bit-width / `"ptr"` segment.
+    std::string elemName = elemTy->isIntegerTy()
+        ? ("i" + std::to_string(elemTy->getIntegerBitWidth()))
+        : (elemTy->isPointerTy()
+            ? "ptr"
+            : ("f" + std::to_string(
+                  (int64_t)module_->getDataLayout().getTypeAllocSize(elemTy))));
     std::string stName = "arrenum." + elemName;
     auto* stTy = llvm::StructType::getTypeByName(llvm_, stName);
     if (!stTy) {
@@ -10889,15 +10911,22 @@ llvm::Value* Emitter::wrapDictionaryEntryArrayAsIEnumerable(
     llvm::StructType* stTy = m.stTy;
 
     // Element-name key matches ensureArrayEnumMachinery's per-element-type
-    // scheme (it falls back to "f" for non-integer/non-pointer types —
-    // including structs). Reusing the same prefix means MoveNext/Current
-    // created by the plain machinery are looked up under the SAME name as
+    // scheme. Reusing the same prefix means MoveNext/Current created by the
+    // plain machinery are looked up under the SAME name as
     // wrapOwnedArrayAsIEnumerable uses when it was invoked first (e.g. by
     // the foreach dictionary path), avoiding two parallel sets of identical
-    // MoveNext/Current for the same entry type.
+    // MoveNext/Current for the same entry type. fix #3570 (§29.2 / §28.9 /
+    // §4.8, v0.286): include the entry struct's alloc size so two entry types
+    // with different strides (DictionaryEntry<int,int> = 8 B vs
+    // DictionaryEntry<string,int> = 16 B) get distinct plain MoveNext/Current
+    // instances — the pre-fix `"f"` collapse shared one Current at the first
+    // creator's stride.
     std::string elemName = entryStTy->isIntegerTy()
         ? ("i" + std::to_string(entryStTy->getIntegerBitWidth()))
-        : (entryStTy->isPointerTy() ? "ptr" : "f");
+        : (entryStTy->isPointerTy()
+            ? "ptr"
+            : ("f" + std::to_string(
+                  (int64_t)module_->getDataLayout().getTypeAllocSize(entryStTy))));
     std::string plainPrefix = "bz$arrenum$" + elemName + "$";
     std::string prefix = "bz$dictentryenumown$" + elemName + "$";
 
