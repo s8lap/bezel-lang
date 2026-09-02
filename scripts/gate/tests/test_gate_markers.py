@@ -360,6 +360,10 @@ class SelfTestSuiteIsolationTest(_MarkerAssertions):
         # Spawns a FAKE gate_and_push.sh it writes into a temp dir, to exercise
         # the /proc/<pid>/cmdline sibling detection. Never the real one.
         "test_gate_serialization.py": "fake-in-tempdir",
+        # Reads gate.sh / gate_full_cycle.sh TEXT and sources EXTRACTED
+        # function bodies against a stub gate.sh in a temp dir (#3666).
+        # Never the real gate_and_push.sh.
+        "test_gate_full_cycle_pins.py": "source-only",
         # This file.
         "test_gate_markers.py": "isolated",
     }

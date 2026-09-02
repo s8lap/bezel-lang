@@ -30,7 +30,7 @@
 #
 # Modes (collapsed from default/--quick/--full/--fast — #1861):
 #   scripts/gate.sh            # DEFAULT: reconfigure + build + lit + canary +
-#                              #   tidy + ONE authoritative PLAIN sharded pass.
+#                              #   ONE authoritative PLAIN sharded pass.
 #                              #   NO serial. Fast + robust: plain compiles fit
 #                              #   the per-shard timeout even cold and under
 #                              #   multi-agent load.
@@ -47,7 +47,18 @@
 # (To make ASan the every-gate default on a quiet/uncontended host, run --full or
 #  export GATE_FAST_ASAN=1 — see the ASAN block below for why it is not default.)
 #
-# CANARY tier (gate[4/6], #2100): before the authoritative sharded pass, the
+# NO clang-tidy here (fix #3666). The advisory clang-tidy tier used to be a
+# gate.sh phase, i.e. it ran once per ORACLE: 277 s median per gate.sh run,
+# ~547 s per two-oracle cycle (24% of a ~2230 s cycle), uncached, over
+# identical inputs both times (the cycle pins HEAD, so the merge-base and the
+# changed-file list cannot differ) — and nothing read its result (no trend
+# rule, telemetry field or self-test names a `tidy` phase). It now runs ONCE
+# per cycle in scripts/gate_full_cycle.sh, after the conformance sweep, still
+# advisory. A standalone gate.sh run therefore does NO static analysis. By
+# hand: `scripts/check_tidy.sh build --changed <base>` (base = the merge-base
+# with main), or `cmake --build build --target check-tidy` for a full sweep.
+#
+# CANARY tier (gate[4/5], #2100): before the authoritative sharded pass, the
 # gate runs the diff-selected subset scripts/select_tests.py maps from the
 # worktree's diff vs origin/main (issue-number cross-links, fine §N.M
 # citations, downstream-dir fallback, diagnostic-string matches). Purpose:
@@ -63,7 +74,18 @@
 # and uses the same flake arbitration as the full pass. Selector/infra errors
 # SKIP the canary (fail-open to the full pass — the canary must never brick a
 # gate on its own bugs). Knobs:
-#   GATE_CANARY=0            skip the canary entirely
+#   GATE_CANARY=0            skip the canary entirely. scripts/gate_full_cycle.sh
+#                            sets this on its --full (ASan) pass — fix #3666:
+#                            0 catches in 46 gate.sh runs, and on the ASan
+#                            oracle a median 184 s (up to 286 s) whenever it
+#                            ran, so its expected value there is negative. The
+#                            cycle also passes BEZEL_GATE_ATTEMPT=<n> (echoed
+#                            on the shard-ceiling line as `attempt=<n>`;
+#                            `standalone` when unset) and BEZEL_GATE_ORACLE=
+#                            plain|asan (the cycle's INTENDED oracle, for the
+#                            log and child processes; gate.sh derives its own
+#                            from MODE and the cycle checks the OBSERVED
+#                            evidence — assert-asan-ran).
 #   GATE_CANARY_BASE=<ref>   selection base (default: merge-base HEAD origin/main)
 #   GATE_CANARY_MAX_PCT=<n>  skip when the selection exceeds n% of the suite
 #                            (default 50 — the full pass then does the work anyway)
@@ -540,7 +562,7 @@ gate_arbitrate() { # $1 = sharded-run log  →  returns 0|1|2; sets ARB_LAST_SUS
   return "$_verdict"
 }
 
-echo "== gate[1/6]: reconfigure (glob any new test files) =="
+echo "== gate[1/5]: reconfigure (glob any new test files) =="
 # Snapshot the compiler-archive mtime BEFORE any build work: comparing after
 # the build phase tells us whether the k2 cache identity changed this gate
 # (core.a rebuilt => cold ASan pass guaranteed) — see the ceiling note above.
@@ -563,7 +585,7 @@ rec_ran configure "$prc"
 
 # `bezel_tests` is the AGGREGATE target over the per-area binaries
 # (tests/CMakeLists.txt) — the target name is unchanged, so this phase is too.
-echo "== gate[2/6]: build bezel_tests (all per-area binaries) =="
+echo "== gate[2/5]: build bezel_tests (all per-area binaries) =="
 PHASE_T0=$(now)
 "$DH" build cmake --build build --target bezel_tests -j16 >"$S/gate_build.log" 2>&1; prc=$?
 rec_ran build "$prc"
@@ -702,7 +724,11 @@ core_note="unchanged"; [ "$core_post" != "$CORE_MTIME_PRE" ] && core_note="rebui
 cold_note="warm-predicted"; [ "$GATE_COLD" -eq 1 ] && cold_note="cold-predicted"
 _sto_label="plain"; [ "$ASAN" -eq 1 ] && _sto_label="ASan"
 _mult_note=""; [ "$ASAN" -eq 1 ] && _mult_note=", x${ASAN_STO_MULT} for ASan (#3222)"
-echo "   $_sto_label shard ceiling: ${sto}s ($cold_note: core.a $core_note, bincache entries=$cache_n, identity $gate_id_note$_mult_note)"
+# fix #3666: the cycle's attempt number (BEZEL_GATE_ATTEMPT) rides on this line
+# so a per-attempt log names its own attempt; a standalone run says so. On
+# --full this line is also the "ASan" evidence assert-asan-ran greps for
+# (via $_sto_label) — it must keep carrying that word.
+echo "   $_sto_label shard ceiling: ${sto}s ($cold_note: core.a $core_note, bincache entries=$cache_n, identity $gate_id_note$_mult_note) attempt=${BEZEL_GATE_ATTEMPT:-standalone}"
 
 # lit + FileCheck diagnostic track (tests/lit/): drives the REAL bezelc over .bzl
 # files and matches diagnostics with FileCheck. Fast (~0.1s/test, no JIT) and
@@ -710,7 +736,7 @@ echo "   $_sto_label shard ceiling: ${sto}s ($cold_note: core.a $core_note, binc
 # surface without the sharding-pollution or wrong-harness (#1682) failure modes
 # the gtest suite is exposed to. Skipped cleanly if lit/FileCheck/not were absent
 # at configure (the site config is only generated when all three are found).
-echo "== gate[3/6]: lit diagnostic track (real bezelc + FileCheck, per-process) =="
+echo "== gate[3/5]: lit diagnostic track (real bezelc + FileCheck, per-process) =="
 if [ -f build/tests/lit/lit.site.cfg.py ]; then
   PHASE_T0=$(now)
   "$DH" build cmake --build build --target bezelc check-lit -j16 >"$S/gate_lit.log" 2>&1; lit_rc=$?
@@ -729,7 +755,7 @@ fi
 # acceptance authority. Inherits the gate's ASan mode (SHARD_ENV) and shares
 # arbitrate() with the full pass. Selector/infra problems SKIP (fail-open).
 # See the CANARY block in the header for the design and knobs.
-echo "== gate[4/6]: canary — diff-selected subset (fail-fast only; never acceptance) =="
+echo "== gate[4/5]: canary — diff-selected subset (fail-fast only; never acceptance) =="
 CANARY_LIST="$S/gate_canary.list"
 canary_skip() { echo "   (canary skipped: $1)"; rec_skip canary "$1"; }
 # per #3010 Wave 4: the canary DECISION logic (the classify/dispatch) is now
@@ -825,33 +851,7 @@ else
   fi
 fi
 
-# clang-tidy static-analysis tier (tests/CMakeLists.txt target check-tidy;
-# design + config: test-infra migration plan §2 / WS7 —
-# /var/tmp/bezel-scratch/impl-run-2026-07-12/aot-plan/ws7-static-analysis.md).
-# ADVISORY ONLY: reports findings, does NOT fail the gate — WS7 measured a
-# ~70-80% false-positive rate among substantive findings on this ASan-hardened
-# codebase (report §2.5/§4); promotion to gate-blocking is a follow-on once the
-# real findings (R1-R7) are fixed and the confirmed FPs are NOLINT-annotated.
-# Changed-TUs mode only, mirroring check-lit's "skip cleanly if absent" guard:
-# a full 62-TU sweep is ~4-5 min at -j16 (WS7 §2.3) — heavier than a clean
-# build, so it's a consolidation/CI cost (`cmake --build build --target
-# check-tidy`), not a per-merge one. Skips cleanly if clang-tidy /
-# run-clang-tidy are absent.
-echo "== gate[5/6]: clang-tidy static-analysis (advisory; changed TUs only) =="
-if command -v clang-tidy >/dev/null 2>&1 && command -v run-clang-tidy >/dev/null 2>&1; then
-  base_ref="$(git merge-base HEAD main 2>/dev/null || true)"
-  [ -z "$base_ref" ] && base_ref="HEAD~1"
-  PHASE_T0=$(now)
-  "$DH" build scripts/check_tidy.sh build --changed "$base_ref" >"$S/gate_tidy.log" 2>&1; tidy_rc=$?
-  rec_ran tidy "$tidy_rc" "advisory"
-  grep -E 'check-tidy:' "$S/gate_tidy.log" | head -10 || true
-  # advisory: intentionally no `fail` call here regardless of findings/exit code
-else
-  echo "   (clang-tidy or run-clang-tidy not found — skipping; advisory tier disabled)"
-  rec_skip tidy "no clang-tidy"
-fi
-
-echo "== gate[6/6]: sharded suite ($SHARD_LABEL) — the authoritative oracle =="
+echo "== gate[5/5]: sharded suite ($SHARD_LABEL) — the authoritative oracle =="
 PHASE_T0=$(now)
 # per #3012 Phase 2c: name a merged run-summary path for the MAIN shard run
 # only (not the canary above — its summary would otherwise clobber this one).

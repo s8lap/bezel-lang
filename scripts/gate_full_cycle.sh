@@ -42,6 +42,12 @@
 # Environment: BEZEL_NO_GC=1 is set for the gate runs — gate_and_push.sh's
 # post-push worktree reap is slow (~1 worktree / 14s) and has no business
 # running inside a gate cycle. Reap separately at consolidation.
+# Each gate.sh attempt also receives BEZEL_GATE_ATTEMPT=<n>, BEZEL_GATE_ORACLE=
+# plain|asan and GATE_CANARY (forced to 0 on the --full pass — fix #3666: the
+# canary caught nothing in 46 runs and cost a median 184 s under ASan; an
+# operator's own GATE_CANARY=0 is honoured on both passes). The advisory
+# clang-tidy tier runs ONCE per cycle here, after conformance, no longer
+# inside gate.sh (where it ran once per oracle: ~547 s per cycle, no reader).
 
 set -u
 
@@ -269,7 +275,23 @@ trap 'rc=$?; write_cycle_verdict "$rc" || true; exit $rc' EXIT
 run_until_trustworthy() {
   local log="$1"; shift
   local mode_desc="${1:-plain}"; shift || true
-  local i rc v_verdict v_rc dec old_dec reason
+  local i rc v_verdict v_rc dec old_dec reason _oracle _canary
+  # fix #3666: tell each gate.sh attempt WHICH attempt it is and WHICH oracle
+  # the cycle intends (plain, or asan for --full), and turn the canary OFF on
+  # the ASan oracle. Measured over 46 gate.sh runs: the canary caught nothing
+  # (every real failure — 4 plain, 1 ASan — was found by the shard phase) and
+  # on --full it cost a median 184 s (up to 286 s) whenever it ran, so its
+  # expected value there is negative (≈ −46 s/cycle). The plain-oracle canary
+  # is untouched, and an operator's own GATE_CANARY=0 is honoured on BOTH
+  # passes (a literal `_canary=1` would have clobbered a documented knob).
+  # gate.sh echoes the attempt on its shard-ceiling line. BEZEL_GATE_ORACLE is
+  # the INTENDED oracle, for the log and child processes — gate.sh still
+  # derives its own from MODE, and assert-asan-ran below still checks the
+  # OBSERVED evidence, so this export changes nothing a green gate proves.
+  # Pinned functionally by scripts/gate/tests/test_gate_full_cycle_pins.py.
+  _oracle=plain
+  case " $* " in *" --full "*) _oracle=asan ;; esac
+  _canary="${GATE_CANARY:-1}"; [ "$_oracle" = asan ] && _canary=0
   for i in $(seq 1 "$MAX_ATTEMPTS"); do
     # BEZEL_GATE_CYCLE=1 tells gate.sh that a DUAL-oracle run is driving it, so
     # it suppresses its "this is one oracle, not an acceptance verdict" note
@@ -278,6 +300,7 @@ run_until_trustworthy() {
     # consumer reads its OWN gate's verdict, not a stale/concurrent one.
     local vf="${log%.log}.attempt${i}.verdict.json"
     BEZEL_NO_GC=1 BEZEL_GATE_CYCLE=1 GATE_VERDICT_FILE="$vf" \
+      BEZEL_GATE_ATTEMPT="$i" BEZEL_GATE_ORACLE="$_oracle" GATE_CANARY="$_canary" \
       scripts/gate.sh "$@" > "$log" 2>&1
     rc=$?
 
@@ -823,6 +846,56 @@ fi
 grep -E '^(PASS|FAIL|SKIP):' "$LOGDIR/${TAG}_conformance.log" \
   | sed 's/^/  conformance /' | tee -a "$CYCLE_LOG" >/dev/null
 say "conformance phase: GREEN"
+
+# ── CLANG-TIDY PHASE (fix #3666) — ADVISORY, ONCE PER CYCLE ────────────────
+# The clang-tidy tier (scripts/check_tidy.sh, changed TUs only) used to be a
+# gate.sh phase, so it ran once per ORACLE. Measured over 46 gate.sh runs:
+# 277 s median per run, ~547 s per two-oracle cycle — 24% of a ~2230 s cycle —
+# uncached, and over IDENTICAL inputs both times (the HEAD-moved check below
+# pins HEAD for the whole cycle, so `merge-base HEAD main` and the changed-file
+# list cannot differ between the passes). The second run was a pure duplicate.
+# It is advisory end to end (check_tidy.sh always exits 0; gate.sh never called
+# `fail` on it) and has NO reader: no trend rule, telemetry field or self-test
+# names a `tidy` phase. So it runs HERE, once, after the last verdict-bearing
+# phase: a red cycle and every retry attempt pay nothing, and every green cycle
+# still leaves the advisory findings in $LOGDIR for a human to read.
+#
+# ⚠ ADVISORY MEANS ADVISORY. Nothing in this block may `exit` or `return` on
+# its result — findings, a tool failure, dev_heavy refusing to start, a
+# missing compile database: every outcome is one `say` line and then the
+# cycle carries on. What a green cycle proves is unchanged by this block; it
+# can only ADD lines to the log. Pinned by
+# scripts/gate/tests/test_gate_full_cycle_pins.py (exactly one invocation,
+# after conformance-GREEN, before the HEAD-moved check, no exit/return in
+# its block).
+say "tidy phase: clang-tidy over changed src/*.cpp (advisory, once per cycle — fix #3666)"
+_tidy_log="$LOGDIR/${TAG}_tidy.log"
+if command -v clang-tidy >/dev/null 2>&1 && command -v run-clang-tidy >/dev/null 2>&1; then
+  _tidy_base="$(git merge-base HEAD main 2>/dev/null || true)"
+  [ -z "$_tidy_base" ] && _tidy_base="HEAD~1"
+  _tidy_t0="$(date +%s)"
+  # The same invocation gate.sh used to make, through the resource-capped
+  # slice. `|| true` so that even under a future `set -e` this line cannot end
+  # the cycle.
+  scripts/dev_heavy.sh build scripts/check_tidy.sh build --changed "$_tidy_base" \
+    > "$_tidy_log" 2>&1 || true
+  _tidy_s=$(( $(date +%s) - _tidy_t0 ))
+  # check_tidy.sh prints `check-tidy: N finding(s) …` when clang-tidy ran;
+  # otherwise (no changed TU, no compile database, tool missing) its LAST
+  # `check-tidy:` line says why — surface that rather than a bogus 0.
+  _tidy_n="$(sed -n 's/^check-tidy: \([0-9][0-9]*\) finding(s).*/\1/p' "$_tidy_log" 2>/dev/null | tail -1)"
+  _tidy_why="$(grep '^check-tidy:' "$_tidy_log" 2>/dev/null | tail -1)"
+  [ -n "$_tidy_why" ] || _tidy_why="no check-tidy output (see log)"
+  if [ -n "$_tidy_n" ]; then
+    say "tidy phase: done in ${_tidy_s}s — $_tidy_n finding(s) vs $(git rev-parse --short "$_tidy_base" 2>/dev/null || echo "$_tidy_base") (advisory; log $_tidy_log)"
+  else
+    say "tidy phase: done in ${_tidy_s}s — no findings count: $_tidy_why (advisory; log $_tidy_log)"
+  fi
+  grep -E '^check-tidy:' "$_tidy_log" 2>/dev/null | head -10 | sed 's/^/  | /' \
+    | tee -a "$CYCLE_LOG" >/dev/null || true
+else
+  say "tidy phase: skipped — clang-tidy or run-clang-tidy not on PATH (advisory tier disabled)"
+fi
 
 # fix #3413 (the other half): THE TREE MUST STILL BE THE ONE THAT WAS GATED.
 # CLAUDE.md freezes the tree for the duration of a cycle, but nothing enforced
