@@ -57,6 +57,13 @@
 # It NEVER runs the full suite. For whole-suite validation, that is the gate:
 # scripts/gate.sh (coordinator only).
 #
+# Scratch dir (per #3547): logs and --probe outputs go to
+# /var/tmp/bezel-scratch/agent-probe/<worktree-basename>, so concurrent lanes in
+# distinct worktrees no longer share one directory and clobber each other's
+# configure/test logs and --probe object/output files. Set BEZEL_AGENT_SCRATCH
+# to override the scratch dir entirely (e.g. to opt back into one shared
+# location). The effective scratch dir is printed once at startup.
+#
 # Exit code: non-zero if the build fails or ANY requested filter has a failure.
 
 set -uo pipefail
@@ -70,8 +77,13 @@ ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || {
 DH="$ROOT/scripts/dev_heavy.sh"
 BUILD_DIR="${BUILD_DIR:-$ROOT/build}"
 JOBS="${JOBS:-16}"
-SCRATCH="/var/tmp/bezel-scratch/agent-probe"
+# per #3547: qualify by worktree basename so concurrent lanes (distinct
+# worktrees under .claude/lane-pool/) don't clobber each other's configure/test
+# logs and --probe outputs in one shared directory. BEZEL_AGENT_SCRATCH
+# overrides entirely (e.g. to opt back into the old shared location).
+SCRATCH="${BEZEL_AGENT_SCRATCH:-/var/tmp/bezel-scratch/agent-probe/$(basename "$ROOT")}"
 mkdir -p "$SCRATCH"
+echo "agent_check: scratch dir: $SCRATCH" >&2
 
 die() { echo "agent_check: $*" >&2; exit 2; }
 [ -x "$DH" ] || die "scripts/dev_heavy.sh not found/executable at $DH"
