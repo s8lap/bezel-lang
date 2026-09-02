@@ -47,11 +47,22 @@ This module reads script TEXT and drives extracted bodies against stubs. It
 never spawns the real gate_and_push.sh — it is registered as "source-only" in
 test_gate_markers.SelfTestSuiteIsolationTest.KNOWN.
 
+SHARPEN (review of the #3666 landing). The tidy block's two command
+substitutions (`_tidy_n="$(sed … | tail -1)"`, `_tidy_why="$(grep … |
+tail -1)"`) were its only unguarded statements; the reviewer measured
+that under `set -e -o pipefail` they abort a GREEN cycle (grep rc 1 on the
+ordinary tool-absent path, sed rc 2 on an unreadable log). Both now carry
+`|| true`, and the functional harness runs the block under
+`set -eu -o pipefail` with an EMPTY log. Also: when run-clang-tidy itself
+fails, check_tidy.sh prints `check-tidy: 0 finding(s)` BEFORE its
+`… possible tool/config failure` line, so the say line preferred a bogus
+0; it now prefers the failure line. Both pinned below.
+
 Stdlib only (subprocess/tempfile/unittest) — the house style for this
 directory. Every test here FAILED at the parent commit (af4f73b) except the
 two marked GUARD in their docstrings, which pin a contract the change now
 leans on (the GATE_CANARY=0 knob itself dates from #2100) rather than the
-change itself.
+change itself; the sharpen pins failed at a5772aa.
 """
 
 import json
@@ -173,7 +184,7 @@ _CONFORMANCE_GREEN = 'say "conformance phase: GREEN"'
 _HEAD_MOVED = "HEAD MOVED DURING THE CYCLE"
 
 _TIDY_HARNESS = r'''
-set -u
+%(setopts)s
 cd "$PIN_TMP"
 export PATH="$PIN_TMP/bin:$PATH"
 say() { echo "SAY $*"; }
@@ -255,10 +266,12 @@ class CycleShTidyOnceTest(unittest.TestCase):
         self.assertIn("check_tidy.sh", block, "guard: extracted block lacks the invocation")
         return block
 
-    def _run_block(self, dev_heavy_stub, check_tidy_stub):
+    def _run_block(self, dev_heavy_stub, check_tidy_stub, strict=False):
         """Source the tidy block in a temp cwd with stub `clang-tidy` /
         `run-clang-tidy` on PATH (so the main branch runs) and stub
-        scripts/dev_heavy.sh + scripts/check_tidy.sh."""
+        scripts/dev_heavy.sh + scripts/check_tidy.sh. `strict` runs it
+        under `set -eu -o pipefail` — the block must be advisory under
+        ANY future set option, not just today's `set -u`."""
         with tempfile.TemporaryDirectory() as tmp:
             sd = _layout(tmp)
             bind = pathlib.Path(tmp) / "bin"
@@ -275,7 +288,9 @@ class CycleShTidyOnceTest(unittest.TestCase):
             ct.chmod(0o755)
             env = _clean_env(tmp)
             env["PIN_TMP"] = tmp
-            r = _bash(_TIDY_HARNESS % {"block": self._extract_block()}, tmp, env)
+            r = _bash(_TIDY_HARNESS % {
+                "block": self._extract_block(),
+                "setopts": "set -eu -o pipefail" if strict else "set -u"}, tmp, env)
             cycle_log = pathlib.Path(tmp) / "logs" / "pin_cycle.log"
             cycle_text = cycle_log.read_text() if cycle_log.exists() else ""
             return r, cycle_text
@@ -284,37 +299,94 @@ class CycleShTidyOnceTest(unittest.TestCase):
     _DH_PASSTHROUGH = "#!/usr/bin/env bash\nshift\nexec \"$@\"\n"
 
     def test_tidy_block_reports_elapsed_and_finding_count(self):
-        r, cycle_text = self._run_block(
-            self._DH_PASSTHROUGH,
-            "#!/usr/bin/env bash\n"
-            "echo \"check-tidy: changed-files mode vs $4 — 2 file(s)\"\n"
-            "echo 'check-tidy: 3 finding(s) (ADVISORY — does not fail the build)'\n"
-            "exit 0\n")
-        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-        self.assertIn("AFTER_TIDY_BLOCK rc=0", r.stdout,
-                      "the harness must run past the block:\n" + r.stdout + r.stderr)
-        done = [ln for ln in r.stdout.splitlines() if "tidy phase: done in" in ln]
-        self.assertEqual(len(done), 1, "one `done` say line expected:\n" + r.stdout)
-        self.assertRegex(done[0], r"done in \d+s", "elapsed seconds missing")
-        self.assertIn("3 finding(s)", done[0], "finding count missing: " + done[0])
-        self.assertIn("check-tidy: 3 finding(s)", cycle_text,
-                      "the check-tidy summary lines must be teed into the cycle log")
+        for strict in (False, True):
+            with self.subTest(strict=strict):
+                r, cycle_text = self._run_block(
+                    self._DH_PASSTHROUGH,
+                    "#!/usr/bin/env bash\n"
+                    "echo \"check-tidy: changed-files mode vs $4 — 2 file(s)\"\n"
+                    "echo 'check-tidy: 3 finding(s) (ADVISORY — does not fail the build)'\n"
+                    "exit 0\n", strict=strict)
+                self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+                self.assertIn("AFTER_TIDY_BLOCK rc=0", r.stdout,
+                              "the harness must run past the block:\n" + r.stdout + r.stderr)
+                done = [ln for ln in r.stdout.splitlines() if "tidy phase: done in" in ln]
+                self.assertEqual(len(done), 1, "one `done` say line expected:\n" + r.stdout)
+                self.assertRegex(done[0], r"done in \d+s", "elapsed seconds missing")
+                self.assertIn("3 finding(s)", done[0], "finding count missing: " + done[0])
+                self.assertIn("check-tidy: 3 finding(s)", cycle_text,
+                              "the check-tidy summary lines must be teed into the cycle log")
 
     def test_tidy_block_survives_a_failing_tool(self):
         """The whole point of 'advisory': dev_heavy refusing (exit 5, no
         output at all) must leave the cycle running and say so."""
-        r, _ = self._run_block(
-            "#!/usr/bin/env bash\necho 'dev_heavy: refusing (stub)' >&2\nexit 5\n",
-            "#!/usr/bin/env bash\nexit 0\n")
+        for strict in (False, True):
+            with self.subTest(strict=strict):
+                r, _ = self._run_block(
+                    "#!/usr/bin/env bash\necho 'dev_heavy: refusing (stub)' >&2\nexit 5\n",
+                    "#!/usr/bin/env bash\nexit 0\n", strict=strict)
+                self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+                self.assertIn("AFTER_TIDY_BLOCK rc=0", r.stdout,
+                              "a failing tidy tool ended the cycle — the phase is "
+                              "ADVISORY (fix #3666):\n" + r.stdout + r.stderr)
+                done = [ln for ln in r.stdout.splitlines() if "tidy phase: done in" in ln]
+                self.assertEqual(len(done), 1, r.stdout)
+                self.assertIn("no findings count", done[0],
+                              "a run with no `check-tidy:` findings line must say so, "
+                              "not report 0: " + done[0])
+
+    # ---- sharpen (review of a5772aa): errexit/pipefail + tool-failure ----
+
+    def test_tidy_assignments_are_guarded_for_errexit(self):
+        """Source pin: the two command substitutions carry `|| true`."""
+        lines = _code_lines(CYCLE_SH.read_text())
+        for var in ('_tidy_n="$(', '_tidy_why="$('):
+            hits = [(n, ln) for n, ln in lines if ln.lstrip().startswith(var)]
+            self.assertEqual(len(hits), 1, "guard: one %s assignment" % var)
+            n, ln = hits[0]
+            self.assertTrue(
+                ln.rstrip().endswith("|| true"),
+                "gate_full_cycle.sh:%d: %s must end with `|| true` — under "
+                "set -e -o pipefail a no-match grep / unreadable log aborts "
+                "a GREEN cycle from an advisory block: %s" % (n, var, ln))
+
+    def test_tidy_block_survives_errexit_pipefail_with_empty_log(self):
+        """The measured shape: tool present, log EMPTY (no `check-tidy:`
+        line at all), `set -eu -o pipefail`. grep exits 1, pipefail makes
+        the substitution fail, and without `|| true` errexit ends the
+        cycle right there."""
+        r, _ = self._run_block(self._DH_PASSTHROUGH,
+                               "#!/usr/bin/env bash\nexit 0\n", strict=True)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn("AFTER_TIDY_BLOCK rc=0", r.stdout,
-                      "a failing tidy tool ended the cycle — the phase is "
-                      "ADVISORY (fix #3666):\n" + r.stdout + r.stderr)
+                      "an empty tidy log ended the cycle under errexit/pipefail "
+                      "(sharpen of #3666):\n" + r.stdout + r.stderr)
         done = [ln for ln in r.stdout.splitlines() if "tidy phase: done in" in ln]
         self.assertEqual(len(done), 1, r.stdout)
-        self.assertIn("no findings count", done[0],
-                      "a run with no `check-tidy:` findings line must say so, "
-                      "not report 0: " + done[0])
+        self.assertIn("no check-tidy output", done[0], done[0])
+
+    def test_tidy_block_prefers_tool_failure_over_zero_count(self):
+        """check_tidy.sh prints `check-tidy: 0 finding(s)` BEFORE its
+        `… exited N with no parsed findings — possible tool/config failure`
+        line when run-clang-tidy itself failed. A cycle log saying
+        `0 finding(s)` for a tool that did not run is a false clean."""
+        stub = ("#!/usr/bin/env bash\n"
+                "echo 'check-tidy: sanitized database has 1760 TU(s) (from 1760 raw entries)'\n"
+                "echo 'check-tidy: 0 finding(s) (ADVISORY — does not fail the build)'\n"
+                "echo 'check-tidy: run-clang-tidy exited 1 with no parsed findings — "
+                "possible tool/config failure, see /x/tidy/run.log'\n"
+                "exit 0\n")
+        for strict in (False, True):
+            with self.subTest(strict=strict):
+                r, _ = self._run_block(self._DH_PASSTHROUGH, stub, strict=strict)
+                self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+                self.assertIn("AFTER_TIDY_BLOCK rc=0", r.stdout, r.stdout + r.stderr)
+                done = [ln for ln in r.stdout.splitlines() if "tidy phase: done in" in ln]
+                self.assertEqual(len(done), 1, r.stdout)
+                self.assertIn("possible tool/config failure", done[0],
+                              "the say line must surface the tool failure: " + done[0])
+                self.assertNotIn("0 finding(s)", done[0],
+                                 "a 0 from a tool that did not run is not a count: " + done[0])
 
 
 # ---------------------------------------------------------------------------

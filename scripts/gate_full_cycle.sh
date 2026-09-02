@@ -883,9 +883,20 @@ if command -v clang-tidy >/dev/null 2>&1 && command -v run-clang-tidy >/dev/null
   # check_tidy.sh prints `check-tidy: N finding(s) …` when clang-tidy ran;
   # otherwise (no changed TU, no compile database, tool missing) its LAST
   # `check-tidy:` line says why — surface that rather than a bogus 0.
-  _tidy_n="$(sed -n 's/^check-tidy: \([0-9][0-9]*\) finding(s).*/\1/p' "$_tidy_log" 2>/dev/null | tail -1)"
-  _tidy_why="$(grep '^check-tidy:' "$_tidy_log" 2>/dev/null | tail -1)"
+  # `|| true` on both (sharpen, issue 3666 review): under a future
+  # `set -e -o pipefail` a no-match grep (rc 1 — the ordinary tool-absent
+  # path) or an unreadable log (sed rc 2) would otherwise abort a GREEN
+  # cycle from inside an advisory block. Pinned functionally under
+  # `set -eu -o pipefail` with an empty log.
+  _tidy_n="$(sed -n 's/^check-tidy: \([0-9][0-9]*\) finding(s).*/\1/p' "$_tidy_log" 2>/dev/null | tail -1)" || true
+  _tidy_why="$(grep '^check-tidy:' "$_tidy_log" 2>/dev/null | tail -1)" || true
   [ -n "$_tidy_why" ] || _tidy_why="no check-tidy output (see log)"
+  # A `0 finding(s)` from a run-clang-tidy that did not run is not a count:
+  # check_tidy.sh prints it BEFORE its `… exited $rc … possible tool/config
+  # failure` line, so when that (last) line is present it wins.
+  case "$_tidy_why" in
+    *"possible tool/config failure"*) _tidy_n="" ;;
+  esac
   if [ -n "$_tidy_n" ]; then
     say "tidy phase: done in ${_tidy_s}s — $_tidy_n finding(s) vs $(git rev-parse --short "$_tidy_base" 2>/dev/null || echo "$_tidy_base") (advisory; log $_tidy_log)"
   else
