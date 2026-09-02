@@ -96,6 +96,37 @@ Two further facts shape any plan:
   changes, and lane iteration on tests. It does **not** help plain → ASan
   within a cycle (the `sa=` bit is in every key, `aot_support.hpp:1195`).
 
+### 2a. Is the ~30 GiB a record of results? No.
+
+Pass/fail is recorded elsewhere and is tiny: each shard writes one JSON summary
+(`tests/test_main.cpp:327-371`), the runner accounts them per binary, and the
+gate keeps one `gate_run_summary.json` plus a `gate-timings.jsonl` record per
+cycle. Kilobytes. The ~30 GiB is the executables themselves, kept so that a
+*later* run with a byte-identical compiler, runtime and toolchain can skip
+compile and link. It is a speculative cache, and the traffic numbers say the
+speculation pays on ~9% of gates plus retries.
+
+What stopping the store would cost, in decreasing order of value:
+
+- **Retries within a cycle.** A shard killed at the ceiling leaves the store
+  ~95% warm; the retry costs ~310s plain / ~500s ASan instead of a full cold
+  pass (`audit.md`). Without a store a retry is a full re-run — so F6
+  (classify a ceiling kill as retryable, truncate the summary on SIGTERM
+  rather than losing 95% of a pass) matters more, not less.
+- **Test-only landings**, ~9% of gates: warm plain pass 358s vs 555s cold.
+- **Lane iteration on tests**: a lane runs a handful of tests at ~0.1–0.25s
+  each; the cache is noise there.
+
+Why not cache the *verdict* instead of the executable: a result cache keyed on
+the same hash, storing exit code and captured stdout, would be ~100 MB instead
+of 30 GiB. But it changes what a green gate proves. The program run is always
+live today; the harness does not `chdir`, so the program sees the test
+process's working directory, and 55 `runAot` test files use file, directory,
+environment, time or random APIs. A replayed verdict pins whatever happened
+once. The audit already lists the narrower version (cache reject diagnostics
+only) as a Tier-2 recorded-decision item. If wanted, it needs an issue and a
+ruling on which tests are eligible, never a quiet default.
+
 ## 3. What already runs from RAM
 
 `tests/run_parallel.sh:88,165` puts the shard log directory and every shard's
@@ -188,7 +219,11 @@ This is the lever. Three shapes, in increasing invasiveness:
    removing it; more code, and the process-exit path must drain the queue.
    Declined here on CLAUDE.md's simplicity rule unless (2) is refused.
 
-Recommendation: (1) now, (2) as an issue, (3) not.
+Recommendation: (1) now, (2) as an issue, (3) not. For (1) the precise rule is
+"no store on attempt 1 of a predicted-cold gate"; a retry attempt has nothing
+warm to reuse either way, so it makes no difference there, and a
+predicted-warm gate keeps the cache on so the ~9% test-only traffic and the
+`[aot-cache]` telemetry are unchanged.
 
 ### O3 — Run each area's tests as soon as its binary links
 
@@ -253,13 +288,98 @@ an issue, not a PR.
    entries sharing an inode, and peak `MemoryCurrent` of the suite scope.
 4. `df -i` and `df -h` of the tmpfs after each run, to confirm the reaper and
    RAII cleanup leave it empty — the failure class every recorded incident was.
+5. The §8 linker A/B: the same slice, ASan oracle, `-shared-libasan` vs
+   today's static link, cache off, quiet box, 20 interleaved reps of the bare
+   link as `measured.md §6` did — the per-test wall and the executable size.
 
 Do not measure on a busy box (`measured.md §6` lost a linker measurement's sign
 to a concurrent suite run).
 
+## 7. How much faster, on average (estimated, not measured)
+
+The only whole-suite cold numbers on record predate the 2026-08-21 colocation
+fix, and the cycle that validated that fix ran warm, so the current cold cycle
+has to be estimated by applying the fix's controlled-slice ratios (ASan
+−43.7%, plain −36.4%) to the pre-fix medians. Every row below is that kind of
+derivation; §6 item 1 replaces it with the record.
+
+| Segment (cold cycle) | Pre-fix median (measured) | Post-fix (estimated) |
+|---|---|---|
+| plain shard phase | 555s | ~350s |
+| ASan shard phase | 1465s | ~825s |
+| everything else (2× configure+build, 2× lit, ratchets, self-test, canary, conformance) | ~530s | ~530s |
+| **cycle** | **~2550s (43 min)** | **~1700s (28 min)** |
+
+Cross-check on the ASan row: the pre-fix cache-off run (compile everything,
+store nothing, workdir still on the spinning disk) was 634s. The post-fix
+store-on estimate of ~825s leaves ~190s for the store path, and an
+independent model — six fsyncs at the NVMe's ~11 ms each per test, 18,288
+tests at conc=8 — gives ~150s. The two agree within the precision available.
+
+Savings per lever, on that ~1700s cold cycle:
+
+| Lever | Cold-cycle saving | Notes |
+|---|---|---|
+| O2(1) no store on predicted-cold attempt 1 | ~150–190s ASan + ~80–100s plain ≈ **230–290s** | offset by ~70s expected extra retry cost (retries become cold: 0.12×350 + 0.20×825 vs the warm 310/500s) until F6 lands; net ≈ 160–220s |
+| dynamic ASan runtime (§8) | ≈ **150–170s** | ASan link measured 190 ms vs plain 98 ms; the static `libclang_rt.asan` archive is the difference |
+| O1 workdir on tmpfs | ≤ **40s** | ~11 creates + ~2.5 MB + unlinks per test on the NVMe; measure before crediting |
+| O4 `-g0` on test TUs + PCH decoupling | ~**20–30s** per cycle | two builds per cycle at ~91s + ~28s; larger effect on lane cold builds |
+| O3 run-as-built | ≤ ~60s | bounded by codegen's own compile+link |
+
+Stacked, the cold cycle goes from ~1700s to roughly **1250–1350s (21–22
+min)**: about 25% off the post-fix cycle and about half of the 43 min recorded
+in August. Averaged over traffic (91% cold) the store lever alone is worth
+~13–15% of a cycle; the ASan-runtime and build levers apply to warm cycles
+too. None of these changes what a green gate proves. Anything larger than
+this is a contract change (§8, last item) or hardware.
+
+## 8. What else can be done
+
+In value order after O2(1):
+
+- **Link the ASan oracle against the shared sanitizer runtime**
+  (`-shared-libasan` in `Driver::linkCommandLine`, `src/driver/Driver.cpp:293-299`).
+  The link is the largest single per-test cost on record (bfd: 98 ms plain,
+  190 ms ASan, `measured.md §6`), and the ASan delta is the static
+  `libclang_rt.asan` archive being copied into every one of ~18k
+  executables; it is also most of why an ASan executable is 2.3 MB against
+  0.64 MB. The dynamic runtime removes that per-test copy. It changes
+  `linkRecipeSignature` (one K2-cold pass — free if O2(1) lands first) and the
+  program must find the `.so` at run time (`clang -print-file-name` gives the
+  directory; set `LD_LIBRARY_PATH` in the run child, `aot_support.hpp:243-285`).
+  Leak reports symbolise the same way. Measure it on the same 5,484-test slice.
+- **Land F6** so a ceiling-killed 95%-complete pass is a retry, not a bail,
+  and a SIGTERMed shard writes a truncated summary. With the store off on
+  cold gates this is what keeps the expected retry cost from eating O2(1).
+- **Drop `sh` and the `clang` driver from the per-test link.** Today every
+  link is `std::system` → `sh` → `clang` → `ld` (`Driver.cpp:341`), so a cold
+  test is six processes. `posix_spawn` of `clang` directly saves one spawn;
+  invoking `ld` directly saves two but re-implements the driver's runtime
+  path resolution, which is why lld/mold were measured through shims. Worth
+  ~10–20 ms per test, ~20–40s per cycle; do it only alongside the linker
+  change so the recipe is invalidated once.
+- **Re-size the link-token pool after the link gets cheaper.** `min(physical
+  cores, MemAvailable / 1.5 GiB)` = 10 (`aot_support.hpp:451-462`) is the
+  binding constraint the F1 refutation found ("memory is not the constraint").
+  A cheaper, smaller link changes both terms of that formula; re-measure
+  conc=8 vs 16 once it has.
+- **Not a lever: the optimisation level.** `LlvmBackend.cpp` runs no
+  optimisation pipeline at all (only the ASan module pass under the sanitizer
+  oracle, `:87-113`), so there is no `-O2` to turn down.
+- **Not a lever without a policy change: running fewer tests.** The
+  authoritative pass is the whole suite by ruling (#2100, "one authoritative
+  pass"; the diff-selected subset is fail-fast only). A test-impact-selected
+  authoritative pass is the only order-of-magnitude lever left on this
+  hardware, and it is a contract change that the audit's Tier 3 already
+  declined to take silently. Recorded here so it is not re-litigated blind.
+- **Hardware.** Ten physical cores bound the link pool and thus both shard
+  phases; the 32 GB box bounds lane concurrency. A second machine per oracle
+  (the audit's "two-runner dual-oracle") halves the cycle outright and needs
+  no change to what a gate proves.
+
 ## Status
 
 Research note — not spec-affecting. Read-only session on 2026-09-02, HEAD
-09c1803; figures are quoted or derived as marked and are specific to the dev
+09c1803 (§2a, §7 and §8 added the same day after review); figures are quoted or derived as marked and are specific to the dev
 box (20 logical cores, 32 GB, `/` on a 7200 RPM ST2000DM008, `/mnt/fast` on a
 Samsung 980 NVMe, `/tmp` a 16 GB tmpfs with a 12,774 MB per-user quota).
