@@ -72,8 +72,8 @@ retry costs ~310 s plain / ~500 s ASan against a ~2230 s cycle plus a relaunch.
 gate.summary (narrow #3667 / sharpen #3668) classifies that shape; the pins in
 section 5 cover the bash that maps its exit 0 onto the EXISTING rc=3 RETRY
 contract (and nothing else onto anything), bounds the ceiling-only retries at
-three in run_until_trustworthy, swaps the never-matching shard_times harvest
-for the `shard-times` CLI, and puts `actual FAIL` into the condensing grep so
+three in run_until_trustworthy, swaps the shard_times harvest that has
+matched nothing since d0d2390 (2026-08-18) for the `shard-times` CLI, and puts `actual FAIL` into the condensing grep so
 the culprit a completed shard names reaches the reader (#3674). The gate.sh
 pins drive the EXTRACTED rc!=0 block and gate_shard_logdir() against the REAL
 gate.summary over a fixture logdir, so the 0/1/2 contract is exercised, not
@@ -814,10 +814,38 @@ class GateShCeilingOnlyWiringTest(unittest.TestCase):
         self.assertIn(
             "gate.summary shard-times", ln,
             "gate.sh:%d must harvest shard_times via `python3 -m gate.summary "
-            "shard-times` — the grep it replaces was anchored `s$` and never "
-            "matched run_parallel's ` (ceiling 1800s, 0.7%%)` suffix, so every "
-            "telemetry record carried shard_times=[] (narrow #3667): %s" % (n, ln))
+            "shard-times` — the grep it replaces was anchored `s$` and has "
+            "matched nothing since d0d2390 (2026-08-18) added run_parallel's "
+            "` (ceiling 1800s, 0.7%%)` suffix: 690 telemetry records carry "
+            "shard_times data, the 188 written since are all [] "
+            "(narrow #3667): %s" % (n, ln))
         self.assertNotIn("[0-9.]+s$", ln, "the anchored regex must be gone")
+
+    def test_run_summary_is_removed_before_the_shard_launch(self):
+        """sharpen (review of 6102402): GATE_RUN_SUMMARY is a FIXED path
+        (/var/tmp/bezel-scratch/gate_run_summary.json) every gate overwrites.
+        If run_parallel dies before `account` writes it (run_parallel.sh:233),
+        the ceiling-only classifier — and the coverage harvest after it —
+        would read the PREVIOUS gate's summary and classify a run that is not
+        this one. The launch must be preceded by an rm, exactly as
+        MEMPEAK_OUT is (`never source a PRIOR gate's numbers`)."""
+        lines = _code_lines(GATE_SH.read_text())
+        assign = [n for n, ln in lines
+                  if ln.startswith('GATE_RUN_SUMMARY="$S/gate_run_summary.json"')]
+        rm = [n for n, ln in lines if re.match(r'\s*rm -f "\$GATE_RUN_SUMMARY"', ln)]
+        launch = [n for n, ln in lines
+                  if "tests/run_parallel.sh" in ln and '>"$S/gate_shard.log"' in ln]
+        self.assertEqual(len(assign), 1, "guard: one GATE_RUN_SUMMARY assignment")
+        self.assertEqual(len(launch), 1, "guard: one authoritative run_parallel launch")
+        self.assertEqual(
+            len(rm), 1,
+            "gate.sh must `rm -f \"$GATE_RUN_SUMMARY\"` once before the shard "
+            "launch — never classify a PRIOR gate's run summary (sharpen of "
+            "#3667); found %r" % rm)
+        self.assertLess(assign[0], rm[0], "the rm must follow the assignment (set -u)")
+        self.assertLess(rm[0], launch[0],
+                        "the rm (line %d) must precede the run_parallel launch "
+                        "(line %d)" % (rm[0], launch[0]))
 
 
 _CEIL_BLOCK_HARNESS = r"""

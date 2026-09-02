@@ -907,6 +907,12 @@ fi
 # fix #3667: stamp the launch so gate_shard_logdir() (below) can pick the
 # per-shard logdir run_parallel keeps for THIS run and never a previous gate's.
 GATE_SHARD_STAMP="$S/gate_shard.stamp"; : > "$GATE_SHARD_STAMP"
+# sharpen #3667 (review): GATE_RUN_SUMMARY is a FIXED path every gate
+# overwrites. If run_parallel dies before `account` writes it
+# (tests/run_parallel.sh:233), the ceiling-only classifier below — and the
+# coverage harvest after it — would read the PREVIOUS gate's summary and
+# classify a run that is not this one. Same rule as MEMPEAK_OUT above.
+rm -f "$GATE_RUN_SUMMARY" 2>/dev/null || true   # never source a PRIOR gate's numbers
 "$DH" suite "${SHARD_ENV[@]}" tests/run_parallel.sh ${GATE_SHARDS:-} >"$S/gate_shard.log" 2>&1; rc=$?
 if [ -n "${MEMPEAK_PID:-}" ]; then
   scripts/gate/mempeak.sh stop "$MEMPEAK_PID" 2>/dev/null || true
@@ -926,8 +932,10 @@ SHARD_REPORTED_S=$(grep -oE 'across [0-9]+ shards, [0-9]+s' "$S/gate_shard.log" 
 # fix #3667: the harvest is gate.summary's `shard-times` CLI. The grep it
 # replaces was anchored `s$`, and run_parallel.sh:388 appends ` (ceiling 1800s,
 # 0.7%)` whenever BEZEL_SHARD_TIMEOUT is set — which a gate run ALWAYS sets
-# (the ceiling block above) — so it never matched a line and every telemetry
-# record ever written carried `"shard_times":[]`. Same key, same comma-joined
+# (the ceiling block above) — so since d0d2390 (2026-08-18, which added that
+# suffix) it has matched nothing: of the 940 telemetry records on the box this
+# was measured on, 690 carry shard_times data and the 188 written after
+# 2026-08-18T06:05Z are all `"shard_times":[]`. Same key, same comma-joined
 # shape; the CLI emits the RAW seconds tokens (`1795.50`, not a re-rendered
 # float) because telemetry.py wraps each verbatim as a RawNumber. Empty on an
 # unreadable log, exactly as before (observation only — never fails a gate).

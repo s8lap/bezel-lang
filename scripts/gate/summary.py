@@ -663,7 +663,8 @@ def extract_log_failures(logdir, shard_id):
 # ---------------------------------------------------------------------------
 # narrow #3667 (F6 of docs/research/2026-08-19-gate-performance-audit.md):
 # classify a run whose ONLY defect is a per-shard ceiling kill, and harvest the
-# per-shard wall times the telemetry field has never actually received.
+# per-shard wall times the telemetry field has not received since d0d2390
+# (2026-08-18).
 
 
 def log_has_fail_marker(path):
@@ -863,10 +864,12 @@ def ceiling_only_failure(run_summary_path, shard_log_path,
 # `shard <group>.<index>: <seconds>s` — the per-shard wall-time line
 # run_parallel.sh:388 prints. NO `$` ANCHOR: when BEZEL_SHARD_TIMEOUT is set
 # the line continues ` (ceiling 1800s, 0.7%)`, and gate.sh:700 ALWAYS sets it
-# for a gate run. gate.sh:901's harvest regex ends in `s$`, so it has never
-# matched a single line and every telemetry record ever written carries
-# `"shard_times":[]` — the per-shard ceiling-margin trend the code claims to
-# harvest has never had data. Group 1 is the raw seconds text; keeping it as
+# for a gate run. gate.sh's old harvest regex (replaced by the `shard-times`
+# CLI, #3667) ended in `s$`, so since d0d2390 (2026-08-18, which added the
+# suffix) it matched nothing: 690 of the 940 telemetry records measured carry
+# shard_times data, and the 188 written after 2026-08-18T06:05Z are all
+# `"shard_times":[]` — the ceiling-margin trend went dark exactly when the
+# ceiling ratio started being printed. Group 1 is the raw seconds text; keeping it as
 # TEXT (not a re-rendered float) is what lets the CLI hand telemetry.py the
 # same digits the log carried (telemetry wraps each token verbatim as a
 # RawNumber — no %.2f reformatting).
