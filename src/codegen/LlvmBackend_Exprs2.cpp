@@ -2286,6 +2286,9 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         // save/restore the closure-release sets already had.)
         auto savedClosureRelElig = closureReleaseEligible_;
         llvm::Function* savedClosureRelEligFn = closureReleaseEligibleFn_;
+        // fix #3757 follow-up: closureLocalCandidates_ travels with the pair
+        // above (see its declaration, LlvmBackend_impl.hpp).
+        auto savedClosureLocalCandidates = closureLocalCandidates_;
         auto savedCellFreeElig = cellFreeEligible_;
         llvm::Function* savedCellFreeEligFn = cellFreeEligibleFn_;
         // fix #3426: the sole-escaping-holder map is recomputed for the
@@ -2349,6 +2352,8 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
 
         closureReleaseEligible_ = std::move(savedClosureRelElig);
         closureReleaseEligibleFn_ = savedClosureRelEligFn;
+        closureLocalCandidates_ =
+            std::move(savedClosureLocalCandidates);  // fix #3757 follow-up
         cellFreeEligible_ = std::move(savedCellFreeElig);
         cellFreeEligibleFn_ = savedCellFreeEligFn;
         sharedCellEnvdtorFreeOwner_ = std::move(savedSharedCellOwner);  // #3426
@@ -2471,6 +2476,74 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     else
         moveOnlyArrayTransferred_.clear();
     moveOnlyArrayTransferredFn_ = fn;
+    // fix #3757 (§27.5 / §15.3, v0.286): pin the closure-capture-cell
+    // disposal family — closureReleaseEligible_ (#422), boxCaptureLocals_ /
+    // singleCaptureLocals_ / assignedCaptureVars_ / definitelyEscapingLambdas_
+    // (§27.5 / #672 / #694 / #2706), and cellFreeEligible_ / unwindUnsafeCellFree_
+    // / sharedCellEnvdtorFreeOwner_ (§27.5 / #429 / #2334 / #3426) — to the
+    // SYNC lambda's own function, mirroring emitAsyncLambda's identical
+    // clear+collect+pin block for its resume fn (LlvmBackend_Async.cpp
+    // ~L1943-1963) and Setup.cpp's block for a plain method body
+    // (~L9197-9228). Sibling family to the #3738 fix immediately above
+    // (moveOnlyArrayTransferredFn_): that fix's file ownership was narrowly
+    // the §15.3 transfer token; this is the closure-capture-cell family,
+    // never re-pinned for the sync-lambda venue at all. Without this,
+    // collectCellFreeEligible/collectClosureReleaseEligible's admission
+    // tests run against whatever the ENCLOSING function last pinned
+    // cellFreeEligibleFn_/closureReleaseEligibleFn_ to, so a `currentFn_ !=
+    // …Fn_` guard mismatch fails the eligibility check for every capture in
+    // this body — a `[N owned]T` local captured by a NESTED lambda inside
+    // this sync lambda's own body never disposes through its capture cell
+    // (measured total=600 n=400 at 200 activations — a leak, not a
+    // double-free per LSan). CaptureReclaimSetScope (LlvmBackend_impl.hpp,
+    // added by fix #3500, reused as-is per LANE_RULES §6 — no new
+    // predicate/scope) is the EXACT save/restore this family already needed
+    // for `emitIteratorMethod` / `emitAsyncMethod` / `emitAsyncIteratorMethod`
+    // when THOSE bodies nest a specialization mid-emission; it is the
+    // identical hazard here — a lambda/iterator/state-machine nested inside
+    // THIS sync lambda's own body that re-pins the same tokens for ITS OWN
+    // function must leave this scope's copy correct when control returns
+    // here (LANE_RULES §8's two-halves clear()+save/restore contract).
+    // Must run collectCellFreeEligible AFTER collectClosureReleaseEligible
+    // (uses its result) — same ordering emitAsyncLambda and Setup.cpp both
+    // observe. Expression bodies have no LocalDecl/capture statements of
+    // their own; clear closureReleaseEligible_ for them, mirroring the
+    // async branch's `!lam.exprBody` guard exactly (cellFreeEligible_ /
+    // boxCaptureLocals_ are unconditionally cleared+re-pinned either way,
+    // since collectCellFreeEligible/collectBoxCaptureLocals over an empty
+    // `lam.stmts` would be a no-op collection, not a stale one — but an
+    // expr body never reaches this point with non-empty stmts to collect
+    // over, so the clear is what matters).
+    CaptureReclaimSetScope captureReclaimScopeSync(*this);
+    boxCaptureLocals_.clear();
+    singleCaptureLocals_.clear();
+    assignedCaptureVars_.clear();          // fix #2706
+    definitelyEscapingLambdas_.clear();
+    boxCaptureLocalsFn_ = fn;
+    cellFreeEligible_.clear();
+    unwindUnsafeCellFree_.clear();         // fix #2334
+    sharedCellEnvdtorFreeOwner_.clear();   // fix #3426
+    cellFreeEligibleFn_ = fn;
+    if (!lam.exprBody) {
+        collectClosureReleaseEligible(lam.stmts);
+        collectBoxCaptureLocals(lam.stmts);
+        collectDefinitelyEscapingLambdas(lam.stmts);
+        // Must run AFTER collectClosureReleaseEligible (uses its result).
+        collectCellFreeEligible(lam.stmts);
+    } else {
+        closureReleaseEligible_.clear();
+        // fix #3757 follow-up: closureLocalCandidates_ must clear alongside
+        // closureReleaseEligible_ for the SAME reason an expr body clears the
+        // set above — collectClosureReleaseEligible (which would otherwise
+        // repopulate both together) never runs for an expr body, so leaving
+        // this one stale would let a returned identifier that merely CAPTURES
+        // an outer closure-typed local pass returnedClosureLocalOwnsPlusOne's
+        // body-membership guard on a leftover hit from whatever body last
+        // populated it (typically the ENCLOSING scope's own scan) — the exact
+        // hazard that guard exists to close, reopened by an incomplete clear.
+        closureLocalCandidates_.clear();
+    }
+    closureReleaseEligibleFn_ = fn;
     // Emit body.
     if (lam.exprBody) {
         llvm::Value* v = nullptr;

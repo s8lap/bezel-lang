@@ -9197,6 +9197,21 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
     // #422 / §27.5 / §28.9: which `var` closure (function-typed) locals may be
     // released at scope end (mirrors stringReleaseEligible_).
     closureReleaseEligible_.clear();
+    // fix #3757 follow-up (review nit): closureLocalCandidates_ must clear
+    // alongside closureReleaseEligible_ HERE too, not only inside
+    // collectClosureReleaseEligible below — an EXPRESSION-bodied method
+    // (ci.bodyKind != Block) never reaches the `collectClosureReleaseEligible`
+    // call a few lines down (it is gated on `ci.bodyKind == Block && ci.stmts`),
+    // so without this line closureLocalCandidates_ would carry over whatever
+    // the PREVIOUS body's scan left in it while this arrow-bodied method's own
+    // closureReleaseEligibleFn_ is pinned below — the same two-halves
+    // clear()+populate contract every sibling site in this family already
+    // holds. No reachable exploit found for this specific site (an
+    // arrow-bodied method's own ReturnStmt/expr-return path does not consult
+    // returnedClosureLocalOwnsPlusOne the way a lambda body's does), but the
+    // invariant must hold at every clear site, not only the ones a repro
+    // happens to reach today.
+    closureLocalCandidates_.clear();
     closureReleaseEligibleFn_ = fn;
     // #422 / §8.6 / §28.9: which `var` Object/interface locals holding a boxed
     // VALUE may be released at scope end (mirrors stringReleaseEligible_).
@@ -23545,6 +23560,36 @@ bool Emitter::returnedClosureLocalOwnsPlusOne(const ast::Expr* e) const {
     auto* loc = dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*id));
     if (!loc || !loc->decl) return false;
     const void* declNode = static_cast<const void*>(loc->decl);
+    // fix #3757 follow-up (§27.5 / §28.9, v0.286): the decl must belong to the
+    // body being lowered — mirrors #2817's identical fix for
+    // returnedStringLocalOwnsPlusOne exactly, and for the identical reason: the
+    // fn-token guard above (`currentFn_ != closureReleaseEligibleFn_`) does not
+    // establish that on its own. A lambda body can NAME an enclosing local (a
+    // §27.5 CAPTURE, not a local of this body at all) — e.g.
+    // `var f := lambda(): () -> int => do return inner; end;` where `inner` is
+    // declared in the ENCLOSING scope. Without this test, the producer branch
+    // below re-derives "+1 producer initializer" from `inner`'s OWN (enclosing)
+    // declaration and reports "owns +1" for a reference this body does not own
+    // at all — skipping the return-site mint that pairs with the capturing
+    // env's later `bz_closure_release`, so the caller's use of the returned
+    // closure races the capture's own release: a heap-use-after-free (measured
+    // via `bz$lam$…$envdtor` freeing the cell before a later closure call reads
+    // it). This was UNREACHABLE for the SYNC-LAMBDA venue before #3757/#3762
+    // pinned closureReleaseEligibleFn_ there — that venue could never satisfy
+    // `currentFn_ == closureReleaseEligibleFn_` before this commit, so it
+    // could never reach this predicate's body at all. (It WAS already
+    // independently reachable via `emitAsyncLambda`'s resume fn, which has
+    // pinned this token unconditionally since long before this commit —
+    // filed separately as #3773, since that venue's own fix needs a file
+    // this commit does not own.) Pinning the token for a NEW venue is
+    // precisely what LANE_RULES §7 calls "giving a previously-inert slot a
+    // real value" — it makes this pre-existing, latent defect newly
+    // reachable FOR THIS VENUE, and it must be fixed in the same change.
+    // closureLocalCandidates_ (LlvmBackend_impl.hpp) is the closure twin of
+    // stringLocalCandidates_ — every candidate collectClosureReleaseEligible's
+    // scan found WITHIN the analyzed body, so membership proves `declNode`
+    // belongs to THIS body rather than an enclosing one.
+    if (!closureLocalCandidates_.count(declNode)) return false;
     // A producer-initialized closure local: the lambda / method-ref +1 was
     // transferred into the slot (closureReleaseEligible_ or not — the slot
     // always holds the producer's +1).
@@ -24510,6 +24555,7 @@ struct ClosureEscapeWalker {
 void Emitter::collectClosureReleaseEligible(
         const std::vector<std::unique_ptr<ast::Stmt>>& body) {
     closureReleaseEligible_.clear();
+    closureLocalCandidates_.clear();  // fix #3757 follow-up
     // Find every `var` (non-using) closure LocalDecl whose initializer is a
     // +1 closure producer: either a codegen-internal producer (a lambda /
     // method reference — isPlusOneClosureProducer) or a call to a
@@ -24558,8 +24604,12 @@ void Emitter::collectClosureReleaseEligible(
             LocalDeclInitView v = localDeclInitView(s);
             if (v.init && !v.isUsing &&
                 (isPlusOneClosureProducer(v.init) ||
-                 isUserMethodClosureReturnCall(v.init)))
+                 isUserMethodClosureReturnCall(v.init))) {
                 candidates.push_back(s);
+                // fix #3757 follow-up: this decl belongs to the body being
+                // analyzed — see closureLocalCandidates_'s declaration.
+                closureLocalCandidates_.insert(static_cast<const void*>(s));
+            }
         }
         if (auto* is = dynamic_cast<const ast::IfStmt*>(s)) {
             for (auto& b : is->ifBranch.body) scan(b.get());

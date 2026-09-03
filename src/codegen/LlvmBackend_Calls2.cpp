@@ -12238,6 +12238,9 @@ llvm::Function* Emitter::buildSpecializedMethodFn(
     // fix would have introduced.
     auto savedClosureReleaseEligible = closureReleaseEligible_;
     llvm::Function* savedClosureReleaseEligibleFn = closureReleaseEligibleFn_;
+    // fix #3757 follow-up: closureLocalCandidates_ travels with the pair
+    // above (see its declaration, LlvmBackend_impl.hpp).
+    auto savedClosureLocalCandidates = closureLocalCandidates_;
     // fix #568 / §8.6: the specialized body's ReturnStmt lowering consults
     // currentReturnTypeNode_ (return-value boxing, nullable-value coercion). It
     // must name THIS method's declared return type while the body is emitted —
@@ -12559,6 +12562,8 @@ llvm::Function* Emitter::buildSpecializedMethodFn(
     // fix #2854: restore the outer body's closure-release state (see the save).
     closureReleaseEligible_ = std::move(savedClosureReleaseEligible);
     closureReleaseEligibleFn_ = savedClosureReleaseEligibleFn;
+    closureLocalCandidates_ =
+        std::move(savedClosureLocalCandidates);  // fix #3757 follow-up
     currentReturnTypeNode_ = savedRetNode;
     currentSpecMethodSymbol_ = savedSpecMs;  // fix #628
     emittingGenericTemplateBody_ = savedGenTemplate;  // #817

@@ -62,16 +62,11 @@
 #include "support/aot_support.hpp"   // runAot / runAotChecked — AOT harness
 #include "test_harness.hpp"
 
-using bezel::test::runAot;
 using bezel::test::runAotChecked;
 
 namespace {
 std::string checkedOut(const std::string& prog) {
     auto r = runAotChecked(prog);
-    return r.ran ? r.stdoutText : std::string("<did-not-run>");
-}
-std::string plainOut(const std::string& prog) {
-    auto r = runAot(prog);
     return r.ran ? r.stdoutText : std::string("<did-not-run>");
 }
 
@@ -329,30 +324,23 @@ BEZEL_TEST(sync_lambda_inline_owned_array_disposal_3738,
 // §6): the walker already special-cases this shape for the three
 // state-machine emitters and the async lambda, so this row is a regression
 // guard on the REUSE, not new logic.
-// KNOWN GAP, out of scope for #3738 and filed separately: a captured
-// inline-owned array normally disposes THROUGH its capture cell at scope end
-// (tests/codegen/inline_owned_array_disposal_747_test.cpp
-// closure_capture_disposes_via_cell_782, a PLAIN METHOD body) — but that
-// cell-free eligibility (`cellFreeEligibleFn_`/`boxCaptureLocalsFn_`) is a
-// SEPARATE Fn-keyed token family this commit's file ownership excludes, and
-// (measured: `grep` finds no `cellFreeEligibleFn_ =` / `boxCaptureLocalsFn_ =`
-// anywhere in lowerLambda's sync path) it is never re-pinned for a SYNC
-// LAMBDA venue either — so inside a sync lambda specifically (unlike a plain
-// method body) the captured array's cells are NEVER disposed: a real,
-// program-observable leak (`Cell.n` itself, not only ASan) of `total=600
-// n=400` — measured identical on BOTH sides of this commit (this fix's file
-// ownership is the §15.3 transfer-analysis token alone, never touches the
-// closure-capture family), confirmed clean of any double-free/UAF under
-// `bezelc --sanitize=address` separately (LeakSanitizer reports the leak,
-// nothing else). This row pins that KNOWN value with plain `runAot` (no LSan,
-// since the leak is real and expected, not a defect this row exists to
-// detect) so it still fails loudly if this shape ever regresses to a
-// NEGATIVE `n` (a double free) or a crash; it is intentionally NOT `n=0` —
-// see the new issue filed alongside this commit. 200 * 3 = 600.
-// per §15.3, §27.5 (issue #3738)
+//
+// FLIPPED by fix #3757 (§27.5 / §15.3, v0.286): this row was a KNOWN GAP —
+// `total=600 n=400` — because the SIBLING Fn-keyed token family
+// (`cellFreeEligibleFn_`/`boxCaptureLocalsFn_`, the closure-capture-cell
+// disposal family) was, like the §15.3 transfer token this file's own fix
+// pins, never re-pinned for the sync-lambda venue either. #3757 pins it
+// (`lowerLambda`'s sync branch, reusing the existing `CaptureReclaimSetScope`
+// RAII guard, LlvmBackend_impl.hpp — added by fix #3500, no new predicate),
+// so `a`'s cell-free-through-capture-cell disposal now registers correctly
+// and `n` is `0`. Now `runAotChecked` (ASan/LSan) instead of plain `runAot`:
+// with the gap closed there is no longer a known leak to dodge, and this is
+// exactly the shape (`[N owned]T` disposed through a capture cell) LSan must
+// certify clean. 200 * 3 = 600.
+// per §15.3, §27.5 (issue #3738; flipped by #3757)
 BEZEL_TEST(sync_lambda_inline_owned_array_disposal_3738,
            captured_by_nested_lambda_no_double_free_spec_27_5) {
-    BEZEL_EXPECT_EQ(plainOut(
+    BEZEL_EXPECT_EQ(checkedOut(
         std::string(kHdr) +
         "class C "
         "  public static method Run(): int "
@@ -367,5 +355,5 @@ BEZEL_TEST(sync_lambda_inline_owned_array_disposal_3738,
         "    var total := 0; "
         "    for var j in 0..<200 do total := total + C.Run(); end; " +
         kTail),
-        "total=600 n=400\n");
+        "total=600 n=0\n");
 }

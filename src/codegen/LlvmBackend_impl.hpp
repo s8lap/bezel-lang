@@ -11425,6 +11425,7 @@ private:
             : e_(e),
               closureReleaseEligible_(e.closureReleaseEligible_),
               closureReleaseEligibleFn_(e.closureReleaseEligibleFn_),
+              closureLocalCandidates_(e.closureLocalCandidates_),  // fix #3757 follow-up
               boxCaptureLocals_(e.boxCaptureLocals_),
               singleCaptureLocals_(e.singleCaptureLocals_),
               assignedCaptureVars_(e.assignedCaptureVars_),
@@ -11437,6 +11438,8 @@ private:
         ~CaptureReclaimSetScope() {
             e_.closureReleaseEligible_ = std::move(closureReleaseEligible_);
             e_.closureReleaseEligibleFn_ = closureReleaseEligibleFn_;
+            e_.closureLocalCandidates_ =
+                std::move(closureLocalCandidates_);  // fix #3757 follow-up
             e_.boxCaptureLocals_ = std::move(boxCaptureLocals_);
             e_.singleCaptureLocals_ = std::move(singleCaptureLocals_);
             e_.assignedCaptureVars_ = std::move(assignedCaptureVars_);
@@ -11457,6 +11460,7 @@ private:
         Emitter& e_;
         std::unordered_set<const void*> closureReleaseEligible_;
         llvm::Function* closureReleaseEligibleFn_;
+        std::unordered_set<const void*> closureLocalCandidates_;  // fix #3757 follow-up
         std::unordered_set<const void*> boxCaptureLocals_;
         std::unordered_set<const void*> singleCaptureLocals_;
         std::unordered_set<const void*> assignedCaptureVars_;
@@ -13198,6 +13202,21 @@ private:
     // inherits no eligibility, so its closure locals just leak (never
     // double-freed).
     llvm::Function* closureReleaseEligibleFn_ = nullptr;
+    // fix #3757 follow-up (§27.5 / §28.9, v0.286): the closure twin of
+    // `stringLocalCandidates_` (fix #2817) — every closure-typed LocalDecl
+    // `collectClosureReleaseEligible`'s scan actually found WITHIN the body it
+    // analyzed (a +1-producer or user-method-closure-return initializer),
+    // regardless of the subsequent escape verdict. `returnedClosureLocalOwnsPlusOne`
+    // consults this so its producer-initializer arm cannot re-derive "owns a
+    // +1" from an OUTER-SCOPE decl merely CAPTURED (not declared) in the body
+    // being lowered — see that function's own comment for the exact hazard
+    // (identical in shape to the one #2817 fixed for strings, and reachable
+    // for the first time once a lambda-like venue's closureReleaseEligibleFn_
+    // is correctly pinned to its own body, which #3757/#3762 does for the
+    // sync-lambda venue). `closureReleaseEligible_` itself needs no such guard
+    // — every entry it holds is, by construction, one of THIS scan's own
+    // candidates.
+    std::unordered_set<const void*> closureLocalCandidates_;
     // Compute closureReleaseEligible_ for a block body (see the .cpp).
     void collectClosureReleaseEligible(
         const std::vector<std::unique_ptr<ast::Stmt>>& body);
