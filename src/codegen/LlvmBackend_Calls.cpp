@@ -6855,19 +6855,17 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 decodeDictGenericKeyAt(dtKeyLlvm, dtKeysArr, dtIdx,
                                        "dictterm.kgen").first;
 
-            // Decode the target value. NOTE (#3717 §6b): this arm's
-            // `loadAsStruct` predicate is `dtValLlvm->isStructTy()` alone —
-            // broader than lowerDictEntryFor's / wrapDictionaryAsIEnumerable's
-            // `valRec || (valNullableVal && isStructTy())` (see
-            // decodeDictValueAt's declaration for why the two are preserved
-            // separately rather than merged: they are not proven equivalent
-            // for a struct-lowering V that is neither a record nor a nullable
-            // value type). Identical decode to GetOrNull's stored-slot unbox
-            // a few arms down otherwise: struct -> load the box, pointer ->
-            // the borrow itself, scalar -> ptrtoint + trunc/bitcast.
+            // Decode the target value. fix #3758: decodeDictValueAt now
+            // derives struct-vs-scalar from `dtValLlvm` itself (previously
+            // this arm's own `dtValLlvm->isStructTy()` argument — see #3717
+            // §6b history in the helper's declaration — was already the
+            // broader predicate lowerDictEntryFor's/wrapDictionaryAsIEnumerable's
+            // callers now share, so this call site's behaviour is unchanged).
+            // Identical decode to GetOrNull's stored-slot unbox a few arms
+            // down otherwise: struct -> load the box, pointer -> the borrow
+            // itself, scalar -> ptrtoint + trunc/bitcast.
             llvm::Value* dtValDecoded = decodeDictValueAt(
-                dtValLlvm, dtValsArr, dtIdx,
-                /*loadAsStruct=*/dtValLlvm->isStructTy(), "dictterm.vrec");
+                dtValLlvm, dtValsArr, dtIdx, "dictterm.vrec");
 
             // Free every per-key blob (bz_dict_keys_gen mallocs one per
             // entry regardless of which index is chosen — mirrors

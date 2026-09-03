@@ -15654,21 +15654,40 @@ private:
         llvm::Type* keyLlvm, llvm::Value* keysArr, llvm::Value* idx,
         const char* namePrefix);
 
-    // decodeDictValueAt decodes the VALUE half at `idx` out of `valsArr`:
-    // struct-load the boxed slot when `loadAsStruct` is true, else
+    // fix #3758 (§4.8 / §9.x choice lowering, v0.286): decodeDictValueAt
+    // decodes the VALUE half at `idx` out of `valsArr` — struct-load the
+    // boxed slot when `valLlvm` itself lowers to an LLVM struct type, else
     // ptrtoint+bitcast/trunc a scalar out of the pointer-sized slot, else pass
-    // the raw pointer through as a borrow. `loadAsStruct` is supplied BY THE
-    // CALLER using its own pre-existing predicate, verbatim, rather than a new
-    // one this helper invents: the for-in loop / materializer / GetEnumerator
-    // sites test `valRec || (valNullableVal && valLlvm->isStructTy())`
-    // (record OR nullable-value-type), while #3576's arm tests the broader
-    // `valLlvm->isStructTy()` alone (see that arm's call site for why — #3717
-    // §6b: the two are NOT proven equivalent for a struct-lowering V that is
-    // neither a record nor a nullable value type, e.g. a Choice, so this
-    // lane preserves both spellings rather than merging them).
+    // the raw pointer through as a borrow.
+    //
+    // Before this fix `loadAsStruct` was a caller-supplied bool: the for-in
+    // loop / materializer / GetEnumerator sites computed
+    // `valRec || (valNullableVal && valLlvm->isStructTy())` (record OR
+    // nullable-value-type) while #3576's arm computed the broader
+    // `valLlvm->isStructTy()` alone. narrow #3717 preserved that divergence
+    // verbatim rather than merge it, on the stated grounds that "nothing in
+    // this codebase currently reaches" a struct-lowering V that is neither a
+    // record nor a nullable value type. That claim was FALSE: a value-like
+    // `choice` ALSO lowers to a bare LLVM struct (see isNullableValueTy's
+    // header comment enumerating record/enum/prim/choice/value-builtin/unit
+    // as the nullable-value family, and the SAME is true of a bare,
+    // non-nullable choice) — so `for var e in d` over a
+    // `Dictionary<int, Choice>` hit the narrower predicate's `false` branch
+    // and this function's scalar arm tried to `trunc` an i64 into a struct
+    // type, which the IR verifier rejects (`Trunc only produces integer`).
+    //
+    // `isStructTy()` is a strict superset of the old narrow predicate for
+    // every V this function can be called with: `valRec` and
+    // `valNullableVal && isStructTy()` both imply `isStructTy()` already, so
+    // deriving `loadAsStruct` from `valLlvm` itself here — once, in the ONE
+    // place all four callers already agree the boxed-vs-scalar-vs-pointer
+    // decision belongs — both closes the crash and removes the drift #3717's
+    // review flagged, without changing behaviour for int / nullable-int /
+    // record / class / string V at any of the three callers that route
+    // through this helper (see the callers' §6b notes for the object-parity
+    // measurement).
     llvm::Value* decodeDictValueAt(llvm::Type* valLlvm, llvm::Value* valsArr,
-                                    llvm::Value* idx, bool loadAsStruct,
-                                    const char* namePrefix);
+                                    llvm::Value* idx, const char* namePrefix);
 
     // fix #3488 / stdlib §4.17 / spec §14.2: the same-ABI comparator thunk for a
     // REFERENCE key/element (a class or an interface that satisfies

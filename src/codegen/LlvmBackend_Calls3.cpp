@@ -1689,13 +1689,19 @@ llvm::Value* Emitter::lowerToLazyEnumerator(const ast::Expr& recvExpr,
         const sema::TypeRef* keyTy = recvTy->genericArgs[0];
         const sema::TypeRef* valTy = recvTy->genericArgs[1];
 
-        // Determine record / nullable-val flags for value (mirrors lowerDictEntryFor).
+        // fix #3758 (§4.8 / §9.x, v0.286): `valRec` still selects a debug-name
+        // prefix below. It and the OLD `valNullableVal && isStructTy()` arm
+        // were merged into a single `isStructTy()` predicate a few lines down
+        // — see that decode's comment: #3754 named this arm as one of the two
+        // copies NOT routed through decodeDictValueAt, and this lane's brief
+        // permits applying the SAME one-line predicate widening in place
+        // without extracting a shared helper here (that unification is
+        // #3754's job).
         const sema::TypeSymbol* valRec =
             (valTy->kind == sema::TypeRef::Kind::Named &&
              valTy->declaration &&
              valTy->declaration->kind == ast::TypeDeclKind::Record)
                 ? valTy->declaration : nullptr;
-        bool valNullableVal = isNullableValueTy(valTy);
 
         llvm::Type* keyLlvm = lowerTypeRef(keyTy);
         llvm::Type* valLlvm = lowerTypeRef(valTy);
@@ -1894,15 +1900,22 @@ llvm::Value* Emitter::lowerToLazyEnumerator(const ast::Expr& recvExpr,
                     keyDecoded = llvm::Constant::getNullValue(keyLlvm);
                 }
 
-                // --- decode value (mirrors lowerDictEntryFor) ---
+                // --- decode value (mirrors lowerDictEntryFor). fix #3758:
+                // struct-load whenever `valLlvm` itself lowers to an LLVM
+                // struct — record OR nullable-value-type OR a value-like
+                // choice (a bare choice also lowers to a struct; the OLD
+                // `valRec || (valNullableVal && isStructTy())` predicate
+                // excluded that third case and made the branch below try to
+                // `trunc` an i64 into a struct type, the exact IR-verifier
+                // crash issue #3758 reports for `d.Select(...)` /
+                // `d.Where(...)` etc. over a `Dictionary<K, Choice>`). ---
                 llvm::Value* vpPtr =
                     builder_.CreateGEP(ptrTy(), valsArr, idxB);
                 llvm::Value* slotV = builder_.CreateLoad(ptrTy(), vpPtr);
                 llvm::Value* valDecoded;
-                if (valRec) {
-                    valDecoded = builder_.CreateLoad(valLlvm, slotV, "dmat.vrec");
-                } else if (valNullableVal && valLlvm->isStructTy()) {
-                    valDecoded = builder_.CreateLoad(valLlvm, slotV, "dmat.vnv");
+                if (valLlvm->isStructTy()) {
+                    valDecoded = builder_.CreateLoad(
+                        valLlvm, slotV, valRec ? "dmat.vrec" : "dmat.vnv");
                 } else if (!valLlvm->isPointerTy()) {
                     llvm::Value* asI64 = builder_.CreatePtrToInt(slotV, i64());
                     if (valLlvm->isDoubleTy())

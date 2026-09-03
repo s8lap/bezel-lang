@@ -11020,9 +11020,20 @@ bool Emitter::dictEntryWrapShapeSupported(const sema::TypeRef* iEnumTy,
     // convert a deterministic SIGSEGV into a QUIET WRONG ANSWER, which is the
     // trade this arm was narrowed to avoid in the first place. They come in
     // with 3563, not before it; the gate is one `TypeDeclKind` away.
-    //   A CHOICE value is declined for a third, independent reason: it lowers
-    // to a bare struct that is neither `valRec` nor `valNullableVal`, so the
-    // decode's scalar arm would try to `trunc` an i64 into a struct type.
+    //   A CHOICE value was ALSO declined for a third, independent reason: it
+    // lowers to a bare struct that is neither `valRec` nor `valNullableVal`,
+    // so the decode's scalar arm would try to `trunc` an i64 into a struct
+    // type — measured as the exact `Trunc only produces integer` IR-verifier
+    // crash issue #3758 reports for `for var e in d` over
+    // `Dictionary<int, Choice>`. fix #3758 closes THAT reason (decodeDictValueAt
+    // now derives struct-vs-scalar from `valLlvm` itself, so it struct-loads
+    // a choice correctly), but a choice V stays declined HERE regardless: its
+    // disposal obligation through `dictSnapshotValueDisposers` and its
+    // `x.Value.<member>` lowering on the wrapped entry face are both
+    // unaudited for a choice payload (issue 3563 measured only record/class),
+    // so admitting it here would risk the exact quiet-wrong-answer trade the
+    // record/class exclusion above was written to avoid. Filed as followup
+    // #3767 rather than lifted speculatively.
     if (valTy->kind == K::Primitive) return true;
     const ast::TypeDeclKind* vk = namedDeclKind(valTy);
     return vk && *vk == ast::TypeDeclKind::Enum;
@@ -11042,12 +11053,13 @@ llvm::Value* Emitter::wrapDictionaryAsIEnumerable(
     const sema::TypeRef* keyTy = entryTy->genericArgs[0];
     const sema::TypeRef* valTy = entryTy->genericArgs[1];
 
-    // Record / nullable-val flags for value (mirrors lowerDictEntryFor).
+    // fix #3758: `valRec` still selects a debug-name prefix below;
+    // decodeDictValueAt's struct-vs-scalar decision no longer needs a
+    // per-caller flag (it now reads valLlvm's own LLVM type).
     const sema::TypeSymbol* valRec =
         (valTy->kind == sema::TypeRef::Kind::Named && valTy->declaration &&
          valTy->declaration->kind == ast::TypeDeclKind::Record)
             ? valTy->declaration : nullptr;
-    bool valNullableVal = isNullableValueTy(valTy);
 
     llvm::Type* keyLlvm = lowerTypeRef(keyTy);
     llvm::Type* valLlvm = lowerTypeRef(valTy);
@@ -11148,11 +11160,10 @@ llvm::Value* Emitter::wrapDictionaryAsIEnumerable(
             keyDecoded = llvm::Constant::getNullValue(keyLlvm);
         }
 
-        // --- decode value (mirrors lowerDictEntryFor) ---
+        // --- decode value (mirrors lowerDictEntryFor; fix #3758: struct-vs-
+        // scalar is now decided BY decodeDictValueAt from valLlvm itself) ---
         llvm::Value* valDecoded = decodeDictValueAt(
-            valLlvm, valsArr, idxB,
-            /*loadAsStruct=*/valRec || (valNullableVal && valLlvm->isStructTy()),
-            valRec ? "denum.vrec" : "denum.vnv");
+            valLlvm, valsArr, idxB, valRec ? "denum.vrec" : "denum.vnv");
 
         // Store key at field 0, value at field 1 and append.
         builder_.CreateStore(keyDecoded,

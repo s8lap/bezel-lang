@@ -6829,11 +6829,16 @@ std::pair<llvm::Value*, llvm::Value*> Emitter::decodeDictGenericKeyAt(
 }
 
 llvm::Value* Emitter::decodeDictValueAt(llvm::Type* valLlvm, llvm::Value* valsArr,
-                                        llvm::Value* idx, bool loadAsStruct,
+                                        llvm::Value* idx,
                                         const char* namePrefix) {
     llvm::Value* vpPtr = builder_.CreateGEP(ptrTy(), valsArr, idx);
     llvm::Value* slotV = builder_.CreateLoad(ptrTy(), vpPtr);
-    if (loadAsStruct)
+    // fix #3758: derived from the lowered type itself (a struct-lowering V
+    // is ALWAYS struct-loaded from the box, whether it is a record, a
+    // nullable value type, or a choice) rather than a caller-supplied bool —
+    // see the declaration in LlvmBackend_impl.hpp for why this is a strict
+    // widening, not a behaviour change, for every V reachable before this fix.
+    if (valLlvm->isStructTy())
         return builder_.CreateLoad(valLlvm, slotV, namePrefix);
     if (!valLlvm->isPointerTy()) {
         llvm::Value* asI64 = builder_.CreatePtrToInt(slotV, i64());
@@ -6872,13 +6877,14 @@ bool Emitter::lowerDictEntryFor(const ast::ForStmt& fs) {
     const sema::TypeRef* keyTy = dictTy->genericArgs[0];
     const sema::TypeRef* valTy = dictTy->genericArgs[1];
 
-    // Determine record / nullable-val flags for value (mirrors lowerDictValuesFor).
+    // fix #3758: `valRec` still selects a debug-name prefix below;
+    // decodeDictValueAt's struct-vs-scalar decision no longer needs a
+    // per-caller flag (it now reads valLlvm's own LLVM type).
     const sema::TypeSymbol* valRec =
         (valTy->kind == sema::TypeRef::Kind::Named &&
          valTy->declaration &&
          valTy->declaration->kind == ast::TypeDeclKind::Record)
             ? valTy->declaration : nullptr;
-    bool valNullableVal = isNullableValueTy(valTy);
 
     llvm::Type* keyLlvm = lowerTypeRef(keyTy);
     llvm::Type* valLlvm = lowerTypeRef(valTy);
@@ -7022,11 +7028,10 @@ bool Emitter::lowerDictEntryFor(const ast::ForStmt& fs) {
             keyDecoded = llvm::Constant::getNullValue(keyLlvm);
         }
 
-        // --- decode value (mirrors lowerDictValuesFor) ---
+        // --- decode value (mirrors lowerDictValuesFor; fix #3758: struct-vs-
+        // scalar is now decided BY decodeDictValueAt from valLlvm itself) ---
         llvm::Value* valDecoded = decodeDictValueAt(
-            valLlvm, valsArr, idxB,
-            /*loadAsStruct=*/valRec || (valNullableVal && valLlvm->isStructTy()),
-            valRec ? "de.vrec" : "de.vnv");
+            valLlvm, valsArr, idxB, valRec ? "de.vrec" : "de.vnv");
 
         // Store key at field 0, value at field 1 of the entry struct.
         builder_.CreateStore(keyDecoded,
