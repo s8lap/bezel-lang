@@ -352,6 +352,40 @@ std::unique_ptr<ast::Expr> Parser::parsePrimaryExpressionImpl() {
         // and expression parts. The lexer already validated balanced braces.
         splitInterpolation(*e);
         advance();
+        // fix #3724 (§18.5 / §22.8 / §2.8.2, v0.286): CLOSE the span. The two
+        // lines above pre-stamp `span.begin`/`span.end` at the SAME location so
+        // splitInterpolation's own diagnostics have somewhere to point — but a
+        // non-zero `span.begin.line` also makes `parsePrimaryExpression`'s
+        // `stampSpan` wrapper (which only stamps a node whose span is still
+        // unset, `span.begin.line == 0`) a NO-OP here. Every other primary gets
+        // `[firstToken, tokenAfter)` from that wrapper; this one alone was left
+        // ZERO-WIDTH, i.e. `span.end.offset == span.begin.offset`.
+        //
+        // That is not cosmetic: every SOURCE-SLICING consumer guards on
+        // `span.begin.offset < span.end.offset` and silently falls back when it
+        // fails. ModuleMetadataBuilder's `fieldInitText` carriage (#2860/#2871/
+        // #3723, ModuleMetadataBuilder.cpp) therefore never wrote a single byte
+        // for an interpolated-string field initializer, so the importer's §22.8
+        // step-2 replay (`importedInstanceFieldInitExpr`, #2874, consumed by
+        // `emitOwnFieldInit` for a class and `buildRecordValue` for a record)
+        // had nothing to reconstruct AND the #2860 construction-site reject had
+        // no text to fire on: `public bInterp: string := $"v{H.Get()}";` on an
+        // imported generic/record left the non-nullable `string` slot on its
+        // §7.9 calloc-zero null, and `.Length`/`+` on it SEGFAULT because a
+        // non-nullable slot is assumed by construction never to hold null.
+        // The same guard fronts `canonicalClauseText` (contract-clause
+        // carriage, same file), whose fallback is the literal text
+        // "<expression>"; that consumer is not reachable for this node today
+        // — a `requires`/`ensures`/`invariant` clause is boolean-typed, so a
+        // bare interpolation cannot BE one — but it is the same guard over the
+        // same authority. Closing the span here repairs that authority once,
+        // instead of teaching each consumer a second spelling of "where does
+        // this expression end".
+        //
+        // `current_.location` is the token AFTER the string — exactly the upper
+        // bound `stampSpan` would have supplied, so the slice matches every
+        // other expression's convention.
+        e->span.end = current_.location;
         return std::unique_ptr<ast::Expr>(e.release());
     }
     // §A.7 high-only and fully-open RangeExpr forms: `..b`, `..<b`, `..`.

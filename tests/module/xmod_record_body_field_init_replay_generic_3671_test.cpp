@@ -66,13 +66,17 @@
 //   - `new`                (`new Pt(3, 4)`)            — was silently 0, now replays (T2)
 //   - static member read   (`H.Val`)                   — was silently 0, now replays (T3)
 //   - conditional           (`(if H.Get() > 0 then 1 else 2)`) — was silently 0, now replays (T4)
-//   - interpolation        (`$"v{H.Get()}"`)           — STILL WRONG on both the record path
-//     AND its class twin (a separate, pre-existing #2874-family defect in the
-//     shared load-time reconstruction, confirmed identical on both sides —
-//     filed as #3724). T5 pins this as a KNOWN, PARITY-ACHIEVED (not
-//     correctness-achieved) shape: the record path now fails exactly the way
-//     the class path already failed, rather than failing a third, different
-//     way.
+//   - interpolation        (`$"v{H.Get()}"`)           — was silently WRONG on BOTH the
+//     record path and its class twin when THIS commit landed; FIXED later by
+//     #3724, so T5 below has been FLIPPED from pinning the known gap (`2`, the
+//     null-like answer) to pinning the correct replayed value (`0`, "v42") on
+//     both legs. #3724's root cause was NOT in this replay: the parser stamped
+//     a ZERO-WIDTH span on `ast::InterpolatedStringExpr`, so
+//     ModuleMetadataBuilder's `fieldInitText` slice — guarded by
+//     `span.begin.offset < span.end.offset` — never put the initializer on the
+//     wire at all, and neither replay arm (nor the #2860 loud reject, gated on
+//     that same text) could see it. The parity this row pins is therefore now
+//     parity at the CORRECT value.
 //
 // FAIL-WITHOUT / PASS-WITH (measured on this lane's worktree, #3671's own
 // commit): reverting `src/codegen/LlvmBackend_Exprs2.cpp` to its parent
@@ -313,49 +317,51 @@ BEZEL_TEST(xmod_record_body_field_init_replay_generic_3671,
 }
 
 // ===========================================================================
-// T5 — INTERPOLATION PARITY (documented, filed #3724, NOT this fix's
-// closure): both a GENERIC RECORD and a GENERIC CLASS field initialized with
-// `$"v{H3671.Get()}"` read back a value that is neither the exporter's
-// declared "v42" NOR a valid empty string — MEASURED (via a separate probe
-// outside this file, since `.Length`/string `+` on the result SEGFAULTS
-// deterministically, 5/5 runs, on BOTH legs — see #3724) to behave as a
-// NULL pointer stored in the non-nullable `string` slot: the null-safe `=`
-// comparison below returns `false` against every literal with no crash
-// (falling through to `return 2`), matching `Console.WriteLine` printing an
-// empty line for the same value with no crash — both of those call sites
-// have their own null guard; `.Length`/`+` do not, because a non-nullable
-// slot is assumed by construction to never hold null. That guard violation
-// is a pre-existing defect in the SHARED #2874 load-time-reconstruction
-// mechanism (something an interpolation hole's render needs is not
-// available/copied correctly when the expression tree was reconstructed in
-// `parseAndAttachFieldInit`'s throwaway `freshCtx` and remapped into
-// `mainCtx`), independent of class-vs-record — #3671 does not introduce it:
-// concatenating a record/class string field left at the ORDINARY §7.9 null
-// default (the pre-existing #3672/#3723-class gap) already SEGFAULTs the
-// same way on this same build, confirmed by a control probe.
+// T5 — INTERPOLATION PARITY, **FLIPPED by fix #3724**. When #3671 landed,
+// both a GENERIC RECORD and a GENERIC CLASS field initialized with
+// `$"v{H3671.Get()}"` read back a value that was neither the exporter's
+// declared "v42" NOR a valid empty string: a NULL pointer parked in the
+// non-nullable `string` slot. `Console.WriteLine` and `=` have their own null
+// guards (so the comparison below fell through to `return 2` with no crash),
+// while `.Length` and string `+` SEGFAULTed deterministically, 5/5 runs, on
+// BOTH legs — they emit no null guard precisely because a non-nullable slot is
+// assumed by construction never to hold null. This row pinned that shared
+// wrong answer as `2`: parity achieved, correctness not.
 //
-// This test pins PARITY, the actual scope of #3671 (two paths answering the
-// SAME question the SAME way), not correctness of that shared answer —
-// #3724 tracks fixing the shared answer (and, separately, hardening
-// `.Length`/`+` against a null non-nullable string, if that turns out to be
-// the more appropriate fix point). It deliberately does NOT invoke
-// `.Length`/`+` here — pinning a deterministic child-process SEGV belongs to
-// #3724's own regression test, not this one. If this test starts failing
-// because the class side now reads "v42" while the record side does not (or
-// vice versa), that IS a #3671-class regression; if both now read "v42",
-// strengthen this test's assertion and close #3724's class/record-parity
-// half.
+// #3724 has since FIXED it, and its root cause was NOT the shared #2874
+// load-time reconstruction this comment previously suspected. MEASURED: the
+// parser stamped a ZERO-WIDTH span on `ast::InterpolatedStringExpr` — the
+// branch pre-stamps `span.begin`/`span.end` at the same location so
+// `splitInterpolation`'s own diagnostics have somewhere to point, which also
+// makes `parsePrimaryExpression`'s `stampSpan` wrapper a no-op — so
+// ModuleMetadataBuilder's `fieldInitText` slice, guarded by
+// `span.begin.offset < span.end.offset`, never put the initializer on the wire
+// at all. Neither replay arm had anything to reconstruct, and the #2860 loud
+// reject, gated on that same text, could not fire either. The reconstruction
+// machinery was always capable of replaying an interpolation: the SAME
+// initializer wrapped in a binary `+` (`$"v{H3671.Get()}" + ""`) replayed to
+// the correct "v42" even before #3724.
+//
+// The row therefore still pins PARITY — the actual scope of #3671, two paths
+// answering the SAME question the SAME way — but now at the CORRECT shared
+// answer (`0`, i.e. "v42"). A regression that reintroduces the null shows up
+// here as `2` on both legs; a class/record divergence shows up as the parity
+// assertion failing. See
+// tests/module/xmod_imported_field_init_interpolation_3724_test.cpp for
+// #3724's own grid (the verbatim / formatted / multi-hole / hole-free shapes,
+// the non-generic class and record legs, the `.Length`/`+` crash surface, and
+// a 200-iteration ASan/LSan dispose-exactly-once row).
 // ===========================================================================
 BEZEL_TEST(xmod_record_body_field_init_replay_generic_3671,
-           t5_interpolation_shape_parity_with_class_twin_known_gap_2874) {
+           t5_interpolation_shape_parity_with_class_twin_fixed_3724) {
     std::string stem = unique_stem("bz3671_t5_");
     std::string aObj;
     BEZEL_EXPECT_TRUE(buildLib3671(stem, kLib3671, aObj));
     TempFile3671 aObjFile(aObj);
 
     auto dir = std::filesystem::temp_directory_path();
-    // 0 -> "v42" (correct/fixed), 1 -> "" (a valid empty string), 2 ->
-    // neither literal matched (the currently-measured, null-like answer).
+    // 0 -> "v42" (correct — the post-#3724 answer), 1 -> "" (a valid empty
+    // string), 2 -> neither literal matched (the pre-#3724 null-like answer).
     TempFile3671 bSrcR((dir / (stem + "_r.bzl")).string());
     TempFile3671 bExeR((dir / (stem + "_r")).string());
     writeSource3671(bSrcR.path,
@@ -378,9 +384,10 @@ BEZEL_TEST(xmod_record_body_field_init_replay_generic_3671,
 
     // Parity is the property #3671 owns: record and class must agree.
     BEZEL_EXPECT_EQ(recordResult, classResult);
-    // Documented current shared (null-like) answer — see #3724. Neither leg
-    // crashed (-1) or matched a literal (0 or 1).
-    BEZEL_EXPECT_EQ(recordResult, 2);
+    // Fixed shared answer (fix #3724): 0 — both legs read the exporter's
+    // declared "v42". This was 2 (neither literal matched: the null-like
+    // answer) until #3724 closed the metadata-carriage gap.
+    BEZEL_EXPECT_EQ(recordResult, 0);
 }
 
 // ===========================================================================

@@ -96,11 +96,17 @@
 //   - CONST fields (already constant-folded via `valueText`)  -- UNCHANGED
 //     (this fix touches only `fieldInitText`, never `valueText`)
 //   - a fully LOCAL (non-imported) non-generic record       -- UNCHANGED (T8)
-//   - interpolated (`$"..."`) initializers -- STILL WRONG on this fix as on
-//     #3671's generic case (pre-existing #3724 defect in the shared #2874
-//     load-time reconstruction, independent of class/record/generic-ness);
-//     this lane does not widen into that shape (no test here exercises it,
-//     per the brief's explicit instruction).
+//   - interpolated (`$"..."`) initializers -- was STILL WRONG when this fix
+//     landed, as on #3671's generic case; FIXED LATER by #3724, whose root
+//     cause was NOT the shared #2874 load-time reconstruction this comment
+//     originally guessed but a ZERO-WIDTH parser span on
+//     `ast::InterpolatedStringExpr`, which made THIS FILE'S OWN
+//     `fieldInitText` slice (`span.begin.offset < span.end.offset`) skip the
+//     initializer entirely -- so the shape this widening admits for a
+//     non-generic record now includes interpolation too. This lane exercised
+//     no such row (per its brief); #3724 ships that grid in
+//     tests/module/xmod_imported_field_init_interpolation_3724_test.cpp,
+//     including the non-generic record leg (its T4).
 //
 // FAIL-WITHOUT / PASS-WITH: reverting `src/module/ModuleMetadataBuilder.cpp`
 // to its parent commit (in a separate scratch copy, per LANE_RULES
