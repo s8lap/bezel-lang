@@ -2328,6 +2328,21 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         // set must track its guard, dictLiteralFreeEligibleFn_, which IS
         // restored two lines below.)
         auto savedLiteralTreeAggElig = literalTreeAggregateEligible_;
+        // fix #3728 (§15.1.1 / §15.3 / §28.9, v0.286): emitAsyncLambda now ALSO
+        // recomputes the §15.3 move-only owning inline-array TRANSFER set for
+        // the lambda body and keys it to the lambda resume fn (the same
+        // re-establishment #3699 gave the three state-machine emitters). Save
+        // and restore it exactly like the borrowing-collection sets above — the
+        // §8 "clear() + nested-emission save/restore are two halves of ONE
+        // contract" rule (LANE_RULES) — or a LATER `[N owned]T` local in the
+        // ENCLOSING async body would be tested against the lambda's stale
+        // transfer set (wrong fn key): the mismatch fails safe (a leak, per the
+        // guard's own "conservatively-misjudged transfer at worst LEAKS"), but
+        // is still wrong and is exactly the class of defect this run's dedup
+        // discipline exists to prevent.
+        auto savedMoveOnlyArrayTransferred = moveOnlyArrayTransferred_;
+        llvm::Function* savedMoveOnlyArrayTransferredFn =
+            moveOnlyArrayTransferredFn_;
 
         emitAsyncLambda(lam, fn, paramSyms, asyncResultElemSemaTy,
                        asyncDeclaredTaskTy);
@@ -2354,6 +2369,9 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         dictLiteralFreeEligibleFn_ = savedDictLiteralFreeEligFn;           // #2143
         literalTreeAggregateEligible_ =
             std::move(savedLiteralTreeAggElig);                            // #2660
+        // fix #3728: restore half of the save two-step above.
+        moveOnlyArrayTransferred_ = std::move(savedMoveOnlyArrayTransferred);
+        moveOnlyArrayTransferredFn_ = savedMoveOnlyArrayTransferredFn;
         // fix #3505: the whole sm*_/async*_ frame is put back by smFrameSave's
         // destructor at the end of this block. Only the member that is NOT part
         // of the retracted frame is restored by hand.

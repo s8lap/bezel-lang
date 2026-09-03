@@ -1991,6 +1991,28 @@ void Emitter::emitAsyncLambda(const ast::LambdaExpr& lam, llvm::Function* fn,
         groupingFreeEligibleFn_ = resumeFn;
         setLiteralFreeEligibleFn_ = resumeFn;   // #2142
         dictLiteralFreeEligibleFn_ = resumeFn;  // #2143
+        // fix #3728 (§15.1.1 / §15.3 / §29.7 / §30.6, v0.286): re-establish the
+        // §15.3 (#747) move-only owning inline-array TRANSFER analysis for the
+        // async LAMBDA's resume fn too — the #3699 fix gave `emitAsyncMethod` /
+        // `emitIteratorMethod` / `emitAsyncIteratorMethod` this exact
+        // re-establishment (LlvmBackend_Async.cpp ~L1400,
+        // LlvmBackend_Iterators.cpp) but DELIBERATELY declined the async lambda
+        // ("issue 3728 carries the root cause and the fix pointer" — that
+        // comment, ~60 lines above `emitAsyncMethod`'s own copy of this block):
+        // pinning `moveOnlyArrayTransferredFn_` here without the body block's
+        // `emitDisposals` fix (this commit, below) would register a Disposal
+        // into `disposeStack_` that the pop below still discarded — measured
+        // ZERO effect, hence declined as unprovable. With the body block now
+        // running `emitDisposals` on the normal edge, this registration is live
+        // for the first time. Same NO-NEW-PREDICATE / re-run-the-analysis-over-
+        // the-SAME-body argument as #3699 (LANE_RULES §6): a re-pointed-but-
+        // stale set would double-free a transferred-out `[N owned]T` (§15.3).
+        // Expression-bodied lambdas have no stmts (and no such local).
+        if (!lam.exprBody)
+            collectMoveOnlyArrayTransferred(lam.stmts);
+        else
+            moveOnlyArrayTransferred_.clear();
+        moveOnlyArrayTransferredFn_ = resumeFn;
         // CRITICAL (nested lambda): the await spill/restore loop iterates
         // smAllocaToField_, mapping a suspend-local's alloca → its frame field.
         // An ENCLOSING async method's resume populated this with ITS allocas
@@ -2174,12 +2196,43 @@ void Emitter::emitAsyncLambda(const ast::LambdaExpr& lam, llvm::Function* fn,
             // completes the task. A no-value `Task` lambda (resultTy == null)
             // ignores the value and completes with no result.
             llvm::Value* v = lowerExpr(*lam.exprBody);
+            // fix #3728 (§28.3 / §28.10 / §30.6, v0.286): dispose this scope's
+            // registrations (a match-arm scrutinee backstop is the only thing
+            // an expr-bodied lambda can register here — §28.10's own example
+            // uses a block body for `using var`, so this branch is a
+            // completeness mirror of the stmts branch below, not the
+            // measured leak) on the un-terminated normal edge, mirroring
+            // emitAsyncMethod's fall-off disposal (~L1610) and gated by the
+            // SAME terminator check already guarding the completion below —
+            // an expression that threw already diverted control to `faultBB`
+            // and left the block terminated, so this does not run twice. `v`
+            // is the completing VALUE, never a disposeStack_-registered
+            // temporary (only bound names/backstops are registered), so
+            // disposing the scope here cannot free the value being handed to
+            // `emitAsyncComplete`.
+            if (!builder_.GetInsertBlock()->getTerminator())
+                emitDisposals(disposeStack_.back());
             if (!builder_.GetInsertBlock()->getTerminator()) {
                 emitAsyncComplete(resultTy ? v : nullptr);
                 builder_.CreateRetVoid();
             }
         } else {
             bool term = lowerBody(lam.stmts);
+            // fix #3728 (§28.3 / §28.10 / §30.6, v0.286): emitAsyncLambda's
+            // block-body resume pushed this scope and popped it with NO
+            // `emitDisposals` between — every `using var` / owned local /
+            // borrowing-`Array<T>` literal / `[N owned]T` registration this
+            // scope collected was discarded, so no destructor and no free
+            // ever ran on the normal (fall-through) edge (measured: 3200 B /
+            // 200 for `using var`, 24000 B / 400 for an `Array<int>`
+            // literal). Mirrors emitAsyncMethod's identical fix (#938,
+            // ~L1600-1611) verbatim, including its `term` guard: a body that
+            // ended in an explicit `return` already ran emitAllDisposals via
+            // the return handler, so re-running here would double-dispose —
+            // this is gated to the un-terminated fall-off path exactly as
+            // the method twin is.
+            if (!term && !builder_.GetInsertBlock()->getTerminator())
+                emitDisposals(disposeStack_.back());
             if (!term && !builder_.GetInsertBlock()->getTerminator()) {
                 emitAsyncComplete(/*value=*/nullptr);
                 builder_.CreateRetVoid();
