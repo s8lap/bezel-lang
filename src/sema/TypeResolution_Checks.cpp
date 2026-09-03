@@ -5,6 +5,7 @@
 
 #include "sema/ConstFold.hpp"
 #include "sema/EnumValues.hpp"  // enumHasZeroConstant — §17.11 default(E) (#3044)
+#include "sema/FieldSymbolAccessors.hpp"  // fieldDeclTypeOf — §28.9/§15.1.1 (#3650)
 #include "sema/GenericParams.hpp"  // detail::astGenericParams — §14.6 in-scope name set (#3271)
 #include "sema/NestedTypeWalk.hpp"  // fix #3597: promoted so PureChecker.cpp can share it too
 #include "sema/Sendability.hpp"  // isSendableType — §30.14 sendability computation
@@ -137,14 +138,28 @@ bool Resolver::recordValueContainsSelf(TypeSymbol* start, TypeSymbol* cur,
     for (Symbol* m : cur->members) {
         auto* fs = dynamic_cast<FieldSymbol*>(m);
         if (!fs || hasMod(fs, "static")) continue;
-        // A record field's type comes from its positional param (`posParam`) or,
-        // for a body field, its FieldDecl. (`fs->decl` of a positional field is
-        // the owning TypeDecl, not a FieldDecl — §9.1.)
-        const ast::Type* ftype = nullptr;
-        if (fs->posParam && fs->posParam->type)
-            ftype = fs->posParam->type.get();
-        else if (auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl))
-            ftype = fd->type.get();
+        // fix #3650 (§28.9/§15.1.1, #3152 drain): the shared both-sources
+        // field-type accessor — positional param first, then (LOCAL only)
+        // the FieldDecl. `cur` can be an IMPORTED record/choice reached
+        // through a value-typed field (see the header comment above), in
+        // which case `fieldDeclTypeOf` returns null and this field's
+        // component is simply not explored further. That is sound, not a
+        // false negative, TODAY: Driver's `compileObject`/`compileFile`
+        // dependency model is acyclic-only (src/driver/Driver.hpp,
+        // `compileObject`'s doc: "`deps` lets a dependency itself import
+        // further dependencies (acyclic)"), so no path leaving into an
+        // imported type can currently lead back to `start`, and any
+        // self-cycle wholly inside the dependency was already rejected when
+        // THAT module was compiled (this same check, run there with every
+        // symbol local). This is a DRIVER LIMITATION, not a language
+        // guarantee — §2.8.1 rule 4 (v0.286) states plainly that "import
+        // cycles between distinct modules remain legal and compile as an
+        // SCC" (§2.5). `recordValueContainsSelf` MUST be revisited when SCC
+        // import-cycle compilation lands: at that point a value-typed field
+        // chain could leave `start`'s module, cross an SCC member back into
+        // it, and this walk's silent stop at the first imported symbol
+        // would need to resume across the cycle instead of assuming safety.
+        const ast::Type* ftype = sema::fieldDeclTypeOf(fs);
         if (!ftype) continue;
         TypeSymbol* contained = valueTypeOf(ctx_.resolvedType(*ftype));
         if (!contained) continue;
@@ -272,9 +287,14 @@ void Resolver::checkTypeMemberSignatureVisibility(TypeSymbol* t) {
         // §13.3: a private member is unconstrained.
         if (mem->visibility == ast::Visibility::Private) continue;
         if (auto* fs = dynamic_cast<FieldSymbol*>(m)) {
+            // SEAM-ACCESSOR: §13.3 signature-visibility walk: `fs` is a member of `t`, which
+            // forEachTypeAndNested (#3574) draws only from this module's own
+            // declaration tree (#3152) — never an imported symbol.
             if (auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl))
                 checkSig(fd->type.get(), mem, "field");
         } else if (auto* ms = dynamic_cast<MethodSymbol*>(m)) {
+            // SEAM-ACCESSOR: same walk as the field arm just above — `ms` is a member of the
+            // locally-declared `t` (#3152).
             if (auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl)) {
                 checkSig(md->returnType.get(), mem, "return");
                 for (const auto& p : md->params)
@@ -350,6 +370,9 @@ void Resolver::checkTypeConstructorChains(TypeSymbol* t) {
     for (Symbol* m : t->members) {
         auto* cs = dynamic_cast<ConstructorSymbol*>(m);
         if (!cs) continue;
+        // SEAM-ACCESSOR: `cs` is a member of `t`, drawn from forEachTypeAndNested's local-only
+        // declaration tree (#3574 / #3152); a constructor-chain check has no
+        // reason to run over an imported type's members.
         auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
         if (!cd) continue;
         int chainCount = 0;
@@ -445,6 +468,9 @@ void Resolver::checkTypeAsyncModifiers(TypeSymbol* t) {
         // `async abstract` combination is already diagnosed above; we still run
         // the return-type check on it so the more specific cause is also named.
         if (hasMod(ms, "async")) {
+            // SEAM-ACCESSOR: `ms` is a member of the locally-declared `t` (forEachTypeAndNested,
+            // #3574) — this async-modifier check is a declaration-site check,
+            // never reached for an imported member (#3152).
             auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
             if (md && !isAdmittedAsyncReturnType(md->returnType.get())) {
                 ctx_.diagnostics().report(
@@ -520,6 +546,8 @@ void Resolver::checkTypeMethodBodies(TypeSymbol* t) {
     for (Symbol* m : t->members) {
         auto* ms = dynamic_cast<MethodSymbol*>(m);
         if (!ms) continue;
+        // SEAM-ACCESSOR: `ms` is a member of the locally-declared `t` (forEachTypeAndNested,
+        // #3574); a method-body-kind check is declaration-site only (#3152).
         auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
         if (!md) continue;
         bool noBody = md->bodyKind == ast::MethodBodyKind::Abstract;
@@ -618,6 +646,9 @@ void Resolver::checkEnumRestrictions() {
                 // (`get => 7; end P;`) is still "block-form" and equally
                 // forbidden by §10.5's unqualified wording, not just a
                 // settable one.
+                // SEAM-ACCESSOR: `ps` is a member of the locally-declared enum `t`
+                // (forEachTypeAndNested, #3574) — this §10.5 property-form check never
+                // sees an imported member (#3152).
                 if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl)) {
                     if (pd->bodyKind == ast::PropertyBodyKind::Block)
                         bad("a block-form property");
@@ -656,6 +687,8 @@ void Resolver::checkEnumRestrictions() {
         // (enumUnderlyingType) or the default `int`. A value that fits `int`
         // but exceeds a smaller declared underlying type (`enum E: byte A :=
         // 256;`) previously wrapped silently at codegen.
+        // SEAM-ACCESSOR: `t` is drawn from forEachTypeAndNested (#3574), which walks only this
+        // module's own declaration tree — never an imported type (#3152).
         if (auto* td = dynamic_cast<const ast::TypeDecl*>(t->decl)) {
             using P = PrimitiveType;
             P up = P::Int;
@@ -850,6 +883,8 @@ void Resolver::checkGenericConstraintConsistency() {
     for (Symbol* child : ctx_.module()->children) {
         auto* ts = dynamic_cast<TypeSymbol*>(child);
         if (!ts || !ts->decl) continue;
+        // SEAM-ACCESSOR: already explicitly gated one line above (`if (!ts || !ts->decl)
+        // continue;`) — this cast cannot see a null `decl` (#3152).
         auto* td = dynamic_cast<const ast::TypeDecl*>(ts->decl);
         if (!td) continue;
         std::vector<std::string_view> typeParams;
@@ -915,6 +950,8 @@ void Resolver::checkTypeConsts(TypeSymbol* t) {
     for (Symbol* m : t->members) {
         auto* cs = dynamic_cast<ConstMemberSymbol*>(m);
         if (!cs) continue;
+        // SEAM-ACCESSOR: `cs` is a member of the locally-declared `t` (forEachTypeAndNested,
+        // #3574); `t`'s OWN const members are always local (#3152).
         auto* cd = dynamic_cast<const ast::ConstDecl*>(cs->decl);
         if (!cd || !cd->type) continue;  // inferred — deferred
         TypeRef* rt = ctx_.resolvedType(*cd->type);
@@ -972,6 +1009,11 @@ void Resolver::checkTypeConsts(TypeSymbol* t) {
                         auto* scs = dynamic_cast<ConstMemberSymbol*>(sm);
                         if (!scs || scs->name != name) continue;
                         if (auto* scd =
+                                // SEAM-ACCESSOR: `ts` here walks `t`'s class BASE CHAIN (`ts->baseTypes` below), which
+                                // DOES cross module boundaries, so `scs` can be an imported const. Fix
+                                // #3230 (family M11 of #3152) already covers that: when `scd` (this AST
+                                // cast) is null, the fallback three lines below reads the loader's
+                                // typed `scs->intValue` instead of silently no-opping.
                                 dynamic_cast<const ast::ConstDecl*>(scs->decl))
                             if (scd->value)
                                 return foldIntConst(*scd->value, resolve,
@@ -1055,6 +1097,8 @@ void Resolver::checkTypeAccessorVisibility(TypeSymbol* t) {
     for (Symbol* m : t->members) {
         auto* ps = dynamic_cast<PropertySymbol*>(m);
         if (!ps) continue;
+        // SEAM-ACCESSOR: `ps` is a member of the locally-declared `t` (forEachTypeAndNested,
+        // #3574); accessor-visibility is a declaration-site check (#3152).
         auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
         if (!pd) continue;
         int propRank = visRank(pd->visibility);
@@ -1164,6 +1208,8 @@ void Resolver::checkRecordRestrictions() {
                 }
                 // Inline-array field with owned slots.
                 if (auto* fd =
+                        // SEAM-ACCESSOR: `fs` is a member of `t`, which checkRecordRestrictions draws only
+                        // from `ctx_.module()->children` — never an imported symbol (#3152).
                         dynamic_cast<const ast::FieldDecl*>(fs->decl)) {
                     if (fd->type) {
                         auto* rt = ctx_.resolvedType(*fd->type);
@@ -1197,11 +1243,13 @@ void Resolver::checkRecordRestrictions() {
                 // Positional records: type rides on `posParam->type`. Body
                 // fields: type rides on the `FieldDecl`. Resolve whichever
                 // is present and consult the §35.4 classifier.
-                const ast::Type* ftypeAst = nullptr;
-                if (fs->posParam && fs->posParam->type)
-                    ftypeAst = fs->posParam->type.get();
-                else if (auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl))
-                    ftypeAst = fd->type.get();
+                //
+                // fix #3650 (#3152 drain): the shared both-sources accessor —
+                // `fs` here is always a member of `t`, which this function's
+                // caller (checkRecordRestrictions) draws only from
+                // `ctx_.module()->children`, so `fs` is never imported and
+                // `fieldDeclTypeOf` never takes the null-`decl` branch here.
+                const ast::Type* ftypeAst = sema::fieldDeclTypeOf(fs);
                 if (ftypeAst) {
                     const TypeRef* rt = ctx_.resolvedType(*ftypeAst);
                     if (rt && rt->kind == TypeRef::Kind::Named &&
@@ -1228,6 +1276,8 @@ void Resolver::checkRecordRestrictions() {
             // an owning-classified choice type at the property declaration.
             if (auto* ps = dynamic_cast<PropertySymbol*>(m)) {
                 if (hasAstAutoPropertyDecl(ps)) {
+                    // SEAM-ACCESSOR: `ps` is a member of `t`, which checkRecordRestrictions draws only
+                    // from `ctx_.module()->children` — never an imported symbol (#3152).
                     auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
                     if (pd && pd->type) {
                         const TypeRef* rt = ctx_.resolvedType(*pd->type);
@@ -1283,6 +1333,9 @@ void Resolver::checkRecordRestrictions() {
         // IDisposable implementation: name-based check on the AST
         // base-type list (the built-in IDisposable has no user
         // TypeSymbol to resolve against).
+        // SEAM-ACCESSOR: `t` is drawn from `ctx_.module()->children`
+        // (checkRecordRestrictions's own loop) — never an imported type
+        // (#3152).
         if (auto* td = dynamic_cast<const ast::TypeDecl*>(t->decl)) {
             for (const auto& bt : td->baseTypes) {
                 if (bt && bt->name && !bt->name->parts.empty() &&
@@ -2077,6 +2130,10 @@ void Resolver::checkIndexerParamDefaults() {
             // reconstructed ParameterSymbols an IMPORTED indexer carries do
             // not record one, so an imported declaration is skipped here and
             // caught in its own module.
+            // SEAM-ACCESSOR: `ps` is a member of `t`, which checkIndexerParamDefaults draws only
+            // from `ctx_.module()->children`. An imported indexer's default-value
+            // syntax is not reconstructed (see the comment above) and is instead
+            // caught in ITS OWN module's compilation, where it was local (#3152).
             auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
             if (!pd) continue;
             for (const auto& p : pd->indexerParams) {
@@ -2472,6 +2529,11 @@ void Resolver::checkHashContainerKeys() {
     auto paramHasHashableConstraint = [](const TypeSymbol* enc,
                                          std::string_view pn) -> bool {
         if (!enc || !enc->decl) return false;  // imported type, no AST
+        // SEAM-ACCESSOR: already explicitly gated one line above
+        // (`if (!enc || !enc->decl) return false;`); returning `false` here
+        // means "no matching `hashable` constraint found", which does NOT
+        // suppress the §3.6 rule-2 check below — it makes the check fire
+        // unconditionally, the fail-SAFE direction (#3152).
         const auto* td = dynamic_cast<const ast::TypeDecl*>(enc->decl);
         if (!td) return false;
         for (const ast::GenericConstraint& gc : td->genericConstraints) {
@@ -3723,7 +3785,14 @@ void Resolver::checkOverrideSignatureMatch(MemberSymbol* derivedSym,
     if (derived->visibility != base->visibility) {
         err("visibility");
     }
+    // SEAM-ACCESSOR: `derived` is always the LOCAL override (from `t`'s own module, per
+    // the #2386 comment 15 lines below) — no import fallback needed for
+    // this side (#3152).
     auto* dDecl = dynamic_cast<const ast::MethodDecl*>(derived->decl);
+    // SEAM-ACCESSOR: fix #2386 (§12.1, family of #3152): `base` may be an IMPORTED
+    // virtual/abstract ancestor member; when this cast is null the code
+    // just below falls back to ctx_.importedReturnType/importedReturnOwned
+    // instead of silently skipping the return-type/`owned` comparison.
     auto* bDecl = dynamic_cast<const ast::MethodDecl*>(base->decl);
     // §2.8.2/§12.1 (v0.235, #2386): `base` may be an IMPORTED virtual/
     // abstract ancestor member — the BFS at this check's `override`-handling
@@ -3979,7 +4048,13 @@ void Resolver::checkPropertyOverrideSignatureMatch(PropertySymbol* derived,
         err("visibility");
     }
 
+    // SEAM-ACCESSOR: `derived` is always the LOCAL override — same reasoning as
+    // checkOverrideSignatureMatch's `dDecl` (#2386, #3152).
     auto* dDecl = dynamic_cast<const ast::PropertyDecl*>(derived->decl);
+    // SEAM-ACCESSOR: fix #2386 (§12.1/§23, family of #3152): `base` may be an imported
+    // ancestor property; when this cast is null, `bTy` two lines below
+    // falls back to ctx_.importedMemberType instead of silently skipping
+    // the property-type comparison.
     auto* bDecl = dynamic_cast<const ast::PropertyDecl*>(base->decl);
     // §2.8.2/§12.1/§23 (v0.235, #2386): the OVERRIDE-MATCHING twin of #2380's
     // `checkAbstractImplementations` fix (§11.2 conformance, same file) for
@@ -4525,6 +4600,13 @@ bool Resolver::methodIsAbstract(MethodSymbol* ms) {
     for (auto mod : ms->modifiers) {
         if (mod == "abstract") return true;
     }
+    // SEAM-ACCESSOR: `ms->modifiers` (checked just above) already carries "abstract" for
+    // an imported method — ModuleLoader.cpp:758 wires MethodSymbol
+    // modifiers on both sides (#3152's audit §3). This AST fallback only
+    // WIDENS the local, syntax-derived case (`abstract method Foo();` with
+    // no explicit modifier token is not a real shape, but if it were, this
+    // is where it would be caught); the cast is unreachable for an import
+    // because the modifiers check above already returned true.
     if (auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl)) {
         if (md->bodyKind == ast::MethodBodyKind::Abstract) return true;
     }
@@ -5082,8 +5164,17 @@ void Resolver::checkAbstractImplementations() {
                 // Compare the AST-level `returnOwned` bit the same way
                 // checkOverrideSignatureMatch does for `override`
                 // (`dDecl->returnOwned != bDecl->returnOwned`, §12.1).
+                // SEAM-ACCESSOR: fix #3194 (family M13 of #3152): `im` may be an IMPORTED interface/
+                // abstract member. When this cast is null, `imRetRef`/`imRetOwned` a
+                // few lines below fall back to ctx_.importedReturnType/
+                // importedReturnOwned instead of silently treating the member as
+                // returning nothing.
                 auto* imDecl = dynamic_cast<const ast::MethodDecl*>(im->decl);
                 auto* implDecl =
+                    // SEAM-ACCESSOR: fix #3194: the implementation-side twin of the `im->decl` fallback
+                    // just above — gated on `implSymIsImported` (ctx_.isImported), which
+                    // falls back to ctx_.importedReturnType/importedReturnOwned rather
+                    // than defaulting to "unknown" for every decl-less witness.
                     dynamic_cast<const ast::MethodDecl*>(impl->decl);
                 // §2.8.2/§12.5 (#2373): `im` may be an IMPORTED interface/
                 // abstract member. ModuleLoader never attaches an
@@ -5210,6 +5301,12 @@ void Resolver::checkAbstractImplementations() {
                 const bool imPure = hasMod(im, "pure");
                 bool implPure = hasMod(impl, "pure");
                 if (!implPure)
+                    // SEAM-ACCESSOR: `implPure` is already read from `hasMod(impl, "pure")` (symbol-side,
+                    // correct for imports) just above; this OperatorDecl cast only WIDENS
+                    // it further for a LOCAL operator whose purity rides the AST
+                    // (`OperatorDecl::isPure` is not mirrored onto `modifiers`). Null for
+                    // an import leaves `implPure` at its already-correct symbol-side
+                    // value — no silent answer change (#3152).
                     if (auto* op = dynamic_cast<const ast::OperatorDecl*>(
                             impl->decl))
                         implPure = op->isPure;
@@ -5441,6 +5538,9 @@ void Resolver::checkAbstractImplementations() {
         for (auto& [name, info] : ifaceProps) {
             PropertySymbol* ips = info.first;
             TypeSymbol* iface = info.second;
+            // SEAM-ACCESSOR: fix #2400/#2414/#2529 (family of #3152): `ifaceHasSetter` already
+            // falls back to ctx_.importedPropertyHasSetter(ips) when this AST cast
+            // is null — see the lambda body two lines below.
             auto* ipd = dynamic_cast<const ast::PropertyDecl*>(ips->decl);
             auto ifaceHasSetter = [&]() -> bool {
                 if (ipd) return propertyDeclHasSetter(ipd);
@@ -5449,6 +5549,9 @@ void Resolver::checkAbstractImplementations() {
             auto cit = concreteProps.find(name);
             if (cit != concreteProps.end()) {
                 auto* cpd =
+                    // SEAM-ACCESSOR: fix #2449 (family of #3152): `candidateHasSetter`/`candidateHasGetter`
+                    // just below already fall back to
+                    // ctx_.importedPropertyHasSetter/HasGetter when `cpd` is null.
                     dynamic_cast<const ast::PropertyDecl*>(cit->second->decl);
                 const bool candidateHasSetter =
                     cpd ? propertyDeclHasSetter(cpd)
@@ -5710,6 +5813,10 @@ void Resolver::checkAbstractImplementations() {
         // fully reconstructable from what #2414 + #2400 already publish.
         for (auto& obl : ifaceIndexerObligations) {
             PropertySymbol* ips = obl.ips;
+            // SEAM-ACCESSOR: fix #2414/#2529 (family of #3152): `ifaceParamCount`/`ifaceParamTy`
+            // (the comment above names them) already fall back to
+            // `ips->indexerParams` (reconstructed ParameterSymbols) when `ipd` is
+            // null.
             auto* ipd = dynamic_cast<const ast::PropertyDecl*>(ips->decl);
 
             // #2529: count/type of the interface indexer's parameter list,
@@ -5753,6 +5860,10 @@ void Resolver::checkAbstractImplementations() {
             // so sema and codegen agree on what a candidate's signature IS,
             // not just on which candidate wins.
             auto candParamCount = [](PropertySymbol* cand) -> std::size_t {
+                // SEAM-ACCESSOR: fix #2449 (family of #3152): `candParamCount` already falls back to
+                // `cand->indexerParams` (reconstructed ParameterSymbols) when this cast
+                // is null — see the comment above and the `return cand->indexerParams
+                // ...` line just below.
                 if (auto* cpd = dynamic_cast<const ast::PropertyDecl*>(cand->decl))
                     return cpd->indexerParams.size();
                 return cand->indexerParams.size();
@@ -5760,6 +5871,8 @@ void Resolver::checkAbstractImplementations() {
             auto candParamTy = [&](PropertySymbol* cand,
                                    std::size_t k) -> TypeRef* {
                 if (auto* cpd =
+                        // SEAM-ACCESSOR: same accessor as `candParamCount` just above — `candParamTy` falls
+                        // back to `cand->indexerParams` when this cast is null (#2449, #3152).
                         dynamic_cast<const ast::PropertyDecl*>(cand->decl)) {
                     return (k < cpd->indexerParams.size() &&
                             cpd->indexerParams[k].type)
@@ -5813,6 +5926,11 @@ void Resolver::checkAbstractImplementations() {
                 for (auto mod : cand->modifiers)
                     if (mod == "abstract")
                         return false;
+                // SEAM-ACCESSOR: `candWireable` is a deliberate decl-PRESENCE test (documented in the
+                // comment above): local when the cast succeeds, else a `cand->decl`
+                // presence check (defensive) and finally an interface-kind fallback —
+                // the null branch is handled explicitly, not silently (#2437/#2442/
+                // #2449, family of #3152).
                 if (dynamic_cast<const ast::PropertyDecl*>(cand->decl))
                     return true;  // local
                 if (cand->decl) return false;  // defensive
@@ -5937,6 +6055,9 @@ void Resolver::checkAbstractImplementations() {
             // declareImportedIndexerSetters, LlvmBackend_Setup.cpp, gates
             // stub declaration on, so sema and codegen read one source of
             // truth for accessor presence here too).
+            // SEAM-ACCESSOR: fix #2400/#2414/#2449 (family of #3152): `candidateHasSetter` just
+            // below already falls back to ctx_.importedPropertyHasSetter(candidate)
+            // when `cpd` is null (the comment above names the source table).
             auto* cpd = dynamic_cast<const ast::PropertyDecl*>(candidate->decl);
             bool candidateHasSetter =
                 cpd ? propertyDeclHasSetter(cpd)
@@ -5995,6 +6116,10 @@ void Resolver::checkAbstractImplementations() {
             // read through the interface reference, produced a garbage `int`
             // off the string's representation).
             auto propType = [&](PropertySymbol* ps) -> const TypeRef* {
+                // SEAM-ACCESSOR: the `propType` lambda already falls back to
+                // ctx_.importedMemberType(ps) when `pd` is null — see the comment 15
+                // lines above and the `return ctx_.importedMemberType(ps);` line just
+                // below (fix #3152's audit family for the §11.2 property-type check).
                 auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
                 if (pd) {
                     if (!pd->type) return nullptr;
@@ -6235,11 +6360,18 @@ void Resolver::checkStaticInterfaceConformance() {
                 const ast::Type* imRetNode = nullptr;
                 bool imRetOwned = false;
                 bool imHasAstDecl = false;
+                // SEAM-ACCESSOR: fix #2294 (§11.8/§2.8.2, family of #3152): `im` may be an IMPORTED
+                // static interface member. `imHasAstDecl` (set alongside this cast)
+                // gates the fallback to ctx_.importedReturnType/importedReturnOwned a
+                // few lines below — no silent "unit-returning" default.
                 if (auto* imd = dynamic_cast<const ast::MethodDecl*>(im->decl)) {
                     imRetNode = imd->returnType.get();
                     imRetOwned = imd->returnOwned;
                     imHasAstDecl = true;
                 } else if (auto* iod =
+                               // SEAM-ACCESSOR: the OperatorDecl arm of the same #2294 fallback as the MethodDecl
+                               // cast just above — `imHasAstDecl` still gates the
+                               // ctx_.importedReturnType/importedReturnOwned fallback below.
                                dynamic_cast<const ast::OperatorDecl*>(im->decl)) {
                     imRetNode = iod->returnType.get();
                     imRetOwned = iod->returnOwned;
@@ -6326,9 +6458,15 @@ void Resolver::checkStaticInterfaceConformance() {
                     const ast::Type* cRetNode = nullptr;
                     bool cRetOwned = false;
                     if (auto* cmd =
+                            // SEAM-ACCESSOR: `cms` is drawn ONLY from `t->members` (the "Candidates on the
+                            // conforming type itself" loop ~150 lines above) — `t` comes from
+                            // `ctx_.module()->children`, so `cms` is always LOCAL; this function
+                            // does not walk a base-class chain to find a static witness (#3152).
                             dynamic_cast<const ast::MethodDecl*>(cms->decl)) {
                         cRetNode = cmd->returnType.get();
                         cRetOwned = cmd->returnOwned;
+                    // SEAM-ACCESSOR: the OperatorDecl arm of the same local-only `cms` as the MethodDecl
+                    // cast just above (#3152).
                     } else if (auto* cod = dynamic_cast<const ast::OperatorDecl*>(
                                    cms->decl)) {
                         cRetNode = cod->returnType.get();
@@ -6998,6 +7136,12 @@ void Resolver::checkGenericConstraints(const ast::Type& t, TypeSymbol* tsym,
     // (the issue's repro and every realistic instantiation site) and no
     // deferral is needed.
     if (!tsym) return;
+    // SEAM-ACCESSOR: fix #3146 (family F13 of #3152): `td` survives only for the ONE
+    // residual `recordDeferredNested` call ~25 lines below, explicitly
+    // gated on `if (td)` and documented there as a known, tracked gap for
+    // an imported `tsym`'s deferred-nested obligation — every other §14.2
+    // constraint check in this function now reads `GenericParamSymbol::
+    // constraints` instead.
     auto* td = dynamic_cast<const ast::TypeDecl*>(tsym->decl);
     bool anyConstraint = false;
     for (Symbol* gpSym : tsym->genericParams) {
@@ -7610,6 +7754,9 @@ void Resolver::checkVariancePositions() {
             const std::string_view variance  = gps->variance;  // "in" or "out"
 
             // Walk each member of the interface.
+            // SEAM-ACCESSOR: `t` is drawn from `ctx_.module()->children`
+            // (checkVariancePositions's own loop) — never an imported type
+            // (#3152).
             auto* td = dynamic_cast<const ast::TypeDecl*>(t->decl);
             if (!td) continue;
 
@@ -8319,6 +8466,8 @@ void Resolver::checkSerializationEligibility() {
     for (Symbol* child : ctx_.module()->children) {
         auto* t = dynamic_cast<TypeSymbol*>(child);
         if (!t || t->kind != ast::TypeDeclKind::Class) continue;
+        // SEAM-ACCESSOR: `t` is drawn from `ctx_.module()->children` (this pre-pass's own
+        // loop) — never an imported type (#3152).
         auto* td = dynamic_cast<const ast::TypeDecl*>(t->decl);
         if (!td) continue;
         // fix #3140 (family F2): a shape already derived on the SYMBOL is left
@@ -8350,6 +8499,9 @@ void Resolver::checkSerializationEligibility() {
         for (const Symbol* m : t->members) {
             auto* fs = dynamic_cast<const FieldSymbol*>(m);
             if (!fs || !fs->decl) continue;
+            // SEAM-ACCESSOR: `fs` is a member of `t`, which this pre-pass draws only from
+            // `ctx_.module()->children` — gated on `fs->decl` one line above too
+            // (#3152).
             auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
             if (!fd || !fd->type) continue;
             bool isStatic = false, isOwned = false;
@@ -8424,6 +8576,8 @@ void Resolver::checkSerializationEligibility() {
         bool isChoice = t->kind == ast::TypeDeclKind::Choice;
         if (!isRecord && !isEnum && !isClass && !isChoice) continue;
 
+        // SEAM-ACCESSOR: `t` is drawn from `ctx_.module()->children` (this function's second
+        // loop) — never an imported type (#3152).
         auto* td = dynamic_cast<const ast::TypeDecl*>(t->decl);
         if (!td) continue;
 
@@ -8691,6 +8845,9 @@ void Resolver::checkSerializationEligibility() {
                 if (!hasAstAutoPropertyDecl(m)) continue;
                 auto* ps = dynamic_cast<const PropertySymbol*>(m);
                 if (!ps) continue;
+                // SEAM-ACCESSOR: `ps` is a member of `t`, which checkSerializationEligibility draws
+                // only from `ctx_.module()->children` — never an imported symbol
+                // (#3152).
                 auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
                 if (!pd) continue;
                 // Check for serialized skip on the auto-property.
@@ -8802,6 +8959,9 @@ void Resolver::checkSerializationEligibility() {
             for (const Symbol* m : t->members) {
                 auto* cs = dynamic_cast<const sema::ConstructorSymbol*>(m);
                 if (!cs || cs->isStatic) continue;
+                // SEAM-ACCESSOR: `cs` is a member of `t`, which checkSerializationEligibility draws
+                // only from `ctx_.module()->children` — never an imported symbol
+                // (#3152).
                 auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
                 if (!cd) continue;
 
@@ -8896,6 +9056,13 @@ void Resolver::checkClassSerializationEligibilityLate() {
         auto* t = dynamic_cast<TypeSymbol*>(child);
         if (!t || t->kind != ast::TypeDeclKind::Class) continue;
 
+        // SEAM-ACCESSOR: `t` is drawn from `ctx_.module()->children`
+        // (checkClassSerializationEligibilityLate's own loop) — never an
+        // imported type; the base-CHAIN reads a few hundred lines below
+        // (`t->baseTypes`) are the ones that cross modules, and those already
+        // route through symbol-side predicates (`isInstanceFieldStorageSymbol`
+        // / `isAutoPropertyStorageSymbol`, fix #3152/#3182/#3221) rather than
+        // an AST cast (#3152).
         auto* td = dynamic_cast<const ast::TypeDecl*>(t->decl);
         if (!td) continue;
 
@@ -9272,6 +9439,11 @@ void Resolver::checkClassSerializationEligibilityLate() {
                 // Fields (FieldDecl).
                 auto* fs = dynamic_cast<const FieldSymbol*>(m);
                 if (fs) {
+                    // SEAM-ACCESSOR: `fs` is a member of `t`, which checkClassSerializationEligibilityLate
+                    // draws only from `ctx_.module()->children`. A null `fd` here is the
+                    // ORDINARY local positional-field shape (the comment below), not an
+                    // import gap — `fs->decl` of a positional field is the owning TypeDecl,
+                    // never a FieldDecl (#3152).
                     auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
                     if (!fd) {
                         // §9.8 / #2325: a primary-constructor-parameter-
@@ -9304,6 +9476,8 @@ void Resolver::checkClassSerializationEligibilityLate() {
                 if (!hasAstAutoPropertyDecl(m)) continue;
                 auto* ps = dynamic_cast<const PropertySymbol*>(m);
                 if (!ps) continue;
+                // SEAM-ACCESSOR: `ps` is a member of the locally-declared `t` — never an imported
+                // symbol (#3152).
                 auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
                 if (!pd) continue;
                 if (pd->serialized && pd->serialized->isSkip) continue;
@@ -9342,6 +9516,8 @@ void Resolver::checkClassSerializationEligibilityLate() {
                 for (const Symbol* m : t->members) {
                     auto* cs = dynamic_cast<const sema::ConstructorSymbol*>(m);
                     if (!cs || cs->isStatic) continue;
+                    // SEAM-ACCESSOR: `cs` is a member of the locally-declared `t` — never an imported
+                    // symbol (#3152).
                     auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
                     if (!cd) continue;
 
@@ -9399,6 +9575,9 @@ void Resolver::checkClassSerializationEligibilityLate() {
                 for (const Symbol* m : t->members) {
                     auto* fs = dynamic_cast<const FieldSymbol*>(m);
                     if (fs) {
+                        // SEAM-ACCESSOR: `fs` is a member of the locally-declared `t`; a null `fd` here is
+                        // the ordinary local positional-field shape, handled by the `posParam`
+                        // fallback just below, not an import gap (#3152).
                         auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
                         if (!fd) {
                             // §9.8 / #2325: a captured primary-ctor-param
@@ -9462,6 +9641,8 @@ void Resolver::checkClassSerializationEligibilityLate() {
                 for (const Symbol* m : t->members) {
                     auto* cs = dynamic_cast<const sema::ConstructorSymbol*>(m);
                     if (!cs || cs->isStatic) continue;
+                    // SEAM-ACCESSOR: `cs` is a member of the locally-declared `t` — never an imported
+                    // symbol (#3152).
                     auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
                     if (!cd) continue;
 
@@ -10492,6 +10673,9 @@ void Resolver::checkTypeStaticFieldDomains(TypeSymbol* t) {
         // Check FieldSymbol (body fields, not positional record fields).
         if (auto* fs = dynamic_cast<FieldSymbol*>(m)) {
             if (!hasMod(fs, "static")) continue;
+            // SEAM-ACCESSOR: `fs` is a member of `t`, which forEachTypeAndNested (#3574) draws
+            // only from this module's own declaration tree — never an imported
+            // symbol (#3152).
             auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
             if (!fd || !fd->type) continue;
 
@@ -10551,6 +10735,8 @@ void Resolver::checkTypeStaticFieldDomains(TypeSymbol* t) {
         // Check static auto-properties (PropertySymbol with Auto body).
         if (auto* ps = dynamic_cast<PropertySymbol*>(m)) {
             if (ps->isIndexer || !hasMod(ps, "static")) continue;
+            // SEAM-ACCESSOR: `ps` is a member of the locally-declared `t` — same reasoning as the
+            // field arm above (#3152).
             auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
             if (!pd || pd->isIndexer ||
                 pd->bodyKind != ast::PropertyBodyKind::Auto ||
@@ -11534,6 +11720,9 @@ void Resolver::checkTypePureModifiers(TypeSymbol* t) {
             // carries it on the AST (`OperatorDecl::isPure`) since the
             // operator parser doesn't propagate modifiers into the symbol.
             const auto* opDecl =
+                // SEAM-ACCESSOR: `ms` is a member of `t`, which forEachTypeAndNested (#3574) draws
+                // only from this module's own declaration tree — never an imported
+                // symbol (#3152).
                 dynamic_cast<const ast::OperatorDecl*>(ms->decl);
             const bool isPure = hasMod(ms, "pure") ||
                                 (opDecl && opDecl->isPure);
@@ -11555,6 +11744,7 @@ void Resolver::checkTypePureModifiers(TypeSymbol* t) {
             // §22.15 "Where pure is rejected": iterator methods (a body
             // containing `yield`) may not be `pure`. Operators and abstract
             // methods have no body to check.
+            // SEAM-ACCESSOR: same local-only `ms` as the OperatorDecl arm above (#3152).
             if (auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl)) {
                 bool bodyHasYield = false;
                 for (const auto& s : md->stmts) {
@@ -11594,6 +11784,7 @@ void Resolver::checkTypePureModifiers(TypeSymbol* t) {
             bool retOwned = opDecl ? opDecl->returnOwned : false;
             const ast::Type* retTy = opDecl ? opDecl->returnType.get()
                                             : nullptr;
+            // SEAM-ACCESSOR: same local-only `ms` as the two purity-placement casts above (#3152).
             if (auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl)) {
                 retOwned = md->returnOwned;
                 retTy = md->returnType.get();
@@ -11616,6 +11807,8 @@ void Resolver::checkTypePureModifiers(TypeSymbol* t) {
         // ---- ConstructorDecl ----------------------------------------------
         if (auto* cs = dynamic_cast<ConstructorSymbol*>(m)) {
             const auto* cd =
+                // SEAM-ACCESSOR: `cs` is a member of the locally-declared `t` — same reasoning as the
+                // method arms above (#3152).
                 dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
             if (!cd || !cd->isPure) continue;
             // §22.15 "Where pure is rejected": static constructors admit no
@@ -11664,6 +11857,8 @@ void Resolver::checkTypePureModifiers(TypeSymbol* t) {
         if (auto* ps = dynamic_cast<PropertySymbol*>(m)) {
             if (!hasMod(ps, "pure")) continue;
             const auto* pd =
+                // SEAM-ACCESSOR: `ps` is a member of the locally-declared `t` — same reasoning as the
+                // method/constructor arms above (#3152).
                 dynamic_cast<const ast::PropertyDecl*>(ps->decl);
             if (!pd) continue;
             // §22.15: writing `pure` on the auto-property form is rejected
@@ -11748,6 +11943,9 @@ void Resolver::checkTypePureModifiers(TypeSymbol* t) {
     for (Symbol* m : t->members) {
         auto* ps = dynamic_cast<PropertySymbol*>(m);
         if (!ps) continue;
+        // SEAM-ACCESSOR: `ps` is a member of the locally-declared `t` (this function's own
+        // `for (Symbol* m : t->members)` loop just above) — same reasoning as
+        // every other arm of checkTypePureModifiers (#3152).
         const auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
         if (!pd || pd->bodyKind != ast::PropertyBodyKind::Block) continue;
         for (const auto& a : pd->accessors) {
@@ -11846,6 +12044,10 @@ void Resolver::checkTypeReadonlyPropertyFormsMember(PropertySymbol* ps) {
     // implemented) and they parse to PropertyDecl with bodyKind=Auto
     // when in signature form, so the Auto branch below accepts them.
     if (!hasMod(ps, "readonly")) return;
+    // SEAM-ACCESSOR: `ps` is always local: both call sites (checkTypeReadonlyPropertyForms
+    // and the extension arm of checkReadonlyPropertyForms, ~20/~30 lines
+    // above) draw it from `t->members`/`ext->members`, where `t`/`ext` are
+    // themselves module()->children-only (#3152).
     const auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
     if (!pd) return;
 

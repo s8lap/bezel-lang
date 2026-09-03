@@ -28,7 +28,6 @@
 6    src/sema/ExprTypecheck_Exprs.cpp
 1    src/sema/PureChecker.cpp
 3    src/sema/SymbolCollection.cpp
-9    src/sema/TypeResolution_Checks.cpp
 1    src/sema/TypeResolution_Names.cpp
 
 # class2: deliberately has NO grandfathered ceiling. The always-null cast
@@ -63,5 +62,5 @@
 7    src/sema/PureChecker.cpp
 5    src/sema/StaticInitCycles.cpp
 5    src/sema/SymbolCollection.cpp
-53   src/sema/TypeResolution_Checks.cpp
+2    src/sema/TypeResolution_Checks.cpp
 3    src/sema/TypeResolution_Names.cpp
