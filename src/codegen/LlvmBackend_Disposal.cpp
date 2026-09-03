@@ -4485,6 +4485,27 @@ llvm::Function* Emitter::boxElementDisposerThunk() {
 }
 
 
+// fix #3776 (stdlib §4.8 / §4.17, v0.286): the BORROWING dict-family head
+// names whose stored VALUE may ever be heap-boxed — `Dictionary` and
+// `SortedDictionary`. `OwningDictionary` is deliberately excluded: it
+// requires `V: class` (stdlib §4.9), and a class value lowers to a pointer,
+// never a struct, so `dictValueIsBoxedStruct`'s own `isStructTy()` test would
+// already exclude it independently of this name gate — this gate is a second,
+// name-level line of defense that also keeps the owning-vs-borrowing disposal
+// cascades (`owningDictValueDisposer` vs this file's plain box `free()`)
+// visibly distinct at every call site. This is the SAME two-name test
+// `collectionNodeFreeThunk` below already spells inline for the identical
+// "does the dict-value string child's construction-side retain contract
+// apply" question (its own `head` is pre-filtered against
+// `common::isOwningPrefixedName`, so only these two names can ever reach it)
+// — named once here instead of re-derived a third time, per the #3770/#3768
+// commit's own instruction not to add a second string list for a fact the
+// compiler already computes.
+static bool isBoxedValueDictHeadName(std::string_view head) {
+    return head == "Dictionary" || head == "SortedDictionary";
+}
+
+
 llvm::Function* Emitter::dictValueBoxFreer(const sema::TypeRef* dictTy) {
     // #401 / stdlib §4.8, WIDENED by fix #3770 (§28.9, v0.286): only a
     // BORROWING Dictionary<K,V> whose value type V is stored BOXED — a
@@ -4539,10 +4560,37 @@ llvm::Function* Emitter::dictValueBoxFreer(const sema::TypeRef* dictTy) {
     // frees the box, exactly as it already did for a record V — measured:
     // that repro's leak goes from 40 B (24 B box + 16 B owned Connection) to
     // 16 B [Connection only] after this fix, never to a double free.)
+    //
+    // fix #3776 (stdlib §4.8 / §4.17, v0.286): WIDENED again to admit
+    // `SortedDictionary<K, V>` — the §4.17 prose states its value semantics
+    // "match Dictionary<K, V>: values are copied in and out for value types
+    // and string, borrowed for class types" and that it has no owning
+    // counterpart in this revision ("There is no owning
+    // `OwningSortedDictionary`"), so its value-boxing story is identical to
+    // borrowing `Dictionary<K, V>`'s — the same encode-side broad `isStructTy()`
+    // test (LlvmBackend_{Calls,Assign}.cpp's `encodeValue`) boxes a
+    // SortedDictionary's record/nullable-value/choice value on `.Add`
+    // exactly as it does for Dictionary, but until this fix this function's
+    // `headName() != "Dictionary"` early return excluded SortedDictionary
+    // BEFORE the boxed-struct predicate was ever consulted — so EVERY V kind
+    // that boxes (not just choice) leaked at scope-end/Clear/indexer-
+    // overwrite. Measured: `using var d := new SortedDictionary<int, Pt>()`
+    // (Pt a 2-int record) with two `.Add`s and no iteration, 200 iterations,
+    // leaked 3200 B / 400 allocations pre-fix, LSan-clean post-fix; the same
+    // shape with a `choice Shape` value leaked 4800 B / 400 allocations
+    // pre-fix (identical to #3770's own Dictionary repro), LSan-clean
+    // post-fix. `isBoxedValueDictHeadName` (above) is the ONE spelling of
+    // "Dictionary or SortedDictionary" this function and
+    // `collectionNodeFreeThunk` both now read — see that function's header
+    // comment for why `OwningDictionary` is excluded on BOTH the name axis
+    // and (independently) the `isStructTy()` axis, and why this is a strict
+    // widening with no double-free: `Dictionary`'s own behavior for every V
+    // kind is UNCHANGED (this touches only the head-name test, not the
+    // boxed-struct predicate below it), verified byte-identical vs parent.
     if (!dictTy || !dictTy->astNode || !dictTy->astNode->name ||
         dictTy->astNode->name->parts.empty())
         return nullptr;
-    if (dictTy->headName() != "Dictionary") return nullptr;
+    if (!isBoxedValueDictHeadName(dictTy->headName())) return nullptr;
     if (dictTy->genericArgs.size() <= 1) return nullptr;
     const sema::TypeRef* valTy = dictTy->genericArgs[1];
     llvm::Type* valLlvm = valTy ? lowerTypeRef(valTy) : nullptr;
@@ -4675,9 +4723,16 @@ llvm::Function* Emitter::collectionNodeFreeThunk(const sema::TypeRef* nodeTy) {
         // `OwningLinkedList<string>` outright anyway (stdlib §4.2 / §14.4,
         // #1327 — a runtime-managed element has no disposal obligation and
         // cannot be owned), so no owning-family LinkedList reaches this arm.
+        // fix #3776: reads the ONE `isBoxedValueDictHeadName` spelling (above
+        // dictValueBoxFreer) instead of re-deriving this exact two-name test
+        // — `head` here can only ever be "Dictionary" or "SortedDictionary"
+        // when `childIsDictValue` is true (this function already rejected
+        // any `common::isOwningPrefixedName(head)` at its own top, and
+        // `isDictTypeName` admits no fourth name), so this is a mechanical,
+        // no-behavior-change de-duplication, not a new decision.
         bool strChildRetainedAtConstruction =
             childIsDictValue
-                ? (head == "Dictionary" || head == "SortedDictionary")
+                ? isBoxedValueDictHeadName(head)
                 : (head == "Array" || head == "Stack" || head == "Queue" ||
                    head == "LinkedList" ||
                    // fix #3249 (§4.19, v0.186): FrozenArray<T> shares the

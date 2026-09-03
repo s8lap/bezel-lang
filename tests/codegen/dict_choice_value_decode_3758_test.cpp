@@ -112,21 +112,20 @@
 // GetEnumerator (2), the LINQ materializer (3), #3576's First()/Last() (4),
 // and the cross-caller-agreement row are ALL LSan-clean post-fix.
 //
-// The TWO `SortedDictionary` rows
-// (`for_in_int_payload_choice_value_sorted_dict_4_17`,
-// `sorted_dict_getenumerator_int_payload_choice_value_4_17`) STAY on
-// `runAotCheckedLenient` — flipping them would fail on a SEPARATE,
-// pre-existing, unrelated leak discovered while doing this measurement and
-// filed as #3776: `dictValueBoxFreer`'s `headName() != "Dictionary"` guard
-// excludes `SortedDictionary<K,V>` entirely, for EVERY boxed V kind, not
-// just choice — a `SortedDictionary<K, record>` leaks its value boxes
-// exactly the same way a `SortedDictionary<K, Choice>` does (measured
-// 3200 B / 400 for a plain `record Pt(x: int, y: int)` V, byte-identical
-// before and after THIS fix). #3770/#3768's brief scopes this lane to
-// `dictValueBoxFreer`'s boxed-struct PREDICATE and `lowerDictValuesFor`, not
-// to `dictValueBoxFreer`'s head-name GATE — a different, independent
-// question ("which dictionary kinds route through this function at all")
-// that #3776 tracks separately.
+// UPDATE (fix #3776, stdlib §4.8/§4.17, v0.286): the TWO `SortedDictionary`
+// rows (`for_in_int_payload_choice_value_sorted_dict_4_17`,
+// `sorted_dict_getenumerator_int_payload_choice_value_4_17`) originally
+// STAYED on `runAotCheckedLenient` — flipping them failed on a SEPARATE,
+// pre-existing, unrelated leak discovered while doing the #3770/#3768
+// measurement and filed as #3776: `dictValueBoxFreer`'s
+// `headName() != "Dictionary"` guard excluded `SortedDictionary<K,V>`
+// entirely, for EVERY boxed V kind, not just choice — a
+// `SortedDictionary<K, record>` leaked its value boxes exactly the same way
+// a `SortedDictionary<K, Choice>` did (measured 3200 B / 400 for a plain
+// `record Pt(x: int, y: int)` V). #3776 widened `dictValueBoxFreer`'s gate to
+// admit `SortedDictionary` (LlvmBackend_Disposal.cpp), so both rows below now
+// run under the STRICT `runAotChecked` oracle: measured individually
+// LSan-clean post-#3776 fix (`total=1400` unchanged, zero leak either row).
 //
 // See `dict_choice_value_box_freer_3770_test.cpp` for the disposal-focused
 // rows (the 200x Add+dispose-only leak pin, the indexer-overwrite disposing-
@@ -242,9 +241,9 @@ BEZEL_TEST(dict_choice_value_decode_3758,
 //     decodeDictValueAt, exercised through the §4.17 ascending-key sort
 //     branch (ordering not asserted here; #1426/#3511 already cover that
 //     axis — this row is choice-V decode coverage on the sorted path).
-//     STAYS on runAotCheckedLenient (see the file header's ORACLE note):
-//     SortedDictionary's own value-box leak is a separate, pre-existing bug
-//     independent of choice V, filed as #3776.
+//     Runs under runAotChecked (moved off runAotCheckedLenient by fix #3776 —
+//     see the file header's UPDATE note): SortedDictionary's own value-box
+//     leak, independent of choice V, is now fixed.
 // ---------------------------------------------------------------------------
 
 BEZEL_TEST(dict_choice_value_decode_3758,
@@ -268,7 +267,7 @@ BEZEL_TEST(dict_choice_value_decode_3758,
         "  Console.WriteLine($\"total={total}\"); "
         "  return 0; "
         "end Main; end C;";
-    JitResult r = runAotCheckedLenient(src);
+    JitResult r = runAotChecked(src);
     if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_TRUE(has(r.stdoutText, "total=1400"));  // 200 x (3 + 4)
@@ -315,9 +314,17 @@ BEZEL_TEST(dict_choice_value_decode_3758,
 // (5, unrouted copy, #3754) explicit `sd.GetEnumerator()` on a
 // SortedDictionary — LlvmBackend_Calls2.cpp's `wrapSortedDictionaryAsIEnumerable`,
 // its own independent decode copy (not routed through decodeDictValueAt),
-// fixed in place by the same one-line predicate widening.
-// STAYS on runAotCheckedLenient — see the file header's ORACLE note and #3776
-// (SortedDictionary's value-box leak, independent of choice V).
+// fixed in place by the same one-line predicate widening. Runs under
+// runAotChecked (moved off runAotCheckedLenient by fix #3776 — see the file
+// header's UPDATE note): the receiver `d` here is a bare `var`, never
+// `using var` — but it is never explicitly discharged either, so the
+// ownership pass's §28.3 v0.150 affine auto-drop (`ld->autoDropAtScopeEnd`,
+// LlvmBackend_Stmts.cpp) routes it through the SAME `registerUsingDisposal`
+// -> `dictTypeOfLocal` -> `dictValueBoxFreer` fallback an explicit
+// `using var d` would get (this function itself never frees `dict` or any
+// value box — it only frees its OWN scratch `keysArr`/`valsArr` snapshot
+// arrays). `d`'s scope-end box-free is exactly what #3776 fixed; measured
+// LSan-clean post-fix.
 // ---------------------------------------------------------------------------
 
 BEZEL_TEST(dict_choice_value_decode_3758,
