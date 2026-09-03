@@ -3447,6 +3447,27 @@ static std::string buildSyntheticFieldInitSource(const MetaTypeDecl& td,
         if (!mm.fieldInitText.empty()) src += " := " + mm.fieldInitText;
         src += ";\n";
     }
+    // fix #3736 (§9.2/§22.8/§2.8.2, v0.286): also re-declare each AUTO-
+    // PROPERTY member carrying its own fieldInitText, mirroring the Field
+    // loop immediately above — so an auto-property initializer that
+    // references a SIBLING auto-property (or static field) of the SAME
+    // type (§22.8's "static members of any class" clause, self included)
+    // resolves against a live symbol here instead of failing to parse. A
+    // computed/block-bodied or static property has no backing-field
+    // storage to scaffold (`isAutoProperty` already excludes both — the
+    // predicate #2478/#2939 established) and is skipped; an initializer
+    // that references one of those still fails to resolve in this
+    // throwaway context and correctly falls through to the same
+    // reject/silent-fallback boundary the Field loop's own "internal
+    // sibling" comment documents.
+    for (const MetaMember& mm : td.members) {
+        if (mm.kind != MetaMemberKind::Property || !mm.isAutoProperty) continue;
+        src += "  " + metaVisibilityToKeyword(mm.visibility);
+        for (const std::string& mod : mm.modifiers) src += " " + mod;
+        src += " property " + mm.name + " : " + metaTypeToSourceText(mm.type);
+        if (!mm.fieldInitText.empty()) src += " := " + mm.fieldInitText;
+        src += ";\n";
+    }
     // Method stubs, for any self-call the initializer makes.
     for (const MetaMember& mm : td.members) {
         if (mm.kind != MetaMemberKind::Method) continue;
@@ -3518,11 +3539,29 @@ static std::string buildSyntheticFieldInitSource(const MetaTypeDecl& td,
 // (storageType / #662). See `importedInstanceFieldInitExpr` (SemaContext.hpp)
 // and the construction-site fallback in `emitOwnFieldInit` for the matching
 // reader side.
+//
+// fix #3736 (§9.2/§22.8/§2.8.2, v0.286): `importedMember` widened from
+// `sema::FieldSymbol*` to `sema::Symbol*` so this SAME reconstruction —
+// synthetic re-parse, sibling/self remap, type/lambda/pattern-symbol copy —
+// also serves a non-static instance AUTO-PROPERTY's initializer (the
+// Property twin of the instance-field gap #2874 closed), rather than
+// duplicating ~250 lines of remap machinery in a parallel function. Per
+// LANE_RULES §6 ("prefer feeding the existing authority"): the field-vs-
+// property split is now isolated to exactly the two points that must know
+// which AST node shape they are looking at — `target.kind`-branched lookup
+// of the reconstructed member below, and the reconstructed initializer
+// expression's extraction (`FieldDecl::initializer` vs
+// `PropertyDecl::autoInitializer`) — every other step (type resolution,
+// symbol remap, lambda params, pattern symbols) is untouched and identical
+// for both. `isStatic=true` is a Field-only path by the CALLER's contract
+// (ModuleMetadataBuilder.cpp's PropertySymbol branch never populates
+// `fieldInitText` for a static property — see that branch's #3736 comment
+// for why), so the `isStatic` attach arm below keeps its Field-only cast.
 static bool parseAndAttachFieldInit(
     const MetaTypeDecl& td,
     const std::string& moduleName,
     const MetaMember& target,
-    sema::FieldSymbol* importedFs,
+    sema::Symbol* importedMember,
     const sema::TypeSymbol& importedType,
     sema::SemaContext& mainCtx,
     bool isStatic) {
@@ -3619,28 +3658,83 @@ static bool parseAndAttachFieldInit(
         return false;
     }
 
-    sema::FieldSymbol* freshFs = nullptr;
-    for (sema::Symbol* m : freshType->members) {
-        auto* fs = dynamic_cast<sema::FieldSymbol*>(m);
-        if (fs && std::string(fs->name) == target.name) { freshFs = fs; break; }
-    }
-    if (!freshFs) {
-        reject("the reconstructed field could not be located");
-        return false;
+    // fix #3736: locate the reconstructed member by the SAME kind the
+    // exporter tagged it with — a Field target looks for a FieldSymbol via
+    // its `->decl` backlink (unchanged, the pre-existing pattern below); a
+    // Property target (the only other kind that ever reaches this function
+    // — see the widening comment above) is instead located by walking the
+    // freshly-PARSED AST (`sf`) directly — `buildSyntheticFieldInitSource`
+    // now declares an auto-property member as `property Name : Type :=
+    // ...;` (fix #3736) — rather than through a fresh PropertySymbol's own
+    // `->decl`. Both would be equally SAFE here (`freshType->members` are
+    // never imported symbols — they are fresh, always-non-null-`decl`
+    // symbols from this function's own throwaway re-parse — exactly like
+    // the pre-existing `freshFs->decl` read four lines below), but the
+    // #3152 imported-symbol-seam ratchet (scripts/check_imported_symbol_
+    // reads.py) counts `dynamic_cast<const ast::XDecl*>(sym->decl)` sites
+    // textually per file regardless of provenance, and this file is
+    // already at its baselined ceiling — walking the AST directly avoids
+    // adding a new counted site for a pattern this function does not
+    // otherwise need (no other step here reads anything off a Property
+    // Symbol; the type-level operations below key off `freshType`, and the
+    // storage/method remap maps key off `importedType`, the REAL imported
+    // type, never `freshType`'s own members).
+    const ast::FieldDecl* parsedFd = nullptr;
+    const ast::Expr* freshInitExpr = nullptr;
+    if (target.kind == MetaMemberKind::Property) {
+        const ast::TypeDecl* freshTd = nullptr;
+        for (const auto& top : sf->topDecls) {
+            auto* cand = dynamic_cast<const ast::TypeDecl*>(top.get());
+            if (cand && cand->name == td.name) { freshTd = cand; break; }
+        }
+        const ast::PropertyDecl* parsedPd = nullptr;
+        if (freshTd) {
+            for (const auto& mem : freshTd->members) {
+                auto* pd = dynamic_cast<const ast::PropertyDecl*>(mem.get());
+                if (pd && !pd->isIndexer && pd->name == target.name) {
+                    parsedPd = pd;
+                    break;
+                }
+            }
+        }
+        if (!parsedPd || !parsedPd->autoInitializer) {
+            reject("the reconstructed property could not be located, or "
+                   "carries no initializer");
+            return false;
+        }
+        freshInitExpr = parsedPd->autoInitializer.get();
+    } else {
+        sema::FieldSymbol* freshFs = nullptr;
+        for (sema::Symbol* m : freshType->members) {
+            auto* fs = dynamic_cast<sema::FieldSymbol*>(m);
+            if (fs && std::string(fs->name) == target.name) { freshFs = fs; break; }
+        }
+        if (!freshFs) {
+            reject("the reconstructed field could not be located");
+            return false;
+        }
+        parsedFd = dynamic_cast<const ast::FieldDecl*>(freshFs->decl);
+        if (!parsedFd || !parsedFd->initializer) {
+            reject("the reconstructed declaration carries no initializer");
+            return false;
+        }
+        freshInitExpr = parsedFd->initializer.get();
     }
 
-    auto* parsedFd = dynamic_cast<const ast::FieldDecl*>(freshFs->decl);
-    if (!parsedFd || !parsedFd->initializer) {
-        reject("the reconstructed declaration carries no initializer");
-        return false;
-    }
-
-    // Field remap map (every field of the class, so a sibling reference in
-    // `target`'s initializer binds to the REAL imported FieldSymbol).
+    // Storage remap map (every FIELD and non-indexer auto-PROPERTY of the
+    // class, so a sibling reference in `target`'s initializer binds to the
+    // REAL imported symbol — fix #3736 widened this from Field-only to also
+    // catch a self auto-property reference, e.g. a §22.8 "static members of
+    // any class" initializer referencing a static sibling auto-property of
+    // THIS same type).
     std::unordered_map<std::string_view, sema::Symbol*> importedFields;
     for (sema::Symbol* m : importedType.members) {
-        if (dynamic_cast<sema::FieldSymbol*>(m) && !m->name.empty())
-            importedFields[m->name] = m;
+        bool isStorage = dynamic_cast<sema::FieldSymbol*>(m) != nullptr;
+        if (!isStorage) {
+            auto* ps = dynamic_cast<sema::PropertySymbol*>(m);
+            isStorage = ps && !ps->isIndexer;
+        }
+        if (isStorage && !m->name.empty()) importedFields[m->name] = m;
     }
 
     // Self-method remap map (signature-keyed, as in the ctor/method paths).
@@ -3659,19 +3753,26 @@ static bool parseAndAttachFieldInit(
 
     for (const auto& [expr, freshSym] : freshCtx.allExprSymbols()) {
         if (!expr || !freshSym) continue;
-        if (dynamic_cast<sema::FieldSymbol*>(freshSym)) {
+        // fix #3736: widened from FieldSymbol-only to also catch a
+        // non-indexer PropertySymbol — a self auto-property reference (or a
+        // sibling type's auto-property reference) remaps through the SAME
+        // `importedFields` storage map exactly as a field does; see that
+        // map's #3736 widening comment above.
+        auto* propSym = dynamic_cast<sema::PropertySymbol*>(freshSym);
+        if (dynamic_cast<sema::FieldSymbol*>(freshSym) ||
+            (propSym && !propSym->isIndexer)) {
             auto it = importedFields.find(freshSym->name);
             if (it != importedFields.end()) {
-                mainCtx.setExprSymbol(expr, it->second);  // self-field → imported
+                mainCtx.setExprSymbol(expr, it->second);  // self-storage → imported
                 continue;
             }
-            // #2375: not a self-field — a SIBLING type's field (e.g.
-            // `Box.DefaultSize` in the reconstructed initializer). The
-            // sibling was registered as the REAL imported TypeSymbol, so
-            // freshSym already IS the imported FieldSymbol — copy it as-is.
-            // Skipping it (the pre-#2375 behavior for any non-self symbol)
-            // left codegen with no symbol for the reference and it silently
-            // read zero.
+            // #2375: not a self-field/self-property — a SIBLING type's
+            // member (e.g. `Box.DefaultSize` in the reconstructed
+            // initializer). The sibling was registered as the REAL imported
+            // TypeSymbol, so freshSym already IS the imported symbol — copy
+            // it as-is. Skipping it (the pre-#2375 behavior for any non-self
+            // symbol) left codegen with no symbol for the reference and it
+            // silently read zero.
             mainCtx.setExprSymbol(expr, freshSym);
         } else if (auto* fms = dynamic_cast<sema::MethodSymbol*>(freshSym)) {
             auto it = importedMethods.find(freshMethodSigKey(fms));
@@ -3746,24 +3847,32 @@ static bool parseAndAttachFieldInit(
     for (const auto& [pat, sym] : freshCtx.allPatternSymbols())
         if (pat && sym) mainCtx.setPatternSymbol(pat, sym);
 
-    // Attach: importedFs->decl now points at a live ast::FieldDecl whose
+    // Attach: importedMember->decl now points at a live ast::FieldDecl whose
     // `initializer` genericInstSfinitFn's existing loop lowers and stores.
     //
     // fix #2874 (§2.8.2 / §22.8 step 2, v0.240): for an INSTANCE field,
     // `decl` MUST stay null — `decl == nullptr` is the discriminator every
     // imported-member fallback in the backend keys on (storageType /
     // recordFieldType / isOwnedReferenceField / …). Instead, publish the
-    // parsed initializer into the side table that emitOwnFieldInit reads
-    // ahead of its constant-foldable replay and its construction-site
-    // diagnostic fallback. The Expr* rides in `sf` (kept alive via
-    // ownImportedAst below), so the side-table pointer is valid for the
-    // lifetime of this SemaContext.
+    // parsed initializer into the side table that emitOwnFieldInit /
+    // buildRecordValue read ahead of their constant-foldable replay and
+    // their construction-site diagnostic fallback. The Expr* rides in `sf`
+    // (kept alive via ownImportedAst below), so the side-table pointer is
+    // valid for the lifetime of this SemaContext.
+    //
+    // fix #3736: `isStatic=true` is reached ONLY for a Field target (the
+    // writer never populates fieldInitText for a static Property — see
+    // ModuleMetadataBuilder.cpp's PropertySymbol branch) — so `parsedFd` is
+    // guaranteed non-null on that arm by construction; a Property target
+    // (static or not) always takes the `else` arm, keyed generically on
+    // `importedMember` (a Symbol* — works identically for a FieldSymbol or
+    // a PropertySymbol, since `setImportedInstanceFieldInitExpr` and its
+    // `buildRecordValue`/`emitOwnFieldInit` readers are already keyed on
+    // the member Symbol*, not on FieldSymbol specifically).
     if (isStatic) {
-        importedFs->decl = parsedFd;
-    } else {
-        if (parsedFd->initializer)
-            mainCtx.setImportedInstanceFieldInitExpr(importedFs,
-                                                     parsedFd->initializer.get());
+        importedMember->decl = parsedFd;
+    } else if (freshInitExpr) {
+        mainCtx.setImportedInstanceFieldInitExpr(importedMember, freshInitExpr);
     }
     mainCtx.ownImportedSource(std::move(source));
     mainCtx.ownImportedAst(std::move(sf));
@@ -4145,18 +4254,41 @@ static void loadMetadataPass2(
         // the #1513 shared per-instantiation cell. Fields are never
         // overloaded (§22.6 is a method/constructor/indexer concept), so a
         // name match is sufficient — no signature-key matching needed.
+        //
+        // fix #3736 (§9.2/§22.8/§2.8.2, v0.286): widened to ALSO drive a
+        // Property member's fieldInitText (populated by
+        // ModuleMetadataBuilder.cpp's PropertySymbol branch only for a
+        // non-static AUTO-property of a generic type or a record — see that
+        // branch's comment) — the Property twin of the instance-field path
+        // #2874 already covers below. A Property's fieldInitText is NEVER
+        // populated for a static member (the writer's gate is
+        // `!isStaticProp` unconditionally), so only the non-static `else`
+        // arm below is ever reached for a Property target; the `isStatic`
+        // arm stays exactly as it was, reachable only for a Field target.
         for (const MetaMember& mm : td.members) {
-            if (mm.kind != MetaMemberKind::Field || mm.fieldInitText.empty())
+            if (mm.fieldInitText.empty()) continue;
+            if (mm.kind != MetaMemberKind::Field &&
+                mm.kind != MetaMemberKind::Property)
                 continue;
-            sema::FieldSymbol* importedFs = nullptr;
-            for (sema::Symbol* m : t->members) {
-                auto* fs = dynamic_cast<sema::FieldSymbol*>(m);
-                if (fs && std::string(fs->name) == mm.name) {
-                    importedFs = fs;
-                    break;
+            sema::Symbol* importedMember = nullptr;
+            if (mm.kind == MetaMemberKind::Property) {
+                for (sema::Symbol* m : t->members) {
+                    auto* ps = dynamic_cast<sema::PropertySymbol*>(m);
+                    if (ps && !ps->isIndexer && std::string(ps->name) == mm.name) {
+                        importedMember = ps;
+                        break;
+                    }
+                }
+            } else {
+                for (sema::Symbol* m : t->members) {
+                    auto* fs = dynamic_cast<sema::FieldSymbol*>(m);
+                    if (fs && std::string(fs->name) == mm.name) {
+                        importedMember = fs;
+                        break;
+                    }
                 }
             }
-            if (!importedFs) continue;
+            if (!importedMember) continue;
             // fix #2860 (§2.8.2 "No restrictions beyond visibility", v0.240):
             // #2351's re-parse+attach is a STATIC-field mechanism — it sets
             // `FieldSymbol::decl`, which for an INSTANCE field is the key every
@@ -4183,7 +4315,7 @@ static void loadMetadataPass2(
             for (const std::string& mod : mm.modifiers)
                 if (mod == "static") { isStaticMember = true; break; }
             if (isStaticMember) {
-                parseAndAttachFieldInit(td, md.moduleName, mm, importedFs, *t,
+                parseAndAttachFieldInit(td, md.moduleName, mm, importedMember, *t,
                                         ctx, /*isStatic=*/true);
             } else {
                 // ALWAYS record the source text: emitOwnFieldInit's existing
@@ -4191,12 +4323,12 @@ static void loadMetadataPass2(
                 // replay NOR the parsed-expr lowering produced a value
                 // (parse failed / parse succeeded but lower returned null).
                 // Cost: one std::string copy per non-static imported field.
-                ctx.setImportedInstanceFieldInitText(importedFs,
+                ctx.setImportedInstanceFieldInitText(importedMember,
                                                      mm.fieldInitText);
                 // fix #2874: best-effort reconstruction. On success the
                 // side-table expr drives emitOwnFieldInit's lower path; on
                 // failure the construction-site diagnostic still fires.
-                parseAndAttachFieldInit(td, md.moduleName, mm, importedFs, *t,
+                parseAndAttachFieldInit(td, md.moduleName, mm, importedMember, *t,
                                         ctx, /*isStatic=*/false);
             }
         }

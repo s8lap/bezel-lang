@@ -1379,6 +1379,62 @@ bool convertMember(const sema::MemberSymbol& m, bool inInterface,
                     if (mod == "static") { isStaticProp = true; break; }
                 if (!isStaticProp)
                     out.valueText = renderConstExpr(pd->autoInitializer.get());
+                // fix #3736 (§9.2 / §22.8 step 2 / §2.8.2, v0.286): also carry
+                // the RAW initializer source text via `fieldInitText` —
+                // reusing the exact wire slot fix #3723 widened for the
+                // FieldDecl branch above, rather than adding a new metadata
+                // surface (mirrors #2467's own precedent of reusing
+                // `valueText` for Property). `out.valueText` above stays
+                // reserved for the CONSTANT-FOLDABLE case (renderConstExpr
+                // returns "" for a non-foldable initializer); this is the
+                // Property twin of the gap #3723 closed for Field — before
+                // this fix the PropertySymbol branch had NO fieldInitText
+                // carriage at ALL, so `buildRecordValue`'s decl-null fallback
+                // (LlvmBackend_Exprs2.cpp, already reads
+                // `ctx_.importedInstanceFieldInitExpr`/`Text` generically —
+                // no codegen change needed) had nothing to read for an
+                // imported auto-property, generic or not, and the field
+                // silently stayed at its §7.9 zero default with no
+                // diagnostic (issue #3736's own measured repro).
+                //
+                // Gate mirrors the FieldDecl branch's `(isGenericType ||
+                // (isRecordType && !isStaticField))` — a RECORD (generic or
+                // not) has no cross-module call to replay ANY body-member
+                // initializer through (§9.1/§9.2 construction is lowered
+                // inline by value at the `new` site), and a GENERIC class
+                // exports no `bz$<Type>$init` at all (the importer
+                // monomorphizes construction, #2860) — but with ONE
+                // deliberate asymmetry from the Field gate: Field carries
+                // for a GENERIC type's STATIC field unconditionally
+                // (`isGenericType` alone, regardless of `isStaticField`),
+                // because the #2351/#2860 static-field reconstruction path
+                // (ModuleLoader.cpp's `parseAndAttachFieldInit` with
+                // `isStatic=true`) already exists and is exercised for
+                // Field. No such reconstruction path exists for a Property
+                // yet — building one is a separate, unfiled gap (a GENERIC
+                // type's STATIC auto-property stays on the untouched
+                // external-storage-global story, same as before this fix)
+                // — so this gate stays `!isStaticProp` UNCONDITIONALLY,
+                // never carrying for a static property of ANY type
+                // (generic or not). A non-generic CLASS's auto-property is
+                // deliberately excluded either way — its `bz$<Type>$init`
+                // already replays every instance field/auto-property
+                // initializer (#2452), so carrying the text would be inert,
+                // unconsumed data, exactly as the FieldDecl branch's own
+                // comment documents for the class case.
+                const bool isRecordType =
+                    m.parent && m.parent->kind == ast::TypeDeclKind::Record;
+                if (!isStaticProp && (isGenericType || isRecordType) &&
+                    !source.empty()) {
+                    const ast::Expr* init = pd->autoInitializer.get();
+                    if (init->span.begin.offset < init->span.end.offset &&
+                        init->span.end.offset <= source.size()) {
+                        out.fieldInitText = std::string(
+                            source.substr(init->span.begin.offset,
+                                          init->span.end.offset -
+                                              init->span.begin.offset));
+                    }
+                }
             }
             // fix #2478 (§9.2/§22.8, v0.235): carry whether this Property is
             // declared in AUTO form (a real instance-storage member, §9.2) so

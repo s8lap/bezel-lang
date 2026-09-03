@@ -121,7 +121,28 @@ enum RecordCode : unsigned {
     // separately, in `readTypeDeclBody`, and do not need their own record
     // code here.
     REC_SER_TYPE_SHAPE = 13,
-    // 14.. additive; unknown codes are skipRecord()'d by the reader
+    // fix #3736 (§9.2 / §22.8 step 2 / §2.8.2, v0.286): MEMBER_BLOCK — a
+    // non-static AUTO-property's initializer EXPRESSION source text (the
+    // Property twin of Field's #2351/#2860 `fieldInitText` positional slot),
+    // as a string payload under its OWN code — NOT a third positional
+    // trailing REC_STRING after `caps[1]`'s `propertyBodyText`, for the
+    // exact reason REC_POSPARAM_DEFAULT's comment above states: a third
+    // positional string makes the reader's `capIdx` ordering load-bearing
+    // for any future addition, while a coded record is self-describing and
+    // `skipRecord()`'d by every reader this format has had. Emitted only
+    // when `ModuleMetadataBuilder.cpp`'s PropertySymbol branch populated
+    // `fieldInitText` (a non-static auto-property of a generic type or a
+    // record — see that branch's own gate), so a module with none is
+    // byte-identical to before this fix. Mutually exclusive with
+    // `propertyBodyText` in practice (Auto vs Expression/Block bodyKind),
+    // but carried as an independent slot rather than reusing `caps[1]`
+    // itself, since the reader must know unambiguously which member field
+    // a given trailing payload belongs in. Absent (an OLD artifact, or a
+    // pre-#3736 blob) reads as "" — the pre-fix reading, an unchanged
+    // silent §7.9 default for a stale not-yet-recompiled dependency, same
+    // dependency-direction safety as REC_POSPARAM_DEFAULT.
+    REC_AUTO_PROP_INIT = 14,
+    // 15.. additive; unknown codes are skipRecord()'d by the reader
     REC_UNKNOWN_FUTURE = 90, // test-only: a record code this reader skips
 };
 
@@ -1041,6 +1062,23 @@ void emitMember(llvm::BitstreamWriter& w, const MetaMember& m) {
             dv.push_back(static_cast<std::uint8_t>(c));
         w.EmitRecord(REC_POSPARAM_DEFAULT, dv);
     }
+    // fix #3736 (§9.2 / §22.8 step 2 / §2.8.2, v0.286): a Property member's
+    // auto-property initializer EXPRESSION source text, under its OWN record
+    // code (REC_AUTO_PROP_INIT, see enum RecordCode above — NOT a third
+    // positional trailing REC_STRING sharing `caps[1]`'s slot with
+    // `propertyBodyText`). Emitted only when `ModuleMetadataBuilder.cpp`'s
+    // PropertySymbol branch populated `fieldInitText` (non-static
+    // auto-property of a generic type or a record), so a module with no such
+    // member is byte-identical to before this fix. `hashMember` already
+    // hashes `m.fieldInitText` UNCONDITIONALLY for every member kind (see
+    // above), so no change was needed there.
+    if (m.kind == MetaMemberKind::Property && !m.fieldInitText.empty()) {
+        llvm::SmallVector<std::uint64_t, 64> fv;
+        fv.reserve(m.fieldInitText.size());
+        for (char c : m.fieldInitText)
+            fv.push_back(static_cast<std::uint8_t>(c));
+        w.EmitRecord(REC_AUTO_PROP_INIT, fv);
+    }
     // §11.3 (schema v4, issue #502): when kind == NestedType, emit the nested
     // type's full declaration as an embedded TYPE_BLOCK. The trailing
     // finishBlockImpl in readMemberBody skips it for v3 readers (they never
@@ -1942,6 +1980,24 @@ bool readMemberBody(Reader& r, MetaMember& m) {
                     m.posParamDefaultText.reserve(vals.size());
                     for (std::uint64_t v : vals)
                         m.posParamDefaultText.push_back(
+                            static_cast<char>(v & 0xFF));
+                }
+                // fix #3736 (§9.2 / §22.8 step 2 / §2.8.2, v0.286): a
+                // Property member's auto-property initializer text, coded
+                // (see REC_AUTO_PROP_INIT's enum comment) rather than a
+                // third positional trailing REC_STRING — captured BY CODE
+                // like REC_SER_CLAUSE/REC_POSPARAM_DEFAULT above, so it is
+                // read whatever its position relative to `caps[1]`'s
+                // `propertyBodyText` (mutually exclusive in practice, but
+                // independently absent-safe either way). Absent on a
+                // pre-#3736 blob leaves `fieldInitText` empty — the
+                // pre-fix reading (issue #3736's own silent §7.9 default)
+                // a stale not-yet-recompiled dependency already exhibits.
+                if (got.get() == REC_AUTO_PROP_INIT) {
+                    m.fieldInitText.clear();
+                    m.fieldInitText.reserve(vals.size());
+                    for (std::uint64_t v : vals)
+                        m.fieldInitText.push_back(
                             static_cast<char>(v & 0xFF));
                 }
                 continue;
