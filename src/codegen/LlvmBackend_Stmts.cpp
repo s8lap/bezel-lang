@@ -2359,6 +2359,86 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
             // touch freed memory. // per §30.5 kind 1 + kind 2, v0.252
             // fix #3125: pass borrowedReturn too — see emitAsyncPatternAResultDecision.
             emitAsyncPatternAResultDecision(chainedReturn, borrowedReturn);
+            // fix #3788 / §27.5 / §28.9 / §30.5 (v0.286): the BLOCK-bodied twin
+            // of #3773 (expression-body async lambda mint, landed in
+            // LlvmBackend_Async.cpp ~L2218). This async arm completes the task
+            // and returns ~90 lines BEFORE the closure/string mint arms further
+            // down this function (the L2485 closure mint keys on
+            // `currentLambdaReturnSemaTy_`, which is null for an async lambda —
+            // `lowerLambda` nulls it at Exprs2.cpp:2114 because the closure's
+            // declared return is the outer `Task<T>`, not the inner T), so an
+            // `async lambda() => do return <closure-typed expr>; end` completed
+            // its outer task with a +0 BORROW of a captured closure local. The
+            // consumer that makes that fatal is the lambda ENVIRONMENT
+            // DESTRUCTOR: when the awaited result is bound to a local that is
+            // then CAPTURED by a sibling lambda, the capturing env's dtor
+            // releases the captured cell keyed purely on its function type
+            // (LlvmBackend_Exprs2.cpp envdtor, `ce.semaTy->kind ==
+            // Kind::Function`), on the invariant that a closure local's slot
+            // owns +1 — and the async lambda's OWN env released the captured
+            // local while the awaited result still aliased it. Measured on
+            // this parent (r12-cycle-1 = 254ae52) for the issue 3788 repro —
+            // `var inner := lambda() => 7; var f := async lambda() => do
+            // return inner; end; var g := await f(); var use := lambda() =>
+            // g(); return use();` — as `attempting double-free on 0x...
+            // in bz$lam$1$envdtor` (the async lambda's envdtor releasing
+            // `inner`, whose cell `g` still aliased).
+            //
+            // Mirror #3773's expression-body mint token-for-token, with the
+            // SAME three transfer exclusions, and key on the RETURNED
+            // EXPRESSION's own sema type — `ctx_.exprType(*rs->value)` — NOT
+            // `asyncResultSemaType_`. The latter is the WRAPPED `Task<T>` for
+            // an unannotated return (LlvmBackend_Async.cpp:1702 stores
+            // `resultElemSemaTy` there, but the call-site annotation path
+            // passes `Task<T>` itself for the disposer derivation; the
+            // expression body of #3773 has the same defect and was fixed by
+            // the same change of key). The body's natural type — the type of
+            // the value being minted for — is the only one right on BOTH the
+            // annotated and unannotated derivations.
+            //
+            // No STRING ARM here either, for the same reason #3773 declined
+            // it: `bz_string_retain` for an async result goes through the
+            // async Result slot, and the consumer-side `var g := await f();`
+            // does not arm a string release the way `var g := f();` does on
+            // the sync venue, so a string minted here has nobody to discharge
+            // it. Filed (2714 follow-on).
+            //
+            // ⚠ THE ASYNC-SPECIFIC EXCLUSION IS NARROWER THAN #3773's here.
+            // #3773 needed to exclude any value that arrives from a callee
+            // that mints on return (CallExpr of any shape, or `await`)
+            // because the expression body could be `=> await C.MkA()` or
+            // `=> f2()`. The block body is the `return` STATEMENT's value,
+            // which has already been evaluated by the time we reach this
+            // site — a callee that mints has ALREADY minted into `v`, so
+            // `v` IS the callee's +1 and re-minting would over-mint. Same
+            // shape, narrower authority: a direct CallExpr is by far the
+            // most common callee-mints-on-return shape, and that case the
+            // sync venue's own mint (lowerLambda's expr-body for an inner
+            // lambda, or the L2485 / L2546 mint for an outer method) has
+            // already handled. `await` as a body is excluded too — the
+            // awaited task's `emitAsyncComplete` already produced the +1.
+            // An Identifier (named local of this scope) is answerable
+            // here as `returnedClosureLocalOwnsPlusOne`.
+            if (v && rs->value && v->getType()->isPointerTy() &&
+                !builder_.GetInsertBlock()->getTerminator()) {
+                const sema::TypeRef* bodySemaTy =
+                    ctx_.exprType(*rs->value);
+                bool arrivesFromCallee =
+                    dynamic_cast<const ast::CallExpr*>(rs->value.get()) !=
+                        nullptr;
+                if (auto* un = dynamic_cast<const ast::UnaryExpr*>(
+                        rs->value.get()))
+                    if (un->op == "await")
+                        arrivesFromCallee = true;
+                if (bodySemaTy &&
+                    bodySemaTy->kind == sema::TypeRef::Kind::Function &&
+                    !bodySemaTy->nullable &&
+                    !arrivesFromCallee &&
+                    !isPlusOneClosureProducer(rs->value.get()) &&
+                    !isUserMethodClosureReturnCall(rs->value.get()) &&
+                    !returnedClosureLocalOwnsPlusOne(rs->value.get()))
+                    emitClosureRetain(v);
+            }
             emitAsyncComplete(v);
             builder_.CreateRetVoid();
             return true;
