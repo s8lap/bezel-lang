@@ -793,6 +793,48 @@ private:
     // shallower (smaller depth) — sound because both are in scope at the
     // assignment, so their blocks lie on a single nesting path.
     std::unordered_map<const ast::Node*, int> localDepth_;
+    // fix #3727 (§28.3 *Borrow lifetime rules* / §28.9, v0.286): the depths
+    // above, SEALED as they stood the FIRST time `collectLocalDepths` ran on
+    // this analyzer instance — i.e. the frame that lexically ENCLOSES every
+    // lambda body this instance will later check.
+    //
+    // Why a second copy of the same map is not a second AUTHORITY: it is
+    // written by `collectLocalDepths` itself, in one place, from the same walk;
+    // nothing recomputes a depth and nothing decides "which block encloses
+    // which" a second way. What it preserves is the INPUT that
+    // `checkOneLambdaBodyEscapes` (Ownership.cpp) deliberately clears: that
+    // driver saves, clears and re-seeds `localDepth_` from ONE lambda body so
+    // the §31.1 depth comparison answers about that body — which is exactly
+    // right for a source declared INSIDE it, and leaves a source (and target)
+    // declared OUTSIDE it with no depth at all (issue 3727: a measured
+    // heap-use-after-free).
+    //
+    // Sealing on the FIRST call is what makes an entry's depth meaningful:
+    //   * from `run()` the first call is line ~221's `collectLocalDepths(body)`
+    //     over the whole METHOD body, long before `checkLambdaBodyEscapes` runs
+    //     at the bottom — so the seal is the method frame;
+    //   * on the instances that never call `run()` at all (a property /
+    //     operator / accessor `=> E` body: `mo.checkLambdaBodyEscapesExpr(...)`
+    //     on a fresh `MethodOwnership`) the first call is the OUTERMOST lambda
+    //     body `collectBodyLambdas` yields — again a frame enclosing every
+    //     later one it can be consulted about.
+    // A miss is always safe: both readers require a POSITIVE hit for BOTH the
+    // target and the source before comparing (`enclosingFrameDepthOf` returns
+    // -1 otherwise), and a decl recorded in some UNRELATED frame (a sibling
+    // lambda's body) can never be named from the body being checked — it is not
+    // in scope there — so a hit for both operands proves both live in the one
+    // sealed frame, on a single nesting path, with comparable depths.
+    // // per §28.3, §28.9, v0.286
+    std::unordered_map<const ast::Node*, int> enclosingFrameLocalDepth_;
+    bool enclosingFrameDepthsSealed_ = false;
+    // fix #3727: the enclosing frame's OWNED-obligation facts, seeded lazily
+    // from `enclosingFrameLocalDepth_` through the same `localIsOwnedObligation`
+    // authority `seedLambdaBodyOwnedLocals` uses (Ownership.cpp). Built at most
+    // once per instance because both of its inputs are settled by the time a
+    // lambda-body escape pass can ask: the depth map is sealed, and
+    // `applyUsingVarBorrowPinInLambdas` (#2166) has already run at the top of
+    // `run()`. // per §28.3, §28.9, v0.286
+    std::optional<BlockState> enclosingFrameOwnedStates_;
     // Slice O8 / §28.8.1 (#867): the CURRENT block's `move this.field`
     // tracker — the field's name maps to its moved-from state. The transfer
     // functions (recordMovesIn / handleDischarge mark; handleAssignment clear)
@@ -2100,6 +2142,34 @@ private:
     void collectLocalDepths(
         const std::vector<std::unique_ptr<ast::Stmt>>& body);
     void collectLocalDepthsStmt(const ast::Stmt& s, int depth);
+
+    // fix #3727 (§28.3 *Borrow lifetime rules* / §28.9, v0.286): the
+    // `enclosingFrameLocalDepth_` reader. Returns the sealed enclosing frame's
+    // block-nesting depth of the declaration node `declNode`, or -1 when that
+    // frame does not declare it. -1 is the DECLINE answer, never a guess: a
+    // for-loop induction variable (`LocalSymbol::decl` is the `ForStmt`), a
+    // pattern binding (a `BindingPattern`) and an inline `out var` are not
+    // `localDepth_` keys in any frame, so they read -1 here exactly as a decl
+    // belonging to some other frame does — the #3707 review's lesson
+    // ("`td < 0` is not proof of *declared outside*") applied to this map by
+    // deciding membership POSITIVELY. // per §28.3, §28.9, v0.286
+    int enclosingFrameDepthOf(const ast::Node* declNode) const;
+
+    // fix #3727 (§28.3 *Borrow lifetime rules* / §28.9 / §27.5, v0.286): ask
+    // `ownedLocalBorrowSource` — the SAME authority, not a second spelling of
+    // it — about the ENCLOSING frame rather than the lambda body currently
+    // being checked, by installing that frame's owned-obligation facts in
+    // `states_` for the duration of the one query and restoring them after.
+    //
+    // Needed because `isOwnedTrackedLocal` (the leaf `borrowSourceForExpr`'s
+    // owned legs bottom out in) is a `states_` lookup, and `states_` inside
+    // `EscapeScope::LambdaBody` holds ONLY the checked body's own seeded
+    // obligations — so an owned local declared in the enclosing method (or an
+    // enclosing lambda) resolves to NO borrow source at all and
+    // `checkBorrowStoreEscape` returns before any depth comparison. Called
+    // only after the ordinary, body-scoped query has already come back empty.
+    // // per §28.3, §28.9, §27.5, v0.286
+    sema::Symbol* enclosingFrameOwnedLocalBorrowSource(const ast::Expr& rhs);
 
     // Issue #392 / §31.1: a returned bare catch-binding identifier
     // (`return ex;`) lets the in-flight exception instance escape the arm

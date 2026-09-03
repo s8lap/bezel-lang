@@ -4552,6 +4552,89 @@ void MethodOwnership::collectLocalDepthsStmt(const ast::Stmt& s, int depth) {
 void MethodOwnership::collectLocalDepths(
     const std::vector<std::unique_ptr<ast::Stmt>>& body) {
     for (const auto& s : body) if (s) collectLocalDepthsStmt(*s, 0);
+    // fix #3727 (§28.3 *Borrow lifetime rules* / §28.9, v0.286): keep the FIRST
+    // frame's depths. `checkOneLambdaBodyEscapes` (Ownership.cpp) clears and
+    // re-seeds `localDepth_` per lambda body so the depth comparison answers
+    // about THAT body; the frame that encloses it then has no depths at all,
+    // which is why an owned local declared outside the checked lambda body
+    // reached no escape check (issue 3727, a measured heap-use-after-free).
+    // Sealing here — rather than in the driver — keeps the whole change inside
+    // the one function that builds this map. See the member's declaration for
+    // why "first call" is the enclosing frame on every path, and why a miss is
+    // always the safe answer. // per §28.3, §28.9, v0.286
+    if (!enclosingFrameDepthsSealed_) {
+        enclosingFrameDepthsSealed_ = true;
+        enclosingFrameLocalDepth_ = localDepth_;
+    }
+}
+
+int MethodOwnership::enclosingFrameDepthOf(const ast::Node* declNode) const {
+    if (!declNode) return -1;
+    auto it = enclosingFrameLocalDepth_.find(declNode);
+    return it == enclosingFrameLocalDepth_.end() ? -1 : it->second;
+}
+
+sema::Symbol* MethodOwnership::enclosingFrameOwnedLocalBorrowSource(
+    const ast::Expr& rhs) {
+    // fix #3727 (§28.3 / §28.9 / §27.5, v0.286). See the declaration for why
+    // this exists. The seed is built at most once per analyzer instance.
+    if (!enclosingFrameOwnedStates_) {
+        BlockState seeded;
+        for (const auto& kv : enclosingFrameLocalDepth_) {
+            // The owned-obligation question is asked of the ONE predicate that
+            // answers it (`localIsOwnedObligation`, reached through the
+            // node-keyed `findLocalSymbol`) — the same pair
+            // `seedLambdaBodyOwnedLocals` uses for the lambda body's own
+            // obligations, so the two seeds cannot drift.
+            //
+            //
+            // Why this cast needs no sibling `LocalConstDecl` arm (#3591), in
+            // two independent steps, both checkable: (1) a `LocalConstDecl` is
+            // not a KEY of this map at all — `collectLocalDepthsStmt` records
+            // only an `ast::LocalDecl` statement and, pre-recorded, a
+            // `TryStmt` catch arm's `arm.body`, and carries its own #3591
+            // marker saying so; (2) even if it were, `localIsOwnedObligation`
+            // would answer false for it — §21.1 gives a runtime `const` no
+            // disposal obligation ("never takes a disposal obligation"), and
+            // that predicate's own #3591-tested `!ld` fallback returns false
+            // for exactly this reason. MEASURED with the const twin of this
+            // fix's own repro (`const r := new R();` in place of the
+            // `using var`): the §21.1 rejection fires at the declaration, so
+            // no such program reaches ownership's lambda-body pass at all. The
+            // map's OTHER key kind, a catch arm body, is skipped here for a
+            // different reason: its binding is a §31.1 catch borrow, never an
+            // owned obligation, and it is already resolved scope-free by
+            // `isCatchBorrow` before this helper is ever reached.
+            // // per §21.1, §31.1
+            // LOCALDECL-ONLY: a `const` is neither a key of this map nor an
+            // owned obligation (§21.1) — see the two steps just above
+            const auto* ld = dynamic_cast<const ast::LocalDecl*>(kv.first);
+            if (!ld) continue;
+            sema::LocalSymbol* ls = findLocalSymbol(*ld);
+            if (!ls || !localIsOwnedObligation(ls)) continue;
+            LocalOwnership st;
+            st.state = OwnershipState::Owned;
+            st.obligationOrigin = ld;
+            seeded[ls] = st;
+        }
+        enclosingFrameOwnedStates_ = std::move(seeded);
+    }
+    if (enclosingFrameOwnedStates_->empty()) return nullptr;
+    // Swap the frame under the query, not the query under the frame: every
+    // owned leg of `borrowSourceForExpr` is a read of `states_`, so asking it
+    // about another frame is exactly installing that frame. The swap is
+    // restored on the single exit path below; `borrowSourceForExpr` and
+    // `ownedLocalBorrowSource` only READ `states_` (verified: no assignment,
+    // no erase, no `report`), so nothing of the lambda body's own seed is
+    // lost. The enclosing frame's facts REPLACE rather than extend the body's:
+    // a source the body's own seed could resolve was already returned by the
+    // caller's first query, so the only question left for this one is what the
+    // ENCLOSING frame contributes.
+    BlockState savedStates = std::move(states_);
+    states_ = *enclosingFrameOwnedStates_;
+    sema::Symbol* src = ownedLocalBorrowSource(rhs);
+    states_ = std::move(savedStates);
+    return src;
 }
 
 void MethodOwnership::checkCatchBorrowEscapesOnReturn(const ast::Expr& e) {
@@ -5035,6 +5118,33 @@ bool MethodOwnership::checkBorrowStoreEscape(const ast::AssignmentStmt& as,
     // as a live borrow source — `box.f := move r;` / `o := move r;` transfers,
     // it does not store a borrow.
     sema::Symbol* src = ownedLocalBorrowSource(*as.value);
+    // fix #3727 (§28.3 *Borrow lifetime rules* / §28.9 / §27.5, v0.286): the
+    // query above asked about the CHECKED LAMBDA BODY's frame — `states_` was
+    // cleared and re-seeded from that body alone by `checkOneLambdaBodyEscapes`
+    // — so an owned local declared in the frame that ENCLOSES it resolves to no
+    // borrow source at all and this function returns here, before any depth
+    // comparison, however the target is declared. Measured on the parent
+    // (28e5b15): `using var r := new R();` in a method-scope `do ... end`
+    // block, `f := lambda(): int => r.V();` inside a nested lambda's body with
+    // `f` at method scope — compiles rc=0 with NO diagnostic and
+    // heap-use-after-frees at run (issue 3727), while the byte-identical
+    // METHOD-level spelling has been rejected since #861. Re-ask the SAME
+    // authority about the enclosing frame.
+    //
+    // Restricted to the plain-LOCAL target channel (`dest == Dest::None &&
+    // targetLocal`): that is the one destination whose escape verdict is a
+    // DEPTH COMPARISON, and the enclosing frame supplies both depths (below).
+    // The `Dest::Field` / `Dest::OutParam` legs have no depth guard at all —
+    // they reject unconditionally once a source resolves — so widening them
+    // here would be a much larger behavioural change than the measured defect,
+    // argued separately; they stay exactly as they are (see the §6b diff in the
+    // commit body). // per §28.3, §28.9, §27.5, v0.286
+    bool srcFromEnclosingFrame = false;
+    if (!src && scope == EscapeScope::LambdaBody && dest == Dest::None &&
+        targetLocal) {
+        src = enclosingFrameOwnedLocalBorrowSource(*as.value);
+        srcFromEnclosingFrame = src != nullptr;
+    }
     if (!src) return false;
 
     // §28.3 (#861, generalized under v0.180 / #1539): resolve a plain-local
@@ -5174,6 +5284,52 @@ bool MethodOwnership::checkBorrowStoreEscape(const ast::AssignmentStmt& as,
             // as issue 3727) rather than folded into this §31.1-scoped fix.
             dest = Dest::OuterLocal;
             outerLocalIsClosureCapture = hasLambda(*as.value);
+        } else if (srcFromEnclosingFrame) {
+            // fix #3727 (§28.3 *Borrow lifetime rules* / §28.9 / §27.5,
+            // v0.286): the source resolved only against the ENCLOSING frame
+            // (the retry above), so BOTH operands are declared outside the
+            // checked lambda body and neither `td` nor `sd` — both read from
+            // the re-seeded, body-local map — can say anything about them.
+            // Re-run the SAME comparison ("the target outlives the captured
+            // source iff its declaring block is strictly shallower") in the
+            // frame that actually declares them.
+            //
+            // This decides "declared outside the checked body" POSITIVELY, by
+            // MEMBERSHIP in the enclosing frame's own depth map — not by
+            // reading `td < 0` as proof of it. That distinction is #3707's
+            // review finding, and it is what keeps this branch off the decl
+            // kinds `collectLocalDepthsStmt` never records at all: a for-loop
+            // induction variable (`LocalSymbol::decl` is the `ForStmt` itself),
+            // a case/match pattern binding (a `BindingPattern`), an inline
+            // `out var`'s bare identifier anchor. None is a key of ANY frame's
+            // map, so `enclosingFrameDepthOf` returns -1 for it and this branch
+            // declines exactly as the pre-existing `else` below does — the same
+            // conservative default an unknown depth already gets at method
+            // scope ("If either depth is unknown ... we conservatively do NOT
+            // flag it").
+            //
+            // Requiring BOTH hits is also what makes the two depths
+            // comparable. They are hits in ONE map, which describes ONE frame,
+            // so the blocks they number lie on that frame's single nesting
+            // path — the same soundness argument the `td >= 0 && sd >= 0` arm
+            // above makes for the body-local map. A decl belonging to some
+            // other frame (a sibling lambda's body) can never be named from
+            // here: it is not in lexical scope at this assignment.
+            //
+            // `srcFromEnclosingFrame` also implies the source is NOT a catch
+            // borrow: `isCatchBorrow` is scope-free, so a capture of one would
+            // already have resolved in the caller's FIRST query and never
+            // reached the retry. The §31.1 legs below are therefore untouched
+            // by this branch; it reaches only the §28.3 / §28.9 owned-local
+            // diagnostics. // per §28.3, §28.9, §27.5, v0.286
+            const int etd = enclosingFrameDepthOf(targetLocal->decl);
+            const int esd = enclosingFrameDepthOf(src->decl);
+            if (etd >= 0 && esd >= 0 && etd < esd) {
+                dest = Dest::OuterLocal;
+                outerLocalIsClosureCapture = hasLambda(*as.value);
+            } else {
+                return false;
+            }
         } else {
             return false;
         }
