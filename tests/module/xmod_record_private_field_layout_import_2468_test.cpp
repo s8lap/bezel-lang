@@ -43,12 +43,15 @@
 // mechanically: reverting this fix reproduces the method returning the
 // POSITIONAL field's own value instead of the hidden field's slot).
 //
-// WHAT THIS FIX DOES NOT DO: it makes the hidden field's STORAGE SLOT visible
-// (so it no longer aliases/shifts other fields) but does NOT make the hidden
-// field's DECLARED DEFAULT VALUE correct cross-module — that is issue #2467
-// (record body-member initializer replay), fixed separately; T1 below
-// confirms the post-fix (still #2467-unfixed) value is a well-defined,
-// non-aliased ZERO, not `_hidden`'s declared `77`.
+// WHAT THIS FIX (#2468) DID NOT DO, AT THE TIME: it made the hidden field's
+// STORAGE SLOT visible (so it no longer aliases/shifts other fields) but did
+// NOT make the hidden field's DECLARED DEFAULT VALUE correct cross-module —
+// that was issue #2467 (record body-member initializer replay, public
+// fields only) and, for a PRIVATE field specifically, #3723 (a second copy
+// of #2467's own gate inside this fix's own `includeForLayout` carriage,
+// widened in a later commit). T1/T2 below now pin the fix #3723 gave this
+// file: `_hidden`'s declared `77` (and `_a`/`_b`/`_c`'s `2`/`3`/`5`) DO
+// replay, not a well-defined-but-zero default.
 //
 // FILED SEPARATELY, NOT FIXED HERE (scope discipline, CLAUDE.md rule 4):
 //   - A private/internal record AUTO-PROPERTY (an `isAutoPropertySymbol`
@@ -199,13 +202,20 @@ bool compileImportCaptureErr2468(const std::string& libSrc,
 // PRIVATE body field `_hidden`, and a PUBLIC method that returns `_hidden`.
 // Calling the method cross-module marshals the record's storage to the
 // exporter's compiled body. ⚠ runAot's exit code is WEXITSTATUS-masked to 8
-// bits (lane protocol) — pre-fix, the method ALIASED and returned `x`'s own
-// value (9), so `r.x + h` was 18 (9+9); post-fix (this commit) the hidden
-// slot is a distinct, well-defined (zero — #2467's value-replay gap is not
-// fixed by this commit) storage cell, so `r.x + h` is 9 (9+0). Either
-// possible corrupted-read outcome (18, or anything else the ordering
-// regression #2464 already guards against) is distinguishable from the
-// correct 9.
+// bits (lane protocol) — pre-#2468 the method ALIASED and returned `x`'s
+// own value (9), so `r.x + h` was 18 (9+9); post-#2468/pre-#3723 the hidden
+// slot was a distinct, well-defined but ZERO (#2467's value-replay gap, not
+// fixed by #2468) storage cell, so `r.x + h` was 9 (9+0).
+//
+// FLIPPED by fix #3723 (§9.1/§9.2/§22.8/§2.8.2, v0.286): #3723 widened
+// `ModuleMetadataBuilder.cpp`'s `includeForLayout` `fieldInitText`-clearing
+// gate (a second, independently-drifting copy of the same
+// `isGenericType`-alone predicate its headline FieldDecl-branch fix
+// corrected) to keep the carriage for a RECORD's private field too — a
+// record has no `bz$<Type>$init` to replay ANY field's initializer through,
+// public or private. `_hidden`'s declared `77` now replays, so `r.x + h`
+// is `86` (9+77) — still distinguishable from the aliasing-corrupted `18`
+// the ordering regression #2464 guards against.
 // ===========================================================================
 BEZEL_TEST(xmod_record_private_field_layout_import_2468,
            method_call_does_not_alias_positional_field_9_1_22_8) {
@@ -224,19 +234,19 @@ BEZEL_TEST(xmod_record_private_field_layout_import_2468,
         "  end Main; "
         "end C2468T1;");
     if (r == -2) return;  // dependency toolchain unavailable — skip
-    BEZEL_EXPECT_EQ(r, 9);
+    BEZEL_EXPECT_EQ(r, 86);  // 9 + 77 — replayed (fix #3723)
 }
 
 // ===========================================================================
 // T2 — index ARITHMETIC across multiple hidden fields (not just "off by one
 // slot"): three private body fields ahead of the positional field's storage
 // index, each read back via its own method, plus the positional field
-// itself. Pre-fix every hidden field is entirely absent from the importer's
-// layout, so `collectRecordStorage` sees only `x` — any method reading a
-// hidden field aliases `x` (all three would read 9); post-fix each is its
-// own distinct (zero) slot. Combined total distinguishes "some/all hidden
-// reads still alias x" (would total > 9) from "every hidden slot is
-// independent" (exactly 9).
+// itself. Pre-#2468 every hidden field is entirely absent from the
+// importer's layout, so `collectRecordStorage` sees only `x` — any method
+// reading a hidden field aliases `x` (all three would read 9). Post-#2468/
+// pre-#3723 each was its own distinct but ZERO slot (combined total 9).
+// Post-#3723 (this commit's regression) each private field's declared
+// value now replays: `2 + 3 + 5 = 10` on top of `x`'s `9`.
 // ===========================================================================
 BEZEL_TEST(xmod_record_private_field_layout_import_2468,
            multiple_private_fields_no_aliasing_9_1_22_8) {
@@ -261,7 +271,7 @@ BEZEL_TEST(xmod_record_private_field_layout_import_2468,
         "  end Main; "
         "end C2468T2;");
     if (r == -2) return;
-    BEZEL_EXPECT_EQ(r, 9);  // 9 + 0 + 0 + 0 — no aliasing, no corruption
+    BEZEL_EXPECT_EQ(r, 19);  // 9 + 2 + 3 + 5 — no aliasing, replayed (fix #3723)
 }
 
 // ===========================================================================

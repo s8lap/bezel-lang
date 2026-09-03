@@ -293,16 +293,19 @@ BEZEL_TEST(xmod_record_property_binary_operand_2474,
 }
 
 // ===========================================================================
-// T3 — CONTROL (scope boundary, not a regression): an arrow-getter backed by
-// a PRIVATE field. #2467/#2468 deliberately do NOT replay a private body
-// field's initializer VALUE cross-module (only its storage SLOT is correct)
-// — so `_hidden` legitimately stays the documented `0` default after
-// import-side construction, and `r.Hidden` reads that documented `0`, not
-// the declared `77`. The POINT of this control is CONSISTENCY: inline and
-// bound-local must agree with each other (both `9 + 0 = 9`), which is the
-// actual #2474 property (not the private-value-replay gap, which is
-// #2467/#2468's own explicitly out-of-scope decision, not re-litigated
-// here).
+// T3 — CONTROL (scope boundary): an arrow-getter backed by a PRIVATE field.
+// AT THE TIME this test was written, #2467/#2468 deliberately did NOT
+// replay a private body field's initializer VALUE cross-module (only its
+// storage SLOT was correct) — so `_hidden` stayed the documented `0`
+// default after import-side construction, and `r.Hidden` read that
+// documented `0`, not the declared `77`. FLIPPED by fix #3723
+// (§9.1/§9.2/§22.8/§2.8.2, v0.286): #3723 widened the SAME `includeForLayout`
+// carriage this file's `_hidden` shape depends on to keep a record's
+// private field initializer text regardless of generic-ness, so `_hidden`
+// now replays to its declared `77` and `r.Hidden` returns it. The POINT of
+// this control is still CONSISTENCY: inline and bound-local must agree with
+// each other (both now `9 + 77 = 86`), which is the actual #2474 property
+// (never the private-value-replay question itself, which #3723 now closes).
 // ===========================================================================
 BEZEL_TEST(xmod_record_property_binary_operand_2474,
            arrow_getter_private_backing_inline_matches_local_control_9_2) {
@@ -323,7 +326,7 @@ BEZEL_TEST(xmod_record_property_binary_operand_2474,
         "  end Main; "
         "end C2474T3I;");
     if (rInline == -2) return;
-    BEZEL_EXPECT_EQ(rInline, 9);  // 9 + 0 (documented private-value gap)
+    BEZEL_EXPECT_EQ(rInline, 86);  // 9 + 77 — replayed (fix #3723)
 
     int rLocal = compileImportAndRun2474(
         lib,
@@ -336,7 +339,7 @@ BEZEL_TEST(xmod_record_property_binary_operand_2474,
         "  end Main; "
         "end C2474T3L;");
     if (rLocal == -2) return;
-    BEZEL_EXPECT_EQ(rLocal, 9);  // must MATCH rInline — the actual #2474 property
+    BEZEL_EXPECT_EQ(rLocal, 86);  // must MATCH rInline — the actual #2474 property
 }
 
 // ===========================================================================

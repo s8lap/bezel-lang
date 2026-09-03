@@ -8654,21 +8654,24 @@ llvm::Value* Emitter::buildRecordValue(
         // fix #3671 (§2.8.2 "No restrictions beyond visibility" / §9.1 /
         // §22.8, v0.286): mirror `emitOwnFieldInit`'s own #2874/#2860
         // construction-site diagnostic — a LOUD reject instead of a silent
-        // §7.9-default zero, for the one case codegen can actually detect it
-        // in today: a GENERIC record (or a generic class monomorphizing a
-        // record-typed member) whose wire carried
-        // `importedInstanceFieldInitText` (so the exporter DID have a
-        // non-static field initializer here) but NEITHER the parsed-expr
+        // §7.9-default zero, for the case codegen can actually detect it in:
+        // an imported record (generic OR, since issue 3723 widened the
+        // writer's `ModuleMetadataBuilder.cpp` gate to also carry a
+        // NON-generic record's instance field text, non-generic too — or a
+        // generic class monomorphizing a record-typed member) whose wire
+        // carried `importedInstanceFieldInitText` (so the exporter DID have
+        // a non-static field initializer here) but NEITHER the parsed-expr
         // replay above NOR the constant fold just above produced a value (a
         // reconstruction parse/sema failure — e.g. the initializer
         // references a sibling that is not part of the exported public
-        // surface — or a fold that returned null). A non-generic record's
-        // initializer text is not carried across the wire at all yet
-        // (#3723), so this positive-evidence guard cannot false-fire on
-        // it — that shape still takes the silent-default path below,
-        // UNCHANGED from before this fix (§6c of this run's lane rules: no
-        // signal reaching codegen, no reject — the loud diagnostic needs
-        // #3723 first).
+        // surface — or a fold that returned null). Before issue 3723's
+        // writer-side widening landed, a non-generic record's initializer
+        // text was not carried across the wire at all, so this positive-
+        // evidence guard could not false-fire on it — that shape took the
+        // silent-default path below, unchanged from before this fix. It now
+        // DOES fire for that shape too (the intended, correct behavior —
+        // see xmod_non_generic_record_field_init_replay_3723_test.cpp T7),
+        // exactly as it always did for the generic case.
         if (!replayed && !init) {
             if (const std::string* initText =
                     ctx_.importedInstanceFieldInitText(m)) {

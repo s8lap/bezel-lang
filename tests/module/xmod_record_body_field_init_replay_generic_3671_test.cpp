@@ -50,6 +50,16 @@
 // exactly as it already did for a generic class) and leaves the non-generic
 // half open, tracked by #3723, with zero behavioral change to that shape.
 //
+// UPDATE (fix #3723, a later commit in this file's history): #3723 has since
+// landed — it widened `ModuleMetadataBuilder.cpp`'s FieldDecl branch (and a
+// second, independently-drifting copy of the same gate in the private/
+// layout-only-field carriage) exactly as the paragraph above predicted. T6
+// below now pins the FIXED, non-zero value instead of the documented gap;
+// see tests/module/xmod_non_generic_record_field_init_replay_3723_test.cpp
+// for the fuller regression grid #3723 shipped (call/new/member-read/
+// conditional/private-field/loud-reject rows, plus a non-generic-class
+// control confirming that path was already correct and is untouched).
+//
 // §6b exclusion diff — what the fold-only copy zeroed, and what the new
 // parsed-expr-replay path now admits, for a GENERIC imported record:
 //   - call                 (`H.Get()`)                — was silently 0, now replays (T1)
@@ -64,12 +74,14 @@
 //     the class path already failed, rather than failing a third, different
 //     way.
 //
-// FAIL-WITHOUT / PASS-WITH (measured on this lane's worktree): reverting
-// `src/codegen/LlvmBackend_Exprs2.cpp` to its parent commit and relinking
-// `bezelc` makes T1-T4 and T7 fail (T1/T2/T3/T4 read back 0/the §7.9 default
-// instead of the replayed value; T7's diagnostic never fires because the
-// fold-only path takes a silent `continue`). T6 and T8 pass unconditionally
-// (they pin behavior this fix does not change).
+// FAIL-WITHOUT / PASS-WITH (measured on this lane's worktree, #3671's own
+// commit): reverting `src/codegen/LlvmBackend_Exprs2.cpp` to its parent
+// commit and relinking `bezelc` makes T1-T4 and T7 fail (T1/T2/T3/T4 read
+// back 0/the §7.9 default instead of the replayed value; T7's diagnostic
+// never fires because the fold-only path takes a silent `continue`). T8
+// passes unconditionally (it pins behavior this fix does not change). T6's
+// own FAIL-WITHOUT/PASS-WITH (post-#3723) is recorded at #3723's commit —
+// see the writer-side test file named above.
 
 #include <cstdio>
 #include <cstdlib>
@@ -372,18 +384,24 @@ BEZEL_TEST(xmod_record_body_field_init_replay_generic_3671,
 }
 
 // ===========================================================================
-// T6 — CONTROL (scope boundary, not a regression, #3723 tracks closing it):
-// a NON-GENERIC imported record's non-constant field initializer is
-// UNCHANGED by this fix — `ctx_.importedInstanceFieldInitExpr` legitimately
-// returns null (ModuleMetadataBuilder.cpp never carries the text for a
-// non-generic type, #3723), so `buildRecordValue` falls through to the same
-// fold-only path as before, and the field stays at its documented §7.9
-// default. This is #3671's OWN stated repro shape (`public record R(a: int)
-// { public b: int := Helper(); }`) — pinning it here as an explicit,
-// unchanged control keeps this fix honest about what it does NOT close.
+// T6 — FLIPPED by fix #3723 (was a documented known-gap control pinning the
+// WRONG value `0`; now pins the FIXED value `42`): a NON-GENERIC imported
+// record's non-constant field initializer now replays exactly like the
+// GENERIC case above. #3723 widened `ModuleMetadataBuilder.cpp`'s FieldDecl
+// branch gate from `isGenericType` alone to `(isGenericType || Record)`
+// (mirroring fix #2525's identical widening of the ConstructorSymbol
+// branch's `ctorBodyText`), so `ctx_.importedInstanceFieldInitExpr` now
+// returns the reconstructed expression for this shape too, and
+// `buildRecordValue`'s #3671 replay (this file's own fix, unchanged by
+// #3723) consumes it with no further codegen change. This is #3671's OWN
+// stated repro shape (`public record R(a: int) { public b: int :=
+// Helper(); }`) — see
+// tests/module/xmod_non_generic_record_field_init_replay_3723_test.cpp for
+// the fuller #3723 regression grid (call/new/member-read/conditional/
+// private-field/loud-reject rows).
 // ===========================================================================
 BEZEL_TEST(xmod_record_body_field_init_replay_generic_3671,
-           t6_non_generic_record_call_initializer_unchanged_control_3672) {
+           t6_non_generic_record_call_initializer_now_replays_3723) {
     std::string stem = unique_stem("bz3671_t6_");
     std::string aObj;
     BEZEL_EXPECT_TRUE(buildLib3671(stem, kLib3671, aObj));
@@ -396,9 +414,8 @@ BEZEL_TEST(xmod_record_body_field_init_replay_generic_3671,
         appSrc3671("App3671T6", "Lib3671",
                    "    var r := new R3671NonGeneric(9);\n"
                    "    return r.b;\n"));
-    // Documented current (unfixed) answer for the non-generic shape: 0, not
-    // the exporter's declared 42. Tracked by #3723.
-    BEZEL_EXPECT_EQ(compileImportAndRun3671(bSrc.path, bExe.path, aObj), 0);
+    // Fixed answer (fix #3723): 42, the exporter's declared value.
+    BEZEL_EXPECT_EQ(compileImportAndRun3671(bSrc.path, bExe.path, aObj), 42);
 }
 
 // ===========================================================================

@@ -1072,7 +1072,45 @@ bool convertMember(const sema::MemberSymbol& m, bool inInterface,
         // generic instance-field initializer, foldable or not, so the consumer's
         // test is the category-blind "did a value actually reach the slot?"
         // rather than a guess about which initializer shapes fold.
-        if (isGenericType && fd->initializer && !source.empty()) {
+        //
+        // fix #3723 (§9.1 / §9.2 / §22.8 / §2.8.2, v0.286): widen the gate to
+        // `(isGenericType || Record)`, exactly mirroring the ConstructorSymbol
+        // branch's `ctorBodyText` gate below (fix #2525) — a RECORD, generic
+        // or NOT, has "no cross-module call of any kind to replay a field
+        // initializer through" (issue #3723's own words, echoing #2525's
+        // rationale for ctorBodyText): §9.1/§9.2 record construction is
+        // lowered INLINE BY VALUE at the `new` site, so there is no
+        // `bz$<Type>$init` a non-generic record could export for the field
+        // branch's own comment above to point to (that mechanism exists only
+        // for classes). A non-generic CLASS is deliberately left OUT of this
+        // widening — its `bz$<Type>$init` already replays every instance
+        // field initializer, foldable or not, so adding text carriage here
+        // would be inert data with no consumer (`buildRecordValue`, the sole
+        // reader of `fieldInitText` for a non-generic type, is record-only —
+        // see LlvmBackend_Exprs2.cpp).
+        // fix #3723 review follow-up: a non-generic record's STATIC field
+        // must stay on the "external storage global" path the comment two
+        // paragraphs up documents — its initializer runs ONCE in the
+        // declaring module's own compilation (§22.12 rule 1) and needs no
+        // textual carriage. Unlike an INSTANCE field, a record has nothing
+        // "inline by value" to reconstruct for a static: the static cell
+        // lives at one process-wide address regardless of how many modules
+        // import it. Populating fieldInitText for a non-reconstructible
+        // static initializer (e.g. one that calls an `internal` sibling)
+        // made ModuleLoader.cpp's parseAndAttachFieldInit take its
+        // isStatic=true reject path — turning a program that compiled and
+        // ran correctly via the external-global mechanism into a hard
+        // §2.8.2 import-time reject. A GENERIC type's static field is the
+        // opposite case (already excluded from `valueText` above via the
+        // same `isStaticField` flag) — #2860/#2871 established that each
+        // generic instantiation needs its OWN replayed static-field text
+        // (#1513's per-instantiation cell), so `isGenericType` must keep
+        // carrying it regardless of `isStaticField`; only the newly-added
+        // `isRecordType` arm needs the exclusion.
+        const bool isRecordType =
+            m.parent && m.parent->kind == ast::TypeDeclKind::Record;
+        if ((isGenericType || (isRecordType && !isStaticField)) &&
+            fd->initializer && !source.empty()) {
             const ast::Expr* init = fd->initializer.get();
             if (init->span.begin.offset < init->span.end.offset &&
                 init->span.end.offset <= source.size()) {
@@ -2007,7 +2045,19 @@ MetaTypeDecl convertTypeDecl(const sema::TypeSymbol& t, sema::SemaContext& ctx,
                 // generic bodies reach"). This is the text the consumer names in
                 // the §2.8.2 diagnostic; it adds no member, no slot and no ABI —
                 // the member itself was already being carried for layout.
-                if (!isGenericMonomorphized) mm.fieldInitText.clear();
+                //
+                // fix #3723: also keep it for a NON-generic RECORD. This gate
+                // is a second, independently-drifting spelling of the same
+                // "isGenericMonomorphized alone" question the FieldDecl branch
+                // above (§9.1/§9.2/§22.8) already widened to `(isGenericType
+                // || Record)` — a record has no `bz$<Type>$init` at any
+                // arity, so a PRIVATE record field's initializer needs the
+                // same replay carriage a PUBLIC one now gets (this gate only
+                // ever runs for `!exported` members, so the two never
+                // overlap). Left untouched for a non-generic CLASS, matching
+                // the FieldDecl branch's own exclusion.
+                if (!isGenericMonomorphized && t.kind != ast::TypeDeclKind::Record)
+                    mm.fieldInitText.clear();
             }
             out.members.push_back(std::move(mm));
         }

@@ -60,12 +60,30 @@
 // the wire intact) infrastructure that #2478's own eventual fix can consume
 // directly with no further wire-format change.
 //
-// SCOPE (mirrors #2468's own scoping): a PRIVATE/internal body field's
-// value is deliberately NOT replayed by this commit — #2468's
+// SCOPE (mirrors #2468's own scoping), AT THIS COMMIT: a PRIVATE/internal
+// body field's value was deliberately NOT replayed — #2468's
 // `includeForLayout` strips `valueText`/`fieldInitText` for a layout-only
 // (private, unexported) member to keep that carriage genuinely layout-only
-// (no initializer, no ABI change). T4 below pins this as a known, expected
-// state, not a regression.
+// (no initializer, no ABI change). T4 below pinned this as a known,
+// expected state, not a regression, AT THE TIME.
+//
+// FLIPPED by fix #3723 (§9.1/§9.2/§22.8/§2.8.2, v0.286): #3723 found that
+// `includeForLayout`'s `fieldInitText`-clearing gate (ModuleMetadataBuilder.
+// cpp, ~line 2029) was a second, independently-drifting copy of the exact
+// `isGenericType`-alone predicate mistake #3723's own headline fix corrected
+// in the FieldDecl branch — a RECORD (generic or not) has no
+// `bz$<Type>$init` to replay ANY field's initializer through, public or
+// private, so clearing `fieldInitText` for a non-generic record's private
+// field reproduced the identical silent-zero bug for that subset. #3723
+// widened the clearing gate to keep `fieldInitText` for `t.kind ==
+// ast::TypeDeclKind::Record` regardless of generic-ness, so `_hidden`'s
+// declared `77` now replays through `GetHidden()`'s cross-module method call
+// exactly like a public field's initializer already did. T4 below now pins
+// the FIXED value (`86`, not `9`) — see
+// tests/module/xmod_non_generic_record_field_init_replay_3723_test.cpp T6
+// for the dedicated #3723 regression (a non-foldable private-field
+// initializer, which this file's foldable `77` literal does not exercise on
+// its own).
 
 #include <cstdio>
 #include <cstdlib>
@@ -201,19 +219,21 @@ BEZEL_TEST(xmod_record_body_field_init_replay_2467,
 }
 
 // ===========================================================================
-// T4 — CONTROL (scope boundary, not a regression): a PRIVATE body field's
-// declared value is deliberately NOT replayed by this fix — #2468's
-// `includeForLayout` strips a layout-only (private) member's `valueText` to
-// keep that carriage genuinely layout-only. The private field's STORAGE
-// SLOT is correct (via #2468, proven by the positional field NOT
-// aliasing/corrupting), but its VALUE stays the zero default. Reads the
-// private field's value through a method (mirrors #2468's own T1, avoiding
-// #2474's separate inline-property-in-binary-expression defect) to confirm
-// this is a well-defined, documented `0` — not a crash, not a
+// T4 — FLIPPED by fix #3723 (was a documented-gap control pinning `9` — the
+// private field's `77` initializer NOT replayed; now pins `86` — it IS
+// replayed). A PRIVATE body field's declared value now replays exactly like
+// a public one: #3723 widened `includeForLayout`'s `fieldInitText`-clearing
+// gate (ModuleMetadataBuilder.cpp) to keep the carriage for a RECORD
+// regardless of generic-ness, since a record has no `bz$<Type>$init` to
+// replay ANY field through, public or private. The private field's STORAGE
+// SLOT was already correct (via #2468); this fix additionally makes its
+// VALUE correct. Reads the private field's value through a method (mirrors
+// #2468's own T1, avoiding #2474's separate inline-property-in-binary-
+// expression defect) to confirm the replayed value, not a crash or a
 // mis-corrupted read of a neighboring slot.
 // ===========================================================================
 BEZEL_TEST(xmod_record_body_field_init_replay_2467,
-           private_body_field_value_stays_documented_gap_control) {
+           private_body_field_value_now_replays_3723) {
     int r = compileImportAndRun2467(
         "module RecLib2467T4; "
         "public record Rec2467T4(x: int) "
@@ -229,7 +249,7 @@ BEZEL_TEST(xmod_record_body_field_init_replay_2467,
         "  end Main; "
         "end C2467T4;");
     if (r == -2) return;
-    BEZEL_EXPECT_EQ(r, 9);  // 9 + 0 — private value NOT replayed (documented)
+    BEZEL_EXPECT_EQ(r, 86);  // 9 + 77 — private value now replays (fix #3723)
 }
 
 // ===========================================================================
