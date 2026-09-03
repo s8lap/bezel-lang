@@ -1693,6 +1693,147 @@ private:
     bool isCapturedOwnedBinding(const ast::Expr& e);
     void reportCapturedOwnedConsume(std::string_view name, SourceLocation loc,
                                     const char* verb);
+
+    // fix #3755 (§28.3 *Captured owned bindings* / §27.5 / §28.8.1, v0.286):
+    // the READ half of the §28.3 captured-owned-binding rule, the sibling of
+    // the CONSUME half `checkCapturedOwnedConsumeInStmt` above.
+    //
+    // §28.3 *Captured owned bindings*: "Inside a closure, a captured owned
+    // binding — an owned local or `owned` parameter of the enclosing body —
+    // is uniformly in **borrow state**: reads borrow". A capture is therefore
+    // a READ of the binding, performed where the closure is created (§27.5:
+    // "Captured variables are heap-allocated in a closure object"). §28.8.1:
+    // "a moved-from *binding* is simply unreadable until reassigned, with no
+    // restoration obligation." Composing the two: capturing a binding that is
+    // MovedFrom at the literal's position is the same error `checkRead`'s
+    // IdentifierExpr arm reports for a direct `p.V()` after `move p` — but
+    // `checkRead` never descends into a lambda literal's body, so the capture
+    // form was unchecked and compiled into a read of freed/garbage memory
+    // (#3755, measured: a garbage `int`, no diagnostic, rc=0).
+    //
+    // No new state table: this consults the SAME `states_` MovedFrom fact the
+    // direct read consults, at the SAME program point the consume half uses
+    // (statement entry — the point the closure is created), and enumerates
+    // the captures with the SAME `collectLambdaIdentifiers` free-variable
+    // walk every other capture check uses. Resolution is BY SYMBOL
+    // (`ctx_.exprSymbol`), like `isCapturedOwnedBinding`, so a lambda
+    // parameter or lambda-body local that shadows the outer name resolves to
+    // its own symbol, is absent from `states_`, and is correctly not
+    // reported. Only the MovedFrom state is consulted — the Disposed /
+    // maybe-consumed / Uninitialized legs of `checkRead` are deliberately NOT
+    // replicated here (see the commit body's exclusion diff).
+    //
+    // `lamPath` is the literal's branch path — see `stmtBranchPath_` below for
+    // what a branch path is and why the per-statement sets are scoped by one.
+    using BranchPath = std::vector<std::pair<const void*, unsigned>>;
+    // Two paths can co-execute unless they sit in DIFFERENT arms of some
+    // branch node they share. Paths are built by nesting, so a shared node
+    // always appears at the same depth with the same prefix, which is what
+    // makes the lockstep comparison exact.
+    static bool branchPathsCoExecute(const BranchPath& a, const BranchPath& b) {
+        const std::size_t n = a.size() < b.size() ? a.size() : b.size();
+        for (std::size_t i = 0; i < n; ++i) {
+            // Different branch CONSTRUCTS at the same depth are siblings —
+            // both run, so they co-execute.
+            if (a[i].first != b[i].first) return true;
+            // Same construct, different arm: mutually exclusive.
+            if (a[i].second != b[i].second) return false;
+        }
+        // One path is a prefix of the other: the shorter one is unconditional
+        // relative to the longer, so it runs whenever the longer does.
+        return true;
+    }
+    void reportMovedFromCapturesIn(const ast::LambdaExpr& lam,
+                                   const BranchPath& lamPath);
+    // fix #3755 (review follow-up, §22.5 *Evaluation order* / §28.3, v0.286):
+    // the same-STATEMENT leg. `checkCapturedOwnedConsumeInStmt` runs on the
+    // states at STATEMENT ENTRY, so a consume performed by another part of the
+    // SAME statement is invisible to the MovedFrom test above:
+    //
+    //     Go(move p, lambda(): int => p.V())   // accepted; reads freed memory
+    //     Go(lambda(): int => p.V(), move p)   // accepted; reads freed memory
+    //
+    // BOTH orders were measured to compile rc=0 and read freed storage (plain
+    // build printed garbage; `--probe --asan` reported a heap-use-after-free),
+    // so the defect is NOT the argument order — it is that the statement
+    // transfers the captured binding's value away at all. §22.5's *Evaluation
+    // order* ("A call's supplied argument expressions are evaluated in
+    // call-site textual order — left to right as written") makes the first
+    // spelling a plain read-of-moved-from at the literal; the second is
+    // §28.3's consume-site freeze ("A borrow is *live* at a consume site when
+    // some path from the site reaches a later use of it — … through a closure
+    // value that is itself still live"), whose implementation sees only
+    // closures held by LOCALS and therefore misses an argument-position
+    // closure temporary. One order-independent rule covers both: a lambda
+    // literal may not capture a binding this statement consumes.
+    //
+    // `stmtConsumedBindings_` is that statement's consume set, `stmtPendingLambdas_`
+    // its lambda literals; the walk fills both and the driver drains the
+    // second against the first AFTER the walk, so the answer does not depend
+    // on which side the walk reached first. Both are cleared per statement.
+    //
+    // PATH SCOPING (second review follow-up). A flat per-statement set is
+    // WRONG for the two EXPRESSION-level mutually-exclusive-branch nodes:
+    //
+    //     var r: () -> int := (if flag then Consume(move p)
+    //                                   else lambda(): int => p.V());
+    //
+    // is legal and safe — the arms never both run, so on the `else` path `p`
+    // was never moved — yet a flat set pools the `move` from one arm with the
+    // lambda from the other and falsely rejects it. Statement-level control
+    // flow needs no such treatment: `scanCapturedOwnedConsumeStmt` returns
+    // early for it at the top level (each nested statement gets its own
+    // `visitStmt` -> `checkCapturedOwnedConsumeInStmt` call with fresh state),
+    // so IfStmt/WhileStmt/ForStmt/CaseStmt/TryStmt arms are already isolated.
+    // Only `ConditionalExpr` (the §20 if-atom, elif chains nesting inside its
+    // `elseValue`) and `CaseExpr` are walked as one expression here.
+    //
+    // Enumerated from the AST: those two are the WHOLE set of expression nodes
+    // with mutually exclusive alternatives. The short-circuiting BinaryExpr
+    // forms (`??`, `and`, `or`) and the null-conditional accesses have a
+    // conditional RIGHT side but an unconditional LEFT one, so their parts CAN
+    // co-execute and flat pooling is already the exact answer for them.
+    //
+    // So each consume and each pending lambda carries the branch path it sits
+    // on — the stack of (branch node, arm index) it is nested under — and a
+    // consume is paired with a lambda only when the two paths CAN co-execute.
+    // A condition / scrutinee runs on every path through its construct and so
+    // carries the ENCLOSING path, not an arm's; a `case` arm's guard likewise
+    // (a guard may run and its arm still not be selected), which is the
+    // conservative direction — it can only add rejections, never lose one.
+    BranchPath stmtBranchPath_;
+    std::vector<std::pair<sema::Symbol*, BranchPath>> stmtConsumedBindings_;
+    std::vector<std::pair<const ast::LambdaExpr*, BranchPath>>
+        stmtPendingLambdas_;
+    // Cheap gate: false when the statement contains no lambda literal at all,
+    // in which case nothing is recorded and the new leg is provably inert.
+    bool stmtHasLambda_ = false;
+    // Records `e` (a bare identifier naming a dataflow-tracked binding) as
+    // consumed by the statement being walked. Non-identifier operands and
+    // untracked symbols are ignored.
+    void recordStatementConsumedBinding(const ast::Expr& e);
+    // The one insertion point for a resolved consumed symbol; stamps it with
+    // the branch path currently being walked.
+    void recordStatementConsumedSymbol(sema::Symbol* sym);
+    // THE one spelling of "does this argument CONSUME its operand?" — a marked
+    // `owned r`, or a bare identifier bound to a plain `owned` formal. Shared
+    // by `reportArgConsumeCapturedOwned` (the #1958 in-closure consume reject)
+    // and the statement-consume recorder, so the two can never drift.
+    static bool argConsumesBareBinding(const ast::CallArgument& a,
+                                       bool ownedSinkParam) {
+        return a.modifier == "owned" || (a.modifier.empty() && ownedSinkParam);
+    }
+    // fix #3755: per-method de-duplication for the walk above. A nested
+    // lambda's identifiers are collected by BOTH its own and its enclosing
+    // lambda's `collectLambdaIdentifiers` call, and a block may be re-visited,
+    // so report each offending capture SITE at most once. Keyed by AST site,
+    // not by symbol, so two distinct captures of the same binding each get
+    // their own diagnostic. Deliberately does NOT poison the `states_` record
+    // (unlike `checkRead`'s direct-read arm): this walk runs from a pre-pass
+    // driver that is invoked before the statement's own transfer functions,
+    // and mutating the dataflow record from there would perturb every later
+    // consumer of that binding's state.
+    std::unordered_set<const ast::IdentifierExpr*> reportedMovedFromCaptures_;
     // True when the argument at source index `argIdx` of a call whose callee is
     // `callee` is a CONSUMING owned sink — a user-declared plain `owned` formal,
     // or a builtin owned-sink position (Domain.Spawn, channel Send, …). Mirrors

@@ -2562,10 +2562,105 @@ void MethodOwnership::reportArgConsumeCapturedOwned(const ast::CallArgument& a,
     // NOT an ownership consume of the passed value, and a bare identifier into a
     // BORROW parameter (ownedSinkParam == false) is a legitimate borrow-in-
     // closure — both stay accepted.
-    if (a.modifier == "owned" || (a.modifier.empty() && ownedSinkParam)) {
+    // fix #3755 (review follow-up): the condition now lives in
+    // `argConsumesBareBinding`, shared with the statement-consume recorder.
+    if (argConsumesBareBinding(a, ownedSinkParam)) {
         const auto* aid =
             dynamic_cast<const ast::IdentifierExpr*>(a.value.get());
         reportCapturedOwnedConsume(aid->name, aid->span.begin, "transfer");
+    }
+}
+
+// fix #3755 (§28.3 *Captured owned bindings* / §27.5 / §28.8.1, v0.286).
+//
+// The READ half of §28.3's captured-owned-binding rule. §28.3 states the
+// capture's classification directly — "Inside a closure, a captured owned
+// binding ... is uniformly in **borrow state**: reads borrow" — and §28.8.1
+// states the moved-from binding rule directly: "a moved-from *binding* is
+// simply unreadable until reassigned, with no restoration obligation." A
+// capture of a binding that is MovedFrom where the closure literal is
+// evaluated is therefore exactly the error `checkRead`'s IdentifierExpr arm
+// already reports for the direct read (`owned value in `p` was already moved
+// out at this point`); the only reason it went undiagnosed is that no read
+// check descends into a lambda literal's body.
+//
+// Measured on the parent (a31fb7b): the issue's repro — `var q := move p;
+// this.h := lambda(): int => p.V();` — compiled rc=0 with no diagnostic and
+// printed a garbage int (`-571446371`, `-1803718759` on consecutive runs of
+// the same binary). The `owned` parameter and plain owned local forms behave
+// identically, and the `var f := lambda(): int => p.V();` LocalDecl form (no
+// field store at all) is outside the #3746 store-escape channel entirely.
+//
+// Flow-sensitive by construction: the driver `checkCapturedOwnedConsumeInStmt`
+// runs before the statement's own transfer functions, so `states_` holds the
+// binding states at the point the closure is created. A closure created BEFORE
+// the move is therefore not reported here (see the enumeration in the commit
+// body: that shape is the consume-site freeze's business, §28.3, and is
+// already rejected by the #3746 store-escape rule in the field-store form).
+void MethodOwnership::reportMovedFromCapturesIn(const ast::LambdaExpr& lam,
+                                                const BranchPath& lamPath) {
+    std::vector<const ast::IdentifierExpr*> ids;
+    collectLambdaIdentifiers(lam, ids);
+    for (const ast::IdentifierExpr* id : ids) {
+        if (!id) continue;
+        if (id->name == "this" || id->name == "base") continue;
+        // Resolve BY SYMBOL, not by name: `states_` is keyed by
+        // `sema::Symbol*`, and a lambda parameter or a lambda-body local that
+        // shadows the enclosing name resolves to its OWN symbol, which is not
+        // in `states_` (it is declared inside the closure). That is what keeps
+        // `lambda(p: int): int => p + 1` and `lambda(): int => do var p := 7;
+        // return p; end;` accepted next to an outer moved-from `p`.
+        sema::Symbol* sym = ctx_.exprSymbol(*id);
+        if (!sym) continue;
+        auto it = states_.find(sym);
+        if (it == states_.end()) continue;
+        const bool movedAtLiteral =
+            it->second.state == OwnershipState::MovedFrom;
+        // fix #3755 (review follow-up): the same-STATEMENT leg — the states
+        // consulted above are the statement's ENTRY states, so a consume
+        // performed by another part of this very statement is not in them.
+        // fix #3755 (second review follow-up): only a consume that CAN
+        // co-execute with this literal counts. A consume sitting in a
+        // mutually exclusive arm of an if-atom / case-expression never runs on
+        // the path that creates this closure, so pairing them would reject a
+        // legal program (§28.3's obligations are per-path).
+        bool consumedInThisStmt = false;
+        for (const auto& [csym, cpath] : stmtConsumedBindings_) {
+            if (csym != sym) continue;
+            if (!branchPathsCoExecute(cpath, lamPath)) continue;
+            consumedInThisStmt = true;
+            break;
+        }
+        if (!movedAtLiteral && !consumedInThisStmt) continue;
+        if (!reportedMovedFromCaptures_.insert(id).second) continue;
+        if (movedAtLiteral) {
+            report(Severity::Error, id->span.begin,
+                   std::string("closure captures `") + std::string(id->name) +
+                   "` whose owned value was already moved out at this point "
+                   "(§28.3) — a captured owned binding is borrow-state throughout "
+                   "the closure and the capture READS the binding (§28.3 "
+                   "*Captured owned bindings*, §27.5), but a moved-from binding is "
+                   "unreadable until reassigned (§28.8.1), so the closure would "
+                   "read freed or uninitialized memory. Create the closure before "
+                   "the move, reassign `" + std::string(id->name) +
+                   "` to a fresh value first, or give the closure an `owned` "
+                   "parameter and pass the value in.");
+        } else {
+            report(Severity::Error, id->span.begin,
+                   std::string("closure captures `") + std::string(id->name) +
+                   "` whose owned value is transferred away by this same "
+                   "statement (§28.3 / §22.5) — a captured owned binding is "
+                   "borrow-state throughout the closure and the capture READS "
+                   "the binding (§28.3 *Captured owned bindings*, §27.5), but "
+                   "the statement also consumes it, and nothing at the call "
+                   "site orders the closure's INVOCATION against that transfer "
+                   "(§22.5 *Evaluation order* fixes only when the argument "
+                   "EXPRESSIONS run), so the closure would read freed memory. "
+                   "Transfer `" + std::string(id->name) +
+                   "` in an earlier statement and re-borrow from its new "
+                   "owner, or give the closure an `owned` parameter and pass "
+                   "the value in.");
+        }
     }
 }
 
@@ -2575,6 +2670,19 @@ void MethodOwnership::scanCapturedOwnedConsumeExpr(const ast::Expr& e,
     // top-level lambda literal and a nested one funnel through here, so every
     // closure's direct body is scanned exactly once.
     if (const auto* lam = dynamic_cast<const ast::LambdaExpr*>(&e)) {
+        // fix #3755 (§28.3 *Captured owned bindings* / §27.5 / §28.8.1): the
+        // READ half of the same rule this walk enforces the CONSUME half of.
+        // Fired on every lambda literal reached — top-level, nested, and IIFE
+        // callee alike — at the statement-entry states, i.e. at the point the
+        // closure is created. Per-site de-duplication lives in the callee (a
+        // nested lambda's identifiers are collected by its enclosing lambda's
+        // walk as well as its own).
+        // fix #3755 (review follow-up): DEFER. The statement's own consume
+        // set is not complete until the whole statement has been walked (a
+        // `move p` may sit in a LATER argument than this literal), so the
+        // capture check runs from `checkCapturedOwnedConsumeInStmt` after the
+        // walk, not here. Order-independent by construction.
+        stmtPendingLambdas_.emplace_back(lam, stmtBranchPath_);
         if (lam->exprBody)
             scanCapturedOwnedConsumeExpr(*lam->exprBody, /*insideLambda=*/true);
         for (const auto& st : lam->stmts)
@@ -2604,11 +2712,20 @@ void MethodOwnership::scanCapturedOwnedConsumeExpr(const ast::Expr& e,
         // unmarked spelling reaches the closure body unrejected — #1958). A bare
         // identifier passed to a BORROW parameter is not an owned sink and stays
         // an accepted borrow-in-closure.
-        if (insideLambda) {
+        {
             std::size_t pos = 0;
             for (const auto& a : call->args) {
-                reportArgConsumeCapturedOwned(
-                    a, calleeArgIsOwnedSink(call->callee.get(), call->args, pos));
+                const bool ownedSink =
+                    calleeArgIsOwnedSink(call->callee.get(), call->args, pos);
+                if (insideLambda) {
+                    reportArgConsumeCapturedOwned(a, ownedSink);
+                } else if (stmtHasLambda_ && a.value &&
+                           argConsumesBareBinding(a, ownedSink)) {
+                    // fix #3755 (review follow-up): an owned-sink argument of
+                    // THIS statement consumes the binding; a sibling argument's
+                    // lambda literal may not capture it (§22.5 / §28.3).
+                    recordStatementConsumedBinding(*a.value);
+                }
                 ++pos;
             }
         }
@@ -2632,11 +2749,17 @@ void MethodOwnership::scanCapturedOwnedConsumeExpr(const ast::Expr& e,
         return;
     }
     if (const auto* nc = dynamic_cast<const ast::NullCondCallExpr*>(&e)) {
-        if (insideLambda) {
+        {
             std::size_t pos = 0;
             for (const auto& a : nc->args) {
-                reportArgConsumeCapturedOwned(
-                    a, calleeArgIsOwnedSink(nc->callee.get(), nc->args, pos));
+                const bool ownedSink =
+                    calleeArgIsOwnedSink(nc->callee.get(), nc->args, pos);
+                if (insideLambda) {
+                    reportArgConsumeCapturedOwned(a, ownedSink);
+                } else if (stmtHasLambda_ && a.value &&
+                           argConsumesBareBinding(a, ownedSink)) {
+                    recordStatementConsumedBinding(*a.value);  // fix #3755
+                }
                 ++pos;
             }
         }
@@ -2646,6 +2769,27 @@ void MethodOwnership::scanCapturedOwnedConsumeExpr(const ast::Expr& e,
         return;
     }
     if (const auto* ne = dynamic_cast<const ast::NewExpr*>(&e)) {
+        // fix #3755 (review follow-up): a ctor `owned` argument of THIS
+        // statement consumes the binding, exactly like a method call's
+        // (`new Holder(move p, lambda(): int => p.V())`). Recorded outside the
+        // `insideLambda` block below, which reports the #1958 in-closure
+        // consume instead.
+        if (!insideLambda && stmtHasLambda_) {
+            const CalleeFormals ctorFormals = resolveCtorParams(*ne, ctx_);
+            std::size_t rpos = 0;
+            for (const auto& a : ne->args) {
+                const std::size_t bp =
+                    ctorFormals.valid()
+                        ? boundParamIndex(ne->args, rpos, ctorFormals)
+                        : rpos;
+                const bool ownedSink =
+                    ctorFormals.valid() && bp < ctorFormals.size() &&
+                    ctorFormals.modifier(bp) == "owned";
+                if (a.value && argConsumesBareBinding(a, ownedSink))
+                    recordStatementConsumedBinding(*a.value);
+                ++rpos;
+            }
+        }
         // Transfer into a constructor `owned` parameter — MARKED
         // `new Holder(owned r)` and UNMARKED `new Holder(r)` alike (#1958).
         if (insideLambda) {
@@ -2673,9 +2817,15 @@ void MethodOwnership::scanCapturedOwnedConsumeExpr(const ast::Expr& e,
         // Indexer indices: only the MARKED `owned` form is a consume here (an
         // index argument is never a plain `owned` sink), so pass ownedSinkParam
         // = false — reportArgConsumeCapturedOwned still fires on `coll[owned r]`.
-        if (insideLambda)
+        if (insideLambda) {
             for (const auto& a : ix->indices)
                 reportArgConsumeCapturedOwned(a, /*ownedSinkParam=*/false);
+        } else if (stmtHasLambda_) {
+            for (const auto& a : ix->indices)  // fix #3755
+                if (a.value &&
+                    argConsumesBareBinding(a, /*ownedSinkParam=*/false))
+                    recordStatementConsumedBinding(*a.value);
+        }
         if (ix->target) scanCapturedOwnedConsumeExpr(*ix->target, insideLambda);
         for (const auto& a : ix->indices)
             if (a.value) scanCapturedOwnedConsumeExpr(*a.value, insideLambda);
@@ -2689,6 +2839,11 @@ void MethodOwnership::scanCapturedOwnedConsumeExpr(const ast::Expr& e,
                 dynamic_cast<const ast::IdentifierExpr*>(un->operand.get());
             reportCapturedOwnedConsume(oid->name, oid->span.begin, "transfer");
         }
+        // fix #3755 (review follow-up): `move p` ANYWHERE in this statement
+        // (an argument, an initializer, a return operand) consumes `p`, so a
+        // lambda literal of the same statement may not capture it.
+        if (!insideLambda && stmtHasLambda_ && un->op == "move" && un->operand)
+            recordStatementConsumedBinding(*un->operand);
         if (un->operand) scanCapturedOwnedConsumeExpr(*un->operand, insideLambda);
         return;
     }
@@ -2718,6 +2873,12 @@ void MethodOwnership::scanCapturedOwnedConsumeExpr(const ast::Expr& e,
             if (consumedCaptured)
                 reportCapturedOwnedConsume(mt->name, mt->span.begin,
                                            "transfer");
+        } else if (stmtHasLambda_) {
+            // fix #3755 (review follow-up): the marked transfer `owned r` in
+            // an ordinary (non-closure) position of this statement is a
+            // consume of `r` for the same-statement capture rule.
+            if (sema::Symbol* resolved = ctx_.exprSymbol(*mt))
+                recordStatementConsumedSymbol(resolved);
         }
         return;
     }
@@ -2744,12 +2905,24 @@ void MethodOwnership::scanCapturedOwnedConsumeExpr(const ast::Expr& e,
         return;
     }
     if (const auto* cd = dynamic_cast<const ast::ConditionalExpr*>(&e)) {
-        if (cd->thenValue)
+        // fix #3755 (second review follow-up, §28.3 per-path): the two value
+        // arms are MUTUALLY EXCLUSIVE, so a consume in one and a capture in
+        // the other never co-execute and must not be paired. The CONDITION
+        // runs on every path through the construct and therefore keeps the
+        // ENCLOSING path. An elif chain is a ConditionalExpr nested in
+        // `elseValue`, so it scopes itself by the same recursion.
+        if (cd->thenValue) {
+            stmtBranchPath_.emplace_back(cd, 0u);
             scanCapturedOwnedConsumeExpr(*cd->thenValue, insideLambda);
+            stmtBranchPath_.pop_back();
+        }
         if (cd->condition)
             scanCapturedOwnedConsumeExpr(*cd->condition, insideLambda);
-        if (cd->elseValue)
+        if (cd->elseValue) {
+            stmtBranchPath_.emplace_back(cd, 1u);
             scanCapturedOwnedConsumeExpr(*cd->elseValue, insideLambda);
+            stmtBranchPath_.pop_back();
+        }
         return;
     }
     if (const auto* th = dynamic_cast<const ast::ThrowExpr*>(&e)) {
@@ -2776,10 +2949,19 @@ void MethodOwnership::scanCapturedOwnedConsumeExpr(const ast::Expr& e,
         return;
     }
     if (const auto* ce = dynamic_cast<const ast::CaseExpr*>(&e)) {
+        // fix #3755 (second review follow-up, §28.3 per-path): exactly one arm
+        // is selected, so arms are mutually exclusive — same treatment as the
+        // if-atom above. The SCRUTINEE runs on every path and keeps the
+        // enclosing path; so does an arm GUARD, deliberately: a guard may run
+        // and its arm still not be selected (a later arm wins), so scoping a
+        // guard to its own arm would be UNSOUND. Keeping it unconditional can
+        // only add rejections, never lose one.
         if (ce->scrutinee)
             scanCapturedOwnedConsumeExpr(*ce->scrutinee, insideLambda);
+        unsigned armIdx = 0;
         for (const auto& arm : ce->arms) {
             if (arm.guard) scanCapturedOwnedConsumeExpr(*arm.guard, insideLambda);
+            stmtBranchPath_.emplace_back(ce, armIdx);
             if (arm.bodyKind == ast::CaseArmBodyKind::Expression) {
                 if (arm.exprBody)
                     scanCapturedOwnedConsumeExpr(*arm.exprBody, insideLambda);
@@ -2787,6 +2969,8 @@ void MethodOwnership::scanCapturedOwnedConsumeExpr(const ast::Expr& e,
                 for (const auto& bs : arm.stmts)
                     if (bs) scanCapturedOwnedConsumeStmt(*bs, insideLambda);
             }
+            stmtBranchPath_.pop_back();
+            ++armIdx;
         }
         return;
     }
@@ -2928,8 +3112,53 @@ void MethodOwnership::scanCapturedOwnedConsumeStmt(const ast::Stmt& s,
     }
 }
 
+// fix #3755 (review follow-up): resolve `e` to a dataflow-tracked binding and
+// record it as consumed by the statement currently being walked. Only a BARE
+// identifier is a binding consume (`move box.f` empties a FIELD, which §28.3's
+// scope clause explicitly exempts from the freeze — "Fields and collection
+// slots are **not** frozen"); an untracked symbol (a lambda-internal binding,
+// a field, a static) is not in `states_` and is ignored.
+void MethodOwnership::recordStatementConsumedBinding(const ast::Expr& e) {
+    const auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e);
+    if (!id) return;
+    if (id->name == "this" || id->name == "base") return;
+    if (sema::Symbol* sym = ctx_.exprSymbol(*id))
+        recordStatementConsumedSymbol(sym);
+}
+
+// fix #3755 (second review follow-up): the ONE insertion point for a consumed
+// binding. Stamps the symbol with the branch path currently being walked, so
+// the drain can tell a consume that co-executes with a capture from one that
+// sits in a mutually exclusive arm. An untracked symbol (a lambda-internal
+// binding, a field, a static) is not in `states_` and is ignored.
+void MethodOwnership::recordStatementConsumedSymbol(sema::Symbol* sym) {
+    if (!sym) return;
+    if (!states_.count(sym)) return;
+    stmtConsumedBindings_.emplace_back(sym, stmtBranchPath_);
+}
+
 void MethodOwnership::checkCapturedOwnedConsumeInStmt(const ast::Stmt& s) {
+    // fix #3755 (review follow-up): TWO phases over one walk. The walk records
+    // this statement's consumed bindings and DEFERS its lambda literals; the
+    // capture check then runs against the COMPLETE consume set. Doing it in
+    // one pass made the verdict depend on which side the walk reached first,
+    // which is exactly the order-sensitivity the review measured as a
+    // heap-use-after-free in both directions.
+    stmtConsumedBindings_.clear();
+    stmtPendingLambdas_.clear();
+    stmtBranchPath_.clear();
+    // Cheap gate: with no lambda literal in the statement there is nothing to
+    // check, so nothing is recorded and this leg is provably inert.
+    std::vector<const ast::LambdaExpr*> lambdasHere;
+    collectBodyLambdas(s, lambdasHere);
+    stmtHasLambda_ = !lambdasHere.empty();
     scanCapturedOwnedConsumeStmt(s, /*insideLambda=*/false);
+    for (const auto& [lam, lamPath] : stmtPendingLambdas_)
+        reportMovedFromCapturesIn(*lam, lamPath);
+    stmtPendingLambdas_.clear();
+    stmtConsumedBindings_.clear();
+    stmtBranchPath_.clear();
+    stmtHasLambda_ = false;
 }
 
 void MethodOwnership::checkClosureEscapesOnReturn(const ast::Expr& e,
