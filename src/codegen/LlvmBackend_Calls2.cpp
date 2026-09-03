@@ -13945,8 +13945,26 @@ llvm::Value* Emitter::tryBuildOwningEnumeratorForBuiltinSource(
 //     bz_string; released by the wrapper's Dispose path via the owning
 //     array wrapper's Rc machinery).
 //   * generic: load key bytes (key_size bytes per element) into elemTy.
-llvm::Value* Emitter::wrapSortedSetAsIEnumerable(
-        llvm::Value* set, const sema::TypeRef* iEnumTy) {
+// fix #3711 (stdlib §4.18 / §5, v0.286): the ascending SNAPSHOT half of
+// wrapSortedSetAsIEnumerable, split out so the §5 lazy-operator path
+// (LlvmBackend_Calls3.cpp's lowerToLazyEnumerator) can feed the SAME sorted
+// snapshot instead of spelling a second one. Everything from here to the
+// `return arr` is verbatim what wrapSortedSetAsIEnumerable ran before; the
+// only change is that the caller now decides how to wrap the array.
+//
+// Returns a FRESH bz_array_t* holding the set's elements in ASCENDING order
+// (stdlib §4.18's ordered-iteration obligation) with no owner: the caller must
+// hand it to something that frees it exactly once (wrapOwnedArrayAsIEnumerable
+// below, or bz_lazy_from_owned_array in Calls3). The array BORROWS its elements
+// — a string slot holds the SortedSet's own bz_string* +1, exactly as
+// bz_lazy_from_set's snapshot does — so every consumer must free it with a
+// NULL element disposer.
+//
+// `*outElemSize`, when requested, receives the element stride the array was
+// built with, so a caller cannot re-derive a different one and then read the
+// array at the wrong pitch.
+llvm::Value* Emitter::sortedSetSnapshotToSortedArray(
+        llvm::Value* set, const sema::TypeRef* iEnumTy, int64_t* outElemSize) {
     if (!set || !iEnumTy || iEnumTy->genericArgs.empty() ||
         !iEnumTy->genericArgs[0])
         return nullptr;
@@ -13954,6 +13972,7 @@ llvm::Value* Emitter::wrapSortedSetAsIEnumerable(
     llvm::Type* elemLlvm = lowerTypeRef(elemTy);
     if (!elemLlvm) return nullptr;
     int64_t esz = (int64_t)module_->getDataLayout().getTypeAllocSize(elemLlvm);
+    if (outElemSize) *outElemSize = esz;
 
     // fix #2550: SortedSet<string>'s backing store uses the GENERIC-key dict
     // (bz_dict_set_gen stores each element as a malloc(8) buffer holding the
@@ -14106,14 +14125,23 @@ llvm::Value* Emitter::wrapSortedSetAsIEnumerable(
     builder_.SetInsertPoint(endBB);
     builder_.CreateCall(freeFn, {keysArr});
 
-    // Wrap the materialised sorted array as an OWNING IEnumerable<T>. The
-    // string-element case uses the plain wrapOwnedArrayAsIEnumerable (the
-    // bz_array_t holds pointers directly, so the null-element-disposer
-    // bz_array_free path is correct — each slot is a bz_string* ready for
-    // bz_string_release by the owning wrapper's standard #2218-class
-    // machinery). For generic-key elements, the array is a tight
-    // key-bytes array and the plain wrapper is also correct (no per-slot
-    // heap refs).
+    return arr;
+}
+
+// fix #2546 (stdlib §4.18; language spec §29.1, v0.236):
+// SortedSet<T>.GetEnumerator() codegen — the WRAP half. The snapshot+sort above
+// is now shared with the §5 lazy-operator path (#3711); this half wraps the
+// materialised sorted array as an OWNING IEnumerable<T>. The string-element
+// case uses the plain wrapOwnedArrayAsIEnumerable (the bz_array_t holds
+// pointers directly, so the null-element-disposer bz_array_free path is
+// correct — each slot is a bz_string* ready for bz_string_release by the
+// owning wrapper's standard #2218-class machinery). For generic-key elements,
+// the array is a tight key-bytes array and the plain wrapper is also correct
+// (no per-slot heap refs).
+llvm::Value* Emitter::wrapSortedSetAsIEnumerable(
+        llvm::Value* set, const sema::TypeRef* iEnumTy) {
+    llvm::Value* arr = sortedSetSnapshotToSortedArray(set, iEnumTy, nullptr);
+    if (!arr) return nullptr;
     return wrapOwnedArrayAsIEnumerable(arr, iEnumTy);
 }
 

@@ -2015,32 +2015,70 @@ llvm::Value* Emitter::lowerToLazyEnumerator(const ast::Expr& recvExpr,
     // fix #2726 / stdlib §4.18 (v0.278): admit SortedSet alongside Set/OwningSet
     // here — its runtime IS the bz_dict_t* (the same `bz_dict_alloc_generic`
     // lowerNew mints for Set/OwningSet, with sorted-ordering presentation
-    // layered on, #1426), and `bz_lazy_from_set` snapshots its element keys
-    // identically. Without SortedSet in this predicate, a `sortedSet.ToArray()`
-    // (Calls3.cpp:1668) — or `new LinkedList<T>(sortedSet)` (Exprs2.cpp:3965) —
-    // fell through to `bz_lazy_from_array` over a `bz_dict_t*` at line 1565:
-    // a silent misread where `bz_array_t`/`bz_dict_t` struct-prefix coincidence
-    // aliased the count slot but `bz_array_ptr_at` read `bz_entry_t` header
-    // bytes as element slots. Narrow residue of the broader Set-family thesis
-    // (the prior registry move regressed 30+ tests, per-fix-review verdict);
-    // this commit widens ONLY this one predicate, mirroring the SortedSet
-    // membership already in Calls.cpp:2238, Calls2.cpp:6231, Exprs.cpp:4364, and
-    // Setup.cpp:15101 / 16034 / 23682. The class-element case is preserved
-    // unchanged: SortedSet's `where T: IComparable<T>` constraint excludes
-    // class elements (#2773), so every reachable SortedSet hits
-    // `genericBackingType` non-null and enters bz_lazy_from_set.
+    // layered on, #1426). Without SortedSet in this predicate, a
+    // `sortedSet.ToArray()` — or `new LinkedList<T>(sortedSet)`
+    // (Exprs2.cpp:3965) — fell through to `bz_lazy_from_array` over a
+    // `bz_dict_t*`: a silent misread where `bz_array_t`/`bz_dict_t`
+    // struct-prefix coincidence aliased the count slot but `bz_array_ptr_at`
+    // read `bz_entry_t` header bytes as element slots. Narrow residue of the
+    // broader Set-family thesis (the prior registry move regressed 30+ tests,
+    // per-fix-review verdict); that fix widened ONLY this one predicate,
+    // mirroring the SortedSet membership already in Calls.cpp:2238,
+    // Calls2.cpp:6231, Exprs.cpp:4364, and Setup.cpp:15101 / 16034 / 23682.
     elemRef = (recvTy && !recvTy->genericArgs.empty()) ? recvTy->genericArgs[0]
                                                        : nullptr;
     if (recvTy && recvTy->astNode && recvTy->astNode->name &&
         !recvTy->astNode->name->parts.empty() &&
         (recvTy->headName() == "Set" ||
          recvTy->headName() == "OwningSet" ||
-         // stdlib §4.18 (#1426): SortedSet shares the bz_dict_t* rep of
-         // Set/OwningSet (sorting is a presentation layer over the hash table,
-         // #1426); bz_lazy_from_set walks it the same way.
          recvTy->headName() == "SortedSet")) {
         uint64_t ksz = 0;
         if (genericBackingType(recvTy, 0, /*isSet=*/true, &ksz)) {
+            // fix #3711 (stdlib §4.18 / §5, v0.286): a SortedSet<T> receiver
+            // must NOT take `bz_lazy_from_set`. That helper snapshots the
+            // element keys with `bz_dict_keys_gen` and enumerates them in the
+            // hash table's bucket order — correct for `Set`/`OwningSet`, whose
+            // §4.10 surface promises no order at all, but a direct violation of
+            // stdlib §4.18's "iterates its elements in ASCENDING order" for
+            // `SortedSet<T>`. #2726 admitted SortedSet to this arm to stop the
+            // bz_dict_t*-as-bz_array_t* misread and gave it the Set helper,
+            // which fixed the COUNT and the element bytes but left the ORDER
+            // wrong: measured on `new LinkedList<int>(s)` and
+            // `a.Concat(s).ToArray()` for a SortedSet inserted 30,10,20,40, the
+            // §5 path yielded 30,10,20,40 while `for var x in s` over the very
+            // same set yielded 10,20,30,40 — the two surfaces disagreeing, the
+            // exact property #2471 / #2472 established they must not.
+            //
+            // Feed the ONE existing sorted-snapshot authority instead
+            // (`sortedSetSnapshotToSortedArray`, the snapshot half of
+            // `wrapSortedSetAsIEnumerable` — the helper the §29.2 for-in and
+            // explicit-`GetEnumerator()` surfaces already use), and wrap its
+            // result with `bz_lazy_from_owned_array`. That wrap is the exact
+            // ownership shape the snapshot needs and the same one
+            // `bz_lazy_from_set` provided: the lazy owns the fresh array and
+            // frees it once at `bz_lazy_dispose` with a NULL element disposer,
+            // borrowing every element (a string slot holds the SortedSet's own
+            // +1, which the set releases at its own scope end). Only the
+            // element ORDER changes; `Set`/`OwningSet` keep `bz_lazy_from_set`
+            // verbatim, and the two guards admitting this arm are unchanged, so
+            // no receiver that reached one lowering now reaches a different one.
+            if (recvTy->headName() == "SortedSet") {
+                int64_t ssz = 0;
+                if (llvm::Value* sortedArr =
+                        sortedSetSnapshotToSortedArray(recv, recvTy, &ssz)) {
+                    auto* ownFn = declareC("bz_lazy_from_owned_array", ptrTy(),
+                                           {ptrTy(), i64()});
+                    return builder_.CreateCall(
+                        ownFn, {sortedArr, builder_.getInt64(ssz)},
+                        "lazy.sortedset");
+                }
+                // The snapshot helper only declines when the element type has
+                // no LLVM lowering — the same shape that would make every arm
+                // below malformed. Fall through to the Set helper rather than
+                // returning null: an unordered sequence is strictly better than
+                // the #2434 zero-value degrade, and this arm is not reachable
+                // for any element `genericBackingType` has just admitted.
+            }
             auto* setFn = declareC("bz_lazy_from_set", ptrTy(), {ptrTy(), i64()});
             return builder_.CreateCall(setFn,
                 {recv, builder_.getInt64((int64_t)ksz)}, "lazy.set");

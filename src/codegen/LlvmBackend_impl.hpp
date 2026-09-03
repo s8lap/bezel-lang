@@ -8877,6 +8877,21 @@ private:
     llvm::Value* wrapSortedSetAsIEnumerable(
         llvm::Value* set, const sema::TypeRef* iEnumTy);
 
+    // fix #3711 (stdlib §4.18 / §5, v0.286): the SNAPSHOT half of the wrap
+    // above — the ONE place that turns a `SortedSet<T>`'s bz_dict_t* into a
+    // fresh bz_array_t* of its elements in ASCENDING order. Both the §29.2
+    // for-in / explicit-GetEnumerator surface (via wrapSortedSetAsIEnumerable)
+    // and the §5 lazy-operator surface (lowerToLazyEnumerator's SortedSet arm,
+    // LlvmBackend_Calls3.cpp) read it, so the two paths cannot disagree about
+    // element order the way they did before #3711 (#2471 / #2472's "the two
+    // paths must not disagree" property). The array borrows its elements and
+    // has no owner on return: the caller must free it exactly once with a NULL
+    // element disposer. `outElemSize`, when non-null, receives the element
+    // stride the array was built with.
+    llvm::Value* sortedSetSnapshotToSortedArray(
+        llvm::Value* set, const sema::TypeRef* iEnumTy,
+        int64_t* outElemSize);
+
 
     // §29.2 (#552): wrap a user-class instance (implementing IEnumerable<T>)
     // in a type-specific vtable-backed enumerator compatible with the iterator
