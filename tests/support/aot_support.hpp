@@ -75,6 +75,36 @@
 // inspects a JitResult diagnostic's .location; the stderr blob keeps
 // .hasErrors() true and message.find(...) assertions matching).
 //
+// INFRASTRUCTURE FAILURES ARE LOUD, AND DISTINGUISHABLE (#3007). A workdir
+// create, a source write, a fork(), or an execv() that fails is NOT the
+// compiler's verdict on the program — the program never ran. Before #3007 each
+// of those returned `ran=false` + one Severity::Error carrying the message,
+// which is BYTE-FOR-BYTE the shape of a legitimate compile REJECT: the 272
+// `BEZEL_EXPECT_TRUE(<var>.diagnostics.hasErrors())` and 205
+// `BEZEL_EXPECT_FALSE(<var>.ran)` assertions in the 1,446 test files that reach
+// this harness (measured 2026-09-03; #3007's own 1,008 + 84 = 1,092 does NOT
+// reproduce — it counted across ALL of tests/, most of which belongs to the
+// in-process JIT/sema harnesses this path cannot reach) would all have gone
+// GREEN on a full disk, certifying rules that were never evaluated. (`hasErrors()` is the assertion across most
+// of tests/ownership/ — #2988 — so the harness was handing those tests nothing
+// stronger to assert on.) Latency was luck, not design: the issue was filed
+// while the harness workdir was on a 1.3 TiB spindle, and scripts/lane_setup.sh
+// has since symlinked scratchBase() onto /mnt/fast, which HAS hit ENOSPC.
+//
+// So every non-verdict failure now goes through aot_detail::noteInfraFailure():
+//   * it marks the CURRENT TEST FAILED (bezel::test::currentTestFailed()) —
+//     unconditionally, before the caller sees a result, so no assertion of any
+//     shape can read an infra failure as green;
+//   * it prints a `[ INFRA ]` marker naming the stage and the errno;
+//   * it counts into a process-wide tally printed at exit as
+//     `INFRA: N failure(s) ...` (the sibling of test_main.cpp's
+//     `NATIVE SANITIZER: N check(s) skipped`, #3626), which a later change can
+//     sum across shards in tests/run_parallel.sh; and
+//   * the returned JitResult carries the reason at Severity::NOTE, never Error,
+//     so `hasErrors()` stays FALSE and a legacy negative assertion FAILS rather
+//     than passing for the wrong reason.
+// The self-tests are tests/support/aot_infra_loud_3007_test.cpp.
+//
 // TWO SEMANTIC DIFFERENCES FROM runJit (documented, inherent — not bugs here):
 //   1. runJit returns the raw 32-bit int from main(); a process exit status is
 //      8-bit (WEXITSTATUS masks to 0..255). A test whose Main returns a value
@@ -111,6 +141,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include "test_harness.hpp"              // currentTestFailed() — the #3007 trip
 #include "support/codegen_support.hpp"   // JitResult + codegen::CodegenOptions
 #include "support/force_sanitize.hpp"    // the ONE BEZEL_AOT_FORCE_SANITIZE parse
 #include "support/scratch_dir.hpp"      // cacheDir/scratchBase/keepArtifacts/reapAgeSec
@@ -242,14 +273,48 @@ inline int reapWithDeadline(pid_t pid, int timeoutSec, bool& timedOut) {
 // qr1 M4: stdin is redirected to /dev/null so a program that reads Console input
 // gets immediate EOF instead of blocking to the deadline (or draining the test
 // runner's own stdin).
+//
+// fix #3007: `execErrno` (optional, defaulted so the three external call sites
+// are untouched) reports an execv() FAILURE distinguishably. Before this, a
+// failed exec left the child at `_Exit(127)`, which the caller read as
+// `ran=true, exitCode=127` — indistinguishable from a Bezel program whose Main
+// legitimately returns 127, and therefore a silent wrong answer rather than the
+// infrastructure failure it is. The classic close-on-exec errno pipe settles it
+// with no guesswork: the write end has O_CLOEXEC, so a SUCCESSFUL exec closes
+// it and the parent reads EOF; a FAILED exec writes errno through it first.
+//
+// pipe2(O_CLOEXEC), NOT pipe() + fcntl(FD_CLOEXEC) (review nit N1). The two-call
+// form has a window between the pipe and the fcntl in which a CONCURRENT
+// fork+exec would inherit the write end WITHOUT the close-on-exec flag. That
+// inherited copy keeps the pipe's write side open after our own exec succeeds,
+// so the parent's read() below never sees EOF and BLOCKS FOREVER — a wedged
+// shard, the worst failure shape a test harness can have, and one that would
+// look like a compiler hang. The harness is single-threaded today so the window
+// is unreachable, but the atomic form costs nothing and removes the reasoning
+// step entirely.
 inline int spawnCaptured(const std::vector<std::string>& argv,
                          const std::string& outPath, const std::string& errPath,
                          int timeoutSec, bool& timedOut,
                          const std::vector<std::pair<std::string, std::string>>&
-                             extraEnv = {}) {
+                             extraEnv = {},
+                         int* execErrno = nullptr) {
     timedOut = false;
+    if (execErrno) *execErrno = 0;
+    // Close-on-exec errno pipe (#3007), created ATOMICALLY (nit N1 — see the
+    // function comment for the shard-hang the two-call form could produce).
+    // Best-effort: if pipe2() fails we lose the discrimination, never the run.
+    int execPipe[2] = {-1, -1};
+    if (::pipe2(execPipe, O_CLOEXEC) != 0) execPipe[0] = execPipe[1] = -1;
     pid_t pid = ::fork();
-    if (pid < 0) return -1;
+    if (pid < 0) {
+        // Preserve the fork() errno across the pipe cleanup: the caller reads
+        // errno to build the `[ INFRA ]` reason (#3007), and close() would
+        // otherwise be free to clobber it.
+        const int forkErrno = errno;
+        if (execPipe[0] >= 0) { ::close(execPipe[0]); ::close(execPipe[1]); }
+        errno = forkErrno;
+        return -1;
+    }
     if (pid == 0) {
         // ---- CHILD ----
         for (const auto& kv : extraEnv)
@@ -279,25 +344,64 @@ inline int spawnCaptured(const std::vector<std::string>& argv,
         cargv.reserve(argv.size() + 1);
         for (const auto& a : argv) cargv.push_back(const_cast<char*>(a.c_str()));
         cargv.push_back(nullptr);
+        if (execPipe[0] >= 0) ::close(execPipe[0]);   // child holds only the write end
         ::execv(cargv[0], cargv.data());
+        // exec failed — report errno through the CLOEXEC pipe (#3007) so the
+        // parent can tell this apart from a program that returned 127 itself.
+        const int e = errno;
+        if (execPipe[1] >= 0) {
+            ssize_t ignored = ::write(execPipe[1], &e, sizeof(e));
+            (void)ignored;
+        }
         ::_Exit(127);  // exec failed
     }
     // ---- PARENT ----
-    return reapWithDeadline(pid, timeoutSec, timedOut);
+    if (execPipe[1] >= 0) ::close(execPipe[1]);   // parent holds only the read end
+    int status = reapWithDeadline(pid, timeoutSec, timedOut);
+    if (execPipe[0] >= 0) {
+        // The child has been reaped, so the pipe is already at EOF (exec
+        // succeeded) or holds exactly one int (exec failed): a single read
+        // cannot block.
+        int e = 0;
+        const ssize_t n = ::read(execPipe[0], &e, sizeof(e));
+        ::close(execPipe[0]);
+        if (n == static_cast<ssize_t>(sizeof(e)) && execErrno) *execErrno = e;
+    }
+    return status;
 }
 
 
 // A per-call working directory under scratchBase(). Empty string on failure.
-inline std::string makeWorkDir() {
+//
+// fix #3007: on failure, `why` (when non-null) receives the CAUSE — the errno
+// from mkdtemp plus any create_directories error. The empty return alone told
+// the caller nothing, so the diagnostic it built named only the directory and
+// read exactly like a compiler reject; "No space left on device" is what makes
+// the `[ INFRA ]` marker actionable instead of merely loud.
+inline std::string makeWorkDir(std::string* why) {
+    if (why) why->clear();
     std::error_code ec;
     fs::create_directories(scratchBase(), ec);
     reapStaleWorkDirs();  // qr1 N1: sweep prior-run leaks once per process.
     std::string tmpl = scratchBase() + "/aotXXXXXX";
     std::vector<char> tbuf(tmpl.begin(), tmpl.end());
     tbuf.push_back('\0');
+    errno = 0;
     const char* dirp = ::mkdtemp(tbuf.data());
-    return dirp ? std::string(dirp) : std::string{};
+    if (dirp) return std::string(dirp);
+    if (why) {
+        const int e = errno;
+        *why = "could not create a work dir under " + scratchBase() +
+               " (mkdtemp: errno=" + std::to_string(e) + ": " +
+               std::strerror(e) + ")";
+        if (ec) *why += " [create_directories: " + ec.message() + "]";
+    }
+    return {};
 }
+
+// Signature-preserving overload — the three existing aot_detail::makeWorkDir()
+// call sites (tests/support/aot_cache_key_test.cpp) are untouched.
+inline std::string makeWorkDir() { return makeWorkDir(nullptr); }
 
 // RAII cleanup of a work dir (kept when BEZEL_AOT_KEEP is set, for debugging).
 struct WorkDir {
@@ -365,6 +469,161 @@ inline void emitSanitizerReportToStderr(std::string_view report) {
         "===== [aot-asan #1822] end sanitizer report =====\n",
         static_cast<int>(std::min(report.size(), cap)), report.data());
     std::fflush(stderr);
+}
+
+
+// ── INFRASTRUCTURE-FAILURE CHANNEL (fix #3007) ─────────────────────────────
+//
+// THE DEFECT. A workdir create, a source write, a fork(), an exec(), or a
+// driver that reports success and produces no executable is not a verdict on
+// the program under test — the program NEVER RAN. Every one of those used to
+// come back as `ran=false` plus one `Severity::Error` carrying the message,
+// which is exactly the shape of a legitimate compile REJECT. The two negative
+// assertions this tree is built on —
+//     BEZEL_EXPECT_TRUE(<var>.diagnostics.hasErrors());   (272 sites)
+//     BEZEL_EXPECT_FALSE(<var>.ran);                      (205 sites)
+// — are both SATISFIED by that shape, so on a full disk ~477 assertions go
+// green while certifying nothing. (Counts measured 2026-09-03 over the 1,446
+// test files that call a runAot* helper — the only ones this harness reaches.
+// #3007 states 1,008 + 84 = 1,092; that figure does not reproduce and appears
+// to have counted all 3,015 hasErrors() assertions in tests/, including the
+// in-process JIT/sema harnesses. The defect is unchanged in kind, only in size.) `hasErrors()` cannot distinguish "the rule
+// under test rejected this" from "anything at all went wrong" (#2988), and the
+// harness was giving those tests nothing stronger to assert on.
+//
+// WHY A HARNESS-LEVEL TRIP AND NOT A `JitResult::infraFailure` FIELD. A field
+// is only ever ADVISORY: it makes the failure observable to a call site that
+// remembers to look, which is ~477 edits away and re-creates the very
+// opt-in-per-site shape that produced the bug (see #3633 — the ~122 per-file
+// `runUnderAsan` helpers whose `-1` each caller had to interpret, and did not).
+// Marking the CURRENT TEST FAILED inside the harness is unconditional: it needs
+// no cooperation from any assertion, so the fix holds for every one of those
+// sites the day it lands, and for every site written afterwards. The two are not
+// alternatives on a soundness axis — once the harness fails the test, a field
+// adds nothing a test could act on — so the field is deliberately NOT added
+// (it would also have to live in tests/support/codegen_support.hpp, shared with
+// the JIT path, for no gain). The result is still made HONEST: `ran=false`,
+// `exitCode=-1`, and the reason recorded at Severity::NOTE, never Error, so
+// `hasErrors()` is FALSE and a legacy negative assertion FAILS loudly instead of
+// passing for the wrong reason. That is belt (harness trip) and braces (the
+// assertion itself can no longer be satisfied).
+//
+// WHY NOT std::abort(). The harness runs each test as a plain call from
+// test_main.cpp's loop, with no try/catch and no per-test process — so an abort
+// or a throw takes the WHOLE SHARD, converting one infra failure into the loss
+// of every other test in it. Under a genuine ENOSPC that is every shard, which
+// destroys precisely the information the fix exists to produce: WHICH tests were
+// affected, and how many. A per-test FAIL plus a process-wide tally keeps the
+// suite's own accounting intact.
+
+// Process-wide count of infrastructure failures. Leaked on purpose: the atexit
+// hook below reads it at teardown, after ordinary function-local statics would
+// already have been destroyed (same discipline as forkFailureCount()).
+inline std::atomic<std::uint64_t>& infraFailureCount() {
+    static std::atomic<std::uint64_t>* c = new std::atomic<std::uint64_t>(0);
+    return *c;
+}
+
+// Scoped interception, FOR THE HARNESS'S OWN SELF-TESTS ONLY. While one of
+// these is alive, noteInfraFailure() records into it and does NOT fail the
+// current test; the destructor removes this scope's contribution from the
+// process tally, so a synthetic probe cannot poison the `INFRA:` line the run
+// reports (the #3626 self-test has to restore its counter by hand — this makes
+// the restore structural). Never use it to silence a real infra failure.
+//
+// ⚠ THIS IS A PROCESS-GLOBAL BYPASS OF THE #3007 TRIP, and the only one that
+// exists (review nit N4). The pointer is a plain global, so an InfraExpectation
+// that OUTLIVES its test body — parked in a `static`, a namespace-scope object,
+// or leaked with `new` — silently disarms the trip for every remaining test in
+// the shard, restoring exactly the false green this whole change removes, with
+// no marker anywhere. The ONLY sanctioned use is a stack-scoped local inside
+// tests/support/aot_infra_loud_3007_test.cpp. Two properties keep that honest
+// and both are load-bearing: it is non-copyable, and its destructor restores
+// the PREVIOUS pointer rather than clearing to null, so nesting cannot strand
+// a stale one. A cheap belt for the future is asserting
+// `currentInfraExpectation() == nullptr` after each test body in
+// tests/test_main.cpp — not done here because this lane does not own that file.
+struct InfraExpectation;
+inline InfraExpectation*& currentInfraExpectation() {
+    static InfraExpectation* p = nullptr;
+    return p;
+}
+
+// One-line summary printed at process exit, unconditionally once the AOT
+// harness has been used at all — so `INFRA: 0 failure(s)` is a POSITIVE
+// confirmation the channel was live this process, not merely the absence of a
+// signal (#3626's lesson, applied to its sibling channel). Format, stable and
+// greppable, on stdout (shard logs capture stdout and stderr into one file):
+//
+//     INFRA: <N> failure(s) (test-harness infrastructure: work dir / source
+//     write / fork / exec — see tests/support/aot_support.hpp)
+//
+// A later change can sum it across shards in tests/run_parallel.sh exactly as
+// it sums `native_sanitizer_unavailable_skips` today — grep -ho 'INFRA: [0-9]*'
+// over shard.*.log — and fail the sharded run on a nonzero total. That wiring
+// is deliberately NOT done here: this lane makes the harness honest, and the
+// gate floor is a separate, gate-owned change.
+inline void ensureInfraTallyAtExit() {
+    static const bool once = [] {
+        std::atexit([] {
+            std::fprintf(stdout,
+                "INFRA: %llu failure(s) (test-harness infrastructure: work dir /"
+                " source write / fork / exec — see tests/support/aot_support.hpp)\n",
+                static_cast<unsigned long long>(
+                    infraFailureCount().load(std::memory_order_relaxed)));
+            std::fflush(stdout);
+        });
+        return true;
+    }();
+    (void)once;
+}
+
+// Record ONE infrastructure failure: count it, print the `[ INFRA ]` marker,
+// and FAIL THE CURRENT TEST. `where` names the harness entry point, `reason`
+// the stage and the errno.
+inline void noteInfraFailure(const char* where, const std::string& reason);
+
+struct InfraExpectation {
+    InfraExpectation() : prev_(currentInfraExpectation()) {
+        currentInfraExpectation() = this;
+    }
+    ~InfraExpectation() {
+        currentInfraExpectation() = prev_;
+        // Undo this scope's contribution to the process tally: a deliberate
+        // probe is not a real outage, and the `INFRA:` line must stay true.
+        if (count)
+            infraFailureCount().fetch_sub(count, std::memory_order_relaxed);
+    }
+    InfraExpectation(const InfraExpectation&) = delete;
+    InfraExpectation& operator=(const InfraExpectation&) = delete;
+
+    std::uint64_t count = 0;
+    std::string lastReason;
+    std::string lastWhere;
+
+private:
+    InfraExpectation* prev_;
+};
+
+inline void noteInfraFailure(const char* where, const std::string& reason) {
+    ensureInfraTallyAtExit();
+    infraFailureCount().fetch_add(1, std::memory_order_relaxed);
+    if (InfraExpectation* e = currentInfraExpectation()) {
+        ++e->count;
+        e->lastWhere = where ? where : "";
+        e->lastReason = reason;
+        return;   // self-test interception: observed, NOT a test failure
+    }
+    // Inline with the test's own output (BEZEL_EXPECT_* writes to std::cout),
+    // so the marker lands next to the `[ FAIL ]` line in the shard log.
+    std::cout << "    [ INFRA ] " << (where ? where : "runAot") << ": "
+              << reason << "\n"
+              << "    [ INFRA ] the harness could not RUN this program: an "
+                 "INFRASTRUCTURE failure (disk / fork / exec), NOT a compiler "
+                 "rejection. The test is FAILED so no negative assertion can "
+                 "read it as green (#3007).\n";
+    std::cout.flush();
+    ::bezel::test::currentTestFailed() = true;
 }
 
 // ---- forked in-process compile -------------------------------------------
@@ -2088,11 +2347,46 @@ inline CompileStatus cachedCompile(std::string_view source,
 }
 
 // Write `source` to `srcPath`. Returns false on write failure (disk full etc.).
-inline bool writeSource(const std::string& srcPath, std::string_view source) {
+// fix #3007: `why` (optional) receives the errno so the `[ INFRA ]` marker can
+// say "No space left on device" rather than only naming the path.
+inline bool writeSource(const std::string& srcPath, std::string_view source,
+                        std::string* why) {
+    if (why) why->clear();
+    errno = 0;
     std::ofstream os(srcPath, std::ios::binary);
     os.write(source.data(), static_cast<std::streamsize>(source.size()));
     os.flush();
-    return static_cast<bool>(os);  // qr1 N4: report a failed write as infra
+    if (os) return true;   // qr1 N4: report a failed write as infra
+    if (why) {
+        const int e = errno;
+        *why = "failed to write the program source to " + srcPath +
+               (e ? std::string(" (errno=") + std::to_string(e) + ": " +
+                        std::strerror(e) + ")"
+                  : std::string(" (stream failed; errno not set)"));
+    }
+    return false;
+}
+
+// Signature-preserving overload (no external call sites today; kept so the
+// two-argument spelling in any in-flight branch still compiles).
+inline bool writeSource(const std::string& srcPath, std::string_view source) {
+    return writeSource(srcPath, source, nullptr);
+}
+
+// Stamp an infrastructure failure onto a result AND fail the current test
+// (#3007). The result is left maximally honest: it did not run, its exit code
+// is the did-not-run sentinel, and the reason is recorded at Severity::NOTE —
+// never Error — so `r.diagnostics.hasErrors()` stays FALSE and a legacy
+// `BEZEL_EXPECT_TRUE(hasErrors())` cannot be satisfied by it.
+inline JitResult& markInfra(JitResult& r, const char* where,
+                            const std::string& reason) {
+    noteInfraFailure(where, reason);
+    r.ran = false;
+    r.exitCode = -1;
+    r.diagnostics.report(Severity::Note, SourceLocation{},
+                         std::string("[INFRA] ") + (where ? where : "runAot") +
+                             ": " + reason);
+    return r;
 }
 
 }  // namespace aot_detail
@@ -2114,6 +2408,9 @@ inline bool writeSource(const std::string& srcPath, std::string_view source) {
 inline JitResult runAot(std::string_view source,
                         const codegen::CodegenOptions& optsIn) {
     JitResult r;
+    // Arm the exit tally the moment the AOT harness is used at all, so
+    // `INFRA: 0 failure(s)` is a positive confirmation rather than silence.
+    aot_detail::ensureInfraTallyAtExit();
 
     // #1822: in the whole-suite ASan sweep, force generated-code ASan on every
     // program (the runAotChecked recipe, suite-wide). A local copy keeps the
@@ -2121,13 +2418,10 @@ inline JitResult runAot(std::string_view source,
     codegen::CodegenOptions opts = optsIn;
     if (aot_detail::forceSanitizeAddress()) opts.sanitizeAddress = true;
 
-    aot_detail::WorkDir wd{aot_detail::makeWorkDir()};
-    if (wd.path.empty()) {
-        r.diagnostics.report(Severity::Error, SourceLocation{},
-                             "runAot: could not create work dir under " +
-                                 aot_detail::scratchBase());
-        return r;
-    }
+    std::string infraWhy;
+    aot_detail::WorkDir wd{aot_detail::makeWorkDir(&infraWhy)};
+    if (wd.path.empty())
+        return aot_detail::markInfra(r, "runAot", infraWhy);
     namespace fs = aot_detail::fs;
     const std::string srcPath = (fs::path(wd.path) / "prog.bzl").string();
     const std::string exePath = (fs::path(wd.path) / "prog").string();
@@ -2135,17 +2429,20 @@ inline JitResult runAot(std::string_view source,
     const std::string outPath = (fs::path(wd.path) / "out.txt").string();
     const std::string errPath = (fs::path(wd.path) / "run.err").string();
 
-    if (!aot_detail::writeSource(srcPath, source)) {
-        r.diagnostics.report(Severity::Error, SourceLocation{},
-                             "runAot: failed to write source to " + srcPath);
-        return r;
-    }
+    if (!aot_detail::writeSource(srcPath, source, &infraWhy))
+        return aot_detail::markInfra(r, "runAot", infraWhy);
 
     // --- Compile + link via the real driver, forked (crash/hang isolated),
     //     served from the content-addressed link-cache on an unchanged input. --
     aot_detail::CompileStatus cc =
         aot_detail::cachedCompile(source, srcPath, exePath, opts, ccErr);
     if (cc.outcome != aot_detail::CompileOutcome::Ok) {
+        // fix #3007: CompileOutcome::Infra is NOT a verdict on the program —
+        // it is a refused fork (isolation could not be guaranteed) or a driver
+        // that claimed success and produced no executable. Reporting it as an
+        // Error made it read as a compile reject; route it to the infra channel.
+        if (cc.outcome == aot_detail::CompileOutcome::Infra)
+            return aot_detail::markInfra(r, "runAot", cc.diag);
         r.diagnostics.report(Severity::Error, SourceLocation{},
                              std::move(cc.diag));
         return r;  // ran stays false — AOT is the stricter oracle (see header)
@@ -2163,9 +2460,31 @@ inline JitResult runAot(std::string_view source,
     std::vector<std::pair<std::string, std::string>> runEnv;
     if (opts.sanitizeAddress)
         runEnv.push_back({"ASAN_OPTIONS", "detect_leaks=0:abort_on_error=0"});
+    int execErrno = 0;
     int status = aot_detail::spawnCaptured({exePath}, outPath, errPath,
                                            aot_detail::aotTimeoutSec(), timedOut,
-                                           runEnv);
+                                           runEnv, &execErrno);
+    const int spawnErrno = errno;   // only meaningful when status < 0
+    // fix #3007: fork() for the program run failed. spawnCaptured's -1 is not a
+    // wait status; read as one it makes WIFSIGNALED true and reported "program
+    // terminated by signal 127" — a fabricated crash of a program that never
+    // started.
+    if (status < 0)
+        return aot_detail::markInfra(
+            r, "runAot",
+            "fork() failed launching the compiled program (errno=" +
+                std::to_string(spawnErrno) + ": " +
+                std::strerror(spawnErrno) + ")");
+    // fix #3007: execv() failed — the executable the link produced could not be
+    // started (ENOEXEC / ENOMEM / EACCES / it vanished). The child exits 127,
+    // which is a value a Bezel Main may legitimately return, so the CLOEXEC
+    // errno pipe, not the exit code, is what makes this distinguishable.
+    if (execErrno != 0)
+        return aot_detail::markInfra(
+            r, "runAot",
+            "could not exec the linked program " + exePath + " (errno=" +
+                std::to_string(execErrno) + ": " + std::strerror(execErrno) +
+                ")");
     r.stdoutText = aot_detail::slurp(outPath);
 
     if (timedOut) {
@@ -2305,10 +2624,24 @@ inline JitResult runAotCheckedImpl(std::string_view source,
                                     bool detectLeaks,
                                     codegen::CodegenOptions opts = {}) {
     JitResult r;
+    aot_detail::ensureInfraTallyAtExit();
 
     // SKIP if the C toolchain (which the driver shells out to for the ASan link)
     // is absent — preserves the pre-existing "environment can't run this"
     // contract. Memoized: probed once per process.
+    //
+    // #3007 scope note: this SKIP is itself a member of the #3633 silent-skip
+    // class — a box without clang runs the whole ASan tier vacuously — but it
+    // is DELIBERATELY left as-is here. It is already textually distinguishable
+    // ("<name>: SKIP — C toolchain ..."), 224 call sites in 224 files read that
+    // literal out of the message (`message.find("SKIP")`) and return without
+    // asserting — measured 2026-09-03; do NOT confuse this set with the ~122
+    // per-file native `runUnderAsan` helpers of #3626/#3633, which are a
+    // different family, nor with the 1,551 `runAotChecked(` call sites that are
+    // the total surface the SKIP disarms (issue 3733). Turning it loud is a
+    // policy change about which environments may run the suite, not a
+    // harness-honesty fix. Filed separately; this lane changes only the paths
+    // that were INdistinguishable.
     static const bool toolchainOk = [] {
         return std::system("clang --version > /dev/null 2>&1") == 0;
     }();
@@ -2319,12 +2652,10 @@ inline JitResult runAotCheckedImpl(std::string_view source,
         return r;
     }
 
-    aot_detail::WorkDir wd{aot_detail::makeWorkDir()};
-    if (wd.path.empty()) {
-        r.diagnostics.report(Severity::Error, SourceLocation{},
-                             std::string(name) + ": could not create work dir");
-        return r;
-    }
+    std::string infraWhy;
+    aot_detail::WorkDir wd{aot_detail::makeWorkDir(&infraWhy)};
+    if (wd.path.empty())
+        return aot_detail::markInfra(r, name, infraWhy);
     namespace fs = aot_detail::fs;
     const std::string srcPath = (fs::path(wd.path) / "prog.bzl").string();
     const std::string exePath = (fs::path(wd.path) / "prog").string();
@@ -2332,11 +2663,8 @@ inline JitResult runAotCheckedImpl(std::string_view source,
     const std::string outPath = (fs::path(wd.path) / "out.txt").string();
     const std::string sanPath = (fs::path(wd.path) / "san.txt").string();
 
-    if (!aot_detail::writeSource(srcPath, source)) {
-        r.diagnostics.report(Severity::Error, SourceLocation{},
-                             std::string(name) + ": failed to write source");
-        return r;
-    }
+    if (!aot_detail::writeSource(srcPath, source, &infraWhy))
+        return aot_detail::markInfra(r, name, infraWhy);
 
     // --- Compile + link with generated-code ASan, forked (S3), served from the
     //     link-cache (keyed sanitizeAddress=1, so it never collides with a plain
@@ -2347,17 +2675,18 @@ inline JitResult runAotCheckedImpl(std::string_view source,
     aot_detail::CompileStatus cc =
         aot_detail::cachedCompile(source, srcPath, exePath, opts, ccErr);
     if (cc.outcome != aot_detail::CompileOutcome::Ok) {
-        // #2214: prefix every non-OK compile outcome with the harness name so
-        // the diagnostic tells the reader which harness produced the reject.
-        // A Rejected / Crashed / TimedOut outcome gets the bare harness-name
-        // prefix ("<name>: ..."); an Infra outcome also gets the SKIP marker
-        // so a toolchain-absent env still surfaces a distinguishable diagnostic.
-        const std::string prefix =
-            cc.outcome == aot_detail::CompileOutcome::Infra
-                ? (std::string(name) + ": SKIP — ")
-                : (std::string(name) + ": ");
+        // fix #3007: an Infra outcome (refused fork, or a driver that reported
+        // success and produced no executable) used to be dressed as
+        // "<name>: SKIP — ..." at Severity::Error. That is the #3633 shape
+        // twice over: an Error a negative assertion reads as a rejection, AND a
+        // SKIP marker that 224 call sites read as "return without asserting".
+        // It is infrastructure, so it goes to the infra channel and fails loudly.
+        if (cc.outcome == aot_detail::CompileOutcome::Infra)
+            return aot_detail::markInfra(r, name, cc.diag);
+        // #2214: prefix a genuine verdict (Rejected / Crashed / TimedOut) with
+        // the harness name so the diagnostic says which harness produced it.
         r.diagnostics.report(Severity::Error, SourceLocation{},
-                             prefix + std::move(cc.diag));
+                             std::string(name) + ": " + std::move(cc.diag));
         return r;  // reject / compiler crash / compile timeout — ran=false
     }
 
@@ -2371,9 +2700,26 @@ inline JitResult runAotCheckedImpl(std::string_view source,
                                  (detectLeaks ? "1" : "0") +
                                  ":exitcode=99:abort_on_error=0";
     bool timedOut = false;
+    int execErrno = 0;
     int status = aot_detail::spawnCaptured(
         {exePath}, outPath, sanPath, aot_detail::aotTimeoutSec(), timedOut,
-        {{"ASAN_OPTIONS", asanOpts}});
+        {{"ASAN_OPTIONS", asanOpts}}, &execErrno);
+    const int spawnErrno = errno;   // only meaningful when status < 0
+    // fix #3007: neither a failed fork() nor a failed execv() is a sanitizer
+    // finding. Read as a wait status, spawnCaptured's -1 makes WIFSIGNALED true
+    // and `crashed` true, which this helper reports as "sanitizer fired
+    // (crash/abort)" — a fabricated memory-safety failure on a program that
+    // never started.
+    if (status < 0)
+        return aot_detail::markInfra(
+            r, name, "fork() failed launching the compiled program (errno=" +
+                         std::to_string(spawnErrno) + ": " +
+                         std::strerror(spawnErrno) + ")");
+    if (execErrno != 0)
+        return aot_detail::markInfra(
+            r, name, "could not exec the linked program " + exePath +
+                         " (errno=" + std::to_string(execErrno) + ": " +
+                         std::strerror(execErrno) + ")");
     r.stdoutText = aot_detail::slurp(outPath);
     std::string sanText = aot_detail::slurp(sanPath);
 
