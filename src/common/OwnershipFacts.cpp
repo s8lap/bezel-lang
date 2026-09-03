@@ -1750,6 +1750,30 @@ std::optional<ChoiceClassification> classifyChoiceType(
     return classifyChoiceCore(rt, ctx, env, choiceSeen);
 }
 
+// per §15.3 (#3775): see the header comment for the contract. Promoted
+// verbatim from the previously TU-local `static bool isMoveOnlyValueType`
+// in sema/ExprTypecheck.cpp (#2912) — same two structural facts, same
+// `kindOut` spellings — so the §8.6 boxing check and the new §28.11
+// collection-element check share one decision instead of two drifting
+// copies (CLAUDE.md §6 / LANE_RULES §6).
+bool isMoveOnlyValueType(const sema::TypeRef* t, const sema::SemaContext& ctx,
+                         const char*& kindOut) {
+    if (!t) return false;
+    if (t->kind == sema::TypeRef::Kind::InlineArray && t->arrayOwned) {
+        kindOut = "an owning inline array";
+        return true;
+    }
+    if (t->kind == sema::TypeRef::Kind::Named && t->declaration &&
+        t->declaration->kind == ast::TypeDeclKind::Choice) {
+        auto verdict = classifyChoiceType(t, ctx);
+        if (verdict && *verdict == ChoiceClassification::Owning) {
+            kindOut = "an owning-classified choice";
+            return true;
+        }
+    }
+    return false;
+}
+
 bool declaredReturnIsBareTypeParam(const ast::MethodDecl& md,
                                    const sema::SemaContext& ctx) {
     // `owned T` is the ordinary ownership-transferring return (§28.8), not a

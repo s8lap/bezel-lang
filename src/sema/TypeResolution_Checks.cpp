@@ -2596,6 +2596,107 @@ void Resolver::checkHashContainerKeys() {
     }
 }
 
+// §28.11 / §15.3 (#3775): the element-slot-policy table's move-only row is
+// "rejected at instantiation" for BOTH collection families — an owning
+// inline array or an owning-classified choice (§15.3, common::
+// isMoveOnlyValueType, shared with the §8.6 boxing rejection so the two
+// checks cannot disagree) cannot be copied (the borrowing family's element
+// operation for an ordinary, non-move-only value type) and has no disposal
+// cascade wired through any of these collection kinds' codegen (issue
+// #3775: an owning-classified `choice` `Dictionary<K,V>` value compiled,
+// ran, and leaked the case's owned payload — nothing rejected it).
+//
+// Two-pass shape modelled on checkHashContainerKeys immediately above
+// (concrete slots vs. a bare generic parameter of the enclosing type,
+// re-checked per instantiation — #1338/#1384) rather than on
+// checkOwningElementInstantiations's single predicate, because that
+// predicate treats every value type (choice included, #2744) alike and
+// needs no classification; ours must additionally ask WHICH choices are
+// move-only, a question §15.3 says is not decidable until the choice's own
+// case payloads are resolved, so it cannot run inline at
+// moveOnlyElementSites_'s recording site.
+void Resolver::checkElementCategoryInstantiations() {
+    std::unordered_set<const ast::Type*> reported;
+
+    // Pass 1: every site, direct (non-generic-param) AND bare-param alike —
+    // modelled on checkHashContainerKeys' Pass 1 immediately above, which
+    // calls its shared predicate (isEqualityBearing) unconditionally rather
+    // than gating on `declaration == nullptr` first. That gate would be
+    // WRONG here: an inline-array TypeRef (Kind::InlineArray) also carries a
+    // null `declaration` — inline arrays have no TypeSymbol — so a
+    // `declaration == nullptr` early-exit would route a genuinely CONCRETE
+    // `[N owned]T`/`[N owned]T?` slot into Pass 2, whose bare-param walk
+    // immediately drops it (`kind != TypeRef::Kind::Named`), silently
+    // admitting the slot. common::isMoveOnlyValueType is itself null/kind-
+    // safe and answers false for a bare generic parameter (Kind::Named with
+    // no declaration, so its Choice arm never fires) with no gating needed,
+    // so Pass 1 can simply ask it of every recorded site.
+    for (const MoveOnlyElementSite& s : moveOnlyElementSites_) {
+        const char* moveOnlyKind = nullptr;
+        if (!common::isMoveOnlyValueType(s.elRef, ctx_, moveOnlyKind)) continue;
+        if (s.site && !reported.insert(s.site).second) continue;  // dedup per site
+        ctx_.diagnostics().report(
+            Severity::Error, s.site ? s.site->span.begin : SourceLocation{},
+            std::string("`") + std::string(s.container) + "` cannot use " +
+            std::string(moveOnlyKind) + " as its " + std::string(s.slotName) +
+            " type argument (\xC2\xA7""28.11 / \xC2\xA7""15.3) \xE2\x80\x94 "
+            "the element-category table's move-only row is rejected at "
+            "instantiation for both collection families: a move-only value "
+            "cannot be copied, and this collection kind has no disposal "
+            "cascade for it");
+    }
+
+    // Pass 2 (#3775, modelled on checkOwningElementInstantiations' #2713
+    // pass and checkHashContainerKeys' Pass 2 above): a slot whose bound is
+    // a bare generic parameter of the ENCLOSING type is re-checked against
+    // every concrete instantiation of that type, once every instantiation
+    // site has been recorded.
+    std::unordered_set<const ast::Type*> reported2;
+    for (const MoveOnlyElementSite& s : moveOnlyElementSites_) {
+        if (!s.elRef || s.elRef->declaration) continue;  // concrete: pass 1
+        if (!s.enclosingType) continue;
+        if (s.elRef->kind != TypeRef::Kind::Named) continue;
+        if (!s.elRef->astNode ||
+            s.elRef->astNode->kind != ast::TypeKind::Named ||
+            !s.elRef->astNode->name ||
+            s.elRef->astNode->name->parts.size() != 1)
+            continue;
+        std::string_view paramName = s.elRef->headName();
+        std::size_t paramIdx = s.enclosingType->genericParams.size();
+        for (std::size_t i = 0; i < s.enclosingType->genericParams.size(); ++i) {
+            if (s.enclosingType->genericParams[i] &&
+                s.enclosingType->genericParams[i]->name == paramName) {
+                paramIdx = i;
+                break;
+            }
+        }
+        if (paramIdx >= s.enclosingType->genericParams.size()) continue;
+        for (const GenericInstantiation& inst : instantiations_) {
+            if (inst.type != s.enclosingType) continue;
+            if (paramIdx >= inst.argRefs.size()) continue;
+            TypeRef* concrete = inst.argRefs[paramIdx];
+            if (!concrete || concrete->kind == TypeRef::Kind::Error) continue;
+            const char* moveOnlyKind = nullptr;
+            if (!common::isMoveOnlyValueType(concrete, ctx_, moveOnlyKind))
+                continue;
+            if (s.site && !reported2.insert(s.site).second) continue;
+            const TypeSymbol* rec = concrete->declaration;
+            std::string argName =
+                rec ? ("`" + std::string(rec->name) + "`") : std::string("it");
+            ctx_.diagnostics().report(
+                Severity::Error,
+                s.site ? s.site->span.begin : SourceLocation{},
+                std::string("`") + std::string(s.container) +
+                "` cannot use " + argName + " as its " +
+                std::string(s.slotName) +
+                " type argument (\xC2\xA7""28.11 / \xC2\xA7""15.3) \xE2\x80\x94 "
+                "it is " + std::string(moveOnlyKind) +
+                ", and the element-category table's move-only row is "
+                "rejected at instantiation for both collection families");
+        }
+    }
+}
+
 // stdlib §4.2 / spec §14.4 (#1327/#1463/#2713) — THE predicate deciding whether
 // a type may be an owning collection's owned element. Shared verbatim by the
 // declaration-site check in resolveType() (TypeResolution_Names.cpp) and by the

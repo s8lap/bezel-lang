@@ -762,6 +762,22 @@ std::optional<ChoiceClassification> classifyChoiceType(
     const sema::TypeRef* rt, const sema::SemaContext& ctx,
     const RecordSubstEnv* env = nullptr);
 
+// per §15.3 (#3775, promoted from a TU-local predicate in ExprTypecheck.cpp
+// that carried the same #2912 citation): is `t` a MOVE-ONLY value type? §15.3
+// names exactly two kinds — the owning inline array (`[N owned]T`/`[N owned]T?`,
+// §15.1.1) and the owning-classified choice (§35.4) — and "Move-only
+// membership follows from *structure*, never from a declaration form", so this
+// reads the same two structural facts `classifyChoiceType` and `arrayOwned`
+// already compute rather than re-deciding either. `kindOut`, if non-null,
+// receives the spec's own name for whichever kind matched ("an owning inline
+// array" / "an owning-classified choice"), for use in a diagnostic. THE single
+// authority for this decision: the §8.6 boxing rejection (ExprTypecheck.cpp)
+// and the §28.11 collection-element-category instantiation check
+// (TypeResolution_Names.cpp) both consult it, so they cannot give different
+// answers for the same type.
+bool isMoveOnlyValueType(const sema::TypeRef* t, const sema::SemaContext& ctx,
+                         const char*& kindOut);
+
 // §28.1 (v0.196) per-instantiation erasure of the `owned` payload marker, as
 // §35.4 requires for a choice's classification: given a payload field's type
 // resolved AT the choice's instantiation, is the `owned` marker MEANINGFUL —

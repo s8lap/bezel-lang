@@ -1841,6 +1841,38 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                     hashContainerSites_.push_back(
                         {first, hashRole, ref.genericArgs[0], &t,
                          currentOuterType_});  // §1384: for per-instantiation check
+                // §28.11 / §15.3 (#3775): record every element-category slot
+                // the move-only row covers so checkElementCategoryInstantiations
+                // can reject it — after all member types are resolved, exactly
+                // like the hashContainerSites_ site above — if the bound is an
+                // owning inline array or an owning-classified choice. See
+                // moveOnlyElementSites_'s comment for exactly which slots these
+                // are and why the owning family's already-checked owned slot
+                // (OwningArray/OwningLinkedList/OwningSet/OwningStack/
+                // OwningQueue's sole slot, OwningDictionary's VALUE slot) is
+                // excluded.
+                {
+                    // {generic-arg index, spelled slot name}
+                    std::vector<std::pair<std::size_t, std::string_view>>
+                        categorySlots;
+                    if (first == "Array" || first == "LinkedList" ||
+                        first == "Set" || first == "Stack" ||
+                        first == "Queue" || first == "SortedSet") {
+                        categorySlots.push_back({0, "T"});
+                    } else if (first == "Dictionary" ||
+                               first == "SortedDictionary") {
+                        categorySlots.push_back({0, "K"});
+                        categorySlots.push_back({1, "V"});
+                    } else if (first == "OwningDictionary") {
+                        categorySlots.push_back({0, "K"});
+                    }
+                    for (const auto& slot : categorySlots) {
+                        if (slot.first >= ref.genericArgs.size()) continue;
+                        moveOnlyElementSites_.push_back(
+                            {first, slot.second, ref.genericArgs[slot.first],
+                             &t, currentOuterType_});
+                    }
+                }
                 // §16.5 / issue #922: Range<T> is a compiler-intrinsic record.
                 // An explicit annotation `Range<int>` must resolve to the SAME
                 // TypeRef shape as the inferred form `var r := 1..5` — both

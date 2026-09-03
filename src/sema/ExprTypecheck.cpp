@@ -3472,35 +3472,16 @@ static bool isBoxingTargetType(const TypeRef* to) {
            to->declaration->kind == ast::TypeDeclKind::Interface;
 }
 
-// per §15.3 (#2912): is `t` a MOVE-ONLY value type? §15.3, *Move-only value
-// types*: "The move-only value type kinds in this specification are two: the
-// owning inline array (`[N owned]T` or `[N owned]T?`, see [§15.1.1]) and the
-// owning-classified choice ([§35.4])." — and, immediately after, "Move-only
-// membership follows from *structure*, never from a declaration form".
-//
-// That two-kind population is EXACTLY the one §8.6 excludes from boxing, so
-// this is written against the property (move-only) rather than against the one
-// spelling the bug report used: an owning-classified choice reaching an
-// `Object` location was measured to be accepted with the same silent `false`
-// as the owning inline array, and a predicate that named only inline arrays
-// would have left half the rule unenforced. `kindOut` receives the spec's own
-// name for whichever kind matched, so the diagnostic can say which one it is.
+// per §15.3 (#2912, promoted to common::isMoveOnlyValueType by #3775 so the
+// §28.11 collection-element-category check can share it — see
+// common/OwnershipFacts.hpp for the full contract): is `t` a MOVE-ONLY value
+// type? §15.3 names exactly two kinds — the owning inline array and the
+// owning-classified choice — "Move-only membership follows from *structure*,
+// never from a declaration form". `kindOut` receives the spec's own name for
+// whichever kind matched, so the diagnostic can say which one it is.
 static bool isMoveOnlyValueType(const TypeRef* t, const SemaContext& ctx,
                                 const char*& kindOut) {
-    if (!t) return false;
-    if (t->kind == TypeRef::Kind::InlineArray && t->arrayOwned) {
-        kindOut = "an owning inline array";
-        return true;
-    }
-    if (t->kind == TypeRef::Kind::Named && t->declaration &&
-        t->declaration->kind == ast::TypeDeclKind::Choice) {
-        auto verdict = common::classifyChoiceType(t, ctx);
-        if (verdict && *verdict == common::ChoiceClassification::Owning) {
-            kindOut = "an owning-classified choice";
-            return true;
-        }
-    }
-    return false;
+    return common::isMoveOnlyValueType(t, ctx, kindOut);
 }
 
 // per §8.6 (#2912): a source spelling for the move-only rejection below.

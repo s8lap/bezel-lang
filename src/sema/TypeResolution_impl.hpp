@@ -457,6 +457,13 @@ private:
     // `OwningDictionary<K,V>` key (K) and `Set<T>` / `OwningSet<T>` element (T)
     // must be hashable (§3.6 rule 2, at the instantiation site).
     void checkHashContainerKeys();
+    // §28.11 / §15.3 (#3775): every recorded element-category slot (see
+    // moveOnlyElementSites_) must not be a move-only value type — the
+    // element-slot-policy table's move-only row is "rejected at
+    // instantiation" for both collection families (§3.6 rule 2, at the
+    // instantiation site). Modelled on checkHashContainerKeys's two-pass
+    // shape immediately above.
+    void checkElementCategoryInstantiations();
     // stdlib §4.2 / spec §14.4 (#1327/#1463/#2713): the single authoritative
     // predicate for "may this type be an owning collection's element?".  Returns
     // an empty string when `el` is admissible (a class or interface type, or an
@@ -1128,6 +1135,36 @@ private:
         TypeSymbol* enclosingType = nullptr;
     };
     std::vector<HashContainerSite> hashContainerSites_;
+
+    // §28.11 / §15.3 (#3775): one element-category-slot instantiation site
+    // whose bound must not be a move-only value type (an owning inline array
+    // or an owning-classified choice, §15.3). Recorded for every slot the
+    // element-slot-policy table's move-only row covers and that no other
+    // check already excludes: the sole slot of a borrowing collection
+    // (Array/LinkedList/Set/Stack/Queue/SortedSet), both slots of
+    // Dictionary<K,V>/SortedDictionary<K,V>, and OwningDictionary<K,V>'s KEY
+    // slot only — its VALUE slot is the owned slot owningElementBadDesc
+    // already rejects for every value type (move-only included), so
+    // recording it again here would just duplicate that diagnostic.
+    // Owning{Array,LinkedList,Set,Stack,Queue}'s sole slot is the owned slot
+    // for the same reason and is likewise not recorded.
+    //
+    // A choice's classification is not decidable until its case payloads are
+    // resolved (which may happen after this site is visited, exactly the
+    // #1338 hashContainerSites_ rationale above), so the decision is deferred
+    // to checkElementCategoryInstantiations() — modelled on
+    // hashContainerSites_ / checkHashContainerKeys (concrete slots) and
+    // owningElementSites_ / checkOwningElementInstantiations (the bare-
+    // generic-parameter Pass 2 re-check against each instantiation of the
+    // enclosing generic type).
+    struct MoveOnlyElementSite {
+        std::string_view container;   // "Dictionary" / "Array" / …
+        std::string_view slotName;    // "K" / "V" / "T" (for the diagnostic)
+        TypeRef* elRef = nullptr;     // the slot's type argument
+        const ast::Type* site = nullptr;  // the annotation node (span)
+        TypeSymbol* enclosingType = nullptr;  // for the bare-param Pass 2 recheck
+    };
+    std::vector<MoveOnlyElementSite> moveOnlyElementSites_;
 
     // stdlib §4.2 / spec §14.4 / §3.6 rule 2 (#2713): one owning-collection
     // instantiation whose owned element slot is a bare generic parameter of the

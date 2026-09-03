@@ -325,6 +325,12 @@ void Resolver::run(const ast::SourceFile& src) {
     // each instantiation of the enclosing generic binds (runs after all member
     // types are resolved, so every instantiation has been recorded).
     checkOwningElementInstantiations();
+    // §28.11 / §15.3 (#3775): every recorded element-category slot must not
+    // be a move-only value type (an owning inline array or an owning-
+    // classified choice) — runs after checkOwningElementInstantiations for
+    // the same reason: every instantiation site has been recorded by now,
+    // and a choice's classification needs every member type resolved.
+    checkElementCategoryInstantiations();
     // §17.4 / §3.6 rule 2 (#2911, #2962): `x as T` over a TYPE-level parameter
     // is re-checked against the type each instantiation of the enclosing
     // generic binds (runs here for the same reason: every instantiation site
