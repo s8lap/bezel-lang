@@ -51,23 +51,31 @@
 //     with §22.5 defaults admitted (`argsCanFill`, fix #3082), then the §22.10
 //     primary. R7 / R8 pin the explicit-fill arm and R9 pins that exact arity
 //     still wins first (§22.6's "Defaulted-arity tie-break").
-//   * a `this(...)` / `base(...)` chain lowers through `emitChainCall`, which
-//     uses `ctorByArity` — EXACT arity, no defaults — and then, for `this(...)`,
-//     the §22.10 primary whose defaults `storePrimaryCtorPositionalArgs` DOES
-//     fill (fix #3583). Measured on 89eb914 AND on this commit: a `this(x)`
-//     chain to an explicit sibling across an omitted default lowers to NOTHING
-//     (`class B` with `constructor(a: int, b: int := 3)` prints `0/0`). R11 is
-//     the row that pins ownership NOT classifying that argument: declaring a
-//     transfer into a constructor that is never called would suppress the
-//     §28.3 auto-drop that today correctly frees the value — a LEAK introduced
-//     by widening, strictly worse than the arity rule being fixed.
+//   * a `this(...)` / `base(...)` chain lowers through `emitChainCall`. When
+//     #3769 landed that resolver used `ctorByArity` — EXACT arity, no defaults
+//     — so a `this(x)` chain to an explicit sibling across an omitted default
+//     lowered to NOTHING (`class B` with `constructor(a: int, b: int := 3)`
+//     printed `0/0`), and R11 pinned ownership NOT classifying that argument:
+//     declaring a transfer into a constructor that is never called would have
+//     suppressed the §28.3 auto-drop and LEAKED.
+//
+//     fix #3777 (the commit that owns this file's R11 today) made that site
+//     select with `ctorForArgs` and materialise the omitted §22.5 tail, so the
+//     sibling constructor now really runs — which inverts the carve-out into a
+//     DOUBLE FREE. R11 is therefore REVERSED: the unmarked spelling is now a
+//     §22.3 REJECT and `this(owned x)` is the accepted one, disposing exactly
+//     once. `CtorSelect::ChainSite` still differs from `NewSite` in one place
+//     only — a NAMED short chain call, which `emitChainCall` still lowers by
+//     the exact-arity rule.
 //
 // ── ROWS THAT PASS ON BOTH SIDES, BY DESIGN ────────────────────────────────
 //
-// R9, R10 and R11 are anti-over-reject pins: they assert behaviour this fix
-// must NOT change (the §22.6 exact-arity preference, a plain omitted-default
-// positional staying a non-sink with its default still materialized, and the
-// chain-site carve-out). A fix that widened past its warrant breaks them.
+// R9 and R10 are anti-over-reject pins: they assert behaviour this fix must NOT
+// change (the §22.6 exact-arity preference, and a plain omitted-default
+// positional staying a non-sink with its default still materialized). A fix
+// that widened past its warrant breaks them. R11 WAS the third such pin (the
+// chain-site carve-out); fix #3777 removed the lowering gap it was built
+// around, so it is now a REJECT row with an ACCEPT twin — see above.
 
 #include <string>
 
@@ -475,27 +483,31 @@ BEZEL_TEST(defaulted_ctor_arity_owned_sink_3769,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// R11 — ANTI-OVER-REJECT (passes on BOTH sides, by design), AND the row that
-// pins `CtorSelect::ChainSite`. A `this(...)` chain to an explicit SIBLING
-// across an omitted default is NOT lowered by codegen at all — `emitChainCall`
-// resolves its target with `ctorByArity` (exact arity, no defaults) and the
-// `!target` fall-through reaches the §22.10 primary arm, which this class does
-// not have. Measured on 89eb914 AND on this commit: the plain twin of this
-// program prints `0/0`, i.e. the sibling constructor never runs.
+// R11 — REJECT + ACCEPT, and the row that pins `CtorSelect::ChainSite`.
 //
-// Ownership therefore must NOT classify `x` as transferred here: doing so would
-// demand `this(owned x)`, suppress the §28.3 auto-drop, and leak the object the
-// never-called constructor was supposed to adopt. `made=50 live=0` is the proof
-// that today's behaviour — auto-drop frees it exactly once — is the correct one
-// to preserve.
+// ⚠ REVERSED BY fix #3777, IN THE SAME BATCH. When #3769 landed, a `this(...)`
+// chain to an explicit SIBLING across an omitted default was not lowered by
+// codegen at all — `emitChainCall` resolved its target with `ctorByArity`
+// (exact arity, no defaults) and the `!target` fall-through reached the §22.10
+// primary arm, which this class does not have; the plain twin printed `0/0`.
+// Ownership therefore declined to classify `x` as transferred: demanding
+// `this(owned x)` would have suppressed the §28.3 auto-drop and leaked the
+// object the never-called constructor was supposed to adopt (the reviewer
+// measured 800 B / 50 objects for the flip alone), and this row asserted the
+// ACCEPT.
 //
-// (The codegen gap itself — a chain call that resolves no target and silently
-// lowers nothing — is filed separately; ownership tracks what is lowered.)
+// fix #3777 makes `emitChainCall` select with `ctorForArgs` and materialise the
+// omitted §22.5 tail, so `B.constructor(owned a: Res, b: int := 3)` really runs
+// and really adopts the argument into `_f`. The carve-out inverts into a DOUBLE
+// FREE — measured on the codegen half alone, `AddressSanitizer:
+// heap-use-after-free`, freed in `bz$M.Holder$ctor.1` — so the two halves land
+// together and this row flips with them: unmarked is a §22.3 REJECT, and
+// `this(owned x)` is the spelling that disposes exactly once.
 // ═══════════════════════════════════════════════════════════════════════════
-// per §12.8 / §22.5 / §28.3 (auto-drop), issue #3769
+// per §12.8 / §22.5 / §22.3 / §28.8, issues #3769 and #3777
 BEZEL_TEST(defaulted_ctor_arity_owned_sink_3769,
-           chain_to_explicit_sibling_across_omitted_default_not_an_owned_sink) {
-    const char* body =
+           chain_to_explicit_sibling_across_omitted_default_is_an_owned_sink) {
+    const char* bodyUnmarked =
         "class B "
         "  private owned _f: Res; "
         "  private _n: int; "
@@ -508,24 +520,47 @@ BEZEL_TEST(defaulted_ctor_arity_owned_sink_3769,
         "  end constructor; "
         "end B; ";
     auto d = parseAndCheckOwnership(std::string("module M; ") + kResPlain +
-                                    body);
-    BEZEL_EXPECT_FALSE(hasMissingOwnedMarker(d, "x"));
-    BEZEL_EXPECT_FALSE(hasSpuriousOwnedMarkerReject(d));
-    // The auto-drop warning IS the correct diagnostic here: nothing consumed
-    // `x`, so §28.3 discharges it, and that free is the one that keeps the
-    // program leak-free below.
-    BEZEL_EXPECT_TRUE(hasOwnedParamAutoDropWarning(d, "x"));
+                                    bodyUnmarked);
+    // The sibling constructor is really called now, so the position IS an owned
+    // sink and §22.3 requires the call site to announce the transfer.
+    BEZEL_EXPECT_TRUE(hasMissingOwnedMarker(d, "x"));
+
+    // The MARKED spelling is accepted, and disposes exactly once: `x` is
+    // moved-from, so §28.3's auto-drop does not fire, and `B._f` owns the
+    // object for the rest of the `using var`'s scope.
+    const char* bodyMarked =
+        "class B "
+        "  private owned _f: Res; "
+        "  private _n: int; "
+        "  public constructor(owned a: Res, b: int := 3) "
+        "    _f := move a; "
+        "    _n := b; "
+        "  end constructor; "
+        "  public constructor(owned x: Res, y: bool) "
+        "    this(owned x); "
+        "  end constructor; "
+        "  public method N(): int "
+        "    return _n; "
+        "  end N; "
+        "end B; ";
+    auto dm = parseAndCheckOwnership(std::string("module M; ") + kResPlain +
+                                     bodyMarked);
+    BEZEL_EXPECT_FALSE(hasMissingOwnedMarker(dm, "x"));
+    BEZEL_EXPECT_FALSE(hasSpuriousOwnedMarkerReject(dm));
+    BEZEL_EXPECT_FALSE(hasOwnedParamAutoDropWarning(dm, "x"));
 
     const std::string src =
-        std::string("module M3769k; ") + kRes + body +
+        std::string("module M3769k; ") + kRes + bodyMarked +
         "class C "
         "  public static method Main(): int "
         "    var i: int := 0; "
+        "    var acc: int := 0; "
         "    while i < 50 do "
         "      using var b := new B(new Res(i), true); "
+        "      acc := acc + b.N(); "
         "      i := i + 1; "
         "    end while; "
-        "    Console.WriteLine($\"made={Res._made} live={Res._live}\"); "
+        "    Console.WriteLine($\"made={Res._made} live={Res._live} acc={acc}\"); "
         "    return 0; "
         "  end Main; "
         "end C; ";
@@ -533,7 +568,10 @@ BEZEL_TEST(defaulted_ctor_arity_owned_sink_3769,
     BEZEL_EXPECT_TRUE(r.ran);
     if (!r.ran) return;
     BEZEL_EXPECT_EQ(r.exitCode, 0);
-    BEZEL_EXPECT_TRUE(r.stdoutText.find("made=50 live=0") != std::string::npos);
+    // acc = 50 * 3 proves the §22.5 default really reached `_n` — the value
+    // half #3777 adds on top of the disposal counters #3769 could assert.
+    BEZEL_EXPECT_TRUE(r.stdoutText.find("made=50 live=0 acc=150") !=
+                      std::string::npos);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

@@ -208,20 +208,37 @@ enum class CtorSelect {
     // must be tried before the primary here.
     NewSite,
     // `this(...)` / `base(...)` — codegen's `emitChainCall`
-    // (LlvmBackend_Setup.cpp): `ctorByArity` — EXACT arity only, no defaults —
-    // and then, for `this(...)`, the §22.10 primary, whose §22.5 defaults and
-    // named arguments `storePrimaryCtorPositionalArgs` DOES fill (fix #3583).
+    // (LlvmBackend_Setup.cpp).
     //
-    // ⚠ The explicit-fill pass is deliberately NOT run here, and that is a
-    // soundness requirement, not hygiene. Measured on the parent: `class B`
+    // narrow #3769 / fix #3777 (§22.5 / §22.8 step 1 / §12.8, v0.286): this
+    // used to mean "EXACT arity only, then the §22.10 primary", because that is
+    // literally what `emitChainCall` did — it selected with `ctorByArity`, and
+    // a `this(x)` to an explicit sibling across an omitted default therefore
+    // resolved NO target and lowered NOTHING (measured on 89eb914: `class B`
     // with `constructor(a: int, b: int := 3)` and
-    // `constructor(x: int, y: bool) this(x); end`, `new B(7, true)` prints
-    // `0/0` — codegen's chain resolves NO target for `this(x)` and lowers
-    // nothing at all. Classifying that argument against the sibling's formals
-    // would declare an `owned` transfer into a constructor that is never
-    // called, suppressing the §28.3 auto-drop that today correctly frees the
-    // value: a LEAK introduced by widening. The codegen gap is filed
-    // separately; ownership tracks what is lowered.
+    // `constructor(x: int, y: bool) this(x); end` printed `0/0`). Declaring an
+    // `owned` transfer into a constructor that is never called would have
+    // suppressed the §28.3 auto-drop and LEAKED (measured: 800 B / 50 objects),
+    // so the explicit-fill pass was carved out here.
+    //
+    // #3777 made `emitChainCall` select with `ctorForArgs` and materialise the
+    // omitted §22.5 tail, so the sibling constructor now really runs — and the
+    // carve-out inverted into a DOUBLE FREE: the value is transferred into the
+    // callee's `owned` field AND auto-dropped by the caller. Measured on the
+    // codegen half alone, with this enum still carving the pass out:
+    //
+    //   AddressSanitizer: heap-use-after-free ... READ of size 4
+    //     #0 bz$M.Res$Id  #1 bz$M.Holder$Show  #2 main
+    //   freed by thread T0 here: ... #1 bz$M.Holder$ctor.1
+    //
+    // So the pass runs here too now. ONE difference from `NewSite` survives,
+    // and it is again "agree with what is lowered": `emitChainCall` widened its
+    // admission only for an ALL-POSITIONAL argument list, because its argument
+    // loop pairs argument `i` with formal `i` positionally and never consults
+    // the §22.5 binding — a NAMED short chain call is therefore still lowered
+    // by the exact-arity rule (or not at all). Running the fill pass for one
+    // here would re-create exactly the leak this carve-out was built for, on
+    // the named-argument shape.
     ChainSite,
 };
 
@@ -303,10 +320,22 @@ CalleeFormals resolveCtorFormals(const sema::TypeSymbol* cls,
 
     // PASS 2 — fix #3769: an explicit constructor the arguments can fill with
     // §22.5 defaults admitted. FIRST match in member order, which is exactly
-    // what `ctorForArgs`'s fallback loop returns. Skipped at a CHAIN site,
-    // where the lowering resolver (`ctorByArity`) has no such fallback — see
-    // `CtorSelect::ChainSite`.
-    if (select == CtorSelect::NewSite)
+    // what `ctorForArgs`'s fallback loop returns.
+    //
+    // narrow #3769 / fix #3777: this pass now runs at a CHAIN site too, because
+    // `emitChainCall` now selects with `ctorForArgs` and fills the omitted
+    // §22.5 tail — see `CtorSelect::ChainSite` for the measured double free the
+    // old carve-out became. It still mirrors that site's own restriction: the
+    // chain's widened admission is gated on the call being ALL-POSITIONAL, so a
+    // NAMED short chain call keeps the exact-arity rule on both sides. // per
+    // §22.5, §22.8 step 1, #3777
+    bool runFillPass = select == CtorSelect::NewSite;
+    if (!runFillPass) {
+        runFillPass = true;
+        for (const ast::CallArgument& a : args)
+            if (!a.name.empty()) { runFillPass = false; break; }
+    }
+    if (runFillPass)
         for (sema::Symbol* m : cls->members)
             if (auto* cs = candidate(m)) {
                 CalleeFormals f = formalsOfCtor(cs);
@@ -478,12 +507,14 @@ CalleeFormals MethodOwnership::resolveChainCtorParams(
     auto* id = dynamic_cast<const ast::IdentifierExpr*>(callee);
     if (!id) return {};
     const sema::TypeSymbol* owner = enclosingCtor_->parent;
-    // fix #3769 (§22.5 / §22.10, v0.286): `CtorSelect::ChainSite` — an exact
-    // arity match, then the §22.10 primary with its §22.5 defaults filled,
-    // which is exactly what `emitChainCall` lowers (`ctorByArity`, then the
-    // #1087 primary arm whose #3583 store fills defaults and named arguments).
-    // NOT the explicit-fill pass: see `CtorSelect::ChainSite` for the measured
-    // leak that widening would introduce.
+    // fix #3769 / narrow #3769 (§22.5 / §22.10 / §22.8 step 1, v0.286):
+    // `CtorSelect::ChainSite` — an exact arity match, then (for an
+    // all-positional call) an explicit constructor the arguments FILL, then the
+    // §22.10 primary with its §22.5 defaults filled. That is exactly what
+    // `emitChainCall` lowers since #3777 (`ctorForArgs` with the §22.10
+    // no-self-chain exclusion, the omitted-tail fill, then the #1087/#3583
+    // primary arm). See `CtorSelect::ChainSite` for why the named-argument
+    // shape is still excluded on both sides.
     if (id->name == "this")
         return resolveCtorFormals(owner, args, /*exclude=*/enclosingCtor_,
                                   CtorSelect::ChainSite);
