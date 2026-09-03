@@ -4992,6 +4992,57 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             ctx_.setExprType(&ce, nullTy);
                         }
                     }
+                    // fix #3784 (stdlib §5.1, v0.286): MinOrNull()/MaxOrNull()
+                    // on a LAZY IEnumerable<T> receiver (e.g. `arr.Where(...)
+                    // .MinOrNull()`) return nullable T — the same shape as the
+                    // sibling FirstOrNull/LastOrNull/SingleOrNull arm above,
+                    // but with the IComparable<T> constraint §5.1 imposes.
+                    // Reuses the same `declaresBuiltinInterface` predicate
+                    // the concrete-collection arm above and the Min/Max
+                    // class-element arm ~L5894 consult — no new predicate;
+                    // primitives and string always satisfy the constraint.
+                    // The issue's "Reproduces identically on a
+                    // lazy-chain-materialized receiver" sentence records
+                    // this same shape degrades via #2434 absent this arm:
+                    // sema's lazy-enumerable path silently left the call
+                    // untyped, falling into the same lowerLocalDecl
+                    // i32-default branch the direct-Array case hit.
+                    else if ((m == "MinOrNull" || m == "MaxOrNull") &&
+                             ce.args.empty() && srcElem) {
+                        // Defer the IComparable<T> check at a generic-var
+                        // placeholder srcElem (§14.2's
+                        // check-runs-at-instantiation rule; mirrors the
+                        // hashable gate's defer behaviour ~L5076). At a
+                        // concrete class/interface element the gate fires
+                        // here, the same way it does on the concrete
+                        // collection arm above.
+                        bool implIComp = true;
+                        if (srcElem->kind == TypeRef::Kind::Named &&
+                            srcElem->declaration &&
+                            (srcElem->declaration->kind ==
+                                 ast::TypeDeclKind::Class ||
+                             srcElem->declaration->kind ==
+                                 ast::TypeDeclKind::Interface))
+                            implIComp = declaresBuiltinInterface(
+                                srcElem->declaration, "IComparable");
+                        if (!implIComp) {
+                            ctx_.diagnostics().report(
+                                Severity::Error, ce.span.begin,
+                                std::string(m) +
+                                "() requires the element type to "
+                                "implement IComparable<T> (stdlib §5.1 "
+                                "/ §14.2 / #1198); " +
+                                std::string(srcElem->declaration->name) +
+                                " does not implement IComparable<T>. Use "
+                                "Select(selector).MinOrNull() / "
+                                "MaxOrNull() instead.");
+                            return;
+                        }
+                        auto* nullTy = ctx_.makeTypeRef();
+                        *nullTy = *srcElem;
+                        nullTy->nullable = true;
+                        ctx_.setExprType(&ce, nullTy);
+                    }
                     else if (m == "ToArray" || m == "ToSet") {
                         // fix #3331 (C5, stdlib §5 + proposal 0116 D9):
                         // `ToSet` is one of the six `where T: hashable`
@@ -6435,6 +6486,71 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                  recvTy->genericArgs[0]) {
                             auto* nullTy = ctx_.makeTypeRef();
                             *nullTy = *recvTy->genericArgs[0];
+                            nullTy->nullable = true;
+                            ctx_.setExprType(&ce, nullTy);
+                        }
+                        // fix #3784 (stdlib §5.1, v0.286): MinOrNull()/MaxOrNull()
+                        // on a direct collection receiver return nullable T
+                        // (the §5.1 `IEnumerable<T> where T: IComparable<T>`
+                        // block; sibling of the FirstOrNull/LastOrNull/
+                        // SingleOrNull arm just above, same nullable-copy
+                        // construction). Was the silent-#2434 case
+                        // `var m := someArray<Box>.MinOrNull();` degraded
+                        // into, even though the codegen array arm
+                        // (`LlvmBackend_Calls.cpp:~3753`) already lowered
+                        // the call correctly — the call's `exprType` was
+                        // never set, so the inferred local's slot
+                        // (lowerLocalDecl ~L14350) defaulted to i32 and
+                        // emitted the "lowerLocalDecl's initializer
+                        // expression failed to lower" warning. Reuses the
+                        // same IComparable<T> verification the Min/Max
+                        // class-element arm ~L5894 runs through
+                        // `declaresBuiltinInterface` (#3139's
+                        // imported-element accessor) — no new predicate;
+                        // primitives and string always satisfy the
+                        // constraint (per the same arm). Selector
+                        // overloads (`MinOrNull<U>(sel)`) deliberately do
+                        // not exist (stdlib §5.1's "There are deliberately
+                        // no MinOrNull/MaxOrNull selector overloads —
+                        // compose Select(selector).MinOrNull()"), so a
+                        // no-arg-only gate matches the stdlib exactly.
+                        else if ((m == "MinOrNull" || m == "MaxOrNull") &&
+                                 ce.args.empty() &&
+                                 !recvTy->genericArgs.empty() &&
+                                 recvTy->genericArgs[0]) {
+                            TypeRef* elem = recvTy->genericArgs[0];
+                            // stdlib §5.1: `where T: IComparable<T>`. For
+                            // primitive elements (int/long/double/…) the
+                            // constraint is trivially satisfied; for
+                            // string (§9.6) likewise; for class/interface
+                            // elements consult declaresBuiltinInterface —
+                            // the symbol-side accessor the Min/Max arm
+                            // ~L5924 shares, with the #3139 imported-side
+                            // fix already in place.
+                            bool implIComp = true;
+                            if (elem->kind == TypeRef::Kind::Named &&
+                                elem->declaration &&
+                                (elem->declaration->kind ==
+                                     ast::TypeDeclKind::Class ||
+                                 elem->declaration->kind ==
+                                     ast::TypeDeclKind::Interface))
+                                implIComp = declaresBuiltinInterface(
+                                    elem->declaration, "IComparable");
+                            if (!implIComp) {
+                                ctx_.diagnostics().report(
+                                    Severity::Error, ce.span.begin,
+                                    std::string(m) +
+                                    "() requires the element type to "
+                                    "implement IComparable<T> (stdlib "
+                                    "§5.1 / §14.2 / #1198); " +
+                                    std::string(elem->declaration->name) +
+                                    " does not implement IComparable<T>. "
+                                    "Use Select(selector).MinOrNull() / "
+                                    "MaxOrNull() instead.");
+                                return;
+                            }
+                            auto* nullTy = ctx_.makeTypeRef();
+                            *nullTy = *elem;
                             nullTy->nullable = true;
                             ctx_.setExprType(&ce, nullTy);
                         }
