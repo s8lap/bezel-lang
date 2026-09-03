@@ -381,15 +381,41 @@ BEZEL_TEST(sema_param,
     BEZEL_EXPECT_TRUE(!hasError(r, "non-trivial-dispose"));
 }
 
-// §22.5 / §28.9: the owned-FIELD path — a class with no destructor but an
-// `owned` field is still non-trivial-dispose (§28.9's derived-property
-// computation covers both), so a default constructing it on a plain
-// parameter is rejected too, not just the destructor case above.
+// §22.5 / §28.9: the owned-FIELD path. §28.9 (v0.286) evaluates the
+// trivial-dispose property RECURSIVELY: "an `owned` field whose declared type
+// is itself trivial-dispose does not disqualify the holder". `T` here has no
+// destructor and no owned fields, so `Holder { owned _t: T }` is
+// trivial-dispose and the default `new Holder()` on a plain parameter is
+// ADMITTED. (Before fix #3632 / #3647 the predicate short-circuited on any
+// owned field and this row pinned that conservative verdict; the R12 gate
+// caught the fixture when the widening landed.)
 BEZEL_TEST(sema_param,
-           default_owned_new_owned_field_on_plain_param_rejected_1684) {
+           default_owned_new_trivial_owned_field_on_plain_param_admitted_1684) {
     auto r = parseSemaAll(
         "module M; "
         "class T end T; "
+        "class Holder "
+        "  private owned _t: T; "
+        "  public constructor() _t := new T(); end constructor; "
+        "end Holder; "
+        "class C "
+        "  public static method M(h: Holder := new Holder()): int => 0; "
+        "  public static method Main(): int => 0; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(!hasError(r, "non-trivial-dispose"));
+}
+
+// §22.5 / §28.9: the same owned-FIELD path with a NON-trivial-dispose field
+// type — `T` declares a destructor, so the holder is non-trivial-dispose
+// through the recursive clause and the default `new` on a plain parameter is
+// still rejected. This is the row the widening must not admit.
+BEZEL_TEST(sema_param,
+           default_owned_new_nontrivial_owned_field_on_plain_param_rejected_1684) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class T "
+        "  destructor end destructor; "
+        "end T; "
         "class Holder "
         "  private owned _t: T; "
         "  public constructor() _t := new T(); end constructor; "

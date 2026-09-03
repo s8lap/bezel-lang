@@ -197,7 +197,7 @@ BEZEL_TEST(linked_list_4_6, remove_first_decrements_count) {
         "  using var l := new LinkedList<int>(); "
         "  l.AddLast(10); l.AddLast(20); l.AddLast(30); "
         "  l.RemoveFirst(); "
-        "  return (l.Count * 10 + l.First) ?? 0; "   // 2*10 + 20 = 40
+        "  return l.Count * 10 + (l.First ?? 0); "   // 2*10 + 20 = 40 (§7.11 v0.267+: no lifting over int?; unwrap with ?? per fix #3298)
         "end Main; end C;"), 40);
 }
 
@@ -209,7 +209,7 @@ BEZEL_TEST(linked_list_4_6, remove_last_decrements_count) {
         "  using var l := new LinkedList<int>(); "
         "  l.AddLast(10); l.AddLast(20); l.AddLast(30); "
         "  l.RemoveLast(); "
-        "  return (l.Count * 10 + l.Last) ?? 0; "   // 2*10 + 20 = 40
+        "  return l.Count * 10 + (l.Last ?? 0); "   // 2*10 + 20 = 40 (§7.11: unwrap the nullable Last)
         "end Main; end C;"), 40);
 }
 
@@ -223,7 +223,7 @@ BEZEL_TEST(linked_list_4_6, remove_node_by_pointer) {
         "  l.AddLast(10); l.AddLast(20); l.AddLast(30); "
         "  var n := l.Find(20); "
         "  l.RemoveNode(n); "
-        "  return (l.Count * 10 + l.First + l.Last) ?? 0; "   // 2*10 + 10 + 30 = 60
+        "  return l.Count * 10 + (l.First ?? 0) + (l.Last ?? 0); "   // 2*10 + 10 + 30 = 60 (§7.11: unwrap both)
         "end Main; end C;"), 60);
 }
 
