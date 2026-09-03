@@ -161,6 +161,258 @@ BEZEL_TEST(lambda_body_escape, catch_copied_value_assign_to_outer_local_accepted
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
+// POSITIVE (§31.1, #3707 — residual of #3565): the TARGET is at METHOD scope,
+// entirely outside the lambda body under check (`mk`'s own `try`/`catch`
+// wraps the store). #3565 closed the case where the target is declared
+// INSIDE the lambda body (`catch_closure_assign_to_outer_local_rejected_31_1`
+// above): there, `checkOneLambdaBodyEscapes`'s re-seeded `localDepth_` finds
+// BOTH depths and the ordinary `td < sd` comparison fires. Here `f`'s decl is
+// never visited by that re-seeding walk at all (it lives in the METHOD body,
+// not `mk.stmts`), so `td` came back -1 and the `td >= 0 && sd >= 0` guard
+// silently declined every case where the target lives outside the lambda body
+// — issue #3520's dead-arm shape, now measured for this scope. Verified on
+// the parent (pre-#3707) build: compiles rc=0 with NO diagnostic, runs rc=139
+// (SIGSEGV) once `f` is called after the arm — and calling `f` before `mk`
+// returns cannot happen syntactically here, so every call site is a
+// use-after-free.
+BEZEL_TEST(lambda_body_escape, catch_closure_assign_to_method_scope_local_rejected_31_1) {
+    auto r = parseAndCheckOwnership(wrap(
+        "public method Handle(): int "
+        "  var f := lambda(): int => 0; "
+        "  var mk := lambda(): int => do "
+        "    try DoWork(); "
+        "    catch var e: Exception => do "
+        "      f := lambda(): int => Use(e); "
+        "    end; "
+        "    end; "
+        "    return 0; "
+        "  end; "
+        "  var ignored := mk(); "
+        "  return f() + f() + ignored; "
+        "end Handle;"));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "caught exception `e` may not be captured by a closure assigned "
+           "to `f`"));
+    BEZEL_EXPECT_TRUE(hasErrorMessage(r, "(§31.1"));
+}
+
+// POSITIVE (§31.1, #3707) — the filed repro's own shape: the LAMBDA under
+// check (`mk`) is declared *inside* the catch arm, so the arm is `mk`'s
+// ANCESTOR rather than a descendant of `mk.stmts` — `collectLocalDepths
+// (mk.stmts)` never walks up to it, so `sd` (not just `td`) comes back -1
+// here. The fix does not depend on `sd`: `isCatchBorrow` is a scope-free
+// sema flag, so `td < 0` alone is enough to know `f` outlives `mk`'s own
+// invocation, and outliving `mk` outlives the arm that `mk` is called from
+// inside of (`mk()` is invoked, and returns, before the arm completes).
+// Verified on the parent (pre-#3707) build: compiles rc=0, runs rc=139.
+BEZEL_TEST(lambda_body_escape,
+           catch_closure_in_nested_lambda_assign_to_method_scope_local_rejected_31_1) {
+    auto r = parseAndCheckOwnership(wrap(
+        "public method Handle(): int "
+        "  var f := lambda(): int => 0; "
+        "  var total := 0; "
+        "  try DoWork(); "
+        "  catch var e: Exception => do "
+        "    var mk := lambda(): int => do "
+        "      f := lambda(): int => Use(e); "
+        "      return 0; "
+        "    end; "
+        "    total := mk(); "
+        "  end; "
+        "  end; "
+        "  return total + f() + f(); "
+        "end Handle;"));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "caught exception `e` may not be captured by a closure assigned "
+           "to `f`"));
+    BEZEL_EXPECT_TRUE(hasErrorMessage(r, "(§31.1"));
+}
+
+// NEGATIVE (§31.1, #3707) — the boundary the fix must not cross: same nested-
+// lambda-in-catch-arm shape as the row just above, but `f` is declared INSIDE
+// `mk`'s own body (`mk.stmts`) rather than at method scope, so `td >= 0`
+// (found by `collectLocalDepths(mk.stmts)`) and the NEW branch — gated on
+// `td < 0` — never fires; the assignment falls through to the pre-existing
+// `else { return false; }`. `f` dies with `mk`'s own invocation, which
+// happens synchronously and completes before the arm does, so `e` is live for
+// every call `f` makes. Genuinely safe, not merely unflagged: `mk()` runs to
+// completion (including both calls to the reassigned `f`) strictly inside the
+// arm's own dynamic extent.
+BEZEL_TEST(lambda_body_escape,
+           catch_closure_assign_to_local_inside_nested_lambda_accepted_31_1) {
+    auto r = parseAndCheckOwnership(wrap(
+        "public method Handle(): int "
+        "  var total := 0; "
+        "  try DoWork(); "
+        "  catch var e: Exception => do "
+        "    var mk := lambda(): int => do "
+        "      var f := lambda(): int => 0; "
+        "      f := lambda(): int => Use(e); "
+        "      return f() + f(); "
+        "    end; "
+        "    total := mk(); "
+        "  end; "
+        "  end; "
+        "  return total; "
+        "end Handle;"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// NEGATIVE (§31.1, #3707) — a store to a method-scope outer local of a value
+// that does NOT capture the catch binding at all. `ownedLocalBorrowSource`
+// finds no borrow source for a closure that reads nothing but a literal, so
+// `src` is null and the check returns before it ever reaches the new branch
+// — this row pins that the fix's `td < 0` gate did not turn into "any store
+// to an outside-the-lambda-body local is rejected."
+BEZEL_TEST(lambda_body_escape,
+           catch_arm_present_but_non_capturing_store_to_method_scope_local_accepted_31_1) {
+    auto r = parseAndCheckOwnership(wrap(
+        "public method Handle(): int "
+        "  var f := lambda(): int => 0; "
+        "  var mk := lambda(): int => do "
+        "    try DoWork(); "
+        "    catch var e: Exception => do "
+        "      f := lambda(): int => 7; "
+        "    end; "
+        "    end; "
+        "    return 0; "
+        "  end; "
+        "  var ignored := mk(); "
+        "  return f() + f() + ignored; "
+        "end Handle;"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// NEGATIVE (§31.1, #3707 review fix) — a FOR-LOOP INDUCTION VARIABLE as the
+// target, declared and used entirely inside the checked lambda body's own
+// `for` loop. `cur`'s `LocalSymbol::decl` is the `ForStmt` node itself
+// (src/sema/ExprTypecheck.cpp: `lsym->decl = fs`), which
+// `collectLocalDepthsStmt` never records — unlike a plain `var`, its depth is
+// `-1` REGARDLESS of scope or nesting. The first draft of this fix's new
+// branch treated any `td < 0` in `EscapeScope::LambdaBody` as proof of
+// "declared outside the lambda body," which is false for this decl kind:
+// MEASURED, this row false-rejected on that draft (`cur := e;` — the
+// plain-store spelling, needing `cur`'s element type to admit an `Exception`
+// — compiled clean on the parent, rc=1 with the §31.1 message falsely
+// claiming `cur` "lives in an enclosing block that outlives the arm" on the
+// draft). The shipped fix restricts the new branch to
+// `dynamic_cast<const ast::LocalDecl*>(targetLocal->decl)`, the ONE decl kind
+// `collectLocalDepthsStmt` covers completely for every statement inside the
+// checked lambda body — a `ForStmt`'s own induction variable never matches
+// it, so the branch declines and the (unaffected) `else { return false; }`
+// accepts, exactly as the parent did.
+BEZEL_TEST(lambda_body_escape, catch_plain_store_to_forloop_var_inside_body_accepted_31_1) {
+    auto r = parseAndCheckOwnership(
+        "module M; import System; "
+        "class C "
+        "  public static method Run(): int "
+        "    var items: Array<Exception> := [new InvalidOperationException(\"a\"), "
+        "                                     new InvalidOperationException(\"b\")]; "
+        "    var mk := lambda(): int => do "
+        "      var total := 0; "
+        "      try "
+        "        throw new InvalidOperationException(\"wxyz\"); "
+        "      catch "
+        "        var e: Exception => do "
+        "          for var cur in items do "
+        "            cur := e; "
+        "            total := total + cur.Message.Length; "
+        "          end; "
+        "        end "
+        "      end try; "
+        "      return total; "
+        "    end; "
+        "    return mk(); "
+        "  end Run; "
+        "  public static method Main(): int "
+        "    Console.WriteLine(Run().ToString()); "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// NEGATIVE (§31.1, #3707 review fix) — a CASE-ARM PATTERN-BOUND LOCAL as the
+// target, declared and used entirely inside the checked lambda body's own
+// `case` arm. `v`'s `LocalSymbol::decl` is the arm's `BindingPattern` node
+// (or the #1271 naked anchor) — the sibling decl kind to a `ForStmt`
+// induction variable, and equally never a `collectLocalDepthsStmt` entry.
+// Same shape, same fix, same guard as the for-loop row above: MEASURED to
+// false-reject on the first draft (`v := e;`, rc=1, the same falsely-claimed
+// "lives in an enclosing block" message) and to compile clean both with the
+// shipped `dynamic_cast<const ast::LocalDecl*>` guard and on the parent.
+BEZEL_TEST(lambda_body_escape, catch_plain_store_to_pattern_bound_var_inside_body_accepted_31_1) {
+    auto r = parseAndCheckOwnership(
+        "module M; import System; "
+        "public choice Box "
+        "  Full(v: Exception), "
+        "  Empty; "
+        "end Box; "
+        "class C "
+        "  private static method MakeBox(): Box "
+        "    return Box.Full(new InvalidOperationException(\"seed\")); "
+        "  end MakeBox; "
+        "  public static method Run(): int "
+        "    var mk := lambda(): int => do "
+        "      var total := 0; "
+        "      try "
+        "        throw new InvalidOperationException(\"wxyz\"); "
+        "      catch "
+        "        var e: Exception => do "
+        "          case MakeBox() of "
+        "            Full(var v) => do "
+        "              v := e; "
+        "              total := v.Message.Length; "
+        "            end, "
+        "            Empty => do end "
+        "          end case; "
+        "        end "
+        "      end try; "
+        "      return total; "
+        "    end; "
+        "    return mk(); "
+        "  end Run; "
+        "  public static method Main(): int "
+        "    Console.WriteLine(Run().ToString()); "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// NEGATIVE (§31.1, #3707 review fix) — regression guard, not a false-reject
+// row: a plain `var` LocalDecl target nested one block DEEPER than the arm
+// (an `if` inside the arm), inside the checked lambda body. `n`'s decl IS a
+// `LocalDecl`, so `collectLocalDepthsStmt` records its real depth regardless
+// of how many nested blocks separate it from the arm, and `td > sd` here (the
+// `if` block is nested inside the arm, not the reverse) — this never reaches
+// the new branch at all (`td >= 0` up front), passes on the parent AND both
+// drafts of the fix, and pins that the `dynamic_cast<const ast::LocalDecl*>`
+// guard added for the two rows above does not regress ordinary nested-block
+// targets.
+BEZEL_TEST(lambda_body_escape, catch_closure_assign_to_deeper_nested_block_local_accepted_31_1) {
+    auto r = parseAndCheckOwnership(wrap(
+        "public method Handle(): int "
+        "  var mk := lambda(): int => do "
+        "    var total := 0; "
+        "    try DoWork(); "
+        "    catch var e: Exception => do "
+        "      if true then "
+        "        var n := lambda(): int => 0; "
+        "        n := lambda(): int => Use(e); "
+        "        total := n() + n(); "
+        "      end; "
+        "    end; "
+        "    end; "
+        "    return total; "
+        "  end; "
+        "  return mk(); "
+        "end Handle;"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
 // ---------------------------------------------------------------- #3564 ----
 
 // POSITIVE (§28.9, #3564): the filed repro. `r` is an owned scope-bound local

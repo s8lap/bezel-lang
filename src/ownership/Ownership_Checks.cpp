@@ -5075,6 +5075,105 @@ bool MethodOwnership::checkBorrowStoreEscape(const ast::AssignmentStmt& as,
         if (td >= 0 && sd >= 0 && td < sd) {
             dest = Dest::OuterLocal;
             outerLocalIsClosureCapture = hasLambda(*as.value);
+        } else if (scope == EscapeScope::LambdaBody && td < 0 &&
+                   // LOCALDECL-ONLY: assignment targets can never be const (§21.1)
+                   dynamic_cast<const ast::LocalDecl*>(targetLocal->decl) &&
+                   isCatchBorrow(src)) {
+            // fix #3707 (§31.1, v0.286): residual of #3565. In
+            // `EscapeScope::LambdaBody`, `localDepth_` was cleared and
+            // re-seeded from THIS lambda body alone (checkOneLambdaBodyEscapes),
+            // so `td < 0` here does not mean "depth unknown" the way it can at
+            // method scope for a decl kind `collectLocalDepthsStmt` never
+            // records — it means `targetLocal`'s decl was never visited by
+            // that re-seeding walk, i.e. it is declared OUTSIDE the current
+            // lambda body: at method scope, or in an outer lambda's own body
+            // (collectLocalDepths deliberately never recurses into a nested
+            // LambdaExpr, so both shapes land here identically). Such a
+            // target is, by construction, declared in a scope that lexically
+            // ENCLOSES this lambda body, so it outlives anything scoped
+            // inside the body — there is no narrower comparison to make,
+            // unlike the ordinary td>=0 case above where both depths
+            // describe blocks on one nesting path.
+            //
+            // review fix (measured post-edb5779): `td < 0` alone is NOT proof
+            // of "outside the body" — it is also what a for-loop induction
+            // variable's OWN depth looks like, unconditionally, regardless of
+            // scope: `collectLocalDepthsStmt` (this file) populates
+            // `localDepth_` only for an `ast::LocalDecl` statement and, as a
+            // pre-recorded special case, a `TryStmt` catch arm's `arm.body`.
+            // A for-loop variable's `LocalSymbol::decl` is the `ForStmt` node
+            // ITSELF (`lsym->decl = fs`, src/sema/ExprTypecheck.cpp:~15132)
+            // — never a `localDepth_` key, inside the lambda body or out of
+            // it. A pattern-bound case/match arm binding is the same shape
+            // one level over (`decl` is a `BindingPattern` or the #1271 naked
+            // anchor, ExprTypecheck_Exprs.cpp / ExprTypecheck.cpp, multiple
+            // sites). MEASURED: a `for var cur in items do cur := e; end`
+            // nested entirely inside the checked lambda's own catch arm
+            // false-rejected under the first draft of this fix (`cur` cannot
+            // outlive the arm — it is declared and used entirely inside it —
+            // but its `td` was -1 exactly like a genuinely-outside target's).
+            // The added `dynamic_cast<const ast::LocalDecl*>` conjunct
+            // restricts this branch to the ONE decl kind
+            // `collectLocalDepthsStmt` covers COMPLETELY and unconditionally
+            // for every statement `forEachNestedStmt` reaches inside
+            // `lam.stmts` (if/while/for-BODY/do-end/try/case-arm-BODY, per
+            // its own header comment) — so for a `LocalDecl` target,
+            // `td < 0` after re-seeding really does prove "not inside this
+            // lambda body's subtree," with no structural false positive left.
+            //
+            // The LOCALDECL-ONLY marker above (not a LOCALDECL-DEBT: this
+            // site is correct, not an offender) records why no sibling
+            // `LocalConstDecl` handling belongs beside it: `targetLocal` is
+            // resolved from `as.target`, the ASSIGNMENT'S OWN LHS, and a
+            // `const` local is single-assignment (§21.1 — "not an assignable
+            // location"); reassigning one is rejected by an earlier
+            // typecheck pass. A `LocalConstDecl` can therefore never reach
+            // `targetLocal->decl` here structurally, in any program that
+            // passed sema — not merely in the programs this fix's own tests
+            // happen to try.
+            // For every OTHER decl kind (`ForStmt`, `BindingPattern`, an
+            // inline `out var`'s bare `IdentifierExpr` anchor, ...) this
+            // branch now DECLINES rather than guesses — the same
+            // conservative default the pre-existing `else { return false; }`
+            // below already applies to an unknown depth at method scope
+            // ("If either depth is unknown ... we conservatively do NOT flag
+            // it"). That is a real, honestly-scoped gap for those decl kinds
+            // when the target genuinely IS outside the lambda body — not a
+            // new false-reject, just this narrow fix declining to widen
+            // beyond what it can prove; not independently measured as a
+            // SIGSEGV here (unlike issue 3727 below) and not filed as its own
+            // issue for that reason, but worth a reader's attention if this
+            // branch is ever extended.
+            //
+            // Restricted to `isCatchBorrow(src)`: that predicate is scope-free
+            // by construction (a sema-set flag on the LocalSymbol, not a
+            // `states_`/`localDepth_` lookup), so it needs no re-seeded input
+            // to answer correctly regardless of which scope asked — unlike
+            // `sd` itself, which is NOT relied on here. `sd` is found (>=0)
+            // when the catch arm textually encloses this lambda body (the
+            // `try`/`catch` sits inside `lam.stmts`, so `collectLocalDepths`
+            // recorded it); it is NOT found when the catch arm instead
+            // encloses the *declaration* of this lambda (`mk` is itself a
+            // LocalDecl inside the arm body, so the arm is an ANCESTOR of
+            // `lam.stmts`, never a descendant collectLocalDepths walks into)
+            // — issue #3707's own filed repro is exactly this second shape.
+            // Both are still "target lives outside this lambda body, source is
+            // a scope-free catch borrow", so gating on `td < 0` alone (not
+            // `sd >= 0`) is what makes this branch cover both.
+            //
+            // A general owned-scope-bound-local SOURCE (the sibling §28.3 case
+            // just below `isCatchBorrow`, e.g. `using var r := new R();
+            // f := lambda() => r.V();` with `f` at method scope) is
+            // deliberately NOT widened into this branch: `isOwnedTrackedLocal`
+            // is NOT scope-free the way `isCatchBorrow` is (it looks the
+            // source up in the re-seeded `states_`, which answers about THIS
+            // lambda body only), so admitting it here would need its own
+            // reasoning about what a method-scope `states_` miss for the
+            // TARGET side implies — a different argument than the one this
+            // comment makes for `isCatchBorrow`. Left as its own gap (filed
+            // as issue 3727) rather than folded into this §31.1-scoped fix.
+            dest = Dest::OuterLocal;
+            outerLocalIsClosureCapture = hasLambda(*as.value);
         } else {
             return false;
         }
