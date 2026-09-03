@@ -159,7 +159,7 @@ CalleeFormals resolveCalleeParams(const ast::Expr* callee,
 }
 
 // fix #3751 (§22.10 / §22.3 / §28.8, v0.286): the SAME constructor-formals
-// resolution, keyed on the target CLASS and the argument count rather than on a
+// resolution, keyed on the target CLASS and the argument list rather than on a
 // `new` expression. `resolveCtorParams` below is now a thin adapter over it, and
 // the `this(...)` / `base(...)` chain resolver
 // (`MethodOwnership::resolveChainCtorParams`) is the second caller — so a chain
@@ -175,52 +175,175 @@ CalleeFormals resolveCalleeParams(const ast::Expr* callee,
 // — resolves the chain to the CONVENIENCE constructor (same arity) rather than
 // to the primary, i.e. answers the question about the wrong parameter list.
 //
-// Arity is matched EXACTLY, which is what `ctorByArity` does at the lowering
-// site: a chain call whose arity matches no constructor and no positional list
-// answers "no formals" and behaves exactly as it did before this fix.
-CalleeFormals resolveCtorFormals(const sema::TypeSymbol* cls, std::size_t nArgs,
-                                 const sema::ConstructorSymbol* exclude) {
-    if (!cls) return {};
-    // Arity-matched scan, unchanged for a locally declared constructor. An
-    // IMPORTED constructor takes the same arity rule off the reconstructed
-    // ParameterSymbol list — the only way to match it, and the same rule
-    // codegen's ctorForArgs applies.
-    for (sema::Symbol* m : cls->members) {
-        if (auto* cs = dynamic_cast<sema::ConstructorSymbol*>(m)) {
-            if (cs->isStatic) continue;  // §22.7: not part of the call surface
-            if (cs == exclude) continue; // §22.10: no self-chain
-            if (sema::formalParamCount(*cs) != nArgs) continue;
-            CalleeFormals f;
-            if (auto* d = dynamic_cast<const ast::ConstructorDecl*>(cs->decl))
-                f.declParams = &d->params;
-            else
-                f.ctorSym = cs;
-            return f;
+// fix #3769 (§22.5 / §22.6 / §22.3 / §28.8, v0.286): arity is NO LONGER matched
+// exactly. A call that omits a §22.5-DEFAULTED trailing parameter matched
+// nothing here, so the view was invalid and every §22.3 / §28.8 question
+// answered "this position is not an owned sink" — a named owned binding handed
+// to an `owned` parameter was neither marker-checked nor marked moved-from, and
+// the §28.3 auto-drop then freed a value the callee had already transferred into
+// an `owned` field. Measured on the parent commit, both under
+// `--sanitize=address`, both `heap-use-after-free`:
+//
+//   `class Base(owned r: Res, tag: int := 5)`
+//     * `new Base(x)`  — compiled with NO diagnostic at all (issue 3769 (a));
+//     * `this(x)` from `constructor(owned x: Res, flag: bool)` — compiled with
+//       only the §28.3 auto-drop warning (issue 3769 (b)).
+//   Spelling the default explicitly (`new Base(x, 5)`, `this(owned x, 5)`) made
+//   the arity exact and both were classified correctly, which is what pinned the
+//   arity match as the whole defect.
+//
+// See `CtorSelect` for why the admission rule is a parameter rather than one
+// rule: the two LOWERING resolvers this must agree with do not agree with each
+// other, and agreeing with the wrong one is a fresh soundness hole in the
+// opposite direction (measured — see `ChainSite`).
+enum class CtorSelect {
+    // `new T(args)` — codegen's `ctorForArgs`
+    // (LlvmBackend_impl.hpp): an EXACT-arity explicit constructor, then the
+    // first explicit constructor whose formals the arguments CAN FILL with
+    // §22.5 defaults admitted (`argsCanFill` / `argsCanFillSymbolic`, fix
+    // #3082), then — `ctorForArgs` having returned null — the §22.10 primary.
+    // Measured on the parent: `class B(p: int)` plus
+    // `constructor(q: int, r: int := 9)`, `new B(5)` reaches the EXPLICIT
+    // constructor (printed `5/9`, not the primary's `5/0`), so explicit-fill
+    // must be tried before the primary here.
+    NewSite,
+    // `this(...)` / `base(...)` — codegen's `emitChainCall`
+    // (LlvmBackend_Setup.cpp): `ctorByArity` — EXACT arity only, no defaults —
+    // and then, for `this(...)`, the §22.10 primary, whose §22.5 defaults and
+    // named arguments `storePrimaryCtorPositionalArgs` DOES fill (fix #3583).
+    //
+    // ⚠ The explicit-fill pass is deliberately NOT run here, and that is a
+    // soundness requirement, not hygiene. Measured on the parent: `class B`
+    // with `constructor(a: int, b: int := 3)` and
+    // `constructor(x: int, y: bool) this(x); end`, `new B(7, true)` prints
+    // `0/0` — codegen's chain resolves NO target for `this(x)` and lowers
+    // nothing at all. Classifying that argument against the sibling's formals
+    // would declare an `owned` transfer into a constructor that is never
+    // called, suppressing the §28.3 auto-drop that today correctly frees the
+    // value: a LEAK introduced by widening. The codegen gap is filed
+    // separately; ownership tracks what is lowered.
+    ChainSite,
+};
+
+// fix #3769 (§22.5 "Optional parameters and named arguments" / §22.6, v0.286):
+// "can this argument list fill these formals?" — the §22.5 ADMISSION rule.
+//
+// This is `Emitter::argsCanFill` (LlvmBackend_Assign.cpp) and its imported twin
+// `Emitter::argsCanFillSymbolic` (same file, fix #3082), which are themselves
+// `ExprTC::bindArgsToParams`'s rule restated for a caller that wants the verdict
+// without the five diagnostics. Neither is reachable from here — both are
+// `Emitter` members, and ownership does not depend on codegen — so the LOOP is
+// mirrored, statement for statement, and cited. What is NOT mirrored is the
+// formal list itself: it is read through `sema::FormalsView` (#3178/#3173), the
+// one view all three of those binders already run over, so the three facts the
+// rule turns on (count, name, may-be-omitted) have a single answer per formal
+// rather than a fifth spelling. // per §22.5, #3082, #3178
+bool formalsAdmitArgs(const CalleeFormals& f,
+                      const std::vector<ast::CallArgument>& args) {
+    const sema::FormalsView v = f.bindingView();
+    const std::size_t n = v.size();
+    std::vector<bool> filled(n, false);
+    std::size_t pos = 0;
+    for (const ast::CallArgument& a : args) {
+        std::size_t idx;
+        if (a.name.empty()) {
+            // §22.5: positional arguments fill parameters left to right.
+            if (pos >= n) return false;
+            idx = pos++;
+        } else {
+            // §22.5: a named argument fills the parameter of that name.
+            idx = n;
+            for (std::size_t j = 0; j < n; ++j)
+                if (v.name(j) == a.name) { idx = j; break; }
+            if (idx >= n) return false;
         }
+        if (filled[idx]) return false;
+        filled[idx] = true;
     }
+    // §22.5: an unfilled parameter must carry a default.
+    for (std::size_t j = 0; j < n; ++j)
+        if (!filled[j] && !v.hasDefault(j)) return false;
+    return true;
+}
+
+// The formals of a locally declared or imported constructor SYMBOL, in the
+// source order every `CalleeFormals` accessor uses.
+CalleeFormals formalsOfCtor(sema::ConstructorSymbol* cs) {
+    CalleeFormals f;
+    if (auto* d = dynamic_cast<const ast::ConstructorDecl*>(cs->decl))
+        f.declParams = &d->params;
+    else
+        f.ctorSym = cs;
+    return f;
+}
+
+CalleeFormals resolveCtorFormals(const sema::TypeSymbol* cls,
+                                 const std::vector<ast::CallArgument>& args,
+                                 const sema::ConstructorSymbol* exclude,
+                                 CtorSelect select) {
+    if (!cls) return {};
+    const std::size_t nArgs = args.size();
+    // §22.7: a static constructor is not part of the call surface.
+    // §22.10: a convenience constructor may not chain to itself.
+    auto candidate = [&](sema::Symbol* m) -> sema::ConstructorSymbol* {
+        auto* cs = dynamic_cast<sema::ConstructorSymbol*>(m);
+        if (!cs || cs->isStatic || cs == exclude) return nullptr;
+        return cs;
+    };
+
+    // PASS 1 — EXACT arity. Unchanged, and deliberately still ahead of every
+    // other pass: §22.6's "Defaulted-arity tie-break" prefers a candidate
+    // applicable WITHOUT filling any default over one that fills some, and
+    // codegen's `ctorForArgs` orders its own two steps the same way. An
+    // IMPORTED constructor takes the same rule off the reconstructed
+    // ParameterSymbol list — the only way to match it.
+    for (sema::Symbol* m : cls->members)
+        if (auto* cs = candidate(m))
+            if (sema::formalParamCount(*cs) == nArgs) return formalsOfCtor(cs);
+
+    // PASS 2 — fix #3769: an explicit constructor the arguments can fill with
+    // §22.5 defaults admitted. FIRST match in member order, which is exactly
+    // what `ctorForArgs`'s fallback loop returns. Skipped at a CHAIN site,
+    // where the lowering resolver (`ctorByArity`) has no such fallback — see
+    // `CtorSelect::ChainSite`.
+    if (select == CtorSelect::NewSite)
+        for (sema::Symbol* m : cls->members)
+            if (auto* cs = candidate(m)) {
+                CalleeFormals f = formalsOfCtor(cs);
+                if (formalsAdmitArgs(f, args)) return f;
+            }
+
     // #1627 / fix #3141: a class PRIMARY constructor. `hasPositionalFields` is
     // mirrored onto the TypeSymbol (#501) and each parameter is a FieldSymbol on
     // both sides (#2516), so this arm no longer stops at the module boundary.
     // Where the local `ast::Param` list exists it is still what is handed on —
     // it is the same list, and it carries the syntax (`owned`, defaults) the
     // metadata does not.
+    //
+    // fix #3769: the exact-size test is KEPT as the first disjunct rather than
+    // folded into `formalsAdmitArgs`, so an exact-arity call's view is resolved
+    // by byte-identical code to the parent's — a malformed exact-arity call
+    // (a duplicated or unknown named argument, already diagnosed by §22.5)
+    // keeps the view it had, and this fix widens only the arm that previously
+    // answered "no formals at all".
     if (cls->kind == ast::TypeDeclKind::Class && cls->hasPositionalFields) {
         if (auto* td = dynamic_cast<const ast::TypeDecl*>(cls->decl)) {
-            if (td->positionalFields.size() == nArgs) {
-                CalleeFormals f;
-                f.declParams = &td->positionalFields;
-                f.primaryCtor = true;
+            CalleeFormals f;
+            f.declParams = &td->positionalFields;
+            f.primaryCtor = true;
+            if (td->positionalFields.size() == nArgs ||
+                formalsAdmitArgs(f, args))
                 return f;
-            }
             return {};
         }
         std::vector<const sema::Symbol*> pos =
             sema::recordPositionalFieldSymbols(cls);
-        if (pos.size() == nArgs && !pos.empty()) {
+        if (!pos.empty()) {
             CalleeFormals f;
             f.posFields = std::move(pos);
             f.primaryCtor = true;
-            return f;
+            if (f.posFields.size() == nArgs || formalsAdmitArgs(f, args))
+                return f;
         }
     }
     return {};
@@ -230,8 +353,8 @@ CalleeFormals resolveCtorParams(const ast::NewExpr& ne, sema::SemaContext& ctx) 
     if (!ne.type) return {};
     const sema::TypeRef* rt = ctx.resolvedType(*ne.type);
     if (!rt) return {};
-    return resolveCtorFormals(rt->declaration, ne.args.size(),
-                              /*exclude=*/nullptr);
+    return resolveCtorFormals(rt->declaration, ne.args,
+                              /*exclude=*/nullptr, CtorSelect::NewSite);
 }
 
 // §22.5 (v0.184, #1973): the parameter index the argument at source position
@@ -314,20 +437,28 @@ std::size_t boundParamIndex(const std::vector<ast::CallArgument>& args,
 // enclosing constructor symbol is unknown or the arity matches nothing, in
 // which case every caller behaves exactly as it did before this fix.
 CalleeFormals MethodOwnership::resolveChainCtorParams(
-    const ast::Expr* callee, std::size_t nArgs) const {
+    const ast::Expr* callee, const std::vector<ast::CallArgument>& args) const {
     if (!callee || !enclosingCtor_ || !enclosingCtor_->parent) return {};
     auto* id = dynamic_cast<const ast::IdentifierExpr*>(callee);
     if (!id) return {};
     const sema::TypeSymbol* owner = enclosingCtor_->parent;
+    // fix #3769 (§22.5 / §22.10, v0.286): `CtorSelect::ChainSite` — an exact
+    // arity match, then the §22.10 primary with its §22.5 defaults filled,
+    // which is exactly what `emitChainCall` lowers (`ctorByArity`, then the
+    // #1087 primary arm whose #3583 store fills defaults and named arguments).
+    // NOT the explicit-fill pass: see `CtorSelect::ChainSite` for the measured
+    // leak that widening would introduce.
     if (id->name == "this")
-        return resolveCtorFormals(owner, nArgs, /*exclude=*/enclosingCtor_);
+        return resolveCtorFormals(owner, args, /*exclude=*/enclosingCtor_,
+                                  CtorSelect::ChainSite);
     if (id->name == "base") {
         // Codegen's `Emitter::baseClassOf`: the first CLASS entry of
         // `baseTypes` (interfaces sit in the same list and are not chain
         // targets).
         for (const sema::TypeSymbol* b : owner->baseTypes)
             if (b && b->kind == ast::TypeDeclKind::Class)
-                return resolveCtorFormals(b, nArgs, /*exclude=*/nullptr);
+                return resolveCtorFormals(b, args, /*exclude=*/nullptr,
+                                          CtorSelect::ChainSite);
     }
     return {};
 }
@@ -339,10 +470,10 @@ CalleeFormals MethodOwnership::resolveChainCtorParams(
 // `recordMovesInArgs` — but both had the same blind spot and both must answer
 // identically about one argument position, or the §22.3 marker surface and the
 // §28.8 transfer would disagree about the same call (the #1462 half-fix shape).
-CalleeFormals MethodOwnership::calleeOrChainFormals(const ast::Expr* callee,
-                                                    std::size_t nArgs) const {
+CalleeFormals MethodOwnership::calleeOrChainFormals(
+    const ast::Expr* callee, const std::vector<ast::CallArgument>& args) const {
     CalleeFormals f = resolveCalleeParams(callee, ctx_);
-    if (!f.valid()) f = resolveChainCtorParams(callee, nArgs);
+    if (!f.valid()) f = resolveChainCtorParams(callee, args);
     return f;
 }
 
@@ -585,7 +716,7 @@ void MethodOwnership::recordMovesInArgs(const std::vector<ast::CallArgument>& ar
     // so a `this(...)` / `base(...)` CHAIN call — whose callee is the bare
     // identifier `this`/`base` and resolves to no symbol — is classified against
     // the target constructor's formals instead of against nothing at all.
-    const CalleeFormals formals = calleeOrChainFormals(callee, args.size());
+    const CalleeFormals formals = calleeOrChainFormals(callee, args);
     const sema::ChoiceCaseSymbol* calleeChoiceCase =
         callee ? dynamic_cast<sema::ChoiceCaseSymbol*>(ctx_.exprSymbol(*callee))
                : nullptr;
@@ -752,7 +883,7 @@ bool MethodOwnership::isImplicitOwned(const std::vector<ast::CallArgument>& args
     // owned sink, so it was neither marker-checked nor marked moved-from, and
     // the convenience constructor's §28.3 auto-drop freed a value the chained-to
     // constructor had already transferred into an `owned` field.
-    const CalleeFormals formals = calleeOrChainFormals(callee, args.size());
+    const CalleeFormals formals = calleeOrChainFormals(callee, args);
     if (!formals.valid()) return false;
     // §22.5 (v0.184, #1973): resolve the BOUND parameter (named-arg binding),
     // not the source position — a reordered `owned`/borrow named-arg call

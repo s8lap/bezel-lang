@@ -148,6 +148,30 @@ struct CalleeFormals {
         if (ctorSym) return sema::formalParamResolvedType(*ctorSym, i);
         return methSym ? sema::formalParamResolvedType(*methSym, i) : nullptr;
     }
+    // fix #3769 (§22.5 / §2.5, v0.286): this same formal list as the ONE
+    // §22.5 BINDING view `ExprTC::bindArgsToParams` runs over
+    // (`sema::FormalsView`, #3178/#3173). The binding facts — how many formals
+    // there are, each one's NAME, and whether each MAY BE LEFT UNBOUND — are
+    // exactly what an admission test needs, and `hasDefault` in particular has
+    // no reader on `CalleeFormals` at all: this view is where it already lives,
+    // for a local `ast::Param` list, a §22.10 positional-field list, an
+    // imported `ConstructorSymbol` and a `MethodSymbol` alike. Constructing the
+    // view here rather than restating those four arms is what keeps the
+    // owned-sink resolver's "which constructor does this call reach?" answer
+    // from drifting away from sema's "may this call omit that argument?".
+    //
+    // NON-OWNING, like every `FormalsView`: the returned view borrows this
+    // `CalleeFormals`' `posFields` vector (and the AST/symbol lists the other
+    // arms point at), so it must not outlive the `CalleeFormals` it came from.
+    // The source order is the one every accessor above uses — AST first,
+    // symbol second — so a formal both sources describe cannot get two answers.
+    sema::FormalsView bindingView() const {
+        if (declParams) return sema::FormalsView::of(*declParams);
+        if (!posFields.empty()) return sema::FormalsView::of(posFields);
+        if (ctorSym) return sema::FormalsView::of(*ctorSym);
+        if (methSym) return sema::FormalsView::of(*methSym);
+        return {};
+    }
 };
 
 // Per-method ownership analyzer.
@@ -1163,14 +1187,20 @@ private:
     // Ownership_Checks.cpp for the measured defect this closes. Answers an
     // invalid view for anything that is not a chain call, so a caller can use
     // it as a fallback when `resolveCalleeParams` finds no symbol.
-    CalleeFormals resolveChainCtorParams(const ast::Expr* callee,
-                                         std::size_t nArgs) const;
+    //
+    // fix #3769 (§22.5, v0.286): takes the ARGUMENT LIST, not just its size —
+    // §22.5 admission needs each argument's NAME to bind it, and a call may now
+    // omit a defaulted trailing parameter.
+    CalleeFormals resolveChainCtorParams(
+        const ast::Expr* callee,
+        const std::vector<ast::CallArgument>& args) const;
 
     // fix #3751: `resolveCalleeParams` with the chain fallback applied — the ONE
     // answer to "what formal list does this call reach?" shared by the two
     // owned-sink classifiers (`recordMovesInArgs` and `isImplicitOwned`).
-    CalleeFormals calleeOrChainFormals(const ast::Expr* callee,
-                                       std::size_t nArgs) const;
+    CalleeFormals calleeOrChainFormals(
+        const ast::Expr* callee,
+        const std::vector<ast::CallArgument>& args) const;
 
     // Detect `local.Dispose()` patterns and mark the local as Disposed.
     // Also detects `local` consumed as a `return` value (handleReturn
