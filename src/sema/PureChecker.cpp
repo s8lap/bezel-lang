@@ -1144,13 +1144,13 @@ void PureBodyWalker::checkExpr(const ast::Expr* e) {
         // populates it from `resolveMemberAccess` (ExprTypecheck_Exprs.cpp
         // ~3437, which mirrors the call-resolution path). For an INDEXER read
         // (`obj[i]`, the IndexExpr arm below), the route through here is NOT
-        // taken — indexer reads are themselves IndexExpr nodes, and the
-        // property-side predicate `propertyGetterIsPure` does not (yet)
-        // classify indexers by indexer-parameter purity under rule 6 (the
-        // indexer arm is filed separately — see the brief). A non-property
-        // member (field, method-of-target-as-value, etc.) is NOT this rule's
-        // concern — field reads are the frame's responsibility, and methods
-        // are reached via CallExpr, never MemberAccessExpr.
+        // taken — indexer reads are themselves IndexExpr nodes, and get
+        // their OWN rule-6 accessor-read check in the IndexExpr arm below
+        // (fix #3721), asking the SAME `propertyGetterIsPure` predicate. A
+        // non-property member (field, method-of-target-as-value, etc.) is
+        // NOT this rule's concern — field reads are the frame's
+        // responsibility, and methods are reached via CallExpr, never
+        // MemberAccessExpr.
         if (auto* ps = dynamic_cast<PropertySymbol*>(ctx_.exprSymbol(*e))) {
             if (!propertyGetterIsPure(ps)) {
                 reportPureViolation(
@@ -1164,6 +1164,59 @@ void PureBodyWalker::checkExpr(const ast::Expr* e) {
         return;
     }
     if (auto* ix = dynamic_cast<const ast::IndexExpr*>(e)) {
+        // fix #3721 (§22.15 rule 6, v0.286): the INDEXER twin of the
+        // MemberAccessExpr arm above. `obj[i]` on a class receiver with a
+        // user-declared indexer is a call to that indexer's `get` accessor
+        // — rule 6's "accessor read" form — exactly like `c.Value` is a
+        // call to a named property's getter, just spelled with brackets
+        // instead of a dot. The previous implementation here only
+        // descended into the target and the index expressions, so a
+        // non-`pure` indexer getter's side effects ran unobserved inside a
+        // `pure` body (issue's measured repro: compile exit 0, run exit 4
+        // — the getter's `Calls := Calls + 1` executed inside `pure P`).
+        //
+        // NO NEW RECORDING SITE, NO SIXTH PREDICATE. #3721's own
+        // structural note claimed no writer ever attaches a symbol to an
+        // `ast::IndexExpr` — REFUTED: `ExprTypecheck_Exprs.cpp`'s
+        // `visitExpr` IndexExpr arm already calls
+        // `ctx_.setExprSymbol(&e, ps)` (fix #2530, §22.3/§23) for the
+        // user-declared-indexer branch — the grep the issue based that
+        // claim on (`setExprSymbol(&ix\|setExprSymbol(ix`) missed it
+        // because the call spells the node `&e` (the shared `ast::Expr&`
+        // parameter), not `&ix`. That attachment already reaches BOTH a
+        // local and an imported indexer identically (the same
+        // `tt->declaration->members` walk resolves both — #2414's comment
+        // there records the imported-candidate fix), so
+        // `ctx_.exprSymbol(*e)` already returns the resolved
+        // `PropertySymbol` here, same as the MemberAccessExpr arm. The
+        // purity classification itself is also already both-sources:
+        // `PropertySymbol::accessorIsPure` (Symbol.hpp) is populated
+        // identically for a Property or an Indexer by
+        // SymbolCollection.cpp's single `PropertyDecl` arm (`pd->isIndexer`
+        // is just a bit on the same node) locally, and by
+        // `ModuleLoader.cpp`'s Indexer case (`p->accessorIsPure =
+        // mm.accessorIsPure`, mirroring the Property case) across the
+        // module boundary — `ModuleMetadataBuilder.cpp`'s exporter walk for
+        // `MetaMember::accessorIsPure` (#3618) already says explicitly
+        // "Covers both Property AND Indexer". So `propertyGetterIsPure`,
+        // the SAME authority the MemberAccessExpr arm asks, already
+        // answers the indexer question correctly on both sides of the
+        // module boundary — this arm only needed to ASK it. A builtin
+        // collection index (Array<T>, Dictionary<K,V>, a span, an inline
+        // array, a string) resolves no user `PropertySymbol` at this site
+        // (the ExprTypecheck_Exprs.cpp branch that calls `setExprSymbol`
+        // is gated on `tt->kind == TypeRef::Kind::Named && tt->declaration`
+        // with a matching indexer candidate), so `ctx_.exprSymbol(*e)`
+        // stays null there and this arm is a no-op for every builtin/array
+        // shape — see the commit body's §6b enumeration.
+        if (auto* ps = dynamic_cast<PropertySymbol*>(ctx_.exprSymbol(*e))) {
+            if (!propertyGetterIsPure(ps)) {
+                reportPureViolation(
+                    e->span.begin, "indexer read",
+                    "the resolved indexer's `get` accessor is not "
+                    "pure-declared (§22.15 rule 6 / #3721)");
+            }
+        }
         checkExpr(ix->target.get());
         for (const auto& i : ix->indices)
             if (i.value) checkExpr(i.value.get());
