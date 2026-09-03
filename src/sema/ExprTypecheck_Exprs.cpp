@@ -912,8 +912,31 @@ void ExprTC::checkIndexArgsPositional(const ast::IndexExpr& ix) {
 // builtin have the SAME TypeRef shape (Named, `declaration == nullptr`), so
 // the closed-surface arms below must be able to tell them apart by name.
 // Mirrors the §14.1 (#992) detection in the NewExpr arm: a name is a type
-// parameter when the enclosing method's or the enclosing type's own
-// `genericParams` list it.
+// parameter when the enclosing method's, the enclosing type's, or (fix
+// #3644, a direct twin of #3643's `ExprTC::isInScopeTypeParam` in
+// ExprTypecheck.cpp) the enclosing EXTENSION's own §26.4 block-level
+// parameter names it.
+//
+// The extension arm was missing. Inside an extension body `currentType_`
+// names the EXTENDED type (`visitTopDecl`'s `ExtensionDecl` arm), so the
+// `currentType_` arm above answers this function's question only by
+// NAME-COINCIDENCE — it asks whether the EXTENDED type's own declared
+// `genericParams` contains `name`, which matches the extension's true
+// answer (§26.4: `extension Box<T>` binds a FRESH `T` belonging to the
+// extension, not to `Box`'s own declaration; `ast::ExtensionDecl` carries no
+// `genericParams` field of its own, #3083) only when an author reuses the
+// same letter, and is a false negative whenever they do not — or whenever
+// the extended type is IMPORTED, since `TypeSymbol::decl` is unconditionally
+// null for an import (`ModuleLoader.cpp`'s Pass-3 generic-body reparse
+// attaches a decl to individual MEMBER symbols only, never to the TYPE's own
+// `decl`), so the `currentType_` arm never fires at all on that side. A
+// generic extension writing `new T()` (or the builtin-named shadow this
+// function exists to guard, `new Guid()` where `Guid` is the extension's own
+// type parameter) was therefore reachable through
+// `checkBuiltinClosedConstructorSurface`'s per-name builtin checks for an
+// imported extended type while a same-named local one was correctly
+// excluded — a false REJECT (or a categorically worse diagnostic), not a
+// silent widening.
 bool ExprTC::isEnclosingGenericTypeParamName(std::string_view name) const {
     if (name.empty()) return false;
     if (currentMethodDecl_)
@@ -923,6 +946,12 @@ bool ExprTC::isEnclosingGenericTypeParamName(std::string_view name) const {
         if (auto* td = dynamic_cast<const ast::TypeDecl*>(currentType_->decl))
             for (const auto& gp : td->genericParams)
                 if (gp.name == name) return true;
+    if (currentExtension_ && currentExtension_->decl)
+        if (auto* ed = dynamic_cast<const ast::ExtensionDecl*>(
+                currentExtension_->decl))
+            if (ed->targetType &&
+                isExtensionTargetTypeParam(*ed->targetType, name))
+                return true;
     return false;
 }
 
@@ -2739,13 +2768,24 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                     // (ExprTypecheck_Calls.cpp): walk the type parameter's
                     // where-constraints on the enclosing method, then the class.
                     if (!ctx_.exprType(e)) {
+                        // fix #3644 (§26.4 / §14.2, v0.286): `isParam` used to
+                        // be computed INSIDE the lambda from a `gps` list
+                        // (currentMethodDecl_'s or currentType_'s own
+                        // `genericParams`) — but an extension's own §26.4
+                        // block-level type parameter binds via its
+                        // `targetType`'s argument positions
+                        // (`isExtensionTargetTypeParam`), never through a
+                        // `genericParams` list (`ast::ExtensionDecl` has no
+                        // such field), so there was no `gps` to pass for a
+                        // third, extension arm. Hoisting the "is `cn` a
+                        // declared param here" computation to each call site
+                        // and taking a plain `bool` lets the extension arm
+                        // below reuse the same gc-scan instead of a second
+                        // hand-rolled copy of it.
                         auto tryIndexerConstraint =
-                            [&](const std::vector<ast::GenericParam>& gps,
+                            [&](bool isParam,
                                 const std::vector<ast::GenericConstraint>& gcs)
                             -> bool {
-                            bool isParam = false;
-                            for (const auto& gp : gps)
-                                if (gp.name == cn) { isParam = true; break; }
                             if (!isParam) return false;
                             for (const auto& gc : gcs) {
                                 if (gc.typeParam != cn) continue;
@@ -2815,17 +2855,49 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                         };
                         bool done = false;
                         if (currentMethodDecl_ &&
-                            !currentMethodDecl_->genericParams.empty())
+                            !currentMethodDecl_->genericParams.empty()) {
+                            bool isParam = false;
+                            for (const auto& gp :
+                                 currentMethodDecl_->genericParams)
+                                if (gp.name == cn) { isParam = true; break; }
                             done = tryIndexerConstraint(
-                                currentMethodDecl_->genericParams,
+                                isParam,
                                 currentMethodDecl_->genericConstraints);
+                        }
                         if (!done && currentType_ && currentType_->decl)
                             if (auto* td = dynamic_cast<const ast::TypeDecl*>(
                                     currentType_->decl))
-                                if (!td->genericParams.empty())
+                                if (!td->genericParams.empty()) {
+                                    bool isParam = false;
+                                    for (const auto& gp : td->genericParams)
+                                        if (gp.name == cn) {
+                                            isParam = true;
+                                            break;
+                                        }
+                                    done = tryIndexerConstraint(
+                                        isParam, td->genericConstraints);
+                                }
+                        // fix #3644 (§26.4, v0.286): the third arm #3643 gave
+                        // `isInScopeTypeParam`/`forEachConstraintBound` in
+                        // ExprTypecheck.cpp was missing here — an extension
+                        // over an IMPORTED generic type (`currentType_->decl`
+                        // unconditionally null for an import, per #3643's
+                        // measurement) never reached the `currentType_` arm
+                        // above at all, so `x[i]` on the extension's own
+                        // constrained type parameter fell through to
+                        // "unresolved identifier" instead of resolving
+                        // through the constraint interface's indexer.
+                        if (!done && currentExtension_ &&
+                            currentExtension_->decl)
+                            if (auto* ed =
+                                    dynamic_cast<const ast::ExtensionDecl*>(
+                                        currentExtension_->decl))
+                                if (ed->targetType) {
+                                    bool isParam = isExtensionTargetTypeParam(
+                                        *ed->targetType, cn);
                                     tryIndexerConstraint(
-                                        td->genericParams,
-                                        td->genericConstraints);
+                                        isParam, ed->genericConstraints);
+                                }
                     }
                 }
                 // fix #3249 (§23.4 / §4.19, v0.240): FrozenArray<T>'s indexer
@@ -3639,12 +3711,21 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                     // constraint is present for it.
                     bool isTypeParam = false;
                     bool hasNewConstraint = false;
+                    // fix #3644 (§26.4 / §14.1, v0.286): `checkGPs` used to
+                    // take a `gps` list and derive `isParamHere` itself
+                    // (mirroring `tryIndexerConstraint`'s identical shape a
+                    // few hundred lines up, see its own comment) — but an
+                    // extension's own §26.4 block-level parameter has no
+                    // `genericParams` list to pass (it binds through
+                    // `isExtensionTargetTypeParam`'s walk of the extension's
+                    // `targetType`). Taking `isParamHere` as a plain `bool`,
+                    // computed per call site, lets the extension arm below
+                    // reuse the same `hasNewConstraint` scan.
                     auto checkGPs =
-                        [&](const std::vector<ast::GenericParam>& gps,
+                        [&](bool isParamHere,
                             const std::vector<ast::GenericConstraint>& gcs) {
-                        for (const auto& gp : gps)
-                            if (gp.name == paramName) { isTypeParam = true; break; }
-                        if (!isTypeParam) return;
+                        if (!isParamHere) return;
+                        isTypeParam = true;
                         for (const auto& gc : gcs) {
                             if (gc.typeParam != paramName) continue;
                             for (const auto& item : gc.items)
@@ -3657,15 +3738,45 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                         for (const auto& gp : currentMethodDecl_->genericParams)
                             if (gp.name == paramName) { isMethodParam = true; break; }
                         if (isMethodParam)
-                            checkGPs(currentMethodDecl_->genericParams,
+                            checkGPs(true,
                                      currentMethodDecl_->genericConstraints);
                     }
                     if (!isMethodParam && currentType_ && currentType_->decl)
                         if (auto* td = dynamic_cast<const ast::TypeDecl*>(
                                 currentType_->decl))
-                            if (!td->genericParams.empty())
-                                checkGPs(td->genericParams,
-                                         td->genericConstraints);
+                            if (!td->genericParams.empty()) {
+                                bool isTd = false;
+                                for (const auto& gp : td->genericParams)
+                                    if (gp.name == paramName) {
+                                        isTd = true;
+                                        break;
+                                    }
+                                checkGPs(isTd, td->genericConstraints);
+                            }
+                    // fix #3644: the extension arm #3643 gave
+                    // `isInScopeTypeParam`/`forEachConstraintBound` in
+                    // ExprTypecheck.cpp was missing here — an extension's
+                    // own §26.4 type parameter (never in `currentType_`'s
+                    // `genericParams`, and unreachable at all when the
+                    // extended type is imported — `currentType_->decl` is
+                    // unconditionally null then, per #3643's measurement)
+                    // silently escaped the `where T: new()` obligation
+                    // §14.1 requires: `new T()` inside a generic extension
+                    // method type-checked whether or not the extension's own
+                    // `T` was constrained `new()`, because this predicate
+                    // never saw the extension's parameter or its
+                    // constraints at all. Only tried once neither the method
+                    // nor the (name-coincident) class arm already matched —
+                    // same method > type > extension precedence #3643 used.
+                    if (!isMethodParam && !isTypeParam && currentExtension_ &&
+                        currentExtension_->decl)
+                        if (auto* ed = dynamic_cast<const ast::ExtensionDecl*>(
+                                currentExtension_->decl))
+                            if (ed->targetType)
+                                checkGPs(
+                                    isExtensionTargetTypeParam(
+                                        *ed->targetType, paramName),
+                                    ed->genericConstraints);
                     if (isTypeParam && !hasNewConstraint) {
                         ctx_.diagnostics().report(
                             Severity::Error, ne->span.begin,
@@ -4445,9 +4556,26 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                     de->type->name && !de->type->name->parts.empty()) {
                     std::string_view paramName = de->type->name->parts.front();
                     // Walk the enclosing method's constraints first, then the
-                    // enclosing class's constraints (for class-level params).
+                    // enclosing class's, then (fix #3644) the enclosing
+                    // extension's — returning true iff it reported, so a
+                    // later scope does not RE-REPORT the identical
+                    // diagnostic once an earlier scope already found a
+                    // matching non-null-kind constraint. REVIEW FINDING
+                    // (#3644): the first cut of the extension arm below was
+                    // gated only on `!isMethodParam`, with no tracking of
+                    // whether an earlier arm already reported — measured to
+                    // double-fire the identical `default(T)` diagnostic, same
+                    // span, for `class Box<T> where T: class` extended by
+                    // `extension Box<T> where T: class` (both the type arm
+                    // and the extension arm matched the coincidentally
+                    // same-named `T`). `checkGPs`, fixed in this same commit
+                    // a few hundred lines up, already had the right shape
+                    // (`!isTypeParam` gates its own extension arm); this
+                    // function now mirrors it via a `bool` return instead of
+                    // drifting from it.
                     auto checkConstraintsFor =
-                        [&](const std::vector<ast::GenericConstraint>& gcs) {
+                        [&](const std::vector<ast::GenericConstraint>& gcs)
+                        -> bool {
                         for (const auto& gc : gcs) {
                             if (gc.typeParam != paramName) continue;
                             for (const auto& item : gc.items) {
@@ -4467,26 +4595,59 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                                         "fit T's non-null contract (§17.11); "
                                         "write `default(T?)` to produce null of the "
                                         "nullable counterpart");
-                                    return;
+                                    return true;
                                 }
                             }
                         }
+                        return false;
                     };
                     // Check method-level constraints first; fall through to
                     // class-level constraints only when the name is not a
                     // method-level generic param (avoids false positives when
                     // the class has a same-named param with looser constraints).
                     bool isMethodParam = false;
+                    bool constraintReported = false;
                     if (currentMethodDecl_) {
                         for (const auto& gp : currentMethodDecl_->genericParams)
                             if (gp.name == paramName) { isMethodParam = true; break; }
                         if (isMethodParam)
-                            checkConstraintsFor(currentMethodDecl_->genericConstraints);
+                            constraintReported = checkConstraintsFor(
+                                currentMethodDecl_->genericConstraints);
                     }
-                    if (!isMethodParam && currentType_ && currentType_->decl)
+                    if (!isMethodParam && !constraintReported && currentType_ &&
+                        currentType_->decl)
                         if (auto* td = dynamic_cast<const ast::TypeDecl*>(
                                 currentType_->decl))
-                            checkConstraintsFor(td->genericConstraints);
+                            constraintReported =
+                                checkConstraintsFor(td->genericConstraints);
+                    // fix #3644 (§17.11 / §26.4, v0.286): the extension arm
+                    // was missing — the identical gap `forEachConstraintBound`
+                    // (ExprTypecheck.cpp, #3643) had for the same "walk the
+                    // enclosing scope's `where` clauses" question. An
+                    // extension's own §26.4 type parameter's `where T: class`
+                    // / `where T: <type>` constraint lives on the EXTENSION,
+                    // not on `currentType_` (the extended type — read here
+                    // only by name-coincidence, and not at all when the
+                    // extended type is imported, since `currentType_->decl`
+                    // is unconditionally null then). Gated on
+                    // `!constraintReported` (REVIEW FINDING fix, #3644) so
+                    // this arm runs only when NEITHER an earlier scope
+                    // already reported — mirroring `forEachConstraintBound`'s
+                    // own SHORT-CIRCUITING per-scope scan (method, then type,
+                    // then extension, each tried only once the prior one did
+                    // NOT already succeed, via its `return true` as soon as
+                    // one scope's `scan` accepts). An earlier revision of
+                    // this comment called that scan "unconditional", which
+                    // was inaccurate and is corrected here:
+                    // `forEachConstraintBound` stops at the first successful
+                    // scope exactly like this fixed version now does — it
+                    // does not scan every scope regardless of an earlier
+                    // match, and neither does this one any more.
+                    if (!isMethodParam && !constraintReported &&
+                        currentExtension_ && currentExtension_->decl)
+                        if (auto* ed = dynamic_cast<const ast::ExtensionDecl*>(
+                                currentExtension_->decl))
+                            checkConstraintsFor(ed->genericConstraints);
                     // fix #3044 (§17.11 / §3.6 rule 2, v0.242): this body takes
                     // `default(T)` of a bare type parameter, so an instantiation
                     // that supplies a type whose `default` is NOT well-defined
@@ -4527,6 +4688,29 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                             if (paramHasValueConstraint(td->genericConstraints))
                                 recordDefaultTypeParamUse(
                                     currentType_->decl, paramName,
+                                    de->span.begin);
+                    } else if (currentExtension_ && currentExtension_->decl) {
+                        // fix #3644 (§17.11 / §3.6 rule 2 / §26.4, v0.286):
+                        // the extension arm was missing — same gap as
+                        // `checkConstraintsFor` a few lines up. An
+                        // extension's own §26.4 `where T: value` obligation
+                        // was never recorded (`currentType_` names the
+                        // EXTENDED type, whose `decl` is unconditionally
+                        // null for an imported extended type, and only a
+                        // name-coincidence otherwise), so a generic
+                        // extension method's `default(T)` under `where T:
+                        // value` never got its instantiation-site obligation
+                        // discharged — silently admitting a type argument
+                        // whose `default` is NOT well-defined instead of
+                        // rejecting it at the instantiation site (§17.11's
+                        // closing rule). `currentExtension_->decl` (the
+                        // ExtensionDecl AST node) is the owner key, mirroring
+                        // `currentType_->decl` above.
+                        if (auto* ed = dynamic_cast<const ast::ExtensionDecl*>(
+                                currentExtension_->decl))
+                            if (paramHasValueConstraint(ed->genericConstraints))
+                                recordDefaultTypeParamUse(
+                                    currentExtension_->decl, paramName,
                                     de->span.begin);
                     }
                 }
