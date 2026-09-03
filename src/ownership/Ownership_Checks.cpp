@@ -400,6 +400,42 @@ std::size_t boundParamIndex(const std::vector<ast::CallArgument>& args,
         if (params.name(j) == a.name) return j;
     return params.size();
 }
+
+// fix #3779 (§22.5 / §22.3 / §28.8, v0.286): ASK THE BOUND FORMAL, never the
+// source position. `boundParamIndex` above has existed since #1973 and states
+// the consequence of skipping it verbatim — mapping by source position
+// "MISSES a consume (an owned binding at a borrow slot's source index never
+// marked moved-from → the callee disposes it while the caller still believes
+// it owns it → double-free / UAF)" — yet only two of the eight consumers of a
+// constructor's `CalleeFormals` called it. The other six read
+// `formals.modifier(pos)` with `pos` the SOURCE index, so the identical call
+// was classified correctly when its result was bound to a local
+// (`recordMovesIn`) and mis-classified when it was a bare statement
+// (`handleDischarge`), an `await` operand (`collectOwnedConsumingInExpr`), a
+// catch-borrow source (`borrowSourceForExpr`,
+// `catchBorrowAmongNonOwnedCtorArgs`) or a §28.14 gate (`scopedFormalAt`,
+// `verifiedCallBoundedFormalAt`).
+//
+// These three accessors exist so that no consumer can spell the question with
+// a raw index again: there is no `modifier(pos)` to reach for, because getting
+// the modifier REQUIRES passing the argument list the binding is computed
+// from. Out-of-range and invalid-view both answer "no formal", exactly as the
+// `valid() && pos < size()` guards they replace did.
+std::size_t boundFormalIndex(const std::vector<ast::CallArgument>& args,
+                             std::size_t argIdx, const CalleeFormals& f) {
+    if (!f.valid() || argIdx >= args.size()) return f.size();
+    return boundParamIndex(args, argIdx, f);
+}
+std::string_view boundModifier(const std::vector<ast::CallArgument>& args,
+                               std::size_t argIdx, const CalleeFormals& f) {
+    const std::size_t j = boundFormalIndex(args, argIdx, f);
+    return j < f.size() ? f.modifier(j) : std::string_view{};
+}
+std::string_view boundFormalName(const std::vector<ast::CallArgument>& args,
+                                 std::size_t argIdx, const CalleeFormals& f) {
+    const std::size_t j = boundFormalIndex(args, argIdx, f);
+    return j < f.size() ? f.name(j) : std::string_view{};
+}
 } // namespace
 
 // fix #3751 (§22.10 / §22.3 / §28.8 / §28.3, v0.286): the formals of a
@@ -1529,10 +1565,17 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
             // constructor call, mirroring the CallExpr path above — surface-only,
             // the consumption logic below is unchanged. An owned sink here is a
             // ctor `owned` (or `out owned`) formal.
+            // fix #3779 (§22.5, v0.286): the BOUND formal, not the source
+            // position. This is `recordMovesIn`'s twin — the BARE-STATEMENT
+            // path to `recordMovesIn`'s local-decl / assignment-RHS path — and
+            // it was the one that never applied #1973's binding. Measured:
+            // `new Sink(tag := 7, r := x)` as a bare statement compiled clean
+            // and was a use-after-free, while the identical call bound to a
+            // local was correctly rejected.
+            const std::string_view ctorFormalMod =
+                boundModifier(ne->args, pos, ctorParams);
             const bool ctorOwnedSink =
-                ctorParams.valid() && pos < ctorParams.size() &&
-                (ctorParams.modifier(pos) == "owned" ||
-                 ctorParams.modifier(pos) == "out owned");
+                ctorFormalMod == "owned" || ctorFormalMod == "out owned";
             if (a.modifier == "owned" && !ctorOwnedSink) {
                 reportSpuriousOwnedMarker(a.value->span.begin,
                                           /*onFreshProducer=*/false);
@@ -1627,10 +1670,13 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
                 }
             }
             // §28.8: bare id to an `owned` formal param = implicit transfer.
-            if (!consumed && a.modifier.empty() && ctorParams.valid() &&
-                pos < ctorParams.size() &&
-                (ctorParams.modifier(pos) == "owned" ||
-                 ctorParams.modifier(pos) == "out owned")) {
+            // fix #3779: the SAME `ctorFormalMod` the §22.3 marker surface
+            // above asked for. These two are the marker half and the transfer
+            // half of ONE question; binding only one of them would leave the
+            // diagnostic and the moved-from marking disagreeing about the same
+            // argument — the #1462 half-fix shape CLAUDE.md §6b warns about.
+            if (!consumed && a.modifier.empty() &&
+                (ctorFormalMod == "owned" || ctorFormalMod == "out owned")) {
                 if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(a.value.get())) {
                     // §28.8 (#395): reject a borrow flowing into the owned formal.
                     if (!checkOwnedArgSource(*a.value, id->span.begin))
@@ -4122,9 +4168,11 @@ sema::Symbol* MethodOwnership::borrowSourceForExpr(const ast::Expr& rhs) {
             std::size_t pos = 0;
             for (const ast::CallArgument& a : ne->args) {
                 if (!a.value) { ++pos; continue; }
+                // fix #3779: the BOUND formal — carve-out (d) ("owned
+                // positions are exempt, checkOwnedArgSource handles them")
+                // must exempt the position the argument actually reaches.
                 const std::string_view formalMod =
-                    (ctorFormals.valid() && pos < ctorFormals.size())
-                        ? ctorFormals.modifier(pos) : std::string_view{};
+                    boundModifier(ne->args, pos, ctorFormals);
                 const bool paramIsOwned =
                     formalMod == "owned" || formalMod == "out owned";
                 if (!paramIsOwned) {
@@ -5111,10 +5159,11 @@ sema::Symbol* MethodOwnership::catchBorrowAmongNonOwnedCtorArgs(
         // `checkOwnedArgSource` path already rejects those. We only add a
         // new diagnostic for NON-owned parameter positions, which the existing
         // check does not cover. // per §31.1, §28.8
+        // fix #3779: the BOUND formal for both keys below.
+        const std::string_view formalMod =
+            boundModifier(ne.args, pos, ctorParams);
         const bool paramIsOwned =
-            ctorParams.valid() && pos < ctorParams.size() &&
-            (ctorParams.modifier(pos) == "owned" ||
-             ctorParams.modifier(pos) == "out owned");
+            formalMod == "owned" || formalMod == "out owned";
         // §31.2.4 cause position: skip ONLY when the argument lands in the
         // spec-defined `cause` parameter of an exception-class ctor (§31.4).
         // Any other exception-typed argument at a non-`cause` position falls
@@ -5122,12 +5171,18 @@ sema::Symbol* MethodOwnership::catchBorrowAmongNonOwnedCtorArgs(
         const bool isCauseByName =
             constructedIsException &&
             ownershipIsExceptionClassRef(ctx_.exprType(*a.value)) &&
-            ctorParams.valid() && pos < ctorParams.size() &&
-            ctorParams.name(pos) == "cause";
+            boundFormalName(ne.args, pos, ctorParams) == "cause";
         // Builtin base `Exception` has no user `cause` parameter; use the
         // §31.4 spec signature — pos 1 of a 2-arg ctor — as the cause marker.
+        // fix #3779: the builtin base `Exception` has NO formals view at all
+        // (no TypeSymbol), so there is nothing to bind against — but §31.4
+        // fixes the parameter NAMES as well as the order, so a NAMED argument
+        // binds by its own name and only a positional one falls back to the
+        // spec signature's slot 1. Without this, `new Exception(cause := ex,
+        // message := m)` missed the cause carve-out and was rejected.
         const bool isCauseByBuiltinBaseSig =
-            constructedIsBaseExceptionBuiltin && pos == 1 &&
+            constructedIsBaseExceptionBuiltin &&
+            (a.name.empty() ? pos == 1 : a.name == "cause") &&
             ownershipIsExceptionClassRef(ctx_.exprType(*a.value));
         if (isCauseByName || isCauseByBuiltinBaseSig) {
             ++pos;
@@ -8033,8 +8088,14 @@ void MethodOwnership::markOutOwnedArgsCore(
         // does not always reject it, so keying off the modifier alone would
         // over-fire on a value-typed `out`
         // (e.g. `Stack<int>.TryPop(out var item)`, no disposal obligation).
-        const bool userOutOwned = params.valid() && pos < params.size() &&
-                                  params.modifier(pos) == "out owned";
+        // fix #3779: the BOUND formal. §22.5 makes an `out` ARGUMENT
+        // positional-only, so the two indices coincide for the `out` argument
+        // itself — but only while every argument before it is positional too;
+        // in an already-diagnosed positional-after-named ordering
+        // `boundParamIndex` still counts correctly, and reading the source
+        // index does not.
+        const bool userOutOwned =
+            boundModifier(args, pos, params) == "out owned";
         const bool builtinOutOwned = builtinOutOwnedArg(callee, pos);
         if (userOutOwned || builtinOutOwned) {
             if (auto* id =
@@ -8170,8 +8231,10 @@ void MethodOwnership::collectCondOutOwnedRecipients(
         // inline `out owned var` / `out using var` forms are collected by
         // collectOutOwnedVarSyms; an `out using var` is implicitly discharged.
         if (a.modifier == "out") {
-            const bool userOutOwned = params.valid() && pos < params.size() &&
-                                      params.modifier(pos) == "out owned";
+            // fix #3779: the BOUND formal — the demotion half of the pair
+            // above, which must not disagree with it.
+            const bool userOutOwned =
+                boundModifier(*args, pos, params) == "out owned";
             if (userOutOwned || builtinOutOwnedArg(callee, pos)) {
                 if (auto* id =
                         dynamic_cast<const ast::IdentifierExpr*>(a.value.get()))
@@ -10049,10 +10112,13 @@ void MethodOwnership::collectOwnedConsumingInExpr(
         for (const auto& a : ne->args) {
             if (a.value) {
                 if (auto* aw = awaitRoot(*a.value)) {
+                    // fix #3779: the BOUND formal — a §30.5 `await` in a
+                    // reordered named-argument position is owned-consuming
+                    // exactly when the formal it BINDS to is `owned`.
+                    const std::string_view fm =
+                        boundModifier(ne->args, pos, ctorParams);
                     bool ownedSink = a.modifier == "owned" ||
-                        (ctorParams.valid() && pos < ctorParams.size() &&
-                         (ctorParams.modifier(pos) == "owned" ||
-                          ctorParams.modifier(pos) == "out owned"));
+                        fm == "owned" || fm == "out owned";
                     if (ownedSink) out.insert(aw);
                 }
                 collectOwnedConsumingInExpr(*a.value, out);
@@ -10565,8 +10631,12 @@ bool MethodOwnership::deferredActivationArgIsPlainRefParam(
     // list" once again means what the comment says it means.
     const CalleeFormals formals = resolveCalleeParams(ce.callee.get(), ctx_);
     if (!formals.methSym && !formals.ctorSym) return false;  // scope unchanged
-    if (pos >= formals.size()) return false;
-    return formals.modifier(pos) != "owned";
+    // fix #3779: the BOUND formal. This gate and its `…PlainFuncSlot` sibling
+    // below answer the same §28.14 rule from opposite ends and must not
+    // disagree — including about which formal a named argument reaches.
+    const std::size_t bp = boundFormalIndex(ce.args, pos, formals);
+    if (bp >= formals.size()) return false;
+    return formals.modifier(bp) != "owned";
 }
 
 // #1818 (§28.3 v0.196): true when a captured LOCAL is a live owned obligation
@@ -10778,8 +10848,10 @@ bool MethodOwnership::deferredActivationArgIsPlainFuncSlot(
     // disagree about an imported callee's formals.
     const CalleeFormals formals = resolveCalleeParams(ce.callee.get(), ctx_);
     if (!formals.methSym && !formals.ctorSym) return false;  // scope unchanged
-    if (pos >= formals.size()) return false;
-    return formals.modifier(pos).empty();
+    // fix #3779: the BOUND formal; see the sibling gate above.
+    const std::size_t bp = boundFormalIndex(ce.args, pos, formals);
+    if (bp >= formals.size()) return false;
+    return formals.modifier(bp).empty();
 }
 
 // #1818 T9 (§28.14 `scoped`-field read-out bar, v0.196): true when `e` reads a
@@ -13938,11 +14010,18 @@ bool MethodOwnership::scopedFormalAt(const ast::Expr* callee,
         // diagnostic — a silent soundness widening, arriving from a spec change
         // nobody would think to re-audit here. // per §22.10, §28.14
         if (formals.primaryCtor) return false;
-        return formals.valid() && argPos < formals.size() &&
-               formals.modifier(argPos) == "scoped";
+        // fix #3779: the BOUND formal. A `true` here SUPPRESSES the §28.14
+        // call-bounded diagnostic at the caller, so a source-position read
+        // could suppress it for the WRONG argument of a reordered named call.
+        return boundModifier(ne->args, argPos, formals) == "scoped";
     }
     if (!callee) return false;
     // User method: the resolved MethodSymbol's formals carry the modifier.
+    // KNOWN-GAP: #3785 (§22.5 / §28.14) — this arm still reads the SOURCE
+    // position, because the METHOD call's argument list is not passed to this
+    // function (only the `ne` arm above carries one). Fixing it is a signature
+    // change across three callers and belongs to the §28.14 named-argument
+    // family, not to #3779's constructor one; filed with a measured repro.
     // A negative here FALLS THROUGH to the builtin arms below rather than
     // returning — the pre-#3176 code reached them whenever `ms->decl` was not
     // an ast::MethodDecl, and a stdlib `scoped` position whose callee happens to
@@ -15379,11 +15458,14 @@ bool MethodOwnership::verifiedCallBoundedFormalAt(const ast::Expr* callee,
         // resolveCtorParams unifies the primary and declared forms for the
         // owned-sink question (#1627/#3141), which is right there and wrong
         // here; this is the one consumer that must tell them apart.
-        return formals.valid() && !formals.primaryCtor &&
-               argPos < formals.size() &&
-               formalIsPlainFunction(formals, argPos);
+        // fix #3779: the BOUND formal, for the same reason as scopedFormalAt.
+        if (!formals.valid() || formals.primaryCtor) return false;
+        const std::size_t bp = boundFormalIndex(ne->args, argPos, formals);
+        return bp < formals.size() && formalIsPlainFunction(formals, bp);
     }
     if (!callee) return false;
+    // KNOWN-GAP: #3785 — the METHOD arm reads the SOURCE position; see the
+    // twin note in scopedFormalAt.
     const CalleeFormals formals = resolveCalleeParams(callee, ctx_);
     return formals.methSym && argPos < formals.size() &&
            formalIsPlainFunction(formals, argPos);
