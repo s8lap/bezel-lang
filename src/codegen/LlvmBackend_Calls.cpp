@@ -1938,7 +1938,26 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         m == "Last" || m == "ElementAt" || m == "Any" || m == "All" ||
         m == "Contains" || m == "IndexOf" ||
         // stdlib §5 *OrNull variants (lazy source → materialize, then check):
-        m == "FirstOrNull" || m == "LastOrNull" || m == "SingleOrNull";
+        m == "FirstOrNull" || m == "LastOrNull" || m == "SingleOrNull" ||
+        // fix #3764 / stdlib §5.1 (v0.286): MinOrNull()/MaxOrNull() are the
+        // `T?`-returning siblings of Min()/Max() on the SAME
+        // `extension IEnumerable<T> where T: IComparable<T>` block — they
+        // were missing from this list, so a lazy/LinkedList/Range/
+        // vtable-IEnumerable/Set-family receiver fell through this whole
+        // materialize-then-run disjunction (`lazyTerminal` below stayed
+        // false) while the array arm at ~line 3734 already implements them
+        // (fix #2783). One term on the existing list, no new arm: the array
+        // arm reads `recv` via bz_array_len/bz_array_ptr_at exactly like
+        // every sibling here, so it composes unchanged over the
+        // materialized snapshot. `string` is NOT newly reachable here: a
+        // separate, sema-level closed-surface gate
+        // (common::isStringLinqOperatorMemberName,
+        // src/common/BuiltinRegistry.cpp) rejects `"s".MinOrNull()` before
+        // codegen is ever reached — a DELIBERATE exclusion recorded by #3444
+        // ("do not add the name without exercising the lowering end-to-end")
+        // and left untouched by #3735's own sibling fix; out of scope here
+        // (this lane owns only LlvmBackend_Calls.cpp / tests/codegen).
+        m == "MinOrNull" || m == "MaxOrNull";
     // issue #995 / stdlib §5 / §29.11: a vtable-backed IEnumerable<T> receiver
     // (interface-typed local/param, or a yield-method result) is materialized via
     // lowerToLazyEnumerator (driving the iterator vtable once into an Array<T>),
