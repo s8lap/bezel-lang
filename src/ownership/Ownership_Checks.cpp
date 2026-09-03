@@ -6296,8 +6296,19 @@ bool MethodOwnership::checkBorrowStoreEscape(const ast::AssignmentStmt& as,
 // conservatively left unclassified — no diagnostic — matching the "residual
 // is trust" posture the spec documents for the cases this structural check
 // cannot decide. // per §28.11
+//
+// fix #3799 (§28.11, v0.286): `fromLambdaBody` triggers the same enclosing-
+// frame retry the assignment-channel sibling (`checkBorrowStoreEscape`) uses
+// for its #3727 / #3744 leg. The body's own seed only contains locals
+// DECLARED inside the lambda body, so a borrow of an owned local declared in
+// the ENCLOSING method (`using var r := new R();` outside, `this.items.Add(r)`
+// inside) resolves to no source the first time and would silently slip past
+// the §28.11 rejection. The retry installs the enclosing frame's owned-
+// obligation facts into `states_` and re-asks the same authority, so a
+// captured owned local is correctly identified as the borrow source. See
+// `enclosingFrameOwnedLocalBorrowSource` for the helper's own declaration.
 void MethodOwnership::checkCollectionBorrowStoreEscape(
-    const ast::CallExpr& call) {
+    const ast::CallExpr& call, bool fromLambdaBody) {
     if (!call.callee) return;
     auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get());
     if (!ma || !ma->target) return;
@@ -6582,6 +6593,19 @@ void MethodOwnership::checkCollectionBorrowStoreEscape(
         } else {
             src = ownedLocalBorrowSource(*a.value, elemKinds);
         }
+        // fix #3799 (§28.11, v0.286): the lambda-body pre-pass calls this
+        // check with `fromLambdaBody=true`. The body's own seed only knows
+        // locals declared INSIDE the lambda, so a borrow of an owned local
+        // captured from the enclosing method resolves to no source above —
+        // retry with the enclosing frame installed (the SAME authority the
+        // assignment-channel sibling uses, #3727/#3744). The bulk-store arm
+        // above has its own resolution path that does not go through
+        // `ownedLocalBorrowSource` and so cannot be retried here; the bulk
+        // store's argument is a COLLECTION, which the enclosing-frame retry
+        // would not admit anyway (it is not a borrow source by #3746's
+        // measured argument — see the bulk-storing branch's own comment).
+        if (!src && fromLambdaBody && !bulkStoring)
+            src = enclosingFrameOwnedLocalBorrowSource(*a.value, elemKinds);
         if (!src) continue;
         bool reject = false;
         if (kind == RecvKind::Escapes) {
@@ -6751,9 +6775,18 @@ void MethodOwnership::warnSec154FreshStore(const ast::Expr& arg,
 // checkCollectionBorrowStoreEscape's receiver classification, applied to the
 // indexer target's collection. Owning-collection / inline-array indexer sets
 // TAKE owned (the §28.11 owning-slot path in handleAssignment) — a transfer, not
-// a borrow store — and are excluded. Returns true when it reported. // per §28.11
+// a borrow store — and are excluded. Returns true when it reported.
+//
+// fix #3799 (§28.11, v0.286): `fromLambdaBody` triggers the same enclosing-
+// frame retry `checkCollectionBorrowStoreEscape` now performs — the body's
+// own seed only knows locals declared INSIDE the lambda, so a borrow of an
+// owned local captured from the enclosing method resolves to no source the
+// first time and would silently slip past the §28.11 rejection. See that
+// function's comment for the full rationale. Default false preserves every
+// existing call site (handleAssignment / the method-level dataflow).
+// // per §28.11
 bool MethodOwnership::checkIndexerSetBorrowStoreEscape(
-    const ast::AssignmentStmt& as) {
+    const ast::AssignmentStmt& as, bool fromLambdaBody) {
     if (as.op != ":=" || !as.target || !as.value) return false;
     const auto* ix = dynamic_cast<const ast::IndexExpr*>(as.target.get());
     if (!ix || !ix->target) return false;
@@ -6877,6 +6910,13 @@ bool MethodOwnership::checkIndexerSetBorrowStoreEscape(
         (kind == RecvKind::Escapes) ? OwnedSourceKinds::LocalOrOwnedParam
                                     : OwnedSourceKinds::LocalOnly;
     sema::Symbol* src = ownedLocalBorrowSource(*as.value, elemKinds);
+    // fix #3799 (§28.11, v0.286): enclosing-frame retry — see the
+    // declaration comment. Without this, an indexer-set `coll[i] := r`
+    // inside a lambda body, where `r` is a captured `using var` from the
+    // enclosing method, slips past the §28.11 rejection because the
+    // body's own `states_` does not contain `r`.
+    if (!src && fromLambdaBody)
+        src = enclosingFrameOwnedLocalBorrowSource(*as.value, elemKinds);
     if (!src) return false;
     bool reject = false;
     if (kind == RecvKind::Escapes) {

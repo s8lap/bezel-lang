@@ -521,6 +521,21 @@ public:
     // statement kind reaches it with no edit here.
     void scanLambdaBodyBorrowStores(const ast::Stmt& s);
 
+    // fix #3799 (§28.11, v0.286): the expression-bearing walker companions
+    // used by `scanLambdaBodyBorrowStores` to drive
+    // `checkCollectionBorrowStoreEscape` from inside lambda bodies. Mirrors
+    // `collectBodyLambdas` / `collectBodyLambdasExpr` shape-for-shape (the
+    // #3565 / #1919 walkers), so every expression position those admit is
+    // visited here. Never crosses into a nested lambda — a nested lambda's
+    // own stores are walked when the flat lambda list in
+    // `checkOneLambdaBodyEscapes` reaches it, with ITS body's seed.
+    void forEachBorrowStoreCallInStmt(
+        const ast::Stmt& s,
+        const std::function<void(const ast::CallExpr&)>& fn) const;
+    void forEachBorrowStoreCallInExpr(
+        const ast::Expr& e,
+        const std::function<void(const ast::CallExpr&)>& fn) const;
+
     // #2166 / §28.10 (v0.220): the `using var` borrow-pin classification
     // (`handleLocalDecl`'s `usingVarSourceIsBorrow` flag — see the #2128/#2137
     // derivation above) is set by the dataflow's `visitStmt` walk for every
@@ -2091,8 +2106,19 @@ private:
     // elsewhere, not this rule, so they are excluded. Called from
     // handleDischarge for every CallExpr; scans a builtin storing method
     // (Add/Insert/TryAdd/AddFirst/AddLast/AddBefore/AddAfter/Push/Enqueue)
-    // whose receiver is a borrowing collection. // per §28.11
-    void checkCollectionBorrowStoreEscape(const ast::CallExpr& call);
+    // whose receiver is a borrowing collection.
+    //
+    // fix #3799 (§28.11, v0.286): `fromLambdaBody` is the signal from the
+    // lambda-body pre-pass (`scanLambdaBodyBorrowStores`, the #3565 driver).
+    // When true, the function additionally retries the borrow-source query
+    // against the ENCLOSING frame (mirroring `checkBorrowStoreEscape`'s #3727
+    // / #3744 retry leg) so a borrow of a captured owned local — declared in
+    // the enclosing method, not in this lambda body — is correctly identified
+    // as a scope-bound source, exactly as the assignment-channel sibling does.
+    // Default false preserves every existing call site (visitExpr and the
+    // method-level dataflow). // per §28.11
+    void checkCollectionBorrowStoreEscape(const ast::CallExpr& call,
+                                          bool fromLambdaBody = false);
 
     // §28.11 "Storing a borrow" (hole closed #1884) — the indexer-set sibling of
     // checkCollectionBorrowStoreEscape. §28.11 lists "Add, Insert, indexer-set"
@@ -2110,8 +2136,14 @@ private:
     // It is also the indexer half of §15.4's fresh-store warning, for BOTH of
     // that section's store positions — "the indexer-set, key and value positions
     // alike" (#3395): the value always, and the index when the head is a
-    // dictionary, whose `:=` upsert retains an absent key. // per §28.11, §15.4
-    bool checkIndexerSetBorrowStoreEscape(const ast::AssignmentStmt& as);
+    // dictionary, whose `:=` upsert retains an absent key.
+    //
+    // fix #3799 (§28.11, v0.286): `fromLambdaBody` mirrors the same retry as
+    // `checkCollectionBorrowStoreEscape` above — see that function's comment
+    // for the rationale. Default false preserves every existing call site
+    // (handleAssignment / the method-level dataflow). // per §28.11, §15.4
+    bool checkIndexerSetBorrowStoreEscape(const ast::AssignmentStmt& as,
+                                          bool fromLambdaBody = false);
 
     // §15.4 fresh-store warning (v0.243, the taken #1813 follow-on) — THE one
     // authority for it, and the reason it is a function rather than two inline

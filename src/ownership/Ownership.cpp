@@ -7690,11 +7690,232 @@ void MethodOwnership::seedLambdaBodyOwnedLocals(
 // statement grammar, which never crosses into a nested lambda — a nested
 // lambda's own assignments are walked when the flat lambda list reaches it,
 // with ITS body's seed. // per §31.1, §28.3, v0.286
+//
+// fix #3799 (§28.11, v0.286): the two §28.11 SIBLINGS of
+// `checkBorrowStoreEscape` — `checkCollectionBorrowStoreEscape` (driven from
+// `visitExpr`'s `CallExpr` arm at the method level) and
+// `checkIndexerSetBorrowStoreEscape` (driven from `handleAssignment` at the
+// method level) — were NEVER reached from inside a lambda body, because
+// ownership's statement walks do not enter one. A `this.items.Add(r)` or
+// `coll[i] := r` whose `r` is an owned scope-bound local in the lambda body
+// therefore compiled clean and heap-use-after-freed, while the byte-identical
+// METHOD-level spelling has been rejected since #1539/#1886. Drive BOTH from
+// the lambda-body pre-pass so the three §28.11 channels are reachable from
+// every enclosing frame:
+//   * AssignmentStmt → `checkBorrowStoreEscape` (the #3565 channel) AND
+//     `checkIndexerSetBorrowStoreEscape` (mutually exclusive by target shape —
+//     IndexExpr vs member/identifier — so no duplicate diagnostic).
+//   * Every `CallExpr` reachable through the statement's expression-bearing
+//     positions → `checkCollectionBorrowStoreEscape`. The check itself bails on
+//     non-storing calls, so walking every CallExpr is safe.
+//
+// Mirrors `handleAssignment` / `visitExpr`'s call pattern exactly. The walker
+// never crosses into a nested lambda — a nested lambda's own stores are
+// walked when the flat lambda list reaches it, with ITS body's seed (same
+// #3656 grammar as above). // per §28.11, v0.286
 void MethodOwnership::scanLambdaBodyBorrowStores(const ast::Stmt& s) {
     forEachNestedStmt(s, [this](const ast::Stmt& cur) {
-        if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&cur))
+        if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&cur)) {
             checkBorrowStoreEscape(*as, EscapeScope::LambdaBody);
+            // §28.11 indexer-set sink — see fix #3799 above. The check is a
+            // no-op on a non-IndexExpr target (it bails in its first guard),
+            // so running it on every AssignmentStmt alongside the #3565 call
+            // costs nothing. `fromLambdaBody=true` triggers the enclosing-
+            // frame retry so a captured owned local resolves as a source.
+            checkIndexerSetBorrowStoreEscape(*as, /*fromLambdaBody=*/true);
+        }
+        // §28.11 storing-method-CALL sink — see fix #3799 above. Walk the
+        // statement's expression-bearing positions and call the check on every
+        // reachable CallExpr; the check itself bails on non-storing methods.
+        // `fromLambdaBody=true` triggers the enclosing-frame retry for the
+        // same reason as above.
+        forEachBorrowStoreCallInStmt(cur, [this](const ast::CallExpr& call) {
+            checkCollectionBorrowStoreEscape(call, /*fromLambdaBody=*/true);
+        });
     });
+}
+
+// fix #3799 (§28.11, v0.286): the expression-bearing walker companion to
+// `forEachNestedStmt`, used by `scanLambdaBodyBorrowStores` to drive
+// `checkCollectionBorrowStoreEscape` from inside lambda bodies. Reuses the
+// exact same statement / expression grammar as `collectBodyLambdas` /
+// `collectBodyLambdasExpr` (the #3565 / #1919 walkers) so every expression
+// position those admit is visited here. The walker never crosses into a
+// nested lambda (`collectBodyLambdasExpr` records the lambda and descends
+// into ITS body, but THIS walker stops at the lambda boundary — the nested
+// lambda's own statements are walked when the flat lambda list in
+// `checkOneLambdaBodyEscapes` reaches it, with ITS body's seed). Mirrors the
+// `collectBodyLambdas` shape-for-shape so a future addition to that walker
+// (a new statement or expression kind) is one site to update here too.
+void MethodOwnership::forEachBorrowStoreCallInStmt(
+        const ast::Stmt& s,
+        const std::function<void(const ast::CallExpr&)>& fn) const {
+    if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
+        if (ld->initializer) forEachBorrowStoreCallInExpr(*ld->initializer, fn);
+        return;
+    }
+    if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(&s)) {
+        if (lc->value) forEachBorrowStoreCallInExpr(*lc->value, fn);
+        return;
+    }
+    if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&s)) {
+        if (rs->value) forEachBorrowStoreCallInExpr(*rs->value, fn);
+        return;
+    }
+    if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(&s)) {
+        if (es->expr) forEachBorrowStoreCallInExpr(*es->expr, fn);
+        return;
+    }
+    if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&s)) {
+        if (as->target) forEachBorrowStoreCallInExpr(*as->target, fn);
+        if (as->value) forEachBorrowStoreCallInExpr(*as->value, fn);
+        return;
+    }
+    if (auto* ts = dynamic_cast<const ast::ThrowStmt*>(&s)) {
+        if (ts->value) forEachBorrowStoreCallInExpr(*ts->value, fn);
+        return;
+    }
+    if (auto* is = dynamic_cast<const ast::IncrementStmt*>(&s)) {
+        if (is->target) forEachBorrowStoreCallInExpr(*is->target, fn);
+        return;
+    }
+    if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(&s)) {
+        if (ds->value) forEachBorrowStoreCallInExpr(*ds->value, fn);
+        return;
+    }
+    if (auto* ys = dynamic_cast<const ast::YieldStmt*>(&s)) {
+        if (ys->value) forEachBorrowStoreCallInExpr(*ys->value, fn);
+        return;
+    }
+    if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&s)) {
+        if (ifs->ifBranch.condition)
+            forEachBorrowStoreCallInExpr(*ifs->ifBranch.condition, fn);
+        return;
+    }
+    if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&s)) {
+        if (ws->condition) forEachBorrowStoreCallInExpr(*ws->condition, fn);
+        return;
+    }
+    if (auto* fs = dynamic_cast<const ast::ForStmt*>(&s)) {
+        if (fs->iterable) forEachBorrowStoreCallInExpr(*fs->iterable, fn);
+        if (fs->withExpr) forEachBorrowStoreCallInExpr(*fs->withExpr, fn);
+        return;
+    }
+    if (auto* cs = dynamic_cast<const ast::CaseStmt*>(&s)) {
+        if (cs->scrutinee) forEachBorrowStoreCallInExpr(*cs->scrutinee, fn);
+        for (const auto& arm : cs->arms) {
+            if (arm.guard) forEachBorrowStoreCallInExpr(*arm.guard, fn);
+            if (arm.exprBody) forEachBorrowStoreCallInExpr(*arm.exprBody, fn);
+        }
+        return;
+    }
+    // Break / Continue: no child expressions.
+}
+
+void MethodOwnership::forEachBorrowStoreCallInExpr(
+        const ast::Expr& e,
+        const std::function<void(const ast::CallExpr&)>& fn) const {
+    if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(&e)) {
+        // Nested-lambda boundary: do NOT descend. The flat lambda list in
+        // `checkOneLambdaBodyEscapes` walks this nested lambda with its own
+        // body's seed; mixing them here would re-walk it with the outer body
+        // and double-report.
+        (void)lam;
+        return;
+    }
+    if (auto* ce = dynamic_cast<const ast::CallExpr*>(&e)) {
+        fn(*ce);
+        if (ce->callee) forEachBorrowStoreCallInExpr(*ce->callee, fn);
+        for (const auto& a : ce->args)
+            if (a.value) forEachBorrowStoreCallInExpr(*a.value, fn);
+        return;
+    }
+    if (auto* nc = dynamic_cast<const ast::NullCondCallExpr*>(&e)) {
+        // NullCondCallExpr is a CALL form for §28.11 too — its receiver and
+        // arguments can hold storing-method calls. Visit each argument and
+        // the callee; the NullCondCallExpr itself is not a `CallExpr`, so
+        // the receiver pattern below does not fire for it directly.
+        if (nc->callee) forEachBorrowStoreCallInExpr(*nc->callee, fn);
+        for (const auto& a : nc->args)
+            if (a.value) forEachBorrowStoreCallInExpr(*a.value, fn);
+        return;
+    }
+    if (auto* ne = dynamic_cast<const ast::NewExpr*>(&e)) {
+        for (const auto& a : ne->args)
+            if (a.value) forEachBorrowStoreCallInExpr(*a.value, fn);
+        return;
+    }
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+        if (ma->target) forEachBorrowStoreCallInExpr(*ma->target, fn);
+        return;
+    }
+    if (auto* nm = dynamic_cast<const ast::NullCondMemberExpr*>(&e)) {
+        if (nm->target) forEachBorrowStoreCallInExpr(*nm->target, fn);
+        return;
+    }
+    if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&e)) {
+        if (ix->target) forEachBorrowStoreCallInExpr(*ix->target, fn);
+        for (const auto& a : ix->indices)
+            if (a.value) forEachBorrowStoreCallInExpr(*a.value, fn);
+        return;
+    }
+    if (auto* be = dynamic_cast<const ast::BinaryExpr*>(&e)) {
+        if (be->left) forEachBorrowStoreCallInExpr(*be->left, fn);
+        if (be->right) forEachBorrowStoreCallInExpr(*be->right, fn);
+        return;
+    }
+    if (auto* un = dynamic_cast<const ast::UnaryExpr*>(&e)) {
+        if (un->operand) forEachBorrowStoreCallInExpr(*un->operand, fn);
+        return;
+    }
+    if (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(&e)) {
+        if (pb->operand) forEachBorrowStoreCallInExpr(*pb->operand, fn);
+        return;
+    }
+    if (auto* tt = dynamic_cast<const ast::TypeTestExpr*>(&e)) {
+        if (tt->operand) forEachBorrowStoreCallInExpr(*tt->operand, fn);
+        return;
+    }
+    if (auto* cd = dynamic_cast<const ast::ConditionalExpr*>(&e)) {
+        if (cd->condition) forEachBorrowStoreCallInExpr(*cd->condition, fn);
+        if (cd->thenValue) forEachBorrowStoreCallInExpr(*cd->thenValue, fn);
+        if (cd->elseValue) forEachBorrowStoreCallInExpr(*cd->elseValue, fn);
+        return;
+    }
+    if (auto* th = dynamic_cast<const ast::ThrowExpr*>(&e)) {
+        if (th->operand) forEachBorrowStoreCallInExpr(*th->operand, fn);
+        return;
+    }
+    if (auto* we = dynamic_cast<const ast::WithExpr*>(&e)) {
+        if (we->source) forEachBorrowStoreCallInExpr(*we->source, fn);
+        for (const auto& ia : we->assigns)
+            if (ia.value) forEachBorrowStoreCallInExpr(*ia.value, fn);
+        return;
+    }
+    if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(&e)) {
+        for (const auto& k : cl->keys)
+            if (k) forEachBorrowStoreCallInExpr(*k, fn);
+        for (const auto& el : cl->elements)
+            if (el) forEachBorrowStoreCallInExpr(*el, fn);
+        return;
+    }
+    if (auto* isx = dynamic_cast<const ast::InterpolatedStringExpr*>(&e)) {
+        for (const auto& part : isx->parts)
+            if (part.expr) forEachBorrowStoreCallInExpr(*part.expr, fn);
+        return;
+    }
+    if (auto* cx = dynamic_cast<const ast::CaseExpr*>(&e)) {
+        if (cx->scrutinee) forEachBorrowStoreCallInExpr(*cx->scrutinee, fn);
+        for (const auto& arm : cx->arms) {
+            if (arm.guard) forEachBorrowStoreCallInExpr(*arm.guard, fn);
+            if (arm.exprBody) forEachBorrowStoreCallInExpr(*arm.exprBody, fn);
+        }
+        return;
+    }
+    // Literals / identifiers / typeof / nameof / default / unit / bind /
+    // range: no child expressions that can hold a storing-method CallExpr.
+    // (Bind / range do have child expressions, but those children never carry
+    // a storing-method call either; consistent with `collectBodyLambdasExpr`.)
 }
 
 // fix #3571: a thin `scanReturnsIn` leaf, firing `checkClosureEscapesOnReturn`
