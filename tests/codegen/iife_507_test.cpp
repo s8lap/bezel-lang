@@ -300,3 +300,112 @@ BEZEL_TEST(codegen_iife_507, control_no_arg_lambda_in_local_27_3) {
         "  end Main; "
         "end C;"), 99);
 }
+
+// ---------------------------------------------------------------------------
+// §27.3 / §27.4 — fix #3797: IIFE unannotated-param type inference
+// ---------------------------------------------------------------------------
+//
+// Per §27.4: "When the lambda's target type is known from context, parameter
+// type annotations may be omitted." For an immediately-invoked lambda
+// `(lambda(params) => body)(args)`, the target type IS the call's argument
+// types. Pre-fix #3797, sema did not thread the per-argument types into the
+// IIFE callee (the argument-visiting loop runs after the callee visit), so
+// each unannotated lambda param had `resolvedDeclType == null`; codegen's
+// IIFE bypass built the LLVM function type from the actual argument VALUES
+// (correct for the call signature) but `lowerLambda` inside the body fell
+// back to `i32` for every untyped param — producing a type mismatch between
+// the body's parameter slots and the call-site argument types, and a silent
+// wrong value (`0` / default).
+//
+// Fix #3797: in `ExprTypecheck_Exprs.cpp`'s CallExpr visit, when the callee
+// is a bare LambdaExpr, peek each argument's type by visiting it BEFORE the
+// callee and seed `pendingLambdaParamTypes_` so the lambda visitor consumes
+// the real per-parameter types (the same thread that typed-local init /
+// argument-lambda paths already use, #829 / #3756).
+//
+// The IIFE result's own exprType is also now populated by typeCall's
+// `!calleeSym` branch (`ctx_.exprType(*ce.callee)->funcReturn`), so member
+// access on the IIFE result lowers correctly (the pre-#3797 `#3079` guard
+// fired for `r.ToString()` when the result had no sema type).
+
+// §27.4 / fix #3797: the issue's headline repro. An unannotated `b: string`
+// typed by the arg `"hello"`; `b.Length` reads the string's length (5), NOT
+// the i32-defaulted slot's bytes (0). Pre-fix: returned 0, no diagnostic.
+BEZEL_TEST(codegen_iife_507, iife_mixed_unannotated_params_member_access_27_4) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public static method Main(): int "
+        "    return (lambda(a, b) => b.Length)(3, \"hello\"); "
+        "  end Main; "
+        "end C;"), 5);
+}
+
+// §27.4 / fix #3797: the issue's positive case (homogeneous-typed IIFE with
+// the result consumed via `.ToString()`). Pre-fix: the IIFE call result had
+// no sema type, so `.ToString()` failed to lower (`internal: ... #3079`)
+// and the line was silently dropped — the program exited 0 with no output.
+// Post-fix: prints "10".
+BEZEL_TEST(codegen_iife_507, iife_unannotated_result_member_access_27_4) {
+    // runAotOut strips the trailing newline (lane-rules §15); r.stdoutText
+    // captured directly would carry it.
+    std::string out = bezel::test::runAotOut(
+        "module M; import System; class C "
+        "  public static method Main(): int "
+        "    var r := (lambda(x) => x * 2)(5); "
+        "    Console.WriteLine(r.ToString()); "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_EQ(out, std::string("10"));
+}
+
+// §27.4 / fix #3797: control — an annotated IIFE of the same shape still
+// works (regression guard against the fix narrowing an already-correct path).
+BEZEL_TEST(codegen_iife_507, iife_mixed_annotated_params_control_27_4) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public static method Main(): int "
+        "    return (lambda(a: int, b: string) => b.Length)(3, \"hello\"); "
+        "  end Main; "
+        "end C;"), 5);
+}
+
+// §27.4 / fix #3797: a single-param IIFE whose body uses a member-access on
+// the unannotated param — exercises the same fix path on the simplest shape
+// (a single positional arg, no second param to confuse the index alignment).
+BEZEL_TEST(codegen_iife_507, iife_single_unannotated_param_member_access_27_4) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public static method Main(): int "
+        "    return (lambda(s) => s.Length)(\"world\"); "
+        "  end Main; "
+        "end C;"), 5);
+}
+
+// §27.4 / fix #3797: three-param mixed-type IIFE — first arg drives an int
+// expression, second drives a string.Length, third drives another int
+// expression — to confirm positional alignment survives beyond two params.
+BEZEL_TEST(codegen_iife_507, iife_three_unannotated_params_mixed_27_4) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public static method Main(): int "
+        "    return (lambda(a, b, c) => a + b.Length + c)(1, \"abc\", 100); "
+        "  end Main; "
+        "end C;"), 104);
+}
+
+// §27.4 / fix #3797: IIFE where the body calls a method on the unannotated
+// string param (`.ToUpper()` is a stdlib §2.3 string member), not just
+// reads a primitive field — confirms the seeded TypeRef is propagated
+// far enough for arbitrary member-call resolution, not just field loads.
+BEZEL_TEST(codegen_iife_507, iife_unannotated_param_method_call_27_4) {
+    std::string out = bezel::test::runAotOut(
+        "module M; import System; class C "
+        "  public static method Main(): int "
+        "    var s := (lambda(s) => s.ToUpper())((\"hi\")); "
+        "    Console.WriteLine(s); "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_EQ(out, std::string("HI"));
+}

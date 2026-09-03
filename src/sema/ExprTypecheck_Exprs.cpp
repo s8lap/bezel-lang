@@ -6730,27 +6730,63 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         std::ptrdiff_t savedArity = currentCallArity_;
         currentCallArity_ =
             static_cast<std::ptrdiff_t>(ce->args.size());
+        // fix #3797 (§27.3 / §27.4, v0.286): for an immediately-invoked
+        // lambda (`(lambda(params) => body)(args)`), the call's argument
+        // types ARE the target-type context §27.4 names ("when the lambda's
+        // target type is known from context, parameter type annotations
+        // may be omitted"). Peek each argument's type by visiting it BEFORE
+        // the callee and seed `pendingLambdaParamTypes_` so the lambda's
+        // unannotated params consume the corresponding arg types — the
+        // standard thread typed-local init / argument-lambda paths already
+        // use (#829 / #3756). Saved/restored so a nested call's
+        // pendingLambdaParamTypes_ does not leak into the outer call.
+        //
+        // Without this, the IIFE compiles clean and runs with the wrong
+        // value: codegen's IIFE bypass builds the LLVM function type from
+        // the actual argument VALUES (correct for the call signature), but
+        // lowerLambda inside the body falls back to i32 for every
+        // unannotated param (no resolvedDeclType was set by sema), so the
+        // body's references read the wrong bytes — measured:
+        // `(lambda(a, b) => b.Length)(3, "hello")` returns 0 instead of
+        // 5. The IIFE callee visit below also no longer needs the
+        // narrow-#3756 "context exists, but exact types not threaded"
+        // carve-out: the per-parameter seeding below carries the real
+        // types, so the lambda body's member/operator resolution sees real
+        // types.
+        std::vector<TypeRef*> savedIifeParams = pendingLambdaParamTypes_;
+        if (ce->callee &&
+            dynamic_cast<const ast::LambdaExpr*>(ce->callee.get())) {
+            std::vector<TypeRef*> iifeParamTypes;
+            iifeParamTypes.reserve(ce->args.size());
+            for (const auto& a : ce->args) {
+                if (a.value) {
+                    visitExpr(*a.value);
+                    iifeParamTypes.push_back(ctx_.exprType(*a.value));
+                } else {
+                    iifeParamTypes.push_back(nullptr);
+                }
+            }
+            pendingLambdaParamTypes_ = std::move(iifeParamTypes);
+        }
         // narrow #3756 (§27.3 / §27.4, v0.286): an immediately-invoked
         // lambda (`(lambda(x) => ...)(args)`) is the CALLEE of this
         // CallExpr, not one of its arguments — the argument-visiting loop's
         // `pendingLambdaArgContext_ = true` (below, for each `a.value`)
         // never reaches a lambda sitting in callee position, so #3756's new
         // terminal reject fired here even though the call's own arguments
-        // are exactly the target-type context §27.4 asks for ("when the
-        // lambda's target type is known from context, parameter type
-        // annotations may be omitted"). Treat a bare-LambdaExpr callee the
-        // same way a call-argument lambda is treated: a context exists,
-        // even though this pass does not thread the arguments' exact
-        // per-parameter types here (codegen's own IIFE path in `lowerCall`
-        // already types the closure's parameters from the actual argument
-        // values at the LLVM level — see tests/codegen/iife_507_test.cpp —
-        // so no diagnostic is warranted). Saved/restored so a nested IIFE
-        // argument's own callee-visit does not leak here.
+        // are exactly the target-type context §27.4 asks for. Treat a bare-
+        // LambdaExpr callee the same way a call-argument lambda is treated:
+        // a context exists. Saved/restored so a nested IIFE argument's own
+        // callee-visit does not leak here. (fix #3797 above threads the
+        // real per-parameter types; this flag is the boolean "context
+        // exists" companion that suppresses the §27.4 top-level-only
+        // diagnostic for IIFE callees whose args we just visited.)
         bool savedArgCtxIifeCallee = pendingLambdaArgContext_;
         if (dynamic_cast<const ast::LambdaExpr*>(ce->callee.get()))
             pendingLambdaArgContext_ = true;
         if (ce->callee) visitExpr(*ce->callee);
         pendingLambdaArgContext_ = savedArgCtxIifeCallee;
+        pendingLambdaParamTypes_ = savedIifeParams;
         currentCallArity_ = savedArity;
         calleeOfCallCtx_ = savedCallee;
         // per §24.3: an event-handler argument (`<event>.Subscribe(h)` / .Add /
