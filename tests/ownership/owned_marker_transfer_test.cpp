@@ -1,12 +1,16 @@
-// Spec-derived tests for the v0.169 call-site transfer marker (#1348).
+// Spec-derived tests for the v0.169 call-site transfer marker (#1348), kept
+// up to date as the marker spelling respelled to `M(move x)` at v0.286
+// (fix #3783; §22.3 / §28.8.1).
 //
-// §22.3 (v0.169): "when the argument is a **named owned binding** — an owned
+// §22.3 (v0.286): "when the argument is a **named owned binding** — an owned
 // local or an `owned` parameter, which the call leaves moved-from — the caller
-// writes `owned` at the call site: `M(owned x)`. A **fresh producer** — a `new`
+// writes the transfer marker at the call site: `M(move x)` (an identifier-
+// operand `move` expression, §28.8.1 — the marker is part of the argument
+// expression, not an argument modifier). A **fresh producer** — a `new`
 // expression, a call returning `owned T`, an operator result, or a `move
 // obj._field` — stays unmarked ... Omitting the marker on a named owned binding
-// is a compile error ... writing it on a borrow, a fresh producer, or a
-// non-`owned` parameter position is likewise an error."
+// is a compile error naming the fix ... writing it on a borrow, a fresh
+// producer, or a non-`owned` parameter position is likewise an error."
 //
 // The marker is SURFACE-ONLY: §28.8 ownership transfer is unchanged; the pass
 // already models the move. These tests pin the required/rejected SPELLING both
@@ -109,7 +113,8 @@ BEZEL_TEST(owned_marker, owned_param_marked_accepted) {
 }
 
 // REJECT: the bare named owned binding — missing marker — is an error naming
-// the fix (`write \`M(owned x)\``).
+// the fix (`write \`M(move x)\``; v0.286 §22.3; the v0.169 spelling was
+// `M(owned x)`, fix #3783).
 BEZEL_TEST(owned_marker, bare_named_owned_local_missing_marker_rejected) {
     auto r = parseAndCheckOwnership(mod(
         "class C public method M(s: Sink) "
@@ -117,7 +122,7 @@ BEZEL_TEST(owned_marker, bare_named_owned_local_missing_marker_rejected) {
         "end M; end C;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(errorSays(r, "this call consumes `x`"));
-    BEZEL_EXPECT_TRUE(errorSays(r, "write `M(owned x)`"));
+    BEZEL_EXPECT_TRUE(errorSays(r, "write `M(move x)`"));
 }
 
 // REJECT: a bare `owned` PARAMETER without the marker is likewise missing it.
@@ -332,7 +337,7 @@ BEZEL_TEST(owned_marker, fire_and_forget_unmarked_named_task_missing_marker_1890
     auto r = parseAndCheckOwnership(fafMod("Task.FireAndForget(t);"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(errorSays(r, "this call consumes `t`"));
-    BEZEL_EXPECT_TRUE(errorSays(r, "write `M(owned t)`"));
+    BEZEL_EXPECT_TRUE(errorSays(r, "write `M(move t)`"));
 }
 
 // ACCEPT: the fresh-producer form `Task.FireAndForget(Ping())` stays UNMARKED —

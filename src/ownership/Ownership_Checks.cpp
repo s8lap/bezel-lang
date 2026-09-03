@@ -8010,10 +8010,10 @@ void MethodOwnership::reportMissingOwnedMarker(std::string_view name,
                                                SourceLocation loc) {
     report(Severity::Error, loc,
            std::string("this call consumes `") + std::string(name) +
-               "`; write `M(owned " + std::string(name) +
+               "`; write `M(move " + std::string(name) +
                ")` — passing the named owned binding `" + std::string(name) +
                "` to an `owned` parameter transfers ownership and leaves it "
-               "moved-from, which the call site must announce (§22.3, v0.169)");
+               "moved-from, which the call site must announce (§22.3, v0.286)");
 }
 
 void MethodOwnership::reportSpuriousOwnedMarker(SourceLocation loc,

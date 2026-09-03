@@ -27,4 +27,4 @@ class Base(owned r: Res)
   end Id;
 end Base;
 
-// CHECK: :{{[0-9]+}}:{{[0-9]+}}: this call consumes `x`; write `M(owned x)` — passing the named owned binding `x` to an `owned` parameter transfers ownership and leaves it moved-from, which the call site must announce (§22.3
+// CHECK: :{{[0-9]+}}:{{[0-9]+}}: this call consumes `x`; write `M(move x)` — passing the named owned binding `x` to an `owned` parameter transfers ownership and leaves it moved-from, which the call site must announce (§22.3
