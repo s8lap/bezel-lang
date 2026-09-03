@@ -84,6 +84,16 @@
 // filed as #2524). T7 is therefore a COMPILE-STABILITY control,
 // not a value regression. The layout-aliasing regressions (T1-T6) are
 // the authoritative fail-without/pass-with tests for this fix.
+//
+// UPDATE (fix #3736, v0.286, LANE_RULES Â§7): the "value-replay gap"
+// this SCOPE section names above was closed for a private RECORD
+// auto-property by fix #3736 (the Property twin of fix #3723's
+// identical widening for a private record FIELD). T6's row below was
+// updated from the deferred-gap `9` (0 replayed) to the spec-correct
+// `50` (41 replayed) accordingly â see T6's own header comment for the
+// measured before/after. This file's #2473 fix itself (the anti-
+// aliasing SLOT-visibility widening) is untouched and unaffected;
+// only the value that was always known to be a deferred gap changed.
 
 #include <cstdio>
 #include <cstdlib>
@@ -397,16 +407,41 @@ BEZEL_TEST(xmod_private_auto_property_layout_import_2473,
 // exporter's real layout offset.
 //
 // ⚠ runAot's exit code is WEXITSTATUS-masked to 8 bits (lane protocol):
-// pre-fix, W never crosses the wire (private auto-prop filtered), so the
-// importer's record reconstruction has only `x` in `t->members`, the
-// exporter's compiled `GetW` (which reads the exporter's offset for W —
-// struct index 0, since a record's body members precede its positional
-// fields in `t->members`) reads `x`'s slot instead, returning 9, and
-// `r.x + h` was `9 + 9 = 18`; post-fix W's slot crosses for layout
-// (value stripped per the layout-only contract, mirroring #2468 — the
-// private-member value-replay gap is the same #2467 follow-up), so
-// `GetW` reads W's own (zero-initialized) slot and `r.x + h` is `9 + 0
-// = 9`. Both the corrupted 18 and the correct 9 are distinguishable.
+// pre-#2473, W never crossed the wire at all (private auto-prop
+// filtered), so the importer's record reconstruction had only `x` in
+// `t->members`, the exporter's compiled `GetW` (which reads the
+// exporter's offset for W — struct index 0, since a record's body
+// members precede its positional fields in `t->members`) read `x`'s
+// slot instead, returning 9 — the ALIASING bug this test's own name
+// pins: `r.x + h` was `9 + 9 = 18`. #2473 (this file) made W's SLOT
+// cross for layout, ending the aliasing; #2473's own scope note said
+// the value itself stayed a deferred gap ("value-replay is #2467's
+// follow-up" — value NOT replayed, W's slot zero-initialized, `r.x + h`
+// was `9 + 0 = 9`), and this row pinned that intermediate state.
+//
+// fix #3736 (§9.2 / §22.8 step 2 / §2.8.2, v0.286) closed exactly that
+// deferred gap: ModuleMetadataBuilder.cpp's PropertySymbol branch now
+// carries a non-static auto-property's initializer text via the SAME
+// `fieldInitText` wire slot fix #3723 already carries a private RECORD
+// FIELD's initializer through (this file's own `includeForLayout`
+// gate, `!isGenericMonomorphized && t.kind != Record` — a record has no
+// `bz$<Type>$init` at any visibility, so #3723 already made the
+// analogous PLAIN-FIELD case replay for records, see
+// xmod_non_generic_record_field_init_replay_3723_test.cpp T6). §9.2
+// requires an auto-property's initializer to run once at construction
+// exactly like a field's; there is no visibility carve-out in §22.8's
+// storage-layout rule or §9.2's construction rule, so a PRIVATE
+// auto-property is not a distinct case from a private FIELD here.
+// MEASURED (this row's own fix-forward investigation, copy-reverting
+// ModuleMetadataBuilder.cpp/ModuleLoader.cpp/ModuleMetadata.cpp to their
+// pre-#3736 state and rebuilding): pre-#3736, `x=9, h=0` (this row's old
+// pin); post-#3736, `x=9, h=41` — `x` is IDENTICAL in both trees (the
+// #2473 anti-aliasing fix this file is about is untouched by #3736;
+// there is no aliasing regression), only `h` (W's replayed value)
+// changes, from the deferred-gap `0` to the spec-correct `41`. So this
+// row's `9` was pinning a KNOWN, explicitly-documented-as-incomplete
+// intermediate state, not a final correct answer — per LANE_RULES §7,
+// updated here to the now-correct `r.x + h = 9 + 41 = 50`.
 // ===========================================================================
 BEZEL_TEST(xmod_private_auto_property_layout_import_2473,
            record_method_call_does_not_alias_positional_field_9_2_22_8) {
@@ -425,7 +460,12 @@ BEZEL_TEST(xmod_private_auto_property_layout_import_2473,
         "  end Main; "
         "end C2473T6;");
     if (r == -2) return;
-    BEZEL_EXPECT_EQ(r, 9);  // 9 + 0 — W's slot visible but value-replay is #2467's gap
+    // §9.2/§22.8: `x` stays 9 (no aliasing, this row's own #2473 claim,
+    // unaffected by #3736 — verified by direct instrumentation, see this
+    // row's header comment); `h` is now 41 (W's initializer correctly
+    // replayed by fix #3736, closing the deferred value-replay gap
+    // #2473's own scope note left open).
+    BEZEL_EXPECT_EQ(r, 50);  // 9 + 41
 }
 
 // ===========================================================================
