@@ -3998,7 +3998,12 @@ private:
     // True when the call's formal at `argPos` is `scoped`. Resolves user
     // methods/ctors via sema symbols, builtin TaskScope.Spawn by receiver
     // type name, and function-VALUE callees via their Function TypeRef.
+    //
+    // fix #3785 (§22.5 / §28.14, v0.286): the METHOD arm reads the
+    // §22.5-BOUND formal, not the source position — passing the call's
+    // argument list lets it look the bound formal up by name.
     bool scopedFormalAt(const ast::Expr* callee, const ast::NewExpr* ne,
+                        const std::vector<ast::CallArgument>* args,
                         std::size_t argPos);
 
     // §24.3 / stdlib §6.5, §6.1 (v0.175 signatures; enforced per #1420): true
@@ -4176,8 +4181,13 @@ private:
     // signatures), function-value callees, and unresolved callees stay on the
     // legacy caller-side rejection — the stdlib-certified path §28.14 v0.177
     // records. // per §28.14, §28.3 (v0.177)
+    //
+    // fix #3785 (§22.5 / §28.14, v0.286): the METHOD arm reads the
+    // §22.5-BOUND formal, not the source position — passing the call's
+    // argument list lets it look the bound formal up by name.
     bool verifiedCallBoundedFormalAt(const ast::Expr* callee,
                                      const ast::NewExpr* ne,
+                                     const std::vector<ast::CallArgument>* args,
                                      std::size_t argPos);
 
     // -- §28.14 v0.179 (#1527): call-bounded × TASK-ABANDONMENT escape sink --

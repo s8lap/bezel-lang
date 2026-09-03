@@ -3225,7 +3225,7 @@ void MethodOwnership::checkClosureEscapesOnReturn(const ast::Expr& e,
                     const auto& a = ce->args[i];
                     if (!a.value) continue;
                     if (verifiedCallBoundedFormalAt(ce->callee.get(), nullptr,
-                                                    i))
+                                                    &ce->args, i))
                         continue;
                     findLambdas(*a.value);
                 }
@@ -3235,7 +3235,7 @@ void MethodOwnership::checkClosureEscapesOnReturn(const ast::Expr& e,
                 for (std::size_t i = 0; i < ne->args.size(); ++i) {
                     const auto& a = ne->args[i];
                     if (!a.value) continue;
-                    if (verifiedCallBoundedFormalAt(nullptr, ne, i)) continue;
+                    if (verifiedCallBoundedFormalAt(nullptr, ne, &ne->args, i)) continue;
                     findLambdas(*a.value);
                 }
                 return;
@@ -14183,7 +14183,7 @@ void MethodOwnership::scopedPreScanExpr(const ast::Expr& e) {
                     if (sema::Symbol* osym = ctx_.exprSymbol(*oid))
                         scopedAssignedSyms_.insert(osym);
             }
-            if (scopedFormalAt(callee, ne, i))
+            if (scopedFormalAt(callee, ne, args, i))
                 scopedAdmissionQueue_.push_back(
                     {&e, callee, ne, a.value.get()});
             scopedPreScanExpr(*a.value);
@@ -14387,6 +14387,7 @@ void MethodOwnership::checkExternOutCallbackCapture(
 
 bool MethodOwnership::scopedFormalAt(const ast::Expr* callee,
                                      const ast::NewExpr* ne,
+                                     const std::vector<ast::CallArgument>* args,
                                      std::size_t argPos) {
     // Constructor form: match the ctor by arg count (as recordMovesIn does).
     //
@@ -14420,21 +14421,30 @@ bool MethodOwnership::scopedFormalAt(const ast::Expr* callee,
     }
     if (!callee) return false;
     // User method: the resolved MethodSymbol's formals carry the modifier.
-    // KNOWN-GAP: #3785 (§22.5 / §28.14) — this arm still reads the SOURCE
-    // position, because the METHOD call's argument list is not passed to this
-    // function (only the `ne` arm above carries one). Fixing it is a signature
-    // change across three callers and belongs to the §28.14 named-argument
-    // family, not to #3779's constructor one; filed with a measured repro.
-    // A negative here FALLS THROUGH to the builtin arms below rather than
-    // returning — the pre-#3176 code reached them whenever `ms->decl` was not
-    // an ast::MethodDecl, and a stdlib `scoped` position whose callee happens to
-    // resolve to a MethodSymbol must keep its answer.
+    // fix #3785 (§22.5 / §28.14, v0.286): read the BOUND formal, not the
+    // source position — `m(b := "x", a := 1)` against `m(a, b)` would
+    // otherwise answer for `b`'s source index, where there is no `scoped`
+    // to find, and the §28.14 unverifiable-captures gate fires on `b`'s
+    // value (a non-`scoped` slot) when it should be skipped at the BOUND
+    // slot `a` (which IS `scoped`). // per §22.5, §28.14
     {
         const CalleeFormals formals = resolveCalleeParams(callee, ctx_);
-        if (formals.methSym && argPos < formals.size() &&
-            formals.modifier(argPos) == "scoped")
-            return true;
+        if (formals.methSym) {
+            // fix #3785: the callee resolves to a MethodSymbol, so the
+            // Function-Value arm below is the WRONG authority (it would
+            // re-read the source position against the same parameter list
+            // — the same bug, with a different name). Return the gate's
+            // verdict against the §22.5-BOUND formal.
+            if (!args) return false;
+            const std::size_t bp = boundFormalIndex(*args, argPos, formals);
+            return bp < formals.size() && formals.modifier(bp) == "scoped";
+        }
     }
+    // The builtin / function-value arms below apply only to callees that did
+    // NOT resolve to a MethodSymbol — a true function-value callee (`var g:
+    // (scoped () -> Task) -> ()` … `g(cb)`) carries its own `scoped`
+    // positions, and a TaskScope.Spawn / Subscribe / Register callee encodes
+    // a stdlib-declared `scoped` handler.
     // Builtin: TaskScope.Spawn(scoped body: () -> Task) — stdlib §6.10.
     if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(callee)) {
         if (ma->member == "Spawn" && argPos == 0 && ma->target &&
@@ -15520,7 +15530,7 @@ void MethodOwnership::scopedCalleeWalkExpr(const ast::Expr& e) {
                 // construction": "may forward it only to another `scoped`
                 // parameter with the same bounding object") forwards.
                 bool formalScoped =
-                    scopedFormalAt(ce->callee.get(), nullptr, i);
+                    scopedFormalAt(ce->callee.get(), nullptr, &ce->args, i);
                 bool onThis = false;
                 if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
                         ce->callee.get())) {
@@ -15831,6 +15841,7 @@ bool MethodOwnership::builtinCollectionStoreCallee(const ast::Expr* callee) {
 
 bool MethodOwnership::verifiedCallBoundedFormalAt(const ast::Expr* callee,
                                                   const ast::NewExpr* ne,
+                                                  const std::vector<ast::CallArgument>* args,
                                                   std::size_t argPos) {
     // A formal is a VERIFIED call-bounded position when it belongs to a
     // user-authored method/constructor (its body runs this same pre-pass),
@@ -15867,11 +15878,15 @@ bool MethodOwnership::verifiedCallBoundedFormalAt(const ast::Expr* callee,
         return bp < formals.size() && formalIsPlainFunction(formals, bp);
     }
     if (!callee) return false;
-    // KNOWN-GAP: #3785 — the METHOD arm reads the SOURCE position; see the
-    // twin note in scopedFormalAt.
+    // fix #3785 (§22.5 / §28.14, v0.286): read the BOUND formal, not the
+    // source position; see the twin note in scopedFormalAt. A `true` here
+    // SUPPRESSES the §28.14 lambda-escape scan at the caller, so a wrong
+    // true (against a non-plain-function-typed bound slot) is a silent MISS,
+    // not a false reject.
     const CalleeFormals formals = resolveCalleeParams(callee, ctx_);
-    return formals.methSym && argPos < formals.size() &&
-           formalIsPlainFunction(formals, argPos);
+    if (!formals.methSym || !args) return false;
+    const std::size_t bp = boundFormalIndex(*args, argPos, formals);
+    return bp < formals.size() && formalIsPlainFunction(formals, bp);
 }
 
 void MethodOwnership::reportCallBounded(SourceLocation loc,
@@ -16153,7 +16168,7 @@ void MethodOwnership::callBoundedWalkExpr(const ast::Expr& e) {
                 // Forward into a `scoped` position: reported by the §28.14
                 // admission (checkScopedAdmission), which sees the same call
                 // — skip the duplicate here.
-                if (scopedFormalAt(callee, ne, i)) {
+                if (scopedFormalAt(callee, ne, args, i)) {
                     // (admission owns the diagnostic)
                 } else if (collStore) {
                     // Sink: builtin-collection mutator on a receiver

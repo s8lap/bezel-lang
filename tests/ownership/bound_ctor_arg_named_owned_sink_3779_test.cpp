@@ -51,9 +51,11 @@
 // index unspellable: getting a modifier now REQUIRES passing the argument list
 // the binding is computed from.
 //
-// The METHOD arms of the two §28.14 gates keep the source index and carry a
-// `// KNOWN-GAP: #3785` — their signature receives no argument list at all.
-// B8 pins that gap so closing it fails loudly here.
+// The METHOD arms of the two §28.14 gates (#3785) were the same shape — they
+// received only a callee and a SOURCE index — and were fixed alongside #3779:
+// the same signature change (add `args` parameter), the same `boundFormalIndex`
+// access. B8 now asserts the §22.5-equivalence between the positional and
+// reordered-named spellings of one call.
 
 #include <string>
 
@@ -315,20 +317,17 @@ BEZEL_TEST(bound_ctor_arg_named_owned_sink_3779,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// B8 — KNOWN-GAP PIN for issue #3785. ⚠ THIS ROW ASSERTS A DEFECT, not correct
-// behaviour: it exists so that closing #3785 fails here and the pin is removed
-// deliberately rather than the gap being re-discovered.
-//
-// The METHOD arms of `scopedFormalAt` / `verifiedCallBoundedFormalAt` receive
-// only a callee and a SOURCE index — no argument list — so they cannot bind,
-// and the two §22.5-equivalent spellings of one call disagree: the positional
-// form draws no §28.14 unverifiable-captures diagnostic and the reordered named
-// form does. When #3785 lands, both halves below become FALSE and this row
-// must be deleted.
+// B8 — METHOD-arms pin for issue #3785 (FIXED). The METHOD arms of
+// `scopedFormalAt` / `verifiedCallBoundedFormalAt` now read the §22.5-BOUND
+// formal (look up the argument's named-binding target in the callee type's
+// parameter list), so the positional and reordered-named spellings of the
+// same call draw the same §28.14 verdicts. The pre-fix behaviour was a
+// false-positive §28.14 unverifiable-captures diagnostic on the
+// reordered-named form alone (the §22.5-equivalent spelling produced none).
 // ═══════════════════════════════════════════════════════════════════════════
-// per §22.5 / §28.14, issues #3779 and #3785
+// per §22.5 / §28.14, issue #3785
 BEZEL_TEST(bound_ctor_arg_named_owned_sink_3779,
-           known_gap_3785_method_arm_still_reads_the_source_index) {
+           method_arm_reads_the_bound_formal_not_source_index_3785) {
     const char* holder =
         "class Holder "
         "  private scoped _h: () -> int; "
@@ -358,5 +357,5 @@ BEZEL_TEST(bound_ctor_arg_named_owned_sink_3779,
         "  end Main; "
         "end C; ");
     BEZEL_EXPECT_FALSE(hasUnverifiableCaptures(positional));
-    BEZEL_EXPECT_TRUE(hasUnverifiableCaptures(named));
+    BEZEL_EXPECT_FALSE(hasUnverifiableCaptures(named));
 }
