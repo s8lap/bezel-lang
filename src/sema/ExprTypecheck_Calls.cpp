@@ -5665,68 +5665,39 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         // SortedSet here must not convert these into a new
                         // quiet failure either).
                         //
-                        // A SECOND, measured category widens this same
-                        // exclusion: several names ARE declared by stdlib §5's
-                        // `IEnumerable<T>` extension (so they are not a naming
-                        // mistake) but have no codegen dispatch arm for a
-                        // DIRECT `SortedSet<T>` receiver specifically — every
-                        // other isArrLike family reaches these through a
-                        // receiver-family-keyed direct-evaluation dispatcher
-                        // that has no SortedSet case, unlike the *lazy*
-                        // operators (`Where`/`Select`/`Skip`/`TakeWhile`/
-                        // `SkipWhile`/`Distinct`/`OrderBy`/`OrderByDescending`/
-                        // `Concat`/`Zip`/`Union`/`Intersect`/`Except`/
-                        // `GroupBy`/`ToArray`/`ToSet`/`ToDictionary`), which
-                        // all route through `lowerToLazyEnumerator`'s
-                        // SortedSet arm and were confirmed fixed by #3711.
-                        // Measured directly against this tree (probe programs,
-                        // `bezelc -c`; each without this exclusion either hit
-                        // codegen's `internal: lowerExpr returned null for
-                        // interpolated-string expression part — #1386` inside
-                        // a `Console.WriteLine($"...")`, or degraded silently
-                        // to zero via the #2434 path when assigned to a plain
-                        // local first — the exact quiet failure this issue
-                        // exists to close): `Any()`/`Any(pred)`, `All(pred)`,
-                        // `Count(pred)` (bare `Count()`/`Count` DO work — a
-                        // separate existing dispatch — so only the predicate
-                        // form is excluded here), `Sum()`/`Sum(sel)`,
-                        // `Min()`/`Min(sel)`, `Max()`/`Max(sel)`,
-                        // `Average()`/`Average(sel)`, `Aggregate(seed, fold)`,
-                        // `FirstOrNull()`, `LastOrNull()`,
-                        // `SingleOrNull(pred)`, `Single()`/`Single(pred)`,
-                        // `ElementAt(i)`, and `Reverse()` (§5's LAZY
-                        // `Reverse(): IEnumerable<T>` — even
-                        // `s.Reverse().ToArray()` degrades; splitting it
-                        // across two locals instead produces a proper "no
-                        // dispatch arm" reject, so the degrade is itself
-                        // inconsistent across equivalent-looking call shapes).
-                        // Each is a real gap in the RECEIVER-DISPATCH layer
-                        // (owned by LlvmBackend_Calls*.cpp, out of this lane's
-                        // file ownership per the brief), not a naming
-                        // mistake — the diagnostic below says so. Filed as
-                        // issue 3735: the SAME gap (ICE/silent-zero, not a
-                        // SortedSet-only defect) reproduces TODAY on a plain
-                        // `Set<int>` receiver for `Sum`/`Any`, which has been
-                        // in `isArrLike` throughout and is untouched by this
-                        // commit — so this is pre-existing and family-wide
-                        // for the dict-backed collections, not something this
-                        // admission introduces. Once 3735 adds the missing
-                        // dispatch arm(s), lift this exclusion for SortedSet.
-                        bool sortedSetHasNoDirectDispatch =
-                            m == "Get" || m == "Peek" || m == "Pop" ||
-                            m == "Dequeue" || m == "PopLast" ||
-                            m == "PopFirst" || m == "PopAt" ||
-                            m == "IndexOf" || m == "TryPop" ||
-                            m == "TryDequeue" || m == "TryPeek" ||
-                            m == "TryPopFirst" || m == "TryPopLast" ||
-                            m == "TryTake" || m == "Length" ||
-                            m == "Any" || m == "All" ||
-                            (m == "Count" && !ce.args.empty()) ||
-                            m == "Sum" || m == "Min" || m == "Max" ||
-                            m == "Average" || m == "Aggregate" ||
-                            m == "FirstOrNull" || m == "LastOrNull" ||
-                            m == "SingleOrNull" || m == "Single" ||
-                            m == "ElementAt" || m == "Reverse";
+                        // fix #3735 (stdlib §4.10 / §4.18 / §5, v0.286) —
+                        // THE SECOND CATEGORY IS DOWN TO ONE MEMBER. #3730
+                        // additionally rejected a measured list of names that
+                        // stdlib §5's `IEnumerable<T>` extension DOES declare
+                        // on a `SortedSet<T>` (`Any`/`All`/`Count(pred)`/
+                        // `Sum`/`Min`/`Max`/`Average`/`Aggregate`/
+                        // `FirstOrNull`/`LastOrNull`/`SingleOrNull`/`Single`/
+                        // `ElementAt`/`Reverse`), because this compiler had no
+                        // direct-receiver codegen dispatch for them on a
+                        // dict-backed source — the #1386 ICE / #2434 silent
+                        // zero that reject existed to keep loud (§6c). Issue
+                        // 3735 supplied that dispatch: the §5 EAGER terminals
+                        // now materialize a Set-family receiver through the
+                        // SAME `lowerToLazyEnumerator` source the §5 chains
+                        // already use (`LlvmBackend_Calls.cpp`'s `setRecvTerm`
+                        // term in `lazyTerminal`). With a real lowering behind
+                        // each of those names, #3444's "either a lowering or a
+                        // loud reject" obligation is discharged by the
+                        // lowering, and keeping the reject would now be the
+                        // defect — every one of them is measured working on a
+                        // direct `SortedSet<int>` receiver.
+                        //
+                        // `Reverse` is the ONE survivor, and for a reason that
+                        // is not codegen's: §5's LAZY `Reverse(): IEnumerable<T>`
+                        // has no sema TYPING arm at all for a direct collection
+                        // receiver — `typeLinqOperator` (~line 4625) never
+                        // mentions it — so the call acquires no `exprType` and
+                        // degrades at the NEXT line via #2434 no matter what
+                        // codegen does. (The codegen admission was written and
+                        // measured INERT without the typing half, then
+                        // reverted.) Filed as issue 3763 with the measured
+                        // repro; the reject below keeps the failure LOUD and
+                        // located until that lands, per §6c.
                         bool sortedSetMemberUndeclared =
                             m == "Get" || m == "Peek" || m == "Pop" ||
                             m == "Dequeue" || m == "PopLast" ||
@@ -5735,9 +5706,24 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             m == "TryDequeue" || m == "TryPeek" ||
                             m == "TryPopFirst" || m == "TryPopLast" ||
                             m == "TryTake" || m == "Length";
-                        if (colName == "SortedSet" &&
-                            sortedSetHasNoDirectDispatch &&
-                            sortedSetMemberUndeclared) {
+                        if (colName == "SortedSet" && m == "Reverse") {
+                            // stdlib §5 declares `Reverse()` on the
+                            // `IEnumerable<T>` extension surface, so this is
+                            // not a naming mistake — it is issue 3763's
+                            // missing sema typing arm. Reported HERE rather
+                            // than letting it reach the #2434 degrade one line
+                            // later.
+                            ctx_.diagnostics().report(
+                                Severity::Error, ce.span.begin,
+                                "`Reverse` is declared on `SortedSet<T>` via "
+                                "stdlib §5's IEnumerable<T> extension surface, "
+                                "but this compiler gives the LAZY `Reverse(): "
+                                "IEnumerable<T>` no typing on a direct "
+                                "collection receiver (issue 3763) — compose it "
+                                "through a materializing operator instead, "
+                                "e.g. `s.ToArray().Reverse()`");
+                        } else if (colName == "SortedSet" &&
+                                   sortedSetMemberUndeclared) {
                             ctx_.diagnostics().report(
                                 Severity::Error, ce.span.begin,
                                 std::string("no member `") + std::string(m) +
@@ -5747,28 +5733,6 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 "stdlib §5 IEnumerable<T> surface; it has no "
                                 "positional index, no front/back, and no "
                                 "extraction query to `" + std::string(m) + "`");
-                        } else if (colName == "SortedSet" &&
-                                   sortedSetHasNoDirectDispatch) {
-                            // Declared by stdlib §5 (or the no-selector §5.1
-                            // aggregates T: IComparable<T> already grants a
-                            // SortedSet element), but this compiler has no
-                            // direct-receiver codegen dispatch arm for a
-                            // SortedSet source at this operator — see the
-                            // measured list above the flag's declaration.
-                            // Reporting this HERE (sema) rather than letting
-                            // it reach codegen's #2434/#1386 paths keeps the
-                            // failure loud and located, per §6c.
-                            ctx_.diagnostics().report(
-                                Severity::Error, ce.span.begin,
-                                std::string("`") + std::string(m) +
-                                "` is declared on `SortedSet<T>` via stdlib §5's "
-                                "IEnumerable<T> extension surface, but this "
-                                "compiler has no direct-receiver lowering for it "
-                                "on a SortedSet source (issue 3735 — the same "
-                                "gap measured on a plain Set<T> receiver) — "
-                                "compose it through a materializing operator "
-                                "instead, e.g. `s.ToArray()." + std::string(m) +
-                                "(...)`");
                         }
                         // fix #3345: the static-call form
                         // `Array.Sort(a)` / `Array.Reverse(a)` is handled

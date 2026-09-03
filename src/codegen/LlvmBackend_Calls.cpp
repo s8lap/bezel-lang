@@ -1952,9 +1952,66 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
     bool isStringRecvTerm = recvTy &&
         recvTy->kind == sema::TypeRef::Kind::Primitive &&
         recvTy->primitive == sema::PrimitiveType::String;
+    // issues #343 / D8 / §4.10 (+ stdlib §4.18, #1426: `SortedSet<T>` shares the
+    // generic-key hash-table backing of `Set`/`OwningSet`): the Set-family
+    // receiver heads. Hoisted here by fix #3735 from the dict-backed member
+    // arms below — it is now read by BOTH the §5 eager-terminal materialize
+    // decision immediately below and those arms, one spelling for one fact.
+    bool isSetName = recvTy && recvTy->astNode && recvTy->astNode->name &&
+                     !recvTy->astNode->name->parts.empty() &&
+                     (recvTy->headName() == "Set" ||
+                      recvTy->headName() == "OwningSet" ||
+                      recvTy->headName() == "SortedSet");
+    // fix #3735 / stdlib §4.10 / §4.18 / §5 (v0.286): a DICT-BACKED Set-family
+    // receiver (`Set<T>`/`OwningSet<T>` over a record/primitive/enum/choice/
+    // string/decimal element, and every `SortedSet<T>`) at a §5 EAGER terminal.
+    // Such a receiver's runtime value is a `bz_dict_t*`, so the concrete-array
+    // terminal lowerings below (bz_array_len / bz_array_ptr_at) cannot read it;
+    // the dedicated dict arms further down covered only the §4.10/§4.18 native
+    // surface and `return nullptr` for everything else, which reached the
+    // caller as `internal: lowerExpr returned null …` (#1386) inside a string
+    // interpolation and as the SILENT #2434 zero-degrade through a plain local
+    // — measured `Set<int>{30,10,20}.Sum()` printing 0 where `Array<int>` over
+    // the same elements prints 60 (issue 3735).
+    //
+    // The fix is the SAME materialize-then-run route the lazy / LinkedList /
+    // Range / vtable-IEnumerable / string sources already take, not a new
+    // per-operator arm family: `lowerToLazyEnumerator` is the ONE place that
+    // turns a §5 source into a `bz_lazy_t*`, and its Set arm already handles
+    // all three heads (`bz_lazy_from_set`'s insertion-ordered key snapshot for
+    // Set/OwningSet, #3711's §4.18 ascending snapshot for SortedSet), so
+    // `s.Sum()` lowers exactly as `s.Where(…).Sum()` and as `s.ToArray().Sum()`
+    // already do. #2726's commit body records why the family-wide alternative
+    // (moving the Set heads between backing REGISTRIES) regressed 30+ tests:
+    // this change widens no registry and moves no head — it adds one source
+    // family to the terminal-materialize disjunction, the same one term each
+    // of the five sources above added.
+    //
+    // ⚠ EXCLUSION (kept in step with the dict arms below by construction, see
+    // `isSetName`): three members of `isArrTerminal` ALREADY have a correct
+    // dict-backed lowering — `Contains` (bz_dict_contains_gen, which honours
+    // the element's §8.3 hash/equality rather than a linear `==` scan),
+    // no-arg `Count` (bz_dict_count, O(1) and allocation-free), and
+    // `SortedSet`'s no-arg `First`/`Last` (bz_dict_min_key_gen /
+    // bz_dict_max_key_gen). Those keep their arms; everything else
+    // materializes. Should this list ever drift from the arms it mirrors, both
+    // directions are FAIL-SAFE: a member listed here with no arm falls to the
+    // `return nullptr` loud reject, and a member omitted here that has an arm
+    // simply takes the (correct, slower) snapshot path instead — neither can
+    // produce a wrong value.
+    bool isDictBackedSetRecv =
+        isSetName &&
+        genericBackingType(recvTy, 0, /*isSet=*/true, nullptr) != nullptr;
+    bool dictSetArmClaims =
+        isDictBackedSetRecv &&
+        ((m == "Contains") ||
+         (m == "Count" && call.args.empty()) ||
+         ((m == "First" || m == "Last") && call.args.empty() &&
+          recvTy->headName() == "SortedSet"));
+    bool setRecvTerm = isDictBackedSetRecv && !dictSetArmClaims;
     bool lazyTerminal =
         (lazyRecv || isLinkedList || isRangeRecv || vtIEnum ||
-         isStringRecvTerm) && isArrTerminal;
+         isStringRecvTerm || setRecvTerm) && isArrTerminal;
 
     // fix #853 / stdlib §4.1–§4.3: a built-in collection member invoked through a
     // POLYMORPHIC collection interface (IReadOnlyCollection<T> / ICollection<T> /
@@ -2250,16 +2307,15 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         // semantics follow the element's hash/equality (§8.3). This covers
         // records (#343), primitive/enum elements, AND string elements (D8) —
         // none of which the array backing could deduplicate. Element value is a
-        // non-null sentinel; only membership matters. Other Set operations
-        // (LINQ, set-algebra) are not wired in this slice and fall through.
-        bool isSetName = recvTy && recvTy->astNode && recvTy->astNode->name &&
-                         !recvTy->astNode->name->parts.empty() &&
-                         (recvTy->headName() == "Set" ||
-                          recvTy->headName() == "OwningSet" ||
-                          // stdlib §4.18 (#1426): SortedSet<T> shares the generic-key
-                          // hash table backing of Set/OwningSet.
-                          recvTy->headName() == "SortedSet");
-        if (isSetName) {
+        // non-null sentinel; only membership matters.
+        //
+        // fix #3735 (v0.286): `isSetName` is computed ONCE, up beside
+        // `lazyTerminal` (the §5 eager-terminal materialize decision reads the
+        // same fact), rather than spelled a second time here. `!lazyTempArr` is
+        // the other half of that decision: when the terminal path snapshotted
+        // this set, `recv` is a fresh concrete `bz_array_t*` and the `bz_dict_*`
+        // arms below no longer describe it — the §5 array terminals do.
+        if (isSetName && !lazyTempArr) {
             if (const sema::TypeRef* elemTy =
                     genericBackingType(recvTy, 0, /*isSet=*/true, nullptr)) {
                 // Spill the element to a stack slot of its natural LLVM type and

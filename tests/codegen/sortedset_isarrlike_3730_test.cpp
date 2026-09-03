@@ -10,9 +10,16 @@
 //
 // The rejection half (members with no lowering, either because §4.18 never
 // declares them or because this compiler's direct-eager-operator dispatch
-// has no SortedSet arm — issue 3735) is pinned in
+// had no SortedSet arm — issue 3735) is pinned in
 // tests/sema/sortedset_isarrlike_3730_test.cpp; this file is VALUE
 // correctness for what DOES work.
+//
+// fix #3735 (v0.286) supplied that missing eager-terminal dispatch for every
+// dict-backed Set-family receiver, so the second rejection category is gone
+// (except `Reverse`, retargeted to issue 3763). Its own value grid — the §5
+// eager terminals across Set / OwningSet / SortedSet — lives in
+// tests/codegen/set_family_eager_terminals_3735_test.cpp; the LAZY / ToArray
+// rows below are unaffected by it and stay here.
 //
 // `runAotOut` rows assert the printed VALUE, never an exit code or a bare
 // "it compiled" — per lane rules §3, an oracle that cannot observe the

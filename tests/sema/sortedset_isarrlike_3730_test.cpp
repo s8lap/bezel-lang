@@ -10,10 +10,21 @@
 // SortedSet call that has no lowering — either because §4.18 never declares
 // the member at all, or because it IS a real stdlib §5 member but this
 // compiler's direct-receiver codegen dispatch has no SortedSet arm for it
-// (issue 3735, filed while measuring this fix — the SAME gap reproduces
-// today on a plain `Set<int>` receiver, so it is pre-existing and family-
+// (issue 3735, filed while measuring this fix — the SAME gap reproduced
+// today on a plain `Set<int>` receiver, so it was pre-existing and family-
 // wide for the dict-backed collections, not something this admission
-// introduces).
+// introduced).
+//
+// UPDATED BY fix #3735 (stdlib §4.10 / §4.18 / §5, v0.286), per lane rules
+// §7: that second exclusion category is GONE except for one member. The §5
+// EAGER terminals (Any/All/Count(pred)/Sum/Min/Max/Average/Aggregate/
+// FirstOrNull/LastOrNull/SingleOrNull/Single/ElementAt) now materialize a
+// Set-family receiver through the same `lowerToLazyEnumerator` source the §5
+// chains already use, so Category C's rows are VALUE rows now, not reject
+// rows. `Reverse` alone still rejects, retargeted to issue 3763 — §5's LAZY
+// `Reverse()` has no sema TYPING arm on a direct collection receiver, which
+// no codegen change can remedy. Category B (members §4.18 never declares)
+// is untouched.
 //
 // VALUE correctness (does the newly-typed §5 surface actually run right) is
 // pinned in tests/codegen/sortedset_isarrlike_3730_test.cpp; this file is the
@@ -173,42 +184,58 @@ BEZEL_TEST(sortedset_isarrlike_3730, trytake_rejected_not_declared) {
 }
 
 // ===========================================================================
-// Category C — §6b exclusion: members stdlib §5 DOES declare on
-// `IEnumerable<T>` (so SortedSet legitimately has them), but this compiler
-// has no direct-receiver codegen dispatch arm for a SortedSet source — see
-// issue 3735. Rejected here at sema, LOUD and located, rather than reaching
-// codegen's `#1386` ICE (inside a string interpolation) or the silent
-// `#2434` zero-degrade (assigned to a plain local) — §6c: loud -> quiet is a
-// rejected trade, and a NEWLY admitted head must not manufacture a new
-// instance of it.
+// Category C — WAS the §6b "declared by stdlib §5, but no direct-receiver
+// codegen dispatch for a SortedSet source" exclusion (issue 3735). FLIPPED
+// by fix #3735 (stdlib §4.10 / §4.18 / §5, v0.286): the §5 EAGER terminals
+// now materialize a Set-family receiver through the SAME
+// `lowerToLazyEnumerator` source the §5 chains already use
+// (`LlvmBackend_Calls.cpp`'s `setRecvTerm` term in `lazyTerminal`), so every
+// name below has a real lowering and #3444's "either a lowering or a loud
+// reject" obligation is discharged by the LOWERING. Per lane rules §7 (a fix
+// reversing a prior rejection must update the tests that pinned the old
+// behaviour in the same commit), each row here is now a VALUE row rather
+// than a reject row — and each asserts an ORDER-SENSITIVE value where §4.18's
+// ascending guarantee is observable (`First`/`Last`/`ElementAt`/`Aggregate`),
+// never a permutation-blind count.
+//
+// The one SURVIVOR is `Reverse` — for a reason that is not codegen's: §5's
+// LAZY `Reverse(): IEnumerable<T>` has no sema TYPING arm at all on a direct
+// collection receiver (`typeLinqOperator` never mentions it), so the call
+// acquires no `exprType` and degrades at the NEXT line via #2434 whatever
+// codegen does. Filed as issue 3763 with the measured repro; its row below
+// pins the retargeted diagnostic.
+//
+// The source set for every row is the file's own `prog()` prelude:
+// `SortedSet<int>` with 30, 10, 20, 40 added in that order, so §4.18's
+// ascending iteration is 10, 20, 30, 40.
 // ===========================================================================
 
-BEZEL_TEST(sortedset_isarrlike_3730, any_rejected_no_direct_dispatch) {
-    auto r = reject("    var x := s.Any();");
-    BEZEL_EXPECT_TRUE(hasErrorContaining(
-        r, "`Any` is declared on `SortedSet<T>` via stdlib \xC2\xA7" "5's"));
-    BEZEL_EXPECT_TRUE(hasErrorContaining(r, "issue 3735"));
+BEZEL_TEST(sortedset_isarrlike_3730, any_now_dispatches) {
+    BEZEL_EXPECT_EQ(
+        runAotOut(prog("    Console.WriteLine($\"{s.Any()}\");")), "True");
 }
 
-BEZEL_TEST(sortedset_isarrlike_3730, any_predicate_rejected_no_direct_dispatch) {
-    BEZEL_EXPECT_TRUE(hasErrorContaining(
-        reject("    var x := s.Any(lambda(y) => y > 15);"),
-        "`Any` is declared on `SortedSet<T>` via stdlib \xC2\xA7" "5's"));
+BEZEL_TEST(sortedset_isarrlike_3730, any_predicate_now_dispatches) {
+    BEZEL_EXPECT_EQ(
+        runAotOut(prog("    Console.WriteLine($\"{s.Any(lambda(y) => y > 15)},"
+                        "{s.Any(lambda(y) => y > 99)}\");")),
+        "True,False");
 }
 
-BEZEL_TEST(sortedset_isarrlike_3730, all_rejected_no_direct_dispatch) {
-    BEZEL_EXPECT_TRUE(hasErrorContaining(
-        reject("    var x := s.All(lambda(y) => y > 0);"),
-        "`All` is declared on `SortedSet<T>` via stdlib \xC2\xA7" "5's"));
+BEZEL_TEST(sortedset_isarrlike_3730, all_now_dispatches) {
+    BEZEL_EXPECT_EQ(
+        runAotOut(prog("    Console.WriteLine($\"{s.All(lambda(y) => y > 0)},"
+                        "{s.All(lambda(y) => y > 15)}\");")),
+        "True,False");
 }
 
-BEZEL_TEST(sortedset_isarrlike_3730, count_predicate_rejected_no_direct_dispatch) {
-    // `Count()`/`Count` (no predicate) DO still type and lower correctly —
-    // that is a SEPARATE, already-working dispatch. Only the predicate
-    // overload (a genuinely different stdlib §5 member) is excluded here.
-    BEZEL_EXPECT_TRUE(hasErrorContaining(
-        reject("    var x := s.Count(lambda(y) => y > 15);"),
-        "`Count` is declared on `SortedSet<T>` via stdlib \xC2\xA7" "5's"));
+BEZEL_TEST(sortedset_isarrlike_3730, count_predicate_now_dispatches) {
+    // The no-predicate `Count()` keeps its own O(1) `bz_dict_count` arm (the
+    // row just below); only the predicate overload takes the new snapshot
+    // route. 20, 30 and 40 are > 15.
+    BEZEL_EXPECT_EQ(
+        runAotOut(prog("    Console.WriteLine($\"{s.Count(lambda(y) => y > 15)}\");")),
+        "3");
 }
 
 BEZEL_TEST(sortedset_isarrlike_3730, count_noarg_still_types_and_runs) {
@@ -216,70 +243,79 @@ BEZEL_TEST(sortedset_isarrlike_3730, count_noarg_still_types_and_runs) {
                     "4");
 }
 
-BEZEL_TEST(sortedset_isarrlike_3730, sum_rejected_no_direct_dispatch) {
-    BEZEL_EXPECT_TRUE(hasErrorContaining(
-        reject("    var x := s.Sum();"),
-        "`Sum` is declared on `SortedSet<T>` via stdlib \xC2\xA7" "5's"));
+BEZEL_TEST(sortedset_isarrlike_3730, sum_min_max_now_dispatch) {
+    BEZEL_EXPECT_EQ(
+        runAotOut(prog("    Console.WriteLine($\"{s.Sum()},{s.Min()},"
+                        "{s.Max()}\");")),
+        "100,10,40");
 }
 
-BEZEL_TEST(sortedset_isarrlike_3730, min_rejected_no_direct_dispatch) {
-    BEZEL_EXPECT_TRUE(hasErrorContaining(
-        reject("    var x := s.Min();"),
-        "`Min` is declared on `SortedSet<T>` via stdlib \xC2\xA7" "5's"));
+BEZEL_TEST(sortedset_isarrlike_3730, average_now_dispatches) {
+    // stdlib §5.1 `Average(): double` over an int source; rendered through
+    // `int(…)` so the row asserts the numeric value rather than `double`'s
+    // exponent formatting.
+    BEZEL_EXPECT_EQ(
+        runAotOut(prog("    var avg := s.Average(lambda(y) => y);\n"
+                        "    Console.WriteLine($\"{int(avg)}\");")),
+        "25");
 }
 
-BEZEL_TEST(sortedset_isarrlike_3730, max_rejected_no_direct_dispatch) {
-    BEZEL_EXPECT_TRUE(hasErrorContaining(
-        reject("    var x := s.Max();"),
-        "`Max` is declared on `SortedSet<T>` via stdlib \xC2\xA7" "5's"));
+BEZEL_TEST(sortedset_isarrlike_3730, aggregate_now_dispatches_in_ascending_order) {
+    // ORDER-SENSITIVE: one decimal place per element, so this is 10203040 for
+    // §4.18's ascending order and a different number for any permutation —
+    // the property #3711's sorted snapshot exists to guarantee, now observed
+    // through an EAGER terminal for the first time.
+    BEZEL_EXPECT_EQ(
+        runAotOut(prog("    Console.WriteLine($\"{s.Aggregate(0, "
+                        "lambda(acc, y) => acc * 100 + y)}\");")),
+        "10203040");
 }
 
-BEZEL_TEST(sortedset_isarrlike_3730, average_rejected_no_direct_dispatch) {
-    BEZEL_EXPECT_TRUE(hasErrorContaining(
-        reject("    var x := s.Average(lambda(y) => y);"),
-        "`Average` is declared on `SortedSet<T>` via stdlib \xC2\xA7" "5's"));
+BEZEL_TEST(sortedset_isarrlike_3730, ornull_family_now_dispatches_ascending) {
+    BEZEL_EXPECT_EQ(
+        runAotOut(prog("    Console.WriteLine($\"{s.FirstOrNull()},"
+                        "{s.LastOrNull()},"
+                        "{s.SingleOrNull(lambda(y) => y = 10)}\");")),
+        "10,40,10");
 }
 
-BEZEL_TEST(sortedset_isarrlike_3730, aggregate_rejected_no_direct_dispatch) {
-    BEZEL_EXPECT_TRUE(hasErrorContaining(
-        reject("    var x := s.Aggregate(0, lambda(acc, y) => acc + y);"),
-        "`Aggregate` is declared on `SortedSet<T>` via stdlib \xC2\xA7" "5's"));
+BEZEL_TEST(sortedset_isarrlike_3730, single_now_dispatches) {
+    BEZEL_EXPECT_EQ(
+        runAotOut(prog("    Console.WriteLine($\"{s.Single(lambda(y) => y = 10)}\");")),
+        "10");
 }
 
-BEZEL_TEST(sortedset_isarrlike_3730, firstornull_rejected_no_direct_dispatch) {
-    BEZEL_EXPECT_TRUE(hasErrorContaining(
-        reject("    var x := s.FirstOrNull();"),
-        "`FirstOrNull` is declared on `SortedSet<T>` via stdlib \xC2\xA7" "5's"));
+BEZEL_TEST(sortedset_isarrlike_3730, elementat_now_dispatches_ascending) {
+    // ORDER-SENSITIVE: ascending indices 0..3 are 10, 20, 30, 40.
+    BEZEL_EXPECT_EQ(
+        runAotOut(prog("    Console.WriteLine($\"{s.ElementAt(0)},{s.ElementAt(1)},"
+                        "{s.ElementAt(2)},{s.ElementAt(3)}\");")),
+        "10,20,30,40");
 }
 
-BEZEL_TEST(sortedset_isarrlike_3730, lastornull_rejected_no_direct_dispatch) {
-    BEZEL_EXPECT_TRUE(hasErrorContaining(
-        reject("    var x := s.LastOrNull();"),
-        "`LastOrNull` is declared on `SortedSet<T>` via stdlib \xC2\xA7" "5's"));
+BEZEL_TEST(sortedset_isarrlike_3730,
+           first_last_dict_arm_agrees_with_snapshot_elementat) {
+    // `First()`/`Last()` keep the dedicated `bz_dict_min_key_gen` /
+    // `bz_dict_max_key_gen` arm (fix #3735 excludes them from the snapshot
+    // route deliberately). The two surfaces must agree — the property
+    // #2471/#2472 established.
+    BEZEL_EXPECT_EQ(
+        runAotOut(prog("    Console.WriteLine($\"{s.First() = s.ElementAt(0)},"
+                        "{s.Last() = s.ElementAt(3)}\");")),
+        "True,True");
 }
 
-BEZEL_TEST(sortedset_isarrlike_3730, singleornull_rejected_no_direct_dispatch) {
+BEZEL_TEST(sortedset_isarrlike_3730, reverse_rejected_no_sema_typing_3763) {
+    // The ONE survivor of the old Category C. Retargeted from issue 3735
+    // (now fixed) to issue 3763: stdlib §5's LAZY `Reverse(): IEnumerable<T>`
+    // has no typing arm on a direct collection receiver, so the reject keeps
+    // the failure LOUD and located rather than letting it reach the #2434
+    // degrade one line later (§6c).
+    auto r = reject("    using var r := s.Reverse().ToArray();");
     BEZEL_EXPECT_TRUE(hasErrorContaining(
-        reject("    var x := s.SingleOrNull(lambda(y) => y = 10);"),
-        "`SingleOrNull` is declared on `SortedSet<T>` via stdlib \xC2\xA7" "5's"));
-}
-
-BEZEL_TEST(sortedset_isarrlike_3730, single_rejected_no_direct_dispatch) {
-    BEZEL_EXPECT_TRUE(hasErrorContaining(
-        reject("    var x := s.Single(lambda(y) => y = 10);"),
-        "`Single` is declared on `SortedSet<T>` via stdlib \xC2\xA7" "5's"));
-}
-
-BEZEL_TEST(sortedset_isarrlike_3730, elementat_rejected_no_direct_dispatch) {
-    BEZEL_EXPECT_TRUE(hasErrorContaining(
-        reject("    var x := s.ElementAt(1);"),
-        "`ElementAt` is declared on `SortedSet<T>` via stdlib \xC2\xA7" "5's"));
-}
-
-BEZEL_TEST(sortedset_isarrlike_3730, reverse_rejected_no_direct_dispatch) {
-    BEZEL_EXPECT_TRUE(hasErrorContaining(
-        reject("    using var r := s.Reverse().ToArray();"),
-        "`Reverse` is declared on `SortedSet<T>` via stdlib \xC2\xA7" "5's"));
+        r, "`Reverse` is declared on `SortedSet<T>` via stdlib \xC2\xA7" "5's"));
+    BEZEL_EXPECT_TRUE(hasErrorContaining(r, "issue 3763"));
+    BEZEL_EXPECT_FALSE(hasErrorContaining(r, "issue 3735"));
 }
 
 // ===========================================================================
