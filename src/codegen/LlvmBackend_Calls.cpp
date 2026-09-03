@@ -4170,8 +4170,27 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             builder_.CreateBr(condBB);
             builder_.SetInsertPoint(endBB);
             if (relCl) emitClosureRelease(closure);
-            sema::TypeRef* elemRefNN = (recvTy && !recvTy->genericArgs.empty())
-                ? recvTy->genericArgs[0] : nullptr;
+            // fix #3795 (stdlib §5.1 / §9.6, v0.286): a STRING receiver's
+            // `recvTy` is the bare `string` Primitive TypeRef, which carries
+            // no `genericArgs` — so the generic-collection derivation below
+            // yields `nullptr` for it. Left uncorrected, that makes the
+            // `isValTy` decision further down treat `char` (a value type, §4.5,
+            // fix #849) as a POINTER-typed element instead, returning a bare
+            // i32 for the value (0 doubling as both "null" and the valid code
+            // point U+0000 — the same shape #3786 measured for MinOrNull /
+            // MaxOrNull). Force-unwrapping with `!` then SEGFAULTS the
+            // compiler, because sema types the local as `char?` (the
+            // tagged {i8 hasValue; i32} struct per #849) while codegen
+            // produced a bare i32. Substitute the same `char` TypeRef
+            // `lowerToLazyEnumerator`'s string arm already builds for the
+            // identical reason (LlvmBackend_Calls3.cpp, fix #1220), and
+            // #3786 used here for MinOrNull/MaxOrNull. Mirror of #3786
+            // across the four `*OrNull` arms (FirstOrNull/LastOrNull/
+            // SingleOrNull, no-arg and predicate forms).
+            sema::TypeRef* elemRefNN = isStringRecvTerm
+                ? ctx_.primitiveTypeRef(sema::PrimitiveType::Char)
+                : (recvTy && !recvTy->genericArgs.empty())
+                    ? recvTy->genericArgs[0] : nullptr;
             sema::TypeRef nullRT;
             if (elemRefNN) { nullRT = *elemRefNN; nullRT.nullable = true; }
             bool isValTy = elemRefNN && isNullableValueTy(&nullRT);
@@ -4313,8 +4332,27 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
 
             // Build T? result — check element ref for nullable value type.
             // In the isArr section, elemRef is not local — use recvTy->genericArgs[0].
-            sema::TypeRef* elemRefNN = (recvTy && !recvTy->genericArgs.empty())
-                ? recvTy->genericArgs[0] : nullptr;
+            // fix #3795 (stdlib §5.1 / §9.6, v0.286): a STRING receiver's
+            // `recvTy` is the bare `string` Primitive TypeRef, which carries
+            // no `genericArgs` — so the generic-collection derivation below
+            // yields `nullptr` for it. Left uncorrected, that makes the
+            // `isValTy` decision further down treat `char` (a value type, §4.5,
+            // fix #849) as a POINTER-typed element instead, returning a bare
+            // i32 for the value (0 doubling as both "null" and the valid code
+            // point U+0000 — the same shape #3786 measured for MinOrNull /
+            // MaxOrNull). Force-unwrapping with `!` then SEGFAULTS the
+            // compiler, because sema types the local as `char?` (the
+            // tagged {i8 hasValue; i32} struct per #849) while codegen
+            // produced a bare i32. Substitute the same `char` TypeRef
+            // `lowerToLazyEnumerator`'s string arm already builds for the
+            // identical reason (LlvmBackend_Calls3.cpp, fix #1220), and
+            // #3786 used here for MinOrNull/MaxOrNull. Mirror of #3786
+            // across the four `*OrNull` arms (FirstOrNull/LastOrNull/
+            // SingleOrNull, no-arg and predicate forms).
+            sema::TypeRef* elemRefNN = isStringRecvTerm
+                ? ctx_.primitiveTypeRef(sema::PrimitiveType::Char)
+                : (recvTy && !recvTy->genericArgs.empty())
+                    ? recvTy->genericArgs[0] : nullptr;
             // Make a nullable copy of the element type for the return struct.
             sema::TypeRef nullRT;
             if (elemRefNN) { nullRT = *elemRefNN; nullRT.nullable = true; }
@@ -4401,8 +4439,27 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             if (relCl) emitClosureRelease(closure);
 
             // Build T? result — same logic as the no-predicate *OrNull path.
-            sema::TypeRef* elemRefNN = (recvTy && !recvTy->genericArgs.empty())
-                ? recvTy->genericArgs[0] : nullptr;
+            // fix #3795 (stdlib §5.1 / §9.6, v0.286): a STRING receiver's
+            // `recvTy` is the bare `string` Primitive TypeRef, which carries
+            // no `genericArgs` — so the generic-collection derivation below
+            // yields `nullptr` for it. Left uncorrected, that makes the
+            // `isValTy` decision further down treat `char` (a value type, §4.5,
+            // fix #849) as a POINTER-typed element instead, returning a bare
+            // i32 for the value (0 doubling as both "null" and the valid code
+            // point U+0000 — the same shape #3786 measured for MinOrNull /
+            // MaxOrNull). Force-unwrapping with `!` then SEGFAULTS the
+            // compiler, because sema types the local as `char?` (the
+            // tagged {i8 hasValue; i32} struct per #849) while codegen
+            // produced a bare i32. Substitute the same `char` TypeRef
+            // `lowerToLazyEnumerator`'s string arm already builds for the
+            // identical reason (LlvmBackend_Calls3.cpp, fix #1220), and
+            // #3786 used here for MinOrNull/MaxOrNull. Mirror of #3786
+            // across the four `*OrNull` arms (FirstOrNull/LastOrNull/
+            // SingleOrNull, no-arg and predicate forms).
+            sema::TypeRef* elemRefNN = isStringRecvTerm
+                ? ctx_.primitiveTypeRef(sema::PrimitiveType::Char)
+                : (recvTy && !recvTy->genericArgs.empty())
+                    ? recvTy->genericArgs[0] : nullptr;
             sema::TypeRef nullRT;
             if (elemRefNN) { nullRT = *elemRefNN; nullRT.nullable = true; }
             bool isValTy = elemRefNN && isNullableValueTy(&nullRT);
@@ -4503,8 +4560,27 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             if (relCl) emitClosureRelease(closure);
 
             // Build T? result: valid iff matchCount == 1.
-            sema::TypeRef* elemRefNN = (recvTy && !recvTy->genericArgs.empty())
-                ? recvTy->genericArgs[0] : nullptr;
+            // fix #3795 (stdlib §5.1 / §9.6, v0.286): a STRING receiver's
+            // `recvTy` is the bare `string` Primitive TypeRef, which carries
+            // no `genericArgs` — so the generic-collection derivation below
+            // yields `nullptr` for it. Left uncorrected, that makes the
+            // `isValTy` decision further down treat `char` (a value type, §4.5,
+            // fix #849) as a POINTER-typed element instead, returning a bare
+            // i32 for the value (0 doubling as both "null" and the valid code
+            // point U+0000 — the same shape #3786 measured for MinOrNull /
+            // MaxOrNull). Force-unwrapping with `!` then SEGFAULTS the
+            // compiler, because sema types the local as `char?` (the
+            // tagged {i8 hasValue; i32} struct per #849) while codegen
+            // produced a bare i32. Substitute the same `char` TypeRef
+            // `lowerToLazyEnumerator`'s string arm already builds for the
+            // identical reason (LlvmBackend_Calls3.cpp, fix #1220), and
+            // #3786 used here for MinOrNull/MaxOrNull. Mirror of #3786
+            // across the four `*OrNull` arms (FirstOrNull/LastOrNull/
+            // SingleOrNull, no-arg and predicate forms).
+            sema::TypeRef* elemRefNN = isStringRecvTerm
+                ? ctx_.primitiveTypeRef(sema::PrimitiveType::Char)
+                : (recvTy && !recvTy->genericArgs.empty())
+                    ? recvTy->genericArgs[0] : nullptr;
             sema::TypeRef nullRT;
             if (elemRefNN) { nullRT = *elemRefNN; nullRT.nullable = true; }
             bool isValTy = elemRefNN && isNullableValueTy(&nullRT);
