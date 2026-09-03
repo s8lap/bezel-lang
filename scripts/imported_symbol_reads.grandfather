@@ -23,7 +23,6 @@
 4    src/module/ModuleMetadataBuilder.cpp
 1    src/ownership/Ownership_Checks.cpp
 1    src/sema/EnumValues.hpp
-6    src/sema/ExprTypecheck.cpp
 4    src/sema/ExprTypecheck_Calls.cpp
 6    src/sema/ExprTypecheck_Exprs.cpp
 1    src/sema/PureChecker.cpp

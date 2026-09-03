@@ -2014,6 +2014,12 @@ bool ExprTC::caseArmsExhaustive(
             }
             missing.push_back(name);
         };
+        // SEAM-ACCESSOR: both-sources inline (#3152) — the AST arm walks
+        // `td->enumConstants` (declaration order) and the `else` arm below
+        // falls back to `sub->members` (populated for BOTH a local and an
+        // imported enum's TypeSymbol), so a null `sub->decl` (imported enum)
+        // does not silently under-enumerate the constant NAMES this
+        // exhaustiveness check considers.
         if (auto* td = dynamic_cast<const ast::TypeDecl*>(sub->decl)) {
             for (const auto& ec : td->enumConstants) considerName(ec.name);
         } else {
@@ -2598,6 +2604,11 @@ void ExprTC::checkTopLevelNamedPattern(const ast::NamedPattern* np,
         for (const auto& gp : currentMethodDecl_->genericParams)
             if (gp.name == last) return;
     if (currentType_ && currentType_->decl)
+        // SEAM-ACCESSOR: null for an EXTENSION over an imported target
+        // (comment above) — the `currentExtension_` arm right below
+        // independently recognizes the same name via
+        // `isExtensionTargetTypeParam` on the always-local extension AST
+        // (#3152), so the two arms together are import-correct.
         if (auto* td = dynamic_cast<const ast::TypeDecl*>(currentType_->decl))
             for (const auto& gp : td->genericParams)
                 if (gp.name == last) return;
@@ -7464,17 +7475,37 @@ static bool typeNamesFreeVar(
     return false;
 }
 
-// §26.5 (#773): true when an extension method's parameter or return types
-// reference a free type variable of the extension — the case whose codegen
-// substitution is deferred for user-declared extension targets (see
-// lookupExtensionMember). For builtin-target extensions (§26.5 #714), the
-// binding-and-codegen path is now implemented, so this check is not applied.
+// §26.5 (#773): true when an extension method's parameter types, return
+// type, or own generic constraints reference a free type variable of the
+// extension — the case whose codegen substitution is deferred for
+// user-declared extension targets (see lookupExtensionMember). For
+// builtin-target extensions (§26.5 #714), the binding-and-codegen path is
+// now implemented, so this check is not applied.
+//
+// fix #3672 (§26.4/§26.5, v0.286): every Type-shape question here routes
+// through `typeNamesFreeVar` — the single both-sources `ast::Type` walker —
+// rather than re-testing shapes locally; this function only enumerates
+// WHERE in an `ast::MethodDecl` a `Type` can occur. `genericConstraints` is
+// the addition: a method's own type-bound constraint (`where U: T`, §14.2
+// "Type-parameter bounds") can name the extension's free var as the bound
+// even when neither the return type nor any parameter does (e.g. `method
+// Foo<U>(): int where U: T`). Before this fix such a method was NOT
+// deferred — `Foo<Z>()` compiled and ran on a `Bag<W>` receiver with no
+// diagnostic even though `Z` does not satisfy `T`'s receiver-bound
+// instantiation (`W`), because the constraint-satisfaction check has no
+// concrete type to check `Z` against when the bound is an unresolved free
+// var. That is exactly the #773 deferred case, silently NOT deferred: this
+// closes a silent-accept gap, not a LOUD->QUIET regression (see the
+// `ExtSignatureFreeVar3672` sema tests for the FAIL-WITHOUT/PASS-WITH pin).
 static bool extSignatureUsesFreeVar(
     const ast::MethodDecl* md,
     const std::unordered_set<std::string_view>& freeVars) {
     if (typeNamesFreeVar(md->returnType.get(), freeVars)) return true;
     for (const auto& p : md->params)
         if (typeNamesFreeVar(p.type.get(), freeVars)) return true;
+    for (const auto& gc : md->genericConstraints)
+        for (const auto& item : gc.items)
+            if (typeNamesFreeVar(item.typeArg.get(), freeVars)) return true;
     return false;
 }
 
@@ -8335,6 +8366,12 @@ bool ExprTC::isInScopeTypeParam(std::string_view name) const {
             if (gp.name == name) return true;
     }
     if (currentType_ && currentType_->decl) {
+        // SEAM-ACCESSOR: see the function comment above (#3152) — an
+        // imported extension target leaves `currentType_->decl` null, but
+        // the `currentExtension_` arm below (an always-local read, own
+        // comment above) independently recognizes the identical name via
+        // `isExtensionTargetTypeParam`, so this arm's import-blindness does
+        // not change the function's overall (both-sources-correct) answer.
         if (auto* td = dynamic_cast<const ast::TypeDecl*>(currentType_->decl)) {
             for (const auto& gp : td->genericParams)
                 if (gp.name == name) return true;
@@ -8403,6 +8440,12 @@ bool ExprTC::forEachConstraintBound(
     // still guards this walk against looping defensively.
     const ast::TypeDecl* typeDecl =
         (currentType_ && currentType_->decl)
+            // SEAM-ACCESSOR: `typeDecl` is null for an extension over an
+            // imported target (function comment above), but `extDecl`
+            // below reads `currentExtension_->decl`, which is always local
+            // (#3152) — `isDeclaredParam` and `scan` (below) both consult
+            // `extDecl` too, so the walk's overall answer is
+            // import-correct despite `typeDecl` alone going null.
             ? dynamic_cast<const ast::TypeDecl*>(currentType_->decl)
             : nullptr;
     const ast::ExtensionDecl* extDecl =
@@ -8730,6 +8773,12 @@ bool ExprTC::isEnclosingTypeParamName(std::string_view name) const {
     if (currentMethodDecl_ && has(currentMethodDecl_->genericParams))
         return true;
     if (currentType_ && currentType_->decl)
+        // SEAM-ACCESSOR: `currentType_->decl` is null for an extension over
+        // an imported target (#3152) — the `currentExtension_` arm right
+        // below (always local, per #3083's comment there) independently
+        // recognizes the extension's own `<T>` parameter for that case, so
+        // this arm's import-blindness does not change the function's
+        // overall answer.
         if (auto* td = dynamic_cast<const ast::TypeDecl*>(currentType_->decl))
             if (has(td->genericParams)) return true;
     if (currentExtension_ && currentExtension_->decl) {
@@ -8765,6 +8814,12 @@ bool ExprTC::isEnclosingTypeParamName(std::string_view name) const {
 bool ExprTC::typeParamHasExceptionBound(std::string_view paramName) {
     const ast::TypeDecl* typeDecl =
         (currentType_ && currentType_->decl)
+            // SEAM-ACCESSOR: `typeDecl` is null for an extension over an
+            // imported target; `extDecl` below (always local —
+            // `currentExtension_` is never an import, see
+            // `isInScopeTypeParam`'s comment) is scanned for the SAME
+            // `paramName` a few lines down (#3152), so this walk's overall
+            // answer is import-correct despite `typeDecl` alone going null.
             ? dynamic_cast<const ast::TypeDecl*>(currentType_->decl)
             : nullptr;
     const ast::ExtensionDecl* extDecl =
