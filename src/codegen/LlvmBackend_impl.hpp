@@ -15624,6 +15624,52 @@ private:
     // Unsupported types (record, decimal, enum, unresolved T): returns null.
     llvm::Function* buildSortedKeyComparator(const sema::TypeRef* keyTy);
 
+    // narrow #3717 / §4.8 / §28.9: the per-index `DictionaryEntry<K,V>` decode
+    // shared by `lowerDictEntryFor` (for-in), `wrapDictionaryAsIEnumerable`
+    // (the GetEnumerator materializer), and #3576's First/Last/ElementAt arm
+    // in LlvmBackend_Calls.cpp. Each caller already snapshots `keysArr`/
+    // `lensArr`/`valsArr` its own way (the snapshot call, the §4.17
+    // SortedDictionary sort step, and every free are left copy-specific per
+    // issue #3717's own recommended shape — "freeing is copy-specific... and
+    // should stay separate") and passes the resulting arrays + an index in.
+    //
+    // decodeDictStringKeyAt rebuilds an owned `bz_string_t*` from
+    // `bz_dict_keys_str`'s raw bytes at `idx` (mirrors the byte-identical
+    // malloc+memcpy+calloc+initStringRc sequence all three callers had).
+    // Returns {keyDecoded, rawKeyPtr}; rawKeyPtr is `bz_dict_keys_str`'s own
+    // malloc'd pointer for that slot — freeing it (immediately, as the
+    // materializer/GetEnumerator sites do, or deferred to a loop's increment
+    // block, as the for-in site does) is the CALLER's job, unchanged from
+    // before this fix.
+    std::pair<llvm::Value*, llvm::Value*> decodeDictStringKeyAt(
+        llvm::Value* keysArr, llvm::Value* lensArr, llvm::Value* idx);
+
+    // decodeDictGenericKeyAt loads a generic (non-string) key BY VALUE out of
+    // the malloc'd raw-bytes copy `bz_dict_keys_gen` wrote at `idx`. Returns
+    // {keyDecoded, rawKeyPtr}; rawKeyPtr is that same malloc'd copy — again,
+    // freeing it is the caller's job (the for-in loop's incBB, the
+    // materializer's inline free, or #3576's arm's single bulk free-loop over
+    // every index).
+    std::pair<llvm::Value*, llvm::Value*> decodeDictGenericKeyAt(
+        llvm::Type* keyLlvm, llvm::Value* keysArr, llvm::Value* idx,
+        const char* namePrefix);
+
+    // decodeDictValueAt decodes the VALUE half at `idx` out of `valsArr`:
+    // struct-load the boxed slot when `loadAsStruct` is true, else
+    // ptrtoint+bitcast/trunc a scalar out of the pointer-sized slot, else pass
+    // the raw pointer through as a borrow. `loadAsStruct` is supplied BY THE
+    // CALLER using its own pre-existing predicate, verbatim, rather than a new
+    // one this helper invents: the for-in loop / materializer / GetEnumerator
+    // sites test `valRec || (valNullableVal && valLlvm->isStructTy())`
+    // (record OR nullable-value-type), while #3576's arm tests the broader
+    // `valLlvm->isStructTy()` alone (see that arm's call site for why — #3717
+    // §6b: the two are NOT proven equivalent for a struct-lowering V that is
+    // neither a record nor a nullable value type, e.g. a Choice, so this
+    // lane preserves both spellings rather than merging them).
+    llvm::Value* decodeDictValueAt(llvm::Type* valLlvm, llvm::Value* valsArr,
+                                    llvm::Value* idx, bool loadAsStruct,
+                                    const char* namePrefix);
+
     // fix #3488 / stdlib §4.17 / spec §14.2: the same-ABI comparator thunk for a
     // REFERENCE key/element (a class or an interface that satisfies
     // `IComparable<Self>`) — it dispatches the type's own `CompareTo` rather

@@ -11130,70 +11130,29 @@ llvm::Value* Emitter::wrapDictionaryAsIEnumerable(
     {
         llvm::Value* idxB = builder_.CreateLoad(i64(), idxSlot);
 
-        // --- decode key (mirrors lowerDictEntryFor) ---
+        // --- decode key (narrow #3717: shared with lowerDictEntryFor and
+        // #3576's arm — see LlvmBackend_impl.hpp for the helpers) ---
         llvm::Value* keyDecoded;
         if (isStringKey) {
-            auto* mallocFn = declareC("malloc", ptrTy(), {i64()});
-            auto* memcpyFn = declareC("memcpy", ptrTy(),
-                                      {ptrTy(), ptrTy(), i64()});
-            auto* callocFn = declareC("calloc", ptrTy(), {i64(), i64()});
-            auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
-            uint64_t strSz = dl.getTypeAllocSize(stringType());
-            llvm::Value* kpPtr = builder_.CreateGEP(ptrTy(), keysArr, idxB);
-            llvm::Value* kp    = builder_.CreateLoad(ptrTy(), kpPtr);
-            llvm::Value* lpPtr = builder_.CreateGEP(i64(), lensArr, idxB);
-            llvm::Value* kl    = builder_.CreateLoad(i64(), lpPtr);
-            llvm::Value* dataSz  = builder_.CreateAdd(kl, builder_.getInt64(1));
-            llvm::Value* dataCpy = builder_.CreateCall(mallocFn, {dataSz});
-            builder_.CreateCall(memcpyFn, {dataCpy, kp, kl});
-            llvm::Value* nulPtr = builder_.CreateGEP(i8Ty, dataCpy, kl);
-            builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 0), nulPtr);
-            llvm::Value* strObj = builder_.CreateCall(
-                callocFn,
-                {builder_.getInt64(1), builder_.getInt64((int64_t)strSz)});
-            builder_.CreateStore(dataCpy,
-                builder_.CreateStructGEP(stringType(), strObj, 0));
-            builder_.CreateStore(kl,
-                builder_.CreateStructGEP(stringType(), strObj, 1));
-            builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 1),
-                builder_.CreateStructGEP(stringType(), strObj, 2));
-            initStringRc(strObj);
+            auto [strObj, kp] = decodeDictStringKeyAt(keysArr, lensArr, idxB);
             // Free the raw key bytes from bz_dict_keys_str.
             builder_.CreateCall(freeFn, {kp});
             keyDecoded = strObj;
         } else if (useGen) {
-            llvm::Value* kpPtr  = builder_.CreateGEP(ptrTy(), keysArr, idxB);
-            llvm::Value* keyPtr = builder_.CreateLoad(ptrTy(), kpPtr);
-            keyDecoded =
-                builder_.CreateLoad(keyLlvm, keyPtr, "denum.kgen");
+            auto [gk, keyPtr] = decodeDictGenericKeyAt(keyLlvm, keysArr, idxB,
+                                                        "denum.kgen");
             // Free the malloc'd raw-bytes key copy.
             builder_.CreateCall(freeFn, {keyPtr});
+            keyDecoded = gk;
         } else {
             keyDecoded = llvm::Constant::getNullValue(keyLlvm);
         }
 
         // --- decode value (mirrors lowerDictEntryFor) ---
-        llvm::Value* vpPtr  = builder_.CreateGEP(ptrTy(), valsArr, idxB);
-        llvm::Value* slotV  = builder_.CreateLoad(ptrTy(), vpPtr);
-        llvm::Value* valDecoded;
-        if (valRec) {
-            valDecoded = builder_.CreateLoad(valLlvm, slotV, "denum.vrec");
-        } else if (valNullableVal && valLlvm->isStructTy()) {
-            valDecoded = builder_.CreateLoad(valLlvm, slotV, "denum.vnv");
-        } else if (!valLlvm->isPointerTy()) {
-            llvm::Value* asI64 = builder_.CreatePtrToInt(slotV, i64());
-            if (valLlvm->isDoubleTy())
-                valDecoded = builder_.CreateBitCast(asI64, valLlvm);
-            else if (valLlvm->isFloatTy())
-                valDecoded = builder_.CreateBitCast(
-                    builder_.CreateTrunc(asI64, i32()), valLlvm);
-            else if (valLlvm->isIntegerTy(64))
-                valDecoded = asI64;
-            else
-                valDecoded = builder_.CreateTrunc(asI64, valLlvm);
-        } else {
-            valDecoded = slotV;
-        }
+        llvm::Value* valDecoded = decodeDictValueAt(
+            valLlvm, valsArr, idxB,
+            /*loadAsStruct=*/valRec || (valNullableVal && valLlvm->isStructTy()),
+            valRec ? "denum.vrec" : "denum.vnv");
 
         // Store key at field 0, value at field 1 and append.
         builder_.CreateStore(keyDecoded,

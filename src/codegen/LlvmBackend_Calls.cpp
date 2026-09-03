@@ -6844,41 +6844,30 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 }
             }
 
-            // Decode the target key (mirrors lowerDictEntryFor's generic-
-            // key per-iteration decode, at the ONE computed index rather
-            // than a loop var): a plain value LOAD out of the malloc'd
-            // raw-bytes copy `bz_dict_keys_gen` wrote — no separate heap
-            // ownership survives the load, so freeing the blob below (for
-            // every index, including this one) is always safe.
-            llvm::Value* dtKpPtr = builder_.CreateGEP(ptrTy(), dtKeysArr, dtIdx);
-            llvm::Value* dtKeyPtr = builder_.CreateLoad(ptrTy(), dtKpPtr);
+            // Decode the target key (narrow #3717: shared with
+            // lowerDictEntryFor and wrapDictionaryAsIEnumerable — see
+            // LlvmBackend_impl.hpp): a plain value LOAD out of the malloc'd
+            // raw-bytes copy `bz_dict_keys_gen` wrote at the ONE computed
+            // index rather than a loop var — no separate heap ownership
+            // survives the load, so freeing the blob below (for every index,
+            // including this one) is always safe.
             llvm::Value* dtKeyDecoded =
-                builder_.CreateLoad(dtKeyLlvm, dtKeyPtr, "dictterm.kgen");
+                decodeDictGenericKeyAt(dtKeyLlvm, dtKeysArr, dtIdx,
+                                       "dictterm.kgen").first;
 
-            // Decode the target value (identical decode to GetOrNull's
-            // stored-slot unbox a few arms down: struct -> load the box,
-            // pointer -> the borrow itself, scalar -> ptrtoint +
-            // trunc/bitcast).
-            llvm::Value* vpPtr = builder_.CreateGEP(ptrTy(), dtValsArr, dtIdx);
-            llvm::Value* slotV = builder_.CreateLoad(ptrTy(), vpPtr);
-            llvm::Value* dtValDecoded;
-            if (dtValLlvm->isStructTy()) {
-                dtValDecoded =
-                    builder_.CreateLoad(dtValLlvm, slotV, "dictterm.vrec");
-            } else if (!dtValLlvm->isPointerTy()) {
-                llvm::Value* asI64 = builder_.CreatePtrToInt(slotV, i64());
-                if (dtValLlvm->isDoubleTy())
-                    dtValDecoded = builder_.CreateBitCast(asI64, dtValLlvm);
-                else if (dtValLlvm->isFloatTy())
-                    dtValDecoded = builder_.CreateBitCast(
-                        builder_.CreateTrunc(asI64, i32()), dtValLlvm);
-                else if (dtValLlvm->isIntegerTy(64))
-                    dtValDecoded = asI64;
-                else
-                    dtValDecoded = builder_.CreateTrunc(asI64, dtValLlvm);
-            } else {
-                dtValDecoded = slotV;  // pointer value (string/class): a borrow
-            }
+            // Decode the target value. NOTE (#3717 §6b): this arm's
+            // `loadAsStruct` predicate is `dtValLlvm->isStructTy()` alone —
+            // broader than lowerDictEntryFor's / wrapDictionaryAsIEnumerable's
+            // `valRec || (valNullableVal && isStructTy())` (see
+            // decodeDictValueAt's declaration for why the two are preserved
+            // separately rather than merged: they are not proven equivalent
+            // for a struct-lowering V that is neither a record nor a nullable
+            // value type). Identical decode to GetOrNull's stored-slot unbox
+            // a few arms down otherwise: struct -> load the box, pointer ->
+            // the borrow itself, scalar -> ptrtoint + trunc/bitcast.
+            llvm::Value* dtValDecoded = decodeDictValueAt(
+                dtValLlvm, dtValsArr, dtIdx,
+                /*loadAsStruct=*/dtValLlvm->isStructTy(), "dictterm.vrec");
 
             // Free every per-key blob (bz_dict_keys_gen mallocs one per
             // entry regardless of which index is chosen — mirrors

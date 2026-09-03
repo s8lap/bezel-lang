@@ -6783,8 +6783,72 @@ bool Emitter::lowerDictValuesFor(const ast::ForStmt& fs) {
 // produced by bz_dict_keys_str is retained and lives exactly for the loop body,
 // then released in the increment block (mirrors lowerDictKeysFor's free pass).
 //
-// The snapshot arrays themselves (void** from bz_dict_values_str and char**/i64*
+// The snapshot arrays themselves (void** from bz_dict_values_str and void**/i64*
 // from bz_dict_keys_str) are malloc'd by the runtime and freed at endBB.
+
+// narrow #3717 / §4.8 / §28.9: the per-index DictionaryEntry<K,V> decode
+// shared by this function, `wrapDictionaryAsIEnumerable` (LlvmBackend_
+// Assign.cpp) and #3576's First/Last/ElementAt arm (LlvmBackend_Calls.cpp).
+// See the declarations in LlvmBackend_impl.hpp for the full rationale;
+// snapshotting, sorting and freeing stay copy-specific at each call site.
+std::pair<llvm::Value*, llvm::Value*> Emitter::decodeDictStringKeyAt(
+        llvm::Value* keysArr, llvm::Value* lensArr, llvm::Value* idx) {
+    auto* mallocFn = declareC("malloc", ptrTy(), {i64()});
+    auto* memcpyFn = declareC("memcpy", ptrTy(), {ptrTy(), ptrTy(), i64()});
+    auto* callocFn = declareC("calloc", ptrTy(), {i64(), i64()});
+    auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
+    uint64_t strSz = module_->getDataLayout().getTypeAllocSize(stringType());
+    llvm::Value* kpPtr = builder_.CreateGEP(ptrTy(), keysArr, idx);
+    llvm::Value* kp    = builder_.CreateLoad(ptrTy(), kpPtr);
+    llvm::Value* lpPtr = builder_.CreateGEP(i64(), lensArr, idx);
+    llvm::Value* kl    = builder_.CreateLoad(i64(), lpPtr);
+    llvm::Value* dataSz  = builder_.CreateAdd(kl, builder_.getInt64(1));
+    llvm::Value* dataCpy = builder_.CreateCall(mallocFn, {dataSz});
+    builder_.CreateCall(memcpyFn, {dataCpy, kp, kl});
+    llvm::Value* nulPtr = builder_.CreateGEP(i8Ty, dataCpy, kl);
+    builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 0), nulPtr);
+    llvm::Value* strObj = builder_.CreateCall(callocFn,
+        {builder_.getInt64(1), builder_.getInt64((int64_t)strSz)});
+    builder_.CreateStore(dataCpy,
+        builder_.CreateStructGEP(stringType(), strObj, 0));
+    builder_.CreateStore(kl,
+        builder_.CreateStructGEP(stringType(), strObj, 1));
+    builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 1),
+        builder_.CreateStructGEP(stringType(), strObj, 2));
+    initStringRc(strObj);
+    return {strObj, kp};
+}
+
+std::pair<llvm::Value*, llvm::Value*> Emitter::decodeDictGenericKeyAt(
+        llvm::Type* keyLlvm, llvm::Value* keysArr, llvm::Value* idx,
+        const char* namePrefix) {
+    llvm::Value* kpPtr = builder_.CreateGEP(ptrTy(), keysArr, idx);
+    llvm::Value* keyPtr = builder_.CreateLoad(ptrTy(), kpPtr);
+    llvm::Value* keyDecoded = builder_.CreateLoad(keyLlvm, keyPtr, namePrefix);
+    return {keyDecoded, keyPtr};
+}
+
+llvm::Value* Emitter::decodeDictValueAt(llvm::Type* valLlvm, llvm::Value* valsArr,
+                                        llvm::Value* idx, bool loadAsStruct,
+                                        const char* namePrefix) {
+    llvm::Value* vpPtr = builder_.CreateGEP(ptrTy(), valsArr, idx);
+    llvm::Value* slotV = builder_.CreateLoad(ptrTy(), vpPtr);
+    if (loadAsStruct)
+        return builder_.CreateLoad(valLlvm, slotV, namePrefix);
+    if (!valLlvm->isPointerTy()) {
+        llvm::Value* asI64 = builder_.CreatePtrToInt(slotV, i64());
+        if (valLlvm->isDoubleTy())
+            return builder_.CreateBitCast(asI64, valLlvm);
+        if (valLlvm->isFloatTy())
+            return builder_.CreateBitCast(
+                builder_.CreateTrunc(asI64, i32()), valLlvm);
+        if (valLlvm->isIntegerTy(64))
+            return asI64;
+        return builder_.CreateTrunc(asI64, valLlvm);
+    }
+    return slotV;  // pointer value (string/class): a borrow
+}
+
 bool Emitter::lowerDictEntryFor(const ast::ForStmt& fs) {
     if (!fs.iterable) return false;
     // Detect: iterable type is Dictionary<K,V>.
@@ -6940,72 +7004,29 @@ bool Emitter::lowerDictEntryFor(const ast::ForStmt& fs) {
     {
         llvm::Value* idxB = builder_.CreateLoad(i64(), idxSlot);
 
-        // --- decode key ---
+        // --- decode key (narrow #3717: shared with wrapDictionaryAsIEnumerable
+        // and #3576's arm; the raw key pointer these return is freed BELOW in
+        // incBB, unchanged from before this fix — see the helpers' declarations
+        // in LlvmBackend_impl.hpp) ---
         llvm::Value* keyDecoded;
         if (isStringKey) {
-            // Same logic as lowerDictKeysFor: malloc+memcpy the key bytes
-            // into a new string object and ref-count it.
-            auto* mallocFn = declareC("malloc", ptrTy(), {i64()});
-            auto* memcpyFn = declareC("memcpy", ptrTy(), {ptrTy(), ptrTy(), i64()});
-            auto* callocFn = declareC("calloc", ptrTy(), {i64(), i64()});
-            auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
-            uint64_t strSz =
-                module_->getDataLayout().getTypeAllocSize(stringType());
-            llvm::Value* kpPtr = builder_.CreateGEP(ptrTy(), keysArr, idxB);
-            llvm::Value* kp    = builder_.CreateLoad(ptrTy(), kpPtr); // char*
-            llvm::Value* lpPtr = builder_.CreateGEP(i64(), lensArr, idxB);
-            llvm::Value* kl    = builder_.CreateLoad(i64(), lpPtr);
-            llvm::Value* dataSz  = builder_.CreateAdd(kl, builder_.getInt64(1));
-            llvm::Value* dataCpy = builder_.CreateCall(mallocFn, {dataSz});
-            builder_.CreateCall(memcpyFn, {dataCpy, kp, kl});
-            llvm::Value* nulPtr = builder_.CreateGEP(i8Ty, dataCpy, kl);
-            builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 0), nulPtr);
-            llvm::Value* strObj = builder_.CreateCall(callocFn,
-                {builder_.getInt64(1), builder_.getInt64((int64_t)strSz)});
-            builder_.CreateStore(dataCpy,
-                builder_.CreateStructGEP(stringType(), strObj, 0));
-            builder_.CreateStore(kl,
-                builder_.CreateStructGEP(stringType(), strObj, 1));
-            builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 1),
-                builder_.CreateStructGEP(stringType(), strObj, 2));
-            initStringRc(strObj);
-            keyDecoded = strObj;
+            keyDecoded = decodeDictStringKeyAt(keysArr, lensArr, idxB).first;
         } else if (useGen) {
-            // Generic key: mirrors emitGenericKeyTableFor exactly.
             // bz_dict_keys_gen returns void** where each element is a malloc'd
             // copy of the key's raw bytes (NOT inttoptr-encoded — the raw bytes
             // are loaded directly as keyLlvm). The copy must be freed in incBB
             // (same free pass as emitGenericKeyTableFor performs).
-            llvm::Value* kpPtr = builder_.CreateGEP(ptrTy(), keysArr, idxB);
-            llvm::Value* keyPtr = builder_.CreateLoad(ptrTy(), kpPtr);
-            keyDecoded = builder_.CreateLoad(keyLlvm, keyPtr, "de.kgen");
+            keyDecoded = decodeDictGenericKeyAt(keyLlvm, keysArr, idxB, "de.kgen").first;
         } else {
             // Non-string non-generic key — should not happen; emit null.
             keyDecoded = llvm::Constant::getNullValue(keyLlvm);
         }
 
         // --- decode value (mirrors lowerDictValuesFor) ---
-        llvm::Value* vpPtr = builder_.CreateGEP(ptrTy(), valsArr, idxB);
-        llvm::Value* slotV = builder_.CreateLoad(ptrTy(), vpPtr);
-        llvm::Value* valDecoded;
-        if (valRec) {
-            valDecoded = builder_.CreateLoad(valLlvm, slotV, "de.vrec");
-        } else if (valNullableVal && valLlvm->isStructTy()) {
-            valDecoded = builder_.CreateLoad(valLlvm, slotV, "de.vnv");
-        } else if (!valLlvm->isPointerTy()) {
-            llvm::Value* asI64 = builder_.CreatePtrToInt(slotV, i64());
-            if (valLlvm->isDoubleTy())
-                valDecoded = builder_.CreateBitCast(asI64, valLlvm);
-            else if (valLlvm->isFloatTy())
-                valDecoded = builder_.CreateBitCast(
-                    builder_.CreateTrunc(asI64, i32()), valLlvm);
-            else if (valLlvm->isIntegerTy(64))
-                valDecoded = asI64;
-            else
-                valDecoded = builder_.CreateTrunc(asI64, valLlvm);
-        } else {
-            valDecoded = slotV;
-        }
+        llvm::Value* valDecoded = decodeDictValueAt(
+            valLlvm, valsArr, idxB,
+            /*loadAsStruct=*/valRec || (valNullableVal && valLlvm->isStructTy()),
+            valRec ? "de.vrec" : "de.vnv");
 
         // Store key at field 0, value at field 1 of the entry struct.
         builder_.CreateStore(keyDecoded,
