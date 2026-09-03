@@ -8421,6 +8421,44 @@ llvm::Value* Emitter::buildRecordValue(
             init = fd->initializer.get();
         else if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(m->decl))
             init = pd->autoInitializer.get();  // §9.2: `property X := v;`
+        // fix #3671 (§9.1 / §9.2 / §22.8 / §2.8.2, v0.286): an IMPORTED body
+        // member (m->decl == nullptr, so `init` above always misses) first
+        // tries the SAME full parsed-AST-expr replay `emitOwnFieldInit`
+        // (LlvmBackend_Setup.cpp) uses for a class's own imported field —
+        // `ctx_.importedInstanceFieldInitExpr`, the load-time-reconstructed
+        // Expr* ModuleLoader's `parseAndAttachFieldInit` (#2874) publishes —
+        // BEFORE falling back to the narrower constant-fold-only replay
+        // (#2467/#328) below. Setting `init` here, ahead of the `if (init)`
+        // block, reuses that block's existing §5.1 widening / §23.1
+        // nullable-value wrap verbatim instead of duplicating them — the
+        // record side deliberately does NOT also reuse
+        // `emitOwnFieldInit`'s class-only retain/box/§29.7-wrap logic
+        // beyond that block: §9/§9.7 make a record's reference fields
+        // borrows with no disposer, so none of that applies to a by-value
+        // record, exactly as this loop's `if (init)` block already omits it
+        // for a LOCAL record field's initializer.
+        //
+        // Reach today: ModuleMetadataBuilder.cpp's `isGenericMonomorphized`
+        // gate (#2871) populates the wire's `fieldInitText`/parsed-expr
+        // carriage only for a GENERIC record's (or generic class's)
+        // instance field — a NON-generic record's non-constant field
+        // initializer is not carried across the module boundary AT ALL yet
+        // (its Field branch of `convertMember` never received the
+        // `|| Record` widening #2525 already gave the ConstructorSymbol
+        // branch's `ctorBodyText`, for the identical "a record has no
+        // cross-module call to replay an initializer through" reason —
+        // filed as #3723, a writer-side gap outside this file's ownership,
+        // MEASURED via a real two-module build: `public record R(a: int) {
+        // public b: int := Helper(); }` still reads `b == 0` after this fix
+        // when `R` is non-generic). So this lookup legitimately returns
+        // null for a non-generic record and falls through UNCHANGED to the
+        // fold-only path below — no regression for that shape, just not yet
+        // this fix's full reach.
+        if (!init && m->decl == nullptr) {
+            if (const ast::Expr* parsedInit =
+                    ctx_.importedInstanceFieldInitExpr(m))
+                init = parsedInit;
+        }
         auto idxIt = fieldIndex_.find(m);
         if (idxIt == fieldIndex_.end()) continue;
         if (init) {
@@ -8505,23 +8543,66 @@ llvm::Value* Emitter::buildRecordValue(
         // (harmless, since the map lookup would find nothing, but
         // misleading) importedConstValue probe.
         if (m->decl != nullptr) continue;
+        bool replayed = false;
         const std::string* text = ctx_.importedConstValue(m);
-        if (!text || text->empty()) continue;
-        const sema::TypeRef* fty = recordMemberTypeResolved(m);
-        llvm::Value* v = foldImportedConstText(*text, fty);
-        if (!v) continue;
-        if (isNullableValueTy(fty)) {
-            auto* expectedSt = nullableValueStructTy(fty);
-            if (v->getType() != expectedSt) {
-                if (v->getType()->isPointerTy() &&
-                    llvm::isa<llvm::ConstantPointerNull>(v))
-                    v = nullableValueNull(fty);
-                else if (v->getType() == expectedSt->getElementType(1))
-                    v = wrapNullableValue(fty, v);
+        if (text && !text->empty()) {
+            const sema::TypeRef* fty = recordMemberTypeResolved(m);
+            if (llvm::Value* v = foldImportedConstText(*text, fty)) {
+                if (isNullableValueTy(fty)) {
+                    auto* expectedSt = nullableValueStructTy(fty);
+                    if (v->getType() != expectedSt) {
+                        if (v->getType()->isPointerTy() &&
+                            llvm::isa<llvm::ConstantPointerNull>(v))
+                            v = nullableValueNull(fty);
+                        else if (v->getType() == expectedSt->getElementType(1))
+                            v = wrapNullableValue(fty, v);
+                    }
+                }
+                builder_.CreateStore(
+                    v, builder_.CreateStructGEP(st, slot, idxIt->second));
+                replayed = true;
             }
         }
-        builder_.CreateStore(
-            v, builder_.CreateStructGEP(st, slot, idxIt->second));
+        // fix #3671 (§2.8.2 "No restrictions beyond visibility" / §9.1 /
+        // §22.8, v0.286): mirror `emitOwnFieldInit`'s own #2874/#2860
+        // construction-site diagnostic — a LOUD reject instead of a silent
+        // §7.9-default zero, for the one case codegen can actually detect it
+        // in today: a GENERIC record (or a generic class monomorphizing a
+        // record-typed member) whose wire carried
+        // `importedInstanceFieldInitText` (so the exporter DID have a
+        // non-static field initializer here) but NEITHER the parsed-expr
+        // replay above NOR the constant fold just above produced a value (a
+        // reconstruction parse/sema failure — e.g. the initializer
+        // references a sibling that is not part of the exported public
+        // surface — or a fold that returned null). A non-generic record's
+        // initializer text is not carried across the wire at all yet
+        // (#3723), so this positive-evidence guard cannot false-fire on
+        // it — that shape still takes the silent-default path below,
+        // UNCHANGED from before this fix (§6c of this run's lane rules: no
+        // signal reaching codegen, no reject — the loud diagnostic needs
+        // #3723 first).
+        if (!replayed && !init) {
+            if (const std::string* initText =
+                    ctx_.importedInstanceFieldInitText(m)) {
+                ctx_.diagnostics().report(
+                    Severity::Error, importedFieldInitDiagLoc_,
+                    "constructing imported record `" + std::string(t->name) +
+                        "` cannot run the initializer of its field `" +
+                        std::string(m->name) + "` (`:= " + *initText +
+                        "`): a record's construction is fully inline with no "
+                        "cross-module call to hook a replay into, so an "
+                        "initializer crosses the module boundary only as a "
+                        "reconstructed parsed expression or a constant value "
+                        "folded into the interface, and neither reached this "
+                        "field — either it is not a compile-time-constant "
+                        "expression and this implementation could not "
+                        "reconstruct it (#2874/#3671), or it references "
+                        "something not visible across the module boundary. "
+                        "Per \xC2\xA7""2.8.2 this construction is rejected "
+                        "rather than silently leaving the field at its "
+                        "\xC2\xA7""7.9 default");
+            }
+        }
     }
 
     // §9.1 positional record: a bare positional argument list whose count
