@@ -401,25 +401,31 @@ BEZEL_TEST(static_auto_property_nonfoldable_init_3749,
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
 
-// T8 — KNOWN GAP (pre-existing, NOT introduced or worsened by this fix,
-// measured on this lane's pre-fix HEAD too — see this file's PASS-WITH/
-// FAIL-WITHOUT notes): a GENERIC type's static auto-property has no
-// per-instantiation backing storage at all — `staticFieldGlobal`'s
-// auto-property arm (`isStaticAutoProperty(sym_raw)` branch,
-// LlvmBackend_Setup.cpp) keys directly on `staticGlobals_[ps]`, the ONE
-// template-level global, with no `genericInstStaticGlobals_`-style
-// per-instantiation redirection the FieldSymbol path has (#709/#1513) — so
-// every instantiation of `Box<T>.X` ALIASES the same process-wide cell,
-// contradicting §22.12's "Each distinct instantiation has its own static
-// state". This pre-dates #3749 (reproduces identically for the ALREADY-
-// working #743 plain get/set case with no initializer at all — confirmed on
-// this lane's pre-fix HEAD) and this fix's runtime store does not touch
-// `staticFieldGlobal` at all, so it neither causes nor repairs the sharing.
-// Pinned here (not silently left unexercised) so the actual current
-// behavior — instantiation 2 observes instantiation 1's counter-driven
-// value instead of running its own initializer — is visible and does not
-// regress further; tracked as its own follow-up issue (filed separately
-// from #3749, which is scoped to "does the initializer run at all").
+// T8 — KNOWN GAP, already tracked as issue #2861 (found by search before
+// this fix, NOT filed by it — LANE_RULES §15 "search first before gh issue
+// create"): a GENERIC type's static auto-property has no per-instantiation
+// backing storage at all — `staticFieldGlobal`'s auto-property arm
+// (`isStaticAutoProperty(sym_raw)` branch, LlvmBackend_Setup.cpp) keys
+// directly on `staticGlobals_[ps]`, the ONE template-level global, with no
+// `genericInstStaticGlobals_`-style per-instantiation redirection the
+// FieldSymbol path has (#709/#1513) — so every instantiation of `Box<T>.X`
+// ALIASES the same process-wide cell, contradicting §22.12's "Each distinct
+// instantiation has its own static state". #2861 pre-dates #3749 and
+// reproduces identically for the ALREADY-working #743 plain get/set case
+// with no initializer at all (confirmed on this lane's pre-#3749 HEAD) —
+// this fix's runtime store does not touch `staticFieldGlobal` at all, so it
+// neither causes nor repairs the sharing #2861 tracks.
+//
+// The PINNED VALUE below (4) is #3749-POST-fix only, not "unchanged before
+// and after": pre-#3749, EVERY static auto-property initializer was inert
+// (including this generic one), so both instantiations read a=b=0 and the
+// checksum was 0. Post-#3749 the ONE shared cell's initializer now actually
+// runs (exactly once, via the same run-once sfinit this fix wires up), so
+// both instantiations observe that one shared run's value (a=b=100) instead
+// of each independently running its own — checksum 4. #3749 therefore DOES
+// change this row's behavior (silently-inert -> silently-aliased), which is
+// real progress (the initializer runs at all now) but not a fix for #2861's
+// aliasing, which remains exactly as broken as before.
 BEZEL_TEST(static_auto_property_nonfoldable_init_3749,
            t8_known_gap_generic_instantiations_alias_one_shared_global_22_12) {
     auto r = runAotChecked(
