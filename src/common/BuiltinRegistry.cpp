@@ -658,7 +658,7 @@ constexpr std::array<std::string_view, 4> kBuiltinNamedArgTableHeads = {
 };
 
 // fix #3589 (stdlib §5 / §9.6): see the header — the string-receiver LINQ
-// exemption gate. 37 names; two independent hand-spellings (the `.` and `?.`
+// exemption gate. 39 names; two independent hand-spellings (the `.` and `?.`
 // member-access gates) were found byte-identical, confirming they answer the
 // one question. fix #3636 removed `ForEach`: instance `.ForEach(...)` is NOT
 // in stdlib §5 (the only documented `ForEach` is the unrelated static
@@ -666,7 +666,17 @@ constexpr std::array<std::string_view, 4> kBuiltinNamedArgTableHeads = {
 // `LlvmBackend_Calls.cpp` was retired in the same fix, and the builtin-
 // collection twin (`kBuiltinCollectionLinqOperatorNames` below) already
 // excluded `ForEach` — so the two tables are now consistent on this name.
-constexpr std::array<std::string_view, 37> kStringLinqOperatorMemberNames = {
+// fix #3786 (stdlib §5.1, v0.286) added `MinOrNull`/`MaxOrNull`: the
+// collection twin already admitted them (fix #2783's array arm), and this
+// table was the one remaining gap #3444 flagged and explicitly declined to
+// close without first proving the string-receiver materialize path lowers
+// them correctly (issue 3444's warning) — fix #3764 completed that proof by
+// adding both names to `LlvmBackend_Calls.cpp`'s `isArrTerminal`, the SAME
+// disjunction `isStringRecvTerm` already sits in, so a string receiver now
+// materializes via `bz_lazy_to_array(lazy, esz=4)` and runs the existing
+// #2783 array arm exactly as First/Sum/Min/Max/... already do (verified
+// end-to-end below before this table changed, not assumed).
+constexpr std::array<std::string_view, 39> kStringLinqOperatorMemberNames = {
     "Where",     "Select",     "SelectMany", "Skip",
     "Take",      "TakeWhile",  "SkipWhile",  "Distinct",
     "OrderBy",   "OrderByDescending",        "ThenBy",
@@ -677,7 +687,7 @@ constexpr std::array<std::string_view, 37> kStringLinqOperatorMemberNames = {
     "Last",      "Single",     "ElementAt",  "FirstOrNull",
     "LastOrNull", "SingleOrNull",            "ToArray",
     "ToSet",     "ToDictionary",             "GroupBy",
-    "Aggregate",
+    "Aggregate", "MinOrNull",  "MaxOrNull",
 };
 
 // fix #3589 (stdlib §5): see the header — the builtin-collection-family

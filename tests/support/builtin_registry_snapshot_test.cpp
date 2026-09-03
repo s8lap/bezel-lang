@@ -915,28 +915,33 @@ BEZEL_TEST(builtin_registry_snapshot, keyword_alias_builtin_set) {
 //     verifier: "Instruction has a name, but provides a void value!"), and
 //     the builtin-collection twin table (`kBuiltinCollectionLinqOperatorNames`,
 //     see below) already excluded `ForEach` — so the two tables now agree.
-//     The negatives matter more than usual here: `ElementAtOrNull`/
-//     `MinOrNull`/`MaxOrNull`/`Contains`/`OfType`/`ForEach` are real (or, for
-//     `OfType`, formerly real) stdlib §5/§5.1 names that stay OUT of this
-//     particular table — issue #3444 tracks whether the first three should
-//     be added, but only after their string/IEnumerable<char> lowering is
-//     exercised end-to-end, which this fix does not do.
+//     fix #3786 ADDED `MinOrNull`/`MaxOrNull` (stdlib §5.1): issue #3444's
+//     widening question for these two names is resolved — the
+//     string-receiver materialize path (`isStringRecvTerm`, part of the same
+//     `lazyTerminal` disjunction #3764 widened) was proven end-to-end to
+//     compose with the #2783 array arm, and a genuine codegen bug in the
+//     `elemTypeRef`/`isValTy` derivation for a string receiver (found while
+//     proving it) was fixed alongside. `ElementAtOrNull`/`OfType` remain
+//     OUT — `ElementAtOrNull` has no lowering on ANY receiver (a separate,
+//     larger gap: #3444/#3764), and `OfType` was removed from the stdlib
+//     entirely at v0.284 (issue #3559) — #3786 does not touch either.
 BEZEL_TEST(builtin_registry_snapshot, string_linq_operator_member_name_set) {
-    static constexpr std::array<std::string_view, 37> kSnapshot = {
+    static constexpr std::array<std::string_view, 39> kSnapshot = {
         "Where", "Select", "SelectMany", "Skip", "Take", "TakeWhile",
         "SkipWhile", "Distinct", "OrderBy", "OrderByDescending", "ThenBy",
         "ThenByDescending", "Concat", "Zip", "Union", "Intersect", "Except",
         "Reverse", "Any", "All", "Count", "Sum", "Min", "Max", "Average",
         "First", "Last", "Single", "ElementAt", "FirstOrNull", "LastOrNull",
         "SingleOrNull", "ToArray", "ToSet", "ToDictionary", "GroupBy",
-        "Aggregate",
+        "Aggregate", "MinOrNull", "MaxOrNull",
     };
     for (auto n : kSnapshot) BEZEL_EXPECT_TRUE(isStringLinqOperatorMemberName(n));
-    // Real stdlib §5/§5.1 names deliberately absent from THIS table (#3444's
-    // still-open widening question), plus `ForEach` retired by #3636 (not a
-    // stdlib §5 instance member — only the static `Parallel.ForEach`
-    // exists), plus the retired `OfType` and a near-neighbour typo.
-    for (std::string_view n : {"ElementAtOrNull", "MinOrNull", "MaxOrNull",
+    // Real stdlib §5/§5.1 names deliberately absent from THIS table (see
+    // above: `ElementAtOrNull`/`OfType` stay gated on purpose), plus
+    // `ForEach` retired by #3636 (not a stdlib §5 instance member — only the
+    // static `Parallel.ForEach` exists), plus a retired/never-real name and a
+    // near-neighbour typo.
+    for (std::string_view n : {"ElementAtOrNull",
                                "Contains", "OfType", "ToList", "Sorted",
                                "Reversed", "ForEach", ""})
         BEZEL_EXPECT_FALSE(isStringLinqOperatorMemberName(n));

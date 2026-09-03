@@ -3753,8 +3753,27 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         if ((m == "MinOrNull" || m == "MaxOrNull") && call.args.empty() &&
             isArr) {
             bool isMaxOrNull = (m == "MaxOrNull");
-            sema::TypeRef* elemTypeRef =
-                (recvTy && !recvTy->genericArgs.empty())
+            // fix #3786 (stdlib §5.1 / §9.6, v0.286): a STRING receiver's
+            // `recvTy` is the bare `string` Primitive TypeRef, which carries
+            // no `genericArgs` — so the generic-collection derivation below
+            // yields `nullptr` for it. Left uncorrected, that makes the
+            // empty-path/`isValTy` decision further down treat `char` (a
+            // value type, §4.5 — `char?` is `{i8 hasValue; i32}`, fix #849)
+            // as a POINTER-typed element instead, returning a bare i32 with
+            // 0 doubling as both "null" and the valid code point U+0000.
+            // Measured before this fix: `"".MinOrNull()` compared `= null`
+            // as `False` (should be `True`) — the same latent shape #1252's
+            // null-slot degrade takes, but here from a genuinely wrong `T?`
+            // ENCODING, not a stale pointer. `char` is the only element type
+            // this can happen for among admitted §5 terminal-materialize
+            // families: LinkedList<T>/Range<T>/vtable-IEnumerable<T>/Set
+            // receivers all carry a real `genericArgs[0]`. Substitute the
+            // same `char` TypeRef `lowerToLazyEnumerator`'s string arm
+            // already builds for the identical reason
+            // (LlvmBackend_Calls3.cpp, fix #1220).
+            sema::TypeRef* elemTypeRef = isStringRecvTerm
+                ? ctx_.primitiveTypeRef(sema::PrimitiveType::Char)
+                : (recvTy && !recvTy->genericArgs.empty())
                     ? recvTy->genericArgs[0] : nullptr;
             llvm::Type* elemLLTy = getElemTy();
             auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});

@@ -38,25 +38,28 @@
 // arms exactly as `#3735` left them — `other_operators_still_route_the_same`
 // below pins that.
 //
-// ONE FAMILY DELIBERATELY STAYS EXCLUDED: `string`. Measured on this tree:
-// `"abc".MinOrNull()` draws "string member `.MinOrNull` is not yet supported
-// in codegen" from a SEPARATE, sema-level closed-surface gate
-// (`common::isStringLinqOperatorMemberName`,
-// src/common/BuiltinRegistry.cpp's `kStringLinqOperatorMemberNames` — 37
+// `string` WAS DELIBERATELY EXCLUDED HERE, AND IS NO LONGER (fix #3786).
+// At the time this file was written, `"abc".MinOrNull()` drew "string member
+// `.MinOrNull` is not yet supported in codegen" from a SEPARATE, sema-level
+// closed-surface gate (`common::isStringLinqOperatorMemberName`,
+// src/common/BuiltinRegistry.cpp's `kStringLinqOperatorMemberNames`, then 37
 // names) that runs in `ExprTypecheck_Calls.cpp` BEFORE codegen is ever
-// reached, so this fix (which only touches codegen) cannot reach it, and
-// this file does not claim to. This is the residual half of issue #3444
+// reached — this fix (which only touched codegen) could not reach it, and
+// this file did not claim to. That was the residual half of issue #3444
 // ("isLinqOp name list has drifted from stdlib §5 — MinOrNull/MaxOrNull work
 // on Array<T> but are refused on a string receiver"), which fix #3589's
-// later consolidation deliberately left untouched per its own commit body
-// ("its narrower string-receiver MinOrNull/MaxOrNull/ElementAtOrNull
-// widening question is untouched, per its own explicit warning against
-// adding names without exercising the lowering end-to-end"). The sibling
-// table `kBuiltinCollectionLinqOperatorNames` (the same gate for the
-// builtin-collection family) ALREADY lists `MinOrNull`/`MaxOrNull` (38
-// names) — filed as issue #3786 (not fixed here — outside this lane's owned
-// files, which are `LlvmBackend_Calls.cpp` and `tests/codegen/**`, not
-// `src/common/` or `src/sema/`).
+// consolidation deliberately left untouched per its own commit body ("its
+// narrower string-receiver MinOrNull/MaxOrNull/ElementAtOrNull widening
+// question is untouched, per its own explicit warning against adding names
+// without exercising the lowering end-to-end"). Fix #3786 completed that
+// proof — the string materialize path (`isStringRecvTerm`, already part of
+// the `lazyTerminal` disjunction this fix widened) composes with the same
+// #2783 array arm exactly as the other five families above — and added
+// `MinOrNull`/`MaxOrNull` to `kStringLinqOperatorMemberNames` (39 names).
+// See `minornull_maxornull_string_receiver_3786_test.cpp` for the
+// string-receiver value rows; this file's own scope stays the five
+// originally-fixed non-array families plus the `string`-still-excluded
+// history above, kept for the record.
 //
 // FAIL-WITHOUT / PASS-WITH (lane rules §R12-H): with `isArrTerminal` reverted
 // to its pre-fix form (a scratch stash of just this hunk, never `git
