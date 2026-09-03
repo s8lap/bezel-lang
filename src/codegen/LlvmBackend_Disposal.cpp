@@ -5196,6 +5196,39 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
             emitInlineArrayStringReleases(it->slot, it->inlineArrayElemType);
             continue;
         }
+        // fix #3752 (§28.2 / §27.5 / §28.9, v0.286): the DEFERRED CONTENT
+        // release for a `string` / function-typed local captured from a
+        // STRICTLY DEEPER scope. `slot` is the cell HOLDER; the value the local
+        // owns lives one indirection further in, in the cell. The capturing
+        // env's envdtor was suppressed at the capture site (it would have run at
+        // the INNER scope's end, freeing a value the local still uses), so this
+        // is the single release of that single +1 — on BOTH exit edges, since
+        // the reference dies either way and one exit goes one way only.
+        // NULL SAFETY: guarded boxing null-initialises the holder in the entry
+        // block, and a path that never reached the capture site leaves it null,
+        // so the holder load is branch-guarded (both release helpers are
+        // null-safe for the CONTENT, but the cell load itself is not).
+        // Nulling the cell slot afterwards keeps a re-entered guarded cell (a
+        // case arm inside a loop) from releasing the same value twice.
+        if (it->capturedCellContentRelease) {
+            llvm::Function* hfn = builder_.GetInsertBlock()->getParent();
+            llvm::Value* cell =
+                builder_.CreateLoad(ptrTy(), it->slot, "cellcnt.cell");
+            llvm::Value* live = builder_.CreateICmpNE(
+                cell, llvm::ConstantPointerNull::get(ptrTy()), "cellcnt.live");
+            auto* doBB = llvm::BasicBlock::Create(llvm_, "cellcnt.do", hfn);
+            auto* contBB = llvm::BasicBlock::Create(llvm_, "cellcnt.cont", hfn);
+            builder_.CreateCondBr(live, doBB, contBB);
+            builder_.SetInsertPoint(doBB);
+            llvm::Value* content =
+                builder_.CreateLoad(ptrTy(), cell, "cellcnt.val");
+            if (it->capturedCellContentString) emitStringRelease(content);
+            else emitClosureRelease(content);
+            builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), cell);
+            builder_.CreateBr(contBB);
+            builder_.SetInsertPoint(contBB);
+            continue;
+        }
         // #429 / §27.5: a boxed capture cell (shared heap allocation from
         // boxLocalSlot) whose owning lambda is proven non-escaping.  `slot`
         // is the ptr-alloca (newSlot) holding the cell pointer.  At scope end

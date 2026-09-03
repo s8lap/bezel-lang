@@ -1639,6 +1639,22 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         // inner-scope (lambda-declaration) exit would corrupt subsequent
         // iterations.  Such cells continue to be freed at the outer scope exit
         // through the variable's own disposal entry (future work).
+        // §27.5 / §28.9 (#969), read ONCE for this capture: was the captured
+        // local declared in a scope STRICTLY SHALLOWER than this capture site?
+        // `declScopeDepth_` is #969's own predicate; three consumers below need
+        // it — the #3498 guarded-boxing admission, the #3508 deferred cell free,
+        // and the #3752 deferred CONTENT release — and all three must read it at
+        // the same depth (they run in this one block, one after the other), so
+        // it is hoisted here rather than respelled per consumer.
+        bool declaredShallower = false;
+        std::size_t declScopeDepth = 0;
+        {
+            auto ddit = declScopeDepth_.find(static_cast<const void*>(decl));
+            if (ddit != declScopeDepth_.end()) {
+                declaredShallower = ddit->second < disposeStack_.size();
+                declScopeDepth = ddit->second;
+            }
+        }
         if (!alreadyBoxed && !isForVar &&
             currentFn_ == cellFreeEligibleFn_ &&
             cellFreeEligible_.count(static_cast<const void*>(decl))) {
@@ -1729,15 +1745,12 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
             // respelled, and it is read at the same depth the consumer will read
             // it at (both run inside this scope, one immediately after the
             // other), so the two cannot disagree.
-            bool declaredShallower = false;
-            std::size_t declScopeDepth = 0;
-            {
-                auto ddit = declScopeDepth_.find(static_cast<const void*>(decl));
-                if (ddit != declScopeDepth_.end()) {
-                    declaredShallower = ddit->second < disposeStack_.size();
-                    declScopeDepth = ddit->second;
-                }
-            }
+            //
+            // fix #3752 (§27.5 / §28.9 / §28.2, v0.286): the two values are now
+            // computed ONCE, just above this block — the deferred CONTENT
+            // release added by that fix needs the same depth fact and must read
+            // it at the same point, so respelling it here would be a second
+            // spelling of one question.
             bool guardedOk = !wasGuardedLocal || isPatternBinding ||
                              loopStack_.empty() || declaredShallower;
             if (guardedOk) {
@@ -1884,6 +1897,65 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         ce.suppressContentRcInEnvdtor = mutatedSharedCaptureCell(
             static_cast<const void*>(decl), ce.semaTy,
             /*freshCellPerIteration=*/forceFresh);
+        // fix #3752 (§28.2 / §27.5 / §28.9, v0.286): THE FIRST capture's
+        // envdtor is the captured local's DEFERRED SCOPE-END RELEASE — and a
+        // deferred release is only sound when the env dies at or AFTER the
+        // local's own scope end. That is exactly what `declaredShallower`
+        // denies: the local was declared in a strictly SHALLOWER scope than
+        // this capture site, so the closure holding this env is released at the
+        // INNER scope's end while the local is still live and read afterwards.
+        // The envdtor then frees the string/closure the local still owns —
+        // measured as `heap-use-after-free ... freed by ... bz$lam$N$envdtor`
+        // on
+        //     var f := lambda(): int => 11;
+        //     do var g := lambda(): int => f(); total := g(); end;
+        //     return total + f();        // <- reads freed 40-byte cell
+        // and, for the §28.2 shape issue 3752 was filed on, as a SIGSEGV under
+        // `--checked-disposal` where the method-level twin raises a clean
+        // DisposedAccessException: the backstop cannot fire through a closure
+        // the envdtor already freed.
+        //
+        // The repair is the CONTENT analogue of what #3508 already does for the
+        // CELL, under the very same gate and the very same proof: suppress the
+        // early envdtor release and register ONE release in the OWNER's scope.
+        // `cellFreeEligible_` is the proof that EVERY lambda capturing this
+        // local is non-escaping, so every env is dead by the owner's scope end;
+        // `declScopeDepth_` names that scope. Accounting is exact, not a leak
+        // trade: the local's single +1 (its scope-end release suppressed by
+        // escape detection) is released exactly once, at the scope where it
+        // actually dies. 2nd-and-later captures are untouched (`!alreadyBoxed`)
+        // — they mint their own +1 and their envdtors stay balanced whenever
+        // they run.
+        //
+        // ORDER. The owner-scope entry is a MAIN-LOOP disposal, so it fires
+        // before the SECOND-pass `boxedCellFreeDeferred` that frees the cell it
+        // reads through (#1017's two-pass split), and after every inner scope
+        // has run — i.e. after the last envdtor that could observe the value.
+        const bool contentIsString = isStringTypeRefNonNull(ce.semaTy);
+        const bool contentIsClosure =
+            ce.semaTy && ce.semaTy->kind == sema::TypeRef::Kind::Function;
+        if ((contentIsString || contentIsClosure) && declaredShallower &&
+            !alreadyBoxed && !isForVar && declScopeDepth > 0 &&
+            currentFn_ == cellFreeEligibleFn_ &&
+            cellFreeEligible_.count(static_cast<const void*>(decl))) {
+            std::size_t ownerScopeIdx = declScopeDepth - 1;
+            if (ownerScopeIdx < disposeStack_.size()) {
+                ce.suppressContentRcInEnvdtor = true;
+                bool alreadyDeferred = false;
+                for (const auto& existing : disposeStack_[ownerScopeIdx])
+                    if (existing.slot == newSlot &&
+                        existing.capturedCellContentRelease) {
+                        alreadyDeferred = true;
+                        break;
+                    }
+                if (!alreadyDeferred) {
+                    Disposal dcr{newSlot, nullptr};
+                    dcr.capturedCellContentRelease = true;
+                    dcr.capturedCellContentString = contentIsString;
+                    disposeStack_[ownerScopeIdx].push_back(dcr);
+                }
+            }
+        }
         if (alreadyBoxed && !wasGuardedLocal && !ce.suppressContentRcInEnvdtor) {
             if (isStringTypeRefNonNull(ce.semaTy)) {
                 llvm::Value* str =

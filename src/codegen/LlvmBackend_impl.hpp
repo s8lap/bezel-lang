@@ -1644,6 +1644,30 @@ private:
         // escaping env holds the cell past scope exit → no UAF). `slot` is the
         // cell-holder ptr-alloca; the cell ptr may be null (free(null) no-op).
         bool boxedCellFreeDeferred = false;
+        // fix #3752 (§28.2 / §27.5 / §28.9, v0.286): the CONTENT analogue of
+        // `boxedCellFreeDeferred`. A runtime-managed (`string` / function-typed)
+        // local captured from a STRICTLY DEEPER scope keeps its single +1 in the
+        // capture cell; the capturing env's envdtor would have released it at
+        // the INNER scope's end, while the local is still live (a
+        // heap-use-after-free — see the registration site in lowerLambda). The
+        // envdtor release is suppressed there and this entry performs it in the
+        // scope that OWNS the local, reading the value THROUGH the cell
+        // (`slot` is the cell HOLDER ptr-alloca, exactly as for the two
+        // `boxedCellFree*` kinds). Fires on BOTH the normal and unwind exits —
+        // the reference dies either way and a given exit goes one way only, so
+        // exactly once per exit — and nulls the cell afterwards so a re-entered
+        // guarded cell cannot release twice. Registered only where
+        // `cellFreeEligible_` proves EVERY capturing lambda non-escaping, so no
+        // live env can read the value after this fires; it is a MAIN-loop
+        // disposal, so it precedes the SECOND-pass cell free that reclaims the
+        // cell it reads through.
+        bool capturedCellContentRelease = false;
+        // fix #3752: which release the entry above performs — true =
+        // bz_string_release (a non-nullable `string` capture), false =
+        // bz_closure_release (a function-typed capture). These are exactly the
+        // envdtor's own two content branches, so the suppressed release and this
+        // deferred one agree by construction.
+        bool capturedCellContentString = false;
         // fix #2334 / §28.14 / §28.9: applies to `boxedCellFree` /
         // `boxedCellFreeDeferred` ONLY. `boxedCellFree`'s "fires on BOTH
         // normal and unwind paths" soundness argument (above) rests on every

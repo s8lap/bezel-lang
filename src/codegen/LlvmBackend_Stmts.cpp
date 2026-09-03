@@ -3823,8 +3823,20 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                         // asserts the abandonment residue is EXACTLY the three
                         // §27.5 allocations per round (closure + env + cell),
                         // so removing this filter cannot go unnoticed.
+                        // fix #3752 (§27.5 / §28.9, v0.286):
+                        // `capturedCellContentRelease` joins the list for the
+                        // reason the list exists — it is registered by
+                        // `lowerLambda` under `cellFreeEligibleFn_`, one of the
+                        // tokens this venue re-establishes, and it RELEASES A
+                        // VALUE THROUGH THE CELL. Replaying it on the
+                        // abandonment / Dispose edge after the scope exit
+                        // already ran it is an over-release of the same
+                        // reference — the same use-after-free trade
+                        // `inlineOwnedArrayCell` is in the list to avoid. The
+                        // residue is the pre-existing §27.5 leak, unchanged.
                         if (d.closureRelease || d.boxedCellFree ||
-                            d.boxedCellFreeDeferred || d.inlineOwnedArrayCell)
+                            d.boxedCellFreeDeferred || d.inlineOwnedArrayCell ||
+                            d.capturedCellContentRelease)
                             continue;
                         if (d.iterEnumDispose) {
                             auto* alloca =
