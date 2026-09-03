@@ -12038,16 +12038,22 @@ void Emitter::emitChainCall(const ast::CallExpr* call, bool isThis,
     // constructor's own trailing parameters are defaulted, and `this(...)`
     // becomes infinite recursion.
     //
-    // ⚠ NAMED arguments keep the exact-arity rule. The argument loop below
-    // pairs `call->args[ai]` with `target->params[ai]` POSITIONALLY — a chain
-    // call written with named arguments is already lowered in source order
-    // rather than in §22.5 binding order (a separate, pre-existing defect,
-    // filed on its own) — so admitting a named-argument FILL here would select
-    // a target this function cannot lower, and the `arg_size()` guard at the
-    // end would then silently emit nothing for a shape that reaches the
-    // §22.10 primary arm (which DOES honour the binding, #3583) today. The
-    // widened admission is therefore gated on the call being all-positional,
-    // which is exactly the set the loop below can fill.
+    // fix #3791 (§22.5 "Optional parameters and named arguments" / §22.8 step
+    // 1 / §12.8, v0.286): NAMED arguments no longer keep the exact-arity
+    // defect. The argument loop below was rewritten to lower the call's
+    // arguments in §22.5's source-textual order (the rule, unchanged) and then
+    // PLACE them at the §22.5-bound parameter index — so `this(b := 9, a :=
+    // x)` against `constructor(a: int, b: int)` stores `x` into `a` and `9`
+    // into `b`, where the pre-fix positional pairing stored `9` into `a` and
+    // `x` into `b` (the silent-wrong-object case the #3777 commit's "STILL
+    // EXCLUDED, deliberately" paragraph #f flagged on its own). The exact-
+    // arity SELECTOR above is kept: widening it to admit an omitted defaulted
+    // tail through a named-arg call is the same shape `ctorForArgs` already
+    // admits (#3777 / §22.6 / §22.5) and is left for the next change, so a
+    // named chain call whose target has more parameters than the call
+    // supplied still falls through to `ctorByArity`'s exact-arity answer
+    // rather than the §22.10 primary arm below (no behavioural shift from
+    // today; the chain path below can NOW lower what the selector picked).
     bool chainArgsAllPositional = true;
     for (const auto& a : call->args)
         if (!a.name.empty()) { chainArgsAllPositional = false; break; }
@@ -12214,6 +12220,59 @@ void Emitter::emitChainCall(const ast::CallExpr* call, bool isThis,
                                         chainSema))
             carryCalleeUnitSubst(chainSema);
     }
+    // fix #3791 (§22.5 / §22.8 step 1 / §12.8, v0.286): §22.5 NAMED-argument
+    // BINDING at the chain-call site. §22.5: "naming an argument changes which
+    // parameter it binds to, never when it runs" — evaluation order remains
+    // source-textual, but the positional pairing `call->args[ai]` ↔
+    // `target->params[ai]` is the §22.5 defect (issue 3791): `this(b := 9, a :=
+    // x)` against `constructor(a: int, b: int)` stored `9` into `a` and `x`
+    // into `b`, where §22.5 requires the reverse. Build the
+    // parameter-index→source-argument-index map first, then lower each
+    // `call->args[ai]` in source order (preserving the §22.5 evaluation
+    // discipline and the side-effect order the spec §22.5 paragraph makes
+    // observable) but look up the formal modifier and the unit-rescue's
+    // parameter index on the BOUND `target->params[pi]`, not the source `ai`.
+    // Omitted parameters (`paramToArg[pi] == -1`) leave the corresponding
+    // `args` slot to be filled by `fillOmittedCtorArgs` below.
+    //
+    // The map is built from the same rule `buildOrderedArgs` and
+    // `sema::bindArgsToParams` already use (§22.5 "positional-in-order,
+    // named-after-positional" — a positional argument consumes the next
+    // unbound parameter position; a named argument resolves by exact name to
+    // a parameter position; the same argument may not bind twice). Sema has
+    // already accepted this call's arguments by the time codegen runs, so
+    // duplicate-name and unknown-name failures here are unreachable for any
+    // semantically-accepted call; the defensive fallbacks (skip / last-write-
+    // wins) preserve the pre-fix posture exactly for those shapes, which is
+    // what an unreachable-path guard should do (CLAUDE.md §3 — trace, then
+    // write the path the language accepts).
+    std::vector<int> paramToArg(target->params.size(), -1);
+    {
+        std::size_t pos = 0;
+        for (std::size_t ai = 0; ai < call->args.size(); ++ai) {
+            const auto& a = call->args[ai];
+            std::size_t pi;
+            if (a.name.empty()) {
+                pi = pos++;
+            } else {
+                pi = target->params.size();  // "not found"
+                for (std::size_t j = 0; j < target->params.size(); ++j) {
+                    if (target->params[j]->name == a.name) { pi = j; break; }
+                }
+                // Sema already rejected an unknown name; reach this branch on
+                // nothing semantically-accepted. Leave `paramToArg` unchanged
+                // for this `ai` rather than binding to an out-of-range slot.
+                if (pi >= target->params.size()) continue;
+            }
+            paramToArg[pi] = static_cast<int>(ai);  // last write wins on a
+                                                    // duplicate-name call (sema
+                                                    // rejected; defensive)
+        }
+    }
+    // Lower each `call->args[ai]` in source order, keyed by the BOUND parameter
+    // for the formal modifier / unit rescue. Source-indexed values are held in
+    // a parallel vector and re-placed in parameter order below.
+    std::vector<llvm::Value*> sourceVals(call->args.size(), nullptr);
     for (std::size_t ai = 0; ai < call->args.size(); ++ai) {
         const auto& a = call->args[ai];
         if (!a.value) {
@@ -12223,12 +12282,26 @@ void Emitter::emitChainCall(const ast::CallExpr* call, bool isThis,
             genericSubstSemaTy_ = std::move(savedSemaForChainArgs);  // #3501
             return;
         }
-        // The formal modifier lives on the chain TARGET ctor's params.
+        // The bound parameter index for this source argument. A `continue`
+        // above (unknown-name defensive branch) leaves `paramToArg` with no
+        // entry for this `ai`, so skip — no formal to consult, no slot to
+        // fill, and a duplicate-name call's first write is silently dropped
+        // in favour of the last (sema-rejected; the failure mode is the same
+        // as the pre-fix positional pairing on those unreachable shapes).
+        int pi = -1;
+        for (std::size_t j = 0; j < paramToArg.size(); ++j) {
+            if (paramToArg[j] == static_cast<int>(ai)) {
+                pi = static_cast<int>(j);
+                break;
+            }
+        }
+        if (pi < 0) continue;
+        // The formal modifier lives on the chain TARGET ctor's parameter — at
+        // the BOUND position, not the source position.
         std::string_view formalMod;
-        if (ai < target->params.size())
-            if (auto* ps = dynamic_cast<sema::ParameterSymbol*>(
-                    target->params[ai]))
-                formalMod = ps->modifier;
+        if (auto* ps = dynamic_cast<sema::ParameterSymbol*>(
+                target->params[pi]))
+            formalMod = ps->modifier;
         llvm::Value* v = nullptr;
         if (isByRefMod(a.modifier) || isByRefMod(formalMod)) {
             // §22.3 alias path: a true-alias location has an address the
@@ -12257,7 +12330,14 @@ void Emitter::emitChainCall(const ast::CallExpr* call, bool isThis,
             // §22.3 ref/out branch above: there a null `v` means no ADDRESS was
             // obtained, and the callee's formal is a `ptr` — a placeholder byte
             // would be malformed IR, not a rescue.
-            if (!v) v = unitValueForCtorParam(v, target, ai, a.value.get());
+            //
+            // fix #3791: pass the BOUND parameter index `pi`, not the source
+            // `ai`, so a `this(C.Nothing(), b := ...)` form resolves the
+            // unit-rescue against the parameter the named arg ACTUALLY binds
+            // to (which is the only position whose formal type can be `()`).
+            if (!v) v = unitValueForCtorParam(v, target,
+                                              static_cast<std::size_t>(pi),
+                                              a.value.get());
         }
         if (!v) {
             // #1386: ICE — the expression kind is not yet handled by codegen.
@@ -12269,7 +12349,16 @@ void Emitter::emitChainCall(const ast::CallExpr* call, bool isThis,
             genericSubstSemaTy_ = std::move(savedSemaForChainArgs);  // #3501
             return;
         }
-        args.push_back(v);
+        sourceVals[ai] = v;
+    }
+    // Build `args` in PARAMETER order. `args[0]` is the receiver; `args[1..]`
+    // are the target's parameters in declaration order, with each bound slot
+    // pulling its lowered value from `sourceVals[paramToArg[pi]]` and the
+    // omitted slots left null for `fillOmittedCtorArgs` below.
+    for (std::size_t pi = 0; pi < target->params.size(); ++pi) {
+        int ai = paramToArg[pi];
+        if (ai >= 0) args.push_back(sourceVals[ai]);
+        // else: leave the position for fillOmittedCtorArgs.
     }
     // fix #3777 (§22.5 "Optional parameters and named arguments" / §22.8 step 1
     // / §12.8, v0.286): the target was selected with an omitted §22.5-defaulted

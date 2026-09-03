@@ -30,11 +30,18 @@
 // asserts printed VALUES.
 //
 // ⚠ ONE ROW IS A KNOWN-GAP PIN, NOT AN APPROVAL. `named_chain_arg_binding_gap`
-// records that a chain call written with NAMED arguments is still lowered in
-// SOURCE order rather than in §22.5 binding order — a separate, pre-existing
-// defect this fix deliberately does not widen (both chain sites keep the
-// exact-arity rule for a named call for exactly that reason; issue 3791). It
-// asserts the WRONG value on purpose so that fixing it fails loudly here.
+// (now renamed to `named_chain_arg_binding`, with its assertion corrected) was
+// the §22.5 BINDING gap at a chain site — a separate, pre-existing defect this
+// fix's parent deliberately did not widen (both chain sites kept the exact-
+// arity rule for a named call for exactly that reason; issue 3791). The row
+// asserted the WRONG value on purpose so that fixing it failed loudly here.
+//
+// fix #3791 (§22.5 / §22.8 step 1 / §12.8, v0.286): the gap above is closed.
+// The previous "WRONG value" pin was renamed to `named_chain_arg_binding` and
+// its assertion flipped from `9/7` to `7/9`, and the six rows below it cover
+// the §22.5 sibling shapes — mixed positional/named, source-order evaluation,
+// `base(...)` chain, `this(...)` to the §22.10 primary — that the same
+// lowering change must satisfy.
 //
 // NOT COVERED, and filed: the IMPLICIT base chain still selects by exact arity
 // (`emitImplicitBase`'s `ctorByArity(b, 0, nullptr)`), so a base whose
@@ -631,23 +638,24 @@ BEZEL_TEST(ctor_chain_defaulted_arity_3777,
 }
 
 // ---------------------------------------------------------------------------
-// ⚠ KNOWN GAP — pinned so a fix for it FAILS HERE rather than passing silently.
+// fix #3791 (§22.5 / §22.8 step 1 / §12.8, v0.286): §22.5 NAMED-argument
+// BINDING at the chain-call site.
 //
-// A chain call written with NAMED arguments is lowered in SOURCE order: the
-// argument loop in `emitChainCall` pairs `call->args[ai]` with
-// `target->params[ai]` positionally and never consults the §22.5 binding. So
-// `this(b := 9, a := x)` against `constructor(a: int, b: int)` stores 9 into
-// `a` and 7 into `b` and prints `9/7` where §22.5 requires `7/9`.
+// Pre-fix, the argument loop in `emitChainCall` paired `call->args[ai]` with
+// `target->params[ai]` POSITIONALLY and never consulted the §22.5 binding.
+// So `this(b := 9, a := x)` against `constructor(a: int, b: int)` stored 9
+// into `a` and 7 into `b` and printed `9/7` where §22.5 requires `7/9`. This
+// gap was filed as issue 3791 by the #3777 commit's "STILL EXCLUDED,
+// deliberately" paragraph #f.
 //
-// Pre-existing (identical on 3b751a8) and a DIFFERENT family from this fix —
-// the §22.5 BINDING at a chain site, not the §22.5 DEFAULTS. #3777 deliberately
-// does not widen it: both chain sites keep the exact-arity rule for a named
-// call, so a named short call is not newly selected into a loop that cannot
-// lower it. Filed as issue 3791; when that lands, this row must be updated to
-// `7/9` and the three all-positional gates it names can go away.
-// ---------------------------------------------------------------------------
+// The argument loop now walks `call->args` in source order (preserving §22.5's
+// "evaluated in call-site textual order") but places each lowered value at the
+// §22.5-bound parameter index rather than the source-index position. The
+// assertion below was `9/7\n` on the pre-fix compiler and is now `7/9\n`;
+// failing this row after the fix is what verified the change, and the suite
+// below adds the sibling shapes §22.5 has to bind identically.
 
-BEZEL_TEST(ctor_chain_defaulted_arity_3777, named_chain_arg_binding_gap) {
+BEZEL_TEST(ctor_chain_defaulted_arity_3791, named_chain_arg_binding) {
     auto r = runAot(
         "module M; "
         "class B "
@@ -671,6 +679,171 @@ BEZEL_TEST(ctor_chain_defaulted_arity_3777, named_chain_arg_binding_gap) {
         "end C;");
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
-    // KNOWN GAP: §22.5 requires "7/9". See the block comment above.
-    BEZEL_EXPECT_EQ(r.stdoutText, std::string("9/7\n"));
+    // §22.5: a named argument changes which parameter it binds to. `b := 9`
+    // binds to the formal `b`, `a := x` binds to the formal `a`.
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("7/9\n"));
+}
+
+// Control: a DIRECT (non-chain) call to the target constructor stores the
+// first positional arg in `a` and the second in `b`. Pinned so a fix that
+// flipped the binding of NAMED arguments by accident — and therefore
+// accidentally flipped POSITIONAL binding too — fails loudly here.
+// (Earlier versions of this row used a `(x:int, y:int)` convenience overload
+// chaining via `this(x, y)` to (a, b); that overload had the same
+// `(int, int)` signature as the target, which made `new B(7, 9)` ambiguous
+// between the two and rejected at compile. The row is now a direct call,
+// the simplest possible §22.5 positional pin.)
+BEZEL_TEST(ctor_chain_defaulted_arity_3791, positional_chain_arg_unchanged) {
+    auto r = runAot(
+        "module M; "
+        "class B "
+        "  private _a: int; "
+        "  private _b: int; "
+        "  public constructor(a: int, b: int) "
+        "    _a := a; "
+        "    _b := b; "
+        "  end constructor; "
+        "  public method Show(): string => $\"{_a}/{_b}\"; "
+        "end B; "
+        "class C "
+        "  public static method Main(): int "
+        "    var v := new B(7, 9); "
+        "    Console.WriteLine(v.Show()); "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("7/9\n"));
+}
+
+// §22.5 "Named arguments may appear in any order after positional arguments":
+// a mixed positional+named chain call binds the positional argument to the
+// first formal and the named argument to its declared formal position.
+BEZEL_TEST(ctor_chain_defaulted_arity_3791, mixed_positional_then_named_chain) {
+    auto r = runAot(
+        "module M; "
+        "class B "
+        "  private _a: int; "
+        "  private _b: int; "
+        "  public constructor(a: int, b: int) "
+        "    _a := a; "
+        "    _b := b; "
+        "  end constructor; "
+        "  public constructor(x: int) "
+        "    this(7, b := x); "
+        "  end constructor; "
+        "  public method Show(): string => $\"{_a}/{_b}\"; "
+        "end B; "
+        "class C "
+        "  public static method Main(): int "
+        "    var v := new B(9); "
+        "    Console.WriteLine(v.Show()); "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("7/9\n"));
+}
+
+// §22.5: evaluation order is source-textual for the supplied arguments, even
+// when the named bindings REORDER them. A side-effecting argument must run
+// before its sibling, regardless of the parameter slot it ultimately binds
+// to. Two named arguments run in source order; their values land at their
+// declared parameters.
+BEZEL_TEST(ctor_chain_defaulted_arity_3791,
+           named_chain_arg_evaluation_is_source_order) {
+    auto r = runAot(
+        "module M; "
+        "class T "
+        "  public static method Tick(label: string): int "
+        "    Console.Write(label); "
+        "    return 1; "
+        "  end Tick; "
+        "end T; "
+        "class B "
+        "  private _a: int; "
+        "  private _b: int; "
+        "  public constructor(a: int, b: int) "
+        "    _a := a; "
+        "    _b := b; "
+        "  end constructor; "
+        "  public constructor(x: int) "
+        "    this(b := T.Tick(\"B=\"), a := T.Tick(\"A=\")); "
+        "  end constructor; "
+        "  public method Show(): string => $\"{_a}/{_b}\"; "
+        "end B; "
+        "class C "
+        "  public static method Main(): int "
+        "    var v := new B(0); "
+        "    Console.WriteLine(\"|\" + v.Show()); "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    // Source order: "B=" first, then "A=". Binding: B goes to _b, A to _a.
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("B=A=|1/1\n"));
+}
+
+// §12.8 chain to a base constructor with named arguments — same binding rule
+// must apply at the `base(...)` site.
+BEZEL_TEST(ctor_chain_defaulted_arity_3791, named_base_chain_arg_binding) {
+    auto r = runAot(
+        "module M; "
+        "class P "
+        "  private _n: int; "
+        "  private _s: string; "
+        "  public constructor(n: int, s: string) "
+        "    _n := n; "
+        "    _s := s; "
+        "  end constructor; "
+        "  public method Show(): string => $\"{_n}/{_s}\"; "
+        "end P; "
+        "class D : P "
+        "  public constructor(v: int) "
+        "    base(s := \"world\", n := v); "
+        "  end constructor; "
+        "end D; "
+        "class C "
+        "  public static method Main(): int "
+        "    var d := new D(7); "
+        "    Console.WriteLine(d.Show()); "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("7/world\n"));
+}
+
+// §22.10 PRIMARY-PATH PIN (not the fix's loop). A §22.10 inheritance-clause
+// primary is not a `ConstructorSymbol`, so the new emitChainCall loop is not
+// reached here — control falls into the !target branch via
+// `storePrimaryCtorPositionalArgs` (#3583 path). This row pins the primary-
+// path binding shape (`this(s := "primary", n := x)` against `(n:int, s:string)`)
+// as a regression guard for the existing primary path. The named-arg
+// correctness at a CONSTRUCTOR-SYMBOL chain site is covered by
+// `named_chain_arg_binding` (the renamed, §22.5-flipped row above).
+BEZEL_TEST(ctor_chain_defaulted_arity_3791,
+           named_chain_to_primary_ctor_binding) {
+    auto r = runAot(
+        "module M; "
+        "class B(n: int, s: string) "
+        "  public constructor(x: int, y: bool) "
+        "    this(s := \"primary\", n := x); "
+        "  end constructor; "
+        "  public method Show(): string => $\"{n}/{s}\"; "
+        "end B; "
+        "class C "
+        "  public static method Main(): int "
+        "    var v := new B(7, true); "
+        "    Console.WriteLine(v.Show()); "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("7/primary\n"));
 }
