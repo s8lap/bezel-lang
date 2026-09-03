@@ -21447,6 +21447,25 @@ struct StringEscapeWalker {
     // bit-identical.
     const void* outVarIntroSite = nullptr;
 
+    // fix #3729 / §9.7 / §28.9: OPT-IN pointer to the WHOLE enclosing
+    // function body (the same statement list collectRecordCallResultReleaseEligible
+    // walks each candidate against), used ONLY by the record-copy-alias
+    // relaxation in the `LocalDecl`/`LocalConstDecl` arms below. A record
+    // value has no independent per-binding refcount (§9.7: its string
+    // fields are bit-copied, never retained, on a plain local-to-local
+    // copy), so — unlike the string walk's `borrowRetainedAliases` set,
+    // which is sound because armStringLocalRefcount mints the alias its
+    // OWN +1 — the ONLY way a copy `var r2 := r;` can be proven not to
+    // undermine `r`'s scope-end release is to prove `r2` ITSELF never
+    // escapes, by re-running this same walk keyed on `r2` over the WHOLE
+    // body (not the copy statement alone: `r2` may be used, or itself
+    // copied onward, anywhere in the rest of the function). Non-null only
+    // when set by collectRecordCallResultReleaseEligible (recordFieldReleaseMode);
+    // every other reuse of this walker (string/dict/grouping/borrowing-
+    // Array/value-like-choice) leaves it null, so a record-typed copy
+    // alias stays unreachable there and this pointer is simply unused.
+    const std::vector<std::unique_ptr<ast::Stmt>>* wholeBody = nullptr;
+
     bool isTargetIdent(const ast::Expr* e) {
         if (outVarIntroSite && static_cast<const void*>(e) == outVarIntroSite)
             return false;
@@ -22561,6 +22580,63 @@ struct StringEscapeWalker {
                 expr(ld->initializer.get(), /*safeRead=*/true);
                 return;
             }
+            // fix #3729 / §9.7 / §28.9 (v0.286): the RECORD twin of the two
+            // relaxations directly above, for `recordFieldReleaseMode`. A
+            // plain local-to-local record COPY — `var r2 := r;` — is a raw
+            // struct bit-copy (§9.7: no retain touches a record's string
+            // fields on copy, unlike `armStringLocalRefcount`'s string-local
+            // alias handling), so `r2` carries the SAME un-retained
+            // reference `r` does; unconditionally treating the copy as safe
+            // (the way `borrowRetainedAliases` does for strings) would be
+            // UNSOUND — if `r2` itself later escapes (returned, stored,
+            // captured), releasing `r` at scope end would dangle it.
+            //
+            // SOUND CONDITION: `r2` may be treated as a BORROW of `r` — `r`
+            // stays eligible for its own scope-end release — iff `r2` is
+            // itself PROVABLY non-escaping. That is checked by re-running
+            // this SAME conservative walk, keyed on `r2`'s own LocalDecl,
+            // over the WHOLE enclosing function body (`wholeBody` — a
+            // sub-expression-only check is not enough, since `r2` may be
+            // read or copied onward anywhere later in the function, exactly
+            // the same completeness requirement collectRecordCallResultReleaseEligible's
+            // own per-candidate walk already has for `r`). `r2` itself is
+            // NEVER independently admitted as a release candidate — only a
+            // NewExpr/CallExpr initializer is (see the candidate scan
+            // comments above) — so no double-free risk is introduced by
+            // this relaxation: at most ONE of `r`/`r2` is ever a release
+            // candidate (`r`), and this only widens WHEN `r` stays eligible
+            // despite the copy.
+            //
+            // Gated on recordFieldReleaseMode (only set by
+            // collectRecordCallResultReleaseEligible) and `wholeBody != null`
+            // (only that one caller supplies it), so every other reuse of
+            // this walker (string/dict/grouping/borrowing-Array/value-like-
+            // choice) is bit-identical to before — none of them sets
+            // recordFieldReleaseMode, so this branch is dead code for them.
+            //
+            // WITHOUT this relaxation `r` is unconditionally tainted by the
+            // copy (falls to the generic `expr(..., safeRead=false)` below),
+            // and `r2` is never itself release-eligible (not a NewExpr/
+            // CallExpr candidate) — so NEITHER binding releases the
+            // record's string fields: measured 7000 B / 400 allocations
+            // over 200 iterations for the issue's exact repro (`var r :=
+            // new R(i); var r2 := r;` in a loop), where the single-binding
+            // case is clean.
+            if (recordFieldReleaseMode && !inLambda && wholeBody &&
+                isTargetIdent(ld->initializer.get())) {
+                StringEscapeWalker w2{ctx, static_cast<const void*>(ld)};
+                w2.recordFieldReleaseMode = true;
+                w2.scrutineeBorrowMode = true;
+                w2.wholeBody = wholeBody;  // chain: r2 itself may be copied onward
+                for (auto& s2 : *wholeBody) {
+                    w2.stmt(s2.get());
+                    if (w2.escaped) break;
+                }
+                if (!w2.escaped) {
+                    expr(ld->initializer.get(), /*safeRead=*/true);
+                    return;
+                }
+            }
             expr(ld->initializer.get(), /*safeRead=*/false);
             return;
         }
@@ -22658,6 +22734,32 @@ struct StringEscapeWalker {
                 isTargetIdent(lc->value.get())) {
                 expr(lc->value.get(), /*safeRead=*/true);
                 return;
+            }
+            // fix #3729 / §9.7 / §28.9 / §21.1 (v0.286): the `const` twin of
+            // the `LocalDecl` arm's record-copy-alias relaxation just above
+            // — `const r2 := r;` is the SAME raw bit-copy §21.1 makes legal
+            // for a runtime const (a record is a value-typed expression),
+            // and carries the identical soundness argument: `r2` is a BORROW
+            // of `r`, not an escape of it, iff `r2` is itself PROVABLY
+            // non-escaping over the whole function body. See the `LocalDecl`
+            // arm's comment for the full argument (identical here, keyed on
+            // `lc` instead of `ld`) — a `const` binding cannot be
+            // reassigned, so if anything this is STRONGER than the `var`
+            // case, exactly as #3416/#3417 note for the string-release twin.
+            if (recordFieldReleaseMode && !inLambda && wholeBody &&
+                isTargetIdent(lc->value.get())) {
+                StringEscapeWalker w2{ctx, static_cast<const void*>(lc)};
+                w2.recordFieldReleaseMode = true;
+                w2.scrutineeBorrowMode = true;
+                w2.wholeBody = wholeBody;
+                for (auto& s2 : *wholeBody) {
+                    w2.stmt(s2.get());
+                    if (w2.escaped) break;
+                }
+                if (!w2.escaped) {
+                    expr(lc->value.get(), /*safeRead=*/true);
+                    return;
+                }
             }
             expr(lc->value.get(), /*safeRead=*/false); return;
         }
@@ -24836,6 +24938,13 @@ void Emitter::collectRecordCallResultReleaseEligible(
         // stay false so the string-release / borrowing-Array / value-like-
         // choice relaxation never affects this pass.
         w.recordFieldReleaseMode = true;
+        // fix #3729 / §9.7 / §28.9: the WHOLE function body, for the
+        // copy-alias relaxation's own nested non-escape check (see the
+        // `wholeBody` member comment and the `LocalDecl`/`LocalConstDecl`
+        // arm comments in `stmt()`). This is the SAME `body` this loop
+        // already walks each candidate against, just also handed to any
+        // nested walker the copy-alias relaxation constructs.
+        w.wholeBody = &body;
         // fix #2481 (consumer 2/3, #1747 record-call-result): OPT-IN the
         // case-scrutinee relaxation — see the scrutineeBorrowMode flag
         // comment (struct StringEscapeWalker, above) for the general
