@@ -2448,6 +2448,29 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     asyncOwnedParamFrame_ = nullptr;
     asyncChainedReturn_ = false;
     asyncBorrowedReturn_ = false;
+    // fix #3738 (§15.1.1 / §15.3 / §27.5, v0.286): pin the §15.3 (#747)
+    // move-only owning inline-array TRANSFER analysis to the SYNC lambda's
+    // own function, exactly as #3699 gave the three state-machine emitters
+    // and #3728 gave the async-lambda twin (the branch above). Without this,
+    // registerInlineOwnedArrayDisposal's `currentFn_ != moveOnlyArrayTransferredFn_`
+    // guard (LlvmBackend_Setup.cpp) is unconditionally true for the whole sync
+    // lambda body — every `[N owned]T` / `[N owned]T?` local in it NEVER
+    // registers a scope-end disposal at all (a LEAK, never a double-free; the
+    // guard's own documented direction is fail-safe). MoveOnlyArrayTransferScope
+    // (LlvmBackend_impl.hpp, reused as-is per LANE_RULES §6 — no new
+    // predicate) saves/restores the pair, so a lambda/iterator/state-machine
+    // nested inside THIS body that re-pins the token for ITS OWN function
+    // leaves this scope's copy correct when control returns here — the same
+    // two-halves clear()+save/restore contract LANE_RULES §8 requires.
+    // Expression bodies have no LocalDecl statements (so no `[N owned]T`
+    // local of their own); clear the set for them, mirroring the async
+    // branch's `!lam.exprBody` guard exactly.
+    MoveOnlyArrayTransferScope moveOnlyArrayScopeSync(*this);
+    if (!lam.exprBody)
+        collectMoveOnlyArrayTransferred(lam.stmts);
+    else
+        moveOnlyArrayTransferred_.clear();
+    moveOnlyArrayTransferredFn_ = fn;
     // Emit body.
     if (lam.exprBody) {
         llvm::Value* v = nullptr;
