@@ -20,31 +20,37 @@
 // removal measurably does not hold.
 //
 // That second half is the point. A removal is only as good as its narrowest
-// gate, and this one had two holes, both filed and both pinned here — one
-// (3710) as a REJECT row now that it is fixed, one (3711) still as a
-// KNOWN-GAP row so the remaining gap cannot widen unobserved and so the day
-// it is fixed the row goes red and gets flipped rather than quietly staying
-// green:
+// gate, and this one had two holes, both filed and both now fixed and
+// pinned here as REJECT rows:
 //
 //   * issue 3710 — `OfType<U>(x)`: BOTH sema arms gated on `ce.args.empty()`,
 //     while the §5 name exemption in `kBuiltinCollectionLinqOperatorNames` is
 //     name-only. So a WITHDRAWN member given any argument was waved past the
 //     "no member" reject AND skipped by the removal arm: rc=0, linked, ran.
-//     FIXED in this commit (both arms dropped the `ce.args.empty()` guard —
-//     a withdrawn member is a removal diagnostic at ANY arity); the row below
-//     is flipped to a reject row rather than deleted, so a re-introduction of
-//     the guard shows up as a regression, not silence.
-//   * issue 3711 — a `SortedSet<T>` receiver: the whole §5 surface (and
-//     `ToArray`) lowers to a zero-initialized value there, so the removed
-//     `OfType` compiles for the same reason `Where` returns nothing. STILL
-//     OPEN — a different bug (the SortedSet §5 surface itself), out of scope
-//     for #3710's fix.
+//     FIXED in the commit that added this row (both arms dropped the
+//     `ce.args.empty()` guard — a withdrawn member is a removal diagnostic
+//     at ANY arity); the row is a reject row rather than deleted, so a
+//     re-introduction of the guard shows up as a regression, not silence.
+//   * issue 3711/3730 — a `SortedSet<T>` receiver: the whole §5 surface (and
+//     `ToArray`) lowered to a zero-initialized value there (the removed
+//     `OfType` compiled for the same reason `Where` returned nothing),
+//     because `isArrLike` (`ExprTypecheck_Calls.cpp`) omitted `SortedSet`
+//     from its head list entirely — the SEMA half, issue 3730. FIXED by
+//     #3730: `isArrLike` now admits `SortedSet`, so the whole §5 surface —
+//     `OfType` included — reaches the SAME removal diagnostic every other
+//     receiver family gets. The row below, formerly a KNOWN-GAP pin on the
+//     `sortedToArray=0` symptom, is FLIPPED to the fixed value
+//     (`sortedToArray=3`) rather than deleted, per the file's own "flip it"
+//     convention; a new REJECT row (`reject_sortedset_oftype_receiver`)
+//     directly pins that `s.OfType<int>()` on a `SortedSet<int>` now takes
+//     the removal diagnostic, closing the loop for THIS file's actual
+//     subject.
 //
 // AXIS GRID (receiver kind x expected outcome). Every reject row below is a
 // cell issue 3440's original grid either miscompiled or never contained, and
 // every one of them PASSES today — they are guards against the removal being
-// partially undone, not pins on a fix in this commit (except the 3710 row,
-// which IS the fix this commit ships).
+// partially undone, not pins on a fix in this commit (except the 3710 and
+// 3730 rows, each of which WAS a fix at the revision that added/flipped it).
 //
 //   receiver family              row                              today
 //   ---------------------------  -------------------------------  ----------
@@ -58,7 +64,8 @@
 //   IGrouping<K,T>               reject_igrouping_receiver        REJECT
 //   user class with own OfType   accept_user_declared_oftype      RUNS -> 42
 //   Array<T>, one argument       reject_3710_oftype_with_argument REJECT
-//   SortedSet<T>                 known_gap_3711_...               rc=0, "0"
+//   SortedSet<T>, direct OfType  reject_sortedset_oftype_receiver REJECT
+//   SortedSet<T>, ToArray witness fixed_3730_sortedset_...        "...=3"
 //
 // The `Bag` row is the over-rejection control that matters most: `OfType` is an
 // ordinary identifier, and a user's own method of that name must be unaffected
@@ -297,25 +304,21 @@ BEZEL_TEST(oftype_removal_completeness_3440,
 }
 
 // ===========================================================================
-// KNOWN GAP — this row asserts the WRONG behaviour that ships today, because
-// the alternative is that the gap widens with nothing observing it. Names the
-// issue that owns the fix. When it is fixed the row goes RED: flip it to the
-// reject/correct-value assertion and delete the gap note. Do not "repair" it
-// by loosening it. (issue 3710's sibling known-gap row above this section
-// was fixed and flipped in this commit — see `reject_3710_...` above,
-// alongside the other REJECT rows — rather than deleted, so a re-introduced
-// `ce.args.empty()` guard shows up as a regression here.)
+// FIXED (was a KNOWN-GAP row) — fix #3730: `isArrLike`
+// (ExprTypecheck_Calls.cpp) admits `SortedSet<T>` now, so the whole stdlib
+// §5 surface over a direct `SortedSet<T>` receiver types (and, via #3711's
+// codegen fix, lowers correctly) instead of degrading to a zero-initialized
+// value. This row is the SAME program the KNOWN-GAP row previously pinned as
+// broken — flipped to the fixed value per the file's own "flip it" rule
+// rather than deleted, so a regression of #3730 shows up here as a returned
+// row rather than silence. Two controls in the SAME program make this
+// impossible to pass vacuously: the `Set<int>` line is the identical shape
+// three statements earlier and is (and was always) correct, and `for-in`
+// over the very same `SortedSet` sums 3+1+2 = 6, proving the set is
+// populated independent of the §5 path under test.
 // ===========================================================================
-
-// issue 3711. The whole stdlib §5 surface over a `SortedSet<T>` receiver —
-// `ToArray` included — lowers to a zero-initialized value, so the removed
-// `OfType` compiles there for the same reason `Where` returns nothing. Two
-// controls in the SAME program make this impossible to pass vacuously: the
-// `Set<int>` line is the identical shape three statements earlier and is
-// correct, and `for-in` over the very same `SortedSet` sums 3+1+2 = 6, proving
-// the set is populated and that only the §5 path is empty.
 BEZEL_TEST(oftype_removal_completeness_3440,
-           known_gap_3711_sortedset_linq_path_is_empty_while_forin_is_right) {
+           fixed_3730_sortedset_linq_path_now_matches_forin) {
     BEZEL_EXPECT_EQ(
         runAotOut(prog("    using var p := new Set<int>();\n"
                        "    p.Add(3); p.Add(1); p.Add(2);\n"
@@ -331,5 +334,25 @@ BEZEL_TEST(oftype_removal_completeness_3440,
                        "    for var x in s do n := n + x; end;\n"
                        "    Console.WriteLine($\"forin={n}\");\n"
                        "    return 0;")),
-        "setToArray=3\nsortedToArray=0\nforin=6");
+        "setToArray=3\nsortedToArray=3\nforin=6");
+}
+
+// ===========================================================================
+// This file's actual subject, directly: `OfType<U>()` on a DIRECT
+// `SortedSet<int>` receiver now reaches the SAME v0.284 removal diagnostic
+// every other receiver family in this file gets — before #3730, `isArrLike`
+// excluding `SortedSet` meant this call never reached the `OfType` arm at
+// all (it degraded via #2434 instead, per the row above, pre-fix). This is
+// the direct proof the removal gate is complete for `SortedSet`; the row
+// above is a witness via `ToArray` for the surrounding `isArrLike` fix.
+// ===========================================================================
+BEZEL_TEST(oftype_removal_completeness_3440,
+           reject_sortedset_oftype_receiver) {
+    auto r = runAot(prog("    using var s := new SortedSet<int>();\n"
+                          "    s.Add(3); s.Add(1); s.Add(2);\n"
+                          "    var v := s.OfType<int>();\n"
+                          "    return 0;"));
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(removedOfType(r, "int", "int"));
+    BEZEL_EXPECT_FALSE(carriesInterim3440Wording(r));
 }

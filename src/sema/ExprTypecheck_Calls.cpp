@@ -873,6 +873,43 @@ bool isLinqHashableOperator(std::string_view m) {
            m == "Except"   || m == "Contains" || m == "ToSet";
 }
 
+// fix #3730 (stdlib §4.18 / §26.5 rule 1, v0.286), sharpened after review:
+// whether one of the six `isLinqHashableOperator` operators' applicability
+// gate should run AT ALL for a given (receiver family, operator name) pair.
+// It is `true` for every pair except one: `SortedSet<T>.Contains` has its
+// OWN native, unconstrained `Contains(item: T): bool` (§4.18) — identity by
+// `CompareTo`-equality via the class's `where T: IComparable<T>` constraint,
+// not by hashable — and per §26.5 rule 1 that instance member is resolved
+// before the §5 extension's hashable-gated `Contains` is even consulted.
+// `T: IComparable<T>` does NOT imply `T: hashable` (a body record can
+// satisfy the former and fail the latter's §3.6 computation — the review
+// repro is a record with an explicit-field `IComparable<T>` conformance and
+// no auto-hashable component), so running the gate for this ONE pair rejects
+// legal programs that never reach the extension method at all.
+//
+// Deliberately NARROW: `SortedSet<T>`'s other five hashable-gated operators
+// (Distinct/Union/Intersect/Except/ToSet) have no native SortedSet override
+// — they ARE the §5 extension, unconditionally — so they keep the gate.
+// `Set<T>`/`OwningSet<T>`/every other isArrLike family is untouched: their
+// own `Contains` is ALSO the extension member (Set/Dictionary already
+// require hashable T at the type-instantiation level per §4.10/§4.8 / §3.6
+// rule 2, so the gate is a no-op there, not skipped).
+//
+// ONE predicate, read by BOTH hashable-check call sites in this file (the
+// isArrLike Contains/TryAdd/Try* arm below, and `typeLinqOperator`'s
+// applicability gate) — a review finding: the isArrLike-local exclusion
+// alone left the `typeLinqOperator` fallback's own, independent
+// `isLinqHashableOperator` check unguarded, since that fallback runs
+// unconditionally for any isArrLike receiver whose earlier arms did not
+// already type the call (a SEPARATE if/else-if chain from the one the
+// Contains/TryAdd arm belongs to, per that lambda's own comment). A second
+// hand-written `colName == "SortedSet"` copy at that site would have been
+// exactly the duplicated-predicate defect class lane rules §6 warns
+// against; this is the one authority both sites consult instead.
+bool linqHashableGateApplies(std::string_view colName, std::string_view m) {
+    return !(colName == "SortedSet" && m == "Contains");
+}
+
 // #1937 / §14.1 / §2.5: does `rt` structurally reference any of the
 // type-parameter names in `paramNames` — as a bare parameter reference, or
 // nested inside a generic argument (`Pair<A, B>`), an inline-array element
@@ -4601,7 +4638,24 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     // call is fatal anyway). Returning false (rather than
                     // true) prevents the caller from OVERWRITING the exprType
                     // with a lazy-enumerable sentinel on a rejected call.
+                    //
+                    // fix #3730, sharpened after review: this lambda is a
+                    // SECOND, independent call site for the hashable gate
+                    // (the isArrLike Contains/TryAdd/Try* arm below is the
+                    // first) — reached via its own unconditional fallback
+                    // further down, a SEPARATE if/else-if chain from the one
+                    // the Contains arm belongs to (see that fallback's own
+                    // comment), so excluding SortedSet's native Contains ONLY
+                    // at the first site left this one still rejecting a
+                    // legal `SortedSet<T>.Contains` call for a T that is
+                    // IComparable but not hashable. `linqHashableGateApplies`
+                    // is the ONE predicate both sites now consult — see its
+                    // declaration for why the exclusion is narrow (Contains
+                    // only, SortedSet only; the other five hashable-gated
+                    // operators, and every other receiver family, are
+                    // unaffected).
                     if (isLinqHashableOperator(m) &&
+                        linqHashableGateApplies(colName, m) &&
                         !linqHashableCheck(m, srcElem, ce.span.begin, ctx_))
                         return false;  // diagnostic reported; do not type
                     // fix #1476 / stdlib §4.10: OwningSet<T>.Take(query: T) is
@@ -5544,12 +5598,31 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             }
                         }
                     }
-                    // Array/Stack/Queue/Set/LinkedList methods
+                    // Array/Stack/Queue/Set/LinkedList/SortedSet methods
+                    // fix #3730 (stdlib §4.18 / §5, v0.286): `SortedSet<T>`
+                    // was omitted here, so the whole §5 operator surface
+                    // (ToArray/ToSet/Where/Select/Count()/First()/… on a
+                    // DIRECT SortedSet receiver) never acquired a type —
+                    // `ctx_.exprType(ce)` stayed null, `lowerLocalDecl` read
+                    // the initializer as a UNIT initializer, and the local's
+                    // slot degraded to zero (#2434) with no diagnostic on the
+                    // line itself. `SortedSet<T>: IReadOnlyCollection<T>`
+                    // (stdlib §4.18) and `IReadOnlyCollection<out T>:
+                    // IEnumerable<T>` (stdlib line 1467), so §5's `extension
+                    // IEnumerable<T>` block applies to it normatively; #3711
+                    // (the codegen half, LlvmBackend_Calls3.cpp's
+                    // lowerToLazyEnumerator SortedSet arm) already lowers the
+                    // §5 lazy-operator surface in stdlib §4.18's required
+                    // ascending order, so admitting the head here is the
+                    // remaining half. See the guard immediately below the
+                    // `if (isArrLike)` open brace for the members §4.18 does
+                    // NOT declare that this admission would otherwise expose.
                     bool isArrLike = colName == "Array" || colName == "OwningArray" ||
                         colName == "Stack" || colName == "OwningStack" ||
                         colName == "Queue" || colName == "OwningQueue" ||
                         colName == "Set" || colName == "OwningSet" ||
-                        colName == "LinkedList" || colName == "OwningLinkedList";
+                        colName == "LinkedList" || colName == "OwningLinkedList" ||
+                        colName == "SortedSet";
                     // fix #3331 (C5, stdlib §5 + proposal 0116 D9): the
                     // `where T: hashable` gate can fire inside the isArrLike
                     // chain (for the `Contains` and `ToSet` arms, ~line
@@ -5562,11 +5635,146 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     // type with a lazy enumerable sentinel either.
                     bool linqHashableRejected = false;
                     if (isArrLike) {
+                        // fix #3730 (§6b exclusion diff, stdlib §4.18, v0.286):
+                        // every OTHER isArrLike family this block admits has a
+                        // positional or FIFO/LIFO structure (`Array`/
+                        // `OwningArray`, `Stack`/`OwningStack`, `Queue`/
+                        // `OwningQueue`, `LinkedList`/`OwningLinkedList`) or is
+                        // an unordered hash-set with its own extraction query
+                        // (`Set`/`OwningSet`'s `TryTake`). `SortedSet<T>`
+                        // (stdlib §4.18) declares none of that: its native
+                        // surface is exactly `Count`, `Add`, `TryAdd`,
+                        // `Contains`, `Remove`, `Clear`, `First`, `Last` (typed
+                        // by the dedicated `colName == "SortedSet"` arm further
+                        // below, which runs unconditionally and is therefore
+                        // unaffected by this admission — see its comment for
+                        // the :7073 clobber note) plus whatever stdlib §5's
+                        // `IEnumerable<T>` extension surface adds. `Get`,
+                        // `Peek`, `Pop`, `Dequeue`, `PopLast`, `PopFirst`,
+                        // `PopAt`, `IndexOf`, and the `Try*` extraction family
+                        // below (`TryPop`/`TryDequeue`/`TryPeek`/
+                        // `TryPopFirst`/`TryPopLast`/`TryTake`) are none of
+                        // that — §4.18 declares no index, no front/back, and
+                        // no extraction query — and none of them has a
+                        // lowering arm for a SortedSet receiver (#3444: an
+                        // admitted head's every operator needs one or the
+                        // other). Reject them by name, LOUD, instead of
+                        // falling through untyped into the very #2434 degrade
+                        // this issue exists to close (§6c: loud -> quiet is a
+                        // rejected trade in EITHER direction — admitting
+                        // SortedSet here must not convert these into a new
+                        // quiet failure either).
+                        //
+                        // A SECOND, measured category widens this same
+                        // exclusion: several names ARE declared by stdlib §5's
+                        // `IEnumerable<T>` extension (so they are not a naming
+                        // mistake) but have no codegen dispatch arm for a
+                        // DIRECT `SortedSet<T>` receiver specifically — every
+                        // other isArrLike family reaches these through a
+                        // receiver-family-keyed direct-evaluation dispatcher
+                        // that has no SortedSet case, unlike the *lazy*
+                        // operators (`Where`/`Select`/`Skip`/`TakeWhile`/
+                        // `SkipWhile`/`Distinct`/`OrderBy`/`OrderByDescending`/
+                        // `Concat`/`Zip`/`Union`/`Intersect`/`Except`/
+                        // `GroupBy`/`ToArray`/`ToSet`/`ToDictionary`), which
+                        // all route through `lowerToLazyEnumerator`'s
+                        // SortedSet arm and were confirmed fixed by #3711.
+                        // Measured directly against this tree (probe programs,
+                        // `bezelc -c`; each without this exclusion either hit
+                        // codegen's `internal: lowerExpr returned null for
+                        // interpolated-string expression part — #1386` inside
+                        // a `Console.WriteLine($"...")`, or degraded silently
+                        // to zero via the #2434 path when assigned to a plain
+                        // local first — the exact quiet failure this issue
+                        // exists to close): `Any()`/`Any(pred)`, `All(pred)`,
+                        // `Count(pred)` (bare `Count()`/`Count` DO work — a
+                        // separate existing dispatch — so only the predicate
+                        // form is excluded here), `Sum()`/`Sum(sel)`,
+                        // `Min()`/`Min(sel)`, `Max()`/`Max(sel)`,
+                        // `Average()`/`Average(sel)`, `Aggregate(seed, fold)`,
+                        // `FirstOrNull()`, `LastOrNull()`,
+                        // `SingleOrNull(pred)`, `Single()`/`Single(pred)`,
+                        // `ElementAt(i)`, and `Reverse()` (§5's LAZY
+                        // `Reverse(): IEnumerable<T>` — even
+                        // `s.Reverse().ToArray()` degrades; splitting it
+                        // across two locals instead produces a proper "no
+                        // dispatch arm" reject, so the degrade is itself
+                        // inconsistent across equivalent-looking call shapes).
+                        // Each is a real gap in the RECEIVER-DISPATCH layer
+                        // (owned by LlvmBackend_Calls*.cpp, out of this lane's
+                        // file ownership per the brief), not a naming
+                        // mistake — the diagnostic below says so. Filed as
+                        // issue 3735: the SAME gap (ICE/silent-zero, not a
+                        // SortedSet-only defect) reproduces TODAY on a plain
+                        // `Set<int>` receiver for `Sum`/`Any`, which has been
+                        // in `isArrLike` throughout and is untouched by this
+                        // commit — so this is pre-existing and family-wide
+                        // for the dict-backed collections, not something this
+                        // admission introduces. Once 3735 adds the missing
+                        // dispatch arm(s), lift this exclusion for SortedSet.
+                        bool sortedSetHasNoDirectDispatch =
+                            m == "Get" || m == "Peek" || m == "Pop" ||
+                            m == "Dequeue" || m == "PopLast" ||
+                            m == "PopFirst" || m == "PopAt" ||
+                            m == "IndexOf" || m == "TryPop" ||
+                            m == "TryDequeue" || m == "TryPeek" ||
+                            m == "TryPopFirst" || m == "TryPopLast" ||
+                            m == "TryTake" || m == "Length" ||
+                            m == "Any" || m == "All" ||
+                            (m == "Count" && !ce.args.empty()) ||
+                            m == "Sum" || m == "Min" || m == "Max" ||
+                            m == "Average" || m == "Aggregate" ||
+                            m == "FirstOrNull" || m == "LastOrNull" ||
+                            m == "SingleOrNull" || m == "Single" ||
+                            m == "ElementAt" || m == "Reverse";
+                        bool sortedSetMemberUndeclared =
+                            m == "Get" || m == "Peek" || m == "Pop" ||
+                            m == "Dequeue" || m == "PopLast" ||
+                            m == "PopFirst" || m == "PopAt" ||
+                            m == "IndexOf" || m == "TryPop" ||
+                            m == "TryDequeue" || m == "TryPeek" ||
+                            m == "TryPopFirst" || m == "TryPopLast" ||
+                            m == "TryTake" || m == "Length";
+                        if (colName == "SortedSet" &&
+                            sortedSetHasNoDirectDispatch &&
+                            sortedSetMemberUndeclared) {
+                            ctx_.diagnostics().report(
+                                Severity::Error, ce.span.begin,
+                                std::string("no member `") + std::string(m) +
+                                "` on `SortedSet<T>` (stdlib §4.18 / §22.5) — "
+                                "SortedSet<T> declares Count/Add/TryAdd/"
+                                "Contains/Remove/Clear/First/Last plus the "
+                                "stdlib §5 IEnumerable<T> surface; it has no "
+                                "positional index, no front/back, and no "
+                                "extraction query to `" + std::string(m) + "`");
+                        } else if (colName == "SortedSet" &&
+                                   sortedSetHasNoDirectDispatch) {
+                            // Declared by stdlib §5 (or the no-selector §5.1
+                            // aggregates T: IComparable<T> already grants a
+                            // SortedSet element), but this compiler has no
+                            // direct-receiver codegen dispatch arm for a
+                            // SortedSet source at this operator — see the
+                            // measured list above the flag's declaration.
+                            // Reporting this HERE (sema) rather than letting
+                            // it reach codegen's #2434/#1386 paths keeps the
+                            // failure loud and located, per §6c.
+                            ctx_.diagnostics().report(
+                                Severity::Error, ce.span.begin,
+                                std::string("`") + std::string(m) +
+                                "` is declared on `SortedSet<T>` via stdlib §5's "
+                                "IEnumerable<T> extension surface, but this "
+                                "compiler has no direct-receiver lowering for it "
+                                "on a SortedSet source (issue 3735 — the same "
+                                "gap measured on a plain Set<T> receiver) — "
+                                "compose it through a materializing operator "
+                                "instead, e.g. `s.ToArray()." + std::string(m) +
+                                "(...)`");
+                        }
                         // fix #3345: the static-call form
                         // `Array.Sort(a)` / `Array.Reverse(a)` is handled
                         // by the early-return above; the arms below are
                         // for the instance-call form only.
-                        if (m == "Length" || m == "Count")
+                        else if (m == "Length" || m == "Count")
                             ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Int));
                         else if (m == "IsEmpty")
                             ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Bool));
@@ -5623,7 +5831,42 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             // §4.10/§4.8 / §3.6 rule 2), so the check
                             // gates the `Array<T>.Contains` / `List<T>.Contains`
                             // / etc. shape and lets Set/Dictionary through.
+                            //
+                            // fix #3730 (stdlib §4.18, v0.286): `SortedSet<T>`
+                            // must NOT take this hashable gate for `Contains`.
+                            // §4.18 declares its OWN unconstrained
+                            // `Contains(item: T): bool` — identity is
+                            // `CompareTo`-equality (its `where T:
+                            // IComparable<T>` constraint), not hashable — and
+                            // per §26.5 rule 1 an instance member is resolved
+                            // before the §5 extension's hashable-gated
+                            // `Contains` is even consulted. `T: IComparable<T>`
+                            // does not imply `T: hashable` (a record can
+                            // satisfy the former and fail the latter's §3.6
+                            // computation), so running this check for a
+                            // SortedSet receiver would reject legal programs
+                            // that never call the extension method at all —
+                            // the exact `Contains`/`Remove`/clobber question
+                            // the issue's :7073 note asks to settle: the
+                            // dedicated `colName == "SortedSet"` arm below
+                            // already types `Contains` correctly and
+                            // unconditionally, so this branch's job for a
+                            // SortedSet receiver is only to skip past without
+                            // emitting a diagnostic. `linqHashableGateApplies`
+                            // is the ONE predicate this exclusion shares with
+                            // `typeLinqOperator`'s own, independent hashable
+                            // check (a review finding: a second hand-written
+                            // `colName == "SortedSet"` copy there would have
+                            // left that site's Contains gate unguarded, since
+                            // it is reached via a SEPARATE if/else-if chain
+                            // that runs regardless of what this arm decided).
                             if (m == "Contains" &&
+                                !linqHashableGateApplies(colName, m)) {
+                                /* handled by the dedicated colName ==
+                                   "SortedSet" arm below; no hashable gate
+                                   applies to its own Contains */
+                            }
+                            else if (m == "Contains" &&
                                 !linqHashableCheck(m, recvTy->genericArgs[0],
                                                    ce.span.begin, ctx_))
                                 linqHashableRejected = true;  // gate fired — suppress typeLinqOperator fallback's duplicate
