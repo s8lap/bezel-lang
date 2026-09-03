@@ -1201,11 +1201,11 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
     const sema::TypeRef* valTy =
         (recvTy && recvTy->genericArgs.size() > 1) ? recvTy->genericArgs[1]
                                                    : nullptr;
-    const sema::TypeSymbol* valRec =
-        (valTy && valTy->kind == sema::TypeRef::Kind::Named &&
-         valTy->declaration &&
-         valTy->declaration->kind == ast::TypeDeclKind::Record)
-            ? valTy->declaration : nullptr;
+    // fix #3780: the boxing decision below no longer needs its own
+    // record-vs-not classification (`valRec`) — it now reads
+    // `dictValueIsBoxedStruct` (LlvmBackend_impl.hpp), which derives the
+    // answer from the lowered LLVM type itself, so no local record symbol is
+    // required here.
     // issue #539 / §4.8 / §7: nullable value types lower to a tagged {i8,T}
     // struct and must be heap-boxed the same way non-nullable records are.
     bool valNullableVal = valTy && isNullableValueTy(valTy);
@@ -1240,8 +1240,16 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
         if (valNullableVal && v->getType()->isStructTy() &&
             v->getType() != nullableValueStructTy(valTy))
             v = wrapNullableValue(valTy, v);  // inner record → {i8=1, record}
-        if ((valRec || valNullableVal) && v->getType()->isStructTy()) {
-            // Box the struct (record or nullable-value tagged struct).
+        // fix #3780 (§4.8 / §28.9, v0.286): route the boxing decision through
+        // the #3770/#3768 shared predicate instead of this arm's own
+        // `(valRec || valNullableVal) && isStructTy()` copy — see
+        // dictValueIsBoxedStruct's declaration in LlvmBackend_impl.hpp for why
+        // `isStructTy()` alone is a strict widening (a struct-lowering V that
+        // is neither a record nor a nullable value type, i.e. a `choice`, was
+        // excluded here and fell through to the scalar-widening tail below,
+        // which crashed the IR verifier trying to ZExt a struct value).
+        if (dictValueIsBoxedStruct(v->getType())) {
+            // Box the struct (record, nullable-value tagged struct, or choice).
             uint64_t vsz =
                 module_->getDataLayout().getTypeAllocSize(v->getType());
             auto* mallocFn = declareC("malloc", ptrTy(), {i64()});
