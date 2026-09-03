@@ -9530,6 +9530,23 @@ void checkTopDecl(const ast::TopDecl& d, sema::SemaContext& ctx);
 // Find the sema symbol that wraps a given member AST and return its
 // param-list, or nullptr if the member doesn't have one (or wasn't
 // matched by symbol collection).
+// fix #3751 (§22.10 / §22.3 / §28.8, v0.286): the `ConstructorSymbol` for a
+// `ConstructorDecl` member. The ownership pass needs it — and not merely the
+// enclosing `ast::TypeDecl` — to resolve a `this(...)` / `base(...)` chain
+// call's TARGET: `cs->parent` names the class whose constructors and §22.10
+// positional parameters the chain can bind to, and `cs` itself is the
+// no-self-chain exclusion codegen's `emitChainCall` applies. Same one-pass scan
+// `paramSymsOf` below performs, over the same table.
+const sema::ConstructorSymbol* ctorSymbolOf(const ast::Member& m,
+                                            sema::SemaContext& ctx) {
+    for (const auto& s : ctx.symbols()) {
+        if (s->decl != &m) continue;
+        if (auto* cs = dynamic_cast<sema::ConstructorSymbol*>(s.get()))
+            return cs;
+    }
+    return nullptr;
+}
+
 const std::vector<sema::Symbol*>* paramSymsOf(
     const ast::Member& m, sema::SemaContext& ctx) {
     for (const auto& s : ctx.symbols()) {
@@ -9887,6 +9904,12 @@ void checkMember(const ast::Member& m, sema::SemaContext& ctx,
         checkStaticMethodReturnDeclaration(*md, enclosingType, ctx);
     } else if (auto* cd = dynamic_cast<const ast::ConstructorDecl*>(&m)) {
         MethodOwnership mo(ctx);
+        // fix #3751: arm the `this(...)` / `base(...)` chain-target resolution
+        // (see MethodOwnership::resolveChainCtorParams). Without it the chain
+        // call's arguments were classified against NO formal list, so an
+        // `owned` parameter chained into an `owned` slot was neither marked
+        // moved-from nor marker-checked — a measured heap-use-after-free.
+        mo.setEnclosingCtor(ctorSymbolOf(m, ctx));
         mo.run(cd->body, paramSymsOf(m, ctx));
     } else if (auto* dd = dynamic_cast<const ast::DestructorDecl*>(&m)) {
         MethodOwnership mo(ctx);

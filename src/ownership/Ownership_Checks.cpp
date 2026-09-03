@@ -158,18 +158,37 @@ CalleeFormals resolveCalleeParams(const ast::Expr* callee,
     return f;
 }
 
-CalleeFormals resolveCtorParams(const ast::NewExpr& ne, sema::SemaContext& ctx) {
-    if (!ne.type) return {};
-    const sema::TypeRef* rt = ctx.resolvedType(*ne.type);
-    if (!rt || !rt->declaration) return {};
-    const std::size_t nArgs = ne.args.size();
+// fix #3751 (§22.10 / §22.3 / §28.8, v0.286): the SAME constructor-formals
+// resolution, keyed on the target CLASS and the argument count rather than on a
+// `new` expression. `resolveCtorParams` below is now a thin adapter over it, and
+// the `this(...)` / `base(...)` chain resolver
+// (`MethodOwnership::resolveChainCtorParams`) is the second caller — so a chain
+// call's arguments are classified against the target's `owned` parameters by
+// exactly the predicate a `new T(args)` is classified by, rather than by a
+// chain-specific second spelling (CLAUDE.md §6).
+//
+// `exclude` is the §22.10 self-chain guard: a convenience constructor may not
+// chain to itself, and codegen's target selection excludes it
+// (`emitChainCall`'s `ctorByArity(targetCls, n, isThis ? cs : nullptr)`), so
+// this resolver must too. Without it the repro shape — a convenience
+// `constructor(owned x: Res)` chaining `this(x)` into `class Base(owned r: Res)`
+// — resolves the chain to the CONVENIENCE constructor (same arity) rather than
+// to the primary, i.e. answers the question about the wrong parameter list.
+//
+// Arity is matched EXACTLY, which is what `ctorByArity` does at the lowering
+// site: a chain call whose arity matches no constructor and no positional list
+// answers "no formals" and behaves exactly as it did before this fix.
+CalleeFormals resolveCtorFormals(const sema::TypeSymbol* cls, std::size_t nArgs,
+                                 const sema::ConstructorSymbol* exclude) {
+    if (!cls) return {};
     // Arity-matched scan, unchanged for a locally declared constructor. An
     // IMPORTED constructor takes the same arity rule off the reconstructed
     // ParameterSymbol list — the only way to match it, and the same rule
     // codegen's ctorForArgs applies.
-    for (sema::Symbol* m : rt->declaration->members) {
+    for (sema::Symbol* m : cls->members) {
         if (auto* cs = dynamic_cast<sema::ConstructorSymbol*>(m)) {
             if (cs->isStatic) continue;  // §22.7: not part of the call surface
+            if (cs == exclude) continue; // §22.10: no self-chain
             if (sema::formalParamCount(*cs) != nArgs) continue;
             CalleeFormals f;
             if (auto* d = dynamic_cast<const ast::ConstructorDecl*>(cs->decl))
@@ -185,10 +204,8 @@ CalleeFormals resolveCtorParams(const ast::NewExpr& ne, sema::SemaContext& ctx) 
     // Where the local `ast::Param` list exists it is still what is handed on —
     // it is the same list, and it carries the syntax (`owned`, defaults) the
     // metadata does not.
-    if (rt->declaration->kind == ast::TypeDeclKind::Class &&
-        rt->declaration->hasPositionalFields) {
-        if (auto* td =
-                dynamic_cast<const ast::TypeDecl*>(rt->declaration->decl)) {
+    if (cls->kind == ast::TypeDeclKind::Class && cls->hasPositionalFields) {
+        if (auto* td = dynamic_cast<const ast::TypeDecl*>(cls->decl)) {
             if (td->positionalFields.size() == nArgs) {
                 CalleeFormals f;
                 f.declParams = &td->positionalFields;
@@ -198,7 +215,7 @@ CalleeFormals resolveCtorParams(const ast::NewExpr& ne, sema::SemaContext& ctx) 
             return {};
         }
         std::vector<const sema::Symbol*> pos =
-            sema::recordPositionalFieldSymbols(rt->declaration);
+            sema::recordPositionalFieldSymbols(cls);
         if (pos.size() == nArgs && !pos.empty()) {
             CalleeFormals f;
             f.posFields = std::move(pos);
@@ -207,6 +224,14 @@ CalleeFormals resolveCtorParams(const ast::NewExpr& ne, sema::SemaContext& ctx) 
         }
     }
     return {};
+}
+
+CalleeFormals resolveCtorParams(const ast::NewExpr& ne, sema::SemaContext& ctx) {
+    if (!ne.type) return {};
+    const sema::TypeRef* rt = ctx.resolvedType(*ne.type);
+    if (!rt) return {};
+    return resolveCtorFormals(rt->declaration, ne.args.size(),
+                              /*exclude=*/nullptr);
 }
 
 // §22.5 (v0.184, #1973): the parameter index the argument at source position
@@ -253,6 +278,73 @@ std::size_t boundParamIndex(const std::vector<ast::CallArgument>& args,
     return params.size();
 }
 } // namespace
+
+// fix #3751 (§22.10 / §22.3 / §28.8 / §28.3, v0.286): the formals of a
+// `this(...)` / `base(...)` CONSTRUCTOR CHAIN CALL's target.
+//
+// A chain call is an `ast::CallExpr` whose callee is the bare identifier `this`
+// or `base` (`ast::chainCallOfStmt`). That identifier resolves to no
+// `ConstructorSymbol` — the chain target is selected by ARITY against the
+// enclosing class (or its base), which is what codegen's `emitChainCall` does —
+// so `resolveCalleeParams` answered "this callee has no formals" for every chain
+// call. Measured consequences, all under `--sanitize=address`:
+//
+//   * `class Base(owned r: Res)` with `constructor(owned x: Res) this(x); end`
+//     compiled with only the §28.3 auto-drop WARNING and was a
+//     `heap-use-after-free`: the primary had already transferred `x` into the
+//     `owned` field `_s`, and the convenience constructor then auto-dropped it
+//     (issue 3751's repro).
+//   * The same shape chaining to an explicit SIBLING `constructor(owned r: Res)`
+//     — same free, same read-after-free. The defect was never specific to a
+//     §22.10 primary; the primary is only the arm that has no symbol at all.
+//   * `base(x)` from a derived constructor into `class P` with
+//     `constructor(owned r: Res)` — identical.
+//   * A BORROW parameter chained into an `owned` slot (`constructor(b: Res)
+//     this(b);`) was accepted and double-owned: §28.8's borrow-into-owned-formal
+//     reject (`checkOwnedArgSource`) never ran either.
+//   * Conversely `this(owned x)` was REJECTED with "this parameter position does
+//     not take ownership" — naming a position that IS `owned` — so no correct
+//     spelling of the transfer existed.
+//
+// Target selection mirrors `emitChainCall` exactly, because ownership must
+// classify the arguments against the parameter list the lowering actually
+// stores them into: `this(...)` targets the enclosing class excluding the
+// enclosing constructor (§22.10's no-self-chain), `base(...)` targets the first
+// CLASS base (codegen's `baseClassOf`). Returns an invalid view when the
+// enclosing constructor symbol is unknown or the arity matches nothing, in
+// which case every caller behaves exactly as it did before this fix.
+CalleeFormals MethodOwnership::resolveChainCtorParams(
+    const ast::Expr* callee, std::size_t nArgs) const {
+    if (!callee || !enclosingCtor_ || !enclosingCtor_->parent) return {};
+    auto* id = dynamic_cast<const ast::IdentifierExpr*>(callee);
+    if (!id) return {};
+    const sema::TypeSymbol* owner = enclosingCtor_->parent;
+    if (id->name == "this")
+        return resolveCtorFormals(owner, nArgs, /*exclude=*/enclosingCtor_);
+    if (id->name == "base") {
+        // Codegen's `Emitter::baseClassOf`: the first CLASS entry of
+        // `baseTypes` (interfaces sit in the same list and are not chain
+        // targets).
+        for (const sema::TypeSymbol* b : owner->baseTypes)
+            if (b && b->kind == ast::TypeDeclKind::Class)
+                return resolveCtorFormals(b, nArgs, /*exclude=*/nullptr);
+    }
+    return {};
+}
+
+// fix #3751: the ONE answer to "what formal list does this call reach?" for the
+// two owned-sink classifiers below (`recordMovesInArgs`, the LocalDecl-
+// initializer / assignment-RHS path, and `isImplicitOwned`, the bare-statement
+// `handleDischarge` path). A CHAIN call reaches `handleDischarge`, not
+// `recordMovesInArgs` — but both had the same blind spot and both must answer
+// identically about one argument position, or the §22.3 marker surface and the
+// §28.8 transfer would disagree about the same call (the #1462 half-fix shape).
+CalleeFormals MethodOwnership::calleeOrChainFormals(const ast::Expr* callee,
+                                                    std::size_t nArgs) const {
+    CalleeFormals f = resolveCalleeParams(callee, ctx_);
+    if (!f.valid()) f = resolveChainCtorParams(callee, nArgs);
+    return f;
+}
 
 void MethodOwnership::recordMovesIn(const ast::Expr& e) {
     if (auto* un = dynamic_cast<const ast::UnaryExpr*>(&e)) {
@@ -489,7 +581,11 @@ void MethodOwnership::recordMovesInArgs(const std::vector<ast::CallArgument>& ar
     // that payload list on as the formal list, so the §22.3 owned-marker check
     // below sees the case payload's modifier; the symbol itself is kept because
     // the §28.1 erasure oracle below needs the `ast::Param`, not its modifier.
-    const CalleeFormals formals = resolveCalleeParams(callee, ctx_);
+    // fix #3751 (§22.10 / §22.3 / §28.8, v0.286): through `calleeOrChainFormals`,
+    // so a `this(...)` / `base(...)` CHAIN call — whose callee is the bare
+    // identifier `this`/`base` and resolves to no symbol — is classified against
+    // the target constructor's formals instead of against nothing at all.
+    const CalleeFormals formals = calleeOrChainFormals(callee, args.size());
     const sema::ChoiceCaseSymbol* calleeChoiceCase =
         callee ? dynamic_cast<sema::ChoiceCaseSymbol*>(ctx_.exprSymbol(*callee))
                : nullptr;
@@ -647,7 +743,16 @@ bool MethodOwnership::isImplicitOwned(const std::vector<ast::CallArgument>& args
     // user `owned` parameter. Without this, every owning-choice construction
     // rejects the `owned` marker the spec admits on `owned` payload fields
     // (§35.3 + §28.1). resolveCalleeParams supplies that payload list.
-    const CalleeFormals formals = resolveCalleeParams(callee, ctx_);
+    // fix #3751 (§22.10 / §22.3 / §28.8, v0.286): through `calleeOrChainFormals`.
+    // This is the classifier a BARE-STATEMENT call consults (`handleDischarge`),
+    // and a `this(...)` / `base(...)` chain call is always a bare statement
+    // (§12.8 puts it in the leading statement position), so this — not
+    // `recordMovesInArgs` — is the site the measured heap-use-after-free of
+    // issue 3751 flowed through: with no formals the chain's argument was not an
+    // owned sink, so it was neither marker-checked nor marked moved-from, and
+    // the convenience constructor's §28.3 auto-drop freed a value the chained-to
+    // constructor had already transferred into an `owned` field.
+    const CalleeFormals formals = calleeOrChainFormals(callee, args.size());
     if (!formals.valid()) return false;
     // §22.5 (v0.184, #1973): resolve the BOUND parameter (named-arg binding),
     // not the source position — a reordered `owned`/borrow named-arg call

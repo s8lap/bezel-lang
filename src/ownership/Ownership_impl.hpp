@@ -348,6 +348,17 @@ public:
              const GenericReturnContext* genericCtx = nullptr,
              bool isGenericBody = false);
 
+    // fix #3751: the CONSTRUCTOR whose body is being analysed, when the body
+    // is a constructor's (null for a method / destructor / operator / lambda /
+    // field-initializer run). It is the only channel through which the
+    // ownership pass can know which class — and which sibling constructors — a
+    // `this(...)` / `base(...)` chain in this body can target; §22.10's
+    // no-self-chain exclusion needs the symbol itself, not just its class.
+    // Set by `checkMember`'s ConstructorDecl arm (Ownership.cpp) before `run`.
+    void setEnclosingCtor(const sema::ConstructorSymbol* cs) {
+        enclosingCtor_ = cs;
+    }
+
     // §28.3 / §5.11 (#1007): apply ONLY the borrow-returned-through-owning-type
     // check to an expression-bodied method `M(): T => exprBody` (which the full
     // block dataflow above is not run on). Seeds the parameters so a borrowed
@@ -1144,6 +1155,22 @@ private:
 
     void recordMovesInArgs(const std::vector<ast::CallArgument>& args,
                            const ast::Expr* callee = nullptr);
+
+    // fix #3751 (§22.10 / §22.3 / §28.8, v0.286): the formals of a `this(...)`
+    // / `base(...)` constructor CHAIN call's target, resolved by the SAME
+    // `resolveCtorFormals` a `new T(args)` site resolves through and against
+    // the target `emitChainCall` lowers to. See the definition in
+    // Ownership_Checks.cpp for the measured defect this closes. Answers an
+    // invalid view for anything that is not a chain call, so a caller can use
+    // it as a fallback when `resolveCalleeParams` finds no symbol.
+    CalleeFormals resolveChainCtorParams(const ast::Expr* callee,
+                                         std::size_t nArgs) const;
+
+    // fix #3751: `resolveCalleeParams` with the chain fallback applied — the ONE
+    // answer to "what formal list does this call reach?" shared by the two
+    // owned-sink classifiers (`recordMovesInArgs` and `isImplicitOwned`).
+    CalleeFormals calleeOrChainFormals(const ast::Expr* callee,
+                                       std::size_t nArgs) const;
 
     // Detect `local.Dispose()` patterns and mark the local as Disposed.
     // Also detects `local` consumed as a `return` value (handleReturn
@@ -2525,6 +2552,9 @@ private:
     // `owned T`, an operator result, a `move obj.f`) is a *fresh producer* that
     // invalidates no live binding and stays unmarked. Reuses the existing
     // moved-from state tracking rather than re-classifying the expression.
+    // fix #3751: see setEnclosingCtor above.
+    const sema::ConstructorSymbol* enclosingCtor_ = nullptr;
+
     bool isNamedOwnedBinding(const ast::Expr& e);
 
     // §22.3 (v0.169, #1348): report the "missing marker" error — a named owned
