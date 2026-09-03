@@ -1215,11 +1215,21 @@ llvm::Function* Emitter::emitImportedIndexerGetterInheritedWrapper(
     // Build a stable, cache-encoded name: the wrapper is InternalLinkage
     // (no cross-module ABI to maintain) and uniquely named per (ps,
     // recvTy) pair so duplicate emission does not occur.
+    // fix #3548: name the (ps, recvTy) pair from its §2.8.3 rule 3 identity
+    // — `ps`'s owner+name (mangledTypeName(ps->parent) + ps->name) and
+    // recvTy's own mangled identity — not the two POINTER values. A pointer
+    // is a fresh heap address every process, which made the emitted symbol
+    // (and so the object file) differ between two runs of the SAME compiler
+    // on the SAME source. Any residual collision (two distinct (ps, recvTy)
+    // pairs mangling to the same string) is caught by llvm::Function::Create's
+    // Module insertion, which auto-renames via ValueSymbolTable::create
+    // ValueName — deterministic on creation order, itself deterministic here
+    // (single-threaded, syntax-order codegen walk).
     std::string wrapperName =
         "bz$" + std::string(ps->parent->name) + "$idxget$" +
         std::to_string(ps->indexerParams.size()) + "$inh$" +
-        std::to_string(reinterpret_cast<std::uintptr_t>(ps)) + "_" +
-        std::to_string(reinterpret_cast<std::uintptr_t>(recvTy));
+        mangledTypeName(ps->parent) + "$" + std::string(ps->name) + "_" +
+        mangleTypeRefForSymbol(recvTy);
     auto* fn = llvm::Function::Create(
         fnTy, llvm::Function::InternalLinkage, wrapperName, module_.get());
     importedIndexerGetterInheritedWrappers_[cacheKey] = fn;
@@ -1324,11 +1334,13 @@ llvm::Function* Emitter::emitImportedIndexerSetterInheritedWrapper(
     }
     paramTys.push_back(retTy);   // `value` parameter
     auto* fnTy = llvm::FunctionType::get(builder_.getVoidTy(), paramTys, false);
+    // fix #3548: see emitImportedIndexerGetterInheritedWrapper above — the
+    // same §2.8.3 rule 3 identity, not the (ps, recvTy) POINTER pair.
     std::string wrapperName =
         "bz$" + std::string(ps->parent->name) + "$idxset$" +
         std::to_string(ps->indexerParams.size()) + "$inh$" +
-        std::to_string(reinterpret_cast<std::uintptr_t>(ps)) + "_" +
-        std::to_string(reinterpret_cast<std::uintptr_t>(recvTy));
+        mangledTypeName(ps->parent) + "$" + std::string(ps->name) + "_" +
+        mangleTypeRefForSymbol(recvTy);
     auto* fn = llvm::Function::Create(
         fnTy, llvm::Function::InternalLinkage, wrapperName, module_.get());
     importedIndexerSetterInheritedWrappers_[cacheKey] = fn;
@@ -1418,11 +1430,13 @@ llvm::Function* Emitter::emitImportedPropGetterInheritedWrapper(
     std::vector<llvm::Type*> paramTys;
     paramTys.push_back(ptrTy());   // `this`
     auto* fnTy = llvm::FunctionType::get(retTy, paramTys, false);
+    // fix #3548: see emitImportedIndexerGetterInheritedWrapper above — the
+    // same §2.8.3 rule 3 identity, not the (ps, recvTy) POINTER pair.
     std::string wrapperName =
         "bz$" + std::string(ps->parent->name) + "$" +
         std::string(ps->name) + "$propget$inh$" +
-        std::to_string(reinterpret_cast<std::uintptr_t>(ps)) + "_" +
-        std::to_string(reinterpret_cast<std::uintptr_t>(recvTy));
+        mangledTypeName(ps->parent) + "$" + std::string(ps->name) + "_" +
+        mangleTypeRefForSymbol(recvTy);
     auto* fn = llvm::Function::Create(
         fnTy, llvm::Function::InternalLinkage, wrapperName, module_.get());
     importedPropGetterInheritedWrappers_[cacheKey] = fn;
@@ -1505,11 +1519,13 @@ llvm::Function* Emitter::emitImportedPropSetterInheritedWrapper(
     paramTys.push_back(ptrTy());   // `this`
     paramTys.push_back(retTy);     // `value`
     auto* fnTy = llvm::FunctionType::get(builder_.getVoidTy(), paramTys, false);
+    // fix #3548: see emitImportedIndexerGetterInheritedWrapper above — the
+    // same §2.8.3 rule 3 identity, not the (ps, recvTy) POINTER pair.
     std::string wrapperName =
         "bz$" + std::string(ps->parent->name) + "$" +
         std::string(ps->name) + "$propset$inh$" +
-        std::to_string(reinterpret_cast<std::uintptr_t>(ps)) + "_" +
-        std::to_string(reinterpret_cast<std::uintptr_t>(recvTy));
+        mangledTypeName(ps->parent) + "$" + std::string(ps->name) + "_" +
+        mangleTypeRefForSymbol(recvTy);
     auto* fn = llvm::Function::Create(
         fnTy, llvm::Function::InternalLinkage, wrapperName, module_.get());
     importedPropSetterInheritedWrappers_[cacheKey] = fn;

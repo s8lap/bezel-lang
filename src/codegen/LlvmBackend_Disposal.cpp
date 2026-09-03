@@ -3927,10 +3927,15 @@ llvm::Function* Emitter::nestedCollectionDisposerThunk(const sema::TypeRef* elem
     std::string thunkName = std::string("bz$nestedFree$") + std::string(collName);
     // Make unique if same collection name appears multiple times (shouldn't, but
     // guard against symbol clash if two OwningArray<R1> and OwningArray<R2> both
-    // need a thunk — give each its own symbol via the cache key pointer).
+    // need a thunk — give each its own symbol via the type's §2.8.3 rule 3
+    // identity, not the cache-key POINTER (fix #3548: a pointer value is a
+    // fresh heap address every process, so the old spelling made `bezelc`'s
+    // output non-reproducible — nm'd different bytes across two runs of the
+    // SAME compiler on the SAME source; mangleTypeRefForSymbol recurses
+    // through genericArgs, so OwningArray<R1> and OwningArray<R2> still land
+    // on distinct, but now deterministic, names).
     if (module_->getFunction(thunkName)) {
-        thunkName += "$" + std::to_string(
-            reinterpret_cast<std::uintptr_t>(elemCollTy));
+        thunkName += "$" + mangleTypeRefForSymbol(elemCollTy);
     }
     auto* fn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage,
                                       thunkName, module_.get());
@@ -3992,13 +3997,24 @@ llvm::Function* Emitter::taskElementDisposerThunk(const sema::TypeRef* taskTy) {
     auto it = taskElementDisposerThunks_.find(taskTy);
     if (it != taskElementDisposerThunks_.end()) return it->second;
 
-    // void(void*) thunk: void bz$taskElemDispose$N(bz_task_t* task)
+    // void(void*) thunk: void bz$taskElemDispose$<mangled T>(bz_task_t* task)
     auto* fnTy = llvm::FunctionType::get(llvm::Type::getVoidTy(llvm_),
                                          {ptrTy()}, /*isVarArg=*/false);
     // Per-TypeRef key on the symbol name (mirrors nestedCollectionDisposerThunk
     // — guards against name clash if a module needs more than one Task thunk).
+    // fix #3548: name from the type's §2.8.3 rule 3 identity
+    // (mangleTypeRefForSymbol), not the taskTy cache-key POINTER — a pointer
+    // value is a fresh heap address every process (this was the issue's own
+    // repro: `bz$taskElemDispose$24965040` vs `…$447905712` for the SAME
+    // source compiled twice). Two distinct TypeRef* nodes CAN denote the same
+    // semantic Task<T> (one per textual occurrence) and so want the identical
+    // mangled name; llvm::Function::Create's Module insertion auto-renames a
+    // collision via ValueSymbolTable::createValueName (deterministic on
+    // creation order, which is itself deterministic — this thunk is built
+    // synchronously during a single-threaded, syntax-order codegen walk, not
+    // from unordered-container iteration), so no manual counter is needed.
     std::string name = "bz$taskElemDispose";
-    name += "$" + std::to_string(reinterpret_cast<std::uintptr_t>(taskTy));
+    name += "$" + mangleTypeRefForSymbol(taskTy);
     auto* fn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage,
                                       name, module_.get());
     taskElementDisposerThunks_[taskTy] = fn;
@@ -4293,9 +4309,13 @@ llvm::Function* Emitter::patternAResultCollectionDisposer(
                                          {ptrTy()}, /*isVarArg=*/false);
     std::string thunkName = std::string("bz$patAResultCollFree$") +
                             std::string(collName);
+    // fix #3548: disambiguate by the type's §2.8.3 rule 3 identity, not the
+    // resultCollTy cache-key POINTER — see nestedCollectionDisposerThunk above
+    // for the full rationale (this is the same pattern: collName alone
+    // collapses e.g. OwningArray<R1> and OwningArray<R2>, and the pointer
+    // suffix that used to disambiguate them was ASLR-fresh every process).
     if (module_->getFunction(thunkName)) {
-        thunkName += "$" + std::to_string(
-            reinterpret_cast<std::uintptr_t>(resultCollTy));
+        thunkName += "$" + mangleTypeRefForSymbol(resultCollTy);
     }
     auto* fn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage,
                                       thunkName, module_.get());

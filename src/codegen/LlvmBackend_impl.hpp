@@ -5779,6 +5779,81 @@ private:
         return ts->moduleName + "." + cls;
     }
 
+    // fix #3548 (§2.8.3 rule 3, v0.286): a deterministic, ASLR-independent
+    // mangling of a resolved sema::TypeRef* for embedding in an emitted LLVM
+    // symbol name. Companion to mangledTypeName(TypeSymbol*) above — that one
+    // alone is not enough here because a constructed generic type's §2.8.3
+    // rule-3 identity is "its generic's identity plus the identities of its
+    // ARGUMENTS", and mangledTypeName(ts) only ever sees the head declaration:
+    // `OwningArray<Task<int>>` and `OwningArray<Task<string>>` would both
+    // mangle to "OwningArray" and collide. This walks genericArgs recursively,
+    // mirroring the shape of the local `mangleTy` lambda in
+    // LlvmBackend_Setup.cpp's genericSubst path (#738) but as a HEADER-level
+    // function so callers outside that TU (the disposal-thunk and
+    // imported-member-wrapper namers fixed by #3548) can share it. Every
+    // branch bottoms out in the type's own name/enum tag or a literal — never
+    // a pointer value, which is what made the old names change between two
+    // runs of the same compiler (ASLR reassigns heap addresses per process).
+    static std::string mangleTypeRefForSymbol(const sema::TypeRef* t) {
+        if (!t) return "v";
+        std::string s;
+        switch (t->kind) {
+            case sema::TypeRef::Kind::Named:
+                if (t->declaration) {
+                    s = mangledTypeName(t->declaration);
+                } else {
+                    // Builtin generic head with no declaration symbol
+                    // (OwningArray<T>, Task<T>, ... per §2.5/§29.3) —
+                    // headName() is the alias-transparent syntactic head.
+                    s = std::string(t->headName());
+                    if (s.empty()) s = "u";
+                }
+                for (const sema::TypeRef* a : t->genericArgs)
+                    s += "_" + mangleTypeRefForSymbol(a);
+                break;
+            case sema::TypeRef::Kind::Primitive:
+                switch (t->primitive) {
+                    case sema::PrimitiveType::Bool:    s = "bool";    break;
+                    case sema::PrimitiveType::Char:    s = "char";    break;
+                    case sema::PrimitiveType::String:  s = "string";  break;
+                    case sema::PrimitiveType::Byte:    s = "byte";    break;
+                    case sema::PrimitiveType::SByte:   s = "sbyte";   break;
+                    case sema::PrimitiveType::Short:   s = "short";   break;
+                    case sema::PrimitiveType::UShort:  s = "ushort";  break;
+                    case sema::PrimitiveType::Int:     s = "int";     break;
+                    case sema::PrimitiveType::UInt:    s = "uint";    break;
+                    case sema::PrimitiveType::Long:    s = "long";    break;
+                    case sema::PrimitiveType::ULong:   s = "ulong";   break;
+                    case sema::PrimitiveType::Float:   s = "float";   break;
+                    case sema::PrimitiveType::Double:  s = "double";  break;
+                    case sema::PrimitiveType::Decimal: s = "decimal"; break;
+                    case sema::PrimitiveType::Object:  s = "object";  break;
+                    default:                           s = "prim";   break;
+                }
+                break;
+            case sema::TypeRef::Kind::Unit:
+                s = "unit";
+                break;
+            case sema::TypeRef::Kind::InlineArray:
+                s = "arr" + std::to_string(t->arraySizeValue) +
+                    (t->arrayOwned ? "o" : "") + "_" +
+                    mangleTypeRefForSymbol(t->arrayElement);
+                break;
+            case sema::TypeRef::Kind::Function:
+                s = "fn";
+                for (const auto& p : t->funcParams)
+                    s += "_" + mangleTypeRefForSymbol(p.type);
+                s += "_r" + mangleTypeRefForSymbol(t->funcReturn);
+                break;
+            case sema::TypeRef::Kind::Error:
+            default:
+                s = "err";
+                break;
+        }
+        if (t->nullable) s += "n";
+        return s;
+    }
+
     // fix #3119 (spec §8.5, v0.252; stdlib §2.13 rule 1 + rule 2): the module
     // path component of §8.5's qualified-name default for a reserved BUILT-IN
     // CLASS — `ts->moduleName` is empty for a synthetic builtin (built by
