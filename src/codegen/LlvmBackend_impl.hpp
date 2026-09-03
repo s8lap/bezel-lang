@@ -12406,6 +12406,22 @@ private:
     void lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
                         const ast::Type* declType);
 
+    // fix #3712 (§3.2 / §15.1 / §17.11, v0.286): the ONE unit-typed
+    // collection-literal-element decision, hoisted from fix #3528's
+    // local-decl-only guard and shared by all FOUR store loops (local decl,
+    // static field, instance field, return statement). `lowerExpr` returns
+    // nullptr for a UNIT-typed expression (`()`) by the #3421 convention, so
+    // a null `ev` at a `[N]T` literal element is not automatically the
+    // #1386 lowering-failure ICE — it may be a legitimate unit value. Keyed
+    // on `elemExpr`'s OWN SEMA TYPE being Kind::Unit, never on `ev` being
+    // null, so a genuinely failed lowering of a NON-unit element still
+    // reaches the caller's #1386 report. Returns the storage slot's
+    // placeholder zero value (`elemTy` must already carry the InlineArray
+    // element-position `unitStorageTy` substitution — LlvmBackend_Layout.cpp,
+    // fix #3528) when `elemExpr` is unit-typed; nullptr otherwise.
+    llvm::Value* lowerCollectionLiteralElementOrUnitNull(
+        const ast::Expr& elemExpr, llvm::Type* elemTy);
+
     // fix #2935 (stdlib closed surfaces; language spec §3/#605, v0.240): is `e`
     // a member CALL whose receiver is a compiler BUILT-IN type — one the
     // `builtinTypeArity` registry resolves without any user `TypeDecl`? Returns

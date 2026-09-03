@@ -9815,14 +9815,23 @@ void Emitter::emitStaticConstructorBody(sema::ConstructorSymbol* cs,
                         if (!cl->elements[i]) continue;
                         llvm::Value* ev = lowerExpr(*cl->elements[i]);
                         if (!ev) {
-                            // #1386: ICE — lowerExpr returned null for a
-                            // static field inline-array initializer element.
-                            ctx_.diagnostics().report(
-                                Severity::Error,
-                                cl->elements[i]->span.begin,
-                                "internal: lowerExpr returned null for static "
-                                "field inline-array initializer element — #1386");
-                            continue;
+                            // fix #3712 (§3.2 / §15.1 / §17.11, v0.286): a
+                            // UNIT-typed element is not a lowering failure —
+                            // see lowerCollectionLiteralElementOrUnitNull
+                            // (hoisted from fix #3528's local-decl guard).
+                            ev = lowerCollectionLiteralElementOrUnitNull(
+                                *cl->elements[i], elemTy);
+                            if (!ev) {
+                                // #1386: ICE — lowerExpr returned null for a
+                                // static field inline-array initializer element.
+                                ctx_.diagnostics().report(
+                                    Severity::Error,
+                                    cl->elements[i]->span.begin,
+                                    "internal: lowerExpr returned null for "
+                                    "static field inline-array initializer "
+                                    "element — #1386");
+                                continue;
+                            }
                         }
                         if (ev->getType() != elemTy &&
                             ev->getType()->isIntegerTy() &&
@@ -11117,13 +11126,22 @@ void Emitter::emitOwnFieldInit(const sema::TypeSymbol* t, llvm::Value* obj,
                     if (!cl->elements[i]) continue;
                     llvm::Value* ev = lowerExpr(*cl->elements[i]);
                     if (!ev) {
-                        // #1386: ICE — lowerExpr returned null for an instance
-                        // field inline-array initializer element.
-                        ctx_.diagnostics().report(
-                            Severity::Error, cl->elements[i]->span.begin,
-                            "internal: lowerExpr returned null for instance "
-                            "field inline-array initializer element — #1386");
-                        continue;
+                        // fix #3712 (§3.2 / §15.1 / §17.11, v0.286): a
+                        // UNIT-typed element is not a lowering failure — see
+                        // lowerCollectionLiteralElementOrUnitNull (hoisted
+                        // from fix #3528's local-decl guard).
+                        ev = lowerCollectionLiteralElementOrUnitNull(
+                            *cl->elements[i], elemTy);
+                        if (!ev) {
+                            // #1386: ICE — lowerExpr returned null for an
+                            // instance field inline-array initializer element.
+                            ctx_.diagnostics().report(
+                                Severity::Error, cl->elements[i]->span.begin,
+                                "internal: lowerExpr returned null for "
+                                "instance field inline-array initializer "
+                                "element — #1386");
+                            continue;
+                        }
                     }
                     if (ev->getType() != elemTy &&
                         ev->getType()->isIntegerTy() &&
@@ -13284,6 +13302,22 @@ std::string Emitter::builtinMemberChainNote(const std::string& member,
            appliedMember + "` here would be wrong \xE2\x80\x94 #2976)";
 }
 
+// fix #3712 (§3.2 / §15.1 / §17.11, v0.286): the ONE unit-typed
+// collection-literal-element decision, hoisted from fix #3528's local-decl-
+// only guard so the static-field, instance-field and return-statement store
+// loops share it too instead of re-deriving it. See the declaration
+// (LlvmBackend_impl.hpp) for the full rationale; in short: `lowerExpr`
+// returns nullptr for a UNIT-typed expression by the #3421 convention, so a
+// null `ev` here is only a genuine #1386 lowering failure when the
+// element's OWN sema type is NOT Unit.
+llvm::Value* Emitter::lowerCollectionLiteralElementOrUnitNull(
+    const ast::Expr& elemExpr, llvm::Type* elemTy) {
+    const sema::TypeRef* et = ctx_.exprType(elemExpr);
+    if (et && et->kind == sema::TypeRef::Kind::Unit)
+        return llvm::Constant::getNullValue(elemTy);
+    return nullptr;
+}
+
 void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
                     const ast::Type* declType) {
     // §27.5 / §28.9 (#969): record this local's block-nesting depth so the
@@ -13549,35 +13583,23 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
                 if (!cl->elements[i]) continue;
                 llvm::Value* ev = lowerExpr(*cl->elements[i]);
                 if (!ev) {
-                    // fix #3528 (§4.7 / §15.1, v0.286): a UNIT-typed element
-                    // (`()`) is not a lowering failure — `lowerExpr` normalises
-                    // every unit-typed expression to nullptr by the SAME
-                    // established convention #3421's guard documents ("a
-                    // unit-typed expression has no lowered value; every
-                    // producer must report it as one"). `elemTy` here already
-                    // carries the InlineArray element-position substitution
-                    // (LlvmBackend_Layout.cpp's `Kind::InlineArray` arm, fix
-                    // #3528), so a genuinely unit-typed element's slot is the
-                    // one-byte placeholder and a zero byte is a faithful,
-                    // never-meaningfully-read value — the SAME "one inert
-                    // byte" reasoning #3453/#3527 apply to every other unit
-                    // storage position. Only a non-unit element still ICEs.
-                    const sema::TypeRef* et = ctx_.exprType(*cl->elements[i]);
-                    if (et && et->kind == sema::TypeRef::Kind::Unit) {
-                        llvm::Value* ugep = builder_.CreateGEP(
-                            arrTy, slot,
-                            {builder_.getInt32(0), builder_.getInt32(i)});
-                        builder_.CreateStore(
-                            llvm::Constant::getNullValue(elemTy), ugep);
+                    // fix #3712 (§3.2 / §15.1 / §17.11, v0.286): a UNIT-typed
+                    // element (`()`) is not a lowering failure; fall through
+                    // with the placeholder zero value and let the ordinary
+                    // per-element store code below run unchanged (its type
+                    // matches `elemTy` exactly, so the int-coercion and
+                    // coerceToNullableSlot steps are both no-ops for it).
+                    ev = lowerCollectionLiteralElementOrUnitNull(
+                        *cl->elements[i], elemTy);
+                    if (!ev) {
+                        // #1386: ICE — lowerExpr returned null for a
+                        // local-decl inline-array initializer element.
+                        ctx_.diagnostics().report(
+                            Severity::Error, cl->elements[i]->span.begin,
+                            "internal: lowerExpr returned null for local-decl "
+                            "inline-array initializer element — #1386");
                         continue;
                     }
-                    // #1386: ICE — lowerExpr returned null for a local-decl
-                    // inline-array initializer element.
-                    ctx_.diagnostics().report(
-                        Severity::Error, cl->elements[i]->span.begin,
-                        "internal: lowerExpr returned null for local-decl "
-                        "inline-array initializer element — #1386");
-                    continue;
                 }
                 // Coerce element to the array's element type if needed.
                 if (ev->getType() != elemTy) {

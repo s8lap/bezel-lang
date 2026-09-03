@@ -1987,15 +1987,26 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                                 if (!cl->elements[i]) continue;
                                 llvm::Value* ev = lowerExpr(*cl->elements[i]);
                                 if (!ev) {
-                                    // #1386: ICE — lowerExpr returned null
-                                    // for an inline-array return element.
-                                    ctx_.diagnostics().report(
-                                        Severity::Error,
-                                        cl->elements[i]->span.begin,
-                                        "internal: lowerExpr returned null "
-                                        "for inline-array return element"
-                                        " — #1386");
-                                    continue;
+                                    // fix #3712 (§3.2 / §15.1 / §17.11,
+                                    // v0.286): a UNIT-typed element is not a
+                                    // lowering failure — see
+                                    // lowerCollectionLiteralElementOrUnitNull
+                                    // (hoisted from fix #3528's local-decl
+                                    // guard; LlvmBackend_Setup.cpp).
+                                    ev = lowerCollectionLiteralElementOrUnitNull(
+                                        *cl->elements[i], elemTy);
+                                    if (!ev) {
+                                        // #1386: ICE — lowerExpr returned
+                                        // null for an inline-array return
+                                        // element.
+                                        ctx_.diagnostics().report(
+                                            Severity::Error,
+                                            cl->elements[i]->span.begin,
+                                            "internal: lowerExpr returned "
+                                            "null for inline-array return "
+                                            "element — #1386");
+                                        continue;
+                                    }
                                 }
                                 if (ev->getType() != elemTy &&
                                     ev->getType()->isIntegerTy() &&
