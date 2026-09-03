@@ -4595,7 +4595,165 @@ llvm::Function* Emitter::dictValueBoxFreer(const sema::TypeRef* dictTy) {
     const sema::TypeRef* valTy = dictTy->genericArgs[1];
     llvm::Type* valLlvm = valTy ? lowerTypeRef(valTy) : nullptr;
     if (!dictValueIsBoxedStruct(valLlvm)) return nullptr;
+    // fix #3798 (stdlib §4.8 / §28.9, v0.286): when V is a non-nullable record
+    // or choice that owns a string (directly or transitively through a
+    // non-nullable nested record/choice), the plain valueBoxFreeThunk's
+    // free(box) leaks the box's nested string allocations. Specialize to a
+    // per-V boxed-value freer that walks V's string fields first (using the
+    // SAME walker scope-end Disposal uses for plain `var` record / choice
+    // locals, #1747/#2425) and then `free(box)`s the storage. Non-recursive
+    // V (record with only int fields, choice with only int payloads,
+    // value-like primitive) keeps the plain thunk — UNCHANGED.
+    if (valTy && !valTy->nullable &&
+        valTy->kind == sema::TypeRef::Kind::Named && valTy->declaration) {
+        if (valTy->declaration->kind == ast::TypeDeclKind::Record &&
+            recordHasStringFields(valTy->declaration)) {
+            return boxedRecordValueFreer(valTy);
+        }
+        if (valTy->declaration->kind == ast::TypeDeclKind::Choice &&
+            choiceHasStringFields(valTy->declaration)) {
+            return boxedChoiceValueFreer(valTy);
+        }
+    }
     return valueBoxFreeThunk();
+}
+
+
+// fix #3798 (stdlib §4.8 / §28.9, v0.286): the per-V boxed-value freer for a
+// `Dictionary<K, V>` whose V is a non-nullable record that owns a string
+// (directly or transitively, through a non-nullable nested record/choice
+// payload — `recordHasStringFields` already filters to those). The thunk
+// takes the box pointer as a `void*`, walks V's string fields and releases
+// each (releasing its +1 / refcount), then `free(box)`s the malloc'd
+// storage. Walking is done by reusing the SAME emitRecordStringFieldReleases_impl
+// scope-end Disposal uses for plain `var` record locals (#1747/#2405) — the
+// address it expects (recAddr) IS the box's struct base. Cached per-V so a
+// module's N Dictionary<…, V> instances all share one V-specialized thunk.
+//
+// Built with its own IRBuilder so the active builder_'s insert point is
+// untouched (mirrors valueBoxFreeThunk / boxElementDisposerThunk /
+// sharedReleaseThunk on this point). emitRecordStringFieldReleases_impl uses
+// the active builder_/currentFn_, so we save both, point them at the thunk,
+// emit the field-release IR + the free, and restore.
+llvm::Function* Emitter::boxedRecordValueFreer(const sema::TypeRef* valTy) {
+    if (!valTy || !valTy->declaration) return nullptr;
+    auto cached = boxedRecordValueFreers_.find(valTy);
+    if (cached != boxedRecordValueFreers_.end()) return cached->second;
+    auto* fnTy = llvm::FunctionType::get(llvm::Type::getVoidTy(llvm_),
+                                         {ptrTy()}, /*isVarArg=*/false);
+    auto* fn = llvm::Function::Create(
+        fnTy, llvm::Function::InternalLinkage,
+        ("bz$recValBoxFree$" +
+         std::string(valTy->declaration->name.empty() ? "V"
+                                                      : valTy->declaration->name))
+            .c_str(),
+        module_.get());
+    llvm::Argument* box = &*fn->args().begin();
+    auto* entry = llvm::BasicBlock::Create(llvm_, "entry", fn);
+    auto* doBB  = llvm::BasicBlock::Create(llvm_, "box.do", fn);
+    auto* retBB = llvm::BasicBlock::Create(llvm_, "box.ret", fn);
+    llvm::IRBuilder<> b(entry);
+    // A null box (a moved-from / never-stored slot) is safe to skip —
+    // mirrors valueBoxFreeThunk's null-check.
+    llvm::Value* isNull = b.CreateICmpEQ(
+        box, llvm::ConstantPointerNull::get(ptrTy()));
+    b.CreateCondBr(isNull, retBB, doBB);
+    b.SetInsertPoint(doBB);
+
+    // emitRecordStringFieldReleases_impl uses builder_/currentFn_ — save
+    // both, point them at this thunk, then restore.
+    llvm::Function* savedFn = currentFn_;
+    auto* savedBB = builder_.GetInsertBlock();
+    auto savedIP = savedBB ? builder_.GetInsertPoint()
+                           : decltype(savedBB->begin()){};
+    currentFn_ = fn;
+    builder_.SetInsertPoint(doBB);
+    emitRecordStringFieldReleases_impl(box, valTy->declaration);
+    // The walker emits non-terminator instructions only — doBB is the BB it
+    // emitted into and is currently unterminated. Append the free + branch
+    // to retBB on the local IRBuilder (NOT builder_, which we are about to
+    // restore), so the boxed-V storage reclaim runs on every walk path.
+    if (!builder_.GetInsertBlock()->getTerminator()) {
+        b.SetInsertPoint(builder_.GetInsertBlock());
+        b.CreateCall(freeFn(), {box});
+        b.CreateBr(retBB);
+    } else {
+        // Walker already terminated doBB (only happens if a future walker
+        // shape adds terminators; safe to chain a tail BB).
+        auto* tailBB = llvm::BasicBlock::Create(llvm_, "box.tail", fn);
+        builder_.SetInsertPoint(tailBB);
+        b.SetInsertPoint(tailBB);
+        b.CreateCall(freeFn(), {box});
+        b.CreateBr(retBB);
+    }
+    // retBB's terminator MUST be on retBB itself. builder_ here is irrelevant
+    // (about to restore); use b explicitly so the ret void lands in retBB.
+    b.SetInsertPoint(retBB);
+    b.CreateRetVoid();
+    currentFn_ = savedFn;
+    if (savedBB) builder_.SetInsertPoint(savedBB, savedIP);
+    boxedRecordValueFreers_[valTy] = fn;
+    return fn;
+}
+
+
+// fix #3798 (stdlib §4.8 / §28.9, v0.286): the choice-side counterpart to
+// boxedRecordValueFreer (above). Tag-switched walk of the active case's
+// string payload(s), reusing emitChoiceStringFieldReleases_impl (#2425).
+// Same builder_/currentFn_ save/restore as the record variant; same null
+// guard; same post-walk `free(box)`.
+llvm::Function* Emitter::boxedChoiceValueFreer(const sema::TypeRef* valTy) {
+    if (!valTy || !valTy->declaration) return nullptr;
+    auto cached = boxedChoiceValueFreers_.find(valTy);
+    if (cached != boxedChoiceValueFreers_.end()) return cached->second;
+    auto* fnTy = llvm::FunctionType::get(llvm::Type::getVoidTy(llvm_),
+                                         {ptrTy()}, /*isVarArg=*/false);
+    auto* fn = llvm::Function::Create(
+        fnTy, llvm::Function::InternalLinkage,
+        ("bz$chValBoxFree$" +
+         std::string(valTy->declaration->name.empty() ? "V"
+                                                      : valTy->declaration->name))
+            .c_str(),
+        module_.get());
+    llvm::Argument* box = &*fn->args().begin();
+    auto* entry = llvm::BasicBlock::Create(llvm_, "entry", fn);
+    auto* doBB  = llvm::BasicBlock::Create(llvm_, "box.do", fn);
+    auto* retBB = llvm::BasicBlock::Create(llvm_, "box.ret", fn);
+    llvm::IRBuilder<> b(entry);
+    llvm::Value* isNull = b.CreateICmpEQ(
+        box, llvm::ConstantPointerNull::get(ptrTy()));
+    b.CreateCondBr(isNull, retBB, doBB);
+    b.SetInsertPoint(doBB);
+
+    llvm::Function* savedFn = currentFn_;
+    auto* savedBB = builder_.GetInsertBlock();
+    auto savedIP = savedBB ? builder_.GetInsertPoint()
+                           : decltype(savedBB->begin()){};
+    currentFn_ = fn;
+    builder_.SetInsertPoint(doBB);
+    emitChoiceStringFieldReleases_impl(box, valTy->declaration);
+    // Choice walker terminates its join BB itself (CreateBr to its own
+    // joinBB), so doBB here is terminated when the walker had any case to
+    // release. The unterminated path is the case where the walker emitted
+    // nothing (no active case or no string-owning case). Chain the free
+    // exactly the same way as the record variant.
+    if (!builder_.GetInsertBlock()->getTerminator()) {
+        b.SetInsertPoint(builder_.GetInsertBlock());
+        b.CreateCall(freeFn(), {box});
+        b.CreateBr(retBB);
+    } else {
+        auto* tailBB = llvm::BasicBlock::Create(llvm_, "box.tail", fn);
+        builder_.SetInsertPoint(tailBB);
+        b.SetInsertPoint(tailBB);
+        b.CreateCall(freeFn(), {box});
+        b.CreateBr(retBB);
+    }
+    b.SetInsertPoint(retBB);
+    b.CreateRetVoid();
+    currentFn_ = savedFn;
+    if (savedBB) builder_.SetInsertPoint(savedBB, savedIP);
+    boxedChoiceValueFreers_[valTy] = fn;
+    return fn;
 }
 
 

@@ -12840,6 +12840,28 @@ private:
     llvm::Function* collectionNodeFreeThunk(const sema::TypeRef* nodeTy);
     std::unordered_map<const sema::TypeRef*, llvm::Function*>
         collectionNodeFreeThunks_;
+    // fix #3798 (stdlib §4.8 / §28.9, v0.286): per-V `void(void*)` boxed-value
+    // freers for a Dictionary<K, V> / SortedDictionary<K, V> entry whose V is
+    // a record / choice with transitively-owned `string` storage (directly or
+    // through a non-nullable nested record/choice payload). The plain
+    // valueBoxFreeThunk just `free(box)`s — issue #3798 measured that leaks
+    // each owned nested string allocation. These per-V thunks first walk V's
+    // string fields (and recurse into nested records/choices, via
+    // emitRecordStringFieldReleases_impl / emitChoiceStringFieldReleases_impl
+    // — the SAME walkers scope-end Disposal already uses for plain `var`
+    // record locals) and THEN `free(box)` to reclaim the box. The `box`
+    // argument is the malloc'd box, so its struct base is the SAME record /
+    // choice struct address emitRecordStringFieldReleases_impl /
+    // emitChoiceStringFieldReleases_impl already accept. Cached per-V; nullable
+    // V is excluded because its lowered `{i8, T}` wrapper changes the GEP
+    // shape and is a separate, pre-existing gap (the same Nullable-rectypass
+    // gap #2405/#2425 documented for those walkers).
+    llvm::Function* boxedRecordValueFreer(const sema::TypeRef* valTy);
+    llvm::Function* boxedChoiceValueFreer(const sema::TypeRef* valTy);
+    std::unordered_map<const sema::TypeRef*, llvm::Function*>
+        boxedRecordValueFreers_;
+    std::unordered_map<const sema::TypeRef*, llvm::Function*>
+        boxedChoiceValueFreers_;
     // fix #2660: if `declNode` is a proven literal-tree aggregate root of type
     // `collTy`, return the interior-node disposer to install on the root's
     // Disposal; null otherwise. Single entry point for the three registration
