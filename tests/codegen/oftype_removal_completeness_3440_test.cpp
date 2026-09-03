@@ -20,22 +20,31 @@
 // removal measurably does not hold.
 //
 // That second half is the point. A removal is only as good as its narrowest
-// gate, and this one has two holes — both filed, both pinned here as KNOWN-GAP
-// rows so the gaps cannot widen unobserved and so the day either is fixed the
-// row goes red and gets flipped rather than quietly staying green:
+// gate, and this one had two holes, both filed and both pinned here — one
+// (3710) as a REJECT row now that it is fixed, one (3711) still as a
+// KNOWN-GAP row so the remaining gap cannot widen unobserved and so the day
+// it is fixed the row goes red and gets flipped rather than quietly staying
+// green:
 //
-//   * issue 3710 — `OfType<U>(x)`: BOTH sema arms gate on `ce.args.empty()`,
+//   * issue 3710 — `OfType<U>(x)`: BOTH sema arms gated on `ce.args.empty()`,
 //     while the §5 name exemption in `kBuiltinCollectionLinqOperatorNames` is
-//     name-only. So a WITHDRAWN member given any argument is waved past the
-//     "no member" reject AND skipped by the removal arm: rc=0, links, runs.
+//     name-only. So a WITHDRAWN member given any argument was waved past the
+//     "no member" reject AND skipped by the removal arm: rc=0, linked, ran.
+//     FIXED in this commit (both arms dropped the `ce.args.empty()` guard —
+//     a withdrawn member is a removal diagnostic at ANY arity); the row below
+//     is flipped to a reject row rather than deleted, so a re-introduction of
+//     the guard shows up as a regression, not silence.
 //   * issue 3711 — a `SortedSet<T>` receiver: the whole §5 surface (and
 //     `ToArray`) lowers to a zero-initialized value there, so the removed
-//     `OfType` compiles for the same reason `Where` returns nothing.
+//     `OfType` compiles for the same reason `Where` returns nothing. STILL
+//     OPEN — a different bug (the SortedSet §5 surface itself), out of scope
+//     for #3710's fix.
 //
 // AXIS GRID (receiver kind x expected outcome). Every reject row below is a
 // cell issue 3440's original grid either miscompiled or never contained, and
 // every one of them PASSES today — they are guards against the removal being
-// partially undone, not pins on a fix in this commit.
+// partially undone, not pins on a fix in this commit (except the 3710 row,
+// which IS the fix this commit ships).
 //
 //   receiver family              row                              today
 //   ---------------------------  -------------------------------  ----------
@@ -48,7 +57,7 @@
 //   IEnumerable<T> PARAMETER     reject_ienumerable_param_recv    REJECT
 //   IGrouping<K,T>               reject_igrouping_receiver        REJECT
 //   user class with own OfType   accept_user_declared_oftype      RUNS -> 42
-//   Array<T>, one argument       known_gap_3710_...               rc=0, "0"
+//   Array<T>, one argument       reject_3710_oftype_with_argument REJECT
 //   SortedSet<T>                 known_gap_3711_...               rc=0, "0"
 //
 // The `Bag` row is the over-rejection control that matters most: `OfType` is an
@@ -249,6 +258,30 @@ BEZEL_TEST(oftype_removal_completeness_3440, reject_igrouping_receiver) {
     BEZEL_EXPECT_TRUE(removedOfType(r, "int", "int"));
 }
 
+// issue 3710 (fixed in this commit). `OfType<U>(x)` — a member stdlib §5 no
+// longer declares, given an argument — used to compile rc=0 and run, because
+// the §5 name exemption is arity-blind while both removal arms gated on
+// `ce.args.empty()`. The `direct=3` half is the control: the source really
+// does hold three elements, so a silent `withArg=0` was a wrong ANSWER and
+// not an empty input. fix #3710 drops the `ce.args.empty()` guard from both
+// arms (ExprTypecheck_Calls.cpp ~:4733 and ~:6265), so a withdrawn member is
+// a removal diagnostic at ANY arity. This row was the known-gap pin before
+// the fix; it is kept (flipped, not deleted) so a re-introduced arity guard
+// shows up as a regression here rather than silently reopening the gap.
+BEZEL_TEST(oftype_removal_completeness_3440,
+           reject_3710_oftype_with_argument_now_rejects) {
+    auto r = runAot(prog("    using var a := new Array<int>();\n"
+                         "    a.Add(1); a.Add(2); a.Add(3);\n"
+                         "    Console.WriteLine($\"direct={a.Count}\");\n"
+                         "    using var b := a.OfType<int>(0).ToArray();\n"
+                         "    var c := b.Count;\n"
+                         "    Console.WriteLine($\"withArg={c}\");\n"
+                         "    return 0;"));
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(removedOfType(r, "int", "int"));
+    BEZEL_EXPECT_FALSE(carriesInterim3440Wording(r));
+}
+
 // ===========================================================================
 // ACCEPT-CONTROL — the removal is about a stdlib member, not about the
 // identifier. A user's own `OfType` method must be untouched.
@@ -264,30 +297,15 @@ BEZEL_TEST(oftype_removal_completeness_3440,
 }
 
 // ===========================================================================
-// KNOWN GAPS — these rows assert the WRONG behaviour that ships today, because
-// the alternative is that the gap widens with nothing observing it. Each names
-// the issue that owns the fix. When either is fixed the row goes RED: flip it
-// to the reject/correct-value assertion and delete the gap note. Do not
-// "repair" one by loosening it.
+// KNOWN GAP — this row asserts the WRONG behaviour that ships today, because
+// the alternative is that the gap widens with nothing observing it. Names the
+// issue that owns the fix. When it is fixed the row goes RED: flip it to the
+// reject/correct-value assertion and delete the gap note. Do not "repair" it
+// by loosening it. (issue 3710's sibling known-gap row above this section
+// was fixed and flipped in this commit — see `reject_3710_...` above,
+// alongside the other REJECT rows — rather than deleted, so a re-introduced
+// `ce.args.empty()` guard shows up as a regression here.)
 // ===========================================================================
-
-// issue 3710. `OfType<U>(x)` — a member stdlib §5 no longer declares, given an
-// argument — compiles rc=0 and runs, because the §5 name exemption is
-// arity-blind while both removal arms gate on `ce.args.empty()`. The `direct=3`
-// half is the control: the source really does hold three elements, so
-// `withArg=0` is a wrong ANSWER and not an empty input.
-BEZEL_TEST(oftype_removal_completeness_3440,
-           known_gap_3710_oftype_with_argument_compiles_and_yields_zero) {
-    BEZEL_EXPECT_EQ(
-        runAotOut(prog("    using var a := new Array<int>();\n"
-                       "    a.Add(1); a.Add(2); a.Add(3);\n"
-                       "    Console.WriteLine($\"direct={a.Count}\");\n"
-                       "    using var b := a.OfType<int>(0).ToArray();\n"
-                       "    var c := b.Count;\n"
-                       "    Console.WriteLine($\"withArg={c}\");\n"
-                       "    return 0;")),
-        "direct=3\nwithArg=0");
-}
 
 // issue 3711. The whole stdlib §5 surface over a `SortedSet<T>` receiver —
 // `ToArray` included — lowers to a zero-initialized value, so the removed

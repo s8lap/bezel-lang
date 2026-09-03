@@ -483,6 +483,139 @@ BEZEL_TEST(sema_v0284_removals_3559,
 }
 
 // ===========================================================================
+// REJECT — issue 3710: `OfType<U>(x)` at ANY arity (fix #3710, stdlib §5,
+// v0.286).
+//
+// Both removal arms above gated on `ce.args.empty()`, so every row in this
+// section (arity != 0, across every receiver shape the two arms cover) used
+// to be WAVED PAST the removal diagnostic — the §5 name exemption in
+// `kBuiltinCollectionLinqOperatorNames` (BuiltinRegistry.cpp) that lets a bare
+// `OfType` reference reach this arm at all is name-only, not arity-aware, so
+// nothing else typed the call and codegen's #2434/#2491 zero-init
+// degradation notes let it compile rc=0, link, and run silently. fix #3710
+// drops the `ce.args.empty()` guard from both arms (ExprTypecheck_Calls.cpp
+// ~:4733 lazy-receiver arm, ~:6265 collection-receiver arm) — a withdrawn
+// member is a removal diagnostic at ANY arity, matching the zero-arg rows
+// above.
+//
+// §6b exclusion diff: `ce.args.empty()` previously ADMITTED every non-empty
+// arg list (1 arg, 2 args, with or without an explicit `<U>`) on EVERY
+// receiver shape both arms cover — concrete collection (Array, Set),
+// lazy-chain, Range, and an `IEnumerable<T>`-typed parameter. Every row below
+// is one of those previously-admitted cells; each is now a reject, matching
+// the zero-arg row for the same receiver shape above. No accept row in this
+// file flips: the user-declared `Bag.OfType(n)` control
+// (`oftype_removal_completeness_3440_test.cpp`'s
+// `accept_user_declared_oftype_method_still_runs`) is untouched by this
+// change because it never reaches either removal arm (its receiver is `Bag`,
+// not an `IEnumerable<T>` builtin).
+// ===========================================================================
+
+BEZEL_TEST(sema_v0284_removals_3559,
+           reject_3710_oftype_one_argument_collection_arm) {
+    auto r = reject(prog("    using var a := new Array<int>();\n"
+                         "    a.Add(1); a.Add(2); a.Add(3);\n"
+                         "    using var b := a.OfType<int>(0).ToArray();\n"
+                         "    return b.Count;"));
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(removedOfType(r, "int", "int"));
+    BEZEL_EXPECT_TRUE(locatedAt(r, "`OfType<int>()`"));
+    BEZEL_EXPECT_FALSE(carriesInterim3440Wording(r));
+}
+
+BEZEL_TEST(sema_v0284_removals_3559, reject_3710_oftype_two_arguments) {
+    auto r = reject(prog("    using var a := new Array<int>();\n"
+                         "    a.Add(1);\n"
+                         "    using var b := a.OfType<int>(1, 2).ToArray();\n"
+                         "    return b.Count;"));
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(removedOfType(r, "int", "int"));
+}
+
+// No explicit `<U>` type argument AND a value argument — the source element
+// type stands in for U (same fallback the zero-arg, no-typearg cell would
+// use), so `removedOfType` is asserted with `int`/`int`.
+BEZEL_TEST(sema_v0284_removals_3559, reject_3710_oftype_no_typearg_with_arg) {
+    auto r = reject(prog("    using var a := new Array<int>();\n"
+                         "    a.Add(1);\n"
+                         "    using var b := a.OfType(1).ToArray();\n"
+                         "    return b.Count;"));
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(removedOfType(r, "int", "int"));
+}
+
+// The upcast shape (base-class `<U>`) WITH an argument — combines 3710's
+// arity gap with 3440's original identity-relabelling grid, on the receiver
+// family the issue's own repro used (`OwningArray<Animal>`).
+BEZEL_TEST(sema_v0284_removals_3559,
+           reject_3710_oftype_upcast_with_argument) {
+    auto r = reject(prog("    using var xs := new OwningArray<Dog>();\n"
+                         "    xs.Add(new Dog());\n"
+                         "    var acc := 0;\n"
+                         "    for var a in xs.OfType<Animal>(0) do\n"
+                         "      acc := acc + a.Tag;\n"
+                         "    end;\n"
+                         "    return acc;"));
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(removedOfType(r, "Animal", "Dog"));
+}
+
+// The LAZY-receiver arm (the sibling `ce.args.empty()` guard this fix also
+// drops) WITH an argument.
+BEZEL_TEST(sema_v0284_removals_3559, reject_3710_oftype_lazy_arm_with_argument) {
+    auto r = reject(prog("    using var a := new Array<int>();\n"
+                         "    a.Add(1); a.Add(2);\n"
+                         "    using var b := a.Where(lambda(x: int) => x > 0)"
+                         ".OfType<int>(0).ToArray();\n"
+                         "    return b.Count;"));
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(removedOfType(r, "int", "int"));
+    BEZEL_EXPECT_FALSE(carriesInterim3440Wording(r));
+}
+
+// A `Set<T>` receiver — the collection-receiver arm's OTHER concrete builtin
+// (not just `Array`/`OwningArray`) — WITH an argument.
+BEZEL_TEST(sema_v0284_removals_3559, reject_3710_oftype_set_receiver_with_argument) {
+    auto r = reject(prog("    using var s := new Set<int>();\n"
+                         "    s.Add(1);\n"
+                         "    using var b := s.OfType<int>(0).ToArray();\n"
+                         "    return b.Count;"));
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(removedOfType(r, "int", "int"));
+}
+
+// An `IEnumerable<T>`-typed PARAMETER receiver WITH an argument — the shape
+// that is neither a concrete collection nor a lazy chain.
+BEZEL_TEST(sema_v0284_removals_3559,
+           reject_3710_oftype_ienumerable_param_receiver_with_argument) {
+    auto r = reject(std::string(kTypes) +
+                    "class C\n"
+                    "  public static method F(xs: IEnumerable<int>): int\n"
+                    "    using var b := xs.OfType<int>(0).ToArray();\n"
+                    "    return b.Count;\n"
+                    "  end F;\n"
+                    "  public static method Main(): int\n"
+                    "    using var a := new Array<int>();\n"
+                    "    a.Add(1);\n"
+                    "    return F(a);\n"
+                    "  end Main;\n"
+                    "end C;\n");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(removedOfType(r, "int", "int"));
+}
+
+// A `Range<T>` receiver (the lazy arm's third route) WITH an argument.
+BEZEL_TEST(sema_v0284_removals_3559,
+           reject_3710_oftype_range_receiver_with_argument) {
+    auto r = reject(prog("    var n := 0;\n"
+                         "    for var x in (1..4).OfType<int>(0) do "
+                         "n := n + x; end;\n"
+                         "    return n;"));
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(removedOfType(r, "int", "int"));
+}
+
+// ===========================================================================
 // ACCEPT-CONTROLS — stdlib §5's other lazy operators are untouched. `Where`
 // shares the operator table `OfType` was removed from, and `Reverse` sits
 // immediately beside it in the same `isOp` disjunction that lost the `OfType`

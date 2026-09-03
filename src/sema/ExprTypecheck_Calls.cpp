@@ -4724,7 +4724,13 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         return true;
                     }
                     // stdlib §5 (#651): OfType<U>() on lazy receiver → lazy IEnum<U>.
-                    if (m == "OfType" && ce.args.empty()) {
+                    // fix #3710: no `ce.args.empty()` guard — a WITHDRAWN
+                    // member is a removal diagnostic at ANY arity, not only
+                    // the zero-arg spelling. Pre-fix, `OfType<U>(x)` slipped
+                    // past this arm (and the §5 name exemption, which is
+                    // name-only) untyped, and codegen's #2434/#2491
+                    // degradation notes let it compile and run silently.
+                    if (m == "OfType") {
                         TypeRef* outElem = srcElem;
                         if (auto* callMa = dynamic_cast<const ast::MemberAccessExpr*>(
                                 ce.callee.get())) {
@@ -6253,7 +6259,10 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         // measured: `Array<int>{1,2,3}.OfType<string>()`
                         // compiled clean and SIGSEGV'd.) The gate below is that
                         // enforcement, for BOTH arms.
-                        else if (m == "OfType" && ce.args.empty()) {
+                        // fix #3710: no `ce.args.empty()` guard — see the
+                        // sibling lazy-receiver arm above. Arity is not the
+                        // question; the member is gone at every arity.
+                        else if (m == "OfType") {
                             TypeRef* srcElem = recvTy->genericArgs.empty()
                                 ? nullptr : recvTy->genericArgs[0];
                             TypeRef* outElem = srcElem;
