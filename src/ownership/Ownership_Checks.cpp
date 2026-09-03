@@ -8578,7 +8578,22 @@ void MethodOwnership::markOutOwnedArgs(
     // #3186 in the same batch the imported build now reports the same §28.3
     // auto-drop warning as its single-module twin, returns the same value, and
     // is LeakSanitizer-clean.
-    markOutOwnedArgsCore(args, resolveCalleeParams(callee, ctx_), callee);
+    //
+    // fix #3790 (§22.3 / §22.10 / §12.8 / §28.8, v0.286): through
+    // `calleeOrChainFormals`, so a `this(...)` / `base(...)` CHAIN call — whose
+    // callee is the bare identifier `this`/`base` and resolves to no symbol —
+    // classifies its `out owned` recipients against the target constructor's
+    // formals, not against nothing. Pre-fix the chain target's `out owned`
+    // parameter was invisible to this arm, so a chain recipient was silently
+    // unmarked: `markOutOwnedArgsCore` saw an empty `params` view, the
+    // `boundModifier` check returned empty, `markOwnedByName`/`insert` never
+    // ran, and the recipient local stayed Borrowed — no §28.3 auto-drop
+    // warning, but no `preDeclaredOutOwnedRecipients_` entry either, so a
+    // Try* false-return path or scope-end reclaim had nothing to consult.
+    // `recordMovesInArgs` / `collectCondOutOwnedRecipients` already use the
+    // chain fallback; `markOutOwnedArgs` was the one remaining consumer reading
+    // `resolveCalleeParams` directly.
+    markOutOwnedArgsCore(args, calleeOrChainFormals(callee, args), callee);
 }
 
 // §28.3 / §22.4 (issue #2429): the constructor-call overload — see the
