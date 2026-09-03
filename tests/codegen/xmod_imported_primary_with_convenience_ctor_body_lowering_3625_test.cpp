@@ -222,11 +222,32 @@ InProcessApp buildApp(const std::filesystem::path& dir,
 // the in-process `Driver::compileFile` discards diagnostic text on success
 // (`aot_support.hpp:876`, exactly the lane-rule §3 vacuous-test trap).
 // Returns the CLI's stderr verbatim.
-std::string compileViaCli(const std::string& libObjPath,
+//
+// fix #3649 (lane c6-b7, v0.286): this used to shell out to
+// `/home/.../lane-pool/lane-10/build/bezelc` — an ABSOLUTE PATH INTO A
+// DIFFERENT LANE'S WORKTREE. Lane worktrees are ephemeral (created and torn
+// down per run, `scripts/gc_scratch.sh`); once `lane-10` no longer existed the
+// `popen` command failed at the shell (`No such file or directory`, exit 127)
+// and `compileViaCli` returned that shell error text — which does NOT contain
+// "no constructor call could be lowered", so the caller's absence-of-warning
+// assertion below passed VACUOUSLY regardless of what the compiler actually
+// emits. Measured on this lane's worktree (`lane-38`): the old command failed
+// exactly this way. The fix uses the `BEZELC_PATH` compile-time definition
+// (`tests/CMakeLists.txt` passes `$<TARGET_FILE:bezelc>` — the CURRENT
+// worktree's own just-built binary, see `tests/support/bezelc_version_test.cpp`
+// for the established idiom) instead of a hand-guessed path, so the command
+// is correct regardless of cwd or which worktree the binary was built in.
+// The output executable goes into the shared scratch dir via `unique_stem`
+// instead of a fixed `/tmp` path (lane rule: never a bare `/tmp` path — a
+// concurrent shard could collide on the same name, and `/tmp` is a
+// quota-bounded tmpfs).
+std::string compileViaCli(const std::filesystem::path& dir,
+                          const std::string& libObjPath,
                           const std::string& appSrcPath) {
-    std::string cmd = "/home/stepan/w/code/bezel-lang/.claude/lane-pool/lane-10/build/bezelc "
+    std::string outExe = (dir / (unique_stem("bezel_3625_cli_app_") + "_exe")).string();
+    std::string cmd = std::string(BEZELC_PATH) + " "
                       "--import " + libObjPath +
-                      " -o /tmp/bezel_3625_cli_app " + appSrcPath + " 2>&1";
+                      " -o " + outExe + " " + appSrcPath + " 2>&1";
     std::string out;
     FILE* p = popen(cmd.c_str(), "r");
     if (!p) return out;
@@ -234,7 +255,7 @@ std::string compileViaCli(const std::string& libObjPath,
     while (std::size_t n = std::fread(buf, 1, sizeof(buf), p)) out.append(buf, n);
     int status = pclose(p);
     (void)status;
-    std::remove("/tmp/bezel_3625_cli_app");
+    std::remove(outExe.c_str());
     return out;
 }
 
@@ -384,10 +405,210 @@ BEZEL_TEST(xmod_imported_primary_with_convenience_ctor_body_lowering_3625,
     InProcessApp r = buildApp(dir, libH.objPath, app);
     BEZEL_EXPECT_TRUE(r.ok);
     if (!r.ok) return;
-    std::string stderrText = compileViaCli(libH.objPath, r.src->path);
+    std::string stderrText = compileViaCli(dir, libH.objPath, r.src->path);
     // Post-fix: no warning. Pre-fix: the #2658 warning fired here.
     BEZEL_EXPECT_TRUE(stderrText.find("no constructor call could be lowered")
                       == std::string::npos);
+}
+
+// ── #3649 — dedicated regression pin ───────────────────────────────────────
+//
+// #3649 was filed against exactly the (b) shape above (`new WithConv(7,
+// "direct")` printing `0` instead of `7\ndirect`). Lane c6-b7 (R12 cycle 3)
+// re-verified the repro on `r12-cycle-1` HEAD before doing any work (lane
+// rule §1) and found it does NOT reproduce: `0d3deb7` (this file's own fix,
+// above) already restores the correct value and suppresses the `#2658`
+// warning. #3649 is closed as already-fixed (`gh issue close 3649`); this
+// row exists so `BEZEL_TEST_FILTER=3649` is not "0 passed, 0 failed" (lane
+// rule §2's zero-match trap) and so a future regression on this exact shape
+// is caught under the issue number a reader would search for.
+//
+// per §22.5, §22.8 step 0, §22.10, §2.8.3 rule 4 (v0.286), issue #3649
+BEZEL_TEST(xmod_imported_primary_direct_ctor_3649,
+           direct_positional_shape_prints_value_and_emits_no_warning) {
+    auto dir = wtDir3625();
+    const std::string lib =
+        "module XLib3649; "
+        "public class WithConv(a: int, b: string) "
+        "  public constructor(x: int) "
+        "    this(x, \"conv\"); "
+        "  end constructor; "
+        "  public method Show() "
+        "    Console.WriteLine(a.ToString()); "
+        "    Console.WriteLine(b); "
+        "  end Show; "
+        "end WithConv; ";
+    const std::string app =
+        "module XMain3649; "
+        "import XLib3649; "
+        "class C "
+        "  public static method Main(): int "
+        "    using var t := new WithConv(7, \"direct\"); "
+        "    t.Show(); "
+        "    return 0; "
+        "  end Main; "
+        "end C; ";
+    LibHandle libH = buildLib(dir, lib);
+    BEZEL_EXPECT_TRUE(libH.ok);
+    if (!libH.ok) return;
+    InProcessApp r = buildApp(dir, libH.objPath, app);
+    BEZEL_EXPECT_TRUE(r.ok);
+    if (!r.ok) return;
+    auto [code, out] = runCapture(r.exePath);
+    BEZEL_EXPECT_EQ(code, 0);
+    // Load-bearing: pre-#3649-fix this printed "0\n" (calloc-zero `a`/`b`).
+    BEZEL_EXPECT_TRUE(out.find("7") != std::string::npos);
+    BEZEL_EXPECT_TRUE(out.find("direct") != std::string::npos);
+    // Not vacuous: a fresh CLI compile, so the diagnostic text is real
+    // (`Driver::compileFile`'s in-process path discards it on success,
+    // aot_support.hpp:876 — the same trap `compileViaCli` above exists for).
+    std::string stderrText = compileViaCli(dir, libH.objPath, r.src->path);
+    BEZEL_EXPECT_TRUE(stderrText.find("no constructor call could be lowered")
+                      == std::string::npos);
+}
+
+// ── #3713 — KNOWN-GAP pin, NOT an aspiration ───────────────────────────────
+//
+// While verifying #3649, this lane found that #3649's own fix (`0d3deb7`) is
+// step 0 ONLY (the primary-constructor PARAMETER fields `a`/`b`). A class
+// that ALSO has another field with an initializer — §22.8 step 2 — never
+// runs that initializer when constructed through the direct-primary shape:
+// the class's compiled `bz$<Type>$ctor` is never invoked on this path (no
+// `ConstructorSymbol` matches a 2-argument call against a 1-argument
+// convenience ctor), and the exporter's `bz$<Type>$init` is deliberately
+// vtable-only for a has-explicit-ctor class (`emitInstanceInitFunction`,
+// `LlvmBackend_Setup.cpp:11400`, gated `!hasAnyConstructor`) — so NOTHING on
+// this path ever calls `emitOwnFieldInit`. Filed as #3713, with the same gap
+// MEASURED on the single-module twin below — it is not cross-module-specific
+// (§2.8.3 rule 4 already holds: both sides are broken identically), so a fix
+// belongs in BOTH of `lowerNew`'s local and imported arms together (lane
+// rule §6b: "a family lands WHOLE or not at all") — out of THIS lane's
+// imported-arm-only ownership, hence filed rather than attempted.
+//
+// The counter (`WithCounter.Bumps()`) is the oracle, not the field value
+// alone: a field default of `0` could arguably be "still zero, coincidence";
+// a process-global counter that never incremented is unambiguous proof the
+// field initializer expression was never evaluated at all.
+//
+// If #3713 lands, this row must flip to asserting `x == 1` /
+// `Bumps() == 1` and lose its KNOWN-GAP framing — a failure here afterward
+// is the intended signal, not a regression (the same idiom
+// `async_iterator_lambda_param_capture_cell_3567_test.cpp` row 2 documents).
+//
+// per §22.8 step 2, §22.10, §2.8.3 rule 4 (v0.286), issue #3713
+BEZEL_TEST(xmod_imported_primary_direct_ctor_field_init_gap_3713,
+           KNOWN_GAP_imported_direct_call_skips_step_2_field_initializer) {
+    auto dir = wtDir3625();
+    const std::string lib =
+        "module XLib3713; "
+        "public class WithCounter(a: int, b: string) "
+        "  private static _bumps: int := 0; "
+        "  public x: int := WithCounter.Bump(); "
+        "  public constructor(x: int) "
+        "    this(x, \"conv\"); "
+        "  end constructor; "
+        "  public static method Bump(): int "
+        "    _bumps := _bumps + 1; "
+        "    return _bumps; "
+        "  end Bump; "
+        "  public static method Bumps(): int "
+        "    return _bumps; "
+        "  end Bumps; "
+        "  public method Show() "
+        "    Console.WriteLine(a.ToString()); "
+        "    Console.WriteLine(b); "
+        "    Console.WriteLine(x.ToString()); "
+        "    Console.WriteLine(WithCounter.Bumps().ToString()); "
+        "  end Show; "
+        "end WithCounter; ";
+    const std::string app =
+        "module XMain3713; "
+        "import XLib3713; "
+        "class C "
+        "  public static method Main(): int "
+        "    using var t := new WithCounter(7, \"direct\"); "
+        "    t.Show(); "
+        "    return 0; "
+        "  end Main; "
+        "end C; ";
+    LibHandle libH = buildLib(dir, lib);
+    BEZEL_EXPECT_TRUE(libH.ok);
+    if (!libH.ok) return;
+    InProcessApp r = buildApp(dir, libH.objPath, app);
+    BEZEL_EXPECT_TRUE(r.ok);
+    if (!r.ok) return;
+    auto [code, out] = runCapture(r.exePath);
+    BEZEL_EXPECT_EQ(code, 0);
+    // `a`/`b` (step 0, #3649) are correct.
+    BEZEL_EXPECT_TRUE(out.find("7") != std::string::npos);
+    BEZEL_EXPECT_TRUE(out.find("direct") != std::string::npos);
+    // KNOWN GAP (#3713): `x` and the counter should both read `1` (the field
+    // initializer ran once) but currently read `0` (it never ran). Asserting
+    // the CURRENT wrong values, not GTEST_SKIP, so a silent fix regression
+    // cannot hide behind a vacuously-passing/skipped row (lane-rule §3's
+    // silent-skip trap) — see this file's header block for the rewrite
+    // instruction once #3713 lands.
+    // Precise, not fuzzy: right after "direct" the next two lines (`x` then
+    // `Bumps()`) must both read `0` — anchoring on "direct\n0\n0" rules out
+    // an accidental match against an unrelated "0" elsewhere in the output.
+    BEZEL_EXPECT_TRUE(out.find("direct\n0\n0") != std::string::npos);
+}
+
+// ── #3713 single-module twin — proves the gap is NOT cross-module-specific ─
+//
+// Character-identical class + call, ONE file, no `import` at all. If this
+// gap were an imported-arm defect only, this row would be clean; it is not.
+// per §22.8 step 2, §22.10 (v0.286), issue #3713
+BEZEL_TEST(xmod_imported_primary_direct_ctor_field_init_gap_3713,
+           KNOWN_GAP_local_twin_also_skips_step_2_field_initializer) {
+    auto dir = wtDir3625();
+    const std::string src =
+        "module LocalTwin3713; "
+        "class WithCounter(a: int, b: string) "
+        "  private static _bumps: int := 0; "
+        "  public x: int := WithCounter.Bump(); "
+        "  public constructor(x: int) "
+        "    this(x, \"conv\"); "
+        "  end constructor; "
+        "  public static method Bump(): int "
+        "    _bumps := _bumps + 1; "
+        "    return _bumps; "
+        "  end Bump; "
+        "  public static method Bumps(): int "
+        "    return _bumps; "
+        "  end Bumps; "
+        "  public method Show() "
+        "    Console.WriteLine(a.ToString()); "
+        "    Console.WriteLine(b); "
+        "    Console.WriteLine(x.ToString()); "
+        "    Console.WriteLine(WithCounter.Bumps().ToString()); "
+        "  end Show; "
+        "end WithCounter; "
+        "class C "
+        "  public static method Main(): int "
+        "    using var t := new WithCounter(7, \"direct\"); "
+        "    t.Show(); "
+        "    return 0; "
+        "  end Main; "
+        "end C; ";
+    std::string stem = unique_stem("bezel_3713local_");
+    auto srcFile = std::make_shared<TempFile>((dir / (stem + ".bzl")).string());
+    auto exeFile = std::make_shared<TempFile>((dir / stem).string());
+    writeSource(srcFile->path, src);
+    bezel::Driver driver;
+    bezel::CompileResult r = driver.compileFile(srcFile->path, exeFile->path, {});
+    BEZEL_EXPECT_TRUE(r.success);
+    if (!r.success) return;
+    auto [code, out] = runCapture(exeFile->path);
+    BEZEL_EXPECT_EQ(code, 0);
+    BEZEL_EXPECT_TRUE(out.find("7") != std::string::npos);
+    BEZEL_EXPECT_TRUE(out.find("direct") != std::string::npos);
+    // KNOWN GAP (#3713), single-module: same `0`/`0` the imported row above
+    // measures — proof this is not an importer-side defect.
+    // Precise, not fuzzy: right after "direct" the next two lines (`x` then
+    // `Bumps()`) must both read `0` — anchoring on "direct\n0\n0" rules out
+    // an accidental match against an unrelated "0" elsewhere in the output.
+    BEZEL_EXPECT_TRUE(out.find("direct\n0\n0") != std::string::npos);
 }
 
 }  // namespace bezel::codegen
