@@ -467,37 +467,40 @@ BEZEL_TEST(xmod_imported_primary_direct_ctor_3649,
                       == std::string::npos);
 }
 
-// ── #3713 — KNOWN-GAP pin, NOT an aspiration ───────────────────────────────
+// ── #3713 — FIXED: §22.8 step 2 on the direct-primary shape ───────────────
 //
-// While verifying #3649, this lane found that #3649's own fix (`0d3deb7`) is
-// step 0 ONLY (the primary-constructor PARAMETER fields `a`/`b`). A class
-// that ALSO has another field with an initializer — §22.8 step 2 — never
-// runs that initializer when constructed through the direct-primary shape:
-// the class's compiled `bz$<Type>$ctor` is never invoked on this path (no
-// `ConstructorSymbol` matches a 2-argument call against a 1-argument
-// convenience ctor), and the exporter's `bz$<Type>$init` is deliberately
-// vtable-only for a has-explicit-ctor class (`emitInstanceInitFunction`,
-// `LlvmBackend_Setup.cpp:11400`, gated `!hasAnyConstructor`) — so NOTHING on
-// this path ever calls `emitOwnFieldInit`. Filed as #3713, with the same gap
-// MEASURED on the single-module twin below — it is not cross-module-specific
-// (§2.8.3 rule 4 already holds: both sides are broken identically), so a fix
-// belongs in BOTH of `lowerNew`'s local and imported arms together (lane
-// rule §6b: "a family lands WHOLE or not at all") — out of THIS lane's
-// imported-arm-only ownership, hence filed rather than attempted.
+// Lane c6-b7 filed this row as a KNOWN-GAP pin while verifying #3649: #3649's
+// own fix (`0d3deb7`) is step 0 ONLY (the primary-constructor PARAMETER fields
+// `a`/`b`). A class that ALSO has another field with an initializer — §22.8
+// step 2 — never ran that initializer when constructed through the
+// direct-primary shape: the class's compiled `bz$<Type>$ctor` is never invoked
+// on this path (no `ConstructorSymbol` matches a 2-argument call against a
+// 1-argument convenience ctor), and the exporter's `bz$<Type>$init` is
+// deliberately vtable-only for a has-explicit-ctor class
+// (`emitInstanceInitFunction`, gated `!hasAnyConstructor`) — so NOTHING on this
+// path ever called `emitOwnFieldInit`.
+//
+// fix #3713 (v0.286) closed it in BOTH of `lowerNew`'s arms together (lane rule
+// §6b: "a family lands WHOLE or not at all"): the local arm routes the shape
+// through the existing `else if (!hasAnyConstructor(t))` construction sequence,
+// and the imported arm calls a second exported entry point,
+// `bz$<Type>$initprimary`, which is §22.8 steps 1+2 without the vtable store.
+// THESE TWO ROWS ARE THEREFORE FLIPPED from the values c6-b7 pinned
+// (`direct\n0\n0`) to the §22.8-required ones (`direct\n1\n1`) — that flip is
+// the fix's FAIL-WITHOUT / PASS-WITH evidence, and a future `0\n0` here is a
+// regression, not a known gap.
 //
 // The counter (`WithCounter.Bumps()`) is the oracle, not the field value
 // alone: a field default of `0` could arguably be "still zero, coincidence";
-// a process-global counter that never incremented is unambiguous proof the
-// field initializer expression was never evaluated at all.
-//
-// If #3713 lands, this row must flip to asserting `x == 1` /
-// `Bumps() == 1` and lose its KNOWN-GAP framing — a failure here afterward
-// is the intended signal, not a regression (the same idiom
-// `async_iterator_lambda_param_capture_cell_3567_test.cpp` row 2 documents).
+// a process-global counter is unambiguous proof about whether the field
+// initializer EXPRESSION evaluated, and — reading `1`, not `2` — that it
+// evaluated EXACTLY ONCE (§22.8 "Field initializers run exactly once per
+// instance construction"), which is the other half of what the fix must not
+// break.
 //
 // per §22.8 step 2, §22.10, §2.8.3 rule 4 (v0.286), issue #3713
 BEZEL_TEST(xmod_imported_primary_direct_ctor_field_init_gap_3713,
-           KNOWN_GAP_imported_direct_call_skips_step_2_field_initializer) {
+           imported_direct_call_runs_step_2_field_initializer_once) {
     auto dir = wtDir3625();
     const std::string lib =
         "module XLib3713; "
@@ -542,25 +545,30 @@ BEZEL_TEST(xmod_imported_primary_direct_ctor_field_init_gap_3713,
     // `a`/`b` (step 0, #3649) are correct.
     BEZEL_EXPECT_TRUE(out.find("7") != std::string::npos);
     BEZEL_EXPECT_TRUE(out.find("direct") != std::string::npos);
-    // KNOWN GAP (#3713): `x` and the counter should both read `1` (the field
-    // initializer ran once) but currently read `0` (it never ran). Asserting
-    // the CURRENT wrong values, not GTEST_SKIP, so a silent fix regression
-    // cannot hide behind a vacuously-passing/skipped row (lane-rule §3's
-    // silent-skip trap) — see this file's header block for the rewrite
-    // instruction once #3713 lands.
+    // fix #3713: `x` and the counter now BOTH read `1` — the §22.8 step-2 field
+    // initializer ran, and ran exactly once. Pre-fix both read `0`.
     // Precise, not fuzzy: right after "direct" the next two lines (`x` then
-    // `Bumps()`) must both read `0` — anchoring on "direct\n0\n0" rules out
-    // an accidental match against an unrelated "0" elsewhere in the output.
-    BEZEL_EXPECT_TRUE(out.find("direct\n0\n0") != std::string::npos);
+    // `Bumps()`) must both read `1` — anchoring on "direct\n1\n1" rules out
+    // an accidental match against an unrelated "1" elsewhere in the output,
+    // and distinguishes the fix from a DOUBLE run (which would print `2\n2`).
+    BEZEL_EXPECT_TRUE(out.find("direct\n1\n1") != std::string::npos);
+    // Explicitly exclude the two failure modes on either side of correct: the
+    // pre-fix skip (`0\n0`) and a double-run (`2\n2`).
+    BEZEL_EXPECT_TRUE(out.find("direct\n0\n0") == std::string::npos);
+    BEZEL_EXPECT_TRUE(out.find("direct\n2\n2") == std::string::npos);
 }
 
-// ── #3713 single-module twin — proves the gap is NOT cross-module-specific ─
+// ── #3713 single-module twin — the gap was NOT cross-module-specific ──────
 //
-// Character-identical class + call, ONE file, no `import` at all. If this
-// gap were an imported-arm defect only, this row would be clean; it is not.
-// per §22.8 step 2, §22.10 (v0.286), issue #3713
+// Character-identical class + call, ONE file, no `import` at all. c6-b7
+// measured this row failing identically to the imported one, which is why
+// fix #3713 had to land in BOTH `lowerNew` arms rather than only the importer's
+// — repairing the imported arm alone would have made the IMPORTER produce a
+// value its own single-module twin does not, a fresh §2.8.3 rule 4 violation in
+// the opposite direction. This row is what pins the two paths to AGREE.
+// per §22.8 step 2, §22.10, §2.8.3 rule 4 (v0.286), issue #3713
 BEZEL_TEST(xmod_imported_primary_direct_ctor_field_init_gap_3713,
-           KNOWN_GAP_local_twin_also_skips_step_2_field_initializer) {
+           local_twin_runs_step_2_field_initializer_once) {
     auto dir = wtDir3625();
     const std::string src =
         "module LocalTwin3713; "
@@ -603,12 +611,11 @@ BEZEL_TEST(xmod_imported_primary_direct_ctor_field_init_gap_3713,
     BEZEL_EXPECT_EQ(code, 0);
     BEZEL_EXPECT_TRUE(out.find("7") != std::string::npos);
     BEZEL_EXPECT_TRUE(out.find("direct") != std::string::npos);
-    // KNOWN GAP (#3713), single-module: same `0`/`0` the imported row above
-    // measures — proof this is not an importer-side defect.
-    // Precise, not fuzzy: right after "direct" the next two lines (`x` then
-    // `Bumps()`) must both read `0` — anchoring on "direct\n0\n0" rules out
-    // an accidental match against an unrelated "0" elsewhere in the output.
-    BEZEL_EXPECT_TRUE(out.find("direct\n0\n0") != std::string::npos);
+    // fix #3713, single-module: the same `1`/`1` the imported row above now
+    // measures — the §2.8.3 rule 4 parity the fix had to preserve.
+    BEZEL_EXPECT_TRUE(out.find("direct\n1\n1") != std::string::npos);
+    BEZEL_EXPECT_TRUE(out.find("direct\n0\n0") == std::string::npos);
+    BEZEL_EXPECT_TRUE(out.find("direct\n2\n2") == std::string::npos);
 }
 
 }  // namespace bezel::codegen

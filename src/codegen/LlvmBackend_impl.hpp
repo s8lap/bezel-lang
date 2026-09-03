@@ -12087,6 +12087,31 @@ private:
     // initFns_.
     llvm::Function* declareImportedInit(const sema::TypeSymbol* ts);
 
+    // fix #3713 (§22.8 step 1+2 / §22.10 / §2.8.3 rule 4, v0.286): the ONE body
+    // emitter behind BOTH exported per-type construction entry points. `fn` is
+    // the function whose body is written; `installVtable` selects §22.8's
+    // pre-step-1 vtable store (emitInstanceInit) and `runStepsOneTwo` selects
+    // step 1 (the base sequence) + step 2 (this class's own field
+    // initializers). Extracted from emitInstanceInitFunction so the second
+    // entry point below is the SAME sequence under a different pair of flags
+    // rather than a second, drifting spelling of it.
+    void emitInitEntryBody(const sema::TypeSymbol* ts, llvm::Function* fn,
+                           bool installVtable, bool runStepsOneTwo);
+
+    // fix #3713 (§22.8 step 1+2 / §22.10 / §2.8.3 rule 4, v0.286): the exported
+    // `bz$<Type>$initprimary(ptr this)` — §22.8 steps 1+2 ONLY (base sequence +
+    // own field initializers), with no vtable store. It exists because
+    // `bz$<Type>$init` is deliberately vtable-only for a class that declares an
+    // explicit constructor (the importer calls `bz$<Type>$ctor` afterwards,
+    // which runs steps 1+2 inside its own compiled body) — and the §22.10
+    // direct-primary `new` shape that #3625's sema fix admits calls NO
+    // `bz$<Type>$ctor` at all, so nothing on that path ran step 2. Emitted by
+    // the exporter for every public non-generic class that has BOTH a primary
+    // constructor and an explicit one; declared by the importer at the
+    // direct-primary `new` site. ONE function so the mangled name has one home
+    // (both sides call this). Cached by name via `module_->getFunction`.
+    llvm::Function* primaryInitFn(const sema::TypeSymbol* ts);
+
     // fix #2452 (§22.8 step 1-2 / §2.5 / §2.8.2-§2.8.3, v0.235): run an
     // IMPORTED, no-explicit-ctor base's own construction sequence (its own
     // base chain + its own field initializers) via the already-exported

@@ -6003,6 +6003,36 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
     }
     const bool importedGenericWithBody =
         importedGenericExplicitCs != nullptr;
+    // fix #3713 (§22.8 step 2 / §22.10 / §2.8.3 rule 4, v0.286): the
+    // DIRECT-PRIMARY `new` shape — a class that declares BOTH a §22.10 primary
+    // constructor and at least one explicit constructor, constructed through
+    // the primary because no explicit constructor matched the call's arguments.
+    // #3625's sema fix (`checkNewExprArgs`'s fall-through to
+    // `checkPositionalNewArgsFromSymbols`) admitted this shape; before it the
+    // construction was rejected outright, which is why no codegen path handles
+    // §22.8 step 2 for it. Both arms below read this ONE predicate so the local
+    // and imported paths cannot disagree (§2.8.3 rule 4).
+    //
+    // Each conjunct is load-bearing:
+    //   - `Class` + `hasPositionalFields`: the class HAS a primary constructor.
+    //     `hasPositionalFields` is the both-sources flag (`Parser_Decls.cpp`
+    //     sets it the moment the header's `(` is seen, so an empty primary
+    //     parameter list counts; `ModuleMetadataBuilder` carries it across the
+    //     wire) — the SAME gate `storePrimaryCtorPositionalArgs` uses for step 0
+    //     one screen down, not a second spelling of it.
+    //   - `hasAnyConstructor(t)`: without an explicit constructor the existing
+    //     no-explicit-ctor path already runs steps 1+2 (locally through the
+    //     `else if (!hasAnyConstructor(t))` branch, cross-module through the
+    //     exporter's `bz$<Type>$init`). Admitting those here would DOUBLE-RUN
+    //     every field initializer — §22.8's "field initializers run exactly once
+    //     per instance construction".
+    //   - `ctorForArgs(t, ne.args) == nullptr`: an explicit constructor that DID
+    //     match runs steps 1+2 inside its own compiled body (locally via
+    //     `inlineCtorBody`, cross-module via `bz$<Type>$ctor`), so this is the
+    //     same once-only guard from the other side.
+    const bool directPrimaryNew =
+        t->kind == ast::TypeDeclKind::Class && t->hasPositionalFields &&
+        hasAnyConstructor(t) && ctorForArgs(t, ne.args) == nullptr;
     if (ctx_.isImported(t) && !importedGeneric) {
         // fix #3162 (§22.10 / §22.8 step 0 / §2.8.3 rule 4, v0.254): a
         // dependency's `bz$<Type>$init` takes only the object, so a §22.10
@@ -6128,6 +6158,37 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
             savedSemaTy, currentThis_);
         llvm::Function* initFn = declareImportedInit(t);
         builder_.CreateCall(initFn, {obj});
+        // fix #3713 (§22.8 step 1+2 / §22.10 / §2.8.3 rule 4, v0.286): the
+        // IMPORTED half of the direct-primary gap. `bz$<Type>$init` above is
+        // vtable-only for a class that declares an explicit constructor
+        // (`emitInstanceInitFunction`'s `!hasAnyConstructor(ts)` gate) — the
+        // design assumes the importer ALSO calls `bz$<Type>$ctor`, whose
+        // compiled body runs steps 1+2. On this shape no `bz$<Type>$ctor` is
+        // ever called (the primary constructor has no `ConstructorSymbol`), so
+        // step 1 and step 2 ran NOWHERE and every field outside the primary
+        // parameter list kept its §7.9 default. Measured on r12-cycle-1:
+        // `public class WithCounter(a: int, b: string)` with
+        // `public x: int := WithCounter.Bump();` and a convenience ctor, called
+        // as `new WithCounter(7, "direct")`, printed `x = 0` and
+        // `WithCounter.Bumps() = 0` — the counter proving the initializer
+        // EXPRESSION never evaluated, not merely that a field read zero.
+        //
+        // The importer cannot run step 2 itself: `emitOwnFieldInit` walks
+        // `ast::FieldDecl` initializers off each member's `decl`, always null
+        // for an imported symbol (the #2374-class gap), and an initializer may
+        // legitimately name the exporter's PRIVATE statics (`_bumps` above), so
+        // there is nothing here to re-lower even in principle. The exporter is
+        // the only side that can run it, exactly as #2452 concluded for an
+        // imported no-explicit-ctor BASE (`emitImportedBaseFieldInit` routes
+        // through `bz$<Base>$init` for the same reason). `bz$<Type>$initprimary`
+        // is that entry point for this shape: steps 1+2, no vtable store (the
+        // `$init` call above already made it), run against the object it is
+        // handed — with the primary parameters already in their slots from the
+        // step-0 store immediately above, so an initializer that READS a primary
+        // parameter sees the call's argument and not the calloc zero (§22.8's
+        // step 0 → 1 → 2 order, preserved across the boundary).
+        if (directPrimaryNew)
+            builder_.CreateCall(primaryInitFn(t), {obj});
     } else if (importedGenericNoBody || importedGenericWithBody) {
         // Foundation A: no explicit ctor — install vtable, no ctor body.
         // Foundation C: explicit ctor with loaded body — install vtable first,
@@ -7441,7 +7502,34 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                 emitAccessorRefArgWriteBacks(accessorRefArgs, /*emit=*/false);
             }
         }
-    } else if (!hasAnyConstructor(t)) {
+    } else if (!hasAnyConstructor(t) || directPrimaryNew) {
+        // fix #3713 (§22.8 step 1+2 / §22.10, v0.286): `|| directPrimaryNew` is
+        // the LOCAL half of the direct-primary gap, and it deliberately reuses
+        // this branch rather than adding a second step-2 emission site. A local
+        // class with a primary constructor AND an explicit one, constructed
+        // through the primary (`new WithCounter(7, "direct")` against a
+        // one-argument convenience ctor), reached neither arm of this cascade:
+        // `ctorForArgs` found no matching explicit constructor, and
+        // `hasAnyConstructor(t)` excluded it here. So `emitImplicitBase`
+        // (step 1), `emitOwnFieldInit` (step 2), `emitNewPendingCheck` and the
+        // §22.16 construction-exit invariant ALL failed to run, and the object
+        // was returned with every non-primary field at its §7.9 default.
+        // MEASURED on r12-cycle-1, single module, no import anywhere:
+        // `class Derived(a: int): Base` with `Base.bx := 11`, `Derived.x := 22`
+        // and `property P := 33` printed `7 / 0 / 0 / 0 / 0` where §22.8
+        // requires `7 / 22 / 11 / 0 / 33`. This is the same defect the imported
+        // arm above closes, so the two land together (§2.8.3 rule 4: the
+        // importer must observe what a single-module compile of the same
+        // declarations produces — pre-fix BOTH were wrong, identically).
+        //
+        // Everything this branch does is already right for the shape: step 0
+        // and the base positional pre-population ran above (guarded by
+        // `!boundCtorChainsThis`, which is true here because `ctorForArgs`
+        // returned null — §22.8's own "a constructor that chains via `this(...)`
+        // skips steps 0 and 2", and the primary is precisely the constructor
+        // that does NOT skip them), and what remains is exactly steps 1+2 plus
+        // the two construction-exit checks.
+        //
         // CG16: no explicit ctor → the implicit ctor runs an implicit
         // `base()`, so a base-class ctor still runs on `new Derived()`.
         // §22.8 step 2 (#929/#930): after the base sequence (step 1), run this

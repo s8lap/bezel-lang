@@ -11450,8 +11450,58 @@ void Emitter::emitInstanceInitFunction(const sema::TypeSymbol* ts) {
     auto it = initFns_.find(ts);
     if (it == initFns_.end()) return;  // not an exported init
     llvm::Function* fn = it->second;
-    if (!fn->empty()) return;  // already emitted
+    if (fn->empty()) {
+        // §22.8 (#929/#930): `bz$<T>$init` installs the vtable (step pre-1). For
+        // a class WITH a constructor the importer calls `bz$<T>$ctor` after
+        // this, which runs the base chain + field initializers + body — so init
+        // stays vtable-only to avoid double-init. For a NO-explicit-ctor class
+        // there is no `bz$<T>$ctor` for the importer to call, so init must
+        // itself run the construction sequence (base sequence then this class's
+        // own field initializers, §22.8 step 1+2).
+        emitInitEntryBody(ts, fn, /*installVtable=*/true,
+                          /*runStepsOneTwo=*/!hasAnyConstructor(ts));
+    }
 
+    // fix #3713 (§22.8 step 2 / §22.10 / §2.8.3 rule 4, v0.286): the SECOND
+    // exported entry point, `bz$<Type>$initprimary` — steps 1+2 with no vtable
+    // store. The gate above is exactly why it is needed: for a class that
+    // declares an explicit constructor, `bz$<T>$init` runs NEITHER step 1 NOR
+    // step 2, on the assumption that the importer also calls `bz$<T>$ctor`,
+    // whose compiled body runs them. #3625's sema fix admitted a construction
+    // shape for which that assumption is FALSE — `new WithConv(7, "direct")`
+    // against `class WithConv(a: int, b: string)` + `constructor(x: int)
+    // this(x, "conv")` binds to the §22.10 PRIMARY constructor, which has no
+    // `ConstructorSymbol` and therefore no `bz$<T>$ctor` for the importer to
+    // call. So nothing ran step 2 and every non-primary-parameter field kept
+    // its §7.9 default, with no diagnostic (measured: `WithCounter.Bumps()`
+    // stayed 0, proving the initializer EXPRESSION never evaluated).
+    //
+    // Emitted for every public non-generic CLASS that has both a primary
+    // constructor (`hasPositionalFields` — the both-sources flag `ModuleMetadata
+    // Builder` carries across the wire) and an explicit one, which is a strict
+    // SUPERSET of the shapes the importer's `lowerNew` gate can call: the
+    // importer additionally requires `ctorForArgs(t, ne.args) == nullptr` (no
+    // explicit constructor matched the call). A no-explicit-ctor class gets no
+    // `$initprimary`, because for it `bz$<T>$init` ALREADY runs steps 1+2 and a
+    // second entry point could only double-run them.
+    if (ts->kind == ast::TypeDeclKind::Class && ts->hasPositionalFields &&
+        hasAnyConstructor(ts)) {
+        llvm::Function* pfn = primaryInitFn(ts);
+        if (pfn->empty())
+            emitInitEntryBody(ts, pfn, /*installVtable=*/false,
+                              /*runStepsOneTwo=*/true);
+    }
+}
+
+
+// fix #3713 (§22.8 step 1+2, v0.286): the shared body of both exported
+// construction entry points — see the declaration comment. Everything below
+// (the #2754 disposeStack_ audit, the per-function emitter-state save/restore)
+// was `emitInstanceInitFunction`'s body verbatim; only the two flags and the
+// `fn` parameter are new, so the second entry point cannot drift from the
+// first.
+void Emitter::emitInitEntryBody(const sema::TypeSymbol* ts, llvm::Function* fn,
+                                bool installVtable, bool runStepsOneTwo) {
     // fix #2754 (§28 "Resource Management", v0.282) — save/restore
     // `disposeStack_` like every other emitter that lowers user code under a
     // swapped `currentFn_` (lambda body, the six property/indexer accessor
@@ -11489,14 +11539,11 @@ void Emitter::emitInstanceInitFunction(const sema::TypeSymbol* ts) {
     unwindScopeDepth_ = 0;
     builder_.SetInsertPoint(llvm::BasicBlock::Create(llvm_, "entry", fn));
 
-    // §22.8 (#929/#930): `bz$<T>$init` installs the vtable (step pre-1). For a
-    // class WITH a constructor the importer calls `bz$<T>$ctor` after this, which
-    // runs the base chain + field initializers + body — so init stays vtable-only
-    // to avoid double-init. For a NO-explicit-ctor class there is no `bz$<T>$ctor`
-    // for the importer to call, so init must itself run the construction sequence
-    // (base sequence then this class's own field initializers, §22.8 step 1+2).
-    emitInstanceInit(ts, currentThis_, classStruct(ts));
-    if (!hasAnyConstructor(ts)) {
+    // The vtable store (§22.8 pre-step-1) belongs to `bz$<T>$init` only —
+    // `bz$<T>$initprimary` runs after it on the same object, so re-storing the
+    // pointer there would be a redundant write, not a second initialization.
+    if (installVtable) emitInstanceInit(ts, currentThis_, classStruct(ts));
+    if (runStepsOneTwo) {
         // fix #3162 (§22.10 / §22.8 step 1, v0.254): run the base clause's
         // ARGUMENT pre-population here too, not only at the `new` site.
         //
@@ -11555,6 +11602,25 @@ llvm::Function* Emitter::declareImportedInit(const sema::TypeSymbol* ts) {
                                       module_.get());
     initFns_[ts] = fn;
     return fn;
+}
+
+
+// fix #3713 (§22.8 step 1+2 / §22.10 / §2.8.3 rule 4, v0.286): the ONE home of
+// the `bz$<Type>$initprimary` symbol name — see the declaration comment. The
+// EXPORTER calls this to obtain the function it defines; the IMPORTER calls it
+// at a direct-primary `new` site to obtain the external declaration it calls.
+// Both go through here so the mangled name has a single spelling (the same
+// discipline `declareImportedInit` follows for `bz$<Type>$init`). Cached by
+// name on the module rather than in a second side table: `module_->getFunction`
+// is already the identity this symbol has, and an eleventh loader-adjacent side
+// table is exactly what this codebase's dedup rules forbid.
+llvm::Function* Emitter::primaryInitFn(const sema::TypeSymbol* ts) {
+    const std::string name = "bz$" + mangledTypeName(ts) + "$initprimary";
+    if (llvm::Function* existing = module_->getFunction(name)) return existing;
+    auto* fnType = llvm::FunctionType::get(llvm::Type::getVoidTy(llvm_),
+                                           {ptrTy()}, /*isVarArg=*/false);
+    return llvm::Function::Create(fnType, llvm::Function::ExternalLinkage, name,
+                                  module_.get());
 }
 
 
