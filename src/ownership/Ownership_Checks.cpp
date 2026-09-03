@@ -4177,16 +4177,56 @@ void MethodOwnership::checkIndirectEscapeOnReturn(const ast::Expr& e) {
         "the caller's scope and build the aliasing value there instead)");
 }
 
-sema::Symbol* MethodOwnership::ownedLocalBorrowSource(const ast::Expr& rhs) {
+sema::Symbol* MethodOwnership::ownedLocalBorrowSource(const ast::Expr& rhs,
+                                                      OwnedSourceKinds kinds) {
     // Reuse the full borrow-source computation (covering the re-borrow,
     // borrow-bearing-record, closure-capture, and multi-hop shapes), then
-    // restrict the result to an owned scope-bound *local*. An owned parameter
-    // is excluded: assigning an owned parameter into an owned field is the
-    // §28.8 ownership-transfer pattern, not a borrow store. // per §28.3, §28.8
+    // restrict the result to an owned binding whose value dies inside this
+    // frame. Which bindings those are is the caller's `kinds` argument.
+    //
+    // `LocalOnly` — an owned scope-bound *local* and nothing else. An owned
+    // PARAMETER is excluded there because assigning one into an owned field is
+    // the §28.8 ownership-transfer pattern, not a borrow store, and because the
+    // channels that pass it decide by a declaring-BLOCK depth comparison a
+    // parameter has no operand for.
+    //
+    // fix #3746 (§28.3 *Captured owned bindings* / §28.9 / §27.5, v0.286):
+    // `LocalOrOwnedParam` also admits an `owned` parameter of this frame. The
+    // §28.8 reason above is real but it is a reason about the DESTINATION (an
+    // owned slot, which takes the transfer), not about the source, and it was
+    // being applied to destinations that take no transfer at all. MEASURED on
+    // the parent (f517ddb): with `p: owned R`, each of
+    //   `this.h := lambda(): int => p.V();`   (a field)
+    //   `g := lambda(): int => p.V();`        (an `out` parameter)
+    //   `var b := p; this.items.Add(b);`      (a field-held borrowing Array)
+    //   `var b := p; this.items[0] := b;`     (the same by indexer-set)
+    // compiles rc=0 and reads freed memory at run (SIGSEGV, or a garbage int),
+    // while the byte-identical spelling over a `using var` LOCAL has been
+    // rejected for revisions. §28.3's field-store admission of "parameter-
+    // sourced" borrows rests on its own stated premise — "the caller-side
+    // source outlives the constructed object" — which an `owned` parameter
+    // falsifies: *Auto-drop (affine)* disposes it "at the end of the method".
+    // `checkClosureEscapesOnReturn`'s §28.9 leg already reads it that way (it
+    // resolves through `states_`, which holds the `owned` parameters, and has
+    // its own `ParameterSymbol` arm), so this is one rule's two channels being
+    // made to agree, not a new rule. // per §28.3, §28.8, §28.9, v0.286
     sema::Symbol* src = borrowSourceForExpr(rhs);
     if (src) {
-        if (!dynamic_cast<sema::LocalSymbol*>(src)) return nullptr;
-        return src;
+        if (dynamic_cast<sema::LocalSymbol*>(src)) return src;
+        // The `owned`-parameter arm. Both halves are required and neither is a
+        // new classification: `symbolIsOwnedObligation` is the DECLARATIVE half
+        // (§28.3's category, `owned` and not `out owned`), `isOwnedTrackedLocal`
+        // the FLOW half (still Owned here — a parameter already `move`d out is
+        // MovedFrom and is no longer a live source, exactly as for a local).
+        // Every path in `borrowSourceForExpr` that can return a parameter runs
+        // through `isOwnedTrackedLocal`/`isEscapeBoundLocal` already, so the
+        // second conjunct is inert today; it is written here so a future leg
+        // that resolves a source without consulting the state cannot widen this
+        // one silently.
+        if (kinds == OwnedSourceKinds::LocalOrOwnedParam &&
+            symbolIsOwnedObligation(src) && isOwnedTrackedLocal(src))
+            return src;
+        return nullptr;
     }
     // §28.3 *Bare-type-parameter returns* (v0.194, #1801 S2): a bare-T call
     // result holder (`var m := Pick(a, b);`) carries its union borrow in
@@ -4207,7 +4247,13 @@ sema::Symbol* MethodOwnership::ownedLocalBorrowSource(const ast::Expr& rhs) {
     if (!holder) return nullptr;
     sema::Symbol* carried =
         carriedEscapeBoundSourceLiveAt(holder, id->span.begin.offset);
-    if (carried && dynamic_cast<sema::LocalSymbol*>(carried)) return carried;
+    if (!carried) return nullptr;
+    if (dynamic_cast<sema::LocalSymbol*>(carried)) return carried;
+    // fix #3746: the same kind filter on the bare-T / record-provenance leg, so
+    // the two legs of ONE function cannot answer differently about one axis.
+    if (kinds == OwnedSourceKinds::LocalOrOwnedParam &&
+        symbolIsOwnedObligation(carried) && isOwnedTrackedLocal(carried))
+        return carried;
     return nullptr;
 }
 
@@ -4896,6 +4942,24 @@ void MethodOwnership::checkCatchBorrowEscapesViaNewExpr(
         "`throw;`)");
 }
 
+// fix #3746 (§28.3, v0.286): the ONE sentence naming why an `owned` PARAMETER
+// source dies inside this frame, shared by every leg that grew a parameter arm
+// (the field store, the out/ref-parameter store, the borrowing-collection
+// element store, the indexer-set store) so four legs cannot become four
+// spellings of one fact. The existing owned-LOCAL wording is untouched and is
+// still emitted verbatim for a local source: calling a parameter "an owned
+// scope-bound local" would name a declaration the program does not contain.
+static std::string ownedParamSourceClause(std::string_view name) {
+    return std::string("`") + std::string(name) +
+           "` is an `owned` parameter, whose value THIS method disposes at its "
+           "end (§28.3 *Auto-drop (affine)*: an undischarged `owned` "
+           "parameter is disposed implicitly \"at the end of the method\"), so "
+           "the caller's value does not outlive this call — "
+           "§28.3 admits a *parameter-sourced* borrow because the "
+           "caller-side source outlives the callee, which is true of a plain "
+           "(borrow) parameter and false of an `owned` one";
+}
+
 bool MethodOwnership::checkBorrowStoreEscape(const ast::AssignmentStmt& as,
                                              EscapeScope scope) {
     if (as.op != ":=") return false;
@@ -5117,7 +5181,29 @@ bool MethodOwnership::checkBorrowStoreEscape(const ast::AssignmentStmt& as,
     // a `move`d source is now MovedFrom, not Owned, and is correctly not seen
     // as a live borrow source — `box.f := move r;` / `o := move r;` transfers,
     // it does not store a borrow.
-    sema::Symbol* src = ownedLocalBorrowSource(*as.value);
+    // fix #3746 (§28.3 *Captured owned bindings* / §28.9 / §27.5, v0.286): the
+    // two destinations that OUTLIVE this method activation — a field of some
+    // object, and an out/ref parameter's location in the CALLER's frame — also
+    // outlive an `owned` parameter, which §28.3 *Auto-drop (affine)* disposes
+    // "at the end of the method". So they ask about owned parameters too. The
+    // remaining destination (`Dest::None` + `targetLocal`, the plain-local
+    // channel) deliberately does NOT: its verdict is "does the target's
+    // declaring block strictly enclose the source's", and no block of this
+    // frame outlives the frame — so a method-scope target can never outlive an
+    // `owned` parameter and there is nothing to reject. (`ParameterSymbol::decl`
+    // is null besides, so the depth arm would have had no operand; declining
+    // there is a POSITIVE argument about lifetimes, not a missing-depth
+    // guess — #3707's review lesson.) MEASURED on the parent: the filed #3746
+    // repro's own shape (a closure over `p` stored into a METHOD-SCOPE local,
+    // then `p.Dispose()`) behaves identically over an owned LOCAL, and is a
+    // [K3.10] site-announced kill the consume table marks **unfrozen** and
+    // §28.2's checked mode backstops (verified: `--checked-disposal` turns both
+    // into a clean `DisposedAccessException`) — not this rule's business.
+    const OwnedSourceKinds srcKinds =
+        (dest == Dest::Field || dest == Dest::OutParam)
+            ? OwnedSourceKinds::LocalOrOwnedParam
+            : OwnedSourceKinds::LocalOnly;
+    sema::Symbol* src = ownedLocalBorrowSource(*as.value, srcKinds);
     // fix #3727 (§28.3 *Borrow lifetime rules* / §28.9 / §27.5, v0.286): the
     // query above asked about the CHECKED LAMBDA BODY's frame — `states_` was
     // cleared and re-seeded from that body alone by `checkOneLambdaBodyEscapes`
@@ -5342,6 +5428,12 @@ bool MethodOwnership::checkBorrowStoreEscape(const ast::AssignmentStmt& as,
     // — a use-after-free. This is the `_lastError := ex;` error from Guide 02
     // §3. Distinct message from the owned-local case so the §31.1 rule is
     // pointed to directly.
+    // fix #3746 (§28.3, v0.286): which noun the diagnostics below use for the
+    // source. Only the `Dest::Field` / `Dest::OutParam` legs can see one (the
+    // source query above asked `LocalOnly` for every other destination), and a
+    // catch borrow is never a parameter, so the §31.1 legs are untouched.
+    const bool srcIsOwnedParam =
+        dynamic_cast<sema::ParameterSymbol*>(src) != nullptr;
     if (isCatchBorrow(src)) {
         if (dest == Dest::OuterLocal && outerLocalIsClosureCapture) {
             report(
@@ -5438,6 +5530,24 @@ bool MethodOwnership::checkBorrowStoreEscape(const ast::AssignmentStmt& as,
                 "`, or transfer an owned value instead)");
         }
     } else if (dest == Dest::Field) {
+        // fix #3746 (§28.3, v0.286): an `owned` PARAMETER source gets its own
+        // sentence. The owned-LOCAL text below is byte-for-byte what it was —
+        // and it would be a lie here, both in naming a "scope-bound local" the
+        // program does not declare and in offering "source the field's borrow
+        // from a … parameter" as the remedy, which is exactly what this
+        // program did.
+        if (srcIsOwnedParam) {
+            report(
+                Severity::Error, as.span.begin,
+                std::string("borrow of `") + std::string(src->name) +
+                "` stored into a field would outlive its source — " +
+                ownedParamSourceClause(src->name) +
+                ", and a field of the target object outlives this call, so a "
+                "later read through it would see a disposed value (§28.3's "
+                "borrowed-field store rule; transfer the value instead — "
+                "`move` it into an `owned` field — or declare the parameter "
+                "as a plain borrow, whose source the caller keeps alive)");
+        } else {
         report(
             Severity::Error, as.span.begin,
             std::string("borrow of `") + std::string(src->name) +
@@ -5450,6 +5560,21 @@ bool MethodOwnership::checkBorrowStoreEscape(const ast::AssignmentStmt& as,
             "while scope-bound locals and temporaries are rejected; store an "
             "owned value with `move`, or source the field's borrow from a "
             "receiver or parameter — the §28.5 back-reference idiom)");
+        }
+    } else if (srcIsOwnedParam) {
+        // fix #3746 (§28.3, v0.286): the out/ref-parameter destination, whose
+        // location is in the CALLER's frame — which outlives this method, and
+        // so outlives an `owned` parameter this method disposes at its end.
+        report(
+            Severity::Error, as.span.begin,
+            std::string("borrow of `") + std::string(src->name) +
+            "` written through an out/ref parameter would outlive its source "
+            "— " + ownedParamSourceClause(src->name) +
+            ", while the out/ref parameter's location lives in the caller's "
+            "frame, which outlives this call — the written reference would "
+            "dangle the moment this method returns (§28.3 borrow-lifetime "
+            "rule; produce an owned value with `move` for an `out owned` "
+            "parameter, or declare the source as a plain borrow parameter)");
     } else {
         report(
             Severity::Error, as.span.begin,
@@ -5717,16 +5842,41 @@ void MethodOwnership::checkCollectionBorrowStoreEscape(
         // its scope, the same escape as an `.Add` of one of them.
         //
         // Restricted to a LocalSymbol, EXCLUDING parameters — the exact same
-        // distinction ownedLocalBorrowSource draws (it rejects any non-LocalSymbol
-        // source). `isOwnedTrackedLocal` alone is NOT enough: run() seeds
+        // distinction ownedLocalBorrowSource's `LocalOnly` mode draws.
+        // `isOwnedTrackedLocal` alone is NOT enough: run() seeds
         // `owned`/`out owned` PARAMETERS into `states_` as Owned, so it is true
-        // for them too. An owned parameter's source outlives the method (the
-        // caller supplied it), so `_all.AddRange(items)` with `items: owned
-        // Array<Res>` is admitted, exactly as the plain-parameter and field cases
-        // are (§28.11: parameter-, receiver-, and field-sourced borrows are
-        // admitted) and exactly as the `.Add` element-store path (ownedLocalBorrow-
-        // Source) admits every parameter. The element-type gate above already
-        // excluded a value-typed (borrow-free) element collection. // per §28.11
+        // for them too. The element-type gate above already excluded a
+        // value-typed (borrow-free) element collection.
+        //
+        // fix #3746 (§28.11 / §28.3, v0.286) DELIBERATELY LEAVES THE BULK LEG
+        // ALONE, and its old reason is worth correcting rather than deleting:
+        // it said "an owned parameter's source outlives the method (the caller
+        // supplied it)", which is FALSE for an `owned` parameter — §28.3
+        // *Auto-drop (affine)* disposes it "at the end of the method". The
+        // right reason is a different one, and it is about what `AddRange`
+        // stores: its argument is a borrowing-family CONTAINER, which does not
+        // own its elements (§28.11: `Dispose()` is a no-op, `Clear`/`Remove`
+        // "remove without disposing"). Disposing an `owned Array<T>` parameter
+        // therefore reclaims the container and NOT the element borrows the bulk
+        // store copied out, whose sources are the caller's — §28.11's admitted
+        // parameter-sourced case, with its recorded trust clause. MEASURED:
+        // the owned-parameter `AddRange` runs clean where the four ELEMENT
+        // channels below read freed memory. The local form's rejection is
+        // #1886's conservative bound on the LOCAL's own scope and is unchanged.
+        //
+        // The ELEMENT store is the opposite: the argument IS the borrow, and a
+        // borrow of an `owned` parameter stored into a receiver that outlives
+        // this call dangles the moment the method returns. MEASURED on the
+        // parent (f517ddb): `var b := p; this.items.Add(b);` with `p: owned R`
+        // compiles rc=0 and reads freed memory, while the `using var` twin has
+        // been rejected. So the element leg asks about owned parameters — but
+        // only for a receiver that PROVABLY outlives this method
+        // (`RecvKind::Escapes`). `RecvKind::Local` decides by a declaring-block
+        // depth comparison, for which an `owned` parameter has no operand and
+        // needs none: no block of this frame outlives the frame. // per §28.11
+        const OwnedSourceKinds elemKinds =
+            (kind == RecvKind::Escapes) ? OwnedSourceKinds::LocalOrOwnedParam
+                                        : OwnedSourceKinds::LocalOnly;
         sema::Symbol* src = nullptr;
         if (bulkStoring) {
             if (const auto* aid =
@@ -5736,7 +5886,7 @@ void MethodOwnership::checkCollectionBorrowStoreEscape(
                         dynamic_cast<sema::LocalSymbol*>(asym))
                         src = asym;
         } else {
-            src = ownedLocalBorrowSource(*a.value);
+            src = ownedLocalBorrowSource(*a.value, elemKinds);
         }
         if (!src) continue;
         bool reject = false;
@@ -5750,6 +5900,24 @@ void MethodOwnership::checkCollectionBorrowStoreEscape(
         if (!reject) continue;
         const std::string recvName =
             recvRoot ? std::string(recvRoot->name) : std::string("it");
+        // fix #3746: an `owned` PARAMETER source gets the clause that is true
+        // of it; the owned-local text below is unchanged.
+        if (dynamic_cast<sema::ParameterSymbol*>(src)) {
+            report(
+                Severity::Error, a.value->span.begin,
+                std::string("borrow of `") + std::string(src->name) +
+                "` passed to `." + std::string(m) + "(...)` on `" + recvName +
+                "` would outlive its source — " +
+                ownedParamSourceClause(src->name) +
+                ", while `" + recvName +
+                "` is reachable beyond this method's scope (the receiver, a "
+                "field, or a parameter), so the stored borrow dangles the "
+                "moment this method returns (§28.11 borrowing-collection "
+                "store rule; store into an owning-family collection and "
+                "transfer ownership with `Add(owned item)` instead, or "
+                "declare the source as a plain borrow parameter)");
+            continue;
+        }
         report(
             Severity::Error, a.value->span.begin,
             std::string("borrow of `") + std::string(src->name) +
@@ -5994,11 +6162,27 @@ bool MethodOwnership::checkIndexerSetBorrowStoreEscape(
     }
     if (kind == RecvKind::Unknown) return false;
 
-    // ownedLocalBorrowSource restricts to a scope-bound owned LOCAL source
-    // (excluding parameters, which outlive the method — the admitted "borrow in,
-    // borrow out" pattern); a `move`d source is already MovedFrom before this
+    // ownedLocalBorrowSource's `LocalOnly` mode restricts to a scope-bound
+    // owned LOCAL source; a `move`d source is already MovedFrom before this
     // pass runs and so is correctly not seen as a live borrow.
-    sema::Symbol* src = ownedLocalBorrowSource(*as.value);
+    //
+    // fix #3746 (§28.11 / §28.3, v0.286): the indexer-set is the same store as
+    // `.Add` (this function's own diagnostic says so) and grows the same
+    // `owned`-parameter arm, on the same condition — a receiver that PROVABLY
+    // outlives this method. §28.3 *Auto-drop (affine)* disposes an `owned`
+    // parameter "at the end of the method", so a borrow of one stored into a
+    // field-reachable collection dangles when the method returns; the old
+    // reason recorded here — "parameters … outlive the method — the admitted
+    // 'borrow in, borrow out' pattern" — is true of a PLAIN parameter and false
+    // of an `owned` one. MEASURED on the parent (f517ddb): `var b := p;
+    // this.items[0] := b;` with `p: owned R` compiles rc=0 and prints a garbage
+    // int; the `using var` twin is rejected. `RecvKind::Local` keeps
+    // `LocalOnly`: its verdict is a declaring-block depth comparison, and no
+    // block of this frame outlives the frame. // per §28.11, §28.3, v0.286
+    const OwnedSourceKinds elemKinds =
+        (kind == RecvKind::Escapes) ? OwnedSourceKinds::LocalOrOwnedParam
+                                    : OwnedSourceKinds::LocalOnly;
+    sema::Symbol* src = ownedLocalBorrowSource(*as.value, elemKinds);
     if (!src) return false;
     bool reject = false;
     if (kind == RecvKind::Escapes) {
@@ -6015,6 +6199,25 @@ bool MethodOwnership::checkIndexerSetBorrowStoreEscape(
     if (!reject) return false;
     const std::string recvName =
         recvRoot ? std::string(recvRoot->name) : std::string("it");
+    // fix #3746: an `owned` PARAMETER source gets the clause that is true of
+    // it; the owned-local text below is unchanged.
+    if (dynamic_cast<sema::ParameterSymbol*>(src)) {
+        report(
+            Severity::Error, as.value->span.begin,
+            std::string("borrow of `") + std::string(src->name) +
+            "` stored into `" + recvName +
+            "[...]` would outlive its source — " +
+            ownedParamSourceClause(src->name) +
+            ", while `" + recvName +
+            "` is reachable beyond this method's scope (the receiver, a "
+            "field, or a parameter), so the stored borrow dangles the moment "
+            "this method returns (§28.11 borrowing-collection store rule — "
+            "the indexer-set `coll[i] := value` is a store operation exactly "
+            "like `.Add`; store into an owning-family collection and transfer "
+            "ownership with `coll[i] := move item` instead, or declare the "
+            "source as a plain borrow parameter)");
+        return true;
+    }
     report(
         Severity::Error, as.value->span.begin,
         std::string("borrow of `") + std::string(src->name) +
@@ -10161,6 +10364,34 @@ bool MethodOwnership::localIsOwnedObligation(const sema::LocalSymbol* ls) const 
     return ls->autoDropAtScopeEnd;
 }
 
+// fix #3746 (§28.3 *Captured owned bindings*, v0.286): the ONE both-kinds
+// spelling. See the header for why it exists; the two arms are not new
+// classifications — the parameter arm is the modifier test #1818's capture
+// reduction already made inline right below, and the local arm delegates to
+// `localIsOwnedObligation` unchanged.
+//
+// §28.3 *Captured owned bindings*: "a captured owned binding — an owned local
+// or `owned` parameter of the enclosing body — is uniformly in borrow state".
+// §28.3 *Auto-drop (affine)*: an undischarged `owned` parameter "is disposed
+// implicitly at that scope end (for an `owned` parameter, at the end of the
+// method)". Those two sentences are the whole justification for the parameter
+// arm: the value dies inside this frame, so a borrow of it is frame-bounded
+// exactly as an owned local's is.
+//
+// `out owned` is EXCLUDED on purpose, and this is the one place that decision
+// is made: an `out owned` parameter's storage is the caller's frame and the
+// value written is transferred out (§22.3), so this frame disposes nothing and
+// a borrow of it is not bounded here. (`run()` seeds BOTH modifiers into
+// `states_` as Owned — for the transfer classification — so `isOwnedTrackedLocal`
+// alone cannot draw this line; the modifier can.) // per §28.3, §22.3, v0.286
+bool MethodOwnership::symbolIsOwnedObligation(const sema::Symbol* sym) const {
+    if (const auto* ps = dynamic_cast<const sema::ParameterSymbol*>(sym))
+        return ps->modifier == "owned";
+    if (const auto* ls = dynamic_cast<const sema::LocalSymbol*>(sym))
+        return localIsOwnedObligation(ls);
+    return false;
+}
+
 // #1818 (§28.3 "capture-set contribution", §28.14 frame residence, v0.196):
 // the load-bearing collector. See the header comment for the reduction and the
 // provenance-row scope (T2 lambda literal + T3 method reference).
@@ -10253,7 +10484,7 @@ void MethodOwnership::deferredActivationCaptureSources(
         if (id->name == "this" || id->name == "base") continue;
         sema::Symbol* sym = ctx_.exprSymbol(*id);
         if (!sym || !seen.insert(sym).second) continue;
-        if (auto* ps = dynamic_cast<sema::ParameterSymbol*>(sym)) {
+        if (dynamic_cast<sema::ParameterSymbol*>(sym)) {
             // #2527 (§28.3, sibling of #2342 §28.14): skip ONLY params
             // internal to the FORWARDED lambda (its own params + those of
             // any lambda nested within it — recorded in
@@ -10274,7 +10505,11 @@ void MethodOwnership::deferredActivationCaptureSources(
             // method discharges at exit; a plain (borrow) parameter outlives
             // the method and the caller re-establishes the frame's constraint
             // against its own actual argument (admitted).
-            out.push_back({id, sym, ps->modifier == "owned"});
+            // fix #3746: through `symbolIsOwnedObligation`, which IS this
+            // modifier test — lifted out so the store-escape source resolution
+            // reads the same answer instead of a second, narrower one. `ps` is
+            // still needed for the `forwardedInternalParams` gate above.
+            out.push_back({id, sym, symbolIsOwnedObligation(sym)});
             continue;
         }
         if (auto* ls = dynamic_cast<sema::LocalSymbol*>(sym)) {
@@ -10282,7 +10517,9 @@ void MethodOwnership::deferredActivationCaptureSources(
             // no lifetime hazard (checkScopedAdmission's isBorrowableType gate;
             // a null declType stays conservative → treated as a reference).
             if (ls->declType && !isBorrowableType(ls->declType)) continue;
-            out.push_back({id, sym, localIsOwnedObligation(ls)});
+            // fix #3746: the same one predicate; its LocalSymbol arm delegates
+            // to `localIsOwnedObligation` verbatim, so this row is unchanged.
+            out.push_back({id, sym, symbolIsOwnedObligation(sym)});
             continue;
         }
         // A field / method / property / event reference is an implicit `this`

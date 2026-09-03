@@ -195,6 +195,34 @@ enum class EscapeScope {
     LambdaBody,
 };
 
+// fix #3746 (§28.3 *Captured owned bindings*, v0.286): WHICH owned bindings a
+// borrow-source query counts as a source whose life ends inside THIS frame.
+//
+// §28.3 states the two kinds as ONE category — "a captured owned binding — an
+// owned local or `owned` parameter of the enclosing body" — and *Auto-drop
+// (affine)* gives the parameter its scope end explicitly: "for an `owned`
+// parameter, at the end of the method". `checkClosureEscapesOnReturn`'s §28.9
+// leg has always answered for BOTH (it reads `states_`, which `run()` seeds
+// with the `owned` parameters, and it has a `ParameterSymbol` arm), while
+// `ownedLocalBorrowSource` answered for locals only. Two channels of ONE escape
+// rule disagreeing on one axis is the defect #3746 measured, so the kind is an
+// ARGUMENT of the one query rather than a second query beside it. See
+// `ownedLocalBorrowSource` for which caller passes which, and why.
+// // per §28.3, §28.9, v0.286
+enum class OwnedSourceKinds {
+    // Owned scope-bound LOCALs only — the pre-#3746 answer. Kept for the
+    // channels whose verdict is a declaring-BLOCK depth comparison (an `owned`
+    // parameter has no declaring block, and no block of this frame outlives the
+    // frame, so there is nothing to compare and nothing to reject) and for the
+    // §28.8 transfer-shaped positions.
+    LocalOnly,
+    // …and an `owned` parameter of this frame, whose value THIS method disposes
+    // at its end. NOT `out owned`: that parameter's storage is the CALLER's
+    // frame and the value written is transferred out, so this frame disposes
+    // nothing and a borrow of it is not bounded here.
+    LocalOrOwnedParam,
+};
+
 // §28.8.1 (#1125) / §28.6 bullet 2 (#2518): if `e` is a leading force-unwrap
 // `x!` (PostfixBangExpr), return its operand `x`; otherwise return `e`
 // unchanged. Lets the §28.6 / §28.8.1 field-read recognizers see through the
@@ -1956,12 +1984,20 @@ private:
                                     bool intoOwningArraySlot = false);
 
     // Like the owned-source half of borrowSourceForExpr but restricted to an
-    // owned scope-bound *local* (a `using var` or `var x := <owned producer>`),
-    // excluding owned parameters. Returns that local, or null. Used by
-    // checkBorrowStoreEscape to flag exactly the use-after-dispose hazard
-    // (a borrow of a value that dies at this scope's end) while leaving the
-    // §28.8 owned-parameter-into-owned-field transfer alone. // per §28.3
-    sema::Symbol* ownedLocalBorrowSource(const ast::Expr& rhs);
+    // owned binding whose life ends inside this frame. `kinds` selects WHICH
+    // (see OwnedSourceKinds above): the default `LocalOnly` is an owned
+    // scope-bound *local* (a `using var` or `var x := <owned producer>`) and
+    // nothing else, which is what leaves the §28.8 owned-parameter-into-owned-
+    // field transfer alone; `LocalOrOwnedParam` (fix #3746) adds an `owned`
+    // parameter, which §28.3 *Captured owned bindings* names in the same breath
+    // as the local and *Auto-drop (affine)* disposes "at the end of the method".
+    // Returns that binding's symbol, or null. Used by checkBorrowStoreEscape /
+    // checkCollectionBorrowStoreEscape / checkIndexerSetBorrowStoreEscape to
+    // flag exactly the use-after-dispose hazard — a borrow of a value that dies
+    // before the destination does. // per §28.3, §28.8, §28.9
+    sema::Symbol* ownedLocalBorrowSource(
+        const ast::Expr& rhs,
+        OwnedSourceKinds kinds = OwnedSourceKinds::LocalOnly);
 
     // Compute the owned scope-bound source local that the initializer/RHS
     // expression `rhs` borrows from, or null if it borrows nothing owned.
@@ -3395,6 +3431,17 @@ private:
     // owned-ness flags are populated by the dataflow before this post-pass runs
     // (Ownership.cpp). // per §28.3 v0.196
     bool localIsOwnedObligation(const sema::LocalSymbol* ls) const;
+
+    // fix #3746 (§28.3 *Captured owned bindings*, v0.286): the ONE both-kinds
+    // form of the question above — "is this symbol a binding whose owned value
+    // THIS frame disposes?" §28.3 names the category once ("an owned local or
+    // `owned` parameter of the enclosing body"); #1818's capture reduction had
+    // already answered it for both, spelled inline at one site, and the
+    // store-escape source resolution answered a narrower question at another.
+    // This is that one spelling, so the two cannot drift. A symbol that is
+    // neither a local nor a parameter (a field, a method) is not a binding of
+    // this frame and answers false. // per §28.3, v0.286
+    bool symbolIsOwnedObligation(const sema::Symbol* sym) const;
 
     // #1818 (§28.14 "Call-bounded × deferred activation", v0.196): true when
     // argument `pos` of the deferred-activation call `ce` sits at a PLAIN
