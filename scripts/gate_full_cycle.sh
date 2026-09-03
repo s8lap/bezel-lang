@@ -873,7 +873,7 @@ say "conformance phase: GREEN"
 # gate.sh phase, so it ran once per ORACLE. Measured over 46 gate.sh runs:
 # 277 s median per run, ~547 s per two-oracle cycle — 24% of a ~2230 s cycle —
 # uncached, and over IDENTICAL inputs both times (the HEAD-moved check below
-# pins HEAD for the whole cycle, so `merge-base HEAD main` and the changed-file
+# pins HEAD for the whole cycle, so the merge-base and the changed-file
 # list cannot differ between the passes). The second run was a pure duplicate.
 # It is advisory end to end (check_tidy.sh always exits 0; gate.sh never called
 # `fail` on it) and has NO reader: no trend rule, telemetry field or self-test
@@ -892,8 +892,34 @@ say "conformance phase: GREEN"
 say "tidy phase: clang-tidy over changed src/*.cpp (advisory, once per cycle — fix #3666)"
 _tidy_log="$LOGDIR/${TAG}_tidy.log"
 if command -v clang-tidy >/dev/null 2>&1 && command -v run-clang-tidy >/dev/null 2>&1; then
-  _tidy_base="$(git merge-base HEAD main 2>/dev/null || true)"
-  [ -z "$_tidy_base" ] && _tidy_base="HEAD~1"
+  # fix #3718: the base is THIS BRANCH'S UPSTREAM, never the bare local `main`.
+  # Nothing in the run workflow ever fast-forwards local `main`: an integration
+  # branch TRACKS `origin/main` and gate_and_push.sh lands through that same
+  # upstream (it resolves its push destination from branch.<b>.{remote,merge}
+  # rather than a hardcoded "origin main" for exactly this reason, ~:517-536).
+  # So local `main` is whatever it was when someone last checked it out, and
+  # `git merge-base HEAD main` quietly widened this advisory sweep to every
+  # file landed since then. Measured 2026-09-03 on the R12 integration head:
+  # 16 changed src/**/*.cpp against the stale local `main` (ed5f814) versus 1
+  # against origin/main (98931b5) — 2.7x-16x the files the cycle changed, at
+  # >=15 min a cycle — and it re-rots the moment origin/main advances, i.e.
+  # every cycle. What a merge-base needs is the local remote-TRACKING ref, so
+  # this reads `@{upstream}` rather than the branch.<b>.merge pair
+  # gate_and_push.sh reads (that one is the remote's OWN branch name, which is
+  # not a rev here). `origin/main` is the fallback for a detached HEAD or a
+  # lane branch with no upstream configured at all; `HEAD~1` if even that is
+  # absent, as before. Pinned in test_gate_full_cycle_pins.py, both as source
+  # (no code line may spell `merge-base HEAD main`) and functionally, against
+  # a temp repo whose local `main` is deliberately stale.
+  _tidy_up="$(git rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null || true)"
+  if [ -z "$_tidy_up" ] || ! git rev-parse --verify --quiet "${_tidy_up}^{commit}" >/dev/null 2>&1; then
+    _tidy_up="origin/main"
+  fi
+  _tidy_base="$(git merge-base HEAD "$_tidy_up" 2>/dev/null || true)"
+  # `if` rather than `[ … ] && …`: a trailing short-circuit that evaluates
+  # false is rc 1, which under a future `set -e` would end the cycle from
+  # inside an advisory block (issue 3666's SHARPEN, same hazard).
+  if [ -z "$_tidy_base" ]; then _tidy_base="HEAD~1"; fi
   _tidy_t0="$(date +%s)"
   # The same invocation gate.sh used to make, through the resource-capped
   # slice. `|| true` so that even under a future `set -e` this line cannot end

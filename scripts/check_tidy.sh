@@ -76,9 +76,14 @@ filter_args=()
 case "$mode" in
   --changed)
     base="${2:-HEAD}"
+    # fix #3718: say WHICH commit the base resolved to, not just the ref the
+    # caller named. `main`/`origin/main`/`HEAD~1` all move, and the whole
+    # symptom of #3718 (a base pointing at a long-stale local `main`) is
+    # invisible in a log that only echoes the ref name back.
+    base_sha="$(git rev-parse --short "$base" 2>/dev/null || echo "$base")"
     mapfile -t changed < <(git diff --name-only "$base" -- 'src/*.cpp' 'src/**/*.cpp' 2>/dev/null)
     if [ "${#changed[@]}" -eq 0 ]; then
-      echo "check-tidy: no changed src/*.cpp vs $base — nothing to check."
+      echo "check-tidy: no changed src/*.cpp vs $base ($base_sha) — nothing to check."
       exit 0
     fi
     # One alternation regex of absolute paths, matched against run-clang-tidy's
@@ -90,7 +95,7 @@ case "$mode" in
       regex="${regex:+$regex|}$esc"
     done
     filter_args=("$regex")
-    echo "check-tidy: changed-files mode vs $base — ${#changed[@]} file(s)"
+    echo "check-tidy: changed-files mode vs $base ($base_sha) — ${#changed[@]} file(s)"
     ;;
   --full|"")
     # Scope per WS7 report: the compiler's own C++ under src/ — NOT the

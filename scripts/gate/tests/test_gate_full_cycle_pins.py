@@ -58,6 +58,20 @@ fails, check_tidy.sh prints `check-tidy: 0 finding(s)` BEFORE its
 `… possible tool/config failure` line, so the say line preferred a bogus
 0; it now prefers the failure line. Both pinned below.
 
+FIX #3718 (section 2b below). The tidy phase resolved its changed-file base
+with `git merge-base HEAD main` — the LOCAL `main` branch, which nothing in
+the run workflow ever fast-forwards: integration branches track `origin/main`
+and gate_and_push.sh lands through that upstream, never through a local ref.
+Measured 2026-09-03 on the R12 integration head with local `main` one cycle
+behind: 16 changed `src/**/*.cpp` against the stale `main` versus 1 against
+`origin/main` — an advisory phase spending >=15 min a cycle on files the cycle
+never touched, and it re-rots the moment origin/main advances, so the one-off
+`git branch -f main origin/main` workaround does not hold. The base is now the
+branch's `@{upstream}`, falling back to `origin/main` and then (as before) to
+`HEAD~1`; check_tidy.sh also prints the base's short SHA, so a cycle log
+records WHICH commit it diffed against rather than a ref name that moves.
+                                                  -> CycleShTidyBaseIsUpstreamTest
+
 Stdlib only (subprocess/tempfile/unittest) — the house style for this
 directory. Every test here FAILED at the parent commit (af4f73b) except the
 two marked GUARD in their docstrings, which pin a contract the change now
@@ -101,6 +115,7 @@ HERE = pathlib.Path(__file__).resolve().parent
 SCRIPTS = HERE.parent.parent          # scripts/
 GATE_SH = SCRIPTS / "gate.sh"
 CYCLE_SH = SCRIPTS / "gate_full_cycle.sh"
+CHECK_TIDY_SH = SCRIPTS / "check_tidy.sh"
 GATE_PKG = SCRIPTS / "gate"
 RP_SH = SCRIPTS.parent / "tests" / "run_parallel.sh"
 
@@ -417,6 +432,202 @@ class CycleShTidyOnceTest(unittest.TestCase):
                               "the say line must surface the tool failure: " + done[0])
                 self.assertNotIn("0 finding(s)", done[0],
                                  "a 0 from a tool that did not run is not a count: " + done[0])
+
+
+# ---------------------------------------------------------------------------
+# 2b. fix #3718 — the advisory tidy base is the branch's UPSTREAM, never the
+#     bare local `main`.
+# ---------------------------------------------------------------------------
+
+_TIDY_BASE_START = '_tidy_up="$(git rev-parse'
+_TIDY_BASE_END = "_tidy_t0="
+
+_BASE_HARNESS = r'''
+%(setopts)s
+cd "$PIN_REPO"
+%(snippet)s
+echo "TIDY_UP=$_tidy_up"
+echo "TIDY_BASE=$_tidy_base"
+'''
+
+# `merge-base HEAD main` in any quoting. `main` must be a word: `main`,
+# "main", 'main' — but NOT origin/main, which is the whole point of the fix.
+_STALE_MAIN_RE = re.compile(r"""merge-base\s+HEAD\s+["']?main\b""")
+
+
+class CycleShTidyBaseIsUpstreamTest(unittest.TestCase):
+    """#3718. `git merge-base HEAD main` resolved against the LOCAL `main`
+    branch, which nothing in the run workflow ever fast-forwards: integration
+    branches track `origin/main` and gate_and_push.sh lands through that
+    upstream. Measured 2026-09-03 on the R12 integration head: 16 changed
+    `src/**/*.cpp` against a stale local `main` versus 1 against `origin/main`
+    — an advisory phase costing >=15 min a cycle over files the cycle never
+    touched, re-rotting every time origin/main advances."""
+
+    # -- source -------------------------------------------------------------
+
+    def test_no_script_resolves_a_base_against_the_bare_local_main(self):
+        for path in (CYCLE_SH, GATE_SH):
+            with self.subTest(script=path.name):
+                bad = [(n, ln) for n, ln in _code_lines(path.read_text())
+                       if _STALE_MAIN_RE.search(ln)]
+                self.assertEqual(
+                    bad, [],
+                    "%s resolves a base against the bare local `main` (#3718). "
+                    "Local `main` is whatever it was when someone last checked "
+                    "it out; use the branch's `@{upstream}`, falling back to "
+                    "`origin/main`:\n%s"
+                    % (path.name, "\n".join("  %d: %s" % h for h in bad)))
+
+    def test_tidy_base_resolution_names_the_upstream_and_the_fallback(self):
+        block = _slice(CYCLE_SH.read_text(), _TIDY_START, "\nfi\n", "tidy block")[0]
+        # CODE only. The block's comment recounts the defect verbatim, so a
+        # whole-text search would stay green over a reverted resolution.
+        code = "\n".join(ln for _n, ln in _code_lines(block))
+        self.assertIn("@{upstream}", code,
+                      "the tidy base must be resolved from the branch's own "
+                      "upstream (#3718)")
+        self.assertIn("origin/main", code,
+                      "the tidy base needs an `origin/main` fallback for a "
+                      "detached HEAD or a lane branch with no upstream (#3718)")
+        self.assertIn("merge-base HEAD", code,
+                      "guard: the base is still a merge-base against that ref")
+
+    def test_check_tidy_reports_the_base_sha_not_only_the_ref_name(self):
+        """A log line that only echoes the ref name back cannot show that the
+        base was stale — which is how #3718 survived unnoticed."""
+        text = CHECK_TIDY_SH.read_text()
+        self.assertIn('base_sha="$(git rev-parse --short "$base"', text,
+                      "check_tidy.sh --changed must resolve the base to a sha "
+                      "(#3718)")
+        said = [ln for n, ln in _code_lines(text)
+                if "check-tidy:" in ln and "$base_sha" in ln]
+        self.assertGreaterEqual(
+            len(said), 1,
+            "check_tidy.sh must print the resolved base sha on its "
+            "changed-files line (#3718)")
+
+    # -- functional ---------------------------------------------------------
+
+    def _snippet(self):
+        block, _ = _slice(CYCLE_SH.read_text(), _TIDY_BASE_START,
+                          _TIDY_BASE_END, "tidy base resolution")
+        snippet = block[:-len(_TIDY_BASE_END)]
+        self.assertIn("merge-base", snippet, "guard: snippet lacks the merge-base")
+        self.assertIn("@{upstream}", snippet, "guard: snippet lacks the upstream read")
+        return snippet
+
+    def _git(self, repo, *args):
+        env = _clean_env(repo)
+        env.pop("GIT_CEILING_DIRECTORIES", None)   # the repo IS at `repo`
+        env.update({"GIT_AUTHOR_NAME": "pin", "GIT_AUTHOR_EMAIL": "pin@invalid",
+                    "GIT_COMMITTER_NAME": "pin", "GIT_COMMITTER_EMAIL": "pin@invalid",
+                    "GIT_CONFIG_GLOBAL": os.devnull,
+                    "GIT_CONFIG_SYSTEM": os.devnull})
+        r = subprocess.run(("git",) + args, cwd=repo, env=env,
+                           capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0,
+                         "git %s failed: %s%s" % (" ".join(args), r.stdout, r.stderr))
+        return r.stdout.strip()
+
+    def _repo(self, tmp):
+        """A repo shaped exactly like the measured defect: local `main` LEFT
+        BEHIND at A, `origin/main` at B, HEAD on a branch at C that tracks
+        origin/main. Returns (A, B, C)."""
+        repo = pathlib.Path(tmp) / "r"
+        repo.mkdir()
+        self._git(repo, "init", "-q", "-b", "main", ".")
+        shas = []
+        for msg in ("a", "b", "c"):
+            self._git(repo, "commit", "-q", "--allow-empty", "-m", msg)
+            shas.append(self._git(repo, "rev-parse", "HEAD"))
+        a, b, c = shas
+        self._git(repo, "update-ref", "refs/remotes/origin/main", b)
+        # `topic` first: git refuses to force a branch a worktree has checked out.
+        self._git(repo, "checkout", "-q", "-B", "topic", c)
+        self._git(repo, "branch", "-f", "main", a)
+        self._git(repo, "config", "branch.topic.remote", "origin")
+        self._git(repo, "config", "branch.topic.merge", "refs/heads/main")
+        # Non-vacuity: the two bases really do differ in this repo, so a pin
+        # that passes here cannot be passing because they coincide.
+        self.assertEqual(self._git(repo, "merge-base", "HEAD", "main"), a,
+                         "guard: stale local `main` does not give the old answer")
+        self.assertEqual(self._git(repo, "merge-base", "HEAD", "origin/main"), b,
+                         "guard: origin/main does not give the new answer")
+        self.assertNotEqual(a, b, "guard: the two bases coincide")
+        return repo, a, b, c
+
+    def _resolve(self, repo, strict=False):
+        env = _clean_env(str(repo))
+        env.pop("GIT_CEILING_DIRECTORIES", None)
+        env["PIN_REPO"] = str(repo)
+        env["GIT_CONFIG_GLOBAL"] = os.devnull
+        env["GIT_CONFIG_SYSTEM"] = os.devnull
+        r = _bash(_BASE_HARNESS % {
+            "snippet": self._snippet(),
+            "setopts": "set -eu -o pipefail" if strict else "set -u"},
+            str(repo), env)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        out = dict(ln.split("=", 1) for ln in r.stdout.splitlines() if "=" in ln)
+        return out, r
+
+    def test_base_is_the_upstream_tip_not_the_stale_local_main(self):
+        for strict in (False, True):
+            with self.subTest(strict=strict):
+                with tempfile.TemporaryDirectory() as tmp:
+                    repo, a, b, _c = self._repo(tmp)
+                    out, r = self._resolve(repo, strict=strict)
+                    self.assertEqual(out.get("TIDY_UP"), "origin/main", r.stdout)
+                    self.assertEqual(
+                        out.get("TIDY_BASE"), b,
+                        "the advisory tidy base must be the merge-base with the "
+                        "branch's upstream (%s), not with the stale local `main` "
+                        "(%s) — #3718:\n%s" % (b[:7], a[:7], r.stdout))
+
+    def test_base_falls_back_to_origin_main_without_an_upstream(self):
+        """A lane branch created with `git branch <n> <sha>` has no upstream at
+        all; `origin/main` is still the right base, and `main` still is not."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, a, b, _c = self._repo(tmp)
+            self._git(repo, "config", "--unset", "branch.topic.remote")
+            self._git(repo, "config", "--unset", "branch.topic.merge")
+            out, r = self._resolve(repo)
+            self.assertEqual(out.get("TIDY_UP"), "origin/main", r.stdout)
+            self.assertEqual(out.get("TIDY_BASE"), b,
+                             "no upstream must fall back to origin/main, not to "
+                             "the stale local `main` (%s):\n%s" % (a[:7], r.stdout))
+
+    def test_base_falls_back_when_the_upstream_has_no_tracking_ref(self):
+        """`branch.<b>.merge` can name a remote branch this clone has never
+        fetched: git then fails the `@{upstream}` read outright. That must not
+        leave the base empty, and must not fall through to `main`."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, a, b, _c = self._repo(tmp)
+            self._git(repo, "config", "branch.topic.merge", "refs/heads/nope")
+            out, r = self._resolve(repo)
+            self.assertEqual(out.get("TIDY_UP"), "origin/main", r.stdout)
+            self.assertEqual(out.get("TIDY_BASE"), b,
+                             "an unfetched upstream must fall back to origin/main "
+                             "(not %s):\n%s" % (a[:7], r.stdout))
+
+    def test_base_falls_back_to_head_1_with_no_upstream_and_no_origin_main(self):
+        """The pre-existing last-resort, unchanged: a repo with no remote at
+        all still gets a usable base rather than an empty one."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, _a, _b, _c = self._repo(tmp)
+            self._git(repo, "config", "--unset", "branch.topic.remote")
+            self._git(repo, "config", "--unset", "branch.topic.merge")
+            self._git(repo, "update-ref", "-d", "refs/remotes/origin/main")
+            out, r = self._resolve(repo)
+            self.assertEqual(out.get("TIDY_BASE"), "HEAD~1", r.stdout)
+
+    def test_a_detached_head_resolves_without_erroring(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, _a, b, c = self._repo(tmp)
+            self._git(repo, "checkout", "-q", "--detach", c)
+            out, r = self._resolve(repo, strict=True)
+            self.assertEqual(out.get("TIDY_UP"), "origin/main", r.stdout)
+            self.assertEqual(out.get("TIDY_BASE"), b, r.stdout)
 
 
 # ---------------------------------------------------------------------------
