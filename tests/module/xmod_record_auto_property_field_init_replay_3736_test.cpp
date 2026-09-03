@@ -95,10 +95,19 @@
 //     above — means this never even reaches the text-carriage/reject path);
 //     MEASURED while writing T4 (mirrors #3723's T10 in INTENT — "does this
 //     fix newly reject a static property?" — no): a static auto-property's
-//     NON-FOLDABLE initializer never runs AT ALL, even single-module with
-//     no import, a pre-existing gap this fix's own exclusion cannot be the
-//     cause of and does not touch — filed as issue #3749; T4 asserts "no
-//     new reject", not the (currently unreachable, tracked by #3749) value
+//     NON-FOLDABLE initializer never ran AT ALL, even single-module with no
+//     import, a pre-existing gap this fix's own exclusion cannot be the
+//     cause of and did not touch — filed as issue #3749. UPDATE (fix #3749,
+//     landed after this fix, §23.1/§22.13): #3749 fixed the initializer at
+//     its actual source — the exporting module's OWN static-initializer
+//     emission (LlvmBackend_Setup.cpp's sfinit function, not this fix's
+//     metadata-carriage gate, which is untouched and stays UNCONDITIONALLY
+//     `!isStaticProp`) — so `R3736T4.X` now reads `88` cross-module too, via
+//     the pre-existing #798 mechanism (an imported public type's static
+//     initialization runs, on first cross-module use, as compiled code in
+//     ITS OWN defining module — no AST/text carriage needed, unlike an
+//     instance auto-property's construction-time replay). T4 below now
+//     asserts the value directly instead of only "not -1"
 
 //   - GENERIC record, auto-property, call init                 -- was 0,
 //     now replays (T5)
@@ -350,23 +359,32 @@ BEZEL_TEST(xmod_record_auto_property_field_init_replay_3736,
 // #3723's T10 makes for Field's static case.
 //
 // MEASURED while writing this test (NOT introduced by this fix, and NOT
-// this fix's concern): a static auto-property's NON-FOLDABLE initializer
-// never actually RUNS at all, even in a fully LOCAL single-module
-// compilation with no import whatsoever — `R3736T4.X` reads the §7.9 zero
-// default regardless of whether this program is compiled standalone or
-// split across modules (confirmed with the import removed entirely: same
-// zero). This is a pre-existing, SEPARATE local-codegen gap (static-
-// initializer emission for a class/record's own static auto-property),
-// filed as issue #3749 with a minimal single-module repro; this fix's own
-// gate deliberately never carries ANYTHING at all for a static property
-// (writer or reader), so it structurally cannot be the cause. This test's
-// assertion is therefore narrowed to what THIS fix actually claims — the
-// program still compiles and runs (no NEW hard reject) — not that `X`
-// reads the exporter's declared value; issue #3749 tracks getting `X` to
-// read `88`.
+// this fix's concern at the time): a static auto-property's NON-FOLDABLE
+// initializer never actually RAN at all, even in a fully LOCAL single-module
+// compilation with no import whatsoever — `R3736T4.X` read the §7.9 zero
+// default regardless of whether this program was compiled standalone or
+// split across modules. This was a pre-existing, SEPARATE local-codegen gap
+// (static-initializer emission for a class/record's own static
+// auto-property), filed as issue #3749 with a minimal single-module repro;
+// this fix's own gate deliberately never carried ANYTHING at all for a
+// static property (writer or reader), so it structurally could not be the
+// cause.
+//
+// fix #3749 (landed separately, §23.1/§22.13, v0.286) closed that gap at its
+// actual source: LlvmBackend_Setup.cpp's `needsRuntimeFieldInit` /
+// `emitStaticConstructorBody` (the module-init static-initializer
+// machinery) now also walks a static auto-property's backing global, not
+// only a static FIELD's — so `Secret3736T4.Get()` now runs, in the
+// EXPORTING module, at the point the pre-existing #798 mechanism already
+// runs an imported public type's static initialization on first
+// cross-module use (compiled code, no text/AST carriage — this fix's own
+// `!isStaticProp` metadata-carriage exclusion above is untouched and stays
+// exactly as documented). `R3736T4.X` now reads the exporter's declared
+// `88` cross-module, exactly like its (already-working, per #1146) constant
+// sibling would.
 // ===========================================================================
 BEZEL_TEST(xmod_record_auto_property_field_init_replay_3736,
-           t4_static_auto_property_internal_initializer_still_compiles_22_12) {
+           t4_static_auto_property_internal_initializer_replays_3749_22_12) {
     std::string stem = unique_stem("bz3736_t4_");
     std::string aObj;
     BEZEL_EXPECT_TRUE(buildLib3736(stem,
@@ -386,11 +404,9 @@ BEZEL_TEST(xmod_record_auto_property_field_init_replay_3736,
     writeSource3736(bSrc.path,
         appSrc3736("App3736T4", "Lib3736T4",
                    "    return R3736T4.X;\n"));
-    // -1 is compileImportAndRun3736's ONLY failure signal (a compile, link,
-    // or run failure); any other value — including the pre-existing-gap `0`
-    // issue #3749 tracks — proves this fix did not introduce a NEW reject.
-    int result = compileImportAndRun3736(bSrc.path, bExe.path, aObj);
-    BEZEL_EXPECT_TRUE(result != -1);
+    // fix #3749: was 0 (never ran) pre-#3749; now replays the exporter's
+    // declared 88, cross-module, via #798's ensureinit mechanism.
+    BEZEL_EXPECT_EQ(compileImportAndRun3736(bSrc.path, bExe.path, aObj), 88);
 }
 
 // ===========================================================================

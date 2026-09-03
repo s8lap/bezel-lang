@@ -2154,23 +2154,52 @@ void Emitter::declareFunctions() {
     // (constructors, fields), so the TypeSymbol and the synthesized sfinit
     // entry for it always precede the user-written ConstructorSymbol entry.
     //
-    // Helper: does `t` have any static field whose initializer is NOT a
-    // compile-time constant (i.e. not handled by constInitFor)?  Those need
-    // a runtime store emitted by the synthesized sfinit function.
+    // Helper: does `t` have any static field OR static auto-property whose
+    // initializer is NOT a compile-time constant (i.e. not handled by
+    // constInitFor / constInitForExpr)?  Those need a runtime store emitted
+    // by the synthesized sfinit function.
+    //
+    // fix #3749 (§23.1 / §22.13, v0.286): the auto-property arm was ENTIRELY
+    // ABSENT — this helper only ever inspected `sema::FieldSymbol` members, so
+    // a type whose only static state was a property-only `static readonly
+    // property X: int := H.Get();` (no static FIELD at all) reported
+    // "no runtime init needed", no sfinit function was ever created for it,
+    // and the initializer never ran at module init OR on first access — the
+    // static cell stayed at its §7.9 zero default forever (#3749's own
+    // measured single-module repro, unrelated to import/export carriage).
+    // The CONSTANT-foldable case (`:= 42`) already worked (#1146): it is
+    // baked straight into the backing global's LLVM initializer by
+    // declareStatics's constInitForExpr call, unconditionally — a static
+    // auto-property bakes a constant literal regardless of `readonly`,
+    // unlike isBakedStaticFieldInit's field rule (see declareStatics's own
+    // comment), so the gate below is the bare `isConstantLiteralStaticInit`
+    // predicate rather than `isBakedStaticFieldInit`.
     auto needsRuntimeFieldInit = [&](const sema::TypeSymbol* t) -> bool {
         for (const sema::Symbol* m : t->members) {
             auto* fs = dynamic_cast<const sema::FieldSymbol*>(m);
-            if (!fs || !isStaticField(fs)) continue;
-            // SEAM-ACCESSOR: needsRuntimeFieldInit's `t` (its only call site
-            // is the ctx_.symbols() loop just below) is always local. #3152
-            auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
-            if (!fd || !fd->initializer) continue;
-            const ast::Expr* e = fd->initializer.get();
-            // #1309 / §22.13: only a readonly static's literal initializer is
-            // baked (constInitFor); a mutable static's literal initializer needs
-            // a runtime store in textual order, so it does NOT skip here.
-            if (isBakedStaticFieldInit(fs, e)) continue;
-            return true;  // non-constant initializer found
+            if (fs && isStaticField(fs)) {
+                // SEAM-ACCESSOR: needsRuntimeFieldInit's `t` (its only call
+                // site is the ctx_.symbols() loop just below) is always
+                // local. #3152
+                auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
+                // #1309 / §22.13: only a readonly static's literal initializer
+                // is baked (constInitFor); a mutable static's literal
+                // initializer needs a runtime store in textual order, so it
+                // does NOT skip here.
+                if (fd && fd->initializer &&
+                    !isBakedStaticFieldInit(fs, fd->initializer.get()))
+                    return true;  // non-constant field initializer found
+            }
+            auto* ps = dynamic_cast<const sema::PropertySymbol*>(m);
+            if (ps && isStaticAutoProperty(ps)) {
+                // SEAM-ACCESSOR: needsRuntimeFieldInit's `t` (its only call
+                // site is the ctx_.symbols() loop just below) is always
+                // local, exactly like the FieldSymbol arm above. #3152
+                auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
+                if (pd && pd->autoInitializer &&
+                    !isConstantLiteralStaticInit(pd->autoInitializer.get()))
+                    return true;  // non-constant auto-property initializer found
+            }
         }
         return false;
     };
@@ -9732,13 +9761,84 @@ void Emitter::emitStaticConstructorBody(sema::ConstructorSymbol* cs,
     // LLVM initializer by constInitFor, so they need no runtime store.
     if (type) {
         for (const sema::Symbol* m : type->members) {
-            // NOTE (#1146 residual): a static auto-property with a NON-constant
-            // inline initializer (`static readonly property X: int := calc()`) is
-            // NOT yet emitted here — the "type has static state" detection that
-            // gates sfinit generation only inspects static FIELDS, so no static
-            // initializer runs for a property-only type. The CONSTANT case (the
-            // common form) is handled by constInitForExpr in declareStatics. The
-            // non-constant case is tracked separately.
+            // fix #3749 (§23.1 / §22.13, v0.286): a static auto-property's
+            // NON-constant inline initializer (`static readonly property X:
+            // int := calc();`) now gets the same runtime-store treatment as a
+            // static field's, in the SAME textual-order walk over
+            // `type->members` — so a property declared between two static
+            // fields runs at the right point relative to both, per §22.13
+            // "within a single type, static fields are initialized in textual
+            // declaration order" (§23.1: the auto-property's backing field is
+            // assigned "in the declaring type's own static initialization",
+            // the same phase this loop implements for fields). The CONSTANT
+            // case (the common form, `:= 42`) is unaffected — it is still
+            // baked straight into the global's LLVM initializer by
+            // declareStatics's constInitForExpr call (#1146) and needs no
+            // runtime store here; this arm only fires for the non-foldable
+            // shape (a method call / static-member reference) that #3749
+            // measured as silently never running at all, even single-module.
+            //
+            // §23.1 note: `owned` "applies only to fields" (not to properties
+            // or other members), so — unlike the FieldSymbol arm below —
+            // there is no atexit disposal registration to emit here: a static
+            // auto-property can never be `owned`. Nor is there a collection-
+            // literal / inline-array shape to materialize: §22.12 rule 2
+            // forms (iii)/(iv) both restrict the inline-array and owning-
+            // inline-array mutable-static admissions to "fields only", so a
+            // static auto-property's declared type is never an inline array.
+            // A GENERIC type's static auto-property is a separate, unfiled
+            // gap: this arm still runs for the (unreachable at runtime)
+            // TEMPLATE-level global, mirroring the field path's own
+            // "template-level store … handles the (unreachable) template
+            // path" comment below, but the PER-INSTANTIATION carriage that
+            // #709/#1513 built for fields (genericInstStaticGlobals_ /
+            // genericInstSfinitFn) has no property analogue — filed
+            // separately rather than attempted here.
+            if (auto* ps = dynamic_cast<const sema::PropertySymbol*>(m)) {
+                if (!isStaticAutoProperty(ps)) continue;
+                // SEAM-ACCESSOR: `type->members` here (like the FieldSymbol
+                // arm below) is always a LOCAL type's member list — this
+                // function's only callers build `type` from `ctx_.symbols()`
+                // (staticCtors_ / sfinitFnOf_ / cctorFnOf_, all populated
+                // above from the local-only declareFunctions() walk), never
+                // from an imported symbol, so `ps->decl` is never null here.
+                // #3152
+                auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
+                if (!pd || !pd->autoInitializer) continue;
+                const ast::Expr* pInitExpr = pd->autoInitializer.get();
+                // Mirrors needsRuntimeFieldInit's gate: a static
+                // auto-property bakes ANY constant-literal initializer
+                // unconditionally (declareStatics), regardless of
+                // `readonly` — unlike a field, which bakes only a readonly
+                // one (isBakedStaticFieldInit) — so the skip test here is
+                // the bare constant-literal predicate, not the field rule.
+                if (isConstantLiteralStaticInit(pInitExpr)) continue;
+                auto pGvIt = staticGlobals_.find(ps);
+                if (pGvIt == staticGlobals_.end()) continue;  // no backing global
+                llvm::Value* pVal = lowerExpr(*pInitExpr);
+                if (!pVal) {
+                    // #1386-style ICE, mirroring the field arm below.
+                    ctx_.diagnostics().report(
+                        Severity::Error, pInitExpr->span.begin,
+                        "internal: lowerExpr returned null for static "
+                        "auto-property initializer — #1386");
+                    continue;
+                }
+                // fix #2903-style coercion (§5.1 / §7.2 / §22.13 / §23.1):
+                // the same numeric-direction + tagged-nullable-slot wrap the
+                // field runtime-store path applies below, so a non-foldable
+                // initializer of a narrow or nullable type stores correctly
+                // rather than zero-filled bits or an unwrapped payload.
+                const sema::TypeRef* pRt =
+                    pd->type ? ctx_.resolvedType(*pd->type) : nullptr;
+                pVal = coerceInitializerToSlot(pVal, pGvIt->second->getValueType(),
+                                               isUnsignedTargetExpr(*pInitExpr));
+                if (pRt && isNullableValueTy(pRt))
+                    pVal = coerceReturnToNullableValue(
+                        pVal, pRt, isUnsignedTargetExpr(*pInitExpr));
+                builder_.CreateStore(pVal, pGvIt->second);
+                continue;
+            }
             auto* fs = dynamic_cast<const sema::FieldSymbol*>(m);
             if (!fs || !isStaticField(fs)) continue;
             auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
