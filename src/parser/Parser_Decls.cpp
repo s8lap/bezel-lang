@@ -829,6 +829,22 @@ std::unique_ptr<ast::Type> Parser::parseType() {
     //                      | InlineArrayType
     //                      | FunctionType
     //                      | "(" ")"            /* unit */
+    // fix #3796 (§3.6 / §8.3 / §28.11 / §15.3, v0.286): stamp parseType's
+    // result with the [start, current token) span so generic type arguments
+    // — the inner `Holder` AST node, not the outer `Dictionary<Holder, int>`
+    // — carry a real source location. Every other earlier `parseExpression`
+    // variant already wraps its return with stampSpan (Parser_Exprs.cpp:113);
+    // `parseType` did not, so any sema diagnostic anchoring on an `ast::Type*`
+    // span — the hash-container key/element reject, the element-category
+    // reject, the per-instantiation constraint check — reported `0:0` in
+    // precisely the contexts the spec asks for IDE-jump correctness. The
+    // stompSpan no-op-on-already-stamped rule (line 19 above) keeps an
+    // already-populated span (e.g. a catch-arm Type, stampSpan'd at Parser_Stmts
+    // :640) untouched.
+    const SourceLocation typeStart = current_.location;
+    auto stampType = [&](std::unique_ptr<ast::Type> t) {
+        return stampSpan(std::move(t), typeStart, current_.location);
+    };
     auto type = std::make_unique<ast::Type>();
 
     // InlineArrayType: `[ ConstIntExpr "owned"? ] Type`.
@@ -851,7 +867,7 @@ std::unique_ptr<ast::Type> Parser::parseType() {
             type->nullable = true;
             advance();
         }
-        return type;
+        return stampType(std::move(type));
     }
 
     // Unit type `()` or FunctionType `(...) -> ...`.
@@ -935,7 +951,7 @@ std::unique_ptr<ast::Type> Parser::parseType() {
                     auto inner = std::move(type->funcParams[0].type);
                     inner->nullable = true;
                     advance(); // consume `?`
-                    return inner;
+                    return stampType(std::move(inner));
                 }
                 diagnostics_.report(
                     Severity::Error, current_.location,
@@ -948,7 +964,7 @@ std::unique_ptr<ast::Type> Parser::parseType() {
             type->nullable = true;
             advance();
         }
-        return type;
+        return stampType(std::move(type));
     }
 
     // Default: NamedType.
@@ -1022,7 +1038,7 @@ std::unique_ptr<ast::Type> Parser::parseType() {
         type->nullable = true;
         advance();
     }
-    return type;
+    return stampType(std::move(type));
 }
 
 std::unique_ptr<ast::Member> Parser::parseMember() {

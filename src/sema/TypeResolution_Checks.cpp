@@ -2498,9 +2498,22 @@ void Resolver::checkHashContainerKeys() {
         const TypeSymbol* rec = s.keyRef ? s.keyRef->declaration : nullptr;
         std::string keyName =
             rec ? ("`" + std::string(rec->name) + "`") : std::string("it");
+        // fix #3796 (§3.6 / §8.3): prefer the offending TYPE-ARGUMENT's source
+        // location over the enclosing annotation site's. The annotation may
+        // sit inside a typed-local or a `new …()` whose Name* AST node has
+        // spans populated by the lexer's per-token stamping (paths that flow
+        // through parseExpression's stampSpan wrap); the type-argument's AST
+        // node carries the more precise location the user actually needs to
+        // jump to in an IDE. Falls back to `s.site` only if the type argument
+        // has no AST node (an imported type whose TypeRef carries no AST).
+        SourceLocation diagLoc;
+        if (s.keyRef && s.keyRef->astNode &&
+            s.keyRef->astNode->span.begin.line != 0)
+            diagLoc = s.keyRef->astNode->span.begin;
+        else if (s.site)
+            diagLoc = s.site->span.begin;
         ctx_.diagnostics().report(
-            Severity::Error,
-            s.site ? s.site->span.begin : SourceLocation{},
+            Severity::Error, diagLoc,
             std::string("`") + std::string(s.container) +
             "` requires a hashable " + std::string(s.property) +
             " type, but the type argument " + keyName +
@@ -2584,9 +2597,22 @@ void Resolver::checkHashContainerKeys() {
             const TypeSymbol* rec = concreteKey->declaration;
             std::string keyName =
                 rec ? ("`" + std::string(rec->name) + "`") : std::string("it");
+            // fix #3796 (§3.6 / §8.3): prefer the offending concrete
+            // type-argument's source location (`inst.argAsts[paramIdx]`) over
+            // the interior annotation site — the §3.6 rule-2 per-instantiation
+            // discipline wants the diagnostic at the instantiation site, which
+            // for `Holder` in `new Registry2<Holder>()` is the inner type
+            // argument's AST span, not the body annotation site's.
+            SourceLocation diagLoc;
+            const ast::Type* argAst = (paramIdx < inst.argAsts.size())
+                                          ? inst.argAsts[paramIdx]
+                                          : nullptr;
+            if (argAst && argAst->span.begin.line != 0)
+                diagLoc = argAst->span.begin;
+            else if (s.site)
+                diagLoc = s.site->span.begin;
             ctx_.diagnostics().report(
-                Severity::Error,
-                s.site ? s.site->span.begin : SourceLocation{},
+                Severity::Error, diagLoc,
                 std::string("`") + std::string(s.container) +
                 "` requires a hashable " + std::string(s.property) +
                 " type, but the type argument " + keyName +
@@ -2635,8 +2661,19 @@ void Resolver::checkElementCategoryInstantiations() {
         const char* moveOnlyKind = nullptr;
         if (!common::isMoveOnlyValueType(s.elRef, ctx_, moveOnlyKind)) continue;
         if (s.site && !reported.insert(s.site).second) continue;  // dedup per site
+        // fix #3796 (§28.11 / §15.3): prefer the offending TYPE-ARGUMENT's
+        // source location (`s.elRef->astNode`) over the annotation site's,
+        // matching the checkHashContainerKeys Pass-1 change just above — IDE
+        // jumps land on the type argument, not the surrounding `Dictionary<…>`
+        // name. Falls back to `s.site` if the elRef has no AST node.
+        SourceLocation diagLoc;
+        if (s.elRef && s.elRef->astNode &&
+            s.elRef->astNode->span.begin.line != 0)
+            diagLoc = s.elRef->astNode->span.begin;
+        else if (s.site)
+            diagLoc = s.site->span.begin;
         ctx_.diagnostics().report(
-            Severity::Error, s.site ? s.site->span.begin : SourceLocation{},
+            Severity::Error, diagLoc,
             std::string("`") + std::string(s.container) + "` cannot use " +
             std::string(moveOnlyKind) + " as its " + std::string(s.slotName) +
             " type argument (\xC2\xA7""28.11 / \xC2\xA7""15.3) \xE2\x80\x94 "
@@ -2683,9 +2720,23 @@ void Resolver::checkElementCategoryInstantiations() {
             const TypeSymbol* rec = concrete->declaration;
             std::string argName =
                 rec ? ("`" + std::string(rec->name) + "`") : std::string("it");
+            // fix #3796 (§28.11 / §15.3): prefer the offending concrete
+            // type-argument's source location over the interior annotation
+            // site, like the hash-container Pass 2 just above — the §3.6
+            // rule-2 per-instantiation discipline puts the diagnostic at the
+            // instantiation site, where `concrete` is the bound's resolved
+            // TypeRef and `inst.argAsts[paramIdx]` is its source-spelled
+            // AST node.
+            SourceLocation diagLoc;
+            const ast::Type* argAst = (paramIdx < inst.argAsts.size())
+                                          ? inst.argAsts[paramIdx]
+                                          : nullptr;
+            if (argAst && argAst->span.begin.line != 0)
+                diagLoc = argAst->span.begin;
+            else if (s.site)
+                diagLoc = s.site->span.begin;
             ctx_.diagnostics().report(
-                Severity::Error,
-                s.site ? s.site->span.begin : SourceLocation{},
+                Severity::Error, diagLoc,
                 std::string("`") + std::string(s.container) +
                 "` cannot use " + argName + " as its " +
                 std::string(s.slotName) +
