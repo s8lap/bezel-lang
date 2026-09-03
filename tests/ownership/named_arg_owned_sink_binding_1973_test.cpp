@@ -48,6 +48,18 @@
 //     consume diagnostic (→ runtime UAF); WITH the fix the consume is detected
 //     ("this call consumes `r`", §22.3).
 
+// AMENDED (fix #3746 follow-up, v0.286): the shared prelude's `Holder` field is
+// now `public owned _b: R;`. As originally written (`public _b: R;`) the ctor
+// stored a borrow of its own `owned` parameter into a non-owning field and the
+// parameter was auto-dropped at the constructor's end — a dangling `_b` for the
+// object's whole life. #3746 made that store an error, and the four "accepted"
+// rows below (which assert `!hasErrors()` over this shared prelude) went red on
+// the gate. The repair is the §28.8 transfer, not a narrowing of #3746: no
+// narrowing exists that accepts this prelude and still rejects the four
+// measured use-after-frees #3746's own rows pin, since `Box.Take(p: owned R)
+// { this.r := p; }` and this constructor are the same program. See the comment
+// at the field itself for the measurement.
+
 #include <string>
 #include <string_view>
 
@@ -73,8 +85,25 @@ std::string wrap(const std::string& body) {
         "  public method Get(): int return V; end Get; "
         "  destructor end destructor; "
         "end R; "
+        // fix #3746 follow-up: `_b` is declared `owned`. It was a plain
+        // `public _b: R;`, which made this prelude an instance of exactly the
+        // §28.3 defect #3746 closed: an `owned` ctor parameter stored into a
+        // NON-owned field is a borrow store, the parameter is then auto-dropped
+        // at the constructor's end (the compiler's own pre-existing diagnostic
+        // says so verbatim — "owned parameter `b` is implicitly disposed at the
+        // end of the method (§28.3 auto-drop)"), and `_b` dangles for the whole
+        // life of the Holder, with no site-announced kill anywhere that §28.2's
+        // backstop could key on. MEASURED on a31fb7b: the identical shape with a
+        // caller-side `Dispose()` (the only spelling the pre-#3746 compiler
+        // accepted) prints a garbage int in unchecked mode and raises
+        // `System.DisposedAccessException` under `--checked-disposal`.
+        // `owned _b` is the §28.8 transfer — the ctor parameter is DISCHARGED
+        // into the field, the Holder's destructor owns it, and the auto-drop
+        // warning disappears. Nothing this file tests changes: `Holder`'s
+        // constructor keeps its `(a: int, owned b: R)` signature, which is the
+        // only thing the §22.5 named-argument binding rows below exercise.
         "class Holder "
-        "  public _b: R; "
+        "  public owned _b: R; "
         "  public constructor(a: int, owned b: R) this._b := b; end constructor; "
         "  destructor end destructor; "
         "end Holder; "

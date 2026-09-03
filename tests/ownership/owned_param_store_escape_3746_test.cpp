@@ -394,4 +394,184 @@ BEZEL_TEST(owned_param_store_escape_3746,
         "end C;")), "5");
 }
 
+
+// ------------------------------------- THE CALL-ARGUMENT CHANNEL (follow-up)
+//
+// Added after gate cycle 6, where four "accepted" rows of
+// `tests/ownership/named_arg_owned_sink_binding_1973_test.cpp` went red. The
+// dispatching hypothesis was that #3746's reject had leaked into the CALL-
+// ARGUMENT channel — an `owned` parameter passed as an argument to a borrow
+// parameter, possibly reordered by §22.5 named arguments or captured by a
+// closure. MEASURED on a31fb7b (the integrated tree where the four rows fail),
+// that hypothesis is REFUTED: all eight programs below already compile and
+// print the right value. The four rows failed on a FIELD STORE in their shared
+// prelude — `Holder`'s constructor stored its `owned` parameter into a
+// non-`owned` field — which is #3746's own destination, not a call argument;
+// that prelude was repaired at its own file.
+//
+// These rows exist so the channel is ratcheted HERE, in #3746's own suite: the
+// escape check must never reach an argument position. §22.3's parameter
+// modifiers, §22.5's named-argument binding, and §28.3's captured-owned-binding
+// borrow state are what make each of them sound — the callee's parameter is a
+// plain borrow, so the call borrows for its duration and stores nothing.
+
+// NEGATIVE (§22.3) — an `owned` parameter passed POSITIONALLY to a plain borrow
+// parameter. The callee borrows for the duration of the call; nothing outlives
+// `p`.
+BEZEL_TEST(owned_param_store_escape_3746,
+           call_arg_owned_param_to_borrow_param_accepted_22_3) {
+    BEZEL_EXPECT_EQ(runOut(prog(
+        "class C "
+        "  public static method Peek(x: R): int return x.V(); end Peek; "
+        "  public static method Take(p: owned R): int "
+        "    return Peek(p); "
+        "  end Take; "
+        "  public static method Main(): int "
+        "    Console.WriteLine(Take(new R()).ToString()); "
+        "    return 0; "
+        "  end Main; "
+        "end C;")), "5");
+}
+
+// NEGATIVE (§22.5) — the same, through a REORDERED named argument. §22.5:
+// "a named argument `name := expr` fills the parameter named `name`; named
+// arguments may appear in any order after positional arguments." `p` sits at
+// source index 0 but binds the borrow parameter `b`.
+BEZEL_TEST(owned_param_store_escape_3746,
+           call_arg_owned_param_named_reordered_to_borrow_param_accepted_22_5) {
+    BEZEL_EXPECT_EQ(runOut(prog(
+        "class C "
+        "  public static method Peek2(a: int, b: R): int return b.V() + a; end Peek2; "
+        "  public static method Take(p: owned R): int "
+        "    return Peek2(b := p, a := 7); "
+        "  end Take; "
+        "  public static method Main(): int "
+        "    Console.WriteLine(Take(new R()).ToString()); "
+        "    return 0; "
+        "  end Main; "
+        "end C;")), "12");
+}
+
+// NEGATIVE (§28.3 *Captured owned bindings* / §22.5) — the reordered named call
+// made from inside a CLOSURE that captures the `owned` parameter and is invoked
+// locally. The capture is a borrow (§28.3), the closure does not escape, and the
+// argument still binds a borrow parameter.
+BEZEL_TEST(owned_param_store_escape_3746,
+           call_arg_owned_param_captured_in_closure_accepted_28_3) {
+    BEZEL_EXPECT_EQ(runOut(prog(
+        "class C "
+        "  public static method Peek2(a: int, b: R): int return b.V() + a; end Peek2; "
+        "  public static method Take(p: owned R): int "
+        "    var f := lambda(): int => Peek2(b := p, a := 7); "
+        "    return f(); "
+        "  end Take; "
+        "  public static method Main(): int "
+        "    Console.WriteLine(Take(new R()).ToString()); "
+        "    return 0; "
+        "  end Main; "
+        "end C;")), "12");
+}
+
+// NEGATIVE (§22.3 / §28.8) — an `owned` parameter forwarded ONWARD into another
+// `owned` sink with the positional `owned` marker. That is a transfer, not a
+// borrow store: `recordMovesIn` leaves `p` moved-from, so no live source
+// resolves and the discharge is the callee's.
+BEZEL_TEST(owned_param_store_escape_3746,
+           call_arg_owned_param_forwarded_with_marker_accepted_22_3) {
+    BEZEL_EXPECT_EQ(runOut(prog(
+        "class C "
+        "  public static method Sink(owned q: R): int "
+        "    var n := q.V(); "
+        "    q.Dispose(); "
+        "    return n; "
+        "  end Sink; "
+        "  public static method Take(p: owned R): int "
+        "    return Sink(owned p); "
+        "  end Take; "
+        "  public static method Main(): int "
+        "    Console.WriteLine(Take(new R()).ToString()); "
+        "    return 0; "
+        "  end Main; "
+        "end C;")), "5");
+}
+
+// The four gate-red shapes themselves, transcribed from
+// `named_arg_owned_sink_1973` and run through the AOT oracle for their VALUE
+// rather than for `!hasErrors()`. Their prelude there is shared, so a single
+// prelude-level diagnostic takes all four down at once and none of them can say
+// which construct moved; here each stands alone.
+
+// NEGATIVE (§22.5) — `Sink2(owned a, b)` called `Sink2(b := r, a := new R())`
+// with `r` a BORROW parameter: `r` binds the borrow parameter `b`, the fresh
+// producer binds the owned parameter `a`.
+BEZEL_TEST(owned_param_store_escape_3746,
+           named_arg_borrow_reorder_to_borrow_param_accepted_22_5) {
+    BEZEL_EXPECT_EQ(runOut(prog(
+        "class C "
+        "  public static method Sink2(owned a: R, b: R): int "
+        "    a.Dispose(); return b.V(); "
+        "  end Sink2; "
+        "  public static method Use(r: R): int "
+        "    return Sink2(b := r, a := new R()); "
+        "  end Use; "
+        "  public static method Main(): int "
+        "    using var q := new R(); "
+        "    Console.WriteLine(Use(q).ToString()); "
+        "    return 0; "
+        "  end Main; "
+        "end C;")), "5");
+}
+
+// NEGATIVE (§22.5) — the all-named call that does NOT reorder.
+BEZEL_TEST(owned_param_store_escape_3746,
+           named_args_in_declaration_order_accepted_22_5) {
+    BEZEL_EXPECT_EQ(runOut(prog(
+        "class C "
+        "  public static method Sink2(owned a: R, b: R): int "
+        "    a.Dispose(); return b.V(); "
+        "  end Sink2; "
+        "  public static method Use(r: R): int "
+        "    return Sink2(a := new R(), b := r); "
+        "  end Use; "
+        "  public static method Main(): int "
+        "    using var q := new R(); "
+        "    Console.WriteLine(Use(q).ToString()); "
+        "    return 0; "
+        "  end Main; "
+        "end C;")), "5");
+}
+
+// NEGATIVE (§22.3) — the sound POSITIONAL owned transfer of an owned LOCAL with
+// the call-site marker (`Sink3(7, owned r)`); the marker is positional-only.
+BEZEL_TEST(owned_param_store_escape_3746,
+           positional_owned_transfer_with_marker_accepted_22_3) {
+    BEZEL_EXPECT_EQ(runOut(prog(
+        "class C "
+        "  public static method Sink3(a: int, owned b: R): int "
+        "    b.Dispose(); return a; "
+        "  end Sink3; "
+        "  public static method Main(): int "
+        "    var r := new R(); "
+        "    Console.WriteLine(Sink3(7, owned r).ToString()); "
+        "    return 0; "
+        "  end Main; "
+        "end C;")), "7");
+}
+
+// NEGATIVE (§28.3 / §22.5) — a captured owned LOCAL passed by a reordered named
+// argument into a borrow parameter, from inside a locally-invoked closure.
+BEZEL_TEST(owned_param_store_escape_3746,
+           closure_borrow_reorder_to_borrow_param_accepted_28_3) {
+    BEZEL_EXPECT_EQ(runOut(prog(
+        "class C "
+        "  public static method Peek2(a: int, b: R): int return b.V() + a; end Peek2; "
+        "  public static method Main(): int "
+        "    using var r := new R(); "
+        "    var f := lambda(): int => Peek2(b := r, a := 7); "
+        "    Console.WriteLine(f().ToString()); "
+        "    return 0; "
+        "  end Main; "
+        "end C;")), "12");
+}
+
 }  // namespace
