@@ -944,6 +944,35 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
     // mid-emission of an OUTER body by buildSpecializedMethodFn, so the
     // clear needs its save/restore half — see CaptureReclaimSetScope.
     CaptureReclaimSetScope captureReclaimScope(*this);
+    // fix #3705 (§28.9 / §28.11 / §29.7 / §30.7, v0.286): the borrowing-
+    // collection twin of the line above, and the half this emitter has been
+    // missing since fix #2148 gave it the OTHER half. `emitIteratorMethod`
+    // re-establishes the five collection-reclaim eligibility sets and their five
+    // fn tokens for `moveNextFn` in the pre-scan block below (~L1690), and is
+    // reached MID-EMISSION of an outer body by `buildSpecializedMethodFn`
+    // (LlvmBackend_Calls2.cpp ~L12080) whenever a generic sync iterator is
+    // monomorphized inside one. That site saves the unwind, string and
+    // closure-release sets; it never grew a save for this family. So the outer
+    // body resumed lowering with `borrowingArrayFreeEligibleFn_ == moveNextFn`
+    // and every one of its own five gates in `lowerLocalDecl` was false.
+    //
+    // MEASURED on r12-cycle-1 (`bezelc --sanitize=address`, LSan on): a generic
+    // sync iterator specialised inside a body that then declares
+    // `var ys: Array<int> := [5, 6, 7]`, 200 rounds — value correct
+    // (`total=2400`), 24000 B / 400 allocations leaked, ALL of it the OUTER
+    // body's own `ys` backing. Not a regression: identical before and after
+    // #3697, which added the same scope to the async-iterator twin only.
+    //
+    // LANE_RULES §8: a `clear()` on per-lowering state and a save/restore around
+    // nested emission are two halves of ONE contract. // per §28.9, §28.11
+    BorrowingReclaimSetScope borrowingReclaimScope(*this);
+    // fix #3699 (§15.3 / §15.1.1 / §29.7, v0.286): the same half for the §15.3
+    // (#747) move-only inline-array TRANSFER set, whose re-establishment for
+    // `moveNextFn` this commit adds in the same pre-scan block below. Neither
+    // specialisation site saves this pair, so without this scope arming #3699's
+    // disposal would cost the OUTER body its own `[N owned]T` disposal — trading
+    // one leak for another.
+    MoveOnlyArrayTransferScope moveOnlyArrayScope(*this);
     smKind_ = SuspendKind::Yield;
 
     // §29.6: a SYNCHRONOUS iterator (returning IEnumerable<T>/IEnumerator<T>)
@@ -1668,6 +1697,59 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         // non-throwing path. // per §28.3
         unwindIneligibleFn_ = moveNextFn;
         collectUnwindIneligible(*ci.stmts);
+        // fix #3699 (§15.3 / §15.1.1 / §28.10 / §29.7 / §30.7, v0.286): the
+        // §15.3 (#747) move-only owning inline-array TRANSFER analysis must
+        // describe the MOVENEXT fn (where the iterator body lowers) too. `registerInlineOwnedArrayDisposal`
+        // (LlvmBackend_Setup.cpp) opens with
+        //
+        //     if (currentFn_ != moveOnlyArrayTransferredFn_) return true;
+        //
+        // and `moveOnlyArrayTransferredFn_` was assigned in exactly two places
+        // (`emitFunctionBody` and the constructor-body setup, both in
+        // LlvmBackend_Setup.cpp), both keyed to the ENTRY fn. A state-machine
+        // body lowers with `currentFn_ == moveNextFn`, so the gate was false for the
+        // WHOLE body and §15.1.1's "the array's auto-dispose pass disposes each
+        // non-null slot ... For locals, this happens at scope end" never
+        // happened in ANY state machine: the elements' DESTRUCTORS never ran.
+        // That is an observable semantic defect, not only a leak — measured
+        // with a `Cell` whose ctor/dtor bump a static counter, 200 activations
+        // of `var a: [2 owned]Cell? := [new Cell(1), new Cell(2)];`, full drain:
+        //
+        //   plain method (control)   total=600 n=0     clean
+        //   sync iterator            total=600 n=400   6400 B / 400 allocs
+        //   async method             total=600 n=400   6400 B / 400 allocs
+        //   async iterator           total=600 n=400   6400 B / 400 allocs
+        //
+        // `n=400` is 200 rounds x 2 slots whose destructors never ran.
+        //
+        // NO NEW PREDICATE (LANE_RULES §6): `collectMoveOnlyArrayTransferred`
+        // already computes the whole fact — it was simply never asked about this
+        // body. One call clears and re-populates the set over THESE statements;
+        // re-pin the token to moveNextFn. Re-running the analysis over the SAME body is
+        // load-bearing and not merely re-pointing the token: the set is what
+        // suppresses disposal for a local whose slots were MOVED OUT, so a
+        // re-pointed-but-stale set would double-free a transferred array.
+        //
+        // ABANDONMENT (§29.7) / THROW. A plain `inlineOwnedArray` Disposal is
+        // neither `caughtException` nor `unwindOnly` and is NOT on the §27.5
+        // exclusion list in LlvmBackend_Stmts.cpp's yield handler (`closureRelease
+        // || boxedCellFree || boxedCellFreeDeferred || inlineOwnedArrayCell` —
+        // the NEIGHBOURING `inlineOwnedArrayCell`, which disposes elements
+        // THROUGH a capture cell, is excluded; the plain kind is not), so it now
+        // enrols in the `smIterCleanupAtState_` snapshot Dispose replays. That
+        // comment's own note — "gated on moveOnlyArrayTransferredFn_, a token
+        // this commit does not touch, so it is as inert in an iterator body after
+        // this change as it was before" — describes the state THIS commit ends:
+        // the entry is live for the first time. It runs exactly once for the
+        // reason every other entry in that snapshot relies on: Dispose stamps the
+        // DISPOSED sentinel (-2) before running the stack, exhaustion parks -1
+        // and the throw edge parks -1 (#3531), and neither state has a case in
+        // the resume switch. Both edges are probed at 200 activations under
+        // ASan/LSan as rows of the regression test, together with the
+        // transferred-out shape that must NOT be disposed here at all.
+        // // per §15.3, §28.10, §29.7
+        collectMoveOnlyArrayTransferred(*ci.stmts);
+        moveOnlyArrayTransferredFn_ = moveNextFn;
         // fix #2148 / #2142 / #2143 / #1871 / #1003 / #1028 / #1930 / §28.9 /
         // §28.11: the scope-end reclaim of a plain `var` borrowing-`Array<T>` /
         // `Set<T>` / `Dictionary<K,V>` LITERAL (its backing is "reclaimed with

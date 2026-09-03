@@ -11453,6 +11453,115 @@ private:
         llvm::Function* cellFreeEligibleFn_;
     };
 
+    // fix #3705 / fix #3697 (§28.9 / §28.11 / §29.7 / §30.7, v0.286): the
+    // borrowing-collection twin of `CaptureReclaimSetScope` above — save and
+    // restore the five collection-reclaim eligibility SETS, their five function
+    // TOKENS, and the nested-literal aggregate set across ONE nested body
+    // emission. Same contract, same reason (LANE_RULES §8): a `clear()` on
+    // per-lowering state and a save/restore around nested emission are two
+    // halves of ONE contract, and every emitter that re-establishes this family
+    // for its own body needs both halves.
+    //
+    // HOISTED HERE BY fix #3705. #3697 declared this struct LOCAL to
+    // `emitAsyncIteratorMethod` "because it guards exactly one call site"; it
+    // now guards THREE (`emitIteratorMethod`, `emitAsyncMethod`,
+    // `emitAsyncIteratorMethod`), which is what makes it a header type rather
+    // than a function-local one. The member list is BYTE-IDENTICAL to the
+    // 11-item hand-written save/restore `LlvmBackend_Exprs2.cpp` (~L2309-2357)
+    // performs around `emitAsyncLambda` — five sets, five fn tokens, plus
+    // `literalTreeAggregateEligible_` (#2660), whose consumer
+    // (LlvmBackend_Disposal.cpp) gates on `dictLiteralFreeEligibleFn_`, so the
+    // two must move together. It is deliberately NOT merged with that hand-
+    // written list here: Exprs2's copy also saves the capture family and the
+    // sm*_ frame in the same block, and this lane does not own that file.
+    //
+    // DIRECTION IF MISSING: the outer body resumes lowering with every
+    // borrowing/dict/grouping/set-literal/dict-literal reclaim keyed to the
+    // NESTED body's fn, so every gate in `lowerLocalDecl` goes false and the
+    // outer body's own reclaims silently stop firing — a LEAK, measured at
+    // 24000 B / 400 allocations for a generic sync iterator specialised inside
+    // a body that then declares `var ys: Array<int> := [5, 6, 7]` (issue 3705),
+    // and the same for a generic async METHOD specialised the same way.
+    struct BorrowingReclaimSetScope {
+        explicit BorrowingReclaimSetScope(Emitter& e)
+            : e_(e),
+              borrowingArrayFreeEligible_(e.borrowingArrayFreeEligible_),
+              borrowingArrayFreeEligibleFn_(e.borrowingArrayFreeEligibleFn_),
+              dictMaterializerFreeEligible_(e.dictMaterializerFreeEligible_),
+              dictMaterializerFreeEligibleFn_(e.dictMaterializerFreeEligibleFn_),
+              groupingFreeEligible_(e.groupingFreeEligible_),
+              groupingFreeEligibleFn_(e.groupingFreeEligibleFn_),
+              setLiteralFreeEligible_(e.setLiteralFreeEligible_),
+              setLiteralFreeEligibleFn_(e.setLiteralFreeEligibleFn_),
+              dictLiteralFreeEligible_(e.dictLiteralFreeEligible_),
+              dictLiteralFreeEligibleFn_(e.dictLiteralFreeEligibleFn_),
+              literalTreeAggregateEligible_(e.literalTreeAggregateEligible_) {}
+        ~BorrowingReclaimSetScope() {
+            e_.borrowingArrayFreeEligible_ =
+                std::move(borrowingArrayFreeEligible_);
+            e_.borrowingArrayFreeEligibleFn_ = borrowingArrayFreeEligibleFn_;
+            e_.dictMaterializerFreeEligible_ =
+                std::move(dictMaterializerFreeEligible_);
+            e_.dictMaterializerFreeEligibleFn_ = dictMaterializerFreeEligibleFn_;
+            e_.groupingFreeEligible_ = std::move(groupingFreeEligible_);
+            e_.groupingFreeEligibleFn_ = groupingFreeEligibleFn_;
+            e_.setLiteralFreeEligible_ = std::move(setLiteralFreeEligible_);
+            e_.setLiteralFreeEligibleFn_ = setLiteralFreeEligibleFn_;
+            e_.dictLiteralFreeEligible_ = std::move(dictLiteralFreeEligible_);
+            e_.dictLiteralFreeEligibleFn_ = dictLiteralFreeEligibleFn_;
+            e_.literalTreeAggregateEligible_ =
+                std::move(literalTreeAggregateEligible_);
+        }
+        BorrowingReclaimSetScope(const BorrowingReclaimSetScope&) = delete;
+        BorrowingReclaimSetScope& operator=(const BorrowingReclaimSetScope&) =
+            delete;
+
+    private:
+        Emitter& e_;
+        std::unordered_set<const void*> borrowingArrayFreeEligible_;
+        llvm::Function* borrowingArrayFreeEligibleFn_;
+        std::unordered_set<const void*> dictMaterializerFreeEligible_;
+        llvm::Function* dictMaterializerFreeEligibleFn_;
+        std::unordered_set<const void*> groupingFreeEligible_;
+        llvm::Function* groupingFreeEligibleFn_;
+        std::unordered_set<const void*> setLiteralFreeEligible_;
+        llvm::Function* setLiteralFreeEligibleFn_;
+        std::unordered_set<const void*> dictLiteralFreeEligible_;
+        llvm::Function* dictLiteralFreeEligibleFn_;
+        std::unordered_set<const void*> literalTreeAggregateEligible_;
+    };
+
+    // fix #3699 (§15.3 / §15.1.1 / §28.10 / §29.7 / §30.7, v0.286): the same
+    // two-halves contract for the §15.3 (#747) move-only owning inline-array
+    // TRANSFER set and its function token. The three state-machine emitters now
+    // re-establish this pass for the fn their body lowers into (MoveNext /
+    // Resume), so — exactly as for the two families above — they must leave the
+    // outer body's copy as they found it. Neither `buildSpecializedMethodFn`
+    // nor `emitInlineGenericMethod` saves this pair (they save the unwind,
+    // string and closure-release sets only), so without this scope arming
+    // #3699's disposal would COST an outer body its own `[N owned]T` disposal
+    // whenever a generic state machine is specialised mid-emission — trading
+    // one leak for another.
+    struct MoveOnlyArrayTransferScope {
+        explicit MoveOnlyArrayTransferScope(Emitter& e)
+            : e_(e),
+              moveOnlyArrayTransferred_(e.moveOnlyArrayTransferred_),
+              moveOnlyArrayTransferredFn_(e.moveOnlyArrayTransferredFn_) {}
+        ~MoveOnlyArrayTransferScope() {
+            e_.moveOnlyArrayTransferred_ =
+                std::move(moveOnlyArrayTransferred_);
+            e_.moveOnlyArrayTransferredFn_ = moveOnlyArrayTransferredFn_;
+        }
+        MoveOnlyArrayTransferScope(const MoveOnlyArrayTransferScope&) = delete;
+        MoveOnlyArrayTransferScope& operator=(
+            const MoveOnlyArrayTransferScope&) = delete;
+
+    private:
+        Emitter& e_;
+        std::unordered_set<const void*> moveOnlyArrayTransferred_;
+        llvm::Function* moveOnlyArrayTransferredFn_;
+    };
+
     // §30.7: complete the in-flight async iterator's PER-ADVANCE Task<bool> with
     // `hasValue` (true = a value was yielded into current_val; false = exhausted).
     // Unlike emitAsyncComplete, it does NOT free the frame (the frame persists

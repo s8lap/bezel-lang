@@ -968,6 +968,35 @@ void Emitter::emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,
     // block, which left smStateGEP_/smKind_/smStateBBs_/smDoneBB_/
     // smNextSuspendState_/smForInSrcFields_ live for the next function.
     StateMachineFrameScope smFrameScope(*this);
+    // fix #3705 (§27.5 / §28.9 / §28.11 / §30.2, v0.286): the two save/restore
+    // halves this emitter never had. `emitAsyncMethod` re-establishes the §27.5
+    // capture-cell family AND the borrowing-collection reclaim family for
+    // `resumeFn` in the pre-scan block below (since #1416/#1418 and
+    // #2132/#2142/#2143 respectively), but is ALSO reached mid-emission of an
+    // OUTER body by `buildSpecializedMethodFn` (LlvmBackend_Calls2.cpp ~L12080)
+    // when a generic async method is monomorphized inside one. That site saves
+    // the unwind, string and closure-release sets — it never grew a save for
+    // either of these two families, which is exactly the asymmetry the #3500
+    // comment on `CaptureReclaimSetScope` names ("which `emitAsyncMethod`
+    // already trips over today") and which issue 3705 asked this lane to audit.
+    //
+    // MEASURED on r12-cycle-1 (`bezelc --sanitize=address`, LSan on, 200
+    // activations), a generic async method specialised inside an outer async
+    // body that then declares one of its own:
+    //   outer `var ys: Array<int> := [5, 6, 7]`      24000 B / 400 allocs
+    //   outer `var g: () -> int := lambda() => k+1`    800 B / 200 allocs
+    // Both are the outer body's OWN reclaims silently going un-registered
+    // because its five/four gate tokens still name the specialisation's
+    // resumeFn. Direction is a LEAK in both cases; RESTORING a saved set can
+    // only put back a registration the outer body would have made anyway — it
+    // cannot arm a disposal that was not already armed before this emitter ran.
+    // // per §27.5, §28.9, §28.11
+    CaptureReclaimSetScope captureReclaimScope(*this);
+    BorrowingReclaimSetScope borrowingReclaimScope(*this);
+    // fix #3699 (§15.3 / §29.7 / §30.2, v0.286): and the same half for the
+    // §15.3 (#747) move-only inline-array TRANSFER set, whose re-establishment
+    // for `resumeFn` this commit adds in the pre-scan block below.
+    MoveOnlyArrayTransferScope moveOnlyArrayScope(*this);
     smKind_ = SuspendKind::Await;
 
     // §30.9 / §31.2 (#438): `await` is now supported in a try BODY, a catch ARM
@@ -1304,6 +1333,72 @@ void Emitter::emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         // sema-enforced), so no double-free on the non-throwing path. // per §28.3
         unwindIneligibleFn_ = resumeFn;
         collectUnwindIneligible(*ci.stmts);
+        // fix #3699 (§15.3 / §15.1.1 / §28.10 / §29.7 / §30.7, v0.286): the
+        // §15.3 (#747) move-only owning inline-array TRANSFER analysis must
+        // describe the RESUME fn (where the async body lowers) too. `registerInlineOwnedArrayDisposal`
+        // (LlvmBackend_Setup.cpp) opens with
+        //
+        //     if (currentFn_ != moveOnlyArrayTransferredFn_) return true;
+        //
+        // and `moveOnlyArrayTransferredFn_` was assigned in exactly two places
+        // (`emitFunctionBody` and the constructor-body setup, both in
+        // LlvmBackend_Setup.cpp), both keyed to the ENTRY fn. A state-machine
+        // body lowers with `currentFn_ == resumeFn`, so the gate was false for the
+        // WHOLE body and §15.1.1's "the array's auto-dispose pass disposes each
+        // non-null slot ... For locals, this happens at scope end" never
+        // happened in ANY state machine: the elements' DESTRUCTORS never ran.
+        // That is an observable semantic defect, not only a leak — measured
+        // with a `Cell` whose ctor/dtor bump a static counter, 200 activations
+        // of `var a: [2 owned]Cell? := [new Cell(1), new Cell(2)];`, full drain:
+        //
+        //   plain method (control)   total=600 n=0     clean
+        //   sync iterator            total=600 n=400   6400 B / 400 allocs
+        //   async method             total=600 n=400   6400 B / 400 allocs
+        //   async iterator           total=600 n=400   6400 B / 400 allocs
+        //
+        // `n=400` is 200 rounds x 2 slots whose destructors never ran.
+        //
+        // NO NEW PREDICATE (LANE_RULES §6): `collectMoveOnlyArrayTransferred`
+        // already computes the whole fact — it was simply never asked about this
+        // body. One call clears and re-populates the set over THESE statements;
+        // re-pin the token to resumeFn. Re-running the analysis over the SAME body is
+        // load-bearing and not merely re-pointing the token: the set is what
+        // suppresses disposal for a local whose slots were MOVED OUT, so a
+        // re-pointed-but-stale set would double-free a transferred array.
+        //
+        // ABANDONMENT (§29.7) / THROW. A plain `inlineOwnedArray` Disposal is
+        // neither `caughtException` nor `unwindOnly` and is NOT on the §27.5
+        // exclusion list in LlvmBackend_Stmts.cpp's yield handler (`closureRelease
+        // || boxedCellFree || boxedCellFreeDeferred || inlineOwnedArrayCell` —
+        // the NEIGHBOURING `inlineOwnedArrayCell`, which disposes elements
+        // THROUGH a capture cell, is excluded; the plain kind is not), so it now
+        // enrols in the `smIterCleanupAtState_` snapshot Dispose replays. That
+        // comment's own note — "gated on moveOnlyArrayTransferredFn_, a token
+        // this commit does not touch, so it is as inert in an iterator body after
+        // this change as it was before" — describes the state THIS commit ends:
+        // the entry is live for the first time. It runs exactly once for the
+        // reason every other entry in that snapshot relies on: Dispose stamps the
+        // DISPOSED sentinel (-2) before running the stack, exhaustion parks -1
+        // and the throw edge parks -1 (#3531), and neither state has a case in
+        // the resume switch. Both edges are probed at 200 activations under
+        // ASan/LSan as rows of the regression test, together with the
+        // transferred-out shape that must NOT be disposed here at all.
+        //
+        // ⚠ THE TWO LAMBDA VENUES ARE DELIBERATELY NOT FIXED HERE, and both are
+        // filed with measured repros. The SYNC lambda keeps the "safe leak,
+        // never a double-free" the guard's own comment documents (its body is
+        // lowered inline by `lowerLambda`, which has no emitter of its own).
+        // The ASYNC lambda leaks the same 6400 B / 400 — but for a DIFFERENT
+        // reason: `emitAsyncLambda`'s body block pushes a dispose scope and pops
+        // it with NO `emitDisposals` between, so NOTHING it registers is ever
+        // emitted on the normal edge (a `using var` and an `Array<T>` literal
+        // leak there too, while the async-METHOD twin of each is clean).
+        // Establishing this pass for its resume fn was measured to have ZERO
+        // effect and was reverted rather than shipped unprovable — issue 3728
+        // carries the root cause and the fix pointer.
+        // // per §15.3, §28.10, §29.7
+        collectMoveOnlyArrayTransferred(*ci.stmts);
+        moveOnlyArrayTransferredFn_ = resumeFn;
         // #1416 / #1418 / §27.5 / §28.9: the CAPTURE CELL of a frame-local that a
         // lambda captures (the `calloc` from boxLocalSlot) is freed at scope end by
         // the same boxedCellFree / deferred-cell-free machinery as in a synchronous
@@ -2153,70 +2248,30 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
     // pre-scan block below re-establishes (closureReleaseEligible, boxCapture,
     // cellFreeEligible, plus the three sibling sets). // per §27.5, §28.9
     CaptureReclaimSetScope captureReclaimScope(*this);
-    // fix #3697 (§28.9 / §28.11 / §30.7, v0.286): the save/restore half of the
-    // borrowing-collection reclaim re-establishment the resume preamble below
-    // adds — LANE_RULES §8's "a clear() on per-lowering state and a save/restore
-    // around nested emission are two halves of ONE contract". Same reason
-    // `CaptureReclaimSetScope` is on the line above: this emitter is reached
-    // mid-emission of an OUTER body by `instantiateGenericSpecialization`
+    // fix #3697 / fix #3705 (§28.9 / §28.11 / §30.7, v0.286): the save/restore
+    // half of the borrowing-collection reclaim re-establishment the resume
+    // preamble below adds — LANE_RULES §8's "a clear() on per-lowering state and
+    // a save/restore around nested emission are two halves of ONE contract".
+    // Same reason `CaptureReclaimSetScope` is on the line above: this emitter is
+    // reached mid-emission of an OUTER body by `instantiateGenericSpecialization`
     // (LlvmBackend_Calls2.cpp ~L12345/L12371), whose `SmFrameSaveScope` does NOT
     // cover these six sets or their five function tokens, so without this the
     // outer body would resume lowering with every `borrowing*/dict*/grouping/
     // set-literal/dict-literal` reclaim keyed to THIS iterator's resumeFn and
-    // would silently skip its own — a leak, in the direction this whole commit
-    // exists to close. Declared local to the member function (which grants it
-    // the function's access to Emitter's private members) rather than beside
-    // CaptureReclaimSetScope in LlvmBackend_impl.hpp because it guards exactly
-    // one call site. // per §28.9, §28.11
-    struct BorrowingReclaimSetScope {
-        explicit BorrowingReclaimSetScope(Emitter& e)
-            : e_(e),
-              borrowingArrayFreeEligible_(e.borrowingArrayFreeEligible_),
-              borrowingArrayFreeEligibleFn_(e.borrowingArrayFreeEligibleFn_),
-              dictMaterializerFreeEligible_(e.dictMaterializerFreeEligible_),
-              dictMaterializerFreeEligibleFn_(e.dictMaterializerFreeEligibleFn_),
-              groupingFreeEligible_(e.groupingFreeEligible_),
-              groupingFreeEligibleFn_(e.groupingFreeEligibleFn_),
-              setLiteralFreeEligible_(e.setLiteralFreeEligible_),
-              setLiteralFreeEligibleFn_(e.setLiteralFreeEligibleFn_),
-              dictLiteralFreeEligible_(e.dictLiteralFreeEligible_),
-              dictLiteralFreeEligibleFn_(e.dictLiteralFreeEligibleFn_),
-              literalTreeAggregateEligible_(e.literalTreeAggregateEligible_) {}
-        ~BorrowingReclaimSetScope() {
-            e_.borrowingArrayFreeEligible_ =
-                std::move(borrowingArrayFreeEligible_);
-            e_.borrowingArrayFreeEligibleFn_ = borrowingArrayFreeEligibleFn_;
-            e_.dictMaterializerFreeEligible_ =
-                std::move(dictMaterializerFreeEligible_);
-            e_.dictMaterializerFreeEligibleFn_ = dictMaterializerFreeEligibleFn_;
-            e_.groupingFreeEligible_ = std::move(groupingFreeEligible_);
-            e_.groupingFreeEligibleFn_ = groupingFreeEligibleFn_;
-            e_.setLiteralFreeEligible_ = std::move(setLiteralFreeEligible_);
-            e_.setLiteralFreeEligibleFn_ = setLiteralFreeEligibleFn_;
-            e_.dictLiteralFreeEligible_ = std::move(dictLiteralFreeEligible_);
-            e_.dictLiteralFreeEligibleFn_ = dictLiteralFreeEligibleFn_;
-            e_.literalTreeAggregateEligible_ =
-                std::move(literalTreeAggregateEligible_);
-        }
-        BorrowingReclaimSetScope(const BorrowingReclaimSetScope&) = delete;
-        BorrowingReclaimSetScope& operator=(const BorrowingReclaimSetScope&) =
-            delete;
-
-    private:
-        Emitter& e_;
-        std::unordered_set<const void*> borrowingArrayFreeEligible_;
-        llvm::Function* borrowingArrayFreeEligibleFn_;
-        std::unordered_set<const void*> dictMaterializerFreeEligible_;
-        llvm::Function* dictMaterializerFreeEligibleFn_;
-        std::unordered_set<const void*> groupingFreeEligible_;
-        llvm::Function* groupingFreeEligibleFn_;
-        std::unordered_set<const void*> setLiteralFreeEligible_;
-        llvm::Function* setLiteralFreeEligibleFn_;
-        std::unordered_set<const void*> dictLiteralFreeEligible_;
-        llvm::Function* dictLiteralFreeEligibleFn_;
-        std::unordered_set<const void*> literalTreeAggregateEligible_;
-    };
+    // would silently skip its own — a leak, in the direction #3697 exists to
+    // close.
+    //
+    // fix #3705 HOISTED the struct itself into LlvmBackend_impl.hpp beside
+    // `CaptureReclaimSetScope`: #3697 declared it function-local "because it
+    // guards exactly one call site", and it now guards three — the two sibling
+    // emitters were missing the identical half (measured: `emitIteratorMethod`
+    // 24000 B / 400, `emitAsyncMethod` 24000 B / 400). Not one byte of the
+    // 11-item member list changed in the move. // per §28.9, §28.11
     BorrowingReclaimSetScope borrowingReclaimScope(*this);
+    // fix #3699 (§15.3 / §29.7 / §30.7, v0.286): the same half for the §15.3
+    // (#747) move-only inline-array TRANSFER set, whose re-establishment for
+    // `resumeFn` this commit adds in the resume preamble below.
+    MoveOnlyArrayTransferScope moveOnlyArrayScope(*this);
     smKind_ = SuspendKind::AsyncYield;
 
     // §29.6 / §30.7 (#554): check for FORBIDDEN suspend positions in this async
@@ -2817,6 +2872,59 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
         // Mirror the synchronous setup. // per §28.3
         unwindIneligibleFn_ = resumeFn;
         collectUnwindIneligible(*ci.stmts);
+        // fix #3699 (§15.3 / §15.1.1 / §28.10 / §29.7 / §30.7, v0.286): the
+        // §15.3 (#747) move-only owning inline-array TRANSFER analysis must
+        // describe the RESUME fn (where the async-iterator body lowers) too. `registerInlineOwnedArrayDisposal`
+        // (LlvmBackend_Setup.cpp) opens with
+        //
+        //     if (currentFn_ != moveOnlyArrayTransferredFn_) return true;
+        //
+        // and `moveOnlyArrayTransferredFn_` was assigned in exactly two places
+        // (`emitFunctionBody` and the constructor-body setup, both in
+        // LlvmBackend_Setup.cpp), both keyed to the ENTRY fn. A state-machine
+        // body lowers with `currentFn_ == resumeFn`, so the gate was false for the
+        // WHOLE body and §15.1.1's "the array's auto-dispose pass disposes each
+        // non-null slot ... For locals, this happens at scope end" never
+        // happened in ANY state machine: the elements' DESTRUCTORS never ran.
+        // That is an observable semantic defect, not only a leak — measured
+        // with a `Cell` whose ctor/dtor bump a static counter, 200 activations
+        // of `var a: [2 owned]Cell? := [new Cell(1), new Cell(2)];`, full drain:
+        //
+        //   plain method (control)   total=600 n=0     clean
+        //   sync iterator            total=600 n=400   6400 B / 400 allocs
+        //   async method             total=600 n=400   6400 B / 400 allocs
+        //   async iterator           total=600 n=400   6400 B / 400 allocs
+        //
+        // `n=400` is 200 rounds x 2 slots whose destructors never ran.
+        //
+        // NO NEW PREDICATE (LANE_RULES §6): `collectMoveOnlyArrayTransferred`
+        // already computes the whole fact — it was simply never asked about this
+        // body. One call clears and re-populates the set over THESE statements;
+        // re-pin the token to resumeFn. Re-running the analysis over the SAME body is
+        // load-bearing and not merely re-pointing the token: the set is what
+        // suppresses disposal for a local whose slots were MOVED OUT, so a
+        // re-pointed-but-stale set would double-free a transferred array.
+        //
+        // ABANDONMENT (§29.7) / THROW. A plain `inlineOwnedArray` Disposal is
+        // neither `caughtException` nor `unwindOnly` and is NOT on the §27.5
+        // exclusion list in LlvmBackend_Stmts.cpp's yield handler (`closureRelease
+        // || boxedCellFree || boxedCellFreeDeferred || inlineOwnedArrayCell` —
+        // the NEIGHBOURING `inlineOwnedArrayCell`, which disposes elements
+        // THROUGH a capture cell, is excluded; the plain kind is not), so it now
+        // enrols in the `smIterCleanupAtState_` snapshot Dispose replays. That
+        // comment's own note — "gated on moveOnlyArrayTransferredFn_, a token
+        // this commit does not touch, so it is as inert in an iterator body after
+        // this change as it was before" — describes the state THIS commit ends:
+        // the entry is live for the first time. It runs exactly once for the
+        // reason every other entry in that snapshot relies on: Dispose stamps the
+        // DISPOSED sentinel (-2) before running the stack, exhaustion parks -1
+        // and the throw edge parks -1 (#3531), and neither state has a case in
+        // the resume switch. Both edges are probed at 200 activations under
+        // ASan/LSan as rows of the regression test, together with the
+        // transferred-out shape that must NOT be disposed here at all.
+        // // per §15.3, §28.10, §29.7
+        collectMoveOnlyArrayTransferred(*ci.stmts);
+        moveOnlyArrayTransferredFn_ = resumeFn;
         // fix #3697 / #2148 / #2142 / #2143 / #1003 / #1028 / #1930 / §28.9 /
         // §28.11 / §30.7 (v0.286): the SIXTH member of this emitter's
         // "re-establish this pass for the resume fn" family, and the last one
