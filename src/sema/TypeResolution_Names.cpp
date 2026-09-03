@@ -803,6 +803,49 @@ void Resolver::resolveTypeDecl(const ast::TypeDecl& td, Scope* parent) {
     // Positional fields (records).
     for (const auto& pf : td.positionalFields) {
         if (pf.type) resolveType(*pf.type, &typeScope);
+        // fix #3742 (§22.5 "Optional parameters and named arguments" /
+        // §22.10 "primary constructors", v0.286): the parameter's `:= Expr`
+        // DEFAULT is an expression position of the class HEADER, and nothing
+        // walked it either — the same gap, the same wild pointer. Measured on
+        // f517ddb: `class Holder(a: int, owned r: Res := new Res(77))` with `r`
+        // read in a body position SEGV'd on `new Holder(5)`. See the
+        // `primaryBaseCtorArgs` loop just below for the whole mechanism; these
+        // two are the header's only expression positions and they land
+        // together.
+        if (pf.defaultValue) resolveTypesInExpr(*pf.defaultValue, &typeScope);
+    }
+    // fix #3742 (§22.10 "When a class with a primary constructor has a base
+    // class, the base call appears in the inheritance clause" / §22.8 step 1
+    // "The base or chained constructor call", v0.286): the inheritance-clause
+    // base call's ARGUMENT expressions.
+    //
+    // An `ast::Type` node NESTED INSIDE an expression is resolved only by
+    // `resolveTypesInExpr` — which is exactly why issue #163 added that call
+    // for a field initializer one function down (`resolveMember`, whose
+    // comment names `new T()` as the reason). Nothing walked
+    // `primaryBaseCtorArgs`, so in `class Derived(a: int): Base(new Res(a))`
+    // the `Res` type node stayed unresolved; `ExprTC`'s NewExpr arm READS
+    // `ctx_.resolvedType(*ne->type)` (it never writes it) and therefore
+    // attached no exprType, and codegen's `lowerNew` returns nullptr the
+    // moment that read is null. `prePopulateBasePositionalFields` then took
+    // its `if (!v) { baseArgVals.clear(); break; }` arm, so the argument was
+    // silently NEVER EVALUATED and the base's positional slot kept its calloc
+    // zero. Measured on f517ddb: the §11.1 ResourceHolder shape printed
+    // `made=0 live=0` (the `new` never ran at all), and the body-referenced
+    // shape SEGV'd reading the zero slot as a pointer.
+    //
+    // Only an argument CARRYING a type node was affected — which is why an
+    // arithmetic, literal, interpolated-string or method-call argument of the
+    // very same class type always worked (measured: `Base(Fact.Make(a))`
+    // returns the right object). The discriminator is the unresolved type
+    // node, not the argument's type.
+    //
+    // `&typeScope` is the scope `ExprTC` already type-checks these same
+    // arguments in (ExprTypecheck.cpp's `primaryBaseCtorArgs` visit, #873):
+    // a primary-constructor parameter is reachable there as a positional
+    // FieldSymbol of the enclosing type.
+    for (const auto& arg : td.primaryBaseCtorArgs) {
+        if (arg.value) resolveTypesInExpr(*arg.value, &typeScope);
     }
     // §35.1 (v0.200, #2045): choice cases' payload fields — same Param shape
     // as record positional fields. Resolved here so the §35.4 classifier

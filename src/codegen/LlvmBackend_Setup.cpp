@@ -12521,15 +12521,21 @@ void Emitter::emitImplicitBase(const sema::TypeSymbol* cls, llvm::Value* obj,
             // `bp=7`). `ctorForArgs` also resolves an overload set by
             // argument type when more than one explicit constructor shares
             // arity `n`, which `ctorByArity` never attempted.
-            if (sema::ConstructorSymbol* bt =
-                    ctorForArgs(b, td->primaryBaseCtorArgs)) {
-                auto bit = ctorFns_.find(bt);
-                if (bit == ctorFns_.end() && ctx_.isImported(b)) {
-                    declareImportedCtor(bt);
-                    bit = ctorFns_.find(bt);
-                }
-                if (bit != ctorFns_.end() &&
-                    bit->second->arg_size() == n + 1) {
+            // fix #3742 (§22.8 step 1 / §22.10, v0.286): the resolution this
+            // arm used to spell inline is now `baseClauseExplicitCtor`
+            // (LlvmBackend_Exprs2.cpp) — byte-for-byte the same three steps
+            // (`ctorForArgs`, the on-demand imported declaration, the
+            // `arg_size() == n + 1` guard), stated once so that
+            // `prePopulateBasePositionalFields` can ask the SAME question and
+            // decline to evaluate these arguments a second time. `.cs` selects
+            // this arm exactly as the old `if (ctorForArgs(...))` did (so a
+            // resolved-but-not-callable constructor still falls through to the
+            // arity-0 fallback below and NOT into the route-to-primary `else
+            // if`); `.fn` is the callable.
+            BaseClauseExplicitCtor bce =
+                baseClauseExplicitCtor(b, td->primaryBaseCtorArgs);
+            if (sema::ConstructorSymbol* bt = bce.cs) {
+                if (bce.fn) {
                     std::vector<llvm::Value*> args;
                     args.push_back(obj);
                     bool ok = true;
@@ -12560,12 +12566,12 @@ void Emitter::emitImplicitBase(const sema::TypeSymbol* cls, llvm::Value* obj,
                         // Coerce a numeric arg to the base ctor's param type
                         // (a no-op for pointer/struct args, per §5.1).
                         v = coerceNumericToType(
-                            v, bit->second->getFunctionType()->getParamType(i + 1),
+                            v, bce.fn->getFunctionType()->getParamType(i + 1),
                             /*srcUnsigned=*/false);
                         args.push_back(v);
                     }
                     if (ok && args.size() == n + 1) {
-                        builder_.CreateCall(bit->second, args);
+                        builder_.CreateCall(bce.fn, args);
                         return;
                     }
                 }

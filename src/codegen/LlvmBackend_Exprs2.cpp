@@ -3462,6 +3462,34 @@ void Emitter::storePrimaryCtorPositionalArgs(
       }
 }
 
+// fix #3742 (§22.8 step 1 / §22.10, v0.286) — see the declaration comment in
+// LlvmBackend_impl.hpp for the measured double evaluation this exists to stop.
+// Every conjunct here is one `emitImplicitBase` already applied before it
+// lowered the arguments; stating them once is what keeps the evaluator and the
+// skipper from disagreeing about which of them runs (§2.8.3 rule 4).
+Emitter::BaseClauseExplicitCtor Emitter::baseClauseExplicitCtor(
+        const sema::TypeSymbol* base,
+        const std::vector<ast::CallArgument>& args) {
+    BaseClauseExplicitCtor r;
+    if (!base || args.empty()) return r;
+    r.cs = ctorForArgs(base, args);
+    if (!r.cs) return r;
+    auto it = ctorFns_.find(r.cs);
+    // Declaring an imported constructor on demand is idempotent and is what
+    // `emitImplicitBase` did at this point already; doing it here means both
+    // readers see the same answer on the FIRST query, not only after the
+    // emitter happened to have declared it for some other reason.
+    if (it == ctorFns_.end() && ctx_.isImported(base)) {
+        declareImportedCtor(r.cs);
+        it = ctorFns_.find(r.cs);
+    }
+    if (it == ctorFns_.end() ||
+        it->second->arg_size() != args.size() + 1)
+        return r;  // resolved, but NOT callable: the caller still owes the args
+    r.fn = it->second;
+    return r;
+}
+
 void Emitter::prePopulateBasePositionalFields(
         const sema::TypeSymbol* t,
         llvm::Value* obj,
@@ -3509,8 +3537,21 @@ void Emitter::prePopulateBasePositionalFields(
     auto* td = dynamic_cast<const ast::TypeDecl*>(t->decl);
 
     // --- Case (a): primary-ctor class with primaryBaseCtorArgs ---
+    // fix #3742 (§22.8 step 1 / §22.10, v0.286): ...but NOT when the base call
+    // resolves to an explicit base constructor that `emitImplicitBase` is about
+    // to lower these very expressions for and CALL. That call's own §22.8
+    // step 0 writes the same positional slots this loop would write, so
+    // evaluating them here as well is a second evaluation of one source
+    // expression — measured `bp=200 n=2` for `: Base(Counter.Next())` where
+    // §22.8 step 1 admits `bp=100 n=1`, and a second heap allocation (a leak)
+    // for `: Base(new Res())`. The predicate is `emitImplicitBase`'s own,
+    // stated once (`baseClauseExplicitCtor`) and read from both sides.
+    // `.fn`, not `.cs`: a resolved-but-not-callable constructor makes
+    // `emitImplicitBase` fall through WITHOUT lowering anything, so the
+    // pre-population still owes the arguments there.
     if (td && td->kind == ast::TypeDeclKind::Class &&
-        !td->primaryBaseCtorArgs.empty()) {
+        !td->primaryBaseCtorArgs.empty() &&
+        !baseClauseExplicitCtor(baseTs, td->primaryBaseCtorArgs).fn) {
         for (const auto& arg : td->primaryBaseCtorArgs) {
             if (!arg.value) { baseArgVals.clear(); break; }
             llvm::Value* v = lowerExpr(*arg.value);

@@ -16601,6 +16601,43 @@ private:
         const sema::ConstructorSymbol* cs,             // null if no explicit ctor
         bool ctorArgsByRefAbi = false);
 
+    // fix #3742 (§22.8 step 1 "The base or chained constructor call" / §22.10,
+    // v0.286): the ONE decision of WHO evaluates a §22.10 inheritance-clause
+    // base call's ARGUMENT expressions.
+    //
+    // Two emitters walk `ast::TypeDecl::primaryBaseCtorArgs` for a single
+    // construction: `prePopulateBasePositionalFields` (LlvmBackend_Exprs2.cpp),
+    // which stores them into the base's positional-parameter slots, and
+    // `emitImplicitBase` (LlvmBackend_Setup.cpp), which passes them to the
+    // base's EXPLICIT constructor when one resolves for them. BOTH lowered
+    // them, so on the shape where both run the same source expression was
+    // evaluated TWICE. Measured on f517ddb with
+    // `class Derived(a: int): Base(Counter.Next())` over a base declaring both
+    // a primary and an explicit constructor: `bp=200 n=2`, where §22.8 step 1
+    // admits exactly one evaluation of the base call's arguments (`n=1`,
+    // `bp=100`). Invisible for as long as every base-clause argument was a
+    // literal or a parameter read — and a second heap ALLOCATION the moment one
+    // is a `new`, which is precisely what #3742's sema half makes reachable.
+    //
+    // A non-null `.fn` means "emitImplicitBase WILL lower these arguments and
+    // call this function with them", so the pre-population must not evaluate
+    // them at all: the callee's own §22.8 step 0 writes the very slots the
+    // pre-population would have written (§22.10 requires every convenience
+    // constructor of a primary-constructor class to chain via `this(...)`, and
+    // `Resolver::checkTypeConstructorChains` enforces it, so the chain always
+    // reaches the primary). `.cs` is reported separately from `.fn` because
+    // `emitImplicitBase`'s control flow distinguishes them: a resolved
+    // constructor whose lowered function is missing or has the wrong arity
+    // falls through to the arity-0 fallback WITHOUT lowering the arguments, so
+    // the pre-population still owes them.
+    struct BaseClauseExplicitCtor {
+        sema::ConstructorSymbol* cs = nullptr;  // resolved by ctorForArgs
+        llvm::Function*          fn = nullptr;  // set only if it will be CALLED
+    };
+    BaseClauseExplicitCtor baseClauseExplicitCtor(
+        const sema::TypeSymbol* base,
+        const std::vector<ast::CallArgument>& args);
+
     // §22.8 step 0 / §22.10 (fix #3162): store a `new T(args)` call's positional
     // arguments into `t`'s own primary-constructor parameter field slots.
     //
