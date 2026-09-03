@@ -888,7 +888,31 @@ private:
     // in scope there — so a hit for both operands proves both live in the one
     // sealed frame, on a single nesting path, with comparable depths.
     // // per §28.3, §28.9, v0.286
-    std::unordered_map<const ast::Node*, int> enclosingFrameLocalDepth_;
+    //
+    // fix #3743 (§28.3 / §28.9 / §27.5, v0.286): the seal is a CHAIN of frames,
+    // not one frame. #3727 sealed only the frame `collectLocalDepths` walked
+    // first, and that walk deliberately never enters a `LambdaExpr` (the #3656
+    // statement grammar), so an owned local declared in an ENCLOSING LAMBDA's
+    // own body was a key of no map at all and `checkBorrowStoreEscape` returned
+    // before any comparison — issue 3743, a measured SIGSEGV one frame further
+    // out than 3727's. Each entry therefore carries WHICH frame declared it
+    // (`frameLevel`: 0 is the frame walked first, +1 per enclosing-lambda
+    // nesting step) beside its block depth WITHIN that frame, and the escape
+    // comparison is lexicographic on the pair. That is the same "strictly
+    // encloses" question the single-frame form asked, extended to the one axis
+    // it could not express: descending into a lambda body is a scope step
+    // exactly as descending into a `do ... end` is, and along the ancestor
+    // chain of ANY assignment both operands are in lexical scope, so their
+    // (frameLevel, blockDepth) pairs lie on one strictly-increasing path — the
+    // single-nesting-path argument above, one level up.
+    struct EnclosingFrameSite {
+        // -1 in BOTH fields is the DECLINE answer (`enclosingFrameSiteOf`'s
+        // miss), never a guess — see that declaration.
+        int frameLevel = -1;
+        int blockDepth = -1;
+    };
+    std::unordered_map<const ast::Node*, EnclosingFrameSite>
+        enclosingFrameLocalDepth_;
     bool enclosingFrameDepthsSealed_ = false;
     // fix #3727: the enclosing frame's OWNED-obligation facts, seeded lazily
     // from `enclosingFrameLocalDepth_` through the same `localIsOwnedObligation`
@@ -2387,7 +2411,35 @@ private:
     // belonging to some other frame does — the #3707 review's lesson
     // ("`td < 0` is not proof of *declared outside*") applied to this map by
     // deciding membership POSITIVELY. // per §28.3, §28.9, v0.286
-    int enclosingFrameDepthOf(const ast::Node* declNode) const;
+    EnclosingFrameSite enclosingFrameSiteOf(const ast::Node* declNode) const;
+
+    // fix #3743 (§28.3 *Borrow lifetime rules*, v0.286): "does the block that
+    // declares `outer` strictly enclose the block that declares `inner`?",
+    // asked of two sealed frame-chain sites. A shallower FRAME wins outright (a
+    // lambda body is scoped inside the block that declares the lambda, so every
+    // binding of an enclosing frame outlives every binding of an inner one);
+    // within ONE frame the pre-existing block-depth comparison decides. Both
+    // sites must be positive hits — a miss on either declines, exactly as the
+    // single-frame form did. // per §28.3, §28.9, v0.286
+    static bool frameSiteStrictlyEncloses(const EnclosingFrameSite& outer,
+                                          const EnclosingFrameSite& inner);
+
+    // fix #3743: seal the frame CHAIN. Called once, from `collectLocalDepths`,
+    // right after that function has sealed the frame it was handed (level 0):
+    // walks the lambda bodies nested inside `body` and seals each one's own
+    // `LocalDecl` depths under its lambda-nesting level. Frame membership and
+    // depth are recorded by the ONE authority that already records them
+    // (`collectLocalDepthsStmt`, run over each frame's statements with
+    // `localDepth_` swapped aside), and the set of lambda bodies is the ONE
+    // authority that already enumerates them for the escape driver
+    // (`collectBodyLambdas` / `collectBodyLambdasExpr`) — so a lambda this seal
+    // covers is exactly a lambda body `checkOneLambdaBodyEscapes` will check,
+    // and neither the depth rule nor the lambda grammar is respelled here.
+    // // per §28.3, §28.9, v0.286
+    void sealEnclosingFrameChain(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body);
+    void sealOneEnclosingFrame(
+        const std::vector<std::unique_ptr<ast::Stmt>>& stmts, int frameLevel);
 
     // fix #3727 (§28.3 *Borrow lifetime rules* / §28.9 / §27.5, v0.286): ask
     // `ownedLocalBorrowSource` — the SAME authority, not a second spelling of
@@ -2403,7 +2455,22 @@ private:
     // `checkBorrowStoreEscape` returns before any depth comparison. Called
     // only after the ordinary, body-scoped query has already come back empty.
     // // per §28.3, §28.9, §27.5, v0.286
-    sema::Symbol* enclosingFrameOwnedLocalBorrowSource(const ast::Expr& rhs);
+    //
+    // fix #3744 (§28.3 *Captured owned bindings* / *Auto-drop (affine)*,
+    // v0.286): `kinds` is passed straight through to `ownedLocalBorrowSource`,
+    // so the retry admits exactly the source kinds its CALLING CHANNEL admits —
+    // one axis, decided once, by #3746's argument rather than a second one
+    // here. `LocalOrOwnedParam` additionally installs the frame's `owned`
+    // PARAMETERS in the swapped-in `states_`: `enclosingFrameLocalDepth_`'s
+    // keys are declaration NODES and a `ParameterSymbol::decl` is null, so a
+    // frame seeded from that map alone holds no parameter and the widened
+    // channel would still resolve nothing for `owned p` (measured — the
+    // parameter twin of issue 3744's repro compiles rc=0 and SIGSEGVs both
+    // before and after fix #3746). The `owned`-ness question is asked of
+    // `symbolIsOwnedObligation`, the predicate #3746 added for exactly it.
+    // // per §28.3, §28.9, §27.5, v0.286
+    sema::Symbol* enclosingFrameOwnedLocalBorrowSource(const ast::Expr& rhs,
+                                                       OwnedSourceKinds kinds);
 
     // Issue #392 / §31.1: a returned bare catch-binding identifier
     // (`return ex;`) lets the in-flight exception instance escape the arm

@@ -5121,20 +5121,101 @@ void MethodOwnership::collectLocalDepths(
     // the one function that builds this map. See the member's declaration for
     // why "first call" is the enclosing frame on every path, and why a miss is
     // always the safe answer. // per §28.3, §28.9, v0.286
+    // fix #3743 (§28.3 / §28.9 / §27.5, v0.286): seal a CHAIN — this frame at
+    // level 0, and every lambda body nested inside it at its own lambda-nesting
+    // level. #3727's single frame left an owned local declared in an ENCLOSING
+    // LAMBDA's body a key of no map at all (this walk never enters a
+    // `LambdaExpr`), so `checkBorrowStoreEscape` returned before any comparison
+    // — issue 3743, measured: compiles rc=0, SIGSEGVs at run, while the
+    // byte-identical program with the same local one frame IN is rejected by
+    // #3727. See the member's declaration for why the (frameLevel, blockDepth)
+    // pair is comparable. // per §28.3, §28.9, v0.286
     if (!enclosingFrameDepthsSealed_) {
         enclosingFrameDepthsSealed_ = true;
-        enclosingFrameLocalDepth_ = localDepth_;
+        for (const auto& kv : localDepth_)
+            enclosingFrameLocalDepth_[kv.first] =
+                EnclosingFrameSite{/*frameLevel=*/0, /*blockDepth=*/kv.second};
+        sealEnclosingFrameChain(body);
     }
 }
 
-int MethodOwnership::enclosingFrameDepthOf(const ast::Node* declNode) const {
-    if (!declNode) return -1;
+// fix #3743 (§28.3 / §28.9 / §27.5, v0.286). See the declaration.
+void MethodOwnership::sealEnclosingFrameChain(
+    const std::vector<std::unique_ptr<ast::Stmt>>& body) {
+    // The lambda set is `collectBodyLambdas`', the SAME enumeration
+    // `checkLambdaBodyEscapes` drives its per-body passes from — so every frame
+    // sealed here is a frame that will be checked, and no third lambda grammar
+    // is introduced. The list is flat and pre-order, which does not by itself
+    // say how deeply nested each entry is; the nesting LEVEL is derived from
+    // the same enumeration by counting proper ancestors — `lam` is a proper
+    // descendant of `p` exactly when `collectBodyLambdasExpr(p)` yields it and
+    // `p != lam`. A lambda's ancestors form a chain (the AST is a tree), so the
+    // count IS its nesting level, with the frame `collectLocalDepths` was
+    // handed at level 0.
+    std::vector<const ast::LambdaExpr*> all;
+    for (const auto& s : body)
+        if (s) collectBodyLambdas(*s, all);
+    if (all.empty()) return;
+    std::unordered_map<const ast::LambdaExpr*, int> level;
+    for (const ast::LambdaExpr* lam : all) level[lam] = 1;
+    for (const ast::LambdaExpr* p : all) {
+        std::vector<const ast::LambdaExpr*> under;
+        collectBodyLambdasExpr(*p, under);
+        for (const ast::LambdaExpr* d : under)
+            if (d != p) {
+                auto it = level.find(d);
+                if (it != level.end()) ++it->second;
+            }
+    }
+    for (const ast::LambdaExpr* lam : all)
+        sealOneEnclosingFrame(lam->stmts, level[lam]);
+}
+
+// fix #3743: record ONE frame's own `LocalDecl` depths under `frameLevel`.
+// `localDepth_` is swapped aside for the walk so the caller's map is untouched
+// — the method frame's depths must keep meaning exactly what they meant, since
+// the method-scope readers of `localDepth_` (checkBorrowStoreEscape's own
+// td/sd arm, checkBareBorrowLoopCarriedEscape, ...) are not part of this fix.
+// The recording itself is `collectLocalDepthsStmt`, unchanged: the `LocalDecl`
+// arm, the #3520 catch-arm pre-record and the #3591 LOCALDECL-ONLY argument all
+// apply to a lambda body exactly as they do to a method body.
+// // per §28.3, §28.9, v0.286
+void MethodOwnership::sealOneEnclosingFrame(
+    const std::vector<std::unique_ptr<ast::Stmt>>& stmts, int frameLevel) {
+    if (stmts.empty()) return;
+    std::unordered_map<const ast::Node*, int> saved;
+    saved.swap(localDepth_);
+    // Depth 0 is this lambda body itself — the same convention
+    // `collectLocalDepths` uses for a method body (and the one
+    // `checkOneLambdaBodyEscapes` re-seeds with), so a depth compared WITHIN a
+    // frame means the same thing in every frame.
+    for (const auto& s : stmts)
+        if (s) collectLocalDepthsStmt(*s, 0);
+    for (const auto& kv : localDepth_)
+        enclosingFrameLocalDepth_[kv.first] =
+            EnclosingFrameSite{frameLevel, kv.second};
+    localDepth_.swap(saved);
+}
+
+MethodOwnership::EnclosingFrameSite MethodOwnership::enclosingFrameSiteOf(
+    const ast::Node* declNode) const {
+    if (!declNode) return EnclosingFrameSite{};
     auto it = enclosingFrameLocalDepth_.find(declNode);
-    return it == enclosingFrameLocalDepth_.end() ? -1 : it->second;
+    return it == enclosingFrameLocalDepth_.end() ? EnclosingFrameSite{}
+                                                 : it->second;
+}
+
+bool MethodOwnership::frameSiteStrictlyEncloses(
+    const EnclosingFrameSite& outer, const EnclosingFrameSite& inner) {
+    // A miss on either side declines — never a guess (#3707's lesson).
+    if (outer.frameLevel < 0 || inner.frameLevel < 0) return false;
+    if (outer.frameLevel != inner.frameLevel)
+        return outer.frameLevel < inner.frameLevel;
+    return outer.blockDepth < inner.blockDepth;
 }
 
 sema::Symbol* MethodOwnership::enclosingFrameOwnedLocalBorrowSource(
-    const ast::Expr& rhs) {
+    const ast::Expr& rhs, OwnedSourceKinds kinds) {
     // fix #3727 (§28.3 / §28.9 / §27.5, v0.286). See the declaration for why
     // this exists. The seed is built at most once per analyzer instance.
     if (!enclosingFrameOwnedStates_) {
@@ -5178,7 +5259,16 @@ sema::Symbol* MethodOwnership::enclosingFrameOwnedLocalBorrowSource(
         }
         enclosingFrameOwnedStates_ = std::move(seeded);
     }
-    if (enclosingFrameOwnedStates_->empty()) return nullptr;
+    // fix #3744: the `owned` PARAMETERS are added per QUERY, not baked into the
+    // cached seed, because they are admissible on some calling channels and not
+    // others (#3746's axis) and the seed is shared by all of them. Baking them
+    // in would let a `LocalOnly` query resolve a PARAMETER as
+    // `borrowSourceForExpr`'s first owned source and then discard it on the
+    // kind filter — silently LOSING the rejection of a program that also
+    // captures an owned local (a loud→quiet trade, LANE_RULES §6c). `states_`
+    // is assigned a COPY just below, so the insert is local to this query.
+    const bool wantOwnedParams = kinds == OwnedSourceKinds::LocalOrOwnedParam;
+    if (enclosingFrameOwnedStates_->empty() && !wantOwnedParams) return nullptr;
     // Swap the frame under the query, not the query under the frame: every
     // owned leg of `borrowSourceForExpr` is a read of `states_`, so asking it
     // about another frame is exactly installing that frame. The swap is
@@ -5191,7 +5281,25 @@ sema::Symbol* MethodOwnership::enclosingFrameOwnedLocalBorrowSource(
     // ENCLOSING frame contributes.
     BlockState savedStates = std::move(states_);
     states_ = *enclosingFrameOwnedStates_;
-    sema::Symbol* src = ownedLocalBorrowSource(rhs);
+    if (wantOwnedParams) {
+        // fix #3744 (c9-b33's measured note on issue 3744): a frame's `owned`
+        // parameters are in NO frame's depth map — `ParameterSymbol::decl` is
+        // null — so a seed built from that map alone resolves nothing for them
+        // and the widened Field / OutParam channel would still miss the
+        // parameter twin of the repro. `symbolIsOwnedObligation` is the ONE
+        // predicate that answers "is this binding an owned obligation of this
+        // frame" for a local and a parameter alike (fix #3746), including its
+        // `out owned` exclusion; `paramSyms_` is the enclosing method's own
+        // ordered parameter list, which `checkOneLambdaBodyEscapes` does not
+        // clear. // per §28.3 *Auto-drop (affine)*, v0.286
+        for (sema::Symbol* ps : paramSyms_) {
+            if (!ps || !symbolIsOwnedObligation(ps)) continue;
+            LocalOwnership st;
+            st.state = OwnershipState::Owned;
+            states_[ps] = st;
+        }
+    }
+    sema::Symbol* src = ownedLocalBorrowSource(rhs, kinds);
     states_ = std::move(savedStates);
     return src;
 }
@@ -5737,18 +5845,37 @@ bool MethodOwnership::checkBorrowStoreEscape(const ast::AssignmentStmt& as,
     // METHOD-level spelling has been rejected since #861. Re-ask the SAME
     // authority about the enclosing frame.
     //
-    // Restricted to the plain-LOCAL target channel (`dest == Dest::None &&
-    // targetLocal`): that is the one destination whose escape verdict is a
-    // DEPTH COMPARISON, and the enclosing frame supplies both depths (below).
-    // The `Dest::Field` / `Dest::OutParam` legs have no depth guard at all —
-    // they reject unconditionally once a source resolves — so widening them
-    // here would be a much larger behavioural change than the measured defect,
-    // argued separately; they stay exactly as they are (see the §6b diff in the
-    // commit body). // per §28.3, §28.9, §27.5, v0.286
+    // fix #3744 (§28.3 *Borrow lifetime rules* clause 1 / §28.3 *Captured owned
+    // bindings* / §28.9, v0.286): #3727 restricted this retry to the
+    // plain-LOCAL target channel and said why — that is the one destination
+    // whose verdict is a DEPTH COMPARISON, which the enclosing frame supplies
+    // (below), whereas the `Dest::Field` / `Dest::OutParam` legs reject
+    // unconditionally once a source resolves. That asymmetry is exactly the
+    // argument for widening them, not against it: those two destinations need
+    // NO depth operand because they outlive EVERY frame of this method
+    // unconditionally — a field's object is reached from outside the method,
+    // and an out/ref parameter's location is the caller's frame. §28.3's own
+    // clause 1 states it without a scope comparison at all ("A borrowed
+    // scope-bound *local* never satisfies the rule — it is disposed at the end
+    // of its scope, which a field of the object outlives — so a borrowed local
+    // may not be assigned to any field"), and §28.3 *Captured owned bindings*
+    // supplies the missing half for a store made from inside a closure: the
+    // captured owned binding is "uniformly in **borrow state**: reads borrow",
+    // so the read on the right of `this.h := lambda() => r.V();` is a borrow of
+    // `r` and not the §28.8 move-on-read the method-scope owned-field skip
+    // above admits. MEASURED on the parent (9feef15), each compiling rc=0 with
+    // NO diagnostic and dying by SIGSEGV at run, with the byte-identical
+    // METHOD-level spelling of each rejected:
+    //   `this.h := lambda(): int => r.V();`   over a method-scope `using var r`
+    //   `g := lambda(): int => r.V();`        the same through a `ref` param
+    //   `this.h := lambda(): int => p.V();`   over an `owned` parameter `p`
+    // (issue 3744, and c9-b33's parameter note on it — which is why `srcKinds`
+    // rather than the default travels into the retry). // per §28.3, §28.9
     bool srcFromEnclosingFrame = false;
-    if (!src && scope == EscapeScope::LambdaBody && dest == Dest::None &&
-        targetLocal) {
-        src = enclosingFrameOwnedLocalBorrowSource(*as.value);
+    if (!src && scope == EscapeScope::LambdaBody &&
+        ((dest == Dest::None && targetLocal) || dest == Dest::Field ||
+         dest == Dest::OutParam)) {
+        src = enclosingFrameOwnedLocalBorrowSource(*as.value, srcKinds);
         srcFromEnclosingFrame = src != nullptr;
     }
     if (!src) return false;
@@ -5928,9 +6055,25 @@ bool MethodOwnership::checkBorrowStoreEscape(const ast::AssignmentStmt& as,
             // reached the retry. The §31.1 legs below are therefore untouched
             // by this branch; it reaches only the §28.3 / §28.9 owned-local
             // diagnostics. // per §28.3, §28.9, §27.5, v0.286
-            const int etd = enclosingFrameDepthOf(targetLocal->decl);
-            const int esd = enclosingFrameDepthOf(src->decl);
-            if (etd >= 0 && esd >= 0 && etd < esd) {
+            //
+            // fix #3743 (§28.3 / §28.9 / §27.5, v0.286): the sealed map is a
+            // CHAIN of frames, so a site is a (frameLevel, blockDepth) pair and
+            // the comparison is lexicographic on it. #3727's single frame could
+            // only answer when BOTH decls belonged to the method frame; a
+            // source declared in an ENCLOSING LAMBDA's body was in no frame's
+            // map, so this branch declined and the program compiled and
+            // SIGSEGV'd (issue 3743). Everything the paragraph above argues is
+            // unchanged: membership is still decided POSITIVELY, a decl kind
+            // `collectLocalDepthsStmt` never records (a for-loop induction
+            // variable, a pattern binding, an inline `out var` anchor) is still
+            // a key of no frame and still declines here, and the two sites are
+            // still comparable — both operands are in lexical scope at this
+            // assignment, so their frames lie on ONE ancestor chain with one
+            // frame per level, and within a frame the pre-existing block-depth
+            // argument applies verbatim.
+            if (frameSiteStrictlyEncloses(
+                    enclosingFrameSiteOf(targetLocal->decl),
+                    enclosingFrameSiteOf(src->decl))) {
                 dest = Dest::OuterLocal;
                 outerLocalIsClosureCapture = hasLambda(*as.value);
             } else {
