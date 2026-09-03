@@ -1844,92 +1844,37 @@ llvm::Value* Emitter::lowerToLazyEnumerator(const ast::Expr& recvExpr,
             {
                 llvm::Value* idxB = builder_.CreateLoad(i64(), idxSlot);
 
-                // --- decode key (mirrors lowerDictEntryFor) ---
+                // --- decode key (fix #3754 / narrow #3717 / §4.8 / §28.9:
+                // routed through the shared decodeDictStringKeyAt /
+                // decodeDictGenericKeyAt helpers, declared in
+                // LlvmBackend_impl.hpp and defined beside lowerDictEntryFor
+                // in LlvmBackend_Stmts.cpp. This materializer frees the raw
+                // key pointer IMMEDIATELY below — unlike the for-in loop's
+                // deferred incBB release, this loop has no increment block —
+                // unchanged from before this fix. The third branch (neither
+                // string nor generic-backed) mirrors lowerDictEntryFor's own
+                // "should not happen" null fallback verbatim.) ---
                 llvm::Value* keyDecoded;
                 if (isStringKey) {
-                    auto* mallocFn = declareC("malloc", ptrTy(), {i64()});
-                    auto* memcpyFn = declareC("memcpy", ptrTy(),
-                                              {ptrTy(), ptrTy(), i64()});
-                    auto* callocFn = declareC("calloc", ptrTy(), {i64(), i64()});
-                    auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
-                    uint64_t strSz =
-                        dl.getTypeAllocSize(stringType());
-                    llvm::Value* kpPtr =
-                        builder_.CreateGEP(ptrTy(), keysArr, idxB);
-                    llvm::Value* kp   = builder_.CreateLoad(ptrTy(), kpPtr);
-                    llvm::Value* lpPtr =
-                        builder_.CreateGEP(i64(), lensArr, idxB);
-                    llvm::Value* kl   = builder_.CreateLoad(i64(), lpPtr);
-                    llvm::Value* dataSz =
-                        builder_.CreateAdd(kl, builder_.getInt64(1));
-                    llvm::Value* dataCpy =
-                        builder_.CreateCall(mallocFn, {dataSz});
-                    builder_.CreateCall(memcpyFn, {dataCpy, kp, kl});
-                    llvm::Value* nulPtr =
-                        builder_.CreateGEP(i8Ty, dataCpy, kl);
-                    builder_.CreateStore(
-                        llvm::ConstantInt::get(i8Ty, 0), nulPtr);
-                    llvm::Value* strObj = builder_.CreateCall(
-                        callocFn,
-                        {builder_.getInt64(1), builder_.getInt64((int64_t)strSz)});
-                    builder_.CreateStore(
-                        dataCpy,
-                        builder_.CreateStructGEP(stringType(), strObj, 0));
-                    builder_.CreateStore(
-                        kl,
-                        builder_.CreateStructGEP(stringType(), strObj, 1));
-                    builder_.CreateStore(
-                        llvm::ConstantInt::get(i8Ty, 1),
-                        builder_.CreateStructGEP(stringType(), strObj, 2));
-                    initStringRc(strObj);
-                    // Free the raw key bytes from bz_dict_keys_str (same as
-                    // lowerDictEntryFor's incBB per-slot free).
-                    builder_.CreateCall(freeFn, {kp});
-                    keyDecoded = strObj;
+                    auto strPr = decodeDictStringKeyAt(keysArr, lensArr, idxB);
+                    keyDecoded = strPr.first;
+                    builder_.CreateCall(freeFn, {strPr.second});
                 } else if (useGen) {
-                    llvm::Value* kpPtr =
-                        builder_.CreateGEP(ptrTy(), keysArr, idxB);
-                    llvm::Value* keyPtr =
-                        builder_.CreateLoad(ptrTy(), kpPtr);
-                    keyDecoded =
-                        builder_.CreateLoad(keyLlvm, keyPtr, "dmat.kgen");
-                    // Free the malloc'd raw-bytes key copy (same as
-                    // lowerDictEntryFor's incBB per-slot free for useGen).
-                    builder_.CreateCall(freeFn, {keyPtr});
+                    auto genPr = decodeDictGenericKeyAt(
+                        keyLlvm, keysArr, idxB, "dmat.kgen");
+                    keyDecoded = genPr.first;
+                    builder_.CreateCall(freeFn, {genPr.second});
                 } else {
                     keyDecoded = llvm::Constant::getNullValue(keyLlvm);
                 }
 
-                // --- decode value (mirrors lowerDictEntryFor). fix #3758:
-                // struct-load whenever `valLlvm` itself lowers to an LLVM
-                // struct — record OR nullable-value-type OR a value-like
-                // choice (a bare choice also lowers to a struct; the OLD
-                // `valRec || (valNullableVal && isStructTy())` predicate
-                // excluded that third case and made the branch below try to
-                // `trunc` an i64 into a struct type, the exact IR-verifier
-                // crash issue #3758 reports for `d.Select(...)` /
-                // `d.Where(...)` etc. over a `Dictionary<K, Choice>`). ---
-                llvm::Value* vpPtr =
-                    builder_.CreateGEP(ptrTy(), valsArr, idxB);
-                llvm::Value* slotV = builder_.CreateLoad(ptrTy(), vpPtr);
-                llvm::Value* valDecoded;
-                if (valLlvm->isStructTy()) {
-                    valDecoded = builder_.CreateLoad(
-                        valLlvm, slotV, valRec ? "dmat.vrec" : "dmat.vnv");
-                } else if (!valLlvm->isPointerTy()) {
-                    llvm::Value* asI64 = builder_.CreatePtrToInt(slotV, i64());
-                    if (valLlvm->isDoubleTy())
-                        valDecoded = builder_.CreateBitCast(asI64, valLlvm);
-                    else if (valLlvm->isFloatTy())
-                        valDecoded = builder_.CreateBitCast(
-                            builder_.CreateTrunc(asI64, i32()), valLlvm);
-                    else if (valLlvm->isIntegerTy(64))
-                        valDecoded = asI64;
-                    else
-                        valDecoded = builder_.CreateTrunc(asI64, valLlvm);
-                } else {
-                    valDecoded = slotV;
-                }
+                // --- decode value (fix #3754: routed through
+                // decodeDictValueAt; fix #3758 already derives the
+                // struct-vs-scalar decision from valLlvm itself inside that
+                // helper, so this call is behaviour-identical to the inline
+                // isStructTy() check it replaces) ---
+                llvm::Value* valDecoded = decodeDictValueAt(
+                    valLlvm, valsArr, idxB, valRec ? "dmat.vrec" : "dmat.vnv");
 
                 // Store key at field 0, value at field 1 and append.
                 builder_.CreateStore(

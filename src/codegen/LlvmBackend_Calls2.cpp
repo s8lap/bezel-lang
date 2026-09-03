@@ -14271,72 +14271,36 @@ llvm::Value* Emitter::wrapSortedDictionaryAsIEnumerable(
     {
         llvm::Value* idxB = builder_.CreateLoad(i64(), idxSlot);
 
-        // --- decode key ---
+        // --- decode key (fix #3754 / narrow #3717 / §4.8 / §28.9: routed
+        // through the shared decodeDictStringKeyAt / decodeDictGenericKeyAt
+        // helpers, declared in LlvmBackend_impl.hpp and defined beside
+        // lowerDictEntryFor in LlvmBackend_Stmts.cpp. This function frees the
+        // raw key pointer IMMEDIATELY below — it has no incBB, unlike the
+        // for-in loop's deferred release — unchanged from before this fix.
+        // Only two branches here (isStringKey / else), matching this
+        // function's own `useGen = !isStringKey` — a strict complement, so
+        // there is no third "neither" case to preserve, unlike
+        // lowerToLazyEnumerator's dict arm.) ---
         llvm::Value* keyDecoded;
         if (isStringKey) {
-            auto* mallocFn = declareC("malloc", ptrTy(), {i64()});
-            auto* memcpyFn = declareC("memcpy", ptrTy(),
-                                      {ptrTy(), ptrTy(), i64()});
-            auto* callocFn = declareC("calloc", ptrTy(), {i64(), i64()});
-            auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
-            uint64_t strSz = module_->getDataLayout().getTypeAllocSize(stringType());
-            llvm::Value* kpPtr = builder_.CreateGEP(ptrTy(), keysArr, idxB);
-            llvm::Value* kp    = builder_.CreateLoad(ptrTy(), kpPtr);
-            llvm::Value* lpPtr = builder_.CreateGEP(i64(), lensArr, idxB);
-            llvm::Value* kl    = builder_.CreateLoad(i64(), lpPtr);
-            llvm::Value* dataSz  = builder_.CreateAdd(kl, builder_.getInt64(1));
-            llvm::Value* dataCpy = builder_.CreateCall(mallocFn, {dataSz});
-            builder_.CreateCall(memcpyFn, {dataCpy, kp, kl});
-            llvm::Value* nulPtr = builder_.CreateGEP(i8Ty, dataCpy, kl);
-            builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 0), nulPtr);
-            llvm::Value* strObj = builder_.CreateCall(
-                callocFn,
-                {builder_.getInt64(1), builder_.getInt64((int64_t)strSz)});
-            builder_.CreateStore(dataCpy,
-                builder_.CreateStructGEP(stringType(), strObj, 0));
-            builder_.CreateStore(kl,
-                builder_.CreateStructGEP(stringType(), strObj, 1));
-            builder_.CreateStore(
-                llvm::ConstantInt::get(i8Ty, 1),
-                builder_.CreateStructGEP(stringType(), strObj, 2));
-            initStringRc(strObj);
-            builder_.CreateCall(freeFn, {kp});
-            keyDecoded = strObj;
+            auto strPr = decodeDictStringKeyAt(keysArr, lensArr, idxB);
+            keyDecoded = strPr.first;
+            builder_.CreateCall(freeFn, {strPr.second});
         } else {
-            llvm::Value* kpPtr = builder_.CreateGEP(ptrTy(), keysArr, idxB);
-            llvm::Value* keyPtr = builder_.CreateLoad(ptrTy(), kpPtr);
-            keyDecoded = builder_.CreateLoad(keyLlvm, keyPtr, "sdenum.kgen");
-            builder_.CreateCall(freeFn, {keyPtr});
+            auto genPr = decodeDictGenericKeyAt(
+                keyLlvm, keysArr, idxB, "sdenum.kgen");
+            keyDecoded = genPr.first;
+            builder_.CreateCall(freeFn, {genPr.second});
         }
 
-        // --- decode value. fix #3758: struct-load whenever `valLlvm` itself
-        // lowers to an LLVM struct — record OR nullable-value-type OR a
-        // value-like choice (see the field declaration comment above; the OLD
-        // predicate excluded a bare struct-lowering choice and made the
-        // branch below try to `trunc` an i64 into a struct type). Reachable
-        // via `sd.GetEnumerator()` called directly (LlvmBackend_Calls2.cpp's
-        // own explicit-call arm, ungated by `dictEntryWrapShapeSupported`) for
-        // a `SortedDictionary<K, Choice>` even before this fix. ---
-        llvm::Value* vpPtr = builder_.CreateGEP(ptrTy(), valsArr, idxB);
-        llvm::Value* slotV = builder_.CreateLoad(ptrTy(), vpPtr);
-        llvm::Value* valDecoded;
-        if (valLlvm->isStructTy()) {
-            valDecoded = builder_.CreateLoad(
-                valLlvm, slotV, valRec ? "sdenum.vrec" : "sdenum.vnv");
-        } else if (!valLlvm->isPointerTy()) {
-            llvm::Value* asI64 = builder_.CreatePtrToInt(slotV, i64());
-            if (valLlvm->isDoubleTy())
-                valDecoded = builder_.CreateBitCast(asI64, valLlvm);
-            else if (valLlvm->isFloatTy())
-                valDecoded = builder_.CreateBitCast(
-                    builder_.CreateTrunc(asI64, i32()), valLlvm);
-            else if (valLlvm->isIntegerTy(64))
-                valDecoded = asI64;
-            else
-                valDecoded = builder_.CreateTrunc(asI64, valLlvm);
-        } else {
-            valDecoded = slotV;
-        }
+        // --- decode value (fix #3754: routed through decodeDictValueAt;
+        // fix #3758 already derives the struct-vs-scalar decision from
+        // valLlvm itself inside that helper — reachable via
+        // `sd.GetEnumerator()` called directly, this function's own
+        // explicit-call arm ungated by `dictEntryWrapShapeSupported`, for a
+        // `SortedDictionary<K, Choice>` even before this fix) ---
+        llvm::Value* valDecoded = decodeDictValueAt(
+            valLlvm, valsArr, idxB, valRec ? "sdenum.vrec" : "sdenum.vnv");
 
         builder_.CreateStore(keyDecoded,
             builder_.CreateStructGEP(entryStTy, entrySlot, 0));
