@@ -3308,6 +3308,57 @@ bool ctorChainsViaThis(const sema::ConstructorSymbol* cs) {
 
 }  // namespace
 
+// fix #3777 (§22.5 "Optional parameters and named arguments" / §22.10 "primary
+// constructors" / §22.8 step 0, v0.286): the ONE materialization of a §22.10
+// positional parameter's §22.5 default. Extracted verbatim from
+// `storePrimaryCtorPositionalArgs`, whose two channels this used to be, because
+// `prePopulateBasePositionalFields` now has to fill the same omitted slot for a
+// BASE class and a second spelling of "what value does an omitted positional
+// parameter take" is the defect class CLAUDE.md §6 names.
+//
+// LOCAL (`posParam->defaultValue`): lowered under the OUTER substitution but
+// with `currentThis_ = obj`, because the default may read EARLIER primary-ctor
+// parameters on the SAME list (§22.5 "Permitted default-value expressions") and
+// those live in `obj`'s captured field slots, not in the enclosing scope. Both
+// callers store slot `i` before evaluating slot `i+1`'s default, which is the
+// left-to-right order that rule relies on.
+//
+// IMPORTED (`posParam->defaultText`): folded through
+// `lowerImportedPositionalDefault` — #3202's REC_POSPARAM_DEFAULT text through
+// the same `foldImportedConstText` every other imported constant read uses.
+//
+// Returns null when the parameter declares no default at all, and when the
+// default failed to lower (`lowerImportedPositionalDefault` has already
+// reported in that case); both callers then leave the slot alone.
+llvm::Value* Emitter::positionalParamDefaultValue(
+        const sema::FieldSymbol& fs,
+        llvm::Value* obj,
+        const std::unordered_map<std::string_view, llvm::Type*>& outerSubst,
+        const std::unordered_map<std::string_view, const sema::TypeRef*>&
+            outerSemaTy) {
+    if (!fs.posParam) return nullptr;
+    if (fs.posParam->defaultValue) {
+        // local — evaluate under the outer substitution, with
+        // `currentThis_ = obj` so earlier primary-ctor params resolve through
+        // their captured slots.
+        llvm::Value* savedThisForArg = currentThis_;
+        currentThis_ = obj;
+        auto posSubst = genericSubst_;
+        auto posSemaTy = genericSubstSemaTy_;
+        genericSubst_ = outerSubst;
+        genericSubstSemaTy_ = outerSemaTy;
+        llvm::Value* defaultV = lowerExpr(*fs.posParam->defaultValue);
+        genericSubst_ = std::move(posSubst);
+        genericSubstSemaTy_ = std::move(posSemaTy);
+        currentThis_ = savedThisForArg;
+        return defaultV;
+    }
+    if (!fs.posParam->defaultText.empty())
+        return lowerImportedPositionalDefault(fs);  // imported — textual
+    return nullptr;
+}
+
+
 // §22.8 step 0 / §22.10 (fix #3162) — see LlvmBackend_impl.hpp for the
 // contract and for why this is a method rather than two copies.
 void Emitter::storePrimaryCtorPositionalArgs(
@@ -3473,25 +3524,15 @@ void Emitter::storePrimaryCtorPositionalArgs(
                       // half of #3213's path.
                       // `lowerImportedPositionalDefault` materializes the
                       // constant on demand.
-                      if (fs->posParam->defaultValue) {
-                          // local — evaluate under the outer substitution,
-                          // with `currentThis_ = obj` so earlier
-                          // primary-ctor params resolve through their
-                          // captured slots.
-                          llvm::Value* savedThisForArg = currentThis_;
-                          currentThis_ = obj;
-                          auto posSubst = genericSubst_;
-                          auto posSemaTy = genericSubstSemaTy_;
-                          genericSubst_ = outerSubst;
-                          genericSubstSemaTy_ = outerSemaTy;
-                          defaultV = lowerExpr(*fs->posParam->defaultValue);
-                          genericSubst_ = std::move(posSubst);
-                          genericSubstSemaTy_ = std::move(posSemaTy);
-                          currentThis_ = savedThisForArg;
-                      } else {
-                          // imported — fold the textual default
-                          defaultV = lowerImportedPositionalDefault(*fs);
-                      }
+                      // fix #3777 (§22.5 / §22.10 / §22.8 step 0, v0.286):
+                      // the two channels are now `positionalParamDefaultValue`
+                      // — the same body, stated once, so that the BASE-level
+                      // pre-population (`prePopulateBasePositionalFields`,
+                      // below) fills an omitted defaulted positional slot by
+                      // the identical rule instead of leaving it calloc-zero.
+                      defaultV = positionalParamDefaultValue(*fs, obj,
+                                                             outerSubst,
+                                                             outerSemaTy);
                       if (!defaultV) continue;
                   } else {
                       // No arg, no default — leave the slot calloc-zero
@@ -3651,8 +3692,34 @@ Emitter::BaseClauseExplicitCtor Emitter::baseClauseExplicitCtor(
         declareImportedCtor(r.cs);
         it = ctorFns_.find(r.cs);
     }
+    // fix #3777 (§22.8 step 1 / §22.10 / §22.5, v0.286): the callable test is
+    // against the resolved constructor's FORMAL count, not the base clause's
+    // ARGUMENT count. `ctorForArgs` admits an omitted §22.5-defaulted tail (fix
+    // #3082), so `class D(v: int) : P(v)` over `P.constructor(n: int, s: string
+    // := "d")` resolved `r.cs` and then failed this guard — "resolved, but not
+    // callable" — and `emitImplicitBase` fell through to its arity-0 fallback,
+    // which found no arity-0 constructor either, so the base was NEVER
+    // CONSTRUCTED: `s` stayed a null string pointer and the first read SEGV'd
+    // (issue 3777, the §22.10 base-clause face of arm (b)). `emitImplicitBase`
+    // now fills the omitted tail from the parameters' §22.5 defaults, exactly
+    // as `emitChainCall` and every `new` site do.
+    //
+    // A NAMED clause argument keeps the pre-#3777 exact-arity rule, and the
+    // test lives HERE rather than at the caller so that both readers of this
+    // predicate — `emitImplicitBase`, which evaluates the clause arguments, and
+    // `prePopulateBasePositionalFields`, which declines to evaluate them a
+    // second time — keep answering identically (the #3742 contract). The
+    // caller's fill loop pairs clause argument `i` with formal `i`
+    // POSITIONALLY, so it can only complete a TRAILING omitted tail; declaring
+    // a named short clause callable would make the evaluator skip it and the
+    // caller emit nothing.
+    bool clauseAllPositional = true;
+    for (const auto& a : args)
+        if (!a.name.empty()) { clauseAllPositional = false; break; }
+    const std::size_t nFormals = sema::formalParamCount(*r.cs);
     if (it == ctorFns_.end() ||
-        it->second->arg_size() != args.size() + 1)
+        it->second->arg_size() != nFormals + 1 ||
+        (!clauseAllPositional && nFormals != args.size()))
         return r;  // resolved, but NOT callable: the caller still owes the args
     r.fn = it->second;
     return r;
@@ -3815,13 +3882,6 @@ void Emitter::prePopulateBasePositionalFields(
         }
     }
 
-    if (baseArgVals.empty()) {
-        // No base-call args determined — nothing to pre-populate.
-        // Still recurse in case the base's own base needs pre-population.
-        prePopulateBasePositionalFields(baseTs, obj, {}, nullptr);
-        return;
-    }
-
     // Store the base-call arg values into the base's positional-param field slots.
     llvm::StructType* baseSt = classStruct(baseTs);
     std::size_t numToStore = std::min(baseArgVals.size(), basePosFields.size());
@@ -3834,6 +3894,60 @@ void Emitter::prePopulateBasePositionalFields(
         llvm::Type* fieldTy = baseSt->getElementType(idxIt->second);
         v = coerceNumericToType(v, fieldTy, /*srcUnsigned=*/false);
         builder_.CreateStore(v, builder_.CreateStructGEP(baseSt, obj, idxIt->second));
+    }
+
+    // fix #3777 (§22.5 "Optional parameters and named arguments" / §22.10 /
+    // §22.8 step 0, v0.286): every positional slot the base call did NOT supply
+    // takes its §22.5 DEFAULT. This loop is what completes this function's own
+    // contract — "the base's positional-param field slots hold the values the
+    // base call passed" — because §22.5 says the value an omitted defaulted
+    // parameter is passed IS its default. Without it the slot kept its calloc
+    // zero and the base's field initializers, and every later read, saw it:
+    //
+    //   class P(n: int, s: string := "d") ... end P;
+    //   class D : P  public constructor(v: int) base(v); end constructor; end D;
+    //   new D(7).Show()      // SEGV — `s` is a null string pointer
+    //   class D(v: int) : P(v)                      // the §22.10 base-clause
+    //                                               // face: the same SEGV
+    //
+    // (issue 3777 arm (b) and its base-clause twin; measured on r12-cycle-1.)
+    // The `int` twin was non-fatal and therefore worse — it read back 0 rather
+    // than the declared default, compiling clean.
+    //
+    // The two arms above supply slots `[0, numToStore)` and never a later one:
+    // both evaluate the base call's arguments left to right, and a base call
+    // with NAMED arguments publishes no binding at this site, so it produces no
+    // `baseArgVals` at all and reaches this loop with `numToStore == 0` — which
+    // is the correct conservative answer for it (a named base call that omits a
+    // default is the pre-existing named-arg chain-binding gap, filed separately;
+    // filling every slot from its default would be wrong there, and this loop
+    // does not, because a required slot has no default to fill from).
+    //
+    // Runs BEFORE the `baseArgVals.empty()` early return on purpose: a `base()`
+    // with no arguments at all into a base whose positional parameters are ALL
+    // defaulted is exactly the same defect (measured: SEGV), and it produces no
+    // `baseArgVals`.
+    for (std::size_t i = numToStore; i < basePosFields.size(); ++i) {
+        sema::FieldSymbol* fs = basePosFields[i];
+        auto idxIt = fieldIndex_.find(fs);
+        if (idxIt == fieldIndex_.end()) continue;
+        // The ONE §22.5 positional-default materialization (local `:= Expr`,
+        // imported rendered text) — shared with §22.8 step 0's own store,
+        // `storePrimaryCtorPositionalArgs`. Null means "no default declared":
+        // leave the slot calloc-zero, exactly as before this fix.
+        llvm::Value* v = positionalParamDefaultValue(*fs, obj, genericSubst_,
+                                                     genericSubstSemaTy_);
+        if (!v) continue;
+        llvm::Type* fieldTy = baseSt->getElementType(idxIt->second);
+        v = coerceNumericToType(v, fieldTy, /*srcUnsigned=*/false);
+        builder_.CreateStore(v, builder_.CreateStructGEP(baseSt, obj, idxIt->second));
+    }
+
+    if (baseArgVals.empty()) {
+        // No base-call args determined — nothing more to pre-populate.
+        // Still recurse in case the base's own base needs pre-population.
+        prePopulateBasePositionalFields(baseTs, obj, {}, nullptr);
+        return;
     }
 
     // Recurse: the base class itself may also have a base with positional params

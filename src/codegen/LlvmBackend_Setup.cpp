@@ -11822,6 +11822,69 @@ int Emitter::ctorArityCount(const sema::TypeSymbol* cls, std::size_t n,
 }
 
 
+// fix #3777 (§22.5 "Optional parameters and named arguments" / §22.8 step 1 /
+// §12.8 / §22.10, v0.286) — see LlvmBackend_impl.hpp for the contract.
+//
+// The ONE omitted-§22.5-tail fill for a CONSTRUCTOR call in this file, and the
+// ONE place the LOCAL/IMPORTED split for such a call is decided. Two callers,
+// both §22.8 step 1: the explicit `this(...)` / `base(...)` chain
+// (`emitChainCall`) and the §22.10 inheritance-clause base call
+// (`emitImplicitBase`). Both used to select their target by EXACT arity and so
+// never had a tail to fill; both now select it the way a `new` site does
+// (`ctorForArgs`, which has admitted an omitted defaulted tail since fix
+// #3082), and "what value does an omitted parameter take" must have exactly one
+// answer in the emitter (CLAUDE.md §6) — which is why the LOCAL arm delegates
+// to `fillOmittedParamDefaults`, `buildOrderedArgs`' own body, rather than
+// restating it.
+//
+// `args[0]` is the receiver and `args[1..]` the arguments already lowered, in
+// parameter order; the filled slots are appended. Returns false when an omitted
+// slot declares no default, or its default failed to lower (the imported arm
+// has already reported in that case) — the caller then abandons the call, which
+// is exactly what it did before #3777 for these shapes.
+bool Emitter::fillOmittedCtorArgs(const sema::ConstructorSymbol& target,
+                                  llvm::FunctionType* fnTy,
+                                  bool coerceNumericDefaults,
+                                  std::vector<llvm::Value*>& args,
+                                  bool* outIsLocal) {
+    // A LOCAL constructor carries its source-written `ast::Param` list, whose
+    // `defaultValue` is the real `ast::Expr` — strictly better than any
+    // rendered text (it can read an earlier parameter, `default(T)`, …). An
+    // IMPORTED one ships no `ast::ConstructorDecl` at all (the #2374 shape), so
+    // its defaults ride `ParameterSymbol::defaultText` and fold through
+    // `importedCtorDefaultArgValue` — the same helper the imported `new`-site
+    // fill uses (LlvmBackend_Exprs2.cpp, fix #3082).
+    auto* cd = dynamic_cast<const ast::ConstructorDecl*>(target.decl);
+    if (outIsLocal) *outIsLocal = cd != nullptr;
+    const std::size_t nFormals = target.params.size();
+    if (args.empty() || args.size() >= nFormals + 1) return true;  // nothing omitted
+    const std::size_t nSupplied = args.size() - 1;
+    std::vector<llvm::Value*> ordered(nFormals, nullptr);
+    for (std::size_t k = 0; k < nSupplied; ++k) ordered[k] = args[k + 1];
+    if (cd) {
+        if (cd->params.size() != nFormals) return false;
+        if (!fillOmittedParamDefaults(cd->params, ordered,
+                                      /*orderedExprs=*/nullptr))
+            return false;
+    } else {
+        for (std::size_t k = nSupplied; k < nFormals; ++k) {
+            ordered[k] = importedCtorDefaultArgValue(target, k);
+            if (!ordered[k]) return false;
+        }
+    }
+    for (std::size_t k = nSupplied; k < nFormals; ++k) {
+        llvm::Value* dv = ordered[k];
+        // §5.1: widen an int default landing in a wider numeric formal, as the
+        // imported `new`-site fill does. A no-op for a non-numeric pair.
+        if (coerceNumericDefaults && fnTy && k + 1 < fnTy->getNumParams())
+            dv = coerceNumericToType(dv, fnTy->getParamType(k + 1),
+                                     /*srcUnsigned=*/false);
+        args.push_back(dv);
+    }
+    return true;
+}
+
+
 void Emitter::emitChainCall(const ast::CallExpr* call, bool isThis,
                    sema::ConstructorSymbol* cs) {
     const sema::TypeSymbol* targetCls =
@@ -11949,8 +12012,49 @@ void Emitter::emitChainCall(const ast::CallExpr* call, bool isThis,
         return;
     }
     std::size_t n = call->args.size();
+    // fix #3777 (§22.8 step 1 / §12.8 / §22.5 / §22.6, v0.286): select the chain
+    // target the way a `new` site selects it — `ctorForArgs`, which since fix
+    // #3082 admits an omitted §22.5-DEFAULTED tail — instead of the raw
+    // `ctorByArity`, which matches EXACT arity and nothing else. `ctorByArity`
+    // found no target for `this(x)` against a sibling `constructor(a: int,
+    // b: int := 3)`, so control fell through to the `!target` arms below and,
+    // for a class with no §22.10 positional fields, emitted NOTHING AT ALL: the
+    // object stayed calloc-zero and printed `0/0` with no diagnostic at any
+    // severity (issue 3777 arm (a); `base()` into an explicit base constructor
+    // whose only parameter is defaulted was the same silent no-op).
+    //
+    // §22.6's own order is preserved because it is `ctorForArgs`'s order: the
+    // exact-arity pass runs first ("Defaulted-arity tie-break": a candidate
+    // applicable *without filling any default* is preferred over one that
+    // fills some), then the fill pass, and only then — `ctorForArgs` having
+    // returned null — the §22.10 primary arm below, which is #3583's and is
+    // untouched. Measured: `class B` with `constructor(a: int, b: int := 3)`
+    // beside `constructor(a: int)` still resolves `this(x)` to the arity-1
+    // constructor.
+    //
+    // `exclude` (§22.10 "no self-chain") is threaded through EVERY arm of
+    // `ctorForArgs` for this call site — see its declaration comment. Without
+    // it the fill pass reaches the enclosing constructor itself whenever that
+    // constructor's own trailing parameters are defaulted, and `this(...)`
+    // becomes infinite recursion.
+    //
+    // ⚠ NAMED arguments keep the exact-arity rule. The argument loop below
+    // pairs `call->args[ai]` with `target->params[ai]` POSITIONALLY — a chain
+    // call written with named arguments is already lowered in source order
+    // rather than in §22.5 binding order (a separate, pre-existing defect,
+    // filed on its own) — so admitting a named-argument FILL here would select
+    // a target this function cannot lower, and the `arg_size()` guard at the
+    // end would then silently emit nothing for a shape that reaches the
+    // §22.10 primary arm (which DOES honour the binding, #3583) today. The
+    // widened admission is therefore gated on the call being all-positional,
+    // which is exactly the set the loop below can fill.
+    bool chainArgsAllPositional = true;
+    for (const auto& a : call->args)
+        if (!a.name.empty()) { chainArgsAllPositional = false; break; }
     sema::ConstructorSymbol* target =
-        ctorByArity(targetCls, n, isThis ? cs : nullptr);
+        chainArgsAllPositional
+            ? ctorForArgs(targetCls, call->args, isThis ? cs : nullptr)
+            : ctorByArity(targetCls, n, isThis ? cs : nullptr);
     if (!target) {
         // Explicit `base(...)` with no matching base CONSTRUCTOR symbol. This is
         // the primary-ctor / no-explicit-ctor base case (e.g. `class ED: Base`
@@ -12167,6 +12271,45 @@ void Emitter::emitChainCall(const ast::CallExpr* call, bool isThis,
         }
         args.push_back(v);
     }
+    // fix #3777 (§22.5 "Optional parameters and named arguments" / §22.8 step 1
+    // / §12.8, v0.286): the target was selected with an omitted §22.5-defaulted
+    // tail ADMITTED, so this site now owes those slots their defaults — exactly
+    // what a `new` site owes them. `fillOmittedCtorArgs` is the ONE fill for a
+    // constructor call in this file, shared with the §22.10 inheritance-clause
+    // call in `emitImplicitBase`; it also answers the LOCAL/IMPORTED question
+    // once, which the generic-inline gate below then reads instead of asking
+    // the AST a second time.
+    //
+    // Only the TRAILING tail can be omitted at this site: the selection above
+    // is gated on the call being all-positional, so the supplied arguments
+    // occupy slots `[0, call->args.size())` and the omitted ones are the rest.
+    //
+    // Evaluation order is §22.5's: the supplied arguments were lowered above in
+    // source order, and each default is lowered after them, in parameter order,
+    // with every earlier slot bound — so a default that reads an earlier
+    // parameter (§22.5 "Permitted default-value expressions") sees the value
+    // this call bound, and a default with side effects runs exactly once.
+    //
+    // The carried #3501 unit bindings are still active here on purpose: a
+    // default is an expression of the TARGET's parameter list, so it is owed the
+    // same substitution the arguments filling that list were lowered under.
+    //
+    // Numeric coercion of a default is applied only for a NON-generic target:
+    // for a generic one `it->second` is the T→i32 TEMPLATE and the inline path
+    // below binds each value at the formal's own SPECIALIZED lowered type, so
+    // the template signature is not the authority.
+    bool chainTargetIsLocal = false;
+    if (!fillOmittedCtorArgs(*target, it->second->getFunctionType(),
+                             /*coerceNumericDefaults=*/
+                             targetCls->genericParams.empty(), args,
+                             &chainTargetIsLocal)) {
+        // No default for some omitted slot (or it failed to lower, which
+        // already reported). The call cannot be made — release the §22.3
+        // bracket pins and leave, exactly as the `!a.value` edge above does.
+        emitAccessorRefArgWriteBacks(accessorRefArgs, /*emit=*/false);
+        genericSubstSemaTy_ = std::move(savedSemaForChainArgs);  // #3501
+        return;
+    }
     // fix #3501: the carried unit bindings cover the ARGUMENT loop ONLY. The
     // #617 block immediately below captures `genericSubstSemaTy_` into
     // `savedSemaTyForBase` and rebuilds the base substitution from scratch, so
@@ -12264,8 +12407,12 @@ void Emitter::emitChainCall(const ast::CallExpr* call, bool isThis,
     // so the active substitution applies directly. The target's own
     // `base(...)`/implicit-base chain runs recursively inside inlineCtorBody.
     if (!genericSubst_.empty() && targetCls && !targetCls->genericParams.empty()) {
-        auto* targetCd = dynamic_cast<const ast::ConstructorDecl*>(target->decl);
-        if (targetCd && args.size() == target->params.size() + 1) {
+        // fix #3777: `chainTargetIsLocal` is `fillOmittedCtorArgs`'s answer to
+        // the same question this line used to re-ask ("does the target carry a
+        // source-written `ast::ConstructorDecl`?"). Asked once, so the fill and
+        // the inline path cannot drift — and one fewer AST-gated read of a
+        // symbol that may be imported (#3152).
+        if (chainTargetIsLocal && args.size() == target->params.size() + 1) {
             // Save/restore the inlining frame state, then bind the chained
             // ctor's params to the lowered argument values and inline its body
             // onto the SAME object subobject (currentThis_).
@@ -12714,7 +12861,31 @@ void Emitter::emitImplicitBase(const sema::TypeSymbol* cls, llvm::Value* obj,
                             /*srcUnsigned=*/false);
                         args.push_back(v);
                     }
-                    if (ok && args.size() == n + 1) {
+                    // fix #3777 (§22.5 / §22.8 step 1 / §22.10, v0.286): the
+                    // §22.10 inheritance-clause face of the chain-call fill.
+                    // `baseClauseExplicitCtor` now resolves a base constructor
+                    // whose trailing parameters the clause OMITS (`class D(v:
+                    // int) : P(v)` over `P.constructor(n: int, s: string :=
+                    // "d")`), so this loop owes those slots their §22.5
+                    // defaults — through the SAME `fillOmittedCtorArgs` the
+                    // `this(...)` / `base(...)` chain uses, which is itself
+                    // `buildOrderedArgs`'s own fill body. Before this the
+                    // clause resolved no callable constructor at all and the
+                    // base subobject was never constructed: a `string`-typed
+                    // omitted slot stayed a null pointer and the first read
+                    // SEGV'd.
+                    //
+                    // A short clause reaches here only when
+                    // `baseClauseExplicitCtor` declared it CALLABLE, which it
+                    // does only for an all-positional clause — see that
+                    // predicate for why the test lives there rather than here.
+                    const std::size_t nBaseFormals = bce.cs->params.size();
+                    if (ok && !fillOmittedCtorArgs(
+                                  *bce.cs, bce.fn->getFunctionType(),
+                                  /*coerceNumericDefaults=*/true, args,
+                                  /*outIsLocal=*/nullptr))
+                        ok = false;
+                    if (ok && args.size() == nBaseFormals + 1) {
                         builder_.CreateCall(bce.fn, args);
                         return;
                     }

@@ -12494,6 +12494,119 @@ llvm::Value* Emitter::resolveOutAddrWithBracket(
 }
 
 
+// fix #3777 (§22.5 "Optional parameters and named arguments" / §22.8 step 1 /
+// §12.8, v0.286): the ONE materialization of an omitted §22.5 default for a
+// LOCALLY declared formal list. Extracted verbatim from `buildOrderedArgs`,
+// whose tail loop this used to be, because a §12.8 chain call
+// (`Emitter::emitChainCall`) now has to fill exactly the same omitted tail and
+// a second spelling of "what value does an omitted parameter take" is the
+// defect class CLAUDE.md §6 names. `ordered` is sized to `params` with a null
+// in every slot the call did not supply; on return every slot holds a value.
+// Returns false — leaving the caller to abandon the call exactly as it did
+// before — for a slot with no default, or a default that failed to lower.
+// `orderedExprs`, when given, is sized to `params` and receives each filled
+// slot's own default expression so the caller can recover its signedness.
+bool Emitter::fillOmittedParamDefaults(
+        const std::vector<ast::Param>& params,
+        std::vector<llvm::Value*>& ordered,
+        std::vector<const ast::Expr*>* orderedExprs) {
+    // §22.5: a default-value expression may reference an EARLIER parameter
+    // (e.g. `M(a, b := a + 1)`). At the call site the earlier parameters are
+    // already lowered into `ordered[k]` (k < j). To make a reference to such a
+    // parameter resolve to this call's argument value, bind each earlier
+    // ParameterSymbol to a slot holding its computed value via paramSlots_
+    // before lowering the default — exactly the mechanism a parameter access
+    // uses inside a method body (localSlot → paramSlots_). A reference to a
+    // LATER parameter is rejected by sema (not yet bound here), and a
+    // literal/constant default ignores these bindings, so both keep working.
+    //
+    // Map each parameter position to its ParameterSymbol. The collection pass
+    // records sym->declType = params[k].type.get(), so the AST type pointer is
+    // the stable key (declared method/ctor parameters always carry a type).
+    std::vector<const sema::ParameterSymbol*> paramSyms;
+    bool anyDefaultNeeded = false;
+    for (std::size_t j = 0; j < params.size(); ++j)
+        if (!ordered[j] && params[j].defaultValue) { anyDefaultNeeded = true; break; }
+    if (anyDefaultNeeded) {
+        paramSyms.assign(params.size(), nullptr);
+        for (std::size_t k = 0; k < params.size(); ++k) {
+            const ast::Type* pt = params[k].type.get();
+            if (!pt) continue;
+            for (const auto& s : ctx_.symbols()) {
+                auto* psym = dynamic_cast<const sema::ParameterSymbol*>(s.get());
+                if (psym && psym->declType == pt) { paramSyms[k] = psym; break; }
+            }
+        }
+    }
+    for (std::size_t j = 0; j < params.size(); ++j) {
+        if (!ordered[j]) {
+            const ast::Expr* dv = params[j].defaultValue.get();
+            if (!dv) return false;
+            // Temporarily bind each already-computed earlier parameter so the
+            // default expression's references resolve to this call's values.
+            auto savedParams = paramSlots_;
+            for (std::size_t k = 0; k < j; ++k) {
+                if (!ordered[k] || !paramSyms[k]) continue;
+                auto* slot = entryAlloca(ordered[k]->getType());
+                builder_.CreateStore(ordered[k], slot);
+                paramSlots_[paramSyms[k]] = slot;
+            }
+            // fix #1163 / §22.5 / §17.11: a `default(T)` default-value
+            // expression is reached through the PARAMETER declaration, whose
+            // inner type node (the `T` of `default(T)`) the type-resolution pass
+            // does NOT walk — it resolves only the parameter's own `: Type`
+            // annotation (TypeResolution_Names.cpp resolves `p.type`, not
+            // `p.defaultValue`). So lowering the DefaultExpr the ordinary way
+            // calls `lowerType(de->type)` on an UNRESOLVED TypeRef, which falls
+            // back to the i32 placeholder; a reference / nullable-ref
+            // `default(R?)` then becomes a bare `i32 0` passed to a `ptr`
+            // parameter ("Call parameter type does not match function
+            // signature"). Lower the omitted-argument `default(T)` at the
+            // PARAMETER's OWN lowered type, which IS resolved (resolveType on
+            // `p.type` above): `ptr null` for a reference / nullable-ref, the
+            // tagged {i8,T} zero for a nullable value, and 0 / 0.0 / false for a
+            // value type — exactly the zero value `default(T)` denotes, already
+            // in the parameter's representation.
+            if (dynamic_cast<const ast::DefaultExpr*>(dv)) {
+                ordered[j] = llvm::Constant::getNullValue(
+                    lowerType(params[j].type.get()));
+            } else {
+                ordered[j] = lowerExpr(*dv);
+                // fix #1235 / §22.5 / §22.7: a bare `null` literal default
+                // for a nullable VALUE param (int?, enum?, nullable record)
+                // lowers as ptr null but the param's LLVM type is {i8,T}.
+                // Apply the same coercion the explicit-arg path uses
+                // (CG-nullable, see L3523): ptr null → nullableValueNull.
+                if (ordered[j] && params[j].type) {
+                    sema::TypeRef* formalTy =
+                        ctx_.resolvedType(*params[j].type);
+                    if (isNullableValueTy(formalTy)) {
+                        auto* expectedSt = nullableValueStructTy(formalTy);
+                        if (ordered[j]->getType() != expectedSt) {
+                            if (ordered[j]->getType()->isPointerTy() &&
+                                llvm::isa<llvm::ConstantPointerNull>(
+                                    ordered[j])) {
+                                ordered[j] = nullableValueNull(formalTy);
+                            } else if (ordered[j]->getType() ==
+                                       expectedSt->getElementType(1)) {
+                                ordered[j] =
+                                    wrapNullableValue(formalTy, ordered[j]);
+                            }
+                        }
+                    }
+                }
+            }
+            paramSlots_ = std::move(savedParams);
+            if (!ordered[j]) return false;
+            // A defaulted parameter has no call-site argument expression;
+            // record the default's own expression so its signedness is honored.
+            if (orderedExprs) (*orderedExprs)[j] = dv;
+        }
+    }
+    return true;
+}
+
+
 bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
                       const std::vector<ast::CallArgument>& args,
                       std::vector<llvm::Value*>& out,
@@ -13319,98 +13432,11 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
             }
         }
     }
-    // §22.5: a default-value expression may reference an EARLIER parameter
-    // (e.g. `M(a, b := a + 1)`). At the call site the earlier parameters are
-    // already lowered into `ordered[k]` (k < j). To make a reference to such a
-    // parameter resolve to this call's argument value, bind each earlier
-    // ParameterSymbol to a slot holding its computed value via paramSlots_
-    // before lowering the default — exactly the mechanism a parameter access
-    // uses inside a method body (localSlot → paramSlots_). A reference to a
-    // LATER parameter is rejected by sema (not yet bound here), and a
-    // literal/constant default ignores these bindings, so both keep working.
-    //
-    // Map each parameter position to its ParameterSymbol. The collection pass
-    // records sym->declType = params[k].type.get(), so the AST type pointer is
-    // the stable key (declared method/ctor parameters always carry a type).
-    std::vector<const sema::ParameterSymbol*> paramSyms;
-    bool anyDefaultNeeded = false;
-    for (std::size_t j = 0; j < params.size(); ++j)
-        if (!ordered[j] && params[j].defaultValue) { anyDefaultNeeded = true; break; }
-    if (anyDefaultNeeded) {
-        paramSyms.assign(params.size(), nullptr);
-        for (std::size_t k = 0; k < params.size(); ++k) {
-            const ast::Type* pt = params[k].type.get();
-            if (!pt) continue;
-            for (const auto& s : ctx_.symbols()) {
-                auto* psym = dynamic_cast<const sema::ParameterSymbol*>(s.get());
-                if (psym && psym->declType == pt) { paramSyms[k] = psym; break; }
-            }
-        }
-    }
+    // fix #3777: the §22.5 omitted-default fill is now `fillOmittedParamDefaults`
+    // — the same body, stated once, so that `emitChainCall` fills a chain
+    // call's omitted tail by the identical rule rather than by a second copy.
+    if (!fillOmittedParamDefaults(params, ordered, &orderedExprs)) return false;
     for (std::size_t j = 0; j < params.size(); ++j) {
-        if (!ordered[j]) {
-            const ast::Expr* dv = params[j].defaultValue.get();
-            if (!dv) return false;
-            // Temporarily bind each already-computed earlier parameter so the
-            // default expression's references resolve to this call's values.
-            auto savedParams = paramSlots_;
-            for (std::size_t k = 0; k < j; ++k) {
-                if (!ordered[k] || !paramSyms[k]) continue;
-                auto* slot = entryAlloca(ordered[k]->getType());
-                builder_.CreateStore(ordered[k], slot);
-                paramSlots_[paramSyms[k]] = slot;
-            }
-            // fix #1163 / §22.5 / §17.11: a `default(T)` default-value
-            // expression is reached through the PARAMETER declaration, whose
-            // inner type node (the `T` of `default(T)`) the type-resolution pass
-            // does NOT walk — it resolves only the parameter's own `: Type`
-            // annotation (TypeResolution_Names.cpp resolves `p.type`, not
-            // `p.defaultValue`). So lowering the DefaultExpr the ordinary way
-            // calls `lowerType(de->type)` on an UNRESOLVED TypeRef, which falls
-            // back to the i32 placeholder; a reference / nullable-ref
-            // `default(R?)` then becomes a bare `i32 0` passed to a `ptr`
-            // parameter ("Call parameter type does not match function
-            // signature"). Lower the omitted-argument `default(T)` at the
-            // PARAMETER's OWN lowered type, which IS resolved (resolveType on
-            // `p.type` above): `ptr null` for a reference / nullable-ref, the
-            // tagged {i8,T} zero for a nullable value, and 0 / 0.0 / false for a
-            // value type — exactly the zero value `default(T)` denotes, already
-            // in the parameter's representation.
-            if (dynamic_cast<const ast::DefaultExpr*>(dv)) {
-                ordered[j] = llvm::Constant::getNullValue(
-                    lowerType(params[j].type.get()));
-            } else {
-                ordered[j] = lowerExpr(*dv);
-                // fix #1235 / §22.5 / §22.7: a bare `null` literal default
-                // for a nullable VALUE param (int?, enum?, nullable record)
-                // lowers as ptr null but the param's LLVM type is {i8,T}.
-                // Apply the same coercion the explicit-arg path uses
-                // (CG-nullable, see L3523): ptr null → nullableValueNull.
-                if (ordered[j] && params[j].type) {
-                    sema::TypeRef* formalTy =
-                        ctx_.resolvedType(*params[j].type);
-                    if (isNullableValueTy(formalTy)) {
-                        auto* expectedSt = nullableValueStructTy(formalTy);
-                        if (ordered[j]->getType() != expectedSt) {
-                            if (ordered[j]->getType()->isPointerTy() &&
-                                llvm::isa<llvm::ConstantPointerNull>(
-                                    ordered[j])) {
-                                ordered[j] = nullableValueNull(formalTy);
-                            } else if (ordered[j]->getType() ==
-                                       expectedSt->getElementType(1)) {
-                                ordered[j] =
-                                    wrapNullableValue(formalTy, ordered[j]);
-                            }
-                        }
-                    }
-                }
-            }
-            paramSlots_ = std::move(savedParams);
-            if (!ordered[j]) return false;
-            // A defaulted parameter has no call-site argument expression;
-            // record the default's own expression so its signedness is honored.
-            orderedExprs[j] = dv;
-        }
         out.push_back(ordered[j]);
         if (outExprs) outExprs->push_back(orderedExprs[j]);
     }

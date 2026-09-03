@@ -12244,24 +12244,34 @@ private:
     int ctorArityCount(const sema::TypeSymbol* cls, std::size_t n,
                        const sema::ConstructorSymbol* exclude);
 
+    // fix #3777 (§22.8 step 1 / §12.8 / §22.5 / §22.6, v0.286): `exclude` is
+    // the §22.10 "no self-chain" carve-out `ctorByArity` has always taken, and
+    // it must be threaded through EVERY arm here, not only the exact-arity one.
+    // `emitChainCall` now selects a `this(...)` target through this resolver
+    // rather than through the raw `ctorByArity`, so the fill pass below can
+    // reach the ENCLOSING constructor itself whenever that constructor's own
+    // trailing parameters are defaulted — `constructor(x: int, y: bool := false)`
+    // whose body writes `this(x)` fills `y` and calls itself forever. The
+    // exclusion is what makes the widened admission safe.
     sema::ConstructorSymbol* ctorForArgs(
         const sema::TypeSymbol* cls,
-        const std::vector<ast::CallArgument>& args) {
+        const std::vector<ast::CallArgument>& args,
+        const sema::ConstructorSymbol* exclude = nullptr) {
         if (!cls) return nullptr;
         // If exactly one constructor matches by arity, use it directly.
-        if (ctorArityCount(cls, args.size(), nullptr) == 1) {
-            if (auto* exact = ctorByArity(cls, args.size(), nullptr)) return exact;
+        if (ctorArityCount(cls, args.size(), exclude) == 1) {
+            if (auto* exact = ctorByArity(cls, args.size(), exclude)) return exact;
         }
         // Multiple constructors with same arity: resolve by LLVM type
         // matching. Lower each arg, check if the lowered type matches
         // the constructor's parameter type. Use the sema type of each
         // arg (ptr for class/string, i32 for int, etc.) to discriminate.
-        if (ctorArityCount(cls, args.size(), nullptr) > 1) {
+        if (ctorArityCount(cls, args.size(), exclude) > 1) {
             // Collect candidate ctors with matching arity.
             std::vector<sema::ConstructorSymbol*> candidates;
             for (sema::Symbol* m : cls->members) {
                 auto* cs = dynamic_cast<sema::ConstructorSymbol*>(m);
-                if (!cs || cs->isStatic) continue;
+                if (!cs || cs->isStatic || cs == exclude) continue;
                 if (cs->params.size() == args.size()) candidates.push_back(cs);
             }
             // For each candidate, check if positional arg sema types are
@@ -12315,7 +12325,7 @@ private:
         }
         for (sema::Symbol* m : cls->members) {
             auto* cs = dynamic_cast<sema::ConstructorSymbol*>(m);
-            if (!cs || cs->isStatic) continue;
+            if (!cs || cs->isStatic || cs == exclude) continue;  // fix #3777
             // fix #3082 (§22.5 / §2.8.2, v0.244): the previous `dynamic_cast
             // <ast::ConstructorDecl*>` gate made this fallback unreachable for
             // every IMPORTED constructor (the #2374 shape — the dep never
@@ -12338,6 +12348,22 @@ private:
         }
         return nullptr;
     }
+
+    // fix #3777 (§22.5 / §22.8 step 1 / §12.8 / §22.10, v0.286): fill the
+    // omitted trailing §22.5 defaults of a CONSTRUCTOR call whose target was
+    // selected with them admitted (`ctorForArgs`, fix #3082) — and answer, once,
+    // whether that target is LOCAL (carries an `ast::ConstructorDecl`, whose
+    // `ast::Param` defaults are real expressions) or IMPORTED (defaults ride
+    // `ParameterSymbol::defaultText`). Two callers, both §22.8 step 1: the
+    // explicit `this(...)`/`base(...)` chain and the §22.10 inheritance-clause
+    // base call. `args[0]` is the receiver; the filled values are appended.
+    // False = an omitted slot has no default, or its default failed to lower;
+    // the caller abandons the call. `outIsLocal` may be null.
+    bool fillOmittedCtorArgs(const sema::ConstructorSymbol& target,
+                             llvm::FunctionType* fnTy,
+                             bool coerceNumericDefaults,
+                             std::vector<llvm::Value*>& args,
+                             bool* outIsLocal);
 
     // CG16: emit a resolved chain call with `this` + lowered arguments.
     void emitChainCall(const ast::CallExpr* call, bool isThis,
@@ -14989,6 +15015,21 @@ private:
         const sema::ConstructorSymbol& cs,
         const std::vector<ast::CallArgument>& args);
 
+    // fix #3777 (§22.5 / §22.8 step 1 / §12.8 / §22.6, v0.286): materialize the
+    // §22.5 default of every slot of `ordered` the call did not supply, in
+    // parameter order (so a default that reads an EARLIER parameter, §22.5
+    // "Permitted default-value expressions", sees the value that call bound).
+    // This IS `buildOrderedArgs`'s own tail loop, lifted out unchanged: fix
+    // #3777 gave `emitChainCall` an omitted defaulted tail to fill for the first
+    // time, and "what value does an omitted parameter take" must have exactly
+    // one answer in the emitter (CLAUDE.md §6). `ordered` is sized to `params`,
+    // null in each unsupplied slot; false means a slot has no default or its
+    // default failed to lower, and the caller abandons the call.
+    bool fillOmittedParamDefaults(
+        const std::vector<ast::Param>& params,
+        std::vector<llvm::Value*>& ordered,
+        std::vector<const ast::Expr*>* orderedExprs);
+
     // #1302 / §22.3 (v0.228) "**`ref` local and field targets alias; accessor
     // targets bracket.**": a `ref`/`out` argument naming an **indexer slot or
     // property** is NOT an alias — it is **copy-in / copy-out** under §17.6's
@@ -16731,6 +16772,23 @@ private:
     BaseClauseExplicitCtor baseClauseExplicitCtor(
         const sema::TypeSymbol* base,
         const std::vector<ast::CallArgument>& args);
+
+    // fix #3777 (§22.5 / §22.10 / §22.8 step 0, v0.286): the ONE §22.5 default
+    // materialization for a §22.10 positional parameter — the LOCAL `:= Expr`
+    // on `posParam->defaultValue`, or the IMPORTED rendered text on
+    // `posParam->defaultText`. Two callers: §22.8 step 0's own store
+    // (`storePrimaryCtorPositionalArgs`) and the BASE-level pre-population
+    // (`prePopulateBasePositionalFields`), which before #3777 left an omitted
+    // defaulted base slot at its calloc zero. `obj` is the constructing
+    // instance: the default may read EARLIER positional parameters, which live
+    // in its captured field slots. Null = no default declared (or it failed to
+    // lower, already reported) — the caller leaves the slot alone.
+    llvm::Value* positionalParamDefaultValue(
+        const sema::FieldSymbol& fs,
+        llvm::Value* obj,
+        const std::unordered_map<std::string_view, llvm::Type*>& outerSubst,
+        const std::unordered_map<std::string_view, const sema::TypeRef*>&
+            outerSemaTy);
 
     // §22.8 step 0 / §22.10 (fix #3162): store a `new T(args)` call's positional
     // arguments into `t`'s own primary-constructor parameter field slots.
