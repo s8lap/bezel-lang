@@ -167,6 +167,35 @@ BEZEL_TEST(codegen_iife_507, iife_two_unannotated_params_27_3) {
         "end C;"), 7);
 }
 
+// narrow #3756 (§27.3 / §27.4, v0.286): two UNANNOTATED params, both
+// SAME-typed (int, matching the codegen `lowerCall` bypass's verified
+// case — see below), but each argument is a non-trivial EXPRESSION
+// (`2 + 1`, `10 - 6`) rather than a bare literal, unlike
+// `iife_two_unannotated_params_27_3`'s two plain literals.
+// `((a, b) => a * b)(2 + 1, 10 - 6)` = 3 * 4 = 12.
+//
+// NOTE on scope: a genuinely MIXED-TYPE two-param unannotated IIFE
+// (e.g. `(lambda(a, b) => a + b.Length)(3, "hello")`, `a` from an `int`
+// argument and `b` from a `string` one) was measured while adding this
+// row to SILENTLY compute the wrong value (`0`/no diagnostic, not even
+// a clean crash) — a genuine, PRE-EXISTING codegen gap in `lowerCall`'s
+// IIFE bypass (per `iife_two_annotated_params_27_3`'s neighboring
+// annotated control, the annotated form is unaffected), predating #3756
+// and orthogonal to this narrow fix's sema-only change (a fix would need
+// to thread real per-parameter types into the IIFE callee by peeking the
+// call's arguments before visiting the callee — a larger change than
+// this lane's scope per CLAUDE.md's "no while-we're-at-it expansions").
+// Filed as https://github.com/s8lap/bezel-lang/issues/3797 with the
+// measured repro instead of shipped as an (incorrect) ACCEPT row here.
+BEZEL_TEST(codegen_iife_507, iife_two_unannotated_params_expr_args_27_3) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public static method Main(): int "
+        "    return (lambda(a, b) => a * b)(2 + 1, 10 - 6); "
+        "  end Main; "
+        "end C;"), 12);
+}
+
 // §27.3 / #507: two-param IIFE with capture. `((a: int, b: int) => a * b + n)(2, 3)` where n=1 → 7.
 BEZEL_TEST(codegen_iife_507, iife_two_params_with_capture_27_3_27_5) {
     BEZEL_EXPECT_EQ(run(
@@ -204,6 +233,27 @@ BEZEL_TEST(codegen_iife_507, iife_nested_27_3) {
         "module M; class C "
         "  public static method Main(): int "
         "    return (lambda(x: int) => x * 2)((lambda(y: int) => y + 1)(4)); "
+        "  end Main; "
+        "end C;"), 10);
+}
+
+// narrow #3756 (§27.3 / §27.4, v0.286): an IIFE whose OWN argument is
+// itself a lambda LITERAL (a function VALUE passed positionally, not a
+// call producing a scalar — the counterpart of `iife_nested_27_3` above,
+// which nests a *called* IIFE). One CallExpr, callee = LambdaExpr AND
+// arg[0] = LambdaExpr at once: exercises the fix's new callee-position
+// `pendingLambdaArgContext_` toggle (around the callee visit) alongside
+// the pre-existing #3756 argument-position toggle (around the arg visit,
+// set/restored independently in the arg-visiting loop) in the SAME call,
+// guarding against the two save/restore pairs leaking into each other.
+// `f` and `x` are annotated (this row is about the callee/argument
+// interaction, not further inference); `(lambda(f: (int) -> int) => f(5))
+// (lambda(x: int) => x * 2)` = 10.
+BEZEL_TEST(codegen_iife_507, iife_arg_is_itself_a_lambda_27_3) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public static method Main(): int "
+        "    return (lambda(f: (int) -> int) => f(5))(lambda(x: int) => x * 2); "
         "  end Main; "
         "end C;"), 10);
 }

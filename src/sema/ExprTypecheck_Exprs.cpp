@@ -6730,7 +6730,27 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         std::ptrdiff_t savedArity = currentCallArity_;
         currentCallArity_ =
             static_cast<std::ptrdiff_t>(ce->args.size());
+        // narrow #3756 (§27.3 / §27.4, v0.286): an immediately-invoked
+        // lambda (`(lambda(x) => ...)(args)`) is the CALLEE of this
+        // CallExpr, not one of its arguments — the argument-visiting loop's
+        // `pendingLambdaArgContext_ = true` (below, for each `a.value`)
+        // never reaches a lambda sitting in callee position, so #3756's new
+        // terminal reject fired here even though the call's own arguments
+        // are exactly the target-type context §27.4 asks for ("when the
+        // lambda's target type is known from context, parameter type
+        // annotations may be omitted"). Treat a bare-LambdaExpr callee the
+        // same way a call-argument lambda is treated: a context exists,
+        // even though this pass does not thread the arguments' exact
+        // per-parameter types here (codegen's own IIFE path in `lowerCall`
+        // already types the closure's parameters from the actual argument
+        // values at the LLVM level — see tests/codegen/iife_507_test.cpp —
+        // so no diagnostic is warranted). Saved/restored so a nested IIFE
+        // argument's own callee-visit does not leak here.
+        bool savedArgCtxIifeCallee = pendingLambdaArgContext_;
+        if (dynamic_cast<const ast::LambdaExpr*>(ce->callee.get()))
+            pendingLambdaArgContext_ = true;
         if (ce->callee) visitExpr(*ce->callee);
+        pendingLambdaArgContext_ = savedArgCtxIifeCallee;
         currentCallArity_ = savedArity;
         calleeOfCallCtx_ = savedCallee;
         // per §24.3: an event-handler argument (`<event>.Subscribe(h)` / .Add /
