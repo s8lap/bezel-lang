@@ -76,10 +76,15 @@ filter_args=()
 case "$mode" in
   --changed)
     base="${2:-HEAD}"
-    # fix #3718: say WHICH commit the base resolved to, not just the ref the
-    # caller named. `main`/`origin/main`/`HEAD~1` all move, and the whole
-    # symptom of #3718 (a base pointing at a long-stale local `main`) is
-    # invisible in a log that only echoes the ref name back.
+    # fix #3718: print the base's short SHA. Nit (#3725, review of #3718):
+    # gate_full_cycle.sh's caller already passes a resolved SHA here (the
+    # output of its own `git merge-base`), not a moving ref — so the OLD log
+    # already echoed a SHA back, not a ref name. What it never showed was
+    # WHICH ref (`main` vs `origin/main` vs `HEAD~1`) that SHA was resolved
+    # from, so a long-stale SHA from local `main` was indistinguishable from
+    # a fresh one from `origin/main`. This line's own value is shortening a
+    # full 40-char SHA for the log, plus resolving a genuine REF into a SHA
+    # when a human runs `check_tidy.sh build --changed <ref>` by hand.
     base_sha="$(git rev-parse --short "$base" 2>/dev/null || echo "$base")"
     mapfile -t changed < <(git diff --name-only "$base" -- 'src/*.cpp' 'src/**/*.cpp' 2>/dev/null)
     if [ "${#changed[@]}" -eq 0 ]; then

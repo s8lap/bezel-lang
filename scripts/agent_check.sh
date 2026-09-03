@@ -41,7 +41,13 @@
 #   scripts/agent_check.sh --select [BASE]            auto-derive the subset from
 #                                                     the lane's OWN diff vs BASE
 #                                                     (default: merge-base HEAD
-#                                                     main) via select_tests.py
+#                                                     against the branch's own
+#                                                     @{upstream}, falling back
+#                                                     to origin/main then
+#                                                     HEAD~1 — fix #3725; NEVER
+#                                                     the bare local `main`,
+#                                                     which nothing fast-
+#                                                     forwards) via select_tests.py
 #                                                     --variant lane (#2100), and
 #                                                     run it via BEZEL_TEST_LIST.
 #                                                     Still a targeted lane check
@@ -262,7 +268,27 @@ if [ "${1:-}" = "--select" ]; then
   shift
   base="${1:-}"
   if [ -z "$base" ]; then
-    base="$(git -C "$ROOT" merge-base HEAD main 2>/dev/null || true)"
+    # fix #3725 (sibling of #3718 in gate_full_cycle.sh:~895-922): the base is
+    # THIS BRANCH'S UPSTREAM, never the bare local `main`. Nothing in the run
+    # workflow ever fast-forwards local `main` — an integration/lane branch
+    # tracks `origin/main`, and gate_and_push.sh lands through that same
+    # upstream — so `git merge-base HEAD main` silently widened every
+    # `--select` run to everything landed since local `main` was last checked
+    # out. Measured in this worktree: 10628 tests selected against the stale
+    # local `main` vs 6022 against `origin/main` for the same HEAD (the
+    # sibling issue measured 9424 vs 3225 at 61b146c) — a lane-only check
+    # running ~1.8x the intended subset, and select_tests.py's OWN default
+    # (scripts/select_tests.py:~377) already resolves against `origin/main`,
+    # so this made the two scripts disagree with each other. Duplicated
+    # verbatim from gate_full_cycle.sh's tidy-base resolution rather than
+    # extracted to a shared helper: that file is owned by a different lane in
+    # this batch and factoring the snippet out would require editing it too.
+    _up="$(git -C "$ROOT" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null || true)"
+    if [ -z "$_up" ] || ! git -C "$ROOT" rev-parse --verify --quiet "${_up}^{commit}" >/dev/null 2>&1; then
+      _up="origin/main"
+    fi
+    base="$(git -C "$ROOT" merge-base HEAD "$_up" 2>/dev/null || true)"
+    if [ -z "$base" ]; then base="HEAD~1"; fi
   fi
   [ -n "$base" ] || die "--select: cannot determine a base (pass one: agent_check.sh --select <ref>)"
   build_tests

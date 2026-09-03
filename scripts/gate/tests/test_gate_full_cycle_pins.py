@@ -98,6 +98,17 @@ GUARD.
      (SHARD_ENV+=(BEZEL_AOT_STORE_FSYNC=0), #3669) AFTER the ASan branch
      reassigns SHARD_ENV and BEFORE both run sites, and logs it beside
      the ceiling line.                             -> GateShStoreFsyncOffTest
+
+FIX #3725 (section 2c, sibling of #3718, found during its review). The same
+`git merge-base HEAD main` defect existed a second, independent time in
+`scripts/agent_check.sh`'s `--select` default base. Measured 2026-09-03 in a
+lane worktree: 10628 tests selected against the stale local `main` versus
+6022 against `origin/main` for the same HEAD (~1.8x over-selection), and
+`scripts/select_tests.py`'s own default base already resolved against
+`origin/main`, so the two scripts disagreed with each other. The scan
+`_STALE_MAIN_RE` runs over is extended to `agent_check.sh` so a fourth
+instance cannot reappear anywhere in scripts/.
+                                                  -> AgentCheckSelectBaseIsUpstreamTest
 """
 
 import json
@@ -116,6 +127,7 @@ SCRIPTS = HERE.parent.parent          # scripts/
 GATE_SH = SCRIPTS / "gate.sh"
 CYCLE_SH = SCRIPTS / "gate_full_cycle.sh"
 CHECK_TIDY_SH = SCRIPTS / "check_tidy.sh"
+AGENT_CHECK_SH = SCRIPTS / "agent_check.sh"
 GATE_PKG = SCRIPTS / "gate"
 RP_SH = SCRIPTS.parent / "tests" / "run_parallel.sh"
 
@@ -467,16 +479,19 @@ class CycleShTidyBaseIsUpstreamTest(unittest.TestCase):
     # -- source -------------------------------------------------------------
 
     def test_no_script_resolves_a_base_against_the_bare_local_main(self):
-        for path in (CYCLE_SH, GATE_SH):
+        # fix #3725: agent_check.sh's `--select` default base had the SAME
+        # defect independently (`git merge-base HEAD main`) — added to this
+        # scan so a fourth instance cannot reappear anywhere in scripts/.
+        for path in (CYCLE_SH, GATE_SH, AGENT_CHECK_SH):
             with self.subTest(script=path.name):
                 bad = [(n, ln) for n, ln in _code_lines(path.read_text())
                        if _STALE_MAIN_RE.search(ln)]
                 self.assertEqual(
                     bad, [],
-                    "%s resolves a base against the bare local `main` (#3718). "
-                    "Local `main` is whatever it was when someone last checked "
-                    "it out; use the branch's `@{upstream}`, falling back to "
-                    "`origin/main`:\n%s"
+                    "%s resolves a base against the bare local `main` "
+                    "(#3718/#3725). Local `main` is whatever it was when "
+                    "someone last checked it out; use the branch's "
+                    "`@{upstream}`, falling back to `origin/main`:\n%s"
                     % (path.name, "\n".join("  %d: %s" % h for h in bad)))
 
     def test_tidy_base_resolution_names_the_upstream_and_the_fallback(self):
@@ -628,6 +643,166 @@ class CycleShTidyBaseIsUpstreamTest(unittest.TestCase):
             out, r = self._resolve(repo, strict=True)
             self.assertEqual(out.get("TIDY_UP"), "origin/main", r.stdout)
             self.assertEqual(out.get("TIDY_BASE"), b, r.stdout)
+
+
+# ---------------------------------------------------------------------------
+# 2c. fix #3725 (sibling of #3718, found during its review) — agent_check.sh's
+#     `--select` default base independently spelled the SAME
+#     `git merge-base HEAD main` defect: the bare local `main`, which nothing
+#     in the run workflow fast-forwards.
+# ---------------------------------------------------------------------------
+
+_SELECT_BASE_START = '_up="$(git -C "$ROOT" rev-parse'
+# The resolution lives inside an `if [ -z "$base" ]; then … fi` guard (an
+# explicit `--select <ref>` must skip it — shape requirement of #3725), so
+# the end sentinel is that guard's OWN closing `fi` (2-space indent, distinct
+# from the resolution's own inner `if … fi` pairs at 4-space indent) rather
+# than the next statement, which would leave the extracted snippet with an
+# unbalanced trailing `fi`.
+_SELECT_BASE_END = "\n  fi\n"
+
+_SELECT_BASE_HARNESS = r'''
+%(setopts)s
+ROOT="$PIN_REPO"
+%(snippet)s
+echo "SELECT_UP=$_up"
+echo "SELECT_BASE=$base"
+'''
+
+
+class AgentCheckSelectBaseIsUpstreamTest(unittest.TestCase):
+    """#3725. `scripts/agent_check.sh --select`'s default base resolved
+    `git merge-base HEAD main` against the LOCAL `main` branch — the same
+    defect fix #3718 removed from gate_full_cycle.sh, spelled a second,
+    independent time. `scripts/select_tests.py` (~377, not owned by this
+    fix) already resolves ITS OWN default base against `origin/main`, so the
+    two scripts silently disagreed with each other on every `--select` run.
+    Measured 2026-09-03 in a lane worktree with no upstream configured for
+    the lane branch (so both bases fall through their own fallback chains):
+    10628 tests selected against the stale local `main` (ed5f8148b) versus
+    6022 against `origin/main` (98931b5e6) for the SAME HEAD — a lane check
+    running ~1.8x the intended subset (the issue measured 9424 vs 3225 at
+    61b146c; the ratio drifts as the branch advances since local `main` was
+    last moved, the defect itself does not)."""
+
+    # -- source -------------------------------------------------------------
+
+    def test_select_base_resolution_names_the_upstream_and_the_fallback(self):
+        block, _ = _slice(AGENT_CHECK_SH.read_text(), _SELECT_BASE_START,
+                          _SELECT_BASE_END, "--select base resolution")
+        # CODE only: the block's own comment recounts the defect verbatim
+        # (including the string `origin/main`), so a whole-text search would
+        # stay green even over a reverted resolution.
+        code = "\n".join(ln for _n, ln in _code_lines(block))
+        self.assertIn("@{upstream}", code,
+                      "the --select base must be resolved from the branch's "
+                      "own upstream (#3725)")
+        self.assertIn("origin/main", code,
+                      "the --select base needs an `origin/main` fallback for "
+                      "a detached HEAD or a lane branch with no upstream "
+                      "(#3725)")
+        self.assertIn("merge-base HEAD", code,
+                      "guard: the base is still a merge-base against that ref")
+
+    def test_explicit_base_argument_skips_the_upstream_resolution(self):
+        """Shape requirement: `agent_check.sh --select <ref>` must still use
+        exactly that ref — the resolution only fires when no ref was passed."""
+        text = AGENT_CHECK_SH.read_text()
+        block, _ = _slice(text, 'base="${1:-}"', _SELECT_BASE_END,
+                          "--select argument handling")
+        self.assertIn('if [ -z "$base" ]; then', block,
+                      "the upstream resolution must be gated on an EMPTY "
+                      "explicit base (#3725), so `--select <ref>` is unaffected")
+
+    # -- functional -----------------------------------------------------
+    # Reuses #3718's repo/git fixture verbatim (same shape: local `main` LEFT
+    # BEHIND at A, `origin/main` at B, HEAD on a branch at C) rather than
+    # duplicating it: the two harnesses differ only in the shell variable
+    # names each snippet happens to use (`_tidy_up`/`_tidy_base` there,
+    # `_up`/`base` here), which the harness template already isolates.
+
+    _git = CycleShTidyBaseIsUpstreamTest._git
+    _repo = CycleShTidyBaseIsUpstreamTest._repo
+
+    def _snippet(self):
+        block, _ = _slice(AGENT_CHECK_SH.read_text(), _SELECT_BASE_START,
+                          _SELECT_BASE_END, "--select base resolution")
+        snippet = block[:-len(_SELECT_BASE_END)]
+        self.assertIn("merge-base", snippet, "guard: snippet lacks the merge-base")
+        self.assertIn("@{upstream}", snippet, "guard: snippet lacks the upstream read")
+        return snippet
+
+    def _resolve(self, repo, strict=False):
+        env = _clean_env(str(repo))
+        env.pop("GIT_CEILING_DIRECTORIES", None)
+        env["PIN_REPO"] = str(repo)
+        env["GIT_CONFIG_GLOBAL"] = os.devnull
+        env["GIT_CONFIG_SYSTEM"] = os.devnull
+        r = _bash(_SELECT_BASE_HARNESS % {
+            "snippet": self._snippet(),
+            "setopts": "set -eu -o pipefail" if strict else "set -u"},
+            str(repo), env)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        out = dict(ln.split("=", 1) for ln in r.stdout.splitlines() if "=" in ln)
+        return out, r
+
+    def test_base_is_the_upstream_tip_not_the_stale_local_main(self):
+        for strict in (False, True):
+            with self.subTest(strict=strict):
+                with tempfile.TemporaryDirectory() as tmp:
+                    repo, a, b, _c = self._repo(tmp)
+                    out, r = self._resolve(repo, strict=strict)
+                    self.assertEqual(out.get("SELECT_UP"), "origin/main", r.stdout)
+                    self.assertEqual(
+                        out.get("SELECT_BASE"), b,
+                        "the --select base must be the merge-base with the "
+                        "branch's upstream (%s), not with the stale local "
+                        "`main` (%s) — #3725:\n%s" % (b[:7], a[:7], r.stdout))
+
+    def test_base_falls_back_to_origin_main_without_an_upstream(self):
+        """The common lane shape: `git branch <n> <sha>` sets no upstream at
+        all; `origin/main` is still the right base, and `main` still is not."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, a, b, _c = self._repo(tmp)
+            self._git(repo, "config", "--unset", "branch.topic.remote")
+            self._git(repo, "config", "--unset", "branch.topic.merge")
+            out, r = self._resolve(repo)
+            self.assertEqual(out.get("SELECT_UP"), "origin/main", r.stdout)
+            self.assertEqual(out.get("SELECT_BASE"), b,
+                             "no upstream must fall back to origin/main, not "
+                             "to the stale local `main` (%s):\n%s" % (a[:7], r.stdout))
+
+    def test_base_falls_back_when_the_upstream_has_no_tracking_ref(self):
+        """`branch.<b>.merge` can name a remote branch this clone has never
+        fetched: git then fails the `@{upstream}` read outright. That must
+        not leave the base empty, and must not fall through to `main`."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, a, b, _c = self._repo(tmp)
+            self._git(repo, "config", "branch.topic.merge", "refs/heads/nope")
+            out, r = self._resolve(repo)
+            self.assertEqual(out.get("SELECT_UP"), "origin/main", r.stdout)
+            self.assertEqual(out.get("SELECT_BASE"), b,
+                             "an unfetched upstream must fall back to "
+                             "origin/main (not %s):\n%s" % (a[:7], r.stdout))
+
+    def test_base_falls_back_to_head_1_with_no_upstream_and_no_origin_main(self):
+        """The pre-existing last-resort, unchanged: a repo with no remote at
+        all still gets a usable base rather than an empty one."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, _a, _b, _c = self._repo(tmp)
+            self._git(repo, "config", "--unset", "branch.topic.remote")
+            self._git(repo, "config", "--unset", "branch.topic.merge")
+            self._git(repo, "update-ref", "-d", "refs/remotes/origin/main")
+            out, r = self._resolve(repo)
+            self.assertEqual(out.get("SELECT_BASE"), "HEAD~1", r.stdout)
+
+    def test_a_detached_head_resolves_without_erroring(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, _a, b, c = self._repo(tmp)
+            self._git(repo, "checkout", "-q", "--detach", c)
+            out, r = self._resolve(repo, strict=True)
+            self.assertEqual(out.get("SELECT_UP"), "origin/main", r.stdout)
+            self.assertEqual(out.get("SELECT_BASE"), b, r.stdout)
 
 
 # ---------------------------------------------------------------------------
