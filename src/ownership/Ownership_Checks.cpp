@@ -5826,8 +5826,37 @@ bool MethodOwnership::checkBorrowStoreEscape(const ast::AssignmentStmt& as,
     // still flagged below — and a catch-bound exception borrow is not in
     // `states_` at all, so the §31.1 store-into-owned-field diagnosis is
     // untouched. handleOwnedFieldAssignment records the move for the legal
-    // transfer. // per §28.3, §28.8
-    if (dest == Dest::Field && targetIsOwnedField(*as.target)) {
+    // transfer.
+    //
+    // fix #3800 (§28.3 / §28.9 *Runtime-managed types* / §28.3 *Captured owned
+    // bindings*, v0.286): the skip is only sound at METHOD scope. At lambda
+    // body scope (`EscapeScope::LambdaBody`) the dataflow that records the move
+    // (`handleOwnedFieldAssignment` → `markMovedByName`) is reached, but the
+    // lambda body's own scope-end auto-drop does not consume that record —
+    // checked at compile time but never enforced at runtime, the local stays
+    // Owned through the body's exit and is auto-disposed WHILE the field also
+    // owns it. E11's enclosing-frame widening reached the rejection via
+    // `lookupState` returning null for the captured binding; the SAME-FRAME
+    // twin (`b.a := r;` over `var r := new R();` and `var b := new Box();`
+    // BOTH declared in the lambda body's own frame) still finds `r` in the
+    // body seed, so the skip fired and the program compiled. MEASURED on the
+    // parent (3729220, `--sanitize=address`):
+    //   `class Box public owned a: R := new R();`
+    //   `  public method Fill(): int `
+    //   `    var mk := lambda(): int => do `
+    //   `      var r := new R(); var b := new Box(); `
+    //   `      b.a := r; return b.a.V; `
+    //   `    end; return mk(); `
+    //   `  end Fill; `
+    // compiles rc=0 with NO diagnostic and dies with
+    // `heap-use-after-free … READ of size 8 … in bz$M.Box$DisposeCore` (the
+    // local auto-drops, then the field's disposal reads it). Gate the skip on
+    // method scope so the borrowed-store check below fires and the program is
+    // rejected with the §28.3 / §28.9 diagnostic (reworded to be honest about
+    // `move` being no remedy on a captured owned binding — see below).
+    // // per §28.3, §28.8, §28.9, v0.286
+    if (dest == Dest::Field && targetIsOwnedField(*as.target) &&
+        scope != EscapeScope::LambdaBody) {
         if (const auto* rid =
                 dynamic_cast<const ast::IdentifierExpr*>(as.value.get())) {
             if (const LocalOwnership* rst = lookupState(rid->name))
@@ -6241,6 +6270,52 @@ bool MethodOwnership::checkBorrowStoreEscape(const ast::AssignmentStmt& as,
                 "borrowed-field store rule; transfer the value instead — "
                 "`move` it into an `owned` field — or declare the parameter "
                 "as a plain borrow, whose source the caller keeps alive)");
+        } else if (scope == EscapeScope::LambdaBody) {
+            // fix #3800 (§28.3 *Captured owned bindings* / §28.9:7398 /
+            // §28.9 *Runtime-managed types*, v0.286): at lambda body scope,
+            // the borrowed-store channel the E12 widening reaches names a
+            // CAPTURED owned binding — either an owned local of an enclosing
+            // frame captured by the closure (E11), or an owned local of the
+            // lambda body's OWN frame whose move into the field the dataflow
+            // does not record through the body's scope end (E12). §28.9:7398
+            // ("the closure may not assign to, transfer from, or dispose the
+            // captured binding") and §28.3 *Captured owned bindings*
+            // ("reads borrow … every other owned-consuming use of it are
+            // compile errors") reject the captured case in spec — including
+            // `move`, which §28.9 calls "transfer from"; the same-frame case
+            // has no spec rule barring `move` but the dataflow doesn't visit
+            // lambda-body statements, so the scope-end auto-drop still
+            // disposes the local WHILE the field owns it (measured: SIGSEGV
+            // on `b.a := move r;` over `var r := new R();` and `var b := new
+            // Box();` both declared in the lambda body's own frame, the
+            // same shape as the bare-store E12). The previous wording
+            // ("store an owned value with `move`, or source the field's
+            // borrow from a receiver or parameter") named a remedy that
+            // either case rejects: `move` is a compile error on a captured
+            // owned binding per §28.9:7398, and it is silently no-op on a
+            // same-frame owned local inside a lambda body. The honest
+            // statement is that the value cannot reach this field from
+            // inside the closure at all — bind or transfer the value
+            // outside the lambda, or source the field's borrow from a
+            // parameter or receiver (the §28.5 back-reference idiom, the
+            // only one whose source the field's owner keeps alive). // per
+            // §28.3, §28.9, v0.286
+            report(
+                Severity::Error, as.span.begin,
+                std::string("borrow of `") + std::string(src->name) +
+                "` stored into a field would outlive its source — `" +
+                std::string(src->name) +
+                "` is an owned scope-bound local disposed at scope end, and a "
+                "field of the target object outlives it. From inside a "
+                "closure the value cannot reach the field: a captured owned "
+                "binding (§28.3 *Captured owned bindings* / §28.9:7398, "
+                "v0.286) is uniformly in borrow state and rejects every "
+                "owned-consuming use, so `move` is also rejected; and a "
+                "same-frame owned local's `move` is not recorded through the "
+                "body's scope end, so the local is still auto-disposed while "
+                "the field owns it. Bind or transfer the value outside the "
+                "lambda, or source the field's borrow from a parameter or "
+                "receiver — the §28.5 back-reference idiom)");
         } else {
         report(
             Severity::Error, as.span.begin,

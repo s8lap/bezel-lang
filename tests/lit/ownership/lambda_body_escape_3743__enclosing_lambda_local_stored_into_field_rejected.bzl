@@ -37,4 +37,6 @@ class C
 end C;
 
 // CHECK: :{{[0-9]+}}:{{[0-9]+}}: borrow of `r` stored into a field would outlive its source
-// CHECK-SAME: (§28.3's borrowed-field store rule
+// CHECK-SAME: is an owned scope-bound local disposed at scope end
+// CHECK-SAME: From inside a closure the value cannot reach the field
+// CHECK-SAME: §28.3 *Captured owned bindings* / §28.9:7398
