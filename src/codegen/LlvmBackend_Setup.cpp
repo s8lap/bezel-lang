@@ -12487,7 +12487,24 @@ void Emitter::emitImplicitBase(const sema::TypeSymbol* cls, llvm::Value* obj,
     if (auto* td = dynamic_cast<const ast::TypeDecl*>(cls->decl)) {
         if (!td->primaryBaseCtorArgs.empty()) {
             std::size_t n = td->primaryBaseCtorArgs.size();
-            if (sema::ConstructorSymbol* bt = ctorByArity(b, n, nullptr)) {
+            // fix #3731 (§22.8 step 1 / §22.10, v0.286): resolve the base
+            // call with `ctorForArgs` — the SAME resolver `new` uses to pick
+            // between a class's explicit constructors and its §22.10 PRIMARY
+            // constructor (`ctorForArgs` returning null is how a direct-`new`
+            // site already recognizes "route to the primary", #3625/#3713) —
+            // not the raw arity match `ctorByArity` performed. `ctorByArity`
+            // only sees `ConstructorSymbol`s, so a base declaring BOTH a
+            // primary constructor of arity `n` AND an explicit constructor of
+            // a DIFFERENT arity used to find no arity-`n` match here and fall
+            // straight through to the arity-0 fallback below, which then
+            // matched the explicit constructor and called it with NO
+            // arguments at all — silently dropping the base-clause value the
+            // primary was supposed to receive (measured: `bp=0` instead of
+            // `bp=7`). `ctorForArgs` also resolves an overload set by
+            // argument type when more than one explicit constructor shares
+            // arity `n`, which `ctorByArity` never attempted.
+            if (sema::ConstructorSymbol* bt =
+                    ctorForArgs(b, td->primaryBaseCtorArgs)) {
                 auto bit = ctorFns_.find(bt);
                 if (bit == ctorFns_.end() && ctx_.isImported(b)) {
                     declareImportedCtor(bt);
@@ -12534,6 +12551,63 @@ void Emitter::emitImplicitBase(const sema::TypeSymbol* cls, llvm::Value* obj,
                         return;
                     }
                 }
+            } else if (b->hasPositionalFields && hasAnyConstructor(b) &&
+                       sema::recordPositionalFieldSymbols(b).size() == n &&
+                       (!ctx_.isImported(b) || b->genericParams.empty())) {
+                // fix #3731 (§22.8 step 1 / §22.10, v0.286): `ctorForArgs`
+                // found no explicit constructor for these `n` args, `b`
+                // declares BOTH a primary constructor (`hasPositionalFields`)
+                // AND at least one explicit constructor (`hasAnyConstructor`
+                // — otherwise the plain no-explicit-ctor base below already
+                // handles it byte-identically), and `n` matches the
+                // primary's own arity exactly — the base clause routes to
+                // `b`'s PRIMARY constructor, mirroring `new`'s
+                // `directPrimaryNew` resolution (#3625/#3713) one level up
+                // the construction chain. §22.10: "This replaces an explicit
+                // `base(...)` call" — the base-clause call resolves like any
+                // other constructor call, and an explicit constructor that
+                // does NOT match these arguments never shadows the primary.
+                //
+                // `b`'s own positional-param fields are ALREADY populated:
+                // `prePopulateBasePositionalFields` (LlvmBackend_Exprs2.cpp)
+                // stores `td->primaryBaseCtorArgs` — the SAME values read
+                // above — into them at the construction entry point (the
+                // `new` site locally, `emitInitEntryBody` across a module),
+                // strictly before this function runs. So there is nothing to
+                // (re-)store here; what remains is exactly §22.8 steps 1+2
+                // for `b` ITSELF — its own base chain, then its own field
+                // initializers — run UNCONDITIONALLY, because `b`'s explicit
+                // constructor (the reason this shape reaches codegen at all)
+                // is deliberately NOT invoked on this path, and nothing else
+                // runs them.
+                //
+                // IMPORTED: `b`'s field initializers live in the exporter's
+                // AST, unreachable here (the #2374-class gap) — route
+                // through the exporter's `bz$<Base>$initprimary` entry point
+                // (fix #3713), which runs exactly steps 1+2 with NO vtable
+                // store (`emitInitEntryBody`'s `installVtable=false`) — so,
+                // unlike `emitImportedBaseFieldInit`'s `bz$<Base>$init` call,
+                // no vtable-slot save/restore is needed around it.
+                // `primaryInitFn` is only ever DEFINED by the exporter for a
+                // non-generic class (the `initFns_` emission loop above is
+                // gated on `genericParams.empty()`, and `emitInstanceInit
+                // Function` early-returns when `ts` never entered that map),
+                // so an imported GENERIC base with both constructor forms is
+                // excluded by the guard above and falls through unchanged to
+                // the existing (pre-existing-gap) arity-0 fallback below.
+                //
+                // LOCAL: the SAME two calls the no-explicit-ctor fallback
+                // below makes for `b` when `hasAnyConstructor(b)` is false —
+                // `emitLocalBaseFieldInit` already carries the generic
+                // ancestor substitution that case needs, so a local generic
+                // base with both forms is not a separate case here.
+                if (ctx_.isImported(b)) {
+                    builder_.CreateCall(primaryInitFn(b), {obj});
+                } else {
+                    emitImplicitBase(b, obj, mostDerived);
+                    emitLocalBaseFieldInit(b, obj, mostDerived);
+                }
+                return;
             }
         }
     }
