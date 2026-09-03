@@ -43,20 +43,31 @@
 // fix rejects that shape LOUDLY (a diagnostic) instead of shipping the leak;
 // #3720 is the sema-side fix (give `DictionaryEntry` a real field list).
 //
-// SORTEDDICTIONARY AND OWNINGDICTIONARY ARE NOT COVERED — measured, not
-// assumed, and unrelated to the string-key narrowing above (both fail on
-// PLAIN int keys too). `SortedDictionary<K,V>.First()` stays LOUD-rejected
-// end to end (a PRE-EXISTING, deliberate sema containment:
-// ExprTypecheck_Calls.cpp's `dictEntryElemTyped` hand-off excludes these four
-// names specifically so a later SortedDictionary-only catch-all clobbers the
-// type back to `V` — its own comment cites #3576 by number as the reason).
-// `OwningDictionary<K,V>` has no typing rule for these four names at all, so
-// `od.First()` itself now lowers (this fix's arm is reached by every
-// `isDictTypeName` receiver) but a consuming `fe.Key` still silently
-// degrades, one level up, via #2491 instead of #2434 — not a regression (see
-// the commit body), but not a fix for that family either. Both are filed as
-// the sema-side follow-up, #3716 — a `src/sema/**` change outside this
-// lane's file ownership.
+// SORTEDDICTIONARY AND OWNINGDICTIONARY WERE NOT COVERED BY THIS COMMIT AT
+// THE TIME IT LANDED — measured, not assumed, and unrelated to the
+// string-key narrowing above (both failed on PLAIN int keys too).
+// `SortedDictionary<K,V>.First()` stayed LOUD-rejected end to end (a
+// PRE-EXISTING, deliberate sema containment: ExprTypecheck_Calls.cpp's
+// `dictEntryElemTyped` hand-off excluded these four names specifically so a
+// later SortedDictionary-only catch-all clobbered the type back to `V` —
+// its own comment cited #3576 by number as the reason). `OwningDictionary
+// <K,V>` had no typing rule for these four names at all, so `od.First()`
+// itself lowered (this fix's arm is reached by every `isDictTypeName`
+// receiver) but a consuming `fe.Key` still silently degraded, one level up,
+// via #2491 instead of #2434 — not a regression (see the commit body), but
+// not a fix for that family either. Both were filed as the sema-side
+// follow-up, #3716 — a `src/sema/**` change outside this lane's file
+// ownership.
+//
+// #3716 HAS SINCE LANDED. `SortedDictionary`'s `First`/`Last`/`ElementAt`
+// (not `Single` — #3576's codegen arm here never implemented it, see #3761)
+// now type-check and lower correctly — value coverage in
+// `sorted_dict_linq_compose_3511_test.cpp` and
+// `dict_first_last_elementat_3716_test.cpp`. `OwningDictionary` did NOT get
+// a typing rule: stdlib §4.9's own prose rules out entry-view iteration on
+// it entirely ("The interface conformance is `IDisposable` only"), so
+// #3716 instead makes `od.First()`/`.Last()`/`.Single()`/`.ElementAt()` a
+// LOUD sema rejection — see `dict_first_last_elementat_3716_test.cpp`.
 //
 // ORACLE. Plain-return rows assert the ENTRY yielded (Key*100+Value, so a
 // wrong key or a wrong value both move the number). `runAotChecked` proves
@@ -505,20 +516,31 @@ BEZEL_TEST(dict_first_last_elementat_3576, dictionary_string_value_int_key_first
 }
 
 // ---------------------------------------------------------------------------
-// SortedDictionary / OwningDictionary — the surviving, sema-side half (#3716)
+// SortedDictionary / OwningDictionary — the sema-side half, CLOSED by #3716
 // ---------------------------------------------------------------------------
-
-// Pin: `SortedDictionary<K,V>.First()` stays a LOUD sema rejection, unchanged
-// by this fix, and correctly so (a deliberate pre-existing containment, not
-// this fix's job to lift — #3716). If this row ever starts PASSING (no
-// diagnostic), #3716's sema fix has landed and this whole block — plus the
-// `SortedDictionary` coverage it should gain — needs revisiting.
+//
+// UPDATED by fix #3716 (was: a pin that `SortedDictionary<K,V>.First()` stays
+// a loud sema rejection "pending #3716"). #3716 has landed:
+// `SortedDictionary`'s `First`/`Last`/`ElementAt` now type-check and lower
+// correctly (the sema containment this file's header comment describes was
+// lifted for those three names; full ascending-key value coverage lives in
+// `tests/codegen/sorted_dict_linq_compose_3511_test.cpp` and
+// `tests/codegen/dict_first_last_elementat_3716_test.cpp`). `Single` alone
+// stays excluded — #3576's codegen arm never implemented it — see #3761.
+//
+// `OwningDictionary<K,V>` did NOT get a typing rule mirroring `Dictionary`'s
+// (the shape #3716 originally suggested): stdlib §4.9's own prose rules it
+// out — "The interface conformance is `IDisposable` only... a borrowing
+// entry view over an owning dictionary is a separate decision deliberately
+// not taken here" — so `od.First()`/`.Last()`/`.Single()`/`.ElementAt()` are
+// now LOUD sema rejections instead of the pre-#3716 silent #2491
+// degradation. See `tests/codegen/dict_first_last_elementat_3716_test.cpp`
+// for that coverage.
 BEZEL_TEST(dict_first_last_elementat_3576,
-           sorted_dictionary_first_still_rejected_pending_3716) {
-    BEZEL_EXPECT_TRUE(hasError(prog(
+           sorted_dictionary_first_now_typed_and_ascending_3716) {
+    BEZEL_EXPECT_EQ(run(prog(
         "var sd := new SortedDictionary<int, int>(); "
-        "sd.Add(1, 10); "
+        "sd.Add(3, 30); sd.Add(1, 10); "
         "var fe := sd.First(); "
-        "return fe.Key; "),
-        "no member `Key` on primitive type `int`"));
+        "return fe.Key * 100 + fe.Value; ")), 110);
 }

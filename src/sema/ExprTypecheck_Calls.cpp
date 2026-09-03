@@ -6661,42 +6661,135 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         // fix #3511: this block owns the answer for every name it
                         // typed here (including the `typeLinqOperator` fallback,
                         // whose own name set is the one authority for §5) —
-                        // EXCEPT the four §5 element-access terminals.
+                        // EXCEPT `Single` (see below) — the other three §5
+                        // element-access terminals are no longer carved out.
                         //
-                        // Why those four are carved out (issue 3576). `First` /
-                        // `Last` / `Single` / `ElementAt` are typed by ONE
+                        // History (issue 3576, superseded here by #3716).
+                        // `First`/`Last`/`Single`/`ElementAt` are typed by ONE
                         // dedicated arm a few lines above (`setExprType(entryTy)`)
-                        // and are lowered by a DIFFERENT codegen path from
-                        // everything this fix enables — and that path has no arm
-                        // for an entry-struct element type on ANY member of the
-                        // dictionary family, `Dictionary` included. It emits the
-                        // `#2434` "degraded to a zero-initialized value" NOTE,
-                        // which is not an error, so the program compiles and
-                        // yields a zero-filled entry.
+                        // and were, at the time #3576 was filed, lowered by NO
+                        // codegen path at all for an entry-struct element type on
+                        // ANY member of the dictionary family — so letting this
+                        // guard cover them turned a loud pre-fix rejection into a
+                        // silent wrong answer (`var f := sd.First(); … f.Key`
+                        // going from "no member `Key` on primitive type `int`" to
+                        // compiling and printing `0:0`). #3576 (narrow, landed as
+                        // 82fceb2) closed that gap in codegen for `First`/`Last`/
+                        // `ElementAt` — `LlvmBackend_Calls.cpp`'s `isDict` block
+                        // now decodes those three for ANY `isDictTypeName`
+                        // receiver (`Dictionary`, `SortedDictionary`, and
+                        // `OwningDictionary` alike) — so this catch-all no longer
+                        // needs to clobber them back to `V` for `SortedDictionary`
+                        // specifically; #3716 lifts the exclusion for those three.
                         //
-                        // Letting the guard cover them would therefore turn a
-                        // LOUD pre-fix rejection into a SILENT wrong answer:
-                        // measured, `var f := sd.First(); … f.Key` went from a
-                        // hard "no member `Key` on primitive type `int`" (the
-                        // catch-all had typed the call as V) to compiling and
-                        // printing `0:0` with exit 0. Excluding the four names
-                        // keeps that reject exactly as loud as it was, and costs
-                        // nothing this fix delivers: every operator #3511 is
-                        // about — the lazy chain through `typeLinqOperator`, the
-                        // `Any`/`All`/`Count` bool/int arms, and the
-                        // `ToArray`/`ToSet` materializers — is typed by a
-                        // different arm and lowered by a different path.
+                        // `Single` STAYS carved out. Measured directly against
+                        // #3576's own codegen arm (LlvmBackend_Calls.cpp, the
+                        // `isDict` block): its condition is `(call.args.empty() &&
+                        // (m == "First" || m == "Last")) || (m == "ElementAt" &&
+                        // …)` — there is no `m == "Single"` arm anywhere in that
+                        // block, nor anywhere else in the `isDict` codegen
+                        // surface. Typing `sd.Single()` as `entryTy` here would
+                        // hand codegen a call it cannot lower — `lowerLocalDecl`'s
+                        // #2434 defense-in-depth would degrade it SILENTLY to a
+                        // zero-filled entry rather than reject it, exactly the
+                        // loud→quiet trade LANE_RULES §6c forbids (the shape
+                        // #3444 names "a typed call with no lowering arm is a
+                        // silent miscompile"). The SAME gap already exists today
+                        // for `Dictionary<K, V>.Single()` — that block's arm above
+                        // types it unconditionally and `Dictionary` has no
+                        // catch-all here to stop it — measured: `new
+                        // Dictionary<int,int>(){{1,1}}.Single()` bound to a local
+                        // compiles clean and prints `dictSingle=0`. That is a
+                        // pre-existing defect outside #3716's stated scope
+                        // (SortedDictionary + OwningDictionary) and outside this
+                        // lane's file ownership (the fix is in
+                        // `LlvmBackend_Calls.cpp`, not owned here) — filed
+                        // separately as #3761 rather than fixed here. Keeping
+                        // `Single` on the `V`-catch-all path below preserves its
+                        // current loud rejection for `SortedDictionary` (it does
+                        // NOT preserve today's silent bug for plain `Dictionary`,
+                        // which this arm cannot reach — see #3761).
                         //
                         // The carve-out is deliberately spelled by NAME rather
                         // than by "did the element-access arm fire", because the
-                        // four names ARE the arm's whole condition; there is no
-                        // separate fact to consult.
-                        const bool isEntryElementAccess =
-                            m == "First" || m == "Last" || m == "Single" ||
-                            m == "ElementAt";
+                        // name IS the arm's whole condition; there is no separate
+                        // fact to consult.
+                        const bool isEntryAccessWithoutCodegenArm = m == "Single";
                         dictEntryElemTyped =
                             !hadTypeBefore && (ctx_.exprType(ce) != nullptr) &&
-                            !isEntryElementAccess;
+                            !isEntryAccessWithoutCodegenArm;
+                    }
+                    // fix #3716 / stdlib §4.9 (v0.286): `OwningDictionary<K,
+                    // V>`'s §5 element-access terminals `First`/`Last`/`Single`/
+                    // `ElementAt` are not merely unresolved by sema — they are
+                    // NOT PART OF THE STDLIB SURFACE AT ALL. §4.9's own prose is
+                    // explicit: "The interface conformance is `IDisposable` only
+                    // — not `IOwningCollection<DictionaryEntry<K, V>>`... a
+                    // borrowing entry view over an owning dictionary is a
+                    // separate decision deliberately not taken here... Default
+                    // `for var entry in ownedDict do` iteration is not provided
+                    // on `OwningDictionary<K, V>`". §5's `First`/`Last`/`Single`/
+                    // `ElementAt` are `extension IEnumerable<T>` members
+                    // (reachable for `Dictionary`/`SortedDictionary` via
+                    // `ICollection<DictionaryEntry<K,V>>: IReadOnlyCollection<..
+                    // >: IEnumerable<..>`); `OwningDictionary` conforms to
+                    // neither, so these four names have NO applicable stdlib
+                    // member on it — exactly like calling them on any other
+                    // `IDisposable`-only type would be a misspelling. The
+                    // suggested fix on issue #3716 itself — "mirror the
+                    // Dictionary rule" and type the call as `entryTy` — is
+                    // REFUTED by this: doing that would make `od.First().Key`
+                    // COMPILE AND RUN, which contradicts §4.9's prose above.
+                    //
+                    // Before this fix these four calls reached NO typing rule
+                    // at all (absent from this function's `colName ==
+                    // "Dictionary" || colName == "SortedDictionary"` block
+                    // above, and from the `colName == "Dictionary" || colName
+                    // == "OwningDictionary"` method-list block below), so `ce`'s
+                    // `exprType` stayed unresolved. Narrow #3576's codegen arm
+                    // (`LlvmBackend_Calls.cpp`'s `isDict` block — `isDictTypeName`
+                    // is a three-name registry) still fires for ANY
+                    // `isDictTypeName` receiver, `OwningDictionary` included, so
+                    // `od.First()` itself silently produced an entry VALUE with
+                    // no sema type attached to interpret it — the consuming
+                    // expression then degraded instead of rejecting (measured:
+                    // `var fe := od.First(); return fe.Key;` gave "internal:
+                    // return-value expression failed to lower to a value
+                    // (degraded to a zero/null return value) — #2491", exit 0,
+                    // wrong value 0). Reject the call LOUDLY here instead — the
+                    // §6c-correct fix for a member that genuinely does not
+                    // exist on this receiver, in the same "does not expose"
+                    // shape as `OwningArray<T>.AsSpan()` a few lines above.
+                    //
+                    // Note this is a NARROWER, more targeted gate than the
+                    // generic `allowedOwningMethod` union earlier in this
+                    // function (~line 5353): that union deliberately admits
+                    // `First`/`Last`/every `common::isBuiltinCollectionLinqOperat
+                    // orName` name (including `Single`/`ElementAt`) for EVERY
+                    // owning container, "over-inclusion never over-rejects — a
+                    // name valid on a SIBLING owning type is allowed here too;
+                    // that finer per-type precision is a follow-up" (that
+                    // comment's own words) — so it does not, and by design does
+                    // not, catch this. This block is exactly that follow-up,
+                    // scoped to `OwningDictionary`.
+                    if (colName == "OwningDictionary" &&
+                        (m == "First" || m == "Last" || m == "Single" ||
+                         m == "ElementAt")) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, ce.span.begin,
+                            std::string("`OwningDictionary<K, V>` does not "
+                                        "expose `") +
+                            std::string(m) +
+                            "` — its interface conformance is `IDisposable` "
+                            "only (stdlib §4.9): a borrowing entry view over "
+                            "an owning dictionary is a decision the stdlib "
+                            "deliberately does not take (a `DictionaryEntry<K, "
+                            "V>` is a record and cannot own the dictionary's "
+                            "owned `Value`, unlike `Drain()`'s "
+                            "`DrainedEntry<K, V>`). Use `Drain()` "
+                            "(ownership-transferring, one pass) or the "
+                            "borrowing key-driven surface (`Keys`, "
+                            "`GetOrNull`, the indexer) instead.");
                     }
                     // §4.15 (#549): Array<T>.AsSpan() / AsSpan(start) /
                     // AsSpan(start,length) / AsSpan(range) → ArraySpan<T>.
@@ -7310,12 +7403,17 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         // `IEnumerable<DictionaryEntry<K, V>>`) must NOT fall into
                         // the catch-all below — that is the clobber #3511 reports.
                         //
-                        // `dictEntryElemTyped` is FALSE for `First`/`Last`/
-                        // `Single`/`ElementAt` by construction (issue 3576), so
-                        // those four still reach the catch-all and are still typed
-                        // as V — which is what makes `sd.First().Key` a loud
-                        // reject instead of a silent zero-filled entry. The
-                        // reasoning is recorded where the flag is assigned.
+                        // fix #3716: `dictEntryElemTyped` is now TRUE for
+                        // `First`/`Last`/`ElementAt` (narrow #3576 gave codegen
+                        // an arm for all three over any `isDictTypeName`
+                        // receiver), so they keep the `entryTy` typed above and
+                        // `sd.First().Key` type-checks instead of rejecting.
+                        // `Single` is still FALSE by construction (no codegen
+                        // arm exists for it — see the flag's assignment site
+                        // above), so it still reaches the catch-all below and
+                        // is still typed as `V` — which is what makes
+                        // `sd.Single().Key` a loud reject instead of a silent
+                        // zero-filled entry.
                         else if (dictEntryElemTyped) { /* typed above; keep it */ }
                         // Indexer / Value return: V (second generic arg).
                         else if (recvTy && recvTy->genericArgs.size() > 1 &&
