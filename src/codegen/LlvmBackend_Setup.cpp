@@ -9164,6 +9164,35 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
     // #422 / §4.6 / §28.9: which `var` string locals may be released at scope
     // end (mirrors collectUnwindIneligible; consulted in lowerLocalDecl).
     stringReleaseEligible_.clear();
+    // fix #3782 (§28.9, v0.286): the STRING twin of the clear the #3757/#3762
+    // fix added ~30 lines below for `closureLocalCandidates_`, and it had the
+    // identical asymmetry. `stringLocalCandidates_` (fix #2817) is repopulated
+    // only by `collectStringReleaseEligible`, which this function calls under a
+    // `ci.bodyKind == Block && ci.stmts` gate — so an EXPRESSION-bodied method
+    // never runs it, while `stringReleaseEligibleFn_ = fn` on the next line
+    // pins the token unconditionally. That is the two-halves clear()+populate
+    // contract (LANE_RULES §8) broken in exactly the shape #3762 was: the fn
+    // gate in `returnedStringLocalOwnsPlusOne` is satisfied for this body while
+    // its body-membership set still holds the PREVIOUS body's decls, and the
+    // arrow-body string mint further down (`ci.exprBody`, the #694/#2262 site)
+    // consults that predicate directly — a stale hit there SKIPS the +1 the
+    // caller's scope-end release is about to discharge, which is the
+    // under-retain (premature free) direction, not a leak.
+    //
+    // NOT EXPLOITABLE TODAY, and the reason is an accident rather than an
+    // invariant: `returnedStringLocalOwnsPlusOne` requires the returned
+    // identifier to resolve to a `sema::LocalSymbol`, and an expression-bodied
+    // method has no locals of its own, so the only names it can return are
+    // parameters and members — and `ParameterSymbol` is not a `LocalSymbol`.
+    // Nothing pins that; the first refactor that lets a parameter or a captured
+    // binding satisfy the candidate predicate turns this into the #3762
+    // conflation. The invariant must hold at every clear site, not only the
+    // ones a repro happens to reach today. Measured with `bezelc -c` and `cmp`
+    // over 31 programs — this fix's own three arrow-body/block-body pairings
+    // plus the whole #3773 over-mint grid — 31 SAME, 0 DIFF, so this line
+    // changes no emitted code today (LANE_RULES §11: SAME is conclusive). The
+    // test beside it documents the invariant rather than a behaviour change.
+    stringLocalCandidates_.clear();
     stringReleaseEligibleFn_ = fn;
     // #1003 / stdlib §5 / §28: which plain `var` borrowing-Array locals bound to a
     // fresh materializer (ToArray/Sorted/Reversed) may have their backing reclaimed
