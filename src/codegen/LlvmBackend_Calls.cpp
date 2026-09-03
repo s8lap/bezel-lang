@@ -7281,14 +7281,25 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             if (!k) return nullptr;
             // For an OwningDictionary<K, class> get the value disposer thunk
             // (same helper Clear uses, so the dispose logic is exactly-once
-            // and consistent). For borrowing Dictionary<K, string>, get the
-            // string-release thunk. For borrowing Dict or non-class/non-string
-            // values, valDisp is null → fall through to plain non-disposing remove.
+            // and consistent). For a borrowing Dictionary<K, V> (or
+            // SortedDictionary<K, V>) whose V is heap-boxed (record, nullable
+            // value type, choice — fix #3787), get the box-freeing thunk. For
+            // borrowing Dictionary<K, string>, get the string-release thunk.
+            // For borrowing Dict or non-class/non-string/non-boxed values,
+            // valDisp is null → fall through to plain non-disposing remove.
             // #602 / §28.11 v0.135 fix #619: derive disposer from dictValPol (hoisted
             // above).  dictValClassDisposer: OwningDictionary<K,class-or-interface>
             // (ClassOwned row per §28.11 v0.135).
+            // fix #3787 (stdlib §4.8 / §4.17, v0.286): dictValueBoxFreer fallback —
+            // Remove(k) was the only disposal call site missing it (scope-end in
+            // LlvmBackend_Setup.cpp, .Clear() above at ~L7015, and the indexer-
+            // overwrite path in LlvmBackend_Assign.cpp all already call it). Same
+            // position in the cascade as .Clear()'s: class-disposer, then
+            // box-freer, then string-release — one spelling, four call sites
+            // (scope-end, Clear, indexer-overwrite, and now Remove).
             // dictIsStringValue: borrowing Dictionary<K,string> (RuntimeManaged row).
             llvm::Function* valDisp = dictValClassDisposer;
+            if (!valDisp) valDisp = dictValueBoxFreer(recvTy);
             if (!valDisp && dictIsStringValue)
                 valDisp = stringElementReleaseThunk();
             if (keyTy) {
