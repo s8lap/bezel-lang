@@ -15673,11 +15673,43 @@ private:
         llvm::Type* keyLlvm, llvm::Value* keysArr, llvm::Value* idx,
         const char* namePrefix);
 
+    // fix #3770 / #3768 (stdlib §4.8 / §28.9, v0.286): the ONE predicate for
+    // "this dictionary V is stored BOXED as a struct" (malloc'd, one heap
+    // block per value, holding the value's own LLVM struct bytes) rather than
+    // encoded inline into the pointer-sized slot (a scalar via ptrtoint, or a
+    // raw pointer for string/class — a borrow, never boxed).
+    //
+    // Before #3770/#3768, THREE separate call sites each re-derived this
+    // decision with their OWN narrower spelling — `decodeDictValueAt` (below)
+    // had already been unified onto `valLlvm->isStructTy()` by fix #3758, but
+    // `dictValueBoxFreer` (LlvmBackend_Disposal.cpp — the DISPOSAL side) still
+    // tested `valIsRecord || valIsNullableVal`, and `lowerDictValuesFor`
+    // (LlvmBackend_Stmts.cpp, `for var v in d.Values`) carried a THIRD,
+    // independent inline copy of the same narrow test. Both excluded a
+    // struct-lowering V that is neither a record nor a nullable value type —
+    // i.e. a `choice` (value-like OR one that merely holds a class-typed
+    // BORROW field: choiceStruct lowers every classification to a bare LLVM
+    // struct, §35.4/§35.1) — so a `Dictionary<K, Choice>` leaked every
+    // entry's box on disposal (#3770) and `for var v in d.Values` crashed the
+    // IR verifier (`Trunc only produces integer`, #3768) exactly as the
+    // decode side did before #3758.
+    //
+    // All three sites now read THIS predicate instead of re-deriving their
+    // own, so they cannot drift apart again. `isStructTy()` is a strict
+    // superset of every predicate it replaces here (a record's and a nullable
+    // value type's LLVM lowering both already imply `isStructTy()`), so this
+    // widens what each site ADMITS without narrowing anything any of them
+    // already handled — see each call site's own comment for its
+    // object-parity measurement.
+    static bool dictValueIsBoxedStruct(llvm::Type* valLlvm) {
+        return valLlvm && valLlvm->isStructTy();
+    }
+
     // fix #3758 (§4.8 / §9.x choice lowering, v0.286): decodeDictValueAt
     // decodes the VALUE half at `idx` out of `valsArr` — struct-load the
-    // boxed slot when `valLlvm` itself lowers to an LLVM struct type, else
-    // ptrtoint+bitcast/trunc a scalar out of the pointer-sized slot, else pass
-    // the raw pointer through as a borrow.
+    // boxed slot when `dictValueIsBoxedStruct(valLlvm)` (above) says the slot
+    // is boxed, else ptrtoint+bitcast/trunc a scalar out of the pointer-sized
+    // slot, else pass the raw pointer through as a borrow.
     //
     // Before this fix `loadAsStruct` was a caller-supplied bool: the for-in
     // loop / materializer / GetEnumerator sites computed

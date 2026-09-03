@@ -6626,19 +6626,19 @@ bool Emitter::lowerDictValuesFor(const ast::ForStmt& fs) {
     if (dictTy->genericArgs.size() < 2 || !dictTy->genericArgs[1]) return false;
     const sema::TypeRef* valTy = dictTy->genericArgs[1];
 
-    // Determine if V is a record (heap-boxed in the dict), a scalar, or a ptr.
-    // Any Named-kind TypeRef with a Record declaration is boxed (issue D4).
-    const sema::TypeSymbol* valRec =
-        (valTy && valTy->kind == sema::TypeRef::Kind::Named &&
-         valTy->declaration &&
-         valTy->declaration->kind == ast::TypeDeclKind::Record)
-            ? valTy->declaration : nullptr;
-    // issue #539 / §4.8 / §7: nullable value types (int?, bool?, enum?,
-    // nullable record) lower to a tagged {i8 hasValue; T} struct and are
-    // heap-boxed by encodeValue.  Decode them the same way records are:
-    // load the struct back from the box pointer in the slot.
-    bool valNullableVal = valTy && isNullableValueTy(valTy);
-
+    // fix #3768 (§4.8 / §28.9, v0.286): the struct-vs-scalar-vs-pointer decode
+    // decision is now made ONCE by decodeDictValueAt (LlvmBackend_impl.hpp /
+    // LlvmBackend_Stmts.cpp, via the shared dictValueIsBoxedStruct predicate)
+    // instead of this loop re-deriving its OWN `valRec || (valNullableVal &&
+    // isStructTy())` copy — before this fix that copy was a SEVENTH,
+    // independent instance of the exact narrow predicate fix #3758 unified
+    // everywhere else, so `for var v in d.Values` over a `Dictionary<int,
+    // Choice>` still crashed the IR verifier (`Trunc only produces integer`)
+    // after #3758 landed. See decodeDictValueAt's declaration for why routing
+    // through it is a strict widening (record / nullable-int / int / string /
+    // class V all decode identically to before; only a struct-lowering V that
+    // is neither a record nor a nullable value type — a choice — is newly
+    // admitted).
     llvm::Type* valLlvm = lowerTypeRef(valTy);
     if (!valLlvm) return false;
 
@@ -6706,48 +6706,16 @@ bool Emitter::lowerDictValuesFor(const ast::ForStmt& fs) {
     builder_.CreateCondBr(builder_.CreateICmpSLT(idx, cnt), bodyBB, endBB);
 
     builder_.SetInsertPoint(bodyBB);
-    llvm::Value* idxB   = builder_.CreateLoad(i64(), idxSlot);
-    llvm::Value* vpPtr  = builder_.CreateGEP(ptrTy(), valsArr, idxB);
-    llvm::Value* slotV  = builder_.CreateLoad(ptrTy(), vpPtr);  // raw void*
+    llvm::Value* idxB = builder_.CreateLoad(i64(), idxSlot);
 
-    // Decode void* → V following the same encoding as TryGetValue / GetOrAdd.
-    //   record value: slotV is the heap-box pointer → load the record struct
-    //     out of the box (fix #563; mirrors emitGenericKeyTableFor and the
-    //     direct-indexer get in lowerCollectionIndexerGet §4.8).  The box is
-    //     owned by the dict and must not be freed — we only read its bytes.
-    //   nullable value type (issue #539): slotV is the heap-box pointer of the
-    //     tagged {i8,T} struct → load the struct from the box.
-    //   scalar (int/long/bool/char/enum/float/double): slotV was inttoptr'd →
-    //     ptrtoint back to i64, then trunc/bitcast to the target type.
-    //   pointer (string / class object): slotV IS the value.
-    llvm::Value* decoded;
-    if (valRec) {
-        // fix #563 / §4.8: load the record struct from the heap box.  The
-        // runtime heap-boxes records (malloc + memcpy) so they fit in the void*
-        // value slot; decode by loading the struct type out of the box pointer,
-        // exactly as lowerCollectionIndexerGet does for dict[key] on a record V.
-        decoded = builder_.CreateLoad(valLlvm, slotV, "dv.rec");
-    } else if (valNullableVal && valLlvm->isStructTy()) {
-        // Nullable value type: unbox the tagged struct from the heap box.
-        // The box is non-null even when hasValue=0 (the null tag is in the
-        // bytes, not the pointer).
-        decoded = builder_.CreateLoad(valLlvm, slotV, "dv.nvval");
-    } else if (!valLlvm->isPointerTy()) {
-        // Scalar: undo the inttoptr encoding.
-        llvm::Value* asI64 = builder_.CreatePtrToInt(slotV, i64());
-        if (valLlvm->isDoubleTy())
-            decoded = builder_.CreateBitCast(asI64, valLlvm);
-        else if (valLlvm->isFloatTy())
-            decoded = builder_.CreateBitCast(
-                builder_.CreateTrunc(asI64, i32()), valLlvm);
-        else if (valLlvm->isIntegerTy(64))
-            decoded = asI64;
-        else
-            decoded = builder_.CreateTrunc(asI64, valLlvm);
-    } else {
-        // Pointer (string / class object): the void* IS the value.
-        decoded = slotV;
-    }
+    // fix #3768 (§4.8 / §28.9, v0.286): decode void* → V through the SAME
+    // decodeDictValueAt helper lowerDictEntryFor's for-in loop already routes
+    // through (see that function's own comment) — struct-load a boxed slot
+    // (record / nullable value type / choice, per dictValueIsBoxedStruct),
+    // else undo the ptrtoint scalar encoding, else pass the raw pointer
+    // through as a borrow (string / class object). The box itself is owned by
+    // the dict and must not be freed here — this only reads its bytes.
+    llvm::Value* decoded = decodeDictValueAt(valLlvm, valsArr, idxB, "dv.val");
     builder_.CreateStore(decoded, varSlot);
 
     loopStack_.push_back({incBB, endBB, disposeStack_.size()});
@@ -6833,12 +6801,14 @@ llvm::Value* Emitter::decodeDictValueAt(llvm::Type* valLlvm, llvm::Value* valsAr
                                         const char* namePrefix) {
     llvm::Value* vpPtr = builder_.CreateGEP(ptrTy(), valsArr, idx);
     llvm::Value* slotV = builder_.CreateLoad(ptrTy(), vpPtr);
-    // fix #3758: derived from the lowered type itself (a struct-lowering V
-    // is ALWAYS struct-loaded from the box, whether it is a record, a
-    // nullable value type, or a choice) rather than a caller-supplied bool —
-    // see the declaration in LlvmBackend_impl.hpp for why this is a strict
-    // widening, not a behaviour change, for every V reachable before this fix.
-    if (valLlvm->isStructTy())
+    // fix #3758, now routed through the #3770/#3768 shared predicate: derived
+    // from the lowered type itself (a struct-lowering V is ALWAYS
+    // struct-loaded from the box, whether it is a record, a nullable value
+    // type, or a choice) rather than a caller-supplied bool — see
+    // dictValueIsBoxedStruct's declaration in LlvmBackend_impl.hpp for why
+    // this is a strict widening, not a behaviour change, for every V
+    // reachable before fix #3758.
+    if (dictValueIsBoxedStruct(valLlvm))
         return builder_.CreateLoad(valLlvm, slotV, namePrefix);
     if (!valLlvm->isPointerTy()) {
         llvm::Value* asI64 = builder_.CreatePtrToInt(slotV, i64());

@@ -4486,31 +4486,67 @@ llvm::Function* Emitter::boxElementDisposerThunk() {
 
 
 llvm::Function* Emitter::dictValueBoxFreer(const sema::TypeRef* dictTy) {
-    // #401 / stdlib §4.8: only a BORROWING Dictionary<K,V> whose value type V is
-    // a RECORD or a NULLABLE VALUE TYPE stores a heap box per value (the encode in
-    // LlvmBackend_{Calls,Assign}.cpp boxes exactly `(valRec || valNullableVal) &&
-    // isStructTy()`); its disposal must reclaim each surviving box. An
+    // #401 / stdlib §4.8, WIDENED by fix #3770 (§28.9, v0.286): only a
+    // BORROWING Dictionary<K,V> whose value type V is stored BOXED — a
+    // record, a nullable value type, or (since #3770) a `choice` — stores a
+    // heap box per value; its disposal must reclaim each surviving box. An
     // OwningDictionary<K, class> routes through owningDictValueDisposer instead
     // (#394: dispose+free a class object), and a borrowing Dictionary with a
-    // scalar/string value stores no box (the value is inttoptr'd or is the pointer
-    // itself) — both return null here, so the value box is never freed twice.
-    // The record check mirrors the encode's broad test (any record declaration,
-    // hashable or not), NOT the narrower recordTypeOfRef, so it matches
-    // every boxed value exactly.
-    // issue #539 / §7: nullable value types ({i8,T} tagged structs) are also
-    // heap-boxed by encodeValue; their boxes must be freed at Clear/scope-end too.
+    // scalar/string/class value stores no box (the value is inttoptr'd or is
+    // the pointer itself) — both return null here, so the value box is never
+    // freed twice.
+    //
+    // Before #3770 this function tested `valIsRecord || valIsNullableVal`
+    // directly — the EXACT narrow predicate fix #3758 replaced on the DECODE
+    // side (decodeDictValueAt) with `dictValueIsBoxedStruct` (LlvmBackend_
+    // impl.hpp), because that test excludes a struct-lowering V that is
+    // neither a record nor a nullable value type: a `choice` (choiceStruct
+    // lowers EVERY classification — value-like, borrow-bearing, or owning —
+    // to a bare LLVM struct, §35.1/§35.4). #3758 fixed the read side; this
+    // function is the WRITE-side twin the same narrow test survived in,
+    // confirmed by the encode side's own broad test (LlvmBackend_{Calls,
+    // Assign}.cpp's `encodeValue`: fix #685 boxes ANY struct-typed value, not
+    // just `valRec || valNullableVal`) — so a `Dictionary<K, Choice>` boxed
+    // every value on `.Add` (correctly) but never freed the box on
+    // disposal/Clear/overwrite (this function returned null for a choice V),
+    // leaking every entry — measured 4800 B / 400 allocations at 200
+    // iterations of bare `.Add` + dispose, no iteration at all (issue #3770).
+    //
+    // Reading `dictValueIsBoxedStruct(lowerTypeRef(valTy))` here — the SAME
+    // predicate the decoder and `lowerDictValuesFor` (#3768, LlvmBackend_
+    // Stmts.cpp) now read — is a strict widening for every V this function
+    // was ever called with: `valIsRecord` and `valIsNullableVal` both already
+    // imply `isStructTy()`, so int / nullable-int / string / class V are
+    // UNCHANGED (none of them is struct-lowering) and only a struct-lowering
+    // V that is neither record nor nullable-value — i.e. a choice — newly
+    // qualifies. `valueBoxFreeThunk` stays a plain `free()` (§3.2/§9: a value
+    // type carries no disposal obligation of its own) — unchanged by this fix,
+    // and correct for a choice exactly as it already was for a record: the
+    // choice's OWN classification can never be `owning` here, because an
+    // owning-classified choice is move-only ([§15.3](move-only value types))
+    // and `Dictionary<K,V>.Add(key: K, value: V)` takes `value` by plain
+    // (non-owned, non-move) parameter, so only a value-like or a
+    // borrow-bearing choice ever reaches a live `Dictionary<K, Choice>` — a
+    // borrow-bearing choice's class-typed payload field is a raw BORROW
+    // pointer inside the box (verified: `dict_choice_value_box_freer_3770_
+    // test.cpp`'s `class_like_choice_...` row disposes the borrowed class
+    // instance separately via its own `using var` and measures zero leak,
+    // zero double-free, 200x under ASan/LSan) — freeing the box never touches
+    // it, so there is no double free of a choice's box or its payload.
+    // (Sema does not yet reject an OWNING-classified choice as a Dictionary
+    // V at all — a separate, pre-existing gap measured and filed as #3775;
+    // this function's widening does not worsen that gap, since it still only
+    // frees the box, exactly as it already did for a record V — measured:
+    // that repro's leak goes from 40 B (24 B box + 16 B owned Connection) to
+    // 16 B [Connection only] after this fix, never to a double free.)
     if (!dictTy || !dictTy->astNode || !dictTy->astNode->name ||
         dictTy->astNode->name->parts.empty())
         return nullptr;
     if (dictTy->headName() != "Dictionary") return nullptr;
     if (dictTy->genericArgs.size() <= 1) return nullptr;
     const sema::TypeRef* valTy = dictTy->genericArgs[1];
-    bool valIsRecord =
-        valTy && valTy->kind == sema::TypeRef::Kind::Named &&
-        valTy->declaration &&
-        valTy->declaration->kind == ast::TypeDeclKind::Record;
-    bool valIsNullableVal = valTy && isNullableValueTy(valTy);
-    if (!valIsRecord && !valIsNullableVal) return nullptr;
+    llvm::Type* valLlvm = valTy ? lowerTypeRef(valTy) : nullptr;
+    if (!dictValueIsBoxedStruct(valLlvm)) return nullptr;
     return valueBoxFreeThunk();
 }
 

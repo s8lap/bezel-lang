@@ -85,42 +85,64 @@
 // `SortedDictionary<int, Shape>` (`lowerDictEntryFor`'s own ascending-sort
 // branch, already routed through the fixed `decodeDictValueAt`).
 //
-// ORACLE — runAotCheckedLenient, NOT runAotChecked, and here is why (a
-// blocker discovered WHILE writing this file, filed separately as #3770,
-// NOT part of #3758 and NOT fixed by it): EVERY row below constructs a
-// `Dictionary<K, Choice>` and `.Add`s at least one entry, which boxes the
-// choice value on the heap (`.Add`'s encode path — confirmed by the leak's
-// own stack trace bottoming out in a `malloc` at the `.Add` call site, with
-// or without any read of the dictionary afterward). Freeing that box on the
-// dictionary's own disposal is `dictValueBoxFreer`'s job
-// (`LlvmBackend_Disposal.cpp:4488`), and it tests the EXACT SAME narrow
-// predicate #3758 fixes here (`valIsRecord || valIsNullableVal`, excluding a
-// choice) — so it returns null for a choice V and the box is never freed.
-// MEASURED: a 200x loop of `using var d := new Dictionary<int, Shape>();
+// ORACLE — UPDATED by fix #3770/#3768 (same commit) from runAotCheckedLenient
+// to runAotChecked. History: EVERY row below constructs a `Dictionary<K,
+// Choice>` and `.Add`s at least one entry, which boxes the choice value on
+// the heap (`.Add`'s encode path — confirmed by the leak's own stack trace
+// bottoming out in a `malloc` at the `.Add` call site, with or without any
+// read of the dictionary afterward). Freeing that box on the dictionary's own
+// disposal was `dictValueBoxFreer`'s job (`LlvmBackend_Disposal.cpp:4488`),
+// and at the time this file was written it tested the EXACT SAME narrow
+// predicate #3758 fixed on the decode side (`valIsRecord || valIsNullableVal`,
+// excluding a choice) — so it returned null for a choice V and the box was
+// never freed: a 200x loop of `using var d := new Dictionary<int, Shape>();
 // d.Add(...); d.Add(...);` with NO for-in, NO GetEnumerator, NO LINQ at all
-// leaks 4800 B in 400 allocations under LSan, byte-identical on the #3758
-// PARENT and the #3758 FIX — this is pre-existing, independent of the
-// decode-side crash this file's fix closes, and unfixable from THIS file's
-// scope (a different file, `LlvmBackend_Disposal.cpp`, outside #3758's
-// ownership; see issue #3770 for the fix).
+// leaked 4800 B in 400 allocations under LSan, byte-identical on the #3758
+// PARENT and the #3758 FIX. Filed as #3770 (disposal-side sibling) and #3768
+// (`lowerDictValuesFor` / `for var v in d.Values`, a SEVENTH independent copy
+// of the same narrow predicate, untouched by #3758's routing through
+// decodeDictValueAt). Both are now fixed: `dictValueBoxFreer` and
+// `lowerDictValuesFor` read the SAME `dictValueIsBoxedStruct` predicate
+// `decodeDictValueAt` reads (LlvmBackend_impl.hpp), so a choice V's box is
+// freed exactly once at scope-end/Clear/overwrite — SIX of the eight rows
+// below (every plain-`Dictionary<K,V>` row) now run under the STRICT
+// `runAotChecked` oracle (LeakSanitizer's exit-time scan included) and are
+// expected to be LSan-clean, not merely UAF/double-free-clean. Measured
+// individually before flipping each: for-in (1), the ungated explicit
+// GetEnumerator (2), the LINQ materializer (3), #3576's First()/Last() (4),
+// and the cross-caller-agreement row are ALL LSan-clean post-fix.
 //
-// So: `runAotCheckedLenient` (`tests/support/aot_support.hpp`, pinned by
-// `aot_checked_lenient_2214_test.cpp`) — the SAME AOT + generated-code-ASan
-// pipeline as `runAotChecked`, with ONLY LeakSanitizer's exit-time scan
-// disabled (`ASAN_OPTIONS=detect_leaks=0`). A real use-after-free / double-
-// free / out-of-bounds access in the struct-load path THIS fix touches is
-// still caught (ASan's instrumentation fires on the access, not at exit);
-// only the KNOWN, separately-filed box leak is not asserted on. Every row is
-// still looped 200x so a UAF that only manifests on a REUSED allocation
-// (freed-then-reused heap slot) has the same chance to fire it would under
-// the strict variant. The int-payload rows prove the struct LOAD itself
-// decodes the right bytes (the case-match on the loop-decoded value recovers
-// the exact payload written at `Add`); the string-payload row proves an
-// OWNED field inside a struct-lowering choice value survives 200 reads via
-// the now-fixed struct-load path with no UAF/double-free from the read
-// itself (it CANNOT prove "disposed exactly once" — the outer box leaking
-// means the string leaks with it, which is #3770's bug, not this file's to
-// assert clean).
+// The TWO `SortedDictionary` rows
+// (`for_in_int_payload_choice_value_sorted_dict_4_17`,
+// `sorted_dict_getenumerator_int_payload_choice_value_4_17`) STAY on
+// `runAotCheckedLenient` — flipping them would fail on a SEPARATE,
+// pre-existing, unrelated leak discovered while doing this measurement and
+// filed as #3776: `dictValueBoxFreer`'s `headName() != "Dictionary"` guard
+// excludes `SortedDictionary<K,V>` entirely, for EVERY boxed V kind, not
+// just choice — a `SortedDictionary<K, record>` leaks its value boxes
+// exactly the same way a `SortedDictionary<K, Choice>` does (measured
+// 3200 B / 400 for a plain `record Pt(x: int, y: int)` V, byte-identical
+// before and after THIS fix). #3770/#3768's brief scopes this lane to
+// `dictValueBoxFreer`'s boxed-struct PREDICATE and `lowerDictValuesFor`, not
+// to `dictValueBoxFreer`'s head-name GATE — a different, independent
+// question ("which dictionary kinds route through this function at all")
+// that #3776 tracks separately.
+//
+// See `dict_choice_value_box_freer_3770_test.cpp` for the disposal-focused
+// rows (the 200x Add+dispose-only leak pin, the indexer-overwrite disposing-
+// setter path, and the class-like/borrow-bearing-choice double-free check)
+// and `dict_values_choice_3768_test.cpp` for `for var v in d.Values`'s own
+// FAIL-WITHOUT/PASS-WITH pin. Every row here is still looped 200x so a UAF
+// that only manifests on a REUSED allocation (freed-then-reused heap slot)
+// has the same chance to fire it always did. The int-payload rows prove the
+// struct LOAD itself decodes the right bytes (the case-match on the
+// loop-decoded value recovers the exact payload written at `Add`); the
+// string-payload row (a plain `Dictionary`, so it DOES flip to the strict
+// oracle) now additionally proves the OWNED `string` field inside a
+// struct-lowering choice value is disposed correctly across 200 full
+// Add-through-dispose cycles (previously it could only prove no UAF from the
+// READ side, because the outer box's own leak carried the string's
+// allocation with it).
 
 #include <string>
 
@@ -128,6 +150,7 @@
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
+using bezel::test::runAotChecked;
 using bezel::test::runAotCheckedLenient;
 
 namespace {
@@ -172,7 +195,7 @@ BEZEL_TEST(dict_choice_value_decode_3758, for_in_int_payload_choice_value_4_8) {
         "  Console.WriteLine($\"total={total}\"); "
         "  return 0; "
         "end Main; end C;";
-    JitResult r = runAotCheckedLenient(src);
+    JitResult r = runAotChecked(src);
     if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_TRUE(has(r.stdoutText, "total=1400"));  // 200 x (3 + 4)
@@ -208,7 +231,7 @@ BEZEL_TEST(dict_choice_value_decode_3758,
         "  Console.WriteLine($\"total={total}\"); "
         "  return 0; "
         "end Main; end C;";
-    JitResult r = runAotCheckedLenient(src);
+    JitResult r = runAotChecked(src);
     if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_TRUE(has(r.stdoutText, "total=1000"));  // 200 x (2 + 3)
@@ -219,6 +242,9 @@ BEZEL_TEST(dict_choice_value_decode_3758,
 //     decodeDictValueAt, exercised through the §4.17 ascending-key sort
 //     branch (ordering not asserted here; #1426/#3511 already cover that
 //     axis — this row is choice-V decode coverage on the sorted path).
+//     STAYS on runAotCheckedLenient (see the file header's ORACLE note):
+//     SortedDictionary's own value-box leak is a separate, pre-existing bug
+//     independent of choice V, filed as #3776.
 // ---------------------------------------------------------------------------
 
 BEZEL_TEST(dict_choice_value_decode_3758,
@@ -279,7 +305,7 @@ BEZEL_TEST(dict_choice_value_decode_3758,
         "  Console.WriteLine($\"total={total}\"); "
         "  return 0; "
         "end Main; end C;";
-    JitResult r = runAotCheckedLenient(src);
+    JitResult r = runAotChecked(src);
     if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_TRUE(has(r.stdoutText, "total=600"));  // 200 x 3
@@ -290,6 +316,8 @@ BEZEL_TEST(dict_choice_value_decode_3758,
 // SortedDictionary — LlvmBackend_Calls2.cpp's `wrapSortedDictionaryAsIEnumerable`,
 // its own independent decode copy (not routed through decodeDictValueAt),
 // fixed in place by the same one-line predicate widening.
+// STAYS on runAotCheckedLenient — see the file header's ORACLE note and #3776
+// (SortedDictionary's value-box leak, independent of choice V).
 // ---------------------------------------------------------------------------
 
 BEZEL_TEST(dict_choice_value_decode_3758,
@@ -348,7 +376,7 @@ BEZEL_TEST(dict_choice_value_decode_3758,
         "  Console.WriteLine($\"total={total}\"); "
         "  return 0; "
         "end Main; end C;";
-    JitResult r = runAotCheckedLenient(src);
+    JitResult r = runAotChecked(src);
     if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_TRUE(has(r.stdoutText, "total=600"));  // 200 x 3
@@ -382,7 +410,7 @@ BEZEL_TEST(dict_choice_value_decode_3758,
         "  Console.WriteLine($\"total={total}\"); "
         "  return 0; "
         "end Main; end C;";
-    JitResult r = runAotCheckedLenient(src);
+    JitResult r = runAotChecked(src);
     if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_TRUE(has(r.stdoutText, "total=1400"));  // 200 x (3 + 4)
@@ -426,7 +454,7 @@ BEZEL_TEST(dict_choice_value_decode_3758,
         "linq={viaLinq} firstlast={viaFirstLast}\"); "
         "  return 0; "
         "end Main; end C;";
-    JitResult r = runAotCheckedLenient(src);
+    JitResult r = runAotChecked(src);
     if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     // 3 + 4 == 7 through every full-drain decode call site.
