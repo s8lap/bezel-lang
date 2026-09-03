@@ -2043,6 +2043,17 @@ private:
     // read this immediately after lowering a sub-expression to exclude a
     // diverged branch from the join.
     bool diverged_ = false;
+    // fix #3778 (§27.5 / §28.9, v0.286): set true while `buildOrderedArgs`
+    // is lowering an argument that is a `LambdaExpr` — the lambda is a
+    // TEMPORARY whose closure is released at end of statement, BEFORE the
+    // captured local's scope ends. The first-capture content release at
+    // `lowerLambda`'s `capturedCellContentRelease` registration widens its
+    // gate with this signal: a captured string/closure local's envdtor
+    // content release fires too early for a temporary closure, so we
+    // suppress it and register a deferred release at the OWNER's scope
+    // (the same #3752 move, but for a same-depth capture whose lifetime
+    // mismatch is a STATEMENT, not a deeper dispose scope).
+    bool inArgumentLambda_ = false;
     // #1467 / §22.4 / §28.3: scratch slots holding an `out owned`
     // (class/interface) value that a call passed via `out _` (discard). The
     // callee writes a fresh OWNED heap object into each such slot, but no

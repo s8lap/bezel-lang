@@ -1934,7 +1934,58 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         const bool contentIsString = isStringTypeRefNonNull(ce.semaTy);
         const bool contentIsClosure =
             ce.semaTy && ce.semaTy->kind == sema::TypeRef::Kind::Function;
-        if ((contentIsString || contentIsClosure) && declaredShallower &&
+        // fix #3778 (§27.5 / §28.9, v0.286): widen the #3752 gate's
+        // `declaredShallower` conjunct with `inArgumentLambda_` so a
+        // CAPTURING CLOSURE PASSED AS AN ARGUMENT also triggers the
+        // deferred CONTENT release. The argument closure is a TEMPORARY
+        // (§27.5): the callee releases it at end of the call statement,
+        // which sits inside the captured local's scope — so the envdtor's
+        // content release fires before any later read of the local. Measured
+        // on 3729220 (the #3752 fix):
+        //     var f := lambda(): int => 11;
+        //     var total := Apply(lambda(): int => f());  <- temporary lambda
+        //     return total + f();                        <- reads freed cell
+        // ASan: `heap-use-after-free ... in bz$M.C$Take`; `freed by ... in
+        // bz$lam$1$envdtor`. The #3752 gate declined this because the
+        // capture site is at the SAME dispose scope as `f` (`declaredShallower`
+        // is false) and the pre-scan misclassifies argument-position
+        // lambdas as escaping, so the local is NOT in `cellFreeEligible_`
+        // on the bare parent.
+        //
+        // The repair keeps the CONTENT release (suppressed here, deferred
+        // to the owner's scope — exactly what #3752 does for a deeper-
+        // scope capture) and adds two new things that the new venue needs:
+        //
+        //   1. PRE-SCAN widening (§cellfree#3778, Setup.cpp). The argument
+        //      closure does not actually outlive the call: it is consumed
+        //      by the callee (a function-typed parameter, not stored in
+        //      a field, not returned through a function-typed return).
+        //      `isCallBoundedClosureArgPosition` is widened to admit non-
+        //      function-typed returns so the captured local lands in
+        //      `cellFreeEligible_`. The widening is deliberately narrower
+        //      than the IIFE case: an async callee and a yield-body callee
+        //      stay excluded (the closure may live on the awaited /
+        //      iterated task), and an `owned`/`scoped` parameter stays
+        //      excluded (those have their own storage-bounded admission).
+        //
+        //   2. GATE widening (this block). With the pre-scan correctly
+        //      recognizing the argument lambda as non-escaping, the
+        //      captured local is in `cellFreeEligible_`. The original
+        //      #3752 gate further required `declaredShallower` — a CAPTURE
+        //      IN A STRICTLY DEEPER SCOPE. The new venue is at the SAME
+        //      scope as the local: the lifetime mismatch is a STATEMENT
+        //      (end of the call expression), not a deeper dispose scope.
+        //      `inArgumentLambda_` (set by `buildOrderedArgs` around
+        //      `lowerExpr(*a.value)` for lambda arguments) is the signal:
+        //      the closure dies at end of statement, before the local's
+        //      scope end. Replacing `declaredShallower` with
+        //      `(declaredShallower || inArgumentLambda_)` covers BOTH
+        //      venues under the same one-shot registration; both releases
+        //      stay exactly once per reference (one `+1` produced by the
+        //      capture-time cell allocation, one release at the owner's
+        //      scope end — never both).
+        if ((contentIsString || contentIsClosure) &&
+            (declaredShallower || inArgumentLambda_) &&
             !alreadyBoxed && !isForVar && declScopeDepth > 0 &&
             currentFn_ == cellFreeEligibleFn_ &&
             cellFreeEligible_.count(static_cast<const void*>(decl))) {

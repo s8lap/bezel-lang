@@ -12994,7 +12994,22 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
                 if (pt && pt->kind == sema::TypeRef::Kind::Function)
                     expectedFunctionType_ = pt;
             }
+            // fix #3778 (§27.5 / §28.9, v0.286): a lambda LITERAL passed as
+            // a CALL ARGUMENT is a TEMPORARY — its closure is released at end
+            // of statement, before any later read of a captured local. Mark
+            // the inner `lowerLambda` so its first-capture content-release
+            // gate widens (`(declaredShallower || inArgumentLambda_)`) and the
+            // release moves to the captured local's own scope, where it
+            // actually lines up. We only set the flag for the lambda-literal
+            // shape (not for `IdentifierExpr` arguments that name a bound
+            // closure — those are BORROWS, the callee consumes them, and the
+            // existing bookkeeping already balances them).
+            const bool savedInArg = inArgumentLambda_;
+            if (a.value &&
+                dynamic_cast<const ast::LambdaExpr*>(a.value.get()))
+                inArgumentLambda_ = true;
             v = lowerExpr(*a.value);
+            inArgumentLambda_ = savedInArg;
             expectedFunctionType_ = savedExpected;
         }
         // fix #3296 / §17.12 (v0.266): a `throw` expression used as an

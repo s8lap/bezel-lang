@@ -23804,10 +23804,30 @@ bool Emitter::isCallBoundedClosureArgPosition(const ast::CallExpr& call,
     if (isAsyncMethod(ms)) return false;
     if (md->bodyKind == ast::MethodBodyKind::Block && containsYield(md->stmts))
         return false;
-    // NO declared return type: nothing can carry the callback out of the call at
-    // all. Strictly narrower than lowerCall's `declaredReturnOk`/`callResultOk`,
-    // which admit non-frame return heads too.
-    if (md->returnType) return false;
+    // fix #3778 (§27.5 / §28.9, v0.286): a function-TYPED return CAN carry
+    // the callback out of the call (the callee may `return f;` directly), so
+    // we decline that. Any OTHER declared return type — primitive, record,
+    // enum, value class — cannot carry a function-typed value out at all,
+    // and the existing "no return type at all" rule was deliberately over-
+    // conservative (#3498). Widen to admit those non-function return heads,
+    // so the captured local lands in `cellFreeEligible_` and the
+    // `lowerLambda` capture-loop's `inArgumentLambda_` widening (this
+    // commit) registers the deferred CONTENT release that #3752 could not
+    // see at the SAME dispose scope. Mirrors lowerCall's `declaredReturnOk`
+    // / `callResultOk` admit-non-frame-return-heads envelope, the gate
+    // that #3498 itself borrowed; the second-pass argument-side check is
+    // independent and lives here. Rejected shapes remain identical: async
+    // methods, yield-body iterators, named/defaulted args, an `owned` or
+    // `scoped` parameter, and a non-function-typed parameter. A callee that
+    // stores the closure in a long-lived location (a class field, an
+    // out-parameter captured by reference) and returns a non-function-typed
+    // value is a SEPARATE, much rarer shape — the existing ownership pass's
+    // escape-detection already handles the field-store / out-parameter cases
+    // for an arg passed to a non-`using var` receiver (declining the call
+    // at sema) and `buildOrderedArgs` keeps an `out` arg's TRANSFERRED
+    // bookkeeping on its own slot.
+    if (md->returnType &&
+        md->returnType->kind == ast::TypeKind::Function) return false;
     // POSITIONAL, exact arity — the only shape in which the SYNTACTIC index is
     // the PARAMETER index. A named (`Identifier :=`) or defaulted call is not
     // reordered here the way `buildOrderedArgs` reorders it at lowering time, so
