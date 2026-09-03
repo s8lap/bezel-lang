@@ -613,6 +613,24 @@ private:
     // rule's check is suppressed. Cleared alongside pendingLambdaTargetReturn_.
     bool pendingLambdaTargetReturnOwned_ = false;
 
+    // fix #3756 (§27.4 / §27.1, v0.286): true while visiting a lambda literal
+    // that is a DIRECT call- or constructor-argument — a target-type context
+    // genuinely exists there (the matched formal's declared function-type
+    // slot), even when this argument-visiting pass cannot thread its exact
+    // per-parameter type through `pendingLambdaParamType_(s)_` (e.g. a
+    // callee whose OWN generic type parameter the slot is written in terms
+    // of, resolved later by call-site monomorphization rather than by this
+    // thread — fix #829/#505's exclusion; or a `new` constructor argument,
+    // which has no `pendingLambdaParamTypes_` seeding path at all). Consulted
+    // by visitExpr(LambdaExpr) so an unannotated parameter is rejected only
+    // when NO target-type context exists at all (§27.4: "In top-level
+    // contexts with no target type ... parameter types must be specified"),
+    // never merely because this specific thread came up empty. Consumed
+    // (and cleared) once per lambda so a nested lambda, or an argument
+    // lexically after the lambda in the same call, does not inherit a stale
+    // `true`.
+    bool pendingLambdaArgContext_ = false;
+
     // issue #777 / §30.6: true when `t` is a Named `Task<…>` / `OwningTask<…>`
     // (the async task wrapper). Used to detect a forgotten `await`.
     bool isTaskShapedRef(const TypeRef* t) const;

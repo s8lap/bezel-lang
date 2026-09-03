@@ -11166,7 +11166,38 @@ void ExprTC::runMethodBody(
     }
     forbiddenForwardParams_.clear();
     if (exprBody) {
+        // fix #3756 (§27.4 / §27.3 v0.226 #2107): an expression-bodied
+        // method/operator/property-getter (`=> E`) whose declared return
+        // type is a function type is a target-type context for a lambda
+        // body `E` exactly as the block-form `return E;` is (ReturnStmt's
+        // #2107 thread below) and as a typed-local initializer is (fix
+        // #829) — but this position had NO thread at all before #3756.
+        // Without it, `method MkOwned(): (owned Task<int>) -> owned
+        // Task<int> => lambda(owned t) => t;` left `t` untyped (silently
+        // wrong-value pre-#3756, false-rejected by #3756's initial reject —
+        // measured: tests/lit/ownership/…lambda_positions_1926__accept.bzl's
+        // `MkOwned` case). Saved/restored around the visit; consumed once by
+        // visitExpr(LambdaExpr) so a NESTED lambda inside `E` does not
+        // inherit it.
+        TypeRef* savedLamTargetRet = pendingLambdaTargetReturn_;
+        bool savedLamTargetRetOwned = pendingLambdaTargetReturnOwned_;
+        std::vector<TypeRef*> savedLamParams = pendingLambdaParamTypes_;
+        if (returnCtx_ == ReturnCtx::ValueMethod && currentReturnType_ &&
+            currentReturnType_->kind == TypeRef::Kind::Function &&
+            dynamic_cast<const ast::LambdaExpr*>(exprBody)) {
+            pendingLambdaTargetReturn_ = currentReturnType_->funcReturn;
+            pendingLambdaTargetReturnOwned_ =
+                currentReturnType_->funcReturnOwned;
+            if (!currentReturnType_->funcParams.empty()) {
+                pendingLambdaParamTypes_.clear();
+                for (const auto& fp : currentReturnType_->funcParams)
+                    pendingLambdaParamTypes_.push_back(fp.type);
+            }
+        }
         visitExpr(*exprBody);
+        pendingLambdaTargetReturn_ = savedLamTargetRet;
+        pendingLambdaTargetReturnOwned_ = savedLamTargetRetOwned;
+        pendingLambdaParamTypes_ = savedLamParams;
         // §5.1 / §22.2 (issue #1774): an expression body `=> E` is the method's
         // returned value — spec-equivalent to `{ return E; }` (§22.2) — so E
         // must satisfy the SAME return-type convertibility check the block-form
@@ -11685,7 +11716,36 @@ void ExprTC::visitMember(const ast::Member& m) {
                     }
                 }
             }
+            // fix #3756 (§27.4 / §27.3 v0.226 #2107): a field's declared
+            // function-type ascription is a target-type context for a
+            // lambda initializer, exactly as a typed LOCAL's is (fix #829)
+            // — but the field-initializer position had no thread at all
+            // before #3756. Without it, `public id: (int) -> int :=
+            // lambda(x) => x;` left `x` untyped (silently wrong-value
+            // pre-#3756, false-rejected by #3756's initial reject —
+            // measured: tests/lit/ownership/…lambda_positions_1926__accept
+            // .bzl's `id` field). Saved/restored around the visit.
+            TypeRef* savedLamTargetRet = pendingLambdaTargetReturn_;
+            bool savedLamTargetRetOwned = pendingLambdaTargetReturnOwned_;
+            std::vector<TypeRef*> savedLamParams = pendingLambdaParamTypes_;
+            if (fd->type &&
+                dynamic_cast<const ast::LambdaExpr*>(fd->initializer.get())) {
+                if (auto* fty = ctx_.resolvedType(*fd->type)) {
+                    if (fty->kind == TypeRef::Kind::Function) {
+                        pendingLambdaTargetReturn_ = fty->funcReturn;
+                        pendingLambdaTargetReturnOwned_ = fty->funcReturnOwned;
+                        if (!fty->funcParams.empty()) {
+                            pendingLambdaParamTypes_.clear();
+                            for (const auto& fp : fty->funcParams)
+                                pendingLambdaParamTypes_.push_back(fp.type);
+                        }
+                    }
+                }
+            }
             visitExpr(*fd->initializer);
+            pendingLambdaTargetReturn_ = savedLamTargetRet;
+            pendingLambdaTargetReturnOwned_ = savedLamTargetRetOwned;
+            pendingLambdaParamTypes_ = savedLamParams;
             currentLiteralWideningHint_ = savedFieldHint;
             // §17.7 (#987, mirrors the LocalDecl fix #979): a typeless
             // `new(args)` shorthand field initializer takes its construction
@@ -13043,6 +13103,16 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         // inference. Restored after the visit.
         TypeRef* savedLamTargetRet = pendingLambdaTargetReturn_;
         bool savedLamTargetRetOwned = pendingLambdaTargetReturnOwned_;
+        // fix #3756 (§27.4): sibling of fix #829's typed-local positional-
+        // parameter thread, missing here since #2107 added only the RETURN
+        // slot. Without it a `return lambda(x) => …;` in a method declared
+        // `(): (T) -> R` left the lambda's OWN parameter untyped — before
+        // #3756's reject this was a silent wrong-value bug identical to the
+        // issue's `var h := lambda(owned c) …` repro; after it, a false
+        // reject (measured: tests/lit/ownership/…lambda_return_positions
+        // _1929__accept.bzl's `MkId`). Saved/restored alongside the sibling
+        // fields above.
+        std::vector<TypeRef*> savedLamParams = pendingLambdaParamTypes_;
         if (rs->value && returnCtx_ == ReturnCtx::ValueMethod &&
             currentReturnType_ &&
             currentReturnType_->kind == TypeRef::Kind::Function &&
@@ -13053,10 +13123,18 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
             // below threads the marker from the function-typed argument's
             // OWN type — both paths must agree.
             pendingLambdaTargetReturnOwned_ = currentReturnType_->funcReturnOwned;
+            // fix #3756 / #829: thread the positional parameter types too —
+            // see the comment above `savedLamParams`.
+            if (!currentReturnType_->funcParams.empty()) {
+                pendingLambdaParamTypes_.clear();
+                for (const auto& fp : currentReturnType_->funcParams)
+                    pendingLambdaParamTypes_.push_back(fp.type);
+            }
         }
         if (rs->value) visitExpr(*rs->value);
         pendingLambdaTargetReturn_ = savedLamTargetRet;
         pendingLambdaTargetReturnOwned_ = savedLamTargetRetOwned;
+        pendingLambdaParamTypes_ = savedLamParams;
         currentLiteralWideningHint_ = savedRetHint;
         // §22.4 (v0.183, #1585): a `return E;` that may produce a postcondition's
         // stated constant must leave the out parameter provably non-null.
@@ -13871,6 +13949,11 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
             TypeRef* savedPending = pendingLambdaParamType_;
             TypeRef* savedLamTargetRet = pendingLambdaTargetReturn_;
             bool savedLamTargetRetOwned = pendingLambdaTargetReturnOwned_;
+            // fix #3756 (§27.4): sibling of fix #829's typed-local
+            // positional-parameter thread, missing here since #2107 added
+            // only the RETURN slot. Saved/restored alongside the sibling
+            // fields above.
+            std::vector<TypeRef*> savedLamParams = pendingLambdaParamTypes_;
             if (eventPayload &&
                 dynamic_cast<const ast::LambdaExpr*>(as->value.get()))
                 pendingLambdaParamType_ = eventPayload;
@@ -13894,6 +13977,13 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                         // paths.
                         pendingLambdaTargetReturnOwned_ =
                             tgtTy->funcReturnOwned;
+                        // fix #3756 / #829: thread the positional parameter
+                        // types too — see the comment above `savedLamParams`.
+                        if (!tgtTy->funcParams.empty()) {
+                            pendingLambdaParamTypes_.clear();
+                            for (const auto& fp : tgtTy->funcParams)
+                                pendingLambdaParamTypes_.push_back(fp.type);
+                        }
                     }
                 }
             }
@@ -13943,6 +14033,7 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
             pendingLambdaParamType_ = savedPending;
             pendingLambdaTargetReturn_ = savedLamTargetRet;
             pendingLambdaTargetReturnOwned_ = savedLamTargetRetOwned;
+            pendingLambdaParamTypes_ = savedLamParams;
         }
         // §6.6 (v0.184, #1689): a compound assignment `x op= e` desugars to
         // `x := x op e`. Let T be the target's type and R the type of

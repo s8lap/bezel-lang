@@ -302,6 +302,14 @@ const char* k841BoundLocalNonCapturing =
     "end Main; end C;";
 
 // #841 BOUND-LOCAL capturing variant: `h` captures `box`.  Returns 4.
+//
+// fix #3756 (§27.4): `var h := lambda(v) => ...;` has no target type at the
+// lambda's own formation site — `h`'s later use as a call argument to
+// `Subscribe` does not flow backward to type the lambda literal, the same
+// as §27.4's own canonical reject example `var f := lambda(x) => x * 2;`.
+// `v` is annotated `int` (the type `box.Add` takes) so the fixture keeps
+// exercising its actual purpose (bound-local capturing handler, no double
+// free) instead of the parameter-inference question this file is not about.
 const char* k841BoundLocalCapturing =
     "module M; "
     "class Box "
@@ -315,7 +323,7 @@ const char* k841BoundLocalCapturing =
     "class C public static method Main(): int "
     "  using var box := new Box(); "
     "  using var src := new Src(); "
-    "  var h := lambda(v) => do box.Add(v); end; "
+    "  var h := lambda(v: int) => do box.Add(v); end; "
     "  do "
     "    using var sub := src.Ev.Subscribe(h); "
     "    src.Fire(4); "

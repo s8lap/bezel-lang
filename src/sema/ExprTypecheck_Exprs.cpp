@@ -7292,8 +7292,14 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                 std::vector<TypeRef*> savedLamParams = pendingLambdaParamTypes_;
                 TypeRef* savedLamTargetRet = pendingLambdaTargetReturn_;
                 bool savedLamTargetRetOwned = pendingLambdaTargetReturnOwned_;
+                bool savedArgCtx = pendingLambdaArgContext_;
                 if (auto* lam =
                         dynamic_cast<const ast::LambdaExpr*>(a.value.get())) {
+                    // fix #3756 (§27.4): a call-argument lambda always has a
+                    // target-type context — the matched formal's declared
+                    // slot — whether or not THIS pass can thread its exact
+                    // substituted type below.
+                    pendingLambdaArgContext_ = true;
                     if (eventPayload)     pendingLambdaParamType_ = eventPayload;
                     else if (linqElem)    pendingLambdaParamType_ = linqElem;
                     // stdlib §5 (#1124): an `Aggregate(seed, (acc, x) => …)` fold
@@ -7527,6 +7533,7 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                 pendingLambdaParamTypes_ = savedLamParams;
                 pendingLambdaTargetReturn_ = savedLamTargetRet;
                 pendingLambdaTargetReturnOwned_ = savedLamTargetRetOwned;
+                pendingLambdaArgContext_ = savedArgCtx;
             }
             // per §7.4 (#1188): a `ref`/`out` argument can be reassigned by the
             // callee — including being set to null — so a prior null-narrowing
@@ -8023,7 +8030,16 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                  a.modifier == "out owned var")
                     ? a.value.get()
                     : nullptr;
+            // fix #3756 (§27.4): a constructor-argument lambda has a
+            // target-type context too — the matched formal's declared
+            // slot — even though this NewExpr path has no
+            // `pendingLambdaParamTypes_` per-parameter seeding at all
+            // (unlike the CallExpr path's fix #829 machinery above).
+            bool savedArgCtxNew = pendingLambdaArgContext_;
+            if (a.value && dynamic_cast<const ast::LambdaExpr*>(a.value.get()))
+                pendingLambdaArgContext_ = true;
             if (a.value) visitExpr(*a.value);
+            pendingLambdaArgContext_ = savedArgCtxNew;
             refOutArgTargetNode_ = savedRefOutNew;
             currentLiteralWideningHint_ = savedNewHint;
             // §22.3 (v0.184, #1682): validate a bare `ref`/`out` constructor
@@ -8271,6 +8287,12 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         // Consumed once and cleared so a nested lambda doesn't inherit them.
         std::vector<TypeRef*> inferredParamTypes = pendingLambdaParamTypes_;
         pendingLambdaParamTypes_.clear();
+        // fix #3756 (§27.4): true when this lambda literal is a direct call-
+        // or constructor-argument, so a target-type context exists even
+        // where neither of the two threads above named its exact type.
+        // Consumed once so a nested lambda doesn't inherit it.
+        bool hadArgContext = pendingLambdaArgContext_;
+        pendingLambdaArgContext_ = false;
         // issue #777 / §30.6: the expected async element type T (peeled from a
         // `(…) -> Task<T>` context), threaded in to detect a forgotten `await`.
         // Consumed once so nested lambdas don't inherit it.
@@ -8386,6 +8408,30 @@ void ExprTC::visitChildren(const ast::Expr& e) {
             // lambda's expected function type, positionally.
             else if (pi < inferredParamTypes.size() && inferredParamTypes[pi])
                 ps->resolvedDeclType = inferredParamTypes[pi];
+            else if (!hadArgContext) {
+                // fix #3756 (§27.4 / §27.1, v0.286): NONE of the three
+                // context-supplying threads above named a type for this
+                // parameter, AND it is not a call/constructor argument
+                // either (`hadArgContext`, which covers the cases the
+                // threads above cannot — a callee's own generic type
+                // parameter, resolved later by monomorphization, and a
+                // `new` constructor argument, which has no per-parameter
+                // thread at all) — so there is genuinely no target-type
+                // context anywhere. §27.4: "In top-level contexts with no
+                // target type ... parameter types must be specified."
+                // Previously this fell through silently: `ps->declType` /
+                // `resolvedDeclType` stayed null, the lambda's own function
+                // type recorded a null-typed slot too (the `fp.type` mirror
+                // below), and the body's member/operator resolution against
+                // the untyped parameter produced a wrong runtime value
+                // instead of ANY diagnostic (#3756: `var h := lambda(owned
+                // c): int => c.V(); ...; h(move p)` compiled clean and
+                // printed `0`, not `5`).
+                ctx_.diagnostics().report(
+                    Severity::Error, lam->span.begin,
+                    "parameter `" + std::string(p.name) + "` needs a type "
+                    "annotation: no target type to infer from (§27.4)");
+            }
             lamParamSyms.push_back(ps);
             if (!p.name.empty()) lamScope.names[p.name] = ps;
         }
