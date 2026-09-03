@@ -4395,6 +4395,15 @@ private:
     //   `lowerLocalDecl`'s slot spelled the placeholder `i8()` where every other
     //   site spelled it `unitPlaceholderTy()` — the same type, two names, which
     //   is precisely the drift this helper closes.
+    //   The InlineArray ELEMENT position — `lowerTypeRef`'s `Kind::InlineArray`
+    //   arm (LlvmBackend_Layout.cpp), the ninth site — wraps the raw element
+    //   lowering in this helper before handing it to `ArrayType::get`, so a
+    //   unit-typed element (`[N]()`) lowers to `[N x i8]` instead of the
+    //   illegal `[N x void]` (fix #3528). Every earlier site here substitutes
+    //   at the TOP-LEVEL lowered type; this is the first one applied one level
+    //   down, at the element, which is why the top-level
+    //   `entryAlloca`/`bindParameters` guards never caught `[N]()` on their
+    //   own.
     //
     // The four #3537 sites are ONE decision at four faces, not four decisions:
     // the element type becomes the frame's `current_val` field, `Current`'s
@@ -4417,11 +4426,6 @@ private:
     //     a hand-written `Current(): ()` really is a `void`-returning function, so
     //     the producer/consumer agreement that justifies the four sites above
     //     does not hold there. Left alone deliberately; issue 3544.
-    //   * `lowerTypeRef`'s inline-array arm builds `ArrayType::get(elem, N)`
-    //     from a RAW element lowering. This helper tests the TOP-LEVEL type
-    //     only, so `[3]()` — a `[3 x void]` — passes straight through it and
-    //     traps in `entryAlloca`/`bindParameters`; issue 3528, filed loud and
-    //     deliberately not patched.
     //   * `emitValueToString`'s unit arm answers §8.5's `"()"` string, and its
     //     caller only ROUTES a `Kind::Unit` operand there — a rendering
     //     decision, not a storage-type one, so it is not this helper's

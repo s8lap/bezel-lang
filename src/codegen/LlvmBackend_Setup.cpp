@@ -13409,6 +13409,28 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
                 if (!cl->elements[i]) continue;
                 llvm::Value* ev = lowerExpr(*cl->elements[i]);
                 if (!ev) {
+                    // fix #3528 (§4.7 / §15.1, v0.286): a UNIT-typed element
+                    // (`()`) is not a lowering failure — `lowerExpr` normalises
+                    // every unit-typed expression to nullptr by the SAME
+                    // established convention #3421's guard documents ("a
+                    // unit-typed expression has no lowered value; every
+                    // producer must report it as one"). `elemTy` here already
+                    // carries the InlineArray element-position substitution
+                    // (LlvmBackend_Layout.cpp's `Kind::InlineArray` arm, fix
+                    // #3528), so a genuinely unit-typed element's slot is the
+                    // one-byte placeholder and a zero byte is a faithful,
+                    // never-meaningfully-read value — the SAME "one inert
+                    // byte" reasoning #3453/#3527 apply to every other unit
+                    // storage position. Only a non-unit element still ICEs.
+                    const sema::TypeRef* et = ctx_.exprType(*cl->elements[i]);
+                    if (et && et->kind == sema::TypeRef::Kind::Unit) {
+                        llvm::Value* ugep = builder_.CreateGEP(
+                            arrTy, slot,
+                            {builder_.getInt32(0), builder_.getInt32(i)});
+                        builder_.CreateStore(
+                            llvm::Constant::getNullValue(elemTy), ugep);
+                        continue;
+                    }
                     // #1386: ICE — lowerExpr returned null for a local-decl
                     // inline-array initializer element.
                     ctx_.diagnostics().report(

@@ -1480,7 +1480,29 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
             // unfoldable size failing loudly rather than silently.
             if (!rt->arrayElement) return i32();
             if (!rt->arraySize && rt->arraySizeValue < 0) return i32();
-            llvm::Type* elem = lowerTypeRef(rt->arrayElement);
+            // fix #3528 (§4.7 / §15.1, v0.286): `unitStorageTy`, the ONE
+            // spelling of "the storage form of a lowered type" (#3527). §15.1's
+            // element-type rule reads over the total, disjoint §3.2
+            // classification ("value type" / "class type" / "runtime-managed
+            // reference type") with no unit-type carve-out — unlike the
+            // explicit `[N][M]T` multi-dimensional exclusion beside it — and
+            // §4.7/§3.2 both classify the unit type as a value type, so `[N]()`
+            // is an admitted element shape, not a rejection. `lowerTypeRef`
+            // answers `void` for exactly the unit type's `Kind::Unit` arm, and
+            // `void` is not a legal LLVM array ELEMENT type any more than it is
+            // a legal alloca/parameter/struct-member type: `ArrayType::get`
+            // does not itself validate this in a release (assertions-off)
+            // LLVM, so the trap surfaced one level up, inside
+            // `DataLayout::getPrefTypeAlign` at the array's OWN alloca —
+            // `entryAlloca` already substitutes its TOP-level type, but a `[3
+            // x void]` array is not void at the top level, so that guard never
+            // saw it (measured rc=132, SIGILL, no diagnostic, for both a local
+            // `var a: [3]() := [(), (), ()];` and a parameter `(a: [2]())`).
+            // Every existing storage substitution in this family tests the
+            // TOP-level lowered type; this is the first one applied one level
+            // down, at the ELEMENT — the same fix `unitStorageTy` exists to
+            // keep from being re-derived at a ninth site.
+            llvm::Type* elem = unitStorageTy(lowerTypeRef(rt->arrayElement));
             // fix #2936: decode the lexeme with the ONE literal parser. This
             // was `std::stoull(text)` — base 10 — so `[0x5]int` became a
             // 0-element array and `[5_0]int` a 5-element one, SILENTLY. Note
