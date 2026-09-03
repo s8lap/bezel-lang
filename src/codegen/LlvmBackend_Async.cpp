@@ -1965,6 +1965,28 @@ void Emitter::emitAsyncLambda(const ast::LambdaExpr& lam, llvm::Function* fn,
             collectCellFreeEligible(lam.stmts);
         } else {
             closureReleaseEligible_.clear();
+            // fix #3773 (§27.5 / §28.9, v0.286): closureLocalCandidates_ must
+            // clear alongside closureReleaseEligible_ — the two halves of one
+            // contract (LANE_RULES §8), and here it is LOAD-BEARING rather than
+            // merely hygienic. collectClosureReleaseEligible (which repopulates
+            // BOTH sets together) never runs for an expression body, while
+            // closureReleaseEligibleFn_ IS pinned to resumeFn just below, so
+            // `returnedClosureLocalOwnsPlusOne`'s fn-token gate is satisfied for
+            // this body while its body-membership set still holds whatever the
+            // ENCLOSING (or a sibling) scan last put there. The new return-site
+            // mint added below asks exactly that predicate, so a stale hit would
+            // suppress the mint for an identifier that merely CAPTURES an outer
+            // closure local — reopening the very heap-use-after-free this fix
+            // closes. Mirrors LlvmBackend_Exprs2.cpp's sync-lambda expr-body
+            // branch (the #3757 follow-up) token-for-token.
+            //
+            // ⚠ On its own this line fixes NOTHING: issue 3773's original
+            // one-line remedy was exactly this clear, and it was implemented,
+            // rebuilt and measured by the #3757/#3762 lane against the repro,
+            // which crashed identically — because the expression-body branch had
+            // no mint logic to suppress in the first place. It becomes
+            // load-bearing only together with the mint below.
+            closureLocalCandidates_.clear();
         }
         closureReleaseEligibleFn_ = resumeFn;
         // fix #2132 / #2142 / #2143 / #1871 / §28.9 / §28.11: re-establish the
@@ -2196,6 +2218,147 @@ void Emitter::emitAsyncLambda(const ast::LambdaExpr& lam, llvm::Function* fn,
             // completes the task. A no-value `Task` lambda (resultTy == null)
             // ignores the value and completes with no result.
             llvm::Value* v = lowerExpr(*lam.exprBody);
+            // fix #3773 (§27.3 / §27.5 / §28.9 / §30.6, v0.286): mint the
+            // return-site +1 for the value that completes the outer task,
+            // mirroring `lowerLambda`'s OWN expression-body mint
+            // (LlvmBackend_Exprs2.cpp, the `#429 (closure CALL-RETURN category)`
+            // block) token-for-token, with `resultElemSemaTy` — §30.6's T, the
+            // async spelling of that site's `retSemaTy` — as the return type.
+            //
+            // This branch previously handed `v` STRAIGHT to emitAsyncComplete
+            // with no ownership adjustment of any kind, so an
+            // `async lambda() => <captured outer closure local>` completed its
+            // task with a +0 BORROW of a cell the capturing environment still
+            // owns. The consumer that makes that fatal is the lambda ENVIRONMENT
+            // DESTRUCTOR, which releases a captured closure-typed cell keyed
+            // purely on its function type on the invariant that a closure local's
+            // slot owns +1 (LlvmBackend_Exprs2.cpp's envdtor): the async lambda's
+            // own env released the captured local while the awaited result still
+            // aliased it — measured as `heap-use-after-free ... in lam$2, freed
+            // by bz$lam$1$envdtor` for issue 3773's repro, and as a plain
+            // `attempting double-free` when the awaited result is re-captured by
+            // a sibling lambda local in the same scope. Minting here is the same
+            // trade the SYNC lambda venue already makes and the direction
+            // `returnedClosureLocalOwnsPlusOne`'s own contract names ("at worst
+            // a leak, never a UAF/double-free"): a shape whose consumer never
+            // releases the result gains a leak the sync venue has always had
+            // (measured identical, both venues), and the two venues now AGREE —
+            // the invariant issue 2688 established between a lambda's two body
+            // forms, applied between a lambda's two KINDS.
+            //
+            // Guarded by the terminator check the completion below already uses:
+            // an expression that threw diverted control to `faultBB` and left
+            // this block terminated, so nothing is appended after a terminator.
+            // Runs BEFORE the scope disposal below so the mint cannot be
+            // observed by a disposal of the same value.
+            // `resultTy` null means a no-value `Task` whose value is discarded
+            // (see the completion call below), so nothing is minted for it.
+            //
+            // ⚠ The mint keys off the BODY EXPRESSION's own sema type, not
+            // `resultElemSemaTy`. That is deliberate and it is the same node the
+            // sync venue keys off (`retSemaTy` there IS
+            // `ctx_.exprType(*lam.exprBody)` for a non-async expression body —
+            // LlvmBackend_Exprs2.cpp's `else if (lam.exprBody)` arm), and it is
+            // the type of the value actually being minted for. It is also the
+            // only one that is right on BOTH of `resultElemSemaTy`'s two
+            // derivations: with a call-site annotation the caller passes
+            // `Task<T>`'s genericArgs[0] (= T, correct), but with NO annotation
+            // — `var f := async lambda() => inner;`, this issue's own repro —
+            // the fallback passes the lambda's whole `funcReturn`, which #800
+            // Layer-2 made the WRAPPED `Task<T>`, so `resultElemSemaTy->kind` is
+            // `Named` and neither arm below could ever fire. (Measured: the
+            // first cut of this fix keyed on `resultElemSemaTy` and changed
+            // nothing at all — kind=Named for the repro. The
+            // annotated/unannotated disagreement is a separate defect, filed.)
+            const sema::TypeRef* bodySemaTy = ctx_.exprType(*lam.exprBody);
+            if (v && resultTy && bodySemaTy &&
+                v->getType()->isPointerTy() &&
+                !builder_.GetInsertBlock()->getTerminator()) {
+                // ⚠ NO STRING ARM. The sync venue this block mirrors has one
+                // (`emitStringRetain` beside its closure retain), and it was
+                // written here, built and MEASURED — then removed, because in
+                // this venue it is a pure regression:
+                //   * every string shape that could over-release is already
+                //     CLEAN on the parent — a captured outer `string` local, a
+                //     `string` field read (`=> this.sf`), and the enclosing
+                //     method's own `string` parameter, each with the awaited
+                //     result re-captured by a sibling lambda whose envdtor
+                //     releases it: 0 leaked, no double-free, all three;
+                //   * and the arm turned two of those from clean into a
+                //     7400 B / 400-allocation leak per 200 activations, where
+                //     the SYNC twin of the same program stays clean.
+                // The asymmetry is on the CONSUMER side, not here: `var g :=
+                // f();` off a closure call arms a scope-end string release,
+                // while `var g := await f();` does not recognise the awaited
+                // result as a producer at all, so a string minted here has
+                // nobody to discharge it. Landing the arm before that
+                // recognition exists would buy no soundness and cost a leak, so
+                // it is declined with reasons and filed rather than shipped
+                // (LANE_RULES §4). The closure arm below is landed because it
+                // has the opposite measurement: it removes a real double-free.
+                // Closure: retain unless the body is a +1 closure producer (a
+                // lambda literal / method reference / user-method closure-return
+                // call) or is an identifier naming a closure local that owns +1.
+                // The third predicate is answerable at all here only because the
+                // `closureLocalCandidates_.clear()` above makes it describe THIS
+                // body; without that clear it would read an enclosing scan's set.
+                //
+                // ⚠ ONE ASYNC-SPECIFIC EXCLUSION beyond the sync venue's
+                // three: a closure value that arrives from A CALLEE THAT MINTS
+                // ON RETURN — a user method with a declared function return
+                // type, or a lambda body (either form) — already carries that
+                // callee's +1 and must be TRANSFERRED, not minted again. The
+                // syntactic test is a CallExpr of any shape, or an `await`.
+                //
+                // ⚠⚠ THE SYNTACTIC TEST IS WIDER THAN THE PROPERTY IT STANDS
+                // FOR, and deliberately so. One callee shape reachable through
+                // it does NOT mint: an async METHOD's `return e;`, whose
+                // lowering (`lowerReturnStmt`'s async arm,
+                // LlvmBackend_Stmts.cpp ~L2190) completes the task and returns
+                // ~90 lines before every return-site mint. So
+                // `async method GetA(): Task<() -> int> return this.handler;`
+                // consumed as `=> await this.GetA()` hands back a +0 borrow
+                // that this exclusion declines to repair — measured
+                // `attempting double-free` (x2, 200 activations) on BOTH the
+                // parent and this fix, i.e. NOT a regression introduced here,
+                // and NOT repairable here either: nothing at this site can tell
+                // that callee apart from `async method MkA(): Task<() -> int>
+                // return lambda() => 7;`, which DOES hand back a +1 and which
+                // minting again leaks (8000 B / 200, measured). The callee's
+                // own return is where the difference lives, and that is issue
+                // 3788's arm; when it mints, this exclusion becomes exact.
+                //
+                // Extending `isUserMethodClosureReturnCall` itself was rejected
+                // rather than done: it also drives
+                // `collectClosureReleaseEligible`'s ADMISSION of a local to the
+                // scope-end release set (Setup.cpp ~L24583 states the positive
+                // form — "the callee mints exactly +1 on return, so the caller's
+                // local transfers that single reference"), where widening it
+                // would arm releases for call results the callee may still
+                // reference. `isPlusOneClosureProducer` (Setup.cpp ~L23416-23421)
+                // is where that restriction is argued — "the callee may hand
+                // back a function value WITHOUT a fresh +1 … so caller-side
+                // release of a call result could free a value the callee still
+                // references (UAF)" — with `isPlusOneStringProducer`
+                // (~L19846-19850) carrying the same sentence for strings. So the
+                // widening is scoped to this one mint decision, not to the
+                // shared predicate. Measured, 200 activations each, awaited
+                // result re-captured by a sibling lambda whose envdtor releases
+                // it: `=> await C.MkA()` and `=> f2()` (a closure-typed LOCAL's
+                // call) are both clean on the parent and both leaked
+                // 8000 B / 200 without this exclusion.
+                const ast::Expr* be = lam.exprBody.get();
+                bool arrivesFromCallee =
+                    dynamic_cast<const ast::CallExpr*>(be) != nullptr;
+                if (auto* un = dynamic_cast<const ast::UnaryExpr*>(be))
+                    if (un->op == "await") arrivesFromCallee = true;
+                if (bodySemaTy->kind == sema::TypeRef::Kind::Function &&
+                    !arrivesFromCallee &&
+                    !isPlusOneClosureProducer(be) &&
+                    !isUserMethodClosureReturnCall(be) &&
+                    !returnedClosureLocalOwnsPlusOne(be))
+                    emitClosureRetain(v);
+            }
             // fix #3728 (§28.3 / §28.10 / §30.6, v0.286): dispose this scope's
             // registrations (a match-arm scrutinee backstop is the only thing
             // an expr-bodied lambda can register here — §28.10's own example
