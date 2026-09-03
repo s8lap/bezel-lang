@@ -385,7 +385,7 @@ BEZEL_TEST(xmod_method_owned_param_3176, t2_unmarked_owned_arg_rejected_22_3) {
     if (rc == -2) return;
     BEZEL_EXPECT_EQ(rc, -1);  // must NOT build
     BEZEL_EXPECT_TRUE(mentions3176(err, "this call consumes `r`"));
-    BEZEL_EXPECT_TRUE(mentions3176(err, "owned r"));
+    BEZEL_EXPECT_TRUE(mentions3176(err, "move r"));
     BEZEL_EXPECT_TRUE(mentions3176(err, "§22.3"));
     // And specifically NOT the pre-fix spurious-marker complaint.
     BEZEL_EXPECT_TRUE(!mentions3176(err, "this parameter position does not "
