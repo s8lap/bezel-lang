@@ -791,6 +791,25 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
                 // (the common single-param LINQ case) this yields the same type
                 // the expected-function-type fallback below would.
                 ty = lowerTypeRef(par->resolvedDeclType);
+                // fix #3801 (§27.3 / §27.4, v0.287): also backfill
+                // lambdaParamTypeHint_ from the inferred resolvedDeclType so
+                // body identifier references (e.g. `b.Length` on a string-typed
+                // inferred param, or `a(7)` on a function-typed inferred param)
+                // see the correct sema type via the lambdaParamTypeHint_ lookup
+                // sites in LlvmBackend_Exprs.cpp:1140/:1927/:6192. The earlier
+                // expectedFunctionType_-gated SETs (below) only fired when an
+                // expected function type was threaded in — the IIFE path in
+                // LlvmBackend_Calls2.cpp:5421 calls lowerLambda directly
+                // without setting expectedFunctionType_, so for an IIFE param
+                // whose sema-resolved type is non-i32 (function types, string,
+                // class types — anything that lowerTypeRef maps to a non-i32
+                // LLVM type) the hint was never set, and `r=0` came out
+                // silently. Use find-then-insert so we don't clobber the
+                // genericSubst_-resolved hint the expected-function-type path
+                // may have already set above for an overlapping param.
+                if (!par->declType &&
+                    lambdaParamTypeHint_.find(par) == lambdaParamTypeHint_.end())
+                    lambdaParamTypeHint_[par] = par->resolvedDeclType;
             }
             // If the param type is still i32 (unresolved) but we have an
             // expected function type from the call site, infer from that.

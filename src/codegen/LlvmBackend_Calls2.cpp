@@ -5226,7 +5226,17 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
     if (auto* par = dynamic_cast<sema::ParameterSymbol*>(calleeSym)) {
         sema::TypeRef* rt = par->declType
                                 ? ctx_.resolvedType(*par->declType)
-                                : nullptr;
+                                : par->resolvedDeclType;
+        // fix #3801 (§27.3 / §27.4 / §27.1, v0.287): for an UNANNOTATED lambda
+        // parameter, par->declType is null and the inferred type rides
+        // par->resolvedDeclType (set by ExprTypecheck_Exprs.cpp's
+        // pendingLambdaParamTypes_ thread, e.g. an IIFE's positional arg
+        // types). Without this fallback, a function-typed lambda param —
+        // `(lambda(a) => a(7))(f)` where `f: (int) -> int` — left rt null,
+        // missed the `rt->kind == Function` dispatch, and silently returned 0
+        // (the #2477 zero-init fallback) instead of calling through the
+        // closure pointer. Mirrors the FieldSymbol arm's generic-substitution
+        // fallback immediately below this site.
         if (rt && rt->kind == sema::TypeRef::Kind::Function) {
             llvm::Value* closurePtr = nullptr;
             auto pit = paramSlots_.find(par);
