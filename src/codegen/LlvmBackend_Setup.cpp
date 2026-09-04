@@ -28636,6 +28636,24 @@ void Emitter::collectBoxCaptureLocals(
     for (const ast::LambdaExpr* lam : lambdas) {
         std::unordered_set<const sema::Symbol*> caps;
         collectCapturedSyms(*lam, caps);
+        // fix #3823 / §27.5 / §28.9 (v0.287): exclude the lambda's own
+        // params from its captures before tallying. The full-descent walker
+        // in collectCapturedSyms descends into nested lambda bodies, so a
+        // symbol referenced inside a nested lambda (e.g. the OUTER
+        // lambda's own `n` referenced inside the nested inner lambda's
+        // body) also appears in the OUTER lambda's captures — but the
+        // OUTER does NOT actually allocate a cell for its own params (the
+        // captures list in lowerLambda iterates the ENCLOSING function's
+        // `paramSlots_`/`locals_`, which doesn't contain the outer
+        // lambda's own params). Without this filter the over-count
+        // prevents the envdtor cell-free gate at LlvmBackend_Exprs2.cpp
+        // ~L1403 from firing for a sole env-holder cell (the 4-byte
+        // lam$0 env n-field residual, #3823).
+        if (const std::vector<sema::Symbol*>* lps = ctx_.lambdaParams(lam)) {
+            for (sema::Symbol* s : *lps) {
+                caps.erase(s);
+            }
+        }
         for (const sema::Symbol* s : caps) {
             if (auto* loc = dynamic_cast<const sema::LocalSymbol*>(s)) {
                 if (loc->decl)

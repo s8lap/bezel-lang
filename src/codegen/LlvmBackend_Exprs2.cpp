@@ -1403,8 +1403,9 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         if (!alreadyBoxed && (!wasGuardedParam || loopStack_.empty()) &&
             currentFn_ == boxCaptureLocalsFn_ &&
             definitelyEscapingLambdas_.count(static_cast<const void*>(&lam)) &&
-            singleCaptureLocals_.count(static_cast<const void*>(sym)))
+            singleCaptureLocals_.count(static_cast<const void*>(sym))) {
             ce.freeCellInEnvdtor = true;
+        }
         // fix #3426 (§27.5 / §28.9, v0.283): the SHARED-cell twin of the branch
         // above. `singleCaptureLocals_` requires this env to be the cell's only
         // holder; when a non-escaping sibling lambda also captures the parameter
@@ -1421,8 +1422,9 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         // here).
         if (!ce.freeCellInEnvdtor && loopStack_.empty() &&
             currentFn_ == cellFreeEligibleFn_ &&
-            isSharedCellEnvdtorFreeOwner(static_cast<const void*>(sym), &lam))
+            isSharedCellEnvdtorFreeOwner(static_cast<const void*>(sym), &lam)) {
             ce.freeCellInEnvdtor = true;
+        }
         captures.push_back(ce);
     }
     // #1207 / §27.5/§22.3: captured outer ref/out params.
@@ -2639,7 +2641,24 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     // over, so the clear is what matters).
     CaptureReclaimSetScope captureReclaimScopeSync(*this);
     boxCaptureLocals_.clear();
-    singleCaptureLocals_.clear();
+    // fix #3823 / §27.5 / §28.9 (v0.287): for an EXPR-body lambda whose body is
+    // itself a LambdaExpr (Shape B/C: a closure-returning lambda whose expr body
+    // is another lambda), DO NOT clear `singleCaptureLocals_` here — the
+    // enclosing function's pre-scan set is the correct data for the nested
+    // lambda's `capturedParamSyms` gate (line ~1405), because every lambda in
+    // this body's enclosing function that captures any of THIS lambda's params
+    // must, transitively, live inside THIS lambda's body (a lambda's own param
+    // is not accessible outside its body). The count of captures from
+    // `singleCaptureLocals_` keyed by this lambda's own param is therefore
+    // invariant under the body-vs-enclosing-function view. Clearing it here
+    // wipes Main's pre-scan tally before `lowerExpr(lam.exprBody)` reaches the
+    // INNER's captured-param gate, and the gate then fails (singleCap=0) — the
+    // exact 4-byte env n-field residual in #3823. For block bodies, the
+    // `else`-branch's `collectBoxCaptureLocals(lam.stmts)` repopulates the
+    // set, so the clear-then-repopulate pair is preserved for that case.
+    if (!lam.exprBody) {
+        singleCaptureLocals_.clear();
+    }
     assignedCaptureVars_.clear();          // fix #2706
     definitelyEscapingLambdas_.clear();
     boxCaptureLocalsFn_ = fn;
@@ -2665,6 +2684,24 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         // populated it (typically the ENCLOSING scope's own scan) — the exact
         // hazard that guard exists to close, reopened by an incomplete clear.
         closureLocalCandidates_.clear();
+        // fix #3823 / §27.5 / §28.9 (v0.287): if the EXPR body IS another
+        // lambda expression, that lambda IS this lambda's return value (its
+        // sole expression), so it DEFINITELY ESCAPES this lambda's frame.
+        // Mark it in definitelyEscapingLambdas_ so its envdtor can free a
+        // sole-holder capture cell. The cell-free gate at LlvmBackend_
+        // Exprs2.cpp:~1403 requires this admission; without it, a value-typed
+        // capture cell (e.g. a captured int parameter `n` in
+        // `lambda(n: int): (int) -> int => lambda(m: int) => n + m`) leaks
+        // 4 B per call (the 4-byte env n-field residual in lam$0, #3823,
+        // Shape C: `var add5 := adder(5);` and Shape B:
+        // `var got := pick(n);`).
+        if (lam.exprBody) {
+            if (auto* innerLam = dynamic_cast<const ast::LambdaExpr*>(
+                    lam.exprBody.get())) {
+                definitelyEscapingLambdas_.insert(
+                    static_cast<const void*>(innerLam));
+            }
+        }
     }
     closureReleaseEligibleFn_ = fn;
     // Emit body.

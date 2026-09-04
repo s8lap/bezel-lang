@@ -73,15 +73,25 @@
 // allocations leak pre-fix at 100 iters, 0 bytes post-fix). The
 // earlier "closure cells are calloc'd via a path LSan does not
 // intercept" rationale for Lenient is REFUTED for Shape A (see
-// regression-test-pins-the-bug). Rows B and C keep
-// runAotCheckedLenient: both mint the same 4 B lam$0 env n-field
-// residual post-fix (a separate latent bug, NOT the bug #2714
-// addresses — filed as a discovery issue alongside this PR); a
-// Strict-oracle pin on these rows would regress to a permanent FAIL
-// after the fix, defeating the FAIL-WITHOUT / PASS-WITH ratchet.
-// (Both rows pin the pre-fix-vs-post-fix delta via the expectedExitCode
-// alone — Shape B returns 12, Shape C returns 42 — plus the ASan
-// UAF/DF coverage Lenient still provides.)
+// regression-test-pins-the-bug).
+//
+// fix #3823 / §27.5 / §28.9 (v0.287): Row C advances to `runAotChecked`
+// (Strict LSan). The 4-byte lam$0 env n-field residual the lane-fixed
+// bug drained on shape C, leaving the program silent under
+// `bezelc --sanitize=address` + LSan (verified:
+// `b109-shape-c-post-fix` exits 42 with no LSan report, vs the pre-fix
+// `b109-shape-c-head`'s `4 byte(s) leaked in 1 allocation(s)`).
+//
+// Row B KEEPS `runAotCheckedLenient` for a SEPARATE reason from #3823:
+// the program still leaks 40 B under LSan ON after the #3823 fix — a
+// residual closure-value leak that lives on `Main` (the calloc
+// allocation reports `in main`), independent of the env n-field
+// release the lane just fixed. That 40 B leak is NOT in scope for #3823
+// (it is present pre- and post-fix; the lane's change is +0/-4 B on
+// Row B), and a Strict pin on Row B would regress to a permanent FAIL
+// against an unrelated bug. Row B's load-bearing pin is the expected
+// 12, plus the ASan UAF/DF coverage Lenient still provides — same shape
+// of pin Row C used to rely on for the 4 B residual.
 //
 // FAIL-WITHOUT / PASS-WITH provenance: each row's `expectedExitCode`
 // matches the program's last return — a wrong answer there is a
@@ -315,7 +325,13 @@ BEZEL_TEST(closure_call_local_borrow_2714,
 
 BEZEL_TEST(closure_call_local_borrow_2714,
            nested_lambda_return_releases_outer_closure_spec_27_5_28_9) {
-    expectNoLeakAndValue(kNestedLambdaReturn, 42);
+    // fix #3823 / §27.5 / §28.9 (v0.287): advanced from Lenient to
+    // Strict. The 4-byte lam$0 env n-field residual the lane drained
+    // was the only reason this row sat on Lenient; post-fix the program
+    // is silent under `--sanitize=address` + LSan (returns 42, no LSan
+    // report). Pin via expectedExitCode (42) + Strict-oracle LSan
+    // silence.
+    expectStrictNoLeakAndValue(kNestedLambdaReturn, 42);
 }
 
 BEZEL_TEST(closure_call_local_borrow_2714,
