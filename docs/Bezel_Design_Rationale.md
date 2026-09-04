@@ -1,6 +1,6 @@
 # Bezel: Design Rationale
 
-**Companion to the Bezel Language Specification, v0.286 — August 2026**
+**Companion to the Bezel Language Specification, v0.287 — September 2026**
 
 The spec describes the language. This document explains the choices behind it — places where two reasonable designs were possible and one was picked, places where a familiar-looking rule has a less-stated rule behind it, and places where something widely done elsewhere was deliberately left out. The spec says what the language *is*; this document says *why*, and what the alternatives would have cost.
 
@@ -2228,7 +2228,7 @@ The sorted collections take no per-instance ordering comparer (declined at v0.13
 
 ## 18. Things deferred
 
-Not in this version; the design is open to them in future revisions.
+Not in this version; the design is open to them in future revisions. Several of these were priced in study proposals rather than here — proposal 0061 (`docs/proposals/0061-expression-form-studies.md`) and the later `*-study.md` proposals — so a deferral scan of this list alone under-reads what has been examined; read the studies beside it.
 
 - **Sum types / discriminated unions.** *Shipped in v0.200 (proposal 0041, spec §35)* — closed nominal sums as the `choice` kind, with the three-way payload-derived ownership classification and static exhaustiveness by case name; the reasons and declined alternatives are [§9.6](#sec-choices-why-a-new-kind). What remains open is what the proposal deliberately excluded: structural/anonymous unions (declined — §9.6), GADTs, multi-level exhaustiveness counting, and `Result` combinators over **owned payloads** (each recorded liftable in proposal 0041; the value-payload combinators and declared-result construction target-typing shipped in v0.233 — proposal 0075 stages 1–2, spec §35.3, stdlib §2.20 — while the owning-payload form waits on ownership-polymorphic function parameters, recorded as 0075's stage 3(a)).
 - **Static interface members.** *Shipped in v0.176 (#807, spec §11.8)* — abstract-only, recurrence-constrained, with compiler-provided primitive conformances. The follow-ups it unblocks (FromCollectionLiteral/IDeserializable promotion, Range<T> de-intrinsicking) are tracked issues.

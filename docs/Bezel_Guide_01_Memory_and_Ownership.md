@@ -88,6 +88,7 @@ var c := source.Buffer;               // field / property read  -> borrowed (sou
 var d := registry.Find("key");        // returns Buffer (no owned) -> borrowed
 var t := source.PrefetchAsync();      // returns Task<Buffer>  -> owned (task calls mint, v0.190)
 var q := xs.Where(p);                 // returns a lazy query  -> owned (calls mint, v0.258)
+var parts := line.Split(':');         // returns owned Array<string> -> owned (trivial-dispose: no ceremony, §2)
 var e := move holder.slot;            // move out of owned field -> owned
 ```
 
@@ -96,6 +97,8 @@ The rule of thumb: `new` and any method whose return type says `owned` give you 
 - Outside the mint-announcing families, a *static* method's class-typed return must say `owned` — the compiler rejects the unmarked form, so a static signature always tells you whether you own the result.
 - A call whose declared return type is **mint-announcing** — `Task`/`Task<T>`/`OwningTask<T>`, or an iterable/enumerator interface or a lazy query — is **owned** no matter the callee: calls mint a fresh frame, no marker needed (tasks v0.190, iterables v0.258). A stored task or collection view is re-exposed as a property, whose read is a borrow.
 - A generic call returning bare `T`, like `Math.Max(a, b)`, is a **borrow of its arguments** (v0.194).
+
+`Split` is the producer people miss: its result is owned — a fresh array, not a borrow of the string — though `Array<T>` is trivial-dispose, so no ceremony is owed (§2). It also keeps every segment, empty ones included: `"a::b".Split(':')` is `["a", "", "b"]`, and a tokenizer filters explicitly — `line.Split(':').Where(lambda(w) => w.Length > 0)` (stdlib §9.6).
 
 When in doubt, the spec's producers table (§28.3) is exhaustive.
 
