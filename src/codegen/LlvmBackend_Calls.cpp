@@ -6794,8 +6794,9 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             return builder_.CreateIntToPtr(asI64, ptrTy());
         };
 
-        // narrow #3576 / stdlib §5 / §4.8 / §4.17 (v0.286): First()/Last()/
-        // ElementAt(i) over a Dictionary/SortedDictionary receiver. Sema
+        // narrow #3576 / stdlib §5 / §4.8 / §4.17 (v0.286); fix #3761:
+        // First()/Last()/ElementAt(i)/Single() over a Dictionary/
+        // SortedDictionary receiver. Sema
         // types the call as `DictionaryEntry<K,V>` (the shared `entryTy`
         // arm in ExprTypecheck_Calls.cpp's `colName == "Dictionary" ||
         // colName == "SortedDictionary"` block), but codegen had no arm for
@@ -6807,7 +6808,9 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         // SILENTLY — issue #3576 measured `dictFirst=0 dictLast=0
         // dictElemAt1=0` plus the internal "degraded to a zero-initialized
         // value" note (which is not an error, so the program still compiled
-        // and ran).
+        // and ran). Fix #3761 added the `Single()` arm: same silent
+        // degradation (Key=0, Value=0) — issue #3761 measured
+        // `dictSingle=0` for `Dictionary<int,int>.Single()` on a 1-entry dict.
         //
         // NARROWED to a non-string key (any K). A string key hits a
         // disposal dead end unrelated to this arm's own logic — see the
@@ -6821,7 +6824,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         // enumerator the for-in path uses"), applying the §4.17 ascending-
         // key sort for SortedDictionary (fix #3511) so all families agree
         // with `for var e in dict`, then decode ONLY the one index First/
-        // Last/ElementAt's own guard selects. This is a 4th "mirrors
+        // Last/ElementAt/Single's own guard selects. This is a 4th "mirrors
         // lowerDictEntryFor" copy (joining `LlvmBackend_Assign.cpp`'s and
         // the Calls3 LINQ materializer's) rather than a call into either of
         // those: both existing copies decode EVERY entry into a fresh
@@ -6841,7 +6844,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         // dict's own storage slot with no retain (a borrow, matching
         // GetOrNull's identical `dv = valPtr` decode a few arms down), so an
         // `OwningDictionary<K,V>` value returned through First/Last/
-        // ElementAt is disposed exactly once, at the dictionary's own
+        // ElementAt/Single is disposed exactly once, at the dictionary's own
         // scope end — never here.
         //
         // SortedDictionary<K,V> reaches this arm too (isDictTypeName is a
@@ -6876,7 +6879,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         // `src/sema/**` gap this arm cannot close. Both surviving halves
         // (the SortedDictionary exclusion and the missing OwningDictionary
         // typing rule) are filed as #3716.
-        if ((call.args.empty() && (m == "First" || m == "Last")) ||
+        if ((call.args.empty() && (m == "First" || m == "Last" || m == "Single")) ||
             (m == "ElementAt" && call.args.size() == 1 && call.args[0].value)) {
             // narrow #3576 / #3720: a STRING key has no disposal hook for
             // this consumption shape. `bz_dict_keys_str` hands back raw,
@@ -6957,9 +6960,10 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             }
 
             // Compute/guard the target index (stdlib §5 line 3594: First/
-            // Last throw InvalidOperationException on empty; ElementAt
-            // throws IndexOutOfRangeException out of bounds) -- before any
-            // snapshot allocation, per the note above.
+            // Last throw InvalidOperationException on empty; Single throws
+            // InvalidOperationException when count != 1; ElementAt throws
+            // IndexOutOfRangeException out of bounds) -- before any snapshot
+            // allocation, per the note above.
             llvm::Value* dtIdx;
             if (m == "First") {
                 emitGuardThrow(
@@ -6971,6 +6975,17 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                     builder_.CreateICmpEQ(dtCnt0, builder_.getInt64(0)),
                     "InvalidOperationException");
                 dtIdx = builder_.CreateSub(dtCnt0, builder_.getInt64(1));
+            } else if (m == "Single") {
+                // fix #3761 / stdlib §5 line 3594: Single throws
+                // InvalidOperationException if the source is empty OR has
+                // more than one entry — a single (dtCnt0 != 1) check covers
+                // both. Same "no allocation before reject" discipline as
+                // First/Last above: the snapshot is taken only after the
+                // guard passes, so the throw path leaks neither spine.
+                emitGuardThrow(
+                    builder_.CreateICmpNE(dtCnt0, builder_.getInt64(1)),
+                    "InvalidOperationException");
+                dtIdx = builder_.getInt64(0);
             } else {
                 llvm::Value* rawIdx = lowerExpr(*call.args[0].value);
                 if (!rawIdx) return nullptr;
@@ -6982,8 +6997,8 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                                "IndexOutOfRangeException");
             }
 
-            // Guard passed (dtCnt0 > 0 for First/Last; dtIdx in
-            // [0, dtCnt0) for ElementAt) -- safe to allocate the snapshot.
+            // Guard passed (dtCnt0 > 0 for First/Last; dtCnt0 == 1 for Single;
+            // dtIdx in [0, dtCnt0) for ElementAt) -- safe to allocate the snapshot.
             auto* dtFreeFn = declareC("free", llvm::Type::getVoidTy(llvm_), {ptrTy()});
             auto* dtKeysOutSlot = entryAlloca(ptrTy());
             auto* dtCntSlot     = entryAlloca(i64());
