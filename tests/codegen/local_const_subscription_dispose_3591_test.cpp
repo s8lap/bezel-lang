@@ -17,51 +17,47 @@
 // compile error, so a LocalConstDecl can never reach here" — is FALSE.
 // `Subscribe()` returns `owned Subscription` (stdlib §2.11 / §6.5), which by
 // §21.1's own text SHOULD be rejected for a `const` binding ("Rejected: ...
-// an `owned`-returning call"), but sema does not yet enforce that rejection
-// for `Subscribe()` specifically (a separate, pre-existing gap, NOT fixed
-// here — filed as #3591's own residue). Because the rejection does not fire,
-// codegen is handed exactly the shape the exemption claimed was unreachable.
+// an `owned`-returning call"). The earlier fix shipped the codegen-side
+// `isSubscriptionExpr` LocalConstDecl arm that made `.Dispose()` dispatch
+// correctly WITHOUT crashing — but the §21.1 REJECTION at the declaration was
+// not yet enforced (a separate, pre-existing gap flagged in #3591's own
+// commit body and filed as #3694). #3694 closes that gap: a `const sub :=
+// face.Subscribe(...)` binding is now REJECTED at compile time by the
+// ownership pass's `MethodOwnership::constInitializerRejected` (the new
+// `common::isEventSubscribeCall` disjunct). The codegen-side LocalConstDecl
+// arm added in #3591 stays in place as a defensive recognition (so a future
+// diagnostic refactor cannot reintroduce the SIGSEGV).
 //
-// THREE ROWS, MEASURED (probes in /var/tmp/bezel-scratch/r12/c3-d5/):
-//   1. IEVENT-FACE, const (the crash). `var face: IEvent<int> := bell.E;
-//      const sub := face.Subscribe(...); sub.Dispose();` in a 200-iteration
-//      loop. PRE-FIX: AddressSanitizer SEGV on address 0x4 (a small-integer
-//      value misread as a vtable-slot pointer) on the FIRST iteration's
-//      `.Dispose()` — matches the reviewer's repro exactly.
-//   2. IEVENT-FACE, var (control). Byte-identical except `var` in place of
-//      `const`. Clean before AND after this fix — the `var` fallback arm is
-//      unchanged; this row pins that the fix does not alter it.
-//   3. CONCRETE-FIELD, const (`_evt.Subscribe(...)` where `_evt:
-//      EventSource<int>`, no IEvent<T> face). Measured clean on BOTH sides
-//      (sema's primary isSubscriptionType check already recognizes this
-//      shape without the LocalDecl/LocalConstDecl fallback, because
-//      `isSubscribeCall`'s structural test only matches a direct `event`
-//      member or an IEvent<T>/IAsyncEvent<T>-typed target — an
-//      EventSource<T>-typed target is neither). Included per the review
-//      request as a regression guard on the untouched sibling shape, not
-//      because it crashes.
+// TWO ROWS REWRITTEN for #3694 (previously three — rows 1 and 3 tested
+// `const sub := face.Subscribe(...); sub.Dispose();` running clean via
+// codegen's `Emitter::isSubscriptionExpr` LocalConstDecl arm; those programs
+// are no longer LEGAL under the §21.1 rejection, so the test now asserts
+// the compile error instead. Per the project's "Fix must update EXISTING
+// tests" ratchet — the test's premise (the const binding compiles and
+// disposes correctly) is reversed by #3694, and updating in the same PR is
+// the right move; the gate would otherwise report this as a REAL
+// regression):
+//   1. IEVENT-FACE, const. PRE-#3694: SEGV on `.Dispose()`. POST-#3694:
+//      rejected at the declaration by §21.1 (verified via
+//      `parseAndCheckOwnership`).
+//   2. CONCRETE-FIELD, const. PRE-#3694: compiled cleanly. POST-#3694:
+//      rejected at the declaration by §21.1.
+//   3. IEVENT-FACE, var (control). Byte-identical to row 1 except `var` in
+//      place of `const`. Unchanged — the `var` fallback arm is untouched
+//      by this fix and must still compile, dispose cleanly, and total 200.
 //
-// Every row is a VALUE oracle, not a crash-signature oracle (§R12-G): each
-// Fire(1) immediately before `.Dispose()` must land (handler still
-// subscribed) and each Fire(1000) immediately after must NOT (handler
-// unsubscribed) — over 200 iterations the running total must be exactly 200,
-// never 200200 (disposal silently a no-op) nor any other value. A crash
-// (pre-fix row 1) makes `runAotChecked` return `ran=false`, which the `run()`
-// helper below turns into the sentinel "<did-not-run>" — distinct from every
-// passing value, so the assertion fails either way without inspecting a
-// signal or exit code. Expected values are "200\n" — `stdoutText` keeps its
-// trailing newline (unlike `runAotOut`, which strips one; #runet-vs-exit).
-//
-// FAIL-WITHOUT / PASS-WITH (mechanically verified, §R12-H): built bezelc
-// against the pre-fix `isSubscriptionExpr` (the committed `LOCALDECL-ONLY`
-// exemption, `git stash` isolated to this one file, `ab779f8`'s tree) with
-// `--sanitize=address`; row 1's program SEGVs (`AddressSanitizer: SEGV on
-// unknown address 0x000000000004`), rows 2 and 3 stay clean. Restored the
-// fix, rebuilt, relinked; all three rows clean with row 1's total == 200.
+// FAIL-WITHOUT / PASS-WITH (mechanically verified, §R12-H): row 1's
+// pre-#3591 program SEGV'd; #3591 made rows 1 and 2 (then-control) and 3
+// run clean via codegen's LocalConstDecl arm; #3694 makes rows 1 and 3
+// rejected at compile time, leaves row 2 (renamed) compiling and
+// disposing clean.
 
 #include "support/aot_support.hpp"   // runAotChecked — ASan/LSan AOT harness
+#include "support/ownership_support.hpp"  // parseAndCheckOwnership — diagnostic check
 #include "test_harness.hpp"
 
+using bezel::test::OwnershipResult;
+using bezel::test::parseAndCheckOwnership;
 using bezel::test::runAotChecked;
 
 namespace {
@@ -75,6 +71,27 @@ std::string run(const std::string& src) {
     return r.ran ? r.stdoutText : std::string("<did-not-run>");
 }
 
+// fix #3694 (§21.1 / stdlib §2.11 / §6.5): the `const` initializer of a
+// `.Subscribe(...)` call on an event-family receiver is rejected at the
+// declaration. Match the SPECIFIC Subscribe wording (not the generic
+// "must not take an owned production" — that's the §28.3 `new`-RHS /
+// materializer branches and would pass for unrelated reasons).
+bool hasConstSubscribeError(const OwnershipResult& r,
+                            const std::string& name) {
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        if (d.severity != bezel::Severity::Error) continue;
+        if (d.message.find("must not take an owned production") ==
+            std::string::npos)
+            continue;
+        if (d.message.find("`.Subscribe(...)` returns a fresh `owned` "
+                           "Subscription") == std::string::npos)
+            continue;
+        if (d.message.find("`" + name + "`") == std::string::npos) continue;
+        return true;
+    }
+    return false;
+}
+
 // Shared preamble: a Bell with an int event, and C's IEvent<int> face plumbing.
 const char* kPre =
     "module M; "
@@ -85,36 +102,31 @@ const char* kPre =
 
 }  // namespace
 
-// Row 1 (the crash): a `const` local bound to a stored IEvent<int> FACE's
-// Subscribe() result, explicitly disposed, 200x. Fire(1) before Dispose must
-// land; Fire(1000) after must not. Expected total: 200.
+// Row 1 (rewritten for #3694): a `const` local bound to a stored
+// IEvent<int> FACE's Subscribe() result is REJECTED at the declaration by
+// §21.1 — the leak path that #3591 closed at codegen-side is closed at the
+// sema side here. PRE-#3694: this program compiled and SEGV'd on
+// `.Dispose()`; #3591 made the `.Dispose()` work; #3694 removes the
+// program from the legal set.
 BEZEL_TEST(local_const_subscription_dispose_3591, ievent_face_const_loop_200) {
-    BEZEL_EXPECT_EQ(run(std::string(kPre) +
+    auto r = parseAndCheckOwnership(std::string(kPre) +
         "class C "
-        "  private owned _bell: Bell := new(); "
-        "  public static Total: int := 0; "
-        "  public method Loop() "
-        "    var face: IEvent<int> := _bell.E; "
-        "    var i := 0; "
-        "    while i < 200 do "
-        "      const sub := face.Subscribe(lambda(v: int) => do C.Total := C.Total + v; end); "
-        "      _bell.Fire(1); "
-        "      sub.Dispose(); "
-        "      _bell.Fire(1000); "
-        "      i := i + 1; "
-        "    end; "
-        "  end Loop; "
         "  public static method Main(): int "
-        "    using var c := new C(); "
-        "    c.Loop(); "
-        "    Console.WriteLine(C.Total.ToString()); "
+        "    using var bell := new Bell(); "
+        "    var face: IEvent<int> := bell.E; "
+        "    const sub := face.Subscribe(lambda(v: int) => do end); "
         "    return 0; "
         "  end Main; "
-        "end C;"), "200\n");
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasConstSubscribeError(r, "sub"));
 }
 
-// Row 2 (control): byte-identical to row 1 except `var` in place of `const`.
-// Must stay at total 200 — the `var` fallback arm this fix does not touch.
+// Row 2 (control, unchanged): byte-identical to row 1's PREVIOUS shape
+// except `var` in place of `const`. The `var` fallback arm this fix does not
+// touch must keep compiling, disposing cleanly, and totalling exactly 200
+// over 200 iterations of Fire(1) + Dispose + Fire(1000) — the VALUE oracle
+// (§R12-G) that pins codegen's `isSubscriptionExpr` LocalDecl arm.
 BEZEL_TEST(local_const_subscription_dispose_3591, ievent_face_var_loop_200_control) {
     BEZEL_EXPECT_EQ(run(std::string(kPre) +
         "class C "
@@ -140,34 +152,20 @@ BEZEL_TEST(local_const_subscription_dispose_3591, ievent_face_var_loop_200_contr
         "end C;"), "200\n");
 }
 
-// Row 3 (regression guard, measured clean on both sides): a `const` local
-// bound directly to a concrete EventSource<int> FIELD's Subscribe() result
-// (no IEvent<T> face) — a sibling shape `isSubscribeCall`'s structural test
-// does not recognize either way (it only matches a direct `event` member or
-// an IEvent<T>/IAsyncEvent<T>-typed target), so sema's primary
-// isSubscriptionType check is what disposes it correctly. Total: 200.
+// Row 3 (rewritten for #3694): a `const` local bound directly to a concrete
+// EventSource<int> FIELD's Subscribe() result (no IEvent<T> face) is
+// REJECTED at the declaration by §21.1. PRE-#3694: this program compiled
+// cleanly; #3694 removes it from the legal set.
 BEZEL_TEST(local_const_subscription_dispose_3591, concrete_eventsource_field_const_loop_200) {
-    BEZEL_EXPECT_EQ(run(
+    auto r = parseAndCheckOwnership(
         "module M; "
         "class C "
-        "  private owned _evt: EventSource<int> := new(); "
-        "  public static Total: int := 0; "
-        "  public method Loop() "
-        "    var i := 0; "
-        "    while i < 200 do "
-        "      const sub := _evt.Subscribe(lambda(v: int) => do C.Total := C.Total + v; end); "
-        "      _evt.Raise(1); "
-        "      sub.Dispose(); "
-        "      _evt.Raise(1000); "
-        "      i := i + 1; "
-        "    end; "
-        "  end Loop; "
         "  public static method Main(): int "
-        "    using var c := new C(); "
-        "    c.Loop(); "
-        "    Console.WriteLine(C.Total.ToString()); "
+        "    using var evt := new EventSource<int>(); "
+        "    const sub := evt.Subscribe(lambda(v: int) => do end); "
         "    return 0; "
         "  end Main; "
-        "end C;"), "200\n");
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasConstSubscribeError(r, "sub"));
 }
-

@@ -2686,17 +2686,49 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
                     "materializer returns a fresh `owned` collection (stdlib "
                     "§5) that the binding would never dispose, so the value "
                     "would leak; bind it with `using var` (§21.1 / §28.3)");
+            } else if (auto* sce =
+                           dynamic_cast<const ast::CallExpr*>(lc->value.get());
+                       sce &&
+                       common::isEventSubscribeCall(*sce, ctx_)) {
+                // fix #3694 (§21.1 v0.286 / stdlib §2.11 / §6.5): the §24.1 /
+                // §6.5 `.Subscribe(...)` member on an event face
+                // (`IEvent<T>` / `IAsyncEvent<T>` / `ISharedEvent<T>`), on a
+                // producer-side sealed source (`EventSource<T>` /
+                // `AsyncEventSource<T>` / `SharedEventSource<T>`), or on a
+                // direct event member access — returns `owned Subscription`,
+                // but is a compiler-known member with no user `MethodDecl`, so
+                // producerState's `md->returnOwned` arm cannot see it and the
+                // Owned branch above does not catch it. Same shape as the
+                // materializer branch: a const binding here leaks because a
+                // const local is neither a `LocalDecl` (codegen's plain-`var`
+                // Subscription reclaim, `Emitter::isSubscriptionExpr`'s var
+                // path) nor a `using var` (`registerUsingDisposal` on
+                // Subscription), so NOTHING frees the handle. Measured under
+                // ASan/LSan: 500 iterations of `const sub :=
+                // face.Subscribe(...)` leak 16000 B (32 B per Subscription
+                // handle — `#3591` lane c4-d4 review recorded this on
+                // 2026-09-03). Both spellings that DO bind it (`var sub`
+                // and `using var sub`) are already reclaimed by codegen
+                // correctly, so no disposal machinery changes here.
+                // // per §21.1 v0.286, stdlib §2.11 / §6.5, #3694
+                ctx_.diagnostics().report(
+                    Severity::Error, lc->value->span.begin,
+                    std::string("a `const` local (`") + std::string(lc->name) +
+                    "`) must not take an owned production — `.Subscribe(...)` "
+                    "returns a fresh `owned` Subscription (stdlib §2.11 / §6.5) "
+                    "that the binding would never dispose, so the handle would "
+                    "leak; bind it with `using var` (§21.1 / §28.3)");
             } else {
                 // UNREACHABLE TODAY, and structural rather than defensive: the
                 // outer gate is `constInitializerRejected`, whose disjuncts are
-                // exactly the four branches above, so falling here means a
-                // fifth disjunct was added to the predicate without a message.
+                // exactly the five branches above, so falling here means a
+                // sixth disjunct was added to the predicate without a message.
                 // Without this arm that combination would REJECT-BUT-SAY-
                 // NOTHING — the initializer accepted in silence while the lint
                 // (which consults the same predicate) also stays quiet: the
                 // #2709 accept-and-leak failure mode restored by omission.
                 // Emitting §21.1's general wording keeps the gate and the
-                // messages jointly total. // per §21.1, #2709
+                // messages jointly total. // per §21.1, #2709, #3694
                 ctx_.diagnostics().report(
                     Severity::Error, lc->value->span.begin,
                     std::string("a `const` local (`") + std::string(lc->name) +
@@ -3856,6 +3888,21 @@ bool MethodOwnership::constInitializerRejected(const ast::Expr& e) {
         // §21.1's "an `owned`-returning call", for the builtin materializers
         // `producerState` cannot see (#2709).
         if (common::isBuiltinOwnedMaterializerCall(*ce, ctx_)) return true;
+        // fix #3694 (§21.1 v0.286 / stdlib §2.11 / §6.5): the `.Subscribe(...)`
+        // call on an `IEvent<T>` / `IAsyncEvent<T>` / `ISharedEvent<T>` face,
+        // on an `EventSource<T>` / `AsyncEventSource<T>` / `SharedEventSource<T>`
+        // sealed source, or on a direct event member access — every such call
+        // returns `owned Subscription` (stdlib §6.5) and is rejected by §21.1's
+        // text, but it is a compiler-known member with no user `MethodDecl`,
+        // so producerState's `md->returnOwned` arm cannot see it and the first
+        // disjunct above stays silent. This is the #2709 shape recurring for
+        // the event family: a const binding of `face.Subscribe(...)` was
+        // accepted and the returned handle leaked (measured 16000 B / 500
+        // iterations, one Subscription each). The predicate is
+        // diagnostic-only (no disposal, retain, or dataflow state); the codegen
+        // subscription-reclaim path that lowers the `var` and `using var`
+        // spellings is unchanged.
+        if (common::isEventSubscribeCall(*ce, ctx_)) return true;
     }
     // §28.3's "Range slice `arr[r]` on `Array<T>`" producer row (#2749 item 2).
     // The spec makes the two spellings ONE operation — the row reads "Owned — a

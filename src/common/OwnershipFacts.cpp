@@ -883,6 +883,56 @@ bool isBuiltinArrayRangeSliceIndex(const ast::IndexExpr& ix,
     return ctx.exprType(ix) == rt;
 }
 
+bool isEventSubscribeCall(const ast::CallExpr& call,
+                          const sema::SemaContext& ctx) {
+    // See the header contract. // per §21.1 v0.286, stdlib §2.11 / §6.5, #3694
+    auto [maTarget, mm] = builtinInstanceCallee(call.callee.get());
+    if (!maTarget) return false;
+    if (mm != "Subscribe") return false;
+    // §6.5's signature is `Subscribe(handler)` — exactly one argument. The
+    // codegen-side structural test (LlvmBackend_Calls2.cpp:3847) has the same
+    // gate; an arity-0 or arity-2 spelling reaches a different stdlib surface
+    // and is excluded here on the same basis. The `AsyncSubscribe` member
+    // referenced in #3694's reproduction does not exist — the
+    // async-event-handler path is the same `Subscribe` member with a
+    // `(T) -> Task` handler type (stdlib §6.5, `IAsyncEvent<T>.Subscribe`'s
+    // signature) — so the single `Subscribe` name covers both.
+    if (call.args.size() != 1) return false;
+    // The direct-event path: `evt.Subscribe(handler)` / `this.Clicked.Subscribe(...)`
+    // — the EventSymbol-bearing shape (§24.1, the §17.2 desugaring of the
+    // `+=` operator stays in `Emitter::isSubscriptionExpr`'s recognition,
+    // which we mirror here for the §21.1 half). An event-member access on its
+    // own is a `MemberAccessExpr` / `IdentifierExpr` carrying an `EventSymbol`
+    // attached by sema to that expr.
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get())) {
+        if (ma->target &&
+            dynamic_cast<sema::EventSymbol*>(ctx.exprSymbol(*ma->target)))
+            return true;
+    }
+    // The stored-face / sealed-source path: `face.Subscribe(handler)` /
+    // `src.Subscribe(handler)` where the receiver types as one of the six
+    // compiler-known event-family heads. Same shape predicate codegen's
+    // `Emitter::isIEventTypeName` / `isEventSourceTypeName` /
+    // `isISharedEventTypeName` / `isSharedEventSourceTypeName` (the latter two
+    // #1832 added for `SharedEventSource`; the same `SharedEventSource<T>`
+    // pair produces `owned Subscription` and is therefore in scope here) use:
+    // Named TypeRef, declaration-null, astNode name, head is in the set below.
+    // The declaration-null gate is what excludes a user type that happens to
+    // share the name `EventSource` / `IEvent` / etc.: such a type carries a
+    // declaration and reaches the user-method authority instead. Per stdlib
+    // §6.5 the `.Subscribe` member returns `owned Subscription` on every one
+    // of these receivers.
+    const sema::TypeRef* rt = ctx.exprType(*maTarget);
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
+        return false;
+    if (!rt->astNode || !rt->astNode->name || rt->astNode->name->parts.empty())
+        return false;
+    const auto head = rt->headName();
+    return head == "IEvent" || head == "IAsyncEvent" ||
+           head == "ISharedEvent" || head == "EventSource" ||
+           head == "AsyncEventSource" || head == "SharedEventSource";
+}
+
 namespace {
 
 // Recursively scan every `return EXPR;` reachable in statement `s` (the same

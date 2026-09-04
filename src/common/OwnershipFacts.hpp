@@ -604,6 +604,59 @@ bool isBuiltinOwnedMaterializerCall(const ast::CallExpr& call,
 bool isBuiltinArrayRangeSliceIndex(const ast::IndexExpr& ix,
                                    const sema::SemaContext& ctx);
 
+// §21.1 (v0.286) / stdlib §2.11 / §6.5 (fix #3694): a `.Subscribe(handler)`
+// member call on an `IEvent<T>` / `IAsyncEvent<T>` / `ISharedEvent<T>` face, on
+// the producer-side `EventSource<T>` / `AsyncEventSource<T>` /
+// `SharedEventSource<T>` sealed classes, or on a direct event member access
+// (carrying an `EventSymbol`, §24.1). Every one of those returns
+// `owned Subscription` (stdlib §2.11), so by §21.1's text it MUST be rejected
+// as a `const` initializer — but the call is to a COMPILER-KNOWN MEMBER with
+// no user `MethodDecl`, so `producerState`'s `md->returnOwned` arm (the only
+// call-side Owned authority) cannot see it. Without this disjunct the §21.1
+// rejection falls through (this is the exact #2709 shape recurring for the
+// event-family, documented in #3694) and a `const sub := face.Subscribe(...)`
+// compiles and LEAKS — measured 16000 B / 500 iterations, one `Subscription`
+// handle each.
+//
+// WHAT IT RECOGNIZES, and why it cannot over-fire. Mirrors codegen's
+// `Emitter::isSubscribeCall` structural test (LlvmBackend_Calls2.cpp:3847) on
+// all three of its clauses, AND widens it with the producer-side sealed
+// classes (codegen's predicate is exact-only — codegen's `isIEventTypeName`
+// gate is the one copy of the face check; the producer-side sealed class is
+// also a `Subscription` producer, but codegen reaches it through sema's
+// primary `isSubscriptionType` typing of `EventSource.Subscribe(...)` rather
+// than through this structural fallback). The four clauses AND'd:
+//   (a) the callee is `recv.M(...)` or `recv?.M(...)` (the same
+//       `builtinInstanceCallee` helper the two preceding predicates use, so the
+//       three cannot drift on the `.` / `?.` widening #2581 / #2749 item 3
+//       closed);
+//   (b) the member name is `Subscribe` (one arg only — `Subscribe(handler)`
+//       per stdlib §6.5; an `AsyncSubscribe` does not exist);
+//   (c) the receiver is one of the six builtin event-family types listed
+//       above (Named / declaration-less TypeRef whose head name matches) OR a
+//       direct event member access whose target exprSymbol is an `EventSymbol`.
+//       The declaration-less gate is what excludes a user class whose
+//       `Subscribe` member happens to share the name: a user class carries a
+//       declaration and `eventSymbolOf` is the only path that lets one
+//       through (an event member on `Bell` accesses the symbol, a `Subscribe`
+//       call on a user-typed receiver does not).
+//
+// A USER method named `Subscribe` that returns `owned Subscription` (per its
+// own `MethodDecl::returnOwned`) is ALREADY handled by the existing first
+// disjunct of `constInitializerRejected` (producerState → Owned via
+// `md->returnOwned`), and this predicate stays out of its way: the user
+// `MethodDecl` carries a symbol that reaches the user-method path, not the
+// builtin path. The codegen-side structural test has the same shape and the
+// same narrowness.
+//
+// DIAGNOSTIC-ONLY, exactly like `isBuiltinOwnedMaterializerCall` and
+// `isBuiltinArrayRangeSliceIndex`: it is reached only through
+// `MethodOwnership::constInitializerRejected`, changes no disposal, retain, or
+// dataflow state, and the code generated for every program that still
+// compiles is what it was. // per §21.1 v0.286, stdlib §2.11 / §6.5, #3694
+bool isEventSubscribeCall(const ast::CallExpr& call,
+                          const sema::SemaContext& ctx);
+
 // §28.3 "Factory methods and sourceless returns" / Appendix C.3 (fix #1499): a
 // STATIC method returning a plain class/interface type with NO `owned`
 // annotation has no STRUCTURAL borrow source — a static call has no receiver —
