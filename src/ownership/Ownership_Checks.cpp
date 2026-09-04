@@ -5932,15 +5932,24 @@ bool MethodOwnership::checkBorrowStoreEscape(const ast::AssignmentStmt& as,
     // consults no borrow SOURCE — it is a TYPE rule ("a borrow-bearing record
     // may not be stored in an instance field of a class, unconditionally"),
     // so unlike every leg below it neither `states_` nor `localDepth_` gates
-    // it and the lambda-body re-seeding neither enables nor scopes it. Running
-    // it from `EscapeScope::LambdaBody` would therefore not be "the same
-    // question answered for a smaller scope" but a DIFFERENT rule newly
-    // reaching a position it never reached before, on this fix's coat-tails.
-    // That gap (a `this.f := someSpan;` inside a lambda body) is real —
-    // measured: rc=0 there, rejected at method level — and is filed as issue
-    // 3701; it is deliberately not widened in here. // per §9.7
-    if (scope == EscapeScope::Method && dest == Dest::Field &&
-        storeTargetIsClassField(*as.target)) {
+    // it and the lambda-body re-seeding neither enables nor scopes it. fix
+    // #3701 (§9.7 / §28.3, v0.287): WIDEN that scope restriction to both
+    // Method and LambdaBody — the §9.7 type rule has no borrow source, only a
+    // type-classified RHS and a class-instance-field target, so it does not
+    // depend on `states_` / `localDepth_` and the lambda-body re-seed is
+    // irrelevant to its answer. The narrower rule "a class instance's
+    // lifetime is not bounded by that backing store's scope" applies
+    // regardless of WHERE in the program the store is positioned — a `this.f
+    // := borrowBearingRecord` inside a lambda body has the same defect as
+    // one at method level (a class instance's lifetime exceeds any borrow
+    // source's scope, and the per-access disposed-flag check is unavailable
+    // through record/span/choice-carried access paths). Measured pre-fix:
+    // the lambda-body form compiled rc=0 and SEGV'd at runtime once the
+    // backing buffer was disposed; the byte-identical method-level twin is
+    // rejected on the same compiler. // per §9.7, §28.3
+    if ((scope == EscapeScope::Method ||
+         scope == EscapeScope::LambdaBody) &&
+        dest == Dest::Field && storeTargetIsClassField(*as.target)) {
         const sema::TypeRef* rhsType = ctx_.exprType(*as.value);
         const bool rhsIsRecord = isBorrowBearingRecord(rhsType);
         const bool rhsIsSpan =
