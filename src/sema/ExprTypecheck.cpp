@@ -10519,8 +10519,66 @@ void ExprTC::visitTopDecl(const ast::TopDecl& d) {
             inFieldInitializer_ = true;
             Scope* saveScope = currentScope_;
             if (!currentScope_) currentScope_ = moduleScope_.get();
-            for (const auto& arg : td->primaryBaseCtorArgs) {
-                if (arg.value) visitExpr(*arg.value);
+            // fix #3750 (§22.10 "primary constructors" / §22.5 "Defaults and
+            // modifiers" / §28.3 rule 5 / §28.9, v0.286): an inheritance-
+            // clause base call of the form `class D(a: int): Base(new Res(a))`
+            // binds each argument to a positional field of the BASE class.
+            // Per §22.5 "Defaults and modifiers", a default-value expression
+            // that produces a fresh owned value of NON-trivial-dispose class
+            // type (§28.9) is admitted only when the parameter is declared
+            // `owned`, and is a compile error on a plain (borrowing)
+            // parameter. The same rule applies to §22.10 base-call arguments
+            // (the spec positions inheritance-clause base-call arguments as
+            // supplying the base class's positional parameters — they are
+            // argument expressions, not default-value expressions, but the
+            // same disposal obligation applies: an `owned` is needed on the
+            // base parameter, or the fresh instance is undischargeable). The
+            // OWNED spelling (`owned r: Res` in the base) already works
+            // because §28.3 owns the temporary through the `owned` parameter;
+            // the plain spelling leaked (issue #3750's measured oracle: 3200
+            // bytes / 200 Res instances disposed `made=200 live=200`). Walk
+            // the BASE class's positional fields in declaration order, gate on
+            // the matching modifier being empty (plain), and check the
+            // argument expression with the existing runMethodBody predicate.
+            const TypeSymbol* baseTs = nullptr;
+            if (currentType_ && !currentType_->baseTypes.empty()) {
+                for (TypeSymbol* b : currentType_->baseTypes) {
+                    if (b && b->kind == ast::TypeDeclKind::Class) {
+                        baseTs = b;
+                        break;
+                    }
+                }
+            }
+            std::vector<const sema::FieldSymbol*> basePosParams;
+            if (baseTs) {
+                for (Symbol* m : baseTs->members) {
+                    if (auto* fs = dynamic_cast<FieldSymbol*>(m)) {
+                        if (fs->posParam) basePosParams.push_back(fs);
+                    }
+                }
+            }
+            for (std::size_t ai = 0;
+                 ai < td->primaryBaseCtorArgs.size(); ++ai) {
+                const auto& arg = td->primaryBaseCtorArgs[ai];
+                if (!arg.value) continue;
+                visitExpr(*arg.value);
+                // Same check as runMethodBody's parameter-default path, but
+                // keyed on the BASE class's positional parameter at index ai
+                // — the inheritance-clause binds positionally.
+                if (ai < basePosParams.size() &&
+                    basePosParams[ai]->posParam &&
+                    basePosParams[ai]->posParam->modifier.empty() &&
+                    exprIsOwnedProducerOfNonTrivialDisposeClass(*arg.value)) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, arg.value->span.begin,
+                        std::string("base-call argument ") +
+                            std::to_string(ai + 1) +
+                            " produces an owned value of non-trivial-dispose "
+                            "class type, which would have no owner to "
+                            "discharge it; declare the base parameter `owned` "
+                            "to receive it, or use a trivial-dispose "
+                            "default (§22.5)");
+                }
             }
             currentScope_ = saveScope;
             inFieldInitializer_ = saveIFI;
@@ -10584,6 +10642,35 @@ void ExprTC::visitTopDecl(const ast::TopDecl& d) {
                         visitExpr(*pf.defaultValue);
                         inFieldInitializer_ = saveIFI;
                         inPrimaryCtorDefault_ = savePCD;
+                        // fix #3750 (§22.10 "primary constructors" /
+                        // §22.5 "Defaults and modifiers" / §28.3 rule 5 /
+                        // §28.9, v0.286): a primary-ctor positional field's
+                        // `:= Expr` default is exactly the same shape as a
+                        // METHOD parameter's default — `runMethodBody` already
+                        // runs this exact check on method/ctor parameter
+                        // defaults (line 11096), but the primary-ctor
+                        // positional-fields loop was missing it. Mirror that
+                        // check here so `class Holder(a: int, r: Res := new
+                        // Res(77))` is rejected the same way
+                        // `public method M(h: Res := new Res())` already is.
+                        // A trivial-dispose producer stays admissible per the
+                        // spec's "stays admissible on either form" clause —
+                        // the predicate itself excludes trivial-dispose.
+                        if (pf.modifier.empty() &&
+                            exprIsOwnedProducerOfNonTrivialDisposeClass(
+                                *pf.defaultValue)) {
+                            ctx_.diagnostics().report(
+                                Severity::Error, pf.defaultValue->span.begin,
+                                std::string("default value of primary "
+                                            "constructor parameter `") +
+                                    std::string(pf.name) +
+                                    "` produces an owned value of "
+                                    "non-trivial-dispose class type, which "
+                                    "would have no owner to discharge it; "
+                                    "declare the parameter `owned` to receive "
+                                    "it, or use a trivial-dispose default "
+                                    "(§22.5)");
+                        }
                     }
                 }
                 currentScope_ = saveScope;

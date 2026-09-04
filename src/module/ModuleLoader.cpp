@@ -830,6 +830,31 @@ struct Loader {
                 if (mm.isPositional) {
                     auto* p = ctx.makeImportedParam();
                     f->posParam = p;
+                    // fix #3750 (§22.5 / §22.10 / §28.3 rule 5 / §28.9,
+                    // v0.286): the synthetic `posParam` reconstructed here is
+                    // the mirror of the LOCAL path's `posParam = &pf`
+                    // (SymbolCollection.cpp:309), whose modifier `""` /
+                    // `"owned"` rides on `ast::Param::modifier`. Without
+                    // bridging `mm.modifiers[0]` ("owned", the only marker
+                    // the metadata carries — ModuleMetadataBuilder
+                    // line 1167-1168) into `p->modifier`, an imported §22.10
+                    // base call's #3750 reject predication saw `modifier.empty()`
+                    // for an `owned r: Res` field — false-rejected the
+                    // borrowed-over-imported-base sibling shape (LSan-free
+                    // rows that the metadata has always supported). The
+                    // `modifiers`-list path also carries `static` for body
+                    // fields; a positional class parameter carries `owned`
+                    // ONLY in current spec, so reading the first element is
+                    // safe. Recorded here because every other reader of
+                    // `fs->posParam->modifier` (#2654 / #3773 / the
+                    // `Modifier` arm of `formalParamName` /
+                    // `formalParamHasDefault`) currently answers
+                    // "plain"/"no default" for every imported positional
+                    // parameter — a silent-write the predicate carried for
+                    // one site (#3647) before this fix.
+                    if (!mm.modifiers.empty()) {
+                        p->modifier = ctx.internString(mm.modifiers.front());
+                    }
                     // fix #3221 (§22.10/§9.8/§2.8.3 rule 4, v0.254): the
                     // captured-vs-not flag. The synthetic `posParam` above
                     // (#2516) is the positional vs body distinction; the
