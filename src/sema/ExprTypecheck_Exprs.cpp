@@ -8092,10 +8092,98 @@ void ExprTC::visitChildren(const ast::Expr& e) {
             // `pendingLambdaParamTypes_` per-parameter seeding at all
             // (unlike the CallExpr path's fix #829 machinery above).
             bool savedArgCtxNew = pendingLambdaArgContext_;
-            if (a.value && dynamic_cast<const ast::LambdaExpr*>(a.value.get()))
+            // fix #3772 (§27.4 / §14.1, v0.287): when a constructor-argument
+            // lambda is bound to a function-typed ctor parameter on a
+            // GENERIC class (e.g. `new Box<R>(lambda(x) => x.V())` where
+            // `Box<T>::ctor(scoped g: (T) -> int)`), the lambda's
+            // unannotated parameter `x` MUST be typed to the concrete
+            // generic argument (`R`), not to the bare class type-parameter
+            // `T` — otherwise codegen computes the wrong value once the
+            // closure escapes the constructor and is invoked from elsewhere
+            // (issue #3772: prints `0` instead of `5`). This mirrors the
+            // CallExpr path's fix-#829 / fix-#1140 machinery above — build
+            // the class-level substitution map from the `new` expression's
+            // resolved type's bound generic args and thread it through
+            // `pendingLambdaParamTypes_` / `pendingLambdaTargetReturn_`
+            // before visiting the lambda literal.
+            //
+            // Source: `formalCtorOutParamType(posn)` — the same
+            // both-sources accessor the inline-`out` recipients (#2668 /
+            // #3206 / #3186 / #3188) and the integer-literal widening hint
+            // (#3220) above already consult. Returns the formal parameter's
+            // resolved TypeRef for BOTH a local ctor (`ctorDecl` non-null)
+            // and an imported ctor (`ctorSym` non-null) — the issue's
+            // repro sits on the local side, but the imported side is
+            // covered by the same accessor without further widening.
+            std::vector<TypeRef*> savedLamParamsNew = pendingLambdaParamTypes_;
+            TypeRef* savedLamTargetRetNew = pendingLambdaTargetReturn_;
+            bool savedLamTargetRetOwnedNew = pendingLambdaTargetReturnOwned_;
+            if (a.value &&
+                dynamic_cast<const ast::LambdaExpr*>(a.value.get())) {
                 pendingLambdaArgContext_ = true;
+                if (TypeRef* pt = formalCtorOutParamType(posn)) {
+                    if (pt->kind == TypeRef::Kind::Function &&
+                        !pt->funcParams.empty()) {
+                        // Build the class-level substitution map from the
+                        // `new` expression's RESOLVED type's bound generic
+                        // args, mapping the class's type-parameter name to
+                        // the concrete type argument. The CallExpr path's
+                        // `recvTy` analogue here is the resolved NewExpr
+                        // target type (`rt = ctx_.resolvedType(*ne->type)`)
+                        // — the class itself is `rt->declaration`.
+                        std::unordered_map<std::string_view, TypeRef*>
+                            classSubst;
+                        if (ne->type) {
+                            if (auto* rt = ctx_.resolvedType(*ne->type)) {
+                                if (rt->declaration &&
+                                    !rt->declaration->genericParams.empty() &&
+                                    !rt->genericArgs.empty()) {
+                                    for (std::size_t gi = 0;
+                                         gi < rt->declaration->genericParams
+                                                     .size() &&
+                                         gi < rt->genericArgs.size(); ++gi) {
+                                        if (rt->declaration->genericParams[gi]
+                                            && rt->genericArgs[gi])
+                                            classSubst[
+                                                rt->declaration->genericParams[gi]
+                                                    ->name] =
+                                                rt->genericArgs[gi];
+                                    }
+                                }
+                            }
+                        }
+                        pendingLambdaParamTypes_.clear();
+                        for (const auto& fp : pt->funcParams) {
+                            TypeRef* paramTy = fp.type;
+                            if (!classSubst.empty())
+                                paramTy = substituteReturnType(
+                                    paramTy, classSubst);
+                            pendingLambdaParamTypes_.push_back(paramTy);
+                        }
+                        // §27.3 (v0.226, #2107): thread the target function
+                        // type's return slot too, so block-body divergent-
+                        // return inference has a target and the inner
+                        // §28.3 / §28.8 ownership marker travels. Apply the
+                        // same class-level substitution as the params.
+                        pendingLambdaTargetReturn_ = pt->funcReturn;
+                        pendingLambdaTargetReturnOwned_ = pt->funcReturnOwned;
+                        if (!classSubst.empty() &&
+                            pendingLambdaTargetReturn_)
+                            pendingLambdaTargetReturn_ =
+                                substituteReturnType(
+                                    pendingLambdaTargetReturn_, classSubst);
+                    }
+                }
+            }
             if (a.value) visitExpr(*a.value);
             pendingLambdaArgContext_ = savedArgCtxNew;
+            // fix #3772: restore the lambda-typing threading state so it
+            // does not leak into the next constructor argument (parallel
+            // to the CallExpr path's savedLamParams / savedLamTargetRet
+            // restoration at ~line 7587 above).
+            pendingLambdaParamTypes_ = savedLamParamsNew;
+            pendingLambdaTargetReturn_ = savedLamTargetRetNew;
+            pendingLambdaTargetReturnOwned_ = savedLamTargetRetOwnedNew;
             refOutArgTargetNode_ = savedRefOutNew;
             currentLiteralWideningHint_ = savedNewHint;
             // §22.3 (v0.184, #1682): validate a bare `ref`/`out` constructor
