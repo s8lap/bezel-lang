@@ -3229,6 +3229,79 @@ void MethodOwnership::checkClosureEscapesOnReturn(const ast::Expr& e,
                         continue;
                     findLambdas(*a.value);
                 }
+                // fix #3702 (§28.9, v0.286): the SIGSEGV residual of #3564.
+                // `return mk();` is a CallExpr whose callee is a function-
+                // typed local whose value comes from a lambda-literal
+                // initializer. `findLambdas` historically descended into a
+                // call's ARGUMENTS only and never into the callee's
+                // initializer, so neither escape check saw a lambda; the
+                // closure returned by `mk()` then escaped the method
+                // through Mk()'s own return (a use-after-dispose measured
+                // as a SIGSEGV on the next call into the captured local).
+                //
+                // The fix DOES NOT simply push `initLam` onto the `lambdas`
+                // list: that would also walk every identifier used ANYWHERE
+                // in `mk`'s body, and reject the legitimate sibling where
+                // `mk`'s body merely READS a method-scope owned local —
+                // e.g. `mk := lambda(): int => r.V(); return mk();` — even
+                // though the closure is consumed by the call and `r` is
+                // never borrowed past Mk()'s scope.
+                //
+                // The right shape is "what does `mk()` return?". When the
+                // body returns a closure (or a value that contains one),
+                // THAT closure escapes Mk(); when the body returns an int
+                // computed from `r` (no closure in the return value), the
+                // closure never escapes. The check that already knows how
+                // to answer this is `checkClosureEscapesOnReturn` itself,
+                // driven against every `return E;` reachable inside `mk`'s
+                // body (using the §28.3 `scanReturnsIn` walker that the
+                // lambda-literal-return path itself uses), with
+                // `EscapeScope::Method` because we are still asking about
+                // the enclosing method's owned locals. For an expression-
+                // bodied lambda there is exactly one such return value:
+                // `initLam->exprBody`. Resolution goes through `exprSymbol`
+                // (the SEMA-populated side table), then `LocalSymbol::decl`
+                // (the declaration the local was registered against), then
+                // the LocalDecl's initializer expression. A non-identifier
+                // callee (a member access, a path expression, a callee
+                // itself coming from a call) is left alone — the issue's
+                // reproduction is exactly the IdentifierExpr→LocalDecl
+                // shape, and the lambda-literal initializer is the unique
+                // signature of a function-typed local storing a closure.
+                if (auto* calleeId =
+                        dynamic_cast<const ast::IdentifierExpr*>(
+                            ce->callee.get())) {
+                    sema::Symbol* calleeSym = ctx_.exprSymbol(*calleeId);
+                    if (auto* ls =
+                            dynamic_cast<sema::LocalSymbol*>(calleeSym)) {
+                        if (auto* ld = dynamic_cast<const ast::LocalDecl*>(
+                                ls->decl)) {
+                            if (auto* initLam =
+                                    dynamic_cast<const ast::LambdaExpr*>(
+                                        ld->initializer.get())) {
+                                // The lambda body is what `mk()` evaluates
+                                // to; any lambda escaping that body escapes
+                                // Mk() via the CallExpr in the return
+                                // position. Recurse `findLambdas` over it:
+                                // for `=> E` the entire body is one
+                                // expression; for `do ... end` the walker
+                                // drives each `return E;` reachable inside
+                                // the body (without crossing nested
+                                // lambdas — exactly Mk()'s hand-back values).
+                                if (initLam->exprBody) {
+                                    findLambdas(*initLam->exprBody);
+                                }
+                                for (const auto& st : initLam->stmts) {
+                                    if (st) scanReturnsIn(
+                                        *st,
+                                        [&](const ast::Expr& re) {
+                                            findLambdas(re);
+                                        });
+                                }
+                            }
+                        }
+                    }
+                }
                 return;
             }
             if (auto* ne = dynamic_cast<const ast::NewExpr*>(&x)) {
