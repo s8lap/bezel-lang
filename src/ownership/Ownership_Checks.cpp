@@ -2645,8 +2645,35 @@ void MethodOwnership::reportMovedFromCapturesIn(const ast::LambdaExpr& lam,
         if (!sym) continue;
         auto it = states_.find(sym);
         if (it == states_.end()) continue;
+        const LocalOwnership& st = it->second;
         const bool movedAtLiteral =
-            it->second.state == OwnershipState::MovedFrom;
+            st.state == OwnershipState::MovedFrom;
+        // fix #3771 (§28.3 *Captured owned bindings* / §27.5 / §28.2,
+        // v0.287): checkRead's IdentifierExpr arm reports four OTHER legs
+        // for a tracked owned binding — maybe-consumed (Owned ⊓ MovedFrom
+        // join, error), disposed-on-some-path (Owned ⊓ Disposed join,
+        // error), explicit Dispose (same-frame, warning), Uninitialized
+        // (error). MovedFrom was wired by #3755. The same gap that left
+        // MovedFrom silent in the captured form leaves these four silent
+        // too: no read check descends into a lambda literal's body, so a
+        // captured read of a binding in any of those states is accepted
+        // where the direct read would be rejected. Mirror the MovedFrom
+        // wiring for each leg, consulting the same `states_` fact at the
+        // statement-entry state — the point the closure is created.
+        //
+        // #3771 #2439 sweep: this check NEVER poisons the record (the
+        // moved-from leg didn't either, on the same reasoning — the
+        // capture-read is one observation; the direct read in the closure
+        // body is a separate, later observation in the same walk; poisoning
+        // here would silently suppress the second). The reportedMovedFromCaptures_
+        // set de-duplicates per IdentifierExpr pointer so a nested lambda
+        // doesn't double-report.
+        const bool maybeConsumedAtLiteral =
+            st.maybeConsumed && st.state == OwnershipState::Owned;
+        const bool disposedOnSomePathAtLiteral =
+            st.disposedOnSomePath && st.state == OwnershipState::Owned;
+        const bool disposedAtLiteral =
+            st.state == OwnershipState::Disposed;
         // fix #3755 (review follow-up): the same-STATEMENT leg — the states
         // consulted above are the statement's ENTRY states, so a consume
         // performed by another part of this very statement is not in them.
@@ -2662,7 +2689,9 @@ void MethodOwnership::reportMovedFromCapturesIn(const ast::LambdaExpr& lam,
             consumedInThisStmt = true;
             break;
         }
-        if (!movedAtLiteral && !consumedInThisStmt) continue;
+        if (!movedAtLiteral && !consumedInThisStmt &&
+            !maybeConsumedAtLiteral && !disposedOnSomePathAtLiteral &&
+            !disposedAtLiteral) continue;
         if (!reportedMovedFromCaptures_.insert(id).second) continue;
         if (movedAtLiteral) {
             report(Severity::Error, id->span.begin,
@@ -2676,7 +2705,7 @@ void MethodOwnership::reportMovedFromCapturesIn(const ast::LambdaExpr& lam,
                    "the move, reassign `" + std::string(id->name) +
                    "` to a fresh value first, or give the closure an `owned` "
                    "parameter and pass the value in.");
-        } else {
+        } else if (consumedInThisStmt) {
             report(Severity::Error, id->span.begin,
                    std::string("closure captures `") + std::string(id->name) +
                    "` whose owned value is transferred away by this same "
@@ -2691,6 +2720,62 @@ void MethodOwnership::reportMovedFromCapturesIn(const ast::LambdaExpr& lam,
                    "` in an earlier statement and re-borrow from its new "
                    "owner, or give the closure an `owned` parameter and pass "
                    "the value in.");
+        } else if (maybeConsumedAtLiteral) {
+            report(Severity::Error, id->span.begin,
+                   std::string("closure captures `") + std::string(id->name) +
+                   "` whose owned value may have already been consumed on "
+                   "another branch (maybe-consumed join, §28.3) — a captured "
+                   "owned binding is borrow-state throughout the closure and "
+                   "the capture READS the binding (§28.3 *Captured owned "
+                   "bindings*, §27.5), but a maybe-consumed binding is "
+                   "unreadable until reassigned (§28.3 — equalize the branches "
+                   "before the merge, or confine every use of `" +
+                   std::string(id->name) + "` to a single branch), so the "
+                   "closure would read freed memory. Create the closure "
+                   "before the join, reassign `" + std::string(id->name) +
+                   "` to a fresh value on the still-owned branch first, or "
+                   "give the closure an `owned` parameter and pass the value "
+                   "in.");
+        } else if (disposedOnSomePathAtLiteral) {
+            report(Severity::Error, id->span.begin,
+                   std::string("closure captures `") + std::string(id->name) +
+                   "` whose owned value may have already been disposed on "
+                   "another branch (conditional-discharge join, §28.3 / §28.2) "
+                   "— a captured owned binding is borrow-state throughout the "
+                   "closure and the capture READS the binding (§28.3 "
+                   "*Captured owned bindings*, §27.5), but a "
+                   "disposed-on-some-path binding is unreadable until "
+                   "reassigned (§28.3 — confine every read of `" +
+                   std::string(id->name) + "` to a single branch, or "
+                   "reassign it after the discharge to clear the obligation), "
+                   "so the closure would read freed memory. Create the "
+                   "closure before the join, reassign `" +
+                   std::string(id->name) + "` to a fresh value on the "
+                   "still-owned branch first, or give the closure an `owned` "
+                   "parameter and pass the value in.");
+        } else {
+            // Disposed (same-frame use-after-dispose). Same severity / Note
+            // pairing as checkRead's own warning — §28.2 checked-mode
+            // semantics carry over identically to the capture form.
+            report(Severity::Warning, id->span.begin,
+                   std::string("closure captures `") + std::string(id->name) +
+                   "` after a dominating explicit Dispose() call "
+                   "(§28.2 / §28.3) — a captured owned binding is "
+                   "borrow-state throughout the closure and the capture READS "
+                   "the binding (§28.3 *Captured owned bindings*, §27.5), but "
+                   "the binding was disposed on every path that reaches this "
+                   "literal, so the closure would read freed memory. "
+                   "Use-after-dispose is undefined behaviour in unchecked "
+                   "mode and raises DisposedAccessException in checked mode "
+                   "(§28.2). Create the closure before the Dispose(), "
+                   "reassign `" + std::string(id->name) +
+                   "` to a fresh value first, or give the closure an "
+                   "`owned` parameter and pass the value in.");
+            if (st.explicitlyDisposed && st.explicitDisposeLoc.line != 0) {
+                report(Severity::Note, st.explicitDisposeLoc,
+                       std::string("explicit Dispose() of `") +
+                       std::string(id->name) + "` was here");
+            }
         }
     }
 }
