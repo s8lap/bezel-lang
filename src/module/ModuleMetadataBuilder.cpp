@@ -1253,7 +1253,56 @@ bool convertMember(const sema::MemberSymbol& m, bool inInterface,
             // bodies have a span (abstract methods have no body to inline; an
             // operator goes down the OperatorDecl arm). Skip when the span is
             // absent/degenerate (the importer then keeps the §14.1/#783 gate).
-            if (isGenericType && !source.empty() &&
+            //
+            // fix #3645 (§9.7 / §28.9 / §2.8.3 rule 4, v0.286): for a
+            // NON-GENERIC class method whose return type is a record class
+            // (the imported twin of the local fresh-record-factory shape),
+            // ALSO ship the body — the importer re-parses it and attaches a
+            // fresh ast::MethodDecl, so the existing body-walk proof
+            // `isProvablyFreshRecordFactoryMethod` (LlvmBackend_Setup.cpp) can
+            // verify the callee returns `new Pt(...)` and admit the imported
+            // twin. Without this, every imported record-returning factory's
+            // `ms->decl` is null, the body walk early-returns false, and the
+            // scope-end `recordStringFields` Disposal at LlvmBackend_Disposal
+            // never registers for the consumer's
+            // `var p := Lib.Maker.Make(i)` — measured 8290 B / 400
+            // allocations over 200 iterations at the consumer side
+            // (#3621's repro, verbatim). The body walk IS the sound gate —
+            // a borrow-returning method
+            // (`static f(s: string, i: int): Pt => _cache[i]`) is
+            // REJECTED by `isFreshRecordConstructionOfExactType` because
+            // its body is not `new Pt(...)`, exactly the
+            // #2448 UAF class this fix is meant to NOT re-admit. The
+            // narrow codegen-only signature-only admission
+            // (`isProvablyFreshImportedRecordFactoryMethod_`) is strictly
+            // weaker than this body walk — the structural fix supersedes it.
+            // Per §2.5 / §2.8.3 the gate is the return type is a Named
+            // record class (the same `ctx.resolvedType(...)` the body walk
+            // consumes).
+            const sema::TypeRef* retMd = md->returnType
+                ? ctx.resolvedType(*md->returnType) : nullptr;
+            const bool methodReturnsRecord =
+                retMd && retMd->kind == sema::TypeRef::Kind::Named &&
+                retMd->declaration &&
+                retMd->declaration->kind == ast::TypeDeclKind::Record;
+            // fix #3645 scope-narrow (the #1937 sibling, v0.286): the
+            // record-return widening ONLY ships for a method that is itself
+            // non-generic. A GENERIC method on a NON-GENERIC class is the
+            // #1937 case — rejected by the §14.1/#1937 sema gate at
+            // ExprTypecheck_Calls.cpp:3585, which keys on
+            // `!md && ctx_.isImported(ms)`. Attaching a MethodDecl here
+            // would set `ms->decl` non-null, silently bypass the gate,
+            // and rely on codegen-side `needsInline` to monomorphize the
+            // body — the broader #1937/#428 monomorphization fix is a
+            // SEPARATE work item, so we deliberately leave the gate in
+            // force and skip the wire carriage for that shape. The
+            // canonical #3645 case (`Maker.Make(n: int): Pt => new Pt(...)`
+            // — non-generic method, non-generic class, return type is a
+            // non-parametric record) IS shipped.
+            const bool isNonGenericClassRecordReturn =
+                methodReturnsRecord && md->genericParams.empty();
+            if ((isGenericType || isNonGenericClassRecordReturn) &&
+                !source.empty() &&
                 md->span.begin.offset < md->span.end.offset &&
                 md->span.end.offset <= source.size()) {
                 out.methodBodyText = std::string(

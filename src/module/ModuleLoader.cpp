@@ -2521,9 +2521,26 @@ static bool parseAndAttachDtorBody(
 // and `target`'s full declaration text is emitted verbatim in place of its stub.
 // The returned source is identical in shape to buildSyntheticClassSource so the
 // remap discipline (field/param/self-method) carries over unchanged.
+//
+// fix #3645 (§9.7 / §28.9 / §2.8.3 rule 4, v0.286): the `nonGenericRecordFactoryPath`
+// arm emits `import <moduleName>;` at the head of the synthetic source so a
+// body that references a sibling type from the EXPORTING module (the common
+// case: `Make(n: int): Pt => new Pt(n, ...)` references `Pt`, the exporting
+// module's own record) resolves in the fresh context — the same cross-module
+// sibling-type visibility trick buildSyntheticFieldInitSource uses (#2375).
+// Without this, the body's `Pt` reference fails to resolve and the
+// §14.1/#783 SOUNDNESS GATE refuses to attach the decl, defeating the
+// structural fix. Generic-class bodies are unaffected — they have no
+// cross-module sibling-record reference (the sibling sits in a separate
+// instantiation).
 static std::string buildSyntheticMethodSource(const MetaTypeDecl& td,
-                                              const MetaMember& target) {
+                                              const MetaMember& target,
+                                              bool nonGenericRecordFactoryPath,
+                                              const std::string& moduleName) {
     std::string src = "module _783_reparsed_method_;\n";
+    if (nonGenericRecordFactoryPath && !moduleName.empty()) {
+        src += "import " + moduleName + ";\n";
+    }
     src += metaVisibilityToKeyword(td.visibility);
     src += " class ";
     src += td.name;
@@ -2642,8 +2659,11 @@ static bool parseAndAttachMethodBody(
     const MetaMember& target,
     sema::MethodSymbol* importedMs,
     const sema::TypeSymbol& importedType,
-    sema::SemaContext& mainCtx) {
-    std::string source = buildSyntheticMethodSource(td, target);
+    sema::SemaContext& mainCtx,
+    bool nonGenericRecordFactoryPath,
+    const std::string& moduleName) {
+    std::string source = buildSyntheticMethodSource(td, target,
+        nonGenericRecordFactoryPath, moduleName);
 
     DiagnosticEngine freshDiag;
     Lexer freshLex(source, freshDiag);
@@ -2663,6 +2683,34 @@ static bool parseAndAttachMethodBody(
     sema::SemaContext& freshCtx = *freshCtxPtr;
     sema::collectSymbols(*sf, freshCtx);
     if (semaDiag->hasErrors()) return false;
+    // fix #3645 (§9.7 / §28.9 / §2.8.3 rule 4, v0.286): register the
+    // exporting module's PUBLIC sibling types (already imported into mainCtx
+    // under `moduleName`) into this fresh context so the `import <moduleName>;`
+    // line emitted above resolves a sibling-type reference in the reconstructed
+    // method body (e.g. the body `new Pt(n, ...)` references `Pt`, a sibling
+    // record of the exporting class) to the REAL imported TypeSymbol — no stub
+    // declaration and no remap: the reconstructed TypeRefs/exprTypes point
+    // directly at the imported symbols, exactly what codegen consumes. Mirrors
+    // parseAndAttachFieldInit's #2375 sibling-registry. The reconstructed type
+    // itself (td.name) is skipped so its synthetic declaration stays
+    // authoritative for any self-reference (preserving pre-#3645 behavior).
+    // Internal siblings are absent from mainCtx's imported registry (only
+    // publics are exported, §13.2), so they still correctly fail resolveTypes
+    // and reject — matching the existing §14.1/#783 soundness gate's intent.
+    // The registry fires ONLY for the non-generic record-factory path so the
+    // existing T5 canary (a generic method that fails to resolve a sibling)
+    // still rejects: the generic-class body path does NOT receive the
+    // `import <moduleName>;` line nor this sibling registration.
+    if (nonGenericRecordFactoryPath && !moduleName.empty()) {
+        if (const std::vector<sema::TypeSymbol*>* siblings =
+                mainCtx.importedTypesOf(moduleName)) {
+            for (sema::TypeSymbol* sib : *siblings) {
+                if (!sib || sib->name.empty()) continue;
+                if (sib->name == td.name) continue;
+                freshCtx.registerImportedType(moduleName, sib);
+            }
+        }
+    }
     sema::resolveTypes(*sf, freshCtx);
     if (semaDiag->hasErrors()) return false;
     sema::typecheckExpressions(*sf, freshCtx);
@@ -4130,9 +4178,31 @@ static void loadMetadataPass2(
         const MetaTypeDecl& td = md.types[i];
         sema::TypeSymbol* t = created[i];
         // Only generic classes and records carry exported constructor bodies.
+        // fix #3645 (§9.7 / §28.9 / §2.8.3 rule 4, v0.286): widen the gate to
+        // also admit a NON-GENERIC class whose members carry a non-empty
+        // `methodBodyText` entry — the §14.1/#783 generic-only gate would
+        // otherwise skip them, and the body-walk proof
+        // `isProvablyFreshRecordFactoryMethod` needs `ms->decl` populated to
+        // admit the imported fresh-construction factory shape
+        // (`Make(n: int): Pt => new Pt(...)`). The widening is conditioned on
+        // a present methodBodyText so the §14.1/#1937 soundness gate on
+        // generic-method bodies stays in force for the GENERIC case (which
+        // still goes through the generic-method attach path immediately
+        // below).
+        bool hasMethodBodyText = false;
+        if (t->kind == ast::TypeDeclKind::Class && td.genericParams.empty()) {
+            for (const MetaMember& mm : td.members) {
+                if (mm.kind == MetaMemberKind::Method &&
+                    !mm.methodBodyText.empty()) {
+                    hasMethodBodyText = true;
+                    break;
+                }
+            }
+        }
         if ((t->kind != ast::TypeDeclKind::Class &&
              t->kind != ast::TypeDeclKind::Record) ||
-            (t->kind == ast::TypeDeclKind::Class && td.genericParams.empty()))
+            (t->kind == ast::TypeDeclKind::Class && td.genericParams.empty() &&
+             !hasMethodBodyText))
             continue;
 
         // Ctor bodies: find each Constructor member with non-empty ctorBodyText.
@@ -4218,7 +4288,10 @@ static void loadMetadataPass2(
                 }
             }
             if (importedMs)
-                parseAndAttachMethodBody(td, mm, importedMs, *t, ctx);
+                parseAndAttachMethodBody(td, mm, importedMs, *t, ctx,
+                    (t->kind == ast::TypeDeclKind::Class &&
+                     td.genericParams.empty()),
+                    md.moduleName);
         }
 
         // §14.1 / §23 / §2.8.2 / §2.8.3 rule 4 (fix #2893): property bodies —
