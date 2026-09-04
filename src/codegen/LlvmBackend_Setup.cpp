@@ -12976,6 +12976,44 @@ void Emitter::emitImplicitBase(const sema::TypeSymbol* cls, llvm::Value* obj,
                         ok = false;
                     if (ok && args.size() == nBaseFormals + 1) {
                         builder_.CreateCall(bce.fn, args);
+                        // fix #3759 (§22.8 step 1 / §22.10 / §28.9, v0.286):
+                        // the §22.10 base-clause twin of #429 (ARGUMENT-PASS)
+                        // in `lowerCall`. A +1 string producer (interpolation
+                        // `: Base($"v{n}")`, concat, range-slice,
+                        // user-method-return) directly as a base-ctor argument
+                        // holds an independent rc=1 reference, and the base
+                        // constructor receives the parameter as a BORROW (Bezel
+                        // parameters are borrows by default — strings are
+                        // runtime-managed, §28.9) without retaining it. The
+                        // `#429` lowerCall post-call release here brings rc→0
+                        // (if the base ctor only reads the string) or rc→1
+                        // (if the base ctor stored it via `lowerStringFieldStore`,
+                        // which transfers a producer). Same `!diverged_` guard
+                        // (an exception path is the pre-existing safe leak),
+                        // same `isPlusOneStringProducer` predicate the lowerCall
+                        // post-call release uses — the two release sites stay
+                        // in lockstep so an interpolated base-clause argument
+                        // is reclaimed exactly once per construction. Without
+                        // this, the producer leaks 18 B / 200 iterations per
+                        // construction: 2 heap objects × 200 = 400 (7200 B),
+                        // measured under ASan/LSan on r12-cycle-1.
+                        // per §22.10 / §28.9, issue #3759; sibling #3742.
+                        if (!diverged_) {
+                            for (std::size_t ai = 0;
+                                 ai < td->primaryBaseCtorArgs.size(); ++ai) {
+                                const auto& a = td->primaryBaseCtorArgs[ai];
+                                // Skip args past the ctor's declared arity —
+                                // these are the §22.5 defaults
+                                // `fillOmittedCtorArgs` materialized above
+                                // (its own release is internal); the clause
+                                // itself supplied no expression at this
+                                // position. Aligns with `lowerCall`'s
+                                // `ai < args.size()` bound.
+                                if (ai + 1 >= args.size()) break;
+                                if (a.value && isPlusOneStringProducer(a.value.get()))
+                                    emitStringRelease(args[ai + 1]);
+                            }
+                        }
                         return;
                     }
                 }
