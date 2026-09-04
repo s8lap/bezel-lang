@@ -395,6 +395,70 @@ void Resolver::checkTypeConstructorChains(TypeSymbol* t) {
                 "a constructor may contain at most one `base(...)` "
                 "or `this(...)` chain call (§12.8)");
         }
+        // fix #3793 (§22.10 / §12.8 / §22.8, v0.287): a `this(...)` chain
+        // call must NOT resolve to the constructor that contains it.
+        // §22.10 ("primary constructors" / "Constructors") states that a
+        // `this(...)` chain "chains to another constructor in the same
+        // class" — "another" excludes self; §12.8 gives the same rule from
+        // the chain-call side. The codegen `ctorByArity` /
+        // `ctorForArgs` already takes an `exclude` carve-out for `cs` so a
+        // self-resolved chain call does not infinitely recurse
+        // (LlvmBackend_impl.hpp:12259 and fix #3777's widening), but the
+        // SEMANTIC omission was silent: the call compiled clean, codegen
+        // emitted nothing for a non-primary-ctor class, and the object
+        // stayed calloc-zero with no diagnostic at any severity — silently
+        // producing a wrong value.
+        //
+        // Apply the rule ONLY to classes without a primary constructor:
+        // when a primary exists (`classHasPrimaryCtor`), the §22.10
+        // primary arm in `emitChainCall` (LlvmBackend_Setup.cpp:12189,
+        // fix #1087) routes the call to the primary — which has no
+        // ConstructorSymbol — rather than `cs`, so a self-arithmetic
+        // match is never actually reached. In a non-primary class the
+        // primary arm is absent and the chain would resolve to `cs` itself,
+        // which is the defect.
+        //
+        // Detection: a leading `this(...)` chain call whose arity matches
+        // `cs->params.size()` and matches NO OTHER non-static
+        // ConstructorSymbol of the class. Static constructors are exempt
+        // (no chain-call position). Constructors whose chain call is
+        // already diagnosed as misplaced/duplicated are skipped — the §12.8
+        // diagnostic above already names the defect, and a second one over
+        // the same statement would only add noise.
+        if (!classHasPrimaryCtor && !cs->isStatic &&
+            !misplacedChain && chainCount <= 1 &&
+            !cd->body.empty() && cd->body[0]) {
+            bool selfLeadingIsThis = false;
+            const ast::CallExpr* selfChain =
+                ast::chainCallOfStmt(*cd->body[0], selfLeadingIsThis);
+            if (selfChain && selfLeadingIsThis) {
+                const std::size_t n = selfChain->args.size();
+                if (n == cs->params.size()) {
+                    // Look for any OTHER non-static ConstructorSymbol of
+                    // this class whose arity matches the chain call —
+                    // if found, the chain resolves to that constructor,
+                    // not to cs itself.
+                    bool siblingMatch = false;
+                    for (Symbol* m2 : t->members) {
+                        auto* other = dynamic_cast<ConstructorSymbol*>(m2);
+                        if (!other || other->isStatic || other == cs) continue;
+                        if (other->params.size() == n) {
+                            siblingMatch = true;
+                            break;
+                        }
+                    }
+                    if (!siblingMatch) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, selfChain->span.begin,
+                            std::string("`this(...)` constructor chain call in `") +
+                            std::string(t->name) +
+                            "` chains to the constructor itself; a "
+                            "constructor cannot chain to its own "
+                            "constructor (§22.10)");
+                    }
+                }
+            }
+        }
         // §22.10 / §22.7: the convenience-constructor chaining rule. A
         // static constructor has no chaining position (§22.7) and is
         // exempt. A constructor whose chain call is already diagnosed as
