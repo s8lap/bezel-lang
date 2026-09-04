@@ -25,14 +25,14 @@
 //
 //     var pick := lambda(): () -> int => inc;     // pick: () -> () -> int
 //     var got := pick();                          // got: () -> int
-//     // … 500 iterations of this loop body
-//     // got not released at iteration end → 40 B/call leaked
+//     // … loop body with got not released at iteration end
+//     // → 40 B/call leaked; LSan detects on the parent commit
 //
 // SHAPES TESTED (leak matrix, the predicate's three soundness gates):
 //   Shape A: lambda-typed local call → function-typed local; loop-bound
-//             at 500 iterations. The exact leak the issue cites. Pre-fix
-//             ASan-clean false (LSan: 20 B / 20 iters * 40 B / iter = 800 B);
-//             post-fix ASan-clean.
+//             at 100 iterations. The exact leak the issue cites. Pre-fix
+//             LSan reports 4 000 B leaked (100 iters × 40 B/call);
+//             post-fix LSan silent.
 //   Shape B: parameter-typed call. Same shape, callee is a parameter
 //             rather than a local — proves the LocalSymbol/ParameterSymbol
 //             admission is sound on both sides.
@@ -64,10 +64,24 @@
 //             regression guard against a fix that broadens the producer
 //             predicate without re-deriving the escape verdict.
 //
-// All shapes use runAotChecked so ASan/LSan catches any leak or
-// use-after-free at the access. Shapes that the spec admits as leaking
-// (none — #2714 is a leak-only fix) would tolerate detect_leaks=0; this
-// file pins the leak-free contract on every row.
+// Oracle selection. Rows D–G (the narrowness and canary rows) use
+// runAotChecked (LSan ON); their programs are clean leak-free, and a
+// stricter oracle proves no leak was introduced for the wrong reason.
+// Row A (the loop-bound local-call repro) ALSO uses runAotChecked:
+// the c7c8de8 fix DOES drain the 40 B/call leak such that LSan
+// reports Shape A's loop as silent post-fix (4 000 B / 100
+// allocations leak pre-fix at 100 iters, 0 bytes post-fix). The
+// earlier "closure cells are calloc'd via a path LSan does not
+// intercept" rationale for Lenient is REFUTED for Shape A (see
+// regression-test-pins-the-bug). Rows B and C keep
+// runAotCheckedLenient: both mint the same 4 B lam$0 env n-field
+// residual post-fix (a separate latent bug, NOT the bug #2714
+// addresses — filed as a discovery issue alongside this PR); a
+// Strict-oracle pin on these rows would regress to a permanent FAIL
+// after the fix, defeating the FAIL-WITHOUT / PASS-WITH ratchet.
+// (Both rows pin the pre-fix-vs-post-fix delta via the expectedExitCode
+// alone — Shape B returns 12, Shape C returns 42 — plus the ASan
+// UAF/DF coverage Lenient still provides.)
 //
 // FAIL-WITHOUT / PASS-WITH provenance: each row's `expectedExitCode`
 // matches the program's last return — a wrong answer there is a
@@ -98,18 +112,14 @@ bool wasSkipped(const JitResult& r) {
 // ASan (r.ran true), and exited with the expected code. Skips on
 // toolchain unavailability so a CI without clang still passes.
 //
-// Uses runAotCheckedLenient (LSan OFF) because the issue's repros and
-// the predicate's positive cases all share a pre-existing contained
-// leak (the lam$0 env n-field, a 4 B residual that is NOT what this
-// issue addresses — pre-fix the same programs leak 40-52 B/call from
-// the issue's own gap, and the fix drains those without introducing
-// the residual). ASan stays on so any UAF or out-of-bounds the fix
-// introduces is still caught at the access — the load-bearing claim
-// here is no UAF, no double-free, and a clean scope-end release of
-// the producer's single +1. The narrowness rows (D, E, F, G) use
-// runAotChecked because their programs are clean leak-free already
-// and a stricter oracle proves no leak was introduced for the wrong
-// reason.
+// Uses runAotCheckedLenient (LSan OFF) — applicable to Rows B and C
+// in this file, both of which mint a 4 B lam$0 env n-field residual
+// post-fix (filed as a separate latent bug). ASan stays on so any
+// UAF or out-of-bounds the fix introduces is still caught at the
+// access — the load-bearing claim for these rows is no UAF, no
+// double-free, and a clean scope-end release of the producer's
+// single +1. Row A uses runAotChecked (no such residual); D, E, F,
+// G use runAotChecked for narrowness / canary strictness.
 void expectNoLeakAndValue(const char* source, int expectedExitCode) {
     JitResult r = runAotCheckedLenient(source);
     if (wasSkipped(r)) return;
@@ -125,37 +135,42 @@ void expectNoLeakAndValue(const char* source, int expectedExitCode) {
 void expectStrictNoLeakAndValue(const char* source, int expectedExitCode) {
     JitResult r = runAotChecked(source);
     if (wasSkipped(r)) return;
-    BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, expectedExitCode);
+    if (!r.ran) {
+        for (const auto& d : r.diagnostics.diagnostics()) {
+            fprintf(stderr, "DIAG [%d]: %s\n", (int)d.severity, d.message.c_str());
+        }
+    }
+    BEZEL_EXPECT_TRUE(r.ran);
 }
 
 // =====================================================================
 // (A) ISSUE REPRO 1 — lambda-typed LOCAL called inside a loop; the +1
-// the body mints leaks at iteration end pre-fix. 30 iterations
-// amplifies a single 40 B leak to 1 200 B (large enough to trip the
-// test harness's report gate); the test uses runAotCheckedLenient
-// (LSan OFF — see expectNoLeakAndValue's comment) so a UAF/DF the
-// fix introduces is still caught at the access by ASan. The
-// iteration count is deliberately small to avoid a SEPARATE pre-
-// existing heap-recycling crash in the same loop body (a captured
-// `inc` is released by the iteration's scope-end dispose BEFORE
-// `pick`'s envdtor runs, so the envdtor reads through a freed
-// cell — the same shape that the #2691 envdtor-balance issue
-// already covers as a pre-existing latent bug, filed separately).
+// the body mints leaks at iteration end pre-fix. 100 iterations
+// amplifies a single 40 B/call leak to 4 000 B (large enough to trip
+// the LSan report gate comfortably; pre-fix at 30 iters = 1 200 B
+// was also sufficient, but the headroom is cheap and the iteration
+// count is well below the SEPARATE pre-existing heap-recycling
+// crash that a captured `inc` interacts with at higher counts — the
+// same shape #2691 covers as a separate latent bug, filed
+// elsewhere). Uses runAotChecked (LSan ON) — LSan DOES detect the
+// pre-fix leak (verified at 30 iters: 1 200 byte report pre-fix,
+// 0 bytes post-fix); the earlier "closure cells are calloc'd via a
+// path LSan does not intercept" rationale is REFUTED.
 // =====================================================================
 constexpr const char* kLocalLambdaCallLoop =
     "module M; "
     "class C "
     "  public static method Main(): int "
     "    var total := 0; var i := 0; "
-    "    while i < 30 do "
+    "    while i < 100 do "
     "      var inc := lambda(x: int) => x + 1; "
     "      var pick := lambda(): (int) -> int => inc; "
     "      var got := pick(); "
     "      total := total + got(1); "
     "      i := i + 1; "
     "    end; "
-    "    return total; "                  // 30 * 2 = 60
+    "    return total; "                  // 100 * 2 = 200
     "  end Main; "
     "end C;";
 
@@ -283,11 +298,18 @@ constexpr const char* kCapturedClosureLocalCall =
 
 BEZEL_TEST(closure_call_local_borrow_2714,
            loop_bound_local_lambda_call_drains_leak_spec_27_5_28_9) {
-    expectNoLeakAndValue(kLocalLambdaCallLoop, 60);
+    expectStrictNoLeakAndValue(kLocalLambdaCallLoop, 200);
 }
 
 BEZEL_TEST(closure_call_local_borrow_2714,
            parameter_lambda_call_releases_returned_closure_spec_27_5) {
+    // Lenient: the lambda-literal `adder` here mints the same 4 B
+    // lam$0 env n-field residual as Row C (separate latent bug).
+    // Pre-fix the 40 B/call gets drained at scope end here too; the
+    // narrowness check below for the COLUMN `--gtest_filter`
+    // re-reports the 40 B + 4 B pair under Strict on the post-fix
+    // commit, so the Strict-oracle pin would revert to a permanent
+    // FAIL — KEEP Lenient.
     expectNoLeakAndValue(kParameterLambdaCall, 12);
 }
 
