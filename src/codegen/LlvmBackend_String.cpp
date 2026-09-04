@@ -3165,6 +3165,43 @@ llvm::Value* Emitter::emitValueToString(llvm::Value* val,
     if (fieldTy && fieldTy->kind == K::Named && fieldTy->declaration) {
         const sema::TypeSymbol* ts = fieldTy->declaration;
         if (ts->kind == ast::TypeDeclKind::Record && val->getType()->isStructTy()) {
+            // fix #3496 (spec §8.5 / §18.5 / §9.1, v0.287): honor a user-declared
+            // `ToString(): string` on the record BEFORE deciding the §8.5 default.
+            // §8.5's first sentence pins the explicit `.ToString()` call and the
+            // §18.5 hole to ONE rule: a record's declared member wins over the
+            // synthesized field-listing default. Without this lookup
+            // `emitValueToString` only knew the field-listing and the qualified
+            // type-name defaults, so every path that recursed through here — the
+            // §18.5 nullable-value-type arm in `LlvmBackend_Exprs.cpp` being the
+            // headline one — silently DROPPED the override and rendered the
+            // auto-property listing instead, agreeing with neither the direct
+            // `.ToString()` call (which routes through `lowerCall` and finds the
+            // user member) nor the non-nullable §18.5 hole (which uses the
+            // interpolation-chain lookup at `LlvmBackend_Exprs.cpp:815`). The
+            // interpolation-chain walk is mirrored here so the ONE renderer every
+            // sibling spelling reaches has identical behaviour to all of them.
+            sema::MethodSymbol* toStr = nullptr;
+            for (auto* cur = ts; cur && !toStr;) {
+                for (auto* sym : cur->members) {
+                    auto* ms = dynamic_cast<sema::MethodSymbol*>(sym);
+                    if (ms && ms->name == "ToString" && ms->params.empty()) {
+                        toStr = ms; break;
+                    }
+                }
+                sema::TypeSymbol* nxt = nullptr;
+                for (auto* b : cur->baseTypes)
+                    if (b && b->kind == ast::TypeDeclKind::Class) { nxt = b; break; }
+                cur = nxt;
+            }
+            if (toStr) {
+                // Spill the record value to an alloca; `emitMethodCall` expects
+                // a `ptr` receiver for the value-struct shape.
+                llvm::AllocaInst* spill = entryAlloca(val->getType());
+                builder_.CreateStore(val, spill);
+                std::vector<llvm::Value*> args{spill};
+                if (llvm::Value* r = emitMethodCall(toStr, args, false))
+                    return r;
+            }
             // fix #2934 (§8.5, v0.252): ask the SAME three-way question the
             // direct `.ToString()` call asks (LlvmBackend_Calls2.cpp's
             // `autoBearing`) and the interpolation chain asks
