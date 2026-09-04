@@ -2176,11 +2176,39 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
                 asyncResultElemSemaTy = taskTy->genericArgs[0];
         } else if (retSemaTy && retSemaTy->kind != sema::TypeRef::Kind::Unit &&
                    retTy != i32()) {
-            // No annotation visible (e.g. an IIFE-invoked async lambda): fall
-            // back to the body's natural result type as T, so `async () => 42`
-            // still completes its task with 42. A void / Unit body leaves T null
-            // (no result), avoiding lowering Unit to an unsized type.
-            asyncResultElemSemaTy = retSemaTy;
+            // fix #3789 (§30.6, v0.287): NO call-site annotation (e.g. an
+            // IIFE-invoked async lambda). `retSemaTy` here is the wrapped
+            // `Task<T>` (#800 Layer-2 explicitly reads `lamTy->funcReturn` for
+            // an async expression body — the WRAPPER, not the element), so the
+            // pre-fix pass-through silently made `asyncResultElemSemaTy` the
+            // whole `Task<T>` (a Named type) where the call-site-annotation
+            // path above extracted T via `genericArgs[0]`. That disagreement
+            // reached `emitAsyncLambda` as `resultElemSemaTy`, which sized
+            // `bz_task_complete`'s memcpy via
+            // `getTypeAllocSize(lowerTypeRef(resultElemSemaTy))` — and for an
+            // element T that is NOT a pointer (e.g. `int`),
+            // `lowerTypeRef(Task<int>)` is `ptr` (8 B), so the producer
+            // memcpy'd 8 bytes from a 4-byte `i32` value: `42` still came back
+            // right (the consumer read 4 bytes from an 8-byte buffer and got
+            // the low 4), but `1234567` SIGBUS'd when the over-read crossed
+            // into another stack frame's live storage. For closure-typed T
+            // the bug is silent: `lowerTypeRef(Task<() -> int>)` and
+            // `lowerTypeRef(() -> int>)` are both `ptr`, so the two paths
+            // produced the same size by coincidence (#3773 noted this).
+            //
+            // Mirror the annotation path exactly: extract T from
+            // `retSemaTy->genericArgs[0]`. A `Task<T>` wrapping is the only
+            // shape `retSemaTy` can carry here (it was read from
+            // `lamTy->funcReturn` above, and an async lambda's funcReturn IS
+            // `Task<T>` / `OwningTask<T>` per §30.6), so the generic arg IS T.
+            // A void / Unit lambda body would have produced a null
+            // `funcReturn` (or a `Kind::Unit` `retSemaTy`); the gate above
+            // rejects both — leaving `asyncResultElemSemaTy` null, which is
+            // the "no-value Task" case (per the no-annotation fallback's
+            // contract below).
+            asyncDeclaredTaskTy = retSemaTy;
+            if (!retSemaTy->genericArgs.empty() && retSemaTy->genericArgs[0])
+                asyncResultElemSemaTy = retSemaTy->genericArgs[0];
         }
         retTy = ptrTy();  // the closure returns the outer Task pointer
         retSemaTy = nullptr;
