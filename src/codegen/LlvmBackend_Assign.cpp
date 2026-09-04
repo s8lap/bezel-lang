@@ -7852,6 +7852,56 @@ llvm::Value* Emitter::wrapAsIEnumerableForTarget(
             return drainLazyPipelineToOwnedIEnumerable(lazy, targetTy);
         }
     }
+    // fix #3695 (§13.4 / §5 / §29.2 / §28.9, v0.286): SortedSet<T>'s arm of the
+    // §29.2 wrap grid — MISSING ENTIRELY until this commit. A `SortedSet<T>`
+    // coerced to `IEnumerable<T>` (an argument, a local-decl init, a method
+    // RETURN) used to fall off the end of this function to the bare `return v`
+    // and hand the caller the raw `bz_dict_t*`. §29.2's desugaring then read
+    // that value's first word as a vtable and called slot 4 (GetEnumerator):
+    // measured as a deterministic SIGSEGV (rc 139) with ASan reporting a
+    // null-address call (`pc 0x0`), at BOTH faces this function serves — the
+    // RETURN coercion and the ARGUMENT coercion — while the same SortedSet
+    // reached through its concrete type (`.GetEnumerator()` direct, `for x in
+    // s`) iterates cleanly through `wrapSortedSetAsIEnumerable`. The direct /
+    // for-in surfaces both call `wrapSortedSetAsIEnumerable`
+    // (`LlvmBackend_Calls2.cpp:14146`); this arm extends the §29.2 coercion to
+    // route through the SAME helper, so the interface-upcast path is
+    // structurally identical to the direct path rather than a separately
+    // (and incorrectly) re-derived one.
+    //
+    // SortedSet is ALWAYS hash-backed (`where T: IComparable<T>` excludes
+    // class elements, so the dense-array path is unreachable — same reason
+    // the #2546 SortedSet.GetEnumerator arm uses `wrapSortedSetAsIEnumerable`
+    // rather than the array wrap), so the OrderedSet/SortedDictionary sibling
+    // arm here is the right model.
+    //
+    // OWNERSHIP. `wrapSortedSetAsIEnumerable` already returns an OWNING
+    // enumerator over a fresh sorted snapshot (`sortedSetSnapshotToSortedArray`
+    // → `wrapOwnedArrayAsIEnumerable`) — the wrapper's slot-1 Dispose frees
+    // the snapshot array exactly once at the caller's scope end. The snapshot
+    // holds +1 references to the source's keys (a string slot is the
+    // SortedSet's own bz_string*, +1, exactly as `bz_lazy_from_set` arranges);
+    // releasing the source via `bz_dict_free` decrements those refs, and the
+    // snapshot's independent +1 references keep the keys alive for iteration.
+    // So a callee-OWNED source (the RETURN site) frees its source RIGHT HERE
+    // — mirror #2299's `Set`/`Dictionary` arms — and a BORROWED source (the
+    // ARGUMENT / local-decl sites) lets the source's binder reclaim at its
+    // own scope end. `freeDictSourceNow(v, /*valDisposer=*/nullptr)` is the
+    // right free: SortedSet is a hash table of keys with no values, so the
+    // value-disposer argument is null.
+    if (actualTy && (actualTy->headName() == "SortedSet" ||
+                     builtinTypeName(actualTy) == "SortedSet")) {
+        if (outWrapMade) *outWrapMade = true;
+        // Snapshot the source FIRST, then free the source. The snapshot is
+        // built FROM the live source dict (bz_dict_keys_gen reads the key
+        // bytes), and the snapshot is independent of the source's allocation
+        // once built — so reversing the order would UAF on the source's key
+        // bytes. Mirror the local-decl site's snapshot-then-free ordering.
+        llvm::Value* wrap = wrapSortedSetAsIEnumerable(v, targetTy);
+        if (wrap && srcOwnedByCallee)
+            freeDictSourceNow(v, /*valDisposer=*/nullptr);
+        return wrap;
+    }
     // fix #3519 (§29.2 / §28.9 / §28.3, v0.283; stdlib §4.8 / §4.17): the
     // Dictionary family's arm of the §29.2 wrap grid — MISSING ENTIRELY until
     // this commit. A `Dictionary<K,V>` coerced to

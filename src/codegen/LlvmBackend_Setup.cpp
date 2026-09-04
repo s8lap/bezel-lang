@@ -14319,6 +14319,48 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
                 v = drainLazyPipelineToOwnedIEnumerable(lazy, declTR);
                 if (dynamic_cast<const ast::NewExpr*>(init) != nullptr)
                     freeDictSourceNow(srcSet);
+            } else if (initTR &&
+                       builtinTypeName(initTR) == "SortedSet") {
+                // fix #3695 (§13.4 / §5 / §29.2 / §28.9, v0.286): the local-decl
+                // face of the SAME missing arm `wrapAsIEnumerableForTarget` gets.
+                // `var en: IEnumerable<int> := s;` (s: SortedSet<int>) used to
+                // store the raw `bz_dict_t*` in the slot and the following
+                // `en.GetEnumerator()` vtable-dispatched on it — measured SIGSEGV
+                // (rc 139), the identical symptom the RETURN / ARGUMENT coercion
+                // faces show. Route through `wrapSortedSetAsIEnumerable`, the
+                // SAME helper the explicit `.GetEnumerator()` and `for x in s`
+                // surfaces already use (`LlvmBackend_Calls2.cpp:14146` /
+                // `LlvmBackend_Stmts.cpp:8900`), so the local-decl face is
+                // structurally identical to those rather than a separately
+                // (and incorrectly) re-derived one. SortedSet is ALWAYS
+                // hash-backed (`where T: IComparable<T>` excludes class elements),
+                // so the `wrapSortedSetAsIEnumerable` snapshot+sort+wrap is the
+                // right authority — mirroring the SortedDictionary arm just below.
+                //
+                // OWNERSHIP. The snapshot is INDEPENDENT of the source set (the
+                // wrapper's slot-1 Dispose frees the snapshot's array exactly
+                // once at this local's scope end via `wrappedHere`'s
+                // `registerIterableSourceDisposal`); the source set is freed
+                // here ONLY for the unbound-`new` shape, on the same
+                // alias-rejection gate the Set/Dictionary/LinkedList arms use
+                // — a producer-init IDENTIFIER source is still owned by that
+                // identifier, so freeing here would DOUBLE-FREE at its own
+                // scope end, while a `new` at this site is bound to no other
+                // name by construction. `freeDictSourceNow(v, null)` is the
+                // right free: SortedSet is a hash table of keys with no values.
+                //
+                // ORDERING. Snapshot FIRST, then free the source. The snapshot
+                // is built FROM the live source dict (bz_dict_keys_gen reads
+                // key bytes from it), and the snapshot is independent of the
+                // source's allocation once built — so reversing the order
+                // would UAF on the source's key bytes.
+                llvm::Value* srcSet = v;  // capture BEFORE the snapshot
+                llvm::Value* wrap = wrapSortedSetAsIEnumerable(srcSet, declTR);
+                if (wrap) {
+                    v = wrap;
+                    if (dynamic_cast<const ast::NewExpr*>(init) != nullptr)
+                        freeDictSourceNow(srcSet, /*valDisposer=*/nullptr);
+                }
             } else if (initTR && isDictTypeName(initTR) &&
                        dictEntryWrapShapeSupported(declTR)) {
                 // fix #3519 (§29.2 / §28.9 / §28.3, v0.283; stdlib §4.8 /
