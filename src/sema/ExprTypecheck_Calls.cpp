@@ -5904,8 +5904,56 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 recvTy->genericArgs[0])
                                 ctx_.setExprType(&ce, recvTy->genericArgs[0]);
                         }
-                        else if (m == "IndexOf")
-                            ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Int));
+                        // fix #3765 (stdlib §4.6/§4.7/§4.10/§4.11, v0.287):
+                        // `IndexOf(item)` is declared only by `Array<T>` (§4.4)
+                        // and `OwningArray<T>` (§4.5); every OTHER isArrLike
+                        // family — `Stack`/`OwningStack`/`Queue`/`OwningQueue`/
+                        // `Set`/`OwningSet`/`LinkedList`/`OwningLinkedList`/
+                        // `SortedSet` (§§4.6/4.7/4.10/4.11/4.18) — does NOT
+                        // declare it. The previous unconditional typing
+                        // (`m == "IndexOf" → int`) silently admitted every
+                        // other head, and codegen has no dispatch arm for any
+                        // of them, so the call's result slot zero-filled via
+                        // the #2434 degrade — exactly the "loud -> quiet"
+                        // defect class §6c rejects. SortedSet already has its
+                        // own dedicated reject at the head of this
+                        // `if (isArrLike)` block (the sortedSetMemberUndeclared
+                        // arm above). For the other eight heads we type ONLY
+                        // for `Array`/`OwningArray` and emit a precise "no
+                        // member `IndexOf` on `<Type><T>`" diagnostic on the
+                        // call line for every other isArrLike head — matching
+                        // the SortedSet arm's wording and the §4.x citation
+                        // pattern so a user greps "no member `IndexOf`" and
+                        // lands all nine. The non-isArrLike receivers
+                        // (Dictionary/SortedDictionary/…) are handled by the
+                        // §22.5 member-not-found arm below.
+                        else if (m == "IndexOf") {
+                            if (colName == "Array" || colName == "OwningArray") {
+                                ctx_.setExprType(&ce,
+                                                 ctx_.primitiveTypeRef(P::Int));
+                            } else {
+                                // Stack/Queue/Set/LinkedList and their owning
+                                // twins, plus SortedSet — none declares
+                                // `IndexOf`. Emit the diagnostic HERE so the
+                                // user sees the precise "no member" wording
+                                // with the §4.x citation on the call line
+                                // (§6c: loud, located, not the silent zero).
+                                // SortedSet has its own reject above for the
+                                // same name; this branch covers the rest.
+                                ctx_.diagnostics().report(
+                                    Severity::Error, ce.span.begin,
+                                    std::string("no member `IndexOf` on `") +
+                                    std::string(colName) +
+                                    "<T>` (stdlib §22.5 / §4.x) — `IndexOf` "
+                                    "is declared only by `Array<T>` (§4.4) "
+                                    "and `OwningArray<T>` (§4.5); for "
+                                    "membership testing on the unordered "
+                                    "set/queue/stack/linked-list families "
+                                    "use `Contains`, and for an index on an "
+                                    "ordered source materialize it as "
+                                    "`s.ToArray()` first");
+                            }
+                        }
                         // per §5 LINQ: Any/All → bool, Count(pred) → int
                         else if (m == "Any" || m == "All")
                             ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Bool));
