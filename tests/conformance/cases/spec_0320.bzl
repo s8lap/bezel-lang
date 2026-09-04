@@ -137,12 +137,9 @@ CaseField       ::= "owned"? Identifier ":" Type SerializedClause? EqualityClaus
                                  requirement, including the bare-type-parameter
                                  erasure. Inheritance names interfaces only
                                  (as for records). §35.1. */
-ChoiceMember    ::= MethodDecl | ExpressionPropertyDecl
-                  | StaticReadonlyDecl | StaticConstDecl
-                  | OperatorDecl
-                              /* Identical to EnumMember; kept as a named
-                                 production so the two sections can restrict
-                                 independently if they ever diverge. */
+ChoiceMember    ::= EnumMember
+                              /* a choice body admits exactly the enum
+                                 member set (§35.2). */
                               /* `serialized "name"` on an enum constant
                                  customizes that member's serialized name
                                  (§9.8). `serialized skip` and `serialized

@@ -119,7 +119,7 @@ Accessor        ::= Visibility? "pure"? "get" AccessorBody
                               /* "pure" is admitted on "get" only — a "pure set"
                                  does not parse (the set alternative carries no
                                  "pure" slot); §22.15 states the rule */
-SetterParamSpec ::= "(" ParamMod? Identifier? ")"
+SetterParamSpec ::= "(" "owned"? Identifier? ")"
                               /* Explicit setter parameter spec, used when
                                  the parameter modifier needs to be declared
                                  (typically `owned` for owned-element-collection
@@ -132,11 +132,9 @@ SetterParamSpec ::= "(" ParamMod? Identifier? ")"
                                  is omitted entirely (`set` alone), the
                                  implicit `value` parameter has no modifier
                                  and takes a borrow of the property's declared
-                                 type (§22.3, §23.3). */
-ParamMod        ::= "owned"
-                              /* Only `owned` is meaningful on a setter's value
-                                 parameter: the parameter is an input,
-                                 so `ref`/`out` do not parse here. */
+                                 type (§22.3, §23.3). Only `owned` is
+                                 meaningful on the value parameter: it is an
+                                 input, so `ref`/`out` do not parse here. */
 AccessorBody    ::= "=>" (Expression | AssignmentStmt | "do" Statement* "end") ";"
                   | ";"                                  /* abstract / interface body */
                               /* The single-statement form `set => _x := value;`

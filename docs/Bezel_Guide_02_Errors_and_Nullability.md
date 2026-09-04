@@ -86,6 +86,15 @@ var port     := int.ParseOrNull(raw) ?? 8080;
 var greeting := config.GetOrNull("greeting") ?? "hello";
 ```
 
+The same principle reaches the file system: an *expected* missing file is a test, not a catch. `File.Exists(path)` (stdlib §7.3) answers it before anything is opened, so `FileNotFoundException` keeps its meaning — a file you asserted would be there was not:
+
+```bezel
+if not File.Exists(path) then
+  return defaultSettings;          // expected absence: no try/catch
+end;
+using var fs := new FileStream(path, FileMode.Open);
+```
+
 `ParseOrNull` returns null exactly where `Parse` would throw, so one `??` covers every failure path in a single expression. (For `int`/`bool` environment variables specifically, `Environment.GetInt`/`GetBool` are the dedicated one-call spelling.) When you must *distinguish* absence from a present null — a dictionary whose value type is itself nullable, say — `T?` collapses the two (the conflation caveat, stdlib §1/§4.8). Use `ContainsKey` or the Try shape below instead.
 
 **The `Try` pattern** when the failure path and success path differ, and especially when the value is *owned*. A `bool` return plus an `out owned` parameter, with a `when true` postcondition that lets the caller skip the `!`:
