@@ -16,7 +16,9 @@
 //
 // fix #3735 (v0.286) supplied that missing eager-terminal dispatch for every
 // dict-backed Set-family receiver, so the second rejection category is gone
-// (except `Reverse`, retargeted to issue 3763). Its own value grid — the §5
+// (including `Reverse`, which was retargeted to issue 3763 and closed by fix
+// #3763 at v0.287 — see tests/sema/reverse_set_3763_test.cpp for that fix's
+// value grid and §6b exclusion diff). Its own value grid — the §5
 // eager terminals across Set / OwningSet / SortedSet — lives in
 // tests/codegen/set_family_eager_terminals_3735_test.cpp; the LAZY / ToArray
 // rows below are unaffected by it and stay here.

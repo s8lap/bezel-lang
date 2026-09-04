@@ -732,6 +732,14 @@ constexpr std::array<std::string_view, 11> kLinqLazyPassthroughOperatorNames = {
     "SkipWhile", "Union",      "Intersect",  "Except",
 };
 
+// fix #3763 (stdlib §5 / §4.6 / §4.7 / §4.10 / §4.18, v0.287): see the header
+// for the membership rule (stdlib §5's `Reverse` naming note read with spec
+// §26.5 rule 1) and for why the Stack/Queue, `OwningBuffer`, `FrozenArray` and
+// dictionary families are deliberately NOT here.
+constexpr std::array<std::string_view, 5> kLazyReverseDirectReceiverHeads = {
+    "Set", "OwningSet", "SortedSet", "LinkedList", "OwningLinkedList",
+};
+
 }  // namespace
 
 bool isOwningPrefixedName(std::string_view head) {
@@ -1354,5 +1362,9 @@ bool isLinqElementLambdaOperatorName(std::string_view m) {
 bool isLinqLazyPassthroughOperatorName(std::string_view m) {
     return contains(kLinqLazyPassthroughOperatorNames, m);
 }  // per §5, fix #3670
+
+bool isLazyReverseDirectReceiverHead(std::string_view head) {
+    return contains(kLazyReverseDirectReceiverHeads, head);
+}  // per §5 / §4.6 / §4.7 / §4.10 / §4.18, fix #3763
 
 }  // namespace bezel::common

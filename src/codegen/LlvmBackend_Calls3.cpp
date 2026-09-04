@@ -2153,6 +2153,26 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
     // type from lowerToLazyEnumerator's `elemRef` out-param, which is the
     // grouping's genericArgs[1].
     bool igrpRecv = iGroupingElemTypeRef(recvTy) != nullptr;
+    // fix #3763 (stdlib §5 / §5's `Reverse` naming note v0.195 / §4.6 / §4.7 /
+    // §4.10 / §4.18, v0.287): the receiver heads on which stdlib §5's LAZY
+    // `Reverse()` is the only declared meaning — the Set family and the
+    // linked-list family, neither of which declares an instance `Reverse()`.
+    // Without this term `isOp` below refused `Reverse` on them, the call fell
+    // through to `tryLowerCollectionInstanceCall`'s IN-PLACE `bz_array_*`
+    // reverse (LlvmBackend_Calls.cpp), and a class-element `Set<T>` was
+    // silently MUTATED where §5 promises a fresh lazy sequence — measured
+    // `{1,2,3}` → `{3,2,1}` on the receiver itself, exit 0, no diagnostic.
+    // `collRecv`/`llRecv` are re-tested alongside the head so this term can
+    // only ever NARROW the two families already admitted at the gate below,
+    // never widen the receiver set. The membership rule itself lives in ONE
+    // place — `common::isLazyReverseDirectReceiverHead`, which sema's typing
+    // arm (ExprTypecheck_Calls.cpp's `typeLinqOperator`) reads too; see its
+    // header for which heads are excluded and why. Both halves are required:
+    // this admission alone was measured INERT by #3735 (with no `exprType` on
+    // the call, nothing reaches here).
+    bool revRecv = (collRecv || llRecv) &&
+                   common::isLazyReverseDirectReceiverHead(
+                       builtinTypeName(recvTy));
     if (!collRecv && !lazyRecv && !llRecv && !rangeRecv && !vtRecv && !strRecv &&
         !dictRecv && !igrpRecv)
         return nullptr;
@@ -2476,9 +2496,12 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
     }
 
     // The deferred operators. Lower the source to a lazy enumerator first.
-    // NOTE: Reverse is intercepted ONLY on a lazy receiver — on a concrete
-    // collection (Array) it falls through to the in-place Array.Reverse()
-    // handler in tryLowerCollectionInstanceCall (§3).
+    // NOTE: Reverse is intercepted only where §5's LAZY operator is the
+    // receiver's declared meaning — on a concrete `Array`/`OwningArray` (whose
+    // §4.4/§4.5 in-place `Reverse()` wins by spec §26.5 rule 1) it falls
+    // through to the in-place handler in tryLowerCollectionInstanceCall (§3),
+    // and so, today, do Stack/Queue and the other array-backed heads
+    // `revRecv` excludes (fix #3763; see that flag's definition).
     bool isOp = (m == "Where" || m == "Select" || m == "Take" || m == "Skip" ||
                  m == "Distinct" || m == "OrderBy" || m == "OrderByDescending" ||
                  m == "Concat" || m == "TakeWhile" || m == "SkipWhile" ||
@@ -2496,7 +2519,11 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
                  // fix #1220: string is IEnumerable<char> — admit Reverse on it.
                  // fix #3559: `OfType<U>()` was removed from stdlib §5 at
                  // v0.284 and its always-true-predicate lowering deleted here.
-                 (m == "Reverse" && (lazyRecv || rangeRecv || strRecv)));
+                 // fix #3763: `revRecv` — the Set and linked-list families,
+                 // which declare no instance `Reverse()`, so §5's lazy operator
+                 // is the only meaning. See `revRecv`'s definition above.
+                 (m == "Reverse" &&
+                  (lazyRecv || rangeRecv || strRecv || revRecv)));
     if (!isOp) return nullptr;
 
     // stdlib §5 (#755) / #1914: `X.GroupBy(k).SelectMany(lambda(g) => g)` — the

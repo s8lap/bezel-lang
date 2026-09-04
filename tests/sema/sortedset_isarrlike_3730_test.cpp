@@ -21,10 +21,15 @@
 // FirstOrNull/LastOrNull/SingleOrNull/Single/ElementAt) now materialize a
 // Set-family receiver through the same `lowerToLazyEnumerator` source the §5
 // chains already use, so Category C's rows are VALUE rows now, not reject
-// rows. `Reverse` alone still rejects, retargeted to issue 3763 — §5's LAZY
-// `Reverse()` has no sema TYPING arm on a direct collection receiver, which
-// no codegen change can remedy. Category B (members §4.18 never declares)
+// rows. `Reverse` alone still rejected, retargeted to issue 3763 — §5's LAZY
+// `Reverse()` had no sema TYPING arm on a direct collection receiver, which
+// no codegen change could remedy. Category B (members §4.18 never declares)
 // is untouched.
+//
+// UPDATED AGAIN BY fix #3763 (stdlib §5 / §4.18, v0.287), per lane rules §7:
+// Category C is now EMPTY. The missing typing arm landed
+// (`typeLinqOperator`'s `common::isLazyReverseDirectReceiverHead` gate) with
+// its codegen counterpart, so `Reverse` is a value row too.
 //
 // VALUE correctness (does the newly-typed §5 surface actually run right) is
 // pinned in tests/codegen/sortedset_isarrlike_3730_test.cpp; this file is the
@@ -198,12 +203,20 @@ BEZEL_TEST(sortedset_isarrlike_3730, trytake_rejected_not_declared) {
 // ascending guarantee is observable (`First`/`Last`/`ElementAt`/`Aggregate`),
 // never a permutation-blind count.
 //
-// The one SURVIVOR is `Reverse` — for a reason that is not codegen's: §5's
-// LAZY `Reverse(): IEnumerable<T>` has no sema TYPING arm at all on a direct
-// collection receiver (`typeLinqOperator` never mentions it), so the call
-// acquires no `exprType` and degrades at the NEXT line via #2434 whatever
-// codegen does. Filed as issue 3763 with the measured repro; its row below
-// pins the retargeted diagnostic.
+// The one SURVIVOR was `Reverse` — for a reason that was not codegen's: §5's
+// LAZY `Reverse(): IEnumerable<T>` had no sema TYPING arm at all on a direct
+// collection receiver (`typeLinqOperator` never mentioned it), so the call
+// acquired no `exprType` and degraded at the NEXT line via #2434 whatever
+// codegen did. That was filed as issue 3763 with the measured repro.
+//
+// UPDATED AGAIN BY fix #3763 (stdlib §5 / §4.18, v0.287), per lane rules §7:
+// the typing arm now exists and codegen's `isOp` Reverse gate reads the same
+// predicate, so `SortedSet<T>.Reverse()` is a lazy `IEnumerable<T>` over
+// §4.18's ascending order. The reject is deleted and its row below is a
+// VALUE row — order-sensitive, since a descending sequence is exactly what
+// distinguishes the fix from any materialization. `tests/sema/
+// reverse_set_3763_test.cpp` carries that fix's own grid and its §6b
+// exclusion diff.
 //
 // The source set for every row is the file's own `prog()` prelude:
 // `SortedSet<int>` with 30, 10, 20, 40 added in that order, so §4.18's
@@ -305,17 +318,29 @@ BEZEL_TEST(sortedset_isarrlike_3730,
         "True,True");
 }
 
-BEZEL_TEST(sortedset_isarrlike_3730, reverse_rejected_no_sema_typing_3763) {
-    // The ONE survivor of the old Category C. Retargeted from issue 3735
-    // (now fixed) to issue 3763: stdlib §5's LAZY `Reverse(): IEnumerable<T>`
-    // has no typing arm on a direct collection receiver, so the reject keeps
-    // the failure LOUD and located rather than letting it reach the #2434
-    // degrade one line later (§6c).
-    auto r = reject("    using var r := s.Reverse().ToArray();");
-    BEZEL_EXPECT_TRUE(hasErrorContaining(
-        r, "`Reverse` is declared on `SortedSet<T>` via stdlib \xC2\xA7" "5's"));
-    BEZEL_EXPECT_TRUE(hasErrorContaining(r, "issue 3763"));
+BEZEL_TEST(sortedset_isarrlike_3730, reverse_now_types_descending_3763) {
+    // Was `reverse_rejected_no_sema_typing_3763`, the LAST survivor of the old
+    // Category C. fix #3763 (stdlib §5 / §4.18, v0.287) supplied the missing
+    // sema typing arm (`typeLinqOperator`'s
+    // `isLazyReverseDirectReceiverHead` gate) and the matching codegen `isOp`
+    // term, so the reject is gone and this is a VALUE row (lane rules §7: a
+    // fix reversing a prior rejection updates the test that pinned it, in the
+    // same commit).
+    //
+    // ORDER-SENSITIVE on purpose: §4.18 iterates ascending (10, 20, 30, 40),
+    // so §5's `Reverse()` is the descending sequence. A count-only assertion
+    // would pass on any materialization.
+    auto r = runAot(prog(
+        "    using var rv := s.Reverse().ToArray();\n"
+        "    Console.WriteLine($\"{rv[0]},{rv[1]},{rv[2]},{rv[3]}\");"));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_FALSE(hasErrorContaining(r, "issue 3763"));
     BEZEL_EXPECT_FALSE(hasErrorContaining(r, "issue 3735"));
+    BEZEL_EXPECT_EQ(
+        runAotOut(prog(
+            "    using var rv := s.Reverse().ToArray();\n"
+            "    Console.WriteLine($\"{rv[0]},{rv[1]},{rv[2]},{rv[3]}\");")),
+        "40,30,20,10");
 }
 
 // ===========================================================================

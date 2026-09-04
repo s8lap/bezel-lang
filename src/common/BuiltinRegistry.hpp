@@ -741,4 +741,43 @@ bool isLinqElementLambdaOperatorName(std::string_view m);
 // name) copy of the same routing decision. per §5, fix #3670
 bool isLinqLazyPassthroughOperatorName(std::string_view m);
 
+// fix #3763 (stdlib §5 / §5's `Reverse` naming note v0.195 / §4.10 / §4.18 /
+// §4.6 / §4.7, v0.287): the builtin collection HEADS on which stdlib §5's LAZY
+// `Reverse(): IEnumerable<T>` is the ONLY declared meaning of a direct
+// `recv.Reverse()`, so both sema (the typing arm) and codegen (the lazy
+// operator gate) must admit them.
+//
+// The membership question is the §5 naming note's own, verbatim: "the lazy
+// operator applies only where the receiver's static type has no instance
+// `Reverse`" (stdlib §5, v0.195), read together with spec §26.5 rule 1
+// ("instance members win", BY NAME). Only four types in this document declare
+// an instance `Reverse()`: `Array<T>` (§4.4), `OwningArray<T>` (§4.5),
+// `Span<T>`/`ReadOnlySpan<T>` and `ArraySpan<T>` (§4.15) — on each of those
+// §26.5 rule 1 makes the in-place member win and the §5 operator unreachable.
+// The Set family (`Set`/`OwningSet` §4.10, `SortedSet` §4.18) and the linked-
+// list family (`LinkedList`/`OwningLinkedList` §4.6/§4.7) declare none, so §5
+// is all a call on them can mean.
+//
+// ⚠ EXCLUDES `Stack`/`OwningStack`/`Queue`/`OwningQueue` even though stdlib
+// §4.11 declares no `Reverse()` on them either, and the §5 naming note
+// therefore says the lazy operator SHOULD apply. It does not, today: this
+// compiler structurally dispatches those four to the in-place `bz_array_*`
+// mutator through `isCollectionTypeName`, and #2457 slice 2 measured that
+// mutation VALUE-CORRECT and accepted it deliberately (see
+// `tests/codegen/stack_queue_unresolved_member_2457_test.cpp`'s
+// `legit_reverse_alias_stack_value_correct` and its Queue twin, which pin it).
+// Admitting them here would silently retarget working code from an in-place
+// reverse to a lazy sequence — a behaviour change to a WORKING path, not the
+// repair of a broken one, and outside issue 3763's scope. Filed separately;
+// this table is the place to add them when that lands.
+//
+// ⚠ EXCLUDES `OwningBuffer` (§4.14) and `FrozenArray` (§4.19) for the same
+// reason as the Stack family (both are `bz_array_t*`-backed and reach the same
+// in-place mutator — `OwningBuffer<int>.Reverse()` measured mutating in place),
+// and `Dictionary`/`SortedDictionary` (§4.8/§4.17), whose §5 element type is a
+// `DictionaryEntry<K, V>` STRUCT rather than a plain element — a different
+// lazy-element lowering shape with no measured coverage here.
+// per §5 / §4.6 / §4.7 / §4.10 / §4.18, fix #3763
+bool isLazyReverseDirectReceiverHead(std::string_view head);
+
 }  // namespace bezel::common

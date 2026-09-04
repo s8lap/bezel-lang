@@ -4699,6 +4699,41 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         ctx_.setExprType(&ce, makeLazyEnumerable(srcElem));
                         return true;
                     }
+                    // fix #3763 (stdlib §5 / §5's `Reverse` naming note v0.195
+                    // / §4.6 / §4.7 / §4.10 / §4.18, v0.287): stdlib §5's LAZY
+                    // `Reverse(): IEnumerable<T>` had NO typing arm here at
+                    // all, on any receiver — the four call sites of this lambda
+                    // that need `Reverse` typed on a *non*-direct receiver (the
+                    // lazy sentinel, the string receiver) each answer it in
+                    // their own `else if` BEFORE falling through here, so the
+                    // gap was invisible from those two and total on a DIRECT
+                    // collection receiver: `s.Reverse()` on a `Set<int>` was
+                    // left untyped and the next line degraded through #2434
+                    // (a quiet zero), while `SortedSet<T>` carried a
+                    // 3763-citing loud reject below to keep it located.
+                    //
+                    // It is NOT folded into `isLinqLazyPassthroughOperatorName`
+                    // (whose body this arm duplicates exactly) precisely
+                    // because `Reverse` is the one §5 operator whose
+                    // applicability is RECEIVER-dependent: spec §26.5 rule 1
+                    // gives the in-place `Array<T>.Reverse()` (§4.4) /
+                    // `OwningArray<T>.Reverse()` (§4.5) the name on those
+                    // receivers, so a plain name predicate would retarget a
+                    // working in-place mutator to a lazy sequence. The
+                    // receiver test is therefore explicit, and its membership
+                    // rule — "the receiver's static type declares no instance
+                    // `Reverse`" — lives in ONE place,
+                    // `common::isLazyReverseDirectReceiverHead`, which both
+                    // this arm and codegen's `isOp` Reverse gate
+                    // (LlvmBackend_Calls3.cpp) read. See that predicate's
+                    // header for the §6b exclusion diff: which heads it admits,
+                    // and why the Stack/Queue, `OwningBuffer`, `FrozenArray`
+                    // and dictionary families stay out.
+                    if (m == "Reverse" && ce.args.empty() &&
+                        common::isLazyReverseDirectReceiverHead(colName)) {
+                        ctx_.setExprType(&ce, makeLazyEnumerable(srcElem));
+                        return true;
+                    }
                     if (m == "Select" && !ce.args.empty() && ce.args[0].value) {
                         TypeRef* outElem = srcElem;
                         if (auto* lamTy = ctx_.exprType(*ce.args[0].value))
@@ -5738,17 +5773,29 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         // defect — every one of them is measured working on a
                         // direct `SortedSet<int>` receiver.
                         //
-                        // `Reverse` is the ONE survivor, and for a reason that
-                        // is not codegen's: §5's LAZY `Reverse(): IEnumerable<T>`
-                        // has no sema TYPING arm at all for a direct collection
+                        // `Reverse` was the ONE survivor, and for a reason that
+                        // was not codegen's: §5's LAZY `Reverse(): IEnumerable<T>`
+                        // had no sema TYPING arm at all for a direct collection
                         // receiver — `typeLinqOperator` (~line 4625) never
-                        // mentions it — so the call acquires no `exprType` and
-                        // degrades at the NEXT line via #2434 no matter what
-                        // codegen does. (The codegen admission was written and
+                        // mentioned it — so the call acquired no `exprType` and
+                        // degraded at the NEXT line via #2434 no matter what
+                        // codegen did. (The codegen admission was written and
                         // measured INERT without the typing half, then
-                        // reverted.) Filed as issue 3763 with the measured
-                        // repro; the reject below keeps the failure LOUD and
-                        // located until that lands, per §6c.
+                        // reverted.) That was filed as issue 3763 and the
+                        // reject here kept the failure LOUD and located, per
+                        // §6c.
+                        //
+                        // fix #3763 (stdlib §5 / §4.18, v0.287): that typing
+                        // arm now exists (`typeLinqOperator`'s
+                        // `isLazyReverseDirectReceiverHead` arm) and codegen's
+                        // `isOp` Reverse gate reads the SAME predicate, so
+                        // `SortedSet<T>.Reverse()` is a lazy `IEnumerable<T>`
+                        // in §4.18's required ascending order, reversed —
+                        // measured `{30,10,20}` → `30,20,10`. The reject is
+                        // DELETED rather than left as dead code: keeping a
+                        // loud reject over a member that now lowers correctly
+                        // is the #3735 defect this block already records one
+                        // paragraph up.
                         bool sortedSetMemberUndeclared =
                             m == "Get" || m == "Peek" || m == "Pop" ||
                             m == "Dequeue" || m == "PopLast" ||
@@ -5757,24 +5804,8 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             m == "TryDequeue" || m == "TryPeek" ||
                             m == "TryPopFirst" || m == "TryPopLast" ||
                             m == "TryTake" || m == "Length";
-                        if (colName == "SortedSet" && m == "Reverse") {
-                            // stdlib §5 declares `Reverse()` on the
-                            // `IEnumerable<T>` extension surface, so this is
-                            // not a naming mistake — it is issue 3763's
-                            // missing sema typing arm. Reported HERE rather
-                            // than letting it reach the #2434 degrade one line
-                            // later.
-                            ctx_.diagnostics().report(
-                                Severity::Error, ce.span.begin,
-                                "`Reverse` is declared on `SortedSet<T>` via "
-                                "stdlib §5's IEnumerable<T> extension surface, "
-                                "but this compiler gives the LAZY `Reverse(): "
-                                "IEnumerable<T>` no typing on a direct "
-                                "collection receiver (issue 3763) — compose it "
-                                "through a materializing operator instead, "
-                                "e.g. `s.ToArray().Reverse()`");
-                        } else if (colName == "SortedSet" &&
-                                   sortedSetMemberUndeclared) {
+                        if (colName == "SortedSet" &&
+                            sortedSetMemberUndeclared) {
                             ctx_.diagnostics().report(
                                 Severity::Error, ce.span.begin,
                                 std::string("no member `") + std::string(m) +
