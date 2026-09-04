@@ -12309,6 +12309,16 @@ void ExprTC::visitMember(const ast::Member& m) {
             }
             currentScope_ = saveScope;
             inFieldInitializer_ = save;
+            // fix #3774 (§22.13 / §23.1, v0.286): a `static readonly`
+            // auto-property's initializer stores into the §23.1 backing field
+            // during the declaring type's own static initialization — one of
+            // the very stores §22.13 orders "in textual declaration order" —
+            // so it may no more read a later-declared static-readonly sibling
+            // (field OR auto-property) than an explicit field initializer may.
+            // Before this, the check ran only for a FieldDecl source with a
+            // FieldSymbol target, so `P1 := C.P2 + 1;` above `P2 := H.Get();`
+            // compiled and stored P2's zero default + 1 permanently.
+            checkStaticReadonlyForwardRef(pd);
         }
         for (const auto& a : pd->accessors) {
             // §22.9: a setter accessor has an implicit `value` parameter
@@ -12475,14 +12485,90 @@ bool ExprTC::isConstInitExpr(const ast::Expr& e) {
     return false;
 }
 
-void ExprTC::checkStaticReadonlyForwardRef(const ast::FieldDecl* fd) {
-    if (!fd || !fd->initializer || !currentType_) return;
+// fix #3774 (§22.13 / §23.1, v0.286): §22.13's forward-reference rule is about
+// STORAGE written by the textual-order static-initialization pass, not about
+// the `field` spelling. §23.1 says a `static readonly` auto-property's
+// initializer "is a store to the backing field (no setter exists to invoke)"
+// admitted "in the declaring type's own static initialization" — the exact
+// phase §22.13's "static fields are initialized in textual declaration order"
+// orders. So a static-readonly auto-property's backing field is one of the
+// slots the rule ranges over, on BOTH sides of a reference.
+//
+// A getter-bearing property (expression-bodied, or a block form) is NOT such a
+// slot: it recomputes on every read and holds no static-init-written storage,
+// so it is neither a source nor a target here (and §23.2 rejects `readonly`
+// on those forms anyway). An indexer is likewise excluded (it has parameters
+// and no static-init store).
+std::string_view ExprTC::staticReadonlyStorageName(const Symbol* s) {
     auto hasMod = [](const std::vector<std::string_view>& mods,
                      std::string_view m) {
         for (auto x : mods) if (x == m) return true;
         return false;
     };
-    if (!hasMod(fd->modifiers, "static") || !hasMod(fd->modifiers, "readonly"))
+    if (auto* fs = dynamic_cast<const FieldSymbol*>(s)) {
+        if (hasMod(fs->modifiers, "static") && hasMod(fs->modifiers, "readonly"))
+            return fs->name;
+        return {};
+    }
+    if (auto* ps = dynamic_cast<const PropertySymbol*>(s)) {
+        if (ps->isIndexer) return {};
+        // Auto-property (backing-field) shape only — mirrors codegen's
+        // `isStaticAutoProperty` gate on the emitting side, so the two agree
+        // about which properties own static-init-written storage.
+        //
+        // `PropertySymbol::isAutoProperty` is NOT the symbol-side channel for
+        // this question: it is an INSTANCE-storage predicate and is false for
+        // every static auto-property (SymbolCollection's
+        // `hasAstAutoPropertyDecl` and ModuleMetadataBuilder both clear it on
+        // `static`), so the declaration is the only source. That is sound
+        // here because every symbol reaching this line is a member of
+        // `currentType_` — the caller's `iF` loop walks that member list
+        // directly, and `laterSR` tests `indexOf` (which admits only that
+        // list) BEFORE calling here — and ExprTypecheck only ever walks THIS
+        // source file's declarations, so `currentType_` is always LOCAL. An
+        // imported symbol (`OtherMod.C.P`) fails `indexOf` and never arrives;
+        // it could not be a SAME-TYPE forward reference in any case.
+        //
+        // SEAM-ACCESSOR: local-only by the paragraph above — every arrival is
+        // a member of the local `currentType_` and carries a decl. #3152
+        auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
+        if (!pd || pd->isIndexer ||
+            pd->bodyKind != ast::PropertyBodyKind::Auto)
+            return {};
+        if (hasMod(ps->modifiers, "static") && hasMod(ps->modifiers, "readonly"))
+            return ps->name;
+        return {};
+    }
+    return {};
+}
+
+void ExprTC::checkStaticReadonlyForwardRef(const ast::FieldDecl* fd) {
+    if (!fd) return;
+    checkStaticReadonlyForwardRefImpl(fd, fd->name, fd->modifiers,
+                                      fd->initializer.get());
+}
+
+// fix #3774: the auto-property source arm. `autoInitializer` is the only
+// initializer form a property has; a getter body is not an initializer and is
+// not checked here (it runs on demand, after static init, so it cannot observe
+// partial state through this rule).
+void ExprTC::checkStaticReadonlyForwardRef(const ast::PropertyDecl* pd) {
+    if (!pd || pd->isIndexer || pd->bodyKind != ast::PropertyBodyKind::Auto)
+        return;
+    checkStaticReadonlyForwardRefImpl(pd, pd->name, pd->modifiers,
+                                      pd->autoInitializer.get());
+}
+
+void ExprTC::checkStaticReadonlyForwardRefImpl(
+    const ast::Member* srcDecl, std::string_view srcName,
+    const std::vector<std::string_view>& srcMods, const ast::Expr* init) {
+    if (!srcDecl || !init || !currentType_) return;
+    auto hasMod = [](const std::vector<std::string_view>& mods,
+                     std::string_view m) {
+        for (auto x : mods) if (x == m) return true;
+        return false;
+    };
+    if (!hasMod(srcMods, "static") || !hasMod(srcMods, "readonly"))
         return;
     // Declaration-order index of a symbol in the current type, or -1.
     auto indexOf = [&](const Symbol* s) -> int {
@@ -12494,19 +12580,25 @@ void ExprTC::checkStaticReadonlyForwardRef(const ast::FieldDecl* fd) {
         return -1;
     };
     int iF = -1;
+    // fix #3774: match on the DECL pointer over every member symbol kind, not
+    // over `FieldSymbol` alone — the source may now be a PropertySymbol.
     for (std::size_t i = 0; i < currentType_->members.size(); ++i)
-        if (auto* fs = dynamic_cast<const FieldSymbol*>(currentType_->members[i]))
-            if (fs->decl == fd) { iF = static_cast<int>(i); break; }
+        if (auto* ms = dynamic_cast<const MemberSymbol*>(currentType_->members[i]))
+            if (ms->decl == srcDecl && !staticReadonlyStorageName(ms).empty()) {
+                iF = static_cast<int>(i); break;
+            }
     if (iF < 0) return;
-    // A reference is offending iff it resolves to a static-readonly field of the
-    // same type declared after F.
-    auto laterSR = [&](Symbol* g) -> const FieldSymbol* {
-        auto* fs = dynamic_cast<FieldSymbol*>(g);
-        if (!fs) return nullptr;
-        if (!hasMod(fs->modifiers, "static") ||
-            !hasMod(fs->modifiers, "readonly"))
-            return nullptr;
-        return indexOf(fs) > iF ? fs : nullptr;
+    // A reference is offending iff it resolves to a static-readonly storage
+    // member of the same type — a field, or (fix #3774) an auto-property whose
+    // §23.1 backing field the same textual-order pass writes — declared after F.
+    auto laterSR = [&](Symbol* g) -> const MemberSymbol* {
+        auto* ms = dynamic_cast<MemberSymbol*>(g);
+        // Order matters (#3152): `indexOf` admits only members of
+        // `currentType_`, so testing it FIRST is what makes
+        // `staticReadonlyStorageName`'s decl read a local-only one — see the
+        // SEAM-ACCESSOR note there.
+        if (!ms || indexOf(ms) <= iF) return nullptr;
+        return staticReadonlyStorageName(ms).empty() ? nullptr : ms;
     };
     std::function<void(const ast::Expr*)> walk = [&](const ast::Expr* e) {
         if (!e) return;
@@ -12515,7 +12607,7 @@ void ExprTC::checkStaticReadonlyForwardRef(const ast::FieldDecl* fd) {
             if (auto* g = laterSR(ctx_.exprSymbol(*e)))
                 ctx_.diagnostics().report(
                     Severity::Error, e->span.begin,
-                    std::string("static readonly `") + std::string(fd->name) +
+                    std::string("static readonly `") + std::string(srcName) +
                     "` reads static readonly `" + std::string(g->name) +
                     "`, which is declared later in the same type — a forward "
                     "reference between static readonly fields is not allowed; "
@@ -12541,7 +12633,7 @@ void ExprTC::checkStaticReadonlyForwardRef(const ast::FieldDecl* fd) {
             for (const auto& a : ne->args) walk(a.value.get());
         }
     };
-    walk(fd->initializer.get());
+    walk(init);
 }
 
 // §21.4 / §29: does a locally-declared user type (or any type in its base

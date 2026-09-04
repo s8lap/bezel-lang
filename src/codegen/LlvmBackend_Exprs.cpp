@@ -6068,7 +6068,16 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                 // yet raises the cycle backstop rather than observing partial state.
                 // (No-op for a generic-instantiation field: initProgressGV_ has no
                 // entry for a generic TypeSymbol, matching pre-#1513 behavior.)
-                if (auto* fsym = dynamic_cast<const sema::FieldSymbol*>(sym))
+                //
+                // fix #3774 (§22.13 / §23.1, v0.286): the gate is MemberSymbol,
+                // not FieldSymbol — `staticFieldGlobal` resolves a static
+                // auto-property's §23.1 backing global at this very site, so a
+                // read of one used to skip the guard entirely whoever was
+                // reading it and whenever. `staticInitSlotIndex` returns -1 for
+                // every member sfinit does not runtime-store (a method symbol
+                // reaching here included), so the widened gate stays a no-op
+                // everywhere it was one before.
+                if (auto* fsym = dynamic_cast<const sema::MemberSymbol*>(sym))
                     emitStaticPartialReadGuard(memberOwner(sym), fsym);
             }
             return builder_.CreateLoad(gv->getValueType(), gv);
@@ -6240,7 +6249,16 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                 // yet raises the cycle backstop rather than observing partial state.
                 // (No-op for a generic-instantiation field: initProgressGV_ has no
                 // entry for a generic TypeSymbol, matching pre-#1513 behavior.)
-                if (auto* fsym = dynamic_cast<const sema::FieldSymbol*>(sym))
+                //
+                // fix #3774 (§22.13 / §23.1, v0.286): the gate is MemberSymbol,
+                // not FieldSymbol — `staticFieldGlobal` resolves a static
+                // auto-property's §23.1 backing global at this very site, so a
+                // read of one used to skip the guard entirely whoever was
+                // reading it and whenever. `staticInitSlotIndex` returns -1 for
+                // every member sfinit does not runtime-store (a method symbol
+                // reaching here included), so the widened gate stays a no-op
+                // everywhere it was one before.
+                if (auto* fsym = dynamic_cast<const sema::MemberSymbol*>(sym))
                     emitStaticPartialReadGuard(memberOwner(sym), fsym);
             }
             return builder_.CreateLoad(gv->getValueType(), gv);

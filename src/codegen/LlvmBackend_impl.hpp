@@ -12085,19 +12085,35 @@ private:
     // stores, and initProgress counts). Returns -1 for a field sfinit does not
     // store at runtime — a compile-time-constant initializer (already in the
     // global) or one without a backing global — i.e. always-assigned, no guard.
+    // Thin wrapper over `staticInitSlotIndex` since fix #3774.
     int staticFieldInitIndex(const sema::FieldSymbol* fs);
 
+    // fix #3774 (§22.13 / §23.1, v0.286): the ordinal of `m` among ALL the slots
+    // sfinit runtime-stores in textual declaration order — static fields AND
+    // static auto-properties, whose §23.1 backing field the very same
+    // emitStaticConstructorBody loop stores in the very same order. Before this
+    // the index counted fields only and the property arm never advanced
+    // init-progress at all, so a re-entrant read of a not-yet-stored static
+    // auto-property sailed past emitStaticPartialReadGuard and observed the
+    // slot's zero default (issue #3774's `P1=1` measurement). Returns -1 for a
+    // member sfinit does not runtime-store (baked constant initializer, no
+    // backing global, getter-bearing property, indexer) — always-assigned, so
+    // no guard.
+    int staticInitSlotIndex(const sema::MemberSymbol* m);
+
     // #1553 / §22.13 (v0.181): the static-initialization-cycle runtime backstop.
-    // Emitted after emitEnsureStaticInit at a static-FIELD READ site: if `owner`'s
-    // static init is in progress on THIS thread and `fs` has not been assigned yet
-    // (its declaration index >= owner's init progress), the read would observe a
-    // partially-initialized static — synthesize a TypeInitializationException
-    // (naming `owner`, InnerException null) into bz_exc and route it through the
-    // current unwind target instead. A no-op when `owner` has no static state, or
-    // `fs` is always-assigned (staticFieldInitIndex < 0), or the state is not
-    // in-progress (the normal post-init read).
+    // Emitted after emitEnsureStaticInit at a static-storage READ site: if
+    // `owner`'s static init is in progress on THIS thread and `fs` has not been
+    // assigned yet (its slot index >= owner's init progress), the read would
+    // observe a partially-initialized static — synthesize a
+    // TypeInitializationException (naming `owner`, InnerException null) into
+    // bz_exc and route it through the current unwind target instead. A no-op
+    // when `owner` has no static state, or `fs` is always-assigned
+    // (staticInitSlotIndex < 0), or the state is not in-progress (the normal
+    // post-init read). Takes a MemberSymbol since fix #3774 — a static
+    // auto-property read reaches the same backing-global load site.
     void emitStaticPartialReadGuard(const sema::TypeSymbol* owner,
-                                    const sema::FieldSymbol* fs);
+                                    const sema::MemberSymbol* fs);
 
     // #1553 / §22.13 (v0.181): store a freshly-synthesized cycle-backstop
     // TypeInitializationException — vtable + a message naming `typeName`,

@@ -9881,6 +9881,22 @@ void Emitter::emitStaticConstructorBody(sema::ConstructorSymbol* cs,
                     pVal = coerceReturnToNullableValue(
                         pVal, pRt, isUnsignedTargetExpr(*pInitExpr));
                 builder_.CreateStore(pVal, pGvIt->second);
+                // fix #3774 (§22.13 / §23.1, v0.286): advance the owning type's
+                // init-progress past this auto-property's slot, exactly as the
+                // FieldSymbol arm below does for a field. Without this the
+                // property arm stored its value but left progress where the
+                // preceding field slot put it, so every later static — property
+                // OR field — kept testing as "assigned" and the partial-state
+                // read guard never fired on a forward reference through one.
+                {
+                    auto pPgIt = initProgressGV_.find(type);
+                    int pSlotIdx = staticInitSlotIndex(ps);
+                    if (pPgIt != initProgressGV_.end() && pSlotIdx >= 0)
+                        builder_.CreateStore(
+                            llvm::ConstantInt::get(i32(),
+                                static_cast<uint64_t>(pSlotIdx) + 1),
+                            pPgIt->second);
+                }
                 continue;
             }
             auto* fs = dynamic_cast<const sema::FieldSymbol*>(m);
@@ -10580,13 +10596,71 @@ static bool isSfinitStoredStaticField(const sema::FieldSymbol* f,
 }
 
 int Emitter::staticFieldInitIndex(const sema::FieldSymbol* fs) {
-    if (!fs || !fs->parent) return -1;
-    if (!isSfinitStoredStaticField(fs, staticGlobals_)) return -1;
+    return staticInitSlotIndex(fs);
+}
+
+// fix #3774 (§22.13 / §23.1, v0.286): the auto-property companion of
+// `isSfinitStoredStaticField` — true iff emitStaticConstructorBody's
+// PropertySymbol arm stores `ps` at RUNTIME in textual order. Its gate has to
+// be the SAME triple that arm applies (static auto-property, an
+// `autoInitializer` that is not a constant literal, and a backing global),
+// because the index this feeds must count exactly the slots sfinit's stores
+// advance init-progress through. Note the constant-literal test is the BARE
+// predicate, not `isBakedStaticFieldInit`: a static auto-property bakes any
+// constant-literal initializer regardless of `readonly` (declareStatics),
+// unlike a field, and that arm's own skip already says so.
+static bool isSfinitStoredStaticAutoProperty(const sema::PropertySymbol* ps,
+    const std::unordered_map<const sema::Symbol*, llvm::GlobalVariable*>& globals) {
+    if (!ps || ps->isIndexer) return false;
+    bool isStatic = false;
+    for (auto mod : ps->modifiers) if (mod == "static") { isStatic = true; break; }
+    if (!isStatic) return false;
+    // SEAM-ACCESSOR: the only caller is `staticInitSlotIndex`, which returns
+    // -1 for a member of an IMPORTED type before reaching here, so `ps->decl`
+    // is never null on this path. (`PropertySymbol::isAutoProperty` is not the
+    // symbol-side channel for this question — it is an INSTANCE-storage
+    // predicate, cleared on `static` by both SymbolCollection's
+    // `hasAstAutoPropertyDecl` and ModuleMetadataBuilder.) #3152
+    auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
+    if (!pd || pd->isIndexer || pd->bodyKind != ast::PropertyBodyKind::Auto)
+        return false;
+    if (!pd->autoInitializer) return false;
+    if (isConstantLiteralStaticInit(pd->autoInitializer.get())) return false;
+    return globals.count(ps) != 0;
+}
+
+int Emitter::staticInitSlotIndex(const sema::MemberSymbol* m) {
+    if (!m || !m->parent) return -1;
+    // fix #3774 / #3152: the ordinals below are THIS module's sfinit
+    // numbering. An IMPORTED type's init-progress counter is written by the
+    // defining module's sfinit against its own member list, so this module
+    // cannot index into it — and `initStateGV_` / `initProgressGV_` are keyed
+    // by local types only (emitEnsureInitFns skips `ctx_.isImported(t)`; its
+    // other two sources, sfinitFnOf_ / cctorFnOf_, come from the local-only
+    // declareFunctions walk), so `emitStaticPartialReadGuard` would have
+    // bailed anyway. Bailing HERE makes locality a structural property of
+    // this function rather than an ordering accident at one call site, which
+    // is what licenses the SEAM-ACCESSOR decl reads in the two slot
+    // predicates it calls.
+    if (ctx_.isImported(m->parent)) return -1;
+    // Which slot kind is `m`? A member sfinit does not runtime-store owns no
+    // slot and needs no guard.
+    auto isSlot = [&](const sema::Symbol* s) {
+        if (auto* f = dynamic_cast<const sema::FieldSymbol*>(s))
+            return isSfinitStoredStaticField(f, staticGlobals_);
+        if (auto* p = dynamic_cast<const sema::PropertySymbol*>(s))
+            return isSfinitStoredStaticAutoProperty(p, staticGlobals_);
+        return false;
+    };
+    if (!isSlot(m)) return -1;
     int idx = 0;
-    for (const sema::Symbol* m : fs->parent->members) {
-        auto* f = dynamic_cast<const sema::FieldSymbol*>(m);
-        if (!f || !isSfinitStoredStaticField(f, staticGlobals_)) continue;
-        if (f == fs) return idx;
+    // Walk `parent->members` in declaration order — the SAME order
+    // emitStaticConstructorBody's loop walks, so slot n's store is the n'th
+    // bumpProgress and a read of slot k with progress <= k is a read of a
+    // not-yet-assigned static (§22.13's partial-state condition).
+    for (const sema::Symbol* mem : m->parent->members) {
+        if (!isSlot(mem)) continue;
+        if (mem == m) return idx;
         ++idx;
     }
     return -1;
@@ -10613,12 +10687,12 @@ void Emitter::emitSynthesizeCycleTIE(const std::string& typeName) {
 }
 
 void Emitter::emitStaticPartialReadGuard(const sema::TypeSymbol* owner,
-                                         const sema::FieldSymbol* fs) {
+                                         const sema::MemberSymbol* fs) {
     if (!owner || !fs) return;
     auto stIt = initStateGV_.find(owner);
     if (stIt == initStateGV_.end()) return;   // no static state → no guard
-    int idx = staticFieldInitIndex(fs);
-    if (idx < 0) return;                        // always-assigned field → no guard
+    int idx = staticInitSlotIndex(fs);
+    if (idx < 0) return;                        // always-assigned slot → no guard
     auto ownIt = initOwnerGV_.find(owner);
     auto prIt  = initProgressGV_.find(owner);
     if (ownIt == initOwnerGV_.end() || prIt == initProgressGV_.end()) return;

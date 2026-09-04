@@ -2071,7 +2071,27 @@ private:
     // §22.13 (#747 R42): reject a `static readonly` field whose initializer
     // reads a `static readonly` field of the same type declared LATER. Called
     // with the FieldDecl after its initializer is type-checked.
+    //
+    // fix #3774 (§22.13 / §23.1, v0.286): the rule is storage-shaped, not
+    // syntax-shaped — a `static readonly` AUTO-PROPERTY's initializer is
+    // "a store to the backing field … in the declaring type's own static
+    // initialization" (§23.1), i.e. one of the very stores §22.13 orders
+    // "in textual declaration order". Both the SOURCE and the TARGET of the
+    // forward reference are therefore taken over static-readonly fields AND
+    // static-readonly auto-properties, which is why the core takes an
+    // `ast::Member*` (the two decl kinds' common base) rather than a
+    // `FieldDecl*`. The PropertyDecl overload passes `pd->autoInitializer`.
     void checkStaticReadonlyForwardRef(const ast::FieldDecl* fd);
+    void checkStaticReadonlyForwardRef(const ast::PropertyDecl* pd);
+    void checkStaticReadonlyForwardRefImpl(
+        const ast::Member* srcDecl, std::string_view srcName,
+        const std::vector<std::string_view>& srcMods, const ast::Expr* init);
+    // fix #3774: is `s` a member of the current type whose STORAGE is written
+    // by §22.13's textual-order static-initialization pass and declared
+    // `readonly` — a `static readonly` field, or a `static readonly`
+    // auto-property (§23.1's generated backing field)? Returns the symbol's
+    // declared name when it is, empty otherwise.
+    static std::string_view staticReadonlyStorageName(const Symbol* s);
 
     void visitStmt(const ast::Stmt& s);
 
