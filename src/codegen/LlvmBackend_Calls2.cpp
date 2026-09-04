@@ -5226,17 +5226,7 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
     if (auto* par = dynamic_cast<sema::ParameterSymbol*>(calleeSym)) {
         sema::TypeRef* rt = par->declType
                                 ? ctx_.resolvedType(*par->declType)
-                                : par->resolvedDeclType;
-        // fix #3801 (§27.3 / §27.4 / §27.1, v0.287): for an UNANNOTATED lambda
-        // parameter, par->declType is null and the inferred type rides
-        // par->resolvedDeclType (set by ExprTypecheck_Exprs.cpp's
-        // pendingLambdaParamTypes_ thread, e.g. an IIFE's positional arg
-        // types). Without this fallback, a function-typed lambda param —
-        // `(lambda(a) => a(7))(f)` where `f: (int) -> int` — left rt null,
-        // missed the `rt->kind == Function` dispatch, and silently returned 0
-        // (the #2477 zero-init fallback) instead of calling through the
-        // closure pointer. Mirrors the FieldSymbol arm's generic-substitution
-        // fallback immediately below this site.
+                                : nullptr;
         if (rt && rt->kind == sema::TypeRef::Kind::Function) {
             llvm::Value* closurePtr = nullptr;
             auto pit = paramSlots_.find(par);
@@ -5534,11 +5524,105 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
     // `handlers[i]()` where handlers: [N](T) -> R. The IndexExpr has
     // no resolved symbol (calleeSym = null), so we lower the IndexExpr
     // directly and use its exprType to drive emitClosureCall.
+    //
+    // fix #3704 (narrowed) / §27.5 / §28.9 / §30.5 (v0.287): this arm
+    // also covers the chain-call temporary `f()()` where `f()` is a
+    // CallExpr (no resolved callee symbol — a CallExpr is not a symbol
+    // reference). The `closurePtr` is the result of evaluating `f()` —
+    // a function-typed value whose lifetime ends with the full
+    // expression.
+    //
+    // Release-count selection. The cell's rc on arrival at the chain-
+    // call site equals the producer's +1 (the lambda literal in the
+    // inner call's body, set by `initClosureRc` to 1) PLUS any
+    // `bz_closure_retain` the inner method's return-statement fired
+    // (Stmts.cpp:2626-2634 mints +1 for a closure-typed return whose
+    // value is NOT a +1 producer / NOT a user-method-closure-return /
+    // NOT a returned-closure-local — i.e., a borrowed value crossing a
+    // method boundary). Two patterns exist:
+    //
+    //   1. Inner method returns a +1 producer (lambda literal, method
+    //      ref, primitive-intrinsic ref, Object-member ref): the return
+    //      does NOT mint. Closure arrives with rc=1. ONE release.
+    //
+    //   2. Inner method returns a borrowed value (a CallExpr to a
+    //      lambda-typed local, a field read, etc.): the return mints.
+    //      Closure arrives with rc=2. TWO releases.
+    //
+    // The chain-call site cannot see the inner method's body directly,
+    // so walk to the LAST `ReturnStmt` of the method (`exprBody` for
+    // expression-bodied methods, last statement in `stmts` for block-
+    // bodied methods) and apply the SAME predicate Stmts.cpp:2626 uses
+    // to gate its mint. If the predicate would fire retain, emit two
+    // releases here; otherwise one. This mirrors the IIFE site at
+    // line 5520 in either case (which already does this for inline-
+    // created closures).
+    //
+    // Callee-kind gate. This arm covers BOTH the chain-call `f()()`
+    // shape (callee IS a CallExpr — producer closure, balanced by the
+    // releases below) AND the IndexExpr-borrow shape `xs[0]()` (callee
+    // is an IndexExpr — a BORROW read of an array element of function
+    // type, with no +1 producer to balance). The IndexExpr shape MUST
+    // skip both releases (#3704 review caught an unconditional first
+    // release over-releasing the borrowed cell into UAF on the next
+    // access — the local `g := f` then segfaults when `g()` reads
+    // from the freed cell).
     if (!calleeSym) {
         sema::TypeRef* calleeTy = ctx_.exprType(*call.callee);
         if (calleeTy && calleeTy->kind == sema::TypeRef::Kind::Function) {
             llvm::Value* closurePtr = lowerExpr(*call.callee);
-            return emitClosureCall(closurePtr, calleeTy);
+            llvm::Value* ccRes = emitClosureCall(closurePtr, calleeTy);
+            // #422 / §28.9: release the transient closure after the call.
+            // fix #3704 (narrowed) / §27.5 / §28.9 / §30.5 (v0.287):
+            // mirror the Stmts.cpp:2626 mint gate at the chain-call
+            // site. When the inner method's return-statement mints (a
+            // borrowed value crossing the function boundary), two
+            // releases balance producer + mint; otherwise one release
+            // balances the producer alone. Probe-verified across all
+            // five chains in scope here (Rows 1-5 below):
+            //   * Rows 1-3 — `return outer();` — outer() is a CallExpr
+            //     to a lambda-typed local; Stmts.cpp:2626 fires retain;
+            //     chain call needs TWO.
+            //   * Row 4 — `return lambda() => lambda() => x;` — outer
+            //     lambda is a producer; no retain; ONE release.
+            //   * Row 5 — `return lambda() => x;` — producer; ONE.
+            //
+            // Callee-kind gate (narrow #3704, this fix): the chain-call
+            // shape has `call.callee` = CallExpr (a producer); the
+            // IndexExpr-borrow shape `xs[0]()` has `call.callee` =
+            // IndexExpr (a borrow — the read produces no +1 to
+            // balance). Skip BOTH releases for the IndexExpr shape.
+            if (auto* calleeCall =
+                    dynamic_cast<const ast::CallExpr*>(call.callee.get())) {
+                bool innerMints = false;
+                if (auto* ms = dynamic_cast<sema::MethodSymbol*>(
+                        ctx_.exprSymbol(*calleeCall->callee))) {
+                    if (auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl)) {
+                        const ast::Expr* retVal = nullptr;
+                        if (md->bodyKind == ast::MethodBodyKind::Expression &&
+                            md->exprBody) {
+                            retVal = md->exprBody.get();
+                        } else {
+                            const ast::ReturnStmt* ret = nullptr;
+                            for (const auto& s : md->stmts) {
+                                if (auto* r =
+                                        dynamic_cast<const ast::ReturnStmt*>(s.get()))
+                                    ret = r;
+                            }
+                            if (ret) retVal = ret->value.get();
+                        }
+                        if (retVal) {
+                            innerMints = !isPlusOneClosureProducer(retVal) &&
+                                         !isUserMethodClosureReturnCall(retVal) &&
+                                         !returnedClosureLocalOwnsPlusOne(retVal);
+                        }
+                    }
+                }
+                emitClosureRelease(closurePtr);
+                if (innerMints)
+                    emitClosureRelease(closurePtr);
+            }
+            return ccRes;
         }
     }
     // #608 / §8.5: `e.ToString()` on ANY user-class or built-in exception
