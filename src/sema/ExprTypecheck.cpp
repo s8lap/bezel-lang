@@ -13129,6 +13129,49 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
     } else if (auto* lc =
                    dynamic_cast<const ast::LocalConstDecl*>(&s)) {
         if (lc->value) visitExpr(*lc->value);
+        // fix #3700 (§21.1 / §6.3 / §28.3, v0.287): a runtime const of a
+        // sub-int nullable width (e.g. `const cb: byte? := 3`) used to store
+        // the payload as `i32 3` into the `{i8 hasValue; i8 value}` slot —
+        // 32 bits over a 16-bit slot, so the second byte of `3` (0x00)
+        // landed in the PAYLOAD slot and the discriminator read 3 (truthy).
+        // Result: `cb!` extracted 0, `cb == 3` was false, `cb ?? 9` was 0.
+        // The var twin (`var cb: byte? := 3`) was correct because its
+        // LocalDecl handler calls checkAssignable (line 13035 above), which
+        // re-types the unsuffixed `int` literal to the target's payload
+        // width via narrowIntConstantToTarget (§5.1 "Constant narrowing"),
+        // so lowerExpr emits `i8 3` and the codegen wrap path produces
+        // `{i8 1, i8 3}`. Mirror that call here for the explicit-type arm
+        // (the inferred-type arm below has no source type to retype) — it
+        // is a no-op for any initializer that is not a compile-time integer
+        // constant in range (narrowIntConstantToTarget itself short-
+        // circuits when the fold fails or the value does not fit), so it
+        // changes nothing else. The narrowing stays compile-time because
+        // checkAssignable is invoked BEFORE the §21.1 classification block
+        // below reads `lcInferredTy`, so the compile-time/fold path sees
+        // the retyped constant exactly as the var path does.
+        if (lc->type && lc->value) {
+            // §21.1 v0.201 (#2049): a `null`-literal initializer is a §21.1
+            // carve-out for runtime const locals — the binding is then
+            // "permanently null" and the §7 strict nullability check
+            // (applied inside `checkAssignable` for the var twin) does NOT
+            // fire for the const path. Without this skip, a `const X: T :=
+            // null;` for a non-nullable class type T would be wrongly
+            // rejected with the §7 "initializer is nullable but the target
+            // type is non-nullable" diagnostic, even though it is the
+            // canonical example from the §21.1 v0.201 spec text. The bare-
+            // null / no-annotation case is still rejected by the parallel
+            // §7.1 / §21.1 check a few lines below (constant-fold-time).
+            if (!dynamic_cast<const ast::NullLiteralExpr*>(lc->value.get())) {
+                if (auto* rt = ctx_.resolvedType(*lc->type)) {
+                    checkAssignable(
+                        ctx_.exprType(*lc->value),
+                        rt, lc->value->span.begin,
+                        std::string("initializer for `") +
+                            std::string(lc->name) + "`",
+                        lc->value.get());
+                }
+            }
+        }
         // §21.1 v0.201 (#2049): classification split for a local `const`.
         // Compile-time-constant classification requires BOTH (a) the
         // initializer be a §17.14 constant expression AND (b) the declared
