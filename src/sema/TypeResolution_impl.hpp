@@ -464,6 +464,19 @@ private:
     // instantiation site). Modelled on checkHashContainerKeys's two-pass
     // shape immediately above.
     void checkElementCategoryInstantiations();
+    // §14.4 (#3794): every recorded OwningBuffer<T>/Span<T>/ReadOnlySpan<T>
+    // element slot (see owningBufferSpanMoveOnlySites_) must not be a move-only
+    // value type. The §14.4 OwningBuffer/Span/ReadOnlySpan exception admits
+    // value-typed T in general (unlike a plain §28.11 collection), but still
+    // rejects the §15.3 move-only kinds — owning inline arrays and owning-
+    // classified choices (§35.4). Modelled two-pass on
+    // checkElementCategoryInstantiations / checkHashContainerKeys: a choice's
+    // classification needs its case payloads resolved, which may postdate this
+    // site, and bare generic parameters of the enclosing type are re-checked
+    // against each instantiation of the enclosing type. Filed separately
+    // (#3794) rather than folded into #3775 because the diagnostic cites §14.4
+    // rather than §28.11 — different rule, different message.
+    void checkOwningBufferSpanMoveOnlyInstantiations();
     // stdlib §4.2 / spec §14.4 (#1327/#1463/#2713): the single authoritative
     // predicate for "may this type be an owning collection's element?".  Returns
     // an empty string when `el` is admissible (a class or interface type, or an
@@ -1165,6 +1178,25 @@ private:
         TypeSymbol* enclosingType = nullptr;  // for the bare-param Pass 2 recheck
     };
     std::vector<MoveOnlyElementSite> moveOnlyElementSites_;
+
+    // stdlib §4.14 / spec §14.4 (#3794): one OwningBuffer<T>/Span<T>/
+    // ReadOnlySpan<T> element slot whose T is a bare generic parameter of the
+    // ENCLOSING type, e.g. `field: OwningBuffer<T>` inside `class H<T>`. The
+    // declaration-site check cannot decide such a site (no concrete T is
+    // known), so it is recorded here and re-checked per instantiation of the
+    // enclosing type by checkOwningBufferSpanMoveOnlyInstantiations(). Modelled
+    // on MoveOnlyElementSite above — same shape, separate collection because
+    // the diagnostic cites §14.4 not §28.11 (different rule, different
+    // message). A concrete move-only T is rejected INLINE at the annotation
+    // site (TypeResolution_Names.cpp) and is NOT recorded here — the predicate
+    // answers true for it immediately, with no second-pass deferral needed.
+    struct OwningBufferSpanMoveOnlySite {
+        std::string_view container;       // "OwningBuffer" / "Span" / "ReadOnlySpan"
+        std::string paramName;            // bare generic parameter name (e.g. "T")
+        const ast::Type* site = nullptr;  // the `OwningBuffer<T>` annotation node
+        TypeSymbol* enclosingType = nullptr;  // the generic body it sits in
+    };
+    std::vector<OwningBufferSpanMoveOnlySite> owningBufferSpanMoveOnlySites_;
 
     // stdlib §4.2 / spec §14.4 / §3.6 rule 2 (#2713): one owning-collection
     // instantiation whose owned element slot is a bare generic parameter of the

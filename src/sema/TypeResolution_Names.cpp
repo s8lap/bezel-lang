@@ -1,6 +1,7 @@
 #include "sema/TypeResolution_impl.hpp"
 
 #include "common/BuiltinRegistry.hpp"  // isBuiltinExceptionName — §31.4 (#2950)
+#include "common/OwnershipFacts.hpp"   // isMoveOnlyValueType — §14.4 / §15.3 (#3794)
 #include "sema/ConstFold.hpp"
 #include "sema/ExprTypecheck_impl.hpp"  // isValidRangeElementType / rangeElementTypeName — fix #3247 / §16.3
 
@@ -1871,6 +1872,97 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                         moveOnlyElementSites_.push_back(
                             {first, slot.second, ref.genericArgs[slot.first],
                              &t, currentOuterType_});
+                    }
+                }
+                // §14.4 / §15.3 (#3794): OwningBuffer<T>/Span<T>/ReadOnlySpan<T>
+                // are an EXCEPTION to §28.11's element-slot-policy table — they
+                // admit T to be value-typed in general — but the §14.4 exception
+                // itself STILL rejects the §15.3 move-only value type kinds
+                // (owning inline arrays `[N owned]T` / `[N owned]T?`, and
+                // owning-classified choices, §35.4). #3775 deliberately deferred
+                // these three to a separate fix because their admission rule
+                // differs (value-typed T is otherwise legal) and the diagnostic
+                // cites §14.4 not §28.11. The check is INLINE here for the
+                // concrete-bound case (Pass 1 of the two-pass shape, exactly
+                // like checkElementCategoryInstantiations's Pass 1 — the
+                // predicate answers false for a bare generic parameter without
+                // recording it, so Pass 2 only needs to walk bare-param sites).
+                //
+                // A bare generic parameter of the ENCLOSING type (e.g.
+                // `field: OwningBuffer<T>` inside `class H<T>`) is recorded for
+                // Pass 2 re-check, with the same shadowing guard as the
+                // OwningElementSite recorder above: a generic METHOD may declare
+                // a parameter of the same name (`class H<T> { method M<T>() }`),
+                // and that name inside the method body denotes the METHOD's
+                // parameter whose bindings `instantiations_` knows nothing
+                // about. Recording it as the enclosing type's would falsely
+                // reject a legal program — the OwningElementSite recorder has
+                // the same guard; reusing its shape keeps the two sites
+                // consistent.
+                if (first == "OwningBuffer" || first == "Span" ||
+                    first == "ReadOnlySpan") {
+                    if (!ref.genericArgs.empty()) {
+                        TypeRef* el = ref.genericArgs[0];
+                        const char* moveOnlyKind = nullptr;
+                        if (common::isMoveOnlyValueType(el, ctx_,
+                                                        moveOnlyKind)) {
+                            // Concrete move-only T → reject inline. fix #3796
+                            // (§3.6 rule 2 / §14.4): prefer the offending TYPE-
+                            // ARGUMENT's source location (`el->astNode`) over
+                            // the enclosing annotation site's, matching the
+                            // checkHashContainerKeys / checkElementCategory-
+                            // Instantiations pattern. Falls back to `t.span`
+                            // if the elRef has no AST node.
+                            SourceLocation diagLoc;
+                            if (el && el->astNode &&
+                                el->astNode->span.begin.line != 0)
+                                diagLoc = el->astNode->span.begin;
+                            else
+                                diagLoc = t.span.begin;
+                            ctx_.diagnostics().report(
+                                Severity::Error, diagLoc,
+                                std::string("`") + std::string(first) +
+                                "` cannot use " +
+                                std::string(moveOnlyKind) +
+                                " as its T type argument "
+                                "(\xC2\xA7""14.4 / \xC2\xA7""15.3) \xE2\x80\x94 "
+                                "the OwningBuffer/Span/ReadOnlySpan exception "
+                                "still rejects move-only value types, both "
+                                "kinds of \xC2\xA7""15.3: the owning inline "
+                                "arrays and the owning-classified choices "
+                                "(\xC2\xA7""35.4)");
+                        } else if (el && !el->declaration &&
+                                   el->kind == TypeRef::Kind::Named &&
+                                   el->astNode && el->astNode->name &&
+                                   el->astNode->name->parts.size() == 1 &&
+                                   currentOuterType_) {
+                            // Bare generic parameter of the enclosing type →
+                            // record for Pass 2 recheck.
+                            // Same method-shadowing guard as the
+                            // OwningElementSite recorder immediately above: a
+                            // generic method may declare a parameter of the
+                            // same name, and that name inside the method body
+                            // denotes the METHOD's parameter whose bindings
+                            // `instantiations_` knows nothing about.
+                            bool boundByMethod = false;
+                            if (currentMethodGenericParams_) {
+                                for (const ast::GenericParam& gp :
+                                     *currentMethodGenericParams_) {
+                                    if (gp.name ==
+                                        el->astNode->name->parts.front()) {
+                                        boundByMethod = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            if (!boundByMethod) {
+                                owningBufferSpanMoveOnlySites_.push_back(
+                                    {first,
+                                     std::string(
+                                         el->astNode->name->parts.front()),
+                                     &t, currentOuterType_});
+                            }
+                        }
                     }
                 }
                 // §16.5 / issue #922: Range<T> is a compiler-intrinsic record.

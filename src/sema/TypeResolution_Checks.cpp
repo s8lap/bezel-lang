@@ -2748,6 +2748,95 @@ void Resolver::checkElementCategoryInstantiations() {
     }
 }
 
+// stdlib §4.14 / spec §14.4 (#3794) — OwningBuffer<T>/Span<T>/ReadOnlySpan<T>
+// reject move-only value types T (the §15.3 move-only kinds, owning inline
+// arrays and owning-classified choices) per the §14.4 OwningBuffer/Span/
+// ReadOnlySpan exception's own clause. Filed separately from #3775 (which
+// covers the §28.11 element-slot-policy table's move-only row) because the
+// admission rule differs — these three admit value-typed T in general — and
+// the diagnostic cites §14.4 rather than §28.11.
+//
+// Spec §14.4 (v0.286): "`OwningBuffer<T>`, `Span<T>`, and `ReadOnlySpan<T>`
+// (stdlib §4.14) are exceptions to this restriction. They admit T to be
+// either class-typed (with ownership semantics as above) or value-typed
+// (with plain value semantics — no per-slot ownership, no Dispose cascade,
+// no `move` admission). They still reject the runtime-managed reference
+// types (`string`, function values) and **move-only value types** — both
+// kinds of §15.3: the owning inline arrays `[N owned]T` and `[N owned]T?`,
+// and the owning-classified choice (§35.4)."
+//
+// Pass 1 — the concrete-bound case — is INLINE at the annotation site
+// (TypeResolution_Names.cpp), so this function is just Pass 2: re-walk the
+// bare-generic-parameter sites recorded in owningBufferSpanMoveOnlySites_
+// against every concrete instantiation of the enclosing type, exactly like
+// checkOwningElementInstantiations's #2713 shape and
+// checkElementCategoryInstantiations's Pass 2 above. The `instantiations_`
+// table is the same one those two walks use — every type instantiation the
+// resolver has seen — so an H<Wrap> instantiation of a class H<T> holding
+// `field: OwningBuffer<T>` lands here exactly once and gets one diagnostic
+// at the type argument (fix #3796, §3.6 rule 2).
+void Resolver::checkOwningBufferSpanMoveOnlyInstantiations() {
+    std::unordered_set<const ast::Type*> reported;
+    for (const OwningBufferSpanMoveOnlySite& s :
+         owningBufferSpanMoveOnlySites_) {
+        if (!s.enclosingType) continue;
+        // Index of the bare generic parameter within the enclosing type's
+        // list. The recorder has already filtered the method-shadow case but
+        // re-derive the index here defensively in case the param list has
+        // since grown or the bound name no longer resolves.
+        std::size_t paramIdx = s.enclosingType->genericParams.size();
+        for (std::size_t i = 0; i < s.enclosingType->genericParams.size(); ++i) {
+            if (s.enclosingType->genericParams[i] &&
+                s.enclosingType->genericParams[i]->name == s.paramName) {
+                paramIdx = i;
+                break;
+            }
+        }
+        // Not a type parameter of the enclosing TYPE — silently drop. Same
+        // tolerance as checkOwningElementInstantiations: a false reject here
+        // is strictly worse than carrying the gap (#2736-class residue).
+        if (paramIdx >= s.enclosingType->genericParams.size()) continue;
+        for (const GenericInstantiation& inst : instantiations_) {
+            if (inst.type != s.enclosingType) continue;
+            if (paramIdx >= inst.argRefs.size()) continue;
+            TypeRef* concrete = inst.argRefs[paramIdx];
+            if (!concrete || concrete->kind == TypeRef::Kind::Error) continue;
+            const char* moveOnlyKind = nullptr;
+            if (!common::isMoveOnlyValueType(concrete, ctx_, moveOnlyKind))
+                continue;
+            if (s.site && !reported.insert(s.site).second) continue;
+            const TypeSymbol* rec = concrete->declaration;
+            std::string argName =
+                rec ? ("`" + std::string(rec->name) + "`") : std::string("it");
+            // fix #3796 (§3.6 rule 2 / §14.4): prefer the offending concrete
+            // type-argument's source location over the interior annotation
+            // site, like the hash-container and §28.11 Pass 2 above. The
+            // §3.6 rule-2 per-instantiation discipline puts the diagnostic at
+            // the instantiation site — for `H<Wrap>` with
+            // `field: OwningBuffer<T>` that's the `Wrap` argument's location.
+            SourceLocation diagLoc;
+            const ast::Type* argAst = (paramIdx < inst.argAsts.size())
+                                          ? inst.argAsts[paramIdx]
+                                          : nullptr;
+            if (argAst && argAst->span.begin.line != 0)
+                diagLoc = argAst->span.begin;
+            else if (s.site)
+                diagLoc = s.site->span.begin;
+            ctx_.diagnostics().report(
+                Severity::Error, diagLoc,
+                std::string("`") + std::string(s.container) +
+                "` cannot use " + argName +
+                " as its T type argument "
+                "(\xC2\xA7""14.4 / \xC2\xA7""15.3) \xE2\x80\x94 "
+                "the OwningBuffer/Span/ReadOnlySpan exception still rejects "
+                "move-only value types, both kinds of \xC2\xA7""15.3: the "
+                "owning inline arrays and the owning-classified choices "
+                "(\xC2\xA7""35.4). It is " +
+                std::string(moveOnlyKind) + ".");
+        }
+    }
+}
+
 // stdlib §4.2 / spec §14.4 (#1327/#1463/#2713) — THE predicate deciding whether
 // a type may be an owning collection's owned element. Shared verbatim by the
 // declaration-site check in resolveType() (TypeResolution_Names.cpp) and by the

@@ -331,6 +331,15 @@ void Resolver::run(const ast::SourceFile& src) {
     // the same reason: every instantiation site has been recorded by now,
     // and a choice's classification needs every member type resolved.
     checkElementCategoryInstantiations();
+    // §14.4 / §15.3 (#3794): OwningBuffer<T>/Span<T>/ReadOnlySpan<T> reject
+    // the §15.3 move-only kinds (owning inline arrays, owning-classified
+    // choices) per the §14.4 exception's own clause. Pass 1 (concrete slot)
+    // runs inline at the annotation site in TypeResolution_Names.cpp; Pass 2
+    // here re-walks bare generic parameters of the enclosing type against
+    // each instantiation — same dependencies as checkElementCategory-
+    // Instantiations above (every instantiation site must be recorded by
+    // now, and a choice's classification needs every member type resolved).
+    checkOwningBufferSpanMoveOnlyInstantiations();
     // §17.4 / §3.6 rule 2 (#2911, #2962): `x as T` over a TYPE-level parameter
     // is re-checked against the type each instantiation of the enclosing
     // generic binds (runs here for the same reason: every instantiation site
