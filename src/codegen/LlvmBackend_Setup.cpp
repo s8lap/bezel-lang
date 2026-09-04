@@ -14491,7 +14491,7 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
                         freeDictSourceNow(srcSet, /*valDisposer=*/nullptr);
                 }
             } else if (initTR && isDictTypeName(initTR) &&
-                       dictEntryWrapShapeSupported(declTR)) {
+                       dictEntryWrapShapeSupported(declTR, initTR)) {
                 // fix #3519 (§29.2 / §28.9 / §28.3, v0.283; stdlib §4.8 /
                 // §4.17): the local-decl face of the SAME missing arm this
                 // commit adds to `wrapAsIEnumerableForTarget`. `var e:

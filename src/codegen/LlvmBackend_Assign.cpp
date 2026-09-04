@@ -11094,7 +11094,8 @@ bool Emitter::dictEntryWrapShapeSupported(const sema::TypeRef* iEnumTy,
     // #3767 rather than lifted speculatively.
     if (valTy->kind == K::Primitive) return true;
     const ast::TypeDeclKind* vk = namedDeclKind(valTy);
-    return vk && *vk == ast::TypeDeclKind::Enum;
+    return vk && (*vk == ast::TypeDeclKind::Enum ||
+                  *vk == ast::TypeDeclKind::Choice);
 }
 
 llvm::Value* Emitter::wrapDictionaryAsIEnumerable(
