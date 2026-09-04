@@ -5597,6 +5597,10 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                 bool innerMints = false;
                 if (auto* ms = dynamic_cast<sema::MethodSymbol*>(
                         ctx_.exprSymbol(*calleeCall->callee))) {
+                    // SEAM-DEBT: #3704 — class-3 read on ms->decl for the chain-call mint gate;
+                    // safe because the inner method is reached only via local CallExpr callee
+                    // (the outer `f()` in `f()()`); an imported callee would not produce a
+                    // CallExpr here at all (the chain-call shape is local-only).
                     if (auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl)) {
                         const ast::Expr* retVal = nullptr;
                         if (md->bodyKind == ast::MethodBodyKind::Expression &&
