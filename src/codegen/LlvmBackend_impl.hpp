@@ -12883,12 +12883,25 @@ private:
     // V is excluded because its lowered `{i8, T}` wrapper changes the GEP
     // shape and is a separate, pre-existing gap (the same Nullable-rectypass
     // gap #2405/#2425 documented for those walkers).
-    llvm::Function* boxedRecordValueFreer(const sema::TypeRef* valTy);
-    llvm::Function* boxedChoiceValueFreer(const sema::TypeRef* valTy);
+    //
+    // fix #3802 (stdlib §4.8 / §28.9, v0.287): the same freers are widened to
+    // nullable V via a second `bool nullable` parameter (default false). The
+    // nullable variant GEPs element 1 of the `{i8, T}` wrapper before handing
+    // the address to the walker; the non-nullable variant is byte-identical
+    // to #3798. Separate caches per nullable-ness because the wrapper GEP
+    // shape and the bare-T base differ, and the same module can carry both.
+    llvm::Function* boxedRecordValueFreer(const sema::TypeRef* valTy,
+                                           bool nullable = false);
+    llvm::Function* boxedChoiceValueFreer(const sema::TypeRef* valTy,
+                                          bool nullable = false);
     std::unordered_map<const sema::TypeRef*, llvm::Function*>
         boxedRecordValueFreers_;
     std::unordered_map<const sema::TypeRef*, llvm::Function*>
         boxedChoiceValueFreers_;
+    std::unordered_map<const sema::TypeRef*, llvm::Function*>
+        boxedNullableRecordValueFreers_;
+    std::unordered_map<const sema::TypeRef*, llvm::Function*>
+        boxedNullableChoiceValueFreers_;
     // fix #2660: if `declNode` is a proven literal-tree aggregate root of type
     // `collTy`, return the interior-node disposer to install on the root's
     // Disposal; null otherwise. Single entry point for the three registration

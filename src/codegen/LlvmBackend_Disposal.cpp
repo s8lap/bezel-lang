@@ -4628,15 +4628,34 @@ llvm::Function* Emitter::dictValueBoxFreer(const sema::TypeRef* dictTy) {
     // locals, #1747/#2425) and then `free(box)`s the storage. Non-recursive
     // V (record with only int fields, choice with only int payloads,
     // value-like primitive) keeps the plain thunk — UNCHANGED.
-    if (valTy && !valTy->nullable &&
+    //
+    // fix #3802 (stdlib §4.8 / §28.9, v0.287): the same shape extends to
+    // nullable V (`record?` / `choice?`). The boxed value lowers to a
+    // `{i8 hasValue, T}` literal struct (nullableValueStructTy, §7.2/#416),
+    // and the box is the malloc'd storage of that wrapper — T's struct bytes
+    // are INSIDE the wrapper, but T's nested `string` allocations are
+    // separate heap objects whose +1 refcounts the wrapper holds. Without
+    // walking the wrapper's T payload before `free(box)`, every Remove /
+    // Clear / scope-end Dispose leaks each entry's nested string. Specialize
+    // the same way: GEP element 1 of the wrapper to reach T's struct base,
+    // then reuse emitRecordStringFieldReleases_impl /
+    // emitChoiceStringFieldReleases_impl unchanged (the walkers still get a
+    // bare-T address), then `free(box)`s the wrapper storage. Nullable V is
+    // cached SEPARATELY (boxedNullable*ValueFreers_) because the wrapper's
+    // GEP shape differs from the non-nullable V's bare-struct base, and a
+    // single `Dictionary<int, T>` vs `Dictionary<int, T?>` may both appear in
+    // one module — one box is the bare T, the other is `{i8, T}`. A nullable
+    // V without string fields still keeps the plain valueBoxFreeThunk —
+    // UNCHANGED for that V.
+    if (valTy &&
         valTy->kind == sema::TypeRef::Kind::Named && valTy->declaration) {
         if (valTy->declaration->kind == ast::TypeDeclKind::Record &&
             recordHasStringFields(valTy->declaration)) {
-            return boxedRecordValueFreer(valTy);
+            return boxedRecordValueFreer(valTy, valTy->nullable);
         }
         if (valTy->declaration->kind == ast::TypeDeclKind::Choice &&
             choiceHasStringFields(valTy->declaration)) {
-            return boxedChoiceValueFreer(valTy);
+            return boxedChoiceValueFreer(valTy, valTy->nullable);
         }
     }
     return valueBoxFreeThunk();
@@ -4654,20 +4673,35 @@ llvm::Function* Emitter::dictValueBoxFreer(const sema::TypeRef* dictTy) {
 // address it expects (recAddr) IS the box's struct base. Cached per-V so a
 // module's N Dictionary<…, V> instances all share one V-specialized thunk.
 //
+// fix #3802 (stdlib §4.8 / §28.9, v0.287): widens the same specialization to
+// nullable V (`record?`). A nullable V lowers to `{i8 hasValue, T}` and the
+// box is the malloc'd storage of that wrapper — T's bytes are at element 1
+// of the wrapper, not at the box base. We GEP element 1 to recover T's
+// struct base, hand that to emitRecordStringFieldReleases_impl unchanged,
+// and `free(box)`s the wrapper storage. The nullable variant is cached
+// separately (boxedNullableRecordValueFreers_) because the wrapper's GEP
+// shape differs from a bare-T base; the same module may contain both a
+// `Dictionary<int, V>` and a `Dictionary<int, V?>` and must not share one
+// thunk (the bare-T one would GEP through a non-wrapper struct type).
+//
 // Built with its own IRBuilder so the active builder_'s insert point is
 // untouched (mirrors valueBoxFreeThunk / boxElementDisposerThunk /
 // sharedReleaseThunk on this point). emitRecordStringFieldReleases_impl uses
 // the active builder_/currentFn_, so we save both, point them at the thunk,
 // emit the field-release IR + the free, and restore.
-llvm::Function* Emitter::boxedRecordValueFreer(const sema::TypeRef* valTy) {
+llvm::Function* Emitter::boxedRecordValueFreer(const sema::TypeRef* valTy,
+                                               bool nullable) {
     if (!valTy || !valTy->declaration) return nullptr;
-    auto cached = boxedRecordValueFreers_.find(valTy);
-    if (cached != boxedRecordValueFreers_.end()) return cached->second;
+    auto& cache = nullable ? boxedNullableRecordValueFreers_
+                           : boxedRecordValueFreers_;
+    auto cached = cache.find(valTy);
+    if (cached != cache.end()) return cached->second;
     auto* fnTy = llvm::FunctionType::get(llvm::Type::getVoidTy(llvm_),
                                          {ptrTy()}, /*isVarArg=*/false);
     auto* fn = llvm::Function::Create(
         fnTy, llvm::Function::InternalLinkage,
-        ("bz$recValBoxFree$" +
+        (std::string("bz$recValBoxFree$") +
+         (nullable ? "N" : "") +
          std::string(valTy->declaration->name.empty() ? "V"
                                                       : valTy->declaration->name))
             .c_str(),
@@ -4692,7 +4726,16 @@ llvm::Function* Emitter::boxedRecordValueFreer(const sema::TypeRef* valTy) {
                            : decltype(savedBB->begin()){};
     currentFn_ = fn;
     builder_.SetInsertPoint(doBB);
-    emitRecordStringFieldReleases_impl(box, valTy->declaration);
+    // fix #3802: for nullable V the box base is `{i8, T}`, so T's struct
+    // base is at element 1 of the wrapper. The walker expects a bare-T
+    // address, so GEP it before walking. For non-nullable V the box base
+    // IS T's struct base, identical to the #3798 path.
+    llvm::Value* recAddr = box;
+    if (nullable) {
+        llvm::StructType* wrapTy = nullableValueStructTy(valTy);
+        recAddr = builder_.CreateStructGEP(wrapTy, box, 1, "nrec.box.payload");
+    }
+    emitRecordStringFieldReleases_impl(recAddr, valTy->declaration);
     // The walker emits non-terminator instructions only — doBB is the BB it
     // emitted into and is currently unterminated. Append the free + branch
     // to retBB on the local IRBuilder (NOT builder_, which we are about to
@@ -4716,7 +4759,7 @@ llvm::Function* Emitter::boxedRecordValueFreer(const sema::TypeRef* valTy) {
     b.CreateRetVoid();
     currentFn_ = savedFn;
     if (savedBB) builder_.SetInsertPoint(savedBB, savedIP);
-    boxedRecordValueFreers_[valTy] = fn;
+    cache[valTy] = fn;
     return fn;
 }
 
@@ -4726,15 +4769,24 @@ llvm::Function* Emitter::boxedRecordValueFreer(const sema::TypeRef* valTy) {
 // string payload(s), reusing emitChoiceStringFieldReleases_impl (#2425).
 // Same builder_/currentFn_ save/restore as the record variant; same null
 // guard; same post-walk `free(box)`.
-llvm::Function* Emitter::boxedChoiceValueFreer(const sema::TypeRef* valTy) {
+//
+// fix #3802 (stdlib §4.8 / §28.9, v0.287): same nullable-V widening as the
+// record variant — GEP element 1 of the `{i8, T}` wrapper to reach T's
+// struct base before handing it to emitChoiceStringFieldReleases_impl,
+// then `free(box)`s the wrapper storage. Separate cache.
+llvm::Function* Emitter::boxedChoiceValueFreer(const sema::TypeRef* valTy,
+                                               bool nullable) {
     if (!valTy || !valTy->declaration) return nullptr;
-    auto cached = boxedChoiceValueFreers_.find(valTy);
-    if (cached != boxedChoiceValueFreers_.end()) return cached->second;
+    auto& cache = nullable ? boxedNullableChoiceValueFreers_
+                           : boxedChoiceValueFreers_;
+    auto cached = cache.find(valTy);
+    if (cached != cache.end()) return cached->second;
     auto* fnTy = llvm::FunctionType::get(llvm::Type::getVoidTy(llvm_),
                                          {ptrTy()}, /*isVarArg=*/false);
     auto* fn = llvm::Function::Create(
         fnTy, llvm::Function::InternalLinkage,
-        ("bz$chValBoxFree$" +
+        (std::string("bz$chValBoxFree$") +
+         (nullable ? "N" : "") +
          std::string(valTy->declaration->name.empty() ? "V"
                                                       : valTy->declaration->name))
             .c_str(),
@@ -4755,7 +4807,14 @@ llvm::Function* Emitter::boxedChoiceValueFreer(const sema::TypeRef* valTy) {
                            : decltype(savedBB->begin()){};
     currentFn_ = fn;
     builder_.SetInsertPoint(doBB);
-    emitChoiceStringFieldReleases_impl(box, valTy->declaration);
+    // fix #3802: for nullable V the box base is `{i8, T}`, so the choice's
+    // struct base is at element 1 of the wrapper. GEP it before walking.
+    llvm::Value* chAddr = box;
+    if (nullable) {
+        llvm::StructType* wrapTy = nullableValueStructTy(valTy);
+        chAddr = builder_.CreateStructGEP(wrapTy, box, 1, "nch.box.payload");
+    }
+    emitChoiceStringFieldReleases_impl(chAddr, valTy->declaration);
     // Choice walker terminates its join BB itself (CreateBr to its own
     // joinBB), so doBB here is terminated when the walker had any case to
     // release. The unterminated path is the case where the walker emitted
@@ -4776,7 +4835,7 @@ llvm::Function* Emitter::boxedChoiceValueFreer(const sema::TypeRef* valTy) {
     b.CreateRetVoid();
     currentFn_ = savedFn;
     if (savedBB) builder_.SetInsertPoint(savedBB, savedIP);
-    boxedChoiceValueFreers_[valTy] = fn;
+    cache[valTy] = fn;
     return fn;
 }
 
