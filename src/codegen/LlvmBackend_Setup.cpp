@@ -9241,6 +9241,21 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
     // invariant must hold at every clear site, not only the ones a repro
     // happens to reach today.
     closureLocalCandidates_.clear();
+    // fix #2714 (§27.5 / §28.9, v0.286): the parallel borrow-side sets
+    // `closureBorrowAll_` and `closureBorrowRetainEligible_` must clear HERE
+    // too, alongside `closureReleaseEligible_` and `closureLocalCandidates_`.
+    // An EXPRESSION-bodied method never reaches the collectClosureReleaseEligible
+    // call below (same gate — `ci.bodyKind == Block && ci.stmts`), so the
+    // borrow-side sets would carry over the PREVIOUS body's entries while the
+    // new arrow-bodied method's own closureReleaseEligibleFn_ is pinned — the
+    // same two-halves clear()+populate contract the sibling sets above
+    // already hold. No reachable exploit found for this specific venue (an
+    // arrow-bodied method's own `armClosureLocalRefcount` consults them only
+    // when its `closureReleaseEligibleFn_` token matches, and the new token
+    // is just about to be pinned two lines down), but the invariant must hold
+    // at every clear site, not only the ones a repro happens to reach today.
+    closureBorrowAll_.clear();
+    closureBorrowRetainEligible_.clear();
     closureReleaseEligibleFn_ = fn;
     // #422 / §8.6 / §28.9: which `var` Object/interface locals holding a boxed
     // VALUE may be released at scope end (mirrors stringReleaseEligible_).
@@ -15245,6 +15260,20 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
         // next lowerLocalDecl in this scope does not reprocess stale cells.
         lastLambdaCapturedCells_.clear();
     }
+    // fix #2714 (§27.5 / §28.9, v0.286): the producer-side fix for closure-
+    // value calls — `var got := pick();` where `pick` is a lambda-typed local
+    // is now admitted to `closureReleaseEligible_` (via
+    // `isLambdaClosureReturnCall`), and the existing producer arm above has
+    // armed its scope-end release. The borrow-side fields
+    // (`closureBorrowAll_` / `closureBorrowRetainEligible_`) and helper
+    // (`armClosureLocalRefcount`) are kept in place for future
+    // borrow-initialized shapes (a closure-typed local whose init is neither
+    // a producer nor a recognized return call, e.g. a field-then-call or a
+    // complex expression), but are intentionally NOT invoked here: a
+    // producer-bound local entering `closureBorrowAll_` would over-retain
+    // (the producer's +1 is already in the slot, the +1 retain would leave
+    // the cell at RC=2 and the scope-end release at RC=1 — a leak). The
+    // producer-side path alone drains the #2714 measured leaks.
     // #422 / #2960 / §8.6 / §28.9: register managed box state for a
     // non-escaping Object/interface local that starts with, or later receives,
     // a known fresh box. The state bit describes the slot's CURRENT contents:
@@ -21612,6 +21641,65 @@ void Emitter::armStringLocalRefcount(const void* declNode,
 }
 
 
+// fix #2714 (§27.5 / §28.9, v0.286): the closure twin of `armStringLocalRefcount`
+// — bind-time retain + scope-end release registrar for a `var` closure
+// (function-typed) local whose initializer is NOT a +1 closure producer (i.e.,
+// the BORROW side). Mirrors `armStringLocalRefcount` line-for-line:
+//   * BORROW closure local (escaping or not): retain so the slot owns an
+//     independent +1. (A null initializer — the #2434 degraded slot — is left
+//     alone; the retain is null-safe via emitClosureRetain.)
+//   * Release at scope end iff the local was proven NON-escaping via the
+//     `closureBorrowRetainEligible_` subset. An escaping local is in
+//     `closureBorrowAll_` but NOT `closureBorrowRetainEligible_`, so its +1
+//     (the just-emitted retain) simply leaks — safe.
+//
+// The producer side (`closureReleaseEligible_`) is already handled by the
+// dedicated block immediately above `armStringLocalRefcount` in `lowerLocalDecl`
+// (with its `consumeLastLambdaCapturedCells()` ordering with the captured-cell
+// dispose); this helper handles ONLY the borrow side. Both share the same
+// `closureReleaseEligibleFn_` token gate so a body the collector did not walk
+// stays inert — its locals just leak (never double-freed). A producer-bound
+// local is NOT in `closureBorrowAll_` and so is NOT retained here (its single
+// producer reference is transferred into the slot, the existing producer arm
+// releases it). Disjoint with the producer arm by construction.
+//
+// Reassign edge: a `var` may be overwritten by a later `:=`. That is the same
+// edge the producer side handles (and the string side before it) — the
+// existing `closureReleaseEligible_` arm in `lowerLocalDecl` does NOT arm a
+// reassign-time release either, so a reassigned borrow local's drop-on-overwrite
+// also relies on the slot's bind-time retain being the +1 reference the envdtor
+// sees. Leaving this gap closed-but-not-overwritten is consistent with the
+// sibling producer / string paths.
+void Emitter::armClosureLocalRefcount(const void* declNode,
+                                     llvm::AllocaInst* slot, llvm::Value* v) {
+    if (!v || !v->getType()->isPointerTy() || disposeStack_.empty()) return;
+    // Gated on the analyzed function: a body no pin names is not walked, so the
+    // eligibility sets are empty for its locals — they just leak (never
+    // double-freed). `collectClosureReleaseEligible` classified THIS function's
+    // `var` closure locals into the two sets (`closureBorrowAll_` for the
+    // borrow side, `closureReleaseEligible_` for the producer side); this helper
+    // only acts on members of the borrow-side set, so it never fires on a
+    // producer-bound closure local or a non-closure pointer local. Mirrors
+    // `armStringLocalRefcount`'s gating on `stringReleaseEligibleFn_` exactly.
+    if (currentFn_ != closureReleaseEligibleFn_) return;
+    // BORROW closure local: retain so the slot owns an independent +1. A
+    // producer-bound local is NOT in closureBorrowAll_ and so is NOT retained
+    // here (its single producer reference is transferred into the slot, and the
+    // dedicated producer arm in lowerLocalDecl releases it at scope end).
+    if (closureBorrowAll_.count(declNode))
+        emitClosureRetain(v);
+    // Release at scope end iff the local was proven NON-escaping via
+    // closureBorrowRetainEligible_. An escaping borrow local is in
+    // closureBorrowAll_ (it was just retained above) but NOT in
+    // closureBorrowRetainEligible_ — its +1 simply leaks, safe.
+    if (closureBorrowRetainEligible_.count(declNode)) {
+        Disposal d{slot, nullptr};
+        d.closureRelease = true;
+        disposeStack_.back().push_back(d);
+    }
+}
+
+
 // fix #2696 / §28.1 / §28.9 / §4.6 (v0.240): a non-nullable `string` PARAMETER
 // that this body ASSIGNS TO is retained at bind, so its slot owns an
 // INDEPENDENT +1 — exactly the treatment armStringLocalRefcount (above) gives a
@@ -23933,6 +24021,104 @@ bool Emitter::isUserMethodClosureReturnCall(const ast::Expr* init) const {
 }
 
 
+// fix #2714 (§27.5 / §28.9, v0.286): the LAMBDA sibling of
+// `isUserMethodClosureReturnCall`. Recognize a CallExpr whose callee is a
+// LAMBDA-typed LOCAL or PARAMETER (not a method — that's the user-method case
+// above) whose declared type is a function type. Such a call invokes a lambda
+// whose body mints exactly +1 for the returned closure cell (post-#2691 the
+// BLOCK-bodied form matches the EXPRESSION-bodied form, both via `emitReturn`'s
+// `!isPlusOneClosureProducer(value) && !returnedClosureLocalOwnsPlusOne(value)`
+// gate, and a LambdaExpr IS a producer so the body's mint is skipped and the
+// producer's +1 is transferred directly), so the caller owns that single
+// reference and must release at scope end. THIS is the closure sibling of the
+// #429 / #712 string-RETURN category that `isUserMethodStringReturnCall` /
+// `isUserMethodClosureReturnCall` were widened to for methods; lambdas were
+// never widened because no predicate admitted a `CallExpr` callee at all.
+//
+//
+// The decline of "make every closure-value call a +1 producer at the call
+// site" in `isPlusOneClosureProducer`'s own comment ("the callee may hand
+// back a function value WITHOUT a fresh +1 ... so caller-side release of a
+// call result could free a value the callee still references (UAF)") is
+// specifically about CALLABLES whose body shape is unknown to the caller — a
+// method that returns a captured field without minting, for example. For a
+// LAMBDA callee (a LocalSymbol / ParameterSymbol holding a known +1 cell),
+// the body shape is statically a LambdaExpr with a function-typed return, so
+// the #2691 mint (or the producer's transfer) is guaranteed. This predicate
+// is therefore strictly narrower than the declined blanket "every closure
+// call", and only admits the shape #2714's three measured leaks take:
+//   * (1) `var got := pick();` where `pick` is a lambda-typed local
+//   * (3) `var add5 := adder(5);` where `adder` is a lambda-typed local
+//
+//
+// `isImported` does not apply (LocalSymbol / ParameterSymbol are by
+// definition local — an imported call's callee would resolve through the
+// module boundary and arrive as a different shape, not as a bare LocalSymbol).
+// A `using`-parameter borrow of a function type is a function-typed parameter
+// value, but its body's return mint is still governed by the same #2691 gate
+// at the lambda level, so admitting it here is sound. A `ref` / `out`
+// parameter cannot be a function type (function types are not stored through
+// aliases — the type system rejects the shape before codegen), so the
+// ParameterSymbol admission is not over-broad.
+//
+//
+// Parallel to `isUserMethodClosureReturnCall` line-for-line; the only
+// differences are the callee-symbol kind (LocalSymbol/ParameterSymbol vs
+// MethodSymbol) and the absence of an `isOperator` / `isImported` branch
+// (those concepts do not apply to a lambda binding).
+bool Emitter::isLambdaClosureReturnCall(const ast::Expr* init) const {
+    auto* call = dynamic_cast<const ast::CallExpr*>(init);
+    if (!call || !call->callee) return false;
+    // A bare reference to a lambda-typed LOCAL or PARAMETER — an
+    // IdentifierExpr naming a LocalSymbol or ParameterSymbol. A method-ref
+    // (MemberAccessExpr `T.M` / `obj.M`) is handled by
+    // isPlusOneClosureProducer's own MethodSymbol arm, not here. A call to a
+    // method (any MethodSymbol callee) is handled by
+    // isUserMethodClosureReturnCall above.
+    auto* id = dynamic_cast<const ast::IdentifierExpr*>(call->callee.get());
+    if (!id) return false;
+    sema::Symbol* sym = ctx_.exprSymbol(*id);
+    // LocalSymbol covers plain `var` / `const` locals; ParameterSymbol covers
+    // method parameters. Both are lambda-bindable names with function-typed
+    // declarations (or inferred types via `var g := lambda(...)`, which the
+    // caller passed in via `init`'s `exprType`).
+    bool isLambdaCallee =
+        dynamic_cast<sema::LocalSymbol*>(sym) != nullptr ||
+        dynamic_cast<sema::ParameterSymbol*>(sym) != nullptr;
+    if (!isLambdaCallee) return false;
+    // Soundness gate: the CALL RESULT must be a NON-NULLABLE function type.
+    // The callee is a function-typed local / parameter, so `rt` is the
+    // callee's own Function TypeRef; the CALL's result type is `rt->funcReturn`
+    // — the function's RETURNED type, not the function type itself. The body's
+    // return mint (post-#2691) fires only for function-typed declared returns,
+    // so admitting a callable whose result is a primitive (e.g.
+    // `var v := h()` where `h: () -> int` returns int) would mismatch the
+    // body's own mint and the caller's release — exactly the UAF the decline
+    // cited. The check reads the callee's type from the symbol's ascription
+    // (a bare `f()` where `f` is a parameter picks up its declared type
+    // through ctx_.resolvedType; mirrors the string side's
+    // `isUserMethodStringReturnCall`'s declared-return gate).
+    const sema::TypeRef* rt = nullptr;
+    if (auto* ls = dynamic_cast<sema::LocalSymbol*>(sym)) {
+        // LocalSymbol::declType is set from an explicit `: T` ascription OR
+        // inferred from the initializer's exprType — populated during
+        // TypeResolution / ExprTypecheck (Symbol.hpp, slice 3g). It is
+        // already a TypeRef* (no ctx_.resolvedType call needed), and it is
+        // the most reliable source because it covers the inferred case
+        // `var adder := lambda(...)` where LocalDecl::type is null.
+        if (ls->declType) rt = ls->declType;
+    } else if (auto* ps = dynamic_cast<sema::ParameterSymbol*>(sym)) {
+        if (ps->declType) rt = ctx_.resolvedType(*ps->declType);
+    }
+    if (rt && !rt->nullable && rt->kind == sema::TypeRef::Kind::Function &&
+        rt->funcReturn && !rt->funcReturn->nullable &&
+        rt->funcReturn->kind == sema::TypeRef::Kind::Function) {
+        return true;
+    }
+    return false;
+}
+
+
 // fix #3498 (§28.14 / §27.5 / §28.9, v0.283): see the declaration in
 // LlvmBackend_impl.hpp for the §28.14 argument and for why this is a strict
 // UNDER-approximation of lowerCall's `callBoundedClosureArgs` rather than a
@@ -24078,6 +24264,18 @@ bool Emitter::returnedClosureLocalOwnsPlusOne(const ast::Expr* e) const {
     // A non-escaping closure local also in closureReleaseEligible_ was
     // proven to own its single +1 (codegen registered its scope-end release).
     if (closureReleaseEligible_.count(declNode)) return true;
+    // fix #2714 (§27.5 / §28.9, v0.286): a non-escaping BORROW-initialized
+    // closure local in `closureBorrowRetainEligible_` was proven to own its
+    // single +1 too — codegen emitted a bind-time `bz_closure_retain` for it
+    // (the slot holds an independent reference, not the source's), and
+    // registered a scope-end `bz_closure_release` to balance it. Treating it
+    // as a +1 owner here makes the return-site mint (envdtor) skip its own
+    // retain, exactly as for the producer side — without this, returning a
+    // borrow-local-initialized closure would mint a SECOND reference and
+    // either leak (no one decremented it) or over-release the bind-time
+    // retain's twin (a UAF once the envdtor reads through the now-dangling
+    // cell). Mirrors the producer arm directly above.
+    if (closureBorrowRetainEligible_.count(declNode)) return true;
     return false;
 }
 
@@ -25019,6 +25217,16 @@ void Emitter::collectClosureReleaseEligible(
         const std::vector<std::unique_ptr<ast::Stmt>>& body) {
     closureReleaseEligible_.clear();
     closureLocalCandidates_.clear();  // fix #3757 follow-up
+    // fix #2714 (§27.5 / §28.9, v0.286): parallel borrow-side sets — see the
+    // helper declaration in LlvmBackend_impl.hpp. The `closureBorrowAll_`
+    // member holds EVERY borrow-initialized closure-typed `var` local (the
+    // string twin is `stringBorrowAll_`); the `closureBorrowRetainEligible_`
+    // member holds the non-escaping subset (the string twin is
+    // `stringBorrowRetainEligible_`). Both are populated HERE, before the
+    // producer-candidates walk, so any consumer that consults them (notably
+    // `returnedClosureLocalOwnsPlusOne`) sees the right state during the walk.
+    closureBorrowAll_.clear();
+    closureBorrowRetainEligible_.clear();
     // Find every `var` (non-using) closure LocalDecl whose initializer is a
     // +1 closure producer: either a codegen-internal producer (a lambda /
     // method reference — isPlusOneClosureProducer) or a call to a
@@ -25060,18 +25268,64 @@ void Emitter::collectClosureReleaseEligible(
     // `const ast::Node*` and the initializer read goes through the shared
     // `LocalDeclInitView` #2802 introduced for exactly this purpose, rather
     // than growing a second parallel predicate.
+    //
+    // fix #2714 (§27.5 / §28.9, v0.286): also find every `var` (non-using)
+    // closure LocalDecl whose initializer is a CLOSURE-TYPED BORROW — a local /
+    // parameter / field read, a closure-typed CALL that is not a +1 producer
+    // (the `pick()` in `var got := pick();` — `isPlusOneClosureProducer`
+    // deliberately excludes every `CallExpr`, and `isUserMethodClosureReturnCall`
+    // requires a `MethodSymbol` callee). Such a local is NOT a producer, so its
+    // slot owns NOTHING at bind — but the callee / read site MINTED a +1 that
+    // flows into the slot, so the slot DOES need an independent reference of its
+    // own (envdtor / field-disposal / overwrite can race). The `armClosureLocalRefcount`
+    // bind-time retain handles that; this walk admits the borrow-side
+    // candidates. The escape walk decides which are non-escaping — the
+    // non-escaping subset gets a scope-end release; the escaping ones retain
+    // without release (their +1 leaks — the safe direction). Mirrors the string
+    // scan's borrowCandidates / stringBorrowAll_ arms exactly.
     std::vector<const ast::Node*> candidates;
+    std::vector<const ast::Node*> borrowCandidates;
     std::function<void(const ast::Stmt*)> scan = [&](const ast::Stmt* s) {
         if (!s) return;
         {
             LocalDeclInitView v = localDeclInitView(s);
-            if (v.init && !v.isUsing &&
-                (isPlusOneClosureProducer(v.init) ||
-                 isUserMethodClosureReturnCall(v.init))) {
-                candidates.push_back(s);
-                // fix #3757 follow-up: this decl belongs to the body being
-                // analyzed — see closureLocalCandidates_'s declaration.
-                closureLocalCandidates_.insert(static_cast<const void*>(s));
+            if (v.init && !v.isUsing) {
+                if (isPlusOneClosureProducer(v.init) ||
+                    isUserMethodClosureReturnCall(v.init) ||
+                    isLambdaClosureReturnCall(v.init)) {
+                    candidates.push_back(s);
+                    // fix #3757 follow-up: this decl belongs to the body being
+                    // analyzed — see closureLocalCandidates_'s declaration.
+                    closureLocalCandidates_.insert(
+                        static_cast<const void*>(s));
+                } else {
+                    // fix #2714: BORROW-initialized closure-typed local.
+                    // Gate on the LOCAL's resolved type being a non-nullable
+                    // function type — the same gate `collectStringReleaseEligible`
+                    // uses for its borrowCandidates arm (a `string?` borrow is
+                    // also left alone there for the same reason: null/sentinel
+                    // handling is unchanged and the retain/release are
+                    // null-safe, but the conservative scope to non-nullable
+                    // borrows is kept for this increment). Reads the type from
+                    // the declared annotation, or — for an inferred
+                    // `var g := f()` — from the initializer's exprType.
+                    const sema::TypeRef* lt = nullptr;
+                    if (v.type) lt = ctx_.resolvedType(*v.type);
+                    if (!lt) lt = ctx_.exprType(*v.init);
+                    if (lt && !lt->nullable &&
+                        lt->kind == sema::TypeRef::Kind::Function) {
+                        borrowCandidates.push_back(s);
+                        closureBorrowAll_.insert(static_cast<const void*>(s));
+                        // fix #2714 follow-up: a borrow-initialized closure
+                        // local also belongs to THIS body — extend
+                        // closureLocalCandidates_ so returnedClosureLocalOwnsPlusOne
+                        // recognizes the borrow side the same way it recognizes
+                        // the producer side (mirrors #2817's parallel extension
+                        // of stringLocalCandidates_ to stringBorrowAll_).
+                        closureLocalCandidates_.insert(
+                            static_cast<const void*>(s));
+                    }
+                }
             }
         }
         if (auto* is = dynamic_cast<const ast::IfStmt*>(s)) {
@@ -25108,6 +25362,28 @@ void Emitter::collectClosureReleaseEligible(
         for (auto& s : body) { w.stmt(s.get()); if (w.escaped) break; }
         if (!w.escaped)
             closureReleaseEligible_.insert(static_cast<const void*>(ld));
+    }
+    // fix #2714 (§27.5 / §28.9, v0.286): same conservative escape walk for the
+    // BORROW side. A non-escaping borrow local releases its retained +1 at
+    // scope end exactly-once (no UAF — no escaping alias; no double-free —
+    // exactly one release through the slot). An escaping borrow local is still
+    // RETAINED at bind (closureBorrowAll_ arms `armClosureLocalRefcount`'s
+    // retain regardless of escape) but NOT released — its +1 leaks, which is
+    // safe. The walk uses the identical over-approximation as the producer
+    // loop above, so the producer and borrow release sets are constructed
+    // under the same escape discipline.
+    for (const ast::Node* ld : borrowCandidates) {
+        ClosureEscapeWalker w{ctx_, static_cast<const void*>(ld)};
+        // Mirrors the producer loop above — same scrutineeBorrowMode opt-in,
+        // same soundness argument (independent of whether the slot's +1 came
+        // from a producer or a retained borrow; either way the slot owns
+        // exactly one reference and the escape walk proves no alias outlives
+        // the scope).
+        w.scrutineeBorrowMode = true;
+        for (auto& s : body) { w.stmt(s.get()); if (w.escaped) break; }
+        if (!w.escaped)
+            closureBorrowRetainEligible_.insert(
+                static_cast<const void*>(ld));
     }
 }
 

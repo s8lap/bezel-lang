@@ -13235,6 +13235,26 @@ private:
     // at the call site). Cross-module imported methods are excluded (no local
     // mint). Parallel to isUserMethodStringReturnCall for strings.
     bool isUserMethodClosureReturnCall(const ast::Expr* init) const;
+    // fix #2714 (§27.5 / §28.9, v0.286): the LAMBDA sibling of
+    // `isUserMethodClosureReturnCall`. Recognize a CallExpr whose callee is
+    // a function-typed LOCAL or PARAMETER (not a method — that's the user-
+    // method case above) whose DECLARED return type is itself a function
+    // type (the `rt->funcReturn->kind == Function` gate; gating on the
+    // callee type alone admitted `var v := h()` for `h: () -> int`,
+    // treating an int slot as a closure cell — UAF on the synthetic rc).
+    // Such a call invokes a lambda whose body mints exactly +1 for the
+    // returned closure cell (post-#2691 the BLOCK-bodied form matches the
+    // EXPRESSION-bodied form), so the caller owns that single reference and
+    // must release at scope end. THIS is the closure sibling of the
+    // #429 / #712 string-RETURN category; lambdas were never widened
+    // because no predicate admitted a `CallExpr` callee at all. The decline
+    // of "make every closure-value call a +1 producer at the call site" in
+    // `isPlusOneClosureProducer`'s own comment is specifically about
+    // CALLABLES whose body shape is unknown to the caller — a LAMBDA callee
+    // (a LocalSymbol / ParameterSymbol holding a known +1 cell) is the
+    // statically-known case the decline was protecting AGAINST this fix
+    // misfiring on.
+    bool isLambdaClosureReturnCall(const ast::Expr* init) const;
     // fix #3498 (§28.14 / §27.5 / §28.9, v0.283): is syntactic argument `ai` of
     // `call` a §28.14 CALL-BOUNDED function-typed parameter position — i.e. one
     // where the callee provably holds no reference to the callback once the call
@@ -13316,6 +13336,38 @@ private:
     // — every entry it holds is, by construction, one of THIS scan's own
     // candidates.
     std::unordered_set<const void*> closureLocalCandidates_;
+    // fix #2714 (§27.5 / §28.9, v0.286): parallel borrow-side sets — see
+    // `collectClosureReleaseEligible` (the .cpp) for the rationale. The
+    // `closureBorrowAll_` member holds EVERY borrow-initialized closure-typed
+    // `var` local (the string twin is `stringBorrowAll_`); the
+    // `closureBorrowRetainEligible_` member holds the non-escaping subset
+    // (the string twin is `stringBorrowRetainEligible_`). Both are populated
+    // by the collect-walk, before the producer-candidates walk, so any
+    // consumer that consults them (notably `returnedClosureLocalOwnsPlusOne`)
+    // sees the right state during the walk. The producer-side fix is the
+    // one this issue lands — extending `isPlusOneClosureProducer`'s caller
+    // to admit a `CallExpr` whose callee is a function-typed LocalSymbol /
+    // ParameterSymbol whose declared return type is itself a function type
+    // (the post-#2691 mint that drained 40 B/call out of the issue's three
+    // measured leaks). The borrow-side fields are kept in place for the
+    // sibling fix that admits a borrow-initialized closure local's bind-time
+    // retain + scope-end release (a closure-typed local whose init is
+    // neither a producer nor a recognized return call — a field-then-call or
+    // a complex expression).
+    std::unordered_set<const void*> closureBorrowAll_;
+    // closure LocalDecl nodes, the subset of `closureBorrowAll_` whose
+    // scope-end release codegen arms — the non-escaping borrow side. An
+    // escaping local is in `closureBorrowAll_` (so its bind-time retain is
+    // still emitted) but NOT in `closureBorrowRetainEligible_`, so its +1
+    // simply leaks — the safe direction.
+    std::unordered_set<const void*> closureBorrowRetainEligible_;
+    // fix #2714 (§27.5 / §28.9, v0.286): bind-time retain + scope-end release
+    // registrar for a BORROW-initialized closure local. Mirrors
+    // `armStringLocalRefcount` line-for-line — see that helper's comment for
+    // the soundness argument. Currently a stub; the producer-side path
+    // (the isPlusOneClosureProducer extension) is the one this issue lands.
+    void armClosureLocalRefcount(const void* declNode,
+                                 llvm::AllocaInst* slot, llvm::Value* v);
     // Compute closureReleaseEligible_ for a block body (see the .cpp).
     void collectClosureReleaseEligible(
         const std::vector<std::unique_ptr<ast::Stmt>>& body);
