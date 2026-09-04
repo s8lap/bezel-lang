@@ -1838,6 +1838,17 @@ private:
     // (208 B per element under `bz$App$Make`'s bz_task_t, async frame, result
     // slot — the #1889 element half, the #2224 deferred gap).
     std::map<const sema::TypeRef*, llvm::Function*> taskElementDisposerThunks_;
+    // fix #3685 / §30.5 / §28.11 / §28.3 (v0.287): void(void*) thunk that runs
+    // the four-step TaskCompletionSource release protocol (fault_if_pending,
+    // error_obj cleanup, owned_result_dispose for OwningTaskCompletionSource,
+    // fire_and-forget, bz_tcs_free) — the same protocol the `using var`/explicit
+    // Dispose()/owned-field paths share via emitTcsRelease. Used as the per-
+    // element disposer for OwningArray<TaskCompletionSource<T>> etc. and as the
+    // Pattern A result disposer for Task<TaskCompletionSource<T>> (an async
+    // method whose declared return type is a TCS-family). One module-level
+    // thunk covers all three TCS names — the runtime representation is the same
+    // bz_tcs_t* for all three. // per §30.11 / §28.3, v0.287
+    llvm::Function* tcsElementDisposerThunk_ = nullptr;
     // #2279 (§30.5 Pattern A, v0.236): per-result-collection-type thunks for the
     // intrinsic-collection case `Task<intrinsic-coll>` — when a Pattern A task
     // produces an Array<T>/Set<T>/Dictionary<K,V>/LinkedList<T>/OwningBuffer<T>/
@@ -9499,6 +9510,21 @@ private:
     // each (Task/Task<T>/OwningTask<T>) TypeRef gets its own thunk so the
     // per-T result_disposer matches the element's concrete type. // per §30.5
     llvm::Function* taskElementDisposerThunk(const sema::TypeRef* taskTy);
+    // fix #3685 / §30.5 / §28.11 / §28.3 (v0.287): void(void*) thunk that
+    // emits the four-step TaskCompletionSource release protocol
+    // (fault_if_pending, error_obj cleanup with §30.9 in-flight deferral,
+    // owned_result_dispose for OwningTaskCompletionSource, fire-and-forget the
+    // inner task, bz_tcs_free the TCS struct) — the same protocol as a `using
+    // var` TCS / an explicit `tcs.Dispose()` / an owned TCS field. Used as the
+    // per-element disposer for OwningArray<TaskCompletionSource<T>> (and the
+    // Owning variant) AND as the Pattern A result disposer for an async method
+    // declared `Task<TaskCompletionSource<T>>` whose task is disposed with an
+    // unconsumed TCS result. One module-level thunk covers all three TCS names
+    // because the runtime representation is the same bz_tcs_t*; the Owning-
+    // specific owned_result_dispose step is keyed inside the runtime function
+    // itself, not by the emitter.
+    // per §30.11 / §28.3, v0.287
+    llvm::Function* tcsElementDisposerThunk();
 
     // #429 / §4.6 / §28.9: a module-level `void(void*)` thunk that calls
     // bz_string_release on the element (the slot holds a bz_string*). Used as the
@@ -16570,6 +16596,18 @@ private:
     // `Subscription` — a Named TypeRef with no user declaration whose name is
     // "Subscription" (resolved per TypeResolution_Names §24.4 / stdlib §2.11).
     static bool isSubscriptionType(const sema::TypeRef* rt);
+
+    // fix #3685 / §6.6 / §30.11 (v0.287): true when `rt` is one of the
+    // TaskCompletionSource family — TaskCompletionSource, TaskCompletionSource<T>,
+    // OwningTaskCompletionSource<T>. Each is a compiler-known built-in class
+    // with no user TypeDecl and no vtable (a Named TypeRef whose name is in
+    // {TaskCompletionSource, OwningTaskCompletionSource}). The runtime
+    // representation is identical for all three — a `bz_tcs_t*` whose
+    // `owned_result_disposer` slot is only non-null for OwningTaskCompletionSource
+    // <T:class> — so the disposal protocol is the same (see emitTcsRelease /
+    // tcsElementDisposerThunk).
+    // per §30.11 / §28.3, v0.287
+    static bool isTaskCompletionSourceType(const sema::TypeRef* rt);
 
     // per §24.5: emit the handler-invocation loop for `Raise(payload)` — call
     // every active handler closure with `payload` (already lowered, or null for

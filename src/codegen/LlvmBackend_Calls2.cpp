@@ -3833,6 +3833,23 @@ bool Emitter::isSubscriptionType(const sema::TypeRef* rt) {
     return rt->headName() == "Subscription";
 }
 
+// fix #3685 / §6.6 / §30.11 (v0.287): the TaskCompletionSource family
+// (TaskCompletionSource, TaskCompletionSource<T>, OwningTaskCompletionSource<T>)
+// resolves to a Named TypeRef with a null user declaration whose first name
+// part is "TaskCompletionSource" or "OwningTaskCompletionSource". Same
+// shape as the Subscription check above — both are vtable-less built-in
+// classes with no user TypeDecl. The runtime representation is identical
+// for all three (a `bz_tcs_t*`), so this predicate treats them as one
+// family for disposal routing.
+bool Emitter::isTaskCompletionSourceType(const sema::TypeRef* rt) {
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
+        return false;
+    if (!rt->astNode || !rt->astNode->name || rt->astNode->name->parts.empty())
+        return false;
+    auto n = rt->headName();
+    return n == "TaskCompletionSource" || n == "OwningTaskCompletionSource";
+}
+
 bool Emitter::isSubscriptionExpr(const ast::Expr& e) {
     // Primary, type-based recognition (per §2.11): any expression whose static
     // type is `Subscription` disposes through the events runtime, regardless of

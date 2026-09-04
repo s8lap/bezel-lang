@@ -212,6 +212,46 @@ Emitter::ElementPolicy Emitter::elementPolicyFor(const sema::TypeRef* elemTy,
         };
     }
 
+    // fix #3685 / §30.5 / §28.11 / §28.3 (v0.287): TaskCompletionSource /
+    // TaskCompletionSource<T> / OwningTaskCompletionSource<T> are runtime-
+    // managed opaque handles (bz_tcs_t*, no vtable) that own their inner task
+    // and (for OwningTaskCompletionSource<T:class>) its produced result. An
+    // OWNING slot holding one of them (an OwningArray<TaskCompletionSource<T>>
+    // element, OR the result slot of a Pattern A `Task<TaskCompletionSource<T>>`
+    // async method whose result was never awaited) MUST release it at slot
+    // disposal — the four-step TCS protocol (fault_if_pending, error-obj
+    // cleanup, owned_result_dispose keyed by the TCS's own slot, fire-and-
+    // forget the inner task, bz_tcs_free the struct).
+    //
+    // Without this arm these elements had no declaration ⇒ fell through to
+    // the Value row (null disposer), and bz_array_free / bz_dict_free /
+    // bz_task_fire_and_forget's per-T disposer chain was invoked with a NULL
+    // disposer — leaking the bz_tcs_t struct + the inner task frame +
+    // produced result (#3685's repro: 24 B bz_tcs_t + 184 B inner bz_task_t +
+    // 4 B produced int, one allocation chain per Task<TaskCompletionSource<T>>
+    // async call whose task was disposed unconsumed). The TCS branch is
+    // deliberately BEFORE the declaration-based class arm so a builtin TCS
+    // TypeRef never falls into the declaration-based test. Borrowing family
+    // stays ClassBorrow — an outer collection borrows the inner TCS (its real
+    // owner is elsewhere), and disposing it again would double-free.
+    // per §30.5 / §30.11 / §28.3, v0.287
+    if (isTaskCompletionSourceType(elemTy)) {
+        if (owningFamily) {
+            return ElementPolicy{
+                ElementPolicy::Category::ClassOwned,
+                ptrTy(),
+                tcsElementDisposerThunk(),
+                /*retainRelease=*/false
+            };
+        }
+        return ElementPolicy{
+            ElementPolicy::Category::ClassBorrow,
+            ptrTy(),
+            /*disposerThunk=*/nullptr,
+            /*retainRelease=*/false
+        };
+    }
+
     bool isSharedWeakElem = isSharedOrWeak(elemTy);
     // Distinguish Shared vs Weak for per-element release thunk selection.
     auto isWeakElem = [](const sema::TypeRef* t) {

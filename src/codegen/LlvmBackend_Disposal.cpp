@@ -2458,6 +2458,57 @@ void Emitter::emitTcsRelease(llvm::Value* tcs) {
 }
 
 
+// fix #3685 / §30.5 / §28.11 / §28.3 (v0.287): per-element disposer thunk for
+// a TaskCompletionSource-family value (TaskCompletionSource,
+// TaskCompletionSource<T>, OwningTaskCompletionSource<T>) when the surrounding
+// collection / Pattern A task result slot is OWNING — i.e., the slot is
+// responsible for releasing the TCS at scope-end / clear / remove / task
+// disposal. The runtime representation is identical for all three TCS names
+// (a `bz_tcs_t*`); the disposal protocol is the same four-step
+// `emitTcsRelease` sequence (fault_if_pending, error-obj cleanup with §30.9
+// in-flight deferral, owned_result_dispose for OwningTaskCompletionSource
+// <T:class> keyed inside the runtime, fire-and-forget the inner task,
+// bz_tcs_free the TCS struct).
+//
+// The element slot holds a NON-NULL `bz_tcs_t*` by construction — slot-emptied
+// sites null the slot before recycling, the same invariant the `using var`
+// scope-exit path holds. Same shape as subscriptionDisposeThunk: cached
+// module-level thunk, own IRBuilder + insertion point restored on the way out.
+// No per-T variety is needed: the per-T owned-result disposer is registered
+// on the bz_tcs_t itself via bz_tcs_set_owned_disposer at `new`
+// initialisation (#1250), and bz_tcs_dispose_owned_result consults that slot
+// — the emitter never sees the per-T disposer, so one thunk covers every T.
+//
+// Pre-fix this arm did not exist: elementPolicyFor fell through to the Value
+// row for TCS-typed slots (no declaration ⇒ no class/interface arm), so an
+// OwningArray<TaskCompletionSource<T>> freed with a null disposer leaked the
+// bz_tcs_t struct + the inner task frame + the produced result, and a
+// Pattern A `Task<TaskCompletionSource<T>>` returned from an async method
+// and never awaited leaked the same (MEASURED in #3685's repro:
+// 24 B bz_tcs_t + 184 B inner bz_task_t + 4 B produced int result under
+// LSan, all allocated in the async body).
+// per §30.5 / §30.11 / §28.3, v0.287
+llvm::Function* Emitter::tcsElementDisposerThunk() {
+    if (tcsElementDisposerThunk_) return tcsElementDisposerThunk_;
+    auto* fnTy = llvm::FunctionType::get(llvm::Type::getVoidTy(llvm_),
+                                         {ptrTy()}, /*isVarArg=*/false);
+    auto* fn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage,
+                                      "bz$tcsElementDispose", module_.get());
+    llvm::Argument* tcs = &*fn->args().begin();
+    auto* entry = llvm::BasicBlock::Create(llvm_, "entry", fn);
+    auto savedIP = builder_.saveIP();
+    llvm::Function* savedFn = currentFn_;
+    currentFn_ = fn;
+    builder_.SetInsertPoint(entry);
+    emitTcsRelease(tcs);
+    builder_.CreateRetVoid();
+    currentFn_ = savedFn;
+    builder_.restoreIP(savedIP);
+    tcsElementDisposerThunk_ = fn;
+    return fn;
+}
+
+
 // fix #2921 (spec §28.2 / §28.9 / §8.1, v0.240): emit the RELEASE of a
 // vtable-less built-in class receiver `recv` whose built-in name is `bn`, and
 // report whether one was emitted.
