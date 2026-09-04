@@ -7852,7 +7852,7 @@ llvm::Value* Emitter::wrapAsIEnumerableForTarget(
             return drainLazyPipelineToOwnedIEnumerable(lazy, targetTy);
         }
     }
-    // fix #3695 (§13.4 / §5 / §29.2 / §28.9, v0.286): SortedSet<T>'s arm of the
+    // fix #3695 (stdlib §4.18 / stdlib §4.1 / §29.2 / §28.3, v0.286): SortedSet<T>'s arm of the
     // §29.2 wrap grid — MISSING ENTIRELY until this commit. A `SortedSet<T>`
     // coerced to `IEnumerable<T>` (an argument, a local-decl init, a method
     // RETURN) used to fall off the end of this function to the bare `return v`

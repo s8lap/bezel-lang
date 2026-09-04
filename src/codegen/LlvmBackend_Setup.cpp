@@ -14321,7 +14321,7 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
                     freeDictSourceNow(srcSet);
             } else if (initTR &&
                        builtinTypeName(initTR) == "SortedSet") {
-                // fix #3695 (§13.4 / §5 / §29.2 / §28.9, v0.286): the local-decl
+                // fix #3695 (stdlib §4.18 / stdlib §4.1 / §29.2 / §28.3, v0.286): the local-decl
                 // face of the SAME missing arm `wrapAsIEnumerableForTarget` gets.
                 // `var en: IEnumerable<int> := s;` (s: SortedSet<int>) used to
                 // store the raw `bz_dict_t*` in the slot and the following

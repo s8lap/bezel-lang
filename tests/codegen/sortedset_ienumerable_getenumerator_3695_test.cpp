@@ -1,4 +1,4 @@
-// Codegen / SEGV — fix #3695 (§13.4 / §5 / §29.2 / §28.9, v0.286):
+// Codegen / SEGV — fix #3695 (stdlib §4.18 / stdlib §4.1 / §29.2 / §28.3, v0.286):
 // `SortedSet<T>.GetEnumerator()` accessed through an `IEnumerable<T>`-typed
 // variable SEGV'd, for every element type.
 //
@@ -149,7 +149,7 @@ const char* const kLocalDeclRepro =
 
 // ---------------------------------------------------------------------------
 // (A) The LOCAL-DECL face, PLAIN build.
-//   per §13.4 (SortedSet), §5 (IEnumerable), §28.9 (boxed enumerator disposal)
+//   per stdlib §4.18 (SortedSet), stdlib §4.1 (IEnumerable), §28.3 (boxed enumerator disposal)
 //
 // Pre-fix on e89658c: SIGSEGV, rc 139 — `en` held the raw `bz_dict_t*`,
 // `en.GetEnumerator()` read slot 4 of that struct as a function pointer and
@@ -166,7 +166,7 @@ BEZEL_TEST(sortedset_ienumerable_getenumerator_3695,
 
 // ---------------------------------------------------------------------------
 // (B) The SAME program, SANITIZED — the wild call AND the disposal claim.
-//   per §28.9 (boxed enumerator disposal), §28.2 (dispose exactly once)
+//   per §28.3 (boxed enumerator disposal), §28.2 (dispose exactly once)
 // ---------------------------------------------------------------------------
 BEZEL_TEST(sortedset_ienumerable_getenumerator_3695,
            sortedset_ienumerable_getenumerator_is_not_a_wild_call_28_9) {
@@ -178,7 +178,7 @@ BEZEL_TEST(sortedset_ienumerable_getenumerator_3695,
 
 // ---------------------------------------------------------------------------
 // (C) The RETURN face — the third position `wrapAsIEnumerableForTarget` serves.
-//   per §29.2 (Desugaring of `for`), §13.4, §5
+//   per §29.2 (Desugaring of `for`), stdlib §4.18, stdlib §4.1
 //
 // The SortedSet is the RETURN source, so `returnSourceIsCalleeOwnedCollection`
 // classifies it as callee-owned and the coercion takes the owning arm. (A
@@ -212,7 +212,7 @@ BEZEL_TEST(sortedset_ienumerable_getenumerator_3695,
 
 // ---------------------------------------------------------------------------
 // (D) The ARGUMENT face — passing a SortedSet as `IEnumerable<int>`.
-//   per §29.2, §5
+//   per §29.2, stdlib §4.1
 // ---------------------------------------------------------------------------
 BEZEL_TEST(sortedset_ienumerable_getenumerator_3695,
            sortedset_passed_as_ienumerable_argument_iterates_29_2) {
@@ -275,7 +275,7 @@ BEZEL_TEST(sortedset_ienumerable_getenumerator_3695,
 
 // ---------------------------------------------------------------------------
 // (F) The DIRECT `.GetEnumerator()` surface — the control that already worked.
-//   per §13.4, §29.11
+//   per stdlib §4.18, §29.11
 //
 // Direct call on the concrete type routes through `wrapSortedSetAsIEnumerable`
 // (`LlvmBackend_Calls2.cpp:14146`); this fix extends the §29.2 coercion +
@@ -343,7 +343,7 @@ BEZEL_TEST(sortedset_ienumerable_getenumerator_3695,
 
 // ---------------------------------------------------------------------------
 // (H) IN-PLACE `for x in s do` — the control that already worked.
-//   per §13.4, §29.11
+//   per stdlib §4.18, §29.11
 // ---------------------------------------------------------------------------
 BEZEL_TEST(sortedset_ienumerable_getenumerator_3695,
            in_place_sortedset_iteration_is_unchanged_13_4) {
