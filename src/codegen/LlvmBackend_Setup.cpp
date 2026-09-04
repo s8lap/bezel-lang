@@ -25727,10 +25727,22 @@ bool Emitter::isFreshRecordConstructionOfExactType(
 bool Emitter::isProvablyFreshRecordFactoryMethod(
         const sema::MethodSymbol* ms, const sema::TypeSymbol* recTs) const {
     if (!ms || !recTs) return false;
-    // SEAM-ACCESSOR: the imported case is a SIBLING function, not a gap --
-    // every caller ORs this with isProvablyFreshImportedRecordFactoryMethod_
-    // (see the call site), so `false` here for an imported `ms` (ms->decl
-    // null) is complete, not a missing arm. #3152
+    // fix #3645 (§9.7 / §28.9 / §2.8.3 rule 4, v0.286): `ms->decl` is no
+    // longer null for an imported method that returns a record class — the
+    // exporter (ModuleMetadataBuilder.cpp MethodDecl arm) now ships
+    // methodBodyText for non-generic class methods whose return type is a
+    // record class, and the importer (ModuleLoader.cpp parseAndAttachMethod-
+    // Body) re-parses + attaches it. The body walk below therefore admits
+    // the imported twin when its body is provably `return new Pt(...)` (and
+    // correctly rejects the borrow-returning shape `_cache[i]` via the
+    // isFreshRecordConstructionOfExactType + isPlusOneStringProducer check
+    // — the same soundness gate that closed the #2448 UAF class). The
+    // #3621 signature-only sibling has been removed; this predicate is the
+    // single source of truth for both locals and imports.
+    // SEAM-ACCESSOR: post-#3645 the importer attaches `decl` for a shipped
+    // record-factory body, so this read is the sanctioned single source of
+    // truth for locals AND imports — not an AST-gated gap (the #3621
+    // signature-only sibling that previously sat alongside it is gone). #3152
     const auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
     if (!md) return false;
     if (md->bodyKind == ast::MethodBodyKind::Expression) {
