@@ -13166,14 +13166,33 @@ void Emitter::emitImplicitBase(const sema::TypeSymbol* cls, llvm::Value* obj,
             }
         }
     }
-    if (sema::ConstructorSymbol* target = ctorByArity(b, 0, nullptr)) {
+    // fix #3792 (§22.5 / §22.8 step 1 / §12.8, v0.287): the IMPLICIT base
+    // chain previously selected its target with `ctorByArity(b, 0, nullptr)`
+    // — EXACT arity, no §22.5 fill — so a derived class whose base ctor
+    // parameters are ALL §22.5-defaulted found no arity-0 candidate, fell
+    // through to the `else if` arm below, the base had no positional fields
+    // for that arm to pre-populate, and the base subobject was never
+    // constructed: `base();` printed 5, omitting it printed 0 (calloc zero),
+    // silently. Use the SAME `ctorForArgs` `new` uses to pick between a
+    // class's explicit constructors and the §22.10 primary constructor —
+    // its `argsCanFill` / `argsCanFillSymbolic` fallback admits an
+    // all-defaulted ctor with zero supplied args (#3082), so the implicit
+    // base chain now reaches it. Its EXACT-arity arm still wins for a real
+    // arity-0 ctor (`ctorArityCount(b, 0, nullptr) == 1`), preserving every
+    // pre-existing call: §22.6's order is preserved because it IS
+    // `ctorForArgs`'s order.
+    std::vector<ast::CallArgument> emptyArgs;
+    if (sema::ConstructorSymbol* target = ctorForArgs(b, emptyArgs, nullptr)) {
         // fix #2882 (§22.8 step 1 / §14.1 / §12, v0.240): when `b` is a generic
         // instantiation whose lowered layout differs from the erased template's,
         // `ctorFns_[target]` is the WRONG body for this object — see the
         // declaration comment. Inline the target's body under the base
         // instantiation's substitution instead, exactly as emitChainCall already
         // does for an explicit `base()`. Returns false (and this falls through
-        // unchanged) for every shape whose layout it cannot prove differs.
+        // unchanged) for every shape whose layout it cannot prove differs —
+        // including every non-empty `target->params` (the inline path's
+        // obligation 1 refuses one), so a non-arity-0 all-defaulted target
+        // simply reaches the lowered-call arm below.
         // fix #2908: ask about the base chain from the MOST-DERIVED class, not
         // from `cls` — obligation 2 below synthesizes a receiver out of this
         // argument and needs no seed when that receiver is non-generic.
@@ -13186,8 +13205,29 @@ void Emitter::emitImplicitBase(const sema::TypeSymbol* cls, llvm::Value* obj,
             declareImportedCtor(target);
             it = ctorFns_.find(target);
         }
-        if (it != ctorFns_.end() && it->second->arg_size() == 1) {
-            builder_.CreateCall(it->second, {obj});
+        // fix #3792 (§22.5 / §22.8 step 1 / §12.8, v0.287): the IMPLICIT-base
+        // twin of the `fillOmittedCtorArgs` call `emitChainCall` and the
+        // §22.10 inheritance-clause arm above make for the EXPLICIT `base()`
+        // and the `class D : B(args)` chains. The constructor selected here
+        // may have ALL of its parameters §22.5-defaulted — `target->params`
+        // non-empty but every slot has a default — so the call must materialize
+        // those defaults and pass them in order. `fillOmittedCtorArgs` is the
+        // ONE constructor-call fill (fix #3777, v0.286) and answers the
+        // LOCAL/IMPORTED question its own way; reusing it here means "what
+        // value does an omitted parameter take" stays single-sourced across
+        // every chain site (CLAUDE.md §6). The args.size() == nBaseFormals + 1
+        // gate is `fillOmittedCtorArgs`'s contract — it grew the vector by
+        // exactly the number of omitted slots.
+        if (it != ctorFns_.end()) {
+            std::vector<llvm::Value*> args;
+            args.push_back(obj);
+            const std::size_t nBaseFormals = target->params.size();
+            if (fillOmittedCtorArgs(*target, it->second->getFunctionType(),
+                                    /*coerceNumericDefaults=*/true,
+                                    args, /*outIsLocal=*/nullptr) &&
+                args.size() == nBaseFormals + 1) {
+                builder_.CreateCall(it->second, args);
+            }
         }
     } else if (!emitImportedBaseFieldInit(b, obj, mostDerived)) {
         // fix #2452 (§22.8 step 1-2 / §2.5, v0.235): `b` may be an IMPORTED
