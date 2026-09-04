@@ -152,3 +152,47 @@ BEZEL_TEST(method_scope_owned_local_escape, mk_call_result_consumed_in_method_ac
         "end Mk;"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
+
+// POSITIVE (§28.9 / §27.5, #3702 + #3591): the §21.1 `const`-binding sibling
+// of the filed repro. `mk` is a `const` local (§21.1) bound to a
+// lambda-literal initializer, and §21.1 explicitly admits a `const` carrying
+// the initializer's source-liveness constraints, exactly as a plain
+// unmarked `var` alias. Without the #3591 sibling `LocalConstDecl` arm the
+// walker at Ownership_Checks.cpp:3277 silently never visited the lambda
+// literal, so the method-level §28.9 escape check fired on NO closures and
+// `Mk()` returned a closure capturing `r` past `r`'s scope end — identical
+// to the `var mk := ...` repro, one binding-form over.
+BEZEL_TEST(method_scope_owned_local_escape, const_mk_call_returned_method_closure_rejected_28_9) {
+    auto r = parseAndCheckOwnership(wrap(
+        "public method Mk(): () -> int "
+        "  using var r := new R(); "
+        "  const mk := lambda(): () -> int => do "
+        "    return lambda(): int => r.V(); "
+        "  end; "
+        "  return mk(); "
+        "end Mk;"));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "returned closure captures `r` whose source is disposed at scope "
+           "end"));
+    BEZEL_EXPECT_TRUE(hasErrorMessage(r, "(§28.9 closure-capture escape"));
+}
+
+// POSITIVE (§28.9 / §27.5, #3702 + #3591): the §21.1 `const`-binding sibling
+// of the expression-bodied row. `mk` is a `const` local whose initializer is
+// an expression-bodied lambda returning an inner closure that captures `r`.
+// Without the #3591 sibling arm the exprBody branch never ran for a `const`,
+// so this compiled clean.
+BEZEL_TEST(method_scope_owned_local_escape, const_mk_exprbody_returns_closure_rejected_28_9) {
+    auto r = parseAndCheckOwnership(wrap(
+        "public method Mk(): () -> int "
+        "  using var r := new R(); "
+        "  const mk := lambda(): () -> int => lambda(): int => r.V(); "
+        "  return mk(); "
+        "end Mk;"));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "returned closure captures `r` whose source is disposed at scope "
+           "end"));
+    BEZEL_EXPECT_TRUE(hasErrorMessage(r, "(§28.9 closure-capture escape"));
+}

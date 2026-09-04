@@ -3274,11 +3274,36 @@ void MethodOwnership::checkClosureEscapesOnReturn(const ast::Expr& e,
                     sema::Symbol* calleeSym = ctx_.exprSymbol(*calleeId);
                     if (auto* ls =
                             dynamic_cast<sema::LocalSymbol*>(calleeSym)) {
+                        const ast::Expr* calleeInit = nullptr;
                         if (auto* ld = dynamic_cast<const ast::LocalDecl*>(
                                 ls->decl)) {
+                            calleeInit = ld->initializer.get();
+                        }
+                        // fix #3591 (§21.1 / §27.5 / §28.9, v0.286): §21.1's
+                        // runtime `const` is a SEPARATE AST node
+                        // (LocalConstDecl) from `var`'s LocalDecl, and
+                        // §21.1 explicitly admits a `const` binding a
+                        // lambda-literal ("the binding is then a borrow
+                        // carrying the initializer's source-liveness
+                        // constraints, exactly as a plain unmarked `var`
+                        // alias"). Without this arm the callee of a
+                        // return-position CallExpr could be a `const mk :=
+                        // lambda(): int => ...;` — the same #3702 / #3564
+                        // escape shape, one binding-form over — and the
+                        // method-level §28.9 escape check silently never
+                        // visited its initializer lambda. Measured: identical
+                        // to the #3702 repro, replacing `var mk := ...` with
+                        // `const mk := ...` compiled clean and disposed the
+                        // captured owned local while the returned closure was
+                        // still live.
+                        if (auto* lcd = dynamic_cast<
+                                const ast::LocalConstDecl*>(ls->decl)) {
+                            calleeInit = lcd->value.get();
+                        }
+                        if (calleeInit) {
                             if (auto* initLam =
                                     dynamic_cast<const ast::LambdaExpr*>(
-                                        ld->initializer.get())) {
+                                        calleeInit)) {
                                 // The lambda body is what `mk()` evaluates
                                 // to; any lambda escaping that body escapes
                                 // Mk() via the CallExpr in the return
