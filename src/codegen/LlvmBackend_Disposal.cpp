@@ -4208,11 +4208,20 @@ llvm::Function* Emitter::patternAResultCollectionDisposer(
                             collName == "Array" || collName == "Stack" ||
                             collName == "Queue" || collName == "Set" ||
                             collName == "SortedSet";
-    // For LinkedList / Dictionary, the owning property is the head's
-    // "Owning" prefix (per stdlib §4.6/§4.7/§4.8/§4.9 — OwningLinkedList /
-    // OwningDictionary own their elements; the borrowing forms don't).
+    // For LinkedList / Dictionary / OwningBuffer, the owning property is the
+    // head's "Owning" prefix (per stdlib §4.6/§4.7/§4.8/§4.9 — OwningLinkedList
+    // / OwningDictionary own their elements; the borrowing forms don't).
+    // fix #3684: §4.14 OwningBuffer<T> admits BOTH value-typed T (no per-slot
+    // obligation — destructor just releases backing storage) AND class-typed T
+    // (the destructor disposes each non-null slot). Setting isOwningColl from
+    // the prefix makes class-T slots route through their per-element dispose
+    // thunk via bz_array_free; value-T elements get a null disposer because
+    // elementPolicyFor returns no thunk for value-typed T. Pre-fix this arm
+    // forced isOwningColl=false (because bz_buffer_free was single-arg and
+    // no element disposer could be passed), so an OwningBuffer<MyClass> Task
+    // result leaked its class slots — measured as 32 B / 2 Widgets.
     if (collName == "LinkedList" || collName == "Dictionary" ||
-        collName == "SortedDictionary") {
+        collName == "SortedDictionary" || collName == "OwningBuffer") {
         isOwningColl = common::isOwningPrefixedName(collName);
     }
     if (!isLL && !isDict && !isBuffer && !isOwningColl) {
@@ -4223,26 +4232,45 @@ llvm::Function* Emitter::patternAResultCollectionDisposer(
         // which is exactly the failure mode this whole fix exists to end.
         return nullptr;
     }
-    // OwningBuffer is NOT value-owning by element kind — its `T` is value-
-    // typed by construction (it is the manual-storage primitive, §4.14) and
-    // bz_buffer_free does not take an element disposer. The owning flag is
-    // irrelevant for buffer selection; treat its element disposer as null.
-    if (isBuffer) {
-        isOwningColl = false;  // no element disposer on bz_buffer_free
-    }
+    // §4.14 OwningBuffer<T>: runtime storage is `bz_array_t*` (allocated via
+    // `bz_array_alloc_count_n` — see the new-OwningBuffer arm in
+    // LlvmBackend_Exprs2.cpp:5070-5096), the SAME layout every other
+    // `isCollectionTypeName` collection uses. Pre-fix this function below
+    // routed OwningBuffer through `bz_buffer_free(ptr)` — a free fn that
+    // targets the separately-managed `bz_buffer_hdr_t*` layout of `Buffer<T>`
+    // (single calloc'd block, header + inline payload) and does `free(buf)`
+    // only. That freed the bz_array_t header as if it were one block but did
+    // NOT free `arr->data`, so a `Task<OwningBuffer<T>>` Pattern A result
+    // leaked its data payload at task teardown (#3684) — exactly the 16-byte
+    // LSan signature in the issue body. The using-var scope-end path (in
+    // `registerUsingDisposal`/emit disposal, `d.collection = true` arm) and the
+    // nested-collection disposer thunk (`nestedCollectionDisposerThunk`
+    // above) BOTH already route OwningBuffer through `bz_array_free` — Pattern
+    // A was the only orphan. Pinned in
+    // tests/codegen/owning_buffer_task_pattern_a_disposal_3684_test.cpp
+    // (runAotChecked, LSan ON, multiple rows: int value-T control,
+    // PlainClass class-T control, the recursive nested-owning-collection row,
+    // and the amplified 200× buffer-count check for the row-1 orphan).
+    // // per §30.5 / §14.4 / §4.14, v0.287
 
+    // fix #3684 / §30.5 / §14.4: OwningBuffer joins the array-backed free path
+    // (bz_array_free) — see the paragraph above.
     const char* freeName = isLL ? "bz_llist_free"
                          : isDict ? "bz_dict_free"
-                         : isBuffer ? "bz_buffer_free"
                          : "bz_array_free";
-    // The free fn signature: bz_array_free/bz_llist_free/bz_dict_free take
-    // (ptr, dispose_elem), bz_buffer_free takes (ptr) only.
-    bool freeFnTakesElem = !isBuffer;
+    // The free fn signature: every free fn in scope (bz_array_free,
+    // bz_llist_free, bz_dict_free) takes (ptr, dispose_elem). For an
+    // OwningBuffer<T> with class-typed T the element disposer is the class
+    // Destroy thunk; for value-typed T elementPolicyFor returns no disposer
+    // and bz_array_free's per-element loop is skipped. (Pre-fix this was a
+    // bool that branched between bz_buffer_free(ptr) and the two-arg form;
+    // with the buffer arm merged with the bz_array_free path it is
+    // invariantly two-arg.)
 
     // Per-element (or per-value) disposer:
     //   Array/Stack/Queue/Set/OwningArray/OwningStack/OwningQueue/OwningSet/
-    //   LinkedList/OwningLinkedList: elementType = genericArgs[0], isOwning
-    //     = isOwningColl
+    //   LinkedList/OwningLinkedList/OwningBuffer: elementType = genericArgs[0],
+    //     isOwning = isOwningColl (OWNING for OwningBuffer per §4.14)
     //   Dictionary/OwningDictionary/SortedDictionary: elementType is the
     //     KEY (genericArgs[0]) for isOwning purposes, BUT the value
     //     (genericArgs[1]) is the one that carries the disposal obligation
@@ -4250,11 +4278,8 @@ llvm::Function* Emitter::patternAResultCollectionDisposer(
     //     For the runtime free call we pass the VALUE disposer; the value
     //     element policy (owningDictionaryElementDisposer etc.) already uses
     //     genericArgs[1].
-    //   OwningBuffer: no per-element disposer.
     const sema::TypeRef* elemForDisposer = nullptr;
-    if (isBuffer) {
-        elemForDisposer = nullptr;
-    } else if (isDict) {
+    if (isDict) {
         elemForDisposer = (resultCollTy->genericArgs.size() > 1)
                               ? resultCollTy->genericArgs[1] : nullptr;
     } else {
@@ -4304,7 +4329,12 @@ llvm::Function* Emitter::patternAResultCollectionDisposer(
     // Build the thunk: void(void* resultCollPtr) {
     //                       if (!ptr) return;
     //                       freeFn(ptr, elemDisposer); }
-    // For bz_buffer_free (no element-disposer arg), the call drops it.
+    // fix #3684: every free fn in scope (bz_array_free / bz_llist_free /
+    // bz_dict_free) is the two-arg form (ptr, dispose_elem); OwningBuffer
+    // used to route through bz_buffer_free (single-arg), but OwningBuffer's
+    // runtime storage is a bz_array_t* (allocated via bz_array_alloc_count_n),
+    // so the single-arg bz_buffer_free was the wrong free fn — see the
+    // big comment block above the kind-dispatch for the full diagnosis.
     auto* fnTy = llvm::FunctionType::get(llvm::Type::getVoidTy(llvm_),
                                          {ptrTy()}, /*isVarArg=*/false);
     std::string thunkName = std::string("bz$patAResultCollFree$") +
@@ -4330,7 +4360,7 @@ llvm::Function* Emitter::patternAResultCollectionDisposer(
         b.CreateICmpEQ(ptr, llvm::ConstantPointerNull::get(ptrTy())),
         retBB, freeBB);
     b.SetInsertPoint(freeBB);
-    if (freeFnTakesElem) {
+    {
         llvm::Value* dispArg = elemDisposer
             ? elemDisposer
             : llvm::ConstantPointerNull::get(ptrTy());
@@ -4338,12 +4368,6 @@ llvm::Function* Emitter::patternAResultCollectionDisposer(
                                 llvm::Type::getVoidTy(llvm_),
                                 {ptrTy(), ptrTy()});
         b.CreateCall(freeFn, {ptr, dispArg});
-    } else {
-        // bz_buffer_free: single-arg free.
-        auto* freeFn = declareC(freeName,
-                                llvm::Type::getVoidTy(llvm_),
-                                {ptrTy()});
-        b.CreateCall(freeFn, {ptr});
     }
     b.CreateBr(retBB);
     b.SetInsertPoint(retBB);
