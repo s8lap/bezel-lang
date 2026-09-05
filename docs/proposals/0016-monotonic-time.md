@@ -18,7 +18,7 @@ All items below are in the current stdlib; nothing is invented here.
 
 - **`TimeSpan`** (stdlib [§2.5](../Bezel_Standard_Library.md#sec-system-auto-imported)) — stores duration as a count of **100-nanosecond ticks** (`Ticks: long`); factory `FromTicks(ticks: long)`, `FromMilliseconds`, `FromSeconds`, `FromMinutes`, `FromHours`, `FromDays`; component accessors `TotalMilliseconds: double`, etc.  No `FromNanoseconds` or `TotalNanoseconds` exist.
 - **`DateTime`** (stdlib §2.5) — wall-clock calendar value. `DateTime.Now` / `DateTime.UtcNow` read the system clock.  Not monotonic — advancing the system clock or daylight-saving transitions can make `DateTime.Now` jump or repeat.
-- **`Stopwatch`** (stdlib [§8.1](../Bezel_Standard_Library.md#sec-stopwatch)) — wraps the OS high-resolution timer; exposes `Elapsed: TimeSpan`, `ElapsedMilliseconds: long`, `IsRunning: bool`, `Start()`/`Stop()`/`Restart()`/`Reset()`, and the static factory `StartNew(): owned Stopwatch`. Missing: `ElapsedTicks: long` (raw hardware ticks) and `Frequency: long` (hardware ticks per second, the denominator that converts `ElapsedTicks` to wall time).
+- **`Stopwatch`** (stdlib [§8.1](../Bezel_Standard_Library.md#sec-stopwatch)) — wraps the OS high-resolution timer; exposes `Elapsed: TimeSpan`, `ElapsedMilliseconds: long`, `IsRunning: bool`, `Start()`/`Stop()`/`Reset()`, and the static factory `StartNew(): owned Stopwatch`. Missing: `ElapsedTicks: long` (raw hardware ticks) and `Frequency: long` (hardware ticks per second, the denominator that converts `ElapsedTicks` to wall time).
 
 **What is missing:** a standalone monotonic timestamp value (no Stopwatch instance required), sub-millisecond `Stopwatch` introspection, and nanosecond entry/exit points on `TimeSpan`.
 
@@ -87,11 +87,11 @@ end Instant;
 // Additions to the existing Stopwatch class in System.Diagnostics:
 public class Stopwatch
   // ... (existing members unchanged: StartNew, IsRunning, Elapsed,
-  //      ElapsedMilliseconds, Start, Stop, Restart, Reset)
+  //      ElapsedMilliseconds, Start, Stop, Reset)
 
   /// Raw hardware ticks elapsed while the stopwatch was running.
   /// Divide by Frequency to get seconds. Monotonically non-decreasing
-  /// between Stop and the next Start. Resets to 0 on Reset()/Restart().
+  /// between Stop and the next Start. Resets to 0 on Reset().
   public readonly property ElapsedTicks: long;   // PROPOSED
 
   /// Hardware ticks per second on this platform. Constant for the
@@ -145,7 +145,7 @@ using var sw := Stopwatch.StartNew();
 for var i in 0..100 do
   Iteration();
   Console.WriteLine($"Lap {i}: {sw.Elapsed.TotalMilliseconds:F3} ms");
-  sw.Restart();
+  sw.Reset(); sw.Start();
 end;
 
 // --- Pattern 3: raw ticks for zero-overhead profiling ---

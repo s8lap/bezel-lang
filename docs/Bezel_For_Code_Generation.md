@@ -1,6 +1,6 @@
 # Bezel for Code Generation
 
-*Validated against v0.288. Companion to the Bezel Language Specification — a writing reference, not a normative document.*
+*Validated against v0.290. Companion to the Bezel Language Specification — a writing reference, not a normative document.*
 
 A dense reference for writing correct Bezel without reading the spec. It covers the syntax surface, the ownership rules, the standard-library name index, the idioms that work, and the shapes that look right and are rejected.
 
@@ -31,7 +31,7 @@ Read this page first. Every row is a habit that produces broken Bezel.
 | 3 | `a == b`, `a != b` | `a = b`, `a <> b` | §17.3 |
 | 4 | `&&`, `\|\|`, `!x` | `and`, `or`, `not x`. Postfix `!` is the null-forgiving operator, nothing else | §17.1, §7.8 |
 | 5 | `a % b` | `a mod b`; the compound form is one token, `mod=` | §17.1, A.6 |
-| 6 | `else if`, `switch`, `foreach` | `elif`; `case … of … end case;` (scrutinee) or `when … end when;` (conditions); `for var x in xs do … end;`. **`foreach` does not exist in Bezel** | §19, §21.4 |
+| 6 | `else if`, `switch`, `foreach` | `elif` (`if … then … elif … then … else … end;` is the only condition ladder — there is no `when` construct); `case … of … end case;` (scrutinee); `for var x in xs do … end;`. **`foreach` does not exist in Bezel** | §19, §20, §21.4 |
 | 7 | `cond ? a : b` | `(if cond then a else b)` — the parentheses are part of the form, and `else` is mandatory | §20 |
 | 8 | `void` | omit the `: Type` clause; the result type is the unit type `()` | §22.1, §4.7 |
 | 9 | `namespace` / `using X;` | `module X.Y;` (one per file, first line) / `import X.Y;` | §2.1, §2.2 |
@@ -57,14 +57,14 @@ Four more that cost the same amount of time. **(21)** Collections come in two fa
 
 ```bezel
 module App.Billing;                       // first non-comment line; exactly one per file
-import System.Collections.Generic;
+import System.Threading;                  // only a non-auto module needs a line (§5.0)
 import App.Ledger as Led;                 // optional file-scoped alias
 type Handler<T> := (T, string?) -> bool;  // type alias: `:=`, never a visibility keyword
 ```
 
 After the module line and imports come top-level declarations: `class`, `interface`, `record`, `enum`, `choice`, `extension`, `type`, `extern` (§2.1, §2.2, §27.8, A.2). Source files are UTF-8 with extension `.bzl`. Comments: `// line`, `/* block, does not nest */`, `/// doc` (§1.1, §1.5).
 
-Auto-imported, no `import` needed (§2.3): `System`, `System.Text`, the primitives, `Array<T>`, `OwningArray<T>`, the `Task` family, the eight iteration interfaces, `CancellationToken`, `Subscription`, and the six event types. `CancellationTokenSource` is NOT auto — it needs `import System.Threading;`. **Everything else needs an import** — section 5.0 has the table.
+Auto-imported, no `import` needed (§2.3): `System`, `System.Text`, `System.Collections.Generic` (v0.289 — every collection type, the spans, `Counter`, `FrozenArray`, `KeyNotFoundException`, and the iteration interfaces), `System.Collections.Linq` (v0.278 — the query operators), the primitives, the `Task` family, `CancellationToken`, `Subscription`, and the six event types. `CancellationTokenSource` is NOT auto — it needs `import System.Threading;`. **Everything else needs an import** — section 5.0 has the table.
 
 ### 3.2 Keywords
 
@@ -180,7 +180,7 @@ One condition per clause. `result` names the return value inside `ensures`; `old
 
 ### 3.4 Statements, with their exact terminators
 
-The complete statement list (A.6): `LocalDecl`, `LocalConstDecl`, `AssignmentStmt`, `ExpressionStmt`, `DiscardStmt`, `IfStmt`, `WhileStmt`, `ForStmt`, `DoEndBlock`, `CaseStmt`, `WhenStmt`, `ReturnStmt`, `ThrowStmt`, `BreakStmt`, `ContinueStmt`, `TryStmt`, `YieldStmt`, `IncrementStmt`, `LocalTypeDecl`. Every statement ends `;`. Every block ends `end … ;`.
+The complete statement list (A.6): `LocalDecl`, `LocalConstDecl`, `AssignmentStmt`, `ExpressionStmt`, `DiscardStmt`, `IfStmt`, `WhileStmt`, `ForStmt`, `DoEndBlock`, `CaseStmt`, `ReturnStmt`, `ThrowStmt`, `BreakStmt`, `ContinueStmt`, `TryStmt`, `YieldStmt`, `IncrementStmt`, `LocalTypeDecl`. Every statement ends `;`. Every block ends `end … ;`.
 
 `end` may be followed by the construct's **name** if it has one, or by its **introducing keyword** otherwise; a present label must match. **A bare `end;` is always valid everywhere** (§1.6).
 
@@ -200,9 +200,8 @@ The complete statement list (A.6): `LocalDecl`, `LocalConstDecl`, `AssignmentStm
 | `do … end` block | `end do;` or `end;` | — |
 | `try` | `end try;` or `end;` | — |
 | `case` statement | `end case;` or `end;` | ✗ `end switch;` |
-| `when` statement | `end when;` or `end;` | — |
 | lambda block body | `do … end` — bare `end`, no label and no `;` of its own | ✗ `end lambda;` |
-| `case`/`when` arm `do` block | `do … end` — bare `end`, no `;` | — |
+| `case` arm `do` block | `do … end` — bare `end`, no `;` | — |
 
 Every statement shape:
 
@@ -238,15 +237,13 @@ outer: for var row in rows do ... end outer;
 await for var line in reader do ... end;      // `with token` supplies a CancellationToken (§30.7)
 do  using var t := Open();  end;            // a `do` block ends a scope early
 
-// case / when statements
+// case statement
 case delta of
   -10..-6 => "strongly down",
   ..<0    => Log("down"),                   // single-statement arm
   0       => do Reset(); Log("flat"); end,  // do-block arm
   _       => Log("up")
 end case;
-
-when  score >= 90 => Console.WriteLine("A"),  _ => Console.WriteLine("F")  end when;
 
 // return / throw / break / continue / yield
 return;
@@ -301,7 +298,7 @@ Precedence, high to low (§17.1):
 ✗ var r := mask & 0..n;               ✓ var r := mask & (0..n);
 ```
 
-`(if …)`, `(case …)`, `(when …)` and the binding atom `(var x := e; body)` take no precedence entry — they are self-delimited primary atoms usable in any operand position (§17.2, §17.15).
+`(if …)`, `(case …)` and the binding atom `(var x := e; body)` take no precedence entry — they are self-delimited primary atoms usable in any operand position (§17.2, §17.15).
 
 Literals (§18, A.8):
 
@@ -339,7 +336,6 @@ The paren atoms:
 var max   := (if a > b then a else b);                    // `else` MANDATORY
 var grade := (if s >= 90 then "A" elif s >= 80 then "B" else "F");
 var g2    := (case score of 90..100 => "A", 70..<80 => "C", _ => "F");
-var g3    := (when score >= 90 => "A", _ => "F");
 var area  := (var w := bounds.Width(); w * w);            // binding atom (§17.15)
 ```
 
@@ -471,7 +467,7 @@ The declared type, nullability stripped, must be a class type, an interface type
 
 **`ref` / `out`** (§22.3, §22.4). Written at the declaration **and** at the call site. `out` is copy-out-on-normal-return: the callee must assign on every normal-completion path; on the exception edge the recipient is untouched.
 
-- `out owned p: T` is the only modifier compound. At the call site it accepts **only** `out using var x` or `out owned var x`; plain `out var x` is rejected.
+- `out owned p: T` is the only modifier compound. At the call site `out var x` **adopts** what the signature announces — against `out owned` it is an owned local you discharge yourself (`move` it, store it in an owned slot, or let scope-end auto-drop with the must-use warning) — and `out using var x` is the scope-bound owned form, accepted **only** against `out owned`. There is no `out owned var` spelling (retired v0.289).
 - `ref`/`out` arguments may **not** name a location of owned state (an owned local, an `owned` parameter, an `owned` field, an owning slot), nor a `using var`, nor a `readonly` field outside its assignable context. **For an *instance* `readonly` field or auto-property that context is per-instance** (§22.8, v0.270): it is assignable only through an lvalue chain rooted at `this` — so a constructor may not write *another* value's `readonly` storage, and binding one to a `ref`/`out` parameter inside a constructor is the same store by other syntax — and an instance `readonly` **field** is assigned **at most once** on any path through one instance construction, counting the field initializer and every constructor body in the `this(...)` chain together (v0.271; stated for fields — auto-properties are not decided). A `static readonly` field is different on both counts: its context is its own static initializer or a constructor body of the declaring type, spelled as the bare name or `TypeName.F`, and its unit is one type initialization. Pass a borrow instead, or use `owned` parameters/returns and `move`.
 - `ref`/`out` are **forbidden** on `async` methods, on lambdas, on iterator methods and on indexers (§30.1, §29.3, §23.5). The argument's static type must match the referent type exactly. `out var _` is an error; write `out _`.
 
@@ -530,7 +526,7 @@ A borrow is valid only where **every** source in its source set is live; joins, 
 - A borrow may not be captured by a closure that may outlive its source (immediately-invoked closures, closures bound to a `using var` of function type, and closures passed to a function-typed parameter are fine).
 - Every field-, collection- or async-frame-held borrow carries the obligation not to transfer the borrowed object to another domain. This has **no runtime backstop** — it is a data race (§30.14).
 
-**Merges must agree** (§28.3). owned ⊓ owned = owned. borrowed ⊓ borrowed = borrowed, sources unioned. **owned ⊓ borrowed = rejected.** owned ⊓ moved-from = maybe-consumed (unreadable). The rule governs `if` statements, `if` expressions, `??`, and expression-`case`/`when` arms identically.
+**Merges must agree** (§28.3). owned ⊓ owned = owned. borrowed ⊓ borrowed = borrowed, sources unioned. **owned ⊓ borrowed = rejected.** owned ⊓ moved-from = maybe-consumed (unreadable). The rule governs `if` statements, `if` expressions, `??`, and expression-`case` arms identically.
 
 **The consume-site freeze** (§28.3). Consuming an owned **binding** while a **live local borrow of its current value** exists is a compile error. Frozen: every transfer (a `move` at an argument, binding, assignment or arm; a store into an `owned` field, an owning slot or a `set(owned)`; a `return` under an `owned` or mint-announcing return; an owning iterator's `yield return`) and drop-on-overwrite. **Not** frozen — these are site-announced kills, permitted while borrows live: an explicit `Dispose()` (including `x?.Dispose()`), the discard `_ := x;`, `throw x`, and a Pattern B `await` on an owned `OwningTask<T>` binding. Fields and collection slots are **not** frozen. The mechanical rewrite for the frozen case is **transfer first, then re-borrow from the new owner**.
 
@@ -608,7 +604,7 @@ Everything below is transcribed from `Bezel_Standard_Library.md` v0.282 with its
 |---|---|---|
 | `System` | auto | `Console`, `Math`, `Convert`, `Environment`, temporal types, `Guid`, `Random`, the core interfaces, `Type`, the serialization vocabulary, `Shared`/`Weak`, `Result`, `ScopeGuard`, `Subscription`, the FFI carriers |
 | `System.Text` | auto | `StringBuilder`, `Encoding`, `ReadOnlyStringSpan` |
-| `System.Collections.Generic` | **explicit** | the collections — *except* the iteration interfaces (`IEnumerable`/`IEnumerator`/`IAsyncEnumerable`/`IAsyncEnumerator`/`IOwning*`), which are auto |
+| `System.Collections.Generic` | **auto** (v0.289) | every §4 name — the collections, the spans, `Counter`, `FrozenArray`, `IEqualityComparer`, `KeyNotFoundException`, the iteration interfaces. An explicit `import` line is legal and redundant |
 | `System.Collections.Linq` | **auto** (v0.278) | the query operators. No `import` needed — §2.3's invariant: a stdlib extension over an always-available type is auto-imported |
 | `System.Threading` | **explicit** | *except* `CancellationToken`, `Subscription`, and the six event types, which are auto — `CancellationTokenSource` itself needs the import |
 | `System.IO` | **explicit** | `Stream`, `FileStream`, `File`, `TextReader`/`TextWriter`, `Directory`, `Path` |
@@ -662,9 +658,9 @@ public static class Math
   public static pure method Pow(x: double, y: double): double;
   public static method DivRem(a: int, b: int, out remainder: int): int;   // + long form; NOT pure
   public static pure method Floor/Ceiling/Truncate(x: double): double;
-  public static pure method Round(x: double[, digits: int]): double;
+  public static pure method Round(x: double, digits: int := 0): double;
   public static pure method Floor/Ceiling/Truncate(x: decimal): decimal;  // no Math.Round(decimal)
-  public static pure method Sign(int|long|double|decimal): int;
+  public static method Sign<T>(x: T): int where T: INumber<T>;   // NOT pure (v0.290); -1/0/1; NaN → 0; no char argument
   public static pure method Fmod(x, y: double): double;   IEEERemainder(x, y: double): double;
 end
 ```
@@ -705,7 +701,7 @@ public interface IFormattable      method ToString(format: string): string;   en
 public class Subscription  destructor; end     // no public ctor; returned as `owned Subscription`
 ```
 
-`IComparable<T>`/`IEquatable<T>` are **invariant**. `BitConverter`: `FloatToInt32Bits`, `Int32BitsToFloat`, `DoubleToInt64Bits`, `Int64BitsToDouble`, `Reinterpret<TTo>(value)`. `Type` (`public sealed class`): `Name` (the identifier alone), `FullName` (module path + enclosing-type path + identifier, `"M.Outer.Inner"`), `IsClass/IsInterface/IsRecord/IsEnum/IsChoice/IsPrimitive/IsInlineArray/IsFunctionType/IsValueType`, `BaseType: Type?`, `Implements(iface)`, `IsAssignableFrom(other)`, `EnumNames`, `EnumValues` — **no member reflection at all** (declined, not deferred).
+`IComparable<T>`/`IEquatable<T>` are **invariant**. `BitConverter`: `FloatToInt32Bits`, `Int32BitsToFloat`, `DoubleToInt64Bits`, `Int64BitsToDouble`, `Reinterpret<TTo>(value)`. `Type` (`public sealed class`): `Name` (the identifier alone), `FullName` (module path + enclosing-type path + identifier, `"M.Outer.Inner"`), `IsClass/IsInterface/IsRecord/IsEnum/IsChoice/IsPrimitive/IsInlineArray/IsFunctionType/IsValueType`, `BaseType: Type?`, `IsAssignableFrom(other)` (interface conformance is `iface.IsAssignableFrom(t)` — there is no `Implements`), `EnumNames`, `EnumValues` — **no member reflection at all** (declined, not deferred).
 
 **Format specifiers** (invariant culture only; an unrecognized specifier raises `FormatException`): integers `D`/`Dn`, `X`/`x`/`Xn`, `B` (no grouping separators); `double`/`float` `F`/`Fn` (default 2), `E`/`En`, `G`/`Gn`, `P`/`Pn`, `R`; `decimal` `F`/`Fn`, `E`/`En`, `G`, `P`/`Pn` (midpoints half-to-even); `DateTime`/`DateOnly`/`TimeOnly` patterns of `yyyy MM dd HH mm ss fff` with every other character a literal; `TimeSpan` `c`; `Guid` `D`/`N`; `bool`, `char`, `string` take **none** — a format spec on those is a compile error. **`C` (currency) deliberately does not exist**: write `$"{amount:F2} EUR"`.
 
@@ -772,11 +768,11 @@ end
 
 `StringBuilder` — `constructor()`, `(capacity: int)`, `(initial: string)`; `Length: int`, `pure Capacity: int`; `Append(string|char|Object|bool|int|byte|sbyte|short|ushort|uint|long|ulong|float|double|decimal|ReadOnlyStringSpan): StringBuilder`; `AppendLine()`, `AppendLine(value: string)`; `AppendFormat(format: string, args: Array<Object>)`; `Insert(index, value: string)`, `Remove(startIndex, length)`, `Replace(oldValue, newValue: string)`, `Clear()` — all returning `StringBuilder`; `ToString(): string`.
 
-`Encoding` (`public abstract class`) — `abstract GetBytes(s: string): owned Array<byte>`; `abstract GetString(bytes: Array<byte>)`, `GetString(bytes, start, length)` (params renamed v0.282), `GetString(bytes: ReadOnlySpan<byte>)`, `GetString(bytes: ReadOnlyArraySpan<byte>)`; `abstract GetByteCount(s: string): int`; `abstract GetBytes(s: string, destination: Span<byte>): int`; `abstract GetByteCount(s: ReadOnlyStringSpan): int`; `abstract GetBytes(s: ReadOnlyStringSpan, destination: Span<byte>): int`; `abstract GetBytes(s: ReadOnlyStringSpan): owned Array<byte>`; `abstract readonly property Name: string`; `static readonly property UTF8, UTF16, UTF32, ASCII: Encoding`. Malformed input raises `FormatException`, **never** a replacement character. UTF8 emits no BOM; UTF16/UTF32 are little-endian only.
+`Encoding` (`public abstract class`) — `abstract GetBytes(s: string): owned Array<byte>`; `abstract GetString(bytes: Array<byte>)`, `GetString(bytes: ReadOnlySpan<byte>)`, `GetString(bytes: ReadOnlyArraySpan<byte>)` (a window over an array is `GetString(bytes.AsReadOnlySpan(start, length))` — there is no `(bytes, start, length)` form); `abstract GetByteCount(s: string): int`; `abstract GetBytes(s: string, destination: Span<byte>): int`; `abstract GetByteCount(s: ReadOnlyStringSpan): int`; `abstract GetBytes(s: ReadOnlyStringSpan, destination: Span<byte>): int`; `abstract GetBytes(s: ReadOnlyStringSpan): owned Array<byte>`; `abstract readonly property Name: string`; `static readonly property UTF8, UTF16, UTF32, ASCII: Encoding`. Malformed input raises `FormatException`, **never** a replacement character. UTF8 emits no BOM; UTF16/UTF32 are little-endian only.
 
 `ReadOnlyStringSpan` — `public record (Source: string, Start: int, Length: int): IReadOnlySpan<char>`; **ordinary record, not borrow-bearing**. `property [i: int]: char { get }`; `pure IsEmpty: bool`; `pure Slice(start, length) / Slice(start) / Slice(r: Range<int>)`; `pure IndexOf(char|ReadOnlyStringSpan|string): int`; `pure Contains(…): bool`; `pure StartsWith`/`EndsWith(ReadOnlyStringSpan|string): bool`; `pure SequenceEqual(ReadOnlyStringSpan|string|IReadOnlySpan<char>): bool`; `CopyTo(destination: Span<char>)` (**not pure**); `pure ToString(): string`. `ReadOnlyAsciiByteSpan` was **retired** and does not exist.
 
-### 5.4 `System.Collections.Generic` (explicit import)
+### 5.4 `System.Collections.Generic` (auto-imported, v0.289)
 
 ```bezel
 public interface IReadOnlyCollection<out T>: IEnumerable<T>   pure readonly property Count: int;  end
@@ -808,7 +804,7 @@ public class Array<T>: IList<T>                      // borrowing, resizable
   pure readonly property Count: int;   pure readonly property Capacity: int;   property [i: int]: T;
   method Add(item: T);  AddRange(items: IEnumerable<T>);  Insert(index, item);  RemoveAt(index);
   method Remove(item: T): bool;  Clear();  Contains(item: T): bool;
-  method IndexOf(item: T): int;  IndexOf(item: T, startIndex: int): int;  LastIndexOf(item: T): int;
+  method IndexOf(item: T, startIndex: int := 0): int;   LastIndexOf(item: T): int;
   method Sort(comparer: (T, T) -> int);   method Reverse();                        // in place
   method Sorted(comparer: (T, T) -> int): owned Array<T>;   Reversed(): owned Array<T>;
   method ToArray(): owned Array<T>;
@@ -1005,7 +1001,7 @@ end                                             // `Slice` is deliberately NOT o
 
 `Span<T>`/`ReadOnlySpan<T>` are **borrow-bearing records** bounded by the buffer's lifetime; never an `async` method's parameter or result. **There is no implicit `Span<T>` → `ReadOnlySpan<T>` conversion** — call `.AsReadOnly()`. Spans do **not** implement `IEnumerable<T>`; `for` over a span is a direct indexed loop. `Span<T>` and `ArraySpan<T>` are **not interchangeable**. The `AsSpan`/`AsReadOnlySpan` factories and `Slice(r: Range<int>)` validate eagerly (`IndexOutOfRangeException`); direct constructors and `Slice(start[, length])` do not. **There is no writable-span interface.**
 
-**Byte accessors** (`public extension` on `ReadOnlySpan<byte>`/`Span<byte>`, mirrored on `ReadOnlyArraySpan<byte>`/`ArraySpan<byte>`): `Read{Int16,UInt16,Int32,UInt32,Int64,UInt64,Float,Double}{LittleEndian,BigEndian}()` and the matching `TryRead…(out value: T): bool`; on the writable spans additionally `Write…{LittleEndian,BigEndian}(value: T)` and `TryWrite…(value: T): bool`. **Endianness is in the name — there is no platform-default form, no enum parameter, and no offset parameter; slice first.** A short span raises `IndexOutOfRangeException`; a false `TryWrite*` leaves the span unmodified.
+**Byte accessors** (the read tier is one `public extension IReadOnlySpan<byte>` — every byte span of both families is a receiver; the write tier is declared on `Span<byte>` and `ArraySpan<byte>`): `Read{Int16,UInt16,Int32,UInt32,Int64,UInt64,Float,Double}{LittleEndian,BigEndian}()` and the matching `TryRead…(out value: T): bool`; on the writable spans additionally `Write…{LittleEndian,BigEndian}(value: T)` and `TryWrite…(value: T): bool`. **Endianness is in the name — there is no platform-default form, no enum parameter, and no offset parameter; slice first.** A short span raises `IndexOutOfRangeException`; a false `TryWrite*` leaves the span unmodified.
 
 **Bit tier** (v0.264): four borrow-bearing records — `BitReader(Source: ReadOnlySpan<byte>, BitStart: int, BitLength: int)`, `BitWriter(Source: Span<byte>, …)` and their `ArrayBitReader`/`ArrayBitWriter` mirrors over the array spans — reached by `pure AsBitReader()` on the read-only spans and `AsBitReader()` (**not pure**) / `pure AsBitWriter()` on the writable ones. Each carries `pure IsEmpty`, `pure IsByteAligned`, `pure Slice` ×3, `pure AlignToByte()`, `AlignedTail()`, plus `ReadBitsBigEndianMsbFirst(count: int): ulong`, `ReadBitsLittleEndianLsbFirst(count: int): ulong`, `ReadBitMsbFirst()`/`ReadBitLsbFirst(): bool` and their `TryRead…(…, out value): bool` forms — the writer swapping reads for `WriteBits…(value: ulong, count: int)`/`WriteBit…(value: bool)`/`TryWrite…` and adding `AsReadOnly()`. Only **two** of the four bit-order × byte-order combinations exist; every multi-bit read returns `ulong` and every multi-bit write takes one (**no signed form**); a reader does not advance itself — slice to advance.
 
@@ -1035,7 +1031,7 @@ public class Counter<K>: IEnumerable<DictionaryEntry<K, int>> where K: hashable
   constructor();
   method Increment(key: K, delta: int := 1);     // absent key is created at `delta`; negative admitted
   method CountOf(key: K): int;                   // 0 when absent — NOT pure
-  method ContainsKey(key: K): bool;              // distinguishes present-at-zero from absent
+  method Contains(key: K): bool;                 // distinguishes present-at-zero from absent; enables `key in tally`. No ContainsKey on Counter
   method Remove(key: K): bool;   Clear();
   pure readonly property Count: int;             // distinct keys
   pure readonly property Total: int;             // sum of counts; may be negative
@@ -1168,7 +1164,7 @@ public class Task
   static method FromOwnedResult<T>(owned value: T): OwningTask<T> where T: class;
   static method FromException<T>(owned exception: Exception): Task<T>;   FromCancelled<T>(): Task<T>;
   static method FromException(owned exception: Exception): Task;         FromCancelled(): Task;
-  static method Delay(milliseconds: int[, token]): Task;   Delay(duration: TimeSpan[, token]): Task;
+  static method Delay(milliseconds: int, token: CancellationToken := CancellationToken.None): Task;   Delay(duration: TimeSpan, token := CancellationToken.None): Task;
   static method WhenAll(tasks: Array<Task>): Task;
   static method WhenAll<T>(tasks: Array<Task<T>>): Task<Array<T>>;                        // non-class T
   static method WhenAll<T>(owned tasks: OwningArray<OwningTask<T>>): OwningTask<OwningArray<T>> where T: class;
@@ -1275,7 +1271,7 @@ public abstract class TextWriter          // Write(value: string|char|Object); W
 end
 public static class Directory
   Exists(path: string): bool;   CreateDirectory(path: string);
-  Delete(path: string);         Delete(path: string, recursive: bool);
+  Delete(path: string, recursive: bool := false);   // IOException if non-empty and not recursive
   GetFiles(path: string): owned Array<string>;   GetDirectories(path: string): owned Array<string>;
 end
 public static class Path                  // exactly six members
@@ -1288,7 +1284,7 @@ end
 
 ### 5.8 `System.Diagnostics`
 
-`Stopwatch` — `constructor()`, `static method StartNew(): owned Stopwatch`; `IsRunning: bool`, `Elapsed: TimeSpan`, `ElapsedMilliseconds: long`; `Start()`, `Stop()`, `Restart()`, `Reset()`. `Debug` — `Assert(condition: bool)`, `Assert(condition: bool, message: string)`, `WriteLine(message: string)`. **`Debug.Assert` terminates the process; it never throws**, and calls may be elided in release builds.
+`Stopwatch` — `constructor()`, `static method StartNew(): owned Stopwatch`; `IsRunning: bool`, `Elapsed: TimeSpan`, `ElapsedMilliseconds: long`; `Start()`, `Stop()`, `Reset()` — **no `Restart`**: write `sw.Reset(); sw.Start();`. `Debug` — `Assert(condition: bool, message: string := "")` (an empty message reports as no message), `WriteLine(message: string)`. **`Debug.Assert` terminates the process; it never throws**, and calls may be elided in release builds.
 
 ### 5.9 Primitives
 
@@ -1307,19 +1303,19 @@ public class String: IEnumerable<char>, IComparable<string>, IEquatable<string>
   static From(value: CString|WString): string;   static FromCStringPointer/FromWStringPointer(p: IntPtr): string;
   static pure Repeat(c: char, count: int): string;    static pure Repeat(unit: string, count: int): string;
   static Join(separator: string, items: IEnumerable<string>): string;
-  static pure IsNullOrEmpty(value: string?): bool;    static pure IsNullOrWhiteSpace(value: string?): bool;
+  static pure IsNullOrWhiteSpace(value: string?): bool;    // no IsNullOrEmpty — write `s = null or s.IsEmpty` (or `s?.IsEmpty ?? true`)
   pure Contains(string|char): bool;  pure StartsWith(string): bool;  pure EndsWith(string): bool;
-  pure IndexOf(char|string[, startIndex: int]): int;   pure LastIndexOf(char|string): int;
+  pure IndexOf(char|string, startIndex: int := 0): int;   pure LastIndexOf(char|string): int;
   pure Substring(startIndex[, length]): string;
   pure AsSpan([start[, length]] | r: Range<int>): ReadOnlyStringSpan;
   pure Trim() / Trim(chars: IEnumerable<char>) / TrimStart() / TrimEnd() / ToUpper() / ToLower(): string;
   pure Replace(oldChar: char, newChar: char) / Replace(oldValue: string, newValue: string): string;
-  pure PadLeft/PadRight/PadCenter(totalWidth: int[, paddingChar: char]): string;
+  pure PadLeft/PadRight/PadCenter(totalWidth: int, paddingChar: char := ' '): string;
   pure Insert(startIndex: int, value: string): string;   pure Remove(startIndex[, length]): string;
   method Split(separator: char): owned Array<string>;
   method Split(separator: string): owned Array<string>;
   method Split(separators: Array<char>): owned Array<string>;
-  pure CompareTo(other: string): int;   static pure Compare(a, b[, ignoreCase: bool]): int;
+  pure CompareTo(other: string): int;   pure CompareTo(other: string, ignoreCase: bool): int;   // no static string.Compare — `a.CompareTo(b, ignoreCase := true)`
   pure Equals(other: string?[, ignoreCase: bool]): bool;
   pure override Equals(other: Object?): bool;   pure override GetHashCode(): int;   pure override ToString(): string;
   method ToCharArray(): owned Array<char>;      method GetEnumerator(): owned IEnumerator<char>;
@@ -1343,17 +1339,17 @@ The carriers are `IntPtr`/`UIntPtr` (records: `static readonly property Zero`, `
 
 Every absence below was verified by a full-document search. Reaching for one of these is the failure this document exists to prevent.
 
-**I/O.** `MemoryStream` (→ `OwningBuffer<byte>` + spans; for serializers, `JsonSerializer.ToBytes()`); `File.Open`/`OpenRead`/`OpenWrite`/`OpenText`/`AppendAllText`/`AppendAllLines` (→ `new FileStream(path, mode[, access])`, `FileMode.Append`); `File.ReadAllBytesAsync`/`ReadAllLinesAsync`/`WriteAllBytesAsync` (the async `File` surface is **text-only** → `FileStream.ReadAllAsync`/`ReadAsync`/`WriteAsync`); `StreamReader`/`StreamWriter`/`BufferedStream`; async `TextReader`/`TextWriter`; async **span** overloads on `Stream`; `Directory.Move`/`EnumerateFiles`/globbing; `Path.ChangeExtension`/`HasExtension`/`GetTempPath`/`DirectorySeparatorChar`; `Console.Read()`.
+**I/O.** `MemoryStream` (→ `OwningBuffer<byte>` + spans; for serializers, `JsonSerializer.ToBytes()`); `File.Open`/`OpenRead`/`OpenWrite`/`OpenText`/`AppendAllText`/`AppendAllLines` (→ `new FileStream(path, mode, access := FileAccess.ReadWrite)`, `FileMode.Append`); `File.ReadAllBytesAsync`/`ReadAllLinesAsync`/`WriteAllBytesAsync` (the async `File` surface is **text-only** → `FileStream.ReadAllAsync`/`ReadAsync`/`WriteAsync`); `StreamReader`/`StreamWriter`/`BufferedStream`; async `TextReader`/`TextWriter`; async **span** overloads on `Stream`; `Directory.Move`/`EnumerateFiles`/globbing; `Path.ChangeExtension`/`HasExtension`/`GetTempPath`/`DirectorySeparatorChar`; `Console.Read()`.
 
 **Query operators.** `ToList`, `ToLookup`, `Join`, `GroupJoin`, `Cast<T>`, `AsEnumerable`, `DefaultIfEmpty`, `Prepend`, `Append`, `Chunk`, `DistinctBy`, `UnionBy`/`IntersectBy`/`ExceptBy`, `MinBy`, `MaxBy`, `Order()`/`OrderDescending()`, `TakeLast`, `SkipLast`, `LongCount`, `Enumerable.Empty`/`Range`/`Repeat` (**there is no `Enumerable` class at all**), `SequenceEqual` over `IEnumerable<T>` (it exists only on the span types), `SelectMany` with a result selector, `Zip` without a combiner, `Where`/`Select` with an index, and an instance `ForEach(action)` on any sequence (`Array<T>` and `string` included — write the `for` loop). Replacements: `ToList` → `ToArray()`; `MinBy(f)` → `OrderBy(f).First()`; `Enumerable.Range` → the language's `1..n`, which is `IEnumerable<T>` (`(1..100).Sum()` works); `Append`/`Prepend` → `Concat` with a one-element `Array<T>`.
 
-**Collections.** `List<T>` (reserved name), `HashSet<T>` (→ `Set<T>`), `SortedList`, `PriorityQueue`, `Deque`, `ConcurrentDictionary`/`ConcurrentQueue`/`ConcurrentBag` (→ `Locked<T>` over a sendable collection, or `Channel<T>`), `ImmutableArray`/`ImmutableList`/`ImmutableDictionary` (→ `FrozenArray<T>`), `ReadOnlyDictionary`, `BitArray`, `Lookup`, `KeyValuePair` (→ `DictionaryEntry<K,V>`), `Tuple`/`ValueTuple` (**Bezel has no tuples** — use a record), `Nullable<T>` (→ `T?`), `IComparer<T>` (only `IEqualityComparer<T>` exists), `StringComparison`/`StringComparer`. Absent *members* on types that do exist: `Array<T>` has no `RemoveAll`, `FindIndex`, `FindAll`, `Find`, `Exists`, `BinarySearch`, `CopyTo`, `TrueForAll`, `GetRange`, `InsertRange`, `RemoveRange`, `ForEach`; `Dictionary` has no `GetValueOrDefault` (→ `GetOrNull`) — it *does* have `TryAdd` since v0.282; `Math` has no transcendental block since v0.284 (`Sin`/`Cos`/`Tan`/`Asin`/`Acos`/`Atan`/`Atan2`/`Sinh`/`Cosh`/`Tanh`/`Exp`/`Log`/`Log10`/`Log2`/`E` removed; `Sqrt`/`Pow`/rounding stay) and no `Hypot`/`Cbrt`/`PI` (never documented) — the compiler rejects every one of these with a removed-at-v0.284 diagnostic (#3559); `IEnumerable<T>` has no `OfType<U>` since v0.284 (#3559, rejected likewise); `Console` has no `Clear` since v0.284 (rejected as an unknown `Console` static, #3572); `OwningArray<T>` declares no `ToArray`/`Sorted`/`Reversed`; `OwningLinkedList<T>` has no source constructor; `Stack`/`Queue` have no `Add`/`Remove`/`IsReadOnly`.
+**Collections.** `List<T>` (reserved name), `HashSet<T>` (→ `Set<T>`), `SortedList`, `PriorityQueue`, `Deque`, `ConcurrentDictionary`/`ConcurrentQueue`/`ConcurrentBag` (→ `Locked<T>` over a sendable collection, or `Channel<T>`), `ImmutableArray`/`ImmutableList`/`ImmutableDictionary` (→ `FrozenArray<T>`), `ReadOnlyDictionary`, `BitArray`, `Lookup`, `KeyValuePair` (→ `DictionaryEntry<K,V>`), `Tuple`/`ValueTuple` (**Bezel has no tuples** — use a record), `Nullable<T>` (→ `T?`), `IComparer<T>` (only `IEqualityComparer<T>` exists), `StringComparison`/`StringComparer`. Absent *members* on types that do exist: `Array<T>` has no `RemoveAll`, `FindIndex`, `FindAll`, `Find`, `Exists`, `BinarySearch`, `CopyTo`, `TrueForAll`, `GetRange`, `InsertRange`, `RemoveRange`, `ForEach`; `Dictionary` has no `GetValueOrDefault` (→ `GetOrNull`) — it *does* have `TryAdd` since v0.282; `Math` has no transcendental block since v0.284 (`Sin`/`Cos`/`Tan`/`Asin`/`Acos`/`Atan`/`Atan2`/`Sinh`/`Cosh`/`Tanh`/`Exp`/`Log`/`Log10`/`Log2`/`E` removed; `Sqrt`/`Pow`/rounding stay) and no `Hypot`/`Cbrt`/`PI` (never documented) — the compiler rejects every one of these with a removed-at-v0.284 diagnostic (#3559); `IEnumerable<T>` has no `OfType<U>` since v0.284 (#3559, rejected likewise); `Console` has no `Clear` since v0.284 (rejected as an unknown `Console` static, #3572); `OwningArray<T>` declares no `ToArray`/`Sorted`/`Reversed`; `OwningLinkedList<T>` has no source constructor; `Stack`/`Queue` have no `Add`/`Remove`/`IsReadOnly`; `Counter<K>` has no `ContainsKey` (→ `Contains(key)`, `key in tally`, v0.290); `ArraySpan<T>`/`ReadOnlyArraySpan<T>` have no concrete cross-mode `SequenceEqual` (the `IReadOnlySpan<T>` overload takes the other family's span directly, v0.290).
 
-**Text.** `string.Format`/`String.Format` (**use interpolation**), `String.Empty` (use `""`), `string.Concat`, `Split` with a remove-empty option, `Regex`, `ToTitleCase`, `Normalize`, the `StringBuilder.Length` setter, the `C` format specifier, any culture-aware formatting.
+**Text.** `string.Format`/`String.Format` (**use interpolation**), `String.Empty` (use `""`), `string.Concat`, `Split` with a remove-empty option, `Regex`, `ToTitleCase`, `Normalize`, the `StringBuilder.Length` setter, the `C` format specifier, any culture-aware formatting, `string.IsNullOrEmpty` (→ `s = null or s.IsEmpty`, v0.290), the static `string.Compare(a, b[, ignoreCase])` (→ `a.CompareTo(b)`, `a.CompareTo(b, ignoreCase := true)`, v0.290).
 
 **Concurrency.** `Thread`, `ThreadPool`, `Monitor`, a `lock` statement (→ `Mutex`/`Locked<T>`), `Interlocked` (→ `Atomic<T>`), `ManualResetEvent`/`AutoResetEvent`/`CountdownEvent`/`Barrier`, `Task.Run` (→ `Domain.Spawn`), `Task.CompletedTask` (→ `Task.FromResult`), `Task.Yield`, `ConfigureAwait`, `Task.Wait`/`.Result` inside async code, `AggregateException` (first fault wins; **no aggregation**), `Parallel.For`.
 
-**Everything else.** `Object.MemberwiseClone` and any clone facility, `ICloneable`, member reflection (**declined, not deferred**), attributes, `Activator`, `Lazy<T>`, `WeakReference` (→ `Weak<T>`), `Option<T>` (→ `T?`), `Result.Unwrap`/`UnwrapOrElse`, `Math.Round(decimal)` (→ `Decimal.Round`), `Math.Cbrt`/`Hypot`/`BigMul`, `Random.Shared`, cryptographic randomness, a `Guid` constructor, `Environment.StackTrace`/`CurrentDirectory`/`TickCount`, `Convert` from any non-`string` source, `Encoding.GetEncoding(name)`/`Encoding.Default`, `OutOfMemoryException`, `InnerException` on user exception types, multidimensional arrays, `defer`/`errdefer` (→ `ScopeGuard`).
+**Everything else.** `Object.MemberwiseClone` and any clone facility, `ICloneable`, member reflection (**declined, not deferred**), attributes, `Activator`, `Lazy<T>`, `WeakReference` (→ `Weak<T>`), `Option<T>` (→ `T?`), `Result.Unwrap`/`UnwrapOrElse`, `Math.Round(decimal)` (→ `Decimal.Round`), `Math.Cbrt`/`Hypot`/`BigMul`, `Random.Shared`, cryptographic randomness, a `Guid` constructor, `Environment.StackTrace`/`CurrentDirectory`/`TickCount`, `Convert` from any non-`string` source, `Encoding.GetEncoding(name)`/`Encoding.Default`, `Encoding.GetString(bytes, start, length)` (→ `GetString(bytes.AsReadOnlySpan(start, length))`, v0.290), `Stopwatch.Restart()` (→ `Reset(); Start();`, v0.290), `Type.Implements(iface)` (→ `iface.IsAssignableFrom(t)`, v0.290), `Math.Sign(c: char)` (`Sign<T>` needs `INumber<T>` — `Math.Sign(int(c))`), `OutOfMemoryException`, `InnerException` on user exception types, multidimensional arrays, `defer`/`errdefer` (→ `ScopeGuard`).
 
 ### 5.12 The `pure` inventory
 
@@ -1461,8 +1457,6 @@ end Pooling;
 **The Try shape, and `out using var`.**
 
 ```bezel
-import System.Collections.Generic;
-
 public class ConnectionPool
   private owned _cache: OwningDictionary<string, Connection> := new OwningDictionary<string, Connection>();
 
@@ -1483,7 +1477,7 @@ public class ConnectionPool
 end ConnectionPool;
 ```
 
-`out owned` in the signature ⇄ `out using var` (or `out owned var`) at the call site; the compiler rejects a mismatch in either direction. Without `when true` the caller would need `c!`: a `bool` guard alone does not narrow.
+`out owned` in the signature ⇄ `out using var` at the call site (or `out var c`, which then binds an owned local you discharge yourself); `out using var` against a plain `out` is rejected. Without `when true` the caller would need `c!`: a `bool` guard alone does not narrow.
 
 **`Result<T, E>` and an exhaustive `case`.** In a **declared-result position** — a `return` operand, or an expression body checked against a declared type — the bare case name resolves against that type (§35.3); everywhere else the qualified form `Result<int, string>.Ok(v)` is required.
 
@@ -1611,6 +1605,9 @@ var ys := [1, 2, 3];                                        // WRONG: no target 
 var sd: SortedDictionary<string, int> := ["a": 1];          // WRONG: the dictionary literal targets only Dictionary/OwningDictionary (§15.4)
 var max := a > b ? a : b;                                   // WRONG: no `?:` operator
 x := y++;   ++c;   if count++ > 3 then ... end;               // WRONG: `++` is a postfix STATEMENT
+var g := (when s >= 90 => "A", _ => "F");                    // WRONG: no `when` construct (retired v0.289) — `(if s >= 90 then "A" else "F")`
+when c1 => A(), _ => B() end when;                            // WRONG: same — `if c1 then A(); else B(); end;`
+public static method operator ++(c: Counter): Counter => …;   // WRONG: `++`/`--` are not overloadable (v0.289) — declare `operator +`, write `c := c + 1;`
 if count then ... end;                                        // WRONG: no truthiness
 var (a, b) := point;                                        // WRONG: destructuring is pattern-position only
 public method Log(params items: Array<string>);             // WRONG: no `params`
@@ -1786,6 +1783,7 @@ public method Bumped(): Tally => this with(Hits := Hits + 1);   // return the up
 ```bezel
 method TryGet(k: string, out v: Conn?): bool;
 method TryGet(k: string, out owned v: Conn?): bool;   // ERROR at the second declaration
+pool.TryPopCached("p", out owned var c);   // ERROR: no `out owned var` (retired v0.289) — `out var c` adopts owned; `out using var c` scope-binds it
 seen.Add(candidate);                     // ERROR when Add takes `owned`: write Add(move candidate)
 r.Append(move new Widget());             // ERROR: a fresh producer announces itself
 return move fresh;                       // ERROR: `return` under `owned` is a marker-free position
@@ -2019,7 +2017,20 @@ public method WithValue(v: int): Port => new Port(v);      // the sanctioned upd
 
 ### 8.5 v0.246 — the use-site transfer marker is `move`, not `owned`
 
-Through v0.245 the marker was spelled `owned` at binding positions. After v0.246, **`owned` appears only where a slot is described, and `move` only where an action occurs.** Any code with `owned` in an argument or right-hand-side position is pre-v0.246 and wrong: `TakeOwnership(owned resource)` → `TakeOwnership(move resource)`; `var y := owned x;` → `var y := move x;`; `case owned outcome of …` → `case move outcome of …`; `using var c := owned conn;` → `using var c := move conn;`. `owned` (declarative) is correct in exactly these positions: parameters (`owned x: T`), fields (`private owned _f: T;`), return types (`: owned T`), `out owned var x`, function-type slots, choice payloads, `[N owned]T`, `static owned readonly`. Nothing else.
+Through v0.245 the marker was spelled `owned` at binding positions. After v0.246, **`owned` appears only where a slot is described, and `move` only where an action occurs.** Any code with `owned` in an argument or right-hand-side position is pre-v0.246 and wrong: `TakeOwnership(owned resource)` → `TakeOwnership(move resource)`; `var y := owned x;` → `var y := move x;`; `case owned outcome of …` → `case move outcome of …`; `using var c := owned conn;` → `using var c := move conn;`. `owned` (declarative) is correct in exactly these positions: parameters (`owned x: T`), fields (`private owned _f: T;`), return types (`: owned T`), function-type slots, choice payloads, `[N owned]T`, `static owned readonly`. Nothing else.
+
+### 8.6 v0.289 — four retirements: `when`, `out owned var`, `operator ++`/`--`, and the collections import
+
+- **`(when …)` / `when … end when;` are gone.** A ladder of conditions is `(if c1 then a elif c2 then b else z)` or `if c1 then … elif c2 then … else … end;` — same type, same order, same ownership meet. `when` survives only as the arm guard (`var t when t > 30 => …`) and the `when true`/`when false` clause.
+- **`out owned var x` is gone.** `out var x` adopts the signature: a borrow against `out`, an owned local against `out owned` (discharge it yourself, or use `out using var x`, which is accepted only against `out owned`).
+- **`operator ++`/`operator --` are gone.** `++`/`--` are built-in statements on integer, floating-point, `decimal` and `char` operands only (§6.6's set — `char++` still works). Declare `operator +(c: Counter, n: int)` and write `c := c + 1;`, or use a named method.
+- **`import System.Collections.Generic;` is redundant.** Every §4 name is bare-visible (`Dictionary`, `Set`, `Stack`, `Queue`, the spans, `Counter`, `FrozenArray`, `KeyNotFoundException`, the iteration interfaces). The line still compiles. Beware the new bare names when naming your own types: a same-named type in your module shadows the import; a same-named export from another imported module is an ambiguity error.
+
+### 8.7 v0.290 — the stdlib regularization: nine defaults, four retired duals, one interface-declared read tier
+
+- **Optional trailing arguments are `:=` defaults now** — `Task.Delay(ms, token := …)`, `Directory.Delete(path, recursive := false)`, `Pad*(width, paddingChar := ' ')`, `new FileStream(path, mode, access := FileAccess.ReadWrite)`, `new BinaryDeserializer(span, ignoreUnknownFields := false)` / `Binary.Parse<T>(span, ignoreUnknownFields := false)` (both span families), `Debug.Assert(cond, message := "")`, `Math.Round(x, digits := 0)`, `IndexOf(value, startIndex := 0)` on `string` and `Array<T>`. Every call you wrote before still compiles; named arguments for the defaulted position are new.
+- **Gone:** `string.IsNullOrEmpty(s)` (→ `s = null or s.IsEmpty`); static `string.Compare(a, b[, ic])` (→ `a.CompareTo(b)`, `a.CompareTo(b, ignoreCase := true)`); `sw.Restart()` (→ `sw.Reset(); sw.Start();`); `t.Implements(i)` (→ `i.IsAssignableFrom(t)`); `enc.GetString(bytes, start, length)` (→ `enc.GetString(bytes.AsReadOnlySpan(start, length))`); `tally.ContainsKey(k)` on `Counter<K>` (→ `tally.Contains(k)` / `k in tally`); `Math.Sign` on a `char` (→ `Math.Sign(int(c))`). `Math.Sign<T>` is generic over `INumber<T>` and is **not** `pure`.
+- **The byte read tier is one block on `IReadOnlySpan<byte>`.** Nothing changes at a call: `bytes.AsReadOnlySpan().ReadUInt32LittleEndian()` and `span.ReadInt16BigEndian()` resolve as before. A parameter typed `IReadOnlySpan<byte>` now has the read accessors too.
 
 ---
 

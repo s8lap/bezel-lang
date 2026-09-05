@@ -1,6 +1,6 @@
 # Bezel Standard Library Specification
 
-**Companion to the Bezel Language Specification, v0.288 — September 2026**
+**Companion to the Bezel Language Specification, v0.291 — September 2026**
 
 This document specifies the standard library types referenced by the language specification. The language spec assumes these types exist and have certain shapes; this document defines those shapes.
 
@@ -12,7 +12,7 @@ The library is organized into modules. Some are auto-imported in every file; oth
 1. [Conventions](#1-conventions)
 2. [`System` (auto-imported)](#2-system-auto-imported)
 3. [`System.Text` (auto-imported)](#3-systemtext-auto-imported)
-4. [`System.Collections.Generic`](#4-systemcollectionsgeneric)
+4. [`System.Collections.Generic` (auto-imported)](#4-systemcollectionsgeneric-auto-imported)
 5. [`System.Collections.Linq`](#5-systemcollectionslinq)
 6. [`System.Threading`](#6-systemthreading)
 7. [`System.IO`](#7-systemio)
@@ -35,10 +35,20 @@ Throughout this document:
 - Implementations may add internal helper methods and private members. Anything documented here is part of the public contract.
 - Methods returning freshly-allocated class instances annotate the return type with `owned` to communicate the caller's disposal obligation (see [§28.3](Bezel_Language_Spec.md#sec-local-variables-ownership-and-borrows) and [§28.8](Bezel_Language_Spec.md#sec-ownership-transfer) of the language spec). Methods returning `string` or other runtime-managed types ([§28.9](Bezel_Language_Spec.md#sec-runtime-managed-types)) do not use `owned`, since those types are exempt from manual disposal. Two further families are deliberately unmarked, their declared return type itself being the transfer announcement — type-announced, and minting at every callee kind under one rule (calls mint, language spec [§28.3](Bezel_Language_Spec.md#sec-producers); unified v0.258): **`Task`-family returns** (v0.190 — every call whose declared return type is `Task`/`Task<T>`/`OwningTask<T>` mints a caller-owned task; [§6.7](#sec-task-static-helpers)) and **iterable-family returns** (every call whose declared return type is an iterable or enumerator interface or a lazy query mints a caller-owned frame — the lazy [§5](#sec-system-collections-linq) operators, `Drain()`, `ReceiveAll()` included). A *stored* task or collection view is re-exposed through a property, field, or slot, whose reads are borrows — never through an unmarked method return of a family type. Where a signature does spell `owned` on such a return (`GetEnumerator`, `Domain.Spawn`), it states the same contract with emphasis (v0.195).
 - Generic constraints are noted where relevant; absence of a constraint clause means "any T."
-- **The Try convention (v0.171, #1336; shape (c) codified v0.184; shape (d) v0.195).** Exactly three Try shapes are sanctioned for payload extraction, plus the payload-free shape (d) at the end of this bullet. **(a) `bool` + nullable out** — `TryX(..., out item: T?): bool` (with `owned` on the out where the payload transfers) — for keyed/positional extraction: the bool distinguishes the outcome from a legitimately-null payload, and, for a **generic or class-typed** payload, the out parameter is *nullable in every form*, because a class payload has no `default` to assign on the false path (spec §17.11) and a generic payload may be instantiated by a class; §22.3 requires every out assigned on every return path (v0.184 wording; throw paths carry no obligation), and the false path assigns `null`. **(b) nullable return** — `TryX(...): owned T?` — when null alone is the signal (e.g. `Mutex.TryAcquire` — simpler call sites; `Weak<T>.TryUpgrade` — the handle payload is statically non-nullable at every instantiation, so a bool would carry no information). **(c) `bool` + non-nullable value-typed out** — `TryX(..., out result: T): bool` with `default(T)` assigned on the false path (spec §22.3) — for APIs whose payload type is a **concrete value type**: the §9 primitive `TryParse` family, `Convert.TryTo*` (§2.3), the `DateTime`/`DateOnly`/`TimeOnly`/`Guid` `TryParse` members (§2.5/§2.6), and the §4.14/§4.15 `TryRead*` accessors. The `when true` postcondition does not apply — the out is never null, so `default(T)` (a real value distinguished only by the `bool`) is what the false path assigns. **Every shape-(a) signature in this document carries the `when true` nullability postcondition** on its out parameter (language spec §22.4, v0.183) — `TryX(..., out item: T? when true): bool` — so in a region where the call is known `true`, the recipient is narrowed non-null and no `!` is needed. The clause is elided from the per-type listings below for brevity but is normative for **every** shape-(a) member in this document (`TryGetValue`, `TryPop`/`TryPeek`/`TryDequeue`, `TryPopFirst`/`TryPopLast`, `Channel<T>.TryReceive`, `OwningSet<T>.TryPop`, `OwningDictionary<K, V>.TryPopValue`, and `IParsable<T>.TryParse` through the constraint). A fourth, payload-free shape exists alongside the three extraction shapes — **(d) bool-only attempt** (v0.195): `TryX(...): bool` with no out parameter, for operations whose only outcome is succeeded/declined and whose payload, if any, was passed *in* — `TryAdd` (§4.8–§4.10, §4.17/§4.18), the `TrySet*` completion family (§6.6), and the span `TryWrite*` accessors (§4.14/§4.15). Shape (d) carries no nullability postcondition: there is no out to narrow. **The `*OrNull` convenience tier (v0.231).** Beside the Try shapes, a surface may carry a nullable-return **convenience form**, named with the `OrNull` suffix (`ParseOrNull`, `GetOrNull`, `ReadKeyOrNull`, §5's `*OrNull` element accessors — `ElementAtOrNull` completing that set at v0.259) — a recorded tier in the sense of the no-dual rule below, and band 2's nullable-return value shape in the failure-signal rule below. The three access tiers, named: the **throwing form** (`Parse`, the `[key]` indexer) treats absence as a bug, the **`*OrNull` form** returns `T?` for direct `??`/`?.` composition where the payload can carry the signal (where it cannot — a nullable payload type — the surface carries the §7.10 conflation caveat: §4.8, §4.17, §5), and the **`Try` form** remains the only shape that distinguishes the outcomes a collapsed `T?` cannot (spec §7.10). Shape (b)'s `TryX` spelling stays reserved for acquisition-shaped members whose payload is statically non-nullable (`TryAcquire`, `TryUpgrade`).
+- **The Try convention (v0.171, #1336; shape (c) codified v0.184; shape (d) v0.195).** Four `Try` shapes are sanctioned — three for payload extraction and one payload-free — and the table is the rule:
+
+| Shape | Signature | False path | Members |
+|---|---|---|---|
+| **(a)** `bool` + nullable out | `TryX(..., out item: T? when true): bool` (`owned` on the out where the payload transfers) | assigns `null` | keyed/positional extraction: `TryGetValue`, `TryPop`/`TryPeek`/`TryDequeue`, `TryPopFirst`/`TryPopLast`, `Channel<T>.TryReceive`, `OwningSet<T>.TryPop`, `OwningDictionary<K, V>.TryPopValue`, and `IParsable<T>.TryParse` through the constraint |
+| **(b)** nullable return | `TryX(...): owned T?` | returns `null` | acquisition-shaped members whose payload is statically non-nullable at every instantiation: `Mutex.TryAcquire` (simpler call sites), `Weak<T>.TryUpgrade` (a bool would carry no information) |
+| **(c)** `bool` + non-nullable value-typed out | `TryX(..., out result: T): bool` | assigns `default(T)` (spec §22.3) | a **concrete value type** payload: the §9 primitive `TryParse` family, `Convert.TryTo*` (§2.3), the `DateTime`/`DateOnly`/`TimeOnly`/`Guid` `TryParse` members (§2.5/§2.6), the §4.14/§4.15 `TryRead*` accessors |
+| **(d)** bool-only attempt | `TryX(...): bool` — no out; the payload, if any, was passed *in* | — | succeeded/declined operations: `TryAdd` (§4.8–§4.10, §4.17/§4.18), the `TrySet*` completion family (§6.6), the span `TryWrite*` accessors (§4.14/§4.15) |
+
+Why the shapes split as they do. In (a) the bool distinguishes the outcome from a legitimately-null payload, and for a **generic or class-typed** payload the out parameter is *nullable in every form*, because a class payload has no `default` to assign on the false path (spec §17.11) and a generic payload may be instantiated by a class; §22.3 requires every out assigned on every return path (throw paths carry no obligation), and the false path assigns `null`. (b) is for members where null alone is the signal. In (c) the `when true` postcondition does not apply — the out is never null, so `default(T)` (a real value distinguished only by the `bool`) is what the false path assigns. (d) carries no nullability postcondition: there is no out to narrow. **Every shape-(a) signature in this document carries the `when true` nullability postcondition** on its out parameter (language spec §22.4, v0.183) — `TryX(..., out item: T? when true): bool` — so in a region where the call is known `true`, the recipient is narrowed non-null and no `!` is needed; the clause is elided from the per-type listings below for brevity but is normative for **every** shape-(a) member in this document (the table's (a) row names them). **The `*OrNull` convenience tier (v0.231).** Beside the Try shapes, a surface may carry a nullable-return **convenience form**, named with the `OrNull` suffix (`ParseOrNull`, `GetOrNull`, `ReadKeyOrNull`, §5's `*OrNull` element accessors — `ElementAtOrNull` completing that set at v0.259) — a recorded tier in the sense of the no-dual rule below, and band 2's nullable-return value shape in the failure-signal rule below. The three access tiers, named: the **throwing form** (`Parse`, the `[key]` indexer) treats absence as a bug, the **`*OrNull` form** returns `T?` for direct `??`/`?.` composition where the payload can carry the signal (where it cannot — a nullable payload type — the surface carries the §7.10 conflation caveat: §4.8, §4.17, §5), and the **`Try` form** remains the only shape that distinguishes the outcomes a collapsed `T?` cannot (spec §7.10). Shape (b)'s `TryX` spelling stays reserved for acquisition-shaped members whose payload is statically non-nullable (`TryAcquire`, `TryUpgrade`).
 - **Negative magnitudes fault (v0.183, #1396).** Every constructor parameter that states a magnitude — `capacity`, `size`, `length` — raises `ArgumentOutOfRangeException` when passed a negative value: `StringBuilder(capacity)`, `Array<T>(capacity)`, `Array<T>(size, fill)`, `OwningArray<T>(capacity)`, the `Dictionary`/`OwningDictionary`/`Set`/`OwningSet` capacity forms, and `OwningBuffer<T>(length)` with its `init` overloads. Zero is valid (an empty container or zero-length buffer). A negative magnitude is a programming error, not a request — the defined-fault stance of `DateTime`'s component validation (§2.5), chosen over a silent empty fallback. (`Channel<T>(capacity)` is stricter under its own v0.174 contract — `capacity >= 1`, `ArgumentException` otherwise — and is unchanged.)
 - **The `Async` suffix (v0.195).** The suffix marks the asynchronous member of a sync/async pair (`Acquire`/`AcquireAsync`, `Send`/`SendAsync`, `ReadAll`/`ReadAllAsync`, `Lock`/`LockAsync`); an operation that exists only in asynchronous form carries no suffix (`Channel<T>.Receive`, `TaskScope.Join`, `Task.Delay`). `Receive` beside `SendAsync` on the §6.9 endpoint pair is this rule at work, not an inconsistency.
 - **Borrowing/owning duals are overloads, not `Owned`-suffixed names (v0.250).** Where one operation has a borrowing and an owning argument-side form, the two are declared as a same-name overload pair — distinguished by parameter type where the types already differ (the merged `Task.WhenAll`/`WhenEach`, §6.7: ordinary applicability selects, with spec [§22.3](Bezel_Language_Spec.md#sec-parameter-modifiers)'s call-site marker spelling the consuming form), or by `owned` on the marked parameter where they do not (spec [§22.6](Bezel_Language_Spec.md#sec-owned-and-overload-resolution)'s ownership-mode applicability) — and the `Owned` name suffix for such duals is retired where the pair is declarable. *Return-side* `Owned` names — the `ParseOwned` family (`Json.ParseOwned<T>`, `Binary.ParseOwned<T>`) — stand because the return position carries no call-site marker and no overloading-by-return exists; there the name is the §28.3 type-announcement discipline at a static producer. `Task.FromOwnedResult` marks its *parameter* and stands for a different reason: its would-be pair with `FromResult` is undeclarable under spec [§22.6](Bezel_Language_Spec.md#sec-overloading)'s declaration guard — no [§14.2](Bezel_Language_Spec.md#sec-constraints) constraint spells the owning-generic domain ([§14.4](Bezel_Language_Spec.md#sec-owned-as-a-generic-argument)'s recorded imprecision) — so the argument-side name carries the distinction the overload cannot. Stdlib pairs do not declare a default value on the marked position (the two-defaults-filled ambiguity of spec [§22.6](Bezel_Language_Spec.md#sec-overloading) would make the argument-omitting call unwritable).
+- **An optional trailing argument is a `:=` default, not an overload pair (v0.290).** Where one operation takes an optional trailing argument with a nameable default — a literal, a constant, `default(T)` (spec [§22.5](Bezel_Language_Spec.md#sec-optional-parameters-and-named-arguments)'s permitted default-value expressions) — this document declares **one** signature carrying the default (`Task.Delay(milliseconds, token := CancellationToken.None)`, `Directory.Delete(path, recursive := false)`, `Debug.Assert(condition, message := "")`), and the parameter's name is API surface exactly as at any other position. A same-name pair is declared where the two forms differ by parameter *type* or by `owned` (the duals above); where the shorter form is an interface-required member whose signature must match exactly (spec [§11.2](Bezel_Language_Spec.md#sec-interface-declaration)) — `String.CompareTo`/`Equals` beside their `ignoreCase` forms ([§9.6](#sec-string)); or where the omitted argument has **no nameable default** — the *to-the-end* window forms (`Slice`, `AsSpan`, `AsReadOnlySpan`, `Substring`, `String.Remove`), whose shorter form means the remainder of the sequence rather than a default value, and the [§2.15](#sec-concrete-serialization-formats) JSON facade's `options: JsonOptions`, which names no default constant (`DECLINED.md`, *One-shot serialization facade alternatives*).
 - Compiler-intrinsic types (primitive wrappers, `Range<T>`) may declare `const` members whose values are provided by the compiler rather than by a source-level initializer expression. In the declarations below, a `const` field shown without `:= value` (e.g. `public static const MaxValue: double;`) is such a compiler-provided constant. User-defined code may not omit `const` initializers (see language spec [§22.12](Bezel_Language_Spec.md#sec-static-members)).
 - **Elided interface-required members.** When a class declares it implements an interface, the members required by that interface are part of the class's public contract whether or not the declaration shows them explicitly. Some declarations show every interface-required member; others elide the redundant ones with a marker comment such as `// plus standard ICollection<T> operations` or `// ICollection<T> operations plus:`. Both forms are equivalent — the elided members are still part of the public contract, with signatures determined by the interface declaration plus the implementation's type substitution (per the [§11.2](Bezel_Language_Spec.md#sec-interface-declaration) exact-match rule). For interfaces whose substitution produces a member with the same name but a different parameter type than another method on the class — `Dictionary<K, V>: ICollection<DictionaryEntry<K, V>>` is the leading example, where ICollection's `Add(item: T)` substitutes to `Add(item: DictionaryEntry<K, V>)` while Dictionary also offers `Add(key: K, value: V)` — both forms are public members of the class and both are reachable.
 - **An instance member blocks a same-named extension, document-wide (v0.259).** Extension resolution commits to instance members **by name** (spec [§26.5](Bezel_Language_Spec.md#sec-resolution) rule 1 — any arity, applicability, or accessibility), so wherever a type of this document declares (or inherits from a base type — §26.5 rule 1's own reach) an instance member named `Count`, `Contains`, `First`, `Last`, `Reverse`, or `ToArray`, that member — not the same-named [§5](#sec-system-collections-linq) operator — is what a call resolves to on that receiver, and the operator is unreachable there by name: `arr.Count(pred)` does not resolve to LINQ's predicate count on an `Array<T>`, because `Array<T>` declares the `Count` property. The semantics are usually equivalent where both exist (`Array<T>.Contains` and LINQ's `Contains` agree); the differences, where they exist, are the member's own documented behavior, and the composed spelling — `coll.Where(pred).Count()`; `Where` is shadowed nowhere in this document — reaches the operator pipeline. A per-name workaround tier (a `CountWhere` beside the blocked `Count(pred)`) was **declined, evidence-gated (v0.259)**: it fixes one name of six while leaving `FirstWhere`/`LastWhere` undeclared, the one-call composition is already idiomatic, no corpus use or filed issue evidences the friction, and the recorded general remedy is the extension-call-disambiguation deferral (rationale [§18](Bezel_Design_Rationale.md#sec-things-deferred)). The reopening bar: field evidence that the collision costs real users real time on the `Count`/`Contains` names specifically — at which point the question is the `*Where` tier or the disambiguation syntax, not `CountWhere` alone.
@@ -63,7 +73,9 @@ The band-3/band-4 boundary, stated once: what distinguishes them is **where cons
 
 **`Count` vs `Length` (v0.231).** `Length` measures a fixed or contiguous extent — text (`String`, `StringBuilder`, `ReadOnlyStringSpan`), buffers and spans (§4.14–§4.16), `FrozenArray<T>`, `Stream`, and the §10 FFI carriers; `Count` counts the elements of a collection whose membership grows and shrinks (the `Add`/`Remove`/`Push`/`Enqueue` families). A type declares one or the other, never both, and new types follow the same line — which is why the resizable `Array<T>` says `Count` where .NET's fixed array says `Length`.
 
-**Window parameters (v0.282).** A parameter pair naming a sub-range of a sequence is spelled **`(start, length)`** — `startIndex` stands as the string family's established spelling of the start position — and every new windowed signature follows it; parameter names are API surface (named arguments, spec §22.5). The one recorded exception is the **`Stream` byte-window family** (`Read`/`Write(buffer, offset, count)`, §7.1), which keeps `(offset, count)` deliberately: those are the signatures C-family muscle memory types unprompted. Renamed to the convention at v0.282: `String.From(buffer, start, length)`, `String.Remove(startIndex, length)`, `Encoding.GetString(bytes, start, length)`. (`destOffset` on `RawBytes.CopyTo` names a write *position*, not a window, and is untouched.)
+**Key membership is `Contains(key)` (v0.290).** A map-like type spells key membership `Contains(key)`, so that `key in m` resolves (spec [§17.5](Bezel_Language_Spec.md#sec-the-in-operator)'s structural `Contains` lookup); `ContainsKey` on `Dictionary<K, V>`, `OwningDictionary<K, V>` and `SortedDictionary<K, V>` is the inherited .NET alias (rationale [§15.x](Bezel_Design_Rationale.md#sec-convert-is-a-familiarity-alias)'s familiarity ground) and is not minted on new types — `Counter<K>` ([§4.20](#sec-counterk)) declares `Contains` alone.
+
+**Window parameters (v0.282).** A parameter pair naming a sub-range of a sequence is spelled **`(start, length)`** — `startIndex` stands as the string family's established spelling of the start position — and every new windowed signature follows it; parameter names are API surface (named arguments, spec §22.5). The one recorded exception is the **`Stream` byte-window family** (`Read`/`Write(buffer, offset, count)`, §7.1), which keeps `(offset, count)` deliberately: those are the signatures C-family muscle memory types unprompted. Renamed to the convention at v0.282: `String.From(buffer, start, length)` and `String.Remove(startIndex, length)`. `String.From` keeps its window because `Array<char>` has no span-shaped route to `string` — a span twin, if one is wanted, retires the window with it. A window over an `Array<byte>` is not a parameter pair at all but a slice — `Encoding.GetString(bytes.AsReadOnlySpan(start, length))` ([§3.2](#sec-encoding); [§4.14](#sec-owned-buffers-and-spans)'s *no offset parameter* rule). (`destOffset` on `RawBytes.CopyTo` names a write *position*, not a window, and is untouched.)
 
 **Replay intercept points (v0.204).** The members of this library that consult the world outside the process — the clock and elapsed-time reads (§2.5, §8.1), entropy (§2.6, and §2.7's parameterless constructor), environment, argument, and process information (§2.4), console input (§2.1), and the file system (§7) — together with the scheduling and synchronized-object operations the language spec enumerates (language spec [§30.13](Bezel_Language_Spec.md#sec-determinism), *Determinism*) — are **intercept points**: a conforming runtime may record their results and later substitute the recorded values, and no program may observe the substitution except through the values themselves. Everything not so designated is pure computation and is deliberately not interceptable. A future addition to this library that reads the world must declare itself an intercept point in its own section at the time it is added.
 
@@ -108,7 +120,7 @@ public static class Console
 end Console;
 ```
 
-The `Object` overloads invoke `ToString()`. For interpolated strings, the compiler resolves the `string` overload directly.
+The `Object` overloads invoke `ToString()`. For interpolated strings, the compiler resolves the `string` overload directly. A call to an `Object` overload whose argument is statically of primitive type is lowered without boxing (implementation guidance — not observable, and §1's performance disclaimer applies).
 
 `ReadKey()` blocks until one key (code point) is available and raises `EndOfStreamException` ([§7.5](#sec-io-exception-types); catching it by name requires `import System.IO;`) at end of input, where no key can exist. `ReadKeyOrNull()` (v0.231) is the [§1](#sec-failure-signal-rule) `*OrNull` tier beside it — `null` at end of input, the key otherwise — resolving the misfit the failure-signal rule recorded at v0.229: end of input is band 2's expected absence, and `char?` is exactly the `ReadLine` null-at-EOF analog the v0.195 note said was missing (`char` is a non-nullable value type, so `null` is unambiguous). `ReadKey` remains the assert-shaped throwing tier — end of input is a bug at its call sites. Whether the key is echoed is implementation-defined.
 
@@ -143,8 +155,7 @@ public static class Math
 
   public static pure method Floor(x: double): double;
   public static pure method Ceiling(x: double): double;
-  public static pure method Round(x: double): double;     // banker's rounding
-  public static pure method Round(x: double, digits: int): double;
+  public static pure method Round(x: double, digits: int := 0): double;   // banker's rounding
   public static pure method Truncate(x: double): double;
 
   public static pure method Floor(x: decimal): decimal;    // toward negative infinity (v0.228);
@@ -154,10 +165,11 @@ public static class Math
                                                            //   Truncate is toward zero. Round(decimal)
                                                            //   is the instance Decimal.Round (§9.3).
 
-  public static pure method Sign(x: int): int;            // -1, 0, or 1
-  public static pure method Sign(x: long): int;
-  public static pure method Sign(x: double): int;
-  public static pure method Sign(x: decimal): int;        // -1, 0, or 1 (v0.228)
+  public static method Sign<T>(x: T): int where T: INumber<T>;   // -1, 0, or 1: two `<` tests against
+                                                                  //   T.Zero() (§2.19), so a NaN yields 0.
+                                                                  //   Not `pure`: INumber<T>'s operators are
+                                                                  //   not pure-declared (spec §22.15's
+                                                                  //   transitive rule), as Min/Max/Clamp above
 
   public static pure method Fmod(x: double, y: double): double;
   public static pure method IEEERemainder(x: double, y: double): double;
@@ -233,7 +245,7 @@ public static class Environment
 end Environment;
 ```
 
-`Variables()` (v0.231) returns a freshly-allocated `owned Dictionary<string, string>` (per the §1 convention for fresh-instance returns). Although `Environment` itself is auto-imported via `System` ([§2.3](Bezel_Language_Spec.md#sec-always-available-names) of the language spec), the `Dictionary` type lives in `System.Collections.Generic` and is not auto-imported; calling the returned dictionary's members needs no import ([§2.8.3](Bezel_Language_Spec.md#sec-transitive-closure-and-type-identity) rule 2 of the language spec), but **naming** the type — an explicit `Dictionary<string, string>` ascription, say — requires `import System.Collections.Generic;`.
+`Variables()` (v0.231) returns a freshly-allocated `owned Dictionary<string, string>` (per the §1 convention for fresh-instance returns).
 
 <a id="sec-datetime-timespan-dateonly-timeonly"></a>
 ### 2.5 `DateTime`, `TimeSpan`, `DateOnly`, `TimeOnly`
@@ -571,7 +583,7 @@ The method names use the sized record-type names (`Int32`, `Int64`) consistently
 
 `Type` is the runtime type-identity token. A `Type` value is obtained from the `typeof(T)` operator (language spec [§17.10](Bezel_Language_Spec.md#sec-the-typeof-operator)) for a statically named type, or from `value.GetType()` (language spec [§8.2](Bezel_Language_Spec.md#sec-gettype)) for the runtime type of a value. The runtime guarantees exactly one `Type` instance per distinct type, so reference equality and `=` coincide; `Type` is a valid `Dictionary` key.
 
-> ⚠ **Spec-ahead-of-implementation (v0.287, [#3819](https://github.com/s8lap/bezel-lang/issues/3819)):** the lattice members below — `BaseType`, `Implements`, `IsAssignableFrom`, the kind predicates (`IsClass`, `IsEnum`, and their siblings), `EnumNames`, `EnumValues`, and `FullName` — have no compiler support: no sema arm and no codegen arm carries any of their names, and the runtime `Type` token itself is not yet emitted (`typeof(T)` is rejected in codegen, #487; `GetType()` in sema, #511), so no member of this class is reachable from a running program today. The `Name`/`FullName` rendering rules are exercised only through language spec §8.5's default `ToString`. The surface below is the normative contract the implementation will meet.
+> ⚠ **Spec-ahead-of-implementation (v0.287, [#3819](https://github.com/s8lap/bezel-lang/issues/3819)):** the lattice members below — `BaseType`, `IsAssignableFrom`, the kind predicates (`IsClass`, `IsEnum`, and their siblings), `EnumNames`, `EnumValues`, and `FullName` — have no compiler support: no sema arm and no codegen arm carries any of their names, and the runtime `Type` token itself is not yet emitted (`typeof(T)` is rejected in codegen, #487; `GetType()` in sema, #511), so no member of this class is reachable from a running program today. The `Name`/`FullName` rendering rules are exercised only through language spec §8.5's default `ToString`. The surface below is the normative contract the implementation will meet.
 
 ```bezel
 public sealed class Type
@@ -597,8 +609,6 @@ public sealed class Type
   public readonly property BaseType: Type?;         // direct superclass; null for
                                                     //   Object, interfaces, value
                                                     //   types, function types
-  public method Implements(iface: Type): bool;      // true if this type conforms to
-                                                    //   the interface `iface`
   public method IsAssignableFrom(other: Type): bool;// true if a value of type
                                                     //   `other` is assignable to a
                                                     //   location of this type
@@ -617,9 +627,9 @@ end Type;
 
 **`Name` and `FullName` rendering (normative, v0.222, #1812).** Both properties render the type's canonical source-level type expression; the produced strings are exact — they are what diagnostics print and registries key on. `Name` renders named components unqualified; `FullName` renders every named component qualified by its declaring module path and, for a nested type, its enclosing-type path (`"BankingApp.BankAccount"`, `"BankingApp.Ledger.Entry"`); the distinction is carried recursively. Rules: **(1)** a named non-generic type renders its declared identifier (Name) / its module-qualified path (FullName) — for a **nested** type (language spec [§11.6](Bezel_Language_Spec.md#sec-nested-types)) Name is the nested identifier alone (`"Inner"`) and FullName is the declaring module, then every enclosing type outermost first (an enclosing generic type rendered as rule 3 renders it, type arguments included), then the identifier (`"M.Outer.Inner"`), the enclosing-type path being part of the type's identity (language spec [§2.8.3](Bezel_Language_Spec.md#sec-transitive-closure-and-type-identity) rule 3), so two unrelated nested types of one name render distinct FullNames and the same Name; **(2)** the keyword-aliased types (language spec [§3.4](Bezel_Language_Spec.md#sec-keyword-aliases-for-built-in-types)) render as their lowercase keyword in *both* properties (`typeof(int).FullName = "int"`; `typeof(String)` renders `"string"`) — the keyword is the canonical name, a recorded exception to qualification; **(3)** a generic instantiation renders the head followed by `<`, its arguments joined by `", "`, and `>`, each argument rendered recursively in the same property's form (`"Dictionary<string, Array<int>>"`; FullName: `"System.Collections.Generic.Dictionary<string, System.Collections.Generic.Array<int>>"`) — no arity markers; a nullable argument renders with a trailing `?` (`"Array<int?>"`, a distinct `Type` from `"Array<int>"`); **(4)** an inline array renders its canonical type expression `"[N]T"` / `"[N owned]T?"` (language spec §15), the element recursing; **(5)** a function type renders its canonical type expression `"(A, B) -> R"` (parameters `", "`-joined, one space around `->`, modifiers as written, unit as `"()"`), components recursing — a function type has no module of its own, so Name and FullName differ only through the components; **(6)** the unit type renders `"()"`. **Nullability is erased at reification**: no `Type` exists for a top-level nullable form — a `null` has no runtime type and `GetType` requires a narrowed receiver ([§8.2](Bezel_Language_Spec.md#sec-gettype)) — and `typeof(T)` at a substitution `U?` returns `typeof(U)`; `typeof(int?)` is a compile error ([§17.10](Bezel_Language_Spec.md#sec-the-typeof-operator)'s accepted forms). The language-spec side of this contract — substitution distinctness scoped up to top-level nullability, and the `U?` reification — is stated normatively in [§17.10](Bezel_Language_Spec.md#sec-the-typeof-operator)'s identity paragraph (as amended in the same revision, #1812). Nullability inside a composite's identity (rules 3–5) is part of that identity and renders.
 
-**`BaseType`.** Returns the direct superclass of a class type. It is `null` for `Object` (the root has no base), for interface types (interfaces have no base *class*; conformance is queried with `Implements`), for all value types, and for function types. Walking the chain to the root is `t.BaseType`, then `that!.BaseType`, terminating at the `Object` `Type` whose `BaseType` is `null`. For most subtype questions `IsAssignableFrom` is the better tool; `BaseType` is the lower-level primitive, useful mainly for diagnostics that print an inheritance chain.
+**`BaseType`.** Returns the direct superclass of a class type. It is `null` for `Object` (the root has no base), for interface types (interfaces have no base *class*; conformance is queried with `IsAssignableFrom`), for all value types, and for function types. Walking the chain to the root is `t.BaseType`, then `that!.BaseType`, terminating at the `Object` `Type` whose `BaseType` is `null`. For most subtype questions `IsAssignableFrom` is the better tool; `BaseType` is the lower-level primitive, useful mainly for diagnostics that print an inheritance chain.
 
-**`Implements` and `IsAssignableFrom`.** `t.Implements(i)` requires `i.IsInterface` (otherwise it raises `InvalidOperationException`) and returns whether the type `t` conforms to interface `i`. `a.IsAssignableFrom(b)` is the reflective form of the `is` operator (language spec [§12.7](Bezel_Language_Spec.md#sec-type-tests-is-is-not-as)): it returns whether a value whose runtime type is `b` may be assigned to a location of static type `a` — true when `a = b`, when `a` is a base class of `b`, or when `a` is an interface that `b` implements. The two are related: `a.IsAssignableFrom(b)` with `a.IsInterface` is equivalent to `b.Implements(a)`. Both operate on `Type` tokens with no value in hand, which is what distinguishes them from `is`/`as`.
+**`IsAssignableFrom`.** `a.IsAssignableFrom(b)` is the reflective form of the `is` operator (language spec [§12.7](Bezel_Language_Spec.md#sec-type-tests-is-is-not-as)): it returns whether a value whose runtime type is `b` may be assigned to a location of static type `a` — true when `a = b`, when `a` is a base class of `b`, or when `a` is an interface that `b` implements; interface conformance is therefore queried as `iface.IsAssignableFrom(t)`, and there is no second spelling for it. It operates on `Type` tokens with no value in hand, which is what distinguishes it from `is`/`as`.
 
 **Enum metadata.** When `IsEnum`, `EnumNames` and `EnumValues` are parallel arrays (same length, same order — declaration order of the enum members) giving each member's source name and its integer value widened to `long` — except for an enum whose underlying type is `ulong` (spec §10.3 admits it), whose values are **bit-reinterpreted** into `long` (`BitConverter.Reinterpret` semantics, [§2.12](#sec-bitconverter): the bit pattern is preserved; callers of such enums reinterpret back to `ulong`), since values above `long.MaxValue` have no widening (v0.195). They are the building blocks for enum-to-string formatting, string-to-enum parsing, and enumerating all members for UI or validation. On any non-enum `Type`, accessing either property raises `InvalidOperationException` (the property is meaningless, and a silent empty array would mask a programming error). The properties are **read-only views** over cached, process-lived storage (`IReadOnlyList<T>`, [§4.1](#sec-borrowing-collection-interfaces)), handed out as borrows (a property getter may not mint — spec §28.6) — the [§4.8](#sec-dictionaryk-v) `Keys`/`Values` shape, **including its backing**: each view is a dedicated view object owned by the `Type` instance, whose class is not nameable in user code and is in particular not `Array<T>`. There is no mutation surface, declared or recoverable: the view type has no mutating members, so the pre-v0.222 hazard of mutating process-wide metadata through the borrow is closed at compile time, and a type-test downcast (spec [§12.7](Bezel_Language_Spec.md#sec-type-tests-is-is-not-as)) cannot reach one — `typeof(E).EnumNames as Array<string>` is `null` (#1805). The same backing rule governs [§2.4](#sec-environment)'s `CommandLineArgs`. `IReadOnlyList` lives in `System.Collections.Generic`; touching the view's members needs no import (language spec [§2.8.3](Bezel_Language_Spec.md#sec-transitive-closure-and-type-identity) rule 2) — naming the interface in source does, as for [§2.4](#sec-environment)'s `Variables` result. Example:
 
@@ -887,10 +897,9 @@ public class BinarySerializer: ISerializer
 end BinarySerializer;
 
 public class BinaryDeserializer: IDeserializer
-  public constructor(input: ReadOnlySpan<byte>);         // strict
-  public constructor(input: ReadOnlyArraySpan<byte>);    // v0.165 (#1358): Array-world twin;
+  public constructor(input: ReadOnlySpan<byte>, ignoreUnknownFields: bool := false);        // strict by default
+  public constructor(input: ReadOnlyArraySpan<byte>, ignoreUnknownFields: bool := false);   // v0.165 (#1358): Array-world twin;
                                                           //   borrowed identically for the deserializer's lifetime
-  public constructor(input: ReadOnlySpan<byte>, ignoreUnknownFields: bool);
   // IDeserializer surface (§2.14) implemented for the compact binary format.
 end BinaryDeserializer;
 ```
@@ -939,16 +948,11 @@ public static class Binary
   // its one knob is the BinaryDeserializer constructor bool, mirrored here.
   public static method ToBytes<T>(value: T): owned OwningBuffer<byte> where T: ISerializable;
 
-  public static method Parse<T>(input: ReadOnlySpan<byte>): T where T: IDeserializable;
-  public static method Parse<T>(input: ReadOnlySpan<byte>, ignoreUnknownFields: bool): T where T: IDeserializable;
-  public static method Parse<T>(input: ReadOnlyArraySpan<byte>): T where T: IDeserializable;
-      // no (ReadOnlyArraySpan<byte>, ignoreUnknownFields) form: the facade
-      // mirrors the BinaryDeserializer constructor set above, which declares
-      // no such constructor
+  public static method Parse<T>(input: ReadOnlySpan<byte>, ignoreUnknownFields: bool := false): T where T: IDeserializable;
+  public static method Parse<T>(input: ReadOnlyArraySpan<byte>, ignoreUnknownFields: bool := false): T where T: IDeserializable;
 
-  public static method ParseOwned<T>(input: ReadOnlySpan<byte>): owned T where T: class, IDeserializable;
-  public static method ParseOwned<T>(input: ReadOnlySpan<byte>, ignoreUnknownFields: bool): owned T where T: class, IDeserializable;
-  public static method ParseOwned<T>(input: ReadOnlyArraySpan<byte>): owned T where T: class, IDeserializable;
+  public static method ParseOwned<T>(input: ReadOnlySpan<byte>, ignoreUnknownFields: bool := false): owned T where T: class, IDeserializable;
+  public static method ParseOwned<T>(input: ReadOnlyArraySpan<byte>, ignoreUnknownFields: bool := false): owned T where T: class, IDeserializable;
 end Binary;
 ```
 
@@ -1015,7 +1019,7 @@ end SerializationException;
 
 The three properties are value-typed and copy out of a `catch` arm like any other snapshot state (language spec [§31.1](Bezel_Language_Spec.md#sec-throwing-and-catching)). The deserializer interfaces' `Try*`-shaped members (`TryReadNull`) do not throw; every other read member throws on mismatch rather than returning a sentinel, because a deserialization mismatch is a structural error in the input, not an expected control-flow branch.
 
-**Unknown-field policy.** A field present in the input that matches no declared component of the target type is, by default, a `SerializationException` — the strict default established when synthesis shipped (v0.116), because silently dropping unrecognized input masks producer/consumer schema drift and field-name typos. This behavior is a property of the deserialization *operation*, not of the target type: the same type may legitimately be read strictly when consuming a trusted internal message and leniently when consuming a third-party producer that adds fields freely, a decision that belongs to the caller performing the read, not to the type's serialization contract (rationale [§5.19](Bezel_Design_Rationale.md#sec-serialization-without-reflection)). It is therefore configured on the deserializer: `JsonOptions.IgnoreUnknownFields` (default `false`) for JSON, the `ignoreUnknownFields` constructor parameter for `BinaryDeserializer`. When set, the deserializer skips an unrecognized field's value (via `IDeserializer.SkipValue`, [§2.14](#sec-serialization-vocabulary), which consumes the value including any nested object/array structure) and continues rather than raising. The synthesized `Deserialize` (language spec [§9.8](Bezel_Language_Spec.md#sec-serialization-synthesis)) is identical regardless of policy — it always delegates an unrecognized field to the deserializer; strictness lives entirely in the deserializer's configuration. This policy governs only *unknown* fields; missing required fields, duplicates, and type mismatches remain unconditional errors regardless of the setting, and a *missing* declared field is tolerated only by the per-member `serialized optional` clause (language spec [§9.8](Bezel_Language_Spec.md#sec-serialization-synthesis)) — the two leniencies are orthogonal and compose.
+**Unknown-field policy.** A field present in the input that matches no declared component of the target type is, by default, a `SerializationException` — the strict default established when synthesis shipped (v0.116), because silently dropping unrecognized input masks producer/consumer schema drift and field-name typos. This behavior is a property of the deserialization *operation*, not of the target type: the same type may legitimately be read strictly when consuming a trusted internal message and leniently when consuming a third-party producer that adds fields freely, a decision that belongs to the caller performing the read, not to the type's serialization contract (rationale [§5.19](Bezel_Design_Rationale.md#sec-serialization-without-reflection)). It is therefore configured on the deserializer: `JsonOptions.IgnoreUnknownFields` (default `false`) for JSON, the `ignoreUnknownFields` parameter (default `false`) of the `BinaryDeserializer` constructors and of the `Binary.Parse<T>`/`ParseOwned<T>` facade. When set, the deserializer skips an unrecognized field's value (via `IDeserializer.SkipValue`, [§2.14](#sec-serialization-vocabulary), which consumes the value including any nested object/array structure) and continues rather than raising. The synthesized `Deserialize` (language spec [§9.8](Bezel_Language_Spec.md#sec-serialization-synthesis)) is identical regardless of policy — it always delegates an unrecognized field to the deserializer; strictness lives entirely in the deserializer's configuration. This policy governs only *unknown* fields; missing required fields, duplicates, and type mismatches remain unconditional errors regardless of the setting, and a *missing* declared field is tolerated only by the per-member `serialized optional` clause (language spec [§9.8](Bezel_Language_Spec.md#sec-serialization-synthesis)) — the two leniencies are orthogonal and compose.
 
 `JsonSerializer`, `JsonDeserializer`, `BinarySerializer`, `BinaryDeserializer`, `JsonOptions`, and `SerializationException` are declared in `System.Serialization` and require an explicit `import System.Serialization`, and the one-shot facades `Json` and `Binary` are declared beside them under the same import. The vocabulary interfaces the agent classes implement (`ISerializer`/`IDeserializer`/`ISerializable`/`IDeserializable`, [§2.14](#sec-serialization-vocabulary)) remain auto-imported, so a type's `: ISerializable` conformance never requires the import — only the code that picks a concrete format does.
 
@@ -1324,8 +1328,6 @@ Methods return `this` to allow chaining.
 public abstract class Encoding
   public abstract method GetBytes(s: string): owned Array<byte>;
   public abstract method GetString(bytes: Array<byte>): string;
-  public abstract method GetString(bytes: Array<byte>, start: int, length: int): string;   // params renamed v0.282 (§1 window convention)
-                              // window over Count; IndexOutOfRangeException out of range (v0.165)
   public abstract method GetString(bytes: ReadOnlySpan<byte>): string;       // v0.222 (#1809): buffer-backed source
   public abstract method GetString(bytes: ReadOnlyArraySpan<byte>): string;  // v0.222 (#1809): Array-backed twin (#1358)
   public abstract method GetByteCount(s: string): int;                       // v0.165 (#1355)
@@ -1355,7 +1357,7 @@ The static properties (`UTF8`, `UTF16`, `UTF32`, `ASCII`) return singleton insta
 - **`UTF32`** (`Name` = `"utf-32le"`): little-endian, no BOM emitted. `GetString` requires a byte count divisible by four, consumes one leading little-endian BOM if present, and raises `FormatException` on any unit that is not a Unicode scalar value (greater than `U+10FFFF` or in the surrogate range).
 - **`ASCII`** (`Name` = `"us-ascii"`): strict seven-bit. `GetBytes` raises `FormatException` on any code point above `U+007F`; `GetString` raises `FormatException` on any byte above `0x7F`.
 
-The `index`/`count` overload of `GetString` applies the same rules to the selected byte range; a BOM is consumed only at the start of the range. The span-source decode overloads (v0.222, #1809) are the same operation over a caller-selected range spelled as a span — identical fault model, BOM consumed only at the start of the span, the empty span decoding to `""`; the parameter is a call-bounded borrow and the returned `string` retains nothing of the source. They complete the v0.165 span-destination encode pair (`GetByteCount`/`GetBytes(s, destination)`) in the decode direction, on both byte-span families per the #1358 mirroring precedent. The span-**source** encode overloads (v0.228) are the mirror on the input side: identical contract to the string forms over the span's code-point range (`GetByteCount` and `GetBytes` agree; the empty span encodes to zero bytes; the same strict fault model, `FormatException` possible only for `ASCII`), equivalent to calling the string overload on `s.ToString()` minus the materialization — the produced bytes retain nothing of the source, and `ReadOnlyStringSpan` is not borrow-bearing ([§3.3](#sec-readonlystringspan)), so the parameter imposes no lifetime restriction.
+The span-source decode overloads (v0.222, #1809) are the same operation over a caller-selected range spelled as a span — a window over an `Array<byte>` is `bytes.AsReadOnlySpan(start, length)` ([§4.4](#sec-arrayt)), per [§4.14](#sec-owned-buffers-and-spans)'s slice-first convention — identical fault model, BOM consumed only at the start of the span, the empty span decoding to `""`; the parameter is a call-bounded borrow and the returned `string` retains nothing of the source. They complete the v0.165 span-destination encode pair (`GetByteCount`/`GetBytes(s, destination)`) in the decode direction, on both byte-span families per the #1358 mirroring precedent. The span-**source** encode overloads (v0.228) are the mirror on the input side: identical contract to the string forms over the span's code-point range (`GetByteCount` and `GetBytes` agree; the empty span encodes to zero bytes; the same strict fault model, `FormatException` possible only for `ASCII`), equivalent to calling the string overload on `s.ToString()` minus the materialization — the produced bytes retain nothing of the source, and `ReadOnlyStringSpan` is not borrow-bearing ([§3.3](#sec-readonlystringspan)), so the parameter imposes no lifetime restriction.
 
 <a id="sec-readonlystringspan"></a>
 ### 3.3 `ReadOnlyStringSpan`
@@ -1451,9 +1453,9 @@ Retired. There is no `ReadOnlyAsciiByteSpan`, and `string` has no `AsAsciiByteSp
 ---
 
 <a id="sec-system-collections-generic"></a>
-## 4. `System.Collections.Generic`
+## 4. `System.Collections.Generic` (auto-imported)
 
-The collection types. None are auto-imported except the iteration-interface family (the read-only and mutating interfaces), which is auto-imported per language spec [§2.3](Bezel_Language_Spec.md#sec-always-available-names).
+The collection types. **Auto-imported (v0.289):** this module is on language spec [§2.3](Bezel_Language_Spec.md#sec-always-available-names)'s auto-import list, so every name below resolves in every file with no `import` — the same standing as `System`, `System.Text`, and [§5](#sec-system-collections-linq). §2.3's row states the bare-name cost in full.
 
 The language separates **borrowing** collections (store references the caller continues to own; element disposal is the caller's responsibility) from **owning** collections (own their elements; element disposal is the collection's responsibility). Each kind has its own concrete class and its own interfaces; the two kinds share read-only iteration interfaces (`IEnumerable<T>`, `IReadOnlyCollection<T>`, `IReadOnlyList<T>`) because reading produces borrows in either case.
 
@@ -1570,14 +1572,13 @@ public class Array<T>: IList<T>
   public method Remove(item: T): bool;
   public method Clear();
   public method Contains(item: T): bool;
-  public method IndexOf(item: T): int;          // -1 if not found
-  public method IndexOf(item: T, startIndex: int): int;
+  public method IndexOf(item: T, startIndex: int := 0): int;
                                                 // first occurrence at or after startIndex, or -1
                                                 //   (v0.228); 0 <= startIndex <= Count required,
                                                 //   IndexOutOfRangeException otherwise;
                                                 //   startIndex = Count is legal and returns -1
   public method LastIndexOf(item: T): int;      // last occurrence, or -1 (v0.228). Equality is
-                                                //   Equals for both, as the one-argument IndexOf
+                                                //   Equals for both, as IndexOf
 
   public method Sort(comparer: (T, T) -> int);  // in place
   public method Reverse();                       // in place
@@ -1620,15 +1621,8 @@ end Array;
 // combinators (§2.20), which take the identical shape. The register is closed and
 // grows only by recorded ruling.
 //
-// `OwningArray<T>` has the same parameterless `Sort()`, declared in its own block
-// below. It was documented from v0.242 to v0.273 and removed by the same v0.274
-// ruling this one reverses -- a two-type deletion of which v0.275 undid only half.
-// Three sema sites admit it positively (the §22.5 owning-container allow-list names
-// `Sort`; the result-typing arm names `OwningArray` explicitly; the sole rejection
-// arm covers `Reversed`/`Sorted` and omits `Sort`), and codegen reaches it because
-// `OwningArray` is array-backed. NOTE: the `T: IComparable<T>` gate is `Array`-only
-// in the compiler today, so an owning array of a class without `CompareTo` is
-// admitted where it should be rejected -- #3325, the owning-side twin of #2790.
+// `OwningArray<T>` declares the same parameterless `Sort()` in its own block below,
+// on the same §14.2 register row (the compiler's owning-side gate is tracked as #3325).
 ```
 
 A collection literal `[1, 2, 3]` constructs an `Array<T>` when the target type is `Array<T>`; it constructs an inline array `[N]T` when the target is an inline array. See language spec [§15.4](Bezel_Language_Spec.md#sec-collection-literals) for the contextual-typing rules.
@@ -1673,8 +1667,8 @@ public class OwningArray<T>: IOwningList<T>, IOwningEnumerable<T> where T: class
   public method Sort(comparer: (T, T) -> int);          // comparer takes borrows
   public method Sort();                                 // natural order; conditionally
                                                         //   admitted where `T: IComparable<T>`
-                                                        //   (language spec §14.2) -- see #3325,
-                                                        //   the gate is Array-only today
+                                                        //   (language spec §14.2; the same register
+                                                        //   row as Array<T>.Sort())
   public method Reverse();
 
   // Drain methods — transfer ownership of elements out of the collection
@@ -2383,7 +2377,7 @@ end IEnumerator;
 
 The standard iteration interfaces. `IEnumerable<T>` is covariant in T. `IEnumerator<T>.Current` is non-destructive — it returns a borrow of the most-recently-yielded value, which the enumerator continues to own (if it has ownership; if T is a borrowing element type, Current returns a re-borrow).
 
-These interfaces are auto-imported per language spec [§2.3](Bezel_Language_Spec.md#sec-always-available-names) because they participate in the for-loop desugaring.
+These interfaces are auto-imported with the rest of this module (language spec [§2.3](Bezel_Language_Spec.md#sec-always-available-names)); they are the interfaces the for-loop desugaring names.
 
 `IAsyncEnumerable<T>` and `IAsyncEnumerator<T>` are the async variants; they participate in `await for` similarly:
 
@@ -2819,10 +2813,10 @@ In either case, the returned span borrows the `FrameBuffer` instance (transitive
 <a id="sec-byte-buffer-accessors"></a>
 #### Byte-buffer accessors
 
-When T is `byte`, the spans are commonly used for binary I/O — file formats, network protocols, image headers, serialization. The endianness-aware accessors below read and write multi-byte numeric types from a `Span<byte>` or `ReadOnlySpan<byte>` without bit-shuffling at the call site.
+When T is `byte`, the spans are commonly used for binary I/O — file formats, network protocols, image headers, serialization. The endianness-aware accessors below read and write multi-byte numeric types without bit-shuffling at the call site. The **read tier** is declared once, as an extension of `IReadOnlySpan<byte>` ([§4.16](#sec-ireadonlyspan)): language spec [§26.2](Bezel_Language_Spec.md#sec-what-can-be-extended) admits interfaces as extension heads and [§26.5](Bezel_Language_Spec.md#sec-resolution) rule 2 searches a receiver's implemented interfaces, so every byte span — `ReadOnlySpan<byte>`, `Span<byte>`, and [§4.15](#sec-arrayspant-readonlyarrayspant)'s `ReadOnlyArraySpan<byte>`/`ArraySpan<byte>` — is a receiver of the one block; the receiver box is call-bounded (language spec [§8.6](Bezel_Language_Spec.md#sec-boxing-of-borrow-bearing-records), which states the bound for the receiver of an interface-headed extension call), and an accessor body reads only `this.Length` and `this[i]`, both interface members, and returns a value. The **write tier** has no interface to hang on ([§4.16](#sec-ireadonlyspan), *What about writable spans*) and is declared per writable span.
 
 ```bezel
-public extension ReadOnlySpan<byte>                        // public: spec §26.1 defaults extensions to internal (fixed v0.195)
+public extension IReadOnlySpan<byte>                       // public: spec §26.1 defaults extensions to internal; one block, four byte-span receivers (v0.290)
   // 16-bit integers
   public method ReadInt16LittleEndian(): short;
   public method ReadInt16BigEndian(): short;
@@ -2867,14 +2861,8 @@ public extension ReadOnlySpan<byte>                        // public: spec §26.
 end;
 
 public extension Span<byte>
-  // Reads and TryReads (delegate to AsReadOnly)
-  public method ReadInt16LittleEndian(): short =>
-    this.AsReadOnly().ReadInt16LittleEndian();
-  public method ReadInt16BigEndian(): short =>
-    this.AsReadOnly().ReadInt16BigEndian();
-  // ... (full set of 16 Read methods and 16 TryRead methods, each
-  //      delegating identically to the corresponding AsReadOnly method;
-  //      omitted here for brevity)
+  // Reads and TryReads: the IReadOnlySpan<byte> block above — Span<byte> implements
+  // IReadOnlySpan<byte> (§4.16), so nothing is re-declared here.
 
   // Writes — Span<byte> only
   public method WriteInt16LittleEndian(value: short);
@@ -2916,7 +2904,7 @@ end;
 **Example implementation (one Read, one Write).** The remaining methods follow the same pattern.
 
 ```bezel
-public extension ReadOnlySpan<byte>
+public extension IReadOnlySpan<byte>
   public method ReadInt32LittleEndian(): int
     if this.Length < 4 then
       throw new IndexOutOfRangeException();
@@ -3069,7 +3057,7 @@ Records carrying borrows of an `Array<T>` ([§4.4](#sec-arrayt)) plus a `(Start,
 
 `ArraySpan<T>` is the writable form; `ReadOnlyArraySpan<T>` is the read-only form. The split parallels `Span<T>` / `ReadOnlySpan<T>` ([§4.14](#sec-owned-buffers-and-spans)) but with `Array<T>` as the source instead of `OwningBuffer<T>`. The two span families coexist; they are not interchangeable (a method that takes `Span<T>` does not accept `ArraySpan<T>` and vice versa) because the underlying storage models differ — `OwningBuffer<T>` owns its slots for class T, while `Array<T>` borrows them. Both types declare the three `Slice` overloads of the §4.14 family, including the `Slice(r: Range<int>)` Range form under [§4.14](#sec-owned-buffers-and-spans)'s normalization contract (v0.241).
 
-**Byte-buffer accessors (v0.165, #1358):** the §4.14 endianness-aware extension family is mirrored onto this family — all `Read*{Little,Big}Endian`/`TryRead*` forms on `ReadOnlyArraySpan<byte>` and `ArraySpan<byte>`, and the `Write*`/`TryWrite*` forms on `ArraySpan<byte>`, with identical semantics (no offset parameters; slice first). This closes the file→binary-parse path: `File.ReadAllBytes(p).AsReadOnlySpan().ReadUInt32LittleEndian()` is direct and zero-copy. The chained form is admitted although `File.ReadAllBytes` returns `owned Array<byte>` unbound: §4.14's *no construction from a temporary* is language spec [§9.7](Bezel_Language_Spec.md#sec-records-and-disposal)'s syntactic rule on a `new`-expression's **construction argument**, and the factory route supplies `this` — a named location — instead; the array is an unbound owned temporary whose borrowing uses, receiver position included, run before its end-of-full-expression disposal (spec [§28.3](Bezel_Language_Spec.md#sec-unbound-owned-temporaries)). **Binding** the view is the rejected shape: `var s := File.ReadAllBytes(p).AsReadOnlySpan();` leaves `s` borrowing a source disposed at that statement's end. Bind the array, not the span — `using var bytes := File.ReadAllBytes(p); var s := bytes.AsReadOnlySpan();`.
+**Byte-buffer accessors (v0.165, #1358):** the §4.14 endianness-aware read tier — every `Read*{Little,Big}Endian`/`TryRead*` form — is declared once on `IReadOnlySpan<byte>` and is a member of `ReadOnlyArraySpan<byte>` and `ArraySpan<byte>` by their [§4.16](#sec-ireadonlyspan) conformance, not by mirroring; the `Write*`/`TryWrite*` forms are mirrored onto `ArraySpan<byte>` with identical semantics (no offset parameters; slice first). This closes the file→binary-parse path: `File.ReadAllBytes(p).AsReadOnlySpan().ReadUInt32LittleEndian()` is direct and zero-copy. The chained form is admitted although `File.ReadAllBytes` returns `owned Array<byte>` unbound: §4.14's *no construction from a temporary* is language spec [§9.7](Bezel_Language_Spec.md#sec-records-and-disposal)'s syntactic rule on a `new`-expression's **construction argument**, and the factory route supplies `this` — a named location — instead; the array is an unbound owned temporary whose borrowing uses, receiver position included, run before its end-of-full-expression disposal (spec [§28.3](Bezel_Language_Spec.md#sec-unbound-owned-temporaries)). **Binding** the view is the rejected shape: `var s := File.ReadAllBytes(p).AsReadOnlySpan();` leaves `s` borrowing a source disposed at that statement's end. Bind the array, not the span — `using var bytes := File.ReadAllBytes(p); var s := bytes.AsReadOnlySpan();`.
 
 **Bit-granular accessors (v0.264):** the §4.14 bit tier is mirrored the same way, as `ArrayBitReader` and `ArrayBitWriter` — see [below](#sec-array-bit-granular-accessors).
 
@@ -3113,7 +3101,6 @@ public record ArraySpan<T>(Source: Array<T>, Start: int, Length: int): IReadOnly
 
   // Equality
   public method SequenceEqual(other: ArraySpan<T>): bool;
-  public method SequenceEqual(other: ReadOnlyArraySpan<T>): bool;
   public method SequenceEqual(other: IReadOnlySpan<T>): bool; // v0.108 — interface form
 
   // Bulk mutation
@@ -3139,7 +3126,7 @@ An `ArraySpan<T>` is a borrow-bearing record ([§9.7](Bezel_Language_Spec.md#sec
 
 **Iteration.** `for var x in arrSpan do ... end` is admitted. The desugaring is a direct indexed loop over the span's range, parallel to the OwningBuffer-backed span rule of language spec [§29.2](Bezel_Language_Spec.md#sec-desugaring-of-for). The iteration variable's type is T and the loop body sees a borrow of each slot (the borrow's source is the underlying array, reached through the span's `Source` field).
 
-**Search and equality.** `IndexOf` walks the span's range, returning the first index whose slot equals `value`, or `-1` if none. `Contains` returns `IndexOf(value) >= 0`. The comparison uses `Equals` per the standard convention. `SequenceEqual(other: ArraySpan<T>)` compares two writable array spans pairwise; the `ReadOnlyArraySpan<T>` overload supports comparison across the access-mode boundary without requiring an `AsReadOnly()` call at the comparison site.
+**Search and equality.** `IndexOf` walks the span's range, returning the first index whose slot equals `value`, or `-1` if none. `Contains` returns `IndexOf(value) >= 0`. The comparison uses `Equals` per the standard convention. `SequenceEqual(other: ArraySpan<T>)` compares two writable array spans pairwise. There is no concrete cross-mode overload, and none is needed: the interface form `SequenceEqual(other: IReadOnlySpan<T>)` admits a `ReadOnlyArraySpan<T>` (and any other span family at element type `T`) directly, under the call-bounded boxing of language spec [§8.6](Bezel_Language_Spec.md#sec-boxing-of-borrow-bearing-records) — the rule [§4.14](#sec-owned-buffers-and-spans) states for `Span<T>`; see [§4.16](#sec-ireadonlyspan), *SequenceEqual and the interface*.
 
 **Bulk mutation.** Unlike `Span<T>` (whose mutation API splits by T's category — `Clear`/`MoveFrom`/`MoveTo` for class T owning slots, `Fill`/`CopyFrom`/`CopyTo` for value T), `ArraySpan<T>` provides a single uniform mutation surface for all T: `Fill(value)` assigns `value` to every slot; `CopyFrom(source)` copies slot-by-slot from a source span (lengths must match, else `ArgumentException`); `CopyTo(destination)` copies slot-by-slot to a destination span (lengths must match); `Reverse()` reverses the slot ordering in place. The uniform API is admissible because `Array<T>` slots do not own their contents — there is no ownership transfer to worry about, no dispose-previous semantics, no need for the category-dependent split. For class T, the assigned-into slot stores a borrow (`Fill(myClass)` makes every slot borrow `myClass`); for value T, the slot stores a copy. Both fit naturally under `Fill`. `CopyTo` was added in v0.109 alongside the broader v0.109 ergonomics pass.
 
@@ -3177,7 +3164,6 @@ public record ReadOnlyArraySpan<T>(Source: Array<T>, Start: int, Length: int): I
   public method Contains(value: T): bool;
 
   public method SequenceEqual(other: ReadOnlyArraySpan<T>): bool;
-  public method SequenceEqual(other: ArraySpan<T>): bool;
   public method SequenceEqual(other: IReadOnlySpan<T>): bool; // v0.108 — interface form
 
   public method CopyTo(destination: ArraySpan<T>);            // v0.109 — copy slot-by-slot to destination;
@@ -3287,6 +3273,8 @@ Authors of performance-sensitive APIs typically provide the concrete-type signat
 **Slice and the interface.** The interface deliberately omits `Slice`. Each concrete span type has its own `Slice` returning the same concrete type — `ReadOnlySpan<T>.Slice` returns `ReadOnlySpan<T>`, `ReadOnlyArraySpan<T>.Slice` returns `ReadOnlyArraySpan<T>`, and so on. Putting `Slice` on the interface would require the return type to be `IReadOnlySpan<TElement>`, which would propagate the interface-typed handle (and its virtual-dispatch cost) through the slicing chain. Callers who hold an `IReadOnlySpan<TElement>` and want to slice can do so by reading the relevant elements through the interface in a loop, or by recovering the concrete type via a pattern match (`if s is ReadOnlySpan<T> then ... else if s is ReadOnlyArraySpan<T> then ...`) and slicing on the concrete handle. In practice, slicing through the interface is rare enough that the explicit pattern is acceptable.
 
 **SequenceEqual and the interface.** `SequenceEqual` *is* on the interface, with parameter type `IReadOnlySpan<TElement>`. This admits cross-source equality through the interface — `bufSpan.SequenceEqual(arrSpan)` where one is a `ReadOnlySpan<byte>` (buffer-backed) and the other is a `ReadOnlyArraySpan<byte>` (array-backed) compiles with a concrete receiver and the argument boxed to `IReadOnlySpan<byte>`, the receiver's own v0.108 interface overload resolving it. The cost is one virtual-dispatched indexer read per element (the argument side; the receiver's reads stay direct), or two where the receiver is itself interface-typed; the convenience is real for comparison code that doesn't care which source type the operands came from.
+
+**Extensions on the interface.** [§4.14](#sec-owned-buffers-and-spans)'s byte read tier is declared as `extension IReadOnlySpan<byte>`. That adds nothing to the interface's own surface — an extension block declares no interface members (language spec [§26.3](Bezel_Language_Spec.md#sec-extension-blocks-restrictions)) — and reaches every conformer at element type `byte` through [§26.5](Bezel_Language_Spec.md#sec-resolution) rule 2, the receiver boxed for the call's duration under [§8.6](Bezel_Language_Spec.md#sec-boxing-of-borrow-bearing-records)'s bound for the receiver of an interface-headed extension call — the same bound as for an interface-typed argument. The accessors are not `pure`; making them so runs through the recorded deferral on pure-body iteration over this interface (`DECLINED.md`, *Pure-body `for` over `IReadOnlySpan<TElement>`*).
 
 **What about writable spans.** No writable-span interface (`IMutableSpan` or similar) is provided. The writable side has substantive semantic differences across span families — `Span<T>`'s class-T setter takes `owned T?` and disposes previous slot contents; `ArraySpan<T>`'s setter takes a borrow with no disposal; value-T setters are plain copies. Unifying these under a single writable interface would either pick one model and exclude the others, or fork the contract by source kind, which defeats the unification. The read-only side is genuinely uniform: every span supports indexer-get returning the slot's element, and that's enough for one interface. The writable side may be revisited if a partial unification (e.g. covering only the non-owned-slot writable spans) proves valuable.
 
@@ -3459,7 +3447,8 @@ public class Counter<K>: IEnumerable<DictionaryEntry<K, int>> where K: hashable
   public method CountOf(key: K): int;                 // 0 when absent — not `pure`: compares
                                                       //   via K's equality (§22.15's line;
                                                       //   the same reason Contains is not pure)
-  public method ContainsKey(key: K): bool;            // distinguishes present-at-zero from absent
+  public method Contains(key: K): bool;               // distinguishes present-at-zero from absent;
+                                                      //   enables `key in tally` (spec §17.5)
   public method Remove(key: K): bool;
   public method Clear();
 
@@ -3468,7 +3457,7 @@ public class Counter<K>: IEnumerable<DictionaryEntry<K, int>> where K: hashable
 end Counter;
 ```
 
-`Counter<K>` implements `IEnumerable<DictionaryEntry<K, int>>`; iteration is **insertion-ordered**, exactly as `Dictionary` ([§4.8](#sec-dictionaryk-v)): `Increment` on an existing key updates in place and preserves its position. Negative `delta` is admitted; a key decremented to zero or below is **not** removed — it keeps its position, counts toward `Count`, and `CountOf` returns its (possibly zero or negative) value; only `Remove` deletes it. `CountOf` therefore returns `0` for both an absent key and a present-at-zero key — `ContainsKey` distinguishes them. Trivial-dispose — the tally's backing state is intrinsic, part of the instance's single allocation released by its one compiler-inserted free (spec §28.9; the [§1](#sec-conventions) intrinsic-backing device); the key regime is `Dictionary`'s (class-typed keys are borrows).
+`Counter<K>` implements `IEnumerable<DictionaryEntry<K, int>>`; iteration is **insertion-ordered**, exactly as `Dictionary` ([§4.8](#sec-dictionaryk-v)): `Increment` on an existing key updates in place and preserves its position. Negative `delta` is admitted; a key decremented to zero or below is **not** removed — it keeps its position, counts toward `Count`, and `CountOf` returns its (possibly zero or negative) value; only `Remove` deletes it. `CountOf` therefore returns `0` for both an absent key and a present-at-zero key — `Contains` distinguishes them. Trivial-dispose — the tally's backing state is intrinsic, part of the instance's single allocation released by its one compiler-inserted free (spec §28.9; the [§1](#sec-conventions) intrinsic-backing device); the key regime is `Dictionary`'s (class-typed keys are borrows).
 
 The counting idiom, replacing §4.8's two-lookup dance for tallies:
 
@@ -4172,10 +4161,8 @@ public class Task
   public static method FromException(owned exception: Exception): Task;   // v0.179 fault ownership, as above
   public static method FromCancelled(): Task;
 
-  public static method Delay(milliseconds: int): Task;
-  public static method Delay(milliseconds: int, token: CancellationToken): Task;
-  public static method Delay(duration: TimeSpan): Task;
-  public static method Delay(duration: TimeSpan, token: CancellationToken): Task;
+  public static method Delay(milliseconds: int, token: CancellationToken := CancellationToken.None): Task;
+  public static method Delay(duration: TimeSpan, token: CancellationToken := CancellationToken.None): Task;
 
   public static method WhenAll(tasks: Array<Task>): Task;
 
@@ -4357,33 +4344,18 @@ public static class Domain
   public static method Spawn<A, R>(entry: (A) -> R, arg: A): owned Task<R>
       where A: sendable, notnull where R: sendable, notnull;
 
-  // Async entries (v0.179; spec §30.14 "Async entries"): the runtime awaits the
-  // returned task inside the spawned domain; the join handle tracks that task.
-  public static method Spawn(entry: () -> Task): owned Task;
-  public static method Spawn<A>(entry: (owned A) -> Task, owned arg: A): owned Task
-      where A: sendable, class;
-  public static method Spawn<A>(entry: (A) -> Task, arg: A): owned Task
-      where A: sendable, notnull;
-
-  public static method Spawn<R>(entry: () -> OwningTask<R>): owned OwningTask<R>
-      where R: sendable, class;
-  public static method Spawn<A, R>(entry: (owned A) -> OwningTask<R>, owned arg: A): owned OwningTask<R>
-      where A: sendable, class where R: sendable, class;
-  public static method Spawn<A, R>(entry: (A) -> OwningTask<R>, arg: A): owned OwningTask<R>
-      where A: sendable, notnull where R: sendable, class;
-
-  public static method Spawn<R>(entry: () -> Task<R>): owned Task<R>
-      where R: sendable, notnull;
-  public static method Spawn<A, R>(entry: (owned A) -> Task<R>, owned arg: A): owned Task<R>
-      where A: sendable, class where R: sendable, notnull;
-  public static method Spawn<A, R>(entry: (A) -> Task<R>, arg: A): owned Task<R>
-      where A: sendable, notnull where R: sendable, notnull;
+  // Async entries (v0.179; spec §30.14 "Async entries") — nine rows elided: every
+  // synchronous row above has an async twin whose `entry` returns `Task` /
+  // `OwningTask<R>` / `Task<R>` in place of `()` / `owned R` / `R`, with the same
+  // parameters, the same `where` clauses and the same return type; the elided rows
+  // are declared members on exactly those terms. The runtime awaits the returned
+  // task inside the spawned domain; the join handle tracks that task.
 end Domain;
 ```
 
 The `where` clauses state the full requirement (v0.201): `sendable` is checked per instantiation by the §30.14 computation (language spec §14.2's derived-property constraints), diagnosed at the caller's site naming the failing component. The kind constraints (`class`/`notnull`) remain alongside `sendable` — they select each row's ownership shape, which sendability alone does not determine. For more than one argument, pass a sendable class aggregating them, an `OwningArray<T>` of sendable elements, or a `ChannelSender<T>` ([§6.9](#sec-channel)) and send the rest.
 
-**Async entries (v0.179).** The nine async rows mirror the nine synchronous rows. The entry is a capture-free `async` lambda or a static `async` method reference; the runtime runs it as the spawned domain's first continuation and awaits the returned task **within that domain** (the `async Main` analog, spec §33.2). The join handle completes when that task settles; a fault anywhere in the entry's async chain surfaces at the join as `DomainFaultedException`. The entry's task object never crosses the boundary; for the `OwningTask<R>` rows the runtime is the single Pattern B consumer, and only the sendable result crosses. Overload resolution prefers the async rows for any entry whose return type is in the `Task` family; the synchronous generic rows never bind `R` to a task type (spec §30.14).
+**Async entries (v0.179).** The nine async rows — elided from the listing above, each the twin of a synchronous row with a `Task`-family entry return, on the terms the marker comment states — mirror the nine synchronous rows. The entry is a capture-free `async` lambda or a static `async` method reference; the runtime runs it as the spawned domain's first continuation and awaits the returned task **within that domain** (the `async Main` analog, spec §33.2). The join handle completes when that task settles; a fault anywhere in the entry's async chain surfaces at the join as `DomainFaultedException`. The entry's task object never crosses the boundary; for the `OwningTask<R>` rows the runtime is the single Pattern B consumer, and only the sendable result crosses. Overload resolution prefers the async rows for any entry whose return type is in the `Task` family; the synchronous generic rows never bind `R` to a task type (spec §30.14).
 
 The join handle completes when the entry's task completes. A fault in the entry surfaces at the join as `DomainFaultedException`:
 
@@ -4816,8 +4788,7 @@ end SeekOrigin;
 
 ```bezel
 public class FileStream: Stream
-  public constructor(path: string, mode: FileMode);
-  public constructor(path: string, mode: FileMode, access: FileAccess);
+  public constructor(path: string, mode: FileMode, access: FileAccess := FileAccess.ReadWrite);
   // Stream operations plus file-specific:
   public readonly property Path: string;
   destructor;    // flushes buffered writes and closes the OS file handle
@@ -4832,7 +4803,7 @@ public enum FileAccess: byte
 end FileAccess;
 ```
 
-**Constructor contract (v0.230).** The two-argument constructor implies **`FileAccess.ReadWrite`**: `new FileStream(path, mode)` behaves as `new FileStream(path, mode, FileAccess.ReadWrite)`. A construction that cannot open the file raises the [§7.5](#sec-io-exception-types) types: `FileNotFoundException` when `FileMode.Open` names a file that does not exist, `DirectoryNotFoundException` when a directory component of `path` does not exist, and `IOException` otherwise (an existing file under `FileMode.CreateNew`, a permission failure, and every other OS-level open failure — where the OS reports a too-long path, as [§7.5](#sec-io-exception-types)'s `IOException`-derived `PathTooLongException`).
+**Constructor contract (v0.230).** `access` defaults to **`FileAccess.ReadWrite`** (spec §22.5): `new FileStream(path, mode)` is `new FileStream(path, mode, FileAccess.ReadWrite)`. A construction that cannot open the file raises the [§7.5](#sec-io-exception-types) types: `FileNotFoundException` when `FileMode.Open` names a file that does not exist, `DirectoryNotFoundException` when a directory component of `path` does not exist, and `IOException` otherwise (an existing file under `FileMode.CreateNew`, a permission failure, and every other OS-level open failure — where the OS reports a too-long path, as [§7.5](#sec-io-exception-types)'s `IOException`-derived `PathTooLongException`).
 
 **Disposal (flush-on-dispose).** Disposing a `FileStream` — at `using var` scope exit or an explicit `Dispose()` — flushes any buffered writes and releases the OS file handle. A `FileStream` opened for writing must be disposed (or explicitly `Flush()`ed) for buffered data to reach the file; the `using var` idiom guarantees this on every exit edge, including exceptions. `FileStream` overrides `ReadAsync`/`WriteAsync` ([§7.1](#sec-stream)) with genuinely asynchronous OS I/O — not the blocking base default.
 
@@ -4870,7 +4841,11 @@ end File;
 
 ```bezel
 public abstract class TextReader
-  public abstract method Read(): int;             // next char as int, or -1 at EOF
+  public abstract method Read(): int;             // next char as int, or -1 at EOF.
+                                                  //   Recorded misfit (§1's failure-signal rule):
+                                                  //   band 2 would spell this `char?`; the sentinel
+                                                  //   stands, moved only by its own graduation
+                                                  //   ruling — compare Console.ReadKeyOrNull (§2.1)
   public abstract method ReadLine(): string?;      // null at EOF
   public method ReadToEnd(): string;
   destructor;       // releases the underlying resource
@@ -4899,8 +4874,7 @@ end TextWriter;
 public static class Directory
   public static method Exists(path: string): bool;
   public static method CreateDirectory(path: string);
-  public static method Delete(path: string);                       // IOException if non-empty
-  public static method Delete(path: string, recursive: bool);
+  public static method Delete(path: string, recursive: bool := false);   // IOException if non-empty and not recursive
   public static method GetFiles(path: string): owned Array<string>;
   public static method GetDirectories(path: string): owned Array<string>;
 end Directory;
@@ -4941,10 +4915,11 @@ public class Stopwatch
 
   public method Start();
   public method Stop();
-  public method Restart();
   public method Reset();
 end Stopwatch;
 ```
+
+`Reset()` stops the stopwatch and zeroes `Elapsed`; a restart from zero is `sw.Reset(); sw.Start();`, and `StartNew()` is the fresh-instance form.
 
 <a id="sec-debug-and-trace"></a>
 <a id="sec-debug"></a>
@@ -4954,13 +4929,12 @@ Conditional logging facilities.
 
 ```bezel
 public static class Debug
-  public static method Assert(condition: bool);
-  public static method Assert(condition: bool, message: string);
+  public static method Assert(condition: bool, message: string := "");
   public static method WriteLine(message: string);
 end Debug;
 ```
 
-Calls to `Debug.*` may be elided in release builds, depending on the compiler's `--debug` flag. Side effects in `Debug.Assert` arguments are unspecified. A failed assertion — `condition` false where the call is not elided — reports the condition's source location and the message through the diagnostic channel and **terminates the process** (v0.195): assertion failure is a programming-error report, not a recoverable fault, so `Assert` never throws.
+Calls to `Debug.*` may be elided in release builds, depending on the compiler's `--debug` flag. Side effects in `Debug.Assert` arguments are unspecified. A failed assertion — `condition` false where the call is not elided — reports the condition's source location and the message (an empty `message` is reported as no message) through the diagnostic channel and **terminates the process** (v0.195): assertion failure is a programming-error report, not a recoverable fault, so `Assert` never throws.
 
 ---
 
@@ -5198,7 +5172,6 @@ public class String: IEnumerable<char>, IComparable<string>, IEquatable<string> 
   public static method Join(separator: string, items: IEnumerable<string>): string;
 
   // Inspection
-  public static pure method IsNullOrEmpty(value: string?): bool;
   public static pure method IsNullOrWhiteSpace(value: string?): bool;
   public pure method Contains(value: string): bool;
   public pure method Contains(value: char): bool;
@@ -5207,12 +5180,12 @@ public class String: IEnumerable<char>, IComparable<string>, IEquatable<string> 
                               // Empty needle (v0.230): Contains("") = true; StartsWith("") = true;
                               //   EndsWith("") = true — the vacuous-match convention of IndexOf("") = 0;
                               //   the §3.3 span family mirrors the whole set.
-  public pure method IndexOf(value: char): int;       // code-point index of first occurrence, or -1 (v0.195)
-  public pure method IndexOf(value: string): int;     // -1 when absent; IndexOf("") = 0 (v0.195)
-  public pure method IndexOf(value: char, startIndex: int): int;    // v0.215: search from the code-point
-  public pure method IndexOf(value: string, startIndex: int): int;  //   index startIndex; 0 <= startIndex <= Length
-                                                                    //   (IndexOutOfRangeException otherwise);
-                                                                    //   IndexOf("", start) = start
+  public pure method IndexOf(value: char, startIndex: int := 0): int;     // code-point index of the first occurrence
+  public pure method IndexOf(value: string, startIndex: int := 0): int;   //   at or after startIndex, or -1 (v0.195,
+                                                                          //   v0.215); 0 <= startIndex <= Length
+                                                                          //   (IndexOutOfRangeException otherwise);
+                                                                          //   IndexOf("", start) = start, so
+                                                                          //   IndexOf("") = 0
   public pure method LastIndexOf(value: char): int;   // last occurrence, or -1
   public pure method LastIndexOf(value: string): int; // -1 when absent; LastIndexOf("") = Length (v0.195)
 
@@ -5236,13 +5209,10 @@ public class String: IEnumerable<char>, IComparable<string>, IEquatable<string> 
   public pure method ToLower(): string;
   public pure method Replace(oldChar: char, newChar: char): string;
   public pure method Replace(oldValue: string, newValue: string): string;
-  public pure method PadLeft(totalWidth: int): string;
-  public pure method PadLeft(totalWidth: int, paddingChar: char): string;
-  public pure method PadRight(totalWidth: int): string;
-  public pure method PadRight(totalWidth: int, paddingChar: char): string;
-  public pure method PadCenter(totalWidth: int): string;                    // v0.215
-  public pure method PadCenter(totalWidth: int, paddingChar: char): string; // v0.215
-                              // Pad contract (v0.215, all five Pad forms): totalWidth <= Length returns the original string
+  public pure method PadLeft(totalWidth: int, paddingChar: char := ' '): string;
+  public pure method PadRight(totalWidth: int, paddingChar: char := ' '): string;
+  public pure method PadCenter(totalWidth: int, paddingChar: char := ' '): string;   // v0.215
+                              // Pad contract (v0.215, all three Pad members): totalWidth <= Length returns the original string
                               // unchanged; totalWidth < 0 raises ArgumentOutOfRangeException.
                               // PadCenter splits the padding evenly; when it is odd, the extra
                               // character goes to the RIGHT: "ab".PadCenter(5) = " ab  ".
@@ -5262,9 +5232,10 @@ public class String: IEnumerable<char>, IComparable<string>, IEquatable<string> 
   // compares each code point's simple Unicode case-folded form, with no locale
   // or culture-specific tailoring. Culture-aware comparison will be provided by
   // System.Globalization in a future revision.
-  public pure method CompareTo(other: string): int;            // ordinal
-  public static pure method Compare(a: string, b: string): int;
-  public static pure method Compare(a: string, b: string, ignoreCase: bool): int;
+  public pure method CompareTo(other: string): int;            // ordinal; satisfies IComparable<string>
+  public pure method CompareTo(other: string, ignoreCase: bool): int;   // the case-folded form (note above);
+                                                                       //   `other` is non-nullable, as the
+                                                                       //   conformance member's is
   public pure method Equals(other: string?): bool;             // satisfies IEquatable<string>'s
                                                           //   Equals(string) under §11.2's
                                                           //   parameter-nullability widening
