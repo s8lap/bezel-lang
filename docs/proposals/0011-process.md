@@ -243,7 +243,7 @@ This follows **0007's `TcpConnection` precedent** ([0007 §3](0007-system-net-su
 
 ### Q6 — Errors: a typed spawn-failure taxonomy rooted under `IOException`
 
-**Decision.** Spawn and process faults are typed, catchable, and rooted under **`IOException`** (stdlib §7.5) so that `catch IOException` is the honest "any I/O — file, socket, or process — failed" umbrella (the same rooting 0007 §7 chose for sockets), while the two conditions a caller actually branches on get named subtypes. This obeys the errors-are-typed-values discipline (Guide 2 §5): an *expected* condition (executable missing, permission denied) is a distinct catchable type, not a string to match.
+**Decision.** Spawn and process faults are typed, catchable, and rooted under **`IOException`** (stdlib §7.5) so that `catch IOException` is the honest "any I/O — file, socket, or process — failed" umbrella (the same rooting 0007 §7 chose for sockets), while the two conditions a caller actually distinguishes at its boundary get named subtypes. This is **band 4 of the failure-signal rule** (stdlib [§1](Bezel_Standard_Library.md#sec-failure-signal-rule), v0.229): an *expected* environmental condition (executable missing, permission denied) consumed at a boundary, supervision, or retry site is a distinct catchable type, producer-local per spec [§31.4](Bezel_Language_Spec.md#sec-standard-exception-types), not a string to match. The `TryStart` form deferred in §5 is the rule's band-2 tier waiting on evidence — a different call-site stance, not a second mechanism for this condition (0076 §5's table and R6; graduation-checklist obligation [#2338](https://github.com/s8lap/bezel-lang/issues/2338)).
 
 ```
 Exception (spec §31.4)
