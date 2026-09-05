@@ -87,4 +87,28 @@ ConstShiftDomainFault findConstShiftDomainFault(
         resolveIdent,
     int depth = 0);
 
+// fix #3879 (§22.12, v0.294): is `rt` an admissible declared type for a
+// class-level (or enum-body) `const` (grammar A.4 `ConstDecl`)? §22.12's
+// `const` paragraph after rule 2's tables requires "a primitive value type or
+// `string`", and rule 2's own verdict table is stricter still on the
+// primitive-or-enum row: "non-nullable primitive: ok; enum and both nullable
+// forms: —" (the `string`/`string?` row states the identical non-
+// nullable-ok/nullable-reject split for `string`). So the admissible set is
+// exactly: `kind == Primitive`, excluding `Object` (§8's Object class is not
+// itself a primitive value type; the primitive-value-type enumeration that
+// excludes it is §3.1), excluding EITHER nullable form.
+//
+// Shared by checkTypeConsts's explicit-type-annotation check
+// (TypeResolution_Checks.cpp) and ExprTypecheck's inferred-type mirror (fix
+// #3856, which deliberately copied checkTypeConsts's two-clause test verbatim
+// so the two admission points could not drift) — before this fix each site
+// independently spelled `kind == Primitive && primitive != Object` and BOTH
+// omitted the `nullable` clause the table states, so `int? / string? / <a
+// nullable enum, already excluded by kind alone>` were silently accepted at
+// both the explicit (`const A: int? := 1;`) and inferred (`const B := (if …
+// then 1 else null);`) spellings. Routing both sites through this one
+// function keeps that "one rule, two admission points" property intact going
+// forward: a future change to the rule only needs to change here.
+bool isAdmissibleClassConstType(const TypeRef& rt);
+
 }  // namespace bezel::sema

@@ -322,4 +322,11 @@ ConstShiftDomainFault findConstShiftDomainFault(
     return none;
 }
 
+// fix #3879 (§22.12, v0.294): see ConstFold.hpp for the rule this states and
+// why it is shared between the explicit- and inferred-type admission points.
+bool isAdmissibleClassConstType(const TypeRef& rt) {
+    return rt.kind == TypeRef::Kind::Primitive &&
+           rt.primitive != PrimitiveType::Object && !rt.nullable;
+}
+
 }  // namespace bezel::sema

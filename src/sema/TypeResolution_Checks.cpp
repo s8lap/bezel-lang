@@ -1113,8 +1113,13 @@ void Resolver::checkTypeConsts(TypeSymbol* t) {
         if (!cd || !cd->type) continue;  // inferred — deferred
         TypeRef* rt = ctx_.resolvedType(*cd->type);
         if (!rt) continue;
-        bool ok = rt->kind == TypeRef::Kind::Primitive &&
-                  rt->primitive != PrimitiveType::Object;
+        // fix #3879 (§22.12, v0.294): routed through the ONE shared predicate
+        // (ConstFold.hpp) so this explicit-type-annotation admission point
+        // and ExprTypecheck's inferred-type mirror (fix #3856) cannot drift —
+        // this used to spell `kind == Primitive && primitive != Object`
+        // in-line, which (like the mirror) omitted the `nullable` clause
+        // rule 2's table states, silently accepting `const A: int? := 1;`.
+        bool ok = isAdmissibleClassConstType(*rt);
         if (!ok) {
             ctx_.diagnostics().report(
                 Severity::Error, m->declLoc,

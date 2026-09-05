@@ -12333,14 +12333,22 @@ void ExprTC::visitMember(const ast::Member& m) {
             // the inferred form, with the SAME diagnostic checkTypeConsts
             // emits for the explicit form — one rule, two admission points,
             // not a second classifier.
+            //
+            // fix #3879 (§22.12, v0.294): the SAME rule is now the shared
+            // `isAdmissibleClassConstType` (ConstFold.hpp) rather than each
+            // site spelling its own copy — this in-line copy independently
+            // omitted rule 2's table's `nullable` clause exactly as
+            // checkTypeConsts's did, so `public const B := (if true then 1
+            // else null);` (an inferred `int?`) compiled silently at this
+            // site too. Routing both through one function is what keeps
+            // "one rule, two admission points" true going forward.
             if (!cd->type) {
                 // §22.12's own "(!rt) continue" guard on the explicit-type
                 // side (TypeResolution_Checks.cpp): an unresolved type
                 // already has its own diagnostic, so skip rather than pile
                 // on a second, misleading one here.
                 if (TypeRef* vt = ctx_.exprType(*cd->value)) {
-                    const bool ok = vt->kind == TypeRef::Kind::Primitive &&
-                                    vt->primitive != PrimitiveType::Object;
+                    const bool ok = isAdmissibleClassConstType(*vt);
                     if (!ok) {
                         ctx_.diagnostics().report(
                             Severity::Error, cd->span.begin,
