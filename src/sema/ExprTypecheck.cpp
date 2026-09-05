@@ -12301,6 +12301,39 @@ void ExprTC::visitMember(const ast::Member& m) {
                     "expression — a literal, an operation on constants, or a "
                     "reference to another const or enum constant (§22.12)");
             }
+            // fix #3856 (§22.12, v0.294): `const` (with or without `static`)
+            // requires "a primitive value type or `string`" — checkTypeConsts
+            // (TypeResolution_Checks.cpp) enforces exactly this for a const
+            // with a WRITTEN type annotation, but skips one with no
+            // annotation ("inferred — deferred", TypeResolution_Checks.cpp
+            // ~:1020): resolveTypes() (which runs checkTypeConsts) executes
+            // BEFORE typecheckExpressions() (this function), so at that
+            // point `cd->value` has no exprType yet to classify against —
+            // there was nothing to defer TO. No later pass picked it up, so
+            // `public const J := Priority.Low;` (an enum, rejected in the
+            // `: Priority` explicit-type spelling one line above it) compiled
+            // silently. `visitExpr` just above is the first point the
+            // initializer's type exists, so complete the SAME rule here for
+            // the inferred form, with the SAME diagnostic checkTypeConsts
+            // emits for the explicit form — one rule, two admission points,
+            // not a second classifier.
+            if (!cd->type) {
+                // §22.12's own "(!rt) continue" guard on the explicit-type
+                // side (TypeResolution_Checks.cpp): an unresolved type
+                // already has its own diagnostic, so skip rather than pile
+                // on a second, misleading one here.
+                if (TypeRef* vt = ctx_.exprType(*cd->value)) {
+                    const bool ok = vt->kind == TypeRef::Kind::Primitive &&
+                                    vt->primitive != PrimitiveType::Object;
+                    if (!ok) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, cd->span.begin,
+                            std::string("const `") + std::string(cd->name) +
+                            "` must have a primitive value type or `string` "
+                            "(§22.12)");
+                    }
+                }
+            }
         }
     } else if (auto* nt = dynamic_cast<const ast::NestedTypeMember*>(&m)) {
         if (nt->decl) {
