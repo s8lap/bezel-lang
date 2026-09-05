@@ -22094,6 +22094,84 @@ bool isConsoleNonRetainingArg(const ast::Expr* callee, size_t i) {
     return false;
 }
 
+// fix #3874 (§4.14/§4.15/§4.16/§8.6/§28.9, v0.294): is argument `i` of a call
+// whose callee is `callee` the `other` argument of `SequenceEqual` on a
+// T-element span receiver — ArraySpan<T>/ReadOnlyArraySpan<T> (§4.15,
+// borrowing) or Span<T>/ReadOnlySpan<T> (§4.14, owning) — or on an
+// `IReadOnlySpan<T>`-typed receiver dispatched through the vtable (§4.16)?
+//
+// Every codegen path for this shape reads the argument's span struct / box
+// PAYLOAD ONLY and never stores the pointer past the call:
+//   * tryLowerArraySpanCall's devirtualized SequenceEqual arm
+//     (LlvmBackend_Calls3.cpp, `m == "SequenceEqual"`) for a concrete
+//     receiver — an unboxing box+16 GEP+load for an already-boxed
+//     IReadOnlySpan<T> argument (the shape this predicate targets), or a
+//     bare struct read for a concrete argument;
+//   * the `bzspan$SequenceEqual` itable thunk `ensureSpanBoxVtable` mints
+//     (this file) for an interface receiver — `loadSpan` on both operands,
+//     never a store.
+// A CALL-BOUNDED BORROW, not an escape — the BOX twin of
+// isConsoleNonRetainingArg's rationale, above, just keyed on the RECEIVER's
+// type rather than a fixed callee identifier alone (`SequenceEqual` is also
+// declared on unrelated receivers — see the exclusion below — so the member
+// name by itself is not enough context).
+//
+// MEASURED, not assumed: before this predicate existed, `sp`'s LocalDecl
+// never joined `boxReleaseEligible_` for this exact call shape (every
+// argument position defaulted to escaped), and the filed issue's repro
+// leaked 32 B / 1 allocation (9600 B / 300 loop-amplified) with NO
+// `bz_box_release` anywhere in the emitted function — confirmed by
+// `BEZEL_DUMP_IR=1` before this fix. A control row (the same local read
+// again via `.Length` AFTER the `SequenceEqual` call, x300 under
+// `--asan`) proved a release emitted unconditionally at the CALL SITE
+// instead (i.e. skipping this walker entirely) would be unsound — it still
+// just leaked pre-fix, meaning a call-site release would have freed a box
+// a later read still needed: a UAF, not a fix. This walker's whole-local
+// lifetime view is the only place that question can be answered correctly.
+//
+// Scoped to these four concrete heads plus the interface itself, NOT to the
+// member name alone: `SequenceEqual` is ALSO declared on the string/char-span
+// family (ReadOnlyStringSpan / StringSpan / string, stdlib §3.3). Verified
+// (not assumed) that this exclusion costs nothing today: `SequenceEqual(other:
+// IReadOnlySpan<char>)` on `ReadOnlyStringSpan` is a clean SEMA REJECT right
+// now, already tracked as deferred surface by issue #2317 (blocked on #2313,
+// "IReadOnlySpan<char> parameter emits malformed IR") — it never reaches
+// codegen at all, so there is no reachable boxed-argument shape on this
+// receiver family for this predicate to get wrong yet. Should #2313/#2317
+// land and give `ReadOnlyStringSpan.SequenceEqual` a real boxed-argument
+// codegen path, that path's box-lifetime needs the SAME analysis this commit
+// did for the T-element family before it can safely join this predicate —
+// tracked as a residual on this fix rather than guessed at now.
+//
+// Not implemented by calling the existing `Emitter::isSpanLikeTypeName` /
+// `Emitter::isIReadOnlySpanType` (LlvmBackend_impl.hpp) — both are PRIVATE
+// static members of `Emitter`, and this walker (like `StringEscapeWalker`
+// below and `isConsoleNonRetainingArg` above) is a free function/struct
+// outside that class, never touching Emitter internals anywhere else
+// either. The five-name head check below is the minimal duplication of
+// their logic rather than widening Emitter's public surface or relocating
+// them across this run's #3874/#3805 file-ownership partition.
+bool isSequenceEqualSpanNonRetainingArg(const ast::Expr* callee, size_t i,
+                                        const sema::SemaContext& ctx) {
+    if (i != 0) return false;
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(callee);
+    if (!ma || !ma->target || ma->member != "SequenceEqual") return false;
+    const sema::TypeRef* recvTy = ctx.exprType(*ma->target);
+    if (!recvTy || recvTy->kind != sema::TypeRef::Kind::Named) return false;
+    // IReadOnlySpan<T> receiver (interface dispatch, §4.16) — mirrors
+    // isIReadOnlySpanType's declaration-based check.
+    if (recvTy->declaration) return recvTy->declaration->name == "IReadOnlySpan";
+    // Concrete span family (§4.14/§4.15) — mirrors isSpanLikeTypeName's
+    // astNode-head-name check (see the comment above for why it is
+    // duplicated here rather than called).
+    if (!recvTy->astNode || !recvTy->astNode->name ||
+        recvTy->astNode->name->parts.empty())
+        return false;
+    auto n = recvTy->astNode->name->parts[0];
+    return n == "ArraySpan" || n == "ReadOnlyArraySpan" ||
+           n == "Span" || n == "ReadOnlySpan";
+}
+
 struct StringEscapeWalker {
     const sema::SemaContext& ctx;
     const void* target;   // the LocalDecl node we are testing
@@ -28118,11 +28196,24 @@ struct BoxEscapeWalker {
     // declared Object/interface, resolved non-Object/interface at this point).
     // Inside a lambda the safe-read is suppressed — captured borrows live in
     // the env, which outlives the producing scope.
+    //
+    // fix #3874 (§4.14/§4.15/§4.16/§8.6/§28.9, v0.294) widens the safe-read
+    // set with `isSequenceEqualSpanNonRetainingArg` (defined beside
+    // `isConsoleNonRetainingArg`, above): the `other` argument of
+    // `SequenceEqual` on a T-element span receiver or an `IReadOnlySpan<T>`
+    // receiver is a CALL-BOUNDED BORROW for the same reason the console
+    // argument is — every codegen path for it reads the box/struct payload
+    // and never stores the pointer past the call. MEASURED before the fix:
+    // `var sp: IReadOnlySpan<int> := b.AsReadOnlySpan();
+    // if sa.SequenceEqual(sp) then … end;` leaked 32 B / 1 allocation (9600 B
+    // / 300 loop-amplified) because `sp` never joined `boxReleaseEligible_`
+    // for this call shape and no `bz_box_release` was ever emitted for it.
     void walkArgs(const ast::Expr* callee,
                   const std::vector<ast::CallArgument>& args) {
         for (std::size_t i = 0; i < args.size(); ++i) {
             bool safe = args[i].name.empty() && args[i].modifier.empty() &&
                         (isConsoleNonRetainingArg(callee, i) ||
+                         isSequenceEqualSpanNonRetainingArg(callee, i, ctx) ||
                          isNarrowedRead(args[i].value.get())) &&
                         !inLambda;
             expr(args[i].value.get(), safe);

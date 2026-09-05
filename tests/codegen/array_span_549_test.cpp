@@ -22,7 +22,9 @@
 //   §4.15 Reverse() reverses in place (and in source array)
 //   §4.15 SequenceEqual (same / different span)
 //   §4.15 / §4.16 (#3849) SequenceEqual cross-mode, both receiver directions
-//   §4.16 (#3849) SequenceEqual with a boxed IReadOnlySpan<T> argument
+//   §4.16 (#3849/#3874) SequenceEqual with a boxed IReadOnlySpan<T> argument,
+//     now ASan-clean; amplified x300; a control row proving the argument's
+//     owning local survives (and is not double-released) past the call
 //   §4.15 for-in iteration over span
 //   §4.15 ASan: span over a 'using var' array does NOT free array at span end
 //   §4.15 ReadOnly: indexer setter rejected at compile time
@@ -56,6 +58,7 @@
 #include "llvm/IR/Module.h"
 
 using bezel::test::runAot;
+using bezel::test::runAotChecked;
 
 namespace {
 
@@ -65,6 +68,21 @@ namespace fs = std::filesystem;
 int run(const std::string& src) {
     auto r = runAot(src);
     return r.ran ? r.exitCode : -999;
+}
+
+// fix #3874: runAotChecked compiles+runs `src` with GENERATED-CODE ASan/LSan
+// in-process (aot_support.hpp's `opts.sanitizeAddress = true`), unlike
+// `runUnderAsan` below (a separate native-toolchain ASan build+exec, which is
+// vacuous — always returns -1 — inside a lane worktree per #3682; only the
+// gate tree runs it for real). runAotChecked has no such gap: a leak or a
+// use-after-free in `src` turns `ran` false, right here, in this process.
+// Returns the program's stdout text (trailing newline included, matching
+// `stdoutText`'s contract) so a loop-amplified row can assert an accumulated
+// VALUE alongside the leak/UAF-clean requirement, or the sentinel below on
+// any failure (compile reject, leak, ASan abort).
+std::string runCheckedStdout(const std::string& src) {
+    auto r = runAotChecked(src);
+    return r.ran ? r.stdoutText : std::string("<did-not-run>");
 }
 
 // True iff sema rejected `src` with at least one error diagnostic.
@@ -789,18 +807,19 @@ BEZEL_TEST(array_span_549, sequence_equal_cross_mode_length_mismatch_3849) {
 // §4.16: SequenceEqual with a boxed `IReadOnlySpan<T>` argument, equal
 // content — the exact reviewer repro for the boxed-argument bug.
 //
-// Uses the plain VALUE oracle (`run`), not `expectValueAndAsanClean`: issue
-// #3874 (filed alongside this fix, NOT part of #3849's scope) tracks a
-// separate, pre-existing 32-byte leak of the argument's `IReadOnlySpan<T>`
-// box on this exact call shape — measured present BOTH with and without
-// this commit's unboxing fix (isolated by running this file's unmodified
-// pre-fix `LlvmBackend_Calls3.cpp` through the same ASan/LSan probe), so it
-// is not this commit's to fix or to mask by weakening the oracle elsewhere.
-// The VALUE assertion below is exactly what pinned the wrong-boolean bug
-// (FAIL-WITHOUT: plain, non-instrumented `bezelc` run of this program
-// returns 0; PASS-WITH: returns 1 — see the commit body).
+// fix #3874: previously asserted VALUE only via the plain `run()` oracle,
+// because the argument's box leaked (32 B / 1 allocation) on this exact call
+// shape regardless of the #3849 unboxing fix — a separate, pre-existing bug
+// this test file explicitly declined to mask by weakening the oracle. Now
+// ASan-clean too: `sp`'s box is released at its own scope end once
+// `BoxEscapeWalker` (LlvmBackend_Setup.cpp `walkArgs`) stops treating this
+// argument position as an escape (`isSequenceEqualSpanNonRetainingArg`).
+// Uses `expectValueAndAsanClean` (native-toolchain ASan leg, may SKIP in a
+// lane worktree per #3682) for the value+ASan pairing this file already uses
+// throughout; the loop-amplified rows below use `runAotChecked` (in-process
+// ASan, never vacuous) for the leak-specific proof.
 BEZEL_TEST(array_span_549, sequence_equal_boxed_ireadonlyspan_arg_3849) {
-    BEZEL_EXPECT_EQ(run(
+    expectValueAndAsanClean(
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  a.Add(1); a.Add(2); a.Add(3); "
@@ -810,13 +829,13 @@ BEZEL_TEST(array_span_549, sequence_equal_boxed_ireadonlyspan_arg_3849) {
         "  var sp: IReadOnlySpan<int> := b.AsReadOnlySpan(); "
         "  if sa.SequenceEqual(sp) then return 1; end; "
         "  return 0; "
-        "end Main; end C;"), 1);
+        "end Main; end C;", 1);
 }
 
 // §4.16: same shape, different content — must be false, not garbage.
-// Plain VALUE oracle for the same #3874 reason as the row above.
+// fix #3874: same ASan-clean upgrade as the row above.
 BEZEL_TEST(array_span_549, sequence_equal_boxed_ireadonlyspan_arg_unequal_3849) {
-    BEZEL_EXPECT_EQ(run(
+    expectValueAndAsanClean(
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  a.Add(1); a.Add(2); a.Add(3); "
@@ -826,7 +845,75 @@ BEZEL_TEST(array_span_549, sequence_equal_boxed_ireadonlyspan_arg_unequal_3849) 
         "  var sp: IReadOnlySpan<int> := b.AsReadOnlySpan(); "
         "  if sa.SequenceEqual(sp) then return 1; end; "
         "  return 0; "
-        "end Main; end C;"), 0);
+        "end Main; end C;", 0);
+}
+
+// ===========================================================================
+// fix #3874 (§4.15/§4.16/§8.6/§28.9, v0.294): the box-leak fix itself, loop-
+// amplified x300 under `runAotChecked` (in-process generated-code ASan/LSan,
+// never vacuous in a lane worktree — unlike `runUnderAsan` above, #3682).
+// A one-shot LSan row passes on BOTH sides of a leak fix because the single
+// allocation is still stack-reachable at process exit; amplifying to 300
+// iterations of a `using var`-scoped repro (each iteration's arrays freed,
+// so nothing OTHER than the fix keeps the run leak-clean) is what actually
+// exercises the per-iteration release. MEASURED pre-fix (probe, not this
+// test): 9600 B / 300 allocations leaked on this exact program. The VALUE
+// assertion (a running count of equal-content matches, all 300) is the same
+// value oracle that pins #3849's correctness; `runAotChecked` adds the
+// leak/UAF-clean requirement on top, not in place of it.
+// ===========================================================================
+
+BEZEL_TEST(array_span_549,
+           sequence_equal_boxed_ireadonlyspan_arg_leak_free_amplified_300_3874) {
+    BEZEL_EXPECT_EQ(runCheckedStdout(
+        "module M; import System; class C public static method Main(): int "
+        "  var count: int := 0; "
+        "  for var i in 0..<300 do "
+        "    using var a := new Array<int>(); "
+        "    a.Add(1); a.Add(2); a.Add(3); "
+        "    using var b := new Array<int>(); "
+        "    b.Add(1); b.Add(2); b.Add(3); "
+        "    var sa := a.AsSpan(); "
+        "    var sp: IReadOnlySpan<int> := b.AsReadOnlySpan(); "
+        "    if sa.SequenceEqual(sp) then count := count + 1; end; "
+        "  end; "
+        "  Console.WriteLine(count.ToString()); "
+        "  return 0; "
+        "end Main; end C;"),
+        "300\n");
+}
+
+// #3874 control row (mandatory per this run's lane rules — "never trade a
+// leak for a double-free"): `sp` is read AGAIN, via `.Length`, after the
+// `SequenceEqual` call that made it non-escaping. This is the exact shape
+// that would turn into a use-after-free if the fix instead released the
+// argument's box unconditionally at the `SequenceEqual` CALL SITE (rejected
+// approach — proved unsound by probe: that shape still just leaked pre-fix,
+// meaning a call-site release would free a box this later read still needs).
+// The fix here works precisely because it does NOT touch the call site at
+// all — it only widens `BoxEscapeWalker`'s whole-local-lifetime escape
+// classification for `sp`'s OWN scope-end release, which correctly still
+// fires exactly once, after BOTH reads. Amplified x300; loop-carried `count`
+// covers both the match tally (300) and the length tally (300 * 3 = 900).
+BEZEL_TEST(array_span_549,
+           sequence_equal_boxed_ireadonlyspan_arg_reused_after_call_control_3874) {
+    BEZEL_EXPECT_EQ(runCheckedStdout(
+        "module M; import System; class C public static method Main(): int "
+        "  var count: int := 0; "
+        "  for var i in 0..<300 do "
+        "    using var a := new Array<int>(); "
+        "    a.Add(1); a.Add(2); a.Add(3); "
+        "    using var b := new Array<int>(); "
+        "    b.Add(1); b.Add(2); b.Add(3); "
+        "    var sa := a.AsSpan(); "
+        "    var sp: IReadOnlySpan<int> := b.AsReadOnlySpan(); "
+        "    if sa.SequenceEqual(sp) then count := count + 1; end; "
+        "    count := count + sp.Length; "
+        "  end; "
+        "  Console.WriteLine(count.ToString()); "
+        "  return 0; "
+        "end Main; end C;"),
+        "1200\n");
 }
 
 // ===========================================================================
