@@ -192,6 +192,36 @@ BEZEL_TEST(fresh_store_warning_3364, hazard_text_splits_trivial_vs_non_trivial) 
     BEZEL_EXPECT_TRUE(contains(freshStoreText(nont), "a disposed instance"));
 }
 
+// fix #3680 (§28.9 recursive clause / §28.3, v0.293): site 6 of #3647's
+// TypeRef+SemaContext migration — this hazard-text selector, inside this same
+// function — was still reading the legacy `TypeSymbol`-only
+// `isNonTrivialDisposeClass`, which cannot see the §28.9 recursive clause ("an
+// owned field whose declared type is itself trivial-dispose does not
+// disqualify the holder"). `Wrapper` below has exactly that shape: its only
+// member is `owned _inner: Item?`, and `Item` (no destructor, no owned field)
+// is itself trivial-dispose, so §28.9 makes `Wrapper` trivial-dispose too —
+// the same verdict the five already-migrated call sites (#3647) already give
+// it. Pre-fix, the legacy overload disqualified `Wrapper` on the mere
+// presence of an `owned` field, so this test FAILS WITHOUT the fix (hazard
+// text contains "a disposed instance" instead) and PASSES WITH it.
+BEZEL_TEST(fresh_store_warning_3364,
+           recursive_trivial_dispose_owned_field_gets_trivial_hazard_text) {
+    OwnershipResult r = check(
+        "class Wrapper "
+        "  private owned _inner: Item?; "
+        "  public constructor(v: int) _inner := new Item(v); end constructor; "
+        "end Wrapper; "
+        "class C public static method M(): int "
+        "  using var a := new Array<Wrapper>(); "
+        "  a.Add(new Wrapper(1)); "
+        "  return a.Count; "
+        "end M; end C;");
+    const std::string w = freshStoreText(r);
+    BEZEL_EXPECT_FALSE(w.empty());
+    BEZEL_EXPECT_TRUE(contains(w, "DisposedAccessException"));
+    BEZEL_EXPECT_FALSE(contains(w, "a disposed instance"));
+}
+
 // §15.4 names the indexer-set alongside `Add`/`Insert`, so the two store sinks
 // answer with the one predicate. `t` is a borrowed parameter, so the `.Add(t)`
 // that seeds the slot is itself admitted and unwarned — the single warning

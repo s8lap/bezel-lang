@@ -6995,8 +6995,22 @@ void MethodOwnership::warnSec154FreshStore(const ast::Expr& arg,
             "an abandoned task — the operation runs to its terminal state "
             "unsupervised and its result, if owned, is disposed on arrival "
             "(§30.5) — and the slot dangles besides";
+    // fix #3680 (§28.9 / §28.3 / §15.4, v0.293): the TypeRef+SemaContext
+    // overload — `at` is already the resolved TypeRef this function read
+    // above (via `ctx_.exprType(arg)`), so pass it (and `ctx_`) directly
+    // rather than just `at->declaration`, picking up the §28.9 recursive
+    // clause and §3.6 rule 2 per-instantiation reading here too, matching
+    // the five sibling call sites #3647 already migrated. This only
+    // reselects WHICH of the two warning-text hazard clauses below fires
+    // for a class with a non-static `owned` field whose OWN declared type
+    // is itself trivial-dispose (or a generic instantiation, e.g.
+    // `OwningBox<Random>`, that only classifies trivial-dispose once
+    // substituted): the surrounding `warnSec154FreshStore` warning still
+    // fires either way, so this is not an accept/reject change — but it
+    // ends the site's disagreement with the class's own compile-time
+    // verdict everywhere else in the compiler (the five sites above).
     } else if ((at->declaration &&
-                common::isNonTrivialDisposeClass(at->declaration)) ||
+                common::isNonTrivialDisposeClass(at, ctx_)) ||
                (!at->declaration && !argHead.empty() &&
                 common::isOwningCollectionHead(argHead))) {
         hazard =
