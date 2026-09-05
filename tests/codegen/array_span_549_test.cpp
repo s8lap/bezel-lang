@@ -21,6 +21,8 @@
 //   §4.15 CopyTo(dst) copies slot-by-slot
 //   §4.15 Reverse() reverses in place (and in source array)
 //   §4.15 SequenceEqual (same / different span)
+//   §4.15 / §4.16 (#3849) SequenceEqual cross-mode, both receiver directions
+//   §4.16 (#3849) SequenceEqual with a boxed IReadOnlySpan<T> argument
 //   §4.15 for-in iteration over span
 //   §4.15 ASan: span over a 'using var' array does NOT free array at span end
 //   §4.15 ReadOnly: indexer setter rejected at compile time
@@ -693,6 +695,138 @@ BEZEL_TEST(array_span_549, sequence_equal_with_readonly_span_spec_4_15) {
         "  if sa.SequenceEqual(rob) then return 1; end; "
         "  return 0; "
         "end Main; end C;", 1);
+}
+
+// ===========================================================================
+// §4.15 / §4.16 (#3849): cross-mode SequenceEqual, both receiver directions.
+//
+// v0.290 (proposal 0123 R3) retired the concrete cross-mode overloads
+// (`ArraySpan<T>.SequenceEqual(other: ReadOnlyArraySpan<T>)` and the
+// `ReadOnlyArraySpan<T>` mirror); stdlib §4.15 now states "There is no
+// concrete cross-mode overload, and none is needed: the interface form
+// `SequenceEqual(other: IReadOnlySpan<T>)` admits a `ReadOnlyArraySpan<T>`
+// (and any other span family at element type `T`) directly, under the
+// call-bounded boxing of language spec §8.6". The codegen arm in
+// LlvmBackend_Calls3.cpp (`tryLowerArraySpanCall`, `m == "SequenceEqual"`)
+// was never written to switch on the argument's concrete span kind — it
+// lowers `call.args[0].value` and reads it back through the one shared
+// bz.arrayspan struct layout regardless of which of the four span types
+// produced it, so it already serves the retired concrete overloads and the
+// interface-routed cross-mode call identically (issue #3849's decision:
+// KEEP the direct arm as the permitted devirtualization stdlib §1 allows
+// ("Implementations are free to optimize"), documented at the arm itself).
+// The test above (sequence_equal_with_readonly_span_spec_4_15) already pins
+// the ArraySpan-receiver / equal-content direction; these three close the
+// gaps: the REVERSE receiver direction, and the unequal-content and
+// length-mismatch outcomes for a cross-mode pair.
+// ===========================================================================
+
+// §4.15/§4.16: ReadOnlyArraySpan<T> receiver, ArraySpan<T> argument, equal
+// content — the reverse of sequence_equal_with_readonly_span_spec_4_15.
+BEZEL_TEST(array_span_549, sequence_equal_readonly_receiver_cross_mode_equal_3849) {
+    expectValueAndAsanClean(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(5); a.Add(6); a.Add(7); "
+        "  using var b := new Array<int>(); "
+        "  b.Add(5); b.Add(6); b.Add(7); "
+        "  var rob := a.AsReadOnlySpan(); "
+        "  var sb := b.AsSpan(); "
+        "  if rob.SequenceEqual(sb) then return 1; end; "
+        "  return 0; "
+        "end Main; end C;", 1);
+}
+
+// §4.15/§4.16: ReadOnlyArraySpan<T> receiver, ArraySpan<T> argument, same
+// length but different elements — must be false, not just "compiles".
+BEZEL_TEST(array_span_549, sequence_equal_readonly_receiver_cross_mode_unequal_3849) {
+    expectValueAndAsanClean(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(5); a.Add(6); a.Add(7); "
+        "  using var b := new Array<int>(); "
+        "  b.Add(5); b.Add(6); b.Add(9); "
+        "  var rob := a.AsReadOnlySpan(); "
+        "  var sb := b.AsSpan(); "
+        "  if rob.SequenceEqual(sb) then return 1; end; "
+        "  return 0; "
+        "end Main; end C;", 0);
+}
+
+// §4.15/§4.16: ArraySpan<T> receiver, ReadOnlyArraySpan<T> argument, lengths
+// differ — the cross-mode counterpart of sequence_equal_length_mismatch_spec_4_15.
+BEZEL_TEST(array_span_549, sequence_equal_cross_mode_length_mismatch_3849) {
+    expectValueAndAsanClean(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(1); a.Add(2); "
+        "  using var b := new Array<int>(); "
+        "  b.Add(1); b.Add(2); b.Add(3); "
+        "  var sa := a.AsSpan(); "
+        "  var rob := b.AsReadOnlySpan(); "
+        "  if sa.SequenceEqual(rob) then return 1; end; "
+        "  return 0; "
+        "end Main; end C;", 0);
+}
+
+// ===========================================================================
+// §4.15/§4.16 (#3849 review follow-up): argument STATICALLY typed
+// `IReadOnlySpan<T>` (already boxed), distinct from the concrete cross-mode
+// rows above. `var sp: IReadOnlySpan<int> := b.AsReadOnlySpan();` matches
+// ArraySpan<T>'s own `SequenceEqual(other: IReadOnlySpan<T>)` overload with
+// no further boxing conversion — `sp` is already the boxed
+// `{vtable*, i64 rc, bz.arrayspan}` value, not the raw 3-field struct the
+// concrete rows produce. Before the fix, storing that lone pointer into the
+// `spanSt`-typed `otherSlot` alloca filled only the first field, leaving
+// `start`/`length` as uninitialized stack garbage: the fast-path length
+// compare then read garbage and the equal-content row below incorrectly
+// returned 0 instead of 1 (measured pre-fix; valgrind additionally reported
+// "Conditional jump ... depends on uninitialised value(s) ... created by a
+// stack allocation" over the same program). FAIL-WITHOUT / PASS-WITH proof
+// is in the commit body.
+// ===========================================================================
+
+// §4.16: SequenceEqual with a boxed `IReadOnlySpan<T>` argument, equal
+// content — the exact reviewer repro for the boxed-argument bug.
+//
+// Uses the plain VALUE oracle (`run`), not `expectValueAndAsanClean`: issue
+// #3874 (filed alongside this fix, NOT part of #3849's scope) tracks a
+// separate, pre-existing 32-byte leak of the argument's `IReadOnlySpan<T>`
+// box on this exact call shape — measured present BOTH with and without
+// this commit's unboxing fix (isolated by running this file's unmodified
+// pre-fix `LlvmBackend_Calls3.cpp` through the same ASan/LSan probe), so it
+// is not this commit's to fix or to mask by weakening the oracle elsewhere.
+// The VALUE assertion below is exactly what pinned the wrong-boolean bug
+// (FAIL-WITHOUT: plain, non-instrumented `bezelc` run of this program
+// returns 0; PASS-WITH: returns 1 — see the commit body).
+BEZEL_TEST(array_span_549, sequence_equal_boxed_ireadonlyspan_arg_3849) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(1); a.Add(2); a.Add(3); "
+        "  using var b := new Array<int>(); "
+        "  b.Add(1); b.Add(2); b.Add(3); "
+        "  var sa := a.AsSpan(); "
+        "  var sp: IReadOnlySpan<int> := b.AsReadOnlySpan(); "
+        "  if sa.SequenceEqual(sp) then return 1; end; "
+        "  return 0; "
+        "end Main; end C;"), 1);
+}
+
+// §4.16: same shape, different content — must be false, not garbage.
+// Plain VALUE oracle for the same #3874 reason as the row above.
+BEZEL_TEST(array_span_549, sequence_equal_boxed_ireadonlyspan_arg_unequal_3849) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(1); a.Add(2); a.Add(3); "
+        "  using var b := new Array<int>(); "
+        "  b.Add(1); b.Add(2); b.Add(9); "
+        "  var sa := a.AsSpan(); "
+        "  var sp: IReadOnlySpan<int> := b.AsReadOnlySpan(); "
+        "  if sa.SequenceEqual(sp) then return 1; end; "
+        "  return 0; "
+        "end Main; end C;"), 0);
 }
 
 // ===========================================================================

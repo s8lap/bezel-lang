@@ -4263,10 +4263,72 @@ llvm::Value* Emitter::tryLowerArraySpanCall(const ast::CallExpr& call) {
     }
 
     // -- SequenceEqual(other: ArraySpan<T> | ReadOnlyArraySpan<T>) → bool -----
+    // #3849 DECISION: KEEP this arm as a single implementation serving both
+    // the concrete cross-mode call (ArraySpan<T> receiver, ReadOnlyArraySpan<T>
+    // argument, or vice versa) AND an argument already typed IReadOnlySpan<T>,
+    // rather than adding a second, interface-routed emitter.
+    //
+    // v0.290 (proposal 0123 R3) retired the concrete cross-mode overloads
+    // (`ArraySpan<T>.SequenceEqual(other: ReadOnlyArraySpan<T>)` and its
+    // `ReadOnlyArraySpan<T>` mirror); stdlib §4.15 now states: "There is no
+    // concrete cross-mode overload, and none is needed: the interface form
+    // `SequenceEqual(other: IReadOnlySpan<T>)` admits a `ReadOnlyArraySpan<T>`
+    // (and any other span family at element type `T`) directly, under the
+    // call-bounded boxing of language spec §8.6". Stdlib §4.16 ("SequenceEqual
+    // and the interface") spells out the naive translation of that rule: box
+    // the argument into a heap `IReadOnlySpan<T>` object and read it back
+    // through "one virtual-dispatched indexer read per element (the argument
+    // side; the receiver's reads stay direct)".
+    //
+    // For a CONCRETE argument (ArraySpan<T>/ReadOnlyArraySpan<T>/Span<T>/
+    // ReadOnlySpan<T> — the cross-mode case the issue was filed against) this
+    // arm skips the box and the virtual dispatch entirely: `lowerExpr` already
+    // produces the raw `{ptr source, i32 start, i32 length}` value every span
+    // type shares (see the block comment at this function's top), so reading
+    // it directly is a sound devirtualization stdlib §1 permits
+    // ("Implementations are free to optimize") — provably the same bytes the
+    // interface path's box would eventually hand back. This predates the
+    // v0.290 retirement (the arm was never argument-kind-specific for a
+    // CONCRETE argument, going back to the pre-split LlvmBackend_Calls.cpp),
+    // so nothing needed to change here for that case.
+    //
+    // BUT an argument whose STATIC type is *already* `IReadOnlySpan<T>` (an
+    // identity match against this method's own `(other: IReadOnlySpan<T>)`
+    // overload — no further boxing conversion happens, it is already boxed)
+    // is NOT the same value shape: `lowerExpr` returns the boxed heap pointer
+    // `{vtable*, i64 rc, bz.arrayspan}` (see `ensureSpanBoxVtable`'s `loadSpan`
+    // lambda, LlvmBackend_Setup.cpp — box+16 is the arrayspan slot), not the
+    // bare struct. An earlier version of this comment claimed the direct read
+    // was sound unconditionally; it was not measured against this case, and it
+    // was wrong: storing that lone pointer into a `spanSt`-typed alloca fills
+    // only the first field, leaving `start`/`length` as UNINITIALIZED stack
+    // bytes — the fast-path length compare below then reads garbage, so the
+    // call could return the wrong boolean (valgrind: "Conditional jump ...
+    // depends on uninitialised value(s) ... created by a stack allocation").
+    // Detect that case with `isIReadOnlySpanType` (the same predicate the
+    // rest of the codegen uses to recognize a boxed span — no new "is this a
+    // span" spelling) and unbox through the SAME box+16 offset `loadSpan`
+    // uses, reusing its GEP shape rather than re-deriving the layout.
+    // Regression tests (array_span_549_test.cpp): the `sequence_equal_*_
+    // cross_mode_*_3849` rows pin the concrete cross-mode case; `sequence_
+    // equal_boxed_ireadonlyspan_arg_3849` pins THIS case with an asserted
+    // VALUE (was 0, must be 1) and was the row that failed without the unbox.
+    // ⚠ A DIFFERENT, pre-existing bug shares this call shape: the argument's
+    // box leaks (32 bytes) whether or not the unbox above is present — filed
+    // separately as issue 3874 (not fixed here; the two rows above assert
+    // VALUE only, not ASan-cleanliness, for exactly that reason).
     if (m == "SequenceEqual" && call.args.size() == 1 && call.args[0].value) {
         llvm::Value* otherVal = lowerExpr(*call.args[0].value);
         if (!otherVal) return nullptr;
         auto* otherSlot = entryAlloca(spanSt);
+        // #3849: an already-boxed `IReadOnlySpan<T>` argument is a heap
+        // pointer, not the raw arrayspan struct — unbox it first (see the
+        // block comment above).
+        if (isIReadOnlySpanType(ctx_.exprType(*call.args[0].value))) {
+            llvm::Value* boxSpanPtr = builder_.CreateGEP(
+                ptrTy(), otherVal, {builder_.getInt32(2)}, "se.box.span");
+            otherVal = builder_.CreateLoad(spanSt, boxSpanPtr, "se.unboxed");
+        }
         builder_.CreateStore(otherVal, otherSlot);
         llvm::Value* aLen = loadLen();
         llvm::Value* bLen = builder_.CreateLoad(i32(),
