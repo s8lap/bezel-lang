@@ -12428,6 +12428,27 @@ private:
                 int argCls = argIsNull ? 3 : typeClassOf(argTy);
                 auto* paramTy = localParamType(pi);
                 int paramCls = typeClassOf(paramTy);
+                // fix #3760 follow-up: a `null` arg against a NULLABLE param
+                // is a valid match — a `null` literal carries no typeClass
+                // information of its own (sema leaves its exprType either null
+                // or a sentinel), so the previous `argCls=3 vs paramCls=1`
+                // rejection rejected `new B(null)` against `constructor(n:
+                // int?)` even though the parameter clearly admits null. The
+                // param's `nullable` flag is the load-bearing signal: a null
+                // arg → nullable param is fine, null arg → non-nullable param
+                // is rejected (the value-1 nullCls=3 vs the value-1 primitive
+                // mismatch above correctly rejects that). For NAMED class 3
+                // params both nullable and non-nullable are class 3 (the
+                // typeClassOf NAMED branch flattens), so this branch only
+                // narrows the rejection for primitives.
+                if (argIsNull) {
+                    if (paramTy && paramTy->nullable) {
+                        // null → nullable param: accept
+                    } else if (argCls != paramCls) {
+                        return false;
+                    }
+                    continue;
+                }
                 if (argCls != -1 && paramCls != -1 && argCls != paramCls)
                     return false;
             }
