@@ -179,7 +179,7 @@ BEZEL_TEST(dict_snapshot_value_disposer_3568,
 
 // ---------------------------------------------------------------------------
 // (B) The SENTINEL control — the same shape with string LITERAL values.
-//   per §8.6 (release is null- and sentinel-safe)
+//   per §28.9 (release is null- and sentinel-safe)
 //
 // A literal's `bz_string` is not a heap producer, so its release is a no-op and
 // this row was clean before the fix. It is here to fail if the deferred release
@@ -220,7 +220,7 @@ BEZEL_TEST(dict_snapshot_value_disposer_3568,
 // ---------------------------------------------------------------------------
 // (C) BOTH obligations at once: `Dictionary<string, string>` with LITERAL keys
 //     and BUILT values, 200x under LSan.
-//   per stdlib §4.8, §28.11, §8.6
+//   per stdlib §4.8, §28.11, §28.9
 //
 // One `Dispose` now walks each entry twice over: `bz_string_release` on the
 // REBUILT key at field 0 (the #2522 job) and the inherited value release on

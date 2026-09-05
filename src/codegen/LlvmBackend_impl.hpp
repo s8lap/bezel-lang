@@ -8645,12 +8645,24 @@ private:
     void freeCollectionSourceNow(llvm::Value* v, const sema::TypeRef* srcTy);
     // fix #3568 (§29.2 / §28.9 / stdlib §4.8, v0.286): the KEYS-ONLY face.
     // `bz_dict_free(d, null)` frees the table and each key copy and touches NO
-    // value slot, which is exactly right for the dict-backed `Set<T>` arms (a
+    // value slot, which is exactly right for the dict-backed `Set<T>` arm (a
     // Set's hash table has keys and no values) and WRONG for a real dictionary
     // whose value slots carry a heap box or a co-owned reference. Every
     // dictionary caller must therefore use the two-argument overload below and
-    // say which disposer the source free discharges; this one-argument spelling
-    // is retained ONLY for the two `Set` arms in LlvmBackend_Setup.cpp.
+    // say which disposer the source free discharges. There are exactly two
+    // call sites of this one-argument spelling in LlvmBackend_Setup.cpp, and
+    // only ONE of them is a `Set` arm (the `initIsDictSet` local-decl mint):
+    // the other is the plain `Dictionary` local-decl mint's unbound-`new`
+    // free (`isDictTypeName(initTR) && dictEntryWrapShapeSupported(...)`
+    // arm). That second call site is NOT "no values" the way a Set is — it
+    // is safe for a different reason: an unbound `new Dictionary<K,V>()`
+    // bound directly at a local-decl site is always EMPTY (the initializer
+    // is checked to be the `ast::NewExpr` itself, so no statement could have
+    // populated it before this one runs — no spelling of a dictionary
+    // literal is an `ast::NewExpr`), not because a Dictionary's value slot
+    // carries nothing to release. Read this spelling as "no LIVE value slot
+    // to discharge" (empty table, in the Dictionary case; no value slot at
+    // all, in the Set case), not as "Set-only".
     void freeDictSourceNow(llvm::Value* v);
     // fix #3568: the same free with an EXPLICIT value disposer. `valDisposer`
     // is the `void(void*)` thunk `bz_dict_free` invokes on every live value

@@ -11111,7 +11111,21 @@ bool Emitter::dictEntryWrapShapeSupported(const sema::TypeRef* iEnumTy,
     //     MEASURED (200x, LSan): `Dictionary<int, int?>` gives
     //     `keys=600 present=200`, clean, where the pre-#3568 kind-only gate
     //     leaked 3200 B in 400 allocations.
-    //   * ENUM. An integer in the slot; nothing to dispose either way.
+    //   * ENUM. Admitted NULLABLE OR NOT — the Named branch (`namedDeclKind`
+    //     below) has no `->nullable` exclusion, unlike `primV` above (the
+    //     v0.283 narrow test) which spells `!valTy->nullable` explicitly. The
+    //     two shapes are NOT the same, though: a non-nullable `Color` is a
+    //     bare integer in the slot with nothing to dispose, but a nullable
+    //     `Color?` is heap-boxed on `.Add` exactly like `int?` —
+    //     `isNullableValueTy` folds `isNullableEnumTy` in alongside the
+    //     primitive/record nullable forms (LlvmBackend_Calls.cpp's
+    //     `encodeValue`, issue #539: "nullable value types (int?, bool?,
+    //     enum?, nullable record) lower to a tagged {i8 hasValue; T}
+    //     struct"), so `Color?`'s box IS something to release. It needs no
+    //     enum-specific handling here only because `dictValueBoxFreer`'s
+    //     `isStructTy()` test (`dictValueIsBoxedStruct`) already catches it
+    //     the same generic way it catches `int?` — not because there is
+    //     nothing to free.
     //     MEASURED (200x, LSan): `Dictionary<int, Color>` gives
     //     `keys=600 total=800`, clean.
     //
