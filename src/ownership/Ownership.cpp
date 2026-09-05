@@ -2757,9 +2757,45 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
         // correct-by-context because the shape it would have needed to see
         // can no longer reach it. // per §22.3, §21.1, #3591
         if (lc->value) recordMovesIn(*lc->value);
-        // No state transition: a const local carries no obligation. The
-        // narrowing-persistence rule (§7.4) is enforced in sema; the
-        // ownership pass treats the binding as a no-op for its analysis.
+        // No OWNERSHIP-OBLIGATION transition: a const local carries no
+        // disposal obligation. The narrowing-persistence rule (§7.4) is
+        // enforced in sema.
+        //
+        // fix #3687 (§21.1 v0.286, §28.3): a const local IS, however, tracked
+        // as a BORROW — §21.1: "the binding is then a borrow carrying the
+        // initializer's source-liveness constraints, exactly as a plain
+        // unmarked `var` alias". `handleLocalDecl`'s `var` twin seeds
+        // `states_[lsym].source` via `borrowSourceForExpr` at the end of that
+        // function, gated on `!ld.isUsing && !ld.initializerHasOwnedMarker` —
+        // both conditions are unconditionally true for a `const` (it can
+        // never be `using` and never carries the `owned` transfer marker).
+        // This arm never seeded `states_` at all, so `borrowSourceForExpr`
+        // (called later from an assignment/return/throw check on a read of
+        // this const) always missed on `states_.find(sym)` and returned null
+        // — `checkBorrowStoreEscape` / the field-store escape check then had
+        // no source to compare scopes against and could never fire. Measured:
+        // `using var localObj := new Widget(); const cur := localObj; h.w :=
+        // cur;` compiled clean and read-after-free through `h.w` once
+        // `localObj` disposed at scope end (confirmed under ASan:
+        // heap-use-after-free), where the identical `var cur := localObj;`
+        // spelling is correctly rejected. Only `.source` is populated, never
+        // `.state = Owned` — a const still takes no obligation, and every
+        // consumer on this path (`borrowSourceForExpr`'s multi-hop-chain
+        // branch, `isEscapeBoundLocal` on the SOURCE symbol) reads `.source`
+        // directly without consulting this local's own `.state`. // per
+        // §21.1, §28.3, #3687
+        if (lc->value) {
+            if (sema::Symbol* src = borrowSourceForExpr(*lc->value)) {
+                if (sema::LocalSymbol* lsym = findLocalSymbol(*lc)) {
+                    BorrowSource bs;
+                    bs.sym = src;
+                    LocalOwnership lo;
+                    lo.state = OwnershipState::Borrowed;
+                    lo.source = bs;
+                    states_[lsym] = lo;
+                }
+            }
+        }
         return;
     }
     if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(&s)) {
