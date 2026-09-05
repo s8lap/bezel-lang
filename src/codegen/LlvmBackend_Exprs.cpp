@@ -7625,7 +7625,15 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
                 llvm::Value* klen  = loadStringLen(key);
                 auto* fn = declareC("bz_dict_contains_str", i1(),
                                     {ptrTy(), ptrTy(), i64()});
-                return builder_.CreateCall(fn, {dict, kdata, klen}, "dict.in");
+                llvm::Value* r =
+                    builder_.CreateCall(fn, {dict, kdata, klen}, "dict.in");
+                // fix #3703 / §28.9: `key in dict` never stores the key — the
+                // table copies kdata/klen's bytes, never retaining `key`
+                // itself (unlike a VALUE slot, per #429). Release a fresh +1
+                // KEY producer now, after the sole use of its buffer.
+                if (isPlusOneStringProducer(bin.left.get()))
+                    emitStringRelease(key);
+                return r;
             }
         }
         // §17.5: `x in coll` where `coll` is an Array<T>-, Stack<T>-, or

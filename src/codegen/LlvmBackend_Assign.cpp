@@ -619,6 +619,18 @@ llvm::Value* Emitter::lowerCollectionIndexerGet(const ast::IndexExpr& ix) {
         auto* fn = declareC("bz_dict_try_get_str", i1(),
                             {ptrTy(), ptrTy(), i64(), ptrTy()});
         found = builder_.CreateCall(fn, {recv, kd, kl, tmpSlot});
+        // fix #3703 / §28.9: a Dictionary<K,V> string KEY is copied into the
+        // table BY VALUE (bz_dict_try_get_str reads kd/kl and never retains
+        // the bz_string* itself — unlike the VALUE slot, which stores the
+        // pointer and is released by the #429 mechanism). A fresh +1 KEY
+        // producer ($"...", string concat, a case/if arm-meet) used only to
+        // derive this call's kd/kl is never referenced again, so nothing else
+        // will ever discharge its +1. Release it now: after the byte read (kd
+        // is an alias into k's own buffer, so releasing any earlier would be a
+        // use-after-free), before the guard-throw below so BOTH outcomes
+        // (found / KeyNotFoundException) are covered.
+        if (isPlusOneStringProducer(ix.indices[0].value.get()))
+            emitStringRelease(k);
     }
     // §4.8: absent key → KeyNotFoundException.
     emitGuardThrow(builder_.CreateNot(found), "KeyNotFoundException");
@@ -848,7 +860,30 @@ llvm::Value* Emitter::lowerMoveFromCollectionSlot(const ast::IndexExpr& ix) {
         found = builder_.CreateCall(fn, {recv, kd, kl, tmpSlot});
     }
     // §4.8/§4.9: a `move` of an absent key raises, same as the indexer get.
-    emitGuardThrow(builder_.CreateNot(found), "KeyNotFoundException");
+    // fix #3703 / §28.9: unlike lowerCollectionIndexerGet (a SINGLE read of
+    // kd/kl, so a release placed before this guard covers both outcomes),
+    // this function reads kd/kl a SECOND time below (the null-store), only on
+    // the found path — so a release placed before the guard would be a
+    // use-after-free of that second read. On the NOT-found (throw) edge, k's
+    // one-and-only read here is already complete, so it is safe — and
+    // necessary — to release a fresh +1 KEY producer on THAT edge instead
+    // (else it leaks: the found-path release below never runs when we throw).
+    // Manual branch instead of emitGuardThrow (mirrors the `.Add` owning-value
+    // dispose-then-throw arm elsewhere in this file) ONLY when a release is
+    // actually needed; every other case (non-string key, or a borrowed key)
+    // keeps the plain emitGuardThrow, unchanged.
+    if (!keyTy && isPlusOneStringProducer(ix.indices[0].value.get())) {
+        llvm::Value* notFound = builder_.CreateNot(found);
+        auto* errBB = llvm::BasicBlock::Create(llvm_, "mv.notfound", currentFn_);
+        auto* foundBB = llvm::BasicBlock::Create(llvm_, "mv.found", currentFn_);
+        builder_.CreateCondBr(notFound, errBB, foundBB);
+        builder_.SetInsertPoint(errBB);
+        emitStringRelease(k);   // the ONLY execution of this call's key release
+        emitThrowBuiltin("KeyNotFoundException");
+        builder_.SetInsertPoint(foundBB);
+    } else {
+        emitGuardThrow(builder_.CreateNot(found), "KeyNotFoundException");
+    }
     // The stored void* is the owned value pointer (a class object).
     llvm::Value* moved = builder_.CreateLoad(ptrTy(), tmpSlot, "mv.val");
     // Leave the slot moved-from: store null under the existing key via the
@@ -863,6 +898,12 @@ llvm::Value* Emitter::lowerMoveFromCollectionSlot(const ast::IndexExpr& ix) {
         auto* fn = declareC("bz_dict_set_str", llvm::Type::getVoidTy(llvm_),
                             {ptrTy(), ptrTy(), i64(), ptrTy()});
         builder_.CreateCall(fn, {recv, kd, kl, nullV});
+        // fix #3703 / §28.9: kd/kl alias k's own buffer and are read TWICE in
+        // this function (the try_get probe above and this null-store); only
+        // now, after the last read, is it safe to discharge a fresh +1 KEY
+        // producer without a use-after-free. See lowerCollectionIndexerGet.
+        if (isPlusOneStringProducer(ix.indices[0].value.get()))
+            emitStringRelease(k);
     }
     return moved;   // owned class object pointer, taken out of the slot
 }
@@ -1421,6 +1462,14 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
         if (!dictIsOwning2 && isFreshOwnedClassProducer(valueExpr))
             emitDisposeAndReclaim(val);
     }
+    // fix #3703 / §28.9: a Dictionary<K,V> string KEY is copied into the
+    // table BY VALUE (bz_dict_set_str/_disposing read kd/kl and strndup the
+    // bytes — they never retain the bz_string* itself, unlike the VALUE
+    // slot). kd/kl are computed once, immediately above, with a single use
+    // in either sub-branch, so releasing a fresh +1 KEY producer here (after
+    // both branches have already consumed kd/kl) is safe and covers both.
+    if (isPlusOneStringProducer(ix.indices[0].value.get()))
+        emitStringRelease(k);
     return true;
 }
 

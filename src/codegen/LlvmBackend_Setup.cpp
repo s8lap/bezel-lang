@@ -32291,6 +32291,14 @@ llvm::Value* Emitter::materializeHeapDictLiteral(
             auto* fn = declareC("bz_dict_set_str", llvm::Type::getVoidTy(llvm_),
                                 {ptrTy(), ptrTy(), i64(), ptrTy()});
             builder_.CreateCall(fn, {dict, kd, kl, vPtr});
+            // fix #3703 / §28.9: same escaping-value story as .Add(k,v) and
+            // the indexer-set — bz_dict_set_str copies kd/kl's BYTES
+            // (strndup), never retaining `k` (the bz_string*) itself. A
+            // dict-literal key like `[$"k{i}": v]` that is a fresh +1
+            // producer is never referenced again, so release it here, right
+            // after the sole use of its buffer.
+            if (isPlusOneStringProducer(cl->keys[i].get()))
+                emitStringRelease(k);
         }
     }
     return dict;

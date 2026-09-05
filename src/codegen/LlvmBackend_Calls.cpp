@@ -7163,7 +7163,17 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             }
             auto [kd, kl] = strDataLen(k);
             auto* fn = declareC("bz_dict_contains_str", i1(), {ptrTy(), ptrTy(), i64()});
-            return builder_.CreateCall(fn, {recv, kd, kl}, "dict.contains");
+            llvm::Value* r = builder_.CreateCall(fn, {recv, kd, kl}, "dict.contains");
+            // fix #3703 / §28.9: a Dictionary<K,V> string KEY is copied into
+            // the table BY VALUE (bz_dict_contains_str reads kd/kl, never the
+            // bz_string* itself — unlike the VALUE slot, which is retained
+            // per #429). ContainsKey never stores the key, so a fresh +1 KEY
+            // producer ($"...", concat, …) used only to derive kd/kl here is
+            // never referenced again and must be released now, after the
+            // sole (already-completed) use of its buffer.
+            if (isPlusOneStringProducer(call.args[0].value.get()))
+                emitStringRelease(k);
+            return r;
         }
         // fix #3372 / stdlib §4.8 + §4.9 (v0.282, §1 Try shape (d)):
         //   Dictionary<K, V>.TryAdd(key: K, value: V): bool
@@ -7244,6 +7254,17 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // disposal exactly-once.
             if (dictValIsOwning)
                 nullTransferredOwnedLocalSlot(call.args[1].value.get());
+            // fix #3703 / §28.9: the string-key branch above derives kd0/kl0
+            // from `k` for the dup-probe (unconditional, both edges) and,
+            // ONLY on the insert edge, re-derives kd/kl from `k` a second
+            // time — both are aliases into k's own buffer, so k must stay
+            // alive until BOTH edges have joined here. Release a fresh +1
+            // KEY producer now (never for the generic-key path — `k` there
+            // is not a string and isPlusOneStringProducer is false for a
+            // non-string key expression anyway, but `!keyTy` keeps the
+            // release scoped to the branch it belongs to).
+            if (!keyTy && isPlusOneStringProducer(call.args[0].value.get()))
+                emitStringRelease(k);
             return phi;
         }
         // .Add(k, v) / .Set(k, v)
@@ -7269,8 +7290,9 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // branch is dead for borrowing dicts. The probe fires before the
             // string-value retain so no retain leak occurs on the throw path.
             if (m == "Add" && !dictValIsOwning) {
-                // §4.8 / #1201: borrowing Dictionary — plain emitGuardThrow
-                // suffices (no owned value to discharge on the throw path).
+                // §4.8 / #1201: borrowing Dictionary, generic key — plain
+                // emitGuardThrow suffices (no owned value AND no string key
+                // to discharge on the throw path).
                 if (keyTy) {
                     auto* cf = declareC("bz_dict_contains_gen",
                                         i1(), {ptrTy(), ptrTy()});
@@ -7281,9 +7303,28 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                     auto [kd0, kl0] = strDataLen(k);
                     auto* cf = declareC("bz_dict_contains_str",
                                         i1(), {ptrTy(), ptrTy(), i64()});
-                    emitGuardThrow(
-                        builder_.CreateCall(cf, {recv, kd0, kl0}, "add.dup"),
-                        "ArgumentException");
+                    llvm::Value* isDup =
+                        builder_.CreateCall(cf, {recv, kd0, kl0}, "add.dup");
+                    // fix #3703 / §28.9: the real insert below re-derives
+                    // kd/kl from `k` a SECOND time and releases a fresh +1 KEY
+                    // producer only after that insert — which never runs on
+                    // this duplicate edge. Release it here, before throwing,
+                    // instead (manual branch mirrors the OwningDictionary
+                    // arm's dispose-then-throw just below); every other case
+                    // (a borrowed key) keeps the plain emitGuardThrow.
+                    if (isPlusOneStringProducer(call.args[0].value.get())) {
+                        auto* dupBB = llvm::BasicBlock::Create(
+                            llvm_, "add.dup.keyrel", currentFn_);
+                        auto* contBB = llvm::BasicBlock::Create(
+                            llvm_, "add.cont", currentFn_);
+                        builder_.CreateCondBr(isDup, dupBB, contBB);
+                        builder_.SetInsertPoint(dupBB);
+                        emitStringRelease(k);
+                        emitThrowBuiltin("ArgumentException");
+                        builder_.SetInsertPoint(contBB);
+                    } else {
+                        emitGuardThrow(isDup, "ArgumentException");
+                    }
                 }
             }
             // fix #1214 / §4.8 / §28.3: OwningDictionary.Add on a duplicate key
@@ -7315,6 +7356,12 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 // be consumed here to prevent a leak (the value is not inserted).
                 if (dictValClassDisposer)
                     builder_.CreateCall(dictValClassDisposer, {v});
+                // fix #3703 / §28.9: same reasoning as the borrowing arm above
+                // — the real insert's re-derived kd/kl (and this fix's release
+                // after it) never run on this duplicate edge; release a fresh
+                // +1 KEY producer here, before throwing, instead.
+                if (!keyTy && isPlusOneStringProducer(call.args[0].value.get()))
+                    emitStringRelease(k);
                 emitThrowBuiltin("ArgumentException");
                 builder_.SetInsertPoint(contBB);
             }
@@ -7358,6 +7405,15 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // stays exactly-once (throw-before disposes, throw-after skips).
             if (dictValIsOwning)
                 nullTransferredOwnedLocalSlot(call.args[1].value.get());
+            // fix #3703 / §28.9: release a fresh +1 KEY producer — this
+            // insert is the final use of `k` on the non-duplicate path (the
+            // table copies kd/kl's bytes, never retaining `k` itself, unlike
+            // the VALUE slot). The duplicate-key throw path above releases
+            // its own copy of `k` before diverging (see the manual
+            // dup-then-release-then-throw branches, both arms), so this is
+            // exactly-once regardless of which edge fires.
+            if (isPlusOneStringProducer(call.args[0].value.get()))
+                emitStringRelease(k);
             return llvm::ConstantInt::get(i32(), 0);
         }
         // .Remove(k): bool — per §4.9: OwningDictionary.Remove disposes the
@@ -7406,16 +7462,24 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 return builder_.CreateCall(fn, {recv, genKeyPtr(k)}, "dict.remove");
             }
             auto [kd, kl] = strDataLen(k);
+            llvm::Value* removeResult;
             if (valDisp) {
                 // OwningDictionary (or Dict<string,string>) with string key.
                 auto* fn = declareC("bz_dict_remove_str_disposing", i1(),
                                     {ptrTy(), ptrTy(), i64(), ptrTy()});
-                return builder_.CreateCall(
+                removeResult = builder_.CreateCall(
                     fn, {recv, kd, kl, llvm::cast<llvm::Value>(valDisp)},
                     "dict.remove");
+            } else {
+                auto* fn = declareC("bz_dict_remove_str", i1(), {ptrTy(), ptrTy(), i64()});
+                removeResult = builder_.CreateCall(fn, {recv, kd, kl}, "dict.remove");
             }
-            auto* fn = declareC("bz_dict_remove_str", i1(), {ptrTy(), ptrTy(), i64()});
-            return builder_.CreateCall(fn, {recv, kd, kl}, "dict.remove");
+            // fix #3703 / §28.9: Remove never throws (absent key just returns
+            // false), so `k`'s single use above (kd/kl) is unconditionally
+            // complete by this point — release a fresh +1 KEY producer now.
+            if (isPlusOneStringProducer(call.args[0].value.get()))
+                emitStringRelease(k);
+            return removeResult;
         }
         // fix #643 / stdlib §4.9: .PopValue(k): owned V — retrieve the owned
         // value for key k, remove the entry WITHOUT disposing the value
@@ -7443,6 +7507,12 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                                     {ptrTy(), ptrTy(), i64(), ptrTy()});
                 found = builder_.CreateCall(fn, {recv, kd2, kl2, tmpSlot},
                                             "pv.found");
+                // fix #3703 / §28.9: this call is the sole use of `k`'s
+                // buffer (kd2/kl2 alias it); release a fresh +1 KEY producer
+                // now, before the found/not-found guard below — both
+                // outcomes are covered since the read already happened.
+                if (isPlusOneStringProducer(call.args[0].value.get()))
+                    emitStringRelease(k);
             }
             // Raise InvalidOperationException when key is not found.
             llvm::Value* notFound = builder_.CreateNot(found, "pv.notfound");
@@ -7507,6 +7577,10 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                                     {ptrTy(), ptrTy(), i64(), ptrTy()});
                 found = builder_.CreateCall(fn, {recv, kd2, kl2, tmpSlot},
                                             "tpv.found");
+                // fix #3703 / §28.9: sole use of `k`'s buffer; TryPopValue
+                // never throws, so release a fresh +1 KEY producer now.
+                if (isPlusOneStringProducer(call.args[0].value.get()))
+                    emitStringRelease(k);
             }
             llvm::Value* valPtr = builder_.CreateLoad(ptrTy(), tmpSlot, "tpv.vptr");
             // Decode the stored void* into *outAddr — mirror TryGetValue: a
@@ -7600,6 +7674,10 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 auto* fn = declareC("bz_dict_try_get_str", i1(),
                                     {ptrTy(), ptrTy(), i64(), ptrTy()});
                 found = builder_.CreateCall(fn, {recv, kd, kl, tmpSlot});
+                // fix #3703 / §28.9: sole use of `k`'s buffer; TryGetValue
+                // never throws, so release a fresh +1 KEY producer now.
+                if (isPlusOneStringProducer(call.args[0].value.get()))
+                    emitStringRelease(k);
             }
             llvm::Value* valPtr = builder_.CreateLoad(ptrTy(), tmpSlot);
             // v0.171 (#1336): the out param is `V?`. Assign null on the miss
@@ -7689,6 +7767,10 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 auto* fn = declareC("bz_dict_try_get_str", i1(),
                                     {ptrTy(), ptrTy(), i64(), ptrTy()});
                 found = builder_.CreateCall(fn, {recv, kd, kl, tmpSlot});
+                // fix #3703 / §28.9: sole use of `k`'s buffer; GetOrNull
+                // never throws, so release a fresh +1 KEY producer now.
+                if (isPlusOneStringProducer(call.args[0].value.get()))
+                    emitStringRelease(k);
             }
             auto* hitBB = llvm::BasicBlock::Create(llvm_, "gon.hit", currentFn_);
             auto* endBB = llvm::BasicBlock::Create(llvm_, "gon.end", currentFn_);
@@ -7922,6 +8004,14 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // the HIT path the closure was never called, but it was still
             // allocated and must be reclaimed. Null-safe.
             if (factoryIsInlineLambda) emitClosureRelease(closure);
+            // fix #3703 / §28.9: strKd/strKl (computed once above) alias `k`'s
+            // own buffer and are read on the hit path AND, again, the miss
+            // path (probe + insert + re-read) — only now, after the join, is
+            // `k` guaranteed done. Release a fresh +1 KEY producer; `!keyTy`
+            // scopes this to the string-key branch (strKd/strKl are only
+            // populated there).
+            if (!keyTy && isPlusOneStringProducer(call.args[0].value.get()))
+                emitStringRelease(k);
             return phi;
         }
 
