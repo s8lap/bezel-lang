@@ -5990,14 +5990,18 @@ private:
         using K = sema::TypeRef::Kind;
         switch (rt->kind) {
             case K::Named: {
-                // The head name: prefer the declaration's name (handles the
-                // builtin-class case via `spec85BuiltinModuleName`); fall
-                // back to the astNode's head when the declaration is null
+                // The head name: prefer the declaration's QUALIFIED name
+                // (handles the builtin-class case via
+                // `spec85BuiltinModuleName`, and — fix #3832 (§8.5 / §11.6,
+                // v0.291; stdlib §2.13 rule 1) — a NESTED type's enclosing
+                // path via `TypeSymbol::qualifiedTypeName()`, which degrades
+                // to the bare name for a top-level declaration); fall back to
+                // the astNode's head when the declaration is null
                 // (transparent alias, aliasResolvedHead, importedName, …).
                 std::string head;
                 std::string_view mod;
                 if (rt->declaration) {
-                    head = std::string(rt->declaration->name);
+                    head = rt->declaration->qualifiedTypeName();
                     // #2934 user-class path: `declaration->moduleName` is
                     // populated for a real (local or imported) TypeSymbol,
                     // and is empty for a synthetic builtin (sema-built).
@@ -6158,6 +6162,17 @@ private:
     // `TypeSymbol*` and a generic INSTANTIATION's type arguments live on the
     // `TypeRef*`, not the symbol; the (b) sites that have the TypeRef in hand
     // consult `spec85TypeRefQualifiedName` above.
+    // fix #3832 (§8.5 / §11.6, v0.291; stdlib §2.13 rule 1): both returns below
+    // used to join `moduleName + "." + ts->name` — the BARE simple name —
+    // which silently dropped a nested type's enclosing-type path: a nested
+    // `M.Outer.Inner` rendered as "M.Inner". `TypeSymbol::qualifiedTypeName()`
+    // (Symbol.hpp) already builds the "Outer.Inner" half from
+    // `enclosingTypePath` (populated at symbol-creation time on both the
+    // local and imported sides, #3529); this just consults it instead of the
+    // bare `name`. A no-op change for a top-level type, since
+    // `enclosingTypePath` is empty there and `qualifiedTypeName()` degrades to
+    // the bare name — a synthetic builtin is never nested, so this cannot
+    // change any builtin's rendering either.
     static std::string spec85QualifiedTypeName(const sema::TypeSymbol* ts) {
         if (!ts) return "";
         if (ts->moduleName.empty()) {
@@ -6167,10 +6182,10 @@ private:
             // a populated moduleName are not in this branch) keeps the
             // pre-#3119 bare-name fallback.
             std::string_view mod = spec85BuiltinModuleName(ts);
-            if (mod.empty()) return std::string(ts->name);
-            return std::string(mod) + "." + std::string(ts->name);
+            if (mod.empty()) return ts->qualifiedTypeName();
+            return std::string(mod) + "." + ts->qualifiedTypeName();
         }
-        return ts->moduleName + "." + std::string(ts->name);
+        return ts->moduleName + "." + ts->qualifiedTypeName();
     }
 
     // §9.1 / §9.3 (#501, #1488): is `rec` a POSITIONAL (or combined-form)
