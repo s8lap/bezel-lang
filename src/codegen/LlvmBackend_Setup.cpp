@@ -23223,6 +23223,54 @@ struct StringEscapeWalker {
                         idxPs = ps;
                 }
             }
+            // fix #3872 (§4.8 / §4.9 / §28.9, v0.294): a built-in
+            // Dictionary<string,V>/OwningDictionary<string,V> indexer's KEY
+            // position (`d[key]` get, `d[key] := v` set, and the compound/
+            // incr-decr forms that route through this same arm) is ALWAYS a
+            // safe read for a bare string local — UNLIKE a user-defined
+            // indexer, a built-in collection indexer has NO PropertySymbol
+            // (ExprTypecheck_Exprs.cpp's #2530 attachment is "ONLY for the
+            // user-defined indexer branch"; `ctx.exprSymbol(*ix)` is null
+            // here), so `idxPs` above is always null for it and every index
+            // fell through to the conservative `safeIdx=false`,
+            // unconditionally tainting the key local as escaped and
+            // suppressing its scope-end release (measured: 8248 B / 398
+            // allocations leaked per 200 iterations of `var key := $"...";
+            // d[key] := 1;` — #3872).
+            //
+            // SOUNDNESS. The runtime never retains or stores the caller's
+            // `bz_string*` for a dict KEY: `bz_dict_set_str` /
+            // `bz_dict_set_str_disposing` (bezel_runtime_collections.cpp)
+            // read only `kd`/`kl` (data pointer + length) and, on a fresh
+            // insertion, `strndup` a byte COPY into the table; a lookup
+            // (`bz_dict_try_get_str`, `.ContainsKey`/`.Remove`) is a pure
+            // read. This is the identical fact fix #3703 already relies on
+            // for the VALUE-position release half — see its own
+            // "byte-copying string-mode key" citation. So a scope-end
+            // release of the local's own +1 can never dangle the dict's
+            // internal copy (no UAF) and never double-frees the same
+            // reference (the dict holds none of it). Restricted to a
+            // NON-NULLABLE `string` key type (a `string?` key's null/
+            // sentinel handling is out of scope for this increment, mirrors
+            // every other relaxation in this walker); OwningDictionary is
+            // included because its KEY handling is byte-identical to
+            // Dictionary's (only the VALUE side differs, per
+            // LlvmBackend_Assign.cpp's dict indexer-set).
+            bool dictStrKeySafe = false;
+            if (stringReleaseMode) {
+                if (const sema::TypeRef* rt = ctx.exprType(*ix->target)) {
+                    std::string_view h = rt->headName();
+                    if ((h == "Dictionary" || h == "OwningDictionary") &&
+                        !rt->genericArgs.empty() && rt->genericArgs[0] &&
+                        !rt->genericArgs[0]->nullable &&
+                        rt->genericArgs[0]->kind ==
+                            sema::TypeRef::Kind::Primitive &&
+                        rt->genericArgs[0]->primitive ==
+                            sema::PrimitiveType::String) {
+                        dictStrKeySafe = true;
+                    }
+                }
+            }
             for (std::size_t k = 0; k < ix->indices.size(); ++k) {
                 bool safeIdx = false;
                 // Both the ARGUMENT side and the PARAMETER side must be plain,
@@ -23241,6 +23289,36 @@ struct StringEscapeWalker {
                         idxPs->indexerParams[k]);
                     if (pp && pp->modifier.empty()) safeIdx = true;
                 }
+                // #3872: Dictionary/OwningDictionary has exactly one index
+                // parameter (the key), so k==0 is always the key position —
+                // gated on the SAME plain-argument-shape AND
+                // isTargetIdent(...) check as the user-indexer relaxation
+                // immediately above (this arm is its twin, not a looser
+                // cousin of it): a non-plain argument (modifier/name/
+                // discard) is spellable per the same `IndexExpr::indices`
+                // AST comment cited above, and — independently — a KEY
+                // expression that is not itself our tracked target
+                // identifier (e.g. a nested `d[cond ? key : other]`
+                // ConditionalExpr) must not be blanket-marked a safe read:
+                // `expr()`'s ConditionalExpr/PostfixBangExpr arms are two of
+                // the few that still consult an incoming `safeRead` rather
+                // than imposing their own, so passing `true` there without
+                // this check would (independent of any occurrence of our
+                // OWN target inside it) widen what THOSE arms treat as safe
+                // for whatever nested identifier they recurse into — never
+                // observed to matter in the shapes collectStringReleaseEligible
+                // currently admits as a KEY candidate (review confirmed only
+                // IdentifierExpr/PostfixBangExpr/ConditionalExpr consult the
+                // incoming safeRead at all, and a Dictionary<string,V> key
+                // candidate here is always the bare tracked IdentifierExpr in
+                // every case this fix's own tests exercise), but the guard is
+                // restored as DEFENSIVE symmetry with the #2717 arm rather
+                // than relying on that being true everywhere it could ever be
+                // reached.
+                if (!safeIdx && dictStrKeySafe && k == 0 &&
+                    ia.modifier.empty() && ia.name.empty() && !ia.isDiscard &&
+                    isTargetIdent(ia.value.get()))
+                    safeIdx = true;
                 expr(ix->indices[k].value.get(), safeIdx);
             }
             return;
