@@ -30098,8 +30098,52 @@ void Emitter::collectCellFreeEligible(
                         }
                     }
                 }
+                // fix #3871 (stdlib §4.8 / §4.9 / language spec §27.5 /
+                // §28.9, v0.294): stdlib §4.8 states outright "GetOrAdd's
+                // factory is call-bounded" (incorporated by reference into
+                // §4.9's OwningDictionary) — LlvmBackend_Calls.cpp's `m ==
+                // "GetOrAdd"` arm invokes the factory synchronously on the
+                // miss path only and unconditionally `emitClosureRelease`s
+                // the closure at the join point on BOTH the hit and miss
+                // paths, so it never outlives this expression, exactly like
+                // the IIFE case above. GetOrAdd is a BUILTIN — there is no
+                // `ast::MethodDecl` body for `isCallBoundedClosureArgPosition`
+                // (the #3498 arm just below) to run `MethodOwnership::
+                // callBoundedScan` against — so that admission never fires
+                // for it, and the generic `expr(arg, false)` recursion
+                // classified the factory ESCAPING: the captured local's
+                // boxed cell was never freed (measured #3871: 4 B leaked per
+                // invocation for a captured `int`, on both the hit and miss
+                // paths' shared factory-construction site). `isDictTypeName`
+                // is the SAME #1414 stage-3 registry LlvmBackend_Calls.cpp's
+                // own `isDict` gate uses for this exact arm — no new
+                // predicate. Narrowed to the SECOND (factory) argument of a
+                // 2-arg `.GetOrAdd(key, factory)` call whose member name is
+                // exactly "GetOrAdd" on a Dictionary/OwningDictionary/
+                // SortedDictionary receiver; a user type happening to define
+                // its own `GetOrAdd` method is excluded by `isDictTypeName`
+                // requiring a null `declaration` (a builtin-only shape).
+                bool getOrAddFactoryHandled = false;
+                if (c->args.size() == 2 && c->args[1].value) {
+                    if (auto* factoryLam =
+                            dynamic_cast<const ast::LambdaExpr*>(
+                                c->args[1].value.get())) {
+                        if (auto* ma =
+                                dynamic_cast<const ast::MemberAccessExpr*>(
+                                    c->callee.get())) {
+                            if (ma->member == "GetOrAdd" && ma->target &&
+                                em.isDictTypeName(
+                                    ctx.exprType(*ma->target))) {
+                                collectLambdaCaptures(factoryLam, em,
+                                                      /*isNonEscaping=*/true);
+                                getOrAddFactoryHandled = true;
+                            }
+                        }
+                    }
+                }
                 for (std::size_t ai = 0; ai < c->args.size(); ++ai) {
                     if (scopedCallArgHandled && ai == 0) continue;
+                    if (getOrAddFactoryHandled && ai == 1) continue;
                     // fix #3498 (§28.14 the CALL-BOUNDED DEFAULT / §27.5 /
                     // §28.9, v0.283): the THIRD non-escaping admission in this
                     // arm, beside #2182's IIFE and #2334's stdlib `scoped`

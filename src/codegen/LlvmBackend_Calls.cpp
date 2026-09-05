@@ -7987,6 +7987,28 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             const bool factoryIsInlineLambda =
                 dynamic_cast<const ast::LambdaExpr*>(call.args[1].value.get())
                     != nullptr;
+            // fix #3871 (stdlib §4.8 / §4.9 / language spec §27.5 / §28.9,
+            // v0.294): stdlib §4.8 states outright "GetOrAdd's factory is
+            // call-bounded" (incorporated by reference into §4.9's
+            // OwningDictionary). `lowerExpr` just above, for an inline
+            // factory LITERAL, ran `lowerLambda`, which populated
+            // `lastLambdaCapturedCells_` for any capture the
+            // collectCellFreeEligible pre-scan's GetOrAdd special case (added
+            // alongside this fix) marked `cellFreeEligible_` on exactly that
+            // basis: this arm invokes the factory synchronously on the miss
+            // path only and unconditionally `emitClosureRelease`s the closure
+            // at `goa.end` on BOTH paths, so it never outlives this
+            // expression, exactly like the IIFE arm (LlvmBackend_Calls2.cpp).
+            // Consuming here registers the captured local's scope-end
+            // `boxedCellFree`; without it the box leaked (measured #3871: 4 B
+            // for one captured `int`, independent of hit/miss). Gated on the
+            // AST shape exactly like the TaskScope.Spawn call site's #2334
+            // guard just below in this file: a method-reference/variable
+            // factory never runs `lowerLambda`, so consuming then would drain
+            // whatever unrelated lambda's cells happen to be stale in the
+            // vector. A harmless no-op when the pre-scan did not flag
+            // anything (a non-capturing factory).
+            if (factoryIsInlineLambda) consumeLastLambdaCapturedCells();
 
             // First TryGet: is the key already present?
             auto* tmpSlot = entryAlloca(ptrTy());
