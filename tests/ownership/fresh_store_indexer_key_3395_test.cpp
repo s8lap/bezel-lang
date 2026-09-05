@@ -32,14 +32,19 @@
 // SCOPE, recorded. The index is examined only for a DICTIONARY head, because
 // only there is it a store position: `d[k] := v` upserts, so an absent key is
 // RETAINED (stdlib §4.8 / §4.17). An `Array`/`Stack`/`Queue`/`LinkedList` index
-// selects a position and is retained in no slot. `OwningDictionary` stays
-// outside this sink entirely (its indexer-set takes the value `owned`), exactly
-// as the storing-call sink excludes it — §15.4 scopes the must-warn to "a
-// store-position argument on a **borrowing-family** collection", and the two
-// sinks stay symmetric. Whether an `OwningDictionary`'s (borrowing) KEY should
-// draw the warning at BOTH sinks is filed as #3429 rather than decided here;
-// `SortedSet`'s absence from both sinks' head lists is #3428 (unobservable
-// today — a class-element `SortedSet` cannot be constructed at all).
+// selects a position and is retained in no slot. `OwningDictionary`'s VALUE
+// position stays outside this sink entirely (its indexer-set/`Add` take the
+// value `owned`, a §28.8 transfer, not a borrow store), exactly as the
+// storing-call sink excludes it. `SortedSet`'s absence from both sinks' head
+// lists is #3428 (unobservable today — a class-element `SortedSet` cannot be
+// constructed at all).
+//
+// UPDATE (fix #3839, ruling #3429, v0.288): `OwningDictionary`'s KEY position
+// *is* now widened at both sinks — it owns its values and not its keys
+// (stdlib §4.9), so a fresh class-typed key is a borrowing position exactly
+// like `Dictionary`'s, per §28.11's amended text ("the same check reaches the
+// key slot of `OwningDictionary<K, V>`, a borrowing position"). See the
+// `owning_dictionary_fresh_class_key_warns_*` tests below.
 //
 // // per §15.4 (fresh-store warning, v0.243; store-position list quoted above),
 //    §28.11 *Borrowing collections*, §28.3 *Unbound owned temporaries*
@@ -295,11 +300,13 @@ BEZEL_TEST(fresh_store_indexer_key_3395, array_index_is_not_a_store_position) {
     BEZEL_EXPECT_TRUE(freshStoreTextWith(r, "key store").empty());
 }
 
-// `OwningDictionary`'s indexer-set takes the value `owned` (a §28.8 transfer,
-// not a borrow store), so the whole sink declines it — as the storing-call sink
-// declines it too. §15.4's must-warn is scoped to "a borrowing-family
-// collection"; warning here would contradict the remedy the warning itself
-// names.
+// `OwningDictionary`'s indexer-set takes the VALUE `owned` (a §28.8 transfer,
+// not a borrow store), so this fresh-VALUE store still declines — as the
+// storing-call sink's value leg declines it too — even after fix #3839 widens
+// the KEY leg below. The key here is a plain `string` (not class-typed), so
+// it draws nothing either: this test pins the value-only case; the
+// `owning_dictionary_fresh_class_key_warns_*` tests below pin the (now warned)
+// class-typed-key case.
 BEZEL_TEST(fresh_store_indexer_key_3395, owning_dictionary_indexer_set_does_not_warn) {
     OwnershipResult r = check(
         "class C public static method M(): int "
@@ -310,6 +317,110 @@ BEZEL_TEST(fresh_store_indexer_key_3395, owning_dictionary_indexer_set_does_not_
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_EQ(freshStoreWarnings(r), 0);
     BEZEL_EXPECT_EQ(anyFreshTempWarnings(r), 0);
+}
+
+// ── fix #3839 (ruling #3429, v0.288): OwningDictionary's KEY is borrowing ───
+
+// §28.11 (v0.288): "the same check reaches the key slot of
+// `OwningDictionary<K, V>`, a borrowing position" — a fresh class-typed key
+// dangles at its K8 boundary exactly as a `Dictionary` key does. Pre-fix: 0
+// (neither sink reached it at all, since `OwningDictionary` is absent from
+// the ordinary `borrowingFamily` whitelist both sinks share).
+BEZEL_TEST(fresh_store_indexer_key_3395, owning_dictionary_fresh_class_key_warns_indexer) {
+    OwnershipResult r = check(
+        "class C public static method M(): int "
+        "  using var od := new OwningDictionary<Key, Item>(); "
+        "  od[new Key(1)] := new Item(2); "
+        "  return od.Count; "
+        "end M; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    // Exactly one — the key's. The value is an owned transfer (stdlib §4.9's
+    // `set(owned)`) and must stay silent even though it is equally fresh.
+    BEZEL_EXPECT_EQ(freshStoreWarnings(r), 1);
+    BEZEL_EXPECT_EQ(anyFreshTempWarnings(r), 1);
+    const std::string w = freshStoreTextWith(r, "key store");
+    BEZEL_EXPECT_FALSE(w.empty());
+    BEZEL_EXPECT_TRUE(contains(w, "K8 full-expression boundary"));
+    BEZEL_EXPECT_TRUE(contains(w, "named holder"));
+    BEZEL_EXPECT_TRUE(contains(w, "§28.11"));
+    // The third message variant's whole point: there is no better remedy to
+    // name — the caller already used the owning family, and switching
+    // families would not fix the key (it is inherently a borrowing position).
+    BEZEL_EXPECT_FALSE(contains(w, "use the owning family"));
+}
+
+// The storing-CALL sink's `Add` must agree with the indexer-set sink above —
+// the same symmetry #3395 established for `Dictionary`. Pre-fix: 0 (excluded
+// by the `borrowingFamily` whitelist entirely).
+BEZEL_TEST(fresh_store_indexer_key_3395, owning_dictionary_fresh_class_key_warns_add) {
+    OwnershipResult r = check(
+        "class C public static method M(): int "
+        "  using var od := new OwningDictionary<Key, Item>(); "
+        "  od.Add(new Key(1), new Item(2)); "
+        "  return od.Count; "
+        "end M; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_EQ(freshStoreWarnings(r), 1);
+    BEZEL_EXPECT_EQ(anyFreshTempWarnings(r), 1);
+    // Unlike the indexer-set sink, the storing-CALL sink's `storeSpelling` is
+    // `` `.Add(...)` store `` at every position — it does not say "key store"
+    // — so the collection head name (named in the sentence body regardless of
+    // remedy) is the stable needle here.
+    const std::string w = freshStoreTextWith(r, "OwningDictionary");
+    BEZEL_EXPECT_FALSE(w.empty());
+    BEZEL_EXPECT_FALSE(contains(w, "use the owning family"));
+}
+
+// `TryAdd` (stdlib §4.9, v0.282) is the other storing member named in #3839's
+// "Required" list; the sink's `storing` set already recognizes it (`m ==
+// "TryAdd"`, shared with `Dictionary`/`Set`), so only the head classification
+// needed widening.
+BEZEL_TEST(fresh_store_indexer_key_3395, owning_dictionary_fresh_class_key_warns_tryadd) {
+    OwnershipResult r = check(
+        "class C public static method M(): bool "
+        "  using var od := new OwningDictionary<Key, Item>(); "
+        "  return od.TryAdd(new Key(1), new Item(2)); "
+        "end M; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_EQ(freshStoreWarnings(r), 1);
+    BEZEL_EXPECT_EQ(anyFreshTempWarnings(r), 1);
+}
+
+// Named-holder key, fresh value, via BOTH sinks: the key does not warn (it is
+// not a fresh temporary) and the value does not warn either (it is an owned
+// transfer) — confirms the value stays silent even when the key draws no
+// warning of its own to hide behind.
+BEZEL_TEST(fresh_store_indexer_key_3395, owning_dictionary_named_key_fresh_value_no_warn) {
+    OwnershipResult r = check(
+        "class C public static method M(): int "
+        "  using var od := new OwningDictionary<Key, Item>(); "
+        "  using var k := new Key(1); "
+        "  od.Add(k, new Item(2)); "
+        "  using var k2 := new Key(3); "
+        "  od[k2] := new Item(4); "
+        "  return od.Count; "
+        "end M; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_EQ(freshStoreWarnings(r), 0);
+    BEZEL_EXPECT_EQ(anyFreshTempWarnings(r), 0);
+}
+
+// Admission is unchanged (§15.4: "the program remains accepted") — end to end
+// through the real driver, with a class-typed key so both fix #3839 branches
+// fire on the compile path that actually runs the program.
+BEZEL_TEST(fresh_store_indexer_key_3395, owning_dictionary_warned_program_still_compiles_and_runs) {
+    auto r = runAot(
+        std::string(kPreamble) +
+        "class C public static method Main(): int "
+        "  using var od := new OwningDictionary<Key, Item>(); "
+        "  od[new Key(1)] := new Item(10); "
+        "  od.Add(new Key(2), new Item(20)); "
+        "  Console.WriteLine(\"count=\" + od.Count.ToString()); "
+        "  return 0; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_TRUE(r.stdoutText.find("count=2") != std::string::npos);
 }
 
 // A user type's own indexer carries its own §28.14 obligations, not this

@@ -6619,7 +6619,41 @@ void MethodOwnership::checkCollectionBorrowStoreEscape(
         cn == "Array" || cn == "Dictionary" || cn == "SortedDictionary" ||
         cn == "Set" || cn == "SortedSet" || cn == "Stack" || cn == "Queue" ||
         cn == "LinkedList";
-    if (!borrowingFamily) return;
+    // fix #3839 (§15.4 / §28.11, ruling #3429, v0.288): `OwningDictionary` is
+    // NOT a borrowing-family collection — its VALUE slot takes `owned` (a
+    // §28.8 transfer, `builtinOwnedSinkArg`) — but §15.4/§28.11's v0.288
+    // ruling amends the classification with one more borrowing POSITION on a
+    // non-borrowing-family collection: "the same check reaches the key slot
+    // of `OwningDictionary<K, V>`, a borrowing position" — it owns its
+    // values and not its keys (stdlib §4.9), so a fresh class-typed key
+    // dangles at its K8 boundary exactly as a `Dictionary` key does. Only
+    // `Add`/`TryAdd`'s key (args[0]) draws the warning; the value stays
+    // silent. No "use the owning family" remedy clause is emitted here —
+    // not because of `isDictionaryKeyPosition`, but because
+    // `sec154HeadHasOwningTwin` never whitelisted `OwningDictionary`
+    // (Array/Set/LinkedList/Stack/Queue/Dictionary only), so `owningRemedy`
+    // is empty regardless of the flag. Passing `true` is still correct and
+    // matches the `Dictionary`-key convention, but it is behaviourally inert
+    // at THIS call site; do not rely on it to suppress the remedy elsewhere. Scoped to the §15.4 warning
+    // only: the broader §28.11 scope-bound-local-borrow REJECTION for this
+    // position — a NAMED local key, not a fresh temporary — does not run
+    // here (filed as a follow-up), so this branch returns without entering
+    // the general escape-rejection walk below, which is for the ordinary
+    // borrowing family only.
+    if (!borrowingFamily) {
+        if (storing && cn == "OwningDictionary" && !call.args.empty() &&
+            call.args[0].value) {
+            const ast::IdentifierExpr* odRoot = identifierRoot(*ma->target);
+            const std::string recvNameForWarn =
+                odRoot ? std::string(odRoot->name) : std::string("it");
+            const std::string storeSpelling =
+                std::string("`.") + std::string(m) + "(...)` store";
+            warnSec154FreshStore(*call.args[0].value, storeSpelling,
+                                 recvNameForWarn, cn,
+                                 /*isDictionaryKeyPosition=*/true);
+        }
+        return;
+    }
 
     // §28.11 (#1886): the bulk `AddRange` argument is an IEnumerable<T>, not a
     // single element, so its scope-bound-local nature is only an escape when the
@@ -7071,18 +7105,51 @@ bool MethodOwnership::checkIndexerSetBorrowStoreEscape(
     if (as.op != ":=" || !as.target || !as.value) return false;
     const auto* ix = dynamic_cast<const ast::IndexExpr*>(as.target.get());
     if (!ix || !ix->target) return false;
+
+    // Built-in borrowing collections resolve to a Named TypeRef with a NULL
+    // declaration (a user type's own indexer carries its own §28.14 rules, not
+    // this collection-specific one). Hoisted above the owned-value bail below
+    // so the OwningDictionary key check (fix #3839) can read it first.
+    const sema::TypeRef* tt = ctx_.exprType(*ix->target);
+    const std::string_view cn =
+        (tt && tt->kind == sema::TypeRef::Kind::Named && !tt->declaration)
+            ? tt->headName()
+            : std::string_view();
+
+    // fix #3839 (§15.4 / §28.11, ruling #3429, v0.288): `OwningDictionary`'s
+    // KEY position is a borrowing position even though its VALUE position is
+    // an owned-transfer indexer-set (`indexerSetterTakesOwned` below answers
+    // TRUE for it) — it owns its values and not its keys (stdlib §4.9), so a
+    // fresh class-typed key dangles at its K8 boundary exactly as a
+    // `Dictionary` key does (§28.11: "the same check reaches the key slot of
+    // `OwningDictionary<K, V>`, a borrowing position"). This MUST run BEFORE
+    // the owned-value bail below: `indexerSetterTakesOwned` classifies the
+    // VALUE's transfer, not the KEY's borrow-store status, and previously
+    // gated the key's warning as a side effect of the value's classification
+    // — the #3839 bug. Scoped to the §15.4 warning only: the broader §28.11
+    // scope-bound-local-borrow REJECTION for this position — a NAMED local
+    // key, not a fresh temporary — does not run here (filed as a follow-up);
+    // this sink keeps returning `false` for OwningDictionary below, matching
+    // the storing-CALL sink's own scoping.
+    if (cn == "OwningDictionary" && !ix->indices.empty()) {
+        const ast::IdentifierExpr* odRoot = identifierRoot(*ix->target);
+        const std::string recvNameForWarn =
+            odRoot ? std::string(odRoot->name) : std::string("it");
+        for (const ast::CallArgument& idx : ix->indices) {
+            if (!idx.value) continue;
+            warnSec154FreshStore(*idx.value, "`coll[key] := …` key store",
+                                 recvNameForWarn, cn,
+                                 /*isDictionaryKeyPosition=*/true);
+        }
+    }
+
     // Owning-collection / inline-array slot: indexer-set takes owned (handled by
     // handleAssignment's owning-slot path) — a transfer, not a borrow store.
     if (indexerSetterTakesOwned(*as.target) ||
         targetIsOwningInlineArraySlot(*as.target))
         return false;
-    // Built-in borrowing collections resolve to a Named TypeRef with a NULL
-    // declaration (a user type's own indexer carries its own §28.14 rules, not
-    // this collection-specific one); owning collections are excluded above.
-    const sema::TypeRef* tt = ctx_.exprType(*ix->target);
     if (!tt || tt->kind != sema::TypeRef::Kind::Named || tt->declaration)
         return false;
-    const std::string_view cn = tt->headName();
     // fix #2773 (B1) / stdlib §4.18 (v0.286): kept symmetric with
     // `checkCollectionBorrowStoreEscape`'s whitelist above (per issue #3428's
     // "add `SortedSet` to those two whitelists in the same PR"). Inert for
@@ -7121,10 +7188,12 @@ bool MethodOwnership::checkIndexerSetBorrowStoreEscape(
     // calls "statically certain to outlive the value". The index of an
     // `Array`/`Stack`/`Queue`/`LinkedList`/`Set` head selects a position and is
     // not retained in any slot, so it is not a store position and draws nothing.
-    // `OwningDictionary` is outside this sink altogether (the owned-setter bail
-    // above) and stays so: §15.4 scopes the must-warn to "a store-position
-    // argument on a **borrowing-family** collection", and the storing-call sink
-    // excludes it identically — the two sinks stay symmetric. // per §15.4, §28.11
+    // `OwningDictionary` never reaches this block — the fix #3839 branch above
+    // (before the owned-setter bail) already answered its key, and its VALUE
+    // stays excluded: §15.4 scopes the must-warn to "a store-position argument
+    // on a **borrowing-family** collection" for the value position, and the
+    // storing-call sink excludes it identically — the two sinks stay
+    // symmetric there. // per §15.4, §28.11
     {
         const ast::IdentifierExpr* warnRoot = identifierRoot(*ix->target);
         const std::string recvNameForWarn =
