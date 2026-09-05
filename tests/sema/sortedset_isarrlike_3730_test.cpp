@@ -329,13 +329,9 @@ BEZEL_TEST(sortedset_isarrlike_3730, reverse_now_types_descending_3763) {
     //
     // ORDER-SENSITIVE on purpose: §4.18 iterates ascending (10, 20, 30, 40),
     // so §5's `Reverse()` is the descending sequence. A count-only assertion
-    // would pass on any materialization.
-    auto r = runAot(prog(
-        "    using var rv := s.Reverse().ToArray();\n"
-        "    Console.WriteLine($\"{rv[0]},{rv[1]},{rv[2]},{rv[3]}\");"));
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_FALSE(hasErrorContaining(r, "issue 3763"));
-    BEZEL_EXPECT_FALSE(hasErrorContaining(r, "issue 3735"));
+    // would pass on any materialization. The EXPECT_EQ already covers the
+    // "did the program run" check (runAotOut returns "<did-not-run>" on a
+    // compile/runtime failure, which does not equal "40,30,20,10").
     BEZEL_EXPECT_EQ(
         runAotOut(prog(
             "    using var rv := s.Reverse().ToArray();\n"

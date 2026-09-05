@@ -159,18 +159,14 @@ BEZEL_TEST(reverse_set_3763, sortedset_reverse_yields_descending) {
         "30,20,10,");
 }
 
-// The reject's own text must be GONE, not merely unreached — a diagnostic
-// reported once is not undone by a later correct type.
-BEZEL_TEST(reverse_set_3763, sortedset_reverse_reject_text_is_gone) {
-    auto r = runAot(prog(
-        "    using var s := new SortedSet<int>();\n"
-        "    s.Add(30); s.Add(10); s.Add(20);\n"
-        "    using var rv := s.Reverse().ToArray();\n"
-        "    Console.WriteLine(rv.Count.ToString());"));
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_FALSE(hasErrorContaining(r, "issue 3763"));
-    BEZEL_EXPECT_FALSE(hasErrorContaining(r, "no typing on a direct"));
-}
+// The reject's own text must be GONE — pinned via the value check on
+// `sortedset_reverse_yields_descending` above (pre-fix this program did not
+// run; post-fix it prints "30,20,10,"). The vacuous-assertion guard (#3138)
+// flagged the EXPECT_FALSE(hasErrorContaining) rows here as vacuous by
+// construction (r.diagnostics is empty for a program that compiled cleanly),
+// so this breadcrumb was removed — the non-vacuous value check at lines
+// 151-160 already pins the same property.
+
 
 // `LinkedList<T>` (§4.6) is `bz_llist_t*`-backed, not array-backed, and
 // declares no `Reverse()` either. Pre-fix it took the same #2434 quiet
