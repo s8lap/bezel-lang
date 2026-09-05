@@ -145,15 +145,69 @@ llvm::Value* Emitter::tryLowerEncodingCall(const ast::CallExpr& call) {
     // form is retired and rejected in sema (ExprTypecheck_Calls.cpp) before
     // this codegen arm is ever reached, so only the one-argument form is
     // lowered here. The four `bz_encoding_*_get_string(arr, index, count)`
-    // runtime entries stay — this surviving form lowers through them with a
-    // synthesised full window (index 0, count = Length).
+    // runtime entries stay — the plain `Array<byte>` shape lowers through
+    // them with a synthesised full window (index 0, count = Length).
+    //
+    // fix #3889 (stdlib §3.2, v0.222 #1809): the argument may ALSO be a
+    // `ReadOnlySpan<byte>` / `ReadOnlyArraySpan<byte>` — the exact spelling
+    // `bytes.AsReadOnlySpan(start, length)` that fix #3851's own retirement
+    // diagnostic names as the replacement for the removed windowed call.
+    // Both span kinds lower to the shared `%bz.arrayspan { ptr source, i32
+    // start, i32 length }` value struct (LlvmBackend_impl.hpp
+    // arraySpanStructType/isSpanLikeTypeName; OwningBuffer<T> — the backing
+    // store for Span<T>/ReadOnlySpan<T> — shares Array<T>'s bz_array_t*
+    // layout, per the AsSpan/AsReadOnlySpan comment above in this file), so
+    // `source` is a genuine `bz_array_t*` the exact same runtime entry point
+    // already accepts — no raw-pointer unpacking (bz_array_ptr_at) is
+    // needed, unlike the 2-arg GetBytes(s, destination: Span<byte>) arm
+    // above, which writes into the span rather than reading a sub-window of
+    // it. Distinguish the two shapes the same way the File.WriteAllBytes arm
+    // does (LlvmBackend_Calls.cpp): after lowering, a span argument comes
+    // back as the `%bz.arrayspan` STRUCT value, a plain Array<byte> as a
+    // bare `bz_array_t*` pointer.
     if (m == "GetString" && call.args.size() == 1 && call.args[0].value) {
-        llvm::Value* arr = lowerExpr(*call.args[0].value);
-        if (!arr) return nullptr;
-        // index = 0, count = bz_array_len(arr).
-        llvm::Value* index = builder_.getInt64(0);
-        auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
-        llvm::Value* count = builder_.CreateCall(lenFn, {arr}, "enc.arrlen");
+        llvm::Value* arg = lowerExpr(*call.args[0].value);
+        if (!arg) return nullptr;
+        // fix #3889 follow-up (reviewer NEEDS-FIX): the discriminator MUST be
+        // the argument's static TypeRef, never the lowered LLVM shape alone.
+        // Sema's 1-arg GetString typing (ExprTypecheck_Calls.cpp ~5468) types
+        // ANY 1-arg call on an Encoding receiver as `string`, gated only on
+        // member name and arity — it does not itself check that the argument
+        // is one of the three documented types (Array<byte> /
+        // ReadOnlySpan<byte> / ReadOnlyArraySpan<byte>). The first cut of
+        // this fix used `arg->getType()->isStructTy()` alone as the span
+        // test: ANY value that happens to lower to an LLVM struct — a
+        // `Range<int>`, an arbitrary record — matched too, and had its raw
+        // bytes reinterpreted as `{ptr, i32, i32}` via
+        // spanSource/spanStart/spanLength. That turned a loud compile-time
+        // IR-verification failure into a quiet compile that segfaults at
+        // runtime (measured: `GetString(1..5)` compiled clean and crashed
+        // with SIGSEGV). Gate on the static type instead, the same way the
+        // Console.Write(Line) span/Range arm (LlvmBackend_Calls.cpp, fix
+        // #2661) does for this exact hazard class.
+        const sema::TypeRef* argTy = ctx_.exprType(*call.args[0].value);
+        llvm::Value* arr;
+        llvm::Value* index;
+        llvm::Value* count;
+        if (arg->getType()->isStructTy() && isSpanLikeTypeName(argTy)) {
+            // Span-typed argument: unpack { source, start, length }.
+            arr = spanSource(arg);
+            index = builder_.CreateSExt(spanStart(arg), i64(), "enc.sp.st64");
+            count = builder_.CreateSExt(spanLength(arg), i64(), "enc.sp.len64");
+        } else {
+            // Plain Array<byte>: index = 0, count = bz_array_len(arr). A
+            // struct-typed argument that is NOT a recognized span (a
+            // Range<int>, a record, ...) falls through here UNCHANGED from
+            // the pre-#3889 code: bz_array_len/bz_encoding_*_get_string are
+            // called with the struct value where a pointer is expected,
+            // which reproduces the same loud IR-verification failure this
+            // call form has always produced for an argument outside the
+            // three documented types — never a silent miscompile.
+            arr = arg;
+            index = builder_.getInt64(0);
+            auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+            count = builder_.CreateCall(lenFn, {arr}, "enc.arrlen");
+        }
         auto* fn = declareC(getStringName.c_str(), ptrTy(),
                             {ptrTy(), i64(), i64()});
         llvm::Value* result = builder_.CreateCall(fn, {arr, index, count},

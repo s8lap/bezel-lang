@@ -131,6 +131,27 @@ bool hasErrorContaining(const bezel::test::JitResult& r, const char* sub) {
     return false;
 }
 
+// fix #3889 (review finding): `r.ran == false` alone does NOT distinguish a
+// genuine compile-time rejection from a runtime crash — runAot's `ran` is
+// "true once main executed" (tests/support/codegen_support.hpp), so it is
+// ALSO false when the driver compiled and linked fine but the resulting
+// program was killed by a signal at run time (tests/support/aot_support.hpp:
+// the `WIFSIGNALED(status)` branch reports "runAot: program terminated by
+// signal N", a DIFFERENT diagnostic than a `CompileOutcome::Rejected`'s
+// captured driver stderr). A discriminator regression that reinterprets a
+// non-span struct's raw bytes (this file's whole negative-control section)
+// compiles clean and SEGFAULTS at run time — which also has `r.ran == false`
+// and would let a naive `BEZEL_EXPECT_FALSE(r.ran)` pass for the wrong
+// reason. This asserts the STRONGER, correct claim: the driver itself
+// rejected the program before ever executing it (the pre-#3889 IR-
+// verification failure text), and the process was never launched at all.
+bool failedAtCompileTimeNotRuntime(const bezel::test::JitResult& r) {
+    return !r.ran &&
+           hasErrorContaining(r, "IR verification failed") &&
+           !hasErrorContaining(r, "terminated by signal") &&
+           !hasErrorContaining(r, "compiler CRASHED");
+}
+
 // fix #3851: the diagnostic must point at the call, never at 0:0. A REJECT's
 // `runAot` packs the whole captured stderr into ONE synthetic Diagnostic at
 // SourceLocation{} (0:0) — `d.location` itself cannot be asserted — so this
@@ -731,6 +752,146 @@ BEZEL_TEST(codegen_encoding, indirect_singleton_use_rejected_spec_3_2) {
         "  using var b: Array<byte> := e.GetBytes(s); "
         "  return b.Length; "
         "end Main; end C;"));
+}
+
+// === span-source GetString overloads (fix #3889, stdlib §3.2 v0.222 #1809) ==
+//
+// GetString(bytes: ReadOnlyArraySpan<byte>) and GetString(bytes: ReadOnlySpan
+// <byte>) — the two span-typed 1-argument overloads stdlib §3.2 documents
+// alongside GetString(bytes: Array<byte>) — crashed codegen with an LLVM IR
+// verification failure: tryLowerEncodingCall's 1-arg GetString arm
+// (LlvmBackend_Calls2.cpp) always treated `call.args[0].value` as a raw
+// bz_array_t* regardless of its static type, so a span-struct argument
+// (%bz.arrayspan) was passed directly to a runtime entry point declared to
+// take a bare pointer — the exact crash fix #3851's own retirement diagnostic
+// steers users into by naming `GetString(bytes.AsReadOnlySpan(start, length))`
+// as the replacement for the removed 3-argument window call. Fixed by
+// detecting a struct-typed (span) lowered argument and unpacking { source,
+// start, length } the same way the adjacent 2-arg GetBytes(s, destination)
+// arm already does.
+//
+// Every row below asserts the DECODED VALUE (not just "it compiled"), and the
+// windowed rows use a non-zero `start` so a fix that silently ignored the
+// span's start offset (always decoding from 0) could not pass.
+
+// fix #3889: the issue's own repro — Array<byte>.AsReadOnlySpan(1, 3) over
+// GetBytes("Hello") (bytes 72,101,108,108,111) must decode exactly "ell",
+// proving the windowed ReadOnlyArraySpan<byte> overload both compiles AND
+// honors the non-zero start.
+BEZEL_TEST(codegen_encoding,
+           utf8_getstring_readonlyarrayspan_windowed_value_3889) {
+    expectValueAndNoCorruption(
+        "module M; class C public static method Main(): int "
+        "  var s := \"Hello\"; "
+        "  using var b: Array<byte> := Encoding.UTF8.GetBytes(s); "
+        "  var sub: string := Encoding.UTF8.GetString(b.AsReadOnlySpan(1, 3)); "
+        "  return (if sub = \"ell\" and sub.Length = 3 then 1 else 0); "
+        "end Main; end C;", 1);
+}
+
+// fix #3889: the no-offset ReadOnlyArraySpan<byte> form (b.AsReadOnlySpan(),
+// start=0, length=Count) must still decode the FULL string — a regression
+// guard that the span arm's zero-start case did not somehow drop bytes.
+BEZEL_TEST(codegen_encoding, utf8_getstring_readonlyarrayspan_full_3889) {
+    expectValueAndNoCorruption(
+        "module M; class C public static method Main(): int "
+        "  var s := \"Hello\"; "
+        "  using var b: Array<byte> := Encoding.UTF8.GetBytes(s); "
+        "  var back: string := Encoding.UTF8.GetString(b.AsReadOnlySpan()); "
+        "  return (if back = s and back.Length = 5 then 1 else 0); "
+        "end Main; end C;", 1);
+}
+
+// fix #3889: a multi-byte-safe window. "café" UTF-8-encodes to bytes
+// [99,97,102,195,169] (c,a,f, then é's two-byte 0xC3 0xA9 — see
+// utf8_getbytes_multibyte_bytes_spec_3_2 above). The window [3, 2) covers
+// exactly the two continuation bytes of é and must decode to "é" alone —
+// guards against an off-by-one in the unpacked start/length beyond plain
+// ASCII single-byte code points.
+BEZEL_TEST(codegen_encoding,
+           utf8_getstring_readonlyarrayspan_multibyte_window_3889) {
+    expectValueAndNoCorruption(
+        "module M; class C public static method Main(): int "
+        "  var s := \"caf\\u00e9\"; "
+        "  using var b: Array<byte> := Encoding.UTF8.GetBytes(s); "
+        "  var sub: string := Encoding.UTF8.GetString(b.AsReadOnlySpan(3, 2)); "
+        "  return (if sub = \"\\u00e9\" and sub.Length = 1 then 1 else 0); "
+        "end Main; end C;", 1);
+}
+
+// fix #3889: the OwningBuffer<byte>-backed `ReadOnlySpan<byte>` overload — the
+// sibling span kind stdlib §3.2 documents alongside ReadOnlyArraySpan<byte>
+// (both share codegen's %bz.arrayspan layout per LlvmBackend_impl.hpp
+// isSpanLikeTypeName; OwningBuffer<T> shares Array<T>'s bz_array_t* backing).
+// Copies GetBytes("Hello")'s bytes into an OwningBuffer<byte> and decodes the
+// windowed [1, 3) slice through AsReadOnlySpan(start, length) — must also
+// yield exactly "ell", proving the non-Array span source unpacks identically.
+BEZEL_TEST(codegen_encoding,
+           utf8_getstring_readonlyspan_ownedbuffer_windowed_value_3889) {
+    expectValueAndNoCorruption(
+        "module M; class C public static method Main(): int "
+        "  var s := \"Hello\"; "
+        "  using var b: Array<byte> := Encoding.UTF8.GetBytes(s); "
+        "  using var buf: OwningBuffer<byte> := "
+        "      new OwningBuffer<byte>(5, lambda(i: int) => b[i]); "
+        "  var sub: string := "
+        "      Encoding.UTF8.GetString(buf.AsReadOnlySpan(1, 3)); "
+        "  return (if sub = \"ell\" and sub.Length = 3 then 1 else 0); "
+        "end Main; end C;", 1);
+}
+
+// === negative controls: a struct-typed argument that is NOT a recognized
+// span must never reach the span-unpack path (fix #3889 review finding) ====
+//
+// Sema's 1-arg GetString typing (ExprTypecheck_Calls.cpp ~5468) types ANY
+// 1-arg call on an Encoding receiver as `string`, gated only on member name
+// and arity — it does not itself check the argument's type against the three
+// documented overloads (Array<byte> / ReadOnlySpan<byte> /
+// ReadOnlyArraySpan<byte>). A discriminator keyed on the LOWERED LLVM shape
+// alone (`arg->getType()->isStructTy()`) is therefore unsound: `Range<int>`
+// and any record ALSO lower to an LLVM struct, and reusing
+// spanSource/spanStart/spanLength on one reinterprets its raw bytes as
+// `{ptr, i32, i32}` — measured to compile clean and then SIGSEGV at runtime
+// (`Encoding.UTF8.GetString(1..5)`), a loud-diagnostic-into-quiet-crash
+// inversion strictly worse than the pre-fix IR-verification failure. Both
+// rows below must compile-FAIL the same way the pre-#3889 code always
+// handled a non-Array<byte>, non-span argument here (an unimplemented-shape
+// codegen error) — never produce a runnable binary.
+
+// fix #3889 (review finding): Range<int> is a struct-typed argument that is
+// NOT one of the three documented GetString overloads. Must fail AT COMPILE
+// TIME (the real bezelc codegen pipeline, not sema alone — sema's
+// arity/name-only gate accepts this call; only codegen's struct-vs-span
+// discriminator can catch it) — never compile-and-segfault. Asserts the
+// STRONG claim (failedAtCompileTimeNotRuntime), not merely `!r.ran`: a
+// runtime SIGSEGV also has `r.ran == false` and would let a regressed
+// discriminator pass this row for the wrong reason (exactly the review
+// finding — see the helper's comment above).
+BEZEL_TEST(codegen_encoding,
+           utf8_getstring_range_argument_rejected_not_miscompiled_3889) {
+    auto r = runAot(
+        "module M; class C public static method Main(): int "
+        "  var sub: string := Encoding.UTF8.GetString(1..5); "
+        "  return sub.Length; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeNotRuntime(r));
+}
+
+// fix #3889 (review finding): an arbitrary record is also a struct-typed
+// argument that is NOT a recognized span. Same requirement: must fail AT
+// COMPILE TIME, never compile-and-segfault via a reinterpreted-bytes span
+// unpack (see failedAtCompileTimeNotRuntime's comment for why `!r.ran` alone
+// is not a strong enough assertion here).
+BEZEL_TEST(codegen_encoding,
+           utf8_getstring_record_argument_rejected_not_miscompiled_3889) {
+    auto r = runAot(
+        "module M; record Pair(A: int, B: int); "
+        "class C public static method Main(): int "
+        "  var p := new Pair(1, 2); "
+        "  var sub: string := Encoding.UTF8.GetString(p); "
+        "  return sub.Length; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeNotRuntime(r));
 }
 
 }  // namespace
