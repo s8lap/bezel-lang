@@ -3698,6 +3698,43 @@ static bool parseAndAttachFieldInit(
             if (!sib || sib->name.empty()) continue;
             if (sib->name == td.name) continue;
             freshCtx.registerImportedType(moduleName, sib);
+            // fix #3748 (§22.8 / §2.8.2 / §18.5, v0.286): a sibling
+            // TypeSymbol registered above is the real imported one, so its
+            // members are also the real imported symbols. Carry the
+            // per-symbol type channels (`importedReturnType` /
+            // `importedReturnOwned` / `importedMemberType`) so the
+            // re-parsed field initializer sees the same return type for
+            // `H.Str()` that the importer's own sema saw. Without this,
+            // `H.Str()` (a CallExpr) gets no exprType in freshCtx, the
+            // binary `+`'s left/right operand types come out null, the
+            // §4.6 typecheck (`"+` requires both operands to be string")
+            // rejects at construction time, AND — when the rejection
+            // gate is bypassed by passing two non-constant `string`s
+            // (`H.Str() + H.Str()`) — the lowered `+` reaches the
+            // integer-arithmetic path and emits `add ptr`, an
+            // IR-verification abort. Symmetric with the same one-line
+            // type-channel carry the ctor/method bodies already do.
+            for (sema::Symbol* mem : sib->members) {
+                if (!mem) continue;
+                if (auto* ms = dynamic_cast<sema::MethodSymbol*>(mem)) {
+                    if (sema::TypeRef* rt = mainCtx.importedReturnType(ms))
+                        freshCtx.setImportedReturnType(
+                            ms, rt, mainCtx.importedReturnOwned(ms));
+                } else if (auto* fs = dynamic_cast<sema::FieldSymbol*>(mem)) {
+                    if (sema::TypeRef* ty = mainCtx.importedMemberType(fs))
+                        freshCtx.setImportedMemberType(fs, ty);
+                } else if (auto* ps = dynamic_cast<sema::PropertySymbol*>(
+                               mem)) {
+                    if (sema::TypeRef* ty = mainCtx.importedMemberType(ps))
+                        freshCtx.setImportedMemberType(ps, ty);
+                }
+                // See markImported's #3748 doc comment: the imported-flag
+                // is what the CallExpr typecheck's "imported method" arm
+                // keys on (ExprTypecheck_Calls.cpp ~3477). The symbol IS
+                // the mainCtx's own imported symbol, so the predicate must
+                // be true here too.
+                freshCtx.markImported(mem);
+            }
         }
     }
     sema::resolveTypes(*sf, freshCtx);
@@ -4169,6 +4206,28 @@ static void loadMetadataPass2(
     // pass 3, whose generic-body re-parse reads the member types this fills in.
     // See `Loader::resolvePendingNamed`.
     loader.resolvePendingNamed();
+
+    // fix #3748 (§22.8 / §2.8.2, v0.286): publish the per-method
+    // `importedReturnType` and per-member `importedMemberType` side
+    // tables BEFORE pass 3's `parseAndAttachFieldInit` runs. The
+    // load-time field-init reconstruction builds a fresh SemaContext
+    // and re-parses the initializer expression; that synthetic AST
+    // references the IMPORTED sibling methods (e.g. `H.Str()`), and
+    // the typecheck arm that gives the CallExpr its exprType
+    // (ExprTypecheck_Calls.cpp ~3477) reads `ctx.importedReturnType`
+    // on the fresh context. Without this early publish, the
+    // reconstruction silently leaves the call's exprType null, the
+    // §4.6 string `+` check passes only because both operands are
+    // equally untyped, and the codegen path then routes the binary
+    // `+` through the integer-arithmetic fallthrough that emits
+    // `add ptr` (an IR-verification abort). Published here, not after
+    // pass 4, for the same reason `resolvePendingNamed` is placed
+    // here — pass 3's body re-parse is the first consumer that
+    // actually reads these tables.
+    for (auto& [m, ret] : loader.returnTypes_)
+        ctx.setImportedReturnType(m, ret, loader.returnOwned_[m]);
+    for (auto& [m, ty] : loader.fieldTypes_)
+        ctx.setImportedMemberType(m, ty);
 
     // Pass 3 (§14/#662c, schema v5): for imported generic CLASSES, re-parse
     // exported ctor/dtor body text and attach ast::ConstructorDecl /
@@ -4643,13 +4702,8 @@ static void loadMetadataPass2(
         ctx.ownImportedAst(std::move(synth));
     }
 
-    // Publish the loader's member-type side tables into the SemaContext so the
-    // rest of the front-end (and codegen) can read an imported member's resolved
-    // type without an ast::Type node.
-    for (auto& [m, ret] : loader.returnTypes_)
-        ctx.setImportedReturnType(m, ret, loader.returnOwned_[m]);
-    for (auto& [m, ty] : loader.fieldTypes_)
-        ctx.setImportedMemberType(m, ty);
+    // Publish the loader's remaining side tables (the returnType /
+    // fieldType publishes were lifted above pass 3 by #3748).
     // fix #2391 (§14.2/§2.8.2, v0.236): publish imported generic base
     // methods' per-parameter constraint payload so checkOverrideSignatureMatch
     // can verify an override's restated clause set against an imported base.

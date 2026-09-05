@@ -625,6 +625,19 @@ public:
     bool isImported(const Symbol* s) const {
         return imported_.count(const_cast<Symbol*>(s)) != 0;
     }
+    // fix #3748 (§22.8 / §2.8.2, v0.286): a sibling TypeSymbol registered
+    // via `registerImportedType` for the load-time field-init reconstruction
+    // is the SAME imported symbol already in mainCtx — but freshCtx's
+    // `isImported` predicate (a private set) does not know that without
+    // this entry, so the `else if (!md && ctx_.isImported(ms))` arm of
+    // sema's CallExpr typecheck (ExprTypecheck_Calls.cpp ~3477) does not
+    // fire on the reconstructed H.Str() call, leaving its exprType null,
+    // and the §4.6 "+" requires both operands to be string" check rejects
+    // the whole binary at construction time. Idempotent — re-inserting
+    // an already-present symbol is a no-op.
+    void markImported(const Symbol* s) {
+        if (s) imported_.insert(const_cast<Symbol*>(s));
+    }
 
     // Intern a string so a Symbol's string_view `name` (which does not own its
     // bytes) can point at storage that lives for the whole compilation. Used by
