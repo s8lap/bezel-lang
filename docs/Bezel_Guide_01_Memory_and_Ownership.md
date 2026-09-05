@@ -1,6 +1,6 @@
 # Bezel Guide 1: Memory and Ownership
 
-*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.281.*
+*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.291.*
 
 Bezel has no garbage collector. Every heap object has exactly one owner responsible for disposing it. The compiler tracks ownership and guarantees every object is disposed exactly once — no leaks, no double-frees. This is an **affine** model: an owned value you do not explicitly discharge is auto-dropped at the end of its scope, with a must-use warning (§2's trivial-dispose classes excepted). A use-after-free or double-free is rejected outright. This guide shows the everyday patterns; it does not restate the full rules (see spec §28).
 
@@ -45,6 +45,8 @@ There is really only one disposal mechanism. At the end of a scope, every owned 
 | `_ := x;` | right there, and ends the binding | says nothing — the discard is the announcement (spec §28.3) |
 
 `using var` is the default: *lives and dies here.* Plain `var` is for a value whose ownership will **move on** — a factory result you return, an accumulator, the best-so-far in a loop. The must-use warning then marks any path where it silently *doesn't* move on, so a leak is never quiet. An explicit `.Dispose()` is for an **early or conditional** release inside a longer scope. `_ := x;` disposes an unwanted owned value immediately (§9).
+
+**One owned value takes neither discard form: a `Task`.** `_ := SomeAsync();` is a compile error, and so is the anonymous binding `using var _ := SomeAsync();` — nothing can await an unnamed binding, so it is the same abandonment one scope later. Disposing a task abandons a running operation, which is a decision about the *operation*, not cleanup of a value, so the language makes you announce which decision you mean: `Task.FireAndForget(SomeAsync())` lets it run to completion and logs any failure, and a **named** `using var t := SomeAsync();` is the unsupervised scope-end drop (spec §17.13; stdlib §6.7). Every other owned value takes all four spellings above.
 
 **The habit to unlearn.** Elsewhere, a trailing `foo.Dispose()` at the end of a block is the anti-pattern `using` blocks exist to kill, because a thrown exception skips the trailing call. In Bezel the unwinding edge *always* disposes live owned values, so a trailing `Dispose()` is exception-safe by construction. It therefore never means "cleanup plumbing." It means one thing only: *release this early.* Auto-drop is the safety net underneath all four forms. You are choosing *when* and *how loudly*, never *whether*. And *loudly* has a meaning: disposing a resource is an **effect** — a file closes, a lock releases, a subscription unhooks — and the spellings say where effects fire, the warning firing exactly where none says so.
 
@@ -465,7 +467,7 @@ When *not* to reach for it: if the thing to undo is a **value**, it has an owner
 | Hand a new object to the caller | return type `: owned T`, `return x;` |
 | Hand an owned local to a method that takes it | `M(move x)` (marker required) |
 | Move an owned field's contents out | `move _f` (then reassign `_f` before exit) |
-| Dispose an unwanted owned value now | `_ := x;` (or `x.Dispose();` for an early release) |
+| Dispose an unwanted owned value now | `_ := x;` (or `x.Dispose();` for an early release) — never a `Task` (§2) |
 | Make a resource-free helper (no destructor, no `owned`/inline-owned fields) | just `new` it — trivial-dispose, no `using var` needed (§2) |
 | Drain an owning collection | `for var e in coll.Drain() do using var x := move e; … end;` |
 | Merge branches with mixed ownership | equalize first (Pattern A or B, §8) |

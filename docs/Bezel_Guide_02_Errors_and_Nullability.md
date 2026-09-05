@@ -1,6 +1,6 @@
 # Bezel Guide 2: Errors and Nullability
 
-*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.268.*
+*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.291.*
 
 Most of the syntax here is mainstream: non-nullable by default, `?` for nullable, `?.`, `??`, exceptions with `try`/`catch`/`finally`. The *emphasis* is not. Bezel splits failure signals by one rule (the **failure-signal rule**, stdlib §1), and it is worth knowing the shape before the details (teaching order here, not the rule's band order):
 
@@ -42,6 +42,19 @@ if maybe <> null then
   var ok := maybe.Length;          // maybe is narrowed to non-null here
 end;
 ```
+
+Narrowing is not only for member access. An operator that a nullable operand would reject is admitted *through* the narrowing, and the store leaves the narrowing standing — a compound assignment writes back a non-nullable value:
+
+```bezel
+var n: int? := counts.GetOrNull(key);
+if n <> null then
+  n += 1;                          // admitted: the narrowed operand is non-nullable
+  n++;                             // the same rule, read through the same desugaring
+  Report(n);                       // n is still narrowed — the stores wrote non-null values
+end;
+```
+
+`n += 1` is admitted exactly where `n := n + 1` is, and `n++` with it (spec §6.6, §17.6). Outside a narrowing both are compile errors, and the diagnostic names the three remedies — narrow first, or write `n := (n ?? 0) + 1;` or `n := n! + 1;` (spec §7.11).
 
 One rule that bites people: **narrowing applies to locals and `readonly` fields only, never to mutable fields or properties.** A mutable field can be reassigned between the check and the use by things the compiler cannot see — a method call that writes it, a closure, or another continuation interleaving at an `await` — so the compiler will not narrow it. Copy it to a local first:
 
