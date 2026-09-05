@@ -37,6 +37,34 @@ std::string prog(const std::string& mainBody) {
            " end Main; end C;";
 }
 
+// fix #3891 (review finding, per #3892): `r.ran == false` alone does NOT
+// distinguish a genuine compile-time rejection from a runtime crash — runAot's
+// `ran` is "true once main executed" (tests/support/aot_support.hpp), so it is
+// ALSO false when the driver compiled/linked fine but the resulting program
+// was killed by a signal at run time (the `WIFSIGNALED(status)` branch reports
+// "runAot: program terminated by signal N", a DIFFERENT diagnostic than a
+// `CompileOutcome::Rejected`'s captured driver stderr). A regressed
+// span/non-span discriminator here compiles clean and crashes at run time —
+// which also has `r.ran == false` and would let a naive
+// `BEZEL_EXPECT_FALSE(r.ran)` pass for the wrong reason. This asserts the
+// STRONGER, correct claim: the driver itself rejected the program before ever
+// executing it (the IR-verification-failure text), and the process was never
+// launched at all. Model: tests/codegen/encoding_test.cpp's helper of the same
+// name, added for fix #3889 (the sibling hazard this issue is the "surviving
+// copy" of).
+bool hasErrorContaining(const bezel::test::JitResult& r, const char* sub) {
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find(sub) != std::string::npos) return true;
+    return false;
+}
+
+bool failedAtCompileTimeNotRuntime(const bezel::test::JitResult& r) {
+    return !r.ran &&
+           hasErrorContaining(r, "IR verification failed") &&
+           !hasErrorContaining(r, "terminated by signal") &&
+           !hasErrorContaining(r, "compiler CRASHED");
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -188,5 +216,83 @@ BEZEL_TEST(file_io_644_7_3, copy_then_move_chain) {
         "File.Delete(\"/tmp/bzt644_chain_src.txt\"); "
         "File.Delete(\"/tmp/bzt644_chain_dst.txt\"); "
         "if srcOk and midGone and dstOk then return 1; end; "
+        "return 0; ")), 1);
+}
+
+// ---------------------------------------------------------------------------
+// fix #3891 (stdlib §7.3): `File.WriteAllBytes`'s codegen arm discriminated
+// its span argument with a bare `contents->getType()->isStructTy()` test on
+// the LOWERED LLVM type — the surviving copy of the exact hazard fix #3889
+// corrected for `Encoding.GetString`'s 1-arg arm (that fix's own commit cited
+// this site, unfixed, as its precedent). Sema types `WriteAllBytes`'s 2-arg
+// call by member name and arity only (ExprTypecheck_Calls.cpp ~8006/~8768) —
+// it does NOT itself constrain `contents` to the documented Array<byte> /
+// ReadOnlySpan<byte> / ReadOnlyArraySpan<byte> family, so ANY struct-typed
+// value reached the span unpack (spanSource/spanStart/spanLength) and had its
+// raw bytes reinterpreted as `{ptr, i32, i32}`.
+//
+// MEASURED on the pre-fix tree (probes under `scripts/agent_check.sh --probe
+// --asan`): `File.WriteAllBytes(path, 1..5)` (a `Range<int>`) compiled clean
+// and produced an ASan stack-buffer-overflow WRITE of size 32 inside `main`
+// (a wild write, not merely a crash); `File.WriteAllBytes(path, aRecord)` (a
+// plain 2-field record) compiled clean and SEGV'd (READ) inside
+// `bz_array_ptr_at` (bezel_runtime_collections.cpp:421). Both rows below must
+// compile-FAIL with the driver's own IR-verification diagnostic — never
+// produce a runnable binary — the same way the pre-#644 code always handled
+// an unimplemented shape here. Each asserts the STRONG claim
+// (failedAtCompileTimeNotRuntime), not merely `!r.ran`, per #3892.
+// ---------------------------------------------------------------------------
+
+// A `Range<int>` argument is struct-typed but not a documented span; must be
+// rejected at compile time, never miscompiled into the span-unpack path.
+BEZEL_TEST(file_io_644_7_3,
+           write_all_bytes_range_argument_rejected_not_miscompiled_3891) {
+    auto r = runAot(prog(
+        "File.WriteAllBytes(\"/tmp/bzt3891_range.bin\", 1..5); "
+        "return 0; "));
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeNotRuntime(r));
+}
+
+// An arbitrary user record is also struct-typed and not a documented span;
+// same requirement.
+BEZEL_TEST(file_io_644_7_3,
+           write_all_bytes_record_argument_rejected_not_miscompiled_3891) {
+    auto r = runAot(
+        "module M; record Pair(A: int, B: int); "
+        "class C public static method Main(): int "
+        "  var p := new Pair(1, 2); "
+        "  File.WriteAllBytes(\"/tmp/bzt3891_record.bin\", p); "
+        "  return 0; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeNotRuntime(r));
+}
+
+// Positive control: the `Array<byte>` overload must keep working after the
+// discriminator change (round-trip, per the file_io_644_7_3 happy-path tests
+// above — repeated here beside the negative rows so a reviewer sees both
+// sides of the fix in one place).
+BEZEL_TEST(file_io_644_7_3,
+           write_all_bytes_array_still_works_3891) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "using var bytes := new Array<byte>(); "
+        "bytes.Add(byte(5)); bytes.Add(byte(6)); "
+        "File.WriteAllBytes(\"/tmp/bzt3891_arr_ok.bin\", bytes); "
+        "var back := File.ReadAllBytes(\"/tmp/bzt3891_arr_ok.bin\"); "
+        "File.Delete(\"/tmp/bzt3891_arr_ok.bin\"); "
+        "if back.Count = 2 then return 1; end; "
+        "return 0; ")), 1);
+}
+
+// Positive control: the `ReadOnlyArraySpan<byte>` overload (the real span
+// shape the struct-typed unpack path exists for) must keep working.
+BEZEL_TEST(file_io_644_7_3,
+           write_all_bytes_span_still_works_3891) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "using var bytes := new Array<byte>(); "
+        "bytes.Add(byte(9)); bytes.Add(byte(8)); bytes.Add(byte(7)); bytes.Add(byte(6)); "
+        "File.WriteAllBytes(\"/tmp/bzt3891_span_ok.bin\", bytes.AsReadOnlySpan(1, 2)); "
+        "var back := File.ReadAllBytes(\"/tmp/bzt3891_span_ok.bin\"); "
+        "File.Delete(\"/tmp/bzt3891_span_ok.bin\"); "
+        "if back.Count = 2 then return 1; end; "
         "return 0; ")), 1);
 }

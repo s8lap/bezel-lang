@@ -12366,13 +12366,33 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
         // cases are handled: the span case extracts the raw data pointer and
         // byte count and calls bz_file_write_all_bytes directly (avoiding the
         // bz_array_t wrapper entirely).
+        //
+        // fix #3891 (stdlib §7.3): the span/non-span discriminator MUST be the
+        // argument's static TypeRef, never `isStructTy()` on the lowered LLVM
+        // shape alone. Sema types `File.WriteAllBytes`'s 2-arg call by member
+        // name and arity only (ExprTypecheck_Calls.cpp ~8006/~8768) — it does
+        // NOT itself constrain `contents` to the documented Array<byte> /
+        // ReadOnlySpan<byte> / ReadOnlyArraySpan<byte> family. A bare
+        // `isStructTy()` test therefore also matches a `Range<int>` or an
+        // arbitrary user record, which then had its raw bytes reinterpreted as
+        // `{ptr, i32, i32}` via spanSource/spanStart/spanLength — MEASURED:
+        // `File.WriteAllBytes(path, 1..5)` compiled clean and produced an
+        // ASan stack-buffer-overflow WRITE inside `main`; a plain 2-field
+        // record argument compiled clean and SEGV'd (READ) inside
+        // `bz_array_ptr_at`. This is the exact hazard class #3889 fixed for
+        // `Encoding.GetString`'s 1-arg arm, and this site was that fix's own
+        // cited (bare, unfixed) precedent. Gate on the static type instead,
+        // same as the `Console.Write(Line)` span/Range arm (fix #2661,
+        // ~line 483) and `GetString` (fix #3889, LlvmBackend_Calls2.cpp).
         if (m == "WriteAllBytes" && call.args.size() == 2 &&
             call.args[0].value && call.args[1].value) {
             llvm::Value* pathStr = lowerExpr(*call.args[0].value);
             llvm::Value* contents = lowerExpr(*call.args[1].value);
             if (!pathStr || !contents) return nullptr;
             llvm::Value* pathC = strToPath(pathStr);
-            if (contents->getType()->isStructTy()) {
+            const sema::TypeRef* contentsTy = ctx_.exprType(*call.args[1].value);
+            if (contents->getType()->isStructTy() &&
+                isSpanLikeTypeName(contentsTy)) {
                 // Span arg: extract bz_array_t* source, byte start, length.
                 llvm::Value* src   = spanSource(contents);
                 llvm::Value* start = builder_.CreateZExt(spanStart(contents), i64());
@@ -12387,7 +12407,14 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                                     {ptrTy(), ptrTy(), i64()});
                 return builder_.CreateCall(fn, {pathC, dataPtr, slen});
             }
-            // Array<byte> arg: bz_array_t* passed directly.
+            // Array<byte> arg: bz_array_t* passed directly. A struct-typed
+            // argument that is NOT a recognized span (a Range<int>, a record,
+            // ...) also falls through here UNCHANGED from the pre-#3891 code:
+            // the struct value is passed where `bz_file_write_all_bytes_arr`
+            // declares a bare pointer, which reproduces the loud IR-verification
+            // failure this call form has always produced for an argument
+            // outside the three documented types (MEASURED: `bezelc: codegen
+            // error: IR verification failed`) — never a silent miscompile.
             auto* fn = declareC("bz_file_write_all_bytes_arr", i32(),
                                 {ptrTy(), ptrTy()});
             return builder_.CreateCall(fn, {pathC, contents});
