@@ -1444,6 +1444,7 @@ void Emitter::emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         borrowingArrayFreeEligibleFn_ = resumeFn;
         dictMaterializerFreeEligibleFn_ = resumeFn;
         groupingFreeEligibleFn_ = resumeFn;
+        dictEntryKeyReleaseEligibleFn_ = resumeFn;  // fix #3720
         setLiteralFreeEligibleFn_ = resumeFn;   // #2142
         dictLiteralFreeEligibleFn_ = resumeFn;  // #2143
         // fix #2807 / #429 / §4.6 / §28.9 / §28.3 (v0.240): the `var` STRING-
@@ -2004,6 +2005,7 @@ void Emitter::emitAsyncLambda(const ast::LambdaExpr& lam, llvm::Function* fn,
             borrowingArrayFreeEligible_.clear();
             dictMaterializerFreeEligible_.clear();
             groupingFreeEligible_.clear();
+            dictEntryKeyReleaseEligible_.clear();  // fix #3720
             setLiteralFreeEligible_.clear();   // #2142
             dictLiteralFreeEligible_.clear();  // #2143
             literalTreeAggregateEligible_.clear();  // fix #2660
@@ -2011,6 +2013,7 @@ void Emitter::emitAsyncLambda(const ast::LambdaExpr& lam, llvm::Function* fn,
         borrowingArrayFreeEligibleFn_ = resumeFn;
         dictMaterializerFreeEligibleFn_ = resumeFn;
         groupingFreeEligibleFn_ = resumeFn;
+        dictEntryKeyReleaseEligibleFn_ = resumeFn;  // fix #3720
         setLiteralFreeEligibleFn_ = resumeFn;   // #2142
         dictLiteralFreeEligibleFn_ = resumeFn;  // #2143
         // fix #3728 (§15.1.1 / §15.3 / §29.7 / §30.6, v0.286): re-establish the
@@ -3205,6 +3208,7 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
         borrowingArrayFreeEligibleFn_ = resumeFn;
         dictMaterializerFreeEligibleFn_ = resumeFn;   // #1028
         groupingFreeEligibleFn_ = resumeFn;           // #1930
+        dictEntryKeyReleaseEligibleFn_ = resumeFn;    // fix #3720
         setLiteralFreeEligibleFn_ = resumeFn;         // #2142
         dictLiteralFreeEligibleFn_ = resumeFn;        // #2143
         // fix #2817 / #2807 / #429 / §4.6 / §28.9 / §28.3 / §30.7 (v0.240): the

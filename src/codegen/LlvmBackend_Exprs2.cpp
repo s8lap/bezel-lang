@@ -2487,6 +2487,14 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         llvm::Function* savedDictMaterializerFreeEligFn = dictMaterializerFreeEligibleFn_;
         auto savedGroupingFreeElig = groupingFreeEligible_;
         llvm::Function* savedGroupingFreeEligFn = groupingFreeEligibleFn_;
+        // fix #3720: same save/restore for the DictionaryEntry-Key-release
+        // eligibility set — populated by the SAME collectBorrowingArrayFree
+        // Eligible call this block already protects, so it needs identical
+        // protection against the lambda's stale keys leaking into the
+        // enclosing body's registration (LANE_RULES §8).
+        auto savedDictEntryKeyReleaseElig = dictEntryKeyReleaseEligible_;
+        llvm::Function* savedDictEntryKeyReleaseEligFn =
+            dictEntryKeyReleaseEligibleFn_;
         // #2142 / #2143: same save/restore for the Set-literal / Dict-literal
         // reclaim eligibility sets — populated by the SAME
         // collectBorrowingArrayFreeEligible call emitAsyncLambda makes above, so
@@ -2540,6 +2548,9 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         dictMaterializerFreeEligibleFn_ = savedDictMaterializerFreeEligFn;
         groupingFreeEligible_ = std::move(savedGroupingFreeElig);
         groupingFreeEligibleFn_ = savedGroupingFreeEligFn;
+        dictEntryKeyReleaseEligible_ =
+            std::move(savedDictEntryKeyReleaseElig);                       // #3720
+        dictEntryKeyReleaseEligibleFn_ = savedDictEntryKeyReleaseEligFn;    // #3720
         setLiteralFreeEligible_ = std::move(savedSetLiteralFreeElig);      // #2142
         setLiteralFreeEligibleFn_ = savedSetLiteralFreeEligFn;             // #2142
         dictLiteralFreeEligible_ = std::move(savedDictLiteralFreeElig);    // #2143

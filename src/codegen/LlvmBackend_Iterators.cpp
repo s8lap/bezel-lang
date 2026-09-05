@@ -1765,8 +1765,9 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         // materializer local in a `yield` body — the MoveNext scope-end drop
         // never freed it; the same gap applies to a Set<T>/Dictionary<K,V>
         // literal in a yield body, fixed here alongside #2142/#2143's entry-
-        // and resume-fn fixes for parity). One call re-populates all five
-        // sets; re-pin all five fn keys to moveNextFn. Mirrors emitAsyncMethod's
+        // and resume-fn fixes for parity). One call re-populates all six
+        // sets (fix #3720 added the sixth, dictEntryKeyReleaseEligible_); re-pin
+        // all six fn keys to moveNextFn. Mirrors emitAsyncMethod's
         // resume-fn re-establishment (LlvmBackend_Async.cpp) and the unwind
         // re-establishment just above. // per §28.9, §28.11
         //
@@ -1786,6 +1787,7 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         borrowingArrayFreeEligibleFn_ = moveNextFn;
         dictMaterializerFreeEligibleFn_ = moveNextFn;
         groupingFreeEligibleFn_ = moveNextFn;
+        dictEntryKeyReleaseEligibleFn_ = moveNextFn;  // fix #3720
         setLiteralFreeEligibleFn_ = moveNextFn;   // #2142
         dictLiteralFreeEligibleFn_ = moveNextFn;  // #2143
         // fix #2817 / #2807 / #429 / §4.6 / §28.9 / §28.3 / §29.2 (v0.240): the

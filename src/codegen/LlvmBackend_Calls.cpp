@@ -6812,12 +6812,11 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         // degradation (Key=0, Value=0) — issue #3761 measured
         // `dictSingle=0` for `Dictionary<int,int>.Single()` on a 1-entry dict.
         //
-        // NARROWED to a non-string key (any K). A string key hits a
-        // disposal dead end unrelated to this arm's own logic — see the
-        // `if (!keyTy)` reject a few lines down and #3720 — so this fix
-        // covers `Dictionary`/`SortedDictionary`'s scalar/enum/record-keyed
-        // shapes fully and rejects the string-keyed shape loudly rather
-        // than shipping a leak.
+        // fix #3720 (v0.294): a STRING key is ALSO covered now — see this
+        // arm's own opening comment a few lines down for the disposal
+        // mechanism that made it safe to stop rejecting. Narrow #3576
+        // originally scoped this fix to a non-string key ONLY and rejected
+        // a string-keyed receiver loudly (git history); #3720 lifts that.
         //
         // Snapshot the key/value tables exactly as the for-in path does
         // (mirrors `lowerDictEntryFor`, LlvmBackend_Stmts.cpp — "the same
@@ -6881,58 +6880,71 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         // typing rule) are filed as #3716.
         if ((call.args.empty() && (m == "First" || m == "Last" || m == "Single")) ||
             (m == "ElementAt" && call.args.size() == 1 && call.args[0].value)) {
-            // narrow #3576 / #3720: a STRING key has no disposal hook for
-            // this consumption shape. `bz_dict_keys_str` hands back raw,
-            // non-refcounted bytes; the only way to give the caller a
-            // `string`-typed Key is to rebuild a fresh, independently-owned
-            // `bz_string*` (as the for-in loop and the LINQ materializer
-            // both do) — but BOTH of those thread its release through their
-            // OWN consumption shape (a loop's incBB, a wrapped array's own
-            // dispose), which only exists because they own that shape. A
-            // plain local (`var fe := d.First();`) has no such hook: the
-            // general per-local disposal pass does not know
-            // `DictionaryEntry<K,V>`'s fields (it is a SYNTHETIC TypeRef,
-            // `declaration = nullptr`, built ad hoc in
-            // ExprTypecheck_Calls.cpp/ExprTypecheck.cpp — there is no real
-            // TypeSymbol with a field list for that pass to walk). Measured
-            // (200x under ASan/LSan, `Dictionary<string,int>.First()`
-            // bound to a plain local): the VALUE is correct
-            // (`total=4400`) but every call leaks the rebuilt Key (6400 B
-            // header + 600 B data over 200 iterations = 7000 B in 400
-            // allocations) — shipping it would be the loud->quiet trade
-            // §6c forbids, just moved from "wrong value" to "leak" instead
-            // of "silent zero". Reject loudly instead; #3720 is the
-            // sema-side fix (give `DictionaryEntry`/`DrainedEntry` a real
-            // field list the general disposal pass can walk), outside
-            // `LlvmBackend_Calls*.cpp`'s file ownership. Once #3720 lands,
-            // this whole `if (!keyTy)` arm is deleted and the string-key
-            // rebuild (identical to `lowerDictEntryFor`'s) slots in beside
-            // the generic-key decode below — the value decode, the
-            // SortedDictionary sort, and the free-loop are already
-            // key-type-agnostic.
-            if (!keyTy) {
-                ctx_.diagnostics().report(
-                    Severity::Error, call.span.begin,
-                    "`." + std::string(m) + "` over a string-keyed "
-                    "Dictionary/SortedDictionary is not yet supported "
-                    "(stdlib \xC2\xA7""5 / \xC2\xA7""4.8, #3720): the "
-                    "returned entry's Key would be a freshly-built string "
-                    "with no disposal hook at the returned local's scope "
-                    "end -- every existing consumer of this shape (the "
-                    "for-in loop, the \xC2\xA7""5 LINQ operators, "
-                    "ToArray()) threads its own release through ITS OWN "
-                    "consumption shape, which a plain local has none of; "
-                    "shipping it would leak on every call. Use "
-                    "`for var e in dict` (which disposes it) or "
-                    "`.Keys`/`.Values` instead.");
-                llvm::Type* resTy = i32();
-                if (sema::TypeRef* rt = ctx_.exprType(call))
-                    if (llvm::Type* lt = lowerTypeRef(rt))
-                        resTy = lt;
-                return llvm::PoisonValue::get(resTy);
-            }
+            // fix #3720 / stdlib §5 / §4.8 / §4.17 (v0.294): lifts narrow
+            // #3576's own string-key reject (the `if (!keyTy)` diagnostic
+            // this arm used to emit here — see git history) now that a
+            // plain local bound to this call has a disposal hook for the
+            // rebuilt Key. `keyTy` is null ONLY for a string key (see the
+            // `genKeyPtr`/`keyIsRecord` comment above genKeyPtr's own
+            // declaration a few dozen lines up this function) — every
+            // other key shape (scalar/enum/record) already worked via the
+            // generic-key decode below.
+            //
+            // `bz_dict_keys_str` hands back raw, non-refcounted bytes; the
+            // only way to give the caller a `string`-typed Key is to
+            // rebuild a fresh, independently-owned `bz_string*` — decodeDict
+            // StringKeyAt (LlvmBackend_Stmts.cpp, shared with the for-in
+            // loop and the two LINQ-materializer copies) does exactly that.
+            // What was MISSING before this fix was a disposal hook for the
+            // result bound to a PLAIN LOCAL (`var fe := d.First();`): the
+            // for-in loop and the LINQ materializer each thread the release
+            // through their OWN consumption shape (a loop's incBB, a
+            // wrapped array's own dispose), and neither applies to a bare
+            // local. `DictionaryEntry<K,V>` is a SYNTHETIC TypeRef
+            // (`declaration = nullptr`, built ad hoc in
+            // ExprTypecheck_Calls.cpp/ExprTypecheck.cpp) with no real
+            // TypeSymbol/field-list for the GENERAL per-local disposal pass
+            // to walk (`emitRecordStringFieldReleases` and friends,
+            // LlvmBackend_Disposal.cpp, all require one) — teaching that
+            // pass a real field list for a synthetic type was declined as
+            // disproportionate to this one shape (§6b: a much larger
+            // unification than this fix's scope).
+            //
+            // The fix instead is a ONE-OFF disposal special-case mirroring
+            // the EXISTING #1930 `GroupBy(sel).First()` grouping-terminal
+            // precedent (LlvmBackend_Setup.cpp's `collectBorrowingArrayFree
+            // Eligible`): a NEW candidate shape ("a plain `var`/`const`
+            // local initialized directly from a First/Last/ElementAt call
+            // whose result type is `DictionaryEntry<string, V>`") is
+            // recognized by `isFreshDictEntryKeyReleaseTerminalLocal`, run
+            // through the SAME type-agnostic `StringEscapeWalker` every
+            // other candidate family in that function reuses (no new modes
+            // needed — a `.Key`/`.Value` read is already a safe receiver
+            // read under the walker's default `MemberAccessExpr` rule, and
+            // DictionaryEntry has no user-written method that could stash
+            // `this` elsewhere, unlike a general record). A local proven
+            // NON-escaping is registered in `dictEntryKeyReleaseEligible_`;
+            // `lowerLocalDecl` (LlvmBackend_Setup.cpp) arms a scope-end
+            // `dictEntryKeyRelease` Disposal for it (GEP field 0 off the
+            // local's own 2-field struct slot + `emitStringRelease`,
+            // LlvmBackend_Disposal.cpp's `emitDisposals`) — exactly zero
+            // leak for the common case. An ESCAPING local (returned, stored,
+            // captured, reassigned, passed elsewhere) is simply not
+            // registered, so its rebuilt Key leaks — the SAME safe-direction
+            // fallback every sibling family in this codebase already uses
+            // for a runtime-managed value it cannot prove non-escaping
+            // (never a UAF, never a double-free — only ever a leak on an
+            // edge case no idiomatic caller hits, since the ONLY useful
+            // thing to do with `.First()`'s result is read `.Key`/`.Value`).
+            // This is NOT the loud->quiet trade §6c forbids: the VALUE is
+            // always correct (as it already was pre-fix), and the common
+            // case is now ALSO leak-free — only the rare unprovable-escape
+            // edge stays at the pre-fix "correct but leaks" state, which was
+            // the whole-program behavior §6c's own analysis measured before
+            // narrow #3576 chose to reject instead of ship it.
+            bool dtIsStringKey = !keyTy;
 
-            llvm::Type* dtKeyLlvm = lowerTypeRef(keyTy);
+            llvm::Type* dtKeyLlvm = dtIsStringKey ? ptrTy() : lowerTypeRef(keyTy);
             if (!dtKeyLlvm) dtKeyLlvm = ptrTy();
             llvm::Type* dtValLlvm = valTy ? lowerTypeRef(valTy) : ptrTy();
             if (!dtValLlvm) dtValLlvm = ptrTy();
@@ -6951,8 +6963,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // Dictionary<int,int>().First()` guarded in a try/catch leaked
             // 3200 B in 400 allocations (8 B keys-array + 8 B values-array
             // per throw). Deferring the snapshot to AFTER the guard passes
-            // gives this arm the SAME "no allocation before reject"
-            // discipline the string-key reject above already has.
+            // gives this arm a "no allocation before reject" discipline.
             llvm::Value* dtCnt0;
             {
                 auto* cfn = declareC("bz_dict_count", i64(), {ptrTy()});
@@ -7003,10 +7014,37 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             auto* dtKeysOutSlot = entryAlloca(ptrTy());
             auto* dtCntSlot     = entryAlloca(i64());
             auto* dtValsOutSlot = entryAlloca(ptrTy());
-            auto* kfn = declareC("bz_dict_keys_gen",
-                llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy(), ptrTy()});
-            builder_.CreateCall(kfn, {recv, dtKeysOutSlot, dtCntSlot});
-            auto* vfn = declareC("bz_dict_values_gen",
+            // fix #3720: a string key snapshots through `bz_dict_keys_str`
+            // (mirrors `lowerDictEntryFor`'s `isStringKey` branch) — it
+            // ALSO needs the per-key length array `decodeDictStringKeyAt`
+            // reads to rebuild each key's fresh `bz_string*`. A generic
+            // (non-string) key keeps the pre-existing `bz_dict_keys_gen`
+            // path unchanged.
+            llvm::Value* dtLensArr = nullptr;
+            if (dtIsStringKey) {
+                auto* dtLensOutSlot = entryAlloca(ptrTy());
+                auto* kfnStr = declareC("bz_dict_keys_str",
+                    llvm::Type::getVoidTy(llvm_),
+                    {ptrTy(), ptrTy(), ptrTy(), ptrTy()});
+                builder_.CreateCall(kfnStr,
+                    {recv, dtKeysOutSlot, dtLensOutSlot, dtCntSlot});
+                dtLensArr = builder_.CreateLoad(ptrTy(), dtLensOutSlot);
+            } else {
+                auto* kfn = declareC("bz_dict_keys_gen",
+                    llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy(), ptrTy()});
+                builder_.CreateCall(kfn, {recv, dtKeysOutSlot, dtCntSlot});
+            }
+            // fix #3720: the VALUES table is ALSO keyed by which internal
+            // hash table backs the dict — `bz_dict_values_str` for a
+            // string-keyed dict, `bz_dict_values_gen` otherwise (mirrors
+            // `lowerDictEntryFor`'s identical `isStringKey` branch on the
+            // values snapshot, LlvmBackend_Stmts.cpp). Calling the GENERIC
+            // values snapshot against a STRING-keyed dict's table is wrong
+            // (a different internal table / layout) — measured via probe:
+            // Key decoded correctly ("ab", Length=2) but Value read back 0
+            // (First) or garbage (Last/ElementAt) before this fix.
+            auto* vfn = declareC(dtIsStringKey ? "bz_dict_values_str"
+                                                : "bz_dict_values_gen",
                 llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy(), ptrTy()});
             builder_.CreateCall(vfn, {recv, dtValsOutSlot, entryAlloca(i64())});
             llvm::Value* dtKeysArr = builder_.CreateLoad(ptrTy(), dtKeysOutSlot);
@@ -7018,9 +7056,18 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // identical step). A key type `buildSortedKeyComparator` cannot
             // rank (returns null) leaves the snapshot unsorted, matching
             // what the for-in path already does for that same key type
-            // (#1426).
+            // (#1426). fix #3720: a string key sorts via `bz_sort_kv_str`
+            // (keys + lens + values together), mirroring the for-in path's
+            // own `isStringKey` sort branch.
             if (builtinTypeName(recvTy) == "SortedDictionary") {
-                if (llvm::Function* cmpFn = buildSortedKeyComparator(keyTy)) {
+                if (dtIsStringKey) {
+                    auto* sortStrFn = declareC("bz_sort_kv_str",
+                        llvm::Type::getVoidTy(llvm_),
+                        {ptrTy(), ptrTy(), ptrTy(), i64()});
+                    builder_.CreateCall(sortStrFn,
+                        {dtKeysArr, dtLensArr, dtValsArr, dtCnt});
+                } else if (llvm::Function* cmpFn =
+                               buildSortedKeyComparator(keyTy)) {
                     auto* sortFn = declareC("bz_sort_kv_gen",
                         llvm::Type::getVoidTy(llvm_),
                         {ptrTy(), ptrTy(), i64(), ptrTy()});
@@ -7035,10 +7082,17 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // raw-bytes copy `bz_dict_keys_gen` wrote at the ONE computed
             // index rather than a loop var — no separate heap ownership
             // survives the load, so freeing the blob below (for every index,
-            // including this one) is always safe.
+            // including this one) is always safe. fix #3720: a string key
+            // instead rebuilds a fresh, independently-owned `bz_string*` via
+            // `decodeDictStringKeyAt` (identical to the for-in loop's own
+            // per-iteration decode) — disposed at the bound local's scope
+            // end by the new `dictEntryKeyRelease` mechanism when eligible
+            // (see this arm's opening comment), or safely leaked otherwise.
             llvm::Value* dtKeyDecoded =
-                decodeDictGenericKeyAt(dtKeyLlvm, dtKeysArr, dtIdx,
-                                       "dictterm.kgen").first;
+                dtIsStringKey
+                    ? decodeDictStringKeyAt(dtKeysArr, dtLensArr, dtIdx).first
+                    : decodeDictGenericKeyAt(dtKeyLlvm, dtKeysArr, dtIdx,
+                                             "dictterm.kgen").first;
 
             // Decode the target value. fix #3758: decodeDictValueAt now
             // derives struct-vs-scalar from `dtValLlvm` itself (previously
@@ -7082,6 +7136,13 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 builder_.SetInsertPoint(fEnd);
             }
             builder_.CreateCall(dtFreeFn, {dtKeysArr});
+            // fix #3720: the string-key snapshot's per-key length array
+            // (`bz_dict_keys_str`'s 3rd out-param) is a SEPARATE malloc'd
+            // spine from `dtKeysArr`, freed by the for-in path's own endBB
+            // (`lensArr`) the same way — a generic key never allocates one
+            // (`dtLensArr` stays null).
+            if (dtIsStringKey)
+                builder_.CreateCall(dtFreeFn, {dtLensArr});
             builder_.CreateCall(dtFreeFn, {dtValsArr});
 
             // #1013-style reclaim: a fresh unbound Dictionary/SortedDictionary

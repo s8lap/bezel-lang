@@ -1736,6 +1736,24 @@ private:
         // the grouping pointer; bz_grouping_free is null-safe (an *OrNull empty
         // result is null). The class/collection/dict fields are unused.
         bool grouping = false;
+        // fix #3720 / stdlib §5 / §4.8 (v0.294): a plain `var`/`const` local
+        // bound directly to `dict.First()`/`.Last()`/`.Single()`/`.ElementAt(i)`
+        // over a Dictionary/SortedDictionary with a STRING key (the shape
+        // LlvmBackend_Calls.cpp's isDict block rebuilds a fresh,
+        // independently-owned `bz_string*` Key for). `slot` is the local's OWN
+        // 2-field `{K key; V value}` struct alloca (field 0 = Key); at scope
+        // end field 0 is loaded and `bz_string_release`d, then nulled (matching
+        // stringRelease/recordStringFields semantics). Registered ONLY for a
+        // local the StringEscapeWalker proved never escapes
+        // (dictEntryKeyReleaseEligible_, LlvmBackend_Setup.cpp's
+        // collectBorrowingArrayFreeEligible — the SAME type-agnostic walk
+        // #1930's `grouping` flag above reuses): nothing else holds the
+        // rebuilt string, so no UAF and no double-free. An escaping local is
+        // simply never registered — its rebuilt Key leaks (the pre-existing
+        // safe direction every sibling family in this file already falls
+        // back to for a runtime-managed value it cannot prove non-escaping).
+        // Fires on BOTH the normal and unwind exit, mirroring `grouping`.
+        bool dictEntryKeyRelease = false;
         // §35.4 (v0.200, #2045 stage 3): an OWNING-CLASSIFIED choice local
         // (a sum whose classification is Owning, e.g. one with an `owned`
         // payload slot per §35.4.1). At scope end the active case's owned
@@ -11586,6 +11604,13 @@ private:
               dictMaterializerFreeEligibleFn_(e.dictMaterializerFreeEligibleFn_),
               groupingFreeEligible_(e.groupingFreeEligible_),
               groupingFreeEligibleFn_(e.groupingFreeEligibleFn_),
+              // fix #3720: dictEntryKeyReleaseEligible_ is populated by the
+              // SAME collectBorrowingArrayFreeEligible call this scope
+              // guards, so it needs the identical save/restore protection
+              // (LANE_RULES §8's two-halves-of-one-contract rule) — see the
+              // member's own declaration comment.
+              dictEntryKeyReleaseEligible_(e.dictEntryKeyReleaseEligible_),
+              dictEntryKeyReleaseEligibleFn_(e.dictEntryKeyReleaseEligibleFn_),
               setLiteralFreeEligible_(e.setLiteralFreeEligible_),
               setLiteralFreeEligibleFn_(e.setLiteralFreeEligibleFn_),
               dictLiteralFreeEligible_(e.dictLiteralFreeEligible_),
@@ -11600,6 +11625,10 @@ private:
             e_.dictMaterializerFreeEligibleFn_ = dictMaterializerFreeEligibleFn_;
             e_.groupingFreeEligible_ = std::move(groupingFreeEligible_);
             e_.groupingFreeEligibleFn_ = groupingFreeEligibleFn_;
+            e_.dictEntryKeyReleaseEligible_ =
+                std::move(dictEntryKeyReleaseEligible_);           // fix #3720
+            e_.dictEntryKeyReleaseEligibleFn_ =
+                dictEntryKeyReleaseEligibleFn_;                    // fix #3720
             e_.setLiteralFreeEligible_ = std::move(setLiteralFreeEligible_);
             e_.setLiteralFreeEligibleFn_ = setLiteralFreeEligibleFn_;
             e_.dictLiteralFreeEligible_ = std::move(dictLiteralFreeEligible_);
@@ -11619,6 +11648,8 @@ private:
         llvm::Function* dictMaterializerFreeEligibleFn_;
         std::unordered_set<const void*> groupingFreeEligible_;
         llvm::Function* groupingFreeEligibleFn_;
+        std::unordered_set<const void*> dictEntryKeyReleaseEligible_;  // #3720
+        llvm::Function* dictEntryKeyReleaseEligibleFn_;                // #3720
         std::unordered_set<const void*> setLiteralFreeEligible_;
         llvm::Function* setLiteralFreeEligibleFn_;
         std::unordered_set<const void*> dictLiteralFreeEligible_;
@@ -12950,6 +12981,22 @@ private:
     // walk, separate set because groupings free via bz_grouping_free).
     std::unordered_set<const void*> groupingFreeEligible_;
     llvm::Function* groupingFreeEligibleFn_ = nullptr;
+    // fix #3720 / stdlib §5 / §4.8 (v0.294): the DictionaryEntry-Key analog of
+    // groupingFreeEligible_ just above — plain `var`/`const` locals bound
+    // directly to `dict.First()`/`.Last()`/`.Single()`/`.ElementAt(i)` over a
+    // STRING-keyed Dictionary/SortedDictionary (isFreshDictEntryKeyRelease
+    // TerminalLocal), whose rebuilt `bz_string*` Key the type-agnostic escape
+    // walk (StringEscapeWalker) proves never escapes. Membership arms a
+    // scope-end release of the entry struct's field-0 string
+    // (LlvmBackend_Disposal.cpp's `dictEntryKeyRelease` Disposal — see that
+    // flag's own declaration comment). An escaping local is excluded → the
+    // rebuilt Key just leaks (the same safe direction groupingFreeEligible_
+    // falls back to: never a UAF, never a double-free with a consumer that
+    // took the string elsewhere). Populated alongside borrowingArrayFree
+    // Eligible_ (same escape walk, separate set because this releases ONE
+    // struct field via bz_string_release, not a whole-object free).
+    std::unordered_set<const void*> dictEntryKeyReleaseEligible_;
+    llvm::Function* dictEntryKeyReleaseEligibleFn_ = nullptr;
     // #2142 / §28.9 / §28.11: the Set<T> analog of borrowingArrayFreeEligible_ —
     // plain `var s: Set<T> := [ ... ]` collection-literal locals (dict-backed,
     // bz_dict_t*) that the type-agnostic escape walk proves never escape. Set<T>
@@ -13125,6 +13172,23 @@ private:
     // end when non-escaping). Takes a view (not a LocalDecl) so a §21.1
     // `const` local (LocalConstDecl) is recognized identically — fix #2802.
     bool isFreshGroupingTerminalLocal(const LocalDeclInitView& view) const;
+    // fix #3720 / stdlib §5 / §4.8 (v0.294): true if the local described by
+    // `view` is a plain `var`/`const fe := d.First()/.Last()/.Single()/
+    // .ElementAt(i)` whose result type is the synthetic (declaration-less)
+    // `DictionaryEntry<string, V>` — the STRING-keyed shape LlvmBackend_
+    // Calls.cpp's isDict block rebuilds a fresh, independently-owned
+    // `bz_string*` Key for. Mirrors isFreshGroupingTerminalLocal immediately
+    // above (same result-type-then-call-shape recognition pattern), plus an
+    // explicit receiver-type check (isDictTypeName) so this predicate can
+    // NEVER admit the unrelated shape of the SAME method name called on an
+    // `Array<DictionaryEntry<string,V>>` (e.g. `dict.ToArray().First()`,
+    // lowered by the generic array-terminal block, a completely different
+    // code path with its own ownership story) — that receiver-type gate is
+    // load-bearing: without it this predicate would register a disposal for
+    // a value this fix's codegen arm never produced, risking a double-free
+    // or UAF against whatever DOES own that other path's Key.
+    bool isFreshDictEntryKeyReleaseTerminalLocal(
+        const LocalDeclInitView& view) const;
     // #1871 / §28.9 / §28.11: true if the local described by `view` is a plain
     // `var xs: Array<T> := [ ... ]` (a borrowing `Array<T>` local initialised by
     // a collection literal) whose element policy is backing-only (null per-

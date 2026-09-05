@@ -9208,6 +9208,10 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
     // lowerLocalDecl (mirrors borrowingArrayFreeEligible_).
     groupingFreeEligible_.clear();
     groupingFreeEligibleFn_ = fn;
+    // fix #3720: DictionaryEntry-Key-release eligibility, populated by the
+    // same pass (mirrors groupingFreeEligible_ just above).
+    dictEntryKeyReleaseEligible_.clear();
+    dictEntryKeyReleaseEligibleFn_ = fn;
     // #2142: Set<T>-literal eligibility, populated by the same pass.
     setLiteralFreeEligible_.clear();
     setLiteralFreeEligibleFn_ = fn;
@@ -15432,6 +15436,23 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
         !disposeStack_.empty()) {
         Disposal d{slot, nullptr};
         d.grouping = true;
+        disposeStack_.back().push_back(d);
+    }
+    // fix #3720 / stdlib §5 / §4.8: a plain `var`/`const fe := d.First()/…`
+    // over a STRING-keyed Dictionary/SortedDictionary, proven non-escaping,
+    // holds the SOLE reference to the rebuilt `bz_string*` Key
+    // (LlvmBackend_Calls.cpp's isDict block). Release it at scope end via
+    // `dictEntryKeyRelease` (GEP field 0 off `slot` — the local's own 2-field
+    // `{K,V}` struct alloca — + `bz_string_release`, LlvmBackend_
+    // Disposal.cpp's `emitDisposals`). Gated on currentFn_ matching the
+    // analyzed function (a lambda/thunk body inherits no eligibility → the
+    // rebuilt Key just leaks, never double-freed), mirroring every other
+    // consumer of this eligibility family.
+    if (v && currentFn_ == dictEntryKeyReleaseEligibleFn_ &&
+        dictEntryKeyReleaseEligible_.count(static_cast<const void*>(declNode)) &&
+        !disposeStack_.empty()) {
+        Disposal d{slot, nullptr};
+        d.dictEntryKeyRelease = true;
         disposeStack_.back().push_back(d);
     }
     // fix #1747 / §28.9 / §9.7 / §28.3: if this plain `var` RECORD local was
@@ -26524,6 +26545,58 @@ bool Emitter::isFreshGroupingTerminalLocal(const LocalDeclInitView& view) const 
 }
 
 
+// fix #3720 / stdlib §5 / §4.8 (v0.294): see the declaration comment in
+// LlvmBackend_impl.hpp. Unlike isFreshGroupingTerminalLocal just above, this
+// predicate does NOT require `rt->astNode` non-null: the DictionaryEntry
+// synthetic TypeRef ExprTypecheck_Calls.cpp builds for these four call names
+// sets `astNode = nullptr` and carries the type name in `importedName`
+// instead (`entryTy->importedName = "DictionaryEntry"`) — `headName()`
+// (TypeRef.hpp) already falls back to `importedName` when `astNode` is null,
+// so checking `headName()` directly (without the astNode pre-check) is the
+// correct, general read for THIS synthetic type's construction shape.
+bool Emitter::isFreshDictEntryKeyReleaseTerminalLocal(
+        const LocalDeclInitView& view) const {
+    if (view.isUsing || !view.init) return false;
+    // Result type must be the synthetic (declaration-less) DictionaryEntry
+    // with a non-nullable `string` Key (K) — the shape LlvmBackend_Calls.cpp's
+    // isDict block rebuilds a fresh, independently-owned bz_string* Key for.
+    // A non-string K reaches the SAME codegen arm but decodes via a plain
+    // value LOAD with no separate heap ownership (decodeDictGenericKeyAt) —
+    // nothing to release here, so this predicate correctly excludes it.
+    const sema::TypeRef* rt = ctx_.exprType(*view.init);
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
+        return false;
+    if (rt->headName() != "DictionaryEntry") return false;
+    if (rt->genericArgs.size() < 2 || !rt->genericArgs[0]) return false;
+    const sema::TypeRef* kt = rt->genericArgs[0];
+    if (kt->kind != sema::TypeRef::Kind::Primitive ||
+        kt->primitive != sema::PrimitiveType::String || kt->nullable)
+        return false;
+    // The initializer must be a terminal CALL to exactly one of the four
+    // method names LlvmBackend_Calls.cpp's isDict block lowers this way,
+    // over a Dictionary/SortedDictionary receiver — mirrors that arm's own
+    // `(m == "First" || m == "Last" || m == "Single") || (m == "ElementAt" &&
+    // call.args.size() == 1 && call.args[0].value)` condition exactly, plus
+    // the explicit isDictTypeName receiver-type gate (see this function's
+    // declaration comment for why that gate is load-bearing: without it, the
+    // SAME method names called on an unrelated `Array<DictionaryEntry<
+    // string,V>>` receiver — a completely different codegen path with its
+    // own ownership story — would also match on result type alone).
+    auto* call = dynamic_cast<const ast::CallExpr*>(view.init);
+    if (!call || !call->callee) return false;
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call->callee.get());
+    if (!ma || !ma->target) return false;
+    const sema::TypeRef* recvTy = ctx_.exprType(*ma->target);
+    if (!recvTy || !isDictTypeName(recvTy)) return false;
+    std::string_view mm = ma->member;
+    if (mm == "First" || mm == "Last" || mm == "Single")
+        return call->args.empty();
+    if (mm == "ElementAt")
+        return call->args.size() == 1 && call->args[0].value != nullptr;
+    return false;
+}
+
+
 // #1004 / stdlib §5 / §3 / §28: is `e` an EXPRESSION codegen lowers to a FRESH,
 // OWNERLESS `Array<T>` temporary — i.e. a fresh-array materializer call
 // (`recv.ToArray()`, `recv.Sorted(...)`, or `recv.Reversed()`) whose result is
@@ -26826,6 +26899,7 @@ void Emitter::collectBorrowingArrayFreeEligible(
     borrowingArrayFreeEligible_.clear();
     dictMaterializerFreeEligible_.clear();  // #1028
     groupingFreeEligible_.clear();          // #1930
+    dictEntryKeyReleaseEligible_.clear();    // #3720
     setLiteralFreeEligible_.clear();        // #2142
     dictLiteralFreeEligible_.clear();       // #2143
     literalTreeAggregateEligible_.clear();  // #2660
@@ -26833,6 +26907,7 @@ void Emitter::collectBorrowingArrayFreeEligible(
     std::vector<const ast::Node*> candidates;
     std::vector<const ast::Node*> dictCandidates;  // #1028
     std::vector<const ast::Node*> groupingCandidates;  // #1930
+    std::vector<const ast::Node*> dictEntryKeyCandidates;  // #3720
     std::vector<const ast::Node*> setLiteralCandidates;   // #2142
     std::vector<const ast::Node*> dictLiteralCandidates;  // #2143
     std::vector<const ast::Node*> aggregateCandidates;    // #2660
@@ -26873,6 +26948,14 @@ void Emitter::collectBorrowingArrayFreeEligible(
             // never reaches here (IGrouping has no user Dispose; it is a plain `var`).
             if (isFreshGroupingTerminalLocal(v))
                 groupingCandidates.push_back(node);
+            // fix #3720 / stdlib §5 / §4.8: a plain `var`/`const fe :=
+            // d.First()/.Last()/.Single()/.ElementAt(i)` over a STRING-keyed
+            // Dictionary/SortedDictionary — independent candidacy test
+            // (mirrors the grouping check just above), since this result
+            // type can never also match the array/dict/set/literal shapes
+            // the if/else chain below tests.
+            if (isFreshDictEntryKeyReleaseTerminalLocal(v))
+                dictEntryKeyCandidates.push_back(node);
             if (isFreshBorrowingArrayMaterializerLocal(v))
                 candidates.push_back(node);
             // #1871 / §28.9 / §28.11: a plain `var xs: Array<T> := [ ... ]` — a
@@ -26980,6 +27063,26 @@ void Emitter::collectBorrowingArrayFreeEligible(
         for (auto& s : body) { w.stmt(s.get()); if (w.escaped) break; }
         if (!w.escaped)
             groupingFreeEligible_.insert(static_cast<const void*>(ld));
+    }
+    // fix #3720 / stdlib §5 / §4.8: the same conservative type-agnostic escape
+    // walk for DictionaryEntry-Key-release candidates. A local proven never to
+    // escape holds the SOLE reference to the rebuilt `bz_string*` Key
+    // (LlvmBackend_Calls.cpp's isDict block mints exactly one +1 owner per
+    // call, no aliasing), so a scope-end `bz_string_release` of the entry
+    // struct's field 0 runs exactly once (no UAF, no double-free). Default
+    // (non-recordFieldReleaseMode) walker rules already treat a bare
+    // `.Key`/`.Value` MemberAccessExpr receiver read as safe — DictionaryEntry
+    // has no user-written method that could stash `this` elsewhere, so no
+    // extra mode is needed (see this arm's own declaration comment,
+    // LlvmBackend_impl.hpp). An escaping local (returned, stored into a
+    // field/collection, captured by a closure, reassigned, passed elsewhere)
+    // is simply excluded — the rebuilt Key then leaks (the safe direction,
+    // identical to groupingFreeEligible_ just above).
+    for (const ast::Node* ld : dictEntryKeyCandidates) {
+        StringEscapeWalker w{ctx_, static_cast<const void*>(ld)};
+        for (auto& s : body) { w.stmt(s.get()); if (w.escaped) break; }
+        if (!w.escaped)
+            dictEntryKeyReleaseEligible_.insert(static_cast<const void*>(ld));
     }
     // #2142 / §28.9 / §28.11: same conservative escape walk as the Array-literal
     // pass above (borrowingArrayMode, safeViewAliases) — Set<T> is a borrowing-

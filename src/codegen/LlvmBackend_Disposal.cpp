@@ -5414,6 +5414,33 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
             builder_.CreateCall(gfree, {g});
             continue;
         }
+        // fix #3720 / stdlib §5 / §4.8 (v0.294): a provably-non-escaping
+        // `var`/`const fe := d.First()/.Last()/.Single()/.ElementAt(i)` local
+        // over a STRING-keyed Dictionary/SortedDictionary. `slot` holds the
+        // entry's OWN 2-field `{K key; V value}` struct (field 0 = Key, a
+        // freshly-rebuilt `bz_string*` with a lone +1 — LlvmBackend_
+        // Calls.cpp's isDict block mints exactly one per call, no aliasing;
+        // see dictEntryKeyReleaseEligible_'s declaration comment,
+        // LlvmBackend_impl.hpp). Release field 0 at scope end — on BOTH the
+        // normal and unwind exit (the reference dies either way; a given
+        // exit goes one way only, so exactly once per exit) — then null it
+        // (matching stringRelease/recordStringFields semantics, a few arms
+        // above/below). The local was proven non-escaping, so nothing else
+        // holds the string: bz_string_release frees it exactly once (no UAF,
+        // no double-free). bz_string_release is null-/sentinel-safe.
+        if (it->dictEntryKeyRelease) {
+            if (auto* st = llvm::dyn_cast_or_null<llvm::StructType>(
+                    it->slot->getAllocatedType())) {
+                llvm::Value* keyAddr =
+                    builder_.CreateStructGEP(st, it->slot, 0, "dictek.addr");
+                llvm::Value* keyVal =
+                    builder_.CreateLoad(ptrTy(), keyAddr, "dictek.val");
+                emitStringRelease(keyVal);
+                builder_.CreateStore(
+                    llvm::ConstantPointerNull::get(ptrTy()), keyAddr);
+            }
+            continue;
+        }
         // #422 / #2960 / §8.6 / §28.9: a provably-non-escaping `var`
         // Object/interface local whose box-vs-class contents are tracked by the
         // placement layer. Reassignable slots carry `boxReleaseState`: release

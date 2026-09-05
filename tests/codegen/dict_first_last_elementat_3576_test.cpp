@@ -33,15 +33,26 @@
 // InvalidOperationException for First/Last; out of range ->
 // IndexOutOfRangeException for ElementAt, stdlib §5 line 3594).
 //
-// NARROWED OFF: a STRING key. Measured (200x under ASan/LSan): the entry's
-// VALUE is correct, but the rebuilt `bz_string` Key leaks on every call — a
-// `DictionaryEntry<K,V>` is a SYNTHETIC TypeRef (no TypeSymbol, no field
-// list), so the general per-local disposal pass cannot know to release it,
-// and unlike the for-in loop / the LINQ materializer (which each thread that
-// release through their OWN consumption shape — a loop body, a wrapped
-// array), a plain local bound to `d.First()`'s result has no such hook. This
-// fix rejects that shape LOUDLY (a diagnostic) instead of shipping the leak;
-// #3720 is the sema-side fix (give `DictionaryEntry` a real field list).
+// NARROWED OFF (AT THE TIME THIS FIX LANDED): a STRING key. Measured (200x
+// under ASan/LSan): the entry's VALUE was correct, but the rebuilt
+// `bz_string` Key leaked on every call — a `DictionaryEntry<K,V>` is a
+// SYNTHETIC TypeRef (no TypeSymbol, no field list), so the general per-local
+// disposal pass could not know to release it, and unlike the for-in loop /
+// the LINQ materializer (which each thread that release through their OWN
+// consumption shape — a loop body, a wrapped array), a plain local bound to
+// `d.First()`'s result had no such hook. This fix originally rejected that
+// shape LOUDLY (a diagnostic) instead of shipping the leak.
+//
+// #3720 HAS SINCE LANDED (v0.294). Rather than a real TypeSymbol/field list
+// for the synthetic type, it added a ONE-OFF disposal special-case mirroring
+// the pre-existing #1930 grouping-terminal precedent: a plain `var`/`const`
+// local bound directly to `d.First()/.Last()/.Single()/.ElementAt(i)` whose
+// result type is `DictionaryEntry<string, V>`, proven non-escaping by the
+// SAME type-agnostic `StringEscapeWalker` #1930 reuses, is released at scope
+// end (LlvmBackend_Disposal.cpp's `dictEntryKeyRelease`; see
+// `isFreshDictEntryKeyReleaseTerminalLocal`'s declaration, LlvmBackend_
+// impl.hpp). The string-key reject below is GONE — see the "String key" test
+// section for the value + ASan-clean coverage that replaces it.
 //
 // SORTEDDICTIONARY AND OWNINGDICTIONARY WERE NOT COVERED BY THIS COMMIT AT
 // THE TIME IT LANDED — measured, not assumed, and unrelated to the
@@ -73,8 +84,8 @@
 // wrong key or a wrong value both move the number). `runAotChecked` proves
 // the per-key snapshot free-loop this fix adds does not leak or double-free
 // the malloc'd raw-key blobs, looped 200x under ASan/LSan per LANE_RULES —
-// and that the string-key reject fires with NO allocation at all (so it
-// cannot leak either).
+// and (fix #3720) that the rebuilt string-key `bz_string*` is released
+// exactly once for a non-escaping local, with the same 200x amplification.
 //
 // REVIEW AMENDMENT (c6-b12-review, NEEDS-FIX). Two findings, both fixed here:
 //
@@ -157,13 +168,6 @@ bool wasSkipped(const JitResult& r) {
 
 bool has(const std::string& hay, const char* needle) {
     return hay.find(needle) != std::string::npos;
-}
-
-bool hasError(const std::string& program, const std::string& needle) {
-    auto r = runAot(program);
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find(needle) != std::string::npos) return true;
-    return false;
 }
 
 }  // namespace
@@ -469,37 +473,140 @@ BEZEL_TEST(dict_first_last_elementat_3576, dictionary_record_key_snapshot_no_lea
 }
 
 // ---------------------------------------------------------------------------
-// String key — narrowed off, rejected loudly (no leak, no allocation at all)
+// String key — fix #3720: First()/Last()/Single()/ElementAt(i) now work, and
+// a non-escaping local's rebuilt Key is released exactly once (0 leak).
 // ---------------------------------------------------------------------------
 
-// A string key must not reach this arm's lowering at all: the reject fires
-// BEFORE any snapshot/malloc happens, so this is 0 allocations, not a freed
-// one — the strongest form of "no leak" for the shape this fix declines.
-BEZEL_TEST(dict_first_last_elementat_3576, dictionary_string_key_first_rejected_loudly_3720) {
-    BEZEL_EXPECT_TRUE(hasError(prog(
-        "var d := new Dictionary<string, int>(); "
-        "d.Add(\"a\", 1); "
-        "var fe := d.First(); "
-        "return fe.Key.Length; "),
-        "over a string-keyed Dictionary/SortedDictionary is not yet supported"));
+// A single-entry Dictionary so First()/Last()/ElementAt(0) all resolve to
+// the SAME entry regardless of Dictionary's hash-ordering (no ordering
+// ambiguity to reason about — unlike the multi-entry int-keyed rows above,
+// which rely on insertion order that only Dictionary, not SortedDictionary,
+// preserves). 200x under ASan/LSan: FAILS pre-#3720 (the loud reject fired,
+// so this row could not even be written then) and on any regression that
+// reintroduces the leak (the pre-#3720 issue measured 7000 B / 400
+// allocations at this amplification, for ONE such local); PASSES clean here,
+// with THREE independent locals (fe/le/ea) each getting their own release.
+BEZEL_TEST(dict_first_last_elementat_3576, dictionary_string_key_first_last_element_at_no_leak_3720) {
+    const std::string src =
+        "module M; class C public static method Main(): int "
+        "  var total := 0; var i := 0; "
+        "  while i < 200 do "
+        "    var d := new Dictionary<string, int>(); "
+        "    d.Add(\"ab\", 15); "
+        "    var fe := d.First(); "
+        "    var le := d.Last(); "
+        "    var ea := d.ElementAt(0); "
+        "    total := total + fe.Key.Length + fe.Value + "
+        "                     le.Key.Length + le.Value + "
+        "                     ea.Key.Length + ea.Value; "
+        "    i := i + 1; "
+        "  end while; "
+        "  Console.WriteLine($\"total={total}\"); "
+        "  return 0; "
+        "end Main; end C;";
+    JitResult r = runAotChecked(src);
+    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_TRUE(r.ran);
+    // 200 x 3 x (2 + 15) == 10200.
+    BEZEL_EXPECT_TRUE(has(r.stdoutText, "total=10200"));
 }
 
-BEZEL_TEST(dict_first_last_elementat_3576, dictionary_string_key_last_rejected_loudly_3720) {
-    BEZEL_EXPECT_TRUE(hasError(prog(
-        "var d := new Dictionary<string, int>(); "
-        "d.Add(\"a\", 1); "
-        "var le := d.Last(); "
-        "return le.Key.Length; "),
-        "over a string-keyed Dictionary/SortedDictionary is not yet supported"));
+// stdlib §5 line 3594: Single() over a one-entry string-keyed Dictionary —
+// same isDict arm, same disposal mechanism, exact-count oracle. 200x under
+// ASan/LSan.
+BEZEL_TEST(dict_first_last_elementat_3576, dictionary_string_key_single_no_leak_3720) {
+    const std::string src =
+        "module M; class C public static method Main(): int "
+        "  var total := 0; var i := 0; "
+        "  while i < 200 do "
+        "    var d := new Dictionary<string, int>(); "
+        "    d.Add(\"xy\", 7); "
+        "    var fe := d.Single(); "
+        "    total := total + fe.Key.Length + fe.Value; "
+        "    i := i + 1; "
+        "  end while; "
+        "  Console.WriteLine($\"total={total}\"); "
+        "  return 0; "
+        "end Main; end C;";
+    JitResult r = runAotChecked(src);
+    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_TRUE(has(r.stdoutText, "total=1800"));  // 200 x (2 + 7)
 }
 
-BEZEL_TEST(dict_first_last_elementat_3576, dictionary_string_key_element_at_rejected_loudly_3720) {
-    BEZEL_EXPECT_TRUE(hasError(prog(
-        "var d := new Dictionary<string, int>(); "
-        "d.Add(\"a\", 1); "
-        "var ea := d.ElementAt(0); "
-        "return ea.Key.Length; "),
-        "over a string-keyed Dictionary/SortedDictionary is not yet supported"));
+// fix #3720 / stdlib §4.17: SortedDictionary<string,int> — ascending-key
+// order (bz_sort_kv_str), string-keyed Key rebuild + release. 200x under
+// ASan/LSan.
+BEZEL_TEST(dict_first_last_elementat_3576, sorted_dictionary_string_key_ascending_no_leak_3720) {
+    const std::string src =
+        "module M; class C public static method Main(): int "
+        "  var total := 0; var i := 0; "
+        "  while i < 200 do "
+        "    var sd := new SortedDictionary<string, int>(); "
+        "    sd.Add(\"c\", 30); sd.Add(\"a\", 10); sd.Add(\"b\", 20); "
+        "    var fe := sd.First(); var le := sd.Last(); "
+        "    total := total + int(fe.Key = \"a\") * 100 + fe.Value + "
+        "                     int(le.Key = \"c\") * 100 + le.Value; "
+        "    i := i + 1; "
+        "  end while; "
+        "  Console.WriteLine($\"total={total}\"); "
+        "  return 0; "
+        "end Main; end C;";
+    JitResult r = runAotChecked(src);
+    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_TRUE(r.ran);
+    // 200 x (100 + 10 + 100 + 30) == 48000; a wrong (unsorted) order drops
+    // one or both `int(... = ...)` terms to 0.
+    BEZEL_EXPECT_TRUE(has(r.stdoutText, "total=48000"));
+}
+
+// fix #3720 soundness control: an ESCAPING local (`fe` passed BY VALUE as an
+// ordinary call argument, then read again in its OWN scope afterward) must
+// NOT be corrupted or use-after-freed by the disposal this fix adds. Passing
+// a bare identifier as a call argument is not a recognized "safe read" in
+// StringEscapeWalker's default rule (`walkCallArgs`'s conservative treatment
+// of the shared walker every candidate in this family reuses — no relaxation
+// was added for a DictionaryEntry-typed argument), so `fe` is excluded from
+// `dictEntryKeyReleaseEligible_` and never disposed — its rebuilt Key leaks
+// (confirmed separately via an ASan/LSan probe: 35 B / 2 allocations
+// leaked, no UAF, no overflow — the safe direction), but the VALUE stays
+// correct on every subsequent read.
+//
+// NOTE: an escape via RETURNING the entry itself, or via a closure that
+// CAPTURES it and is invoked after the producing method returns, would be
+// even sharper regression coverage for this property — but both are
+// currently broken for `DictionaryEntry<K,V>` for reasons UNRELATED to this
+// fix: returning one hits the pre-existing "#2491 return-value expression
+// failed to lower" degradation this file's header comment already documents
+// (measured against a non-string key too), and a closure that captures one
+// across a returning method boundary reads back garbage regardless of key
+// type (measured: `Dictionary<int,int>.First()` — no disposal involved at
+// all — also reads garbage through such a closure, and a STRING key
+// additionally trips a real `AddressSanitizer: stack-buffer-overflow` in the
+// closure's own body; filed as #3876, closure-capture-of-a-declaration-less-
+// TypeRef being a distinct bug from this one). This row is deliberately the
+// NARROWER, currently-working escape shape instead.
+BEZEL_TEST(dict_first_last_elementat_3576, dictionary_string_key_escaping_via_call_arg_stays_correct_3720) {
+    const std::string src =
+        "module M; "
+        "class C "
+        "  public static method Consume(e: DictionaryEntry<string, int>): int "
+        "    return e.Key.Length + e.Value; "
+        "  end Consume; "
+        "  public static method Main(): int "
+        "    var d := new Dictionary<string, int>(); "
+        "    d.Add(\"xy\", 9); "
+        "    var fe := d.First(); "
+        "    var r := Consume(fe); "
+        "    Console.WriteLine($\"consumed={r} stillKey={fe.Key} stillValue={fe.Value}\"); "
+        "    return 0; "
+        "  end Main; "
+        "end C;";
+    JitResult r = runAot(src);
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_TRUE(has(r.stdoutText, "consumed=11"));
+    BEZEL_EXPECT_TRUE(has(r.stdoutText, "stillKey=xy"));
+    BEZEL_EXPECT_TRUE(has(r.stdoutText, "stillValue=9"));
 }
 
 // The string-value (non-string-key) case is NOT narrowed off — the leak is
