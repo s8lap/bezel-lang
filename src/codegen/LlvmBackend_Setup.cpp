@@ -25185,12 +25185,215 @@ struct ClosureEscapeWalker {
     // and armsBindingsSafe (below) is sound for the same reason #2450's is.
     bool scrutineeBorrowMode = false;
 
-    bool isTargetIdent(const ast::Expr* e) {
+    // fix #3805 (§27.5 / §15.3 / §28.9, v0.294): a plain occurrence counter,
+    // incremented once per CALLEE-position occurrence of `target` (a
+    // non-escaping "safe read" by this walker's own rules). `escaped` alone
+    // cannot distinguish "target is called exactly once" from "target is
+    // called N>1 times, all as safe reads" — a set-based classification (as
+    // `capturedByEscaping` et al. use) collapses that multiplicity the same
+    // way. collectCellFreeEligible's transparent-forwarding-chain check
+    // (fix #3805) needs the true count: two calls to the SAME forwarding
+    // lambda create two independent inner closures sharing the SAME boxed
+    // cell for whatever they capture, and only an exactly-one count rules
+    // out a second instance outliving the first's disposal.
+    int calleeCallCount = 0;
+    // fix #3805 follow-up (review NEEDS-FIX): `calleeCallCount` above only
+    // recognized a BARE-IDENTIFIER callee (`isTargetIdent(c->callee.get())`
+    // checked directly). `ClosureEscapeWalker`'s own ConditionalExpr arm
+    // forwards `safeRead` unchanged into BOTH branches, so a callee reached
+    // through a `(if … then … else …)` atom (grammar A.7 `IfExpr`,
+    // `src/parser/Parser_Exprs.cpp` `parseIfExprAtom`) — e.g. `(if cond
+    // then L else other end)()` — is ALSO a safe, non-escaping read of `L`
+    // by the walker's existing rules, yet the old counter never saw it:
+    // `calleeCallCount` stayed at whatever the OTHER, bare-identifier call
+    // sites contributed, silently UNDER-counting. This flag records whether
+    // ANY callee position was reached through a shape this walker cannot
+    // structurally attribute a call count to (scanCalleePosition below
+    // recognizes exactly two countable shapes — a bare identifier and an
+    // if-expression atom recursing into both branches — and sets this flag
+    // for anything else that still contains `target`). The admission gate
+    // in collectCellFreeEligible requires `!uncountableCalleeSeen` in
+    // addition to `calleeCallCount == 1`: refusing to claim an uncountable
+    // shape is always safe, where guessing a count is not.
+    bool uncountableCalleeSeen = false;
+
+    bool isTargetIdent(const ast::Expr* e) const {
         auto* id = dynamic_cast<const ast::IdentifierExpr*>(e);
         if (!id) return false;
         auto* loc = dynamic_cast<sema::LocalSymbol*>(ctx.exprSymbol(*id));
         return loc && loc->decl &&
                static_cast<const void*>(loc->decl) == target;
+    }
+
+    // fix #3805 follow-up #2 (review NEEDS-FIX, delta re-review): does
+    // `target` occur ANYWHERE within `e`, or can its ABSENCE not be proven?
+    // A prior revision of this helper answered by running a scratch
+    // `ClosureEscapeWalker` over `e` and reading back ITS `escaped` flag —
+    // which means its answer was only as complete as `expr()`'s own
+    // dispatch, and the delta review found and reproduced (by direct ASan
+    // repro) a live heap-use-after-free through exactly the ONE node kind
+    // that dispatch had NO arm for at all (`BindExpr`, §17.15). Delegating
+    // to that same dispatch would have reproduced the identical class of
+    // bug in a second place.
+    //
+    // This is therefore now a SEPARATE, self-contained walk — independent
+    // of `expr()`'s coverage, present or future — enumerated by hand
+    // against the COMPLETE `ast::Expr` hierarchy (32 structs total,
+    // `src/ast/Node.hpp`; verified via `grep -n '^struct .*: Expr\b' src/ast/*.hpp`,
+    // the same command reproduced in this fix's commit body alongside the
+    // per-kind disposition). Every kind falls into exactly one of three
+    // buckets:
+    //   (a) IdentifierExpr — the one kind that answers `target` directly:
+    //       true when it names `target`, false otherwise (it has no
+    //       children of its own, so a NON-matching identifier is provably
+    //       absent, same as bucket (b) below — kept as its own bucket only
+    //       because `isTargetIdent` already special-cases it above).
+    //   (b) A LEAF with provably NO Expr children (8 literal/atom kinds,
+    //       plus TypeOfExpr/NameOfExpr/DefaultExpr whose only child is a
+    //       Type or QualifiedName, never a value-producing Expr) — `target`
+    //       (a runtime VALUE) cannot be reached through any of these,
+    //       structurally or semantically; returns false.
+    //   (c) A COMPOSITE with every Expr-typed child enumerated by hand and
+    //       recursed into — 17 kinds, BindExpr among them (the fix).
+    // Anything NOT in one of these three buckets — CaseExpr's Block-form
+    // arms (would need a parallel Stmt walker this helper deliberately does
+    // not have), LambdaExpr (a nested lambda's body is DELIBERATELY not
+    // descended into — its mere presence is already conservative
+    // territory), MarkedTransferExpr (`owned x`; no Expr child to compare
+    // against `target`'s resolved symbol, so structural absence cannot be
+    // shown even though it holds only a name — see the commit body for why
+    // `move x`, the OTHER transfer spelling, is a plain UnaryExpr and
+    // already covered by bucket (c)), and any FUTURE Expr kind not yet
+    // added to this enumeration — falls through to the final `return true`:
+    // NOT PROVEN ABSENT, the review's demanded default. A caller that reads
+    // this as "uncountable, decline" is always safe; one that reads a false
+    // "not present" here is not.
+    bool containsTargetAnywhere(const ast::Expr* e) const {
+        if (!e) return false;
+        if (isTargetIdent(e)) return true;
+        // (b) LEAVES — no Expr children. An IdentifierExpr that reached
+        // here already failed `isTargetIdent` above — a DIFFERENT bare
+        // name (or the same name resolving to a DIFFERENT symbol) cannot
+        // itself hide `target` (it has no sub-expressions of its own), so
+        // it belongs in this bucket, not the final catch-all — a bug this
+        // fix's own bisection caught: without this line, EVERY reference to
+        // any OTHER local anywhere in a scanned body (e.g. `return inner();`
+        // reading `inner`, not `target`) fell through to "not proven
+        // absent" and wrongly declined the admission for every candidate.
+        if (dynamic_cast<const ast::IdentifierExpr*>(e)) return false;
+        if (dynamic_cast<const ast::IntLiteralExpr*>(e)) return false;
+        if (dynamic_cast<const ast::FloatLiteralExpr*>(e)) return false;
+        if (dynamic_cast<const ast::CharLiteralExpr*>(e)) return false;
+        if (dynamic_cast<const ast::StringLiteralExpr*>(e)) return false;
+        if (dynamic_cast<const ast::VerbatimStringExpr*>(e)) return false;
+        if (dynamic_cast<const ast::BoolLiteralExpr*>(e)) return false;
+        if (dynamic_cast<const ast::NullLiteralExpr*>(e)) return false;
+        if (dynamic_cast<const ast::UnitExpr*>(e)) return false;
+        if (dynamic_cast<const ast::TypeOfExpr*>(e)) return false;
+        if (dynamic_cast<const ast::NameOfExpr*>(e)) return false;
+        if (dynamic_cast<const ast::DefaultExpr*>(e)) return false;
+        // (c) COMPOSITES — every Expr child recursed into.
+        if (auto* is2 = dynamic_cast<const ast::InterpolatedStringExpr*>(e)) {
+            for (auto& part : is2->parts)
+                if (containsTargetAnywhere(part.expr.get())) return true;
+            return false;
+        }
+        if (auto* m = dynamic_cast<const ast::MemberAccessExpr*>(e))
+            return containsTargetAnywhere(m->target.get());
+        if (auto* m = dynamic_cast<const ast::NullCondMemberExpr*>(e))
+            return containsTargetAnywhere(m->target.get());
+        if (auto* c = dynamic_cast<const ast::CallExpr*>(e)) {
+            if (containsTargetAnywhere(c->callee.get())) return true;
+            for (auto& a : c->args)
+                if (containsTargetAnywhere(a.value.get())) return true;
+            return false;
+        }
+        if (auto* c = dynamic_cast<const ast::NullCondCallExpr*>(e)) {
+            if (containsTargetAnywhere(c->callee.get())) return true;
+            for (auto& a : c->args)
+                if (containsTargetAnywhere(a.value.get())) return true;
+            return false;
+        }
+        if (auto* ix = dynamic_cast<const ast::IndexExpr*>(e)) {
+            if (containsTargetAnywhere(ix->target.get())) return true;
+            for (auto& a : ix->indices)
+                if (containsTargetAnywhere(a.value.get())) return true;
+            return false;
+        }
+        if (auto* p = dynamic_cast<const ast::PostfixBangExpr*>(e))
+            return containsTargetAnywhere(p->operand.get());
+        if (auto* n = dynamic_cast<const ast::NewExpr*>(e)) {
+            for (auto& a : n->args)
+                if (containsTargetAnywhere(a.value.get())) return true;
+            return false;
+        }
+        if (auto* b = dynamic_cast<const ast::BinaryExpr*>(e))
+            return containsTargetAnywhere(b->left.get()) ||
+                   containsTargetAnywhere(b->right.get());
+        if (auto* u = dynamic_cast<const ast::UnaryExpr*>(e))
+            return containsTargetAnywhere(u->operand.get());
+        if (auto* t = dynamic_cast<const ast::TypeTestExpr*>(e))
+            return containsTargetAnywhere(t->operand.get());
+        if (auto* co = dynamic_cast<const ast::ConditionalExpr*>(e))
+            return containsTargetAnywhere(co->condition.get()) ||
+                   containsTargetAnywhere(co->thenValue.get()) ||
+                   containsTargetAnywhere(co->elseValue.get());
+        if (auto* th = dynamic_cast<const ast::ThrowExpr*>(e))
+            return containsTargetAnywhere(th->operand.get());
+        if (auto* r = dynamic_cast<const ast::RangeExpr*>(e))
+            return containsTargetAnywhere(r->lo.get()) ||
+                   containsTargetAnywhere(r->hi.get()) ||
+                   containsTargetAnywhere(r->step.get());
+        if (auto* w = dynamic_cast<const ast::WithExpr*>(e)) {
+            if (containsTargetAnywhere(w->source.get())) return true;
+            for (auto& a : w->assigns)
+                if (containsTargetAnywhere(a.value.get())) return true;
+            return false;
+        }
+        if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(e)) {
+            for (auto& el : cl->elements)
+                if (containsTargetAnywhere(el.get())) return true;
+            for (auto& k : cl->keys)
+                if (containsTargetAnywhere(k.get())) return true;
+            return false;
+        }
+        if (auto* bx = dynamic_cast<const ast::BindExpr*>(e)) {
+            // fix #3805 follow-up #2: THE reviewer-identified gap.
+            for (auto& cl2 : bx->clauses)
+                if (containsTargetAnywhere(cl2->initializer.get())) return true;
+            return containsTargetAnywhere(bx->body.get());
+        }
+        // Anything else (CaseExpr, LambdaExpr, MarkedTransferExpr, or a
+        // kind not yet added to this enumeration) — NOT PROVEN ABSENT.
+        return true;
+    }
+
+    // fix #3805 follow-up: count call sites reaching `target` through a
+    // callee expression `e`, recognizing exactly two STRUCTURALLY countable
+    // shapes: a bare identifier (one call), and an if-expression atom
+    // (grammar A.7) whose branches are recursively scanned the same way —
+    // either branch might execute, so BOTH are counted (conservative
+    // over-counting in the safe direction: two occurrences from one
+    // if-expression call site is never LESS safe than treating it as one).
+    // Any other node kind that still contains `target` cannot be soundly
+    // attributed a call count here (a member access, a call argument, a
+    // nested nontrivial expression, etc.) — declines via
+    // `uncountableCalleeSeen` rather than guessing.
+    void scanCalleePosition(const ast::Expr* e) {
+        if (!e) return;
+        if (isTargetIdent(e)) { ++calleeCallCount; return; }
+        if (auto* co = dynamic_cast<const ast::ConditionalExpr*>(e)) {
+            // The condition itself is never `target` in practice (`target`
+            // is function-typed, never a bool), but be exhaustive: if it
+            // somehow contains `target`, that is not a call this scan
+            // recognizes — decline rather than ignore it silently.
+            if (containsTargetAnywhere(co->condition.get()))
+                uncountableCalleeSeen = true;
+            scanCalleePosition(co->thenValue.get());
+            scanCalleePosition(co->elseValue.get());
+            return;
+        }
+        if (containsTargetAnywhere(e)) uncountableCalleeSeen = true;
     }
 
     // fix #2481 (consumer 3/3, closures) / §19.3 / §28.9 / §28.3 / §27.5: are
@@ -25252,12 +25455,14 @@ struct ClosureEscapeWalker {
         // Call: the callee `f(...)` is a non-consuming read (invocation); every
         // ARGUMENT escapes (the callee may store the function value).
         if (auto* c = dynamic_cast<const ast::CallExpr*>(e)) {
+            scanCalleePosition(c->callee.get());  // fix #3805 (+ follow-up)
             expr(c->callee.get(), /*safeRead=*/true);
             for (auto& a : c->args) expr(a.value.get(), /*safeRead=*/false);
             return;
         }
         if (auto* c = dynamic_cast<const ast::NullCondCallExpr*>(e)) {
             // `f?(...)` null-conditional call (§27.7): callee is a read.
+            scanCalleePosition(c->callee.get());  // fix #3805 (+ follow-up)
             expr(c->callee.get(), /*safeRead=*/true);
             for (auto& a : c->args) expr(a.value.get(), /*safeRead=*/false);
             return;
@@ -25359,6 +25564,26 @@ struct ClosureEscapeWalker {
             expr(r->lo.get(), /*safeRead=*/true);
             expr(r->hi.get(), /*safeRead=*/true);
             expr(r->step.get(), /*safeRead=*/true);
+            return;
+        }
+        // fix #3805 follow-up #2 (review NEEDS-FIX, delta re-review): §17.15
+        // grammar A.7 `BindExpr` — the `(var x := SOURCE; BODY)` binding
+        // atom — had NO arm anywhere in this dispatch. A `target` reference
+        // inside one (as a clause's SOURCE or inside BODY) was invisible to
+        // this walker: neither counted as a call nor flagged as an escape,
+        // silently read as "not present" — the review's own reproduced
+        // heap-use-after-free went through exactly this gap. Each clause is
+        // an embedded plain-`var` LocalDecl (isBindAtomClause); its
+        // initializer is walked exactly like an ordinary LocalDecl's own
+        // initializer in stmt() below — binding `target` into ANOTHER local
+        // is itself an escape (safeRead=false). `body` supplies the atom's
+        // own value in the position the WHOLE BindExpr occupies, so it
+        // inherits the CALLER's `safeRead` — the same substitution
+        // ConditionalExpr's branches already get, above.
+        if (auto* bx = dynamic_cast<const ast::BindExpr*>(e)) {
+            for (auto& cl : bx->clauses)
+                expr(cl->initializer.get(), /*safeRead=*/false);
+            expr(bx->body.get(), safeRead);
             return;
         }
         // Leaf literals contain no identifiers — nothing to do. An unrecognized
@@ -29390,6 +29615,16 @@ void Emitter::collectCellFreeEligible(
         std::unordered_map<const void*, std::unordered_set<const void*>>&
             escapingCapturersOf;
         std::unordered_set<const void*>& nestedWidenedKeys;
+        // fix #3805 (§27.5 / §15.3 / §28.9, v0.294): the set of nested
+        // LambdaExpr nodes proven safe to treat as NON-escaping even though
+        // they are reached at an "unconditional tail position" (the entire
+        // expression body of an outer, purely-forwarding lambda) rather than
+        // a `var h :=` / `const h :=` binding — the ONLY shape #3766's own
+        // ClosureEscapeWalker-based reclassification (below) recognizes.
+        // Computed once, before the body walk, by collectCellFreeEligible's
+        // pre-pass (see its own comment for the full soundness argument);
+        // consulted by collectLambdaCaptures's #1135 widening walker.
+        const std::unordered_set<const void*>& transparentTailNonEscaping;
         // fix #2334: anchors for `using var` initializer CallExprs (form 2
         // of §28.14 — `using var sub := cs.Token.Register(lambda)`). Populated
         // by stmt() before the initializer is walked; consulted by expr() to
@@ -29648,6 +29883,24 @@ void Emitter::collectCellFreeEligible(
                 findLamsE = [&](const ast::Expr* e) {
                     if (!e) return;
                     if (auto* nl = dynamic_cast<const ast::LambdaExpr*>(e)) {
+                        // fix #3805 (§27.5 / §15.3 / §28.9, v0.294): `nl` is
+                        // the terminal capturer of a proven transparent
+                        // forwarding chain (collectCellFreeEligible's
+                        // pre-pass — see its comment for the full soundness
+                        // argument: exactly-one call site, that call's
+                        // result binding proven non-escaping). This covers
+                        // the "unconditional tail position" shape #3766's
+                        // `inVarInit`-gated check just below cannot reach —
+                        // `nl` has no `var h :=` binding of its own; it IS
+                        // the outer lambda's entire expression body. Checked
+                        // FIRST and unconditionally (independent of
+                        // `inVarInit`/`isNonEscaping`/`currentParentStmt`).
+                        if (transparentTailNonEscaping.count(
+                                static_cast<const void*>(nl))) {
+                            collectLambdaCaptures(nl, em,
+                                                  /*isNonEscaping=*/true);
+                            return;
+                        }
                         // fix #3766: a nested lambda at a `var h := lambda()`
                         // (or `const h := lambda()`) position INSIDE a non-
                         // escaping outer lambda is itself non-escaping when
@@ -30299,10 +30552,80 @@ void Emitter::collectCellFreeEligible(
         }
     };
 
+    // fix #3805 (§27.5 / §15.3 / §28.9, v0.294): pre-pass recognizing a
+    // TRANSPARENT FORWARDING LAMBDA — `var L := lambda() => H;` where `H`
+    // is itself a bare LambdaExpr (L's entire, expression-bodied, statement-
+    // free body IS the value every call to `L` produces) — called through
+    // exactly one `var/const M := L();` whose own binding `M` is already
+    // proven non-escaping (isLambdaClosureReturnCall
+    // admitted it into closureReleaseEligible_, fix #2714). In that shape
+    // `H`'s free variables are safe to treat as captured NON-ESCAPING: `H`
+    // is created and released entirely within THIS body's lifetime (via
+    // `M`'s own scope-end release, which this same body's disposeStack
+    // already fires), so its env cannot outlive the point cellFreeEligible_
+    // locals are freed. The exactly-one-call proof is load-bearing: TWO
+    // calls to the same forwarding lambda would build two independent `H`
+    // closures sharing the SAME boxed cell for whatever they capture, and
+    // only ClosureEscapeWalker's new calleeCallCount==1 (not just
+    // `!escaped`, which two safe-read calls would also satisfy) rules that
+    // out — the double-free the whole family exists to avoid.
+    std::unordered_map<const void*, const ast::LambdaExpr*> forwardTarget3805;
+    for (auto& s : body) {
+        LocalDeclInitView v = localDeclInitView(s.get());
+        auto* g = v.init ? dynamic_cast<const ast::LambdaExpr*>(v.init)
+                          : nullptr;
+        if (!g || !g->stmts.empty()) continue;
+        // EXACTLY one level: calling `L()` once evaluates `g`'s body, which
+        // CONSTRUCTS (but does not itself invoke) the nested LambdaExpr — so
+        // one call materializes exactly one level of nesting, never more.
+        // A THREE-literal-level chain (`lambda() => lambda() => lambda() =>
+        // …`) called only once is deliberately NOT unwound past level one
+        // here: that would name a lambda `L()` never directly produces, and
+        // this map's only consumer (the exactly-one-call check below) would
+        // then be proving the wrong call safe. A chain reached through TWO
+        // separate named locals and calls (`var m := outer(); var inner :=
+        // m();`) is NOT recognized either — `m`'s own initializer is a
+        // CallExpr, not a bare LambdaExpr, so `m` never becomes a key here.
+        // That is the conservative direction (a bounded leak, never an
+        // over-free); widening to that shape is future work, not attempted
+        // in this fix.
+        auto* nl = dynamic_cast<const ast::LambdaExpr*>(g->exprBody.get());
+        if (nl) forwardTarget3805[static_cast<const void*>(s.get())] = nl;
+    }
+    std::unordered_set<const void*> transparentTailNonEscaping3805;
+    for (auto& s : body) {
+        LocalDeclInitView v = localDeclInitView(s.get());
+        if (!v.init ||
+            !closureReleaseEligible_.count(static_cast<const void*>(s.get())))
+            continue;
+        auto* call = dynamic_cast<const ast::CallExpr*>(v.init);
+        if (!call || !call->callee) continue;
+        auto* callee = dynamic_cast<const ast::IdentifierExpr*>(call->callee.get());
+        if (!callee) continue;
+        auto* lsym = dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*callee));
+        if (!lsym || !lsym->decl) continue;
+        auto it = forwardTarget3805.find(static_cast<const void*>(lsym->decl));
+        if (it == forwardTarget3805.end()) continue;
+        ClosureEscapeWalker cew3805{ctx_, static_cast<const void*>(lsym->decl)};
+        for (auto& s2 : body) cew3805.stmt(s2.get());
+        // fix #3805 follow-up (review NEEDS-FIX): `!uncountableCalleeSeen`
+        // joins `calleeCallCount == 1` — a callee shape scanCalleePosition
+        // could not structurally attribute a count to (e.g. `target` read
+        // through anything other than a bare identifier or an if-expression
+        // atom) must decline this local rather than risk an undercounted
+        // "1" that is really 2-or-more, which is precisely the shared-cell
+        // double-instance hazard this whole gate exists to rule out.
+        if (!cew3805.escaped && !cew3805.uncountableCalleeSeen &&
+            cew3805.calleeCallCount == 1)
+            transparentTailNonEscaping3805.insert(
+                static_cast<const void*>(it->second));
+    }
+
     LambdaFinder finder{ctx_, *this, closureReleaseEligible_,
                         capturedByNonEscaping, capturedByEscaping,
                         capturedByNonEscapingUnwindUnsafe,
-                        escapingCapturersOf, nestedWidenedKeys};
+                        escapingCapturersOf, nestedWidenedKeys,
+                        transparentTailNonEscaping3805};
     for (auto& s : body) finder.stmt(s.get());
 
     // fix #3426 (§27.5 / §28.9, v0.283): record the sole out-of-frame holder of
