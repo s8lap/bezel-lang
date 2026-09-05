@@ -1,6 +1,6 @@
 # Bezel for Code Generation
 
-*Validated against v0.287. Companion to the Bezel Language Specification — a writing reference, not a normative document.*
+*Validated against v0.288. Companion to the Bezel Language Specification — a writing reference, not a normative document.*
 
 A dense reference for writing correct Bezel without reading the spec. It covers the syntax surface, the ownership rules, the standard-library name index, the idioms that work, and the shapes that look right and are rejected.
 
@@ -41,7 +41,7 @@ Read this page first. Every row is a habit that produces broken Bezel.
 | 13 | `if (x is Dog d)` | `is` **does not bind**. `var d := x as Dog; if d <> null then …` or a `case` arm `var d: Dog` | §12.7 |
 | 14 | `if (count)` truthiness | Conditions are `bool`. Write `count <> 0` | §4.1 |
 | 15 | `i++` as an expression, `++i` | `++`/`--` are **postfix-only statements**: `i++;` on its own line. Assignments are statements too and produce no value | §17.6, §17.2 |
-| 16 | `int? + int?` lifts | **Retired at v0.267.** Arithmetic, bitwise, shift, relational, compound and `++`/`--` over a nullable operand are a compile error. `=`/`<>`/`??`/`?.`/`?(args)`/`??=` still work | §7.11 |
+| 16 | `int? + int?` lifts | **Retired at v0.267.** Arithmetic, bitwise, shift, relational, compound and `++`/`--` over a nullable operand are a compile error — a §7.4-narrowed local counts as non-nullable at every one of them (`if n <> null then n += 1; end;` is fine). `=`/`<>`/`??`/`?.`/`?(args)`/`??=` still work | §7.11, §6.6 |
 | 17 | `if (_field != null) Use(_field);` | Mutable fields and properties **never narrow**. Copy to a local first | §7.4 |
 | 18 | `var y = x;` moves (Rust) or aliases-and-GCs (C#) | `var y := x;` is **always a borrow**; nothing is consumed silently. Transfer is written `move x` — at use sites only | §28.3, §22.3 |
 | 19 | `new Foo()` returned from an unmarked method | A plain class-typed **instance** return means "a borrow of the receiver". A method that creates must declare `: owned T`; a **static** method returning a class type without `owned` is rejected at its declaration | §28.3 |
@@ -149,10 +149,10 @@ visibility  static  (async|pure)  (abstract|virtual|override|sealed override)  (
 | Block property | `public property Balance: decimal` / `get => _b;` / `set => do … end;` / `end Balance;` | §23.3 |
 | Owned-taking setter | `set(owned);` or `set(owned x);` — the type is the property's and is never repeated | §23.3 |
 | Indexer | `public property [i: int]: string => _items[i];` — the block form closes with a bare `end;` | §23.4 |
-| Constructor | `public constructor(a: int)` + optional `base(a);`/`this(a);` chain + body + `end constructor;` | §22.7 |
+| Constructor | `public constructor(a: int)` + optional `base(a);`/`this(a);` chain + body + `end constructor;`. A chain argument may read only the constructor's own parameters, constants and statics — never a field of `this` or a primary-constructor parameter | §22.7, §12.8 |
 | Destructor | `destructor` … `end destructor;` — no visibility, no name, no parameters | §28.4 |
 | Operator | `public static pure method operator +(a: V, b: V): V => …;` closes `end operator +;` | §25.1 |
-| Equality operator | Overloading `=`/`<>` with **both operands the declaring type** obliges `Equals(T)` **and** `override GetHashCode` beside them (a record; an enum or choice writes a plain `GetHashCode(): int`), and by itself strips the record of auto-`=`/`Equals`/`GetHashCode`/`ToString` — **write all four or none**. A **heterogeneous** `=` (`T = U`) obliges nothing and strips nothing. On a move-only choice, `=`/`<>` operands and the `Equals(T)` parameter bind BORROWS — both operands stay live (v0.286). | §25.2, §9.2 |
+| Equality operator | Overloading `=`/`<>` with **both operands the declaring type** obliges `Equals(T)` **and** `GetHashCode` beside them (`override` or plain, on a record, enum, or choice alike — v0.288), and by itself strips the record of auto-`=`/`Equals`/`GetHashCode`/`ToString` — **write all four or none**. A **heterogeneous** `=` (`T = U`) obliges nothing and strips nothing. On a move-only choice, `=`/`<>` operands and the `Equals(T)` parameter bind BORROWS — both operands stay live (v0.286). | §25.2, §9.2 |
 | Invariant | `invariant(_bal + _limit >= 0m);` — class bodies only, no visibility, keeps its `;` | §22.16 |
 | Nested type | `public record Token(…);` inside a class body — visibility **required** | §11.6 |
 
@@ -453,7 +453,7 @@ The declared type, nullability stripped, must be a class type, an interface type
 
 - `using var y := move x;` — **adoption**: the standard way to turn an owned local, parameter or loop-variable obligation into scope-bound disposal.
 - `using var y := x;` (unmarked, `x` a named owned binding) — **does not adopt**. It is a **borrow-pin**: no obligation is assumed, `x` keeps it, and the pin extends `x`'s required liveness to this block's end.
-- `using var _ := expr;` — the anonymous owning binding (`using var _ := mutex.Acquire();`).
+- `using var _ := expr;` — the anonymous owning binding (`using var _ := mutex.Acquire();`). Not for a `Task`-family value (§17.13).
 - Admissible over value-typed, runtime-managed and move-only right-hand sides, where disposal is a no-op — safe to use uniformly in generic code.
 - To dispose earlier than the method's end, nest a `do … end` block.
 
@@ -467,7 +467,7 @@ The declared type, nullability stripped, must be a class type, an interface type
 | `_ := x;` | end of the discard statement | — | none |
 | unbound temporary | end of the full expression | — | none |
 
-`_ := x;` leaves the binding **explicitly-disposed**: a later straight-line read is a mandatory use-after-dispose warning, and a read after a *conditional* discard is a compile error at the merge. `_ := task` is **rejected** for the `Task` family — use `Task.FireAndForget(t)` (§17.13).
+`_ := x;` leaves the binding **explicitly-disposed**: a later straight-line read is a mandatory use-after-dispose warning, and a read after a *conditional* discard is a compile error at the merge. `_ := task` **and** `using var _ := task` are **rejected** for the `Task` family — use `Task.FireAndForget(t)`, or a *named* `using var t := …` (§17.13, v0.288).
 
 **`ref` / `out`** (§22.3, §22.4). Written at the declaration **and** at the call site. `out` is copy-out-on-normal-return: the callee must assign on every normal-completion path; on the exception edge the recipient is untouched.
 
@@ -525,7 +525,7 @@ Five corollaries you will need constantly:
 A borrow is valid only where **every** source in its source set is live; joins, `??` and arm meets take the **union** of source sets (§28.3).
 
 - A borrow may **not** be assigned to a local whose scope strictly encloses its source's scope — including flowing around a loop back edge. Rejected **at the assignment**, not at the later use.
-- A borrow of a **scope-bound local** may not be stored in a field or in a longer-lived collection. A borrow whose source *does* outlive the object **is** admissible: the **back-reference** idiom binds a constructor parameter into a plain (non-`owned`) class-typed field (`private _owner: Customer;`). The check is structural — parameter- and receiver-sourced admitted, locals and temporaries rejected.
+- A borrow of a **scope-bound local** may not be stored in a field or in a longer-lived collection. A borrow whose source *does* outlive the object **is** admissible: the **back-reference** idiom binds a constructor parameter into a plain (non-`owned`) class-typed field (`private _owner: Customer;`). The check is structural — sourced from a parameter that is not `owned` (plain or `scoped`) or from the receiver: admitted; locals, temporaries **and `owned` parameters**: rejected (an `owned` parameter is disposed at the method's end, so it is scope-bound — §28.3, v0.288).
 - A borrow may not be returned unless its source is one every caller can re-establish: receiver-sourced from an instance method, the receiver-parameter borrow of an extension method, or static storage through a **static property getter**.
 - A borrow may not be captured by a closure that may outlive its source (immediately-invoked closures, closures bound to a `using var` of function type, and closures passed to a function-typed parameter are fine).
 - Every field-, collection- or async-frame-held borrow carries the obligation not to transfer the borrowed object to another domain. This has **no runtime backstop** — it is a data race (§30.14).
@@ -590,11 +590,11 @@ Two desugaring facts (§29.2): a **fresh** iterable-family source is taken by th
 
 **Element disposal is the owner's, always** (§28.6). `Dispose()` requires a receiver you own: an owned local or `owned` parameter, a `using var`, an unbound owned temporary, a `move` result, or an `owned` field / owning slot read by code of the owning object's declaring type. Through a **borrow it is a compile error with no exception** — a borrowed local or parameter, **`this`**, a non-`owned` field read, an owned-field read outside the declaring class, a getter result, a `catch`-arm binding, a pattern binding, a captured owned binding inside a closure, and an element borrow of *either* family. A borrowed **owning collection** may be added to, removed from, drained and read — the pass-and-fill idiom `method Fill(a: OwningArray<T>)  a.Add(…)` is core — but it may not be `Dispose`d.
 
-**Fresh values into collections** (§15.4, §28.11). On the **owning** family a fresh producer is idiomatic and warning-free: `pool.Add(new Connection("a"));`. On the **borrowing** family the same shape via `Add`/`Insert`/indexer-set is admitted but **warns** (the temporary dies at the statement's end and the slot dangles), and inside a collection **literal** a fresh non-trivial-dispose element is a hard **error** at the literal site — bind first, or use the owning family. Runtime-managed elements are unaffected: `summary.Add(name)` on an `Array<string>` carries no obligation and no warning.
+**Fresh values into collections** (§15.4, §28.11). On the **owning** family a fresh producer is idiomatic and warning-free: `pool.Add(new Connection("a"));`. On the **borrowing** family the same shape via `Add`/`Insert`/indexer-set is admitted but **warns** (the temporary dies at the statement's end and the slot dangles) — and so does a fresh class-typed **key** into an `OwningDictionary`, whose keys are borrowed (bind the key first: `using var k := new K(); od[k] := v;`), and inside a collection **literal** a fresh non-trivial-dispose element is a hard **error** at the literal site — bind first, or use the owning family. Runtime-managed elements are unaffected: `summary.Add(name)` on an `Array<string>` carries no obligation and no warning.
 
 ### 4.6 The diagnostics you will actually hit
 
-Section 7 lists each with its remedy. In frequency order they are: the **must-use warning** on an undischarged plain-`var` owned local; a **mixed owned/borrowed merge** rejected at the join; *"borrow held by `x` would outlive its source `y`"*, reported at the **assignment**; *"this call consumes `x`; write `M(move x)`"* and its inverse (the marker written where the target already announces); *"cannot move out of `using var`"*; a **field moved and not restored** on some exit path; a fresh owned value **escaping into a non-owning location** (a borrow field, a getter, a plain return); a **static** method's plain class-typed return, rejected at its declaration; `Dispose()` **on a borrow**; the **consume-site freeze**; the **fresh-store warning** on a borrowing collection; the **terminal-accessor provenance warning**; and `_ := someTask;`.
+Section 7 lists each with its remedy. In frequency order they are: the **must-use warning** on an undischarged plain-`var` owned local; a **mixed owned/borrowed merge** rejected at the join; *"borrow held by `x` would outlive its source `y`"*, reported at the **assignment**; *"this call consumes `x`; write `M(move x)`"* and its inverse (the marker written where the target already announces); *"cannot move out of `using var`"*; a **field moved and not restored** on some exit path; a fresh owned value **escaping into a non-owning location** (a borrow field, a getter, a plain return); a **static** method's plain class-typed return, rejected at its declaration; `Dispose()` **on a borrow**; the **consume-site freeze**; the **fresh-store warning** on a borrowing collection; the **terminal-accessor provenance warning**; and `_ := someTask;` / `using var _ := someTask;`.
 
 ---
 
@@ -629,7 +629,7 @@ Exactly four sanctioned shapes; nothing else is a Try (stdlib §1).
 | **(c)** bool + **non-nullable value** out (`default(T)` on false) | `TryX(…, out result: T): bool` | concrete **value**-type payload | the primitive `TryParse` family; `Convert.TryTo*`; `DateTime`/`DateOnly`/`TimeOnly`/`Guid`.`TryParse`; the span/bit `TryRead*` accessors |
 | **(d)** bool only, no out | `TryX(…): bool` | succeeded/declined; the payload was passed *in* | `Set.TryAdd`, `OwningSet.TryAdd`, `SortedSet.TryAdd`, the three dictionary `TryAdd`s (v0.282), `TaskCompletionSource.TrySet*`, the span/bit `TryWrite*` |
 
-**The `when true` postcondition is normative on every shape-(a) member** even though the per-type listings elide it: inside a `true`-narrowed region the recipient needs no `!`.
+**The `when true` postcondition is normative on every shape-(a) member** even though the per-type listings elide it: inside a `true`-narrowed region the recipient needs no `!`. It has one spelling — the clause; a hand-written `static ensures(not result or p <> null)` is an ordinary contract clause and narrows nothing (§22.16).
 
 **Three access tiers over one operation:** the **throwing** tier (absence is a bug) — `Parse`, `dict[key]`, `First()`, `PopAt`, `Pop`, `Dequeue`, `Console.ReadKey`; the **`*OrNull`** tier, returning `T?` for `??`/`?.` composition — `ParseOrNull`, `GetOrNull`, `Console.ReadKeyOrNull`, `FirstOrNull`/`LastOrNull`/`SingleOrNull`/`ElementAtOrNull`/`MinOrNull`/`MaxOrNull`, `E.FromUnderlyingOrNull`; and the **`Try`** tier, the only shape that distinguishes "absent" from "present null". `*OrNull` **conflates** absent with a present `null` wherever the payload can be null — use `ContainsKey`/`Count`/the `Try` shape when the distinction matters.
 
@@ -705,7 +705,7 @@ public interface IFormattable      method ToString(format: string): string;   en
 public class Subscription  destructor; end     // no public ctor; returned as `owned Subscription`
 ```
 
-`IComparable<T>`/`IEquatable<T>` are **invariant**. `BitConverter`: `FloatToInt32Bits`, `Int32BitsToFloat`, `DoubleToInt64Bits`, `Int64BitsToDouble`, `Reinterpret<TTo>(value)`. `Type` (`public sealed class`): `Name`, `FullName`, `IsClass/IsInterface/IsRecord/IsEnum/IsChoice/IsPrimitive/IsInlineArray/IsFunctionType/IsValueType`, `BaseType: Type?`, `Implements(iface)`, `IsAssignableFrom(other)`, `EnumNames`, `EnumValues` — **no member reflection at all** (declined, not deferred).
+`IComparable<T>`/`IEquatable<T>` are **invariant**. `BitConverter`: `FloatToInt32Bits`, `Int32BitsToFloat`, `DoubleToInt64Bits`, `Int64BitsToDouble`, `Reinterpret<TTo>(value)`. `Type` (`public sealed class`): `Name` (the identifier alone), `FullName` (module path + enclosing-type path + identifier, `"M.Outer.Inner"`), `IsClass/IsInterface/IsRecord/IsEnum/IsChoice/IsPrimitive/IsInlineArray/IsFunctionType/IsValueType`, `BaseType: Type?`, `Implements(iface)`, `IsAssignableFrom(other)`, `EnumNames`, `EnumValues` — **no member reflection at all** (declined, not deferred).
 
 **Format specifiers** (invariant culture only; an unrecognized specifier raises `FormatException`): integers `D`/`Dn`, `X`/`x`/`Xn`, `B` (no grouping separators); `double`/`float` `F`/`Fn` (default 2), `E`/`En`, `G`/`Gn`, `P`/`Pn`, `R`; `decimal` `F`/`Fn`, `E`/`En`, `G`, `P`/`Pn` (midpoints half-to-even); `DateTime`/`DateOnly`/`TimeOnly` patterns of `yyyy MM dd HH mm ss fff` with every other character a literal; `TimeSpan` `c`; `Guid` `D`/`N`; `bool`, `char`, `string` take **none** — a format spec on those is a compile error. **`C` (currency) deliberately does not exist**: write `$"{amount:F2} EUR"`.
 
@@ -1608,6 +1608,7 @@ foreach var t in transactions do Process(t); end foreach;   // WRONG: no such ke
 var first := rows?[0];                                      // WRONG: there is no `?[` suffix
 var xs: Array := [10, 20, 30];                              // WRONG: `Array` is not a type
 var ys := [1, 2, 3];                                        // WRONG: no target type for the literal
+var sd: SortedDictionary<string, int> := ["a": 1];          // WRONG: the dictionary literal targets only Dictionary/OwningDictionary (§15.4)
 var max := a > b ? a : b;                                   // WRONG: no `?:` operator
 x := y++;   ++c;   if count++ > 3 then ... end;               // WRONG: `++` is a postfix STATEMENT
 if count then ... end;                                        // WRONG: no truthiness
@@ -1710,7 +1711,7 @@ var conns: Array<Connection> := [new Connection("a")];   // ERROR: hard rejectio
 _ := DoTelemetryAsync();                                 // ERROR: a Task may not be discarded
 ```
 
-> §15.4's fresh-store lint on the borrowing family; the collection-**literal** form of the same shape is an error, not a warning. §17.13: `Task.FireAndForget(t)` (supervised) or `using var t := …;` (unsupervised) are the two legal not-awaiting spellings.
+> §15.4's fresh-store lint on the borrowing family; the collection-**literal** form of the same shape is an error, not a warning. §17.13: `Task.FireAndForget(t)` (supervised) or `using var t := …;` (unsupervised) are the two legal not-awaiting spellings — *named*; the anonymous `using var _ := t;` is rejected like the discard.
 
 ```bezel
 using var t1 := File.WriteAllTextAsync(pathA, report);   // named holders
