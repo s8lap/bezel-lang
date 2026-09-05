@@ -1,6 +1,6 @@
 # Bezel for Code Generation
 
-*Validated against v0.290. Companion to the Bezel Language Specification — a writing reference, not a normative document.*
+*Validated against v0.292. Companion to the Bezel Language Specification — a writing reference, not a normative document.*
 
 A dense reference for writing correct Bezel without reading the spec. It covers the syntax surface, the ownership rules, the standard-library name index, the idioms that work, and the shapes that look right and are rejected.
 
@@ -1823,7 +1823,7 @@ method Report(samples: IEnumerable<Sample>)
 end Report;
 ```
 
-> §29.5: exit an iterator with `yield break;` (and `yield` is barred inside a `try` with a `catch`, and in a lambda). §28.3 row 2 callee side: a *stored* collection is re-exposed as a **property**, whose read is a borrow. §29.11: a lazy query is single-consumption. §29.2: over an interface-typed source the loop variable's source is conservatively the loop's own enumerator, so any escape is rejected — take a concrete collection type instead.
+> §29.5: exit an iterator with `yield break;` (and `yield` is barred inside a `try` with a `catch`, and in a lambda). §28.3 row 2 callee side: a *stored* collection is re-exposed as a **property**, whose read is a borrow. §29.11: a lazy query is single-consumption. §29.2: over an interface-typed source the loop variable's source is conservatively the loop's own enumerator, so any escape is rejected — take a concrete collection type instead. §14.5/§15.4: a selector whose body is a collection literal (`xs.SelectMany(lambda(x) => [x, x + 10])`) is rejected — the literal has no standalone type and an `IEnumerable<U>` return position admits none; bind the literal to an explicitly typed local in a block body and return that local (the compiler's diagnostic names the shape).
 
 ```bezel
 if n <= 0 then yield break; end;

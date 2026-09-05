@@ -1,6 +1,6 @@
 # Bezel Language Specification
 
-**Version 0.291 — September 2026**
+**Version 0.292 — September 2026**
 
 Bezel is a compiled language for services and tools, with ownership-based memory management and no garbage collector. The compiler tracks ownership of every heap object and ensures that each one is disposed exactly once. Borrowing lets you pass references without transferring ownership, with lifetimes checked at compile time rather than enforced by a runtime. The result aims to give you the safety of a managed language and the predictability of a manual one, without the ceremony of either.
 
@@ -2076,7 +2076,7 @@ At a class or interface substitution of `T`, `total` is an owned local: `T.Zero(
 
 **Primitive conformances (compiler-provided).** The primitive numeric tower (`byte`…`ulong`, `float`, `double`, `decimal`) conforms to the standard-library `INumber<T>`/`ISteppable<T>`/`IParsable<T>` interfaces, and `char` to `ISteppable<char>`/`IParsable<char>` (stdlib §2.19), **without declaring them**: primitive operators are compiler intrinsics (§3.5), so the compiler bridges the intrinsic/declared split by treating each primitive as conforming with its intrinsic operations as the member bodies. User code observes no difference from a declared conformance. The bridge covers not only the intrinsic/declared operator split but also the `IParsable<T>.TryParse` **out-nullability** shape: the per-type witnesses declare `out result: T` (a concrete value type), while the interface declares `out owned value: T?` — the nullability required for user class conformers, for which `default(T)` is a compile error ([§17.11](#sec-the-default-operator)). A call through the constraint observes the declared slot under the class assumption, erased at value substitutions; a direct call observes `out result: T`. The stdlib §2.19 producer markers themselves (`owned` returns; the `out owned` slot) ask nothing extra of the bridge: at every primitive conformer they are erased by the substitution ([§28.1](#sec-where-the-owned-modifier-can-appear)), so the intrinsic value operations witness the erased — unmarked — signatures directly.
 
-**What this unblocks:** promoting the name-recognized `FromCollectionLiteral` (§15.4.1) to a real `ICollectionLiteralTarget<T>` and `IDeserializable`'s `Deserialize` (stdlib §2.14) to a true static interface method — both signatures were chosen for zero-source-change promotion; and replacing §16's compiler-intrinsic `Range<T>` element restriction with an `ISteppable<T>` constraint.
+**What this unblocks:** promoting the name-recognized `FromCollectionLiteral` (§15.4.1) to a real `ICollectionLiteralTarget<T>` and `IDeserializable`'s `Deserialize` (stdlib §2.14) to a true static interface method — both signatures were chosen for zero-source-change promotion. §16's `Range<T>` element restriction is **not** among them: its admitted set is a strict subset of the `ISteppable<T>` conformers, so the constraint cannot replace it without widening ([§16.3](#sec-the-ranget-type), v0.292).
 
 ---
 
@@ -2629,7 +2629,11 @@ one **agreement rule** stated after them.
      the unique instantiation of `G` that the argument's type implements or
      extends (an `Array<int>` argument against `xs: IEnumerable<T>` binds
      `T` to `int`); an argument whose type reaches no instantiation of `G`
-     makes the candidate inapplicable;
+     makes the candidate inapplicable, and so does one whose type reaches
+     **more than one** (a type implementing both `I<int>` and `I<string>`,
+     against `p: I<X>`) — a non-unique instantiation is never resolved by
+     choice (*Agreement* below); cast the argument to the intended
+     instantiation or supply explicit type arguments (v0.292);
    - a function-typed parameter unifies component-wise; modifier slots
      (`owned`/`ref`/`out`/`out owned`/`scoped`) must match exactly
      ([§27.1](#sec-function-types));
@@ -2668,6 +2672,27 @@ one **agreement rule** stated after them.
    [§27.6](#sec-method-references-to-overloaded-methods). If a
    lambda's parameter positions are still open after this phase, inference
    fails: annotate the lambda's parameters or supply explicit type arguments.
+   Two shapes contribute **no return binding** (v0.292). A lambda whose
+   body — its expression body, or a `return` operand — is a **collection
+   literal** has no self-determined return type, the literal having no
+   standalone type ([§15.4](#sec-collection-literals)): the literal is typed
+   against the substituted return position, which must be **closed** at the
+   lambda's turn in this phase and must admit a literal (a
+   collection-interface position such as `IEnumerable<U>` admits none) —
+   otherwise the lambda is a compile error at the body, the literal having
+   no target. The remedy is a block body binding the literal to an
+   explicitly typed local; a type parameter such a position would have
+   bound must come from an earlier argument or an explicit list. At an
+   overloaded call the position ranks as [§22.6](#sec-overloading)'s
+   *Lambda-literal arguments* states. A lambda **nested** in a lambda body
+   is an expression of that body: it is typed by
+   [§27.3](#sec-lambda-expressions)/[§27.4](#sec-parameter-type-inference)
+   against the target its own position supplies (the enclosing lambda's
+   substituted return position when it is the body's result, a call's
+   parameter type, a typed local) and never re-enters this phase — its
+   parameter positions bind nothing of the enclosing call's type
+   parameters, and what it contributes is the enclosing lambda's inferred
+   return type, unified as above.
 
 3. **Target-typed completion.** A type parameter still unbound is bound from
    the call's **target type**, where the call site has one, by unifying the
@@ -3160,7 +3185,7 @@ In a pattern, `..<0` matches "any value less than 0" and `31..` matches "any val
 <a id="sec-the-ranget-type"></a>
 ### 16.3 The `Range<T>` type
 
-A range over `T` has type `Range<T>`. `T` is restricted by the compiler to the integer types (`byte`, `sbyte`, `short`, `ushort`, `int`, `uint`, `long`, `ulong`) and `char`. Other substitutions are rejected. This restriction is enforced as a compiler-intrinsic rule. Static interface members now exist ([§11.8](#sec-static-interface-members)) and the standard library defines `ISteppable<T>` (stdlib §2.19); replacing the intrinsic restriction with the constraint is a recorded follow-up (the change is compiler surgery with no user-visible effect, so it is sequenced separately).
+A range over `T` has type `Range<T>`. `T` is restricted by the compiler to the integer types (`byte`, `sbyte`, `short`, `ushort`, `int`, `uint`, `long`, `ulong`) and `char`. Other substitutions are rejected — at the range expression or the `Range<T>` annotation; a bare type parameter is checked at its substitution. The nine admitted types are compiler-provided `ISteppable<T>` conformers (stdlib §2.19, [§11.8](#sec-static-interface-members)), and conformance to `ISteppable<T>` is **necessary but not sufficient** (v0.292): `float`, `double`, and `decimal` conform and are not admitted, and a user `ISteppable<T>` conformer is not admitted. The restriction is therefore a compiler-intrinsic rule and not a spelling of a `where T: ISteppable<T>` clause — that clause would admit every conformer, a widening recorded as a deferred design change (`docs/proposals/DECLINED.md`, *`Range<T>` element widening*), not as a follow-up.
 
 `Range<T>` is a compiler-intrinsic record that implements `IEnumerable<T>`:
 
@@ -4821,7 +4846,15 @@ selects the `(T) -> int` overload of the stdlib `Average` family: the
 `int`-returning candidate is exact and the others convert. When no candidate is
 exact, the co-equal rule above applies unchanged: `bytes.Average(lambda(x) => x)`
 over an `Array<byte>` is ambiguous — every candidate converts the `byte` body
-result — remedied by widening in the body (`lambda(x) => int(x)`).
+result — remedied by widening in the body (`lambda(x) => int(x)`). A lambda
+whose body contributes no return binding ([§14.5](#sec-type-argument-inference)
+phase 2 — a collection-literal body; v0.292) has no inferred return type: the
+candidate is **applicable** at the position when its substituted return slot is
+closed and admits the literal ([§15.4](#sec-collection-literals)), and the
+position ranks *converting*, never exact — so two candidates that differ only
+there (`M(f: (int) -> Array<int>)` beside `M(f: (int) -> Set<int>)`, called as
+`M(lambda(x) => [x])`) fall to the ambiguity below, remedied by a block body
+whose explicitly typed local names the collection.
 
 A candidate is **unambiguously better** than another when it is better-or-equal on every argument position and strictly better (an exact match where the other converts) on at least one. The call resolves to a candidate that is unambiguously better than every other applicable candidate.
 
@@ -6075,7 +6108,7 @@ A function-typed **value** may be used where a different function type is expect
 - **Modifier slots** (`owned`/`ref`/`out`/`out owned`/`scoped`) must match **exactly** ([§27.1](#sec-function-types)); per-slot nullability follows the standard [§7](#sec-nullability-2) rules.
 - **Mint-announcing return slots are announcement-bearing** (the slot's declared family is **type-announced**, [K6.2](#sec-kernel-k6); unified v0.258)**:** a function-typed value whose return slot (nullability stripped) is a mint-announcing type — a `Task`-family type, or one of the eight [§29.3](#sec-iterator-methods)/[§30.7](#sec-asynchronous-programming-async-iterators) iterable and enumerator interface heads (`IEnumerable<T>`, `IEnumerator<T>`, `IAsyncEnumerable<T>`, `IAsyncEnumerator<T>`, `IOwningEnumerable<T>`, `IOwningEnumerator<T>`, `IOwningAsyncEnumerable<T>`, `IOwningAsyncEnumerator<T>`; a declared slot type is all this rule can key on, so a lazy query needs no separate mention: a lazy query's declared type is ordinarily a head already, and where it is not ([§28.3](#sec-producers)'s derived-interface case) [§27.6](#sec-method-references) keeps it off every formed slot) — is usable only where the target's return slot (nullability stripped) is also a type of the **same family** — covariance applies *within* a family (`() -> Task<int>` is usable as `() -> Task`; `() -> IEnumerable<Dog>` as `() -> IEnumerable<Animal>` under the ordinary reference-conversion rule: `IEnumerable<out T>`, stdlib §4.12) and never across a family boundary (`() -> Task<int>` is not usable as `() -> Object`, nor `() -> IEnumerable<int>` as `() -> Object`, nor either family's slot as the other's). Nor can within-family covariance launder the **drain contract**: the owning heads extend `IDisposable`/`IAsyncDisposable`, not the non-owning heads (stdlib §4.13), so no reference conversion exists from `() -> IOwningEnumerable<T>` to `() -> IEnumerable<T>` — a consuming face never retypes to a lending one. The rule is a **use-site admission, not a conversion**: it engages even where no conversion is required. The **target's return slot is read from its declared, pre-substitution type**: a bare-type-parameter slot is not announcement-bearing, so a mint-announcing value may not inhabit it even at an instantiation whose substitution makes the two types coincide — the inhabitant-side closure of the bare-parameter seam ([§28.3](#sec-bare-type-parameter-returns); for the `Task` family the member's parameter-position instantiation is itself already excluded there). The unmarked mint-announcing return is container-ownership-transferring ([§28.3](#sec-producers)) — the same announcement-by-declared-type logic as an `owned` return — so it takes the modifier slots' exact-match discipline rather than the concrete-class covariance rule: retyping it to a non-family slot would erase the calls-mint announcement, and an invocation through the retyped face would classify the minted frame as a borrow — a leak. Stdlib §5's derived interfaces (`IOrderedEnumerable<T>`, `IGrouping<TKey, T>`) extend `IEnumerable<T>` but are outside the family: a value whose return slot is one of them is not announcement-bearing and takes the ordinary covariance rule — sound, including covariantly *into* a head-typed target slot, because no derived-interface slot can conceal a minting face ([§28.3](#sec-factory-methods-and-sourceless-returns)'s static-announcement rule leaves no unmarked derived-interface factory to form over, [§28.3](#sec-bare-type-parameter-returns)'s *Concrete-slot function bodies* admission rejects a minting lambda inhabitant, and [§27.6](#sec-method-references) bars a lazy-query-kinded callee from being formed at a derived-interface slot at all). The same boundary governs **method-reference formation** ([§27.6](#sec-method-references)): formation over a callee whose declared return type is mint-announcing — any callee kind, v0.258 — may bridge only to a target slot in the same family (and a property reference over a mint-announcing-typed property is rejected outright — [§27.6](#sec-method-references)); once formed, a value obeys this bullet whatever its origin.
 
-Assignability under this rule preserves **identity**: the value is the same function object viewed at a compatible function type (like interface variance, [§12.9](#sec-variance)), so function-value equality ([§27.7.1](#sec-equality-of-function-values)) is unaffected by the retyping. This *value*-assignability rule is distinct from **method-reference formation** ([§27.6](#sec-method-references)): forming a reference from a *named method* against a target type may bridge any [§5.1](#sec-implicit-conversions) implicit conversion, because the compiler synthesizes the adapter at the formation site; once formed, the value obeys the narrower rule above. This subsection is the single normative statement of these criteria; [§27.6](#sec-method-references) defers to it.
+Assignability under this rule preserves **identity**: the value is the same function object viewed at a compatible function type (like interface variance, [§12.9](#sec-variance)), so function-value equality ([§27.7.1](#sec-equality-of-function-values)) is unaffected by the retyping. This *value*-assignability rule is distinct from **method-reference formation** ([§27.6](#sec-method-references)): forming a reference from a *named method* against a target type may bridge any [§5.1](#sec-implicit-conversions) implicit conversion, because the compiler synthesizes the adapter at the formation site; once formed, the value obeys the narrower rule above. This subsection is the single normative statement of these criteria; [§27.6](#sec-method-references) defers to it, and the admission of a **lambda literal** at a target-typed non-call position ([§27.3](#sec-lambda-expressions), v0.292) is the one other site-typed bridge — the literal, like a formed reference, is typed at the site.
 
 <a id="sec-lambda-parameter-modifiers"></a>
 #### Lambda parameter modifiers
@@ -6138,6 +6171,8 @@ end;
 ```
 
 Expression-bodied lambdas need no inference rule: the body expression's type is the return type, and a body of type `()` makes a procedure lambda.
+
+**Admission at a target-typed non-call position (v0.292).** A lambda literal at a position that supplies a function-typed target other than a call argument — the initializer of a declared function-typed local or field, an assignment to a function-typed location, a `return` against a declared function-typed return type — is admitted under the argument-position rule of [§14.5](#sec-type-argument-inference) phase 2 and [§22.6](#sec-overloading) (*Lambda-literal arguments*): its parameters take the target's parameter types ([§27.4](#sec-parameter-type-inference)), the body is typed, and its inferred return type must equal the target's return slot or implicitly convert to it ([§5.1](#sec-implicit-conversions)); otherwise the lambda is a compile error at the position (`var f: (int) -> long := lambda(x) => x * 2;` is admitted, the `int` body widening to `long`). The conversion is admitted for the reason [§27.1.1](#sec-function-type-assignability) gives for method-reference formation — the compiler types the body at the site and can bridge it; a function-typed **value** at the same position is not a literal and takes §27.1.1's narrower rule unchanged. An ascribed lambda's ascription is its written return type and must agree with the target as the ascription paragraph above states — judged as a value's return type under §27.1.1 — so an ascription narrows what the position admits: `var g: (int) -> long := lambda(x): int => x * 2;` is rejected where the unascribed form is admitted.
 
 For procedure lambdas, the body may also be a single expression whose result is discarded:
 ```bezel
@@ -7791,7 +7826,7 @@ The caller side is correspondingly unrestricted: **any** closure — capture-bea
 
 Note the deliberate asymmetry with ordinary borrows: a parameter-sourced *object* borrow may be stored into a field under §28.3's borrowed-field rule — a structural check whose residual is the caller's trust — but a call-bounded *function* value may not be stored at all — frame residence (*Call-bounded × deferred activation* above) is not a store but the retention the deferred-activation return type itself type-announces. A closure's true bound is its capture set, which a plain signature does not carry, so neither party is positioned to accept the trust; `scoped` is exactly the signature-carried form of it, and the deferred-activation case needs neither: there the capture set rides the frame as carried sources ([§28.3](#sec-unbound-owned-temporaries)), visible to the caller's own flow analysis.
 
-*Known v1 limitation:* combinators that compose received callbacks into a returned **function value** (`Compose(f, g)` returning `lambda(x) => g(f(x))`) are not expressible over call-bounded parameters — the returned closure would capture them beyond the call, and no bounding frame exists. The missing third tier is an *unbounded* marker (admitting only capture-free or transitively unbounded arguments, which the callee may then retain freely); it is deferred until evidence demands it. Combinators that compose received callbacks into a returned **deferred-activation frame** — an iterator method over a callback parameter, a body returning `xs.Where(f)` — are the expressible neighbors: there the frame bounds the retention (*Call-bounded × deferred activation* above).
+*Known v1 limitation:* combinators that compose received callbacks into a returned **function value** (`Compose(f, g)` returning `lambda(x) => g(f(x))`) are not expressible over call-bounded parameters — the returned closure would capture them beyond the call, and no bounding frame exists. The missing third tier is an *unbounded* marker (admitting only capture-free or transitively unbounded arguments, which the callee may then retain freely); it is deferred, with the reopening bar recorded at `docs/proposals/DECLINED.md` (*Unbounded retention tier for function-typed parameters*). Combinators that compose received callbacks into a returned **deferred-activation frame** — an iterator method over a callback parameter, a body returning `xs.Where(f)` — are the expressible neighbors: there the frame bounds the retention (*Call-bounded × deferred activation* above).
 
 **v1 admission bounds (ratified; axiom [A11](#sec-axiom-register)).** The implementation chose conservatively at eight corners the original text left silent; those choices are **normative**. Bounds marked *liftable* may be widened by a future revision with more analysis; the rest are settled. (The first recorded choice — self-capture of the bounding local — is promoted into the admission text above rather than listed here.)
 
