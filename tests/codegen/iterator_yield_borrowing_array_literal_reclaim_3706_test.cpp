@@ -43,24 +43,26 @@
 // the safe direction) is UNCHANGED. Row 6 below is the regression guard: the
 // owning-iterator control's PRINTED VALUE must stay correct and UNCHANGED by
 // this fix (this fix does not touch that code path — `isOwningIter` gates it
-// out at the two call sites). Row 6 uses the UNCHECKED oracle (`runAot`, via
-// `plainOut`) rather than `runAotChecked`: its own `TakeCurrent()`-bound
-// consumer-side local trips a SEPARATE, PRE-EXISTING leak (filed as #3878,
-// discovered while writing this row) that reproduces byte-identically with
-// this fix applied and with it fully reverted — see row 6's own comment
-// for the measured proof. Rows 1-5 (the actual fix) stay on `runAotChecked`.
+// out at the two call sites). Row 6 was on the UNCHECKED oracle (`runAot`)
+// when this file was written: its own `TakeCurrent()`-bound consumer-side
+// local (`const arr := en.TakeCurrent();`) tripped a SEPARATE, PRE-EXISTING
+// leak, filed as #3878 and discovered while writing this row, that
+// reproduced byte-identically with this fix applied and with it fully
+// reverted. #3878 has SINCE landed (a new `isFreshTakeCurrentBuiltinArrayLocal`
+// recognizer joining the `collectBorrowingArrayFreeEligible` family,
+// `LlvmBackend_Setup.cpp`), so Row 6 is now on `runAotChecked` like every
+// other row — see its own comment for the updated cross-check.
 //
-// Rows 1-5 are `runAotChecked` (generated-code ASan with LeakSanitizer on),
+// All rows are `runAotChecked` (generated-code ASan with LeakSanitizer on),
 // loop-amplified to 200 activations: a one-shot row reads clean on BOTH
 // sides (the single allocation is still stack-reachable at exit), so it
 // would prove nothing. per §28.9, §28.11, §29.2 (issue #3706)
 
 #include <string>
 
-#include "support/aot_support.hpp"   // runAotChecked / runAot — AOT harness
+#include "support/aot_support.hpp"   // runAotChecked — AOT harness
 #include "test_harness.hpp"
 
-using bezel::test::runAot;
 using bezel::test::runAotChecked;
 
 namespace {
@@ -69,16 +71,6 @@ namespace {
 // row (ran=false) before the printed value is even compared.
 std::string checkedOut(const std::string& prog) {
     auto r = runAotChecked(prog);
-    return r.ran ? r.stdoutText : std::string("<did-not-run>");
-}
-// Plain (unchecked) oracle — no ASan/LSan enforcement. Used ONLY by the
-// owning-iterator control row below, which sits on a DIFFERENT, pre-existing
-// leak (issue #3878) that `runAotChecked` would otherwise fail on every run,
-// masking the one property this row exists to prove (this fix does not touch
-// the owning-iterator path at all). Mirrors the c3-l2/#3874 pattern: assert
-// the VALUE only, with a comment naming the filed issue.
-std::string plainOut(const std::string& prog) {
-    auto r = runAot(prog);
     return r.ran ? r.stdoutText : std::string("<did-not-run>");
 }
 }  // namespace
@@ -245,28 +237,27 @@ BEZEL_TEST(iterator_yield_borrowing_array_literal_reclaim_3706,
 // warns would double-free (ownership already transferred to the consumer
 // via `TakeCurrent()`). 200 * 3 = 600.
 //
-// ⚠ VALUE-ONLY (`runAot`, not `runAotChecked`): this exact program trips a
-// SEPARATE, PRE-EXISTING leak, unrelated to this fix — issue #3878. `arr`,
-// bound via `const arr := en.TakeCurrent();`, is a `CallExpr`-initialized
-// local; neither `isBorrowingArrayLiteralLocal` nor
-// `isFreshBorrowingArrayMaterializerLocal` (both require a
-// `CollectionLiteralExpr` initializer) ever add it to a reclaim-eligibility
-// set, so its backing is never freed regardless of this fix. MEASURED: this
-// program leaks 24000 B / 400 allocations under `runAotChecked` BOTH with
-// this fix applied and with the ENTIRE fix reverted (`git checkout --
-// src/codegen/LlvmBackend_{Iterators,Async,Setup}.cpp
-// src/codegen/LlvmBackend_impl.hpp
-// src/ownership/Ownership_{Checks.cpp,impl.hpp}` back to the parent commit,
-// rebuilt, relinked) — byte-identical leak, confirming this fix neither
-// causes nor cures it; `Gen()`'s own `yield return xs;` is correctly
+// #3878 FIXED (checked oracle restored): when this file was written, `arr`
+// (bound via `const arr := en.TakeCurrent();`) tripped a SEPARATE,
+// pre-existing leak (issue #3878) unrelated to this fix — neither
+// `isBorrowingArrayLiteralLocal` nor `isFreshBorrowingArrayMaterializerLocal`
+// (both require a `CollectionLiteralExpr` initializer) ever added the
+// `CallExpr`-initialized `arr` to a reclaim-eligibility set. That leak
+// reproduced byte-identically (24000 B / 400 allocations) both with this
+// #3706 fix applied and with it fully reverted, confirming #3706 neither
+// caused nor cured it — `Gen()`'s own `yield return xs;` is correctly
 // UNAFFECTED here (`isOwningIter` is true, so `yieldIsBorrowIterYield` is
 // false, so this program's `MoveNext` lowers identically before and after
-// this fix). Switching this ONE row to the checked oracle is deferred to
-// #3878; the property this row exists to prove — the owning path computes
-// the correct value and is untouched by this fix — does not need it.
+// #3706). #3878 has SINCE landed (a new `isFreshTakeCurrentBuiltinArrayLocal`
+// recognizer joining this same `collectBorrowingArrayFreeEligible` family),
+// so this row is back on the checked oracle like every other row — it now
+// cross-checks BOTH fixes at once: the owning path's printed value stays
+// correct and untouched by #3706 (unchanged property), AND `arr`'s backing
+// is now reclaimed (the #3878 property), so a regression in EITHER fix
+// fails this row.
 BEZEL_TEST(iterator_yield_borrowing_array_literal_reclaim_3706,
            owning_iterator_bare_array_literal_yield_unaffected_control) {
-    BEZEL_EXPECT_EQ(plainOut(
+    BEZEL_EXPECT_EQ(checkedOut(
         "module M; "
         "class C "
         "  public static method Gen(): IOwningEnumerable<Array<int>> "

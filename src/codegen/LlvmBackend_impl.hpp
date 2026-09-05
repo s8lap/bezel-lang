@@ -13189,6 +13189,26 @@ private:
     // or UAF against whatever DOES own that other path's Key.
     bool isFreshDictEntryKeyReleaseTerminalLocal(
         const LocalDeclInitView& view) const;
+    // fix #3878 / §29.1 / §28.9 / §28.11 (v0.294): true if the local described
+    // by `view` is a plain `const`/`var` bound directly to an explicit
+    // `<expr>.TakeCurrent()` call on a builtin (declaration-less)
+    // `IOwningEnumerator<T>`/`IOwningAsyncEnumerator<T>`, at a builtin
+    // `Array<T>` result type (name-head exactly "Array", the shape this issue
+    // measures — Set<T>/Dictionary<K,V> are left unwidened; file rather than
+    // guess if one of those leaks too). Mirrors
+    // isFreshDictEntryKeyReleaseTerminalLocal immediately above (independent
+    // candidacy test, same result-type-then-call-shape pattern), and the
+    // receiver-type gate is the SAME two-predicate combination
+    // (isIterFormatEnumeratorHead && isOwningIterableInterfaceHead) the
+    // explicit-TakeCurrent codegen arm itself uses to recognize this call
+    // shape (LlvmBackend_Calls2.cpp's `isOwningEnumerator`), so this
+    // recognizer can never admit a local whose initializer that arm did not
+    // actually lower this way. `using var` already reclaims via
+    // registerUsingDisposal (view.isUsing excluded below) — this predicate
+    // exists only for the const/plain-var gap #3878 measured (24000 B / 400
+    // allocations over 200 drains).
+    bool isFreshTakeCurrentBuiltinArrayLocal(
+        const LocalDeclInitView& view) const;
     // #1871 / §28.9 / §28.11: true if the local described by `view` is a plain
     // `var xs: Array<T> := [ ... ]` (a borrowing `Array<T>` local initialised by
     // a collection literal) whose element policy is backing-only (null per-

@@ -26597,6 +26597,52 @@ bool Emitter::isFreshDictEntryKeyReleaseTerminalLocal(
 }
 
 
+// fix #3878 / §29.1 / §28.9 / §28.11 (v0.294): see the declaration comment in
+// LlvmBackend_impl.hpp. §29.1's "`Current` semantics on borrowing and owning
+// enumerators" states `TakeCurrent()` "transfers ownership of the most-
+// recently-yielded value to the caller" and that the result "follows the
+// standard §28.1/§28.3 owned-return rules (discharge or auto-drop-with-
+// warning — no special carve-out needed)" — i.e. a plain `const`/`var` local
+// bound to it is an ordinary owned local like any other. For a builtin
+// `Array<T>` result, "discharge" is §28.9/§28.11's "reclaimed with the
+// instance" backing free — exactly what `using var` already gets via
+// registerUsingDisposal, and exactly what plain `const`/`var` were missing
+// (issue #3878, measured 24000 B / 400 allocations over 200 drains).
+bool Emitter::isFreshTakeCurrentBuiltinArrayLocal(
+        const LocalDeclInitView& view) const {
+    if (view.isUsing || !view.init) return false;
+    // Result type must be a builtin borrowing `Array<T>` (name-head exactly
+    // "Array", declaration-less) — the same gate
+    // isFreshBorrowingArrayMaterializerLocal uses. Narrow on purpose: file a
+    // new issue rather than widen speculatively if Set<T>/Dictionary<K,V>
+    // ever measure the same leak through a different codegen arm.
+    const sema::TypeRef* rt = nullptr;
+    if (view.type) rt = ctx_.resolvedType(*view.type);
+    if (!rt) rt = ctx_.exprType(*view.init);
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
+        return false;
+    if (builtinTypeName(rt) != "Array") return false;
+    // The initializer must be an explicit, no-argument `<expr>.TakeCurrent()`
+    // call whose RECEIVER is a builtin (declaration-less)
+    // IOwningEnumerator<T>/IOwningAsyncEnumerator<T> — the SAME two-predicate
+    // combination (isIterFormatEnumeratorHead && isOwningIterableInterfaceHead)
+    // LlvmBackend_Calls2.cpp's explicit-TakeCurrent codegen arm
+    // (`isOwningEnumerator`, #1349 / §29.1) already uses to recognize this
+    // exact call shape, so this recognizer can never admit a local whose
+    // initializer that arm did not actually lower this way.
+    auto* call = dynamic_cast<const ast::CallExpr*>(view.init);
+    if (!call || !call->callee || !call->args.empty()) return false;
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call->callee.get());
+    if (!ma || !ma->target || ma->member != "TakeCurrent") return false;
+    const sema::TypeRef* recvTy = ctx_.exprType(*ma->target);
+    return recvTy && recvTy->kind == sema::TypeRef::Kind::Named &&
+           !recvTy->declaration && recvTy->astNode && recvTy->astNode->name &&
+           !recvTy->astNode->name->parts.empty() &&
+           common::isIterFormatEnumeratorHead(recvTy->headName()) &&
+           common::isOwningIterableInterfaceHead(recvTy->headName());
+}
+
+
 // #1004 / stdlib §5 / §3 / §28: is `e` an EXPRESSION codegen lowers to a FRESH,
 // OWNERLESS `Array<T>` temporary — i.e. a fresh-array materializer call
 // (`recv.ToArray()`, `recv.Sorted(...)`, or `recv.Reversed()`) whose result is
@@ -26957,6 +27003,17 @@ void Emitter::collectBorrowingArrayFreeEligible(
             if (isFreshDictEntryKeyReleaseTerminalLocal(v))
                 dictEntryKeyCandidates.push_back(node);
             if (isFreshBorrowingArrayMaterializerLocal(v))
+                candidates.push_back(node);
+            // fix #3878 / §29.1 / §28.9 / §28.11: a plain `const`/`var` bound
+            // to `<expr>.TakeCurrent()` on a builtin owning enumerator, at a
+            // builtin `Array<T>` result type — mutually exclusive with the
+            // branch just above (that one requires the initializer CallExpr's
+            // member name to be ToArray/Sorted/Reversed/Split; this one
+            // requires TakeCurrent), so ordering relative to it is immaterial.
+            // Feeds the SAME `candidates` vector so it gets the identical
+            // escape walk and the identical (already-generic) `lowerLocalDecl`
+            // consumer — no new consumption code needed.
+            else if (isFreshTakeCurrentBuiltinArrayLocal(v))
                 candidates.push_back(node);
             // #1871 / §28.9 / §28.11: a plain `var xs: Array<T> := [ ... ]` — a
             // collection literal whose backing the local solely owns. `Array<T>`
