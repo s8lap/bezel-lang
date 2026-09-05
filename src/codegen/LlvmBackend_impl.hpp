@@ -16082,6 +16082,32 @@ private:
     // §4.17 `where K: IComparable<K>` shape that nothing checks today (#3490).
     llvm::Function* buildObjectCompareToThunk(const sema::TypeRef* ty);
 
+    // fix #3740 (stdlib §4.18 / §14.2, v0.291): is `ty` a RECORD that declares
+    // a dispatchable single-parameter `CompareTo` (the record analogue of
+    // `hasObjectHeaderEquality`'s class/interface test)? A PURE predicate — no
+    // IR side effects — so `genericBackingType`'s eligibility test stays
+    // side-effect-free; the side-effecting half is `buildRecordCompareToThunk`
+    // below, built only by an actual consumer. Deliberately independent of
+    // `recordTypeOfRef` (which requires the record to be auto-hashable, §9.2):
+    // a record can be `IComparable<T>`-ordered without being hashable at all
+    // (stdlib §4.18 requires only `T: IComparable<T>`), so this predicate must
+    // admit exactly the case `recordTypeOfRef` excludes.
+    bool recordHasDispatchableCompareTo(const sema::TypeRef* ty) const;
+
+    // fix #3740 (stdlib §4.18 / §14.2, v0.291): the record analogue of
+    // `buildObjectCompareToThunk` — a `CompareTo`-dispatch comparator thunk
+    // `int cmp(const void* a, const void* b)` for a RECORD element/key. Unlike
+    // a class/interface key (whose stored bytes are the REFERENCE itself, so
+    // `a`/`b` are `ptr*` and the callee spills), a record's stored bytes ARE
+    // its own inline struct value (the same layout `buildRecordHashTrampoline`/
+    // `buildRecordEqTrampoline` read), so `a`/`b` are DIRECT pointers to the
+    // record and no vtable dispatch applies — records are not polymorphic
+    // (CG29): `this` passes by pointer (§9.4/CG29) and the second operand by
+    // value, mirroring `Math.Min`'s pre-existing record-`CompareTo` dispatch
+    // (`comparableCompareTo`/`emitCompareToCmp`) rather than re-deriving it.
+    // Null for a non-record, or a record with no single-parameter `CompareTo`.
+    llvm::Function* buildRecordCompareToThunk(const sema::TypeRef* ty);
+
     // fix #3530 (§14.1 / §2.8.3 rule 4, v0.283): buildObjectCompareToThunk's
     // per-instantiation cache, keyed on `descIdentityKey(declaration, instArgs)`
     // — the STRUCTURAL identity — rather than on the emitted symbol name,

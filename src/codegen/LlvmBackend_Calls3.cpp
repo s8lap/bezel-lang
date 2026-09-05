@@ -430,6 +430,28 @@ const sema::TypeRef* Emitter::genericBackingType(const sema::TypeRef* collTy,
         // returns null (§4.18's `where T: IComparable<T>` going unchecked for
         // a builtin generic is #3490's open question, unaffected by this fix).
         eligible = true;
+    // fix #3740 (stdlib §4.18 / §14.2, v0.291): a SortedSet<T> RECORD element
+    // that is NOT auto-hashable (`recordTypeOfRef` above already excluded it
+    // — §3.6/§9.2: an explicit field declaration, not an auto-property, that
+    // is not `equality skip`ped) but DOES declare a dispatchable
+    // single-parameter `CompareTo` (§14.2's `IComparable<T>` shape) — the
+    // value-type analogue of the class/interface exception immediately
+    // above. Named explicitly to
+    // `SortedSet` for the identical reason that one is: `Set<T>`/
+    // `OwningSet<T>` must not widen (no test here measures that blast
+    // radius), and unlike a plain hashable record (routed through
+    // `recordTypeOfRef` and structural §9.1/§9.2 Equals/GetHashCode),
+    // `SortedSet<T>`'s membership is `CompareTo`-equality, not structural
+    // equality, per stdlib §4.18 ("Two elements are the same element exactly
+    // when CompareTo returns 0" — the same rule §4.17 states for
+    // `SortedDictionary`'s key). `recordHasDispatchableCompareTo` is a PURE
+    // predicate (no IR side effects), mirroring `hasObjectHeaderEquality`
+    // above: the side-effecting half (actually building the comparator) is
+    // `buildRecordCompareToThunk`, called only by an actual consumer
+    // (`buildSortedObjectKeyIdentity`, from `lowerNew`'s allocation path).
+    else if (isSet && collTy && collTy->headName() == "SortedSet" &&
+             !ty->nullable && recordHasDispatchableCompareTo(ty))
+        eligible = true;
     if (!eligible) return nullptr;
     if (byteSize) {
         llvm::Type* lt = lowerTypeRef(ty);
@@ -896,6 +918,116 @@ llvm::Function* Emitter::specializedClassCompareToFn(
     return specFn;
 }
 
+// fix #3740 (stdlib §4.18 / §14.2, v0.291): is `ty` a RECORD that declares a
+// dispatchable single-parameter `CompareTo`? A PURE predicate (no IR side
+// effects — mirrors `hasObjectHeaderEquality`'s role for the class/interface
+// exception in `genericBackingType`). Deliberately independent of
+// `recordTypeOfRef`, which requires the record to be auto-hashable (§9.2): a
+// non-auto-hashable record (e.g. one with an explicit field declaration, not
+// an auto-property) can still be `IComparable<T>`-ordered — stdlib §4.18
+// requires only `T: IComparable<T>`, not hashability — so this predicate must
+// admit exactly the shape `recordTypeOfRef` excludes.
+//
+// review fix (#3740, silent-wrong-identity finding): a GENERIC record is
+// EXCLUDED here too, matching `buildRecordCompareToThunk`'s own exclusion —
+// the two must agree, because this predicate is `genericBackingType`'s
+// ELIGIBILITY gate and the thunk is the only thing that can make that
+// eligibility SOUND. Before this line, a non-auto-hashable generic record
+// with `CompareTo` was eligibility-wise ADMITTED here while the thunk
+// builder declined it: `genericBackingType` returned non-null, `lowerNew`
+// built the dict table via `buildValueHashTrampoline`/`buildValueEqTrampoline`
+// (the STRUCTURAL fallback, since `recordTypeOfRef` also declines a
+// non-auto-hashable record), `buildSortedObjectKeyIdentity` then found
+// `buildRecordCompareToThunk` null (generic) and left that structural pair
+// UNCHANGED — so the SortedSet silently ordered/deduped by STRUCTURAL
+// equality instead of `CompareTo`-equality. MEASURED: a
+// `record BadG<T>: IComparable<BadG<T>>` with a class-typed `Item: R` field
+// and a `Payload: T` field, `CompareTo` comparing only `Item.V` — two
+// elements with equal `Item.V` but different `Payload` landed as TWO
+// entries (`Count` == 2) where §4.18 ("adding an equal element leaves the
+// set unmodified") requires ONE. That is a loud-crash-to-quiet-wrong-answer
+// regression relative to the pre-#3740 behavior (a compiler abort), which
+// this project treats as strictly worse than the crash it replaced. With
+// this exclusion, `genericBackingType` declines a generic record exactly as
+// it did before #3740, and the pre-existing loud paths (the #2974
+// construction-time degrade, or — for a borrowed-parameter receiver with no
+// construction — the residual malformed-IR crash #3865 already tracks for
+// every non-eligible record shape) fire instead of a silent wrong answer.
+// Monomorphizing a generic record's `CompareTo` (`buildRecordCompareThunk`
+// learning to handle it, the alternative this fix declines) is a
+// self-contained follow-up, not attempted here: no test in this lane
+// exercises it, and the conservative, narrow fix is to keep the two
+// predicates in agreement rather than teach the thunk a new capability.
+bool Emitter::recordHasDispatchableCompareTo(const sema::TypeRef* ty) const {
+    if (!ty || ty->kind != sema::TypeRef::Kind::Named || !ty->declaration ||
+        ty->declaration->kind != ast::TypeDeclKind::Record)
+        return false;
+    if (!sema::genericParamNames(ty->declaration).empty()) return false;
+    sema::MethodSymbol* cm = findMethodByName(ty->declaration, "CompareTo");
+    return cm && cm->params.size() == 1;
+}
+
+// fix #3740 (stdlib §4.18 / §14.2, v0.291): the record analogue of
+// `buildObjectCompareToThunk` above — a `CompareTo`-dispatch comparator thunk
+// `int cmp(const void* a, const void* b)` for a RECORD element/key. Unlike a
+// class/interface key (whose stored bytes ARE the reference, so the ABI is
+// `ptr*` and the caller/callee spill through an extra indirection), a
+// record's stored key/element bytes are its own INLINE struct value — the
+// same layout `buildRecordHashTrampoline`/`buildRecordEqTrampoline` read — so
+// `a`/`b` here are direct pointers to the record and no vtable dispatch
+// applies: records are not polymorphic (CG29). `this` passes by pointer
+// (§9.4/CG29, forwarded unchanged — `a` is already that address) and the
+// second operand by value (loaded from `b`), the identical receiver/argument
+// shape `Math.Min`'s pre-existing record-`CompareTo` dispatch builds inline
+// (`comparableCompareTo`/`emitCompareToCmp`, LlvmBackend_Calls.cpp) — reused
+// here as one shared thunk rather than re-derived per call site.
+//
+// A LOCAL IRBuilder, not `builder_` — mirrors `buildObjectCompareToThunk`:
+// this thunk is built mid-lowering of another function, and touching
+// `builder_`/`currentFn_` would drag `propagateBB_`/`unwindTarget_` with it
+// (the same hazard `rejectUnimplementedComparerCtor` documents for the
+// comparer trampolines). A DIRECT call to the compiled body, not
+// `emitMethodCall`, for the identical reason.
+//
+// Null for a non-record, a record with no single-parameter `CompareTo`, or a
+// GENERIC record — monomorphizing a generic record's `CompareTo` the way
+// `specializedClassCompareToFn` does for a generic class is deliberately out
+// of scope here (no test in this fix exercises it); the caller treats null as
+// "not orderable", exactly as it already does for every other reference-type
+// residual (#3490). The generic exclusion lives SOLELY in
+// `recordHasDispatchableCompareTo` (the entry gate immediately below) —
+// review fix (#3740): this function used to carry its OWN second copy of
+// that same exclusion, and the eligibility predicate `genericBackingType`
+// consults did NOT share it, so a generic record was ADMITTED at
+// eligibility while DECLINED here — a silent-wrong-identity gap (see that
+// predicate's comment). One spelling, not two, is what keeps them agreeing.
+llvm::Function* Emitter::buildRecordCompareToThunk(const sema::TypeRef* ty) {
+    if (!recordHasDispatchableCompareTo(ty)) return nullptr;
+    const sema::TypeSymbol* rec = ty->declaration;
+    sema::MethodSymbol* cmpMs = findMethodByName(rec, "CompareTo");
+    auto fnIt = methodFns_.find(cmpMs);
+    // `findMethodByName` already demands `methodFns_.count(ms)`; kept
+    // well-formed rather than trusting that (mirrors buildObjectCompareToThunk).
+    if (fnIt == methodFns_.end()) return nullptr;
+
+    std::string thunkName = std::string("bz$reccmp$") + mangledTypeName(rec);
+    if (auto* existing = module_->getFunction(thunkName)) return existing;
+
+    llvm::StructType* st = recordStruct(rec);
+    auto* fty = llvm::FunctionType::get(i32(), {ptrTy(), ptrTy()}, false);
+    auto* fn = llvm::Function::Create(fty, llvm::Function::InternalLinkage,
+                                      thunkName, module_.get());
+    auto* bb = llvm::BasicBlock::Create(llvm_, "entry", fn);
+    llvm::IRBuilder<> thunkB(bb);
+    llvm::Value* thisPtr = &*fn->arg_begin();
+    llvm::Value* bVal =
+        thunkB.CreateLoad(st, &*std::next(fn->arg_begin()), "cmp.b");
+    llvm::Value* result =
+        thunkB.CreateCall(fnIt->second, {thisPtr, bVal}, "cmp.result");
+    thunkB.CreateRet(result);
+    return fn;
+}
+
 // fix #3488 / stdlib §4.17 (v0.283): the stored-identity pair for a REFERENCE
 // key of a `SortedDictionary<K, V>`.
 //
@@ -937,10 +1069,23 @@ bool Emitter::buildSortedObjectKeyIdentity(const sema::TypeRef* keyTy,
                                            llvm::Function*& hashOut,
                                            llvm::Function*& eqOut) {
     llvm::Function* cmp = buildObjectCompareToThunk(keyTy);
-    // Null for `Object` and for a reference type that declares no `CompareTo`
+    // fix #3740 (stdlib §4.18, v0.291): a non-auto-hashable RECORD element
+    // shares the identical "no hash consistent with CompareTo-equality"
+    // problem a reference key has (this function's own header comment above)
+    // — `buildObjectCompareToThunk` is null for EVERY record (it only ever
+    // inspects a class/interface), so try the record analogue next.
+    // `!recordTypeOfRef(keyTy)` keeps this NARROW to exactly the shape
+    // `genericBackingType`'s own new eligibility branch admits: an
+    // AUTO-HASHABLE record (recordTypeOfRef non-null) that also happens to
+    // implement `CompareTo` keeps its EXISTING structural §9.1/§9.2 identity
+    // unchanged — widening that pair to CompareTo-equality is a distinct,
+    // unmeasured semantic change this fix does not make.
+    if (!cmp && !recordTypeOfRef(keyTy)) cmp = buildRecordCompareToThunk(keyTy);
+    // Null for `Object`, for a reference type that declares no `CompareTo`
     // — §4.17 constrains `K: IComparable<K>`, but nothing checks that for a
     // builtin generic (#3490), so such a key stays on today's §8.3 pair rather
-    // than acquiring a new rejection this lane did not measure.
+    // than acquiring a new rejection this lane did not measure — and for a
+    // record with no dispatchable `CompareTo` (same #3490-shaped residual).
     if (!cmp) return false;
 
     static const char* kHashName = "bz$sortedobjkey$hash";
@@ -1007,7 +1152,17 @@ llvm::Function* Emitter::buildSortedKeyComparator(const sema::TypeRef* keyTy) {
         // (§4.17: "Ordering is defined by `K`'s `IComparable<K>.CompareTo`"),
         // which buildObjectCompareToThunk dispatches at the same ABI.
         return buildObjectCompareToThunk(keyTy);
-    else return nullptr;  // unsupported (record, decimal, etc.)
+    // fix #3740 (stdlib §4.18, v0.291): a non-auto-hashable RECORD key/element
+    // with a dispatchable `CompareTo` — the value-type analogue of the
+    // class/interface branch immediately above, admitting exactly the shape
+    // `genericBackingType`'s own new SortedSet exception admits. `!recordTypeOfRef`
+    // keeps this narrow to that shape only: an AUTO-HASHABLE record (already
+    // routed through `recordTypeOfRef` elsewhere) stays on today's `nullptr`
+    // — widening ordering to every record is a distinct, unmeasured change
+    // (and was already `nullptr` before this fix, so nothing regresses).
+    else if (!recordTypeOfRef(keyTy) && recordHasDispatchableCompareTo(keyTy))
+        return buildRecordCompareToThunk(keyTy);
+    else return nullptr;  // unsupported (other records, decimal, etc.)
 
     if (auto* existing = module_->getFunction(name)) return existing;
 
