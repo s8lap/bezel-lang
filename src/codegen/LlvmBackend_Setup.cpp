@@ -33005,13 +33005,20 @@ llvm::Value* Emitter::materializeHeapDictLiteral(
         genericBackingType(dictTy, 0, /*isSet=*/false, &ksz);
         llvm::Function* hashT = buildValueHashTrampoline(keyTy);
         llvm::Function* eqT   = buildValueEqTrampoline(keyTy);
-        // fix #3488 / stdlib §4.17: the literal form allocates the same table
-        // as `lowerNew`, so it takes the same `CompareTo`-identity retarget for
-        // a SortedDictionary reference key. Keeping the two in step is the
-        // point: a literal-built and a `new`-built map of the same type must
-        // agree on what "the same key" means.
-        if (dictTy->headName() == "SortedDictionary")
-            buildSortedObjectKeyIdentity(keyTy, hashT, eqT);
+        // fix #3831 (§15.4, v0.294): a #3488 comment here used to retarget a
+        // literal-built `SortedDictionary`'s hash/eq trampolines to its
+        // `CompareTo`-identity, mirroring `lowerNew`'s allocation. But §15.4's
+        // dictionary-literal form admits only `Dictionary<K, V>`/
+        // `OwningDictionary<K, V>` — a closed two-name list that never
+        // included `SortedDictionary<K, V>` — and sema now rejects a
+        // `SortedDictionary` literal target before codegen is reached
+        // (`isCollectionLiteralAdmissibleTarget` /
+        // `isCollectionLiteralEmptyAdmissibleTarget`, ExprTypecheck_Calls.cpp),
+        // so `dictTy->headName() == "SortedDictionary"` can no longer hold at
+        // this call site; the retarget was also the path that leaked the
+        // backing table (#3517 item 1). `lowerNew`'s own retarget
+        // (LlvmBackend_Exprs2.cpp:5474) is untouched — `new
+        // SortedDictionary<K, V>()` remains legal and unaffected.
         auto* allocFn = declareC("bz_dict_alloc_generic", ptrTy(),
                                  {i64(), ptrTy(), ptrTy()});
         dict = builder_.CreateCall(allocFn,

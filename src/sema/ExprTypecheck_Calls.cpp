@@ -413,6 +413,28 @@ void reportCollectionLiteralBadTarget(DiagnosticEngine& diags,
                                       SourceLocation loc,
                                       const TypeRef* target) {
     std::string spelled = collectionLiteralTargetSpelling(target);
+    // fix #3831 (§15.4, v0.294): `SortedDictionary<K, V>` reaches this
+    // generic fallback for EVERY literal form (dict, sequence, and empty) —
+    // it is now excluded from both `isCollectionLiteralAdmissibleTarget`'s
+    // dict-form and sequence-form checks (see that predicate's exclusion
+    // comment above), so it never matches the "target admits the OTHER
+    // form" branch any call site checks before falling here. Name the
+    // SortedDictionary-specific remedy instead of the generic
+    // "pick a listed target" nudge, since the fix (`new` + `.Add`) is
+    // concrete and worth stating.
+    if (target && target->kind == TypeRef::Kind::Named && target->astNode &&
+        target->astNode->name && !target->astNode->name->parts.empty() &&
+        target->headName() == "SortedDictionary") {
+        diags.report(
+            Severity::Error, loc,
+            "a collection literal `[...]` cannot target the type `" +
+            spelled + "` — §15.4's collection-literal target list admits "
+            "only `Dictionary<K, V>`/`OwningDictionary<K, V>` for the "
+            "dictionary form, not `SortedDictionary<K, V>`; use `new "
+            "SortedDictionary<K, V>()` followed by `.Add(k, v)` per "
+            "key/value pair instead (§15.4)");
+        return;
+    }
     diags.report(
         Severity::Error, loc,
         "a collection literal `[...]` cannot target the type `" + spelled +
@@ -429,11 +451,21 @@ void reportCollectionLiteralBadTarget(DiagnosticEngine& diags,
 // built-in `Dictionary<K, V>` and `OwningDictionary<K, V>`." The target
 // spelling is the same as the generic rejection above so the message names
 // the type the user must change, but the remediation is different — the
-// literal's FORM is the wrong thing here, not the target type. (The
-// `SortedDictionary<K,V>` family member is included both because it lives on
-// the same runtime as `Dictionary<K,V>` and because §15.4's `OwningDictionary`
-// synonym is the owning form of the same head; the user-extensible
-// dictionary-literal protocol is §18 deferred.)
+// literal's FORM is the wrong thing here, not the target type.
+// fix #3831 (§15.4, v0.294): `SortedDictionary<K, V>` was previously admitted
+// here on the (mistaken) reasoning that it shares `Dictionary<K, V>`'s
+// runtime and that §15.4's `OwningDictionary` synonym covers "the owning form
+// of the same head" — but §15.4's target-set sentence is a CLOSED two-name
+// list ("targets ONLY the built-in `Dictionary<K, V>` and
+// `OwningDictionary<K, V>`") and `SortedDictionary<K, V>` is not one of the
+// two names; the ruling on #3517 confirms the list is closed and that
+// widening it is an undecided proposal question (#3489), not current
+// behavior. Admitting it here let `materializeHeapDictLiteral`
+// (LlvmBackend_Setup.cpp) retarget a literal onto a `SortedDictionary`'s
+// `CompareTo`-identity table, which leaked the backing (#3517 item 1); with
+// the admission gone that codegen path is unreachable. `SortedDictionary<K,
+// V>` is unaffected everywhere else — `new SortedDictionary<K, V>()` +
+// `.Add(k, v)` remains the only construction path, exactly as before.
 void reportCollectionLiteralDictFormBadTarget(DiagnosticEngine& diags,
                                               SourceLocation loc,
                                               const TypeRef* target) {
@@ -442,7 +474,7 @@ void reportCollectionLiteralDictFormBadTarget(DiagnosticEngine& diags,
         Severity::Error, loc,
         "a dictionary literal `[k: v, ...]` cannot target the type `" +
         spelled + "` — §15.4 admits the dictionary-literal form only at "
-        "`Dictionary<K, V>`/`OwningDictionary<K, V>`/`SortedDictionary<K, V>`; "
+        "`Dictionary<K, V>`/`OwningDictionary<K, V>`; "
         "remove the key/value pairs to use the sequence-literal form, or "
         "change the target type to a dictionary (§15.4)");
 }
@@ -455,8 +487,8 @@ void reportCollectionLiteralDictFormBadTarget(DiagnosticEngine& diags,
 //     paths, but the LAMBDA-BODY materialiser routes through here too;
 //   * a CONCRETE builtin collection named type (`Array`/`OwningArray`,
 //     `Stack`/`OwningStack`, `Queue`/`OwningQueue`, `LinkedList`/
-//     `OwningLinkedList`, `Set`/`OwningSet`, `Dictionary`/`OwningDictionary`/
-//     `SortedDictionary`)
+//     `OwningLinkedList`, `Set`/`OwningSet`, `Dictionary`/`OwningDictionary`
+//     — NOT `SortedDictionary`, fix #3831, §15.4's target list is closed)
 //     — matched by name in codegen's materializeHeapCollectionLiteral /
 //     materializeHeapDictLiteral;
 //   * a user type that declared `FromCollectionLiteral` (stdlib §15.4 — the
@@ -467,7 +499,8 @@ void reportCollectionLiteralDictFormBadTarget(DiagnosticEngine& diags,
 // site that needs the same positive check.
 // per §15.4 (#3031): the predicate ALSO consults the literal's FORM. The
 // dictionary-literal form `[k: v, ...]` is admitted only at the dictionary
-// family (`Dictionary<K,V>`/`OwningDictionary<K,V>`/`SortedDictionary<K,V>`);
+// family (`Dictionary<K,V>`/`OwningDictionary<K,V>` — fix #3831 removed
+// `SortedDictionary<K,V>`, which §15.4's closed target list never listed);
 // the sequence-literal form `[e1, e2, ...]` is admitted at every OTHER
 // §15.4 target (inline arrays, the sequence-shaped collection heads, and a
 // user type opting in via `FromCollectionLiteral` — §15.4.1 is sequence-only).
@@ -522,14 +555,21 @@ bool isCollectionLiteralAdmissibleTarget(const TypeRef* t, bool isDict) {
     }
     // Builtin collections: Array/OwningArray/Stack/OwningStack/Queue/
     // OwningQueue/Set/OwningSet/LinkedList/OwningLinkedList + Dictionary/
-    // OwningDictionary/SortedDictionary — matched by simple name (the #1414
-    // stage-3 registry is the single source of truth, but a name-only check
-    // is sufficient here because the codegen side does the same).
+    // OwningDictionary — matched by simple name (the #1414 stage-3 registry
+    // is the single source of truth, but a name-only check is sufficient
+    // here because the codegen side does the same).
+    // fix #3831 (§15.4, v0.294): `SortedDictionary<K, V>` is deliberately
+    // NOT matched here (nor by the sequence-form list below) — §15.4's
+    // target-set sentence is a closed two-name list for the dictionary form
+    // ("targets ONLY the built-in `Dictionary<K, V>` and `OwningDictionary<K,
+    // V>`"), and `SortedDictionary<K, V>` has no sequence-literal form
+    // either (it is not a §15.4.1 conformer). Falling through both checks
+    // below correctly returns `false` for it under either literal form.
     if (!t->astNode || !t->astNode->name || t->astNode->name->parts.empty())
         return false;
     std::string_view n = t->headName();
     // §15.4 last paragraph: only the dictionary family accepts the dict form.
-    if (n == "Dictionary" || n == "OwningDictionary" || n == "SortedDictionary")
+    if (n == "Dictionary" || n == "OwningDictionary")
         return isDict;
     // Every other §15.4 head is sequence-shaped; the seq form only.
     return !isDict && (n == "Array" || n == "OwningArray" || n == "Stack" ||
@@ -595,7 +635,10 @@ bool isCollectionLiteralEmptyAdmissibleTarget(const TypeRef* t) {
     }
     // Builtin collections: Array/OwningArray/Stack/OwningStack/Queue/
     // OwningQueue/Set/OwningSet/LinkedList/OwningLinkedList + Dictionary/
-    // OwningDictionary/SortedDictionary.
+    // OwningDictionary. fix #3831 (§15.4, v0.294): `SortedDictionary<K, V>`
+    // is NOT on §15.4's closed target list (dict form or empty form), so it
+    // is deliberately excluded here too — see the sibling exclusion comment
+    // on `isCollectionLiteralAdmissibleTarget` above.
     if (!t->astNode || !t->astNode->name || t->astNode->name->parts.empty())
         return false;
     std::string_view n = t->headName();
@@ -603,7 +646,7 @@ bool isCollectionLiteralEmptyAdmissibleTarget(const TypeRef* t) {
            n == "OwningStack" || n == "Queue" || n == "OwningQueue" ||
            n == "Set" || n == "OwningSet" || n == "LinkedList" ||
            n == "OwningLinkedList" || n == "Dictionary" ||
-           n == "OwningDictionary" || n == "SortedDictionary";
+           n == "OwningDictionary";
 }
 
 // §22.6 classify how `argTy` matches `paramTy` at one argument position.
