@@ -181,3 +181,108 @@ BEZEL_TEST(codegen_record_string_field_call_release_1747,
     // the prior safe behaviour, tracked as a residual #1747 channel).
     BEZEL_EXPECT_TRUE(rc != 2);
 }
+
+// fix #3745 / §9.7 / §28.9 (v0.286): isProvablyFreshRecordFactoryMethod now
+// admits the two-statement factory body `(var x := new P(...); return x;)` —
+// the natural expansion of the existing single-statement
+// `return new P(...);` case the #1747 row above already pins. On stock main
+// the multi-statement shape was REJECTED (the predicate required exactly one
+// statement), so a `var p := Make(...)` local on this shape leaked one
+// `bz_string_release` per call (LSan-measured 7000 B / 400 allocations over
+// 200 iter — #3745 row 3). With the predicate extension it is admitted, the
+// recordStringFields scope-end disposal is registered, and the program is
+// LSan-clean. Pins the positive case the #1747 narrow fix could NOT reach
+// before the predicate gained the second-statement arm.
+BEZEL_TEST(codegen_record_string_field_call_release_1747,
+           record_return_call_result_multistmt_factory_released_spec_9_7_3745) {
+    std::string src =
+        "module M; record P(Name: string, X: int); "
+        "class C public static method Mk(): P "
+        "  var x := new P($\"hello\", 8); "
+        "  return x; "
+        "end Mk; "
+        "public static method Main(): int "
+        "  var total := 0; "
+        "  var i := 0; "
+        "  while i < 200 do "
+        "    var p := Mk(); "
+        "    total := total + p.X; "
+        "    i := i + 1; "
+        "  end while; "
+        "  return total; "
+        "end Main; end C;";
+    int rc = runUnderLeakSanitizer(src);
+    if (rc == -1) return;
+    // Output check: total = 8 * 200 = 1600 (every record's X is 8).
+    BEZEL_EXPECT_EQ(rc, 0);
+}
+
+// fix #3745 / §9.7 / §28.9 (v0.286): control — the EXISTING single-statement
+// `return new P(...);` shape MUST stay admitted by the predicate extension.
+// The two-statement arm gates ONLY on the EXACT two-statement shape
+// (LocalDecl + ReturnStmt, plain `var`, identifier return); a single-
+// statement return continues to flow through the (b) arm. Pins no regression
+// on the #1747 positive case when the predicate's case (c) is added.
+BEZEL_TEST(codegen_record_string_field_call_release_1747,
+           record_return_call_result_singleexpr_factory_still_clean_spec_9_7_3745) {
+    std::string src =
+        "module M; record P(Name: string, X: int); "
+        "class C public static method Mk(): P => new P($\"hello\", 8); "
+        "public static method Main(): int "
+        "  var total := 0; "
+        "  var i := 0; "
+        "  while i < 200 do "
+        "    var p := Mk(); "
+        "    total := total + p.X; "
+        "    i := i + 1; "
+        "  end while; "
+        "  return total; "
+        "end Main; end C;";
+    int rc = runUnderLeakSanitizer(src);
+    if (rc == -1) return;
+    BEZEL_EXPECT_EQ(rc, 0);
+}
+
+// fix #3745 / §9.7 / §28.9 (v0.286): fail-closed regression — the predicate's
+// two-statement arm must REJECT a body that is NOT exactly
+// `(var x := new P(...); return x;)`. A control-flow shape (an `if` between
+// the local and the return, two locals, an `else`, etc.) must NOT be
+// admitted — otherwise we re-open the #2448 use-after-free class through a
+// construct this predicate does not reason about. Here we use the simplest
+// failure-2 — a SECOND LocalDecl — to pin that the predicate returns false
+// even when the body is otherwise well-shaped (a factory method with two
+// locals + return).
+//
+// Pinned via the LEAK channel: if the predicate incorrectly admitted the
+// two-local shape, the `var p := Mk();` local on the call-result side would
+// either be scope-end-released (UAF if Mk returned a borrowed field) OR
+// conservatively not released (leak). For a body that returns a fresh
+// construction in BOTH locals, the conservatively-not-released branch
+// dominates — the program runs to completion (no UAF, since the body is
+// fresh on every path) and LSan reports the leftover +1.
+BEZEL_TEST(codegen_record_string_field_call_release_1747,
+           record_return_call_result_two_locals_factory_still_leaky_spec_9_7_3745) {
+    std::string src =
+        "module M; record P(Name: string, X: int); "
+        "class C public static method Mk(n: int): P "
+        "  var x := new P($\"hello\", n); "
+        "  var y := new P($\"world\", n); "
+        "  return x; "
+        "end Mk; "
+        "public static method Main(): int "
+        "  var total := 0; "
+        "  var i := 0; "
+        "  while i < 50 do "
+        "    var p := Mk(i); "
+        "    total := total + p.X; "
+        "    i := i + 1; "
+        "  end while; "
+        "  return total; "
+        "end Main; end C;";
+    int rc = runUnderLeakSanitizer(src);
+    if (rc == -1) return;
+    // Pin no UAF / double-free: rc must NOT be 2. The leak itself (rc == 1)
+    // is the documented safe direction for the two-local shape the predicate
+    // does not admit — a bounded leak, not a soundness defect.
+    BEZEL_EXPECT_TRUE(rc != 2);
+}

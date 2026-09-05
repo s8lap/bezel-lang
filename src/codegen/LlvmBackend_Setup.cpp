@@ -26101,19 +26101,25 @@ bool Emitter::isFreshRecordConstructionOfExactType(
 // isFreshRecordConstructionOfExactType? Deliberately narrow: supports ONLY
 // (a) an expression-bodied method (`=> new P(...)`), or (b) a block-bodied
 // method whose ENTIRE top-level statement list is EXACTLY ONE statement, a
-// `return new P(...);`. This sidesteps a general control-flow walk over the
+// `return new P(...);`, or (c) a block-bodied method whose ENTIRE top-level
+// statement list is EXACTLY TWO statements, a `var x := new P(...);` followed
+// by `return x;` — the natural two-statement form the single-statement case
+// generates from. This sidesteps a general control-flow walk over the
 // callee's body — which would risk silently missing a return hidden in an
 // unrecognized statement/expression kind and admitting an UNSAFE callee —
 // by requiring the body have NO other statement in which one could hide.
 // The EXISTING #1747 test's shape
 // (`Mk(): P return new P($"hello", 8); end Mk;`) is exactly case (b): one
-// statement, so it stays admitted. A multi-statement or branching factory
-// body (e.g. a local computed first, or an if/else choosing between two
-// constructions) is conservatively REJECTED — a bounded leak for that
-// shape, strictly preferable to silently re-admitting the #2448
-// use-after-free class through a construct this check does not reason
-// about. (A fuller whole-body escape analysis remains a follow-up, out of
-// this fix's scope — see the commit message.)
+// statement, so it stays admitted. The #3745 row-3 shape
+// (`Make(n): RStr<int> var r := new RStr<int>(n); return r; end Make;`)
+// is exactly case (c): two statements, single local, single return, no
+// branching. A multi-statement body that is NOT case (c) — two locals,
+// two constructions, an `if`/`while` choosing between constructions,
+// or any other control-flow shape — is conservatively REJECTED — a
+// bounded leak for that shape, strictly preferable to silently
+// re-admitting the #2448 use-after-free class through a construct this
+// check does not reason about. (A fuller whole-body escape analysis
+// remains a follow-up, out of this fix's scope — see the commit message.)
 bool Emitter::isProvablyFreshRecordFactoryMethod(
         const sema::MethodSymbol* ms, const sema::TypeSymbol* recTs) const {
     if (!ms || !recTs) return false;
@@ -26139,10 +26145,51 @@ bool Emitter::isProvablyFreshRecordFactoryMethod(
         return isFreshRecordConstructionOfExactType(md->exprBody.get(), recTs);
     }
     if (md->bodyKind == ast::MethodBodyKind::Block) {
-        if (md->stmts.size() != 1) return false;
-        auto* rs = dynamic_cast<const ast::ReturnStmt*>(md->stmts[0].get());
-        if (!rs) return false;
-        return isFreshRecordConstructionOfExactType(rs->value.get(), recTs);
+        // fix #3745 / §9.7 / §28.9 (v0.286): also admit the two-statement
+        // shape `(var x := new P(...); return x;)` — the natural expansion
+        // the (b) single-statement case generates from and the shape the
+        // #3745 row-3 repro exercises. Bound: EXACTLY two statements, the
+        // first a `LocalDecl` whose initializer is a provably-fresh
+        // construction of recTs and whose declared type (if any) is recTs,
+        // the second a `return <that local>;`. The local must be a plain
+        // `var` (no `using` / `await using`), and the return must be a
+        // bare-identifier read of that local (no operator, no method call,
+        // no indexer — the same "this is a direct return of one local" rule
+        // the relaxation's earlier cases implicitly relied on). A
+        // different-shape body (two locals, two constructions, an if/while
+        // between them, or any other statement interleaved) stays
+        // conservatively rejected — leak-over-UAF, the safe direction.
+        if (md->stmts.size() == 1) {
+            auto* rs = dynamic_cast<const ast::ReturnStmt*>(md->stmts[0].get());
+            if (!rs) return false;
+            return isFreshRecordConstructionOfExactType(rs->value.get(), recTs);
+        }
+        if (md->stmts.size() == 2) {
+            auto* ld = dynamic_cast<const ast::LocalDecl*>(md->stmts[0].get());
+            auto* rs = dynamic_cast<const ast::ReturnStmt*>(md->stmts[1].get());
+            if (!ld || !rs) return false;
+            // Plain `var` only (no `using` / `await using`) — a using-var
+            // would imply a Dispose path on the local, which this analysis
+            // does not track through.
+            if (ld->isUsing || ld->isAwaitUsing) return false;
+            // Initializer must be a provably-fresh construction of recTs.
+            if (!isFreshRecordConstructionOfExactType(ld->initializer.get(),
+                                                       recTs)) return false;
+            // Return value must be a bare-identifier read of THAT local —
+            // not a field access, member call, indexer, or any other
+            // expression (those shapes are not yet audited against the
+            // record-call-result release's aliasing rules, conservatively
+            // rejected — leak-over-UAF, the safe direction).
+            auto* rid = dynamic_cast<const ast::IdentifierExpr*>(rs->value.get());
+            if (!rid) return false;
+            // Compare names — the local's `name` (a string_view) and the
+            // identifier's resolved LocalSymbol name. A bare-identifier
+            // read of a local resolves to the local's LocalSymbol whose
+            // `name` matches the LocalDecl's `name`. Using the LocalDecl's
+            // own name keeps this predicate AST-only (no sema round-trip).
+            return rid->name == ld->name;
+        }
+        return false;
     }
     return false;
 }
