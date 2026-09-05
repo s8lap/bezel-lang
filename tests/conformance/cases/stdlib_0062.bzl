@@ -1,4 +1,6 @@
-public class Set<T>: ICollection<T>
+public class Set<T>: ICollection<T>, ICollectionLiteralTarget<Set<T>, T>
+  public static method FromCollectionLiteral(elements: ReadOnlyArraySpan<T>): owned Set<T>;   // §2.19 witness; duplicates
+                                                                                              //   collapse (spec §15.4)
   public constructor();
   public constructor(capacity: int);
   public constructor(comparer: IEqualityComparer<T>);
@@ -14,7 +16,8 @@ public class Set<T>: ICollection<T>
   public method IsSupersetOf(other: IEnumerable<T>): bool;
 end Set;
 
-public class OwningSet<T>: IOwningCollection<T> where T: class
+public class OwningSet<T>: IOwningCollection<T>, IOwningCollectionLiteralTarget<OwningSet<T>, T> where T: class
+  public static method FromCollectionLiteral(owned elements: OwningArray<T>): owned OwningSet<T>;   // §2.19 witness
   public constructor();
   public constructor(capacity: int);
   public constructor(comparer: IEqualityComparer<T>);

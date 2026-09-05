@@ -1,4 +1,5 @@
-public class OwningLinkedList<T>: IOwningCollection<T> where T: class
+public class OwningLinkedList<T>: IOwningCollection<T>, IOwningCollectionLiteralTarget<OwningLinkedList<T>, T> where T: class
+  public static method FromCollectionLiteral(owned elements: OwningArray<T>): owned OwningLinkedList<T>;   // §2.19 witness
   public constructor();
 
   public pure readonly property Count: int;

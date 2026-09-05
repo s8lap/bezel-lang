@@ -1,4 +1,4 @@
-public class RingBuffer<T>
+public class RingBuffer<T>: ICollectionLiteralTarget<RingBuffer<T>, T>
   private owned _slots: Array<T>;
   private _head: int;
 
