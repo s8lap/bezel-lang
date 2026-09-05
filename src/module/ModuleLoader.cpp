@@ -4220,10 +4220,16 @@ static void loadMetadataPass2(
     // §4.6 string `+` check passes only because both operands are
     // equally untyped, and the codegen path then routes the binary
     // `+` through the integer-arithmetic fallthrough that emits
-    // `add ptr` (an IR-verification abort). Published here, not after
-    // pass 4, for the same reason `resolvePendingNamed` is placed
-    // here — pass 3's body re-parse is the first consumer that
-    // actually reads these tables.
+    // `add ptr` (an IR-verification abort). Published here for the
+    // same reason `resolvePendingNamed` is placed here — pass 3's body
+    // re-parse is the first consumer that actually reads these tables.
+    //
+    // fix #3828 (§26.1 / §26.5, v0.287): this is the EARLIER of TWO
+    // publishes, not a move. #3748 originally deleted the end-of-
+    // function one, which silently dropped everything pass 4 adds —
+    // every imported EXTENSION method's return type and extension
+    // property's type. Both must run; see the twin block at the end of
+    // this function for why replaying is safe.
     for (auto& [m, ret] : loader.returnTypes_)
         ctx.setImportedReturnType(m, ret, loader.returnOwned_[m]);
     for (auto& [m, ty] : loader.fieldTypes_)
@@ -4702,8 +4708,31 @@ static void loadMetadataPass2(
         ctx.ownImportedAst(std::move(synth));
     }
 
-    // Publish the loader's remaining side tables (the returnType /
-    // fieldType publishes were lifted above pass 3 by #3748).
+    // fix #3828 (§26.1 / §26.5 / §2.8.2 clause 1, v0.287): re-publish the
+    // returnType / fieldType side tables HERE as well as at the early point
+    // #3748 lifted them to. #3748 MOVED this block above pass 3 (pass 3's
+    // field-init re-parse is the first consumer that reads these tables) and
+    // deleted it from here — but pass 4, further down this same function, is
+    // where an imported EXTENSION's members are built, and it writes
+    // `loader.returnTypes_[ms]` for every extension METHOD (~line 4693) and
+    // `loader.fieldTypes_[ps]` for every extension PROPERTY (~line 4665).
+    // Everything pass 4 adds was therefore never published into the
+    // SemaContext: an imported extension method's call site got no
+    // `importedReturnType`, so its CallExpr carried no exprType, and the
+    // §26.1 call degraded to a null lower — the #2434 / #2491 / #2961
+    // "failed to lower to a value" warnings, with the enclosing local /
+    // return / assignment silently zero-filled (measured: `x.Triple()` on an
+    // extension-only dependency returned 0 instead of 21). Both publishes are
+    // needed and the pair is safe: `setImportedReturnType` /
+    // `setImportedMemberType` are idempotent map assignments over the same
+    // (symbol, TypeRef) pairs, and `importedReturnOwned_` is an insert-only
+    // set, so replaying the early entries here is a no-op and the pass-3/4
+    // additions are picked up. Keep BOTH — deleting either reopens one of the
+    // two defects.
+    for (auto& [m, ret] : loader.returnTypes_)
+        ctx.setImportedReturnType(m, ret, loader.returnOwned_[m]);
+    for (auto& [m, ty] : loader.fieldTypes_)
+        ctx.setImportedMemberType(m, ty);
     // fix #2391 (§14.2/§2.8.2, v0.236): publish imported generic base
     // methods' per-parameter constraint payload so checkOverrideSignatureMatch
     // can verify an override's restated clause set against an imported base.

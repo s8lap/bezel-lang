@@ -363,3 +363,86 @@ BEZEL_TEST(xmod_extension_735, metadata_extension_roundtrip_and_hash_2_5) {
     BEZEL_EXPECT_TRUE(serialize(plain) == without);
     BEZEL_EXPECT_EQ(semanticHash(plain), hashWithout);
 }
+
+// ===========================================================================
+// fix #3828 (§26.1 / §26.5 step 2 / §2.8.2 clause 1, v0.287) — BOTH loader
+// publishes of `returnTypes_` / `fieldTypes_` must run, and this row fails if
+// EITHER is removed.
+//
+// `ModuleLoader::loadMetadataPass2` fills two side tables while it walks the
+// metadata (`loader.returnTypes_` per imported method, `loader.fieldTypes_`
+// per imported field/property) and publishes them into the SemaContext with
+// `setImportedReturnType` / `setImportedMemberType`. The publish used to sit
+// at the END of that function. #3748 (v0.286) MOVED it to just before pass 3
+// — pass 3's `parseAndAttachFieldInit` re-parses an imported generic's field
+// initializer against a throwaway SemaContext and is the first consumer that
+// reads these tables — and deleted the trailing copy.
+//
+// That move silently dropped everything pass FOUR adds. Pass 4 is where an
+// imported EXTENSION block's members are reconstructed, and it is the writer
+// of `loader.returnTypes_[ms]` for every extension METHOD and
+// `loader.fieldTypes_[ps]` for every extension PROPERTY. With no published
+// `importedReturnType`, the §26.5-resolved call `x.Triple()` carried no
+// exprType, so codegen had nothing to lower and degraded the enclosing slot
+// to a zero fill — the `#2434` / `#2491` / `#2961` "failed to lower to a
+// value" warning family, exit status 0, WRONG VALUE. #3828 restores the
+// trailing publish while keeping the #3748 early one.
+//
+// The row pins both halves with ONE observable so neither publish can be
+// deleted as "redundant":
+//
+//   * the #3828 half — `x.Triple()` on the dependency's `public extension
+//     int` — contributes 7 * 3 = 21. Without the LATE publish this degrades
+//     to 0 and the total reads 6.
+//   * the #3748 half — `G735P<int>`'s `b: string := H735P.Str() +
+//     H735P.Str()` (two NON-constant string operands on an imported generic)
+//     — contributes `g.b.Length` = 6 ("s42s42", a code-point count, stdlib
+//     §4.6). Without the EARLY publish this is the #3748 malformed-IR shape:
+//     codegen emits `add ptr` and the LLVM verifier aborts, so the importer
+//     never links and `importRun735x` returns -1.
+//
+// 21 + 6 = 27, and each failure mode has a distinct wrong answer (6 / -1).
+// ===========================================================================
+BEZEL_TEST(xmod_extension_735,
+           imported_extension_method_return_type_published_after_pass4_26_1) {
+    namespace fs = std::filesystem;
+    auto dir = fs::temp_directory_path();
+    std::string stem = unique_stem("bz735x_pub_");
+    TempFile735x aSrc((dir / (stem + "_a.bzl")).string());
+    TempFile735x aObj((dir / (stem + "_a.o")).string());
+
+    // One dependency carrying BOTH consumers: an imported generic whose field
+    // initializer pass 3 re-parses (needs the EARLY publish) and an
+    // extension-on-`int` block pass 4 builds (needs the LATE publish).
+    write735x(aSrc.path,
+        "module ExtLib735Pub; "
+        "public class H735P "
+        "  public static method Str(): string => \"s42\"; "
+        "end H735P; "
+        "public class G735P<T> "
+        "  public v: T; "
+        "  public b: string := H735P.Str() + H735P.Str(); "
+        "  public constructor(v0: T) v := v0; end constructor; "
+        "end G735P; "
+        "public extension int "
+        "  public method Triple(): int => this * 3; "
+        "end;");
+
+    BEZEL_EXPECT_TRUE(compileObj735x(aSrc.path, aObj.path));
+    if (!std::ifstream(aObj.path).good()) return;
+
+    TempFile735x bSrc((dir / (stem + "_b.bzl")).string());
+    TempFile735x bExe((dir / (stem + "_b")).string());
+    write735x(bSrc.path,
+        "module App; "
+        "import ExtLib735Pub; "
+        "class C public static method Main(): int "
+        "  var g := new G735P<int>(9); "
+        "  var n := g.b.Length; "        // 6 — the #3748 (early publish) half
+        "  var x: int := 7; "
+        "  var t := x.Triple(); "        // 21 — the #3828 (late publish) half
+        "  return t + n; "               // 21 + 6 = 27
+        "end Main; end C;");
+
+    BEZEL_EXPECT_EQ(importRun735x(bSrc.path, bExe.path, aObj.path), 27);
+}
