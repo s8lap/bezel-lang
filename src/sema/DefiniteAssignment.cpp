@@ -1281,9 +1281,10 @@ private:
                 gateObservation(id->span.begin, "reference to `this`");
                 return;
             }
-            // fix #3583 (§22.8 step 0 / §22.10): the bare spelling of a
-            // primary-constructor parameter in the chaining position.
-            gateChainPositionPrimaryParamRead(*id, id->span.begin);
+            // fix #3583 (§22.8 step 0 / §22.10), widened by fix #3829
+            // (§12.8 / §22.10): the bare spelling of a field, auto-property,
+            // or primary-constructor parameter in the chaining position.
+            gateChainPositionFieldRead(*id, id->span.begin);
             checkRead(*id);
             return;
         }
@@ -1791,8 +1792,9 @@ private:
         }
     }
 
-    // fix #3583 (§22.8 step 0 / §22.10 / §22.7 rule 1, v0.286): a read of a
-    // §22.10 PRIMARY-CONSTRUCTOR PARAMETER in the chaining position.
+    // fix #3583 (§22.8 step 0 / §22.10 / §22.7 rule 1, v0.286), WIDENED by
+    // fix #3829 (§12.8 / §22.10, v0.291): a read of a field, auto-property, or
+    // §22.10 PRIMARY-CONSTRUCTOR PARAMETER of `this` in the chaining position.
     //
     // §22.7 rule 1's gate above deliberately excludes a field read — "a field
     // or auto-property read is backing storage … its own §7.9/§28.8.1 DA rules
@@ -1826,20 +1828,84 @@ private:
     // 3585 both recommend. (issue 3585 asks the spec to state the rule
     // explicitly; this implements the reading its own Recommendation gives, and
     // is recorded there.)
-    void gateChainPositionPrimaryParamRead(const ast::Expr& e,
-                                           const SourceLocation& loc) {
+    //
+    // #3583 landed only the primary-constructor-parameter half (`fs->posParam`
+    // required below). §12.8 states the GENERAL rule of which that is one
+    // instance — "it may **not** read a field or auto-property of the object
+    // under construction — nor, in a class with a primary constructor, a
+    // primary-constructor parameter" (§12.8, v0.291) — and §22.10 gives the
+    // same fact from the field side: "as is reading any field or auto-property
+    // of the not-yet-constructed `this` from that position, for the same
+    // reason: a `this(...)`/`base(...)` argument runs before any field of the
+    // declaring class is assigned" (§22.10, v0.291). A primary-constructor
+    // parameter, a plain field, and an auto-property's backing storage are all
+    // the SAME underlying fact — a FieldSymbol (or auto-property storage) with
+    // no value yet in the chaining position — so #3829 widens this ONE
+    // predicate to cover all three rather than adding a second one (issue
+    // 3829, measured: `constructor(v: int) this(v, _f); end constructor;`
+    // compiled cleanly before this fix, reading `_f`'s not-yet-initialized
+    // storage).
+    void gateChainPositionFieldRead(const ast::Expr& e,
+                                    const SourceLocation& loc) {
         if (!ctorMode_ || !inChainingPosition_) return;
-        auto* fs = dynamic_cast<FieldSymbol*>(ctx_.exprSymbol(e));
-        if (!fs || !fs->posParam) return;
-        if (!fs->parent || fs->parent->kind != ast::TypeDeclKind::Class) return;
-        ctx_.diagnostics().report(
-            Severity::Error, loc,
-            std::string("cannot read primary-constructor parameter `") +
-            std::string(fs->name) +
-            "` in the chaining position — the primary-constructor parameters "
-            "are captured as step 0 of the chained-to primary constructor, "
-            "which runs after the `this(...)` arguments are evaluated, so the "
-            "parameter has no value here (§22.8 step 0, §22.10)");
+        if (auto* fs = dynamic_cast<FieldSymbol*>(ctx_.exprSymbol(e))) {
+            if (!fs->parent || fs->parent->kind != ast::TypeDeclKind::Class)
+                return;
+            // §12.8: "the only reads a `base(...)`/`this(...)` argument may
+            // make are of the constructor's own parameters, constants, and
+            // statics" — a static field has no per-instance storage and does
+            // not depend on `this` being constructed, so it is admitted. A
+            // primary-constructor parameter is never static (§22.10 admits no
+            // `static` modifier on a primary-constructor parameter), so this
+            // check cannot exempt the `fs->posParam` arm below.
+            for (auto mod : fs->modifiers)
+                if (mod == "static") return;
+            if (fs->posParam) {
+                ctx_.diagnostics().report(
+                    Severity::Error, loc,
+                    std::string("cannot read primary-constructor parameter `") +
+                    std::string(fs->name) +
+                    "` in the chaining position — the primary-constructor "
+                    "parameters are captured as step 0 of the chained-to "
+                    "primary constructor, which runs after the `this(...)` "
+                    "arguments are evaluated, so the parameter has no value "
+                    "here (§22.8 step 0, §22.10)");
+            } else {
+                ctx_.diagnostics().report(
+                    Severity::Error, loc,
+                    std::string("cannot read field `") + std::string(fs->name) +
+                    "` in the chaining position — a `this(...)`/`base(...)` "
+                    "argument runs before any field of the declaring class is "
+                    "assigned, so the field has no value here (§12.8, §22.10)");
+            }
+            return;
+        }
+        if (auto* ps = dynamic_cast<PropertySymbol*>(ctx_.exprSymbol(e))) {
+            if (ps->isIndexer || !isAutoPropertyStorageSymbol(ps, ctx_)) return;
+            if (!ps->parent || ps->parent->kind != ast::TypeDeclKind::Class)
+                return;
+            // §12.8 admits "the constructor's own parameters, constants, and
+            // statics". A static auto-property is already excluded ABOVE, by
+            // `isAutoPropertyStorageSymbol`: both the local collector
+            // (SymbolCollection.cpp's hasAstAutoPropertyDecl) and the export
+            // path (ModuleMetadataBuilder.cpp) refuse to classify a `static`
+            // auto-property as auto-property storage, so control never reaches
+            // here for one. The loop below is therefore REDUNDANT TODAY and is
+            // kept only as a defence in depth: if that classification is ever
+            // widened to admit statics, this gate must not start rejecting
+            // them. `static_auto_property_control_accepted` pins the observable
+            // behaviour so the guarantee survives either mechanism.
+            for (auto mod : ps->modifiers)
+                if (mod == "static") return;
+            ctx_.diagnostics().report(
+                Severity::Error, loc,
+                std::string("cannot read auto-property `") +
+                std::string(ps->name) +
+                "` in the chaining position — a `this(...)`/`base(...)` "
+                "argument runs before any field of the declaring class is "
+                "assigned, so the auto-property's backing storage has no "
+                "value here (§12.8, §22.10)");
+        }
     }
 
     // §22.7 rule 2: a dispatching call on `this` to a `virtual`/`override`/
@@ -2007,11 +2073,12 @@ private:
                                     "property `" + std::string(ma.member) + "`");
             }
         }
-        // fix #3583 (§22.8 step 0 / §22.10): the `this.p` spelling of a
+        // fix #3583 (§22.8 step 0 / §22.10), widened by fix #3829 (§12.8 /
+        // §22.10): the `this.p` spelling of a field, auto-property, or
         // primary-constructor parameter in the chaining position. §22.10's
-        // capture rule makes the parameter a compiler-generated field, so both
-        // spellings reach the same unwritten slot.
-        gateChainPositionPrimaryParamRead(ma, ma.span.begin);
+        // capture rule makes a primary-constructor parameter a compiler-
+        // generated field, so both spellings reach the same unwritten slot.
+        gateChainPositionFieldRead(ma, ma.span.begin);
         // Field / auto-property / method-group / unresolved: not an
         // observation; do not recurse into the `this`/`base` receiver.
         return true;
