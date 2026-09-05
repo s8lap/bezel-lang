@@ -1,6 +1,6 @@
 # Bezel Language Specification
 
-**Version 0.288 — September 2026**
+**Version 0.289 — September 2026**
 
 Bezel is a compiled language for services and tools, with ownership-based memory management and no garbage collector. The compiler tracks ownership of every heap object and ensures that each one is disposed exactly once. Borrowing lets you pass references without transferring ownership, with lifetimes checked at compile time rather than enforced by a runtime. The result aims to give you the safety of a managed language and the predictability of a manual one, without the ceremony of either.
 
@@ -29,7 +29,7 @@ If this is your first encounter with Bezel, the rationale's opening section is a
 16. [Range Expressions](#16-range-expressions)
 17. [Expressions and Operators](#17-expressions-and-operators)
 18. [Literals and Strings](#18-literals-and-strings)
-19. [The `case` and `when` Constructs](#19-the-case-and-when-constructs)
+19. [The `case` Construct](#19-the-case-construct)
 20. [The `if` Expression](#20-the-if-expression)
 21. [Statements](#21-statements)
 22. [Methods and Constructors](#22-methods-and-constructors)
@@ -97,7 +97,7 @@ Documentation comments use XML element syntax. See [§34](#sec-comments-and-docu
 Every statement terminates with a semicolon. Block-bodied constructs terminate with `end`, optionally followed by a label, then a semicolon. **One uniform rule: `end` may be followed by the construct's name if it has one, or by its introducing keyword otherwise; when a label is present, it must match.** Concretely:
 
 - **Named constructs** — class, interface, record, enum bodies; method bodies; property accessor blocks; labeled loop statements ([§21.5](#sec-break-and-continue)) — the loop label is the construct's name: `end scan;`. The optional label is the *identifier*: `end ClassName;`, `end methodName;`. A mismatch is a compile error.
-- **Keyword-labelled constructs** — everything else, labelled by the keyword that introduced the block: `end constructor;`, `end destructor;`, `end operator +;` (the operator token must also match), and the statement-level and container blocks: `end if;`, `end while;`, `end for;`, `end do;`, `end try;`, `end case;`, `end when;`, `end extension;`, `end extern;`. (`end while;`/`end for;` apply to **unlabeled** loops; a loop carrying a loop label is a named construct — previous bullet — per the umbrella rule's "otherwise".) A label that does not match the construct's introducing keyword is a compile error.
+- **Keyword-labelled constructs** — everything else, labelled by the keyword that introduced the block: `end constructor;`, `end destructor;`, `end operator +;` (the operator token must also match), and the statement-level and container blocks: `end if;`, `end while;`, `end for;`, `end do;`, `end try;`, `end case;`, `end extension;`, `end extern;`. (`end while;`/`end for;` apply to **unlabeled** loops; a loop carrying a loop label is a named construct — previous bullet — per the umbrella rule's "otherwise".) A label that does not match the construct's introducing keyword is a compile error.
 
 The unlabelled form `end;` is always valid everywhere — the label is for readability across long bodies and carries no semantic weight beyond compile-time verification that it matches.
 
@@ -125,7 +125,7 @@ Multiple files with identical `module` declarations **presented to the module's 
 ### 2.2 Imports
 
 ```bezel
-import System.Collections.Generic;
+import System.Threading;
 ```
 
 `import` makes the public names of the named module visible in the current file. Imports are file-scoped: an import in one file has no effect on other files in the same module. Public `extern` methods ([§32](#sec-foreign-function-interface)) are **not** among the bare names an import makes visible: they are reachable only through a qualifier — the module name or an alias ([§32.2](#sec-scoping), stated explicitly).
@@ -147,17 +147,17 @@ The following names are visible in every source file without import.
 |---|---|---|
 | Primitive value types, their reserved PascalCase aliases, and `string`/`String` | `bool`, `byte`, `sbyte`, `short`, `ushort`, `int`, `uint`, `long`, `ulong`, `float`, `double`, `decimal`, `char`, `string` | **No** ([§3.4](#sec-keyword-aliases-for-built-in-types)) |
 | Type-shaped syntax | the unit type `()`; inline arrays `[N]T` (with size N as part of the type) | — (syntactic forms, not names) |
-| Core types | `Object`, `Array<T>`, `OwningArray<T>`, `Type` | Yes |
+| Core types | `Object`, `Type` | Yes |
 | Disposal interfaces | `IDisposable`, `IAsyncDisposable` | Yes |
-| Iteration and collection interfaces | `IEnumerable<out T>`, `IEnumerator<out T>`, `IAsyncEnumerable<out T>`, `IAsyncEnumerator<out T>`; `IOwningEnumerable<T>`, `IOwningEnumerator<T>`, `IOwningAsyncEnumerable<T>`, `IOwningAsyncEnumerator<T>`; `IReadOnlyCollection<out T>`, `IReadOnlyList<out T>`, `ICollection<T>`, `IList<T>`, `IOwningCollection<T>`, `IOwningList<T>` (full declarations: stdlib [§4](Bezel_Standard_Library.md#sec-system-collections-generic)) | Yes |
 | Task family | `Task`, `Task<T>`, `OwningTask<T>` | Yes |
 | Events, subscription, cancellation | `Subscription` (stdlib [§2.11](Bezel_Standard_Library.md#sec-subscription)); `CancellationToken`; `IEvent<out T>`, `IAsyncEvent<out T>`, `EventSource<T>`, `AsyncEventSource<T>`, `ISharedEvent<out T>`, `SharedEventSource<T>` (stdlib [§6.5](Bezel_Standard_Library.md#sec-events-ievent-eventsource)) | Yes |
 | Standard exception types | the [§31.4](#sec-standard-exception-types) list | Yes |
 | Auto-imported module: `System` | `Console`, `Math`, `Convert`, `Environment`, `DateTime`, `TimeSpan`, `Guid`, `Random`, `IComparable<T>`, `IEquatable<T>`, `ISerializer`, `IDeserializer`, `ISerializable`, `IDeserializable`, and the FFI-boundary types `IntPtr`, `UIntPtr`, `CString`, `WString`, `RawBytes` (stdlib [§10](Bezel_Standard_Library.md#sec-ffi-boundary-types), whose module home is `System`) — representative, not exhaustive: stdlib §2 is `System`'s full catalog, including `DateOnly`/`TimeOnly`, `BitConverter`, `Type`, `Shared<T>`/`Weak<T>`, `IFormattable`, and the stdlib §2.19 static abstractions | Yes |
 | Auto-imported module: `System.Text` | `StringBuilder`, `Encoding`, `ReadOnlyStringSpan` (stdlib §3) | Yes |
+| Auto-imported module: `System.Collections.Generic` (v0.289) | the whole of stdlib [§4](Bezel_Standard_Library.md#sec-system-collections-generic): `Array<T>`, `OwningArray<T>`; the iteration and collection interfaces `IEnumerable<out T>`, `IEnumerator<out T>`, `IAsyncEnumerable<out T>`, `IAsyncEnumerator<out T>`, `IOwningEnumerable<T>`, `IOwningEnumerator<T>`, `IOwningAsyncEnumerable<T>`, `IOwningAsyncEnumerator<T>`, `IReadOnlyCollection<out T>`, `IReadOnlyList<out T>`, `ICollection<T>`, `IList<T>`, `IOwningCollection<T>`, `IOwningList<T>`; and — the names this row adds to the bare-name space, stated in full because they are its cost — `LinkedList<T>`, `LinkedListNode<T>`, `OwningLinkedList<T>`, `Dictionary<K, V>`, `OwningDictionary<K, V>`, `DictionaryEntry<K, V>`, `DrainedEntry<K, V>`, `Set<T>`, `OwningSet<T>`, `Stack<T>`, `OwningStack<T>`, `Queue<T>`, `OwningQueue<T>`, `OwningBuffer<T>`, `Span<T>`, `ReadOnlySpan<T>`, `BitReader`, `BitWriter`, `ArraySpan<T>`, `ReadOnlyArraySpan<T>`, `ArrayBitReader`, `ArrayBitWriter`, `IReadOnlySpan<TElement>`, `SortedDictionary<K, V>`, `SortedSet<T>`, `FrozenArray<T>`, `Counter<K>`, `IEqualityComparer<T>`, `KeyNotFoundException` — twenty-nine names. A current-module declaration shadows any of them ([§2.2](#sec-imports)); a user module exporting one of them makes the bare name ambiguous in a file importing both, and no opt-out exists | Yes |
 | Auto-imported module: `System.Collections.Linq` (v0.278) | the [§5](Bezel_Standard_Library.md#sec-system-collections-linq) query operators over `IEnumerable<T>` — nameless `extension` blocks ([§26.1](#sec-extension-blocks-declaration)) contributing no bare names, plus the module's only named declarations, `IGrouping<TKey, T>` and `IOrderedEnumerable<T>` | Yes |
 
-Only the first row's names cannot be shadowed ([§3.4](#sec-keyword-aliases-for-built-in-types)); every other always-available name may be shadowed by local declarations under the normal name-resolution rules. Auto-import follows participation in core constructs and standard patterns: the iteration interfaces appear in the `for`/`await for` desugarings ([§29.2](#sec-desugaring-of-for)) and in standard-library inheritance clauses; `Subscription` is the return type of event `.Subscribe()` methods and of `CancellationToken.Register()`; `CancellationToken` appears in the `await for ... with` desugaring ([§30.7](#sec-asynchronous-programming-async-iterators)), in default parameter values on standard async methods, and in `IAsyncEnumerable<T>.GetAsyncEnumerator`; the six event types appear in the declaration and public property surface of every standard event. Importing `System.Threading` is not required to use `Subscription`, `CancellationToken`, or any of the six event types; it is required for `CancellationTokenSource`, `Mutex`, and the other threading types. All other library modules require explicit `import`.
+Only the first row's names cannot be shadowed ([§3.4](#sec-keyword-aliases-for-built-in-types)); every other always-available name may be shadowed by local declarations under the normal name-resolution rules. Auto-import follows participation in core constructs and standard patterns: `System.Collections.Generic` holds the types the `for`/`await for` desugarings ([§29.2](#sec-desugaring-of-for)) and the collection literal ([§15.4](#sec-collection-literals)) name, and its interfaces appear in standard-library inheritance clauses; `Subscription` is the return type of event `.Subscribe()` methods and of `CancellationToken.Register()`; `CancellationToken` appears in the `await for ... with` desugaring ([§30.7](#sec-asynchronous-programming-async-iterators)), in default parameter values on standard async methods, and in `IAsyncEnumerable<T>.GetAsyncEnumerator`; the six event types appear in the declaration and public property surface of every standard event. Importing `System.Threading` is not required to use `Subscription`, `CancellationToken`, or any of the six event types; it is required for `CancellationTokenSource`, `Mutex`, and the other threading types. All other library modules require explicit `import`.
 
 `System.Interop` — `Ptr<T>` and the `Interop` intrinsics ([§32.12](#sec-foreign-memory)) — is deliberately **not** auto-imported, so *naming* `Ptr<T>` or `Interop` requires the `import System.Interop;` line: a convention marking a file's typed foreign-memory surface. It is **not a sound audit marker for foreign-memory access**, and no import is (v0.265, [#3278](https://github.com/s8lap/bezel-lang/issues/3278)). Three routes defeat it: [§2.8.3](#sec-transitive-closure-and-type-identity) rule 2 admits *use* without import, so a `var` binding of an inferred `Ptr<T>` and calls on it need no such line; `IntPtr`, `CString`, `WString`, and `RawBytes` are auto-imported members of `System` (stdlib [§10](Bezel_Standard_Library.md#sec-ffi-boundary-types)); and the forging conversion `IntPtr(longValue)` ([§32.7](#sec-pointers-and-intptr)) composed with `string.FromCStringPointer` (stdlib [§10.4](Bezel_Standard_Library.md#sec-conversions-to-bezel-types)) reads foreign memory with no import at all. What a file *does* is audited over its **resolved callees**, not over its import list.
 
@@ -553,7 +553,7 @@ New rules added to this specification that need a structural classification of t
 <a id="sec-bool"></a>
 ### 4.1 `bool`
 
-Two values: `true` and `false`. No implicit conversion to or from any other type. Conditions of `if`, `while`, and the `when` construct ([§19.1](#sec-forms)), as well as a `case`/`catch` arm's `when` guard, require `bool`.
+Two values: `true` and `false`. No implicit conversion to or from any other type. Conditions of `if`/`elif` and `while`, and a `case`/`catch` arm's `when` guard ([§19.4](#sec-guards)), require `bool`.
 
 <a id="sec-integer-types"></a>
 ### 4.2 Integer types
@@ -1036,7 +1036,7 @@ Narrowing also applies after early return, after `is not null`, inside the contr
 
 **How narrowing is established.** Narrowing is flow-sensitive: at each program point the compiler tracks, per local, whether its value is known non-null. The knowledge is established by:
 
-- a null test — `x <> null` (narrowing the true branch), `x = null` (narrowing the *false* branch), `x is not null`, or a successful `is`/typed-pattern test ([§12.7](#sec-type-tests-is-is-not-as), [§19.3](#sec-patterns)) — in an `if`/`elif` condition (of the statement or of the [§20](#sec-the-if-expression) conditional atom, each condition narrowing its own branches), a `while` condition, a `when` guard, or a `(when …)` arm condition ([§19.1](#sec-forms), narrowing that arm's body);
+- a null test — `x <> null` (narrowing the true branch), `x = null` (narrowing the *false* branch), `x is not null`, or a successful `is`/typed-pattern test ([§12.7](#sec-type-tests-is-is-not-as), [§19.3](#sec-patterns)) — in an `if`/`elif` condition (of the statement or of the [§20](#sec-the-if-expression) conditional atom, each condition narrowing its own branches), a `while` condition, or a `when` guard ([§19.4](#sec-guards), narrowing that arm's body);
 - boolean composition of tests: in `A and B`, `B` (and the true branch) is checked under `A`'s true-facts; in `A or B`, `B` (and the false branch) sees `A`'s false-facts; `not` swaps the fact sets — the standard three-outcome flow analysis, so `x <> null and x.Length > 0` is well-typed. The `not`-swap applies to **null facts**; a *type-classification* fact is established only by the `is`/`is not` operators and typed patterns directly, never by `not`-composition — `not (x is T)` has the same truth value as `x is not T` but narrows neither branch ([§17.4](#sec-the-is-is-not-and-as-operators));
 - an early exit: after `if x = null then return; end;` (or `throw`, `break`, `continue` in that branch), the surviving path is narrowed;
 - assignment: after `x := expr;` where `expr`'s static type is non-nullable — or `expr` is itself narrowed non-null at that point — `x` is narrowed until invalidated; likewise after `x ??= expr;` with such an `expr` (on every path `x` then holds a non-null value, [§7.7](#sec-null-coalescing-and-=));
@@ -1480,14 +1480,9 @@ A record cannot derive from another record or from a class (other than the impli
 ```bezel
 record Point(X: int, Y: int): IComparable<Point>
   public method CompareTo(other: Point): int =>
-    (when
-      X <> other.X => (when
-        X < other.X => -1,
-        _ => 1),
-      Y <> other.Y => (when
-        Y < other.Y => -1,
-        _ => 1),
-      _ => 0);
+    (if X <> other.X then (if X < other.X then -1 else 1)
+     elif Y <> other.Y then (if Y < other.Y then -1 else 1)
+     else 0);
 end Point;
 ```
 
@@ -1735,8 +1730,6 @@ enum Priority
     Medium => "Medium",
     High => "High");
 
-  // FrozenArray<T> is stdlib §4.19 — not among §2.3's always-available names;
-  //   naming it requires `import System.Collections.Generic;` (§2.8.3 rule 2).
   public static owned readonly All: FrozenArray<Priority> :=
       FrozenArray<Priority>.From([Low, Medium, High]);
 
@@ -1798,10 +1791,9 @@ enum Priority: IComparable<Priority>
   Low, Medium, High;
 
   public method CompareTo(other: Priority): int =>
-    (when
-      int(this) < int(other) => -1,
-      int(this) > int(other) => 1,
-      _ => 0);
+    (if int(this) < int(other) then -1
+     elif int(this) > int(other) then 1
+     else 0);
 end Priority;
 ```
 
@@ -2485,7 +2477,7 @@ Five rules govern every such member:
 
 **No row of this register is a standing grant.** Each carries a recorded disposition off it, and the register is expected to empty rather than to grow:
 
-- **`Array<T>`/`OwningArray<T>` sorting** is here because [§26.5](#sec-resolution) rule 1 commits instance resolution by *name*: the receiver declares `Sort`, so a constrained extension ([§26.4](#sec-generic-extensions)) spelled `Sort` is never consulted, whatever its clause. Two ways out are open and neither is decided here — give the natural-order form a name the receiver does not declare, or admit a member-level condition (declined at this revision, [Appendix C.1](#sec-appendix-c-type-system)). The row lapses when one is taken. One cost belongs to the first and is a language cost, not an implementation one: `Array<T>` and `OwningArray<T>` are always-available names, so under [§2.3](#sec-always-available-names)'s auto-import invariant a standard-library extension over them auto-imports the extension's **whole home module** — every bare name that module declares arrives in every file with it.
+- **`Array<T>`/`OwningArray<T>` sorting** is here because [§26.5](#sec-resolution) rule 1 commits instance resolution by *name*: the receiver declares `Sort`, so a constrained extension ([§26.4](#sec-generic-extensions)) spelled `Sort` is never consulted, whatever its clause. Two ways out are open and neither is decided here — give the natural-order form a name the receiver does not declare, or admit a member-level condition (declined at this revision, [Appendix C.1](#sec-appendix-c-type-system)). The row lapses when one is taken.
 - **`DangerousPointer()`** is **not implemented** — no admissibility arm and no lowering — and is a candidate at the subtraction review of this specification's change process. Its row records that status on its face; a row whose member the compiler does not implement, or whose condition it does not enforce, is an ordinary specification-ahead-of-implementation delta and is tracked as one.
 - **`Result<T, E>`'s combinators** are here because [§26.2](#sec-what-can-be-extended) closes the extendable list against the choice kind, and closes it *for this reason*: no constraint of this section names the classification a payload-generic extension surface would need. Admitting such a constraint, and opening [§26.2](#sec-what-can-be-extended) with it, would make these four an ordinary constrained extension and retire the row; that is a separate ruling, not assumed here.
 
@@ -2902,7 +2894,7 @@ The move-only value type kinds in this specification are two: the owning inline 
 - **Local lifetime**: a move-only local's owned slots are auto-disposed at scope end by the compiler. Unlike owned class-typed locals ([§28.3](#sec-local-variables-ownership-and-borrows)), the array as a whole does not require an explicit discharge call (no `Dispose()` to invoke; the array is not a class). However, the field-restoration rule still applies to individual slots: any slot moved-from via `move arr[i]` must be reassigned before any exit edge, because auto-dispose on a moved-from slot is not defined. The standard restoration mechanisms apply: assign a fresh owned value, or for `[N owned]T?` arrays, assign `null` to mark the slot empty.
 - **Exception-path discharge**: on exception edges, the slots are auto-disposed by the implicit `try`/`finally` rule ([§28.3](#sec-local-variables-ownership-and-borrows)). The same mechanism that handles owned class-typed locals on exception paths handles move-only inline-array locals.
 - **Equality**: move-only values support equality via borrowing comparison (reads each slot without moving), provided their element types support equality.
-- **Pattern binding**: a `case`/`when` binding over a move-only scrutinee is a **borrow** of the value; consuming operations through the binding (`move s[i]`) are rejected ([§19.3](#sec-patterns)). In an **owning match** over an owning choice ([§35.5](#sec-owning-match)), a case-payload of move-only value type matched by a **positional slot or a marked named slot** instead **transfers into its binding at arm selection**, exactly as an `owned` payload does (v0.251); an **unmarked named slot** keeps the borrow ([§19.3](#sec-patterns)); the transferred binding is then a move-only owned local of the arm body's scope under this section's rules.
+- **Pattern binding**: a `case` binding over a move-only scrutinee is a **borrow** of the value; consuming operations through the binding (`move s[i]`) are rejected ([§19.3](#sec-patterns)). In an **owning match** over an owning choice ([§35.5](#sec-owning-match)), a case-payload of move-only value type matched by a **positional slot or a marked named slot** instead **transfers into its binding at arm selection**, exactly as an `owned` payload does (v0.251); an **unmarked named slot** keeps the borrow ([§19.3](#sec-patterns)); the transferred binding is then a move-only owned local of the arm body's scope under this section's rules.
 
 `using var` is admitted for move-only inline arrays per the general rule of [§28.10](#sec-using-var) (which admits `using var` for any value-type or runtime-managed RHS). For a move-only inline-array local, `using var` has no disposal effect (scope-end auto-dispose runs whether or not `using var` is applied), and its only observable consequence is preventing reassignment. Programs that want to express "this owning inline-array binding is fixed at construction and may not be rebound" may use `using var arr: [16 owned]Connection?;`; programs that don't need the reassignment lock use plain `var`. Both are admitted; both produce identical runtime behavior at scope end.
 
@@ -3322,7 +3314,7 @@ Operators are evaluated according to the following table, from highest to lowest
 - `and` and `or` short-circuit: the right operand is not evaluated if the result is determined by the left.
 - `??` is right-associative: `a ?? b ?? c` means `a ?? (b ?? c)`. `??` binds tighter than `and`/`or`, so `a ?? b or c` parses as `(a ?? b) or c`. `??` also short-circuits: its right operand is evaluated only when the left is `null` ([§7.7](#sec-null-coalescing-and-=)), as do `?.` and `?(…)` ([§7.5](#sec-null-conditional-access), [§7.6](#sec-null-conditional-call-args)).
 - `?.`, `?(...)`, and `!` (postfix) are primary-level. They bind as tightly as `.` and `[ ]`.
-- The `(if …)`, `(case …)`, and `(when …)` expression atoms, and the `(var …)` binding atom ([§17.15](#sec-the-binding-atom)), do not appear in the table: each is self-delimited and parses as a **primary atom** (grammar A.7 `PrimaryAtom`), composable in any operand position without further parenthesization. `throw expr` genuinely belongs at level 15: its operand is a full `Expression`, so it extends maximally to the right; inside an atom, a branch or arm derives a full expression, so a bare `throw` branch needs no parenthesization ([§20](#sec-the-if-expression)).
+- The `(if …)` and `(case …)` expression atoms, and the `(var …)` binding atom ([§17.15](#sec-the-binding-atom)), do not appear in the table: each is self-delimited and parses as a **primary atom** (grammar A.7 `PrimaryAtom`), composable in any operand position without further parenthesization. `throw expr` genuinely belongs at level 15: its operand is a full `Expression`, so it extends maximally to the right; inside an atom, a branch or arm derives a full expression, so a bare `throw` branch needs no parenthesization ([§20](#sec-the-if-expression)).
 - Assignments and compound assignments are statements, not expressions; they produce no value.
 - **Event-subscription forms `+=`/`-=`.** When the static type of the left operand of `+=` or `-=` is `EventSource<T>`, `AsyncEventSource<T>`, or `SharedEventSource<T>` (stdlib [§6.5](Bezel_Standard_Library.md#sec-events-ievent-eventsource)), the statement is a fixed, language-defined desugaring: `lhs += h` rewrites to `lhs.Add(h)` and `lhs -= h` to `lhs.Remove(h)`, selected by that operand type before the compound-assignment rules of [§6.6](#sec-compound-assignments) apply. Grammatically the form is an `AssignmentStmt` (A.6) reinterpreted by the LHS's static type; the forms are not compound assignments, not user-overloadable ([§25.1](#sec-overloadable-operators)), and `lhs += h` **evaluates `lhs` only as the receiver of the desugared call** — it performs no read-modify-write of the location and never assigns to it. The desugaring is recognized **before** `readonly`-assignability checking, so the forms are available on a `readonly` field — the recommended declaration of stdlib §6.5's event pattern (`private owned readonly _clicked: EventSource<T> := new();` … `_clicked += OnClicked;`). `Add` is a `scoped` (storing) position: [§28.14](#sec-scoped-callback-parameters)'s storage-bounded admission applies to the desugared call (for the pattern's spelling the receiver chain roots at `this` through an `owned` field — form 4); on `SharedEventSource<T>` the handler position admits only **capture-free** handlers ([§28.14](#sec-scoped-callback-parameters)'s stdlib-stated capture-free register). `Remove` is call-bounded — it only compares its argument, by function-value equality ([§27.7.1](#sec-equality-of-function-values)); when no handler matches, `-=` is a no-op.
 - `++` and `--` are statement-only ([§17.6](#sec-the-increment-and-decrement-operators)) and do not appear in the precedence table. They are not expression operators; they cannot be combined with other operators.
@@ -3424,11 +3416,7 @@ c--;            // c is 5
 
 `x := y++` is a compile error; `++c` is a parse error. There is no prefix form.
 
-The operand must be an assignable lvalue (a local variable, a writable field, an indexer slot, or a property with a setter — the same storage categories [§22.3](#sec-ref-and-out-argument-locations)'s `ref`/`out` arguments reuse). Read-only locations cannot be incremented. For a value-type operand whose type T overloads `operator ++`, the statement `x++` is equivalent to `x := T.operator++(x)`; the new value replaces the old through the lvalue's normal assignment path. For built-in numeric types, `x++` is equivalent to `x := x + 1` (and likewise `x--` to `x := x - 1`), with the same overflow semantics as `+` and `-` ([§6.1](#sec-integer-arithmetic)). An operand whose static type is a nullable type is a **compile error**: the desugared `x + 1` has no meaning on a nullable operand ([§7.11](#sec-lifted-operators)), and this form and [§6.6](#sec-compound-assignments)'s compound assignments are one rule read through one desugaring — write `x := (x ?? 0) + 1;`, `x := x! + 1;`, or narrow first. The static type is read as §6.6 and §7.11 read it, after [§7.4](#sec-member-access-on-nullable-values)'s narrowing: a local `n: int?` that §7.4 has narrowed non-null admits `n++` exactly as it admits `n := n + 1`, and stays narrowed after it.
-
-For reference-type operands, `++` and `--` apply only when the reference type overloads the operator; the overload returns a new instance, and the statement reassigns the local or field to the new instance. Overloading `++`/`--` on a class is permitted but uncommon; the `Counter` example in [§25.3](#sec-examples) demonstrates the typical record use.
-
-When `++` or `--` is applied to an `owned` field of class type T whose `operator ++` / `operator --` returns a new instance, the [§28.7](#sec-reassigning-owned-fields) drop-on-overwrite rule applies: the operator result (an owned value) is produced first, then the displaced previous value is disposed implicitly, then the new value is stored — no explicit prior disposal and no warning is involved. Authors of class-typed types that overload `++` or `--` should document the intended use; in practice these overloads are far easier to reason about on records, where ownership is not at issue.
+The operand must be an assignable lvalue (a local variable, a writable field, an indexer slot, or a property with a setter — the same storage categories [§22.3](#sec-ref-and-out-argument-locations)'s `ref`/`out` arguments reuse). Read-only locations cannot be incremented. The operand's type is one [§6.6](#sec-compound-assignments)'s compound form admits for `+= 1` — an integer type, a floating-point type, `decimal`, or `char` — and `x++` is equivalent to `x := x + 1` (and likewise `x--` to `x := x - 1`) under exactly §6.6's rules: the same overflow semantics as `+` and `-` ([§6.1](#sec-integer-arithmetic)), §6.6's checked narrowing for a narrow integer target, and for a `char` target the [§5.2](#sec-explicit-conversions) code-point rules (`c++` is `c := char(c + 1)`). An operand whose static type is a nullable type is a **compile error**: the desugared `x + 1` has no meaning on a nullable operand ([§7.11](#sec-lifted-operators)), and this form and [§6.6](#sec-compound-assignments)'s compound assignments are one rule read through one desugaring — write `x := (x ?? 0) + 1;`, `x := x! + 1;`, or narrow first. On an operand of any other type the statement is a **compile error** on a separate ground: `++`/`--` are not user-overloadable ([§25.1](#sec-overloadable-operators)), so a type spells advancement as `x := x + 1` under its own `operator +`, or as a named method. The static type is read as §6.6 and §7.11 read it, after [§7.4](#sec-member-access-on-nullable-values)'s narrowing: a local `n: int?` that §7.4 has narrowed non-null admits `n++` exactly as it admits `n := n + 1`, and stays narrowed after it.
 
 <a id="sec-increment-decrement-on-indexer-slots"></a>
 #### Increment/decrement on indexer slots
@@ -3454,13 +3442,11 @@ do
 end;
 ```
 
-Each subexpression in the LHS — the collection expression and every index expression — is evaluated exactly once. The indexer's getter and setter are each called once. For a value-type element T that overloads `operator ++`, the assigned value is `T.operator++(__coll[__idx])` instead of `__coll[__idx] + 1`.
+Each subexpression in the LHS — the collection expression and every index expression — is evaluated exactly once. The indexer's getter and setter are each called once.
 
 Implementations may not deduplicate the getter+setter pair: every `arr[i]++` performs one logical read followed by one logical write through the indexer — on a `Dictionary<K, int>`, two hash lookups. The two-access cost is **inherent** to indexer-mediated read-modify-write: the language has no ref-returning indexers (a recorded deferral, [rationale §18](Bezel_Design_Rationale.md#sec-things-deferred)), so no rewrite of the statement changes it — spelling the read and write as separate statements performs the same getter and setter calls, and re-evaluates the collection and index expressions besides. For **tallying** specifically, the standard library's `Counter<K>` ([stdlib §4.20](Bezel_Standard_Library.md#sec-counterk)) is the dedicated single-operation form (`tally.Increment(key);`, with absent keys created at the delta); for general accumulation the indexer read-modify-write, in either spelling, is the supported idiom (stdlib [§4.8](Bezel_Standard_Library.md#sec-dictionaryk-v)).
 
 The same desugaring applies to `--`. For `+=`, `-=`, and the other compound assignments on indexer slots, the same desugaring applies with the operator changed accordingly; it is the indexer instance of the general compound-assignment rule of [§6.6](#sec-compound-assignments), which also fixes the result's typing — including the checked narrow-integer write-back — for every target kind.
-
-When the indexer's element type is a class T whose `operator ++` / `operator --` returns a new instance, the desugaring would assign a fresh owned value to a slot. For a non-owning collection (`Array<MyClass>`), the slot does not own its content per [§28.11](#sec-collections-do-not-own-elements), so the assignment of an owned `new`-result to a non-owned slot would leak; per [§28.6](#sec-leak-prevention), this is rejected at compile time. For an owned-element collection (`OwningArray<MyClass>`), the slot owns its content; the assignment disposes the previous value and installs the new one (per [§28.11](#sec-collections-do-not-own-elements)'s indexer-set rule), which is the same rule as for an owned-field reassignment. `arr[i]++` is therefore admitted on `OwningArray<MyClass>` when MyClass overloads `operator ++`, and rejected on `Array<MyClass>`. The asymmetry is the same as for direct slot assignment.
 
 <a id="sec-the-new-operator"></a>
 ### 17.7 The `new` operator
@@ -3642,7 +3628,7 @@ Bare `throw` outside a catch arm body is a compile error, with the same diagnost
 
 The bare token `_` is **reserved** ([§1.3](#sec-identifiers), Appendix [B.1](#sec-reserved-keywords)): it is never an identifier — never declarable, never readable as a name. It is a *discard* — a sink that consumes or ignores a value without binding it. Every position in which `_` can appear is one of the sanctioned forms of this section — a discard or wildcard, an ignore, or the anonymous owning binding — or a compile error whose diagnostic names the sanctioned forms (the rejected positions are listed below). A discard is valid exactly where receiving-and-ignoring a value is coherent, and an error everywhere else. Identifiers merely *containing* underscores (`_camelCase`, `_f`) are ordinary identifiers and unaffected by this section.
 
-**Pattern position.** Inside a `case` arm or destructuring pattern, `_` matches any value without binding. (The `when` construct's `_` catch-all arm, [§19.1](#sec-forms), is the same wildcard reading.)
+**Pattern position.** Inside a `case` arm or destructuring pattern, `_` matches any value without binding.
 
 ```bezel
 case shape of
@@ -3806,7 +3792,7 @@ The binding atom names a subexpression within expression position (grammar A.7 `
 (var a := E1; var b := E2; body)
 ```
 
-The parentheses are part of the form: in atom-start position, `(` followed by the reserved `var` — which begins no other expression — commits the reading at the second token, exactly as the `(if …)`, `(case …)`, and `(when …)` atoms commit ([§20](#sec-the-if-expression)); in call- and index-argument position the atom supplies its own pair. Each **clause** — `var x := E;` or `var x: T := E;` — introduces one binding and is terminated by `;` (no expression contains a top-level `;`, so the clause's extent is unambiguous); at least one clause is required; clauses chain; the **body** is one full expression, and the atom's value, type, and ownership classification are the body's. The atom takes no precedence-table entry ([§17.1](#sec-precedence)): it is self-delimited and composes in any operand position, exactly as the other paren atoms do.
+The parentheses are part of the form: in atom-start position, `(` followed by the reserved `var` — which begins no other expression — commits the reading at the second token, exactly as the `(if …)` and `(case …)` atoms commit ([§20](#sec-the-if-expression)); in call- and index-argument position the atom supplies its own pair. Each **clause** — `var x := E;` or `var x: T := E;` — introduces one binding and is terminated by `;` (no expression contains a top-level `;`, so the clause's extent is unambiguous); at least one clause is required; clauses chain; the **body** is one full expression, and the atom's value, type, and ownership classification are the body's. The atom takes no precedence-table entry ([§17.1](#sec-precedence)): it is self-delimited and composes in any operand position, exactly as the other paren atoms do.
 
 ```bezel
 var area := (var w := bounds.Width(); w * w);
@@ -3991,14 +3977,14 @@ Surrogate escapes (U+D800–U+DFFF) are compile errors.
 ---
 
 <a id="sec-the-case-construct"></a>
-## 19. The `case` and `when` Constructs
+## 19. The `case` Construct
 
-`case` is multi-way pattern matching against a scrutinee. Its sibling `when` is multi-way **condition** dispatch with no scrutinee — each arm is a boolean test, and the first true arm wins. Both are single constructs that produce a value; in statement position, the value is discarded per the [§21.9](#sec-statement-form-of-expressions) rules (applied per arm — see below). **Expression-position type:** the construct's type is the left-fold of its arm-body types under the [§20](#sec-the-if-expression) common-type rule (`throw` arms are bottom-typed and impose no constraint). Only the selected arm's body is evaluated. They share the same arm bodies ([§19.2](#sec-arms)) and appear in either position, with the closer keyed to the position: in expression position each is a parenthesized, self-delimited **atom** — `(case … of …)` / `(when …)`, expression-bodied arms only — and in statement position each is an `end`-terminated **statement** (`case … of … end case?;` / `when … end when?;`, grammar A.6 `CaseStmt`/`WhenStmt`) whose arms may also be single statements or `do … end` blocks.
+`case` is multi-way pattern matching against a scrutinee: a single construct that produces a value; in statement position, the value is discarded per the [§21.9](#sec-statement-form-of-expressions) rules (applied per arm — see below). **Expression-position type:** the construct's type is the left-fold of its arm-body types under the [§20](#sec-the-if-expression) common-type rule (`throw` arms are bottom-typed and impose no constraint). Only the selected arm's body is evaluated. The arm bodies are those of [§19.2](#sec-arms), and the construct appears in either position, with the closer keyed to the position: in expression position it is a parenthesized, self-delimited **atom** — `(case … of …)`, expression-bodied arms only — and in statement position an `end`-terminated **statement** (`case … of … end case?;`, grammar A.6 `CaseStmt`) whose arms may also be single statements or `do … end` blocks. Multi-way selection over *conditions* rather than over one scrutinee is the `if`/`elif` chain — the [§21.2](#sec-the-if-statement) statement and the [§20](#sec-the-if-expression) atom.
 
 <a id="sec-forms"></a>
 ### 19.1 Forms
 
-**`case` (scrutinee form)** — `case expression of` followed by arms. The scrutinee is evaluated once and matched against each pattern in order. `case` **always** takes a scrutinee; a `case` written with no scrutinee expression is a syntax error — use `when` for condition dispatch.
+**`case` (scrutinee form)** — `case expression of` followed by arms. The scrutinee is evaluated once and matched against each pattern in order. `case` **always** takes a scrutinee; a `case` written with no scrutinee expression is a syntax error — a ladder of conditions is an `if`/`elif` chain ([§20](#sec-the-if-expression)).
 
 **The `of` delimiter.** The keyword `of` terminates the scrutinee and introduces the arms — the Pascal-heritage spelling (`case x of`). Because the boundary is explicit, the scrutinee is a **full Expression** with no precedence restriction and no parenthesization rule: `case x - 1 of`, `case flags & mask of`, and `case lo..hi of` are all direct. A first pattern may begin with any pattern token — a negative range bound in particular — with no possibility of the scrutinee absorbing it:
 
@@ -4021,28 +4007,6 @@ var grade := (case score of
   _ => "F");
 ```
 
-**`when` (condition dispatch)** — `when` followed by arms whose patterns are full boolean expressions. The arms are evaluated in textual order; the first whose expression is `true` is selected. This subsumes the `if`/`elif` chain. `when` takes no scrutinee.
-
-```bezel
-var grade := (when
-  score >= 90 => "A",
-  score >= 80 => "B",
-  score >= 70 => "C",
-  _ => "F");
-```
-
-`when` exists in both expression position (above) and statement position:
-
-```bezel
-when
-  score >= 90 => Console.WriteLine("A"),
-  score >= 70 => Console.WriteLine("C"),
-  _          => Console.WriteLine("F")
-end;
-```
-
-A `when` arm's expression must have type `bool` ([§4.1](#sec-bool)). The `_` catch-all is permitted as the last arm and behaves as an always-true condition. Because `when` has no scrutinee, it is never statically exhaustive: in expression position, supply a `_` arm or the compiler warns that an unmatched dispatch raises `MatchFailureException` ([§19.6](#sec-exhaustiveness)).
-
 <a id="sec-arms"></a>
 ### 19.2 Arms
 
@@ -4052,7 +4016,7 @@ Each arm has the form `pattern => body`. An arm body has three possible shapes:
 - **A single statement** (e.g. `=> _x := y;`, `=> return;`, `=> throw new ArgumentException("nope");`). Valid in *statement-position* `case` only. The statement's terminating `;` ends the arm body, and the arm separator `,` follows. This is the convenient form for the common one-line arm body that is a statement rather than an expression.
 - **A `do … end` block** of statements. Has type `()` and produces no value, so it is valid in statement-position `case` only. Use this when the arm body needs multiple statements.
 
-In an expression-position `case` or `when`, an arm result may be the **marked transfer** `move x` ([§28.3](#sec-producers), K3.4): the named binding is consumed on the path where that arm is selected, and is per-path consumed after the construct ([K7.4](#sec-kernel-k7)). An arm result marking the *scrutinee's own binding* is always rejected by the consume-site freeze — the scrutinee borrow is live through the selected arm's completion ([K8.3](#sec-kernel-k8), [§28.3](#sec-consume-site-freeze)); transfer after the construct instead.
+In an expression-position `case`, an arm result may be the **marked transfer** `move x` ([§28.3](#sec-producers), K3.4): the named binding is consumed on the path where that arm is selected, and is per-path consumed after the construct ([K7.4](#sec-kernel-k7)). An arm result marking the *scrutinee's own binding* is always rejected by the consume-site freeze — the scrutinee borrow is live through the selected arm's completion ([K8.3](#sec-kernel-k8), [§28.3](#sec-consume-site-freeze)); transfer after the construct instead.
 
 Multi-statement logic in *expression-position* arms is extracted into a helper method or local lambda — both produce values, and the extraction makes the arm's intent visible at its declaration site:
 
@@ -4073,7 +4037,7 @@ Calls to a helper are zero-overhead in the common case (the compiler is permitte
 
 `return` inside an arm exits the enclosing callable, not the arm. `case` cannot be exited "early" via `return`; restructure into helper methods.
 
-Arms are comma-separated. A trailing comma after the last arm is optional. In expression position, the ownership of the `case`/`when` result follows the arm-meet rule of [§28.3](#sec-producers)'s producers table — identical to `??` and the `if` expression ([§20](#sec-the-if-expression)).
+Arms are comma-separated. A trailing comma after the last arm is optional. In expression position, the ownership of the `case` result follows the arm-meet rule of [§28.3](#sec-producers)'s producers table — identical to `??` and the `if` expression ([§20](#sec-the-if-expression)).
 
 <a id="sec-patterns"></a>
 ### 19.3 Patterns
@@ -4158,8 +4122,6 @@ end;
 
 Arms are evaluated in textual order. The first arm whose pattern matches *and* whose guard is true is selected.
 
-The guard keyword `when` (after a pattern, within an arm) is distinct from the `when` *construct* keyword ([§19.1](#sec-forms), at the start of an expression or statement); position disambiguates the two, so no parsing conflict arises.
-
 <a id="sec-type-pattern-matching-never-matches-null"></a>
 ### 19.5 Type-pattern matching never matches `null`
 
@@ -4172,8 +4134,6 @@ If `_` appears, it must be the last arm; placing it earlier is a compile error.
 
 A `case` with no `_` arm is permitted. In statement position, an unmatched value falls through with no action — except for a statement-`case` that [§21.7](#sec-the-return-statement) grants totality, whose no-match edge is statically dead and is lowered as a defined trap rather than a fall-through. In expression position, an unmatched value raises `MatchFailureException` at runtime; the compiler warns when it cannot prove exhaustiveness statically.
 
-A `when` construct is governed by the same no-match rule, but having no scrutinee it is never statically exhaustive: the static-proof cases below all reason about a scrutinee's type. A `when` with no `_` arm in expression position therefore always draws the non-exhaustiveness warning; supply a `_` arm to make the dispatch total.
-
 The compiler proves exhaustiveness statically in the following cases:
 
 - **Any scrutinee — irrefutable arm:** some arm is irrefutable — an unguarded `_`, or an unguarded untyped `var x` pattern (which binds any value, including `null`, [§19.5](#sec-type-pattern-matching-never-matches-null)).
@@ -4183,7 +4143,7 @@ The compiler proves exhaustiveness statically in the following cases:
 - **Sealed class hierarchy scrutinee:** when the scrutinee's static type is a `closed` class, or an `abstract` class whose only direct subclasses are themselves `sealed` or recursively form a closed set, and every leaf type in the closed hierarchy is matched by a type pattern (with or without binding), no `_` arm is required. A **leaf type** is every **concrete** (neither `abstract` nor `closed`) class in the closed set — including a concrete class that itself has subclasses: its exact-runtime-class instances exist, so the childless-only reading would claim a proof while such a value matches no arm. Abstract and `closed` members of the set have no instances ([§11.7](#sec-static-classes), [§12.5](#sec-abstract-classes-and-members)) and need no arm. A leaf is **covered** when some unguarded type pattern it is assignable to matches it — subtype matching, [§19.3](#sec-patterns) — so an arm for a concrete intermediate also covers its concrete descendants; to discriminate, place the descendant's arm first ([§19.4](#sec-guards) first-match order). This is the runtime test's static image (for non-generic hierarchies; see the *Generic hierarchies* subsection): every non-null value's runtime class is some concrete member of the closed set, so covering each concrete member covers every value. The leaves may be matched in any order; the analysis is purely on type coverage. When the root or any leaf is generic, leaf coverage is **not attempted** and the match is completable only by an irrefutable arm (the *Generic hierarchies* subsection below). Class leaves are matched by type-test patterns (`var c: Circle => ...`); positional destructuring ([§19.3](#sec-patterns)) applies to record leaves, not to class leaves. A `closed` class ([§11.7](#sec-static-classes)) provides the strongest guarantee: no subclass outside the declaring module can exist, so exhaustiveness holds across module boundaries.
 - **Nullable scrutinee:** under the rules above plus an explicit `null` pattern.
 
-Every proof in the list above is a **closed-value-space** proof — what closes the value space is stated per bullet: an irrefutable arm absorbs any value; an enum's value set and a choice's case set are closed by declaration ([§5.4](#sec-enum-casts), [§35.1](#sec-choice-declaration)) — for an enum, closed by its producers too: every producer of an enum value yields a declared value (checked casts, [§5.4](#sec-enum-casts); [§9.8](#sec-serialization-synthesis) deserialization; [§17.11](#sec-the-default-operator)'s zero-constant requirement), so a statically exhaustive enum match's no-match edge is unreachable; no conversion manufactures a third `bool` value ([§4.1](#sec-bool)); a closed hierarchy's concrete-class set is closed ([§11.7](#sec-static-classes) — across artifacts under [§2.8](#sec-module-identity)'s compilation-closure view, the *Exhaustiveness across module boundaries* subsection below); and the nullable bullet closes the added `null` with its explicit arm. [§21.7](#sec-the-return-statement)'s statement-`case` totality grant is keyed to exactly this property, and this list is its registry; a warning-only reading over an *open* value space (an open hierarchy, a `when` construct) is not a static proof and grants nothing there.
+Every proof in the list above is a **closed-value-space** proof — what closes the value space is stated per bullet: an irrefutable arm absorbs any value; an enum's value set and a choice's case set are closed by declaration ([§5.4](#sec-enum-casts), [§35.1](#sec-choice-declaration)) — for an enum, closed by its producers too: every producer of an enum value yields a declared value (checked casts, [§5.4](#sec-enum-casts); [§9.8](#sec-serialization-synthesis) deserialization; [§17.11](#sec-the-default-operator)'s zero-constant requirement), so a statically exhaustive enum match's no-match edge is unreachable; no conversion manufactures a third `bool` value ([§4.1](#sec-bool)); a closed hierarchy's concrete-class set is closed ([§11.7](#sec-static-classes) — across artifacts under [§2.8](#sec-module-identity)'s compilation-closure view, the *Exhaustiveness across module boundaries* subsection below); and the nullable bullet closes the added `null` with its explicit arm. [§21.7](#sec-the-return-statement)'s statement-`case` totality grant is keyed to exactly this property, and this list is its registry; a warning-only reading over an *open* value space (an open hierarchy) is not a static proof and grants nothing there.
 
 An arm carrying a `when` guard contributes **nothing** to static exhaustiveness (the compiler does not evaluate guards): the analysis considers only unguarded patterns. A match whose every arm is guarded is therefore never statically exhaustive — in expression position it draws the warning and raises `MatchFailureException` if every guard declines at run time.
 
@@ -4218,7 +4178,7 @@ The recommended discipline is treating any addition of a leaf type to a sealed h
 <a id="sec-termination"></a>
 ### 19.7 Termination
 
-The closer is keyed to the position. In expression position the construct is a parenthesized atom — it opens with `(case` (or `(when`) and its closing parenthesis is the terminator; there is no `end`. In statement position it is an `end`-terminated statement, with the statement's `;` following the `end`:
+The closer is keyed to the position. In expression position the construct is a parenthesized atom — it opens with `(case` and its closing parenthesis is the terminator; there is no `end`. In statement position it is an `end`-terminated statement, with the statement's `;` following the `end`:
 
 ```bezel
 var grade := (case score of
@@ -4278,7 +4238,7 @@ var grade := (if score >= 90 then "A"
 
 For many-way selection over one scrutinee, `case` is preferred ([§19](#sec-the-case-construct)).
 
-The atom takes no precedence-table entry ([§17.1](#sec-precedence)): it is self-delimited and composes in any operand position without further parenthesization, exactly as the `case` and `when` atoms do.
+The atom takes no precedence-table entry ([§17.1](#sec-precedence)): it is self-delimited and composes in any operand position without further parenthesization, exactly as the `case` atom does.
 
 ---
 
@@ -4462,7 +4422,7 @@ Form rules:
 
 The top-level operand of `return expression;` in a body with a declared return type is a **declared-result position**: when the declared type (for an `async` body, the declared `Task<T>`'s result type, [§30.1](#sec-async-methods)) is — nullability stripped — a choice with a case of the written name, a bare case construction target-types against it ([§35.3](#sec-choice-construction)).
 
-**Statement-`case` totality.** A statement-position `case` ([§19.7](#sec-termination)) counts as exiting on every path — so a callable may end with it, with no trailing `return` — when both hold: **(i)** [§19.6](#sec-exhaustiveness) proves the match statically exhaustive — every §19.6 static proof is a **closed-value-space** proof ([§19.6](#sec-exhaustiveness) defines the term and states each family's closure ground: the irrefutable-arm, choice, bool, sealed-hierarchy, and enum bullets, and any of these under the nullable bullet with its explicit `null` arm), so each qualifies and nothing else feeds this condition — a warning-only reading over an *open* value space (an open hierarchy, a `when` construct) grants nothing; and **(ii)** every arm's body itself exits on every path (`return`, `throw`, or a nested total construct). Guarded arms must satisfy (ii) like any other arm but contribute nothing to (i) (the [§19.6](#sec-exhaustiveness) rule). For a `case` granted totality under this rule, the no-match edge is statically dead; an implementation lowers it as a defined trap (raising `MatchFailureException` or aborting) rather than fall-through, so that the grant's soundness never rests on the exhaustiveness computation alone (as-if: the trap is unreachable in a conforming implementation).
+**Statement-`case` totality.** A statement-position `case` ([§19.7](#sec-termination)) counts as exiting on every path — so a callable may end with it, with no trailing `return` — when both hold: **(i)** [§19.6](#sec-exhaustiveness) proves the match statically exhaustive — every §19.6 static proof is a **closed-value-space** proof ([§19.6](#sec-exhaustiveness) defines the term and states each family's closure ground: the irrefutable-arm, choice, bool, sealed-hierarchy, and enum bullets, and any of these under the nullable bullet with its explicit `null` arm), so each qualifies and nothing else feeds this condition — a warning-only reading over an *open* value space (an open hierarchy) grants nothing; and **(ii)** every arm's body itself exits on every path (`return`, `throw`, or a nested total construct). Guarded arms must satisfy (ii) like any other arm but contribute nothing to (i) (the [§19.6](#sec-exhaustiveness) rule). For a `case` granted totality under this rule, the no-match edge is statically dead; an implementation lowers it as a defined trap (raising `MatchFailureException` or aborting) rather than fall-through, so that the grant's soundness never rests on the exhaustiveness computation alone (as-if: the trap is unreachable in a conforming implementation).
 
 **Compound statements carry no special grant.** A callable may equally end with an `if`/`elif`/`else`, a `try`/`catch`/`finally`, or any other compound statement: a compound statement satisfies the every-exit-path rule by **ordinary reachability over its completion edges** — it counts as exiting on every path exactly when no path through it completes normally (an `if` chain exits when it has an `else` and every branch exits; a `try` exits when its `finally` block exits on every path — which only a `throw` or a non-terminating path can realize, `return` being rejected in a `finally` (below) — or when the `try` body and every `catch` arm do). The statement-`case` rule above is the sole grant keyed to an exhaustiveness proof.
 
@@ -4478,7 +4438,7 @@ The top-level operand of `return expression;` in a body with a declared return t
 <a id="sec-statement-form-of-expressions"></a>
 ### 21.9 Statement form of expressions
 
-A method call, an `await` expression, or any other expression whose result is `()` may appear as a statement on its own line, terminated with `;`. A `case`/`when` in statement position also stands alone as a statement; its value handling is **per arm**: an *expression*-bodied arm whose value is non-`()` gets this section's discard warning — and the non-trivial-dispose / interface / `Task` hard error — applied at that arm; statement-bodied and `do … end` arms have type `()` and are exempt.
+A method call, an `await` expression, or any other expression whose result is `()` may appear as a statement on its own line, terminated with `;`. A `case` in statement position also stands alone as a statement; its value handling is **per arm**: an *expression*-bodied arm whose value is non-`()` gets this section's discard warning — and the non-trivial-dispose / interface / `Task` hard error — applied at that arm; statement-bodied and `do … end` arms have type `()` and are exempt.
 
 An expression statement whose result is a non-`()` type is permitted but the compiler emits a warning: the result is silently discarded, which may indicate a bug (a return value the programmer forgot to use). **One exemption: the fluent-receiver discard.** A discarded **method-call** result draws no warning when it is a [§28.3](#sec-producers) **borrow** whose source set lies within the statement's receiver chain **and** whose static type equals the receiver's static type — the `return this` fluent shape (`sb.Append(x);`, stdlib §3.1, chained calls included): the caller still holds the receiver, so nothing computed is lost. Both conditions are load-bearing: dropping the type test would silence same-source *queries* (`FirstOrNull()`-class results are receiver-sourced too), and the exemption deliberately covers method calls only, not accessor reads. A fluent method whose declared return is a *base* of the receiver's type stays warned — conservative by design; `_ := …` remains available ([§17.13](#sec-the-discard-_)). Owned results and every other borrow keep this section's regime unchanged. To suppress the warning, use the discard form `_ := expression;` ([§17.13](#sec-the-discard-_)) — but only when the result type allows it. For non-trivial-dispose class types, for **interface types** — an interface's conformance set is open, so its implementations' trivial-dispose status cannot be proven across modules and an interface-typed result is treated as **possibly-non-trivial-dispose**, the same unknowability reasoning that makes interface-typed discards dispose the runtime type ([§17.13](#sec-the-discard-_)) — and for `Task`, the warning is replaced by a hard error directing the caller to the discard `_ := expression;` (immediate disposal, [§17.13](#sec-the-discard-_) — for an interface, disposal of the runtime type; not available for `Task`), `using var _ := expression;` (scope-end disposal), an explicit `.Dispose()`, or `Task.FireAndForget` as appropriate.
 
@@ -4574,8 +4534,13 @@ property target, taken through the copy-in / copy-out bracket below like any
 other property with an accessible setter. A `ref` argument must additionally be definitely
 assigned before the call. For plain `out`, the same categories apply, plus the
 inline declarations `out var x` and the discard `out _` ([§22.6](#sec-overloading));
-for `out owned`, the accepted forms remain exactly the inline
-`out using var x` / `out owned var x` of [§22.4](#sec-inline-out-declarations).
+for `out owned`, the inline `out var x` and `out using var x`, the discard
+`out _`, and a pre-declared **local** in an adoptable state
+([§28.3](#sec-local-variables-ownership-and-borrows)) — the rules of
+[§22.4](#sec-inline-out-declarations); a writable field, an indexer slot, or a
+property target is **not** admitted at an `out owned` parameter: it is either
+an owned-state location this section bars above, or a borrowing location the
+callee's owned value would leak into ([§28.6](#sec-leak-prevention)).
 
 **Exact referent type.** The argument's static type must be **exactly** the
 parameter's referent type. Because the parameter aliases the caller's location,
@@ -4621,7 +4586,7 @@ if factory.TryCreate(config, out using var conn) then
 end;
 ```
 
-When a method parameter is declared `out owned`, the callee produces an owned value through the output parameter, and the caller's call-site syntax must reflect this. The accepted forms at the call site of an `out owned` parameter are `out using var x` (a scope-bound owned local) and `out owned var x` (an owned local with the standard owned-local discharge rules applying); both produce an owned location for the callee to write through. Plain `out var x` is **not** accepted at the call site of an `out owned` parameter — the resulting value's ownership would have nowhere to go. The full call-site / parameter-modifier compatibility rules are given in [§22.6](#sec-overloading).
+When a method parameter is declared `out owned`, the callee produces an owned value through the output parameter, and the caller's recipient takes ownership of it. `out var x` declares a fresh local that **adopts** the classification the callee's declaration announces ([§28.3](#sec-local-variables-ownership-and-borrows)'s adoption clause): a borrow against a plain `out` parameter; against `out owned`, an **owned local** under the standard owned-local discharge rules, the must-use warning included. `out using var x` is the scope-bound owned form and is accepted only against `out owned`; `out _` is admitted against either kind ([§22.6](#sec-overloading)). A **pre-declared local** passed as plain `out x` is admitted against `out owned` exactly when it is in one of §28.3's two adoptable states — uninitialized (`var c: Connection?;`) or polymorphic-null — and adopts owned on every normal-return path of the call: the callee's declaration announces the production as owned, so a `null` assigned on the callee's `false` path leaves an owned local holding `null`, and [K7](#sec-kernel-k7) meets owned with owned at the join. The adoption happens **once**: from the call's normal return the local is state-matched by §28.3, so a second `out x` on the same local — including on a loop back edge — is rejected until the value is discharged (an owned-state location is not admitted at an `out` argument, [§22.3](#sec-ref-and-out-argument-locations)); the pre-declared form is therefore the single-use remedy of [§22.6](#sec-overloading), and the loop shape is written with the inline forms. No other lvalue category is admitted at `out owned` — a field, indexer slot, or property target is either an owned-state location §22.3 bars or a borrowing location the owned value would leak into ([§28.6](#sec-leak-prevention)). No use-site `owned` marker exists in this position: ownership is announced by the declaration alone ([§28.1](#sec-where-the-owned-modifier-can-appear), [K3.13](#sec-kernel-k3)). The full call-site / parameter-modifier compatibility rules are given in [§22.6](#sec-overloading).
 
 <a id="sec-out-nullability-postcondition"></a>
 #### Nullability postcondition on `out` parameters
@@ -4652,7 +4617,7 @@ Log("System started", timestamp := false);
 Log(level := "ERROR", message := "Failed");
 ```
 
-Named arguments may appear in any order after positional arguments. **A `ref`/`out`/`scoped` argument is positional-only:** those modifiers inhabit the `ArgModifiers` alternative of `Argument` (Appendix A.4), which has no named form — `M(out var result := n)` has no reading and does not parse, the `:=` of the binding form and the `:=` of the named form being the same token. The rule survives because those are **true argument modifiers** — grammar-level prefixes on the argument, not parts of its expression: for `out`'s binding forms (`out var x`, `out using var x`, `out owned var x`) a named spelling would put `:=` in two roles on one argument, and `scoped` shares the alternative and therefore the shape ([§22.3](#sec-parameter-modifiers)'s lending-mode line). A **transfer-marked** argument carries no modifier — the marker is part of the argument expression ([§22.3](#sec-parameter-modifiers), [§28.8.1](#sec-the-move-expression)) — so `M(item := move x)` is an ordinary named argument whose expression happens to be a `MoveExpr`, and is legal (v0.260).
+Named arguments may appear in any order after positional arguments. **A `ref`/`out`/`scoped` argument is positional-only:** those modifiers inhabit the `ArgModifiers` alternative of `Argument` (Appendix A.4), which has no named form — `M(out var result := n)` has no reading and does not parse, the `:=` of the binding form and the `:=` of the named form being the same token. The rule survives because those are **true argument modifiers** — grammar-level prefixes on the argument, not parts of its expression: for `out`'s binding forms (`out var x`, `out using var x`) a named spelling would put `:=` in two roles on one argument, and `scoped` shares the alternative and therefore the shape ([§22.3](#sec-parameter-modifiers)'s lending-mode line). A **transfer-marked** argument carries no modifier — the marker is part of the argument expression ([§22.3](#sec-parameter-modifiers), [§28.8.1](#sec-the-move-expression)) — so `M(item := move x)` is an ordinary named argument whose expression happens to be a `MoveExpr`, and is legal (v0.260).
 
 **Defaults and modifiers.** A default value is permitted only on parameters with **no modifier or `owned`** (an `owned` default is the owned-allocation form this section already blesses, e.g. a factory-call default); a default-value expression that **produces an owned value of non-trivial-dispose class type** ([§28.9](#sec-trivial-dispose-classes)) is admitted only when the parameter itself is declared `owned` — the parameter then receives ownership per [§22.3](#sec-parameter-modifiers)/[§28.8](#sec-ownership-transfer) and the callee discharges it — and is a **compile error on a plain (borrowing) parameter**, naming the undischargeable fresh instance (a trivial-dispose producer, e.g. a `new StringBuilder()` default, stays admissible on either form: on a plain parameter the materialized default is a compiler-introduced unbound owned temporary of the **calling statement** — owned by the call's full expression, freed at its [K8](#sec-kernel-k8) boundary ([§28.3](#sec-unbound-owned-temporaries)) — and the plain parameter borrows it call-bounded); `ref` and `out` parameters can never carry defaults — both require a caller-side location, which an omitted argument cannot supply. Every parameter after the first defaulted parameter must itself have a default.
 
@@ -4769,7 +4734,7 @@ Routing a fresh production to the `owned` candidate is the useful reading: fresh
 
 `owned` on an **`out` parameter** stays outside the distinguishability list: **two methods differing only in the `owned` qualifier on an `out` parameter are a compile error.** The lifted half above keys on what the caller *passes* — an expression with an ownership classification; an `out` half would key on how the caller *binds* a result (`out var` vs `out using var`), making `out` the only position where resolution consults a binding form, and it would require a dedicated `out _` ambiguity remedy (the discard is compatible with both members of such a pair). And the distinction would misdescribe the surface it serves: the standard library never declares the same-name pair, because every shipped borrow/take `out` pair is **operation-distinct**, not merely ownership-distinct — `TryGetValue` leaves the entry where `TryPopValue` removes it; `TryPeek` leaves where `TryPop`/`TryDequeue` remove — so merging them would key a *mutation of the receiver* to how the caller binds an out-result. APIs expose borrowing and owning `out` forms under distinct method names.
 
-The call-site form must still **match** the declaration ([§22.4](#sec-inline-out-declarations)): `out var x` produces a borrow location and is accepted only against a plain `out` parameter; `out using var x` (and the inline `out owned var x`) produce an owned location and are accepted only against `out owned`. A caller cannot write `out using var` against a plain `out` parameter (the result would have no owned source), nor plain `out var` against an `out owned` parameter (the resulting value's ownership would have nowhere to go). These are compatibility checks against the *resolved* signature, not resolution signals. (An explicit type annotation on the inline `out` declaration is not permitted — the type is inferred from the callee's parameter, [§22.4](#sec-inline-out-declarations). Overloads that differ in the out parameter's *type* remain legal; when the inline form's inference is ambiguous between them, disambiguate by pre-declaring a typed local and passing plain `out x`.)
+The call-site form must still **match** the declaration ([§22.4](#sec-inline-out-declarations)): `out var x` is accepted against either parameter kind and adopts the resolved parameter's classification ([§22.4](#sec-inline-out-declarations)); `out using var x` produces a scope-bound owned location and is accepted only against `out owned`. A caller cannot write `out using var` against a plain `out` parameter (the result would have no owned source). These are compatibility checks against the *resolved* signature, not resolution signals. (An explicit type annotation on the inline `out` declaration is not permitted — the type is inferred from the callee's parameter, [§22.4](#sec-inline-out-declarations). Overloads that differ in the out parameter's *type* remain legal; when the inline form's inference is ambiguous between them, disambiguate by pre-declaring a typed local and passing plain `out x`.)
 
 **`out _`.** The discard form applies to both parameter kinds: against `out T` the received value is simply dropped ([§17.13](#sec-the-discard-_)); against `out owned T` the discarded value is an unbound owned temporary disposed at the end of the full statement ([§28.3](#sec-unbound-owned-temporaries)). No ambiguity rule for `out _` against an out/out-owned pair is needed — the pair itself is not declarable.
 
@@ -5426,7 +5391,7 @@ A pure body may contain exactly the following; the list is closed, and everythin
 2. **Locals and frame-local mutation.** Variable declarations of every [§21.1](#sec-variable-declarations) form; assignment, compound assignment, and `++`/`--` where the target's **root is a local variable or by-value parameter of this body and the access path from that root traverses only value-typed storage** (record fields, inline-array slots). The first class-typed dereference on a path leaves the frame and makes the target prohibited. Mutating a record local, a record parameter copy, or an inline-array local is frame-private and admitted.
 3. **Value, record, enum, choice, and string construction and operations.** All built-in operators on primitives, enums, and `string` (concatenation included); interpolated strings (each interpolated value's implied `ToString`/`Format` call is governed by rule 6); explicit and implicit conversions; range construction; record construction and `with` update, provided the invoked constructor is compiler-synthesized-pure or declared `pure`; choice construction — the payload-free case reference and the payload-case application ([§35.3](#sec-choice-construction); a choice has no user constructors, [§35.2](#sec-choice-members)) — provided every payload argument is itself admitted under these rules **and the constructed choice's classification is not owning** ([§35.4](#sec-choice-classification)): constructing an owning-classified choice is rejected whatever case is selected — even its payload-free and value-payload cases mint an owned move-only value ([§35.3](#sec-choice-construction)) that no admitted operation of this fragment can discharge (the move-only return is rejected above; `move`, `owned` arguments, and the other consuming positions are prohibited by this list), so the error lands at the construction site rather than deferring into the scope-end disposal machinery the fragment fences off; for a generic choice the classification is per-instantiation and the check is enforced at the instantiation or use site ([§35.11](#sec-choice-generics)); inline-array construction and literals of value/record element type.
 4. **Defining lambdas and forming method references.** Closure allocation is runtime-managed ([§28.9](#sec-runtime-managed-types)) — permitted like string concatenation. A lambda *body* defined inside a pure body is **not** checked under these rules: it is a separate function that provably cannot run during the pure call (invoking function-typed values is prohibited, rule 6's contrapositive), and its later invocation happens at the caller's effect discipline. Captures follow [§28.3](#sec-local-variables-ownership-and-borrows)/[§28.9](#sec-runtime-managed-types) unchanged. (Forming a method reference *from* a pure method loses the purity fact at the formation boundary — function types carry no purity in this revision.)
-5. **All control flow.** `if`/`elif`/`else`, `case`/`when`, `while`, `for`, `do … end`, `break`/`continue`/`return`, `try`/`catch`/`finally`, and `throw` — including the bare re-raise; a caught exception binding is a borrow ([§31.1](#sec-the-throw-operand)) and is readable under rule 1. A `for` loop is admitted when its desugaring does not construct an enumerator: over `Range<T>` of primitive steppable type, the direct counted-loop form ([§16.5](#sec-iteration), [§29.2](#sec-desugaring-of-for)) — elsewhere an admitted elision — is **the normative semantics inside a pure body**; over inline arrays, spans, `ReadOnlyStringSpan`, and value-typed `OwningBuffer<T>` the desugaring is already the direct indexed loop; and over a source whose **static type at this body's own check site** is concretely **`Array<T>`, `OwningArray<T>`, class-typed `OwningBuffer<T>`, or `string`**, [§29.2](#sec-desugaring-of-for)'s admitted protocol elision is likewise **the normative semantics inside a pure body**: the compiler emits the direct indexed loop — a bounds read and per-element reads, rule-1 material — and constructs no enumerator. (The bound is read as an intrinsic length fact of the concrete layout, exactly as the counted loop's endpoints are. `string.Length` and the `string` indexer (stdlib [§9.6](Bezel_Standard_Library.md#sec-string)) and the `Count` properties of `Array<T>`/`OwningArray<T>` (stdlib [§4](Bezel_Standard_Library.md#sec-system-collections-generic)) are `pure`-declared, so for those reads either lowering satisfies the fragment; where they are not — the element indexers — the intrinsic-layout reading is the only admissible lowering. The marker follows the stored extent and stops there: `OwningBuffer<T>.Length` (stdlib [§4.14](Bezel_Standard_Library.md#sec-owned-buffers-and-spans)) is `pure`-declared as an immutable-once-allocated extent read, while an element indexer — which at a class element type lends a borrow of an owned slot — is not, and the [§4.14](Bezel_Standard_Library.md#sec-owned-buffers-and-spans)/[§4.15](Bezel_Standard_Library.md#sec-arrayspant-readonlyarrayspant) span families carry no purity markers at all.) The iteration variable's type and state are [§29.2](#sec-desugaring-of-for)'s for the elided form (a value copy for value elements and `string`; a borrow of the element for class-typed elements — default iteration over `OwningArray<T>` remains borrowing). A source whose static type is an **interface** (`IEnumerable<T>` included) or a **generic type parameter** — even one instantiated at a concrete sequence type — remains **rejected**: the remedy is declaring the source at a concrete sequence type (a concretely-typed parameter, or a concretely-typed binding before the loop). No index-loop spelling is available inside a pure body at such a source either: `IEnumerable<T>` declares no `Count` or indexer; `IReadOnlyList<T>`'s indexer is not `pure`-declared (stdlib [§4.1](Bezel_Standard_Library.md#sec-borrowing-collection-interfaces)), so rule 6 rejects the element read; and a type-parameter source has only its constraint interfaces' members — the same wall. The structural-modification fault of [§29.12](#sec-mutation-during-iteration) is preserved by the elision as everywhere; inside a pure region no admitted operation can structurally modify a collection (stores through class-typed paths and non-pure calls are both prohibited), so the fault path is statically unreachable there and an implementation may omit its check in pure bodies with no observable difference.
+5. **All control flow.** `if`/`elif`/`else`, `case`, `while`, `for`, `do … end`, `break`/`continue`/`return`, `try`/`catch`/`finally`, and `throw` — including the bare re-raise; a caught exception binding is a borrow ([§31.1](#sec-the-throw-operand)) and is readable under rule 1. A `for` loop is admitted when its desugaring does not construct an enumerator: over `Range<T>` of primitive steppable type, the direct counted-loop form ([§16.5](#sec-iteration), [§29.2](#sec-desugaring-of-for)) — elsewhere an admitted elision — is **the normative semantics inside a pure body**; over inline arrays, spans, `ReadOnlyStringSpan`, and value-typed `OwningBuffer<T>` the desugaring is already the direct indexed loop; and over a source whose **static type at this body's own check site** is concretely **`Array<T>`, `OwningArray<T>`, class-typed `OwningBuffer<T>`, or `string`**, [§29.2](#sec-desugaring-of-for)'s admitted protocol elision is likewise **the normative semantics inside a pure body**: the compiler emits the direct indexed loop — a bounds read and per-element reads, rule-1 material — and constructs no enumerator. (The bound is read as an intrinsic length fact of the concrete layout, exactly as the counted loop's endpoints are. `string.Length` and the `string` indexer (stdlib [§9.6](Bezel_Standard_Library.md#sec-string)) and the `Count` properties of `Array<T>`/`OwningArray<T>` (stdlib [§4](Bezel_Standard_Library.md#sec-system-collections-generic)) are `pure`-declared, so for those reads either lowering satisfies the fragment; where they are not — the element indexers — the intrinsic-layout reading is the only admissible lowering. The marker follows the stored extent and stops there: `OwningBuffer<T>.Length` (stdlib [§4.14](Bezel_Standard_Library.md#sec-owned-buffers-and-spans)) is `pure`-declared as an immutable-once-allocated extent read, while an element indexer — which at a class element type lends a borrow of an owned slot — is not, and the [§4.14](Bezel_Standard_Library.md#sec-owned-buffers-and-spans)/[§4.15](Bezel_Standard_Library.md#sec-arrayspant-readonlyarrayspant) span families carry no purity markers at all.) The iteration variable's type and state are [§29.2](#sec-desugaring-of-for)'s for the elided form (a value copy for value elements and `string`; a borrow of the element for class-typed elements — default iteration over `OwningArray<T>` remains borrowing). A source whose static type is an **interface** (`IEnumerable<T>` included) or a **generic type parameter** — even one instantiated at a concrete sequence type — remains **rejected**: the remedy is declaring the source at a concrete sequence type (a concretely-typed parameter, or a concretely-typed binding before the loop). No index-loop spelling is available inside a pure body at such a source either: `IEnumerable<T>` declares no `Count` or indexer; `IReadOnlyList<T>`'s indexer is not `pure`-declared (stdlib [§4.1](Bezel_Standard_Library.md#sec-borrowing-collection-interfaces)), so rule 6 rejects the element read; and a type-parameter source has only its constraint interfaces' members — the same wall. The structural-modification fault of [§29.12](#sec-mutation-during-iteration) is preserved by the elision as everywhere; inside a pure region no admitted operation can structurally modify a collection (stores through class-typed paths and non-pure calls are both prohibited), so the fault path is statically unreachable there and an implementation may omit its check in pure bodies with no observable difference.
 6. **Calls to pure members.** A call — method, operator, accessor read, or constructor in the admitted positions — is permitted iff the member **declared on the receiver's static type** (or the statically resolved member, for statics and extensions) is `pure`-declared or pure-classified (below). Every entry point of the task, domain, channel, event, synchronization, and I/O surfaces is excluded by this one rule — none is or can be `pure`-declared — with no per-API enumeration.
 7. **`throw`, with the construction carve-out below.**
 
@@ -5750,7 +5715,7 @@ Records, enums, choices ([§35.2](#sec-choice-members) admits of a choice body e
 <a id="sec-overloadable-operators"></a>
 ### 25.1 Overloadable operators
 
-- Unary: `+`, `-`, `~`, `++`, `--`
+- Unary: `+`, `-`, `~`
 - Binary: `+`, `-`, `*`, `/`, `mod`, `&`, `|`, `^`, `<<`, `>>`
 - Comparison: `<`, `>`, `<=`, `>=`, `=`, `<>`
 
@@ -5761,6 +5726,7 @@ The following operators are also not overloadable, for various reasons:
 - The null-forgiving `!`, the null-coalescing `??`, and the type-test operators `is`, `is not`, `as` — these have null-aware or type-system semantics fixed by the language; user types do not customize them.
 - Range operators `..` and `..<` — these construct values of the language-built-in `Range<T>` type ([§16](#sec-range-expressions)); user types do not customize them.
 - The `in` operator — customization is via the structural `Contains` lookup ([§17.5](#sec-the-in-operator)).
+- The increment and decrement statements `++` and `--` — built-in statements over the operand types [§6.6](#sec-compound-assignments)'s compound form admits ([§17.6](#sec-the-increment-and-decrement-operators)), not operators of the expression grammar; a type spells advancement as `x := x + 1` under its own `operator +`, or as a named method (the shape the standard library's `ISteppable<T>.Step` already takes).
 - Assignment and compound-assignment operators (`:=`, `+=`, `-=`, `*=`, `/=`, `mod=`, `&=`, `|=`, `^=`, `<<=`, `>>=`, `??=`) — Bezel has no compound-operator overload mechanism; the compound forms desugar mechanically to read-modify-write using the underlying binary operator's overload, with the evaluation counts and result typing of [§6.6](#sec-compound-assignments).
 - The `+=` and `-=` event-subscription forms ([§17.2](#sec-notes-on-operators)) — a fixed, language-defined desugaring available only on `EventSource<T>`, `AsyncEventSource<T>`, and `SharedEventSource<T>`; they are not operator overloads and are not part of the user-overloadable surface.
 - The short-circuit boolean operators `and` and `or` — like `not`, they are fixed on `bool`; their short-circuit evaluation cannot be expressed by a user method's eager parameters, so they are not overloadable. Element access `[ ]` is customized through indexers ([§23.4](#sec-indexers)), not through operator overloads.
@@ -5776,7 +5742,6 @@ The following operators are also not overloadable, for various reasons:
 
 - `=` and `<>` may **not** be overloaded on classes or on inline arrays. For classes, `=` always invokes `Equals`. For inline arrays, the language-defined structural equality of [§8.3](#sec-equals-and-gethashcode) is the only `=` available; inline arrays cannot be extended ([§26.2](#sec-what-can-be-extended)), so the overload mechanism does not reach them. Records, enums, and choices may overload `=` and `<>` ([§35.2](#sec-choice-members)).
 - Comparison operators must be overloaded as a complete group: `<`, `>`, `<=`, `>=` together; `=` and `<>` together.
-- `++` and `--` are postfix-only and statement-only. There is no separate prefix overload; the single overload is used in the one permitted position.
 - **Operator parameters admit no parameter modifiers.** `ref`, `out`, `owned`, and `scoped` on an operator's parameter list are rejected semantically — the grammar admits them through the shared `Param` production, the same over-admit-and-reject pattern as [§22.10](#sec-methods-and-constructors-primary-constructors)'s primary constructors. Operands are received as plain borrows (or value copies) under their type kinds; the return slot's optional `owned` (grammar A.4) is the sole ownership annotation on operators. Operator operand positions therefore never consume a named owned binding — the transfer marker is not admitted in operator-operand position (axiom [A7](#sec-axiom-register)), and under this rule none is needed. **For a move-only operand type** — an owning choice ([§35.4](#sec-choice-classification)), the one move-only kind with an operator surface ([§15.3](#sec-move-only-value-types), [§9.4](#sec-value-receivers-are-borrows)) — operand positions bind **borrows** of the operand values (v0.286): [§15.3](#sec-move-only-value-types)'s by-value-move rule governs plain *parameters*, not operator operands, and the borrow is the reading the intrinsic move-only comparison already uses (§15.3's borrowing comparison) and that [§19.3](#sec-patterns)/[§35.5](#sec-choice-matching) already give the receiver, the scrutinee, and payload bindings. The [§19.3](#sec-patterns) discipline governs through the borrow — reads and non-destructive matches admitted, consuming operations rejected — and both operands are live after the operation. The accepted limit: an operator body cannot transfer an operand's payload into its result; it constructs the result from fresh or copied parts. (The marker-free operands that consume by keyword — `throw x` ([§31.1](#sec-the-throw-operand)), a Pattern B `await x`, an owning-iterator `yield return x` — are separate, non-operator positions, enumerated in [§28.3](#sec-consume-table).)
 
 When a record overloads `=` and `<>`, the overloaded operators are invoked for `a = b` and `a <> b` directly — they do not delegate to `Equals`. The auto-generated or user-supplied `Equals(Object?)` and `Equals(T)` methods continue to exist; they are reachable via `.Equals(...)` call syntax and are what collections and pattern matching use. The disjunction is a two-case split (v0.276): a **heterogeneous** overload leaves the record auto-hashable, so both are the auto-generated ones; a **homogeneous** one strips the property ([§9.2](#sec-body-records)), so both are user-supplied — of which the co-declaration rule below obliges only `Equals(T)`, and a record that wants a meaningful `Equals(Object?)` rather than the inherited box-identity one declares it too, per [§9.2](#sec-body-records)'s three-member remedy.
@@ -5794,11 +5759,6 @@ record Vector2(X: double, Y: double)
   public static method operator *(v: Vector2, scalar: double): Vector2 =>
     new Vector2(v.X * scalar, v.Y * scalar);
 end Vector2;
-
-record Counter(Value: int)
-  public static method operator ++(c: Counter): Counter =>
-    new Counter(c.Value + 1);
-end Counter;
 ```
 
 Bitwise complement is overloadable for types with a natural bit-pattern or set-complement reading:
@@ -6527,7 +6487,7 @@ The taxonomy defines what a source *is* and how it bounds a borrow; which source
 | K3.1 | store into an `owned` field or owning-collection slot, including through a `set(owned)` accessor ([§23.3](#sec-block-form-properties)) | none — the declared slot announces (marker-free) | **moved-from** — a later read is an error until reassigned | frozen (K5.1) | none here — the new holder's |
 | K3.2 | `return` under an `owned` return type, or under an unmarked **mint-announcing** return type — `Task`-family in a non-`async` body, iterable-family in a non-iterator body ([§29.5](#sec-return-not-allowed-in-iterator-methods) bars plain `return` in iterator bodies) | none — the declared return type announces (marker-free) | **moved-from** | frozen (K5.1) | none here — the caller's |
 | K3.3 | an `owned` argument ([§22.3](#sec-parameter-modifiers)) | `move x` at the call site | **moved-from** | frozen (K5.1) | none here — the callee's |
-| K3.4 | a marked binding or assignment transfer — `var y := move x;`, `y := move x;`, `using var y := move x;` (the anonymous adoption `using var _ := move x;` included, [§17.13](#sec-the-discard-_)) — the marked owning-match scrutinee `case move x of …` ([§35.5](#sec-owning-match)) — and the **marked arm transfer**: `move x` as an if-expression branch or an expression-`case`/`when` arm result ([§20](#sec-the-if-expression), [§19.2](#sec-arms)), consuming on the path where its arm is selected | `move x` | **moved-from** (an arm: on the selected path; joins per K7.4) | frozen (K5.1) | none here — the new holder's |
+| K3.4 | a marked binding or assignment transfer — `var y := move x;`, `y := move x;`, `using var y := move x;` (the anonymous adoption `using var _ := move x;` included, [§17.13](#sec-the-discard-_)) — the marked owning-match scrutinee `case move x of …` ([§35.5](#sec-owning-match)) — and the **marked arm transfer**: `move x` as an if-expression branch or an expression-`case` arm result ([§20](#sec-the-if-expression), [§19.2](#sec-arms)), consuming on the path where its arm is selected | `move x` | **moved-from** (an arm: on the selected path; joins per K7.4) | frozen (K5.1) | none here — the new holder's |
 | K3.12 | for move-only values ([§15.3](#sec-move-only-value-types)), any store into an owning location | none ([§15.3](#sec-move-only-value-types)'s scope note: unmarked assignment and plain passing move) | **moved-from** | frozen (K5.1) | none here — the new holder's |
 | — | **Family 2 — ownership-taking kills and transfers** (K3.5–K3.9) | | | | |
 | K3.5 | the operand of a Pattern B `await` ([§30.5](#sec-result-lifetime-and-task-disposal)) | none — the keyword announces | **moved-from** | **unfrozen** (K4.2, K5.3)† | at the await, on all outgoing edges including fault and cancel ([§30.5](#sec-result-lifetime-and-task-disposal)) |
@@ -6585,7 +6545,7 @@ The [consume table](#sec-consume-table) records the verdicts these bits decide, 
 5. **Interaction with K8.** A frame sourced by an unbound temporary must itself be consumed to its bound within the same full expression; a frame that escapes the expression is rejected — the reject-not-extend posture.
 
 <a id="sec-kernel-k7"></a>
-**K7 — The join rule.** At every control-flow join — statement merges, `??`, `if` expressions, expression-position `case`/`when` arms, loop back edges — a variable's or expression's state is the lattice meet, owned ⊑ borrowed:
+**K7 — The join rule.** At every control-flow join — statement merges, `??`, `if` expressions, expression-position `case` arms, loop back edges — a variable's or expression's state is the lattice meet, owned ⊑ borrowed:
 
 1. owned ⊓ owned = **owned**, obligation carried forward (for expression arms: exactly one arm's value exists at runtime, so exactly one obligation);
 2. borrowed ⊓ borrowed = **borrowed**, carrying the union of the arms' source sets (K2.2);
@@ -6628,7 +6588,7 @@ Eleven axioms (and four tombstones). Each is a rule the kernel cannot derive —
 | A4 | Accessor read faces are lend-only: property and indexer *types* carry no `owned`, and a getter may not return a fresh owned value; `set(owned)` is the marker-free write face (K3.1) | [§28.6](#sec-leak-prevention), [§23](#sec-properties-and-indexers) | Signature predictability: every accessor read classifies as a borrow with no marker position available; factories are methods. |
 | A5 | `using var` is a scope pin: non-reassignable, never movable out | [§28.10](#sec-using-var); rationale §5.23 | Declared-intent form; scope-pinning is its entire meaning (kept strict deliberately at the affine transition). |
 | A6 | `Task`/`Task<T>` may not be discarded — by `_ := …` or by the anonymous `using var _ := …` binding; `Task.FireAndForget` is the routed spelling | [§17.13](#sec-the-discard-_); rationale §5.23 | Semantic, not memory: abandoning a running operation is a decision, not a disposal. |
-| A7 | The transfer marker is not admitted in `??`-operand or operator-operand position: identifier-operand `move` there is rejected, and a named owned binding written bare is a borrow arm. (The arm half — if-expression branches, expression-`case`/`when` arm results — is a K3.4 derivation; the `??` lift stays gated on the null-evaluated-transfer ruling, sequenced after the v0.246 marker unification so that rule, if ever adopted, lands in the unified spelling.) | [§28.3](#sec-producers), [§22.3](#sec-parameter-modifiers) | Recorded liftable bound, narrowed — and purely semantic: the marker parses in these positions, so the axiom's content is the recorded rejection, not a spelling gap; the `??` half awaits the null-evaluated-transfer ruling, the operator half's use case arrived at v0.286 (#3560) and resolved toward the entrenched never-consume reading: move-only operands bind borrows (§25.2). No-silent-consume (K3.13) stays uniform: the unmarked read is a borrow arm. |
+| A7 | The transfer marker is not admitted in `??`-operand or operator-operand position: identifier-operand `move` there is rejected, and a named owned binding written bare is a borrow arm. (The arm half — if-expression branches, expression-`case` arm results — is a K3.4 derivation; the `??` lift stays gated on the null-evaluated-transfer ruling, sequenced after the v0.246 marker unification so that rule, if ever adopted, lands in the unified spelling.) | [§28.3](#sec-producers), [§22.3](#sec-parameter-modifiers) | Recorded liftable bound, narrowed — and purely semantic: the marker parses in these positions, so the axiom's content is the recorded rejection, not a spelling gap; the `??` half awaits the null-evaluated-transfer ruling, the operator half's use case arrived at v0.286 (#3560) and resolved toward the entrenched never-consume reading: move-only operands bind borrows (§25.2). No-silent-consume (K3.13) stays uniform: the unmarked read is a borrow arm. |
 | A8 | *Retired.* The prior axiom and its decision record are in the [changelog](Bezel_Changelog.md). | — | — |
 | A9 | The two collection families: borrowing by default, owning as separately named types | [§28.11](#sec-collection-element-ownership); rationale §5.3 | The recorded resolution; the declined merged-generic form is rationale §5.3/§5.11's record. |
 | A10 | Stdlib certification grants: `CancellationToken`'s source-outlives-settlement certification; the §30.11 completion-source callback admission — a named carve beside §28.14, not a derivation of it | [§30.1](#sec-async-methods), [§30.8](#sec-cancellation), [§30.11](#sec-taskcompletionsourcet-and-ownedtaskcompletionsourcet) | A named allowlist of trust granted to specific stdlib types — by construction not derivable; each entry normatively stated at its type. |
@@ -6713,7 +6673,7 @@ The ownership state of an expression is determined by the expression form — th
 | `this` | Borrowed (source: caller) |
 | `x as T` | Borrowed (source: same as `x`'s source if `x` is borrowed; `x` itself if `x` is owned). The cast does not move from `x`; `x` retains its ownership state. The result is nullable. See [§17.4](#sec-the-is-is-not-and-as-operators) for the rationale. |
 | `a ?? b` (null-coalescing, [§7.7](#sec-null-coalescing-and-=)) | The **meet** of the ownership states of `a` and `b` per [K7](#sec-kernel-k7) — the same two-branch merge as the control-flow join above (K7.1–K7.3: owned ⊓ owned = **owned**, exactly one arm's value produced and discharged; borrowed ⊓ borrowed = **borrowed** with the union of sources; mixed = **rejected** — equalize the arms first). A **named owned binding** written as an arm is an *unmarked read* and therefore a **borrow** arm (K3.13; the transfer marker is rejected in `??`-operand position — axiom [A7](#sec-axiom-register)): `a ?? b` over two named owned locals consumes neither binding. To coalesce two named owned bindings into one owned result, use the marked arm transfer — `var r := (if a <> null then move a else move b);` ([K3.4](#sec-kernel-k3)) — or equalize by statement. A `null`-literal or bottom-typed (`throw`) arm absorbs to the other arm's state (K7.5), legitimizing the `x ?? throw …` shape ([§17.12](#sec-the-throw-expression)). The compound form `a ??= b` assigns into `a` and follows the same meet rule for the assigned-into location. |
-| `(if c then v1 else v2)` ([§20](#sec-the-if-expression)); the result of an expression-position `case`/`when` ([§19.1](#sec-forms), [§19.2](#sec-arms)) | The **meet** of the arms' ownership states, identically to the `a ?? b` row above ([K7](#sec-kernel-k7) at expression joins; for `case`/`when` the meet ranges over every arm's result expression) — with one difference: the **marked arm** `move x` *is* admitted here (axiom A7 rejects it only in `??`-operand position), an **owned** producer and [K3.4](#sec-kernel-k3) transfer consuming on the path where its arm is selected, the binding joining per [K7.4](#sec-kernel-k7) after the construct. An **unmarked** read of a named owned binding remains a **borrow** arm (K3.13 — no silent consume); `throw` and `null`-literal arms absorb (K7.5; [§17.12](#sec-the-throw-expression)). |
+| `(if c then v1 else v2)` ([§20](#sec-the-if-expression)); the result of an expression-position `case` ([§19.1](#sec-forms), [§19.2](#sec-arms)) | The **meet** of the arms' ownership states, identically to the `a ?? b` row above ([K7](#sec-kernel-k7) at expression joins; for `case` the meet ranges over every arm's result expression) — with one difference: the **marked arm** `move x` *is* admitted here (axiom A7 rejects it only in `??`-operand position), an **owned** producer and [K3.4](#sec-kernel-k3) transfer consuming on the path where its arm is selected, the binding joining per [K7.4](#sec-kernel-k7) after the construct. An **unmarked** read of a named owned binding remains a **borrow** arm (K3.13 — no silent consume); `throw` and `null`-literal arms absorb (K7.5; [§17.12](#sec-the-throw-expression)). |
 | The binding atom `(var x := E; body)` ([§17.15](#sec-the-binding-atom)) | The **body's** classification, transparently — the atom is not a join (clauses and body evaluate unconditionally; no meet arises). Each clause is a *binding form*: its binding classifies per this table applied to its initializer — a borrow initializer yields a borrow binding carrying the initializer's sources; `var y := move x;` is [K3.4](#sec-kernel-k3)'s marked binding transfer; an owned production yields a **named unbound owned temporary bounded by the atom** ([K8.5](#sec-kernel-k8)), disposed at the atom's completion if undischarged. A borrow sourced by an atom binding may not escape the atom ([K8.4](#sec-kernel-k8) at the atom boundary) — in particular, a body whose value borrows an owned binding of the atom is rejected. The body is not a [K3.4](#sec-kernel-k3) marked-transfer position (no `move x` body in this revision). |
 | Captured borrow inside a closure | Borrowed (source: same as the captured local's source). The closure value itself is runtime-managed; the captured borrow's lifetime is tracked separately. |
 | Captured owned local inside a closure | Borrowed (source: the local's enclosing scope). Capturing does not transfer ownership; the closure cannot outlive the local's scope. See [§28.9](#sec-runtime-managed-types). |
@@ -6724,7 +6684,7 @@ The **borrowing positions** — `x` retains ownership, and the value is borrowed
 
 - a non-`owned` argument;
 - an indexer or property access;
-- an operand of a null-coalescing expression (`a ?? b` — the table's `??` row then sees a borrow arm; the marker is rejected in that position, axiom [A7](#sec-axiom-register)), or an **unmarked** if-expression branch or expression-`case`/`when` arm result (the arm-meet row sees a borrow arm; the *marked* form `move x` in those positions is instead the K3.4 arm transfer);
+- an operand of a null-coalescing expression (`a ?? b` — the table's `??` row then sees a borrow arm; the marker is rejected in that position, axiom [A7](#sec-axiom-register)), or an **unmarked** if-expression branch or expression-`case` arm result (the arm-meet row sees a borrow arm; the *marked* form `move x` in those positions is instead the K3.4 arm transfer);
 - the operand of a `yield return` in a borrowing iterator (a re-borrow, source the binding itself — [§29.2](#sec-iterator-yield-ownership));
 - an **unmarked** local binding or assignment RHS — `var y := x;`, `y := x;`: a plain alias binding is a borrow of `x`, source `x` itself;
 - for move-only locals, a borrow of the value through indexing or equality comparison.
@@ -6916,7 +6876,7 @@ The discharge requirement above governs *named* owned values — locals, fields,
 
 **The scoped-bind pinned slot ([§30.5](#sec-the-scoped-await-bind)).** A fresh `Task<T>` (class T) producer expression that is the exact initializer of a fresh local `var`/`const` declaration under the scoped await-bind is **not left** an unbound temporary of this section: the compiler binds it — establishing a hidden, unnameable `using var` slot ([§28.10](#sec-using-var)) at the declaration, pinned to the innermost enclosing block — and the ordinary named-location machinery governs from there. The classification (which expressions are unbound owned temporaries of task type) is this section's, unchanged; the re-pointing of its consequence at that one declaration form — bind-to-slot instead of dispose-at-boundary — is stated at [§30.5](#sec-the-scoped-await-bind).
 
-**The full expression boundary.** The disposal boundary above — and the boundary wherever this specification uses the term for value lifetime — is [K8](#sec-kernel-k8)'s **full expression**, which includes desugared bindings such as [§29.2](#sec-desugaring-of-for)'s `__source` (in an expression statement, "end of the full expression" and "end of the statement" coincide, [§21.9](#sec-statement-form-of-expressions)); [K8.2](#sec-kernel-k8) makes each **evaluation** of a condition, `when` arm condition, or pattern guard its own boundary, so condition temporaries never accumulate across iterations. (Distinguish the grammar-level use of the phrase — "the scrutinee is a full Expression", [§19.1](#sec-forms) — which is about parse precedence, not this lifetime boundary.)
+**The full expression boundary.** The disposal boundary above — and the boundary wherever this specification uses the term for value lifetime — is [K8](#sec-kernel-k8)'s **full expression**, which includes desugared bindings such as [§29.2](#sec-desugaring-of-for)'s `__source` (in an expression statement, "end of the full expression" and "end of the statement" coincide, [§21.9](#sec-statement-form-of-expressions)); [K8.2](#sec-kernel-k8) makes each **evaluation** of a condition or pattern guard its own boundary, so condition temporaries never accumulate across iterations. (Distinguish the grammar-level use of the phrase — "the scrutinee is a full Expression", [§19.1](#sec-forms) — which is about parse precedence, not this lifetime boundary.)
 
 **`case` scrutinees extend the boundary.** For a `case` whose scrutinee produces an unbound owned temporary, the boundary is [K8.3](#sec-kernel-k8)'s: the **whole `case` construct**, in statement position exactly as in expression position, which is what keeps [§19.3](#sec-patterns)'s pattern bindings — borrows whose source is the scrutinee — alive through the arm body: in `case pool.PopFirst() of var f: FastConnection => f.Warm(), _ => () end;` the binding `f` reads a temporary that is disposed after the selected arm finishes, never before it (the declined reject-instead alternative is recorded at rationale [§5.24](Bezel_Design_Rationale.md#sec-the-full-expression-boundary)).
 
@@ -7477,7 +7437,7 @@ end ProcessFile;
 
 Disposal happens on every exit path: normal completion, `break`, `return`, or exception. **Cleanup ordering is uniform across exit edges:** `using var` compiles to `try`/`finally` ([§29.6](#sec-restrictions-inside-try-catch-finally)), so `using var` disposals and explicit `finally` clauses form one establishment-ordered stack — on *every* exit edge (normal, `return`, `break`/`continue`, exception, and an iterator's early disposal, [§29.7](#sec-disposal-of-partially-consumed-iterators)), pending cleanups run in reverse order of establishment. No edge runs the two kinds in separate category-ordered phases. A `try` statement's own `finally` is **established at entry to the protected block** — before any establishment the block itself performs. Consequently, on every exit edge, an owned local or `using var` declared **inside** the protected block (established later) is disposed **before** the `finally` runs, exactly as the desugared nested `try`/`finally` of this section and [§29.6](#sec-restrictions-inside-try-catch-finally) would dispose it; cleanups established **before** the `try` run after the `finally`, as before ([§31.2](#sec-try-catch-finally)).
 
-An expression whose arm-meet is **owned** — a `??`, an `if` expression, or an expression-position `case`/`when` over owned producers (the [K7](#sec-kernel-k7) meet; [§28.3](#sec-producers)) — is an owned producer for this section's admission: `using var x := (if useFresh then new Buffer() else source.CloneBuffer());` — where `CloneBuffer` is declared `CloneBuffer(): owned Buffer`, making both arms fresh producers — binds `x` owned and disposes it at scope end. (An arm that is an *unmarked* read of a named owned binding is a borrow arm per the producers table — the whole expression is then a borrow and the `using var` a borrow-pin; a **marked** arm `move cached` is an owned arm.)
+An expression whose arm-meet is **owned** — a `??`, an `if` expression, or an expression-position `case` over owned producers (the [K7](#sec-kernel-k7) meet; [§28.3](#sec-producers)) — is an owned producer for this section's admission: `using var x := (if useFresh then new Buffer() else source.CloneBuffer());` — where `CloneBuffer` is declared `CloneBuffer(): owned Buffer`, making both arms fresh producers — binds `x` owned and disposes it at scope end. (An arm that is an *unmarked* read of a named owned binding is a borrow arm per the producers table — the whole expression is then a borrow and the `using var` a borrow-pin; a **marked** arm `move cached` is an owned arm.)
 
 `using var` is a scope pin (axiom [A5](#sec-axiom-register)): it is implicitly non-reassignable, and reassigning a `using var` variable is a compile error. To use a different resource later in the method, introduce a new `do ... end` block.
 
@@ -9377,7 +9337,7 @@ All exceptions in the list above are catchable except `StackOverflowException`. 
 
 The principle behind the built-in list: an exception is built-in iff its only producer is a built-in operation (an array or string indexer, an integer arithmetic operation, the `case` construct, an async cancellation). Exceptions whose producer requires explicit `import` live alongside their producer in the standard library and require the same import.
 
-Domain-specific exception types defined in the standard library include `KeyNotFoundException` (raised by `Dictionary<K, V>`'s indexer; declared in `System.Collections.Generic`, stdlib §4.8), `ArgumentOutOfRangeException` (deriving from `ArgumentException`; raised by range-validating constructors such as `DateTime`'s; declared in the auto-imported `System`, stdlib §2.5), `FileNotFoundException`, `IOException`, and others. Outside the auto-imported `System`, each requires explicit `import` of its containing module.
+Domain-specific exception types defined in the standard library include `KeyNotFoundException` (raised by `Dictionary<K, V>`'s indexer; declared in the auto-imported `System.Collections.Generic`, stdlib §4.8), `ArgumentOutOfRangeException` (deriving from `ArgumentException`; raised by range-validating constructors such as `DateTime`'s; declared in the auto-imported `System`, stdlib §2.5), `FileNotFoundException`, `IOException`, and others. Outside the auto-imported modules ([§2.3](#sec-always-available-names)), each requires explicit `import` of its containing module.
 
 <a id="sec-throw-as-an-expression"></a>
 ### 31.5 `throw` as an expression
@@ -10933,7 +10893,7 @@ OperatorBody    ::= "=>" Expression ";"
                   | Statement* "end" ("operator" OpToken)? ";"
 OpToken         ::= "+" | "-" | "*" | "/" | "mod" | "&" | "|" | "^"
                   | "<<" | ">>" | "<" | ">" | "<=" | ">="
-                  | "=" | "<>" | "~" | "++" | "--"
+                  | "=" | "<>" | "~"
 
 NestedTypeDecl  ::= ClassDecl | InterfaceDecl | RecordDecl | EnumDecl
                               /* The reused productions carry `Visibility?` for
@@ -11002,18 +10962,18 @@ Argument        ::= ArgModifiers ArgExpression
 ArgModifiers    ::= "ref"
                   | "out" "var"?
                   | "out" "using" "var"
-                  | "out" "owned" "var"
                   | "scoped"
                               /* The bare "owned" alternative was deleted at
                                  v0.246 (proposal 0090): the call-site transfer
                                  marker is part of the argument EXPRESSION —
                                  `M(move x)` parses through the plain
                                  ArgExpression path as an identifier-operand
-                                 MoveExpr (A.7; §22.3, §28.8.1). "out owned var"
-                                 stays: it declares a fresh owned binding at
-                                 the call site — a declaration position
-                                 (§22.4), on `owned`'s declarative side of the
-                                 line. "scoped" (§22.3/§28.14) marks a
+                                 MoveExpr (A.7; §22.3, §28.8.1). An inline
+                                 "out var" recipient adopts the resolved
+                                 parameter's classification (§22.4); "out using
+                                 var" is the scope-bound owned recipient,
+                                 admitted only against an `out owned` parameter
+                                 (§22.6). "scoped" (§22.3/§28.14) marks a
                                  class/interface-typed borrow argument to a
                                  `scoped` parameter — `M(scoped x)`; fresh
                                  producers rejected (§9.7). `scoped` remains an
@@ -11133,7 +11093,7 @@ PrimitiveType   ::= IntegerType | "float" | "double" | "decimal"
 Statement       ::= LocalDecl | LocalConstDecl | AssignmentStmt | ExpressionStmt
                   | DiscardStmt
                   | IfStmt | WhileStmt | ForStmt | DoEndBlock
-                  | CaseStmt | WhenStmt
+                  | CaseStmt
                   | ReturnStmt | ThrowStmt | BreakStmt | ContinueStmt
                   | TryStmt | YieldStmt
                   | IncrementStmt
@@ -11157,11 +11117,10 @@ LocalTypeDecl   ::= RecordDecl | EnumDecl
                                  (RecordDecl, EnumDecl) is unchanged. */
 
 CaseStmt        ::= "case" Expression "of" CaseArm ("," CaseArm)* ","? "end" "case"? ";"
-WhenStmt        ::= "when" WhenArm ("," WhenArm)* ","? "end" "when"? ";"
-                              /* The statement forms of §19's constructs:
+                              /* The statement form of §19's construct:
                                  `end`-terminated, with the statement's `;`
-                                 following the closer. Arms use the same CaseArm/
-                                 WhenArm grammar as the A.7 atoms, and here
+                                 following the closer. Arms use the same CaseArm
+                                 grammar as the A.7 atom, and here
                                  ArmBody additionally admits its Statement and
                                  `do … end` alternatives; an expression-bodied
                                  arm's value is discarded per §21.9, applied per
@@ -11305,7 +11264,7 @@ The grammar shown here is informal: it lists the alternatives at each precedence
 ```ebnf
 Expression      ::= LogicalOr
                   | ThrowExpr
-                              /* IfExpr, CaseExpr, and WhenExpr are PrimaryAtom
+                              /* IfExpr and CaseExpr are PrimaryAtom
                                  forms (self-delimited, usable in any operand
                                  position); no conditional level exists in the
                                  operator table (§17.1). A bare ThrowExpr
@@ -11432,7 +11391,6 @@ PrimaryAtom     ::= Literal
                   | LambdaExpr
                   | IfExpr
                   | CaseExpr
-                  | WhenExpr
                   | BindExpr
                   | "this" | "base"
                   | NameOfExpr | TypeOfExpr | DefaultExpr
@@ -11474,7 +11432,7 @@ MoveExpr        ::= "move" PrimaryExpr
                                  §22.3; named or positional alike, §22.5,
                                  v0.260), a `case`
                                  scrutinee root (§35.5), an if-expression
-                                 branch, or an expression-`case`/`when` arm
+                                 branch, or an expression-`case` arm
                                  result. Everywhere else — `??` operands,
                                  operator operands, guards, nested
                                  subexpressions — it is a compile error naming
@@ -11575,10 +11533,8 @@ CaseExpr        ::= "(" "case" Expression "of" CaseArm ("," CaseArm)* ","? ")"
                                  when the scrutinee names a named owned binding
                                  of owning-choice classification; anywhere else
                                  it is a compile error. */
-                              /* The scrutinee Expression is mandatory;
-                                 the scrutinee-less condition-dispatch form is
-                                 the separate WhenExpr below. `of` delimits the
-                                 scrutinee from the first arm, so
+                              /* The scrutinee Expression is mandatory. `of`
+                                 delimits the scrutinee from the first arm, so
                                  the scrutinee is a FULL Expression — no
                                  precedence restriction, no parenthesization
                                  rule — and a first pattern may begin with `-`,
@@ -11595,19 +11551,6 @@ AltPattern      ::= Pattern ("|" Pattern)*
                                  relationals (§19.3). `|` never collides with
                                  bitwise-or: pattern-embedded expressions parse
                                  at Shift level or tighter (§19.3). */
-WhenExpr        ::= "(" "when" WhenArm ("," WhenArm)* ","? ")"
-                              /* Scrutinee-less condition dispatch (§19.1), the
-                                 expression-position atom: arms are
-                                 Expression-bodied only; the statement form is
-                                 A.6's WhenStmt. Arms are tried in textual order;
-                                 the first whose condition is `true` is selected.
-                                 The construct keyword `when` is distinct from
-                                 the guard `when` of a CaseArm/CatchArm —
-                                 position disambiguates. */
-WhenArm         ::= (Expression | "_") "=>" ArmBody
-                              /* The Expression is a `bool` condition. `_` is the
-                                 always-true catch-all and, if present, must be the
-                                 last arm. ArmBody follows the same rules as CaseArm. */
 BindExpr        ::= "(" BindClause+ Expression ")"
 BindClause      ::= "var" Identifier (":" Type)? ":=" Expression ";"
                               /* The binding atom (§17.15): "(" followed
@@ -11623,11 +11566,11 @@ BindClause      ::= "var" Identifier (":" Type)? ":=" Expression ";"
                                  transfer `move x` (a K3.4 binding transfer,
                                  §28.3); the body position does not. */
 ArmBody         ::= Expression
-                  | Statement                  /* valid only in a CaseStmt/WhenStmt (A.6)
+                  | Statement                  /* valid only in a CaseStmt (A.6)
                                                   or in a catch arm; reads as a single
                                                   statement whose terminating `;` ends the
                                                   arm body, the same as `do Statement end` */
-                  | "do" Statement* "end"     /* type (); valid only in a CaseStmt/WhenStmt
+                  | "do" Statement* "end"     /* type (); valid only in a CaseStmt
                                                   or in a catch arm */
 Pattern         ::= "_"                       /* discard */
                   | "null"                     /* null literal pattern */
@@ -11803,7 +11746,7 @@ The following keywords from [§B.1](#sec-reserved-keywords) carry meaning only i
 
 The setter parameter is named `value` by convention; it is not a true keyword in that role and may be shadowed inside the setter body (though doing so is poor style).
 
-`when`, `where`, `with`, and `yield` are reserved everywhere — although they appear only in specific syntactic positions in practice, the grammar treats them as full keywords for clarity. `requires`, `ensures`, and `invariant` joined that category at v0.260 (they had been contextual since their v0.203 introduction): the words appear only in the clause region and the member-leading `invariant` position, but reserving them unconditionally makes the end of a clause region a fact about the *token*, not about what a body's first statement happens to be named — a body's first statement can no longer be a call to something named `requires`, so the clause region can never absorb a statement (proposal 0055 §3's first-statement collision, closed). `old` and `result` stay contextual: they are clause-interior names whose ordinary-identifier use (`result` especially) is common vocabulary, and their marker-wins rows above already resolve them without a seam.
+`when`, `where`, `with`, and `yield` are reserved everywhere — although they appear only in specific syntactic positions in practice, the grammar treats them as full keywords for clarity. `when` has exactly two positions — the arm guard of a `case`/`catch` arm ([§19.4](#sec-guards)) and the `when true`/`when false` clause of an `out` parameter ([§22.4](#sec-out-nullability-postcondition)); it begins no expression and no statement, and a `when`-led expression or statement is a syntax error. `requires`, `ensures`, and `invariant` joined that category at v0.260 (they had been contextual since their v0.203 introduction): the words appear only in the clause region and the member-leading `invariant` position, but reserving them unconditionally makes the end of a clause region a fact about the *token*, not about what a body's first statement happens to be named — a body's first statement can no longer be a call to something named `requires`, so the clause region can never absorb a statement (proposal 0055 §3's first-statement collision, closed). `old` and `result` stay contextual: they are clause-interior names whose ordinary-identifier use (`result` especially) is common vocabulary, and their marker-wins rows above already resolve them without a seam.
 
 <a id="sec-not-vs-notnull"></a>
 #### `not` vs `notnull`
@@ -11902,6 +11845,7 @@ This appendix consolidates the invariants the compiler enforces. It is a checkli
 - An unbound owned temporary is disposed exactly once — at the end of its full expression after its uses complete, or during unwinding in reverse production order ([§28.3](#sec-unbound-owned-temporaries); K1 + K3.15 + [K8.1](#sec-kernel-k8)).
 - A binding-atom binding whose initializer is an owned production ([§17.15](#sec-the-binding-atom)) is a named unbound owned temporary bounded by the atom — disposed exactly once at the atom boundary unless a [K3](#sec-kernel-k3) position discharged it, no borrow or frame sourced by it escaping the atom ([§28.3](#sec-unbound-owned-temporaries); [K8.4](#sec-kernel-k8)/[K8.5](#sec-kernel-k8)).
 - An `out owned` parameter is a callee-local owned slot until normal return — disposed by the callee's exception-path discharge on a later throw, transferring to the caller's recipient exactly on normal return, the caller-side obligation attaching on normal-completion paths only ([§22.3](#sec-parameter-modifiers), [§22.4](#sec-inline-out-declarations); K3 + K3.15).
+- An inline `out var x` recipient adopts the resolved parameter's announced classification (a borrow against `out`, an owned local against `out owned`); `out using var x` is admitted only against an `out owned` parameter; a pre-declared **local** is admitted as an `out owned` recipient only in an adoptable state, adopts owned once, and is state-matched from the call's normal return; no field, indexer slot, or property target is admitted at `out owned` ([§22.3](#sec-ref-and-out-argument-locations), [§22.4](#sec-inline-out-declarations), [§22.6](#sec-overloading); K1.7 + K3.11).
 - `using var` variables may not be reassigned (axiom [A5](#sec-axiom-register)).
 - Records may not have `owned` fields, may not have inline-array fields with the `owned` slot marker, may not have destructors, may not implement `IDisposable` (K1.7 — copy-semantics holders cannot hold obligations).
 - At a control-flow merge point, a variable that was owned on one branch and borrowed on the other is rejected ([§28.3](#sec-local-variables-ownership-and-borrows); [K7.3](#sec-kernel-k7)). The two branches must be equalized before the merge.
@@ -12049,6 +11993,7 @@ This appendix consolidates the invariants the compiler enforces. It is a checkli
 - A body record or value-like choice carrying a **homogeneous** `=`/`<>` overload is **not auto-hashable**; a heterogeneous-operand one (`T = U`) neither qualifies nor disqualifies ([§9.2](#sec-body-records)'s membership list and third disqualifier, [§35.7](#sec-choice-equality); ruled v0.276).
 - Comparison operators are overloaded as a complete group (`<`, `>`, `<=`, `>=` together; `=` and `<>` together).
 - The bitwise complement operator is `~`; the boolean negation operator is `not`. They are not interchangeable. `~` is user-overloadable; `not` is not.
+- `++` and `--` are not user-overloadable: `operator ++`/`operator --` is not an `OpToken` (Appendix A.4), so such a declaration is a syntax error at the token ([§25.1](#sec-overloadable-operators) states the reason), and `x++`/`x--` is admitted only on an operand of a type [§6.6](#sec-compound-assignments)'s compound form admits — an integer type, a floating-point type, `decimal`, or `char` ([§17.6](#sec-the-increment-and-decrement-operators)).
 - Assignment and compound-assignment operators (`:=`, `+=`, `-=`, `*=`, `/=`, `mod=`, `&=`, `|=`, `^=`, `<<=`, `>>=`, `??=`) are not user-overloadable. The `+=` and `-=` event-subscription forms on `EventSource<T>`, `AsyncEventSource<T>`, and `SharedEventSource<T>` are a fixed compiler desugaring ([§17.2](#sec-notes-on-operators)), not operator overloads.
 
 <a id="sec-static-initialization"></a>

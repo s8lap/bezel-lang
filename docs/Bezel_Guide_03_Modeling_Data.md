@@ -1,6 +1,6 @@
 # Bezel Guide 3: Modeling Data
 
-*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.270.*
+*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.289.*
 
 Bezel gives you five ways to declare a data shape and three ways to select over one. This guide is the picking rule for each. The definitions live in the spec (§9 records, §10 enums, §11 classes, §19 selection, §35 choices), and the *why* behind the design is rationale §9.6. For choosing a **failure signal** (`T?` vs `Try` vs `Result` vs `requires`/exceptions), see Guide 2 §7 — that table is the home; this guide does not repeat it.
 
@@ -46,17 +46,16 @@ Boundary calls that come up in practice:
 - **Choice vs `T?`.** A choice with one meaningful payload and one empty case is what `T?` already provides — use `T?` (the recorded rule; DECLINED.md's `Option<T>` entry).
 - **Generic over a kind.** The constraint set is `where T: class`, `where T: value`, `where T: notnull`, `where T: new()`, `where T: sendable`, `where T: hashable`, a base class, an interface, or another type parameter (spec §14.2). `where T: value` is the kind constraint for records, enums, choices, primitives, and inline arrays — the one a value-only generic wants, where `notnull` admits references too.
 
-## 2. Selecting over a value — `(if …)`, `(when …)`, `(case …)`
+## 2. Selecting over a value — `(if …)`, `(case …)`
 
-The three-sentence rule: a **two-way** pick on one condition is the conditional atom. A **ladder of conditions** is `(when …)`. **Dispatch on the shape or value of one scrutinee** is `(case … of …)`. In statement position the same constructs take their `end`-terminated statement forms.
+The two-sentence rule: a pick on **conditions** — two-way, or a ladder — is the conditional atom, `(if c then a elif c2 then b else z)`. **Dispatch on the shape or value of one scrutinee** is `(case … of …)`. In statement position the same constructs take their `end`-terminated statement forms.
 
 ```bezel
 var max    := (if a > b then a else b);                       // two-way
 
-var fee    := (when                                            // condition ladder
-  amount > 10_000m => 0m,
-  isPremium        => 1m,
-  _                => 2.50m);
+var fee    := (if amount > 10_000m then 0m                     // condition ladder
+               elif isPremium then 1m
+               else 2.50m);
 
 var label  := (case outcome of                                 // shape dispatch
   Fetched(var body) => $"got {body.Length} bytes",
@@ -64,7 +63,7 @@ var label  := (case outcome of                                 // shape dispatch
   Failed(var code)  => $"error {code}");
 ```
 
-- `elif` chains keep a short ladder inside the conditional atom (`(if c1 then a elif c2 then b else d)`). Once arms stop being conditions-on-different-things and start being cases-of-one-thing, switch to `case`.
+- `elif` chains keep a ladder of any length inside the conditional atom, and in statement position a trailing `if`/`elif`/`else` whose every branch exits satisfies the every-exit-path rule (spec §21.7). Once arms stop being conditions-on-different-things and start being cases-of-one-thing, switch to `case`.
 - `case` is the only form that *binds* — patterns destructure payloads (`Fetched(var body)`) and narrow types (`var c: Circle`). If you need the scrutinee's pieces, you want `case` regardless of arity.
 - Exhaustiveness: `case` over an enum, choice, or closed hierarchy needs no `_` arm when every case is covered (§19.6) — prefer that. A `_` arm silences the compiler's help when the type grows. One carve (v0.245): when a closed hierarchy's root or any leaf is *generic*, leaf coverage is not attempted — no arrangement of type-pattern arms is a static proof, and the `case` is completable only by an irrefutable arm (an unguarded `_` or unguarded untyped `var`); a value-shaped sum there is better modeled as a `choice`, whose exhaustiveness is counted by case name and needs no `_` (§19.6).
 - Ownership in arms follows the meet rule (Guide 1 §8): arms must agree — all owned or all borrowed. A named owned binding as an arm is a borrow unless you mark it (`move x`, consume-if-selected).

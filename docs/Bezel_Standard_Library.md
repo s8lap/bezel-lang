@@ -1,6 +1,6 @@
 # Bezel Standard Library Specification
 
-**Companion to the Bezel Language Specification, v0.288 — September 2026**
+**Companion to the Bezel Language Specification, v0.289 — September 2026**
 
 This document specifies the standard library types referenced by the language specification. The language spec assumes these types exist and have certain shapes; this document defines those shapes.
 
@@ -12,7 +12,7 @@ The library is organized into modules. Some are auto-imported in every file; oth
 1. [Conventions](#1-conventions)
 2. [`System` (auto-imported)](#2-system-auto-imported)
 3. [`System.Text` (auto-imported)](#3-systemtext-auto-imported)
-4. [`System.Collections.Generic`](#4-systemcollectionsgeneric)
+4. [`System.Collections.Generic` (auto-imported)](#4-systemcollectionsgeneric-auto-imported)
 5. [`System.Collections.Linq`](#5-systemcollectionslinq)
 6. [`System.Threading`](#6-systemthreading)
 7. [`System.IO`](#7-systemio)
@@ -233,7 +233,7 @@ public static class Environment
 end Environment;
 ```
 
-`Variables()` (v0.231) returns a freshly-allocated `owned Dictionary<string, string>` (per the §1 convention for fresh-instance returns). Although `Environment` itself is auto-imported via `System` ([§2.3](Bezel_Language_Spec.md#sec-always-available-names) of the language spec), the `Dictionary` type lives in `System.Collections.Generic` and is not auto-imported; calling the returned dictionary's members needs no import ([§2.8.3](Bezel_Language_Spec.md#sec-transitive-closure-and-type-identity) rule 2 of the language spec), but **naming** the type — an explicit `Dictionary<string, string>` ascription, say — requires `import System.Collections.Generic;`.
+`Variables()` (v0.231) returns a freshly-allocated `owned Dictionary<string, string>` (per the §1 convention for fresh-instance returns).
 
 <a id="sec-datetime-timespan-dateonly-timeonly"></a>
 ### 2.5 `DateTime`, `TimeSpan`, `DateOnly`, `TimeOnly`
@@ -1451,9 +1451,9 @@ Retired. There is no `ReadOnlyAsciiByteSpan`, and `string` has no `AsAsciiByteSp
 ---
 
 <a id="sec-system-collections-generic"></a>
-## 4. `System.Collections.Generic`
+## 4. `System.Collections.Generic` (auto-imported)
 
-The collection types. None are auto-imported except the iteration-interface family (the read-only and mutating interfaces), which is auto-imported per language spec [§2.3](Bezel_Language_Spec.md#sec-always-available-names).
+The collection types. **Auto-imported (v0.289):** this module is on language spec [§2.3](Bezel_Language_Spec.md#sec-always-available-names)'s auto-import list, so every name below resolves in every file with no `import` — the same standing as `System`, `System.Text`, and [§5](#sec-system-collections-linq). §2.3's row states the bare-name cost in full.
 
 The language separates **borrowing** collections (store references the caller continues to own; element disposal is the caller's responsibility) from **owning** collections (own their elements; element disposal is the collection's responsibility). Each kind has its own concrete class and its own interfaces; the two kinds share read-only iteration interfaces (`IEnumerable<T>`, `IReadOnlyCollection<T>`, `IReadOnlyList<T>`) because reading produces borrows in either case.
 
@@ -2383,7 +2383,7 @@ end IEnumerator;
 
 The standard iteration interfaces. `IEnumerable<T>` is covariant in T. `IEnumerator<T>.Current` is non-destructive — it returns a borrow of the most-recently-yielded value, which the enumerator continues to own (if it has ownership; if T is a borrowing element type, Current returns a re-borrow).
 
-These interfaces are auto-imported per language spec [§2.3](Bezel_Language_Spec.md#sec-always-available-names) because they participate in the for-loop desugaring.
+These interfaces are auto-imported with the rest of this module (language spec [§2.3](Bezel_Language_Spec.md#sec-always-available-names)); they are the interfaces the for-loop desugaring names.
 
 `IAsyncEnumerable<T>` and `IAsyncEnumerator<T>` are the async variants; they participate in `await for` similarly:
 

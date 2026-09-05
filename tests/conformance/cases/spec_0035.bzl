@@ -2,8 +2,7 @@ enum Priority: IComparable<Priority>
   Low, Medium, High;
 
   public method CompareTo(other: Priority): int =>
-    (when
-      int(this) < int(other) => -1,
-      int(this) > int(other) => 1,
-      _ => 0);
+    (if int(this) < int(other) then -1
+     elif int(this) > int(other) then 1
+     else 0);
 end Priority;

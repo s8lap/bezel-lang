@@ -5,8 +5,3 @@ record Vector2(X: double, Y: double)
   public static method operator *(v: Vector2, scalar: double): Vector2 =>
     new Vector2(v.X * scalar, v.Y * scalar);
 end Vector2;
-
-record Counter(Value: int)
-  public static method operator ++(c: Counter): Counter =>
-    new Counter(c.Value + 1);
-end Counter;

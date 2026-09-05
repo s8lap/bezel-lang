@@ -1,6 +1,6 @@
 # Bezel for Code Generation
 
-*Validated against v0.288. Companion to the Bezel Language Specification — a writing reference, not a normative document.*
+*Validated against v0.289. Companion to the Bezel Language Specification — a writing reference, not a normative document.*
 
 A dense reference for writing correct Bezel without reading the spec. It covers the syntax surface, the ownership rules, the standard-library name index, the idioms that work, and the shapes that look right and are rejected.
 
@@ -31,7 +31,7 @@ Read this page first. Every row is a habit that produces broken Bezel.
 | 3 | `a == b`, `a != b` | `a = b`, `a <> b` | §17.3 |
 | 4 | `&&`, `\|\|`, `!x` | `and`, `or`, `not x`. Postfix `!` is the null-forgiving operator, nothing else | §17.1, §7.8 |
 | 5 | `a % b` | `a mod b`; the compound form is one token, `mod=` | §17.1, A.6 |
-| 6 | `else if`, `switch`, `foreach` | `elif`; `case … of … end case;` (scrutinee) or `when … end when;` (conditions); `for var x in xs do … end;`. **`foreach` does not exist in Bezel** | §19, §21.4 |
+| 6 | `else if`, `switch`, `foreach` | `elif` (`if … then … elif … then … else … end;` is the only condition ladder — there is no `when` construct); `case … of … end case;` (scrutinee); `for var x in xs do … end;`. **`foreach` does not exist in Bezel** | §19, §20, §21.4 |
 | 7 | `cond ? a : b` | `(if cond then a else b)` — the parentheses are part of the form, and `else` is mandatory | §20 |
 | 8 | `void` | omit the `: Type` clause; the result type is the unit type `()` | §22.1, §4.7 |
 | 9 | `namespace` / `using X;` | `module X.Y;` (one per file, first line) / `import X.Y;` | §2.1, §2.2 |
@@ -57,14 +57,14 @@ Four more that cost the same amount of time. **(21)** Collections come in two fa
 
 ```bezel
 module App.Billing;                       // first non-comment line; exactly one per file
-import System.Collections.Generic;
+import System.Threading;                  // only a non-auto module needs a line (§5.0)
 import App.Ledger as Led;                 // optional file-scoped alias
 type Handler<T> := (T, string?) -> bool;  // type alias: `:=`, never a visibility keyword
 ```
 
 After the module line and imports come top-level declarations: `class`, `interface`, `record`, `enum`, `choice`, `extension`, `type`, `extern` (§2.1, §2.2, §27.8, A.2). Source files are UTF-8 with extension `.bzl`. Comments: `// line`, `/* block, does not nest */`, `/// doc` (§1.1, §1.5).
 
-Auto-imported, no `import` needed (§2.3): `System`, `System.Text`, the primitives, `Array<T>`, `OwningArray<T>`, the `Task` family, the eight iteration interfaces, `CancellationToken`, `Subscription`, and the six event types. `CancellationTokenSource` is NOT auto — it needs `import System.Threading;`. **Everything else needs an import** — section 5.0 has the table.
+Auto-imported, no `import` needed (§2.3): `System`, `System.Text`, `System.Collections.Generic` (v0.289 — every collection type, the spans, `Counter`, `FrozenArray`, `KeyNotFoundException`, and the iteration interfaces), `System.Collections.Linq` (v0.278 — the query operators), the primitives, the `Task` family, `CancellationToken`, `Subscription`, and the six event types. `CancellationTokenSource` is NOT auto — it needs `import System.Threading;`. **Everything else needs an import** — section 5.0 has the table.
 
 ### 3.2 Keywords
 
@@ -180,7 +180,7 @@ One condition per clause. `result` names the return value inside `ensures`; `old
 
 ### 3.4 Statements, with their exact terminators
 
-The complete statement list (A.6): `LocalDecl`, `LocalConstDecl`, `AssignmentStmt`, `ExpressionStmt`, `DiscardStmt`, `IfStmt`, `WhileStmt`, `ForStmt`, `DoEndBlock`, `CaseStmt`, `WhenStmt`, `ReturnStmt`, `ThrowStmt`, `BreakStmt`, `ContinueStmt`, `TryStmt`, `YieldStmt`, `IncrementStmt`, `LocalTypeDecl`. Every statement ends `;`. Every block ends `end … ;`.
+The complete statement list (A.6): `LocalDecl`, `LocalConstDecl`, `AssignmentStmt`, `ExpressionStmt`, `DiscardStmt`, `IfStmt`, `WhileStmt`, `ForStmt`, `DoEndBlock`, `CaseStmt`, `ReturnStmt`, `ThrowStmt`, `BreakStmt`, `ContinueStmt`, `TryStmt`, `YieldStmt`, `IncrementStmt`, `LocalTypeDecl`. Every statement ends `;`. Every block ends `end … ;`.
 
 `end` may be followed by the construct's **name** if it has one, or by its **introducing keyword** otherwise; a present label must match. **A bare `end;` is always valid everywhere** (§1.6).
 
@@ -200,9 +200,8 @@ The complete statement list (A.6): `LocalDecl`, `LocalConstDecl`, `AssignmentStm
 | `do … end` block | `end do;` or `end;` | — |
 | `try` | `end try;` or `end;` | — |
 | `case` statement | `end case;` or `end;` | ✗ `end switch;` |
-| `when` statement | `end when;` or `end;` | — |
 | lambda block body | `do … end` — bare `end`, no label and no `;` of its own | ✗ `end lambda;` |
-| `case`/`when` arm `do` block | `do … end` — bare `end`, no `;` | — |
+| `case` arm `do` block | `do … end` — bare `end`, no `;` | — |
 
 Every statement shape:
 
@@ -238,15 +237,13 @@ outer: for var row in rows do ... end outer;
 await for var line in reader do ... end;      // `with token` supplies a CancellationToken (§30.7)
 do  using var t := Open();  end;            // a `do` block ends a scope early
 
-// case / when statements
+// case statement
 case delta of
   -10..-6 => "strongly down",
   ..<0    => Log("down"),                   // single-statement arm
   0       => do Reset(); Log("flat"); end,  // do-block arm
   _       => Log("up")
 end case;
-
-when  score >= 90 => Console.WriteLine("A"),  _ => Console.WriteLine("F")  end when;
 
 // return / throw / break / continue / yield
 return;
@@ -301,7 +298,7 @@ Precedence, high to low (§17.1):
 ✗ var r := mask & 0..n;               ✓ var r := mask & (0..n);
 ```
 
-`(if …)`, `(case …)`, `(when …)` and the binding atom `(var x := e; body)` take no precedence entry — they are self-delimited primary atoms usable in any operand position (§17.2, §17.15).
+`(if …)`, `(case …)` and the binding atom `(var x := e; body)` take no precedence entry — they are self-delimited primary atoms usable in any operand position (§17.2, §17.15).
 
 Literals (§18, A.8):
 
@@ -339,7 +336,6 @@ The paren atoms:
 var max   := (if a > b then a else b);                    // `else` MANDATORY
 var grade := (if s >= 90 then "A" elif s >= 80 then "B" else "F");
 var g2    := (case score of 90..100 => "A", 70..<80 => "C", _ => "F");
-var g3    := (when score >= 90 => "A", _ => "F");
 var area  := (var w := bounds.Width(); w * w);            // binding atom (§17.15)
 ```
 
@@ -471,7 +467,7 @@ The declared type, nullability stripped, must be a class type, an interface type
 
 **`ref` / `out`** (§22.3, §22.4). Written at the declaration **and** at the call site. `out` is copy-out-on-normal-return: the callee must assign on every normal-completion path; on the exception edge the recipient is untouched.
 
-- `out owned p: T` is the only modifier compound. At the call site it accepts **only** `out using var x` or `out owned var x`; plain `out var x` is rejected.
+- `out owned p: T` is the only modifier compound. At the call site `out var x` **adopts** what the signature announces — against `out owned` it is an owned local you discharge yourself (`move` it, store it in an owned slot, or let scope-end auto-drop with the must-use warning) — and `out using var x` is the scope-bound owned form, accepted **only** against `out owned`. There is no `out owned var` spelling (retired v0.289).
 - `ref`/`out` arguments may **not** name a location of owned state (an owned local, an `owned` parameter, an `owned` field, an owning slot), nor a `using var`, nor a `readonly` field outside its assignable context. **For an *instance* `readonly` field or auto-property that context is per-instance** (§22.8, v0.270): it is assignable only through an lvalue chain rooted at `this` — so a constructor may not write *another* value's `readonly` storage, and binding one to a `ref`/`out` parameter inside a constructor is the same store by other syntax — and an instance `readonly` **field** is assigned **at most once** on any path through one instance construction, counting the field initializer and every constructor body in the `this(...)` chain together (v0.271; stated for fields — auto-properties are not decided). A `static readonly` field is different on both counts: its context is its own static initializer or a constructor body of the declaring type, spelled as the bare name or `TypeName.F`, and its unit is one type initialization. Pass a borrow instead, or use `owned` parameters/returns and `move`.
 - `ref`/`out` are **forbidden** on `async` methods, on lambdas, on iterator methods and on indexers (§30.1, §29.3, §23.5). The argument's static type must match the referent type exactly. `out var _` is an error; write `out _`.
 
@@ -530,7 +526,7 @@ A borrow is valid only where **every** source in its source set is live; joins, 
 - A borrow may not be captured by a closure that may outlive its source (immediately-invoked closures, closures bound to a `using var` of function type, and closures passed to a function-typed parameter are fine).
 - Every field-, collection- or async-frame-held borrow carries the obligation not to transfer the borrowed object to another domain. This has **no runtime backstop** — it is a data race (§30.14).
 
-**Merges must agree** (§28.3). owned ⊓ owned = owned. borrowed ⊓ borrowed = borrowed, sources unioned. **owned ⊓ borrowed = rejected.** owned ⊓ moved-from = maybe-consumed (unreadable). The rule governs `if` statements, `if` expressions, `??`, and expression-`case`/`when` arms identically.
+**Merges must agree** (§28.3). owned ⊓ owned = owned. borrowed ⊓ borrowed = borrowed, sources unioned. **owned ⊓ borrowed = rejected.** owned ⊓ moved-from = maybe-consumed (unreadable). The rule governs `if` statements, `if` expressions, `??`, and expression-`case` arms identically.
 
 **The consume-site freeze** (§28.3). Consuming an owned **binding** while a **live local borrow of its current value** exists is a compile error. Frozen: every transfer (a `move` at an argument, binding, assignment or arm; a store into an `owned` field, an owning slot or a `set(owned)`; a `return` under an `owned` or mint-announcing return; an owning iterator's `yield return`) and drop-on-overwrite. **Not** frozen — these are site-announced kills, permitted while borrows live: an explicit `Dispose()` (including `x?.Dispose()`), the discard `_ := x;`, `throw x`, and a Pattern B `await` on an owned `OwningTask<T>` binding. Fields and collection slots are **not** frozen. The mechanical rewrite for the frozen case is **transfer first, then re-borrow from the new owner**.
 
@@ -608,7 +604,7 @@ Everything below is transcribed from `Bezel_Standard_Library.md` v0.282 with its
 |---|---|---|
 | `System` | auto | `Console`, `Math`, `Convert`, `Environment`, temporal types, `Guid`, `Random`, the core interfaces, `Type`, the serialization vocabulary, `Shared`/`Weak`, `Result`, `ScopeGuard`, `Subscription`, the FFI carriers |
 | `System.Text` | auto | `StringBuilder`, `Encoding`, `ReadOnlyStringSpan` |
-| `System.Collections.Generic` | **explicit** | the collections — *except* the iteration interfaces (`IEnumerable`/`IEnumerator`/`IAsyncEnumerable`/`IAsyncEnumerator`/`IOwning*`), which are auto |
+| `System.Collections.Generic` | **auto** (v0.289) | every §4 name — the collections, the spans, `Counter`, `FrozenArray`, `IEqualityComparer`, `KeyNotFoundException`, the iteration interfaces. An explicit `import` line is legal and redundant |
 | `System.Collections.Linq` | **auto** (v0.278) | the query operators. No `import` needed — §2.3's invariant: a stdlib extension over an always-available type is auto-imported |
 | `System.Threading` | **explicit** | *except* `CancellationToken`, `Subscription`, and the six event types, which are auto — `CancellationTokenSource` itself needs the import |
 | `System.IO` | **explicit** | `Stream`, `FileStream`, `File`, `TextReader`/`TextWriter`, `Directory`, `Path` |
@@ -776,7 +772,7 @@ end
 
 `ReadOnlyStringSpan` — `public record (Source: string, Start: int, Length: int): IReadOnlySpan<char>`; **ordinary record, not borrow-bearing**. `property [i: int]: char { get }`; `pure IsEmpty: bool`; `pure Slice(start, length) / Slice(start) / Slice(r: Range<int>)`; `pure IndexOf(char|ReadOnlyStringSpan|string): int`; `pure Contains(…): bool`; `pure StartsWith`/`EndsWith(ReadOnlyStringSpan|string): bool`; `pure SequenceEqual(ReadOnlyStringSpan|string|IReadOnlySpan<char>): bool`; `CopyTo(destination: Span<char>)` (**not pure**); `pure ToString(): string`. `ReadOnlyAsciiByteSpan` was **retired** and does not exist.
 
-### 5.4 `System.Collections.Generic` (explicit import)
+### 5.4 `System.Collections.Generic` (auto-imported, v0.289)
 
 ```bezel
 public interface IReadOnlyCollection<out T>: IEnumerable<T>   pure readonly property Count: int;  end
@@ -1461,8 +1457,6 @@ end Pooling;
 **The Try shape, and `out using var`.**
 
 ```bezel
-import System.Collections.Generic;
-
 public class ConnectionPool
   private owned _cache: OwningDictionary<string, Connection> := new OwningDictionary<string, Connection>();
 
@@ -1483,7 +1477,7 @@ public class ConnectionPool
 end ConnectionPool;
 ```
 
-`out owned` in the signature ⇄ `out using var` (or `out owned var`) at the call site; the compiler rejects a mismatch in either direction. Without `when true` the caller would need `c!`: a `bool` guard alone does not narrow.
+`out owned` in the signature ⇄ `out using var` at the call site (or `out var c`, which then binds an owned local you discharge yourself); `out using var` against a plain `out` is rejected. Without `when true` the caller would need `c!`: a `bool` guard alone does not narrow.
 
 **`Result<T, E>` and an exhaustive `case`.** In a **declared-result position** — a `return` operand, or an expression body checked against a declared type — the bare case name resolves against that type (§35.3); everywhere else the qualified form `Result<int, string>.Ok(v)` is required.
 
@@ -1611,6 +1605,9 @@ var ys := [1, 2, 3];                                        // WRONG: no target 
 var sd: SortedDictionary<string, int> := ["a": 1];          // WRONG: the dictionary literal targets only Dictionary/OwningDictionary (§15.4)
 var max := a > b ? a : b;                                   // WRONG: no `?:` operator
 x := y++;   ++c;   if count++ > 3 then ... end;               // WRONG: `++` is a postfix STATEMENT
+var g := (when s >= 90 => "A", _ => "F");                    // WRONG: no `when` construct (retired v0.289) — `(if s >= 90 then "A" else "F")`
+when c1 => A(), _ => B() end when;                            // WRONG: same — `if c1 then A(); else B(); end;`
+public static method operator ++(c: Counter): Counter => …;   // WRONG: `++`/`--` are not overloadable (v0.289) — declare `operator +`, write `c := c + 1;`
 if count then ... end;                                        // WRONG: no truthiness
 var (a, b) := point;                                        // WRONG: destructuring is pattern-position only
 public method Log(params items: Array<string>);             // WRONG: no `params`
@@ -1786,6 +1783,7 @@ public method Bumped(): Tally => this with(Hits := Hits + 1);   // return the up
 ```bezel
 method TryGet(k: string, out v: Conn?): bool;
 method TryGet(k: string, out owned v: Conn?): bool;   // ERROR at the second declaration
+pool.TryPopCached("p", out owned var c);   // ERROR: no `out owned var` (retired v0.289) — `out var c` adopts owned; `out using var c` scope-binds it
 seen.Add(candidate);                     // ERROR when Add takes `owned`: write Add(move candidate)
 r.Append(move new Widget());             // ERROR: a fresh producer announces itself
 return move fresh;                       // ERROR: `return` under `owned` is a marker-free position
@@ -2019,7 +2017,14 @@ public method WithValue(v: int): Port => new Port(v);      // the sanctioned upd
 
 ### 8.5 v0.246 — the use-site transfer marker is `move`, not `owned`
 
-Through v0.245 the marker was spelled `owned` at binding positions. After v0.246, **`owned` appears only where a slot is described, and `move` only where an action occurs.** Any code with `owned` in an argument or right-hand-side position is pre-v0.246 and wrong: `TakeOwnership(owned resource)` → `TakeOwnership(move resource)`; `var y := owned x;` → `var y := move x;`; `case owned outcome of …` → `case move outcome of …`; `using var c := owned conn;` → `using var c := move conn;`. `owned` (declarative) is correct in exactly these positions: parameters (`owned x: T`), fields (`private owned _f: T;`), return types (`: owned T`), `out owned var x`, function-type slots, choice payloads, `[N owned]T`, `static owned readonly`. Nothing else.
+Through v0.245 the marker was spelled `owned` at binding positions. After v0.246, **`owned` appears only where a slot is described, and `move` only where an action occurs.** Any code with `owned` in an argument or right-hand-side position is pre-v0.246 and wrong: `TakeOwnership(owned resource)` → `TakeOwnership(move resource)`; `var y := owned x;` → `var y := move x;`; `case owned outcome of …` → `case move outcome of …`; `using var c := owned conn;` → `using var c := move conn;`. `owned` (declarative) is correct in exactly these positions: parameters (`owned x: T`), fields (`private owned _f: T;`), return types (`: owned T`), function-type slots, choice payloads, `[N owned]T`, `static owned readonly`. Nothing else.
+
+### 8.6 v0.289 — four retirements: `when`, `out owned var`, `operator ++`/`--`, and the collections import
+
+- **`(when …)` / `when … end when;` are gone.** A ladder of conditions is `(if c1 then a elif c2 then b else z)` or `if c1 then … elif c2 then … else … end;` — same type, same order, same ownership meet. `when` survives only as the arm guard (`var t when t > 30 => …`) and the `when true`/`when false` clause.
+- **`out owned var x` is gone.** `out var x` adopts the signature: a borrow against `out`, an owned local against `out owned` (discharge it yourself, or use `out using var x`, which is accepted only against `out owned`).
+- **`operator ++`/`operator --` are gone.** `++`/`--` are built-in statements on integer, floating-point, `decimal` and `char` operands only (§6.6's set — `char++` still works). Declare `operator +(c: Counter, n: int)` and write `c := c + 1;`, or use a named method.
+- **`import System.Collections.Generic;` is redundant.** Every §4 name is bare-visible (`Dictionary`, `Set`, `Stack`, `Queue`, the spans, `Counter`, `FrozenArray`, `KeyNotFoundException`, the iteration interfaces). The line still compiles. Beware the new bare names when naming your own types: a same-named type in your module shadows the import; a same-named export from another imported module is an ambiguity error.
 
 ---
 
