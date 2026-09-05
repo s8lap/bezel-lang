@@ -2379,8 +2379,9 @@ private:
     // un-narrowed `string?` exactly as a user `method Take(x: string)`
     // does. `Equals(other: string?)` is the documented exception (§11.2
     // parameter-nullability widening) and stays admissible; the static
-    // `IsNullOrEmpty`/`IsNullOrWhiteSpace` take `string?` and are not
-    // reached here (this covers the INSTANCE-receiver path only).
+    // `IsNullOrWhiteSpace` takes `string?` and is not reached here (this
+    // covers the INSTANCE-receiver path only) — its former sibling
+    // `IsNullOrEmpty` was retired entirely (fix #3854, stdlib §9.6, v0.290).
     void checkBuiltinStringCallArgs(const ast::CallExpr& ce);
 
     // fix #3398 (spec §22.5 "Optional parameters and named arguments",

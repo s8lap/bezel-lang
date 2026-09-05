@@ -324,23 +324,31 @@ BEZEL_TEST(integration, for_in_string_char_count) {
 }
 
 BEZEL_TEST(integration, string_isnotempty_branch) {
-    // string.IsNullOrEmpty gate (non-empty path).
+    // Empty-string gate (non-empty path). fix #3854 (stdlib §9.6, v0.290):
+    // migrated off the retired `string.IsNullOrEmpty(s)`. The documented
+    // replacement for a possibly-null receiver is `s = null or s.IsEmpty`
+    // (`IsEmpty`, v0.231), but `s` here is a non-nullable local (never null),
+    // so the null half is moot and the check is just `s = ""`. NOT migrated
+    // to `s.IsEmpty` — that property is stdlib-documented but its codegen
+    // lowering for a plain `string` receiver does not exist yet (measured
+    // separately; not this fix's scope, filed as its own issue).
     BEZEL_EXPECT_EQ(compileAndRun(
         "module M; class C public static method Main(): int "
         "  var s := \"hello\"; "
-        "  if string.IsNullOrEmpty(s) then return 0; end; "
+        "  if s = \"\" then return 0; end; "
         "  return s.Length; "
         "end Main; end C;"), 5);
 }
 
 BEZEL_TEST(integration, string_isempty_branch) {
-    // string.IsNullOrEmpty gate (empty path → true). Exercises the branch whose
-    // PHI edge supplies `true`; a dead, unterminated `ine.null` block (malformed
-    // IR, removed) used to sit alongside it. Empty string → true → return 7.
+    // Empty-string gate (empty path → true). fix #3854 (stdlib §9.6, v0.290):
+    // migrated off the retired `string.IsNullOrEmpty(s)` (whose codegen used
+    // to exercise a null/empty PHI, `ine.*`-labelled, now deleted along with
+    // the member). Empty string → true → return 7.
     BEZEL_EXPECT_EQ(compileAndRun(
         "module M; class C public static method Main(): int "
         "  var s := \"\"; "
-        "  if string.IsNullOrEmpty(s) then return 7; end; "
+        "  if s = \"\" then return 7; end; "
         "  return s.Length; "
         "end Main; end C;"), 7);
 }

@@ -729,33 +729,11 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         return builder_.CreateCall(fn, {arr, start64, count64}, "str.from");
     }
 
-    // string.IsNullOrEmpty(s): bool — true if s is null or length 0.
-    if (pt == P::String && m == "IsNullOrEmpty" &&
-        call.args.size() == 1 && call.args[0].value) {
-        llvm::Value* arg = lowerExpr(*call.args[0].value);
-        if (!arg) return nullptr;
-        // null → true
-        llvm::Value* isNull = builder_.CreateICmpEQ(
-            arg, llvm::ConstantPointerNull::get(ptrTy()), "ine.null");
-        // The null case branches straight to endBB (its PHI edge supplies
-        // `true`); no separate null block is needed. A previously-created but
-        // never-branched-to `ine.null` block was left without a terminator,
-        // producing malformed IR.
-        auto* checkBB= llvm::BasicBlock::Create(llvm_, "ine.check", currentFn_);
-        auto* endBB  = llvm::BasicBlock::Create(llvm_, "ine.end",   currentFn_);
-        auto* entBB  = builder_.GetInsertBlock();
-        builder_.CreateCondBr(isNull, endBB, checkBB);
-        builder_.SetInsertPoint(checkBB);
-        llvm::Value* len = loadStringLen(arg);
-        llvm::Value* empty = builder_.CreateICmpEQ(len, builder_.getInt64(0), "ine.empty");
-        auto* chkEnd = builder_.GetInsertBlock();
-        builder_.CreateBr(endBB);
-        builder_.SetInsertPoint(endBB);
-        auto* phi = builder_.CreatePHI(i1(), 2, "ine.result");
-        phi->addIncoming(builder_.getTrue(), entBB);
-        phi->addIncoming(empty, chkEnd);
-        return phi;
-    }
+    // fix #3854 (stdlib §9.6, v0.290): `string.IsNullOrEmpty(s)` was
+    // impl-ahead-of-spec surface, retired at v0.290 (proposal 0123 R6) in
+    // favor of `s = null or s.IsEmpty` (`IsEmpty`, v0.231). Its lowering
+    // (the `ine.*`-labelled null/empty PHI) is deleted, not left dead code —
+    // sema now rejects the call before codegen is reached, per §3.4.
     // string.IsNullOrWhiteSpace(s): bool — null, empty, or all whitespace.
     if (pt == P::String && m == "IsNullOrWhiteSpace" &&
         call.args.size() == 1 && call.args[0].value) {

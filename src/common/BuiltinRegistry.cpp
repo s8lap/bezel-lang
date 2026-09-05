@@ -486,7 +486,7 @@ struct BuiltinParamNameRow {
 // `Split/1`, `AsSpan/1` — are present since #3424 as MULTIPLE candidate rows
 // at the same argument count. `Trim/0`, `ToUpper/0` and the other nullary
 // members carry no parameters and so cannot take a named argument at all.
-constexpr std::array<BuiltinParamNameRow, 39> kStringParamNames = {{
+constexpr std::array<BuiltinParamNameRow, 38> kStringParamNames = {{
     // Construction (static)
     {"string", "From", 1, 1, {"value", "", "", ""}},
     {"string", "From", 3, 3, {"buffer", "start", "length", ""}},  // renamed v0.282 (§1)
@@ -496,8 +496,10 @@ constexpr std::array<BuiltinParamNameRow, 39> kStringParamNames = {{
     // §9.6 declares two arity-2 `Repeat` overloads that disagree (#3424).
     {"string", "Repeat", 2, 2, {"c", "count", "", ""}},
     {"string", "Repeat", 2, 2, {"unit", "count", "", ""}},
-    // Inspection (static)
-    {"string", "IsNullOrEmpty", 1, 1, {"value", "", "", ""}},
+    // Inspection (static). fix #3854 (stdlib §9.6, v0.290): `IsNullOrEmpty`
+    // was impl-ahead-of-spec surface (retired at v0.290, proposal 0123 R6) —
+    // deleted, not just left unregistered here, so its row does not silently
+    // resurrect a named-argument binding for a call the sema layer now rejects.
     {"string", "IsNullOrWhiteSpace", 1, 1, {"value", "", "", ""}},
     // Inspection (instance)
     {"string", "Contains", 1, 1, {"value", "", "", ""}},

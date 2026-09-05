@@ -2122,8 +2122,9 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
             // (keyed on the instance-receiver VALUE) does not reach it — an
             // un-narrowed `string?` argument was silently accepted. Run the §7
             // assignability check against the declared non-nullable `string`
-            // (IsNullOrEmpty/IsNullOrWhiteSpace take `string?` and stay admissible;
-            // they are not `Compare` and are excluded by the method-name gate).
+            // (IsNullOrWhiteSpace takes `string?` and stays admissible; fix
+            // #3854 retired its former sibling `IsNullOrEmpty` entirely, so
+            // it is not `Compare` and is excluded by the method-name gate).
             if (recvPt == PrimitiveType::String && mm == "Compare" &&
                 ce.args.size() >= 2) {
                 for (std::size_t ai : {std::size_t{0}, std::size_t{1}}) {
@@ -11555,9 +11556,10 @@ void ExprTC::publishPrimaryCtorChainBinding(const ast::ConstructorDecl& cd) {
 // `string?` argument to it continues to compile. Only INSTANCE calls are
 // covered: the callee target must carry a Primitive-String exprType (a value
 // of type `string`), which excludes static calls like `string.Compare(a, b)`
-// (target is the type name, no value exprType). The static `IsNullOrEmpty`/
-// `IsNullOrWhiteSpace` take `string?` anyway, so excluding statics does not
-// leave a nullable hole.
+// (target is the type name, no value exprType). The static
+// `IsNullOrWhiteSpace` takes `string?` anyway (its retired sibling
+// `IsNullOrEmpty`, fix #3854, is rejected outright before reaching this
+// path), so excluding statics does not leave a nullable hole.
 // #2581: a builtin instance-call callee is EITHER a MemberAccessExpr
 // (`recv.M(..)`) OR a NullCondMemberExpr (`recv?.M(..)`); the two are separate
 // Expr kinds but share identical `target`/`member` fields. The null-conditional
@@ -15875,8 +15877,30 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 }
                 // string static methods → bool or string or int.
                 if (pt == PrimitiveType::String) {
-                    if (mbr == "IsNullOrEmpty" || mbr == "IsNullOrWhiteSpace") {
-                        // §27.6: `string.IsNullOrEmpty` as a reference is
+                    // fix #3854 (stdlib §9.6, v0.290; proposal 0123 R6):
+                    // `string.IsNullOrEmpty` was impl-ahead-of-spec surface —
+                    // accepted here (and lowered in codegen) but never
+                    // declared in stdlib §9.6's `String` member list, nor in
+                    // the spec's own §3.4 static-access example (which reads
+                    // `string.IsNullOrWhiteSpace`, not `IsNullOrEmpty`).
+                    // Retired: the spelling is `s = null or s.IsEmpty`
+                    // (`IsEmpty`, v0.231) or `s?.IsEmpty ?? true`. Reject it
+                    // explicitly, ahead of the shared closed-set arm below, so
+                    // the diagnostic names the real replacement instead of the
+                    // generic "no static method" text every other unknown
+                    // static gets.
+                    if (mbr == "IsNullOrEmpty") {
+                        ctx_.diagnostics().report(
+                            Severity::Error, ma.span.begin,
+                            "'String.IsNullOrEmpty' was REMOVED from the "
+                            "standard library at v0.290 (stdlib \xC2\xA7""9.6) "
+                            "\xE2\x80\x94 write `s = null or s.IsEmpty` (or "
+                            "`s?.IsEmpty ?? true`); it is gone, not "
+                            "misspelled (issue 3854)");
+                        return;
+                    }
+                    if (mbr == "IsNullOrWhiteSpace") {
+                        // §27.6: `string.IsNullOrWhiteSpace` as a reference is
                         // `(string) -> bool`.
                         methodRef({ctx_.primitiveTypeRef(PrimitiveType::String)},
                                   ctx_.primitiveTypeRef(PrimitiveType::Bool));

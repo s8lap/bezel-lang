@@ -291,18 +291,25 @@ BEZEL_TEST(sema_span_nullable_arg_2581,
     }
 }
 
-// #2581 / stdlib §9.6: `string.IsNullOrEmpty(value: string?)` /
-// `IsNullOrWhiteSpace(value: string?)` declare NULLABLE parameters, so an
-// un-narrowed `string?` stays admissible — the fix must not reject them.
+// #2581 / stdlib §9.6: `IsNullOrWhiteSpace(value: string?)` declares a
+// NULLABLE parameter, so an un-narrowed `string?` stays admissible — the fix
+// must not reject it.
+//
+// fix #3854 (stdlib §9.6, v0.290): this case originally covered
+// `IsNullOrWhiteSpace`'s sibling `string.IsNullOrEmpty(value: string?)` too
+// (`return string.IsNullOrEmpty(N()) or string.IsNullOrWhiteSpace(N());`).
+// `IsNullOrEmpty` was impl-ahead-of-spec surface, retired at v0.290
+// (proposal 0123 R6) — deleted from the compiler by #3854, not merely
+// undocumented — so the case now exercises `IsNullOrWhiteSpace` alone; the
+// nullable-argument admissibility it tests is unchanged.
 BEZEL_TEST(sema_span_nullable_arg_2581,
-           static_isnullorempty_accepts_nullable) {
+           static_isnullorwhitespace_accepts_nullable) {
     auto r = parseSemaAll(
         "module M; "
         "class C "
         "  private static method N(): string? => null; "
         "  public static method T(): bool "
-        "    return string.IsNullOrEmpty(N()) or "
-        "           string.IsNullOrWhiteSpace(N()); "
+        "    return string.IsNullOrWhiteSpace(N()); "
         "  end T; "
         "end C;");
     BEZEL_EXPECT_TRUE(!hasError(r, kNullableDiag));
