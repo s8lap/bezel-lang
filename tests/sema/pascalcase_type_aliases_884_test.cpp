@@ -5,7 +5,7 @@
 // are interchangeable: `bool`/`Boolean`, `char`/`Char`, `string`/`String`,
 // `byte`/`Byte`, `sbyte`/`SByte`, `short`/`Int16`, `ushort`/`UInt16`,
 // `int`/`Int32`, `uint`/`UInt32`, `long`/`Int64`, `ulong`/`UInt64`,
-// `float`/`Single`, `double`/`Double`, `decimal`/`Decimal`."
+// `float`/`Float`, `double`/`Double`, `decimal`/`Decimal`."
 //
 // Bug: before the fix, every PascalCase name errored with
 // "unresolved type name `String`" etc. — primitiveFromName did not handle
@@ -14,6 +14,12 @@
 // After the fix: each PascalCase name resolves to the same TypeRef::Kind::Primitive
 // as its lowercase keyword, so it is interchangeable in type positions and in
 // static-member dispatch (String.From, Int32.MaxValue, etc.).
+//
+// fix #3833 (ruled #3812, v0.293): `Single` was never in §3.4's table (only
+// `Float` is `float`'s PascalCase alias) — the resolver's undocumented
+// `Single` -> float arm is deleted, so `Single` is now an ordinary,
+// unreserved identifier: `var c: Single := …;` is "unresolved type name",
+// and `record Single(...)` is accepted (below, was rejected under #1081).
 
 #include "sema/ExprTypecheck.hpp"
 #include "sema/Symbol.hpp"
@@ -176,7 +182,7 @@ BEZEL_TEST(sema_pascalcase_aliases_884, char_type_no_error_sec3_4) {
 
 // ---------------------------------------------------------------------------
 // Remaining PascalCase aliases: Byte, SByte, Int16, UInt16, UInt32, UInt64,
-// Single, Decimal — each must not produce "unresolved type name".
+// Decimal — each must not produce "unresolved type name".
 // §3.4, #884.
 // ---------------------------------------------------------------------------
 BEZEL_TEST(sema_pascalcase_aliases_884, byte_sbyte_int16_uint16_no_error_sec3_4) {
@@ -191,16 +197,40 @@ BEZEL_TEST(sema_pascalcase_aliases_884, byte_sbyte_int16_uint16_no_error_sec3_4)
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-BEZEL_TEST(sema_pascalcase_aliases_884, uint32_uint64_single_decimal_no_error_sec3_4) {
+BEZEL_TEST(sema_pascalcase_aliases_884, uint32_uint64_decimal_no_error_sec3_4) {
     auto r = parseSema(
         "module M; class C public method M() "
         "  var a: UInt32 := 1000; "
         "  var b: UInt64 := 9000000000; "
-        "  var c: Single := float(1.5); "
-        "  var d: Decimal := decimal(2); "
+        "  var c: Decimal := decimal(2); "
         "end M; end C;");
     BEZEL_EXPECT_FALSE(anyMessageMentions(r, "unresolved type name"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// ---------------------------------------------------------------------------
+// fix #3833 (ruled #3812, v0.293): `Single` is NOT a §3.4 alias — only
+// `Float` pairs with `float`. `var c: Single := float(1.5);` must now be
+// rejected as "unresolved type name `Single`", with a real (non-0:0) source
+// location at the type annotation (the sema DiagnosticEngine here is
+// populated directly by TypeResolution_Names.cpp's `t.span.begin`, not via
+// the AOT harness's location-discarding wrapper).
+// ---------------------------------------------------------------------------
+BEZEL_TEST(sema_pascalcase_aliases_884, single_no_longer_an_alias_rejected_3833) {
+    auto r = parseSema(
+        "module M; class C public method M() "
+        "  var c: Single := float(1.5); "
+        "end M; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(anyMessageMentions(r, "unresolved type name `Single`"));
+    bool sawRealLocation = false;
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        if (d.message.find("unresolved type name `Single`") != std::string::npos) {
+            if (d.location.line != 0 || d.location.column != 0)
+                sawRealLocation = true;
+        }
+    }
+    BEZEL_EXPECT_TRUE(sawRealLocation);
 }
 
 // ---------------------------------------------------------------------------
@@ -281,17 +311,31 @@ BEZEL_TEST(sema_pascalcase_aliases_884,
 }
 
 // ---------------------------------------------------------------------------
-// §3.4 (#1081): the PascalCase primitive-alias names are RESERVED — a user type
-// may not be declared with one of them. Before the fix, `record Single` silently
-// shadowed the `float` alias and `new Single(42).v` read 0; now it is a clean
-// compile error directing the author to a different name.
+// fix #3833 (ruled #3812, v0.293): `record Single` is now ACCEPTED — flips the
+// pre-fix expectation pinned by #1081. Before this fix `Single` was reserved
+// riding on TypeResolution.cpp's undocumented `Single -> float` resolver arm
+// (the #1081 wrong-value bug: `record Single` silently shadowed `float`, so
+// `new Single(42).v` read 0); with that arm deleted, §3.4's reserved-name list
+// never named `Single` (only `Float` pairs with `float`), so nothing reserves
+// it any more and the declaration is a clean, ordinary user record. Asserts
+// both that no reservation/unresolved error fires AND that `s`'s declared
+// type resolves to the user record (Kind::Named), not to Primitive/Float —
+// the actual #1081 shadowing hazard this test previously existed to catch.
 // ---------------------------------------------------------------------------
-BEZEL_TEST(sema_pascalcase_aliases_884, user_record_single_reserved_rejected_1081) {
+BEZEL_TEST(sema_pascalcase_aliases_884, user_record_single_now_accepted_3833) {
     auto r = parseSema(
         "module M; record Single(v: int); "
-        "class C public static method Main(): int => 0; end C;");
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(anyMessageMentions(r, "reserved primitive-alias type name"));
+        "class C public method M() "
+        "  var s: Single := new Single(42); "
+        "end M; end C;");
+    BEZEL_EXPECT_FALSE(anyMessageMentions(r, "reserved primitive-alias type name"));
+    BEZEL_EXPECT_FALSE(anyMessageMentions(r, "unresolved type name"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    auto* s = findLocal(r, "s");
+    BEZEL_EXPECT_TRUE(s != nullptr);
+    if (s && s->declType) {
+        BEZEL_EXPECT_TRUE(s->declType->kind == TypeRef::Kind::Named);
+    }
 }
 
 BEZEL_TEST(sema_pascalcase_aliases_884, user_class_double_reserved_rejected_1081) {

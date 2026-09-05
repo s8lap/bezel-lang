@@ -58,15 +58,20 @@ std::string moduleDottedName(const ModuleSymbol* mod) {
 // `string`) through its lowercase keyword alias, and §3.4's dual-form rule makes
 // the PascalCase form interchangeable with the keyword everywhere a type is
 // named; a user type with one of these names would silently shadow the primitive
-// at some use sites and not others (the #1081 wrong-value bug: `record Single`
-// resolved to `float`, so `new Single(42).v` read 0). `Object` is intentionally
-// NOT reserved (§3.4: it has no keyword alias and is referenced unconditionally),
-// and the lowercase keywords cannot reach a type-decl name (the lexer tokenizes
-// them as keywords, not identifiers).
+// at some use sites and not others (the #1081 wrong-value bug). `Object` is
+// intentionally NOT reserved (§3.4: it has no keyword alias and is referenced
+// unconditionally), and the lowercase keywords cannot reach a type-decl name
+// (the lexer tokenizes them as keywords, not identifiers).
+//
+// fix #3833 (ruled #3812, v0.293): `Single` is NOT in this list. §3.4's table
+// has no `Single` row and its reserved-name list does not name it; the
+// resolver's undocumented `Single` -> float arm (that reservation rode on) is
+// deleted in TypeResolution.cpp, so `Single` is an ordinary, unreserved
+// identifier again — a user type may now be declared `Single`.
 bool isReservedPrimitiveAliasName(std::string_view n) {
     return n == "Boolean" || n == "Byte" || n == "SByte" || n == "Int16" ||
            n == "UInt16"  || n == "Int32" || n == "UInt32" || n == "Int64" ||
-           n == "UInt64"  || n == "Single" || n == "Float" || n == "Double" ||
+           n == "UInt64"  || n == "Float" || n == "Double" ||
            n == "Decimal" || n == "Char"  || n == "String";
 }
 
@@ -415,7 +420,7 @@ TypeSymbol* collectTypeDecl(const ast::TypeDecl& td, SemaContext& ctx,
     // mangled name byte-identical to the pre-#3529 spelling.
     sym->enclosingTypePath = std::string(enclosingTypePath);
     // §3.4 (#1081): reject a user type whose name is a reserved PascalCase
-    // primitive-alias (Single/Double/Int32/String/…). The symbol is still
+    // primitive-alias (Double/Int32/String/…; NOT Single — fix #3833). The symbol is still
     // registered so later passes have a well-formed type to resolve against; the
     // diagnostic makes the program a compile error.
     if (isReservedPrimitiveAliasName(td.name)) {

@@ -47,7 +47,10 @@ PrimitiveType primitiveFromName(std::string_view name) {
     if (name == "UInt32")  return PrimitiveType::UInt;
     if (name == "Int64")   return PrimitiveType::Long;
     if (name == "UInt64")  return PrimitiveType::ULong;
-    if (name == "Single")  return PrimitiveType::Float;
+    // fix #3833 (ruled #3812, v0.293): `Single` was an undocumented resolver
+    // arm — §3.4's dual-form table pairs `float` only with `System.Float`, and
+    // stdlib §9.2 declares no `Single` record type. Deleted; `float`'s sole
+    // PascalCase alias is `Float`.
     if (name == "Float")   return PrimitiveType::Float;   // §3.4 / stdlib §9.2 (#1241)
     if (name == "Double")  return PrimitiveType::Double;
     if (name == "Decimal") return PrimitiveType::Decimal;
