@@ -5802,6 +5802,74 @@ static std::string ownedParamSourceClause(std::string_view name) {
            "(borrow) parameter and false of an `owned` one";
 }
 
+// fix #3706 (§28.3 clause 1 / §28.9 / §28.11 / §29.2 "Iterator yield
+// ownership", v0.294): see the header comment (Ownership_impl.hpp) for the
+// full derivation of WHY this recognizer exists — `producerState`'s funnel
+// (handleLocalDecl, Ownership.cpp) deliberately classifies a bare `[...]`
+// collection literal Borrowed, so `states_` never marks such a local Owned
+// and `checkBorrowStoreEscape`'s general `ownedLocalBorrowSource` /
+// `borrowSourceForExpr` machinery structurally cannot see it as a live
+// borrow source. K1.5 nonetheless classifies "reference-typed collection
+// literals" as OWNED atoms, and Array<T>'s backing is "reclaimed with the
+// instance" (§28.9/§28.11) at the LOCAL's own scope end — exactly the
+// resource a field-store would let outlive its holder.
+//
+// Scope, matching codegen's `Emitter::isBorrowingArrayLiteralLocal`
+// (LlvmBackend_Setup.cpp ~L27017, the SAME shape from the reclaim side) MINUS
+// its `!isUsing` restriction:
+//   - a plain `var`, a `using var` (LocalDecl — either), or a §21.1 `const`
+//     (LocalConstDecl, never `using` by grammar);
+//   - initializer is a non-dict `ast::CollectionLiteralExpr` (`[...]`, not
+//     `[k:v, ...]`);
+//   - resolved type is a declaration-less Named TypeRef (a builtin with no
+//     user TypeDecl — Array<T> has none) whose head name is exactly "Array".
+//
+// MEASURED (2026-09, this issue): a `using var` binding of the SAME literal
+// is NOT already caught by the general machinery below — a first draft of
+// this recognizer excluded `isUsing` on the theory that §28.10's "using var
+// LAYERS its keyword semantics ... BOTH verdicts record the binding Owned +
+// implicitDischarge" already put it in `states_` as Owned. That theory was
+// wrong: `ownedLocalBorrowSource` / `borrowSourceForExpr`'s Shape 1 gates on
+// `returnedExprMayBorrow`, i.e. `isBorrowableType`, which returns FALSE for
+// ANY `Array<T>`-typed identifier — a declaration-less Named TypeRef that is
+// not the recognized builtin-exception carve-out (isBorrowableType,
+// Ownership_Checks.cpp) — regardless of the local's `states_` state. So
+// `using var xs: Array<int> := [1, 2, 3]; b.Items := xs;` compiled clean
+// (verified: `bezelc -c` exit 0, no diagnostic) for the exact same
+// underlying reason a plain `var` did. `isUsing` is therefore NOT excluded
+// here: every local FORM sharing this literal-binding shape needs the SAME
+// rejection, and there is no double-report risk (the general path never
+// answers about this shape at all, for any of the three forms).
+//
+// Restricted to the `Array<T>` head only, mirroring this issue's exact title
+// and measured repro; `Set<T>`/`Dictionary<K,V>` literals are the same K1.5
+// shape and share the identical gap, but widening this recognizer to them
+// is a separate, unmeasured change and is filed as a follow-up rather than
+// folded in silently here.
+sema::LocalSymbol* MethodOwnership::borrowingArrayLiteralLocalFieldStoreSource(
+        const ast::Expr& e) const {
+    const auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e);
+    if (!id) return nullptr;
+    auto* ls = dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*id));
+    if (!ls || !ls->decl) return nullptr;
+    const ast::Expr* init = nullptr;
+    if (const auto* ld = dynamic_cast<const ast::LocalDecl*>(ls->decl)) {
+        init = ld->initializer.get();
+    } else if (const auto* lcd =
+                   dynamic_cast<const ast::LocalConstDecl*>(ls->decl)) {
+        init = lcd->value.get();
+    } else {
+        return nullptr;
+    }
+    const auto* lit = dynamic_cast<const ast::CollectionLiteralExpr*>(init);
+    if (!lit || lit->isDict) return nullptr;
+    const sema::TypeRef* rt = ctx_.exprType(*id);
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
+        return nullptr;
+    if (rt->headName() != "Array") return nullptr;
+    return ls;
+}
+
 bool MethodOwnership::checkBorrowStoreEscape(const ast::AssignmentStmt& as,
                                              EscapeScope scope) {
     if (as.op != ":=") return false;
@@ -6053,6 +6121,36 @@ bool MethodOwnership::checkBorrowStoreEscape(const ast::AssignmentStmt& as,
                 dynamic_cast<const ast::IdentifierExpr*>(as.value.get())) {
             if (const LocalOwnership* rst = lookupState(rid->name))
                 if (rst->state == OwnershipState::Owned) return false;
+        }
+    }
+
+    // fix #3706 (§28.3 clause 1 / §28.9 / §28.11 / §29.2, v0.294): a `var` /
+    // `using var` / `const` `Array<T>` collection-literal local, stored into
+    // ANY field (owned or not — see the recognizer's own header comment for
+    // why `states_` cannot see this shape through the general machinery
+    // below, for any of the three local forms). Sound in BOTH scopes: the
+    // recognizer consults no `states_` / `localDepth_` entry (mirrors the
+    // §9.7 record/span/choice leg above, fix #3701/#3800).
+    if (dest == Dest::Field) {
+        if (sema::LocalSymbol* arrSrc =
+                borrowingArrayLiteralLocalFieldStoreSource(*as.value)) {
+            report(
+                Severity::Error, as.span.begin,
+                std::string("collection literal local `") +
+                std::string(arrSrc->name) +
+                "` may not be stored into a field — `" +
+                std::string(arrSrc->name) +
+                "` is a plain `Array<T>` collection literal, an OWNED atom "
+                "per K1.5 (\"reference-typed collection literals\"), whose "
+                "backing is reclaimed with the local's own scope end "
+                "(§28.9 / §28.11 collection-element ownership); a field of "
+                "the target object outlives that scope, so the field would "
+                "read reclaimed memory once `" + std::string(arrSrc->name) +
+                "` is disposed (§28.3 clause 1: a borrowed local may not be "
+                "assigned to any field of any object). Construct the array "
+                "literal directly as the field's own value instead of "
+                "through an intermediate local");
+            return true;
         }
     }
 

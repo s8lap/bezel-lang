@@ -1769,7 +1769,20 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         // sets; re-pin all five fn keys to moveNextFn. Mirrors emitAsyncMethod's
         // resume-fn re-establishment (LlvmBackend_Async.cpp) and the unwind
         // re-establishment just above. // per §28.9, §28.11
-        collectBorrowingArrayFreeEligible(*ci.stmts);
+        //
+        // fix #3706 (§28.9 / §28.11 / §29.2 "Iterator yield ownership",
+        // v0.294): pass `!isOwningIter` so the Array-literal `candidates`
+        // loop's escape walk treats `yield return <bare local>;` as a borrow
+        // read (not an escape) EXACTLY when this iterator returns a
+        // BORROWING enumeration interface — `isOwningIter` is already
+        // computed above (this same fn, ~L1065) from the SAME `retName` the
+        // TakeCurrent/owning-contract logic reads, so this cannot disagree
+        // with it. For an owning iterator the yield operand is a K3.7
+        // CONSUME (moved-from) instead — a different discharge story this
+        // pass does not attempt — so the flag stays false there and the
+        // pre-existing (leaky-but-safe) conservative-escape treatment is
+        // unchanged.
+        collectBorrowingArrayFreeEligible(*ci.stmts, /*yieldIsBorrowIterYield=*/!isOwningIter);
         borrowingArrayFreeEligibleFn_ = moveNextFn;
         dictMaterializerFreeEligibleFn_ = moveNextFn;
         groupingFreeEligibleFn_ = moveNextFn;

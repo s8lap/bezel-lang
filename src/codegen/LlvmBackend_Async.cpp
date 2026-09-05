@@ -3193,7 +3193,15 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
         // tokens do not match there and nothing arms in it — the same scoping
         // the other five re-establishments already rely on.
         // // per §28.9, §28.11, §30.7
-        collectBorrowingArrayFreeEligible(*ci.stmts);
+        //
+        // fix #3706 (§28.9 / §28.11 / §29.2 "Iterator yield ownership",
+        // v0.294): the async-iterator spelling of the sync-iterator call
+        // site's identical addition (LlvmBackend_Iterators.cpp
+        // emitIteratorMethod) — see that call site's comment for the full
+        // soundness argument. `isOwningIter` is already computed above
+        // (this same fn, ~L2553) from the SAME retName the TakeCurrent/
+        // owning-contract logic reads.
+        collectBorrowingArrayFreeEligible(*ci.stmts, /*yieldIsBorrowIterYield=*/!isOwningIter);
         borrowingArrayFreeEligibleFn_ = resumeFn;
         dictMaterializerFreeEligibleFn_ = resumeFn;   // #1028
         groupingFreeEligibleFn_ = resumeFn;           // #1930

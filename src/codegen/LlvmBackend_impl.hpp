@@ -13059,8 +13059,34 @@ private:
     // Compute borrowingArrayFreeEligible_ (and #1930 groupingFreeEligible_, #2142
     // setLiteralFreeEligible_, #2143 dictLiteralFreeEligible_, #2660
     // literalTreeAggregateEligible_) for a block body (see the .cpp).
+    //
+    // fix #3706 (§28.9 / §28.11 / §29.2 "Iterator yield ownership", v0.294):
+    // `yieldIsBorrowIterYield` is an OPT-IN gate, default false (every
+    // existing call site is unaffected), set true ONLY by
+    // `emitIteratorMethod` / `emitAsyncIteratorMethod` when the enclosing
+    // iterator method's declared return type is a BORROWING enumeration
+    // interface (`!isOwningIter` at that call site) — never by the
+    // general/non-iterator call sites (a `yield` cannot occur outside an
+    // iterator body, so the flag is simply inert there). When true, the
+    // borrowing-Array-literal escape walk (the `candidates` loop only — the
+    // dict/grouping/set-literal/dict-literal/aggregate walks are untouched)
+    // treats `yield return <the tracked bare local>;` as a borrow-position
+    // read, not an escape: §29.2's "Iterator yield ownership" preamble rules
+    // that an unmarked read of a named owned binding yielded from a
+    // BORROWING iterator is a re-borrow whose source is the binding itself —
+    // "the iterator frame owns the literal ... released at its scope end
+    // under §28.3's ordinary rules, and the consumer borrows it" — so the
+    // local stays eligible for the SAME scope-end `bz_array_free` every other
+    // non-escaping borrowing-Array-literal local already gets (and, on early
+    // abandonment, the SAME §29.7 disposal-pass replay that reclaim already
+    // rides). For an OWNING iterator the yield operand is instead a K3.7
+    // CONSUME (moved-from) — an entirely different discharge story this
+    // function does not attempt, so the flag must stay false there; arming
+    // it unconditionally would double-free a value the ruling says the
+    // consumer now owns.
     void collectBorrowingArrayFreeEligible(
-        const std::vector<std::unique_ptr<ast::Stmt>>& body);
+        const std::vector<std::unique_ptr<ast::Stmt>>& body,
+        bool yieldIsBorrowIterYield = false);
     // fix #2802 / §21.1 / §28.9 / §15.4: a tiny POD view over a local
     // declaration's initialization, holding exactly the fields every
     // eligibility recognizer (isFreshGroupingTerminalLocal,

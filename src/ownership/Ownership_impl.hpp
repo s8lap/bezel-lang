@@ -2253,6 +2253,30 @@ private:
         const ast::Expr& rhs,
         OwnedSourceKinds kinds = OwnedSourceKinds::LocalOnly);
 
+    // fix #3706 (§28.3 clause 1 / §28.9 / §28.11 / §29.2 "Iterator yield
+    // ownership", v0.294): a TYPE/SHAPE-based recognizer, independent of
+    // `states_`, for "is `e` a bare read of a `var` / `using var` / §21.1
+    // `const` local bound directly to a fresh, non-dict `[...]` collection
+    // literal of the builtin `Array<T>` head?" K1.5 classifies a reference-
+    // typed collection literal as an OWNED atom, so per §28.3 clause 1 an
+    // unmarked read of such a local stored into ANY field is the same
+    // borrow-escape this file rejects for every other owned scope-bound
+    // local — but `isBorrowableType` (this file) classifies EVERY
+    // `Array<T>`-typed identifier non-borrowable (a declaration-less Named
+    // TypeRef, not the recognized builtin-exception carve-out), so
+    // `ownedLocalBorrowSource` / `borrowSourceForExpr` above structurally
+    // cannot see one as a live borrow source regardless of the local's
+    // `states_` state — true of a plain `var`, a `using var`, AND a `const`
+    // alike (measured: all three compile clean with no diagnostic before
+    // this fix). This recognizer is the narrow, independent leg
+    // `checkBorrowStoreEscape` needs so the store is rejected anyway. See
+    // the .cpp for the full derivation and why it is sound in both
+    // `EscapeScope::Method` and `EscapeScope::LambdaBody` (it consults no
+    // `states_` / `localDepth_` entry, mirroring the §9.7 record/span/choice
+    // leg). Returns the local's symbol, or null.
+    sema::LocalSymbol* borrowingArrayLiteralLocalFieldStoreSource(
+        const ast::Expr& e) const;
+
     // Compute the owned scope-bound source local that the initializer/RHS
     // expression `rhs` borrows from, or null if it borrows nothing owned.
     // Used to populate LocalOwnership.source so an aliasing local can be

@@ -22096,6 +22096,21 @@ struct StringEscapeWalker {
     // walk keeps its stricter conservative treatment. Only the borrowing-array
     // eligibility analysis (collectBorrowingArrayFreeEligible) sets it.
     bool borrowingArrayMode = false;
+    // fix #3706 (§28.9 / §28.11 / §29.2 "Iterator yield ownership", v0.294):
+    // OPT-IN, borrowingArrayMode-ADJACENT gate — a `yield return` of the bare
+    // tracked identifier is a borrow-position read, not an escape. Set ONLY
+    // by collectBorrowingArrayFreeEligible's `candidates` (borrowing-Array-
+    // literal) loop, and ONLY when its caller (emitIteratorMethod /
+    // emitAsyncIteratorMethod) confirmed the enclosing iterator returns a
+    // BORROWING enumeration interface (`!isOwningIter`) — see that call
+    // site's own comment, and collectBorrowingArrayFreeEligible's new
+    // parameter, for the full soundness argument (an OWNING iterator's yield
+    // is a K3.7 CONSUME, a different discharge story this walk must not
+    // relax for). Distinct from `borrowingArrayMode` itself, which several
+    // OTHER call sites (dict-materializer, grouping, ...) also flip on for
+    // their own unrelated relaxations — this one is scoped narrowly to the
+    // single new YieldStmt arm below and defaults false everywhere else.
+    bool yieldIsBorrowIterYield = false;
     // #1997 / §4.6 / §28.9 / §28.3 (v0.197): OPT-IN gate for the plain-`:=`
     // reassignment relaxation below (treat a reassignment of the tracked local as
     // NOT an escape, so the local stays scope-end-release eligible). Sound ONLY for
@@ -23875,6 +23890,26 @@ struct StringEscapeWalker {
             expr(ds->value.get(), /*safeRead=*/false); return;
         }
         if (auto* ys = dynamic_cast<const ast::YieldStmt*>(s)) {
+            // fix #3706 (§29.2 "Iterator yield ownership" preamble, v0.294):
+            // an unmarked read of the bare tracked local as the yield
+            // operand, when the caller has confirmed (via
+            // yieldIsBorrowIterYield) that the enclosing iterator returns a
+            // BORROWING enumeration interface, is a re-borrow whose source
+            // is the local itself — "the iterator frame owns the literal
+            // ... released at its scope end under §28.3's ordinary rules,
+            // and the consumer borrows it." Mirrors the existing
+            // borrowingArrayMode `for var x in a` relaxation just below:
+            // safeRead=true so `expr`'s IdentifierExpr arm does not mark an
+            // escape (still subject to the `inLambda` override there, though
+            // §29.9 forbids `yield` inside a lambda body in the first place,
+            // so that combination cannot arise). Any OTHER yield operand
+            // shape (a derived expression, a call, a non-tracked identifier)
+            // falls through to the fully conservative safeRead=false below,
+            // unchanged.
+            if (yieldIsBorrowIterYield && isTargetIdent(ys->value.get())) {
+                expr(ys->value.get(), /*safeRead=*/true);
+                return;
+            }
             expr(ys->value.get(), /*safeRead=*/false); return;
         }
         if (auto* is = dynamic_cast<const ast::IfStmt*>(s)) {
@@ -26786,7 +26821,8 @@ void Emitter::freeUnboundOwnedOwningCollectionTemp(llvm::Value* v,
 // stays eligible — for those, the local is provably the sole owner of the backing,
 // so freeing it once at scope end is free of UAF and of double-free.
 void Emitter::collectBorrowingArrayFreeEligible(
-        const std::vector<std::unique_ptr<ast::Stmt>>& body) {
+        const std::vector<std::unique_ptr<ast::Stmt>>& body,
+        bool yieldIsBorrowIterYield) {
     borrowingArrayFreeEligible_.clear();
     dictMaterializerFreeEligible_.clear();  // #1028
     groupingFreeEligible_.clear();          // #1930
@@ -26907,6 +26943,12 @@ void Emitter::collectBorrowingArrayFreeEligible(
         collectSafeViewAliases(body, ld, safeViews);
         StringEscapeWalker w{ctx_, static_cast<const void*>(ld)};
         w.borrowingArrayMode = true;
+        // fix #3706: only THIS loop (the Array-literal `candidates` family)
+        // gets the relaxation — see the walker field's own comment and this
+        // function's new parameter doc (LlvmBackend_impl.hpp) for why the
+        // Set/Dictionary-literal and aggregate-root loops below are left
+        // untouched (narrowly scoped to this issue's exact title/repro).
+        w.yieldIsBorrowIterYield = yieldIsBorrowIterYield;
         w.safeViewAliases = &safeViews;
         for (auto& s : body) { w.stmt(s.get()); if (w.escaped) break; }
         if (!w.escaped)
