@@ -13,11 +13,7 @@ enum Priority
   public static owned readonly All: FrozenArray<Priority> :=
       FrozenArray<Priority>.From([Low, Medium, High]);
 
-  public static method Parse(text: string): Priority?
-    return (case text of
-      "Low" => Low,
-      "Medium" => Medium,
-      "High" => High,
-      _ => null);
-  end Parse;
+  public static method Parse(text: string): Priority =>
+      Priority.FromNameOrNull(text)
+      ?? throw new ArgumentException($"unknown priority {text}", "text");
 end Priority;

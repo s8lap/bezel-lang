@@ -15,6 +15,8 @@ end Rectangle;
 enum Priority
   Low, Medium, High;                      // the constant list ends with `;`
   public method IsUrgent(): bool => this = High;
+  // compiler-provided on EVERY enum (v0.293): Priority.FromUnderlyingOrNull(u): Priority?, Priority.FromNameOrNull(s): Priority?
+  // (declared identifier, exact), Priority.NameOf(v): string = nameof(Priority.X) for a written X. ToString() renders the TYPE name.
 end Priority;
 enum HttpStatus: short  Ok := 200, NotFound := 404;  end HttpStatus;   // underlying type
 

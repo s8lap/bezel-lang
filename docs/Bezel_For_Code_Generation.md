@@ -1,6 +1,6 @@
 # Bezel for Code Generation
 
-*Validated against v0.292. Companion to the Bezel Language Specification — a writing reference, not a normative document.*
+*Validated against v0.293. Companion to the Bezel Language Specification — a writing reference, not a normative document.*
 
 A dense reference for writing correct Bezel without reading the spec. It covers the syntax surface, the ownership rules, the standard-library name index, the idioms that work, and the shapes that look right and are rejected.
 
@@ -116,6 +116,8 @@ end Rectangle;
 enum Priority
   Low, Medium, High;                      // the constant list ends with `;`
   public method IsUrgent(): bool => this = High;
+  // compiler-provided on EVERY enum (v0.293): Priority.FromUnderlyingOrNull(u): Priority?, Priority.FromNameOrNull(s): Priority?
+  // (declared identifier, exact), Priority.NameOf(v): string = nameof(Priority.X) for a written X. ToString() renders the TYPE name.
 end Priority;
 enum HttpStatus: short  Ok := 200, NotFound := 404;  end HttpStatus;   // underlying type
 
@@ -627,7 +629,7 @@ Exactly four sanctioned shapes; nothing else is a Try (stdlib §1).
 
 **The `when true` postcondition is normative on every shape-(a) member** even though the per-type listings elide it: inside a `true`-narrowed region the recipient needs no `!`. It has one spelling — the clause; a hand-written `static ensures(not result or p <> null)` is an ordinary contract clause and narrows nothing (§22.16).
 
-**Three access tiers over one operation:** the **throwing** tier (absence is a bug) — `Parse`, `dict[key]`, `First()`, `PopAt`, `Pop`, `Dequeue`, `Console.ReadKey`; the **`*OrNull`** tier, returning `T?` for `??`/`?.` composition — `ParseOrNull`, `GetOrNull`, `Console.ReadKeyOrNull`, `FirstOrNull`/`LastOrNull`/`SingleOrNull`/`ElementAtOrNull`/`MinOrNull`/`MaxOrNull`, `E.FromUnderlyingOrNull`; and the **`Try`** tier, the only shape that distinguishes "absent" from "present null". `*OrNull` **conflates** absent with a present `null` wherever the payload can be null — use `ContainsKey`/`Count`/the `Try` shape when the distinction matters.
+**Three access tiers over one operation:** the **throwing** tier (absence is a bug) — `Parse`, `dict[key]`, `First()`, `PopAt`, `Pop`, `Dequeue`, `Console.ReadKey`; the **`*OrNull`** tier, returning `T?` for `??`/`?.` composition — `ParseOrNull`, `GetOrNull`, `Console.ReadKeyOrNull`, `FirstOrNull`/`LastOrNull`/`SingleOrNull`/`ElementAtOrNull`/`MinOrNull`/`MaxOrNull`, `E.FromUnderlyingOrNull`, `E.FromNameOrNull` (`E` = the enum's own name; the declared identifier, exact ordinal match — never a `serialized` rename; v0.293; its inverse `E.NameOf(v): string` is total and equals `nameof(E.X)` for a written `X`); and the **`Try`** tier, the only shape that distinguishes "absent" from "present null". `*OrNull` **conflates** absent with a present `null` wherever the payload can be null — use `ContainsKey`/`Count`/the `Try` shape when the distinction matters.
 
 **Negative magnitudes fault:** `capacity`/`size`/`length` < 0 raises `ArgumentOutOfRangeException` on the `StringBuilder`, `Array<T>`, `OwningArray<T>`, `Dictionary`/`OwningDictionary`/`Set`/`OwningSet` capacity forms and `OwningBuffer<T>`. Zero is valid. `Channel<T>(capacity)` requires `capacity >= 1`, else `ArgumentException`.
 
@@ -1349,7 +1351,7 @@ Every absence below was verified by a full-document search. Reaching for one of 
 
 **Concurrency.** `Thread`, `ThreadPool`, `Monitor`, a `lock` statement (→ `Mutex`/`Locked<T>`), `Interlocked` (→ `Atomic<T>`), `ManualResetEvent`/`AutoResetEvent`/`CountdownEvent`/`Barrier`, `Task.Run` (→ `Domain.Spawn`), `Task.CompletedTask` (→ `Task.FromResult`), `Task.Yield`, `ConfigureAwait`, `Task.Wait`/`.Result` inside async code, `AggregateException` (first fault wins; **no aggregation**), `Parallel.For`.
 
-**Everything else.** `Object.MemberwiseClone` and any clone facility, `ICloneable`, member reflection (**declined, not deferred**), attributes, `Activator`, `Lazy<T>`, `WeakReference` (→ `Weak<T>`), `Option<T>` (→ `T?`), `Result.Unwrap`/`UnwrapOrElse`, `Math.Round(decimal)` (→ `Decimal.Round`), `Math.Cbrt`/`Hypot`/`BigMul`, `Random.Shared`, cryptographic randomness, a `Guid` constructor, `Environment.StackTrace`/`CurrentDirectory`/`TickCount`, `Convert` from any non-`string` source, `Encoding.GetEncoding(name)`/`Encoding.Default`, `Encoding.GetString(bytes, start, length)` (→ `GetString(bytes.AsReadOnlySpan(start, length))`, v0.290), `Stopwatch.Restart()` (→ `Reset(); Start();`, v0.290), `Type.Implements(iface)` (→ `iface.IsAssignableFrom(t)`, v0.290), `Math.Sign(c: char)` (`Sign<T>` needs `INumber<T>` — `Math.Sign(int(c))`), `OutOfMemoryException`, `InnerException` on user exception types, multidimensional arrays, `defer`/`errdefer` (→ `ScopeGuard`).
+**Everything else.** `Enum.Parse`/`Enum.TryParse`/`Enum.GetName`/`Enum.GetNames`/`Enum.GetValues`/`Enum.IsDefined` (**there is no `Enum` class** — the members are per-enum statics, `E` being the enum's own name: `E.FromNameOrNull(s)` (declared identifier, exact) and `E.NameOf(v)` (v0.293), `E.FromUnderlyingOrNull(u)`; the lists are `typeof(E).EnumNames`/`EnumValues`, and `IsDefined` is `E.FromUnderlyingOrNull(u) <> null`), `Object.MemberwiseClone` and any clone facility, `ICloneable`, member reflection (**declined, not deferred**), attributes, `Activator`, `Lazy<T>`, `WeakReference` (→ `Weak<T>`), `Option<T>` (→ `T?`), `Result.Unwrap`/`UnwrapOrElse`, `Math.Round(decimal)` (→ `Decimal.Round`), `Math.Cbrt`/`Hypot`/`BigMul`, `Random.Shared`, cryptographic randomness, a `Guid` constructor, `Environment.StackTrace`/`CurrentDirectory`/`TickCount`, `Convert` from any non-`string` source, `Encoding.GetEncoding(name)`/`Encoding.Default`, `Encoding.GetString(bytes, start, length)` (→ `GetString(bytes.AsReadOnlySpan(start, length))`, v0.290), `Stopwatch.Restart()` (→ `Reset(); Start();`, v0.290), `Type.Implements(iface)` (→ `iface.IsAssignableFrom(t)`, v0.290), `Math.Sign(c: char)` (`Sign<T>` needs `INumber<T>` — `Math.Sign(int(c))`), `OutOfMemoryException`, `InnerException` on user exception types, multidimensional arrays, `defer`/`errdefer` (→ `ScopeGuard`).
 
 ### 5.12 The `pure` inventory
 
