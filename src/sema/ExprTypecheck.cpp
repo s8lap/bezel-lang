@@ -10348,9 +10348,11 @@ void ExprTC::checkOutPostcondAtReturn(const ast::Expr* returnValue,
 // one branch into narrowings_. A single type test narrows per
 // narrowFromTypeTest; a single null test narrows per narrowFromNullTest (§7.4 /
 // §8.4); `and`-joined tests (`x is T and y is S`, `a <> null and b <> null`)
-// contribute all their narrowings to the combined true branch. The caller has
-// already visited the condition (so operand symbols and test types are
-// resolved) and is responsible for save/restore of narrowings_ around the
+// contribute all their narrowings to the combined true branch, and (fix #3877,
+// §7.4, v0.294) `or`-joined tests (`a = null or b = null`) contribute all
+// their FALSE-facts to the combined false branch, the De Morgan dual. The
+// caller has already visited the condition (so operand symbols and test types
+// are resolved) and is responsible for save/restore of narrowings_ around the
 // branch body.
 void ExprTC::collectNarrowings(const ast::Expr* cond, bool forTrueBranch) {
     if (!cond) return;
@@ -10364,13 +10366,27 @@ void ExprTC::collectNarrowings(const ast::Expr* cond, bool forTrueBranch) {
     // stated constant.
     if (narrowFromOutPostcond(cond, forTrueBranch)) return;
     // `and`-joined tests: both sides narrow throughout the combined true
-    // branch (§12.7). This does not extend to `or` (where neither side is
-    // guaranteed) nor to the else branch of an `and` (De Morgan would make it
-    // an `or` of negations — no single narrowing holds); those are deferred.
+    // branch (§12.7). This does not extend to the true branch of an `and`'s
+    // mirror-image counterpart, nor to the else branch of an `and` (De Morgan
+    // would make it an `or` of negations — no single narrowing holds); those
+    // remain deferred (neither side of an `and`'s false branch, nor of an
+    // `or`'s true branch, is guaranteed).
+    //
+    // fix #3877 (§7.4, v0.294): `or`-joined tests are the DUAL — by De
+    // Morgan, `A or B` is false only when BOTH `A` and `B` are false, so the
+    // combined FALSE branch (the `or` condition's else branch, or the false
+    // outcome of a boolean-valued `or` expression) is narrowed by both
+    // operands' false-facts, exactly as an `and`'s combined true branch is
+    // narrowed by both operands' true-facts above. `x = null or y = null`
+    // narrows both `x` and `y` non-null in the `else` of `if (x = null or
+    // y = null) ... else ... end;`.
     if (auto* be = dynamic_cast<const ast::BinaryExpr*>(cond)) {
         if (be->op == "and" && forTrueBranch) {
             collectNarrowings(be->left.get(), /*forTrueBranch=*/true);
             collectNarrowings(be->right.get(), /*forTrueBranch=*/true);
+        } else if (be->op == "or" && !forTrueBranch) {
+            collectNarrowings(be->left.get(), /*forTrueBranch=*/false);
+            collectNarrowings(be->right.get(), /*forTrueBranch=*/false);
         }
     }
 }

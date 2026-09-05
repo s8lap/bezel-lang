@@ -1777,8 +1777,10 @@ private:
     // `else` branch (`x is not T` narrows there; `x is T` does not). Each
     // narrowing maps the tested variable's resolved symbol to the test type's
     // resolved TypeRef. `and`-joined tests contribute all their narrowings to
-    // the true branch (§12.7). The condition must already have been visited so
-    // operand symbols and the test type are resolved. Entries are written into
+    // the true branch (§12.7), and (fix #3877, v0.294) `or`-joined tests
+    // contribute all their FALSE-facts to the false branch — the De Morgan
+    // dual. The condition must already have been visited so operand symbols
+    // and the test type are resolved. Entries are written into
     // `narrowings_`; the caller saves/restores the map for block scoping.
     void collectNarrowings(const ast::Expr* cond, bool forTrueBranch);
 

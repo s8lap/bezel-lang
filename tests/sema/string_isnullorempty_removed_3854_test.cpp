@@ -215,13 +215,13 @@ BEZEL_TEST(sema_isnullorempty_removed_3854,
 //     lowering for a plain `string` receiver at all — `s.IsEmpty` on a
 //     provably non-null `var s := "hello";` rejects with "string member
 //     `.IsEmpty` is not yet supported in codegen", independent of nullability.
-//   - The `or`-composition narrowing spec §7.4 documents ("in `A or B`, `B`
-//     sees `A`'s false-facts") does not fire for an equality null-test:
-//     `s = null or s.Length` rejects "requires narrowing" even for an
-//     unconstrained `string?` parameter, while the dual `and`/`<>` form
-//     (`s <> null and s.Length > 0`) narrows correctly. So today NEITHER half
-//     of the documented replacement idiom works, for two independent reasons
-//     that have nothing to do with `IsNullOrEmpty`'s removal.
+//   - (CLOSED by fix #3877.) The `or`-composition narrowing spec §7.4
+//     documents ("in `A or B`, `B` sees `A`'s false-facts") did not fire for
+//     an equality null-test: `s = null or s.Length` rejected "requires
+//     narrowing" even for an unconstrained `string?` parameter, while the
+//     dual `and`/`<>` form narrowed correctly. That half now works; only the
+//     `String.IsEmpty` codegen gap above still blocks the documented
+//     replacement idiom, so ONE of its two independent reasons remains.
 // The diagnostic still names the spec-correct spelling (CLAUDE.md §1: the
 // spec is the source of truth; a gap between spec and implementation is a
 // separate defect, not a reason to change what the compiler tells the user

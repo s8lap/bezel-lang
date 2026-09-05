@@ -6670,10 +6670,19 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         // visitExpr — so without this, the right operand saw no left-side
         // narrowing and `requires(s <> null and s.Length >= 0)` on a `string?`
         // was wrongly rejected. Per §22.16 ("Flow narrowing works inside
-        // clauses unchanged") this applies in contract clauses too. `or` is
-        // left alone (collectNarrowings is and-only). Save/restore mirrors
-        // checkOutPostcondAtReturn; collectNarrowings recurses into `and`
-        // itself (ExprTypecheck.cpp:6710-6714).
+        // clauses unchanged") this applies in contract clauses too. Save/
+        // restore mirrors checkOutPostcondAtReturn; collectNarrowings recurses
+        // into `and` itself (ExprTypecheck.cpp:6710-6714).
+        //
+        // fix #3877 (§7.4, v0.294): `or` gets the mirror-image treatment — in
+        // `A or B`, `B` is checked under `A`'s FALSE-facts ("x = null or
+        // x.Length > 0" is well-typed; `A`'s false-fact is exactly what
+        // `collectNarrowings(A, forTrueBranch=false)` computes, since `or`
+        // only evaluates `B` when `A` is false — the same short-circuit
+        // reasoning the `and` case above already uses for true-facts). Before
+        // this fix `or` was left alone entirely (collectNarrowings was
+        // and-only), so the stdlib's own documented `String.IsNullOrEmpty`
+        // replacement idiom (`s = null or s.IsEmpty`) did not type-check.
         if (be->op == "and" && be->left && be->right) {
             auto savedNull = nullNarrowed_;
             auto savedNarrow = narrowings_;
@@ -6693,6 +6702,19 @@ void ExprTC::visitChildren(const ast::Expr& e) {
             // `s.Length` compiled to a null dereference (silent ACCEPT,
             // SIGSEGV). The intersection keeps the drop and still discards the
             // left operand's seeded facts (absent from the snapshot).
+            intersectNarrowingSetsWith(savedNull, savedNarrow, savedField);
+        } else if (be->op == "or" && be->left && be->right) {
+            // fix #3877 (§7.4, v0.294): symmetric to the `and` case above,
+            // false-facts instead of true-facts. Same intersect-not-assign
+            // reasoning applies: the right operand's visit can invalidate a
+            // fact seeded from the left (a `ref`/`out` argument, a call/await
+            // dropping mutably-captured locals), and un-seeding must keep
+            // that drop rather than resurrecting the entry snapshot.
+            auto savedNull = nullNarrowed_;
+            auto savedNarrow = narrowings_;
+            auto savedField = fieldNarrowed_;
+            collectNarrowings(be->left.get(), /*forTrueBranch=*/false);
+            visitExpr(*be->right);
             intersectNarrowingSetsWith(savedNull, savedNarrow, savedField);
         } else if (be->right) {
             visitExpr(*be->right);
