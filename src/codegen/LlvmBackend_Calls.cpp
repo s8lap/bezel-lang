@@ -7977,7 +7977,33 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             }
             const sema::TypeRef* savedExpected = expectedFunctionType_;
             expectedFunctionType_ = funcRef;
+            // fix #3890 (stdlib §4.8/§4.9, spec §27.5/§28.9, v0.294): arm the
+            // SAME `inArgumentLambda_` signal fix #3778 introduced for an
+            // ordinary call-argument lambda literal (LlvmBackend_Assign.cpp).
+            // GetOrAdd is a BUILTIN lowered here, not through
+            // `buildOrderedArgs`, so that ordinary path never sets the flag
+            // for this factory literal. Without it, `lowerLambda`'s
+            // first-capture content-release gate (`declaredShallower ||
+            // inArgumentLambda_`, LlvmBackend_Exprs2.cpp) never widens for a
+            // factory capturing a local declared in the SAME scope as this
+            // call — the common shape `var key := ...; d.GetOrAdd(key,
+            // lambda(x) => key...)` — so the envdtor performs its ordinary
+            // unconditional content release for that capture at `goa.end`
+            // (this arm unconditionally `emitClosureRelease`s the closure
+            // there on both the hit and miss paths), which runs BEFORE the
+            // captured local's own scope ends: a heap-use-after-free on any
+            // later read of it (#3890, measured: ASan `freed by ... in
+            // bz$lam$0$envdtor`, read in the caller). Setting the flag here
+            // defers that release to the captured local's OWNER scope
+            // instead, exactly as #3778 does; gated on the argument actually
+            // being a lambda LITERAL (a var/field-bound factory is an
+            // `ast::IdentifierExpr`, never `ast::LambdaExpr` — that shape's
+            // own separate defect is #3885).
+            const bool savedInArgumentLambda = inArgumentLambda_;
+            if (dynamic_cast<const ast::LambdaExpr*>(call.args[1].value.get()))
+                inArgumentLambda_ = true;
             llvm::Value* closure = lowerExpr(*call.args[1].value);
+            inArgumentLambda_ = savedInArgumentLambda;
             expectedFunctionType_ = savedExpected;
             if (!closure) return nullptr;
             // #422: a closure produced INLINE here (a lambda literal) is a fresh
