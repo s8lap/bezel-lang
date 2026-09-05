@@ -26165,16 +26165,33 @@ bool Emitter::isProvablyFreshRecordFactoryMethod(
             return isFreshRecordConstructionOfExactType(rs->value.get(), recTs);
         }
         if (md->stmts.size() == 2) {
-            auto* ld = dynamic_cast<const ast::LocalDecl*>(md->stmts[0].get());
+            // fix #3591 (LOCALDECL-ONLY WALKER RATCHET): the prior shape
+            // (`dynamic_cast<ast::LocalDecl*>` alone) silently rejected a
+            // §21.1 `const x := new P(...); return x;` factory because a
+            // `const` is a `LocalConstDecl`, not a `LocalDecl`. Per #3591,
+            // every LocalDecl site in a function MUST have a sibling
+            // LocalConstDecl cast in the same scope; the predicate widens
+            // the binding-kind check to either form and reads the common
+            // init/type/isUsing fields through `localDeclInitView` (#3402's
+            // shared authority) so both kinds are recognized identically.
+            const ast::Node* declNode = md->stmts[0].get();
+            auto* ld = dynamic_cast<const ast::LocalDecl*>(declNode);
+            auto* lcd = dynamic_cast<const ast::LocalConstDecl*>(declNode);
+            std::string_view ldName;
+            if (ld) ldName = ld->name;
+            else if (lcd) ldName = lcd->name;
             auto* rs = dynamic_cast<const ast::ReturnStmt*>(md->stmts[1].get());
-            if (!ld || !rs) return false;
+            if ((!ld && !lcd) || !rs) return false;
+            LocalDeclInitView view = localDeclInitView(declNode);
             // Plain `var` only (no `using` / `await using`) — a using-var
             // would imply a Dispose path on the local, which this analysis
-            // does not track through.
-            if (ld->isUsing || ld->isAwaitUsing) return false;
+            // does not track through. `localDeclInitView` reports `isUsing`
+            // uniformly — `const` is never `using`, so view.isUsing=false
+            // for the const arm.
+            if (view.isUsing) return false;
             // Initializer must be a provably-fresh construction of recTs.
-            if (!isFreshRecordConstructionOfExactType(ld->initializer.get(),
-                                                       recTs)) return false;
+            if (!isFreshRecordConstructionOfExactType(view.init, recTs))
+                return false;
             // Return value must be a bare-identifier read of THAT local —
             // not a field access, member call, indexer, or any other
             // expression (those shapes are not yet audited against the
@@ -26187,7 +26204,7 @@ bool Emitter::isProvablyFreshRecordFactoryMethod(
             // read of a local resolves to the local's LocalSymbol whose
             // `name` matches the LocalDecl's `name`. Using the LocalDecl's
             // own name keeps this predicate AST-only (no sema round-trip).
-            return rid->name == ld->name;
+            return rid->name == ldName;
         }
         return false;
     }

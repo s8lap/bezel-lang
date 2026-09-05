@@ -314,3 +314,44 @@ BEZEL_TEST(codegen_record_local_copy_alias_release_3729,
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.stdoutText, "800\n");
 }
+
+// ── Row 10 — fix #3591 LOCALDECL-ONLY WALKER RATCHET (per §21.1, §9.7,
+// §28.9, v0.286): `isProvablyFreshRecordFactoryMethod` (LlvmBackend_Setup.cpp,
+// admitted by #3745) previously walked `dynamic_cast<ast::LocalDecl*>` on
+// the two-statement factory body — a §21.1 `const` binding is a
+// `LocalConstDecl`, not a `LocalDecl`, so the cast returned nullptr and the
+// predicate silently REJECTED the `const x := new P(...); return x;` shape
+// (leak-over-UAF, the safe direction — but a real false negative that
+// double-counted the safe leak). After #3591 the predicate widens the cast
+// to admit EITHER binding kind and reads init/type/isUsing through
+// `localDeclInitView` (#3402's shared authority), so a §21.1 `const x` is
+// recognized identically.
+//
+// The 200-iteration amplification under ASan (`runAotChecked` — the lenient
+// oracle would only see the value, not the leak) pins the regression: pre-fix
+// the 200 returned RStr<int> records (and their string fields) leak at scope
+// end because the predicate says "not a fresh factory" → no release fires →
+// ASan reports the leak; post-fix the predicate says "fresh factory" → release
+// fires → ASan reports clean. The print total `400` = sum of string Lengths
+// (4 visible chars per `Make` call, "v" + 1 digit + 1 padding) — the value
+// check is a redundant pin on the program's basic correctness. per #3591 +
+// #3745 (issues #3591, #3745)
+BEZEL_TEST(codegen_record_local_copy_alias_release_3729,
+           const_local_factory_two_statement_form_admitted_after_3591_spec_21_1) {
+    JitResult r = runAotChecked(std::string(kHdr) +
+        "public class C public static method Make(n: int): RStr<int> "
+        "  const r := new RStr<int>(n); "
+        "  return r; "
+        "end Make; "
+        "public static method Main(): int "
+        "  var total := 0; var i := 0; "
+        "  while i < 200 do "
+        "    var r2 := C.Make(i); "
+        "    total := total + r2.s.Length; "
+        "    i := i + 1; "
+        "  end while; "
+        "  Console.WriteLine(total); return 0; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.stdoutText, "400\n");
+}
