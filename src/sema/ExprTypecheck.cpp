@@ -2,6 +2,7 @@
 #include "sema/ExprTypecheck_impl.hpp"
 #include "sema/EnumValues.hpp"  // enumDeclaredValues — §10.2/§17.11 (#3044)
 #include "sema/GenericParams.hpp"  // fix #3143: the ONE both-sources generic-param walk (§14.1/§12.9/§2.5)
+#include "sema/LinqStdlibOverloads.hpp"  // fix #3726: shared stdlib §5 LINQ overload table (name + arity + where) — exported from this TU so `ExprTypecheck_Calls.cpp`'s arity gate (#3726) can consult the SAME source of truth
 
 #include <algorithm>
 #include <cerrno>
@@ -7688,105 +7689,12 @@ bool ExprTC::extWhereClauseProvablyViolated(
 // §5 LINQ operators are declared over `extension IEnumerable<T>` (plus three
 // constrained siblings for `where T: hashable`, `where T: IComparable<T>`,
 // and `where T: INumber<T>` — all over the same `IEnumerable<T>` head).
-// The per-name + per-arity signature table below mirrors stdlib §5's listing
-// (the table the LINQ matching in ExprTypecheck_Calls.cpp / typeCall also
-// reaches for, e.g. the `isLinqOp` check at ~15702; kept independent here
-// rather than imported, because lookupExtensionMember runs in a different
-// translation unit and the cost of duplicating the table is one comment).
-// The size is stated qualitatively on purpose: the "42-row" figure this
-// comment carried was already wrong before #3559 removed the `OfType` row
-// (the initializer held 54), and a hardcoded count in a comment beside a
-// table that changes every time stdlib §5 does is a claim that goes stale
-// unread.
-struct StdlibLinqOverload {
-    const char* name;
-    int arity;  // one entry per overload of `name` — name + arity match a
-                // specific stdlib §5 method.
-    const char* where;  // "" for the main `extension IEnumerable<T>` block;
-                        // "where T: hashable" / "where T: IComparable<T>" /
-                        // "where T: INumber<T>" for the constrained blocks.
-                        // The §26.5 rule 4 diagnostic's "declared head
-                        // including any where clause" wording (§26.5.1
-                        // v0.278) applies uniformly to stdlib and user
-                        // candidates — the where clause is part of the
-                        // declared head, not a separate fact.
-};
-static const StdlibLinqOverload kStdlibLinqOverloads[] = {
-    // Main `extension IEnumerable<T>` block (stdlib §5 line 3497)
-    // Filtering
-    // fix #3559: `OfType` was removed from stdlib §5 at v0.284, so it is no
-    // longer a row of the table this list mirrors.
-    {"Where", 1, ""},
-    // Projection
-    {"Select", 1, ""}, {"SelectMany", 1, ""},
-    // Quantifiers
-    {"Any", 0, ""}, {"Any", 1, ""}, {"All", 1, ""},
-    {"Count", 0, ""}, {"Count", 1, ""},
-    // Element access
-    {"First", 0, ""}, {"First", 1, ""},
-    {"FirstOrNull", 0, ""}, {"FirstOrNull", 1, ""},
-    {"Last", 0, ""}, {"Last", 1, ""},
-    {"LastOrNull", 0, ""}, {"LastOrNull", 1, ""},
-    {"Single", 0, ""}, {"Single", 1, ""},
-    {"SingleOrNull", 0, ""}, {"SingleOrNull", 1, ""},
-    {"ElementAt", 1, ""}, {"ElementAtOrNull", 1, ""},
-    // Aggregation — selector forms (selector overloads live in the main
-    // block; no-selector overloads live in §5.1's constrained blocks and
-    // would each need a different `where` string; the ambiguity admission
-    // is per overload, and no-selector overloads match an arity the user
-    // could not have written for the selector form's receiver, so the
-    // selector-only listing is the right scope for the table).
-    {"Sum", 1, ""}, {"Min", 1, ""}, {"Max", 1, ""},
-    {"Average", 1, ""}, {"Aggregate", 2, ""},
-    // Ordering
-    {"OrderBy", 1, ""}, {"OrderByDescending", 1, ""},
-    {"ThenBy", 1, ""}, {"ThenByDescending", 1, ""},
-    {"Reverse", 0, ""},
-    // Slicing
-    {"Take", 1, ""}, {"TakeWhile", 1, ""},
-    {"Skip", 1, ""}, {"SkipWhile", 1, ""},
-    // Combination
-    {"Concat", 1, ""}, {"Zip", 2, ""},
-    // Grouping
-    {"GroupBy", 1, ""},
-    // Materialization
-    {"ToArray", 0, ""}, {"ToDictionary", 1, ""}, {"ToDictionary", 2, ""},
-
-    // `extension IEnumerable<T> where T: hashable` block (stdlib §5 line 3585)
-    {"Contains", 1, "where T: hashable"},
-    {"Distinct", 0, "where T: hashable"},
-    {"Union", 1, "where T: hashable"}, {"Intersect", 1, "where T: hashable"},
-    {"Except", 1, "where T: hashable"},
-    {"ToSet", 0, "where T: hashable"},
-
-    // `extension IEnumerable<T> where T: IComparable<T>` block (stdlib §5.1)
-    // The no-selector Min/Max overloads live here, not the main block. The
-    // selector forms are in the main block (above).
-    {"Min", 0, "where T: IComparable<T>"},
-    {"Max", 0, "where T: IComparable<T>"},
-    {"MinOrNull", 0, "where T: IComparable<T>"},
-    {"MaxOrNull", 0, "where T: IComparable<T>"},
-
-    // `extension IEnumerable<T> where T: INumber<T>` block (stdlib §5.1) —
-    // the no-selector `Sum()` lives here.
-    {"Sum", 0, "where T: INumber<T>"},
-};
-// The fixed where-clause strings above are owned by the kStdlibLinqOverloads
-// table itself (string literals with static storage duration). Look up the
-// matching entry so the candidate can carry the clause in `stdWhere`.
-static const StdlibLinqOverload* stdlibLinqLookup(std::string_view name,
-                                                  std::ptrdiff_t arity) {
-    if (arity < 0) {
-        for (const auto& e : kStdlibLinqOverloads) if (name == e.name) return &e;
-        return nullptr;
-    }
-    for (const auto& e : kStdlibLinqOverloads)
-        if (name == e.name && e.arity == arity) return &e;
-    return nullptr;
-}
-static bool stdlibLinqMemberMatches(std::string_view name, std::ptrdiff_t arity) {
-    return stdlibLinqLookup(name, arity) != nullptr;
-}
+// The per-name + per-arity signature table is in `sema/LinqStdlibOverloads.hpp`
+// — fix #3726 (v0.286) exported it from this TU so `ExprTypecheck_Calls.cpp`'s
+// `typeLinqOperator` arity gate could consult the SAME source of truth (the
+// §26.5 extension-ambiguity path's `lookupExtensionMember` here uses it too).
+// Adding a row to `kStdlibLinqOverloads` is now a one-place edit shared by
+// both readers.
 
 // fix #3343 (§26.5 / §5, v0.278): does `receiver` implement `IEnumerable<T>`
 // for SOME T? Returns the receiver-substituted `IEnumerable<...>` ancestor

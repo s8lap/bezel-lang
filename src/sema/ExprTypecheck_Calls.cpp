@@ -5,6 +5,7 @@
 #include "common/BuiltinRegistry.hpp"  // isArrayBackedCollectionName/isDictionaryName/isLinkedListName (#2465)
 #include "common/OwnershipFacts.hpp"  // isBorrowBearingRecordOrSpan (§30.1, #1595)
 #include "sema/EnumValues.hpp"  // enumDeclaresValue — §5.4's checked enum cast (#3044)
+#include "sema/LinqStdlibOverloads.hpp"  // fix #3726: shared stdlib §5 overload table (name + arity + where)
 #include "sema/Sendability.hpp"  // isSendableType — §30.14 sendability computation (shared with Resolver)
 #include "sema/TypeResolution.hpp"  // typeRefEqual, overrideParamTypeMatches
 
@@ -4658,6 +4659,69 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         linqHashableGateApplies(colName, m) &&
                         !linqHashableCheck(m, srcElem, ce.span.begin, ctx_))
                         return false;  // diagnostic reported; do not type
+                    // fix #3726 (stdlib §5 `System.Collections.Linq`, v0.286):
+                    // arity-gate the lazy LINQ typing arms below. The §5 name
+                    // exemption in `kBuiltinCollectionLinqOperatorNames`
+                    // (`BuiltinRegistry.cpp`) is name-only, so pre-fix a
+                    // `Where(1, 2)` / `Take(1, 2)` / `Where()` call reached
+                    // the pass-through match below, was typed as
+                    // `IEnumerable<T>` UNCONDITIONALLY (no arity check
+                    // anywhere in this lambda), and codegen's #2434/#2491
+                    // zero-init degradation notes let it compile rc=0, link,
+                    // and run with `count=0` — a silent zero-degrade on a
+                    // LIVE stdlib §5 operator. Gate on the SAME
+                    // `(name, arity)` lookup the §26.5 extension-ambiguity
+                    // path consults (now shared via
+                    // `sema/LinqStdlibOverloads.hpp`).
+                    //
+                    // SCOPE — three deliberate exclusions:
+                    //   * `m` must already be a stdlib §5 LINQ name — the
+                    //     lambda is called as a FALLBACK for every method
+                    //     name the caller's earlier arms did not type, so a
+                    //     gate that runs on every name would mis-fire on
+                    //     `a.Add(x)` / `a.Remove(x)` etc. and reject every
+                    //     non-LINQ method (the existing "no member" path,
+                    //     not this lambda, owns those).
+                    //   * `OfType` is excluded — it was REMOVED from stdlib
+                    //     §5 at v0.284 (fix #3559), its dedicated arm below
+                    //     fires the removal diagnostic at ANY arity (fix
+                    //     #3710), and the arity gate would silently route
+                    //     the WITHDRAWN case to this lambda's "wrong arity"
+                    //     wording instead of the v0.284 removal wording —
+                    //     the inverse of what #3710 pinned.
+                    //   * The hashable gate above fires FIRST for
+                    //     Distinct/Union/Intersect/Except/Contains/ToSet, so
+                    //     a non-hashable T gets the hashable diagnostic
+                    //     instead of a misleading "wrong number of
+                    //     arguments" (and this gate's `return false` would
+                    //     otherwise silently swallow the hashable
+                    //     diagnostic).
+                    if (m != "OfType" &&
+                        common::isBuiltinCollectionLinqOperatorName(m) &&
+                        !bezel::sema::stdlibLinqMemberMatches(
+                            m, ce.args.size())) {
+                        // Collect every admitted arity for `m` so the user
+                        // sees what they SHOULD have written (e.g. "Where:
+                        // 1", "Any: 0 or 1", "Count: 0 or 1") rather than a
+                        // bare "wrong number of arguments".
+                        std::string arityList;
+                        for (const auto& e :
+                             bezel::sema::kStdlibLinqOverloads) {
+                            if (e.name != m) continue;
+                            if (!arityList.empty()) arityList += " or ";
+                            arityList += std::to_string(e.arity);
+                        }
+                        if (arityList.empty()) arityList = "(unknown)";
+                        ctx_.diagnostics().report(
+                            Severity::Error, ce.span.begin,
+                            std::string("wrong number of arguments for stdlib "
+                                        "§5 LINQ operator `") +
+                                std::string(m) + "` (stdlib §5 "
+                                "`System.Collections.Linq`, v0.286): got " +
+                                std::to_string(ce.args.size()) +
+                                ", expected " + arityList + " (#3726)");
+                        return false;
+                    }
                     // fix #1476 / stdlib §4.10: OwningSet<T>.Take(query: T) is
                     // typed explicitly (owned T, above in the isArrLike chain)
                     // and must NOT be re-typed here as the LINQ Take(count:
