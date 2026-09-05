@@ -5442,6 +5442,29 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     } else if (m == "GetByteCount") {
                         // v0.165 (#1355): GetByteCount(s: string): int
                         ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Int));
+                    } else if (m == "GetString" && ce.args.size() == 3) {
+                        // fix #3851 (stdlib §3.2 / §1, v0.290, proposal 0123
+                        // R5 Option B): the windowed three-argument
+                        // `GetString(bytes, start, length)` call form was
+                        // retired — a window over an Array<byte> is a slice,
+                        // not a parameter pair (§4.14's no-offset-parameter
+                        // rule). Reject explicitly, ahead of the one-argument
+                        // arm below, so the diagnostic names the real
+                        // replacement instead of falling through untyped or
+                        // producing a generic "no dispatch arm" codegen
+                        // error. The four `bz_encoding_*_get_string` runtime
+                        // entries stay: the surviving one-argument
+                        // `GetString(bytes)` still lowers through them with a
+                        // synthesised full window (LlvmBackend_Calls2.cpp).
+                        ctx_.diagnostics().report(
+                            Severity::Error, ce.span.begin,
+                            "the three-argument `Encoding.GetString(bytes, "
+                            "start, length)` was REMOVED from the standard "
+                            "library at v0.290 (stdlib \xC2\xA7""3.2) \xE2\x80\x94 "
+                            "it is gone, not misspelled (issue 3851); slice "
+                            "first: `GetString(bytes.AsReadOnlySpan(start, "
+                            "length))`");
+                        return;
                     } else if (m == "GetString" || m == "Name") {
                         ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::String));
                     }

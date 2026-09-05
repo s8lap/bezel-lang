@@ -139,50 +139,21 @@ llvm::Value* Emitter::tryLowerEncodingCall(const ast::CallExpr& call) {
         return builder_.CreateTrunc(needed, i32(), "enc.sp.written");
     }
 
-    // GetString(bytes): string — decode the whole array (index 0, count Length).
-    // GetString(bytes, index, count): string — decode the requested sub-range.
-    if (m == "GetString" &&
-        (call.args.size() == 1 || call.args.size() == 3) &&
-        call.args[0].value) {
+    // GetString(bytes): string — decode the whole array (index 0, count
+    // Length). fix #3851 (stdlib §3.2 / §1, v0.290, proposal 0123 R5 Option
+    // B): the windowed `GetString(bytes, index, count)` three-argument call
+    // form is retired and rejected in sema (ExprTypecheck_Calls.cpp) before
+    // this codegen arm is ever reached, so only the one-argument form is
+    // lowered here. The four `bz_encoding_*_get_string(arr, index, count)`
+    // runtime entries stay — this surviving form lowers through them with a
+    // synthesised full window (index 0, count = Length).
+    if (m == "GetString" && call.args.size() == 1 && call.args[0].value) {
         llvm::Value* arr = lowerExpr(*call.args[0].value);
         if (!arr) return nullptr;
-        llvm::Value* index;
-        llvm::Value* count;
-        if (call.args.size() == 1) {
-            // index = 0, count = bz_array_len(arr).
-            index = builder_.getInt64(0);
-            auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
-            count = builder_.CreateCall(lenFn, {arr}, "enc.arrlen");
-        } else {
-            if (!call.args[1].value || !call.args[2].value) return nullptr;
-            llvm::Value* iv = lowerExpr(*call.args[1].value);
-            llvm::Value* cv = lowerExpr(*call.args[2].value);
-            if (!iv || !cv) return nullptr;
-            // §3.2 index/count are `int` (i32); widen to the runtime's i64.
-            index = iv->getType()->isIntegerTy(64)
-                        ? iv : builder_.CreateSExt(iv, i64(), "enc.idx");
-            count = cv->getType()->isIntegerTy(64)
-                        ? cv : builder_.CreateSExt(cv, i64(), "enc.cnt");
-            // stdlib §3.2 v0.165 (#1355): the (bytes, index, count) window ranges
-            // over the array's Count; an out-of-range window raises
-            // IndexOutOfRangeException (like every other bounds rule in the
-            // library). Guard `index < 0 || count < 0 || index + count > Count`
-            // before the decode so an out-of-range request faults rather than
-            // reading past the backing storage.
-            auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
-            llvm::Value* alen =
-                builder_.CreateCall(lenFn, {arr}, "enc.gs.len");
-            llvm::Value* idxNeg =
-                builder_.CreateICmpSLT(index, builder_.getInt64(0));
-            llvm::Value* cntNeg =
-                builder_.CreateICmpSLT(count, builder_.getInt64(0));
-            llvm::Value* endPos =
-                builder_.CreateAdd(index, count, "enc.gs.end");
-            llvm::Value* over = builder_.CreateICmpSGT(endPos, alen);
-            llvm::Value* bad = builder_.CreateOr(
-                builder_.CreateOr(idxNeg, cntNeg), over, "enc.gs.oor");
-            emitGuardThrow(bad, "IndexOutOfRangeException");
-        }
+        // index = 0, count = bz_array_len(arr).
+        llvm::Value* index = builder_.getInt64(0);
+        auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+        llvm::Value* count = builder_.CreateCall(lenFn, {arr}, "enc.arrlen");
         auto* fn = declareC(getStringName.c_str(), ptrTy(),
                             {ptrTy(), i64(), i64()});
         llvm::Value* result = builder_.CreateCall(fn, {arr, index, count},

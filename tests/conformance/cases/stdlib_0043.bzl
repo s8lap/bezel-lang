@@ -1,8 +1,6 @@
 public abstract class Encoding
   public abstract method GetBytes(s: string): owned Array<byte>;
   public abstract method GetString(bytes: Array<byte>): string;
-  public abstract method GetString(bytes: Array<byte>, start: int, length: int): string;
-                              // window over Count; IndexOutOfRangeException out of range (v0.165)
   public abstract method GetString(bytes: ReadOnlySpan<byte>): string;       // v0.222 (#1809): buffer-backed source
   public abstract method GetString(bytes: ReadOnlyArraySpan<byte>): string;  // v0.222 (#1809): Array-backed twin (#1358)
   public abstract method GetByteCount(s: string): int;                       // v0.165 (#1355)

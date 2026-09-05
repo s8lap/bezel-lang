@@ -4,10 +4,14 @@
 //   public abstract class Encoding
 //     public abstract method GetBytes(s: string): owned Array<byte>;       // §3.2
 //     public abstract method GetString(bytes: Array<byte>): string;        // §3.2
-//     public abstract method GetString(bytes: Array<byte>,
-//                                       index: int, count: int): string;    // §3.2
 //     public static readonly property UTF8: Encoding;                       // §3.2
 //   end Encoding;
+//
+// fix #3851 (stdlib §3.2 / §1, v0.290, proposal 0123 R5 Option B): the
+// windowed `GetString(bytes, index, count)` call form shown above in earlier
+// revisions of this comment was retired — a window over an Array<byte> is a
+// slice, not a parameter pair (§4.14's no-offset-parameter rule); the
+// replacement spelling is `GetString(bytes.AsReadOnlySpan(start, length))`.
 //
 // Scope of THIS milestone: `Encoding.UTF8` only. The UTF16/UTF32/ASCII
 // singletons are rejected in sema (their GetBytes/GetString semantics —
@@ -118,6 +122,42 @@ void expectValueAndNoCorruption(const std::string& source, int expectedExitCode)
     int code = runUnderAsan(source, /*detectLeaks=*/false);
     if (code == -1) return;                 // toolchain unavailable: skip
     BEZEL_EXPECT_EQ(code, expectedExitCode);  // no UAF / double-free
+}
+
+// fix #3851: true iff some diagnostic contains `sub`.
+bool hasErrorContaining(const bezel::test::JitResult& r, const char* sub) {
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find(sub) != std::string::npos) return true;
+    return false;
+}
+
+// fix #3851: the diagnostic must point at the call, never at 0:0. A REJECT's
+// `runAot` packs the whole captured stderr into ONE synthetic Diagnostic at
+// SourceLocation{} (0:0) — `d.location` itself cannot be asserted — so this
+// parses the real `<file>:<line>:<col>:` prefix rendered ahead of `needle`
+// inside the message text (mirrors tests/sema/string_isnullorempty_removed_
+// 3854_test.cpp's `locatedAt`).
+bool hasErrorLocatedAt(const bezel::test::JitResult& r,
+                       const std::string& needle) {
+    const std::string tail = ": " + needle;
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        const std::string& m = d.message;
+        for (std::size_t at = m.find(tail); at != std::string::npos;
+             at = m.find(tail, at + 1)) {
+            std::size_t p = at;
+            auto digitsBack = [&m](std::size_t& q) -> long {
+                const std::size_t end = q;
+                while (q > 0 && m[q - 1] >= '0' && m[q - 1] <= '9') --q;
+                if (q == end) return -1;
+                return std::stol(m.substr(q, end - q));
+            };
+            const long col = digitsBack(p);
+            if (col <= 0 || p == 0 || m[p - 1] != ':') continue;
+            --p;
+            if (digitsBack(p) > 0) return true;
+        }
+    }
+    return false;
 }
 
 // === GetBytes: byte values (§3.2) ======================================
@@ -243,16 +283,29 @@ BEZEL_TEST(codegen_encoding, utf8_roundtrip_multibyte_spec_3_2) {
         "end Main; end C;", 1);
 }
 
-// §3.2: the three-argument GetString(bytes, index, count) decodes the sub-range
-// [index, index+count). GetString(GetBytes("Hello"), 1, 3) == "ell".
-BEZEL_TEST(codegen_encoding, utf8_getstring_index_count_spec_3_2) {
-    expectValueAndNoCorruption(
+// fix #3851 (stdlib §3.2 / §1, v0.290, proposal 0123 R5 Option B): the
+// three-argument `GetString(bytes, index, count)` window call form this row
+// used to accept (decoding the sub-range [index, index+count),
+// GetString(GetBytes("Hello"), 1, 3) == "ell") was retired — a window over
+// an Array<byte> is a slice, not a parameter pair (§4.14's no-offset-
+// parameter rule). The call must now be REJECTED, naming the real
+// replacement, at the real call-site location (never 0:0).
+BEZEL_TEST(codegen_encoding, utf8_getstring_index_count_call_form_retired_3851) {
+    auto r = runAot(
         "module M; class C public static method Main(): int "
         "  var s := \"Hello\"; "
         "  using var b: Array<byte> := Encoding.UTF8.GetBytes(s); "
         "  using var sub: string := Encoding.UTF8.GetString(b, 1, 3); "
         "  return (if sub = \"ell\" and sub.Length = 3 then 1 else 0); "
-        "end Main; end C;", 1);
+        "end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(hasErrorContaining(
+        r, "was REMOVED from the standard library at v0.290"));
+    BEZEL_EXPECT_TRUE(hasErrorContaining(
+        r, "GetString(bytes.AsReadOnlySpan(start, length))"));
+    BEZEL_EXPECT_TRUE(hasErrorContaining(r, "issue 3851"));
+    BEZEL_EXPECT_TRUE(hasErrorLocatedAt(
+        r, "the three-argument `Encoding.GetString(bytes, start, length)`"));
 }
 
 // §3.2: GetString of an empty byte array is the empty string.

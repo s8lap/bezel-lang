@@ -543,13 +543,21 @@ constexpr std::array<BuiltinParamNameRow, 38> kStringParamNames = {{
     {"string", "Equals", 2, 2, {"other", "ignoreCase", "", ""}},
 }};
 
-// stdlib §3.2 `Encoding` (v0.283). No overload at a shared arity disagrees on
+// stdlib §3.2 `Encoding` (v0.290). No overload at a shared arity disagrees on
 // names here, so the whole declared surface is covered.
-constexpr std::array<BuiltinParamNameRow, 5> kEncodingParamNames = {{
+//
+// fix #3851 (stdlib §3.2 / §1, v0.290, proposal 0123 R5 Option B): dropped
+// the three-argument `GetString(bytes, start, length)` row (was renamed to
+// the (start, length) window convention at v0.282; retired outright at
+// v0.290 — a window over an Array<byte> is a slice, not a parameter pair).
+// The call form is rejected in sema (ExprTypecheck_Calls.cpp) ahead of the
+// named-argument lookup this table serves, so removing the row costs no
+// coverage: a 3-argument `GetString` call never reaches
+// `checkBuiltinNamedArgs` un-rejected.
+constexpr std::array<BuiltinParamNameRow, 4> kEncodingParamNames = {{
     {"Encoding", "GetBytes", 1, 1, {"s", "", "", ""}},
     {"Encoding", "GetBytes", 2, 2, {"s", "destination", "", ""}},
     {"Encoding", "GetString", 1, 1, {"bytes", "", "", ""}},
-    {"Encoding", "GetString", 3, 3, {"bytes", "start", "length", ""}},  // renamed v0.282 (§1)
     {"Encoding", "GetByteCount", 1, 1, {"s", "", "", ""}},
 }};
 

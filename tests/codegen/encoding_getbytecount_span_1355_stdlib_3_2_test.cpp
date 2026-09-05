@@ -1,16 +1,24 @@
 // Spec-derived tests for fix #1355 — Encoding.GetByteCount and
 // Encoding.GetBytes(s, destination: Span<byte>), the two new overloads added in
-// stdlib §3.2 v0.165, plus the GetString(bytes, index, count) window contract.
+// stdlib §3.2 v0.165.
 //
 // Authority: stdlib §3.2 v0.165:
 //   public abstract method GetByteCount(s: string): int;
 //   public abstract method GetBytes(s: string, destination: Span<byte>): int;
 //       // returns bytes written; IndexOutOfRangeException if destination too short
-//   public abstract method GetString(bytes: Array<byte>, index: int, count: int): string;
-//       // window over Count; IndexOutOfRangeException out of range
 // Error model (v0.136, unchanged): malformed/unrepresentable input is a defined
 // fault — ASCII.GetByteCount/GetBytes raise FormatException on any code point
 // above U+007F.
+//
+// fix #3851 (stdlib §3.2 / §1, v0.290, proposal 0123 R5 Option B): this file
+// originally also carried the `GetString(bytes, index, count)` window
+// contract added alongside #1355 — v0.290 retired that three-argument call
+// form outright (a window over an Array<byte> is a slice, not a parameter
+// pair; §4.14's no-offset-parameter rule). The two rows below now pin the
+// REJECTION instead: `getstring_window_selects_range` (a successful decode)
+// and `getstring_window_out_of_range_raises` (its runtime
+// IndexOutOfRangeException bounds check) can no longer be expressed at all
+// through this call form, so both become compile-rejection rows.
 //
 // Bezel syntax: inequality `<>` (§17.3); byte value `byte(N)`; an uncaught
 // runtime raise would exit-70 the whole binary, so raises are pinned in-source
@@ -27,6 +35,40 @@ namespace {
 int run(const std::string& src) {
     auto r = runAot(src);
     return r.ran ? r.exitCode : -999;
+}
+
+// fix #3851: true iff some diagnostic contains `sub`.
+bool hasErrorContaining(const bezel::test::JitResult& r, const char* sub) {
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find(sub) != std::string::npos) return true;
+    return false;
+}
+
+// fix #3851: the diagnostic must point at the call, never at 0:0 (mirrors
+// tests/codegen/encoding_test.cpp's `hasErrorLocatedAt` / tests/sema/
+// string_isnullorempty_removed_3854_test.cpp's `locatedAt`). Parses the real
+// `<file>:<line>:<col>:` prefix the driver renders ahead of `needle`.
+bool hasErrorLocatedAt(const bezel::test::JitResult& r,
+                       const std::string& needle) {
+    const std::string tail = ": " + needle;
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        const std::string& m = d.message;
+        for (std::size_t at = m.find(tail); at != std::string::npos;
+             at = m.find(tail, at + 1)) {
+            std::size_t p = at;
+            auto digitsBack = [&m](std::size_t& q) -> long {
+                const std::size_t end = q;
+                while (q > 0 && m[q - 1] >= '0' && m[q - 1] <= '9') --q;
+                if (q == end) return -1;
+                return std::stol(m.substr(q, end - q));
+            };
+            const long col = digitsBack(p);
+            if (col <= 0 || p == 0 || m[p - 1] != ':') continue;
+            --p;
+            if (digitsBack(p) > 0) return true;
+        }
+    }
+    return false;
 }
 
 }  // namespace
@@ -178,23 +220,45 @@ BEZEL_TEST(encoding_getbytecount_span_1355, ascii_getbytes_span_ok) {
         "end Main; end C;"), 0);
 }
 
-// ── GetString(bytes, index, count): window over Count (§3.2 v0.165) ───────────
+// ── GetString(bytes, index, count): the retired window (fix #3851) ────────────
+//
+// v0.290 (proposal 0123 R5 Option B) retired the three-argument call form
+// these two rows used to exercise. Both are now REJECTION rows: the window
+// they used to select, and the runtime out-of-range bounds check its guard
+// used to raise, can no longer be reached through this call form at all —
+// the call is rejected in sema before codegen (or any runtime guard) is ever
+// reached.
 
-BEZEL_TEST(encoding_getbytecount_span_1355, getstring_window_selects_range) {
-    // per stdlib §3.2 v0.165 (#1355): bytes "Hi!" → decode [1,2) = "i!".
-    BEZEL_EXPECT_EQ(run(
+BEZEL_TEST(encoding_getbytecount_span_1355,
+           getstring_window_call_form_retired_3851_in_range) {
+    // per stdlib §3.2 v0.290 (fix #3851): the in-range window call
+    // `GetString(b, 1, 2)` this row used to accept and decode ("Hi!" →
+    // [1,2) = "i!") is now rejected outright.
+    auto r = runAot(
         "module M; import System.Text; import System.Collections.Generic; "
         "class C public static method Main(): int "
         "  using var b := new Array<byte>(0, 0); "
         "  b.Add(byte(72)); b.Add(byte(105)); b.Add(byte(33)); "  // 'H','i','!'
         "  using var s := Encoding.UTF8.GetString(b, 1, 2); "
-        "  return s.Length; "  // "i!" → 2
-        "end Main; end C;"), 2);
+        "  return s.Length; "
+        "end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(hasErrorContaining(
+        r, "was REMOVED from the standard library at v0.290"));
+    BEZEL_EXPECT_TRUE(hasErrorContaining(
+        r, "GetString(bytes.AsReadOnlySpan(start, length))"));
+    BEZEL_EXPECT_TRUE(hasErrorLocatedAt(
+        r, "the three-argument `Encoding.GetString(bytes, start, length)`"));
 }
 
-BEZEL_TEST(encoding_getbytecount_span_1355, getstring_window_out_of_range_raises) {
-    // per stdlib §3.2 v0.165 (#1355): a window past Count → IndexOutOfRangeException.
-    BEZEL_EXPECT_EQ(run(
+BEZEL_TEST(encoding_getbytecount_span_1355,
+           getstring_window_call_form_retired_3851_out_of_range) {
+    // per stdlib §3.2 v0.290 (fix #3851): the out-of-range window call
+    // `GetString(b, 1, 5)` (1+5 > Count=2) this row used to accept and then
+    // raise IndexOutOfRangeException at runtime is now rejected at compile
+    // time instead — the same diagnostic as the in-range control above,
+    // since the call form itself is gone regardless of the window's bounds.
+    auto r = runAot(
         "module M; import System.Text; import System.Collections.Generic; "
         "class C public static method Main(): int "
         "  using var b := new Array<byte>(0, 0); "
@@ -204,5 +268,10 @@ BEZEL_TEST(encoding_getbytecount_span_1355, getstring_window_out_of_range_raises
         "    return 0; "
         "  catch IndexOutOfRangeException => return 9; "
         "  end; "
-        "end Main; end C;"), 9);
+        "end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(hasErrorContaining(
+        r, "was REMOVED from the standard library at v0.290"));
+    BEZEL_EXPECT_TRUE(hasErrorContaining(
+        r, "GetString(bytes.AsReadOnlySpan(start, length))"));
 }

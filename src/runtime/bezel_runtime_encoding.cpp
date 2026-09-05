@@ -4,7 +4,13 @@
 
 // ---------------------------------------------------------------------------
 // Encoding (stdlib §3.2). The abstract `Encoding` base declares
-// `GetBytes(s): owned Array<byte>` and `GetString(bytes[, index, count]): string`.
+// `GetBytes(s): owned Array<byte>` and `GetString(bytes): string`. (fix #3851,
+// stdlib §3.2 / §1, v0.290: the windowed three-argument `GetString(bytes,
+// start, length)` CALL FORM was retired at v0.290 — a window over an
+// Array<byte> is a slice, not a parameter pair — and is rejected in sema
+// before reaching codegen or this runtime. The `index`/`count` parameters
+// below stay: the surviving one-argument `GetString(bytes)` still lowers
+// through them with a synthesised full window.)
 // This runtime implements the UTF-8 concrete encoding (`Encoding.Utf8`), which is
 // total and lossless over every Bezel `string` (UTF-8 is the canonical byte form
 // referenced throughout §3.4 / §32.5). Utf16/Utf32/Ascii are NOT implemented here

@@ -385,44 +385,89 @@ BEZEL_TEST(builtin_named_arg_3398,
 // `declaration = builtinClassSym("Encoding")` — a NON-null declaration — so it
 // reaches the check through the intrinsic-TypeSymbol arm rather than the
 // declaration-less one. In-order named arguments must still compute the
-// §3.2-declared window.
+// §3.2-declared result.
+//
+// fix #3851 (stdlib §3.2 / §1, v0.290, proposal 0123 R5 Option B): these
+// three rows originally exercised this receiver shape through the
+// three-argument `GetString(bytes, start, length)` window, which v0.290
+// retired outright (a window over an Array<byte> is a slice, not a parameter
+// pair — the call form no longer exists at ANY argument order, so it can no
+// longer demonstrate in-order-accept/reorder-reject/unknown-name-reject).
+// Migrated to the two-argument `GetBytes(s, destination: Span<byte>)`
+// overload (stdlib §3.2 v0.165, #1355), the same `Encoding.UTF8`
+// intrinsic-TypeSymbol receiver shape, still exercising all three §22.5
+// binder behaviours this section documents. `dst.AsSpan()` (an
+// `ArraySpan<byte>`) is accepted positionally by this same overload
+// elsewhere (encoding_getbytecount_span_1355_stdlib_3_2_test.cpp) — the
+// codegen destination-span arm does not distinguish the span's nominal type.
 BEZEL_TEST(builtin_named_arg_3398,
-           accepts_in_order_named_args_on_encoding_getstring) {
+           accepts_in_order_named_args_on_encoding_getbytes) {
     BEZEL_EXPECT_EQ(
         runAotOut(prog(
-            "    var by := Encoding.UTF8.GetBytes(\"hello\"); "
-            "    Console.WriteLine(Encoding.UTF8.GetString(bytes := by, "
-            "start := 1, length := 3)); ")),
-        std::string("ell"));
+            "    using var dst := new Array<byte>(4, 0); "
+            "    var n := Encoding.UTF8.GetBytes(s := \"Hi\", "
+            "destination := dst.AsSpan()); "
+            "    Console.WriteLine(n); ")),
+        std::string("2"));
 }
 
-// #3398 / stdlib §3.2 / §1: the reordered form. On the pre-fix tree this did
-// not merely mis-evaluate — the arguments were passed in WRITTEN order, so
-// codegen emitted malformed IR ("SExt only operates on integer", "Call
-// parameter type does not match function signature"). §22.5's rejection
-// replaces a codegen ICE with a diagnostic that names the problem.
+// #3398 / stdlib §3.2 / §1: the reordered form. On the pre-fix tree the
+// GetString analogue of this row did not merely mis-evaluate — the arguments
+// were passed in WRITTEN order, so codegen emitted malformed IR ("SExt only
+// operates on integer", "Call parameter type does not match function
+// signature"). §22.5's rejection replaces a codegen ICE with a diagnostic
+// that names the problem.
 BEZEL_TEST(builtin_named_arg_3398,
-           rejects_reordered_named_args_on_encoding_getstring) {
+           rejects_reordered_named_args_on_encoding_getbytes) {
     JitResult r = runAot(prog(
-        "    var by := Encoding.UTF8.GetBytes(\"hello\"); "
-        "    Console.WriteLine(Encoding.UTF8.GetString(length := 3, "
-        "start := 1, bytes := by)); "));
+        "    using var dst := new Array<byte>(4, 0); "
+        "    var n := Encoding.UTF8.GetBytes(destination := dst.AsSpan(), "
+        "s := \"Hi\"); "
+        "    Console.WriteLine(n); "));
     if (!hasError(r, kReorderDiag)) dumpDiagnostics(r);
     BEZEL_EXPECT_TRUE(hasError(r, kReorderDiag));
-    BEZEL_EXPECT_TRUE(hasError(r, "`Encoding.GetString`"));
+    BEZEL_EXPECT_TRUE(hasError(r, "`Encoding.GetBytes`"));
 }
 
 // #3398 / stdlib §3.2: the issue's own `Encoding` row — nonsense names were
-// accepted and the call ran, printing "ell".
+// accepted and the call ran.
 BEZEL_TEST(builtin_named_arg_3398,
-           rejects_unknown_parameter_name_on_encoding_getstring) {
+           rejects_unknown_parameter_name_on_encoding_getbytes) {
     JitResult r = runAot(prog(
-        "    var by := Encoding.UTF8.GetBytes(\"hello\"); "
-        "    Console.WriteLine(Encoding.UTF8.GetString(aaa := by, bbb := 1, "
-        "ccc := 3)); "));
+        "    using var dst := new Array<byte>(4, 0); "
+        "    var n := Encoding.UTF8.GetBytes(sss := \"Hi\", "
+        "ttt := dst.AsSpan()); "
+        "    Console.WriteLine(n); "));
     if (!hasError(r, kUnknownNameDiag)) dumpDiagnostics(r);
     BEZEL_EXPECT_TRUE(hasError(r, kUnknownNameDiag));
-    BEZEL_EXPECT_TRUE(hasError(r, "`aaa`"));
+    BEZEL_EXPECT_TRUE(hasError(r, "`sss`"));
+}
+
+// #3851 (stdlib §3.2 / §1, v0.290, proposal 0123 R5 Option B): the retired
+// three-argument `GetString` call form is rejected BEFORE this file's §22.5
+// named-argument binder is ever reached — every one of these shapes (in
+// order, reordered, unknown names) now draws the SAME diagnostic, at the
+// call site.
+BEZEL_TEST(builtin_named_arg_3398,
+           rejects_three_argument_getstring_named_or_positional) {
+    for (const char* body :
+         {"    var by := Encoding.UTF8.GetBytes(\"hello\"); "
+          "    Console.WriteLine(Encoding.UTF8.GetString(bytes := by, "
+          "start := 1, length := 3)); ",
+          "    var by := Encoding.UTF8.GetBytes(\"hello\"); "
+          "    Console.WriteLine(Encoding.UTF8.GetString(length := 3, "
+          "start := 1, bytes := by)); ",
+          "    var by := Encoding.UTF8.GetBytes(\"hello\"); "
+          "    Console.WriteLine(Encoding.UTF8.GetString(by, 1, 3)); "}) {
+        JitResult r = runAot(prog(body));
+        if (!hasError(r, "was REMOVED from the standard library at v0.290"))
+            dumpDiagnostics(r);
+        BEZEL_EXPECT_TRUE(
+            hasError(r, "was REMOVED from the standard library at v0.290"));
+        BEZEL_EXPECT_TRUE(hasError(
+            r, "GetString(bytes.AsReadOnlySpan(start, length))"));
+        BEZEL_EXPECT_TRUE(hasError(r, "issue 3851"));
+    }
 }
 
 // #3398 / stdlib §9.6 / §1: the STATIC spelling. `String.From(buffer, start,
