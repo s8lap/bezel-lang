@@ -22,15 +22,17 @@
 // `decodeDictValueAt` decode pair as First/Last/ElementAt (#3717 helpers,
 // reused without change) and decodes the lone entry at index 0.
 //
-// NARROWED OFF (mirroring #3576): a STRING key. The string-key leak is a
-// pre-existing #3720 issue this fix does not touch — measured 200x under
-// ASan/LSan, the entry's Value is correct but the rebuilt `bz_string` Key
-// leaks on every call (the synthetic DictionaryEntry TypeRef has no field
-// list for the per-local disposal pass to walk). #3720 is the sema-side
-// fix outside this lane's file ownership. A `Dictionary<string, V>.Single()`
-// rejects LOUDLY with the same diagnostic as First/Last/ElementAt — the
-// "Dictionary/SortedDictionary is not yet supported (#3720)" text — so
-// the user is told what shape is missing rather than handed a leak.
+// NARROWED OFF AT THE TIME (mirroring #3576): a STRING key. The string-key
+// leak was a pre-existing #3720 issue this fix did not touch when it
+// landed — measured 200x under ASan/LSan, the entry's Value was correct
+// but the rebuilt `bz_string` Key leaked on every call (the synthetic
+// DictionaryEntry TypeRef has no field list for the per-local disposal
+// pass to walk). At the time, `Dictionary<string, V>.Single()` rejected
+// LOUDLY with the same diagnostic as First/Last/ElementAt rather than
+// shipping the leak. #3720 has SINCE landed (a disposal hook joining the
+// `collectBorrowingArrayFreeEligible` family) and lifted that reject —
+// see the `dictionary_string_key_single_now_works_3720` row below, which
+// replaced this file's own loud-reject pin once it stopped reproducing.
 //
 // SCOPE. Plain `Dictionary<K, V>` is the affected receiver (#3761 only
 // mentions the borrowing form). `SortedDictionary<K, V>.Single()` reaches
@@ -211,16 +213,25 @@ BEZEL_TEST(dictionary_single_3761,
 }
 
 // ---------------------------------------------------------------------------
-// Bonus — String-keyed Dictionary<K,V>.Single() must be rejected loudly
-// (narrowed off for the same #3720 reason First/Last/ElementAt are — a
-// plain local bound to `d.Single()`'s result has no disposal hook for the
-// rebuilt `bz_string` Key).
+// Bonus — String-keyed Dictionary<K,V>.Single() now WORKS. This row used to
+// pin a loud reject (stdlib §5 / §4.8, "... is not yet supported (#3720)");
+// fix #3720 (LlvmBackend_Calls.cpp / LlvmBackend_Disposal.cpp / LlvmBackend_
+// Setup.cpp, v0.294) gave the returned DictionaryEntry's rebuilt `bz_string`
+// Key a disposal hook (dictEntryKeyReleaseEligible_, joining the
+// collectBorrowingArrayFreeEligible family) and deleted the `if (!keyTy)`
+// reject this row exercised, so asserting `hasError(...)` on the removed
+// diagnostic text can never pass again. The value oracle below is the
+// direct replacement: for a 1-entry dict keyed "a", `fe.Key.Length` is 1.
+// Leak-freedom for this exact shape is already pinned 200x under ASan/LSan
+// by the sibling row `dict_first_last_elementat_3576.
+// dictionary_string_key_single_no_leak_3720`, landed in the same commit —
+// this row only needs to prove the VALUE is right, not re-prove the leak.
 // ---------------------------------------------------------------------------
-BEZEL_TEST(dictionary_single_3761, dictionary_string_key_single_rejected_loudly_3720) {
-    BEZEL_EXPECT_TRUE(hasError(prog(
+BEZEL_TEST(dictionary_single_3761, dictionary_string_key_single_now_works_3720) {
+    BEZEL_EXPECT_EQ(runAot(prog(
         "var d := new Dictionary<string, int>(); "
         "d.Add(\"a\", 1); "
         "var fe := d.Single(); "
-        "return fe.Key.Length; "),
-        "over a string-keyed Dictionary/SortedDictionary is not yet supported"));
+        "return fe.Key.Length; ")).exitCode,
+        1);
 }
