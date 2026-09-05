@@ -7,5 +7,5 @@
 
 module M; class C public static async method Work(): Task return; end Work; public static method Main(): int _ := Work(); return 0; end Main; end C;
 
-// CHECK: :{{[0-9]+}}:{{[0-9]+}}: cannot discard a `Task` — disposing it abandons a running operation; use `Task.FireAndForget(expr)` for supervised fire-and-forget, or `using var _ := expr;` to dispose it at scope end
+// CHECK: :{{[0-9]+}}:{{[0-9]+}}: cannot discard a `Task` — disposing it abandons a running operation; use `Task.FireAndForget(expr)` for supervised fire-and-forget, or a named `using var t := expr;` for the unsupervised scope-end drop
 // CHECK-SAME: (§17.13 / §30.10)

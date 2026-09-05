@@ -12757,6 +12757,37 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                         "`for var g in <seq>.GroupBy(...)`, or use a terminal "
                         "operator such as `.ToArray()`, `.Count()`, or `.Any()`");
         }
+        // fix #3835 / §17.13 "The anonymous owning binding `using var _`"
+        // (v0.288, axiom A6): the anonymous `using var _ := expr;` (and
+        // `await using var _ := expr;`, isAwaitUsing implies isUsing) over a
+        // Task-family initializer is rejected — nothing can await an unnamed
+        // binding, so it is the discard statement's same abandonment
+        // deferred to scope end. A bare (pre-substitution) type parameter is
+        // correctly NOT Task-shaped here, but NOT because of the `Kind` test:
+        // a generic parameter IS recorded as `TypeRef::Kind::Named` with a
+        // null declaration (TypeResolution_Names.cpp, "Generic parameter —
+        // record as a Named with no declaration"), so it passes that check.
+        // The exclusion comes from `isTaskShapedRef`'s `headName()` test --
+        // the parameter's own name (`T`) is neither "Task" nor "OwningTask"
+        // (K2.4 keying, matching the discard-statement check below). Only the ANONYMOUS spelling
+        // (`ld->name == "_"`, set only by the parser's `using var _`/
+        // `await using var _` production, Parser_Stmts.cpp) is rejected;
+        // a NAMED `using var t := expr;` remains the unsupervised idiom
+        // (§30.10) and is untouched by this check.
+        if (ld->isUsing && ld->name == "_" && ld->initializer) {
+            if (const TypeRef* it = ctx_.exprType(*ld->initializer)) {
+                if (isTaskShapedRef(it)) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, ld->initializer->span.begin,
+                        "cannot bind a `Task` to the anonymous `using var _` — "
+                        "nothing can await an unnamed binding, so this is the "
+                        "discard's abandonment deferred to scope end; use "
+                        "`Task.FireAndForget(expression)` for supervised "
+                        "fire-and-forget, or a named `using var t := expression;` "
+                        "for the unsupervised scope-end drop (§17.13 / §30.10)");
+                }
+            }
+        }
         if (currentScope_ && !ld->name.empty()) {
             auto* lsym = ctx_.makeSymbol<LocalSymbol>();
             lsym->name = ld->name;
@@ -15094,13 +15125,18 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
             // `_ := await t;` is unaffected; `Task.FireAndForget(...)` returns Unit
             // so its own discard stays legal. Reported before the generic reject so
             // the message is task-specific.
+            // fix #3835 / §17.13 (v0.288, axiom A6): the remedy used to offer
+            // `using var _ := expr;` — but that anonymous binding is now ALSO
+            // rejected for a Task-family value (nothing can await an unnamed
+            // binding, so it is the same abandonment one scope later). The
+            // remaining scope-end remedy is the NAMED form only.
             if (isTaskShapedRef(t)) {
                 ctx_.diagnostics().report(
                     Severity::Error, ds->value->span.begin,
                     "cannot discard a `Task` — disposing it abandons a running "
                     "operation; use `Task.FireAndForget(expr)` for supervised "
-                    "fire-and-forget, or `using var _ := expr;` to dispose it at "
-                    "scope end (§17.13 / §30.10)");
+                    "fire-and-forget, or a named `using var t := expr;` for the "
+                    "unsupervised scope-end drop (§17.13 / §30.10)");
             }
             bool reject = isEventSubscribeDrop(ds->value.get());
             if (reject) {

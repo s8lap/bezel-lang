@@ -300,7 +300,7 @@ BEZEL_TEST(async_lambda_scope_end_disposal_3728,
         "total=600 n=0\n");
 }
 
-// ── Row 9, ABANDONMENT via the task being dropped: `using var _ := f();`
+// ── Row 9, ABANDONMENT via the task being dropped: `using var t := f();`
 // dropped without an `await` is one of spec §30.1/§30.5's named abandonment
 // idioms ("The shapes that carry a live residual are the abandonment idioms
 // — `using var t := call();` dropped without an await, and
@@ -312,6 +312,12 @@ BEZEL_TEST(async_lambda_scope_end_disposal_3728,
 // later does with the returned Task handle: it fires when the RESUME
 // function itself falls off its own end, not when the caller touches the
 // Task. 200 * 1 = 200. // per §17.13, §28.10, §30.1, §30.5 (issue #3728)
+// NOTE (fix #3835, §17.13 v0.288, axiom A6): the binding is NAMED (`t`, unread)
+// rather than anonymous (`_`) — v0.288 made the anonymous `using var _` form
+// a compile error over a Task-family initializer (nothing can await an
+// unnamed binding, so it is the discard's abandonment deferred to scope end).
+// This row's own subject is the scope-end abandonment semantics, which the
+// named form exercises identically; only the anonymous SPELLING is banned.
 BEZEL_TEST(async_lambda_scope_end_disposal_3728,
            using_var_disposes_before_the_returned_task_is_abandoned_spec_30_5) {
     BEZEL_EXPECT_EQ(checkedOut(
@@ -321,7 +327,7 @@ BEZEL_TEST(async_lambda_scope_end_disposal_3728,
         "    var f := async lambda() => do "
         "      using var r := new Cell(1); "
         "    end; "
-        "    using var _ := f(); "
+        "    using var t := f(); "
         "    return 1; "
         "  end Run; "
         "  public static async method Main(): Task<int> "
