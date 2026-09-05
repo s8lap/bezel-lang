@@ -1,6 +1,6 @@
 # Bezel Guide 4: Concurrency — Tasks, Domains, and Channels
 
-*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.270.*
+*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.291.*
 
 The syntax here is mainstream async: `async` methods, `await`, tasks, cancellation tokens. The model underneath is not, and the habits that come with the syntax elsewhere will fight you. Four ideas carry the whole chapter. A **domain** runs one continuation at a time, so most code needs no locks (§1). A **task is a heap resource you own**, like every other class instance (§2). **No mutable state is ever reachable from two domains** — data crosses by ownership transfer or as immutable copies (§5). And fan-out defaults to a **structured scope**, not loose tasks (§4). If you skim everything else, read the three sections headed **How Bezel does it** and the table in §10.
 
@@ -55,14 +55,18 @@ The everyday shapes all discharge the obligation without ceremony:
 - `using var` pins a task you will await below;
 - `return await Producer();` chains it into your own task.
 
-What you may **not** do is silently drop one:
+What you may **not** do is silently drop one — by the discard, or by the anonymous binding that reads like a holder and is not one:
 
 ```bezel
-_ := DoTelemetryAsync();          // ERROR: a task's discard would skip its
-                                  //   continuation cleanup (spec §17.13, §30.10)
+_ := DoTelemetryAsync();            // ERROR: a task's discard would skip its
+                                    //   continuation cleanup (spec §17.13, §30.10)
+using var _ := DoTelemetryAsync();  // ERROR too (v0.288): nothing can await an
+                                    //   unnamed binding, so the form is the
+                                    //   discard's abandonment one scope later
+                                    //   (spec §17.13; `await using var _` alike)
 ```
 
-The two legal ways to *not* await a task (spec §30.10):
+The two legal ways to *not* await a task (spec §30.10) — and in the second it is the **name** that separates it from the rejection above, because a name is what a later `await` would need:
 
 ```bezel
 Task.FireAndForget(DoTelemetryAsync());   // supervised: runs to completion, exceptions logged
