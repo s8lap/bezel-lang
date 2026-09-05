@@ -16153,8 +16153,24 @@ bool MethodOwnership::builtinCollectionStoreCallee(const ast::Expr* callee) {
         cn = tt->headName();
     else
         cn = tt->importedName;
+    // narrow #3696 (spec §28.14 / stdlib §4.18, v0.286): `SortedSet` was the
+    // third built-in collection family absent from this disjunction — distinct
+    // from the two whitelists #3428 named (both fixed by #2773 (B1)) which
+    // gate §15.4 fresh-store warnings on a borrow-store collection receiver.
+    // This site is the §28.14 call-boundedness walk's sink (used by
+    // `callBoundedWalkExpr` / `processFanoutAdd`), not the §15.4 warning — so
+    // `SortedSet` here was deliberately NOT in scope for #3428, filed here
+    // separately. stdlib §4.18 gives `SortedSet<T>` the same borrowing-family
+    // value semantics as §4.17 (`SortedDictionary`, already in the list),
+    // making the omission a soundness gap rather than a design decision:
+    // `SortedSet<T>.Add(callBoundedSource)` through a reachable-beyond-call
+    // receiver was silently admitted where every other family rejects.
+    // `OwningSortedSet` is intentionally absent — stdlib §4.18 declares no
+    // owning twin (mirroring `SortedDictionary` / `Set` here, both of which
+    // are listed only by their borrowing names; owning collection `Add`
+    // takes OWNED (§28.8 transfer) and is gated by `builtinOwnedSinkArg`).
     return cn == "Array" || cn == "Dictionary" || cn == "SortedDictionary" ||
-           cn == "Set" || cn == "Stack" || cn == "Queue" ||
+           cn == "Set" || cn == "SortedSet" || cn == "Stack" || cn == "Queue" ||
            cn == "LinkedList" || cn == "OwningArray" ||
            cn == "OwningDictionary" || cn == "OwningSet" ||
            cn == "OwningStack" || cn == "OwningQueue" ||
