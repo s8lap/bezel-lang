@@ -386,6 +386,10 @@ void Resolver::run(const ast::SourceFile& src) {
     checkConstTypes();
     // Slice S32: enum member restrictions (§10.5).
     checkEnumRestrictions();
+    // §35.2 (v0.288, #3837): choice methods' dispatch-modifier restrictions
+    // (virtual/abstract always rejected; override admitted only on the
+    // Equals/GetHashCode/ToString trio, mirroring enums).
+    checkChoiceDispatchModifiers();
     // §14.2 (#746): contradictory generic constraints (e.g. class + value).
     checkGenericConstraintConsistency();
     // Slice S33: method body-presence rules (§12.5 / §11.2).

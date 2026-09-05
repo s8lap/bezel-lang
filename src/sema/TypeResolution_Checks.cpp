@@ -642,6 +642,29 @@ void Resolver::checkTypeMethodBodies(TypeSymbol* t) {
     }
 }
 
+// §10.5 / §35.2 (v0.288, #3837): true iff `ms` is one of the three
+// `Object`-virtual members whose replacement §10.5 admits spelling with
+// `override` — `Equals` (arity 1: the co-declared `Equals(T)` §25.2
+// requires; whether `override` reaches `Equals(Object?)` as a distinct
+// declaration follows the record rule and is explicitly left open by
+// #3837, so both arity-1 spellings are admitted alike here), `GetHashCode`
+// (arity 0), and `ToString` (arity 0). Matched by name and arity, not
+// exact parameter type — the same discipline checkEqualityCoDeclaration
+// below already uses to recognize the co-declared `Equals`/`GetHashCode`
+// pair (#1338/#3333). Not reused directly from there: that check's
+// membership test omits `ToString` (outside the co-declaration
+// obligation) and is inlined into a loop with a different shape, so
+// sharing it would mean threading a "which members" parameter through an
+// unrelated loop for one caller — a new, narrower predicate is the
+// smaller change.
+static bool isObjectVirtualReplacementMember(const MethodSymbol* ms) {
+    if (!ms || ms->isOperator) return false;
+    if (ms->name == "GetHashCode" || ms->name == "ToString")
+        return ms->params.empty();
+    if (ms->name == "Equals") return ms->params.size() == 1;
+    return false;
+}
+
 void Resolver::checkEnumRestrictions() {
     if (!ctx_.module()) return;
     // fix #3601 (§10.4 / §10.5 / §11.6, v0.286): the two module-children-only
@@ -735,8 +758,30 @@ void Resolver::checkEnumRestrictions() {
                 continue;
             }
             if (auto* ms = dynamic_cast<MethodSymbol*>(m)) {
+                // fix #3837 (§10.5, v0.288): `override` is admitted on
+                // exactly the `Object`-virtual replacement trio — every
+                // other use of `override`, and `virtual`/`abstract`
+                // regardless of name, are still rejected below.
+                //
+                // narrow #3837 (§10.5 verbatim, v0.293): "Enum methods may
+                // not be declared `virtual`, `abstract`, or `sealed
+                // override`" — `sealed override` is named as its OWN
+                // rejected compound, distinct from plain `override`, and is
+                // never admitted here even on the trio (§11.5 Modifier order:
+                //  `sealed override` seals a previously-virtual member
+                // against further overriding — meaningless on a statically-
+                // dispatched enum method, trio or not). The `hasMod(ms,
+                // "sealed")` guard below disqualifies admission rather than
+                // adding an unconditional top-level reject: `sealed` alone
+                // (no `override`) is a different, already-rejected shape
+                // (checkTypeStaticNotVirtual's "may not be `sealed` on its
+                // own" check, ~line 583) and gating it here too would
+                // double-report that case.
+                bool overrideAdmitted = hasMod(ms, "override") &&
+                    !hasMod(ms, "sealed") &&
+                    isObjectVirtualReplacementMember(ms);
                 if (hasMod(ms, "virtual") || hasMod(ms, "abstract") ||
-                    hasMod(ms, "override")) {
+                    (hasMod(ms, "override") && !overrideAdmitted)) {
                     ctx_.diagnostics().report(
                         Severity::Error, m->declLoc,
                         std::string("enum method `") +
@@ -820,6 +865,54 @@ void Resolver::checkEnumRestrictions() {
                             "underlying type's range)");
                 }
                 running = val + 1;
+            }
+        }
+    });
+}
+
+// §35.2 (v0.288, #3837): "Choice methods are statically dispatched; `virtual`
+// and `abstract` are rejected as on enums (§10.5), `override` is admitted
+// exactly where §10.5 admits it — the `Object`-virtual surface, spelled
+// `override` or plain — and §10.5's `Equals`/`GetHashCode`/`ToString`
+// replacement rule carries over for the boxable classifications." Before
+// this fix, NOTHING rejected `virtual`/`abstract`/`override` on a choice
+// method at all — MEASURED: a choice declaring `public virtual method
+// Area(): double => …;` compiled with zero diagnostics on pre-fix HEAD,
+// because checkEnumRestrictions (above) is gated to `TypeDeclKind::Enum`
+// only and the general base-class override-match walk
+// (checkHidingAndOverride) never populates `baseMembers` for a choice — a
+// choice's `baseTypes` holds only `Interface`-kind entries, never `Class`,
+// so that walk's frontier is empty and it early-outs. This is therefore a
+// NEW check, not a widening of an existing one; it deliberately mirrors
+// only checkEnumRestrictions's dispatch-modifier sub-check, not its other
+// enum-only restrictions (instance fields / constructors / nested types /
+// indexers) — those choice-side admissible-kind gaps are a separate,
+// pre-existing defect, out of this fix's scope (issue #3869).
+void Resolver::checkChoiceDispatchModifiers() {
+    if (!ctx_.module()) return;
+    forEachTypeAndNested([&](TypeSymbol* t) {
+        if (t->kind != ast::TypeDeclKind::Choice) return;
+        for (Symbol* m : t->members) {
+            auto* ms = dynamic_cast<MethodSymbol*>(m);
+            if (!ms) continue;
+            // narrow #3837 (§35.2, v0.293): §35.2 carries §10.5's rejection
+            // set over "as on enums", and §10.5 names `sealed override` as
+            // its OWN rejected compound, distinct from plain `override` —
+            // never admitted here even on the trio. See the matching
+            // `sealed` guard in checkEnumRestrictions above for the reason
+            // this disqualifies admission rather than adding an
+            // unconditional top-level reject (avoids double-reporting bare
+            // `sealed`, already caught by checkTypeStaticNotVirtual).
+            bool overrideAdmitted = hasMod(ms, "override") &&
+                !hasMod(ms, "sealed") &&
+                isObjectVirtualReplacementMember(ms);
+            if (hasMod(ms, "virtual") || hasMod(ms, "abstract") ||
+                (hasMod(ms, "override") && !overrideAdmitted)) {
+                ctx_.diagnostics().report(
+                    Severity::Error, m->declLoc,
+                    std::string("choice method `") + std::string(ms->name) +
+                    "` may not be virtual, abstract, or override "
+                    "— choices dispatch statically (§35.2)");
             }
         }
     });
@@ -2414,12 +2507,14 @@ void Resolver::checkEqualsHashCodePairing() {
 // §25.2 (v0.158, #1338; enum spelling corrected v0.183, #1381/#1582; choices
 // added v0.276, #3333): "A record, enum, or choice that overloads `=`/`<>`
 // with both operands of the declaring type must also declare `Equals(T)` and
-// — on a record, `override GetHashCode`; on an enum, a plain `GetHashCode(): int`,
-// since enum members never carry `override` (§10.5); on a choice, the enum
-// spelling, §35.2 carrying §10.5's plain-member replacement rule over — the
-// same discipline, and the same diagnostic style, as §8.3's Equals→GetHashCode
-// pairing." The three surfaces (`=`, `Equals`, hashing) can otherwise silently
-// diverge exactly where it hurts: `a = b` true while a `Set<T>` treats them as
+// — on a record, `override GetHashCode`; on an enum, a plain `GetHashCode(): int`
+// (§10.5, v0.288, #3837: `override` is ALSO admitted on an enum's/choice's
+// `GetHashCode` now, but the plain spelling remains fully sufficient here and
+// is what this diagnostic recommends); on a choice, the enum spelling, §35.2
+// carrying §10.5's plain-member replacement rule over — the same discipline,
+// and the same diagnostic style, as §8.3's Equals→GetHashCode pairing." The
+// three surfaces (`=`, `Equals`, hashing) can otherwise silently diverge
+// exactly where it hurts: `a = b` true while a `Set<T>` treats them as
 // distinct. Heterogeneous-operand overloads (`T = U`) carry no such obligation.
 //
 // Per v0.275/v0.276: there is no exemption for compiler-intrinsic types.
@@ -2431,12 +2526,16 @@ void Resolver::checkEqualsHashCodePairing() {
 // the type's name — a user type named `IntPtr` is subject to the same rule.
 //
 // v0.183 fix: the diagnostic text below previously said `` `override
-// GetHashCode` `` unconditionally, including for enums — but §10.5 REJECTS
-// `override` on any enum method, so an enum author following that diagnostic
-// literally hit a second compile error. The message now spells the requirement
-// the way each `t->kind` actually accepts it. v0.276 widens the kind set to
-// choices and uses the enum spelling on them (§35.2 carries §10.5's plain-
-// member replacement rule over to choices).
+// GetHashCode` `` unconditionally, including for enums — but §10.5 (pre-v0.288)
+// REJECTED `override` on any enum method, so an enum author following that
+// diagnostic literally hit a second compile error. The message now spells the
+// requirement the way each `t->kind` actually accepts it. v0.276 widens the
+// kind set to choices and uses the enum spelling on them (§35.2 carries
+// §10.5's plain-member replacement rule over to choices). v0.288 (#3837) then
+// admitted `override` on this same trio for enums/choices too (checkEnumRestrictions
+// / checkChoiceDispatchModifiers) — that widened what the AUTHOR may write,
+// not what this diagnostic RECOMMENDS: the plain spelling is still legal and
+// still the simpler answer, so the message is unchanged.
 //
 // #3333 dependency note: §35.2 carries the rule over "for the boxable
 // classifications"; an owning choice's ability to declare `Equals(T)`/
@@ -2486,10 +2585,12 @@ void Resolver::checkEqualityCoDeclaration() {
             }
         }
         if (homoOp && !(hasEquals && hasGetHashCode)) {
-            // §10.5 + §35.2: enum and choice members never carry `override` —
-            // a plain `GetHashCode(): int` is the only spelling both kinds
-            // accept (v0.183 fix for enums, #1381/#1582; v0.276 widening for
-            // choices, #3333).
+            // §10.5 + §35.2: a plain `GetHashCode(): int` is always an
+            // accepted spelling on an enum/choice (v0.183 fix for enums,
+            // #1381/#1582; v0.276 widening for choices, #3333) — v0.288
+            // (#3837) additionally admits `override` on this same member,
+            // but the plain form recommended below remains sufficient, so
+            // the message is unchanged.
             bool isRecord = t->kind == ast::TypeDeclKind::Record;
             std::string kind =
                 isRecord ? "a record" :

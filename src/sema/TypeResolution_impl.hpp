@@ -307,9 +307,22 @@ private:
 
     // Slice S32 (§10.5): an enum may not declare instance fields,
     // constructors, nested types, or indexers, and its methods may not
-    // be virtual / abstract / override / sealed override. Static
-    // fields and static methods are permitted (§10.4).
+    // be virtual / abstract / sealed override. `override` is admitted
+    // only on the `Object`-virtual replacement trio — `Equals`,
+    // `GetHashCode`, `ToString` (§10.5, v0.288, #3837) — and rejected on
+    // every other method. Static fields and static methods are
+    // permitted (§10.4).
     void checkEnumRestrictions();
+
+    // §35.2 (v0.288, #3837): a choice body's methods are statically
+    // dispatched exactly as an enum's are — `virtual`/`abstract`/`sealed
+    // override` are rejected outright, and `override` is admitted only on
+    // the same `Object`-virtual replacement trio §10.5 admits it on
+    // (`Equals`, `GetHashCode`, `ToString`). Unlike checkEnumRestrictions,
+    // this does not police choice member KINDS (fields/constructors/nested
+    // types) — that admissible-kind enforcement for choices is a separate,
+    // pre-existing gap (issue filed) out of this fix's scope.
+    void checkChoiceDispatchModifiers();
 
     // §14.2 (#746): a type parameter may not carry contradictory constraints
     // (e.g. both `class` and `value`). Checked once per generic declaration

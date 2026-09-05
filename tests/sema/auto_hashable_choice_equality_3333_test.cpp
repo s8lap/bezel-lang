@@ -105,9 +105,12 @@ BEZEL_TEST(auto_hashable_choice_equality_3333,
 // since §35.2 carries §10.5's plain-member replacement rule over to
 // choices. The v0.183 fix at TypeResolution_Checks.cpp's enum arm set
 // this precedent; the v0.276 widening (fix #3333) extends the same
-// spelling to choices. Telling a choice author to write `override
-// GetHashCode` sends them straight into a second, unrelated compile error
-// (the same defect class as #1381/#1582 for enums).
+// spelling to choices. At v0.276 this was required to avoid a second,
+// unrelated compile error (the same defect class as #1381/#1582 for enums):
+// `override` was rejected outright on any choice method. v0.288/#3837 later
+// ADMITS `override` on a choice's `Equals`/`GetHashCode`/`ToString` too, but
+// the plain spelling recommended below remains fully sufficient, so this
+// message — and this test — are unaffected.
 BEZEL_TEST(auto_hashable_choice_equality_3333,
            codecl_choice_message_says_plain_gethashcode_spec_25_2_v0_276) {
     auto r = semaAll(

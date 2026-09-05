@@ -10,8 +10,11 @@
 //  - §25.2 (v0.158, enum spelling corrected v0.183 #1381/#1582) co-declaration
 //    rule — a record/enum overloading `=`/`<>` with both operands the
 //    declaring type must also declare `Equals(T)` and — on a record,
-//    `override GetHashCode`; on an enum, a plain `GetHashCode` (§10.5: enum
-//    members never carry `override`).
+//    `override GetHashCode`; on an enum, a plain `GetHashCode` (§10.5, v0.183:
+//    the plain spelling is always sufficient here; v0.288/#3837 additionally
+//    ADMITS `override` on an enum's `Equals`/`GetHashCode`/`ToString`, but
+//    that widens what the AUTHOR may write, not what this diagnostic
+//    recommends, so the tests below are unaffected).
 //  - §3.6 / §8.3 (v0.158) hashable — a `Dictionary<K,V>` key and a
 //    `Set<T>` element must be hashable; enforced at the instantiation
 //    site (§3.6 rule 2).
@@ -259,11 +262,14 @@ BEZEL_TEST(equality_v0158, codecl_enum_missing_pair_rejected_spec_25_2) {
 }
 
 // §25.2 (v0.183, #1381/#1582): on an enum, the co-declaration diagnostic must
-// instruct a PLAIN `GetHashCode`, not `override GetHashCode` — §10.5 rejects
-// `override` on any enum method (enums dispatch statically, no override
-// chain), so telling an enum author to write `override GetHashCode` sends
-// them straight into a second, unrelated compile error. Before the v0.183 fix
-// this message hardcoded "override GetHashCode" for every `t->kind`.
+// instruct a PLAIN `GetHashCode`, not `override GetHashCode`. At v0.183 this
+// was required — §10.5 rejected `override` on any enum method outright, so
+// the `override` spelling sent an author straight into a second, unrelated
+// compile error. v0.288/#3837 later ADMITS `override` here too (both
+// spellings now declare the same member), but the plain spelling recommended
+// below remains fully sufficient, so this message — and this test — are
+// unaffected. Before the v0.183 fix this message hardcoded "override
+// GetHashCode" for every `t->kind`.
 BEZEL_TEST(equality_v0158,
            codecl_enum_message_says_plain_gethashcode_spec_25_2_v0_183) {
     auto r = parseSema(
@@ -278,8 +284,10 @@ BEZEL_TEST(equality_v0158,
             continue;
         // Must name the enum's own spelling ...
         sawPlainSpelling = d.message.find("`GetHashCode`") != std::string::npos;
-        // ... and must NOT tell the author to write `override GetHashCode`,
-        // which §10.5 would then reject.
+        // ... and must NOT tell the author to write `override GetHashCode` —
+        // the plain spelling is the simpler, always-sufficient answer (the
+        // message is unaffected by v0.288/#3837 additionally admitting
+        // `override` here too).
         BEZEL_EXPECT_TRUE(
             d.message.find("override GetHashCode") == std::string::npos);
     }
