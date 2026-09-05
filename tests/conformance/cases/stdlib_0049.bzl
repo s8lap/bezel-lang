@@ -1,5 +1,7 @@
-public class OwningArray<T>: IOwningList<T>, IOwningEnumerable<T> where T: class
+public class OwningArray<T>: IOwningList<T>, IOwningEnumerable<T>, IOwningCollectionLiteralTarget<OwningArray<T>, T> where T: class
                                      // IOwningEnumerable: stated v0.195 — §4.13/spec §29.2's both-implemented rule presupposed it
+  public static method FromCollectionLiteral(owned elements: OwningArray<T>): owned OwningArray<T>;   // §2.19 witness: the
+                                                                                                        //   transferred array is the result
   public constructor();
   public constructor(capacity: int);
 

@@ -1,4 +1,5 @@
-public class LinkedList<T>: ICollection<T>
+public class LinkedList<T>: ICollection<T>, ICollectionLiteralTarget<LinkedList<T>, T>
+  public static method FromCollectionLiteral(elements: ReadOnlyArraySpan<T>): owned LinkedList<T>;   // §2.19 witness (spec §15.4)
   public constructor();
   public constructor(source: IEnumerable<T>);
 

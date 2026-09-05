@@ -1,6 +1,6 @@
 # Bezel Standard Library Specification
 
-**Companion to the Bezel Language Specification, v0.293 — September 2026**
+**Companion to the Bezel Language Specification, v0.294 — September 2026**
 
 This document specifies the standard library types referenced by the language specification. The language spec assumes these types exist and have certain shapes; this document defines those shapes.
 
@@ -729,7 +729,7 @@ end Point;
 
 (A positional record may add a body to supply method implementations; the positional parameters remain the auto-generated readonly properties of [§9.1](Bezel_Language_Spec.md#sec-positional-records).) Composition works through the same interface: a containing type's `Serialize` calls each serializable component's `Serialize`, passing the same `ISerializer` through. A serializable collection writes `BeginArray`, each element's `Serialize`, `EndArray`.
 
-**Why `IDeserializable` has no method in this version.** Serialization is an *instance* operation (an existing value writes itself); deserialization is a *static* one (a format reader produces a new value — there is no instance yet). A static entry point could not be expressed as an interface method until static interface members existed (added in v0.176 — language spec [§11.8](Bezel_Language_Spec.md#sec-static-interface-members)); this by-name protocol predates them. Rather than block deserialization on that keystone, v0.114 recognizes the deserialization entry point **by name**, exactly as the user-defined collection-literal protocol recognizes `FromCollectionLiteral` ([§15.4.1](Bezel_Language_Spec.md#sec-the-user-defined-sequence-literal-protocol) of the language spec): a type that declares `: IDeserializable` and provides a static method of the shape
+**Why `IDeserializable` has no method in this version.** Serialization is an *instance* operation (an existing value writes itself); deserialization is a *static* one (a format reader produces a new value — there is no instance yet). A static entry point could not be expressed as an interface method until static interface members existed (added in v0.176 — language spec [§11.8](Bezel_Language_Spec.md#sec-static-interface-members)); this by-name protocol predates them. Rather than block deserialization on that keystone, v0.114 recognizes the deserialization entry point **by name**, as the user-defined collection-literal protocol recognized `FromCollectionLiteral` before its promotion to the [§2.19](#sec-static-abstractions) target pair (language spec [§15.4.1](Bezel_Language_Spec.md#sec-the-user-defined-sequence-literal-protocol)): a type that declares `: IDeserializable` and provides a static method of the shape
 
 ```bezel
 public static method Deserialize(d: IDeserializer): T;          // value-type
@@ -744,7 +744,7 @@ public static method Deserialize(d: IDeserializer): owned Shared<C>;  // co-owne
 // T = the declaring type; C = the declaring shared-node class; both written concretely.
 ```
 
-is deserializable. The recognized factory's return type is the declaring type itself, written concretely. The `owned` modifier appears exactly when the declaring type is a class (a class instance is an owned heap value transferred to the caller — language spec [§28.8](Bezel_Language_Spec.md#sec-ownership-transfer)); for a value-type target (a record, enum, or value-like choice — the synthesis-eligible common case, language spec [§9.8](Bezel_Language_Spec.md#sec-choice-serialization) admitting choices on the same terms as records and enums) the return is a plain by-value `T` with no `owned` modifier, because `owned` on a record, enum, or choice return is a compile error (language spec [§28.1](Bezel_Language_Spec.md#sec-where-the-owned-modifier-can-appear)'s type requirement — the modifier admits class types, interface types, and bare type parameters, and is admitted-but-redundant on move-only value types). A class that is itself a *shared node* in its own serialized graph uses the `owned Shared<C>` form — it participates by identity and round-trips as a co-owned handle, and `Shared<C>` is a class so the `owned` modifier applies; the choice is locally decidable — a class that merely *holds* `Shared<T>`/`Weak<T>` fields returns `owned C`, a class that *is* the shared node returns `owned Shared<C>` (language spec [§9.8](Bezel_Language_Spec.md#sec-serialization-synthesis), rationale [§5.22](Bezel_Design_Rationale.md#sec-type-driven-serialization)). Bezel has no `Self` type (that feature is separately deferred), so the return type is spelled with the concrete type name. `IDeserializable` is a *marker* whose presence says "this type provides the recognized `Deserialize` factory," in the same way `: IEquatable<T>` opts a record into synthesized equality without the user writing the comparison. The hand-written form today, for the record (value-type) case:
+is deserializable. The recognized factory's return type is the declaring type itself, written concretely. The `owned` modifier appears exactly when the declaring type is a class (a class instance is an owned heap value transferred to the caller — language spec [§28.8](Bezel_Language_Spec.md#sec-ownership-transfer)); for a value-type target (a record, enum, or value-like choice — the synthesis-eligible common case, language spec [§9.8](Bezel_Language_Spec.md#sec-choice-serialization) admitting choices on the same terms as records and enums) the return is a plain by-value `T` with no `owned` modifier, because `owned` on a record, enum, or choice return is a compile error (language spec [§28.1](Bezel_Language_Spec.md#sec-where-the-owned-modifier-can-appear)'s type requirement — the modifier admits class types, interface types, and bare type parameters, and is admitted-but-redundant on move-only value types). A class that is itself a *shared node* in its own serialized graph uses the `owned Shared<C>` form — it participates by identity and round-trips as a co-owned handle, and `Shared<C>` is a class so the `owned` modifier applies; the choice is locally decidable — a class that merely *holds* `Shared<T>`/`Weak<T>` fields returns `owned C`, a class that *is* the shared node returns `owned Shared<C>` (language spec [§9.8](Bezel_Language_Spec.md#sec-serialization-synthesis), rationale [§5.22](Bezel_Design_Rationale.md#sec-type-driven-serialization)). Bezel has no `Self` type (a self-type keyword is declined — spec §11.8; proposals `DECLINED.md`), so the return type is spelled with the concrete type name. `IDeserializable` is a *marker* whose presence says "this type provides the recognized `Deserialize` factory," in the same way `: IEquatable<T>` opts a record into synthesized equality without the user writing the comparison. The hand-written form today, for the record (value-type) case:
 
 ```bezel
 public record Point(X: int, Y: int): ISerializable, IDeserializable
@@ -766,7 +766,7 @@ public record Point(X: int, Y: int): ISerializable, IDeserializable
 end Point;
 ```
 
-Were a `Self`-return type ever added (the separately-deferred feature this section names above — static interface members themselves exist since v0.176, spec §11.8), `Deserialize` could be promoted to an actual `IDeserializable` interface method with the identical name and signature, without breaking any code — the name and shape were chosen now to be promotable, the same forward-compatibility discipline applied to `FromCollectionLiteral`.
+Promoting `Deserialize` to a static interface member is a recorded follow-up (spec §11.8; #1507): it takes the type-parameter form of spec §11.8 — a self-type keyword is declined (proposals `DECLINED.md`) — with the member's name and signature unchanged and the conformance declaration becoming `: IDeserializable<T>`; the same discipline promoted `FromCollectionLiteral` ([§2.19](#sec-static-abstractions)).
 
 **Synthesis (v0.116) and what remains.** A record or enum that declares `: ISerializable` and/or `: IDeserializable` and satisfies the synthesis-eligibility rule has the bodies **generated by the compiler** — the hand-written forms above are unnecessary for the common case. The rule, the recursive component check, and the generated-body semantics are defined in language spec [§9.8](Bezel_Language_Spec.md#sec-serialization-synthesis); the design mirrors the existing auto-equality synthesis ([§9.2](Bezel_Language_Spec.md#sec-body-records)). The hand-written `Point` above becomes simply:
 
@@ -1112,9 +1112,9 @@ Auto-imported. String interpolation dispatches a hole's format spec here (langua
 **Temporal patterns: non-specifier characters are literals (v0.230).** In a temporal pattern (`DateTime`, `DateOnly`, `TimeOnly`), every character that does not begin one of the specifiers above is a **literal**, copied to the output verbatim — `T`, `Z`, `-`, `:`, space, and any other non-specifier character alike; the unrecognized-specifier fault governs malformed runs of the specifier letters (`y` `M` `d` `H` `m` `s` `f`), not literal characters. The temporal specifier vocabulary grows only by recorded ruling, and never in a way that reinterprets a character that passes through as a literal — a new specifier letter would be a breaking change for every pattern using it as a literal, and this section's default answer to such a proposal is no.
 
 <a id="sec-static-abstractions"></a>
-### 2.19 `INumber<T>`, `ISteppable<T>`, `IParsable<T>` (v0.176, #807)
+### 2.19 `INumber<T>`, `ISteppable<T>`, `IParsable<T>`, and the collection-literal target pair (v0.176, #807)
 
-The static-interface abstractions (language spec [§11.8](Bezel_Language_Spec.md#sec-static-interface-members)). The primitive numeric tower and `char` conform via compiler-provided conformances; user types conform by declaring and supplying the statics.
+The static-interface abstractions (language spec [§11.8](Bezel_Language_Spec.md#sec-static-interface-members)). The primitive numeric tower and `char` conform to the first three via compiler-provided conformances; user types conform by declaring and supplying the statics. The collection-literal target pair at the end of this section is conformed to by declaration only — by the ten built-in sequence collections in their own declarations ([§4.3](#sec-how-the-borrowing-and-owning-hierarchies-relate)) and by user classes.
 
 ```bezel
 public interface INumber<T> where T: INumber<T>
@@ -1140,7 +1140,22 @@ end IParsable;
 
 Conformances: `byte`, `sbyte`, `short`, `ushort`, `int`, `uint`, `long`, `ulong`, `float`, `double`, `decimal` conform to all three; `char` to `ISteppable<char>` and `IParsable<char>`. (`Range<T>` admits only the integer conformers and `char`: conformance is necessary, not sufficient, there — [§9.8](#sec-ranget), language spec §16.3, v0.292.) `string` conforms to none (concatenation is not addition; parsing a string to a string is meaningless), and `bool` conforms to none — deliberately (v0.222, #1792): its `Parse`/`TryParse` ([§9.4](#sec-boolean)) are plain static members, not witnesses; the constraint's clients are generic scalar-parsing paths, a caller that means bool spells `bool.TryParse` directly, and a later admission would be a compatible widening if a use case arrives. `Parse` is witnessed by the existing per-type members unchanged — for `char`, the one-code-point members of [§9.5](#sec-char) (v0.222). For `TryParse`, the per-type members keep their non-nullable value-typed outs (the shape-(c) convention, [§1](#sec-conventions)); the **compiler-provided conformance bridges the out-nullability difference**, so `T.TryParse(s, out using var v)` **through the constraint** has the declared `out owned value: T?` shape (the marker erased at value substitutions, language spec [§28.1](Bezel_Language_Spec.md#sec-where-the-owned-modifier-can-appear)) while a **direct** call keeps `out result: T` (language spec [§11.8](Bezel_Language_Spec.md#sec-static-interface-members)).
 
-**Producer markers (v0.196).** Every §2.19 member that produces a value spells the production: `owned` returns on `Zero`, `One`, the four arithmetic operators, `Step`, and `Parse`, and the `out owned` slot on `TryParse` — arithmetic mints a *new* number, never one of its operands, so at a class or interface conformer each witness transfers a fresh value on every path (language spec [§28.8](Bezel_Language_Spec.md#sec-ownership-transfer)), which is what makes the [§11.8](Bezel_Language_Spec.md#sec-static-interface-members) `Sum<T>` accumulator sound there (each iteration's displaced total is disposed by drop-on-overwrite, language spec [§28.7](Bezel_Language_Spec.md#sec-reassigning-owned-fields)). The `<` operators return `bool` and carry no marker, and the free selectors `Math.Min`/`Max`/`Clamp` ([§2.2](#sec-math)) deliberately keep their bare-`T` borrow signatures — a selector transfers nothing. At every **value or runtime-managed** conformer the markers are erased by the substitution (language spec [§28.1](Bezel_Language_Spec.md#sec-where-the-owned-modifier-can-appear)): the primitive tower's intrinsic witnesses and any user record or enum conformer are declared — and remain — unmarked, matching the erased signatures exactly; only class and interface conformers spell the markers.
+**Producer markers (v0.196).** Every §2.19 member that produces a value spells the production: `owned` returns on `Zero`, `One`, the four arithmetic operators, `Step`, `Parse`, and both `FromCollectionLiteral` members, and the `out owned` slot on `TryParse` — arithmetic mints a *new* number, never one of its operands, so at a class or interface conformer each witness transfers a fresh value on every path (language spec [§28.8](Bezel_Language_Spec.md#sec-ownership-transfer)), which is what makes the [§11.8](Bezel_Language_Spec.md#sec-static-interface-members) `Sum<T>` accumulator sound there (each iteration's displaced total is disposed by drop-on-overwrite, language spec [§28.7](Bezel_Language_Spec.md#sec-reassigning-owned-fields)). The `<` operators return `bool` and carry no marker, and the free selectors `Math.Min`/`Max`/`Clamp` ([§2.2](#sec-math)) deliberately keep their bare-`T` borrow signatures — a selector transfers nothing. At every **value or runtime-managed** conformer the markers are erased by the substitution (language spec [§28.1](Bezel_Language_Spec.md#sec-where-the-owned-modifier-can-appear)): the primitive tower's intrinsic witnesses and any user record or enum conformer are declared — and remain — unmarked, matching the erased signatures exactly; only class and interface conformers spell the markers.
+
+**The collection-literal target pair.** The two static interfaces behind the sequence-literal protocol (language spec [§15.4.1](Bezel_Language_Spec.md#sec-the-user-defined-sequence-literal-protocol)): a target conforms at `TSelf` = itself and supplies the one factory; exactly one of the two per class, declared on the class itself. The ten built-in sequence collections declare the conformance and list the factory in their own sections ([§4.3](#sec-how-the-borrowing-and-owning-hierarchies-relate)). Neither interface is variant (language spec [§11.8](Bezel_Language_Spec.md#sec-static-interface-members), consequence 2).
+
+```bezel
+public interface ICollectionLiteralTarget<TSelf, T>
+    where TSelf: ICollectionLiteralTarget<TSelf, T>
+  static method FromCollectionLiteral(elements: ReadOnlyArraySpan<T>): owned TSelf;   // the borrowing form: elements
+end ICollectionLiteralTarget;                                                           //   are borrows (§4.15 view)
+
+public interface IOwningCollectionLiteralTarget<TSelf, T>
+    where TSelf: IOwningCollectionLiteralTarget<TSelf, T>
+    where T: class
+  static method FromCollectionLiteral(owned elements: OwningArray<T>): owned TSelf;   // the owning form: the factory
+end IOwningCollectionLiteralTarget;                                                    //   drains the array (§4.5)
+```
 
 <a id="sec-result"></a>
 ### 2.20 `Result<T, E>` (v0.200)
@@ -1529,7 +1544,7 @@ The `where T: class` constraint expresses that owning collections are meaningful
 <a id="sec-how-the-borrowing-and-owning-hierarchies-relate"></a>
 ### 4.3 How the borrowing and owning hierarchies relate
 
-The two hierarchies share `IEnumerable<T>`, `IReadOnlyCollection<T>`, and `IReadOnlyList<T>` as common ancestors. A function that wants to read elements without taking ownership accepts one of these interfaces; both borrowing and owning collections of T conform.
+The two hierarchies share `IEnumerable<T>`, `IReadOnlyCollection<T>`, and `IReadOnlyList<T>` as common ancestors. A function that wants to read elements without taking ownership accepts one of these interfaces; both borrowing and owning collections of T conform. The sequence collections are also collection-literal targets, and each **declares** it (language spec [§15.4.1](Bezel_Language_Spec.md#sec-the-user-defined-sequence-literal-protocol); the pair is at [§2.19](#sec-static-abstractions)): each conforms at itself — `Array<T>`, `LinkedList<T>`, `Set<T>`, `Stack<T>`, and `Queue<T>` to `ICollectionLiteralTarget` (`Array<T>` to `ICollectionLiteralTarget<Array<T>, T>`, and so on), and `OwningArray<T>`, `OwningLinkedList<T>`, `OwningSet<T>`, `OwningStack<T>`, and `OwningQueue<T>` to `IOwningCollectionLiteralTarget` (`OwningArray<T>` to `IOwningCollectionLiteralTarget<OwningArray<T>, T>`, and so on) — the conformance is in each class's declaration below and the factory is a listed member of each, whose body is the literal's own lowering (language spec [§15.4](Bezel_Language_Spec.md#sec-collection-literals)). Language spec §15.4's target list is derived from these declarations. The dictionaries take the dictionary-literal form only and conform to neither.
 
 ```bezel
 public method ReportEach<T>(items: IReadOnlyList<T>) where T: class
@@ -1554,7 +1569,9 @@ Every collection's element semantics — what `Add`, `Remove`, `Clear`, the inde
 Borrowing resizable array. Stores references that the caller continues to own (or value-typed elements directly).
 
 ```bezel
-public class Array<T>: IList<T>
+public class Array<T>: IList<T>, ICollectionLiteralTarget<Array<T>, T>
+  public static method FromCollectionLiteral(elements: ReadOnlyArraySpan<T>): owned Array<T>;   // §2.19 witness; the literal's
+                                                                                                //   own lowering (spec §15.4)
   public constructor();
   public constructor(capacity: int);                     // empty (Count = 0), storage reserved;
                                                           //   capacity < 0: ArgumentOutOfRangeException (v0.183, #1396)
@@ -1641,8 +1658,10 @@ A collection literal `[1, 2, 3]` constructs an `Array<T>` when the target type i
 Owning resizable array. Owns its elements; disposal cascades through them.
 
 ```bezel
-public class OwningArray<T>: IOwningList<T>, IOwningEnumerable<T> where T: class
+public class OwningArray<T>: IOwningList<T>, IOwningEnumerable<T>, IOwningCollectionLiteralTarget<OwningArray<T>, T> where T: class
                                      // IOwningEnumerable: stated v0.195 — §4.13/spec §29.2's both-implemented rule presupposed it
+  public static method FromCollectionLiteral(owned elements: OwningArray<T>): owned OwningArray<T>;   // §2.19 witness: the
+                                                                                                        //   transferred array is the result
   public constructor();
   public constructor(capacity: int);
 
@@ -1720,13 +1739,17 @@ end Build;
 `OwningArray<T>` composes over `OwningBuffer<T>` ([§4.14](#sec-owned-buffers-and-spans)) in pure Bezel; the standard library provides this implementation directly, and user code is welcome to inspect or extend it.
 
 ```bezel
-public class OwningArray<T>: IOwningList<T>, IOwningEnumerable<T> where T: class
+public class OwningArray<T>: IOwningList<T>, IOwningEnumerable<T>, IOwningCollectionLiteralTarget<OwningArray<T>, T> where T: class
   private owned _storage: OwningBuffer<T>;
   private _count: int := 0;
 
   public constructor()
     this(8);
   end constructor;
+
+  public static method FromCollectionLiteral(owned elements: OwningArray<T>): owned OwningArray<T>
+    return elements;                                   // the literal's temporary is the result (spec §15.4.1, owning form)
+  end FromCollectionLiteral;
 
   public constructor(capacity: int)
     if capacity < 0 then
@@ -1835,7 +1858,8 @@ The implementation example above omits some methods for brevity; the production 
 Borrowing doubly-linked list. Use when frequent insertion/removal in the middle is required. (The name `List<T>` is reserved and unused: it commonly denotes a dynamic array — which `Array<T>` is here — so a linked structure under that name would mislead; `LinkedList<T>` makes the linked representation an explicit choice.)
 
 ```bezel
-public class LinkedList<T>: ICollection<T>
+public class LinkedList<T>: ICollection<T>, ICollectionLiteralTarget<LinkedList<T>, T>
+  public static method FromCollectionLiteral(elements: ReadOnlyArraySpan<T>): owned LinkedList<T>;   // §2.19 witness (spec §15.4)
   public constructor();
   public constructor(source: IEnumerable<T>);
 
@@ -1876,7 +1900,8 @@ A `LinkedList<T>` may be constructed with a sequence literal (language spec [§1
 Owning doubly-linked list.
 
 ```bezel
-public class OwningLinkedList<T>: IOwningCollection<T> where T: class
+public class OwningLinkedList<T>: IOwningCollection<T>, IOwningCollectionLiteralTarget<OwningLinkedList<T>, T> where T: class
+  public static method FromCollectionLiteral(owned elements: OwningArray<T>): owned OwningLinkedList<T>;   // §2.19 witness
   public constructor();
 
   public pure readonly property Count: int;
@@ -2232,7 +2257,9 @@ Borrowing and owning hash-based sets. `T` must be **hashable** (spec §3.6/§8.3
 **Iteration order.** Iteration over a `Set<T>` yields elements in **insertion order** — removing and re-adding an element places it at the end — the same guarantee as `Dictionary<K, V>` ([§4.8](#sec-dictionaryk-v)). `OwningSet<T>` makes **no** iteration-order guarantee, for [§4.9](#sec-owneddictionaryk-v)'s drain-and-rebuild reason; programs needing ordered iteration use `SortedSet<T>` or an `Array`.
 
 ```bezel
-public class Set<T>: ICollection<T>
+public class Set<T>: ICollection<T>, ICollectionLiteralTarget<Set<T>, T>
+  public static method FromCollectionLiteral(elements: ReadOnlyArraySpan<T>): owned Set<T>;   // §2.19 witness; duplicates
+                                                                                              //   collapse (spec §15.4)
   public constructor();
   public constructor(capacity: int);
   public constructor(comparer: IEqualityComparer<T>);
@@ -2248,7 +2275,8 @@ public class Set<T>: ICollection<T>
   public method IsSupersetOf(other: IEnumerable<T>): bool;
 end Set;
 
-public class OwningSet<T>: IOwningCollection<T> where T: class
+public class OwningSet<T>: IOwningCollection<T>, IOwningCollectionLiteralTarget<OwningSet<T>, T> where T: class
+  public static method FromCollectionLiteral(owned elements: OwningArray<T>): owned OwningSet<T>;   // §2.19 witness
   public constructor();
   public constructor(capacity: int);
   public constructor(comparer: IEqualityComparer<T>);
@@ -2299,7 +2327,9 @@ A `Set<T>` may be constructed with a sequence literal (language spec [§15.4](Be
 LIFO and FIFO collections.
 
 ```bezel
-public class Stack<T>: IReadOnlyCollection<T>   // v0.165 (#1354)
+public class Stack<T>: IReadOnlyCollection<T>, ICollectionLiteralTarget<Stack<T>, T>   // v0.165 (#1354)
+  public static method FromCollectionLiteral(elements: ReadOnlyArraySpan<T>): owned Stack<T>;   // §2.19 witness; first element
+                                                                                                //   pushed first (spec §15.4)
   public constructor();
   public method Push(item: T);
   public method Contains(item: T): bool;        // explicit (v0.165; declaration restored v0.195)
@@ -2310,7 +2340,8 @@ public class Stack<T>: IReadOnlyCollection<T>   // v0.165 (#1354)
   public method Clear();                        // v0.222 (#1811): drops all elements; disposes nothing (§28.6)
 end Stack;
 
-public class OwningStack<T>: IReadOnlyCollection<T> where T: class   // v0.222 (#1811): demoted, completing v0.165 #1354
+public class OwningStack<T>: IReadOnlyCollection<T>, IOwningCollectionLiteralTarget<OwningStack<T>, T> where T: class   // v0.222 (#1811): demoted, completing v0.165 #1354
+  public static method FromCollectionLiteral(owned elements: OwningArray<T>): owned OwningStack<T>;   // §2.19 witness
   public constructor();
   public method Push(owned item: T);
   public method Contains(item: T): bool;        // explicit (v0.222, #1811 — the v0.165 pattern)
@@ -2322,7 +2353,9 @@ public class OwningStack<T>: IReadOnlyCollection<T> where T: class   // v0.222 (
   public method Drain(): IOwningEnumerable<T>;
 end OwningStack;
 
-public class Queue<T>: IReadOnlyCollection<T>   // v0.165 (#1354)
+public class Queue<T>: IReadOnlyCollection<T>, ICollectionLiteralTarget<Queue<T>, T>   // v0.165 (#1354)
+  public static method FromCollectionLiteral(elements: ReadOnlyArraySpan<T>): owned Queue<T>;   // §2.19 witness; first element
+                                                                                                //   at the front (spec §15.4)
   public constructor();
   public method Enqueue(item: T);
   public method Dequeue(): T;
@@ -2333,7 +2366,8 @@ public class Queue<T>: IReadOnlyCollection<T>   // v0.165 (#1354)
   public method Clear();                        // v0.222 (#1811): drops all elements; disposes nothing (§28.6)
 end Queue;
 
-public class OwningQueue<T>: IReadOnlyCollection<T> where T: class   // v0.222 (#1811)
+public class OwningQueue<T>: IReadOnlyCollection<T>, IOwningCollectionLiteralTarget<OwningQueue<T>, T> where T: class   // v0.222 (#1811)
+  public static method FromCollectionLiteral(owned elements: OwningArray<T>): owned OwningQueue<T>;   // §2.19 witness
   public constructor();
   public method Enqueue(owned item: T);
   public method Contains(item: T): bool;        // explicit (v0.222, #1811 — the v0.165 pattern)

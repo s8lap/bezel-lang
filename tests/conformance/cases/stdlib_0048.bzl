@@ -1,4 +1,6 @@
-public class Array<T>: IList<T>
+public class Array<T>: IList<T>, ICollectionLiteralTarget<Array<T>, T>
+  public static method FromCollectionLiteral(elements: ReadOnlyArraySpan<T>): owned Array<T>;   // §2.19 witness; the literal's
+                                                                                                //   own lowering (spec §15.4)
   public constructor();
   public constructor(capacity: int);                     // empty (Count = 0), storage reserved;
                                                           //   capacity < 0: ArgumentOutOfRangeException (v0.183, #1396)

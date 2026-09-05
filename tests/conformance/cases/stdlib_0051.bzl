@@ -1,10 +1,14 @@
-public class OwningArray<T>: IOwningList<T>, IOwningEnumerable<T> where T: class
+public class OwningArray<T>: IOwningList<T>, IOwningEnumerable<T>, IOwningCollectionLiteralTarget<OwningArray<T>, T> where T: class
   private owned _storage: OwningBuffer<T>;
   private _count: int := 0;
 
   public constructor()
     this(8);
   end constructor;
+
+  public static method FromCollectionLiteral(owned elements: OwningArray<T>): owned OwningArray<T>
+    return elements;                                   // the literal's temporary is the result (spec §15.4.1, owning form)
+  end FromCollectionLiteral;
 
   public constructor(capacity: int)
     if capacity < 0 then
