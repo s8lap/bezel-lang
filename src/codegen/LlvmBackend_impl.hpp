@@ -12311,9 +12311,134 @@ private:
         const std::vector<ast::CallArgument>& args,
         const sema::ConstructorSymbol* exclude = nullptr) {
         if (!cls) return nullptr;
-        // If exactly one constructor matches by arity, use it directly.
+        // fix #3760 (§22.10 / §12.8 / §22.8, v0.287): a SINGLE explicit
+        // constructor whose arity matches the chain call still has to
+        // type-match the call's positional args before we can adopt it as
+        // the chain target. The pre-#3760 path returned the only arity-
+        // match unconditionally, which let `this(int)` from a (a, b) ctor
+        // in `class C(x: int)` bind to an arity-1 (s: string) sibling
+        // whose first param is a string and the call's first arg is an
+        // int. The (s) ctor then chains `this(int, int)` back to the (a,
+        // b) ctor, and the two form a closed loop — overflow at run time.
+        // The fix factors the type-class check (the same one the >1
+        // branch below already runs) into a small lambda that the ==1
+        // arm also consults, so a single sibling whose types disagree
+        // with the call's args is REJECTED and the caller falls through
+        // to the §22.10 primary arm (line 12189) when the class has one,
+        // or to the default-arity fill arm otherwise.
+        auto typeClassOf = [&](const sema::TypeRef* t) -> int {
+            if (!t) return -1;
+            using P = sema::PrimitiveType;
+            // Nullable-vs-non-nullable compatibility (fix #3760, follow-up):
+            // a non-nullable primitive VALUE (`int`) and its `?` form (`int?`)
+            // are the same typeClass for ctor-selection purposes — a primitive
+            // is a value, not a reference, and `T?` at `T = int` admits an
+            // `int` argument silently. Returning 3 for nullable primitives
+            // here would reject `new B<int>(5)` against `constructor(u: T?)`
+            // (the #3501 N6 control), where the arg class is 1 and the param
+            // class would be 3 — the only arity-match in the class, so my
+            // ==1 arm would null-out `ctorForArgs` and the call would be
+            // silently dropped.
+            //
+            // For NAMED types the nullable flag still matters: a `T?` named
+            // reference can carry null and an arg of a non-nullable named
+            // type is fine, but a non-null `T` (nullable=false) cannot accept
+            // an arg whose declared type is `T?`. The pre-#3760 >1 arm
+            // encoded this by mapping `nullable=true` to class 3 and the
+            // non-nullable named to class 3 too (kind == Named → 3), so the
+            // both-named case agreed; this fix keeps that behaviour for
+            // NAMED while flattening the primitive nullability. (Both named
+            // forms resolve to class 3, so the nullable distinction is moot
+            // for the class returned — `isNullable` is unused above; the
+            // comment is kept so the next reader knows why the primitive
+            // branch below diverged from the pre-#3760 nullable-early
+            // shortcut.)
+            (void)t->nullable;  // see NAMED branch — nullable is informational only
+            if (t->kind == sema::TypeRef::Kind::Function) return 3;
+            if (t->kind == sema::TypeRef::Kind::Primitive) {
+                switch (t->primitive) {
+                case P::Bool:   return 0;
+                case P::Char:   return 1; // char is i32 in LLVM
+                case P::Int:   case P::Long:   case P::Byte:
+                case P::SByte: case P::Short:  case P::UShort:
+                case P::UInt:  case P::ULong:  return 1;
+                case P::Float:  return 2;
+                case P::Double: case P::Decimal: return 2;
+                case P::String: return 3; // class 3 regardless of nullable
+                default: return -1;
+                }
+            }
+            if (t->kind == sema::TypeRef::Kind::Named) {
+                // A `T` generic parameter is referenced through a TypeRef
+                // whose `declaration` is a GenericParamSymbol — a Symbol,
+                // not a TypeSymbol. `dynamic_cast<TypeSymbol*>` returns
+                // null on a generic parameter, so the call below reports
+                // `-1` for "unknown / don't care" and the type-class check
+                // accepts any arg type — the same fallback the >1 branch
+                // already relied on for these shapes pre-#3760. Without
+                // this, `base(n)` from `class IntBox: Box<int>` chains to
+                // `Box<T>::constructor(v: T)` and the typeClass verdict
+                // (`Named` → 3 vs `Int` → 1) rejects the only arity-match,
+                // so the call is silently dropped.
+                if (dynamic_cast<const sema::TypeSymbol*>(t->declaration))
+                    return 3;  // named: class 3 either way
+                return -1;
+            }
+            return -1;
+        };
+        auto ctorTypeMatches = [&](sema::ConstructorSymbol* cs) -> bool {
+            if (cs->params.size() != args.size()) return false;
+            // fix #3760: the type-class check reads the parameter type off the
+            // LOCAL AST when present (`ast::ConstructorDecl::params[i].type`,
+            // resolved to a `sema::TypeRef` via `ctx_.resolvedType`) — and
+            // falls back to the `ParameterSymbol::declType` carried on the
+            // IMPORTED shape (the dep never ships an `ast::ConstructorDecl`,
+            // so the `cd` path is null for an imported ctor and was returning
+            // false unconditionally — which broke every imported convenience
+            // call site, e.g. `WithCounter(6)` from
+            // primary_ctor_direct_new_step2_field_init_3713). Both routes
+            // must agree on the type-class verdict so a single imported
+            // sibling is not rejected on a #3760-motivated check the local
+            // twin would have accepted.
+            auto localParamType = [&](std::size_t pi) -> const sema::TypeRef* {
+                if (auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl)) {
+                    if (pi < cd->params.size() && cd->params[pi].type)
+                        return ctx_.resolvedType(*cd->params[pi].type);
+                }
+                if (pi < cs->params.size()) {
+                    auto* ps = dynamic_cast<sema::ParameterSymbol*>(cs->params[pi]);
+                    // Prefer the already-resolved `resolvedDeclType` (filled
+                    // by sema for an inferred-typed lambda param) when
+                    // available; fall back to resolving `declType` (the AST
+                    // type). `ps->declType` is `const ast::Type*` here —
+                    // ParameterSymbol's own field shadows the inherited
+                    // `Symbol::declType` (a `sema::TypeRef*`).
+                    if (ps) {
+                        if (ps->resolvedDeclType) return ps->resolvedDeclType;
+                        if (ps->declType) return ctx_.resolvedType(*ps->declType);
+                    }
+                }
+                return nullptr;
+            };
+            for (std::size_t pi = 0; pi < args.size(); ++pi) {
+                if (!args[pi].value) continue;
+                auto* argTy = ctx_.exprType(*args[pi].value);
+                bool argIsNull = dynamic_cast<const ast::NullLiteralExpr*>(
+                    args[pi].value.get()) != nullptr;
+                int argCls = argIsNull ? 3 : typeClassOf(argTy);
+                auto* paramTy = localParamType(pi);
+                int paramCls = typeClassOf(paramTy);
+                if (argCls != -1 && paramCls != -1 && argCls != paramCls)
+                    return false;
+            }
+            return true;
+        };
+        // If exactly one constructor matches by arity, use it directly —
+        // but ONLY after the type check above confirms its params agree
+        // with the call's args (the #3760 fix).
         if (ctorArityCount(cls, args.size(), exclude) == 1) {
-            if (auto* exact = ctorByArity(cls, args.size(), exclude)) return exact;
+            if (auto* exact = ctorByArity(cls, args.size(), exclude))
+                return ctorTypeMatches(exact) ? exact : nullptr;
         }
         // Multiple constructors with same arity: resolve by LLVM type
         // matching. Lower each arg, check if the lowered type matches
@@ -12328,50 +12453,11 @@ private:
                 if (cs->params.size() == args.size()) candidates.push_back(cs);
             }
             // For each candidate, check if positional arg sema types are
-            // compatible with param sema types. We classify each type into:
-            //   0 = bool (i1)
-            //   1 = char / integer (i32/i64/etc)
-            //   2 = float/double
-            //   3 = ptr (class, string, char, nullable, function)
-            //  -1 = unknown / don't care
-            using P = sema::PrimitiveType;
-            auto typeClass = [&](const sema::TypeRef* t) -> int {
-                if (!t) return -1;
-                if (t->nullable) return 3;
-                if (t->kind == sema::TypeRef::Kind::Named) return 3;
-                if (t->kind == sema::TypeRef::Kind::Function) return 3;
-                if (t->kind == sema::TypeRef::Kind::Primitive) {
-                    switch (t->primitive) {
-                    case P::Bool:   return 0;
-                    case P::Char:   return 1; // char is i32 in LLVM
-                    case P::Int:   case P::Long:   case P::Byte:
-                    case P::SByte: case P::Short:  case P::UShort:
-                    case P::UInt:  case P::ULong:  return 1;
-                    case P::Float:  return 2;
-                    case P::Double: case P::Decimal: return 2;
-                    case P::String: return 3;
-                    default: return -1;
-                    }
-                }
-                return -1;
-            };
+            // compatible with param sema types. The same `ctorTypeMatches`
+            // helper the ==1 arm uses (#3760) — sharing keeps the two paths
+            // from drifting on what "type match" means.
             for (auto* cs : candidates) {
-                auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
-                if (!cd || cd->params.size() != args.size()) continue;
-                bool match = true;
-                for (std::size_t pi = 0; pi < args.size() && match; ++pi) {
-                    if (!args[pi].value || !cd->params[pi].type) continue;
-                    auto* argTy = ctx_.exprType(*args[pi].value);
-                    bool argIsNull = dynamic_cast<const ast::NullLiteralExpr*>(
-                        args[pi].value.get()) != nullptr;
-                    int argCls = argIsNull ? 3 : typeClass(argTy);
-                    auto* paramTy = ctx_.resolvedType(*cd->params[pi].type);
-                    int paramCls = typeClass(paramTy);
-                    // Both known: must agree. Unknown means any match.
-                    if (argCls != -1 && paramCls != -1 && argCls != paramCls)
-                        match = false;
-                }
-                if (match) return cs;
+                if (ctorTypeMatches(cs)) return cs;
             }
             // No perfect type match — fall back to first by arity.
             return candidates.empty() ? nullptr : candidates[0];
