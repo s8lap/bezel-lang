@@ -71,6 +71,13 @@
 //   false` ASan/LSan sanitizer report; the SortedDictionary control and the
 //   combined multi-call row's leak-side both remain unaffected in direction
 //   (see each test's own comment for exact counts).
+//
+// UPDATE (fixes #3887/#3888, later commit): the SortedDictionary row this
+// count describes was accurate as of #3886's own commit. Fixes #3887/#3888
+// subsequently widened the same two guards to also cover SortedDictionary,
+// which flips that row (see its own comment, below, for the current
+// FAIL-WITHOUT/PASS-WITH count). Left as originally written, per this
+// project's pinned-history convention, rather than rewritten.
 
 #include <string>
 
@@ -399,29 +406,42 @@ BEZEL_TEST(dict_call_arg_key_local_release_3886,
 }
 
 // ---------------------------------------------------------------------------
-// BOUNDARY CONTROL, not a fix-dependent row: `SortedDictionary<string,V>`
-// has the textually identical null-resolved-symbol shape (a built-in
-// collection method carries no `sema::MethodSymbol` for ANY collection
-// family, not only Dictionary/OwningDictionary) but this fix's guard is
-// `headName() == "Dictionary" || "OwningDictionary"`, which `SortedDictionary`
-// does not match — mirroring #3872's own indexer-side boundary control. So a
-// string local reused as a `SortedDictionary.ContainsKey` argument keeps
-// leaking, deliberately: this fix is scoped to the two families issue #3886
-// named. This is a genuine control, asserting the SAME outcome (a real
-// ASan/LSan leak report, `r.ran == false`) on BOTH sides of this commit —
-// reverting the fix does not change SortedDictionary's leak, because the fix
-// never touches it. SortedDictionary's own instance of this defect class
-// (both the indexer form and this named-method form) is tracked as a
-// separate sibling issue, not fixed here.
+// UPDATED by fix #3888 (§4.8/§4.17/§28.9, v0.294) — this row PINNED THE
+// OPPOSITE OUTCOME through fix #3888: `SortedDictionary<string,V>` had the
+// textually identical null-resolved-symbol shape (a built-in collection
+// method carries no `sema::MethodSymbol` for ANY collection family, not
+// only Dictionary/OwningDictionary) but fix #3886's own guard was
+// `headName() == "Dictionary" || "OwningDictionary"` only, deliberately
+// scoped to the two families that issue named — mirroring #3872's own
+// indexer-side boundary. `SortedDictionary`'s own instance of this
+// walkCallArgs-arm defect was filed as issue #3888 and is now FIXED:
+// `dictMethodStrKeySafe`'s guard (LlvmBackend_Setup.cpp) widened to also
+// match `SortedDictionary`, gated on the identical soundness argument
+// (every admitted method dispatches through the same `bz_dict_*_str`
+// runtime regardless of receiver name — see
+// `dict_sorted_key_local_release_3887_3888_test.cpp` for the full
+// verification and the fresh VALUE-position boundary this fix does NOT
+// claim). Note this repro ALSO exercises the indexer-set form (`d[key] :=
+// 1`) that issue #3887 fixed at the same time (this row combines both
+// walker arms, exactly as originally written), so both fixes had to land
+// together for it to go clean.
 //
-// Measured via `scripts/agent_check.sh --probe --asan` on the tree carrying
-// this fix, 50x (smaller loop count, matching #3872's own SortedDictionary
-// control scale): 2040 B / 100 allocations leaked (1600 B / 50 objects direct
-// + 440 B / 50 objects indirect — 50 header+data pairs; one iteration's `key`
-// survives past the loop under LSan's process-exit snapshot).
+// This row previously asserted the INVERSE (`r.ran == false`, a genuine
+// leak control) on both sides of #3886's commit. Fixes #3887/#3888 flip
+// that outcome for real, so the row is updated in the SAME commit that
+// lands them (per this project's "a fix reversing a prior rejection/outcome
+// must update the tests that pinned the OLD behaviour" rule) rather than
+// left pinned to a now-stale expectation.
+//
+// FAIL-WITHOUT / PASS-WITH (this row specifically, as part of fixes
+// #3887/#3888's commit): PASS-WITH — clean, `total=440`. FAIL-WITHOUT
+// (src/codegen/LlvmBackend_Setup.cpp reverted to the pre-#3887/#3888 HEAD,
+// bezel_tests_codegen RELINKED before rerunning): `r.ran == false`, an LSan
+// report of 2040 byte(s) / 100 allocation(s) at this row's own 50x scale
+// (measured live, matches the issue's own filed number exactly).
 // ---------------------------------------------------------------------------
 BEZEL_TEST(dict_call_arg_key_local_release_3886,
-           sorted_dictionary_contains_key_still_leaks_control_28_9) {
+           sorted_dictionary_contains_key_now_released_3888) {
     JitResult r = runAotChecked(prog(
         "var j := 0; var total := 0; "
         "while j < 50 do "
@@ -435,8 +455,11 @@ BEZEL_TEST(dict_call_arg_key_local_release_3886,
         "Console.WriteLine($\"total={total}\"); "
         "return 0; "));
     if (wasSkipped(r)) return;
-    // Deliberately the INVERSE of every row above: this shape is NOT claimed
-    // by this fix, so it must still trip LeakSanitizer on both sides of this
-    // commit — `r.ran == false` here is the expected, unchanging result.
-    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(r.ran);
+    int expected = 0;
+    for (int j = 0; j < 50; ++j) {
+        int digits = (j < 10) ? 1 : 2;
+        expected += 1 /* ContainsKey */ + 6 + digits;
+    }
+    BEZEL_EXPECT_EQ(r.stdoutText, "total=" + std::to_string(expected) + "\n");
 }

@@ -22621,10 +22621,30 @@ struct StringEscapeWalker {
         // Gated on stringReleaseMode (the #1997 narrowing) and restricted to
         // a NON-NULLABLE `string` key type, mirroring #3872's IndexExpr twin
         // exactly (a `string?` key's null/sentinel handling is out of scope
-        // for this increment). `SortedDictionary<string,V>` is deliberately
-        // NOT matched (headName()=="Dictionary"||"OwningDictionary" only) —
-        // #3872's own boundary control already pins that receiver as still
-        // leaking; this fix does not touch it either.
+        // for this increment).
+        //
+        // fix #3888 (§4.8/§4.9/§28.9, v0.294): `SortedDictionary<string,V>`
+        // now ALSO matches (headName()=="Dictionary"||"OwningDictionary"||
+        // "SortedDictionary"). #3872's/#3886's own boundary controls pinned
+        // SortedDictionary as still leaking here because it was deliberately
+        // OUT of scope for those two narrower fixes, not because its runtime
+        // key handling differs. Verified by reading
+        // src/runtime/bezel_runtime_collections.cpp and
+        // LlvmBackend_Calls.cpp's `isDict` dispatch block (not assumed):
+        // `isDictTypeName`/`common::isDictionaryName` is the shared
+        // three-name registry (Dictionary/OwningDictionary/SortedDictionary
+        // all back onto the identical `bz_dict_t*` string-keyed hash table),
+        // and every one of ContainsKey/Contains/TryGetValue/Add/TryAdd/
+        // Remove/PopValue/TryPopValue/GetOrNull/GetOrAdd dispatches through
+        // the SAME `bz_dict_*_str` functions regardless of receiver name —
+        // there is no SortedDictionary-specific method-dispatch arm for any
+        // of these ten. SortedDictionary's `§4.17` ordering machinery
+        // (`bz_dict_min_key_str`/`bz_dict_max_key_str`/the sorted-snapshot
+        // helpers) is a read-only O(n log n) SCAN over that same table for
+        // iteration/FirstKey/LastKey — it never changes how a KEY is stored
+        // on insert, so the identical strndup-byte-copy, never-retains-the-
+        // caller's-bz_string* soundness argument #3703/#3872/#3886 already
+        // established applies unchanged to this receiver.
         bool dictMethodStrKeySafe = false;
         if (stringReleaseMode && callee) {
             if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(callee)) {
@@ -22636,7 +22656,8 @@ struct StringEscapeWalker {
                      ma->member == "GetOrNull" || ma->member == "GetOrAdd")) {
                     if (const sema::TypeRef* rt = ctx.exprType(*ma->target)) {
                         std::string_view h = rt->headName();
-                        if ((h == "Dictionary" || h == "OwningDictionary") &&
+                        if ((h == "Dictionary" || h == "OwningDictionary" ||
+                             h == "SortedDictionary") &&
                             !rt->genericArgs.empty() && rt->genericArgs[0] &&
                             !rt->genericArgs[0]->nullable &&
                             rt->genericArgs[0]->kind ==
@@ -23343,11 +23364,27 @@ struct StringEscapeWalker {
             // included because its KEY handling is byte-identical to
             // Dictionary's (only the VALUE side differs, per
             // LlvmBackend_Assign.cpp's dict indexer-set).
+            //
+            // fix #3887 (§4.8/§4.9/§28.9, v0.294): `SortedDictionary<string,
+            // V>` now ALSO matches. It was excluded from #3872's own guard
+            // deliberately, as a scope decision (narrow rather than widen
+            // speculatively), not because its runtime key storage differs —
+            // confirmed by reading src/runtime/bezel_runtime_collections.cpp
+            // and this file's `isDictTypeName`/`common::isDictionaryName`
+            // (BuiltinRegistry.cpp's shared three-name `kDictionaryNames`
+            // registry): SortedDictionary's indexer-set/get lower through
+            // the identical `bz_dict_set_str`/`bz_dict_try_get_str` as
+            // Dictionary/OwningDictionary (LlvmBackend_Assign.cpp has no
+            // SortedDictionary-specific indexer arm), and its §4.17 ordered-
+            // iteration machinery is a read-only sorted SNAPSHOT taken over
+            // that same table, not a different key-storage discipline. So
+            // the identical strndup-byte-copy soundness argument applies.
             bool dictStrKeySafe = false;
             if (stringReleaseMode) {
                 if (const sema::TypeRef* rt = ctx.exprType(*ix->target)) {
                     std::string_view h = rt->headName();
-                    if ((h == "Dictionary" || h == "OwningDictionary") &&
+                    if ((h == "Dictionary" || h == "OwningDictionary" ||
+                         h == "SortedDictionary") &&
                         !rt->genericArgs.empty() && rt->genericArgs[0] &&
                         !rt->genericArgs[0]->nullable &&
                         rt->genericArgs[0]->kind ==

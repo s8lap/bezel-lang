@@ -100,6 +100,16 @@
 //   either side, so reverting the fix does not flip it — proving the
 //   control does not silently ride along with the fix). Restored the fix
 //   and relinked again before continuing.
+//
+// UPDATE (fix #3887, later commit): the SortedDictionary row this
+// FAIL-WITHOUT/PASS-WITH count describes was accurate as of #3872's own
+// commit — SortedDictionary genuinely was NOT claimed by that fix. Fix
+// #3887 subsequently widened the SAME guard to also cover SortedDictionary,
+// which flips that row (see its own comment, below, for the current
+// FAIL-WITHOUT/PASS-WITH count under fix #3887). This historical note is
+// left as originally written rather than rewritten, per this project's
+// pinned-history convention; it no longer describes this file's current
+// row count for a fresh run.
 
 #include <string>
 
@@ -244,40 +254,40 @@ BEZEL_TEST(dict_indexer_set_key_local_release_3872,
 }
 
 // ---------------------------------------------------------------------------
-// BOUNDARY CONTROL, not a fix-dependent row: `SortedDictionary<string,V>`
-// has the textually identical shape that caused #3872 — the same
-// `IndexExpr` walker arm, the same null `ctx.exprSymbol(*ix)` (a built-in
-// collection indexer carries no `PropertySymbol` for ANY collection family,
-// not only Dictionary/OwningDictionary) — but this fix's guard is
-// `headName() == "Dictionary" || "OwningDictionary"`, which `SortedDictionary`
-// does not match. So a string local reused as a `SortedDictionary`
-// indexer-SET key keeps leaking, deliberately: this fix is scoped to the
-// two collection families issue #3872 named, not every `IndexExpr` receiver
-// that happens to share the null-PropertySymbol shape. `SortedDictionary`'s
-// own instance of the #3872-class defect is tracked separately (a sibling
-// issue), not fixed here.
+// UPDATED by fix #3887 (§4.8/§4.17/§28.9, v0.294) — this row PINNED THE
+// OPPOSITE OUTCOME from #3872 through fix #3887: `SortedDictionary<string,V>`
+// had the textually identical shape that caused #3872 (the same `IndexExpr`
+// walker arm, the same null `ctx.exprSymbol(*ix)` — a built-in collection
+// indexer carries no `PropertySymbol` for ANY collection family, not only
+// Dictionary/OwningDictionary) but #3872's own guard was
+// `headName() == "Dictionary" || "OwningDictionary"` only, deliberately
+// scoped to the two families that issue named. `SortedDictionary`'s own
+// instance of that defect class was filed as issue #3887 and is now FIXED:
+// `dictStrKeySafe`'s guard (LlvmBackend_Setup.cpp) widened to also match
+// `SortedDictionary`, gated on the identical soundness argument (the
+// runtime's `bz_dict_set_str`/`bz_dict_try_get_str` never retain or store
+// the caller's `bz_string*` for a KEY regardless of receiver name — see
+// `dict_sorted_key_local_release_3887_3888_test.cpp` for the full
+// verification and the fresh boundary this fix does NOT claim).
 //
-// This row is a genuine CONTROL, not a fourth fix-dependent measurement: it
-// asserts the identical outcome (a real ASan/LSan leak report, `r.ran ==
-// false`) on BOTH sides of this commit — reverting the fix does not change
-// SortedDictionary's leak, because the fix never touches it. That is what
-// pins the new relaxation's boundary in-suite: if a future change ever widens
-// the `headName()` guard (or replaces it with something looser) to
-// accidentally also claim SortedDictionary, THIS row flips from failing (as
-// expected) to passing unexpectedly and the regression is caught here, not
-// discovered later as a fresh leak report against a boundary nobody could
-// see was supposed to hold.
+// This row previously asserted the INVERSE (`r.ran == false`, a genuine
+// leak control) on both sides of #3872's commit. Fix #3887 flips that
+// outcome for real, so the row is updated in the SAME commit that lands
+// #3887 (per this project's "a fix reversing a prior rejection/outcome must
+// update the tests that pinned the OLD behaviour" rule) rather than left
+// pinned to a now-stale expectation.
 //
-// Measured via `scripts/agent_check.sh --probe --asan` on the tree carrying
-// this fix, 50x (a smaller loop count than the fix-dependent rows above —
-// matching the scale at which this control was originally identified):
-// 2040 B / 100 allocations leaked (1600 B / 50 objects direct + 440 B / 50
-// objects indirect — 50 header+data pairs; one iteration's `key` survives
-// past the loop under LSan's process-exit snapshot, same off-by-one
-// accounting as the fix-dependent rows' 199-not-200).
+// FAIL-WITHOUT / PASS-WITH (this row specifically, as part of fix #3887's
+// commit): PASS-WITH — clean, `total=390`. FAIL-WITHOUT (src/codegen/
+// LlvmBackend_Setup.cpp reverted to the pre-#3887 HEAD, bezel_tests_codegen
+// RELINKED before rerunning): `r.ran == false`, an LSan report of 1999
+// byte(s) / 98 allocation(s) at this row's own 50x scale (measured on this
+// tree; the issue's originally-filed number of 2040 B / 100 allocations was
+// measured against a slightly different tree revision — same signature,
+// same off-by-one accounting, the discrepancy is immaterial to the fix).
 // ---------------------------------------------------------------------------
 BEZEL_TEST(dict_indexer_set_key_local_release_3872,
-           sorted_dictionary_indexer_set_key_local_still_leaks_control_28_9) {
+           sorted_dictionary_indexer_set_key_local_now_released_3887) {
     JitResult r = runAotChecked(prog(
         "var j := 0; var total := 0; "
         "while j < 50 do "
@@ -290,8 +300,11 @@ BEZEL_TEST(dict_indexer_set_key_local_release_3872,
         "Console.WriteLine($\"total={total}\"); "
         "return 0; "));
     if (wasSkipped(r)) return;
-    // Deliberately the INVERSE of every row above: this shape is NOT claimed
-    // by #3872's fix, so it must still trip LeakSanitizer on both sides of
-    // this commit — `r.ran == false` here is the expected, unchanging result.
-    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(r.ran);
+    int expected = 0;
+    for (int j = 0; j < 50; ++j) {
+        int digits = (j < 10) ? 1 : 2;
+        expected += 6 + digits;
+    }
+    BEZEL_EXPECT_EQ(r.stdoutText, "total=" + std::to_string(expected) + "\n");
 }
