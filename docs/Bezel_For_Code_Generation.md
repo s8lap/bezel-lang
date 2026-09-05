@@ -1,6 +1,6 @@
 # Bezel for Code Generation
 
-*Validated against v0.289. Companion to the Bezel Language Specification — a writing reference, not a normative document.*
+*Validated against v0.290. Companion to the Bezel Language Specification — a writing reference, not a normative document.*
 
 A dense reference for writing correct Bezel without reading the spec. It covers the syntax surface, the ownership rules, the standard-library name index, the idioms that work, and the shapes that look right and are rejected.
 
@@ -658,9 +658,9 @@ public static class Math
   public static pure method Pow(x: double, y: double): double;
   public static method DivRem(a: int, b: int, out remainder: int): int;   // + long form; NOT pure
   public static pure method Floor/Ceiling/Truncate(x: double): double;
-  public static pure method Round(x: double[, digits: int]): double;
+  public static pure method Round(x: double, digits: int := 0): double;
   public static pure method Floor/Ceiling/Truncate(x: decimal): decimal;  // no Math.Round(decimal)
-  public static pure method Sign(int|long|double|decimal): int;
+  public static method Sign<T>(x: T): int where T: INumber<T>;   // NOT pure (v0.290); -1/0/1; NaN → 0; no char argument
   public static pure method Fmod(x, y: double): double;   IEEERemainder(x, y: double): double;
 end
 ```
@@ -701,7 +701,7 @@ public interface IFormattable      method ToString(format: string): string;   en
 public class Subscription  destructor; end     // no public ctor; returned as `owned Subscription`
 ```
 
-`IComparable<T>`/`IEquatable<T>` are **invariant**. `BitConverter`: `FloatToInt32Bits`, `Int32BitsToFloat`, `DoubleToInt64Bits`, `Int64BitsToDouble`, `Reinterpret<TTo>(value)`. `Type` (`public sealed class`): `Name` (the identifier alone), `FullName` (module path + enclosing-type path + identifier, `"M.Outer.Inner"`), `IsClass/IsInterface/IsRecord/IsEnum/IsChoice/IsPrimitive/IsInlineArray/IsFunctionType/IsValueType`, `BaseType: Type?`, `Implements(iface)`, `IsAssignableFrom(other)`, `EnumNames`, `EnumValues` — **no member reflection at all** (declined, not deferred).
+`IComparable<T>`/`IEquatable<T>` are **invariant**. `BitConverter`: `FloatToInt32Bits`, `Int32BitsToFloat`, `DoubleToInt64Bits`, `Int64BitsToDouble`, `Reinterpret<TTo>(value)`. `Type` (`public sealed class`): `Name` (the identifier alone), `FullName` (module path + enclosing-type path + identifier, `"M.Outer.Inner"`), `IsClass/IsInterface/IsRecord/IsEnum/IsChoice/IsPrimitive/IsInlineArray/IsFunctionType/IsValueType`, `BaseType: Type?`, `IsAssignableFrom(other)` (interface conformance is `iface.IsAssignableFrom(t)` — there is no `Implements`), `EnumNames`, `EnumValues` — **no member reflection at all** (declined, not deferred).
 
 **Format specifiers** (invariant culture only; an unrecognized specifier raises `FormatException`): integers `D`/`Dn`, `X`/`x`/`Xn`, `B` (no grouping separators); `double`/`float` `F`/`Fn` (default 2), `E`/`En`, `G`/`Gn`, `P`/`Pn`, `R`; `decimal` `F`/`Fn`, `E`/`En`, `G`, `P`/`Pn` (midpoints half-to-even); `DateTime`/`DateOnly`/`TimeOnly` patterns of `yyyy MM dd HH mm ss fff` with every other character a literal; `TimeSpan` `c`; `Guid` `D`/`N`; `bool`, `char`, `string` take **none** — a format spec on those is a compile error. **`C` (currency) deliberately does not exist**: write `$"{amount:F2} EUR"`.
 
@@ -768,7 +768,7 @@ end
 
 `StringBuilder` — `constructor()`, `(capacity: int)`, `(initial: string)`; `Length: int`, `pure Capacity: int`; `Append(string|char|Object|bool|int|byte|sbyte|short|ushort|uint|long|ulong|float|double|decimal|ReadOnlyStringSpan): StringBuilder`; `AppendLine()`, `AppendLine(value: string)`; `AppendFormat(format: string, args: Array<Object>)`; `Insert(index, value: string)`, `Remove(startIndex, length)`, `Replace(oldValue, newValue: string)`, `Clear()` — all returning `StringBuilder`; `ToString(): string`.
 
-`Encoding` (`public abstract class`) — `abstract GetBytes(s: string): owned Array<byte>`; `abstract GetString(bytes: Array<byte>)`, `GetString(bytes, start, length)` (params renamed v0.282), `GetString(bytes: ReadOnlySpan<byte>)`, `GetString(bytes: ReadOnlyArraySpan<byte>)`; `abstract GetByteCount(s: string): int`; `abstract GetBytes(s: string, destination: Span<byte>): int`; `abstract GetByteCount(s: ReadOnlyStringSpan): int`; `abstract GetBytes(s: ReadOnlyStringSpan, destination: Span<byte>): int`; `abstract GetBytes(s: ReadOnlyStringSpan): owned Array<byte>`; `abstract readonly property Name: string`; `static readonly property UTF8, UTF16, UTF32, ASCII: Encoding`. Malformed input raises `FormatException`, **never** a replacement character. UTF8 emits no BOM; UTF16/UTF32 are little-endian only.
+`Encoding` (`public abstract class`) — `abstract GetBytes(s: string): owned Array<byte>`; `abstract GetString(bytes: Array<byte>)`, `GetString(bytes: ReadOnlySpan<byte>)`, `GetString(bytes: ReadOnlyArraySpan<byte>)` (a window over an array is `GetString(bytes.AsReadOnlySpan(start, length))` — there is no `(bytes, start, length)` form); `abstract GetByteCount(s: string): int`; `abstract GetBytes(s: string, destination: Span<byte>): int`; `abstract GetByteCount(s: ReadOnlyStringSpan): int`; `abstract GetBytes(s: ReadOnlyStringSpan, destination: Span<byte>): int`; `abstract GetBytes(s: ReadOnlyStringSpan): owned Array<byte>`; `abstract readonly property Name: string`; `static readonly property UTF8, UTF16, UTF32, ASCII: Encoding`. Malformed input raises `FormatException`, **never** a replacement character. UTF8 emits no BOM; UTF16/UTF32 are little-endian only.
 
 `ReadOnlyStringSpan` — `public record (Source: string, Start: int, Length: int): IReadOnlySpan<char>`; **ordinary record, not borrow-bearing**. `property [i: int]: char { get }`; `pure IsEmpty: bool`; `pure Slice(start, length) / Slice(start) / Slice(r: Range<int>)`; `pure IndexOf(char|ReadOnlyStringSpan|string): int`; `pure Contains(…): bool`; `pure StartsWith`/`EndsWith(ReadOnlyStringSpan|string): bool`; `pure SequenceEqual(ReadOnlyStringSpan|string|IReadOnlySpan<char>): bool`; `CopyTo(destination: Span<char>)` (**not pure**); `pure ToString(): string`. `ReadOnlyAsciiByteSpan` was **retired** and does not exist.
 
@@ -804,7 +804,7 @@ public class Array<T>: IList<T>                      // borrowing, resizable
   pure readonly property Count: int;   pure readonly property Capacity: int;   property [i: int]: T;
   method Add(item: T);  AddRange(items: IEnumerable<T>);  Insert(index, item);  RemoveAt(index);
   method Remove(item: T): bool;  Clear();  Contains(item: T): bool;
-  method IndexOf(item: T): int;  IndexOf(item: T, startIndex: int): int;  LastIndexOf(item: T): int;
+  method IndexOf(item: T, startIndex: int := 0): int;   LastIndexOf(item: T): int;
   method Sort(comparer: (T, T) -> int);   method Reverse();                        // in place
   method Sorted(comparer: (T, T) -> int): owned Array<T>;   Reversed(): owned Array<T>;
   method ToArray(): owned Array<T>;
@@ -1001,7 +1001,7 @@ end                                             // `Slice` is deliberately NOT o
 
 `Span<T>`/`ReadOnlySpan<T>` are **borrow-bearing records** bounded by the buffer's lifetime; never an `async` method's parameter or result. **There is no implicit `Span<T>` → `ReadOnlySpan<T>` conversion** — call `.AsReadOnly()`. Spans do **not** implement `IEnumerable<T>`; `for` over a span is a direct indexed loop. `Span<T>` and `ArraySpan<T>` are **not interchangeable**. The `AsSpan`/`AsReadOnlySpan` factories and `Slice(r: Range<int>)` validate eagerly (`IndexOutOfRangeException`); direct constructors and `Slice(start[, length])` do not. **There is no writable-span interface.**
 
-**Byte accessors** (`public extension` on `ReadOnlySpan<byte>`/`Span<byte>`, mirrored on `ReadOnlyArraySpan<byte>`/`ArraySpan<byte>`): `Read{Int16,UInt16,Int32,UInt32,Int64,UInt64,Float,Double}{LittleEndian,BigEndian}()` and the matching `TryRead…(out value: T): bool`; on the writable spans additionally `Write…{LittleEndian,BigEndian}(value: T)` and `TryWrite…(value: T): bool`. **Endianness is in the name — there is no platform-default form, no enum parameter, and no offset parameter; slice first.** A short span raises `IndexOutOfRangeException`; a false `TryWrite*` leaves the span unmodified.
+**Byte accessors** (the read tier is one `public extension IReadOnlySpan<byte>` — every byte span of both families is a receiver; the write tier is declared on `Span<byte>` and `ArraySpan<byte>`): `Read{Int16,UInt16,Int32,UInt32,Int64,UInt64,Float,Double}{LittleEndian,BigEndian}()` and the matching `TryRead…(out value: T): bool`; on the writable spans additionally `Write…{LittleEndian,BigEndian}(value: T)` and `TryWrite…(value: T): bool`. **Endianness is in the name — there is no platform-default form, no enum parameter, and no offset parameter; slice first.** A short span raises `IndexOutOfRangeException`; a false `TryWrite*` leaves the span unmodified.
 
 **Bit tier** (v0.264): four borrow-bearing records — `BitReader(Source: ReadOnlySpan<byte>, BitStart: int, BitLength: int)`, `BitWriter(Source: Span<byte>, …)` and their `ArrayBitReader`/`ArrayBitWriter` mirrors over the array spans — reached by `pure AsBitReader()` on the read-only spans and `AsBitReader()` (**not pure**) / `pure AsBitWriter()` on the writable ones. Each carries `pure IsEmpty`, `pure IsByteAligned`, `pure Slice` ×3, `pure AlignToByte()`, `AlignedTail()`, plus `ReadBitsBigEndianMsbFirst(count: int): ulong`, `ReadBitsLittleEndianLsbFirst(count: int): ulong`, `ReadBitMsbFirst()`/`ReadBitLsbFirst(): bool` and their `TryRead…(…, out value): bool` forms — the writer swapping reads for `WriteBits…(value: ulong, count: int)`/`WriteBit…(value: bool)`/`TryWrite…` and adding `AsReadOnly()`. Only **two** of the four bit-order × byte-order combinations exist; every multi-bit read returns `ulong` and every multi-bit write takes one (**no signed form**); a reader does not advance itself — slice to advance.
 
@@ -1031,7 +1031,7 @@ public class Counter<K>: IEnumerable<DictionaryEntry<K, int>> where K: hashable
   constructor();
   method Increment(key: K, delta: int := 1);     // absent key is created at `delta`; negative admitted
   method CountOf(key: K): int;                   // 0 when absent — NOT pure
-  method ContainsKey(key: K): bool;              // distinguishes present-at-zero from absent
+  method Contains(key: K): bool;                 // distinguishes present-at-zero from absent; enables `key in tally`. No ContainsKey on Counter
   method Remove(key: K): bool;   Clear();
   pure readonly property Count: int;             // distinct keys
   pure readonly property Total: int;             // sum of counts; may be negative
@@ -1164,7 +1164,7 @@ public class Task
   static method FromOwnedResult<T>(owned value: T): OwningTask<T> where T: class;
   static method FromException<T>(owned exception: Exception): Task<T>;   FromCancelled<T>(): Task<T>;
   static method FromException(owned exception: Exception): Task;         FromCancelled(): Task;
-  static method Delay(milliseconds: int[, token]): Task;   Delay(duration: TimeSpan[, token]): Task;
+  static method Delay(milliseconds: int, token: CancellationToken := CancellationToken.None): Task;   Delay(duration: TimeSpan, token := CancellationToken.None): Task;
   static method WhenAll(tasks: Array<Task>): Task;
   static method WhenAll<T>(tasks: Array<Task<T>>): Task<Array<T>>;                        // non-class T
   static method WhenAll<T>(owned tasks: OwningArray<OwningTask<T>>): OwningTask<OwningArray<T>> where T: class;
@@ -1271,7 +1271,7 @@ public abstract class TextWriter          // Write(value: string|char|Object); W
 end
 public static class Directory
   Exists(path: string): bool;   CreateDirectory(path: string);
-  Delete(path: string);         Delete(path: string, recursive: bool);
+  Delete(path: string, recursive: bool := false);   // IOException if non-empty and not recursive
   GetFiles(path: string): owned Array<string>;   GetDirectories(path: string): owned Array<string>;
 end
 public static class Path                  // exactly six members
@@ -1284,7 +1284,7 @@ end
 
 ### 5.8 `System.Diagnostics`
 
-`Stopwatch` — `constructor()`, `static method StartNew(): owned Stopwatch`; `IsRunning: bool`, `Elapsed: TimeSpan`, `ElapsedMilliseconds: long`; `Start()`, `Stop()`, `Restart()`, `Reset()`. `Debug` — `Assert(condition: bool)`, `Assert(condition: bool, message: string)`, `WriteLine(message: string)`. **`Debug.Assert` terminates the process; it never throws**, and calls may be elided in release builds.
+`Stopwatch` — `constructor()`, `static method StartNew(): owned Stopwatch`; `IsRunning: bool`, `Elapsed: TimeSpan`, `ElapsedMilliseconds: long`; `Start()`, `Stop()`, `Reset()` — **no `Restart`**: write `sw.Reset(); sw.Start();`. `Debug` — `Assert(condition: bool, message: string := "")` (an empty message reports as no message), `WriteLine(message: string)`. **`Debug.Assert` terminates the process; it never throws**, and calls may be elided in release builds.
 
 ### 5.9 Primitives
 
@@ -1303,19 +1303,19 @@ public class String: IEnumerable<char>, IComparable<string>, IEquatable<string>
   static From(value: CString|WString): string;   static FromCStringPointer/FromWStringPointer(p: IntPtr): string;
   static pure Repeat(c: char, count: int): string;    static pure Repeat(unit: string, count: int): string;
   static Join(separator: string, items: IEnumerable<string>): string;
-  static pure IsNullOrEmpty(value: string?): bool;    static pure IsNullOrWhiteSpace(value: string?): bool;
+  static pure IsNullOrWhiteSpace(value: string?): bool;    // no IsNullOrEmpty — write `s = null or s.IsEmpty` (or `s?.IsEmpty ?? true`)
   pure Contains(string|char): bool;  pure StartsWith(string): bool;  pure EndsWith(string): bool;
-  pure IndexOf(char|string[, startIndex: int]): int;   pure LastIndexOf(char|string): int;
+  pure IndexOf(char|string, startIndex: int := 0): int;   pure LastIndexOf(char|string): int;
   pure Substring(startIndex[, length]): string;
   pure AsSpan([start[, length]] | r: Range<int>): ReadOnlyStringSpan;
   pure Trim() / Trim(chars: IEnumerable<char>) / TrimStart() / TrimEnd() / ToUpper() / ToLower(): string;
   pure Replace(oldChar: char, newChar: char) / Replace(oldValue: string, newValue: string): string;
-  pure PadLeft/PadRight/PadCenter(totalWidth: int[, paddingChar: char]): string;
+  pure PadLeft/PadRight/PadCenter(totalWidth: int, paddingChar: char := ' '): string;
   pure Insert(startIndex: int, value: string): string;   pure Remove(startIndex[, length]): string;
   method Split(separator: char): owned Array<string>;
   method Split(separator: string): owned Array<string>;
   method Split(separators: Array<char>): owned Array<string>;
-  pure CompareTo(other: string): int;   static pure Compare(a, b[, ignoreCase: bool]): int;
+  pure CompareTo(other: string): int;   pure CompareTo(other: string, ignoreCase: bool): int;   // no static string.Compare — `a.CompareTo(b, ignoreCase := true)`
   pure Equals(other: string?[, ignoreCase: bool]): bool;
   pure override Equals(other: Object?): bool;   pure override GetHashCode(): int;   pure override ToString(): string;
   method ToCharArray(): owned Array<char>;      method GetEnumerator(): owned IEnumerator<char>;
@@ -1339,17 +1339,17 @@ The carriers are `IntPtr`/`UIntPtr` (records: `static readonly property Zero`, `
 
 Every absence below was verified by a full-document search. Reaching for one of these is the failure this document exists to prevent.
 
-**I/O.** `MemoryStream` (→ `OwningBuffer<byte>` + spans; for serializers, `JsonSerializer.ToBytes()`); `File.Open`/`OpenRead`/`OpenWrite`/`OpenText`/`AppendAllText`/`AppendAllLines` (→ `new FileStream(path, mode[, access])`, `FileMode.Append`); `File.ReadAllBytesAsync`/`ReadAllLinesAsync`/`WriteAllBytesAsync` (the async `File` surface is **text-only** → `FileStream.ReadAllAsync`/`ReadAsync`/`WriteAsync`); `StreamReader`/`StreamWriter`/`BufferedStream`; async `TextReader`/`TextWriter`; async **span** overloads on `Stream`; `Directory.Move`/`EnumerateFiles`/globbing; `Path.ChangeExtension`/`HasExtension`/`GetTempPath`/`DirectorySeparatorChar`; `Console.Read()`.
+**I/O.** `MemoryStream` (→ `OwningBuffer<byte>` + spans; for serializers, `JsonSerializer.ToBytes()`); `File.Open`/`OpenRead`/`OpenWrite`/`OpenText`/`AppendAllText`/`AppendAllLines` (→ `new FileStream(path, mode, access := FileAccess.ReadWrite)`, `FileMode.Append`); `File.ReadAllBytesAsync`/`ReadAllLinesAsync`/`WriteAllBytesAsync` (the async `File` surface is **text-only** → `FileStream.ReadAllAsync`/`ReadAsync`/`WriteAsync`); `StreamReader`/`StreamWriter`/`BufferedStream`; async `TextReader`/`TextWriter`; async **span** overloads on `Stream`; `Directory.Move`/`EnumerateFiles`/globbing; `Path.ChangeExtension`/`HasExtension`/`GetTempPath`/`DirectorySeparatorChar`; `Console.Read()`.
 
 **Query operators.** `ToList`, `ToLookup`, `Join`, `GroupJoin`, `Cast<T>`, `AsEnumerable`, `DefaultIfEmpty`, `Prepend`, `Append`, `Chunk`, `DistinctBy`, `UnionBy`/`IntersectBy`/`ExceptBy`, `MinBy`, `MaxBy`, `Order()`/`OrderDescending()`, `TakeLast`, `SkipLast`, `LongCount`, `Enumerable.Empty`/`Range`/`Repeat` (**there is no `Enumerable` class at all**), `SequenceEqual` over `IEnumerable<T>` (it exists only on the span types), `SelectMany` with a result selector, `Zip` without a combiner, `Where`/`Select` with an index, and an instance `ForEach(action)` on any sequence (`Array<T>` and `string` included — write the `for` loop). Replacements: `ToList` → `ToArray()`; `MinBy(f)` → `OrderBy(f).First()`; `Enumerable.Range` → the language's `1..n`, which is `IEnumerable<T>` (`(1..100).Sum()` works); `Append`/`Prepend` → `Concat` with a one-element `Array<T>`.
 
-**Collections.** `List<T>` (reserved name), `HashSet<T>` (→ `Set<T>`), `SortedList`, `PriorityQueue`, `Deque`, `ConcurrentDictionary`/`ConcurrentQueue`/`ConcurrentBag` (→ `Locked<T>` over a sendable collection, or `Channel<T>`), `ImmutableArray`/`ImmutableList`/`ImmutableDictionary` (→ `FrozenArray<T>`), `ReadOnlyDictionary`, `BitArray`, `Lookup`, `KeyValuePair` (→ `DictionaryEntry<K,V>`), `Tuple`/`ValueTuple` (**Bezel has no tuples** — use a record), `Nullable<T>` (→ `T?`), `IComparer<T>` (only `IEqualityComparer<T>` exists), `StringComparison`/`StringComparer`. Absent *members* on types that do exist: `Array<T>` has no `RemoveAll`, `FindIndex`, `FindAll`, `Find`, `Exists`, `BinarySearch`, `CopyTo`, `TrueForAll`, `GetRange`, `InsertRange`, `RemoveRange`, `ForEach`; `Dictionary` has no `GetValueOrDefault` (→ `GetOrNull`) — it *does* have `TryAdd` since v0.282; `Math` has no transcendental block since v0.284 (`Sin`/`Cos`/`Tan`/`Asin`/`Acos`/`Atan`/`Atan2`/`Sinh`/`Cosh`/`Tanh`/`Exp`/`Log`/`Log10`/`Log2`/`E` removed; `Sqrt`/`Pow`/rounding stay) and no `Hypot`/`Cbrt`/`PI` (never documented) — the compiler rejects every one of these with a removed-at-v0.284 diagnostic (#3559); `IEnumerable<T>` has no `OfType<U>` since v0.284 (#3559, rejected likewise); `Console` has no `Clear` since v0.284 (rejected as an unknown `Console` static, #3572); `OwningArray<T>` declares no `ToArray`/`Sorted`/`Reversed`; `OwningLinkedList<T>` has no source constructor; `Stack`/`Queue` have no `Add`/`Remove`/`IsReadOnly`.
+**Collections.** `List<T>` (reserved name), `HashSet<T>` (→ `Set<T>`), `SortedList`, `PriorityQueue`, `Deque`, `ConcurrentDictionary`/`ConcurrentQueue`/`ConcurrentBag` (→ `Locked<T>` over a sendable collection, or `Channel<T>`), `ImmutableArray`/`ImmutableList`/`ImmutableDictionary` (→ `FrozenArray<T>`), `ReadOnlyDictionary`, `BitArray`, `Lookup`, `KeyValuePair` (→ `DictionaryEntry<K,V>`), `Tuple`/`ValueTuple` (**Bezel has no tuples** — use a record), `Nullable<T>` (→ `T?`), `IComparer<T>` (only `IEqualityComparer<T>` exists), `StringComparison`/`StringComparer`. Absent *members* on types that do exist: `Array<T>` has no `RemoveAll`, `FindIndex`, `FindAll`, `Find`, `Exists`, `BinarySearch`, `CopyTo`, `TrueForAll`, `GetRange`, `InsertRange`, `RemoveRange`, `ForEach`; `Dictionary` has no `GetValueOrDefault` (→ `GetOrNull`) — it *does* have `TryAdd` since v0.282; `Math` has no transcendental block since v0.284 (`Sin`/`Cos`/`Tan`/`Asin`/`Acos`/`Atan`/`Atan2`/`Sinh`/`Cosh`/`Tanh`/`Exp`/`Log`/`Log10`/`Log2`/`E` removed; `Sqrt`/`Pow`/rounding stay) and no `Hypot`/`Cbrt`/`PI` (never documented) — the compiler rejects every one of these with a removed-at-v0.284 diagnostic (#3559); `IEnumerable<T>` has no `OfType<U>` since v0.284 (#3559, rejected likewise); `Console` has no `Clear` since v0.284 (rejected as an unknown `Console` static, #3572); `OwningArray<T>` declares no `ToArray`/`Sorted`/`Reversed`; `OwningLinkedList<T>` has no source constructor; `Stack`/`Queue` have no `Add`/`Remove`/`IsReadOnly`; `Counter<K>` has no `ContainsKey` (→ `Contains(key)`, `key in tally`, v0.290); `ArraySpan<T>`/`ReadOnlyArraySpan<T>` have no concrete cross-mode `SequenceEqual` (the `IReadOnlySpan<T>` overload takes the other family's span directly, v0.290).
 
-**Text.** `string.Format`/`String.Format` (**use interpolation**), `String.Empty` (use `""`), `string.Concat`, `Split` with a remove-empty option, `Regex`, `ToTitleCase`, `Normalize`, the `StringBuilder.Length` setter, the `C` format specifier, any culture-aware formatting.
+**Text.** `string.Format`/`String.Format` (**use interpolation**), `String.Empty` (use `""`), `string.Concat`, `Split` with a remove-empty option, `Regex`, `ToTitleCase`, `Normalize`, the `StringBuilder.Length` setter, the `C` format specifier, any culture-aware formatting, `string.IsNullOrEmpty` (→ `s = null or s.IsEmpty`, v0.290), the static `string.Compare(a, b[, ignoreCase])` (→ `a.CompareTo(b)`, `a.CompareTo(b, ignoreCase := true)`, v0.290).
 
 **Concurrency.** `Thread`, `ThreadPool`, `Monitor`, a `lock` statement (→ `Mutex`/`Locked<T>`), `Interlocked` (→ `Atomic<T>`), `ManualResetEvent`/`AutoResetEvent`/`CountdownEvent`/`Barrier`, `Task.Run` (→ `Domain.Spawn`), `Task.CompletedTask` (→ `Task.FromResult`), `Task.Yield`, `ConfigureAwait`, `Task.Wait`/`.Result` inside async code, `AggregateException` (first fault wins; **no aggregation**), `Parallel.For`.
 
-**Everything else.** `Object.MemberwiseClone` and any clone facility, `ICloneable`, member reflection (**declined, not deferred**), attributes, `Activator`, `Lazy<T>`, `WeakReference` (→ `Weak<T>`), `Option<T>` (→ `T?`), `Result.Unwrap`/`UnwrapOrElse`, `Math.Round(decimal)` (→ `Decimal.Round`), `Math.Cbrt`/`Hypot`/`BigMul`, `Random.Shared`, cryptographic randomness, a `Guid` constructor, `Environment.StackTrace`/`CurrentDirectory`/`TickCount`, `Convert` from any non-`string` source, `Encoding.GetEncoding(name)`/`Encoding.Default`, `OutOfMemoryException`, `InnerException` on user exception types, multidimensional arrays, `defer`/`errdefer` (→ `ScopeGuard`).
+**Everything else.** `Object.MemberwiseClone` and any clone facility, `ICloneable`, member reflection (**declined, not deferred**), attributes, `Activator`, `Lazy<T>`, `WeakReference` (→ `Weak<T>`), `Option<T>` (→ `T?`), `Result.Unwrap`/`UnwrapOrElse`, `Math.Round(decimal)` (→ `Decimal.Round`), `Math.Cbrt`/`Hypot`/`BigMul`, `Random.Shared`, cryptographic randomness, a `Guid` constructor, `Environment.StackTrace`/`CurrentDirectory`/`TickCount`, `Convert` from any non-`string` source, `Encoding.GetEncoding(name)`/`Encoding.Default`, `Encoding.GetString(bytes, start, length)` (→ `GetString(bytes.AsReadOnlySpan(start, length))`, v0.290), `Stopwatch.Restart()` (→ `Reset(); Start();`, v0.290), `Type.Implements(iface)` (→ `iface.IsAssignableFrom(t)`, v0.290), `Math.Sign(c: char)` (`Sign<T>` needs `INumber<T>` — `Math.Sign(int(c))`), `OutOfMemoryException`, `InnerException` on user exception types, multidimensional arrays, `defer`/`errdefer` (→ `ScopeGuard`).
 
 ### 5.12 The `pure` inventory
 
@@ -2025,6 +2025,12 @@ Through v0.245 the marker was spelled `owned` at binding positions. After v0.246
 - **`out owned var x` is gone.** `out var x` adopts the signature: a borrow against `out`, an owned local against `out owned` (discharge it yourself, or use `out using var x`, which is accepted only against `out owned`).
 - **`operator ++`/`operator --` are gone.** `++`/`--` are built-in statements on integer, floating-point, `decimal` and `char` operands only (§6.6's set — `char++` still works). Declare `operator +(c: Counter, n: int)` and write `c := c + 1;`, or use a named method.
 - **`import System.Collections.Generic;` is redundant.** Every §4 name is bare-visible (`Dictionary`, `Set`, `Stack`, `Queue`, the spans, `Counter`, `FrozenArray`, `KeyNotFoundException`, the iteration interfaces). The line still compiles. Beware the new bare names when naming your own types: a same-named type in your module shadows the import; a same-named export from another imported module is an ambiguity error.
+
+### 8.7 v0.290 — the stdlib regularization: nine defaults, four retired duals, one interface-declared read tier
+
+- **Optional trailing arguments are `:=` defaults now** — `Task.Delay(ms, token := …)`, `Directory.Delete(path, recursive := false)`, `Pad*(width, paddingChar := ' ')`, `new FileStream(path, mode, access := FileAccess.ReadWrite)`, `new BinaryDeserializer(span, ignoreUnknownFields := false)` / `Binary.Parse<T>(span, ignoreUnknownFields := false)` (both span families), `Debug.Assert(cond, message := "")`, `Math.Round(x, digits := 0)`, `IndexOf(value, startIndex := 0)` on `string` and `Array<T>`. Every call you wrote before still compiles; named arguments for the defaulted position are new.
+- **Gone:** `string.IsNullOrEmpty(s)` (→ `s = null or s.IsEmpty`); static `string.Compare(a, b[, ic])` (→ `a.CompareTo(b)`, `a.CompareTo(b, ignoreCase := true)`); `sw.Restart()` (→ `sw.Reset(); sw.Start();`); `t.Implements(i)` (→ `i.IsAssignableFrom(t)`); `enc.GetString(bytes, start, length)` (→ `enc.GetString(bytes.AsReadOnlySpan(start, length))`); `tally.ContainsKey(k)` on `Counter<K>` (→ `tally.Contains(k)` / `k in tally`); `Math.Sign` on a `char` (→ `Math.Sign(int(c))`). `Math.Sign<T>` is generic over `INumber<T>` and is **not** `pure`.
+- **The byte read tier is one block on `IReadOnlySpan<byte>`.** Nothing changes at a call: `bytes.AsReadOnlySpan().ReadUInt32LittleEndian()` and `span.ReadInt16BigEndian()` resolve as before. A parameter typed `IReadOnlySpan<byte>` now has the read accessors too.
 
 ---
 

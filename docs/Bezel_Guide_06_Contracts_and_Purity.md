@@ -1,6 +1,6 @@
 # Bezel Guide 6: Contracts and Purity
 
-*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.270.*
+*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.290.*
 
 Bezel lets a signature state obligations the compiler enforces: **`requires(...)`** for what the caller must guarantee, **`ensures(...)`** for what the member guarantees back, **`invariant(...);`** for what an object maintains at its public boundary (spec §22.16), and **`pure`** for members that promise no effects at all (spec §22.15). The syntax is small; the *postures* are what this guide teaches. Contracts are grammar, not a debug-mode assertion library: `requires` runs in every build, and a violation is a bug report, not an outcome (§1). Two postures will break habits you may bring along, and each is headed **How Bezel does it**. First: `requires` states only what a *correct caller already guarantees* — never validation of trust-boundary input, which is value-shape territory Guide 2 owns (§2). Second: `pure` is a promise you *declare* and the compiler verifies — never inferred from a body (§5). If you skim everything else, read those two and the table in §9.
 
@@ -262,7 +262,7 @@ What it does **not** buy: pure calls are not compile-time evaluated — a pure c
 
 ## 8. `Debug.Assert`: the landed assertion surface
 
-`System.Diagnostics` requires an explicit `import System.Diagnostics;`. Its surface, unchanged from v0.247 through v0.270, is `Stopwatch` (stdlib §8.1) and the static `Debug` class (stdlib §8.2) — `Assert(condition)`, `Assert(condition, message)`, and `WriteLine(message)`. That is the whole in-body assertion vocabulary the library ships today. Anything richer is not landed, and this guide teaches only what exists.
+`System.Diagnostics` requires an explicit `import System.Diagnostics;`. Its surface is `Stopwatch` (stdlib §8.1) and the static `Debug` class (stdlib §8.2) — `Assert(condition, message := "")` and `WriteLine(message)`. That is the whole in-body assertion vocabulary the library ships today. Anything richer is not landed, and this guide teaches only what exists.
 
 ```bezel
 import System.Diagnostics;

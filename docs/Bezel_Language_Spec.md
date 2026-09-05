@@ -1,6 +1,6 @@
 # Bezel Language Specification
 
-**Version 0.289 — September 2026**
+**Version 0.290 — September 2026**
 
 Bezel is a compiled language for services and tools, with ownership-based memory management and no garbage collector. The compiler tracks ownership of every heap object and ensures that each one is disposed exactly once. Borrowing lets you pass references without transferring ownership, with lifetimes checked at compile time rather than enforced by a runtime. The result aims to give you the safety of a managed language and the predictability of a manual one, without the ceremony of either.
 
@@ -485,7 +485,7 @@ Each primitive keyword aliases a standard library type. `string`, though a refer
 | `char` | `System.Char` |
 | `string` | `System.String` |
 
-Static members of the standard library type are accessible through either form: `int.Parse`, `int.MaxValue`, `double.IsNaN`, `string.IsNullOrEmpty`.
+Static members of the standard library type are accessible through either form: `int.Parse`, `int.MaxValue`, `double.IsNaN`, `string.IsNullOrWhiteSpace`.
 
 `Object` has no lowercase keyword alias. Keyword aliases are reserved for primitive value types; `Object` is a class and is referenced as `Object` unconditionally — there is no `object` spelling.
 
@@ -1265,7 +1265,7 @@ Unboxing reverses the process: a null `Object` reference unboxes to `null` of th
 <a id="sec-boxing-of-borrow-bearing-records"></a>
 #### Boxing of borrow-bearing records
 
-Boxing a borrow-bearing record ([§9.7](#sec-records-and-disposal)) is subject to the same borrow-lifetime constraints as any other operation on a borrow-bearing value. The boxed copy on the heap holds the same borrowed references as the source record; it does not extend their lifetimes. The compiler enforces: a boxed borrow-bearing record value may not be stored in a location that could outlive the source of any borrow the record contains. In practice, this means a borrow-bearing record may be boxed for a short-lived interface call (e.g. passing to a method accepting `Object`) provided the boxed value does not escape the borrow's source scope. Storing a boxed borrow-bearing record in a field, returning it from a method, or capturing it in a closure that escapes the source scope is rejected by the same rules as the unboxed form ([§9.7](#sec-records-and-disposal), [§28.3](#sec-local-variables-ownership-and-borrows)). The canonical sanctioned use is passing a span to a parameter of type `IReadOnlySpan<TElement>` (stdlib [§4.16](Bezel_Standard_Library.md#sec-ireadonlyspan)): the box is bounded by the call frame, the interface surface is escape-free by construction (no `GetEnumerator`, no `Slice`, no operation returning a borrow-retaining handle), and the source outlives the call in the common synchronous case. The contrasting *forbidden* case is the `IEnumerable<T>` enumerator path: `GetEnumerator()` returns a heap object that would hold the span's borrow across its own, unbounded lifetime, which the borrow tracker cannot bound — which is why spans do not implement `IEnumerable<T?>` ([§29.2](#sec-desugaring-of-for)). The distinction is escaping (an enumerator/field/return/escaping-closure) versus call-bounded, not boxing per se. A borrow-bearing **choice** ([§35.4](#sec-choice-classification)) boxes under exactly these rules.
+Boxing a borrow-bearing record ([§9.7](#sec-records-and-disposal)) is subject to the same borrow-lifetime constraints as any other operation on a borrow-bearing value. The boxed copy on the heap holds the same borrowed references as the source record; it does not extend their lifetimes. The compiler enforces: a boxed borrow-bearing record value may not be stored in a location that could outlive the source of any borrow the record contains. In practice, this means a borrow-bearing record may be boxed for a short-lived interface call (e.g. passing to a method accepting `Object`) provided the boxed value does not escape the borrow's source scope. Storing a boxed borrow-bearing record in a field, returning it from a method, or capturing it in a closure that escapes the source scope is rejected by the same rules as the unboxed form ([§9.7](#sec-records-and-disposal), [§28.3](#sec-local-variables-ownership-and-borrows)). The canonical sanctioned use is passing a span to a parameter of type `IReadOnlySpan<TElement>` (stdlib [§4.16](Bezel_Standard_Library.md#sec-ireadonlyspan)): the box is bounded by the call frame, the interface surface is escape-free by construction (no `GetEnumerator`, no `Slice`, no operation returning a borrow-retaining handle), and the source outlives the call in the common synchronous case. The same bound applies to the **receiver** of an extension-block call whose head is an interface ([§26.2](#sec-what-can-be-extended), [§26.5](#sec-resolution) rule 2): the receiver boxes for the call's duration on identical terms. The contrasting *forbidden* case is the `IEnumerable<T>` enumerator path: `GetEnumerator()` returns a heap object that would hold the span's borrow across its own, unbounded lifetime, which the borrow tracker cannot bound — which is why spans do not implement `IEnumerable<T?>` ([§29.2](#sec-desugaring-of-for)). The distinction is escaping (an enumerator/field/return/escaping-closure) versus call-bounded, not boxing per se. A borrow-bearing **choice** ([§35.4](#sec-choice-classification)) boxes under exactly these rules.
 
 <a id="sec-boxing-of-inline-arrays"></a>
 #### Boxing of inline arrays
@@ -3528,7 +3528,6 @@ public sealed class Type
 
   // Lattice queries.
   public readonly property BaseType: Type?;
-  public method Implements(iface: Type): bool;
   public method IsAssignableFrom(other: Type): bool;
 
   // Enum metadata (valid only when IsEnum; otherwise raises
