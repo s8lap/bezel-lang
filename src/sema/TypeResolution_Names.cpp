@@ -128,12 +128,13 @@ int Resolver::builtinTypeArity(std::string_view n) {
         n == "NullReferenceException" ||
         n == "IndexOutOfRangeException" ||
         // issue #388 / stdlib §4.8: KeyNotFoundException — raised by the
-        // Dictionary<K,V> indexer getter for an absent key. Per the spec it
-        // lives in System.Collections.Generic and requires `import`; the
-        // compiler does not yet enforce import-gating for that namespace (its
-        // sibling collection types Array/Dictionary/… all resolve without
-        // import here too), so it joins the resolvable built-in exception set
-        // for consistency, enabling `catch KeyNotFoundException`.
+        // Dictionary<K,V> indexer getter for an absent key. It lives in
+        // System.Collections.Generic, which §2.3 auto-imports (v0.289,
+        // proposal 0122 L3, #3843) — so resolving it (and its sibling
+        // collection types Array/Dictionary/…) without an explicit import is
+        // correct by design, not an unenforced gate. It joins the resolvable
+        // built-in exception set for consistency, enabling `catch
+        // KeyNotFoundException`.
         n == "KeyNotFoundException" ||
         n == "MatchFailureException" ||
         n == "OperationCanceledException" ||
@@ -144,10 +145,12 @@ int Resolver::builtinTypeArity(std::string_view n) {
         n == "SerializationException" ||
         // issue #976 / stdlib §7.4 / §7.5: System.Threading TimeoutException and
         // the System.IO exception family. Per the spec these live in
-        // System.Threading / System.IO and require `import`, but — like
-        // KeyNotFoundException (System.Collections.Generic) above — the compiler
+        // System.Threading / System.IO and require `import`, but the compiler
         // does not yet enforce import-gating for those namespaces (File/Directory/
-        // Path resolve without import too), so they join the resolvable built-in
+        // Path resolve without import too) — the still-open spec-ahead-of-impl
+        // gap tracked by #3807 (unlike KeyNotFoundException's
+        // System.Collections.Generic above, which v0.289 ratified as
+        // auto-imported per §2.3, #3843). So they join the resolvable built-in
         // exception set, enabling `catch var ex: IOException` and `throw new
         // IOException(...)`. Hierarchy is in builtinExceptionHierarchy() (codegen).
         n == "TimeoutException" || n == "IOException" ||

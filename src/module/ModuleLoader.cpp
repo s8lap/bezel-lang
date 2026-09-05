@@ -4836,16 +4836,16 @@ std::optional<ModuleMetadata> loadDependency(const std::string& artifactPath,
 }
 
 // §2.8.1 rule 5 (#1729, v0.188): the implementation-provided module set —
-// the §2.3 always-available set (System, System.Text, System.Collections.Linq)
-// plus the explicitly-imported modules the standard-library document defines
-// (System.Collections.Generic, System.Threading, System.IO, System.Diagnostics,
-// System.Serialization, System.Reflection, System.Interop). Adding a name here
-// without also editing the spec/stdlib amendment is a spec defect — see the
-// proposal 0034 ruling and the file header in docs/proposals/0034-module-
-// identity.md §1 rule 5.
+// the §2.3 always-available set (System, System.Text, System.Collections.Generic,
+// System.Collections.Linq — the third joined the set in v0.289, proposal 0122
+// L3, #3843) plus the explicitly-imported modules the standard-library document
+// defines (System.Threading, System.IO, System.Diagnostics, System.Serialization,
+// System.Reflection, System.Interop). Adding a name here without also editing
+// the spec/stdlib amendment is a spec defect — see the proposal 0034 ruling and
+// the file header in docs/proposals/0034-module-identity.md §1 rule 5.
 static constexpr const char* kImplProvidedModuleNames[] = {
     "System",                       // stdlib §2
-    "System.Collections.Generic",   // stdlib §4
+    "System.Collections.Generic",   // stdlib §4 (auto-imported, v0.289)
     "System.Collections.Linq",      // stdlib §5 (auto-imported, v0.278)
     "System.Diagnostics",           // stdlib §8
     "System.Interop",               // stdlib §10.5/§10.6
