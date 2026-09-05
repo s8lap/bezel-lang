@@ -22574,6 +22574,81 @@ struct StringEscapeWalker {
                     ctx.exprSymbol(*callee));
             }
         }
+        // fix #3886 (§4.8/§4.9/§28.9): the walkCallArgs twin of fix #3872's
+        // IndexExpr arm above (in this same struct). #3872 taught the walker
+        // that a bare string-local KEY argument to a built-in
+        // Dictionary<string,V>/OwningDictionary<string,V> INDEXER (`d[key]`
+        // get/set) is a safe read; the SAME fact is equally true of every
+        // built-in Dictionary/OwningDictionary NAMED-METHOD call that takes a
+        // string key, but this walker had no relaxation for them: these are
+        // matched structurally by name in LlvmBackend_Calls.cpp's `isDict`
+        // dispatch block, not a resolved sema::MethodSymbol (`ms` stays null
+        // for every one of them, mirroring how a built-in indexer carries no
+        // PropertySymbol per #3872's root-cause note), so a bare string-local
+        // KEY argument to any of these calls fell through to the walker's
+        // conservative escape and the local's own scope-end release never
+        // armed (measured: adding `.ContainsKey(key)` after `d[key] := 1`
+        // reintroduces #3872's identical leak signature, 8290 B / 400
+        // allocations at 200x under ASan/LSan — issue #3886).
+        //
+        // SOUNDNESS, verified per admitted method by reading
+        // LlvmBackend_Calls.cpp's `isDict` block rather than assumed: every
+        // one of ContainsKey/Contains/TryGetValue/Add/TryAdd/Remove/
+        // PopValue/TryPopValue/GetOrNull/GetOrAdd lowers its string KEY
+        // argument through `strDataLen(k)` — it extracts the (data, length)
+        // byte pair and, on a fresh insertion, `bz_dict_set_str`
+        // `strndup`s a COPY into the table's own buffer. None of these
+        // functions stores or retains the caller's `bz_string*` itself; this
+        // is the identical fact #3703's and #3872's fixes already established
+        // and relied on. So a scope-end release of the local's own +1 can
+        // never dangle the dict's internal copy (no UAF) and never
+        // double-frees the same reference (the dict never took one).
+        // `Set` is deliberately absent from the admitted-method list: stdlib
+        // §4.8 states outright "There is no separate `Set` method ... A call
+        // to a `Set` method on any collection is rejected as an unknown
+        // member" — no CallExpr with member "Set" can ever reach codegen, so
+        // admitting it here would be dead code, not a widening.
+        //
+        // The KEY parameter is ALWAYS argument index 0 for every admitted
+        // method (verified in LlvmBackend_Calls.cpp: `k = lowerExpr(*call.
+        // args[0].value)` at each arm) — Add/TryAdd's VALUE-position second
+        // argument (index 1) and GetOrAdd's factory-closure second argument
+        // are NOT widened by this change (index != 0 never matches below);
+        // their co-owned-+1/retain story is different (§3703's VALUE-side
+        // handling) and stays out of scope here, exactly as issue #3886
+        // scoped it.
+        //
+        // Gated on stringReleaseMode (the #1997 narrowing) and restricted to
+        // a NON-NULLABLE `string` key type, mirroring #3872's IndexExpr twin
+        // exactly (a `string?` key's null/sentinel handling is out of scope
+        // for this increment). `SortedDictionary<string,V>` is deliberately
+        // NOT matched (headName()=="Dictionary"||"OwningDictionary" only) —
+        // #3872's own boundary control already pins that receiver as still
+        // leaking; this fix does not touch it either.
+        bool dictMethodStrKeySafe = false;
+        if (stringReleaseMode && callee) {
+            if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(callee)) {
+                if (ma->target &&
+                    (ma->member == "ContainsKey" || ma->member == "Contains" ||
+                     ma->member == "TryGetValue" || ma->member == "Add" ||
+                     ma->member == "TryAdd" || ma->member == "Remove" ||
+                     ma->member == "PopValue" || ma->member == "TryPopValue" ||
+                     ma->member == "GetOrNull" || ma->member == "GetOrAdd")) {
+                    if (const sema::TypeRef* rt = ctx.exprType(*ma->target)) {
+                        std::string_view h = rt->headName();
+                        if ((h == "Dictionary" || h == "OwningDictionary") &&
+                            !rt->genericArgs.empty() && rt->genericArgs[0] &&
+                            !rt->genericArgs[0]->nullable &&
+                            rt->genericArgs[0]->kind ==
+                                sema::TypeRef::Kind::Primitive &&
+                            rt->genericArgs[0]->primitive ==
+                                sema::PrimitiveType::String) {
+                            dictMethodStrKeySafe = true;
+                        }
+                    }
+                }
+            }
+        }
         for (size_t i = 0; i < args.size(); ++i) {
             const ast::CallArgument& a = args[i];
             bool safeArg = false;
@@ -22787,6 +22862,18 @@ struct StringEscapeWalker {
                         safeArg = true;
                 }
             }
+            // fix #3886: the KEY position is always index 0 (see the
+            // detection comment above `dictMethodStrKeySafe`'s computation) —
+            // gated on the SAME plain-argument-shape check every other arm
+            // in this function uses (no modifier, no named-arg prefix, not a
+            // discard), so a `.ContainsKey(key: k)` named-arg spelling or a
+            // `d.ContainsKey(out _)`-shaped discard (not spellable for these
+            // signatures today, but defensive symmetry with every sibling
+            // arm above) still falls through to the conservative escape.
+            if (!safeArg && dictMethodStrKeySafe && i == 0 &&
+                a.modifier.empty() && a.name.empty() && !a.isDiscard &&
+                isTargetIdent(a.value.get()))
+                safeArg = true;
             expr(a.value.get(), safeArg);
         }
     }
