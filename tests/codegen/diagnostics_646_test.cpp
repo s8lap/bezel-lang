@@ -130,15 +130,42 @@ BEZEL_TEST(diagnostics_646_8_1, stopwatch_reset) {
         "return 0; ")), 1);
 }
 
-// stdlib §8.1: Restart() — starts measurement from zero; IsRunning = true
-// and ElapsedMilliseconds = 0 immediately after Restart.
+// fix #3852 (stdlib §8.1, v0.290, proposal 0123 R6(b)): `Restart()` was
+// retired — never documented, and never should have compiled. The migrated
+// spelling is `sw.Reset(); sw.Start();`, which §8.1 now states is exactly
+// what the deleted `bz_stopwatch_restart` runtime entry did: stop-and-zero
+// then start. This row keeps the ORIGINAL assertion this test pinned before
+// the migration (IsRunning = true after the restart-shaped sequence),
+// proving the replacement spelling reproduces the retired member's behavior.
 BEZEL_TEST(diagnostics_646_8_1, stopwatch_restart_is_running_zero) {
     BEZEL_EXPECT_EQ(run(prog(
         "using var sw := new Stopwatch(); "
         "sw.Start(); "
         "sw.Stop(); "
-        "sw.Restart(); "
+        "sw.Reset(); "
+        "sw.Start(); "
         "if sw.IsRunning then return 1; end; "
+        "return 0; ")), 1);
+}
+
+// fix #3852 (stdlib §8.1, v0.290): pins the `Reset()` contract the doc now
+// states in prose — "Reset() stops the stopwatch and zeroes Elapsed" — for
+// the case that actually distinguishes `Reset(); Start();` from a no-op:
+// calling `Reset()` on a STILL-RUNNING watch (no prior `Stop()`). Before this
+// fix only `stopwatch_reset` existed, and it always called `Stop()` first, so
+// "Reset() stops the watch" was never exercised on a running watch. Without
+// the stop-even-if-running behavior, `sw.Reset(); sw.Start();` would not
+// reproduce what `bz_stopwatch_restart` did (reset elapsed unconditionally,
+// then (re)start), so this is the row that makes the migration above sound.
+BEZEL_TEST(diagnostics_646_8_1, stopwatch_reset_stops_and_zeroes_while_running) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "using var sw := new Stopwatch(); "
+        "sw.Start(); "
+        "var i: int := 0; "
+        "while i < 50000 do i := i + 1; end; "
+        "sw.Reset(); "
+        "if sw.IsRunning then return 0; end; "
+        "if sw.ElapsedMilliseconds = 0L then return 1; end; "
         "return 0; ")), 1);
 }
 

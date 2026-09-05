@@ -12605,12 +12605,10 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                         builder_.CreateCall(fn, {sw});
                         return nullptr;
                     }
-                    if (mname == "Restart" && call.args.empty()) {
-                        auto* fn = declareC("bz_stopwatch_restart",
-                            llvm::Type::getVoidTy(llvm_), {ptrTy()});
-                        builder_.CreateCall(fn, {sw});
-                        return nullptr;
-                    }
+                    // fix #3852 (stdlib §8.1, v0.290, proposal 0123 R6(b)):
+                    // `Restart()` was never documented and is retired — sema
+                    // rejects it before codegen is reached (`ExprTypecheck_Calls.cpp`,
+                    // `cls == "Stopwatch"`), so no arm belongs here.
                 }
             }
         }

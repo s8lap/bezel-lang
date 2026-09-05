@@ -8,6 +8,5 @@ public class Stopwatch
 
   public method Start();
   public method Stop();
-  public method Restart();
   public method Reset();
 end Stopwatch;

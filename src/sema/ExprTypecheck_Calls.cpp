@@ -8022,7 +8022,10 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             swTy->declaration = builtinClassSym("Stopwatch");
                             ctx_.setExprType(&ce, swTy);
                         }
-                        // Instance methods Start/Stop/Reset/Restart return unit.
+                        // Instance methods Start/Stop/Reset return unit. `Restart`
+                        // was retired at v0.290 (fix #3852, stdlib §8.1, proposal
+                        // 0123 R6(b)) — never documented; see the `cls ==
+                        // "Stopwatch"` reject arm below.
                         // Debug.Assert/WriteLine return unit. Both are untyped (void).
                     }
                     // §8.2 / issue #646: Debug static methods return unit (void).
@@ -8792,9 +8795,10 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                          "FireAndForget(owned task) (§30.9)",
                          "6.7"},
                         // §8.1 (v0.240 / #3024) — Stopwatch static factory
-                        // only. Instance methods Start/Stop/Reset/Restart
-                        // are handled by the per-instance-type arms
-                        // below (rcn == "Stopwatch" arms). Elapsed,
+                        // only. Instance methods Start/Stop/Reset (`Restart`
+                        // retired at v0.290, fix #3852, proposal 0123 R6(b))
+                        // are handled by the per-instance-type arm
+                        // below (the `cls == "Stopwatch"` arm). Elapsed,
                         // ElapsedMilliseconds, ElapsedTicks are
                         // PROPERTIES, dispatched through
                         // resolveMemberAccess (not a method call).
@@ -19656,6 +19660,37 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                             return;
                         }
                     }
+                    // fix #3852 (stdlib §8.1, v0.290, proposal 0123 R6(b)):
+                    // `Restart()` was retired. This receiver shape —
+                    // `declaration == nullptr`, name resolved structurally via
+                    // `astNode` — is exactly what a `using var sw := new
+                    // Stopwatch();`-constructed receiver has: `new Stopwatch()`'s
+                    // resolved type is never stamped with `declaration =
+                    // builtinClassSym("Stopwatch")` the way the
+                    // `Stopwatch.StartNew()`-typed path is (see the
+                    // `cls == "Stopwatch"` arm further down in this function,
+                    // reached only when `declaration` IS set), so THIS is the
+                    // path a `new Stopwatch()` receiver's `sw.Restart()` call
+                    // actually takes — sibling to the `isRegisteredCollection`
+                    // arm just above, same reason (#2465's "declaration==null
+                    // is not a reliable 'nothing implements this' signal").
+                    // Without this arm the call falls through to the codegen-
+                    // level #2935/#2966 general "no dispatch arm emitted any
+                    // code" gate, whose message is a generic misspelling-or-
+                    // unimplemented catch-all rather than naming the actual
+                    // retirement and its replacement.
+                    if (cn == "Stopwatch" && ma.member == "Restart") {
+                        auto loc = ma.span.begin;
+                        if (loc.line == 0 && ma.target)
+                            loc = ma.target->span.begin;
+                        ctx_.diagnostics().report(
+                            Severity::Error, loc,
+                            "'Stopwatch' has no instance method 'Restart' "
+                            "(stdlib \xC2\xA7""8.1, retired v0.290, proposal "
+                            "0123 R6(b)) — it is gone, not misspelled (issue "
+                            "3852). Use 'sw.Reset(); sw.Start();' instead.");
+                        return;
+                    }
                 }
             }
         }
@@ -20118,21 +20153,50 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 }
                 // ToString → string, CompareTo → int, Round → decimal (instance methods).
             }
-            // §8.1 / issue #646: Stopwatch instance method and static factory
-            // return types.  Start/Stop/Reset/Restart → unit (leave untyped).
-            // StartNew() is also handled in the static-call path above; the
-            // duplicate here handles the `sw.StartNew()` misuse gracefully
-            // (won't crash, just leaves untyped — the static path is the real one).
+            // §8.1 / issue #646, fix #3852: Stopwatch instance method and
+            // static factory return types.  Start/Stop/Reset → unit (leave
+            // untyped). StartNew() is also handled in the static-call path
+            // above; the duplicate here handles the `sw.StartNew()` misuse
+            // gracefully (won't crash, just leaves untyped — the static path
+            // is the real one).
             if (cls == "Stopwatch") {
                 if (m == "StartNew") {
                     auto* swTy = ctx_.makeTypeRef();
                     swTy->kind = TypeRef::Kind::Named;
                     swTy->declaration = builtinClassSym("Stopwatch");
                     ctx_.setExprType(&ma, swTy);
+                } else if (m == "Start" || m == "Stop" || m == "Reset") {
+                    // valid instance methods; unit return (leave untyped).
+                } else if (m == "Restart") {
+                    // fix #3852 (stdlib §8.1, v0.290, proposal 0123 R6(b)):
+                    // `Restart()` was never documented — impl-ahead-of-spec,
+                    // caught up at the v0.290 landing (changelog v0.290's
+                    // "impl-ahead-of-spec" tracking list). `Reset()` stops the
+                    // stopwatch and zeroes `Elapsed`; `sw.Reset(); sw.Start();`
+                    // is byte-for-byte what the deleted `bz_stopwatch_restart`
+                    // runtime entry did (both codegen and runtime arms are
+                    // deleted — see `LlvmBackend_Calls.cpp` and
+                    // `bezel_runtime_time.cpp`).
+                    ctx_.diagnostics().report(
+                        Severity::Error, ma.span.begin,
+                        "'Stopwatch' has no instance method 'Restart' (stdlib "
+                        "§8.1, retired v0.290, proposal 0123 R6(b)) — it is "
+                        "gone, not misspelled (issue 3852). Use "
+                        "'sw.Reset(); sw.Start();' instead.");
                 }
+                // Any OTHER member name (including the universal
+                // Equals/GetHashCode/ToString/GetType, which reach here too
+                // since Stopwatch has null `decl`) is deliberately left
+                // untyped, exactly as before this fix — Stopwatch has no
+                // general accept-list reject fallback (unlike Console/Math/
+                // Convert/BitConverter, #1037/#1038/#3344/#3572), and adding
+                // one is out of this issue's scope (#3852 is scoped to
+                // deleting `Restart` specifically; a blanket reject risked a
+                // false-reject on the universal object methods with no
+                // measured call-site count to justify it — flagged, not
+                // fixed here).
                 // IsRunning, ElapsedMilliseconds, Elapsed: property reads, not
                 // call expressions — handled in resolveMemberAccess above.
-                // Start / Stop / Reset / Restart → unit (leave untyped).
             }
             // §8.2 / issue #646: Debug static methods — all return unit.
             // Assert / WriteLine: leave untyped (void).

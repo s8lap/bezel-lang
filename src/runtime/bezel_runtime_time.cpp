@@ -884,15 +884,6 @@ void bz_stopwatch_reset(void* swp) {
     sw->start_ts.tv_nsec = 0;
 }
 
-// per stdlib §8.1: Stopwatch.Restart() — reset and start immediately.
-void bz_stopwatch_restart(void* swp) {
-    auto* sw = (bz_stopwatch_t*)swp;
-    if (!sw) return;
-    sw->elapsed_ns = 0;
-    clock_gettime(CLOCK_MONOTONIC, &sw->start_ts);
-    sw->running = 1;
-}
-
 // per stdlib §8.1: Stopwatch.IsRunning — returns 1 (true) or 0 (false).
 int32_t bz_stopwatch_is_running(void* swp) {
     auto* sw = (bz_stopwatch_t*)swp;
