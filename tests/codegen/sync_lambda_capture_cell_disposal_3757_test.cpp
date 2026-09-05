@@ -86,18 +86,11 @@
 #include "support/aot_support.hpp"   // runAot / runAotChecked — AOT harness
 #include "test_harness.hpp"
 
-using bezel::test::runAot;
 using bezel::test::runAotChecked;
 
 namespace {
 std::string checkedOut(const std::string& prog) {
     auto r = runAotChecked(prog);
-    return r.ran ? r.stdoutText : std::string("<did-not-run>");
-}
-// Plain runAot for row 4, whose shape still leaks by design — see the
-// file-header comment and issue #3766.
-std::string plainOut(const std::string& prog) {
-    auto r = runAot(prog);
     return r.ran ? r.stdoutText : std::string("<did-not-run>");
 }
 
@@ -201,31 +194,29 @@ BEZEL_TEST(sync_lambda_capture_cell_disposal_3757,
         "total=200 n=0\n");
 }
 
-// ── Row 4, CAPTURE AT 3 LEVELS (f -> g -> h), KNOWN GAP filed as #3766: `a`
-// is declared in the SYNC lambda `f`'s own body; `g` (nested in `f`)
-// captures `a` directly, and `h` (nested inside `g`) ALSO captures `a`
-// directly — a SECOND, independent capture of the same cell, one level
-// deeper than the first. This does NOT exercise this commit's fix in
-// isolation: `g`'s own direct capture of `a` IS disposed correctly (it is
-// bound while `currentFn_` still equals `f`'s own function, per the
-// capture-binding-before-`currentFn_ = fn` ordering in `lowerLambda`'s
-// prologue — the same mechanism rows 1-3/5/6 exercise), but `h`'s capture
-// is bound with `currentFn_ == g`'s own function, and `g`'s own
-// `collectCellFreeEligible(g.stmts)` scan does not know about `a` (`a`
-// is not declared within `g.stmts` — it belongs to the OUTER scope `f`).
-// Measured IDENTICAL (`total=1000 n=400`, no double-free/UAF) whether `a`'s
-// declaring scope is this sync lambda `f` or a PLAIN METHOD (see #3766) —
-// proving it is a pre-existing gap in the capture-binding machinery itself,
-// not a sync-lambda-venue Fn-token gap this commit's file ownership covers.
-// `plainOut` (not `checkedOut`): the leak is real, known, and out of scope;
-// this row exists to pin the value so a regression to a NEGATIVE `n` (a
-// double free) or a crash is caught, and to prove this commit's own fix
-// does not change it (n stays 400, not worse). a[0]!.V=1, h()=a[1]!.V=2,
-// g()=1+2=3, f()=3+2=5. 200 * 5 = 1000.
-// per §27.5 (issue #3757; residual gap filed as #3766)
+// ── Row 4, CAPTURE AT 3 LEVELS (f -> g -> h), #3766 FIXED. `a` is declared
+// in the SYNC lambda `f`'s own body; `g` (nested in `f`) captures `a`
+// directly, and `h` (nested inside `g`) ALSO captures `a` directly — a
+// SECOND, independent capture of the same cell, one level deeper than the
+// first. Pre-fix (`r12-cycle-1` baseline, before this commit's #3766 fix):
+// `total=1000 n=400` (2 slots × 200 iterations leaked through the cell).
+// Post-fix: `total=1000 n=0` — the element-dispose-through-cell fires per
+// iteration exactly as in rows 1-3/5/6. The fix path is in
+// `collectLambdaCaptures`'s #1135 widening walker (LlvmBackend_Setup.cpp ~L29240):
+// when the widening walker encounters a nested lambda `h` at a `var h :=
+// lambda()` (or `const h := lambda()`) position INSIDE a non-escaping
+// outer lambda `g`, AND `h`'s binding does not in turn escape `g`'s body
+// (proven by ClosureEscapeWalker), the widening is skipped and `h` is
+// reclassified as non-escaping — its captures (`a`) join
+// capturedByNonEscaping so `a` lands in cellFreeEligible_ and the cell
+// frees at `g`'s scope end. Same oracle as rows 1-3/5/6 (checkedOut /
+// ASan+LSan): a regression to a NEGATIVE `n` or a crash is caught by the
+// ASan half; a return to the OLD leak is caught by the LSan half. a[0]!.V=1,
+// h()=a[1]!.V=2, g()=1+2=3, f()=3+2=5. 200 * 5 = 1000.
+// per §27.5 (issues #3757, #3766)
 BEZEL_TEST(sync_lambda_capture_cell_disposal_3757,
            capture_three_levels_deep_known_gap_3766_spec_27_5) {
-    BEZEL_EXPECT_EQ(plainOut(
+    BEZEL_EXPECT_EQ(checkedOut(
         std::string(kHdr) +
         "class C "
         "  public static method Run(): int "
@@ -243,7 +234,7 @@ BEZEL_TEST(sync_lambda_capture_cell_disposal_3757,
         "    var total := 0; "
         "    for var j in 0..<200 do total := total + C.Run(); end; " +
         kTail),
-        "total=1000 n=400\n");
+        "total=1000 n=0\n");
 }
 
 // ── Row 5, SOUNDNESS — an element MOVED OUT from under the capture: `g`

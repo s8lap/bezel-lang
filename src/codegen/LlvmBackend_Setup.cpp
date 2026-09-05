@@ -29241,10 +29241,72 @@ void Emitter::collectCellFreeEligible(
                 std::unordered_set<const sema::Symbol*> nestedBodySyms;
                 std::function<void(const ast::Expr*)> findLamsE;
                 std::function<void(const ast::Stmt*)> findLamsS;
+                // fix #3766 (§15.1.1 / §27.5 / §15.3, v0.286): the #1135
+                // widening below conservatively classifies ANY outer local
+                // referenced through a nested lambda as escaping. This is
+                // over-conservative for a nested lambda at a `var h := lambda()`
+                // position inside a NON-ESCAPING outer lambda, IF the nested
+                // lambda's binding (`var h` itself) does not in turn escape
+                // `g`'s body — when `h` is used only locally (e.g. `h()` called
+                // locally, or `h`'s value read into another local), `h`'s env
+                // dies before `g`'s scope end and the captured cell can be
+                // safely freed at `g`'s scope end, restoring §15.1.1's
+                // auto-dispose. Reentering collectLambdaCaptures for `nl` with
+                // isNonEscaping=true puts its captures into capturedByNonEscap-
+                // ing (NOT capturedByEscaping), so `a` is in cellFreeEligible_
+                // and the disposeStack registers the cell at `g`'s scope end.
+                //
+                // SOUNDNESS — escape proof. The naive "any `var h := lambda()`
+                // is non-escaping" claim is unsound: `return h` from `g`,
+                // `escaped := h`, or passing `h` to a callee that retains it
+                // would all make `h` outlive `g`'s scope, freeing the cell while
+                // `escaped`'s env still aliases it — use-after-free. We run
+                // ClosureEscapeWalker (the same walker `collectClosureRelease-
+                // Eligible` already uses) over `lam`'s body (the OUTER lambda
+                // `g`'s body) with `currentParentStmt` as the target; if it
+                // escapes, fall through to the original widening.
+                //
+                // `inVarInit` and `currentParentStmt` are saved/restored
+                // around the LocalDecl/LocalConstDecl descent so the flag
+                // holds exactly while we are inside a `var`/`const`
+                // initializer; once consumed (reclassified or fallen through)
+                // `inVarInit` is cleared so siblings of the LocalDecl outside
+                // the initializer do not inherit the flag.
+                bool inVarInit = false;
+                const ast::Stmt* currentParentStmt = nullptr;
                 findLamsE = [&](const ast::Expr* e) {
                     if (!e) return;
                     if (auto* nl = dynamic_cast<const ast::LambdaExpr*>(e)) {
-                        // Found a nested lambda: collect all symbols in its body.
+                        // fix #3766: a nested lambda at a `var h := lambda()`
+                        // (or `const h := lambda()`) position INSIDE a non-
+                        // escaping outer lambda is itself non-escaping when
+                        // the binding `h` does not escape `g`'s body. Run
+                        // ClosureEscapeWalker on `g`'s body to prove the
+                        // binding does not escape; if not, reclassify the
+                        // nested lambda as non-escaping (puts its captures
+                        // into capturedByNonEscaping instead of widening to
+                        // capturedByEscaping). The outer's env still owns the
+                        // shared cell until the outer's scope end, exactly as
+                        // in the single-capturer twin (closure_capture_
+                        // disposes_via_cell_782).
+                        if (inVarInit && isNonEscaping && currentParentStmt) {
+                            ClosureEscapeWalker cew{
+                                ctx, static_cast<const void*>(currentParentStmt)};
+                            if (lam->exprBody)
+                                cew.expr(lam->exprBody.get(), false);
+                            for (auto& s : lam->stmts) cew.stmt(s.get());
+                            if (!cew.escaped) {
+                                inVarInit = false;
+                                currentParentStmt = nullptr;
+                                collectLambdaCaptures(nl, em,
+                                                      /*isNonEscaping=*/true);
+                                return;
+                            }
+                            // else: h escapes — fall through to original
+                            // widening so the cell stays alive until the
+                            // escape's owner releases it (conservative leak
+                            // is the documented #1135 trade-off).
+                        }
                         if (nl->exprBody)
                             walkExpr(ctx, nl->exprBody.get(), nestedBodySyms);
                         for (auto& ns : nl->stmts)
@@ -29303,7 +29365,22 @@ void Emitter::collectCellFreeEligible(
                 findLamsS = [&](const ast::Stmt* s) {
                     if (!s) return;
                     if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s)) {
-                        findLamsE(ld->initializer.get()); return; }
+                        // fix #3766: descend into the initializer with
+                        // inVarInit=true and currentParentStmt=ld so a
+                        // nested lambda at `var h :=` is classified as
+                        // non-escaping (matches the OUTER walker's
+                        // LocalDecl→LambdaExpr handling, which already
+                        // routes through collectLambdaCaptures with
+                        // isNonEscaping=true when `var h` is in the OUTER
+                        // scope's closureReleaseEligible_).
+                        bool savedInVarInit = inVarInit;
+                        const ast::Stmt* savedParent = currentParentStmt;
+                        inVarInit = true;
+                        currentParentStmt = ld;
+                        findLamsE(ld->initializer.get());
+                        inVarInit = savedInVarInit;
+                        currentParentStmt = savedParent;
+                        return; }
                     // fix #3591 (§21.1 / §27.5 / #1135, v0.286): symmetric with
                     // the walkStmt LocalConstDecl arm above — a nested lambda
                     // bound via `const inner := lambda() => x;` inside this
@@ -29326,7 +29403,15 @@ void Emitter::collectCellFreeEligible(
                     // worsen #3704 and matches the walkStmt arm's shape,
                     // not because it closes an observable bug.
                     if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(s)) {
-                        findLamsE(lc->value.get()); return; }
+                        // fix #3766: symmetric `const h := lambda()` arm.
+                        bool savedInVarInit = inVarInit;
+                        const ast::Stmt* savedParent = currentParentStmt;
+                        inVarInit = true;
+                        currentParentStmt = lc;
+                        findLamsE(lc->value.get());
+                        inVarInit = savedInVarInit;
+                        currentParentStmt = savedParent;
+                        return; }
                     if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(s)) {
                         findLamsE(as->target.get()); findLamsE(as->value.get());
                         return; }
