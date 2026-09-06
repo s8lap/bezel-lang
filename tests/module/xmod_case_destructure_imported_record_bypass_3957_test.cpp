@@ -84,6 +84,8 @@
 #include <unistd.h>
 #include <vector>
 
+#include "support/aot_result_asserts.hpp"  // failedAtCompileTimeWithRealLocation
+
 #include "driver/Driver.hpp"
 #include "support/aot_support.hpp"
 #include "support/driver_run_support.hpp"
@@ -454,7 +456,11 @@ BEZEL_TEST(xmod_case_destructure_imported_record_bypass_3957,
     // A rejected compile: runAot's `ran` is false and it packs the driver's
     // captured stderr into one Error diagnostic (see aot_support.hpp's
     // runAot header comment) — check the actual TEXT, not just `hasErrors()`.
-    BEZEL_EXPECT_FALSE(r.ran);
+    // A bare `!r.ran` cannot tell a compile-time rejection from a runtime
+    // crash/signal/timeout/ASan report (#3892), and under the gate's forced-
+    // ASan oracle a pre-fix ASan report also makes `ran` false — so pin the
+    // rejection with the shared helper as well as the message text.
+    BEZEL_EXPECT_TRUE(bezel::test::failedAtCompileTimeWithRealLocation(r));
     bool sawOrderingDiag = false;
     for (const auto& d : r.diagnostics.diagnostics()) {
         if (d.severity == bezel::Severity::Error &&
