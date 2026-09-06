@@ -1462,6 +1462,28 @@ void MethodOwnership::runExprBodyOwningReturnCheck(
 
 namespace {
 
+// §28.3 (#747 R42 / fix #3949): is `e` a TOP-LEVEL consuming form — the shape a
+// binding context must NOT run the broad `checkRead` over, because a more
+// specific move / await-consume check owns the diagnostic there and a
+// read-check run first would steal it (and, for the dispose half, weaken the
+// error to a use-after-dispose warning)?
+//
+// ONE spelling, TWO callers.  `handleLocalDecl` has made this exact decision
+// since #747 (`var y := move x;`); `handleAssignment` needs the identical one
+// now that it read-checks its RHS (#3949, `y := move x;` — the SAME K3.4 row of
+// §28.3's consume table, differing only in whether the binding is fresh).  A
+// second, drifting copy of a decision an existing site already makes is this
+// codebase's dominant defect generator, so the predicate is named once here and
+// both call sites ask it.  The assignment-position `owned` marker
+// (`y := owned x;`, AssignmentStmt::valueHasOwnedMarker) is the third such
+// shape; it is not visible in the expression at all, so its caller tests the
+// flag beside this call. // per §28.3 K3.4, v0.294, #747, #3949
+bool isTopLevelConsumingForm(const ast::Expr& e) {
+    if (const auto* ue = dynamic_cast<const ast::UnaryExpr*>(&e))
+        return ue->op == "move" || ue->op == "await";
+    return false;
+}
+
 // An edge identified by its endpoints, used to flag CFG back-edges so the
 // O3b loop fixpoint can distinguish loop-carried merges (back-edge / zero-
 // trip skip) from straight-line / if-else forward merges.
@@ -5120,10 +5142,10 @@ void MethodOwnership::handleLocalDecl(const ast::LocalDecl& ld) {
     // broad read-check first would steal that diagnostic (and weaken it to a
     // use-after-dispose warning).
     if (ld.initializer) {
-        bool topLevelConsume = false;
-        if (auto* ue = dynamic_cast<const ast::UnaryExpr*>(ld.initializer.get()))
-            topLevelConsume = (ue->op == "move" || ue->op == "await");
-        if (!topLevelConsume)
+        // fix #3949: the inline two-line test that used to live here is now the
+        // named `isTopLevelConsumingForm` above, so `handleAssignment`'s new
+        // RHS read-check asks the SAME question rather than re-spelling it.
+        if (!isTopLevelConsumingForm(*ld.initializer))
             checkRead(*ld.initializer, /*selfTarget=*/false);
         // §28.3 *Bare-type-parameter returns* (v0.194, #1801 S3): binding the
         // result of a bare-type-parameter call whose source is an unbound owned
@@ -5944,6 +5966,44 @@ void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
             return;
         }
     }
+    // fix #3949 (§28.3 K1.3 / §28.2, v0.294): the assignment RHS is a READ
+    // position like any other, and it was the ONLY one that never reached
+    // `checkRead` — so `t := Sink.Peek(x);` after `Sink.Take(move x);` compiled
+    // with ZERO diagnostics and heap-use-after-freed, while the byte-identical
+    // read spelled as a bare statement (`Sink.Peek(x);`), a binding
+    // (`var u := Sink.Peek(x);`) or a return operand (`return t + x.tag;`) was
+    // correctly rejected with "owned value in `x` was already moved out at this
+    // point (§28.3)".  The member-read spelling `t := x.tag;` was silent too.
+    // The dispose twin behaved the same way: §28.2's "use of `x` after a
+    // dominating explicit Dispose() call" fired for the bare-statement and
+    // binding spellings and not for the assignment.  K1.3 is unambiguous —
+    // "the binding or slot is unreadable until reassigned" — and nothing in
+    // §28.3 carves out an assignment RHS.
+    //
+    // This is the third member of the family #3591 / #3687 / #3864 documented
+    // (a read position that never reaches the ONE authority that detects
+    // MovedFrom / Disposed state) and it is fixed the same way: FEED the
+    // existing authority, do not add a second one.  `handleAssignment`'s other
+    // RHS work — `recordMovesIn`, `checkBorrowStoreEscape`,
+    // `processMarkedArmConstruct`, `checkBareBorrowTempLaunder` — each answers
+    // a different question; none inspects the tracked state of a bare
+    // identifier read inside the RHS.  (The pre-existing `checkRead` calls at
+    // the top of this function are #1928/#1932's, over the assignment TARGET's
+    // array and index sub-expressions, never over `as.value`.)
+    //
+    // Two shapes are deliberately NOT read-checked, exactly as
+    // `handleLocalDecl` has excluded them since #747: a top-level consuming
+    // form (`y := move x;`, `y := await x;` — `isTopLevelConsumingForm`), whose
+    // own, more specific check owns the diagnostic, and the assignment-position
+    // `owned` marker (`y := owned x;`), which `handleMarkedOwnedAssignment`
+    // above has already diverted for a tracked-local target and which
+    // `checkAndMoveBindingOwnedMarker` diagnoses for the rest.  `checkRead`'s
+    // CallExpr arm already carves out `out owned var` arguments (#2436), which
+    // are WRITE targets rather than reads.  Run BEFORE `recordMovesIn` so the
+    // state observed is the one at the top of the statement — the same order
+    // `handleLocalDecl` uses. // per §28.3 K1.3, §28.2, v0.294, #3949
+    if (!as.valueHasOwnedMarker && !isTopLevelConsumingForm(*as.value))
+        checkRead(*as.value, /*selfTarget=*/false);
     // Slice O15: side-effects in the RHS — `x := move y` should
     // transition y to MovedFrom. recordMovesIn handles `move local`,
     // `move this.field`, and `f(owned z)` in any position.
