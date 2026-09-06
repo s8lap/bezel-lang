@@ -239,28 +239,162 @@ BEZEL_TEST(case_relop_nullable_1074, nullable_slot_constant_still_admitted_3692)
 }
 
 // ---------------------------------------------------------------------------
-// The residual gap (issue 3898 / issue 3899): a GENERIC record's slot typed
-// at a bare type parameter is not reached by #3692's sema gate (issue 3898),
-// and MEASURED here to also not correctly reach the SLOT-PATH-ONLY codegen
-// handlers either (issue 3899) — it fails with a clean, loud codegen error
-// instead (verified directly with `./build/bezelc`: exits 1, no crash/signal,
-// "IR verification failed"). This is the §6c-compliant outcome (loud, not a
-// silently wrong D5 value) for a case neither issue closes yet.
+// fix #3899 (§14.1 / §19.3, v0.294): CLOSED. The residual gap above (issue
+// 3898 / issue 3899) was that a GENERIC record's slot typed at a bare type
+// parameter (`Box<T>`'s `X: T`, instantiated `Box<int?>`) is not reached by
+// #3692's sema gate (issue 3898, still open — sema admits this program), and
+// was MEASURED to also not correctly reach the SLOT-PATH-ONLY codegen
+// handlers (`nv.range.match` / `nv.relop.match`, `LlvmBackend_Exprs2.cpp`)
+// either — it failed with a codegen-stage IR-verification error instead
+// (`icmp {i8,i32}, i32`, verified directly with the pre-fix `./build/bezelc`:
+// exits 1, no crash/signal, "IR verification failed").
+//
+// Root cause: `patternMatches`'s record-scrutinee DestructuringPattern branch
+// already installs a `RecordSubstGuard` (`destrSubst`) before computing each
+// slot's field type, but computed it via the bare `recordMemberType` instead
+// of `recordMemberTypeResolved` — the helper that actually consults the
+// active substitution. `recordMemberType` returns the immediate, UNSUBSTITUTED
+// declared type (`T`, non-nullable), so the `isNullableVal` test just above
+// `nv.range.match`/`nv.relop.match` saw a non-nullable scrutinee for what is
+// actually a `{i8,i32}` nullable-value struct, and took the PLAIN dispatch
+// directly on the boxed struct. The fix swaps in `recordMemberTypeResolved`
+// at the three call sites in that branch, so the slot resolves to the
+// CONCRETE substituted type (`int?`) and correctly reaches the nullable-value
+// handlers below. This is the acceptance criterion issue 3899's own review
+// comment records: a live, sema-ADMITTED positive-lowering test that reaches
+// `nv.range.match`/`nv.relop.match` and asserts the correct value (verified
+// below by stubbing both handlers to `return nullptr;` — every one of these
+// tests flips, per the fix's commit message).
 // ---------------------------------------------------------------------------
 
-BEZEL_TEST(case_relop_nullable_1074, generic_record_slot_ordering_pattern_ice_3899) {
-    auto r = bezel::test::runAot(
+// Non-matching case: X = 99 is not in 1..5 — the arm must NOT be selected.
+// Before the fix this hit a clean IR-verification failure instead of
+// running at all.
+BEZEL_TEST(case_relop_nullable_1074, generic_record_slot_range_pattern_no_match_3899) {
+    BEZEL_EXPECT_EQ(run(
         "module M; record Box<T>(X: T, Y: int); "
         "class C public static method Main(): int "
         "  var b := new Box<int?>(99, 1); "
         "  return (case b of Box(1..5, 1) => 7, _ => 3); "
-        "end Main; end C;");
-    BEZEL_EXPECT_FALSE(r.ran);
-    bool sawIrVerificationError = false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("IR verification failed") != std::string::npos)
-            sawIrVerificationError = true;
-    BEZEL_EXPECT_TRUE(sawIrVerificationError);
+        "end Main; end C;"), 3);
+}
+
+// Matching case: X = 3 is in 1..5 — the arm IS selected. Reaches
+// `nv.range.match` on a genuinely present nullable value.
+BEZEL_TEST(case_relop_nullable_1074, generic_record_slot_range_pattern_match_3899) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record Box<T>(X: T, Y: int); "
+        "class C public static method Main(): int "
+        "  var b := new Box<int?>(3, 1); "
+        "  return (case b of Box(1..5, 1) => 7, _ => 3); "
+        "end Main; end C;"), 7);
+}
+
+// Null scrutinee: a range pattern never matches null (§19.5) — hasValue is
+// false, so `nv.range.match`'s AND must short-circuit to false regardless of
+// the (absent) inner value.
+BEZEL_TEST(case_relop_nullable_1074, generic_record_slot_range_pattern_null_3899) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record Box<T>(X: T, Y: int); "
+        "class C public static method Main(): int "
+        "  var b := new Box<int?>(null, 1); "
+        "  return (case b of Box(1..5, 1) => 7, _ => 3); "
+        "end Main; end C;"), 3);
+}
+
+// Relational sub-pattern (`nv.relop.match`), same generic-field shape.
+BEZEL_TEST(case_relop_nullable_1074, generic_record_slot_relational_pattern_match_3899) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record Box<T>(X: T, Y: int); "
+        "class C public static method Main(): int "
+        "  var b := new Box<int?>(10, 1); "
+        "  return (case b of Box(> 5, 1) => 7, _ => 3); "
+        "end Main; end C;"), 7);
+}
+BEZEL_TEST(case_relop_nullable_1074, generic_record_slot_relational_pattern_no_match_3899) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record Box<T>(X: T, Y: int); "
+        "class C public static method Main(): int "
+        "  var b := new Box<int?>(2, 1); "
+        "  return (case b of Box(> 5, 1) => 7, _ => 3); "
+        "end Main; end C;"), 3);
+}
+
+// Two DIFFERENT instantiations of the same generic record matched in
+// sequence, in one function — exercises `RecordSubstGuard`'s save/restore
+// (the outer substitution must not leak between the two independent
+// `destrSubst` installs).
+BEZEL_TEST(case_relop_nullable_1074, generic_record_slot_two_instantiations_3899) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record Box<T>(X: T, Y: int); "
+        "class C public static method Main(): int "
+        "  var a := new Box<int?>(3, 1); "
+        "  var b := new Box<string?>(\"hi\", 1); "
+        "  var r1 := (case a of Box(1..5, 1) => 7, _ => 3); "
+        "  var r2 := (case b of Box(\"hi\", 1) => 11, _ => 13); "
+        "  return r1 + r2; "
+        "end Main; end C;"), 18);
+}
+
+// A generic record slot NESTED inside another destructuring pattern
+// (`Outer<T>(B: Box<T>, Z: int)`) — the substitution must chain through two
+// levels of `RecordSubstGuard` (per #766's "resolve a bare-param arg through
+// the outer subst").
+BEZEL_TEST(case_relop_nullable_1074, generic_record_slot_nested_pattern_3899) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record Box<T>(X: T, Y: int); "
+        "record Outer<T>(B: Box<T>, Z: int); "
+        "class C public static method Main(): int "
+        "  var o := new Outer<int?>(new Box<int?>(3, 1), 9); "
+        "  return (case o of Outer(Box(1..5, 1), 9) => 7, _ => 3); "
+        "end Main; end C;"), 7);
+}
+BEZEL_TEST(case_relop_nullable_1074, generic_record_slot_nested_pattern_no_match_3899) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record Box<T>(X: T, Y: int); "
+        "record Outer<T>(B: Box<T>, Z: int); "
+        "class C public static method Main(): int "
+        "  var o := new Outer<int?>(new Box<int?>(99, 1), 9); "
+        "  return (case o of Outer(Box(1..5, 1), 9) => 7, _ => 3); "
+        "end Main; end C;"), 3);
+}
+
+// A generic record slot inside a CHOICE-case payload — the choice-scrutinee
+// DestructuringPattern branch (fix #3902) resolves the payload's OWN type via
+// `common::substitutedChoicePayloadType`, then recurses into the record-
+// scrutinee branch this fix corrects for the nested `Box<T>` field.
+BEZEL_TEST(case_relop_nullable_1074, generic_record_slot_in_choice_payload_3899) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record Box<T>(X: T, Y: int); "
+        "choice Wrap<T> Val(B: Box<T>), None; end Wrap; "
+        "class C public static method Main(): int "
+        "  var w := Wrap<int?>.Val(new Box<int?>(3, 1)); "
+        "  return (case w of Val(Box(1..5, 1)) => 7, _ => 3); "
+        "end Main; end C;"), 7);
+}
+BEZEL_TEST(case_relop_nullable_1074, generic_record_slot_in_choice_payload_no_match_3899) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record Box<T>(X: T, Y: int); "
+        "choice Wrap<T> Val(B: Box<T>), None; end Wrap; "
+        "class C public static method Main(): int "
+        "  var w := Wrap<int?>.Val(new Box<int?>(99, 1)); "
+        "  return (case w of Val(Box(1..5, 1)) => 7, _ => 3); "
+        "end Main; end C;"), 3);
+}
+
+// Statement-position `case` (LlvmBackend_Stmts.cpp's `lowerCaseStmt`) shares
+// the same `patternMatches` helper the fix, so the shape closes for the
+// statement form too, not just the `(case … of …)` expression form.
+BEZEL_TEST(case_relop_nullable_1074, generic_record_slot_range_pattern_stmt_form_3899) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record Box<T>(X: T, Y: int); "
+        "class C public static method Main(): int "
+        "  var b := new Box<int?>(3, 1); "
+        "  case b of "
+        "    Box(1..5, 1) => do return 7; end, "
+        "    _ => do return 3; end "
+        "  end; "
+        "end Main; end C;"), 7);
 }
 
 // ---------------------------------------------------------------------------

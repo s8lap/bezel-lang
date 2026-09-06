@@ -11665,7 +11665,19 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
                     builder_.CreateStore(fv, slot);
                     locals_[vbp] = slot;
                 } else if (sp.pattern) {
-                    const sema::TypeRef* fieldTy = recordMemberType(fields[i]);
+                    // fix #3899 / §14.1 / §19.3: `recordMemberTypeResolved`
+                    // (not the bare `recordMemberType`) so a generic-record
+                    // field declared at a type parameter (`X: T` on
+                    // `Box<int?>`) resolves to the concrete substituted type
+                    // (`int?`) here, under `destrSubst` (installed above).
+                    // With the unsubstituted type, `isNullableVal` below
+                    // (keyed on this TypeRef) sees a non-nullable bare `T`
+                    // for what is actually a `{i8,i32}` nullable-value
+                    // struct, so a range/relational sub-pattern took the
+                    // PLAIN dispatch on the boxed struct — malformed IR
+                    // (`icmp {i8,i32}, i32`), an IR-verification failure.
+                    const sema::TypeRef* fieldTy =
+                        recordMemberTypeResolved(fields[i]);
                     const sema::TypeSymbol* subEnumTy = nullptr;
                     bool subIsStr = false;
                     if (fieldTy &&
@@ -11718,7 +11730,11 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
             for (std::size_t i = 0; i < dp->subPatterns.size(); ++i) {
                 const auto& sp = dp->subPatterns[i];
                 if (i >= fields.size()) break;
-                const sema::TypeRef* fty = recordMemberType(fields[i]);
+                // fix #3899 / §14.1: resolved (not bare) field type, same
+                // generic-substitution reasoning as the live branch below —
+                // this branch is statically dead but should still type the
+                // undef placeholder as the CONCRETE (substituted) field type.
+                const sema::TypeRef* fty = recordMemberTypeResolved(fields[i]);
                 llvm::Type* llvmFty =
                     fty ? lowerTypeRef(const_cast<sema::TypeRef*>(fty))
                         : i32();  // fallback when fieldTy is unknown
@@ -11775,7 +11791,22 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
                 // returned nullptr (enumTy==nullptr → NamedPattern fell through
                 // → AND skipped → always matched) and string sub-patterns used
                 // pointer equality instead of content equality.
-                const sema::TypeRef* fieldTy = recordMemberType(fields[i]);
+                //
+                // fix #3899 / §14.1 / §19.3: `recordMemberTypeResolved`, not
+                // the bare `recordMemberType` — see the identical reasoning
+                // on the boxed-reference branch above. `destrSubst` (this
+                // record scrutinee's RecordSubstGuard, constructed earlier in
+                // this function) is active here, so the substitution is
+                // available; using the unsubstituted declared type for a
+                // generic record's bare-type-parameter field (`Box<int?>`'s
+                // `X: T`) fed `isNullableVal` a non-nullable TypeRef for what
+                // is actually a `{i8,i32}` nullable-value struct, so a
+                // range/relational sub-pattern (`1..5`) took the PLAIN
+                // dispatch directly on the boxed struct — an IR-verification
+                // failure (`icmp {i8,i32}, i32`), never reaching the
+                // nv.range.match / nv.relop.match handlers above.
+                const sema::TypeRef* fieldTy =
+                    recordMemberTypeResolved(fields[i]);
                 const sema::TypeSymbol* subEnumTy = nullptr;
                 bool subIsStr = false;
                 if (fieldTy && fieldTy->kind == sema::TypeRef::Kind::Named &&
