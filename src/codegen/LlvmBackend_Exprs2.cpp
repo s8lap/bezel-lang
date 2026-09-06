@@ -10193,9 +10193,17 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
     //     checkTopLevelNamedPattern), so the bare form here is always a
     //     payload-free case.
     //   * DestructuringPattern (CaseName(slots...)) — matches when
-    //     tag == caseIndex AND binds the case's payload fields. Sub-pattern
-    //     checks on the payload slots are deferred (the slot binding is
-    //     the dominant shape — `Some(var v)`, `First(a, b)`).
+    //     tag == caseIndex AND every slot's own sub-pattern matches the
+    //     extracted payload field. A naked binding or `var x` slot binds
+    //     unconditionally (the dominant shape — `Some(var v)`, `First(a,
+    //     b)`); any other slot kind (constant, range, relational,
+    //     alternative, nested destructuring, ...) is RECURSED into via
+    //     patternMatches and ANDed into the result, mirroring the RECORD-
+    //     scrutinee DestructuringPattern branch below. fix #3902 (v0.294):
+    //     until this fix, every non-binding slot was silently skipped and
+    //     `matched` reduced to pure tag equality, so ANY refutable payload
+    //     slot pattern always matched regardless of the payload's actual
+    //     value — e.g. `case w of Val(5, 1) => …` matched `Val(5, 99)`.
     // A choice's NamedPattern never resolves through the enum-constant or
     // type-test legs below (choice cases carry no enumValue_ entry and no
     // descriptor), so this early branch is the only path that admits them.
@@ -10287,6 +10295,60 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
                                 if (!disposeStack_.empty())
                                     declScopeDepth_[vbp] = disposeStack_.size();
                                 locals_[vbp] = slot;
+                            } else if (sp.pattern) {
+                                // fix #3902 / §35.5: a REFUTABLE payload slot
+                                // (constant, range, relational, alternative
+                                // list, nested destructuring, ...) must be
+                                // CHECKED against the extracted field value,
+                                // not silently admitted. Recurse via
+                                // patternMatches exactly the way the RECORD-
+                                // scrutinee DestructuringPattern branch below
+                                // does (~L11670+: `patternMatches(sp.pattern
+                                // .get(), fieldVal, subEnumTy, subIsStr,
+                                // fieldTy)`), so a slot pattern that is
+                                // itself a nested DestructuringPattern both
+                                // tests (tag/type match) and binds its own
+                                // sub-slots — the recursive call handles
+                                // both halves uniformly.
+                                //
+                                // Resolve the slot's declared payload type,
+                                // substituted through the scrutinee's actual
+                                // instantiation (the same helper the owning-
+                                // choice disposal codegen uses for the
+                                // sibling §28.1 erasure decision,
+                                // LlvmBackend_Disposal.cpp ~L2895), so an
+                                // enum-constant NamedPattern and a string
+                                // ConstantPattern sub-pattern get the same
+                                // enumTy/isStr context a top-level pattern
+                                // match would (mirrors fix #615's record-side
+                                // rationale).
+                                const sema::TypeRef* fieldTy =
+                                    common::substitutedChoicePayloadType(
+                                        cc->caseDecl->payload[i], choiceTy,
+                                        scrutTy, ctx_);
+                                const sema::TypeSymbol* subEnumTy = nullptr;
+                                bool subIsStr = false;
+                                if (fieldTy &&
+                                    fieldTy->kind ==
+                                        sema::TypeRef::Kind::Named &&
+                                    fieldTy->declaration &&
+                                    fieldTy->declaration->kind ==
+                                        ast::TypeDeclKind::Enum) {
+                                    subEnumTy = fieldTy->declaration;
+                                } else if (
+                                    fieldTy &&
+                                    fieldTy->kind ==
+                                        sema::TypeRef::Kind::Primitive &&
+                                    fieldTy->primitive ==
+                                        sema::PrimitiveType::String) {
+                                    subIsStr = true;
+                                }
+                                llvm::Value* subMatch = patternMatches(
+                                    sp.pattern.get(), fv, subEnumTy, subIsStr,
+                                    fieldTy);
+                                if (subMatch)
+                                    matched =
+                                        builder_.CreateAnd(matched, subMatch);
                             }
                         }
                     }
