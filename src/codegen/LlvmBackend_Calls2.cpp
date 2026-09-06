@@ -3060,6 +3060,29 @@ llvm::Value* Emitter::lowerValueSemMethodOn(const sema::TypeRef* recvTy,
         if (other->getType()->isPointerTy())
             other = builder_.CreateLoad(st, other);
         if (!other->getType()->isStructTy()) return nullptr;
+        // fix #3913 (§8.1/§8.3/§35.4/§7.5, v0.294): `equalsArgIsOwnTypeOrUnresolved`
+        // answers TRUE for an UNRESOLVED generic method type parameter (its "or
+        // unresolved" clause) without knowing what this call site substitutes it
+        // to — codegen substitutes VALUES, never `ctx_.exprType`'s answer (see the
+        // #3452 T6 row's comment), so this arm cannot distinguish "unresolved,
+        // turns out to be `ts`" from "unresolved, turns out to be some OTHER
+        // struct-shaped type" ahead of time. `st` is `ts`'s OWN choice struct
+        // (llvm::StructType::create — an identified type, never structurally
+        // uniqued with an unrelated one), so when the instantiation is a
+        // DIFFERENT struct (a record, a different choice, …) `other`'s loaded
+        // type is that struct's own layout, not `st`. Feeding a mismatched
+        // struct to `emitChoiceEquality`, which unconditionally
+        // `CreateExtractValue`s at `st`'s own field indices, is an out-of-bounds/
+        // mismatched-type access. MEASURED (#3913): `Foo<Pair>(s, new Pair(1,
+        // 2))` with `s: Sh?` SIGSEGVs `bezelc` inside `emitChoiceEquality`'s
+        // `CreateExtractValue` without this guard. Comparing the ACTUAL loaded
+        // type against `st` before dispatch fails this CLOSED — exactly like the
+        // already-pinned `Foo<int>` row (T6, same file) — instead of crashing.
+        // A settled `ts`-vs-`ts` comparison is unaffected: a genuinely
+        // `ts`-typed argument's lowered value always IS `st` by construction, so
+        // this reachable-only-through-the-unresolved-parameter path never fires
+        // for it.
+        if (other->getType() != st) return nullptr;
         return emitChoiceEquality(recv, other, ts);
     }
     if (!isRecord && !isEnum) return nullptr;

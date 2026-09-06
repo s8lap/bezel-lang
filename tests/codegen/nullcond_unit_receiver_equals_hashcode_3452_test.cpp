@@ -354,3 +354,64 @@ BEZEL_TEST(codegen_nullcond_unit_receiver_equals_hashcode_3452,
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_EQ(r.stdoutText, std::string("True\nFalse\nnull\nTrue\n"));
 }
+
+// ── T8 (fix #3913, §8.1/§8.3/§35.4/§7.5, v0.294) — the SIGSEGV sibling of T6's
+// decline. T6's `Foo<int>(s, 7)` reaches the choice `Equals` arm's unresolved-
+// type-parameter path and declines cleanly because `X` substitutes to `int`
+// (not a struct, so the arm's own `isStructTy()` gate already caught it, pre-
+// #3913). This row substitutes `X` at a STRUCT-shaped type instead
+// (`Pair`, an unrelated 2-field record) — `equalsArgIsOwnTypeOrUnresolved`
+// (LlvmBackend_impl.hpp) still answers TRUE for the unresolved `X` (it cannot
+// see the substitution), so pre-fix codegen fed `Pair`'s loaded struct value
+// straight into `emitChoiceEquality`, which unconditionally extracts fields at
+// `Sh`'s OWN choice-struct indices — a mismatched-type `CreateExtractValue`
+// that SIGSEGVs `bezelc` itself (MEASURED via gdb: fault in
+// `llvm::Value::setName`, called from `ExtractValueInst::Create` inside
+// `emitChoiceEquality`, LlvmBackend_Layout.cpp, reached through
+// `lowerValueSemMethodOn`'s choice arm, LlvmBackend_Calls2.cpp). Post-fix, the
+// mismatched-shape guard added for #3913 fails this CLOSED exactly like T6 —
+// same diagnostic, same "declining inner lowering" path — rather than
+// crashing. A bare not-ran check on its own is deliberately not the oracle
+// here (it is also satisfied by a crash or a signal death, per LANE_RULES
+// §3): the diagnostic TEXT is asserted below, which only the fixed-closed
+// outcome produces — the base tree's SIGSEGV asserts nothing here at all
+// (whether the run "ran" is undefined after a child crash, not merely
+// false), which is exactly the FAIL-WITHOUT asymmetry this row exists to
+// prove: pre-fix, `bezelc` (and the harness's forked child running it) dies
+// by signal instead of returning a diagnostic.
+BEZEL_TEST(codegen_nullcond_unit_receiver_equals_hashcode_3452,
+           nullcond_choice_struct_shaped_generic_arg_fails_closed_not_crash_3913) {
+    auto r = runAot(
+        "module M3452F; "
+        "choice Sh "
+        "  Circle(R: int), "
+        "  Square(S: int); "
+        "end Sh; "
+        "record Pair(A: int, B: int); "
+        "class C "
+        "  public static method Foo<X>(s: Sh?, arg: X): bool? "
+        "    return s?.Equals(arg); "
+        "  end Foo; "
+        "  public static method Main(): int "
+        "    var s: Sh? := Sh.Circle(1); "
+        "    var b := C.Foo<Pair>(s, new Pair(1, 2)); "
+        "    Console.WriteLine((if b = null then \"null\" else b!.ToString())); "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    bool located = false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find(
+                "reserves the `null` result of `?.` for a null receiver") !=
+            std::string::npos)
+            located = true;
+    BEZEL_EXPECT_TRUE(located);
+    bool named = false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("member `Equals`") != std::string::npos &&
+            d.message.find("`M3452F.Sh`") != std::string::npos)
+            named = true;
+    BEZEL_EXPECT_TRUE(named);
+}
