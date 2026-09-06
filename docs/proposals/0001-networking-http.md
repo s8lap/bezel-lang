@@ -248,7 +248,7 @@ public sealed class HttpHeaders: IEnumerable<HeaderEntry>
 end HttpHeaders;
 ```
 
-Names are **case-insensitive** (RFC 9110); backing storage is an owned insertion-ordered list of `HeaderEntry` records (two-string records are sendable values, so a **sealed** `HttpHeaders` with that backing is itself sendable per §30.14 — usable in a spawn argument or channel message). No browser "forbidden headers" guard — a systems client may set `Host`, `Content-Length`, `Cookie`. Response-side `Headers` is a read-only view (mutators throw `InvalidOperationException`).
+Names are **case-insensitive** (RFC 9110); backing storage is an owned insertion-ordered list of `HeaderEntry` records (two-string records are sendable values, so a **sealed** `HttpHeaders` with that backing is itself sendable per §30.14 — usable in a spawn argument or channel message). No browser "forbidden headers" guard — a systems client may set `Host`, `Content-Length`, `Cookie`. A *received* response's `Headers` is a read-only view (mutators throw `InvalidOperationException`); a response *constructed* server-side by `Http.*` (proposal 0002 §3.3) has writable headers until it is sent — `r.Headers["ETag"] := tag;` through the indexer above.
 
 ### 3.5 Supporting types and errors
 
@@ -327,7 +327,7 @@ proposal:
 
 ## 7. Deferred (v2+, in rough priority order)
 
-Retry policy (ky's defaults are the model: idempotent methods, 408/429/5xx, `Retry-After`); hooks/middleware (the extension point retry/auth/logging hang off — needs a design that respects ownership of the in-flight request); download/upload progress; a cookie jar (explicit opt-in object on the client, never ambient); response caching (explicit component, never implicit); a `Uri` type + query-parameter ergonomics (string URLs suffice for v1; a `Uri` type is its own proposal — parsing/normalization is a swamp worth its own review); per-phase timeouts (got-style connect/TLS/first-byte/total); multipart/form-data; request-body streaming (upload from a `Stream` — with it, `duplex` semantics); HTTP/2 & 3; WebSocket; server-side `Request → Response` (the fetch vocabulary is deliberately symmetric and server-ready, but the server is out of scope here).
+Retry policy (ky's defaults are the model: idempotent methods, 408/429/5xx, `Retry-After`); hooks/middleware (the extension point retry/auth/logging hang off — needs a design that respects ownership of the in-flight request); download/upload progress; a cookie jar (explicit opt-in object on the client, never ambient); response caching (explicit component, never implicit); a `Uri` type + query-parameter ergonomics (string URLs suffice for v1; a `Uri` type is its own proposal — parsing/normalization is a swamp worth its own review); per-phase timeouts (got-style connect/TLS/first-byte/total); multipart/form-data; request-body streaming (upload from a `Stream` — with it, `duplex` semantics); HTTP/2 & 3; WebSocket; server-side `Request → Response` (the fetch vocabulary is deliberately symmetric and server-ready; the server is proposal 0002 — re-drafted 2026-09-06 on the v0.294 §28.14 trace, sharing this proposal's `HttpResponse`/`HttpHeaders`/`HttpMethod`/`Http` — and out of scope here).
 
 ## 8. Open questions
 
