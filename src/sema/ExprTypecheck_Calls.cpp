@@ -19697,10 +19697,49 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     tt->astNode && tt->astNode->name &&
                     !tt->astNode->name->parts.empty()) {
                     std::string_view cn = tt->headName();
+                    // fix #3883 (stdlib §4.14; language spec §8.3/§8.5,
+                    // v0.291): `OwningBuffer<T>` -- slice 3 of #2457's
+                    // remaining sweep (#2457 itself is now closed; #3883
+                    // tracks this residual scope, filed after #3683
+                    // refuted the claim that this receiver silently fell
+                    // through to identity comparison -- it was actually
+                    // caught right here, just never implemented). It is a
+                    // real, declaration-less `bz_array_t*`-backed
+                    // `public class` (stdlib §4.14) with no
+                    // Equals/GetHashCode/ToString override shown, so the
+                    // §8.3 "Class" default (reference equality /
+                    // identity-based hash) and the §8.5 class default
+                    // (qualified name) apply mechanically -- the SAME
+                    // shape #2457 slices 1/2 implemented for
+                    // Array/OwningArray/Stack/OwningStack/Queue/
+                    // OwningQueue, all sharing `kArrayBackedCollections`.
+                    //
+                    // This chain now names `OwningBuffer` alongside `Array`/
+                    // `OwningArray` (the #3419 class-F shape), but it is NOT
+                    // routed through the grid's
+                    // `isArrayEnumeratorWrapSourceName` authority: this
+                    // predicate answers "has the closed-#2457 Object-
+                    // contract audit covered this type name", a DIFFERENT
+                    // question from "does this receiver take the §29.2
+                    // array-enumerator wrap". The two happen to name the
+                    // same seven types today, but #3896 (filed) plans to
+                    // extend THIS list to Set/OwningSet/SortedSet/
+                    // FrozenArray/Dictionary/OwningDictionary/LinkedList/
+                    // OwningLinkedList — none of which are wrap sources
+                    // (BuiltinRegistry.cpp's own docstring: a hash-backed
+                    // Set is snapshotted, not wrapped) — so sharing the
+                    // wrap-source authority here would make that future
+                    // slice impossible to land through this predicate. Left
+                    // as its own explicit list rather than coupled to an
+                    // authority answering a different question.
+                    // GRID-DEBT: #3883 isAuditedElsewhere names OwningBuffer
+                    // alongside Array/OwningArray but answers a different
+                    // question from the wrap grid; see the paragraph above.
                     bool isAuditedElsewhere =
                         cn == "Array" || cn == "OwningArray" ||
                         cn == "Stack" || cn == "OwningStack" ||
-                        cn == "Queue" || cn == "OwningQueue";
+                        cn == "Queue" || cn == "OwningQueue" ||
+                        cn == "OwningBuffer";
                     bool isRegisteredCollection =
                         !isAuditedElsewhere &&
                         (common::isArrayBackedCollectionName(cn) ||
@@ -19725,6 +19764,87 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                                     "for this receiver (tracked #2457)");
                             return;
                         }
+                    }
+                    // fix #3883 (stdlib §4.14): unlike its five
+                    // `isAuditedElsewhere` siblings just added above,
+                    // `OwningBuffer<T>` declares no `IComparable<T>`
+                    // conformance at all (stdlib §4.14's full member
+                    // list has no `CompareTo`) -- the all-or-nothing
+                    // shape of `isAuditedElsewhere` (one bit gates all
+                    // four of ToString/GetHashCode/Equals/CompareTo per
+                    // type name, #2465) means joining it also exempts
+                    // `CompareTo` from the `isRegisteredCollection`
+                    // reject just above, with NO replacement. Confirmed
+                    // live before this fix: OwningBuffer is explicitly
+                    // excluded from BOTH the #920/#1112
+                    // isOwningContainer/isNonOwningContainer call-surface
+                    // checks a few thousand lines above in this file (see
+                    // their own comments -- "Scoped to the six owning
+                    // CONTAINER collections (not OwningBuffer / the
+                    // owning iterators, whose surfaces differ)" -- and
+                    // OwningBuffer is in neither container-name list), so
+                    // nothing else would catch an OwningBuffer.CompareTo
+                    // call: it would silently degrade to the #2434
+                    // zero-initialized-slot fallback instead of a
+                    // diagnosed reject -- exactly the "loud -> quiet"
+                    // regression the standing protocol forbids. Reject it
+                    // explicitly here, mirroring the Stopwatch.Restart
+                    // precedent just below.
+                    if (cn == "OwningBuffer" && ma.member == "CompareTo") {
+                        auto loc = ma.span.begin;
+                        if (loc.line == 0 && ma.target)
+                            loc = ma.target->span.begin;
+                        ctx_.diagnostics().report(
+                            Severity::Error, loc,
+                            "no member `CompareTo` on `OwningBuffer<T>` "
+                            "(stdlib \xC2\xA7""4.14 declares no "
+                            "`IComparable<T>` conformance for this type)");
+                        return;
+                    }
+                    // fix #3883 (language spec §27.6, following the #2470
+                    // precedent for Array/OwningArray): joining
+                    // `isAuditedElsewhere` also removes the ONLY reject
+                    // that used to fire for a BARE (uncalled) reference to
+                    // `.ToString`/`.Equals`/`.GetHashCode` on OwningBuffer
+                    // — `isAffectedMember` above does not distinguish call
+                    // form from reference form, so before this fix a bare
+                    // `var f := buf.ToString;` hit the SAME
+                    // `isRegisteredCollection` placeholder Error the call
+                    // form did. Confirmed live: without this carve-out,
+                    // that bare reference now silently degrades to the
+                    // #2434 zero-initialized-slot fallback (a mere
+                    // Warning, not a compile Error — codegen has no
+                    // MethodSymbol-independent mechanism to FORM a
+                    // function value for these three, only to dispatch
+                    // their CALL form directly, LlvmBackend_Calls2.cpp)
+                    // rather than the previous loud reject — the exact
+                    // "loud -> quiet" regression the standing protocol
+                    // forbids. The CALL form (`isCallForm` true) is
+                    // unaffected: it is exempted here and dispatches
+                    // through the codegen identity/qualified-name paths
+                    // this same fix wires up.
+                    if (cn == "OwningBuffer" &&
+                        (ma.member == "ToString" || ma.member == "Equals" ||
+                         ma.member == "GetHashCode") &&
+                        &ma != calleeOfCallCtx_) {
+                        auto loc = ma.span.begin;
+                        if (loc.line == 0 && ma.target)
+                            loc = ma.target->span.begin;
+                        ctx_.diagnostics().report(
+                            Severity::Error, loc,
+                            std::string("a bare reference to `") +
+                                std::string(ma.member) + "` (language spec "
+                                "\xC2\xA7""27.6) is not yet supported on "
+                                "`OwningBuffer<T>` (language spec \xC2\xA7"
+                                "8.1/\xC2\xA7""8.3/\xC2\xA7""8.5, #2470): `" +
+                                std::string(ma.member) + "` is a real "
+                                "universal Object member, but this builtin "
+                                "type dispatches it structurally rather "
+                                "than through a real method symbol, so no "
+                                "function value can be formed for it yet "
+                                "-- call it directly instead (`." +
+                                std::string(ma.member) + "(...)`)");
+                        return;
                     }
                     // fix #3852 (stdlib §8.1, v0.290, proposal 0123 R6(b)):
                     // `Restart()` was retired. This receiver shape —

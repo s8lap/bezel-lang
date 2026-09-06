@@ -6163,14 +6163,31 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                 // bz_array_t*-backed generic collections whose explicit-
                 // `.ToString()` call site has no MethodSymbol and would
                 // otherwise reach the vtable-dispatch fallthrough.
+                //
+                // fix #3883 (stdlib §4.14; language spec §8.5, v0.291):
+                // `OwningBuffer<T>` joins this list — same `public class`
+                // shape, no ToString override, `bz_array_t*`-backed
+                // (kArrayBackedCollections), already registered in
+                // `kBuiltinClassModulePaths` under
+                // "System.Collections.Generic" (consulted by `typeof`/
+                // `Type.FullName` independent of this fix), now that the
+                // sema `isAuditedElsewhere` gate admits it. Routed through
+                // `common::isArrayEnumeratorWrapSourceName` (the #3419
+                // grid's class-F authority) rather than a seventh
+                // hand-written name in this chain: the set this site needs
+                // — the declaration-less `bz_array_t*`-backed types with no
+                // §8.1 vtable — is exactly `kArrayEnumeratorWrapSources`
+                // (Array/OwningArray/OwningBuffer/Stack/OwningStack/Queue/
+                // OwningQueue, BuiltinRegistry.cpp), so reading the shared
+                // authority instead of re-spelling it here removes a
+                // class-F ratchet offender instead of adding one (#3419's
+                // `check_enumerable_grid_spellings.py --strict`).
                 if (recvTy && recvTy->kind == K::Named &&
                         !recvTy->declaration && recvTy->astNode &&
                         recvTy->astNode->name &&
                         !recvTy->astNode->name->parts.empty()) {
                     std::string_view arn = recvTy->headName();
-                    if (arn == "Array" || arn == "OwningArray" ||
-                        arn == "Stack" || arn == "OwningStack" ||
-                        arn == "Queue" || arn == "OwningQueue") {
+                    if (common::isArrayEnumeratorWrapSourceName(arn)) {
                         std::string_view mod =
                             common::builtinClassModulePathOf(arn);
                         std::string rendered = mod.empty()
@@ -6455,23 +6472,40 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                     isBuiltinIdentityHeadCandidate &&
                     common::isIterFormatEnumeratorHead(recvTy->headName()) &&
                     !common::isOwningIterableInterfaceHead(recvTy->headName());
-                // Source-family half: NOT routed. This is a THIRD question,
-                // neither `isArrayEnumeratorWrapSourceName` (which ALSO
-                // admits `OwningBuffer` — routing here would silently widen
-                // this identity fallback to OwningBuffer receivers) nor
-                // `isArrayBackedCollectionName` (which additionally admits
-                // `OwningBuffer`/`Set`/`OwningSet`/`SortedSet`/`FrozenArray`).
-                // Left as its own explicit list per the brief's guidance for
-                // a genuinely-third question; see #3683 (filed) for whether
-                // OwningBuffer's absence here is itself a latent gap.
+                // Source-family half: routed onto `isArrayEnumeratorWrapSourceName`
+                // (the #3419 grid's class-F authority for exactly this seven-
+                // name family — Array/OwningArray/OwningBuffer/Stack/
+                // OwningStack/Queue/OwningQueue) rather than a hand-spelled
+                // chain. Deliberately NOT `isArrayBackedCollectionName` (which
+                // ALSO admits `Set`/`OwningSet`/`SortedSet`/`FrozenArray`,
+                // none of which are audited yet — see #3896) — that broader
+                // registry answers "is this bz_array_t*-backed", a different
+                // question from "does this receiver need the §8.3 identity
+                // default computed directly because it has no §8.1 vtable".
+                // The two authorities' name sets happen to coincide exactly
+                // for these seven today; if a future slice (#3896) narrows or
+                // widens either question they are free to diverge again.
+                // #3683 asked whether `OwningBuffer`'s absence here was a
+                // latent gap; that issue was REFUTED (sema's #2465 guard
+                // rejected the call before reaching this codegen block at
+                // all — this block was genuinely unreachable for
+                // OwningBuffer, not silently wrong) and the real, adjacent
+                // defect (never audited, tracked-under-the-closed-#2457
+                // diagnostic) was filed as #3883. fix #3883 (stdlib §4.14;
+                // language spec §8.3): OwningBuffer joins this family now
+                // that the sema `isAuditedElsewhere` gate
+                // (ExprTypecheck_Calls.cpp) admits it — it is
+                // `bz_array_t*`-backed exactly like its six siblings here, no
+                // disposal or retention involved (the fallback only
+                // compares/hashes the receiver pointer, never touches slot
+                // contents). Reading the shared authority instead of adding a
+                // seventh name to a hand-written chain removes a class-F
+                // ratchet offender instead of adding one (#3419's
+                // `check_enumerable_grid_spellings.py --strict`).
                 bool isBuiltinIdentityArrayFamily =
                     isBuiltinIdentityHeadCandidate &&
-                    (recvTy->headName() == "Array" ||
-                     recvTy->headName() == "OwningArray" ||
-                     recvTy->headName() == "Stack" ||
-                     recvTy->headName() == "OwningStack" ||
-                     recvTy->headName() == "Queue" ||
-                     recvTy->headName() == "OwningQueue");
+                    common::isArrayEnumeratorWrapSourceName(
+                        recvTy->headName());
                 bool isBuiltinIdentityRecv =
                     isBuiltinIdentityIterHead || isBuiltinIdentityArrayFamily;
                 if (isBuiltinIdentityRecv) {
