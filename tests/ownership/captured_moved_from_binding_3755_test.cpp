@@ -680,36 +680,79 @@ BEZEL_TEST(own_captured_moved_from_3755, same_stmt_consume_without_any_lambda_ac
 // unconditional LEFT one, so their parts CAN co-execute and the flat pairing
 // is already exact for them.
 
-// The reviewer's repro A: consume in `then`, capture in `else`. With
-// `flag = false` the consuming arm never runs, so `p` is definitely live at
-// the capture. Legal, safe, and must compile.
-BEZEL_TEST(own_captured_moved_from_3755, if_expr_exclusive_arms_consume_and_capture_accepted_28_3) {
+// UPDATED by #3989/#3990 (§28.3 K7.4, issue #3999): the four rows below
+// ("...accepted_28_3" / "aot_...runs_and_reads_live_binding_28_3") used to
+// assert this program compiled clean and ran to 5. It does not, safely: with
+// `flag = true` (never exercised by any row in this file — every accept row
+// and `wrap3`'s own `Main` only ever call `Run(false)`) `p` is genuinely
+// moved into `Consume`, which disposes it, and `Run`'s own end-of-method
+// scope-end auto-drop — which, before #3989/#3990, never learned about that
+// move because `recordMovesIn` had no `ConditionalExpr`/`CaseExpr` arm at
+// all — disposes the SAME (already-freed) `R` a second time. Measured
+// (`--sanitize=address`, `Run(true)`): heap-use-after-free, `free` inside
+// `bz$M.C$Consume`, then a second touch inside `bz$M.C$Run`. Confirmed
+// pre-existing and unrelated to #3971: reproduces byte-identically with
+// `src/ownership/{Ownership.cpp,Ownership_Checks.cpp,Ownership_impl.hpp}`
+// reverted to their pre-#3971 state.
+//
+// #3989/#3990 gives `recordMovesIn` the missing arms, and — reusing
+// `joinInto`, the SAME §28.6 issue #338 / #1626 "Owned ⊓ MovedFrom ⇒
+// Owned+maybeConsumed" meet the real CFG `if`-statement join already applies
+// — `p` now correctly joins to Owned+maybeConsumed after the construct, and
+// reaching Run's end-of-method scan in that state is the ALREADY-SHIPPED
+// §28.3 "would be dropped here without disposal" ERROR: exactly what the
+// equivalent real STATEMENT form (`if flag then Sink.Take(move x); end;`, no
+// else, no post-handling) has always correctly rejected. `p` genuinely IS
+// unsafe to auto-drop unconditionally here, so the four rows below now pin
+// the REJECTION instead of the unsound accept. #3755's OWN diagnostic
+// (`rejectsSameStatementTransfer`, "closure captures ... whose owned value is
+// transferred away") is a DIFFERENT, still-silent checker — capturing a
+// still-Owned binding on the non-consuming path is exactly what it is
+// supposed to allow, so that assertion is kept unchanged below to confirm
+// #3755's own fix is not what regressed.
+//
+// #3999 tracks the residual: this SHAPE (a genuinely safe program per §28.3's
+// own per-path reasoning) has no way to compile today because the K3.4
+// marked-arm-transfer's per-path null-guarded disposal machinery
+// (`dischargedByArmTransfer`) only covers `owned x` as the bare arm value,
+// not a `move` embedded inside a larger arm expression like `Consume(move
+// p)`. That is a feature, not a bug fix, and out of scope here.
+
+// The reviewer's repro A: consume in `then`, capture in `else`. Both arms are
+// walked (so #3755's own capture check still runs and still stays silent),
+// but the construct's post-join state for `p` is Owned+maybeConsumed, and
+// that state reaching Run's end-of-method scope-end scan is the correct,
+// sound rejection — see the block comment above.
+BEZEL_TEST(own_captured_moved_from_3755, if_expr_exclusive_arms_consume_and_capture_rejected_28_3) {
     auto r = parseAndCheckOwnership(wrap3(
         "    var p := new R(); "
         "    var f: () -> int := (if flag then Consume(move p) "
         "                                  else lambda(): int => p.V()); "
         "    return f(); "));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(r, "would be dropped here without disposal"));
     BEZEL_EXPECT_FALSE(rejectsSameStatementTransfer(r, "p"));
 }
 
-// The VALUE check for the same program: it must not merely compile, it must
-// run and produce 5 — the capture reads a live `p`. (A rule that "fixed" the
-// false reject by silencing the check while leaving the program broken would
-// pass the row above and fail this one; §6c.)
-BEZEL_TEST(own_captured_moved_from_3755, aot_if_expr_exclusive_arms_runs_and_reads_live_binding_28_3) {
+// The AOT twin: no program is produced (the front end now rejects it), so
+// there is nothing left to run. Before #3989/#3990 this compiled and
+// `Run(false)` produced 5 — but `Run(true)`, never exercised by this file,
+// heap-use-after-freed (see the block comment above); the fix trades a
+// silent double-free for a compile-time error rather than an unsound accept.
+BEZEL_TEST(own_captured_moved_from_3755, aot_if_expr_exclusive_arms_rejected_no_program_28_3) {
     JitResult r = runAot(wrap3(
         "    var p := new R(); "
         "    var f: () -> int := (if flag then Consume(move p) "
         "                                  else lambda(): int => p.V()); "
         "    return f(); "));
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 5);
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(r.stdoutText.empty());
 }
 
 // The reviewer's repro B: the case-expression analogue. Same verdict — the
-// gap was structural, not specific to the if-atom.
-BEZEL_TEST(own_captured_moved_from_3755, case_expr_exclusive_arms_consume_and_capture_accepted_28_3) {
+// gap was structural, not specific to the if-atom, in both directions (the
+// original hole AND its #3989/#3990 fix).
+BEZEL_TEST(own_captured_moved_from_3755, case_expr_exclusive_arms_consume_and_capture_rejected_28_3) {
     auto r = parseAndCheckOwnership(wrap3(
         "    var p := new R(); "
         "    var f: () -> int := (case flag of "
@@ -717,11 +760,12 @@ BEZEL_TEST(own_captured_moved_from_3755, case_expr_exclusive_arms_consume_and_ca
         "      _ => lambda(): int => p.V() "
         "    ); "
         "    return f(); "));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(r, "would be dropped here without disposal"));
     BEZEL_EXPECT_FALSE(rejectsSameStatementTransfer(r, "p"));
 }
 
-BEZEL_TEST(own_captured_moved_from_3755, aot_case_expr_exclusive_arms_runs_and_reads_live_binding_28_3) {
+BEZEL_TEST(own_captured_moved_from_3755, aot_case_expr_exclusive_arms_rejected_no_program_28_3) {
     JitResult r = runAot(wrap3(
         "    var p := new R(); "
         "    var f: () -> int := (case flag of "
@@ -729,14 +773,20 @@ BEZEL_TEST(own_captured_moved_from_3755, aot_case_expr_exclusive_arms_runs_and_r
         "      _ => lambda(): int => p.V() "
         "    ); "
         "    return f(); "));
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 5);
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(r.stdoutText.empty());
 }
 
 // THREE arms, the consume and the capture two arms apart with an unrelated
 // arm between them — the arm INDEX has to be compared, not merely "is this
-// inside some arm". `Run(false)` selects the middle arm, so the value is 7.
-BEZEL_TEST(own_captured_moved_from_3755, case_expr_three_arms_consume_and_capture_accepted_28_3) {
+// inside some arm" (#3755's own concern). The SAME §28.3 K7.4 join applies
+// regardless of arm count: `p` is consumed on the `true` arm and not on
+// either other arm, so it is Owned+maybeConsumed after the construct and
+// Run's end-of-method scope-end scan correctly rejects it (see the block
+// comment above; this row used to assert `Run(false)` — selecting the
+// middle, capture-free arm — ran to 7, which said nothing about the
+// `true`-arm double-free `Run(true)` never got to exercise).
+BEZEL_TEST(own_captured_moved_from_3755, case_expr_three_arms_consume_and_capture_rejected_28_3) {
     auto r = parseAndCheckOwnership(wrap3(
         "    var p := new R(); "
         "    var f: () -> int := (case flag of "
@@ -745,7 +795,8 @@ BEZEL_TEST(own_captured_moved_from_3755, case_expr_three_arms_consume_and_captur
         "      _ => lambda(): int => p.V() "
         "    ); "
         "    return f(); "));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(r, "would be dropped here without disposal"));
     BEZEL_EXPECT_FALSE(rejectsSameStatementTransfer(r, "p"));
 }
 

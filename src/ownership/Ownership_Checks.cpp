@@ -758,6 +758,125 @@ void MethodOwnership::recordMovesIn(const ast::Expr& e) {
         markOutOwnedArgs(ne->args, ctorParams);
         return;
     }
+    // ---- fix #3990 (§28.3 K1.3/K7/K7.4, v0.294) ---------------------------
+    // A MARKER-FREE if-expression / expression-`case`. #3971 gave `checkRead`
+    // arms for these (this file, ~line 2201/2218) but deliberately routed
+    // every top-level consuming operand (`isTopLevelConsumingForm`) — and
+    // every ctor argument bound to an `owned` formal — AWAY from checkRead,
+    // on the understanding that `recordMovesIn` was the authority that would
+    // actually validate and mark the move. It never was: `recordMovesIn` had
+    // no ConditionalExpr/CaseExpr arm at all, so a `move` nested inside one
+    // of these arms (`new Holder(move x)` as the `then` value — not the bare
+    // arm value `move x` itself, a DIFFERENT shape §28.3's consume table K3.4
+    // names explicitly and which this same join below also happens to cover)
+    // reached NEITHER function. Measured: `var x := new Res(1); x.Dispose();
+    // using var h := (if flag then new Holder(move x) else new
+    // Holder(new Res(0)));` compiled with rc=0 (only the unrelated
+    // ctor-parameter auto-drop warning) and SEGV'd at runtime — a
+    // double-free — while the direct, non-nested `new Holder(move x)` is
+    // correctly rejected with "cannot move from disposed local `x` (§28.3)".
+    // The `case`-expression twin is byte-identical.
+    //
+    // THE JOIN. Only one arm executes at runtime, so a move recorded while
+    // walking one arm must not appear to the other arm (a false "already
+    // moved"), and the construct's own post-state must be the K7.4 meet of
+    // the two: MovedFrom only where EVERY non-absorbing arm consumed the
+    // binding, Owned+maybeConsumed where SOME arm did (unreadable either
+    // way, but a still-Owned path keeps its scope-end obligation — the exact
+    // asymmetry `joinInto`'s Owned/MovedFrom split already encodes for the
+    // real CFG `if`-statement join, issue #338). Each arm is walked from an
+    // isolated copy of the pre-construct state and the arms' exit states are
+    // folded with `joinMarkerFreeArmEnds` (`emitClash=false`: a genuine
+    // Owned/Borrowed clash here is `checkArmMeetMixed`'s separate question,
+    // run over the construct's own result type by the LocalDecl/assignment
+    // caller; `unionKeys=false`: a name a bind-atom introduces inside one arm
+    // is out of scope after it, mirroring the real if-join's own choice,
+    // Ownership.cpp ~3396).
+    //
+    // The MARKED form (`(if c then owned a else new Res(2))`) is
+    // `processMarkedArmConstruct`'s alone — it already runs its own per-arm
+    // walk + K7.4 join for the marker syntax, called separately by this
+    // function's callers (`handleLocalDecl` / `handleAssignment`) whenever
+    // `exprContainsMarkedTransfer`. This arm returns immediately rather than
+    // double-processing the same construct through two join mechanisms —
+    // mirrors checkRead's own early return for the identical predicate (this
+    // file, ~line 1811). A `do … end` (Block) case-arm body is deliberately
+    // NOT walked, for the same reason #3971's checkRead arm gives (~line
+    // 2214): it reaches ownership through the CFG's own `visitStmt`, not a
+    // read/move walk; running it from here would double-process it.
+    // // per §28.3 K1.3/K7/K7.4, v0.294, #3971, #3990
+    if (auto* cd = dynamic_cast<const ast::ConditionalExpr*>(&e)) {
+        if (exprContainsMarkedTransfer(e)) return;
+        if (cd->condition) recordMovesIn(*cd->condition);
+        BlockState saved = states_;
+        std::vector<BlockState> ends;
+        for (const ast::Expr* arm : {cd->thenValue.get(), cd->elseValue.get()}) {
+            if (!arm) continue;
+            states_ = saved;
+            const bool absorbing =
+                dynamic_cast<const ast::ThrowExpr*>(arm) ||
+                dynamic_cast<const ast::NullLiteralExpr*>(arm);
+            recordMovesIn(*arm);
+            if (!absorbing) ends.push_back(states_);
+        }
+        joinMarkerFreeArmEnds(std::move(ends), std::move(saved), cd->span.begin);
+        return;
+    }
+    if (auto* ce = dynamic_cast<const ast::CaseExpr*>(&e)) {
+        if (exprContainsMarkedTransfer(e)) return;
+        if (ce->scrutinee) recordMovesIn(*ce->scrutinee);
+        BlockState saved = states_;
+        std::vector<BlockState> ends;
+        for (const auto& arm : ce->arms) {
+            states_ = saved;
+            if (arm.guard) recordMovesIn(*arm.guard);
+            if (arm.bodyKind != ast::CaseArmBodyKind::Expression ||
+                !arm.exprBody)
+                continue;  // a `do … end` arm is not walked here (see above)
+            const bool absorbing =
+                dynamic_cast<const ast::ThrowExpr*>(arm.exprBody.get()) ||
+                dynamic_cast<const ast::NullLiteralExpr*>(arm.exprBody.get());
+            recordMovesIn(*arm.exprBody);
+            if (!absorbing) ends.push_back(states_);
+        }
+        joinMarkerFreeArmEnds(std::move(ends), std::move(saved), ce->span.begin);
+        return;
+    }
+    // §31.1 / §28.8 / §17.12 (issue #3989): `throw` in EXPRESSION position
+    // (`n ?? throw exc`, or a marker-free arm's `=> throw exc` reached via
+    // the walk above) consumes its operand exactly as the ThrowStmt form
+    // does — mirrors `handleDischarge`'s ThrowExpr arm (this file, ~line
+    // 998), called here rather than re-spelled: `handleDischarge` already
+    // runs the §31.1 borrowed-operand check, the §31.1 catch-borrow-
+    // escapes-via-new check, recurses into the operand for its own nested
+    // owned-argument positions, and discharges a bare named-owned-local
+    // operand (`markDisposedByName`) — none of which recordMovesIn's other
+    // arms reach. `handleDischarge` is never otherwise called on a ThrowExpr
+    // reached through a LocalDecl-initializer / assignment-RHS (only from a
+    // bare ExpressionStmt, or a marked arm's own per-arm walk above), so
+    // this does not double-process. Measured: `var exc := new
+    // InvalidOperationException(…); … r := n ?? throw exc; …` compiled with
+    // rc=0 (a spurious auto-drop warning on `exc`, since nothing discharged
+    // it) and double-freed `exc` at runtime — freed once by the throw/catch
+    // machinery, again by the (wrongly modeled) scope-end auto-drop.
+    // // per §31.1, §28.8, §17.12, v0.294, #3989
+    if (auto* te = dynamic_cast<const ast::ThrowExpr*>(&e)) {
+        handleDischarge(*te);
+        return;
+    }
+}
+
+void MethodOwnership::joinMarkerFreeArmEnds(std::vector<BlockState>&& ends,
+                                            BlockState&& baseline,
+                                            SourceLocation joinLoc) {
+    if (ends.empty()) {
+        states_ = std::move(baseline);
+        return;
+    }
+    states_ = std::move(ends.front());
+    for (std::size_t i = 1; i < ends.size(); ++i)
+        joinInto(states_, ends[i], joinLoc, /*emitClash=*/false,
+                 /*unionKeys=*/false);
 }
 
 void MethodOwnership::recordMovesInArgs(const std::vector<ast::CallArgument>& args,
@@ -18267,12 +18386,34 @@ void MethodOwnership::checkTaskScopeConsumption(
         if (s) scan(*s);
 }
 
-// §28.3 K3.4 (v0.209, #2080): true when `e` contains a MarkedTransferExpr in
-// an ARM position of a nested if/case construct. Sema already rejected every
-// non-arm placement, so a simple containment scan over the arm-bearing
-// shapes suffices as the processing gate.
+// fix #4006 (§28.3 K3.4, v0.246 proposal 0090/#3056): true when `e` is a
+// BARE `move <identifier>` — the shape §7.7/§28.3's own canonical arm-
+// transfer example uses (`(if a <> null then move a else move b)`) and the
+// spec's K3.4 consume-table row names directly ("the marked arm transfer:
+// `move x` as an if-expression branch or an expression-`case` arm result").
+// Unwraps nothing beyond the bare identifier: `move a.f` (a FIELD move,
+// §28.8.1, a different operation) and `move a!` (force-unwrap) do not
+// qualify, matching `MarkedTransferExpr`'s own bare-name-only grammar
+// (`"owned" Identifier`, §A.7). A `move` nested inside a LARGER arm
+// expression (`new Holder(move a)`) does not qualify either — the caller
+// only ever asks this of the arm's own, unwrapped value.
+bool MethodOwnership::isBareMoveArmValue(const ast::Expr& e) {
+    const auto* ue = dynamic_cast<const ast::UnaryExpr*>(&e);
+    return ue && ue->op == "move" &&
+           dynamic_cast<const ast::IdentifierExpr*>(ue->operand.get());
+}
+
+// §28.3 K3.4 (v0.209, #2080; extended #4006 for the `move` spelling): true
+// when `e` contains a MarkedTransferExpr OR a bare `move <id>` in an ARM
+// position of a nested if/case construct. Sema already rejected every
+// non-arm placement of `MarkedTransferExpr`; a bare `move <id>` needs no
+// such rejection (it is an ordinary, always-legal expression) — this
+// predicate only decides which MACHINERY processes it when it IS an arm's
+// own value, not whether it is allowed there. A simple containment scan
+// over the arm-bearing shapes suffices as the processing gate.
 bool MethodOwnership::exprContainsMarkedTransfer(const ast::Expr& e) {
     if (dynamic_cast<const ast::MarkedTransferExpr*>(&e)) return true;
+    if (isBareMoveArmValue(e)) return true;
     if (auto* cd = dynamic_cast<const ast::ConditionalExpr*>(&e))
         return (cd->thenValue && exprContainsMarkedTransfer(*cd->thenValue)) ||
                (cd->elseValue && exprContainsMarkedTransfer(*cd->elseValue));
@@ -18288,41 +18429,50 @@ bool MethodOwnership::exprContainsMarkedTransfer(const ast::Expr& e) {
     return false;
 }
 
-// §28.3 K3.4 (v0.209, #2080): validate + consume one marked arm transfer.
-// First-landing operand bound: a plain `var` owned LOCAL of class/interface
-// type — `owned` parameters and non-class values (owning collections, task
-// frames) draw a targeted rejection (their per-path scope-end disposal
-// machinery is separate; tracked with #2080's residuals). The K5.1 freeze,
-// the moved-from/maybe-consumed read machinery, and everDischarged_ all
-// ride markMovedByName.
-void MethodOwnership::handleMarkedArmTransfer(const ast::MarkedTransferExpr& mt) {
-    if (mt.name.empty()) return;
-    // Resolve the marker's binding by the SEMA-RESOLVED SYMBOL first — the
+// §28.3 K3.4 (v0.209, #2080; generalized #4006): validate + consume one
+// marked arm transfer, WHICHEVER spelling reached it — the legacy `owned
+// <name>` marker or the spec's current canonical bare `move <name>` (see
+// `isBareMoveArmValue`). `handleMarkedArmTransfer` and
+// `handleMarkedArmMoveTransfer` are both thin callers of this core so the
+// decision has ONE spelling; `spellingKeyword` ("owned" or "move") is
+// spliced into the two diagnostics that must name what the user actually
+// wrote. First-landing operand bound: a plain `var` owned LOCAL of
+// class/interface type — `owned` parameters and non-class values (owning
+// collections, task frames) draw a targeted rejection (their per-path
+// scope-end disposal machinery is separate; tracked with #2080's
+// residuals). The K5.1 freeze, the moved-from/maybe-consumed read
+// machinery, and everDischarged_ all ride markMovedByName's own contract.
+void MethodOwnership::consumeMarkedArmTransfer(std::string_view name,
+                                               SourceLocation loc,
+                                               sema::Symbol* resolvedSym,
+                                               std::string_view spellingKeyword) {
+    if (name.empty()) return;
+    // Resolve the binding by the caller's SEMA-RESOLVED SYMBOL first — the
     // same resolution codegen's lowering nulls through — so a shadowed name
     // (two same-named locals in nested scopes) deterministically binds the
     // inner declaration; a first-name-match scan over the unordered states_
     // map could pick the OUTER one while codegen nulls the inner slot (a
     // nondeterministic wrong-binding consume). The name-scan remains as the
-    // fallback for a marker sema left unresolved (error recovery only).
+    // fallback for an unresolved reference (error recovery only).
     sema::Symbol* sym = nullptr;
     LocalOwnership* st = nullptr;
-    if (sema::Symbol* resolved = ctx_.exprSymbol(mt)) {
-        auto it = states_.find(resolved);
-        if (it != states_.end()) { sym = resolved; st = &it->second; }
+    if (resolvedSym) {
+        auto it = states_.find(resolvedSym);
+        if (it != states_.end()) { sym = resolvedSym; st = &it->second; }
     }
     if (!st) {
         for (auto& [s, lo] : states_) {
-            if (s->name == mt.name) { sym = s; st = &lo; break; }
+            if (s->name == name) { sym = s; st = &lo; break; }
         }
     }
     if (!st || st->state != OwnershipState::Owned) {
         // §28.3 v0.209: the marker names a NAMED OWNED BINDING; a borrow, a
         // fresh producer, or an unknown name is not transferable.
         report(
-            Severity::Error, mt.span.begin,
-            std::string("the arm transfer marker `owned ") +
-            std::string(mt.name) +
-            "` requires a named owned binding — `" + std::string(mt.name) +
+            Severity::Error, loc,
+            std::string("the arm transfer marker `") +
+            std::string(spellingKeyword) + " " + std::string(name) +
+            "` requires a named owned binding — `" + std::string(name) +
             "` is not an owned binding at this point (\xc2\xa7""28.3 K3.4, "
             "v0.209)");
         return;
@@ -18349,9 +18499,9 @@ void MethodOwnership::handleMarkedArmTransfer(const ast::MarkedTransferExpr& mt)
     // form draws (checked before the class gate so the message is precise).
     if (st->implicitDischarge) {
         report(
-            Severity::Error, mt.span.begin,
+            Severity::Error, loc,
             std::string("cannot move out of `using var` `") +
-            std::string(mt.name) +
+            std::string(name) +
             "`; `using var` is scope-bound (§28.3)");
         st->state = OwnershipState::Poisoned;
         return;
@@ -18366,8 +18516,8 @@ void MethodOwnership::handleMarkedArmTransfer(const ast::MarkedTransferExpr& mt)
     // arm-transfer consume too.
     if (st->maybeConsumed) {
         report(
-            Severity::Error, mt.span.begin,
-            std::string("cannot consume `") + std::string(mt.name) +
+            Severity::Error, loc,
+            std::string("cannot consume `") + std::string(name) +
             "`: it may have already been consumed on another branch "
             "(maybe-consumed join, §28.3) — confine the consume to a single "
             "branch or equalize the branches before the merge");
@@ -18381,9 +18531,9 @@ void MethodOwnership::handleMarkedArmTransfer(const ast::MarkedTransferExpr& mt)
         // own scope-end machinery. Decline with reasons, never a silent
         // per-path leak or double-free. // per §28.3 K3.4/K7.4 v0.209 (#2080)
         report(
-            Severity::Error, mt.span.begin,
-            std::string("the arm transfer marker `owned ") +
-            std::string(mt.name) +
+            Severity::Error, loc,
+            std::string("the arm transfer marker `") +
+            std::string(spellingKeyword) + " " + std::string(name) +
             "` is supported only on a plain `var` owned local of class or "
             "interface type in this version \xe2\x80\x94 equalize by "
             "statement instead (\xc2\xa7""28.3 K3.4/K7.4, v0.209; #2080)");
@@ -18391,8 +18541,8 @@ void MethodOwnership::handleMarkedArmTransfer(const ast::MarkedTransferExpr& mt)
     }
     // The K5.1 consume-site freeze and the scoped-callback freeze — both
     // diagnose-only, name-keyed like every other consume site's.
-    checkScopedFreeze(mt.name, mt.span.begin, "move from");
-    checkConsumeFreeze(mt.name, mt.span.begin);
+    checkScopedFreeze(name, loc, "move from");
+    checkConsumeFreeze(name, loc);
     // The state transition is applied to the SEMA-RESOLVED symbol directly
     // (not via the name-keyed markMovedByName, whose unordered name-scan
     // could mutate a same-named SHADOWED sibling while codegen nulls this
@@ -18402,6 +18552,23 @@ void MethodOwnership::handleMarkedArmTransfer(const ast::MarkedTransferExpr& mt)
     // §28.3 (#1900): a move-transfer re-poisons a previously-restored local.
     definitelyRestoredLocals_.erase(sym);
     armTransferConsumed_.push_back(sym);
+}
+
+void MethodOwnership::handleMarkedArmTransfer(const ast::MarkedTransferExpr& mt) {
+    consumeMarkedArmTransfer(mt.name, mt.span.begin, ctx_.exprSymbol(mt),
+                              "owned");
+}
+
+// fix #4006: the `move <name>` spelling's entry point — see the header
+// declaration and `isBareMoveArmValue` for why this exists and what it
+// deliberately does not match. The symbol is resolved off the OPERAND
+// identifier (the ordinary resolution every other `move` site uses,
+// `markMovedByName`'s own callers included), not off the UnaryExpr itself.
+void MethodOwnership::handleMarkedArmMoveTransfer(const ast::UnaryExpr& mv) {
+    const auto* id = dynamic_cast<const ast::IdentifierExpr*>(mv.operand.get());
+    if (!id) return;  // isBareMoveArmValue already guarantees this; defensive only
+    consumeMarkedArmTransfer(id->name, mv.span.begin, ctx_.exprSymbol(*id),
+                              "move");
 }
 
 void MethodOwnership::processMarkedArmConstruct(const ast::Expr& e) {
@@ -18449,17 +18616,34 @@ void MethodOwnership::processMarkedArmConstruct(const ast::Expr& e) {
         states_ = saved;
         std::vector<sema::Symbol*> savedList = std::move(armTransferConsumed_);
         armTransferConsumed_.clear();
+        // fix #4006: the K8.3 scrutinee-self-transfer rejection is one
+        // decision, asked identically for both spellings — factored here so
+        // neither call site re-spells it.
+        auto rejectScrutineeSelfTransfer = [&](std::string_view spellingKeyword,
+                                                std::string_view name,
+                                                SourceLocation loc) {
+            report(
+                Severity::Error, loc,
+                std::string("a `case` arm result may not transfer the "
+                "scrutinee's own binding (`") +
+                std::string(spellingKeyword) + " " + std::string(name) +
+                "`) — the scrutinee borrow is live through the selected "
+                "arm's completion (K8.3 / \xc2\xa7""28.3 K5.1, v0.209)");
+        };
         if (auto* mt = dynamic_cast<const ast::MarkedTransferExpr*>(arm)) {
             if (!scrutRootName.empty() && mt->name == scrutRootName) {
-                report(
-                    Severity::Error, mt->span.begin,
-                    std::string("a `case` arm result may not transfer the "
-                    "scrutinee's own binding (`owned ") +
-                    std::string(mt->name) +
-                    "`) — the scrutinee borrow is live through the selected "
-                    "arm's completion (K8.3 / \xc2\xa7""28.3 K5.1, v0.209)");
+                rejectScrutineeSelfTransfer("owned", mt->name, mt->span.begin);
             } else {
                 handleMarkedArmTransfer(*mt);
+            }
+        } else if (isBareMoveArmValue(*arm)) {
+            const auto* mv = dynamic_cast<const ast::UnaryExpr*>(arm);
+            const auto* id =
+                dynamic_cast<const ast::IdentifierExpr*>(mv->operand.get());
+            if (!scrutRootName.empty() && id->name == scrutRootName) {
+                rejectScrutineeSelfTransfer("move", id->name, mv->span.begin);
+            } else {
+                handleMarkedArmMoveTransfer(*mv);
             }
         } else {
             handleDischarge(*arm);

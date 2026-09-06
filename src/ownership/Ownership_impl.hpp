@@ -1223,9 +1223,38 @@ private:
     // (markedConstructsProcessed_, cleared with bindAtomsProcessed_).
     void processMarkedArmConstruct(const ast::Expr& e);
     void handleMarkedArmTransfer(const ast::MarkedTransferExpr& mt);
-    // True when `e` contains a MarkedTransferExpr in an arm position of any
-    // nested if/case construct (the gate for processMarkedArmConstruct — a
-    // construct without markers keeps the old walk).
+    // fix #4006 (§28.3 K3.4, v0.246 proposal 0090/#3056): a bare `move
+    // <identifier>` used directly as an if/case arm's OWN value is the
+    // spec's CURRENT canonical spelling of the K3.4 marked arm transfer
+    // (§7.7/§28.3's own coalescing example, `(if a <> null then move a else
+    // move b)`) — the implementation was never migrated for ARM POSITION:
+    // only the legacy `owned x` marker (`MarkedTransferExpr`) routed through
+    // `processMarkedArmConstruct`'s per-path-safe disposal
+    // (`dischargedByArmTransfer`). `handleMarkedArmMoveTransfer` is this
+    // spelling's entry point (mirrors `handleMarkedArmTransfer`, sharing its
+    // validate+consume core via `consumeMarkedArmTransfer` — no second
+    // spelling of that decision); `isBareMoveArmValue` is the shared
+    // recognizer both `exprContainsMarkedTransfer` and
+    // `processMarkedArmConstruct`'s per-arm dispatch ask, so the two
+    // predicates cannot drift about what counts. A `move` NESTED inside a
+    // larger arm expression (`new Holder(move a)`, #3990's own shape) does
+    // NOT qualify — only the arm's own, unwrapped value.
+    static bool isBareMoveArmValue(const ast::Expr& e);
+    void handleMarkedArmMoveTransfer(const ast::UnaryExpr& mv);
+    // The validate+consume core `handleMarkedArmTransfer` and
+    // `handleMarkedArmMoveTransfer` both funnel through: `name`/`loc` are the
+    // bound identifier and the diagnostic anchor, `resolvedSym` is the
+    // sema-resolved symbol if the caller has one (falls back to a name scan,
+    // exactly as `handleMarkedArmTransfer` always did), and `spellingKeyword`
+    // ("owned" or "move") is spliced into the two diagnostics that name what
+    // the user actually wrote.
+    void consumeMarkedArmTransfer(std::string_view name, SourceLocation loc,
+                                   sema::Symbol* resolvedSym,
+                                   std::string_view spellingKeyword);
+    // True when `e` contains a MarkedTransferExpr OR a bare `move <id>` arm
+    // value (see `isBareMoveArmValue`) in an arm position of any nested
+    // if/case construct (the gate for processMarkedArmConstruct — a
+    // construct without either spelling keeps the old walk).
     static bool exprContainsMarkedTransfer(const ast::Expr& e);
     std::unordered_set<const ast::Expr*> markedConstructsProcessed_;
     // Per-ARM accumulation of the bindings consumed by marked transfers
@@ -1238,6 +1267,19 @@ private:
     // contains. Used by handleLocalDecl so `move`-in-initializer
     // properly transitions the source's state.
     void recordMovesIn(const ast::Expr& e);
+
+    // fix #3990 (§28.3 K7.4, v0.294): fold a marker-free if/case construct's
+    // per-arm exit states — each computed by the caller from an ISOLATED copy
+    // of the pre-construct baseline, so a move recorded in one arm is
+    // invisible to another — via the SAME meet the real CFG `if`-join uses
+    // (`joinInto`, shared rather than re-spelled). `ends` holds only the
+    // NON-absorbing arms' exit states (K7.5's `throw` / `null`-literal arms
+    // are walked by the caller for their own diagnostics but never joined —
+    // control does not resume after the construct on that path). Leaves
+    // `states_` at the meet, or restores `baseline` unchanged when every arm
+    // absorbed.
+    void joinMarkerFreeArmEnds(std::vector<BlockState>&& ends,
+                                BlockState&& baseline, SourceLocation joinLoc);
 
     void recordMovesInArgs(const std::vector<ast::CallArgument>& args,
                            const ast::Expr* callee = nullptr);
