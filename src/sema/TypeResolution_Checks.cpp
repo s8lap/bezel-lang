@@ -10491,17 +10491,19 @@ static bool isBorrowBearingRecordForStaticReadonly(const TypeRef* rt,
         for (std::string_view mod : fs->modifiers)
             if (mod == "static") { isStatic = true; break; }
         if (isStatic) continue;
-        const TypeRef* ft = nullptr;
-        if (fs->posParam && fs->posParam->type)
-            ft = ctx.resolvedType(*fs->posParam->type);
-        if (!ft && fs->decl) {
-            // SEAM-ACCESSOR: AST arm of the both-sources pattern; the
-            // importedMemberType() side-table only covers imported fields
-            // (populated by ModuleLoader), so a LOCAL body's `fd->type` is
-            // reachable only via this cast.
-            if (auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl))
-                if (fd->type) ft = ctx.resolvedType(*fd->type);
-        }
+        // fix #3970 (§9.7/§22.12 rule 4, v0.294): read through
+        // `storageComponentType` (sema/Symbol.hpp) — the ONE accessor that
+        // consults the positional Param, then the body FieldDecl, then the
+        // importer's `importedMemberType` side table — instead of the bare
+        // `posParam->type` / `fs->decl`-as-`FieldDecl` pair. For an IMPORTED
+        // record's positional field, fix #2516 documents `posParam->type` as
+        // deliberately null, and `fs->decl` is never an `ast::FieldDecl` for
+        // a positional field regardless of import status (#3152); the bare
+        // pair above therefore left `ft` null for EVERY field of an imported
+        // record, so this predicate answered "not borrow-bearing" for every
+        // imported record — silently disabling the §9.7 enforcement gate
+        // this predicate feeds (`checkStaticReadonlyNullSource` below).
+        const TypeRef* ft = storageComponentType(m, ctx);
         if (!ft) continue;
         if (staticReadonlyFieldIsReferenceTyped(ft, ctx)) return true;
     }
@@ -11342,23 +11344,41 @@ void checkStaticReadonlyRecordInit(
     std::string_view name) {
     if (!declTy || declTy->kind != TypeRef::Kind::Named || !declTy->declaration)
         return;
-    // SEAM-ACCESSOR: positional-fields / choice-cases vectors (local only;
-    // imported types have no ast::TypeDecl and accept conservatively below).
-    auto* td = dynamic_cast<const ast::TypeDecl*>(declTy->declaration->decl);
-    if (!td) return;  // imported: no ast::TypeDecl — accept conservatively
-    if (td->kind == ast::TypeDeclKind::Record) {
-        const auto& fields = td->positionalFields;
+    const TypeSymbol* ts = declTy->declaration;
+    // fix #3970 (§9.7/§22.12 rule 4, v0.294): this used to cast
+    // `declTy->declaration->decl` to an `ast::TypeDecl` and walk ITS
+    // `positionalFields`/`choiceCases` — `TypeSymbol::decl` is NEVER
+    // assigned for an imported type (Symbol.hpp; #3145's OwnershipFacts.cpp
+    // comment states the same fact for the field-walk sibling), so this
+    // whole function silently "accepted conservatively" for every static
+    // readonly field/property of an IMPORTED record or choice type, no
+    // matter what its initializer held — a second, independent bypass of
+    // this same §9.7 enforcement pass, layered UNDER the
+    // `isBorrowBearingRecordForStaticReadonly` gate above (fixing that gate
+    // alone still reached this early return and produced no diagnostic,
+    // measured). Both branches below now read the SYMBOL side instead,
+    // which is populated identically on both sides of an import boundary:
+    // `recordPositionalFieldSymbols`/`storageComponentType` for a record
+    // (the same accessors `isBorrowBearingRecordForStaticReadonly` now
+    // uses), and `choiceCasesOf`/`ChoiceCaseSymbol::caseDecl` for a choice
+    // — the latter's payload `ast::Param`s are, per fix #3144's
+    // `ModuleLoader::convertChoiceCases`, reconstructed with a REAL
+    // (non-null) `type` node unlike a record's synthetic `posParam`, so
+    // `ctx.resolvedType(*pf.type)` already answers correctly for an
+    // imported case and needed no change beyond removing the `td` gate
+    // that stood in front of it.
+    if (ts->kind == ast::TypeDeclKind::Record) {
+        const std::vector<const Symbol*> fields =
+            recordPositionalFieldSymbols(ts);
         std::size_t arity = fields.size();
         if (nx.args.size() != arity) return;  // mismatch — typecheck reports
         for (std::size_t i = 0; i < arity; ++i) {
-            const ast::Param& pf = fields[i];
-            if (!pf.type) continue;
-            const TypeRef* pft = ctx.resolvedType(*pf.type);
+            const TypeRef* pft = storageComponentType(fields[i], ctx);
             if (!pft) continue;
             if (!staticReadonlyFieldIsReferenceTyped(pft, ctx)) continue;
             if (isStaticallyNullExpr(nx.args[i].value.get())) continue;
             // Non-null reference-typed field: reject.
-            std::string pname = std::string(pf.name);
+            std::string pname = std::string(fields[i]->name);
             ctx.diagnostics().report(
                 Severity::Error, loc,
                 std::string("static readonly ") + std::string(what) + " `"
@@ -11371,18 +11391,19 @@ void checkStaticReadonlyRecordInit(
         }
         return;
     }
-    if (td->kind == ast::TypeDeclKind::Choice) {
+    if (ts->kind == ast::TypeDeclKind::Choice) {
         // For a choice, only the case being constructed is null-source at
         // the value site; this analyser accepts `new MyChoice(...)` of any
         // case whose every payload-typed argument is null. Without case
         // resolution we can only conservatively accept (the constructor's
         // shape must be inspected case by case, which a value-site check
         // before typecheck could not do).
-        for (const ast::ChoiceCase& cc : td->choiceCases) {
-            std::size_t arity = cc.payload.size();
+        for (const ChoiceCaseSymbol* cs : choiceCasesOf(ts)) {
+            if (!cs->caseDecl) continue;
+            std::size_t arity = cs->caseDecl->payload.size();
             if (nx.args.size() != arity) continue;
             for (std::size_t i = 0; i < arity; ++i) {
-                const ast::Param& pf = cc.payload[i];
+                const ast::Param& pf = cs->caseDecl->payload[i];
                 if (!pf.type) continue;
                 const TypeRef* pft = ctx.resolvedType(*pf.type);
                 if (!pft) continue;
@@ -11482,6 +11503,25 @@ void Resolver::checkStaticReadonlyNullSource() {
             // warned at the declaration site; records / choices / plain
             // arrays that are NOT borrow-bearing take the default warning
             // and are not §9.7-deferred.
+            //
+            // ⚠ issue filed (not fixed here): unlike `reportRule4`'s
+            // declaration-site defer test (above, ~line 10829), which ORs
+            // `common::isBorrowBearingRecordOrSpan` with
+            // `isBorrowBearingRecordForStaticReadonly`, this gate consults
+            // only the narrower predicate. Adding the shared predicate here
+            // was investigated for fix #3970 (§9.7/§22.12 rule 4, v0.294)
+            // and found OBSERVATIONALLY INERT against every shape reachable
+            // through `checkStaticReadonlyRecordInit` below: that walk's own
+            // per-field test (`staticReadonlyFieldIsReferenceTyped`) is
+            // documented as a SHALLOW, one-level check that classifies
+            // every record/choice-typed field as value-typed regardless of
+            // what it recursively contains, so a record field that is
+            // ITSELF a borrow-bearing record (a span-view field being the
+            // measured case: `SpanHolder(V: ReadOnlySpan<int>)`) is never
+            // flagged even once `deferred` is forced true. Closing this
+            // needs `checkStaticReadonlyRecordInit` to recurse into a
+            // nested record/choice field's own constructor arguments — a
+            // real, structural, non-import-specific gap, filed separately.
             bool deferred = isBorrowBearingRecordForStaticReadonly(rt, ctx_) ||
                             isHoldsBorrowsChoice(rt, ctx_) ||
                             isPlainInlineArrayCarryingBorrows(rt, ctx_);
