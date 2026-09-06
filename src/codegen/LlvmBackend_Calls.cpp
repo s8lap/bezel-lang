@@ -842,14 +842,14 @@ bool Emitter::isLinkedListTypeName(const sema::TypeRef* rt) {
 }
 
 
+// fix #3897: delegates to the shared `isBuiltinDictionaryTypeRef`
+// (LlvmBackend_impl.hpp) so this predicate, the namespace-scope walker
+// copies in LlvmBackend_Setup.cpp that could not call this private member,
+// and ClosureEscapeWalker's GetOrAdd admission share exactly one body.
+// stdlib §4.17 (#1354): SortedDictionary shares the bz_dict_t* rep. The name
+// set lives in the #1414 stage-3 registry (one home, snapshot-pinned).
 bool Emitter::isDictTypeName(const sema::TypeRef* rt) {
-    if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
-        return false;
-    std::string_view n = builtinTypeName(rt);  // handles both astNode and importedName
-    if (n.empty()) return false;
-    // stdlib §4.17 (#1354): SortedDictionary shares the bz_dict_t* rep. The name
-    // set lives in the #1414 stage-3 registry (one home, snapshot-pinned).
-    return common::isDictionaryName(n);
+    return isBuiltinDictionaryTypeRef(rt);
 }
 
 

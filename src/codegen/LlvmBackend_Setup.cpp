@@ -22700,9 +22700,16 @@ struct StringEscapeWalker {
                      ma->member == "PopValue" || ma->member == "TryPopValue" ||
                      ma->member == "GetOrNull" || ma->member == "GetOrAdd")) {
                     if (const sema::TypeRef* rt = ctx.exprType(*ma->target)) {
-                        std::string_view h = rt->headName();
-                        if ((h == "Dictionary" || h == "OwningDictionary" ||
-                             h == "SortedDictionary") &&
+                        // fix #3897: shared with dictStrKeySafe below and
+                        // ClosureEscapeWalker's GetOrAdd admission —
+                        // isBuiltinDictionaryTypeRef (LlvmBackend_impl.hpp)
+                        // reproduces Emitter::isDictTypeName's full body
+                        // (kind==Named && !declaration guard included), so a
+                        // user class merely named Dictionary/OwningDictionary/
+                        // SortedDictionary (legal — these names are not
+                        // reserved) is excluded rather than answering "yes,
+                        // builtin" on name alone.
+                        if (isBuiltinDictionaryTypeRef(rt) &&
                             !rt->genericArgs.empty() && rt->genericArgs[0] &&
                             !rt->genericArgs[0]->nullable &&
                             rt->genericArgs[0]->kind ==
@@ -23427,9 +23434,14 @@ struct StringEscapeWalker {
             bool dictStrKeySafe = false;
             if (stringReleaseMode) {
                 if (const sema::TypeRef* rt = ctx.exprType(*ix->target)) {
-                    std::string_view h = rt->headName();
-                    if ((h == "Dictionary" || h == "OwningDictionary" ||
-                         h == "SortedDictionary") &&
+                    // fix #3897: shared with dictMethodStrKeySafe above and
+                    // ClosureEscapeWalker's GetOrAdd admission — see that
+                    // site's comment. isBuiltinDictionaryTypeRef reproduces
+                    // Emitter::isDictTypeName's full body (kind==Named &&
+                    // !declaration), excluding a user class merely named
+                    // Dictionary/OwningDictionary/SortedDictionary (legal —
+                    // not reserved names) from this safe-read relaxation.
+                    if (isBuiltinDictionaryTypeRef(rt) &&
                         !rt->genericArgs.empty() && rt->genericArgs[0] &&
                         !rt->genericArgs[0]->nullable &&
                         rt->genericArgs[0]->kind ==
@@ -25628,18 +25640,24 @@ struct ClosureEscapeWalker {
         // bare-identifier `target` read at the factory (second) argument
         // position of a `.GetOrAdd(key, factory)` call on a builtin
         // Dictionary/OwningDictionary/SortedDictionary receiver. Checked via
-        // `common::isDictionaryName` — the SAME #1414 stage-3 registry
-        // predicate `Emitter::isDictTypeName` itself calls — rather than
-        // `Emitter::isDictTypeName` directly: that method is PRIVATE, and
-        // (unlike `collectCellFreeEligible`'s `LambdaFinder`, a class LOCAL
-        // to an `Emitter` member function, which therefore inherits that
-        // function's access) `ClosureEscapeWalker` is a plain struct at
-        // NAMESPACE scope shared by several call sites, so it has no such
-        // access; the `rt->kind`/`rt->declaration`/`rt->headName()` reads
-        // below reproduce `isDictTypeName`'s own body exactly (mirroring how
-        // `collectStringReleaseEligible`'s `walkCallArgs`, another
-        // namespace-scope walker, already inlines this identical check for
-        // #3886/#3888 rather than calling the private method). #3871 fixed
+        // `isBuiltinDictionaryTypeRef` (LlvmBackend_impl.hpp, fix #3897)
+        // rather than `Emitter::isDictTypeName` directly: that method is
+        // PRIVATE, and (unlike `collectCellFreeEligible`'s `LambdaFinder`, a
+        // class LOCAL to an `Emitter` member function, which therefore
+        // inherits that function's access) `ClosureEscapeWalker` is a plain
+        // struct at NAMESPACE scope shared by several call sites, so it has
+        // no such access. `isBuiltinDictionaryTypeRef` reproduces
+        // `isDictTypeName`'s own body exactly (`kind == Named &&
+        // !declaration && common::isDictionaryName(headName())`) and is now
+        // the ONE shared definition for this check — before #3897 this arm,
+        // `collectStringReleaseEligible`'s `walkCallArgs`
+        // (`dictMethodStrKeySafe`, #3886/#3888), and its IndexExpr arm
+        // (`dictStrKeySafe`, #3872/#3887/#3888) each carried their own
+        // inline copy, and the latter two omitted the `kind`/`declaration`
+        // guard this one already carried (a user class legally named
+        // Dictionary/OwningDictionary/SortedDictionary — those names are not
+        // reserved — would answer "yes, builtin" on name alone; #3897
+        // measured this as a reachable heap-use-after-free). #3871 fixed
         // a lambda LITERAL at this exact argument position (widening
         // `collectCellFreeEligible`, which decides the
         // CAPTURED variables' fate); it could not touch a `var`-bound
@@ -25677,9 +25695,15 @@ struct ClosureEscapeWalker {
                     if (ma->member == "GetOrAdd" && ma->target) {
                         if (const sema::TypeRef* rt =
                                 ctx.exprType(*ma->target)) {
-                            if (rt->kind == sema::TypeRef::Kind::Named &&
-                                !rt->declaration &&
-                                common::isDictionaryName(rt->headName())) {
+                            // fix #3897: was an inline reproduction of
+                            // Emitter::isDictTypeName's body (this walker
+                            // could not call that private member); now
+                            // shares LlvmBackend_impl.hpp's
+                            // isBuiltinDictionaryTypeRef with
+                            // dictMethodStrKeySafe/dictStrKeySafe above, the
+                            // OTHER two copies this same predicate used to
+                            // be duplicated across.
+                            if (isBuiltinDictionaryTypeRef(rt)) {
                                 getOrAddFactoryTargetSafe = true;
                             }
                         }

@@ -114,6 +114,53 @@ inline bool indexerElementCannotAliasIndex(const sema::TypeRef* t) {
     }
 }
 
+// fix #3897 / §4.8 / §4.17: is `rt` the builtin `bz_dict_t*`-backed
+// Dictionary/OwningDictionary/SortedDictionary family (the #1414 stage-3
+// registry, `common::isDictionaryName`)?
+//
+// ONE DEFINITION, FOUR CONSUMERS: `Emitter::isDictTypeName` (LlvmBackend_
+// Calls.cpp) now delegates to this instead of carrying its own body, and the
+// three namespace-scope walker structs in LlvmBackend_Setup.cpp that could
+// not call that PRIVATE member call this free function directly instead of
+// each hand-rolling the check — `StringEscapeWalker::walkCallArgs`'s
+// `dictMethodStrKeySafe` (fix #3886/#3887/#3888), `StringEscapeWalker`'s
+// IndexExpr arm's `dictStrKeySafe` (fix #3872/#3887/#3888), and
+// `ClosureEscapeWalker`'s `GetOrAdd`-factory admission (fix #3885), which
+// already reproduced this exact body inline rather than calling
+// `common::isDictionaryName` alone.
+//
+// THE GUARD IS LOAD-BEARING, not merely tidying (#3897). Per the spec's
+// reserved-type-name paragraph (`Bezel_Language_Spec.md`, "an ordinary
+// library type such as `Array` or `Stream` may still be shadowed by a user
+// type under the normal name-resolution rules"), `Dictionary` /
+// `OwningDictionary` / `SortedDictionary` are NOT reserved, so
+// `class Dictionary<T> { ... }` is legal Bezel. For such a class,
+// `rt->declaration` is the user's own `TypeSymbol` (non-null) while
+// `rt->headName()` still returns the shadowing name "Dictionary" — so a name-
+// only test (no `kind`/`declaration` check) answers "yes, builtin" for a
+// receiver that is structurally a user class. Before this fix,
+// `dictMethodStrKeySafe`/`dictStrKeySafe` were exactly that name-only test,
+// and the two-value pair (safe-read relaxation for a `string`-typed indexer/
+// method key argument) reopened issue #2717's use-after-free for a
+// shadowing class implementing its own `[k: T]: T { get => k; }` indexer:
+// measured, ASan `heap-use-after-free` in `main` on a `class Dictionary<T>`
+// with that shape, clean once this guard excludes it (the receiver's own
+// declaration is non-null, so `isBuiltinDictionaryTypeRef` now answers
+// false and the walker falls back to its careful, `indexerElementCannot
+// AliasIndex`-gated user-indexer path, which correctly declines the
+// relaxation for an aliasing getter).
+//
+// `rt->headName()` (not `Emitter::builtinTypeName`, also private) is
+// equivalent here: both resolve to `aliasResolvedHead`, then
+// `astNode->name->parts[0]`, then `importedName`, in that order, and this
+// function only reaches a `headName()` read once `!rt->declaration` is
+// already established — the one branch where the two accessors agree.
+inline bool isBuiltinDictionaryTypeRef(const sema::TypeRef* rt) {
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
+        return false;
+    return common::isDictionaryName(rt->headName());
+}
+
 // Parse a Bezel integer literal lexeme to its value.
 //
 // fix #2936: the implementation MOVED to common/IntLiteral.hpp and this is a
