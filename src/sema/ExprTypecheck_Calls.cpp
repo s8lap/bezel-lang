@@ -15453,6 +15453,39 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     "`, or copy to a local and guard with `<> null`");
                 return;
             }
+        } else {
+            // fix #3912 (§7.4): the target is any OTHER expression shape —
+            // most notably a direct call result (`N().Member`, the filed
+            // repro), but the same "not a local, not narrowable" reasoning
+            // covers every other node kind that can carry a nullable static
+            // type and reach this function as `ma.target`: a conditional
+            // atom (`(if c then N() else N()).Member`), a `??`/`as` binary
+            // result, an `await` result (a UnaryExpr with op "await"), a
+            // `default(T?)`, etc. None of these has an identity a narrowing
+            // fact could be pinned to (no local slot, no field path), so —
+            // exactly like the IndexExpr case immediately above — a
+            // nullable-typed result is rejected outright rather than
+            // enumerating every producing node kind one arm at a time
+            // (deliberate: the prior three-arm `if`/`else if` chain covered
+            // IdentifierExpr, MemberAccessExpr, and IndexExpr but had no
+            // default, so a CallExpr receiver fell through the whole gate,
+            // resolved as if non-nullable, and null-derefed at runtime —
+            // the bug #3912 reports). `x!.M` (PostfixBangExpr) and `x?.M`
+            // (NullCondMemberExpr) targets are already non-nullable at this
+            // point, so they reach here too but never trip the check below.
+            TypeRef* tgt = ctx_.exprType(*ma.target);
+            if (tgt && tgt->nullable) {
+                ctx_.diagnostics().report(
+                    Severity::Error, ma.span.begin,
+                    std::string("member access `.") +
+                    std::string(ma.member) +
+                    "` on a nullable expression result requires narrowing "
+                    "to non-null first (§7.4): force-unwrap with `!`, use "
+                    "the null-conditional `?." + std::string(ma.member) +
+                    "`, or copy the result to a local variable and guard "
+                    "with `<> null`");
+                return;
+            }
         }
     }
     // §15.1.2 (#1100, #1342): an inline array `[N]T` exposes `.Length`,

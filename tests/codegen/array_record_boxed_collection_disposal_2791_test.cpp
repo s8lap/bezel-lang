@@ -139,7 +139,7 @@ BEZEL_TEST(array_record_boxed_collection_disposal_2791, owning_single_boxed_elem
 BEZEL_TEST(array_record_boxed_collection_disposal_2791, borrowing_object_typed_boxed_element_reclaimed) {
     BEZEL_EXPECT_EQ(runChecked(main_(kPt,
         "    var arr: Array<Object> := [new Pt(3)]; "
-        "    return (arr[0] as Pt).R; ")), 3);
+        "    return (arr[0] as Pt)!.R; ")), 3);
 }
 
 // §8.6 / §15.4: Object-typed owning literal. NOTE: `OwningArray<Object>` is

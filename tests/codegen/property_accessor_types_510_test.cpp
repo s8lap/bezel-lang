@@ -332,7 +332,7 @@ BEZEL_TEST(property_accessor_types_510, control_abstract_string_property) {
         "class C "
         "  public static method Main(): int "
         "    using var c := new Child(); "
-        "    var n := (c as Base).Name; "
+        "    var n := (c as Base)!.Name; "
         "    return (if n = \"ok\" then 1 else 0); "
         "  end Main; end C;"), 1);
 }
