@@ -14519,8 +14519,26 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
              as->op == "/=" || as->op == "mod=" || as->op == "&=" ||
              as->op == "|=" ||
              as->op == "^=" || as->op == "<<=" || as->op == ">>=")) {
-            TypeRef* tTy = ctx_.exprType(*as->target);
-            TypeRef* rTy = ctx_.exprType(*as->value);
+            // fix #3830 (§6.6/§7.4/§7.11, v0.288): "Static type is read as
+            // §7.11 reads it — at the statement, after §7.4's narrowing: a
+            // target or right operand that §7.4 has narrowed non-null is a
+            // non-nullable operand." `ctx_.exprType` alone reads the DECLARED
+            // type — sema never rewrites a narrowed read's exprType (see
+            // `isNarrowedNonNullRead`'s own header comment) — so every check
+            // below that tests `->nullable` needs the NORMALIZED type, not
+            // the raw one, or a narrowed `n: int?` rejects `n += 1` /
+            // `n++`/`n--` exactly where `n := n + 1` is admitted. This is the
+            // SAME normalization the plain binary-operator path applies
+            // (ExprTypecheck_Exprs.cpp's `typeBinary`, `operandStaticTypeAt`)
+            // — the one both-sources predicate (#3298), not a second copy of
+            // it. `operandStaticTypeAt` is a no-op for every other case (an
+            // un-narrowed nullable stays nullable; a non-nullable or non-
+            // primitive type is returned unchanged), so this is invisible to
+            // every diagnostic and typing rule below except the narrowing one.
+            TypeRef* tTy =
+                operandStaticTypeAt(as->target.get(), ctx_.exprType(*as->target));
+            TypeRef* rTy =
+                operandStaticTypeAt(as->value.get(), ctx_.exprType(*as->value));
             using P = PrimitiveType;
             // Diagnostic-only spelling of a primitive type; mirrors
             // primitiveSpelling (ExprTypecheck_Exprs.cpp, anonymous
@@ -16289,8 +16307,16 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         // (LlvmBackend_Stmts.cpp ~line 1158), so a type that DOES overload
         // `++`/`--` (the §17.6 `Counter` example, §25.3) still compiles.
         if (is->target) {
-            if (const sema::TypeRef* targetTy =
-                    ctx_.exprType(*is->target)) {
+            // fix #3830 (§6.6/§7.4/§7.11/§17.6, v0.288): "The static type is
+            // read as §6.6 and §7.11 read it, after §7.4's narrowing: a local
+            // `n: int?` that §7.4 has narrowed non-null admits `n++` exactly
+            // as it admits `n := n + 1`." `ctx_.exprType` alone is the
+            // DECLARED type; normalize through the one both-sources narrowing
+            // predicate (#3298's `operandStaticTypeAt`) so the nullable-type
+            // reject a few lines down reads the narrowed type, not the
+            // declared one — the exact AssignmentStmt-arm sibling of this fix.
+            if (const sema::TypeRef* targetTy = operandStaticTypeAt(
+                    is->target.get(), ctx_.exprType(*is->target))) {
                 // §4.6 reference type, IGNORING nullability — a `string?` is
                 // still a reference type that does not overload `++`.
                 bool isRefType = false;

@@ -111,6 +111,21 @@ int runPlain(const std::string& body) {
     return r.ran ? r.exitCode : -999;
 }
 
+// fix #3830: 1 if `body` raises OverflowException, 0 if it runs to
+// completion without it, -999 on a front-end failure. Mirrors codegen_1964's
+// `throwsOverflow` (nullable_value_compound_1964_test.cpp) — §6.6's checked
+// narrow-integer write-back inherited by a §7.4-narrowed compound target.
+int throwsOverflowPlain(const std::string& body) {
+    auto r = runAot(
+        std::string("module MP2888; public class C2888 "
+                    "  public static method Main(): int "
+                    "    try ") +
+        body +
+        " return 0; catch OverflowException => return 1; end; "
+        "  end Main; end C2888;");
+    return r.ran ? r.exitCode : -999;
+}
+
 }  // namespace
 
 // ===========================================================================
@@ -137,11 +152,17 @@ int runPlain(const std::string& body) {
 // with its value by T12 below, which is why T12 is untouched and why it is now
 // this file's load-bearing row rather than its control.
 //
-// §7.4 does NOT rescue any of these: a property and an indexer slot are never
-// narrowable (§7.4 admits a local, a parameter and a `readonly` field only),
-// and for a nullable-typed local target #3298 implements the reading that §6.6
-// and §17.6 enumerate by DECLARED type — recorded, with the alternative and
-// the reason, as issue 3686.
+// §7.4 does NOT rescue a property or an indexer slot: neither is narrowable
+// (§7.4 admits a local, a parameter and a `readonly` field only), so every
+// accessor row in this file (T1-T4, T7-T9, T11) is unaffected by anything
+// below and stays a rejection. A nullable-typed LOCAL target is a different
+// story: issue 3686 asked whether §6.6/§17.6 should enumerate by the
+// DECLARED type (rejecting even a §7.4-narrowed local) or by the type AFTER
+// narrowing, and it has since been RULED at v0.288 (fix #3830): narrowing
+// reaches the compound/`++`/`--` forms exactly as it already reached the
+// binary form. T5 and T10 are the two rows that ruling flips — see their own
+// comments; every other row in this file names a property/indexer target and
+// is untouched.
 // ===========================================================================
 
 namespace {
@@ -247,29 +268,46 @@ BEZEL_TEST(codegen_nullable_property_compound_2888, nullable_rhs_rejected_3298) 
         "    var t: int := 5; "
         "    t += n; "
         "    return t; "));
-    BEZEL_EXPECT_TRUE(rejectedPlain(
-        "    var n: int? := 3; "
+    // fix #3830 (v0.288): `n` is now a PARAMETER, not a literal-initialized
+    // local — `var n: int? := 3;` is §7.4-narrowed at its initializer, and
+    // narrowing now reaches compound assignment, so `t += n` on a narrowed
+    // `n` is admitted (verified empirically: `t` becomes 8) — the exact
+    // int_plus_intq shape from tests/lit/sema/compound_nullable_operand_2153.
+    // A parameter is never narrowed by what the caller passes, so this keeps
+    // testing a genuinely nullable, unguarded RHS.
+    BEZEL_EXPECT_TRUE(rejected2888(
+        "module MP2888N; class C2888N "
+        "  public static method Chk(n: int?): int "
         "    var t: int := 5; "
         "    t += n; "
-        "    return t; "));
+        "    return t; "
+        "  end Chk; "
+        "  public static method Main(): int return Chk(3); end Main; "
+        "end C2888N;"));
 }
 
 // ===========================================================================
 // T5 — the plain LOCAL. §17.6's desugaring is §6.6's, so `a++` on an `int?`
-// takes the same verdict as `a += 1`. ⚠ This is the row where #3298's recorded
-// interpretation bites (issue 3686): `a` here IS §7.4-narrowed by its non-null
-// literal initialiser, and the equivalent `a := a + 1` IS admitted — §6.6 and
-// §17.6 are read as enumerations over the DECLARED type. The asymmetry is
-// deliberate, recorded, and filed; if 3686 rules the other way, THIS row is
-// the one that flips back.
+// takes the same verdict as `a += 1`. ⚠ THIS ROW FLIPPED at v0.288 (fix
+// #3830, ruling on issue 3686 — the "if 3686 rules the other way" case this
+// block used to name): `a`/`b`/`c` here ARE §7.4-narrowed by their non-null
+// literal initializer, and #3830 makes §6.6/§17.6 read the operand's type
+// AFTER narrowing, exactly as §7.11's binary-operator gate already did — so
+// the compound/increment forms are now admitted wherever the desugared
+// `a := a + 1` spelling is, and produce the SAME value. Un-narrowed twins
+// (a `null` initializer) stay rejected in T6 below — the asymmetry this
+// block used to document is gone; what remains is the ordinary
+// narrowed-vs-not distinction §7.4 draws everywhere else.
 // ===========================================================================
-BEZEL_TEST(codegen_nullable_property_compound_2888, local_increment_rejected_3298) {
-    BEZEL_EXPECT_TRUE(rejectedPlain("    var a: int? := 5; a++; return 0; "));
-    BEZEL_EXPECT_TRUE(rejectedPlain("    var b: int? := 5; b--; return 0; "));
-    BEZEL_EXPECT_TRUE(rejectedPlain("    var c: int? := 10; c += 1; return 0; "));
-    // …while the desugared spelling on the SAME narrowed local compiles and
-    // gives the value, which is what issue 3686 is about. Asserted here so the
-    // asymmetry is visible at the site rather than only in the issue.
+BEZEL_TEST(codegen_nullable_property_compound_2888, local_increment_narrowed_accepted_3830) {
+    BEZEL_EXPECT_EQ(runPlain(
+        "    var a: int? := 5; a++; return (a ?? -100); "), 6);
+    BEZEL_EXPECT_EQ(runPlain(
+        "    var b: int? := 5; b--; return (b ?? -100); "), 4);
+    BEZEL_EXPECT_EQ(runPlain(
+        "    var c: int? := 10; c += 1; return (c ?? -100); "), 11);
+    // The desugared spelling on the same narrowed local, for comparison —
+    // #3830 makes the two spellings agree, which is the point.
     BEZEL_EXPECT_EQ(runPlain(
         "    var a: int? := 5; a := a + 1; return (a ?? -100); "), 6);
 }
@@ -365,16 +403,20 @@ BEZEL_TEST(codegen_nullable_property_compound_2888, decimal_nullable_property_re
 }
 
 // ===========================================================================
-// T10 — §6.6's checked narrow-integer write-back and §6.2's signedness, which
-// this file reached through nullable targets. §6.6's write-back paragraph is
-// explicit that it "is unreached here: no operation types" once the operand is
-// nullable, so the rule is now exercised on the NON-nullable path only (T12).
+// T10 — §6.6's checked narrow-integer write-back and §6.2's signedness. ⚠
+// FLIPPED at v0.288 (fix #3830): `y`/`u` are §7.4-narrowed by their literal
+// initializer, so — same as T5 above — the compound form is now admitted,
+// and it inherits §6.6's checked write-back exactly as the non-nullable form
+// does (T12): `byte(260)` and unsigned `5u - 10` are both out of range and
+// raise `OverflowException` at RUNTIME rather than being rejected at compile
+// time. (Confirmed empirically against the non-nullable twins, which already
+// raise the same exception — the nullable-narrowed path now agrees.)
 // ===========================================================================
-BEZEL_TEST(codegen_nullable_property_compound_2888, checked_writeback_nullable_rejected_3298) {
-    BEZEL_EXPECT_TRUE(rejectedPlain(
-        "    var y: byte? := 250; y += 10; return 0; "));
-    BEZEL_EXPECT_TRUE(rejectedPlain(
-        "    var u: uint? := 5; u -= 10; return 0; "));
+BEZEL_TEST(codegen_nullable_property_compound_2888, checked_writeback_narrowed_accepted_3830) {
+    BEZEL_EXPECT_EQ(throwsOverflowPlain(
+        "var y: byte? := 250; y += 10;"), 1);
+    BEZEL_EXPECT_EQ(throwsOverflowPlain(
+        "var u: uint? := 5; u -= 10;"), 1);
 }
 
 // ===========================================================================

@@ -6,7 +6,17 @@
 // has no valid result. Before the fix the nullable gate skipped the check and
 // the #1964 lowering SExt'd the i1 payload — `int?(5) += bool?(true)` silently
 // stored 4 (true → -1), a garbage value.
+//
+// fix #3830 (v0.288): `i`/`b` are PARAMETERS — literal-initialized locals
+// (`var i: int? := 5;`, `var b: bool? := true;`) are §7.4-narrowed at their
+// initializer, and narrowing now reaches compound assignment. A parameter
+// is never narrowed by what the caller passes, so this keeps testing
+// genuinely nullable, unguarded operands.
 
-module M; class C public static method Main(): int var i: int? := 5; var b: bool? := true; i += b; return 0; end Main; end C;
+module M;
+class C
+  public static method Chk(i: int?, b: bool?): int i += b; return 0; end Chk;
+  public static method Main(): int return Chk(5, true); end Main;
+end C;
 
 // CHECK: :{{[0-9]+}}:{{[0-9]+}}: compound assignment `+=` is not defined when both operands are nullable (target `int?`, right-hand operand `bool?`) — the arithmetic, bitwise, or shift operators do not lift over a nullable value type (§7.11, v0.267); narrow first (§7.4 check, `?? <fallback>` (§7.7), or `!` (§7.8)) and use the non-nullable compound form (e.g. `b := (b ?? 0) + 1;`) (§6.6)
