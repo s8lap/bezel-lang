@@ -2513,7 +2513,53 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                         "InvalidOperationException");
                     // Build comparator for the element type.
                     llvm::Function* cmpFn = buildSortedKeyComparator(elemTy);
-                    if (!cmpFn) return nullptr;  // unsupported elem type
+                    if (!cmpFn) {
+                        // fix #3956 (stdlib §4.18, v0.294): `elemTy` reaching
+                        // here is already `genericBackingType`-ELIGIBLE (an
+                        // auto-hashable record via `recordTypeOfRef`, or a
+                        // class/interface via `hasObjectHeaderEquality` —
+                        // #3865's own new `!elemTy` guard above never fires
+                        // for either shape), but has no dispatchable
+                        // `CompareTo`, so `buildSortedKeyComparator` declines.
+                        // Before this fix that decline propagated as a bare
+                        // `return nullptr`, silently zero-degrading
+                        // `s.First()`/`.Last()` CALL syntax (#2434) with NO
+                        // diagnostic at all — MEASURED for both a class
+                        // element with no `CompareTo` and an auto-hashable
+                        // record element with no `CompareTo` (issue 3947's
+                        // own shape). The PROPERTY syntax (`s.First`, no
+                        // parens — LlvmBackend_Exprs.cpp) already carried
+                        // this exact diagnostic; this mirrors it verbatim so
+                        // both spellings agree. Being auto-hashable is NOT
+                        // sufficient — hashable and orderable are different
+                        // properties (issue 3947, filed separately, covers
+                        // the DEEPER question of whether such an element
+                        // should ever have been "eligible" for `.Contains`/
+                        // `.Add` either; this diagnostic does not resolve
+                        // that, it only stops the silent CRASH-ADJACENT
+                        // degrade on this specific call).
+                        const sema::TypeRef* rawElem = resolveTypeParamRef(elemTy);
+                        std::string elemName = "the element type";
+                        if (rawElem &&
+                            rawElem->kind == sema::TypeRef::Kind::Named &&
+                            rawElem->declaration)
+                            elemName = "`" +
+                                std::string(rawElem->declaration->name) + "`";
+                        ctx_.diagnostics().report(
+                            Severity::Error, call.span.begin,
+                            "`." + std::string(m) + "` on `SortedSet<T>` "
+                            "(stdlib \xC2\xA7""4.18) requires the element "
+                            "type to implement `IComparable<T>`; " +
+                            elemName + " does not (it declares no "
+                            "dispatchable single-parameter `CompareTo`, and "
+                            "being auto-hashable is not sufficient — "
+                            "hashable and orderable are different "
+                            "properties).");
+                        llvm::Type* resTy = i32();
+                        if (sema::TypeRef* rt = ctx_.exprType(call))
+                            if (llvm::Type* lt = lowerTypeRef(rt)) resTy = lt;
+                        return llvm::PoisonValue::get(resTy);
+                    }
                     // Call runtime: returns malloc'd copy of min/max key bytes.
                     const char* rtName = isMax ? "bz_dict_max_key_gen"
                                                : "bz_dict_min_key_gen";
@@ -2531,6 +2577,77 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                     return elemVal;
                 }
                 return nullptr;  // remaining ops scoped out for dict-backed sets
+            }
+            // fix #3865 (stdlib §4.18, v0.294): `genericBackingType` returned
+            // null for a `SortedSet<T>` receiver — T does not satisfy §4.18's
+            // `where T: IComparable<T>` constraint, which nothing checks for
+            // a builtin generic (#3490's open sema gap). This is the
+            // "genuinely ineligible" case specifically: a RECORD that is
+            // neither auto-hashable (§9.2) NOR has a dispatchable
+            // `CompareTo`, or a nullable element (`genericBackingType`'s own
+            // `!ty->nullable` guard). It does NOT cover a class/interface or
+            // an auto-hashable record with no `CompareTo` — those are still
+            // `genericBackingType`-ELIGIBLE (via `hasObjectHeaderEquality` /
+            // `recordTypeOfRef`) and reach the SEPARATE `!cmpFn` guard just
+            // above instead (fix #3956, added on review after this comment
+            // originally over-claimed covering that shape too — it cannot:
+            // `elemTy` there is non-null, so this `if (recvTy->headName() ==
+            // "SortedSet")` block is never reached for it).
+            //
+            // Unlike `Set<T>`/`OwningSet<T>` (whose non-eligible-element
+            // fallback below is a SOUND, working array-backed representation,
+            // #1070), `SortedSet` has NO array-backed form at all — its
+            // runtime allocation is ALWAYS `bz_dict_alloc_generic`'s
+            // `bz_dict_t*` (narrow #3428's own "SortedSet is hash-backed or
+            // it is nothing"). Falling through to the member arms below
+            // previously misread that `bz_dict_t*` as a `bz_array_t*`: a
+            // RECORD element's `.Contains`/`.Remove` (`emitRemoveElementEquality`)
+            // loaded a `%record.T` value out of dict-internal bytes and
+            // compared it with a raw `icmp eq`, which LLVM rejects on an
+            // aggregate operand — the "malformed IR" `bezelc` abort #3865
+            // reports (measured: `Invalid operand types for ICmp instruction,
+            // icmp eq %record.NoCmp ...`), and `.First`/`.Last` alone (not
+            // combined with a consumer) silently returned a garbage struct
+            // value read from the wrong layout, no diagnostic.
+            //
+            // Reporting ONE diagnostic here for every member call THIS
+            // receiver shape (ineligible per `genericBackingType`) can reach
+            // — rather than patching each arm's individual failure mode —
+            // converts both the crash and this shape's own silent degrade
+            // into a single loud, located compile error, mirroring the #3428
+            // construction-time precedent (LlvmBackend_Exprs2.cpp) for the
+            // identical family of problem.
+            // ⚠ Gated STRICTLY on `headName() == "SortedSet"`: `Set<T>`/
+            // `OwningSet<T>` reach this same `!elemTy` fallthrough for a
+            // perfectly ordinary class element (`genericBackingType`'s `isSet`
+            // exclusion, line ~379) and MUST keep falling through to the
+            // array-backed logic a few lines below — narrowing this to
+            // `SortedSet` only is what keeps `class_element_set_still_accepted`
+            // / `class_element_owning_set_still_accepted` (#3428) passing.
+            if (recvTy->headName() == "SortedSet") {
+                const sema::TypeRef* rawElem =
+                    (!recvTy->genericArgs.empty())
+                        ? resolveTypeParamRef(recvTy->genericArgs[0])
+                        : nullptr;
+                std::string elemName = "the element type";
+                if (rawElem && rawElem->kind == sema::TypeRef::Kind::Named &&
+                    rawElem->declaration)
+                    elemName = "`" + std::string(rawElem->declaration->name) + "`";
+                ctx_.diagnostics().report(
+                    Severity::Error, call.span.begin,
+                    "`." + std::string(m) + "` on `SortedSet<T>` (stdlib "
+                    "\xC2\xA7""4.18) requires the element type to implement "
+                    "`IComparable<T>`; " + elemName + " does not (it declares "
+                    "no dispatchable single-parameter `CompareTo`, and is not "
+                    "auto-hashable either, so no ordering or identity is "
+                    "available for this element). Give the element type a "
+                    "single-parameter `CompareTo` method (a record) or an "
+                    "`IComparable<T>` conformance (a class/interface), or use "
+                    "`Set<T>`/`OwningSet<T>` if ordering is not required.");
+                llvm::Type* resTy = i32();
+                if (sema::TypeRef* rt = ctx_.exprType(call))
+                    if (llvm::Type* lt = lowerTypeRef(rt)) resTy = lt;
+                return llvm::PoisonValue::get(resTy);
             }
         }
 
@@ -6646,6 +6763,79 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         // null only for the string key.
         const sema::TypeRef* keyTy =
             genericBackingType(recvTy, 0, /*isSet=*/false, nullptr);
+        // fix #3865 (stdlib §4.17, v0.294): every `else` branch below keyed on
+        // `!keyTy` (this whole `isDict` block is shared by `Dictionary` /
+        // `OwningDictionary` / `SortedDictionary`) assumes "keyTy null" means
+        // "the key is a `string`" and takes the `bz_dict_*_str` fast path.
+        // That is TRUE for `Dictionary`/`OwningDictionary` — the only other
+        // way `genericBackingType` returns null for `isSet=false` is its own
+        // `if (!isSet && isString) return nullptr;` early return — but FALSE
+        // for `SortedDictionary` with a non-string key that is not
+        // §4.17-eligible: a record declaring no `CompareTo` at all (illegal
+        // per `where K: IComparable<K>`), or — MEASURED as part of this
+        // issue's family sweep — a record that DOES declare a dispatchable
+        // `CompareTo` (a legal §4.17 key; #3740 admitted the identical shape
+        // for `SortedSet<T>`'s ELEMENT via `recordHasDispatchableCompareTo`,
+        // but that exception is gated on `isSet` inside `genericBackingType`
+        // and so never fires for a Dictionary-family KEY). Both shapes reach
+        // the string-fast-path `else` arms below and feed a `%record.T`
+        // struct into `bz.string`-shaped GEP/load pairs: measured, "GEP base
+        // pointer is not a vector or a vector of pointers ... %bz.string
+        // %record.NoCmp ..." / "... %record.Cmp ..." — malformed IR, the
+        // `SortedDictionary` twin of #3865's own `SortedSet` `.Contains`/
+        // `.First` crash. (A class/interface key is NOT in this guard's
+        // scope: `hasObjectHeaderEquality`'s `!isSet` branch always admits it
+        // here regardless of ordering, so `keyTy` is non-null for it — that
+        // shape's own defect, insertion-ordered iteration and a `FirstKey`
+        // SEGV, is the pre-existing, separately-tracked gap narrow #3428's
+        // commit body records.) Report ONE located diagnostic per call site
+        // instead — worded precisely: "not yet implemented" for the
+        // CompareTo-declaring shape (a legal key codegen cannot dispatch
+        // through yet) and "does not implement IComparable<K>" for the
+        // shape that has no CompareTo at all (an illegal instantiation) —
+        // rather than let either reach the mismatched fast path.
+        if (recvTy->headName() == "SortedDictionary" && !keyTy) {
+            const sema::TypeRef* rawKey =
+                (!recvTy->genericArgs.empty())
+                    ? resolveTypeParamRef(recvTy->genericArgs[0])
+                    : nullptr;
+            bool sdKeyIsString =
+                rawKey && rawKey->kind == sema::TypeRef::Kind::Primitive &&
+                rawKey->primitive == sema::PrimitiveType::String &&
+                !rawKey->nullable;
+            if (!sdKeyIsString) {
+                bool hasCmp = recordHasDispatchableCompareTo(rawKey);
+                std::string keyName = "the key type";
+                if (rawKey && rawKey->kind == sema::TypeRef::Kind::Named &&
+                    rawKey->declaration)
+                    keyName = "`" + std::string(rawKey->declaration->name) + "`";
+                std::string msg;
+                if (hasCmp) {
+                    msg = "`SortedDictionary<K, V>` with a non-hashable record "
+                          "key that declares `CompareTo` (" + keyName +
+                          ") is not yet supported in codegen (stdlib "
+                          "\xC2\xA7""4.17): only the `SortedSet<T>` element "
+                          "analogue of this shape is implemented (fix #3740). "
+                          "Use a hashable key (an auto-property-only record), "
+                          "or `Dictionary<K, V>` if sort order is not required.";
+                } else {
+                    msg = "`." + std::string(m) + "` on `SortedDictionary<K, "
+                          "V>` (stdlib \xC2\xA7""4.17) requires the key type "
+                          "to implement `IComparable<K>`; " + keyName +
+                          " does not (it declares no dispatchable "
+                          "single-parameter `CompareTo`, and is not "
+                          "auto-hashable either). Give the key type a "
+                          "single-parameter `CompareTo` method, or use "
+                          "`Dictionary<K, V>`/`OwningDictionary<K, V>` if "
+                          "ordering is not required.";
+                }
+                ctx_.diagnostics().report(Severity::Error, call.span.begin, msg);
+                llvm::Type* resTy = i32();
+                if (sema::TypeRef* rt = ctx_.exprType(call))
+                    if (llvm::Type* lt = lowerTypeRef(rt)) resTy = lt;
+                return llvm::PoisonValue::get(resTy);
+            }
+        }
         bool keyIsRecord = keyTy && recordTypeOfRef(keyTy) != nullptr;
         // issue D4 / §4.8: V is unconstrained for the borrowing dictionary, so
         // it can be a record (aggregate). A record value is too wide for the
@@ -8144,7 +8334,42 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             if (keyTy) {
                 // Generic-key path: build comparator, call bz_dict_min/max_key_gen.
                 llvm::Function* cmpFn = buildSortedKeyComparator(keyTy);
-                if (!cmpFn) return nullptr;  // unsupported key type
+                if (!cmpFn) {
+                    // fix #3956 (stdlib §4.17, v0.294): the `SortedDictionary`
+                    // twin of the `SortedSet.First()`/`.Last()` guard above.
+                    // `keyTy` here is the SAME `keyTy` this `isDict` block
+                    // computed at its own top (`genericBackingType(recvTy, 0,
+                    // isSet=false, nullptr)`) — non-null for an auto-hashable
+                    // record (`recordTypeOfRef`) or ANY class/interface
+                    // (`hasObjectHeaderEquality`, admitted unconditionally for
+                    // isSet=false), regardless of whether `CompareTo` exists.
+                    // Before this fix, a key with no dispatchable `CompareTo`
+                    // silently degraded `d.FirstKey()`/`.LastKey()` CALL
+                    // syntax to lowerLocalDecl's #2434 zero-fill, with NO
+                    // diagnostic — the PROPERTY syntax (`d.FirstKey`, no
+                    // parens — LlvmBackend_Exprs.cpp) already carried this
+                    // exact diagnostic; this mirrors it verbatim.
+                    const sema::TypeRef* rawKey = resolveTypeParamRef(keyTy);
+                    std::string keyName = "the key type";
+                    if (rawKey &&
+                        rawKey->kind == sema::TypeRef::Kind::Named &&
+                        rawKey->declaration)
+                        keyName = "`" +
+                            std::string(rawKey->declaration->name) + "`";
+                    ctx_.diagnostics().report(
+                        Severity::Error, call.span.begin,
+                        "`." + std::string(m) + "` on `SortedDictionary<K, "
+                        "V>` (stdlib \xC2\xA7""4.17) requires the key type "
+                        "to implement `IComparable<K>`; " + keyName +
+                        " does not (it declares no dispatchable "
+                        "single-parameter `CompareTo`, and being "
+                        "auto-hashable is not sufficient — hashable and "
+                        "orderable are different properties).");
+                    llvm::Type* resTy = i32();
+                    if (sema::TypeRef* rt = ctx_.exprType(call))
+                        if (llvm::Type* lt = lowerTypeRef(rt)) resTy = lt;
+                    return llvm::PoisonValue::get(resTy);
+                }
                 const char* rtName = isMax ? "bz_dict_max_key_gen"
                                            : "bz_dict_min_key_gen";
                 auto* mmFn = declareC(rtName, ptrTy(), {ptrTy(), ptrTy()});

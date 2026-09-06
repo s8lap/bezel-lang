@@ -4633,6 +4633,48 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                                     !keyTy->nullable;
                             }
                         }
+                        // fix #3865 (stdlib §4.18, v0.294): `keyTy` above is
+                        // ALREADY gated by `genericBackingType` for the
+                        // `isSortedSet` case, so null here means T does not
+                        // satisfy `where T: IComparable<T>` — the PROPERTY-
+                        // syntax (`s.First`) twin of the CALL-syntax
+                        // (`s.First()`) crash/silent-degrade this issue's own
+                        // sweep measured in `tryLowerCollectionInstanceCall`
+                        // (LlvmBackend_Calls.cpp). Before this guard the block
+                        // below was simply skipped (the `if (keyTy)` gate),
+                        // and the caller (e.g. `lowerLocalDecl`) silently
+                        // zero-degraded (#2434) with no diagnostic at all.
+                        // `SortedDictionary` is NOT in scope here: its own
+                        // `keyTy` (below) is the RAW generic argument, not
+                        // eligibility-gated, so this specific null case never
+                        // arises for it — its analogous defect is caught by
+                        // the `!cmpFn` guard a few lines further down.
+                        if (!keyTy && isSortedSet) {
+                            const sema::TypeRef* rawElem =
+                                (!tt->genericArgs.empty())
+                                    ? resolveTypeParamRef(tt->genericArgs[0])
+                                    : nullptr;
+                            std::string elemName = "the element type";
+                            if (rawElem &&
+                                rawElem->kind == sema::TypeRef::Kind::Named &&
+                                rawElem->declaration)
+                                elemName = "`" +
+                                    std::string(rawElem->declaration->name) + "`";
+                            ctx_.diagnostics().report(
+                                Severity::Error, ma->span.begin,
+                                "`." + std::string(ma->member) +
+                                "` on `SortedSet<T>` (stdlib \xC2\xA7""4.18) "
+                                "requires the element type to implement "
+                                "`IComparable<T>`; " + elemName + " does not "
+                                "(it declares no dispatchable "
+                                "single-parameter `CompareTo`, and is not "
+                                "auto-hashable either).");
+                            llvm::Type* resTy = i32();
+                            if (sema::TypeRef* rt = ctx_.exprType(e))
+                                if (llvm::Type* lt = lowerTypeRef(rt))
+                                    resTy = lt;
+                            return llvm::PoisonValue::get(resTy);
+                        }
                         if (keyTy) {
                             llvm::Value* obj = lowerExpr(*ma->target);
                             if (obj) {
@@ -4703,6 +4745,62 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                                         builder_.CreateCall(ffn, {kPtr});
                                         return kVal;
                                     }
+                                }
+                                // fix #3865 (stdlib §4.17/§4.18, v0.294): no
+                                // comparator could be built for this key/
+                                // element — either it has no `CompareTo` /
+                                // `IComparable<T>` conformance at all (an
+                                // illegal instantiation), or it is an
+                                // AUTO-HASHABLE record with no `CompareTo`
+                                // (hashable per §9.2 is NOT the same property
+                                // as orderable per §4.17/§4.18 — measured:
+                                // such a key/element was silently admitted by
+                                // `genericBackingType`'s auto-hashable
+                                // eligibility for `.Contains`/`.Add`, then
+                                // `buildSortedKeyComparator` declined it here,
+                                // degrading `.First`/`.FirstKey`/etc. to the
+                                // #2434 zero-fill with no diagnostic at all).
+                                // Report loudly rather than let the caller's
+                                // local-decl silently degrade.
+                                {
+                                    const sema::TypeRef* rawElem =
+                                        resolveTypeParamRef(keyTy);
+                                    std::string elemName = "the element type";
+                                    if (rawElem &&
+                                        rawElem->kind ==
+                                            sema::TypeRef::Kind::Named &&
+                                        rawElem->declaration)
+                                        elemName = "`" +
+                                            std::string(
+                                                rawElem->declaration->name) +
+                                            "`";
+                                    const char* slotWord =
+                                        isSortedSet ? "element" : "key";
+                                    const char* head =
+                                        isSortedSet ? "SortedSet<T>"
+                                                    : "SortedDictionary<K, V>";
+                                    const char* sec =
+                                        isSortedSet ? "\xC2\xA7""4.18"
+                                                    : "\xC2\xA7""4.17";
+                                    const char* tparam =
+                                        isSortedSet ? "T" : "K";
+                                    ctx_.diagnostics().report(
+                                        Severity::Error, ma->span.begin,
+                                        "`." + std::string(ma->member) +
+                                        "` on `" + head + "` (stdlib " + sec +
+                                        ") requires the " + slotWord +
+                                        " type to implement `IComparable<" +
+                                        tparam + ">`; " + elemName +
+                                        " does not (it declares no "
+                                        "dispatchable single-parameter "
+                                        "`CompareTo`, and being auto-hashable "
+                                        "is not sufficient — hashable and "
+                                        "orderable are different properties).");
+                                    llvm::Type* resTy = i32();
+                                    if (sema::TypeRef* rt = ctx_.exprType(e))
+                                        if (llvm::Type* lt = lowerTypeRef(rt))
+                                            resTy = lt;
+                                    return llvm::PoisonValue::get(resTy);
                                 }
                             }
                         }
