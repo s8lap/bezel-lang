@@ -15558,6 +15558,13 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
         if (recTs) {
             Disposal d{slot, recTs};
             d.recordStringFields = true;
+            // fix #3945 (§9.7 / §28.9 / §14.1, v0.294): carry the full
+            // per-instantiation TypeRef (`tr`, e.g. `Box<string>`) through
+            // to the eventual release — `recTs` (`Box`'s bare TypeSymbol)
+            // alone loses the substitution a bare-type-parameter field
+            // needs resolved at release time. See the Disposal::clsRef
+            // comment (LlvmBackend_impl.hpp).
+            d.clsRef = tr;
             disposeStack_.back().push_back(d);
         }
     }
@@ -17395,7 +17402,12 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
     if (!isSub && ld->initializer)
         isSub = isSubscriptionExpr(*ld->initializer);
     if (isSub) {
-        disposeStack_.back().push_back({it->second, nullptr, /*subscription=*/true});
+        // fix #3945 (§9.7/§28.9/§14.1, v0.294): the Disposal struct gained a
+        // `clsRef` field between `cls` and `subscription` — this positional
+        // aggregate-init needs an explicit `nullptr` for it so `true` still
+        // lands on `subscription`, not on the newly-inserted field.
+        disposeStack_.back().push_back(
+            {it->second, nullptr, /*clsRef=*/nullptr, /*subscription=*/true});
         return;
     }
     // §2.15 / issue #550: a `using var` bound to BinarySerializer or
@@ -26798,6 +26810,42 @@ bool Emitter::isFreshRecordConstructionOfExactType(
         const sema::TypeRef* fty =
             sema::storageComponentType(posFields[i], ctx_);
         if (!fty) return false;
+        // fix #3964 (§9.7 / §28.9 / §14.1, v0.294): `storageComponentType`
+        // returns the DECLARED type, so a BARE TYPE-PARAMETER component
+        // (`record Box<T>(X: T, ...)`) is Named/no-declaration whatever `T`
+        // is bound to — the `string` arm below never fired for it, so the
+        // "+1 producer or literal" requirement was silently SKIPPED for any
+        // bare-type-parameter component instantiated at `string`. This was
+        // harmless while nothing released such a field (the field just
+        // leaked, #3945's own bug); once #3945 made the record disposal
+        // walk actually release a bare-type-parameter string field, a
+        // wrongly-admitted local (whose "string" argument was really a
+        // BORROW — a plain identifier read or a field read, not a +1
+        // producer) got that borrow released out from under its other
+        // owner — a heap-use-after-free / double-free, strictly worse than
+        // the leak this fix closes (measured: df2_outlives,
+        // df4_two_records_one_string, df5_field_read_arg — clean/leaking on
+        // the parent, UAF/SEGV with only the release fix and not this one).
+        // Resolve the bare component through THIS construction's own
+        // instantiation (`nty->genericArgs`, already resolved above), and
+        // fail closed (reject the fast-path entirely) when it cannot be
+        // resolved to a concrete type (an enclosing generic body's still-
+        // unbound parameter) — every arm in this loop already follows that
+        // "unresolvable declines the optimization, never assumes it" rule.
+        if (isBareTypeParamRef(fty)) {
+            const std::vector<std::string_view> gpNames =
+                sema::genericParamNames(recTs);
+            const std::string_view paramName = fty->headName();
+            const sema::TypeRef* bound = nullptr;
+            for (std::size_t gi = 0; gi < gpNames.size(); ++gi) {
+                if (gpNames[gi] == paramName && gi < nty->genericArgs.size()) {
+                    bound = nty->genericArgs[gi];
+                    break;
+                }
+            }
+            if (!bound || isBareTypeParamRef(bound)) return false;
+            fty = bound;
+        }
         if (!fty->nullable && fty->kind == sema::TypeRef::Kind::Named &&
             fty->declaration &&
             (fty->declaration->kind == ast::TypeDeclKind::Record ||

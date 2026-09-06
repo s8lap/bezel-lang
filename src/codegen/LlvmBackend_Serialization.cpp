@@ -1063,6 +1063,10 @@ llvm::Value* Emitter::emitRecordDeserialize(const TypeSymbol* ts,
         } else if (isRecordWithStringFieldsTypeRef(cty)) {
             Disposal rd{slots[i], cty->declaration};
             rd.recordStringFields = true;
+            // fix #3945 (§9.7 / §28.9 / §14.1, v0.294): carry `cty` itself
+            // (genericArgs included, e.g. a `Box<string>` component) through
+            // to the release — see Disposal::clsRef (LlvmBackend_impl.hpp).
+            rd.clsRef = cty;
             disposeStack_.back().push_back(rd);
         } else if (!cty->nullable && cty->kind == sema::TypeRef::Kind::Named &&
                    cty->declaration &&
@@ -2148,6 +2152,10 @@ llvm::Value* Emitter::emitChoiceDeserialize(const TypeSymbol* ts,
                 } else if (isRecordWithStringFieldsTypeRef(pty)) {
                     Disposal rd{slots[pi], pty->declaration};
                     rd.recordStringFields = true;
+                    // fix #3945 (§9.7 / §28.9 / §14.1, v0.294): carry `pty`
+                    // itself (genericArgs included) through to the release —
+                    // see Disposal::clsRef (LlvmBackend_impl.hpp).
+                    rd.clsRef = pty;
                     disposeStack_.back().push_back(rd);
                 } else if (!pty->nullable &&
                            pty->kind == sema::TypeRef::Kind::Named &&

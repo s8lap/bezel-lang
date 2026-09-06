@@ -3125,8 +3125,14 @@ bool Emitter::choiceHasStringFields(const sema::TypeSymbol* ts) {
             if (ft->nullable || ft->kind != sema::TypeRef::Kind::Named ||
                 !ft->declaration)
                 continue;
+            // fix #3945 (§9.7 / §28.9 / §14.1, v0.294): pass `ft` itself
+            // (not `ft->declaration`) — a choice payload field may be a
+            // CONCRETE generic-record instantiation (`Val(B: Box<string>)`)
+            // even when the enclosing choice is not generic; recordHasStringFields
+            // now needs the full TypeRef to install the substitution for
+            // such a field's own bare-type-parameter members.
             if (ft->declaration->kind == ast::TypeDeclKind::Record &&
-                recordHasStringFields(ft->declaration))
+                recordHasStringFields(ft))
                 return true;
             if (ft->declaration->kind == ast::TypeDeclKind::Choice &&
                 choiceHasStringFields(ft->declaration))
@@ -3198,8 +3204,10 @@ void Emitter::emitChoiceStringFieldReleases_impl(
             if (ft->nullable || ft->kind != sema::TypeRef::Kind::Named ||
                 !ft->declaration)
                 continue;
+            // fix #3945 (§9.7 / §28.9 / §14.1, v0.294): `ft`, not
+            // `ft->declaration` — see the identical reasoning above.
             if ((ft->declaration->kind == ast::TypeDeclKind::Record &&
-                 recordHasStringFields(ft->declaration)) ||
+                 recordHasStringFields(ft)) ||
                 (ft->declaration->kind == ast::TypeDeclKind::Choice &&
                  choiceHasStringFields(ft->declaration))) {
                 caseOwnsString = true;
@@ -3238,12 +3246,16 @@ void Emitter::emitChoiceStringFieldReleases_impl(
             if (ft->nullable || ft->kind != sema::TypeRef::Kind::Named ||
                 !ft->declaration)
                 continue;
+            // fix #3945 (§9.7 / §28.9 / §14.1, v0.294): `ft`, not
+            // `ft->declaration` — see the choiceHasStringFields comment
+            // above (a choice payload field may be a concrete generic-
+            // record instantiation even when the choice itself is not).
             if (ft->declaration->kind == ast::TypeDeclKind::Record &&
-                recordHasStringFields(ft->declaration)) {
+                recordHasStringFields(ft)) {
                 llvm::Value* nestedAddr = builder_.CreateStructGEP(
                     payloadStruct, payloadAddr, (unsigned)j,
                     "chsfr.nested.rec.addr");
-                emitRecordStringFieldReleases_impl(nestedAddr, ft->declaration);
+                emitRecordStringFieldReleases_impl(nestedAddr, ft);
                 continue;
             }
             if (ft->declaration->kind == ast::TypeDeclKind::Choice &&
@@ -3289,8 +3301,14 @@ bool Emitter::inlineArrayElementCarriesString(const sema::TypeRef* tr) {
         return tr->arrayElement &&
                inlineArrayElementCarriesString(tr->arrayElement);
     if (tr->kind == K::Named && tr->declaration) {
+        // fix #3945 (§9.7 / §28.9 / §14.1, v0.294): `tr`, not
+        // `tr->declaration` — a CONCRETE generic-record instantiation as an
+        // inline-array element (`[N]Box<string>`) needs the substitution;
+        // a genuinely BARE type-parameter element (`[N]T`) still falls to
+        // the `!tr->declaration` early return above, unchanged (the
+        // documented residual gap the comment above this function notes).
         if (tr->declaration->kind == ast::TypeDeclKind::Record)
-            return recordHasStringFields(tr->declaration);
+            return recordHasStringFields(tr);
         if (tr->declaration->kind == ast::TypeDeclKind::Choice)
             return choiceHasStringFields(tr->declaration);
         return false;  // enum: integer representation, no string to release
@@ -3383,9 +3401,12 @@ void Emitter::emitInlineArrayStringReleases_impl(
         if (elemTy->nullable || elemTy->kind != sema::TypeRef::Kind::Named ||
             !elemTy->declaration)
             continue;
+        // fix #3945 (§9.7 / §28.9 / §14.1, v0.294): `elemTy`, not
+        // `elemTy->declaration` — a concrete generic-record inline-array
+        // element (`[N]Box<string>`) needs the substitution installed.
         if (elemTy->declaration->kind == ast::TypeDeclKind::Record &&
-            recordHasStringFields(elemTy->declaration)) {
-            emitRecordStringFieldReleases_impl(slotAddr, elemTy->declaration);
+            recordHasStringFields(elemTy)) {
+            emitRecordStringFieldReleases_impl(slotAddr, elemTy);
             continue;
         }
         if (elemTy->declaration->kind == ast::TypeDeclKind::Choice &&
@@ -4739,8 +4760,12 @@ llvm::Function* Emitter::dictValueBoxFreer(const sema::TypeRef* dictTy) {
     // UNCHANGED for that V.
     if (valTy &&
         valTy->kind == sema::TypeRef::Kind::Named && valTy->declaration) {
+        // fix #3945 (§9.7 / §28.9 / §14.1, v0.294): `valTy`, not
+        // `valTy->declaration` — a `Dictionary<K, Box<string>>` boxed-value
+        // freer needs the substitution installed for `Box`'s own
+        // bare-type-parameter fields.
         if (valTy->declaration->kind == ast::TypeDeclKind::Record &&
-            recordHasStringFields(valTy->declaration)) {
+            recordHasStringFields(valTy)) {
             return boxedRecordValueFreer(valTy, valTy->nullable);
         }
         if (valTy->declaration->kind == ast::TypeDeclKind::Choice &&
@@ -4825,7 +4850,10 @@ llvm::Function* Emitter::boxedRecordValueFreer(const sema::TypeRef* valTy,
         llvm::StructType* wrapTy = nullableValueStructTy(valTy);
         recAddr = builder_.CreateStructGEP(wrapTy, box, 1, "nrec.box.payload");
     }
-    emitRecordStringFieldReleases_impl(recAddr, valTy->declaration);
+    // fix #3945 (§9.7 / §28.9 / §14.1, v0.294): `valTy`, not
+    // `valTy->declaration` — see the emitRecordStringFieldReleases_impl
+    // comment (LlvmBackend_impl.hpp).
+    emitRecordStringFieldReleases_impl(recAddr, valTy);
     // The walker emits non-terminator instructions only — doBB is the BB it
     // emitted into and is currently unterminated. Append the free + branch
     // to retBB on the local IRBuilder (NOT builder_, which we are about to
@@ -5577,7 +5605,14 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
         // no-op. `slot` is the record's struct alloca; `cls` is the record
         // TypeSymbol used to GEP each string storage member.
         if (it->recordStringFields) {
-            emitRecordStringFieldReleases(it->slot, it->cls);
+            // fix #3945 (§9.7 / §28.9 / §14.1, v0.294): `it->clsRef` (the
+            // per-instantiation TypeRef, e.g. `Box<string>`), not `it->cls`
+            // (the bare TypeSymbol `Box`) — see Disposal::clsRef and
+            // emitRecordStringFieldReleases_impl's own comment
+            // (LlvmBackend_impl.hpp). Every `recordStringFields` entry sets
+            // `clsRef` at registration (LlvmBackend_Setup.cpp /
+            // _Serialization.cpp).
+            emitRecordStringFieldReleases(it->slot, it->clsRef);
             continue;
         }
         // fix #2425 / §9.8 / §28.3/§28.9 / §35.4: the choice-side counterpart

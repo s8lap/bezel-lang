@@ -1153,6 +1153,19 @@ private:
     struct Disposal {
         llvm::AllocaInst* slot;
         const sema::TypeSymbol* cls;
+        // fix #3945 (§9.7 / §28.9 / §14.1, v0.294): the per-instantiation
+        // TypeRef for a `recordStringFields` entry (e.g. `Box<string>`,
+        // genericArgs included) — `cls` alone (`Box`'s bare TypeSymbol) lost
+        // the instantiation, so the eventual release
+        // (emitRecordStringFieldReleases) had no way to install the active
+        // substitution and a bare-type-parameter field instantiated at a
+        // string-owning type was never recognized/released. Set ONLY at the
+        // `recordStringFields` registration sites (LlvmBackend_Setup.cpp /
+        // _Serialization.cpp), which already hold the full TypeRef; null for
+        // every other Disposal kind (choiceStringFields keeps using `cls`
+        // alone — choiceHasStringFields already declines ALL generic choices
+        // unconditionally, so no choiceStringFields entry is ever generic).
+        const sema::TypeRef* clsRef = nullptr;
         bool subscription = false;
         // #362 / stdlib §4.5: a `using var` bound to a heap collection
         // (Array<T>/OwningArray<T>/…). At scope end it is freed via
@@ -3776,9 +3789,24 @@ private:
     // emitChoiceStringFieldReleases_impl (LlvmBackend_Disposal.cpp) — the
     // choice-side counterpart this comment's prior revision (#2405) noted
     // was missing.
+    // fix #3945 (§9.7 / §28.9 / §14.1, v0.294): takes the record's
+    // per-instantiation TypeRef, not just its TypeSymbol — same reasoning
+    // as recordHasStringFields above (installs a RecordSubstGuard, a no-op
+    // for a non-generic `tr`, so a bare-type-parameter field's ACTUAL
+    // instantiated type drives both the string-member release below and
+    // `recordStruct(ts)`'s own specialized-layout lookup). Without this,
+    // `Box<T>`'s `X: T` field instantiated at `string` (`Box<string>`) was
+    // never released — every string constructed through such a field
+    // leaked (measured: 13090 B / 600 allocations at 300 loop iterations,
+    // issue #3945's own repro).
     void emitRecordStringFieldReleases_impl(llvm::Value* recAddr,
-                                            const sema::TypeSymbol* ts) {
-        if (!recAddr || !ts || ts->kind != ast::TypeDeclKind::Record) return;
+                                            const sema::TypeRef* tr) {
+        if (!recAddr || !tr || tr->kind != sema::TypeRef::Kind::Named ||
+            !tr->declaration ||
+            tr->declaration->kind != ast::TypeDeclKind::Record)
+            return;
+        const sema::TypeSymbol* ts = tr->declaration;
+        RecordSubstGuard guard(this, tr);  // fix #3945: see comment above.
         llvm::StructType* st = recordStruct(ts);
         if (!st) return;
         std::vector<const sema::Symbol*> storage;
@@ -3786,7 +3814,7 @@ private:
         for (const sema::Symbol* m : storage) {
             auto idxIt = fieldIndex_.find(m);
             if (idxIt == fieldIndex_.end()) continue;
-            if (isStringStorageMember(m)) {
+            if (isStringStorageMemberResolved(m)) {
                 llvm::Value* addr =
                     builder_.CreateStructGEP(st, recAddr, idxIt->second,
                                               "recstrf.addr");
@@ -3797,14 +3825,14 @@ private:
                     llvm::ConstantPointerNull::get(ptrTy()), addr);
                 continue;
             }
-            const sema::TypeRef* mty = recordMemberType(m);
+            const sema::TypeRef* mty = recordMemberTypeResolved(m);
             if (mty && !mty->nullable &&
                 mty->kind == sema::TypeRef::Kind::Named && mty->declaration &&
                 mty->declaration->kind == ast::TypeDeclKind::Record &&
-                recordHasStringFields(mty->declaration)) {
+                recordHasStringFields(mty)) {
                 llvm::Value* nestedAddr = builder_.CreateStructGEP(
                     st, recAddr, idxIt->second, "recstrf.nested.addr");
-                emitRecordStringFieldReleases_impl(nestedAddr, mty->declaration);
+                emitRecordStringFieldReleases_impl(nestedAddr, mty);
                 continue;
             }
             // fix #2425: a nested value-like CHOICE component (see the
@@ -10395,8 +10423,49 @@ private:
     // the disposal-release path. recordMemberType reads the type off a positional
     // Param, a body FieldDecl, OR a PropertyDecl. Nullable string? is included (a
     // plain `ptr` whose null is null; bz_string_release is null-safe).
+    //
+    // ⚠ fix #3964 review (v0.294): DELIBERATELY BARE, unlike its
+    // `isStringStorageMemberResolved` twin just below. This predicate is
+    // SHARED with the CLASS instance-dispose walk (LlvmBackend_Disposal.cpp
+    // ~1519, `emitOwnFieldInit`'s retain-skip check at LlvmBackend_Setup.cpp
+    // ~11587, and the reassignment logic in LlvmBackend_Assign.cpp ~5705,
+    // LlvmBackend_Exprs2.cpp's storePrimaryCtorPositionalArgs ~3856). A class
+    // field's RETAIN half (isStringFieldLvalue → isStringExprType, a
+    // sema-level check) can never see through a monomorphization — it has no
+    // concept of an active codegen-level substitution — so it never retains a
+    // bare-type-parameter field instantiated at `string`. An earlier revision
+    // of this fix resolved ONLY this predicate (via recordMemberTypeResolved)
+    // to close the #3945 record leak, which broke that balance: the CLASS
+    // dispose walk started releasing a +1 the (still-blind) retain half never
+    // minted, turning a leak into a heap-use-after-free / double-free
+    // (measured: cls1_generic_class_string_field, cls2_generic_class_plusone
+    // — both clean on the parent, both crashing with only that swap). Kept
+    // bare so the class-side retain/release pair stays CONSISTENTLY blind
+    // (still leaks a bare-type-parameter class field instantiated at
+    // `string` — a pre-existing, undisturbed gap, not this fix's to close).
     bool isStringStorageMember(const sema::Symbol* m) {
         const sema::TypeRef* rt = recordMemberType(m);
+        return rt && rt->kind == sema::TypeRef::Kind::Primitive &&
+               rt->primitive == sema::PrimitiveType::String;
+    }
+
+    // fix #3945 / #3964 review (§9.7 / §28.9 / §14.1, v0.294): the
+    // substitution-aware twin of isStringStorageMember just above, used ONLY
+    // by the RECORD string-field walk — recordHasStringFields and
+    // emitRecordStringFieldReleases_impl, both of which install a
+    // RecordSubstGuard for the record's own instantiation before calling
+    // this, AND both of which are now gated (via
+    // isFreshRecordConstructionOfExactType's bare-type-parameter resolution,
+    // LlvmBackend_Setup.cpp) so a record local is only ever admitted for this
+    // release when every string-typed argument was proven a literal or a +1
+    // producer — never a borrow. That eligibility proof is what makes
+    // resolving the classifier SOUND for the record walk specifically, where
+    // it is NOT sound for the class walk above (see that predicate's own
+    // comment): a class field has no equivalent argument-level eligibility
+    // gate, so resolving its classifier alone (this function's own earlier,
+    // reverted form) would release a +1 nobody minted.
+    bool isStringStorageMemberResolved(const sema::Symbol* m) {
+        const sema::TypeRef* rt = recordMemberTypeResolved(m);
         return rt && rt->kind == sema::TypeRef::Kind::Primitive &&
                rt->primitive == sema::PrimitiveType::String;
     }
@@ -10409,6 +10478,14 @@ private:
     // resolve as a function TypeRef with nullable=true; bz_closure_release is
     // null-safe, so nullable closure fields are included (same as
     // isStringStorageMember includes nullable string?).
+    //
+    // ⚠ fix #3964 review (v0.294): DELIBERATELY BARE — shared with the CLASS
+    // instance-dispose walk exactly as isStringStorageMember is (see that
+    // predicate's comment just above for the full reasoning). No RECORD-side
+    // release mechanism actually consults this predicate at all: a record's
+    // function-typed fields are BORROWS (§9 — "records use the by-value path
+    // in lowerNew, whose function fields are borrows"), so there is no
+    // "isClosureStorageMemberResolved" twin and none is needed.
     bool isClosureStorageMember(const sema::Symbol* m) {
         const sema::TypeRef* rt = recordMemberType(m);
         return rt && rt->kind == sema::TypeRef::Kind::Function;
@@ -10448,17 +10525,40 @@ private:
     // the choice-side mirror of the #2405 nested-record recursion just
     // above; see choiceHasStringFields (LlvmBackend_Disposal.cpp) for the
     // choice-side termination argument (§35.1 self-containment).
-    bool recordHasStringFields(const sema::TypeSymbol* ts) {
-        if (!ts || ts->kind != ast::TypeDeclKind::Record) return false;
+    //
+    // fix #3945 (§9.7 / §28.9 / §14.1, v0.294): takes the record's
+    // per-instantiation TypeRef (not just its TypeSymbol) and installs a
+    // RecordSubstGuard for it before classifying — a no-op for a
+    // non-generic `tr`, but for a concrete generic instantiation
+    // (`Box<string>`) this makes `genericSubst_`/`genericSubstSemaTy_`
+    // active for the duration of the walk, so isStringStorageMember (via
+    // recordMemberTypeResolved) and the recursive calls below see the
+    // ACTUAL substituted type of a bare-type-parameter field/nested member
+    // instead of the always-unsubstituted bare declared type. This makes
+    // "consult the active substitution" part of the function's OWN
+    // contract rather than per-call-site discipline — every existing call
+    // site already held the needed TypeRef (see the callers in
+    // LlvmBackend_Disposal.cpp / _Serialization.cpp), it was simply being
+    // discarded (`->declaration`) before reaching here. Guards chain via
+    // RecordSubstGuard's own save/restore, so a nested generic record
+    // reached by the recursion below resolves correctly too (the recursive
+    // call passes `mty`, the caller's OWN resolved TypeRef, not just its
+    // declaration).
+    bool recordHasStringFields(const sema::TypeRef* tr) {
+        if (!tr || tr->kind != sema::TypeRef::Kind::Named || !tr->declaration)
+            return false;
+        const sema::TypeSymbol* ts = tr->declaration;
+        if (ts->kind != ast::TypeDeclKind::Record) return false;
+        RecordSubstGuard guard(this, tr);  // fix #3945: see comment above.
         std::vector<const sema::Symbol*> storage;
         collectRecordStorage(ts, storage);
         for (const sema::Symbol* m : storage) {
-            if (isStringStorageMember(m)) return true;
-            const sema::TypeRef* mty = recordMemberType(m);
+            if (isStringStorageMemberResolved(m)) return true;
+            const sema::TypeRef* mty = recordMemberTypeResolved(m);
             if (mty && !mty->nullable &&
                 mty->kind == sema::TypeRef::Kind::Named && mty->declaration &&
                 mty->declaration->kind == ast::TypeDeclKind::Record &&
-                recordHasStringFields(mty->declaration))
+                recordHasStringFields(mty))
                 return true;
             if (mty && !mty->nullable &&
                 mty->kind == sema::TypeRef::Kind::Named && mty->declaration &&
@@ -10564,11 +10664,20 @@ private:
     // classifier used at return sites (the callee retain) and the caller's
     // call-result registration. A nullable record (`P?`) is excluded — it
     // lowers to {i8, P} and a nullable-result release path is deferred.
+    //
+    // fix #3945 (§9.7 / §28.9 / §14.1, v0.294): passes `tr` itself (not
+    // `tr->declaration`) to recordHasStringFields — `tr` carries the
+    // record's per-instantiation genericArgs (`Box<string>`), which
+    // recordHasStringFields now uses to install the active substitution.
+    // Discarding it here (as the pre-fix code did) is exactly how a
+    // generic record's bare-type-parameter field instantiated at `string`
+    // went unrecognized: every one of THIS function's own callers already
+    // held the full TypeRef, so no caller needs to change.
     bool isRecordWithStringFieldsTypeRef(const sema::TypeRef* tr) {
         if (!tr || tr->nullable ||
             tr->kind != sema::TypeRef::Kind::Named || !tr->declaration)
             return false;
-        return recordHasStringFields(tr->declaration);
+        return recordHasStringFields(tr);
     }
 
     // fix #1747 / §28.9 / §9.7 / §28.3: release each string storage member
@@ -10590,9 +10699,15 @@ private:
     // a bit-copy that touches no refcount), and the eligibility walk proves
     // that state is exclusively this local's to release — no separate mint
     // step is needed or exists.
+    //
+    // fix #3945 (§9.7 / §28.9 / §14.1, v0.294): takes the record's
+    // per-instantiation TypeRef (see emitRecordStringFieldReleases_impl's
+    // own comment) — the `Disposal` entry that calls this now carries
+    // `clsRef` (the TypeRef captured at registration time) alongside the
+    // pre-existing `cls` (TypeSymbol, still used by other Disposal kinds).
     void emitRecordStringFieldReleases(llvm::Value* recAddr,
-                                       const sema::TypeSymbol* ts) {
-        emitRecordStringFieldReleases_impl(recAddr, ts);
+                                       const sema::TypeRef* tr) {
+        emitRecordStringFieldReleases_impl(recAddr, tr);
     }
 
     // fix #1747 / §28.9 / §9.7 / §28.3: the set of plain `var` RECORD
