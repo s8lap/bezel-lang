@@ -174,6 +174,112 @@ def _balanced_body(text, open_brace_idx):
     return text[open_brace_idx + 1:]
 
 
+# A raw-string-literal opener: `R"delim(` where `delim` is 0-16 chars, none
+# of them `(`, backslash or whitespace (the C++ grammar's own limit).
+_RAW_STRING_START = re.compile(r'R"([^(\\\s]{0,16})\(')
+
+# An identifier/digit character - used to tell a C++14 digit separator `'`
+# (always flanked by one of these on BOTH sides, e.g. `1'000`, `0xFF'FF`)
+# apart from a genuine char-literal-opening `'` (never is) - fix #3915.
+_WORDCHAR = re.compile(r'[0-9A-Za-z_]')
+
+
+def _strip_comments(text):
+    """Return `text` with every `//` and `/* */` comment SPAN replaced by
+    spaces (newlines preserved, so no OTHER offset math in this file needs
+    to change), so a comment's contents can never be mistaken for live code
+    by any regex that runs after this - fix #3915.
+
+    Issue #3915: `scan_file` used to delimit a test body as "everything up
+    to the next `BEZEL_TEST(`", so a comment quoting the literal text
+    `BEZEL_EXPECT_FALSE(r.ran)` (written to explain why a test deliberately
+    avoids that anti-pattern) bled into the PRECEDING test's scan window and
+    was misattributed to it. A comment living INSIDE a test's own braces has
+    the same problem one level down: it is not live code either way, no
+    matter which test's window it falls in.
+
+    A `"..."` string literal and a `'...'` character literal are scanned
+    with backslash-escape awareness so a literal containing `//` or `/*`
+    (a URL, a path, a diagnostic-message fragment) is never misread as
+    starting a comment. A `R"delim(...)delim"` RAW string literal (used
+    throughout tests/ to embed whole Bezel programs, which use `//` as
+    THEIR OWN comment syntax per spec §1.5) is recognised and copied
+    through completely untouched as one opaque unit, precisely so an
+    embedded Bezel-level `//` comment is never mistaken for a C++ one and
+    stripped out from under a real test body.
+
+    A `'` is NOT always a character-literal opener: C++14 digit separators
+    (`1'000`, `0xFF'FF`) reuse the same character. Per the fix #3915 review
+    round: a genuine char-literal-opening `'` is never immediately flanked
+    on BOTH sides by an identifier/digit character (`[0-9A-Za-z_]`) with no
+    separating token, whereas a digit separator always is. A `'` flanked
+    that way on both sides is passed through as an ordinary character
+    rather than toggling char-literal mode - otherwise everything after it
+    on the same line (crucially, a same-line `//` comment) would be
+    swallowed as "inside a string" and NOT stripped, resurrecting the
+    exact #3915 misattribution this function exists to eliminate.
+    """
+    out = []
+    i, n = 0, len(text)
+    while i < n:
+        m = _RAW_STRING_START.match(text, i)
+        if m:
+            end_marker = ')' + m.group(1) + '"'
+            j = text.find(end_marker, m.end())
+            end = len(text) if j == -1 else j + len(end_marker)
+            out.append(text[i:end])  # opaque - copied verbatim, never scanned
+            i = end
+            continue
+        c = text[i]
+        if (c == "'" and i > 0 and i + 1 < n and
+                _WORDCHAR.match(text[i - 1]) and _WORDCHAR.match(text[i + 1])):
+            # C++14 digit separator (`1'000`, `0xFF'FF`), not a char-literal
+            # opener - fix #3915 review round 2. A real char literal is
+            # never immediately preceded by an identifier/digit character
+            # with no separating token; a digit separator always is, on
+            # BOTH sides. Pass it through unchanged rather than entering
+            # char-literal mode, or the rest of THIS line (including a
+            # same-line `//` comment) would wrongly be treated as still
+            # being inside a string and left unstripped.
+            out.append(c)
+            i += 1
+            continue
+        if c == '"' or c == "'":
+            quote = c
+            out.append(c)
+            i += 1
+            while i < n:
+                cc = text[i]
+                if cc == '\\' and i + 1 < n:
+                    out.append(text[i:i + 2])
+                    i += 2
+                    continue
+                out.append(cc)
+                i += 1
+                if cc == quote or cc == '\n':
+                    break  # closed normally, or bail out at an unterminated EOL
+            continue
+        if c == '/' and i + 1 < n and text[i + 1] == '/':
+            while i < n and text[i] != '\n':
+                out.append(' ')
+                i += 1
+            continue
+        if c == '/' and i + 1 < n and text[i + 1] == '*':
+            out.append('  ')
+            i += 2
+            while i < n and not (text[i] == '*' and i + 1 < n and
+                                  text[i + 1] == '/'):
+                out.append('\n' if text[i] == '\n' else ' ')
+                i += 1
+            if i < n:
+                out.append('  ')
+                i += 2
+            continue
+        out.append(c)
+        i += 1
+    return ''.join(out)
+
+
 def _balanced_paren(text, open_paren_idx):
     """Return the text between the '(' at open_paren_idx and its match,
     treating parens INSIDE a `"..."` string literal as inert. Without this a
@@ -307,6 +413,14 @@ def scan_file(path, text):
     """-> list of (test_name, var) unprotected rows in this file's text."""
     if 'BEZEL_TEST' not in text:
         return []
+    # fix #3915: scan a COMMENT-STRIPPED copy, never the raw text - a
+    # comment quoting `BEZEL_EXPECT_FALSE(r.ran)` is not live code, whether
+    # it sits inside this test's own body or in the gap before/after it
+    # (the body is still delimited by "up to the next BEZEL_TEST(", which
+    # is why a comment in that gap used to bleed into the PRECEDING test's
+    # window - stripping it removes the only thing that made it matchable,
+    # in every window it could possibly fall into).
+    text = _strip_comments(text)
     if not (RAN_FALSE.search(text) or HAS_ERRORS_TRUE.search(text)):
         return []
     text_helpers = _text_checking_helpers(text)
@@ -651,6 +765,80 @@ BEZEL_TEST(fixture_suite, positive_only) {
 }
 ''')
 
+        # fix #3915 - THE MEASURED BUG: a comment quoting the literal text
+        # `BEZEL_EXPECT_FALSE(r.ran)` sits in the gap between two tests (to
+        # explain why the SECOND test deliberately avoids it). The old
+        # "everything up to the next BEZEL_TEST(" delimiter put that
+        # comment in the PRECEDING test's scan window; the preceding test
+        # here binds a var named `r` from `runAot` but never itself
+        # protects it (it only asserts the POSITIVE case), so the bug
+        # attributed a brand new unprotected `r` row to the WRONG test.
+        # Neither test in this file may be flagged.
+        _mk(root, 'tests/codegen/comment_bleeds_to_preceding_test_test.cpp', '''
+BEZEL_TEST(fixture_suite, positive_case_before_the_comment) {
+    auto r = runAot("module M;");
+    BEZEL_EXPECT_TRUE(r.ran);
+}
+// The test below deliberately avoids the ambiguous anti-pattern:
+//     BEZEL_EXPECT_FALSE(r.ran)
+// because plain `.ran` cannot distinguish a genuine rejection from a
+// runtime crash/signal/timeout/ASan report (issue #3892).
+BEZEL_TEST(fixture_suite, protected_case_after_the_comment) {
+    auto r = runAot("module M;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(hasErrorContaining(r, "some specific text"));
+}
+''')
+
+        # fix #3915 - the SAME hazard one level down: a comment quoting the
+        # pattern INSIDE a test's own braces (not in the gap between two
+        # tests) must not be counted as a live assertion in that test
+        # either. This test's only REAL assertion is the positive
+        # `EXPECT_TRUE(r.ran)`; the only thing matching the "unprotected
+        # rejection claim" shape is inside the comment.
+        _mk(root, 'tests/codegen/comment_inside_own_body_test.cpp', '''
+BEZEL_TEST(fixture_suite, comment_inside_own_body) {
+    auto r = runAot("module M;");
+    // Historically this test wrote BEZEL_EXPECT_FALSE(r.ran) here, but
+    // that is ambiguous - see issue #3892 - so it asserts the positive
+    // case instead.
+    BEZEL_EXPECT_TRUE(r.ran);
+}
+''')
+
+        # Companion control: a comment quoting the pattern must NOT mask a
+        # row that is GENUINELY unprotected in real (non-commented) code -
+        # the fix must keep detecting real cases, not merely stop
+        # over-flagging (LANE_RULES: "a fix that stops detecting real cases
+        # is far worse than the bug it fixes").
+        _mk(root, 'tests/codegen/bare_row_near_comment_test.cpp', '''
+BEZEL_TEST(fixture_suite, bare_row_near_comment) {
+    auto r = runAot("module M;");
+    // NOTE: the row below genuinely uses the ambiguous anti-pattern - it
+    // must still be flagged as a real unprotected row even though this
+    // very comment also quotes the pattern's literal text.
+    BEZEL_EXPECT_FALSE(r.ran);
+}
+''')
+
+        # fix #3915 review round 2: a C++14 digit separator (`1'000`,
+        # `0xFF'FF`) must not be misread as opening a char literal - if it
+        # is, everything after it on the SAME line (including a same-line
+        # `//` comment) is wrongly treated as still being "inside a
+        # string" and is left unstripped, resurrecting the exact
+        # misattribution this file exists to eliminate. Real code here
+        # only asserts the POSITIVE case; the anti-pattern's literal text
+        # appears twice, both times inside a same-line trailing comment
+        # immediately after a digit separator (decimal, then hex).
+        _mk(root, 'tests/codegen/digit_separator_same_line_comment_test.cpp', '''
+BEZEL_TEST(fixture_suite, digit_separator_same_line_comment) {
+    auto r = runAot("module M;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    int decimalWithSeparator = 1'000;  // quoting BEZEL_EXPECT_FALSE(r.ran) right after a decimal digit separator - must still be stripped
+    int hexWithSeparator = 0xFF'FF;  // quoting BEZEL_EXPECT_FALSE(r.ran) right after a hex digit separator too
+}
+''')
+
         total, per_file = measure(root)
         chk('bare `!ran` flagged', 'tests/codegen/bare_test.cpp' in per_file)
         chk('`!ran` + hasErrors()-only flagged (equally vulnerable)',
@@ -688,10 +876,29 @@ BEZEL_TEST(fixture_suite, positive_only) {
             'tests/support/demo_test.cpp' in per_file)
         chk('a plain EXPECT_TRUE(r.ran) test is not a rejection claim',
             'tests/codegen/positive_only_test.cpp' not in per_file)
-        chk('exactly 5 unprotected rows across the fixture tree (bare, '
+        # fix #3915 fixtures.
+        chk('issue #3915 MEASURED BUG: a comment quoting the pattern in the '
+            'gap between two tests is NOT attributed to the PRECEDING test',
+            'tests/codegen/comment_bleeds_to_preceding_test_test.cpp'
+            not in per_file)
+        chk('fix #3915: a comment quoting the pattern INSIDE a test\'s own '
+            'body is NOT attributed to that test either',
+            'tests/codegen/comment_inside_own_body_test.cpp' not in per_file)
+        chk('fix #3915: a GENUINE bare row is STILL caught even with a '
+            'comment nearby quoting the same literal text - the fix must '
+            'not stop detecting real cases',
+            'tests/codegen/bare_row_near_comment_test.cpp' in per_file)
+        chk('fix #3915 review round 2: a C++14 digit separator (1\'000, '
+            '0xFF\'FF) is not misread as opening a char literal, so a '
+            'same-line trailing comment quoting the pattern IS stripped '
+            'and the test is not flagged',
+            'tests/codegen/digit_separator_same_line_comment_test.cpp'
+            not in per_file)
+        chk('exactly 6 unprotected rows across the fixture tree (bare, '
             'hasErrors-only, the skip-guard-only row, the aliased-skip-only '
-            'row, the support/ demo)',
-            total == 5)
+            'row, the support/ demo, the #3915 bare-row-near-comment '
+            'control)',
+            total == 6)
 
         bpath = root / 'baseline'
         write_baseline(total, bpath)
