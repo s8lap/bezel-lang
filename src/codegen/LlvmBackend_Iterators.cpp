@@ -1790,6 +1790,7 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         dictEntryKeyReleaseEligibleFn_ = moveNextFn;  // fix #3720
         setLiteralFreeEligibleFn_ = moveNextFn;   // #2142
         dictLiteralFreeEligibleFn_ = moveNextFn;  // #2143
+        takeCurrentDictFreeEligibleFn_ = moveNextFn;  // fix #3880
         // fix #2817 / #2807 / #429 / §4.6 / §28.9 / §28.3 / §29.2 (v0.240): the
         // `var` STRING-local refcount analysis must describe the MOVENEXT fn too
         // — the same re-establishment #1897 made just above for the unwind sets

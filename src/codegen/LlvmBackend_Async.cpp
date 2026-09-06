@@ -1447,6 +1447,7 @@ void Emitter::emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         dictEntryKeyReleaseEligibleFn_ = resumeFn;  // fix #3720
         setLiteralFreeEligibleFn_ = resumeFn;   // #2142
         dictLiteralFreeEligibleFn_ = resumeFn;  // #2143
+        takeCurrentDictFreeEligibleFn_ = resumeFn;  // fix #3880
         // fix #2807 / #429 / §4.6 / §28.9 / §28.3 (v0.240): the `var` STRING-
         // local refcount analysis must describe the RESUME fn too. EVERY
         // consumer of the three string sets gates on `currentFn_ ==
@@ -2008,6 +2009,7 @@ void Emitter::emitAsyncLambda(const ast::LambdaExpr& lam, llvm::Function* fn,
             dictEntryKeyReleaseEligible_.clear();  // fix #3720
             setLiteralFreeEligible_.clear();   // #2142
             dictLiteralFreeEligible_.clear();  // #2143
+            takeCurrentDictFreeEligible_.clear();  // fix #3880
             literalTreeAggregateEligible_.clear();  // fix #2660
         }
         borrowingArrayFreeEligibleFn_ = resumeFn;
@@ -2016,6 +2018,7 @@ void Emitter::emitAsyncLambda(const ast::LambdaExpr& lam, llvm::Function* fn,
         dictEntryKeyReleaseEligibleFn_ = resumeFn;  // fix #3720
         setLiteralFreeEligibleFn_ = resumeFn;   // #2142
         dictLiteralFreeEligibleFn_ = resumeFn;  // #2143
+        takeCurrentDictFreeEligibleFn_ = resumeFn;  // fix #3880
         // fix #3728 (§15.1.1 / §15.3 / §29.7 / §30.6, v0.286): re-establish the
         // §15.3 (#747) move-only owning inline-array TRANSFER analysis for the
         // async LAMBDA's resume fn too — the #3699 fix gave `emitAsyncMethod` /
@@ -3211,6 +3214,7 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
         dictEntryKeyReleaseEligibleFn_ = resumeFn;    // fix #3720
         setLiteralFreeEligibleFn_ = resumeFn;         // #2142
         dictLiteralFreeEligibleFn_ = resumeFn;        // #2143
+        takeCurrentDictFreeEligibleFn_ = resumeFn;    // fix #3880
         // fix #2817 / #2807 / #429 / §4.6 / §28.9 / §28.3 / §30.7 (v0.240): the
         // `var` STRING-local refcount analysis must describe the async-ITERATOR
         // resume fn too — the same re-establishment #1896/#1897 made just above

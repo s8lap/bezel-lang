@@ -9218,6 +9218,10 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
     // #2143: Dictionary<K,V>-literal eligibility, populated by the same pass.
     dictLiteralFreeEligible_.clear();
     dictLiteralFreeEligibleFn_ = fn;
+    // fix #3880: dict-backed TakeCurrent() eligibility, populated by the same
+    // pass (mirrors dictLiteralFreeEligible_ just above).
+    takeCurrentDictFreeEligible_.clear();
+    takeCurrentDictFreeEligibleFn_ = fn;
     // fix #2660: nested-literal aggregate roots, populated by the same pass.
     // This site pins dictLiteralFreeEligibleFn_ (which #2660 reuses as its
     // staleness guard) WITHOUT calling collectBorrowingArrayFreeEligible, so
@@ -15419,6 +15423,35 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
         Disposal d{slot, nullptr};
         d.dict = true;
         disposeStack_.back().push_back(d);
+    }
+    // fix #3880 / §29.1 / §28.9 / §28.11: a plain `const`/`var` bound to
+    // `<expr>.TakeCurrent()` on a builtin owning enumerator, at a dict-backed
+    // result type (Dictionary<K,V>, or a dict-eligible Set<T>) proven non-
+    // escaping — the DICT-BACKED sibling of the #1003 array reclaim above
+    // (isFreshTakeCurrentDictBackedLocal / takeCurrentDictFreeEligible_).
+    // Unlike dictMaterializerFreeEligible_'s ToDictionary()-result reclaim
+    // just above (which assumes a null per-value disposer — the borrowing
+    // chain never owns ToDictionary's values, per stdlib §5), the value
+    // TakeCurrent() hands over here is whatever the SOURCE collection
+    // actually built (e.g. a `Dictionary<int,string>` populated by `.Add`),
+    // so the value/element disposer must be derived from the local's own
+    // resolved type, not assumed null. `buildCollectionTempDisposal` is the
+    // existing (slot, TypeRef) → Disposal helper that already derives the
+    // correct bz_dict_free wiring (including the Set<string> dictStringKeys
+    // +1 release and any record/string value disposer) from a TypeRef — the
+    // SAME helper the CollectionLiteralExpr Set/Dict-literal arms above and
+    // the owned-parameter auto-drop path (~L19203) already reuse, so this
+    // stays correct for every K/V/element combination without re-deriving
+    // the dispatch a fourth time.
+    if (v && currentFn_ == takeCurrentDictFreeEligibleFn_ &&
+        takeCurrentDictFreeEligible_.count(static_cast<const void*>(declNode)) &&
+        !disposeStack_.empty()) {
+        LocalDeclInitView declView = localDeclInitView(declNode);
+        const sema::TypeRef* rt = nullptr;
+        if (declView.type) rt = ctx_.resolvedType(*declView.type);
+        if (!rt && declView.init) rt = ctx_.exprType(*declView.init);
+        if (rt)
+            disposeStack_.back().push_back(buildCollectionTempDisposal(slot, rt));
     }
     // #1930 / stdlib §5 / §28.9: a plain `var g := <src>.GroupBy(sel).First()/…`
     // (a bare-GroupBy element-returning terminal) proven non-escaping holds the SOLE
@@ -27213,6 +27246,64 @@ bool Emitter::isFreshTakeCurrentBuiltinArrayLocal(
 }
 
 
+// fix #3880 / §29.1 / §28.9 / §28.11 (v0.294): see the declaration comment in
+// LlvmBackend_impl.hpp. Sibling of isFreshTakeCurrentBuiltinArrayLocal just
+// above, for the DICT-BACKED builtin collections a `TakeCurrent()` call can
+// also return: a dict-eligible `Set<T>` and any `Dictionary<K,V>`. Both
+// reclaim via `bz_dict_free` — a DIFFERENT runtime call than `Array<T>`'s
+// `bz_array_free` — which is exactly why #3878 filed this as a separate
+// issue (#3880) rather than widening the string test above: admitting a
+// Set<T>/Dictionary<K,V> local into `candidates`/`borrowingArrayFreeEligible_`
+// would run the ARRAY reclaim over a `bz_dict_t*`, freeing the wrong struct
+// shape (a type-confused free, not merely a leak).
+bool Emitter::isFreshTakeCurrentDictBackedLocal(
+        const LocalDeclInitView& view) {
+    if (view.isUsing || !view.init) return false;
+    const sema::TypeRef* rt = nullptr;
+    if (view.type) rt = ctx_.resolvedType(*view.type);
+    if (!rt) rt = ctx_.exprType(*view.init);
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
+        return false;
+    std::string_view head = builtinTypeName(rt);
+    if (head.empty()) return false;
+    if (head == "Dictionary") {
+        // Dictionary<K,V> (name-head exactly "Dictionary", not
+        // "OwningDictionary"/"SortedDictionary" — mirrors
+        // isBorrowingDictLiteralLocal's own scope) is ALWAYS bz_dict_t*-
+        // backed regardless of K/V (isDictTypeName / buildCollectionTemp
+        // Disposal's unconditional dict dispatch) — no further gate needed.
+    } else if (head == "Set") {
+        // Set<T> (name-head exactly "Set", not "OwningSet"/"SortedSet" —
+        // mirrors isBorrowingSetLiteralLocal's own scope) is dict-backed
+        // only when its element is generic-dict-eligible (record, non-
+        // nullable primitive/enum, or string) — the SAME setDictBacked gate
+        // buildCollectionTempDisposal uses. A class/interface element Set is
+        // array-backed (bz_array_t*) instead; that shape is a distinct,
+        // unmeasured gap left alone here (file rather than guess).
+        if (genericBackingType(rt, 0, /*isSet=*/true, nullptr) == nullptr)
+            return false;
+    } else {
+        return false;
+    }
+    // The initializer must be an explicit, no-argument `<expr>.TakeCurrent()`
+    // call whose RECEIVER is a builtin (declaration-less)
+    // IOwningEnumerator<T>/IOwningAsyncEnumerator<T> — identical receiver
+    // gate to isFreshTakeCurrentBuiltinArrayLocal (see its own comment for
+    // why this can never admit a local that arm did not actually lower this
+    // way).
+    auto* call = dynamic_cast<const ast::CallExpr*>(view.init);
+    if (!call || !call->callee || !call->args.empty()) return false;
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call->callee.get());
+    if (!ma || !ma->target || ma->member != "TakeCurrent") return false;
+    const sema::TypeRef* recvTy = ctx_.exprType(*ma->target);
+    return recvTy && recvTy->kind == sema::TypeRef::Kind::Named &&
+           !recvTy->declaration && recvTy->astNode && recvTy->astNode->name &&
+           !recvTy->astNode->name->parts.empty() &&
+           common::isIterFormatEnumeratorHead(recvTy->headName()) &&
+           common::isOwningIterableInterfaceHead(recvTy->headName());
+}
+
+
 // #1004 / stdlib §5 / §3 / §28: is `e` an EXPRESSION codegen lowers to a FRESH,
 // OWNERLESS `Array<T>` temporary — i.e. a fresh-array materializer call
 // (`recv.ToArray()`, `recv.Sorted(...)`, or `recv.Reversed()`) whose result is
@@ -27518,6 +27609,7 @@ void Emitter::collectBorrowingArrayFreeEligible(
     dictEntryKeyReleaseEligible_.clear();    // #3720
     setLiteralFreeEligible_.clear();        // #2142
     dictLiteralFreeEligible_.clear();       // #2143
+    takeCurrentDictFreeEligible_.clear();   // fix #3880
     literalTreeAggregateEligible_.clear();  // #2660
     // fix issue 2802 / §21.1: the eligibility sets are keyed on the AST node pointer (const void*), and the consumers (escape walker's `target`, collectSafeViewAliases, lowerLocalDecl's `dictLiteralFreeEligible_` lookup, ...) all compare via `const void*` — so widening the candidate vector type from `const ast::LocalDecl*` to `const ast::Node*` admits §21.1 `const` locals (LocalConstDecl, a different Stmt subtype) without changing any downstream pointer-identity comparison. The pre-issue-2802 type was the local reason the dict-literal form below elided a `const` binding: collectBorrowingArrayFreeEligible's scan lambda only matched LocalDecl, so a `const d: Dictionary<K,V> := [k:v, ...]` (the issue's measured repro: 832 KB / 10000 allocs leaked per 2000 iters) was never added to dictLiteralCandidates, the escape-walk never ran for it, and dictLiteralFreeEligible_ never received it — the literal's table was allocated by materializeHeapDictLiteral but never reclaimed, exactly the issue's defect. Admitting const locals here is the fix for issue 2802.
     std::vector<const ast::Node*> candidates;
@@ -27526,6 +27618,7 @@ void Emitter::collectBorrowingArrayFreeEligible(
     std::vector<const ast::Node*> dictEntryKeyCandidates;  // #3720
     std::vector<const ast::Node*> setLiteralCandidates;   // #2142
     std::vector<const ast::Node*> dictLiteralCandidates;  // #2143
+    std::vector<const ast::Node*> takeCurrentDictCandidates;  // fix #3880
     std::vector<const ast::Node*> aggregateCandidates;    // #2660
     // fix #2802: build the LocalDeclInitView from whichever AST node kind
     // the scanner hit — a plain `var` (LocalDecl) supplies initializer/type/
@@ -27585,6 +27678,19 @@ void Emitter::collectBorrowingArrayFreeEligible(
             // consumer — no new consumption code needed.
             else if (isFreshTakeCurrentBuiltinArrayLocal(v))
                 candidates.push_back(node);
+            // fix #3880 / §29.1 / §28.9 / §28.11: the DICT-BACKED sibling of
+            // the branch just above — a plain `const`/`var` bound to
+            // `<expr>.TakeCurrent()` on a builtin owning enumerator, at a
+            // Dictionary<K,V> or dict-eligible Set<T> result type. Mutually
+            // exclusive with every other arm in this chain (all require
+            // either a different initializer shape — CollectionLiteralExpr,
+            // ToDictionary()/ToArray()/Sorted()/Reversed()/Split() — or a
+            // different result-type name-head), so ordering is immaterial.
+            // Kept in its OWN candidates vector (not `candidates`) because it
+            // frees via bz_dict_free, not bz_array_free — sharing `candidates`
+            // would run the wrong runtime free over a `bz_dict_t*`.
+            else if (isFreshTakeCurrentDictBackedLocal(v))
+                takeCurrentDictCandidates.push_back(node);
             // #1871 / §28.9 / §28.11: a plain `var xs: Array<T> := [ ... ]` — a
             // collection literal whose backing the local solely owns. `Array<T>`
             // is trivial-dispose (its Dispose is a no-op) but its backing storage
@@ -27741,6 +27847,25 @@ void Emitter::collectBorrowingArrayFreeEligible(
         for (auto& s : body) { w.stmt(s.get()); if (w.escaped) break; }
         if (!w.escaped)
             dictLiteralFreeEligible_.insert(static_cast<const void*>(ld));
+    }
+    // fix #3880 / §29.1 / §28.9 / §28.11: same conservative escape walk
+    // (borrowingArrayMode, safeViewAliases) as the Array-TakeCurrent /
+    // Set-literal / Dict-literal passes above — a `for var x in s`/`for var
+    // kv in d` iteration over the dict-backed local, or a binding into a
+    // proven-safe view, is a borrow-read, not an escape, exactly like the
+    // sibling families. A local proven never to escape holds the SOLE
+    // reference to the value TakeCurrent() handed it (§29.1: "transfers
+    // ownership of the most-recently-yielded value to the caller"), so a
+    // scope-end bz_dict_free runs exactly once (no UAF, no double-free).
+    for (const ast::Node* ld : takeCurrentDictCandidates) {
+        std::unordered_set<const void*> safeViews;
+        collectSafeViewAliases(body, ld, safeViews);
+        StringEscapeWalker w{ctx_, static_cast<const void*>(ld)};
+        w.borrowingArrayMode = true;
+        w.safeViewAliases = &safeViews;
+        for (auto& s : body) { w.stmt(s.get()); if (w.escaped) break; }
+        if (!w.escaped)
+            takeCurrentDictFreeEligible_.insert(static_cast<const void*>(ld));
     }
     // fix #2660 / §15.4 / §28.9 / §28.11: the nested-literal aggregate roots.
     // Candidacy already established condition (b) (every node is a fresh nested

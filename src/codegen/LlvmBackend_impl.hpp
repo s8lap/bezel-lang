@@ -11627,6 +11627,12 @@ private:
               setLiteralFreeEligibleFn_(e.setLiteralFreeEligibleFn_),
               dictLiteralFreeEligible_(e.dictLiteralFreeEligible_),
               dictLiteralFreeEligibleFn_(e.dictLiteralFreeEligibleFn_),
+              // fix #3880: takeCurrentDictFreeEligible_ is populated by the
+              // SAME collectBorrowingArrayFreeEligible call this scope
+              // guards, so it needs the identical save/restore protection
+              // (LANE_RULES §8's two-halves-of-one-contract rule).
+              takeCurrentDictFreeEligible_(e.takeCurrentDictFreeEligible_),
+              takeCurrentDictFreeEligibleFn_(e.takeCurrentDictFreeEligibleFn_),
               literalTreeAggregateEligible_(e.literalTreeAggregateEligible_) {}
         ~BorrowingReclaimSetScope() {
             e_.borrowingArrayFreeEligible_ =
@@ -11645,6 +11651,10 @@ private:
             e_.setLiteralFreeEligibleFn_ = setLiteralFreeEligibleFn_;
             e_.dictLiteralFreeEligible_ = std::move(dictLiteralFreeEligible_);
             e_.dictLiteralFreeEligibleFn_ = dictLiteralFreeEligibleFn_;
+            e_.takeCurrentDictFreeEligible_ =
+                std::move(takeCurrentDictFreeEligible_);           // fix #3880
+            e_.takeCurrentDictFreeEligibleFn_ =
+                takeCurrentDictFreeEligibleFn_;                    // fix #3880
             e_.literalTreeAggregateEligible_ =
                 std::move(literalTreeAggregateEligible_);
         }
@@ -11666,6 +11676,8 @@ private:
         llvm::Function* setLiteralFreeEligibleFn_;
         std::unordered_set<const void*> dictLiteralFreeEligible_;
         llvm::Function* dictLiteralFreeEligibleFn_;
+        std::unordered_set<const void*> takeCurrentDictFreeEligible_;  // #3880
+        llvm::Function* takeCurrentDictFreeEligibleFn_;                // #3880
         std::unordered_set<const void*> literalTreeAggregateEligible_;
     };
 
@@ -13027,6 +13039,18 @@ private:
     // (#2143) — the materializer path already reclaims via the sibling set.
     std::unordered_set<const void*> dictLiteralFreeEligible_;
     llvm::Function* dictLiteralFreeEligibleFn_ = nullptr;
+    // fix #3880 / §29.1 / §28.9 / §28.11: the dict-backed TakeCurrent() analog
+    // of borrowingArrayFreeEligible_ — a plain `const`/`var` bound directly to
+    // `<expr>.TakeCurrent()` on a builtin owning enumerator, at a dict-backed
+    // result type (Dictionary<K,V>, or a dict-eligible Set<T>) — see
+    // isFreshTakeCurrentDictBackedLocal. Sibling of #3878's
+    // borrowingArrayFreeEligible_ population for the SAME call shape at a
+    // builtin Array<T> result type; kept in a SEPARATE set because this frees
+    // via bz_dict_free (buildCollectionTempDisposal), not bz_array_free.
+    // Populated alongside the sets above (same escape walk, same
+    // collectBorrowingArrayFreeEligible pass).
+    std::unordered_set<const void*> takeCurrentDictFreeEligible_;
+    llvm::Function* takeCurrentDictFreeEligibleFn_ = nullptr;
     // fix #2660 / §15.4 / §28.9 / §28.11: the NESTED-literal analog of the three
     // flat sets above. A `var`/`using var` local whose initializer is a
     // collection literal each of whose element/value NODES is itself a fresh
@@ -13221,6 +13245,25 @@ private:
     // allocations over 200 drains).
     bool isFreshTakeCurrentBuiltinArrayLocal(
         const LocalDeclInitView& view) const;
+    // fix #3880 / §29.1 / §28.9 / §28.11 (v0.294): the DICT-BACKED sibling of
+    // isFreshTakeCurrentBuiltinArrayLocal immediately above — true if `view`
+    // is a plain `const`/`var` bound directly to an explicit
+    // `<expr>.TakeCurrent()` call on a builtin (declaration-less)
+    // `IOwningEnumerator<T>`/`IOwningAsyncEnumerator<T>`, at a result type
+    // that is either a builtin `Dictionary<K,V>` (name-head exactly
+    // "Dictionary" — mirrors isBorrowingDictLiteralLocal's scope) or a
+    // dict-eligible builtin `Set<T>` (name-head exactly "Set", AND
+    // genericBackingType(rt, 0, isSet=true, …) non-null — a class/interface
+    // Set element is array-backed instead and is NOT admitted here, a
+    // distinct unmeasured gap). Both reclaim via `bz_dict_free`, a DIFFERENT
+    // runtime call than `Array<T>`'s `bz_array_free` — #3878 filed this as
+    // #3880 rather than widening the Array predicate's string test, because
+    // admitting a dict-backed local into borrowingArrayFreeEligible_ would
+    // run the ARRAY reclaim over a `bz_dict_t*` (a type-confused free, not
+    // merely a leak). Same receiver-type gate as the Array sibling
+    // (isIterFormatEnumeratorHead && isOwningIterableInterfaceHead). Non-
+    // const: calls genericBackingType.
+    bool isFreshTakeCurrentDictBackedLocal(const LocalDeclInitView& view);
     // #1871 / §28.9 / §28.11: true if the local described by `view` is a plain
     // `var xs: Array<T> := [ ... ]` (a borrowing `Array<T>` local initialised by
     // a collection literal) whose element policy is backing-only (null per-

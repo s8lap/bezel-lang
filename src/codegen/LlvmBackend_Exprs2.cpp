@@ -2504,6 +2504,13 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         llvm::Function* savedSetLiteralFreeEligFn = setLiteralFreeEligibleFn_;
         auto savedDictLiteralFreeElig = dictLiteralFreeEligible_;
         llvm::Function* savedDictLiteralFreeEligFn = dictLiteralFreeEligibleFn_;
+        // fix #3880: same save/restore for the dict-backed TakeCurrent()
+        // reclaim eligibility set — populated by the SAME
+        // collectBorrowingArrayFreeEligible call emitAsyncLambda makes above,
+        // so it needs identical protection (LANE_RULES §8).
+        auto savedTakeCurrentDictFreeElig = takeCurrentDictFreeEligible_;
+        llvm::Function* savedTakeCurrentDictFreeEligFn =
+            takeCurrentDictFreeEligibleFn_;
         // fix #2660: same protection for the nested-literal aggregate set —
         // emitAsyncLambda recomputes it for the lambda body, and without the
         // restore the enclosing body's later aggregate roots would consult the
@@ -2555,6 +2562,9 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         setLiteralFreeEligibleFn_ = savedSetLiteralFreeEligFn;             // #2142
         dictLiteralFreeEligible_ = std::move(savedDictLiteralFreeElig);    // #2143
         dictLiteralFreeEligibleFn_ = savedDictLiteralFreeEligFn;           // #2143
+        takeCurrentDictFreeEligible_ =
+            std::move(savedTakeCurrentDictFreeElig);                      // #3880
+        takeCurrentDictFreeEligibleFn_ = savedTakeCurrentDictFreeEligFn;   // #3880
         literalTreeAggregateEligible_ =
             std::move(savedLiteralTreeAggElig);                            // #2660
         // fix #3728: restore half of the save two-step above.
