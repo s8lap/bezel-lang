@@ -7976,16 +7976,20 @@ void MethodOwnership::collectBorrowUsesStmt(const ast::Stmt& s) {
     // z := y.V;` form correctly freezes the `move w` with "the borrow held
     // by `y` is still live" (§28.3/§28.7/§30.14 v0.180).
     //
-    // Scope (recorded, not fixed here): `collectRecordBorrowSource` /
-    // `collectBareTypeParamCallBorrowSource` take `const ast::LocalDecl&`
-    // specifically (record-typed / bare-type-param-result locals) — #3427
-    // already found the shape of a live gap that pattern would close (a
-    // `const` bound to a borrow-bearing RECORD/choice value, e.g. `const rec
-    // := MakeRecord(span);`, is §21.1-admissible and plausibly under-tracked
-    // the same way) but widening those two additionally is unverified here;
-    // filed as a follow-up (issue in this lane's report) rather than guessed.
+    // fix #3689 (§21.1, v0.286): `collectRecordBorrowSource` /
+    // `collectBareTypeParamCallBorrowSource` are the SIBLING registrations the
+    // `var` arm above runs (record-typed / bare-type-param-result locals). Both
+    // were widened from `const ast::LocalDecl&` to `const ast::Node&` (the same
+    // widening `findLocalSymbol` got under #3591) and confirmed applicable-and-
+    // wrong for `const`: `const s := local.AsSpan(); return s;` and `const m :=
+    // Util.Pick(a, b); _ := Util.Sink(owned a); m.Poke();` both compiled clean
+    // pre-fix where their `var` twins are correctly rejected (§9.7/§4.14/§4.15
+    // #1966 and §28.3 #1801 respectively) — see the two functions' own comments
+    // for the measured repros. Run them here exactly as the `var` arm does.
     if (auto* lcd = dynamic_cast<const ast::LocalConstDecl*>(&s)) {
         if (lcd->value) recordBorrowUseExpr(*lcd->value);
+        collectRecordBorrowSource(*lcd);
+        collectBareTypeParamCallBorrowSource(*lcd);
         return;
     }
     if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(&s)) {
@@ -8113,14 +8117,30 @@ void MethodOwnership::collectRecordBorrowRoots(
     }
 }
 
-void MethodOwnership::collectRecordBorrowSource(const ast::LocalDecl& ld) {
+void MethodOwnership::collectRecordBorrowSource(const ast::Node& ld) {
     // §28.3 (v0.186, #1726): "A live local of borrow-bearing record type — a
     // span is the canonical case — counts as a live local borrow of every
     // carried borrow's source." Only borrow-bearing-record / builtin-span locals
     // participate; a plain value/class local is handled by the ordinary
     // states_-based source tracking.
-    if (!ld.initializer) return;
-    const sema::TypeRef* rt = ctx_.exprType(*ld.initializer);
+    //
+    // fix #3689 (§21.1, v0.286): `ld` is a `LocalDecl` (`var`) OR a
+    // `LocalConstDecl` (`const`) — §21.1 explicitly admits a `const` binding a
+    // borrow-bearing record/span value ("value-typed expressions — records
+    // included — a borrow-bearing record value carries §9.7's ordinary source
+    // obligations"), so both must feed the same provenance map. Measured false
+    // ACCEPT before this fix: `const s := local.AsSpan(); return s;` compiled
+    // clean (no diagnostic) where the identical `var s := local.AsSpan();
+    // return s;` form is correctly rejected by checkIndirectEscapeOnReturn
+    // ("returned `s` is a span viewing `local` whose backing storage is
+    // disposed at scope end", §9.7/§4.14/§4.15 #1966) — a `const`-bound span
+    // outliving its backing Array is a use-after-free identical to the `var`
+    // case this function already protects.
+    const ast::Expr* init = nullptr;
+    if (auto* d = dynamic_cast<const ast::LocalDecl*>(&ld)) init = d->initializer.get();
+    else if (auto* c = dynamic_cast<const ast::LocalConstDecl*>(&ld)) init = c->value.get();
+    if (!init) return;
+    const sema::TypeRef* rt = ctx_.exprType(*init);
     // §35.4 / §9.7 (v0.220, #2180): a borrow-bearing CHOICE local (`var b :=
     // Box.Got(hh);`) equally "counts as a live local borrow of every carried
     // borrow's source" (§35.4, applying §9.7's rules with "record" read as
@@ -8130,19 +8150,19 @@ void MethodOwnership::collectRecordBorrowSource(const ast::LocalDecl& ld) {
     sema::LocalSymbol* lsym = findLocalSymbol(ld);
     if (!lsym) return;
     std::vector<const sema::Symbol*> srcs;
-    collectRecordBorrowRoots(*ld.initializer, lsym, srcs);
+    collectRecordBorrowRoots(*init, lsym, srcs);
     if (srcs.empty()) return;
     // §28.3 (#1741): the declaration opens each source's view window at the
     // initializer offset and leaves it open (until = MAX) until a later
     // straight-line reassignment retires it.
-    const std::uint32_t from = ld.initializer->span.begin.offset;
+    const std::uint32_t from = init->span.begin.offset;
     std::vector<RecordBorrowSource>& entries = recordBorrowLocalSource_[lsym];
     for (const sema::Symbol* src : srcs)
         entries.push_back({src, from, UINT32_MAX});
 }
 
 void MethodOwnership::collectBareTypeParamCallBorrowSource(
-    const ast::LocalDecl& ld) {
+    const ast::Node& ld) {
     // §28.3 *Bare-type-parameter returns* (v0.194, #1801). DISJOINT sibling of
     // collectRecordBorrowSource: a `var m := Pick(a, b);` over a static (or
     // instance) method whose DECLARED return is a bare type parameter yields a
@@ -8164,8 +8184,22 @@ void MethodOwnership::collectBareTypeParamCallBorrowSource(
     // method inheriting a generic bare-T declaration (S10), and the intrinsics
     // `Math.Min`/`Max`/`Clamp` (S11) and `Aggregate` (S13) — and returns the
     // resolved source set. // per §28.3, v0.194
-    if (!ld.initializer) return;
-    auto* ce = dynamic_cast<const ast::CallExpr*>(ld.initializer.get());
+    //
+    // fix #3689 (§21.1, v0.286): `ld` is a `LocalDecl` (`var`) OR a
+    // `LocalConstDecl` (`const`) — §21.1 admits a `const` binding the result of
+    // a plain (non-owned-producing) call, and a bare-type-parameter call's
+    // Borrowed result is exactly that. Measured false ACCEPT before this fix:
+    // `const m := Util.Pick(a, b); _ := Util.Sink(owned a); var p := m.Poke();`
+    // compiled clean (Sink's `owned a` disposes `a` while `m`'s later `.Poke()`
+    // use reads it back through `m`'s alias) where the identical `var m :=
+    // Util.Pick(a, b);` form is correctly frozen ("cannot consume `a` here: the
+    // borrow held by `m` is still live", §28.3/§28.7/§30.14 v0.180) — the exact
+    // #1801 keystone UAF this function exists to close, reopened for `const`.
+    const ast::Expr* init = nullptr;
+    if (auto* d = dynamic_cast<const ast::LocalDecl*>(&ld)) init = d->initializer.get();
+    else if (auto* c = dynamic_cast<const ast::LocalConstDecl*>(&ld)) init = c->value.get();
+    if (!init) return;
+    auto* ce = dynamic_cast<const ast::CallExpr*>(init);
     if (!ce) return;
     BareBorrowCallInfo info = analyzeBareBorrowCall(*ce);
     if (!info.recognized) return;
@@ -8183,7 +8217,7 @@ void MethodOwnership::collectBareTypeParamCallBorrowSource(
     // `Create<T>(): T` (factory) — attaches no liveness constraint; the S3 launder
     // reject and the factory rule govern those instead. // per §28.3, v0.194
     if (info.sources.empty()) return;
-    const std::uint32_t from = ld.initializer->span.begin.offset;
+    const std::uint32_t from = init->span.begin.offset;
     std::vector<RecordBorrowSource>& entries = recordBorrowLocalSource_[lsym];
     for (const sema::Symbol* src : info.sources)
         if (src && src != lsym)  // a self-reference carries no constraint

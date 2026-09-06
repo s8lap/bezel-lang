@@ -520,3 +520,150 @@ BEZEL_TEST(localdecl_bare_const_arms_3591,
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(hasErrorMessage(r, "TaskScope bound to a plain `var`"));
 }
+
+// ===========================================================================
+// Site 10 (fix #3689, follow-up on Site 3 / Ownership_Checks.cpp:6235) —
+// collectRecordBorrowSource (Ownership_Checks.cpp:8116).
+//
+// §28.3 (v0.186, #1726) / §9.7 / §4.14 / §4.15 (#1966): a live local of
+// borrow-bearing record / builtin-span type "counts as a live local borrow of
+// every carried borrow's source," and returning such a holder by name after
+// binding it first (`var s := local.AsSpan(); return s;`) is the #1966
+// indirect-escape UAF — already pinned by the `var` form as
+// indirect_span_escape_1966__spanvar_returned_rejected.bzl
+// (tests/lit/ownership). collectRecordBorrowSource is the ONE registration
+// that attaches a span/record holder's carried source into
+// recordBorrowLocalSource_ so checkIndirectEscapeOnReturn can see it, but it
+// took `const ast::LocalDecl&` specifically and was never called from
+// collectBorrowUsesStmt's `LocalConstDecl` arm — so a `const`-bound span
+// holder had NO provenance at all and its later return went unchecked. §21.1
+// explicitly admits a value-typed (record/span-typed) expression as a legal
+// `const` initializer, so this is applicable-and-wrong, not merely
+// unreachable.
+//
+// Fail-without/pass-with (measured on this lane's HEAD): before the fix this
+// compiled with NO diagnostic (the `const` span silently outlives `local` —
+// the exact UAF #1966 closed for `var`); after the fix it draws the same
+// §9.7/§4.14/§4.15 message the `var` form draws.
+BEZEL_TEST(localdecl_bare_const_arms_3591,
+           indirect_span_escape_via_const_holder_rejected_9_7) {
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "class C "
+        "  public static method Leak(): ArraySpan<int> "
+        "    var local := new Array<int>(); local.Add(7); "
+        "    const s := local.AsSpan(); "
+        "    return s; "
+        "  end Leak; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "is a span viewing `local` whose backing storage is disposed at "
+           "scope end"));
+}
+
+// CONTROL: the `var` twin was already rejected before this fix (and is
+// separately pinned by the lit test cited above) — guard-sensitivity proof
+// that the fix does not silently widen admission.
+BEZEL_TEST(localdecl_bare_const_arms_3591,
+           indirect_span_escape_via_var_holder_still_rejected_9_7) {
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "class C "
+        "  public static method Leak(): ArraySpan<int> "
+        "    var local := new Array<int>(); local.Add(7); "
+        "    var s := local.AsSpan(); "
+        "    return s; "
+        "  end Leak; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "is a span viewing `local` whose backing storage is disposed at "
+           "scope end"));
+}
+
+// ===========================================================================
+// Site 11 (fix #3689, follow-up on Site 3 / Ownership_Checks.cpp:6235) —
+// collectBareTypeParamCallBorrowSource (Ownership_Checks.cpp:8144).
+//
+// §28.3 *Bare-type-parameter returns* (v0.194, #1801 keystone): a call whose
+// declared return is a bare type parameter (`Util.Pick<T>(a: T, b: T): T`)
+// yields a borrow carrying the union of its sources' liveness; consuming a
+// contributing source (here, an owned-argument transfer `Sink(owned a)`)
+// while the result has a reachable later use must be frozen — already pinned
+// for `var` by
+// bare_type_param_returns_1801.static_pick_consume_arg_while_result_live_
+// rejected_spec_28_3 (tests/ownership/bare_type_param_returns_1801_test.cpp).
+// collectBareTypeParamCallBorrowSource is the registration that attaches the
+// union source set into recordBorrowLocalSource_ so the consume-site freeze
+// (collectBorrowUsesStmt) can see it, but — the DISJOINT sibling of Site 10 —
+// it too took `const ast::LocalDecl&` specifically and was never called from
+// the `LocalConstDecl` arm, so a `const`-bound bare-T call result had no
+// registered source set and its contributing argument could be consumed
+// (disposed) while the result was still live: a use-after-free through the
+// surviving alias. §21.1 admits a `const` binding a plain (non-owned-
+// producing) call result, so this is applicable-and-wrong.
+//
+// Fail-without/pass-with (measured on this lane's HEAD): before the fix this
+// compiled with NO diagnostic; after the fix it draws the same consume-site-
+// freeze message the `var` form draws.
+BEZEL_TEST(localdecl_bare_const_arms_3591,
+           bare_type_param_consume_freeze_via_const_rejected_28_3) {
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "class C "
+        "  public constructor() end constructor; "
+        "  destructor end destructor; "
+        "  public method Poke(): int return 1; end Poke; "
+        "end C; "
+        "class Util "
+        "  public static method Pick<T>(a: T, b: T): T return a; end Pick; "
+        "  public static method Sink(owned c: C): int c.Dispose(); return 0; "
+        "  end Sink; "
+        "end Util; "
+        "class Prog "
+        "  public static method Main(): int "
+        "    var a := new C(); "
+        "    var b := new C(); "
+        "    const m := Util.Pick(a, b); "
+        "    _ := Util.Sink(owned a); "  // consume `a` while `m` live
+        "    var p := m.Poke(); "            // `m`'s surviving use
+        "    b.Dispose(); "
+        "    return p; "
+        "  end Main; "
+        "end Prog;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(r, "cannot consume `a` here"));
+}
+
+// CONTROL: the `var` twin was already rejected before this fix (and is
+// separately pinned by bare_type_param_returns_1801's own test) —
+// guard-sensitivity proof.
+BEZEL_TEST(localdecl_bare_const_arms_3591,
+           bare_type_param_consume_freeze_via_var_still_rejected_28_3) {
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "class C "
+        "  public constructor() end constructor; "
+        "  destructor end destructor; "
+        "  public method Poke(): int return 1; end Poke; "
+        "end C; "
+        "class Util "
+        "  public static method Pick<T>(a: T, b: T): T return a; end Pick; "
+        "  public static method Sink(owned c: C): int c.Dispose(); return 0; "
+        "  end Sink; "
+        "end Util; "
+        "class Prog "
+        "  public static method Main(): int "
+        "    var a := new C(); "
+        "    var b := new C(); "
+        "    var m := Util.Pick(a, b); "
+        "    _ := Util.Sink(owned a); "
+        "    var p := m.Poke(); "
+        "    b.Dispose(); "
+        "    return p; "
+        "  end Main; "
+        "end Prog;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(r, "cannot consume `a` here"));
+}

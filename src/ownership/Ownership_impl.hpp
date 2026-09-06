@@ -2306,8 +2306,15 @@ private:
     // record the source binding(s) it carries into recordBorrowLocalSource_ (the
     // identifier root of the initializer chain, or the borrow-carrying arg roots
     // of a `new Rec(...)` construction). Called from the freeze pre-pass at each
-    // LocalDecl. // per §28.3
-    void collectRecordBorrowSource(const ast::LocalDecl& ld);
+    // LocalDecl / LocalConstDecl. // per §28.3
+    // fix #3689 (§21.1, v0.286): widened from `const ast::LocalDecl&` to
+    // `const ast::Node&` — §21.1 explicitly admits a `const` binding a
+    // borrow-bearing record/span value (a record constructor call, `AsSpan()`,
+    // …), and the body only ever reads `ld`'s initializer expression and passes
+    // `ld` on to `findLocalSymbol` (already `const ast::Node&`), so this is a
+    // pure widening. See the header comment at the LocalConstDecl call sites in
+    // collectBorrowUsesStmt for the measured false-ACCEPT this closes.
+    void collectRecordBorrowSource(const ast::Node& ld);
     // §28.3 *Bare-type-parameter returns* (v0.194, #1801): a DISJOINT sibling of
     // collectRecordBorrowSource. When `ld`'s initializer is a call whose callee's
     // declared (pre-substitution) return type is a bare type parameter (of the
@@ -2319,7 +2326,12 @@ private:
     // transfer / drop-on-overwrite) of any contributing source while the result
     // has a reachable later use. Keyed on the bare-T-call recognizer, never on
     // the record predicate, so span/record freeze is untouched. // per §28.3
-    void collectBareTypeParamCallBorrowSource(const ast::LocalDecl& ld);
+    // fix #3689 (§21.1 / §28.3 v0.194, v0.286): widened from
+    // `const ast::LocalDecl&` to `const ast::Node&`, the same rationale as
+    // collectRecordBorrowSource above — a `const m := Pick(a, b);` binding a
+    // bare-type-parameter call result is §21.1-admissible and carries the same
+    // union borrow a `var` does.
+    void collectBareTypeParamCallBorrowSource(const ast::Node& ld);
     // §28.3 (#1741): re-collect the carried source of a borrow-bearing-record /
     // span local `s` when it is REASSIGNED (`s := <producer>;`) at source offset
     // `reassignOffset`. The old source windows are closed at that offset and the
