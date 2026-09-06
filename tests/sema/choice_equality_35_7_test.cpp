@@ -36,13 +36,10 @@ using bezel::test::parseAndCollect;
 
 namespace {
 
+// fix #3985: delegates to the shared gated helper (sema_support.hpp)
+// instead of duplicating the parse-error-gate logic locally.
 bezel::test::SemaResult semaAll(std::string_view src) {
-    auto r = parseAndCollect(src);
-    if (r.sourceFile && r.ctx) {
-        bezel::sema::resolveTypes(*r.sourceFile, *r.ctx);
-        bezel::sema::typecheckExpressions(*r.sourceFile, *r.ctx);
-    }
-    return r;
+    return bezel::test::parseAndTypecheckGated(src);
 }
 
 bool hasErrDiagWith(const bezel::test::SemaResult& r, std::string_view needle) {
@@ -86,7 +83,7 @@ BEZEL_TEST(choice_equality_35_7,
     // on `=`. The choice has a plain class payload, which makes it borrow-
     // bearing per §35.4.2.
     auto r = semaAll(
-        "module M; class C; end C; "
+        "module M; class C end C; "
         "choice Box Some(value: C), None; end Box; "
         "class D public static method Main(): int "
         "  var a: Box := Box.None; "
@@ -101,7 +98,7 @@ BEZEL_TEST(choice_equality_35_7,
            spec_35_7_borrow_bearing_choice_rejects_not_equal_op) {
     // §35.7: the rule covers both `=` and `<>`.
     auto r = semaAll(
-        "module M; class C; end C; "
+        "module M; class C end C; "
         "choice Box Some(value: C), None; end Box; "
         "class D public static method Main(): int "
         "  var a: Box := Box.None; "
@@ -118,7 +115,7 @@ BEZEL_TEST(choice_equality_35_7,
     // §35.7: an owning choice (an `owned` marker on a class payload per
     // §35.4.1) is move-only — value equality is unavailable.
     auto r = semaAll(
-        "module M; class R; end R; "
+        "module M; class R end R; "
         "choice FetchOutcome Fetched(owned response: R), NotModified; "
         "end FetchOutcome; "
         "class D public static method Main(): int "
@@ -195,12 +192,12 @@ BEZEL_TEST(choice_equality_35_7,
     // §35.7: "direct `Equals`/`GetHashCode` calls" also draw the use-site
     // error on non-value-like choices. Mirrors §9.2's record rule.
     auto r = semaAll(
-        "module M; class R; end R; "
+        "module M; class R end R; "
         "choice FetchOutcome Fetched(owned response: R), NotModified; "
         "end FetchOutcome; "
         "class D public static method Main(): int "
         "  var a: FetchOutcome := FetchOutcome.NotModified; "
-        "  return if a.Equals(a) then 1 else 0; "
+        "  return (if a.Equals(a) then 1 else 0); "
         "end Main; end D;");
     BEZEL_EXPECT_TRUE(hasErrDiagWith(r, "is not available on choice"));
 }
@@ -209,7 +206,7 @@ BEZEL_TEST(choice_equality_35_7,
            spec_35_7_borrow_bearing_choice_rejects_gethashcode_call) {
     // §35.7: `.GetHashCode()` on a borrow-bearing choice rejects.
     auto r = semaAll(
-        "module M; class C; end C; "
+        "module M; class C end C; "
         "choice Box Some(value: C), None; end Box; "
         "class D public static method Main(): int "
         "  var a: Box := Box.None; "
@@ -238,7 +235,7 @@ BEZEL_TEST(choice_equality_35_7,
         "choice Ev On(f: () -> int), Off; end Ev; "
         "class C public static method Main(): int "
         "  var a: Ev := Ev.Off; "
-        "  return if a.Equals(a) then 1 else 0; "
+        "  return (if a.Equals(a) then 1 else 0); "
         "end Main; end C;");
     BEZEL_EXPECT_TRUE(hasErrDiagWith(r, "is not available on choice"));
     BEZEL_EXPECT_TRUE(hasErrDiagWith(r, "admissible equality component"));
@@ -271,7 +268,7 @@ BEZEL_TEST(choice_equality_35_7,
         "module M; choice Opt Some(value: int), None; end Opt; "
         "class C public static method Main(): int "
         "  var a: Opt := Opt.None; "
-        "  return if a.Equals(a) then 1 else 0; "
+        "  return (if a.Equals(a) then 1 else 0); "
         "end Main; end C;");
     BEZEL_EXPECT_TRUE(lacksErrDiagWith(r, "is not available on choice"));
 }

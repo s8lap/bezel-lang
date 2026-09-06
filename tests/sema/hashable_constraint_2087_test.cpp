@@ -43,13 +43,10 @@ using bezel::test::SemaResult;
 
 namespace {
 
+// fix #3985: delegates to the shared gated helper (sema_support.hpp)
+// instead of duplicating the parse-error-gate logic locally.
 SemaResult parseSemaAll(std::string_view src) {
-    auto r = bezel::test::parseAndCollect(src);
-    if (r.sourceFile && r.ctx) {
-        bezel::sema::resolveTypes(*r.sourceFile, *r.ctx);
-        bezel::sema::typecheckExpressions(*r.sourceFile, *r.ctx);
-    }
-    return r;
+    return bezel::test::parseAndTypecheckGated(src);
 }
 
 // True iff any `where …: …` constraint-not-satisfied diagnostic was reported.
@@ -136,7 +133,7 @@ BEZEL_TEST(hashable_constraint_2087, method_call_class_accepted_spec_3_6) {
 BEZEL_TEST(hashable_constraint_2087, method_call_interface_accepted_spec_3_6) {
     auto r = parseSemaAll(
         "module M; "
-        "interface IShape public method Area(): int; end IShape; "
+        "interface IShape method Area(): int; end IShape; "
         "static class Box "
         "  public static method Hold<T>(): int where T: hashable => 1; "
         "end Box; "

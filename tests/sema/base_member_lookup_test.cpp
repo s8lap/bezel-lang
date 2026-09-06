@@ -20,13 +20,10 @@ using bezel::sema::TypeSymbol;
 
 namespace {
 
+// fix #3985: delegates to the shared gated helper (sema_support.hpp)
+// instead of duplicating the parse-error-gate logic locally.
 bezel::test::SemaResult parseSemaAll(std::string_view src) {
-    auto r = bezel::test::parseAndCollect(src);
-    if (r.sourceFile && r.ctx) {
-        bezel::sema::resolveTypes(*r.sourceFile, *r.ctx);
-        bezel::sema::typecheckExpressions(*r.sourceFile, *r.ctx);
-    }
-    return r;
+    return bezel::test::parseAndTypecheckGated(src);
 }
 
 const bezel::ast::MemberAccessExpr* findMemberAccess(
@@ -88,6 +85,11 @@ BEZEL_TEST(sema_base, derived_inherits_base_method) {
         "  public method M() _ := this.Helper; end M; "
         "end Derived;");
     auto* ma = findMemberAccess(r, "M");
+    // fix #3985: was `if (ma) { EXPECT... }` (issue #3985's vacuous-
+    // assertion finding, same shape as interface_member_resolves below) —
+    // assert non-null unconditionally so a null lookup fails the test
+    // instead of passing with zero assertions executed.
+    BEZEL_EXPECT_TRUE(ma != nullptr);
     if (ma) {
         auto* sym = r.ctx->exprSymbol(*ma);
         BEZEL_EXPECT_TRUE(dynamic_cast<MethodSymbol*>(sym) != nullptr);
@@ -103,6 +105,8 @@ BEZEL_TEST(sema_base, derived_member_shadows_base) {
         "  public method M() _ := this._x; end M; "
         "end Derived;");
     auto* ma = findMemberAccess(r, "M");
+    // fix #3985: was `if (ma) { EXPECT... }` — see interface_member_resolves.
+    BEZEL_EXPECT_TRUE(ma != nullptr);
     if (ma) {
         auto* sym = r.ctx->exprSymbol(*ma);
         // Derived's own _x wins over Base's.
@@ -125,6 +129,8 @@ BEZEL_TEST(sema_base, transitive_inheritance_through_two_levels) {
         "  public method M() _ := this._y; end M; "
         "end C;");
     auto* ma = findMemberAccess(r, "M");
+    // fix #3985: was `if (ma) { EXPECT... }` — see interface_member_resolves.
+    BEZEL_EXPECT_TRUE(ma != nullptr);
     if (ma) {
         auto* sym = r.ctx->exprSymbol(*ma);
         BEZEL_EXPECT_TRUE(dynamic_cast<FieldSymbol*>(sym) != nullptr);
@@ -134,14 +140,28 @@ BEZEL_TEST(sema_base, transitive_inheritance_through_two_levels) {
 BEZEL_TEST(sema_base, interface_member_resolves) {
     // Implements clause (after the colon) — interface members are
     // looked up via the same base-types path.
+    //
+    // fix #3985: `public method Do(): int;` inside the interface body was a
+    // §11.8 rejection (interface members are implicitly public and admit no
+    // repeated visibility modifier) — the fixture never parsed, so this row
+    // was reaching sema on parseSemaAll's ungated, error-recovery-truncated
+    // AST. VERIFIED against the real `bezelc -c`: with `public` dropped from
+    // the interface member, the source parses with zero diagnostics.
     auto r = parseSemaAll(
         "module M; "
-        "interface IDoer public method Do(): int; end IDoer; "
+        "interface IDoer method Do(): int; end IDoer; "
         "class C : IDoer "
         "  public method Do(): int => 1; "
         "  public method M() _ := this.Do; end M; "
         "end C;");
     auto* ma = findMemberAccess(r, "M");
+    // fix #3985: was `if (ma) { EXPECT... }` — a null findMemberAccess
+    // (e.g. from the grammar-invalid fixture above) made this test assert
+    // NOTHING and still report `[ OK ]`, indistinguishable in gtest output
+    // from a genuine pass (issue #3892's `if (x) { EXPECT }` discriminator
+    // problem). Assert non-null unconditionally, as the file's own
+    // `derived_inherits_base_field` already does.
+    BEZEL_EXPECT_TRUE(ma != nullptr);
     if (ma) {
         auto* sym = r.ctx->exprSymbol(*ma);
         BEZEL_EXPECT_TRUE(dynamic_cast<MethodSymbol*>(sym) != nullptr);

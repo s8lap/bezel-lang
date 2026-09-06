@@ -46,12 +46,12 @@ namespace {
 // Parse + collect + resolve (mirrors choice_sema_classification_35_test.cpp).
 // Resolution is enough: classifyChoiceType reads `ctx.resolvedType(*field.type)`
 // on each case payload, which is what TypeResolution populates.
+//
+// fix #3985: delegates to the shared gated helper (sema_support.hpp) instead
+// of duplicating the parse-error-gate logic locally — the file's own copy
+// used to run resolveTypes even when parsing failed.
 bezel::test::SemaResult resolveAll(std::string_view src) {
-    auto r = parseAndCollect(src);
-    if (r.sourceFile && r.ctx) {
-        bezel::sema::resolveTypes(*r.sourceFile, *r.ctx);
-    }
-    return r;
+    return bezel::test::parseAndResolveGated(src);
 }
 
 const TypeSymbol* findType(const bezel::test::SemaResult& r,
@@ -117,7 +117,7 @@ BEZEL_TEST(choice_classification_35_4,
     // or not)" makes the choice borrow-bearing. Plain payload = borrow (no
     // `owned` marker).
     auto r = resolveAll(
-        "module M; class C; end C; "
+        "module M; class C end C; "
         "choice Box Some(value: C), None; end Box;");
     auto c = classify(r, "Box");
     BEZEL_EXPECT_TRUE(c.has_value());
@@ -129,7 +129,7 @@ BEZEL_TEST(choice_classification_35_4,
     // §35.4.2 "(nullable or not)" — a nullable class payload is still a
     // borrow-carrying field.
     auto r = resolveAll(
-        "module M; class C; end C; "
+        "module M; class C end C; "
         "choice Lookup Found(value: C?), Missing; end Lookup;");
     auto c = classify(r, "Lookup");
     BEZEL_EXPECT_TRUE(c.has_value());
@@ -141,7 +141,7 @@ BEZEL_TEST(choice_classification_35_4,
     // §9.7 transitivity: a payload of a borrow-bearing record makes the
     // choice borrow-bearing.
     auto r = resolveAll(
-        "module M; class C; end C; "
+        "module M; class C end C; "
         "record Ref(obj: C); "
         "choice Hold Some(r: Ref), None; end Hold;");
     auto c = classify(r, "Hold");
@@ -157,7 +157,7 @@ BEZEL_TEST(choice_classification_35_4,
     // `owned` (a class, interface, or … payload)." The spec's `FetchOutcome`
     // headline shape — `Fetched(owned response: Response)`.
     auto r = resolveAll(
-        "module M; class R; end R; "
+        "module M; class R end R; "
         "choice FetchOutcome Fetched(owned response: R), NotModified; "
         "end FetchOutcome;");
     auto c = classify(r, "FetchOutcome");
@@ -172,7 +172,7 @@ BEZEL_TEST(choice_classification_35_4,
     // sibling cases are value-like or borrow-bearing. The decision is
     // MAX over cases, not per-case.
     auto r = resolveAll(
-        "module M; class R; end R; "
+        "module M; class R end R; "
         "choice Mixed "
         "  Ok(status: int), "                       // value-like case
         "  Borrowed(r: R), "                        // borrow-bearing case
@@ -191,7 +191,7 @@ BEZEL_TEST(choice_classification_35_4,
     // the OUTER choice owning too, even though the outer payload slot has no
     // `owned` marker of its own.
     auto r = resolveAll(
-        "module M; class R; end R; "
+        "module M; class R end R; "
         "choice Inner Owned(owned r: R), None; end Inner; "
         "choice Outer Wrap(i: Inner), Skip; end Outer;");
     auto c = classify(r, "Outer");
@@ -208,7 +208,7 @@ BEZEL_TEST(choice_classification_35_4,
     // choices are sealed, methods are statically dispatched, and a method
     // is not payload storage. This choice stays value-like.
     auto r = resolveAll(
-        "module M; class R; end R; "
+        "module M; class R end R; "
         "choice Color Red, Green, Blue; "
         "  public method Make(): R => new R(); "
         "end Color;");
@@ -263,7 +263,7 @@ BEZEL_TEST(choice_classification_35_4,
     // similar shape returns nullopt so callers can branch on kind in one
     // test.
     auto r = resolveAll(
-        "module M; class C; end C; record Rec(x: int); end Rec;");
+        "module M; class C end C; record Rec(x: int);");
     BEZEL_EXPECT_FALSE(classify(r, "C").has_value());
     BEZEL_EXPECT_FALSE(classify(r, "Rec").has_value());
 }

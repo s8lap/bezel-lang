@@ -26,13 +26,10 @@
 
 namespace {
 
+// fix #3985: delegates to the shared gated helper (sema_support.hpp)
+// instead of duplicating the parse-error-gate logic locally.
 bezel::test::SemaResult semaAll(std::string_view src) {
-    auto r = bezel::test::parseAndCollect(src);
-    if (r.sourceFile && r.ctx) {
-        bezel::sema::resolveTypes(*r.sourceFile, *r.ctx);
-        bezel::sema::typecheckExpressions(*r.sourceFile, *r.ctx);
-    }
-    return r;
+    return bezel::test::parseAndTypecheckGated(src);
 }
 
 // §25.2 co-declaration error: "a [record|enum|choice] that overloads `=`
@@ -260,7 +257,7 @@ BEZEL_TEST(auto_hashable_choice_equality_3333,
         "end Opt; "
         "class C public static method Main(): int "
         "  var a: Opt := Opt.None; "
-        "  return if a.Equals(a) then 1 else 0; "
+        "  return (if a.Equals(a) then 1 else 0); "
         "end Main; end C;");
     BEZEL_EXPECT_FALSE(hasNotAvailableMemberError(r));
 }
@@ -347,7 +344,7 @@ BEZEL_TEST(auto_hashable_choice_equality_3333,
 BEZEL_TEST(auto_hashable_choice_equality_3333,
            owning_choice_with_pair_still_not_hashable_spec_3_6_v0_276) {
     auto r = semaAll(
-        "module M; class R; end R; "
+        "module M; class R end R; "
         "choice Fetched Loaded(owned response: R), None; "
         "  public static method operator =(a: Fetched, b: Fetched): bool "
         "    => true; "

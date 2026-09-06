@@ -29,13 +29,10 @@ using bezel::test::parseAndCollect;
 
 namespace {
 
+// fix #3985: delegates to the shared gated helper (sema_support.hpp)
+// instead of duplicating the parse-error-gate logic locally.
 bezel::test::SemaResult semaAll(std::string_view src) {
-    auto r = parseAndCollect(src);
-    if (r.sourceFile && r.ctx) {
-        bezel::sema::resolveTypes(*r.sourceFile, *r.ctx);
-        bezel::sema::typecheckExpressions(*r.sourceFile, *r.ctx);
-    }
-    return r;
+    return bezel::test::parseAndTypecheckGated(src);
 }
 
 bool hasErrDiagWith(const bezel::test::SemaResult& r, std::string_view needle) {
@@ -156,7 +153,7 @@ BEZEL_TEST(choice_component_record_equality_v210_2083,
            spec_9_2_v210_body_record_borrow_bearing_choice_component_rejects_eq) {
     auto r = semaAll(
         "module M; "
-        "class C; end C; "
+        "class C end C; "
         "choice Box Some(value: C), None; end Box; "
         "record Wrap "
         "  public property B: Box; "
@@ -177,7 +174,7 @@ BEZEL_TEST(choice_component_record_equality_v210_2083,
            spec_9_2_v210_body_record_owning_choice_component_rejects_eq) {
     auto r = semaAll(
         "module M; "
-        "class R; end R; "
+        "class R end R; "
         "choice Fetched Fetched(owned r: R), NotFetched; end Fetched; "
         "record Wrap "
         "  public property O: Fetched; "

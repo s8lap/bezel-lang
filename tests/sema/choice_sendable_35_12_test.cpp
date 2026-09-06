@@ -32,13 +32,10 @@ using bezel::test::parseAndCollect;
 
 namespace {
 
+// fix #3985: delegates to the shared gated helper (sema_support.hpp)
+// instead of duplicating the parse-error-gate logic locally.
 bezel::test::SemaResult semaAll(std::string_view src) {
-    auto r = parseAndCollect(src);
-    if (r.sourceFile && r.ctx) {
-        bezel::sema::resolveTypes(*r.sourceFile, *r.ctx);
-        bezel::sema::typecheckExpressions(*r.sourceFile, *r.ctx);
-    }
-    return r;
+    return bezel::test::parseAndTypecheckGated(src);
 }
 
 bool hasSendableConstraintError(const bezel::test::SemaResult& r) {
@@ -128,7 +125,7 @@ BEZEL_TEST(choice_sendable_35_12,
     // choice borrow-bearing per §35.4.2.
     auto r = semaAll(
         "module M; "
-        "class C; end C; "
+        "class C end C; "
         "choice Box Some(value: C), None; end Box; "
         "static class Utils public static method Send<T>(): int "
         "  where T: sendable "
@@ -149,7 +146,7 @@ BEZEL_TEST(choice_sendable_35_12,
     // payload makes the choice owning per §35.4.1.
     auto r = semaAll(
         "module M; "
-        "class R; end R; "
+        "class R end R; "
         "choice FetchOutcome Fetched(owned response: R), NotModified; "
         "end FetchOutcome; "
         "static class Utils public static method Send<T>(): int "
