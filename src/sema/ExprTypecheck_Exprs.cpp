@@ -5387,6 +5387,25 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
     // and codegen emitted a struct-level `icmp` on the aggregate (malformed IR).
     // Reject the undefined use cleanly. (Primitive operands have no
     // memberTargetType and keep the built-in relational.)
+    //
+    // fix #3929 (§25/§25.2/§11.8, v0.294): widened to also cover Choice, and
+    // — as its OWN diagnostic, not this one — Interface (see the dedicated
+    // block immediately below). A choice CAN overload comparison operators
+    // (§25, §35.2), but `findBinaryOperator` (via `collectInheritedOperators`,
+    // which is kind-blind) already tried that above and returns before
+    // reaching here when a match exists — so arriving here with a choice
+    // operand means no matching overload was declared, the same "no
+    // applicable overload" verdict a record/class operand gets. Before this
+    // fix a choice operand fell through this record/class-only filter and
+    // reached codegen typed `bool` by the generic relational fallback far
+    // below (no backstop there checks for a Named type at all, unlike the
+    // arithmetic path a few lines below, which at least catches a Named LEFT
+    // operand) — measured on HEAD before this fix: `Shape < int` died in
+    // LLVM's IR verifier ("Both operands to ICmp instruction are not of the
+    // same type!", an `icmp` between a `%choice.Shape` aggregate and `i32`),
+    // in EITHER operand order (this loop already walks both operands, so
+    // widening the kind filter fixes both orders in one place rather than
+    // adding a second, order-specific check).
     if (op == "<" || op == ">" || op == "<=" || op == ">=") {
         for (const ast::Expr* operand : {be.left.get(), be.right.get()}) {
             TypeSymbol* ts = memberTargetType(operand);
@@ -5395,13 +5414,72 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
             // with no user overload (§2.5).
             if (ts && !ts->isValueBuiltin &&
                 (ts->kind == ast::TypeDeclKind::Record ||
-                 ts->kind == ast::TypeDeclKind::Class)) {
+                 ts->kind == ast::TypeDeclKind::Class ||
+                 ts->kind == ast::TypeDeclKind::Choice)) {
                 ctx_.diagnostics().report(
                     Severity::Error, be.span.begin,
                     "operator `" + std::string(op) +
                     "` is not defined for type `" + std::string(ts->name) +
                     "` — comparison operators must be explicitly overloaded "
                     "(§25.2)");
+                ctx_.setExprType(&be, ctx_.primitiveTypeRef(PrimitiveType::Bool));
+                return;
+            }
+        }
+    }
+    // fix #3929 (§25/§11.8, v0.294): an Interface operand gets a DEDICATED
+    // diagnostic rather than reusing the record/class/choice "declare a
+    // matching operator" wording above (issue #3952, caught in review): that
+    // wording is actionable for a choice (it CAN declare an operator; see the
+    // block above) but is actively wrong for an interface. §25's opening
+    // sentence lists exactly who "may overload operators" — "Records, enums,
+    // choices ... and classes" — interfaces are not on that list, and §11.8
+    // states plainly that "through an interface-typed value only instance
+    // members are reachable" and that "`T.Member(...)` dispatch requires a
+    // generic type parameter constrained by the interface: a value's static
+    // type names no single conforming type." So even where the interface (or
+    // a conforming type) DOES declare a matching static operator, it can
+    // never be reached through a plain interface-typed operand — reviewer-
+    // verified: giving `IFoo` a matching `static operator +` and a
+    // conforming `Box` still leaves `b + 1` (`b: IFoo`) rejected. Telling the
+    // user to "declare a matching operator" would send them down a path that
+    // cannot fix their code; this diagnostic instead names the real
+    // remedies — narrow to the concrete conforming type (whose OWN operator,
+    // if it declares one, IS then reachable — this is a record/class-typed
+    // operand at that point, handled by the block above), or constrain a
+    // generic type parameter by the interface (§11.8's `Sum<T>` pattern).
+    //
+    // This is deliberately a THIRD spelling, not a merge into the record/
+    // class/choice block above: `Object` (block earlier in this function, can
+    // never declare an operator at all), record/class/choice (can declare,
+    // just didn't here), and interface (can be declared on, but never
+    // reachable through a value) are three different reasons a "no applicable
+    // overload" verdict applies, and collapsing interface into the
+    // record/class wording would be a drifting predicate in the
+    // UNDER-differentiation direction — the same defect class this project's
+    // classification-predicate discipline warns against, just inverted.
+    if (op == "<" || op == ">" || op == "<=" || op == ">=") {
+        for (const ast::Expr* operand : {be.left.get(), be.right.get()}) {
+            TypeSymbol* ts = memberTargetType(operand);
+            if (ts && ts->kind == ast::TypeDeclKind::Interface) {
+                ctx_.diagnostics().report(
+                    Severity::Error, be.span.begin,
+                    "operator `" + std::string(op) +
+                    "` is not defined for type `" + std::string(ts->name) +
+                    "` (\xC2\xA7""25) \xE2\x80\x94 even where `" +
+                    std::string(ts->name) +
+                    "` or a conforming type declares a matching static "
+                    "operator, it is reachable only through a generic type "
+                    "parameter constrained by `" + std::string(ts->name) +
+                    "`, never through a plain interface-typed value "
+                    "(\xC2\xA7""11.8: \xE2\x80\x9Cthrough an interface-typed "
+                    "value only instance members are reachable\xE2\x80\x9D; "
+                    "\xE2\x80\x9CT.Member(...) dispatch requires a generic "
+                    "type parameter constrained by the "
+                    "interface\xE2\x80\x9D). Narrow to the concrete "
+                    "conforming type first (`is`/`as`, \xC2\xA7""17.4), or "
+                    "constrain a generic parameter by `" +
+                    std::string(ts->name) + "` instead.");
                 ctx_.setExprType(&be, ctx_.primitiveTypeRef(PrimitiveType::Bool));
                 return;
             }
@@ -5478,13 +5556,38 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
     // an IR-verification crash. Reject cleanly. (Primitive and value-builtin
     // operands — e.g. string `+`, decimal arithmetic, DateTime — keep their
     // built-in operators: they have no record/class memberTargetType here.)
+    //
+    // fix #3929 (§25/§25.2/§11.8, v0.294): widened to also cover Choice, and
+    // — as its OWN diagnostic just below, not this one (issue #3952) — cover
+    // Interface too. See the relational (§25.2) sibling above for the full
+    // rationale on why Interface needs a different message than Choice (a
+    // choice CAN declare an operator; an interface's operator, even where
+    // one is declared, is never reachable through a plain interface-typed
+    // value, §11.8) — a choice reaching here already failed
+    // `findBinaryOperator`'s search of its own declarations. This loop
+    // already walks BOTH operands, so widening the filter (rather than
+    // patching the order-asymmetric backstops below, which only ever inspect
+    // the LEFT operand's type) closes the gap in both operand orders at
+    // once: measured on HEAD before this fix, `s + 1` (`s: Shape`, choice)
+    // was already rejected by the generic Named-type backstop a few lines
+    // down (which only checks `lt`), but the swapped `1 + s` fell through it
+    // (backstop checks only the left operand) and died in the IR verifier;
+    // `1 << s`/`1 & s` swapped the same way but didn't even crash — the
+    // isBitwise backstop below also only checks `lt`, so they hit the
+    // unrelated #2434 lower-to-zero path and silently degraded to a
+    // zero-initialized value (exit 0, no diagnostic). This gate now catches
+    // every one of those rows on either operand, with the same wording the
+    // record/class case already gets. (Interface exhibits the identical
+    // order-asymmetric leak — `b: IFoo`, `1 + b`/`1 << b` swapped the same
+    // way — closed by the dedicated Interface check below instead.)
     if (op == "+" || op == "-" || op == "*" || op == "/" || op == "mod" ||
         op == "&" || op == "|" || op == "^" || op == "<<" || op == ">>") {
         for (const ast::Expr* operand : {be.left.get(), be.right.get()}) {
             TypeSymbol* ts = memberTargetType(operand);
             if (ts && !ts->isValueBuiltin &&
                 (ts->kind == ast::TypeDeclKind::Record ||
-                 ts->kind == ast::TypeDeclKind::Class)) {
+                 ts->kind == ast::TypeDeclKind::Class ||
+                 ts->kind == ast::TypeDeclKind::Choice)) {
                 ctx_.diagnostics().report(
                     Severity::Error, be.span.begin,
                     "operator `" + std::string(op) +
@@ -5493,6 +5596,44 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
                     std::string(op) +
                     "` whose parameters match the operand order (Bezel does not "
                     "auto-commute operator overloads) (§25)");
+                if (auto* opTy = ctx_.exprType(*operand))
+                    ctx_.setExprType(&be, opTy);
+                return;
+            }
+        }
+    }
+    // fix #3929 (§25/§11.8, v0.294): an Interface operand on an
+    // arithmetic/bitwise/shift operator gets the SAME dedicated diagnostic
+    // as the relational case above (issue #3952) — see that block's comment
+    // for the full rationale (three genuinely different "no applicable
+    // overload" reasons — Object/record-class-choice/interface — get three
+    // messages, not a merge). This loop walks both operands, closing the
+    // order-asymmetric gap the arithmetic/bitwise backstops below have (they
+    // only ever inspect the LEFT operand) for interface operands specifically
+    // (the Choice case above already has the same both-operand coverage).
+    if (op == "+" || op == "-" || op == "*" || op == "/" || op == "mod" ||
+        op == "&" || op == "|" || op == "^" || op == "<<" || op == ">>") {
+        for (const ast::Expr* operand : {be.left.get(), be.right.get()}) {
+            TypeSymbol* ts = memberTargetType(operand);
+            if (ts && ts->kind == ast::TypeDeclKind::Interface) {
+                ctx_.diagnostics().report(
+                    Severity::Error, be.span.begin,
+                    "operator `" + std::string(op) +
+                    "` is not defined for type `" + std::string(ts->name) +
+                    "` (\xC2\xA7""25) \xE2\x80\x94 even where `" +
+                    std::string(ts->name) +
+                    "` or a conforming type declares a matching static "
+                    "operator, it is reachable only through a generic type "
+                    "parameter constrained by `" + std::string(ts->name) +
+                    "`, never through a plain interface-typed value "
+                    "(\xC2\xA7""11.8: \xE2\x80\x9Cthrough an interface-typed "
+                    "value only instance members are reachable\xE2\x80\x9D; "
+                    "\xE2\x80\x9CT.Member(...) dispatch requires a generic "
+                    "type parameter constrained by the "
+                    "interface\xE2\x80\x9D). Narrow to the concrete "
+                    "conforming type first (`is`/`as`, \xC2\xA7""17.4), or "
+                    "constrain a generic parameter by `" +
+                    std::string(ts->name) + "` instead.");
                 if (auto* opTy = ctx_.exprType(*operand))
                     ctx_.setExprType(&be, opTy);
                 return;
