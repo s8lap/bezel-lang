@@ -13264,6 +13264,25 @@ private:
     // (isIterFormatEnumeratorHead && isOwningIterableInterfaceHead). Non-
     // const: calls genericBackingType.
     bool isFreshTakeCurrentDictBackedLocal(const LocalDeclInitView& view);
+    // fix #3894 / §29.1 / §28.9 / §28.11 (v0.294): the ARRAY-BACKED-`Set<T>`
+    // sibling of the two recognizers immediately above — true if `view` is a
+    // plain `const`/`var` bound directly to an explicit `<expr>.TakeCurrent()`
+    // call on a builtin (declaration-less) `IOwningEnumerator<T>`/
+    // `IOwningAsyncEnumerator<T>`, at a builtin `Set<T>` result type
+    // (name-head exactly "Set", not "OwningSet"/"SortedSet" — same scope as
+    // isFreshTakeCurrentDictBackedLocal's Set arm) whose element is NOT
+    // generic-dict-eligible (genericBackingType(rt, 0, isSet=true, …) is
+    // null) — the class/interface/nullable-element Set that arm deliberately
+    // declines (its own comment named this exact gap and #3894 was filed for
+    // it). This shape frees via `bz_array_free`, the SAME runtime call as
+    // isFreshTakeCurrentBuiltinArrayLocal's `Array<T>`, so it feeds the SAME
+    // `candidates`/`borrowingArrayFreeEligible_` set that recognizer does
+    // (see the .cpp) rather than a third eligibility set — no new save/
+    // restore mirroring is needed because none of the existing sites gate on
+    // WHICH recognizer populated that set, only on membership. Same
+    // receiver-type gate as both siblings (isIterFormatEnumeratorHead &&
+    // isOwningIterableInterfaceHead). Non-const: calls genericBackingType.
+    bool isFreshTakeCurrentArrayBackedSetLocal(const LocalDeclInitView& view);
     // #1871 / §28.9 / §28.11: true if the local described by `view` is a plain
     // `var xs: Array<T> := [ ... ]` (a borrowing `Array<T>` local initialised by
     // a collection literal) whose element policy is backing-only (null per-

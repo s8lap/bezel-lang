@@ -27316,6 +27316,56 @@ bool Emitter::isFreshTakeCurrentDictBackedLocal(
 }
 
 
+// fix #3894 / §29.1 / §28.9 / §28.11 (v0.294): see the declaration comment in
+// LlvmBackend_impl.hpp. Third sibling of isFreshTakeCurrentBuiltinArrayLocal /
+// isFreshTakeCurrentDictBackedLocal above, for the TakeCurrent() result shape
+// neither of those claims: an ARRAY-BACKED `Set<T>` (name-head exactly "Set",
+// element NOT generic-dict-eligible — a class/interface or nullable element,
+// per genericBackingType's own exclusion; buildCollectionTempDisposal's
+// unconditional fallback documents this identical shape as "array-backed:
+// ... falls through to bz_array_free below"). Reclaims via `bz_array_free`,
+// the SAME runtime call isFreshTakeCurrentBuiltinArrayLocal's `Array<T>` uses,
+// so this feeds the SAME `candidates` vector / `borrowingArrayFreeEligible_`
+// set that arm does (see the `scan` lambda below) rather than a new
+// eligibility set — no new save/restore mirroring is required, and the
+// identical (already-generic) lowerLocalDecl consumer already derives the
+// per-element disposer from the local's own resolved element type via
+// elementPolicyFor(el, /*owningFamily=*/false), which is null for a
+// borrowing class/interface element (only the backing is reclaimed, §28.11)
+// — exactly the Array<T>-with-class-element case that consumer already
+// handles, and byte-identical to what buildCollectionTempDisposal's
+// array-backed fallback branch would derive for this same TypeRef.
+bool Emitter::isFreshTakeCurrentArrayBackedSetLocal(
+        const LocalDeclInitView& view) {
+    if (view.isUsing || !view.init) return false;
+    const sema::TypeRef* rt = nullptr;
+    if (view.type) rt = ctx_.resolvedType(*view.type);
+    if (!rt) rt = ctx_.exprType(*view.init);
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
+        return false;
+    // Set<T> (name-head exactly "Set", not "OwningSet"/"SortedSet" — mirrors
+    // isFreshTakeCurrentDictBackedLocal's own scope) that is NOT
+    // generic-dict-eligible: the exact complement of that sibling's Set arm.
+    if (builtinTypeName(rt) != "Set") return false;
+    if (genericBackingType(rt, 0, /*isSet=*/true, nullptr) != nullptr)
+        return false;
+    // The initializer must be an explicit, no-argument `<expr>.TakeCurrent()`
+    // call whose RECEIVER is a builtin (declaration-less)
+    // IOwningEnumerator<T>/IOwningAsyncEnumerator<T> — identical receiver
+    // gate to both siblings above.
+    auto* call = dynamic_cast<const ast::CallExpr*>(view.init);
+    if (!call || !call->callee || !call->args.empty()) return false;
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call->callee.get());
+    if (!ma || !ma->target || ma->member != "TakeCurrent") return false;
+    const sema::TypeRef* recvTy = ctx_.exprType(*ma->target);
+    return recvTy && recvTy->kind == sema::TypeRef::Kind::Named &&
+           !recvTy->declaration && recvTy->astNode && recvTy->astNode->name &&
+           !recvTy->astNode->name->parts.empty() &&
+           common::isIterFormatEnumeratorHead(recvTy->headName()) &&
+           common::isOwningIterableInterfaceHead(recvTy->headName());
+}
+
+
 // #1004 / stdlib §5 / §3 / §28: is `e` an EXPRESSION codegen lowers to a FRESH,
 // OWNERLESS `Array<T>` temporary — i.e. a fresh-array materializer call
 // (`recv.ToArray()`, `recv.Sorted(...)`, or `recv.Reversed()`) whose result is
@@ -27703,6 +27753,24 @@ void Emitter::collectBorrowingArrayFreeEligible(
             // would run the wrong runtime free over a `bz_dict_t*`.
             else if (isFreshTakeCurrentDictBackedLocal(v))
                 takeCurrentDictCandidates.push_back(node);
+            // fix #3894 / §29.1 / §28.9 / §28.11: the ARRAY-BACKED-`Set<T>`
+            // sibling of the two branches just above — a plain `const`/`var`
+            // bound to `<expr>.TakeCurrent()` on a builtin owning enumerator,
+            // at a `Set<T>` result type whose element is NOT generic-dict-
+            // eligible (a class/interface/nullable element) — the shape
+            // #3880's Set arm deliberately declined. Mutually exclusive with
+            // every other arm in this chain (result-type name-head "Set" AND
+            // genericBackingType-null, the exact complement of the branch
+            // just above), so ordering is immaterial. Feeds the SAME
+            // `candidates` vector as isFreshTakeCurrentBuiltinArrayLocal
+            // (NOT takeCurrentDictCandidates) because this shape frees via
+            // bz_array_free, not bz_dict_free — sharing takeCurrentDict
+            // Candidates would run the DICT reclaim over a `bz_array_t*` (a
+            // type-confused free). No new consumption code needed: the
+            // existing candidates/borrowingArrayFreeEligible_ consumer
+            // already derives the per-element disposer generically.
+            else if (isFreshTakeCurrentArrayBackedSetLocal(v))
+                candidates.push_back(node);
             // #1871 / §28.9 / §28.11: a plain `var xs: Array<T> := [ ... ]` — a
             // collection literal whose backing the local solely owns. `Array<T>`
             // is trivial-dispose (its Dispose is a no-op) but its backing storage
