@@ -10551,28 +10551,63 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
             return builder_.getInt1(true);
         }
 
-        // ⚠ SLOT-PATH ONLY (v0.286, #3298). §19.3 makes a relational or range
-        // pattern over a NULLABLE scrutinee a compile error, and sema now
-        // rejects it at both `case` sites (ExprTC::
-        // checkOrderingPatternsOverNullableScrutinee) — so neither handler
-        // below is reachable from an ARM pattern any more. They are kept for
-        // the ONE caller sema's arm-level walk does not reach: a range or
-        // relational SUB-pattern in a DESTRUCTURING SLOT whose field type is
-        // nullable (`case r of R(1..5, 1) => …` where `R.X: int?`), lowered
-        // at the two slot call sites below (~line 10680 and ~10790).
+        // ⚠ SLOT-PATH ONLY (v0.286, #3298; narrowed further v0.294, #3692).
+        // §19.3 makes a relational or range pattern over a NULLABLE scrutinee
+        // a compile error, and sema now rejects it at both `case` sites
+        // (ExprTC::checkOrderingPatternsOverNullableScrutinee) AND, since
+        // #3692, at a DESTRUCTURING SLOT whose declared type sema can resolve
+        // directly — a non-generic record field, or a choice payload field of
+        // any instantiation (ExprTC::checkOrderingPatternOverNullableType,
+        // fed from all six slot-type-resolution call sites in
+        // ExprTypecheck.cpp / ExprTypecheck_Exprs.cpp: CaseExpr x CaseStmt,
+        // record x choice, top-level x nested).
         //
-        // Deleting them without a slot-level sema gate is NOT a net deletion,
-        // it is a silent miscompile: both slot call sites do
-        // `if (subMatch) matched = AND(matched, subMatch);`, so a nullptr
-        // return SKIPS the slot's test and the arm matches unconditionally.
-        // MEASURED on the draft that deleted them: `R(1..5, 1)` against
-        // `R(99, 1)` returned the arm's value instead of falling through —
-        // exactly the "→ AND skipped → always matched" defect the slot code's
-        // own comment records. §19.3's slot-level rule needs the sema gate to
-        // resolve each slot's declared type, which the arm-level walk does not
-        // do; that gap is filed as its own issue and these handlers hold the
-        // pre-#3298 behaviour until it is closed. Do not delete them without
-        // landing that gate first.
+        // #3692 does NOT close the gap for a GENERIC RECORD field typed at a
+        // bare type parameter (`record Box<T>(X: T, Y: int)` instantiated as
+        // `Box<int?>`) — there is no record analogue of the choice path's
+        // generic-payload substitution (issue 3898). MEASURED (issue 3899):
+        // that shape does NOT reach the nullable-value branch below at all —
+        // the DestructuringPattern slot loop further down computes each
+        // slot's fieldTy via `recordMemberType` (the immediate, unsubstituted
+        // declared type) rather than `recordMemberTypeResolved`, and the
+        // `RecordSubstGuard` that would make the latter resolve correctly is
+        // installed only around the arm BODY (fix #1254), after this whole
+        // match has already run — so the `isNullableVal` test just above
+        // this comment sees the bare, non-nullable type parameter and takes
+        // the PLAIN (non-nullable) dispatch instead, which then compares the
+        // raw nullable-boxed struct against a bare literal and LLVM's IR
+        // verifier catches the shape mismatch (`icmp { i8, i32 }, i32`) with
+        // a clean, non-crashing compile error — never reaching nv.range.match
+        // / nv.relop.match below.
+        //
+        // ⚠ CONFIRMED UNGUARDED (measured while reviewing #3692): with both
+        // handlers below stubbed to unconditional `return nullptr;`, the
+        // ENTIRE existing test suite — every #3298/#3692 row, five adjacent
+        // reachable-code-path sweeps, and the whole lit corpus — stays green.
+        // No currently-admitted program reaches either handler: #3692 rejects
+        // every case sema can resolve, the generic-record residual above
+        // does not reach them either, and the CHOICE side is closed at SEMA by
+        // #3692's own fix — a nullable choice payload with an ordering
+        // pattern rejects, non-generic and generic alike (verified on this
+        // build), so no choice program routes here even in principle. A
+        // search for such a path did surface a further, unrelated bug
+        // (issue 3902 — choice payload slots are never checked for any
+        // refutable pattern), but that bug is NOT what closes this route and
+        // fixing it would NOT open one; only #3899's fix does, via records.
+        //
+        // Deleting these two handlers regardless is NOT a net deletion, it is
+        // a silent miscompile FOR THE CASES #3692 DOES NOT REACH: both slot
+        // call sites do `if (subMatch) matched = AND(matched, subMatch);`, so
+        // a nullptr return SKIPS the slot's test and the arm matches
+        // unconditionally. MEASURED on the draft that deleted them (pre-
+        // #3298): `R(1..5, 1)` against a NON-generic `R(99, 1)` returned the
+        // arm's value instead of falling through — exactly the "→ AND
+        // skipped → always matched" defect the slot code's own comment
+        // records; that specific program is a sema rejection today, but the
+        // GENERIC-record shape reaching this function is the live instance
+        // of the same hazard, and issue 3899 carries the acceptance
+        // criterion that closing it must ship a test proving these handlers
+        // are reached and fail if stubbed. Do not delete them.
         // §19.3 (#738): a RangePattern on a nullable value — hasValue AND the
         // unwrapped value is in range. Mirrors the non-nullable range logic
         // below, applied to innerVal. (Open-ended forms: an absent bound is

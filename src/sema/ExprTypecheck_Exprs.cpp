@@ -9606,6 +9606,11 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                                         fieldTy, scrutTy);
                                 }
                             }
+                            // §19.3 (v0.294, #3692): the slot's own declared
+                            // type, not the arm scrutinee's, governs whether
+                            // an ordering sub-pattern is admitted here.
+                            checkOrderingPatternOverNullableType(
+                                fieldTy, sp.pattern.get());
                             if (!sp.nakedBinding.empty()) {
                                 auto* lsym = ctx_.makeSymbol<LocalSymbol>();
                                 lsym->name = sp.nakedBinding;
@@ -9774,6 +9779,10 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                         fields[i]->posParam->type) {
                         fieldTy = ctx_.resolvedType(*fields[i]->posParam->type);
                     }
+                    // §19.3 (v0.294, #3692): slot-declared-type gate — see
+                    // the choice-case call site above for the rationale.
+                    checkOrderingPatternOverNullableType(fieldTy,
+                                                         sp.pattern.get());
                     if (!sp.nakedBinding.empty()) {
                         // Bare `Pt(x, y)` — nakedBinding carries the name.
                         auto* lsym = ctx_.makeSymbol<LocalSymbol>();
@@ -9879,6 +9888,10 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                                 ndFields[i]->posParam->type)
                                 fieldTy = ctx_.resolvedType(
                                     *ndFields[i]->posParam->type);
+                            // §19.3 (v0.294, #3692): same slot-declared-type
+                            // gate, one level down (`Outer(Inner(1..5))`).
+                            checkOrderingPatternOverNullableType(
+                                fieldTy, s.pattern.get());
                             if (!s.nakedBinding.empty()) {
                                 auto* lsym = ctx_.makeSymbol<LocalSymbol>();
                                 lsym->name = s.nakedBinding;

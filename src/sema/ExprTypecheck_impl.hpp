@@ -1927,6 +1927,19 @@ private:
     void checkOrderingPatternsOverNullableScrutinee(
         const TypeRef* scrutTy, const std::vector<ast::CaseArm>& arms);
 
+    // §19.3 (v0.294, #3692): the single-pattern walk `
+    // checkOrderingPatternsOverNullableScrutinee` runs per arm — factored out
+    // so a destructuring SLOT's sub-pattern can be checked against ITS OWN
+    // declared type (which need not be the arm scrutinee's type) at all four
+    // slot-resolution sites (CaseExpr x CaseStmt, record x choice payload)
+    // without a fifth copy of the walk. §19.3: "Each slot's right-hand side is
+    // a full pattern … a binding, `_`, a constant, `null`, a range, a
+    // relational, …" — the relational/range rejection is the same rule the
+    // arm form already has, keyed on the SLOT's declared type, not the
+    // scrutinee's.
+    void checkOrderingPatternOverNullableType(const TypeRef* ty,
+                                              const ast::Pattern* pat);
+
     // §7.4 (issue #418): update `nullNarrowed_` for an assignment of a value of
     // `valueType` to the simple variable `sym` — a non-null value makes it
     // known-non-null; a (possibly-)null value clears that knowledge. `value`

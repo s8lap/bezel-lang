@@ -9881,55 +9881,78 @@ TypeRef* ExprTC::operandStaticTypeAt(const ast::Expr* e, TypeRef* declared) {
     return nonnull;
 }
 
-// §19.3 / §16.6 / §7.11 (v0.286, #3298): a relational (`> x`) or range
-// (`lo..hi`, `..<hi`, `lo..`, bare `..`) pattern over a NULLABLE scrutinee is a
-// compile error — "A nullable scrutinee — value or reference — is a compile
-// error at a relational pattern, and at a range pattern (§16.6) alike:
-// ordering admits no absent participant (§7.11), and pattern position performs
-// no narrowing" (§19.3, v0.286). The rejection is keyed on the pattern's KIND,
-// not on which bounds are written, so it reaches the open-ended forms and the
-// fully open `..` with the closed ones.
+// §19.3 / §16.6 / §7.11 (v0.286, #3298; slot reach v0.294, #3692): a
+// relational (`> x`) or range (`lo..hi`, `..<hi`, `lo..`, bare `..`) pattern
+// over a NULLABLE type — the arm scrutinee's, OR a destructuring slot's own
+// declared type, §19.3's "full pattern" sentence: "Each slot's right-hand
+// side is a full pattern … a binding, `_`, a constant, `null`, a range, a
+// relational, …" reads the relational paragraph against whatever the
+// pattern's scrutinee is, which for a slot is the slot value — is a compile
+// error: "A nullable scrutinee — value or reference — is a compile error at a
+// relational pattern, and at a range pattern (§16.6) alike: ordering admits no
+// absent participant (§7.11), and pattern position performs no narrowing"
+// (§19.3, v0.286). The rejection is keyed on the pattern's KIND, not on which
+// bounds are written, so it reaches the open-ended forms and the fully open
+// `..` with the closed ones.
 //
-// Before this gate these patterns lowered through the backend's nullable
-// relational/range match paths, which ANDed the comparison with the hasValue
-// tag and so silently never matched a `null` — the reading proposal 0114's D5
-// proposed and v0.267 deliberately overrode. Deleting that lowering without
-// this gate turns the silent mismatch into a malformed-IR ICE, which is why
-// the two ship together and why the gate is keyed on nullability rather than
-// on the primitive family the deleted lowering happened to cover.
+// Before the arm-level half of this gate (#3298) these patterns lowered
+// through the backend's nullable relational/range match paths, which ANDed
+// the comparison with the hasValue tag and so silently never matched a `null`
+// — the reading proposal 0114's D5 proposed and v0.267 deliberately
+// overrode. Deleting that lowering without a gate turns the silent mismatch
+// into a malformed-IR ICE (arm level) or a silent WRONG ANSWER (slot level,
+// #3692 — the arm still selects on the AND'd result, so a nullptr return from
+// a deleted slot handler skips the slot's test entirely rather than crashing).
+// That is why the codegen handlers stay and why this gate exists instead:
+// `LlvmBackend_Exprs2.cpp`'s slot-path nullable range/relational handlers are
+// SLOT-PATH ONLY and must not be deleted as "dead code after this gate" — see
+// their own comment.
+//
+// One pattern, one (possibly slot-local) type: this is the walk shared by the
+// arm-level and slot-level call sites so the family has one spelling instead
+// of a sixth copy (§6 dedup, #3692).
+void ExprTC::checkOrderingPatternOverNullableType(const TypeRef* ty,
+                                                  const ast::Pattern* pat) {
+    if (!ty || !ty->nullable || !pat) return;
+    // Iterative walk: the only nesting an ordering pattern can sit inside at
+    // this level is an alternative list's member set (§19.3 admits ranges and
+    // relationals as binding-free alternative members).
+    std::vector<const ast::Pattern*> queue{pat};
+    while (!queue.empty()) {
+        const ast::Pattern* q = queue.back();
+        queue.pop_back();
+        if (!q) continue;
+        const bool isRel =
+            dynamic_cast<const ast::RelOpPattern*>(q) != nullptr;
+        if (isRel || dynamic_cast<const ast::RangePattern*>(q)) {
+            ctx_.diagnostics().report(
+                Severity::Error, q->span.begin,
+                std::string("a ") + (isRel ? "relational" : "range") +
+                " pattern requires a non-nullable scrutinee \xE2\x80\x94 "
+                "ordering admits no absent participant and pattern "
+                "position performs no narrowing (\xC2\xA7""19.3, "
+                "\xC2\xA7""16.6, \xC2\xA7""7.11); separate the absent "
+                "case first (`case x of null => \xE2\x80\xA6, "
+                "var v: T when v > 70 => \xE2\x80\xA6, _ => "
+                "\xE2\x80\xA6 end`), or narrow the scrutinee with `??` "
+                "(\xC2\xA7""7.7) or `!` (\xC2\xA7""7.8) before the "
+                "`case`");
+            continue;
+        }
+        if (auto* ap = dynamic_cast<const ast::AltPattern*>(q))
+            for (const auto& m : ap->members) queue.push_back(m.get());
+    }
+}
+
+// §19.3 / §16.6 / §7.11 (v0.286, #3298): reject a relational or range pattern
+// in `arms` when the ARM SCRUTINEE's static type is nullable. Shared by the
+// CaseExpr and CaseStmt sites via checkOrderingPatternOverNullableType, which
+// also serves the destructuring-slot call sites (#3692).
 void ExprTC::checkOrderingPatternsOverNullableScrutinee(
         const TypeRef* scrutTy, const std::vector<ast::CaseArm>& arms) {
     if (!scrutTy || !scrutTy->nullable) return;
-    for (const ast::CaseArm& arm : arms) {
-        // Iterative walk: the only nesting an ordering pattern can sit inside
-        // at this level is an alternative list's member set (§19.3 admits
-        // ranges and relationals as binding-free alternative members).
-        std::vector<const ast::Pattern*> queue{arm.pattern.get()};
-        while (!queue.empty()) {
-            const ast::Pattern* q = queue.back();
-            queue.pop_back();
-            if (!q) continue;
-            const bool isRel =
-                dynamic_cast<const ast::RelOpPattern*>(q) != nullptr;
-            if (isRel || dynamic_cast<const ast::RangePattern*>(q)) {
-                ctx_.diagnostics().report(
-                    Severity::Error, q->span.begin,
-                    std::string("a ") + (isRel ? "relational" : "range") +
-                    " pattern requires a non-nullable scrutinee \xE2\x80\x94 "
-                    "ordering admits no absent participant and pattern "
-                    "position performs no narrowing (\xC2\xA7""19.3, "
-                    "\xC2\xA7""16.6, \xC2\xA7""7.11); separate the absent "
-                    "case first (`case x of null => \xE2\x80\xA6, "
-                    "var v: T when v > 70 => \xE2\x80\xA6, _ => "
-                    "\xE2\x80\xA6 end`), or narrow the scrutinee with `??` "
-                    "(\xC2\xA7""7.7) or `!` (\xC2\xA7""7.8) before the "
-                    "`case`");
-                continue;
-            }
-            if (auto* ap = dynamic_cast<const ast::AltPattern*>(q))
-                for (const auto& m : ap->members) queue.push_back(m.get());
-        }
-    }
+    for (const ast::CaseArm& arm : arms)
+        checkOrderingPatternOverNullableType(scrutTy, arm.pattern.get());
 }
 
 // §7.4 (issue #418): refresh `nullNarrowed_` for `sym := value`. A non-null
@@ -16708,6 +16731,11 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                                         fieldTy, scrutTy);
                                 }
                             }
+                            // §19.3 (v0.294, #3692): the slot's own declared
+                            // type, not the arm scrutinee's, governs whether
+                            // an ordering sub-pattern is admitted here.
+                            checkOrderingPatternOverNullableType(
+                                fieldTy, sp.pattern.get());
                             if (!sp.nakedBinding.empty()) {
                                 auto* lsym = ctx_.makeSymbol<LocalSymbol>();
                                 lsym->name = sp.nakedBinding;
@@ -16862,6 +16890,10 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                         fields[i]->posParam->type) {
                         fieldTy = ctx_.resolvedType(*fields[i]->posParam->type);
                     }
+                    // §19.3 (v0.294, #3692): slot-declared-type gate — see
+                    // the choice-case call site above for the rationale.
+                    checkOrderingPatternOverNullableType(fieldTy,
+                                                         sp.pattern.get());
                     if (!sp.nakedBinding.empty()) {
                         // Bare `Pt(x, y)` — nakedBinding carries the name.
                         // Use the PositionalPattern's address (stable since
@@ -16954,6 +16986,10 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                                 ndFields[i]->posParam->type)
                                 fieldTy = ctx_.resolvedType(
                                     *ndFields[i]->posParam->type);
+                            // §19.3 (v0.294, #3692): same slot-declared-type
+                            // gate, one level down (`Outer(Inner(1..5))`).
+                            checkOrderingPatternOverNullableType(
+                                fieldTy, s.pattern.get());
                             if (!s.nakedBinding.empty()) {
                                 auto* lsym = ctx_.makeSymbol<LocalSymbol>();
                                 lsym->name = s.nakedBinding;

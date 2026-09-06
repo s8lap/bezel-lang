@@ -575,6 +575,148 @@ BEZEL_TEST(lifted_operators_rejected_3298,
 }
 
 // ---------------------------------------------------------------------------
+// §19.3 (v0.294, #3692): the ordering-pattern-over-nullable rule reaches a
+// DESTRUCTURING SLOT's sub-pattern, not only the arm scrutinee. §19.3: "Each
+// slot's right-hand side is a full pattern (grammar A.7 AltPattern): a
+// binding, `_`, a constant, `null`, a range, a relational, … a per-slot `|`
+// alternative … or a nested destructuring … recursively" — the relational
+// paragraph's "nullable scrutinee" reads, for a slot, as the slot's own
+// declared type. #3298 gated the ARM form only (walking arm patterns and
+// alternative-list members); it did not resolve a destructuring pattern's
+// per-slot declared type, so `case r of R(1..5, 1) => …` over `R(X: int?, …)`
+// compiled and silently took proposal 0114's declined D5 reading instead of
+// being rejected (codegen/case_relop_nullable_1074_test.cpp's
+// `nullable_slot_*_3298` rows pinned that D5 table before this fix; they now
+// pin the rejection, plus a residual-gap control for a GENERIC record's
+// unsubstituted type-parameter slot — see that file's header and issue 3898).
+//
+// checkOrderingPatternOverNullableType is the ONE walk both the arm-level and
+// slot-level call sites share (§6 dedup) — the same diagnostic,
+// hasNullablePatternError, fires for both.
+// ---------------------------------------------------------------------------
+
+BEZEL_TEST(lifted_operators_rejected_3298,
+           case_range_pattern_in_record_slot_over_nullable_field_rejected_3692) {
+    // The issue's verbatim repro.
+    auto r = parseSemaAll(
+        "module M; record R(X: int?, Y: int); "
+        "class C public static method Main(): int "
+        "  var r := new R(99, 1); "
+        "  return (case r of R(1..5, 1) => 7, _ => 3); "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(hasNullablePatternError(r));
+}
+
+BEZEL_TEST(lifted_operators_rejected_3298,
+           case_relop_pattern_in_record_slot_over_nullable_field_rejected_3692) {
+    auto r = parseSemaAll(
+        "module M; record R(X: int?, Y: int); "
+        "class C public static method Main(): int "
+        "  var r := new R(99, 1); "
+        "  return (case r of R(> 50, 1) => 7, _ => 3); "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(hasNullablePatternError(r));
+}
+
+BEZEL_TEST(lifted_operators_rejected_3298,
+           case_range_pattern_in_record_slot_over_nullable_field_stmt_rejected_3692) {
+    // Statement-position `case` — a separate visit site from the expression
+    // form, exactly as the arm-level gate's own stmt row covers.
+    auto r = parseSemaAll(
+        "module M; record R(X: int?, Y: int); "
+        "class C public static method Main(): int "
+        "  var r := new R(99, 1); "
+        "  case r of "
+        "    R(1..5, 1) => return 7; "
+        "    _ => return 3; "
+        "  end case; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(hasNullablePatternError(r));
+}
+
+BEZEL_TEST(lifted_operators_rejected_3298,
+           case_range_pattern_in_choice_payload_slot_over_nullable_field_rejected_3692) {
+    // A choice-case payload slot — the OTHER of the "record x choice" halves
+    // the issue names; this path already substitutes a generic instantiation
+    // via substituteGenericCaseFieldType, so it is fully closed (unlike the
+    // record path's generic residual, issue 3898).
+    auto r = parseSemaAll(
+        "module M; choice Wrap Val(X: int?, Y: int), None; end Wrap; "
+        "class C public static method Main(): int "
+        "  var w := Wrap.Val(99, 1); "
+        "  return (case w of Val(1..5, 1) => 7, _ => 3); "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(hasNullablePatternError(r));
+}
+
+BEZEL_TEST(lifted_operators_rejected_3298,
+           case_range_pattern_in_nested_record_slot_over_nullable_field_rejected_3692) {
+    // Two levels deep (`Outer(Inner(1..5), b)`) — a separate call site (the
+    // nested-destructuring worklist) from the top-level slot loop above.
+    auto r = parseSemaAll(
+        "module M; record Inner(V: int?); record Outer(I: Inner, B: int); "
+        "class C public static method Main(): int "
+        "  var o := new Outer(new Inner(99), 1); "
+        "  return (case o of Outer(Inner(1..5), 1) => 7, _ => 3); "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(hasNullablePatternError(r));
+}
+
+BEZEL_TEST(lifted_operators_rejected_3298,
+           case_alternative_list_member_range_in_slot_over_nullable_field_rejected_3692) {
+    // §19.3 admits ranges/relationals as binding-free ALTERNATIVE members
+    // inside a slot too (`R(1..5 | 10, 1)`); the walk must descend into the
+    // slot's alternative list, not just an arm's.
+    auto r = parseSemaAll(
+        "module M; record R(X: int?, Y: int); "
+        "class C public static method Main(): int "
+        "  var r := new R(99, 1); "
+        "  return (case r of R(1..5 | 10, 1) => 7, _ => 3); "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(hasNullablePatternError(r));
+}
+
+BEZEL_TEST(lifted_operators_rejected_3298,
+           case_constant_slot_over_nullable_field_still_admitted_3692) {
+    // §19.3: a constant slot is unaffected — it is §8.4 equality, total on
+    // `null`. LOUD->QUIET guard: the widened gate must stay exactly as wide
+    // as §19.3 says.
+    auto r = parseSemaAll(
+        "module M; record R(X: int?, Y: int); "
+        "class C public static method Main(): int "
+        "  var r := new R(5, 1); "
+        "  return (case r of R(5, 1) => 7, _ => 3); "
+        "end Main; end C;");
+    BEZEL_EXPECT_FALSE(hasNullablePatternError(r));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+BEZEL_TEST(lifted_operators_rejected_3298,
+           case_range_pattern_in_generic_record_slot_over_nullable_field_admitted_3692) {
+    // The RESIDUAL gap (issue 3898): a generic record's slot is typed at the
+    // bare, unsubstituted type parameter from sema's point of view (there is
+    // no record analogue of substituteGenericCaseFieldType), so `Box<int?>`'s
+    // slot-0 declared type is seen as non-nullable `T`, not `int?`, and this
+    // program is still ADMITTED. ⚠ It does NOT still lower correctly through
+    // the patternMatches slot handlers on this surviving path — MEASURED
+    // (issue 3899): codegen's own field-type resolution has the identical
+    // unsubstituted-type-parameter gap, so it takes the WRONG (non-nullable)
+    // comparison branch entirely and never reaches `nv.range.match`/
+    // `nv.relop.match` at all. codegen/case_relop_nullable_1074_test.cpp's
+    // `generic_record_slot_ordering_pattern_ice_3899` row pins the actual
+    // result: a clean, loud "IR verification failed" compile error — not a
+    // correct value, and not those handlers being exercised.
+    auto r = parseSemaAll(
+        "module M; record Box<T>(X: T, Y: int); "
+        "class C public static method Main(): int "
+        "  var b := new Box<int?>(99, 1); "
+        "  return (case b of Box(1..5, 1) => 7, _ => 3); "
+        "end Main; end C;");
+    BEZEL_EXPECT_FALSE(hasNullablePatternError(r));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// ---------------------------------------------------------------------------
 // §17.5 / §16.6 — `x in <range>` with a nullable left operand, and the §16.6
 // PARITY the issue's "Done means" asks for.
 // ---------------------------------------------------------------------------

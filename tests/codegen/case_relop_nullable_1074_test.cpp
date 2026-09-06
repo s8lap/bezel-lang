@@ -89,53 +89,178 @@ BEZEL_TEST(case_relop_nullable_1074, relational_then_constant_arm_rejected_v0_26
 }
 
 // ---------------------------------------------------------------------------
-// §19.3 / #3298 — the DESTRUCTURING-SLOT path, which sema's arm-level
-// nullable-scrutinee gate does NOT reach.
+// §19.3 / #3298 / #3692 — the DESTRUCTURING-SLOT path.
 //
-// §19.3 makes an ordering pattern over a nullable scrutinee a compile error and
-// #3298 gates that at both `case` sites, but the gate walks ARM patterns (and
-// alternative-list members) only: it does not resolve a destructuring pattern's
-// per-slot declared types, so `case r of R(1..5, 1) => …` where `R.X: int?` is
-// still admitted and still lowers through the nullable range/relational
-// handlers in patternMatches.
+// §19.3 makes an ordering pattern over a nullable scrutinee a compile error.
+// #3298 gated that at the ARM level (and alternative-list members) but did NOT
+// resolve a destructuring pattern's per-slot declared types, so
+// `case r of R(1..5, 1) => …` where `R.X: int?` was still admitted and lowered
+// through the nullable range/relational handlers in patternMatches, silently
+// taking proposal 0114's declined D5 reading ("matches every present value,
+// never null") instead of being rejected — MEASURED pre-#3692: the four
+// `slotProg` calls (the shape now inlined into the `_rejected_3692` rows
+// below) returned 3/7/3/(3,7,3).
 //
-// These rows are the ratchet on that. Both slot call sites lower a slot with
-// `if (subMatch) matched = AND(matched, subMatch);`, so if those handlers ever
-// return nullptr the slot's test is SILENTLY SKIPPED and the arm matches
-// unconditionally — a wrong answer, not a crash. A draft of #3298 deleted the
-// handlers as "dead code after the sema gate" and this exact program returned
-// 7 instead of 3. Whatever the eventual §19.3 slot-level ruling is (reject at
-// sema, or keep this lowering), it must not be "the slot check disappears".
+// #3692 closes that gap for a slot whose declared type sema can see directly
+// — a NON-GENERIC record field (below) or a CHOICE payload field, generic or
+// not (tests/sema/lifted_operators_rejected_3298_test.cpp's
+// `case_range_pattern_in_choice_payload_slot_over_nullable_field_rejected_3692`
+// — the choice path already substitutes a generic instantiation via
+// `ExprTC::substituteGenericCaseFieldType`) — by feeding the arm-level walk's
+// shared single-pattern helper (`checkOrderingPatternOverNullableType`) the
+// slot's OWN resolved type at all six existing slot-type-resolution call
+// sites (CaseExpr x CaseStmt, record x choice, top-level x nested), rather
+// than adding a further copy of slot-type resolution.
+//
+// ⚠ It does NOT close the gap for a GENERIC RECORD's field typed at a bare
+// type parameter (`record Box<T>(X: T, Y: int)`): the record positional-slot
+// loops resolve `fieldTy` from the record's declared (unsubstituted) field
+// type — there is no record analogue of the choice path's
+// `substituteGenericCaseFieldType`. Filed as issue 3898 rather than closed
+// here (needs a record-generic-field substitution helper, the same "further
+// copy or a refactor of the existing four" tradeoff #3298 already declined
+// for this exact reason).
+//
+// That residual, sema-admitted path turns out to ALSO be independently
+// broken in codegen, for an unrelated reason discovered while checking
+// whether it still reaches the SLOT-PATH-ONLY handlers correctly: filed as
+// issue 3899 (`RecordSubstGuard` for a destructuring arm is installed only
+// around the arm BODY, after `patternMatches` has already computed each
+// slot's `fieldTy` from the UNSUBSTITUTED declared type, so a generic
+// record's slot pattern is matched against the wrong LLVM shape). The
+// `generic_record_slot_ordering_pattern_ice_3899` row below pins that
+// CURRENT (loud, non-crashing — §6c is satisfied) codegen-error behaviour,
+// rather than asserting a specific D5 value for a path that does not
+// actually reach those handlers today.
+//
+// Both slot call sites in patternMatches's DestructuringPattern branch lower
+// a slot with `if (subMatch) matched = AND(matched, subMatch);`, so if the
+// SLOT-PATH-ONLY nv.relop.match / nv.range.match handlers ever return
+// nullptr the slot's test is SILENTLY SKIPPED and the arm matches
+// unconditionally — a wrong answer, not a crash. A draft of #3298 deleted
+// the handlers as "dead code after the sema gate" and this exact program
+// returned 7 instead of 3. They are KEPT here too, unconditionally — see the
+// LlvmBackend_Exprs2.cpp SLOT-PATH ONLY comment for why they still matter
+// even though no CURRENTLY-WORKING accepted program reaches them: issue 3899
+// is precisely the kind of future fix (moving `RecordSubstGuard` earlier)
+// that would make a generic-record slot reach them again, correctly.
+//
+// ⚠ MEASURED, via a review of this fix: with BOTH handlers stubbed to an
+// unconditional `return nullptr;`, every row in this file, every row in
+// lifted_operators_rejected_3298, five adjacent reachable-code-path sweeps,
+// and the whole lit corpus stay green — the regression these handlers exist
+// to prevent is CURRENTLY UNGUARDED by any passing test, because (as above)
+// no admitted program reaches them. The CHOICE side is closed at SEMA by
+// #3692's own fix (a nullable choice payload with an ordering pattern
+// rejects, non-generic and generic alike), so it never routes here in
+// principle. Searching that side did surface a further, unrelated bug
+// (issue 3902): choice payload slots are never checked at codegen for ANY
+// refutable pattern (constant, range, relational — nullability irrelevant).
+// That bug is real and severe, but it is NOT what forecloses this route, and
+// fixing it alone would NOT make these handlers reachable; only #3899's fix
+// does, via the record side. Issue 3899 now carries the
+// explicit acceptance criterion that closing it must ship a live
+// positive-lowering test that fails under this same stub.
 // ---------------------------------------------------------------------------
 
 namespace {
-// `case r of R(<slotPat>, 1) => 7, _ => 3` over `R(X: int?, Y: int)`.
-int slotProg(const std::string& xInit, const std::string& slotPat) {
-    return run(
-        std::string("module M; record R(X: int?, Y: int); "
-                    "class C public static method Main(): int "
-                    "  var r := new R(") + xInit + ", 1); "
-        "  return (case r of R(" + slotPat + ", 1) => 7, _ => 3); "
-        "end Main; end C;");
+// §19.3 / #3692: a destructuring slot's ordering sub-pattern over a NULLABLE
+// field is now a compile error. runAot's REJECT diagnostic carries no real
+// source location (it is packed into one synthetic {0,0} Diagnostic), so this
+// asserts message TEXT — the same §19.3/§16.6/§7.11 wording the arm-level gate
+// already uses (checkOrderingPatternOverNullableType is the single shared
+// walk), not merely `!r.ran` (which is also true on a runtime signal death).
+bool rejectedAsNullableOrderingPattern(const std::string& prog) {
+    auto r = bezel::test::runAot(prog);
+    if (r.ran) return false;
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        const auto& m = d.message;
+        if (m.find("pattern requires a non-nullable scrutinee") ==
+                std::string::npos)
+            continue;
+        if (m.find("19.3") == std::string::npos) continue;
+        if (m.find("16.6") == std::string::npos) continue;
+        if (m.find("7.11") == std::string::npos) continue;
+        return true;
+    }
+    return false;
 }
 }  // namespace
 
-BEZEL_TEST(case_relop_nullable_1074, nullable_slot_range_out_of_range_3298) {
-    BEZEL_EXPECT_EQ(slotProg("99", "1..5"), 3);   // 99 not in 1..5
+// §19.3 (v0.294, #3692): a record-destructuring slot's RANGE sub-pattern over
+// a nullable field (`R.X: int?`) is a compile error — the issue's verbatim
+// repro. Before #3692 this compiled and returned 3/7/3 via the D5 reading
+// (measured above); it now rejects for every scrutinee value, present or
+// null, because the rejection is on the PATTERN'S KIND, not on a runtime
+// value.
+BEZEL_TEST(case_relop_nullable_1074, nullable_slot_range_rejected_3692) {
+    BEZEL_EXPECT_TRUE(rejectedAsNullableOrderingPattern(
+        "module M; record R(X: int?, Y: int); "
+        "class C public static method Main(): int "
+        "  var r := new R(99, 1); "
+        "  return (case r of R(1..5, 1) => 7, _ => 3); "
+        "end Main; end C;"));
 }
 
-BEZEL_TEST(case_relop_nullable_1074, nullable_slot_range_in_range_3298) {
-    BEZEL_EXPECT_EQ(slotProg("3", "1..5"), 7);    // 3 in 1..5
+// §19.3 (v0.294, #3692): the RELATIONAL slot sub-pattern form, same field.
+BEZEL_TEST(case_relop_nullable_1074, nullable_slot_relational_rejected_3692) {
+    BEZEL_EXPECT_TRUE(rejectedAsNullableOrderingPattern(
+        "module M; record R(X: int?, Y: int); "
+        "class C public static method Main(): int "
+        "  var r := new R(99, 1); "
+        "  return (case r of R(> 50, 1) => 7, _ => 3); "
+        "end Main; end C;"));
 }
 
-BEZEL_TEST(case_relop_nullable_1074, nullable_slot_range_null_3298) {
-    BEZEL_EXPECT_EQ(slotProg("null", "1..5"), 3); // absent never matches
+// §19.3 (v0.294, #3692): the rejection also reaches a slot nested TWO levels
+// deep (`Outer(Inner(1..5), b)`), which is a SEPARATE call site
+// (the nested-destructuring worklist) from the top-level slot loop above.
+BEZEL_TEST(case_relop_nullable_1074, nullable_nested_slot_range_rejected_3692) {
+    BEZEL_EXPECT_TRUE(rejectedAsNullableOrderingPattern(
+        "module M; record Inner(V: int?); record Outer(I: Inner, B: int); "
+        "class C public static method Main(): int "
+        "  var o := new Outer(new Inner(99), 1); "
+        "  return (case o of Outer(Inner(1..5), 1) => 7, _ => 3); "
+        "end Main; end C;"));
 }
 
-BEZEL_TEST(case_relop_nullable_1074, nullable_slot_relational_3298) {
-    BEZEL_EXPECT_EQ(slotProg("3", "> 50"), 3);    // 3 is not > 50
-    BEZEL_EXPECT_EQ(slotProg("99", "> 50"), 7);   // 99 is
-    BEZEL_EXPECT_EQ(slotProg("null", "> 50"), 3); // absent never matches
+// §19.3 (v0.294, #3692): a CONSTANT slot over the same nullable field stays
+// ADMITTED — "Constant patterns over a nullable scrutinee are unaffected: a
+// constant pattern is the equality test of §8.4, which is total on `null`."
+// This is the LOUD->QUIET guard: the widened rejection must stay exactly as
+// wide as §19.3 says, not swallow the constant-slot case too.
+BEZEL_TEST(case_relop_nullable_1074, nullable_slot_constant_still_admitted_3692) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record R(X: int?, Y: int); "
+        "class C public static method Main(): int "
+        "  var r := new R(5, 1); "
+        "  return (case r of R(5, 1) => 7, _ => 3); "
+        "end Main; end C;"), 7);
+}
+
+// ---------------------------------------------------------------------------
+// The residual gap (issue 3898 / issue 3899): a GENERIC record's slot typed
+// at a bare type parameter is not reached by #3692's sema gate (issue 3898),
+// and MEASURED here to also not correctly reach the SLOT-PATH-ONLY codegen
+// handlers either (issue 3899) — it fails with a clean, loud codegen error
+// instead (verified directly with `./build/bezelc`: exits 1, no crash/signal,
+// "IR verification failed"). This is the §6c-compliant outcome (loud, not a
+// silently wrong D5 value) for a case neither issue closes yet.
+// ---------------------------------------------------------------------------
+
+BEZEL_TEST(case_relop_nullable_1074, generic_record_slot_ordering_pattern_ice_3899) {
+    auto r = bezel::test::runAot(
+        "module M; record Box<T>(X: T, Y: int); "
+        "class C public static method Main(): int "
+        "  var b := new Box<int?>(99, 1); "
+        "  return (case b of Box(1..5, 1) => 7, _ => 3); "
+        "end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    bool sawIrVerificationError = false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("IR verification failed") != std::string::npos)
+            sawIrVerificationError = true;
+    BEZEL_EXPECT_TRUE(sawIrVerificationError);
 }
 
 // ---------------------------------------------------------------------------
