@@ -9879,7 +9879,7 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                                 // both at `int`, not at unrelated `T`/`E`).
                                 // See CaseStmt analogue for the rationale.
                                 if (fieldTy) {
-                                    fieldTy = substituteGenericCaseFieldType(
+                                    fieldTy = substituteGenericFieldType(
                                         fieldTy, scrutTy);
                                 }
                             }
@@ -10068,6 +10068,19 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                     if (i < fields.size() && fields[i]->posParam &&
                         fields[i]->posParam->type) {
                         fieldTy = ctx_.resolvedType(*fields[i]->posParam->type);
+                        // fix #3898 (§14.1 / §19.3, v0.294): a GENERIC
+                        // record's positional field may be declared at a bare
+                        // type parameter (`record Box<T>(X: T, Y: int)`); the
+                        // scrutinee's instantiation (`Box<int?>`) must be
+                        // substituted through here exactly as the choice-case
+                        // payload path above already does, or the
+                        // ordering-pattern gate just below sees the bare,
+                        // non-nullable `T` instead of the substituted `int?`
+                        // and wrongly admits `Box(1..5, 1)`.
+                        if (fieldTy) {
+                            fieldTy = substituteGenericFieldType(fieldTy,
+                                                                 scrutTy);
+                        }
                     }
                     // §19.3 (v0.294, #3692): slot-declared-type gate — see
                     // the choice-case call site above for the rationale.

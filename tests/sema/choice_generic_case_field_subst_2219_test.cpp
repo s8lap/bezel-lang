@@ -133,7 +133,9 @@ BEZEL_TEST(choice_generic_case_field_subst_2219,
 // `ArrayChoice<int>` substitutes the inner `Array<T>` to `Array<int>`, so
 // `xs.Length` resolves (the inner `T` is replaced by `int`, NOT by the
 // bare-type-parameter symbol's `T`). Exercises the recursive `genericArgs`
-// walk in substituteGenericCaseFieldType.
+// walk in `ExprTC::substituteGenericFieldType` (renamed by fix #3898 from
+// `substituteGenericCaseFieldType` when generalized to also serve generic
+// records; the walk itself is unchanged).
 BEZEL_TEST(choice_generic_case_field_subst_2219,
            expr_array_choice_inner_t_substituted_spec_35_5) {
     auto r = semaAll(

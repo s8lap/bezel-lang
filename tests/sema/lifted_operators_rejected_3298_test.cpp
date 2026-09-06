@@ -723,8 +723,11 @@ BEZEL_TEST(lifted_operators_rejected_3298,
            case_range_pattern_in_choice_payload_slot_over_nullable_field_rejected_3692) {
     // A choice-case payload slot — the OTHER of the "record x choice" halves
     // the issue names; this path already substitutes a generic instantiation
-    // via substituteGenericCaseFieldType, so it is fully closed (unlike the
-    // record path's generic residual, issue 3898).
+    // via `substituteGenericFieldType` (fix #3898 generalized this from the
+    // choice-only `substituteGenericCaseFieldType` #2219 introduced), so it
+    // was already fully closed here even before #3898 — the record path's
+    // own generic residual (issue 3898's TOP-LEVEL repro, below) is now
+    // closed too; a NESTED generic residual remains, issue 3938.
     auto r = parseSemaAll(
         "module M; choice Wrap Val(X: int?, Y: int), None; end Wrap; "
         "class C public static method Main(): int "
@@ -777,25 +780,136 @@ BEZEL_TEST(lifted_operators_rejected_3298,
 }
 
 BEZEL_TEST(lifted_operators_rejected_3298,
-           case_range_pattern_in_generic_record_slot_over_nullable_field_admitted_3692) {
-    // The RESIDUAL gap (issue 3898): a generic record's slot is typed at the
-    // bare, unsubstituted type parameter from sema's point of view (there is
-    // no record analogue of substituteGenericCaseFieldType), so `Box<int?>`'s
-    // slot-0 declared type is seen as non-nullable `T`, not `int?`, and this
-    // program is still ADMITTED. ⚠ It does NOT still lower correctly through
-    // the patternMatches slot handlers on this surviving path — MEASURED
-    // (issue 3899): codegen's own field-type resolution has the identical
-    // unsubstituted-type-parameter gap, so it takes the WRONG (non-nullable)
-    // comparison branch entirely and never reaches `nv.range.match`/
-    // `nv.relop.match` at all. codegen/case_relop_nullable_1074_test.cpp's
-    // `generic_record_slot_ordering_pattern_ice_3899` row pins the actual
-    // result: a clean, loud "IR verification failed" compile error — not a
-    // correct value, and not those handlers being exercised.
+           case_range_pattern_in_generic_record_slot_over_nullable_field_rejected_3898) {
+    // fix #3898 (§14.1 / §19.3, v0.294): CLOSED. This is the issue's own
+    // verbatim repro. Before the fix, a generic record's TOP-LEVEL slot was
+    // typed at the bare, unsubstituted type parameter from sema's point of
+    // view (there was no record analogue of the choice path's
+    // `substituteGenericCaseFieldType`), so `Box<int?>`'s slot-0 declared
+    // type was seen as non-nullable `T`, not `int?`, and this program was
+    // wrongly ADMITTED (pinned as `..._admitted_3692` on the parent
+    // compiler). `ExprTC::substituteGenericFieldType` — the same walk,
+    // generalized to accept a Record declaration alongside Choice — is now
+    // called at the record-scrutinee slot-resolution sites too, so the slot
+    // resolves to the substituted `int?` and this rejects, symmetric with
+    // the non-generic `R(1..5, 1)` row above.
     auto r = parseSemaAll(
         "module M; record Box<T>(X: T, Y: int); "
         "class C public static method Main(): int "
         "  var b := new Box<int?>(99, 1); "
         "  return (case b of Box(1..5, 1) => 7, _ => 3); "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(hasNullablePatternError(r));
+}
+
+BEZEL_TEST(lifted_operators_rejected_3298,
+           case_relop_pattern_in_generic_record_slot_over_nullable_field_rejected_3898) {
+    // fix #3898: the RELATIONAL form of the same generic-field shape.
+    auto r = parseSemaAll(
+        "module M; record Box<T>(X: T, Y: int); "
+        "class C public static method Main(): int "
+        "  var b := new Box<int?>(10, 1); "
+        "  return (case b of Box(> 5, 1) => 7, _ => 3); "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(hasNullablePatternError(r));
+}
+
+BEZEL_TEST(lifted_operators_rejected_3298,
+           case_range_pattern_in_generic_record_slot_over_nullable_field_stmt_rejected_3898) {
+    // fix #3898: statement-position `case` — the CaseStmt sema handler is a
+    // separate call site from CaseExpr's, and needs its OWN
+    // `substituteGenericFieldType` call (which the fix adds).
+    //
+    // Appendix A: `CaseStmt ::= "case" Expression "of" CaseArm ("," CaseArm)*
+    // ","? "end" "case"? ";"` — arms are comma-separated, unconditionally, so
+    // the first arm's trailing `,` after its `return 7;` is REQUIRED, not
+    // stylistic (a sibling defect, several rows in this file omitting it, is
+    // tracked separately as issue 3958 — this row was written from that
+    // defective template and is corrected here). VERIFIED directly against
+    // the real `bezelc -c`: this exact source parses with zero diagnostics
+    // through the `case` construct, then rejects at the range pattern with
+    // the expected §19.3/§16.6/§7.11 text — genuine sema coverage, not a
+    // parser-error-recovery artifact.
+    auto r = parseSemaAll(
+        "module M; record Box<T>(X: T, Y: int); "
+        "class C public static method Main(): int "
+        "  var b := new Box<int?>(3, 1); "
+        "  case b of "
+        "    Box(1..5, 1) => return 7;, "
+        "    _ => return 3; "
+        "  end case; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(hasNullablePatternError(r));
+}
+
+BEZEL_TEST(lifted_operators_rejected_3298,
+           case_range_pattern_in_generic_record_second_type_param_slot_rejected_3898) {
+    // fix #3898: a SECOND generic parameter position (`Pair<A,B>`, ordering
+    // on B) — the substitution walk must match B by NAME against the
+    // scrutinee's genericArgs, not just special-case "the first parameter".
+    auto r = parseSemaAll(
+        "module M; record Pair<A, B>(X: A, Y: B); "
+        "class C public static method Main(): int "
+        "  var p := new Pair<int, int?>(1, 3); "
+        "  return (case p of Pair(1, 1..5) => 7, _ => 3); "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(hasNullablePatternError(r));
+}
+
+BEZEL_TEST(lifted_operators_rejected_3298,
+           case_range_pattern_in_generic_record_slot_non_nullable_instantiation_still_admitted_3898) {
+    // POSITIVE CONTROL (§19.3 stays exactly as wide as it says): the SAME
+    // generic-record slot shape instantiated at a NON-nullable type argument
+    // (`Box<int>`) must remain ADMITTED — the fix keys on the SUBSTITUTED
+    // type's own nullability, not on "the slot's declared type names a
+    // generic parameter" (which would over-reject every generic-record
+    // ordering slot, nullable substitution or not).
+    auto r = parseSemaAll(
+        "module M; record Box<T>(X: T, Y: int); "
+        "class C public static method Main(): int "
+        "  var b := new Box<int>(3, 1); "
+        "  return (case b of Box(1..5, 1) => 7, _ => 3); "
+        "end Main; end C;");
+    BEZEL_EXPECT_FALSE(hasNullablePatternError(r));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+BEZEL_TEST(lifted_operators_rejected_3298,
+           case_range_pattern_in_nested_generic_record_slot_still_admitted_3938) {
+    // ⚠ Residual gap, NOT closed by #3898 — filed as issue 3938. A generic
+    // record slot NESTED one level down inside another destructuring pattern
+    // (`Outer<T>(B: Box<T>, Z: int)`) goes through
+    // `ExprTC::bindNestedDestructuringNames`, which resolves each nested
+    // pattern's record purely by NAME and has no substitution context of any
+    // kind (not even the enclosing `scrutTy` this fix threads through the
+    // TOP-LEVEL loops) — so `Box`'s own bare `T` stays unsubstituted and this
+    // program remains (wrongly, per §19.3) ADMITTED. Pinned here as an
+    // explicit still-admitted control, not silently dropped — the same
+    // discipline #3692 used to pin this file's now-closed top-level gap.
+    auto r = parseSemaAll(
+        "module M; record Box<T>(X: T, Y: int); "
+        "record Outer<T>(B: Box<T>, Z: int); "
+        "class C public static method Main(): int "
+        "  var o := new Outer<int?>(new Box<int?>(99, 1), 9); "
+        "  return (case o of Outer(Box(1..5, 1), 9) => 7, _ => 3); "
+        "end Main; end C;");
+    BEZEL_EXPECT_FALSE(hasNullablePatternError(r));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+BEZEL_TEST(lifted_operators_rejected_3298,
+           case_range_pattern_in_generic_choice_payload_nested_record_slot_still_admitted_3938) {
+    // ⚠ Residual gap, issue 3938 — the identical nested shape via a
+    // CHOICE-case payload: the payload's OWN type (`Box<T>` at `Wrap<int?>`)
+    // is correctly substituted (the choice path's `substituteGenericFieldType`
+    // call), but the NESTED `Box(1..5, 1)` sub-pattern still goes through the
+    // same substitution-blind `bindNestedDestructuringNames`.
+    auto r = parseSemaAll(
+        "module M; record Box<T>(X: T, Y: int); "
+        "choice Wrap<T> Val(B: Box<T>), None; end Wrap; "
+        "class C public static method Main(): int "
+        "  var w := Wrap<int?>.Val(new Box<int?>(99, 1)); "
+        "  return (case w of Val(Box(1..5, 1)) => 7, _ => 3); "
         "end Main; end C;");
     BEZEL_EXPECT_FALSE(hasNullablePatternError(r));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());

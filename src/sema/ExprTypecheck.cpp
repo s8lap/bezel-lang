@@ -2797,23 +2797,50 @@ const ChoiceCaseSymbol* ExprTC::findChoiceCaseOnScrutinee(
 }
 
 // #2219: apply the scrutinee's per-instantiation generic-arg substitution to
-// a generic CHOICE's case payload field type. Walks `ty` and rewrites every
-// bare-name TypeRef whose declaration is one of `scrutTy->declaration`'s
-// generic parameters (matched by NAME) with the corresponding entry from
-// `scrutTy->genericArgs`. Recurses into Named genericArgs, InlineArray
-// element types, Function parameter/return types, and the nullable wrapper,
-// so `Array<T>?` at scrutinee `Result<Array<int>, string>` substitutes to
-// `Array<int>?`. A bare `T` at the case-payload slot becomes the substituted
-// `int`, which is what the destructuring pattern's binding type must be so
-// the arms' §20 common-type computation sees both arms at `int`. Without
-// this, both arms of `case r of Ok(v) => v, Err(e) => e` over `Result<int,
-// int>` were typed against the bare `T` and `E` (different generic params
-// of the same choice), and `commonTypeOf` rejected the unrelated named
-// types with the §20 "no common type" diagnostic.
+// a generic CHOICE's case payload field type — extended by fix #3898 (§14.1 /
+// §19.3, v0.294) to a generic RECORD's positional field type too: the walk
+// keys only on `scrutTy->declaration`'s `genericParams`/`genericArgs`, which
+// a record declaration carries exactly the same shape as a choice
+// declaration (§14.1 "classes, interfaces, records, and methods may be
+// generic"), so ONE walk serves both callers rather than a second, drifting
+// copy (LANE_RULES §6 — "is there a fact the compiler ALREADY COMPUTES that
+// decides this?"). Walks `ty` and rewrites every bare-name TypeRef whose
+// declaration is one of `scrutTy->declaration`'s generic parameters (matched
+// by NAME) with the corresponding entry from `scrutTy->genericArgs`.
+// Recurses into Named genericArgs, InlineArray element types, Function
+// parameter/return types, and the nullable wrapper, so `Array<T>?` at
+// scrutinee `Result<Array<int>, string>` substitutes to `Array<int>?`. A
+// bare `T` at the case-payload slot (or, per #3898, a bare `T` at a generic
+// record's positional field) becomes the substituted `int`, which is what
+// the destructuring pattern's binding type must be so (a) the arms' §20
+// common-type computation sees both arms at `int` instead of unrelated
+// generic params, and (b) §19.3's slot-level nullable-ordering-pattern gate
+// (`checkOrderingPatternOverNullableType`, #3692) sees the SUBSTITUTED
+// nullability (`int?`) rather than the bare parameter's own (non-nullable
+// `T`). Without (a), both arms of `case r of Ok(v) => v, Err(e) => e` over
+// `Result<int, int>` were typed against the bare `T` and `E`, and
+// `commonTypeOf` rejected the unrelated named types with the §20 "no common
+// type" diagnostic. Without (b) — issue #3898's own repro —
+// `record Box<T>(X: T, Y: int)` instantiated `Box<int?>` let
+// `case b of Box(1..5, 1) => …` through: sema saw slot 0's declared type as
+// the bare, non-nullable `T`, not the instantiated `int?`, so the range
+// pattern was (wrongly, per §19.3) admitted.
 //
-// Returns `ty` unchanged when no substitution applies (a non-generic choice,
-// a non-parametric field type, a scrutinee without genericArgs) so callers
-// can use the helper unconditionally.
+// Returns `ty` unchanged when no substitution applies (a non-generic
+// choice/record, a non-parametric field type, a scrutinee without
+// genericArgs) so callers can use the helper unconditionally.
+//
+// NOT extended to the nested-destructuring worklist (`bindNestedDestructuring
+// Names`, below): that walker re-derives each nested pattern's record purely
+// by NAME and has no access to any enclosing substitution at all (not even
+// this function's own `scrutTy`), so a nested generic-record slot
+// (`Outer<T>(B: Box<T>, Z: int)`, pattern `Outer(Box(1..5, 1), 9)`) and a
+// generic-record slot nested inside a choice-case payload remain admitted —
+// filed as issue 3938 with measured repros rather than folded in here: closing
+// it needs `bindNestedDestructuringNames` restructured to thread each nested
+// pattern's own (already-substituted) scrutinee type through the recursion,
+// a materially different, larger change than reusing this walk at one more
+// pair of call sites.
 //
 // Mirrors the field-walk of Resolver::applyGenericSubst + the env-build part
 // of Resolver::buildBaseGenericSubst (TypeResolution_Checks.cpp) — local
@@ -2821,14 +2848,17 @@ const ChoiceCaseSymbol* ExprTC::findChoiceCaseOnScrutinee(
 // split). Per §35.5 "Case patterns" + §14.5 "Type-argument inference"
 // posture (type-level arguments are NEVER inferred; the scrutinee's args are
 // the ones substituted).
-TypeRef* ExprTC::substituteGenericCaseFieldType(
+TypeRef* ExprTC::substituteGenericFieldType(
         const TypeRef* ty, const TypeRef* scrutTy) {
     if (!ty || !scrutTy) return const_cast<TypeRef*>(ty);
-    // Collect the substitution map from the scrutinee's choice declaration.
-    // A non-Named scrutinee, a non-choice, or an instantiated-without-args
-    // candidate carries no substitution (return unchanged).
+    // Collect the substitution map from the scrutinee's choice/record
+    // declaration (fix #3898: widened from Choice-only). A non-Named
+    // scrutinee, a class/interface/enum scrutinee, or an
+    // instantiated-without-args candidate carries no substitution (return
+    // unchanged).
     if (scrutTy->kind != TypeRef::Kind::Named || !scrutTy->declaration ||
-        scrutTy->declaration->kind != ast::TypeDeclKind::Choice) {
+        (scrutTy->declaration->kind != ast::TypeDeclKind::Choice &&
+         scrutTy->declaration->kind != ast::TypeDeclKind::Record)) {
         return const_cast<TypeRef*>(ty);
     }
     const auto& params = scrutTy->declaration->genericParams;
@@ -10082,6 +10112,20 @@ void ExprTC::bindNestedDestructuringNames(
             if (i < ndFields.size() && ndFields[i]->posParam &&
                 ndFields[i]->posParam->type)
                 fieldTy = ctx_.resolvedType(*ndFields[i]->posParam->type);
+            // ⚠ residual gap (issue 3938, filed alongside fix #3898): unlike
+            // the top-level CaseExpr/CaseStmt record loops (which now call
+            // `substituteGenericFieldType(fieldTy, scrutTy)`, fix #3898), NO
+            // substitution is applied here — `fieldsOfRecord` re-derives `nd`'s
+            // record purely by NAME (above) and this function receives no
+            // scrutinee TypeRef of any kind, so a GENERIC record nested one
+            // level down (`Outer<T>(B: Box<T>, Z: int)`, pattern
+            // `Outer(Box(1..5, 1), 9)`) still resolves `Box`'s own bare `T`
+            // unsubstituted. Fixing it needs each nested pattern's own
+            // (already-substituted) scrutinee TypeRef threaded through this
+            // worklist — a bare record NAME is not enough once generics are
+            // involved — which is a larger, separate change from reusing
+            // `substituteGenericFieldType` at one more pair of call sites.
+            //
             // §19.3 (v0.294, #3692): same slot-declared-type gate, one
             // level down (`Outer(Inner(1..5))` / `Wrap(Inner(1..5))`).
             checkOrderingPatternOverNullableType(fieldTy, s.pattern.get());
@@ -16917,7 +16961,7 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                                 // Substitute the field type here so every slot
                                 // binding (below) sees the resolved form.
                                 if (fieldTy) {
-                                    fieldTy = substituteGenericCaseFieldType(
+                                    fieldTy = substituteGenericFieldType(
                                         fieldTy, scrutTy);
                                 }
                             }
@@ -17092,6 +17136,19 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                     if (i < fields.size() && fields[i]->posParam &&
                         fields[i]->posParam->type) {
                         fieldTy = ctx_.resolvedType(*fields[i]->posParam->type);
+                        // fix #3898 (§14.1 / §19.3, v0.294): a GENERIC
+                        // record's positional field may be declared at a bare
+                        // type parameter (`record Box<T>(X: T, Y: int)`); the
+                        // scrutinee's instantiation (`Box<int?>`) must be
+                        // substituted through here exactly as the choice-case
+                        // payload path above already does, or the
+                        // ordering-pattern gate just below sees the bare,
+                        // non-nullable `T` instead of the substituted `int?`
+                        // and wrongly admits `Box(1..5, 1)`.
+                        if (fieldTy) {
+                            fieldTy = substituteGenericFieldType(fieldTy,
+                                                                 scrutTy);
+                        }
                     }
                     // §19.3 (v0.294, #3692): slot-declared-type gate — see
                     // the choice-case call site above for the rationale.

@@ -112,26 +112,34 @@ BEZEL_TEST(case_relop_nullable_1074, relational_then_constant_arm_rejected_v0_26
 // sites (CaseExpr x CaseStmt, record x choice, top-level x nested), rather
 // than adding a further copy of slot-type resolution.
 //
-// ⚠ It does NOT close the gap for a GENERIC RECORD's field typed at a bare
-// type parameter (`record Box<T>(X: T, Y: int)`): the record positional-slot
-// loops resolve `fieldTy` from the record's declared (unsubstituted) field
-// type — there is no record analogue of the choice path's
-// `substituteGenericCaseFieldType`. Filed as issue 3898 rather than closed
-// here (needs a record-generic-field substitution helper, the same "further
-// copy or a refactor of the existing four" tradeoff #3298 already declined
-// for this exact reason).
+// ⚠ HISTORICAL (superseded below): at the revision this comment was
+// written, it did NOT close the gap for a GENERIC RECORD's field typed at a
+// bare type parameter (`record Box<T>(X: T, Y: int)`) — the record
+// positional-slot loops resolved `fieldTy` from the record's declared
+// (unsubstituted) field type, with no record analogue of the choice path's
+// substitution helper. That was filed as issue 3898 and is CLOSED for the
+// TOP-LEVEL (non-nested) case as of the fix landing in this file (see the
+// "fix #3898" comment block below, and its `*_rejected_3898` /
+// `*_still_admitted_3898`/`_3899` tests) — a residual NESTED-slot gap remains
+// open as issue 3938, also documented and tested below.
 //
-// That residual, sema-admitted path turns out to ALSO be independently
+// That then-residual, sema-admitted path turned out to ALSO be independently
 // broken in codegen, for an unrelated reason discovered while checking
 // whether it still reaches the SLOT-PATH-ONLY handlers correctly: filed as
-// issue 3899 (`RecordSubstGuard` for a destructuring arm is installed only
-// around the arm BODY, after `patternMatches` has already computed each
-// slot's `fieldTy` from the UNSUBSTITUTED declared type, so a generic
-// record's slot pattern is matched against the wrong LLVM shape). The
-// `generic_record_slot_ordering_pattern_ice_3899` row below pins that
-// CURRENT (loud, non-crashing — §6c is satisfied) codegen-error behaviour,
-// rather than asserting a specific D5 value for a path that does not
-// actually reach those handlers today.
+// issue 3899. ⚠ The issue's OWN filed root cause ("armSubst installed too
+// late, after patternMatches has already run") does NOT hold, per commit
+// 85c633a's own investigation: `patternMatches`'s record-scrutinee
+// DestructuringPattern branch installs its OWN `RecordSubstGuard`
+// (`destrSubst`) before its slot loops — `armSubst`/the arm-body guard is a
+// DIFFERENT one (fix #1254) and is not implicated here. (That stale framing
+// still lingers as a comment at LlvmBackend_Exprs2.cpp:10653-10709, added by
+// #3692 before 85c633a's investigation refuted it — tracked separately as
+// issue 3946; not fixed here.) The ACTUAL bug: the three slot-type-resolution
+// call sites in that branch read `fieldTy` via the bare `recordMemberType`
+// (the immediate, unsubstituted declared type) instead of
+// `recordMemberTypeResolved` (which consults the active substitution) —
+// CLOSED at commit 85c633a by swapping in `recordMemberTypeResolved` at all
+// three call sites — see the "fix #3899" comment block below.
 //
 // Both slot call sites in patternMatches's DestructuringPattern branch lower
 // a slot with `if (subMatch) matched = AND(matched, subMatch);`, so if the
@@ -140,27 +148,28 @@ BEZEL_TEST(case_relop_nullable_1074, relational_then_constant_arm_rejected_v0_26
 // unconditionally — a wrong answer, not a crash. A draft of #3298 deleted
 // the handlers as "dead code after the sema gate" and this exact program
 // returned 7 instead of 3. They are KEPT here too, unconditionally — see the
-// LlvmBackend_Exprs2.cpp SLOT-PATH ONLY comment for why they still matter
-// even though no CURRENTLY-WORKING accepted program reaches them: issue 3899
-// is precisely the kind of future fix (moving `RecordSubstGuard` earlier)
-// that would make a generic-record slot reach them again, correctly.
+// LlvmBackend_Exprs2.cpp SLOT-PATH ONLY comment for why they still matter.
+// Since #3898 landed, a TOP-LEVEL generic-record nullable slot with an
+// ordering pattern is REJECTED at sema (the `*_rejected_3898` rows below),
+// so it can no longer reach these handlers at all — but the NESTED shapes
+// #3898 does NOT close (issue 3938, `*_still_admitted_3899` rows below,
+// unchanged from before #3898) remain admitted and DO reach them: MEASURED
+// here, independently re-verifying #3899's own acceptance criterion, that
+// stubbing both `nv.range.match` and `nv.relop.match` to `return nullptr;`
+// flips `generic_record_slot_nested_pattern_no_match_still_admitted_3899`
+// from 3 to 7 — `if (subMatch) matched = AND(matched, subMatch);` skips a
+// nullptr'd slot test and the arm matches unconditionally, exactly the
+// "→ AND skipped → always matched" hazard above (the sibling `_3899` test,
+// whose correct value already IS 7, is unchanged by the stub — matching a
+// true outcome vacuously is indistinguishable from matching it for real, so
+// only the no-match row demonstrates the defect). Restored, both pass again.
 //
-// ⚠ MEASURED, via a review of this fix: with BOTH handlers stubbed to an
-// unconditional `return nullptr;`, every row in this file, every row in
-// lifted_operators_rejected_3298, five adjacent reachable-code-path sweeps,
-// and the whole lit corpus stay green — the regression these handlers exist
-// to prevent is CURRENTLY UNGUARDED by any passing test, because (as above)
-// no admitted program reaches them. The CHOICE side is closed at SEMA by
-// #3692's own fix (a nullable choice payload with an ordering pattern
-// rejects, non-generic and generic alike), so it never routes here in
-// principle. Searching that side did surface a further, unrelated bug
-// (issue 3902): choice payload slots are never checked at codegen for ANY
-// refutable pattern (constant, range, relational — nullability irrelevant).
-// That bug is real and severe, but it is NOT what forecloses this route, and
-// fixing it alone would NOT make these handlers reachable; only #3899's fix
-// does, via the record side. Issue 3899 now carries the
-// explicit acceptance criterion that closing it must ship a live
-// positive-lowering test that fails under this same stub.
+// The CHOICE side is closed at SEMA by #3692's own fix (a nullable choice
+// payload with an ordering pattern rejects, non-generic and generic alike).
+// Searching that side surfaced a further, unrelated bug (issue 3902): choice
+// payload slots are never checked at codegen for ANY refutable pattern
+// (constant, range, relational — nullability irrelevant) — real and severe,
+// but orthogonal to this file's gap.
 // ---------------------------------------------------------------------------
 
 namespace {
@@ -239,108 +248,141 @@ BEZEL_TEST(case_relop_nullable_1074, nullable_slot_constant_still_admitted_3692)
 }
 
 // ---------------------------------------------------------------------------
-// fix #3899 (§14.1 / §19.3, v0.294): CLOSED. The residual gap above (issue
-// 3898 / issue 3899) was that a GENERIC record's slot typed at a bare type
-// parameter (`Box<T>`'s `X: T`, instantiated `Box<int?>`) is not reached by
-// #3692's sema gate (issue 3898, still open — sema admits this program), and
-// was MEASURED to also not correctly reach the SLOT-PATH-ONLY codegen
-// handlers (`nv.range.match` / `nv.relop.match`, `LlvmBackend_Exprs2.cpp`)
-// either — it failed with a codegen-stage IR-verification error instead
-// (`icmp {i8,i32}, i32`, verified directly with the pre-fix `./build/bezelc`:
-// exits 1, no crash/signal, "IR verification failed").
+// fix #3899 (§14.1 / §19.3, v0.294): CLOSED codegen's half — once a generic
+// record's slot pattern over a nullable bare-type-parameter field IS admitted
+// (below), it correctly reaches the SLOT-PATH-ONLY nullable-value handlers
+// (`nv.range.match` / `nv.relop.match`, `LlvmBackend_Exprs2.cpp`) instead of
+// failing IR verification (`icmp {i8,i32}, i32`).
 //
-// Root cause: `patternMatches`'s record-scrutinee DestructuringPattern branch
-// already installs a `RecordSubstGuard` (`destrSubst`) before computing each
-// slot's field type, but computed it via the bare `recordMemberType` instead
-// of `recordMemberTypeResolved` — the helper that actually consults the
-// active substitution. `recordMemberType` returns the immediate, UNSUBSTITUTED
-// declared type (`T`, non-nullable), so the `isNullableVal` test just above
-// `nv.range.match`/`nv.relop.match` saw a non-nullable scrutinee for what is
-// actually a `{i8,i32}` nullable-value struct, and took the PLAIN dispatch
-// directly on the boxed struct. The fix swaps in `recordMemberTypeResolved`
-// at the three call sites in that branch, so the slot resolves to the
-// CONCRETE substituted type (`int?`) and correctly reaches the nullable-value
-// handlers below. This is the acceptance criterion issue 3899's own review
-// comment records: a live, sema-ADMITTED positive-lowering test that reaches
-// `nv.range.match`/`nv.relop.match` and asserts the correct value (verified
-// below by stubbing both handlers to `return nullptr;` — every one of these
-// tests flips, per the fix's commit message).
+// fix #3898 (§14.1 / §19.3, v0.294): CLOSED sema's half for the TOP-LEVEL
+// (non-nested) case — the case this file's tests exercised as "still
+// admitted" above. `ExprTC::substituteGenericFieldType` (generalized from the
+// choice-only `substituteGenericCaseFieldType` #2219 introduced) is now
+// called at the record-scrutinee slot-type-resolution sites too (CaseExpr and
+// CaseStmt), exactly as the choice-payload site already did, so
+// `Box<int?>`'s slot 0 resolves to the SUBSTITUTED `int?` before §19.3's
+// slot-level ordering-pattern gate (#3692) runs — and that gate now correctly
+// REJECTS `Box(1..5, 1)` over `Box<int?>`, symmetric with the non-generic
+// `R(1..5, 1)` over `R(X: int?, ...)` #3692 already rejected.
+//
+// This FLIPS every test below that exercises a TOP-LEVEL generic-record slot
+// with an ordering (range/relational) sub-pattern over its bare-type-param
+// field from a VALUE assertion to a REJECTION assertion — the program that
+// used to compile and compute 3/7/3 (D5's declined reading) now correctly
+// fails to compile, per the "fix must update existing tests" rule. Measured
+// as part of #3898's FAIL-WITHOUT/PASS-WITH: with `substituteGenericFieldType`
+// reverted to Choice-only, every `*_rejected_3898` row below FAILS (the
+// program still compiles and runs); restored, all pass.
+//
+// ⚠ NOT closed by #3898: a generic-record slot NESTED one level down inside
+// another destructuring pattern (`Outer(Box(1..5, 1), 9)`) or inside a
+// choice-case payload slot (`Val(Box(1..5, 1))`) — `bindNestedDestructuringNames`
+// resolves a nested pattern's record purely by NAME, with no substitution
+// context of any kind, so these remain wrongly ADMITTED. Filed as issue 3938
+// with the two repros below kept as explicit still-admitted controls
+// (`generic_record_slot_nested_pattern_3899` / `_in_choice_payload_3899` and
+// their `_no_match` siblings) rather than silently dropped.
 // ---------------------------------------------------------------------------
 
-// Non-matching case: X = 99 is not in 1..5 — the arm must NOT be selected.
-// Before the fix this hit a clean IR-verification failure instead of
-// running at all.
-BEZEL_TEST(case_relop_nullable_1074, generic_record_slot_range_pattern_no_match_3899) {
-    BEZEL_EXPECT_EQ(run(
+// The issue's own repro, RANGE form: `Box<T>(X: T, Y: int)` instantiated
+// `Box<int?>`, matched `Box(1..5, 1)`. Before #3898 this compiled and
+// returned 3/7/3 depending on X's value (D5's declined reading, MEASURED
+// above at commit 85c633a); it now rejects unconditionally, because the
+// rejection is on the PATTERN'S KIND, not on a runtime value — mirroring
+// `nullable_slot_range_rejected_3692`'s non-generic form above.
+BEZEL_TEST(case_relop_nullable_1074, generic_record_slot_range_pattern_rejected_3898) {
+    BEZEL_EXPECT_TRUE(rejectedAsNullableOrderingPattern(
         "module M; record Box<T>(X: T, Y: int); "
         "class C public static method Main(): int "
         "  var b := new Box<int?>(99, 1); "
         "  return (case b of Box(1..5, 1) => 7, _ => 3); "
-        "end Main; end C;"), 3);
+        "end Main; end C;"));
 }
 
-// Matching case: X = 3 is in 1..5 — the arm IS selected. Reaches
-// `nv.range.match` on a genuinely present nullable value.
-BEZEL_TEST(case_relop_nullable_1074, generic_record_slot_range_pattern_match_3899) {
-    BEZEL_EXPECT_EQ(run(
-        "module M; record Box<T>(X: T, Y: int); "
-        "class C public static method Main(): int "
-        "  var b := new Box<int?>(3, 1); "
-        "  return (case b of Box(1..5, 1) => 7, _ => 3); "
-        "end Main; end C;"), 7);
-}
-
-// Null scrutinee: a range pattern never matches null (§19.5) — hasValue is
-// false, so `nv.range.match`'s AND must short-circuit to false regardless of
-// the (absent) inner value.
-BEZEL_TEST(case_relop_nullable_1074, generic_record_slot_range_pattern_null_3899) {
-    BEZEL_EXPECT_EQ(run(
-        "module M; record Box<T>(X: T, Y: int); "
-        "class C public static method Main(): int "
-        "  var b := new Box<int?>(null, 1); "
-        "  return (case b of Box(1..5, 1) => 7, _ => 3); "
-        "end Main; end C;"), 3);
-}
-
-// Relational sub-pattern (`nv.relop.match`), same generic-field shape.
-BEZEL_TEST(case_relop_nullable_1074, generic_record_slot_relational_pattern_match_3899) {
-    BEZEL_EXPECT_EQ(run(
+// RELATIONAL form, same generic-field shape.
+BEZEL_TEST(case_relop_nullable_1074, generic_record_slot_relational_pattern_rejected_3898) {
+    BEZEL_EXPECT_TRUE(rejectedAsNullableOrderingPattern(
         "module M; record Box<T>(X: T, Y: int); "
         "class C public static method Main(): int "
         "  var b := new Box<int?>(10, 1); "
         "  return (case b of Box(> 5, 1) => 7, _ => 3); "
-        "end Main; end C;"), 7);
+        "end Main; end C;"));
 }
-BEZEL_TEST(case_relop_nullable_1074, generic_record_slot_relational_pattern_no_match_3899) {
+
+// Statement-position `case` (LlvmBackend_Stmts.cpp's `lowerCaseStmt` / the
+// CaseStmt sema handler) — a SEPARATE call site from the expression form
+// above; the fix's CaseStmt-side `substituteGenericFieldType` call must reach
+// it too.
+BEZEL_TEST(case_relop_nullable_1074, generic_record_slot_range_pattern_stmt_form_rejected_3898) {
+    BEZEL_EXPECT_TRUE(rejectedAsNullableOrderingPattern(
+        "module M; record Box<T>(X: T, Y: int); "
+        "class C public static method Main(): int "
+        "  var b := new Box<int?>(3, 1); "
+        "  case b of "
+        "    Box(1..5, 1) => do return 7; end, "
+        "    _ => do return 3; end "
+        "  end; "
+        "end Main; end C;"));
+}
+
+// A SECOND generic parameter position (`Pair<A,B>`, ordering on B) — the
+// substitution walk must match the RIGHT parameter by name, not just "the
+// first one" or "any one".
+BEZEL_TEST(case_relop_nullable_1074, generic_record_second_type_param_slot_rejected_3898) {
+    BEZEL_EXPECT_TRUE(rejectedAsNullableOrderingPattern(
+        "module M; record Pair<A, B>(X: A, Y: B); "
+        "class C public static method Main(): int "
+        "  var p := new Pair<int, int?>(1, 3); "
+        "  return (case p of Pair(1, 1..5) => 7, _ => 3); "
+        "end Main; end C;"));
+}
+
+// POSITIVE CONTROL 1 (§19.3 stays exactly as wide as it says): the SAME
+// generic-record slot shape instantiated at a NON-nullable type argument
+// (`Box<int>`, not `Box<int?>`) must remain ADMITTED and compute the correct
+// D5-style match value — the fix must reject only where the SUBSTITUTED type
+// is actually nullable, not every generic record slot.
+BEZEL_TEST(case_relop_nullable_1074, generic_record_slot_non_nullable_instantiation_still_admitted_3898) {
     BEZEL_EXPECT_EQ(run(
         "module M; record Box<T>(X: T, Y: int); "
         "class C public static method Main(): int "
-        "  var b := new Box<int?>(2, 1); "
-        "  return (case b of Box(> 5, 1) => 7, _ => 3); "
+        "  var b := new Box<int>(3, 1); "
+        "  return (case b of Box(1..5, 1) => 7, _ => 3); "
+        "end Main; end C;"), 7);
+    BEZEL_EXPECT_EQ(run(
+        "module M; record Box<T>(X: T, Y: int); "
+        "class C public static method Main(): int "
+        "  var b := new Box<int>(99, 1); "
+        "  return (case b of Box(1..5, 1) => 7, _ => 3); "
         "end Main; end C;"), 3);
 }
 
-// Two DIFFERENT instantiations of the same generic record matched in
-// sequence, in one function — exercises `RecordSubstGuard`'s save/restore
-// (the outer substitution must not leak between the two independent
-// `destrSubst` installs).
-BEZEL_TEST(case_relop_nullable_1074, generic_record_slot_two_instantiations_3899) {
+// POSITIVE CONTROL 2: two DIFFERENT instantiations of the same generic
+// record matched in sequence, in one function, via CONSTANT slots (not
+// ordering patterns, so neither triggers the new rejection) — exercises
+// `RecordSubstGuard`'s save/restore end to end (sema's `substituteGenericFieldType`
+// AND codegen's per-arm `destrSubst`) and proves the sema fix does not
+// perturb the non-ordering destructuring path at all.
+BEZEL_TEST(case_relop_nullable_1074, generic_record_slot_two_instantiations_value_admitted_3898) {
     BEZEL_EXPECT_EQ(run(
         "module M; record Box<T>(X: T, Y: int); "
         "class C public static method Main(): int "
         "  var a := new Box<int?>(3, 1); "
         "  var b := new Box<string?>(\"hi\", 1); "
-        "  var r1 := (case a of Box(1..5, 1) => 7, _ => 3); "
+        "  var r1 := (case a of Box(3, 1) => 7, _ => 3); "
         "  var r2 := (case b of Box(\"hi\", 1) => 11, _ => 13); "
         "  return r1 + r2; "
         "end Main; end C;"), 18);
 }
 
-// A generic record slot NESTED inside another destructuring pattern
-// (`Outer<T>(B: Box<T>, Z: int)`) — the substitution must chain through two
-// levels of `RecordSubstGuard` (per #766's "resolve a bare-param arg through
-// the outer subst").
-BEZEL_TEST(case_relop_nullable_1074, generic_record_slot_nested_pattern_3899) {
+// ⚠ Residual gap (issue 3938, NOT closed by #3898): a generic record slot
+// NESTED inside another destructuring pattern (`Outer<T>(B: Box<T>, Z:
+// int)`) — `bindNestedDestructuringNames` has no substitution context, so
+// `Box`'s own bare `T` is still resolved unsubstituted and this program stays
+// (wrongly, per §19.3) ADMITTED, computing the D5 value rather than
+// rejecting. Kept as an explicit still-admitted control, not silently
+// dropped, exactly as #3692 pinned this file's top-level case before #3898.
+BEZEL_TEST(case_relop_nullable_1074, generic_record_slot_nested_pattern_still_admitted_3899) {
     BEZEL_EXPECT_EQ(run(
         "module M; record Box<T>(X: T, Y: int); "
         "record Outer<T>(B: Box<T>, Z: int); "
@@ -349,7 +391,7 @@ BEZEL_TEST(case_relop_nullable_1074, generic_record_slot_nested_pattern_3899) {
         "  return (case o of Outer(Box(1..5, 1), 9) => 7, _ => 3); "
         "end Main; end C;"), 7);
 }
-BEZEL_TEST(case_relop_nullable_1074, generic_record_slot_nested_pattern_no_match_3899) {
+BEZEL_TEST(case_relop_nullable_1074, generic_record_slot_nested_pattern_no_match_still_admitted_3899) {
     BEZEL_EXPECT_EQ(run(
         "module M; record Box<T>(X: T, Y: int); "
         "record Outer<T>(B: Box<T>, Z: int); "
@@ -359,11 +401,13 @@ BEZEL_TEST(case_relop_nullable_1074, generic_record_slot_nested_pattern_no_match
         "end Main; end C;"), 3);
 }
 
-// A generic record slot inside a CHOICE-case payload — the choice-scrutinee
-// DestructuringPattern branch (fix #3902) resolves the payload's OWN type via
-// `common::substitutedChoicePayloadType`, then recurses into the record-
-// scrutinee branch this fix corrects for the nested `Box<T>` field.
-BEZEL_TEST(case_relop_nullable_1074, generic_record_slot_in_choice_payload_3899) {
+// ⚠ Residual gap (issue 3938): the identical nested shape via a CHOICE-case
+// payload — the choice-scrutinee DestructuringPattern branch (fix #3902)
+// resolves the payload's OWN type via `common::substitutedChoicePayloadType`
+// (or, at sema, `substituteGenericFieldType` since #3898), but the NESTED
+// `Box(1..5, 1)` sub-pattern still goes through the same
+// substitution-blind `bindNestedDestructuringNames`.
+BEZEL_TEST(case_relop_nullable_1074, generic_record_slot_in_choice_payload_still_admitted_3899) {
     BEZEL_EXPECT_EQ(run(
         "module M; record Box<T>(X: T, Y: int); "
         "choice Wrap<T> Val(B: Box<T>), None; end Wrap; "
@@ -372,7 +416,7 @@ BEZEL_TEST(case_relop_nullable_1074, generic_record_slot_in_choice_payload_3899)
         "  return (case w of Val(Box(1..5, 1)) => 7, _ => 3); "
         "end Main; end C;"), 7);
 }
-BEZEL_TEST(case_relop_nullable_1074, generic_record_slot_in_choice_payload_no_match_3899) {
+BEZEL_TEST(case_relop_nullable_1074, generic_record_slot_in_choice_payload_no_match_still_admitted_3899) {
     BEZEL_EXPECT_EQ(run(
         "module M; record Box<T>(X: T, Y: int); "
         "choice Wrap<T> Val(B: Box<T>), None; end Wrap; "
@@ -380,21 +424,6 @@ BEZEL_TEST(case_relop_nullable_1074, generic_record_slot_in_choice_payload_no_ma
         "  var w := Wrap<int?>.Val(new Box<int?>(99, 1)); "
         "  return (case w of Val(Box(1..5, 1)) => 7, _ => 3); "
         "end Main; end C;"), 3);
-}
-
-// Statement-position `case` (LlvmBackend_Stmts.cpp's `lowerCaseStmt`) shares
-// the same `patternMatches` helper the fix, so the shape closes for the
-// statement form too, not just the `(case … of …)` expression form.
-BEZEL_TEST(case_relop_nullable_1074, generic_record_slot_range_pattern_stmt_form_3899) {
-    BEZEL_EXPECT_EQ(run(
-        "module M; record Box<T>(X: T, Y: int); "
-        "class C public static method Main(): int "
-        "  var b := new Box<int?>(3, 1); "
-        "  case b of "
-        "    Box(1..5, 1) => do return 7; end, "
-        "    _ => do return 3; end "
-        "  end; "
-        "end Main; end C;"), 7);
 }
 
 // ---------------------------------------------------------------------------

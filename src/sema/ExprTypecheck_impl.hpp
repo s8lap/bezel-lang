@@ -1275,17 +1275,25 @@ private:
     // the case's payload field's TYPE may name a generic parameter `T` of the
     // choice declaration. That bare `T` must be substituted by the SCRUTINEE's
     // generic argument (`int`) so the slot binding is correctly typed and the
-    // arms' common-type computation sees the substituted form. Walks `ty`
-    // and substitutes every bare-name TypeRef whose declaration is a
+    // arms' common-type computation sees the substituted form. Extended by
+    // fix #3898 (§14.1 / §19.3, v0.294) to a GENERIC RECORD's positional
+    // field type the same way — a record declaration carries `genericParams`/
+    // instantiations carry `genericArgs` in the identical shape, so this one
+    // walk serves both `scrutTy->declaration->kind`s (Choice or Record)
+    // rather than a second, drifting copy for records. Walks `ty` and
+    // substitutes every bare-name TypeRef whose declaration is a
     // GenericParamSymbol of `scrutTy->declaration` with the corresponding
     // entry from `scrutTy->genericArgs`. Recurses into Named genericArgs,
     // InlineArray element types, Function parameter/return types, and the
-    // nullable wrapper. Returns `ty` unchanged when no substitution applies.
+    // nullable wrapper. Returns `ty` unchanged when no substitution applies
+    // (including when `scrutTy->declaration` is a class/interface/enum).
     // Mirrors (the field-walk part of) Resolver::applyGenericSubst +
     // buildBaseGenericSubst — local copy because the ExprTC worker has no
-    // Resolver handle (#1621 / §31.2.1 split).
-    TypeRef* substituteGenericCaseFieldType(const TypeRef* ty,
-                                            const TypeRef* scrutTy);
+    // Resolver handle (#1621 / §31.2.1 split). NOT threaded into
+    // `bindNestedDestructuringNames` (a nested slot's own scrutinee type is
+    // not available there) — see that function's comment and issue 3938.
+    TypeRef* substituteGenericFieldType(const TypeRef* ty,
+                                        const TypeRef* scrutTy);
 
     // Slice S21: does a callable with this return-type ascription
     // produce a value? No ascription → no (unit). An ascription that
