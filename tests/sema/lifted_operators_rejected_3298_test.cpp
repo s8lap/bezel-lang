@@ -76,23 +76,31 @@
 
 namespace {
 
+// fix #3958 (issue 3958) gated this on parse diagnostics so a program that
+// fails to parse never reaches sema here either — before that gate, a
+// malformed row's parser-error-recovery-truncated AST could still produce a
+// diagnostic this file's helpers matched, masking six grammar-invalid rows
+// (five missing-comma `CaseStmt` arms, one stray `end Identifier;` after an
+// arrow-bodied method) that "passed" for the wrong reason. All were
+// corrected to parse cleanly as part of that fix.
+//
+// test #3958 / fix #3996 (issue 3996): #3958's own gate checked
+// `!r.diagnostics.hasErrors()` AFTER `bezel::test::parseAndCollect`, which
+// always runs `collectSymbols` once `sourceFile` is non-null — so a
+// collectSymbols-stage error (e.g. a §3.4 reserved-primitive-alias-name
+// rejection) would have incorrectly also gated `resolveTypes`/
+// `typecheckExpressions` here, unlike the real driver (Driver.cpp ~473-489),
+// which evaluates its own gate once, immediately after parsing and BEFORE
+// collectSymbols runs, then runs collectSymbols/resolveTypes/
+// typecheckExpressions unconditionally inside that one surviving branch
+// (issue 3996 found and fixed the identical defect in the shared
+// tests/support/sema_support.hpp helpers this file's shape matches).
+// Delegates to that shared, correctly-gated helper instead of keeping a
+// second, independently-drifting copy of the same gate (CLAUDE.md's
+// duplicated-classification-predicate caution) — one authority beats a
+// corrected copy.
 bezel::test::SemaResult parseSemaAll(std::string_view src) {
-    auto r = bezel::test::parseAndCollect(src);
-    // fix #3958: gate on parse diagnostics exactly as the real driver does
-    // (src/driver/Driver.cpp ~473, ~672: `if (unit && !diagnostics.
-    // hasErrors()) { ... resolveTypes/typecheckExpressions ... }`) so a
-    // program that fails to parse never reaches sema here either. Before
-    // this gate, a malformed row's parser-error-recovery-truncated AST
-    // could still produce a diagnostic this file's helpers matched,
-    // masking six grammar-invalid rows (five missing-comma `CaseStmt`
-    // arms, one stray `end Identifier;` after an arrow-bodied method) that
-    // "passed" for the wrong reason. All were corrected to parse cleanly
-    // as part of this fix.
-    if (r.sourceFile && r.ctx && !r.diagnostics.hasErrors()) {
-        bezel::sema::resolveTypes(*r.sourceFile, *r.ctx);
-        bezel::sema::typecheckExpressions(*r.sourceFile, *r.ctx);
-    }
-    return r;
+    return bezel::test::parseAndTypecheckGated(src);
 }
 
 // §7.11 / #3298: the diagnostic family the new gate emits. ALL three
