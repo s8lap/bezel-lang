@@ -120,19 +120,6 @@ NAME_MARKERS = (
 )
 
 
-def _balanced_body(text, open_brace_idx):
-    """Return the text between the brace at open_brace_idx and its match."""
-    depth = 0
-    for j in range(open_brace_idx, len(text)):
-        if text[j] == '{':
-            depth += 1
-        elif text[j] == '}':
-            depth -= 1
-            if depth == 0:
-                return text[open_brace_idx + 1:j]
-    return text[open_brace_idx + 1:]
-
-
 # The literal the toolchain-unavailable bail-out idiom hardcodes. Found under
 # BOTH `wasSkipped` and `aotWasSkipped` spellings (248 combined in-file
 # copies) - always exactly this fixed literal, e.g.:
