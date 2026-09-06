@@ -20661,8 +20661,6 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
         //     and no MemberSymbols; their members are dispatched by name in
         //     codegen, not via sema symbols. (Reached via the `!targetType->decl`
         //     branch above; we never get here for them with a non-null decl.)
-        //   - Interfaces: default/inherited interface-member resolution is not
-        //     complete here, so an interface-typed receiver is not known-complete.
         //   - The universal `Object` members (§8.1) — `GetType`, `Equals`,
         //     `GetHashCode`, `ToString`, `ReferenceEquals` — and `Dispose`
         //     (§8.7, on every non-static class) exist on EVERY type without a
@@ -20685,8 +20683,36 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
         // completeness is not yet guaranteed (the #428 family — #783/#710/#711),
         // so imported generics stay permissive to avoid a false rejection.
         // Builtin types (Console, Math, …) are NOT imported, so they keep their
-        // null-decl permissive path; imported INTERFACES have kind Interface and
-        // are excluded by the kind check (their member resolution is incomplete).
+        // null-decl permissive path.
+        //
+        // fix #3953 (§11.2/§11.3/§8.1, v0.294): widened to also cover
+        // `TypeDeclKind::Interface`. The comment above this block used to say
+        // interface member resolution was "not complete here", but that is
+        // stale: `lookupMember` (ExprTypecheck.cpp) BFS-walks `members` AND
+        // `baseTypes` for ANY `TypeSymbol`, and `collectTypeDecl`
+        // (SymbolCollection.cpp) / the importer's equivalent
+        // (ModuleLoader.cpp) populate both uniformly for every
+        // `ast::TypeDeclKind`, interfaces included — an interface's own
+        // declared members AND every extended interface's members (§11.2
+        // multiple interface inheritance) are already fully in `members`/
+        // `baseTypes` by the time this function runs, local or imported
+        // alike. So a member name that reaches here having failed
+        // `lookupMember` AND `lookupExtensionMember` on an interface-typed
+        // receiver genuinely does not exist on that interface — exactly the
+        // same confidence the class/record/enum/choice case already has.
+        // Before this fix, `b.Extra` (`b: IFoo`, `Extra` declared only on the
+        // *implementing* class, not on `IFoo`) sailed through this gate
+        // un-diagnosed, reached codegen's "permissive acceptance" backstop
+        // (LlvmBackend_Exprs.cpp / LlvmBackend_Calls2.cpp), and silently
+        // zero-filled at runtime — exit 0, no diagnostic, wrong value. §11.2
+        // is unambiguous that an interface-typed value exposes only the
+        // interface's own declared (and inherited) instance surface; §8.1's
+        // universal Object members are still exempted by name just below,
+        // exactly as for the other known-complete kinds. (Static interface
+        // members, §11.8, are already rejected before reaching here by the
+        // separate §22.12 "static member must be accessed through the type
+        // name" gate, since `lookupMember` finds them as real symbols; §11.8
+        // is not otherwise implicated by this widening.)
         bool importedKnownCompleteUserType =
             ctx_.isImported(targetType) && targetType->genericParams.empty();
         bool knownCompleteUserType =
@@ -20694,7 +20720,8 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
             (targetType->kind == ast::TypeDeclKind::Class ||
              targetType->kind == ast::TypeDeclKind::Record ||
              targetType->kind == ast::TypeDeclKind::Enum ||
-             targetType->kind == ast::TypeDeclKind::Choice);
+             targetType->kind == ast::TypeDeclKind::Choice ||
+             targetType->kind == ast::TypeDeclKind::Interface);
         // §8.1 / §8.7: universal members present on every type without a
         // MemberSymbol — never diagnose these as missing.
         const auto& mm = ma.member;
@@ -20842,6 +20869,54 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
             auto nmLoc = ma.span.begin;
             if (nmLoc.line == 0 && ma.target)
                 nmLoc = ma.target->span.begin;
+            // fix #3953 (§11.2/§11.3/§8.1/§17.4, v0.294): an interface-typed
+            // receiver gets its OWN "no member" wording, not the record/
+            // class/enum/choice one reused verbatim. The generic wording
+            // ("no member `M` on type `T`") is silent on WHY — for a
+            // class/record/enum/choice receiver there is nothing more to
+            // say, but for an interface the natural question is "doesn't
+            // the underlying object have this member?", and the answer is a
+            // deliberate abstraction boundary (§11.2): a value typed as an
+            // interface exposes only that interface's own declared (and
+            // inherited, via extended interfaces) surface, never the
+            // concrete conforming type's extra members. Name that boundary
+            // explicitly and give the two remedies that actually work —
+            // narrow to the concrete type (`is`/`as`, §17.4), whose own
+            // member is then reachable via the ordinary class/record path
+            // just below; or add the member to the interface's own
+            // declaration (§11.2) if every conformer should provide it.
+            // This mirrors the precedent set by fix #3929/#3952 (operator
+            // overloading on an interface operand): that fix gave interfaces
+            // a THIRD diagnostic spelling rather than reuse record/class
+            // wording that would have sent the user down a path that cannot
+            // fix their code ("declare a matching operator" is unreachable
+            // through a plain interface-typed value, §11.8). The situation
+            // here is the mirror image: the record/class wording says
+            // nothing actionable at all, where a real remedy exists and is
+            // verified working (see the remedy_narrow_with_is_works,
+            // remedy_narrow_with_as_works and remedy_declare_on_iface_works
+            // controls in unknown_member_interface_3953_test.cpp).
+            std::string noMemberMsg =
+                targetType->kind == ast::TypeDeclKind::Interface
+                    ? (std::string("no member `") + std::string(ma.member) +
+                       "` on interface `" + std::string(targetType->name) +
+                       "` (§11.2/§11.3): a value of interface type `" +
+                       std::string(targetType->name) +
+                       "` exposes only members declared on `" +
+                       std::string(targetType->name) +
+                       "` itself or inherited from an interface it extends "
+                       "— even when the underlying object's concrete type "
+                       "declares more members, they are not reachable "
+                       "through this interface-typed reference (§11.2). "
+                       "Narrow to the concrete type first (`is`/`as`, "
+                       "§17.4) to reach `" + std::string(ma.member) +
+                       "` there, or add `" + std::string(ma.member) +
+                       "` to `" + std::string(targetType->name) +
+                       "`'s own declaration (§11.2) if every conforming "
+                       "type should provide it")
+                    : (std::string("no member `") + std::string(ma.member) +
+                       "` on type `" + std::string(targetType->name) +
+                       "` (§11.3, §12.1)");
             // fix #2328 (§26.5, v0.236): if `currentCallArity_ >= 0` the
             // arity-aware `lookupExtensionMember` calls above silently
             // returned null (no candidate with the call's arity), and the
@@ -20930,18 +21005,12 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                             std::to_string(currentCallArity_) +
                             " argument(s) (§26.5)");
                 } else {
-                    ctx_.diagnostics().report(
-                        Severity::Error, nmLoc,
-                        std::string("no member `") + std::string(ma.member) +
-                            "` on type `" + std::string(targetType->name) +
-                            "` (§11.3, §12.1)");
+                    ctx_.diagnostics().report(Severity::Error, nmLoc,
+                                               noMemberMsg);
                 }
             } else {
-                ctx_.diagnostics().report(
-                    Severity::Error, nmLoc,
-                    std::string("no member `") + std::string(ma.member) +
-                        "` on type `" + std::string(targetType->name) +
-                        "` (§11.3, §12.1)");
+                ctx_.diagnostics().report(Severity::Error, nmLoc,
+                                           noMemberMsg);
             }
         }
         // #608 / §8.5 / §12: `ToString()` is universal and returns `string`.
@@ -21740,6 +21809,15 @@ void ExprTC::resolveNullCondMember(const ast::NullCondMemberExpr& nm) {
             // by this gate even though the `.` form accepts the same access —
             // the EXACT mismatch the issue calls out, replayed on a built-in
             // surface member.
+            //
+            // fix #3953 (§11.2/§11.3/§8.1, v0.294): widened to also cover
+            // `TypeDeclKind::Interface`, mirroring the SAME widening in
+            // resolveMemberAccess's `knownCompleteUserType` above (see its
+            // comment for why interface member resolution is in fact
+            // complete here, not incomplete as an earlier comment claimed).
+            // Before this fix `b?.Extra` (`b: IFoo?`, `Extra` declared only
+            // on the implementing class) exhibited the identical gap as the
+            // `.` form: silently un-diagnosed, zero-filled at runtime.
             if (targetType &&
                 (targetType->decl != nullptr ||
                  (ctx_.isImported(targetType) &&
@@ -21747,7 +21825,8 @@ void ExprTC::resolveNullCondMember(const ast::NullCondMemberExpr& nm) {
                 (targetType->kind == ast::TypeDeclKind::Class ||
                  targetType->kind == ast::TypeDeclKind::Record ||
                  targetType->kind == ast::TypeDeclKind::Enum ||
-                 targetType->kind == ast::TypeDeclKind::Choice)) {
+                 targetType->kind == ast::TypeDeclKind::Choice ||
+                 targetType->kind == ast::TypeDeclKind::Interface)) {
                 bool isUniversalObjectMember =
                     mbr == "ToString" || mbr == "Equals" ||
                     mbr == "GetHashCode" || mbr == "GetType" ||
@@ -21759,11 +21838,36 @@ void ExprTC::resolveNullCondMember(const ast::NullCondMemberExpr& nm) {
                     builtinExceptionSurfaceMember(targetType, mbr) !=
                         BuiltinExcMember::None;
                 if (!isUniversalObjectMember && !isBuiltinExcSurface) {
-                    ctx_.diagnostics().report(
-                        Severity::Error, nmLoc,
-                        std::string("no member `") + std::string(mbr) +
-                        "` on type `" + std::string(targetType->name) +
-                        "` (§11.3, §12.1)");
+                    // fix #3953: reuse the SAME interface-vs-other wording
+                    // split as the `.` form (resolveMemberAccess) rather than
+                    // writing a second, drifting spelling of the interface
+                    // message.
+                    std::string noMemberMsg =
+                        targetType->kind == ast::TypeDeclKind::Interface
+                            ? (std::string("no member `") +
+                               std::string(mbr) + "` on interface `" +
+                               std::string(targetType->name) +
+                               "` (§11.2/§11.3): a value of interface type `" +
+                               std::string(targetType->name) +
+                               "` exposes only members declared on `" +
+                               std::string(targetType->name) +
+                               "` itself or inherited from an interface it "
+                               "extends — even when the underlying object's "
+                               "concrete type declares more members, they "
+                               "are not reachable through this "
+                               "interface-typed reference (§11.2). Narrow "
+                               "to the concrete type first (`is`/`as`, "
+                               "§17.4) to reach `" + std::string(mbr) +
+                               "` there, or add `" + std::string(mbr) +
+                               "` to `" + std::string(targetType->name) +
+                               "`'s own declaration (§11.2) if every "
+                               "conforming type should provide it")
+                            : (std::string("no member `") +
+                               std::string(mbr) + "` on type `" +
+                               std::string(targetType->name) +
+                               "` (§11.3, §12.1)");
+                    ctx_.diagnostics().report(Severity::Error, nmLoc,
+                                               noMemberMsg);
                 }
             }
         }
