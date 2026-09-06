@@ -5303,6 +5303,83 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
             return;
         }
     }
+    // fix #3903 (§3.1/§3.4/§3.5/§8.1/§25/§26.3, v0.294): `Object` is a class
+    // (§3.1 "Every type derives from `Object`" lists it separately from the
+    // primitive VALUE types; §3.4 "`Object` is a class"; §8.1 gives its fixed
+    // member surface), but the implementation represents an `Object`-typed
+    // operand as `TypeRef::Kind::Primitive`/`PrimitiveType::Object` (so boxing,
+    // `is`/`as`, etc. can treat it uniformly with the true primitives). Every
+    // "operator requires a declared overload" gate above and below keys off
+    // `TypeRef::Kind::Named` (the record/class/interface/choice checks) or an
+    // enumerated primitive kind (the bitwise/mod/nullable checks) — `Object`
+    // matches neither, so it fell through every one of them and reached the
+    // generic result-type rules typed as an ordinary primitive.
+    //
+    // §3.5 defines the intrinsic arithmetic/bitwise/shift/ordering operators
+    // over an enumerated list of primitive value types that does not include
+    // `Object`. Per §25, `Object` could only acquire one of these operators by
+    // declaring a `static method operator` overload in its own body — but §8.1
+    // fixes that body to exactly `GetType`/`Equals`/`GetHashCode`/`ToString`/
+    // `ReferenceEquals` ("User code cannot redeclare or replace `Object`"),
+    // and an extension block cannot add one either (§26.3 "No operator
+    // overloads"). So `Object` has no way to acquire any of these operators —
+    // the same "no applicable overload" verdict a record/class/interface/
+    // choice with no matching declaration gets elsewhere in this function,
+    // just reached because there is structurally no path to declare one.
+    // `=`/`<>` are excluded: §8.4 gives every type `=`/`<>` via `Equals`, and
+    // `Object`'s inherited (reference-equality, §8.3) `Equals` already answers
+    // them correctly through the ordinary dispatch path — this gate does not
+    // apply to them.
+    //
+    // Measured on HEAD before this fix: `Object + int`/`Object - Object`/
+    // `Object * int`/`Object / int`/`Object mod int` were typed `Object` (the
+    // left operand's own type, via the "result follows lt" rule far below) and
+    // died in LLVM's IR verifier ("Both operands to a binary operator are not
+    // of the same type!", an add/sub/mul/sdiv/srem between a `ptr` and an
+    // `i32`). `Object & int`/`Object | int`/`Object ^ int` didn't even crash —
+    // they hit the unrelated #2434 lower-to-zero backstop and silently
+    // compiled to a WRONG value (a zero-initialized slot, with only an
+    // "internal:" stderr note and exit 0). `Object < int` reached the generic
+    // relational fallback (typed `bool`) and died in IR verification the same
+    // way as arithmetic; `Object > Object` reached the SAME fallback but
+    // compiled cleanly to a raw pointer `icmp` — an order over heap addresses
+    // that violates §30.13's determinism guarantee, with no crash and no
+    // diagnostic at all. One clean rejection replaces all of these.
+    if (op == "+" || op == "-" || op == "*" || op == "/" || op == "mod" ||
+        op == "&" || op == "|" || op == "^" || op == "<<" || op == ">>" ||
+        op == "<" || op == ">" || op == "<=" || op == ">=") {
+        auto isObjectPrim = [](const TypeRef* t) {
+            return t && t->kind == TypeRef::Kind::Primitive &&
+                   t->primitive == PrimitiveType::Object;
+        };
+        TypeRef* objLt = be.left  ? ctx_.exprType(*be.left)  : nullptr;
+        TypeRef* objRt = be.right ? ctx_.exprType(*be.right) : nullptr;
+        if (isObjectPrim(objLt) || isObjectPrim(objRt)) {
+            bool relational =
+                (op == "<" || op == ">" || op == "<=" || op == ">=");
+            ctx_.diagnostics().report(
+                Severity::Error, be.span.begin,
+                "operator `" + std::string(op) + "` is not defined for type "
+                "`Object` (\xC2\xA7""25) \xE2\x80\x94 `Object`'s declared "
+                "surface is fixed (\xC2\xA7""8.1) and an extension block "
+                "cannot add an operator overload (\xC2\xA7""26.3), so no `" +
+                std::string(op) + "` overload can ever be declared for it; "
+                "only `=`/`<>` are defined on `Object` (\xC2\xA7""8.4, via "
+                "`Equals`). Narrow to a concrete type first (`is`/`as`, "
+                "\xC2\xA7""17.4).");
+            if (relational) {
+                ctx_.setExprType(&be,
+                                 ctx_.primitiveTypeRef(PrimitiveType::Bool));
+            } else if (!isObjectPrim(objLt) && objLt) {
+                ctx_.setExprType(&be, objLt);
+            } else if (!isObjectPrim(objRt) && objRt) {
+                ctx_.setExprType(&be, objRt);
+            } else {
+                ctx_.setExprType(&be, ctx_.primitiveTypeRef(PrimitiveType::Int));
+            }
+            return;
+        }
+    }
     // §25.2 (#746 R41-C): a relational operator (`<`, `>`, `<=`, `>=`) on a
     // record/class operand requires a matching user-defined overload — none is
     // auto-generated. A partial comparison group (e.g. only `<`/`>` declared,

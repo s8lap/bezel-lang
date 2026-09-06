@@ -213,34 +213,32 @@ BEZEL_TEST(codegen_narrowed_value_op_arg_release_3116,
 }
 
 // =====================================================================
-// CONTROL — a non-narrowed binary operator on an `Object` MUST still leak
-// the box. Outside a §12.7 narrowed block the resolved type of `o` stays
-// `Object`, the `isNarrowedRead` predicate declines, and the conservative
-// escape classification keeps the wrapper's scope-end release suppressed.
-// Pins that the new widening is gated on the narrowing — not a blanket
-// "binary op on an Object is safe".
+// CONTROL — a non-narrowed binary operator on an `Object` is now a CLEAN
+// SEMA REJECTION, not a leak. Outside a §12.7 narrowed block the resolved
+// type of `o` stays `Object`, so this row never reaches the box-escape/
+// release path this file otherwise exercises — there is no box to leak.
 //
-// ⚠ fix #3895 (issue #3892) FINDING: this row's own comment claims the
-// program leaks (480 B / 20 iters, LSan-flagged) and was pinned with a bare
-// a bare `!ran` claim (the shape issue #3892 is about), which cannot tell that apart from ANY other
-// `!ran` outcome. Measured directly (`bezelc --sanitize=address` on this
-// EXACT program, and separately via a live gtest run with the honest
-// assertion below): the program does NOT reach the box-escape/leak path at
-// all — sema admits `o + 1` for `o: Object` with no matching `operator +`,
-// and codegen emits `%_ = add ptr %o, i32 1` (an int literal added to a
-// pointer), which fails LLVM's IR verifier before the program ever runs.
-// This row has therefore never exercised what it claims to since it was
-// written — it passed only because a bare `!ran` cannot distinguish "leaked
-// as the comment describes" from "rejected earlier for an unrelated
-// reason". Filed as issue 3903 (sema should reject `Object + int` with a
-// clean §5/§6 diagnostic, the way operator_operand_order_1096_test.cpp's
-// family does for undeclared record operators, instead of reaching codegen
-// with mismatched LLVM types). Pinning the ACTUAL current behavior here
-// (rather than reverting to the disproven bare `!ran`) so this row still
-// catches an actual regression (e.g. a crash) without asserting something
-// the compiler does not do.
+// History: this row's original (#3116-era) comment claimed the program
+// leaks (480 B / 20 iters, LSan-flagged) and was pinned with a bare `!ran`
+// claim. Fix #3895 (issue #3892) found that claim false — the program does
+// NOT reach the box-escape/leak path at all: sema admitted `o + 1` for
+// `o: Object` with no matching `operator +`, and codegen emitted
+// `%_ = add ptr %o, i32 1` (an int literal added to a pointer), which
+// failed LLVM's IR verifier before the program ever ran. #3895 pinned that
+// ACTUAL (buggy) behavior as issue 3903, rather than reverting to the
+// disproven leak claim.
+//
+// fix #3903 (§3.1/§3.4/§3.5/§8.1/§25/§26.3, v0.294): sema's binary-operator
+// typecheck (`ExprTypecheck_Exprs.cpp`'s `typeBinary`) now rejects an
+// `Object`-typed operand of `+`/`-`/`*`/`/`/`mod`/`&`/`|`/`^`/`<<`/`>>`/`<`/
+// `>`/`<=`/`>=` with a clean diagnostic — the same "no applicable overload"
+// verdict `operator_operand_order_1096_test.cpp`'s family gets for an
+// undeclared record operator — instead of reaching codegen typed as an
+// ordinary primitive. This row is re-pinned a second time to assert the
+// diagnostic TEXT of the fix rather than the codegen crash it replaces; see
+// `binary_op_object_operand_rejected_3903_test.cpp` for the full grid.
 BEZEL_TEST(codegen_narrowed_value_op_arg_release_3116,
-           unnarrowed_object_binary_op_still_leaks_as_expected) {
+           unnarrowed_object_binary_op_rejected_by_sema_3903) {
     JitResult r = runAotChecked(
         "module M; class C "
         "  public static method Main(): int "
@@ -254,10 +252,14 @@ BEZEL_TEST(codegen_narrowed_value_op_arg_release_3116,
         "  end Main; "
         "end C;");
     if (wasSkipped(r)) return;
-    // fix #3895 (issue #3892): pins the ACTUAL current rejection (see the
-    // ⚠ finding above, issue 3903) — a genuine IR-verification failure, not
-    // a runtime crash/signal, which a bare `!ran` cannot distinguish.
-    BEZEL_EXPECT_TRUE(failedAtCompileTimeNotRuntime(r));
+    // fix #3903: a clean sema rejection at a real source location, naming
+    // the operator and `Object` — never `hasErrors()`/`!ran` alone, which
+    // could not tell this apart from the IR-verification crash it replaces.
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(
+        r, "operator `+` is not defined for type `Object`"));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "\xC2\xA7""25"));
+    BEZEL_EXPECT_FALSE(diagnosticMessageContains(r, "IR verification failed"));
 }
 
 // =====================================================================
