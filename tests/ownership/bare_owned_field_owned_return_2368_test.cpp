@@ -240,11 +240,24 @@ BEZEL_TEST(bare_owned_field_owned_return_2368,
 }
 
 // A BARE read of a NON-owned field through an `owned` return — `f` is not
-// owned, so §28.6 bullet 2 does not fire. (This is a borrow-laundering shape
-// caught elsewhere if at all; #2368's check is `exprIsOwnedFieldRead`-gated.)
-// Must compile through #2368's check.
+// owned, so §28.6 bullet 2 does not fire; #2368's check is
+// `exprIsOwnedFieldRead`-gated and correctly stays silent here.
+//
+// UPDATED for issue #3993: this row originally asserted "must compile
+// through #2368's check" — true of #2368's OWN narrow scope, but the row's
+// comment already flagged the gap ("a borrow-laundering shape caught
+// elsewhere if at all") and #3993 is that "elsewhere": `f` is a plain
+// (non-owned) field — a BORROW of whatever `Holder`'s constructor was handed
+// — so `Take(): owned Foo => f;` hands the caller a second owner of an
+// object `f0`'s real owner also disposes, exactly the issue's shape one
+// level removed through a field instead of a bare parameter. The new
+// `checkOwnedReturnDirectBorrow` (§28.3 *Borrow lifetime rules*, §28.6
+// *Methods returning `this`*) now rejects it — measured via ASan on an
+// analogous concrete repro (an `OwningArray<Cell>` borrowed field returned
+// the same way SEGVs in `bz_array_free` on a second, disposed-already
+// container).
 BEZEL_TEST(bare_owned_field_owned_return_2368,
-           nonowned_field_owned_return_clean) {
+           nonowned_field_owned_return_rejected_spec_3993) {
     auto r = parseAndCheckOwnership(mod(
         "class Foo end Foo; "
         "class Holder "
@@ -252,5 +265,11 @@ BEZEL_TEST(bare_owned_field_owned_return_2368,
         "  public constructor(f0: Foo) f := f0; end constructor; "
         "  public method Take(): owned Foo => f; "
         "end Holder;"));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(
+        errorSays(r, "a borrow cannot be returned as an `owned` value"));
+    // #2368's OWN check must stay silent — this is #3993's diagnostic, not a
+    // duplicate of #2368's "bare read of an owned field" one (the field here
+    // is not `owned`).
+    BEZEL_EXPECT_FALSE(errorSays(r, std::string(kRepro)));
 }

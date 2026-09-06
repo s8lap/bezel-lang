@@ -190,37 +190,69 @@ BEZEL_TEST(owning_iterable_head_borrow_return_2369,
 // ACCEPT controls: shapes the fix must NOT regress.
 // ===========================================================================
 
-// An explicit `owned` return type makes the container-ownership transfer
-// explicit; `checkBorrowReturnedThroughOwningType` early-returns on
-// `returnOwned_` and the rule does not fire. Proves the fix rejects only the
-// UNMARKED spelling (the #1787 surface) and leaves the `owned` transfer path
-// intact for each of the three newly-inspected heads.
+// UPDATED for issue #3993: these three rows originally asserted that an
+// explicit `owned` return type EXEMPTS the return from THIS file's #2369
+// rule ("`checkBorrowReturnedThroughOwningType` early-returns on
+// `returnOwned_` and the rule does not fire") — true of #2369's OWN narrow
+// scope (it only ever ran for the UNMARKED case), but nothing else verified
+// that the returned expression is actually owned when `owned` IS declared:
+// `a` is a plain borrowed parameter, and each of these four heads extends
+// `IDisposable` (`IOwningEnumerator<T>`, `IOwningAsyncEnumerable<T>`,
+// `IOwningAsyncEnumerator<T>` — stdlib §4.13) — so labeling the borrow
+// "owned" hands the caller a second owner of an object its real owner also
+// disposes. Measured via ASan on a concrete `IOwningEnumerator<T>`
+// conformer with a real destructor, borrowed through this exact `Id` shape
+// and returned `owned`: SEGV in the interface's itable dispatch on the
+// second (already-freed) disposal. The new `checkOwnedReturnDirectBorrow`
+// (§28.3 *Borrow lifetime rules*) rejects all three — NOT exempted by
+// `owned`, exactly like the unmarked case `owning_iterable_head_borrow_
+// return_2369`'s REJECT rows above already cover. (`IOwningEnumerable<T>`,
+// the fourth owning head, is covered by
+// `borrow_return_owning_type_1007_test.cpp`'s analogous update — this file
+// never had an "exempt" row for it.)
 BEZEL_TEST(owning_iterable_head_borrow_return_2369,
-           owned_return_type_exempt_for_iowning_enumerator) {
+           owned_return_type_borrow_rejected_for_iowning_enumerator_3993) {
     auto r = parseAndCheckOwnership(mod(
         "class P "
         "  public static method Id(a: IOwningEnumerator<Cell>): "
         "      owned IOwningEnumerator<Cell> => a; "
         "end P;"));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
 
 BEZEL_TEST(owning_iterable_head_borrow_return_2369,
-           owned_return_type_exempt_for_iowning_async_enumerable) {
+           owned_return_type_borrow_rejected_for_iowning_async_enumerable_3993) {
     auto r = parseAndCheckOwnership(mod(
         "class P "
         "  public static method Id(a: IOwningAsyncEnumerable<Cell>): "
         "      owned IOwningAsyncEnumerable<Cell> => a; "
         "end P;"));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
 
 BEZEL_TEST(owning_iterable_head_borrow_return_2369,
-           owned_return_type_exempt_for_iowning_async_enumerator) {
+           owned_return_type_borrow_rejected_for_iowning_async_enumerator_3993) {
     auto r = parseAndCheckOwnership(mod(
         "class P "
         "  public static method Id(a: IOwningAsyncEnumerator<Cell>): "
         "      owned IOwningAsyncEnumerator<Cell> => a; "
+        "end P;"));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// The genuine owned producer through the SAME owned-declared return type is
+// NOT over-rejected — a fresh producing call result is not a borrow.
+// `IOwningEnumerator<Cell>` has no user-declarable `new` form reachable
+// without an owning collection; use the stdlib factory chain instead —
+// `OwningArray<Cell>.Drain()` mints a fresh `IOwningEnumerable<Cell>` view
+// (stdlib §4.5), whose `.GetOwningEnumerator()` mints the fresh enumerator
+// (stdlib §4.13) — to keep the control minimal and self-contained.
+BEZEL_TEST(owning_iterable_head_borrow_return_2369,
+           owned_return_type_fresh_producer_for_iowning_enumerator_accepted) {
+    auto r = parseAndCheckOwnership(mod(
+        "class P "
+        "  public static method Make(a: OwningArray<Cell>): "
+        "      owned IOwningEnumerator<Cell> => a.Drain().GetOwningEnumerator(); "
         "end P;"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }

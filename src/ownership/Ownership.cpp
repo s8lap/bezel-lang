@@ -1334,6 +1334,11 @@ void MethodOwnership::runExprBodyOwningReturnCheck(
     // `b` is a BORROW returned as owned (double-free). A no-op unless the return
     // type is `owned` and the body is `move <borrow>`. // per §28.6, §28.8
     checkOwnedReturnBorrowSource(exprBody);
+    // §28.3 *Borrow lifetime rules* / §28.6 *Methods returning `this`* (issue
+    // #3993): the `=>` expression-body sibling of the handleReturn call —
+    // rejects `Pick(a: Res, b: Res): owned Res => b;` (a borrowed parameter
+    // returned through an `owned` return type, double-free). // per §28.3, §28.6
+    checkOwnedReturnDirectBorrow(exprBody);
     // #1530 (§30.3 / §30.5): the expression-body sibling of `checkResultSites`
     // — an expression-bodied method's `=>` body can read `.Result` on a
     // class-typed `Task<T>` (`M(): Conn => t.Result;`) just as a block body
@@ -7063,6 +7068,15 @@ void MethodOwnership::handleReturn(const ast::Expr& e) {
     // field chain) is admitted — its lifetime is wider than the call. // per
     // §28.3 v0.226, stdlib §4.5 v0.195, #2175
     checkReturnDrainFromScopeBoundReceiver(e);
+    // §28.3 *Borrow lifetime rules* / §28.6 *Methods returning `this`* (issue
+    // #3993): reject a direct (non-`move`, non-owned-field-read) borrow
+    // returned through an `owned` return type — a borrowed parameter, `this`,
+    // a non-`owned` field, an indexer-get, or a Borrowed-state local. Run
+    // BEFORE the bare-identifier fast path below (which would otherwise
+    // unconditionally mark a returned borrowed parameter "disposed" with no
+    // regard to the declared return type — the double-free this closes).
+    // // per §28.3, §28.6
+    checkOwnedReturnDirectBorrow(e);
     // For slice O1, treat `return x;` (bare identifier) as a
     // discharge. The "is the method's return type owned T?" check
     // is sema's; here we just satisfy the discharge requirement

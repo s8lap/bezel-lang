@@ -167,14 +167,36 @@ BEZEL_TEST(borrow_return_1007, owned_field_read_this_borrow_accepted_2269) {
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// An explicit `owned` return type makes the container-ownership transfer
-// explicit; the rule does not fire (the caller-tracks-as-owned was the
-// declared intent). Must compile.
-BEZEL_TEST(borrow_return_1007, owned_return_type_exempt_clean) {
+// UPDATED for issue #3993: this row originally asserted that an explicit
+// `owned` return type EXEMPTS the return from the #1007 rule ("the
+// caller-tracks-as-owned was the declared intent") — but declaring `owned`
+// only ANNOUNCES the contract; #1007's own `checkBorrowReturnedThroughOwning
+// Type` never verified the returned expression actually satisfies it
+// (`if (returnOwned_) return;` at its own top), so `a` — a plain borrowed
+// parameter — flowed out labeled "owned" untouched. Measured via ASan on the
+// concrete analogue (an `OwningArray<Cell>` with real elements, borrowed
+// through an identical `Id`, returned `owned`, and disposed at both the
+// caller's binding and the parameter's real `using var` owner): SEGV in
+// `bz_array_free` — a genuine cascading double-free of the array's elements,
+// not merely a theoretical laundering. The new `checkOwnedReturnDirectBorrow`
+// (§28.3 *Borrow lifetime rules*) closes this — the declared-`owned`-return
+// case is REJECTED exactly like the unmarked case above, not exempted.
+BEZEL_TEST(borrow_return_1007, owned_return_type_borrow_rejected_spec_3993) {
     auto r = parseAndCheckOwnership(mod(
         "class P "
         "  public static method Id(a: OwningArray<Cell>): owned OwningArray<Cell> "
         "    => a; "
+        "end P;"));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// The genuine owned producer through the SAME owned-declared return type is
+// NOT over-rejected — `new` is a fresh production, not a borrow.
+BEZEL_TEST(borrow_return_1007, owned_return_type_fresh_producer_accepted) {
+    auto r = parseAndCheckOwnership(mod(
+        "class P "
+        "  public static method Make(): owned OwningArray<Cell> "
+        "    => new OwningArray<Cell>(); "
         "end P;"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }

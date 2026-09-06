@@ -10278,6 +10278,112 @@ bool MethodOwnership::checkOwnedReturnBorrowSource(const ast::Expr& e) {
     return true;
 }
 
+// §28.3 *Borrow lifetime rules* / §28.6 *Methods returning `this`* (issue
+// #3993): see the header for the full contract. Excludes:
+//   * `move E` — checkOwnedReturnBorrowSource's job (tailored messaging);
+//   * a bare owned-field read — checkOwnedFieldReturn's job (§28.6 bullet 2,
+//     the "use `return move <field>;`" remedy);
+//   * a bare catch-bound exception identifier — checkCatchBorrowEscapesOnReturn
+//     already rejects `return ex;` UNCONDITIONALLY (every return type, not just
+//     `owned` — a caught exception may never escape the arm, §31.1), so
+//     without this exclusion the two checks would double-report the same
+//     return statement.
+//   * a bare (non-`move`) force-unwrap `E!` whose underlying PLACE is an
+//     OWNED local or an `owned`/`out owned` parameter (issue #2518's own
+//     accept control, `Pass(owned c: Cell?): owned Cell => c!;`) — the
+//     return-position twin of the bare-identifier discharge fast path
+//     (§28.3 Slice O1's `return c;`): returning a named OWNED place
+//     transfers it with no explicit `move` marker needed (only an
+//     ARGUMENT/`move`-return SINK requires the marker, §22.3's call-site
+//     marker economy). `ownedArgSourceIsBorrow`'s bare-`!` branch is
+//     conservatively "always a borrow" for exactly that sink reading (§17.4:
+//     `E!` alone never transfers) and does not know about this return-
+//     position carve-out, so it would otherwise reject a nullable OWNED
+//     parameter's null-checked return. A place that is NOT owned (a plain
+//     borrowed parameter's `b!`, a Borrowed-state local's `x!`) is not
+//     exempted here and falls through to the ordinary borrow rejection
+//     below. // per §17.4, §28.3, #2518
+// so each borrow shape is diagnosed exactly once, by the check whose
+// messaging is specific to it; this function is the catch-all for every
+// remaining borrow shape `ownedArgSourceIsBorrow` recognizes (a plain
+// parameter, `this`, a non-`owned` field, an indexer-get, a record-
+// destructuring binding, a Borrowed-state local). // per §28.3, §28.6
+void MethodOwnership::checkOwnedReturnDirectBorrow(const ast::Expr& e) {
+    if (!returnOwned_) return;
+    // §28.6 *Methods returning `this`* / §28.3 *Borrow lifetime rules* are
+    // ABOUT double-dispose: they matter only where disposal of the RETURNED
+    // VALUE ITSELF is reachable through the declared return type at all.
+    // `IEnumerable<T>` and `IAsyncEnumerable<T>` (stdlib §4.12) do NOT extend
+    // `IDisposable` / `IAsyncDisposable` — only the enumerator they mint does
+    // (`GetEnumerator()` / `GetAsyncEnumerator()` return the disposable
+    // `IEnumerator<T>` / `IAsyncEnumerator<T>`) — so THIS check's own
+    // double-dispose reasoning (a plain field read / parameter / `this`
+    // returned "owned" gets disposed twice) does not apply to a value
+    // statically typed at exactly one of these two heads: there is no
+    // `.Dispose()` reachable through the static type for the ownership pass
+    // to have caused a SECOND call to.
+    //
+    // ⚠ This is NOT a claim that returning a borrow this way is safe overall.
+    // A concrete class implementing `IEnumerable<T>`, borrowed through this
+    // exact shape and bound with `using var` at the caller, DOES crash under
+    // ASan — but with the SAME wild-jump SEGV signature every OTHER rejected
+    // head produces, and measurably for the SOUND case too (`Make(): owned
+    // IEnumerable<T> => new MyE();`, no borrow involved at all) — a
+    // pre-existing CODEGEN defect (`Emitter::rawUserClassInBuiltinInterfaceSlot`
+    // not seeing through a call boundary) unrelated to whether this check
+    // accepts or rejects the return, filed as #4007. Rejecting the borrow
+    // here would not fix that crash and accepting it does not cause it: this
+    // exemption is scoped ONLY to this check's own double-dispose question,
+    // on which its "nothing reachable to double-call" reasoning holds
+    // (verified against stdlib §4.12's declared interface surface, not
+    // against codegen's current representation of it). `IAsyncEnumerable<T>`
+    // is the structurally identical async twin, same caveat. Every OTHER
+    // iterable-family head this check reaches DOES extend `IDisposable`/
+    // `IAsyncDisposable` (`IEnumerator<T>`, `IAsyncEnumerator<T>`, and the
+    // four owning heads — `IOwningEnumerable<T>` included, stdlib §4.13) and
+    // each measurably double-frees for THIS check's own reason (SEGV in the
+    // interface's itable dispatch, or in `bz_array_free` for
+    // `OwningArray<T>`) when a borrow reaches a real destructor through this
+    // shape — so those stay rejected regardless of #4007.
+    // // per stdlib §4.12, §4.13, #3993, #4007
+    if (returnType_ && returnType_->kind == ast::TypeKind::Named &&
+        returnType_->name && !returnType_->name->parts.empty()) {
+        std::string_view head = returnType_->name->parts.front();
+        if (head == "IEnumerable" || head == "IAsyncEnumerable") return;
+    }
+    if (auto* un = dynamic_cast<const ast::UnaryExpr*>(&e))
+        if (un->op == "move") return;
+    if (exprIsOwnedFieldRead(*lookThroughForceUnwrap(&e))) return;
+    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e))
+        if (isCatchBorrow(ctx_.exprSymbol(*id))) return;
+    if (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(&e)) {
+        if (auto* pid = pb->operand ? dynamic_cast<const ast::IdentifierExpr*>(
+                                          pb->operand.get())
+                                    : nullptr) {
+            if (auto* st = lookupState(pid->name)) {
+                if (st->state == OwnershipState::Owned) return;
+            } else if (auto* ps = dynamic_cast<sema::ParameterSymbol*>(
+                           ctx_.exprSymbol(*pid))) {
+                if (ps->modifier == "owned" || ps->modifier == "out owned")
+                    return;
+            }
+        }
+    }
+    if (!ownedArgSourceIsBorrow(e)) return;
+    report(
+        Severity::Error, e.span.begin,
+        "a borrow cannot be returned as an `owned` value: the declared "
+        "`owned` return type tells the caller it receives a value it must "
+        "dispose, but this return expression is a borrow (a plain "
+        "parameter, `this`, a non-`owned` field, an indexer-get, or a "
+        "borrowed local) — its real owner disposes it too, a double-free "
+        "(§28.3 *Borrow lifetime rules*: \"a borrowed local may not be "
+        "returned from a method whose return type is `owned`\"; §28.6 "
+        "*Methods returning `this`*). Return a freshly-produced value "
+        "(`new T(...)`), a call returning `owned T`, or `move` an owned "
+        "local or an owned field of `this`");
+}
+
 // §28.8 / §28.8.1 / §28.6 (issues #2010, #2016): the LOCAL-DECL-initializer /
 // assignment-RHS arg-move twin of the discharge (#1993/#1999) and return
 // (#1995/#2011) owned-source guards. See the header for the full contract.

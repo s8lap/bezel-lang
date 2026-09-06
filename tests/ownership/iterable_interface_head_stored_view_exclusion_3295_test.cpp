@@ -160,8 +160,33 @@ BEZEL_TEST(iterable_interface_head_stored_view_exclusion_3295,
 
 // ===========================================================================
 // EXEMPT controls: the EXPLICIT `owned` return type makes the transfer
-// explicit, so the rule does not fire (the early-return on `returnOwned_`
-// above short-circuits before the stored-view check).
+// explicit, so THIS FILE's #3295 rule does not fire (the early-return on
+// `returnOwned_` above short-circuits before the stored-view check).
+//
+// UPDATED for issue #3993: `IEnumerator<Cell>` and `IAsyncEnumerator<Cell>`
+// no longer belong in this "exempt" group — they extend `IDisposable` /
+// `IAsyncDisposable` (stdlib §4.12), so a borrowed-parameter passthrough
+// through an `owned`-declared return of either genuinely double-frees
+// (measured via ASan on a concrete `IEnumerator<T>` conformer: SEGV in the
+// interface's itable dispatch on the second, already-freed disposal — the
+// same crash signature `IOwningEnumerator<T>` produces). The new
+// `checkOwnedReturnDirectBorrow` (§28.3 *Borrow lifetime rules*) rejects
+// them; they moved to the REJECT group below. `IEnumerable<Cell>` and
+// `IAsyncEnumerable<Cell>` stay exempt from THIS check's own double-dispose
+// reasoning — neither extends `IDisposable`/`IAsyncDisposable` (only the
+// enumerator they mint does), so there is no `.Dispose()` reachable through
+// either static type for this check to have caused a second call to.
+//
+// ⚠ This is NOT a claim that the exempted shape is safe end-to-end: a
+// concrete `IEnumerable<T>` conformer with a real destructor, borrowed
+// through this exact shape and bound with `using var`, DOES crash under
+// ASan — the same wild-jump SEGV every rejected head above produces, and
+// measurably reachable even for a SOUND, non-borrow return through the same
+// slot (`Make(): owned IEnumerable<T> => new MyE();`) — a pre-existing
+// CODEGEN defect independent of what this ownership check decides, filed as
+// #4007. `checkOwnedReturnDirectBorrow` carries this exemption because its
+// OWN reasoning (double-dispose via two tracked bindings) does not apply
+// here, not because the shape is verified safe overall.
 // ===========================================================================
 
 BEZEL_TEST(iterable_interface_head_stored_view_exclusion_3295,
@@ -170,16 +195,6 @@ BEZEL_TEST(iterable_interface_head_stored_view_exclusion_3295,
         "class P "
         "  public static method Id(a: IEnumerable<Cell>): "
         "      owned IEnumerable<Cell> => a; "
-        "end P;"));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-}
-
-BEZEL_TEST(iterable_interface_head_stored_view_exclusion_3295,
-           owned_return_type_exempt_for_ienumerator) {
-    auto r = parseAndCheckOwnership(mod(
-        "class P "
-        "  public static method Id(a: IEnumerator<Cell>): "
-        "      owned IEnumerator<Cell> => a; "
         "end P;"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
@@ -194,14 +209,29 @@ BEZEL_TEST(iterable_interface_head_stored_view_exclusion_3295,
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
+// ===========================================================================
+// REJECT (moved here from the EXEMPT group above, issue #3993): a borrowed
+// parameter returned through an `owned`-declared DISPOSABLE iterable head.
+// ===========================================================================
+
 BEZEL_TEST(iterable_interface_head_stored_view_exclusion_3295,
-           owned_return_type_exempt_for_iasync_enumerator) {
+           owned_return_type_borrow_rejected_for_ienumerator_3993) {
+    auto r = parseAndCheckOwnership(mod(
+        "class P "
+        "  public static method Id(a: IEnumerator<Cell>): "
+        "      owned IEnumerator<Cell> => a; "
+        "end P;"));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+BEZEL_TEST(iterable_interface_head_stored_view_exclusion_3295,
+           owned_return_type_borrow_rejected_for_iasync_enumerator_3993) {
     auto r = parseAndCheckOwnership(mod(
         "class P "
         "  public static method Id(a: IAsyncEnumerator<Cell>): "
         "      owned IAsyncEnumerator<Cell> => a; "
         "end P;"));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
 
 // ===========================================================================

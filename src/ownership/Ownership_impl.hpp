@@ -3194,6 +3194,36 @@ private:
     // is enforced separately). Returns true when it reported. // per §28.6, §28.8, §28.8.1
     bool checkOwnedReturnBorrowSource(const ast::Expr& e);
 
+    // §28.3 *Borrow lifetime rules* / §28.6 *Methods returning `this`* (issue
+    // #3993): the DIRECT-READ sibling of checkOwnedReturnBorrowSource. §28.3's
+    // first borrow-lifetime bullet is unconditional — "A borrowed local may not
+    // be returned from a method whose return type is `owned`" — but the only
+    // callee-side enforcement of it is scoped to a `move E` operand
+    // (checkOwnedReturnBorrowSource) or a bare OWNED-field read
+    // (checkOwnedFieldReturn, §28.6 bullet 2); neither covers a bare non-move
+    // read whose source is a plain BORROW — a borrowed parameter (`return b;`,
+    // the spec's own `static method Pick(a: Res, b: Res): Res return a;`
+    // example with `owned` added to the return type instead of left off), a bare
+    // `this` (§28.6 *Methods returning `this`*: "may not be ... returned as
+    // `owned` — it is the receiver under a different name"), a non-owned field
+    // read, a catch-bound exception, or an indexer-get. handleReturn's bare-
+    // identifier discharge fast-path (§28.3, Slice O1) unconditionally marks
+    // such a return discharged with no regard to the declared return type, so
+    // `static method Pick(a: Res, b: Res): owned Res return b;` compiled with
+    // zero diagnostics and double-freed at runtime — `b`'s real owner (the
+    // caller's `using var`) disposes it, and the caller-side `owned` contract
+    // disposes the same object again. Reuses the exact §28.8 owned-source
+    // classifier (`ownedArgSourceIsBorrow`) the sibling checks already use — the
+    // single existing authority for "is this expression a borrow" — rather than
+    // a second spelling. Excludes `move E` (checkOwnedReturnBorrowSource's job,
+    // with tailored field-vs-general-borrow messaging) and a bare owned-field
+    // read (checkOwnedFieldReturn's job, with the §28.6-bullet-2 "use `return
+    // move <field>;`" remedy) so each borrow shape is diagnosed exactly once.
+    // Fires from handleReturn (block bodies, BEFORE the bare-identifier fast
+    // path swallows the return) and runExprBodyOwningReturnCheck (`=>` bodies).
+    // // per §28.3 *Borrow lifetime rules*, §28.6 *Methods returning `this`*, §28.8
+    void checkOwnedReturnDirectBorrow(const ast::Expr& e);
+
     // §28.8 / §28.8.1 / §28.6 (issues #2010, #2016): the owned-sink borrow-source
     // guard for a `move <place>` ARGUMENT to a ctor/call `owned` formal in the
     // LOCAL-DECL-initializer / assignment-RHS arg-move path (recordMovesIn /
