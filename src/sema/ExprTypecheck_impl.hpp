@@ -846,12 +846,19 @@ private:
     // order-independent, but the AST has no uniform child enumeration, so a
     // hand-written walk would silently miss whichever node kinds it forgot.)
     struct DefaultTypeParamUse {
-        const void* owner;        // the ast::MethodDecl / ast::TypeDecl
+        const void* owner;        // ast::MethodDecl / ast::TypeDecl, or (#3644)
+                                   // ast::ExtensionDecl
         std::string param;        // the type-parameter name
         SourceLocation loc;       // the `default(T)` site (for the note)
     };
     struct GenericInstantiationSite {
-        const void* owner;        // the ast::MethodDecl being instantiated
+        const void* owner;        // fix #3719: the ast::MethodDecl being
+                                   // called (checkMethodGenericConstraints),
+                                   // OR the ast::TypeDecl / ast::ExtensionDecl
+                                   // being constructed
+                                   // (recordDefaultObligationsForConstruction)
+                                   // — must match the corresponding
+                                   // DefaultTypeParamUse::owner's kind.
         std::string param;
         TypeRef* arg = nullptr;   // the substituted type argument
         std::string argName;      // its spelling, for the diagnostic
@@ -865,13 +872,49 @@ private:
     // type).
     void recordDefaultTypeParamUse(const void* owner, std::string_view param,
                                    SourceLocation loc);
-    // Record one type-argument binding of a generic METHOD instantiation.
+    // Record one type-argument binding of a generic instantiation — a
+    // generic METHOD's own call site (ExprTypecheck_Calls.cpp), or, since
+    // fix #3719, a generic CLASS/RECORD construction or the extension(s)
+    // targeting it (recordDefaultObligationsForConstruction).
     void recordGenericInstantiationSite(const void* owner,
                                         std::string_view param, TypeRef* arg,
                                         std::string argName,
                                         SourceLocation loc);
     // §3.6 rule 2 join, run once at the end of the pass.
     void checkDeferredDefaultInstantiations();
+
+    // fix #3719 (§17.11 / §3.6 rule 2, v0.294): every prior call to
+    // `recordGenericInstantiationSite` came from a generic METHOD's own call
+    // site (ExprTypecheck_Calls.cpp's `checkMethodGenericConstraints`), with
+    // `owner` unconditionally the called method's `ast::MethodDecl*`. A
+    // `default(T)` obligation recorded against a class-level
+    // (`currentType_->decl`, a `TypeDecl*`) or extension-level
+    // (`currentExtension_->decl`, an `ExtensionDecl*`, #3644) owner could
+    // therefore never match any recorded instantiation site and was dead
+    // code since #3044 (issue #3719).
+    //
+    // Called once per `new T<...>()` against a generic CLASS or RECORD `t`
+    // (after its own constructor-argument check), this records ONE
+    // instantiation site per class-level type parameter (owner = `t->decl`),
+    // and, because an extension shares its target type's concrete binding at
+    // the SAME construction rather than at any call site of its own (an
+    // extension is never itself "instantiated"), one per LOCAL extension
+    // whose target names `t` at matching arity, for each of the target
+    // type's bare free-type-parameter POSITIONS (owner = that extension's
+    // own `ExtensionDecl*`).
+    //
+    // Scope (recorded here, not silently narrowed): local (non-imported)
+    // extensions only — an imported extension's body is type-checked in its
+    // OWN defining module's separate ExprTC pass, so this importing module's
+    // `defaultTypeParamUses_` can never hold an entry keyed by that decl
+    // pointer regardless of what gets recorded here; and only a target
+    // written with a BARE free-parameter identifier at the matching
+    // position (§26.4) — a concrete or nested target argument at that
+    // position (`extension Box<Array<T>>`) is not a per-instantiation
+    // variable at that position and is not walked recursively here.
+    void recordDefaultObligationsForConstruction(const ast::NewExpr& ne,
+                                                 TypeSymbol* t,
+                                                 const TypeRef* rt);
 
     // fix #2911 + fix #2962 (§17.4 / §3.6 rule 2, v0.241): the generic reach of
     // §17.4's "Degenerate value-type targets" paragraph for a METHOD-level type

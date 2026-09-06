@@ -4431,6 +4431,31 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                         if (t->hasPositionalFields)
                             checkNewExprArgs(*ne, t);
                     }
+                    // fix #3719 (§17.11 / §3.6 rule 2, v0.242): this
+                    // construction IS the instantiation site (§3.6 rule 2)
+                    // for any class-level or extension-level `default(T)`
+                    // obligation recorded on one of `t`'s own generic
+                    // parameters — see
+                    // recordDefaultObligationsForConstruction's own comment
+                    // for why neither half was ever checked before this fix.
+                    // Applies to both Class and Record (both take type
+                    // arguments here); Interface is never constructed with
+                    // `new` (rejected above), and an abstract/static/closed
+                    // class's own rejection above does not need this
+                    // recording to also run. It is harmless when it does:
+                    // measured at this fix's review, an `abstract class
+                    // Box<K> where K: value` illegally `new`'d with a
+                    // non-defaultable K emits BOTH the abstract-instantiation
+                    // rejection AND this constraint-violation diagnostic.
+                    // Both are true and the program is rejected either way,
+                    // so the redundancy is cosmetic — it is NOT the case
+                    // (as an earlier draft of this comment claimed) that a
+                    // rejected-as-non-constructible decl can never also be a
+                    // `default(T)` join key.
+                    if (t->kind == ast::TypeDeclKind::Class ||
+                        t->kind == ast::TypeDeclKind::Record) {
+                        recordDefaultObligationsForConstruction(*ne, t, rt);
+                    }
                     // §14.1 / §2.5 (#428 phase B): imported generic RECORD
                     // construction is now supported — codegen performs per-
                     // instantiation specialization in the importing module using
@@ -4682,14 +4707,47 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                                 currentMethodDecl_->genericConstraints))
                             recordDefaultTypeParamUse(
                                 currentMethodDecl_, paramName, de->span.begin);
-                    } else if (currentType_ && currentType_->decl) {
-                        if (auto* td = dynamic_cast<const ast::TypeDecl*>(
-                                currentType_->decl))
-                            if (paramHasValueConstraint(td->genericConstraints))
-                                recordDefaultTypeParamUse(
-                                    currentType_->decl, paramName,
-                                    de->span.begin);
-                    } else if (currentExtension_ && currentExtension_->decl) {
+                    } else {
+                        // fix #3719 (§17.11 / §3.6 rule 2 / §26.4, v0.294):
+                        // these two arms used to be `else if`-chained on
+                        // `currentType_`'s mere TRUTHINESS, so — inside an
+                        // extension body over a LOCAL target type (where
+                        // `currentType_` is always non-null: `currentType_ =
+                        // targetSym` alongside `currentExtension_ = extSym`
+                        // when visiting an extension member, ExprTypecheck.cpp)
+                        // — the class-level branch below unconditionally
+                        // consumed the branch and the `currentExtension_` arm
+                        // #3644 added was UNREACHABLE whenever `paramName` was
+                        // NOT (by name-coincidence) also one of the class's
+                        // own constrained parameters, which is the common
+                        // case (an extension's own type-parameter name need
+                        // not, and usually does not, match the class's).
+                        // `checkConstraintsFor` a few lines up (also #3644)
+                        // already has the correct shape — try BOTH scopes
+                        // independently, each gated on its OWN constraint
+                        // list actually naming `paramName`, not on which
+                        // scope pointer happens to be non-null — mirrored
+                        // here. Trying both is safe or the identical
+                        // reason `checkConstraintsFor`'s double-report REVIEW
+                        // FINDING isn't a problem here: unlike that function,
+                        // this one does not itself emit a diagnostic — it only
+                        // RECORDS a deferred obligation, and
+                        // `recordDefaultTypeParamUse` already dedupes per
+                        // (owner, param) pair. When a class-level and an
+                        // extension-level parameter are genuinely
+                        // name-coincident AND both declare `where <name>:
+                        // value`, that is two independent, both-real
+                        // obligations against two different owners — both
+                        // SHOULD be recorded, each to be discharged against
+                        // its own instantiation sites.
+                        if (currentType_ && currentType_->decl)
+                            if (auto* td = dynamic_cast<const ast::TypeDecl*>(
+                                    currentType_->decl))
+                                if (paramHasValueConstraint(
+                                        td->genericConstraints))
+                                    recordDefaultTypeParamUse(
+                                        currentType_->decl, paramName,
+                                        de->span.begin);
                         // fix #3644 (§17.11 / §3.6 rule 2 / §26.4, v0.286):
                         // the extension arm was missing — same gap as
                         // `checkConstraintsFor` a few lines up. An
@@ -4706,12 +4764,13 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                         // closing rule). `currentExtension_->decl` (the
                         // ExtensionDecl AST node) is the owner key, mirroring
                         // `currentType_->decl` above.
-                        if (auto* ed = dynamic_cast<const ast::ExtensionDecl*>(
-                                currentExtension_->decl))
-                            if (paramHasValueConstraint(ed->genericConstraints))
-                                recordDefaultTypeParamUse(
-                                    currentExtension_->decl, paramName,
-                                    de->span.begin);
+                        if (currentExtension_ && currentExtension_->decl)
+                            if (auto* ed = dynamic_cast<const ast::ExtensionDecl*>(
+                                    currentExtension_->decl))
+                                if (paramHasValueConstraint(ed->genericConstraints))
+                                    recordDefaultTypeParamUse(
+                                        currentExtension_->decl, paramName,
+                                        de->span.begin);
                     }
                 }
             }

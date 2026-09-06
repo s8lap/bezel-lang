@@ -304,6 +304,82 @@ void ExprTC::checkDeferredDefaultInstantiations() {
     }
 }
 
+// fix #3719 (§17.11 / §3.6 rule 2, v0.294): see the declaration in
+// ExprTypecheck_impl.hpp for the full rationale. `t`'s own generic
+// parameters and `rt`'s (the resolved `ne.type`) generic arguments are
+// positionally aligned by construction (both are read off the same
+// `ast::Type::genericArgs` list — `rt` at `TypeResolution_Names.cpp`'s
+// arity-checked `resolveType`, `t->genericParams` at declaration), so no
+// further arity negotiation is needed beyond the defensive size check below.
+void ExprTC::recordDefaultObligationsForConstruction(const ast::NewExpr& ne,
+                                                     TypeSymbol* t,
+                                                     const TypeRef* rt) {
+    if (!t || !rt) return;
+    if (t->genericParams.empty() || rt->genericArgs.empty()) return;
+    if (t->genericParams.size() != rt->genericArgs.size()) return;
+    // Mirrors ExprTypecheck_Calls.cpp's §14.2 `argNameOf` lambda (naming a
+    // TypeRef for a diagnostic): local rather than shared because both call
+    // sites are small, self-contained, and would gain nothing but an extra
+    // indirection from a shared helper for a three-line formatter.
+    auto argNameOf = [](const TypeRef* a) -> std::string {
+        std::string base;
+        if (a && a->declaration) base = std::string(a->declaration->name);
+        else if (a && a->astNode && a->astNode->name &&
+                 !a->astNode->name->parts.empty())
+            base = std::string(a->astNode->name->parts.back());
+        else return "the type argument";
+        if (a->nullable) base += "?";
+        return base;
+    };
+    // Class-/record-level: owner = t's own TypeDecl. Null for an imported
+    // type (ModuleLoader never assigns Symbol::decl across a module
+    // boundary, #3141) — recordGenericInstantiationSite no-ops on a null
+    // owner, and there is no LOCAL `defaultTypeParamUses_` entry keyed by an
+    // imported decl pointer to join against regardless.
+    for (std::size_t i = 0; i < t->genericParams.size(); ++i) {
+        Symbol* gp = t->genericParams[i];
+        if (!gp) continue;
+        TypeRef* arg = rt->genericArgs[i];
+        if (!arg) continue;
+        recordGenericInstantiationSite(t->decl, gp->name, arg,
+                                       argNameOf(arg), ne.span.begin);
+    }
+    // Extension-level (#3644's currentExtension_ family): every LOCAL
+    // extension targeting `t` by name at matching arity gets one
+    // instantiation-site record per bare free-parameter position in its
+    // target type — the same (name, position) pair `bindExtensionTargetTypeParams`
+    // (TypeResolution_Names.cpp) uses to bind that position into the
+    // extension body's own scope at declaration time.
+    if (!ctx_.module()) return;
+    for (Symbol* child : ctx_.module()->children) {
+        auto* ext = dynamic_cast<ExtensionSymbol*>(child);
+        if (!ext) continue;
+        auto* ed = dynamic_cast<const ast::ExtensionDecl*>(ext->decl);
+        if (!ed || !ed->targetType || !ed->targetType->name) continue;
+        const auto& nm = ed->targetType->name->parts;
+        if (nm.empty() || std::string(nm.back()) != std::string(t->name))
+            continue;
+        const auto& targetArgs = ed->targetType->genericArgs;
+        if (targetArgs.size() != rt->genericArgs.size()) continue;
+        for (std::size_t i = 0; i < targetArgs.size(); ++i) {
+            const auto& ga = targetArgs[i];
+            // §26.4: a bare, non-nullable, single-segment identifier with no
+            // generic args of its own is a free type-parameter position; a
+            // concrete or nested argument at this position is not (and is
+            // not walked recursively here — see the declaration's Scope note).
+            if (!ga || ga->kind != ast::TypeKind::Named || !ga->name ||
+                ga->name->parts.size() != 1 || ga->nullable ||
+                !ga->genericArgs.empty())
+                continue;
+            std::string_view paramName = ga->name->parts[0];
+            TypeRef* arg = rt->genericArgs[i];
+            if (!arg) continue;
+            recordGenericInstantiationSite(ed, paramName, arg,
+                                           argNameOf(arg), ne.span.begin);
+        }
+    }
+}
+
 // fix #2911 + fix #2962 (§17.4 / §3.6 rule 2, v0.241): see the declarations in
 // ExprTypecheck_impl.hpp. The METHOD-parameter half of §17.4's generic clause;
 // the TYPE-parameter half is Resolver::checkAsTargetInstantiations, and both
