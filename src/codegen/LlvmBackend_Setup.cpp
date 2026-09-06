@@ -25578,10 +25578,75 @@ struct ClosureEscapeWalker {
         }
         // Call: the callee `f(...)` is a non-consuming read (invocation); every
         // ARGUMENT escapes (the callee may store the function value).
+        //
+        // fix #3885 (stdlib §4.8/§4.9, spec §27.5/§28.9, v0.294): EXCEPT a
+        // bare-identifier `target` read at the factory (second) argument
+        // position of a `.GetOrAdd(key, factory)` call on a builtin
+        // Dictionary/OwningDictionary/SortedDictionary receiver. Checked via
+        // `common::isDictionaryName` — the SAME #1414 stage-3 registry
+        // predicate `Emitter::isDictTypeName` itself calls — rather than
+        // `Emitter::isDictTypeName` directly: that method is PRIVATE, and
+        // (unlike `collectCellFreeEligible`'s `LambdaFinder`, a class LOCAL
+        // to an `Emitter` member function, which therefore inherits that
+        // function's access) `ClosureEscapeWalker` is a plain struct at
+        // NAMESPACE scope shared by several call sites, so it has no such
+        // access; the `rt->kind`/`rt->declaration`/`rt->headName()` reads
+        // below reproduce `isDictTypeName`'s own body exactly (mirroring how
+        // `collectStringReleaseEligible`'s `walkCallArgs`, another
+        // namespace-scope walker, already inlines this identical check for
+        // #3886/#3888 rather than calling the private method). #3871 fixed
+        // a lambda LITERAL at this exact argument position (widening
+        // `collectCellFreeEligible`, which decides the
+        // CAPTURED variables' fate); it could not touch a `var`-bound
+        // factory (an `ast::IdentifierExpr`, a sibling of `ast::LambdaExpr`
+        // under `ast::Expr` — the dynamic_cast there can never match), and
+        // that shape is THIS walker's concern instead: it decides whether
+        // the closure LOCAL itself (`target`) escapes. Before this widening,
+        // the generic "every call argument escapes" rule below treated
+        // `d.GetOrAdd(key, factory)` exactly like any other call, so
+        // `factory`'s LocalDecl never entered `closureReleaseEligible_` and
+        // neither its own cell/env (this function's own scope-end
+        // `closureRelease` disposal, gated on that set) NOR — transitively —
+        // its captures (`collectCellFreeEligible`'s LambdaFinder treats a
+        // producer lambda as non-escaping exactly when its owning LocalDecl
+        // is in `closureReleaseEligible_`) were ever released: issue #3885's
+        // "leaks the WHOLE closure" symptom (cell + env + captured box).
+        // Stdlib §4.8 states outright "GetOrAdd's factory is call-bounded"
+        // (incorporated by reference into §4.9): LlvmBackend_Calls.cpp's
+        // `GetOrAdd` arm invokes the factory synchronously on the miss path
+        // only and never lets it escape past the call either way — an
+        // inline LITERAL is a fresh +1 the call site itself releases at the
+        // join point (`factoryIsInlineLambda`-gated `emitClosureRelease`),
+        // while a `var`-bound reference is BORROWED there (that same gate is
+        // false, so the call site correctly does not touch it) and is left
+        // for its own scope end to release — which is exactly the release
+        // this fix now arms. So a factory read at this argument position can
+        // never outlive the call, regardless of whether it arrives as a
+        // literal or a `var`-bound reference — only WHO releases it differs.
         if (auto* c = dynamic_cast<const ast::CallExpr*>(e)) {
+            bool getOrAddFactoryTargetSafe = false;
+            if (c->args.size() == 2 && c->args[1].value &&
+                isTargetIdent(c->args[1].value.get())) {
+                if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
+                        c->callee.get())) {
+                    if (ma->member == "GetOrAdd" && ma->target) {
+                        if (const sema::TypeRef* rt =
+                                ctx.exprType(*ma->target)) {
+                            if (rt->kind == sema::TypeRef::Kind::Named &&
+                                !rt->declaration &&
+                                common::isDictionaryName(rt->headName())) {
+                                getOrAddFactoryTargetSafe = true;
+                            }
+                        }
+                    }
+                }
+            }
             scanCalleePosition(c->callee.get());  // fix #3805 (+ follow-up)
             expr(c->callee.get(), /*safeRead=*/true);
-            for (auto& a : c->args) expr(a.value.get(), /*safeRead=*/false);
+            for (std::size_t ai = 0; ai < c->args.size(); ++ai) {
+                bool safeArg = getOrAddFactoryTargetSafe && ai == 1;
+                expr(c->args[ai].value.get(), /*safeRead=*/safeArg);
+            }
             return;
         }
         if (auto* c = dynamic_cast<const ast::NullCondCallExpr*>(e)) {
