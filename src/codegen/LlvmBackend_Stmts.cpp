@@ -395,6 +395,42 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                     // the existing preserve-the-slot degradation, but make it
                     // observable with the same guarded Warning posture.
                     if (!rhsOnce) {
+                        // fix #3714 (§15.1/§3.2, v0.294): `lowerExpr` returns
+                        // nullptr for a UNIT-typed expression by the #3421
+                        // convention (there is no runtime value for `()`), so a
+                        // null `rhsOnce` here is not automatically the #3025
+                        // lowering-failure degrade below — for `a[i] := ()`
+                        // into a plain `[N]()` inline array it is a legitimate
+                        // unit-valued write. Mirrors fix #3712's
+                        // lowerCollectionLiteralElementOrUnitNull decision
+                        // (keyed on the RHS's OWN sema type being Kind::Unit,
+                        // never on rhsOnce being null, so a genuinely failed
+                        // lowering of a NON-unit RHS still degrades below).
+                        // Gated on the TARGET being a plain inline array (not
+                        // an indexer PROPERTY or a heap collection) so those
+                        // shapes keep degrading loudly via #3025 exactly as
+                        // before — this arm only ever engages the plain-array
+                        // fallback a few lines down (line ~427), which
+                        // `lvalueAddr` on `as->target` also reaches.
+                        const sema::TypeRef* rhsTy = ctx_.exprType(*as->value);
+                        const sema::TypeRef* recvArrTy = ix->target
+                            ? ctx_.exprType(*ix->target) : nullptr;
+                        if (rhsTy && rhsTy->kind == sema::TypeRef::Kind::Unit &&
+                            recvArrTy &&
+                            recvArrTy->kind == sema::TypeRef::Kind::InlineArray) {
+                            llvm::Type* elemTyU = nullptr;
+                            llvm::Value* addrU = lvalueAddr(*as->target, elemTyU);
+                            llvm::Value* unitVal = (addrU && elemTyU)
+                                ? lowerCollectionLiteralElementOrUnitNull(
+                                      *as->value, elemTyU)
+                                : nullptr;
+                            if (addrU && unitVal) {
+                                builder_.CreateStore(
+                                    coerceToNullableSlot(elemTyU, unitVal),
+                                    addrU);
+                                return false;
+                            }
+                        }
                         if (!ctx_.diagnostics().hasErrors())
                             ctx_.diagnostics().report(
                                 Severity::Warning, as->value->span.begin,

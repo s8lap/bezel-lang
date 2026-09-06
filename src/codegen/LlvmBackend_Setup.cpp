@@ -8416,7 +8416,19 @@ static bool descTypeArgConcrete(const sema::TypeRef* a) {
             if (!descTypeArgConcrete(g)) return false;
         return true;
     }
-    return a->kind == sema::TypeRef::Kind::Primitive;
+    // fix #3714 (§3.2/§8.6, v0.294): the unit type `()` has no generic-argument
+    // ambiguity — it is a single concrete type, exactly like a Primitive tag —
+    // so it belongs alongside Kind::Primitive here. Without this arm a
+    // unit-typed element (e.g. `[3]()`) read as "not concrete", which made
+    // `Emitter::inlineArrayBoxable` (the sole caller reachable from a runtime
+    // boxing site) refuse to mint a box vtable for `[3]()`; the resulting
+    // `Object`-boxed value was never validly vtabled, so any later virtual
+    // dispatch on it (`.ToString()`) silently failed to lower and fell into
+    // the pre-existing #3079 "argument failed to lower" degrade guard — a
+    // loud-by-design warning, but for the wrong reason (a missing arm, not a
+    // genuine non-concrete type argument).
+    return a->kind == sema::TypeRef::Kind::Primitive ||
+           a->kind == sema::TypeRef::Kind::Unit;
 }
 
 bool Emitter::descArgsConcrete(const std::vector<const sema::TypeRef*>& args) {
