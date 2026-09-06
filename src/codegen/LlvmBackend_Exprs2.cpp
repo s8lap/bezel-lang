@@ -10677,41 +10677,50 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
         // ExprTypecheck.cpp / ExprTypecheck_Exprs.cpp: CaseExpr x CaseStmt,
         // record x choice, top-level x nested).
         //
-        // #3692 does NOT close the gap for a GENERIC RECORD field typed at a
+        // #3692 did not close the gap for a GENERIC RECORD field typed at a
         // bare type parameter (`record Box<T>(X: T, Y: int)` instantiated as
-        // `Box<int?>`) — there is no record analogue of the choice path's
-        // generic-payload substitution (issue 3898). MEASURED (issue 3899):
-        // that shape does NOT reach the nullable-value branch below at all —
-        // the DestructuringPattern slot loop further down computes each
-        // slot's fieldTy via `recordMemberType` (the immediate, unsubstituted
-        // declared type) rather than `recordMemberTypeResolved`, and the
-        // `RecordSubstGuard` that would make the latter resolve correctly is
-        // installed only around the arm BODY (fix #1254), after this whole
-        // match has already run — so the `isNullableVal` test just above
-        // this comment sees the bare, non-nullable type parameter and takes
-        // the PLAIN (non-nullable) dispatch instead, which then compares the
-        // raw nullable-boxed struct against a bare literal and LLVM's IR
-        // verifier catches the shape mismatch (`icmp { i8, i32 }, i32`) with
-        // a clean, non-crashing compile error — never reaching nv.range.match
-        // / nv.relop.match below.
+        // `Box<int?>`) — there was no record analogue of the choice path's
+        // generic-payload substitution. Fix #3899 (§14.1/§19.3, v0.294)
+        // closed the CODEGEN side of that gap: the DestructuringPattern slot
+        // loop below installs its own `RecordSubstGuard` (`destrSubst`, ~line
+        // 11590) BEFORE computing any slot's field type — a different guard
+        // from `armSubst` (~line 9771, for the arm BODY, fix #1254) — but the
+        // three slot-type call sites read the bare, unsubstituted
+        // `recordMemberType` instead of `recordMemberTypeResolved` (the
+        // accessor that actually consults `destrSubst`), so `Box<int?>`'s
+        // slot-0 type was seen as non-nullable `T`, and the `isNullableVal`
+        // test just above this comment took the PLAIN (non-nullable) dispatch
+        // — an IR-verification failure (`icmp {i8,i32}, i32`), not a clean
+        // diagnosis. #3899 swapped all three call sites to
+        // `recordMemberTypeResolved`.
         //
-        // ⚠ CONFIRMED UNGUARDED (measured while reviewing #3692): with both
-        // handlers below stubbed to unconditional `return nullptr;`, the
-        // ENTIRE existing test suite — every #3298/#3692 row, five adjacent
-        // reachable-code-path sweeps, and the whole lit corpus — stays green.
-        // No currently-admitted program reaches either handler: #3692 rejects
-        // every case sema can resolve, the generic-record residual above
-        // does not reach them either, and the CHOICE side is closed at SEMA by
-        // #3692's own fix — a nullable choice payload with an ordering
-        // pattern rejects, non-generic and generic alike (verified on this
-        // build), so no choice program routes here even in principle. A
-        // search for such a path did surface a further, unrelated bug
-        // (issue 3902 — choice payload slots are never checked for any
-        // refutable pattern), but that bug is NOT what closes this route and
-        // fixing it would NOT open one; only #3899's fix does, via records.
+        // Fix #3898 (landed shortly after #3899, same revision) then closed
+        // the SEMA side for the TOP-LEVEL instance of this shape
+        // (`substituteGenericFieldType`, ExprTypecheck.cpp), so
+        // `case b of Box(1..5, 1) => …` over a `Box<int?>` scrutinee is
+        // rejected before it ever reaches codegen today
+        // (`generic_record_slot_range_pattern_rejected_3898` in
+        // case_relop_nullable_1074_test.cpp). #3898 does NOT reach a
+        // GENERIC record slot NESTED inside another destructuring pattern
+        // (`Outer<T>(B: Box<T>, …)`, or the same nesting under a choice-case
+        // payload) — `bindNestedDestructuringNames` has no substitution
+        // context there (issue 3938, open) — so THAT shape stays admitted
+        // and is what live-exercises #3899's fix today: it reaches
+        // `nv.range.match` / `nv.relop.match` below and lowers to the
+        // correct value (`generic_record_slot_nested_pattern_still_admitted_
+        // 3899` and its choice-payload sibling in the same test file).
+        //
+        // ⚠ CONFIRMED UNGUARDED (measured while reviewing #3692, BEFORE
+        // #3899/#3898 landed): with both handlers below stubbed to
+        // unconditional `return nullptr;`, the ENTIRE existing test suite —
+        // every #3298/#3692 row, five adjacent reachable-code-path sweeps,
+        // and the whole lit corpus — stayed green. At that time no admitted
+        // program reached either handler. That is no longer the state of the
+        // tree: the nested generic-record shape above (issue 3938) is a
+        // real, currently-admitted program that reaches them.
         //
         // Deleting these two handlers regardless is NOT a net deletion, it is
-        // a silent miscompile FOR THE CASES #3692 DOES NOT REACH: both slot
+        // a silent miscompile FOR THE CASES sema does NOT reject: both slot
         // call sites do `if (subMatch) matched = AND(matched, subMatch);`, so
         // a nullptr return SKIPS the slot's test and the arm matches
         // unconditionally. MEASURED on the draft that deleted them (pre-
@@ -10719,10 +10728,8 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
         // arm's value instead of falling through — exactly the "→ AND
         // skipped → always matched" defect the slot code's own comment
         // records; that specific program is a sema rejection today, but the
-        // GENERIC-record shape reaching this function is the live instance
-        // of the same hazard, and issue 3899 carries the acceptance
-        // criterion that closing it must ship a test proving these handlers
-        // are reached and fail if stubbed. Do not delete them.
+        // nested-generic-record shape (issue 3938) reaching this function is
+        // the live instance of the same hazard. Do not delete them.
         // §19.3 (#738): a RangePattern on a nullable value — hasValue AND the
         // unwrapped value is in range. Mirrors the non-nullable range logic
         // below, applied to innerVal. (Open-ended forms: an absent bound is
