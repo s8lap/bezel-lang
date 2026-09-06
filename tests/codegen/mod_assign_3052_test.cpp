@@ -172,10 +172,24 @@ BEZEL_TEST(codegen_mod_assign_3052, block_form_property_target_spec_6_6) {
 // `+=`; the lifted spelling this row pinned no longer exists. #3052's subject —
 // that `mod=` desugars and lowers like the rest of the family — is kept by the
 // non-nullable twin, which is the form that survives.
+//
+// fix #3830 (v0.288): `var n: int? := 47;` narrows at its literal initializer
+// (§7.4), and narrowing now reaches compound assignment, so the ORIGINAL
+// local-variable spelling of this row is admitted post-fix (verified
+// empirically: computes 7) rather than rejected — see
+// `nullable_int_target_narrowed_accepted_3830` below, which pins that value.
+// `n` is rewritten to a PARAMETER here to keep testing the genuinely
+// nullable, UNGUARDED gate this row's name promises: a parameter is never
+// narrowed by what the caller passes (narrowing requires an in-body null
+// test, §7.4).
 BEZEL_TEST(codegen_mod_assign_3052, nullable_int_target_rejected_3298) {
     auto r = runAot(
-        "module M; class C public static method Main(): int "
-        "  var n: int? := 47; n mod= 10; return n ?? -1; end Main; end C;");
+        "module M; class C "
+        "  public static method Chk(n: int?): int "
+        "    n mod= 10; return n ?? -1; "
+        "  end Chk; "
+        "  public static method Main(): int return Chk(47); end Main; "
+        "end C;");
     BEZEL_EXPECT_FALSE(r.ran);
     bool sawRule = false;
     for (const auto& d : r.diagnostics.diagnostics())
@@ -185,6 +199,17 @@ BEZEL_TEST(codegen_mod_assign_3052, nullable_int_target_rejected_3298) {
             sawRule = true;
     BEZEL_EXPECT_TRUE(sawRule);
     BEZEL_EXPECT_EQ(run("var n: int := 47; n mod= 10; return n;"), 7);
+}
+
+// fix #3830 (v0.288): the row `nullable_int_target_rejected_3298` used to pin
+// before it was rewritten to a parameter above — `n`'s literal initializer
+// §7.4-narrows it, and #3830 makes a narrowed `int?` target admitted at
+// `mod=` exactly as at `+=`, computing the SAME value (7) the non-nullable
+// twin does. Mirrors nullable_property_compound_2888_test.cpp's
+// `local_increment_narrowed_accepted_3830`.
+BEZEL_TEST(codegen_mod_assign_3052, nullable_int_target_narrowed_accepted_3830) {
+    BEZEL_EXPECT_EQ(
+        run("var n: int? := 47; n mod= 10; return n ?? -1;"), 7);
 }
 
 // §22.12: a static field is the third storage shape a compound assignment can

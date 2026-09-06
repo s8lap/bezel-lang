@@ -72,45 +72,97 @@ bool rejectedCompound(const std::string& body) {
     return false;
 }
 
+// fix #3830 (v0.288): the PARAMETER twin of `rejectedCompound`, for a row
+// whose "still rejected" operand(s) must NOT be §7.4-narrowed. `decimal`
+// (and every integer width this file uses) is `TypeRef::Kind::Primitive`,
+// so a local declared `var x: T? := <literal>;` narrows at its initializer,
+// and #3830 makes such a narrowed operand admitted at compound assignment —
+// so a row meant to test the genuinely-nullable, UNGUARDED gate must route
+// its value(s) through PARAMETER(s) instead: a parameter is never narrowed
+// by what the caller passes (narrowing needs an in-body null test, §7.4).
+// `paramDecl` is the `Chk` method's parameter list (e.g. "d: decimal?, n:
+// int?"), `argExprs` the values passed at the call site, and `body` the
+// helper's statements. Same diagnostic gate as `rejectedCompound`. Modeled
+// on nullable_value_compound_1964_test.cpp's `rejectedCompoundP`.
+bool rejectedCompoundP(const std::string& paramDecl,
+                        const std::string& argExprs,
+                        const std::string& body) {
+    auto r = runAot(
+        std::string("module M; class C "
+                    "  public static method Chk(") + paramDecl + "): int " +
+        body +
+        "  end Chk; "
+        "  public static method Main(): int return Chk(" + argExprs + "); "
+        "end Main; "
+        "end C;");
+    if (r.ran) return false;
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        const auto& m = d.message;
+        if (m.find("compound assignment") == std::string::npos) continue;
+        if (m.find("nullable") == std::string::npos) continue;
+        if (m.find("7.11") == std::string::npos) continue;
+        return true;
+    }
+    return false;
+}
+
 }  // namespace
 
 // Nullable decimal target + nullable integer RHS, across the integer widths
 // this file enumerates and across the present/absent combinations. §6.6
 // rejects on either position, so all sixteen shapes take one verdict.
 BEZEL_TEST(codegen_2149_nullable_decimal_int, int_rhs_rejected_3298) {
-    BEZEL_EXPECT_TRUE(rejectedCompound(
-        "var d: decimal? := 1.0m; var n: int? := 2; d += n; return 0;"));
+    // fix #3830: BOTH `d` and `n` are literal-initialized locals, so both
+    // narrow (§7.4) and the row is fully admitted post-fix — parameterize
+    // both to keep testing the "both present" verdict.
+    BEZEL_EXPECT_TRUE(rejectedCompoundP(
+        "d: decimal?, n: int?", "1.0m, 2", "d += n; return 0;"));
+    // `d := null` never narrows, so it alone keeps this row rejected —
+    // unaffected by #3830.
     BEZEL_EXPECT_TRUE(rejectedCompound(
         "var d: decimal? := null; var n: int? := 2; d += n; return 0;"));
+    // `n := null` never narrows, so it alone keeps this row rejected even
+    // though `d`'s literal initializer narrows — unaffected by #3830.
     BEZEL_EXPECT_TRUE(rejectedCompound(
         "var d: decimal? := 1.0m; var n: int? := null; d += n; return 0;"));
     BEZEL_EXPECT_TRUE(rejectedCompound(
         "var d: decimal? := null; var n: int? := null; d += n; return 0;"));
 }
 BEZEL_TEST(codegen_2149_nullable_decimal_int, long_and_uint_rhs_rejected_3298) {
-    BEZEL_EXPECT_TRUE(rejectedCompound(
-        "var d: decimal? := 1.0m; var n: long? := 2; d += n; return 0;"));
+    // fix #3830: both literal-narrowed — parameterized, see int_rhs above.
+    BEZEL_EXPECT_TRUE(rejectedCompoundP(
+        "d: decimal?, n: long?", "1.0m, 2", "d += n; return 0;"));
+    // `n := null` keeps this rejected regardless of `d`'s narrowing.
     BEZEL_EXPECT_TRUE(rejectedCompound(
         "var d: decimal? := 1.0m; var n: long? := null; d += n; return 0;"));
+    // `d := null` keeps this rejected regardless of `n`'s narrowing.
     BEZEL_EXPECT_TRUE(rejectedCompound(
         "var d: decimal? := null; var n: long? := 5; d += n; return 0;"));
-    BEZEL_EXPECT_TRUE(rejectedCompound(
-        "var d: decimal? := 1.0m; var n: uint? := 7; d += n; return 0;"));
+    // fix #3830: both literal-narrowed — parameterized, see int_rhs above.
+    BEZEL_EXPECT_TRUE(rejectedCompoundP(
+        "d: decimal?, n: uint?", "1.0m, 7", "d += n; return 0;"));
 }
 BEZEL_TEST(codegen_2149_nullable_decimal_int, sub_mul_div_rejected_3298) {
-    BEZEL_EXPECT_TRUE(rejectedCompound(
-        "var d: decimal? := 12.0m; var a: int? := 4; d /= a; return 0;"));
-    BEZEL_EXPECT_TRUE(rejectedCompound(
-        "var d: decimal? := 12.0m; var b: int? := 5; d *= b; return 0;"));
-    BEZEL_EXPECT_TRUE(rejectedCompound(
-        "var d: decimal? := 12.0m; var c: int? := 1; d -= c; return 0;"));
+    // fix #3830: all three rows are both literal-initialized locals — both
+    // narrow, so both are parameterized. See int_rhs above.
+    BEZEL_EXPECT_TRUE(rejectedCompoundP(
+        "d: decimal?, a: int?", "12.0m, 4", "d /= a; return 0;"));
+    BEZEL_EXPECT_TRUE(rejectedCompoundP(
+        "d: decimal?, b: int?", "12.0m, 5", "d *= b; return 0;"));
+    BEZEL_EXPECT_TRUE(rejectedCompoundP(
+        "d: decimal?, c: int?", "12.0m, 1", "d -= c; return 0;"));
 }
 // The two "neighbour" rows: a nullable decimal target with a NON-nullable RHS
 // is rejected on the target's side alone — which is the half of §6.6 the
 // pre-#3298 rule did not have.
 BEZEL_TEST(codegen_2149_nullable_decimal_int, neighbour_nonnullable_rhs_rejected_3298) {
-    BEZEL_EXPECT_TRUE(rejectedCompound("var d: decimal? := 2.0m; d += 3.0m; return 0;"));
-    BEZEL_EXPECT_TRUE(rejectedCompound("var d: decimal? := 4.0m; d += 6; return 0;"));
+    // fix #3830: `d`'s literal initializer narrows it (§7.4), and the RHS
+    // here was ALREADY non-nullable (a bare literal), so once `d` narrows
+    // both sides are non-nullable and the row is fully admitted — `d` is
+    // parameterized to keep testing the genuinely nullable, unguarded
+    // target this row names.
+    BEZEL_EXPECT_TRUE(rejectedCompoundP("d: decimal?", "2.0m", "d += 3.0m; return 0;"));
+    BEZEL_EXPECT_TRUE(rejectedCompoundP("d: decimal?", "4.0m", "d += 6; return 0;"));
 }
 
 // --- §5.1's integer→decimal promotion, on the surviving non-nullable path ---

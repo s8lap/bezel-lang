@@ -74,30 +74,78 @@ bool rejectedCompound(const std::string& body) {
     return false;
 }
 
+// fix #3830 (v0.288): the PARAMETER twin of `rejectedCompound`, for a row
+// whose "still rejected" operand(s) must NOT be §7.4-narrowed. `decimal` is
+// `TypeRef::Kind::Primitive` exactly like `int`/`byte`/etc, so a local
+// declared `var x: decimal? := <literal>;` narrows at its initializer just
+// as an int local does, and #3830 makes such a narrowed operand admitted at
+// compound assignment — so a row meant to test the genuinely-nullable,
+// UNGUARDED gate must route its value(s) through PARAMETER(s) instead: a
+// parameter is never narrowed by what the caller passes (narrowing needs an
+// in-body null test, §7.4). `paramDecl` is the `Chk` method's parameter list
+// (e.g. "d: decimal?" or "d: decimal?, e: decimal?"), `argExprs` the values
+// passed at the call site, and `body` the helper's statements (referencing
+// the parameter(s) by name). Same diagnostic gate as `rejectedCompound`.
+// Modeled on nullable_value_compound_1964_test.cpp's `rejectedCompoundP`.
+bool rejectedCompoundP(const std::string& paramDecl,
+                        const std::string& argExprs,
+                        const std::string& body) {
+    auto r = runAot(
+        std::string("module M; class C "
+                    "  public static method Chk(") + paramDecl + "): int " +
+        body +
+        "  end Chk; "
+        "  public static method Main(): int return Chk(" + argExprs + "); "
+        "end Main; "
+        "end C;");
+    if (r.ran) return false;
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        const auto& m = d.message;
+        if (m.find("compound assignment") == std::string::npos) continue;
+        if (m.find("nullable") == std::string::npos) continue;
+        if (m.find("7.11") == std::string::npos) continue;
+        return true;
+    }
+    return false;
+}
+
 }  // namespace
 
 // Nullable target, nullable RHS, and both — §6.6 rejects each ("either
 // position, or both"). The `null` spellings are rejected for the same reason
 // as the present ones: the gate reads the DECLARED type.
 BEZEL_TEST(codegen_2141_nullable_decimal, nullable_target_rejected_3298) {
-    BEZEL_EXPECT_TRUE(rejectedCompound("var d: decimal? := 1.0m; d += 2.0m; return 0;"));
+    // fix #3830: `1.0m` is a decimal literal — a local initialized with it
+    // narrows (§7.4); routed through a parameter to keep testing the
+    // genuinely nullable, unguarded target.
+    BEZEL_EXPECT_TRUE(rejectedCompoundP("d: decimal?", "1.0m", "d += 2.0m; return 0;"));
     BEZEL_EXPECT_TRUE(rejectedCompound("var d: decimal? := null; d += 2.0m; return 0;"));
 }
 BEZEL_TEST(codegen_2141_nullable_decimal, nullable_rhs_rejected_3298) {
-    BEZEL_EXPECT_TRUE(rejectedCompound(
-        "var d: decimal? := 1.0m; var e: decimal? := 2.0m; d += e; return 0;"));
-    BEZEL_EXPECT_TRUE(rejectedCompound(
-        "var d: decimal := 1.0m; var e: decimal? := 2.0m; d += e; return 0;"));
+    // fix #3830: both `d` and `e` are literal-initialized locals, so BOTH
+    // narrow (§7.4) and the row is fully admitted post-fix — parameterize
+    // both to keep testing the "both nullable" verdict this row names.
+    BEZEL_EXPECT_TRUE(rejectedCompoundP(
+        "d: decimal?, e: decimal?", "1.0m, 2.0m", "d += e; return 0;"));
+    // fix #3830: `d` here is already non-nullable (`decimal`, not
+    // `decimal?`) so it is unaffected; `e`'s literal initializer narrows it
+    // — parameterize `e` only, keeping the file's "RIGHT-operand half" shape
+    // (non-nullable target, nullable RHS).
+    BEZEL_EXPECT_TRUE(rejectedCompoundP(
+        "e: decimal?", "2.0m", "var d: decimal := 1.0m; d += e; return 0;"));
     BEZEL_EXPECT_TRUE(rejectedCompound(
         "var d: decimal? := null; var e: decimal? := null; d += e; return 0;"));
 }
 BEZEL_TEST(codegen_2141_nullable_decimal, sub_mul_div_rejected_3298) {
-    BEZEL_EXPECT_TRUE(rejectedCompound("var d: decimal? := 12.0m; d /= 4.0m; return 0;"));
-    BEZEL_EXPECT_TRUE(rejectedCompound("var d: decimal? := 12.0m; d *= 5.0m; return 0;"));
-    BEZEL_EXPECT_TRUE(rejectedCompound("var d: decimal? := 12.0m; d -= 1.0m; return 0;"));
+    // fix #3830: all three targets are literal-initialized locals —
+    // parameterized, see nullable_target_rejected_3298 above.
+    BEZEL_EXPECT_TRUE(rejectedCompoundP("d: decimal?", "12.0m", "d /= 4.0m; return 0;"));
+    BEZEL_EXPECT_TRUE(rejectedCompoundP("d: decimal?", "12.0m", "d *= 5.0m; return 0;"));
+    BEZEL_EXPECT_TRUE(rejectedCompoundP("d: decimal?", "12.0m", "d -= 1.0m; return 0;"));
 }
 BEZEL_TEST(codegen_2141_nullable_decimal, int_rhs_rejected_3298) {
-    BEZEL_EXPECT_TRUE(rejectedCompound("var d: decimal? := 3.0m; d += 5; return 0;"));
+    // fix #3830: parameterized — see nullable_target_rejected_3298 above.
+    BEZEL_EXPECT_TRUE(rejectedCompoundP("d: decimal?", "3.0m", "d += 5; return 0;"));
 }
 
 // --- the rules this file exists for, on the surviving (non-nullable) path ---

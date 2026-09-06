@@ -59,8 +59,15 @@
 // The retained set (per proposal D2/D3): `=`/`<>` (§8.4), `??` (§7.7),
 // `?.` (§7.5), `?(args)` (§7.6), and `??=` (a compound form that is
 // structurally "not a read-modify-write" per §6.6). Each is asserted in
-// the `retained_*` tests; the trace case `n ??= 0; n += 1;` (the issue's
-// "must reject only at the `+=`" example) is the signature acceptance test.
+// the `retained_*` tests. ⚠ The trace case `n ??= 0; n += 1;` (the issue's
+// own "must reject only at the `+=`" wording) was this file's signature
+// acceptance test at the time it was written; fix #3830 (v0.288, ruling on
+// issue 3686) composes with the PRE-EXISTING `??=`-narrows rule (§7.4
+// v0.210, #2104) to admit the whole trace — see
+// `qq_eq_then_compound_narrowed_admitted_3830` below, which is now the
+// test that pins it (and its `qq_eq_with_nullable_rhs_leaves_target_
+// unnarrowed` control, which keeps the "unnarrowed target still rejects"
+// half alive).
 
 #include "sema/ExprTypecheck.hpp"
 #include "sema/TypeResolution.hpp"
@@ -199,12 +206,22 @@ BEZEL_TEST(lifted_operators_rejected_3298, sticky_accumulator_increment) {
     // underlying `+` is the §7.11 rejected form. Before this fix a local
     // `n++` over int? could ICE on `ConstantInt::get({i8, i32}, 1)`
     // (#2888) or silently drop the write.
+    //
+    // fix #3830 (v0.288): `var n: int? := 5;` narrows at its literal
+    // initializer (§7.4), and narrowing now reaches `++`, so the ORIGINAL
+    // local-variable spelling of this row is admitted post-fix — see
+    // `narrowed_local_admits_increment` below. `n` is rewritten to a
+    // PARAMETER here to keep testing the genuinely nullable, UNGUARDED gate
+    // this row's name promises: a parameter is never narrowed by what the
+    // caller passes (narrowing requires an in-body null test, §7.4).
     auto r = parseSemaAll(
-        "module M; class C public static method Main(): int "
-        "  var n: int? := 5; "
-        "  n++; "
-        "  return 0; "
-        "end Main; end C;");
+        "module M; class C "
+        "  public static method Chk(n: int?): int "
+        "    n++; "
+        "    return 0; "
+        "  end Chk; "
+        "  public static method Main(): int return Chk(5); end Main; "
+        "end C;");
     // §17.6 names the remedies and the §6.6 desugaring; assert the TEXT, not
     // "some diagnostic fired", and scan ALL diagnostics rather than only the
     // first (an unrelated earlier error would otherwise make this vacuous).
@@ -226,12 +243,15 @@ BEZEL_TEST(lifted_operators_rejected_3298, sticky_accumulator_increment) {
 }
 
 BEZEL_TEST(lifted_operators_rejected_3298, sticky_accumulator_decrement) {
+    // fix #3830: parameterized — see sticky_accumulator_increment above.
     auto r = parseSemaAll(
-        "module M; class C public static method Main(): int "
-        "  var n: int? := 5; "
-        "  n--; "
-        "  return 0; "
-        "end Main; end C;");
+        "module M; class C "
+        "  public static method Chk(n: int?): int "
+        "    n--; "
+        "    return 0; "
+        "  end Chk; "
+        "  public static method Main(): int return Chk(5); end Main; "
+        "end C;");
     bool hit = false;
     for (const auto& d : r.diagnostics.diagnostics()) {
         const auto& m = d.message;
@@ -243,6 +263,24 @@ BEZEL_TEST(lifted_operators_rejected_3298, sticky_accumulator_decrement) {
         break;
     }
     BEZEL_EXPECT_TRUE(hit);
+}
+
+// fix #3830 (v0.288): the row `sticky_accumulator_increment`/`_decrement`
+// used to pin before they were rewritten to parameters above — a local's
+// literal initializer §7.4-narrows it, and #3830 makes a narrowed `int?`
+// target admitted at `++`/`--` exactly as at `+=`. Mirrors
+// nullable_property_compound_2888_test.cpp's
+// `local_increment_narrowed_accepted_3830` (gtest, which pins the VALUES;
+// this sema-only file can only assert the absence of a diagnosis).
+BEZEL_TEST(lifted_operators_rejected_3298, narrowed_local_admits_increment) {
+    auto r = parseSemaAll(
+        "module M; class C public static method Main(): int "
+        "  var n: int? := 5; "
+        "  n++; "
+        "  n--; "
+        "  return 0; "
+        "end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
 // ============================================================================
@@ -378,45 +416,92 @@ BEZEL_TEST(lifted_operators_rejected_3298, unary_bitnot_nullable_rejected) {
 BEZEL_TEST(lifted_operators_rejected_3298, compound_target_nullable) {
     // Pre-fix #2153 only rejected `int += int?` (target non-nullable,
     // rhs nullable). v0.267 widens this to ANY nullable operand.
+    //
+    // fix #3830 (v0.288): `var n: int? := 5;` narrows at its literal
+    // initializer (§7.4), and narrowing now reaches compound assignment, so
+    // the ORIGINAL local-variable spelling of this row is admitted post-fix
+    // — see `narrowed_local_admits_compound` below. `n` is rewritten to a
+    // PARAMETER here to keep testing the genuinely nullable, UNGUARDED
+    // target this row's name promises: a parameter is never narrowed by
+    // what the caller passes (narrowing requires an in-body null test,
+    // §7.4).
     auto r = parseSemaAll(
-        "module M; class C public static method Main(): int "
-        "  var n: int? := 5; "
-        "  n += 1; "
-        "  return 0; "
-        "end Main; end C;");
+        "module M; class C "
+        "  public static method Chk(n: int?): int "
+        "    n += 1; "
+        "    return 0; "
+        "  end Chk; "
+        "  public static method Main(): int return Chk(5); end Main; "
+        "end C;");
     BEZEL_EXPECT_TRUE(hasNullableCompoundError(r));
 }
 
 BEZEL_TEST(lifted_operators_rejected_3298, compound_rhs_nullable) {
+    // fix #3830: `n` is already non-nullable (unaffected); `m`'s literal
+    // initializer narrows it (§7.4) — parameterized to keep testing the
+    // genuinely nullable, unguarded RHS this row's name promises. See
+    // compound_target_nullable above.
     auto r = parseSemaAll(
-        "module M; class C public static method Main(): int "
-        "  var n: int := 5; "
-        "  var m: int? := 3; "
-        "  n += m; "
-        "  return 0; "
-        "end Main; end C;");
+        "module M; class C "
+        "  public static method Chk(m: int?): int "
+        "    var n: int := 5; "
+        "    n += m; "
+        "    return 0; "
+        "  end Chk; "
+        "  public static method Main(): int return Chk(3); end Main; "
+        "end C;");
     BEZEL_EXPECT_TRUE(hasNullableCompoundError(r));
 }
 
 BEZEL_TEST(lifted_operators_rejected_3298, compound_both_nullable) {
+    // fix #3830: both `n` and `m`'s literal initializers narrow them —
+    // both parameterized to keep testing the "both nullable" verdict this
+    // row names. See compound_target_nullable above.
     auto r = parseSemaAll(
-        "module M; class C public static method Main(): int "
-        "  var n: int? := 5; "
-        "  var m: int? := 3; "
-        "  n += m; "
-        "  return 0; "
-        "end Main; end C;");
+        "module M; class C "
+        "  public static method Chk(n: int?, m: int?): int "
+        "    n += m; "
+        "    return 0; "
+        "  end Chk; "
+        "  public static method Main(): int return Chk(5, 3); end Main; "
+        "end C;");
     BEZEL_EXPECT_TRUE(hasNullableCompoundError(r));
 }
 
 BEZEL_TEST(lifted_operators_rejected_3298, compound_and_eq_nullable) {
+    // fix #3830: `n`'s literal initializer narrows it — parameterized. See
+    // compound_target_nullable above.
+    auto r = parseSemaAll(
+        "module M; class C "
+        "  public static method Chk(n: uint?): int "
+        "    n &= 1u; "
+        "    return 0; "
+        "  end Chk; "
+        "  public static method Main(): int return Chk(5u); end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(hasNullableCompoundError(r));
+}
+
+// fix #3830 (v0.288): the rows above used to pin before they were rewritten
+// to parameters — a local's literal initializer §7.4-narrows it, and #3830
+// makes a narrowed `int?`/`uint?` operand admitted at compound assignment
+// exactly as at the binary form. Mirrors
+// nullable_property_compound_2888_test.cpp's
+// `local_increment_narrowed_accepted_3830` (gtest, which pins VALUES; this
+// sema-only file can only assert the absence of a diagnosis).
+BEZEL_TEST(lifted_operators_rejected_3298, narrowed_local_admits_compound) {
     auto r = parseSemaAll(
         "module M; class C public static method Main(): int "
-        "  var n: uint? := 5u; "
-        "  n &= 1u; "
+        "  var n: int? := 5; "
+        "  n += 1; "
+        "  var m: int? := 3; "
+        "  n += m; "
+        "  var u: uint? := 5u; "
+        "  u &= 1u; "
         "  return 0; "
         "end Main; end C;");
-    BEZEL_EXPECT_TRUE(hasNullableCompoundError(r));
+    BEZEL_EXPECT_FALSE(hasNullableCompoundError(r));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
 // ============================================================================
@@ -988,18 +1073,32 @@ BEZEL_TEST(lifted_operators_rejected_3298, retained_qq_eq_nullable_target) {
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-BEZEL_TEST(lifted_operators_rejected_3298, retained_qq_eq_then_compound) {
-    // The signature acceptance case from "Done means" in the issue:
-    //   n ??= 0; n += 1;
-    // where `n: int?`. The `??=` must still be ACCEPTED (per the issue's
-    // structural-exclusion rule for `??=`); the subsequent `+=` IS rejected
-    // by §7.11 — the issue's exact wording: "must now reject only at the
-    // `+=`". This test pins both halves of that pair: it does NOT reject at
-    // the `??=` line (the retained acceptance), and DOES reject the `+=`
-    // line. (Lifting §7.7's "after `x ??= expr`, x is narrowed non-null" onto
-    // a subsequent statement is out of scope — proposal 0114 doesn't rule
-    // it. The compound form on a still-nullable target remains a §7.11
-    // reject.)
+// fix #3830 (v0.288): ⚠ THIS ROW FLIPPED. It used to pin proposal 0114's
+// "Done means" trace case verbatim:
+//   n ??= 0; n += 1;
+// with the ISSUE'S OWN wording "must now reject only at the `+=`" — i.e. the
+// `??=` is accepted (§6.6's structural exclusion, unaffected by this fix) but
+// the subsequent `+=` was expected to STILL REJECT, because lifting §7.7's
+// "after `x ??= expr`, x is narrowed non-null" (§7.4 v0.210, #2104 — a
+// PRE-EXISTING, unrelated rule: `narrowOnAssignment` already treats `??=`
+// exactly like `:=` for narrowing purposes, ExprTypecheck.cpp ~15357) onto a
+// SUBSEQUENT statement was "out of scope — proposal 0114 doesn't rule it" at
+// the time this test was written.
+//
+// #3830 (v0.288, ruling on issue 3686) is exactly that missing ruling for the
+// compound-assignment READ side: it makes `n += 1` consult §7.4 narrowing at
+// all, and `n`'s narrowing here was ALREADY being established by #2104's
+// `??=` rule (`0`'s static type is non-nullable, so every path leaves `n`
+// non-null) — #3830 did not touch narrowing ESTABLISHMENT, only where it is
+// READ, so composing the two now means the trace is admitted end to end.
+// Verified empirically: the program computes 1 (`n` becomes 0 via `??=`,
+// then 1 via `+=`) — confirmed via `bezelc -o` + run, not merely "no error".
+// A parameter does NOT rescue this row the way it does the LITERAL-narrowing
+// fallout elsewhere in this file: `??=` narrows via an IN-BODY event exactly
+// as `if n <> null` does, and that reaches a parameter identically to a
+// local (only a narrowing-via-CALLER-supplied-value, which parameters are
+// immune to, does not apply here) — verified: the parameter form admits too.
+BEZEL_TEST(lifted_operators_rejected_3298, qq_eq_then_compound_narrowed_admitted_3830) {
     auto r = parseSemaAll(
         "module M; class C public static method Main(): int "
         "  var n: int? := null; "
@@ -1007,9 +1106,28 @@ BEZEL_TEST(lifted_operators_rejected_3298, retained_qq_eq_then_compound) {
         "  n += 1; "
         "  return 0; "
         "end Main; end C;");
-    // The program has at least one diagnostic: the §6.6 / §7.11 reject on
-    // the `n += 1` line. It must NOT have a §6.6 / §7.11 reject on the `??=`
-    // line — `??=` is structurally excluded from §7.11.
+    BEZEL_EXPECT_FALSE(hasNullableCompoundError(r));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// The control this file's original test also needed: `??=` narrows only when
+// its RHS is non-nullable (§7.4 v0.210's own condition — "on the was-null-
+// then-null path x leaves null, which narrowOnAssignment handles by
+// clearing"). A NULLABLE `??=` RHS establishes no narrowing, so the
+// subsequent `+=` is still the ordinary §7.11 reject — this is the row that
+// keeps testing what `retained_qq_eq_then_compound` used to name: `??=` is
+// retained/accepted on its own line, and an UNNARROWED target still rejects
+// at the following compound form.
+BEZEL_TEST(lifted_operators_rejected_3298, qq_eq_with_nullable_rhs_leaves_target_unnarrowed) {
+    auto r = parseSemaAll(
+        "module M; class C public static method Main(): int "
+        "  var n: int? := null; "
+        "  var m: int? := null; "
+        "  n ??= m; "
+        "  n += 1; "
+        "  return 0; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     int compoundCount = 0;
     for (const auto& d : r.diagnostics.diagnostics()) {
         if (d.message.find("compound assignment") != std::string::npos &&
