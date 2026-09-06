@@ -281,26 +281,66 @@ BEZEL_TEST(sema_object_universal_result_2964, control_string_receiver_still_type
 }
 
 // ---------------------------------------------------------------------------
-// The two rejects that must SURVIVE. Typing the CALL must not un-reject
-// anything, so both are asserted on their diagnostic TEXT (per tests/README.md
+// The one reject that must SURVIVE. Typing the CALL must not un-reject
+// anything, so it is asserted on its diagnostic TEXT (per tests/README.md
 // a bare `!r.ran` would also be satisfied by a crash).
 // ---------------------------------------------------------------------------
 
-// #2465's reject of the not-yet-sliced collection receivers is gated on the
-// MemberAccessExpr's type (`!ctx_.exprType(ma)`); #2964 types the CallExpr, so
-// the reject must be untouched. Without this pin, a future "fix it on the
-// member access instead" would silently reopen #2465's IR-verification crash.
-BEZEL_TEST(sema_object_universal_result_2964, gethashcode_on_unsliced_collection_still_rejected_2465) {
-    BEZEL_EXPECT_TRUE(hasErrorContaining(
+// fix-forward (spec §8.3, v0.294): this row used to pin that `Set<int>`'s
+// `GetHashCode` was REJECTED as "not yet implemented for this receiver" —
+// `narrow #3896` (audit Set/OwningSet/SortedSet/FrozenArray/Dictionary/
+// OwningDictionary/LinkedList/OwningLinkedList for §8.3/§8.5) closed exactly
+// that gap for Set, joining it to `isAuditedElsewhere` and to the codegen
+// identity default (LlvmBackend_Calls2.cpp's
+// `isBuiltinIdentityResidualCollection`), so the reject this row pinned is
+// STALE — MEASURED on this tree: the program below now compiles and runs
+// clean (`bezelc` exit 0), where the pre-#3896 compiler rejected it. §2465's
+// separate collection-receiver reject (gated on the MemberAccessExpr's type,
+// `!ctx_.exprType(ma)`) is untouched by this row moving — it never covered
+// Set to begin with once #3896 lands, and stays pinned by this file's other
+// rows and by collection_universal_member_narrowing_2465_test.cpp.
+//
+// The replacement pins §8.3's Class-kind identity default with VALUES, not
+// "it compiles": `GetHashCode` is stable across two calls on the SAME
+// instance and DIFFERENT for a distinct, separately-constructed `Set<int>`
+// with the same elements (ruling out a degenerate constant-zero default,
+// #2804's trap) — and `Equals` is reference equality (true against itself,
+// false against that distinct instance). The identity hash's actual VALUE is
+// deliberately left unpinned (`allDigits`, not a literal) — per this file's
+// own header comment, §8.3 promises only within-run stability and address-
+// independence, not a specific number — and the "h=" + ToString() prefix
+// keeps #2964's own point alive: the result still has a TYPE that `+`
+// accepts.
+BEZEL_TEST(sema_object_universal_result_2964,
+           gethashcode_on_set_receiver_implements_spec_8_3_identity_default) {
+    std::string out = runAotOut(
         "module M; class C public static method Main(): int "
         "  using var s := new Set<int>(); "
         "  s.Add(1); "
-        "  var h := s.GetHashCode(); "
-        "  Console.WriteLine(\"h=\" + h.ToString()); "
+        "  using var t := new Set<int>(); "
+        "  t.Add(1); "
+        "  var h1 := s.GetHashCode(); "
+        "  Console.WriteLine(\"h=\" + h1.ToString()); "
+        "  var h2 := s.GetHashCode(); "
+        "  if h1 = h2 then Console.WriteLine(\"stable\"); "
+        "             else Console.WriteLine(\"unstable\"); end; "
+        "  var h3 := t.GetHashCode(); "
+        "  if h1 <> h3 then Console.WriteLine(\"distinct\"); "
+        "              else Console.WriteLine(\"collided\"); end; "
+        "  if s.Equals(s) then Console.WriteLine(\"eqself\"); end; "
+        "  if s.Equals(t) then Console.WriteLine(\"eqother\"); "
+        "                 else Console.WriteLine(\"noteqother\"); end; "
         "  return 0; "
-        "end Main; end C;",
-        "is declared via the universal Object contract (language spec \xC2\xA7"
-        "8.1) but is not yet implemented by this compiler for this receiver"));
+        "end Main; end C;");
+    auto ls = lines(out);
+    BEZEL_EXPECT_EQ(static_cast<int>(ls.size()), 5);
+    if (ls.size() == 5) {
+        BEZEL_EXPECT_TRUE(ls[0].rfind("h=", 0) == 0 && allDigits(ls[0].substr(2)));
+        BEZEL_EXPECT_EQ(ls[1], std::string("stable"));
+        BEZEL_EXPECT_EQ(ls[2], std::string("distinct"));
+        BEZEL_EXPECT_EQ(ls[3], std::string("eqself"));
+        BEZEL_EXPECT_EQ(ls[4], std::string("noteqother"));
+    }
 }
 
 // §8.2 / #487: `GetType` is the one §8.1 instance member that is deferred, and

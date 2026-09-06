@@ -191,6 +191,36 @@ BEZEL_TEST(codegen_nullcond_unit_receiver_equals_hashcode_3452,
                     std::string("A\nnull\nB\nside\nTrue\n"));
 }
 
+// ── T5b (fix-forward #3896 gate recovery, spec §8.1/§8.3/§35.7, v0.294) —
+// the CHOICE arm's #3893 fix, exercised through THIS file's `?.` spelling.
+// §8.1 gives every value an `Equals(other: Object?)`; an `int` argument's
+// static type can never BE a `Sh` value, so it settles False WITHOUT ever
+// boxing the receiver (fix #3893's `equalsArgSettlesFalse`, shared with the
+// record/enum arms — LlvmBackend_Calls2.cpp). MEASURED: pre-#3893 `bezelc`
+// declined this exact program (it is the program the OLD T6 row below used
+// to pin, before its receiver moved a second time — see the comment there
+// for why); on this tree it compiles clean and prints `False`.
+BEZEL_TEST(codegen_nullcond_unit_receiver_equals_hashcode_3452,
+           nullcond_choice_equals_settles_false_against_primitive_arg_spec_8_1_8_3) {
+    auto r = runAot(
+        "module M3452F; "
+        "choice Sh "
+        "  Circle(R: int), "
+        "  Square(S: int); "
+        "end Sh; "
+        "class C "
+        "  public static method Main(): int "
+        "    var s: Sh? := Sh.Circle(1); "
+        "    var b := s?.Equals(7); "
+        "    Console.WriteLine((if b = null then \"null\" else b!.ToString())); "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("False\n"));
+}
+
 // ── T6 — HALF (b) MUST FAIL CLOSED. This is the row the first version of this
 // fix did not have, and its absence let a blocker through review.
 //
@@ -213,12 +243,48 @@ BEZEL_TEST(codegen_nullcond_unit_receiver_equals_hashcode_3452,
 // §8.1 gives every value an `Equals(other: Object?)` and §8.6 boxes the
 // argument, so `p?.Equals(true)` is `False`, which is what it now answers
 // (measured: rc=0, prints `False`). Keeping this row on that program would
-// have pinned the defect, so it moves to a receiver whose decline #3538
-// deliberately does NOT remove: a CHOICE, whose arm still refuses a value
-// primitive because §8.6 forbids boxing an owning-classified choice (§35.4)
-// and settling that needs a §35.7 classification #3538 did not make — issue
-// 3545, with the measured table. Every assertion below is unchanged in kind;
-// only the receiver type in them differs.
+// have pinned the defect, so it moved to a receiver whose decline #3538
+// deliberately did NOT remove: a CHOICE, whose arm at the time still refused
+// a value-primitive argument — issue 3545, with the measured table.
+//
+// ⚠⚠ THE RECEIVER MOVED A SECOND TIME (fix-forward #3896 gate recovery,
+// spec §8.1/§8.3/§35.7/§35.8, v0.294), FOR THE SAME REASON: the CHOICE
+// decline the paragraph above relied on was ITSELF a defect, and #3893
+// (gate the choice `Equals` arm on the static TypeRef, not a bare
+// `isStructTy()`) closed it, with #3900 (box a value-like/borrow-bearing
+// choice) closing the sibling boxing gap in the same batch. `Sh` is
+// VALUE-LIKE (§35.4: both cases hold a plain `int` payload, no `owned`, no
+// borrow) — never owning-classified — so "§8.6 forbids boxing an
+// owning-classified choice" never actually applied to THIS receiver; #3893
+// simply hadn't yet routed the choice arm's `Equals` through the same
+// `equalsArgSettlesFalse` the record/enum arms already used. MEASURED on
+// this tree: `s?.Equals(7)` on `Sh` now compiles and prints `False`
+// (rc=0) — T5b above pins that VALUE. Keeping this row on `Sh.Equals(7)`
+// would pin the now-fixed defect, exactly as keeping it on `Pt.Equals(true)`
+// would have after #3538 — so it moves again, per the same "the row did
+// not weaken" discipline: every assertion below is unchanged in kind; only
+// the receiver/argument SHAPE differs.
+//
+// The residual decline this row now pins is a DIFFERENT one, confirmed
+// still live and unaffected by #3893/#3900/#3896: an argument whose STATIC
+// type is an UNRESOLVED generic type parameter (`X` in a generic method,
+// never substituted at the sema level — codegen substitutes only VALUES,
+// never `ctx_.exprType`'s answer) reaches the choice `Equals` arm's own
+// bare `if (!other->getType()->isStructTy()) return nullptr;`
+// (LlvmBackend_Calls2.cpp): `equalsArgSettlesFalse` requires a settled,
+// resolved argument type and declines to answer for a bare unresolved `X`;
+// `equalsArgIsOwnTypeOrUnresolved` therefore reads TRUE for it (its own
+// "or unresolved" clause) and routes to the structural-equality path
+// instead of the run-time boxing path — which then finds a non-struct
+// argument (`X` substituted to `int` at THIS call site) and declines,
+// mirroring the enum arm's own analogous residual decline a few dozen
+// lines below this one in the same source file. MEASURED: `bezelc` on the
+// program below reports rc=1 with exactly the diagnostic asserted below,
+// unchanged in kind from every prior version of this row. (Independently
+// confirmed NOT to be a #3906-shaped sema false-reject: #3906 is about a
+// GENERIC CHOICE's own classification at a value instantiation — `Sh` here
+// is non-generic and is the RECEIVER, not the argument; the decline this
+// row pins fires in codegen, after sema has already admitted the call.)
 //
 // Deleting the row was the alternative and would have retired the guard the
 // previous commit added it for, one commit after adding it.
@@ -235,9 +301,12 @@ BEZEL_TEST(codegen_nullcond_unit_receiver_equals_hashcode_3452,
         "  Square(S: int); "
         "end Sh; "
         "class C "
+        "  public static method Foo<X>(s: Sh?, arg: X): bool? "
+        "    return s?.Equals(arg); "
+        "  end Foo; "
         "  public static method Main(): int "
         "    var s: Sh? := Sh.Circle(1); "
-        "    var b := s?.Equals(7); "
+        "    var b := C.Foo<int>(s, 7); "
         "    Console.WriteLine((if b = null then \"null\" else b!.ToString())); "
         "    return 0; "
         "  end Main; "

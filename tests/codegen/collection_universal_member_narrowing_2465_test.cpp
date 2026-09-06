@@ -149,14 +149,32 @@ BEZEL_TEST(collection_universal_member_narrowing_2465,
     BEZEL_EXPECT_EQ(run(program), 42);
 }
 
-// The reject generalizes across the registry, not just Stack — Set
-// (array-backed, hash-table-on-top) and Dictionary<K,V> itself
-// (dict-backed) each confirmed independently, and REMAIN rejected: neither
-// is part of #2457 slice 2's scope (Stack/OwningStack/Queue/OwningQueue
-// only). Queue<T> — array-backed, and IS in slice 2's scope — moves to the
-// positive/implemented assertion alongside Stack above, mirroring exactly.
+// The universal-member coverage generalizes across the registry, not just
+// Stack — Set (array-backed, hash-table-on-top) and Dictionary<K,V> itself
+// (dict-backed) each confirmed independently. Queue<T> — array-backed, and
+// in #2457 slice 2's scope — moves to the positive/implemented assertion
+// alongside Stack above, mirroring exactly.
+//
+// fix-forward (spec §8.3, v0.294): this test's Set/Dictionary rows used to
+// pin them as REMAINING rejected (neither was in #2457 slice 2's scope of
+// Stack/OwningStack/Queue/OwningQueue). `narrow #3896` (audit Set/OwningSet/
+// SortedSet/FrozenArray/Dictionary/OwningDictionary/LinkedList/
+// OwningLinkedList for §8.3/§8.5) closed exactly that gap — both are now
+// among the eight names `isAuditedElsewhere` admits, joined to the same
+// §8.3 Class-kind identity default (LlvmBackend_Calls2.cpp's
+// `isBuiltinIdentityResidualCollection`) Stack/Queue already had. MEASURED
+// on this tree: both programs below now compile and run clean where the
+// pre-#3896 compiler rejected them with exactly the `hasError` text this
+// row used to assert — STALE, mirroring the Stack/Queue update above.
+// Replaced with the same "computes the spec-correct value" VALUE
+// assertions Stack/Queue got: identity `GetHashCode` is stable across two
+// calls on the SAME `Set<int>` and DIFFERS from a distinct, separately-
+// constructed `Set<int>` with the same element (ruling out a degenerate
+// constant-zero default, #2804's trap); `Equals` on `Dictionary<K,V>` is
+// reference equality (true against itself, false against a distinct,
+// separately-constructed `Dictionary` with the same entries).
 BEZEL_TEST(collection_universal_member_narrowing_2465,
-           reject_generalizes_across_the_registry) {
+           universal_member_now_implemented_generalizes_across_the_registry_spec_8_3) {
     // Queue<T> (#2457 slice 2): now implemented, not rejected.
     //
     // fix #3119 (spec §8.5, v0.252; stdlib §2.13 rule 1 + rule 3): the literal
@@ -174,28 +192,41 @@ BEZEL_TEST(collection_universal_member_narrowing_2465,
             "end Main; end C;";
         BEZEL_EXPECT_EQ(run(program), 42);
     }
-    BEZEL_EXPECT_TRUE(hasError(
-        "module M; "
-        "class C public static method Main(): int "
-        "  var st := new Set<int>(); "
-        "  st.Add(1); "
-        "  var x := st.GetHashCode(); "
-        "  st.Dispose(); "
-        "  return 0; "
-        "end Main; end C;",
-        "member `GetHashCode` on `Set` is declared via the universal "
-        "Object contract"));
-    BEZEL_EXPECT_TRUE(hasError(
-        "module M; "
-        "class C public static method Main(): int "
-        "  var d := new Dictionary<string, int>(); "
-        "  d[\"a\"] := 1; "
-        "  var x := d.Equals(d); "
-        "  d.Dispose(); "
-        "  return 0; "
-        "end Main; end C;",
-        "member `Equals` on `Dictionary` is declared via the universal "
-        "Object contract"));
+    // Set<T> (narrow #3896): §8.3 identity default, VALUE-correct.
+    {
+        const std::string program =
+            "module M; "
+            "class C public static method Main(): int "
+            "  var st := new Set<int>(); "
+            "  st.Add(1); "
+            "  var st2 := new Set<int>(); "
+            "  st2.Add(1); "
+            "  var h1 := st.GetHashCode(); "
+            "  var h2 := st.GetHashCode(); "
+            "  var h3 := st2.GetHashCode(); "
+            "  var ok := h1 = h2 and h1 <> h3; "
+            "  st.Dispose(); "
+            "  st2.Dispose(); "
+            "  return (if ok then 42 else 1); "
+            "end Main; end C;";
+        BEZEL_EXPECT_EQ(run(program), 42);
+    }
+    // Dictionary<K,V> (narrow #3896): §8.3 identity default, VALUE-correct.
+    {
+        const std::string program =
+            "module M; "
+            "class C public static method Main(): int "
+            "  var d := new Dictionary<string, int>(); "
+            "  d[\"a\"] := 1; "
+            "  var e := new Dictionary<string, int>(); "
+            "  e[\"a\"] := 1; "
+            "  var ok := d.Equals(d) and not d.Equals(e); "
+            "  d.Dispose(); "
+            "  e.Dispose(); "
+            "  return (if ok then 42 else 1); "
+            "end Main; end C;";
+        BEZEL_EXPECT_EQ(run(program), 42);
+    }
 }
 
 // A truly bogus (non-universal) member on Stack was UNAFFECTED by #2465
