@@ -3264,7 +3264,94 @@ llvm::Value* Emitter::lowerValueSemMethodOn(const sema::TypeRef* recvTy,
         if (!other) return nullptr;
         if (other->getType()->isPointerTy())
             other = builder_.CreateLoad(st, other);
-        if (!other->getType()->isStructTy()) return nullptr;
+        // fix #3922 (§8.1/§9.1/§9.2, v0.294): the NON-STRUCT sibling of the
+        // #3918 struct-mismatch guard a few lines below. `arg`'s static type
+        // being an unresolved generic method type parameter reaches this
+        // point via the exact same `equalsArgIsOwnTypeOrUnresolved` "or
+        // unresolved" clause; when a LIVE call site's instantiation
+        // substitutes it to a non-struct type (`int`, `bool`, `string`, …)
+        // `other`'s loaded LLVM type is that primitive's own, never a struct
+        // at all. The PRE-EXISTING bare `return nullptr` here (present since
+        // at least #3538/#3556, untouched by #3918) is reached through a
+        // PLAIN `.` access — like #3918's site, there is no enclosing
+        // §7.5/#3452 "declining inner lowering fails closed" wrapper here to
+        // route a bare decline into a diagnostic. MEASURED on HEAD (2760e31):
+        // `Foo<int>(p, 7)` with `p: Pt`, `Foo` returning the comparison
+        // directly, compiled clean (rc=0) and printed `False` — which
+        // happens to be the structurally-correct §8.3 answer for an `int`
+        // vs. a record, purely by luck of the "#2491 degraded return value"
+        // fallback defaulting a `bool` to zero, not because anything
+        // computed it. The wrongness is observable directly, not just by
+        // coincidence: `Console.WriteLine(p.Equals(arg).ToString())`
+        // (the argument-of-a-statement shape, not a return value) hits the
+        // sibling `#3079` degrade instead and prints NOTHING AT ALL —
+        // "before"/"after" markers around it still print, so the whole
+        // comparison silently vanishes while `bezelc` exits 0 as if nothing
+        // were wrong. This is precisely the loud-to-quiet inversion the
+        // ENUM arm's own `!other->getType()->isIntegerTy()` decline a few
+        // dozen lines above already avoids (see its comment) for the
+        // identical shape of problem, and precisely what #3918's new guard
+        // avoided for the STRUCT-shaped half of this same pre-existing
+        // decline — so this fix gives the NON-struct half the same
+        // treatment: report a located ERROR instead of declining bare, but
+        // ONLY at a LIVE call site.
+        //
+        // ⚠ `!emittingGenericTemplateBody_` IS LOAD-BEARING, not decoration.
+        // `at` (`ctx_.exprType(argE)`) is sema's answer, and sema resolves a
+        // generic method's body exactly ONCE, at its DECLARATION — never
+        // per-instantiation (LlvmBackend_Layout.cpp:6567) — so `at` names the
+        // bare, unresolved `Arg` in EVERY codegen pass over this arm,
+        // including the dead, never-invoked "abstract template" body
+        // `emitFunctionBody` also compiles so the generic method's own IR
+        // verifies (#817/§14.2, LlvmBackend_impl.hpp's
+        // `emittingGenericTemplateBody_`comment: "The template is never the
+        // call target — every call binds the concrete substitution and
+        // routes to a specialization"). In THAT dead pass `arg`'s lowered
+        // representation is the generic-parameter placeholder (an `i32`,
+        // MEASURED via a temporary debug print — never a struct, exactly
+        // like a genuinely-non-struct LIVE instantiation), so an unguarded
+        // version of this check fired there TOO and rejected the whole
+        // compile even for a `Foo<Pt>(p, q)` call site that is completely
+        // well-typed on its own live specialization — a FALSE REJECT of
+        // every generic method that merely CONTAINS this call shape,
+        // independent of what any real caller instantiates it with.
+        // MEASURED: an earlier, unguarded version of this fix broke exactly
+        // that shape (T8, `record_equals_own_type_generic_arg_still_lowers_
+        // 3918`, `Foo<Pt>(p, q)`/`Foo<Pt>(p, d)`) with `r.ran == false`.
+        // `emittingGenericTemplateBody_` is the established, save/restored
+        // (LlvmBackend_Calls2.cpp's own `emitFunctionBody`) signal this
+        // codebase already uses to gate a NEW diagnostic away from that dead
+        // pass — the closest sibling precedent is a few thousand lines above
+        // in this same file (the `ToString`/`Equals`/`GetHashCode`-on-
+        // unconstrained-`T` §8.1/§2465 gate, "FALSE-REJECT ANALYSIS", which
+        // excludes the identical dead-template corpus hit by the same
+        // mechanism) and #2477 (`new T()` in the dead abstract body). In the
+        // dead template pass this decline still bare-returns null exactly as
+        // before this fix, degrading to the pre-existing #2491/#3079
+        // `Severity::Warning` backstop — no operational change there, per
+        // #2477's own "purely a diagnostics-clarity fix" precedent: the dead
+        // body is never called, so a warning-only backstop cannot mislead
+        // anyone about a program's real runtime behavior. A genuinely
+        // `ts`-typed argument at a live call site is unaffected either way:
+        // `equalsArgIsOwnTypeOrUnresolved` only reaches this branch for
+        // "this record's own type, or an unresolved parameter", and a
+        // settled `ts` value is always struct-shaped by construction, so
+        // this reachable-only-through-the-unresolved-parameter path never
+        // fires for it.
+        if (!other->getType()->isStructTy()) {
+            if (emittingGenericTemplateBody_) return nullptr;
+            ctx_.diagnostics().report(
+                Severity::Error, call.span.begin,
+                "member `Equals` on a `" + spec85QualifiedTypeName(ts) +
+                "` receiver was given an argument whose type this "
+                "instantiation does not resolve to a value of that record, "
+                "and \xC2\xA7""9.1/\xC2\xA7""9.2's record equality is defined "
+                "structurally over that record's own fields only, so no "
+                "comparison can be emitted; give the argument the record "
+                "type, or compare through an `Object`-typed operand "
+                "(language spec \xC2\xA7""8.1 / \xC2\xA7""9.1 / \xC2\xA7""9.2)");
+            return llvm::PoisonValue::get(i1());
+        }
         // fix #3918 (§8.1/§9.1/§9.2, v0.294): the RECORD twin of fix #3913's
         // choice-arm guard above. `equalsArgIsOwnTypeOrUnresolved` answers
         // TRUE for an UNRESOLVED generic method type parameter (its "or

@@ -424,3 +424,67 @@ BEZEL_TEST(codegen_record_enum_equals_universal_argument_3538,
     BEZEL_EXPECT_EQ(r.stdoutText,
                     std::string("same True\ndiff False\n"));
 }
+
+// ── T9 (fix #3922, §8.1/§9.1/§9.2, v0.294) — the NON-STRUCT sibling of T7's
+// #3918 guard. `p.Equals(arg)` where `p`'s receiver type is a record and
+// `arg`'s STATIC type is an UNRESOLVED generic method type parameter reaches
+// the SAME `equalsArgIsOwnTypeOrUnresolved` "or unresolved" clause T7 does,
+// but THIS instantiation substitutes it to a NON-STRUCT type (`int`) rather
+// than an unrelated struct — the pre-existing bare `return nullptr` three
+// lines above T7's #3918 guard, present since #3538/#3556 and left untouched
+// by #3918 (filed as issue #3922, the sibling gap #3918's own commit
+// flagged), not a NEW decline.
+//
+// MEASURED on HEAD (2760e31, #3918 already landed): `bezelc` on
+// `Foo<int>(p, 7)` returning the comparison directly compiles clean (rc=0)
+// and PRINTS `False` at run time — the §2491 "return-value expression failed
+// to lower … degraded to a zero/null return value" internal note fires, but
+// `hasErrors()` stays false and the program runs. `False` happens to be the
+// §8.3-correct answer for an `int` against a record (structurally
+// impossible to match), which would make a naive `stdoutText == "False"`
+// oracle unable to tell "correctly computed" from "defaulted to zero by
+// accident" — so this row does NOT use that shape. It instead uses the
+// argument-of-a-`Console.WriteLine`-statement shape (the sibling `#3079`
+// degrade, same underlying `res == nullptr` cause), which MEASURABLY prints
+// NOTHING AT ALL for the failing line while the statements immediately
+// before and after it still print — an unambiguous wrong answer: the whole
+// comparison silently vanishes, not merely computes a value that happens to
+// coincide with the right one.
+//
+// Post-fix, the new guard added by this commit (mirroring T7's #3918 guard
+// and the ENUM arm's own pre-existing `!isIntegerTy()` precedent a few dozen
+// lines above both) reports a located `Severity::Error` and rejects the
+// build (`r.ran` false) instead of degrading either the return value or the
+// statement to nothing.
+BEZEL_TEST(codegen_record_enum_equals_universal_argument_3538,
+           record_equals_non_struct_generic_arg_fails_closed_not_degraded_3922) {
+    auto r = runAot(
+        "module M3538I; "
+        "record Pt(X: int, Y: int, Z: int); "
+        "class C "
+        "  public static method Foo<Arg>(p: Pt, arg: Arg) "
+        "    Console.WriteLine(\"before\"); "
+        "    Console.WriteLine(p.Equals(arg).ToString()); "
+        "    Console.WriteLine(\"after\"); "
+        "  end Foo; "
+        "  public static method Main(): int "
+        "    var p := new Pt(1, 2, 3); "
+        "    C.Foo<int>(p, 7); "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    bool named = false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("member `Equals`") != std::string::npos &&
+            d.message.find("`M3538I.Pt`") != std::string::npos)
+            named = true;
+    BEZEL_EXPECT_TRUE(named);
+    bool explainsWhy = false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("does not resolve to a value of that record") !=
+            std::string::npos)
+            explainsWhy = true;
+    BEZEL_EXPECT_TRUE(explainsWhy);
+}
