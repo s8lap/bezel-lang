@@ -6223,12 +6223,37 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                 // authority instead of re-spelling it here removes a
                 // class-F ratchet offender instead of adding one (#3419's
                 // `check_enumerable_grid_spellings.py --strict`).
+                //
+                // fix #3896 (stdlib §4.6-§4.10/§4.18/§4.19; language spec
+                // §8.5): the eight residual `isAuditedElsewhere` names
+                // (ExprTypecheck_Calls.cpp) join this literal chain
+                // directly rather than through `isArrayEnumeratorWrapSourceName`
+                // — that authority DELIBERATELY excludes them (a hash-
+                // backed Set is snapshotted, not wrapped; SortedSet's
+                // iteration order would break if it took the wrap;
+                // BuiltinRegistry.cpp's own docstring), so widening it
+                // here to admit them would silently change what the §29.2
+                // wrap grid answers for unrelated call sites. This §8.5
+                // rendering is purely a compile-time qualified-name
+                // literal (`builtinClassModulePathOf` + rule-3 generic-
+                // args recursion below) with no dependency on the
+                // receiver's runtime backing, so it is correct for these
+                // eight regardless of their `bz_array_t*`/`bz_dict_t*`/
+                // `bz_llist_t*` representation. None of the eight literal
+                // names here is `OwningBuffer` alongside `Array`/
+                // `OwningArray`, so this chain does not join the #3419
+                // class-F shape (`check_enumerable_grid_spellings.py
+                // --strict` verified clean after this fix).
                 if (recvTy && recvTy->kind == K::Named &&
                         !recvTy->declaration && recvTy->astNode &&
                         recvTy->astNode->name &&
                         !recvTy->astNode->name->parts.empty()) {
                     std::string_view arn = recvTy->headName();
-                    if (common::isArrayEnumeratorWrapSourceName(arn)) {
+                    if (common::isArrayEnumeratorWrapSourceName(arn) ||
+                        arn == "Set" || arn == "OwningSet" ||
+                        arn == "SortedSet" || arn == "FrozenArray" ||
+                        arn == "Dictionary" || arn == "OwningDictionary" ||
+                        arn == "LinkedList" || arn == "OwningLinkedList") {
                         std::string_view mod =
                             common::builtinClassModulePathOf(arn);
                         std::string rendered = mod.empty()
@@ -6519,7 +6544,11 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                 // OwningStack/Queue/OwningQueue) rather than a hand-spelled
                 // chain. Deliberately NOT `isArrayBackedCollectionName` (which
                 // ALSO admits `Set`/`OwningSet`/`SortedSet`/`FrozenArray`,
-                // none of which are audited yet — see #3896) — that broader
+                // and additionally `Dictionary`/`OwningDictionary`/
+                // `LinkedList`/`OwningLinkedList` would need `isDictionaryName`/
+                // `isLinkedListName` too — fix #3896 audits and admits all
+                // eight below via the separate `isBuiltinIdentityResidualCollection`
+                // boolean instead) — that broader
                 // registry answers "is this bz_array_t*-backed", a different
                 // question from "does this receiver need the §8.3 identity
                 // default computed directly because it has no §8.1 vtable".
@@ -6547,8 +6576,46 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                     isBuiltinIdentityHeadCandidate &&
                     common::isArrayEnumeratorWrapSourceName(
                         recvTy->headName());
+                // fix #3896 (stdlib §4.6-§4.10/§4.18/§4.19; language spec
+                // §8.3): the eight residual `isAuditedElsewhere` names
+                // (Set/OwningSet/SortedSet/FrozenArray/Dictionary/
+                // OwningDictionary/LinkedList/OwningLinkedList) need this
+                // SAME direct §8.3 identity default (reference equality /
+                // pointer-based hash) once sema admits them, but are
+                // deliberately NOT folded into `isArrayEnumeratorWrapSourceName`
+                // above — that authority answers a different question (the
+                // §29.2 wrap-source axis) and genuinely excludes hash-
+                // backed/ordered collections from it. This block only ever
+                // treats `recv` as an opaque heap pointer (`ICmpEQ` for
+                // Equals, `bz_obj_identity_hash` for GetHashCode) and never
+                // dereferences a backing-specific field, so it is correct
+                // regardless of whether the receiver is `bz_array_t*`-
+                // backed (Set/OwningSet with a class element, SortedSet,
+                // FrozenArray), `bz_dict_t*`-backed (Set/OwningSet with a
+                // value element, Dictionary, OwningDictionary), or
+                // `bz_llist_t*`-backed (LinkedList, OwningLinkedList) — see
+                // ExprTypecheck_Calls.cpp's `isAuditedElsewhere` comment
+                // for the per-type stdlib confirmation that none declares
+                // an Equals/GetHashCode override. A literal chain (not
+                // routed through any shared authority) is used
+                // deliberately: none of these eight names appears
+                // alongside `OwningBuffer`/`Array`/`OwningArray` in this
+                // statement, so it does not join the #3419 class-F shape
+                // (`check_enumerable_grid_spellings.py --strict` verified
+                // clean after this fix).
+                bool isBuiltinIdentityResidualCollection =
+                    isBuiltinIdentityHeadCandidate &&
+                    (recvTy->headName() == "Set" ||
+                     recvTy->headName() == "OwningSet" ||
+                     recvTy->headName() == "SortedSet" ||
+                     recvTy->headName() == "FrozenArray" ||
+                     recvTy->headName() == "Dictionary" ||
+                     recvTy->headName() == "OwningDictionary" ||
+                     recvTy->headName() == "LinkedList" ||
+                     recvTy->headName() == "OwningLinkedList");
                 bool isBuiltinIdentityRecv =
-                    isBuiltinIdentityIterHead || isBuiltinIdentityArrayFamily;
+                    isBuiltinIdentityIterHead || isBuiltinIdentityArrayFamily ||
+                    isBuiltinIdentityResidualCollection;
                 if (isBuiltinIdentityRecv) {
                     llvm::Value* recv = lowerExpr(*ma->target);
                     if (isEqualsCall) {

@@ -19732,14 +19732,47 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     // slice impossible to land through this predicate. Left
                     // as its own explicit list rather than coupled to an
                     // authority answering a different question.
+                    // fix #3896 (stdlib §4.6-§4.10/§4.18/§4.19; language
+                    // spec §8.3/§8.5): the eight residual
+                    // `isArrayBackedCollectionName`/`isDictionaryName`/
+                    // `isLinkedListName` members #3883 deliberately left
+                    // for a future slice (its own commit body: "NOT
+                    // widened here; filed as issue 3896"). Each is
+                    // confirmed against the stdlib doc for its own section
+                    // (§4.10 Set/OwningSet, §4.18 SortedSet, §4.19
+                    // FrozenArray, §4.8 Dictionary, §4.9 OwningDictionary,
+                    // §4.6 LinkedList, §4.7 OwningLinkedList) to be a real,
+                    // declaration-less `public class` with no
+                    // Equals/GetHashCode/ToString override and no
+                    // `IComparable<T>` conformance -- the identical shape
+                    // OwningBuffer has -- so the same §8.3/§8.5 mechanical
+                    // defaults apply. #3896's own caveat is that these are
+                    // NOT all `bz_array_t*`-backed like OwningBuffer's six
+                    // siblings (Dictionary/OwningDictionary are
+                    // `bz_dict_t*`-backed, LinkedList/OwningLinkedList are
+                    // `bz_llist_t*`-backed, and Set/OwningSet are EITHER
+                    // depending on element kind -- LlvmBackend_Setup.cpp's
+                    // materializeHeapSetLiteral/materializeArrayBackedSetLiteral),
+                    // but this turns out not to matter for either default:
+                    // both codegen sites below treat the receiver as an
+                    // opaque heap POINTER only (ICmpEQ identity / pointer-
+                    // to-int hash for Equals/GetHashCode; a compile-time
+                    // string literal for ToString) and never dereference a
+                    // backing-specific field, so the same mechanism is
+                    // correct regardless of which of the three
+                    // representations the receiver actually is.
                     // GRID-DEBT: #3883 isAuditedElsewhere names OwningBuffer
                     // alongside Array/OwningArray but answers a different
-                    // question from the wrap grid; see the paragraph above.
+                    // question from the wrap grid; see the paragraphs above.
                     bool isAuditedElsewhere =
                         cn == "Array" || cn == "OwningArray" ||
                         cn == "Stack" || cn == "OwningStack" ||
                         cn == "Queue" || cn == "OwningQueue" ||
-                        cn == "OwningBuffer";
+                        cn == "OwningBuffer" ||
+                        cn == "Set" || cn == "OwningSet" ||
+                        cn == "SortedSet" || cn == "FrozenArray" ||
+                        cn == "Dictionary" || cn == "OwningDictionary" ||
+                        cn == "LinkedList" || cn == "OwningLinkedList";
                     bool isRegisteredCollection =
                         !isAuditedElsewhere &&
                         (common::isArrayBackedCollectionName(cn) ||
@@ -19790,15 +19823,67 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     // regression the standing protocol forbids. Reject it
                     // explicitly here, mirroring the Stopwatch.Restart
                     // precedent just below.
-                    if (cn == "OwningBuffer" && ma.member == "CompareTo") {
+                    //
+                    // fix #3896: the eight residual names added to
+                    // `isAuditedElsewhere` above need the SAME carve-out.
+                    // Unlike OwningBuffer, SEVEN of the eight (all but
+                    // FrozenArray) ARE named in the #920/#1112
+                    // isOwningContainer/isNonOwningContainer surface
+                    // tables (Set/LinkedList/Dictionary/SortedSet in
+                    // `isNonOwningContainer`, OwningSet/OwningLinkedList/
+                    // OwningDictionary in `isOwningContainer`), whose
+                    // `allowedOwningMethod`/`allowedNonOwningMethod`
+                    // lambdas do NOT admit `CompareTo` -- so the CALL form
+                    // on those seven already has a second, independent
+                    // backstop (a "§22.5 / §4.x ... not part of this
+                    // collection's method surface" reject) even without
+                    // this carve-out, exactly the OwningBuffer precedent's
+                    // "diagnostic precision, not preventing a silent
+                    // accept" finding, re-confirmed here by reading that
+                    // check's own method allowlists rather than assuming.
+                    // `FrozenArray` matches OwningBuffer exactly -- absent
+                    // from both container tables, so this carve-out is
+                    // load-bearing for its CALL form too, via the same
+                    // generic codegen "no dispatch arm" backstop. For ALL
+                    // EIGHT, the BARE (uncalled) reference sub-case has no
+                    // such backstop either way (the container checks above
+                    // only run inside a CallExpr), so this carve-out is
+                    // the only thing preventing the #2434 silent-Warning
+                    // degradation there, identically to OwningBuffer.
+                    struct ResidualAuditedName {
+                        std::string_view name;
+                        std::string_view generics;
+                        std::string_view stdlibSection;
+                    };
+                    static constexpr ResidualAuditedName
+                        kResidualAuditedNames[] = {
+                            {"OwningBuffer", "<T>", "4.14"},
+                            {"Set", "<T>", "4.10"},
+                            {"OwningSet", "<T>", "4.10"},
+                            {"SortedSet", "<T>", "4.18"},
+                            {"FrozenArray", "<T>", "4.19"},
+                            {"Dictionary", "<K, V>", "4.8"},
+                            {"OwningDictionary", "<K, V>", "4.9"},
+                            {"LinkedList", "<T>", "4.6"},
+                            {"OwningLinkedList", "<T>", "4.7"},
+                        };
+                    const ResidualAuditedName* residualInfo = nullptr;
+                    for (const auto& e : kResidualAuditedNames) {
+                        if (e.name == cn) { residualInfo = &e; break; }
+                    }
+                    if (residualInfo && ma.member == "CompareTo") {
                         auto loc = ma.span.begin;
                         if (loc.line == 0 && ma.target)
                             loc = ma.target->span.begin;
                         ctx_.diagnostics().report(
                             Severity::Error, loc,
-                            "no member `CompareTo` on `OwningBuffer<T>` "
-                            "(stdlib \xC2\xA7""4.14 declares no "
-                            "`IComparable<T>` conformance for this type)");
+                            "no member `CompareTo` on `" +
+                                std::string(residualInfo->name) +
+                                std::string(residualInfo->generics) +
+                                "` (stdlib \xC2\xA7" +
+                                std::string(residualInfo->stdlibSection) +
+                                " declares no "
+                                "`IComparable<T>` conformance for this type)");
                         return;
                     }
                     // fix #3883 (language spec §27.6, following the #2470
@@ -19823,7 +19908,14 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     // unaffected: it is exempted here and dispatches
                     // through the codegen identity/qualified-name paths
                     // this same fix wires up.
-                    if (cn == "OwningBuffer" &&
+                    //
+                    // fix #3896: extended to the same nine names as the
+                    // CompareTo carve-out just above (OwningBuffer + the
+                    // eight residual names) — same reasoning, same
+                    // structural gap (`isAffectedMember` above still does
+                    // not distinguish call from bare-reference form for
+                    // any of them).
+                    if (residualInfo &&
                         (ma.member == "ToString" || ma.member == "Equals" ||
                          ma.member == "GetHashCode") &&
                         &ma != calleeOfCallCtx_) {
@@ -19835,7 +19927,9 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                             std::string("a bare reference to `") +
                                 std::string(ma.member) + "` (language spec "
                                 "\xC2\xA7""27.6) is not yet supported on "
-                                "`OwningBuffer<T>` (language spec \xC2\xA7"
+                                "`" + std::string(residualInfo->name) +
+                                std::string(residualInfo->generics) +
+                                "` (language spec \xC2\xA7"
                                 "8.1/\xC2\xA7""8.3/\xC2\xA7""8.5, #2470): `" +
                                 std::string(ma.member) + "` is a real "
                                 "universal Object member, but this builtin "
