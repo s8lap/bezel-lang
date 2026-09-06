@@ -165,10 +165,43 @@ def _balanced_body(text, open_brace_idx):
 # of them `(`, backslash or whitespace (the C++ grammar's own limit).
 _RAW_STRING_START = re.compile(r'R"([^(\\\s]{0,16})\(')
 
-# An identifier/digit character - used to tell a C++14 digit separator `'`
-# (always flanked by one of these on BOTH sides, e.g. `1'000`, `0xFF'FF`)
-# apart from a genuine char-literal-opening `'` (never is) - fix #3915.
+# An identifier/digit character - used to find the run of characters
+# immediately preceding a `'`, to tell a C++14 digit separator (`1'000`,
+# `0xFF'FF`) apart from a genuine char-literal-opening `'` - fix #3915,
+# narrowed by fix #3920 (see _is_digit_separator: flanking on both sides is
+# necessary but not sufficient - an identifier abutting a char literal,
+# e.g. `return'a'`, has the same shape and is valid C++).
 _WORDCHAR = re.compile(r'[0-9A-Za-z_]')
+
+
+def _is_digit_separator(text, i):
+    """True if the `'` at `text[i]` is a C++14 digit separator (`1'000`,
+    `0xFF'FF`) rather than the start of a char literal that merely abuts an
+    identifier character on both sides (`return'a'`, `x'y'`) - fix #3920.
+
+    Fix #3915 round 2 flagged a `'` as a separator whenever BOTH neighbours
+    were word characters. That is necessary but not sufficient: an
+    identifier ending in a letter immediately followed by a char literal
+    has exactly the same shape and is legal C++ (`int f() { return'a'; }`
+    compiles). The two are distinguished by what kind of TOKEN sits
+    immediately before the `'`: a numeric-literal token can only START
+    with a digit (0-9), while a C++ identifier can never start with one
+    (only a letter or `_`, per the identifier grammar). Walking the
+    contiguous run of word characters before `i` back to its start and
+    checking whether that start character is a digit therefore tells a
+    digit separator (`1'000` -> run "1" starts with '1'; `0xFF'FF` -> run
+    "0xFF" starts with '0') apart from an identifier abutting a char
+    literal (`return'a'` -> run "return" starts with 'r'; `x'y'` -> run
+    "x" starts with 'x') without needing a full numeric-literal grammar.
+    """
+    n = len(text)
+    if not (i > 0 and i + 1 < n and _WORDCHAR.match(text[i - 1]) and
+            _WORDCHAR.match(text[i + 1])):
+        return False
+    j = i - 1
+    while j > 0 and _WORDCHAR.match(text[j - 1]):
+        j -= 1
+    return text[j].isdigit()
 
 
 def _strip_comments(text):
@@ -196,15 +229,16 @@ def _strip_comments(text):
     stripped out from under a real test body.
 
     A `'` is NOT always a character-literal opener: C++14 digit separators
-    (`1'000`, `0xFF'FF`) reuse the same character. Per the fix #3915 review
-    round: a genuine char-literal-opening `'` is never immediately flanked
-    on BOTH sides by an identifier/digit character (`[0-9A-Za-z_]`) with no
-    separating token, whereas a digit separator always is. A `'` flanked
-    that way on both sides is passed through as an ordinary character
-    rather than toggling char-literal mode - otherwise everything after it
-    on the same line (crucially, a same-line `//` comment) would be
-    swallowed as "inside a string" and NOT stripped, resurrecting the
-    exact #3915 misattribution this function exists to eliminate.
+    (`1'000`, `0xFF'FF`) reuse the same character. See _is_digit_separator
+    for how those are told apart from a genuine char-literal-opening `'`
+    (fix #3915, narrowed by fix #3920: flanking by word characters on both
+    sides is necessary but not sufficient - `return'a'` has the same shape
+    and is valid C++, so the preceding TOKEN must actually be numeric). A
+    `'` recognised as a digit separator is passed through as an ordinary
+    character rather than toggling char-literal mode - otherwise everything
+    after it on the same line (crucially, a same-line `//` comment) would be
+    swallowed as "inside a string" and NOT stripped, resurrecting the exact
+    #3915 misattribution this function exists to eliminate.
     """
     out = []
     i, n = 0, len(text)
@@ -218,16 +252,15 @@ def _strip_comments(text):
             i = end
             continue
         c = text[i]
-        if (c == "'" and i > 0 and i + 1 < n and
-                _WORDCHAR.match(text[i - 1]) and _WORDCHAR.match(text[i + 1])):
+        if c == "'" and _is_digit_separator(text, i):
             # C++14 digit separator (`1'000`, `0xFF'FF`), not a char-literal
-            # opener - fix #3915 review round 2. A real char literal is
-            # never immediately preceded by an identifier/digit character
-            # with no separating token; a digit separator always is, on
-            # BOTH sides. Pass it through unchanged rather than entering
-            # char-literal mode, or the rest of THIS line (including a
-            # same-line `//` comment) would wrongly be treated as still
-            # being inside a string and left unstripped.
+            # opener - fix #3915 review round 2, narrowed by fix #3920 (an
+            # identifier abutting a char literal, e.g. `return'a'`, has the
+            # same both-sides-wordchar shape but is NOT a digit separator -
+            # see _is_digit_separator). Pass it through unchanged rather
+            # than entering char-literal mode, or the rest of THIS line
+            # (including a same-line `//` comment) would wrongly be treated
+            # as still being inside a string and left unstripped.
             out.append(c)
             i += 1
             continue
@@ -826,6 +859,40 @@ BEZEL_TEST(fixture_suite, digit_separator_same_line_comment) {
 }
 ''')
 
+        # issue #3920: the SAME both-sides-wordchar shape as a digit
+        # separator also arises from an identifier immediately abutting a
+        # char-literal opener, which is valid C++ (`int f() { return'a'; }`
+        # compiles - confirmed with g++, per the issue). Before the fix,
+        # `_is_digit_separator` did not exist and the flanking check alone
+        # misread this `'` as a digit separator, passing it through instead
+        # of opening char-literal mode - so the closing `'` after `a` was
+        # then misread as an OPENING quote (its own right-hand neighbour is
+        # `;`, not a word character, so it fails the flanking test and falls
+        # through to the ordinary quote branch), desyncing parity for the
+        # rest of the line and leaving the same-line trailing `//` comment
+        # UNSTRIPPED - resurrecting the exact #3915 misattribution. MEASURED:
+        # importing the pre-fix module against this exact fixture pair
+        # reports count=2 (both falsely flagged); the fixed module reports
+        # 0. Real code here only asserts the POSITIVE case.
+        _mk(root, 'tests/codegen/char_literal_abuts_identifier_test.cpp', '''
+BEZEL_TEST(fixture_suite, char_literal_abuts_identifier_return) {
+    auto r = runAot("module M;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    int f() { return'a'; }  // quoting BEZEL_EXPECT_FALSE(r.ran) right after a char literal that abuts an identifier - must still be stripped (issue #3920)
+}
+''')
+        # Sibling shape: a single-letter identifier (not a keyword) abutting
+        # a char literal - `x'y'` has the same both-sides-wordchar shape as
+        # `return'a'` but with a run of length 1 before the `'`, exercising
+        # the _is_digit_separator backward walk's j==i-1 boundary.
+        _mk(root, 'tests/codegen/char_literal_abuts_short_identifier_test.cpp', '''
+BEZEL_TEST(fixture_suite, char_literal_abuts_identifier_short) {
+    auto r = runAot("module M;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    char c = x'y';  // quoting BEZEL_EXPECT_FALSE(r.ran) right after a single-letter identifier abutting a char literal - must still be stripped (issue #3920)
+}
+''')
+
         total, per_file = measure(root)
         chk('bare `!ran` flagged', 'tests/codegen/bare_test.cpp' in per_file)
         chk('`!ran` + hasErrors()-only flagged (equally vulnerable)',
@@ -880,6 +947,17 @@ BEZEL_TEST(fixture_suite, digit_separator_same_line_comment) {
             'same-line trailing comment quoting the pattern IS stripped '
             'and the test is not flagged',
             'tests/codegen/digit_separator_same_line_comment_test.cpp'
+            not in per_file)
+        chk('issue #3920: an identifier abutting a char literal '
+            '(`return\'a\'`) is not misread as a digit separator, so a '
+            'same-line trailing comment quoting the pattern IS stripped '
+            'and the test is not flagged',
+            'tests/codegen/char_literal_abuts_identifier_test.cpp'
+            not in per_file)
+        chk('issue #3920 sibling: a single-letter identifier abutting a '
+            'char literal (`x\'y\'`) is likewise not misread as a digit '
+            'separator',
+            'tests/codegen/char_literal_abuts_short_identifier_test.cpp'
             not in per_file)
         chk('exactly 6 unprotected rows across the fixture tree (bare, '
             'hasErrors-only, the skip-guard-only row, the aliased-skip-only '
