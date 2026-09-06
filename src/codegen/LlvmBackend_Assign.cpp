@@ -4206,6 +4206,17 @@ bool Emitter::lowerCollectionIndexerCompound(const ast::AssignmentStmt& as) {
         }
         std::string op(as.op);
         if (!op.empty() && op.back() == '=') op.pop_back();
+        // fix #3924 (§6.6/§7.11/§17.6, v0.288): `d[k] += m` for a §7.4-narrowed
+        // nullable local/parameter `m` — sema now admits it (#3830), but `rhs`
+        // above is still lowered from `m`'s declared `{i8, T}` storage. Unwrap
+        // BEFORE the overload lookup / `coerceNumericToType` below, mirroring
+        // the local/field/static call site's #3924 fix in LlvmBackend_Stmts.cpp
+        // (this dict path calls bare `emitCompoundOp`, not the already-fixed
+        // `emitCompoundOpTyped`, so it needs its own copy of the unwrap). A
+        // no-op when `as.value`'s declared type is not a nullable primitive —
+        // in particular for a Named-type RHS the overload lookup just below
+        // resolves on its own terms.
+        rhs = unwrapNarrowedNullableOperand(rhs, as.value.get());
         // fix #626 / §25.1: if the VALUE element type has a user-defined
         // `static operator <op>` (two params), dispatch to it and write back —
         // mirrors the #610 overload check in lowerStmt.  emitCompoundOp cannot
@@ -4365,6 +4376,13 @@ bool Emitter::lowerCollectionIndexerCompound(const ast::AssignmentStmt& as) {
             "assignment RHS — #1386");
         return false;
     }
+    // fix #3924 (§6.6/§7.11/§17.6, v0.288): `arr[i] += m` for a §7.4-narrowed
+    // nullable local/parameter `m` — see the dict branch's identical #3924
+    // comment above. This Array<T> branch calls bare `emitCompoundOp` too
+    // (measured: `a[0] += m` for a narrowed `int?` local IR-verifier-aborted
+    // identically to the local/field/static shape, "Call parameter type does
+    // not match function signature!"), so it needs the same unwrap.
+    rhs = unwrapNarrowedNullableOperand(rhs, as.value.get());
     std::string op(as.op);
     if (!op.empty() && op.back() == '=') op.pop_back();
 

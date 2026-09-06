@@ -1388,6 +1388,54 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 // property) — each of which therefore aborted the compile on
                 // `llvm.sadd.with.overflow.s_record.Pairs` for a legal program.
                 // One definition; this site is now the plain call.
+                //
+                // fix #3924 (§6.6/§7.11/§17.6, v0.288): #3830 made sema read the
+                // §7.4-NARROWED type of a compound-assignment RHS instead of its
+                // declared type — so `n: int; m: int? := 3; n += m;` is now
+                // ADMITTED (m's narrowed static type is `int`). Narrowing is a
+                // purely static/sema fact (§7.4): it does NOT change `m`'s
+                // *storage* representation, which stays the declared `{i8
+                // hasValue; T payload}` tagged struct. Every branch below
+                // (opMethod dispatch, the decimal arm, and the built-in CG31
+                // numeric arm) assumes `rhs` already has the OPERAND's natural
+                // scalar/struct shape — exactly what the shared preamble's
+                // `coerceNumericToType(rhs, elemTy, …)` above is a no-op for
+                // (its `srcTy->isIntegerTy()` guards all fail on a struct). Left
+                // unwrapped, the tagged struct reached `llvm.sadd.with.overflow`/
+                // `CreateFAdd` (an IR-verifier abort for the scalar family — "Call
+                // parameter type does not match function signature!") or, for a
+                // `decimal` target, was handed whole to `emitDecimalArith`, which
+                // blindly stores it into a bare-decimal-shaped alloca — a SILENT
+                // wrong value, not a diagnostic.
+                //
+                // The unwrap must be keyed on the RHS OPERAND's own narrowed
+                // shape/sema-type, not on the TARGET's type (unlike the sibling
+                // plain-assignment fix at #914 a few lines up, which correctly
+                // uses `unwrapNarrowedNullable(rhs, elemTy)` because there the
+                // target and RHS are always the SAME primitive type). A compound
+                // assignment admits a WIDER target than the RHS payload
+                // (`decimal += int?`, §5.1/§6.4) — `elemTy` there is
+                // `decimalStructType()` while the narrowed RHS's payload is
+                // `i32`, so a target-keyed match (`unwrapNarrowedNullable`) would
+                // silently fail to fire and leave the struct in place.
+                // `unwrapNarrowedNullableOperand` keys on `as->value`'s own sema
+                // type (`isNullablePrimTy`) instead, exactly mirroring the
+                // already-correct nullable-VALUE-TARGET arm inside
+                // `emitCompoundOp` (LlvmBackend_Layout.cpp's `rPay =
+                // coerceNumericToType(rPay, decimalStructType(), rUns)` at the
+                // #2149 site) — reusing the SAME helper every other
+                // narrowed-operand call site in this file already uses (§6 of
+                // the lane rules: no second spelling of "is this a narrowed
+                // nullable-primitive operand").
+                //
+                // A no-op for every already-correct case: `++`/`--` (synthetic
+                // literal RHS, never a struct), a genuinely-nullable (un-narrowed)
+                // RHS (sema rejects those upstream — #3830's own tests), and a
+                // compound assignment whose TARGET is itself nullable (that shape
+                // is unaffected: `elemTy` there is the tagged struct, so the RHS
+                // arrives already correctly shaped for `emitCompoundOp`'s
+                // existing line-370 nullable-VALUE-LEFT-OPERAND arm).
+                rhs = unwrapNarrowedNullableOperand(rhs, as->value.get());
                 std::string op(as->op);
                 if (!op.empty() && op.back() == '=') op.pop_back();
                 sema::MethodSymbol* opMethod = findCompoundOperatorOverload(
@@ -1505,7 +1553,21 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 // emitCompoundOp below emits an integer overflow intrinsic on a
                 // struct (IR_FAIL; a `/=` SIGABRTs in LLVM). Route through the
                 // decimal arithmetic helper instead.
+                //
+                // fix #3924 (§5.1/§6.4, v0.288): the #3924 unwrap above only
+                // extracts a narrowed-nullable RHS's bare payload — for a
+                // `decimal += int?` (narrowed) RHS that payload is `i32`, not
+                // yet `decimal`. The ordinary (non-narrowed) `d += n` case
+                // already arrives here pre-widened by the shared preamble's
+                // `coerceNumericToType(rhs, elemTy, …)` a few hundred lines up
+                // (its `srcTy->isIntegerTy()` guard fires on a bare scalar), but
+                // that call ran BEFORE today's unwrap could turn the struct into
+                // a scalar, so a narrowed-nullable RHS never got its turn. Widen
+                // here — a no-op when `rhs` is already `decimal` (same-type
+                // `decimal?` narrowed RHS, or the ordinary pre-widened case).
                 if (elemTy == decimalStructType()) {
+                    rhs = coerceNumericToType(rhs, decimalStructType(),
+                                              isUnsignedTargetExpr(*as->value));
                     llvm::Value* cur = builder_.CreateLoad(elemTy, addr);
                     if (llvm::Value* res = emitDecimalArith(op, cur, rhs)) {
                         builder_.CreateStore(res, addr);

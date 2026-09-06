@@ -314,6 +314,25 @@ llvm::Value* Emitter::emitCompoundOpTyped(const std::string& op, llvm::Value* l,
                                           const sema::TypeRef* rightTy, bool fp,
                                           bool uns, bool charTarget,
                                           bool rUns) {
+    // fix #3924 (§6.6/§7.11/§17.6, v0.288): every accessor-mediated compound
+    // assignment (block-form property, virtual/interface property, imported
+    // indexer) funnels through this ONE function, but each caller lowers `r`
+    // straight from its own RHS expression with no unwrap — so #3830's sema
+    // change (reading a compound assignment's §7.4-NARROWED operand type)
+    // reaches here too: `b.NP += m` for a narrowed-nullable local `m` handed
+    // the still-tagged `{i8, T}` struct down to `emitCompoundOp`'s integer/
+    // decimal tails exactly as the local/field/static call site in
+    // LlvmBackend_Stmts.cpp did before its own #3924 fix (measured: a
+    // block-form `int` property IR-verifier-aborted identically — "Call
+    // parameter type does not match function signature!"). `rightTy` is
+    // already the RHS's declared (un-narrowed) sema type every caller
+    // threads in for the §25.2 overload lookup just below, so
+    // `unwrapNarrowedNullableOperand`'s TypeRef overload needs no new
+    // plumbing. Placed before the overload lookup (harmless there: a Named
+    // type with a real `operator <op>` overload is never `isNullablePrimTy`,
+    // so the gate never fires for it) so BOTH arms of this function see the
+    // unwrapped operand.
+    r = unwrapNarrowedNullableOperand(r, rightTy);
     if (sema::MethodSymbol* om =
             findCompoundOperatorOverload(op, leftTy, rightTy)) {
         // §25.1 / §25.2: dispatch to the user-defined binary operator with the

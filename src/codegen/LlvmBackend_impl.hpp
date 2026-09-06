@@ -4885,15 +4885,32 @@ private:
     // Adding a call site without first extending a gate is a defect, not an
     // optimization. A no-op for every ordinary scalar operand (no struct →
     // returns `v` untouched).
+    //
+    // fix #3924 (§6.6/§7.11/§17.6, v0.288): the TypeRef-keyed overload below is
+    // the SAME two-sided gate (shape + `isNullablePrimTy`), factored out so a
+    // caller that already holds the operand's `sema::TypeRef` (every
+    // `emitCompoundOpTyped` caller passes one in as `rightTy`) does not need an
+    // `ast::Expr` in hand — several accessor-mediated compound-assignment call
+    // sites (block-form property, virtual/interface property, imported
+    // indexer) compute `rightTy` once and thread it through, with no single
+    // `ast::Expr*` naming "the RHS" at the point the unwrap is needed. Per the
+    // lane rules' "no second spelling of a decision the compiler already
+    // makes": the `ast::Expr` overload now DELEGATES here instead of
+    // reimplementing the same two checks.
     llvm::Value* unwrapNarrowedNullableOperand(llvm::Value* v,
-                                               const ast::Expr* e) {
-        if (!v || !e) return v;
+                                               const sema::TypeRef* ty) {
+        if (!v || !ty) return v;
         auto* st = llvm::dyn_cast<llvm::StructType>(v->getType());
         if (!st || st->getNumElements() != 2 ||
             st->getElementType(0) != nullablePrimHasValTy())
             return v;
-        if (!isNullablePrimTy(ctx_.exprType(*e))) return v;
+        if (!isNullablePrimTy(ty)) return v;
         return nullablePrimValue(v);
+    }
+    llvm::Value* unwrapNarrowedNullableOperand(llvm::Value* v,
+                                               const ast::Expr* e) {
+        if (!v || !e) return v;
+        return unwrapNarrowedNullableOperand(v, ctx_.exprType(*e));
     }
 
     llvm::Type* lowerTypeRef(const sema::TypeRef* rt);

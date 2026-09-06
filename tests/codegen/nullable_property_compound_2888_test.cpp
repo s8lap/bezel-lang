@@ -514,3 +514,328 @@ BEZEL_TEST(codegen_nullable_property_compound_2888, non_nullable_unchanged_contr
         "end MainP2888;");
     BEZEL_EXPECT_EQ(r.ran ? r.exitCode : -999, 255);
 }
+
+// ===========================================================================
+// T13 — issue #3924: a §7.4-NARROWED nullable RHS on a NON-nullable TARGET.
+//
+// #3830 (T5/T10 above) made §6.6/§17.6 read a compound assignment's operand
+// type AFTER §7.4 narrowing — correctly. That sema change admits a codegen
+// shape nothing had built for: the TARGET is a plain non-nullable
+// scalar/`decimal`, and the RIGHT operand is a DIFFERENT narrowed-nullable
+// local/parameter. Narrowing is purely a static/sema fact (§7.4) — it does
+// NOT change the narrowed operand's *storage*, which stays the declared
+// `{i8 hasValue; T payload}` tagged struct. `Emitter::emitCompoundOp`
+// unwrapped that struct only when the LEFT (target) operand already had the
+// tagged shape (the #2888/#7.11 lifting arm above); a non-nullable target
+// skipped it entirely, so the still-tagged struct flowed into
+// `llvm.sadd.with.overflow`/`CreateFAdd` — measured, an IR-verifier abort
+// ("Call parameter type does not match function signature!" for the scalar
+// family) — or, for `decimal`, was handed whole to `emitDecimalArith`, which
+// blindly stores it into a bare-`%bz.decimal`-shaped alloca: a SILENT WRONG
+// VALUE with no diagnostic (measured: `d += e` for `decimal? e := 2m` printed
+// `11874255106`, not `3`).
+//
+// THE FIX: `unwrapNarrowedNullableOperand` (already used to unwrap a §7.4-
+// narrowed nullable ARGUMENT/INDEX) now also runs on the compound-assignment
+// RHS — at the local/field/static call site (LlvmBackend_Stmts.cpp), inside
+// `emitCompoundOpTyped` (the ONE function every accessor-mediated caller —
+// block-form property, virtual/interface property, imported indexer — already
+// funnels through, per #2904/#2888), and at the two heap-collection indexer
+// call sites (`lowerCollectionIndexerCompound`'s Array<T> and Dictionary<K,V>
+// branches) that call `emitCompoundOp` directly. Every row below is a
+// CORRECT VALUE (or, for the decimal rows, the specific value the miscompile
+// got wrong), not merely "it compiled" — the whole point of the bug is a
+// program that compiles clean and computes garbage.
+// ===========================================================================
+
+namespace {
+
+// A full program (not the body-only `runPlain` shape) that prints ONE
+// decimal value via `Console.WriteLine` and returns 0 — decimal does not fit
+// the 8-bit exit status (see the #2883 file this mirrors).
+std::string decimalOut3924(const std::string& body) {
+    return std::string(
+        "module MD3924; public class CD3924 "
+        "  public static method Main(): int ") +
+        body + "  end Main; end CD3924;";
+}
+
+}  // namespace
+
+// T13.1 — the issue's own two repros, both scalar-integer (IR-verifier abort
+// pre-fix) and decimal (silent miscompile pre-fix), target-vs-RHS SAME type.
+BEZEL_TEST(codegen_nullable_property_compound_2888, narrowed_rhs_nonnullable_target_repro_3924) {
+    // Repro 1 (§6.6/§7.11, v0.288): int target, int? narrowed RHS, `+=`.
+    BEZEL_EXPECT_EQ(runPlain(
+        "    var n: int := 5; var m: int? := 3; n += m; return n; "), 8);
+    // Repro 2 (§6.4/§6.6, v0.288): decimal target, decimal? narrowed RHS,
+    // `+=` — the SILENT-MISCOMPILE row. Pre-fix this printed a nonsense value
+    // (11874255106, measured) with NO diagnostic; post-fix it must be exactly
+    // the value §6.4 defines, 1.0 + 2.0 = 3.
+    BEZEL_EXPECT_EQ(runAotOut(decimalOut3924(
+        "    var d: decimal := 1.0m; var e: decimal? := 2.0m; d += e; "
+        "    Console.WriteLine(d); return 0; ")), "3");
+}
+
+// T13.2 — the exact two programs from fix #3830's own commit message
+// (f89b490), whose comment claimed (without a live test — both were
+// converted to the parameter form before that commit, so nothing shipped
+// broken) that they "compute 8" / "compute 3". Re-reviewed for #3924: BOTH
+// crash with the IR-verifier-abort family on the tree #3830 lands against,
+// because #3830 is sema-only ("No codegen change was needed", per that
+// commit) and never touched `emitCompoundOp`'s target-shape-keyed unwrap.
+// Pinned here at their ORIGINAL (un-parameterized, narrowed-local) source
+// text, taken from git history's
+// tests/lit/sema/compound_nullable_operand_2153__{int_plus_intq,
+// int_and_longq}_rejected.bzl at 45c7d71 (pre-#3830).
+BEZEL_TEST(codegen_nullable_property_compound_2888, commit_3830_claimed_values_3924) {
+    // int_plus_intq: `var i: int := 5; var n: int? := 3; i += n;` — §5.1
+    // same-type `+=`.
+    BEZEL_EXPECT_EQ(runPlain(
+        "    var i: int := 5; var n: int? := 3; i += n; return i; "), 8);
+    // int_and_longq: `var i: int := 7; var w: long? := 3L; i &= w;` — §6.2's
+    // WIDENING bitwise promotion (int target, WIDER long? narrowed RHS):
+    // int widens to long (§5.1), `7L & 3L = 3L`, checked-narrows back to
+    // `int` (§6.6/§5.2) — in range, so no OverflowException.
+    BEZEL_EXPECT_EQ(runPlain(
+        "    var i: int := 7; var w: long? := 3L; i &= w; return i; "), 3);
+}
+
+// T13.3 — every arithmetic/bitwise/shift compound operator (§6.6's full list,
+// A.6) on an `int` target with a narrowed `int?` RHS local. 10 OP 3 (or 1
+// OP 3 for the shifts) for every operator §6.6 admits in compound form.
+BEZEL_TEST(codegen_nullable_property_compound_2888, narrowed_rhs_every_operator_3924) {
+    BEZEL_EXPECT_EQ(runPlain(
+        "    var n: int := 10; var m: int? := 3; n += m; return n; "), 13);
+    BEZEL_EXPECT_EQ(runPlain(
+        "    var n: int := 10; var m: int? := 3; n -= m; return n; "), 7);
+    BEZEL_EXPECT_EQ(runPlain(
+        "    var n: int := 10; var m: int? := 3; n *= m; return n; "), 30);
+    BEZEL_EXPECT_EQ(runPlain(
+        "    var n: int := 10; var m: int? := 3; n /= m; return n; "), 3);
+    BEZEL_EXPECT_EQ(runPlain(
+        "    var n: int := 10; var m: int? := 3; n mod= m; return n; "), 1);
+    BEZEL_EXPECT_EQ(runPlain(
+        "    var n: int := 6; var m: int? := 3; n &= m; return n; "), 2);
+    BEZEL_EXPECT_EQ(runPlain(
+        "    var n: int := 6; var m: int? := 3; n |= m; return n; "), 7);
+    BEZEL_EXPECT_EQ(runPlain(
+        "    var n: int := 6; var m: int? := 3; n ^= m; return n; "), 5);
+    BEZEL_EXPECT_EQ(runPlain(
+        "    var n: int := 1; var m: int? := 3; n <<= m; return n; "), 8);
+    BEZEL_EXPECT_EQ(runPlain(
+        "    var n: int := 16; var m: int? := 2; n >>= m; return n; "), 4);
+}
+
+// T13.4 — the scalar family §6.6 admits (byte/short/long/float/double/char),
+// same-type target + narrowed-nullable RHS, `+=`.
+BEZEL_TEST(codegen_nullable_property_compound_2888, narrowed_rhs_scalar_family_3924) {
+    BEZEL_EXPECT_EQ(runPlain(
+        "    var n: byte := 5; var m: byte? := 3; n += m; return int(n); "), 8);
+    BEZEL_EXPECT_EQ(runPlain(
+        "    var n: short := 5; var m: short? := 3; n += m; return int(n); "),
+        8);
+    BEZEL_EXPECT_EQ(runPlain(
+        "    var n: long := 5; var m: long? := 3; n += m; return int(n); "),
+        8);
+    BEZEL_EXPECT_EQ(runPlain(
+        "    var n: char := char(65); var m: char? := char(2); n += m; "
+        "    return int(n); "), 67);
+    // float/double: not integer exit-status-safe, use the stdout route.
+    BEZEL_EXPECT_EQ(runAotOut(decimalOut3924(
+        "    var n: float := 5.0f; var m: float? := 3.0f; n += m; "
+        "    Console.WriteLine(n); return 0; ")), "8");
+    BEZEL_EXPECT_EQ(runAotOut(decimalOut3924(
+        "    var n: double := 5.0; var m: double? := 3.0; n += m; "
+        "    Console.WriteLine(n); return 0; ")), "8");
+}
+
+// T13.5 — §5.1 WIDENING: the target is WIDER than the narrowed RHS's own
+// type, so the fix's unwrap must hand a scalar of the RHS's OWN width to
+// `emitCompoundOp`'s existing width-promotion tail (§6.2/#2140/#1042) rather
+// than the target's. `long += int?` (5 + 3 = 8) and `decimal += int?`
+// (1 + 4 = 5, §5.1 int-to-decimal widening, §6.4).
+BEZEL_TEST(codegen_nullable_property_compound_2888, narrowed_rhs_widening_target_3924) {
+    BEZEL_EXPECT_EQ(runPlain(
+        "    var n: long := 5; var m: int? := 3; n += m; return int(n); "), 8);
+    BEZEL_EXPECT_EQ(runAotOut(decimalOut3924(
+        "    var d: decimal := 1.0m; var n: int? := 4; d += n; "
+        "    Console.WriteLine(d); return 0; ")), "5");
+}
+
+// T13.6 — the `decimal` target's full §6.4 operator set with a narrowed
+// `decimal?` RHS, mirroring #2883's value-asserted style (`runAotOut`, not
+// merely "it compiled").
+BEZEL_TEST(codegen_nullable_property_compound_2888, narrowed_rhs_decimal_every_operator_3924) {
+    BEZEL_EXPECT_EQ(runAotOut(decimalOut3924(
+        "    var d: decimal := 5.0m; var e: decimal? := 2.0m; d -= e; "
+        "    Console.WriteLine(d); return 0; ")), "3");
+    BEZEL_EXPECT_EQ(runAotOut(decimalOut3924(
+        "    var d: decimal := 5.0m; var e: decimal? := 2.0m; d *= e; "
+        "    Console.WriteLine(d); return 0; ")), "10");
+    BEZEL_EXPECT_EQ(runAotOut(decimalOut3924(
+        "    var d: decimal := 6.0m; var e: decimal? := 2.0m; d /= e; "
+        "    Console.WriteLine(d); return 0; ")), "3");
+    BEZEL_EXPECT_EQ(runAotOut(decimalOut3924(
+        "    var d: decimal := 7.0m; var e: decimal? := 2.0m; d mod= e; "
+        "    Console.WriteLine(d); return 0; ")), "1");
+}
+
+// T13.7 — the RHS narrowed via an in-body null-check GUARD on a method
+// PARAMETER, not a literal-initialized local — §7.4 narrows a parameter
+// identically to a local (a local's literal initializer establishes non-null
+// immediately; a parameter needs an explicit guard, since the caller could
+// pass `null`).
+BEZEL_TEST(codegen_nullable_property_compound_2888, narrowed_rhs_parameter_guard_3924) {
+    auto r = runAot(
+        "module MPar3924; public class CPar3924 "
+        "  public static method Foo(m: int?): int "
+        "    var n: int := 5; "
+        "    if m <> null then n += m; end if; "
+        "    return n; "
+        "  end Foo; "
+        "  public static method Main(): int "
+        "    return Foo(3); "
+        "  end Main; "
+        "end CPar3924;");
+    BEZEL_EXPECT_EQ(r.ran ? r.exitCode : -999, 8);
+}
+
+// T13.8 — a genuinely-nullable (UN-narrowed) RHS stays REJECTED at sema, the
+// control for every row above: a call result is never §7.4-narrowable (its
+// value could differ across calls), so `n += Get()` for `Get(): int?` must
+// still be a §6.6/§7.11 compile error, exactly as before #3830.
+BEZEL_TEST(codegen_nullable_property_compound_2888, narrowed_rhs_control_call_result_still_rejected_3924) {
+    BEZEL_EXPECT_TRUE(rejected2888(
+        "module MCall3924; public class CCall3924 "
+        "  public static method Get(): int? "
+        "    return 3; "
+        "  end Get; "
+        "  public static method Main(): int "
+        "    var n: int := 5; "
+        "    n += Get(); "
+        "    return n; "
+        "  end Main; "
+        "end CCall3924;"));
+}
+
+// T13.9 — the ACCESSOR-MEDIATED shapes: a block-form `int` property (through
+// `emitCompoundOpTyped`, the fix's central call site), a `virtual`/`override`
+// property (confirms the fix does not disturb vtable dispatch — 100 + 4 =
+// 104, the OVERRIDE's backing field, not the base's), an `Array<int>`
+// indexer, and a `Dictionary<string,int>` indexer (the two direct
+// `emitCompoundOp` call sites in `lowerCollectionIndexerCompound`) — each
+// with a narrowed `int?` RHS local.
+BEZEL_TEST(codegen_nullable_property_compound_2888, narrowed_rhs_accessor_mediated_3924) {
+    // Block-form property.
+    {
+        auto r = runAot(
+            "module MProp3924; public class BProp3924 "
+            "  private _np: int := 0; "
+            "  public property NP: int "
+            "    get => _np; "
+            "    set => do _np := value; end; "
+            "  end NP; "
+            "end BProp3924; "
+            "public class CProp3924 "
+            "  public static method Main(): int "
+            "    var b := new BProp3924(); "
+            "    var m: int? := 4; "
+            "    b.NP += m; "
+            "    return b.NP; "
+            "  end Main; "
+            "end CProp3924;");
+        BEZEL_EXPECT_EQ(r.ran ? r.exitCode : -999, 4);
+    }
+    // Virtual/override property dispatch.
+    {
+        auto r = runAot(
+            "module MVProp3924; public class VBase3924 "
+            "  private _v: int := 0; "
+            "  public virtual property VP: int "
+            "    get => _v; "
+            "    set => do _v := value; end; "
+            "  end VP; "
+            "end VBase3924; "
+            "public class VDer3924: VBase3924 "
+            "  private _w: int := 100; "
+            "  public override property VP: int "
+            "    get => _w; "
+            "    set => do _w := value; end; "
+            "  end VP; "
+            "end VDer3924; "
+            "public class CVProp3924 "
+            "  public static method Main(): int "
+            "    var b: VBase3924 := new VDer3924(); "
+            "    var m: int? := 4; "
+            "    b.VP += m; "
+            "    return b.VP; "
+            "  end Main; "
+            "end CVProp3924;");
+        BEZEL_EXPECT_EQ(r.ran ? r.exitCode : -999, 104);
+    }
+    // Array<int> indexer (lowerCollectionIndexerCompound's Array branch).
+    {
+        auto r = runAot(
+            "module MArr3924; public class CArr3924 "
+            "  public static method Main(): int "
+            "    var a := new Array<int>(3, 0); "
+            "    a[0] := 5; "
+            "    var m: int? := 4; "
+            "    a[0] += m; "
+            "    return a[0]; "
+            "  end Main; "
+            "end CArr3924;");
+        BEZEL_EXPECT_EQ(r.ran ? r.exitCode : -999, 9);
+    }
+    // Dictionary<string,int> indexer (lowerCollectionIndexerCompound's Dict
+    // branch).
+    {
+        auto r = runAot(
+            "module MDict3924; public class CDict3924 "
+            "  public static method Main(): int "
+            "    var d := new Dictionary<string, int>(); "
+            "    d[\"k\"] := 5; "
+            "    var m: int? := 4; "
+            "    d[\"k\"] += m; "
+            "    return d[\"k\"]; "
+            "  end Main; "
+            "end CDict3924;");
+        BEZEL_EXPECT_EQ(r.ran ? r.exitCode : -999, 9);
+    }
+}
+
+// T13.10 — the `decimal` twin of T13.9's accessor-mediated sweep: a
+// block-form `decimal` property and an `Array<decimal>` indexer, each with a
+// narrowed `decimal?` RHS. These are the SILENT-MISCOMPILE shape (not an
+// abort) through the accessor paths, so the value assertion is load-bearing.
+BEZEL_TEST(codegen_nullable_property_compound_2888, narrowed_rhs_decimal_accessor_mediated_3924) {
+    BEZEL_EXPECT_EQ(runAotOut(
+        "module MDProp3924; public class BDProp3924 "
+        "  private _d: decimal := 1.0m; "
+        "  public property D: decimal "
+        "    get => _d; "
+        "    set => do _d := value; end; "
+        "  end D; "
+        "end BDProp3924; "
+        "public class CDProp3924 "
+        "  public static method Main(): int "
+        "    var b := new BDProp3924(); "
+        "    var e: decimal? := 2.0m; "
+        "    b.D += e; "
+        "    Console.WriteLine(b.D); "
+        "    return 0; "
+        "  end Main; "
+        "end CDProp3924;"), "3");
+    BEZEL_EXPECT_EQ(runAotOut(
+        "module MDArr3924; public class CDArr3924 "
+        "  public static method Main(): int "
+        "    var a := new Array<decimal>(1, 0.0m); "
+        "    a[0] := 1.0m; "
+        "    var e: decimal? := 2.0m; "
+        "    a[0] += e; "
+        "    Console.WriteLine(a[0]); "
+        "    return 0; "
+        "  end Main; "
+        "end CDArr3924;"), "3");
+}
