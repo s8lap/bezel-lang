@@ -48,23 +48,63 @@ inline SemaResult parseAndCollect(std::string_view source) {
 // that failed to PARSE still had sema run over the parser's error-recovery-
 // truncated AST, so a genuinely grammar-invalid row could "pass" by
 // accident instead of exercising the sema rule its name and comment claim
-// (first found and fixed for one file by fix #3958; this pair centralizes
-// that gate so the class cannot recur file-by-file). Two shapes cover the
-// helpers found in the wild: resolve-only (classification/type-resolution
-// tests that never reach expression typechecking) and resolve+typecheck
-// (the common case). Both gate on `!r.diagnostics.hasErrors()`, exactly as
-// the driver does.
+// (first found and fixed for one file by fix #3958; this trio centralizes
+// that gate so the class cannot recur file-by-file).
+//
+// fix #3996: the driver's gate is evaluated EXACTLY ONCE, immediately after
+// `parser.parseCompilationUnit()` returns and BEFORE `collectSymbols` runs
+// (Driver.cpp ~459-489) — so the condition `!diagnostics.hasErrors()` at
+// that point reflects PARSE diagnostics only. Every pass inside that
+// surviving branch (`collectSymbols`, `resolveTypes`, `typecheckExpressions`,
+// `checkPureBodies`) then runs UNCONDITIONALLY, with no second gate: a
+// symbol-collection-stage error (e.g. a §3.4 reserved-primitive-alias-name
+// rejection) does NOT stop `resolveTypes`/`typecheckExpressions` from
+// running in the real compiler, and both diagnostics are reported together
+// (verified directly: `class Int32 public f: NoSuchType; end Int32;`
+// against the real `bezelc -c` reports BOTH the §3.4 rejection AND the
+// downstream "unresolved type name `NoSuchType`").
+//
+// An earlier version of these three helpers called the existing
+// `parseAndCollect` (which always runs `collectSymbols` once `sourceFile` is
+// non-null) and THEN checked `!r.diagnostics.hasErrors()` before running the
+// rest — checking AFTER `collectSymbols` had already run, so a
+// collectSymbols-stage error incorrectly also gated `resolveTypes`/
+// `typecheckExpressions`/`checkPureBodies`, unlike the real driver. None of
+// #3985's 17 migrated files' fixtures tripped this (verified), but it would
+// have silently mismatched the driver for any future file whose fixture
+// combines a collectSymbols-stage error with an assertion on a
+// resolveTypes/typecheck-stage diagnostic.
+//
+// The fix: each helper does its OWN lex + parse + gate, matching the
+// driver's staging exactly, rather than composing on top of
+// `parseAndCollect`'s own (deliberately different, and unchanged here)
+// contract — `parseAndCollect` is a widely-used base helper for tests that
+// specifically want symbol collection over a possibly-parse-broken AST, and
+// changing ITS gating would be a much larger, unrelated blast radius.
+namespace detail {
+inline SemaResult parseOnlyForGatedHelpers(std::string_view source) {
+    SemaResult r;
+    Lexer lexer(source, r.diagnostics);
+    Parser parser(lexer, r.diagnostics);
+    r.sourceFile = parser.parseCompilationUnit();
+    r.ctx = std::make_unique<sema::SemaContext>(r.diagnostics);
+    return r;
+}
+} // namespace detail
+
 inline SemaResult parseAndResolveGated(std::string_view source) {
-    auto r = parseAndCollect(source);
-    if (r.sourceFile && r.ctx && !r.diagnostics.hasErrors()) {
+    auto r = detail::parseOnlyForGatedHelpers(source);
+    if (r.sourceFile && !r.diagnostics.hasErrors()) {
+        sema::collectSymbols(*r.sourceFile, *r.ctx);
         sema::resolveTypes(*r.sourceFile, *r.ctx);
     }
     return r;
 }
 
 inline SemaResult parseAndTypecheckGated(std::string_view source) {
-    auto r = parseAndCollect(source);
-    if (r.sourceFile && r.ctx && !r.diagnostics.hasErrors()) {
+    auto r = detail::parseOnlyForGatedHelpers(source);
+    if (r.sourceFile && !r.diagnostics.hasErrors()) {
+        sema::collectSymbols(*r.sourceFile, *r.ctx);
         sema::resolveTypes(*r.sourceFile, *r.ctx);
         sema::typecheckExpressions(*r.sourceFile, *r.ctx);
     }
@@ -74,8 +114,9 @@ inline SemaResult parseAndTypecheckGated(std::string_view source) {
 // A third recurring shape (resolve + typecheck + the §22.15 pure-body
 // checker), used by the §22.15/§22.16 purity test files.
 inline SemaResult parseAndCheckPureGated(std::string_view source) {
-    auto r = parseAndCollect(source);
-    if (r.sourceFile && r.ctx && !r.diagnostics.hasErrors()) {
+    auto r = detail::parseOnlyForGatedHelpers(source);
+    if (r.sourceFile && !r.diagnostics.hasErrors()) {
+        sema::collectSymbols(*r.sourceFile, *r.ctx);
         sema::resolveTypes(*r.sourceFile, *r.ctx);
         sema::typecheckExpressions(*r.sourceFile, *r.ctx);
         sema::checkPureBodies(*r.sourceFile, *r.ctx);
