@@ -161,6 +161,18 @@ BEZEL_TEST(codegen_record_string_field_call_release_1747,
 // runs to completion (no UAF / no double-free — exit 0 / no ASan
 // hard-error), even though a leak may still be reported for this residual
 // channel (rc==1 is the prior safe behaviour).
+//
+// ⚠ SCOPE OF THIS ROW'S GUARANTEE (see #3917, filed 2026-09-06): this
+// file's runUnderLeakSanitizer calls emitModule/emitObjectFile directly,
+// bypassing Driver::compileFile, and emitObjectFile's `sanitizeAddress`
+// defaults to false and is never overridden here — nor does it consult
+// forceSanitizeAddress(), so `gate.sh --full` does NOT instrument the
+// GENERATED code for this row either. What "no ASan hard-error" above
+// actually establishes today is therefore **no signal death**, not
+// ASan-detected UAF-freedom. The `_no_uaf_` in this row's name (and in
+// its #3827 sibling below) consequently promises more than the oracle
+// can currently deliver. When #3917 lands, move both rows onto an oracle
+// that really instruments generated code, or rename them.
 BEZEL_TEST(codegen_record_string_field_call_release_1747,
            record_return_call_result_escapes_via_method_arg_safe_no_uaf_spec_28_9) {
     std::string src =
@@ -284,5 +296,94 @@ BEZEL_TEST(codegen_record_string_field_call_release_1747,
     // Pin no UAF / double-free: rc must NOT be 2. The leak itself (rc == 1)
     // is the documented safe direction for the two-local shape the predicate
     // does not admit — a bounded leak, not a soundness defect.
+    BEZEL_EXPECT_TRUE(rc != 2);
+}
+
+// issue #3827 (SOUNDNESS GUARD, not a fix) / §9.7 / §28.9 / §28.3 (v0.286):
+// the #3745 lane attempted to extend walkCallArgs' #1430 plain-parameter
+// relaxation (today gated on stringReleaseMode / borrowingArrayMode) to
+// recordFieldReleaseMode — treating a record-typed local passed BY VALUE to
+// a plain-parameter method call as a call-bounded borrow, exactly as already
+// done for strings. That widening does NOT appear on this HEAD: walkCallArgs
+// (LlvmBackend_Setup.cpp) has no recordFieldReleaseMode-gated arm anywhere in
+// its per-argument relaxation chain (verified by reading every `safeArg =
+// true` site in the function; none tests recordFieldReleaseMode). It was
+// caught during the #3745 lane BEFORE landing — see that commit's body — and
+// filed as #3827 to document why: a callee that stores the by-value record
+// parameter into one of ITS OWN class fields (`this.stored := p;`) aliases
+// the record's string field into a longer-lived slot without minting an
+// independent +1 (§9.7 — a record field store is a raw bit-copy, no
+// retain), so scope-end-releasing the caller's local out from under that
+// alias would be a use-after-free.
+//
+// This row is a GUARD, not a regression fix: nothing in src/ changes. It
+// pins the exact shape #3827 describes (a callee that field-stores its
+// by-value record parameter) so that if a future change ever re-admits this
+// case to walkCallArgs' recordFieldReleaseMode relaxation, this test fails
+// loudly instead of the class silently reappearing.
+//
+// GUARD-SENSITIVITY was verified both directions, but NOT through this row's
+// own in-process run — see the #3827 lane commit body for the full account.
+// Summary: `runUnderLeakSanitizer` links an ASan-instrumented C++ RUNTIME but
+// calls `emitObjectFile` with its default `sanitizeAddress=false`, so the
+// *generated Bezel code*'s own loads/stores carry no shadow-memory checks —
+// enough to catch a LEAK (LSan's exit-time scan needs no per-access
+// instrumentation) but structurally unable to catch a use-after-free *read*
+// of still-mapped freed memory. This is a PRE-EXISTING limitation shared by
+// every row in this file, including the sibling
+// `..._escapes_via_method_arg_safe_no_uaf_spec_28_9` above — its "no UAF"
+// claim rests on the same "no signal death" observation this row makes, not
+// on genuine shadow-memory detection. Confirmed empirically: reintroducing
+// the by-value-arg relaxation to `recordFieldReleaseMode` and re-running
+// THIS row via `runUnderLeakSanitizer` still reported rc==0 (clean), while a
+// standalone `scripts/agent_check.sh --probe --asan` compile+run of the
+// IDENTICAL program (which passes `--sanitize=address`, instrumenting the
+// generated code via `emitObjectFile`'s real parameter) reported an actual
+// `AddressSanitizer: heap-use-after-free` READ on `b.stored.Name.Length`,
+// allocated in `bz$M.C$Mk`, freed in `main` — exactly the mechanism #3827
+// describes. Reverting the widening returns the CLI probe to a clean LSan
+// leak report (rc==1-equivalent), matching this row's own PASS-WITHOUT. So:
+// FAIL-WITH and PASS-WITHOUT are both proven, mechanically, via the CLI
+// probe; this gtest row is a (weaker, "no crash") regression tripwire on top,
+// consistent with its sibling's existing standard. The gap in `runUnderLeak
+// Sanitizer` itself — every "no UAF" claim in this file is actually only
+// "no signal death" — is filed as issue #3917 (an earlier draft of this row
+// also read `b.stored.X`, an int field unrelated to the aliased string,
+// which could never observe a UAF regardless of instrumentation — a second,
+// independent mistake self-caught while proving this).
+BEZEL_TEST(codegen_record_string_field_call_release_1747,
+           record_call_result_byvalue_arg_callee_field_store_no_uaf_spec_9_7_3827) {
+    std::string src =
+        "module M; "
+        "record P(Name: string, X: int); "
+        "class B "
+        "  public stored: P; "
+        "  public method Store(p: P): int "
+        "    this.stored := p; "
+        "    return p.X; "
+        "  end Store; "
+        "end B; "
+        "class C "
+        "  public static method Mk(n: int): P "
+        "    var r := new P($\"v\" + n.ToString(), n); "
+        "    return r; "
+        "  end Mk; "
+        "  public static method Main(): int "
+        "    var total := 0; "
+        "    var b := new B(); "
+        "    var i := 0; "
+        "    while i < 50 do "
+        "      var r2 := Mk(i); "
+        "      total := total + b.Store(r2); "
+        "      i := i + 1; "
+        "    end while; "
+        "    return total + b.stored.Name.Length; "
+        "  end Main; end C;";
+    int rc = runUnderLeakSanitizer(src);
+    if (rc == -1) return;
+    // Pin NO signal-death (ASan hard-error) via this in-process harness. It
+    // may be 0 (LSan clean) or 1 (LSan leak — the documented safe residual
+    // channel #3827's follow-up section tracks for a future sound closure).
+    // The full "no UAF" proof is the standalone CLI probe cited above.
     BEZEL_EXPECT_TRUE(rc != 2);
 }
