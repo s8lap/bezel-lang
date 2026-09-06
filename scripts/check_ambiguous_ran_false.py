@@ -1,0 +1,810 @@
+#!/usr/bin/env python3
+"""check_ambiguous_ran_false.py - ratchet rows that pin a compile-time
+REJECTION using only `runAot`'s `.ran` flag (or `hasErrors()` / a bare
+severity check), with no check on diagnostic message TEXT and no check that
+the diagnostic carries a real, nonzero source LOCATION.
+
+WHY (issue #3892). `runAot`'s `JitResult::ran` is false for FOUR outcomes,
+not one (tests/support/aot_support.hpp):
+  1. a genuine `CompileOutcome::Rejected`;
+  2. `CompileOutcome::Crashed` - the compiler itself died;
+  3. the program compiled and linked fine, then died from a RUNTIME signal;
+  4. a compile/run TIMEOUT, or a forced-ASan report.
+All four are reported as ordinary `Severity::Error` diagnostics at
+`SourceLocation{}` (0:0). A test body that pins "the compiler rejects this"
+with nothing but `BEZEL_EXPECT_FALSE(r.ran)` (or `hasErrors()`, or a raw
+`severity == Error` check) cannot tell outcome 1 apart from 2-4 - it ALSO
+passes when the compiled program segfaults, hangs, or trips ASan.
+
+MEASURED, REPRODUCED (not merely described - see the commit body for the
+exact probe): a program that compiles cleanly and then stack-overflows at
+runtime reports `r.ran=0`, one diagnostic reading "runAot: program terminated
+by signal 11", and a bare `BEZEL_EXPECT_FALSE(r.ran)` against it reports
+`[ OK ]`.
+
+THIS SCRIPT'S COUNTING CRITERIA (stated explicitly per issue #3892's own
+request - a mechanical count over ~35 files of hand-traced "two-hop helper
+chains" cannot reproduce the reviewer's manual 60 exactly, and does not need
+to; only the CRITERIA need to be stated so the baseline means something):
+
+  A ROW is one (file, BEZEL_TEST body, variable) triple such that:
+    - `variable` is bound in that body from a rejection-observing harness
+      call (runAot / runAotOut / runAotChecked / runAotCheckedLenient /
+      runAotCheckedDisposal), and
+    - the body contains at least one "rejection-claim" assertion for that
+      variable: `BEZEL_EXPECT_FALSE(variable.ran)`, or
+      `BEZEL_EXPECT_TRUE(variable(.diagnostics)?.hasErrors())`, and
+    - the body contains NO "protection": neither
+        (a) a direct `.message.find(` scan, nor
+        (b) a call, with `variable` as an argument, to a helper whose name
+            signals a message/location check (a fixed marker-substring list
+            covering both this codebase's existing idiom names -
+            hasErrorContaining / hasErrorWithRealLocation / hasMsgAtRealLocation
+            / hasErrorLocatedAt - and the two this issue promotes -
+            failedAtCompileTimeNotRuntime / failedAtCompileTimeWithRealLocation
+            / diagnosticMessageContains), nor
+        (c) an in-file helper taking a JitResult-shaped parameter whose OWN
+            body reads `.message` (the same "classify a local predicate by
+            its body, not its name" technique scripts/check_vacuous_tests.py
+            uses, for a helper this script has not been told the name of),
+            nor
+        (d) a location check anywhere in the body: both a `.line` and a
+            `.column` member compared against 0 (the
+            tests/sema/instantiation_hash_container_diag_3796_test.cpp idiom
+            this issue names as an equally-sound alternative to a text
+            check).
+
+  ONE row per (file, test, variable), not one per macro invocation - a body
+  asserting both `!ran` and `hasErrors()` for the same variable is one claim
+  about that variable, not two.
+
+  Scope is every `tests/**/*_test.cpp` file (tests/support/ INCLUDED,
+  deliberately: tests/support/aot_infra_loud_3007_test.cpp's
+  `legacy_negative_assertion_shape` is a knowingly-preserved demonstration of
+  exactly this unsound shape for issue #3007's unrelated purpose, and a
+  mechanical detector has no way to distinguish "deliberate demonstration"
+  from "accidental bug" without a suppression marker this run does not add -
+  see the commit body).
+
+WHAT THIS DOES NOT CLAIM. This is a heuristic over source TEXT, not a
+type-checked trace of every helper-chain hop (issue #3892's own count needed
+manual inspection of two-hop chains like
+`sawPureOperatorReject(diagText(r), ...)`). A name-based allowlist plus a
+body-classified-helper pass catches the common shapes; a helper defined in a
+header this script does not parse, under a name matching none of the markers,
+would be missed. That is why the count here differs from the issue's manually
+measured 60 - and why FIXING rows (the sweep) is explicitly out of THIS
+lane's scope (see #3892 and its filed follow-up).
+
+THE BASELINE IS EXACT, NOT A CEILING - same rule every ratchet in this file's
+family uses (scripts/check_deprecated_jit_oracle.py, scripts/check_localdecl_
+only_walkers.py, ...). A count BELOW baseline fails as STALE HEADROOM: a sweep
+PR that fixes rows but forgets `--update` silently buys room for the next
+regression.
+
+Usage:  scripts/check_ambiguous_ran_false.py [--strict] [--self-test]
+                                             [--update [--force]] [--list]
+"""
+import argparse
+import pathlib
+import re
+import sys
+import tempfile
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+BASELINE = ROOT / 'scripts' / 'ambiguous_ran_false.baseline'
+
+# A result binding from a harness call whose `.ran == false` is ambiguous
+# between reject / crash / runtime-signal / timeout / ASan (issue #3892).
+# Allows an optional `bezel::test::` qualification (file_io_644_test.cpp's
+# probe file used the qualified form before fix #3892's `using` declaration).
+BIND = re.compile(
+    r'\b(?:auto|JitResult|bezel::test::JitResult)\s+(\w+)\s*=\s*'
+    r'(?:bezel::test::)?'
+    r'(?:runAot|runAotOut|runAotChecked|runAotCheckedLenient|'
+    r'runAotCheckedDisposal)\s*\(')
+
+BEZEL_TEST = re.compile(r'BEZEL_TEST\s*\(\s*(\w+)\s*,\s*(\w+)\s*\)', re.S)
+
+# An in-file predicate over a JitResult: `bool NAME(<...JitResult...>) {`.
+HELPER = re.compile(r'\b(?:static\s+|inline\s+)*bool\s+(\w+)\s*\(([^;{)]*)\)\s*\{')
+
+# Marker substrings for a CALLEE NAME that signals "this checks diagnostic
+# message text or location" - covers both this codebase's pre-existing idiom
+# names and the ones issue #3892 promotes into tests/support/
+# aot_result_asserts.hpp. Matched as a substring of the identifier
+# immediately before an opening paren.
+NAME_MARKERS = (
+    'ErrorContaining', 'RealLocation', 'LocatedAt', 'NotRuntime',
+    'hasMsgAt', 'diagnosticMessageContains',
+)
+
+
+def _balanced_body(text, open_brace_idx):
+    """Return the text between the brace at open_brace_idx and its match."""
+    depth = 0
+    for j in range(open_brace_idx, len(text)):
+        if text[j] == '{':
+            depth += 1
+        elif text[j] == '}':
+            depth -= 1
+            if depth == 0:
+                return text[open_brace_idx + 1:j]
+    return text[open_brace_idx + 1:]
+
+
+# The literal the toolchain-unavailable bail-out idiom hardcodes. Found under
+# BOTH `wasSkipped` and `aotWasSkipped` spellings (248 combined in-file
+# copies) - always exactly this fixed literal, e.g.:
+#   bool wasSkipped(const JitResult& r) {
+#       if (r.ran) return false;
+#       for (const auto& d : r.diagnostics.diagnostics())
+#           if (d.message.find("SKIP") != std::string::npos) return true;
+#       return false;
+#   }
+# This reads `.message` and would otherwise be misclassified as a text check
+# that PROTECTS a `BEZEL_EXPECT_FALSE(r.ran)` row - but it is orthogonal to
+# the reject-vs-crash/signal/timeout/ASan discriminator issue #3892 is about;
+# it only tells a caller "the toolchain to run this program at all was
+# unavailable", not "this failed because the compiler rejected it". A
+# `BEZEL_TEST` guarded ONLY by `if (wasSkipped(r)) return;` before
+# `BEZEL_EXPECT_FALSE(r.ran)` is measurably as unprotected as a bare row.
+SKIP_LITERAL = '"SKIP"'
+
+# A local alias for `.message`: `const std::string& m = d.message;` (or
+# `auto`/`std::string_view`, with or without `&`/`const`). A helper may read
+# `.message` through such an alias rather than spelling `.message.find(`
+# directly - e.g. tests/sema/lambda_param_no_target_type_reject_3756_test.cpp's
+# `locatedAt`: `const std::string& m = d.message; ... m.find(tail)`.
+ALIAS_DECL = re.compile(
+    r'\b(?:const\s+)?(?:std::string|std::string_view|auto)\s*&?\s*(\w+)\s*=\s*'
+    r'[\w.]*\.message\b')
+
+
+def _balanced_body(text, open_brace_idx):
+    """Return the text between the brace at open_brace_idx and its match."""
+    depth = 0
+    for j in range(open_brace_idx, len(text)):
+        if text[j] == '{':
+            depth += 1
+        elif text[j] == '}':
+            depth -= 1
+            if depth == 0:
+                return text[open_brace_idx + 1:j]
+    return text[open_brace_idx + 1:]
+
+
+def _balanced_paren(text, open_paren_idx):
+    """Return the text between the '(' at open_paren_idx and its match,
+    treating parens INSIDE a `"..."` string literal as inert. Without this a
+    diagnostic-message literal that itself contains '(' or ')' (e.g.
+    `"...`OfType<" + u + ">()`..."` in
+    tests/codegen/oftype_removal_completeness_3440_test.cpp's `removedOfType`)
+    can desynchronise a naive character count."""
+    depth, in_str, i, n = 0, False, open_paren_idx, len(text)
+    while i < n:
+        c = text[i]
+        if in_str:
+            if c == '\\':
+                i += 1  # skip the escaped character entirely
+            elif c == '"':
+                in_str = False
+        else:
+            if c == '"':
+                in_str = True
+            elif c == '(':
+                depth += 1
+            elif c == ')':
+                depth -= 1
+                if depth == 0:
+                    return text[open_paren_idx + 1:i]
+        i += 1
+    return text[open_paren_idx + 1:]
+
+
+def _message_find_call_args(body):
+    """Every `<message-derived>.find(...)` call's raw argument TEXT in
+    `body` - `.message.find(...)` directly, or `<alias>.find(...)` for an
+    ALIAS_DECL-recognised local alias of `.message`. Argument text is
+    returned RAW (untouched, whitespace-trimmed only) precisely so the
+    caller does not need to understand concatenation/expression syntax -
+    only whether it is EXACTLY the `"SKIP"` literal or not."""
+    names = {'message'} | {a.group(1) for a in ALIAS_DECL.finditer(body)}
+    call_start = re.compile(
+        r'\b(?:' + '|'.join(re.escape(n) for n in names) + r')\s*\.\s*find\s*\(')
+    args = []
+    for m in call_start.finditer(body):
+        args.append(_balanced_paren(body, m.end() - 1).strip())
+    return args
+
+
+def _text_checking_helpers(text):
+    """Set of in-file helper names taking a JitResult-shaped parameter whose
+    OWN body reads `.message` - classified by BODY, not name (the
+    check_vacuous_tests.py technique), so an oddly-named local helper is
+    still recognised as protective.
+
+    The exclusion is POSITIVE, not a parse failure: a helper is EXCLUDED
+    (denied protective status) only when every `.message`-derived
+    `.find(...)` call this function can find in its body can be confirmed to
+    use the exact fixed `"SKIP"` literal (the toolchain-unavailable bail-out
+    idiom - see SKIP_LITERAL above) - i.e. there is at least one such call,
+    and none of them is anything else. Anything this function CANNOT
+    positively confirm as skip-only - no recognised `.find(` call at all
+    (some other check shape, e.g. `==`/`starts_with`/a regex), a call this
+    function's alias/string-literal handling still cannot see through,
+    ANYTHING - defaults to PROTECTIVE, matching the plain historical
+    `.message in body` behaviour. This asymmetry is deliberate (see the
+    commit body / #3892 review round 3): an inflated baseline never reaches
+    zero and people stop trusting it, whereas a missed row is merely one
+    fewer defect caught THIS ratchet, not a false alarm. Fail toward
+    under-flagging, never over-flagging."""
+    out = set()
+    for m in HELPER.finditer(text):
+        params = m.group(2)
+        if 'JitResult' not in params:
+            continue
+        body = _balanced_body(text, m.end() - 1)
+        if '.message' not in body:
+            continue
+        finds = _message_find_call_args(body)
+        if finds and all(a == SKIP_LITERAL for a in finds):
+            continue  # positively confirmed skip-only - deny
+        out.add(m.group(1))
+    return out
+
+
+LOC_LINE = re.compile(r'\.line\b\s*[><=!]=?\s*0')
+LOC_COLUMN = re.compile(r'\.column\b\s*[><=!]=?\s*0')
+
+
+def _name_marker_call(body, var):
+    """True if `body` calls SOME_NAME(..., var, ...) [var in any argument
+    position, since a needle/substring often comes first] where SOME_NAME
+    contains one of NAME_MARKERS."""
+    for mk in re.finditer(r'([A-Za-z_]\w*)\s*\(', body):
+        name = mk.group(1)
+        if not any(marker in name for marker in NAME_MARKERS):
+            continue
+        # Find this call's argument list (balanced on parens) and check `var`
+        # appears in it as a whole identifier.
+        depth = 0
+        j = mk.end() - 1
+        for k in range(j, len(body)):
+            if body[k] == '(':
+                depth += 1
+            elif body[k] == ')':
+                depth -= 1
+                if depth == 0:
+                    args = body[j + 1:k]
+                    if re.search(r'\b' + re.escape(var) + r'\b', args):
+                        return True
+                    break
+    return False
+
+
+def _protected(body, var, text_helpers):
+    if re.search(r'\.message\s*\.\s*find\s*\(', body):
+        return True
+    if _name_marker_call(body, var):
+        return True
+    for name in text_helpers:
+        if re.search(r'\b' + re.escape(name) + r'\s*\(\s*' + re.escape(var) +
+                      r'\s*[,)]', body):
+            return True
+    if LOC_LINE.search(body) and LOC_COLUMN.search(body):
+        return True
+    return False
+
+
+RAN_FALSE = re.compile(r'BEZEL_EXPECT_FALSE\s*\(\s*(\w+)\s*\.\s*ran\s*\)')
+HAS_ERRORS_TRUE = re.compile(
+    r'BEZEL_EXPECT_TRUE\s*\(\s*(\w+)\s*(?:\.\s*diagnostics)?\s*\.\s*'
+    r'hasErrors\s*\(\s*\)\s*\)')
+
+
+def scan_file(path, text):
+    """-> list of (test_name, var) unprotected rows in this file's text."""
+    if 'BEZEL_TEST' not in text:
+        return []
+    if not (RAN_FALSE.search(text) or HAS_ERRORS_TRUE.search(text)):
+        return []
+    text_helpers = _text_checking_helpers(text)
+    marks = [(m.start(), f'{m.group(1)}.{m.group(2)}', m.end())
+             for m in BEZEL_TEST.finditer(text)]
+    out = []
+    for i, (start, tname, end) in enumerate(marks):
+        stop = marks[i + 1][0] if i + 1 < len(marks) else len(text)
+        body = text[end:stop]
+        bound_vars = {m.group(1) for m in BIND.finditer(body)}
+        claim_vars = ({m.group(1) for m in RAN_FALSE.finditer(body)} |
+                      {m.group(1) for m in HAS_ERRORS_TRUE.finditer(body)})
+        # STRICTLY require the claim variable to be bound, in this same
+        # body, from a rejection-observing runAot-family call. Issue #3892
+        # is specifically about THAT harness's four-outcome `.ran` ambiguity
+        # (a program that is compiled AND RUN) - a `.hasErrors()` assertion
+        # over an unrelated result type (OwnershipResult / SemaResult from a
+        # static-analysis-only check that never executes anything) does not
+        # have this ambiguity at all, and an early draft of this script that
+        # counted such vars whenever NO local binding was recognised in a
+        # body inflated the count from ~1170 by picking up the entire
+        # ownership/sema suites. Under-counting an unusually-wrapped runAot
+        # binding (a project helper like `auto r = compileAndRun(src)`) is
+        # the safer failure mode for a ratchet than over-counting an entire
+        # unrelated test family.
+        for var in sorted(claim_vars & bound_vars):
+            if not _protected(body, var, text_helpers):
+                out.append((tname, var))
+    return out
+
+
+def measure(root):
+    """-> (total, per_file) where per_file: {relpath: [(test, var), ...]}."""
+    per_file = {}
+    tests_dir = root / 'tests'
+    if not tests_dir.is_dir():
+        return 0, {}
+    for p in sorted(tests_dir.rglob('*_test.cpp')):
+        try:
+            text = p.read_text(errors='replace')
+        except OSError:
+            continue
+        rows = scan_file(p, text)
+        if rows:
+            per_file[str(p.relative_to(root))] = rows
+    total = sum(len(v) for v in per_file.values())
+    return total, per_file
+
+
+def read_baseline(path=BASELINE):
+    if not path.exists():
+        sys.stderr.write('missing baseline: %s\n' % path)
+        raise SystemExit(2)
+    for line in path.read_text().splitlines():
+        s = line.strip()
+        if not s or s.startswith('#'):
+            continue
+        if s.startswith('<<<<<<<') or s.startswith('=======') \
+                or s.startswith('>>>>>>>'):
+            sys.stderr.write(
+                'scripts/ambiguous_ran_false.baseline has unresolved merge '
+                'conflict markers. Resolve by taking EITHER side (the count '
+                'is re-measured), then re-run --update on the merged tree.\n')
+            raise SystemExit(2)
+        if '=' not in s:
+            continue
+        k, _, v = s.partition('=')
+        if k.strip() == 'count':
+            try:
+                return int(v.strip())
+            except ValueError:
+                pass
+    sys.stderr.write('scripts/ambiguous_ran_false.baseline is missing '
+                     "'count'.\n")
+    raise SystemExit(2)
+
+
+def write_baseline(count, path=BASELINE):
+    path.write_text('\n'.join([
+        '# ambiguous_ran_false.baseline - ratchet for issue #3892: a row',
+        '# pinning a compile-time REJECTION with only `!ran` / `hasErrors()`',
+        '# and no message-text or real-location check cannot distinguish a',
+        '# genuine rejection from a runtime crash/signal/timeout/ASan report.',
+        '#',
+        '# Regenerate with scripts/check_ambiguous_ran_false.py --update after',
+        '# fixing (protecting) a row.  --update refuses to raise a count.',
+        '#',
+        '# EXACT, not a ceiling: a count below baseline fails as STALE',
+        '# HEADROOM (see the script docstring - same rule as every other',
+        '# ratchet in this family).',
+        '#',
+        '# See the script docstring for the exact counting criteria; this',
+        "# number is NOT expected to equal issue #3892's manually-traced 60",
+        '# (different, explicitly-stated criteria - see docstring).',
+        'count = %d' % count,
+        '']))
+
+
+def check(root, baseline_path=BASELINE, stale=True):
+    base = read_baseline(baseline_path)
+    cur, per_file = measure(root)
+    if cur > base:
+        return False, [
+            'ROSE: baseline %d, tree has %d (+%d). A new row pins a '
+            'compile-time rejection using only `.ran`/`hasErrors()` with no '
+            'message-text or real-location check - see script docstring for '
+            'the fix (use tests/support/aot_result_asserts.hpp or an '
+            'equivalent).' % (base, cur, cur - base)], per_file
+    if stale and cur < base:
+        return False, [
+            'baseline claims %d but the tree has %d - STALE HEADROOM (%+d). '
+            'The baseline is exact, not a ceiling: re-run --update on the '
+            'tree that fixed these rows so the improvement is banked.'
+            % (base, cur, cur - base)], per_file
+    return True, [], per_file
+
+
+# ---------------------------------------------------------------------------
+# self-test
+# ---------------------------------------------------------------------------
+
+def _mk(root, rel, text):
+    p = root / rel
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(text)
+    return p
+
+
+def self_test():
+    ok = True
+
+    def chk(label, cond):
+        nonlocal ok
+        if not cond:
+            ok = False
+            print('  FAIL: %s' % label)
+        else:
+            print('  ok:   %s' % label)
+
+    with tempfile.TemporaryDirectory() as td:
+        root = pathlib.Path(td)
+
+        _mk(root, 'tests/codegen/bare_test.cpp', '''
+BEZEL_TEST(fixture_suite, bare_ran_false) {
+    auto r = runAot("module M;");
+    BEZEL_EXPECT_FALSE(r.ran);
+}
+''')
+        _mk(root, 'tests/codegen/haserrors_only_test.cpp', '''
+BEZEL_TEST(fixture_suite, haserrors_only) {
+    auto r = runAot("module M;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+''')
+        _mk(root, 'tests/codegen/text_checked_test.cpp', '''
+BEZEL_TEST(fixture_suite, text_checked) {
+    auto r = runAot("module M;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(hasErrorContaining(r, "some specific text"));
+}
+''')
+        _mk(root, 'tests/codegen/shared_helper_test.cpp', '''
+#include "support/aot_result_asserts.hpp"
+BEZEL_TEST(fixture_suite, shared_helper) {
+    auto r = runAot("module M;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeNotRuntime(r));
+}
+''')
+        _mk(root, 'tests/codegen/location_checked_test.cpp', '''
+namespace {
+struct Loc { int line; int column; };
+Loc parseLoc(const bezel::test::JitResult& r) { return {1, 2}; }
+}
+BEZEL_TEST(fixture_suite, location_checked) {
+    auto r = runAot("module M;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    auto loc = parseLoc(r);
+    BEZEL_EXPECT_TRUE(loc.line > 0);
+    BEZEL_EXPECT_TRUE(loc.column > 0);
+}
+''')
+        _mk(root, 'tests/codegen/local_helper_body_checked_test.cpp', '''
+namespace {
+bool weirdlyNamed(const bezel::test::JitResult& r, const char* s) {
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find(s) != std::string::npos) return true;
+    return false;
+}
+}
+BEZEL_TEST(fixture_suite, local_helper_body_checked) {
+    auto r = runAot("module M;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(weirdlyNamed(r, "x"));
+}
+''')
+        _mk(root, 'tests/codegen/direct_message_find_test.cpp', '''
+BEZEL_TEST(fixture_suite, direct_message_find) {
+    auto r = runAot("module M;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    bool found = false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("x") != std::string::npos) found = true;
+    BEZEL_EXPECT_TRUE(found);
+}
+''')
+        # THE REVIEWER'S FINDING, pinned: a `wasSkipped`-shaped toolchain
+        # bail-out guard reads `.message` but checks ONLY the fixed "SKIP"
+        # literal - orthogonal to reject-vs-crash discrimination. Before the
+        # SKIP_LITERAL fix this was misclassified as a text check and the row
+        # went unflagged (the exact shape of
+        # tests/codegen/narrowed_value_op_arg_release_3116_test.cpp /
+        # narrowed_value_unbox_3090_test.cpp /
+        # dict_sorted_key_local_release_3887_3888_test.cpp).
+        _mk(root, 'tests/codegen/skip_guard_only_test.cpp', '''
+namespace {
+bool wasSkipped(const bezel::test::JitResult& r) {
+    if (r.ran) return false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("SKIP") != std::string::npos) return true;
+    return false;
+}
+}
+BEZEL_TEST(fixture_suite, skip_guard_only) {
+    auto r = runAot("module M;");
+    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(r.ran);
+}
+''')
+        # Companion: a helper that ALSO checks a real substring alongside the
+        # SKIP bail-out is still genuinely protective - the fix must not
+        # over-correct into denying every helper whose body ever mentions
+        # "SKIP".
+        _mk(root, 'tests/codegen/skip_guard_plus_real_check_test.cpp', '''
+namespace {
+bool wasSkippedOrRejected(const bezel::test::JitResult& r, const char* sub) {
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        if (d.message.find("SKIP") != std::string::npos) return true;
+        if (d.message.find(sub) != std::string::npos) return true;
+    }
+    return false;
+}
+}
+BEZEL_TEST(fixture_suite, skip_guard_plus_real_check) {
+    auto r = runAot("module M;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(wasSkippedOrRejected(r, "some specific rejection text"));
+}
+''')
+        # ROUND-3 REVIEW FINDING: the classifier's FIND_CALL regex only
+        # recognised `.message.find("literal")` or `.message.find(ident)`
+        # directly - so it silently failed to parse (and therefore denied
+        # protection to) two real shapes, inflating the count by 12 false
+        # positives on the real tree. Both get their own fixture here, which
+        # is the gap that let the bug ship (self-test exercised neither).
+        #
+        # Shape 1: `.message` ALIASED to a local before `.find(` is called
+        # on the alias - tests/sema/lambda_param_no_target_type_reject_3756_
+        # test.cpp's `locatedAt`.
+        _mk(root, 'tests/codegen/aliased_message_check_test.cpp', '''
+namespace {
+bool locatedAt(const bezel::test::JitResult& r, const std::string& needle) {
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        const std::string& m = d.message;
+        if (m.find(needle) != std::string::npos) return true;
+    }
+    return false;
+}
+}
+BEZEL_TEST(fixture_suite, aliased_message_check) {
+    auto r = runAot("module M;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(locatedAt(r, "some specific rejection text"));
+}
+''')
+        # Shape 2: adjacent-string-literal concatenation as the `.find(...)`
+        # argument - tests/codegen/generic_owned_field_string_reject_1107_
+        # test.cpp's `has285Reject` (`d.message.find("\\xC2\\xA7""28.5")`) and
+        # tests/codegen/oftype_removal_completeness_3440_test.cpp's
+        # `removedOfType` (`+`-concatenation over an ALIASED `.message`, and
+        # embedded '(' ')' characters inside the literal itself - the
+        # _balanced_paren string-literal-awareness this fixture also pins).
+        _mk(root, 'tests/codegen/concatenated_literal_check_test.cpp', '''
+namespace {
+bool has285Reject(const bezel::test::JitResult& r) {
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("\\xC2\\xA7""28.5") != std::string::npos)
+            return true;
+    return false;
+}
+bool removedOfType(const bezel::test::JitResult& r, const std::string& u) {
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        const std::string& m = d.message;
+        if (m.find("`OfType<" + u + ">()` on a sequence") != std::string::npos)
+            return true;
+    }
+    return false;
+}
+}
+BEZEL_TEST(fixture_suite, concatenated_literal_check) {
+    auto r = runAot("module M;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(has285Reject(r));
+    BEZEL_EXPECT_TRUE(removedOfType(r, "int"));
+}
+''')
+        # A SKIP-only guard reached THROUGH an alias must still be denied -
+        # the positive-confirmation logic must not become "anything aliased
+        # is automatically protective".
+        _mk(root, 'tests/codegen/aliased_skip_only_test.cpp', '''
+namespace {
+bool wasSkippedAliased(const bezel::test::JitResult& r) {
+    if (r.ran) return false;
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        const std::string& m = d.message;
+        if (m.find("SKIP") != std::string::npos) return true;
+    }
+    return false;
+}
+}
+BEZEL_TEST(fixture_suite, aliased_skip_only) {
+    auto r = runAot("module M;");
+    if (wasSkippedAliased(r)) return;
+    BEZEL_EXPECT_FALSE(r.ran);
+}
+''')
+        # Positive control that this is the real demonstration file's shape
+        # (tests/support/aot_infra_loud_3007_test.cpp), included because
+        # support/ is IN SCOPE (see docstring).
+        _mk(root, 'tests/support/demo_test.cpp', '''
+BEZEL_TEST(aot_infra_loud_3007, legacy_negative_assertion_shape) {
+    auto r = bezel::test::runAot("module M;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+''')
+        # A test with EXPECT_TRUE(r.ran) only - not a rejection claim at all.
+        _mk(root, 'tests/codegen/positive_only_test.cpp', '''
+BEZEL_TEST(fixture_suite, positive_only) {
+    auto r = runAot("module M;");
+    BEZEL_EXPECT_TRUE(r.ran);
+}
+''')
+
+        total, per_file = measure(root)
+        chk('bare `!ran` flagged', 'tests/codegen/bare_test.cpp' in per_file)
+        chk('`!ran` + hasErrors()-only flagged (equally vulnerable)',
+            'tests/codegen/haserrors_only_test.cpp' in per_file)
+        chk('a name-marker-matched helper call is NOT flagged',
+            'tests/codegen/text_checked_test.cpp' not in per_file)
+        chk('the shared failedAtCompileTimeNotRuntime call is NOT flagged '
+            '(no bare !ran claim at all)',
+            'tests/codegen/shared_helper_test.cpp' not in per_file)
+        chk('a loc.line>0 && loc.column>0 body pattern is NOT flagged',
+            'tests/codegen/location_checked_test.cpp' not in per_file)
+        chk('an oddly-named in-file helper classified by BODY (.message) is '
+            'NOT flagged',
+            'tests/codegen/local_helper_body_checked_test.cpp' not in per_file)
+        chk('a direct inline .message.find( scan is NOT flagged',
+            'tests/codegen/direct_message_find_test.cpp' not in per_file)
+        chk('a wasSkipped-shaped guard (checks ONLY the fixed "SKIP" '
+            'literal) does NOT count as protection (the reviewer finding)',
+            'tests/codegen/skip_guard_only_test.cpp' in per_file)
+        chk('a helper checking SKIP *plus* a real substring is still '
+            'genuinely protective (no over-correction)',
+            'tests/codegen/skip_guard_plus_real_check_test.cpp' not in per_file)
+        chk('a real check reached through an ALIASED `.message` is '
+            'protective (round-3 review finding: aliasing silently denied '
+            'protection)',
+            'tests/codegen/aliased_message_check_test.cpp' not in per_file)
+        chk('a real check using adjacent/concatenated string-literal '
+            'arguments (including one with embedded parens) is protective '
+            '(round-3 review finding)',
+            'tests/codegen/concatenated_literal_check_test.cpp' not in per_file)
+        chk('a SKIP-only guard reached through an alias is STILL denied '
+            '(positive confirmation, not "any alias is automatically safe")',
+            'tests/codegen/aliased_skip_only_test.cpp' in per_file)
+        chk('tests/support/ IS in scope (the #3007 demo shape is flagged)',
+            'tests/support/demo_test.cpp' in per_file)
+        chk('a plain EXPECT_TRUE(r.ran) test is not a rejection claim',
+            'tests/codegen/positive_only_test.cpp' not in per_file)
+        chk('exactly 5 unprotected rows across the fixture tree (bare, '
+            'hasErrors-only, the skip-guard-only row, the aliased-skip-only '
+            'row, the support/ demo)',
+            total == 5)
+
+        bpath = root / 'baseline'
+        write_baseline(total, bpath)
+        good, msgs, _ = check(root, bpath, stale=True)
+        chk('a tree matching its baseline passes', good and not msgs)
+
+        # A RISE must fail.
+        _mk(root, 'tests/codegen/new_bad_test.cpp', '''
+BEZEL_TEST(fixture_suite, new_bad) {
+    auto r = runAot("module M;");
+    BEZEL_EXPECT_FALSE(r.ran);
+}
+''')
+        good, msgs, _ = check(root, bpath, stale=True)
+        chk('a new unprotected row FAILS the ratchet', not good)
+        chk('the message names a rise', any('ROSE' in m for m in msgs))
+        chk('--update REFUSES to bank a rise',
+            not check(root, bpath, stale=False)[0])
+        (root / 'tests/codegen/new_bad_test.cpp').unlink()
+
+        # STALE HEADROOM: a fix that forgot --update.
+        (root / 'tests/codegen/bare_test.cpp').write_text('''
+BEZEL_TEST(fixture_suite, bare_ran_false) {
+    auto r = runAot("module M;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeNotRuntime(r));
+}
+''')
+        good, msgs, _ = check(root, bpath, stale=True)
+        chk('a fix that did not --update fails as STALE HEADROOM',
+            not good and any('STALE HEADROOM' in m for m in msgs))
+        chk('--update ACCEPTS the drop', check(root, bpath, stale=False)[0])
+        total2, _ = measure(root)
+        write_baseline(total2, bpath)
+        chk('re-baselined tree is green again', check(root, bpath, True)[0])
+        chk('the fix actually lowered the count', total2 < total)
+
+        # A missing baseline must fail loudly.
+        missing = root / 'no-such-baseline'
+        try:
+            check(root, missing, stale=True)
+            chk('a missing baseline fails closed', False)
+        except SystemExit as e:
+            chk('a missing baseline fails closed', e.code == 2)
+
+    print('check_ambiguous_ran_false --self-test: ' + ('PASS' if ok else 'FAIL'))
+    return 0 if ok else 1
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument('--strict', action='store_true',
+                    help='gate mode: count must EQUAL the baseline')
+    ap.add_argument('--self-test', action='store_true',
+                    help='prove the detector still detects')
+    ap.add_argument('--update', action='store_true',
+                    help='re-baseline after fixing rows (refuses to raise)')
+    ap.add_argument('--force', action='store_true',
+                    help='with --update, bank a rise anyway (deliberate)')
+    ap.add_argument('--list', action='store_true',
+                    help='list every unprotected row')
+    a = ap.parse_args()
+
+    if a.self_test:
+        return self_test()
+
+    if a.list:
+        total, per_file = measure(ROOT)
+        for f, rows in sorted(per_file.items(), key=lambda kv: -len(kv[1])):
+            print('%3d  %s' % (len(rows), f))
+            for tname, var in rows:
+                print('       %s (%s)' % (tname, var))
+        print('--- count=%d' % total)
+        return 0
+
+    if a.update:
+        total, _ = measure(ROOT)
+        if not BASELINE.exists():
+            write_baseline(total)
+            print('created baseline: count=%d' % total)
+            return 0
+        if not a.force:
+            good, msgs, _ = check(ROOT, stale=False)
+            if not good:
+                sys.stderr.write(
+                    'check_ambiguous_ran_false --update REFUSES to raise the '
+                    'count:\n')
+                for m in msgs:
+                    sys.stderr.write('  ' + m + '\n')
+                sys.stderr.write(
+                    '  A rise means a new unprotected row was added. Protect '
+                    'it (tests/support/aot_result_asserts.hpp, or an '
+                    'equivalent message-text/location check) instead. If the '
+                    'rise is genuinely intended, re-run with --force and say '
+                    'why in the commit.\n')
+                return 1
+        write_baseline(total)
+        print('re-baselined: count=%d' % total)
+        return 0
+
+    good, msgs, per_file = check(ROOT, stale=True)
+    if good:
+        total, _ = measure(ROOT)
+        print('check_ambiguous_ran_false: OK (count=%d)' % total)
+        return 0
+    for m in msgs:
+        sys.stderr.write('check_ambiguous_ran_false: ' + m + '\n')
+    sys.stderr.write(
+        "See issue #3892: a row pinning a compile-time rejection with only "
+        "`.ran`/`hasErrors()` cannot distinguish a genuine rejection from a "
+        "runtime crash/signal/timeout/ASan report. Run --list to see every "
+        "unprotected row.\n")
+    return 1 if a.strict else 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

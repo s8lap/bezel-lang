@@ -51,6 +51,7 @@
 #include "sema/SymbolCollection.hpp"
 #include "sema/TypeResolution.hpp"
 #include "support/Diagnostic.hpp"
+#include "support/aot_result_asserts.hpp"   // fix #3892: diagnosticMessageContains / failedAtCompileTimeNotRuntime
 #include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration)
 #include "support/codegen_support.hpp"
 #include "support/scratch_dir.hpp"
@@ -124,33 +125,27 @@ void expectValueAndNoCorruption(const std::string& source, int expectedExitCode)
     BEZEL_EXPECT_EQ(code, expectedExitCode);  // no UAF / double-free
 }
 
-// fix #3851: true iff some diagnostic contains `sub`.
+// fix #3851/#3892: thin local forwarder kept for the unqualified call sites
+// below (lines that pin specific rejection message text unrelated to the
+// runtime-vs-compile-time discriminator) — the ONE implementation now lives
+// in tests/support/aot_result_asserts.hpp (see that header's comment for the
+// full, verified breakdown of why it is a differently-named function rather
+// than a same-named one: exactly one other file
+// — tests/codegen/encoding_getbytecount_span_1355_stdlib_3_2_test.cpp — has
+// the byte-identical `hasErrorContaining(const bezel::test::JitResult&,
+// const char*)` signature ADL would make ambiguous; 7 more files share the
+// name under a non-colliding or differently-typed signature, for 8 across
+// the whole family — not the "~14" an earlier revision of this comment
+// claimed).
 bool hasErrorContaining(const bezel::test::JitResult& r, const char* sub) {
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find(sub) != std::string::npos) return true;
-    return false;
+    return bezel::test::diagnosticMessageContains(r, sub);
 }
 
-// fix #3889 (review finding): `r.ran == false` alone does NOT distinguish a
-// genuine compile-time rejection from a runtime crash — runAot's `ran` is
-// "true once main executed" (tests/support/codegen_support.hpp), so it is
-// ALSO false when the driver compiled and linked fine but the resulting
-// program was killed by a signal at run time (tests/support/aot_support.hpp:
-// the `WIFSIGNALED(status)` branch reports "runAot: program terminated by
-// signal N", a DIFFERENT diagnostic than a `CompileOutcome::Rejected`'s
-// captured driver stderr). A discriminator regression that reinterprets a
-// non-span struct's raw bytes (this file's whole negative-control section)
-// compiles clean and SEGFAULTS at run time — which also has `r.ran == false`
-// and would let a naive `BEZEL_EXPECT_FALSE(r.ran)` pass for the wrong
-// reason. This asserts the STRONGER, correct claim: the driver itself
-// rejected the program before ever executing it (the pre-#3889 IR-
-// verification failure text), and the process was never launched at all.
-bool failedAtCompileTimeNotRuntime(const bezel::test::JitResult& r) {
-    return !r.ran &&
-           hasErrorContaining(r, "IR verification failed") &&
-           !hasErrorContaining(r, "terminated by signal") &&
-           !hasErrorContaining(r, "compiler CRASHED");
-}
+// fix #3889 (review finding) / fix #3892 (promoted to shared support): see
+// tests/support/aot_result_asserts.hpp's `failedAtCompileTimeNotRuntime` for
+// the full rationale — `r.ran == false` alone does NOT distinguish a genuine
+// compile-time rejection from a runtime crash/signal/timeout/ASan report.
+using bezel::test::failedAtCompileTimeNotRuntime;
 
 // fix #3851: the diagnostic must point at the call, never at 0:0. A REJECT's
 // `runAot` packs the whole captured stderr into ONE synthetic Diagnostic at

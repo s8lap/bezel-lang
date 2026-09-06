@@ -1,0 +1,16 @@
+# ambiguous_ran_false.baseline - ratchet for issue #3892: a row
+# pinning a compile-time REJECTION with only `!ran` / `hasErrors()`
+# and no message-text or real-location check cannot distinguish a
+# genuine rejection from a runtime crash/signal/timeout/ASan report.
+#
+# Regenerate with scripts/check_ambiguous_ran_false.py --update after
+# fixing (protecting) a row.  --update refuses to raise a count.
+#
+# EXACT, not a ceiling: a count below baseline fails as STALE
+# HEADROOM (see the script docstring - same rule as every other
+# ratchet in this family).
+#
+# See the script docstring for the exact counting criteria; this
+# number is NOT expected to equal issue #3892's manually-traced 60
+# (different, explicitly-stated criteria - see docstring).
+count = 73

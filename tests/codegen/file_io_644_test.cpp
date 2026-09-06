@@ -16,10 +16,12 @@
 // Each test cites the stdlib section and the exact behaviour it verifies.
 // Tests use unique /tmp paths per test to avoid cross-test interference.
 
+#include "support/aot_result_asserts.hpp"   // fix #3892: failedAtCompileTimeNotRuntime
 #include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration, P1)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
+using bezel::test::failedAtCompileTimeNotRuntime;
 using bezel::test::runAot;
 
 namespace {
@@ -35,34 +37,6 @@ std::string prog(const std::string& mainBody) {
            "class C public static method Main(): int "
            + mainBody +
            " end Main; end C;";
-}
-
-// fix #3891 (review finding, per #3892): `r.ran == false` alone does NOT
-// distinguish a genuine compile-time rejection from a runtime crash — runAot's
-// `ran` is "true once main executed" (tests/support/aot_support.hpp), so it is
-// ALSO false when the driver compiled/linked fine but the resulting program
-// was killed by a signal at run time (the `WIFSIGNALED(status)` branch reports
-// "runAot: program terminated by signal N", a DIFFERENT diagnostic than a
-// `CompileOutcome::Rejected`'s captured driver stderr). A regressed
-// span/non-span discriminator here compiles clean and crashes at run time —
-// which also has `r.ran == false` and would let a naive
-// `BEZEL_EXPECT_FALSE(r.ran)` pass for the wrong reason. This asserts the
-// STRONGER, correct claim: the driver itself rejected the program before ever
-// executing it (the IR-verification-failure text), and the process was never
-// launched at all. Model: tests/codegen/encoding_test.cpp's helper of the same
-// name, added for fix #3889 (the sibling hazard this issue is the "surviving
-// copy" of).
-bool hasErrorContaining(const bezel::test::JitResult& r, const char* sub) {
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find(sub) != std::string::npos) return true;
-    return false;
-}
-
-bool failedAtCompileTimeNotRuntime(const bezel::test::JitResult& r) {
-    return !r.ran &&
-           hasErrorContaining(r, "IR verification failed") &&
-           !hasErrorContaining(r, "terminated by signal") &&
-           !hasErrorContaining(r, "compiler CRASHED");
 }
 
 } // namespace

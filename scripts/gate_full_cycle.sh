@@ -676,6 +676,43 @@ if ! python3 scripts/check_deprecated_jit_oracle.py --strict \
 fi
 say "jit-oracle phase: GREEN ($(tail -1 "$LOGDIR/${TAG}_jitoracle.log"))"
 
+# ── AMBIGUOUS-RAN-FALSE PHASE (#3892) ──────────────────────────────────────
+# `runAot`'s `JitResult::ran` is false for FOUR outcomes, not one: a genuine
+# compile-time rejection, a compiler crash, a runtime signal (the compiled
+# program segfaulted/aborted), or a compile/run timeout / forced-ASan report
+# — all four surface as an ordinary `Severity::Error` diagnostic at
+# `SourceLocation{}` (0:0). A row that pins "the compiler rejects this" with
+# nothing but `BEZEL_EXPECT_FALSE(r.ran)` (or `hasErrors()`, or a bare
+# severity check) cannot tell them apart, and MEASURABLY passes for the wrong
+# reason: reproduced directly (see scripts/check_ambiguous_ran_false.py's
+# docstring) with a program that compiles clean and stack-overflows at
+# runtime, which reports `r.ran=0` and a bare `!r.ran` assertion against it
+# as `[ OK ]`. Two fixes in one batch (#3889, #3891) each independently hit
+# this and each wrote the correct guard from scratch — #3891 copied #3889's
+# helper verbatim, which is the "went from nonexistent to duplicated within
+# one batch" evidence #3892 records. This phase ratchets what remains
+# unprotected so the count can only fall.
+say "ambiguous-ran-false phase: detector self-test + ratchet (#3892)"
+if ! python3 scripts/check_ambiguous_ran_false.py --self-test \
+      > "$LOGDIR/${TAG}_ranfalse.log" 2>&1; then
+  say "CYCLE FAILURE: check_ambiguous_ran_false SELF-TEST failed — the"
+  say "  detector is broken, so its verdict means nothing. See $LOGDIR/${TAG}_ranfalse.log"
+  sed -n '1,20p' "$LOGDIR/${TAG}_ranfalse.log" 2>/dev/null | sed 's/^/  | /' \
+    | tee -a "$CYCLE_LOG" >/dev/null
+  exit 1
+fi
+if ! python3 scripts/check_ambiguous_ran_false.py --strict \
+      >> "$LOGDIR/${TAG}_ranfalse.log" 2>&1; then
+  say "CYCLE FAILURE: a new row pins a compile-time rejection using only"
+  say "  \`.ran\`/\`hasErrors()\` with no message-text or real-location check"
+  say "  (#3892) — it cannot distinguish a rejection from a runtime crash/"
+  say "  signal/timeout/ASan report. See $LOGDIR/${TAG}_ranfalse.log"
+  sed -n '/check_ambiguous_ran_false:/,$p' "$LOGDIR/${TAG}_ranfalse.log" 2>/dev/null \
+    | head -40 | sed 's/^/  | /' | tee -a "$CYCLE_LOG" >/dev/null
+  exit 1
+fi
+say "ambiguous-ran-false phase: GREEN ($(tail -1 "$LOGDIR/${TAG}_ranfalse.log"))"
+
 # ── GATE SELF-TEST PHASE (#3415) ───────────────────────────────────────────
 # The fourth source-level check, and the one that guards the checkers rather
 # than the tree. `scripts/gate/tests/` holds the self-tests for the gate's own
