@@ -10109,9 +10109,18 @@ void ExprTC::bindNestedDestructuringNames(
         for (std::size_t i = 0; i < nd->subPatterns.size(); ++i) {
             const auto& s = nd->subPatterns[i];
             TypeRef* fieldTy = nullptr;
-            if (i < ndFields.size() && ndFields[i]->posParam &&
-                ndFields[i]->posParam->type)
-                fieldTy = ctx_.resolvedType(*ndFields[i]->posParam->type);
+            // fix #3957 (§19.3/§9.1/§9.2, v0.294): `storageComponentType`
+            // (sema/Symbol.hpp), not the bare `posParam->type` — an imported
+            // record's positional field carries a synthetic `posParam` whose
+            // `type` is deliberately null (#2516); the bare read left
+            // `fieldTy` null for every NESTED imported-record slot
+            // (`Outer(Inner(1..5, 1))` with `Inner` imported), so the
+            // ordering-pattern gate two lines below silently never fired —
+            // even though `fieldsOfRecord` just above already resolves an
+            // imported `nd` correctly (fix #2844).
+            if (i < ndFields.size())
+                fieldTy = const_cast<TypeRef*>(
+                    storageComponentType(ndFields[i], ctx_));
             // ⚠ residual gap (issue 3938, filed alongside fix #3898): unlike
             // the top-level CaseExpr/CaseStmt record loops (which now call
             // `substituteGenericFieldType(fieldTy, scrutTy)`, fix #3898), NO
@@ -17024,31 +17033,75 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 // not have a positional-destructuring surface … use a
                 // type-test pattern (`Dog`, `var d: Dog`) instead."
                 // Emit a compile error when the named type is a class.
+                // fix #3957: fall back to `ctx_.importedSymbols()` when the
+                // local module-children walk misses — an imported CLASS used
+                // as a destructuring head hit the same local-only-lookup
+                // defect the record search below closes; without the
+                // fallback this diagnostic never fires for an imported class
+                // and the program instead reaches codegen, which emits
+                // malformed IR ("case.end has no terminator", measured)
+                // rather than this clean §19.3 rejection.
+                {
+                    bool isClassHead = false;
+                    if (ctx_.module()) {
+                        for (Symbol* child : ctx_.module()->children) {
+                            if (auto* ts = dynamic_cast<TypeSymbol*>(child)) {
+                                if (ts->name == lastName &&
+                                    ts->kind == ast::TypeDeclKind::Class) {
+                                    isClassHead = true; break;
+                                }
+                            }
+                        }
+                    }
+                    if (!isClassHead) {
+                        for (Symbol* sym : ctx_.importedSymbols()) {
+                            if (auto* ts = dynamic_cast<TypeSymbol*>(sym)) {
+                                if (ts->name == lastName &&
+                                    ts->kind == ast::TypeDeclKind::Class) {
+                                    isClassHead = true; break;
+                                }
+                            }
+                        }
+                    }
+                    if (isClassHead) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, dp->span.begin,
+                            "positional destructuring pattern `" +
+                            std::string(lastName) +
+                            "(...)` is not valid on a class type — "
+                            "classes do not have a positional-"
+                            "destructuring surface (§19.3); use a "
+                            "type-test pattern (`" +
+                            std::string(lastName) +
+                            "` or `var x: " +
+                            std::string(lastName) +
+                            "`) instead");
+                    }
+                }
+                // fix #3957 (§19.3/§2.8.3 rule 4, v0.294): fall back to
+                // `ctx_.importedSymbols()` — mirroring codegen's own
+                // import-aware `patternMatches` lookup (LlvmBackend_Exprs2.cpp,
+                // fix #2844) and the CaseExpr twin above. Without this
+                // fallback an IMPORTED record scrutinee never resolves
+                // `recTy` here (this loop was even narrower than CaseExpr's —
+                // module-children only, no `ctx_.symbols()` pass either), so
+                // `fields` stays empty and every downstream §19.3 check below
+                // (arity, #2178 generic erasure, and the nullable-ordering
+                // gate) is silently skipped for a cross-module program that
+                // an identical single-module program correctly rejects.
                 if (ctx_.module()) {
                     for (Symbol* child : ctx_.module()->children) {
                         if (auto* ts = dynamic_cast<TypeSymbol*>(child)) {
                             if (ts->name == lastName &&
-                                ts->kind == ast::TypeDeclKind::Class) {
-                                ctx_.diagnostics().report(
-                                    Severity::Error, dp->span.begin,
-                                    "positional destructuring pattern `" +
-                                    std::string(lastName) +
-                                    "(...)` is not valid on a class type — "
-                                    "classes do not have a positional-"
-                                    "destructuring surface (§19.3); use a "
-                                    "type-test pattern (`" +
-                                    std::string(lastName) +
-                                    "` or `var x: " +
-                                    std::string(lastName) +
-                                    "`) instead");
-                                break;
+                                ts->kind == ast::TypeDeclKind::Record) {
+                                recTy = ts; break;
                             }
                         }
                     }
                 }
-                if (ctx_.module()) {
-                    for (Symbol* child : ctx_.module()->children) {
-                        if (auto* ts = dynamic_cast<TypeSymbol*>(child)) {
+                if (!recTy) {
+                    for (Symbol* sym : ctx_.importedSymbols()) {
+                        if (auto* ts = dynamic_cast<TypeSymbol*>(sym)) {
                             if (ts->name == lastName &&
                                 ts->kind == ast::TypeDeclKind::Record) {
                                 recTy = ts; break;
@@ -17133,9 +17186,16 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 for (std::size_t i = 0; i < dp->subPatterns.size(); ++i) {
                     const auto& sp = dp->subPatterns[i];
                     TypeRef* fieldTy = nullptr;
-                    if (i < fields.size() && fields[i]->posParam &&
-                        fields[i]->posParam->type) {
-                        fieldTy = ctx_.resolvedType(*fields[i]->posParam->type);
+                    if (i < fields.size()) {
+                        // fix #3957 (§19.3/§9.1/§9.2, v0.294): read through
+                        // `storageComponentType` (sema/Symbol.hpp) rather
+                        // than the bare `posParam->type` — see the CaseExpr
+                        // twin's comment for the full rationale (an imported
+                        // record field's synthetic `posParam->type` is
+                        // deliberately null, #2516; the accessor falls back
+                        // to `ctx_.importedMemberType`).
+                        fieldTy = const_cast<TypeRef*>(
+                            storageComponentType(fields[i], ctx_));
                         // fix #3898 (§14.1 / §19.3, v0.294): a GENERIC
                         // record's positional field may be declared at a bare
                         // type parameter (`record Box<T>(X: T, Y: int)`); the
