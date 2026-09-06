@@ -819,7 +819,22 @@ private:
     // fields — or an inline array whose element — is such a type. Nullable
     // types, value primitives, value-builtins, and generic-parameter/unresolved
     // refs return false.
-    bool defaultIllFormed(const TypeRef* t);
+    //
+    // fix #3995 (§17.11/§9.7/§3.6 rule 2, v0.294): `incoming` is the
+    // instantiation-site substitution environment (`common::RecordSubstEnv`,
+    // OwnershipFacts.hpp, #2145) composed IN from an enclosing record frame
+    // — mirroring `common::isBorrowBearingRecordCommon`'s own `env`
+    // parameter, which the §9.7 borrow-bearing walk threads through its
+    // identically-shaped recursion (OwnershipFacts.cpp). Every external
+    // caller passes the default `nullptr` (a top-level `default(T)` check
+    // has no enclosing frame); the Record and InlineArray arms
+    // (ExprTypecheck_Exprs.cpp) compose it internally when recursing into a
+    // field/element, so a DELEGATING generic record
+    // (`record Outer<T>(In: Inner<T>)`) resolves `Inner<T>`'s own `T` back
+    // to the OUTER instantiation's argument, not just a record's OWN
+    // directly-bare-parameter fields.
+    bool defaultIllFormed(const TypeRef* t,
+                          const common::RecordSubstEnv* incoming = nullptr);
 
     // fix #3044 (§10.4 / stdlib §9.9, v0.242): the ENUM TypeSymbol an
     // expression NAMES as a type (an `E` identifier, or a nested

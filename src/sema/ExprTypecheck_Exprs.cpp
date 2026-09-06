@@ -386,7 +386,26 @@ bool typeTestTargetMentionsTypeVariable(const TypeRef* t) {
 // §17.11 (#951): does `default(T)` have no well-defined zero value? See the
 // header declaration. Recurses into a record's positional fields and an inline
 // array's element type.
-bool ExprTC::defaultIllFormed(const TypeRef* t) {
+//
+// fix #3995 (§17.11/§9.7/§3.6 rule 2, v0.294): `incoming` is threaded through
+// EVERY recursive call in this function — the InlineArray element and the
+// Record field walk below — exactly as `common::isBorrowBearingRecordCommon`
+// threads its own `env` parameter through the identically-shaped §9.7
+// recursion (OwnershipFacts.cpp). Without this, a DELEGATING generic record
+// (`record Outer<T>(In: Inner<T>)`) silently escaped substitution: the OUTER
+// frame correctly resolves `In`'s type to the concrete `Inner<T>` TypeRef
+// (its own genericArgs are literal source text, e.g. `Inner<T>` where `T`
+// is Outer's own bare parameter — NOT yet resolved to `WidgetDG1`), but the
+// recursive call used to reseed the INNER frame with `incoming=nullptr`,
+// so `Inner`'s own `T` genericArg — itself a bare mention of Outer's
+// parameter — never got looked up anywhere, and the bare-parameter early
+// return two lines below then fired on the STILL-GENERIC field, silently
+// accepting. MEASURED: `record InnerDG1<T>(V: T); record
+// OuterDG1<T>(In: InnerDG1<T>); default(OuterDG1<WidgetDG1>)` (WidgetDG1 a
+// non-nullable class) compiled at exit 0 and SIGSEGV'd (exit 139) on the
+// arm that fixed #3986/#3982 without this composition.
+bool ExprTC::defaultIllFormed(const TypeRef* t,
+                              const common::RecordSubstEnv* incoming) {
     if (!t || t->nullable) return false;  // nullable defaults to null — OK
     switch (t->kind) {
         case TypeRef::Kind::Primitive:
@@ -397,8 +416,16 @@ bool ExprTC::defaultIllFormed(const TypeRef* t) {
             return t->primitive == PrimitiveType::String;
         case TypeRef::Kind::Function:
             return true;  // a function value (§28.9) has no zero
-        case TypeRef::Kind::InlineArray:
-            return defaultIllFormed(t->arrayElement);
+        case TypeRef::Kind::InlineArray: {
+            // fix #3995: a bare-parameter element (`[N]T`) needs the SAME
+            // substitution a record field does — resolve it through
+            // `incoming` before recursing, threading the substituted
+            // entry's own env (so a `[N]Inner<T>` element composes exactly
+            // as the Record arm's field walk does below).
+            common::RecordSubstEnv::Entry sub =
+                common::resolveRecordFieldSubst(t->arrayElement, incoming);
+            return defaultIllFormed(sub.ty, sub.env);
+        }
         case TypeRef::Kind::Named: {
             if (!t->declaration) return false;  // generic param / unresolved
             auto k = t->declaration->kind;
@@ -470,10 +497,82 @@ bool ExprTC::defaultIllFormed(const TypeRef* t) {
                 // sources") — which answers identically for a local and an
                 // imported record, exactly as #3970's own record-field walk
                 // fix did for the sibling §9.7 check in the same family.
+                //
+                // fix #3986 (§17.11, v0.294): the symbol-side field type
+                // above is still the record's DECLARED, unsubstituted type
+                // — for a field like `V: T` in `record Box<T>(V: T)` that
+                // is a bare, declaration-less reference to the record's OWN
+                // generic parameter, which line ~403's `!t->declaration`
+                // early-return treats as an unresolved parameter and
+                // unconditionally accepts, regardless of what `t` (the
+                // CONCRETE instantiation being checked, e.g.
+                // `Box<WidgetGL>`) actually binds T to. Substitute it
+                // first, via the SAME instantiation-site environment the
+                // §9.7 borrow-bearing walk and the §35.4/§35.11
+                // choice-payload walk already use for identically-shaped
+                // generic substitution (`common::RecordSubstEnv` /
+                // `seedRecordSubstEnv` / `resolveRecordFieldSubst`,
+                // OwnershipFacts.hpp, #2145) — no new predicate. This uses
+                // the SYMBOL-side `seedRecordSubstEnv(TypeSymbol&, ...)`
+                // overload (rather than the AST-side one, which needs a
+                // `td` this arm no longer materializes), so it seeds
+                // correctly for an imported generic record too:
+                // `TypeSymbol::genericParams` is populated by ModuleLoader
+                // for an imported type (ModuleLoader.cpp), unlike `decl`.
+                //
+                // fix #3995 (§17.11/§9.7/§3.6 rule 2, v0.294): seed THIS
+                // frame's own environment with `incoming` (the caller's
+                // composed env), not a bare `nullptr` — mirroring
+                // `common::isBorrowBearingRecordCommon`'s own
+                // `seedRecordSubstEnv(*ts, *rt, env, myEnv)` call
+                // (OwnershipFacts.cpp), which passes its CALLER's `env`
+                // through as `incoming` for exactly this reason. Without
+                // it, a DELEGATING generic record
+                // (`record Outer<T>(In: Inner<T>)`) breaks: `In`'s
+                // resolved-but-unsubstituted type is the concrete-looking
+                // Named TypeRef `Inner<T>` (declaration set — NOT a bare
+                // parameter itself, so `resolveRecordFieldSubst` below
+                // passes it through unchanged), but recursing into
+                // `defaultIllFormed(Inner<T>, incoming=nullptr)` would
+                // reseed the INNER frame from a `nullptr` incoming, so
+                // `Inner`'s own `genericArgs[0]` (itself a bare mention of
+                // OUTER's `T`) could never be looked up anywhere, and the
+                // bare-parameter early return (`!t->declaration` above)
+                // would fire on the STILL-GENERIC substituted field,
+                // silently accepting — MEASURED: `record InnerDG1<T>(V: T);
+                // record OuterDG1<T>(In: InnerDG1<T>);
+                // default(OuterDG1<WidgetDG1>)` (WidgetDG1 non-nullable)
+                // compiled clean and SIGSEGV'd without this composition,
+                // reproducing identically against `91e353f` (#3982 alone).
+                // `resolveRecordFieldSubst`'s returned `Entry::env` is
+                // exactly the incoming env to recurse with for EITHER
+                // shape (a substituted bare-parameter leaf, or an
+                // unchanged composite field like `Inner<T>`) — see its own
+                // doc comment and `recordFieldTypeIsBorrowCarryingCommon`'s
+                // identical two-shape dispatch (OwnershipFacts.cpp) for the
+                // established precedent this mirrors.
+                //
+                // NOTE for #3988 (filed separately, not fixed here): this
+                // arm still walks only POSITIONAL fields
+                // (`recordPositionalFieldSymbols`), so a combined-form
+                // record's non-nullable BODY field is still invisible to
+                // it. `fieldEnv`, built below, is exactly the `env`
+                // argument `sema::recordStorageMembers` already accepts
+                // (Symbol.hpp) — a fix that widens this arm to cover
+                // body/auto-property fields should be able to swap the
+                // walk below to `recordStorageMembers(t->declaration,
+                // ctx_, ..., fieldEnv)` and drop straight in without
+                // re-deriving the substitution.
+                common::RecordSubstEnv env;
+                common::seedRecordSubstEnv(*t->declaration, *t, incoming, env);
+                const common::RecordSubstEnv* fieldEnv =
+                    env.map.empty() ? nullptr : &env;
                 for (const Symbol* pf : recordPositionalFieldSymbols(t->declaration)) {
                     const TypeRef* pft = storageComponentType(pf, ctx_);
                     if (!pft) continue;
-                    if (defaultIllFormed(pft)) return true;
+                    common::RecordSubstEnv::Entry sub =
+                        common::resolveRecordFieldSubst(pft, fieldEnv);
+                    if (defaultIllFormed(sub.ty, sub.env)) return true;
                 }
                 return false;
             }
