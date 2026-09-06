@@ -2042,7 +2042,29 @@ void Emitter::ensureOutVarSlots(const ast::CallExpr& call) {
 //     any use that is not a proven-safe read ⇒ escaped ⇒ no release ⇒ the
 //     pre-existing leak, unchanged. Leak-over-UAF is the deliberate direction.
 //
-//  5. Not inside a disposer body, and some scope is open to register into.
+//  5. Some scope is open to register into. Gate 5 used to also bail whenever
+//     `emittingDisposerBody_` was set — i.e. unconditionally inside ANY
+//     destructor body — but that exclusion was stale by the time this function
+//     was written (fix #2641, v0.268): fix #2852 (v0.240, `emitDisposerCore`)
+//     already runs `collectStringReleaseEligible(dd->body)` and pins
+//     `stringReleaseEligibleFn_ = fn` for the destructor body specifically, so
+//     gate 3 above already answers "was this body's string-local traffic
+//     analyzed" correctly for a disposer body — the same pin is what lets a
+//     plain `var` string LOCAL declared directly in a destructor body release
+//     at scope end today (`armStringLocalRefcount`, which gates on nothing but
+//     that pin and disposeStack_). An `out var` recipient is analyzed by the
+//     same walk (`outVarStringReleaseEligible`, gate 4, keyed off the same
+//     `stringReleaseAnalyzedBody_` the destructor-body call sets) and
+//     registered into the same `disposeStack_`, which `lowerScopedBlock`
+//     already drains correctly inside a destructor body (proven by the `var`
+//     local case) — so blanket-excluding disposer bodies here left every
+//     `out var` string recipient DECLARED DIRECTLY IN A DESTRUCTOR BODY
+//     leaking unconditionally (issue #3937, measured 20500 B / 1000
+//     allocations at 500 iterations under ASan/LSan on the generated program —
+//     the byte-identical call in an ordinary method was already clean). Fixed
+//     by dropping the `emittingDisposerBody_` half of this gate; gate 3's
+//     per-body pin is the correct, already-existing authority for "was this
+//     body analyzed", so no new predicate is introduced (CLAUDE.md rule 6).
 //
 // The Disposal carries `nullSlotAfterRelease` because — unlike a `var` local's —
 // this slot is READ BACK after the release: the recipient's alloca is entry-
@@ -2054,7 +2076,7 @@ void Emitter::registerOutVarStringRelease(const ast::IdentifierExpr& id,
                                           std::size_t pos,
                                           llvm::AllocaInst* slot) {
     if (!slot || !loc || !ms) return;                              // gate 1
-    if (disposeStack_.empty() || emittingDisposerBody_) return;    // gate 5
+    if (disposeStack_.empty()) return;                             // gate 5
     if (currentFn_ != stringReleaseEligibleFn_) return;            // gate 3
     // gate 2 — read the FORMAL's own modifier + declared type.
     std::string_view formalMod;
@@ -2161,7 +2183,12 @@ void Emitter::registerOutVarStringRelease(const ast::IdentifierExpr& id,
 //     escaped ⇒ no release ⇒ the pre-existing leak, unchanged.
 //     Leak-over-UAF is the deliberate direction.
 //
-//  5. Not inside a disposer body, and some scope is open to register into.
+//  5. Some scope is open to register into. Formerly also excluded a disposer
+//     body unconditionally; fix #3937 (v0.294) dropped that half — see the
+//     matching comment at `registerOutVarStringRelease` above for why gate 3's
+//     `stringReleaseEligibleFn_` pin (already established for a destructor
+//     body by fix #2852) makes the `emittingDisposerBody_` check redundant and
+//     over-broad here, not sound-preserving.
 //
 // The `Disposal::nullSlotAfterRelease` flag is set for the same reason the
 // method variant sets it: unlike a `var` local's slot, this one is READ
@@ -2177,7 +2204,7 @@ void Emitter::registerCtorOutVarStringRelease(
     std::size_t pos, llvm::AllocaInst* slot) {
     if (!slot || !loc) return;                                      // gate 1
     if (!ctorDecl && !ctorSym) return;                              // gate 1
-    if (disposeStack_.empty() || emittingDisposerBody_) return;    // gate 5
+    if (disposeStack_.empty()) return;                             // gate 5
     if (currentFn_ != stringReleaseEligibleFn_) return;            // gate 3
     // gate 2 — read the FORMAL's own modifier + declared type, mirroring
     // registerOutVarStringRelease's exact dual-sourcing (imported symbol
