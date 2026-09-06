@@ -72,6 +72,29 @@
 // case; likewise Disposed and Uninitialized) and the final pass observes it
 // fresh, reports for real, and poisons for real.
 //
+// ---------------------------------------------------------------------------
+// LATER (fix-forward on the batch): two rows in this file pinned the §28.3
+// consume ERROR for `x.Dispose(); while … move x … end;`.  Stacking #3949
+// (which read-checks the assignment RHS) beneath this commit moved that
+// shape's verdict to §28.2's use-after-dispose WARNING — the SPECIFIED
+// verdict for a *dominating* kill, and identical to what its straight-line
+// twin has always produced.  The rows were rewritten to pin the invariant
+// #3931 actually owns (loop verdict == straight-line verdict) plus §28.2's
+// checked-mode backstop, and a third shape was added — a top-level `move`
+// RHS, the one consume position #3949 deliberately does NOT read-check —
+// which stays a hard §28.3 error and pins the guarded arm directly.  See
+// those rows' own comments for the full reasoning and the measurements.
+//
+// The residual — that the SAME `move` of a dominatingly-disposed local draws
+// a §28.2 warning in three read positions and a §28.3 error in three others,
+// decided only by whether `checkRead` runs first and cascade-suppresses the
+// consume diagnostic — is filed as issue 3975 with both candidate readings
+// and a recommendation.  It is a ruling for the spec-change process, not an
+// implementation choice, so nothing here decides it; these rows deliberately
+// pin the loop/straight-line CONSISTENCY and §28.2's checked-mode backstop
+// rather than the severity, so they survive whichever way it is ruled.
+// ---------------------------------------------------------------------------
+//
 // per §28.2, §28.3 K1.3/K7, v0.294, #3931
 
 #include <string>
@@ -87,6 +110,7 @@ using bezel::test::diagnosticMessageContains;
 using bezel::test::failedAtCompileTimeWithRealLocation;
 using bezel::test::parseAndCheckOwnership;
 using bezel::test::runAot;
+using bezel::test::runAotCheckedDisposal;
 
 namespace {
 
@@ -495,22 +519,63 @@ BEZEL_TEST(loop_body_read_after_consume_3931,
     BEZEL_EXPECT_TRUE(diagWithSeverity(r, bezel::Severity::Error, kMovedOut));
 }
 
+// ⚠ THE VERDICT ON THIS SHAPE MOVED, AND THE MOVE IS CORRECT.  When these
+// rows were written this program drew the §28.3 consume ERROR "cannot move
+// from disposed local `x`".  It now draws §28.2's use-after-dispose WARNING
+// instead, because #3949 closed the assignment RHS as an unchecked read
+// position: `checkRead` now reaches `x` first, emits §28.2's warning, and
+// (per this file's own fix) poisons only on the emit pass, which
+// cascade-suppresses `markMovedByName`'s error exactly as it always has for
+// every OTHER read position.
+//
+// The warning is the SPECIFIED verdict, not a relaxation.  §28.2 verbatim:
+// "The compiler additionally **must** emit a compile-time warning when a
+// local variable is used (read, borrowed from, or consumed) after an
+// explicit `Dispose()` call — or a discard of the binding — on the same
+// variable that dominates the use site on every path".  A `move` is a
+// consume and the `Dispose()` dominates, so a WARNING is what §28.2 asks
+// for; its next sentence reserves the ERROR for the *conditional* kill ("A
+// *conditional* kill is treated more strictly: at a join of an
+// explicitly-disposed path with a still-owned path the variable is
+// maybe-consumed and a later use is a compile error").  The old ERROR
+// existed only because this one read position was never read-checked — it
+// pinned a symptom of issue 3949, not a contract.
+//
+// What #3931 owns is not the severity but the CONSISTENCY: the loop
+// spelling must agree with its straight-line twin.  That is what this row
+// now measures, and it is a stronger claim than the old one — measured, it
+// still fails if the sibling guards are removed, because the loop spelling
+// then draws NOTHING AT ALL while the straight-line twin still warns.
 BEZEL_TEST(loop_body_read_after_consume_3931,
-           while_body_move_after_dispose_rejected_28_3) {
-    auto r = parseAndCheckOwnership(wrap(
-        "var x := new Res(1); "
+           while_body_move_after_dispose_warns_28_2_like_straight_line) {
+    const char* kBody =
         "x.Dispose(); "
         "var t := 0; "
-        "var i := 0; "
+        "var i := 0; ";
+    auto loop = parseAndCheckOwnership(wrap(
+        std::string("var x := new Res(1); ") + kBody +
         "while i < 2 do "
         "  t := t + Sink.Take(move x); "
         "  i := i + 1; "
         "end; "
         "return t;"));
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    // The §28.2 warning fires, at a real location...
     BEZEL_EXPECT_TRUE(
-        diagWithSeverity(r, bezel::Severity::Error, kCannotMoveDisposed));
-    BEZEL_EXPECT_TRUE(diagHasRealLocation(r, kCannotMoveDisposed));
+        diagWithSeverity(loop, bezel::Severity::Warning, kUseAfterDispose));
+    BEZEL_EXPECT_TRUE(diagHasRealLocation(loop, kUseAfterDispose));
+    // ...and it is a WARNING, not an error: §28.2's dominating-kill regime.
+    BEZEL_EXPECT_FALSE(loop.diagnostics.hasErrors());
+
+    // The straight-line twin — same consume, same read position, no loop —
+    // must reach the identical verdict.  This equality IS the #3931
+    // invariant; pinning it survives any future move of the severity.
+    auto sl = parseAndCheckOwnership(wrap(
+        std::string("var x := new Res(1); ") + kBody +
+        "t := t + Sink.Take(move x); "
+        "return t;"));
+    BEZEL_EXPECT_TRUE(
+        diagWithSeverity(sl, bezel::Severity::Warning, kUseAfterDispose));
+    BEZEL_EXPECT_FALSE(sl.diagnostics.hasErrors());
 }
 
 // markMovedByName's MOVED-FROM arm (the third guarded sibling).  ⚠ THESE
@@ -591,18 +656,93 @@ BEZEL_TEST(loop_body_read_after_consume_3931,
     BEZEL_EXPECT_TRUE(diagnosticMessageContains(jr, kMovedOut));
 }
 
+// The AOT half of the row above.  It can no longer assert non-compilation —
+// §28.2 admits this program with a warning — so it asserts the thing that
+// makes admitting it SOUND: the checked-disposal backstop §28.2 promises.
+// "any instance member access on a logically-disposed instance ... raises
+// `DisposedAccessException`"; the catch arm observes it and returns 1.
+// That is a strictly stronger claim than "does not compile", and it is why
+// "accepted with a warning" here is the specified behaviour rather than a
+// hole.  (Measured on the batch tip: unchecked mode segfaults — §28.2's
+// "undefined behavior" — and checked mode exits 1 through the arm.)
 BEZEL_TEST(loop_body_read_after_consume_3931,
-           while_body_move_after_dispose_not_compilable_aot_28_3) {
-    JitResult jr = runAot(wrap(
+           while_body_move_after_dispose_raises_in_checked_mode_28_2) {
+    JitResult jr = runAotCheckedDisposal(wrap(
         "var x := new Res(1); "
         "x.Dispose(); "
         "var t := 0; "
         "var i := 0; "
+        "try "
+        "  while i < 2 do "
+        "    t := t + Sink.Take(move x); "
+        "    i := i + 1; "
+        "  end; "
+        "  return 0; "
+        "catch DisposedAccessException => return 1; "
+        "end; "));
+    BEZEL_EXPECT_TRUE(jr.ran);
+    BEZEL_EXPECT_EQ(jr.exitCode, 1);
+}
+
+// ============================================================================
+// NEGATIVE — the consume position where `checkRead` is DELIBERATELY skipped,
+// so `markMovedByName`'s guarded Disposed arm is the sole authority and the
+// verdict stays a hard §28.3 ERROR.  #3949's `isTopLevelConsumingForm` skips
+// the read-check for a top-level `move`/`await` RHS precisely so the more
+// specific consume diagnostic is not preempted — which makes this the row
+// that pins the guarded arm directly, and it keeps an AOT *rejection* oracle
+// for the move-after-dispose family that the two rows above can no longer
+// provide.
+//
+// FAILS WITHOUT THE SIBLING GUARDS (measured on the batch tip by reverting
+// only the four guard tokens): ACCEPTED with ZERO diagnostics, where the
+// straight-line twin still errors.
+// ============================================================================
+BEZEL_TEST(loop_body_read_after_consume_3931,
+           while_body_top_level_move_after_dispose_rejected_28_3) {
+    auto r = parseAndCheckOwnership(wrap(
+        "var x := new Res(1); "
+        "var y := new Res(2); "
+        "x.Dispose(); "
+        "var i := 0; "
         "while i < 2 do "
-        "  t := t + Sink.Take(move x); "
+        "  y := move x; "
         "  i := i + 1; "
         "end; "
-        "return t;"));
+        "return y.tag;"));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(
+        diagWithSeverity(r, bezel::Severity::Error, kCannotMoveDisposed));
+    BEZEL_EXPECT_TRUE(diagHasRealLocation(r, kCannotMoveDisposed));
+}
+
+// Its straight-line twin, rejected before and after — the asymmetry the row
+// above measures against.
+BEZEL_TEST(loop_body_read_after_consume_3931,
+           straight_line_top_level_move_after_dispose_rejected_28_3_control) {
+    auto r = parseAndCheckOwnership(wrap(
+        "var x := new Res(1); "
+        "var y := new Res(2); "
+        "x.Dispose(); "
+        "y := move x; "
+        "return y.tag;"));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(
+        diagWithSeverity(r, bezel::Severity::Error, kCannotMoveDisposed));
+}
+
+BEZEL_TEST(loop_body_read_after_consume_3931,
+           while_body_top_level_move_after_dispose_not_compilable_aot_28_3) {
+    JitResult jr = runAot(wrap(
+        "var x := new Res(1); "
+        "var y := new Res(2); "
+        "x.Dispose(); "
+        "var i := 0; "
+        "while i < 2 do "
+        "  y := move x; "
+        "  i := i + 1; "
+        "end; "
+        "return y.tag;"));
     BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(jr));
     BEZEL_EXPECT_TRUE(diagnosticMessageContains(jr, kCannotMoveDisposed));
 }
