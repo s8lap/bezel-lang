@@ -3265,6 +3265,75 @@ llvm::Value* Emitter::lowerValueSemMethodOn(const sema::TypeRef* recvTy,
         if (other->getType()->isPointerTy())
             other = builder_.CreateLoad(st, other);
         if (!other->getType()->isStructTy()) return nullptr;
+        // fix #3918 (§8.1/§9.1/§9.2, v0.294): the RECORD twin of fix #3913's
+        // choice-arm guard above. `equalsArgIsOwnTypeOrUnresolved` answers
+        // TRUE for an UNRESOLVED generic method type parameter (its "or
+        // unresolved" clause) without knowing what THIS call site substitutes
+        // it to — codegen substitutes VALUES, never `ctx_.exprType`'s answer —
+        // so this arm cannot distinguish "unresolved, turns out to be `ts`"
+        // from "unresolved, turns out to be some OTHER struct-shaped type"
+        // ahead of time. `st` is `ts`'s OWN record struct (`recordStruct`,
+        // LlvmBackend_Layout.cpp:2073+): both its branches build via
+        // `llvm::StructType::create` — the plain (non-generic-instantiation)
+        // branch caches one identified struct per TypeSymbol in `structs_`,
+        // and the specialized-generic branch caches one identified struct per
+        // (TypeSymbol, field-type-vector) pair in `specializedStructs_` —
+        // never via the structurally-uniquing `llvm::StructType::get`, so no
+        // two distinct record types (or distinct instantiations of the same
+        // generic record) can ever share a `recordStruct` pointer. Pointer
+        // comparison against `st` is therefore exactly as sound here as it is
+        // for the choice arm's `st`. When the instantiation is a DIFFERENT
+        // struct (a record, a choice, …) `other`'s loaded type is that
+        // struct's own layout, not `st`. Feeding a mismatched struct to
+        // `emitStructEquality`, which unconditionally `CreateExtractValue`s at
+        // `st`'s own field indices (LlvmBackend_Layout.cpp,
+        // `emitStructEquality`), is an out-of-bounds/mismatched-type access.
+        // MEASURED (#3918) via gdb: `Foo<Pair>(p, new Pair(9))` with `p: Pt`
+        // (a THREE-field record; `Pair` has one field) SIGSEGVs `bezelc` in
+        // `llvm::Value::setName`, called from `ExtractValueInst::Create`
+        // inside `emitStructEquality` (LlvmBackend_Layout.cpp:6227), reached
+        // through `lowerValueSemMethodOn`'s record arm (this call site) — the
+        // same backtrace shape #3913 reported for the choice arm.
+        //
+        // UNLIKE the choice arm, this call site is reached through a PLAIN
+        // `.` access, not `?.` — there is no enclosing §7.5/#3452
+        // "declining inner lowering fails closed" wrapper to route a bare
+        // `return nullptr` into a located diagnostic. A bare decline here
+        // falls through to ordinary member dispatch (line ~4348), finds no
+        // user-defined `Equals` override, and degrades to the #2491/#3079
+        // `Severity::Warning` "return-value expression failed to lower"
+        // note — `bezelc` would exit 0 and the program would RUN, silently
+        // answering a zero/null-degraded `bool`. MEASURED: this is exactly
+        // what the pre-existing sibling decline three lines above
+        // (`!other->getType()->isStructTy()`, reachable when the same
+        // unresolved parameter resolves to a NON-struct type, e.g. `int`)
+        // already does for a plain `.` call. That is a loud-crash-to-quiet-
+        // wrong-answer trade the project's own review discipline rejects
+        // (CLAUDE.md-adjacent lane rule: a fix that silences a crash must
+        // either prove the silenced path answers correctly or fail loudly
+        // instead) — so this guard reports a located ERROR here directly,
+        // exactly mirroring the ENUM arm's own precedent a few lines above
+        // for the identical shape of problem (an unresolved type parameter
+        // whose instantiation this arm cannot structurally accept), rather
+        // than reproducing the record arm's existing quiet-degrade gap.
+        // Filed as issue #3922 (see commit body) so that pre-existing sibling
+        // gap gets its own fix rather than silently widening under this one.
+        // A genuinely `ts`-typed argument is unaffected: its lowered value is
+        // always `st`-shaped by construction, so this reachable-only-through-
+        // the-unresolved-parameter path never fires for it.
+        if (other->getType() != st) {
+            ctx_.diagnostics().report(
+                Severity::Error, call.span.begin,
+                "member `Equals` on a `" + spec85QualifiedTypeName(ts) +
+                "` receiver was given an argument whose type this "
+                "instantiation does not resolve to a value of that record, "
+                "and \xC2\xA7""9.1/\xC2\xA7""9.2's record equality is defined "
+                "structurally over that record's own fields only, so no "
+                "comparison can be emitted; give the argument the record "
+                "type, or compare through an `Object`-typed operand "
+                "(language spec \xC2\xA7""8.1 / \xC2\xA7""9.1 / \xC2\xA7""9.2)");
+            return llvm::PoisonValue::get(i1());
+        }
         // §9.1/§9.2: drive per-field comparison off the record's declared
         // member types so string fields compare by content (per §8.3).
         return emitStructEquality(recv, other, st, ts);

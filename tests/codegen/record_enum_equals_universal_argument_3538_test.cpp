@@ -313,3 +313,114 @@ BEZEL_TEST(codegen_record_enum_equals_universal_argument_3538,
                                 "05 True\n"
                                 "06 True\n"));
 }
+
+// ── T7 (fix #3918, §8.1/§9.1/§9.2, v0.294) — the RECORD twin of fix #3913's
+// choice-arm SIGSEGV. `p.Equals(arg)` where `p`'s receiver type is a record
+// and `arg`'s STATIC type is an UNRESOLVED generic method type parameter
+// reaches `equalsArgIsOwnTypeOrUnresolved`'s "or unresolved" clause, which
+// (per its own documented limitation — codegen substitutes VALUES, never
+// `ctx_.exprType`'s answer) cannot see what the call site actually
+// substitutes the parameter to. Pre-fix, the record arm assumed any
+// STRUCT-shaped `other` must be `ts`-shaped and fed it straight to
+// `emitStructEquality`, which unconditionally `CreateExtractValue`s at
+// `ts`'s own field indices.
+//
+// MEASURED via gdb on the pre-fix tree: `Foo<Pair>(p, new Pair(9))` with
+// `p: Pt` (a THREE-field record; `Pair` has ONE field) SIGSEGVs `bezelc`
+// itself — fault in `llvm::Value::setName`, called from
+// `ExtractValueInst::Create` inside `emitStructEquality`
+// (LlvmBackend_Layout.cpp:6227), reached through `lowerValueSemMethodOn`'s
+// record arm (LlvmBackend_Calls2.cpp) — the identical backtrace shape #3913
+// reported for the choice arm's `emitChoiceEquality`.
+//
+// Post-fix, the mismatched-shape guard added for #3918 fails this CLOSED: a
+// located `Severity::Error` diagnostic, and the whole compile is REJECTED
+// (`r.ran` is false) rather than the compiler crashing. This is a DIFFERENT
+// closing mechanism than #3913's choice-arm fix (which relies on the
+// pre-existing §7.5/#3452 null-conditional "declining inner lowering fails
+// closed" wrapper): this call site is a PLAIN `.` access, so there is no such
+// wrapper to route a bare decline through, and #3918's guard reports the
+// error directly instead — mirroring the ENUM arm's own precedent a few
+// lines above in the same function for the identical shape of problem,
+// rather than falling through to the pre-existing #2491/#3079
+// `Severity::Warning` "return-value expression failed to lower" quiet
+// degrade (which is what a BARE `return nullptr` here would do, since
+// nothing in this call's plain-`.` path fails closed on its own — MEASURED:
+// the sibling pre-existing decline three lines above this guard,
+// `!other->getType()->isStructTy()`, already exhibits exactly that quiet
+// degrade for the same unresolved-parameter shape when it resolves to a
+// non-struct type, e.g. `Foo<int>(p, 7)` — filed as issue #3922, out of
+// scope for this fix).
+//
+// A bare not-ran check on its own is deliberately not the oracle here (it is
+// also satisfied by a crash or a signal death): the diagnostic TEXT is
+// asserted below, which only the fixed-closed outcome produces — the base
+// tree's SIGSEGV asserts nothing here at all (whether the run "ran" is
+// undefined after a child crash, not merely false), which is exactly the
+// FAIL-WITHOUT asymmetry this row exists to prove.
+BEZEL_TEST(codegen_record_enum_equals_universal_argument_3538,
+           record_equals_struct_shaped_generic_arg_fails_closed_not_crash_3918) {
+    auto r = runAot(
+        "module M3538G; "
+        "record Pt(X: int, Y: int, Z: int); "
+        "record Pair(A: int); "
+        "class C "
+        "  public static method Foo<Arg>(p: Pt, arg: Arg): bool "
+        "    return p.Equals(arg); "
+        "  end Foo; "
+        "  public static method Main(): int "
+        "    var p := new Pt(1, 2, 3); "
+        "    var b := C.Foo<Pair>(p, new Pair(9)); "
+        "    Console.WriteLine(b.ToString()); "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    bool named = false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("member `Equals`") != std::string::npos &&
+            d.message.find("`M3538G.Pt`") != std::string::npos)
+            named = true;
+    BEZEL_EXPECT_TRUE(named);
+    bool explainsWhy = false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("does not resolve to a value of that record") !=
+            std::string::npos)
+            explainsWhy = true;
+    BEZEL_EXPECT_TRUE(explainsWhy);
+}
+
+// ── T8 (fix #3918) — ⚠ FALSE-DECLINE GUARD. T7's guard must fire ONLY for a
+// genuinely mismatched instantiation, never for a generic argument that
+// resolves to THIS record's own type — that would turn a correct program
+// into a spuriously rejected one, the opposite failure from #3918's crash.
+// `Foo<Pt>(p, q)` / `Foo<Pt>(p, d)` substitute the SAME unresolved-type-
+// parameter path T7 exercises, but at `Arg = Pt` (the receiver's own type),
+// so the loaded argument's actual LLVM type IS `st` and the new
+// `other->getType() != st` comparison must NOT fire: both calls must still
+// reach `emitStructEquality` and answer structurally, exactly as the
+// direct (non-generic) `p.Equals(q)` spelling does in T1.
+BEZEL_TEST(codegen_record_enum_equals_universal_argument_3538,
+           record_equals_own_type_generic_arg_still_lowers_3918) {
+    auto r = runAot(
+        "module M3538H; "
+        "record Pt(X: int, Y: int, Z: int); "
+        "class C "
+        "  public static method Foo<Arg>(p: Pt, arg: Arg): bool "
+        "    return p.Equals(arg); "
+        "  end Foo; "
+        "  public static method Main(): int "
+        "    var p := new Pt(1, 2, 3); "
+        "    var q := new Pt(1, 2, 3); "
+        "    var d := new Pt(9, 9, 9); "
+        "    Console.WriteLine(\"same \" + C.Foo<Pt>(p, q).ToString()); "
+        "    Console.WriteLine(\"diff \" + C.Foo<Pt>(p, d).ToString()); "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText,
+                    std::string("same True\ndiff False\n"));
+}
