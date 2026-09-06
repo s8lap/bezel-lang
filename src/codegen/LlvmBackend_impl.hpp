@@ -4070,10 +4070,25 @@ private:
     // a nullable value-type receiver. Returns the GetHashCode (i32) / Equals
     // (i1) / record-or-enum ToString result, or null if not handled (a primitive
     // ToString is left to the dedicated string path).
+    //
+    // fix #3925 (§8.1/§35.4/§35.7, v0.294): `viaNullCondWrapper` says whether
+    // THIS call came from `lowerNullCondValueSemCall`'s `?.` dispatch, which
+    // already converts a bare `nullptr` return into its own located §7.5/#3452
+    // "declining inner lowering fails closed" diagnostic (see that function).
+    // The choice `Equals` arm's own non-struct decline needs to know this: a
+    // PLAIN `.`/`!.` call site (the default, `false`) has no such wrapper
+    // above it, so a bare decline there falls through to ordinary member
+    // dispatch and quietly degrades to the #2491/#3079 warning backstop
+    // instead of failing the build — the defect this fix closes. Reported
+    // ONLY when `false`; when `true` the arm still returns bare `nullptr` so
+    // the `?.` wrapper's own diagnostic (pinned verbatim by
+    // `nullcond_unit_receiver_equals_hashcode_3452_test.cpp`'s T6 row) keeps
+    // winning, unchanged.
     llvm::Value* lowerValueSemMethodOn(const sema::TypeRef* recvTy,
                                        llvm::Value* recv,
                                        const ast::CallExpr& call,
-                                       std::string_view member);
+                                       std::string_view member,
+                                       bool viaNullCondWrapper = false);
 
     // §7.5 / #1075: lower `valueRecv?.ToString()/GetHashCode()/Equals(x)` on a
     // NULLABLE value-type/enum/record receiver — `hasValue ? wrap(method(inner))

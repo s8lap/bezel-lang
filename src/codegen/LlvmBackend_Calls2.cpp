@@ -2886,7 +2886,8 @@ llvm::Value* Emitter::emitUnitUniversalAnswer(std::string_view member,
 llvm::Value* Emitter::lowerValueSemMethodOn(const sema::TypeRef* recvTy,
                                             llvm::Value* recv,
                                             const ast::CallExpr& call,
-                                            std::string_view member) {
+                                            std::string_view member,
+                                            bool viaNullCondWrapper) {
     bool isToString    = member == "ToString"    && call.args.empty();
     bool isGetHashCode = member == "GetHashCode"  && call.args.empty();
     bool isEquals      = member == "Equals"       && call.args.size() == 1;
@@ -3059,7 +3060,79 @@ llvm::Value* Emitter::lowerValueSemMethodOn(const sema::TypeRef* recvTy,
         if (!other) return nullptr;
         if (other->getType()->isPointerTy())
             other = builder_.CreateLoad(st, other);
-        if (!other->getType()->isStructTy()) return nullptr;
+        // fix #3925 (§8.1/§35.4/§35.7, v0.294): the CHOICE twin of fix #3922's
+        // record-arm non-struct guard, on this arm's own pre-existing decline
+        // (present since #3893/#3538's rework, untouched by #3913's adjacent
+        // struct-MISMATCH guard below). `equalsArgIsOwnTypeOrUnresolved`
+        // answers TRUE for an UNRESOLVED generic method type parameter
+        // unconditionally — codegen substitutes VALUES, never
+        // `ctx_.exprType`'s answer — so when a LIVE call site's instantiation
+        // is a NON-struct type (`int`, `bool`, `string`, …) `other`'s loaded
+        // LLVM type is that primitive's own, never a struct at all. The bare
+        // `if (!other->getType()->isStructTy()) return nullptr;` that used to
+        // sit here is reached through a PLAIN `.`/`!.` access exactly like
+        // #3922's record-arm site — MEASURED (issue #3925):
+        // `Console.WriteLine(s.Equals(arg).ToString())` inside
+        // `Foo<Arg>(s: Sh, arg: Arg)` called as `Foo<int>(s, 7)` compiled
+        // clean (rc=0) and printed NOTHING for that line — "before"/"after"
+        // markers around it still printed — the whole comparison silently
+        // vanishing via the #2491/#3079 warning backstop while `bezelc`
+        // reported success.
+        //
+        // UNLIKE #3922's record site, this exact source line is reached a
+        // SECOND way: `lowerNullCondValueSemCall`'s `?.` dispatch
+        // (`s?.Equals(arg)` on a nullable `Sh?`) already wraps ANY bare
+        // `nullptr` from this arm in its own §7.5/#3452 "declining inner
+        // lowering fails closed" diagnostic — this is
+        // `nullcond_unit_receiver_equals_hashcode_3452_test.cpp`'s PINNED T6
+        // row (`nullcond_declining_inner_lowering_fails_closed_spec_7_5`,
+        // `Foo<int>(s, 7)` with `s: Sh?`), already failing closed today, NOT
+        // a quiet degrade. Reporting a NEW diagnostic here unconditionally
+        // would fire BEFORE that wrapper's own `if (!res)` check ever saw a
+        // null (a non-null `PoisonValue` no longer trips it), silently
+        // changing T6's exact pinned diagnostic text. `viaNullCondWrapper`
+        // (set only by `lowerNullCondValueSemCall`'s own call site) is the
+        // "the caller already fails closed on a null return" signal issue
+        // #3925 asked for: when true, this arm keeps returning bare
+        // `nullptr`, exactly as before this fix, so T6's wrapper-diagnostic
+        // path and its asserted text are completely unchanged. When false —
+        // every PLAIN `.`/`!.` call site (the three other callers of this
+        // function, none of which pass `viaNullCondWrapper`) — there is no
+        // such wrapper, so this arm now reports its own located error
+        // instead of degrading, mirroring #3922's record fix and the ENUM
+        // arm's own pre-existing `!isIntegerTy()` precedent a few dozen
+        // lines above for the identical shape of problem.
+        //
+        // ⚠ `emittingGenericTemplateBody_` gating is load-bearing, not
+        // decoration, for the SAME reason #3922's commit paid for directly:
+        // sema resolves a generic method's body ONCE, at its declaration
+        // (LlvmBackend_Layout.cpp:6567), so `at` names the bare, unresolved
+        // `Arg` in EVERY codegen pass over this arm, including the dead,
+        // never-invoked "abstract template" body every generic method's
+        // `emitFunctionBody` also compiles so its own IR verifies (#817/
+        // §14.2). In that dead pass `arg`'s lowered representation is the
+        // generic-parameter placeholder — an `i32`, never a struct,
+        // regardless of what any real call site substitutes — so an
+        // unguarded version of this check would reject every generic method
+        // that merely CONTAINS this call shape, independent of what any
+        // caller instantiates it with. In the dead-template pass this arm
+        // still bare-returns null exactly as before this fix; no operational
+        // change there, since that body never runs.
+        if (!other->getType()->isStructTy()) {
+            if (emittingGenericTemplateBody_ || viaNullCondWrapper)
+                return nullptr;
+            ctx_.diagnostics().report(
+                Severity::Error, call.span.begin,
+                "member `Equals` on a `" + spec85QualifiedTypeName(ts) +
+                "` receiver was given an argument whose type this "
+                "instantiation does not resolve to a value of that choice, "
+                "and \xC2\xA7""35.7's choice equality is defined over the "
+                "active case's payload only, so no comparison can be "
+                "emitted; give the argument the choice type, or compare "
+                "through an `Object`-typed operand (language spec "
+                "\xC2\xA7""8.1 / \xC2\xA7""35.4 / \xC2\xA7""35.7)");
+            return llvm::PoisonValue::get(i1());
+        }
         // fix #3913 (§8.1/§8.3/§35.4/§7.5, v0.294): `equalsArgIsOwnTypeOrUnresolved`
         // answers TRUE for an UNRESOLVED generic method type parameter (its "or
         // unresolved" clause) without knowing what this call site substitutes it
@@ -14091,7 +14164,13 @@ llvm::Value* Emitter::lowerNullCondValueSemCall(
     // GetHashCode/Equals go through the factored value-semantics core.
     llvm::Value* res = isToString
         ? emitValueToString(innerVal, &innerTy)
-        : lowerValueSemMethodOn(&innerTy, innerVal, call, nm.member);
+        // fix #3925: this IS the `?.` wrapper — tell the dispatch core so its
+        // choice-arm non-struct decline keeps returning bare `nullptr` here
+        // (routing into THIS function's own diagnostic below, unchanged)
+        // rather than reporting its own, which would change the pinned T6
+        // diagnostic text.
+        : lowerValueSemMethodOn(&innerTy, innerVal, call, nm.member,
+                                 /*viaNullCondWrapper=*/true);
     if (!res) {
         // fix #3452 follow-up (§7.5, v0.283): a declining inner lowering must
         // leave WELL-FORMED IR behind **and must still fail the compile**.

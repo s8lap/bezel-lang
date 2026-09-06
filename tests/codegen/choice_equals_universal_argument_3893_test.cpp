@@ -65,6 +65,13 @@
 //   T3  §8.3's hash/equals control: two equal Shape values hash equal — this
 //       path is untouched by the fix, exercised here to confirm the new gate
 //       does not disturb it.
+//   T4  fix #3925 (§8.1/§35.4/§35.7, v0.294): the CHOICE twin of fix #3922's
+//       record-arm non-struct guard — a PLAIN `.` access whose `Equals`
+//       argument is an UNRESOLVED generic method type parameter that THIS
+//       call site instantiates to a non-struct type (`int`) now fails
+//       closed with a located diagnostic, instead of quietly degrading to
+//       the #2491/#3079 warning backstop (`bezelc` exiting 0 while the
+//       comparison silently vanishes at run time).
 
 #include <string>
 
@@ -167,4 +174,100 @@ BEZEL_TEST(codegen_choice_equals_universal_argument_3893,
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_EQ(r.stdoutText, std::string("eq True\nhash True\n"));
+}
+
+// ── T4 (fix #3925, §8.1/§35.4/§35.7, v0.294) — the CHOICE sibling of
+// `record_enum_equals_universal_argument_3538_test.cpp`'s T9 (fix #3922).
+// `s.Equals(arg)` where `s`'s receiver type is a choice and `arg`'s STATIC
+// type is an UNRESOLVED generic method type parameter reaches the choice
+// arm's own `equalsArgIsOwnTypeOrUnresolved` "or unresolved" clause
+// (LlvmBackend_Calls2.cpp, `lowerValueSemMethodOn`'s choice branch), but THIS
+// instantiation substitutes it to a NON-STRUCT type (`int`) rather than a
+// choice — the pre-existing bare `if (!other->getType()->isStructTy())
+// return nullptr;` there, present since #3893/#3538's rework and left
+// untouched by #3913's adjacent struct-mismatch guard (filed as issue #3925,
+// the gap #3922's own commit — the record twin — flagged as unfixed).
+//
+// MEASURED on HEAD (7cf24f7, #3922 already landed for the RECORD arm only):
+// `bezelc` on this program compiles clean (rc=0) with only the pre-existing
+// #2491/#3079 `Severity::Warning` "the argument of this `Console.WriteLine`
+// failed to lower to a value" internal note (`hasErrors()` stays false).
+// Running the produced binary prints `before` and `after` with NOTHING in
+// between — the `s.Equals(arg)` comparison line vanishes completely, not
+// even a `False` line — an unambiguous wrong answer (this shape is
+// deliberately used instead of a `return`-shape oracle, which would
+// coincidentally print the §8.3-correct `False` for an `int` against a
+// choice and could not distinguish "correctly computed" from "defaulted to
+// zero by accident" — see #3922's own commit for the identical reasoning).
+//
+// Post-fix, the arm reports a located `Severity::Error` naming the receiver
+// type and rejects the build (`r.ran` false) instead of degrading the
+// statement to nothing. This call site is a PLAIN `.` access (`s: Sh`, not
+// `Sh?`) — the OTHER access path, `s?.Equals(arg)` on `s: Sh?`, is the
+// DIFFERENT, ALREADY-fine `?.` spelling pinned by
+// `nullcond_unit_receiver_equals_hashcode_3452_test.cpp`'s T6 row, which
+// this fix's `viaNullCondWrapper` parameter deliberately leaves untouched
+// (see that file and the fix's own source comment).
+BEZEL_TEST(codegen_choice_equals_universal_argument_3893,
+           choice_equals_non_struct_generic_arg_fails_closed_not_degraded_3925) {
+    auto r = runAot(
+        "module M3893D; "
+        "choice Sh Circle(R: int), Square(S: int); end Sh; "
+        "class C "
+        "  public static method Foo<Arg>(s: Sh, arg: Arg) "
+        "    Console.WriteLine(\"before\"); "
+        "    Console.WriteLine(s.Equals(arg).ToString()); "
+        "    Console.WriteLine(\"after\"); "
+        "  end Foo; "
+        "  public static method Main(): int "
+        "    var s := Sh.Circle(1); "
+        "    C.Foo<int>(s, 7); "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    bool named = false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("member `Equals`") != std::string::npos &&
+            d.message.find("`M3893D.Sh`") != std::string::npos)
+            named = true;
+    BEZEL_EXPECT_TRUE(named);
+    bool explainsWhy = false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("does not resolve to a value of that choice") !=
+            std::string::npos)
+            explainsWhy = true;
+    BEZEL_EXPECT_TRUE(explainsWhy);
+}
+
+// ── T5 (fix #3925 false-decline control) — the SAME unresolved-parameter
+// path, resolved to the choice's OWN type via `?.`, must keep answering a
+// real value rather than newly declining. This is a narrower repeat of T5b
+// in `nullcond_unit_receiver_equals_hashcode_3452_test.cpp` (which already
+// covers `Foo<int>` on `Sh?`); pinned here too because it is the row this
+// fix's `emittingGenericTemplateBody_`/`viaNullCondWrapper` gating could
+// most plausibly have broken by being too broad.
+BEZEL_TEST(codegen_choice_equals_universal_argument_3893,
+           choice_equals_own_type_generic_arg_still_lowers_3925) {
+    auto r = runAot(
+        "module M3893E; "
+        "choice Sh Circle(R: int), Square(S: int); end Sh; "
+        "class C "
+        "  public static method Foo<Arg>(s: Sh, arg: Arg): bool "
+        "    return s.Equals(arg); "
+        "  end Foo; "
+        "  public static method Main(): int "
+        "    var s: Sh := Sh.Circle(1); "
+        "    var other: Sh := Sh.Circle(1); "
+        "    var diff: Sh := Sh.Square(1); "
+        "    Console.WriteLine(\"same \" + C.Foo<Sh>(s, other).ToString()); "
+        "    Console.WriteLine(\"diff \" + C.Foo<Sh>(s, diff).ToString()); "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText,
+                    std::string("same True\ndiff False\n"));
 }
