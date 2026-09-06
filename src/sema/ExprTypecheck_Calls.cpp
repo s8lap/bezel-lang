@@ -20122,7 +20122,15 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
         // is rejected at the call site instead of crashing codegen. ToString /
         // GetType are NOT affected — the §8.5/§9.1 default ToString remains for
         // every record, and GetType is universal.
-        checkEqualityMemberUseSite(targetType, ma.member, ma.span.begin);
+        //
+        // fix #3906 (§35.11, v0.294): pass the receiver's OWN resolved
+        // TypeRef (`ma.target`'s exprType) so a generic choice classifies at
+        // THIS instantiation's substituted arguments (`Pair<int>`), not the
+        // bare, uninstantiated declaration the helper falls back to when
+        // given none.
+        checkEqualityMemberUseSite(
+            targetType, ma.member, ma.span.begin,
+            ma.target ? ctx_.exprType(*ma.target) : nullptr);
         // §9.8 / issue #550 / fix #3140 (family F2 of umbrella #3152):
         // `Serialize(s: ISerializer)` and the static `Deserialize(d:
         // IDeserializer)` are SYNTHESIZED by codegen for a record, enum or
@@ -21275,7 +21283,8 @@ TypeRef* ExprTC::builtinValueMemberType(const TypeRef* recvTy,
 // AVAILABLE; the gate is on availability, not on the receiver's nullness.
 void ExprTC::checkEqualityMemberUseSite(TypeSymbol* targetType,
                                         std::string_view member,
-                                        SourceLocation loc) {
+                                        SourceLocation loc,
+                                        const sema::TypeRef* recvTy) {
     if (!targetType) return;
     if (member != "Equals" && member != "GetHashCode") return;
     if (targetType->kind == ast::TypeDeclKind::Record) {
@@ -21318,18 +21327,38 @@ void ExprTC::checkEqualityMemberUseSite(TypeSymbol* targetType,
         // makes the direct `.Equals(...)`/`.GetHashCode()` calls legal on
         // a value-like choice with a homogeneous overload. v0.276 #3333
         // wires the rescue through choiceHasUserDeclaredEquality.
-        sema::TypeRef rt;
-        rt.kind = sema::TypeRef::Kind::Named;
-        rt.declaration = targetType;
+        //
+        // fix #3906 (§35.11, v0.294): "Classification is evaluated per
+        // instantiation under §3.6 rule 2" — an unmarked bare-type-parameter
+        // payload's classification depends on what it is substituted with,
+        // and this call site is exactly where that substitution was being
+        // discarded. `rt` used to carry ONLY `targetType`'s bare declaration
+        // (no `genericArgs`), so `Pair<int>.First(value: T)`'s classifier saw
+        // an uninstantiated `T` and fell back to `payloadFieldTypeIsBorrowCarrying`'s
+        // conservative "still-generic bare param" answer (borrow-carrying) —
+        // §35.11 requires classification-neutral at a value substitution like
+        // `T = int`. Reuse `recvTy` — the receiver's own resolved TypeRef,
+        // already carrying `Pair<int>`'s `genericArgs` — exactly as
+        // `isAutoEqualityBearingChoice`'s own `inst`-vs-bare fallback pattern
+        // does (SymbolCollection.cpp), rather than re-deriving a second,
+        // drifting instantiation spelling here.
+        sema::TypeRef bareRt;
+        const sema::TypeRef* rt = recvTy;
+        if (!rt || rt->kind != sema::TypeRef::Kind::Named ||
+            rt->declaration != targetType) {
+            bareRt.kind = sema::TypeRef::Kind::Named;
+            bareRt.declaration = targetType;
+            rt = &bareRt;
+        }
         // §35.7 / §3.6 (v0.276, #3333): the rescue clause — a value-like
         // choice with the §25.2 co-declared pair is hashable, so direct
         // `.Equals(...)`/`.GetHashCode()` are legal (they dispatch to the
         // user's members). The OR mirrors the record gate above: `isEq ||
         // userDeclared`. Pre-#3333 the choice arm OR'd nothing and a
         // non-auto-hashable choice rejected even with the rescue in place.
-        if (!isAutoEqualityBearingChoice(targetType, ctx_, &rt) &&
-            !choiceHasUserDeclaredEquality(targetType, ctx_, &rt)) {
-            auto verdict = common::classifyChoiceType(&rt, ctx_);
+        if (!isAutoEqualityBearingChoice(targetType, ctx_, rt) &&
+            !choiceHasUserDeclaredEquality(targetType, ctx_, rt)) {
+            auto verdict = common::classifyChoiceType(rt, ctx_);
             std::string reason;
             if (verdict &&
                 *verdict != common::ChoiceClassification::ValueLike) {
@@ -21435,7 +21464,12 @@ void ExprTC::resolveNullCondMember(const ast::NullCondMemberExpr& nm) {
             // extension lookup above also uses.
             SourceLocation loc = nm.span.begin;
             if (loc.line == 0 && nm.target) loc = nm.target->span.begin;
-            checkEqualityMemberUseSite(gateType, nm.member, loc);
+            // fix #3906 (§35.11, v0.294): thread `recvTyForDiag` — already
+            // the receiver's own resolved TypeRef — through so a generic
+            // choice's `?.Equals`/`?.GetHashCode` classifies at THIS
+            // instantiation, matching the `.` form's fix just above.
+            checkEqualityMemberUseSite(gateType, nm.member, loc,
+                                       recvTyForDiag);
         }
         // fix #2756 / §7.5 / §22.3 (v0.282): the §21.1 materializer members
         // reached through `?.` — `Split` on string; `Sorted`/`Reversed`/

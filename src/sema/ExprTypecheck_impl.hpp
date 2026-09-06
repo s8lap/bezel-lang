@@ -2759,9 +2759,19 @@ private:
     // receiver's underlying record/choice TypeSymbol (nullable wrapper already
     // unwrapped by the caller); no-op when targetType is null or not a
     // record/choice. `member` is "Equals"/"GetHashCode"; `loc` is the use site.
+    // `recvTy` (fix #3906, §35.11, v0.294) is the receiver's OWN resolved
+    // TypeRef when the caller has one (`ctx_.exprType` of the receiver
+    // expression) — carrying the actual generic arguments of THIS
+    // instantiation (`Pair<int>`, not bare `Pair`). When it names the same
+    // declaration as `targetType` it is threaded into the choice classifier
+    // so an unmarked bare-type-parameter payload is classified against the
+    // substituted type per §35.11, not the uninstantiated declaration; a
+    // caller with no such TypeRef (or one that does not resolve to
+    // `targetType`) leaves the prior bare-declaration behavior unchanged.
     void checkEqualityMemberUseSite(TypeSymbol* targetType,
                                     std::string_view member,
-                                    SourceLocation loc);
+                                    SourceLocation loc,
+                                    const sema::TypeRef* recvTy = nullptr);
 
     // §7.5 / #751: result type of a builtin (string/primitive) RECEIVER's
     // property-like value member (e.g. `string.Length`, `string.IsAscii`) for
