@@ -2598,11 +2598,25 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         // exclusions, and, as there, NO `!nullable` gate (the closure category
         // has never had one, unlike the string category above): agreement
         // between the two body forms is the invariant #2688 established.
+        // fix #3804 (§27.5 / §15.3 / §28.9, v0.294): `!isLambdaClosureReturnCall`
+        // joins the three existing transfer exclusions — a CallExpr whose
+        // callee is a lambda-typed LOCAL/PARAMETER (`return outer();` where
+        // `outer` holds a lambda) already mints exactly +1 in ITS OWN body
+        // (fix #2714's own reasoning: the callee is statically a LambdaExpr
+        // with a function-typed return, so #2691's mint or the producer's
+        // transfer already fired inside it) — the SAME fact
+        // isUserMethodClosureReturnCall/isPlusOneClosureProducer already
+        // rule out for a user-method callee / a bare lambda literal. Without
+        // this, `return outer();` here retains a reference the callee ALREADY
+        // transferred, inflating the returned closure's refcount by one — it
+        // never reaches zero, so its envdtor never runs and the whole
+        // chain (closure header, env, every capture cell) leaks permanently.
         if (v && rs->value && !currentReturnTypeNode_ && lamRet &&
             v->getType()->isPointerTy() &&
             lamRet->kind == sema::TypeRef::Kind::Function &&
             !isPlusOneClosureProducer(rs->value.get()) &&
             !isUserMethodClosureReturnCall(rs->value.get()) &&
+            !isLambdaClosureReturnCall(rs->value.get()) &&
             !returnedClosureLocalOwnsPlusOne(rs->value.get()))
             emitClosureRetain(v);
         // ⚠ fix #2703 (v0.240) — THIS ARM DELIBERATELY KEEPS `currentReturnType
@@ -2663,9 +2677,23 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
             v->getType()->isPointerTy()) {
             const sema::TypeRef* declRet =
                 ctx_.resolvedType(*currentReturnTypeNode_);
+            // fix #3804 (§27.5 / §15.3 / §28.9, v0.294): `!isLambdaClosureReturnCall`
+            // joins the existing transfer exclusions — see the sibling arm
+            // above (the lambda-body-return twin) for the full argument.
+            // `return outer();` at a METHOD's own top level (`outer` a
+            // lambda-typed LOCAL) is the exact shape issue #3804's own
+            // probes need: without this exclusion, the method mints a
+            // SECOND +1 on a reference `outer`'s own body already
+            // transferred, so the returned closure's refcount never reaches
+            // zero and its envdtor (and therefore every capture cell it is
+            // the designated §3426 owner of) never runs — a permanent leak
+            // of the closure header, its env, and its captures, not merely
+            // the 26000 B / 1500-allocation figure LSan reports at 500
+            // iterations of issue #3804's own probes.
             if (declRet && declRet->kind == sema::TypeRef::Kind::Function &&
                 !isPlusOneClosureProducer(rs->value.get()) &&
                 !isUserMethodClosureReturnCall(rs->value.get()) &&
+                !isLambdaClosureReturnCall(rs->value.get()) &&
                 !returnedClosureLocalOwnsPlusOne(rs->value.get()))
                 emitClosureRetain(v);
         }

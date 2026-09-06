@@ -2732,6 +2732,13 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     boxCaptureLocalsFn_ = fn;
     cellFreeEligible_.clear();
     unwindUnsafeCellFree_.clear();         // fix #2334
+    // fix #3804 (§27.5 / §15.3 / §28.9, v0.294): snapshot the ANCESTOR
+    // scope's already-computed sharedCellEnvdtorFreeOwner_ before it is
+    // cleared for THIS nested lambda's own re-scan — see the merge just
+    // below (after collectCellFreeEligible) for the full soundness
+    // argument.
+    const std::unordered_map<const void*, const void*>
+        ancestorSharedCellOwner3804 = sharedCellEnvdtorFreeOwner_;
     sharedCellEnvdtorFreeOwner_.clear();   // fix #3426
     cellFreeEligibleFn_ = fn;
     if (!lam.exprBody) {
@@ -2771,6 +2778,36 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
             }
         }
     }
+    // fix #3804 (§27.5 / §15.3 / §28.9, v0.294): merge the ANCESTOR scope's
+    // sharedCellEnvdtorFreeOwner_ decisions back in for any key THIS body's
+    // own re-scan does not know about. A captured FREE VARIABLE from an
+    // ancestor scope (e.g. `outer`'s own captured `x`, boxed only to pass
+    // down to a nested `inner`) is never itself a LocalDecl of THIS body,
+    // so collectCellFreeEligible's fresh walk over `lam.stmts` structurally
+    // cannot rediscover the non-escaping co-capture (§3426 condition (c))
+    // that made the ancestor's answer valid — `outer` does not capture
+    // itself. The ancestor's whole-function-body walk (collectCellFreeEligible's
+    // #1135 widening, run once for the OUTERMOST body that actually
+    // declares `x`) already proved the fact correctly for the ENTIRE
+    // nesting structure; `emplace` only inserts an ABSENT key, so THIS
+    // body's own fresh answer always wins for any key it DOES recompute —
+    // no conflict, only filling gaps for inherited captures. Applies to
+    // BOTH branches above (the expr-body branch never calls
+    // collectCellFreeEligible at all, leaving the member empty after the
+    // clear above — the merge is exactly as needed there too).
+    //
+    // Without this, `sharedCellEnvdtorFreeOwner_[x] = inner` (set correctly
+    // while analyzing the ANCESTOR function's own body) is silently lost
+    // the moment `outer`'s own lowerLambda clears the member for its own
+    // re-scan above — and `inner`'s envdtor is generated INSIDE that exact
+    // window (a nested lowerLambda call for `inner` happens while
+    // `outer`'s own re-scan state, cellFreeEligibleFn_ == outer's fn, is
+    // still the active one `isSharedCellEnvdtorFreeOwner` reads against),
+    // so `inner` never learns it is the designated owner and `x`'s cell
+    // leaks. Issue #3804's own two probes (block- and expression-bodied
+    // `outer`) reproduce this precisely.
+    for (const auto& [k, v] : ancestorSharedCellOwner3804)
+        sharedCellEnvdtorFreeOwner_.emplace(k, v);
     closureReleaseEligibleFn_ = fn;
     // Emit body.
     if (lam.exprBody) {

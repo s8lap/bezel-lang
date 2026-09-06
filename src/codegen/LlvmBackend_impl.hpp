@@ -14051,6 +14051,40 @@ private:
     // Compute cellFreeEligible_ for a block body (see the .cpp).
     void collectCellFreeEligible(
         const std::vector<std::unique_ptr<ast::Stmt>>& body);
+    // fix #3804 (§27.5 / §15.3 / §28.9, v0.294): the SINGLE authority
+    // answering "does calling local L (bound `var/const L := lambda() =>
+    // …`) transparently and exclusively produce one specific nested
+    // LambdaExpr H, and is L itself called AT MOST ONCE anywhere in `body`?"
+    // Generalizes fix #3805's own bare-expression-body-only forwardTarget3805
+    // map (formerly an inline loop duplicated inside collectCellFreeEligible)
+    // to ALSO admit a STRAIGHT-LINE block body whose only reachable return is
+    // `return H;` naming a local, declared earlier in the SAME straight-line
+    // statement list, bound to a bare LambdaExpr literal (`var outer :=
+    // lambda() => do var inner := lambda() => …; return inner; end;`) —
+    // deliberately declining (no entry) the instant ANY control-flow
+    // statement (if/while/for/try/case/do) appears anywhere in L's block
+    // body, rather than reasoning about it: the straight-line case alone is
+    // airtight (every statement runs exactly once, top to bottom, so
+    // "exactly one reachable return" is a fact, not an approximation) and is
+    // the shape issue #3804's own probes need. A future widening to admit
+    // control flow is separate work, not attempted here.
+    //
+    // Shared by collectCellFreeEligible (fix #3805's own non-escaping-tail
+    // admission, `transparentTailNonEscaping3805` — replaces that function's
+    // former inline duplicate of this exact bare-expression-body loop AND its
+    // own inline calledAtMostOnce ClosureEscapeWalker check, LANE_RULES §6)
+    // and collectDefinitelyEscapingLambdas / collectLambdaCaptures's #1135
+    // widening (issue #3804's escaping-tail admission — see both call sites'
+    // own comments for the full soundness argument). `calledAtMostOnce`
+    // reuses the identical ClosureEscapeWalker proof fix #3805 already
+    // trusts for exactly this purpose.
+    struct TransparentForwardTarget3804 {
+        const ast::LambdaExpr* target = nullptr;  // H
+        bool calledAtMostOnce = false;            // L's own single-call proof
+    };
+    std::unordered_map<const void*, TransparentForwardTarget3804>
+    collectTransparentForwardTargets(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body) const;
     // fix #2960 / §8.6 / §28.9: classify an expression stored into a managed
     // Object/interface local: +1 means boxForTarget creates (or a local
     // box-return method hands back) a fresh box; 0 means a statically non-box

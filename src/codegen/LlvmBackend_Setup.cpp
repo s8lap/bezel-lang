@@ -29876,6 +29876,78 @@ void Emitter::collectBoxCaptureLocals(
 }
 
 
+// fix #3804 (§27.5 / §15.3 / §28.9, v0.294): see the header declaration's own
+// comment for the full contract. Pure query over `body` — writes no Emitter
+// state.
+std::unordered_map<const void*, Emitter::TransparentForwardTarget3804>
+Emitter::collectTransparentForwardTargets(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body) const {
+    std::unordered_map<const void*, TransparentForwardTarget3804> out;
+    for (auto& s : body) {
+        LocalDeclInitView v = localDeclInitView(s.get());
+        auto* g = v.init ? dynamic_cast<const ast::LambdaExpr*>(v.init)
+                          : nullptr;
+        if (!g) continue;
+        const ast::LambdaExpr* target = nullptr;
+        if (g->stmts.empty()) {
+            // Bare expression body (fix #3805's original shape): calling `L`
+            // constructs and evaluates to `g->exprBody`, nothing else.
+            target = dynamic_cast<const ast::LambdaExpr*>(g->exprBody.get());
+        } else {
+            // fix #3804: straight-line block body. Decline (leave target
+            // null) the instant any control-flow statement appears — see
+            // the header comment for why that keeps the proof trivial.
+            bool decline = false;
+            int returnCount = 0;
+            const ast::LambdaExpr* found = nullptr;
+            for (auto& st : g->stmts) {
+                const ast::Stmt* stp = st.get();
+                if (dynamic_cast<const ast::LocalDecl*>(stp) ||
+                    dynamic_cast<const ast::LocalConstDecl*>(stp) ||
+                    dynamic_cast<const ast::ExpressionStmt*>(stp)) {
+                    continue;
+                }
+                if (auto* r = dynamic_cast<const ast::ReturnStmt*>(stp)) {
+                    ++returnCount;
+                    auto* id = dynamic_cast<const ast::IdentifierExpr*>(
+                        r->value.get());
+                    auto* lsym = id ? dynamic_cast<sema::LocalSymbol*>(
+                                          ctx_.exprSymbol(*id))
+                                     : nullptr;
+                    if (lsym && lsym->decl) {
+                        LocalDeclInitView iv = localDeclInitView(lsym->decl);
+                        found = iv.init
+                            ? dynamic_cast<const ast::LambdaExpr*>(iv.init)
+                            : nullptr;
+                    } else {
+                        found = nullptr;
+                    }
+                    continue;
+                }
+                // Any other statement kind (if/while/for/try/case/do/
+                // assignment/throw) — decline rather than reason about it.
+                decline = true;
+                break;
+            }
+            if (!decline && returnCount == 1 && found) target = found;
+        }
+        if (!target) continue;
+        // fix #3805's exactly-one-call proof, applied to `L` itself: TWO
+        // calls to the same forwarding lambda would build two independent
+        // `target` closures sharing the SAME boxed cell for whatever they
+        // capture, and only calleeCallCount==1 (not just `!escaped`, which
+        // two safe-read calls would also satisfy) rules that out.
+        ClosureEscapeWalker cew{ctx_, static_cast<const void*>(s.get())};
+        for (auto& s2 : body) cew.stmt(s2.get());
+        bool calledAtMostOnce = !cew.escaped && !cew.uncountableCalleeSeen &&
+                                 cew.calleeCallCount == 1;
+        out[static_cast<const void*>(g)] =
+            TransparentForwardTarget3804{target, calledAtMostOnce};
+    }
+    return out;
+}
+
+
 // §27.5 / #694: collect the LambdaExpr nodes that DEFINITELY escape the function
 // — those directly returned (`return () => …`). For such a closure the defining
 // scope is gone before the closure can be dropped, so its envdtor (run at the
@@ -29888,6 +29960,13 @@ void Emitter::collectBoxCaptureLocals(
 void Emitter::collectDefinitelyEscapingLambdas(
         const std::vector<std::unique_ptr<ast::Stmt>>& body) {
     definitelyEscapingLambdas_.clear();
+    // fix #3804 (§27.5 / §15.3 / §28.9, v0.294): resolves `return outer();`
+    // (a CALL to a transparently-forwarding local used directly as the
+    // return value, no intermediate binding) to the single LambdaExpr that
+    // call genuinely produces — see collectTransparentForwardTargets's own
+    // comment. Consumed in the ReturnStmt arm of `scan` below.
+    const std::unordered_map<const void*, TransparentForwardTarget3804>
+        forwardTargets3804 = collectTransparentForwardTargets(body);
     // One pass collects: (a) a DIRECT `return () => …` lambda → escapes; (b) the
     // set of locals that are REASSIGNED anywhere; (c) `return <ident>` candidates.
     // After the pass, a candidate `return f` adds f's INITIALIZER lambda iff f is
@@ -29944,12 +30023,51 @@ void Emitter::collectDefinitelyEscapingLambdas(
                 definitelyEscapingLambdas_.insert(
                     static_cast<const void*>(lam));
             else if (auto* id =
-                         dynamic_cast<const ast::IdentifierExpr*>(r->value.get()))
+                         dynamic_cast<const ast::IdentifierExpr*>(r->value.get())) {
                 if (auto* loc =
                         dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*id)))
                     // fix #3402: LocalDecl OR LocalConstDecl (see returnedVars).
                     if (localDeclInitView(loc->decl).init)
                         returnedVars.push_back(loc->decl);
+            }
+            // fix #3804 (§27.5 / §15.3 / §28.9, v0.294): `return outer();` —
+            // a CALL to a transparently-forwarding local used directly as
+            // the return value (no intermediate binding, unlike the
+            // `return <ident>` arm above). The callee `outer` here is
+            // INVOKED, not itself returned — reassignment of `outer`
+            // elsewhere is exactly the aliasing hazard `calledAtMostOnce`
+            // (computed by collectTransparentForwardTargets with the
+            // identical ClosureEscapeWalker technique fix #3805 uses for
+            // `M := L()`) already rules out, so no separate `reassigned`
+            // bookkeeping is needed here.
+            else if (auto* call =
+                         dynamic_cast<const ast::CallExpr*>(r->value.get())) {
+                if (call->callee) {
+                    if (auto* callee = dynamic_cast<const ast::IdentifierExpr*>(
+                            call->callee.get())) {
+                        if (auto* lsym = dynamic_cast<sema::LocalSymbol*>(
+                                ctx_.exprSymbol(*callee))) {
+                            if (lsym->decl) {
+                                LocalDeclInitView lv =
+                                    localDeclInitView(lsym->decl);
+                                auto* g = lv.init
+                                    ? dynamic_cast<const ast::LambdaExpr*>(
+                                          lv.init)
+                                    : nullptr;
+                                if (g) {
+                                    auto it = forwardTargets3804.find(
+                                        static_cast<const void*>(g));
+                                    if (it != forwardTargets3804.end() &&
+                                        it->second.calledAtMostOnce)
+                                        definitelyEscapingLambdas_.insert(
+                                            static_cast<const void*>(
+                                                it->second.target));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             return;
         }
         if (auto* is = dynamic_cast<const ast::IfStmt*>(s)) {
@@ -30068,6 +30186,17 @@ void Emitter::collectCellFreeEligible(
         // pre-pass (see its own comment for the full soundness argument);
         // consulted by collectLambdaCaptures's #1135 widening walker.
         const std::unordered_set<const void*>& transparentTailNonEscaping;
+        // fix #3804 (§27.5 / §15.3 / §28.9, v0.294): see
+        // collectTransparentForwardTargets's own comment for the full
+        // contract. Consulted UNCONDITIONALLY (like transparentTailNonEscaping
+        // above) at the top of the nested-LambdaExpr handling in
+        // collectLambdaCaptures's #1135 widening, to attribute a GENUINELY
+        // escaping forwarded tail target directly to its own
+        // escapingCapturersOf entry instead of the anonymous
+        // nestedWidenedKeys bucket — see that branch's own comment for the
+        // soundness argument (calledAtMostOnce is the multiplicity guard).
+        const std::unordered_map<const void*, Emitter::TransparentForwardTarget3804>&
+            transparentForwardTargets3804;
         // fix #2334: anchors for `using var` initializer CallExprs (form 2
         // of §28.14 — `using var sub := cs.Token.Register(lambda)`). Populated
         // by stmt() before the initializer is walked; consulted by expr() to
@@ -30343,6 +30472,64 @@ void Emitter::collectCellFreeEligible(
                             collectLambdaCaptures(nl, em,
                                                   /*isNonEscaping=*/true);
                             return;
+                        }
+                        // fix #3804 (§27.5 / §15.3 / §28.9, v0.294): `nl` is
+                        // `lam`'s own PROVEN transparent forward target
+                        // (either `lam`'s bare exprBody IS `nl`, or `nl` is
+                        // bound at a `var/const H :=` position that is the
+                        // sole reachable return of `lam`'s straight-line
+                        // block body — collectTransparentForwardTargets),
+                        // and `lam` itself is called at most once anywhere
+                        // in the enclosing body. Unlike the #3805 branch just
+                        // above (which reclassifies a NON-escaping M's tail
+                        // target), THIS target genuinely escapes `lam`
+                        // (e.g. `return inner;` where `inner` is returned
+                        // out of `lam` entirely — issue #3804's own probes).
+                        // Attribute it as a DIRECT escaping capturer
+                        // (recurse with isNonEscaping=false, which records
+                        // escapingCapturersOf[key]={nl} for every symbol
+                        // `nl` captures) instead of falling through to the
+                        // anonymous nestedWidenedKeys bucket below, which
+                        // sharedCellEnvdtorFreeOwner_'s condition (d) always
+                        // excludes — before this fix, a capture reachable
+                        // ONLY through a genuinely escaping nested lambda
+                        // could never be freed by anyone (excluded from the
+                        // scope-end route by capturedByEscaping, and from
+                        // the envdtor-owner route by nestedWidenedKeys).
+                        // Checked unconditionally (like the #3805 branch
+                        // above) because the bare-exprBody shape never sets
+                        // inVarInit/currentParentStmt below (there is no
+                        // `var h :=` binding at all — `lam`'s ENTIRE body IS
+                        // `nl`).
+                        //
+                        // Soundness — multiplicity. `calledAtMostOnce` (the
+                        // identical ClosureEscapeWalker proof #3805 trusts,
+                        // applied to `lam` itself instead of to a `M := L()`
+                        // binding) bounds `lam`'s own invocation count to at
+                        // most one; combined with
+                        // collectTransparentForwardTargets's straight-line-
+                        // body requirement (no loop can re-run `nl`'s own
+                        // LocalDecl), `nl` is instantiated AT MOST ONCE per
+                        // execution of the enclosing function body — the
+                        // same guarantee a top-level `var f := lambda() =>
+                        // …; return f;` gets for free from running once.
+                        // Without `calledAtMostOnce`, a `lam` called twice
+                        // would build two independent `nl` closures sharing
+                        // the SAME boxed cell, and naming the AST node `nl`
+                        // "the sole holder" would double-free it when both
+                        // are eventually released.
+                        {
+                            auto ftIt = transparentForwardTargets3804.find(
+                                static_cast<const void*>(lam));
+                            if (ftIt != transparentForwardTargets3804.end() &&
+                                ftIt->second.target == nl &&
+                                ftIt->second.calledAtMostOnce) {
+                                inVarInit = false;
+                                currentParentStmt = nullptr;
+                                collectLambdaCaptures(nl, em,
+                                                      /*isNonEscaping=*/false);
+                                return;
+                            }
                         }
                         // fix #3766: a nested lambda at a `var h := lambda()`
                         // (or `const h := lambda()`) position INSIDE a non-
@@ -30995,46 +31182,26 @@ void Emitter::collectCellFreeEligible(
         }
     };
 
-    // fix #3805 (§27.5 / §15.3 / §28.9, v0.294): pre-pass recognizing a
-    // TRANSPARENT FORWARDING LAMBDA — `var L := lambda() => H;` where `H`
-    // is itself a bare LambdaExpr (L's entire, expression-bodied, statement-
-    // free body IS the value every call to `L` produces) — called through
-    // exactly one `var/const M := L();` whose own binding `M` is already
-    // proven non-escaping (isLambdaClosureReturnCall
-    // admitted it into closureReleaseEligible_, fix #2714). In that shape
-    // `H`'s free variables are safe to treat as captured NON-ESCAPING: `H`
-    // is created and released entirely within THIS body's lifetime (via
+    // fix #3804 (§27.5 / §15.3 / §28.9, v0.294): single shared authority —
+    // was an inline bare-expression-body-only loop (fix #3805's original
+    // pre-pass); see collectTransparentForwardTargets's own comment for the
+    // generalization (now also admits a straight-line block body) and for
+    // why widening its domain is safe for both consumers below: neither
+    // cares whether L's own body was expression- or block-shaped, only
+    // whether forwardTargets3804[L] names the single value every call to L
+    // produces and whether L itself is provably called at most once.
+    const std::unordered_map<const void*, TransparentForwardTarget3804>
+        forwardTargets3804 = collectTransparentForwardTargets(body);
+    // fix #3805 (§27.5 / §15.3 / §28.9, v0.294): a `var/const M := L();`
+    // whose own binding `M` is already proven non-escaping
+    // (isLambdaClosureReturnCall admitted it into closureReleaseEligible_,
+    // fix #2714) and whose callee `L` is a transparent forwarding lambda
+    // (forwardTargets3804) called at most once — `H`'s (the forwarded
+    // target's) free variables are safe to treat as captured NON-ESCAPING:
+    // `H` is created and released entirely within THIS body's lifetime (via
     // `M`'s own scope-end release, which this same body's disposeStack
     // already fires), so its env cannot outlive the point cellFreeEligible_
-    // locals are freed. The exactly-one-call proof is load-bearing: TWO
-    // calls to the same forwarding lambda would build two independent `H`
-    // closures sharing the SAME boxed cell for whatever they capture, and
-    // only ClosureEscapeWalker's new calleeCallCount==1 (not just
-    // `!escaped`, which two safe-read calls would also satisfy) rules that
-    // out — the double-free the whole family exists to avoid.
-    std::unordered_map<const void*, const ast::LambdaExpr*> forwardTarget3805;
-    for (auto& s : body) {
-        LocalDeclInitView v = localDeclInitView(s.get());
-        auto* g = v.init ? dynamic_cast<const ast::LambdaExpr*>(v.init)
-                          : nullptr;
-        if (!g || !g->stmts.empty()) continue;
-        // EXACTLY one level: calling `L()` once evaluates `g`'s body, which
-        // CONSTRUCTS (but does not itself invoke) the nested LambdaExpr — so
-        // one call materializes exactly one level of nesting, never more.
-        // A THREE-literal-level chain (`lambda() => lambda() => lambda() =>
-        // …`) called only once is deliberately NOT unwound past level one
-        // here: that would name a lambda `L()` never directly produces, and
-        // this map's only consumer (the exactly-one-call check below) would
-        // then be proving the wrong call safe. A chain reached through TWO
-        // separate named locals and calls (`var m := outer(); var inner :=
-        // m();`) is NOT recognized either — `m`'s own initializer is a
-        // CallExpr, not a bare LambdaExpr, so `m` never becomes a key here.
-        // That is the conservative direction (a bounded leak, never an
-        // over-free); widening to that shape is future work, not attempted
-        // in this fix.
-        auto* nl = dynamic_cast<const ast::LambdaExpr*>(g->exprBody.get());
-        if (nl) forwardTarget3805[static_cast<const void*>(s.get())] = nl;
-    }
+    // locals are freed.
     std::unordered_set<const void*> transparentTailNonEscaping3805;
     for (auto& s : body) {
         LocalDeclInitView v = localDeclInitView(s.get());
@@ -31047,28 +31214,31 @@ void Emitter::collectCellFreeEligible(
         if (!callee) continue;
         auto* lsym = dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*callee));
         if (!lsym || !lsym->decl) continue;
-        auto it = forwardTarget3805.find(static_cast<const void*>(lsym->decl));
-        if (it == forwardTarget3805.end()) continue;
-        ClosureEscapeWalker cew3805{ctx_, static_cast<const void*>(lsym->decl)};
-        for (auto& s2 : body) cew3805.stmt(s2.get());
-        // fix #3805 follow-up (review NEEDS-FIX): `!uncountableCalleeSeen`
-        // joins `calleeCallCount == 1` — a callee shape scanCalleePosition
-        // could not structurally attribute a count to (e.g. `target` read
-        // through anything other than a bare identifier or an if-expression
-        // atom) must decline this local rather than risk an undercounted
-        // "1" that is really 2-or-more, which is precisely the shared-cell
+        LocalDeclInitView lv = localDeclInitView(lsym->decl);
+        auto* g = lv.init ? dynamic_cast<const ast::LambdaExpr*>(lv.init)
+                          : nullptr;
+        if (!g) continue;
+        auto it = forwardTargets3804.find(static_cast<const void*>(g));
+        if (it == forwardTargets3804.end()) continue;
+        // fix #3805 follow-up (review NEEDS-FIX), now folded into
+        // calledAtMostOnce: `!uncountableCalleeSeen` joins
+        // `calleeCallCount == 1` — a callee shape scanCalleePosition could
+        // not structurally attribute a count to (e.g. `target` read through
+        // anything other than a bare identifier or an if-expression atom)
+        // must decline this local rather than risk an undercounted "1" that
+        // is really 2-or-more, which is precisely the shared-cell
         // double-instance hazard this whole gate exists to rule out.
-        if (!cew3805.escaped && !cew3805.uncountableCalleeSeen &&
-            cew3805.calleeCallCount == 1)
+        if (it->second.calledAtMostOnce)
             transparentTailNonEscaping3805.insert(
-                static_cast<const void*>(it->second));
+                static_cast<const void*>(it->second.target));
     }
 
     LambdaFinder finder{ctx_, *this, closureReleaseEligible_,
                         capturedByNonEscaping, capturedByEscaping,
                         capturedByNonEscapingUnwindUnsafe,
                         escapingCapturersOf, nestedWidenedKeys,
-                        transparentTailNonEscaping3805};
+                        transparentTailNonEscaping3805,
+                        forwardTargets3804};
     for (auto& s : body) finder.stmt(s.get());
 
     // fix #3426 (§27.5 / §28.9, v0.283): record the sole out-of-frame holder of
