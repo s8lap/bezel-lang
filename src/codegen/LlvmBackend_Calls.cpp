@@ -2337,12 +2337,94 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         if (isSetName && !lazyTempArr) {
             if (const sema::TypeRef* elemTy =
                     genericBackingType(recvTy, 0, /*isSet=*/true, nullptr)) {
+                bool elemIsRecord = recordTypeOfRef(elemTy) != nullptr;
+                // fix #3947 (stdlib §4.18, v0.294): `genericBackingType`'s two
+                // "admit regardless of ordering" branches — the auto-hashable
+                // RECORD branch (`recordTypeOfRef`, ~line 360 of
+                // LlvmBackend_Calls3.cpp) and the class/interface branch
+                // (`hasObjectHeaderEquality`, ~line 378) — exist to admit
+                // `Set<T>`/`Dictionary<K,V>` (hashing only, no ordering
+                // requirement); `SortedSet` merely INHERITS them, so `elemTy`
+                // here can be non-null for an element with no ordering at
+                // all. Fix #3865 caught this for `.First`/`.Last` (both
+                // syntaxes); this issue is the rest of the member surface
+                // that fix explicitly scoped out. MEASURED (issue 3947's own
+                // repro): `s.Contains(new Pt(1, 2))` on a borrowed
+                // `s: SortedSet<Pt>` (`Pt` auto-hashable, no `CompareTo`)
+                // compiled with NO diagnostic and silently used STRUCTURAL
+                // (§9.1/§9.2) equality instead of `CompareTo`-equality — able
+                // to disagree with the ordering `.First`/`.Last` correctly
+                // refuse to establish at all.
+                //
+                // RESOLUTION (issue 3947): reject the type at EVERY member,
+                // not only the ordering-reading ones — an element with no
+                // comparator is not a legal `SortedSet<T>` element per §4.18
+                // regardless of which member is called (stdlib §4.17/§4.18
+                // name `IComparable<T>`/`IComparable<K>` as the SOLE
+                // constraint; hashability is a distinct property, §3.6/§9.2).
+                // One check here, before the per-member dispatch below,
+                // rather than a second one at every member (`.First`/`.Last`
+                // below keep their own pre-existing `!cmpFn` guard as a
+                // harmless, no-longer-reachable-for-this-shape safety net —
+                // it still matters for shapes this check does not touch,
+                // e.g. an auto-hashable record that DOES declare `CompareTo`,
+                // see NARROW below).
+                //
+                // NARROW: an auto-hashable record that DOES declare
+                // `CompareTo` is deliberately left alone here — it keeps its
+                // pre-existing structural (§9.1/§9.2) identity, matching fix
+                // #3740's own restraint ("widening that pair to
+                // `CompareTo`-equality is a distinct, unmeasured semantic
+                // change this fix does not make"). Only "no comparator at
+                // all" is the new rejection. `for`-in iteration
+                // (LlvmBackend_Stmts.cpp) consults `genericBackingType`
+                // through a SEPARATE call site this fix does not touch —
+                // filed as issue 3976, a residual scope boundary.
+                if (recvTy->headName() == "SortedSet") {
+                    bool needsOrdering =
+                        elemIsRecord || hasObjectHeaderEquality(elemTy);
+                    bool hasOrdering =
+                        elemIsRecord
+                            ? recordHasDispatchableCompareTo(elemTy)
+                            : buildObjectCompareToThunk(elemTy) != nullptr;
+                    if (needsOrdering && !hasOrdering) {
+                        const sema::TypeRef* rawElem =
+                            resolveTypeParamRef(elemTy);
+                        std::string elemName = "the element type";
+                        if (rawElem &&
+                            rawElem->kind == sema::TypeRef::Kind::Named &&
+                            rawElem->declaration)
+                            elemName = "`" +
+                                std::string(rawElem->declaration->name) + "`";
+                        std::string reason =
+                            elemIsRecord
+                                ? "it declares no dispatchable "
+                                  "single-parameter `CompareTo`, and being "
+                                  "auto-hashable (stdlib \xC2\xA7""9.2) is "
+                                  "not sufficient — hashable and orderable "
+                                  "are different properties"
+                                : "it declares no dispatchable "
+                                  "single-argument `CompareTo` — a "
+                                  "class/interface's identity or structural "
+                                  "equality does not establish an ordering";
+                        ctx_.diagnostics().report(
+                            Severity::Error, call.span.begin,
+                            "`." + std::string(m) + "` on `SortedSet<T>` "
+                            "(stdlib \xC2\xA7""4.18) requires the element "
+                            "type to implement `IComparable<T>`; " +
+                            elemName + " does not (" + reason + ").");
+                        llvm::Type* resTy = i32();
+                        if (sema::TypeRef* rt = ctx_.exprType(call))
+                            if (llvm::Type* lt = lowerTypeRef(rt))
+                                resTy = lt;
+                        return llvm::PoisonValue::get(resTy);
+                    }
+                }
                 // Spill the element to a stack slot of its natural LLVM type and
                 // return the byte pointer the generic runtime expects. A record
                 // value reaching us as a pointer is already an address; any
                 // scalar/string value (including a string POINTER, whose bytes
                 // are the key) is stored into a fresh slot of its own type.
-                bool elemIsRecord = recordTypeOfRef(elemTy) != nullptr;
                 auto elemPtr = [&](llvm::Value* v) -> llvm::Value* {
                     if (elemIsRecord && v->getType()->isPointerTy())
                         return v;  // record already spilled to an address
@@ -6837,6 +6919,65 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             }
         }
         bool keyIsRecord = keyTy && recordTypeOfRef(keyTy) != nullptr;
+        // fix #3947 (stdlib §4.17, v0.294): the `SortedDictionary` twin of the
+        // `SortedSet` element check above (this file's Set-family arm) —
+        // `keyTy` non-null here says only "hashable enough to route through
+        // the generic-key dict path" (`recordTypeOfRef` / an auto-hashable
+        // record, or `hasObjectHeaderEquality` / a class, interface, or
+        // `Object`), not "implements `IComparable<K>`" (§4.17). MEASURED
+        // (issue 3947's own family sweep): `d.Add(k, v)` / `.ContainsKey` on a
+        // borrowed `d: SortedDictionary<Pt, int>` (`Pt` auto-hashable, no
+        // `CompareTo`) compiled with NO diagnostic and silently used
+        // STRUCTURAL (§9.1/§9.2) equality — the identical inconsistency
+        // #3865 closed for `.FirstKey`/`.LastKey` (the `!cmpFn` guard further
+        // down this same `isDict` block), just for the rest of the key-op
+        // surface (`Add`/`TryAdd`/`ContainsKey`/`Remove`/`TryGetValue`/
+        // `GetOrNull`/`GetOrAdd`) that fix explicitly scoped out.
+        //
+        // RESOLUTION: reject uniformly for every key op reachable in this
+        // block, mirroring the SortedSet-side resolution above rather than
+        // patching each member individually. NARROW, matching that side: an
+        // auto-hashable record that DOES declare `CompareTo` is left alone
+        // (its existing structural pair is unchanged — #3740's own
+        // restraint). The indexer (`sd[k]` / `sd[k] := v`, LlvmBackend_Assign.cpp)
+        // and `for`-in iteration (LlvmBackend_Stmts.cpp) consult `keyTy`
+        // through SEPARATE call sites this fix does not touch — filed as
+        // issue 3976, a residual scope boundary, not silently folded in here.
+        if (keyTy && recvTy->headName() == "SortedDictionary") {
+            bool needsOrdering =
+                keyIsRecord || hasObjectHeaderEquality(keyTy);
+            bool hasOrdering =
+                keyIsRecord ? recordHasDispatchableCompareTo(keyTy)
+                            : buildObjectCompareToThunk(keyTy) != nullptr;
+            if (needsOrdering && !hasOrdering) {
+                const sema::TypeRef* rawKey = resolveTypeParamRef(keyTy);
+                std::string keyName = "the key type";
+                if (rawKey && rawKey->kind == sema::TypeRef::Kind::Named &&
+                    rawKey->declaration)
+                    keyName =
+                        "`" + std::string(rawKey->declaration->name) + "`";
+                std::string reason =
+                    keyIsRecord
+                        ? "it declares no dispatchable single-parameter "
+                          "`CompareTo`, and being auto-hashable (stdlib "
+                          "\xC2\xA7""9.2) is not sufficient — hashable and "
+                          "orderable are different properties"
+                        : "it declares no dispatchable single-argument "
+                          "`CompareTo` — a class/interface's identity or "
+                          "structural equality does not establish an "
+                          "ordering";
+                ctx_.diagnostics().report(
+                    Severity::Error, call.span.begin,
+                    "`." + std::string(m) + "` on `SortedDictionary<K, V>` "
+                    "(stdlib \xC2\xA7""4.17) requires the key type to "
+                    "implement `IComparable<K>`; " + keyName + " does not (" +
+                    reason + ").");
+                llvm::Type* resTy = i32();
+                if (sema::TypeRef* rt = ctx_.exprType(call))
+                    if (llvm::Type* lt = lowerTypeRef(rt)) resTy = lt;
+                return llvm::PoisonValue::get(resTy);
+            }
+        }
         // issue D4 / §4.8: V is unconstrained for the borrowing dictionary, so
         // it can be a record (aggregate). A record value is too wide for the
         // inttoptr value-slot encoding; it is heap-boxed and the box pointer is

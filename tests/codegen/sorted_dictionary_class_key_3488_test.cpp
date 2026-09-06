@@ -103,10 +103,24 @@ std::string out(const std::string& src) {
     return r.ran ? r.stdoutText : std::string("<did-not-run>");
 }
 
+// A genuine compile-time rejection carrying `needle` in its message (fix
+// #3947, v0.294): `runAot`'s WIFSIGNALED path synthesizes an `Error`
+// diagnostic for a runtime crash too, so a bare "did not run" cannot tell a
+// located rejection from a crash — the needle text is what distinguishes them.
+bool rejectsWith(const std::string& src, const std::string& needle) {
+    auto r = runAot(src);
+    if (r.ran) return false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find(needle) != std::string::npos) return true;
+    return false;
+}
+
 // `Ord` satisfies §4.17's `where K: IComparable<K>`. `IOrd`/`Node` are the
 // interface-key shape (spec §14.2 conformance rule 3). `Plain` is a class that
-// declares NO `CompareTo` — the shape nothing checks the constraint for
-// (#3490), which must keep its pre-fix behaviour exactly.
+// declares NO `CompareTo` — the shape nothing checked the constraint for
+// (#3490) until fix #3947 (v0.294) closed it for exactly this member surface
+// (`.Add`/`.TryAdd`/`.ContainsKey`/etc — see that fix for the indexer/for-in
+// residual, issue #3976).
 const char* PRELUDE =
     "module M; import System.Collections.Generic; "
     "record Rec(A: int); "
@@ -372,34 +386,38 @@ BEZEL_TEST(sorted_dictionary_class_key_3488, dictionary_class_key_keeps_referenc
         "tryAdd=True count=2\n");
 }
 
-// per stdlib §4.17 (v0.283), #3488: a reference key that declares no
-// `CompareTo` has no comparator to dispatch, so it keeps its pre-fix §8.3 pair
-// unchanged rather than acquiring a rejection this fix did not measure. §4.17's
-// `where K: IComparable<K>` is unchecked for a builtin generic (#3490); this
-// row pins the behaviour that gap leaves, so the day the constraint IS checked
-// this row is the one that has to move.
-BEZEL_TEST(sorted_dictionary_class_key_3488, key_without_compareto_unchanged) {
-    BEZEL_EXPECT_EQ(out(prog(
+// per stdlib §4.17 (v0.283) + fix #3947 (v0.294): a reference key that
+// declares no `CompareTo` has no comparator to dispatch. THIS ROW USED TO
+// pin that such a key kept its pre-fix §8.3 pair unchanged ("the day the
+// constraint IS checked this row is the one that has to move") — issue
+// #3947 is that day: §4.17's `where K: IComparable<K>` is now enforced on
+// `.Add`/`.TryAdd` (and the other key ops #3947 covers), matching what fix
+// #3865 already enforced on `.FirstKey`/`.LastKey`. `Plain` has no
+// dispatchable `CompareTo`, so `.Add` now reports the located diagnostic
+// instead of silently admitting a key stdlib §4.17 does not permit.
+BEZEL_TEST(sorted_dictionary_class_key_3488, key_without_compareto_now_rejected) {
+    BEZEL_EXPECT_TRUE(rejectsWith(prog(
         "  using var p1 := new Plain(5); "
-        "  using var p2 := new Plain(5); "
         "  var sd := new SortedDictionary<Plain, int>(); "
         "  sd.Add(p1, 1); "
-        "  Console.WriteLine($\"tryAdd={sd.TryAdd(p2, 2)} count={sd.Count}\"); "
-        "  return 0; ")),
-        "tryAdd=True count=2\n");
+        "  return 0; "),
+        "requires the key type to implement `IComparable<K>`"));
 }
 
-// per stdlib §4.17 (v0.283) + spec §8.1, #3488: an `Object` key is a reference key
-// (`hasObjectHeaderEquality` admits it) with no `CompareTo` to dispatch, so it
-// too is untouched — it must keep constructing and counting, not crash on a
-// comparator that was never built.
-BEZEL_TEST(sorted_dictionary_class_key_3488, object_key_still_constructs) {
-    BEZEL_EXPECT_EQ(run(prog(
+// per stdlib §4.17 (v0.283) + spec §8.1 + fix #3947 (v0.294): an `Object` key
+// is a reference key (`hasObjectHeaderEquality` admits it) with no
+// `CompareTo` to dispatch — THIS ROW USED TO pin that it kept constructing;
+// fix #3947 now rejects it for the identical reason `Plain` is rejected
+// above (`Object` declares no `CompareTo` at all — stdlib §8.1 lists
+// `GetType`/`Equals`/`GetHashCode`/`ToString`/`ReferenceEquals` and nothing
+// else).
+BEZEL_TEST(sorted_dictionary_class_key_3488, object_key_now_rejected) {
+    BEZEL_EXPECT_TRUE(rejectsWith(prog(
         "  using var o := new Ord(1); "
         "  var sd := new SortedDictionary<Object, int>(); "
         "  sd.Add(o, 7); "
-        "  return sd.Count; ")),
-        1);
+        "  return 0; "),
+        "requires the key type to implement `IComparable<K>`"));
 }
 
 // per stdlib §4.17 (v0.283), #3488: the `int` key — the control the filed issue
@@ -434,21 +452,37 @@ BEZEL_TEST(sorted_dictionary_class_key_3488, string_key_still_sorted) {
         "a,b,c,\nfirst=a last=c\n");
 }
 
-// per stdlib §4.17 (v0.283), #3488: a RECORD key and an ENUM key are the two
-// non-scalar categories `genericBackingType` already admitted; neither is a
-// reference type, so neither takes the new arm. `buildSortedKeyComparator`
-// still declines a record (a pre-existing gap, out of scope here), so this row
-// asserts identity and count only — never an order it does not promise.
-BEZEL_TEST(sorted_dictionary_class_key_3488, record_and_enum_keys_unchanged) {
+// per stdlib §4.17 (v0.283), #3488: an ENUM key is one of the non-scalar
+// categories `genericBackingType` already admitted; it is not a reference
+// type, so it does not take the #3488 reference-key arm, and fix #3947
+// (v0.294) does not touch it either — an enum lowers to `i32` and is neither
+// `recordTypeOfRef` nor `hasObjectHeaderEquality`, so it is outside that
+// fix's `needsOrdering` test entirely (its own scalar ordering is unaffected).
+BEZEL_TEST(sorted_dictionary_class_key_3488, enum_key_unchanged) {
     BEZEL_EXPECT_EQ(out(prog(
-        "  var sr := new SortedDictionary<Rec, int>(); "
-        "  sr.Add(new Rec(2), 1); sr.Add(new Rec(1), 2); "
         "  var se := new SortedDictionary<Col, int>(); "
         "  se.Add(Col.Green, 1); se.Add(Col.Red, 2); "
-        "  Console.WriteLine($\"rec={sr.Count} dupe={sr.TryAdd(new Rec(2), 9)}\"); "
         "  Console.WriteLine($\"enum={se.Count} firstIsRed={se.FirstKey = Col.Red}\"); "
         "  return 0; ")),
-        "rec=2 dupe=False\nenum=2 firstIsRed=True\n");
+        "enum=2 firstIsRed=True\n");
+}
+
+// per stdlib §4.17 (v0.283), #3488, UPDATED by fix #3947 (v0.294): `Rec` is
+// an auto-hashable RECORD key (`recordTypeOfRef` admits it, §9.2) with NO
+// `CompareTo` — THIS ROW USED TO pin that it kept constructing and counting
+// via structural (§9.1/§9.2) identity ("buildSortedKeyComparator still
+// declines a record ... so this row asserts identity and count only — never
+// an order it does not promise"). Fix #3947 closes exactly that gap: a
+// `SortedSet`/`SortedDictionary` key/element with no dispatchable
+// `CompareTo` is not a legal instantiation per §4.17/§4.18 regardless of
+// hashability, so `.Add` now reports the same located diagnostic the
+// class-key rows above get.
+BEZEL_TEST(sorted_dictionary_class_key_3488, record_key_without_compareto_now_rejected) {
+    BEZEL_EXPECT_TRUE(rejectsWith(prog(
+        "  var sr := new SortedDictionary<Rec, int>(); "
+        "  sr.Add(new Rec(2), 1); "
+        "  return 0; "),
+        "requires the key type to implement `IComparable<K>`"));
 }
 
 // per stdlib §4.4 (`Array<T>`'s `public method Sort();  // in place`) and §2.8

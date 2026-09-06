@@ -336,14 +336,21 @@ BEZEL_TEST(sorted_set_class_element_3428, string_element_still_constructs) {
         2);
 }
 
-// per stdlib §4.18 (v0.283), #3428: a RECORD element — structural equality, the
-// oldest generic-key row (#343).
-BEZEL_TEST(sorted_set_class_element_3428, record_element_still_constructs) {
-    BEZEL_EXPECT_EQ(run(prog(
-        "  using var s := new SortedSet<Rec>(); "
-        "  s.Add(new Rec(1)); s.Add(new Rec(2)); s.Add(new Rec(1)); "
-        "  return s.Count; ")),
-        2);
+// per stdlib §4.18 (v0.283), #3428, UPDATED by fix #3947 (v0.294): `Rec` is
+// an auto-hashable RECORD element (§9.2) with NO `CompareTo`. THIS ROW USED
+// TO pin that it constructed and deduped by STRUCTURAL equality — "the
+// oldest generic-key row (#343)". Fix #3947 closes that gap: §4.18's SOLE
+// constraint is `T: IComparable<T>`, and hashability is a different property
+// (§3.6/§9.2), so an element with no dispatchable `CompareTo` is not a legal
+// `SortedSet<T>` instantiation regardless of whether it is hashable — `.Add`
+// now reports the same located diagnostic `class_without_compareto_still_diagnosed`
+// above gets for a class with no `CompareTo`.
+BEZEL_TEST(sorted_set_class_element_3428, record_element_without_compareto_now_rejected) {
+    BEZEL_EXPECT_TRUE(rejectsWith(prog(
+        "  var s := new SortedSet<Rec>(); "
+        "  s.Add(new Rec(1)); "
+        "  return 0; "),
+        "requires the element type to implement `IComparable<T>`"));
 }
 
 // per stdlib §4.18 (v0.283), #3428: an ENUM element (lowers to i32).
