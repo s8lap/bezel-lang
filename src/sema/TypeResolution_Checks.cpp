@@ -7171,30 +7171,47 @@ bool Resolver::argSatisfiesNew(const TypeRef* arg, bool& decided) {
             return false;
         }
         if (d->kind == ast::TypeDeclKind::Record) {
-            // A positional record satisfies new() iff default(R) is
-            // well-defined — every field has a well-defined default
-            // (§14.2 / §17.11). Verify each positional field's resolved type
-            // is not a non-nullable reference type.
+            // A record (positional, body-only, or combined-form — §9.3)
+            // satisfies new() iff default(R) is well-defined — every
+            // DECLARED field has a well-defined default (§14.2 / §17.11).
+            // Verify every storage component's resolved type is not a
+            // non-nullable reference type.
             //
             // fix #3141 (family F3 of umbrella #3152, §2.8.3 rule 4): the field
             // walk is symbol-side. Through `d->decl` it deferred on EVERY
             // imported record, so `new Holder<ImportedRefRec>()` compiled while
             // the byte-identical local record was rejected with the §14.2
             // diagnostic (measured both ways).
+            //
+            // fix #3988 (§17.11/§9.3, v0.294): this used to walk ONLY
+            // `recordPositionalFieldSymbols` and deferred full body-field
+            // coverage to "the default-operator slice" — i.e. to
+            // `ExprTC::defaultIllFormed`, which (before that fix, in the
+            // same commit) did not in fact cover body storage either, so
+            // the deferral chain was broken at both ends: a body-only or
+            // combined-form record's non-nullable reference-typed body
+            // field/auto-property satisfied `where T: new()` unverified.
+            // `recordStorageMembers` (sema/Symbol.hpp) is the ONE
+            // symbol-side full-storage enumeration — positional fields,
+            // body fields, and auto-properties together — so this now
+            // reads it instead of leaving body storage unverified.
             decided = true;
-            for (const Symbol* pf : recordPositionalFieldSymbols(d)) {
-                const TypeRef* ft = storageComponentType(pf, ctx_);
-                if (!ft) { decided = false; return false; }  // can't verify
-                if (ft->nullable) continue;  // nullable field → defaults null
-                if (categorize(ft) == TypeCategory::Reference) {
-                    return false;  // non-nullable reference field: no default
-                }
-            }
-            // Body fields of a record can also carry initializers; a record
-            // with body fields lacking defaults would be ill-formed under
-            // §17.11, but verifying that fully is the default-operator slice.
-            // The positional-field check covers the spec's worked example.
-            return true;
+            bool unresolved = false;
+            bool nonDefaultable = false;
+            recordStorageMembers(
+                d, ctx_,
+                [&](const RecordStorageMember& rsm) {
+                    const TypeRef* ft = rsm.type;
+                    if (!ft) { unresolved = true; return false; }  // can't verify
+                    if (ft->nullable) return true;  // nullable → defaults null
+                    if (categorize(ft) == TypeCategory::Reference) {
+                        nonDefaultable = true;
+                        return false;  // non-nullable reference: no default
+                    }
+                    return true;
+                });
+            if (unresolved) { decided = false; return false; }
+            return !nonDefaultable;
         }
         if (d->kind == ast::TypeDeclKind::Class) {
             // A class satisfies new() iff it has an accessible parameterless

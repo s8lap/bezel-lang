@@ -491,34 +491,30 @@ bool ExprTC::defaultIllFormed(const TypeRef* t,
                 // default-constructs each field, so the non-nullable
                 // reference field's "default" is a null pointer with no
                 // diagnostic ever having fired, and a subsequent member
-                // access null-derefs. Read the SYMBOL side instead —
-                // `recordPositionalFieldSymbols` + `storageComponentType`
-                // (sema/Symbol.hpp, "the ONE accessor that consults both
-                // sources") — which answers identically for a local and an
-                // imported record, exactly as #3970's own record-field walk
-                // fix did for the sibling §9.7 check in the same family.
+                // access null-derefs.
                 //
-                // fix #3986 (§17.11, v0.294): the symbol-side field type
-                // above is still the record's DECLARED, unsubstituted type
-                // — for a field like `V: T` in `record Box<T>(V: T)` that
-                // is a bare, declaration-less reference to the record's OWN
-                // generic parameter, which line ~403's `!t->declaration`
+                // fix #3986 (§17.11, v0.294): a field's DECLARED type can
+                // still be a bare, declaration-less reference to the
+                // record's OWN generic parameter (`V: T` in `record
+                // Box<T>(V: T)`), which line ~403's `!t->declaration`
                 // early-return treats as an unresolved parameter and
                 // unconditionally accepts, regardless of what `t` (the
                 // CONCRETE instantiation being checked, e.g.
-                // `Box<WidgetGL>`) actually binds T to. Substitute it
-                // first, via the SAME instantiation-site environment the
-                // §9.7 borrow-bearing walk and the §35.4/§35.11
-                // choice-payload walk already use for identically-shaped
-                // generic substitution (`common::RecordSubstEnv` /
+                // `Box<WidgetGL>`) actually binds T to. Substitute it via
+                // the SAME instantiation-site environment the §9.7
+                // borrow-bearing walk and the §35.4/§35.11 choice-payload
+                // walk already use for identically-shaped generic
+                // substitution (`common::RecordSubstEnv` /
                 // `seedRecordSubstEnv` / `resolveRecordFieldSubst`,
                 // OwnershipFacts.hpp, #2145) — no new predicate. This uses
                 // the SYMBOL-side `seedRecordSubstEnv(TypeSymbol&, ...)`
                 // overload (rather than the AST-side one, which needs a
-                // `td` this arm no longer materializes), so it seeds
-                // correctly for an imported generic record too:
-                // `TypeSymbol::genericParams` is populated by ModuleLoader
-                // for an imported type (ModuleLoader.cpp), unlike `decl`.
+                // `td` this arm no longer materializes — re-adding that
+                // cast would silently reintroduce #3982 for every imported
+                // generic record), so it seeds correctly for an imported
+                // generic record too: `TypeSymbol::genericParams` is
+                // populated by ModuleLoader for an imported type
+                // (ModuleLoader.cpp), unlike `decl`.
                 //
                 // fix #3995 (§17.11/§9.7/§3.6 rule 2, v0.294): seed THIS
                 // frame's own environment with `incoming` (the caller's
@@ -552,29 +548,71 @@ bool ExprTC::defaultIllFormed(const TypeRef* t,
                 // identical two-shape dispatch (OwnershipFacts.cpp) for the
                 // established precedent this mirrors.
                 //
-                // NOTE for #3988 (filed separately, not fixed here): this
-                // arm still walks only POSITIONAL fields
-                // (`recordPositionalFieldSymbols`), so a combined-form
-                // record's non-nullable BODY field is still invisible to
-                // it. `fieldEnv`, built below, is exactly the `env`
-                // argument `sema::recordStorageMembers` already accepts
-                // (Symbol.hpp) — a fix that widens this arm to cover
-                // body/auto-property fields should be able to swap the
-                // walk below to `recordStorageMembers(t->declaration,
-                // ctx_, ..., fieldEnv)` and drop straight in without
-                // re-deriving the substitution.
+                // fix #3988 (§17.11/§9.3, v0.294): §17.11's opening clause is
+                // "Records all of whose DECLARED FIELDS are defaultable" — for
+                // a combined-form record (§9.3: positional fields AND a body)
+                // that is positional fields UNION body storage (fields and
+                // auto-properties alike), mirroring §9.3's own admissibility
+                // rule ("the positional fields counted as storage components
+                // alongside the body's auto-properties"). The field walk
+                // above used to cover only POSITIONAL fields
+                // (`recordPositionalFieldSymbols`) — empty for EVERY
+                // body-only record and for the body half of EVERY
+                // combined-form record, so a non-nullable reference-typed
+                // body field/auto-property was invisible here and
+                // `default(T)` was silently accepted, then codegen's
+                // recursive per-field default-construction null-derefed the
+                // manufactured null at runtime. `recordStorageMembers`
+                // (sema/Symbol.hpp) is the ONE symbol-side full-storage
+                // enumeration — positional fields, body fields, and
+                // auto-properties together, answering identically for a
+                // local and an imported record — so this reads it instead
+                // of re-deriving a second, narrower walk.
                 common::RecordSubstEnv env;
                 common::seedRecordSubstEnv(*t->declaration, *t, incoming, env);
                 const common::RecordSubstEnv* fieldEnv =
                     env.map.empty() ? nullptr : &env;
-                for (const Symbol* pf : recordPositionalFieldSymbols(t->declaration)) {
-                    const TypeRef* pft = storageComponentType(pf, ctx_);
-                    if (!pft) continue;
-                    common::RecordSubstEnv::Entry sub =
-                        common::resolveRecordFieldSubst(pft, fieldEnv);
-                    if (defaultIllFormed(sub.ty, sub.env)) return true;
-                }
-                return false;
+                // ⚠ #3995 interaction, verified rather than assumed: it is
+                // tempting to pass `fieldEnv` straight into
+                // `recordStorageMembers`'s own `env` parameter and drop the
+                // per-field `resolveRecordFieldSubst` call entirely (that
+                // function DOES apply substitution internally per member,
+                // SymbolCollection.cpp fix #3171) — but it keeps only the
+                // substituted `Entry::ty`, discarding `Entry::env`. For a
+                // DELEGATING field (`In: Inner<T>`), the correct recursive
+                // call is `defaultIllFormed(Inner<T>, thisFramesEnv)` — the
+                // type is unchanged (not a bare parameter itself) but the
+                // ENV to recurse with is still needed so the INNER frame can
+                // resolve ITS OWN bare mention of `T`. Losing `Entry::env`
+                // here would silently reintroduce #3995 for exactly the
+                // shape #3988 exists to cover (a delegating GENERIC record
+                // reached through body/combined-form storage) — measured:
+                // without this, `default(Outer<Widget>)` for an imported
+                // combined-form `Outer<T>(X: int) { public In: Inner<T>; }`
+                // compiles clean and SIGSEGVs, identically to #3995's own
+                // pre-fix repro. So `recordStorageMembers` is called with
+                // `env=nullptr` (yielding the RAW, unsubstituted declared
+                // type per member — identical to what `storageComponentType`
+                // alone would give the old positional-only walk) and this
+                // arm performs its OWN `resolveRecordFieldSubst` +
+                // `Entry::env`-threaded recursion per member, exactly
+                // mirroring the positional-field loop's own pattern above,
+                // just applied to the WIDER enumeration.
+                bool illFormed = false;
+                recordStorageMembers(
+                    t->declaration, ctx_,
+                    [&](const RecordStorageMember& rsm) {
+                        if (!rsm.type) return true;  // unresolved — defer
+                        common::RecordSubstEnv::Entry sub =
+                            common::resolveRecordFieldSubst(rsm.type, fieldEnv);
+                        if (defaultIllFormed(sub.ty, sub.env)) {
+                            illFormed = true;
+                            return false;  // stop
+                        }
+                        return true;
+                    },
+                    /*env=*/nullptr);
+                return illFormed;
             }
             return false;
         }
