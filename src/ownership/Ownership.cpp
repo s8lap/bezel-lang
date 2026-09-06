@@ -2377,6 +2377,35 @@ void MethodOwnership::processBlock(const flow::CFGBlock& block) {
     // leave the binding Owned — the very regression this fix targets.
     for (const ast::ForStmt* fs : block.forOrigins) {
         if (!fs) continue;
+        // fix #3977 (§28.3 K1.3/§28.2, v0.294): the for-loop source and its
+        // optional `with` cancellation-token expression are READ positions
+        // like any other, but neither one is part of `block.stmts` (the
+        // comment above explains why), so `visitStmt`'s normal recursion —
+        // and therefore `checkRead`, the one authority that detects a
+        // MovedFrom/Disposed/Uninitialized local at a read — never reached
+        // them. A read of an already moved-from or disposed owned local in
+        // `for var i in x.tag..3 do …` compiled with zero diagnostics and
+        // heap-use-after-freed (measured on origin/main + #3971: the
+        // byte-identical read one node over, `var r := x.tag..3;`, is
+        // already rejected). Route each through checkRead BEFORE
+        // recordMovesIn observes it, mirroring #3949's assignment-RHS fix
+        // and #3864's const-initializer fix for the same family
+        // (#3591/#3687/#3864/#3931/#3949/#3971).
+        //
+        // Guarded by the shared `isTopLevelConsumingForm` (#3941's fix,
+        // promoted to Ownership_impl.hpp by #3971, now a FOURTH caller):
+        // checkRead runs before recordMovesIn and POISONS on report, and
+        // `markMovedByName` (which recordMovesIn calls for a `move`
+        // operand) has no Poisoned arm — an unguarded checkRead over
+        // `for var e in move coll do …` would steal that operand's more
+        // precise move diagnostic, and for the disposed half would
+        // downgrade the precise ERROR to §28.2's WARNING, ACCEPTING a
+        // program that must be rejected (exactly #3941's/#3979's shape).
+        // // per §28.3 K1.3/K3.4, §28.2, v0.294, #3941, #3971, #3977
+        if (fs->iterable && !isTopLevelConsumingForm(*fs->iterable))
+            checkRead(*fs->iterable, /*selfTarget=*/false);
+        if (fs->withExpr && !isTopLevelConsumingForm(*fs->withExpr))
+            checkRead(*fs->withExpr, /*selfTarget=*/false);
         if (fs->iterable) recordMovesIn(*fs->iterable);
         if (fs->withExpr) recordMovesIn(*fs->withExpr);
     }
