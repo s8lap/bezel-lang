@@ -6135,6 +6135,39 @@ void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
             // silently killed).
             if (st.state == OwnershipState::Owned)
                 checkConsumeFreeze(id->name, as.target->span.begin);
+            // fix #3950 (§28.7 v0.294 / §28.3 K1.3 v0.294): record the
+            // MOVED-FROM half of §28.7's liveness test for codegen. "[If] the
+            // previous value is live (non-null and not moved-from ...), it is
+            // disposed" — "A moved-from or null location therefore stores
+            // without disposal". Codegen's local drop-on-overwrite pass
+            // (disposeDisplacedOwnedClassLocal) implements only the NULL half:
+            // it null-guards the loaded old value, which is sufficient for a
+            // `using var` / owned iteration variable / out-owned recipient
+            // (whose slot the `move` lowering nulls) but NOT for a plain `var`
+            // local, whose slot the `move` lowering deliberately leaves
+            // populated so the `new T(move n, n)` idiom can still read it
+            // (LlvmBackend_Exprs2.cpp). The pass therefore disposed a pointer
+            // the move's receiver had already freed: measured as
+            // "AddressSanitizer: heap-use-after-free ... READ of size 8"
+            // (the disposer-slot load) on `var x := new Res(5);
+            // Sink.Take(move x); x := new Res(7); x.Dispose();` — straight-
+            // line, no loop, and accepted with zero ownership diagnostics.
+            // No new classification predicate: this is the dataflow's OWN
+            // converged state for the target at this statement, which is
+            // exactly the fact §28.7 asks for. Gated on the final emit pass
+            // (`!suppressDiag_`) so a mid-fixpoint intermediate state can
+            // never set it — the same discipline #3931 established for
+            // checkRead's poisoning, and the reason the flag is sound in the
+            // LEAK direction too: MovedFrom means the obligation provably
+            // transferred out on every path reaching here, so the receiver
+            // disposes the displaced value and suppression cannot leak it.
+            // The Owned⊓MovedFrom join (maybe-consumed, K1.4) is deliberately
+            // NOT covered — it needs a per-path runtime bit, filed separately.
+            // Sibling of `wholeValueLhsMovedFrom` (#3263), which gave the
+            // move-only inline array this same §28.7 clause.
+            // // per §28.7, §28.3 K1.3, v0.294, #3950
+            if (!suppressDiag_ && st.state == OwnershipState::MovedFrom)
+                const_cast<ast::AssignmentStmt&>(as).lhsMovedFromAtStore = true;
             st.state = producerState(*as.value);
             st.obligationOrigin = &as;
             // §28.3 (#1626): a reassignment writes a fresh value, so any
@@ -6312,6 +6345,16 @@ void MethodOwnership::handleMarkedOwnedAssignment(const ast::AssignmentStmt& as)
     // (disposeDisplacedOwnedClassLocal) — this is the accept side (#1465).
     if (tst->state == OwnershipState::Owned)
         checkConsumeFreeze(tid->name, as.target->span.begin);
+    // fix #3950 (§28.7 v0.294 / §28.3 K1.3 v0.294): the marked-transfer twin of
+    // the flag set in handleAssignment — `Sink.Take(move x); x := owned y;`
+    // reaches the identical codegen path (disposeDisplacedOwnedClassLocal) and
+    // heap-use-after-freed identically (measured: ASan heap-use-after-free, and
+    // SIGSEGV even without ASan). The comment just above already states the
+    // rule this implements — "a poly-null / moved-from / disposed target holds
+    // nothing to drop" — it simply was never communicated to codegen.
+    // // per §28.7, §28.3 K1.3, v0.294, #3950
+    if (!suppressDiag_ && tst->state == OwnershipState::MovedFrom)
+        const_cast<ast::AssignmentStmt&>(as).lhsMovedFromAtStore = true;
     // The target adopts owned state and takes NO borrow source: it is a new
     // OWNER of the moved-in value, not a borrow of the source (a later `return y;`
     // is an owned return, not a borrow escape) — mirroring the binding marker.

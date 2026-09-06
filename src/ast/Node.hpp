@@ -322,6 +322,27 @@ struct AssignmentStmt : Stmt {
     // (#3263 defect 2). Only meaningful when `op == ":="` and the LHS is a
     // move-only inline-array local/field.
     bool wholeValueLhsMovedFrom = false;
+    // fix #3950 (§28.7 v0.294 / §28.3 K1.3 v0.294): the LHS — a plain owned
+    // class/interface LOCAL — was in the MOVED-FROM state at this store site
+    // (`Sink.Take(move x); x := new Res();`, the "consume then re-acquire in
+    // place" idiom). §28.7 is explicit that the drop-on-overwrite pass runs
+    // only "if the previous value is live (**non-null and not moved-from**)",
+    // and that "a moved-from or null location therefore stores without
+    // disposal". Codegen's local pass (disposeDisplacedOwnedClassLocal) tests
+    // only the NULL half of that CONJUNCTION — sound for a `using var` /
+    // iteration-variable / out-owned recipient, whose slot the move lowering
+    // nulls, but NOT for a plain `var` local, whose slot the move lowering
+    // deliberately leaves populated (LlvmBackend_Exprs2.cpp: the `new
+    // T(move n, n)` idiom reads the second operand from that slot). The pass
+    // then disposed a pointer the new owner had already freed — a
+    // heap-use-after-free with no loop and no diagnostic. This flag is the
+    // MOVED-FROM half, supplied by the one authority that computes it: the
+    // ownership dataflow's own converged state at this statement. It is the
+    // class-local sibling of `wholeValueLhsMovedFrom` above (#3263 gave the
+    // move-only inline array the same treatment for the same §28.7 clause).
+    // Set only on the final emit pass, so it records the CONVERGED fact.
+    // Only meaningful when `op == ":="` and the LHS is a bare local identifier.
+    bool lhsMovedFromAtStore = false;
 };
 
 // A.6: `ThrowStmt ::= "throw" Expression? ";"`.
