@@ -10,8 +10,11 @@
 #include "ast/Node.hpp"
 #include "lexer/Lexer.hpp"
 #include "parser/Parser.hpp"
+#include "sema/ExprTypecheck.hpp"
+#include "sema/PureChecker.hpp"
 #include "sema/SemaContext.hpp"
 #include "sema/SymbolCollection.hpp"
+#include "sema/TypeResolution.hpp"
 #include "support/Diagnostic.hpp"
 
 namespace bezel::test {
@@ -33,6 +36,49 @@ inline SemaResult parseAndCollect(std::string_view source) {
     r.ctx = std::make_unique<sema::SemaContext>(r.diagnostics);
     if (r.sourceFile) {
         sema::collectSymbols(*r.sourceFile, *r.ctx);
+    }
+    return r;
+}
+
+// fix #3985: `parseAndCollect` followed by an UNGATED `resolveTypes`/
+// `typecheckExpressions` call was a 137-file, hand-duplicated pattern across
+// tests/sema/*.cpp (each file spelling its own 3-line "parseSemaAll"-shaped
+// helper), diverging from the real driver's own gate (src/driver/Driver.cpp
+// ~473, ~672: `if (unit && !diagnostics.hasErrors()) { ... }`). A fixture
+// that failed to PARSE still had sema run over the parser's error-recovery-
+// truncated AST, so a genuinely grammar-invalid row could "pass" by
+// accident instead of exercising the sema rule its name and comment claim
+// (first found and fixed for one file by fix #3958; this pair centralizes
+// that gate so the class cannot recur file-by-file). Two shapes cover the
+// helpers found in the wild: resolve-only (classification/type-resolution
+// tests that never reach expression typechecking) and resolve+typecheck
+// (the common case). Both gate on `!r.diagnostics.hasErrors()`, exactly as
+// the driver does.
+inline SemaResult parseAndResolveGated(std::string_view source) {
+    auto r = parseAndCollect(source);
+    if (r.sourceFile && r.ctx && !r.diagnostics.hasErrors()) {
+        sema::resolveTypes(*r.sourceFile, *r.ctx);
+    }
+    return r;
+}
+
+inline SemaResult parseAndTypecheckGated(std::string_view source) {
+    auto r = parseAndCollect(source);
+    if (r.sourceFile && r.ctx && !r.diagnostics.hasErrors()) {
+        sema::resolveTypes(*r.sourceFile, *r.ctx);
+        sema::typecheckExpressions(*r.sourceFile, *r.ctx);
+    }
+    return r;
+}
+
+// A third recurring shape (resolve + typecheck + the §22.15 pure-body
+// checker), used by the §22.15/§22.16 purity test files.
+inline SemaResult parseAndCheckPureGated(std::string_view source) {
+    auto r = parseAndCollect(source);
+    if (r.sourceFile && r.ctx && !r.diagnostics.hasErrors()) {
+        sema::resolveTypes(*r.sourceFile, *r.ctx);
+        sema::typecheckExpressions(*r.sourceFile, *r.ctx);
+        sema::checkPureBodies(*r.sourceFile, *r.ctx);
     }
     return r;
 }
