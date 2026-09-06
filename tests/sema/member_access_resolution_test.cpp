@@ -26,13 +26,10 @@ using bezel::sema::TypeRef;
 
 namespace {
 
+// fix #3985: delegates to the shared gated helper (sema_support.hpp)
+// instead of duplicating the parse-error-gate logic locally.
 bezel::test::SemaResult parseSemaAll(std::string_view src) {
-    auto r = bezel::test::parseAndCollect(src);
-    if (r.sourceFile && r.ctx) {
-        bezel::sema::resolveTypes(*r.sourceFile, *r.ctx);
-        bezel::sema::typecheckExpressions(*r.sourceFile, *r.ctx);
-    }
-    return r;
+    return bezel::test::parseAndTypecheckGated(src);
 }
 
 // Locate the first MemberAccessExpr inside the first method's body.
@@ -115,6 +112,9 @@ BEZEL_TEST(sema_member, cross_class_static_method_resolves) {
         "end C; "
         "class Other public static method Val(): int => 7; end Other;");
     auto* ma = firstMemberAccess(r);
+    // fix #3985: was `if (ma) { EXPECT... }` — see
+    // this_property_resolves_to_property_symbol below for the same finding.
+    BEZEL_EXPECT_TRUE(ma != nullptr);
     if (ma) {
         auto* sym = r.ctx->exprSymbol(*ma);
         BEZEL_EXPECT_TRUE(dynamic_cast<MethodSymbol*>(sym) != nullptr);
@@ -158,13 +158,28 @@ BEZEL_TEST(sema_member, this_method_resolves_to_method_symbol) {
 }
 
 BEZEL_TEST(sema_member, this_property_resolves_to_property_symbol) {
+    // fix #3985: `{ get; set; }` is C#'s property-accessor syntax, not
+    // Bezel's — Appendix A's `PropertyBody` has no brace form at all (the
+    // auto-property alternative is `AutoAccessorVis? (":=" Expression)?
+    // ... ";"`, terminated directly by `;`, or the explicit-accessor form is
+    // `Accessor* "end" Identifier? ";"`). This never parsed, so the row was
+    // reaching sema on parseSemaAll's ungated, error-recovery-truncated
+    // AST. VERIFIED against the real `bezelc -c`: a plain auto-property
+    // declaration parses with zero diagnostics and is enough — this test
+    // only asserts that `this.Name` resolves to a PropertySymbol.
     auto r = parseSemaAll(
         "module M; "
         "class C "
-        "  public property Name: int { get; set; } "
+        "  public property Name: int; "
         "  public method M() _ := this.Name; end M; "
         "end C;");
     auto* ma = firstMemberAccess(r);
+    // fix #3985: was `if (ma) { EXPECT... }` — issue #3985's vacuous-
+    // assertion finding: a null lookup (e.g. from the grammar-invalid
+    // fixture the `{ get; set; }` bug above produced) made this test
+    // assert nothing and still report `[ OK ]`. Assert non-null
+    // unconditionally, as most of this file's sibling tests already do.
+    BEZEL_EXPECT_TRUE(ma != nullptr);
     if (ma) {
         auto* sym = r.ctx->exprSymbol(*ma);
         BEZEL_EXPECT_TRUE(dynamic_cast<PropertySymbol*>(sym) != nullptr);
@@ -193,17 +208,33 @@ BEZEL_TEST(sema_member, unresolved_member_on_this_unset_and_diagnosed) {
 }
 
 BEZEL_TEST(sema_member, qualified_field_access_resolves) {
+    // fix #3985: `firstMemberAccess` (above) only walks `topDecls[0]`'s
+    // members — it is a "first method of the FIRST top-level declaration"
+    // helper, not a whole-file search, exactly as every other passing test
+    // in this file relies on (the exercised class is always declared
+    // first). This fixture declared the unrelated dependency `D` first and
+    // `C` — the class whose method `M` is actually under test — second, so
+    // `firstMemberAccess` always walked `D`'s members (a field, no
+    // methods) and returned null. The `if (ma) { EXPECT... }` anti-pattern
+    // masked this: the test has been passing vacuously (asserting nothing)
+    // since it was written, independent of and in addition to issue
+    // #3985's parseSemaAll-gating finding. VERIFIED against the real
+    // gtest binary: with the unconditional `ma != nullptr` assertion
+    // added but the declaration order left as-is, this test FAILS
+    // (`assertion failed: ma != nullptr`); reordering so `C` is declared
+    // first — matching every sibling test in this file — fixes it.
     auto r = parseSemaAll(
         "module M; "
-        "class D "
-        "  public _y: int; "
-        "end D; "
         "class C "
         "  private _d: D; "
         "  public method M() _ := this._d._y; end M; "
-        "end C;");
+        "end C; "
+        "class D "
+        "  public _y: int; "
+        "end D;");
     auto* ma = firstMemberAccess(r);
     // ma is the outer `._y`; check its symbol + type.
+    BEZEL_EXPECT_TRUE(ma != nullptr);
     if (ma) {
         auto* sym = r.ctx->exprSymbol(*ma);
         BEZEL_EXPECT_TRUE(dynamic_cast<FieldSymbol*>(sym) != nullptr);

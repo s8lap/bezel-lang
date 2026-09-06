@@ -26,13 +26,10 @@ using bezel::test::parseAndCollect;
 
 namespace {
 
+// fix #3985: delegates to the shared gated helper (sema_support.hpp)
+// instead of duplicating the parse-error-gate logic locally.
 bezel::test::SemaResult semaAll(std::string_view src) {
-    auto r = parseAndCollect(src);
-    if (r.sourceFile && r.ctx) {
-        bezel::sema::resolveTypes(*r.sourceFile, *r.ctx);
-        bezel::sema::typecheckExpressions(*r.sourceFile, *r.ctx);
-    }
-    return r;
+    return bezel::test::parseAndTypecheckGated(src);
 }
 
 bool hasErrDiagWith(const bezel::test::SemaResult& r, std::string_view needle) {
@@ -124,10 +121,19 @@ BEZEL_TEST(choice_self_containment_2208,
 // not a value cycle.
 BEZEL_TEST(choice_self_containment_2208,
            spec_9_v226_record_with_class_field_accepted_no_value_cycle) {
+    // fix #3985: the constructor's block body was closed with `end Box;`,
+    // but ConstructorDecl's own closer (Appendix A) is `"end" "constructor"?
+    // ";"` — the optional word is literally `constructor`, not the
+    // enclosing type's name (that trailer belongs to ClassBody's `"end"
+    // Identifier? ";"` instead, one level up). `end Box;` therefore closed
+    // nothing the parser expected here and the row never parsed, reaching
+    // sema on semaAll's ungated, error-recovery-truncated AST. VERIFIED
+    // against the real `bezelc -c`: `end constructor;` parses cleanly.
     auto r = semaAll(
         "module M; "
         "record Inner(X: int); "
         "class Box public i: Inner; public constructor(i: Inner) this.i := i; "
+        "end constructor; "
         "end Box; "
         "record Outer(B: Box); "
         "class C public static method Main(): int return 0; "

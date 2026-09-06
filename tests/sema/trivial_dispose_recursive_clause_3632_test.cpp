@@ -51,12 +51,10 @@ namespace {
 // + resolve-types, then locate the named TypeSymbol via the module's
 // children list. Resolution is what populates the field TypeRefs the
 // widening reads through `sema::storageComponentType`.
+// fix #3985: delegates to the shared gated helper (sema_support.hpp)
+// instead of duplicating the parse-error-gate logic locally.
 SemaResult resolveAll(std::string_view src) {
-    auto r = bezel::test::parseAndCollect(src);
-    if (r.sourceFile && r.ctx) {
-        bezel::sema::resolveTypes(*r.sourceFile, *r.ctx);
-    }
-    return r;
+    return bezel::test::parseAndResolveGated(src);
 }
 
 const TypeSymbol* findType(const SemaResult& r, std::string_view name) {
@@ -131,12 +129,19 @@ BEZEL_TEST(trivial_dispose_recursive_clause_3632,
 // ===========================================================================
 BEZEL_TEST(trivial_dispose_recursive_clause_3632,
            owned_field_of_non_trivial_dispose_keeps_disqualifying_spec_28_9) {
+    // fix #3985: `destructor begin end destructor;` used a `begin` keyword
+    // that does not exist anywhere in Bezel's grammar (block bodies are a
+    // bare `Statement*` — `DestructorDecl ::= "destructor" Statement* "end"
+    // "destructor"? ";"`, Appendix A). This never parsed, so the row was
+    // reaching sema on resolveAll's ungated, error-recovery-truncated AST.
+    // VERIFIED against the real `bezelc -c`: dropping `begin` parses
+    // cleanly.
     auto r = resolveAll(
         "module M; "
         "class Res "
         "  public v: int := 0; "
         "  public constructor() end constructor; "
-        "  destructor begin end destructor; "
+        "  destructor end destructor; "
         "end Res; "
         "class H "
         "  public owned r: Res? := null; "

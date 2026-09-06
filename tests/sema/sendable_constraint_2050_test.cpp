@@ -28,13 +28,10 @@ using bezel::test::SemaResult;
 
 namespace {
 
+// fix #3985: delegates to the shared gated helper (sema_support.hpp)
+// instead of duplicating the parse-error-gate logic locally.
 bezel::test::SemaResult parseSemaAll(std::string_view src) {
-    auto r = bezel::test::parseAndCollect(src);
-    if (r.sourceFile && r.ctx) {
-        bezel::sema::resolveTypes(*r.sourceFile, *r.ctx);
-        bezel::sema::typecheckExpressions(*r.sourceFile, *r.ctx);
-    }
-    return r;
+    return bezel::test::parseAndTypecheckGated(src);
 }
 
 // True iff a `where T: …` constraint-not-satisfied diagnostic was reported.
@@ -97,9 +94,16 @@ BEZEL_TEST(sendable_constraint_2050,
 // hence sendable. The constraint accepts at the method-call site.
 BEZEL_TEST(sendable_constraint_2050,
            method_call_record_arg_accepted_spec_30_14) {
+    // fix #3985: the source read `record Point(X: int, Y: int); end
+    // Point;` — a positional record's `RecordDecl` is already terminated
+    // by its own `;` (Appendix A: `PositionalFields? ... (";" |
+    // RecordBody)`), so the trailing `end Point;` is a stray top-level
+    // fragment and never parsed; the row was reaching sema on
+    // parseSemaAll's ungated, error-recovery-truncated AST. VERIFIED
+    // against the real `bezelc -c`: dropping `end Point;` parses cleanly.
     auto r = parseSemaAll(
         "module M; "
-        "record Point(X: int, Y: int); end Point; "
+        "record Point(X: int, Y: int); "
         "static class Box "
         "  public static method Hold<T>(x: T): int where T: sendable => 1; "
         "end Box; "

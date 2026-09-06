@@ -29,13 +29,10 @@
 
 namespace {
 
+// fix #3985: delegates to the shared gated helper (sema_support.hpp)
+// instead of duplicating the parse-error-gate logic locally.
 bezel::test::SemaResult parseSemaAll(std::string_view src) {
-    auto r = bezel::test::parseAndCollect(src);
-    if (r.sourceFile && r.ctx) {
-        bezel::sema::resolveTypes(*r.sourceFile, *r.ctx);
-        bezel::sema::typecheckExpressions(*r.sourceFile, *r.ctx);
-    }
-    return r;
+    return bezel::test::parseAndTypecheckGated(src);
 }
 
 // True iff some reported diagnostic's message contains `needle`.
@@ -234,15 +231,26 @@ BEZEL_TEST(static_readonly_residual_3290,
 // `handler` is reference-typed and the initializer is not `null`.
 BEZEL_TEST(static_readonly_residual_3290,
            record_with_non_null_function_field_rejected_spec_22_12_issue_3290) {
+    // fix #3985: `method SomeHandler(...) ... end SomeHandler;` was a bare
+    // top-level function declaration — Bezel's `TopDecl` grammar (Appendix
+    // A) admits only ClassDecl/InterfaceDecl/RecordDecl/EnumDecl at module
+    // scope; there is no free-function form, so a method must live inside a
+    // type. This never parsed, so the row was reaching sema on
+    // parseSemaAll's ungated, error-recovery-truncated AST. VERIFIED
+    // against the real `bezelc -c`: moving `SomeHandler` into a static
+    // class and referencing it as `Utils.SomeHandler` parses cleanly and
+    // reproduces the intended §9.7 null-source rejection on `Box.F`.
     auto r = parseSemaAll(
         "module M; "
         "class Widget "
         "  public method Render(): int return 42; end Render; "
         "end Widget; "
-        "method SomeHandler(i: int): int return i + 1; end SomeHandler; "
+        "static class Utils "
+        "  public static method SomeHandler(i: int): int return i + 1; end SomeHandler; "
+        "end Utils; "
         "record Holder(handler: (int) -> int); "
         "class Box "
-        "  public static readonly F: Holder := new Holder(SomeHandler); "
+        "  public static readonly F: Holder := new Holder(Utils.SomeHandler); "
         "end Box;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(hasMsg(r, "handler"));
@@ -411,6 +419,15 @@ BEZEL_TEST(static_readonly_residual_3290,
 // not process-global), so the residual check is silent for it.
 BEZEL_TEST(static_readonly_residual_3290,
            instance_readonly_owning_choice_field_silent_spec_22_12_issue_3290) {
+    // fix #3985: `public constructor();` has no body, but Appendix A's
+    // ConstructorDecl admits no bare-`;` alternative (unlike an interface
+    // method) — every instance constructor needs `CtorChain? Statement*
+    // "end" "constructor"? ";"`. This never parsed, so the row was
+    // reaching sema on parseSemaAll's ungated, error-recovery-truncated
+    // AST. Since the non-nullable field `F` also needs definite assignment
+    // (§7.9), the corrected constructor body assigns it. VERIFIED against
+    // the real `bezelc -c`: the corrected source parses and typechecks
+    // with zero diagnostics.
     auto r = parseSemaAll(
         "module M; "
         "class Widget "
@@ -420,7 +437,7 @@ BEZEL_TEST(static_readonly_residual_3290,
         "  end MyChoice; "
         "class Holder "
         "  public readonly F: MyChoice; "
-        "  public constructor(); "
+        "  public constructor() F := MyChoice.Plain(0); end constructor; "
         "end Holder; "
         "class Program "
         "  public static method Main(): int "

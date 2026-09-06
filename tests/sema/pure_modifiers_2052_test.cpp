@@ -27,14 +27,10 @@
 
 namespace {
 
+// fix #3985: delegates to the shared gated helper (sema_support.hpp)
+// instead of duplicating the parse-error-gate logic locally.
 bezel::test::SemaResult parseSemaAll(std::string_view src) {
-    auto r = bezel::test::parseAndCollect(src);
-    if (r.sourceFile && r.ctx) {
-        bezel::sema::resolveTypes(*r.sourceFile, *r.ctx);
-        bezel::sema::typecheckExpressions(*r.sourceFile, *r.ctx);
-        bezel::sema::checkPureBodies(*r.sourceFile, *r.ctx);
-    }
-    return r;
+    return bezel::test::parseAndCheckPureGated(src);
 }
 
 // True iff some reported diagnostic's message contains `needle`.
@@ -162,7 +158,7 @@ BEZEL_TEST(pure_modifiers_2052, pure_async_method_rejected_spec_22_15) {
     auto r = parseSemaAll(
         "module M; "
         "class C "
-        "  public async pure method M(): Task => yield return 1; "
+        "  public async pure method M(): Task   yield return 1; end M; "
         "end C;");
     // The async+pure combination is rejected even before body checks.
     BEZEL_EXPECT_TRUE(hasMsg(r, "combines with neither `async` nor `yield`"));
@@ -308,19 +304,28 @@ BEZEL_TEST(pure_modifiers_2052, pure_owned_class_return_rejected_spec_22_15) {
     BEZEL_EXPECT_TRUE(hasMsg(r, "no `owned` class-typed return"));
 }
 
-// §22.15 (control): a pure method may return a non-class owned-typed value
-// such as a record — the restriction is class-typed only.
+// §22.15 (control): a pure method may return a record value — the
+// `pure`+`owned`-class-return check (§22.15) fires only for a `retOwned &&
+// isUserClassTypeRef` return (TypeResolution_Checks.cpp ~12201), which a
+// plain record return never satisfies.
 //
-// (Records have copy semantics and no disposal; `owned` on a record return
-// carries no disposal obligation — it is a marker that the producer side
-// treats the result as an owned value for the borrow-source rules, not a
-// soundness-critical class return. The check fires only for class types.)
+// fix #3985: the original fixture wrote `owned R` on the record return to
+// exercise that non-firing directly, but `owned` is unconditionally
+// rejected on ANY record return type by an earlier, unrelated §28.1 check
+// ("`owned` requires a class type, an interface type, or a bare type
+// parameter") regardless of `pure` — verified directly against the real
+// `bezelc -c`. Keeping `owned R` here would make the fixture fail to
+// compile for a reason that has nothing to do with what this test names,
+// so the corrected fixture drops the (always-invalid) `owned` marker: a
+// plain record return, which compiles cleanly and — because `retOwned` is
+// false — still never reaches the class-typed-return check this test's
+// name and assertion are about.
 BEZEL_TEST(pure_modifiers_2052, pure_record_return_not_flagged_spec_22_15) {
     auto r = parseSemaAll(
         "module M; "
-        "record R v: int; end R; "
+        "record R(v: int); "
         "class C "
-        "  public static pure method Make(): owned R => new R(0); "
+        "  public static pure method Make(): R => new R(0); "
         "end C;");
     // No "owned class-typed return" diagnostic should fire.
     BEZEL_EXPECT_FALSE(hasMsg(r, "no `owned` class-typed return"));

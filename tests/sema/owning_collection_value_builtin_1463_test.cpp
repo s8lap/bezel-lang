@@ -18,12 +18,10 @@
 
 namespace {
 
+// fix #3985: delegates to the shared gated helper (sema_support.hpp)
+// instead of duplicating the parse-error-gate logic locally.
 bezel::test::SemaResult parseSemaAll(std::string_view src) {
-    auto r = bezel::test::parseAndCollect(src);
-    if (r.sourceFile && r.ctx) {
-        bezel::sema::resolveTypes(*r.sourceFile, *r.ctx);
-    }
-    return r;
+    return bezel::test::parseAndResolveGated(src);
 }
 
 // True iff a diagnostic is the §4.2/§14.4 owning-collection element rejection.
@@ -138,10 +136,25 @@ BEZEL_TEST(owning_collection_value_builtin_1463, interface_element_admitted_cont
 // value-builtin by the null-declaration path).
 BEZEL_TEST(owning_collection_value_builtin_1463, generic_type_param_admitted_control) {
     // Foo<T> uses OwningArray<T>; T is a generic param — should be admitted.
+    //
+    // fix #3985: `class Box<T: class>` inlined the constraint into the
+    // generic-parameter list, but Appendix A puts constraints in a separate
+    // `where Identifier ":" Constraint ...` clause after the parameter
+    // list (`GenericParam ::= Variance? Identifier`, no constraint slot) —
+    // this never parsed, so the row was reaching sema on parseSemaAll's
+    // ungated, error-recovery-truncated AST. Correcting the generic-param
+    // syntax alone then surfaces a second, independent defect the
+    // truncated AST had also hidden: a fresh `new OwningArray<T>()` stored
+    // into a plain (non-`owned`) field is a real §28.5 leak rejection, so
+    // the field needs `owned` too (mirrors the pattern already used
+    // throughout owning_element_generic_instantiation_2713_test.cpp, e.g.
+    // `private owned f: OwningArray<T> := new OwningArray<T>();`).
+    // VERIFIED against the real `bezelc -c`: the corrected source below
+    // parses and typechecks with zero diagnostics.
     auto r = parseSemaAll(
         "module M; "
-        "class Box<T: class> "
-        "  public items: OwningArray<T> := new OwningArray<T>(); "
+        "class Box<T> where T: class "
+        "  public owned items: OwningArray<T> := new OwningArray<T>(); "
         "end Box;");
     BEZEL_EXPECT_FALSE(hasOwningElementError(r));
 }

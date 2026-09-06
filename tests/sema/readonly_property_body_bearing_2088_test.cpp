@@ -27,13 +27,10 @@
 
 namespace {
 
+// fix #3985: delegates to the shared gated helper (sema_support.hpp)
+// instead of duplicating the parse-error-gate logic locally.
 bezel::test::SemaResult parseSemaAll(std::string_view src) {
-    auto r = bezel::test::parseAndCollect(src);
-    if (r.sourceFile && r.ctx) {
-        bezel::sema::resolveTypes(*r.sourceFile, *r.ctx);
-        bezel::sema::typecheckExpressions(*r.sourceFile, *r.ctx);
-    }
-    return r;
+    return bezel::test::parseAndTypecheckGated(src);
 }
 
 // True iff some reported diagnostic's message contains `needle`.
@@ -182,8 +179,8 @@ BEZEL_TEST(readonly_property_body_bearing_2088,
            readonly_choice_expression_property_rejected_spec_23_2) {
     auto r = parseSemaAll(
         "module M; "
-        "choice Foo of int "
-        "  Yes; No; "
+        "choice Foo "
+        "  Yes, No; "
         "  public readonly property Value: int => 0; "
         "end Foo;");
     BEZEL_EXPECT_TRUE(hasMsg(r, "`readonly` is redundant on an "
@@ -198,7 +195,7 @@ BEZEL_TEST(readonly_property_body_bearing_2088,
     auto r = parseSemaAll(
         "module M; "
         "enum Color "
-        "  Red; Green; Blue; "
+        "  Red, Green, Blue; "
         "  public readonly property Hue: int => 0; "
         "end Color;");
     BEZEL_EXPECT_TRUE(hasMsg(r, "`readonly` is redundant on an "
@@ -212,9 +209,9 @@ BEZEL_TEST(readonly_property_body_bearing_2088,
     auto r = parseSemaAll(
         "module M; "
         "class C public property V: int; end C; "
-        "extension CExt of C "
+        "extension C "
         "  public readonly property Doubled: int => 0; "
-        "end CExt;");
+        "end extension;");
     BEZEL_EXPECT_TRUE(hasMsg(r, "`readonly` is redundant on an "
                                 "expression-bodied property"));
 }

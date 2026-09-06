@@ -63,13 +63,10 @@
 
 namespace {
 
+// fix #3985: delegates to the shared gated helper (sema_support.hpp)
+// instead of duplicating the parse-error-gate logic locally.
 bezel::test::SemaResult parseSemaAll(std::string_view src) {
-    auto r = bezel::test::parseAndCollect(src);
-    if (r.sourceFile && r.ctx) {
-        bezel::sema::resolveTypes(*r.sourceFile, *r.ctx);
-        bezel::sema::typecheckExpressions(*r.sourceFile, *r.ctx);
-    }
-    return r;
+    return bezel::test::parseAndTypecheckGated(src);
 }
 
 bool hasError(const bezel::test::SemaResult& r, const char* sub) {
@@ -372,15 +369,29 @@ BEZEL_TEST(sema_init_value_from_object_3115,
 
 BEZEL_TEST(sema_init_value_from_object_3115,
            out_of_scope_object_to_interface_target_local_accepted_spec_3_5_1) {
+    // fix #3985: the original fixture used C#-shaped syntax throughout —
+    // `interface IFoo: M(): void; end interface;` (no such `:`-member /
+    // `void` / `end interface` forms; Appendix A's IfaceMethod is `"method"
+    // Identifier "(" ParamList? ")" (":" "owned"? Type)? ";"`, `end`'s
+    // optional identifier is the interface's own name, and there is no
+    // `void` type — an empty return-type clause means unit), `class A:
+    // implements IFoo;` (inheritance is `class A : IFoo ... end A;`, no
+    // `implements` keyword, and a ClassBody is never `;`-terminated —
+    // Appendix A's `ClassBody ::= Member* "end" Identifier? ";"` has no
+    // semicolon-only alternative, unlike RecordDecl/ChoiceDecl), and `new A`
+    // with no parens (`NewExpr` always takes `"(" ArgList? ")"`). None of it
+    // parsed, so this row was reaching sema on parseSemaAll's ungated,
+    // error-recovery-truncated AST. VERIFIED against the real `bezelc -c`:
+    // the corrected source below parses with zero diagnostics.
     auto r = parseSemaAll(
         "module M; "
-        "interface IFoo: M(): void; end interface; "
-        "class A: implements IFoo; "
-        "  public method M(): void => end method; "
+        "interface IFoo method M(); end IFoo; "
+        "class A : IFoo "
+        "  public method M() end M; "
         "end A; "
         "class C "
         "  public static method Main(): int "
-        "    var a := new A; "
+        "    var a := new A(); "
         "    var o: Object := a; "
         "    var f: IFoo := o; "
         "    return 0; "

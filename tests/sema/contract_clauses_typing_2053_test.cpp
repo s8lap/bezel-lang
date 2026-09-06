@@ -32,14 +32,10 @@
 
 namespace {
 
+// fix #3985: delegates to the shared gated helper (sema_support.hpp)
+// instead of duplicating the parse-error-gate logic locally.
 bezel::test::SemaResult parseSemaAll(std::string_view src) {
-    auto r = bezel::test::parseAndCollect(src);
-    if (r.sourceFile && r.ctx) {
-        bezel::sema::resolveTypes(*r.sourceFile, *r.ctx);
-        bezel::sema::typecheckExpressions(*r.sourceFile, *r.ctx);
-        bezel::sema::checkPureBodies(*r.sourceFile, *r.ctx);
-    }
-    return r;
+    return bezel::test::parseAndCheckPureGated(src);
 }
 
 // True iff some reported diagnostic's message contains `needle`.
@@ -103,20 +99,36 @@ BEZEL_TEST(contract_clauses_typing_2053,
     BEZEL_EXPECT_TRUE(hasMsg(r, "must be `bool`"));
 }
 
-// §22.16 "throw is rejected" (amendment to the pure-body rules): a throw
-// STATEMENT in a clause is rejected.
+// §22.16 "throw is rejected" (amendment to the pure-body rules), exercised
+// via the OTHER syntactic position `throw` can occupy inside an expression.
+//
+// fix #3985: the original fixture wrapped `throw` in a `(do ... end)` block
+// to spell it as a "statement sneaking into clause position", but Appendix
+// A's `"do" Statement* "end"` expression alternative (grammar `ArmBody`) is
+// "valid only in a CaseStmt or in a catch arm" — it is NOT a general
+// parenthesized-expression atom, so `(do throw new ArgumentException();
+// end))` never parsed at all; this row was reaching sema on parseSemaAll's
+// ungated, error-recovery-truncated AST. VERIFIED against the real
+// `bezelc -c` (see also the `do`-block grammar note at ArmBody).
+//
+// There is in fact no grammar position that admits a bare `throw`
+// STATEMENT inside `requires(E)`/`ensures(E)` — the clause parens fence one
+// Expression (§22.16), and `ThrowExpr` is expression-shaped only as the
+// right operand of `??` (`NullCoalesce ::= Equality ("??" (ThrowExpr |
+// NullCoalesce))?`). The sibling test below already covers the if/then
+// `ThrowExpr` position; this row is corrected to cover the `??` position
+// instead of duplicating it, giving the throw-rejection amendment coverage
+// over both of `ThrowExpr`'s two reachable grammar sites.
 BEZEL_TEST(contract_clauses_typing_2053,
-           throw_stmt_in_clause_rejected_spec_22_16) {
+           throw_via_null_coalesce_in_clause_rejected_spec_22_16) {
     auto r = parseSemaAll(
         "module M; "
         "class C "
-        "  public method M(x: int) "
-        "    requires(x > 0 or (do throw new ArgumentException(); end)) "
+        "  public method M(x: int, b: bool?) "
+        "    requires(x > 0 or (b ?? throw new ArgumentException())) "
         "    => 0; "
         "end C;");
-    // Either the bool typing rejects the do-block (it's not bool) or the
-    // pure-body checker rejects the throw — both are §22.16 rejections.
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasMsg(r, "throw"));
 }
 
 // §22.16 throw amendment: a throw EXPRESSION is rejected in a clause.
