@@ -174,6 +174,29 @@ struct CalleeFormals {
     }
 };
 
+// §28.3 K3.4 (#747 R42 / fix #3949 / fix #3971): is `e` a TOP-LEVEL consuming
+// form — the shape a read-checking walker must NOT run the broad `checkRead`
+// over, because a more specific move / await-consume check owns the diagnostic
+// there and a read-check run first would steal it (and, for the dispose half,
+// weaken the ERROR to a use-after-dispose WARNING, which turns a rejected
+// program into an accepted one)?
+//
+// ONE spelling, THREE callers.  `handleLocalDecl` has made this exact decision
+// since #747 (`var y := move x;`); `handleAssignment` since #3949 (`y := move
+// x;`); `checkRead`'s own `NewExpr` argument walk since #3971 (`new T(move x)`
+// — measured: without the guard the precise "cannot move from disposed local
+// `x` (§28.3)" ERROR degrades to §28.2's WARNING and the program is ACCEPTED,
+// the exact #3941 shape).  It was file-local to Ownership.cpp until #3971
+// needed the third caller; a second, drifting copy of a decision an existing
+// site already makes is this codebase's dominant defect generator, so the
+// predicate moved here rather than being restated.
+// // per §28.3 K3.4, v0.294, #747, #3949, #3971
+inline bool isTopLevelConsumingForm(const ast::Expr& e) {
+    if (const auto* ue = dynamic_cast<const ast::UnaryExpr*>(&e))
+        return ue->op == "move" || ue->op == "await";
+    return false;
+}
+
 // Per-method ownership analyzer.
 //
 // Slice O3a: the analysis runs as a forward dataflow over the method

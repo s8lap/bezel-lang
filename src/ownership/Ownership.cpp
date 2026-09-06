@@ -1462,27 +1462,14 @@ void MethodOwnership::runExprBodyOwningReturnCheck(
 
 namespace {
 
-// §28.3 (#747 R42 / fix #3949): is `e` a TOP-LEVEL consuming form — the shape a
-// binding context must NOT run the broad `checkRead` over, because a more
-// specific move / await-consume check owns the diagnostic there and a
-// read-check run first would steal it (and, for the dispose half, weaken the
-// error to a use-after-dispose warning)?
-//
-// ONE spelling, TWO callers.  `handleLocalDecl` has made this exact decision
-// since #747 (`var y := move x;`); `handleAssignment` needs the identical one
-// now that it read-checks its RHS (#3949, `y := move x;` — the SAME K3.4 row of
-// §28.3's consume table, differing only in whether the binding is fresh).  A
-// second, drifting copy of a decision an existing site already makes is this
-// codebase's dominant defect generator, so the predicate is named once here and
-// both call sites ask it.  The assignment-position `owned` marker
-// (`y := owned x;`, AssignmentStmt::valueHasOwnedMarker) is the third such
-// shape; it is not visible in the expression at all, so its caller tests the
-// flag beside this call. // per §28.3 K3.4, v0.294, #747, #3949
-bool isTopLevelConsumingForm(const ast::Expr& e) {
-    if (const auto* ue = dynamic_cast<const ast::UnaryExpr*>(&e))
-        return ue->op == "move" || ue->op == "await";
-    return false;
-}
+// §28.3 (#747 R42 / fix #3949 / fix #3971): `isTopLevelConsumingForm` used to be
+// defined here, in this anonymous namespace.  #3971 gave it a THIRD caller in
+// the other TU (`checkRead`'s `NewExpr` argument walk, Ownership_Checks.cpp) and
+// the predicate moved to Ownership_impl.hpp so all three ask ONE spelling.  The
+// assignment-position `owned` marker (`y := owned x;`,
+// AssignmentStmt::valueHasOwnedMarker) is the fourth such shape; it is not
+// visible in the expression at all, so its caller tests the flag beside this
+// call. // per §28.3 K3.4, v0.294, #747, #3949, #3971
 
 // An edge identified by its endpoints, used to flag CFG back-edges so the
 // O3b loop fixpoint can distinguish loop-carried merges (back-edge / zero-

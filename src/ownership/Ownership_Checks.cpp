@@ -2097,7 +2097,214 @@ void MethodOwnership::checkRead(const ast::Expr& e, bool selfTarget) {
             if (idx.value) checkRead(*idx.value, /*selfTarget=*/false);
         return;
     }
-    // Other expression forms — not exhaustive; later slices extend.
+    // ---- fix #3971 (§28.3 K1.3/K7, §28.2, v0.294) ------------------------
+    // Everything below this line closes the REMAINDER the comment that used to
+    // sit here ("Other expression forms — not exhaustive; later slices
+    // extend.") stood for. `checkRead` is the ONE authority that detects a
+    // MovedFrom / Disposed / maybe-consumed / Uninitialized local at a read
+    // position, so a node kind missing from its recursion is a read position
+    // that reaches NO check at all — and because every caller (a `var`
+    // initializer, a `const` initializer, an assignment RHS, a `return`
+    // operand, a bare statement, a loop body) funnels through this one
+    // function, one missing arm is a hole at ALL of them simultaneously.
+    // That is what distinguishes this family from #3591 / #3687 / #3864 /
+    // #3931 / #3949, which were each a hole in ONE caller.
+    //
+    // Measured on this branch (origin/main e240743, i.e. WITH #3864/#3931/
+    // #3949/#3950 all landed), for `var x := new Res(1); var t :=
+    // Sink.Take(move x);` — `Take` auto-disposes the moved-in value at method
+    // end, §28.3 auto-drop — followed by one read of `x` in each position:
+    //
+    //   position                                     before      ASan
+    //   -------------------------------------------  ----------  ----------
+    //   new T(x.tag)              (all 5 spellings)  SILENT      heap-UAF
+    //   (if c then x.tag else 0)  cond / then / else SILENT      heap-UAF
+    //   (case x.tag of …)         scrut/guard/arm    SILENT      heap-UAF
+    //   [x.tag]                   collection literal SILENT      heap-UAF
+    //   $"{x.tag}"                interpolation      SILENT      heap-UAF
+    //   x is Res                  type test          SILENT      heap-UAF
+    //   p with (A := x.tag)       with-expression    SILENT      heap-UAF
+    //   x.tag..3                  range              SILENT      heap-UAF
+    //   throw MkEx(x.tag)         throw operand      SILENT      heap-UAF
+    //
+    // — 15 read positions across 9 node kinds closed here (two more, the `?.`
+    // pair, are measured and deliberately withheld — see the block below them),
+    // every one of them a silent
+    // accept whose program heap-use-after-frees under
+    // `--sanitize=address`, while the byte-identical read one node kind over
+    // (`Sink.Peek(x)`, `x.tag + 1`, `a[x.tag]`, `-x.tag`, `(var k := x.tag;
+    // k)`) is correctly rejected with "owned value in `x` was already moved
+    // out at this point (§28.3)". Nothing in §28.3 K1.3 ("the binding or slot
+    // is unreadable until reassigned") or §28.2's use-after-dispose regime
+    // ("used (read, borrowed from, or consumed) after an explicit `Dispose()`
+    // call … that dominates the use site on every path") carves out a
+    // constructor argument, an `if`-expression arm, a literal element, an
+    // interpolation hole, an `is` operand, a `with` source, a range endpoint or
+    // a `throw` operand. K7's join list likewise names `if`
+    // expressions and expression-position `case` arms as ordinary joins.
+    //
+    // Every arm below is a pure READ walk over subexpressions that are already
+    // read positions — none of them consumes, marks, or transfers anything —
+    // so the ACCEPT direction is untouched except where the read is genuinely
+    // of a local this function already refuses to read.
+    //
+    // ⚠ The one hazard is #3941's: `checkRead` runs BEFORE `recordMovesIn` on
+    // every binding path, and its report POISONS the record, after which
+    // `markMovedByName` (which has no Poisoned arm, by design) silently falls
+    // through — so a read-check placed over a CONSUMING operand steals that
+    // operand's more precise diagnostic. Measured on this branch: `x.Dispose();
+    // using var h := new Holder(move x);` correctly reports the ERROR "cannot
+    // move from disposed local `x` (§28.3)" and REJECTS, whereas the existing
+    // CallExpr arm's unguarded walk over the identical `Sink.Take(move x)`
+    // already degrades it to §28.2's WARNING and ACCEPTS the program (it
+    // SEGVs — filed separately, it is not this fix's to change). Every new arm
+    // therefore routes its operands through `readOperand`, which declines the
+    // top-level consuming forms via the shared `isTopLevelConsumingForm`
+    // predicate (Ownership_impl.hpp) rather than a second spelling of it, and
+    // the NewExpr arm additionally declines a bare identifier bound to an
+    // `owned` / `out owned` ctor formal — the implicit-transfer shape of §28.8
+    // whose diagnostic `recordMovesIn`'s NewExpr branch owns. Both skips cost
+    // nothing in coverage: those exact programs stay rejected, by the more
+    // specific message. // per §28.3 K1.3/K7/K7.4, §28.2, v0.294, #3941, #3971
+    auto readOperand = [&](const ast::Expr* op) {
+        if (op && !isTopLevelConsumingForm(*op))
+            checkRead(*op, /*selfTarget=*/false);
+    };
+
+    // §28.8 / §22.10: a constructor call's arguments. Mirrors the CallExpr arm
+    // above (including its `out owned var` WRITE-target carve-out, #2436), plus
+    // the owned-formal skip described in the ⚠ block. The formal's modifier
+    // comes from `boundModifier` over `resolveCtorParams` — the SAME pair
+    // `handleDischarge`'s NewExpr branch asks (this file, ~line 1587), so the
+    // two cannot drift about one argument position. `handleDischarge`'s branch
+    // itself could not simply be called from here: it MUTATES (marks moves,
+    // reports missing/spurious §22.3 markers, models the `out owned` transfer),
+    // and every binding path already runs `recordMovesIn` for exactly that, so
+    // reusing it would double-process each of those. // per §28.8, §22.10
+    if (auto* ne = dynamic_cast<const ast::NewExpr*>(&e)) {
+        const CalleeFormals ctorParams = resolveCtorParams(*ne, ctx_);
+        std::size_t pos = 0;
+        for (const auto& a : ne->args) {
+            if (!a.value) { ++pos; continue; }
+            if (a.modifier == "out owned var") { ++pos; continue; }
+            const std::string_view fm = boundModifier(ne->args, pos, ctorParams);
+            if ((fm == "owned" || fm == "out owned") &&
+                dynamic_cast<const ast::IdentifierExpr*>(a.value.get())) {
+                ++pos; continue;   // implicit transfer — recordMovesIn's message
+            }
+            readOperand(a.value.get());
+            ++pos;
+        }
+        return;
+    }
+    // §20 / K7: a MARKER-FREE if-expression. The marked form returned at the
+    // top of this function (processMarkedArmConstruct owns it, and its
+    // markedConstructsProcessed_ dedup depends on that early return), so only
+    // the marker-free shape reaches here. The condition and both arms are read
+    // positions; no save/restore of `states_` around the arms, deliberately —
+    // this walk performs no transfer, so the only state it can write is the
+    // Poison that suppresses a cascade, and that is exactly as wanted across
+    // the arms of one construct (one diagnostic for `(if c then x.tag else
+    // x.tag)`, not two) and after it. // per §20, §28.3 K7
+    if (auto* cd = dynamic_cast<const ast::ConditionalExpr*>(&e)) {
+        readOperand(cd->condition.get());
+        readOperand(cd->thenValue.get());
+        readOperand(cd->elseValue.get());
+        return;
+    }
+    // §19.2 / K7: a MARKER-FREE expression-position `case`. Same early-return
+    // split as the conditional above. Mirrors handleDischarge's own marker-free
+    // CaseExpr walk (this file, ~line 1097) in WHAT it visits — scrutinee,
+    // each arm's guard, each arm's value expression. A `do … end` (Block) arm
+    // body is NOT walked here: `visitStmt` is a statement transfer function
+    // with side effects, and a statement-form arm reaches ownership through the
+    // CFG, not through a read walk; running it from here would double-process
+    // it. // per §19.2, §28.3 K7
+    if (auto* ce = dynamic_cast<const ast::CaseExpr*>(&e)) {
+        readOperand(ce->scrutinee.get());
+        for (const auto& arm : ce->arms) {
+            readOperand(arm.guard.get());
+            if (arm.bodyKind == ast::CaseArmBodyKind::Expression)
+                readOperand(arm.exprBody.get());
+        }
+        return;
+    }
+    // §15.4: a collection literal's elements (and a dict literal's keys) are
+    // ordinary read positions. // per §15.4
+    if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(&e)) {
+        for (const auto& k : cl->keys) readOperand(k.get());
+        for (const auto& el : cl->elements) readOperand(el.get());
+        return;
+    }
+    // §18.5 / §18.7: each interpolation hole is a read of its expression.
+    // per §18.5
+    if (auto* is2 = dynamic_cast<const ast::InterpolatedStringExpr*>(&e)) {
+        for (const auto& part : is2->parts) readOperand(part.expr.get());
+        return;
+    }
+    // §17.1: `NullCondMemberExpr` (`t?.M`) and `NullCondCallExpr` (`f?(args)`)
+    // are the TWO node kinds this fix deliberately does NOT add, though they
+    // are in the same remainder and their repros are the same measured
+    // heap-use-after-free (`var xn: Res? := new Res(1); var t :=
+    // Sink.Take(move xn!); var u := xn?.tag;` — rc=0, zero diagnostics, "READ
+    // of size 4" freed in `bz$M.Sink$Take`; likewise `xn?.Get()`).
+    //
+    // The four-line arms DO close both repros — measured — but `?.` is the
+    // last read spelling that escapes issue 3983, a PRE-EXISTING false
+    // diagnostic in which a nullable owned local's plain null-CHECK (`if item
+    // <> null then … end;`, no discharge on either branch) arms
+    // `disposedOnSomePath`, so every subsequent read draws "local `item` may
+    // have already been disposed on another branch". That already fires for
+    // `item!.Val` on an unpatched tree; adding these arms extends it to the
+    // canonical `?.Dispose()` discharge idiom and breaks six shipped codegen
+    // tests written that way (owned_collection_trypop_831 ×4,
+    // owned_set_take_1476 ×2) — all on
+    //   `var ok := a.TryPopFirst(out owned var item);
+    //    var v := 0; if item <> null then v := item.Val; end;
+    //    item?.Dispose();`
+    // Those programs are correct; the rejection would be 3983's bug, not a
+    // finding, and repairing the fixtures around a false diagnostic is the
+    // wrong direction. The arms are therefore withheld until 3983 lands, and
+    // the residual is filed as issue 3984 with the measurement and the
+    // ordering. (3984 also records the second thing they need: widening
+    // `handleDischarge`'s `skipCalleeReadForDispose` — this file, ~line 1186 —
+    // to recognise a `NullCondMemberExpr` callee, or `x?.Dispose()` on an
+    // already-disposed `x` loses `markDisposedByName`'s precise idempotent-
+    // dispose message to the #3941 poison-preemption.)
+    // // per §17.1, §28.3, v0.294, issue 3983, issue 3984
+    // §17.4: `x is T` / `x is not T` / `x as T` read `x` — an `is` test reads
+    // the instance's type tag out of the object, so on a freed instance it is a
+    // heap-use-after-free like any other member read. // per §17.4
+    if (auto* tt = dynamic_cast<const ast::TypeTestExpr*>(&e)) {
+        readOperand(tt->operand.get());
+        return;
+    }
+    // §9.5 / §22.11: `src with (F := v, …)` reads the source and every
+    // override value. // per §9.5
+    if (auto* we = dynamic_cast<const ast::WithExpr*>(&e)) {
+        readOperand(we->source.get());
+        for (const auto& ia : we->assigns) readOperand(ia.value.get());
+        return;
+    }
+    // §17: a range's endpoints and step are reads. // per §17.1
+    if (auto* re = dynamic_cast<const ast::RangeExpr*>(&e)) {
+        readOperand(re->lo.get());
+        readOperand(re->hi.get());
+        readOperand(re->step.get());
+        return;
+    }
+    // §17.12: `throw E` reads E. // per §17.12
+    if (auto* th = dynamic_cast<const ast::ThrowExpr*>(&e)) {
+        readOperand(th->operand.get());
+        return;
+    }
+    // Remaining expression forms have no subexpression that could hold a read:
+    // the literals, `typeof` / `nameof` / `default` (a Type, not an Expr),
+    // `UnitExpr`, `MarkedTransferExpr` (handled by handleMarkedArmTransfer),
+    // and `LambdaExpr`, whose body is walked by the capture machinery
+    // (Ownership.cpp's walkAtoms / the closure escape walker) rather than as a
+    // straight-line read — a moved-from read in a lambda body is already
+    // diagnosed (measured).
 }
 
 bool MethodOwnership::isBorrowableType(const sema::TypeRef* rt) {
