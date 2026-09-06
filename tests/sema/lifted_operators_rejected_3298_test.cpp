@@ -78,7 +78,17 @@ namespace {
 
 bezel::test::SemaResult parseSemaAll(std::string_view src) {
     auto r = bezel::test::parseAndCollect(src);
-    if (r.sourceFile && r.ctx) {
+    // fix #3958: gate on parse diagnostics exactly as the real driver does
+    // (src/driver/Driver.cpp ~473, ~672: `if (unit && !diagnostics.
+    // hasErrors()) { ... resolveTypes/typecheckExpressions ... }`) so a
+    // program that fails to parse never reaches sema here either. Before
+    // this gate, a malformed row's parser-error-recovery-truncated AST
+    // could still produce a diagnostic this file's helpers matched,
+    // masking six grammar-invalid rows (five missing-comma `CaseStmt`
+    // arms, one stray `end Identifier;` after an arrow-bodied method) that
+    // "passed" for the wrong reason. All were corrected to parse cleanly
+    // as part of this fix.
+    if (r.sourceFile && r.ctx && !r.diagnostics.hasErrors()) {
         bezel::sema::resolveTypes(*r.sourceFile, *r.ctx);
         bezel::sema::typecheckExpressions(*r.sourceFile, *r.ctx);
     }
@@ -525,10 +535,19 @@ BEZEL_TEST(lifted_operators_rejected_3298, relational_double_nullable_rejected) 
 // ============================================================================
 
 BEZEL_TEST(lifted_operators_rejected_3298, case_relop_pattern_over_nullable_rejected) {
+    // fix #3958: Appendix A's `CaseStmt ::= "case" Expression "of" CaseArm
+    // ("," CaseArm)* ","? "end" "case"? ";"` comma-separates arms
+    // unconditionally, so the first arm's trailing `,` after `return 1;` is
+    // REQUIRED — this row omitted it and "passed" only via parseSemaAll's
+    // pre-#3958 failure to gate on parse errors (the omission fed a
+    // parser-error-recovery-truncated AST to sema). VERIFIED directly
+    // against the real `bezelc -c`: with the comma restored, this source
+    // parses with zero diagnostics and rejects at the relop pattern with
+    // the expected §19.3/§16.6/§7.11 text.
     auto r = parseSemaAll(
         "module M; class C public static method Main(n: int?): int "
         "  case n of "
-        "    > 30 => return 1; "
+        "    > 30 => return 1;, "
         "    _ => return 0; "
         "  end case; "
         "end Main; end C;");
@@ -536,10 +555,14 @@ BEZEL_TEST(lifted_operators_rejected_3298, case_relop_pattern_over_nullable_reje
 }
 
 BEZEL_TEST(lifted_operators_rejected_3298, case_range_pattern_over_nullable_rejected) {
+    // fix #3958: same missing-comma defect as case_relop_pattern_over_
+    // nullable_rejected above — see that test's comment. VERIFIED against
+    // the real `bezelc -c` with the comma restored: parses cleanly, rejects
+    // at the range pattern (§19.3/§16.6/§7.11).
     auto r = parseSemaAll(
         "module M; class C public static method Main(n: int?): int "
         "  case n of "
-        "    1..5 => return 1; "
+        "    1..5 => return 1;, "
         "    _ => return 0; "
         "  end case; "
         "end Main; end C;");
@@ -549,11 +572,16 @@ BEZEL_TEST(lifted_operators_rejected_3298, case_range_pattern_over_nullable_reje
 BEZEL_TEST(lifted_operators_rejected_3298, case_relop_over_nullable_stmt_rejected) {
     // The statement-position `case` is the same gate at a different visit
     // site (ExprTypecheck.cpp ~line 14628); cover that path too.
+    //
+    // fix #3958: same missing-comma defect as the two rows above — see
+    // case_relop_pattern_over_nullable_rejected's comment. VERIFIED against
+    // the real `bezelc -c` with the comma restored: parses cleanly, rejects
+    // at the relop pattern (§19.3/§16.6/§7.11).
     auto r = parseSemaAll(
         "module M; class C public static method Main(): int "
         "  var n: int? := 5; "
         "  case n of "
-        "    > 3 => return 1; "
+        "    > 3 => return 1;, "
         "    _ => return 0; "
         "  end case; "
         "end Main; end C;");
@@ -707,12 +735,19 @@ BEZEL_TEST(lifted_operators_rejected_3298,
            case_range_pattern_in_record_slot_over_nullable_field_stmt_rejected_3692) {
     // Statement-position `case` — a separate visit site from the expression
     // form, exactly as the arm-level gate's own stmt row covers.
+    //
+    // fix #3958: a FIFTH row with the same missing-comma defect the issue
+    // pins (found while fixing the four the issue lists) — see
+    // case_relop_pattern_over_nullable_rejected's comment above for the
+    // grammar citation. VERIFIED against the real `bezelc -c` with the
+    // comma restored: parses cleanly, rejects at the range pattern
+    // (§19.3/§16.6/§7.11).
     auto r = parseSemaAll(
         "module M; record R(X: int?, Y: int); "
         "class C public static method Main(): int "
         "  var r := new R(99, 1); "
         "  case r of "
-        "    R(1..5, 1) => return 7; "
+        "    R(1..5, 1) => return 7;, "
         "    _ => return 3; "
         "  end case; "
         "end Main; end C;");
@@ -1360,13 +1395,27 @@ BEZEL_TEST(lifted_operators_rejected_3298, user_operator_gate_mirrors_primitive_
     // "is not defined on a nullable value type — narrow first (§7.4, ?? §7.7,
     // ! §7.8)" framing with the explicit "user-defined operators do not
     // lift over `T?` (§7.11, v0.267)" clause.
+    //
+    // fix #3958: a SIXTH row with a parseSemaAll-masked grammar-invalid
+    // defect, found probing the whole file for parse errors — distinct
+    // from the case-comma family. `class C public method M(...): V => a +
+    // b;` is Appendix A's arrow `MethodBody ::= "=>" (Expression |
+    // AssignmentStmt) ";"` alternative (v0.294), which is complete at the
+    // `;` and takes no trailing `end Identifier? ;` (that belongs only to
+    // the `Statement* "end" Identifier? ";"` block-body alternative). The
+    // stray `end M;` this row appended did not close the method (already
+    // terminated) and mismatched class C's own end-label check, producing
+    // a real parse error masked by parseSemaAll's pre-#3958 failure to gate
+    // on it. VERIFIED against the real `bezelc -c`: with `end M;` removed,
+    // this source parses with zero diagnostics and rejects at the `+` with
+    // the expected §7.11/v0.267 text.
     auto r = parseSemaAll(
         "module M; "
         "record V(n: int) "
         "  public static method operator+(a: V, b: V): V => new V(a.n + b.n); "
         "end V; "
         "class C public method M(a: int, b: V?): V => a + b; "
-        "end M; end C;");
+        "end C;");
     bool hit = false;
     for (const auto& d : r.diagnostics.diagnostics()) {
         // Must say "rejected" (not "deferred") and use the same phrasing
