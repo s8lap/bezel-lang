@@ -486,7 +486,7 @@ struct BuiltinParamNameRow {
 // `Split/1`, `AsSpan/1` — are present since #3424 as MULTIPLE candidate rows
 // at the same argument count. `Trim/0`, `ToUpper/0` and the other nullary
 // members carry no parameters and so cannot take a named argument at all.
-constexpr std::array<BuiltinParamNameRow, 38> kStringParamNames = {{
+constexpr std::array<BuiltinParamNameRow, 37> kStringParamNames = {{
     // Construction (static)
     {"string", "From", 1, 1, {"value", "", "", ""}},
     {"string", "From", 3, 3, {"buffer", "start", "length", ""}},  // renamed v0.282 (§1)
@@ -533,10 +533,15 @@ constexpr std::array<BuiltinParamNameRow, 38> kStringParamNames = {{
     // `Split(separators: Array<char>)` — two candidate names at arity 1.
     {"string", "Split", 1, 1, {"separator", "", "", ""}},
     {"string", "Split", 1, 1, {"separators", "", "", ""}},
-    // Comparison and equality
+    // Comparison and equality. fix #3853 (stdlib §9.6, v0.290, proposal 0123
+    // R6): the static `Compare(a, b)` / `Compare(a, b, ignoreCase)` rows this
+    // table used to carry were RETIRED — deleted, not just left unregistered,
+    // so they do not silently resurrect a named-argument binding for a call
+    // the sema layer now rejects outright (the #3854 `IsNullOrEmpty` pattern
+    // above). The instance replacement is the 2-arg `CompareTo` row below,
+    // parallel to `Equals`'s.
     {"string", "CompareTo", 1, 1, {"other", "", "", ""}},
-    {"string", "Compare", 2, 2, {"a", "b", "", ""}},
-    {"string", "Compare", 3, 3, {"a", "b", "ignoreCase", ""}},
+    {"string", "CompareTo", 2, 2, {"other", "ignoreCase", "", ""}},
     // §9.6 declares BOTH `Equals(other: string?)` and the `Object?` override
     // at arity 1, and they AGREE on the name, so the single row answers both.
     {"string", "Equals", 1, 1, {"other", "", "", ""}},

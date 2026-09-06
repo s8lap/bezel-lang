@@ -2158,32 +2158,18 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                 requireIntLike(0, "first argument");
                 requireIntLike(1, "(int) count");
             }
-            // §7 / stdlib §9.6 (#2581): string.Compare(a: string, b: string)
-            // (and its 3-arg `ignoreCase` overload) declare NON-nullable a/b.
-            // The callee target is the type name `string`, which carries no
-            // Primitive-String VALUE exprType, so checkBuiltinStringCallArgs
-            // (keyed on the instance-receiver VALUE) does not reach it — an
-            // un-narrowed `string?` argument was silently accepted. Run the §7
-            // assignability check against the declared non-nullable `string`
-            // (IsNullOrWhiteSpace takes `string?` and stays admissible; fix
-            // #3854 retired its former sibling `IsNullOrEmpty` entirely, so
-            // it is not `Compare` and is excluded by the method-name gate).
-            if (recvPt == PrimitiveType::String && mm == "Compare" &&
-                ce.args.size() >= 2) {
-                for (std::size_t ai : {std::size_t{0}, std::size_t{1}}) {
-                    if (ai >= ce.args.size() || !ce.args[ai].value) continue;
-                    const auto& a = ce.args[ai];
-                    if (!a.modifier.empty()) continue;  // §22.3 alias — skip
-                    TypeRef* argTy = ctx_.exprType(*a.value);
-                    if (!argTy) continue;  // untyped/error arg — its own diagnostic
-                    TypeRef* paramTy = ctx_.primitiveTypeRef(
-                        PrimitiveType::String, /*nullable=*/false);
-                    checkAssignable(
-                        argTy, paramTy, a.value->span.begin,
-                        "argument to `string.Compare`",
-                        a.value.get());  // §7.4 / §27.6 (#1191) — narrowing-aware
-                }
-            }
+            // fix #3853 (stdlib §9.6, v0.290; proposal 0123 R6): the static
+            // `string.Compare(a, b[, ignoreCase])` this #2581 protection used
+            // to cover was RETIRED — `mbr == "Compare"` is rejected outright
+            // below (the static-methods closed set), so no well-typed call
+            // ever reaches this point with `mm == "Compare"` any more. The
+            // replacement instance member `CompareTo(other: string[, bool])`
+            // is a PRIMITIVE-STRING-VALUE receiver call, which
+            // checkBuiltinStringCallArgs (§2315) already gates for its
+            // non-nullable `other` parameter at position 0 (it has done so
+            // since CompareTo's single-arg form was added, fix #586) — so the
+            // #2581 hole this block patched does not reopen for the new 2-arg
+            // overload and needs no analogous block here.
             // §9.5: char classification / transform statics take a `char`.
             if (recvPt == PrimitiveType::Char &&
                 (mm == "IsDigit" || mm == "IsLetter" || mm == "IsLetterOrDigit" ||
@@ -11625,11 +11611,13 @@ void ExprTC::publishPrimaryCtorChainBinding(const ast::ConstructorDecl& cd) {
 // parameter-nullability widening) and is therefore omitted entirely, so a
 // `string?` argument to it continues to compile. Only INSTANCE calls are
 // covered: the callee target must carry a Primitive-String exprType (a value
-// of type `string`), which excludes static calls like `string.Compare(a, b)`
+// of type `string`), which excludes static calls like `string.From(...)`
 // (target is the type name, no value exprType). The static
-// `IsNullOrWhiteSpace` takes `string?` anyway (its retired sibling
-// `IsNullOrEmpty`, fix #3854, is rejected outright before reaching this
-// path), so excluding statics does not leave a nullable hole.
+// `IsNullOrWhiteSpace` takes `string?` anyway, and its retired siblings
+// `IsNullOrEmpty` (fix #3854) and `Compare` (fix #3853 — its instance
+// replacement `CompareTo` IS covered below, at the `m == "CompareTo"`
+// position-0 entry) are rejected outright before reaching this path, so
+// excluding statics does not leave a nullable hole.
 // #2581: a builtin instance-call callee is EITHER a MemberAccessExpr
 // (`recv.M(..)`) OR a NullCondMemberExpr (`recv?.M(..)`); the two are separate
 // Expr kinds but share identical `target`/`member` fields. The null-conditional
@@ -11677,7 +11665,11 @@ void ExprTC::checkBuiltinStringCallArgs(const ast::CallExpr& ce) {
             if (argKind == PT::Char)  return PT::Char;
             return PT::None;
         }
-        // Single-kind string params.
+        // Single-kind string params. fix #3853 (stdlib §9.6, v0.290): this
+        // `CompareTo` entry is keyed on POSITION, not arity, so it already
+        // covers the `other` parameter of BOTH the 1-arg `CompareTo(other)`
+        // and the 2-arg `CompareTo(other, ignoreCase)` overload added by
+        // #3853 — no separate entry was needed when the overload landed.
         if ((pos == 0 && (m == "StartsWith" || m == "EndsWith" ||
                           m == "CompareTo")) ||
             (pos == 1 && m == "Insert")) {
@@ -16001,12 +15993,23 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                         ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::String));
                         return;
                     }
-                    // string.Compare → int (ordinal comparison result). §27.6:
-                    // `(string, string) -> int` as a reference.
+                    // fix #3853 (stdlib §9.6, v0.290; proposal 0123 R6): the
+                    // static `string.Compare(a, b[, ignoreCase])` was
+                    // impl-ahead-of-spec surface — accepted here (and lowered
+                    // in codegen) but retired from the stdlib at v0.290 in
+                    // favor of the instance `CompareTo(other, ignoreCase)`
+                    // beside `Equals(other, ignoreCase)`. Reject it explicitly
+                    // (the IsNullOrEmpty/#3854 pattern just above), naming the
+                    // real replacement instead of the generic "no static
+                    // method" text every other unknown static gets.
                     if (mbr == "Compare") {
-                        methodRef({ctx_.primitiveTypeRef(PrimitiveType::String),
-                                   ctx_.primitiveTypeRef(PrimitiveType::String)},
-                                  ctx_.primitiveTypeRef(PrimitiveType::Int));
+                        ctx_.diagnostics().report(
+                            Severity::Error, ma.span.begin,
+                            "'String.Compare' was REMOVED from the standard "
+                            "library at v0.290 (stdlib \xC2\xA7""9.6) \xE2\x80\x94 "
+                            "write `a.CompareTo(b)` or "
+                            "`a.CompareTo(b, ignoreCase := true)`; it is gone, "
+                            "not misspelled (issue 3853)");
                         return;
                     }
                 }

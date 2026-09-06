@@ -813,32 +813,14 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
     if (pt == P::String && m == "Empty" && call.args.empty()) {
         return lowerStringLiteral("\"\"", false);
     }
-    // §9.6: string.Compare(a, b): int — ordinal comparison; returns
-    // negative/0/positive like memcmp.
-    if (pt == P::String && m == "Compare" &&
-        call.args.size() == 2 && call.args[0].value && call.args[1].value) {
-        llvm::Value* a = lowerExpr(*call.args[0].value);
-        llvm::Value* b = lowerExpr(*call.args[1].value);
-        if (!a || !b) return nullptr;
-        return emitStringOrdCmp(a, b);
-    }
-    // §9.6: string.Compare(a, b, ignoreCase: bool): int — ordinal comparison,
-    // optionally ASCII case-folded. Routed through the runtime helper so the
-    // case-folding logic lives in one testable place.
-    if (pt == P::String && m == "Compare" && call.args.size() == 3 &&
-        call.args[0].value && call.args[1].value && call.args[2].value) {
-        llvm::Value* a = lowerExpr(*call.args[0].value);
-        llvm::Value* b = lowerExpr(*call.args[1].value);
-        llvm::Value* ic = lowerExpr(*call.args[2].value);
-        if (!a || !b || !ic) return nullptr;
-        llvm::Value* ic32 = ic->getType()->isIntegerTy(32)
-            ? ic : builder_.CreateZExt(ic, i32());
-        auto* fn = declareC("bz_string_compare", i32(),
-                            {ptrTy(), i64(), ptrTy(), i64(), i32()});
-        return builder_.CreateCall(
-            fn, {loadStringData(a), loadStringLen(a),
-                 loadStringData(b), loadStringLen(b), ic32}, "str.cmp.ci");
-    }
+    // fix #3853 (stdlib §9.6, v0.290; proposal 0123 R6): the static
+    // `string.Compare(a, b[, ignoreCase])` this arm used to lower was
+    // RETIRED — sema rejects the call outright (ExprTypecheck_Calls.cpp's
+    // static-methods closed set), so no well-typed call ever reaches codegen
+    // with `pt == String && m == "Compare"` any more. The replacement
+    // instance member `CompareTo(other[, ignoreCase])` lowers in
+    // tryLowerStringMethod (LlvmBackend_String.cpp), reusing the same
+    // `bz_string_compare` runtime helper the 3-arg form used here.
     // §9.6 (static): string.Repeat(c: char, count: int): string — a `count`-long
     // string of the single code point `c`. Width-1 byte mode (ASCII fast path).
     if (pt == P::String && m == "Repeat" && call.args.size() == 2 &&

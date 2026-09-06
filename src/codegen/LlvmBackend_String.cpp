@@ -1693,6 +1693,31 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
         return builder_.CreateTrunc(emitStringOrdCmp(self, other), i32(), "cmp.result");
     }
 
+    // fix #3853 (stdlib §9.6, v0.290; proposal 0123 R6): CompareTo(other,
+    // ignoreCase: bool): int — ordinal comparison, optionally ASCII
+    // case-folded. `other` is non-nullable (checkBuiltinStringCallArgs'
+    // §2315 gate covers this position for both CompareTo arities, so a
+    // well-typed call's `other` is guaranteed non-null here — the same
+    // premise the 1-arg arm above rests on for emitStringOrdCmp). Routed
+    // through the runtime helper `bz_string_compare` — the same one the
+    // retired static `Compare(a, b, ignoreCase)` used — so the case-folding
+    // logic lives in one testable place shared by both call shapes.
+    if (method == "CompareTo" && call.args.size() == 2 &&
+        call.args[0].value && call.args[1].value) {
+        llvm::Value* other = getStrArg(0);
+        if (!other) return nullptr;
+        llvm::Value* ic = lowerExpr(*call.args[1].value);
+        if (!ic) return nullptr;
+        llvm::Value* ic32 = ic->getType()->isIntegerTy(32)
+            ? ic : builder_.CreateZExt(ic, i32());
+        auto* fn = declareC("bz_string_compare", i32(),
+                            {ptrTy(), i64(), ptrTy(), i64(), i32()});
+        return builder_.CreateCall(
+            fn, {loadStringData(self), loadStringLen(self),
+                 loadStringData(other), loadStringLen(other), ic32},
+            "str.cmp.ci");
+    }
+
     // §9.6 / #535: StartsWith(prefix: string): bool — code-point comparison.
     // Delegates to bz_str_startswith which handles width 1/2/4 uniformly.
     if (method == "StartsWith") {

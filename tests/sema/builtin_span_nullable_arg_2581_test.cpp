@@ -20,6 +20,23 @@
 // the coarse rejects() helper, which cannot distinguish a genuine reject from a
 // runtime SIGSEGV synthesized as an Error). The positive cases guard against
 // false rejection of working code.
+//
+// fix #3853 (stdlib §9.6, v0.290; proposal 0123 R6): item (2)'s static
+// `string.Compare(a, b[, ignoreCase])` was RETIRED in favor of the instance
+// `CompareTo(other, ignoreCase)`. The cases below are migrated to the
+// instance spelling rather than deleted, because #2315's primitive-string
+// INSTANCE gate — the same gate items (1)/(3)/(4) exercise — already covers
+// CompareTo's non-nullable `other` parameter (it has since CompareTo's
+// single-arg form was added, fix #586), so this is the file's one seam that
+// changed shape rather than one that disappeared. One outcome DIFFERS from
+// the static original, and is called out at its test: `a` was a plain
+// ARGUMENT in the static form, symmetric with `b`, so an un-narrowed
+// nullable `a` drew the SAME "(§7)" argument diagnostic as `b`. In the
+// instance form `a` is the RECEIVER, not an argument, so an un-narrowed
+// nullable receiver is instead rejected by the general, pre-existing §7.4
+// "member access on a nullable value requires narrowing" gate — a different
+// mechanism, same outcome (a compile error), tested at
+// `instance_compareto_receiver_rejects_unnarrowed_nullable` below.
 
 #include "sema/ExprTypecheck.hpp"
 #include "sema/TypeResolution.hpp"
@@ -51,6 +68,13 @@ bool hasError(const bezel::test::SemaResult& r, const char* sub) {
 // shared by the user-method path and (after #2315/#2581) the builtin paths.
 constexpr const char* kNullableDiag =
     "is nullable but the target type is non-nullable";
+
+// fix #3853: the UNRELATED §7.4 "nullable receiver" diagnostic fragment — a
+// direct `.` member access on a nullable-typed RECEIVER (as opposed to a
+// nullable ARGUMENT, `kNullableDiag`'s concern). Distinct wording, distinct
+// gate; see the header comment for why `CompareTo`'s migrated receiver case
+// draws this one instead of `kNullableDiag`.
+constexpr const char* kNullableReceiverDiag = "requires narrowing it to non-null first";
 
 }  // namespace
 
@@ -121,39 +145,50 @@ BEZEL_TEST(sema_span_nullable_arg_2581,
     BEZEL_EXPECT_TRUE(hasError(r, "ReadOnlyStringSpan.Contains"));
 }
 
-// #2581 / stdlib §9.6: static `string.Compare(n, "x")` with an un-narrowed
-// `string?` first argument rejects. The callee target is the type name, which
-// #2315's instance-receiver VALUE gate does not reach.
+// fix #3853 (stdlib §9.6, v0.290): instance `n.CompareTo("x")` with an
+// un-narrowed `string?` RECEIVER rejects. This migrates the retired static
+// `string.Compare(n, "x")` case — but the original's `n` was the FIRST
+// ARGUMENT (symmetric with `"x"`), gated by #2315/#2581's argument check
+// (`kNullableDiag`, tagged "(§7)"); the instance form's `n` is the RECEIVER,
+// which is a different, pre-existing gate (§7.4's general nullable-receiver
+// narrowing, tagged "(§7.4)", `kNullableReceiverDiag`). Same outcome — a
+// compile error — different mechanism; see the file header.
 BEZEL_TEST(sema_span_nullable_arg_2581,
-           static_string_compare_rejects_unnarrowed_nullable) {
+           instance_compareto_receiver_rejects_unnarrowed_nullable) {
     auto r = parseSemaAll(
         "module M; "
         "class C "
         "  private static method N(): string? => null; "
         "  public static method T(): int "
-        "    return string.Compare(N(), \"x\"); "
+        "    var n := N(); "
+        "    return n.CompareTo(\"x\"); "  // n: string? — un-narrowed receiver
         "  end T; "
         "end C;");
-    BEZEL_EXPECT_TRUE(hasError(r, kNullableDiag));
-    BEZEL_EXPECT_TRUE(hasError(r, "string.Compare"));
-    BEZEL_EXPECT_TRUE(hasError(r, "(§7)"));
+    BEZEL_EXPECT_TRUE(hasError(r, kNullableReceiverDiag));
+    BEZEL_EXPECT_TRUE(hasError(r, "CompareTo"));
+    BEZEL_EXPECT_TRUE(hasError(r, "(§7.4)"));
 }
 
-// #2581 / stdlib §9.6: static `string.Compare("a", n)` rejects on the SECOND
-// argument too (both a/b are non-nullable); the 3-arg `ignoreCase` overload is
-// the same shape.
+// fix #3853 (stdlib §9.6, v0.290): instance `"a".CompareTo(n)` rejects on an
+// un-narrowed `string?` `other` ARGUMENT — the #2315/#2581 gate this file's
+// other cases exercise, unchanged from the retired static form's SECOND
+// argument (`b` in `string.Compare(a, b)`). The 2-arg `ignoreCase` overload
+// is the same shape, migrated from the retired static form's 3-arg
+// `ignoreCase` overload.
 BEZEL_TEST(sema_span_nullable_arg_2581,
-           static_string_compare_second_arg_and_3arg_reject) {
+           instance_compareto_argument_rejects_unnarrowed_nullable) {
     {
         auto r = parseSemaAll(
             "module M; "
             "class C "
             "  private static method N(): string? => null; "
             "  public static method T(): int "
-            "    return string.Compare(\"a\", N()); "
+            "    return \"a\".CompareTo(N()); "
             "  end T; "
             "end C;");
         BEZEL_EXPECT_TRUE(hasError(r, kNullableDiag));
+        BEZEL_EXPECT_TRUE(hasError(r, "string.CompareTo"));
+        BEZEL_EXPECT_TRUE(hasError(r, "(§7)"));
     }
     {
         auto r = parseSemaAll(
@@ -161,7 +196,7 @@ BEZEL_TEST(sema_span_nullable_arg_2581,
             "class C "
             "  private static method N(): string? => null; "
             "  public static method T(): int "
-            "    return string.Compare(N(), \"x\", true); "
+            "    return \"a\".CompareTo(N(), ignoreCase := true); "
             "  end T; "
             "end C;");
         BEZEL_EXPECT_TRUE(hasError(r, kNullableDiag));
@@ -263,19 +298,26 @@ BEZEL_TEST(sema_span_nullable_arg_2581,
     BEZEL_EXPECT_TRUE(!hasError(r, kNullableDiag));
 }
 
-// #2581 / stdlib §9.6: static `string.Compare` with plain `string` args, and a
-// NARROWED `string?`, compile unchanged.
+// fix #3853 (stdlib §9.6, v0.290): instance `CompareTo` with plain `string`
+// args, a NARROWED `string?` RECEIVER, and the 2-arg `ignoreCase` overload's
+// plain args all compile unchanged. Migrates the retired static
+// `string.Compare` case's two sub-cases (plain args; a narrowed `string?`
+// passed where the static form's `a` was an argument — here the analogous
+// narrowed value is the RECEIVER, per the shape change documented in the
+// file header) and adds a third for the new 2-arg overload, uncovered by any
+// static-form case.
 BEZEL_TEST(sema_span_nullable_arg_2581,
-           static_string_compare_accepts_plain_and_narrowed) {
+           instance_compareto_accepts_plain_and_narrowed_receiver) {
     {
         auto r = parseSemaAll(
             "module M; "
             "class C "
             "  public static method T(): int "
-            "    return string.Compare(\"a\", \"b\"); "
+            "    return \"a\".CompareTo(\"b\"); "
             "  end T; "
             "end C;");
         BEZEL_EXPECT_TRUE(!hasError(r, kNullableDiag));
+        BEZEL_EXPECT_TRUE(!hasError(r, kNullableReceiverDiag));
     }
     {
         auto r = parseSemaAll(
@@ -284,7 +326,18 @@ BEZEL_TEST(sema_span_nullable_arg_2581,
             "  public static method T(): int "
             "    var n: string? := \"a\"; "
             "    if n = null then return -1; end; "
-            "    return string.Compare(n, \"b\"); "
+            "    return n.CompareTo(\"b\"); "
+            "  end T; "
+            "end C;");
+        BEZEL_EXPECT_TRUE(!hasError(r, kNullableDiag));
+        BEZEL_EXPECT_TRUE(!hasError(r, kNullableReceiverDiag));
+    }
+    {
+        auto r = parseSemaAll(
+            "module M; "
+            "class C "
+            "  public static method T(): int "
+            "    return \"a\".CompareTo(\"b\", ignoreCase := true); "
             "  end T; "
             "end C;");
         BEZEL_EXPECT_TRUE(!hasError(r, kNullableDiag));

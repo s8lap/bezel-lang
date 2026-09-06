@@ -239,36 +239,69 @@ BEZEL_TEST(codegen_string_split_str_spec_9_6, multichar_delim_no_match_whole_str
 }
 
 // -------------------------------------------------------------------------
-// §9.6 (static) Compare(a, b): int and Compare(a, b, ignoreCase: bool): int —
+// §9.6 CompareTo(other): int and CompareTo(other, ignoreCase: bool): int —
 // ordinal comparison; ignoreCase folds ASCII case. Returns negative/0/positive.
+//
+// fix #3853 (stdlib §9.6, v0.290; proposal 0123 R6): migrated from the
+// retired static `string.Compare(a, b[, ignoreCase])` to the instance
+// `CompareTo`, keeping every assertion (same expected values) — see stdlib
+// §9.6's own worked example: "All comparison and equality methods in this
+// version are ordinal (code-point-based), including the ignoreCase
+// overloads".
 // -------------------------------------------------------------------------
 
-BEZEL_TEST(codegen_string_compare_spec_9_6, compare_equal) {
+BEZEL_TEST(codegen_string_compareto_spec_9_6, compare_equal) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
-        "  return string.Compare(\"abc\", \"abc\"); "
+        "  return \"abc\".CompareTo(\"abc\"); "
         "end Main; end C;"), 0);
 }
 
-BEZEL_TEST(codegen_string_compare_spec_9_6, compare_less) {
+BEZEL_TEST(codegen_string_compareto_spec_9_6, compare_less) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
-        "  return (if string.Compare(\"abc\", \"abd\") < 0 then 1 else 0); "
+        "  return (if \"abc\".CompareTo(\"abd\") < 0 then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
-BEZEL_TEST(codegen_string_compare_spec_9_6, ignorecase_equal_when_folded) {
+// fix #3853: the reverse order of `compare_less` — the three-way sign flips
+// (negative -> positive) for the swapped operands, same ordinal rule.
+BEZEL_TEST(codegen_string_compareto_spec_9_6, compare_greater) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
-        "  return string.Compare(\"ABC\", \"abc\", true); "
+        "  return (if \"abd\".CompareTo(\"abc\") > 0 then 1 else 0); "
+        "end Main; end C;"), 1);
+}
+
+BEZEL_TEST(codegen_string_compareto_spec_9_6, ignorecase_equal_when_folded) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  return \"ABC\".CompareTo(\"abc\", ignoreCase := true); "
         "end Main; end C;"), 0);
 }
 
-BEZEL_TEST(codegen_string_compare_spec_9_6, ordinal_uppercase_less_than_lowercase) {
+// fix #3853: the ignoreCase overload still orders on the FOLDED code points
+// when the letters genuinely differ (not merely case) — 'c' folds to 'c' and
+// precedes 'd', so folding does not collapse this to equal. Both orders.
+BEZEL_TEST(codegen_string_compareto_spec_9_6, ignorecase_less_when_folded) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  return (if \"ABC\".CompareTo(\"abd\", ignoreCase := true) < 0 then 1 else 0); "
+        "end Main; end C;"), 1);
+}
+
+BEZEL_TEST(codegen_string_compareto_spec_9_6, ignorecase_greater_when_folded) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  return (if \"abd\".CompareTo(\"ABC\", ignoreCase := true) > 0 then 1 else 0); "
+        "end Main; end C;"), 1);
+}
+
+BEZEL_TEST(codegen_string_compareto_spec_9_6, ordinal_uppercase_less_than_lowercase) {
     // Ordinal (ignoreCase=false): 'A' (65) < 'a' (97), so "ABC" < "abc".
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
-        "  return (if string.Compare(\"ABC\", \"abc\", false) < 0 then 1 else 0); "
+        "  return (if \"ABC\".CompareTo(\"abc\", ignoreCase := false) < 0 then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
