@@ -33944,8 +33944,20 @@ void Emitter::setupBoxDescriptors() {
             if (auto* ts = dynamic_cast<const sema::TypeSymbol*>(sym))
                 boxCandidates.push_back(ts);
     for (const sema::TypeSymbol* ts : boxCandidates) {
+        // fix #3900 (§35.8, v0.294): a CHOICE joins Record/Enum here so a
+        // value-like or borrow-bearing choice gets the same descriptor +
+        // box vtable machinery (Pass A-D below are already kind-agnostic —
+        // §35.2 "admits of a choice body exactly what an enum body admits",
+        // so the interface-itable construction that already serves Enum
+        // needs no new code to also serve Choice). Building this for a
+        // GENERIC choice too is harmless (never reached, since
+        // `isBoxableValueType` declines a generic choice — see its #3900
+        // comment); reusing the identical unconditional-build shape records
+        // already get for generic records keeps one code path instead of a
+        // second, choice-specific gate here.
         if (ts->kind != ast::TypeDeclKind::Record &&
-            ts->kind != ast::TypeDeclKind::Enum)
+            ts->kind != ast::TypeDeclKind::Enum &&
+            ts->kind != ast::TypeDeclKind::Choice)
             continue;
         if (descArray_.count(ts)) continue;  // never overwrite a class/iface
         std::vector<const sema::TypeSymbol*> supers;
@@ -34380,8 +34392,37 @@ void Emitter::setupBoxDescriptors() {
         // records and enums so an Object-typed receiver gets value-semantics
         // equality (§9.1: field-by-field for records; underlying-integer for
         // enums) rather than reference identity (§8.3 default).
-        elems[kEqualsSlot]      = boxRecordEqualsThunk(ts);
-        elems[kGetHashCodeSlot] = boxRecordHashThunk(ts);
+        //
+        // fix #3900 (§35.7/§35.8, v0.294): a CHOICE's structural `=`/
+        // `GetHashCode` is defined ONLY for an auto-hashable (value-like,
+        // every payload admissible) choice — §35.7: "a homogeneous `=`/`<>`
+        // overload disqualifies the choice … and [§25.2]'s co-declaration
+        // rule then supplies the equality surface" and, separately, "[a]
+        // choice that is not auto-hashable — any borrow-bearing or owning
+        // choice … draws [§9.2]'s use-site compile error on `=`, `<>`, and
+        // direct `Equals`/`GetHashCode` calls". So an auto-hashable choice
+        // and a choice "declaring user equality" are mutually exclusive
+        // (never both), and the direct-call surface for a choice that is
+        // neither is a compile ERROR — a case the boxed dynamic-dispatch
+        // path cannot reject at compile time the same way (the static
+        // receiver type is `Object`/an interface). Route it to the ordinary
+        // §8.3 Object default (reference/box identity) instead of guessing
+        // at a structural comparison the direct-call surface itself never
+        // allows: sound, never crashes, matches what any other type with no
+        // Equals/GetHashCode override already gets at this slot. Calling a
+        // user-declared homogeneous `Equals(T)`/`GetHashCode` pair from the
+        // BOXED path (the "declares user equality" rescue) is a narrower,
+        // separate gap left declined here — filed as a follow-up.
+        bool choiceNeedsDefaultEquals =
+            ts->kind == ast::TypeDeclKind::Choice &&
+            !sema::isAutoEqualityBearingChoice(ts, ctx_);
+        if (choiceNeedsDefaultEquals) {
+            elems[kEqualsSlot]      = boxDefaultEqualsThunk();
+            elems[kGetHashCodeSlot] = boxDefaultHashCodeThunk();
+        } else {
+            elems[kEqualsSlot]      = boxRecordEqualsThunk(ts);
+            elems[kGetHashCodeSlot] = boxRecordHashThunk(ts);
+        }
         auto* arrTy = llvm::ArrayType::get(ptrTy(), elems.size());
         // fix #2797 (§2.8.3 rule 4, v0.240): for a record/enum LOCAL to this
         // module that is PUBLIC and NON-GENERIC, promote the box vtable to
@@ -35108,6 +35149,18 @@ llvm::Function* Emitter::boxRecordEqualsThunkCore(const sema::TypeSymbol* ts,
             llvm::Value* sv = builder_.CreateLoad(st, selfPayload,  "beq.sv");
             llvm::Value* ov = builder_.CreateLoad(st, otherPayload, "beq.ov");
             eq = emitStructEquality(sv, ov, st, ts);
+        } else if (ts->kind == ast::TypeDeclKind::Choice) {
+            // fix #3900 (§35.7/§35.8, v0.294): structural tag+active-payload
+            // equality for a boxed choice. The caller (setupBoxDescriptors)
+            // only routes an auto-hashable choice's Equals slot to THIS
+            // thunk — a non-auto-hashable choice's slot is
+            // `boxDefaultEqualsThunk()` instead (see that call site's
+            // comment) — so `emitChoiceEquality` is always applied to a
+            // choice for which §35.7 actually defines `=`.
+            llvm::StructType* st = choiceStruct(ts);
+            llvm::Value* sv = builder_.CreateLoad(st, selfPayload,  "beq.sv");
+            llvm::Value* ov = builder_.CreateLoad(st, otherPayload, "beq.ov");
+            eq = emitChoiceEquality(sv, ov, ts);
         } else {
             // per §10.5 (v0.183): a user `Equals(E)` replaces the §8.3 default
             // (underlying-integer comparison) for boxed dispatch.
@@ -35191,6 +35244,14 @@ llvm::Function* Emitter::boxRecordHashThunkCore(const sema::TypeSymbol* ts,
             llvm::StructType* st = recordStruct(ts);
             llvm::Value* rv = builder_.CreateLoad(st, payload, "bhash.rv");
             h = emitRecordHashCode(rv, ts);
+        } else if (ts->kind == ast::TypeDeclKind::Choice) {
+            // fix #3900 (§35.7/§35.8, v0.294): tag + active-payload hash for
+            // a boxed choice — see boxRecordEqualsThunkCore's Choice branch
+            // for why this is unconditionally the auto-hashable form (the
+            // caller diverts a non-auto-hashable choice's slot elsewhere).
+            llvm::StructType* st = choiceStruct(ts);
+            llvm::Value* cv = builder_.CreateLoad(st, payload, "bhash.cv");
+            h = emitChoiceHashCode(cv, ts);
         } else {
             // per §10.5 (v0.183): a user `GetHashCode(): int` replaces the §8.3
             // default (hash of the underlying integer) for boxed dispatch.
@@ -35722,6 +35783,59 @@ llvm::Constant* Emitter::boxToStringThunk(const sema::TypeSymbol* ts) {
             llvm::Value* enumVal = builder_.CreateLoad(
                 enumLlvmType(ts), payload, "box.enumval");
             result = emitEnumToString(enumVal, ts);
+        } else if (ts->kind == ast::TypeDeclKind::Choice) {
+            // fix #3900 (§35.7/§35.8/§8.5, v0.294): payload is the choice
+            // struct (tag + active-case payload) two words into the box,
+            // mirroring the record layout. §35.7: "Methods … other than a
+            // homogeneous `=`/`<>` neither qualify nor disqualify" a choice
+            // from auto-hashable, so a `ToString()` override is independent
+            // of eligibility and must be preferred first, exactly as for a
+            // record — reuse the SAME scan, not a choice-specific copy.
+            llvm::Value* boxPtr = thunk->getArg(0);
+            llvm::Value* payload = builder_.CreateGEP(
+                ptrTy(), boxPtr, {builder_.getInt32(2)}, "box.valptr");
+            sema::MethodSymbol* userToStr = nullptr;
+            for (sema::Symbol* sym : ts->members) {
+                auto* ms = dynamic_cast<sema::MethodSymbol*>(sym);
+                if (ms && !isStaticMethod(ms) && ms->name == "ToString" &&
+                    ms->params.empty()) { userToStr = ms; break; }
+            }
+            if (userToStr) {
+                auto fit = methodFns_.find(userToStr);
+                if (fit != methodFns_.end())
+                    result = builder_.CreateCall(fit->second->getFunctionType(),
+                                                 fit->second, {payload});
+            }
+            if (!result) {
+                if (sema::isAutoEqualityBearingChoice(ts, ctx_)) {
+                    // §35.7's synthesized form: "TypeName.CaseName(field1:
+                    // value1, …)" / "TypeName.CaseName" for a payload-free
+                    // case — emitChoiceToString, the same renderer the
+                    // unboxed `.ToString()` path (LlvmBackend_Calls2.cpp's
+                    // lowerValueSemMethodOn Choice branch) uses.
+                    llvm::StructType* st = choiceStruct(ts);
+                    llvm::Value* chVal =
+                        builder_.CreateLoad(st, payload, "cho");
+                    result = emitChoiceToString(chVal, ts);
+                } else {
+                    // #2479 (§35.7, tracked as a genuine spec gap): a choice
+                    // that is neither auto-hashable nor user-ToString-
+                    // overridden (borrow-bearing, owning — unreachable here,
+                    // §8.6 excludes it from boxing — or value-like with an
+                    // inadmissible payload) has no §35.7-defined ToString.
+                    // The unboxed direct-call surface reports a compile
+                    // ERROR for this case (§9.2's use-site rule); the boxed
+                    // dynamic-dispatch surface cannot reject at compile
+                    // time (the static receiver type is Object/an
+                    // interface), so fall back to the same sound default
+                    // §8.5 already gives a non-auto-hashable BODY RECORD
+                    // (spec85NameOnlyDefaultIsQualified's qualified-name
+                    // default) rather than inventing a choice-specific one.
+                    result = lowerStringLiteral(
+                        std::string("\"") + spec85QualifiedTypeName(ts) + "\"",
+                        false);
+                }
+            }
         } else {
             // Record: payload is the bare record struct two words into the box.
             llvm::Value* boxPtr = thunk->getArg(0);
@@ -37177,8 +37291,43 @@ bool Emitter::isBoxableValueType(const sema::TypeRef* rt) {
         // before the Named branch's Record/Enum gate. Gated through the
         // shared `rangeBoxable` predicate (the #2793 lesson).
         if (rangeBoxable(rt)) return true;
-        return rt->declaration->kind == ast::TypeDeclKind::Record ||
-               rt->declaration->kind == ast::TypeDeclKind::Enum;
+        if (rt->declaration->kind == ast::TypeDeclKind::Record ||
+            rt->declaration->kind == ast::TypeDeclKind::Enum)
+            return true;
+        // fix #3900 (§35.8 "Boxing and interfaces", v0.294): "Value-like
+        // choices box per the general rule; the box is runtime-managed. …
+        // Borrow-bearing choices box under §8.6's borrow-bearing-record
+        // rules verbatim". An OWNING-classified choice is excluded here —
+        // but not by re-deriving the classification (CLAUDE.md §6: don't
+        // duplicate a predicate an existing authority already computes):
+        // §8.6's move-only rule ("boxing copies, move-only forbids
+        // copying") is already enforced at every conversion site by
+        // `ExprTC::checkAssignable` via `common::isMoveOnlyValueType`
+        // (fix #2912/#3775), which recognizes an owning-classified choice
+        // and rejects the assignment/argument/return before codegen ever
+        // sees it reach a box call — confirmed on this tree: `var o:
+        // Object := <owning-choice-value>;` is a compile error citing
+        // exactly this rule. So by construction, a Choice TypeRef that
+        // reaches THIS predicate is never owning-classified.
+        //
+        // Restricted to a NON-GENERIC choice declaration. A generic
+        // choice's box vtable (Equals/GetHashCode/ToString thunks, below)
+        // is built ONCE, with no active generic substitution, so it sees
+        // only the TEMPLATE-erased struct layout — correct for records only
+        // because #2176's `specializedBoxVtableFor` mints a per-
+        // instantiation vtable over the concrete layout instead (record-
+        // only gate, `ts->kind != ast::TypeDeclKind::Record`). No such
+        // per-instantiation choice vtable exists yet, so admitting a
+        // generic choice here would silently compare/hash/render a boxed
+        // `Result<string, E>` through the erased (narrower) template
+        // layout — an out-of-bounds read, not merely a wrong answer. Left
+        // declined (the pre-existing #2434 "failed to lower" fallback,
+        // unchanged for this case) and filed as a follow-up mirroring
+        // #2176 for choices.
+        if (rt->declaration->kind == ast::TypeDeclKind::Choice &&
+            rt->declaration->genericParams.empty())
+            return true;
+        return false;
     }
     // §4.16 / §8.6 (#970): span value structs box into IReadOnlySpan<T>.
     if (isSpanLikeTypeName(rt)) return true;

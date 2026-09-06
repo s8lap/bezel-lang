@@ -3057,12 +3057,14 @@ llvm::Value* Emitter::lowerValueSemMethodOn(const sema::TypeRef* recvTy,
         // value-shape handling); anything else (`Object`, an interface, a
         // class, `ts?`) can dynamically BE a boxed `ts` and routes through
         // the same run-time `lowerValueSemUniversalEquals` the record/enum
-        // arms use. NOTE: `isBoxableValueType` does not yet cover Choice
-        // (§35.8 "Value-like choices box per the general rule" is not wired
-        // into it), so that run-time path currently declines for choice
-        // receivers rather than dispatching — a pre-existing gap, not a
-        // regression from this fix (the declined outcome is strictly safer
-        // than the wild pointer read it replaces); filed separately as #3900.
+        // arms use. UPDATE (fix #3900, §35.8): `isBoxableValueType` now
+        // admits a NON-GENERIC Choice, so this run-time path dispatches
+        // correctly for a non-generic choice receiver — the pre-existing gap
+        // this note used to describe is closed for that case. A GENERIC
+        // choice receiver (`Result<T, E>` et al.) still declines here (no
+        // per-instantiation box vtable exists yet — the erased template
+        // layout would be unsound to compare/hash through); filed
+        // separately as #3905.
         const ast::Expr& argE = *call.args[0].value;
         const sema::TypeRef* at = ctx_.exprType(argE);
         if (equalsArgSettlesFalse(at, ts)) {
