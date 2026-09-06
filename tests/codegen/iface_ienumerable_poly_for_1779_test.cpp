@@ -29,6 +29,7 @@
 // SPECIFIC phrase ("#1779", "polymorphic") in addition to asserting that
 // the compilation is rejected.
 
+#include "support/aot_result_asserts.hpp"   // fix #3895: diagnosticMessageContains
 #include "support/aot_support.hpp"
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
@@ -91,18 +92,15 @@ BEZEL_TEST(iface_ienumerable_poly_for_1779, polymorphic_source_rejected_with_spe
     // type we pass (CollA or CollB); either makes the implementer set
     // polymorphic (two distinct GetEnumerators), and either is the same
     // diagnostic from the perspective of the for-in lowering.
-    BEZEL_EXPECT_FALSE(r.ran);
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    // The pre-fix generic NYI text would be: "not yet implemented: codegen
-    // for this for statement" — without our diagnostic, hasErrors() would
-    // still be true. The new diagnostic must mention the issue (#1779) and
-    // the polymorphism reason ("polymorphic"). Match both phrases.
-    std::string all;
-    for (const auto& d : r.diagnostics.diagnostics()) all += d.message + "\n";
-    bool mentionsIssue = all.find("#1779") != std::string::npos;
-    bool mentionsPoly = all.find("polymorphic") != std::string::npos;
-    BEZEL_EXPECT_TRUE(mentionsIssue);
-    BEZEL_EXPECT_TRUE(mentionsPoly);
+    //
+    // fix #3895 (issue #3892): the pre-fix generic NYI text would be: "not
+    // yet implemented: codegen for this for statement" — without our
+    // diagnostic, a bare `hasErrors()`/`!ran` pair (which also cannot
+    // distinguish a runtime crash/signal) would still be true. The new
+    // diagnostic must mention the issue (#1779) and the polymorphism reason
+    // ("polymorphic"); pin both, which subsumes the reject claim.
+    BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(r, "#1779"));
+    BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(r, "polymorphic"));
 }
 
 // #1779: the specific diagnostic is emitted REGARDLESS of which implementer
@@ -122,12 +120,9 @@ BEZEL_TEST(iface_ienumerable_poly_for_1779, polymorphic_source_diag_independent_
         "    using var b := new CollB(1, 3); "  // different implementer than above
         "    return C.Sum(b); "
         "  end Main; end C;");
-    BEZEL_EXPECT_FALSE(r.ran);
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    std::string all;
-    for (const auto& d : r.diagnostics.diagnostics()) all += d.message + "\n";
-    bool mentionsIssue = all.find("#1779") != std::string::npos;
-    BEZEL_EXPECT_TRUE(mentionsIssue);
+    // fix #3895 (issue #3892): see polymorphic_source_rejected_with_specific_diag
+    // above — pinning the specific #1779 text subsumes the reject claim.
+    BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(r, "#1779"));
 }
 
 // #1779 regression guard: when the implementers SHARE a GetEnumerator (a

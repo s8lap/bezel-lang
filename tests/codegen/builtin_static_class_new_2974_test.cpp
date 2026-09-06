@@ -50,6 +50,7 @@
 // FALSE-REJECT COST: see the anti-over-reject block at the bottom, and the
 // commit message for the corpus numbers.
 
+#include "support/aot_result_asserts.hpp"   // fix #3895: diagnosticMessageContains
 #include "support/aot_support.hpp"   // runAot — AOT test harness
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
@@ -101,7 +102,11 @@ BEZEL_TEST(builtin_static_class_new_2974,
     // #2974's LSan measurement was of a binary that should never have been
     // produced. The oracle here is that no binary runs at all.
     auto r = runAot(newLocal("new Domain(\"d\")"));
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    // fix #3895 (issue #3892): pin the SAME specific rejection text the two
+    // rows above assert, not a bare `hasErrors()` (which cannot distinguish
+    // this rejection from a runtime crash/signal).
+    BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(
+        r, "`new Domain(\xE2\x80\xA6)` produced no value"));
     BEZEL_EXPECT_TRUE(r.stdoutText.find("constructed") == std::string::npos);
 }
 
@@ -233,7 +238,10 @@ BEZEL_TEST(builtin_static_class_new_2974,
         "end Main; end C;";
     BEZEL_EXPECT_TRUE(hasError(program, "is not admitted at any argument list"));
     auto r = runAot(program);
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    // fix #3895 (issue #3892): pin the SAME text `hasError` above already
+    // established for this program, not a bare `hasErrors()`.
+    BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(
+        r, "is not admitted at any argument list"));
     BEZEL_EXPECT_TRUE(r.stdoutText.find("00000000") == std::string::npos);
 }
 
@@ -252,7 +260,12 @@ BEZEL_TEST(builtin_static_class_new_2974,
     for (const char* ctor : {"new IntPtr()", "new ExceptionInfo()",
                              "new ReadOnlyStringSpan()"}) {
         auto r = runAot(newLocal(ctor));
-        BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+        // fix #3895 (issue #3892): pin the SAME per-arm text the two checks
+        // below already establish, not a bare `hasErrors()`.
+        const char* expectSub = std::string(ctor) == "new IntPtr()"
+            ? "is not admitted at any argument list"
+            : "is not a declared constructor of";
+        BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(r, expectSub));
         BEZEL_EXPECT_TRUE(r.stdoutText.find("constructed") ==
                           std::string::npos);
     }

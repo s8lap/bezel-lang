@@ -21,11 +21,13 @@
 //   (d) constraint method result used in arithmetic.
 //   (e) two type params each constrained.
 
+#include "support/aot_result_asserts.hpp"   // fix #3895: failedAtCompileTimeWithRealLocation
 #include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
 using bezel::test::runAot;
+using bezel::test::failedAtCompileTimeWithRealLocation;
 
 namespace {
 int run(const std::string& prog) {
@@ -231,8 +233,10 @@ BEZEL_TEST(generic_constraint_dispatch_484, method_constraint_non_conforming_rej
         "    return DoIt<NotIFoo>(b); "
         "  end Main; "
         "end C;");
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_FALSE(r.ran);
+    // fix #3895 (issue #3892): distinguishes a genuine §14.2 rejection from a
+    // runtime crash/signal (this test's own history is a converted SIGSEGV —
+    // a bare `hasErrors()`/`!ran` pair would also pass if it regressed back).
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
 }
 
 // #729: a CONFORMING type arg compiles and runs.
@@ -368,8 +372,9 @@ BEZEL_TEST(generic_constraint_dispatch_484, dispose_on_unconstrained_rejected_12
         "class C public static method Main(): int "
         "  return F.Take<int>(5); "
         "end Main; end C;");
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_FALSE(r.ran);
+    // fix #3895 (issue #3892): distinguishes a genuine §14.2 rejection from a
+    // runtime crash/signal, which a bare `hasErrors()`/`!ran` pair cannot.
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
 }
 
 // #1293 (negative): a VALUE-constrained type param has no Dispose — rejected.
@@ -384,6 +389,7 @@ BEZEL_TEST(generic_constraint_dispatch_484, dispose_on_value_constrained_rejecte
         "class C public static method Main(): int "
         "  return F.Take<int>(5); "
         "end Main; end C;");
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_FALSE(r.ran);
+    // fix #3895 (issue #3892): distinguishes a genuine §14.2 rejection from a
+    // runtime crash/signal, which a bare `hasErrors()`/`!ran` pair cannot.
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
 }

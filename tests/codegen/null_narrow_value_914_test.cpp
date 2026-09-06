@@ -16,11 +16,13 @@
 
 #include <string>
 
+#include "support/aot_result_asserts.hpp"   // fix #3895: failedAtCompileTimeWithRealLocation
 #include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration, P1)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
 using bezel::test::runAot;
+using bezel::test::failedAtCompileTimeWithRealLocation;
 
 namespace {
 
@@ -203,7 +205,9 @@ BEZEL_TEST(null_narrow_value_914, enum_genuinely_nullable_rejected) {
         "class C public static method Main(): int "
         "  var c: Color? := null; var v: Color := c; return int(v); "
         "end Main; end C;");
-    BEZEL_EXPECT_FALSE(r.ran);  // clean compile reject
+    // fix #3895 (issue #3892): distinguishes a genuine rejection from a
+    // runtime crash/signal, which a bare `!ran` cannot.
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
 }
 
 // §28 / §7.4 (#1056): a narrowed class/interface REFERENCE nullable assigns to a
@@ -229,7 +233,9 @@ BEZEL_TEST(null_narrow_value_914, reference_genuinely_nullable_rejected_1056) {
         "class C public static method Main(): int "
         "  var b: Box? := null; using var x: Box := move b; return x.V; "
         "end Main; end C;");
-    BEZEL_EXPECT_FALSE(r.ran);  // clean compile reject
+    // fix #3895 (issue #3892): distinguishes a genuine rejection from a
+    // runtime crash/signal, which a bare `!ran` cannot.
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
 }
 
 // §7.4 / §27.6 (#1191): the narrowing acceptance must also apply in CALL-ARGUMENT
@@ -296,7 +302,9 @@ BEZEL_TEST(null_narrow_value_914, genuinely_nullable_call_argument_rejected_1191
         "  end Pick; "
         "  public static method Main(): int => Pick(true, \"hi\"); "
         "end C;");
-    BEZEL_EXPECT_FALSE(r.ran);  // clean compile reject
+    // fix #3895 (issue #3892): distinguishes a genuine rejection from a
+    // runtime crash/signal, which a bare `!ran` cannot.
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
 }
 
 // CONTROL: a type-mismatched argument (int → string parameter) is STILL rejected
@@ -308,5 +316,7 @@ BEZEL_TEST(null_narrow_value_914, type_mismatch_call_argument_rejected_1191) {
         "  public static method Greet(u: string): int => u.Length; "
         "  public static method Main(): int => Greet(5); "
         "end C;");
-    BEZEL_EXPECT_FALSE(r.ran);  // clean compile reject
+    // fix #3895 (issue #3892): distinguishes a genuine rejection from a
+    // runtime crash/signal, which a bare `!ran` cannot.
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
 }

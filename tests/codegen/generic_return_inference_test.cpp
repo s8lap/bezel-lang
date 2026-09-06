@@ -25,11 +25,13 @@
 // time (`new T()` constructed nothing); the constructor-observing asserts are
 // the load-bearing regression check that the right T is now chosen.
 
+#include "support/aot_result_asserts.hpp"   // fix #3895: failedAtCompileTimeWithRealLocation
 #include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration, P1)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
 using bezel::test::runAot;
+using bezel::test::failedAtCompileTimeWithRealLocation;
 
 namespace {
 const char* kFactory =
@@ -109,8 +111,10 @@ BEZEL_TEST(generic_return_inference_391, no_target_is_rejected) {
         "  return 0; "
         "end Main; end C;";
     auto r = runAot(prog);
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_FALSE(r.ran);
+    // fix #3895 (issue #3892): distinguishes a genuine §15.4/§17.7 rejection
+    // from a runtime crash/signal, which a bare `hasErrors()`/`!ran` pair
+    // cannot.
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
 }
 
 // guard: an argument-inferred generic method (T bound by `proto: T`) still
@@ -206,6 +210,8 @@ BEZEL_TEST(generic_return_inference_391, no_explicit_args_still_rejected_747) {
         "    return 0; "
         "  end Main; "
         "end C;");
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_FALSE(r.ran);
+    // fix #3895 (issue #3892): distinguishes a genuine §15.4/§17.7 rejection
+    // from a runtime crash/signal, which a bare `hasErrors()`/`!ran` pair
+    // cannot.
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
 }

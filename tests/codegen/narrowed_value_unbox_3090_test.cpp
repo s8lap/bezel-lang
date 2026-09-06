@@ -83,6 +83,7 @@
 
 #include <string>
 
+#include "support/aot_result_asserts.hpp"   // fix #3895: failedAtCompileTimeWithRealLocation
 #include "support/aot_support.hpp"
 #include "test_harness.hpp"
 
@@ -90,6 +91,7 @@ using bezel::test::JitResult;
 using bezel::test::runAot;
 using bezel::test::runAotChecked;
 using bezel::test::runAotOut;
+using bezel::test::failedAtCompileTimeWithRealLocation;
 
 namespace {
 
@@ -903,22 +905,25 @@ BEZEL_TEST(codegen_narrowed_value_unbox_3090,
 // released at `o`'s scope end, and the loop leaks 32 B / iter. Pins that
 // the relaxed arm really is conditional on the §12.7 narrowing, not a
 // blanket "value-typed binding from Object is safe".
+//
+// ⚠ fix #3895 (issue #3892) FINDING: this row's comment describes a leak
+// (32 B / iter, LSan-flagged) pinned with a bare `!ran` claim,
+// which cannot tell that apart from ANY other `!ran` outcome. Measured
+// directly (`bezelc --sanitize=address` on this EXACT program): the box-
+// escape/leak path this row means to exercise is UNREACHABLE — `var o:
+// Object := [1, 2, 3];` is itself rejected by §15.4 ("a collection literal
+// `[...]` cannot target the type `Object`"), a restriction that postdates
+// this test (fix #3090) and was never noticed here because a bare `!ran`
+// cannot distinguish "leaked as described" from "rejected before the box
+// this row is about was ever created". Filed as issue 3904 (this control's
+// program needs re-deriving — e.g. box a `[3]int` local into `Object`
+// rather than target a collection literal directly at `Object` — to
+// actually reach the scenario the row's own comment describes). Pinning the
+// ACTUAL current behavior here (rather than reverting to the disproven bare
+// `!ran`) so this row still catches an actual regression without asserting
+// something the compiler does not do.
 BEZEL_TEST(codegen_narrowed_value_unbox_3090,
            unnarrowed_object_to_inline_array_copy_still_leaks_as_expected) {
-    // Without the `if o is [3]int then` guard there is no §12.7 narrowing,
-    // so `ctx.exprType(o)` stays `Object` and the BoxEscapeWalker's new
-    // relaxation does NOT fire. The copy-out here actually copies the box
-    // pointer as an `[3 x i32]` aggregate (silent corruption; the source's
-    // bytes-as-int are not the box's payload bytes — a different defect
-    // that this test does not assert). The LEak is what we pin: it must
-    // match the pre-fix per-iteration cost, confirming the relaxation is
-    // gated.
-    //
-    // We allow `r.ran` to be false (the leak fails LSan) — the test still
-    // proves the gating: without the narrowing the release is suppressed.
-    // If a future change ever turned this shape into a safe release too,
-    // this test would silently go green; replace with a counter-based
-    // check at that point (file a follow-up rather than letting it pass).
     JitResult r = runAotChecked(
         "module M; class C "
         "  public static method Main(): int "
@@ -932,11 +937,11 @@ BEZEL_TEST(codegen_narrowed_value_unbox_3090,
         "  end Main; "
         "end C;");
     if (wasSkipped(r)) return;
-    // The narrowing relaxation does not fire (no `is` at this point), so
-    // the §28.9 release is suppressed and LSan flags the leak. Whether the
-    // test passes (`r.ran == false`) is the assertion: a future regression
-    // that accidentally widened the relaxation would let this go green.
-    BEZEL_EXPECT_FALSE(r.ran);
+    // fix #3895 (issue #3892): pins the ACTUAL current rejection (see the
+    // ⚠ finding above, issue 3904) — a genuine §15.4 compile-time reject
+    // with a real source location, not a runtime crash/signal, which a bare
+    // `!ran` cannot distinguish.
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
 }
 
 // CONTROL: a PARAMETER of type `Object` narrowed by an `is [3]int` then

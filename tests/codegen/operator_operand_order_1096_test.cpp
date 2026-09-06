@@ -9,11 +9,13 @@
 //
 // runJit returns the FULL int from Main() (not 8-bit wrapped); values ≤ 255.
 
+#include "support/aot_result_asserts.hpp"   // fix #3895: failedAtCompileTimeWithRealLocation
 #include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration, P1)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
 using bezel::test::runAot;
+using bezel::test::failedAtCompileTimeWithRealLocation;
 
 namespace {
 int run(const std::string& prog) {
@@ -40,8 +42,9 @@ BEZEL_TEST(operator_operand_order_1096, reversed_operands_rejected_not_crash) {
         "  var r := 4 * v; "                              // (int, Vec) ≠ (Vec, int)
         "  return r.X; "
         "end Main; end Mn;");
-    BEZEL_EXPECT_FALSE(r.ran);
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    // fix #3895 (issue #3892): the row's own name says "not crash" — a bare
+    // `!ran`/`hasErrors()` pair is exactly what would pass if it DID.
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
 }
 
 // The correctly-ordered use compiles and computes.
@@ -74,8 +77,9 @@ BEZEL_TEST(operator_operand_order_1096, undeclared_operator_rejected) {
         "  var r := v - new Vec(1, 1); "                  // no operator -
         "  return r.X; "
         "end Main; end Mn;");
-    BEZEL_EXPECT_FALSE(r.ran);
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    // fix #3895 (issue #3892): the row's own name says "not crash" — a bare
+    // `!ran`/`hasErrors()` pair is exactly what would pass if it DID.
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
 }
 
 // Regression guard: built-in arithmetic on primitives (and string `+`) is
@@ -134,8 +138,9 @@ BEZEL_TEST(operator_operand_order_1096, nullable_user_operator_rejected_not_cras
         "  var c := a + a; "                               // Vec? + Vec? — deferred
         "  return 0; "
         "end Main; end Mn;");
-    BEZEL_EXPECT_FALSE(r.ran);
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    // fix #3895 (issue #3892): the row's own name says "not crash" — a bare
+    // `!ran`/`hasErrors()` pair is exactly what would pass if it DID.
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
 }
 
 // Unwrapping the nullable operands with `!` resolves to the non-nullable

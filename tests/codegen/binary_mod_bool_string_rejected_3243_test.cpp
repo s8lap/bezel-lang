@@ -101,7 +101,10 @@ BEZEL_TEST(binary_mod_bool_string_rejected_3243,
         "  var b: bool := true; "
         "  return int(b mod 2); "
         "end Main; end C;");
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    // fix #3895 (issue #3892): the bare `hasErrors()` claim below was
+    // redundant with (and less precise than) this message-content check —
+    // removed rather than kept alongside an ambiguous claim a runtime
+    // crash/signal could also satisfy.
     BEZEL_EXPECT_TRUE(diagnosticsMentionAll(r.diagnostics,
         {"`mod` is not valid on `bool`", "`and`/`or`/`not`", "§6.1"}));
 }
@@ -113,7 +116,9 @@ BEZEL_TEST(binary_mod_bool_string_rejected_3243,
         "  var s: string := \"abc\"; "
         "  return int(s mod 2); "
         "end Main; end C;");
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    // fix #3895 (issue #3892): see bool_mod_int_diagnostic_mentions_and_or_not
+    // above — the bare `hasErrors()` claim was redundant with this stronger
+    // message-content check.
     BEZEL_EXPECT_TRUE(diagnosticsMentionAll(r.diagnostics,
         {"`mod` is not valid on `string`", "§6.1"}));
 }

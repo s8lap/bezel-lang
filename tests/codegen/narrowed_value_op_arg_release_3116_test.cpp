@@ -79,12 +79,14 @@
 
 #include <string>
 
+#include "support/aot_result_asserts.hpp"   // fix #3895: diagnosticMessageContains
 #include "support/aot_support.hpp"
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
 using bezel::test::runAot;
 using bezel::test::runAotChecked;
+using bezel::test::diagnosticMessageContains;
 
 namespace {
 
@@ -216,16 +218,29 @@ BEZEL_TEST(codegen_narrowed_value_op_arg_release_3116,
 // `Object`, the `isNarrowedRead` predicate declines, and the conservative
 // escape classification keeps the wrapper's scope-end release suppressed.
 // Pins that the new widening is gated on the narrowing — not a blanket
-// "binary op on an Object is safe". We allow r.ran to be false (the leak
-// fails LSan); the test passes iff the gating still works.
-// =====================================================================
+// "binary op on an Object is safe".
+//
+// ⚠ fix #3895 (issue #3892) FINDING: this row's own comment claims the
+// program leaks (480 B / 20 iters, LSan-flagged) and was pinned with a bare
+// a bare `!ran` claim (the shape issue #3892 is about), which cannot tell that apart from ANY other
+// `!ran` outcome. Measured directly (`bezelc --sanitize=address` on this
+// EXACT program, and separately via a live gtest run with the honest
+// assertion below): the program does NOT reach the box-escape/leak path at
+// all — sema admits `o + 1` for `o: Object` with no matching `operator +`,
+// and codegen emits `%_ = add ptr %o, i32 1` (an int literal added to a
+// pointer), which fails LLVM's IR verifier before the program ever runs.
+// This row has therefore never exercised what it claims to since it was
+// written — it passed only because a bare `!ran` cannot distinguish "leaked
+// as the comment describes" from "rejected earlier for an unrelated
+// reason". Filed as issue 3903 (sema should reject `Object + int` with a
+// clean §5/§6 diagnostic, the way operator_operand_order_1096_test.cpp's
+// family does for undeclared record operators, instead of reaching codegen
+// with mismatched LLVM types). Pinning the ACTUAL current behavior here
+// (rather than reverting to the disproven bare `!ran`) so this row still
+// catches an actual regression (e.g. a crash) without asserting something
+// the compiler does not do.
 BEZEL_TEST(codegen_narrowed_value_op_arg_release_3116,
            unnarrowed_object_binary_op_still_leaks_as_expected) {
-    // No `if o is int then` guard, so `ctx.exprType(o)` stays `Object` and
-    // `isNarrowedRead` returns false for both operands of `o + 1`. The
-    // walker keeps its conservative escape verdict on the binary-op arm
-    // and the scope-end §28.9 `bz_box_release` is suppressed — 480 B / 20
-    // iters (24 B per `int` box), LSan-flagged.
     JitResult r = runAotChecked(
         "module M; class C "
         "  public static method Main(): int "
@@ -239,7 +254,10 @@ BEZEL_TEST(codegen_narrowed_value_op_arg_release_3116,
         "  end Main; "
         "end C;");
     if (wasSkipped(r)) return;
-    BEZEL_EXPECT_FALSE(r.ran);
+    // fix #3895 (issue #3892): pins the ACTUAL current rejection (see the
+    // ⚠ finding above, issue 3903) — a genuine IR-verification failure, not
+    // a runtime crash/signal, which a bare `!ran` cannot distinguish.
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeNotRuntime(r));
 }
 
 // =====================================================================
@@ -264,5 +282,8 @@ BEZEL_TEST(codegen_narrowed_value_op_arg_release_3116,
         "  end Main; "
         "end C;");
     if (wasSkipped(r)) return;
-    BEZEL_EXPECT_FALSE(r.ran);
+    // fix #3895 (issue #3892): pin that the failure is SPECIFICALLY the
+    // expected leak report, not a compiler crash / unrelated runtime signal
+    // that a bare `!ran` cannot tell apart from the leak this row wants.
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "LSan/ASan at exit"));
 }

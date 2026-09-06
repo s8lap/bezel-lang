@@ -12,11 +12,13 @@
 // `this`, nullable enums, and serialization. These tests pin each surface for
 // the headline `long` case and exercise every underlying type.
 
+#include "support/aot_result_asserts.hpp"   // fix #3895: failedAtCompileTimeWithRealLocation
 #include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration, P1)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
 using bezel::test::runAot;
+using bezel::test::failedAtCompileTimeWithRealLocation;
 
 namespace {
 int run(const std::string& program) {
@@ -268,8 +270,9 @@ BEZEL_TEST(enum_underlying_740, int_member_over_int_still_rejected) {
         "module M; "
         "enum E: int A := 5000000000; end E; "
         "class C public static method Main(): int return 0; end Main; end C;");
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_FALSE(r.ran);
+    // fix #3895 (issue #3892): distinguishes a genuine §10.3 rejection from a
+    // runtime crash/signal, which a bare `hasErrors()`/`!ran` pair cannot.
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
 }
 
 // §10.3 (#740): a value beyond the underlying type's own range is still rejected
@@ -280,8 +283,9 @@ BEZEL_TEST(enum_underlying_740, long_member_over_long_still_rejected) {
         "module M; "
         "enum Big: long A := 99999999999999999999999; end Big; "
         "class C public static method Main(): int return 0; end Main; end C;");
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_FALSE(r.ran);
+    // fix #3895 (issue #3892): distinguishes a genuine §10.3 rejection from a
+    // runtime crash/signal, which a bare `hasErrors()`/`!ran` pair cannot.
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
 }
 
 // §10.2/§10.3 (#749): a `ulong` member value in [2^63, 2^64) round-trips. The
@@ -350,8 +354,9 @@ BEZEL_TEST(enum_underlying_749, ulong_literal_over_64bit_rejected) {
         "module M; "
         "enum U: ulong A := 99999999999999999999999UL; end U; "
         "class C public static method Main(): int return 0; end Main; end C;");
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_FALSE(r.ran);
+    // fix #3895 (issue #3892): distinguishes a genuine §10.3 rejection from a
+    // runtime crash/signal, which a bare `hasErrors()`/`!ran` pair cannot.
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
 }
 
 // §5 (#749 follow-up): the boundary value ulong.MaxValue (2^64-1) is in range

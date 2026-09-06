@@ -48,11 +48,13 @@
 // control at the end pins that one so a future refactor cannot regress it into
 // the bracket.
 
+#include "support/aot_result_asserts.hpp"   // fix #3895: failedAtCompileTimeWithRealLocation
 #include "support/aot_support.hpp"   // runAot — the real bezelc AOT oracle
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
 using bezel::test::runAot;
+using bezel::test::failedAtCompileTimeWithRealLocation;
 
 namespace {
 int run(const std::string& prog) {
@@ -386,7 +388,9 @@ BEZEL_TEST(ref_out_accessor_writeback_1302, out_owned_to_indexer_slot_still_reje
         "    C.Make(out arr[0]); "
         "    return arr[0].N; "
         "  end Main; end C;");
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    // fix #3895 (issue #3892): distinguishes a genuine §28.6/§28.11 rejection
+    // from a runtime crash/signal, which a bare `hasErrors()` alone cannot.
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
 }
 
 // §22.3 / §22.12 rule 2: a STATIC property is declined by the bracket and
@@ -419,9 +423,16 @@ BEZEL_TEST(ref_out_accessor_writeback_1302, static_property_declined_in_both_spe
         "  public static method Main(): int "
         "    Box.SV := 3; C.Bump(ref Box.S); return Box.SV; "
         "  end Main; end C;");
-    BEZEL_EXPECT_TRUE(bare.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(qualified.diagnostics.hasErrors());
-    BEZEL_EXPECT_EQ(bare.diagnostics.hasErrors(), qualified.diagnostics.hasErrors());
+    // fix #3895 (issue #3892): distinguishes a genuine rejection from a
+    // runtime crash/signal for EACH spelling, which a bare `hasErrors()`
+    // cannot — the row's whole point is that both spellings decline the
+    // same way, so both must be checked as real rejections, not just
+    // "some Error diagnostic exists".
+    bool bareRejected = failedAtCompileTimeWithRealLocation(bare);
+    bool qualifiedRejected = failedAtCompileTimeWithRealLocation(qualified);
+    BEZEL_EXPECT_TRUE(bareRejected);
+    BEZEL_EXPECT_TRUE(qualifiedRejected);
+    BEZEL_EXPECT_EQ(bareRejected, qualifiedRejected);
 }
 
 // §22.3 / §23.3: a read-only property is not "a property with an accessible

@@ -5,12 +5,14 @@
 // handles constant, relational-operator, and discard patterns.
 // Observable via the int exit code.
 
+#include "support/aot_result_asserts.hpp"   // fix #3895: failedAtCompileTimeWithRealLocation
 #include "support/aot_support.hpp"
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
 using bezel::test::runAot;
 using bezel::test::runAotOut;
+using bezel::test::failedAtCompileTimeWithRealLocation;
 
 namespace {
 
@@ -387,8 +389,9 @@ BEZEL_TEST(codegen_cg28, incompatible_value_arms_is_type_error) {
         "    return 0; "
         "  end Main; "
         "end C;");
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_FALSE(r.ran);
+    // fix #3895 (issue #3892): a bare `hasErrors()`/`!ran` pair cannot tell a
+    // genuine type-error rejection apart from a runtime crash/signal.
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
 }
 
 // CONTROL: a normal value-only case (all arms the same type) still works
@@ -836,8 +839,8 @@ BEZEL_TEST(codegen_cg28, step_in_range_pattern_rejected_738) {
         "  var r := (case x of 0..10 step 2 => 1, _ => 0); "
         "  return r; "
         "end Main; end C;");
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_FALSE(r.ran);
+    // fix #3895 (issue #3892): see incompatible_value_arms_is_type_error above.
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
 }
 
 // #738 / §16.4: a `step` in a for-in range is NOT a pattern and stays legal.
@@ -857,8 +860,8 @@ BEZEL_TEST(codegen_cg28, discard_not_last_arm_rejected_738) {
         "  var r := (case x of _ => 0, 1 => 1, 5 => 5); "
         "  return r; "
         "end Main; end C;");
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_FALSE(r.ran);
+    // fix #3895 (issue #3892): see incompatible_value_arms_is_type_error above.
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
 }
 
 // #738 / §19.6: a GUARDED `_ when g` is conditional, not a catch-all, so it may
@@ -1047,15 +1050,15 @@ BEZEL_TEST(codegen_cg28, neg_range_double_inside_1233) {
     auto r = runAot(
         "var x: double := -3.0; "
         "return (case x of -5.0..-1.0 => 1, _ => 0);");
-    BEZEL_EXPECT_FALSE(r.ran);
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    // fix #3895 (issue #3892): see incompatible_value_arms_is_type_error above.
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
 }
 BEZEL_TEST(codegen_cg28, neg_range_double_miss_1233) {
     auto r = runAot(
         "var x: double := 0.0; "
         "return (case x of -5.0..-1.0 => 1, _ => 0);");
-    BEZEL_EXPECT_FALSE(r.ran);
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    // fix #3895 (issue #3892): see incompatible_value_arms_is_type_error above.
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
 }
 
 // ── fix #1234 / §19 / §9.4: DestructuringPattern on an Object/interface ──

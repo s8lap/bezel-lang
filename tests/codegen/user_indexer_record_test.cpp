@@ -18,11 +18,13 @@
 // (int) user indexer, a record-returning METHOD, and a built-in collection
 // indexer (Array<int>[i]) all still produce correct values.
 
+#include "support/aot_result_asserts.hpp"   // fix #3895: failedAtCompileTimeWithRealLocation
 #include "support/aot_support.hpp"
 #include "test_harness.hpp"
 
 using bezel::test::runAot;
 using bezel::test::runAotOut;
+using bezel::test::failedAtCompileTimeWithRealLocation;
 
 namespace {
 int run(const std::string& program) {
@@ -246,8 +248,9 @@ BEZEL_TEST(user_indexer_record_23_4, value_indexer_result_member_assign_rejected
         "    c[0].A := 99; "                      // §23.5 — write to a discarded copy
         "    return c[0].A; "
         "  end Main; end C;");
-    BEZEL_EXPECT_FALSE(r.ran);
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    // fix #3895 (issue #3892): distinguishes a genuine §23.5 rejection from a
+    // runtime crash/signal, which a bare `!ran`/`hasErrors()` pair cannot.
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
 }
 
 // #1147: the same reject on a built-in collection (Dictionary<K, record>) whose
@@ -261,8 +264,9 @@ BEZEL_TEST(user_indexer_record_23_4, dict_record_value_member_assign_rejected_11
         "  d[\"a\"].x := 99; "                     // §23.5
         "  return d[\"a\"].x; "
         "end Main; end C;");
-    BEZEL_EXPECT_FALSE(r.ran);
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    // fix #3895 (issue #3892): distinguishes a genuine §23.5 rejection from a
+    // runtime crash/signal, which a bare `!ran`/`hasErrors()` pair cannot.
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
 }
 
 // #1147 CONTROL: a CLASS-valued indexer result is a REFERENCE — `c[0].X := 99`
@@ -315,8 +319,9 @@ BEZEL_TEST(user_indexer_record_23_4, value_block_property_result_member_assign_r
         "  h.P.X := 99; "                          // §23.5 — write to a discarded copy
         "  return h.P.X; "
         "end Main; end C;");
-    BEZEL_EXPECT_FALSE(r.ran);
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    // fix #3895 (issue #3892): distinguishes a genuine §23.5 rejection from a
+    // runtime crash/signal, which a bare `!ran`/`hasErrors()` pair cannot.
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
 }
 
 // #1312: an AUTO value-typed property — member-assign on its result rejected.
@@ -331,8 +336,9 @@ BEZEL_TEST(user_indexer_record_23_4, value_auto_property_result_member_assign_re
         "  h.P.X := 99; "                          // §23.5
         "  return h.P.X; "
         "end Main; end C;");
-    BEZEL_EXPECT_FALSE(r.ran);
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    // fix #3895 (issue #3892): distinguishes a genuine §23.5 rejection from a
+    // runtime crash/signal, which a bare `!ran`/`hasErrors()` pair cannot.
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
 }
 
 // #1312/#1313 CONTROL: a value-typed FIELD is an lvalue stored inline — `h.f.X :=

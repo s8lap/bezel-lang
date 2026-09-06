@@ -17,11 +17,13 @@
 // path tried an ICmp on a struct pointer, which is illegal IR. Scalar/string
 // element types also regressed to pointer-identity semantics.
 
+#include "support/aot_result_asserts.hpp"   // fix #3895: failedAtCompileTimeWithRealLocation
 #include "support/aot_support.hpp"
 #include "test_harness.hpp"
 
 using bezel::test::runAot;
 using bezel::test::runAotOut;
+using bezel::test::failedAtCompileTimeWithRealLocation;
 
 namespace {
 
@@ -236,8 +238,10 @@ BEZEL_TEST(contains_indexof_equals_4_5, owned_array_record_contains_present) {
         "  if a.Contains(new P(3, 4)) then return 1; end; "
         "  return 0; "
         "end Main; end Program;");
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_FALSE(r.ran);
+    // fix #3895 (issue #3892): distinguishes a genuine §4.5/§14.4 rejection
+    // from a runtime crash/signal, which a bare `hasErrors()`/`!ran` pair
+    // cannot.
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
 }
 
 // §4.5/§14.4/#1327 v0.165: OwningArray<P> with record element rejected at sema.
@@ -250,8 +254,10 @@ BEZEL_TEST(contains_indexof_equals_4_5, owned_array_record_indexof_present) {
         "  a.Add(new P(1, 2)); a.Add(new P(3, 4)); "
         "  return a.IndexOf(new P(3, 4)); "
         "end Main; end Program;");
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_FALSE(r.ran);
+    // fix #3895 (issue #3892): distinguishes a genuine §4.5/§14.4 rejection
+    // from a runtime crash/signal, which a bare `hasErrors()`/`!ran` pair
+    // cannot.
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
 }
 
 // §4.5: OwningArray<R> with class element: Contains query is a PURE BORROW —

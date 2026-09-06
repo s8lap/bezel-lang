@@ -73,11 +73,13 @@
 
 #include <string>
 
+#include "support/aot_result_asserts.hpp"   // fix #3895: diagnosticMessageContains
 #include "support/aot_support.hpp"
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
 using bezel::test::runAotChecked;
+using bezel::test::diagnosticMessageContains;
 
 namespace {
 
@@ -378,7 +380,10 @@ BEZEL_TEST(dict_sorted_key_local_release_3887_3888,
     if (wasSkipped(r)) return;
     // Deliberately the INVERSE of every row above: the VALUE position is NOT
     // claimed by this fix, so it must still trip LeakSanitizer on both sides
-    // of this commit — `r.ran == false` here is the expected, unchanging
-    // result.
-    BEZEL_EXPECT_FALSE(r.ran);
+    // of this commit — a leak report here is the expected, unchanging result.
+    //
+    // fix #3895 (issue #3892): pin that the failure is SPECIFICALLY the
+    // expected leak report, not a compiler crash / unrelated runtime signal
+    // that a bare `!ran` cannot tell apart from the leak this row wants.
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "LSan/ASan at exit"));
 }

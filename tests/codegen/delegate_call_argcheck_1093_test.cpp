@@ -9,11 +9,13 @@
 //
 // runJit returns the FULL int from Main() (not 8-bit wrapped); values ≤ 255.
 
+#include "support/aot_result_asserts.hpp"   // fix #3895: failedAtCompileTimeWithRealLocation
 #include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration, P1)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
 using bezel::test::runAot;
+using bezel::test::failedAtCompileTimeWithRealLocation;
 
 namespace {
 int run(const std::string& prog) {
@@ -31,8 +33,9 @@ BEZEL_TEST(delegate_call_argcheck_1093, wrong_typed_arg_rejected) {
         "  var g: (int)->int := lambda(b: int) => b * 7; "
         "  return f(g); "                                  // g is (int)->int, not int
         "end Main; end C;");
-    BEZEL_EXPECT_FALSE(r.ran);
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    // fix #3895 (issue #3892): distinguishes a genuine §5.1 rejection from a
+    // runtime crash/signal, which a bare `!ran`/`hasErrors()` pair cannot.
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
 }
 
 // #1093: a wrong-ARITY delegate call is rejected.
@@ -42,8 +45,9 @@ BEZEL_TEST(delegate_call_argcheck_1093, wrong_arity_rejected) {
         "  var f: (int)->int := lambda(a: int) => a + 100; "
         "  return f(); "                                   // 0 args, expects 1
         "end Main; end C;");
-    BEZEL_EXPECT_FALSE(r.ran);
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    // fix #3895 (issue #3892): distinguishes a genuine §5.1 rejection from a
+    // runtime crash/signal, which a bare `!ran`/`hasErrors()` pair cannot.
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
 }
 
 // #1093: a wrong scalar type (string where int expected) is rejected.
@@ -53,8 +57,9 @@ BEZEL_TEST(delegate_call_argcheck_1093, wrong_scalar_type_rejected) {
         "  var f: (int)->int := lambda(a: int) => a + 100; "
         "  return f(\"hi\"); "
         "end Main; end C;");
-    BEZEL_EXPECT_FALSE(r.ran);
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    // fix #3895 (issue #3892): distinguishes a genuine §5.1 rejection from a
+    // runtime crash/signal, which a bare `!ran`/`hasErrors()` pair cannot.
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
 }
 
 // A correctly-typed delegate call is unchanged.
