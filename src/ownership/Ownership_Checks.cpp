@@ -1912,7 +1912,47 @@ void MethodOwnership::checkRead(const ast::Expr& e, bool selfTarget) {
                 Severity::Error, id->span.begin,
                 std::string("owned value in `") + std::string(id->name) +
                 "` was already moved out at this point (§28.3)");
-            st->state = OwnershipState::Poisoned;
+        // fix #3931 (§28.3 K1.3/K7, §28.2, v0.294): the poisoning of the
+        // three plain-state arms below is DEFERRED to the final emit pass,
+        // exactly as the two join-flag arms above already defer theirs
+        // (#2439). Poisoning is a diagnostic-cascade suppressor, and a
+        // suppressed pass emits no diagnostic to cascade from — but it DOES
+        // write the poison into this block's exit state, which is what the
+        // loop's back edge feeds into the next pass's header entry (K7: "at
+        // every control-flow join — ... loop back edges — a variable's ...
+        // state is the lattice meet"). `joinInto` has no MovedFrom-⊓-Poisoned
+        // (or Disposed-⊓-Poisoned) rule, so the header's meet falls through to
+        // the generic "other mismatches" catch-all and collapses to bare
+        // Poisoned; the loop-body block's entry on EVERY later pass — the
+        // final, diagnosing one included — is then Poisoned, a state this
+        // chain deliberately has no arm for (Poisoned's "suppress cascades"
+        // contract). The read is silently accepted.
+        //
+        // Measured on HEAD b6ca3d1, `var x := new Res(1); Sink.Take(move x);
+        // while i < 1 do Sink.Peek(x); i := i + 1; end;` compiled with ZERO
+        // diagnostics and heap-use-after-freed under ASan ("READ of size 4 ...
+        // in bz$M.Sink$Peek", freed in bz$M.Sink$Take), while the byte-
+        // identical straight-line spelling is correctly rejected with "owned
+        // value in `x` was already moved out at this point (§28.3)". The
+        // dispose twin (`x.Dispose();` then the same loop) was silent where
+        // the straight-line twin warns, and SEGV'd. The shapes that stayed
+        // correctly diagnosed are exactly those whose reading block has NO
+        // live back edge — a `return` or `break` in the body, or a move
+        // earlier in the same block — which is the mechanism's own signature.
+        //
+        // Leaving the state alone during the suppressed phase makes the
+        // fixpoint converge on the true fact — MovedFrom ⊓ MovedFrom =
+        // MovedFrom, and likewise for Disposed and Uninitialized. (That is
+        // `joinInto`'s `st.state == o.state` short-circuit, NOT a numbered
+        // K7 clause: K7 enumerates the MIXED meets plus K7.1's `owned ⊓
+        // owned = owned`, and leaves the other same-state identities
+        // implicit. The load-bearing authority for rejecting the read is
+        // K1.3, quoted above.) So the final pass observes it fresh and both
+        // reports for real and poisons for real. That is what K1.3 ("the
+        // binding or slot is unreadable until reassigned") and K7.4's "no
+        // flow around a back edge into a use" require of a read reached
+        // around a back edge. // per §28.2, §28.3 K1.3/K7, v0.294, #3931
+            if (!suppressDiag_) st->state = OwnershipState::Poisoned;
         } else if (st->state == OwnershipState::Disposed) {
             // §28.2 v0.131: emit a compile-time warning (not an error) when a
             // local is used after an explicit Dispose() that dominates the use
@@ -1934,7 +1974,9 @@ void MethodOwnership::checkRead(const ast::Expr& e, bool selfTarget) {
                     std::string("explicit Dispose() of `") +
                     std::string(id->name) + "` was here");
             }
-            st->state = OwnershipState::Poisoned;
+            // fix #3931: deferred for the reason traced on the MovedFrom arm
+            // above (§28.2 / §28.3 K1.3/K7, v0.294).
+            if (!suppressDiag_) st->state = OwnershipState::Poisoned;
         } else if (st->state == OwnershipState::Uninitialized &&
                    isOwnedRelevantLocal(sym)) {
             // §28.3: a local declared without an initializer is
@@ -1952,7 +1994,9 @@ void MethodOwnership::checkRead(const ast::Expr& e, bool selfTarget) {
                 "` may be read while uninitialized here: it is assigned "
                 "only on a loop path that may not execute (§28.3 — an "
                 "uninitialized local may not be read until assigned)");
-            st->state = OwnershipState::Poisoned;
+            // fix #3931: deferred for the reason traced on the MovedFrom arm
+            // above (§28.2 / §28.3 K1.3/K7, v0.294).
+            if (!suppressDiag_) st->state = OwnershipState::Poisoned;
         }
         return;
     }
@@ -7712,7 +7756,37 @@ void MethodOwnership::markDisposedByName(std::string_view name, SourceLocation l
             Severity::Error, loc,
             std::string("cannot dispose `") + std::string(name) +
             "`: it was already moved out (§28.3)");
-        st->state = OwnershipState::Poisoned;
+        // fix #3931 (§28.2, §28.3 K1.3/K7, v0.294) — the SIBLING SWEEP. Same
+        // deferral, same reason, as `checkRead`'s three plain-state arms: a
+        // poison written during the O3b fixpoint's diagnostic-SUPPRESSED phase
+        // lands in this block's EXIT state, the loop's back edge carries it to
+        // the header, `joinInto` has no MovedFrom-⊓-Poisoned rule so the meet
+        // collapses to bare Poisoned, and every later pass — the final,
+        // diagnosing one included — enters the body with a state these
+        // chains deliberately have no arm for.
+        //
+        // Guarding the WRITER is the right level: a `MovedFrom ⊓ Poisoned`
+        // rule in `joinInto` would be actively wrong, because Poisoned means
+        // "already reported, stop cascading" — a fact about DIAGNOSTICS, not
+        // a lattice element the meet should reason about. The suppressed-phase
+        // write was also the only NON-MONOTONE one here: every guarded arm
+        // `return`s immediately, leaving the state exactly as it was, so the
+        // fixpoint's chain can only get shorter.
+        //
+        // WHY THIS ARM SPECIFICALLY. `checkRead` (fixed first) correctly
+        // declines to poison a moved-from local, and then THIS function
+        // poisons it in the same statement, re-opening the identical
+        // back-edge collapse. Measured on the checkRead-only commit
+        // (8d9d9e0), with `Sink.Take(owned r)` auto-dropping its parameter:
+        //   var x := new Res(1); Sink.Take(move x);
+        //   var i := 0; while i < 2 do x.Dispose(); i := i + 1; end;
+        //     -> ACCEPTED, zero diagnostics, SIGSEGV at runtime;
+        //   the `for var i in 1..2 do x.Dispose(); end;` spelling likewise;
+        //   the straight-line twin `Sink.Take(move x); x.Dispose();` is
+        //   correctly rejected: "owned value in `x` was already moved out at
+        //   this point (§28.3)".
+        // // per §28.2, §28.3 K1.3/K7, v0.294, #3931
+        if (!suppressDiag_) st->state = OwnershipState::Poisoned;
         return;
     }
     // §28.3 (#1626, v0.180): disposing a maybe-consumed local — owned on one
@@ -8415,7 +8489,11 @@ void MethodOwnership::markMovedByName(std::string_view name, SourceLocation loc)
             Severity::Error, loc,
             std::string("owned value in `") + std::string(name) +
             "` was already moved out at this point (§28.3)");
-        st->state = OwnershipState::Poisoned;
+        // fix #3931 sibling sweep: deferred to the emit pass for the reason
+        // traced in `markDisposedByName`'s MovedFrom arm above — a
+        // suppressed-phase poison collapses the loop-header meet and silences
+        // the diagnostic for good. // per §28.2, §28.3 K1.3/K7, v0.294
+        if (!suppressDiag_) st->state = OwnershipState::Poisoned;
         return;
     }
     if (st->state == OwnershipState::Disposed) {
@@ -8423,7 +8501,11 @@ void MethodOwnership::markMovedByName(std::string_view name, SourceLocation loc)
             Severity::Error, loc,
             std::string("cannot move from disposed local `") +
             std::string(name) + "` (§28.3)");
-        st->state = OwnershipState::Poisoned;
+        // fix #3931 sibling sweep: deferred to the emit pass for the reason
+        // traced in `markDisposedByName`'s MovedFrom arm above — a
+        // suppressed-phase poison collapses the loop-header meet and silences
+        // the diagnostic for good. // per §28.2, §28.3 K1.3/K7, v0.294
+        if (!suppressDiag_) st->state = OwnershipState::Poisoned;
         return;
     }
     if (st->implicitDischarge) {
@@ -12650,7 +12732,11 @@ void MethodOwnership::recordAwaitOperandConsume(
             "` was already awaited (consumed) — an `OwningTask<T>` is "
             "single-consumer; awaiting it again moves out an already-moved "
             "result (§30.5 / §30.4)");
-        st->state = OwnershipState::Poisoned;
+        // fix #3931 sibling sweep: deferred to the emit pass for the reason
+        // traced in `markDisposedByName`'s MovedFrom arm above — a
+        // suppressed-phase poison collapses the loop-header meet and silences
+        // the diagnostic for good. // per §28.2, §28.3 K1.3/K7, v0.294
+        if (!suppressDiag_) st->state = OwnershipState::Poisoned;
         return;
     }
     // §28.3 (#1626): awaiting a maybe-consumed task local is a consume of a
