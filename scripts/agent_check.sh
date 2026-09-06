@@ -242,6 +242,30 @@ if [ "${1:-}" = "--probe" ]; then
   fi
 fi
 
+# --- --no-lit: strip it from ANYWHERE in the remaining args, before any mode
+# is dispatched (issue #3923). --no-lit skips the lit diagnostic track (see
+# the default-run section below) for pure codegen-value lanes that never
+# touch a diagnostic string; default is to RUN it. This used to be stripped
+# only INSIDE the default filter-run path's own arg loop, so `--no-lit` typed
+# BEFORE `--area` (a natural thing to type - a real lane hit exactly this:
+# `agent_check.sh --no-lit --area codegen f1 f2 f3`) never reached that loop:
+# `--area` was $2, not $1, so the dedicated --area block below (which only
+# ever looks at $1) never matched, and both `--area` and its group-name
+# argument fell through, UNRECOGNIZED, into the plain filter loop alongside
+# the real filters - silently exploding a 3-filter run into "everything
+# whose suite name contains 'codegen'". Stripping --no-lit here, before
+# --area/--build-only/--select are dispatched, means the two flags now
+# compose in EITHER order.
+NO_LIT=0
+_ac_args=()
+for _a in "$@"; do
+  case "$_a" in
+    --no-lit) NO_LIT=1 ;;
+    *) _ac_args+=("$_a") ;;
+  esac
+done
+set -- "${_ac_args[@]}"
+
 # --- --area <group>: restrict the BUILD and the RUN to one test binary --------
 # Parsed before the modes below so it composes with all of them.
 if [ "${1:-}" = "--area" ]; then
@@ -310,18 +334,8 @@ if [ "${1:-}" = "--select" ]; then
 fi
 
 # --- targeted test run (the default) ------------------------------------------
-# --no-lit skips the lit diagnostic track below (for pure codegen-value lanes
-# that never touch a diagnostic string). Default is to RUN it. Strip it from the
-# args before the footgun guard so a bare `--no-lit <filter>` still validates.
-NO_LIT=0
-_ac_args=()
-for _a in "$@"; do
-  case "$_a" in
-    --no-lit) NO_LIT=1 ;;
-    *) _ac_args+=("$_a") ;;
-  esac
-done
-set -- "${_ac_args[@]}"
+# --no-lit and --area were already consumed above (composing in either
+# order); anything left here must be either a real gtest filter or a mistake.
 
 # Footgun guards BEFORE we build, so mistakes fail fast.
 [ "$#" -ge 1 ] || die "no test filter given.
@@ -332,6 +346,18 @@ for f in "$@"; do
     --gtest_filter*|--gtest*) die "the test binary IGNORES $f — pass a BARE substring, e.g. 'scripts/agent_check.sh my_area_1234'" ;;
     "") die "empty filter would run the WHOLE suite — give a real substring (the gate runs the full suite)" ;;
     run_parallel*|--full|--all) die "'$f' is a full-suite run — that is the gate's job, not a lane's" ;;
+    # issue #3923, widened by #3934: a gtest suite-or-name substring can
+    # NEVER begin with `-` at all, one dash or two — `-`/`--` are not valid
+    # C++ identifier characters, and every suite/test name is a C++
+    # identifier with an area prefix (e.g. `codegen_...`). So ANY argument
+    # that still starts with `-` at this point is ALMOST CERTAINLY a
+    # mistyped/misplaced flag, not a real filter (`-area codegen` and
+    # `-no-lit` are exactly as much a typo as `--area`/`--no-lit` with a
+    # dropped dash — same failure mode, one dash short). Refuse it loudly
+    # instead of silently running it as a filter substring (which
+    # previously could explode scope to nearly a whole area with no
+    # indication anything was wrong — see the issue's measured repro).
+    -*) die "'$f' looks like a mistyped or misplaced flag, not a filter — refusing to treat it as one (a gtest suite-or-name substring can never start with '-'). Recognized flags: --area <group>, --no-lit, --probe, --build-only, --select (see the usage comment at the top of this script). If you meant --area, it must be followed by its group name." ;;
   esac
 done
 
