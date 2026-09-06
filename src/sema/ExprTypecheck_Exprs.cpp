@@ -583,9 +583,19 @@ TypeRef* ExprTC::bindLambdaDestructure(const ast::DestructuringPattern& dp,
     }
     for (std::size_t i = 0; i < dp.subPatterns.size() && i < fields.size(); ++i) {
         const auto& sp = dp.subPatterns[i];
-        TypeRef* fieldTy = nullptr;
-        if (fields[i]->posParam && fields[i]->posParam->type)
-            fieldTy = ctx_.resolvedType(*fields[i]->posParam->type);
+        // fix #3962 (§27.4/§7/§9.1, v0.294): read through
+        // `storageComponentType` (sema/Symbol.hpp) rather than the bare
+        // `posParam->type` — for an IMPORTED record's positional field, fix
+        // #2516 documents the synthetic `posParam`'s `type` as deliberately
+        // null (the real type lives in `ctx_.importedMemberType`, reached
+        // only through this accessor). The bare read left `fieldTy` null for
+        // every destructured slot over an imported record, which silently
+        // disabled every check keyed on it — measured: a nullable field
+        // (`X: int?`) destructured into a lambda parameter and passed to a
+        // non-nullable-typed call argument compiled cleanly when `X`'s
+        // record was imported, and was correctly rejected (§7) when local.
+        TypeRef* fieldTy = const_cast<TypeRef*>(
+            storageComponentType(fields[i], ctx_));
         if (!sp.nakedBinding.empty()) {
             // per §27.4: "each binding is an ordinary read of the
             // corresponding positional field at body entry" — a naked
