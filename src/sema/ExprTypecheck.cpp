@@ -4017,6 +4017,52 @@ void ExprTC::checkAssignable(TypeRef* from, TypeRef* to,
             if (from->nullable && !to->nullable) { reportNullable(); return; }
             return;  // accepted — codegen boxes the span at the call site
         }
+        // fix #3884 (stdlib §3.3 / §4.16): `ReadOnlyStringSpan` IS documented
+        // as implementing `IReadOnlySpan<char>` (issue 2313's stdlib quote),
+        // but unlike the four buffer/array-backed spans just above it does
+        // NOT share their `bz.arrayspan` { ptr, i32, i32 } layout —
+        // `isSpanLikeTypeName` (LlvmBackend_impl.hpp) deliberately excludes
+        // it, because its backing `string` uses the §4.6 adaptive 1/2/4-byte
+        // code-point encoding, so codegen has no boxed interface-span
+        // representation for it yet. Before this fix `fromN ==
+        // "ReadOnlyStringSpan"` matched none of the arms above, fell through
+        // every remaining branch of this function, and reached the final
+        // "Mixed / generic-parameter / null-literal cases: skip" catch-all —
+        // i.e. this coercion was silently ACCEPTED with no boxing at all.
+        // Measured fallout, both pre-existing and both memory-safe (no
+        // `calloc`/box is ever minted since `isSpanLikeTypeName` says no):
+        //   * a plain-value parameter of type `IReadOnlySpan<char>` reached
+        //     codegen's real call-site boxing path, which assumed the
+        //     `bz.arrayspan` layout and produced a parameter-type mismatch —
+        //     "Call parameter type does not match function signature!" / IR
+        //     verifier abort (issue 2313);
+        //   * an `IReadOnlySpan<char>`-typed LOCAL initialized from a
+        //     `ReadOnlyStringSpan` compiled and ran with NO diagnostic, and
+        //     a `.SequenceEqual` call through that interface-typed receiver
+        //     silently returned the wrong boolean — `false` for two
+        //     spans over equal strings (issue 3884).
+        // Reject the coercion itself instead, mirroring the "not yet
+        // supported" style already used for the direct-receiver argument
+        // form of this exact gap (`SequenceEqual(other: IReadOnlySpan<char>)`
+        // on a `ReadOnlyStringSpan` receiver, ExprTypecheck_Calls.cpp) and
+        // for `CopyTo` beside it. This does not implement the feature —
+        // issue 2317 tracks making the interface form of `SequenceEqual`
+        // actually work once the boxed representation exists — it only
+        // closes the silent-wrong-answer / malformed-IR gap by refusing the
+        // coercion at compile time.
+        if (fromN == "ReadOnlyStringSpan") {
+            ctx_.diagnostics().report(
+                Severity::Error, loc,
+                std::string("the ") + what + " is a `ReadOnlyStringSpan`, "
+                "which does not yet support conversion to "
+                "`IReadOnlySpan<char>` (the boxed interface-span "
+                "representation is not implemented for the adaptively-"
+                "encoded string span, stdlib \xC2\xA7""4.16 / \xC2\xA7""3.3; "
+                "tracked in issue 2313 / issue 2317); use the "
+                "`ReadOnlyStringSpan` value directly, or its `string`/"
+                "`ReadOnlyStringSpan` overloads (stdlib \xC2\xA7""3.3)");
+            return;
+        }
     }
     // §4.14/§4.15 (#1245): a ReadOnly span is NOT assignable to its writable
     // counterpart — ReadOnlyArraySpan<T>→ArraySpan<T> would allow writes
