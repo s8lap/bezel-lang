@@ -449,13 +449,31 @@ bool ExprTC::defaultIllFormed(const TypeRef* t) {
             // case, which is what reaches here).
             if (k == ast::TypeDeclKind::Choice) return true;
             if (k == ast::TypeDeclKind::Record) {
-                auto* td =
-                    dynamic_cast<const ast::TypeDecl*>(t->declaration->decl);
-                if (!td) return false;  // imported record — defer (don't reject)
-                for (const auto& pf : td->positionalFields) {
-                    if (!pf.type) continue;
-                    if (defaultIllFormed(ctx_.resolvedType(*pf.type)))
-                        return true;
+                // fix #3982 (§17.11, v0.294): this used to cast
+                // `t->declaration->decl` to `ast::TypeDecl*` and walk ITS
+                // `positionalFields`, returning "well-formed" (accept)
+                // whenever that cast failed. `TypeSymbol::decl` is NEVER
+                // assigned for an imported type (Symbol.hpp; the same fact
+                // #3911/#3957/#3970 each independently hit for sibling
+                // AST-side reads), so `default(T)` over ANY imported record
+                // was silently accepted regardless of its fields' types —
+                // including a non-nullable class-typed field, which §17.11
+                // says makes the record non-defaultable. Unlike #3970's
+                // sibling gap this one is a real SIGSEGV, not just a static-
+                // checking hole: codegen's `default(T)` lowering recursively
+                // default-constructs each field, so the non-nullable
+                // reference field's "default" is a null pointer with no
+                // diagnostic ever having fired, and a subsequent member
+                // access null-derefs. Read the SYMBOL side instead —
+                // `recordPositionalFieldSymbols` + `storageComponentType`
+                // (sema/Symbol.hpp, "the ONE accessor that consults both
+                // sources") — which answers identically for a local and an
+                // imported record, exactly as #3970's own record-field walk
+                // fix did for the sibling §9.7 check in the same family.
+                for (const Symbol* pf : recordPositionalFieldSymbols(t->declaration)) {
+                    const TypeRef* pft = storageComponentType(pf, ctx_);
+                    if (!pft) continue;
+                    if (defaultIllFormed(pft)) return true;
                 }
                 return false;
             }
