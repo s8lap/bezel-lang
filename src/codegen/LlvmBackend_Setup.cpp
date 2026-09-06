@@ -13127,8 +13127,7 @@ void Emitter::emitImplicitBase(const sema::TypeSymbol* cls, llvm::Value* obj,
                     }
                 }
             } else if (b->hasPositionalFields && hasAnyConstructor(b) &&
-                       sema::recordPositionalFieldSymbols(b).size() == n &&
-                       (!ctx_.isImported(b) || b->genericParams.empty())) {
+                       sema::recordPositionalFieldSymbols(b).size() == n) {
                 // fix #3731 (§22.8 step 1 / §22.10, v0.286): `ctorForArgs`
                 // found no explicit constructor for these `n` args, `b`
                 // declares BOTH a primary constructor (`hasPositionalFields`)
@@ -13156,27 +13155,53 @@ void Emitter::emitImplicitBase(const sema::TypeSymbol* cls, llvm::Value* obj,
                 // is deliberately NOT invoked on this path, and nothing else
                 // runs them.
                 //
-                // IMPORTED: `b`'s field initializers live in the exporter's
-                // AST, unreachable here (the #2374-class gap) — route
-                // through the exporter's `bz$<Base>$initprimary` entry point
-                // (fix #3713), which runs exactly steps 1+2 with NO vtable
-                // store (`emitInitEntryBody`'s `installVtable=false`) — so,
-                // unlike `emitImportedBaseFieldInit`'s `bz$<Base>$init` call,
-                // no vtable-slot save/restore is needed around it.
+                // IMPORTED NON-GENERIC: `b`'s field initializers live in the
+                // exporter's AST, unreachable here (the #2374-class gap) —
+                // route through the exporter's `bz$<Base>$initprimary` entry
+                // point (fix #3713), which runs exactly steps 1+2 with NO
+                // vtable store (`emitInitEntryBody`'s `installVtable=false`)
+                // — so, unlike `emitImportedBaseFieldInit`'s `bz$<Base>$init`
+                // call, no vtable-slot save/restore is needed around it.
                 // `primaryInitFn` is only ever DEFINED by the exporter for a
                 // non-generic class (the `initFns_` emission loop above is
                 // gated on `genericParams.empty()`, and `emitInstanceInit
                 // Function` early-returns when `ts` never entered that map),
-                // so an imported GENERIC base with both constructor forms is
-                // excluded by the guard above and falls through unchanged to
-                // the existing (pre-existing-gap) arity-0 fallback below.
+                // so this arm is gated to `b->genericParams.empty()`.
                 //
-                // LOCAL: the SAME two calls the no-explicit-ctor fallback
-                // below makes for `b` when `hasAnyConstructor(b)` is false —
-                // `emitLocalBaseFieldInit` already carries the generic
-                // ancestor substitution that case needs, so a local generic
-                // base with both forms is not a separate case here.
-                if (ctx_.isImported(b)) {
+                // LOCAL, and fix #3747 (§22.8 step 1 / §22.10, v0.286)
+                // IMPORTED GENERIC: the SAME two calls the no-explicit-ctor
+                // fallback below makes for `b` when `hasAnyConstructor(b)` is
+                // false — `emitLocalBaseFieldInit` already carries the
+                // generic ancestor substitution that case needs (it computes
+                // `computeAncestorGenericSubst` from `mostDerived` itself,
+                // exactly like `emitImportedBaseFieldInit`'s own #2524
+                // generic arm does), so a generic base with both forms is not
+                // a separate case here EITHER WAY. #3747 measured that an
+                // imported GENERIC `b` has no exported `$initprimary` (the
+                // exporter's `initFns_` gate above requires
+                // `genericParams.empty()` — there is no entry point to call),
+                // but it ALSO has no exported `ast::TypeDecl` at all (#2374:
+                // "no ast::TypeDecl exists for imported types" — see
+                // ModuleLoader.cpp's TypeSymbol shell comment) whether or not
+                // it is generic, so `ctx_.isImported(b)` was never the right
+                // axis to gate this specific step on: a generic import is
+                // already reconstructed member-by-member (ModuleLoader pass 3
+                // re-parses `ctorBodyText`/`fieldInitText` and attaches
+                // `ast::ConstructorDecl`/field-initializer text to `b`'s own
+                // members, #662c/#2860/#2874), which is exactly the
+                // machinery `emitOwnFieldInit` (via `emitLocalBaseFieldInit`)
+                // and the `emitImplicitBase` recursion already consume for
+                // the pre-existing no-explicit-ctor generic-import shape
+                // (`emitImportedBaseFieldInit`'s #2524 arm). Before this fix,
+                // a base declaring BOTH forms fell through this `else if`
+                // (excluded by `!b->genericParams.empty()`) to the bottom
+                // arity-0 fallback, which found the SAME explicit
+                // zero-arg constructor `ctorForArgs` above already rejected
+                // for these `n` args and called it with NO arguments —
+                // silently dropping the base-clause value exactly as #3731
+                // measured for the non-generic case (`bp=0` instead of the
+                // supplied value).
+                if (ctx_.isImported(b) && b->genericParams.empty()) {
                     builder_.CreateCall(primaryInitFn(b), {obj});
                 } else {
                     emitImplicitBase(b, obj, mostDerived);
