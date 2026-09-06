@@ -90,6 +90,45 @@ void Emitter::emitDisposerBody(const sema::TypeSymbol* ts, llvm::Function* fn) {
 
 
 void Emitter::emitDisposerCore(const sema::TypeSymbol* ts, llvm::Function* fn) {
+    // fix #3921 (§27.5 / §28.4 / §28.9, v0.294): the SAVE/RESTORE half of the
+    // capture-cell clear+re-pin block ~150 lines below (fix #2887's). A
+    // `clear()` on per-lowering emitter state and a save/restore around nested
+    // emission are two halves of ONE contract (issue 3505), and this emitter
+    // shipped only the first half — the same asymmetry #3500 closed for
+    // `emitIteratorMethod`, #3507 for `emitAsyncIteratorMethod` and #3705 for
+    // `emitAsyncMethod`, all three of which already construct exactly this
+    // scope. (Not #3697/#3705 for both async emitters: those two issues are
+    // the `BorrowingReclaimSetScope` that sits on the NEXT line at each of
+    // those sites — a different member family. Verified against
+    // `eea0ebe` "fix #3507: re-establish the §27.5 capture-cell reclaim
+    // analyses for an async iterator's Resume" and `17931fb` "fix #3705: give
+    // emitIteratorMethod and emitAsyncMethod the reclaim save/restore #3697
+    // gave the async twin".)
+    //
+    // WHY IT MATTERS HERE. `emitDisposerCore` is not only reached from the
+    // top-level disposer pass (where the next disposer's own pre-scan re-pins
+    // everything, so clobbering is harmless). `emitSpecializedDisposer`
+    // (reached from `specializedVtableFor` -> `emitInstanceInit`, i.e. from
+    // `lowerNew` for a generic instantiation with an `owned T` field, #816 /
+    // §28.5) and `specializedDisposerCoreFor` (from `emitBaseDisposeChain`)
+    // both call it MID-EMISSION of an outer body. Those two sites save and
+    // restore the per-function emit state — `currentFn_`, `locals_`, the
+    // dispose/loop/finally stacks, the insert point — precisely for this
+    // reason, but neither ever grew a save for the capture-cell family. So a
+    // single `new Box<Res>(…)` anywhere in a method body silently wiped that
+    // body's own §27.5 capture-cell eligibility (and its `sharedCellEnvdtor
+    // FreeOwner_` §3426 decisions) for every lambda lowered AFTER it, with no
+    // diagnostic and no crash: a leak, never a double-free.
+    //
+    // MEASURED (issue 3921, at 500 iterations under ASan/LSan): fix #3804's
+    // own escaping-nested-lambda probe with one `using var b := new
+    // Box<Res>(new Res());` inserted BEFORE the lambda leaked 26000 B / 1500
+    // allocations — 52 B per activation, i.e. the escaped closure header (40),
+    // its env (8) and the shared capture cell (4), byte-for-byte #3804's own
+    // figure — while the identical program WITHOUT that one line is clean.
+    // Invisible to any test that does not instantiate an owned-`T` generic in
+    // the same body that also captures.
+    CaptureReclaimSetScope captureReclaimScope(*this);
     currentFn_ = fn;
     currentThis_ = &*fn->args().begin();
     locals_.clear();
