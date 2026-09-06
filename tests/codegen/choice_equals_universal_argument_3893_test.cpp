@@ -75,9 +75,11 @@
 
 #include <string>
 
+#include "support/aot_result_asserts.hpp"  // failedAtCompileTimeWithRealLocation
 #include "support/aot_support.hpp"
 #include "test_harness.hpp"
 
+using bezel::test::failedAtCompileTimeWithRealLocation;
 using bezel::test::runAot;
 
 // ── T1 — THE AUDIT'S REPRO (fix #3893). Pre-fix, row 06 crashed `bezelc`
@@ -274,4 +276,60 @@ BEZEL_TEST(codegen_choice_equals_universal_argument_3893,
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_EQ(r.stdoutText,
                     std::string("same True\ndiff False\n"));
+}
+
+// ── T6 (test #3954 — fix #3939's own repro, PLAIN `.` spelling, §8.1/§35.4/
+// §35.7, v0.294) — the STRUCT-MISMATCH sibling of T4 above. #3939 closed a
+// silent zero-degrade in `lowerValueSemMethodOn`'s choice arm: its
+// struct-MISMATCH guard (`if (other->getType() != st)`, a few lines below
+// T4's non-struct guard) let a PLAIN `.`/`!.` access on a NON-NULLABLE
+// choice receiver, inside a generic method whose type parameter resolves at
+// a live call site to a struct-shaped-but-MISMATCHED type (a record, here),
+// compile clean and silently drop the comparison. #3939's own commit body
+// gives this exact program as the MEASURED repro but only updated T6/T8 in
+// nullcond_unit_receiver_equals_hashcode_3452_test.cpp — both the `?.`
+// spelling reached through `lowerNullCondValueSemCall`'s wrapper — leaving
+// the PLAIN `.` shape (the issue's own stated repro, and the shape most
+// likely to regress independently of the `?.` wrapper, e.g. #3925/#3943
+// already show the two paths can diverge) with no dedicated pin anywhere in
+// the suite. `lowerValueSemMethodOn` is one shared function, so T8 does
+// exercise the identical guard — this is a coverage gap, not a correctness
+// one — but it is filled here rather than left implicit.
+//
+// FAIL-WITHOUT (parent 3092eb5, src/ reverted): rc=0, prints "False" —
+// silently wrong, should have been rejected. PASS-WITH (post-#3939): rc=1,
+// a located diagnostic naming `Equals` and `Sh`. A bare
+// `BEZEL_EXPECT_FALSE(r.ran)` cannot tell "rejected at compile time" apart
+// from a runtime crash or an ASan report (issue #3892) — this row uses
+// `failedAtCompileTimeWithRealLocation` instead.
+BEZEL_TEST(codegen_choice_equals_universal_argument_3893,
+           choice_equals_struct_mismatch_generic_arg_fails_closed_plain_dot_3939) {
+    auto r = runAot(
+        "module M3939repro; "
+        "choice Sh Circle(R: int), Square(S: int); end Sh; "
+        "record Pair(A: int, B: int); "
+        "class C "
+        "  public static method Foo<X>(s: Sh, arg: X): bool "
+        "    return s.Equals(arg); "
+        "  end Foo; "
+        "  public static method Main(): int "
+        "    var s: Sh := Sh.Circle(1); "
+        "    var b := C.Foo<Pair>(s, new Pair(1, 2)); "
+        "    Console.WriteLine(b.ToString()); "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    bool named = false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("member `Equals`") != std::string::npos &&
+            d.message.find("`M3939repro.Sh`") != std::string::npos)
+            named = true;
+    BEZEL_EXPECT_TRUE(named);
+    bool explainsWhy = false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("does not resolve to a value of that choice") !=
+            std::string::npos)
+            explainsWhy = true;
+    BEZEL_EXPECT_TRUE(explainsWhy);
 }
