@@ -9107,7 +9107,23 @@ llvm::Value* Emitter::buildRecordValue(
             // three following `byte` fields (255 where 0 is correct). One
             // definition, shared with the class site — see the declaration
             // comment on coerceInitializerToSlot.
-            const sema::TypeRef* initFty = recordMemberType(m);
+            //
+            // fix #3944 (§9.2 / §14.1, v0.294): `recordMemberTypeResolved`,
+            // not the bare `recordMemberType` — same defect class fix #3899
+            // closed in patternMatches's DestructuringPattern branch, at a
+            // different call site. The caller (`lowerNew`'s Record branch,
+            // ~line 6416 above) installs `genericSubst_`/`genericSubstSemaTy_`
+            // for THIS record's own concrete instantiation before calling
+            // buildRecordValue, so the substitution is active here. With the
+            // bare (unsubstituted) type, `isNullableVal` below saw a
+            // non-nullable bare `T` for a field whose ACTUAL instantiated
+            // type (e.g. `Box<int?>`'s `X: T`) is a nullable value — the
+            // {i8 hasValue; T value} wrap was skipped, and the raw payload
+            // was stored directly into a slot LLVM had already laid out
+            // (under the correctly-installed substitution) as the tagged
+            // struct: a silent wrong value (the payload's low byte
+            // corrupting `hasValue`, the real payload staying zero).
+            const sema::TypeRef* initFty = recordMemberTypeResolved(m);
             v = coerceInitializerToSlot(v, st->getElementType(idxIt->second),
                                         isUnsignedTargetExpr(*init));
             // CG-nullable: a NULLABLE VALUE field initialized with a plain
