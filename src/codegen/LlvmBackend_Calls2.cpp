@@ -2886,8 +2886,7 @@ llvm::Value* Emitter::emitUnitUniversalAnswer(std::string_view member,
 llvm::Value* Emitter::lowerValueSemMethodOn(const sema::TypeRef* recvTy,
                                             llvm::Value* recv,
                                             const ast::CallExpr& call,
-                                            std::string_view member,
-                                            bool viaNullCondWrapper) {
+                                            std::string_view member) {
     bool isToString    = member == "ToString"    && call.args.empty();
     bool isGetHashCode = member == "GetHashCode"  && call.args.empty();
     bool isEquals      = member == "Equals"       && call.args.size() == 1;
@@ -3079,29 +3078,40 @@ llvm::Value* Emitter::lowerValueSemMethodOn(const sema::TypeRef* recvTy,
         // vanishing via the #2491/#3079 warning backstop while `bezelc`
         // reported success.
         //
-        // UNLIKE #3922's record site, this exact source line is reached a
-        // SECOND way: `lowerNullCondValueSemCall`'s `?.` dispatch
-        // (`s?.Equals(arg)` on a nullable `Sh?`) already wraps ANY bare
-        // `nullptr` from this arm in its own §7.5/#3452 "declining inner
-        // lowering fails closed" diagnostic — this is
-        // `nullcond_unit_receiver_equals_hashcode_3452_test.cpp`'s PINNED T6
-        // row (`nullcond_declining_inner_lowering_fails_closed_spec_7_5`,
-        // `Foo<int>(s, 7)` with `s: Sh?`), already failing closed today, NOT
-        // a quiet degrade. Reporting a NEW diagnostic here unconditionally
-        // would fire BEFORE that wrapper's own `if (!res)` check ever saw a
-        // null (a non-null `PoisonValue` no longer trips it), silently
-        // changing T6's exact pinned diagnostic text. `viaNullCondWrapper`
-        // (set only by `lowerNullCondValueSemCall`'s own call site) is the
-        // "the caller already fails closed on a null return" signal issue
-        // #3925 asked for: when true, this arm keeps returning bare
-        // `nullptr`, exactly as before this fix, so T6's wrapper-diagnostic
-        // path and its asserted text are completely unchanged. When false —
-        // every PLAIN `.`/`!.` call site (the three other callers of this
-        // function, none of which pass `viaNullCondWrapper`) — there is no
-        // such wrapper, so this arm now reports its own located error
-        // instead of degrading, mirroring #3922's record fix and the ENUM
-        // arm's own pre-existing `!isIntegerTy()` precedent a few dozen
-        // lines above for the identical shape of problem.
+        // UNLIKE #3922's record site, this exact source line is ALSO reached
+        // through `lowerNullCondValueSemCall`'s `?.` dispatch (`s?.Equals(arg)`
+        // on a nullable `Sh?`), which owns its own §7.5/#3452 "declining inner
+        // lowering fails closed" diagnostic for any decline it sees return
+        // bare `nullptr` — `nullcond_unit_receiver_equals_hashcode_3452_test.cpp`'s
+        // T6 row. fix #3925 originally added a `viaNullCondWrapper` parameter
+        // here so THIS arm would keep returning bare `nullptr` under `?.` and
+        // let the wrapper's diagnostic keep winning there, reasoning that
+        // changing T6's pinned text was out of scope for that fix.
+        //
+        // fix #3943 (§8.1/§9.1/§9.2/§35.4/§35.7, v0.294) reverses that call.
+        // #3922's sibling record-arm fix made no equivalent accommodation —
+        // its non-struct guard (below, the record branch) reports
+        // unconditionally regardless of how it was reached — so the identical
+        // class of mistake produced ONE diagnostic for a record receiver via
+        // `?.` and, once #3942's sibling fix stopped the dead-template pass
+        // from ALSO firing the wrapper's diagnostic, a DIFFERENT diagnostic
+        // (the wrapper's generic §7.5 boilerplate) for a choice receiver via
+        // `?.` — an inconsistency a review measured directly (issue #3943).
+        // Comparing the two texts side by side: the wrapper's is generic and
+        // does not name what is wrong; this arm's names the receiver's type,
+        // cites §35.7's structural-equality rule, and gives two concrete
+        // remedies. The arm-level text is strictly more useful, so it is the
+        // one kept: this guard now reports UNCONDITIONALLY whenever live
+        // (mirroring the record arm exactly), `viaNullCondWrapper` has no
+        // remaining reader and is removed, and
+        // `nullcond_unit_receiver_equals_hashcode_3452_test.cpp`'s T6 (and T8,
+        // folded in by this same commit — see the struct-mismatch guard
+        // below) are updated in this commit to assert this arm's text instead
+        // (LANE_RULES §7: a fix reversing a prior diagnostic-choice must
+        // update the pins it displaces in the same commit). This cannot
+        // double-report: reporting here returns a non-null `PoisonValue`, so
+        // `lowerNullCondValueSemCall`'s own `if (!res)` check never sees a
+        // null for this path and stays silent.
         //
         // ⚠ `emittingGenericTemplateBody_` gating is load-bearing, not
         // decoration, for the SAME reason #3922's commit paid for directly:
@@ -3119,8 +3129,7 @@ llvm::Value* Emitter::lowerValueSemMethodOn(const sema::TypeRef* recvTy,
         // still bare-returns null exactly as before this fix; no operational
         // change there, since that body never runs.
         if (!other->getType()->isStructTy()) {
-            if (emittingGenericTemplateBody_ || viaNullCondWrapper)
-                return nullptr;
+            if (emittingGenericTemplateBody_) return nullptr;
             ctx_.diagnostics().report(
                 Severity::Error, call.span.begin,
                 "member `Equals` on a `" + spec85QualifiedTypeName(ts) +
@@ -3155,7 +3164,48 @@ llvm::Value* Emitter::lowerValueSemMethodOn(const sema::TypeRef* recvTy,
         // `ts`-typed argument's lowered value always IS `st` by construction, so
         // this reachable-only-through-the-unresolved-parameter path never fires
         // for it.
-        if (other->getType() != st) return nullptr;
+        //
+        // fix #3939 (§8.1/§35.4/§35.7, v0.294) folds in the diagnostic #3913
+        // left as a bare `return nullptr;`: the exact same #2491/#3079 quiet
+        // zero-degrade #3925 fixed for the non-struct axis above applies here
+        // too for a PLAIN `.`/`!.` access on a non-nullable choice receiver —
+        // MEASURED: `Foo<Pair>(s, new Pair(1, 2))` with `s: Sh` (non-nullable)
+        // compiled clean (rc=0) and silently dropped the comparison at run
+        // time, `bezelc` reporting success. Mirror the non-struct guard above
+        // and the record arm's own struct-mismatch guard (below, in this
+        // file): report unconditionally whenever live.
+        //
+        // ⚠ NO `emittingGenericTemplateBody_` GATE IS NEEDED HERE, unlike the
+        // non-struct guard above — this was #3939's own open question
+        // ("worth confirming... before assuming the gate is (or is not)
+        // needed"), resolved by reading the control flow rather than a fresh
+        // debug print: the dead abstract-template pass's placeholder for an
+        // unresolved type parameter is MEASURED (via the debug print in
+        // #3922's own commit) to always be an `i32`, never a struct. In that
+        // pass `other->getType()->isStructTy()` is therefore always false, so
+        // the non-struct guard four lines above — which DOES gate on
+        // `emittingGenericTemplateBody_` — already returns bare `nullptr` and
+        // this line is never reached at all during the dead pass, for ANY
+        // generic method containing this call shape. The record arm's own
+        // struct-mismatch guard (below, fix #3918) is structurally identical
+        // — its own non-struct guard gates on `emittingGenericTemplateBody_`
+        // the same way, so it is unreachable in the dead pass for the same
+        // reason — and it, too, has no such gate; this guard follows that
+        // established (if previously undocumented) pattern rather than being
+        // a special case.
+        if (other->getType() != st) {
+            ctx_.diagnostics().report(
+                Severity::Error, call.span.begin,
+                "member `Equals` on a `" + spec85QualifiedTypeName(ts) +
+                "` receiver was given an argument whose type this "
+                "instantiation does not resolve to a value of that choice, "
+                "and \xC2\xA7""35.7's choice equality is defined over the "
+                "active case's payload only, so no comparison can be "
+                "emitted; give the argument the choice type, or compare "
+                "through an `Object`-typed operand (language spec "
+                "\xC2\xA7""8.1 / \xC2\xA7""35.4 / \xC2\xA7""35.7)");
+            return llvm::PoisonValue::get(i1());
+        }
         return emitChoiceEquality(recv, other, ts);
     }
     if (!isRecord && !isEnum) return nullptr;
@@ -14164,13 +14214,22 @@ llvm::Value* Emitter::lowerNullCondValueSemCall(
     // GetHashCode/Equals go through the factored value-semantics core.
     llvm::Value* res = isToString
         ? emitValueToString(innerVal, &innerTy)
-        // fix #3925: this IS the `?.` wrapper — tell the dispatch core so its
-        // choice-arm non-struct decline keeps returning bare `nullptr` here
-        // (routing into THIS function's own diagnostic below, unchanged)
-        // rather than reporting its own, which would change the pinned T6
-        // diagnostic text.
-        : lowerValueSemMethodOn(&innerTy, innerVal, call, nm.member,
-                                 /*viaNullCondWrapper=*/true);
+        // fix #3943 (§8.1/§9.1/§9.2/§35.4/§35.7, v0.294): this IS the `?.`
+        // wrapper. Earlier (#3925) this call site passed a
+        // `viaNullCondWrapper=true` flag so the dispatch core's choice-arm
+        // non-struct decline would keep returning bare `nullptr` here and let
+        // THIS function's own diagnostic below win. #3943 reversed that: the
+        // dispatch core's own record/choice diagnostics name the receiver
+        // type and the precise structural-equality rule with two concrete
+        // remedies, which a review found strictly more useful than this
+        // function's generic §7.5 restatement below — so every decline in
+        // the dispatch core that has its own diagnostic now reports it
+        // unconditionally and returns a non-null `PoisonValue`, meaning `res`
+        // is never null for those paths any more and this call site's own
+        // `if (!res)` diagnostic below stays silent for them without needing
+        // to be told how it was reached. `viaNullCondWrapper` therefore has
+        // no remaining reader and was removed.
+        : lowerValueSemMethodOn(&innerTy, innerVal, call, nm.member);
     if (!res) {
         // fix #3452 follow-up (§7.5, v0.283): a declining inner lowering must
         // leave WELL-FORMED IR behind **and must still fail the compile**.
@@ -14208,18 +14267,49 @@ llvm::Value* Emitter::lowerNullCondValueSemCall(
         // That defect is owned elsewhere; this block's job is only to stop it
         // failing open, and T6 in the companion test file is the row that pins
         // it against exactly that receiver.
-        std::string recvName;
-        if (innerTy.declaration)
-            recvName = spec85QualifiedTypeName(innerTy.declaration);
-        ctx_.diagnostics().report(
-            Severity::Error, call.span.begin,
-            "member `" + std::string(nm.member) + "` on a `?.` access to " +
-            (recvName.empty() ? std::string("this nullable value-typed receiver")
-                              : ("a nullable `" + recvName + "` receiver")) +
-            " has no lowering for the argument or receiver shape given here, so "
-            "no value can be produced; language spec \xC2\xA7""7.5 reserves the "
-            "`null` result of `?.` for a null receiver, so the access cannot be "
-            "silently answered `null` instead (tracked #3545)");
+        //
+        // fix #3942 (§7.5/#3452, v0.294): the diagnostic just above is gated
+        // on `!emittingGenericTemplateBody_`, unlike every arm-level decline
+        // diagnostic in `lowerValueSemMethodOn` (#3913/#3918/#3922/#3925/
+        // #3939 all add that gate specifically). A generic method's body is
+        // compiled TWICE — once per live instantiation, and once as a dead,
+        // never-invoked "abstract template" pass so its own IR verifies
+        // (#817/§14.2) — and in that dead pass an unresolved type parameter's
+        // lowered representation is always an `i32` placeholder, never a
+        // struct, so `lowerValueSemMethodOn` bare-declines (returns `nullptr`)
+        // in the dead pass for the SAME reason it would for a genuinely
+        // non-struct live instantiation. Without this gate, THIS function
+        // converted that harmless dead-pass decline into a hard, located
+        // `Severity::Error` unconditionally — MEASURED (issue #3942):
+        // `s?.Equals(arg)` inside `Foo<X>(s: Sh?, arg: X)` called ONLY as
+        // `Foo<Sh>(s, other)` (a completely well-typed live instantiation:
+        // `X` substitutes to the receiver's own type) was rejected outright,
+        // independent of what the only live call site instantiated `X` to —
+        // a total false-reject of a correct program. The plain `.` spelling
+        // of the identical program was unaffected (no such wrapper sits
+        // above the plain-`.`/`!.` call sites), confirming the defect was
+        // specific to this function, not the dispatch core's classification.
+        //
+        // The IR-well-formedness half (closing `callBB` into `endBB`) is NOT
+        // part of the diagnostic and must run regardless of which pass this
+        // is — skipping it during the dead pass would reopen the exact
+        // "Basic Block ... does not have terminator!" failure the #3452
+        // follow-up fixed, since `callBB`/`endBB` are created and branched to
+        // unconditionally above, in every pass.
+        if (!emittingGenericTemplateBody_) {
+            std::string recvName;
+            if (innerTy.declaration)
+                recvName = spec85QualifiedTypeName(innerTy.declaration);
+            ctx_.diagnostics().report(
+                Severity::Error, call.span.begin,
+                "member `" + std::string(nm.member) + "` on a `?.` access to " +
+                (recvName.empty() ? std::string("this nullable value-typed receiver")
+                                  : ("a nullable `" + recvName + "` receiver")) +
+                " has no lowering for the argument or receiver shape given here, so "
+                "no value can be produced; language spec \xC2\xA7""7.5 reserves the "
+                "`null` result of `?.` for a null receiver, so the access cannot be "
+                "silently answered `null` instead (tracked #3545)");
+        }
         builder_.CreateBr(endBB);
         builder_.SetInsertPoint(endBB);
         return nullptr;

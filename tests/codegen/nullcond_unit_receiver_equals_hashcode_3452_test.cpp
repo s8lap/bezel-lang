@@ -289,6 +289,28 @@ BEZEL_TEST(codegen_nullcond_unit_receiver_equals_hashcode_3452,
 // Deleting the row was the alternative and would have retired the guard the
 // previous commit added it for, one commit after adding it.
 //
+// ⚠⚠⚠ THE ASSERTED TEXT MOVED A THIRD TIME (fix #3943, §8.1/§9.1/§9.2/§35.4/
+// §35.7, v0.294) — the row did NOT weaken, only the SOURCE of the diagnostic
+// changed. Every prior version of this row asserted THIS function's own
+// `?.`-wrapper text (`lowerNullCondValueSemCall`'s "declining inner lowering
+// fails closed", citing bare §7.5) — the choice arm's own non-struct decline
+// (`lowerValueSemMethodOn`, LlvmBackend_Calls2.cpp) deliberately stayed
+// silent under `?.` via a `viaNullCondWrapper` parameter #3925 added
+// specifically to keep this row's text unchanged. #3943 reversed that after
+// a review compared the two diagnostics side by side: the wrapper's text
+// above is generic boilerplate restating §7.5, while the arm's own text
+// names the receiver's type, cites §35.7's structural-equality rule
+// directly, and gives two concrete remedies (retype the argument, or compare
+// through `Object`) — strictly more useful for identical information. The
+// arm now reports unconditionally regardless of how it is reached, and
+// returns a non-null `PoisonValue`, so this function's own `if (!res)` check
+// never sees a null for this path any more and never fires its own
+// diagnostic here — the WRAPPER'S text asserted by every prior version of
+// this row no longer appears for this program at all. What this row proves
+// is unchanged in kind (the compile is REJECTED, with a diagnostic naming
+// `Equals` and `M3452F.Sh`) — only which of the two pre-existing diagnostic
+// texts is the one produced.
+//
 // The TEXT is asserted, not `hasErrors()` (which the IR-verifier abort also
 // satisfies) and not `!ran` alone (which the BASE also satisfies) — only the new
 // diagnostic distinguishes this commit from both other states.
@@ -313,13 +335,15 @@ BEZEL_TEST(codegen_nullcond_unit_receiver_equals_hashcode_3452,
         "end C;");
     BEZEL_EXPECT_FALSE(r.ran);
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    bool located = false;
+    // fix #3943: this is now the CHOICE ARM's own diagnostic (mirroring the
+    // record arm's text, `record_enum_equals_universal_argument_3538_test.cpp`),
+    // not the `?.`-wrapper's generic §7.5 restatement.
+    bool explainsWhy = false;
     for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find(
-                "reserves the `null` result of `?.` for a null receiver") !=
+        if (d.message.find("does not resolve to a value of that choice") !=
             std::string::npos)
-            located = true;
-    BEZEL_EXPECT_TRUE(located);
+            explainsWhy = true;
+    BEZEL_EXPECT_TRUE(explainsWhy);
     // …and it must name the member and the receiver type, which is the whole
     // point of replacing "IR verification failed" with a real diagnostic.
     bool named = false;
@@ -328,6 +352,20 @@ BEZEL_TEST(codegen_nullcond_unit_receiver_equals_hashcode_3452,
             d.message.find("`M3452F.Sh`") != std::string::npos)
             named = true;
     BEZEL_EXPECT_TRUE(named);
+    // fix #3943: exactly ONE diagnostic naming this call site — the
+    // wrapper's own generic text must not ALSO appear (that would be the
+    // double-diagnostic #3943 measured, or a #3942-shaped dead-template-pass
+    // duplicate of either text).
+    int equalsDiagCount = 0;
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        if (d.message.find("member `Equals`") != std::string::npos)
+            ++equalsDiagCount;
+        BEZEL_EXPECT_TRUE(
+            d.message.find(
+                "reserves the `null` result of `?.` for a null receiver") ==
+            std::string::npos);
+    }
+    BEZEL_EXPECT_EQ(equalsDiagCount, 1);
 }
 
 // ── T7 — BOTH-SIDES CONTROL. Every other row in this file fails 100% without
@@ -379,6 +417,18 @@ BEZEL_TEST(codegen_nullcond_unit_receiver_equals_hashcode_3452,
 // false), which is exactly the FAIL-WITHOUT asymmetry this row exists to
 // prove: pre-fix, `bezelc` (and the harness's forked child running it) dies
 // by signal instead of returning a diagnostic.
+//
+// ⚠ THE ASSERTED TEXT MOVED (fix #3939 folded into fix #3943, §8.1/§35.4/
+// §35.7, v0.294), for the SAME reason and at the SAME time as T6's: #3913
+// left this exact decline a BARE `return nullptr;` with no diagnostic of its
+// own, so pre-#3939 this row's fail-closed behavior came ENTIRELY from the
+// `?.` wrapper's generic text (the same one T6 used to assert). #3939 gave
+// the choice arm's struct-mismatch guard its own located diagnostic — IDENTICAL
+// text to the non-struct guard's (T6), mirroring the record arm's own
+// established precedent of using one message for both its non-struct and
+// struct-mismatch guards (`record_enum_equals_universal_argument_3538_test.cpp`'s
+// T7/T9) — so this row asserts the SAME "does not resolve to a value of that
+// choice" text T6 now does, not a distinct one.
 BEZEL_TEST(codegen_nullcond_unit_receiver_equals_hashcode_3452,
            nullcond_choice_struct_shaped_generic_arg_fails_closed_not_crash_3913) {
     auto r = runAot(
@@ -401,17 +451,141 @@ BEZEL_TEST(codegen_nullcond_unit_receiver_equals_hashcode_3452,
         "end C;");
     BEZEL_EXPECT_FALSE(r.ran);
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    bool located = false;
+    bool explainsWhy = false;
     for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find(
-                "reserves the `null` result of `?.` for a null receiver") !=
+        if (d.message.find("does not resolve to a value of that choice") !=
             std::string::npos)
-            located = true;
-    BEZEL_EXPECT_TRUE(located);
+            explainsWhy = true;
+    BEZEL_EXPECT_TRUE(explainsWhy);
     bool named = false;
     for (const auto& d : r.diagnostics.diagnostics())
         if (d.message.find("member `Equals`") != std::string::npos &&
             d.message.find("`M3452F.Sh`") != std::string::npos)
             named = true;
     BEZEL_EXPECT_TRUE(named);
+    int equalsDiagCount = 0;
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        if (d.message.find("member `Equals`") != std::string::npos)
+            ++equalsDiagCount;
+        BEZEL_EXPECT_TRUE(
+            d.message.find(
+                "reserves the `null` result of `?.` for a null receiver") ==
+            std::string::npos);
+    }
+    BEZEL_EXPECT_EQ(equalsDiagCount, 1);
+}
+
+// ── T9 (fix #3942, §7.5/#3452, v0.294) — HIGH-SEVERITY FALSE-REJECT CONTROL.
+// `lowerNullCondValueSemCall`'s own decline-fails-closed diagnostic (T6/T8's
+// wrapper text) had no `emittingGenericTemplateBody_` guard, unlike every
+// arm-level decline diagnostic in `lowerValueSemMethodOn`. A generic method's
+// body is compiled TWICE: once as a dead, never-invoked "abstract template"
+// pass (where an unresolved type parameter's placeholder is always `i32`),
+// and once per live instantiation. `Foo<X>(s: Sh?, arg: X)` below is called
+// ONLY as `Foo<Sh>(s, other)` — `X` substitutes to the RECEIVER'S OWN type, a
+// completely well-typed instantiation that should compute the real §35.7
+// answer — but pre-fix, the dead pass's harmless `i32`-placeholder decline
+// was unconditionally promoted to a hard compile error, rejecting this
+// program independent of what its only live call site instantiated `X` to.
+// MEASURED on the pre-#3942 tree: `bezelc` on this exact program exited 1
+// with T6's old wrapper diagnostic; the plain `.` spelling of the identical
+// program (`s: Sh`, not `Sh?`) was unaffected (compiled clean and printed
+// `True`), confirming the defect was specific to the `?.` wrapper, not the
+// dispatch core's classification of the call.
+BEZEL_TEST(codegen_nullcond_unit_receiver_equals_hashcode_3452,
+           nullcond_choice_own_type_generic_arg_via_null_cond_still_lowers_3942) {
+    auto r = runAot(
+        "module M3942A; "
+        "choice Sh "
+        "  Circle(R: int), "
+        "  Square(S: int); "
+        "end Sh; "
+        "class C "
+        "  public static method Foo<X>(s: Sh?, arg: X): bool? "
+        "    return s?.Equals(arg); "
+        "  end Foo; "
+        "  public static method Main(): int "
+        "    var s: Sh? := Sh.Circle(1); "
+        "    var other := Sh.Circle(1); "
+        "    var diff := Sh.Square(1); "
+        "    var same := C.Foo<Sh>(s, other); "
+        "    var notSame := C.Foo<Sh>(s, diff); "
+        "    Console.WriteLine((if same = null then \"null\" else same!.ToString())); "
+        "    Console.WriteLine((if notSame = null then \"null\" else notSame!.ToString())); "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("True\nFalse\n"));
+}
+
+// ── T10 (fix #3942, §7.5/#3452, v0.294) — the RECORD twin of T9. Issue #3942's
+// own repro used a record receiver to show the defect is a property of the
+// shared `?.` wrapper, not specific to the choice arm's classification logic;
+// this row pins that repro directly (`p: Pt?`, `Foo<Pt>(p, other)`).
+BEZEL_TEST(codegen_nullcond_unit_receiver_equals_hashcode_3452,
+           nullcond_record_own_type_generic_arg_via_null_cond_still_lowers_3942) {
+    auto r = runAot(
+        "module M3942B; "
+        "record Pt(X: int, Y: int); "
+        "class C "
+        "  public static method Foo<Arg>(p: Pt?, arg: Arg): bool? "
+        "    return p?.Equals(arg); "
+        "  end Foo; "
+        "  public static method Main(): int "
+        "    var p: Pt? := new Pt(1, 2); "
+        "    var same: Pt := new Pt(1, 2); "
+        "    var diff: Pt := new Pt(9, 9); "
+        "    var a := C.Foo<Pt>(p, same); "
+        "    var b := C.Foo<Pt>(p, diff); "
+        "    Console.WriteLine((if a = null then \"null\" else a!.ToString())); "
+        "    Console.WriteLine((if b = null then \"null\" else b!.ToString())); "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("True\nFalse\n"));
+}
+
+// ── T11 (fix #3943, §8.1/§9.1/§9.2/§35.4/§35.7, v0.294) — the RECORD twin of
+// T6/T8's single-diagnostic assertion, pinning issue #3943's own repro
+// directly: a nullable record accessed via `?.` with a generic method's
+// instantiation genuinely NOT resolving to that record (`Foo<int>(p, 7)`)
+// must produce EXACTLY ONE diagnostic for the one call site. MEASURED on the
+// pre-#3942/#3943 tree: this exact program printed BOTH the `?.` wrapper's
+// generic text (from the dead template pass, #3942's bug) AND the record
+// arm's own specific text (from the live pass, #3922's unconditional report)
+// — two diagnostics for one call site.
+BEZEL_TEST(codegen_nullcond_unit_receiver_equals_hashcode_3452,
+           nullcond_record_bad_instantiation_single_diagnostic_not_double_3943) {
+    auto r = runAot(
+        "module M3943; "
+        "record Pt(X: int, Y: int); "
+        "class C "
+        "  public static method Foo<Arg>(p: Pt?, arg: Arg): bool? "
+        "    return p?.Equals(arg); "
+        "  end Foo; "
+        "  public static method Main(): int "
+        "    var p: Pt? := new Pt(1, 2); "
+        "    var b := C.Foo<int>(p, 7); "
+        "    Console.WriteLine((if b = null then \"null\" else b!.ToString())); "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    int equalsDiagCount = 0;
+    bool sawWrapperText = false;
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        if (d.message.find("member `Equals`") != std::string::npos)
+            ++equalsDiagCount;
+        if (d.message.find(
+                "reserves the `null` result of `?.` for a null receiver") !=
+            std::string::npos)
+            sawWrapperText = true;
+    }
+    BEZEL_EXPECT_EQ(equalsDiagCount, 1);
+    BEZEL_EXPECT_FALSE(sawWrapperText);
 }

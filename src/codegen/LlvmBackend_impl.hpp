@@ -4071,24 +4071,28 @@ private:
     // (i1) / record-or-enum ToString result, or null if not handled (a primitive
     // ToString is left to the dedicated string path).
     //
-    // fix #3925 (§8.1/§35.4/§35.7, v0.294): `viaNullCondWrapper` says whether
-    // THIS call came from `lowerNullCondValueSemCall`'s `?.` dispatch, which
-    // already converts a bare `nullptr` return into its own located §7.5/#3452
-    // "declining inner lowering fails closed" diagnostic (see that function).
-    // The choice `Equals` arm's own non-struct decline needs to know this: a
-    // PLAIN `.`/`!.` call site (the default, `false`) has no such wrapper
-    // above it, so a bare decline there falls through to ordinary member
-    // dispatch and quietly degrades to the #2491/#3079 warning backstop
-    // instead of failing the build — the defect this fix closes. Reported
-    // ONLY when `false`; when `true` the arm still returns bare `nullptr` so
-    // the `?.` wrapper's own diagnostic (pinned verbatim by
-    // `nullcond_unit_receiver_equals_hashcode_3452_test.cpp`'s T6 row) keeps
-    // winning, unchanged.
+    // fix #3925 (§8.1/§35.4/§35.7, v0.294) originally added a `viaNullCondWrapper`
+    // parameter here so a `?.` call site (`lowerNullCondValueSemCall`) could
+    // tell the choice arm's non-struct decline to stay silent and let the
+    // wrapper's own §7.5/#3452 diagnostic win instead. fix #3943 (§8.1/§9.1/
+    // §9.2/§35.4/§35.7, v0.294) reversed that choice after a review compared
+    // the two diagnostics side by side: the wrapper's text is generic
+    // boilerplate restating §7.5, while this function's own record/choice
+    // diagnostics name the receiver's type and cite the precise structural-
+    // equality rule with two concrete remedies — strictly more useful for
+    // identical information. Every decline in this function that has its own
+    // diagnostic now reports it unconditionally (gated only on
+    // `emittingGenericTemplateBody_`, never on how it was reached), and
+    // returns a non-null `PoisonValue` on report, so `lowerNullCondValueSemCall`'s
+    // own `if (!res)` check never sees a null for these paths and stays
+    // silent — no double-reporting. `viaNullCondWrapper` accordingly has no
+    // remaining reader and was removed; see #3943's commit for the measured
+    // before/after and the updated
+    // `nullcond_unit_receiver_equals_hashcode_3452_test.cpp` T6/T8 pins.
     llvm::Value* lowerValueSemMethodOn(const sema::TypeRef* recvTy,
                                        llvm::Value* recv,
                                        const ast::CallExpr& call,
-                                       std::string_view member,
-                                       bool viaNullCondWrapper = false);
+                                       std::string_view member);
 
     // §7.5 / #1075: lower `valueRecv?.ToString()/GetHashCode()/Equals(x)` on a
     // NULLABLE value-type/enum/record receiver — `hasValue ? wrap(method(inner))

@@ -204,10 +204,14 @@ BEZEL_TEST(codegen_choice_equals_universal_argument_3893,
 // type and rejects the build (`r.ran` false) instead of degrading the
 // statement to nothing. This call site is a PLAIN `.` access (`s: Sh`, not
 // `Sh?`) — the OTHER access path, `s?.Equals(arg)` on `s: Sh?`, is the
-// DIFFERENT, ALREADY-fine `?.` spelling pinned by
-// `nullcond_unit_receiver_equals_hashcode_3452_test.cpp`'s T6 row, which
-// this fix's `viaNullCondWrapper` parameter deliberately leaves untouched
-// (see that file and the fix's own source comment).
+// DIFFERENT `?.` spelling pinned by
+// `nullcond_unit_receiver_equals_hashcode_3452_test.cpp`'s T6 row. At the
+// time this fix (#3925) landed, T6 was pinned to a DIFFERENT diagnostic (the
+// `?.` wrapper's own generic §7.5 text, via a `viaNullCondWrapper` parameter
+// this fix added so the arm stayed silent under `?.`); fix #3943 later
+// reversed that choice — this arm's own text was found strictly more useful
+// — and updated T6 (and added a T8) to assert THIS arm's text instead, so
+// both access spellings now report the identical diagnostic below.
 BEZEL_TEST(codegen_choice_equals_universal_argument_3893,
            choice_equals_non_struct_generic_arg_fails_closed_not_degraded_3925) {
     auto r = runAot(
@@ -246,8 +250,8 @@ BEZEL_TEST(codegen_choice_equals_universal_argument_3893,
 // real value rather than newly declining. This is a narrower repeat of T5b
 // in `nullcond_unit_receiver_equals_hashcode_3452_test.cpp` (which already
 // covers `Foo<int>` on `Sh?`); pinned here too because it is the row this
-// fix's `emittingGenericTemplateBody_`/`viaNullCondWrapper` gating could
-// most plausibly have broken by being too broad.
+// fix's `emittingGenericTemplateBody_` gating could most plausibly have
+// broken by being too broad.
 BEZEL_TEST(codegen_choice_equals_universal_argument_3893,
            choice_equals_own_type_generic_arg_still_lowers_3925) {
     auto r = runAot(
