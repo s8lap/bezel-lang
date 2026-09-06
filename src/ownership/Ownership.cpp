@@ -2564,6 +2564,81 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
     // §3.6 rule; this site fires per instantiation category and the
     // diagnostic names the declaration.
     if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(&s)) {
+        // fix #3864 (§21.1, §28.2, §28.3, v0.294): the const arm's twin of
+        // `handleLocalDecl`'s FIRST call — `checkRead(*ld.initializer,
+        // /*selfTarget=*/false)` — was simply missing here. §21.1 states a
+        // `const` initializer that is not a rejected owned production "is
+        // then a borrow carrying the initializer's source-liveness
+        // constraints, exactly as a plain unmarked `var` alias" — but a
+        // BORROW of an already-moved-from or already-disposed local is
+        // exactly the use `checkRead` exists to catch (K1.3/K1.4, §28.2), and
+        // nothing in this arm ever called it: `constInitializerRejected` /
+        // `producerState` decide only whether the WHOLE initializer is a
+        // rejected owned PRODUCTION, `recordMovesIn` below only walks
+        // OUT-transfers (ref/out writes, move markers) reached FROM this
+        // initializer — neither inspects whether a bare identifier read
+        // inside it names a local already in `MovedFrom`/`Disposed` state.
+        // Measured: `var x := new Res(); Sink.Take(move x); const y := x;`
+        // (Take auto-disposes the moved-in value at method end, §28.3
+        // auto-drop) compiled clean with zero diagnostics and heap-use-after-
+        // freed under ASan on a later read of `y`; the byte-identical `var y
+        // := x;` in the same position is correctly rejected: "owned value in
+        // `x` was already moved out at this point (§28.3)". Likewise `var x
+        // := new Res(); x.Dispose(); const y := x;` drew no diagnostic at
+        // all, where the `var` twin draws §28.2's existing use-after-dispose
+        // WARNING.
+        //
+        // fix #3941 (§21.1, §28.3, v0.294): a `topLevelConsume` guard IS
+        // needed here after all, mirroring `handleLocalDecl`'s exactly — the
+        // ORIGINAL #3864 fix reasoned that §21.1 already rejects a top-level
+        // `move x` outright (via `constInitializerRejected`/`producerState`
+        // below), so nothing downstream could be "stolen or weakened" by
+        // running `checkRead` first. That reasoning proved a top-level
+        // `move`/`owned`-marker shape can never SLIP PAST the arm unrejected
+        // (true — no false ACCEPT), but missed that the arm's rejection is
+        // not the only diagnostic in play: `recordMovesIn` below still runs
+        // unconditionally on `lc->value` and, for a top-level `move x`,
+        // reaches `markMovedByName` (Ownership_Checks.cpp) — the SAME
+        // more-specific consume check `handleLocalDecl`'s twin call defers to
+        // for exactly this reason. Measured differentially against
+        // `origin/main` (pre-#3864): for `var x := new Res(); x.Dispose();
+        // const y := move x;` — pre-#3864 (and pre-this-fix) emits TWO
+        // diagnostics, `... must not take an owned production ...` (§21.1,
+        // from `constInitializerRejected` below) AND, from
+        // `markMovedByName`'s own `Disposed` branch, the precise ERROR
+        // `cannot move from disposed local \`x\` (§28.3)`. With the
+        // unconditional `checkRead` the #3864 fix first shipped, `checkRead`
+        // runs BEFORE `recordMovesIn`, its `IdentifierExpr` arm sees `x`
+        // still `Disposed`, reports the GENERIC §28.2 "use of `x` after a
+        // dominating explicit Dispose() call" WARNING, and — critically —
+        // POISONS `x`'s state; `markMovedByName` has NO `Poisoned` branch (by
+        // design, per its own doc comment: "this function ... does not
+        // recognize [Poisoned] ... falls through to the plain-move path"),
+        // so it silently falls through and the precise ERROR never fires.
+        // Net effect: the program is still rejected either way (§21.1's
+        // top-level message survives unconditionally), but the SPECIFIC
+        // §28.3 double-consume diagnostic — an ERROR, not a WARNING — was
+        // downgraded away. Guarding `checkRead` for a top-level `move`
+        // restores the pre-#3864 two-diagnostic set exactly, closing #3941.
+        //
+        // Extended to `await` too, exactly matching `handleLocalDecl`'s
+        // guard condition rather than inventing a narrower one: a top-level
+        // Pattern-B `await x` is likewise already caught by
+        // `constInitializerRejected` (`producerState` classifies it Owned)
+        // regardless of `x`'s runtime state, so guarding `checkRead` here
+        // costs no ACCEPT-direction coverage — the program stays rejected.
+        // (Unlike the `var` path, this arm has no `recordAwaitOperandConsume`
+        // call to hand off to for the *precise* double-await diagnostic —
+        // wiring that in is a separate, unstarted concern, not part of this
+        // fix; the `constInitializerRejected` message alone still surfaces
+        // the bug.) // per §21.1, §28.2, §28.3, v0.294, #3864, #3941
+        bool topLevelConsume = false;
+        if (lc->value) {
+            if (auto* ue = dynamic_cast<const ast::UnaryExpr*>(lc->value.get()))
+                topLevelConsume = (ue->op == "move" || ue->op == "await");
+        }
+        if (lc->value && !topLevelConsume)
+            checkRead(*lc->value, /*selfTarget=*/false);
         // fix #2709 (v0.240): the SHARED gate. `constInitializerRejected` is
         // the single authority for "does §21.1 reject this initializer?", and
         // the lint guard in handleLocalDecl consults the SAME function — so
