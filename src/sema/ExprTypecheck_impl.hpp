@@ -1983,6 +1983,34 @@ private:
     void checkOrderingPatternOverNullableType(const TypeRef* ty,
                                               const ast::Pattern* pat);
 
+    // #726 / §19.3 / #3909 (§35.5, v0.294): the ONE "bind names inside a
+    // NESTED DestructuringPattern sub-pattern" walk (`Outer(Inner(v), b)`).
+    // Before #3909, this walk existed ONLY inline in the two RECORD-
+    // scrutinee DestructuringPattern handlers (CaseExpr in
+    // ExprTypecheck_Exprs.cpp, CaseStmt here) — copy-pasted between them —
+    // and the two CHOICE-case-payload handlers had no equivalent at all, so
+    // `Wrap(Inner(v)) => v` over a choice case left `v` unresolved even
+    // though the identical shape over a record (`Outer(Inner(v)) => v`)
+    // worked. Factored out here (mirroring the #3692
+    // checkOrderingPatternOverNullableType precedent just above, the same
+    // "four call sites, one walk" shape) so the CHOICE handlers gain the
+    // capability by calling this, rather than by copying the walk a THIRD
+    // and FOURTH time — landing #3909 this way REDUCES the count of raw
+    // copies (2 -> 0 hand-copies, 1 shared implementation) while adding the
+    // missing choice-side capability. `subPatterns` is the outer
+    // DestructuringPattern's own subPatterns list (a record's positional
+    // fields, or a choice case's payload slots — the walk does not care
+    // which); it descends into any slot that is itself a nested
+    // DestructuringPattern and registers a LocalSymbol into `armScope` for
+    // each of ITS naked/`var` bindings, recursing further for deeper
+    // nesting. #1281: sets each nested binding's declType from its inner
+    // record's positional field so a member access on a nested class/
+    // record binding in the arm body resolves (a null declType left
+    // `Outer(Inner(x)) => x.Id` unresolved / miscompiled).
+    void bindNestedDestructuringNames(
+        Scope& armScope,
+        const std::vector<ast::PositionalPattern>& subPatterns);
+
     // §7.4 (issue #418): update `nullNarrowed_` for an assignment of a value of
     // `valueType` to the simple variable `sym` — a non-null value makes it
     // known-non-null; a (possibly-)null value clears that knowledge. `value`

@@ -9687,6 +9687,19 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                                 armScope.names[vbp->name] = lsym;
                             }
                         }
+                        // §35.5 / fix #3909: bind names inside a NESTED
+                        // destructuring sub-pattern one level below a choice
+                        // case's payload slots (`Wrap(Inner(v)) => v`, `Inner`
+                        // a record) — the loop above only registers a
+                        // LocalSymbol for a TOP-LEVEL slot's own naked/`var`
+                        // binding, so `v` was left unresolved even though the
+                        // identical shape over a record scrutinee
+                        // (`Outer(Inner(v)) => v`) already worked. Call the
+                        // shared walk (see its declaration comment in
+                        // ExprTypecheck_impl.hpp) — also used by the record-
+                        // scrutinee handler below and by the CaseStmt twin —
+                        // rather than adding a third/fourth hand-copy of it.
+                        bindNestedDestructuringNames(armScope, dp->subPatterns);
                         Scope* saveScope = currentScope_;
                         currentScope_ = &armScope;
                         if (arm.guard) visitExpr(*arm.guard);
@@ -9862,118 +9875,13 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                         armScope.names[vbp->name] = lsym;
                     }
                 }
-                // #726 / §19.3: also bind the names inside NESTED destructuring
-                // sub-patterns (`Outer(Inner(v), b)`). The top-level loop above
-                // only handles naked/`var` binds; a nested DestructuringPattern
-                // sub-pattern was skipped, so `v` never entered armScope and the
-                // body's identifier resolution failed. Walk a worklist of nested
-                // patterns and register their binds.
-                // #1281 (§19.3): the nested binding's declType MUST be its inner
-                // record field's type — the top-level binds set it, but the nested
-                // walk left it null ("best-effort"). With a null declType a nested
-                // binding of a class/record field could not resolve a member access
-                // in the arm body (`Outer(Inner(x)) => x.Id` — sema can't type `x`,
-                // so `x.Id` returns no symbol → fieldAddr null → the case-expr's
-                // `case.end` is left unterminated → IR verification failure). Set
-                // it from the inner record's positional field at each index.
-                {
-                    auto fieldsOfRecord =
-                        [&](const ast::QualifiedName* tn) -> std::vector<FieldSymbol*> {
-                        std::vector<FieldSymbol*> out;
-                        if (!tn || tn->parts.empty()) return out;
-                        std::string_view nm = tn->parts.back();
-                        // fix #2844 / §19.3 / §2.8.3 rule 4 (v0.240): an
-                        // imported record's TypeSymbol lives in
-                        // `ctx_.importedSymbols()` — `ctx_.symbols()` is
-                        // local-only (SemaContext.hpp:90's `symbols_`).
-                        // Without this widening, a NESTED destructuring
-                        // (`Outer(Inner(x))`) where `Outer` and `Inner`
-                        // are both imported left `ndFields` empty and
-                        // `fieldTy` null — the nested binding's `declType`
-                        // stayed null, the arm body's `x.Id` couldn't
-                        // resolve, and the case-expr's `case.end` ended
-                        // up unterminated (the same defect class the
-                        // #2844 issue reports at the top level). The
-                        // top-level case-pattern lookup is fixed in
-                        // patternMatches' DestructuringPattern branch
-                        // (LlvmBackend_Exprs2.cpp) and the parallel
-                        // CaseStmt lambda below.
-                        TypeSymbol* ts = nullptr;
-                        for (const auto& sym : ctx_.symbols()) {
-                            auto* c = dynamic_cast<TypeSymbol*>(sym.get());
-                            if (c && c->name == nm &&
-                                c->kind == ast::TypeDeclKind::Record) {
-                                ts = c;
-                                break;
-                            }
-                        }
-                        if (!ts) {
-                            for (Symbol* s : ctx_.importedSymbols()) {
-                                auto* c = dynamic_cast<TypeSymbol*>(s);
-                                if (c && c->name == nm &&
-                                    c->kind == ast::TypeDeclKind::Record) {
-                                    ts = c;
-                                    break;
-                                }
-                            }
-                        }
-                        if (!ts) return out;
-                        for (Symbol* m : ts->members) {
-                            auto* fs = dynamic_cast<FieldSymbol*>(m);
-                            if (!fs) continue;
-                            bool isStatic = false;
-                            for (auto& md : fs->modifiers)
-                                if (md == "static") { isStatic = true; break; }
-                            if (!isStatic) out.push_back(fs);
-                        }
-                        return out;
-                    };
-                    std::vector<const ast::DestructuringPattern*> nestedWork;
-                    for (const auto& sp : dp->subPatterns)
-                        if (sp.nakedBinding.empty())
-                            if (auto* nd = dynamic_cast<
-                                    const ast::DestructuringPattern*>(
-                                    sp.pattern.get()))
-                                nestedWork.push_back(nd);
-                    while (!nestedWork.empty()) {
-                        const ast::DestructuringPattern* nd = nestedWork.back();
-                        nestedWork.pop_back();
-                        std::vector<FieldSymbol*> ndFields =
-                            fieldsOfRecord(nd->typeName.get());
-                        for (std::size_t i = 0; i < nd->subPatterns.size(); ++i) {
-                            const auto& s = nd->subPatterns[i];
-                            TypeRef* fieldTy = nullptr;
-                            if (i < ndFields.size() && ndFields[i]->posParam &&
-                                ndFields[i]->posParam->type)
-                                fieldTy = ctx_.resolvedType(
-                                    *ndFields[i]->posParam->type);
-                            // §19.3 (v0.294, #3692): same slot-declared-type
-                            // gate, one level down (`Outer(Inner(1..5))`).
-                            checkOrderingPatternOverNullableType(
-                                fieldTy, s.pattern.get());
-                            if (!s.nakedBinding.empty()) {
-                                auto* lsym = ctx_.makeSymbol<LocalSymbol>();
-                                lsym->name = s.nakedBinding;
-                                lsym->decl = s.nakedAnchor.get();  // #1271 real Node anchor
-                                lsym->declType = fieldTy;  // #1281
-                                armScope.names[s.nakedBinding] = lsym;
-                            } else if (auto* vbp =
-                                           dynamic_cast<const ast::BindingPattern*>(
-                                               s.pattern.get())) {
-                                auto* lsym = ctx_.makeSymbol<LocalSymbol>();
-                                lsym->name = vbp->name;
-                                lsym->decl = vbp;
-                                lsym->declType = vbp->type
-                                    ? ctx_.resolvedType(*vbp->type) : fieldTy;  // #1281
-                                armScope.names[vbp->name] = lsym;
-                            } else if (auto* deeper = dynamic_cast<
-                                           const ast::DestructuringPattern*>(
-                                           s.pattern.get())) {
-                                nestedWork.push_back(deeper);
-                            }
-                        }
-                    }
-                }
+                // #726 / §19.3 / #3909: also bind the names inside NESTED
+                // destructuring sub-patterns (`Outer(Inner(v), b)`) — the ONE
+                // shared walk (see bindNestedDestructuringNames's declaration
+                // comment in ExprTypecheck_impl.hpp), also called from the
+                // CaseStmt twin and from both the CHOICE-case-payload
+                // handlers.
+                bindNestedDestructuringNames(armScope, dp->subPatterns);
                 Scope* saveScope = currentScope_;
                 currentScope_ = &armScope;
                 if (arm.guard) visitExpr(*arm.guard);
