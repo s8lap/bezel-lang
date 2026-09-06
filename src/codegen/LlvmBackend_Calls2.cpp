@@ -3030,7 +3030,48 @@ llvm::Value* Emitter::lowerValueSemMethodOn(const sema::TypeRef* recvTy,
         }
         if (isGetHashCode) return emitChoiceHashCode(recv, ts);
         if (!call.args[0].value) return nullptr;
-        llvm::Value* other = lowerExpr(*call.args[0].value);
+        // fix #3893 (§8.1 / §8.3 / §8.6 / §35.7, v0.294): mirror fix #3538's
+        // record/enum gate, which this choice arm never received. §8.1 gives
+        // every value the universal `Equals(other: Object?)`, so sema admits
+        // an argument of ANY type here — an int, a different record, a
+        // DIFFERENT choice — and this arm used to force-load `other` through
+        // THIS choice's own struct type (`st`) whenever the lowered argument
+        // happened to be a pointer, then hand it to `emitChoiceEquality`
+        // whenever it happened to be ANY struct, regardless of whether it
+        // was ever a value of `ts`. MEASURED on the pre-fix tree:
+        // `shapeVal.Equals(new Pair(1, 2))` (an unrelated 2-field record)
+        // crashed `bezelc` itself — SIGSEGV inside `emitChoiceEquality`'s
+        // `CreateExtractValue` (Pair's struct has fewer elements than
+        // Shape's choice struct, an out-of-bounds extractvalue index) — a
+        // COMPILE-TIME crash, not merely a bad runtime answer.
+        // `shapeVal.Equals(42)` separately degraded to the #2434 "failed to
+        // lower" internal note (this arm returned null because an `int` is
+        // neither a pointer nor a struct) instead of the correct static
+        // False. Reuse the SAME both-arms predicates the record/enum arms
+        // use rather than inventing a choice-specific copy (CLAUDE.md §6):
+        // `equalsArgSettlesFalse` answers the argument shapes that can never
+        // equal a `ts` value (primitives, Unit, a different record/enum/
+        // choice) directly per §8.3; `equalsArgIsOwnTypeOrUnresolved` gates
+        // the structural-equality path below to arguments actually typed as
+        // `ts` (or an unresolved generic, matching the pre-existing
+        // value-shape handling); anything else (`Object`, an interface, a
+        // class, `ts?`) can dynamically BE a boxed `ts` and routes through
+        // the same run-time `lowerValueSemUniversalEquals` the record/enum
+        // arms use. NOTE: `isBoxableValueType` does not yet cover Choice
+        // (§35.8 "Value-like choices box per the general rule" is not wired
+        // into it), so that run-time path currently declines for choice
+        // receivers rather than dispatching — a pre-existing gap, not a
+        // regression from this fix (the declined outcome is strictly safer
+        // than the wild pointer read it replaces); filed separately as #3900.
+        const ast::Expr& argE = *call.args[0].value;
+        const sema::TypeRef* at = ctx_.exprType(argE);
+        if (equalsArgSettlesFalse(at, ts)) {
+            lowerExpr(argE);   // §22.5: the argument still evaluates
+            return builder_.getFalse();
+        }
+        if (!equalsArgIsOwnTypeOrUnresolved(at, ts))
+            return lowerValueSemUniversalEquals(recvTy, recv, call);
+        llvm::Value* other = lowerExpr(argE);
         if (!other) return nullptr;
         if (other->getType()->isPointerTy())
             other = builder_.CreateLoad(st, other);
