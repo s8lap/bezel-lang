@@ -1486,35 +1486,43 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                         // targets keep the plain store (no drop-on-overwrite
                         // entry — no double-free).
                         if (!lowerOwnedClassFieldStore(*as->target, addr, res)) {
-                            // fix #3950 — ⚠ UNREACHABLE TODAY, kept deliberately.
+                            // fix #3950 — ⚠ STILL UNREACHABLE, for a DIFFERENT
+                            // reason since fix #3969; kept deliberately.
                             // This is the same §28.7 moved-from gate as the
-                            // plain `:=` path above, but on THIS path the flag
-                            // can never be true: `lhsMovedFromAtStore` is only
+                            // plain `:=` path above. When #3950 landed it was
+                            // unreachable because `lhsMovedFromAtStore` is only
                             // ever WRITTEN by MethodOwnership::handleAssignment,
-                            // which returns at its second line for
-                            // `as.op != ":="` (Ownership.cpp — "Slice O4"), so a
-                            // compound `op=` never reaches the writer. The gate
-                            // is therefore a no-op, not a live guard; do not
-                            // read it as one.
+                            // which returned at its second line for
+                            // `as.op != ":="`, so a compound `op=` never
+                            // reached the writer at all.
                             //
-                            // It is kept rather than deleted because the hole it
-                            // covers is real and filed (issue 3969): a compound `op=`
-                            // READS its target (§25.1 desugars it to
-                            // `target := operator(target, value)`), so on a
-                            // moved-from local it is an undiagnosed
-                            // use-after-move AND an ungated displaced drop —
-                            // `a += b;` after `Sink.Take(move a);` compiles with
-                            // zero diagnostics and heap-use-after-frees, on this
-                            // commit as on its parent. Whoever gives the
-                            // compound form a pass through `handleAssignment`
-                            // gets this half for free, and finds the gate
-                            // already in the right place. (Fixing it HERE alone
-                            // was rejected: the early return also guards
-                            // `st.state = producerState(*as.value)`, which for
-                            // `a += b` would reclassify `a` to `b`'s borrow
-                            // state and silently drop `a`'s §28.3 obligation —
-                            // trading a use-after-free for a leak.)
-                            // // per §28.7, §25.1, v0.294, #3950
+                            // #3969 gave the compound form a pass through
+                            // `handleAssignment` — but deliberately only the
+                            // READ-CHECKING half, not the `:=` state
+                            // transitions, and it did NOT add a
+                            // `lhsMovedFromAtStore` writer. The gate stays a
+                            // no-op, now because the read-check REJECTS every
+                            // program in which it could be true: §6.6 makes
+                            // `x op= e` equivalent to `x := x op e`, so the
+                            // target is a read position, and a read of a
+                            // moved-from local is a hard §28.3 K1.3 error
+                            // ("owned value in `a` was already moved out at
+                            // this point") — the driver emits no object for it
+                            // (verified: `bezelc -o out` on the #3969 repro
+                            // exits 1 and writes no file). Writing the flag
+                            // here would be an unobservable store mirroring an
+                            // unreachable gate, so #3969 did not add one.
+                            //
+                            // The gate is kept, not deleted, because it states
+                            // §28.7's rule correctly for this store ("if the
+                            // previous value is live — non-null and NOT
+                            // moved-from — it is disposed"; "A moved-from or
+                            // null location therefore stores without
+                            // disposal"). If the moved-from read is ever
+                            // demoted from error to warning — as §28.2's
+                            // use-after-DISPOSE read already is — this path
+                            // becomes live and is already right.
+                            // // per §28.7, §6.6, §28.3 K1.3, v0.294, #3950, #3969
                             if (!as->lhsMovedFromAtStore)
                                 disposeDisplacedOwnedClassLocal(
                                     as->target.get(), addr, elemTy, res);

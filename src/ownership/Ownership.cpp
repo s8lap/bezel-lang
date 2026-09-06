@@ -3178,6 +3178,36 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
         handleAssignment(*as);
         return;
     }
+    // fix #3969 (§17.6 / §6.6 / §28.3 K1.3, v0.294): `x++` / `x--` is an
+    // `ast::IncrementStmt`, NOT an `AssignmentStmt`, and this dispatch had no
+    // arm for it at all — so the statement received no ownership handling of
+    // any kind, exactly as the compound assignment it desugars to did.
+    //
+    // §17.6 verbatim: "`x++` is equivalent to `x := x + 1` (and likewise `x--`
+    // to `x := x - 1`) under exactly §6.6's rules".  One rule, two statement
+    // forms: the operand is a READ position, and K1.3 makes a moved-from
+    // binding "unreadable until reassigned".
+    //
+    // Measured on the parent commit: `r.n++;` after `Sink.Take(move r)`
+    // compiled rc=0 with ZERO diagnostics and heap-use-after-freed under
+    // `--sanitize=address` (READ of size 4 in `main`, freed in
+    // `bz$M.Sink$Take`) — an ordinary `int` increment through a moved-from
+    // class local, no operator overload involved.  The class-typed
+    // `a++` twin (which the front end still admits through a user-declared
+    // `operator ++`, contrary to §25.1/§17.6 at this revision — filed
+    // separately) heap-use-after-freed the same way, in `bz$M.Ct$op$++`.
+    //
+    // Feeds the SAME authority as the compound-assignment arm above
+    // (`checkRead`), which reports only for a local already in an error state
+    // — so `i++` on a live `int` is untouched.  No state transition is made
+    // here for the identical reason the compound arm makes none: the operand's
+    // ownership state after `x++` is the state of `x + 1` (the operand's own,
+    // for the built-in numeric forms §17.6 admits), not something read off the
+    // synthetic literal `1`. // per §17.6, §6.6, §28.3 K1.3, v0.294, #3969
+    if (auto* inc = dynamic_cast<const ast::IncrementStmt*>(&s)) {
+        if (inc->target) checkRead(*inc->target, /*selfTarget=*/false);
+        return;
+    }
     if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&s)) {
         if (rs->value) handleReturn(*rs->value);
         return;
@@ -5891,7 +5921,93 @@ bool MethodOwnership::rhsIsDisposableClassType(const sema::TypeRef* rt) {
 void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
     // Slice O4: `x := EXPR` where x is a tracked local updates x's
     // state to match the producer of EXPR.
-    if (as.op != ":=") return;
+    //
+    // fix #3969 (§6.6 / §28.3 K1.3, v0.294): a COMPOUND assignment
+    // (`x += e`, `x -= e`, …, `x ??= e`) used to return on the bare
+    // `as.op != ":="` line below, so it received NO ownership handling of any
+    // kind — no read-check of its target, no read-check of its RHS, and no
+    // move recording. §6.6 verbatim: "the statement `x op= e` is equivalent
+    // to `x := x op e` with the target evaluated once", and "the order is: the
+    // LHS chain's constituent expressions, then the final segment's getter
+    // (where applicable), then `e`, then the operation, then the store".  So a
+    // compound assignment READS its target and READS `e`, and K1.3 is
+    // unambiguous about what that means for a moved-from binding — "the
+    // binding or slot is unreadable until reassigned".  Nothing carves the
+    // compound form out.
+    //
+    // Measured on the parent commit, all five shapes compiling rc=0 with ZERO
+    // ownership diagnostics and heap-use-after-freeing under
+    // `--sanitize=address`, while the byte-identical `a := a + b` spelling is
+    // correctly rejected ("owned value in `a` was already moved out at this
+    // point (§28.3)") since #3949:
+    //   1. `a += b;`            after `Sink.Take(move a)`  — UAF in `bz$M.Ct$op$+`
+    //   2. `total += r.n;`      after `Sink.Take(move r)`  — UAF reading `r.n`
+    //   3. `r.n += 1;`          after `Sink.Take(move r)`  — UAF reading `r.n`
+    //   4. `total += Sink.Take(move r);`                   — UAF at scope end
+    // Shapes 2 and 3 need no user-defined operator at all: they are ordinary
+    // `int` compound assignments whose target chain or RHS merely REACHES a
+    // moved-from local, so the hole is much wider than the operator-overload
+    // path the issue's repro exercises.  (Shape 5, `r.n++`, is the same rule
+    // read through §17.6 and is fixed at `visitStmt`'s new IncrementStmt arm.)
+    //
+    // What this arm deliberately does NOT do is the other, `:=`-specific half
+    // of this function.  Simply deleting the early return would be WRONG: ~60
+    // lines below, the plain path does `st.state = producerState(*as.value)`,
+    // which for `a += b` would reclassify the TARGET `a` from Owned to the
+    // producer state of `b` (a bare borrow read) and silently discard `a`'s
+    // §28.3 disposal obligation — trading a use-after-free for a leak.  The
+    // correct producer for a compound assignment is the OPERATOR RESULT, not
+    // `as.value`, and for the class-typed shape (`operator +` returning
+    // `owned`) that result is Owned, i.e. exactly the state the target already
+    // carries.  Leaving the target's state untouched is therefore not a
+    // shortcut but the right answer, and the displaced value is discharged by
+    // §28.7's drop-on-overwrite in codegen.  `handleOwnedFieldAssignment`,
+    // `checkBorrowStoreEscape`, `checkIndexerSetBorrowStoreEscape`,
+    // `checkRefOutLambdaCaptureOnStore` and `definitelyRestoredLocals_`
+    // likewise all model `:=`'s "store THIS value into that location", a
+    // question the compound form does not ask, and are left alone.
+    //
+    // No new classification predicate (lane-rules §6): the two read positions
+    // are fed to `checkRead` — the ONE authority that detects MovedFrom /
+    // Disposed / maybe-consumed / Uninitialized state — and the RHS carve-outs
+    // are `isTopLevelConsumingForm` + `valueHasOwnedMarker`, the identical pair
+    // `handleLocalDecl` (#747) and the `:=` path (#3949) already ask.
+    // `checkRead` reports ONLY for a local already in an error state, so a live
+    // `i += 1` never triggers it.
+    // // per §6.6, §28.3 K1.3, §17.6, v0.294, #3969
+    if (as.op != ":=") {
+        if (!as.target || !as.value) return;
+        // §6.6: "every constituent of the left-hand side's lvalue chain
+        // (grammar A.6 `LValue`) is evaluated exactly once" and the final
+        // segment's getter produces "the left operand" — the target is a READ
+        // position.  This holds for `??=` too: §6.6's `??=` paragraph keeps
+        // "The LHS chain is evaluated once as above, the getter once" and only
+        // the RHS and the setter become conditional.
+        checkRead(*as.target, /*selfTarget=*/false);
+        // §6.6: `e` is the right operand of the underlying binary operation —
+        // a read position exactly as an assignment RHS is (#3949).
+        if (!as.valueHasOwnedMarker && !isTopLevelConsumingForm(*as.value))
+            checkRead(*as.value, /*selfTarget=*/false);
+        // §6.6: for every operator except `??=`, `x op= e` is equivalent to
+        // `x := x op e`, so `e` is evaluated UNCONDITIONALLY and any transfer
+        // inside it (`total += Sink.Take(move r);`) discharges its source
+        // exactly as it would in the desugared spelling.  Without this the
+        // source stayed Owned and the scope-end auto-drop disposed what the
+        // callee had already freed (shape 4 above).
+        //
+        // `??=` is excluded on §6.6's own words — "`??=` is not a
+        // read-modify-write: `x ??= e` assigns `e` only when `x`'s current
+        // value is null … `e` is evaluated — and the setter invoked — only
+        // when the" assignment occurs.  A conditionally-evaluated transfer is a
+        // K7.4 owned-⊓-moved-from JOIN (maybe-consumed), not an unconditional
+        // move, and `recordMovesIn` records the latter; marking it
+        // unconditionally would over-reject the still-owned path.  Recording
+        // the join correctly needs the per-path state §28.3's producers table
+        // gives `a ??= b`, which this arm does not compute — left as it was
+        // (undiagnosed, i.e. no regression) and filed separately.
+        if (as.op != "??=") recordMovesIn(*as.value);
+        return;
+    }
     if (!as.target || !as.value) return;
     // §15.3 (#1928 half b): a SLOT WRITE `a[i] := …` into a move-only inline
     // array (§15.1.1 `[N owned]T?`) whose WHOLE value has already been moved out
