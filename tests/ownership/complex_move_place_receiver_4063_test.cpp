@@ -1,3 +1,11 @@
+// STATUS (re-land, R15 cycle 6): #4023 is HELD BACK, pending a ruling on the
+// open spec question #3975 — it is NOT part of this fix and is not present
+// on this branch. Everything below narrates the fix as originally found
+// (in review of #4023) and is accurate as history; the one place the
+// distinction matters for THIS branch's own test expectations is the final
+// CONTROL row near the bottom of this file, which is written for the
+// without-#4023 behaviour actually in effect here — see its own comment.
+//
 // Ownership — found in adversarial review of #4023: `checkRead`'s
 // `isTopLevelConsumingForm` skip (introduced by #3971, extended to the bare
 // `CallExpr` argument loop by #4023) declines to read-check the ENTIRE
@@ -74,7 +82,6 @@
 #include "support/ownership_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::hasErrorMessage;
 using bezel::test::OwnershipResult;
 using bezel::test::parseAndCheckOwnership;
 
@@ -297,14 +304,44 @@ BEZEL_TEST(complex_move_place_receiver_4063,
 }
 
 // =============================================================================
-// CONTROL — the ORIGINAL #4023 fix's core mechanism (bare-identifier /
-// `this.field` move of a DISPOSED source) must stay a precise ERROR, not a
-// masked Warning: proves this fix's new fallthrough call did not
-// reintroduce #4023's own masking bug for the shapes that `return` before
-// reaching it.
+// CONTROL — a bare-identifier `move` of a DISPOSED local through a bare
+// CallExpr argument (`Factory.Make(move x)`) is the §28.2 WARNING, not a
+// §28.3 ERROR, on THIS branch.
+//
+// This row originally asserted the precise ERROR "cannot move from disposed
+// local `x` (§28.3)", which is only true once #4023's `isTopLevelConsumingForm`
+// skip is ALSO applied to checkRead's bare-`CallExpr` argument loop — #4023
+// is NOT part of this fix and is not landing alongside it (see below), so
+// this branch keeps the pre-#4023 behaviour: checkRead's CallExpr loop still
+// runs its unconditional `checkRead(*a.value, false)` over `move x`, reports
+// the §28.2 warning for the disposed receiver, and poisons the state before
+// `recordMovesIn`'s `markMovedByName` can report the more precise error.
+// Measured directly (this fix's own `bezelc`, no #4023): the program above
+// compiles with `hasErrors() == false` and the diagnostic text below, byte
+// for byte — see /var/tmp/bezel-scratch/r15/4063/probe/control_bare.bzl.
+//
+// This is NOT an oversight to "fix" by re-adding #4023's guard here. Spec
+// §28.2 (docs/Bezel_Language_Spec.md, v0.294, ~line 6489) is explicit: an
+// explicit `Dispose()` that DOMINATES the use site on every path emits a
+// WARNING (K3.9's consume-table row, ~line 6577, ties this straight-line
+// "explicitly-disposed" post-state to "§28.2's mandatory use-after-dispose
+// warning" by name) — only a *conditional* kill, joining an
+// explicitly-disposed path with a still-owned path into a maybe-consumed
+// state, is a compile ERROR (§28.3, ~line 6490). `x` above is disposed on
+// every path reaching the `move` (no join at all), so K3.9's warning is the
+// one this spec text mandates. #4023 promoted this dominating case to an
+// ERROR, which contradicts that normative text, duplicates the mechanism of
+// the already-DECLINED #3979, and would resolve the OPEN spec question
+// #3975 ("move-after-dominating-Dispose is a §28.2 warning or a §28.3 error
+// depending only on the read position") by implementation, in the direction
+// #3975 argues against. #4023 is therefore held pending a ruling on #3975.
+//
+// If #3975 is ever resolved by adopting #4023's approach (or an equivalent),
+// THIS is the row to revisit — flip the assertions below back to the
+// precise-ERROR form and re-cite #4023 as landed.
 // =============================================================================
 BEZEL_TEST(complex_move_place_receiver_4063,
-           control_bare_identifier_move_of_disposed_local_still_precise_error) {
+           control_bare_identifier_move_of_disposed_local_is_the_dominating_warning) {
     auto r = parseAndCheckOwnership(program(
         "class C "
         "  public static method Main(): int "
@@ -313,7 +350,8 @@ BEZEL_TEST(complex_move_place_receiver_4063,
         "    return y!.v; "
         "  end Main; "
         "end C;"));
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(
-        hasErrorMessage(r, "cannot move from disposed local `x` (§28.3)"));
+        hasWarningMessage(r, "use of `x` after a dominating explicit "
+                              "Dispose() call"));
 }
