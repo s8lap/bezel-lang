@@ -75,6 +75,7 @@ using bezel::test::diagnosticMessageContains;
 using bezel::test::failedAtCompileTimeWithRealLocation;
 using bezel::test::runAot;
 using bezel::test::runAotChecked;
+using bezel::test::runAotCheckedLenient;
 
 namespace {
 
@@ -283,6 +284,68 @@ BEZEL_TEST(lambda_owned_return_call_arg_direct_4034,
 }
 
 // ===========================================================================
+// REJECT — a `this(...)` / `base(...)` CONSTRUCTOR CHAIN CALL's argument.
+// Review follow-up (post-8250253): the commit message credits
+// `calleeOrChainFormals` with covering this surface "for free" (it falls
+// back to `resolveChainCtorParams` — §3751 — exactly as `recordMovesInArgs`/
+// `markOutOwnedArgsCore` already rely on for their own owned-sink questions),
+// but the original commit shipped ZERO chain-call rows to pin it — a future
+// refactor of that fallback could regress this surface silently. These two
+// rows close that gap.
+// ===========================================================================
+
+// `base(...)`: a DERIVED class's constructor chains into its BASE's
+// `() -> owned Res` parameter with a lambda that captures the derived
+// constructor's OWN plain (borrow) parameter `p` — the only named binding a
+// chain argument can be (§12.8 puts the chain call in the leading statement
+// position, so there is no preceding local to capture instead).
+BEZEL_TEST(lambda_owned_return_call_arg_direct_4034,
+           base_chain_call_argument_rejected_spec_28_3_spec_12_8) {
+    JitResult jr = runAot(
+        std::string(kRes) +
+        "class Base "
+        "  public constructor(mk: () -> owned Res) "
+        "    using var c := mk(); "
+        "  end constructor; "
+        "end Base; "
+        "class Derived: Base "
+        "  public constructor(p: Res) base(lambda() => p); end constructor; "
+        "end Derived; "
+        "class C "
+        "  public static method Main(): int "
+        "    using var b := new Res(4); "
+        "    var d := new Derived(b); "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(jr));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(jr, kLambdaOwnedBorrowReturn));
+}
+
+// `this(...)`: a SAME-CLASS convenience constructor chains into a sibling
+// constructor's `() -> owned Res` parameter, same capture shape.
+BEZEL_TEST(lambda_owned_return_call_arg_direct_4034,
+           this_chain_call_argument_rejected_spec_28_3_spec_12_8) {
+    JitResult jr = runAot(
+        std::string(kRes) +
+        "class Holder "
+        "  public constructor(mk: () -> owned Res) "
+        "    using var c := mk(); "
+        "  end constructor; "
+        "  public constructor(p: Res, tag: int) this(lambda() => p); end constructor; "
+        "end Holder; "
+        "class C "
+        "  public static method Main(): int "
+        "    using var b := new Res(4); "
+        "    var h := new Holder(b, 3); "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(jr));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(jr, kLambdaOwnedBorrowReturn));
+}
+
+// ===========================================================================
 // ACCEPT — a genuinely owned production through a call argument is NOT
 // over-rejected, and disposes the value EXACTLY once under the AOT+ASan
 // oracle (Res.live == 0 at exit — no leak, no double-free). LOOP-AMPLIFIED
@@ -360,6 +423,61 @@ BEZEL_TEST(lambda_owned_return_call_arg_direct_4034,
         "  end Main; "
         "end C;";
     JitResult jr = runAotChecked(src);
+    BEZEL_EXPECT_TRUE(jr.ran);
+    BEZEL_EXPECT_EQ(jr.exitCode, 0);
+}
+
+// The `base(...)` CHAIN CALL shape's ACCEPT twin — this check must not
+// over-reject a genuine fresh production reaching a base constructor's
+// owned-target parameter through the chain. LOOP-AMPLIFIED to 500x, not the
+// 50x every other ACCEPT row in this file uses: this family measures clean
+// at low counts on BOTH sides of a per-iteration defect (a single leaked
+// object among 50 can read as noise; 500 makes a real per-iteration defect
+// unmistakable, review-confirmed).
+//
+// Runs under `runAotCheckedLenient` (LeakSanitizer OFF, generated-code ASan
+// — use-after-free / corruption detection — still ON), NOT `runAotChecked`:
+// issue #4077 (filed during this fix's review, reproduces identically on
+// the PARENT commit `3c9703e` — i.e. before this fix existed — so it is a
+// pre-existing codegen defect in `emitChainCall`, not a consequence of this
+// ownership-pass-only change) leaks the CONSTRUCTED OBJECT itself (the
+// `Derived`/`Base` instance) on every chain call whose argument is a lambda
+// literal, REGARDLESS of whether that lambda borrows or freshly produces —
+// so a leak-detecting oracle here would report a false failure sourced
+// entirely from #4077, not from this fix. `runAotCheckedLenient` still
+// catches the failure mode THIS fix is responsible for (a double-free /
+// UAF of the `Res` value `mk()` produces, were this check unsound and
+// wrongly admitting a borrow); `Res.live == 0` still proves that `Res`
+// itself — as opposed to the separately-leaked constructing object — is
+// disposed EXACTLY once by the `owned` chain-call parameter it flows
+// through. Measured directly (raw ASAN_OPTIONS=detect_leaks=0): exit 0,
+// `Res.live == 0`, at 500 iterations; with leak detection ON, the same
+// binary reports #4077's 24000-byte/1000-allocation leak from
+// `Derived$ctor` with `Res.live` never actually observed (LSan aborts the
+// process before `Main`'s return value is used as the exit code).
+BEZEL_TEST(lambda_owned_return_call_arg_direct_4034,
+           base_chain_call_fresh_new_accepted_disposes_once_spec_28_3) {
+    std::string src =
+        std::string(kRes) +
+        "class Base "
+        "  public constructor(mk: () -> owned Res) "
+        "    using var c := mk(); "
+        "  end constructor; "
+        "end Base; "
+        "class Derived: Base "
+        "  public constructor() base(lambda() => new Res(9)); end constructor; "
+        "end Derived; "
+        "class C "
+        "  public static method Main(): int "
+        "    var i := 0; "
+        "    while i < 500 do "
+        "      var d := new Derived(); "
+        "      i := i + 1; "
+        "    end; "
+        "    return Res.live; "
+        "  end Main; "
+        "end C;";
+    JitResult jr = runAotCheckedLenient(src);
     BEZEL_EXPECT_TRUE(jr.ran);
     BEZEL_EXPECT_EQ(jr.exitCode, 0);
 }
