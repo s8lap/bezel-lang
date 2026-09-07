@@ -580,6 +580,66 @@ void MethodOwnership::recordCallArgDirectLambdaTargetsFromFormals(
     }
 }
 
+// fix #4074 (§28.3, v0.294): see the header comment (Ownership_impl.hpp)
+// for the full rationale. Mirrors checkScopedAdmission's own function-value
+// arm (`ft->funcParams[argPos]`, this file) rather than a second spelling
+// of "read the callee's own Function TypeRef". Positional only — see the
+// header comment for why binding through boundFormalIndex's §22.5 named
+// mapping is deliberately out of scope here.
+void MethodOwnership::recordCallArgDirectLambdaTargetsFromFuncValue(
+        const ast::Expr* callee,
+        const std::vector<ast::CallArgument>& args,
+        std::unordered_map<const ast::LambdaExpr*, const sema::TypeRef*>&
+            out) const {
+    if (!callee) return;
+    const sema::TypeRef* ft = ctx_.exprType(*callee);
+    if (!ft || ft->kind != sema::TypeRef::Kind::Function) return;
+    for (std::size_t i = 0; i < args.size() && i < ft->funcParams.size(); ++i) {
+        const ast::CallArgument& a = args[i];
+        if (!a.value) continue;
+        auto* lam = dynamic_cast<const ast::LambdaExpr*>(a.value.get());
+        if (!lam) continue;
+        const sema::TypeRef* pt = ft->funcParams[i].type;
+        if (pt && pt->kind == sema::TypeRef::Kind::Function) out[lam] = pt;
+    }
+}
+
+// fix #4075 (§28.3 / §23.4, v0.294): see the header comment
+// (Ownership_impl.hpp) for the full rationale. Mirrors
+// `checkIndexArgNullability`'s `declaredIndexParam` lambda
+// (ExprTypecheck_Exprs.cpp, fix #2619) exactly: the local (`ast::
+// PropertyDecl::indexerParams`) and imported (`PropertySymbol::
+// indexerParams`, reconstructed ParameterSymbols) dual read, positional
+// per §23.5.
+void MethodOwnership::recordCallArgDirectLambdaTargetsFromIndexer(
+        const ast::IndexExpr& ix,
+        std::unordered_map<const ast::LambdaExpr*, const sema::TypeRef*>&
+            out) const {
+    auto* ps = dynamic_cast<sema::PropertySymbol*>(ctx_.exprSymbol(ix));
+    if (!ps || !ps->isIndexer) return;
+    // SEAM-ACCESSOR: mirrors checkIndexArgNullability's declaredIndexParam
+    // (ExprTypecheck_Exprs.cpp, #2619) — a null `pd` (imported, #3149) falls
+    // through to the `ps->indexerParams` symbol-side arm below, not to a
+    // silent wrong answer, so this reads BOTH sources.
+    auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
+    for (std::size_t i = 0; i < ix.indices.size(); ++i) {
+        const ast::CallArgument& a = ix.indices[i];
+        if (!a.value) continue;
+        auto* lam = dynamic_cast<const ast::LambdaExpr*>(a.value.get());
+        if (!lam) continue;
+        const sema::TypeRef* pt = nullptr;
+        if (pd) {
+            if (i < pd->indexerParams.size() && pd->indexerParams[i].type)
+                pt = ctx_.resolvedType(*pd->indexerParams[i].type);
+        } else if (i < ps->indexerParams.size()) {
+            if (auto* prm = dynamic_cast<const sema::ParameterSymbol*>(
+                    ps->indexerParams[i]))
+                pt = prm->resolvedDeclType;
+        }
+        if (pt && pt->kind == sema::TypeRef::Kind::Function) out[lam] = pt;
+    }
+}
+
 // fix #4034: the Stmt half of the call-argument-direct lambda-target
 // traversal — mirrors `collectBodyLambdas` (Ownership.cpp) statement-for-
 // statement (every form that can hold an expression), because a call site
@@ -706,16 +766,31 @@ void MethodOwnership::collectCallArgDirectLambdaTargetsExpr(
         return;
     }
     if (auto* ce = dynamic_cast<const ast::CallExpr*>(&e)) {
-        recordCallArgDirectLambdaTargetsFromFormals(
-            calleeOrChainFormals(ce->callee.get(), ce->args), ce->args, out);
+        const CalleeFormals ceFormals =
+            calleeOrChainFormals(ce->callee.get(), ce->args);
+        if (ceFormals.valid())
+            recordCallArgDirectLambdaTargetsFromFormals(ceFormals, ce->args, out);
+        else
+            // fix #4074: the callee did not resolve to a named
+            // Method/Constructor/ChoiceCase (nor a this/base chain target)
+            // — try the callee EXPRESSION's own function-VALUE type.
+            recordCallArgDirectLambdaTargetsFromFuncValue(
+                ce->callee.get(), ce->args, out);
         if (ce->callee) collectCallArgDirectLambdaTargetsExpr(*ce->callee, out);
         for (const auto& a : ce->args)
             if (a.value) collectCallArgDirectLambdaTargetsExpr(*a.value, out);
         return;
     }
     if (auto* nc = dynamic_cast<const ast::NullCondCallExpr*>(&e)) {
-        recordCallArgDirectLambdaTargetsFromFormals(
-            calleeOrChainFormals(nc->callee.get(), nc->args), nc->args, out);
+        const CalleeFormals ncFormals =
+            calleeOrChainFormals(nc->callee.get(), nc->args);
+        if (ncFormals.valid())
+            recordCallArgDirectLambdaTargetsFromFormals(ncFormals, nc->args, out);
+        else
+            // fix #4074: same fallback as the CallExpr arm above, for the
+            // null-conditional call spelling (`caller?(lambda() => b)`).
+            recordCallArgDirectLambdaTargetsFromFuncValue(
+                nc->callee.get(), nc->args, out);
         if (nc->callee) collectCallArgDirectLambdaTargetsExpr(*nc->callee, out);
         for (const auto& a : nc->args)
             if (a.value) collectCallArgDirectLambdaTargetsExpr(*a.value, out);
@@ -737,6 +812,12 @@ void MethodOwnership::collectCallArgDirectLambdaTargetsExpr(
         return;
     }
     if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&e)) {
+        // fix #4075: an indexer's own declared parameter list, when this
+        // IndexExpr resolves to a user-defined indexer (`ps->isIndexer`).
+        // No-op (records nothing) for a builtin collection indexer (no
+        // resolved PropertySymbol) exactly as intended — none of those
+        // declare a function-typed index parameter.
+        recordCallArgDirectLambdaTargetsFromIndexer(*ix, out);
         if (ix->target) collectCallArgDirectLambdaTargetsExpr(*ix->target, out);
         for (const auto& a : ix->indices)
             if (a.value) collectCallArgDirectLambdaTargetsExpr(*a.value, out);

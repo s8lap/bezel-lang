@@ -1541,6 +1541,68 @@ private:
         const std::vector<ast::CallArgument>& args,
         std::unordered_map<const ast::LambdaExpr*, const sema::TypeRef*>&
             out) const;
+    // fix #4074 (§28.3, v0.294): the INVOKED-FUNCTION-VALUE sibling of
+    // recordCallArgDirectLambdaTargetsFromFormals immediately above.
+    // `calleeOrChainFormals` (and the `resolveCalleeParams` it wraps)
+    // requires `ctx_.exprSymbol(callee)` to be a MethodSymbol /
+    // ConstructorSymbol / ChoiceCaseSymbol, or a this(...)/base(...) chain
+    // target — a plain parameter/field/local whose own STATIC TYPE happens
+    // to be a function type resolves to none of those, so
+    // `calleeOrChainFormals` answers invalid for it and #4034's mechanism
+    // never sees the call. This reads the callee EXPRESSION's own resolved
+    // type instead, mirroring the EXISTING authority for the identical
+    // "does this function-VALUE callee's type carry information about
+    // argument position N" question — checkScopedAdmission's function-value
+    // arm (`ft->funcParams[argPos]`, Ownership_Checks.cpp, fix #1420/#1439)
+    // — rather than inventing a second spelling of "read the callee's own
+    // Function TypeRef" (CLAUDE.md §6). Deliberately does NOT go through
+    // `boundFormalIndex`'s §22.5 named-argument binding, for the same
+    // reason that existing arm doesn't either: that binding is anchored on
+    // a DECLARED formal list with a compiler-verified name/arity
+    // (`FormalsView`), whereas a function-VALUE's `TypeRef::FuncParam::name`
+    // is optional call-site-facing metadata with no such verification —
+    // extending named-argument binding to it is new scope this fix does not
+    // open. Deliberately narrow in a second sense too: unlike
+    // `CalleeFormals`, which many other owned-sink / scoped / call-bounded
+    // classifiers key off (recordMovesInArgs, markOutOwnedArgsCore,
+    // scopedFormalAt, verifiedCallBoundedFormalAt, borrowSourceForExpr,
+    // catchBorrowAmongNonOwnedCtorArgs — see this file's CalleeFormals
+    // header comment), this does not touch `CalleeFormals`,
+    // `resolveCalleeParams`, or `calleeOrChainFormals` themselves — it
+    // feeds ONLY the lambda-owned-target collector below, so none of those
+    // other consumers' move-marking is affected (LANE_RULES §14/§15,
+    // #4042's double-free lesson: a classifier change can surface in a
+    // caller that keys move-marking off it).
+    void recordCallArgDirectLambdaTargetsFromFuncValue(
+        const ast::Expr* callee,
+        const std::vector<ast::CallArgument>& args,
+        std::unordered_map<const ast::LambdaExpr*, const sema::TypeRef*>&
+            out) const;
+    // fix #4075 (§28.3 / §23.4 *Indexers*, v0.294): the INDEXER sibling of
+    // recordCallArgDirectLambdaTargetsFromFormals. An indexer access
+    // (`obj[args]`) resolves through a DIFFERENT lookup than a call/`new` —
+    // it has no callee EXPRESSION at all (`ast::IndexExpr` carries a
+    // `target` and an index `ArgList`, not a callee), so
+    // `calleeOrChainFormals`/`resolveCalleeParams` — both keyed on a callee
+    // expression — can never see it, and #4034's mechanism never fires for
+    // an indexer argument.  Reads the resolved indexer `PropertySymbol`
+    // ExprTypecheck's own §23.4 branch already attaches to the IndexExpr
+    // node (`ctx_.setExprSymbol(&e, ps)`, ExprTypecheck_Exprs.cpp fix
+    // #2530) — the SAME fact `checkIndexArgNullability`'s
+    // `declaredIndexParam` lambda (ExprTypecheck_Exprs.cpp, fix #2619)
+    // already reads for the identical "declared type of index parameter k"
+    // question — rather than re-deriving indexer overload resolution here
+    // (CLAUDE.md §6). Binds POSITIONALLY, mirroring that same precedent:
+    // §23.5 "Index arguments are positional-only" (fix #2758) — a named
+    // argument at an index position is a compile error, so there is no
+    // §22.5 bound-formal question to ask here at all, unlike a call. Feeds
+    // ONLY the lambda-owned-target collector below, exactly like the
+    // function-value sibling above — it does not touch `CalleeFormals` or
+    // any of its other consumers.
+    void recordCallArgDirectLambdaTargetsFromIndexer(
+        const ast::IndexExpr& ix,
+        std::unordered_map<const ast::LambdaExpr*, const sema::TypeRef*>&
+            out) const;
     void checkOneLambdaTaskFamilyBorrowReturn(
         const ast::LambdaExpr& lam,
         const sema::TypeRef* expectedFnType = nullptr);
