@@ -11245,9 +11245,40 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
         // typed-binding branch (L10916-10923).  per §19.5 (#1206)
         if (np->name && !np->name->parts.empty()) {
             std::string_view last = np->name->parts.back();
+            // fix #4076 (§19.3/§27.8, v0.294): a `type` alias of a RECORD or
+            // ENUM used as this same bare pattern shape (`AliasOfPt`)
+            // resolves a symbol to a `sema::TypeAliasSymbol`, a distinct kind
+            // the original `dynamic_cast<const sema::TypeSymbol*>` alone did
+            // not recognize — the same independent-re-resolution gap #4050
+            // fixed for the DestructuringPattern `considerSym` lambda a few
+            // hundred lines above in this same function, and the class/
+            // interface twin just above fixed via `descriptorForPatternName`
+            // (LlvmBackend_Setup.cpp). Resolve through the shared
+            // `sema::resolveAliasToTypeSymbol` (TypeResolution.hpp) so this
+            // site shares one implementation with sema and its codegen
+            // siblings rather than hand-rolling another copy. Matching is by
+            // the RESOLVED TypeSymbol's identity (`scrutTy->declaration ==
+            // ts`), not by name — an alias's own `name` is the alias's name,
+            // not the aliased record/enum's, so re-checking `ts->name !=
+            // last` after resolving through the alias would always fail.
+            auto matchRecordOrEnumSym =
+                [&](const sema::Symbol* s) -> const sema::TypeSymbol* {
+                if (auto* ts = dynamic_cast<const sema::TypeSymbol*>(s))
+                    return ts->name == last ? ts : nullptr;
+                if (auto* aliasSym =
+                        dynamic_cast<const sema::TypeAliasSymbol*>(s)) {
+                    if (aliasSym->name != last) return nullptr;
+                    return sema::resolveAliasToTypeSymbol(
+                        ctx_, const_cast<sema::TypeAliasSymbol*>(aliasSym));
+                    // #4047: null when the alias's aliasedType has not yet
+                    // been resolved (declared textually before the type it
+                    // names) — falls through to the next symbol / #1847.
+                }
+                return nullptr;
+            };
             for (const auto& sym : ctx_.symbols()) {
-                auto* ts = dynamic_cast<const sema::TypeSymbol*>(sym.get());
-                if (!ts || ts->name != last) continue;
+                const sema::TypeSymbol* ts = matchRecordOrEnumSym(sym.get());
+                if (!ts) continue;
                 if (ts->kind == ast::TypeDeclKind::Record ||
                     ts->kind == ast::TypeDeclKind::Enum) {
                     if (scrut->getType()->isPointerTy())

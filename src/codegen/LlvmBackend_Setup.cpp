@@ -5499,14 +5499,42 @@ llvm::GlobalVariable* Emitter::descriptorForPatternName(
     // DestructuringPattern head lookup (patternMatches, Exprs2.cpp:9793)
     // and the established pattern in LlvmBackend_Stmts.cpp:7657-7666 and
     // LlvmBackend_Assign.cpp:10008-10020.
+    // fix #4076 (§19.3/§27.8, v0.294): a `type` alias of a class/interface
+    // used as a bare type-test pattern (`AliasOfDog`) resolves `s` to a
+    // `sema::TypeAliasSymbol`, a distinct kind the `TypeSymbol` dynamic_cast
+    // below does not recognize — the SAME independent-re-resolution gap
+    // #4050 fixed for the DestructuringPattern head lookup a few hundred
+    // lines above in Exprs2.cpp, and #4051 fixed for the call-lowering
+    // dispatcher in LlvmBackend_Calls2.cpp. Left unfixed, this bare-pattern
+    // form falls through every arm below to the #1847 backstop diagnostic —
+    // a false reject of a program `ExprTC::checkTopLevelNamedPattern`
+    // (ExprTypecheck.cpp) already accepts (it has its own `TypeAliasSymbol`
+    // arm: "type-alias type test"). Resolved through the shared
+    // `sema::resolveAliasToTypeSymbol` (TypeResolution.hpp) — the same free
+    // function #4050/#4051 introduced — so this site shares its
+    // alias-to-TypeSymbol lookup with sema and the sibling codegen sites
+    // rather than hand-rolling another copy.
     auto considerSym = [&](const sema::Symbol* s) -> llvm::GlobalVariable* {
-        auto* ts = dynamic_cast<const sema::TypeSymbol*>(s);
-        if (!ts || ts->name != last) return nullptr;
-        if (ts->kind != ast::TypeDeclKind::Class &&
-            ts->kind != ast::TypeDeclKind::Interface)
-            return nullptr;  // record/enum name — not a reference type test
-        auto it = descArray_.find(ts);
-        if (it != descArray_.end()) return it->second;
+        if (auto* ts = dynamic_cast<const sema::TypeSymbol*>(s)) {
+            if (ts->name != last) return nullptr;
+            if (ts->kind != ast::TypeDeclKind::Class &&
+                ts->kind != ast::TypeDeclKind::Interface)
+                return nullptr;  // record/enum name — not a reference type test
+            auto it = descArray_.find(ts);
+            if (it != descArray_.end()) return it->second;
+            return nullptr;
+        }
+        if (auto* aliasSym = dynamic_cast<const sema::TypeAliasSymbol*>(s)) {
+            if (aliasSym->name != last) return nullptr;
+            const sema::TypeSymbol* aliasedTs = sema::resolveAliasToTypeSymbol(
+                ctx_, const_cast<sema::TypeAliasSymbol*>(aliasSym));
+            if (!aliasedTs) return nullptr;  // #4047 declaration-order gap
+            if (aliasedTs->kind != ast::TypeDeclKind::Class &&
+                aliasedTs->kind != ast::TypeDeclKind::Interface)
+                return nullptr;  // record/enum alias — handled by the loop below
+            auto it = descArray_.find(aliasedTs);
+            if (it != descArray_.end()) return it->second;
+        }
         return nullptr;
     };
     for (const auto& sym : ctx_.symbols()) {
