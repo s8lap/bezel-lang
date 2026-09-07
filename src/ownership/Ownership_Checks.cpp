@@ -838,6 +838,62 @@ void MethodOwnership::recordMovesIn(const ast::Expr& e) {
                     }
                 }
             }
+            // fix #4063 (§28.2/§28.3/§28.4 K9, v0.294 — found in review of
+            // #4023): a COMPLEX move place — `move recv.field` / `move
+            // recv!.field` where `recv` is not `this` and not itself the
+            // whole moved value — falls through past both returns above
+            // with NEITHER validating nor marking anything. Every caller
+            // that reaches `recordMovesIn` on a top-level `move`/`await`
+            // operand (the bare-CallExpr-argument loop fixed by #4023, and
+            // the `NewExpr`/if-case-arm/`CollectionLiteralExpr` `readOperand`
+            // skips from #3971/#3990/#4024) DECLINES to run `checkRead` over
+            // the WHOLE move expression on the documented understanding that
+            // `recordMovesIn` is the sole authority that validates it — but
+            // `recordMovesIn`'s own move-place recognition above only
+            // understands a bare identifier and `this.field`; anything else
+            // was never validated at all, not even here. The FIELD being
+            // moved is not `recv` itself, so `markMovedByName`/
+            // `recordFieldMove` are the wrong tools — but `recv` is read to
+            // reach it, and an owned `recv` disposed by its own `Dispose()`
+            // cascade (§28.4/K9) makes that a genuine use-after-dispose the
+            // §28.2 warning must still catch. Route it through `checkRead`
+            // on the RECEIVER expression exactly as the pre-#4023 unguarded
+            // walk did for this one shape — `un->operand` here is the PLACE
+            // being moved (`recv.field`/…), a plain read position for
+            // everything except the final field/slot itself, so `checkRead`'s
+            // own `MemberAccessExpr`/`PostfixBangExpr` arms recurse to the
+            // receiver identifier correctly. This does NOT reintroduce
+            // #4023's masking: the bare-identifier and `this.field` shapes
+            // above always `return` before reaching this line, so a plain
+            // `move x` never has its state poisoned before `markMovedByName`
+            // sees it — only a shape `recordMovesIn` was never going to mark
+            // anyway reaches this checkRead call, and it is the ONLY place
+            // that ever will.
+            //
+            // ⚠ `move recv[i]` (an INDEXER place) reaches this line too but
+            // is NOT closed by it: `checkRead`'s own `IndexExpr` arm (this
+            // file, further down) only read-checks the TARGET for a
+            // move-only inline array (`isMoveOnlyInlineArrayType`, #1925) —
+            // for an ordinary class-typed indexer the target is never
+            // read-checked there, by design predating #3971/#4023 entirely
+            // (a plain, non-`move` `Reader.Peek(arr[0])` off a disposed
+            // `arr` is EQUALLY unwarned). That is a narrower, separate,
+            // pre-existing gap in `checkRead`'s `IndexExpr` arm itself, not
+            // this fallthrough's to fix — measured and filed as #4065.
+            //
+            // Measured: `Factory.Make(move b.f)` with `b` disposed — before
+            // this fix, HEAD 8fd0324 (the reported regression) compiled with
+            // ZERO diagnostics and SEGV'd under `--sanitize=address`, where
+            // the pre-#4023 tree (b6e91e6) correctly warned "use of `b`
+            // after a dominating explicit Dispose() call". The identical
+            // shape independently reproduces (never protected by ANY
+            // revision, not a regression) through the `NewExpr` ctor-arg
+            // site (#3971), the if/case marker-free arm site (#3990), and
+            // this fix's own new `CollectionLiteralExpr` arm (#4024) — all
+            // four routes converge on this one `recordMovesIn` fallthrough,
+            // so fixing it here closes all four at once. // per §28.2,
+            // §28.3, §28.4 K9, v0.294, #4023, #4063
+            checkRead(*un->operand, /*selfTarget=*/false);
         }
         if (un->operand) recordMovesIn(*un->operand);
         return;
