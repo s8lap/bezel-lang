@@ -3095,6 +3095,25 @@ private:
     // // per §28.8, §28.3, §28.8.1
     bool ownedArgSourceIsBorrow(const ast::Expr& argValue);
 
+    // fix #4042 / #4057 (§21.1 / §28.3 / §28.5 / §28.11, stdlib §5/§4.4/§9.6):
+    // true iff `name` is a tracked local currently Borrowed whose LocalDecl
+    // initializer is DIRECTLY one of the nine builtin owned-materializer
+    // calls — the ONE fact `ownedArgSourceIsBorrow`'s #4042 carve-out and
+    // `handleOwnedFieldAssignment`'s #4057 consume-fix both need, kept as a
+    // single shared predicate so they cannot drift on the shape (the #6
+    // dominant-defect-generator discipline). `ownedArgSourceIsBorrow` uses it
+    // to answer "not a borrow" for the classification question;
+    // `handleOwnedFieldAssignment` uses it to ALSO mark the source consumed
+    // when it accepts such a local, exactly as it already does for a
+    // genuinely-Owned source — closing #4057 (measured double-free: two
+    // `owned` fields, or an owned field and an owning-array-slot store,
+    // could each independently accept the SAME materializer-bound local
+    // because nothing marked it moved-from after the first accept, since
+    // `producerState`/`states_` deliberately still say Borrowed — see
+    // `ownedArgSourceIsBorrow`'s own header comment for why that must stay
+    // true). // per §21.1, §28.3, §28.5, §28.11, stdlib §5/§4.4/§9.6, #4042, #4057
+    bool isMaterializerCarveOutBorrow(std::string_view name);
+
     // §28.3 (issue #398): true when `e` is a read of an `owned` field — either
     // an explicit member access `obj.f` whose member resolves to an owned
     // FieldSymbol, or a bare identifier resolving to an owned field of the

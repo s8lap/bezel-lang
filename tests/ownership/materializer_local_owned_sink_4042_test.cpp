@@ -59,6 +59,34 @@
 // once it observed the sink use, for the SAME reason it already does so for
 // `return newLocal;`.
 //
+// #4057 CORRECTION (post-review): the paragraph above is a NECESSARY but not
+// SUFFICIENT safety argument — it covers the DISPOSAL question (does codegen
+// ever free this local's value twice), which is genuinely sound as argued.
+// It does NOT cover the SEPARATE, CONSUME-TRACKING question: once
+// `ownedArgSourceIsBorrow` accepts a materializer-bound local into ONE owned
+// sink, does anything stop the SAME local from being accepted into a SECOND
+// independent owned sink? A review measured that it did not:
+// `handleOwnedFieldAssignment`'s ONLY consume-tracking step (`markMovedByName`
+// / `markDisposedByName`) was gated on `state == Owned` — and this carve-out
+// deliberately leaves the state Borrowed forever (see above) — so a local
+// accepted into one `owned` field (or owning-array slot) was never marked
+// consumed, and a SECOND owned-field/owning-slot store of the identical local
+// was ALSO silently accepted: two slots, one pointer, two frees at their
+// respective owners' disposal — a measured double-free (`free(): invalid
+// pointer` / ASan SEGV in `DisposeCore`). The argument-sink path
+// (`checkOwnedArgSource`'s CallExpr callers) never had this gap because its
+// move-marking is UNCONDITIONAL, not gated on `state == Owned` — passing the
+// same materializer local to two owned PARAMETERS was already correctly
+// rejected. `handleOwnedFieldAssignment` was the one consumer with the gated
+// bookkeeping, and it is fixed in the SAME commit as this correction: it now
+// ALSO marks the source consumed (via the shared `isMaterializerCarveOutBorrow`
+// fact) when it accepts this carve-out shape, closing both the owned-field
+// and the `intoOwningArraySlot=true` cases (the SAME function). See the
+// "fix #4057" test section below for the measured repros and the FAIL-WITHOUT
+// proof, and `checkOwnedArgSource`/`ownedArgSourceIsBorrow`/
+// `handleOwnedFieldAssignment`'s own updated comments for the mechanism.
+// // per §21.1, §28.3, §28.5, §28.11, stdlib §5/§4.4/§9.6, #4042, #4057
+//
 // Conformance: this fix restores `tests/conformance/cases/spec_0175.bzl`
 // (spec §26.4 *Generic extensions* — its own `IEnumerable<T>.Sort()` worked
 // example) from `blocked-on-#4042` back to `fragment`/`compiles` in
@@ -68,9 +96,13 @@
 // a6e270d) by reverting `src/ownership/Ownership_Checks.cpp` and rebuilding:
 // every REJECT-repro below (materializer_local_owned_sink_4042 suite, the
 // non-"reject_control"/"transitive_alias" cases) failed to compile pre-fix
-// with the diagnostic text asserted here, and compiled clean post-fix.
+// with the diagnostic text asserted here, and compiled clean post-fix. The
+// two "fix #4057" REJECT-repros were separately measured against commit
+// a4f881d (#4042 alone, before the #4057 consume-tracking half landed):
+// both compiled clean there too, and the field-pair one crashed at runtime.
 //
-// per §21.1, §28.3, §28.6, §28.8, stdlib §5 / §4.4 / §9.6, v0.294, #4042
+// per §21.1, §28.3, §28.5, §28.6, §28.8, §28.11, stdlib §5 / §4.4 / §9.6,
+// v0.294, #4042, #4057
 
 #include <string>
 
@@ -559,4 +591,115 @@ BEZEL_TEST(materializer_local_owned_sink_4042,
     BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(jr));
     BEZEL_EXPECT_TRUE(diagnosticMessageContains(jr, kMoveOfBorrowReturn));
     BEZEL_EXPECT_FALSE(diagnosticMessageContains(jr, kDirectBorrowReturn));
+}
+
+// ===========================================================================
+// fix #4057 — a MEASURED double-free the #4042 carve-out introduced and this
+// same commit closes. `ownedArgSourceIsBorrow`'s carve-out deliberately
+// leaves a materializer-bound local's TRACKED STATE at Borrowed forever (see
+// that function's own header comment — touching `producerState`/`states_` is
+// the double-free direction OwnershipFacts.hpp forbids). `handleOwnedField
+// Assignment`'s consume-tracking step was gated on `state == Owned`, so it
+// never marked such a local moved-from after a FIRST successful owned-field/
+// owning-slot store — a SECOND store of the SAME local was then ALSO
+// accepted (the identical Borrowed-forever state, the identical carve-out),
+// producing two owned slots holding one pointer.
+//
+// Measured pre-this-half-of-the-fix (commit a4f881d, #4042 alone): both
+// statements below compiled with ZERO diagnostics; running the program
+// crashed with `free(): invalid pointer` (plain build) / a SEGV inside the
+// containing class's DisposeCore under ASan. Fixed by making
+// `handleOwnedFieldAssignment` ALSO mark the source consumed
+// (`isMaterializerCarveOutBorrow` + `markMovedByName`) when it accepts this
+// carve-out shape — mirroring the argument-sink path's unconditional
+// `markMovedByName`, which never had this gap.
+// ===========================================================================
+
+// The reviewer's exact repro: two `owned` fields, one materializer-bound
+// local. FAIL-WITHOUT proof: measured pre-#4057-half-of-the-fix — compiled
+// clean, `free(): invalid pointer` / SIGABRT at runtime (plain build).
+BEZEL_TEST(materializer_local_owned_sink_4042,
+           two_owned_fields_same_materializer_local_rejected_4057_spec_28_3) {
+    JitResult jr = runAot(
+        "module M; "
+        "class Holder "
+        "  public owned Data: Array<int>; "
+        "  public owned Other: Array<int>; "
+        "  public constructor(seq: Array<int>) "
+        "    var items := seq.Sorted(); "
+        "    this.Data := items; "
+        "    this.Other := items; "
+        "  end constructor; "
+        "  destructor end destructor; "
+        "end Holder;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(jr));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(
+        jr, "was already moved out at this point"));
+}
+
+// The `intoOwningArraySlot=true` sibling the reviewer flagged as structurally
+// identical (SAME `handleOwnedFieldAssignment` function, same gated
+// bookkeeping) — an owning inline-array slot store `a[i] := items;` twice
+// over the SAME materializer-bound local. Measured pre-#4057-half-of-the-fix:
+// compiled clean (zero diagnostics); the store itself did not crash (codegen
+// took a `bz_array_copy` path for the second store rather than aliasing the
+// raw pointer, so THIS particular shape leaked rather than double-freed —
+// still a real over-acceptance of a program that must be rejected, from the
+// exact same root cause). Fixed by the SAME `handleOwnedFieldAssignment`
+// change (both call sites — the owned-field arm and the
+// `intoOwningArraySlot=true` arm — share the code this test exercises).
+BEZEL_TEST(materializer_local_owned_sink_4042,
+           two_owning_array_slots_same_materializer_local_rejected_4057_spec_28_11) {
+    JitResult jr = runAot(
+        "module M; "
+        "class C "
+        "  public static method F(seq: Array<int>): int "
+        "    var items := seq.Sorted(); "
+        "    var a: [2 owned]Array<int>? := [null, null]; "
+        "    a[0] := items; "
+        "    a[1] := items; "
+        "    return 0; "
+        "  end F; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(jr));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(
+        jr, "was already moved out at this point"));
+}
+
+// PASS-WITH runtime proof: the LEGAL single-store shape (the #4042 grid's
+// own `amplified_owned_field_assign_reversed_no_leak_stdlib_4_4` already
+// covers the plain owned-field case under amplified ASan) still works after
+// #4057's consume-tracking fix — re-affirmed here for TWO fields where only
+// ONE receives the materializer-bound local and the other receives an
+// independently-produced value, so the fix's new `markMovedByName` call does
+// not over-reject a legitimate two-field constructor shape.
+BEZEL_TEST(materializer_local_owned_sink_4042,
+           two_owned_fields_distinct_sources_still_accepted_no_leak_4057) {
+    std::string src =
+        "module M; "
+        "class Holder "
+        "  public owned Data: Array<int>; "
+        "  public owned Other: Array<int>; "
+        "  public constructor(seq: Array<int>) "
+        "    var items := seq.Sorted(); "
+        "    this.Data := items; "
+        "    this.Other := seq.Reversed(); "
+        "  end constructor; "
+        "  destructor end destructor; "
+        "end Holder; "
+        "class C "
+        "  public static method Main(): int "
+        "    using var seq := new Array<int>(); "
+        "    seq.Add(3); seq.Add(1); seq.Add(2); "
+        "    var total := 0; "
+        "    for var i in 0..300 do "
+        "      using var h := new Holder(seq); "
+        "      total := total + h.Data.Length + h.Other.Length; "
+        "    end for; "
+        "    return total mod 251; "
+        "  end Main; "
+        "end C;";
+    JitResult jr = runAotChecked(src);
+    BEZEL_EXPECT_TRUE(jr.ran);
+    BEZEL_EXPECT_EQ(jr.exitCode, (301 * 6) % 251);
 }

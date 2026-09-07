@@ -10158,6 +10158,33 @@ bool MethodOwnership::getterBodyIsDrainAliasOverReceiverSourced(
 }
 
 // §28.8 owned-sink check (issue #395). See the header for the full contract.
+// fix #4042 / #4057: see the header comment. Extracted from
+// `ownedArgSourceIsBorrow`'s original inline check so `handleOwnedField
+// Assignment` can consult the SAME fact when deciding whether to mark a
+// locally-accepted source consumed — the double-free #4057 measured was
+// exactly this predicate being asked (and answered) in the classification
+// call but never asked again at the consume-tracking call, so a second
+// owned-field / owning-slot store of the SAME local sailed through unmarked.
+bool MethodOwnership::isMaterializerCarveOutBorrow(std::string_view name) {
+    auto* st = lookupState(name);
+    if (!st || st->state != OwnershipState::Borrowed) return false;
+    // A `const` local's `LocalOwnership` never sets `obligationOrigin` —
+    // visitStmt's `LocalConstDecl` arm (fix #3687) populates only
+    // `.state`/`.source` on the states_ entry it seeds, never
+    // `.obligationOrigin` (that field's only writers are the plain
+    // `var`/parameter/field-alias/task/choice arms). So the cast below is
+    // always null for a `const` and this returns false unconditionally —
+    // moot in practice besides: a `const` bound to one of these builtin
+    // materializer calls is rejected outright at §21.1's declaration-time
+    // check (`constInitializerRejected`), so this path can never be reached
+    // for a `const` in the first place.
+    // LOCALDECL-ONLY: always-null on a `const` (obligationOrigin unset), see above.
+    auto* ld = dynamic_cast<const ast::LocalDecl*>(st->obligationOrigin);
+    if (!ld || !ld->initializer) return false;
+    auto* mce = dynamic_cast<const ast::CallExpr*>(ld->initializer.get());
+    return mce && common::isBuiltinOwnedMaterializerCall(*mce, ctx_);
+}
+
 bool MethodOwnership::ownedArgSourceIsBorrow(const ast::Expr& argValue) {
     const ast::Expr* e = &argValue;
     // Unwrap a leading `move`: `move b` of a borrow is no more an owned value
@@ -10321,28 +10348,15 @@ bool MethodOwnership::ownedArgSourceIsBorrow(const ast::Expr& argValue) {
         // seq.Sorted();`) — a local bound from a further alias
         // (`var x := items;`) is NOT covered and keeps the conservative
         // Borrowed classification (a narrower, separately-tracked gap; see
-        // issue #4053). // per §21.1, §28.3, stdlib §5/§4.4/§9.6, #4042
+        // issue #4053).
         //
-        // A `const` local's `LocalOwnership` never sets `obligationOrigin` —
-        // visitStmt's `LocalConstDecl` arm (fix #3687) populates only
-        // `.state`/`.source` on the states_ entry it seeds, never
-        // `.obligationOrigin` (that field's only writers are the plain
-        // `var`/parameter/field-alias/task/choice arms). So the cast below is
-        // always null for a `const` and falls through unchanged to the
-        // ordinary Borrowed rejection — moot in practice besides: a `const`
-        // bound to one of these builtin materializer calls is rejected
-        // outright at §21.1's declaration-time check
-        // (`constInitializerRejected`), so this identifier-read path can
-        // never be reached for a `const` in the first place.
-        // LOCALDECL-ONLY: always-null on a `const` (obligationOrigin unset), see above.
-        if (auto* ld = dynamic_cast<const ast::LocalDecl*>(st->obligationOrigin)) {
-            if (ld->initializer) {
-                if (auto* mce = dynamic_cast<const ast::CallExpr*>(
-                        ld->initializer.get()))
-                    if (common::isBuiltinOwnedMaterializerCall(*mce, ctx_))
-                        return false;
-            }
-        }
+        // fix #4057: the accept-and-consume half of this carve-out lives in
+        // `isMaterializerCarveOutBorrow` (shared with
+        // `handleOwnedFieldAssignment`, which ALSO marks the source consumed
+        // when this fires — closing the measured double-free where a SECOND
+        // owned-field / owning-slot store of the same local sailed through
+        // unmarked). // per §21.1, §28.3, stdlib §5/§4.4/§9.6, #4042, #4057
+        if (isMaterializerCarveOutBorrow(id->name)) return false;
         return true;
     }
     // Not a tracked local. Resolve the symbol to classify the two remaining
@@ -11141,7 +11155,55 @@ void MethodOwnership::handleOwnedFieldAssignment(const ast::AssignmentStmt& as,
     if (!id) return;
     auto* st = lookupState(id->name);
     if (!st) return;
-    if (st->state != OwnershipState::Owned) return;
+    if (st->state != OwnershipState::Owned) {
+        // fix #4057 (§21.1 / §28.3 / §28.5 / §28.11, v0.294): the #4042
+        // carve-out's OTHER half. `ownedArgSourceIsBorrow` above already
+        // accepted this RHS despite its tracked state being Borrowed, NOT
+        // Owned, because `isMaterializerCarveOutBorrow` recognized it as a
+        // local bound DIRECTLY to a builtin owned-materializer call. That
+        // acceptance is correct — the value genuinely is a fresh owned
+        // production — but this function's ONLY consume-tracking step (the
+        // `markMovedByName`/`markDisposedByName` calls below) was gated on
+        // `state == Owned`, so it never ran for this local: a SECOND owned-
+        // field assignment, or an owning-array-slot store, of the SAME
+        // local was then ALSO accepted (same Borrowed-forever state, same
+        // carve-out), producing two owned slots holding the identical
+        // pointer — a measured double-free (`free(): invalid pointer` /
+        // ASan SEGV in the containing class's DisposeCore, issue #4057).
+        //
+        // The argument-sink path (`checkOwnedArgSource`'s CallExpr callers,
+        // e.g. the `owned`-arg CallExpr arm) never had this gap: it calls
+        // `markMovedByName` UNCONDITIONALLY whenever `ownedArgSourceIsBorrow`
+        // says "not a borrow" for a bare identifier, with no `state ==
+        // Owned` gate at all — so passing the SAME materializer-bound local
+        // to two owned parameters was already correctly rejected on the
+        // second call. This function was the one place that instead gated
+        // the mark on the local's raw tracked state, which is exactly the
+        // asymmetry #4042's carve-out (deliberately leaving that state
+        // Borrowed forever, per `isBuiltinOwnedMaterializerCall`'s own
+        // "do not touch producerState" warning) fell through.
+        //
+        // The fix mirrors the argument-sink path: mark the source consumed
+        // here too, via the SAME shared fact (`isMaterializerCarveOutBorrow`)
+        // `ownedArgSourceIsBorrow` used to accept it. `markMovedByName`
+        // transitions Borrowed -> MovedFrom regardless of the local's PRIOR
+        // state (verified: it has no explicit Borrowed branch and falls
+        // through to the plain move path for any state it does not special-
+        // case), and `checkRead` — which `handleAssignment` already runs on
+        // the assignment RHS BEFORE calling this function (fix #3949) — is
+        // the ONE authority that rejects a read of a MovedFrom local, so a
+        // subsequent `this.Other := items;` is now caught there with the
+        // standard "already moved out" diagnostic, before it can reach this
+        // function a second time. Scoped to the identical shape
+        // `ownedArgSourceIsBorrow` just accepted (never fires for a plain
+        // remaining borrow, which was already rejected above) and never
+        // reached for a `ParameterSymbol` (a materializer-bound local is
+        // always a `var`-declared LocalDecl, never a parameter).
+        // // per §21.1, §28.3, §28.5, §28.11, stdlib §5/§4.4/§9.6, #4042, #4057
+        if (isMaterializerCarveOutBorrow(id->name))
+            markMovedByName(id->name, id->span.begin);
+        return;
+    }
     // A bare owned-PARAMETER read discharges the parameter (the §28.8
     // `_resource := resource;` ownership-transfer pattern: the caller
     // relinquished ownership and the field now holds it). A bare owned-LOCAL
