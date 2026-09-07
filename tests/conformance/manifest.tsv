@@ -174,7 +174,7 @@ spec_0171	spec	253-Examples	fragment	compiles
 spec_0172	spec	253-Examples	fragment	compiles	
 spec_0173	spec	254-No-user-defined-conversion-operators	fragment	compiles	
 spec_0174	spec	261-Declaration	fragment	compiles	
-spec_0175	spec	264-Generic-extensions	skip	n/a	blocked-on-#4042 (docs-ahead: producerState never classifies a var bound to a builtin owned-returning materializer call (ToArray/Sorted/Reversed/Slice/...) as Owned, so #3993's return-borrow check misclassifies `var items := this.ToArray(); return items;` as returning a borrow)
+spec_0175	spec	264-Generic-extensions	fragment	compiles	
 spec_0176	spec	264-Generic-extensions	fragment	compiles	
 spec_0177	spec	2651-Specificity-ordering	fragment	compiles	wrap:mixed
 spec_0178	spec	2651-Specificity-ordering	error	diagnose	

@@ -10286,7 +10286,64 @@ bool MethodOwnership::ownedArgSourceIsBorrow(const ast::Expr& argValue) {
     // (the legal transfer) and the error-producing states (MovedFrom/Disposed/
     // Uninitialized — diagnosed by their own checks) are NOT flagged here.
     if (auto* st = lookupState(id->name)) {
-        return st->state == OwnershipState::Borrowed;
+        if (st->state != OwnershipState::Borrowed) return false;
+        // fix #4042 (§21.1 / §28.3, stdlib §5 / §4.4 / §9.6): a bare local
+        // bound DIRECTLY to a builtin owned-materializer call (`ToArray`,
+        // `ToSet`, `ToDictionary`, `Sorted`, `Reversed`, `Slice`, `Split`,
+        // `GetBytes`/`ToBytes` on `Array<T>`/`Set<T>`/`Dictionary<K,V>`) is
+        // tracked Borrowed by `producerState` for DISPOSAL-BOOKKEEPING reasons
+        // only — `common::isBuiltinOwnedMaterializerCall`'s own header comment
+        // explains why `producerState`/`states_` must stay Borrowed here:
+        // "producerState is the free-deciding input at handleLocalDecl, and
+        // codegen already reclaims these values on its own recognition for
+        // both bindable spellings […]. Reclassifying them Owned would
+        // register a SECOND free on top of codegen's — the double-free
+        // direction." That warning is about the DISPOSAL/free-deciding path
+        // (producerState/states_/handleLocalDecl), which this branch does
+        // NOT touch. `ownedArgSourceIsBorrow` has no side effects of its own —
+        // every caller only feeds a `report(...)` call (checkOwnedArgSource,
+        // checkOwnedReturnDirectBorrow, checkThrowOperandNotBorrowed, the
+        // owned-field-assignment and owning-collection-slot-store checks) —
+        // so recognizing this ONE shape here changes which programs the
+        // owned-sink CHECKS accept, never what codegen frees. The value
+        // itself genuinely is a fresh owned production (stdlib §5: "the
+        // return is `owned` — the caller is responsible for disposing it"),
+        // so flowing it into an owned sink (a `return`, an `owned`
+        // field/parameter/ctor-argument, an owning-collection slot store) is
+        // not a double-dispose hazard: nothing else in the program holds a
+        // second reference to it, and codegen's own escape walk
+        // (StringEscapeWalker, collectBorrowingArrayFreeEligible) already
+        // treats a `return`/owned-sink use of the tracked identifier as an
+        // ESCAPE and excludes it from `isFreshBorrowingArrayMaterializerLocal`'s
+        // scope-end reclaim, so no double free / leak follows from admitting
+        // it here (verified under ASan, amplified loop — see #4042's fix
+        // commit). Recognized only for a DIRECT initializer (`var items :=
+        // seq.Sorted();`) — a local bound from a further alias
+        // (`var x := items;`) is NOT covered and keeps the conservative
+        // Borrowed classification (a narrower, separately-tracked gap; see
+        // issue #4053). // per §21.1, §28.3, stdlib §5/§4.4/§9.6, #4042
+        //
+        // A `const` local's `LocalOwnership` never sets `obligationOrigin` —
+        // visitStmt's `LocalConstDecl` arm (fix #3687) populates only
+        // `.state`/`.source` on the states_ entry it seeds, never
+        // `.obligationOrigin` (that field's only writers are the plain
+        // `var`/parameter/field-alias/task/choice arms). So the cast below is
+        // always null for a `const` and falls through unchanged to the
+        // ordinary Borrowed rejection — moot in practice besides: a `const`
+        // bound to one of these builtin materializer calls is rejected
+        // outright at §21.1's declaration-time check
+        // (`constInitializerRejected`), so this identifier-read path can
+        // never be reached for a `const` in the first place.
+        // LOCALDECL-ONLY: always-null on a `const` (obligationOrigin unset), see above.
+        if (auto* ld = dynamic_cast<const ast::LocalDecl*>(st->obligationOrigin)) {
+            if (ld->initializer) {
+                if (auto* mce = dynamic_cast<const ast::CallExpr*>(
+                        ld->initializer.get()))
+                    if (common::isBuiltinOwnedMaterializerCall(*mce, ctx_))
+                        return false;
+            }
+        }
+        return true;
     }
     // Not a tracked local. Resolve the symbol to classify the two remaining
     // borrow forms a bare identifier can take.
