@@ -144,6 +144,20 @@ std::string program(const std::string& classesAndMain) {
 //   r.diagnostics.hasErrors() false, hasWarningMessage(...) false — SILENT.
 // PASS-WITH (this fix): hasWarningMessage(...) true, matching the pre-#4023
 // baseline (b6e91e6) byte-for-byte.
+//
+// ⚠ RE-LAND NOTE (R15 cycle 6, without #4023 on this branch): this row
+// PASSES on BOTH sides of THIS commit's own src/ diff, not just post-fix.
+// Without #4023, checkRead's CallExpr argument loop still runs its
+// pre-#4023 unconditional `checkRead(*a.value, false)` over `move b.f`,
+// which already recurses `UnaryExpr -> MemberAccessExpr -> IdentifierExpr`
+// to `b` and reports the §28.2 warning — a mechanism entirely independent
+// of this fix's new `checkRead` call in `recordMovesIn`'s fallthrough. The
+// "SILENT" pre-fix state noted above was only ever true on the branch
+// where #4023 had ALSO landed (removing that protection); it does not
+// reproduce here. Measured directly (this branch, `git checkout eae547e --
+// src/ownership/Ownership_Checks.cpp`, rebuilt, filter re-run): this row
+// passes both with and without this commit's src/ diff, unlike the three
+// rows below it, which genuinely go from SILENT to WARNS only with the fix.
 // =============================================================================
 BEZEL_TEST(complex_move_place_receiver_4063,
            bare_call_move_complex_place_disposed_receiver_warns) {
