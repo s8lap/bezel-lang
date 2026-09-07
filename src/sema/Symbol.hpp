@@ -1261,6 +1261,38 @@ bool serializationSurfaceIsEmittable(const TypeSymbol* t, const SemaContext& ctx
 // conservative answer.
 bool isAutoPropertyStorageSymbol(const Symbol* m, const SemaContext& ctx);
 
+// §12.5 (found fixing #4012; #4018/#4020): "does this `ast::PropertyDecl`
+// spell the `abstract` shorthand (`abstract property Name: T;`)?" — a
+// signature-only declaration with NO backing storage, parsed with the exact
+// same `bodyKind == PropertyBodyKind::Auto` as a real auto-property
+// (Parser_Decls.cpp, the class-member property-body dispatch). `abstract` is
+// the only AST signal telling the two shapes apart for a CLASS-level
+// property (unlike an interface member, a class's abstract property has no
+// separate AST node to key on — see #2931's comment on
+// `isAutoPropertyStorageSymbol` for the interface-side twin of this
+// ambiguity).
+//
+// THIS IS THE SHARED PREDICATE every "does this property have backing
+// storage / is it a real obligation-satisfying implementation?" site must
+// use instead of re-deriving its own modifier scan (LANE_RULES §6: a second,
+// drifting spelling of a decision an existing authority already makes).
+// Before this fix, three sites asked the question three ways: #4012 added an
+// inline `m == "abstract"` scan to `Ownership.cpp`'s
+// `isNonNullableReferenceAutoProp` (with a comment explicitly noting the
+// duplication as deliberate cross-TU "lock-step" copying); #4018 found
+// `DefiniteAssignment.cpp`'s sibling `isSevenNineStrictAutoProp` had NO such
+// scan at all (false-rejecting an abstract class's own constructor over an
+// unrelated abstract property); #4020 found `TypeResolution_Checks.cpp`'s
+// per-type BFS had no `abstract` check on the NAMED-property arm at all
+// (unconditionally treating a class's own abstract property as a
+// SATISFYING implementation — the same class of bug #3641 already fixed for
+// indexers). All three now call this one predicate; a fourth site adding its
+// own copy is exactly the drift this exists to stop. Indexers are handled by
+// a separate mechanism (#3641's `hasMod(ps, "abstract")` reuse of
+// `ifaceIndexerObligations` — indexers have no name to key a shared
+// name-based predicate on and are excluded here via `p.isIndexer`).
+bool isAbstractPropertyShorthand(const ast::PropertyDecl& p);
+
 // §9.2 / §22.9: the AST-ONLY half of the predicate above — "does this symbol
 // carry an `ast::PropertyDecl` that declares an auto-property?"
 //

@@ -76,9 +76,23 @@ bool isSevenNineStrictField(const ast::FieldDecl& f, SemaContext& ctx) {
 // and is not counted. fix #3072: the enum CARVE-OUT (zero-less enum) is
 // treated as §7.9-strict for the same reason as a field — auto-prop storage
 // mints an undeclared value at construction when zero-filled.
+//
+// fix #4018 / §12.5 (found fixing #4012): the `abstract` shorthand
+// (`abstract property Name: T;`) parses with this exact same
+// `bodyKind == Auto` but has NO backing storage at all — a subclass supplies
+// the real implementation. Before this fix `runConstructor`'s caller (below)
+// added such a property's name to `fieldsNeedingInit_` for EVERY constructor
+// of the ABSTRACT class that declared it, so an abstract base class with any
+// explicit constructor false-rejected on "constructor does not initialize
+// non-nullable field `Name`" even though there is no field `Name` to
+// initialize — the very shape the closed sibling fix #4012 (Ownership.cpp's
+// `isNonNullableReferenceAutoProp`) had already excluded on its own path.
+// Uses the shared `isAbstractPropertyShorthand` (sema/Symbol.hpp) rather than
+// a third copy of the modifier scan.
 bool isSevenNineStrictAutoProp(const ast::PropertyDecl& p, SemaContext& ctx) {
     if (p.bodyKind != ast::PropertyBodyKind::Auto) return false;
     if (p.isIndexer || p.autoInitializer) return false;
+    if (isAbstractPropertyShorthand(p)) return false;
     for (auto m : p.modifiers)
         if (m == "static") return false;
     if (!p.type) return false;

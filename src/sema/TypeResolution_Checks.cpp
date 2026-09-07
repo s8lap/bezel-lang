@@ -5209,6 +5209,22 @@ void Resolver::checkAbstractImplementations() {
         std::unordered_set<std::string_view> ifacePropertyNames;
         // Property names (PropertySymbol) provided by class or base classes.
         std::unordered_set<std::string_view> concretePropertyNames;
+        // fix #4020 / §12.5 (sibling to #3641's ifaceIndexerObligations): a
+        // class-declared `abstract property Name: T;` (the §12.5 abstract
+        // shorthand, sema/Symbol.hpp's `isAbstractPropertyShorthand`) is an
+        // OBLIGATION some class in the chain must satisfy with a real
+        // (non-abstract) property — the NAMED-property twin of `abstractNames`
+        // above. Before this fix the property loop below unconditionally
+        // inserted every class PropertySymbol, abstract or not, into
+        // `concretePropertyNames` (the SATISFYING set) — so a class's own
+        // abstract property satisfied itself, and neither this obligation
+        // check nor the separate "class containing an abstract member must
+        // itself be abstract/closed" check (this function's `isAbstract`
+        // early-continue above) ever saw an obligation to report. Unlike
+        // indexers, a named property has a name to key on, so this is a flat
+        // set (like `abstractNames`), not `ifaceIndexerObligations`'
+        // anonymous-obligation vector.
+        std::unordered_set<std::string_view> abstractPropertyNames;
         // R39 / §11.2: also remember the PropertySymbol (and, for interface
         // members, the declaring interface) so the implementing property's TYPE
         // can be checked against the interface's — return/property types must
@@ -5380,6 +5396,18 @@ void Resolver::checkAbstractImplementations() {
                         // Record the interface's required property name.
                         ifacePropertyNames.insert(ps->name);
                         ifaceProps.emplace(ps->name, std::make_pair(ps, cur));
+                    } else if (hasMod(ps, "abstract")) {
+                        // fix #4020 / §12.5: mirrors the `methodIsAbstract`
+                        // arm above and #3641's indexer arm just above this
+                        // one — a class-declared abstract property is an
+                        // OBLIGATION, not a satisfying implementation. Do NOT
+                        // fall through to the `concretePropertyNames` arm
+                        // below or this obligation self-satisfies (the exact
+                        // #4020 SIGSEGV: `class Base { abstract property
+                        // Name: string; }` compiled clean because `Base`'s
+                        // own abstract property was accepted as proof `Base`
+                        // implements `Base`).
+                        abstractPropertyNames.insert(ps->name);
                     } else {
                         // A class PropertySymbol satisfies the contract.
                         concretePropertyNames.insert(ps->name);
@@ -5440,6 +5468,22 @@ void Resolver::checkAbstractImplementations() {
         }
         for (auto name : abstractNames) {
             if (!concreteNames.count(name)) {
+                ctx_.diagnostics().report(
+                    Severity::Error, t->declLoc,
+                    std::string("concrete ") + kindWord + " `" +
+                    std::string(t->name) +
+                    "` does not implement inherited abstract member `" +
+                    std::string(name) + "` (§12.5)");
+            }
+        }
+        // fix #4020 / §12.5: the NAMED-property twin of the method check just
+        // above (see `abstractPropertyNames`' declaration comment). Reports
+        // the identical diagnostic shape the method arm uses — §12.5 draws no
+        // distinction between a method and a property for this obligation
+        // (§23.4 extends the same participation to indexers, #3641's already-
+        // fixed sibling).
+        for (auto name : abstractPropertyNames) {
+            if (!concretePropertyNames.count(name)) {
                 ctx_.diagnostics().report(
                     Severity::Error, t->declLoc,
                     std::string("concrete ") + kindWord + " `" +
@@ -12334,10 +12378,28 @@ void Resolver::checkTypePureModifiers(TypeSymbol* t) {
             // An interface property's signature-only form parses as Auto but
             // is an abstract declaration, not an auto-property with backing
             // storage — pure is the contract, not redundant.
+            //
+            // fix #4018/#4020 follow-on (found auditing every
+            // PropertyBodyKind::Auto reader for the same hazard, §12.5): a
+            // CLASS-level `abstract pure property Name: T;` parses with the
+            // exact same bodyKind == Auto as this check's ordinary
+            // auto-property case (the member-modifier prefix at
+            // Parser_Decls.cpp admits `pure` at the class-member PropertyDecl
+            // grammar slot, not just IfaceProperty's), and has the identical
+            // "signature-only, no auto-getter to be redundant with" shape the
+            // `parentIsIface` exclusion above already carves out for
+            // interfaces — but `parentIsIface` is false for a class, so
+            // `public abstract pure property Name: string;` was false-
+            // rejected as "redundant" (measured: probe with an abstract base
+            // class declaring exactly this shape, overridden concretely by a
+            // subclass, rejected at the base declaration before the override
+            // is ever reached). Excluded via the shared
+            // `isAbstractPropertyShorthand` (sema/Symbol.hpp) rather than a
+            // third copy of the modifier scan.
             const bool parentIsIface =
                 ps->parent && ps->parent->kind == ast::TypeDeclKind::Interface;
             if (pd->bodyKind == ast::PropertyBodyKind::Auto &&
-                !parentIsIface) {
+                !parentIsIface && !isAbstractPropertyShorthand(*pd)) {
                 ctx_.diagnostics().report(
                     Severity::Error, m->declLoc,
                     std::string("`pure` on an auto-property is redundant — the "

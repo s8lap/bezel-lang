@@ -1017,6 +1017,19 @@ std::string builtinExceptionSurfaceList(std::string_view builtinBase) {
 // produced result, conservative-but-not-wrong for an auto-property override
 // (whose value is still owned by its own backing field, never by the
 // iteration source).
+// §12.5 (found fixing #4012; #4018/#4020): see Symbol.hpp. Pure AST-level
+// test — no Symbol/SemaContext needed — so it also serves callers (e.g.
+// DefiniteAssignment.cpp's `isSevenNineStrictAutoProp`, Ownership.cpp's
+// `isNonNullableReferenceAutoProp`, TypeResolution_Checks.cpp's per-type BFS)
+// that walk `klass.members` directly and have not (yet, or ever) resolved a
+// PropertySymbol for the member they are looking at.
+bool isAbstractPropertyShorthand(const ast::PropertyDecl& p) {
+    if (p.isIndexer || p.bodyKind != ast::PropertyBodyKind::Auto) return false;
+    for (auto mod : p.modifiers)
+        if (mod == "abstract") return true;
+    return false;
+}
+
 bool hasAstAutoPropertyDecl(const Symbol* m) {
     auto* ps = dynamic_cast<const PropertySymbol*>(m);
     if (!ps || ps->isIndexer) return false;
@@ -1025,8 +1038,7 @@ bool hasAstAutoPropertyDecl(const Symbol* m) {
         return false;
     for (auto mod : ps->modifiers)
         if (mod == "static") return false;
-    for (auto mod : ps->modifiers)
-        if (mod == "abstract") return false;
+    if (isAbstractPropertyShorthand(*pd)) return false;
     return true;
 }
 

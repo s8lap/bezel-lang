@@ -10810,12 +10810,22 @@ bool isNonNullableReferenceField(const ast::FieldDecl& f,
 // property Name: string; end Base;` (no ctor) newly rejected. `virtual`
 // (unlike `abstract`) DOES carry real default-implementation backing storage
 // and stays §7.9-strict.
+//
+// fix #4018 (found fixing this issue's own #4012): the exclusion above was
+// added as an inline modifier scan here with a comment calling the
+// duplication vs. DefiniteAssignment.cpp's `isSevenNineStrictAutoProp`
+// "deliberate ... lock-step" — but #4018 found DefiniteAssignment.cpp's OWN
+// per-constructor screen (`runConstructor`'s use of that sibling predicate)
+// had NO such scan at all, a live false-reject, not a hypothetical drift
+// risk. Both now call the shared `isAbstractPropertyShorthand`
+// (sema/Symbol.hpp) instead of keeping separate copies in lock-step.
 bool isNonNullableReferenceAutoProp(const ast::PropertyDecl& p,
                                      sema::SemaContext& ctx) {
     if (p.bodyKind != ast::PropertyBodyKind::Auto) return false;
     if (p.isIndexer) return false;
+    if (sema::isAbstractPropertyShorthand(p)) return false;
     for (auto m : p.modifiers) {
-        if (m == "static" || m == "abstract") return false;
+        if (m == "static") return false;
     }
     if (!p.type) return false;
     auto* rt = ctx.resolvedType(*p.type);

@@ -10867,10 +10867,28 @@ void MethodOwnership::checkFieldInitializer(const ast::FieldDecl& fd,
 // explicit non-`owned` field initializer rejected above. Reject rather than
 // silently invent ownership for an accessor whose read face is lend-only (A4).
 // Static auto-properties keep §22.13's process-lifetime storage exemption.
+//
+// fix #4018/#4020 follow-on (found auditing every PropertyBodyKind::Auto
+// reader for the same §12.5 hazard): the `abstract` shorthand
+// (`abstract property Name: T := expr;`, admitted by A.4's grammar — the
+// auto-property alternative's `(":=" Expression)?` carries no VirtualKind
+// restriction) has NO generated backing field AT ALL — there is nothing for
+// this check's "would leak into a non-owned field" reasoning to be about.
+// Measured false-reject without this exclusion: `abstract class B { public
+// abstract property Current: Widget := new Widget(); }` rejected with "its
+// generated backing field is non-owned" even though `B`'s own backing field
+// was never generated (the abstract shorthand generates none — see
+// `isAbstractPropertyShorthand`, sema/Symbol.hpp). Whether an initializer on
+// an abstract property should be admitted AT ALL (it can never execute — no
+// constructor path reaches it) is a separate, undecided question this fix
+// does not answer either way (filed as its own issue per CLAUDE.md's
+// decline-with-reasons discipline); this exclusion only stops the WRONG
+// diagnostic from firing on it.
 void MethodOwnership::checkAutoPropertyInitializer(
         const ast::PropertyDecl& pd) {
     if (pd.bodyKind != ast::PropertyBodyKind::Auto || !pd.autoInitializer)
         return;
+    if (sema::isAbstractPropertyShorthand(pd)) return;
     for (std::string_view m : pd.modifiers)
         if (m == "static") return;
     if (producerState(*pd.autoInitializer) != OwnershipState::Owned) return;
