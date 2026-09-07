@@ -14738,6 +14738,30 @@ void ExprTC::resolveExtensionMember(const ast::MemberAccessExpr& ma,
         if (ms->extensionDecl && ma.target) {
             if (auto* tgtSym = ctx_.exprSymbol(*ma.target)) {
                 unboundExtRef = dynamic_cast<TypeSymbol*>(tgtSym) != nullptr;
+                // fix #4070 (§27.6/§27.8, v0.294): a `type` alias of the
+                // extension's target class/record/interface/enum resolves
+                // `tgtSym` to a `TypeAliasSymbol`, not a `TypeSymbol` — the
+                // identical missing-arm shape #4038/#4048/#4050/#4051 all
+                // fixed in their own call chains. Left unhandled,
+                // `unboundExtRef` stays false for `AliasOfExt.Val`, so the
+                // Function TypeRef built below omits the leading receiver
+                // parameter §27.6 requires for the UNBOUND form — a real
+                // mismatch between the reference's computed type and its
+                // (correctly receiver-prepended, since codegen's own
+                // extRef derivation is independent — see makeMethodThunk)
+                // runtime thunk shape, observed as either a declared-type
+                // mismatch (§5.1) or a call-arity mismatch (§5.1) depending
+                // on whether the local's type is explicit or inferred.
+                // Resolve through the shared `resolveAliasToTypeSymbol`
+                // helper (ExprTypecheck.cpp; #4050/#4051) so an alias of the
+                // extension's target is recognized as the UNBOUND
+                // type-name-qualifier form exactly like a direct type name.
+                if (!unboundExtRef) {
+                    if (auto* aliasSym =
+                            dynamic_cast<TypeAliasSymbol*>(tgtSym))
+                        unboundExtRef =
+                            resolveAliasToTypeSymbol(aliasSym) != nullptr;
+                }
             } else if (auto* tid = dynamic_cast<const ast::IdentifierExpr*>(
                            ma.target.get())) {
                 // fix #1633: a PRIMITIVE type-name qualifier (`int.Doubled`)
