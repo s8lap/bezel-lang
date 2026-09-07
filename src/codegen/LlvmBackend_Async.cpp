@@ -1786,6 +1786,30 @@ void Emitter::emitAsyncLambda(const ast::LambdaExpr& lam, llvm::Function* fn,
     if (!lam.exprBody) {
         computeFrameCapturedLocals(lam.stmts);
         collectSuspendLocals(lam.stmts, bodyLocals);
+        // fix #4041 (§22.3/§22.4/§28.9/§30.1/§30.6, v0.294): `emitAsyncLambda`
+        // is the FOURTH state-machine frame venue (fix #3499's own comment,
+        // ~60 lines below) — the only one that builds its `StateMachineFrame`
+        // by hand instead of calling `buildStateMachineFrame`
+        // (LlvmBackend_Iterators.cpp), so fix #3981's reservation of a frame
+        // field for an inline `out var`/`out using var` recipient — added
+        // to `buildStateMachineFrame` itself — never ran here. Without a
+        // reserved field, an out-var recipient bound before a real `await`
+        // inside an async lambda body has its bare `entryAlloca` reset by the
+        // next (resumed) activation before the deferred scope-end release
+        // reads it: a null-pointer SEGV in the release path (`bz$asynclam$
+        // N$Resume`), not merely a leak, because the recipient's storage is
+        // reused by the SAME resume function on every activation (measured:
+        // `AddressSanitizer: SEGV ... in bz$asynclam$0$Resume`, address
+        // 0x8 — a garbage/null `bz_string` dereference). Mirrors
+        // `buildStateMachineFrame`'s own `collectSuspendLocals` +
+        // `collectOutVarSuspendLocals` pairing exactly; the four
+        // `mapSuspendLocalSlot` call sites #3981 added
+        // (registerOutVarStringRelease / registerCtorOutVarStringRelease /
+        // ensureOutVarSlots / ensureCtorOutVarSlots) are venue-agnostic (they
+        // read whatever `smLocalFields_` happens to hold, published from
+        // `frame.localFields` below via `emitResumeDispatch`) and need no
+        // change.
+        collectOutVarSuspendLocals(lam.stmts, bodyLocals);
     } else {
         // fix #3499 (§27.5 / §30.6, v0.283): an EXPRESSION-bodied async lambda
         // runs neither walk, so all three sets would still describe the
@@ -1798,6 +1822,21 @@ void Emitter::emitAsyncLambda(const ast::LambdaExpr& lam, llvm::Function* fn,
         frameCapturedLocals_.clear();
         frameCapturedParams_.clear();
         frameLocalPreBoxTy_.clear();
+        // fix #4041 (§22.3/§22.4/§28.9/§30.1/§30.6, v0.294): the identical gap
+        // reaches an EXPRESSION-bodied async lambda too — verified reachable,
+        // not merely hypothetical (an earlier version of this comment block
+        // assumed it could not happen): the `(var …)` binding atom rejects
+        // `await` inside it (§17.15/v0.216, its own diagnostic), but the
+        // `(if …)` expression atom does not, so
+        // `(if W.Make(s, out var n) and await T() then n.Length else 0)` is
+        // an ACCEPTED single-expression async lambda body that SEGVs
+        // identically to the block-bodied shape without a reserved field.
+        // `collectSuspendLocals` has no expression-entry point (an expr body
+        // has no LocalDecl for it to find), but an inline out-var recipient
+        // CAN be buried in this expression's CallExpr argument list, so the
+        // expression-entry overload of `collectOutVarSuspendLocals`
+        // (LlvmBackend_Iterators.cpp) is needed here on its own.
+        collectOutVarSuspendLocals(lam.exprBody.get(), bodyLocals);
     }
 
     std::vector<llvm::Type*> fields;

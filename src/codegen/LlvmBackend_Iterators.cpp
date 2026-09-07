@@ -544,6 +544,26 @@ void Emitter::collectOutVarSuspendLocals(
 }
 
 
+// fix #4041 (§22.3/§22.4/§28.9/§30.1/§30.6, v0.294): EXPRESSION-bodied
+// overload for the fourth state-machine frame venue, `emitAsyncLambda`'s
+// `lam.exprBody` arm. That arm has no statement list at all — a single
+// `Expression` is the whole body — so the statement-descent overload above
+// cannot be reused directly; this one starts `OutVarSlotCollector`'s walk at
+// `expr()` instead of `stmt()`. Confirmed reachable, not merely theoretical:
+// `(if W.Make(s, out var n) and await T() then n.Length else 0)` is an
+// accepted expression-bodied async lambda body — the out-var's scope-carrying
+// short-circuit (§22.4) composes with an `await` inside a `(if …)` expression
+// atom (§20; unlike the `(var …)` binding atom, §17.15/v0.216, `(if …)` does
+// not reject `await`) — and SEGVs identically to the block-bodied shape
+// without this collector's reservation.
+void Emitter::collectOutVarSuspendLocals(
+        const ast::Expr* body,
+        std::vector<std::pair<const ast::Node*, llvm::Type*>>& out) {
+    OutVarSlotCollector c{out, ptrTy()};
+    c.expr(body);
+}
+
+
 Emitter::StateMachineFrame Emitter::buildStateMachineFrame(
     sema::MethodSymbol* ms,
     const std::vector<std::unique_ptr<ast::Stmt>>& body,

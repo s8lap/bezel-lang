@@ -11003,6 +11003,15 @@ private:
         const std::vector<std::unique_ptr<ast::Stmt>>& body,
         std::vector<std::pair<const ast::Node*, llvm::Type*>>& out);
 
+    // fix #4041 (§22.3/§22.4/§28.9/§30.1/§30.6, v0.294): EXPRESSION-bodied
+    // overload of the above, for `emitAsyncLambda`'s `lam.exprBody` arm (a
+    // single `Expression`, no statement list) — see the definition
+    // (LlvmBackend_Iterators.cpp) for why this arm is reachable, not
+    // hypothetical.
+    void collectOutVarSuspendLocals(
+        const ast::Expr* body,
+        std::vector<std::pair<const ast::Node*, llvm::Type*>>& out);
+
     // §29.3 / §30.2 (#2132): inside a state-machine body (iterator or async), a
     // suspend-live local's alloca must be mapped to its reserved frame field via
     // smAllocaToField_, or the per-suspend spill/restore (emitAwaitSuspend / the
