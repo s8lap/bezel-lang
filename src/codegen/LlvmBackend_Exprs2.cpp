@@ -571,6 +571,36 @@ llvm::Value* Emitter::lowerUnary(const ast::UnaryExpr& un) {
                         return fs_node->ownedIterVarAutoDropAtBodyEnd;
                     return false;
                 }();
+                // (d) fix #4016 (§28.3 K3.4/K7.4, v0.294): this bare `move x`
+                // is itself the K3.4 marked-arm-transfer VALUE
+                // (isBareMoveArmValue) — the ownership pass
+                // (consumeMarkedArmTransfer / processMarkedArmConstruct,
+                // Ownership_Checks.cpp) flagged `x`'s LocalDecl
+                // `dischargedByArmTransfer` and registered a NULL-GUARDED
+                // scope-end dynamicDispose for it (LlvmBackend_Stmts.cpp),
+                // exactly the same per-path mechanism the `owned x`
+                // (MarkedTransferExpr) spelling's OWN dedicated codegen arm
+                // (LlvmBackend_Exprs.cpp, "arm.take") unconditionally nulls
+                // for. That dedicated arm is never reached for THIS spelling
+                // (a bare `move` is a plain UnaryExpr, not a
+                // MarkedTransferExpr), so without this the selected path
+                // read the slot but never nulled it: the not-selected-arm
+                // fix (armIsOwnedProducer recognizing a bare `move` arm,
+                // OwnershipFacts.cpp) made codegen correctly reclaim `x`'s
+                // block via its own explicit/scope-end disposal, and this
+                // slot's UN-nulled per-path scope-end dynamicDispose then
+                // read + freed the SAME already-freed block a second time —
+                // a heap-use-after-free, measured on this fix's own dev
+                // cycle. Unconditional (no isUsing/isIterVarAutoDrop/
+                // autoDropAtScopeEnd gate needed): consumeMarkedArmTransfer
+                // only ever flags a plain, non-using class/interface LOCAL
+                // (LOCALDECL-ONLY, its own comment), so this never overlaps
+                // the other three cases.
+                const bool isArmTransferDischarge = [&]() -> bool {
+                    if (auto* ld = dynamic_cast<const ast::LocalDecl*>(loc->decl))
+                        return ld->dischargedByArmTransfer;
+                    return false;
+                }();
                 // (c) §28.3 / §28.11 (#1466): an out-owned recipient (inline
                 // `out owned var` or a pre-declared `out item`) whose scope-end
                 // reclaim the ownership pass armed as a null-guarded auto-drop
@@ -583,7 +613,7 @@ llvm::Value* Emitter::lowerUnary(const ast::UnaryExpr& un) {
                 // plain `var`'s auto-drop lives on its LocalDecl — so this does
                 // not disturb the plain-`var` borrow-after-move idiom.)
                 if (loc->isUsing || isIterVarAutoDrop ||
-                    loc->autoDropAtScopeEnd) {
+                    loc->autoDropAtScopeEnd || isArmTransferDischarge) {
                     if (llvm::AllocaInst* slotAI = localSlot(*id)) {
                         llvm::Type* ety = nullptr;
                         llvm::Value* addr = boxedStorage(slotAI, ety);

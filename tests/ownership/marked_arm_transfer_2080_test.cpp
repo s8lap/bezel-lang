@@ -244,7 +244,10 @@ BEZEL_TEST(marked_arm_transfer_2080, spec_28_3_same_binding_both_arms) {
 //
 // These rows mirror the five `owned`-spelled tests above, one per one, with
 // `move` substituted — proving the shared core produces IDENTICAL disposal
-// accounting under the same ASan/LSan-verified oracle.
+// accounting under the same ASan/LSan-verified oracle. The
+// `spec_28_3_pattern2_*_4016` and `spec_19_2_case_three_arm_*_4016` rows
+// below additionally pin fix #4016 (the MIXED move+fresh-producer arm-meet
+// gap this #4006 landing's own reviewer found and left unfixed).
 
 // §7.7 / §28.3 (v0.294): the spec's OWN canonical two-binding coalescing
 // example, verbatim modulo names: `var r := (if a <> null then move a else
@@ -278,33 +281,162 @@ BEZEL_TEST(marked_arm_transfer_2080, spec_7_7_move_spelled_coalesce_both_paths_4
 }
 
 // §28.3 Pattern 2 (v0.209/v0.246), `move` spelling — `(if useFresh then new
-// Res(1) else move cached)` — is DELIBERATELY NOT pinned here as a positive
-// row, unlike its `owned`-spelled sibling `spec_28_3_pattern2_coalesce_
-// both_paths` above. MEASURED: this exact shape compiles clean (no
-// diagnostic — `exprContainsMarkedTransfer`/`consumeMarkedArmTransfer`
-// correctly validate and mark `cached`, exactly as the `owned` spelling
-// does) but LEAKS `cached` on the `useFresh=true` path — 16 bytes, one
-// object, under `--sanitize=address` + LSan — while the identical `owned
-// cached` spelling leaks nothing. The three `move`-spelled rows above (§7.7,
-// §19.2, and the same-binding-both-arms shape) are confirmed leak-free and
-// double-free-free; the divergence is specific to MIXING a bare `move`-
-// spelled arm with a plain fresh-producer sibling arm in the SAME
-// construct — not to the `move` spelling in general. Root cause not
-// isolated: `dischargedByArmTransfer` is confirmed SET on `cached`'s
-// LocalDecl (identically to the `owned` case — `processMarkedArmConstruct`'s
-// join loop does not distinguish spellings), and
-// `LlvmBackend_Stmts.cpp`'s `dischargedByArmTransfer` branch (the
-// null-guarded `dynamicDispose` registration) is reached identically for
-// both spellings on inspection — yet the `move`-spelled program's captured
-// stdout shows `cached`'s destructor BODY executing (its `Console.WriteLine`
-// runs) while LeakSanitizer still reports the block never reclaimed,
-// suggesting the dispatch that prints ran through a DIFFERENT code path than
-// the one that would also free the block, not that the per-path disposal is
-// skipped outright. Filed as issue #4016 (NOT fixed here — a codegen
-// investigation beyond this fix's ownership-pass scope); the reviewer's own
-// reported regression (`positive_marked_arm_transfer_still_consumes_
-// exactly_once`, a symmetric move+move shape) is unaffected and is pinned
-// clean above.
+// Res(1) else move cached)`, a `move`-marked arm MIXED with an ordinary
+// fresh-producer sibling arm. fix #4016: root cause was NOT in the ownership
+// pass (which correctly flags `cached`'s LocalDecl `dischargedByArmTransfer`
+// for both spellings identically) but in a SECOND, independent copy of the
+// "is this arm meet OWNED" classification: `common::armIsOwnedProducer`
+// (src/common/OwnershipFacts.cpp), the codegen-and-ownership-shared arm-meet
+// authority `unwindOwnedLocalClass` / `usingVarOwnsClassObjectDynamically` /
+// `producerState` all consult, recognized `owned x` (MarkedTransferExpr) as
+// an owned arm but NOT a bare `move x` — so `x`'s own binding (holding
+// WHICHEVER arm ran) was classified a BORROW meet for `move`, an OWNED meet
+// for `owned`. An explicit `x.Dispose()` on a "borrow" binding fell to the
+// dispatch-only fallback in `explicitDisposeOwnedReceiverSlot`'s caller
+// (`emitDynamicDispose`, no reclaim) — the destructor ran (hence
+// `cached`'s "D9" appeared in stdout) but the 16-byte block was never
+// `free()`d, which is why LSan flagged a leak despite the visible destructor
+// print. Fixed by teaching `armIsOwnedProducer` the same bare-`move`-arm
+// recognition the ownership pass already had (`common::isBareMoveArmValue`,
+// now the ONE shared shape both `MethodOwnership::isBareMoveArmValue` and
+// `armIsOwnedProducer` consult). A SECOND, independent bug surfaced by the
+// same fix: once `x`'s binding is correctly classified OWNED, the bare
+// `move cached` UnaryExpr's own codegen (LlvmBackend_Exprs2.cpp) must null
+// `cached`'s slot on the SELECTED path exactly as `owned cached`'s dedicated
+// MarkedTransferExpr codegen arm always has — it did not (that unconditional
+// null lived ONLY on the MarkedTransferExpr arm, never reached by a bare
+// `move`), so selecting the `move` arm left `cached`'s slot non-null and its
+// per-path scope-end disposal fired a SECOND time against the
+// already-explicitly-disposed object — a heap-use-after-free, measured
+// during this fix's own verification. Both are fixed together here.
+BEZEL_TEST(marked_arm_transfer_2080, spec_28_3_pattern2_move_spelled_coalesce_both_paths_4016) {
+    auto r = runAotChecked(std::string(kResClass) +
+        "class C "
+        "  public static method Pick(useFresh: bool): int "
+        "    var cached := new Res(9); "
+        "    var x := (if useFresh then new Res(1) else move cached); "
+        "    var v := x.Id; "
+        "    x.Dispose(); "
+        "    return v; "
+        "  end Pick; "
+        "  public static method Main(): int "
+        "    var a := C.Pick(true); "
+        "    var b := C.Pick(false); "
+        "    Console.WriteLine(\"A\" + a.ToString() + \"B\" + b.ToString()); "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    // Byte-identical accounting to the `owned`-spelled control above
+    // (spec_28_3_pattern2_coalesce_both_paths): Pick(true) — D1 (explicit
+    // dispose of the fresh winner) + D9 (per-path scope-end dispose of the
+    // not-selected `cached`, the #4016 leak this pins). Pick(false) — D9
+    // once (explicit dispose of `x`, now holding the moved-in `cached`; the
+    // per-path scope-end check sees `cached`'s slot nulled and skips — the
+    // #4016 double-free/UAF this also pins).
+    BEZEL_EXPECT_EQ(countOccurrences(r.stdoutText, "D1"), 1);
+    BEZEL_EXPECT_EQ(countOccurrences(r.stdoutText, "D9"), 2);
+    BEZEL_EXPECT_EQ(countOccurrences(r.stdoutText, "A1B9"), 1);
+}
+
+// #4016, `using var` binding form: the SAME mixed move+fresh construct, but
+// the consumer is a `using var` rather than a plain `var` + explicit
+// `.Dispose()`. Exercises `usingVarOwnsClassObjectDynamically`'s OWN
+// `conditionalCaseArmMeetIsOwned` call site (a different function from
+// `unwindOwnedLocalClass`, sharing the same underlying predicate) — the
+// #4016 fix must hold for BOTH consumer forms, not just the reported one.
+BEZEL_TEST(marked_arm_transfer_2080, spec_28_3_pattern2_move_spelled_coalesce_using_var_4016) {
+    auto r = runAotChecked(std::string(kResClass) +
+        "class C "
+        "  public static method Pick(useFresh: bool): int "
+        "    var cached := new Res(9); "
+        "    using var x := (if useFresh then new Res(1) else move cached); "
+        "    return x.Id; "
+        "  end Pick; "
+        "  public static method Main(): int "
+        "    var a := C.Pick(true); "
+        "    var b := C.Pick(false); "
+        "    Console.WriteLine(\"A\" + a.ToString() + \"B\" + b.ToString()); "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    // Same shape of accounting as the explicit-dispose form above: D1 x1
+    // (using-var scope-end dispose of the fresh winner, Pick(true) only),
+    // D9 x2 (Pick(true)'s per-path dispose of the not-selected `cached`;
+    // Pick(false)'s using-var dispose of the moved-in `cached`).
+    BEZEL_EXPECT_EQ(countOccurrences(r.stdoutText, "D1"), 1);
+    BEZEL_EXPECT_EQ(countOccurrences(r.stdoutText, "D9"), 2);
+    BEZEL_EXPECT_EQ(countOccurrences(r.stdoutText, "A1B9"), 1);
+}
+
+// #4016, RETURNED form: the mixed move+fresh construct is the method's
+// direct `return` value (declared `owned Res`, no intermediate local at
+// all) rather than bound to any local in the callee. `cached`'s own
+// per-path scope-end disposal (registered against ITS OWN LocalDecl,
+// independent of how the construct's result is consumed) must still fire
+// correctly with no intervening `explicitDisposeOwnedReceiverSlot` /
+// `unwindOwnedLocalClass` call site in the picture at all.
+BEZEL_TEST(marked_arm_transfer_2080, spec_28_3_pattern2_move_spelled_coalesce_returned_owned_4016) {
+    auto r = runAotChecked(std::string(kResClass) +
+        "class C "
+        "  public static method Pick(useFresh: bool): owned Res "
+        "    var cached := new Res(9); "
+        "    return (if useFresh then new Res(1) else move cached); "
+        "  end Pick; "
+        "  public static method Main(): int "
+        "    using var a := C.Pick(true); "
+        "    using var b := C.Pick(false); "
+        "    Console.WriteLine(\"A\" + a.Id.ToString() + \"B\" + b.Id.ToString()); "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(countOccurrences(r.stdoutText, "D1"), 1);
+    BEZEL_EXPECT_EQ(countOccurrences(r.stdoutText, "D9"), 2);
+    BEZEL_EXPECT_EQ(countOccurrences(r.stdoutText, "A1B9"), 1);
+}
+
+// #4016, three-arm `case` variant: a `move`-marked arm mixed with TWO
+// ordinary fresh-producer sibling arms (not just one) — confirms the fix
+// generalizes past the two-arm `if`-expression shape the issue's own repro
+// used. Arm 1 and the default arm are fresh producers; arm 2 moves `cached`.
+BEZEL_TEST(marked_arm_transfer_2080, spec_19_2_case_three_arm_move_mixed_with_fresh_4016) {
+    auto r = runAotChecked(std::string(kResClass) +
+        "class C "
+        "  public static method Pick(n: int): int "
+        "    var cached := new Res(9); "
+        "    var x := (case n of 1 => new Res(1), 2 => move cached, _ => new Res(3)); "
+        "    var v := x.Id; "
+        "    x.Dispose(); "
+        "    return v; "
+        "  end Pick; "
+        "  public static method Main(): int "
+        "    var a := C.Pick(1); "
+        "    var b := C.Pick(2); "
+        "    var c := C.Pick(9); "
+        "    Console.WriteLine(\"A\" + a.ToString() + \"B\" + b.ToString() + \"C\" + c.ToString()); "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    // Pick(1): D1 (explicit) + D9 (per-path, cached not selected). Pick(2):
+    // D9 once (explicit dispose of x, holding the moved-in cached). Pick(9):
+    // D3 (explicit) + D9 (per-path, cached not selected). Totals: D1 x1,
+    // D3 x1, D9 x3.
+    BEZEL_EXPECT_EQ(countOccurrences(r.stdoutText, "D1"), 1);
+    BEZEL_EXPECT_EQ(countOccurrences(r.stdoutText, "D3"), 1);
+    BEZEL_EXPECT_EQ(countOccurrences(r.stdoutText, "D9"), 3);
+    BEZEL_EXPECT_EQ(countOccurrences(r.stdoutText, "A1B9C3"), 1);
+}
 
 // §19.2, `move` spelling: expression-`case` arm results coalescing two named
 // owned bindings. Direct analogue of `spec_19_2_case_arm_results_both_ways`.

@@ -358,16 +358,44 @@ bool isFreshOwnedClassProducer(const ast::Expr* e,
                                const sema::SemaContext& ctx,
                                const TypeParamResolver& resolveParam);
 
+// §28.3 K3.4 (v0.209, #2080; extended #4006 for the `move` spelling; #4016):
+// true when `e` is a BARE `move <identifier>` — the spec's CURRENT canonical
+// K3.4 marked-arm-transfer spelling (§28.3 consume table row K3.4; §7.7's own
+// coalescing example `var r := (if a <> null then move a else move b);`).
+// Matches ONLY the arm's own, unwrapped value: a `move` nested inside a
+// larger arm expression (`new Holder(move a)`) or a non-identifier operand
+// (`move a.f`, `move a!`) does not qualify — mirrors `MarkedTransferExpr`'s
+// own bare-name-only grammar (`"owned" Identifier`, §A.7).
+//
+// The SHAPE half of the K3.4 marked-transfer recognition shared by the
+// ownership pass (`MethodOwnership::isBareMoveArmValue`, which delegates
+// here) and `conditionalCaseArmMeetIsOwned` below. #4016: before this, the
+// ownership pass's own arm-transfer machinery (`processMarkedArmConstruct`)
+// recognized a bare `move x` arm, but this file's independent arm-meet
+// classification did not — so `(if useFresh then new Res(1) else move
+// cached)` (a `move`-marked arm MIXED with a fresh-producer sibling) was
+// classified a BORROW meet here while the ownership pass correctly treated
+// `cached` as transferred, and codegen's `unwindOwnedLocalClass` /
+// `usingVarOwnsClassObjectDynamically` (both funnel through
+// `conditionalCaseArmMeetIsOwned`) then found no disposal obligation for the
+// binding — an explicit `x.Dispose()` fell to the dispatch-only fallback and
+// its block leaked. A SYMMETRIC `move`+`move` construct never exercised this
+// path in the same way: `dischargedByArmTransfer`'s own per-path scope-end
+// dispose covers the losing side there, masking the gap this file has.
+bool isBareMoveArmValue(const ast::Expr& e);
+
 // §28.3 arm-meet (v0.184, #1661): true when `e` is an if-expression
 // (`v1 if c else v2`) or an expression-position `case`/`when` whose ownership
 // meets to OWNED — i.e. EVERY value-producing arm is itself a fresh owned
-// producer (isFreshOwnedClassProducer, or a nested owned-meet if/case) and at
-// least one such arm exists. A `throw` arm (bottom-typed) and a `null`-literal
-// arm are ABSORBING (they impose no ownership and are skipped); a borrow /
-// named-owned-binding / non-fresh arm DISQUALIFIES the whole expression (the
-// meet is then a borrow — `false` here). A `case`/`when` with any BLOCK-body
-// arm (`do … end`) is conservatively NOT owned-meet (its value expression is
-// not structurally inspectable here) — leak-but-sound, never a wrong dispose.
+// producer (isFreshOwnedClassProducer, a MARKED transfer — `owned x`
+// (MarkedTransferExpr) or the bare `move x` spelling (isBareMoveArmValue,
+// #4016) — or a nested owned-meet if/case) and at least one such arm exists.
+// A `throw` arm (bottom-typed) and a `null`-literal arm are ABSORBING (they
+// impose no ownership and are skipped); a borrow / non-fresh arm
+// DISQUALIFIES the whole expression (the meet is then a borrow — `false`
+// here). A `case`/`when` with any BLOCK-body arm (`do … end`) is
+// conservatively NOT owned-meet (its value expression is not structurally
+// inspectable here) — leak-but-sound, never a wrong dispose.
 // The single home both the ownership pass (producerState) and codegen
 // (usingVarOwnsClassObjectDynamically / unwindOwnedLocalClass) consult, so the
 // two never diverge on whether such an initializer carries a disposal

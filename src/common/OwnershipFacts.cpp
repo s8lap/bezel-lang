@@ -496,6 +496,15 @@ bool isFreshOwnedClassProducer(const ast::Expr* e, const sema::SemaContext& ctx,
     return rt->declaration->kind == ast::TypeDeclKind::Class;
 }
 
+// §28.3 K3.4 (v0.209, #2080; extended #4006/#4016) — see the header for the
+// full rationale. A bare `move <identifier>` arm value: a UnaryExpr("move")
+// whose operand is a plain identifier, nothing more.
+bool isBareMoveArmValue(const ast::Expr& e) {
+    const auto* ue = dynamic_cast<const ast::UnaryExpr*>(&e);
+    return ue && ue->op == "move" &&
+           dynamic_cast<const ast::IdentifierExpr*>(ue->operand.get());
+}
+
 namespace {
 
 // One arm of an if/case expression is an OWNED arm iff it is a fresh owned
@@ -503,11 +512,14 @@ namespace {
 bool armIsOwnedProducer(const ast::Expr* arm, const sema::SemaContext& ctx,
                         const TypeParamResolver& resolveParam) {
     if (!arm) return false;
-    // §28.3 K3.4 (v0.209, #2080): a MARKED arm `owned x` is an OWNED arm —
-    // the transfer hands over the binding's obligation on the selected path,
-    // so the meet treats it exactly as a fresh producer (the arm-meet row's
+    // §28.3 K3.4 (v0.209, #2080): a MARKED arm — `owned x`
+    // (MarkedTransferExpr) or the spec's current canonical bare `move x`
+    // spelling (isBareMoveArmValue, #4006/#4016) — is an OWNED arm: the
+    // transfer hands over the binding's obligation on the selected path, so
+    // the meet treats it exactly as a fresh producer (the arm-meet row's
     // marked-arm entry; the UNMARKED read stays a borrow arm, K3.13).
     if (dynamic_cast<const ast::MarkedTransferExpr*>(arm)) return true;
+    if (isBareMoveArmValue(*arm)) return true;
     if (dynamic_cast<const ast::ConditionalExpr*>(arm) ||
         dynamic_cast<const ast::CaseExpr*>(arm))
         return conditionalCaseArmMeetIsOwned(*arm, ctx, resolveParam);

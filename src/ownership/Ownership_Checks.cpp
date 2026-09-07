@@ -18416,10 +18416,20 @@ void MethodOwnership::checkTaskScopeConsumption(
 // (`"owned" Identifier`, §A.7). A `move` nested inside a LARGER arm
 // expression (`new Holder(move a)`) does not qualify either — the caller
 // only ever asks this of the arm's own, unwrapped value.
+//
+// narrow #4016: delegates to the shared `common::isBareMoveArmValue` (the
+// SAME shape fact `common::conditionalCaseArmMeetIsOwned`'s
+// `armIsOwnedProducer` now consults, OwnershipFacts.hpp/.cpp) rather than
+// keeping an independent copy — #4016 was exactly this predicate drifting: the
+// ownership pass recognized a bare `move x` arm (this function) but the
+// codegen-shared arm-meet classifier did not, so `(if useFresh then
+// new Res(1) else move cached)` was flagged Owned+maybeConsumed here while
+// codegen's unwindOwnedLocalClass/usingVarOwnsClassObjectDynamically (which
+// consult the OTHER copy) still saw a borrow meet and registered no disposal
+// obligation for the binding — an explicit `.Dispose()` on it fell to the
+// dispatch-only fallback and leaked.
 bool MethodOwnership::isBareMoveArmValue(const ast::Expr& e) {
-    const auto* ue = dynamic_cast<const ast::UnaryExpr*>(&e);
-    return ue && ue->op == "move" &&
-           dynamic_cast<const ast::IdentifierExpr*>(ue->operand.get());
+    return common::isBareMoveArmValue(e);
 }
 
 // §28.3 K3.4 (v0.209, #2080; extended #4006 for the `move` spelling): true
