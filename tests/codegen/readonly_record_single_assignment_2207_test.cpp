@@ -21,12 +21,21 @@
 // pins the diagnostic text + citation; the gtest harness here pins the
 // runtime semantics and the spec-cited REJECT text.
 //
-// Per §22.7 / §7.9: records have no base-first-construction footgun and no
-// per-instance non-nullable-field obligation, so the runConstructor class-
-// specific this-observation gate and field-DA fall-off check deliberately do
-// NOT run for record ctors — only the readonly single-assignment tracker
-// (the once-ness §22.8/#2187 enforces) is layered on. The acceptance/reject
-// tests below cover exactly that boundary.
+// Per §22.7 / §7.9, as of fix #4001 and fix #4014 (this comment previously
+// claimed neither obligation reaches records at all — both claims were
+// false premises, corrected in turn): a record constructor DOES carry its
+// own §7.9 field-completion fall-off check (#4001) and its own §22.7 rule-1
+// this-observation gate (#4014) — rule 1's hazard (an ordinary instance
+// call/property observation of `this` before a field it reads is assigned)
+// is independent of inheritance and applies to a record's own sealed,
+// non-virtual methods exactly as it does to a class's. Only §22.7 rule 2
+// (no virtual dispatch from a non-sealed class's constructor) stays
+// genuinely class-only — records are implicitly sealed with no base class
+// (§9.6), so that footgun cannot arise for one. Every field this file's
+// records declare is **nullable** (`_f: string?`, `_stash: (() -> int)?`),
+// so none is §7.9-strict and rule 1's gate has nothing to observe here — the
+// readonly single-assignment tracker (the once-ness §22.8/#2187 enforces)
+// is the only mechanism exercised below, unaffected by either fix.
 
 #include "support/aot_support.hpp"
 #include "support/codegen_support.hpp"
@@ -131,9 +140,11 @@ BEZEL_TEST(readonly_record_single_assignment_2207, double_assign_rejected) {
 // authored ctor double-assigns a readonly field across a this-escape helper
 // that stashes a narrowing lambda. The exploit (SEGV in `lam$0` on main and
 // on the #2187 branch alike) is closed by rejecting the second assignment.
-// NB: §22.7's this-observation gate does NOT fire on records (records have
-// no base-first-construction footgun — that gate is class-specific per
-// §22.7), so the rejection must come from the readonly once-check alone.
+// NB: as of fix #4014, §22.7 rule 1's this-observation gate DOES run on
+// records — but `_f` and `_stash` are both **nullable**, so neither is a
+// §7.9-strict field and rule 1's gate (which only ever inspects
+// §7.9-strict fields) has nothing to observe on this program; the
+// rejection comes from the readonly once-check alone, unaffected by #4014.
 BEZEL_TEST(readonly_record_single_assignment_2207, this_escape_stored_lambda_rejected) {
     BEZEL_EXPECT_TRUE(rejectedWith(
         "module M; "

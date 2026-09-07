@@ -624,9 +624,18 @@ public:
     // record readonly fields too, so the #2187 exploit (a stored-lambda
     // ambient fact derefing a value the ctor later nulled) reproduced on
     // records (probe-confirmed SEGV in `lam$0`). Enable readonly tracking
-    // WITHOUT importing the class-specific §22.7 this-observation gating
-    // (records have no base-first-construction footgun) — but, per fix #4001,
-    // WITH the §7.9 field-completion obligation itself (`recordCtorMode_`):
+    // WITHOUT importing §22.7 rule 2's dispatch gating (`checkVirtualDispatch`
+    // stays `ctorMode_`-only: records have no base-first-construction/virtual-
+    // dispatch footgun, being implicitly sealed with no base class, §9.6) —
+    // but, per fix #4001, WITH the §7.9 field-completion obligation itself
+    // (`recordCtorMode_`), and, per fix #4014, WITH rule 1's this-observation
+    // gate too (`gateObservation`/`visitCtorCall`/`visitCtorMemberAccess` all
+    // key on `ctorMode_ || recordCtorMode_`) — rule 1's hazard, an ordinary
+    // instance call/property read of a not-yet-assigned field through `this`,
+    // is independent of inheritance and reproduces identically on a record's
+    // own sealed, non-virtual methods (issue #4014, three measured SIGSEGV
+    // repros: an instance-call observation, a computed-property observation,
+    // and `this` passed as a bare argument — none diagnosed before that fix):
     // §7.9's own text is generic ("every non-nullable field must be either
     // assigned … or given a field initializer") and §9.4 states outright that
     // a record constructor's stores are "governed by §22.8's once-only and
@@ -1044,10 +1053,11 @@ private:
             // through to visitExpr below, where its setter invocation is gated.
             // fix #4001 / §7.9: `recordCtorMode_` reuses this same bookkeeping
             // for a record constructor's own §7.9 obligation (see its
-            // declaration) — a record has no observation gate to feed, only
-            // the fall-off completeness check this marks toward. fix #4015 /
-            // #4029: `staticCtorMode_` reuses the SAME completion-tracking
-            // machinery, but through `isOwnStaticMemberTarget` — a DIFFERENT
+            // declaration) — feeding both the fall-off completeness check
+            // AND, per fix #4014, `gateObservation`'s rule-1 gate, exactly as
+            // it does for a class constructor. fix #4015 / #4029:
+            // `staticCtorMode_` reuses the SAME completion-tracking machinery,
+            // but through `isOwnStaticMemberTarget` — a DIFFERENT
             // (symbol-identity, not AST-shape) predicate, since a static
             // member's legal spellings include `TypeName.X` (§2.7), which no
             // AST-shape match on the target enumerates soundly (see that
@@ -1549,7 +1559,16 @@ private:
             // the parent MemberAccess/Call handlers and never recurse into this
             // leaf. `base` alone is not a value (only `base.member`), so only
             // `this` is gated. per §22.7
-            if (ctorMode_ && id->name == "this") {
+            //
+            // fix #4014: also gated under `recordCtorMode_` — a record's
+            // constructor can pass `this` as an argument or store it before a
+            // field is assigned exactly as a class's can (measured: doing so
+            // reaches a SEPARATE, pre-existing codegen defect — malformed IR —
+            // on the pre-fix compiler regardless of field-assignment order;
+            // filed as its own issue since it is independent of definite
+            // assignment). Rejecting here is strictly better than reaching
+            // that crash uninitialized.
+            if ((ctorMode_ || recordCtorMode_) && id->name == "this") {
                 gateObservation(id->span.begin, "reference to `this`");
                 return;
             }
@@ -2046,8 +2065,21 @@ private:
     // §7.9-strict field is not definitely assigned on every reaching path.
     // `what` names the observation form for the diagnostic. Returns nothing;
     // one diagnostic per unadmitted observation.
+    //
+    // fix #4014: also active under `recordCtorMode_`. Rule 1's own text states
+    // the hazard generically — "a synchronous observation of `this` ... is
+    // admitted only at points where every field ... [§7.9] requires to be
+    // explicitly initialized is definitely assigned" — and its stated purpose,
+    // "keep §7.9's guarantee true while `this` is under construction", already
+    // covers records: §7.9 governs a record's non-nullable body field/
+    // auto-property identically to a class's (fix #4001, §9.4). Only rule 2
+    // (virtual dispatch, guarded separately in `checkVirtualDispatch`) depends
+    // on the class-specific base-first-construction footgun; rule 1's hazard —
+    // an ordinary instance method reading a not-yet-assigned field through
+    // `this` — is independent of inheritance and reproduces identically on a
+    // record's own (sealed, non-virtual) instance methods (issue #4014).
     void gateObservation(const SourceLocation& loc, const std::string& what) {
-        if (!ctorMode_) return;
+        if (!ctorMode_ && !recordCtorMode_) return;
         if (inChainingPosition_) {
             ctx_.diagnostics().report(
                 Severity::Error, loc,
@@ -2194,10 +2226,19 @@ private:
     // class whose field initializers have not run. `base.M()` is non-dispatching
     // and exempt (caller passes viaBase=true). Returns true iff it reported (so
     // the caller skips the rule-1 gate for the same site).
+    //
+    // fix #4014: explicitly `ctorMode_`-only (never `recordCtorMode_`). Rule 2
+    // is the genuinely class-specific half of §22.7 — records "cannot derive
+    // from another record or from a class" and are "implicitly sealed" (§9.6),
+    // so the base-first-construction/virtual-dispatch footgun this rule guards
+    // against cannot arise for one, whatever modifiers a record method happens
+    // to carry. Without this guard `classSealedNonAbstract_` (computed only in
+    // `runConstructor`, always false in `runRecordConstructor`) would make this
+    // wrongly fire on a record whose method syntactically carries `virtual`.
     bool checkVirtualDispatch(Symbol* calleeSym, bool viaBase,
                               const SourceLocation& loc,
                               std::string_view mname) {
-        if (viaBase || classSealedNonAbstract_) return false;
+        if (!ctorMode_ || viaBase || classSealedNonAbstract_) return false;
         bool virt = false;
         if (auto* ms = dynamic_cast<MethodSymbol*>(calleeSym))
             virt = methodIsVirtualFamily(*ms);
@@ -2361,8 +2402,14 @@ private:
     // (virtual dispatch) then, unless rule 2 fired, the rule-1 gate, and visits
     // the arguments for their own observations and local DA. Returns true iff
     // the call was a receiver-`this` call it handled (so the caller returns).
+    //
+    // fix #4014: reached under `recordCtorMode_` too (rule 1 generalizes; see
+    // `gateObservation`). `checkVirtualDispatch` stays a no-op under
+    // `recordCtorMode_` (its own `!ctorMode_` guard), so a record's instance
+    // call is checked by rule 1 alone, exactly as the issue's recommendation
+    // describes.
     bool visitCtorCall(const ast::CallExpr& ce) {
-        if (!ctorMode_ || !ce.callee) return false;
+        if ((!ctorMode_ && !recordCtorMode_) || !ce.callee) return false;
         bool viaThis = false, viaBase = false;
         std::string_view mname;
         if (auto* ma =
@@ -2432,8 +2479,15 @@ private:
     // and rule 2 if virtual). Returns true iff `e` was a `this`/`base` member
     // access it handled (so the caller does not recurse into the receiver and
     // wrongly flag it as a bare-`this` observation).
+    //
+    // fix #4014: reached under `recordCtorMode_` too — see `gateObservation`.
+    // `base` is unreachable for a record (§9.6: a record has no base class
+    // other than the implicit `Object` root, which declares no computed
+    // property this gate would fire on), so in practice only the `this` arm
+    // is live here for a record; kept uniform with the class path rather than
+    // special-cased.
     bool visitCtorMemberAccess(const ast::MemberAccessExpr& ma) {
-        if (!ctorMode_ || !ma.target) return false;
+        if ((!ctorMode_ && !recordCtorMode_) || !ma.target) return false;
         bool viaThis = isNamedIdent(*ma.target, "this");
         bool viaBase = isNamedIdent(*ma.target, "base");
         if (!viaThis && !viaBase) return false;
@@ -2486,14 +2540,22 @@ void checkNoCtorScreenForType(const ast::TypeDecl& td, SemaContext& ctx);
 
 // `enclosing` is the type whose members are being walked (null for extension
 // members and top-level free code). §22.7 construction-time `this`-observation
-// checking runs only for a CLASS's non-static constructors: records have no
-// base-first-construction/virtual-dispatch footgun for it to guard against.
-// Fix #4001 narrows that to observation-gating specifically — a record's
-// constructor DOES carry its own §7.9 field-completion obligation (below,
-// `runRecordConstructor`/`recordCtorMode_`), the same as the O9 field-DA
-// obligation Ownership.cpp enforces for a class with no explicit constructor
-// at all. Interfaces/enums/choices still get the ordinary local-DA walk
-// unchanged — neither §22.7 nor §7.9's field obligation applies to them.
+// checking's TWO rules split by class-specificity (fix #4014, correcting an
+// earlier premise here that treated "the observation gate" as one indivisible
+// class-only unit): rule 1 (the observation gate — `gateObservation`,
+// `visitCtorCall`, `visitCtorMemberAccess`) runs for a RECORD's non-static
+// constructor too (`runRecordConstructor`/`recordCtorMode_`), because its
+// hazard — an ordinary instance-method/property read of a not-yet-assigned
+// field through `this` — is independent of inheritance and its stated purpose
+// is to keep §7.9's guarantee true, which already covers records (fix #4001,
+// §9.4). Rule 2 (`checkVirtualDispatch`, no virtual dispatch from a
+// non-sealed class's constructor) stays genuinely class-only — records
+// "cannot derive from another record or from a class" and are "implicitly
+// sealed" (§9.6), so the base-first-construction/virtual-dispatch footgun
+// cannot arise for one; `checkVirtualDispatch` enforces this with its own
+// `ctorMode_`-only guard rather than by omission. Interfaces/enums/choices
+// still get the ordinary local-DA walk unchanged — neither §22.7 nor §7.9's
+// field obligation applies to them.
 void checkMember(const ast::Member& m, SemaContext& ctx,
                  const ast::TypeDecl* enclosing) {
     if (auto* md = dynamic_cast<const ast::MethodDecl*>(&m)) {
@@ -2535,10 +2597,10 @@ void checkMember(const ast::Member& m, SemaContext& ctx,
             // fix #2207 / §22.8: record-ctor readonly single-assignment. §22.8
             // and the §7.4/#2116 narrowing it underwrites apply to records too,
             // so the #2187 exploit reproduces on records (pre-existing SEGV).
-            // Enable roCtorMode_ without the class-specific §22.7
-            // observation-gate (records have no base-first-construction /
-            // virtual-dispatch footgun for gateObservation/checkVirtualDispatch
-            // to guard against, §22.7 rules 1-2 — genuinely class-specific).
+            // Enable roCtorMode_ without §22.7 rule 2's dispatch gate
+            // (`checkVirtualDispatch` stays `ctorMode_`-only — records have no
+            // base-first-construction/virtual-dispatch footgun, being
+            // implicitly sealed with no base class, §9.6).
             //
             // CORRECTED by fix #4001: an earlier revision of this comment
             // additionally claimed "§7.9 applies to class instances, not
@@ -2557,8 +2619,21 @@ void checkMember(const ast::Member& m, SemaContext& ctx,
             // tracks the SAME `fieldsNeedingInit_`/`assignedFields_` §7.9
             // obligation `runConstructor` tracks for classes and runs the
             // same `checkCtorFieldCompletion` fall-off check
-            // (`recordCtorMode_`) — everything EXCEPT the observation gate,
-            // which stays class-only as this comment always correctly said.
+            // (`recordCtorMode_`).
+            //
+            // CORRECTED AGAIN by fix #4014: the comment this replaces also
+            // claimed the *observation gate itself* (rule 1) was class-only —
+            // that was the false premise #4014 names. Rule 1's hazard (an
+            // ordinary instance-method/property observation of `this` before
+            // a field it reads is assigned) has nothing to do with
+            // inheritance and reproduces identically on a record's own
+            // sealed, non-virtual methods; only rule 2 (virtual dispatch) is
+            // genuinely class-only. `recordCtorMode_` now reaches rule 1 too
+            // (`gateObservation`/`visitCtorCall`/`visitCtorMemberAccess`),
+            // leaving `checkVirtualDispatch` as the one piece of §22.7
+            // machinery that stays class-only, guarded on its own by
+            // `ctorMode_` rather than by omission here.
+            //
             // A record with NO explicit constructor at all is not visited
             // here (there is no ConstructorDecl member to walk); that shape
             // is screened separately at the type level, mirroring

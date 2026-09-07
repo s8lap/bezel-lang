@@ -1,0 +1,414 @@
+// Spec-derived tests for fix #4014 — §22.7 (v0.294) rule 1's this-observation
+// gate on a RECORD constructor.
+//
+// §22.7 ("Observing `this` during construction") states three rules that
+// "keep §7.9's guarantee true while `this` is under construction":
+//
+//   Rule 1 (the observation gate): "a synchronous observation of `this` — an
+//   instance method, block-form accessor, or indexer invocation with receiver
+//   `this` (explicit or implicit); `this` as an argument; `this` stored
+//   anywhere; ... — is admitted only at points where every field of the
+//   declaring class that §7.9 requires to be explicitly initialized is
+//   definitely assigned on every reaching path."
+//
+//   Rule 2: "No virtual dispatch from constructor bodies of non-sealed
+//   classes." Its own text is explicit: "A call from a constructor body to a
+//   ... member ... is a compile error unless the declaring class is `sealed`
+//   and not `abstract`." This rule's hazard — a derived override running over
+//   not-yet-initialized fields — genuinely requires inheritance to exist.
+//
+//   Rule 3: capturing `this` in a lambda is NOT itself an observation ("is
+//   not gated by rule 1"); only an admitted closure's INVOCATION before
+//   construction completes would be one (a residual this file does not
+//   reach).
+//
+// Before this fix, `DefiniteAssignment.cpp`'s `runRecordConstructor`
+// (fix #4001/#2207) tracked `fieldsNeedingInit_`/`assignedFields_` for a
+// record exactly as `runConstructor` does for a class, but `recordCtorMode_`
+// never reached `gateObservation`/`visitCtorCall`/`visitCtorMemberAccess` —
+// those three functions, and the bare-`this`-identifier check in `visitExpr`,
+// were gated on `ctorMode_` alone (set only by `runConstructor`, i.e. only for
+// classes). The comment on that design explicitly (and, per this fix,
+// wrongly) attributed the WHOLE observation gate to "records have no
+// base-first-construction/virtual-dispatch footgun" — but that footgun is
+// rule 2's alone; rule 1's hazard (an ordinary instance call/property read of
+// a not-yet-assigned field through `this`) has nothing to do with
+// inheritance, and reproduces identically on a record's own sealed,
+// non-virtual methods. The practical consequence, exactly like #4001's own
+// bug: `bezelc` accepted a record constructor that called `this.Method()` (or
+// read a computed `this.Property`, or passed `this` as a bare argument)
+// BEFORE assigning a non-nullable field that call/read observed, and the
+// generated code read the unset (zero-filled) field storage and SIGSEGVed —
+// one statement earlier in the same constructor #4001 already covers.
+//
+// Because the pre-fix symptom is a SIGSEGV/crash rather than a clean
+// diagnostic-free compile, every REJECT-arm test below uses
+// `failedAtCompileTimeWithRealLocation` (aot_result_asserts.hpp) rather than
+// a bare `!r.ran`, per this project's `check_ambiguous_ran_false.py` ratchet.
+
+#include "support/aot_result_asserts.hpp"
+#include "support/aot_support.hpp"
+#include "support/codegen_support.hpp"
+#include "test_harness.hpp"
+
+using bezel::test::failedAtCompileTimeWithRealLocation;
+using bezel::test::runAot;
+
+namespace {
+
+int runProg(const std::string& src) {
+    auto r = runAot(src);
+    return r.ran ? r.exitCode : -999;
+}
+
+bool diagContains(const bezel::test::JitResult& r, const char* sub) {
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find(sub) != std::string::npos) return true;
+    return false;
+}
+
+// Shared helper class every repro below funnels a non-nullable reference
+// field through (mirrors kWidget in record_field_definite_assignment_4001_test.cpp).
+const char* kWidget4014 =
+    "module M; "
+    "public class Widget4014 "
+    "  public Count: int; "
+    "  public constructor(c: int) Count := c; end constructor; "
+    "  public method Render(): int return Count; end Render; "
+    "end Widget4014; ";
+
+}  // namespace
+
+// =====================================================================
+// REJECT arm — the issue's own repro and the adjacent observation forms
+// §22.7 rule 1 names ("an instance method ... invocation"; "a block-form
+// accessor ... invocation"; "`this` as an argument").
+// =====================================================================
+
+// The issue's exact repro: an ordinary (non-virtual) instance method call
+// `this.Peek()` reads a not-yet-assigned non-nullable field through `Peek`'s
+// body — no inheritance or dispatch involved anywhere in this program.
+BEZEL_TEST(sema_record_ctor_observation_gate_4014,
+           instance_method_call_before_field_assigned_rejected_spec_22_7) {
+    auto r = runAot(std::string(kWidget4014) +
+        "public record RecordObsCtor4014 "
+        "  public readonly property Extra: Widget4014; "
+        "  public constructor(w: Widget4014) "
+        "    var x := this.Peek(); "
+        "    Extra := w; "
+        "  end constructor; "
+        "  public method Peek(): int return Extra.Render(); end Peek; "
+        "end RecordObsCtor4014; "
+        "class C "
+        "  public static method Main(): int "
+        "    var w := new Widget4014(42); "
+        "    var c := new RecordObsCtor4014(w); "
+        "    return c.Extra.Render(); "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagContains(r, "cannot observe `this`"));
+    BEZEL_EXPECT_TRUE(diagContains(r, "instance call `Peek`"));
+    BEZEL_EXPECT_TRUE(diagContains(r, "non-nullable field `Extra`"));
+    BEZEL_EXPECT_TRUE(diagContains(r, "§22.7"));
+}
+
+// A bare (implicit-`this`) call to a non-static instance method is the same
+// observation under a different spelling (§22.7 rule 1: "receiver `this`
+// (explicit or implicit)").
+BEZEL_TEST(sema_record_ctor_observation_gate_4014,
+           implicit_this_call_before_field_assigned_rejected_spec_22_7) {
+    auto r = runAot(std::string(kWidget4014) +
+        "public record RecordObsImplicit4014 "
+        "  public readonly property Extra: Widget4014; "
+        "  public constructor(w: Widget4014) "
+        "    var x := Peek(); "
+        "    Extra := w; "
+        "  end constructor; "
+        "  public method Peek(): int return Extra.Render(); end Peek; "
+        "end RecordObsImplicit4014; "
+        "class C "
+        "  public static method Main(): int "
+        "    var w := new Widget4014(42); "
+        "    var c := new RecordObsImplicit4014(w); "
+        "    return c.Extra.Render(); "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagContains(r, "cannot observe `this`"));
+}
+
+// A computed (block-form) property getter invocation is a "block-form
+// accessor ... invocation" observation (§22.7 rule 1) — distinct from a
+// direct auto-property read, which the rule explicitly excludes.
+BEZEL_TEST(sema_record_ctor_observation_gate_4014,
+           computed_property_read_before_field_assigned_rejected_spec_22_7) {
+    auto r = runAot(std::string(kWidget4014) +
+        "public record RecordObsProp4014 "
+        "  public readonly property Extra: Widget4014; "
+        "  public property Peek: int "
+        "    get => Extra.Render(); "
+        "  end Peek; "
+        "  public constructor(w: Widget4014) "
+        "    var x := this.Peek; "
+        "    Extra := w; "
+        "  end constructor; "
+        "end RecordObsProp4014; "
+        "class C "
+        "  public static method Main(): int "
+        "    var w := new Widget4014(42); "
+        "    var c := new RecordObsProp4014(w); "
+        "    return c.Extra.Render(); "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagContains(r, "cannot observe `this`"));
+    BEZEL_EXPECT_TRUE(diagContains(r, "property `Peek`"));
+}
+
+// `this` passed as a bare argument before a field it (transitively) exposes
+// is assigned — §22.7 rule 1's "`this` as an argument" form. MEASURED: on the
+// pre-fix compiler this specific shape does not SIGSEGV — it reaches a
+// SEPARATE, pre-existing codegen defect (malformed IR, filed as its own
+// issue) that fires whenever `this` is passed by value from inside a
+// record's own constructor, regardless of field-assignment order. Rejecting
+// here at sema time is strictly better than ever reaching that crash.
+BEZEL_TEST(sema_record_ctor_observation_gate_4014,
+           this_passed_as_argument_before_field_assigned_rejected_spec_22_7) {
+    auto r = runAot(std::string(kWidget4014) +
+        "public record RecordObsArg4014 "
+        "  public readonly property Extra: Widget4014; "
+        "  public static method Touch(x: RecordObsArg4014): int "
+        "    return x.Extra.Render(); "
+        "  end Touch; "
+        "  public constructor(w: Widget4014) "
+        "    var y := RecordObsArg4014.Touch(this); "
+        "    Extra := w; "
+        "  end constructor; "
+        "end RecordObsArg4014; "
+        "class C "
+        "  public static method Main(): int "
+        "    var w := new Widget4014(42); "
+        "    var c := new RecordObsArg4014(w); "
+        "    return c.Extra.Render(); "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagContains(r, "cannot observe `this`"));
+    BEZEL_EXPECT_TRUE(diagContains(r, "reference to `this`"));
+}
+
+// =====================================================================
+// ACCEPT arm (over-rejection guards) — each reads back a runtime VALUE, not
+// merely a clean compile, so a false reject shows as a value/-999 mismatch.
+// =====================================================================
+
+// The identical instance-call shape, but the field is assigned FIRST — the
+// gate's own admitted case. 42 round-trips.
+BEZEL_TEST(sema_record_ctor_observation_gate_4014,
+           instance_method_call_after_field_assigned_accepted_spec_22_7) {
+    BEZEL_EXPECT_EQ(runProg(std::string(kWidget4014) +
+        "public record RecordObsOk4014 "
+        "  public readonly property Extra: Widget4014; "
+        "  public constructor(w: Widget4014) "
+        "    Extra := w; "
+        "    var x := this.Peek(); "
+        "  end constructor; "
+        "  public method Peek(): int return Extra.Render(); end Peek; "
+        "end RecordObsOk4014; "
+        "class C "
+        "  public static method Main(): int "
+        "    var w := new Widget4014(42); "
+        "    var c := new RecordObsOk4014(w); "
+        "    return c.Extra.Render(); "
+        "  end Main; "
+        "end C;"),
+        42);
+}
+
+// §22.7 rule 3: capturing `this` in a lambda is NOT itself a synchronous
+// observation ("is not gated by rule 1"). The lambda is bound but never
+// invoked before the field is assigned — must be ACCEPTED even though the
+// field is still unassigned at the capture site. 42 round-trips (the lambda
+// is invoked only after construction completes, in `Main`).
+BEZEL_TEST(sema_record_ctor_observation_gate_4014,
+           lambda_capture_of_this_before_field_assigned_accepted_spec_22_7) {
+    BEZEL_EXPECT_EQ(runProg(std::string(kWidget4014) +
+        "public record RecordObsLambda4014 "
+        "  public readonly property Extra: Widget4014; "
+        "  public readonly property Deferred: () -> int; "
+        "  public method Peek(): int return Extra.Render(); end Peek; "
+        "  public constructor(w: Widget4014) "
+        "    Deferred := lambda(): int => this.Peek(); "
+        "    Extra := w; "
+        "  end constructor; "
+        "end RecordObsLambda4014; "
+        "class C "
+        "  public static method Main(): int "
+        "    var w := new Widget4014(42); "
+        "    var c := new RecordObsLambda4014(w); "
+        "    var f := c.Deferred; "
+        "    return f(); "
+        "  end Main; "
+        "end C;"),
+        42);
+}
+
+// A field with a field initializer counts as assigned at body entry (§22.7
+// rule 1: "Fields with initializers count as assigned at body entry") — an
+// instance call observing it must be ACCEPTED.
+BEZEL_TEST(sema_record_ctor_observation_gate_4014,
+           field_initializer_satisfies_gate_at_entry_accepted_spec_22_7) {
+    BEZEL_EXPECT_EQ(runProg(
+        "module M; "
+        "public record RecordObsInit4014 "
+        "  public Extra: string := \"hello\"; "
+        "  public method Peek(): int return Extra.Length; end Peek; "
+        "  public constructor() "
+        "    var x := this.Peek(); "
+        "  end constructor; "
+        "end RecordObsInit4014; "
+        "class C "
+        "  public static method Main(): int "
+        "    var c := new RecordObsInit4014(); "
+        "    return c.Peek(); "
+        "  end Main; "
+        "end C;"),
+        5);
+}
+
+// A NULLABLE field is not §7.9-strict, so it never enters `fieldsNeedingInit_`
+// and the gate has nothing to observe — an instance call before "assigning"
+// it must be ACCEPTED regardless of assignment order (mirrors the existing
+// `readonly_record_single_assignment_2207_test.cpp` control, which relies on
+// exactly this to keep its own `this_escape_stored_lambda_rejected` case
+// rejecting via the readonly once-check alone rather than this gate).
+BEZEL_TEST(sema_record_ctor_observation_gate_4014,
+           nullable_field_method_call_before_assignment_accepted_spec_7_9) {
+    BEZEL_EXPECT_EQ(runProg(
+        "module M; "
+        "public record RecordObsNullable4014 "
+        "  public Extra: string?; "
+        "  public method Peek(): int "
+        "    var e := Extra; "
+        "    if e <> null then return e.Length; end; "
+        "    return -1; "
+        "  end Peek; "
+        "  public constructor() "
+        "    var x := this.Peek(); "
+        "    Extra := \"hello\"; "
+        "  end constructor; "
+        "end RecordObsNullable4014; "
+        "class C "
+        "  public static method Main(): int "
+        "    var c := new RecordObsNullable4014(); "
+        "    return c.Peek(); "
+        "  end Main; "
+        "end C;"),
+        5);
+}
+
+// §22.7 rule 2 stays genuinely class-only: a record method may carry the
+// syntactically-admitted (but semantically inert — records are implicitly
+// sealed, §9.6) `virtual` modifier, and calling it BEFORE the field is
+// assigned is still rejected — but by RULE 1's observation-gate message, not
+// rule 2's virtual-dispatch message, pinning that `checkVirtualDispatch`
+// stays a no-op for records (its own `!ctorMode_` guard) rather than
+// misfiring because `classSealedNonAbstract_` defaults to false outside
+// `runConstructor`.
+BEZEL_TEST(sema_record_ctor_observation_gate_4014,
+           virtual_record_method_before_assignment_rejected_by_rule1_not_rule2) {
+    auto r = runAot(std::string(kWidget4014) +
+        "public record RecordObsVirtual4014 "
+        "  public readonly property Extra: Widget4014; "
+        "  public virtual method Peek(): int return Extra.Render(); end Peek; "
+        "  public constructor(w: Widget4014) "
+        "    var x := this.Peek(); "
+        "    Extra := w; "
+        "  end constructor; "
+        "end RecordObsVirtual4014; "
+        "class C "
+        "  public static method Main(): int "
+        "    var w := new Widget4014(42); "
+        "    var c := new RecordObsVirtual4014(w); "
+        "    return c.Extra.Render(); "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagContains(r, "cannot observe `this`"));
+    BEZEL_EXPECT_FALSE(diagContains(r, "virtual`/`override`/`abstract`"));
+}
+
+// The same `virtual` record method, called AFTER the field is assigned, must
+// be ACCEPTED and run — confirming rule 2 truly never fires for a record
+// (not merely that rule 1 masks it in the reject case above).
+BEZEL_TEST(sema_record_ctor_observation_gate_4014,
+           virtual_record_method_after_assignment_accepted) {
+    BEZEL_EXPECT_EQ(runProg(std::string(kWidget4014) +
+        "public record RecordObsVirtualOk4014 "
+        "  public readonly property Extra: Widget4014; "
+        "  public virtual method Peek(): int return Extra.Render(); end Peek; "
+        "  public constructor(w: Widget4014) "
+        "    Extra := w; "
+        "    var x := this.Peek(); "
+        "  end constructor; "
+        "end RecordObsVirtualOk4014; "
+        "class C "
+        "  public static method Main(): int "
+        "    var w := new Widget4014(42); "
+        "    var c := new RecordObsVirtualOk4014(w); "
+        "    return c.Extra.Render(); "
+        "  end Main; "
+        "end C;"),
+        42);
+}
+
+// A `this(...)`-chaining record constructor enters its own body with every
+// §7.9-strict field of the chained-to constructor already assigned
+// (`runRecordConstructor` seeds `assignedFields_` from `fieldsNeedingInit_`
+// on a `this(...)` chain, mirroring `runConstructor`) — an instance call in
+// the chaining constructor's OWN body must be ACCEPTED.
+BEZEL_TEST(sema_record_ctor_observation_gate_4014,
+           this_chaining_ctor_body_call_accepted_spec_22_7) {
+    BEZEL_EXPECT_EQ(runProg(std::string(kWidget4014) +
+        "public record RecordObsChain4014 "
+        "  public readonly property Extra: Widget4014; "
+        "  public constructor(w: Widget4014) Extra := w; end constructor; "
+        "  public constructor() this(new Widget4014(42)); "
+        "    var x := this.Peek(); "
+        "  end constructor; "
+        "  public method Peek(): int return Extra.Render(); end Peek; "
+        "end RecordObsChain4014; "
+        "class C "
+        "  public static method Main(): int "
+        "    var c := new RecordObsChain4014(); "
+        "    return c.Peek(); "
+        "  end Main; "
+        "end C;"),
+        42);
+}
+
+// Class control (unaffected by this fix — pins that the class path's
+// pre-existing rejection is unchanged): the identical shape on a CLASS was
+// already rejected before #4014 and must remain rejected identically.
+BEZEL_TEST(sema_record_ctor_observation_gate_4014,
+           class_control_instance_method_call_before_field_assigned_rejected) {
+    auto r = runAot(std::string(kWidget4014) +
+        "public class ClassObsCtor4014 "
+        "  public Extra: Widget4014; "
+        "  public constructor(w: Widget4014) "
+        "    var x := this.Peek(); "
+        "    Extra := w; "
+        "  end constructor; "
+        "  public method Peek(): int return Extra.Render(); end Peek; "
+        "end ClassObsCtor4014; "
+        "class C "
+        "  public static method Main(): int "
+        "    var w := new Widget4014(42); "
+        "    var c := new ClassObsCtor4014(w); "
+        "    return c.Extra.Render(); "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagContains(r, "cannot observe `this`"));
+}
