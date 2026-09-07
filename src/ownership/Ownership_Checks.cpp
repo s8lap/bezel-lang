@@ -10468,7 +10468,26 @@ void MethodOwnership::checkOwnedReturnDirectBorrow(const ast::Expr& e) {
     if (returnType_ && returnType_->kind == ast::TypeKind::Named &&
         returnType_->name && !returnType_->name->parts.empty()) {
         std::string_view head = returnType_->name->parts.front();
-        if (head == "IEnumerable" || head == "IAsyncEnumerable") return;
+        // Read off the shared #3419 classifiers rather than spelling the two
+        // head names by hand (the enumerable-wrap grid's declared-head axis —
+        // a hand-spelled copy drifts from the authority silently). The set
+        // wanted here is exactly the NON-OWNING iterator-format enumerable
+        // heads: `isIterFormatEnumerableHead` is the four-name set
+        // {IEnumerable, IOwningEnumerable, IAsyncEnumerable,
+        // IOwningAsyncEnumerable} and `isOwningIterableInterfaceHead` removes
+        // the two owning ones, leaving {IEnumerable, IAsyncEnumerable}.
+        //
+        // The subtraction is load-bearing, not cosmetic: the owning heads
+        // (stdlib §4.13) DO extend IDisposable/IAsyncDisposable and each
+        // measurably double-frees through this shape when a borrow reaches a
+        // real destructor, so exempting them would be unsound. #4010 tracks
+        // the residual — a USER-DEFINED non-IDisposable interface extending
+        // IEnumerable<T> is still over-rejected, which no head-name query can
+        // see; #4007 separately disputes whether this exemption is sound at
+        // all. // per stdlib §4.12, §4.13, #3419, #3993, #4007, #4010
+        if (common::isIterFormatEnumerableHead(head) &&
+            !common::isOwningIterableInterfaceHead(head))
+            return;
     }
     if (auto* un = dynamic_cast<const ast::UnaryExpr*>(&e))
         if (un->op == "move") return;
