@@ -120,6 +120,100 @@ bool isSevenNineStrictAutoProp(const ast::PropertyDecl& p, SemaContext& ctx) {
     }
 }
 
+// fix #4015 / §7.9: the STATIC twin of isSevenNineStrictField above — §7.9's
+// own text requires assignment "in every constructor (for instance fields) or
+// in the static constructor (for static fields)" generically, and nothing in
+// DefiniteAssignment.cpp or Ownership.cpp screened the static case at all: a
+// non-nullable, non-defaultable `static readonly` field with no static
+// constructor and no field initializer compiled clean and SIGSEGVed on first
+// read, identically for a class and a record (issue #4015). A separate
+// function rather than a `wantStatic` parameter on isSevenNineStrictField
+// itself, deliberately: the type-kind switch below is IDENTICAL to
+// isSevenNineStrictField's, so the two functions differ only in which
+// `static` reading they require, but this file's static- and instance-field
+// no-ctor screens are used by different callers (checkStaticNoCtorField
+// Completion below vs. checkRecordNoCtorFieldCompletion/runConstructor/
+// runRecordConstructor) with no shared call site that would benefit from a
+// single parameterized function, and keeping them separate means neither
+// reads its own boolean argument backwards at a call site.
+bool isSevenNineStrictStaticField(const ast::FieldDecl& f, SemaContext& ctx) {
+    bool isStatic = false;
+    for (auto m : f.modifiers)
+        if (m == "static") { isStatic = true; break; }
+    if (!isStatic) return false;
+    if (f.initializer) return false;  // assigned at body entry
+    if (!f.type) return false;
+    auto* rt = ctx.resolvedType(*f.type);
+    if (!rt || rt->nullable) return false;
+    switch (rt->kind) {
+        case TypeRef::Kind::Primitive:
+            return rt->primitive == PrimitiveType::String ||
+                   rt->primitive == PrimitiveType::Object;
+        case TypeRef::Kind::Function:
+            return true;
+        case TypeRef::Kind::Named:
+            if (!rt->declaration) return false;  // built-in / generic — skip
+            if (rt->declaration->kind == ast::TypeDeclKind::Enum) {
+                std::optional<bool> hasZero =
+                    enumHasZeroConstant(*rt->declaration);
+                return hasZero && !*hasZero;
+            }
+            return rt->declaration->kind == ast::TypeDeclKind::Class ||
+                   rt->declaration->kind == ast::TypeDeclKind::Interface;
+        default:
+            return false;  // Unit, InlineArray, Error → value/unknown
+    }
+}
+
+// fix #4015 / §7.9: the STATIC auto-property twin, mirroring
+// isSevenNineStrictStaticField exactly as isSevenNineStrictAutoProp mirrors
+// isSevenNineStrictField. Deliberately its OWN function rather than a
+// parameter on isSevenNineStrictAutoProp: per the R15 landmine note (#4018/
+// #4020, still open), `abstract property Name: T;` (§12.5) parses with the
+// SAME PropertyBodyKind::Auto a real auto-property gets, so any predicate
+// walking auto-properties must exclude `abstract` explicitly or it
+// misclassifies a signature-only member as backing storage needing
+// assignment. MEASURED: `static abstract property Name: T;` is independently
+// rejected ("static member `Name` may not be virtual, abstract, or override
+// (§12.1)", TypeResolution_Checks.cpp:597/789/914) before this pass ever
+// runs, so requiring `isStatic` already excludes every case this predicate
+// could reach in a program that compiles this far. The explicit `abstract`
+// exclusion below is kept anyway so this function reads as self-evidently
+// correct against the landmine without relying on that separate, differently
+// -scoped rejection remaining in place.
+bool isSevenNineStrictStaticAutoProp(const ast::PropertyDecl& p,
+                                      SemaContext& ctx) {
+    if (p.bodyKind != ast::PropertyBodyKind::Auto) return false;
+    if (p.isIndexer || p.autoInitializer) return false;
+    bool isStatic = false, isAbstract = false;
+    for (auto m : p.modifiers) {
+        if (m == "static") isStatic = true;
+        else if (m == "abstract") isAbstract = true;
+    }
+    if (!isStatic || isAbstract) return false;
+    if (!p.type) return false;
+    auto* rt = ctx.resolvedType(*p.type);
+    if (!rt || rt->nullable) return false;
+    switch (rt->kind) {
+        case TypeRef::Kind::Primitive:
+            return rt->primitive == PrimitiveType::String ||
+                   rt->primitive == PrimitiveType::Object;
+        case TypeRef::Kind::Function:
+            return true;
+        case TypeRef::Kind::Named:
+            if (!rt->declaration) return false;
+            if (rt->declaration->kind == ast::TypeDeclKind::Enum) {
+                std::optional<bool> hasZero =
+                    enumHasZeroConstant(*rt->declaration);
+                return hasZero && !*hasZero;
+            }
+            return rt->declaration->kind == ast::TypeDeclKind::Class ||
+                   rt->declaration->kind == ast::TypeDeclKind::Interface;
+        default:
+            return false;
+    }
+}
+
 // True when `e` is the bare `this`/`base` keyword (stored as an IdentifierExpr
 // with the keyword lexeme, per Parser_Exprs §22.3).
 bool isNamedIdent(const ast::Expr& e, std::string_view n) {
@@ -443,22 +537,78 @@ public:
     // constructors take no parameters. `static readonly` fields carrying a
     // static field initializer run before the static-ctor body (§22.12), so they
     // are seeded as already-assigned, exactly like the instance initializer case.
+    //
+    // fix #4015 / §7.9: this walk previously tracked ONLY the readonly
+    // single-assignment obligation (`roCtorMode_`), never the field-
+    // completion obligation §7.9's own text states for a static constructor
+    // ("assignment ... in the static constructor, for static fields") — so a
+    // static readonly field a declared static constructor simply never got
+    // around to assigning (every live path, not merely a double-assign) fell
+    // off the end unset, and reading it back SIGSEGVed exactly as the
+    // no-static-ctor-at-all case did (MEASURED: `static constructor() {
+    // Other := 5; }` with `Other` unrelated to `static readonly Shared:
+    // Widget;` compiled clean and crashed identically to no static
+    // constructor at all). `staticCtorMode_` reuses the SAME two class-
+    // agnostic mechanisms `recordCtorMode_` already reuses for records
+    // (fix #4001's own comment on `runRecordConstructor` names them: marking
+    // a store toward `assignedFields_`, and the fall-off completeness check)
+    // — never `ctorMode_` itself, so none of the §22.7 this-observation
+    // gating (which reads `ctorMode_` specifically, never `recordCtorMode_`
+    // or this flag) is pulled in; a static constructor has no `this` to
+    // observe. Callable for BOTH a class's and a record's static constructor
+    // — nothing in this body is class- or record-specific — so checkMember's
+    // ConstructorDecl dispatch below routes `cd->isStatic && inRecord`
+    // through this same function, closing a second, separate gap that
+    // existed alongside the field-completion one: a record's static
+    // constructor previously matched NONE of checkMember's typed branches
+    // and fell to the untyped `da.run` path, so it got no readonly single-
+    // assignment tracking either (MEASURED: a record static constructor that
+    // assigned the same `static readonly` field twice compiled with no
+    // §22.8 diagnostic, run silently taking the second value — issue #4015's
+    // repro sibling, closed by this same routing rather than filed
+    // separately since it is the identical missing-dispatch-branch root
+    // cause).
     void runStaticConstructor(const ast::ConstructorDecl& cd,
                               const ast::TypeDecl& klass) {
         roCtorMode_ = true;
+        staticCtorMode_ = true;
         for (const auto& m : klass.members) {
-            auto* f = dynamic_cast<const ast::FieldDecl*>(m.get());
-            if (!f || !f->initializer) continue;
-            bool isStatic = false, isReadonly = false;
-            for (auto mod : f->modifiers) {
-                if (mod == "static") isStatic = true;
-                else if (mod == "readonly") isReadonly = true;
+            if (auto* f = dynamic_cast<const ast::FieldDecl*>(m.get())) {
+                // fix #4015 / §7.9: a static field with no initializer is
+                // the same §7.9-strict-storage shape isSevenNineStrictField
+                // classifies for an instance field — isSevenNineStrictStatic
+                // Field is its static-required twin (see its comment).
+                if (isSevenNineStrictStaticField(*f, ctx_))
+                    fieldsNeedingInit_.push_back(f->name);
+                if (!f->initializer) continue;
+                bool isStatic = false, isReadonly = false;
+                for (auto mod : f->modifiers) {
+                    if (mod == "static") isStatic = true;
+                    else if (mod == "readonly") isReadonly = true;
+                }
+                if (isStatic && isReadonly)
+                    readonlyMaybeAssigned_.insert(f->name);
+            } else if (auto* p = dynamic_cast<const ast::PropertyDecl*>(
+                           m.get())) {
+                // fix #4015 / §7.9: the static auto-property analogue —
+                // "auto-property assignments and reads ... each [are] the
+                // backing field's assignment or read" (§22.7) applies to a
+                // static auto-property's backing storage exactly as to an
+                // instance one.
+                if (isSevenNineStrictStaticAutoProp(*p, ctx_))
+                    fieldsNeedingInit_.push_back(p->name);
             }
-            if (isStatic && isReadonly)
-                readonlyMaybeAssigned_.insert(f->name);
         }
         for (const auto& s : cd.body) {
             if (s) visitStmt(*s);
+        }
+        if (!terminated_) {
+            // fix #4015 / §7.9 (Appendix C.1): the static constructor's
+            // fall-off is a normal-exit path too — every §7.9-strict static
+            // field/auto-property must be assigned by every live path
+            // through it, mirroring runConstructor's/runRecordConstructor's
+            // own call.
+            checkCtorFieldCompletion(&cd.span.begin);
         }
     }
 
@@ -654,6 +804,19 @@ private:
     // assignment machinery"), without importing any observation-gate
     // rejection a record never needed.
     bool recordCtorMode_ = false;
+
+    // fix #4015 / §7.9: static-constructor field-completion tracking. Active
+    // only while walking a static constructor body (runStaticConstructor),
+    // for both a class's and a record's static constructor. Reuses the same
+    // two class-agnostic mechanisms `recordCtorMode_` reuses (see its own
+    // comment above) — marking toward `assignedFields_` and the
+    // checkCtorFieldCompletion fall-off check — for the identical reason:
+    // there is no `this` in a static constructor, so none of the §22.7
+    // this-observation gating (`ctorMode_`-gated) applies, but §7.9's
+    // generic field-completion obligation ("assignment ... in the static
+    // constructor, for static fields") applies exactly as for the instance
+    // case.
+    bool staticCtorMode_ = false;
 
     // §22.4 (v0.181): short-circuit-sensitive definite-assignment state for a
     // boolean sub-expression. `afterTrue` / `afterFalse` are the sets of
@@ -864,8 +1027,11 @@ private:
             // fix #4001 / §7.9: `recordCtorMode_` reuses this same bookkeeping
             // for a record constructor's own §7.9 obligation (see its
             // declaration) — a record has no observation gate to feed, only
-            // the fall-off completeness check this marks toward.
-            if ((ctorMode_ || recordCtorMode_) && as->op == ":=" && as->target) {
+            // the fall-off completeness check this marks toward. fix #4015:
+            // `staticCtorMode_` reuses it identically for a static
+            // constructor's static-field completion obligation.
+            if ((ctorMode_ || recordCtorMode_ || staticCtorMode_) &&
+                as->op == ":=" && as->target) {
                 std::string_view fname;
                 if (isThisFieldOrAutoPropTarget(*as->target, fname)) {
                     assignedFields_.insert(fname);
@@ -1747,10 +1913,12 @@ private:
     // fix #4001: `recordCtorMode_` reaches this gate too — a record
     // constructor's own §7.9 obligation for a body field/auto-property
     // (runRecordConstructor populates `fieldsNeedingInit_`/`assignedFields_`
-    // identically, minus the class-only observation gate). No-ops outside
-    // BOTH modes (`fieldsNeedingInit_` is empty then regardless).
+    // identically, minus the class-only observation gate). fix #4015:
+    // `staticCtorMode_` reaches it the same way, for a static constructor's
+    // static-field obligation. No-ops outside all three modes
+    // (`fieldsNeedingInit_` is empty then regardless).
     void checkCtorFieldCompletion(const SourceLocation* loc) {
-        if (!ctorMode_ && !recordCtorMode_) return;
+        if (!ctorMode_ && !recordCtorMode_ && !staticCtorMode_) return;
         for (auto n : fieldsNeedingInit_) {
             if (!assignedFields_.count(n)) {
                 SourceLocation sl;
@@ -2267,11 +2435,27 @@ void checkMember(const ast::Member& m, SemaContext& ctx,
             // here (there is no ConstructorDecl member to walk); that shape
             // is screened separately at the type level, mirroring
             // Ownership.cpp's `checkOwnedFieldDA` no-ctor screen for classes
-            // (see `checkRecordNoCtorFieldCompletion` below). Static ctors on
-            // records (if admitted) are out of scope here — records typically
-            // have no static ctor surface; if one is added later, route it
-            // through runStaticConstructor analogously.
+            // (see `checkRecordNoCtorFieldCompletion` below).
             da.runRecordConstructor(*cd, *enclosing);
+        } else if (cd->isStatic && inRecord) {
+            // fix #4015 / §7.9: a record's static constructor previously
+            // matched NONE of the branches above and fell to the plain
+            // `da.run` path below — this comment used to say "Static ctors
+            // on records (if admitted) are out of scope here", but they ARE
+            // admitted (`static constructor()` on a record parses and
+            // compiles, MEASURED) and that fall-through meant a record
+            // static constructor got NEITHER readonly single-assignment
+            // tracking NOR §7.9 field-completion tracking — a `static
+            // readonly` field double-assigned in a record's static
+            // constructor compiled with no §22.8 diagnostic, and one left
+            // unassigned on some/every path SIGSEGVed on first read, exactly
+            // as the class case did before fix #2187/this fix. `runStatic
+            // Constructor` has nothing class-specific in it (unlike
+            // `runConstructor`'s §22.7 this-observation gating), so it is
+            // reused verbatim for a record's static constructor — same
+            // routing precedent as `runRecordConstructor` reusing
+            // `runConstructor`'s class-agnostic bookkeeping.
+            da.runStaticConstructor(*cd, *enclosing);
         } else {
             // Interfaces, enums, choices, and any remaining type — readonly
             // single-assignment (§22.8) does not apply. No class this-
@@ -2359,20 +2543,76 @@ void checkRecordNoCtorFieldCompletion(const ast::TypeDecl& rec,
     }
 }
 
+// fix #4015 / §7.9: the STATIC no-ctor screen — the static-field analogue of
+// checkRecordNoCtorFieldCompletion above and Ownership.cpp's checkOwnedField
+// DA, and the piece issue #4015 reports missing altogether: no code anywhere
+// screened "declares a non-nullable static field/auto-property, and declares
+// no static constructor to assign it" for EITHER a class or a record. Unlike
+// the instance-side split (Ownership.cpp for classes, this file for
+// records — kept apart by §22.7's class-only this-observation gating), the
+// static-completion obligation carries no such class/record asymmetry: a
+// static constructor has no receiver to gate, so ONE screen covers both type
+// kinds, run from checkNoCtorScreenForType below for both (that dispatcher
+// already reaches both kinds via checkTopDecl and, per fix #4011, the
+// NestedTypeMember arm, so a nested class's or record's static field gets
+// the same screen for free). A type WITH a declared static constructor is
+// fully covered by runStaticConstructor's own per-constructor fall-off check
+// (every declared static constructor is visited via checkMember); nothing to
+// add here for that case — mirroring the instance-side screens' own
+// has-a-constructor early return.
+void checkStaticNoCtorFieldCompletion(const ast::TypeDecl& td,
+                                      SemaContext& ctx) {
+    if (td.kind != ast::TypeDeclKind::Class &&
+        td.kind != ast::TypeDeclKind::Record)
+        return;
+    bool hasStaticCtor = false;
+    for (const auto& m : td.members) {
+        if (auto* cd = dynamic_cast<const ast::ConstructorDecl*>(m.get())) {
+            if (cd->isStatic) { hasStaticCtor = true; break; }
+        }
+    }
+    if (hasStaticCtor) return;
+    for (const auto& m : td.members) {
+        std::string_view name;
+        SourceLocation loc;
+        if (auto* f = dynamic_cast<const ast::FieldDecl*>(m.get())) {
+            if (!isSevenNineStrictStaticField(*f, ctx)) continue;
+            name = f->name;
+            loc = f->span.begin;
+        } else if (auto* p = dynamic_cast<const ast::PropertyDecl*>(m.get())) {
+            if (!isSevenNineStrictStaticAutoProp(*p, ctx)) continue;
+            name = p->name;
+            loc = p->span.begin;
+        } else {
+            continue;
+        }
+        ctx.diagnostics().report(
+            Severity::Error, loc,
+            std::string("non-nullable static field `") + std::string(name) +
+                "` needs an initializer or a static constructor that "
+                "assigns it (§7.9)");
+    }
+}
+
 // fix #4011 / §7.9: shared dispatch so checkTopDecl (top-level types) and
 // checkMember's NestedTypeMember arm (nested types) run the IDENTICAL no-ctor
 // screen — before this helper, the screen was invoked only from checkTopDecl,
 // so a nested record with a non-nullable field/auto-property and no
-// constructor bypassed it entirely. Classes get their own analogous screen
-// from the ownership pass (checkOwnedFieldDA, Ownership.cpp) via its own
-// mirrored dispatch (checkNoCtorScreenForType there) — that pass and this one
-// are separate translation units invoked from separate driver entry points
-// (checkOwnership / checkDefiniteAssignment), so neither can call into the
-// other's TopDecl walk.
+// constructor bypassed it entirely. Classes get their own analogous
+// INSTANCE-side screen from the ownership pass (checkOwnedFieldDA,
+// Ownership.cpp) via its own mirrored dispatch (checkNoCtorScreenForType
+// there) — that pass and this one are separate translation units invoked
+// from separate driver entry points (checkOwnership / checkDefiniteAssignment
+// ), so neither can call into the other's TopDecl walk. fix #4015: the STATIC
+// screen (checkStaticNoCtorFieldCompletion) is added here, for BOTH type
+// kinds, rather than split by kind like the instance-side screens are — see
+// that function's own comment for why no class/record split is needed for
+// statics.
 void checkNoCtorScreenForType(const ast::TypeDecl& td, SemaContext& ctx) {
     if (td.kind == ast::TypeDeclKind::Record) {
         checkRecordNoCtorFieldCompletion(td, ctx);
     }
+    checkStaticNoCtorFieldCompletion(td, ctx);
 }
 
 void checkTopDecl(const ast::TopDecl& d, SemaContext& ctx) {
