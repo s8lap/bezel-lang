@@ -188,9 +188,14 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
     isStatic_ = isStatic;
     // #2073 / §28.10: vacuous-pin lint gate. Suppress in generic bodies
     // (type-parameter-dependent classification). Defaults false at every
-    // non-method entry point (ctor / dtor / operator) and at the
-    // expression-bodied branch, which carry their own typed-statement
-    // analyses but never reach handleLocalDecl's inert/vacuous-borrow branch.
+    // non-method entry point that does not pass it explicitly (ctor / dtor)
+    // and at every expression-bodied branch, which carry their own typed-
+    // statement analyses but never reach handleLocalDecl's inert/vacuous-
+    // borrow branch. fix #4004: a BLOCK-bodied operator now passes a real
+    // value here (computed from the enclosing type's own generic
+    // parameters — operators carry no method-level generic parameters of
+    // their own, §A.4), mirroring the MethodDecl arm; it no longer defaults
+    // false. // per §28.10, #2073, #4004
     isGenericBody_ = isGenericBody;
     // §28.3 *Bare-type-parameter returns* (v0.194, #1801 S6): recognize a bare-T
     // return and classify its potential source set BEFORE any statement is
@@ -7828,6 +7833,19 @@ void MethodOwnership::checkLambdaTaskFamilyBorrowReturns(
         localDeclDirect;
     for (const auto& s : body)
         if (s) collectLocalDeclDirectLambdaTargets(*s, localDeclDirect);
+    // fix #4033 (review follow-up on #4005): a NESTED lambda's own body can
+    // contain a FURTHER local-decl-direct target one level down — `var
+    // outer := lambda() => do var mk: () -> owned Res := lambda() => b; ...;
+    // end;` (the measured repro: `mk`'s target lives inside `outer`'s own
+    // body, not directly in THIS method's `body`, so the loop above never
+    // reaches it). `lambdas` already includes every lambda at EVERY nesting
+    // depth (`collectBodyLambdas` recurses into each found lambda's own body
+    // to build it), so walking each one's OWN top-level `stmts` here reaches
+    // a local-decl target at ANY nesting depth, not just one level down.
+    // // per §28.3, #4033
+    for (const ast::LambdaExpr* lam : lambdas)
+        for (const auto& s : lam->stmts)
+            if (s) collectLocalDeclDirectLambdaTargets(*s, localDeclDirect);
     for (const ast::LambdaExpr* lam : lambdas) {
         const sema::TypeRef* expected =
             returnDirect.count(lam) ? expectedReturnFnType : nullptr;
@@ -7847,36 +7865,78 @@ void MethodOwnership::checkLambdaTaskFamilyBorrowReturns(
 }
 
 // fix #4005 (§28.3, v0.294): collect, for every LambdaExpr that is the DIRECT
-// initializer of a typed LocalDecl reachable in `s` (recursing through
-// IfStmt/WhileStmt/ForStmt/DoEndBlock/TryStmt/CaseStmt — the same 7
-// statement forms scanReturnsIn walks, minus ReturnStmt itself, which cannot
-// contain a LocalDecl), that local's OWN declared type. Needed because the
-// lambda LITERAL's own inferred function TypeRef (`ctx_.exprType(lam)`)
-// never carries the target's `owned` marker — sema's LambdaExpr arm
-// (ExprTypecheck_Exprs.cpp) sets `lamTy->funcReturn = inferredReturn;` with
-// no accompanying `funcReturnOwned` assignment at all, even though the
-// `#1820` target-return-owned hint (`pendingLambdaTargetReturnOwned_`) IS
-// available at that point and used for a DIFFERENT check
-// (checkConcreteSlotLambdaBody) — it is just never copied onto the lambda's
-// own exprType. `checkOneLambdaOwnedReturnDirectBorrow` therefore needs the
-// LocalDecl's declared type supplied explicitly via `expectedFnType`, mirroring
-// how `checkLambdaTaskFamilyBorrowReturns` already supplies the enclosing
-// method's OWN declared return type for a return-DIRECT lambda
-// (collectReturnDirectLambdas) — this is the sibling collector for the
-// local-decl-DIRECT position. Does not recurse into a found lambda's own
-// body (a nested local-decl-typed lambda one level down is a rarer shape;
-// out of scope here — see the fix commit for why). // per §28.3
+// (or, per #4035 below, conditional-arm) initializer of a typed LocalDecl
+// reachable in `s` (recursing through IfStmt/WhileStmt/ForStmt/DoEndBlock/
+// TryStmt/CaseStmt — the same 7 statement forms scanReturnsIn walks, minus
+// ReturnStmt itself, which cannot contain a LocalDecl), that local's OWN
+// declared type. Needed because the lambda LITERAL's own inferred function
+// TypeRef (`ctx_.exprType(lam)`) never carries the target's `owned` marker —
+// sema's LambdaExpr arm (ExprTypecheck_Exprs.cpp) sets `lamTy->funcReturn =
+// inferredReturn;` with no accompanying `funcReturnOwned` assignment at all,
+// even though the `#1820` target-return-owned hint
+// (`pendingLambdaTargetReturnOwned_`) IS available at that point and used
+// for a DIFFERENT check (checkConcreteSlotLambdaBody) — it is just never
+// copied onto the lambda's own exprType. `checkOneLambdaOwnedReturnDirect
+// Borrow` therefore needs the LocalDecl's declared type supplied explicitly
+// via `expectedFnType`, mirroring how `checkLambdaTaskFamilyBorrowReturns`
+// already supplies the enclosing method's OWN declared return type for a
+// return-DIRECT lambda (collectReturnDirectLambdas) — this is the sibling
+// collector for the local-decl-DIRECT position. Does NOT itself recurse
+// into a found lambda's own body to find a NESTED local-decl target one
+// level down (#4033) — the caller (checkLambdaTaskFamilyBorrowReturns)
+// handles that by invoking this walker once per collected lambda's own
+// `stmts`, not by this function recursing into LambdaExpr itself; see its
+// own comment for why. // per §28.3
+// fix #4035 (review follow-up on #4005): see the header comment
+// (Ownership_impl.hpp) for the contract. `init` may be null (a plain `var
+// x: T;` with no initializer); a null `init` is simply not a lambda and not
+// a ConditionalExpr, so it falls out the bottom as a no-op.
+void MethodOwnership::recordLocalDeclDirectLambdaTarget(
+        const ast::Type* declType, const ast::Expr* init,
+        std::unordered_map<const ast::LambdaExpr*, const sema::TypeRef*>&
+            out) const {
+    if (!init) return;
+    if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(init)) {
+        out[lam] = ctx_.resolvedType(*declType);
+        return;
+    }
+    // §20 / A.7: `(if cond then X else Y)` — an elif chain right-nests as a
+    // further ConditionalExpr in `elseValue`. Both `thenValue` and
+    // `elseValue` are legitimate targets for the SAME declared type (the
+    // slot's type does not vary per arm), so recurse into both — this is
+    // exactly what closes #4035's repro (`(if flag then lambda() => new
+    // Res(1) else lambda() => b)`, where the borrow-returning arm is
+    // `elseValue`).
+    if (auto* ce = dynamic_cast<const ast::ConditionalExpr*>(init)) {
+        recordLocalDeclDirectLambdaTarget(declType, ce->thenValue.get(), out);
+        recordLocalDeclDirectLambdaTarget(declType, ce->elseValue.get(), out);
+    }
+}
+
 void MethodOwnership::collectLocalDeclDirectLambdaTargets(
         const ast::Stmt& s,
         std::unordered_map<const ast::LambdaExpr*, const sema::TypeRef*>&
             out) const {
     if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
-        if (ld->type && ld->initializer) {
-            if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(
-                    ld->initializer.get())) {
-                out[lam] = ctx_.resolvedType(*ld->type);
-            }
-        }
+        if (ld->type)
+            recordLocalDeclDirectLambdaTarget(
+                ld->type.get(), ld->initializer.get(), out);
+        return;
+    }
+    // fix #4031 (review follow-up, check_localdecl_only_walkers): §21.1
+    // permits a `const` local to hold a runtime-managed (non-compile-time)
+    // initializer — including a function-typed one — so `const mk: () ->
+    // owned Res := lambda() => b;` is exactly as legal as its `var mk`
+    // sibling. `ast::LocalConstDecl` is a DIFFERENT AST node from
+    // `ast::LocalDecl` (§21.1's own distinction), so the `LocalDecl`-only
+    // arm above silently skipped it entirely — measured: the `var` form was
+    // correctly rejected by this fix, the byte-identical `const` form
+    // compiled clean and double-freed under ASan. Same fields, different
+    // names (`value` vs. `initializer`), so mirror the arm above exactly.
+    if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(&s)) {
+        if (lc->type)
+            recordLocalDeclDirectLambdaTarget(
+                lc->type.get(), lc->value.get(), out);
         return;
     }
     if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&s)) {
@@ -9444,15 +9504,17 @@ void MethodOwnership::checkOneLambdaOwnedReturnDirectBorrow(
     // This check is ONLY about the `owned`-target contract — the plain-Task
     // case is the sibling function's job. // per §28.3
     if (!effOwned) return;
-    // Stdlib §4.12: `IEnumerable<T>` / `IAsyncEnumerable<T>` do not extend
-    // `IDisposable` / `IAsyncDisposable` — no `.Dispose()` is reachable
-    // through either static type, so this check's own double-dispose
-    // reasoning does not apply. Mirrors checkOwnedReturnDirectBorrow's
-    // identical exemption (#3993, #4007). // per stdlib §4.12
-    {
-        std::string_view head = effRet->headName();
-        if (head == "IEnumerable" || head == "IAsyncEnumerable") return;
-    }
+    // Read off the shared `isNonOwningIterFormatEnumerableHead` predicate
+    // (BuiltinRegistry.hpp/#4004) rather than spelling the two head names by
+    // hand — this is one of TWO ownership-pass sites that need exactly this
+    // exemption; the other is checkOwnedReturnDirectBorrow
+    // (Ownership_Checks.cpp, #3993), which this mirrors. See that shared
+    // predicate's own header comment for the full load-bearing reasoning
+    // (stdlib §4.12's non-`IDisposable` heads vs. §4.13's owning ones, and
+    // why the broader `isIterFormatEnumerableHead` alone would be unsound
+    // here). // per stdlib §4.12, §4.13, #3419, #3993, #4004, #4007
+    if (common::isNonOwningIterFormatEnumerableHead(effRet->headName()))
+        return;
     MethodOwnership sub(ctx_);
     auto classifyReturn = [&](const ast::Expr& re) {
         if (auto* un = dynamic_cast<const ast::UnaryExpr*>(&re))

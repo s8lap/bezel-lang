@@ -1481,6 +1481,18 @@ private:
         const ast::Stmt& s,
         std::unordered_map<const ast::LambdaExpr*, const sema::TypeRef*>&
             out) const;
+    // fix #4035 (review follow-up on #4005): the shared leaf both the
+    // LocalDecl and LocalConstDecl arms of collectLocalDeclDirectLambdaTargets
+    // call — records `declType` for `init` when `init` is directly a
+    // LambdaExpr, OR recurses through a `(if ... then ... else ...)`
+    // ConditionalExpr's `thenValue`/`elseValue` (which right-nests an elif
+    // chain as a further ConditionalExpr in `elseValue`, §20/A.7) applying the
+    // SAME declared type to whichever arm(s) are themselves directly a
+    // LambdaExpr. See Ownership.cpp for the full rationale.
+    void recordLocalDeclDirectLambdaTarget(
+        const ast::Type* declType, const ast::Expr* init,
+        std::unordered_map<const ast::LambdaExpr*, const sema::TypeRef*>&
+            out) const;
     void checkOneLambdaTaskFamilyBorrowReturn(
         const ast::LambdaExpr& lam,
         const sema::TypeRef* expectedFnType = nullptr);

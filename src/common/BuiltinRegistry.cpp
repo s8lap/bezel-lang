@@ -798,6 +798,16 @@ bool isIterFormatEnumerableHead(std::string_view head) {
     return contains(kIterFormatEnumerableHeads, head);
 }
 
+// #3993 / #4004 / #4010: the NON-OWNING half of the above — the subtraction
+// against `isOwningIterableInterfaceHead`. See the header for why this
+// specific two-name set (not the broader four-name one above) is the sound
+// exemption for a borrow-through-owned-return double-dispose check.
+// // per §28.3, §28.6, #3419, #3993, #4004, #4005, #4007, #4010
+bool isNonOwningIterFormatEnumerableHead(std::string_view head) {
+    return isIterFormatEnumerableHead(head) &&
+           !isOwningIterableInterfaceHead(head);
+}
+
 // The synchronous half of the above. // per §29.2, #3419
 bool isSyncIterFormatEnumerableHead(std::string_view head) {
     return contains(kSyncIterFormatEnumerableHeads, head);

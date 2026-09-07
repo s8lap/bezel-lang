@@ -274,3 +274,161 @@ BEZEL_TEST(lambda_owned_return_direct_borrow_4005,
         "end C;");
     BEZEL_EXPECT_TRUE(jr.ran);
 }
+
+// ===========================================================================
+// REVIEW FOLLOW-UPS on this fix's original commit (40053ed) — three real
+// gaps in `collectLocalDeclDirectLambdaTargets`'s coverage, each measured
+// separately and each fixed here in a follow-up commit (none is a
+// regression: before 40053ed nothing checked the owned-target case at all,
+// so every one of these shapes double-freed either way).
+// ===========================================================================
+
+// fix #4031 (also closes check_localdecl_only_walkers, LANE_RULES §14): a
+// `const` local's function-typed initializer is exactly as reachable as a
+// `var` local's — §21.1 permits a `const` to hold a runtime-managed value —
+// but `ast::LocalConstDecl` is a DIFFERENT AST node from `ast::LocalDecl`,
+// and the original collector recognized only the latter. Byte-identical to
+// this file's own `exprbody_lambda_captured_using_var_rejected_spec_28_3`
+// test above except `var` -> `const`.
+BEZEL_TEST(lambda_owned_return_direct_borrow_4005,
+           const_local_captured_using_var_rejected_spec_21_1) {
+    JitResult jr = runAot(
+        std::string(kRes) +
+        "class C "
+        "  public static method Main(): int "
+        "    using var b := new Res(4); "
+        "    const mk: () -> owned Res := lambda() => b; "
+        "    var c := mk(); return c.tag; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(jr));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(jr, kLambdaOwnedBorrowReturn));
+}
+
+// A LEGITIMATE `const` function-typed local (a fresh producer, not a
+// borrow) must keep compiling — the accept side of the same collector arm
+// (LANE_RULES §15: FAIL-WITHOUT only exercises the reject arms).
+BEZEL_TEST(lambda_owned_return_direct_borrow_4005,
+           const_local_fresh_new_accepted_disposes_once_spec_21_1) {
+    std::string src =
+        std::string(kRes) +
+        "class C "
+        "  public static method Main(): int "
+        "    do "
+        "      const mk: () -> owned Res := lambda() => new Res(9); "
+        "      do using var c := mk(); end; "
+        "    end; "
+        "    return Res.live; "
+        "  end Main; "
+        "end C;";
+    JitResult jr = runAotChecked(src);
+    BEZEL_EXPECT_TRUE(jr.ran);
+    BEZEL_EXPECT_EQ(jr.exitCode, 0);
+}
+
+// fix #4033: a NESTED lambda's own body can hold a further local-decl-direct
+// target one level down (`var outer := lambda() => do var mk: () -> owned
+// Res := lambda() => b; ...; end;`). `collectLocalDeclDirectLambdaTargets`
+// only ever walked the ENCLOSING METHOD's own `body`; the fix additionally
+// walks every collected lambda's OWN `stmts` (checkLambdaTaskFamilyBorrow
+// Returns, Ownership.cpp), reaching a target at ANY nesting depth since the
+// collected-lambda list already includes every nesting level.
+BEZEL_TEST(lambda_owned_return_direct_borrow_4005,
+           nested_lambda_body_local_decl_target_rejected_spec_28_3) {
+    JitResult jr = runAot(
+        std::string(kRes) +
+        "class C "
+        "  public static method Main(): int "
+        "    using var b := new Res(4); "
+        "    var outer := lambda() => do "
+        "      var mk: () -> owned Res := lambda() => b; "
+        "      var c := mk(); "
+        "      return c.tag; "
+        "    end; "
+        "    var t := outer(); return t; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(jr));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(jr, kLambdaOwnedBorrowReturn));
+}
+
+// fix #4035: a lambda reached through a `(if ... then ... else ...)`
+// conditional-expression LocalDecl initializer (§20/A.7) — the original
+// collector required the initializer to itself be exactly a bare
+// `LambdaExpr`. `recordLocalDeclDirectLambdaTarget` now recurses through
+// `ConditionalExpr::thenValue`/`elseValue` (which right-nests an elif chain
+// in `elseValue`), applying the local's declared type to whichever arm(s)
+// are themselves directly a lambda. The `else` arm here is the
+// borrow-returning one.
+BEZEL_TEST(lambda_owned_return_direct_borrow_4005,
+           conditional_expr_arm_lambda_rejected_spec_20) {
+    JitResult jr = runAot(
+        std::string(kRes) +
+        "class C "
+        "  public static method Main(): int "
+        "    using var b := new Res(4); "
+        "    var flag := false; "
+        "    var mk: () -> owned Res := "
+        "      (if flag then lambda() => new Res(1) else lambda() => b); "
+        "    var c := mk(); return c.tag; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(jr));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(jr, kLambdaOwnedBorrowReturn));
+}
+
+// The ACCEPT twin of the conditional-arm shape: BOTH arms are legitimate
+// fresh productions — neither is over-rejected by the new recursion. This
+// check's own diagnostic is Severity::Error, so `jr.ran` (plain, non-ASan
+// `runAot`) is conclusive proof it did not fire. Deliberately NOT asserted
+// via `runAotChecked`/exact-once disposal: a `(if ... then <lambda> else
+// <lambda>)` conditional assigned to a typed local leaks 40 B under ASan
+// regardless of which arm's Res ends up selected or whether the local is
+// ever called — reproduces with NEITHER arm being a borrow (so this check
+// never fires) and with NO lambda at all involved in EITHER arm's own
+// ownership classification, i.e. a codegen-only defect, pre-existing and
+// entirely unrelated to this check (this fix touches no codegen file at
+// all); filed as issue #4040, out of scope here.
+BEZEL_TEST(lambda_owned_return_direct_borrow_4005,
+           conditional_expr_both_arms_fresh_not_rejected_spec_20) {
+    JitResult jr = runAot(
+        std::string(kRes) +
+        "class C "
+        "  public static method Main(): int "
+        "    var flag := false; "
+        "    var mk: () -> owned Res := "
+        "      (if flag then lambda() => new Res(1) else lambda() => new Res(2)); "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(jr.ran);
+}
+
+// ===========================================================================
+// NON-REGRESSION — the shared `common::isNonOwningIterFormatEnumerableHead`
+// predicate (BuiltinRegistry.hpp/#4004, factored out of a duplicated
+// hand-spelling this check and #3993's `checkOwnedReturnDirectBorrow` each
+// carried — check_enumerable_grid_spellings, LANE_RULES §14) must still
+// exempt a lambda checked against an `owned IEnumerable<T>` target exactly
+// as #3993's own analogous method-level test does (`iterable_interface_
+// head_stored_view_exclusion_3295_test.cpp`,
+// owned_return_type_exempt_for_ienumerable): `IEnumerable<T>` does not
+// extend `IDisposable` (stdlib §4.12), so this check's own double-dispose
+// reasoning does not apply to it. // per stdlib §4.12, #3419, #4004
+BEZEL_TEST(lambda_owned_return_direct_borrow_4005,
+           ienumerable_target_exempt_not_rejected_stdlib_4_12) {
+    JitResult jr = runAot(
+        "module M; "
+        "class Cell "
+        "  public constructor() end constructor; "
+        "  destructor end destructor; "
+        "end Cell; "
+        "class C "
+        "  public static method Main(): int "
+        "    var mk: (IEnumerable<Cell>) -> owned IEnumerable<Cell> := "
+        "      lambda(a: IEnumerable<Cell>) => a; "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(jr.ran);
+}

@@ -94,6 +94,26 @@ bool isOwningIterableInterfaceHead(std::string_view head);
 // per §29.2 / stdlib §4.12–§4.13, #3419
 bool isIterFormatEnumerableHead(std::string_view head);
 
+// #3993 / #4004 / #4010 (§28.3, §28.6, stdlib §4.12–§4.13): the two
+// NON-OWNING iterator-format enumerable heads — `IEnumerable<T>` and
+// `IAsyncEnumerable<T>` — the subtraction `isIterFormatEnumerableHead(head)
+// && !isOwningIterableInterfaceHead(head)`. Neither of these two extends
+// `IDisposable`/`IAsyncDisposable` (stdlib §4.12), so a borrow-return check
+// whose whole reasoning is "would this double-dispose through the declared
+// static type" has nothing reachable to double-call for exactly these two —
+// unlike every OTHER iterable-family head (the two ENUMERATOR heads and the
+// four `IOwning*` heads), which DOES extend one of those interfaces and
+// measurably double-frees through the identical shape. This is a NARROWER
+// exemption than `isIterFormatEnumerableHead` alone (which also contains the
+// two owning heads) — using that broader predicate here would be UNSOUND,
+// not merely imprecise. One shared spelling for the two ownership-pass sites
+// that need exactly this subtraction (a named method/operator's return,
+// #3993/#4004, and a lambda's return against an `owned` function-type
+// target, #4005) rather than two independent hand-derivations of the same
+// set difference drifting apart. // per §28.3, §28.6, stdlib §4.12–§4.13,
+// #3419, #3993, #4004, #4005, #4007, #4010
+bool isNonOwningIterFormatEnumerableHead(std::string_view head);
+
 // The SYNCHRONOUS half of `isIterFormatEnumerableHead` — `IEnumerable<T>` and
 // `IOwningEnumerable<T>`. The §29.2 synchronous `for` desugaring and the
 // synchronous wrap creators (`wrapAsIEnumerableForTarget` and the local-decl /
