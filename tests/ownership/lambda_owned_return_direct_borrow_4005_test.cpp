@@ -432,3 +432,149 @@ BEZEL_TEST(lambda_owned_return_direct_borrow_4005,
         "end C;");
     BEZEL_EXPECT_TRUE(jr.ran);
 }
+
+// ===========================================================================
+// fix #4043 — review follow-up on this fix's own span-containment check.
+// Span containment answers "is this local declared inside the lambda's own
+// body" (eligible to be one of ITS productions), NOT "is it a producer".
+// The OLD logic treated "yes" as unconditional proof of a fresh production;
+// it is not — a local declared inside the lambda that is itself a bare
+// (non-`move`) RE-BINDING of something else is still just a borrow of that
+// something else (§28.8: only `move` transfers ownership through a place
+// read), regardless of where the re-binding local's OWN declaration sits.
+// ===========================================================================
+
+// The issue's exact repro: a captured `using var` re-bound through the
+// lambda's OWN local before being returned. Fail-without (this fix's
+// PRE-#4043 state, 227b46b): accepted with zero diagnostics, measured
+// heap-use-after-free under ASan — `items`'s span lies inside the lambda,
+// so the old check stopped there without ever looking at what `items` is
+// bound to.
+BEZEL_TEST(lambda_owned_return_direct_borrow_4005,
+           own_local_alias_of_captured_using_var_rejected_spec_28_8) {
+    JitResult jr = runAot(
+        std::string(kRes) +
+        "class C "
+        "  public static method Main(): int "
+        "    using var b := new Res(4); "
+        "    var mk: () -> owned Res := lambda() => do "
+        "      var items := b; "
+        "      return items; "
+        "    end; "
+        "    var c := mk(); return c.tag; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(jr));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(jr, kLambdaOwnedBorrowReturn));
+}
+
+// The same shape through a captured PLAIN (non-`using`) local — the capture
+// classification does not depend on `using`.
+BEZEL_TEST(lambda_owned_return_direct_borrow_4005,
+           own_local_alias_of_captured_plain_local_rejected_spec_28_8) {
+    JitResult jr = runAot(
+        std::string(kRes) +
+        "class C "
+        "  public static method Main(): int "
+        "    var b := new Res(4); "
+        "    var mk: () -> owned Res := lambda() => do "
+        "      var items := b; "
+        "      return items; "
+        "    end; "
+        "    var c := mk(); return c.tag; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(jr));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(jr, kLambdaOwnedBorrowReturn));
+}
+
+// NEWLY CAUGHT by the #4043 fix (was ALSO wrongly accepted pre-fix, by the
+// same unconditional-span-containment hole, just with no ENCLOSING capture
+// involved at all): a lambda's OWN fresh local, bare-re-bound through a
+// SECOND own local before being returned. §28.8's rule applies uniformly —
+// a bare (non-`move`) read is a borrow regardless of what it names, so
+// `items`'s bare read of `x` is a borrow of `x`, not a producer, and `x`
+// itself is never discharged (no `move`, no direct return) — the same
+// double-free shape one level removed, entirely within the lambda.
+BEZEL_TEST(lambda_owned_return_direct_borrow_4005,
+           own_local_bare_alias_of_own_fresh_local_rejected_spec_28_8) {
+    JitResult jr = runAot(
+        std::string(kRes) +
+        "class C "
+        "  public static method Main(): int "
+        "    var mk: () -> owned Res := lambda() => do "
+        "      var x := new Res(4); "
+        "      var items := x; "
+        "      return items; "
+        "    end; "
+        "    var c := mk(); return c.tag; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(jr));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(jr, kLambdaOwnedBorrowReturn));
+}
+
+// The ACCEPT twin: the SAME shape, but the re-binding is a `move` (a genuine
+// transfer, not a bare read) — must NOT be over-rejected by the new
+// producer-resolution. This is the row that matters most: a fix here that
+// over-rejects breaks every legitimate `() -> owned T` lambda, and a
+// one-shot compile-only (or even single-run exact-once) assertion cannot
+// distinguish "correctly accepted" from "accepted and leaking" — a leaked
+// object and a disposed one both leave `Res.live` looking plausible on a
+// SINGLE iteration only by coincidence of timing. LOOP-AMPLIFY 500x (LANE_
+// RULES §3): each iteration constructs a FRESH lambda literal, calls it, and
+// disposes the result — a per-iteration leak of even one object would drive
+// the final `Res.live` to 500, not 0, so the observable is unambiguous
+// either way. Runs under `runAotChecked` (ASan), so a double-free would also
+// abort rather than silently under- or over-count.
+BEZEL_TEST(lambda_owned_return_direct_borrow_4005,
+           own_local_move_alias_of_own_fresh_local_accepted_disposes_once_spec_28_8) {
+    std::string src =
+        std::string(kRes) +
+        "class C "
+        "  public static method Main(): int "
+        "    var i := 0; "
+        "    while i < 500 do "
+        "      var mk: () -> owned Res := lambda() => do "
+        "        var x := new Res(4); "
+        "        var items := move x; "
+        "        return items; "
+        "      end; "
+        "      do using var c := mk(); end; "
+        "      i := i + 1; "
+        "    end; "
+        "    return Res.live; "
+        "  end Main; "
+        "end C;";
+    JitResult jr = runAotChecked(src);
+    BEZEL_EXPECT_TRUE(jr.ran);
+    BEZEL_EXPECT_EQ(jr.exitCode, 0);
+}
+
+// A lambda's OWN plain (non-`owned`) parameter re-bound through an own
+// local before being returned — the parameter-modifier classification
+// (`ownedArgSourceIsBorrow`'s ParameterSymbol branch, unaffected by this
+// fix) already flags a DIRECT `return p;`; this pins that a bare alias of
+// it is caught too, via the SAME producerState-of-the-initializer path this
+// fix adds (producerState has no parameter-specific case either — a bare
+// identifier is Borrowed by default regardless of what kind of place it
+// names).
+BEZEL_TEST(lambda_owned_return_direct_borrow_4005,
+           own_local_alias_of_own_plain_parameter_rejected_spec_28_8) {
+    JitResult jr = runAot(
+        std::string(kRes) +
+        "class C "
+        "  public static method Wrap(p: Res): int "
+        "    var mk: () -> owned Res := lambda() => do "
+        "      var items := p; "
+        "      return items; "
+        "    end; "
+        "    var c := mk(); return c.tag; "
+        "  end Wrap; "
+        "  public static method Main(): int "
+        "    using var b := new Res(4); return Wrap(b); "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(jr));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(jr, kLambdaOwnedBorrowReturn));
+}

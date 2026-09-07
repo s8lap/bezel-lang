@@ -9545,26 +9545,50 @@ void MethodOwnership::checkOneLambdaOwnedReturnDirectBorrow(
             // per checkOneLambdaTaskFamilyBorrowReturn's own header, so a
             // FRESH `sub` never has any `states_` to look up). So a fresh
             // `sub` always falls through to "not a borrow" for ANY bare
-            // local read — correct for a local this LAMBDA'S OWN body
-            // declared (a fresh production it legitimately owns), but wrong
-            // for a CAPTURED local from an ENCLOSING scope: the lambda did
+            // local read regardless of what that local names. Span
+            // containment tells us only whether a local is declared inside
+            // THIS lambda's own body (eligible to be one of ITS productions
+            // at all) or is a CAPTURE of an enclosing scope's binding — it
+            // does NOT by itself prove a same-lambda local is a producer.
+            //
+            // A CAPTURE is unconditionally a borrow for this lambda's
+            // purposes, regardless of what IT is bound to: the lambda did
             // not itself produce that value, and the enclosing scope's own
             // disposal (a `using var`'s scope-end auto-drop, or an ordinary
             // owned-local discharge) is entirely unaffected by what a
             // captured closure later does with it — so returning it here as
-            // `owned` mints a SECOND discharge path for the same object,
-            // whether the captured local is Owned or Borrowed at the
-            // enclosing level (`var mk: () -> owned Res := lambda() => b;`
-            // where `b` is a `using var` — measured heap-use-after-free,
-            // issue #4005). Distinguish "this lambda's own local" from "a
-            // capture" structurally: a local this lambda's own body declared
-            // has its `LocalDecl` (or synthesized anchor) positioned INSIDE
-            // this lambda's own source span; a captured enclosing local's
-            // declaration lies outside it (before, or in a different
-            // function entirely). Scoped to a BARE identifier only — a
-            // captured local reached through a member/index chain is left
-            // to the field/indexer classification above, unaffected by this
-            // addition. // per §28.3
+            // `owned` mints a SECOND discharge path for the same object
+            // (`var mk: () -> owned Res := lambda() => b;` where `b` is a
+            // `using var` — measured heap-use-after-free, issue #4005).
+            //
+            // fix #4043: a local declared INSIDE this lambda's own body is
+            // NOT thereby proven a producer either — `var items := b;
+            // return items;` (`b` the SAME captured `using var`) is declared
+            // inside the lambda, so the OLD unconditional "own local ->
+            // accept" answer sailed it through, measured heap-use-after-free
+            // identical to the direct-capture shape. §28.8's rule is that a
+            // BARE (non-`move`) read of ANY place is a borrow of it,
+            // regardless of what state the place itself is in — ownership
+            // does not pass transparently through a bare local-to-local
+            // re-binding, only `move` transfers it. So a same-lambda local
+            // must be resolved to WHAT ITS OWN INITIALIZER PRODUCES, exactly
+            // as the real per-statement dataflow does when it first visits
+            // that LocalDecl (`handleLocalDecl` seeding `states_` via
+            // `producerState`) — reused here rather than a second
+            // classification rule (a captured local's own initializer is
+            // deliberately NOT consulted this way; only a same-lambda one
+            // is, since a capture is unconditionally a borrow regardless of
+            // its own producer per the paragraph above). `producerState`
+            // treats ANY bare identifier as Borrowed by default (it has no
+            // identifier-specific case at all), so a single application
+            // already answers "is the local itself, or a further bare-alias
+            // chain behind it, ultimately a borrow" — `var y := x; var z :=
+            // y; return z;` needs no manual recursion here, because
+            // `producerState(y)` is Borrowed regardless of what `y` names.
+            // Scoped to a BARE identifier only — a captured/own local
+            // reached through a member/index chain is left to the
+            // field/indexer classification above, unaffected by this
+            // addition. // per §28.3, §28.8
             if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&re)) {
                 if (auto* ls = dynamic_cast<sema::LocalSymbol*>(
                         ctx_.exprSymbol(*id))) {
@@ -9573,7 +9597,27 @@ void MethodOwnership::checkOneLambdaOwnedReturnDirectBorrow(
                         ls->decl->span.begin.offset >=
                             lam.span.begin.offset &&
                         ls->decl->span.end.offset <= lam.span.end.offset;
-                    if (!declaredInLambda) isBorrow = true;
+                    if (!declaredInLambda) {
+                        isBorrow = true;  // a capture: always a borrow here
+                    } else {
+                        const ast::Expr* init = nullptr;
+                        if (auto* ld = dynamic_cast<const ast::LocalDecl*>(
+                                ls->decl))
+                            init = ld->initializer.get();
+                        else if (auto* lc =
+                                     dynamic_cast<const ast::LocalConstDecl*>(
+                                         ls->decl))
+                            init = lc->value.get();
+                        if (init)
+                            isBorrow = sub.producerState(*init) ==
+                                       OwnershipState::Borrowed;
+                        // No initializer reachable (an inline `out var`,
+                        // a destructuring pattern binding, or a
+                        // no-initializer `var` later assigned):
+                        // conservatively NOT flagged, matching
+                        // `ownedArgSourceIsBorrow`'s own "cannot positively
+                        // classify -> not a borrow" tail.
+                    }
                 }
             }
         }
