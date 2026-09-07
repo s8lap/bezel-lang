@@ -630,6 +630,25 @@ void MethodOwnership::recordMovesIn(const ast::Expr& e) {
             if (idx.value) recordMovesIn(*idx.value);
         return;
     }
+    // fix #4028 (§28.3, v0.294): two more structural wrappers with the
+    // IDENTICAL gap #4003 fixed above, found by a reviewer's re-audit of
+    // this function against `ast::Expr`'s full node list (see the
+    // exhaustive per-node-kind derivation in this file's own test,
+    // `record_moves_in_wrapper_arms_4003_test.cpp`). `expr is T` and a
+    // `$"...{expr}..."` interpolation hole are both ordinary READ-like
+    // positions for their operand, but the operand can itself be an
+    // owned-arg-consuming `new`/call — `(new Holder(move x)) is Object` and
+    // `$"{new Holder(move x)}"` reproduced the same zero-diagnostic SEGV as
+    // #4003's five, measured on `98de7f3` (#4003's fix already applied).
+    if (auto* tt = dynamic_cast<const ast::TypeTestExpr*>(&e)) {
+        if (tt->operand) recordMovesIn(*tt->operand);
+        return;
+    }
+    if (auto* isx = dynamic_cast<const ast::InterpolatedStringExpr*>(&e)) {
+        for (const auto& part : isx->parts)
+            if (part.expr) recordMovesIn(*part.expr);
+        return;
+    }
     if (auto* call = dynamic_cast<const ast::CallExpr*>(&e)) {
         recordMovesInArgs(call->args, call->callee.get());
         return;
