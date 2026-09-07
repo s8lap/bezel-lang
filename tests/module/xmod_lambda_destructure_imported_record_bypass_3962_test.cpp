@@ -57,6 +57,7 @@
 #include <vector>
 
 #include "driver/Driver.hpp"
+#include "support/aot_result_asserts.hpp"  // failedAtCompileTimeWithRealLocation
 #include "support/aot_support.hpp"
 #include "support/driver_run_support.hpp"
 #include "support/scratch_dir.hpp"
@@ -191,7 +192,10 @@ BEZEL_TEST(xmod_lambda_destructure_imported_record_bypass_3962,
         "  return f(p); "
         "end Main; end C3962Local;";
     auto r = bezel::test::runAot(prog);
-    BEZEL_EXPECT_FALSE(r.ran);
+    // A bare `!r.ran` cannot tell a compile-time rejection from a runtime
+    // crash, signal, timeout or forced-ASan report — all four also set
+    // `ran` false (issue #3892). Pin the compile-time outcome explicitly.
+    BEZEL_EXPECT_TRUE(bezel::test::failedAtCompileTimeWithRealLocation(r));
     bool saw = false;
     for (const auto& d : r.diagnostics.diagnostics()) {
         if (d.severity == bezel::Severity::Error &&

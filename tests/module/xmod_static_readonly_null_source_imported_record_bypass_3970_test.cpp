@@ -70,6 +70,7 @@
 #include <vector>
 
 #include "driver/Driver.hpp"
+#include "support/aot_result_asserts.hpp"  // failedAtCompileTimeWithRealLocation
 #include "support/aot_support.hpp"
 #include "support/driver_run_support.hpp"
 #include "support/scratch_dir.hpp"
@@ -216,7 +217,10 @@ BEZEL_TEST(xmod_static_readonly_null_source_imported_record_bypass_3970,
         "class Program3970ALocal public static method Main(): int return 0; "
         "end Main; end Program3970ALocal;";
     auto r = bezel::test::runAot(prog);
-    BEZEL_EXPECT_FALSE(r.ran);
+    // A bare `!r.ran` cannot tell a compile-time rejection from a runtime
+    // crash, signal, timeout or forced-ASan report — all four also set
+    // `ran` false (issue #3892). Pin the compile-time outcome explicitly.
+    BEZEL_EXPECT_TRUE(bezel::test::failedAtCompileTimeWithRealLocation(r));
     bool saw = false;
     for (const auto& d : r.diagnostics.diagnostics()) {
         if (d.severity == bezel::Severity::Error &&
@@ -285,7 +289,10 @@ BEZEL_TEST(xmod_static_readonly_null_source_imported_record_bypass_3970,
         "class Program3970BLocal public static method Main(): int return 0; "
         "end Main; end Program3970BLocal;";
     auto r = bezel::test::runAot(prog);
-    BEZEL_EXPECT_FALSE(r.ran);
+    // A bare `!r.ran` cannot tell a compile-time rejection from a runtime
+    // crash, signal, timeout or forced-ASan report — all four also set
+    // `ran` false (issue #3892). Pin the compile-time outcome explicitly.
+    BEZEL_EXPECT_TRUE(bezel::test::failedAtCompileTimeWithRealLocation(r));
     bool saw = false;
     for (const auto& d : r.diagnostics.diagnostics()) {
         if (d.severity == bezel::Severity::Error &&

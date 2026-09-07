@@ -52,6 +52,7 @@
 // shapes a name-keyed (rather than symbol-keyed) implementation would wrongly
 // reject.
 
+#include "support/aot_result_asserts.hpp"  // failedAtCompileTimeWithRealLocation
 #include "support/aot_support.hpp"
 #include "support/ownership_support.hpp"
 #include "test_harness.hpp"
@@ -745,7 +746,10 @@ BEZEL_TEST(own_captured_moved_from_3755, aot_if_expr_exclusive_arms_rejected_no_
         "    var f: () -> int := (if flag then Consume(move p) "
         "                                  else lambda(): int => p.V()); "
         "    return f(); "));
-    BEZEL_EXPECT_FALSE(r.ran);
+    // A bare `!r.ran` cannot tell a compile-time rejection from a runtime
+    // crash, signal, timeout or forced-ASan report — all four also set
+    // `ran` false (issue #3892). Pin the compile-time outcome explicitly.
+    BEZEL_EXPECT_TRUE(bezel::test::failedAtCompileTimeWithRealLocation(r));
     BEZEL_EXPECT_TRUE(r.stdoutText.empty());
 }
 
@@ -773,7 +777,10 @@ BEZEL_TEST(own_captured_moved_from_3755, aot_case_expr_exclusive_arms_rejected_n
         "      _ => lambda(): int => p.V() "
         "    ); "
         "    return f(); "));
-    BEZEL_EXPECT_FALSE(r.ran);
+    // A bare `!r.ran` cannot tell a compile-time rejection from a runtime
+    // crash, signal, timeout or forced-ASan report — all four also set
+    // `ran` false (issue #3892). Pin the compile-time outcome explicitly.
+    BEZEL_EXPECT_TRUE(bezel::test::failedAtCompileTimeWithRealLocation(r));
     BEZEL_EXPECT_TRUE(r.stdoutText.empty());
 }
 
