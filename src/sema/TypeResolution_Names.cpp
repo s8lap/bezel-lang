@@ -2845,4 +2845,17 @@ void Resolver::resolveTypesInExpr(const ast::Expr& e, Scope* scope) {
     // Literals + ThisBaseTypeOf — no nested Types/Exprs.
 }
 
+// fix #4038/#4048/#4050/#4051 (§27.8, v0.294): see the declaration comment
+// in TypeResolution.hpp for the full rationale — the ONE shared resolution
+// this family of "does this written name denote a type" classification
+// predicates needs, reachable from both sema and codegen.
+TypeSymbol* resolveAliasToTypeSymbol(SemaContext& ctx, TypeAliasSymbol* aliasSym) {
+    if (!aliasSym) return nullptr;
+    const auto* aliasDecl = dynamic_cast<const ast::TypeAlias*>(aliasSym->decl);
+    if (!aliasDecl || !aliasDecl->aliasedType) return nullptr;
+    TypeRef* underlying = ctx.resolvedType(*aliasDecl->aliasedType);
+    if (!underlying || underlying->kind != TypeRef::Kind::Named) return nullptr;
+    return underlying->declaration;
+}
+
 }  // namespace bezel::sema

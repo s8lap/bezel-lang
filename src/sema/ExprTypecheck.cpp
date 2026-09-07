@@ -9276,6 +9276,19 @@ bool ExprTC::altMemberNamesType(const ast::Expr* c) {
     return altPartsNameType(parts);
 }
 
+// §27.8 (v0.294; fix #4050/#4051): thin forwarding member — the actual
+// resolution is the free function `sema::resolveAliasToTypeSymbol`
+// (TypeResolution.hpp/.cpp) so codegen's `Emitter` (which independently
+// needs the identical resolution for its own DestructuringPattern name
+// lookup, per #4050's investigation) shares the SAME implementation rather
+// than hand-rolling its own copy — the established hoisting pattern this
+// header already uses for `typeArgRuntimeReified`. Kept as a member (rather
+// than rewriting every `resolveAliasToTypeSymbol(aliasSym)` call site in
+// this commit to the free-function spelling) purely for call-site brevity.
+TypeSymbol* ExprTC::resolveAliasToTypeSymbol(TypeAliasSymbol* aliasSym) {
+    return sema::resolveAliasToTypeSymbol(ctx_, aliasSym);
+}
+
 // §19.3 / §A.7: the shared dotted-name resolution behind altMemberNamesType,
 // operating on an already-split QualifiedName (so a NamedPattern alternative
 // member reaches it directly, #1584).
@@ -10099,12 +10112,27 @@ void ExprTC::bindNestedDestructuringNames(
         // fix #2844 / §19.3 / §2.8.3 rule 4 (v0.240): an imported record's
         // TypeSymbol lives in `ctx_.importedSymbols()` — `ctx_.symbols()` is
         // local-only.
+        //
+        // fix #4050 (§19.3/§27.8, v0.294): a `type` alias of a record used
+        // as a NESTED destructuring head (`Outer(AliasOfInner(a, b))`)
+        // resolves to a `TypeAliasSymbol` here too — same shape as the
+        // top-level CaseExpr/CaseStmt fixes above, resolved through the
+        // same shared `resolveAliasToTypeSymbol` helper.
         TypeSymbol* ts = nullptr;
         for (const auto& sym : ctx_.symbols()) {
             auto* c = dynamic_cast<TypeSymbol*>(sym.get());
             if (c && c->name == nm && c->kind == ast::TypeDeclKind::Record) {
                 ts = c;
                 break;
+            }
+            if (auto* aliasSym = dynamic_cast<TypeAliasSymbol*>(sym.get())) {
+                if (aliasSym->name == nm) {
+                    TypeSymbol* aliasedTs = resolveAliasToTypeSymbol(aliasSym);
+                    if (aliasedTs && aliasedTs->kind == ast::TypeDeclKind::Record) {
+                        ts = aliasedTs;
+                        break;
+                    }
+                }
             }
         }
         if (!ts) {
@@ -17074,6 +17102,10 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 // malformed IR ("case.end has no terminator", measured)
                 // rather than this clean §19.3 rejection.
                 {
+                    // fix #4050 (§19.3/§27.8, v0.294): the CaseStmt twin of
+                    // the ExprTypecheck_Exprs.cpp CaseExpr fix — same
+                    // missing-`TypeAliasSymbol`-arm shape, resolved through
+                    // the same shared `resolveAliasToTypeSymbol` helper.
                     bool isClassHead = false;
                     if (ctx_.module()) {
                         for (Symbol* child : ctx_.module()->children) {
@@ -17081,6 +17113,16 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                                 if (ts->name == lastName &&
                                     ts->kind == ast::TypeDeclKind::Class) {
                                     isClassHead = true; break;
+                                }
+                            } else if (auto* aliasSym =
+                                           dynamic_cast<TypeAliasSymbol*>(child)) {
+                                if (aliasSym->name == lastName) {
+                                    TypeSymbol* aliasedTs =
+                                        resolveAliasToTypeSymbol(aliasSym);
+                                    if (aliasedTs && aliasedTs->kind ==
+                                                          ast::TypeDeclKind::Class) {
+                                        isClassHead = true; break;
+                                    }
                                 }
                             }
                         }
@@ -17121,12 +17163,25 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 // (arity, #2178 generic erasure, and the nullable-ordering
                 // gate) is silently skipped for a cross-module program that
                 // an identical single-module program correctly rejects.
+                //
+                // fix #4050 (§19.3/§27.8, v0.294): same alias arm as
+                // `isClassHead` above.
                 if (ctx_.module()) {
                     for (Symbol* child : ctx_.module()->children) {
                         if (auto* ts = dynamic_cast<TypeSymbol*>(child)) {
                             if (ts->name == lastName &&
                                 ts->kind == ast::TypeDeclKind::Record) {
                                 recTy = ts; break;
+                            }
+                        } else if (auto* aliasSym =
+                                       dynamic_cast<TypeAliasSymbol*>(child)) {
+                            if (aliasSym->name == lastName) {
+                                TypeSymbol* aliasedTs =
+                                    resolveAliasToTypeSymbol(aliasSym);
+                                if (aliasedTs &&
+                                    aliasedTs->kind == ast::TypeDeclKind::Record) {
+                                    recTy = aliasedTs; break;
+                                }
                             }
                         }
                     }

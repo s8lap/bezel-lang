@@ -201,4 +201,42 @@ bool typeArgRuntimeReified(const TypeRef* t);
 // it for §14.4.
 std::string degenerateAsTargetReason(const TypeRef* target);
 
+// §27.8 (v0.294; fix #4038/#4048/#4050/#4051/review #4062): resolve a
+// `TypeAliasSymbol` through to the TypeSymbol its `aliasedType` names (a
+// class/record/interface/enum). THE shared resolution this whole family of
+// "does this WRITTEN NAME denote a type" classification predicates needs —
+// and, per the review chain across #4038 (sema `resolveMemberAccess`), #4048
+// (sema `altPartsNameType`), and #4050 (BOTH sema's destructuring-pattern
+// head resolution AND codegen's independent, parallel `patternMatches`
+// DestructuringPattern resolution — the two layers do NOT share sema's
+// result, so codegen needs the same fix separately), a free function here —
+// reachable from both `sema::ExprTC` (via a thin forwarding member,
+// `ExprTC::resolveAliasToTypeSymbol`) and `codegen::Emitter` (directly; both
+// classes hold a `SemaContext&` named `ctx_`) — is the ONE seam that closes
+// the whole family rather than each site (sema AND codegen alike)
+// hand-rolling its own copy. Mirrors the established pattern in this header:
+// `typeArgRuntimeReified`'s own comment ("Hoisted from ExprTC … so codegen's
+// … shares the SAME predicate").
+//
+// `aliasSym->decl`'s `aliasedType` was already eagerly resolved by
+// `Resolver::resolveTopDecl` when the `type` declaration itself was
+// processed (TypeResolution.cpp) — the same fact fix #578's type-position
+// alias transparency (TypeResolution_Names.cpp) also reuses.
+//
+// Returns null when: the alias is declaration-less (should not happen for a
+// module-internal alias, §27.8 — defensive only); the aliased type is not
+// `TypeRef::Kind::Named` (a primitive, function type, or bare generic-
+// parameter target — none of those are the TypeSymbol-based "type" this
+// family recognizes; review #4062 tracks the SEPARATE codegen hardening a
+// non-Named alias target still needs, a missing never-match guard rather
+// than a missing resolution); OR — #4047 — the alias's `aliasedType` has not
+// yet been resolved because it is declared TEXTUALLY BEFORE the (possibly
+// further-aliased) type it names, and `Resolver::resolveTopDecl`'s single
+// forward pass over `src.topDecls` has not reached it yet (in that case
+// `underlying` is non-null with `Kind::Named` but `underlying->declaration`
+// is itself null, so this function still returns null — never a dangling or
+// garbage TypeSymbol*). Callers inherit that same known-open ordering gap;
+// #4047 tracks it, not this function.
+TypeSymbol* resolveAliasToTypeSymbol(SemaContext& ctx, TypeAliasSymbol* aliasSym);
+
 } // namespace bezel::sema

@@ -5092,12 +5092,34 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
         if (nts->type && nts->type->kind == ast::TypeDeclKind::Enum)
             return lowerEnumCast(call);
     }
+    // fix #4051 (§5.4/§27.8, v0.294): a `type` alias of an ENUM used as a
+    // checked cast (`AliasOfEnum(3)`) resolves `calleeSym` to a
+    // `sema::TypeAliasSymbol` — the SAME symbol sema's own `typeCall`
+    // (ExprTypecheck_Calls.cpp) already resolves through
+    // `sema::resolveAliasToTypeSymbol`, but this codegen dispatcher reads
+    // `ctx_.exprSymbol(*call.callee)` independently and had the identical
+    // missing-arm gap. Left unfixed here, sema's OWN fix correctly
+    // classified the call (no more spurious §9.5 rejection) but codegen
+    // still could not find an enum to lower and the call degraded through
+    // the #2434 backstop to a zero-initialized value — measured:
+    // `AliasEnumCast4051(1)` compiled clean post-sema-fix but still
+    // silently returned 0 instead of `ColorCast4051.Green`.
     if (auto* ets = dynamic_cast<sema::TypeSymbol*>(calleeSym)) {
         if (ets->kind == ast::TypeDeclKind::Enum)
             return lowerEnumCast(call);
         // §9.5: records are constructed with `new Record(...)` (handled in
         // lowerNew), not call-style `Record(...)`. A bare call on a record
         // type name is not construction and is rejected in sema.
+    } else if (auto* aliasSym = dynamic_cast<sema::TypeAliasSymbol*>(calleeSym)) {
+        if (const sema::TypeSymbol* aliasedTs =
+                sema::resolveAliasToTypeSymbol(ctx_, aliasSym)) {
+            if (aliasedTs->kind == ast::TypeDeclKind::Enum)
+                return lowerEnumCast(call);
+            // A record/class alias reaches here too, but sema's own §9.5
+            // rejection (ExprTypecheck_Calls.cpp's fix #4051) already
+            // rejected it at compile time — this point is unreached for
+            // that shape on a diagnostics-clean program.
+        }
     }
     // CG26: a call to an extern (FFI) function — direct C-ABI call to
     // the external declaration. (Native functions don't set the

@@ -10134,12 +10134,32 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                 // emits malformed IR ("case.end has no terminator") instead
                 // of this clean §19.3 rejection (measured).
                 {
+                    // fix #4050 (§19.3/§27.8, v0.294): a `type` alias of a
+                    // class used as a destructuring head (`AliasOfDog(_)`)
+                    // resolves to a `TypeAliasSymbol`, which none of these
+                    // `dynamic_cast<TypeSymbol*>` name-match loops recognize
+                    // — the identical missing-arm shape #4038/#4048 closed
+                    // in their own call chains. Resolve it through the
+                    // shared `resolveAliasToTypeSymbol` helper
+                    // (ExprTypecheck.cpp) so an alias of a class gets the
+                    // SAME "not valid on a class type" §19.3 rejection a
+                    // direct class name already gets.
                     bool isClassHead = false;
                     for (const auto& sym : ctx_.symbols()) {
                         if (auto* ts = dynamic_cast<TypeSymbol*>(sym.get())) {
                             if (ts->name == lastName &&
                                 ts->kind == ast::TypeDeclKind::Class) {
                                 isClassHead = true; break;
+                            }
+                        } else if (auto* aliasSym =
+                                       dynamic_cast<TypeAliasSymbol*>(sym.get())) {
+                            if (aliasSym->name == lastName) {
+                                TypeSymbol* aliasedTs =
+                                    resolveAliasToTypeSymbol(aliasSym);
+                                if (aliasedTs &&
+                                    aliasedTs->kind == ast::TypeDeclKind::Class) {
+                                    isClassHead = true; break;
+                                }
                             }
                         }
                     }
@@ -10182,11 +10202,26 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                 // consults `storageComponentType` — the nullable-ordering
                 // gate) is silently skipped for a cross-module program that
                 // an identical single-module program correctly rejects.
+                //
+                // fix #4050 (§19.3/§27.8, v0.294): same alias arm as
+                // `isClassHead` above — a `type` alias of a record used as a
+                // destructuring head (`AliasOfPoint(x, y)`) must resolve to
+                // the aliased record's TypeSymbol here too.
                 for (const auto& sym : ctx_.symbols()) {
                     if (auto* ts = dynamic_cast<TypeSymbol*>(sym.get())) {
                         if (ts->name == lastName &&
                             ts->kind == ast::TypeDeclKind::Record) {
                             recTy = ts; break;
+                        }
+                    } else if (auto* aliasSym =
+                                   dynamic_cast<TypeAliasSymbol*>(sym.get())) {
+                        if (aliasSym->name == lastName) {
+                            TypeSymbol* aliasedTs =
+                                resolveAliasToTypeSymbol(aliasSym);
+                            if (aliasedTs &&
+                                aliasedTs->kind == ast::TypeDeclKind::Record) {
+                                recTy = aliasedTs; break;
+                            }
                         }
                     }
                 }

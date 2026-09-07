@@ -2462,7 +2462,29 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
             return;
         }
     }
-    if (auto* ts = dynamic_cast<TypeSymbol*>(calleeSym)) {
+    // fix #4051 (§9.5/§5.4/§27.8, v0.294): the callee of a call expression
+    // whose name is a `type` alias (`AliasOfRecord(1, 2)`) resolves to a
+    // `TypeAliasSymbol`, not a `TypeSymbol` — the same missing-arm shape
+    // fix #4038 and fix #4048 closed in their own call chains. Left
+    // unhandled, `ts` below stayed null, the whole block (both the §5.4
+    // enum-cast arm and the §9.5 "constructed with new" rejection) was
+    // skipped, and the call fell through untyped — a SILENT WRONG ANSWER,
+    // not a rejection: the call reached codegen with nothing to lower and
+    // degraded through the #2434/#2491 backstops to a compiles-clean,
+    // runs-clean, wrong value (measured: `AliasOfRecord(1, 2)` compiled and
+    // ran, returning 0 instead of the §9.5 compile error the direct
+    // `Record(1, 2)` spelling correctly produces). Resolve the alias
+    // through `resolveAliasToTypeSymbol` (ExprTypecheck.cpp) FIRST so both
+    // arms below — enum-cast and the record/class rejection — see through
+    // the alias exactly as they already do for a direct type name; this
+    // also correctly extends the §5.4 enum-cast-argument validation to an
+    // alias-of-enum callee, which shared this same gap.
+    TypeSymbol* ts = dynamic_cast<TypeSymbol*>(calleeSym);
+    if (!ts) {
+        if (auto* aliasSym = dynamic_cast<TypeAliasSymbol*>(calleeSym))
+            ts = resolveAliasToTypeSymbol(aliasSym);
+    }
+    if (ts) {
         if (ts->kind == ast::TypeDeclKind::Enum) {
             // fix #3044 (§5.4, v0.242): the checked-cast constant arm — see the
             // lambda's own comment above.

@@ -11829,11 +11829,38 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
         // in LlvmBackend_Stmts.cpp:7657-7666 and LlvmBackend_Assign.cpp:
         // 10008-10020 (the same widening the #3197 fix applied for the
         // §29.2 enumerable case).
+        //
+        // fix #4050 (§19.3/§27.8, v0.294): a `type` alias of a record used
+        // as a destructuring head (`AliasOfPoint(x, y)`) resolves to a
+        // `sema::TypeAliasSymbol` — a distinct kind this lambda's
+        // `dynamic_cast<TypeSymbol*>` alone does not recognize. This is a
+        // SEPARATE gap from sema's OWN identical fix in
+        // `ExprTC::bindNestedDestructuringNames`/the CaseExpr and CaseStmt
+        // twins (ExprTypecheck.cpp / ExprTypecheck_Exprs.cpp): codegen does
+        // NOT consume sema's resolved `recTy` here — it re-derives it
+        // independently from the pattern's `ast::QualifiedName`, so the
+        // sema-side fix alone left this crash reproducing (measured: fixing
+        // only the sema arms did not clear the "Basic Block … does not have
+        // terminator" failure for `case p of AliasOfPoint(x, y) => …`).
+        // Resolved through `sema::resolveAliasToTypeSymbol`
+        // (TypeResolution.hpp) — the SAME free function sema's arms call —
+        // so this codegen site and every sema site share one implementation
+        // rather than each re-deriving the alias-to-TypeSymbol lookup.
         auto considerSym = [&](const sema::Symbol* s) {
-            auto* ts = dynamic_cast<const sema::TypeSymbol*>(s);
-            if (!ts || ts->name != lastName ||
-                ts->kind != ast::TypeDeclKind::Record) return;
-            recTy = ts;
+            if (auto* ts = dynamic_cast<const sema::TypeSymbol*>(s)) {
+                if (ts->name == lastName &&
+                    ts->kind == ast::TypeDeclKind::Record)
+                    recTy = ts;
+                return;
+            }
+            if (auto* aliasSym = dynamic_cast<const sema::TypeAliasSymbol*>(s)) {
+                if (aliasSym->name != lastName) return;
+                const sema::TypeSymbol* aliasedTs =
+                    sema::resolveAliasToTypeSymbol(
+                        ctx_, const_cast<sema::TypeAliasSymbol*>(aliasSym));
+                if (aliasedTs && aliasedTs->kind == ast::TypeDeclKind::Record)
+                    recTy = aliasedTs;
+            }
         };
         for (const auto& sym : ctx_.symbols()) considerSym(sym.get());
         if (!recTy) {

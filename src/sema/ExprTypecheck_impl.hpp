@@ -1739,6 +1739,33 @@ private:
     bool altMemberNamesType(const ast::Expr* c);
     bool altPartsNameType(const std::vector<std::string_view>& parts);
 
+    // §27.8 (v0.294; fix #4050/#4051): resolve a `TypeAliasSymbol` through to
+    // the TypeSymbol its `aliasedType` names (a class/record/interface/enum).
+    // The ONE fact this family of "does this WRITTEN NAME denote a type"
+    // classification predicates needs, and — per the #4038/#4048/#4050/#4051
+    // review chain — the shared seam those sites should all resolve through
+    // rather than each hand-rolling the same three-line lookup (LANE_RULES
+    // §6's "duplicated classification predicate" hazard: fix #4038's
+    // `resolveMemberAccess` arm and fix #4048's `altPartsNameType` lambda are
+    // two independent copies already; this is written once here and reused
+    // by both of THIS commit's fixes rather than becoming a third and fourth
+    // copy). `aliasSym->decl`'s `aliasedType` was already eagerly resolved by
+    // `Resolver::resolveTopDecl` when the `type` declaration itself was
+    // processed (TypeResolution.cpp) — the same fact fix #578's type-position
+    // alias transparency also reuses.
+    //
+    // Returns null when: the alias is somehow declaration-less (should not
+    // happen for a module-internal alias, §27.8 — defensive only); the
+    // aliased type is not `TypeRef::Kind::Named` (a primitive, function
+    // type, or bare generic-parameter target — none of those are the
+    // TypeSymbol-based "type" this family recognizes); OR — #4047 — the
+    // alias's `aliasedType` has not yet been resolved because it is declared
+    // TEXTUALLY BEFORE the (possibly further-aliased) type it names, and
+    // `Resolver::resolveTopDecl`'s single forward pass over `src.topDecls`
+    // has not reached it yet. Callers inherit that same known-open ordering
+    // gap; #4047 tracks it, not this helper.
+    TypeSymbol* resolveAliasToTypeSymbol(TypeAliasSymbol* aliasSym);
+
     // §31.1 (issue #739; v0.243 / proposal 0080 / #3046): the operand of `throw`
     // must be an exception — an instance of `Exception` or a class deriving from
     // it. A primitive/string/record/enum/function thrown value also miscompiles
