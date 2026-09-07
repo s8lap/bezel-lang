@@ -690,20 +690,36 @@ public:
         }
         std::size_t startIdx = 0;
         bool isThisChain = false;
-        if (getChainingCall(cd, isThisChain)) {
+        // fix #4060 / §22.7 rule 1 / §22.3 / §29.11: a record's own
+        // `this(...)`/`base(...)` chain-call arguments got NO
+        // definite-assignment walk at all before this fix —
+        // `getChainingCall`'s return value was discarded and the argument
+        // list itself was never visited by anything. Mirror runConstructor's
+        // identical block above: gate the chaining position (so
+        // `gateObservation`'s in-chaining-position branch fires once
+        // `recordCtorMode_` reaches it, fix #4014) and visit every argument
+        // through `visitCallArg`, which additionally picks up the ordinary
+        // local-DA, §22.3 out-param, and §29.11 lazy-consumption tracking
+        // `visitCallArg` already performs for every OTHER call's arguments —
+        // all of which were silently skipped for a record's chain-call
+        // arguments specifically.
+        if (const ast::CallExpr* chain = getChainingCall(cd, isThisChain)) {
             startIdx = 1;
+            inChainingPosition_ = true;
+            for (const auto& a : chain->args) visitCallArg(a);
+            inChainingPosition_ = false;
+            if (isThisChain) {
+                // fix #4001, mirroring runConstructor: a `this(...)`-chained-to
+                // record constructor has already discharged every §7.9-strict
+                // field on its own normal-exit path (checked when THAT
+                // constructor is walked), so this constructor's body starts with
+                // them all assigned.
+                for (auto n : fieldsNeedingInit_) assignedFields_.insert(n);
+            }
         }
-        if (isThisChain) {
-            // fix #4001, mirroring runConstructor: a `this(...)`-chained-to
-            // record constructor has already discharged every §7.9-strict
-            // field on its own normal-exit path (checked when THAT
-            // constructor is walked), so this constructor's body starts with
-            // them all assigned.
-            for (auto n : fieldsNeedingInit_) assignedFields_.insert(n);
-        } else {
+        if (!isThisChain)
             for (auto n : readonlyInitialized)
                 readonlyMaybeAssigned_.insert(n);
-        }
         for (std::size_t i = startIdx; i < cd.body.size(); ++i) {
             if (cd.body[i]) visitStmt(*cd.body[i]);
         }
