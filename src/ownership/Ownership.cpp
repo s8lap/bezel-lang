@@ -10428,6 +10428,11 @@ static std::vector<ast::GenericParam> extensionTypeParams(
     return out;
 }
 
+// fix #4011 / §7.9: forward-declared so checkMember's NestedTypeMember arm
+// (below) can run the same no-ctor screen checkTopDecl runs for a top-level
+// type — defined after checkOwnedFieldDA, further down this file.
+void checkNoCtorScreenForType(const ast::TypeDecl& td, sema::SemaContext& ctx);
+
 void checkMember(const ast::Member& m, sema::SemaContext& ctx,
                  const ast::TypeDecl* enclosingType = nullptr,
                  const ast::ExtensionDecl* enclosingExtension = nullptr) {
@@ -10606,6 +10611,15 @@ void checkMember(const ast::Member& m, sema::SemaContext& ctx,
         }
     } else if (auto* nt = dynamic_cast<const ast::NestedTypeMember*>(&m)) {
         if (nt->decl) {
+            // fix #4011 / §7.9: a nested type's OWN no-ctor obligation was
+            // never checked — this arm recursed into nt->decl->members
+            // (below) but never re-ran the type-level no-ctor screen for
+            // nt->decl itself, so a nested class with a non-nullable field
+            // and no constructor compiled clean and SIGSEGVed on first
+            // read, even though the identical top-level shape is rejected
+            // by checkTopDecl. Run the same screen here, keyed on
+            // nt->decl->kind exactly as checkTopDecl does.
+            checkNoCtorScreenForType(*nt->decl, ctx);
             // §28.3 (#1801 S6): the nested type is the enclosing type for its own
             // members' bare-type-parameter recognition.
             for (const auto& innerM : nt->decl->members) {
@@ -10879,12 +10893,27 @@ void checkOwnedFieldDA(const ast::TypeDecl& td, sema::SemaContext& ctx) {
     }
 }
 
+// fix #4011 / §7.9: shared dispatch so checkTopDecl (top-level types) and
+// checkMember's NestedTypeMember arm (nested types) run the IDENTICAL
+// no-ctor screen — before this helper, the screen was invoked only from
+// checkTopDecl, so a nested class with a non-nullable field/auto-property and
+// no constructor bypassed it entirely (a SIGSEGV on ordinary construction,
+// even though the identical top-level shape was already rejected). Records
+// get their own analogous screen from the definite-assignment pass
+// (checkRecordNoCtorFieldCompletion, DefiniteAssignment.cpp) via its own
+// mirrored dispatch — that pass and this one are separate translation units
+// invoked from separate driver entry points (checkDefiniteAssignment /
+// checkOwnership), so neither can call into the other's TopDecl walk.
+void checkNoCtorScreenForType(const ast::TypeDecl& td, sema::SemaContext& ctx) {
+    if (td.kind == ast::TypeDeclKind::Class) {
+        checkOwnedFieldDA(td, ctx);
+    }
+}
+
 void checkTopDecl(const ast::TopDecl& d, sema::SemaContext& ctx) {
     if (auto* td = dynamic_cast<const ast::TypeDecl*>(&d)) {
         // O9: per-class owned-field DA check (classes only).
-        if (td->kind == ast::TypeDeclKind::Class) {
-            checkOwnedFieldDA(*td, ctx);
-        }
+        checkNoCtorScreenForType(*td, ctx);
         // §28.3 (#1801 S6): `td` is the enclosing type for its members' bare-
         // type-parameter recognition (a `class Box<T> ... method Get(): T`).
         for (const auto& m : td->members) {

@@ -2168,6 +2168,12 @@ bool hasOutParam(const std::vector<ast::Param>& params) {
     return false;
 }
 
+// fix #4011 / §7.9: forward-declared so checkMember's NestedTypeMember arm
+// (below) can run the same no-ctor screen checkTopDecl runs for a top-level
+// record — defined after checkRecordNoCtorFieldCompletion, further down this
+// file.
+void checkNoCtorScreenForType(const ast::TypeDecl& td, SemaContext& ctx);
+
 // `enclosing` is the type whose members are being walked (null for extension
 // members and top-level free code). §22.7 construction-time `this`-observation
 // checking runs only for a CLASS's non-static constructors: records have no
@@ -2268,6 +2274,15 @@ void checkMember(const ast::Member& m, SemaContext& ctx,
         }
     } else if (auto* nt = dynamic_cast<const ast::NestedTypeMember*>(&m)) {
         if (nt->decl) {
+            // fix #4011 / §7.9: a nested type's OWN no-ctor obligation was
+            // never checked — this arm recursed into nt->decl->members
+            // (below) but never re-ran the type-level no-ctor screen for
+            // nt->decl itself, so a nested record with a non-nullable field/
+            // auto-property and no constructor compiled clean and SIGSEGVed
+            // on first read, even though the identical top-level shape is
+            // rejected by checkTopDecl. Run the same screen here, keyed on
+            // nt->decl->kind exactly as checkTopDecl does.
+            checkNoCtorScreenForType(*nt->decl, ctx);
             for (const auto& innerM : nt->decl->members) {
                 if (innerM) checkMember(*innerM, ctx, nt->decl.get());
             }
@@ -2330,11 +2345,25 @@ void checkRecordNoCtorFieldCompletion(const ast::TypeDecl& rec,
     }
 }
 
+// fix #4011 / §7.9: shared dispatch so checkTopDecl (top-level types) and
+// checkMember's NestedTypeMember arm (nested types) run the IDENTICAL no-ctor
+// screen — before this helper, the screen was invoked only from checkTopDecl,
+// so a nested record with a non-nullable field/auto-property and no
+// constructor bypassed it entirely. Classes get their own analogous screen
+// from the ownership pass (checkOwnedFieldDA, Ownership.cpp) via its own
+// mirrored dispatch (checkNoCtorScreenForType there) — that pass and this one
+// are separate translation units invoked from separate driver entry points
+// (checkOwnership / checkDefiniteAssignment), so neither can call into the
+// other's TopDecl walk.
+void checkNoCtorScreenForType(const ast::TypeDecl& td, SemaContext& ctx) {
+    if (td.kind == ast::TypeDeclKind::Record) {
+        checkRecordNoCtorFieldCompletion(td, ctx);
+    }
+}
+
 void checkTopDecl(const ast::TopDecl& d, SemaContext& ctx) {
     if (auto* td = dynamic_cast<const ast::TypeDecl*>(&d)) {
-        if (td->kind == ast::TypeDeclKind::Record) {
-            checkRecordNoCtorFieldCompletion(*td, ctx);
-        }
+        checkNoCtorScreenForType(*td, ctx);
         for (const auto& m : td->members) {
             if (m) checkMember(*m, ctx, td);
         }
