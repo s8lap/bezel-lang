@@ -644,6 +644,47 @@ void MethodOwnership::recordMovesIn(const ast::Expr& e) {
         if (tt->operand) recordMovesIn(*tt->operand);
         return;
     }
+    // fix #4024 (§15.4 / §28.3, v0.294): the SAME missing-arm gap #4003/#4028
+    // fixed for the structural-wrapper node kinds, one node kind further —
+    // `recordMovesIn` had no `CollectionLiteralExpr` arm at all, so a `move`
+    // operand embedded directly in a collection literal element (or, for the
+    // dict form, a key) was never validated (a Disposed/MovedFrom source
+    // silently accepted) or recorded (the source never transitioned to
+    // MovedFrom). Mirrors `checkRead`'s own `CollectionLiteralExpr` arm
+    // (this file, `readOperand` loop over `keys`/`elements`) on the READ
+    // side; this is the move-recording twin. `keys` is empty for the
+    // non-dict sequence form, so recursing into both unconditionally is
+    // exactly checkRead's own shape.
+    //
+    // Audited against every OTHER `CollectionLiteralExpr` call site in this
+    // file and Ownership.cpp (~17 of them, none reachable from here) before
+    // adding this arm: `scanReassignExpr` / `moveOnlyArrayLeakScanExpr` /
+    // `forEachBorrowStoreCallInExpr` / `collectBodyLambdasExpr` (closure-
+    // capture and reassignment bookkeeping, Ownership.cpp),
+    // `scanCapturedOwnedConsumeExpr` / `scopedPreScanExpr` /
+    // `scopedCaptureWalkExpr` / `scopedCalleeWalkExpr` / `callBoundedSourceOf`
+    // / `callBoundedWalkExpr` (lambda-capture / §28.14 call-bounded scans),
+    // `findThrowable28_8_1` / `collectReadIdentifiers` (unrelated leaf
+    // inventories), the §15.4 fresh-producer-in-borrowing-literal checks
+    // (`sec154StoreArgIsClassTyped`'s caller, `checkBorrowingTaskArrayLiteral`)
+    // and `borrowingArrayLiteralLocalFieldStoreSource` (a LEAF classifier of
+    // the LOCAL's own declaration shape, not a recursive element walk) — every
+    // one is a SEPARATE concern (capture tracking, reassignment scanning,
+    // borrow-store-escape classification) that neither calls `recordMovesIn`
+    // on these elements nor is called BY it, so this arm cannot double-process
+    // or conflict with any of them. Measured: `var x := new Res(1);
+    // x.Dispose(); var arr: OwningArray<Res> := [move x]; return
+    // arr[0].tag;` compiled with rc=0, ZERO diagnostics, and SEGV'd under
+    // ASan reading `x`'s freed storage; the non-literal `(move x)` spelling
+    // through the `UnaryExpr` arm above is and remains correctly rejected.
+    // // per §15.4, §28.3, v0.294, #4003, #4028, #4024
+    if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(&e)) {
+        for (const auto& k : cl->keys)
+            if (k) recordMovesIn(*k);
+        for (const auto& el : cl->elements)
+            if (el) recordMovesIn(*el);
+        return;
+    }
     if (auto* isx = dynamic_cast<const ast::InterpolatedStringExpr*>(&e)) {
         for (const auto& part : isx->parts)
             if (part.expr) recordMovesIn(*part.expr);
