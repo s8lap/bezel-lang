@@ -163,7 +163,7 @@ spec_0160	spec	2214-No-params-no-ref-returns	skip	n/a	skip:elided
 spec_0161	spec	The-throw-carve-out	fragment	compiles	
 spec_0162	spec	Properties-indexers-accessors	fragment	compiles	
 spec_0163	spec	2216-Contract-clauses	skip	n/a	blocked-on-#2942 (ensures result/old not yet implemented)
-spec_0164	spec	231-Auto-properties	fragment	compiles	
+spec_0164	spec	231-Auto-properties	skip	n/a	skip:signature-listing (§23.1's four auto-property forms are shown together with no enclosing constructor -- a syntax listing, not a compilable class; #4012 closed the class no-ctor §7.9 screen's field/auto-property asymmetry, so the harness's class-wrap now correctly rejects it for definite assignment)
 spec_0165	spec	232-Expression-bodied-read-only-properties	skip	n/a	skip:incomplete-fragment
 spec_0166	spec	233-Block-form-properties	fragment	compiles	wrap:mixed; env:_balance
 spec_0167	spec	233-Block-form-properties	fragment	compiles	
@@ -174,7 +174,7 @@ spec_0171	spec	253-Examples	fragment	compiles
 spec_0172	spec	253-Examples	fragment	compiles	
 spec_0173	spec	254-No-user-defined-conversion-operators	fragment	compiles	
 spec_0174	spec	261-Declaration	fragment	compiles	
-spec_0175	spec	264-Generic-extensions	fragment	compiles	
+spec_0175	spec	264-Generic-extensions	skip	n/a	blocked-on-#4042 (docs-ahead: producerState never classifies a var bound to a builtin owned-returning materializer call (ToArray/Sorted/Reversed/Slice/...) as Owned, so #3993's return-borrow check misclassifies `var items := this.ToArray(); return items;` as returning a borrow)
 spec_0176	spec	264-Generic-extensions	fragment	compiles	
 spec_0177	spec	2651-Specificity-ordering	fragment	compiles	wrap:mixed
 spec_0178	spec	2651-Specificity-ordering	error	diagnose	
@@ -635,7 +635,7 @@ stdlib_0121	stdlib	WhenAll-for-class-T-the-owning-overload	skip	n/a	skip:incompl
 stdlib_0122	stdlib	WhenEach-streaming-fan-in-v0212-graduated-from-proposal-0023	skip	n/a	skip:signature-listing
 stdlib_0123	stdlib	WhenEach-streaming-fan-in-v0212-graduated-from-proposal-0023	skip	n/a	skip:incomplete-fragment
 stdlib_0124	stdlib	68-Domain	skip	n/a	skip:signature
-stdlib_0125	stdlib	68-Domain	fragment	compiles	
+stdlib_0125	stdlib	68-Domain	skip	n/a	skip:signature-listing (DomainFaultedException is a runtime-constructed type-shape sketch, stdlib §6.8 -- no constructor is shown or implied; #4012 closed the class no-ctor §7.9 screen's field/auto-property asymmetry, so the harness's library-wrap now correctly rejects it for definite assignment)
 stdlib_0126	stdlib	69-ChannelT-and-ChannelSenderT	skip	n/a	skip:signature
 stdlib_0127	stdlib	69-ChannelT-and-ChannelSenderT	fragment	compiles	
 stdlib_0128	stdlib	69-ChannelT-and-ChannelSenderT	skip	n/a	blocked-on-#3056 (docs-ahead: move-marker unification, v0.246)
