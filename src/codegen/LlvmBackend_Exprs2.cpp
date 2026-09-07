@@ -9027,6 +9027,37 @@ llvm::Value* Emitter::buildRecordValue(
     // have rejected before codegen — not a claim that inequality is a
     // legitimate case.
     //
+    // fix #4019 (§22.8 "Field initializers run exactly once per instance
+    // construction", v0.294): resolve the constructor this call will use
+    // BEFORE running the preamble's field-init loop below, so the loop can
+    // be skipped for a `this(...)`-chaining constructor. §22.8's sequence
+    // makes step 2 (field initializers) run ONLY at the end of a
+    // `this(...)` chain — "A constructor that chains via `this(...)` skips
+    // steps 0 and 2" — precisely because running it at every link would
+    // "run every field initializer twice under `this(...)` chaining —
+    // repeating allocations and initializer side effects, assigning
+    // `readonly` fields twice". `emitChainCall` (invoked below, in the
+    // explicit-constructor branch, per fix #4013) already routes the chain
+    // TARGET through the shared `emitConstructorBody`/`inlineCtorBody`
+    // machinery, whose existing `!isThis` gate runs `emitOwnFieldInit`
+    // exactly once at the bottom of the chain — the SAME once-only
+    // authority the class side already relies on (CLAUDE.md §6: reuse the
+    // existing authority rather than adding a second rule). Computed once,
+    // here, and reused by the explicit-constructor branch below instead of
+    // a second `ctorForArgs` call.
+    sema::ConstructorSymbol* explicitCs = ctorForArgs(t, args);
+    bool skipPreambleFieldInit = false;
+    if (explicitCs) {
+        if (auto* explicitCd =
+                dynamic_cast<const ast::ConstructorDecl*>(explicitCs->decl)) {
+            bool peekIsThis = false;
+            if (!explicitCd->body.empty() &&
+                chainCallOf(*explicitCd->body[0], peekIsThis) && peekIsThis) {
+                skipPreambleFieldInit = true;
+            }
+        }
+    }
+
     // §9.2 body record (or a combined-form record's non-positional storage):
     // zero the whole struct, then run every body-declared field/auto-property
     // initializer. Hoisted ahead of the positional fast path below (fix
@@ -9036,7 +9067,14 @@ llvm::Value* Emitter::buildRecordValue(
     // be zeroed/defaulted first. A positional field's `m->decl` is the owning
     // TypeDecl (never a FieldDecl/PropertyDecl), so this loop naturally skips
     // positional fields — they have no separate initializer to run.
+    //
+    // The zero-fill always runs (the struct's §7.9 default watermark must be
+    // established regardless of which constructor arm follows); the
+    // initializer loop itself is skipped when `skipPreambleFieldInit` is set
+    // (fix #4019 above) — the `this(...)` chain target reached below runs it
+    // instead, exactly once.
     builder_.CreateStore(llvm::ConstantAggregateZero::get(st), slot);
+    if (!skipPreambleFieldInit) {
     for (const sema::Symbol* m : fields) {
         const ast::Expr* init = nullptr;
         if (auto* fd = dynamic_cast<const ast::FieldDecl*>(m->decl))
@@ -9245,6 +9283,7 @@ llvm::Value* Emitter::buildRecordValue(
             }
         }
     }
+    }  // fix #4019: end of `if (!skipPreambleFieldInit)`
 
     // §9.1 positional record: a bare positional argument list whose count
     // matches the POSITIONAL storage members (fix #2464: never total storage
@@ -9474,11 +9513,15 @@ llvm::Value* Emitter::buildRecordValue(
 
     // §9.2 body record, or a combined-form/positional record constructed
     // through an EXPLICIT constructor: storage is already zeroed and
-    // body-declared initializers have already run (hoisted above, fix
-    // #2464); here, run the matching constructor with `this` bound to the
-    // struct slot. Mirrors the class construction path in lowerNew but for a
-    // by-value struct.
-    if (sema::ConstructorSymbol* cs = ctorForArgs(t, args)) {
+    // body-declared initializers have already run UNLESS this constructor
+    // chains via `this(...)` (fix #4019 above — in that case the chain
+    // target reached via `emitChainCall` below runs them instead); here, run
+    // the matching constructor with `this` bound to the struct slot. Mirrors
+    // the class construction path in lowerNew but for a by-value struct.
+    // `explicitCs` is the SAME resolution `skipPreambleFieldInit` above was
+    // computed from (fix #4019) — reused rather than calling `ctorForArgs`
+    // a second time.
+    if (sema::ConstructorSymbol* cs = explicitCs) {
         auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
         if (!cd) return nullptr;
         // Inline the constructor body with `this` = the record slot pointer
@@ -9552,7 +9595,53 @@ llvm::Value* Emitter::buildRecordValue(
         // Folded in here rather than filed because it is literally this one call
         // and the alternative was leaving a proven use-after-free in the tree.
         retainAssignedStringParams(cd->body, cs->params);
-        lowerScopedBlock(cd->body);
+        // fix #4013 (§12.8 / §22.7 / §22.8, v0.294): a leading `this(...)` chain
+        // call (§12.8 puts it in the body's first statement) was never
+        // recognised here — unlike every OTHER constructor-body lowering path
+        // (`emitConstructorBody`'s compiled ctor functions and the class-side
+        // `inlineCtorBody`), which all route through the shared
+        // `chainCallOf`/`emitChainCall` pair (Node.hpp's `chainCallOfStmt`
+        // doc comment). This inline record-construction path instead handed
+        // the WHOLE `cd->body` — chain-call statement included — to
+        // `lowerScopedBlock`. `this(...)`'s callee is the bare identifier
+        // "this" (chainCallOfStmt), which names no ordinary callable symbol,
+        // so the general call-lowering machinery silently produced no IR for
+        // it (the #3777-class "no diagnostic at any severity" failure mode) —
+        // the chained-to constructor's body never ran. Measured (issue 4013):
+        // `record R { property N: int; constructor(n:int) N:=n; constructor()
+        // this(42); }` then `new R().N` read back `0`, not `42`; a second
+        // repro where the chained-to ctor was the only assigner of a
+        // non-nullable reference-typed field SIGSEGVed on first use, because
+        // sema's DefiniteAssignment.cpp (`runRecordConstructor`,
+        // `getChainingCall`) correctly treats a `this(...)`-chaining record
+        // ctor as having discharged every §7.9-strict field THROUGH the
+        // chain — exactly mirroring the class side's `runConstructor` — so no
+        // diagnostic caught the never-executed chain at compile time either.
+        // `emitChainCall` already calls the chain target's OWN compiled
+        // `bz$<Type>$ctor`/`.N` function (found in `ctorFns_`, unconditionally
+        // emitted for every explicit constructor including a record's, per
+        // `emitConstructorBody`'s use above) against `currentThis_` — set to
+        // `slot` just above — which is exactly the by-value receiver a record
+        // constructor needs; a record has no base class (`emitImplicitBase`
+        // no-ops via `baseClassOf` returning null), so only the `this(...)`
+        // arm is reachable here, never `base(...)`.
+        //
+        // fix #4019: this re-derives the SAME `this(...)` fact
+        // `skipPreambleFieldInit` above already computed from `explicitCs`
+        // (this `cs`) — kept as a separate, local check rather than a
+        // parameter threaded down from there, since this one also needs
+        // `chain`/`bodyStartIdx` for the emission below, which the preamble
+        // peek has no use for.
+        bool chainedThis = false;
+        std::size_t bodyStartIdx = 0;
+        if (!cd->body.empty()) {
+            if (const ast::CallExpr* chain =
+                    chainCallOf(*cd->body[0], chainedThis)) {
+                emitChainCall(chain, chainedThis, cs);
+                bodyStartIdx = 1;
+            }
+        }
+        lowerScopedBlock(cd->body, bodyStartIdx);
         currentThis_ = savedThis;
         locals_ = std::move(savedLocals);
         paramSlots_ = std::move(savedParams);
