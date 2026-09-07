@@ -16502,6 +16502,69 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 // misses it. Extract the inner TypeSymbol so enum-constant lookup
                 // (and other member-access paths) work correctly.
                 if (nts->type) targetType = nts->type;
+            } else if (auto* aliasSym = dynamic_cast<TypeAliasSymbol*>(sym)) {
+                // fix #4038 (§27.8, v0.294): a module-level `type` alias used as
+                // the receiver of a static member access (`AliasOfFoo.Bar`) is
+                // NOT a TypeSymbol — it is a distinct TypeAliasSymbol — so it
+                // fell through every arm above and `targetType` stayed null.
+                // §27.8, verbatim: "Type aliases — generic or not — see through
+                // to the aliased type for identity, equality, method dispatch,
+                // and overload resolution." Static member access is exactly
+                // such a dispatch site and must see through the alias too.
+                //
+                // Left unhandled, this was a SILENT WRONG ANSWER, not a
+                // rejection: `targetType` stayed null, so `ma`'s exprSymbol was
+                // never set to the real FieldSymbol/PropertySymbol/MethodSymbol.
+                // On READ, codegen's lowerExpr for the MemberAccessExpr then had
+                // nothing to lower, and emitReturn's own #2491 backstop
+                // (LlvmBackend_Stmts.cpp) substituted a defined zero/null value
+                // with a loud Warning — the backstop worked exactly as designed
+                // (it exists so a codegen lowering gap degrades to a labeled
+                // zero rather than `undef` or a crash), but the ROOT problem is
+                // this resolution gap, not the backstop; fixing the gap here
+                // means the backstop no longer has anything to catch for this
+                // shape. On WRITE, codegen's `lvalueAddr` (LlvmBackend_Layout.cpp)
+                // found no local slot, no field address (the target isn't an
+                // instance receiver), and no static-field global
+                // (`staticFieldGlobal` keys off `ctx_.exprSymbol` of the WHOLE
+                // MemberAccessExpr, which was never set) — the generic `:=`
+                // fallback in LlvmBackend_Stmts.cpp then hit `if (!addr) return
+                // false;` with NO diagnostic at all, silently dropping the
+                // store (and never evaluating the RHS).
+                //
+                // Resolve exactly as the TYPE-POSITION alias-transparency arm
+                // does (TypeResolution_Names.cpp's `resolveType`, fix #578):
+                // the alias's `aliasedType` was already resolved eagerly when
+                // the `type` declaration itself was processed
+                // (Resolver::resolveTopDecl), so `ctx_.resolvedType(...)` has
+                // it by the time any method body is typechecked. Only a Named
+                // underlying (a class/record/interface/enum) has static
+                // members to look up; a primitive/function/generic-parameter
+                // alias target has none and is left for the existing
+                // "no such member" handling below.
+                if (const auto* aliasDecl =
+                        dynamic_cast<const ast::TypeAlias*>(aliasSym->decl)) {
+                    if (aliasDecl->aliasedType) {
+                        if (TypeRef* underlying =
+                                ctx_.resolvedType(*aliasDecl->aliasedType)) {
+                            if (underlying->kind == TypeRef::Kind::Named) {
+                                targetType = underlying->declaration;
+                                // Mirror the §11.8 GenericParamSymbol arm
+                                // above: attach the resolved (possibly
+                                // generic-instantiated, e.g. `type A :=
+                                // G<int>;`) TypeRef to the target identifier
+                                // itself so any downstream code that re-reads
+                                // `ctx_.exprType(*ma.target)` directly (rather
+                                // than through `targetType`) — codegen's
+                                // generic-instantiation static-global redirect
+                                // included — sees the real aliased type, not
+                                // an untyped alias name.
+                                if (targetType)
+                                    ctx_.setExprType(ma.target.get(), underlying);
+                            }
+                        }
+                    }
+                }
             }
         }
     }

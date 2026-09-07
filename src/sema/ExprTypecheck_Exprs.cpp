@@ -3774,7 +3774,20 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                     // §11.8 (v0.176, #807): a type-parameter receiver
                     // (`T.Zero()`) IS a type-name receiver — the static
                     // dispatches through the constraint at instantiation.
-                    dynamic_cast<sema::GenericParamSymbol*>(recv) != nullptr;
+                    dynamic_cast<sema::GenericParamSymbol*>(recv) != nullptr ||
+                    // fix #4038 (§27.8, v0.294): a module-level `type` alias
+                    // receiver (`AliasOfFoo.Bar`) IS a type-name receiver too
+                    // — §27.8 sees the alias through to the aliased type for
+                    // "identity, equality, method dispatch" alike. Without
+                    // this arm, resolveMemberAccess's own #4038 fix (which now
+                    // sets `ma->target`'s exprType to the aliased Named
+                    // TypeRef so codegen sees through the alias) newly tripped
+                    // THIS check: `recv` is a TypeAliasSymbol (not a
+                    // TypeSymbol), so `recvIsType` was false, and the now-
+                    // non-null `ctx_.exprType(*ma->target)` made the
+                    // instance-receiver rejection fire on a perfectly legal
+                    // type-name access.
+                    dynamic_cast<sema::TypeAliasSymbol*>(recv) != nullptr;
                 bool recvIsPrim = false;
                 if (auto* rid = dynamic_cast<const ast::IdentifierExpr*>(
                         ma->target.get()))
