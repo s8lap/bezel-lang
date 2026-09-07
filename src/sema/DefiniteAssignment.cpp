@@ -460,42 +460,83 @@ public:
     // ambient fact derefing a value the ctor later nulled) reproduced on
     // records (probe-confirmed SEGV in `lam$0`). Enable readonly tracking
     // WITHOUT importing the class-specific §22.7 this-observation gating
-    // (records have no base-first-construction footgun) or the §7.9/§22.7
-    // field-DA bookkeeping (records have no `this`-observation gate to fire
-    // on the fall-off path; ctorMode_ stays false). INSTANCE readonly fields
-    // carrying an initializer run as step 2 before a non-chaining ctor's body
-    // (§22.8), so they are seeded as already-assigned exactly as in
-    // runStaticConstructor; a `this(...)`-chaining ctor skips step 2 (its
+    // (records have no base-first-construction footgun) — but, per fix #4001,
+    // WITH the §7.9 field-completion obligation itself (`recordCtorMode_`):
+    // §7.9's own text is generic ("every non-nullable field must be either
+    // assigned … or given a field initializer") and §9.4 states outright that
+    // a record constructor's stores are "governed by §22.8's once-only and
+    // §7.9's definite-assignment machinery" — a record body field or
+    // auto-property left unset by every constructor is exactly the same
+    // unset-non-nullable-field state §7.9 forbids for a class, and reading it
+    // back through a `new R(...)` value SIGSEGVs identically (issue #4001,
+    // three measured repros: an explicit body field, a `readonly property`
+    // auto-property, and an explicit user constructor that simply never
+    // assigns the field — none diagnosed before this fix). INSTANCE readonly
+    // fields carrying an initializer run as step 2 before a non-chaining
+    // ctor's body (§22.8), so they are seeded as already-assigned exactly as
+    // in runStaticConstructor; a `this(...)`-chaining ctor skips step 2 (its
     // initializers ran in the chained-to ctor), so the seeding is suppressed
-    // in that case — mirroring runConstructor's choice. Cross-ctor once-ness
-    // (a chaining ctor re-assigning a field the chained-to ctor already
-    // assigned) is the #2206 route B residual, out of scope here.
+    // in that case — mirroring runConstructor's choice, and (fix #4001) the
+    // chained-to constructor's own §7.9 obligation already discharged every
+    // needing-init field, so this constructor seeds them pre-assigned too,
+    // exactly as runConstructor does for classes. Cross-ctor once-ness for
+    // `readonly` (a chaining ctor re-assigning a field the chained-to ctor
+    // already assigned) is the #2206 route B residual, out of scope here.
     void runRecordConstructor(const ast::ConstructorDecl& cd,
                               const ast::TypeDecl& rec) {
         roCtorMode_ = true;
+        recordCtorMode_ = true;
         std::vector<std::string_view> readonlyInitialized;
         for (const auto& m : rec.members) {
-            auto* f = dynamic_cast<const ast::FieldDecl*>(m.get());
-            if (!f || !f->initializer) continue;
-            bool isStatic = false, isReadonly = false;
-            for (auto mod : f->modifiers) {
-                if (mod == "static") isStatic = true;
-                else if (mod == "readonly") isReadonly = true;
+            if (auto* f = dynamic_cast<const ast::FieldDecl*>(m.get())) {
+                // fix #4001 / §7.9: a record body field is the same storage
+                // shape isSevenNineStrictField already classifies for a
+                // class field — the predicate reads only the field's own
+                // modifiers/type/initializer, nothing class-specific.
+                if (isSevenNineStrictField(*f, ctx_))
+                    fieldsNeedingInit_.push_back(f->name);
+                if (!f->initializer) continue;
+                bool isStatic = false, isReadonly = false;
+                for (auto mod : f->modifiers) {
+                    if (mod == "static") isStatic = true;
+                    else if (mod == "readonly") isReadonly = true;
+                }
+                if (!isStatic && isReadonly)
+                    readonlyInitialized.push_back(f->name);
+            } else if (auto* p = dynamic_cast<const ast::PropertyDecl*>(
+                           m.get())) {
+                // fix #4001 / §7.9 / §22.7: "auto-property assignments and
+                // reads … each [are] the backing field's assignment or
+                // read" — a record's auto-property backing storage is the
+                // §7.9 obligation §7.9's "Default initialization" subsection
+                // states for any non-defaultable storage, record or class.
+                if (isSevenNineStrictAutoProp(*p, ctx_))
+                    fieldsNeedingInit_.push_back(p->name);
             }
-            if (!isStatic && isReadonly)
-                readonlyInitialized.push_back(f->name);
         }
         std::size_t startIdx = 0;
         bool isThisChain = false;
         if (getChainingCall(cd, isThisChain)) {
             startIdx = 1;
         }
-        if (!isThisChain) {
+        if (isThisChain) {
+            // fix #4001, mirroring runConstructor: a `this(...)`-chained-to
+            // record constructor has already discharged every §7.9-strict
+            // field on its own normal-exit path (checked when THAT
+            // constructor is walked), so this constructor's body starts with
+            // them all assigned.
+            for (auto n : fieldsNeedingInit_) assignedFields_.insert(n);
+        } else {
             for (auto n : readonlyInitialized)
                 readonlyMaybeAssigned_.insert(n);
         }
         for (std::size_t i = startIdx; i < cd.body.size(); ++i) {
             if (cd.body[i]) visitStmt(*cd.body[i]);
+        }
+        if (!terminated_) {
+            // fix #4001 / §7.9 (Appendix C.1): the constructor's fall-off is
+            // a normal-exit path too — mirrors runConstructor's own call.
+            checkCtorFieldCompletion(&cd.span.begin);
         }
     }
 
@@ -580,6 +621,25 @@ private:
     bool roCtorMode_ = false;
     int inLoopDepth_ = 0;
     std::unordered_set<std::string_view> readonlyMaybeAssigned_;
+
+    // fix #4001 / §7.9: record-constructor field-completion tracking. Active
+    // only while walking a record's instance constructor body
+    // (runRecordConstructor). Deliberately SEPARATE from `ctorMode_` rather
+    // than reusing it: `ctorMode_` also drives the §22.7 this-observation
+    // gate (gateObservation/gateChainPositionFieldRead/visitCtorCall/
+    // visitCtorMemberAccess), which is genuinely class-specific machinery
+    // guarding a base-first-construction/virtual-dispatch footgun records do
+    // not have (checkMember's comment on the record ctor branch). This flag
+    // reuses ONLY the two class-agnostic parts of that machinery — marking a
+    // `this.f := v`/bare `f := v` store toward `assignedFields_`, and the
+    // §7.9 fall-off completeness check (checkCtorFieldCompletion) — so a
+    // record body field/auto-property gets the SAME "every non-nullable
+    // field must be assigned by every constructor" guarantee §7.9 states
+    // generically (confirmed at spec line ~1452: a record constructor's
+    // stores are "governed by §22.8's once-only and §7.9's definite-
+    // assignment machinery"), without importing any observation-gate
+    // rejection a record never needed.
+    bool recordCtorMode_ = false;
 
     // §22.4 (v0.181): short-circuit-sensitive definite-assignment state for a
     // boolean sub-expression. `afterTrue` / `afterFalse` are the sets of
@@ -787,7 +847,11 @@ private:
             // observation gate, and is itself NOT an observation (do not recurse
             // into the `this` receiver). A computed-property `:=` target falls
             // through to visitExpr below, where its setter invocation is gated.
-            if (ctorMode_ && as->op == ":=" && as->target) {
+            // fix #4001 / §7.9: `recordCtorMode_` reuses this same bookkeeping
+            // for a record constructor's own §7.9 obligation (see its
+            // declaration) — a record has no observation gate to feed, only
+            // the fall-off completeness check this marks toward.
+            if ((ctorMode_ || recordCtorMode_) && as->op == ":=" && as->target) {
                 std::string_view fname;
                 if (isThisFieldOrAutoPropTarget(*as->target, fname)) {
                     assignedFields_.insert(fname);
@@ -1665,8 +1729,14 @@ private:
     // visits). No-ops outside a constructor (`fieldsNeedingInit_` is empty). A
     // `this(...)` chain seeds every field as assigned (runConstructor), so a
     // delegating constructor reports nothing here. per §7.9, Appendix C.1
+    //
+    // fix #4001: `recordCtorMode_` reaches this gate too — a record
+    // constructor's own §7.9 obligation for a body field/auto-property
+    // (runRecordConstructor populates `fieldsNeedingInit_`/`assignedFields_`
+    // identically, minus the class-only observation gate). No-ops outside
+    // BOTH modes (`fieldsNeedingInit_` is empty then regardless).
     void checkCtorFieldCompletion(const SourceLocation* loc) {
-        if (!ctorMode_) return;
+        if (!ctorMode_ && !recordCtorMode_) return;
         for (auto n : fieldsNeedingInit_) {
             if (!assignedFields_.count(n)) {
                 SourceLocation sl;
@@ -2100,10 +2170,14 @@ bool hasOutParam(const std::vector<ast::Param>& params) {
 
 // `enclosing` is the type whose members are being walked (null for extension
 // members and top-level free code). §22.7 construction-time `this`-observation
-// checking runs only for a CLASS's non-static constructors — the same scope as
-// the O9 field-DA obligation (Ownership.cpp): records/interfaces/enums have no
-// base-first-construction/virtual-dispatch footgun, so their constructors get
-// the ordinary local-DA walk unchanged.
+// checking runs only for a CLASS's non-static constructors: records have no
+// base-first-construction/virtual-dispatch footgun for it to guard against.
+// Fix #4001 narrows that to observation-gating specifically — a record's
+// constructor DOES carry its own §7.9 field-completion obligation (below,
+// `runRecordConstructor`/`recordCtorMode_`), the same as the O9 field-DA
+// obligation Ownership.cpp enforces for a class with no explicit constructor
+// at all. Interfaces/enums/choices still get the ordinary local-DA walk
+// unchanged — neither §22.7 nor §7.9's field obligation applies to them.
 void checkMember(const ast::Member& m, SemaContext& ctx,
                  const ast::TypeDecl* enclosing) {
     if (auto* md = dynamic_cast<const ast::MethodDecl*>(&m)) {
@@ -2146,16 +2220,37 @@ void checkMember(const ast::Member& m, SemaContext& ctx,
             // and the §7.4/#2116 narrowing it underwrites apply to records too,
             // so the #2187 exploit reproduces on records (pre-existing SEGV).
             // Enable roCtorMode_ without the class-specific §22.7
-            // observation-gate or §7.9/§22.7 field-DA bookkeeping (records
-            // have neither). The fall-off and this-observation checks that
-            // runConstructor runs deliberately do NOT run for records: a record
-            // has no base-first-construction footgun (§22.7 rule 1) and no
-            // non-nullable-field obligation to discharge on fall-off (§7.9
-            // applies to class instances, not record values — records are
-            // value types with no per-instance non-nullable-field set to
-            // check). Static ctors on records (if admitted) are out of scope
-            // here — records typically have no static ctor surface; if one
-            // is added later, route it through runStaticConstructor analogously.
+            // observation-gate (records have no base-first-construction /
+            // virtual-dispatch footgun for gateObservation/checkVirtualDispatch
+            // to guard against, §22.7 rules 1-2 — genuinely class-specific).
+            //
+            // CORRECTED by fix #4001: an earlier revision of this comment
+            // additionally claimed "§7.9 applies to class instances, not
+            // record values — records are value types with no per-instance
+            // non-nullable-field set to check", and skipped the §7.9
+            // fall-off completeness check on that premise. That premise does
+            // not hold: §7.9's own text states the must-initialize rule
+            // generically over "every non-nullable field", and §9.4 confirms
+            // records are inside it by name — a record constructor's stores
+            // are "governed by §22.8's once-only and §7.9's definite-
+            // assignment machinery" (spec line ~1452). A record's non-
+            // nullable body field or auto-property left unassigned by every
+            // constructor is exactly §7.9's forbidden state, and `new R(...)`
+            // reading it back SIGSEGVs identically to the class case (three
+            // measured repros, issue #4001). `runRecordConstructor` now
+            // tracks the SAME `fieldsNeedingInit_`/`assignedFields_` §7.9
+            // obligation `runConstructor` tracks for classes and runs the
+            // same `checkCtorFieldCompletion` fall-off check
+            // (`recordCtorMode_`) — everything EXCEPT the observation gate,
+            // which stays class-only as this comment always correctly said.
+            // A record with NO explicit constructor at all is not visited
+            // here (there is no ConstructorDecl member to walk); that shape
+            // is screened separately at the type level, mirroring
+            // Ownership.cpp's `checkOwnedFieldDA` no-ctor screen for classes
+            // (see `checkRecordNoCtorFieldCompletion` below). Static ctors on
+            // records (if admitted) are out of scope here — records typically
+            // have no static ctor surface; if one is added later, route it
+            // through runStaticConstructor analogously.
             da.runRecordConstructor(*cd, *enclosing);
         } else {
             // Interfaces, enums, choices, and any remaining type — readonly
@@ -2180,8 +2275,66 @@ void checkMember(const ast::Member& m, SemaContext& ctx,
     }
 }
 
+// fix #4001 / §7.9: the record analogue of Ownership.cpp's `checkOwnedFieldDA`
+// no-ctor screen. `runRecordConstructor` (above) closes §7.9's obligation for
+// every DECLARED record constructor, but a record with NO explicit instance
+// constructor at all has no ConstructorDecl member for checkMember to visit —
+// the same shape Ownership.cpp's own comment names for classes ("a class with
+// such a field and no constructor at all — a shape this pass never visits").
+// A record's auto-generated positional constructor binds ONLY the declared
+// POSITIONAL fields (§9.1) — positional fields never appear in `rec.members`
+// (they ride `TypeDecl::positionalFields` instead, ast/Node.hpp), so this loop
+// naturally sees only §9.2 body storage; a body field or auto-property the
+// synthesized constructor does not bind is left at its zero-filled slot,
+// which is exactly the unset-non-nullable-field state §7.9 forbids (repro 1/2
+// of issue #4001: a combined-form record's explicit body field, and a body
+// record's `readonly property` auto-property, both with no user constructor
+// at all). Scoped to TOP-LEVEL record declarations only, mirroring
+// `checkOwnedFieldDA`'s own scope — a nested record (or class) with no
+// constructor is a pre-existing, shared gap in both passes (neither is called
+// from the NestedTypeMember branch of `checkMember`), filed separately as
+// issue #4011 rather than folded in here.
+void checkRecordNoCtorFieldCompletion(const ast::TypeDecl& rec,
+                                      SemaContext& ctx) {
+    bool hasInstanceCtor = false;
+    for (const auto& m : rec.members) {
+        if (auto* cd = dynamic_cast<const ast::ConstructorDecl*>(m.get())) {
+            if (!cd->isStatic) { hasInstanceCtor = true; break; }
+        }
+    }
+    // A record WITH an explicit instance constructor is fully covered by
+    // runRecordConstructor's own per-constructor fall-off check (every
+    // declared constructor is visited via checkMember); nothing to add here.
+    if (hasInstanceCtor) return;
+    for (const auto& m : rec.members) {
+        std::string_view name;
+        SourceLocation loc;
+        if (auto* f = dynamic_cast<const ast::FieldDecl*>(m.get())) {
+            if (!isSevenNineStrictField(*f, ctx)) continue;
+            name = f->name;
+            loc = f->span.begin;
+        } else if (auto* p = dynamic_cast<const ast::PropertyDecl*>(m.get())) {
+            if (!isSevenNineStrictAutoProp(*p, ctx)) continue;
+            name = p->name;
+            loc = p->span.begin;
+        } else {
+            continue;
+        }
+        ctx.diagnostics().report(
+            Severity::Error, loc,
+            std::string("non-nullable field `") + std::string(name) +
+                "` needs an initializer or a constructor that assigns it — "
+                "this record declares no constructor, so its auto-generated "
+                "positional constructor (which binds only the record's "
+                "positional fields, §9.1) leaves it unset (§7.9)");
+    }
+}
+
 void checkTopDecl(const ast::TopDecl& d, SemaContext& ctx) {
     if (auto* td = dynamic_cast<const ast::TypeDecl*>(&d)) {
+        if (td->kind == ast::TypeDeclKind::Record) {
+            checkRecordNoCtorFieldCompletion(*td, ctx);
+        }
         for (const auto& m : td->members) {
             if (m) checkMember(*m, ctx, td);
         }
