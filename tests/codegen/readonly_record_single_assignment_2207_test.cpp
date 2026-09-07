@@ -32,10 +32,18 @@
 // (no virtual dispatch from a non-sealed class's constructor) stays
 // genuinely class-only — records are implicitly sealed with no base class
 // (§9.6), so that footgun cannot arise for one. Every field this file's
-// records declare is **nullable** (`_f: string?`, `_stash: (() -> int)?`),
-// so none is §7.9-strict and rule 1's gate has nothing to observe here — the
-// readonly single-assignment tracker (the once-ness §22.8/#2187 enforces)
-// is the only mechanism exercised below, unaffected by either fix.
+// records declare is excluded from §7.9-strictness by one of two DIFFERENT
+// mechanisms, never by fix #4014 itself: `_f: string?`/`_stash: (() -> int)?`
+// are excluded because they are **nullable** (§7.9 only requires explicit
+// initialization of non-nullable storage), while `_f: int` (the
+// `double_assign_rejected`/`loop_assign_rejected` cases below) is excluded
+// because `int` is a **defaultable value type** (§17.11) — non-nullable, but
+// exempt from §7.9's must-initialize rule because it has a valid zero value
+// to fall back on. Neither shape is §7.9-strict, so `fieldsNeedingInit_` is
+// empty for every record in this file and rule 1's gate has nothing to
+// observe in any of it — the readonly single-assignment tracker (the
+// once-ness §22.8/#2187 enforces) is the only mechanism exercised below,
+// unaffected by either #4001 or #4014.
 
 #include "support/aot_support.hpp"
 #include "support/codegen_support.hpp"

@@ -45,6 +45,37 @@
 // diagnostic-free compile, every REJECT-arm test below uses
 // `failedAtCompileTimeWithRealLocation` (aot_result_asserts.hpp) rather than
 // a bare `!r.ran`, per this project's `check_ambiguous_ran_false.py` ratchet.
+//
+// FAIL-WITHOUT/PASS-WITH, precisely (correcting an overclaim in fix #4014's
+// own commit body, which said "all 12 ... are verified to fail" without the
+// fix — the true figure is 5 of 12). Reverting `DefiniteAssignment.cpp` to
+// its pre-#4014 state fails exactly the 5 REJECT-arm tests below —
+// `instance_method_call_before_field_assigned_rejected_spec_22_7`,
+// `implicit_this_call_before_field_assigned_rejected_spec_22_7`,
+// `computed_property_read_before_field_assigned_rejected_spec_22_7`,
+// `this_passed_as_argument_before_field_assigned_rejected_spec_22_7`, and
+// `virtual_record_method_before_assignment_rejected_by_rule1_not_rule2` — and
+// `class_control_instance_method_call_before_field_assigned_rejected` still
+// PASSES pre-fix too, being a class (unaffected by this fix either way). The
+// other 7 are ACCEPT-arm/control rows that correctly pass on BOTH sides of
+// the fix BY DESIGN, not because the fix reaches them:
+// `instance_method_call_after_field_assigned_accepted_spec_22_7` and
+// `virtual_record_method_after_assignment_accepted` (field already assigned
+// — the gate was never going to fire either way);
+// `lambda_capture_of_this_before_field_assigned_accepted_spec_22_7` (rule 3:
+// capture is never gated by rule 1, pre- or post-fix);
+// `field_initializer_satisfies_gate_at_entry_accepted_spec_22_7` (the field
+// carries an initializer, so it was never in `fieldsNeedingInit_` regardless
+// of `recordCtorMode_` reaching `gateObservation`);
+// `nullable_field_method_call_before_assignment_accepted_spec_7_9` (a
+// nullable field is never §7.9-strict, so it was never in
+// `fieldsNeedingInit_` either); and
+// `this_chaining_ctor_body_call_accepted_spec_22_7` (the chained-to
+// constructor's own §7.9 obligation already seeds every §7.9-strict field as
+// assigned at body entry, pre-#4001 and unchanged by #4014). Each of these 7
+// is an over-rejection GUARD per §15 of the lane rules, not evidence the fix
+// does anything — their value is proving the fix does NOT newly reject code
+// that should keep compiling, which the REJECT-arm count alone cannot show.
 
 #include "support/aot_result_asserts.hpp"
 #include "support/aot_support.hpp"
