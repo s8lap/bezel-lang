@@ -572,6 +572,7 @@ public:
                               const ast::TypeDecl& klass) {
         roCtorMode_ = true;
         staticCtorMode_ = true;
+        staticCtorType_ = &klass;
         for (const auto& m : klass.members) {
             if (auto* f = dynamic_cast<const ast::FieldDecl*>(m.get())) {
                 // fix #4015 / §7.9: a static field with no initializer is
@@ -817,6 +818,23 @@ private:
     // constructor, for static fields") applies exactly as for the instance
     // case.
     bool staticCtorMode_ = false;
+    // fix #4029 / §7.9: the enclosing type's OWN declaration, set for the
+    // duration of runStaticConstructor. §2.7 documents "the enclosing type's
+    // name" (`TypeName.X`) as a legitimate, spec-named way to reach a static
+    // member — not merely a fallback spelling — so the marking this drives
+    // (isOwnStaticMemberTarget) resolves the assignment target by SYMBOL,
+    // then checks the resolved member's declaring type against this pointer,
+    // rather than pattern-matching the target expression's AST shape (which
+    // cannot enumerate every legal spelling, `TypeName.X` included — the
+    // false reject issue #4029 measured). The identity check is not optional:
+    // `OtherType.Shared := v;` inside THIS type's static constructor must NOT
+    // be mistaken for assigning to THIS type's own `Shared`, and unlike
+    // `checkReadonlyOnceness`'s already-placement-restricted readonly-only
+    // targets, a §7.9 completion-tracked static field need not be `readonly`
+    // — nothing upstream restricts a mutable static field's writer to being
+    // "this type's own code", so a same-named field on a different type is a
+    // real, not merely theoretical, collision to guard against.
+    const ast::TypeDecl* staticCtorType_ = nullptr;
 
     // §22.4 (v0.181): short-circuit-sensitive definite-assignment state for a
     // boolean sub-expression. `afterTrue` / `afterFalse` are the sets of
@@ -1027,11 +1045,21 @@ private:
             // fix #4001 / §7.9: `recordCtorMode_` reuses this same bookkeeping
             // for a record constructor's own §7.9 obligation (see its
             // declaration) — a record has no observation gate to feed, only
-            // the fall-off completeness check this marks toward. fix #4015:
-            // `staticCtorMode_` reuses it identically for a static
-            // constructor's static-field completion obligation.
-            if ((ctorMode_ || recordCtorMode_ || staticCtorMode_) &&
-                as->op == ":=" && as->target) {
+            // the fall-off completeness check this marks toward. fix #4015 /
+            // #4029: `staticCtorMode_` reuses the SAME completion-tracking
+            // machinery, but through `isOwnStaticMemberTarget` — a DIFFERENT
+            // (symbol-identity, not AST-shape) predicate, since a static
+            // member's legal spellings include `TypeName.X` (§2.7), which no
+            // AST-shape match on the target enumerates soundly (see that
+            // function's own comment).
+            if (staticCtorMode_ && as->op == ":=" && as->target) {
+                std::string_view fname;
+                if (isOwnStaticMemberTarget(*as->target, fname)) {
+                    assignedFields_.insert(fname);
+                    return;
+                }
+            } else if ((ctorMode_ || recordCtorMode_) && as->op == ":=" &&
+                       as->target) {
                 std::string_view fname;
                 if (isThisFieldOrAutoPropTarget(*as->target, fname)) {
                     assignedFields_.insert(fname);
@@ -2219,42 +2247,110 @@ private:
         // property setter invocation and gates it as an observation. MEASURED:
         // `this.W := 5;` on an imported base's auto-property was rejected under
         // §22.7 while its single-module twin ran and returned 7.
-        if (auto* ps = dynamic_cast<PropertySymbol*>(sym)) {
-            if (ps->isIndexer) return false;
-            if (isAutoPropertyStorageSymbol(ps, ctx_)) {
+        if (auto* ps = dynamic_cast<PropertySymbol*>(sym))
+            if (!ps->isIndexer && isAutoPropertyStorageSymbol(ps, ctx_)) {
                 out = name;
                 return true;
             }
-            // fix #4015 / §7.9: `isAutoPropertyStorageSymbol` answers `false`
-            // for EVERY static property by its own documented contract
-            // (`hasAstAutoPropertyDecl`, SymbolCollection.cpp: "for auto mod :
-            // ps->modifiers if (mod == "static") return false;") — it
-            // classifies INSTANCE per-object backing-storage layout, which a
-            // static property's storage (one process-global slot, not part of
-            // any object's layout) never participates in. Reusing it verbatim
-            // here made a static constructor's `Shared := v;` on its OWN
-            // type's static auto-property invisible to this marking — a
-            // MEASURED false reject (the assignment compiled and ran fine,
-            // yet checkCtorFieldCompletion still reported it unassigned,
-            // c16/c17-shaped repros caught by self-review before this fix
-            // shipped). Scoped to `staticCtorMode_` only, so instance/record
-            // ctor marking (which must keep using the INSTANCE-storage
-            // question above) is untouched.
-            if (staticCtorMode_) {
-                auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
-                if (pd && !pd->isIndexer &&
-                    pd->bodyKind == ast::PropertyBodyKind::Auto) {
-                    bool isStatic = false, isAbstract = false;
-                    for (auto mod : ps->modifiers) {
-                        if (mod == "static") isStatic = true;
-                        else if (mod == "abstract") isAbstract = true;
-                    }
-                    if (isStatic && !isAbstract) {
-                        out = name;
-                        return true;
-                    }
-                }
+        return false;
+    }
+
+    // fix #4029 / §7.9 (supersedes the #4015-shipped `staticCtorMode_` branch
+    // this function's sibling `isThisFieldOrAutoPropTarget` briefly carried):
+    // the STATIC-mode marking predicate, deliberately SEPARATE from — and
+    // structurally different in KIND from — `isThisFieldOrAutoPropTarget`
+    // above. That function does AST-SHAPE matching (`this.X` / bare `X`) and
+    // is correct for instance/record marking because a receiver ambiguity
+    // exists there (another live object of the same type could be `other.X`)
+    // that only `this`/bare-name-implicit-this rules out. A static member has
+    // no such receiver: exactly one storage slot exists process-wide per
+    // (type, member) pair, so the question is never "which object" but
+    // "which TYPE" — and §2.7 documents `TypeName.X` as the named way to
+    // reach a static member, not a fallback spelling, so a shape-matching
+    // predicate that recognizes only `this.X`/bare `X` necessarily misses it
+    // (issue #4029's measured false reject: `TypeQ1B.Shared := "hello";`
+    // inside `StaticClassQ1B`'s own static constructor rejected as "does not
+    // initialize", identically for fields, auto-properties, and records).
+    //
+    // The fix routes through SYMBOL resolution instead of AST shape —
+    // `ctx_.exprSymbol(e)` answers "what member does this expression touch"
+    // for ANY spelling that resolves to one, `TypeName.X` included, mirroring
+    // the existing authority `checkReadonlyOnceness` already uses
+    // (`ctx_.exprSymbol(target)` with no shape restriction at all). Unlike
+    // that sibling check, this predicate cannot skip the TYPE-IDENTITY guard
+    // `checkReadonlyOnceness` gets to skip: `checkReadonlyOnceness` only ever
+    // sees a READONLY field's assignment target, and §22.8/ExprTypecheck.cpp's
+    // own placement check has ALREADY restricted where a readonly field may
+    // be assigned (only the declaring type's own constructor) by the time
+    // DefiniteAssignment.cpp runs — so receiver correctness there is an
+    // upstream invariant, not something this file re-derives. A §7.9
+    // completion-tracked static field need not be `readonly`, and NOTHING
+    // restricts who may write a mutable static field (`OtherType.Shared :=
+    // v;` is ordinary legal code from anywhere) — so without the identity
+    // check below, a same-NAMED static field on a DIFFERENT type would
+    // wrongly credit THIS type's own completion obligation and reintroduce
+    // exactly the unset-field SIGSEGV this whole fix exists to close.
+    //
+    // The identity check doubles as the fix for the SEAM-DEBT the identical
+    // reasoning implies (issue #4030): `ps->decl`/`fs->decl` is null for an
+    // IMPORTED symbol, but `staticCtorType_` is always the LOCAL ast::TypeDecl
+    // whose static constructor is being walked (a static constructor can only
+    // be authored for a type declared in THIS compilation) — so a member
+    // whose `parent->decl == staticCtorType_` cannot be an imported symbol,
+    // and the `ps->decl`-dependent auto-property check below runs only after
+    // that guard has already ruled the imported case out, rather than before
+    // it (as the superseded `isThisFieldOrAutoPropTarget` branch did).
+    // MEASURED with a two-module program (base declares a public static
+    // readonly field, importer's own unrelated same-named static field's
+    // static constructor references the BASE's qualified name): the identity
+    // check correctly declines to credit the importer's own field, and the
+    // importer's own field is (correctly) still reported as unassigned.
+    bool isOwnStaticMemberTarget(const ast::Expr& e, std::string_view& out) {
+        if (!staticCtorType_) return false;
+        Symbol* sym = ctx_.exprSymbol(e);
+        if (auto* fs = dynamic_cast<FieldSymbol*>(sym)) {
+            if (fs->parent &&
+                fs->parent->decl ==
+                    static_cast<const ast::Node*>(staticCtorType_)) {
+                out = fs->name;
+                return true;
             }
+            return false;
+        }
+        if (auto* ps = dynamic_cast<PropertySymbol*>(sym)) {
+            if (ps->isIndexer) return false;
+            if (!ps->parent ||
+                ps->parent->decl !=
+                    static_cast<const ast::Node*>(staticCtorType_))
+                return false;
+            // Past this point `ps` is provably a LOCAL member of
+            // `staticCtorType_` (see the comment above): a static constructor
+            // can only be authored for a type declared in THIS compilation,
+            // so `staticCtorType_` is always a local `ast::TypeDecl`, and
+            // `ps->parent->decl` equals it only when `ps->parent` IS that
+            // exact local TypeSymbol — an IMPORTED type's TypeSymbol has
+            // `decl == nullptr` (never a local AST pointer), so the guard
+            // above already excludes every imported `ps` before this line is
+            // reached; `ps->decl` cannot be null here. MEASURED with a
+            // two-module program (importer's own static constructor writes
+            // `ImportedType.SomeProperty := v;`, a genuinely imported
+            // PropertySymbol reaching this function): the guard above
+            // returns false without this line ever running, and the
+            // importer's own same-shaped field is correctly still reported
+            // unassigned (no false accept from a name collision either).
+            // SEAM-DEBT: #4030 read is guarded unreachable-for-imports by the identity check above, measured with a two-module program (see this comment)
+            auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
+            if (!pd || pd->isIndexer ||
+                pd->bodyKind != ast::PropertyBodyKind::Auto)
+                return false;
+            bool isStatic = false, isAbstract = false;
+            for (auto mod : ps->modifiers) {
+                if (mod == "static") isStatic = true;
+                else if (mod == "abstract") isAbstract = true;
+            }
+            if (!isStatic || isAbstract) return false;
+            out = ps->name;
+            return true;
         }
         return false;
     }

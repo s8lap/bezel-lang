@@ -389,6 +389,117 @@ BEZEL_TEST(sema_static_field_da_4015,
         17);
 }
 
+// =====================================================================
+// Issue #4029: the QUALIFIED `TypeName.X` spelling — §2.7 documents "the
+// enclosing type's name" as a legitimate, named way to reach a static member,
+// not a fallback. A prior revision of this fix recognized only `this.X`/bare
+// `X` as an assignment target inside a static constructor (an AST-shape
+// match, correct for the INSTANCE case but not general enough for statics,
+// which have no receiver ambiguity to rule out), so
+// `StaticClassQ1B.Shared := "hello";` inside `StaticClassQ1B`'s own static
+// constructor was rejected as "does not initialize" even though the
+// assignment ran and set the value correctly. Field, auto-property, and
+// record — the same shape the issue's own repro named.
+// =====================================================================
+
+BEZEL_TEST(sema_static_field_da_4015,
+           class_static_ctor_assigns_via_qualified_type_name_spec_2_7) {
+    BEZEL_EXPECT_EQ(runProg(
+        "module M; "
+        "public class StaticClassQ1B "
+        "  public static readonly Shared: string; "
+        "  static constructor() "
+        "    StaticClassQ1B.Shared := \"hello\"; "
+        "  end constructor; "
+        "end StaticClassQ1B; "
+        "class C "
+        "  public static method Main(): int "
+        "    return StaticClassQ1B.Shared.Length; "
+        "  end Main; "
+        "end C;"),
+        5);
+}
+
+BEZEL_TEST(
+    sema_static_field_da_4015,
+    class_static_ctor_assigns_autoprop_via_qualified_type_name_spec_2_7) {
+    BEZEL_EXPECT_EQ(runProg(
+        "module M; "
+        "public class StaticClassQ1B2 "
+        "  public static readonly property Shared: string; "
+        "  static constructor() "
+        "    StaticClassQ1B2.Shared := \"hello\"; "
+        "  end constructor; "
+        "end StaticClassQ1B2; "
+        "class C "
+        "  public static method Main(): int "
+        "    return StaticClassQ1B2.Shared.Length; "
+        "  end Main; "
+        "end C;"),
+        5);
+}
+
+BEZEL_TEST(sema_static_field_da_4015,
+           record_static_ctor_assigns_via_qualified_type_name_spec_2_7) {
+    BEZEL_EXPECT_EQ(runProg(
+        "module M; "
+        "public record StaticRecQ1B(X: int) "
+        "  public static readonly Shared: string; "
+        "  static constructor() "
+        "    StaticRecQ1B.Shared := \"hello\"; "
+        "  end constructor; "
+        "end StaticRecQ1B; "
+        "class C "
+        "  public static method Main(): int "
+        "    var r := new StaticRecQ1B(1); "
+        "    return StaticRecQ1B.Shared.Length; "
+        "  end Main; "
+        "end C;"),
+        5);
+}
+
+// =====================================================================
+// The collision guard the qualified-name fix REQUIRES: `isOwnStaticMemberTarget`
+// must verify the resolved member's DECLARING TYPE, not just its NAME, or a
+// same-named static field on a DIFFERENT type would wrongly credit THIS
+// type's own completion obligation. `NoZeroQ1C` (a zero-less enum, §17.11) is
+// §7.9-strict yet — unlike `string`/class-typed statics — admits a MUTABLE
+// (non-`readonly`) static field under §22.12 rule 2 form (iii) with only a
+// warning, so this program cannot be confounded with an unrelated §22.8
+// readonly-placement rejection: `OtherTypeQ1C.Shared := ...;` is ordinary,
+// unrestricted legal code, and the only thing that may legitimately excuse
+// `ThisTypeQ1C.Shared` from its own §7.9 obligation is an assignment that
+// actually touches ITS OWN storage.
+// =====================================================================
+
+BEZEL_TEST(sema_static_field_da_4015,
+           qualified_assign_to_different_type_same_name_still_rejected_spec_7_9) {
+    auto r = runAot(
+        "module M; "
+        "public enum NoZeroQ1C "
+        "  A := 1, B := 2; "
+        "end NoZeroQ1C; "
+        "public class OtherTypeQ1C "
+        "  public static Shared: NoZeroQ1C := NoZeroQ1C.A; "
+        "end OtherTypeQ1C; "
+        "public class ThisTypeQ1C "
+        "  public static Shared: NoZeroQ1C; "
+        "  static constructor() "
+        "    OtherTypeQ1C.Shared := NoZeroQ1C.B; "
+        "  end constructor; "
+        "end ThisTypeQ1C; "
+        "class C "
+        "  public static method Main(): int "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(
+        diagContains(r, "constructor does not initialize non-nullable "
+                        "field `Shared`"));
+    BEZEL_EXPECT_TRUE(diagContains(r, "§7.9"));
+}
+
 // A NULLABLE static field has a well-defined default (`null`) and is exempt
 // whether or not a static constructor exists.
 BEZEL_TEST(sema_static_field_da_4015,
