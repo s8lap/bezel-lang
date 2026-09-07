@@ -1583,6 +1583,21 @@ void Emitter::ensureOutVarSlots(const ast::CallExpr& call) {
                         llvm::ConstantPointerNull::get(ptrTy()), outSlot);
                     locals_[id2] = outSlot;
                     if (loc2 && loc2->decl) locals_[loc2->decl] = outSlot;
+                    // fix #3981 (§22.3/§22.4/§28.9/§28.11/§28.13, v0.294): the
+                    // `out using var` sibling of registerOutVarStringRelease's
+                    // wiring — see that function's comment for the mechanism.
+                    // This arm's disposal (sharedHandle / dynamicDispose below)
+                    // can be deferred past a suspend the same way the string
+                    // release can; without a frame field, `outSlot`'s
+                    // per-activation alloca is reset before the deferred
+                    // disposal reads it. Unconditionally safe: `outSlot` is
+                    // ALWAYS `ptr`-width here (entryAlloca(ptrTy()) a few lines
+                    // above), matching the field width
+                    // collectOutVarSuspendLocals reserves for an `out using var`
+                    // recipient, regardless of which disposal kind (or none, on
+                    // the erased-marker value-substitution path) ends up
+                    // registered below.
+                    mapSuspendLocalSlot(id2, outSlot);
                     // §28.1 (v0.196, #1860): at a value/runtime-managed
                     // substitution the `out owned T` marker is erased, so the
                     // recipient carries NO disposal obligation — dynamic-disposing
@@ -2101,6 +2116,22 @@ void Emitter::registerOutVarStringRelease(const ast::IdentifierExpr& id,
         formalTy->primitive != sema::PrimitiveType::String)
         return;
     if (!outVarStringReleaseEligible(&id)) return;                 // gate 4
+    // fix #3981 (§22.3/§22.4/§28.9, v0.294): inside a suspend-crossing body
+    // (a sync/async iterator or an async method), this disposal can be
+    // DEFERRED past a suspend point — the yield/await handler snapshots it
+    // and drains it on a LATER activation (§29.7's "one bind, one release,
+    // per element", possibly in different activations). Without a frame
+    // field, `slot`'s alloca is local to THIS activation and is silently
+    // reset by the next one, so the deferred release fires against null (a
+    // no-op) and the real pointer this activation produced leaks — measured
+    // 20500 B / 1000 allocations at 500 iterations (issue #3981). Every gate
+    // above just confirmed the FORMAL is non-nullable `string` — `ptr`-width
+    // — which is exactly the field width collectOutVarSuspendLocals reserved
+    // for this recipient (LlvmBackend_Iterators.cpp), so this is safe to wire
+    // unconditionally: outside a state machine, or when no field was
+    // reserved (a plain method body — collectOutVarSuspendLocals never ran),
+    // mapSuspendLocalSlot is a no-op.
+    mapSuspendLocalSlot(&id, slot);
     Disposal d{slot, nullptr};
     d.stringRelease = true;
     d.nullSlotAfterRelease = true;
@@ -2229,6 +2260,15 @@ void Emitter::registerCtorOutVarStringRelease(
         formalTy->primitive != sema::PrimitiveType::String)
         return;
     if (!outVarStringReleaseEligible(&id)) return;                 // gate 4
+    // fix #3981 (§22.3/§22.4/§28.9, v0.294): constructor-call sibling of the
+    // wiring added to registerOutVarStringRelease above — see that function's
+    // comment for the full mechanism (a suspend-crossing body can defer this
+    // disposal past a suspend point; without a frame field the recipient's
+    // per-activation alloca is reset first, losing the real pointer). Safe
+    // unconditionally for the same reason: gate 2 just confirmed the FORMAL
+    // is non-nullable `string`, matching the `ptr`-width field
+    // collectOutVarSuspendLocals reserved for this recipient.
+    mapSuspendLocalSlot(&id, slot);
     Disposal d{slot, nullptr};
     d.stringRelease = true;
     d.nullSlotAfterRelease = true;
@@ -2487,6 +2527,12 @@ void Emitter::ensureCtorOutVarSlots(const ast::NewExpr& ne,
                         llvm::ConstantPointerNull::get(ptrTy()), outSlot);
                     locals_[iduv] = outSlot;
                     if (locuv && locuv->decl) locals_[locuv->decl] = outSlot;
+                    // fix #3981 — constructor-call sibling of the wiring added
+                    // to ensureOutVarSlots' "out using var" arm above; same
+                    // reasoning (this arm's unconditional dynamicDispose can be
+                    // deferred past a suspend, and `outSlot` is unconditionally
+                    // `ptr`-width here).
+                    mapSuspendLocalSlot(iduv, outSlot);
                     const sema::TypeRef* recipTy =
                         (locuv && locuv->declType) ? locuv->declType
                                                    : ctx_.exprType(*iduv);

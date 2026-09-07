@@ -319,6 +319,231 @@ void Emitter::collectSuspendLocals(
 }
 
 
+namespace {
+// fix #3981 (§22.3/§22.4/§28.9, v0.294) — see the declaration comment
+// (LlvmBackend_impl.hpp) for WHY collectSuspendLocals above cannot also
+// answer this. Full statement + expression descent, mirroring
+// LambdaCollector's coverage (LlvmBackend_Layout.cpp) — an inline `out var x`
+// recipient can be buried at any expression position a CallExpr/NewExpr
+// reaches (a LocalDecl initializer, a bare ExpressionStmt, an `if` condition,
+// ...), not just the handful of statement shapes collectSuspendLocals
+// switches on.
+//
+// THE DEFECT THIS CLOSES. `ensureOutVarSlots` / `ensureCtorOutVarSlots`
+// (LlvmBackend_Calls2.cpp) allocate an inline out-family recipient's storage
+// with a bare `entryAlloca` — a stack slot local to ONE MoveNext/resume-fn
+// ACTIVATION — and register it for a SCOPE-END disposal (a `string` release
+// for plain `out var`; a `sharedHandle`/`dynamicDispose` for `out using var`)
+// that the yield/await handler may defer to a LATER activation (the one that
+// resumes past the suspend). Fix #2817 already solved exactly this for a
+// plain `var` string LOCAL by giving every LocalDecl a frame field
+// (collectSuspendLocals) so the per-suspend spill/restore (smAllocaToField_)
+// carries its value across; an inline out-var recipient never got the same
+// treatment because it is not a LocalDecl for collectSuspendLocals to find.
+// Without a frame field the recipient's alloca is silently RESET to its null
+// default by the resuming activation before the deferred disposal runs — the
+// disposal then fires against null (a documented no-op for every release/
+// dispose kind this backend has) and the real pointer this activation
+// actually produced is unreachable: leaked, not corrupted. Measured on the
+// issue's own `out var` repro: 20500 B / 1000 allocations at 500 iterations
+// under ASan/LSan; measured independently on an `out using var` sibling
+// (`OwningStack<T>.TryPop`) in the same venue: 8000 B / 500 allocations.
+//
+// CONSERVATIVELY BROAD ON PURPOSE, SAFELY SO. Every inline `out var` /
+// `out using var` recipient found here gets a reserved PTR-WIDE field — not
+// just a `string`-typed `out var` one — because narrowing the `out var` half
+// to "provably string" would require re-deriving the callee/formal-type
+// lookup `registerOutVarStringRelease`'s own gate 2 already owns (CLAUDE.md
+// rule 6: do not grow a second, drifting classification predicate). This is
+// safe, not merely convenient: reserving a field does nothing by itself —
+// only `mapSuspendLocalSlot` wires a reservation into `smAllocaToField_`, the
+// map the per-suspend spill/restore loop actually iterates, and this fix
+// calls `mapSuspendLocalSlot` from exactly four places: inside
+// `registerOutVarStringRelease` / `registerCtorOutVarStringRelease`, each
+// AFTER their own gate 2 has confirmed the recipient's FORMAL is non-nullable
+// `string` (therefore `ptr`-width); and inside `ensureOutVarSlots` /
+// `ensureCtorOutVarSlots`'s own `out using var` arms, which unconditionally
+// allocate `entryAlloca(ptrTy())` for that form regardless of callee (§22.4:
+// `out using var` is accepted only against an `out owned` class/interface
+// parameter — never a value type). A non-`out using var`, non-confirmed-
+// string `out var` recipient's reserved field is therefore permanently
+// UNWIRED and untouched by the spill/restore loop — inert struct padding,
+// never read or written — so a value-typed `out var` recipient (e.g. a
+// `Dictionary<K,V>.TryGetValue` value out-param, which can be wider than a
+// pointer) can never suffer the #461-class overflow a mismatched frame-field
+// width would otherwise risk.
+//
+// NOT collected here: the retired `out owned var` spelling (Bezel_For_Code_
+// Generation.md §22.4: "There is no `out owned var` spelling (retired
+// v0.289)" — dead modifier text no parser emits any more) and the pre-
+// declared `out owned` / bare `out` (isOutOwnedArgPosition) forms, which bind
+// an ALREADY-EXISTING LocalDecl's own slot — collectSuspendLocals already
+// frame-backs that slot for the same reason it frame-backs any other local.
+struct OutVarSlotCollector {
+    std::vector<std::pair<const ast::Node*, llvm::Type*>>& out;
+    llvm::Type* fieldTy;
+
+    void considerArgs(const std::vector<ast::CallArgument>& args) {
+        for (auto& a : args) {
+            if (!a.value) continue;
+            // fix #3981: "out var" (registerOutVarStringRelease /
+            // registerCtorOutVarStringRelease's `string` disposal) and
+            // "out using var" (ensureOutVarSlots' / ensureCtorOutVarSlots'
+            // unconditional sharedHandle/dynamicDispose) are the two inline
+            // out-family forms this backend still allocates a bare
+            // entryAlloca(ptrTy()) for and may register a deferrable scope-end
+            // disposal on. ("out owned var" was retired at v0.289 — Bezel_For_
+            // Code_Generation.md §22.4 — so it is not collected here; the
+            // pre-declared "out owned"/"out" forms bind a LocalDecl's OWN slot,
+            // which collectSuspendLocals already frame-backs.)
+            if (a.modifier != "out var" && a.modifier != "out using var")
+                continue;
+            if (auto* id =
+                    dynamic_cast<const ast::IdentifierExpr*>(a.value.get()))
+                out.push_back({id, fieldTy});
+        }
+    }
+
+    // Mirrors LambdaCollector's expression descent (LlvmBackend_Layout.cpp)
+    // exactly, with one deliberate difference: a CallExpr/NewExpr's own
+    // argument list is inspected for an `out var` recipient (considerArgs)
+    // before descending into each argument value.
+    void expr(const ast::Expr* e) {
+        if (!e) return;
+        // A lambda body compiles as its own function with its own suspend/
+        // frame domain (if any) — its out-var call sites are that frame's
+        // business, not this one's. Do not descend.
+        if (dynamic_cast<const ast::LambdaExpr*>(e)) return;
+        if (auto* m = dynamic_cast<const ast::MemberAccessExpr*>(e)) {
+            expr(m->target.get()); return; }
+        if (auto* m = dynamic_cast<const ast::NullCondMemberExpr*>(e)) {
+            expr(m->target.get()); return; }
+        if (auto* c = dynamic_cast<const ast::CallExpr*>(e)) {
+            expr(c->callee.get());
+            considerArgs(c->args);
+            for (auto& a : c->args) expr(a.value.get());
+            return; }
+        if (auto* c = dynamic_cast<const ast::NullCondCallExpr*>(e)) {
+            expr(c->callee.get());
+            considerArgs(c->args);
+            for (auto& a : c->args) expr(a.value.get());
+            return; }
+        if (auto* ix = dynamic_cast<const ast::IndexExpr*>(e)) {
+            expr(ix->target.get());
+            for (auto& a : ix->indices) expr(a.value.get());
+            return; }
+        if (auto* b = dynamic_cast<const ast::BinaryExpr*>(e)) {
+            expr(b->left.get()); expr(b->right.get()); return; }
+        if (auto* u = dynamic_cast<const ast::UnaryExpr*>(e)) {
+            expr(u->operand.get()); return; }
+        if (auto* p = dynamic_cast<const ast::PostfixBangExpr*>(e)) {
+            expr(p->operand.get()); return; }
+        if (auto* t = dynamic_cast<const ast::TypeTestExpr*>(e)) {
+            expr(t->operand.get()); return; }
+        if (auto* c = dynamic_cast<const ast::ConditionalExpr*>(e)) {
+            expr(c->condition.get()); expr(c->thenValue.get());
+            expr(c->elseValue.get()); return; }
+        if (auto* t = dynamic_cast<const ast::ThrowExpr*>(e)) {
+            expr(t->operand.get()); return; }
+        if (auto* r = dynamic_cast<const ast::RangeExpr*>(e)) {
+            expr(r->lo.get()); expr(r->hi.get()); expr(r->step.get());
+            return; }
+        if (auto* n = dynamic_cast<const ast::NewExpr*>(e)) {
+            considerArgs(n->args);
+            for (auto& a : n->args) expr(a.value.get());
+            return; }
+        if (auto* w = dynamic_cast<const ast::WithExpr*>(e)) {
+            expr(w->source.get());
+            for (auto& a : w->assigns) expr(a.value.get());
+            return; }
+        if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(e)) {
+            for (auto& el : cl->elements) expr(el.get());
+            for (auto& k : cl->keys) expr(k.get());
+            return; }
+        if (auto* is = dynamic_cast<const ast::InterpolatedStringExpr*>(e)) {
+            for (auto& part : is->parts) expr(part.expr.get());
+            return; }
+        if (auto* ce = dynamic_cast<const ast::CaseExpr*>(e)) {
+            expr(ce->scrutinee.get());
+            for (auto& arm : ce->arms) {
+                expr(arm.guard.get());
+                expr(arm.exprBody.get());
+                for (auto& s : arm.stmts) stmt(s.get());
+            }
+            return; }
+        // Literals and other leaf expressions: nothing to do.
+    }
+
+    void stmt(const ast::Stmt* s) {
+        if (!s) return;
+        if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s)) {
+            expr(ld->initializer.get()); return; }
+        if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(s)) {
+            expr(lc->value.get()); return; }
+        if (auto* r = dynamic_cast<const ast::ReturnStmt*>(s)) {
+            expr(r->value.get()); return; }
+        if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(s)) {
+            expr(es->expr.get()); return; }
+        if (auto* ts = dynamic_cast<const ast::ThrowStmt*>(s)) {
+            expr(ts->value.get()); return; }
+        if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(s)) {
+            expr(as->target.get()); expr(as->value.get()); return; }
+        if (auto* inc = dynamic_cast<const ast::IncrementStmt*>(s)) {
+            expr(inc->target.get()); return; }
+        if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(s)) {
+            expr(ds->value.get()); return; }
+        if (auto* ys = dynamic_cast<const ast::YieldStmt*>(s)) {
+            expr(ys->value.get()); return; }
+        if (auto* is = dynamic_cast<const ast::IfStmt*>(s)) {
+            expr(is->ifBranch.condition.get());
+            for (auto& b : is->ifBranch.body) stmt(b.get());
+            for (auto& br : is->elifBranches) {
+                expr(br.condition.get());
+                for (auto& b : br.body) stmt(b.get());
+            }
+            for (auto& b : is->elseBody) stmt(b.get());
+            return; }
+        if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s)) {
+            expr(ws->condition.get());
+            for (auto& b : ws->body) stmt(b.get());
+            return; }
+        if (auto* fs = dynamic_cast<const ast::ForStmt*>(s)) {
+            expr(fs->iterable.get()); expr(fs->withExpr.get());
+            for (auto& b : fs->body) stmt(b.get());
+            return; }
+        if (auto* d = dynamic_cast<const ast::DoEndBlock*>(s)) {
+            for (auto& b : d->body) stmt(b.get());
+            return; }
+        if (auto* ts = dynamic_cast<const ast::TryStmt*>(s)) {
+            for (auto& b : ts->body) stmt(b.get());
+            for (auto& c : ts->catches) {
+                expr(c.guard.get());
+                stmt(c.body.get());
+            }
+            for (auto& b : ts->finallyBody) stmt(b.get());
+            return; }
+        if (auto* cs = dynamic_cast<const ast::CaseStmt*>(s)) {
+            expr(cs->scrutinee.get());
+            for (auto& arm : cs->arms) {
+                expr(arm.guard.get());
+                expr(arm.exprBody.get());
+                for (auto& a : arm.stmts) stmt(a.get());
+            }
+            return; }
+        // BreakStmt / ContinueStmt: no sub-expressions.
+    }
+};
+}  // namespace
+
+
+void Emitter::collectOutVarSuspendLocals(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body,
+        std::vector<std::pair<const ast::Node*, llvm::Type*>>& out) {
+    OutVarSlotCollector c{out, ptrTy()};
+    for (auto& s : body) c.stmt(s.get());
+}
+
+
 Emitter::StateMachineFrame Emitter::buildStateMachineFrame(
     sema::MethodSymbol* ms,
     const std::vector<std::unique_ptr<ast::Stmt>>& body,
@@ -358,6 +583,14 @@ Emitter::StateMachineFrame Emitter::buildStateMachineFrame(
     // captured (cell-boxed) so collectSuspendLocals plans ptr-typed fields.
     computeFrameCapturedLocals(body);
     collectSuspendLocals(body, frame.bodyLocals);
+    // fix #3981 (§22.3/§22.4/§28.9, v0.294): reserve a field for every inline
+    // `out var` recipient too — collectSuspendLocals cannot see one (see its
+    // declaration comment and collectOutVarSuspendLocals's own comment for
+    // why). Appended after the LocalDecl/ForStmt fields collectSuspendLocals
+    // already planned; nothing downstream indexes into bodyLocals by a fixed
+    // offset before this point, only by walking frame.localFields, so the
+    // append order is not load-bearing.
+    collectOutVarSuspendLocals(body, frame.bodyLocals);
 
     // Build state struct type:
     //   { ptr vtable, i32 state, captures..., locals..., extraTrailing... }

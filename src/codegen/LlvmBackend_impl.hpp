@@ -10983,6 +10983,26 @@ private:
         const std::vector<std::unique_ptr<ast::Stmt>>& body,
         std::vector<std::pair<const ast::Node*, llvm::Type*>>& out);
 
+    // fix #3981 (§22.3/§22.4/§28.9/§28.11/§28.13, v0.294): companion to
+    // collectSuspendLocals above for a recipient collectSuspendLocals
+    // structurally cannot see — an inline `out var x` / `out using var x`
+    // recipient is not a LocalDecl/LocalConstDecl/ForStmt at all
+    // (collectSuspendLocals switches on STATEMENT KIND and never looks inside
+    // a statement's own EXPRESSION tree), so a full expression descent is
+    // needed to find one buried in a CallExpr/NewExpr argument list. Reserves
+    // a PTR-WIDE field per recipient found (both forms always allocate their
+    // slot as `ptr` — the `out var` string case via registerOutVarString-
+    // Release/registerCtorOutVarStringRelease, the `out using var` case
+    // unconditionally in ensureOutVarSlots/ensureCtorOutVarSlots; see the
+    // definition for why over-collecting a non-string `out var` recipient
+    // here is inert, not unsafe). Does not descend into a nested LambdaExpr's
+    // body: that body compiles as its own function with its own suspend/frame
+    // domain, if any. See collectOutVarSuspendLocals's definition
+    // (LlvmBackend_Iterators.cpp) for the full mechanism this closes.
+    void collectOutVarSuspendLocals(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body,
+        std::vector<std::pair<const ast::Node*, llvm::Type*>>& out);
+
     // §29.3 / §30.2 (#2132): inside a state-machine body (iterator or async), a
     // suspend-live local's alloca must be mapped to its reserved frame field via
     // smAllocaToField_, or the per-suspend spill/restore (emitAwaitSuspend / the
