@@ -341,29 +341,50 @@ end Run;                        // logger disposed ⇒ its sender closes
 
 ### 4.3 First real customer — the 0002 HTTP server
 
-The point this makes is the **wiring**: the server takes an `ILogger` by constructor from the composition root — no container, exactly the shape 0002 §2.1 already uses for its dependencies (D-0001).
+The point this makes is the **wiring**: the server takes an `ILogger` by constructor from the composition root — no container, exactly the shape 0002 §2 uses for its dependencies (D-0001).
 
 ```bezel
 import System.Diagnostics;
-import System.Collections.Generic;   // Dictionary is NOT auto-imported (spec §2.3 auto-imports only System / System.Text)
+import System.Threading;             // Locked<T> (stdlib §6.11). Dictionary and Shared<T> are auto-imported (v0.289; stdlib §2.16).
+import System.Net.Http;
 
-public async method Main(): Task<int>
-  await using var hub := new LogHub(new ConsoleSink(), minLevel := LogLevel.Info);
-  var pump := hub.RunAsync();                       // the sink loop, concurrent with the server
+// One sendable object per worker (spec §30.14: sealed, every field an owned sendable class).
+// The logger is a constructor dependency, carried as an owned field — no container (D-0001).
+public sealed class WorkerDeps
+  public owned readonly Todos: Shared<Locked<Dictionary<int, Todo>>>;
+  public owned readonly Log: ChannelLogger;
+  public constructor(owned todos: Shared<Locked<Dictionary<int, Todo>>>, owned log: ChannelLogger)
+    Todos := todos;  Log := log;
+  end constructor;
+end WorkerDeps;
 
-  var app := new HttpApp();
-  // the logger is a constructor dependency of the service object (an owned field):
-  var api := new TodoApi(new Dictionary<int, Todo>(), hub.NewLogger("Http"));
-  app.Get("/todos/{id}", api.GetById);
+public sealed class Api: IHttpService
+  private owned readonly _deps: WorkerDeps;               // the root service owns the deps — and so the logger
+  private owned readonly _routes: RouteTable := new();    // declared last: disposed before _deps (0002 §4.1)
+  public property Routes: RouteTable => _routes;
+  public constructor(owned deps: WorkerDeps)
+    _deps := deps;
+    _routes.Mount("/todos", new TodoApi(_deps.Todos.Clone(), _deps.Log));   // the child borrows the ILogger (0002 §2)
+  end constructor;
+  public static method Create(owned deps: WorkerDeps): owned Api => new Api(move deps);
+end Api;
 
-  var code := await app.Listen(port := 8080);       // serves until Stop()/signal
-  api.Dispose();                                     // server done ⇒ its ChannelLogger disposes ⇒ channel closes
-  await pump;                                         // sink drains and returns
-  return code;
-end Main;
-```
+public static class Program
+  public static async method Main(): Task<int>
+    await using var hub := new LogHub(new ConsoleSink(), minLevel := LogLevel.Info);
+    var pump := hub.RunAsync();                       // the sink loop, concurrent with the server
+    using var todos := new Shared<Locked<Dictionary<int, Todo>>>(
+        new Locked<Dictionary<int, Todo>>(new Dictionary<int, Todo>()));
+    // `deps` runs on this domain once per worker; each result is moved into worker i and handed to
+    // Api.Create there (0002 §3, §4.2). Main holds no logger, so the channel closes with the last worker.
+    var code := await HttpServer.Listen(port := 8080, service := Api.Create,
+        deps := lambda(i) => new WorkerDeps(todos.Clone(), hub.NewLogger($"http-{i}")));   // serves until Stop()
+    await pump;                                       // every worker's ChannelLogger disposed ⇒ channel closed ⇒ sink drains
+    return code;
+  end Main;
+end Program;
 
-Inside a handler the logger is a field of the service object (`_log.Error("create failed", cause := ex)` on a caught fault); the 0002 `OnError` hook receives the same `ExceptionInfo` snapshot (§31.4) that `ILogger.Log`'s `cause` becomes — one exception-snapshot discipline across both APIs. The precise sink-loop lifecycle (who runs `RunAsync`, and when the channel closes) is the subject of open question #2 — the shape above keeps `RunAsync` on the composition-root domain, which is the spec-canonical §30.15 arrangement (the receiving domain owns the channel).
+Inside a handler the logger is a field of the service object (`_log.Error("create failed", cause := ex)` on a caught fault); a 0002 `Around` hook that catches a handler fault logs it through the same `cause` channel (`_deps.Log.Error(…, cause := ex)`), and the dispatcher's own 500 report is a §31.4 snapshot — one exception-snapshot discipline across both APIs. The precise sink-loop lifecycle (who runs `RunAsync`, and when the channel closes) is the subject of open question #2 — the shape above keeps `RunAsync` on the composition-root domain, which is the spec-canonical §30.15 arrangement (the receiving domain owns the channel).
 
 ## 5. Declined alternatives
 
