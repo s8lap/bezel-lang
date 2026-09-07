@@ -9048,8 +9048,18 @@ llvm::Value* Emitter::buildRecordValue(
     sema::ConstructorSymbol* explicitCs = ctorForArgs(t, args);
     bool skipPreambleFieldInit = false;
     if (explicitCs) {
-        if (auto* explicitCd =
-                dynamic_cast<const ast::ConstructorDecl*>(explicitCs->decl)) {
+        // This read is AST-gated, so it answers "not chaining" for every
+        // IMPORTED record: `ConstructorSymbol::decl` is nullptr across a
+        // module boundary (the #3152/#3911 seam — the SAME nullptr the #3671
+        // comment further down documents for an imported body member). Both
+        // #4013 and #4019 are therefore fixed on the LOCAL axis only; the
+        // imported twin is filed as #4022 and wants a wire-format channel for
+        // the chain bit (the `dtorBodyText` precedent, cf. #3916) rather than
+        // a deeper AST read.
+        // SEAM-DEBT: #4022 nullptr for an imported record, so this answers
+        // "not chaining" across a module boundary.
+        if (auto* explicitCd = dynamic_cast<const ast::ConstructorDecl*>(
+                explicitCs->decl)) {
             bool peekIsThis = false;
             if (!explicitCd->body.empty() &&
                 chainCallOf(*explicitCd->body[0], peekIsThis) && peekIsThis) {

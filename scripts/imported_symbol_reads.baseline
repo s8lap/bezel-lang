@@ -19,7 +19,7 @@
 1    src/ownership/Ownership_Checks.cpp
 1    src/sema/EnumValues.hpp
 4    src/sema/ExprTypecheck_Calls.cpp
-6    src/sema/ExprTypecheck_Exprs.cpp
+5    src/sema/ExprTypecheck_Exprs.cpp
 1    src/sema/PureChecker.cpp
 3    src/sema/SymbolCollection.cpp
 1    src/sema/TypeResolution_Names.cpp
@@ -36,7 +36,7 @@
 29   src/codegen/LlvmBackend_Calls2.cpp
 3    src/codegen/LlvmBackend_Disposal.cpp
 8    src/codegen/LlvmBackend_Exprs.cpp
-8    src/codegen/LlvmBackend_Exprs2.cpp
+9    src/codegen/LlvmBackend_Exprs2.cpp
 3    src/codegen/LlvmBackend_Layout.cpp
 8    src/codegen/LlvmBackend_Serialization.cpp
 10   src/codegen/LlvmBackend_Setup.cpp
