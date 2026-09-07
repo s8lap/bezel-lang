@@ -28,16 +28,34 @@
 //
 // ── ORACLE CHOICE ────────────────────────────────────────────────────────
 //
-// The pre-fix failure is a COMPILER CRASH (an LLVM IR verifier failure), not
-// merely a missing diagnostic — `r.ran == false` is true on BOTH sides (a
-// crash also leaves `ran == false`), so a bare `EXPECT_FALSE(r.ran)` would
-// pass vacuously whether the fix is present or not, and would also pass
-// `check_ambiguous_ran_false.py`'s ratchet incorrectly. Every rejection
-// assertion below therefore uses `failedAtCompileTimeWithRealLocation`
-// (`tests/support/aot_result_asserts.hpp`) — which explicitly EXCLUDES a
-// crash/signal/timeout/ASan outcome — AND additionally checks the specific
-// §19.3 diagnostic text, so a row can only pass if the compiler produced
-// exactly the intended clean rejection.
+// ⚠ CORRECTION (found in review, verified independently before recording
+// here): the pre-fix failure is NOT uniformly a compiler crash across all
+// four rejection rows below. Three rows (the class, record, and chained
+// cases) pre-fix ARE an LLVM IR verifier crash. The FOURTH,
+// `alias_in_per_slot_alt_rejected_not_crashed`, pre-fix instead COMPILES
+// CLEAN and RUNS, deterministically returning a wrong value (`1`) — a
+// silent-wrong-answer failure, not a crash, on that one row specifically.
+// (Measured directly: its own FAIL-WITHOUT run shows BOTH
+// `failedAtCompileTimeWithRealLocation` and the diagnostic-text assertion
+// failing together — the location-based helper's first check is
+// `if (r.ran) return false;`, and it returned false, so `r.ran` was true —
+// where the three crash rows fail on the diagnostic-text assertion ALONE,
+// with the location-based helper already passing.) This is exactly why the
+// helper needed pairing with the diagnostic-text check in the first place
+// (see below) — the two pre-fix failure MODES (crash vs. silent-wrong-value)
+// are both closed by asserting the specific §19.3 text, even though only
+// three of the four rows are actually crash-shaped.
+//
+// The general shape below still holds for the crash rows: a bare
+// `EXPECT_FALSE(r.ran)` would pass vacuously whether the fix is present or
+// not for THOSE three (a crash also leaves `ran == false`), so a bare
+// `EXPECT_FALSE(r.ran)` would also pass `check_ambiguous_ran_false.py`'s
+// ratchet incorrectly. Every rejection assertion below therefore uses
+// `failedAtCompileTimeWithRealLocation` (`tests/support/aot_result_asserts.hpp`)
+// — which explicitly EXCLUDES a crash/signal/timeout/ASan outcome — AND
+// additionally checks the specific §19.3 diagnostic text, so a row can only
+// pass if the compiler produced exactly the intended clean rejection,
+// regardless of which pre-fix failure mode it started from.
 
 #include "support/aot_result_asserts.hpp"  // failedAtCompileTimeWithRealLocation
 #include "support/aot_support.hpp"         // runAot
@@ -147,6 +165,16 @@ BEZEL_TEST(type_alias_pattern_alternative_4048,
 // ⚠ Same both-members-must-be-aliases discipline as the chained-alias test
 // above — two DISTINCT alias-of-class members, no direct class name mixed
 // in.
+//
+// ⚠ CORRECTION (see "ORACLE CHOICE" above): unlike the other three
+// rejection rows in this file, this one's PRE-FIX failure mode is NOT a
+// compiler crash — it compiles clean and runs, deterministically returning
+// `1` (a silent wrong value: the malformed per-slot alternative is
+// misclassified as an admissible-but-unfoldable constant member and the
+// arm matches unconditionally, rather than failing to lower). The test
+// name is kept for consistency with its siblings (all four rows share the
+// "not crashed" framing describing the POST-fix guarantee), but do not
+// infer from the name that this row's pre-fix symptom was itself a crash.
 BEZEL_TEST(type_alias_pattern_alternative_4048,
            alias_in_per_slot_alt_rejected_not_crashed) {
     auto r = runAot(
