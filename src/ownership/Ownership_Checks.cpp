@@ -585,8 +585,57 @@ void MethodOwnership::recordMovesIn(const ast::Expr& e) {
         if (be->right) recordMovesIn(*be->right);
         return;
     }
+    // fix #4003 (§28.3, v0.294): a bare structural wrapper — `expr.member`,
+    // `expr?.member`, `expr[i]`, `expr!` — around an owned-arg-consuming
+    // `new`/call is otherwise INVISIBLE to this walk: with no arm for the
+    // wrapper kind, the dynamic_cast chain falls off the end doing nothing,
+    // so the wrapped `new T(move x)` / `f(move x)` one level down is never
+    // reached and its `move` is never validated (a disposed/already-moved
+    // source is silently accepted) or recorded (the source is never
+    // transitioned to MovedFrom). Each arm below simply recurses into the
+    // substructure exactly as `checkRead`'s twin arm already does for the
+    // read side (`MethodOwnership::checkRead`'s own `MemberAccessExpr` /
+    // `PostfixBangExpr` / `IndexExpr` arms, further down this file) —
+    // recordMovesIn had no analogous arm for any of them. Measured: `var y := (new
+    // Holder(move x)).v;` on an already-`Dispose()`d `x` compiled with
+    // ZERO diagnostics and SEGV'd under ASan reading freed memory inside
+    // the constructor (`bz$M.Holder$ctor`); the byte-identical `using var
+    // h := new Holder(move x);` spelling was and remains correctly
+    // rejected ("cannot move from disposed local `x`"). The identical
+    // shape reproduces through `IndexExpr` (a constructed indexer
+    // receiver), `PostfixBangExpr` and `NullCondMemberExpr` (a `!`/`?.`
+    // immediately following an owned-consuming call), and `NullCondCallExpr`
+    // (a null-conditional invocation `f?(move x)` of a nullable
+    // owned-parameter callable) — five confirmed SEGV repros, one fix
+    // pattern.
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+        if (ma->target) recordMovesIn(*ma->target);
+        return;
+    }
+    if (auto* nm = dynamic_cast<const ast::NullCondMemberExpr*>(&e)) {
+        if (nm->target) recordMovesIn(*nm->target);
+        return;
+    }
+    if (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(&e)) {
+        if (pb->operand) recordMovesIn(*pb->operand);
+        return;
+    }
+    if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&e)) {
+        if (ix->target) recordMovesIn(*ix->target);
+        // §15.3 (mirrors checkRead's IndexExpr arm, #1928 half a): every
+        // index sub-expression is itself an owned-consuming position — a
+        // `owned`-typed indexer parameter is legal, so `arr[move x]` is a
+        // real (if unusual) move site.
+        for (const auto& idx : ix->indices)
+            if (idx.value) recordMovesIn(*idx.value);
+        return;
+    }
     if (auto* call = dynamic_cast<const ast::CallExpr*>(&e)) {
         recordMovesInArgs(call->args, call->callee.get());
+        return;
+    }
+    if (auto* nc = dynamic_cast<const ast::NullCondCallExpr*>(&e)) {
+        recordMovesInArgs(nc->args, nc->callee.get());
         return;
     }
     // A constructor call `new T(owned x)` / `new T(move x)` consumes its
