@@ -9342,7 +9342,44 @@ llvm::Value* Emitter::buildRecordValue(
     // §22.5 / #540: named arguments on a positional record are also handled
     // here by reordering the supplied args to field-declaration order before
     // the field stores, mirroring buildOrderedArgs for class constructors.
-    if (!hasAnyConstructor(t) && !args.empty() && args.size() <= fields.size()) {
+    //
+    // fix #4039 (§9.1/§9.3, v0.294): the second disjunct widens this gate for
+    // a COMBINED-FORM record that ALSO declares an explicit constructor of a
+    // DIFFERENT arity (`hasAnyConstructor(t)` true). Per §9.3, "[t]he auto-
+    // generated members are present and the body adds further members" — the
+    // only listed constructor conflict is a body ctor sharing the primary's
+    // exact parameter list — so a different-arity secondary constructor does
+    // not retire the auto-generated primary constructor, and a call whose
+    // arity matches the POSITIONAL fields must still be able to reach it.
+    // Before this fix `hasAnyConstructor(t)` disabled this path unconditionally
+    // (no arity check of its own), and `explicitCs` above (fix #4019's hoisted
+    // `ctorForArgs(t, args)`, REUSED here rather than calling it a second
+    // time, CLAUDE.md §6) correctly finds no EXPLICIT match for such a call
+    // either — so BOTH of this function's construction paths were skipped and
+    // it fell to the `else if (!args.empty())` failure arm at the bottom,
+    // which used to return a bare `nullptr` (see that arm's #4039 comment for
+    // the resulting silent Warning-then-SIGSEGV). Widening is gated STRICTLY
+    // to the case that is provably sound without depending on the record's
+    // own field-completion checking (issue #4001, separately tracked, not
+    // fixed here): a record whose TOTAL storage (`fields`, positional + body)
+    // is EXACTLY its positional fields (`sema::recordPositionalFieldSymbols`)
+    // has no body storage this path could leave uninitialized, so there is
+    // nothing for §7.9 to say about a shape this narrow — every other
+    // combined-form shape (a body field/auto-property beyond the positional
+    // set) still falls through to that arm's Error, which is the correct,
+    // sound answer for a shape codegen cannot prove complete on its own
+    // (§9.3's own "combined form" text says nothing about implicit field
+    // completeness — §7.9 owns that, and #4001 is where it is being closed).
+    // `args.size() == fields.size()` (rather than the pre-existing `<=`) is
+    // exact-arity for this branch specifically, since `fields.size() ==
+    // posFieldCount` here makes the two bounds the same value; the
+    // pre-existing `!hasAnyConstructor(t)` arm's own `<=` bound is untouched.
+    const std::size_t recPosFieldCount =
+        sema::recordPositionalFieldSymbols(t).size();
+    if (!args.empty() && args.size() <= fields.size() &&
+        (!hasAnyConstructor(t) ||
+         (fields.size() == recPosFieldCount && args.size() == fields.size() &&
+          explicitCs == nullptr))) {
         // fix #2464: the positional fields are the TRAILING args.size()
         // entries of `fields` (see the comment above) — never fields[0..N).
         std::vector<const sema::Symbol*> posFields(
@@ -9702,8 +9739,88 @@ llvm::Value* Emitter::buildRecordValue(
                                      /*emit=*/!diverged_);
         emitPendingCheck();  // §28: a constructor may throw
     } else if (!args.empty()) {
-        // Arguments were supplied but no constructor accepts them — fall
-        // back to a failure so the caller does not silently drop them.
+        // fix #4039 (§9.1/§9.3, v0.294): arguments were supplied but no
+        // constructor accepts them. Before reporting anything, narrow to
+        // the SPECIFIC #4039 shape — `recPosFieldCount > 0 && args.size()
+        // == recPosFieldCount` — rather than every call that reaches this
+        // arm. This function is reached by every record, including a
+        // BODY-ONLY record with zero positional fields whose sole
+        // construction route is an explicit constructor; for that shape,
+        // reaching here means `ctorForArgs` (== `explicitCs` above) failed
+        // to match an EXPLICIT constructor for a reason unrelated to
+        // #4039 (e.g. `ctorForArgs`'s `typeClassOf` — LlvmBackend_impl.hpp
+        // — classes `int` and `decimal` differently, so an int-literal
+        // argument against a `decimal`-typed explicit parameter is
+        // rejected as a type mismatch even though it is a legal §5.1
+        // constant-narrowing conversion — MEASURED via
+        // tests/lit/sema/sema_record_equality__validating_ctor_eq_accepted_v0182_1572.bzl's
+        // `record Rectangle { …; constructor(width: decimal, height:
+        // decimal) … }` called as `new Rectangle(3, 4)`). That is a real,
+        // separate, pre-existing silent-degrade defect (filed as #4046,
+        // not fixed here — out of scope for #4039, which is specifically
+        // about a POSITIONAL-field record's OWN auto-generated constructor
+        // being blocked by an unrelated-arity sibling), and promoting ITS
+        // silent Warning to an Error here would be exactly the false
+        // widening #2434's own comment warns against — MEASURED to
+        // regress that lit test's `bezelc -c` from exit 0 to exit 1 when
+        // this narrowing was not yet in place.
+        //
+        // For the narrowed #4039 shape itself: a COMBINED-FORM record
+        // (positional fields + a body) that ALSO declares an explicit
+        // constructor of a DIFFERENT arity — the §9.1 positional fast path
+        // above blanket-disables itself the moment `hasAnyConstructor(t)`
+        // is true, with no arity check of its own, so a call whose arity
+        // matches the POSITIONAL fields (not the explicit ctor) falls
+        // through both this function's paths and lands here with neither
+        // ever having run. Per §9.3, "[t]he auto-generated members are
+        // present and the body adds further members" — the only listed
+        // constructor conflict is a body ctor sharing the primary's exact
+        // parameter list — so a different-arity secondary constructor does
+        // not retire the auto-generated primary constructor, and
+        // `new Combo(5)` against `record Combo(X: int) { …; constructor(x:
+        // int, w: Widget) … }` is legal source with no reachable
+        // construction path in this implementation, not a call this
+        // function should silently drop.
+        //
+        // Before this fix, returning bare `nullptr` here made the caller's
+        // `lowerLocalDecl` #2434 fallback (LlvmBackend_Setup.cpp) — which
+        // exists to tolerate SIX unrelated, genuinely-permissive-typing
+        // "no lowered value" shapes (§3/#605, `where T: new()`) — the ONLY
+        // place this failure surfaced: a `Severity::Warning` naming neither
+        // this record nor this constructor, at a clean COMPILE EXIT 0,
+        // followed by a runtime SIGSEGV on the resulting zero-filled value.
+        // A Warning is right for those six permissive shapes (an Error
+        // there is a measured false-reject, see #2434's own comment) but
+        // wrong for this one: "no constructor of this record accepts this
+        // call" is never legitimate FOR THIS NARROWED SHAPE, so report it
+        // LOUDLY and LOCATED here, at the exact point the front end should
+        // have rejected it and did not — `importedFieldInitDiagLoc_` is
+        // `lowerNew`'s `ne.span` for the whole of this function's call, set
+        // once by the `ImportedFieldInitDiagLocScope` guard (fix #2874)
+        // that already covers every construction path `buildRecordValue`
+        // reaches, so no new location threading is added here.
+        //
+        // This is the CODEGEN half of a two-part defect; the SEMA half —
+        // `new RecordType(args)`'s overload resolution never considering
+        // the record's own explicit constructors, which both over-rejects
+        // a call meant for one (#4017) and, as here, under-detects a call
+        // that coincidentally matches the primary's own arity — is tracked
+        // separately (#4017) and not fixed by this commit.
+        if (recPosFieldCount > 0 && args.size() == recPosFieldCount &&
+            !ctx_.diagnostics().hasErrors()) {
+            ctx_.diagnostics().report(
+                Severity::Error, importedFieldInitDiagLoc_,
+                "`new " + std::string(t->name) + "` supplies " +
+                    std::to_string(args.size()) +
+                    " argument(s), but no constructor of `" +
+                    std::string(t->name) +
+                    "` accepts them: neither an explicit constructor "
+                    "(\xC2\xA7""9.3) nor the record's auto-generated "
+                    "positional constructor (\xC2\xA7""9.1, which takes "
+                    "exactly " + std::to_string(recPosFieldCount) +
+                    " argument(s), the record's positional-field count) "
+                    "matches this call");
+        }
         return nullptr;
     }
     return builder_.CreateLoad(st, slot);  // the record value (by value)
