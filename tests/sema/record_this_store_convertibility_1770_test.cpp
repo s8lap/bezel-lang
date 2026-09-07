@@ -134,6 +134,14 @@ BEZEL_TEST(record_this_store_convertibility_1770,
 // of an interface the record implements — is a valid boxing conversion (§8.6:
 // "a record value boxed at assignment") and must still compile. The seeded
 // receiver type flows through checkAssignable's subtype path, which accepts it.
+//
+// `Box` carries an explicit constructor assigning `Cur` (fix #4012, landed in
+// this same batch: the class no-ctor §7.9 screen now also covers a
+// non-nullable auto-property's backing storage, not just plain fields — a
+// bare `public property Cur: IShape;` with no initializer and no constructor
+// is correctly rejected at DECLARATION regardless of whether `Main` ever
+// constructs a `Box`). Orthogonal to what this test actually exercises (the
+// §5.1/§8.6 upcast convertibility of `box.Cur := this`).
 BEZEL_TEST(record_this_store_convertibility_1770,
            record_this_into_implemented_interface_slot_accepted_spec_8_6_issue_1770) {
     auto r = runAot(
@@ -144,7 +152,9 @@ BEZEL_TEST(record_this_store_convertibility_1770,
         "  public method Area(): int  return S * S; end Area; "
         "  public method Put(box: Box)  box.Cur := this; end Put; "
         "end Sq; "
-        "class Box  public property Cur: IShape; end Box; "
+        "class Box  public property Cur: IShape; "
+        "  public constructor(c: IShape) Cur := c; end constructor; "
+        "end Box; "
         "class C public static method Main(): int  return 0; end Main; end C;");
     // The store must NOT be rejected as non-convertible (it is a valid §8.6
     // upcast); the program compiles and runs.
@@ -155,6 +165,9 @@ BEZEL_TEST(record_this_store_convertibility_1770,
 // a slot of its base class — is a valid reference upcast and must still
 // compile. Guards that the fix accepts a class-subtype `this`, not only the
 // exact receiver type.
+//
+// `Box` again carries an assigning constructor for `Cur` — the same fix #4012
+// interaction as the test above.
 BEZEL_TEST(record_this_store_convertibility_1770,
            derived_class_this_into_base_slot_accepted_spec_12_issue_1770) {
     auto r = runAot(
@@ -167,7 +180,9 @@ BEZEL_TEST(record_this_store_convertibility_1770,
         "  public constructor(n: int) base(n); end constructor; "
         "  public method Put(box: Box)  box.Cur := this; end Put; "
         "end Derived; "
-        "class Box  public property Cur: Base; end Box; "
+        "class Box  public property Cur: Base; "
+        "  public constructor(c: Base) Cur := c; end constructor; "
+        "end Box; "
         "class C public static method Main(): int  return 0; end Main; end C;");
     BEZEL_EXPECT_TRUE(r.ran);
 }

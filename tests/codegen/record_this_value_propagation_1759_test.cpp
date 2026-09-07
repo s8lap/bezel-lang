@@ -69,11 +69,23 @@ BEZEL_TEST(record_this_value_propagation_1759, field_assign_this_copies_struct) 
 // value-semantics COPY of the struct. Before the fix this failed IR
 // verification (`ret ptr` vs a `%record.P` return type). The record carries a
 // string field so the returned value must be a real struct to read `.Name`.
+//
+// `Name` carries a field initializer (fix #4001, landed in this same batch:
+// the record no-ctor §7.9 screen now correctly flags a body-only record's
+// non-nullable-string auto-property too — `string` is not defaultable,
+// ExprTypecheck_Exprs.cpp's `defaultIllFormed` — so a bare `property Name:
+// string;` with no constructor is rejected, since the SAME implicit
+// memberwise construction this test's `new P(Name := ..., K := 1)` uses also
+// admits omitting `Name` entirely, e.g. `new P(K := 1)`, which would leave it
+// unset). The initializer is overridden by the named argument at each `new
+// P(...)` call site below (verified: a field initializer's default is used
+// only when a construction omits the corresponding named argument), so this
+// is orthogonal to what the test exercises.
 BEZEL_TEST(record_this_value_propagation_1759, return_this_copies_struct) {
     BEZEL_EXPECT_EQ(runFull(
         "module M; "
         "record P "
-        "  public property Name: string; "
+        "  public property Name: string := \"\"; "
         "  public property K: int; "
         "  public method Copy(): P  return this; end Copy; "
         "end P; "

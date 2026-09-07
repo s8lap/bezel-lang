@@ -126,16 +126,37 @@ bool contains3988(const std::string& hay, const std::string& needle) {
 }  // namespace
 
 // ── LIBRARY ──────────────────────────────────────────────────────────────
-
+//
+// fix #4001 interaction (§7.9/§9.4, v0.294): #4001 (landed in this same
+// batch, AFTER this file) correctly extends §7.9 definite-assignment
+// enforcement to a record's body field/auto-property — a combined-form
+// record declaring a non-nullable body field with NEITHER a field
+// initializer NOR an assigning explicit constructor is now REJECTED AT
+// DECLARATION, on ordinary `new Combo3988(x)` construction grounds, wholly
+// independent of `default(T)`/§17.11. `Combo3988`'s original shape (`public
+// Extra: Widget3988;`, no initializer, no constructor) tripped exactly that
+// new, correct check, breaking every test in this file at the LIBRARY
+// compile stage (`r.libOk` false) regardless of which record the test
+// actually exercises, since `kLib3988` is one shared source string. `Extra`
+// now gets a field initializer sourced from a `static readonly` singleton
+// (a borrow of an already-alive value, not "a freshly-produced owned value"
+// — §9.7's record-field-borrow rule rejects the latter) so ordinary
+// construction satisfies §7.9. This is orthogonal to what THIS file tests:
+// §17.11's `default(T)` rule is a pure function of a field's DECLARED TYPE
+// (`ExprTC::defaultIllFormed`, ExprTypecheck_Exprs.cpp) and does not consult
+// whether the field has an initializer or an assigning constructor, so
+// `default(Combo3988)` is verified below (still) to reject with the exact
+// same §17.11 diagnostic as before this change.
 const char* kLib3988 =
     "module Lib3988; "
     "public class Widget3988 "
     "  public Count: int; "
     "  public constructor(c: int) Count := c; end constructor; "
     "  public method Render(): int return Count; end Render; "
+    "  public static readonly Shared3988: Widget3988 := new Widget3988(0); "
     "end Widget3988; "
     "public record Combo3988(X: int) "
-    "  public Extra: Widget3988; "
+    "  public Extra: Widget3988 := Widget3988.Shared3988; "
     "end Combo3988; "
     "public record Combo3988Nullable(X: int) "
     "  public Extra: Widget3988?; "

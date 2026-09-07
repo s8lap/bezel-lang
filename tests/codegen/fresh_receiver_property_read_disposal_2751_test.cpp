@@ -322,12 +322,21 @@ BEZEL_TEST(fresh_receiver_property_2751, class_result_receiver_not_disposed) {
 
 // A RECORD result is a by-value struct that may embed a borrow (here a string
 // field); §28.3's reclaim must not fire.
+//
+// `S` carries a field initializer (fix #4001, landed in this same batch: the
+// record no-ctor §7.9 screen now correctly flags a non-nullable-string body
+// FIELD with no constructor and no initializer too — `string` is not
+// defaultable, ExprTypecheck_Exprs.cpp's `defaultIllFormed` — since `Pair`'s
+// implicit constructor would otherwise admit a construction that leaves `S`
+// unset). Verified the initializer is overridden by the positional argument
+// at the one `new Pair(3, "abc")` call site below, so this is orthogonal to
+// what the test exercises (receiver disposal, not `Pair`'s own construction).
 BEZEL_TEST(fresh_receiver_property_2751, record_result_receiver_not_disposed) {
     expectBothLenient(
         prog("  private _p: Pair := new Pair(3, \"abc\"); "
              "  public property Pr: Pair get => _p; end Pr; ",
              "total := total + (new Src()).Pr.A; ",
-             "record Pair public A: int; public S: string; end Pair; "),
+             "record Pair public A: int; public S: string := \"\"; end Pair; "),
         88);
 }
 
