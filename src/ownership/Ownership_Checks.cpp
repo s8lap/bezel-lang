@@ -544,6 +544,268 @@ CalleeFormals MethodOwnership::calleeOrChainFormals(
     return f;
 }
 
+// fix #4034 (§28.3 *Borrow lifetime rules* / *Concrete-slot function bodies*,
+// v0.294): see the header comment (Ownership_impl.hpp) for the full
+// rationale. `formals` is already bound to its call site by the caller;
+// `boundFormalIndex` is the SAME §22.5 binder `markOutOwnedArgsCore` /
+// `recordMovesInArgs` key their owned-sink classification off, so a named or
+// reordered argument list (`Consume(mk := lambda() => b)`,
+// `Consume(other, mk := lambda() => b)`) maps to the right formal here too.
+// The declType-then-resolvedType order matches `verifiedCallBoundedFormalAt`'s
+// `formalIsPlainFunction` (§28.14) exactly — declType is the syntactic node
+// (present for any LOCAL declaration, resolved through SemaContext),
+// resolvedType is the already-resolved ParameterSymbol type (the only thing
+// an IMPORTED formal carries, per CalleeFormals::declType's own header
+// comment: "Never both non-null for one formal").
+void MethodOwnership::recordCallArgDirectLambdaTargetsFromFormals(
+        const CalleeFormals& formals,
+        const std::vector<ast::CallArgument>& args,
+        std::unordered_map<const ast::LambdaExpr*, const sema::TypeRef*>&
+            out) const {
+    if (!formals.valid()) return;
+    for (std::size_t i = 0; i < args.size(); ++i) {
+        const ast::CallArgument& a = args[i];
+        if (!a.value) continue;
+        auto* lam = dynamic_cast<const ast::LambdaExpr*>(a.value.get());
+        if (!lam) continue;
+        const std::size_t bp = boundFormalIndex(args, i, formals);
+        if (bp >= formals.size()) continue;
+        const sema::TypeRef* pt = nullptr;
+        if (const ast::Type* dt = formals.declType(bp)) {
+            pt = ctx_.resolvedType(*dt);
+        } else {
+            pt = formals.resolvedType(bp);
+        }
+        if (pt && pt->kind == sema::TypeRef::Kind::Function) out[lam] = pt;
+    }
+}
+
+// fix #4034: the Stmt half of the call-argument-direct lambda-target
+// traversal — mirrors `collectBodyLambdas` (Ownership.cpp) statement-for-
+// statement (every form that can hold an expression), because a call site
+// can appear anywhere an expression can, unlike a LocalDecl initializer or a
+// `return` value. Each arm hands its expression position(s) to
+// `collectCallArgDirectLambdaTargetsExpr` below.
+void MethodOwnership::collectCallArgDirectLambdaTargets(
+        const ast::Stmt& s,
+        std::unordered_map<const ast::LambdaExpr*, const sema::TypeRef*>&
+            out) const {
+    if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
+        if (ld->initializer) collectCallArgDirectLambdaTargetsExpr(*ld->initializer, out);
+        return;
+    }
+    if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(&s)) {
+        if (lc->value) collectCallArgDirectLambdaTargetsExpr(*lc->value, out);
+        return;
+    }
+    if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&s)) {
+        if (rs->value) collectCallArgDirectLambdaTargetsExpr(*rs->value, out);
+        return;
+    }
+    if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(&s)) {
+        if (es->expr) collectCallArgDirectLambdaTargetsExpr(*es->expr, out);
+        return;
+    }
+    if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&s)) {
+        if (as->target) collectCallArgDirectLambdaTargetsExpr(*as->target, out);
+        if (as->value) collectCallArgDirectLambdaTargetsExpr(*as->value, out);
+        return;
+    }
+    if (auto* ts = dynamic_cast<const ast::ThrowStmt*>(&s)) {
+        if (ts->value) collectCallArgDirectLambdaTargetsExpr(*ts->value, out);
+        return;
+    }
+    if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&s)) {
+        if (ifs->ifBranch.condition)
+            collectCallArgDirectLambdaTargetsExpr(*ifs->ifBranch.condition, out);
+        for (const auto& bs : ifs->ifBranch.body)
+            if (bs) collectCallArgDirectLambdaTargets(*bs, out);
+        for (const auto& el : ifs->elifBranches) {
+            if (el.condition) collectCallArgDirectLambdaTargetsExpr(*el.condition, out);
+            for (const auto& bs : el.body)
+                if (bs) collectCallArgDirectLambdaTargets(*bs, out);
+        }
+        for (const auto& bs : ifs->elseBody)
+            if (bs) collectCallArgDirectLambdaTargets(*bs, out);
+        return;
+    }
+    if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&s)) {
+        if (ws->condition) collectCallArgDirectLambdaTargetsExpr(*ws->condition, out);
+        for (const auto& bs : ws->body)
+            if (bs) collectCallArgDirectLambdaTargets(*bs, out);
+        return;
+    }
+    if (auto* fs = dynamic_cast<const ast::ForStmt*>(&s)) {
+        if (fs->iterable) collectCallArgDirectLambdaTargetsExpr(*fs->iterable, out);
+        if (fs->withExpr) collectCallArgDirectLambdaTargetsExpr(*fs->withExpr, out);
+        for (const auto& bs : fs->body)
+            if (bs) collectCallArgDirectLambdaTargets(*bs, out);
+        return;
+    }
+    if (auto* db = dynamic_cast<const ast::DoEndBlock*>(&s)) {
+        for (const auto& bs : db->body)
+            if (bs) collectCallArgDirectLambdaTargets(*bs, out);
+        return;
+    }
+    if (auto* is = dynamic_cast<const ast::IncrementStmt*>(&s)) {
+        if (is->target) collectCallArgDirectLambdaTargetsExpr(*is->target, out);
+        return;
+    }
+    if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(&s)) {
+        if (ds->value) collectCallArgDirectLambdaTargetsExpr(*ds->value, out);
+        return;
+    }
+    if (auto* ys = dynamic_cast<const ast::YieldStmt*>(&s)) {
+        if (ys->value) collectCallArgDirectLambdaTargetsExpr(*ys->value, out);
+        return;
+    }
+    if (auto* trys = dynamic_cast<const ast::TryStmt*>(&s)) {
+        for (const auto& bs : trys->body)
+            if (bs) collectCallArgDirectLambdaTargets(*bs, out);
+        for (const auto& arm : trys->catches) {
+            if (arm.guard) collectCallArgDirectLambdaTargetsExpr(*arm.guard, out);
+            if (arm.body) collectCallArgDirectLambdaTargets(*arm.body, out);
+        }
+        for (const auto& bs : trys->finallyBody)
+            if (bs) collectCallArgDirectLambdaTargets(*bs, out);
+        return;
+    }
+    if (auto* cs = dynamic_cast<const ast::CaseStmt*>(&s)) {
+        if (cs->scrutinee) collectCallArgDirectLambdaTargetsExpr(*cs->scrutinee, out);
+        for (const auto& arm : cs->arms) {
+            if (arm.guard) collectCallArgDirectLambdaTargetsExpr(*arm.guard, out);
+            if (arm.exprBody) collectCallArgDirectLambdaTargetsExpr(*arm.exprBody, out);
+            for (const auto& bs : arm.stmts)
+                if (bs) collectCallArgDirectLambdaTargets(*bs, out);
+        }
+        return;
+    }
+    // Break / Continue: no child expressions.
+}
+
+// fix #4034: the Expr half. Mirrors `collectBodyLambdasExpr` node-for-node
+// (same rationale: a call site can be nested at any depth), with two
+// differences: the LambdaExpr arm does NOT record itself (only a call
+// ARGUMENT position does, via the CallExpr/NullCondCallExpr/NewExpr arms
+// below) but still descends into the lambda's own body — so a lambda
+// nested inside another lambda's OWN call-argument position (the #4033-
+// shaped nesting, e.g. `Outer(lambda() => do return Consume(lambda() =>
+// b); end)`) is reached by this same traversal with no separate per-lambda
+// re-invocation needed; and the three call-like arms additionally resolve
+// the callee's formals and record each direct-LambdaExpr argument's bound
+// target type before recursing into every argument (including the direct-
+// lambda one itself, to reach any call sites the lambda's OWN body embeds).
+void MethodOwnership::collectCallArgDirectLambdaTargetsExpr(
+        const ast::Expr& e,
+        std::unordered_map<const ast::LambdaExpr*, const sema::TypeRef*>&
+            out) const {
+    if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(&e)) {
+        if (lam->exprBody) collectCallArgDirectLambdaTargetsExpr(*lam->exprBody, out);
+        for (const auto& bs : lam->stmts)
+            if (bs) collectCallArgDirectLambdaTargets(*bs, out);
+        return;
+    }
+    if (auto* ce = dynamic_cast<const ast::CallExpr*>(&e)) {
+        recordCallArgDirectLambdaTargetsFromFormals(
+            calleeOrChainFormals(ce->callee.get(), ce->args), ce->args, out);
+        if (ce->callee) collectCallArgDirectLambdaTargetsExpr(*ce->callee, out);
+        for (const auto& a : ce->args)
+            if (a.value) collectCallArgDirectLambdaTargetsExpr(*a.value, out);
+        return;
+    }
+    if (auto* nc = dynamic_cast<const ast::NullCondCallExpr*>(&e)) {
+        recordCallArgDirectLambdaTargetsFromFormals(
+            calleeOrChainFormals(nc->callee.get(), nc->args), nc->args, out);
+        if (nc->callee) collectCallArgDirectLambdaTargetsExpr(*nc->callee, out);
+        for (const auto& a : nc->args)
+            if (a.value) collectCallArgDirectLambdaTargetsExpr(*a.value, out);
+        return;
+    }
+    if (auto* ne = dynamic_cast<const ast::NewExpr*>(&e)) {
+        recordCallArgDirectLambdaTargetsFromFormals(
+            resolveCtorParams(*ne, ctx_), ne->args, out);
+        for (const auto& a : ne->args)
+            if (a.value) collectCallArgDirectLambdaTargetsExpr(*a.value, out);
+        return;
+    }
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+        if (ma->target) collectCallArgDirectLambdaTargetsExpr(*ma->target, out);
+        return;
+    }
+    if (auto* nm = dynamic_cast<const ast::NullCondMemberExpr*>(&e)) {
+        if (nm->target) collectCallArgDirectLambdaTargetsExpr(*nm->target, out);
+        return;
+    }
+    if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&e)) {
+        if (ix->target) collectCallArgDirectLambdaTargetsExpr(*ix->target, out);
+        for (const auto& a : ix->indices)
+            if (a.value) collectCallArgDirectLambdaTargetsExpr(*a.value, out);
+        return;
+    }
+    if (auto* be = dynamic_cast<const ast::BinaryExpr*>(&e)) {
+        if (be->left) collectCallArgDirectLambdaTargetsExpr(*be->left, out);
+        if (be->right) collectCallArgDirectLambdaTargetsExpr(*be->right, out);
+        return;
+    }
+    if (auto* un = dynamic_cast<const ast::UnaryExpr*>(&e)) {
+        if (un->operand) collectCallArgDirectLambdaTargetsExpr(*un->operand, out);
+        return;
+    }
+    if (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(&e)) {
+        if (pb->operand) collectCallArgDirectLambdaTargetsExpr(*pb->operand, out);
+        return;
+    }
+    if (auto* tt = dynamic_cast<const ast::TypeTestExpr*>(&e)) {
+        if (tt->operand) collectCallArgDirectLambdaTargetsExpr(*tt->operand, out);
+        return;
+    }
+    if (auto* cd = dynamic_cast<const ast::ConditionalExpr*>(&e)) {
+        if (cd->condition) collectCallArgDirectLambdaTargetsExpr(*cd->condition, out);
+        if (cd->thenValue) collectCallArgDirectLambdaTargetsExpr(*cd->thenValue, out);
+        if (cd->elseValue) collectCallArgDirectLambdaTargetsExpr(*cd->elseValue, out);
+        return;
+    }
+    if (auto* th = dynamic_cast<const ast::ThrowExpr*>(&e)) {
+        if (th->operand) collectCallArgDirectLambdaTargetsExpr(*th->operand, out);
+        return;
+    }
+    if (auto* rg = dynamic_cast<const ast::RangeExpr*>(&e)) {
+        if (rg->lo) collectCallArgDirectLambdaTargetsExpr(*rg->lo, out);
+        if (rg->hi) collectCallArgDirectLambdaTargetsExpr(*rg->hi, out);
+        if (rg->step) collectCallArgDirectLambdaTargetsExpr(*rg->step, out);
+        return;
+    }
+    if (auto* we = dynamic_cast<const ast::WithExpr*>(&e)) {
+        if (we->source) collectCallArgDirectLambdaTargetsExpr(*we->source, out);
+        for (const auto& ia : we->assigns)
+            if (ia.value) collectCallArgDirectLambdaTargetsExpr(*ia.value, out);
+        return;
+    }
+    if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(&e)) {
+        for (const auto& k : cl->keys)
+            if (k) collectCallArgDirectLambdaTargetsExpr(*k, out);
+        for (const auto& el : cl->elements)
+            if (el) collectCallArgDirectLambdaTargetsExpr(*el, out);
+        return;
+    }
+    if (auto* isx = dynamic_cast<const ast::InterpolatedStringExpr*>(&e)) {
+        for (const auto& part : isx->parts)
+            if (part.expr) collectCallArgDirectLambdaTargetsExpr(*part.expr, out);
+        return;
+    }
+    if (auto* cx = dynamic_cast<const ast::CaseExpr*>(&e)) {
+        if (cx->scrutinee) collectCallArgDirectLambdaTargetsExpr(*cx->scrutinee, out);
+        for (const auto& arm : cx->arms) {
+            if (arm.guard) collectCallArgDirectLambdaTargetsExpr(*arm.guard, out);
+            if (arm.exprBody) collectCallArgDirectLambdaTargetsExpr(*arm.exprBody, out);
+            for (const auto& bs : arm.stmts)
+                if (bs) collectCallArgDirectLambdaTargets(*bs, out);
+        }
+        return;
+    }
+    // Literals / identifiers / typeof / nameof / default / unit: no children.
+}
+
 void MethodOwnership::recordMovesIn(const ast::Expr& e) {
     if (auto* un = dynamic_cast<const ast::UnaryExpr*>(&e)) {
         if (un->op == "move") {

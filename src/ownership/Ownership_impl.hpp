@@ -1493,6 +1493,54 @@ private:
         const ast::Type* declType, const ast::Expr* init,
         std::unordered_map<const ast::LambdaExpr*, const sema::TypeRef*>&
             out) const;
+    // fix #4034 (§28.3, v0.294): the CALL-ARGUMENT-direct sibling of
+    // collectReturnDirectLambdas / collectLocalDeclDirectLambdaTargets. A
+    // lambda literal passed DIRECTLY as a call argument to a
+    // `() -> owned T`-typed parameter has its type dictated by the CALLEE's
+    // FORMAL SIGNATURE — a target position neither sibling collector can see
+    // (there is no ReturnStmt or LocalDecl at an argument position at all),
+    // which is why #4005's review carved this out as needing "callee-
+    // signature threading, a materially different mechanism" rather than a
+    // third `collectLocalDeclDirectLambdaTargets`-shaped statement-only
+    // walker. Unlike the other two, a call site can appear at ANY expression
+    // nesting depth (`1 + Foo(lambda() => b)`, `Bar(Baz(lambda() => b))`), so
+    // this pair mirrors `collectBodyLambdas`/`collectBodyLambdasExpr`'s FULL
+    // statement+expression traversal (the only walker in this file that
+    // already reaches a lambda at any nesting depth, including inside a
+    // found lambda's own body — #4033's shape falls out of that traversal
+    // for free, with no separate re-invocation needed) rather than the
+    // narrower 7-statement-form walk `collectLocalDeclDirectLambdaTargets`
+    // uses. See Ownership_Checks.cpp for the definitions and for why they
+    // live there (the CalleeFormals / resolveCalleeParams / resolveCtorParams
+    // / boundFormalIndex machinery they delegate to — CLAUDE.md §6, no
+    // second argument-to-formal binding rule — is private to that TU).
+    void collectCallArgDirectLambdaTargets(
+        const ast::Stmt& s,
+        std::unordered_map<const ast::LambdaExpr*, const sema::TypeRef*>&
+            out) const;
+    void collectCallArgDirectLambdaTargetsExpr(
+        const ast::Expr& e,
+        std::unordered_map<const ast::LambdaExpr*, const sema::TypeRef*>&
+            out) const;
+    // fix #4034: the shared leaf the CallExpr / NullCondCallExpr / NewExpr
+    // arms of collectCallArgDirectLambdaTargetsExpr call. `formals` is
+    // already resolved by the caller (calleeOrChainFormals for a CallExpr/
+    // NullCondCallExpr — so a `this(...)`/`base(...)` chain call's target is
+    // reached exactly as recordMovesInArgs/markOutOwnedArgs already reach it
+    // — or resolveCtorParams for a NewExpr); this leaf only maps each
+    // DIRECT-LambdaExpr argument to its BOUND formal's resolved function
+    // type via boundFormalIndex (the SAME §22.5 binder every other owned-
+    // sink classifier in this file uses, so a named/reordered argument list
+    // is not mis-mapped) and CalleeFormals::declType/resolvedType (the same
+    // declType-then-resolvedType order verifiedCallBoundedFormalAt's
+    // formalIsPlainFunction uses — an imported formal has no ast::Type at
+    // all). A formal that does not resolve to a Function-kind type records
+    // nothing.
+    void recordCallArgDirectLambdaTargetsFromFormals(
+        const CalleeFormals& formals,
+        const std::vector<ast::CallArgument>& args,
+        std::unordered_map<const ast::LambdaExpr*, const sema::TypeRef*>&
+            out) const;
     void checkOneLambdaTaskFamilyBorrowReturn(
         const ast::LambdaExpr& lam,
         const sema::TypeRef* expectedFnType = nullptr);

@@ -7846,6 +7846,20 @@ void MethodOwnership::checkLambdaTaskFamilyBorrowReturns(
     for (const ast::LambdaExpr* lam : lambdas)
         for (const auto& s : lam->stmts)
             if (s) collectLocalDeclDirectLambdaTargets(*s, localDeclDirect);
+    // fix #4034 (§28.3, v0.294): the CALL-ARGUMENT-direct sibling of
+    // localDeclDirect above — a lambda literal passed directly as a call
+    // argument to a `() -> owned T`-typed parameter (`Consume(lambda() =>
+    // b)`) has its type dictated by the CALLEE's formal signature, a target
+    // position neither `returnDirect` nor `localDeclDirect` can see. Unlike
+    // `localDeclDirect`, `collectCallArgDirectLambdaTargets` already reaches
+    // every nesting depth in ONE top-level pass (its expression traversal
+    // descends into a found lambda's own body itself), so no per-lambda
+    // `lam->stmts` re-invocation is needed here the way #4033 needed one for
+    // the statement-only local-decl walker.
+    std::unordered_map<const ast::LambdaExpr*, const sema::TypeRef*>
+        callArgDirect;
+    for (const auto& s : body)
+        if (s) collectCallArgDirectLambdaTargets(*s, callArgDirect);
     for (const ast::LambdaExpr* lam : lambdas) {
         const sema::TypeRef* expected =
             returnDirect.count(lam) ? expectedReturnFnType : nullptr;
@@ -7859,6 +7873,12 @@ void MethodOwnership::checkLambdaTaskFamilyBorrowReturns(
         if (!ownedExpected) {
             auto it = localDeclDirect.find(lam);
             if (it != localDeclDirect.end()) ownedExpected = it->second;
+        }
+        // fix #4034: the call-argument-direct fallback — see callArgDirect's
+        // comment above.
+        if (!ownedExpected) {
+            auto it = callArgDirect.find(lam);
+            if (it != callArgDirect.end()) ownedExpected = it->second;
         }
         checkOneLambdaOwnedReturnDirectBorrow(*lam, ownedExpected);
     }
@@ -8499,6 +8519,14 @@ void MethodOwnership::checkLambdaTaskFamilyBorrowReturnsExpr(
         const ast::Expr& e, const sema::TypeRef* topExpected) {
     std::vector<const ast::LambdaExpr*> lambdas;
     collectBodyLambdasExpr(e, lambdas);
+    // fix #4034 (§28.3, v0.294): the `=>` expression-body sibling of the
+    // block-body driver's `callArgDirect` — see its comment there. A call
+    // reachable from an expression-bodied method/property/operator can embed
+    // a direct-lambda argument exactly as a block body can (`property P: int
+    // => Consume(lambda() => b);`).
+    std::unordered_map<const ast::LambdaExpr*, const sema::TypeRef*>
+        callArgDirect;
+    collectCallArgDirectLambdaTargetsExpr(e, callArgDirect);
     const auto* topLam = dynamic_cast<const ast::LambdaExpr*>(&e);
     for (const ast::LambdaExpr* lam : lambdas) {
         const sema::TypeRef* expected = lam == topLam ? topExpected : nullptr;
@@ -8506,7 +8534,12 @@ void MethodOwnership::checkLambdaTaskFamilyBorrowReturnsExpr(
         // fix #4005 (§28.3, v0.294): the `=>` expression-body sibling of the
         // block-body driver above — see checkOneLambdaOwnedReturnDirectBorrow's
         // header comment.
-        checkOneLambdaOwnedReturnDirectBorrow(*lam, expected);
+        const sema::TypeRef* ownedExpected = expected;
+        if (!ownedExpected) {
+            auto it = callArgDirect.find(lam);
+            if (it != callArgDirect.end()) ownedExpected = it->second;
+        }
+        checkOneLambdaOwnedReturnDirectBorrow(*lam, ownedExpected);
     }
 }
 
