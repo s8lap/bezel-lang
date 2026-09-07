@@ -1,0 +1,276 @@
+// Spec-derived regression tests for issue #4005 — a lambda checked against a
+// `() -> owned T` function-type slot never verified that its return is an
+// OWNED PRODUCTION, so the IDENTICAL #3993 borrow-through-owned-return
+// double-free reproduces through a function value instead of a named
+// method/operator return.
+//
+// §28.3 *Borrow lifetime rules*, v0.294 (verbatim, first bullet): "A
+// borrowed local may not be returned from a method whose return type is
+// `owned`." §28.3 *Concrete-slot function bodies* states the callee-side
+// obligation generally: "every return path supplies a fresh or owned value;
+// a borrow is rejected" — but (per the issue) that obligation was never
+// actually implemented for a function-typed target's `owned`-marked return.
+//
+// THE BUG (measured on this worktree with #3993's fix — `handleReturn`'s own
+// `checkOwnedReturnDirectBorrow` — ALREADY APPLIED, i.e. the middle state of
+// a three-way fail-without; #3993's fix touches only named method/operator
+// RETURN checking, an entirely different code path from lambda-body
+// checking):
+//
+//   using var b := new Res(4);
+//   var mk: () -> owned Res := lambda() => b;
+//   var c := mk();
+//
+//   compiled with rc=0 and zero diagnostics (only the unrelated, expected
+//   "`c` is implicitly disposed at scope end" auto-drop note); running the
+//   compiled program under AddressSanitizer produced a heap-use-after-free —
+//   `b`'s object freed once via `c`'s scope-end auto-drop (`c`'s tracked
+//   state is Owned, taken from the DECLARED `owned` slot of `mk`'s function
+//   type) and again via `b`'s own `using var` scope-end disposal.
+//
+// ROOT CAUSE (two layers, both closed by this fix):
+//
+//   1. The one existing lambda-body check that inspects a target's `owned`
+//      marker, `checkOneLambdaTaskFamilyBorrowReturn` (§28.3 SB01-B), reads
+//      `effOwned` and explicitly declines it ("An explicit `owned` target
+//      return is a different, explicit transfer contract, not this rule's
+//      plain-`Task` case") — correct for ITS rule, but nothing else in the
+//      lambda-body-checking machinery ever picked up the owned case
+//      afterward.
+//   2. Even a NEW check reading the same `effOwned` signal would have found
+//      it always false for a TYPED-LOCAL lambda: the lambda LITERAL's own
+//      inferred function TypeRef (`ctx_.exprType(lam)`) never copies the
+//      target's `owned` marker onto `funcReturnOwned` — sema's LambdaExpr
+//      arm (ExprTypecheck_Exprs.cpp) sets `lamTy->funcReturn =
+//      inferredReturn;` with no accompanying `funcReturnOwned` assignment at
+//      all, even though the #1820 hint (`pendingLambdaTargetReturnOwned_`)
+//      carrying the true marker IS available at that point (and used for a
+//      DIFFERENT check, `checkConcreteSlotLambdaBody`, which explicitly
+//      SKIPS the owned case — `if (targetOwnedMarker) return;` — leaving no
+//      other consumer of the hint for this shape).
+//
+// THE FIX: `checkOneLambdaOwnedReturnDirectBorrow` (Ownership.cpp) — the
+// owned-target sibling of `checkOneLambdaTaskFamilyBorrowReturn` — driven
+// from the same two entry points (`checkLambdaTaskFamilyBorrowReturns` /
+// `-Expr`), reusing the exact `ownedArgSourceIsBorrow` classifier
+// `checkOwnedReturnDirectBorrow` (#3993) uses, with the same exclusions
+// (`move E`, a bare owned-field read, a bare catch-bound identifier). To
+// close root-cause (2) for the exact measured shape, a new collector
+// (`collectLocalDeclDirectLambdaTargets`, the local-decl-DIRECT sibling of
+// the existing `collectReturnDirectLambdas`) supplies the LocalDecl's own
+// declared type as `expectedFnType` when the lambda's own inferred type
+// doesn't carry the marker; this function ORs the two `funcReturnOwned`
+// signals together rather than only falling back when `lamTy` supplied
+// nothing, so a correctly-inferred `effRet` from `lamTy` is never
+// discarded. A further, structural addition NOT present in
+// `checkOwnedReturnDirectBorrow` (which needs no such thing — a named
+// method's OWN locals ARE tracked in the real dataflow's `states_`): a bare
+// identifier resolving to a CAPTURED local from an ENCLOSING scope (as
+// opposed to one this lambda's own body declared) is flagged even though
+// `ownedArgSourceIsBorrow` alone cannot see it (a fresh `MethodOwnership`
+// has no `states_` to classify a plain local's Owned/Borrowed state at
+// all) — distinguished structurally by span containment: a local this
+// lambda's own body declared has its LocalDecl positioned INSIDE the
+// lambda's own source span; a captured enclosing local's does not.
+//
+// A broad `lambda`-filtered sweep (852 tests across 5 binaries, 0 failed,
+// plus the full 2308-test lit diagnostic track) found no false-reject
+// fallout from this addition in the existing corpus.
+//
+// per §28.3 *Borrow lifetime rules*, *Concrete-slot function bodies*, v0.294
+
+#include <string>
+
+#include "support/aot_result_asserts.hpp"  // failedAtCompileTimeWithRealLocation
+#include "support/aot_support.hpp"         // runAot / runAotChecked — AOT(+ASan) oracle
+#include "test_harness.hpp"
+
+using bezel::test::JitResult;
+using bezel::test::diagnosticMessageContains;
+using bezel::test::failedAtCompileTimeWithRealLocation;
+using bezel::test::runAot;
+using bezel::test::runAotChecked;
+
+namespace {
+
+// This fix's diagnostic — distinct wording from #3993's named-method form
+// (which this file does not reach at all; a lambda body is a structurally
+// different code path).
+constexpr const char* kLambdaOwnedBorrowReturn =
+    "the lambda is checked against a target function type whose return is "
+    "`owned`";
+
+// A destructor-counter Res: ctor ++, dtor --, surfaced through Res.live so an
+// ACCEPT test can assert exact-once disposal (0 == no leak, no double-free).
+const char* kRes =
+    "module M; "
+    "class Res "
+    "  public static live: int := 0; "
+    "  public tag: int; "
+    "  public constructor(t: int) this.tag := t; Res.live := Res.live + 1; end constructor; "
+    "  destructor Res.live := Res.live - 1; end destructor; "
+    "end Res; ";
+
+}  // namespace
+
+// ===========================================================================
+// REJECT — a lambda checked against a `() -> owned T` slot whose body is a
+// borrow of a CAPTURED variable from the enclosing scope. Fail-without
+// (both #3993 alone and neither fix): accepted with zero diagnostics,
+// double-freed at runtime (ASan heap-use-after-free, measured). Pass-with
+// (this fix): rejected at compile time with a real source location.
+// ===========================================================================
+
+// The issue's exact repro: an EXPRESSION-bodied lambda returning a captured
+// `using var` (Owned-at-the-enclosing-level) local bare, checked against a
+// typed LocalDecl's `() -> owned Res` slot.
+BEZEL_TEST(lambda_owned_return_direct_borrow_4005,
+           exprbody_lambda_captured_using_var_rejected_spec_28_3) {
+    JitResult jr = runAot(
+        std::string(kRes) +
+        "class C "
+        "  public static method Main(): int "
+        "    using var b := new Res(4); "
+        "    var mk: () -> owned Res := lambda() => b; "
+        "    var c := mk(); return c.tag; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(jr));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(jr, kLambdaOwnedBorrowReturn));
+}
+
+// The BLOCK-bodied sibling (`=> do ... return b; end`) — exercises
+// `scanReturnsIn`'s traversal rather than the direct-exprBody path.
+BEZEL_TEST(lambda_owned_return_direct_borrow_4005,
+           blockbody_lambda_captured_using_var_rejected_spec_28_3) {
+    JitResult jr = runAot(
+        std::string(kRes) +
+        "class C "
+        "  public static method Main(): int "
+        "    using var b := new Res(4); "
+        "    var mk: () -> owned Res := lambda() => do return b; end; "
+        "    var c := mk(); return c.tag; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(jr));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(jr, kLambdaOwnedBorrowReturn));
+}
+
+// A CAPTURED plain (non-`owned`) PARAMETER of the enclosing method, rather
+// than a `using var` local — exercises `ownedArgSourceIsBorrow`'s existing
+// ParameterSymbol classification (modifier-based, not span-based), reached
+// through this fix's new owned-target driving rather than the new
+// capture-span addition.
+BEZEL_TEST(lambda_owned_return_direct_borrow_4005,
+           captured_plain_parameter_rejected_spec_28_3) {
+    JitResult jr = runAot(
+        std::string(kRes) +
+        "class C "
+        "  public static method Wrap(p: Res): int "
+        "    var mk: () -> owned Res := lambda() => p; "
+        "    var c := mk(); return c.tag; "
+        "  end Wrap; "
+        "  public static method Main(): int "
+        "    using var b := new Res(4); return Wrap(b); "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(jr));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(jr, kLambdaOwnedBorrowReturn));
+}
+
+// ===========================================================================
+// ACCEPT — a genuinely owned production through a lambda is NOT
+// over-rejected, and disposes the value EXACTLY once under the AOT+ASan
+// oracle (Res.live == 0 at exit — no leak, no double-free).
+// ===========================================================================
+
+// A fresh `new` production — the ordinary factory shape this rule must not
+// disturb.
+BEZEL_TEST(lambda_owned_return_direct_borrow_4005,
+           fresh_new_accepted_disposes_once_spec_28_3) {
+    std::string src =
+        std::string(kRes) +
+        "class C "
+        "  public static method Main(): int "
+        "    do "
+        "      var mk: () -> owned Res := lambda() => new Res(9); "
+        "      do using var c := mk(); end; "
+        "    end; "
+        "    return Res.live; "
+        "  end Main; "
+        "end C;";
+    JitResult jr = runAotChecked(src);
+    BEZEL_EXPECT_TRUE(jr.ran);
+    BEZEL_EXPECT_EQ(jr.exitCode, 0);
+}
+
+// A local this LAMBDA'S OWN body declared (not a capture) — the
+// span-containment distinction this fix's capture check depends on must NOT
+// flag the lambda's own fresh production.
+BEZEL_TEST(lambda_owned_return_direct_borrow_4005,
+           own_internal_local_accepted_disposes_once_spec_28_3) {
+    std::string src =
+        std::string(kRes) +
+        "class C "
+        "  public static method Main(): int "
+        "    do "
+        "      var mk: () -> owned Res := lambda() => do "
+        "        var x := new Res(9); return x; "
+        "      end; "
+        "      do using var c := mk(); end; "
+        "    end; "
+        "    return Res.live; "
+        "  end Main; "
+        "end C;";
+    JitResult jr = runAotChecked(src);
+    BEZEL_EXPECT_TRUE(jr.ran);
+    BEZEL_EXPECT_EQ(jr.exitCode, 0);
+}
+
+// A relayed OWNED call result — the callee-returns-`owned`-T producer form,
+// through a lambda.
+BEZEL_TEST(lambda_owned_return_direct_borrow_4005,
+           relayed_owned_call_result_accepted_disposes_once_spec_28_3) {
+    std::string src =
+        std::string(kRes) +
+        "class C "
+        "  public static method Make(): owned Res return new Res(9); end Make; "
+        "  public static method Main(): int "
+        "    do "
+        "      var mk: () -> owned Res := lambda() => Make(); "
+        "      do using var c := mk(); end; "
+        "    end; "
+        "    return Res.live; "
+        "  end Main; "
+        "end C;";
+    JitResult jr = runAotChecked(src);
+    BEZEL_EXPECT_TRUE(jr.ran);
+    BEZEL_EXPECT_EQ(jr.exitCode, 0);
+}
+
+// A lambda with NO target-type context at all (`var f := lambda() => new
+// Res(9);`, no `() -> owned Res` ascription anywhere) must not be flagged by
+// THIS check — it only fires when a target function type's return is
+// affirmatively marked `owned`. This check's own diagnostic is
+// Severity::Error, so `jr.ran` alone (compile+run SUCCEEDED) is conclusive
+// proof it did not fire — a `diagnosticMessageContains` scan would be
+// VACUOUS here regardless (`runAot` discards captured stderr on a
+// successful compile). (An untyped function-value local's OWN call result
+// is a SEPARATE, pre-existing gap — its inferred function type carries no
+// `owned` marker either, so the call result is itself under-tracked for
+// disposal and LEAKS; filed as issue #4027, out of scope here since it is a
+// leak in an unrelated position, not a rejection this check could
+// introduce — asserted at COMPILE-success only, deliberately not exit-code,
+// to stay independent of that adjacent gap.)
+BEZEL_TEST(lambda_owned_return_direct_borrow_4005,
+           untyped_context_lambda_not_rejected) {
+    JitResult jr = runAot(
+        std::string(kRes) +
+        "class C "
+        "  public static method Main(): int "
+        "    var f := lambda() => new Res(9); "
+        "    var c := f(); return c.tag; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(jr.ran);
+}

@@ -1474,7 +1474,51 @@ private:
     void collectReturnDirectLambdas(
         const ast::Stmt& s,
         std::unordered_set<const ast::LambdaExpr*>& out) const;
+    // fix #4005 (§28.3, v0.294): the local-decl-DIRECT sibling of
+    // collectReturnDirectLambdas immediately above — see its definition
+    // (Ownership.cpp) for the full rationale.
+    void collectLocalDeclDirectLambdaTargets(
+        const ast::Stmt& s,
+        std::unordered_map<const ast::LambdaExpr*, const sema::TypeRef*>&
+            out) const;
     void checkOneLambdaTaskFamilyBorrowReturn(
+        const ast::LambdaExpr& lam,
+        const sema::TypeRef* expectedFnType = nullptr);
+
+    // fix #4005 (§28.3 *Borrow lifetime rules* / *Concrete-slot function
+    // bodies*, v0.294): the OWNED-target sibling of
+    // checkOneLambdaTaskFamilyBorrowReturn immediately above. That function
+    // explicitly declines a target whose `funcReturnOwned` is true ("An
+    // explicit `owned` target return is a different, explicit transfer
+    // contract, not this rule's plain-`Task` case") — but nothing else in
+    // the lambda-body-checking machinery ever picks up the owned-target case
+    // afterward, so `var mk: () -> owned Res := lambda() => b;` (`b` a
+    // captured BORROW) compiled with zero diagnostics and double-freed at
+    // runtime: `c := mk()`'s scope-end auto-drop disposes the object once
+    // (tracked Owned off the declared `owned` slot) and `b`'s own `using
+    // var` scope-end disposal disposes it again — the identical #3993 shape,
+    // reached through a function value instead of a named method/operator
+    // return. Resolves effRet/effOwned exactly as the sibling function does
+    // (the lambda's own inferred function TypeRef first — the #829 typed-
+    // local hint — falling back to `expectedFnType` for a lambda whose type
+    // is dictated by its position but left un-inferred there), fires only
+    // when `effOwned` is true, and applies the SAME exclusions
+    // checkOwnedReturnDirectBorrow (#3993, Ownership_Checks.cpp) applies to
+    // a named method's return: `move E` (an owned transfer, not a borrow),
+    // a bare owned-field read (a legal receiver-sourced transfer), a bare
+    // catch-bound identifier (its own unconditional rejection elsewhere),
+    // and a bare force-unwrap of a named OWNED place. Reuses
+    // `ownedArgSourceIsBorrow` — the single existing borrow-source
+    // authority — via a FRESH `MethodOwnership`, exactly as the sibling
+    // function does, so the lambda's own parameters resolve independently
+    // of the enclosing dataflow. Driven from the same two entry points as
+    // the sibling function (checkLambdaTaskFamilyBorrowReturns /
+    // -Expr), so it reaches a lambda anywhere in a body a lambda can appear
+    // — a local-decl initializer, a return, a field/property/operator
+    // position — the moment those drivers are wired for that body (which
+    // fix #4004 does for operators in the same commit).
+    // // per §28.3 *Borrow lifetime rules*, *Concrete-slot function bodies*
+    void checkOneLambdaOwnedReturnDirectBorrow(
         const ast::LambdaExpr& lam,
         const sema::TypeRef* expectedFnType = nullptr);
 

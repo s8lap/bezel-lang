@@ -7816,9 +7816,109 @@ void MethodOwnership::checkLambdaTaskFamilyBorrowReturns(
     if (expectedReturnFnType)
         for (const auto& s : body)
             if (s) collectReturnDirectLambdas(*s, returnDirect);
-    for (const ast::LambdaExpr* lam : lambdas)
-        checkOneLambdaTaskFamilyBorrowReturn(
-            *lam, returnDirect.count(lam) ? expectedReturnFnType : nullptr);
+    // fix #4005: a lambda that is the DIRECT initializer of a typed LocalDecl
+    // (`var mk: () -> owned Res := lambda() => b;`) is checked against THAT
+    // local's declared type — a target position distinct from a direct
+    // `return`, so a separate collector (mirrors collectReturnDirectLambdas's
+    // shape, keyed on a LocalDecl's initializer instead of a ReturnStmt's
+    // value). Feeds ONLY checkOneLambdaOwnedReturnDirectBorrow below (see its
+    // own header comment for why `expectedFnType` matters there); the
+    // sibling Task-family check's inputs are unchanged. // per §28.3
+    std::unordered_map<const ast::LambdaExpr*, const sema::TypeRef*>
+        localDeclDirect;
+    for (const auto& s : body)
+        if (s) collectLocalDeclDirectLambdaTargets(*s, localDeclDirect);
+    for (const ast::LambdaExpr* lam : lambdas) {
+        const sema::TypeRef* expected =
+            returnDirect.count(lam) ? expectedReturnFnType : nullptr;
+        checkOneLambdaTaskFamilyBorrowReturn(*lam, expected);
+        // fix #4005 (§28.3, v0.294): the owned-target sibling — see its own
+        // header comment. Driven from the same collected-lambda set so it
+        // reaches a lambda anywhere in this body a lambda can appear (a
+        // local-decl initializer, a direct return, …), not just the
+        // Task-family case the call above handles.
+        const sema::TypeRef* ownedExpected = expected;
+        if (!ownedExpected) {
+            auto it = localDeclDirect.find(lam);
+            if (it != localDeclDirect.end()) ownedExpected = it->second;
+        }
+        checkOneLambdaOwnedReturnDirectBorrow(*lam, ownedExpected);
+    }
+}
+
+// fix #4005 (§28.3, v0.294): collect, for every LambdaExpr that is the DIRECT
+// initializer of a typed LocalDecl reachable in `s` (recursing through
+// IfStmt/WhileStmt/ForStmt/DoEndBlock/TryStmt/CaseStmt — the same 7
+// statement forms scanReturnsIn walks, minus ReturnStmt itself, which cannot
+// contain a LocalDecl), that local's OWN declared type. Needed because the
+// lambda LITERAL's own inferred function TypeRef (`ctx_.exprType(lam)`)
+// never carries the target's `owned` marker — sema's LambdaExpr arm
+// (ExprTypecheck_Exprs.cpp) sets `lamTy->funcReturn = inferredReturn;` with
+// no accompanying `funcReturnOwned` assignment at all, even though the
+// `#1820` target-return-owned hint (`pendingLambdaTargetReturnOwned_`) IS
+// available at that point and used for a DIFFERENT check
+// (checkConcreteSlotLambdaBody) — it is just never copied onto the lambda's
+// own exprType. `checkOneLambdaOwnedReturnDirectBorrow` therefore needs the
+// LocalDecl's declared type supplied explicitly via `expectedFnType`, mirroring
+// how `checkLambdaTaskFamilyBorrowReturns` already supplies the enclosing
+// method's OWN declared return type for a return-DIRECT lambda
+// (collectReturnDirectLambdas) — this is the sibling collector for the
+// local-decl-DIRECT position. Does not recurse into a found lambda's own
+// body (a nested local-decl-typed lambda one level down is a rarer shape;
+// out of scope here — see the fix commit for why). // per §28.3
+void MethodOwnership::collectLocalDeclDirectLambdaTargets(
+        const ast::Stmt& s,
+        std::unordered_map<const ast::LambdaExpr*, const sema::TypeRef*>&
+            out) const {
+    if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
+        if (ld->type && ld->initializer) {
+            if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(
+                    ld->initializer.get())) {
+                out[lam] = ctx_.resolvedType(*ld->type);
+            }
+        }
+        return;
+    }
+    if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&s)) {
+        for (const auto& bs : ifs->ifBranch.body)
+            if (bs) collectLocalDeclDirectLambdaTargets(*bs, out);
+        for (const auto& el : ifs->elifBranches)
+            for (const auto& bs : el.body)
+                if (bs) collectLocalDeclDirectLambdaTargets(*bs, out);
+        for (const auto& bs : ifs->elseBody)
+            if (bs) collectLocalDeclDirectLambdaTargets(*bs, out);
+        return;
+    }
+    if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&s)) {
+        for (const auto& bs : ws->body)
+            if (bs) collectLocalDeclDirectLambdaTargets(*bs, out);
+        return;
+    }
+    if (auto* fs = dynamic_cast<const ast::ForStmt*>(&s)) {
+        for (const auto& bs : fs->body)
+            if (bs) collectLocalDeclDirectLambdaTargets(*bs, out);
+        return;
+    }
+    if (auto* db = dynamic_cast<const ast::DoEndBlock*>(&s)) {
+        for (const auto& bs : db->body)
+            if (bs) collectLocalDeclDirectLambdaTargets(*bs, out);
+        return;
+    }
+    if (auto* trys = dynamic_cast<const ast::TryStmt*>(&s)) {
+        for (const auto& bs : trys->body)
+            if (bs) collectLocalDeclDirectLambdaTargets(*bs, out);
+        for (const auto& arm : trys->catches)
+            if (arm.body) collectLocalDeclDirectLambdaTargets(*arm.body, out);
+        for (const auto& bs : trys->finallyBody)
+            if (bs) collectLocalDeclDirectLambdaTargets(*bs, out);
+        return;
+    }
+    if (auto* cs = dynamic_cast<const ast::CaseStmt*>(&s)) {
+        for (const auto& arm : cs->arms)
+            for (const auto& bs : arm.stmts)
+                if (bs) collectLocalDeclDirectLambdaTargets(*bs, out);
+        return;
+    }
 }
 
 // fix #3571 (§28.3 SB01-B / §31.1, v0.286): the ONE traversal reaching every
@@ -8340,9 +8440,14 @@ void MethodOwnership::checkLambdaTaskFamilyBorrowReturnsExpr(
     std::vector<const ast::LambdaExpr*> lambdas;
     collectBodyLambdasExpr(e, lambdas);
     const auto* topLam = dynamic_cast<const ast::LambdaExpr*>(&e);
-    for (const ast::LambdaExpr* lam : lambdas)
-        checkOneLambdaTaskFamilyBorrowReturn(
-            *lam, lam == topLam ? topExpected : nullptr);
+    for (const ast::LambdaExpr* lam : lambdas) {
+        const sema::TypeRef* expected = lam == topLam ? topExpected : nullptr;
+        checkOneLambdaTaskFamilyBorrowReturn(*lam, expected);
+        // fix #4005 (§28.3, v0.294): the `=>` expression-body sibling of the
+        // block-body driver above — see checkOneLambdaOwnedReturnDirectBorrow's
+        // header comment.
+        checkOneLambdaOwnedReturnDirectBorrow(*lam, expected);
+    }
 }
 
 // #2166 / §28.10 (v0.220): the `using var` borrow-pin classification —
@@ -9278,6 +9383,157 @@ void MethodOwnership::checkOneLambdaTaskFamilyBorrowReturn(
     // lambda. A nested lambda's returns belong to it and are checked when the
     // collector reaches it separately. fix #3571: `scanReturnsIn` is the
     // shared traversal — was its own copy here. // per §28.3
+    for (const auto& s : lam.stmts)
+        if (s) scanReturnsIn(*s, classifyReturn);
+}
+
+// fix #4005 (§28.3 *Borrow lifetime rules* / *Concrete-slot function bodies*,
+// v0.294): see the header comment (Ownership_impl.hpp) for the full
+// rationale — this is the owned-target sibling of
+// checkOneLambdaTaskFamilyBorrowReturn immediately above, which explicitly
+// declines the case this function handles (`if (effOwned) return;`).
+// Structurally this mirrors checkOwnedReturnDirectBorrow (Ownership_Checks.
+// cpp, #3993) applied to a lambda body instead of a named method's, reusing
+// the same `ownedArgSourceIsBorrow` classifier and the same three exclusions
+// (a `move` transfer, a bare owned-field read, a bare catch-bound identifier)
+// plus the same IEnumerable/IAsyncEnumerable non-disposable exemption (stdlib
+// §4.12) — see checkOwnedReturnDirectBorrow's comment for why that exemption
+// is scoped to THIS check's own double-dispose reasoning only, not a general
+// safety claim (issue #4007). // per §28.3, stdlib §4.12
+void MethodOwnership::checkOneLambdaOwnedReturnDirectBorrow(
+        const ast::LambdaExpr& lam, const sema::TypeRef* expectedFnType) {
+    const sema::TypeRef* lamTy = ctx_.exprType(lam);
+    const sema::TypeRef* effRet = nullptr;
+    bool effOwned = false;
+    if (lamTy && lamTy->kind == sema::TypeRef::Kind::Function &&
+        lamTy->funcReturn) {
+        effRet = lamTy->funcReturn;
+        effOwned = lamTy->funcReturnOwned;
+    } else if (expectedFnType &&
+               expectedFnType->kind == sema::TypeRef::Kind::Function &&
+               expectedFnType->funcReturn) {
+        effRet = expectedFnType->funcReturn;
+        effOwned = expectedFnType->funcReturnOwned;
+    }
+    // fix #4005: `lamTy` (the lambda LITERAL's own inferred function
+    // TypeRef, set by ExprTypecheck's LambdaExpr arm) never carries the
+    // target's `owned` marker on `funcReturnOwned` — only `funcReturn` (the
+    // return TYPE HEAD) is threaded from inference
+    // (`lamTy->funcReturn = inferredReturn;` in ExprTypecheck_Exprs.cpp has
+    // no accompanying `funcReturnOwned` assignment at all, even though the
+    // #1820 target-return-owned hint is available there and used for a
+    // DIFFERENT check, checkConcreteSlotLambdaBody) — so `effOwned` off the
+    // primary (`lamTy`) path above is ALWAYS false, even for a lambda
+    // unambiguously checked against an owned-returning target (a typed
+    // LocalDecl's declared type: `var mk: () -> owned Res := lambda() =>
+    // b;`, this issue's own measured repro). `expectedFnType` — supplied by
+    // the caller from that DECLARED target position, not re-derived here —
+    // is therefore OR'd in rather than only consulted when `lamTy` supplied
+    // nothing, so a correctly-inferred `effRet` from `lamTy` is not
+    // discarded just because ITS `funcReturnOwned` is (always) false. This
+    // OR only affects this function's own local `effOwned`; the sibling
+    // checkOneLambdaTaskFamilyBorrowReturn's resolution and behavior are
+    // untouched. // per §28.3
+    if (!effOwned && expectedFnType &&
+        expectedFnType->kind == sema::TypeRef::Kind::Function &&
+        expectedFnType->funcReturnOwned) {
+        effOwned = true;
+        if (!effRet) effRet = expectedFnType->funcReturn;
+    }
+    if (!effRet) return;
+    // This check is ONLY about the `owned`-target contract — the plain-Task
+    // case is the sibling function's job. // per §28.3
+    if (!effOwned) return;
+    // Stdlib §4.12: `IEnumerable<T>` / `IAsyncEnumerable<T>` do not extend
+    // `IDisposable` / `IAsyncDisposable` — no `.Dispose()` is reachable
+    // through either static type, so this check's own double-dispose
+    // reasoning does not apply. Mirrors checkOwnedReturnDirectBorrow's
+    // identical exemption (#3993, #4007). // per stdlib §4.12
+    {
+        std::string_view head = effRet->headName();
+        if (head == "IEnumerable" || head == "IAsyncEnumerable") return;
+    }
+    MethodOwnership sub(ctx_);
+    auto classifyReturn = [&](const ast::Expr& re) {
+        if (auto* un = dynamic_cast<const ast::UnaryExpr*>(&re))
+            if (un->op == "move") return;  // owned transfer, not a borrow
+        if (sub.exprIsOwnedFieldRead(*lookThroughForceUnwrap(&re)))
+            return;  // legal receiver-sourced owned transfer
+        if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&re))
+            if (sub.isCatchBorrow(ctx_.exprSymbol(*id)))
+                return;  // its own unconditional rejection elsewhere
+        if (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(&re)) {
+            if (auto* pid = pb->operand ? dynamic_cast<const ast::IdentifierExpr*>(
+                                              pb->operand.get())
+                                        : nullptr) {
+                if (auto* ps = dynamic_cast<sema::ParameterSymbol*>(
+                        ctx_.exprSymbol(*pid))) {
+                    if (ps->modifier == "owned" || ps->modifier == "out owned")
+                        return;  // bare force-unwrap of a named OWNED param
+                }
+            }
+        }
+        bool isBorrow = sub.ownedArgSourceIsBorrow(re);
+        if (!isBorrow) {
+            // `ownedArgSourceIsBorrow` classifies a bare LOCAL (as opposed to
+            // a parameter/field) purely off `states_` (Owned vs Borrowed) —
+            // populated for the ENCLOSING method's own dataflow, never for a
+            // lambda body (deliberately: these lambda-body pre-passes are
+            // "syntactic, independent of the enclosing method's dataflow",
+            // per checkOneLambdaTaskFamilyBorrowReturn's own header, so a
+            // FRESH `sub` never has any `states_` to look up). So a fresh
+            // `sub` always falls through to "not a borrow" for ANY bare
+            // local read — correct for a local this LAMBDA'S OWN body
+            // declared (a fresh production it legitimately owns), but wrong
+            // for a CAPTURED local from an ENCLOSING scope: the lambda did
+            // not itself produce that value, and the enclosing scope's own
+            // disposal (a `using var`'s scope-end auto-drop, or an ordinary
+            // owned-local discharge) is entirely unaffected by what a
+            // captured closure later does with it — so returning it here as
+            // `owned` mints a SECOND discharge path for the same object,
+            // whether the captured local is Owned or Borrowed at the
+            // enclosing level (`var mk: () -> owned Res := lambda() => b;`
+            // where `b` is a `using var` — measured heap-use-after-free,
+            // issue #4005). Distinguish "this lambda's own local" from "a
+            // capture" structurally: a local this lambda's own body declared
+            // has its `LocalDecl` (or synthesized anchor) positioned INSIDE
+            // this lambda's own source span; a captured enclosing local's
+            // declaration lies outside it (before, or in a different
+            // function entirely). Scoped to a BARE identifier only — a
+            // captured local reached through a member/index chain is left
+            // to the field/indexer classification above, unaffected by this
+            // addition. // per §28.3
+            if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&re)) {
+                if (auto* ls = dynamic_cast<sema::LocalSymbol*>(
+                        ctx_.exprSymbol(*id))) {
+                    const bool declaredInLambda =
+                        ls->decl &&
+                        ls->decl->span.begin.offset >=
+                            lam.span.begin.offset &&
+                        ls->decl->span.end.offset <= lam.span.end.offset;
+                    if (!declaredInLambda) isBorrow = true;
+                }
+            }
+        }
+        if (!isBorrow) return;
+        report(
+            Severity::Error, re.span.begin,
+            "a borrow cannot be returned as an `owned` value: the lambda is "
+            "checked against a target function type whose return is "
+            "`owned`, telling the caller it receives a value it must "
+            "dispose, but this return expression is a borrow, or a captured "
+            "variable from an enclosing scope (a plain parameter, a "
+            "captured local or parameter, a non-`owned` field, or an "
+            "indexer-get) — its real owner disposes it too, a double-free "
+            "(§28.3 *Borrow lifetime rules*). Return a "
+            "freshly-produced value (`new T(...)`), a call returning "
+            "`owned T`, or `move` an owned local or an owned field of "
+            "`this`");
+    };
+    if (lam.exprBody) {
+        classifyReturn(*lam.exprBody);
+        return;
+    }
     for (const auto& s : lam.stmts)
         if (s) scanReturnsIn(*s, classifyReturn);
 }
@@ -10559,24 +10815,60 @@ void checkMember(const ast::Member& m, sema::SemaContext& ctx,
         // check runs ahead of body analysis (an Abstract operator has no
         // body to analyse).
         checkOperatorReturnDeclaration(*od, enclosingType, ctx);
+        // fix #4004 (§28.3 *Borrow lifetime rules* / §28.6 *Methods returning
+        // `this`*, v0.294): an operator is `public static method operator`
+        // per §25 — an ordinary static method for every other ownership
+        // purpose (checkOperatorReturnDeclaration above already treats it
+        // that way) — but `mo.run(od->stmts)` used to pass every optional
+        // argument at its default (paramSyms=nullptr, returnType=nullptr,
+        // returnOwned=false, isStatic=false), so NONE of handleReturn's
+        // return-type-aware checks (including #3993's
+        // checkOwnedReturnDirectBorrow) were reachable for a block-bodied
+        // operator, and the equivalent drive was entirely MISSING for an
+        // expression-bodied one (only the narrower lambda-borrow-return
+        // pre-pass ran). `static method operator +(a: Res, b: Res): owned
+        // Res return b;` compiled with zero diagnostics and double-freed at
+        // runtime — the identical #3993 shape, just unreached. Wire the full
+        // signature, mirroring the MethodDecl arm above exactly (operators
+        // are always static, §25).
+        //
+        // Operators carry no method-level generic parameters of their own
+        // (A.4 grammar; checkOperatorReturnDeclaration's own comment: "a
+        // bare-T return can only name the enclosing type's parameter"), so
+        // only the enclosing-type leg of GenericReturnContext is populated —
+        // this admits a generic operator returning a bare `owned T` sourced
+        // from an `owned` parameter without a false reject. // per §28.3
+        GenericReturnContext opGenericCtx;
+        if (enclosingType) {
+            opGenericCtx.enclosingParams = &enclosingType->genericParams;
+            opGenericCtx.enclosingConstraints =
+                &enclosingType->genericConstraints;
+        }
+        const bool isGenericOpBody =
+            enclosingType && !enclosingType->genericParams.empty();
         if (od->bodyKind == ast::MethodBodyKind::Block) {
             MethodOwnership mo(ctx);
-            mo.run(od->stmts);
+            mo.run(od->stmts, paramSymsOf(m, ctx), /*isAsync=*/false,
+                   /*isDestructor=*/false, od->returnType.get(),
+                   od->returnOwned, /*isStatic=*/true, &opGenericCtx,
+                   isGenericOpBody);
         } else if (od->bodyKind == ast::MethodBodyKind::Expression &&
                    od->exprBody) {
-            // §28.3 SB01-B (v0.190, #1926): an EXPRESSION-bodied operator
-            // (`operator +(...): T => E`) is otherwise not ownership-analysed —
-            // only the Block arm above reaches run(), which carries the lambda
-            // borrow-return pre-pass. Wire the same pre-pass over its `=> E`
-            // body so an identity `Task`-family lambda in an expression-bodied
-            // operator is rejected exactly as one in an expression-bodied
-            // method body. // per §28.3 SB01-B (v0.190)
+            // §28.3 SB01-B (v0.190, #1926) / fix #4004: an EXPRESSION-bodied
+            // operator (`operator +(...): T => E`) is otherwise not
+            // ownership-analysed at all beyond the narrow lambda-borrow-
+            // return pre-pass. Run the FULL expression-body owning-return
+            // check (mirrors the MethodDecl Expression arm above) — it
+            // already includes that same pre-pass
+            // (checkLambdaTaskFamilyBorrowReturnsExpr /
+            // checkLambdaBodyEscapesExpr are called from inside it), so the
+            // two calls this arm used to make standalone are now redundant
+            // with (and would double-report alongside) the full check.
             MethodOwnership mo(ctx);
-            mo.checkLambdaTaskFamilyBorrowReturnsExpr(
-                *od->exprBody,
-                od->returnType ? ctx.resolvedType(*od->returnType) : nullptr);
-            // fix #3546 (§31.1, v0.283): same reachability gap, same position.
-            mo.checkLambdaBodyEscapesExpr(*od->exprBody);
+            mo.runExprBodyOwningReturnCheck(
+                *od->exprBody, paramSymsOf(m, ctx), od->returnType.get(),
+                od->returnOwned, /*isAsync=*/false, /*isStatic=*/true,
+                &opGenericCtx);
         }
     } else if (auto* fd = dynamic_cast<const ast::FieldDecl*>(&m)) {
         // #1484 / §28.6: a field INITIALIZER (`f: T := E`) is an ownership-
