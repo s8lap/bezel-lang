@@ -10763,16 +10763,89 @@ bool isNonNullableReferenceField(const ast::FieldDecl& f,
     }
 }
 
+// fix #4012 / §7.9: the auto-property analogue of isNonNullableReferenceField
+// above — same classification, mirrored onto ast::PropertyDecl exactly as
+// DefiniteAssignment.cpp's isSevenNineStrictAutoProp mirrors its own
+// isSevenNineStrictField (the "duplication-by-design" pattern that comment
+// documents: Ownership.cpp and DefiniteAssignment.cpp are different
+// translation units with no shared header for this predicate, so each pass
+// keeps its own copy in lock-step rather than one reaching across files).
+// checkOwnedFieldDA's member loop previously matched ast::FieldDecl only, so
+// a class's non-nullable auto-property storage (`public property X: C;`) was
+// invisible to the no-constructor screen: `new C()` compiled clean and
+// SIGSEGVed on first read (issue #4012, found fixing #4001's record-side
+// gap). An indexer has no backing storage and is excluded; a computed
+// (block/expression-bodied) property likewise has none. An initialized
+// auto-property (`:= …`) is assigned at construction — excluded by the
+// caller, mirroring how isNonNullableReferenceField leaves f->initializer to
+// its own caller.
+//
+// The `abstract` shorthand (`abstract property Name: T;`, §12.5/#1614) is a
+// SIGNATURE-ONLY declaration with no backing storage at all — subclasses
+// must supply the real implementation — but the parser gives it the exact
+// same PropertyBodyKind::Auto as an ordinary auto-property (Parser_Decls.cpp,
+// the class-member property-body dispatch: an interface's own version of
+// this ambiguity is already named at TypeResolution_Checks.cpp's `pure`
+// check, "An interface property's signature-only form parses as Auto but is
+// an abstract declaration, not an auto-property with backing storage"). The
+// `abstract` modifier is the only signal distinguishing the two shapes for a
+// CLASS-level property (an abstract class's abstract property, unlike an
+// interface member, has no separate AST node to key on) — measured false-
+// reject without this exclusion: tests/lit/sema/sema_prop_override_1614__
+// abstract_shorthand_override_ok.bzl's `abstract class Base ... abstract
+// property Name: string; end Base;` (no ctor) newly rejected. `virtual`
+// (unlike `abstract`) DOES carry real default-implementation backing storage
+// and stays §7.9-strict.
+bool isNonNullableReferenceAutoProp(const ast::PropertyDecl& p,
+                                     sema::SemaContext& ctx) {
+    if (p.bodyKind != ast::PropertyBodyKind::Auto) return false;
+    if (p.isIndexer) return false;
+    for (auto m : p.modifiers) {
+        if (m == "static" || m == "abstract") return false;
+    }
+    if (!p.type) return false;
+    auto* rt = ctx.resolvedType(*p.type);
+    if (!rt || rt->nullable) return false;
+    switch (rt->kind) {
+        case sema::TypeRef::Kind::Primitive:
+            return rt->primitive == sema::PrimitiveType::String ||
+                   rt->primitive == sema::PrimitiveType::Object;
+        case sema::TypeRef::Kind::Function:
+            return true;
+        case sema::TypeRef::Kind::Named:
+            if (!rt->declaration) return false;  // built-in/generic — skip
+            if (rt->declaration->kind == ast::TypeDeclKind::Enum) {
+                std::optional<bool> hasZero =
+                    enumHasZeroConstant(*rt->declaration);
+                return hasZero && !*hasZero;
+            }
+            return rt->declaration->kind == ast::TypeDeclKind::Class ||
+                   rt->declaration->kind == ast::TypeDeclKind::Interface;
+        default:
+            return false;  // Unit, InlineArray, Error → value/unknown
+    }
+}
+
 void checkOwnedFieldDA(const ast::TypeDecl& td, sema::SemaContext& ctx) {
-    // Gather non-nullable reference fields without initializers (§7.9).
-    // Owned fields are a subset.
-    std::vector<const ast::FieldDecl*> ownedNoInit;
+    // Gather non-nullable reference fields AND auto-properties without
+    // initializers (§7.9). Owned fields are a subset. fix #4012: a single
+    // slot struct lets the loop below hold both storage forms, since the
+    // diagnostic that follows treats them identically (a name + a location).
+    struct StrictSlot {
+        std::string_view name;
+        SourceLocation loc;
+    };
+    std::vector<StrictSlot> ownedNoInit;
     for (const auto& m : td.members) {
-        auto* f = dynamic_cast<const ast::FieldDecl*>(m.get());
-        if (!f) continue;
-        if (!isNonNullableReferenceField(*f, ctx)) continue;
-        if (f->initializer) continue;
-        ownedNoInit.push_back(f);
+        if (auto* f = dynamic_cast<const ast::FieldDecl*>(m.get())) {
+            if (!isNonNullableReferenceField(*f, ctx)) continue;
+            if (f->initializer) continue;
+            ownedNoInit.push_back({f->name, f->span.begin});
+        } else if (auto* p = dynamic_cast<const ast::PropertyDecl*>(m.get())) {
+            if (!isNonNullableReferenceAutoProp(*p, ctx)) continue;
+            if (p->autoInitializer) continue;
+            ownedNoInit.push_back({p->name, p->span.begin});
+        }
     }
     if (ownedNoInit.empty()) return;
     // Does this class declare any non-static (instance) constructor?
@@ -10796,10 +10869,10 @@ void checkOwnedFieldDA(const ast::TypeDecl& td, sema::SemaContext& ctx) {
     // a constructor is checked there; a class with NONE is not visited by the
     // DA constructor walk, so that case stays here.
     if (!hasInstanceCtor) {
-        for (auto* f : ownedNoInit) {
+        for (const auto& slot : ownedNoInit) {
             ctx.diagnostics().report(
-                Severity::Error, f->span.begin,
-                std::string("non-nullable field `") + std::string(f->name) +
+                Severity::Error, slot.loc,
+                std::string("non-nullable field `") + std::string(slot.name) +
                 "` needs an initializer or a constructor that assigns "
                 "it (§7.9)");
         }
