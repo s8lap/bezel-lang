@@ -343,6 +343,52 @@ BEZEL_TEST(sema_static_field_da_4015,
         9);
 }
 
+// Self-review catch: the auto-PROPERTY analogue of the two ctor-assigns tests
+// above, pinning a real false-reject this fix's own implementation produced
+// and then corrected before shipping. `isThisFieldOrAutoPropTarget`'s
+// PropertySymbol arm reused `isAutoPropertyStorageSymbol` — which answers
+// `false` for EVERY static property by its own documented contract (it
+// classifies per-object INSTANCE backing-storage layout, which a static
+// property's one process-global slot never participates in) — so a static
+// constructor's `Shared := v;` on its own type's static auto-property was
+// invisible to §7.9 completion marking: the assignment compiled and ran
+// fine, yet `checkCtorFieldCompletion` still reported the property
+// unassigned. Class and record.
+BEZEL_TEST(sema_static_field_da_4015,
+           class_static_ctor_assigns_autoprop_accepted_spec_7_9) {
+    BEZEL_EXPECT_EQ(runProg(std::string(kWidget4015) +
+        "public class StaticClass4015F2 "
+        "  public static readonly property Shared: Widget4015; "
+        "  static constructor() "
+        "    Shared := new Widget4015(16); "
+        "  end constructor; "
+        "end StaticClass4015F2; "
+        "class C "
+        "  public static method Main(): int "
+        "    return StaticClass4015F2.Shared.Render(); "
+        "  end Main; "
+        "end C;"),
+        16);
+}
+
+BEZEL_TEST(sema_static_field_da_4015,
+           record_static_ctor_assigns_autoprop_accepted_spec_7_9) {
+    BEZEL_EXPECT_EQ(runProg(std::string(kWidget4015) +
+        "public record StaticRec4015F2(X: int) "
+        "  public static readonly property Shared: Widget4015; "
+        "  static constructor() "
+        "    Shared := new Widget4015(17); "
+        "  end constructor; "
+        "end StaticRec4015F2; "
+        "class C "
+        "  public static method Main(): int "
+        "    var r := new StaticRec4015F2(5); "
+        "    return StaticRec4015F2.Shared.Render(); "
+        "  end Main; "
+        "end C;"),
+        17);
+}
+
 // A NULLABLE static field has a well-defined default (`null`) and is exempt
 // whether or not a static constructor exists.
 BEZEL_TEST(sema_static_field_da_4015,

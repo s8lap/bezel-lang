@@ -2219,11 +2219,43 @@ private:
         // property setter invocation and gates it as an observation. MEASURED:
         // `this.W := 5;` on an imported base's auto-property was rejected under
         // §22.7 while its single-module twin ran and returned 7.
-        if (auto* ps = dynamic_cast<PropertySymbol*>(sym))
-            if (!ps->isIndexer && isAutoPropertyStorageSymbol(ps, ctx_)) {
+        if (auto* ps = dynamic_cast<PropertySymbol*>(sym)) {
+            if (ps->isIndexer) return false;
+            if (isAutoPropertyStorageSymbol(ps, ctx_)) {
                 out = name;
                 return true;
             }
+            // fix #4015 / §7.9: `isAutoPropertyStorageSymbol` answers `false`
+            // for EVERY static property by its own documented contract
+            // (`hasAstAutoPropertyDecl`, SymbolCollection.cpp: "for auto mod :
+            // ps->modifiers if (mod == "static") return false;") — it
+            // classifies INSTANCE per-object backing-storage layout, which a
+            // static property's storage (one process-global slot, not part of
+            // any object's layout) never participates in. Reusing it verbatim
+            // here made a static constructor's `Shared := v;` on its OWN
+            // type's static auto-property invisible to this marking — a
+            // MEASURED false reject (the assignment compiled and ran fine,
+            // yet checkCtorFieldCompletion still reported it unassigned,
+            // c16/c17-shaped repros caught by self-review before this fix
+            // shipped). Scoped to `staticCtorMode_` only, so instance/record
+            // ctor marking (which must keep using the INSTANCE-storage
+            // question above) is untouched.
+            if (staticCtorMode_) {
+                auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
+                if (pd && !pd->isIndexer &&
+                    pd->bodyKind == ast::PropertyBodyKind::Auto) {
+                    bool isStatic = false, isAbstract = false;
+                    for (auto mod : ps->modifiers) {
+                        if (mod == "static") isStatic = true;
+                        else if (mod == "abstract") isAbstract = true;
+                    }
+                    if (isStatic && !isAbstract) {
+                        out = name;
+                        return true;
+                    }
+                }
+            }
+        }
         return false;
     }
 
