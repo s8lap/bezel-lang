@@ -9281,18 +9281,50 @@ bool ExprTC::altMemberNamesType(const ast::Expr* c) {
 // member reaches it directly, #1584).
 bool ExprTC::altPartsNameType(const std::vector<std::string_view>& parts) {
     if (parts.empty()) return false;
+    // fix #4048 (§27.8/§19.3, v0.294): resolve a module-level `type` alias
+    // symbol through to the TypeSymbol it names — the aliased type's
+    // TypeRef is already eagerly resolved by Resolver::resolveTopDecl when
+    // the `type` declaration itself was processed (the same fact fix #578's
+    // type-position alias transparency and fix #4038's resolveMemberAccess
+    // arm both reuse), so a chained alias (`type A := B; type B := C;`,
+    // inner declared first — #4047 tracks the reverse order separately)
+    // resolves all the way through in one call. Returns null for an alias
+    // whose underlying type is not a user TypeSymbol (a primitive, a
+    // function type, or a bare generic parameter) — none of those are the
+    // TypeSymbol-based "type" this classification recognizes, and callers
+    // treat a null return as "not a type" exactly as before this fix.
+    auto resolveAliasToTypeSymbol = [&](TypeAliasSymbol* aliasSym) -> TypeSymbol* {
+        const auto* aliasDecl = dynamic_cast<const ast::TypeAlias*>(aliasSym->decl);
+        if (!aliasDecl || !aliasDecl->aliasedType) return nullptr;
+        TypeRef* underlying = ctx_.resolvedType(*aliasDecl->aliasedType);
+        if (!underlying || underlying->kind != TypeRef::Kind::Named) return nullptr;
+        return underlying->declaration;
+    };
     // Resolve the head. A resolved non-type symbol (local/param/const/enum
     // constant) shadows a same-named type and means "not a type".
     TypeSymbol* ts = nullptr;
     if (Symbol* head = lookupName(parts[0])) {
         if (auto* t = dynamic_cast<TypeSymbol*>(head)) ts = t;
         else if (auto* nt = dynamic_cast<NestedTypeSymbol*>(head)) ts = nt->type;
+        else if (auto* aliasSym = dynamic_cast<TypeAliasSymbol*>(head))
+            ts = resolveAliasToTypeSymbol(aliasSym);
         else return false;  // resolves to a value/const → not a type
     } else {
-        // Not in scope: fall back to a top-level TypeSymbol of that name.
-        for (const auto& sym : ctx_.symbols())
+        // Not in scope: fall back to a top-level TypeSymbol of that name —
+        // or, per #4048, a top-level TypeAliasSymbol of that name (the same
+        // gap this function's primary arm above has; a module-level alias
+        // is registered at module scope, so this arm is defensive symmetry
+        // rather than a shape #4048's own repro reaches: `lookupName` finds
+        // a same-module alias directly, landing in the branch above).
+        for (const auto& sym : ctx_.symbols()) {
             if (auto* t = dynamic_cast<TypeSymbol*>(sym.get()))
                 if (t->name == parts[0]) { ts = t; break; }
+            if (auto* aliasSym = dynamic_cast<TypeAliasSymbol*>(sym.get()))
+                if (aliasSym->name == parts[0]) {
+                    ts = resolveAliasToTypeSymbol(aliasSym);
+                    break;
+                }
+        }
     }
     if (!ts) return false;
     if (parts.size() == 1) return true;  // bare type name (`Circle`)
