@@ -597,6 +597,13 @@ llvm::Value* Emitter::lowerUnary(const ast::UnaryExpr& un) {
                 // (LOCALDECL-ONLY, its own comment), so this never overlaps
                 // the other three cases.
                 const bool isArmTransferDischarge = [&]() -> bool {
+                    // LOCALDECL-ONLY: `dischargedByArmTransfer` is set ONLY by
+                    // consumeMarkedArmTransfer (Ownership_Checks.cpp), which
+                    // requires an Owned production a §21.1 `const` local can
+                    // never bind, so the flag can never be set on a
+                    // LocalConstDecl target. `loc->decl` here is always a var
+                    // LocalDecl. Mirrors Ownership.cpp:991's identical
+                    // reasoning for this SAME flag. // per §21.1, §28.3 K3.4, #3591
                     if (auto* ld = dynamic_cast<const ast::LocalDecl*>(loc->decl))
                         return ld->dischargedByArmTransfer;
                     return false;

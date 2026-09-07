@@ -20,9 +20,13 @@
 #include <string>
 
 #include "support/aot_support.hpp"  // runAotChecked — AOT + ASan/LSan oracle
+#include "support/ownership_support.hpp"  // parseAndCheckOwnership / hasErrorMessage — §3591 const-target question below
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
+using bezel::test::OwnershipResult;
+using bezel::test::hasErrorMessage;
+using bezel::test::parseAndCheckOwnership;
 using bezel::test::runAotChecked;
 
 namespace {
@@ -530,4 +534,55 @@ BEZEL_TEST(marked_arm_transfer_2080,
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_EQ(countOccurrences(r.stdoutText, "D3"), 2);  // one per call
     BEZEL_EXPECT_EQ(countOccurrences(r.stdoutText, "R6"), 1);
+}
+
+// #3591 / §21.1 / §28.3 K3.4 (v0.294): the ratchet-review question behind
+// this fix's own `isArmTransferDischarge` LOCALDECL-ONLY marker
+// (LlvmBackend_Exprs2.cpp) — can a §21.1 `const` local ever legitimately be
+// the TARGET of a K3.4 marked arm transfer (`move cached` / `owned cached`)?
+// MEASURED: no, on TWO independent, layered grounds, so `consumeMarkedArm
+// Transfer`'s LOCALDECL-ONLY restriction to `ast::LocalDecl` never silently
+// skips a `const`. (1) §21.1's own Ownership paragraph rejects a `const`
+// initializer that is a fresh owned production (`new Res(9)` here) OUTRIGHT,
+// at the `const` DECLARATION itself — a `const` local can never even come to
+// HOLD an owned class value in the first place. (2) Independently,
+// `consumeMarkedArmTransfer`'s own `st->state != OwnershipState::Owned`
+// early-return (Ownership_Checks.cpp) would ALSO reject the marker, since a
+// `const`-backed symbol's state can never be Owned (§21.1 again) — the SAME
+// defensive reasoning already pinned for the `owned` spelling by #3591's own
+// `spec_28_3_same_binding_both_arms`-adjacent guard. Confirmed identical for
+// all three shapes this row's sibling coalesce/case tests exercise for a
+// `var` target: a bare `move` if-arm (pinned below), the `owned` spelling of
+// the same, and a `move` `case`-arm — all three produce the SAME two-error
+// shape (the §21.1 declaration-site rejection plus the K3.4 "not an owned
+// binding at this point" rejection) and zero programs compile, so no
+// leak/UAF is reachable through this binding form. Pinning the `move`
+// if-arm shape below as the representative row.
+BEZEL_TEST(marked_arm_transfer_2080,
+           const_target_of_move_arm_transfer_rejected_21_1_28_3_3591) {
+    OwnershipResult r = parseAndCheckOwnership(
+        "module M; "
+        "class Res "
+        "  public Id: int; "
+        "  public constructor(id: int) Id := id; end constructor; "
+        "  destructor end destructor; "
+        "end Res; "
+        "class C "
+        "  public static method Pick(useFresh: bool): int "
+        "    const cached := new Res(9); "
+        "    var x := (if useFresh then new Res(1) else move cached); "
+        "    var v := x.Id; "
+        "    x.Dispose(); "
+        "    return v; "
+        "  end Pick; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    // (1) the §21.1 declaration-site rejection — a `const` may never take an
+    // owned production.
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "must not take an owned production"));
+    // (2) the independent K3.4 defensive rejection — even were (1) somehow
+    // bypassed, the marker's own operand-state check still refuses.
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "requires a named owned binding"));
 }
