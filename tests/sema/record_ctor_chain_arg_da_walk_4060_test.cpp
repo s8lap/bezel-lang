@@ -43,6 +43,25 @@
 // chain call's own argument list, which is exactly what these rows exploit).
 // Rows 3-5 sweep the accept side (LANE_RULES §15): a chain call must keep
 // compiling correctly for the ordinary shapes that do nothing wrong.
+//
+// CORRECTION (review of ace3702, this fix's own commit): that commit's
+// message overstated its FAIL-WITHOUT proof, listing all four
+// non-class-control rows below — out_var_unguarded_read_rejected AND the
+// three accept-controls (own_parameter_control_accepted,
+// multi_level_chain_control_accepted, lambda_capture_control_accepted) — as
+// "differing from their PASS-WITH result". Measured precisely: reverting
+// src/sema/DefiniteAssignment.cpp to this fix's parent (origin/main
+// a6e270d) and re-running this filter gives "4 passed, 1 failed" —
+// EXACTLY ONE row differs: out_var_unguarded_read_rejected (compiles clean
+// pre-fix instead of rejecting). The three accept-controls pass IDENTICALLY
+// on both the pre-fix and post-fix compiler, and correctly so: the missing
+// chain-argument walk this fix closes only ever caused silent
+// OVER-acceptance (a check that should have run never ran), never a false
+// rejection, so those shapes were never broken and an accept-control
+// passing on both sides is the desired outcome, not a sign the row is
+// vacuous — only a REJECT row can meaningfully "differ" between the two
+// compilers. class_control_out_var_unguarded_read_rejected likewise passes
+// both sides (an unaffected parity pin — runConstructor was never touched).
 
 #include <cstdio>
 #include <regex>

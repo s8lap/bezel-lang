@@ -22,6 +22,22 @@
 // wart in the class path this fix does not attempt to correct (hence Row 1's
 // real-location assertion is on the OTHER diagnostic in the same reject,
 // none needed here -- see Row 1's comment).
+//
+// CORRECTION (review of 18af1e7, this fix's own commit): that commit's
+// message overstated its FAIL-WITHOUT proof, listing both
+// unassigned_out_param_rejected AND assigned_out_param_control_accepted as
+// "both differ from PASS-WITH". Measured precisely: reverting
+// src/sema/DefiniteAssignment.cpp to this fix's parent (ace3702, #4060) and
+// re-running this filter gives "2 passed, 1 failed" — EXACTLY ONE row
+// differs: unassigned_out_param_rejected (compiles clean pre-fix instead of
+// rejecting). assigned_out_param_control_accepted passes IDENTICALLY on
+// both the pre-fix and post-fix compiler, and correctly so: the missing
+// out-param seeding this fix closes only ever caused a missed REJECTION
+// (checkOutParams never ran), never a false rejection of a correctly
+// assigned parameter — so that shape was never broken and passing on both
+// sides is the desired outcome, not a sign the row is vacuous.
+// class_control_unassigned_out_param_rejected likewise passes both sides
+// (an unaffected parity pin — runConstructor was never touched).
 
 #include <cstdio>
 #include <string>
