@@ -57,7 +57,12 @@
 //     auto-equality census, but are ordinary static members otherwise)
 //   * alias of a CLOSED generic instantiation (`type A := G<int>;`)
 //   * alias of a NESTED type (`type A := Outer.Inner;`)
-//   * chained alias-of-alias (`type A := B; type B := SomeClass;`)
+//   * chained alias-of-alias, INNER DECLARED BEFORE OUTER
+//     (`type Inner := SomeClass; type Outer := Inner;`, inner textually
+//     FIRST) — FIXED. The REVERSE declaration order (`type Outer := Inner;
+//     type Inner := SomeClass;`, outer textually first) is a SEPARATE,
+//     pre-existing, upstream bug this fix does not touch — see #4047 below
+//     and its pinning control test.
 //   * anti-regression: instance-member access via an alias-typed local
 //     (`var x: AliasOf := new C(); x.Field`) — this path was ALREADY correct
 //     pre-fix (it resolves via TypeResolution_Names.cpp's TYPE-POSITION alias
@@ -300,6 +305,12 @@ BEZEL_TEST(type_alias_static_member_4038, nested_type_alias_static_field) {
 
 // §27.8: "Aliases of aliases are permitted" — a chained alias-of-alias must
 // see through BOTH hops to the real static storage.
+//
+// ⚠ This FIXED verdict holds ONLY for this declaration order — the inner
+// alias (`AliasChainInner4038`) declared TEXTUALLY BEFORE the outer one
+// (`AliasChainOuter4038`) that names it. The REVERSE order is a separate,
+// pre-existing, upstream bug (#4047) this fix does not touch — see the
+// `chained_alias_of_alias_REVERSE_ORDER_known_open_4047` control below.
 BEZEL_TEST(type_alias_static_member_4038, chained_alias_of_alias_static_field) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
@@ -314,6 +325,87 @@ BEZEL_TEST(type_alias_static_member_4038, chained_alias_of_alias_static_field) {
         "    return StaticClassChain4038.Counter; "
         "  end Main; "
         "end C;"), 17);
+}
+
+// ── KNOWN-OPEN CONTROL for #4047 (NOT part of #4038's fix) ─────────────────
+//
+// §27.8: "Aliases of aliases are permitted" places no ordering requirement
+// on a chained alias declaration — `type Outer := Inner; type Inner :=
+// SomeClass;` (outer declared FIRST, inner declared second) must resolve
+// exactly like the reverse order pinned above. It currently does not.
+//
+// Root cause (found in review of #4038, filed as #4047, NOT fixed here):
+// `Resolver::resolveTopDecl` (TypeResolution.cpp) resolves each top-level
+// `type` alias's `aliasedType` in a SINGLE FORWARD PASS over `src.topDecls`
+// in file declaration order (confirmed at the call site:
+// `for (const auto& decl : src.topDecls) resolveTopDecl(*decl, &moduleScope);`).
+// When `Outer` is declared before `Inner`, resolving `Outer`'s aliased type
+// (a reference to `Inner`) runs BEFORE `Inner` itself has been resolved, so
+// fix #578's alias-transparency arm (TypeResolution_Names.cpp) sees a null
+// `ctx_.resolvedType(...)` for `Inner` and this fix's own new
+// TypeAliasSymbol arm (ExprTypecheck_Calls.cpp) inherits that same null —
+// this fix's mechanism is downstream of resolveTopDecl and cannot see past
+// a resolution the earlier pass never performed. #4047 confirmed by
+// revert/rebuild that this reproduces in PURE TYPE POSITION on the
+// pre-#4038 parent commit — it is 100% pre-existing, not a #4038 regression.
+//
+// Why this fix does not attempt #4047: a resolution-ORDER change to a
+// single forward pass that every top-level declaration (not just aliases)
+// resolves through is exactly the shape most likely to break unrelated
+// declaration shapes in ways a narrow alias-focused sweep would not catch
+// (e.g. a class whose base-type reference or field type is itself an alias
+// declared later in the file, or a generic constraint naming a
+// later-declared alias) — the default answer for an order-of-passes defect
+// found while fixing something else is "file it, do not attempt it inline."
+//
+// This test PINS THE CURRENTLY-BROKEN VALUE (0, not 17) so the day #4047 is
+// fixed this test starts FAILING — loudly, not silently — and must be
+// updated to assert the correct value (17) and have this KNOWN-OPEN framing
+// removed, rather than the fix silently going unnoticed.
+BEZEL_TEST(type_alias_static_member_4038,
+           chained_alias_of_alias_REVERSE_ORDER_known_open_4047) {
+    // KNOWN-OPEN (#4047): correct behavior is 17 (matching the
+    // inner-before-outer order pinned above); measured actual is 0 because
+    // `AliasChainOuterRev4047`'s aliasedType (`AliasChainInnerRev4047`) is
+    // resolved before `AliasChainInnerRev4047` itself is.
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "public class StaticClassChainRev4047 "
+        "  public static Counter: int; "
+        "end StaticClassChainRev4047; "
+        "type AliasChainOuterRev4047 := AliasChainInnerRev4047; "
+        "type AliasChainInnerRev4047 := StaticClassChainRev4047; "
+        "class C "
+        "  public static method Main(): int "
+        "    AliasChainOuterRev4047.Counter := 17; "
+        "    return StaticClassChainRev4047.Counter; "
+        "  end Main; "
+        "end C;"), 0);
+}
+
+// KNOWN-OPEN CONTROL for #4047, read half: the same reverse-order shape hits
+// the literal #2491 zero-lowering backstop on READ, exactly like #4038's own
+// read repro did pre-fix. Pins that this control's diagnostic-shape claim
+// (not just its final value) also flips visibly when #4047 lands.
+BEZEL_TEST(type_alias_static_member_4038,
+           chained_alias_of_alias_REVERSE_ORDER_read_hits_2491_known_open_4047) {
+    auto r = runAot(
+        "module M; "
+        "public class StaticClassChainRevRead4047 "
+        "  public static readonly Shared: string := \"hi\"; "
+        "end StaticClassChainRevRead4047; "
+        "type AliasChainOuterRevRead4047 := AliasChainInnerRevRead4047; "
+        "type AliasChainInnerRevRead4047 := StaticClassChainRevRead4047; "
+        "class C "
+        "  public static method Main(): int "
+        "    return AliasChainOuterRevRead4047.Shared.Length; "
+        "  end Main; "
+        "end C;");
+    // KNOWN-OPEN (#4047): correct behavior is r.exitCode == 2 ("hi".Length);
+    // measured actual is a #2491-degraded 0, exactly #4038's own read-repro
+    // symptom, on the reverse declaration order.
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
 
 // Anti-regression: instance-member access via an alias-TYPED local variable
