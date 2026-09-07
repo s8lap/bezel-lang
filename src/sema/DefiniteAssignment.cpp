@@ -688,6 +688,22 @@ public:
                     fieldsNeedingInit_.push_back(p->name);
             }
         }
+        // fix #4067 / §22.3, mirroring runConstructor: seed the record
+        // constructor's own `out` parameters as declared-but-unassigned so
+        // `checkOutParams` (called at fall-off below) can enforce that every
+        // one is definitely assigned on every normal-completion path. A
+        // record constructor's `out` parameter was previously never seeded
+        // here at all, so it silently received NO §22.3 checking (measured:
+        // a record constructor falling off with an unassigned `out`
+        // parameter compiled clean, while the identical class shape was
+        // already correctly rejected).
+        for (const auto& p : cd.params) {
+            if (!p.name.empty() && p.modifier.rfind("out", 0) == 0 &&
+                p.modifier.rfind("out var", 0) != 0) {
+                outParams_.insert(p.name);
+                declared_.insert(p.name);
+            }
+        }
         std::size_t startIdx = 0;
         bool isThisChain = false;
         // fix #4060 / §22.7 rule 1 / §22.3 / §29.11: a record's own
@@ -724,6 +740,11 @@ public:
             if (cd.body[i]) visitStmt(*cd.body[i]);
         }
         if (!terminated_) {
+            // fix #4067 / §22.3, mirroring runConstructor exactly (including
+            // its `nullptr` location argument — runConstructor's own
+            // out-param check reports at SourceLocation{} too, an existing
+            // wart in the class path this fix does not attempt to correct).
+            checkOutParams(/*loc=*/nullptr);
             // fix #4001 / §7.9 (Appendix C.1): the constructor's fall-off is
             // a normal-exit path too — mirrors runConstructor's own call.
             checkCtorFieldCompletion(&cd.span.begin);
