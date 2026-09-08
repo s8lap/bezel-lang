@@ -98,11 +98,11 @@ struct Entry {
 };
 
 // The WARNING-severity `internal:` degrades (sixteen as of v0.240; #3079 added
-// at v0.249; the two #3157 alarms and #3437's representation guard at v0.283),
-// each with the
-// judgement #2924 asks for.  Ordered by file, then by the tag.  The live count
-// is `kN`, derived from this array — the prose above is a changelog, not the
-// number the test asserts.
+// at v0.249; the two #3157 alarms and #3437's representation guard at v0.283;
+// #4045's AssignmentStmt generic-arm null-address exit at v0.294), each with
+// the judgement #2924 asks for.  Ordered by file, then by the tag.  The live
+// count is `kN`, derived from this array — the prose above is a changelog, not
+// the number the test asserts.
 const Entry kWarningDegrades[] = {
     {"src/codegen/LlvmBackend_Assign.cpp", "#2833",
      Disposition::UnsafePointer,
@@ -229,6 +229,20 @@ const Entry kWarningDegrades[] = {
      "stored there before; no null-pointer substitution, no UAF. The hazard "
      "is a stale field/indexer slot — bounded, observable, and now diagnosed."},
 
+    {"src/codegen/LlvmBackend_Stmts.cpp", "#4045",
+     Disposition::WrongValue,
+     "the AssignmentStmt generic lvalueAddr arm's null-address exit (`if "
+     "(!addr) return false;`): no address was ever resolved for the target, "
+     "so the site returns BEFORE evaluating the RHS or calling any store. "
+     "The target keeps whatever value was in its slot/field before the "
+     "statement — exactly the silent-no-op failure mode #4038 exposed via "
+     "an alias-qualified static field write. Same WrongValue disposition as "
+     "the sibling #2961 entries (no zero/null is manufactured or substituted; "
+     "the bounded harm is a stale slot the program reads back as its own "
+     "previous value). Made loud here because the pre-#4045 silent variant "
+     "was the latent gap that the next lowering fallback would silently "
+     "fail through, by construction."},
+
     {"src/codegen/LlvmBackend_Stmts.cpp", "#3025",
      Disposition::WrongValue,
      "the dedicated indexer-setter arm returns before invoking any setter or "
@@ -288,7 +302,11 @@ const Entry kWarningDegrades[] = {
 // The two #2961 and two #3025 entries are WrongValue (no null pointer is
 // substituted), so this count was unchanged at 9 from the twelve-degrade
 // population; #3079 (v0.249) is likewise WrongValue — it substitutes nothing
-// at all, it declines the site — so the count stays 9.
+// at all, it declines the site — so the count stays 9. #4045 (v0.294) is the
+// AssignmentStmt generic-arm null-address exit, also WrongValue (no value is
+// ever substituted; the site returns before evaluating the RHS or invoking any
+// store, so the bounded harm is a stale slot, not a manufactured pointer) —
+// so the count stays 9.
 constexpr std::size_t kUnsafePointerCount = 9;
 
 struct Site {

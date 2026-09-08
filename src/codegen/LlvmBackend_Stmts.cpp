@@ -869,7 +869,32 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 if (!addr) return false;
             } else {
                 addr = lvalueAddr(*as->target, elemTy);
-                if (!addr) return false;
+                // fix #4045 (§28.3/§28.9, v0.294): the generic lvalueAddr
+                // fallback's null-address exit was silently dropping the write
+                // with NO diagnostic of any severity, and the RHS was never
+                // even evaluated. This is the exact mechanism behind #4038's
+                // write-repro (a then-unresolved alias-qualified static field
+                // write), but the gap is GENERAL — it fires for ANY assignment
+                // target whose lvalueAddr resolution fails for any reason, not
+                // just the alias case #4038 already closed at the sema layer.
+                // Mirror #2961's sibling rhs-null diagnostic at this site's
+                // adjacent rhs-null arm (lines below): Warning, guarded on
+                // !hasErrors(), naming the assignment target's span and
+                // stating the write was dropped — so a *future* lowering gap
+                // that reaches this fallback (present or future) is observable
+                // on stderr instead of silently no-op'ing the store. Severity
+                // is Warning not Error for the same reason #2961's is: a
+                // sema-legal program whose target lowering simply fails
+                // (rather than is rejected) would otherwise be turned into a
+                // hard build failure here, the false-reject #2434 warned
+                // against checking for before choosing Error.
+                if (!addr) {
+                    if (!ctx_.diagnostics().hasErrors())
+                        ctx_.diagnostics().report(
+                            Severity::Warning, as->target->span.begin,
+                            "internal: assignment target lvalue address failed to resolve (store dropped — target retains its previous value) — #4045");
+                    return false;
+                }
                 rhs = lowerExpr(*as->value);
                 rhs = rescueUnitAssignRhs(rhs, *as);
                 // fix #2961 — same Warning the localSlot arm emits above; the
