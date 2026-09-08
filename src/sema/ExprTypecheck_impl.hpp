@@ -1304,9 +1304,19 @@ private:
     // (including when `scrutTy->declaration` is a class/interface/enum).
     // Mirrors (the field-walk part of) Resolver::applyGenericSubst +
     // buildBaseGenericSubst — local copy because the ExprTC worker has no
-    // Resolver handle (#1621 / §31.2.1 split). NOT threaded into
-    // `bindNestedDestructuringNames` (a nested slot's own scrutinee type is
-    // not available there) — see that function's comment and issue 3938.
+    // Resolver handle (#1621 / §31.2.1 split). #3938 (§19.3 / §14.1,
+    // v0.294): NOW threaded into `bindNestedDestructuringNames` — the
+    // four caller loops (CaseExpr x CaseStmt, record x choice-payload)
+    // pre-populate the nested-pattern worklist with each pending nested
+    // pattern's own already-substituted scrutTy (the parent slot's
+    // substituted type), and the walk calls this helper to re-substitute
+    // the next level's slot types against that scrutTy. Previously the
+    // helper was not reached in `bindNestedDestructuringNames` (the walk
+    // re-derived each nested pattern's record purely by NAME), so a
+    // generic record slot nested one level down (or nested inside a
+    // choice-case payload) wrongly admitted a range/relational pattern
+    // over the substituted nullable type — see that function's comment
+    // for the full rationale.
     TypeRef* substituteGenericFieldType(const TypeRef* ty,
                                         const TypeRef* scrutTy);
 
@@ -2033,33 +2043,58 @@ private:
     void checkOrderingPatternOverNullableType(const TypeRef* ty,
                                               const ast::Pattern* pat);
 
-    // #726 / §19.3 / #3909 (§35.5, v0.294): the ONE "bind names inside a
-    // NESTED DestructuringPattern sub-pattern" walk (`Outer(Inner(v), b)`).
-    // Before #3909, this walk existed ONLY inline in the two RECORD-
-    // scrutinee DestructuringPattern handlers (CaseExpr in
-    // ExprTypecheck_Exprs.cpp, CaseStmt here) — copy-pasted between them —
-    // and the two CHOICE-case-payload handlers had no equivalent at all, so
-    // `Wrap(Inner(v)) => v` over a choice case left `v` unresolved even
-    // though the identical shape over a record (`Outer(Inner(v)) => v`)
-    // worked. Factored out here (mirroring the #3692
-    // checkOrderingPatternOverNullableType precedent just above, the same
-    // "four call sites, one walk" shape) so the CHOICE handlers gain the
-    // capability by calling this, rather than by copying the walk a THIRD
-    // and FOURTH time — landing #3909 this way REDUCES the count of raw
-    // copies (2 -> 0 hand-copies, 1 shared implementation) while adding the
-    // missing choice-side capability. `subPatterns` is the outer
-    // DestructuringPattern's own subPatterns list (a record's positional
-    // fields, or a choice case's payload slots — the walk does not care
-    // which); it descends into any slot that is itself a nested
-    // DestructuringPattern and registers a LocalSymbol into `armScope` for
-    // each of ITS naked/`var` bindings, recursing further for deeper
-    // nesting. #1281: sets each nested binding's declType from its inner
-    // record's positional field so a member access on a nested class/
-    // record binding in the arm body resolves (a null declType left
+    // fix #3938 (§19.3 / §14.1, v0.294): each pending nested
+    // DestructuringPattern carries its own ALREADY-SUBSTITUTED scrutinee
+    // TypeRef — the slot in the parent pattern whose substituted type is
+    // this nested pattern's scrutinee type — so the walk can substitute
+    // the next level's bare generic-parameter fields (`Outer(Box(1..5, 1),
+    // 9)` against `Outer<int?>` needs the nested `Box<T>` slot seen as
+    // `Box<int?>`, not the bare `Box<T>` template) the same way the four
+    // caller loops already do via `substituteGenericFieldType(fieldTy,
+    // scrutTy)`. #3898 left this walker untouched: it re-derived each
+    // nested pattern's record purely by NAME and received no scrutinee
+    // TypeRef at all, so a generic record slot nested one level down (or
+    // nested inside a choice-case payload) wrongly admitted a
+    // range/relational pattern over the substituted nullable type.
+    struct PendingNestedDestructuring {
+        const ast::DestructuringPattern* pat;
+        TypeRef* scrutTy;
+    };
+
+    // #726 / §19.3 / #3909 / #3938 (§35.5, v0.294): the ONE "bind names
+    // inside a NESTED DestructuringPattern sub-pattern" walk
+    // (`Outer(Inner(v), b)`). Before #3909, this walk existed ONLY inline
+    // in the two RECORD-scrutinee DestructuringPattern handlers (CaseExpr
+    // in ExprTypecheck_Exprs.cpp, CaseStmt here) — copy-pasted between
+    // them — and the two CHOICE-case-payload handlers had no equivalent
+    // at all, so `Wrap(Inner(v)) => v` over a choice case left `v`
+    // unresolved even though the identical shape over a record
+    // (`Outer(Inner(v)) => v`) worked. Factored out here (mirroring the
+    // #3692 checkOrderingPatternOverNullableType precedent just above,
+    // the same "four call sites, one walk" shape) so the CHOICE handlers
+    // gain the capability by calling this, rather than by copying the walk
+    // a THIRD and FOURTH time — landing #3909 this way REDUCES the count
+    // of raw copies (2 -> 0 hand-copies, 1 shared implementation) while
+    // adding the missing choice-side capability.
+    //
+    // Before #3938 the function took `subPatterns` (the OUTER pattern's
+    // own slot list) and built its own worklist by name-only lookup of
+    // any nested `DestructuringPattern` inside `subPatterns`. That lost
+    // the parent slot's substituted type — the very thing §19.3's
+    // nullable-ordering-pattern clause keys on — so the substitution the
+    // four caller loops already compute for their OWN top-level slot was
+    // thrown away one level down. #3938 changes the signature to take
+    // the worklist directly (each pending pattern pre-tagged with its
+    // own substituted scrutTy) so the substitution threads through any
+    // depth of generic-record nesting.
+    //
+    // #1281: sets each nested binding's declType from its inner record's
+    // positional field so a member access on a nested class/record
+    // binding in the arm body resolves (a null declType left
     // `Outer(Inner(x)) => x.Id` unresolved / miscompiled).
     void bindNestedDestructuringNames(
         Scope& armScope,
-        const std::vector<ast::PositionalPattern>& subPatterns);
+        std::vector<PendingNestedDestructuring> nestedWork);
 
     // §7.4 (issue #418): update `nullNarrowed_` for an assignment of a value of
     // `valueType` to the simple variable `sym` — a non-null value makes it

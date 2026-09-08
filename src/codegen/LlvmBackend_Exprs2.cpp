@@ -11099,20 +11099,24 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
         // GENERIC record slot NESTED inside another destructuring pattern
         // (`Outer<T>(B: Box<T>, …)`, or the same nesting under a choice-case
         // payload) — `bindNestedDestructuringNames` has no substitution
-        // context there (issue 3938, open) — so THAT shape stays admitted
-        // and is what live-exercises #3899's fix today: it reaches
-        // `nv.range.match` / `nv.relop.match` below and lowers to the
-        // correct value (`generic_record_slot_nested_pattern_still_admitted_
-        // 3899` and its choice-payload sibling in the same test file).
+        // context there (issue 3938, closed by fix #3938: the four caller
+        // loops now thread each pending nested pattern's already-substituted
+        // scrutinee TypeRef through the worklist, and the walk re-substitutes
+        // the next level's slot types against that scrutTy) — so THAT shape
+        // is also rejected at sema, symmetric with the top-level
+        // (`generic_record_slot_nested_pattern_rejected_3938` /
+        // `_in_choice_payload_rejected_3938` in the same test file).
         //
         // ⚠ CONFIRMED UNGUARDED (measured while reviewing #3692, BEFORE
         // #3899/#3898 landed): with both handlers below stubbed to
         // unconditional `return nullptr;`, the ENTIRE existing test suite —
         // every #3298/#3692 row, five adjacent reachable-code-path sweeps,
         // and the whole lit corpus — stayed green. At that time no admitted
-        // program reached either handler. That is no longer the state of the
-        // tree: the nested generic-record shape above (issue 3938) is a
-        // real, currently-admitted program that reaches them.
+        // program reached either handler. After #3899 landed but before
+        // #3938, the nested generic-record shape above was a real,
+        // admitted program that reached them. After #3938 closed the sema
+        // side, no admitted program reaches either handler — the tree is
+        // back to the pre-#3899 state.
         //
         // Deleting these two handlers regardless is NOT a net deletion, it is
         // a silent miscompile FOR THE CASES sema does NOT reject: both slot
@@ -11122,9 +11126,10 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
         // #3298): `R(1..5, 1)` against a NON-generic `R(99, 1)` returned the
         // arm's value instead of falling through — exactly the "→ AND
         // skipped → always matched" defect the slot code's own comment
-        // records; that specific program is a sema rejection today, but the
-        // nested-generic-record shape (issue 3938) reaching this function is
-        // the live instance of the same hazard. Do not delete them.
+        // records. No currently-admitted program reaches them after #3938,
+        // but the handler MUST stay so a future regression that re-admits a
+        // shape doesn't silently miscompile; the handlers are the SLOT-PATH-
+        // ONLY authority, kept unconditionally. Do not delete them.
         // §19.3 (#738): a RangePattern on a nullable value — hasValue AND the
         // unwrapped value is in range. Mirrors the non-nullable range logic
         // below, applied to innerVal. (Open-ended forms: an absent bound is

@@ -10066,6 +10066,19 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                         }
                         Scope armScope;
                         armScope.parent = currentScope_;
+                        // fix #3938 (§19.3 / §14.1, v0.294): build the
+                        // nested-pattern worklist here so each pending
+                        // pattern carries its own ALREADY-SUBSTITUTED
+                        // scrutinee TypeRef (this slot's substituted
+                        // `fieldTy`, computed via #2219's
+                        // `substituteGenericFieldType(fieldTy, scrutTy)`)
+                        // — the nested walk needs the parent slot's
+                        // substituted type to thread generic substitution
+                        // through `Outer(Box(1..5, 1), 9)` over
+                        // `Outer<int?>` (the bare `T` is no longer enough
+                        // to decide the nested pattern's own slot-level
+                        // ordering-pattern gate).
+                        std::vector<PendingNestedDestructuring> nestedWork;
                         for (std::size_t i = 0; i < dp->subPatterns.size();
                              ++i) {
                             const auto& sp = dp->subPatterns[i];
@@ -10106,12 +10119,21 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                                 lsym->declType = vbp->type
                                     ? ctx_.resolvedType(*vbp->type) : fieldTy;
                                 armScope.names[vbp->name] = lsym;
+                            } else if (auto* deeper =
+                                           dynamic_cast<const ast::DestructuringPattern*>(
+                                               sp.pattern.get())) {
+                                // fix #3938: hand the nested pattern this
+                                // slot's already-substituted `fieldTy` as
+                                // its scrutinee type so the nested walk
+                                // can re-substitute THIS slot's bare
+                                // generic-parameter fields correctly.
+                                nestedWork.push_back({deeper, fieldTy});
                             }
                         }
-                        // §35.5 / fix #3909: bind names inside a NESTED
-                        // destructuring sub-pattern one level below a choice
-                        // case's payload slots (`Wrap(Inner(v)) => v`, `Inner`
-                        // a record) — the loop above only registers a
+                        // §35.5 / fix #3909 / fix #3938: bind names inside a
+                        // NESTED destructuring sub-pattern one level below a
+                        // choice case's payload slots (`Wrap(Inner(v)) => v`,
+                        // `Inner` a record) — the loop above only registers a
                         // LocalSymbol for a TOP-LEVEL slot's own naked/`var`
                         // binding, so `v` was left unresolved even though the
                         // identical shape over a record scrutinee
@@ -10120,7 +10142,12 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                         // ExprTypecheck_impl.hpp) — also used by the record-
                         // scrutinee handler below and by the CaseStmt twin —
                         // rather than adding a third/fourth hand-copy of it.
-                        bindNestedDestructuringNames(armScope, dp->subPatterns);
+                        // fix #3938: pass the worklist pre-populated with
+                        // each nested pattern's own substituted scrutTy
+                        // rather than the outer subPatterns — the walk now
+                        // needs the parent slot's substituted type to
+                        // thread generic substitution through.
+                        bindNestedDestructuringNames(armScope, std::move(nestedWork));
                         Scope* saveScope = currentScope_;
                         currentScope_ = &armScope;
                         if (arm.guard) visitExpr(*arm.guard);
@@ -10344,6 +10371,17 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                 }
                 Scope armScope;
                 armScope.parent = currentScope_;
+                // fix #3938 (§19.3 / §14.1, v0.294): build the
+                // nested-pattern worklist here so each pending pattern
+                // carries its own ALREADY-SUBSTITUTED scrutinee TypeRef
+                // (this slot's substituted `fieldTy`, computed via
+                // #3898's `substituteGenericFieldType(fieldTy, scrutTy)`)
+                // — the nested walk needs the parent slot's substituted
+                // type to thread generic substitution through
+                // `Outer(Box(1..5, 1), 9)` over `Outer<int?>` (the bare
+                // `T` is no longer enough to decide the nested pattern's
+                // own slot-level ordering-pattern gate).
+                std::vector<PendingNestedDestructuring> nestedWork;
                 for (std::size_t i = 0; i < dp->subPatterns.size(); ++i) {
                     const auto& sp = dp->subPatterns[i];
                     TypeRef* fieldTy = nullptr;
@@ -10398,15 +10436,27 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                         lsym->declType = vbp->type
                             ? ctx_.resolvedType(*vbp->type) : fieldTy;
                         armScope.names[vbp->name] = lsym;
+                    } else if (auto* deeper =
+                                   dynamic_cast<const ast::DestructuringPattern*>(
+                                       sp.pattern.get())) {
+                        // fix #3938: hand the nested pattern this slot's
+                        // already-substituted `fieldTy` as its scrutinee
+                        // type so the nested walk can re-substitute THIS
+                        // slot's bare generic-parameter fields correctly.
+                        nestedWork.push_back({deeper, fieldTy});
                     }
                 }
-                // #726 / §19.3 / #3909: also bind the names inside NESTED
-                // destructuring sub-patterns (`Outer(Inner(v), b)`) — the ONE
-                // shared walk (see bindNestedDestructuringNames's declaration
-                // comment in ExprTypecheck_impl.hpp), also called from the
-                // CaseStmt twin and from both the CHOICE-case-payload
-                // handlers.
-                bindNestedDestructuringNames(armScope, dp->subPatterns);
+                // #726 / §19.3 / #3909 / #3938: also bind the names inside
+                // NESTED destructuring sub-patterns (`Outer(Inner(v), b)`)
+                // — the ONE shared walk (see bindNestedDestructuringNames's
+                // declaration comment in ExprTypecheck_impl.hpp), also
+                // called from the CaseStmt twin and from both the
+                // CHOICE-case-payload handlers. fix #3938: pass the worklist
+                // pre-populated with each nested pattern's own substituted
+                // scrutTy rather than the outer subPatterns — the walk now
+                // needs the parent slot's substituted type to thread
+                // generic substitution through.
+                bindNestedDestructuringNames(armScope, std::move(nestedWork));
                 Scope* saveScope = currentScope_;
                 currentScope_ = &armScope;
                 if (arm.guard) visitExpr(*arm.guard);

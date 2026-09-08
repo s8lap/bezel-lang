@@ -120,8 +120,12 @@ BEZEL_TEST(case_relop_nullable_1074, relational_then_constant_arm_rejected_v0_26
 // substitution helper. That was filed as issue 3898 and is CLOSED for the
 // TOP-LEVEL (non-nested) case as of the fix landing in this file (see the
 // "fix #3898" comment block below, and its `*_rejected_3898` /
-// `*_still_admitted_3898`/`_3899` tests) — a residual NESTED-slot gap remains
-// open as issue 3938, also documented and tested below.
+// `*_still_admitted_3898`/`_3899` tests) — the residual NESTED-slot gap
+// that #3898 left open as issue 3938 is itself CLOSED by fix #3938
+// (this file's `*_rejected_3938` rows at the bottom): the four caller
+// loops now hand `bindNestedDestructuringNames` a worklist pre-populated
+// with each pending nested pattern's own substituted scrutTy, and the walk
+// re-substitutes the next level's slot types against that scrutTy.
 //
 // That then-residual, sema-admitted path turned out to ALSO be independently
 // broken in codegen, for an unrelated reason discovered while checking
@@ -151,18 +155,17 @@ BEZEL_TEST(case_relop_nullable_1074, relational_then_constant_arm_rejected_v0_26
 // LlvmBackend_Exprs2.cpp SLOT-PATH ONLY comment for why they still matter.
 // Since #3898 landed, a TOP-LEVEL generic-record nullable slot with an
 // ordering pattern is REJECTED at sema (the `*_rejected_3898` rows below),
-// so it can no longer reach these handlers at all — but the NESTED shapes
-// #3898 does NOT close (issue 3938, `*_still_admitted_3899` rows below,
-// unchanged from before #3898) remain admitted and DO reach them: MEASURED
-// here, independently re-verifying #3899's own acceptance criterion, that
-// stubbing both `nv.range.match` and `nv.relop.match` to `return nullptr;`
-// flips `generic_record_slot_nested_pattern_no_match_still_admitted_3899`
-// from 3 to 7 — `if (subMatch) matched = AND(matched, subMatch);` skips a
-// nullptr'd slot test and the arm matches unconditionally, exactly the
-// "→ AND skipped → always matched" hazard above (the sibling `_3899` test,
-// whose correct value already IS 7, is unchanged by the stub — matching a
-// true outcome vacuously is indistinguishable from matching it for real, so
-// only the no-match row demonstrates the defect). Restored, both pass again.
+// so it can no longer reach these handlers at all. Since #3938 landed, the
+// NESTED shapes #3898 left open (`*_rejected_3938` rows at the bottom of
+// this block) are ALSO rejected at sema — so they, too, can no longer
+// reach the slot-path-only handlers. The SLOT-PATH-ONLY handlers' own
+// acceptance criterion (they correctly lower an admitted null-slot match)
+// is exercised today only by #3692's NON-GENERIC nested case
+// (`nullable_nested_slot_range_rejected_3692` — admitted pre-#3692, the
+// criterion that let the codegen defect be discovered in the first
+// place; the stub flipped its value exactly as the comment block above
+// predicts). Restored, that row rejects at sema per #3692, exactly as
+// before #3938.
 //
 // The CHOICE side is closed at SEMA by #3692's own fix (a nullable choice
 // payload with an ordering pattern rejects, non-generic and generic alike).
@@ -274,14 +277,16 @@ BEZEL_TEST(case_relop_nullable_1074, nullable_slot_constant_still_admitted_3692)
 // reverted to Choice-only, every `*_rejected_3898` row below FAILS (the
 // program still compiles and runs); restored, all pass.
 //
-// ⚠ NOT closed by #3898: a generic-record slot NESTED one level down inside
-// another destructuring pattern (`Outer(Box(1..5, 1), 9)`) or inside a
-// choice-case payload slot (`Val(Box(1..5, 1))`) — `bindNestedDestructuringNames`
-// resolves a nested pattern's record purely by NAME, with no substitution
-// context of any kind, so these remain wrongly ADMITTED. Filed as issue 3938
-// with the two repros below kept as explicit still-admitted controls
-// (`generic_record_slot_nested_pattern_3899` / `_in_choice_payload_3899` and
-// their `_no_match` siblings) rather than silently dropped.
+// ⚠ NOT closed by #3898 (was), closed by #3938: a generic-record slot
+// NESTED one level down inside another destructuring pattern
+// (`Outer(Box(1..5, 1), 9)`) or inside a choice-case payload slot
+// (`Val(Box(1..5, 1))`) — `bindNestedDestructuringNames` resolved a nested
+// pattern's record purely by NAME, with no substitution context of any
+// kind, so before #3938 these remained wrongly ADMITTED. Filed as issue
+// 3938 with the two repros kept as explicit still-admitted controls
+// (`generic_record_slot_nested_pattern_3899` / `_in_choice_payload_3899`
+// and their `_no_match` siblings, since renamed `_rejected_3938`) rather
+// than silently dropped.
 // ---------------------------------------------------------------------------
 
 // The issue's own repro, RANGE form: `Box<T>(X: T, Y: int)` instantiated
@@ -375,55 +380,71 @@ BEZEL_TEST(case_relop_nullable_1074, generic_record_slot_two_instantiations_valu
         "end Main; end C;"), 18);
 }
 
-// ⚠ Residual gap (issue 3938, NOT closed by #3898): a generic record slot
+// ⚠ Residual gap (issue 3938, closed by fix #3938): a generic record slot
 // NESTED inside another destructuring pattern (`Outer<T>(B: Box<T>, Z:
-// int)`) — `bindNestedDestructuringNames` has no substitution context, so
-// `Box`'s own bare `T` is still resolved unsubstituted and this program stays
-// (wrongly, per §19.3) ADMITTED, computing the D5 value rather than
-// rejecting. Kept as an explicit still-admitted control, not silently
-// dropped, exactly as #3692 pinned this file's top-level case before #3898.
-BEZEL_TEST(case_relop_nullable_1074, generic_record_slot_nested_pattern_still_admitted_3899) {
-    BEZEL_EXPECT_EQ(run(
+// int)`) — `bindNestedDestructuringNames` now threads each pending nested
+// pattern's already-substituted scrutinee TypeRef through its worklist
+// (the parent slot's substituted type, computed by the caller loop via
+// `substituteGenericFieldType`), so `Box`'s own bare `T` is now substituted
+// against the parent's instantiation and this program correctly REJECTS
+// the range pattern at the substituted nullable type — symmetric with the
+// top-level `generic_record_slot_range_pattern_rejected_3898` above and
+// with the non-generic `nullable_nested_slot_range_rejected_3692` two
+// sections above. MEASURED in #3938's FAIL-WITHOUT/PASS-WITH: with the
+// four caller loops reverted to passing the outer subPatterns (no
+// substituted worklist) and the walk reverted to its name-only lookup,
+// every `*_rejected_3938` row below FAILS (the program still compiles
+// and runs); restored, all reject on the §19.3/§16.6/§7.11 wording.
+BEZEL_TEST(case_relop_nullable_1074, generic_record_slot_nested_pattern_rejected_3938) {
+    BEZEL_EXPECT_TRUE(rejectedAsNullableOrderingPattern(
         "module M; record Box<T>(X: T, Y: int); "
         "record Outer<T>(B: Box<T>, Z: int); "
         "class C public static method Main(): int "
         "  var o := new Outer<int?>(new Box<int?>(3, 1), 9); "
         "  return (case o of Outer(Box(1..5, 1), 9) => 7, _ => 3); "
-        "end Main; end C;"), 7);
+        "end Main; end C;"));
 }
-BEZEL_TEST(case_relop_nullable_1074, generic_record_slot_nested_pattern_no_match_still_admitted_3899) {
-    BEZEL_EXPECT_EQ(run(
+// Same nested shape with a value that does NOT match — the rejection is on
+// the pattern's KIND, not on the runtime value, so this rows confirms the
+// §19.3 rejection covers both arms' sub-patterns symmetrically (no
+// accidental `r1 = 7`/`r2 = 3` half-rejection).
+BEZEL_TEST(case_relop_nullable_1074, generic_record_slot_nested_pattern_no_match_rejected_3938) {
+    BEZEL_EXPECT_TRUE(rejectedAsNullableOrderingPattern(
         "module M; record Box<T>(X: T, Y: int); "
         "record Outer<T>(B: Box<T>, Z: int); "
         "class C public static method Main(): int "
         "  var o := new Outer<int?>(new Box<int?>(99, 1), 9); "
         "  return (case o of Outer(Box(1..5, 1), 9) => 7, _ => 3); "
-        "end Main; end C;"), 3);
+        "end Main; end C;"));
 }
 
-// ⚠ Residual gap (issue 3938): the identical nested shape via a CHOICE-case
-// payload — the choice-scrutinee DestructuringPattern branch (fix #3902)
-// resolves the payload's OWN type via `common::substitutedChoicePayloadType`
-// (or, at sema, `substituteGenericFieldType` since #3898), but the NESTED
-// `Box(1..5, 1)` sub-pattern still goes through the same
-// substitution-blind `bindNestedDestructuringNames`.
-BEZEL_TEST(case_relop_nullable_1074, generic_record_slot_in_choice_payload_still_admitted_3899) {
-    BEZEL_EXPECT_EQ(run(
+// ⚠ Residual gap (issue 3938, closed by fix #3938): the identical nested
+// shape via a CHOICE-case payload. The choice-scrutinee DestructuringPattern
+// branch's caller loop now hands each nested pattern its own already-
+// substituted `fieldTy` (the substituted payload type, computed via
+// `substituteGenericFieldType(fieldTy, scrutTy)`, #2219's pre-existing
+// choice-side substitution), so `Box`'s bare `T` is substituted against the
+// choice's instantiation too — `Box(1..5, 1)` over `Wrap<int?>.Val(...)`
+// now correctly REJECTS, exactly as the top-level choice path
+// `generic_record_slot_in_choice_payload_range_pattern_rejected_3938`
+// below rejects its top-level sibling.
+BEZEL_TEST(case_relop_nullable_1074, generic_record_slot_in_choice_payload_rejected_3938) {
+    BEZEL_EXPECT_TRUE(rejectedAsNullableOrderingPattern(
         "module M; record Box<T>(X: T, Y: int); "
         "choice Wrap<T> Val(B: Box<T>), None; end Wrap; "
         "class C public static method Main(): int "
         "  var w := Wrap<int?>.Val(new Box<int?>(3, 1)); "
         "  return (case w of Val(Box(1..5, 1)) => 7, _ => 3); "
-        "end Main; end C;"), 7);
+        "end Main; end C;"));
 }
-BEZEL_TEST(case_relop_nullable_1074, generic_record_slot_in_choice_payload_no_match_still_admitted_3899) {
-    BEZEL_EXPECT_EQ(run(
+BEZEL_TEST(case_relop_nullable_1074, generic_record_slot_in_choice_payload_no_match_rejected_3938) {
+    BEZEL_EXPECT_TRUE(rejectedAsNullableOrderingPattern(
         "module M; record Box<T>(X: T, Y: int); "
         "choice Wrap<T> Val(B: Box<T>), None; end Wrap; "
         "class C public static method Main(): int "
         "  var w := Wrap<int?>.Val(new Box<int?>(99, 1)); "
         "  return (case w of Val(Box(1..5, 1)) => 7, _ => 3); "
-        "end Main; end C;"), 3);
+        "end Main; end C;"));
 }
 
 // ---------------------------------------------------------------------------

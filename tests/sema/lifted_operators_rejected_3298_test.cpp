@@ -770,7 +770,9 @@ BEZEL_TEST(lifted_operators_rejected_3298,
     // choice-only `substituteGenericCaseFieldType` #2219 introduced), so it
     // was already fully closed here even before #3898 — the record path's
     // own generic residual (issue 3898's TOP-LEVEL repro, below) is now
-    // closed too; a NESTED generic residual remains, issue 3938.
+    // closed too; the NESTED generic residual that #3898 left open as
+    // issue 3938 is itself closed by fix #3938 (the
+    // `..._rejected_3938` rows below).
     auto r = parseSemaAll(
         "module M; choice Wrap Val(X: int?, Y: int), None; end Wrap; "
         "class C public static method Main(): int "
@@ -918,17 +920,23 @@ BEZEL_TEST(lifted_operators_rejected_3298,
 }
 
 BEZEL_TEST(lifted_operators_rejected_3298,
-           case_range_pattern_in_nested_generic_record_slot_still_admitted_3938) {
-    // ⚠ Residual gap, NOT closed by #3898 — filed as issue 3938. A generic
-    // record slot NESTED one level down inside another destructuring pattern
-    // (`Outer<T>(B: Box<T>, Z: int)`) goes through
-    // `ExprTC::bindNestedDestructuringNames`, which resolves each nested
-    // pattern's record purely by NAME and has no substitution context of any
-    // kind (not even the enclosing `scrutTy` this fix threads through the
-    // TOP-LEVEL loops) — so `Box`'s own bare `T` stays unsubstituted and this
-    // program remains (wrongly, per §19.3) ADMITTED. Pinned here as an
-    // explicit still-admitted control, not silently dropped — the same
-    // discipline #3692 used to pin this file's now-closed top-level gap.
+           case_range_pattern_in_nested_generic_record_slot_rejected_3938) {
+    // fix #3938 (§19.3 / §14.1, v0.294): CLOSED. A generic record slot
+    // NESTED one level down inside another destructuring pattern
+    // (`Outer<T>(B: Box<T>, Z: int)`) used to go through
+    // `ExprTC::bindNestedDestructuringNames`, which resolved each nested
+    // pattern's record purely by NAME and had no substitution context of
+    // any kind — so `Box`'s own bare `T` stayed unsubstituted and this
+    // program was (wrongly, per §19.3) ADMITTED. The fix threads each
+    // pending nested pattern's own already-substituted scrutTy through
+    // the worklist (the parent slot's substituted type, computed by the
+    // caller loop via #3898's `substituteGenericFieldType`), so `Box`'s
+    // bare `T` is now substituted against `Outer<int?>`'s instantiation
+    // and this REJECTS, symmetric with the non-generic
+    // `case_range_pattern_in_nested_record_slot_over_nullable_field_rejected_3692`
+    // above and with the top-level
+    // `case_range_pattern_in_generic_record_slot_over_nullable_field_rejected_3898`
+    // three sections above.
     auto r = parseSemaAll(
         "module M; record Box<T>(X: T, Y: int); "
         "record Outer<T>(B: Box<T>, Z: int); "
@@ -936,17 +944,21 @@ BEZEL_TEST(lifted_operators_rejected_3298,
         "  var o := new Outer<int?>(new Box<int?>(99, 1), 9); "
         "  return (case o of Outer(Box(1..5, 1), 9) => 7, _ => 3); "
         "end Main; end C;");
-    BEZEL_EXPECT_FALSE(hasNullablePatternError(r));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasNullablePatternError(r));
 }
 
 BEZEL_TEST(lifted_operators_rejected_3298,
-           case_range_pattern_in_generic_choice_payload_nested_record_slot_still_admitted_3938) {
-    // ⚠ Residual gap, issue 3938 — the identical nested shape via a
-    // CHOICE-case payload: the payload's OWN type (`Box<T>` at `Wrap<int?>`)
-    // is correctly substituted (the choice path's `substituteGenericFieldType`
-    // call), but the NESTED `Box(1..5, 1)` sub-pattern still goes through the
-    // same substitution-blind `bindNestedDestructuringNames`.
+           case_range_pattern_in_generic_choice_payload_nested_record_slot_rejected_3938) {
+    // fix #3938 (§19.3 / §14.1, v0.294): CLOSED — the identical nested
+    // shape via a CHOICE-case payload. The choice-scrutinee caller loop
+    // now hands each nested pattern its own already-substituted `fieldTy`
+    // (the substituted payload type, computed via
+    // `substituteGenericFieldType(fieldTy, scrutTy)`, #2219's
+    // pre-existing choice-side substitution), so `Box`'s bare `T` is
+    // substituted against `Wrap<int?>`'s instantiation too and this
+    // REJECTS — symmetric with the top-level
+    // `case_range_pattern_in_choice_payload_slot_over_nullable_field_rejected_3692`
+    // above.
     auto r = parseSemaAll(
         "module M; record Box<T>(X: T, Y: int); "
         "choice Wrap<T> Val(B: Box<T>), None; end Wrap; "
@@ -954,8 +966,7 @@ BEZEL_TEST(lifted_operators_rejected_3298,
         "  var w := Wrap<int?>.Val(new Box<int?>(99, 1)); "
         "  return (case w of Val(Box(1..5, 1)) => 7, _ => 3); "
         "end Main; end C;");
-    BEZEL_EXPECT_FALSE(hasNullablePatternError(r));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasNullablePatternError(r));
 }
 
 // ---------------------------------------------------------------------------
