@@ -1,6 +1,6 @@
 # Bezel Language Specification
 
-**Version 0.294 — September 2026**
+**Version 0.295 — September 2026**
 
 Bezel is a compiled language for services and tools, with ownership-based memory management and no garbage collector. The compiler tracks ownership of every heap object and ensures that each one is disposed exactly once. Borrowing lets you pass references without transferring ownership, with lifetimes checked at compile time rather than enforced by a runtime. The result aims to give you the safety of a managed language and the predictability of a manual one, without the ceremony of either.
 
@@ -4649,7 +4649,7 @@ Log("System started", timestamp := false);
 Log(level := "ERROR", message := "Failed");
 ```
 
-Named arguments may appear in any order after positional arguments. **A `ref`/`out`/`scoped` argument is positional-only:** those modifiers inhabit the `ArgModifiers` alternative of `Argument` (Appendix A.4), which has no named form — `M(out var result := n)` has no reading and does not parse, the `:=` of the binding form and the `:=` of the named form being the same token. The rule survives because those are **true argument modifiers** — grammar-level prefixes on the argument, not parts of its expression: for `out`'s binding forms (`out var x`, `out using var x`) a named spelling would put `:=` in two roles on one argument, and `scoped` shares the alternative and therefore the shape ([§22.3](#sec-parameter-modifiers)'s lending-mode line). A **transfer-marked** argument carries no modifier — the marker is part of the argument expression ([§22.3](#sec-parameter-modifiers), [§28.8.1](#sec-the-move-expression)) — so `M(item := move x)` is an ordinary named argument whose expression happens to be a `MoveExpr`, and is legal (v0.260).
+Named arguments may appear in any order after positional arguments. Two positions admit none: an invocation through a function-typed value ([§27.1](#sec-function-types), v0.295), and an index position ([§23.5](#sec-properties-and-indexers-restrictions)). **A `ref`/`out`/`scoped` argument is positional-only:** those modifiers inhabit the `ArgModifiers` alternative of `Argument` (Appendix A.4), which has no named form — `M(out var result := n)` has no reading and does not parse, the `:=` of the binding form and the `:=` of the named form being the same token. The rule survives because those are **true argument modifiers** — grammar-level prefixes on the argument, not parts of its expression: for `out`'s binding forms (`out var x`, `out using var x`) a named spelling would put `:=` in two roles on one argument, and `scoped` shares the alternative and therefore the shape ([§22.3](#sec-parameter-modifiers)'s lending-mode line). A **transfer-marked** argument carries no modifier — the marker is part of the argument expression ([§22.3](#sec-parameter-modifiers), [§28.8.1](#sec-the-move-expression)) — so `M(item := move x)` is an ordinary named argument whose expression happens to be a `MoveExpr`, and is legal (v0.260).
 
 **Defaults and modifiers.** A default value is permitted only on parameters with **no modifier or `owned`** (an `owned` default is the owned-allocation form this section already blesses, e.g. a factory-call default); a default-value expression that **produces an owned value of non-trivial-dispose class type** ([§28.9](#sec-trivial-dispose-classes)) is admitted only when the parameter itself is declared `owned` — the parameter then receives ownership per [§22.3](#sec-parameter-modifiers)/[§28.8](#sec-ownership-transfer) and the callee discharges it — and is a **compile error on a plain (borrowing) parameter**, naming the undischargeable fresh instance (a trivial-dispose producer, e.g. a `new StringBuilder()` default, stays admissible on either form: on a plain parameter the materialized default is a compiler-introduced unbound owned temporary of the **calling statement** — owned by the call's full expression, freed at its [K8](#sec-kernel-k8) boundary ([§28.3](#sec-unbound-owned-temporaries)) — and the plain parameter borrows it call-bounded); `ref` and `out` parameters can never carry defaults — both require a caller-side location, which an omitted argument cannot supply. Every parameter after the first defaulted parameter must itself have a default.
 
@@ -6105,6 +6105,8 @@ var handler: (itemId: int, quantity: int, priority: int) -> bool;
 
 `(int, int, int) -> bool` and the named form are the same type. Calls are positional.
 
+**A call through a function-typed value admits no named argument (v0.295, [#4085](https://github.com/s8lap/bezel-lang/issues/4085)).** The named form (`Identifier :=`, [§22.5](#sec-optional-parameters-and-named-arguments)) at an invocation whose callee is a function-typed value — a parameter, local, field, or property of function type, or any expression of one — is a compile error naming this rule, at the plain invocation form and at the null-conditional form `e?(…)` over a nullable function type ([§27.2](#sec-nullable-function-types), [§27.7](#sec-calling-function-values)) alike: the treatment [§23.5](#sec-properties-and-indexers-restrictions) gives an index position, for the same reason — the names a function type may declare are documentation, not caller-bindable surface, and a function type declares no defaults, so §22.5's optional-parameter and named-binding machinery is never reached. The form is *rejected*, not bound by position: a name accepted and then ignored could spell one binding and perform another (`caller(b := 2, a := 100)` against `(a: int, b: int) -> int` read as a swap and ran as `caller(2, 100)`). Binding *by* name is declined: the names are not part of type identity (above: the named and unnamed forms *are the same type*), so an ordinary assignment — exact-match, or the identity-preserving retyping of [§27.1.1](#sec-function-type-assignability) — may drop or relabel them, so a name-keyed binding would mean one thing through one view of a value and another through the next. Admitting a written name as an order-checked *label* is declined too: it would make documentation-only names a compatibility contract on every call site that spelled them (`DECLINED.md`).
+
 <a id="sec-function-type-assignability"></a>
 #### 27.1.1 Function-type assignability
 
@@ -6301,7 +6303,7 @@ var maybeHandler: ((int) -> ())? := null;
 maybeHandler?(42);                      // null-conditional call; no-op when null
 ```
 
-The null-conditional call result is nullable.
+The null-conditional call result is nullable. Both forms are positional: the named-argument form is not admitted at a call through a function-typed value ([§27.1](#sec-function-types), v0.295).
 
 <a id="sec-equality-of-function-values"></a>
 #### 27.7.1 Equality of function values
@@ -11053,9 +11055,10 @@ Argument        ::= ArgModifiers ArgExpression
                                  operand category for ref/out arguments is
                                  semantic: §22.3 "ref and out argument
                                  locations". Named arguments are additionally
-                                 rejected at the index position (§23.5) —
-                                 admitted by the shared grammar, rejected
-                                 semantically. */
+                                 rejected at the index position (§23.5) and at
+                                 a call through a function-typed value (§27.1,
+                                 v0.295) — admitted by the shared grammar,
+                                 rejected semantically. */
 ArgModifiers    ::= "ref"
                   | "out" "var"?
                   | "out" "using" "var"
