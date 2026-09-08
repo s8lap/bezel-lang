@@ -358,6 +358,16 @@ BEZEL_TEST(codegen_record_enum_equals_universal_argument_3538,
 // tree's SIGSEGV asserts nothing here at all (whether the run "ran" is
 // undefined after a child crash, not merely false), which is exactly the
 // FAIL-WITHOUT asymmetry this row exists to prove.
+//
+// ⚠ THE ROW REVERSES (fix #3914, §8.1/§8.3/§8.6/§9.1/§9.2, v0.294). The
+// resolve-first change at the record arm routes `Foo<Pair>(p, new Pair(9))`
+// through `equalsArgSettlesFalse(Pair, Pt)` — different record types per
+// §8.3 — and emits `False` directly. The crash fix #3918 itself stays in
+// place for the dead abstract-template pass (where `resolveTypeParamRef`
+// returns the bare-unresolved ref unchanged and the i32 placeholder still
+// hits `!isStructTy()`); the row name and `not_crash_3918` suffix are kept
+// (the crash itself is not undone), but the assertion below is updated for
+// the new, more-correct `False` answer per LANE_RULES §7.
 BEZEL_TEST(codegen_record_enum_equals_universal_argument_3538,
            record_equals_struct_shaped_generic_arg_fails_closed_not_crash_3918) {
     auto r = runAot(
@@ -375,20 +385,10 @@ BEZEL_TEST(codegen_record_enum_equals_universal_argument_3538,
         "    return 0; "
         "  end Main; "
         "end C;");
-    BEZEL_EXPECT_FALSE(r.ran);
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    bool named = false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("member `Equals`") != std::string::npos &&
-            d.message.find("`M3538G.Pt`") != std::string::npos)
-            named = true;
-    BEZEL_EXPECT_TRUE(named);
-    bool explainsWhy = false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("does not resolve to a value of that record") !=
-            std::string::npos)
-            explainsWhy = true;
-    BEZEL_EXPECT_TRUE(explainsWhy);
+    // fix #3914: the program now COMPILES and prints `False` per §8.3/§8.6.
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("False\n"));
 }
 
 // ── T8 (fix #3918) — ⚠ FALSE-DECLINE GUARD. T7's guard must fire ONLY for a
@@ -456,6 +456,18 @@ BEZEL_TEST(codegen_record_enum_equals_universal_argument_3538,
 // lines above both) reports a located `Severity::Error` and rejects the
 // build (`r.ran` false) instead of degrading either the return value or the
 // statement to nothing.
+//
+// ⚠ THE ROW REVERSES (fix #3914, §8.1/§8.3/§8.6/§9.1/§9.2, v0.294). The
+// resolve-first change at the record arm routes `Foo<int>(p, 7)` through
+// `equalsArgSettlesFalse(int, Pt)` — an `int` is a primitive, `Pt` is a
+// record, §8.3 settles the answer at `False` — and emits `False` directly
+// from the dispatch core. The statement shape (`Console.WriteLine(...)`)
+// now PRINTS `False` rather than silently vanishing, which is the
+// unambiguous, spec-correct outcome. The crash fix #3918 itself and the
+// non-struct #3922 guard stay in place for the dead abstract-template pass;
+// the row name and `not_degraded_3922` suffix are kept (the degrade fix
+// itself is not undone), but the assertion below is updated for the new
+// `False` answer.
 BEZEL_TEST(codegen_record_enum_equals_universal_argument_3538,
            record_equals_non_struct_generic_arg_fails_closed_not_degraded_3922) {
     auto r = runAot(
@@ -473,18 +485,10 @@ BEZEL_TEST(codegen_record_enum_equals_universal_argument_3538,
         "    return 0; "
         "  end Main; "
         "end C;");
-    BEZEL_EXPECT_FALSE(r.ran);
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    bool named = false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("member `Equals`") != std::string::npos &&
-            d.message.find("`M3538I.Pt`") != std::string::npos)
-            named = true;
-    BEZEL_EXPECT_TRUE(named);
-    bool explainsWhy = false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("does not resolve to a value of that record") !=
-            std::string::npos)
-            explainsWhy = true;
-    BEZEL_EXPECT_TRUE(explainsWhy);
+    // fix #3914: the program now COMPILES and prints "before\nFalse\nafter\n"
+    // — the `False` is the §8.3/§8.6 answer for an `int` argument against a
+    // record receiver, no longer silently degraded to nothing.
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("before\nFalse\nafter\n"));
 }

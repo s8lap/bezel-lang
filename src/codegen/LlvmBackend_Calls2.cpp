@@ -3121,7 +3121,20 @@ llvm::Value* Emitter::lowerValueSemMethodOn(const sema::TypeRef* recvTy,
         // layout would be unsound to compare/hash through); filed
         // separately as #3905.
         const ast::Expr& argE = *call.args[0].value;
-        const sema::TypeRef* at = ctx_.exprType(argE);
+        // fix #3914 (§8.1/§8.3/§8.6/§35.4/§35.7, v0.294): resolve a bare generic
+        // method type parameter through the active substitution BEFORE asking
+        // the predicates, so `Foo<int>(s, 7)` (X → int) reaches
+        // `equalsArgSettlesFalse` directly and answers `False` per §8.3/§8.6 —
+        // matching the concrete `s?.Equals(7)` spelling — instead of routing
+        // through the "or unresolved" clause of `equalsArgIsOwnTypeOrUnresolved`
+        // and declining via the `!isStructTy()` guard (#3925) / struct-mismatch
+        // guard (#3913) when codegen's `lowerExpr` produces a value whose LLVM
+        // type does not match `ts`. The dead abstract-template pass is unaffected:
+        // its `genericSubstSemaTy_` is empty, so `resolveTypeParamRef` returns
+        // the bare-unresolved ref unchanged and the predicates route as before
+        // (the existing `emittingGenericTemplateBody_` gates #3925/#3939 added
+        // already silence any diagnostic in that pass).
+        const sema::TypeRef* at = resolveTypeParamRef(ctx_.exprType(argE));
         if (equalsArgSettlesFalse(at, ts)) {
             lowerExpr(argE);   // §22.5: the argument still evaluates
             return builder_.getFalse();
@@ -3313,7 +3326,16 @@ llvm::Value* Emitter::lowerValueSemMethodOn(const sema::TypeRef* recvTy,
         // integer comparison of two unrelated bit patterns.
         if (isEquals && call.args[0].value) {
             const ast::Expr& argE = *call.args[0].value;
-            const sema::TypeRef* at = ctx_.exprType(argE);
+            // fix #3914 (§8.1/§8.3/§8.6, v0.294): ENUM twin of the choice-arm
+            // resolve-first. `Foo<int>(c, 7)` (X → int) now reaches
+            // `equalsArgSettlesFalse` directly and answers `False` per §8.3/§8.6
+            // — matching the concrete `c.Equals(7)` spelling — instead of
+            // routing through `equalsArgIsOwnTypeOrUnresolved`'s "or unresolved"
+            // clause and falling into the `!isIntegerTy()` guard below. The
+            // dead abstract-template pass is unchanged (its `genericSubstSemaTy_`
+            // is empty, so `resolveTypeParamRef` returns the bare-unresolved ref
+            // unchanged). Replaces what was previously `ctx_.exprType(argE)`.
+            const sema::TypeRef* at = resolveTypeParamRef(ctx_.exprType(argE));
             if (equalsArgSettlesFalse(at, ts)) {
                 lowerExpr(argE);          // §22.5: the argument still evaluates
                 return builder_.getFalse();
@@ -3437,7 +3459,18 @@ llvm::Value* Emitter::lowerValueSemMethodOn(const sema::TypeRef* recvTy,
         // unconditional `CreateLoad(st, other)` below read whatever the pointer
         // pointed at as this record's fields.
         const ast::Expr& argE = *call.args[0].value;
-        const sema::TypeRef* at = ctx_.exprType(argE);
+        // fix #3914 (§8.1/§9.1/§9.2, v0.294): RECORD twin of the choice-arm
+        // resolve-first. `Foo<int>(p, 7)` (X → int) now reaches
+        // `equalsArgSettlesFalse` directly and answers `False` per §8.3/§8.6 —
+        // matching the concrete `p.Equals(7)` spelling — instead of routing
+        // through `equalsArgIsOwnTypeOrUnresolved`'s "or unresolved" clause
+        // and declining via the `!isStructTy()` guard (#3922) / struct-
+        // mismatch guard (#3918) when `lowerExpr` produces a value whose LLVM
+        // type does not match `ts`. The dead abstract-template pass is
+        // unchanged (its `genericSubstSemaTy_` is empty, so
+        // `resolveTypeParamRef` returns the bare-unresolved ref unchanged).
+        // Replaces what was previously `ctx_.exprType(argE)`.
+        const sema::TypeRef* at = resolveTypeParamRef(ctx_.exprType(argE));
         // (a) The argument's static type settles the answer at False on its own.
         //     The argument is still lowered — §22.5 makes its effects part of
         //     the call whatever the answer is.

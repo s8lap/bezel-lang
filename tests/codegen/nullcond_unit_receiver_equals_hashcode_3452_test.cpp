@@ -265,30 +265,6 @@ BEZEL_TEST(codegen_nullcond_unit_receiver_equals_hashcode_3452,
 // not weaken" discipline: every assertion below is unchanged in kind; only
 // the receiver/argument SHAPE differs.
 //
-// The residual decline this row now pins is a DIFFERENT one, confirmed
-// still live and unaffected by #3893/#3900/#3896: an argument whose STATIC
-// type is an UNRESOLVED generic type parameter (`X` in a generic method,
-// never substituted at the sema level — codegen substitutes only VALUES,
-// never `ctx_.exprType`'s answer) reaches the choice `Equals` arm's own
-// bare `if (!other->getType()->isStructTy()) return nullptr;`
-// (LlvmBackend_Calls2.cpp): `equalsArgSettlesFalse` requires a settled,
-// resolved argument type and declines to answer for a bare unresolved `X`;
-// `equalsArgIsOwnTypeOrUnresolved` therefore reads TRUE for it (its own
-// "or unresolved" clause) and routes to the structural-equality path
-// instead of the run-time boxing path — which then finds a non-struct
-// argument (`X` substituted to `int` at THIS call site) and declines,
-// mirroring the enum arm's own analogous residual decline a few dozen
-// lines below this one in the same source file. MEASURED: `bezelc` on the
-// program below reports rc=1 with exactly the diagnostic asserted below,
-// unchanged in kind from every prior version of this row. (Independently
-// confirmed NOT to be a #3906-shaped sema false-reject: #3906 is about a
-// GENERIC CHOICE's own classification at a value instantiation — `Sh` here
-// is non-generic and is the RECEIVER, not the argument; the decline this
-// row pins fires in codegen, after sema has already admitted the call.)
-//
-// Deleting the row was the alternative and would have retired the guard the
-// previous commit added it for, one commit after adding it.
-//
 // ⚠⚠⚠ THE ASSERTED TEXT MOVED A THIRD TIME (fix #3943, §8.1/§9.1/§9.2/§35.4/
 // §35.7, v0.294) — the row did NOT weaken, only the SOURCE of the diagnostic
 // changed. Every prior version of this row asserted THIS function's own
@@ -311,9 +287,29 @@ BEZEL_TEST(codegen_nullcond_unit_receiver_equals_hashcode_3452,
 // `Equals` and `M3452F.Sh`) — only which of the two pre-existing diagnostic
 // texts is the one produced.
 //
-// The TEXT is asserted, not `hasErrors()` (which the IR-verifier abort also
-// satisfies) and not `!ran` alone (which the BASE also satisfies) — only the new
-// diagnostic distinguishes this commit from both other states.
+// ⚠⚠⚠⚠ THE ROW REVERSES ONE FINAL TIME (fix #3914, §8.1/§8.3/§8.6/§35.4/§35.7,
+// v0.294). The residual decline this row pinned — an UNRESOLVED generic method
+// type parameter (`X` in `Foo<X>(s: Sh?, arg: X)`) routed through
+// `equalsArgIsOwnTypeOrUnresolved`'s "or unresolved" clause into the
+// structural-equality path, which then declined on `!isStructTy()` when `X`
+// resolved to `int` at the live call site — was the spec gap #3914 catalogued:
+// §8.1's universal `Equals(other: Object?)` and §8.6's boxing guarantee a
+// boxed `int` can never equal a boxed `Sh`, so the program below asks the
+// IDENTICAL runtime question as the concrete `s?.Equals(7)` already pinned by
+// T5b above and the answer must be the SAME: `False`. Resolving `at` through
+// `resolveTypeParamRef` BEFORE running the predicates (LlvmBackend_Calls2.cpp's
+// choice/record/enum arms, all three) routes `Foo<int>(s, 7)` to
+// `equalsArgSettlesFalse` directly and emits `False` per §8.3/§8.6 —
+// matching T5b. The dead abstract-template pass is unaffected (its
+// `genericSubstSemaTy_` is empty, so `resolveTypeParamRef` returns the bare-
+// unresolved ref unchanged). What this row now proves is: a generic method
+// whose type parameter resolves to a known-settles-False argument compiles,
+// runs, and PRINTS `False` (rc=0) — strictly better than the prior
+// diagnostic-only outcome and identical in kind to T5b's concrete spelling.
+// (The row's name and the `spec_7_5` test-suite suffix are unchanged so the
+// test's identity carries through; the assertion below is updated for the
+// new, more-correct `False` answer per LANE_RULES §7: a fix reversing a
+// prior rejection MUST update the test it displaced.)
 BEZEL_TEST(codegen_nullcond_unit_receiver_equals_hashcode_3452,
            nullcond_declining_inner_lowering_fails_closed_spec_7_5) {
     auto r = runAot(
@@ -333,39 +329,16 @@ BEZEL_TEST(codegen_nullcond_unit_receiver_equals_hashcode_3452,
         "    return 0; "
         "  end Main; "
         "end C;");
-    BEZEL_EXPECT_FALSE(r.ran);
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    // fix #3943: this is now the CHOICE ARM's own diagnostic (mirroring the
-    // record arm's text, `record_enum_equals_universal_argument_3538_test.cpp`),
-    // not the `?.`-wrapper's generic §7.5 restatement.
-    bool explainsWhy = false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("does not resolve to a value of that choice") !=
-            std::string::npos)
-            explainsWhy = true;
-    BEZEL_EXPECT_TRUE(explainsWhy);
-    // …and it must name the member and the receiver type, which is the whole
-    // point of replacing "IR verification failed" with a real diagnostic.
-    bool named = false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("member `Equals`") != std::string::npos &&
-            d.message.find("`M3452F.Sh`") != std::string::npos)
-            named = true;
-    BEZEL_EXPECT_TRUE(named);
-    // fix #3943: exactly ONE diagnostic naming this call site — the
-    // wrapper's own generic text must not ALSO appear (that would be the
-    // double-diagnostic #3943 measured, or a #3942-shaped dead-template-pass
-    // duplicate of either text).
-    int equalsDiagCount = 0;
-    for (const auto& d : r.diagnostics.diagnostics()) {
-        if (d.message.find("member `Equals`") != std::string::npos)
-            ++equalsDiagCount;
-        BEZEL_EXPECT_TRUE(
-            d.message.find(
-                "reserves the `null` result of `?.` for a null receiver") ==
-            std::string::npos);
-    }
-    BEZEL_EXPECT_EQ(equalsDiagCount, 1);
+    // fix #3914: the program now COMPILES and prints `False` per §8.3/§8.6 —
+    // matching the concrete `s?.Equals(7)` spelling T5b above already pins —
+    // rather than declining. The dead abstract-template pass may still emit a
+    // benign #2491 "return-value expression failed to lower" `Severity::Warning`
+    // backstop for the i32-placeholder dead body (an unrelated pre-existing
+    // quirk of the dead-template lowerReturnStmt path; the live
+    // `Foo<int>` specialization lowers correctly and is what runs).
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("False\n"));
 }
 
 // ── T7 — BOTH-SIDES CONTROL. Every other row in this file fails 100% without
@@ -429,6 +402,17 @@ BEZEL_TEST(codegen_nullcond_unit_receiver_equals_hashcode_3452,
 // struct-mismatch guards (`record_enum_equals_universal_argument_3538_test.cpp`'s
 // T7/T9) — so this row asserts the SAME "does not resolve to a value of that
 // choice" text T6 now does, not a distinct one.
+//
+// ⚠⚠ THE ROW REVERSES (fix #3914, §8.1/§8.3/§8.6/§35.4/§35.7, v0.294) — for
+// the SAME reason T6 above reverses. `at = resolveTypeParamRef(X)` substitutes
+// to `Pair` (a record) at this call site; `equalsArgSettlesFalse(Pair, Sh)`
+// returns TRUE (different record type per §8.3) and emits `False` directly.
+// `Pair` is still a struct — #3913's mismatch guard remains in place for
+// the dead abstract-template pass and any genuinely-unresolved case where
+// `resolveTypeParamRef` returns `ty` unchanged — but the LIVE `Foo<Pair>`
+// specialization never reaches it. The row name and `not_crash_3913` suffix
+// stay (the crash fix itself is not undone); the assertion below is updated
+// for the new `False` answer.
 BEZEL_TEST(codegen_nullcond_unit_receiver_equals_hashcode_3452,
            nullcond_choice_struct_shaped_generic_arg_fails_closed_not_crash_3913) {
     auto r = runAot(
@@ -449,30 +433,12 @@ BEZEL_TEST(codegen_nullcond_unit_receiver_equals_hashcode_3452,
         "    return 0; "
         "  end Main; "
         "end C;");
-    BEZEL_EXPECT_FALSE(r.ran);
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    bool explainsWhy = false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("does not resolve to a value of that choice") !=
-            std::string::npos)
-            explainsWhy = true;
-    BEZEL_EXPECT_TRUE(explainsWhy);
-    bool named = false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("member `Equals`") != std::string::npos &&
-            d.message.find("`M3452F.Sh`") != std::string::npos)
-            named = true;
-    BEZEL_EXPECT_TRUE(named);
-    int equalsDiagCount = 0;
-    for (const auto& d : r.diagnostics.diagnostics()) {
-        if (d.message.find("member `Equals`") != std::string::npos)
-            ++equalsDiagCount;
-        BEZEL_EXPECT_TRUE(
-            d.message.find(
-                "reserves the `null` result of `?.` for a null receiver") ==
-            std::string::npos);
-    }
-    BEZEL_EXPECT_EQ(equalsDiagCount, 1);
+    // fix #3914: the program now COMPILES and prints `False` per §8.3/§8.6 —
+    // `Pair` is a record, `Sh` is a choice, §8.3 settles the answer at `False`
+    // — matching the concrete spelling of the same runtime question.
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("False\n"));
 }
 
 // ── T9 (fix #3942, §7.5/#3452, v0.294) — HIGH-SEVERITY FALSE-REJECT CONTROL.
@@ -558,6 +524,21 @@ BEZEL_TEST(codegen_nullcond_unit_receiver_equals_hashcode_3452,
 // generic text (from the dead template pass, #3942's bug) AND the record
 // arm's own specific text (from the live pass, #3922's unconditional report)
 // — two diagnostics for one call site.
+//
+// ⚠ THE ROW REVERSES (fix #3914, §8.1/§8.3/§8.6/§9.1/§9.2, v0.294). The
+// resolve-first change at the record arm routes `Foo<int>(p, 7)` through
+// `equalsArgSettlesFalse(int, Pt)` — `int` is a primitive, `Pt` is a record,
+// §8.3 settles the answer at `False` — and emits `False` directly from the
+// dispatch core. The double-diagnostic defect this row originally pinned is
+// now structurally impossible: the live pass settles `False` per §8.3
+// without reaching the diagnostic path at all, and the dead abstract-template
+// pass still degrades silently under the existing
+// `emittingGenericTemplateBody_` gates #3922/#3942 added. The row name and
+// `single_diagnostic_not_double_3943` suffix are kept (the double-diagnostic
+// fix itself is not undone — it remains load-bearing for any genuinely-
+// unresolved path that the resolve-first cannot subsume), but the assertion
+// below is updated for the new, more-correct `False` answer per LANE_RULES
+// §7.
 BEZEL_TEST(codegen_nullcond_unit_receiver_equals_hashcode_3452,
            nullcond_record_bad_instantiation_single_diagnostic_not_double_3943) {
     auto r = runAot(
@@ -574,18 +555,10 @@ BEZEL_TEST(codegen_nullcond_unit_receiver_equals_hashcode_3452,
         "    return 0; "
         "  end Main; "
         "end C;");
-    BEZEL_EXPECT_FALSE(r.ran);
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    int equalsDiagCount = 0;
-    bool sawWrapperText = false;
-    for (const auto& d : r.diagnostics.diagnostics()) {
-        if (d.message.find("member `Equals`") != std::string::npos)
-            ++equalsDiagCount;
-        if (d.message.find(
-                "reserves the `null` result of `?.` for a null receiver") !=
-            std::string::npos)
-            sawWrapperText = true;
-    }
-    BEZEL_EXPECT_EQ(equalsDiagCount, 1);
-    BEZEL_EXPECT_FALSE(sawWrapperText);
+    // fix #3914: the program now COMPILES and prints `False` per §8.3/§8.6 —
+    // `int` against `Pt?` settles to `False` per §8.3 with §8.6 boxing
+    // (a boxed int cannot equal a record).
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("False\n"));
 }
