@@ -1185,7 +1185,7 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 // is handled correctly without an explicit guard.
                 if (!handled)
                     handled = lowerOwnedCollectionFieldStore(*as->target, addr,
-                                                             rhs);
+                                                             rhs, as->value.get());
                 // §28.7 (#1328): drop-on-overwrite for owned class/interface
                 // FIELDS — the field analog of disposeDisplacedOwnedClassLocal.
                 // Loads the old object pointer, applies null+identity guards (so a
@@ -1340,6 +1340,46 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                     // the struct, not its value element).
                     rhs = unwrapNarrowedNullable(rhs, elemTy);
                     llvm::StoreInst* si = builder_.CreateStore(rhs, addr);
+                    // fix #4068 / §28.3 / §28.9 / stdlib §5 (v0.295): the
+                    // path-sensitive walker change in `collectBorrowingArray
+                    // FreeEligible` (LlvmBackend_Setup.cpp ~24423 / ~28134)
+                    // admits a `var items := seq.Sorted();` whose ONE
+                    // escaping use is confined to a non-taken branch. The
+                    // scope-end `bz_array_free` is now emitted on the
+                    // unescaped branches — but on the consuming branch the
+                    // local's slot still holds the array pointer (which the
+                    // OWNED field now ALSO owns), so a scope-end free on the
+                    // slot would double-free with the field's later
+                    // destructor-side free (measured SIGSEGV in ASan after
+                    // the walker change alone, in `Holder.DisposeCore`
+                    // freeing the already-freed `this.Data` array). Pair the
+                    // walker change with this null: for an `:=` whose RHS is
+                    // a borrowing-`Array`-materializer local admitted to
+                    // `borrowingArrayFreeEligible_`, null the RHS slot right
+                    // after the store so `bz_array_free` on the slot at scope
+                    // end is a no-op (the runtime's `bz_array_free` checks
+                    // `if (!arrp) return;` first). Gated on the
+                    // `borrowingArrayFreeEligible_` membership (so non-
+                    // materializer-bound locals — which the path-
+                    // insensitive walker still suppresses — are untouched)
+                    // and on `borrowingArrayFreeEligibleFn_ == currentFn_`
+                    // (so a lambda body lowered mid-function doesn't fire
+                    // this gate against the OUTER function's analysis).
+                    if (currentFn_ == borrowingArrayFreeEligibleFn_ &&
+                        as->op == ":=" && as->value) {
+                        if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
+                                as->value.get())) {
+                            sema::Symbol* asym = ctx_.exprSymbol(*id);
+                            auto* loc = asym ?
+                                dynamic_cast<sema::LocalSymbol*>(asym) :
+                                nullptr;
+                            if (loc && loc->decl &&
+                                borrowingArrayFreeEligible_.count(
+                                    static_cast<const void*>(loc->decl))) {
+                                nullTransferredOwnedLocalSlot(as->value.get());
+                            }
+                        }
+                    }
                     if (boxState)
                         builder_.CreateStore(
                             builder_.getInt1(newBoxKind > 0), boxState);

@@ -14419,7 +14419,8 @@ private:
     // the assignment). Returns true when handled.
     bool lowerOwnedCollectionFieldStore(const ast::Expr& target,
                                         llvm::Value* fieldAddr,
-                                        llvm::Value* newVal);
+                                        llvm::Value* newVal,
+                                        const ast::Expr* valueExpr = nullptr);
 
     // §28.7 / #1328: is `target` an `owned` CLASS/INTERFACE instance field
     // lvalue? Excludes locals, ref params, static fields, record fields, and any

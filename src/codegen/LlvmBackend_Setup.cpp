@@ -10913,6 +10913,25 @@ void Emitter::emitConstructorBody(sema::ConstructorSymbol* cs, llvm::Function* f
     collectStringReleaseEligible(cd->body);
     stringReleaseEligibleFn_ = fn;
     retainAssignedStringParams(cd->body, cs->params);
+    // fix #4068 / §28.3 / §28.9 / stdlib §5 (v0.295): the constructor body
+    // was running ONLY the string-release eligibility walk — every other
+    // borrowing-`Array`-materializer (#1003 / #4042) analysis was missing,
+    // so a `var items := seq.Sorted();` in a constructor body whose lifetime
+    // extends across an `if`/else that consumes `items` on only one branch
+    // was never admitted to `borrowingArrayFreeEligible_`, and the scope-
+    // end `bz_array_free` was never emitted on the unconsumed branch —
+    // leaking the local every construction (issue's measured 20468 B / 602
+    // allocs over 300 iterations × 2 holders, where the if-branch consumes
+    // and the else-branch does not). Mirror the method-body call site at
+    // line 9358 here so the path-sensitive walker (the matching fix in
+    // `collectBorrowingArrayFreeEligible`'s candidates loop, this file
+    // ~28134) runs against the ctor body too. The token
+    // `borrowingArrayFreeEligibleFn_` is set right after so the
+    // lowerLocalDecl / scope-end-disposal consumers gate on this exact
+    // function — same staleness discipline every method-body call applies.
+    borrowingArrayFreeEligible_.clear();
+    borrowingArrayFreeEligibleFn_ = fn;
+    collectBorrowingArrayFreeEligible(cd->body);
 
     // §22.16 (v0.203, #2053): a constructor's `requires` clauses evaluate
     // AFTER argument binding completes and BEFORE any of the member's own
@@ -22684,6 +22703,33 @@ struct StringEscapeWalker {
     // the alias site, so for them a copy genuinely aliases a single reference
     // and must keep tainting the source.
     const std::unordered_set<const void*>* borrowRetainedAliases = nullptr;
+    // fix #4068 / §28.3 / §28.9 / stdlib §5 (v0.295): path-sensitive branch
+    // analysis. The default walk is PATH-INSENSITIVE — when the walker hits
+    // an `if`/`while`/`for` it walks every reachable branch in sequence and
+    // ANY escape on ANY branch taints the local globally (so the scope-end
+    // reclaim is suppressed everywhere, the safe direction in the
+    // path-insensitive case: a leak is preferable to a UAF/double-free).
+    // For the borrowing-`Array`-materializer (#1003 / #4042) eligibility set
+    // this is too coarse: a `var items := seq.Sorted();` consumed by an
+    // `if flag then this.Data := items; else var n := items.Length; end if;`
+    // is taint-marked by the if-branch's field store even though on the
+    // else-branch the local is provably alive at scope end — the conservative
+    // walk then suppresses the scope-end `bz_array_free` on EVERY path
+    // including the else-branch, leaking the local every time (measured
+    // 20468 B / 602 allocs on the issue's 300-iteration repro). The other
+    // eligibility sets (string, dict-materializer, grouping, set-literal,
+    // record-call-result) KEEP the path-insensitive walk: they have no
+    // consume-site slot-nulling equivalent (the existing `nullTransferred
+    // OwnedLocalSlot` only fires for `:= owned x` and a few collection-
+    // element transfers; a plain `this.Data := items;` does NOT null the
+    // RHS slot) so a path-sensitive verdict would emit scope-end frees that
+    // double-free on the consumed branches. Only the borrowing-`Array`-
+    // materializer pair (this walker change + the `nullTransferredOwnedLocal
+    // Slot` extension at the AssignmentStmt field-store site, in
+    // LlvmBackend_Stmts.cpp / LlvmBackend_Assign.cpp) is sound for path-
+    // sensitivity. OFF by default; set ONLY by `collectBorrowingArrayFree
+    // Eligible`'s candidates loop.
+    bool pathSensitiveBranchMode = false;
     // fix #2900 / §28.9 / §28.3 (v0.240): the `Object`-slot / string-borrow
     // twin of `borrowRetainedAliases` above. The walker's `LocalDecl` arm
     // treats a `var o: Object := s;` binding (the destination `ld` is in
@@ -24585,6 +24631,47 @@ struct StringEscapeWalker {
         }
         if (auto* is = dynamic_cast<const ast::IfStmt*>(s)) {
             expr(is->ifBranch.condition.get(), /*safeRead=*/true);
+            // fix #4068 / §28.3 / §28.9: when pathSensitiveBranchMode is set,
+            // walk each branch independently. The local is only marked globally
+            // escaped if it is escaped on EVERY reachable path: the if-branch
+            // path, every elif-branch path, and either the else-branch path or
+            // the fall-through path (no-else). See pathSensitiveBranchMode's
+            // own comment for why this is sound ONLY for the borrowing-`Array`-
+            // materializer case (the matching slot-null at the field-store
+            // consume site makes the scope-end free a no-op on consumed paths).
+            // OFF for every other eligibility set — they keep the conservative
+            // path-insensitive taint below.
+            if (pathSensitiveBranchMode) {
+                bool outerEscaped = escaped;
+                escaped = false;
+                for (auto& b : is->ifBranch.body) stmt(b.get());
+                bool ifEscaped = escaped;
+                bool allElifEscaped = is->elifBranches.empty();
+                for (auto& br : is->elifBranches) {
+                    expr(br.condition.get(), /*safeRead=*/true);
+                    escaped = false;
+                    for (auto& b : br.body) stmt(b.get());
+                    allElifEscaped = allElifEscaped && escaped;
+                }
+                bool hasElse = !is->elseBody.empty();
+                bool elseEscaped = false;
+                if (hasElse) {
+                    escaped = false;
+                    for (auto& b : is->elseBody) stmt(b.get());
+                    elseEscaped = escaped;
+                }
+                // Globally escaped iff every reachable path escapes the local.
+                // - hasElse: every control path takes SOME branch, so the local
+                //   must be escaped on the if-branch, every elif-branch AND the
+                //   else-branch.
+                // - no else: a fall-through path (all conditions false, no else)
+                //   is reachable; the local is NOT escaped on that path (no
+                //   branch runs), so it is never globally escaped here.
+                bool globallyEscaped =
+                    hasElse && ifEscaped && allElifEscaped && elseEscaped;
+                escaped = outerEscaped || globallyEscaped;
+                return;
+            }
             for (auto& b : is->ifBranch.body) stmt(b.get());
             for (auto& br : is->elifBranches) {
                 expr(br.condition.get(), /*safeRead=*/true);
@@ -24595,6 +24682,36 @@ struct StringEscapeWalker {
         }
         if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s)) {
             expr(ws->condition.get(), /*safeRead=*/true);
+            // fix #4068: in pathSensitiveBranchMode, a while-loop body might
+            // iterate zero times — the local is then provably alive at the
+            // loop exit. Walk the body once into a saved state; if the body
+            // escapes the local, conservatively mark globally escaped (the
+            // loop might iterate, in which case the local escapes); if the
+            // body does NOT escape the local, the local is unescaped on the
+            // zero-iteration path AND on the post-loop-fall-through (every
+            // iteration must exit eventually — sema enforces break/exit, and
+            // a no-escape body means the local's lifetime ends with the loop
+            // either way). Net verdict: not globally escaped.
+            //
+            // The conservative version below treats every while-loop body as
+            // a guaranteed escape (the path-insensitive default for the other
+            // eligibility sets). Keeping it OFF for the other sets is sound —
+            // their scope-end reclaim is suppressed everywhere if any branch
+            // escapes, while here the matching consume-null makes the scope-
+            // end free a no-op on escaped paths.
+            if (pathSensitiveBranchMode) {
+                bool outerEscaped = escaped;
+                escaped = false;
+                for (auto& b : ws->body) stmt(b.get());
+                bool bodyEscaped = escaped;
+                // Body unescaped ⇒ local is unescaped on the zero-iteration
+                // and post-loop-fall-through paths ⇒ NOT globally escaped.
+                // Body escaped ⇒ local MAY be escaped on the iterated path;
+                // since we cannot prove zero-iteration, conservatively mark
+                // escaped (matches pre-fix conservative behavior).
+                escaped = outerEscaped || bodyEscaped;
+                return;
+            }
             for (auto& b : ws->body) stmt(b.get());
             return;
         }
@@ -24608,6 +24725,13 @@ struct StringEscapeWalker {
             // the backing. So iterating the array is a borrow-read, not an escape,
             // and the array stays reclaim-eligible. (A read inside a lambda body
             // still escapes: expr() forces it via inLambda regardless of safeRead.)
+            //
+            // fix #4068: in pathSensitiveBranchMode, the iterable is the only
+            // sub-expression whose escape verdict flips per the mode (the body
+            // and with-expr are walked at the end exactly as below). The body
+            // is conservatively treated as an escape here — for-loops iterate
+            // at least once in practice (a zero-iteration for is semantically
+            // a no-op) and the body typically retains the iterator.
             if (borrowingArrayMode && isTargetIdent(fs->iterable.get()))
                 expr(fs->iterable.get(), /*safeRead=*/true);
             else
@@ -25254,7 +25378,8 @@ bool Emitter::isOwnedCollectionFieldLvalue(const ast::Expr& target) {
 // consistent), the field is never observed holding the old value after dispose.
 bool Emitter::lowerOwnedCollectionFieldStore(const ast::Expr& target,
                                              llvm::Value* fieldAddr,
-                                             llvm::Value* newVal) {
+                                             llvm::Value* newVal,
+                                             const ast::Expr* valueExpr) {
     if (!isOwnedCollectionFieldLvalue(target)) return false;
     if (!fieldAddr || !newVal) return false;
     if (!newVal->getType()->isPointerTy()) return false;
@@ -25264,6 +25389,36 @@ bool Emitter::lowerOwnedCollectionFieldStore(const ast::Expr& target,
 
     // Store the new pointer — field now owns the new collection.
     builder_.CreateStore(newVal, fieldAddr);
+    // fix #4068 / §28.3 / §28.9 / stdlib §5 (v0.295): paired with the
+    // path-sensitive walker change in `collectBorrowingArrayFreeEligible`
+    // (this file ~24423 / ~28134). When the field-store's RHS is a bare
+    // identifier `items` whose LocalDecl is in `borrowingArrayFreeEligible_`,
+    // the OWNED field now ALSO owns the same array pointer as the local slot
+    // — without nulling the slot, the scope-end `bz_array_free` (registered
+    // by lowerLocalDecl on the original declaration) would double-free with
+    // the field's destructor-side `bz_array_free` (measured SIGSEGV in ASan
+    // after the walker change alone). `nullTransferredOwnedLocalSlot` walks
+    // the same eligibility gate so an `eligible ⟹ nulled` invariant holds.
+    // Gated on `borrowingArrayFreeEligibleFn_ == currentFn_` so a lambda
+    // body lowered mid-function does not fire against the OUTER function's
+    // analysis. The post-store null goes HERE rather than at the call site
+    // because this is the one place that actually performs the field-store;
+    // the AssignmentStmt dispatch chain returns `handled=true` here and
+    // skips its post-`CreateStore` block, so a sibling null in Stmts.cpp
+    // is unreachable for owned-collection field stores.
+    if (valueExpr && currentFn_ == borrowingArrayFreeEligibleFn_) {
+        if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(valueExpr)) {
+            sema::Symbol* asym = ctx_.exprSymbol(*id);
+            auto* loc = asym ?
+                dynamic_cast<sema::LocalSymbol*>(asym) :
+                nullptr;
+            if (loc && loc->decl &&
+                borrowingArrayFreeEligible_.count(
+                    static_cast<const void*>(loc->decl))) {
+                nullTransferredOwnedLocalSlot(id);
+            }
+        }
+    }
 
     // Identify the collection element type and whether this is an owning family.
     // Reuse the same logic as emitOwnedFieldDisposals (§2185-§2218).
@@ -28219,6 +28374,16 @@ void Emitter::collectBorrowingArrayFreeEligible(
         // untouched (narrowly scoped to this issue's exact title/repro).
         w.yieldIsBorrowIterYield = yieldIsBorrowIterYield;
         w.safeViewAliases = &safeViews;
+        // fix #4068 / §28.3 / §28.9 / stdlib §5 (v0.295): enable the path-
+        // sensitive branch walk for this candidates loop ONLY. See the
+        // pathSensitiveBranchMode field comment (struct StringEscapeWalker,
+        // LlvmBackend_Setup.cpp ~22485) for the full soundness argument —
+        // the matching slot-null at the AssignmentStmt field-store consume
+        // site (LlvmBackend_Stmts.cpp / LlvmBackend_Assign.cpp) makes the
+        // scope-end `bz_array_free` a no-op on consumed paths. OFF in the
+        // dict-materializer / grouping / set-literal / aggregate-root loops
+        // below, which keep the conservative path-insensitive taint.
+        w.pathSensitiveBranchMode = true;
         for (auto& s : body) { w.stmt(s.get()); if (w.escaped) break; }
         if (!w.escaped)
             borrowingArrayFreeEligible_.insert(static_cast<const void*>(ld));
