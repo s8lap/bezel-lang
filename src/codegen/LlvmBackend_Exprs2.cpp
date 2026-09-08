@@ -642,6 +642,12 @@ llvm::Value* Emitter::lowerUnary(const ast::UnaryExpr& un) {
                 // subsequent borrow — the plain-`var` borrow-after-move idiom
                 // (`new T(move n, n)`) keeps its UN-nulled slot because n's
                 // autoDropAtScopeEnd is false there. // per §28.3, §28.8
+                // LOCALDECL-DEBT: #4049 — fix #4049 adds this null-site for the
+                // plain-`var` local whose OWN autoDropAtScopeEnd is armed; the
+                // flag lives ONLY on LocalDecl (not LocalConstDecl), so widening
+                // the candidate vector to `const ast::Node*` would be a no-op
+                // here (a §21.1 `const` local cannot bind the plain-`var` shape
+                // — mirrors the LOCALDECL-ONLY reasoning above at line 600).
                 const bool isPlainVarAutoDropAtScopeEnd = [&]() -> bool {
                     if (auto* ld =
                             dynamic_cast<const ast::LocalDecl*>(loc->decl))

@@ -31,6 +31,7 @@
 1    src/codegen/LlvmBackend_Assign.cpp
 1    src/codegen/LlvmBackend_Calls2.cpp
 1    src/codegen/LlvmBackend_Calls3.cpp
+1    src/codegen/LlvmBackend_ElementPolicy.cpp
 1    src/codegen/LlvmBackend_Exprs.cpp
 1    src/codegen/LlvmBackend_Exprs2.cpp
 2    src/ownership/Ownership_Checks.cpp

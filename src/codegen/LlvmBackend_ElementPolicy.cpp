@@ -200,6 +200,12 @@ Emitter::ElementPolicy Emitter::elementPolicyFor(const sema::TypeRef* elemTy,
         if (!t->astNode || !t->astNode->name || t->astNode->name->parts.empty())
             return std::nullopt;
         std::string_view n = t->headName();
+        // GRID-DEBT: #4054 — the borrow-builtin classification is needed
+        // here because the OwningArray disposal cascade (fix #4054) must free a
+        // stored element whose TYPE is a borrowing builtin collection via its
+        // matching runtime free fn (bz_array_free / bz_llist_free / bz_dict_free)
+        // with NULL inner disposer. Will consolidate onto a shared classifier
+        // when the borrowing axis gets its own authority predicate.
         if (n == "Array" || n == "Stack" || n == "Queue" ||
             n == "LinkedList" ||
             n == "OwningBuffer" ||  // §4.14: OwningBuffer<T> is OWNING for T (a
