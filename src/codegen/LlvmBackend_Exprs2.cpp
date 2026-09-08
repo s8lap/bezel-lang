@@ -11303,6 +11303,54 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
                 if (scrut->getType()->isPointerTy())
                     return builder_.getInt1(false);
                 bool sameType = scrutTy && scrutTy->declaration == ts;
+                // fix #4082 (§19.5 / §3.6 rule 4 / §27.8, v0.294): a bare
+                // pattern resolved THROUGH A TYPE ALIAS that names a SPECIFIC
+                // generic instantiation (e.g. `type AliasBoxStr := Box<string>;`
+                // used as `case b of AliasBoxStr => …`) must match the
+                // scrutinee on the alias's full instantiation, not on the
+                // record declaration alone — `Box<int>` and `Box<string>` are
+                // distinct runtime type identities under §3.6 rule 4 even
+                // though they share the `Box` TypeSymbol*. The DIRECT
+                // (unaliased) bare-name form has no spelling for type
+                // arguments (#1206 — the pattern grammar carries no `<…>`
+                // position), so its matches-any-instantiation behavior is
+                // kept; the alias route is the ONE place a user can
+                // communicate a specific instantiation through a bare
+                // pattern, and the silent always-match otherwise computes
+                // the wrong value. Compares `genericArgs` element-wise via
+                // the shared `sema::typeRefEqual` so a `Box<int>` scrutinee
+                // against a `Box<string>` alias falls through to the
+                // next arm (the `_` in the issue's repro), as §19.5
+                // requires.
+                if (sameType && ts->kind == ast::TypeDeclKind::Record &&
+                    scrutTy->kind == sema::TypeRef::Kind::Named) {
+                    if (auto* aliasSym =
+                            dynamic_cast<const sema::TypeAliasSymbol*>(s)) {
+                        const auto* aliasDecl =
+                            dynamic_cast<const ast::TypeAlias*>(
+                                aliasSym->decl);
+                        if (aliasDecl && aliasDecl->aliasedType) {
+                            if (auto* underlying = ctx_.resolvedType(
+                                    *aliasDecl->aliasedType)) {
+                                if (scrutTy->genericArgs.size() !=
+                                    underlying->genericArgs.size()) {
+                                    sameType = false;
+                                } else {
+                                    for (size_t i = 0;
+                                         i < scrutTy->genericArgs.size();
+                                         ++i) {
+                                        if (!sema::typeRefEqual(
+                                                scrutTy->genericArgs[i],
+                                                underlying->genericArgs[i])) {
+                                            sameType = false;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 return builder_.getInt1(sameType);
             };
             for (const auto& sym : ctx_.symbols()) {
