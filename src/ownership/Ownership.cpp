@@ -6040,11 +6040,101 @@ void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
         // when the" assignment occurs.  A conditionally-evaluated transfer is a
         // K7.4 owned-⊓-moved-from JOIN (maybe-consumed), not an unconditional
         // move, and `recordMovesIn` records the latter; marking it
-        // unconditionally would over-reject the still-owned path.  Recording
-        // the join correctly needs the per-path state §28.3's producers table
-        // gives `a ??= b`, which this arm does not compute — left as it was
-        // (undiagnosed, i.e. no regression) and filed separately.
-        if (as.op != "??=") recordMovesIn(*as.value);
+        // unconditionally would over-reject the still-owned path.
+        //
+        // fix #3980 (§28.3, §7.7, v0.294): EXCEPTION — when the target of
+        // `??=` is a bare-identifier tracked local whose current dataflow
+        // state is `PolyNull` (the local is provably null at this statement —
+        // either a `null`-initialized plain local at its first use, or one
+        // that has reached PolyNull through a prior §28.3 join), the §6.6
+        // conditional collapses: the assignment provably occurs and the RHS
+        // is evaluated EXACTLY ONCE, equivalent to `:=` on the same target.
+        // §28.3's `a ??= b` producers row ("the compound form `a ??= b`
+        // assigns into `a` and follows the same meet rule for the assigned-
+        // into location") plus K7 (`PolyNull ⊓ Owned = Owned`) is the
+        // authority: the target adopts `producerState(*as.value)` exactly as
+        // the `:=` path does, and the RHS transfer is recorded because the
+        // RHS is unconditionally evaluated here.
+        //
+        // Without this, a `??= <owned producer>` into a `var x: T? := null;`
+        // local left the target's dataflow state at PolyNull (the assignment
+        // arm did not run), so codegen's `unwindOwnedLocalClass` (which keys
+        // on the `becomesOwnedViaReassign` #1625 flag, set by the `:=` path
+        // but only there) never classified the local as an owned class local:
+        // §28.7 drop-on-overwrite never fired (every intermediate value
+        // leaked), and §28.3 scope-end disposal was not registered either
+        // (the final value leaked). Measured 7968 B / 498 allocations on the
+        // issue repro (`x ??= Sink.Give();` in a 500-iteration loop) — the
+        // single allocation per iteration that §7.7 owns was never
+        // discharged. The case 2 shape (target may be non-null — needs per-
+        // path K7.4 state and a runtime maybe-consumed bit) is the harder
+        // half and remains out of scope; this arm only fires when the
+        // dataflow has already resolved the target to PolyNull.
+        if (as.op != "??=") {
+            recordMovesIn(*as.value);
+            return;
+        }
+        // `??=` arm. Read-checks for target + value already ran above.
+        if (const auto* id =
+                dynamic_cast<const ast::IdentifierExpr*>(as.target.get())) {
+            for (auto& [sym, st] : states_) {
+                if (sym->name != id->name) continue;
+                if (st.state == OwnershipState::PolyNull) {
+                    // The assignment provably occurs; mirror the `:=` path's
+                    // bare-identifier arm (§28.3, §28.7). recordMovesIn runs
+                    // first so a `move`d source is no longer Owned before the
+                    // local adopts its producer state (matches the order in
+                    // the `:=` branch).
+                    recordMovesIn(*as.value);
+                    // §28.7 / §28.3 (#1625): the null-INIT flag, set by the
+                    // `:=` path on the first Owned reassignment of a null-
+                    // initialized plain local so codegen treats it as an
+                    // owned class local (drop-on-overwrite + scope-end
+                    // disposal). Restricted to a null-init LocalDecl — the
+                    // two "becomes owned via reassign" shapes the `:=` path
+                    // explicitly guards against (no-init local carrying the
+                    // §28.3 disposal obligation; borrow-init local admitting
+                    // double-free) do not arise here: a `??=` RHS is by §7.7
+                    // a producer (an owned value or a borrow), but the
+                    // borrow-init guard is a property of the LocalDecl's
+                    // initializer, which for a PolyNull local is `null` —
+                    // i.e. exactly the case the flag is for. // per §28.7,
+                    // §28.3, #1625
+                    if (producerState(*as.value) == OwnershipState::Owned) {
+                        if (auto* lsym =
+                                dynamic_cast<sema::LocalSymbol*>(sym)) {
+                            if (auto* ld2 = dynamic_cast<const ast::LocalDecl*>(
+                                    lsym->decl))
+                                if (ld2->initializer &&
+                                    dynamic_cast<const ast::NullLiteralExpr*>(
+                                        ld2->initializer.get()))
+                                    const_cast<ast::LocalDecl*>(ld2)
+                                        ->becomesOwnedViaReassign = true;
+                        }
+                    }
+                    // State transition, mirroring the `:=` path's
+                    // bare-identifier arm at lines below: the local adopts
+                    // the RHS's ownership state and any conditional-
+                    // discharge / await-spend markers from prior joins are
+                    // cleared. // per §28.3, §7.7 K7, #3980
+                    st.state = producerState(*as.value);
+                    st.obligationOrigin = &as;
+                    st.maybeConsumed = false;
+                    st.disposedOnSomePath = false;
+                    st.awaitSpent = false;
+                    // §28.3 (#1900): the scope-end auto-drop's "definitely
+                    // holds a fresh value" marker, used by the
+                    // consume-and-restore idiom. // per §28.3, #1900
+                    if (st.state == OwnershipState::Owned)
+                        definitelyRestoredLocals_.insert(sym);
+                    // §28.9 / §9.7 indirect-escape tracking: `??=` writes a
+                    // fresh value, so any prior borrow source is cleared —
+                    // the local no longer aliases the old referent.
+                    st.source.reset();
+                }
+                break;
+            }
+        }
         return;
     }
     if (!as.target || !as.value) return;

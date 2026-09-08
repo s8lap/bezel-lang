@@ -111,6 +111,7 @@
 #include "support/aot_result_asserts.hpp"  // failedAtCompileTimeWithRealLocation
 #include "support/aot_support.hpp"         // runAot — the AOT oracle
 #include "support/ownership_support.hpp"
+#include "support/run_under_asan.hpp"      // runUnderAsan — #3980 leak oracle
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
@@ -561,4 +562,160 @@ BEZEL_TEST(compound_assignment_read_after_consume_3969,
         "return t;"));
     BEZEL_EXPECT_TRUE(jr.ran);
     BEZEL_EXPECT_EQ(jr.exitCode, 11);
+}
+
+// ============================================================================
+// fix #3980 (§28.3, §7.7, v0.294): a `??= <owned producer>` into a `null`-
+// initialized plain local leaked the fresh owned value silently.  #3969
+// correctly read-checked the target and the RHS but deliberately skipped any
+// state transition for `??=` on §6.6's conditional-evaluation text — for a
+// PolyNull target the conditional collapses and the assignment provably
+// occurs, so the new arm mirrors the `:=` path's state transition and sets
+// the #1625 null-init flag so codegen classifies the local as an owned class
+// local.  See `tests/ownership/compound_assignment_read_after_consume_3969_test.cpp`
+// for the spec citations.
+// ============================================================================
+
+// ASan oracle: the issue repro, loop-amplified to 500 iterations, fails
+// (LeakSanitizer reports 7968 B / 498 allocations) without the fix and is
+// clean with it.  Every `Sink.Give()` allocation is disposed by §28.3's
+// scope-end auto-drop on the now-Owned local — the loop body never disposes.
+BEZEL_TEST(compound_assignment_read_after_consume_3969,
+           asan_null_coalescing_assign_owned_value_no_leak_spec_7_7_3980) {
+    int rc = bezel::test::runUnderAsan(
+        "module M; "
+        "class Res "
+        "  public tag: int; "
+        "  public constructor(t: int) this.tag := t; end constructor; "
+        "  destructor end destructor; "
+        "end Res; "
+        "class Sink "
+        "  public static method Give(): owned Res return new Res(1); end Give; "
+        "end Sink; "
+        "class C public static method Main(): int "
+        "  var total := 0; "
+        "  var i := 0; "
+        "  while i < 500 do "
+        "    var x: Res? := null; "
+        "    x ??= Sink.Give(); "
+        "    total += x!.tag; "
+        "    i += 1; "
+        "  end; "
+        "  return total mod 251; "
+        "end Main; end C;",
+        "bezel_3980_asan");
+    if (rc == -1) return;
+    BEZEL_EXPECT_EQ(rc, 0);
+}
+
+// A chain of `??=` into the same null-init local: every value except the
+// final one is a §28.7 displaced drop; the final value is the scope-end auto-
+// drop.  Without the fix the local stays PolyNull at codegen, every value
+// leaks (LSan reports 4 allocations), and the final-value dispose is never
+// registered.  With the fix all four are disposed.
+BEZEL_TEST(compound_assignment_read_after_consume_3969,
+           asan_null_coalescing_assign_chain_no_leak_spec_7_7_3980) {
+    int rc = bezel::test::runUnderAsan(
+        "module M; "
+        "class Res "
+        "  public tag: int; "
+        "  public constructor(t: int) this.tag := t; end constructor; "
+        "  destructor end destructor; "
+        "end Res; "
+        "class Sink "
+        "  public static method Give(): owned Res return new Res(1); end Give; "
+        "end Sink; "
+        "class C public static method Main(): int "
+        "  var x: Res? := null; "
+        "  x ??= Sink.Give(); "
+        "  x ??= Sink.Give(); "
+        "  x ??= Sink.Give(); "
+        "  x ??= Sink.Give(); "
+        "  return 0; "
+        "end Main; end C;",
+        "bezel_3980_asan");
+    if (rc == -1) return;
+    BEZEL_EXPECT_EQ(rc, 0);
+}
+
+// A `??= move y` RHS where `y` was just adopted Owned by a prior `??=`: the
+// dataflow resolves `y` to Owned, so the move is unconditional, the target
+// `x` adopts Owned, and the local `y` is marked MovedFrom so its scope-end
+// auto-drop is correctly skipped.  Without the fix: target stays PolyNull
+// (every owned value leaks) and `y` is never marked MovedFrom (its scope-end
+// auto-drop double-disposes).  Without the new arm: target stays PolyNull
+// regardless and `y` is correctly MovedFrom — so this is also a regression
+// test that `recordMovesIn` still fires for `??=` in the PolyNull case.
+BEZEL_TEST(compound_assignment_read_after_consume_3969,
+           asan_null_coalescing_assign_move_rhs_no_double_dispose_spec_7_7_3980) {
+    int rc = bezel::test::runUnderAsan(
+        "module M; "
+        "class Res "
+        "  public tag: int; "
+        "  public constructor(t: int) this.tag := t; end constructor; "
+        "  destructor end destructor; "
+        "end Res; "
+        "class Sink "
+        "  public static method Give(): owned Res return new Res(1); end Give; "
+        "end Sink; "
+        "class C public static method Main(): int "
+        "  var x: Res? := null; "
+        "  var y: Res? := null; "
+        "  y ??= Sink.Give(); "
+        "  x ??= move y; "
+        "  x?.Dispose(); "
+        "  return 0; "
+        "end Main; end C;",
+        "bezel_3980_asan");
+    if (rc == -1) return;
+    BEZEL_EXPECT_EQ(rc, 0);
+}
+
+// Destructor-counter test (no ASan needed) — confirms the local is recognized
+// as Owned and §28.3's scope-end auto-drop fires on the FINAL value.  Without
+// the fix: the local is never classified as owned, no scope-end dispose, _n
+// stays at 1 at scope exit.  With the fix: _n drops to 0 on the closing `end`.
+BEZEL_TEST(compound_assignment_read_after_consume_3969,
+           scope_end_auto_drop_after_null_coalescing_assign_spec_28_3_3980) {
+    JitResult jr = runAot(
+        "module M; "
+        "class Res "
+        "  public static _n: int := 0; "
+        "  public tag: int; "
+        "  public constructor(t: int) this.tag := t; Res._n := Res._n + 1; "
+        "  end constructor; "
+        "  destructor Res._n := Res._n - 1; end destructor; "
+        "end Res; "
+        "class Sink "
+        "  public static method Give(): owned Res return new Res(1); end Give; "
+        "end Sink; "
+        "class C public static method Main(): int "
+        "  var total := 0; "
+        "  do "
+        "    var x: Res? := null; "
+        "    x ??= Sink.Give(); "
+        "    x ??= Sink.Give(); "
+        "    total += Res._n; "  // 1 (only the most recent Res is live)
+        "  end; "
+        "  total += Res._n; "     // 0 (final Res auto-dropped at scope end)
+        "  return total; "       // 1
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(jr.ran);
+    BEZEL_EXPECT_EQ(jr.exitCode, 1);
+}
+
+// A read of a moved-from local inside the RHS of `??=` must STILL be rejected
+// — pins that the new state-transition arm does not regress the #3969
+// read-check on `as.value`.  Without the new arm this already passes; with the
+// new arm it MUST still pass (the read-check runs first, before the state
+// transition).
+BEZEL_TEST(compound_assignment_read_after_consume_3969,
+           negative_rhs_read_after_move_rejected_spec_28_3_3980) {
+    OwnershipResult r = parseAndCheckOwnership(
+        wrap(std::string(kConsumed) +
+             "var y: int? := null; "
+             "y ??= x.tag; "
+             "return y!;"));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(diagWithSeverity(r, bezel::Severity::Error, kMovedOut));
 }
