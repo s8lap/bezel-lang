@@ -6048,25 +6048,27 @@ void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
         return;
     }
     if (!as.target || !as.value) return;
-    // §15.3 (#1928 half b): a SLOT WRITE `a[i] := …` into a move-only inline
-    // array (§15.1.1 `[N owned]T?`) whose WHOLE value has already been moved out
-    // writes into a moved-from location — §15.3: after the move the source "may
-    // not be read until reassigned", and a slot store is exactly such a use of
-    // the moved-from array. The whole-move marking (#1899 local / #1922 param)
-    // leaves the array MovedFrom in `states_`; consult it by read-checking the
-    // index TARGET (the array identifier) so its moved-from state is reported as
-    // the §28.3 use-after-move — the write-target analogue of #1925's read gate.
-    // Gated to a move-only inline-array target so it fires ONLY there: a live
-    // array (Owned/Borrowed) or one with only an element moved `move a[i]` (which
-    // leaves the ARRAY live, never MovedFrom) is untouched, and every ordinary
-    // indexer-set is unaffected. Runs before the RHS/target handling below so the
-    // diagnostic is not masked, and before handleOwnedFieldAssignment clears the
-    // slot's own moved-from tracking. // per §15.3 (#1928 half b)
+    // §15.3 / §28.2 / §28.3 (#1928 half b, #4065): a SLOT WRITE `a[i] := …`
+    // into ANY receiver that has been whole-moved out or dominantly disposed
+    // is a use-after-move / use-after-dispose: the indexer setter needs the
+    // receiver to be in a live state, exactly as the indexer getter did in the
+    // read arm. #1928 half b read-checked ONLY a move-only inline-array target
+    // (the §15.3 source path), leaving an ordinary class-typed indexer
+    // (`OwningArray<T>`, a user type with a `property [i: int]: T` indexer)
+    // silently writable after a whole move / Dispose — measured in #4065 to
+    // compile clean with zero diagnostics and to heap-use-after-free under
+    // ASan. Widen the gate to read-check `ix->target` UNCONDITIONALLY
+    // (matching `checkRead`'s own `IndexExpr` arm widening in the same fix):
+    // a live Owned/Borrowed local read-checks silently; a partial slot move
+    // leaves the array live (never MovedFrom — #1928 half b's own reasoning);
+    // a whole move or a dominating `Dispose()` leaves it MovedFrom / Disposed
+    // — each is exactly the diagnostic the IdentifierExpr arm emits on the
+    // moved-from state. Runs before the RHS / handleOwnedFieldAssignment
+    // handling below so the diagnostic is not masked and is not cleared by
+    // the slot's own moved-from tracking. // per §15.3 (#1928 half b), §28.2,
+    // §28.3 K1.3, v0.294, #4065
     if (const auto* ix = dynamic_cast<const ast::IndexExpr*>(as.target.get())) {
-        long long moSize = 0;
-        if (ix->target &&
-            isMoveOnlyInlineArrayType(ctx_.exprType(*ix->target), moSize))
-            checkRead(*ix->target, /*selfTarget=*/false);
+        if (ix->target) checkRead(*ix->target, /*selfTarget=*/false);
         // §15.3 (#1932): each index sub-expression of an assignment TARGET
         // `a[<idx>] := …` is itself a READ position — a moved-from local
         // surfaced through it (e.g. `a[s.V()] := x` after `move s`) is a §15.3

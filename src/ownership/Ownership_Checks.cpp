@@ -2723,21 +2723,33 @@ void MethodOwnership::checkRead(const ast::Expr& e, bool selfTarget) {
         return;
     }
     if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&e)) {
-        // §15.3 (#1925): a SLOT read `a[i]` of a move-only inline array
-        // (§15.1.1 `[N owned]T?`) whose WHOLE value has been moved out reads
-        // from a moved-from location — "Reading from a moved-from location is a
-        // compile error." The whole-move marking (#1899 local / #1922 param)
-        // leaves the array local/parameter in MovedFrom state in `states_`;
-        // recurse the read check into the index TARGET so the IdentifierExpr
-        // branch above consults that state and reports the §28.3 use-after-move.
-        // Gated to a move-only inline-array target so this fires ONLY there: a
-        // partial slot move `move a[i]` leaves the ARRAY live (Owned/Borrowed),
-        // not MovedFrom, so the other slots stay readable, and every ordinary
-        // collection index read is untouched. // per §15.3 (#1925)
-        long long moSize = 0;
-        if (ix->target &&
-            isMoveOnlyInlineArrayType(ctx_.exprType(*ix->target), moSize))
-            checkRead(*ix->target, /*selfTarget=*/false);
+        // §15.3 / §28.2 / §28.3 (#1925, #4065): the index TARGET is a READ
+        // position for the indexer/index operation as a whole — `a[i]` reads
+        // `a` to find the storage, exactly as `a.f` reads `a` (the
+        // MemberAccessExpr arm above unconditionally recurses into its target).
+        // #1925 read-checked ONLY a move-only inline-array target so the
+        // slot-read of an already-moved-out `[N owned]T?` array fired the
+        // §15.3 read-of-moved-from — that gate predated the present function's
+        // general read-check coverage and was the only place a read position's
+        // sub-expression was not consulted, leaving a moved-from or disposed
+        // ordinary indexer receiver (an `OwningArray<T>` local after a whole
+        // move, or any collection after an explicit `Dispose()`) silently
+        // read through its indexer — measured in #4065 to compile clean with
+        // no diagnostic and to heap-use-after-free under ASan. Widen the gate
+        // to read-check the target UNCONDITIONALLY (matching every sibling arm
+        // here): a live Owned/Borrowed local read-checks silently (the
+        // IdentifierExpr arm early-returns on Owned); a partial slot move
+        // `move a[i]` leaves the ARRAY live (not MovedFrom — #1925's own
+        // reasoning) so other slots stay readable; a whole move of a move-only
+        // array OR an ordinary collection marks the local MovedFrom; a
+        // dominating `Dispose()` marks it Disposed — each is precisely the
+        // "use of `x` after / moved-out / maybe-consumed / uninitialized"
+        // diagnostic the IdentifierExpr arm emits on the moved-from state.
+        // No new false-accept on the prior gate's positive controls
+        // (live-array read, copyable value-array read, post-partial-move read)
+        // — every one of those still passes through Owned state and out
+        // silently. // per §15.3 (#1925), §28.2, §28.3 K1.3, v0.294, #4065
+        if (ix->target) checkRead(*ix->target, /*selfTarget=*/false);
         // §15.3 (#1928 half a): every index sub-expression is itself a READ
         // position, so a moved-from local surfaced through one — e.g.
         // `a[m.V()]` after `move m`, or `a[b[i]!.V()]` after a whole move of the
