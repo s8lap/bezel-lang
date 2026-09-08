@@ -21442,8 +21442,23 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 TypeRef::FuncParam fp;
                 fp.modifier = par->modifier;
                 fp.name = par->name;
+                // Both-sources fallback (#4086, §27.6 / §5.1, v0.294): the
+                // imported-method formation previously read `par->declType`
+                // only, which is null for parameters reconstructed from the
+                // binary module manifest — ModuleLoader at ModuleLoader.cpp:411
+                // sets `resolvedDeclType` (the loader's own resolved TypeRef)
+                // for these. Without the fallback the formation's funcParams
+                // is left null for every imported parameter, and any explicit
+                // target-type formation site `var f: (int) -> owned Cell :=
+                // Cell.MakeIt;` fails the §5.1 formation-site check #4081
+                // added (the null source param has no relation to the
+                // declared target type). Mirror #3189/#3193's pattern: when
+                // the local AST half is missing, fall through to the
+                // loader's resolved TypeRef.
                 if (par->declType)
                     fp.type = ctx_.resolvedType(*par->declType);
+                else if (par->resolvedDeclType)
+                    fp.type = par->resolvedDeclType;
                 ft->funcParams.push_back(fp);
             }
             if (TypeRef* rt = ctx_.importedReturnType(ims)) {
@@ -21555,8 +21570,20 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
             TypeRef::FuncParam fp;
             fp.modifier = par->modifier;
             fp.name = par->name;
+            // Both-sources fallback (#4086, §27.6 / §5.1, v0.294): mirror
+            // the imported formation site above — when the local AST half
+            // (`par->declType`) is null, fall through to the loader's
+            // `resolvedDeclType` so the formation TypeRef's funcParams is
+            // populated for every parameter. Without this the §5.1
+            // formation-site check #4081 added reports a param-slot
+            // mismatch whenever the formation source is null. The fallback
+            // is a no-op for the typical local case where `declType` is
+            // non-null (and `resolvedDeclType` is also non-null but never
+            // consulted).
             if (par->declType)
                 fp.type = ctx_.resolvedType(*par->declType);
+            else if (par->resolvedDeclType)
+                fp.type = par->resolvedDeclType;
             ft->funcParams.push_back(fp);
         }
         // Return type: from MethodDecl->returnType, or unit when absent.
