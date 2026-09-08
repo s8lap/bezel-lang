@@ -21783,6 +21783,41 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
             }
         }
     }
+    // fix #3961 / §30.3 / §30.5 (v0.295): `<task>.Result` on a Task<string> is
+    // a +1 string producer — the producer's `return <string>;` (the async twin
+    // of the sync return-escape mint at LlvmBackend_Stmts.cpp ~L2833) flows
+    // its +1 through the task result slot to this read site, where the
+    // consumer's `var f := <task>.Result` slot claims ownership and releases it
+    // at scope end. The runtime does NOT retain a string when copying into the
+    // task result buffer (bz_task_complete memcpy's the pointer at
+    // bezel_runtime_concurrency.cpp:737, no refcount change), so the read site
+    // is the SOLE owner of the +1 after the producer exits — without this
+    // recognition the bind-time retain adds an extra +1 the producer never
+    // had, and the result string leaks at scope end (18500 B / 1000 iters per
+    // the issue's repro, measured as bz$async$M.C$Make$Resume bz.malloc).
+    // Gated on Task (not OwningTask — Pattern A disposer owns its T) and on a
+    // non-nullable `string` generic arg; a `string?` Result has no producer
+    // contract, so it stays on the existing borrow path. Gated on the read
+    // going through the synchronously-blocked `bz_task_await_sync` path
+    // (LlvmBackend_Exprs.cpp ~L4158, the one in-scope here) — the `await f()`
+    // path (Pattern A, lowerAwait) goes through its own result-disposer
+    // construction and is not changed by this arm. The CLASS-typed `T` arm
+    // (intrinsic collection / owned class via patternAResultDisposerFor) is
+    // deliberately untouched: those are disposed by bz_task_free's cascade
+    // (#1503), and a +1-producer recognition here would double-dispose.
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(init)) {
+        if (ma->member == "Result" && ma->target) {
+            const sema::TypeRef* tt = ctx_.exprType(*ma->target);
+            if (isTaskTypeName(tt) && tt->kind == sema::TypeRef::Kind::Named &&
+                !tt->genericArgs.empty() && tt->genericArgs[0]) {
+                const sema::TypeRef* tElem = tt->genericArgs[0];
+                if (tElem && tElem->kind == sema::TypeRef::Kind::Primitive &&
+                    tElem->primitive == sema::PrimitiveType::String &&
+                    !tElem->nullable)
+                    return true;
+            }
+        }
+    }
     return false;
 }
 
