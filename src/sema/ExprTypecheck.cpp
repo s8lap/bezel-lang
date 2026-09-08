@@ -9698,8 +9698,34 @@ std::optional<long long> ExprTC::foldIntConstExprTC(const ast::Expr& e) {
         TypeSymbol* t = nullptr;
         if (auto* id =
                 dynamic_cast<const ast::IdentifierExpr*>(ma->target.get()))
-            if (Symbol* head = lookupName(id->name))
+            if (Symbol* head = lookupName(id->name)) {
                 t = dynamic_cast<TypeSymbol*>(head);
+                // fix #4071 (§5.1 / §17.14 / §27.8, v0.294; family of
+                // #4038/#4048/#4050/#4051/#4070): a `type` alias of the
+                // class declaring the const resolves `head` to a
+                // `TypeAliasSymbol`, so a qualified alias-const reference
+                // like `AliasK4052.V` returned nullopt here — the same
+                // missing-arm shape every other sibling in this family
+                // closed. The fold was supposed to be safely-skippable on
+                // this path (the function's own comment claims "no false
+                // accept is lifted"), but measured behavior contradicts
+                // that: the §5.1 narrowing fall-through produced a
+                // SILENT WRONG VALUE (or, post-#4070/#4076, a false
+                // reject when the narrowing diagnostic happens to fire
+                // for the alias form) instead of folding correctly. The
+                // direct `K.V` spelling already folds; the alias spelling
+                // must too. Resolve through the shared
+                // `resolveAliasToTypeSymbol` helper
+                // (TypeResolution.hpp, #4050/#4051) so an alias-qualified
+                // qualified-const reference is folded exactly like the
+                // direct-name spelling — the alias's own symbol kind
+                // changes nothing; the underlying class/record/etc. is
+                // what `lookupMember` below needs.
+                if (!t)
+                    if (auto* aliasSym =
+                            dynamic_cast<TypeAliasSymbol*>(head))
+                        t = resolveAliasToTypeSymbol(aliasSym);
+            }
         if (!t) return std::nullopt;
         Symbol* mem = lookupMember(t, ma->member);
         auto* cms = dynamic_cast<ConstMemberSymbol*>(mem);

@@ -8895,6 +8895,26 @@ llvm::Value* Emitter::tryLowerEnumFromUnderlyingOrNull(
             if (nts->type && nts->type->kind == ast::TypeDeclKind::Enum)
                 named = nts->type;
         }
+        // fix #4072 (§10.4 / §27.8, v0.294; family of
+        // #4038/#4048/#4050/#4051/#4070): a `type` alias of the enum
+        // resolves `tsym` to a `TypeAliasSymbol`, not a TypeSymbol or
+        // NestedTypeSymbol — the same missing-arm shape #4050's
+        // DestructuringPattern arm discovered (sema fix alone is NOT
+        // enough; codegen independently re-resolves here, with its OWN
+        // matching gap). Without this arm `AliasColor.FromUnderlyingOrNull
+        // (value)` reached this gate with `named` still null, the
+        // recognition fell through, the call's result type was empty
+        // for codegen to dispatch on, and the slot silently degraded to
+        // zero (#2434 backstop) — a SILENT WRONG VALUE, not a crash and
+        // not a diagnosed rejection. Resolve through the SAME shared
+        // `sema::resolveAliasToTypeSymbol` (TypeResolution.hpp,
+        // #4050/#4051) ExprTC::enumTypeNamedBy now calls, so sema and
+        // codegen agree on the alias-qualified spelling exactly like the
+        // direct-name spelling.
+        else if (auto* aliasSym =
+                     dynamic_cast<sema::TypeAliasSymbol*>(tsym))
+            if (auto* ts = sema::resolveAliasToTypeSymbol(ctx_, aliasSym))
+                if (ts->kind == ast::TypeDeclKind::Enum) named = ts;
     }
     if (!named) return nullptr;
     // Sema types the whole call as `E?` (a nullable Named enum).

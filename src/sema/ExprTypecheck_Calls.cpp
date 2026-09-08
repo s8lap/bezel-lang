@@ -1877,6 +1877,24 @@ const TypeSymbol* ExprTC::enumTypeNamedBy(const ast::Expr& e) {
     if (auto* nts = dynamic_cast<NestedTypeSymbol*>(s))
         if (nts->type && nts->type->kind == ast::TypeDeclKind::Enum)
             return nts->type;
+    // fix #4072 (§10.4 / §27.8, v0.294; family of
+    // #4038/#4048/#4050/#4051/#4070): a `type` alias of the enum resolves
+    // `s` to a `TypeAliasSymbol`, not a TypeSymbol or NestedTypeSymbol —
+    // the same missing-arm shape every other sibling in this family
+    // closed. `AliasColor.FromUnderlyingOrNull(value)` therefore failed
+    // this predicate, the §10.4 dispatch in `typeCall` never recognized
+    // the per-enum static member, and the call reached codegen with no
+    // lowering — a SILENT WRONG VALUE (measured: alias-of-enum call
+    // returned 0 instead of the correct `E?` value the direct-name
+    // spelling produces). Resolve through the shared
+    // `resolveAliasToTypeSymbol` helper (TypeResolution.hpp,
+    // #4050/#4051) so an alias of the enum is recognized exactly like a
+    // direct enum-type-name expression — the alias's own symbol kind
+    // changes nothing; the underlying enum is what `typeCall`'s §10.4
+    // arm needs.
+    if (auto* aliasSym = dynamic_cast<TypeAliasSymbol*>(s))
+        if (auto* ts = resolveAliasToTypeSymbol(aliasSym))
+            if (ts->kind == ast::TypeDeclKind::Enum) return ts;
     return nullptr;
 }
 
