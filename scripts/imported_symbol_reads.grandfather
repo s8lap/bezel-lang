@@ -18,8 +18,7 @@
 #
 # class1: dynamic_cast<const ast::TypeDecl*>(<sym>->decl) - wrong-but-quiet
 #         for an imported symbol.
-1    src/codegen/LlvmBackend_Exprs2.cpp
-5    src/codegen/LlvmBackend_Setup.cpp
+4    src/codegen/LlvmBackend_Setup.cpp
 4    src/module/ModuleMetadataBuilder.cpp
 1    src/ownership/Ownership_Checks.cpp
 1    src/sema/EnumValues.hpp

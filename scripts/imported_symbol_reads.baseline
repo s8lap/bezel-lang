@@ -13,14 +13,15 @@
 
 # class1: dynamic_cast<const ast::TypeDecl*>(<sym>->decl) - wrong-but-quiet
 #         for an imported symbol.
-1    src/codegen/LlvmBackend_Exprs2.cpp
-5    src/codegen/LlvmBackend_Setup.cpp
-4    src/module/ModuleMetadataBuilder.cpp
+4    src/codegen/LlvmBackend_Setup.cpp
+1    src/module/ModuleLoader.cpp
+5    src/module/ModuleMetadataBuilder.cpp
 1    src/ownership/Ownership_Checks.cpp
 1    src/sema/EnumValues.hpp
 4    src/sema/ExprTypecheck_Calls.cpp
 5    src/sema/ExprTypecheck_Exprs.cpp
 1    src/sema/PureChecker.cpp
+1    src/sema/Symbol.hpp
 3    src/sema/SymbolCollection.cpp
 1    src/sema/TypeResolution_Names.cpp
 

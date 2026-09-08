@@ -432,6 +432,9 @@ inline bool typeSymbolHasModifier(const TypeSymbol* t, std::string_view m) {
 inline const std::vector<ast::CallArgument>* primaryBaseCtorArgsOf(
     const sema::TypeSymbol* t) {
     if (!t) return nullptr;
+    // SEAM-DEBT: #3911 — local-AST half is safe to read directly; the
+    // IMPORTED branch below reads the wire-format reconstructed vector
+    // instead. A single accessor would subsume both, pending the audit.
     if (auto* td = dynamic_cast<const ast::TypeDecl*>(t->decl)) {
         // LOCAL: trust the canonical parser-built vector. Empty here means
         // "no inheritance-clause arg list" and is reported as null — a caller

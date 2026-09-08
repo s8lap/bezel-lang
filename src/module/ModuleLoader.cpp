@@ -2717,6 +2717,10 @@ static bool parseAndAttachBaseCtorArgs(
         }
     }
     if (!freshType) return false;
+    // SEAM-DEBT: #3911 — the freshly-parsed ModuleLoader stub is always
+    // local-AST (it lives in the new module we just spawned), so the AST
+    // half is safe to read here even though the canonical accessor
+    // `primaryBaseCtorArgsOf` does not (it has to handle both sources).
     auto* freshTd = dynamic_cast<const ast::TypeDecl*>(freshType->decl);
     if (!freshTd) return false;
     if (freshTd->primaryBaseCtorArgs.empty()) return false;

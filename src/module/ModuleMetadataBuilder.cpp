@@ -845,6 +845,9 @@ void collectInvariants(const sema::TypeSymbol& type,
         if (base && base->kind == ast::TypeDeclKind::Class)
             collectInvariants(*base, ctx, source, moduleName, out, visiting);
     }
+    // SEAM-DEBT: #3911 — the builder sees the local module's freshly-
+    // parsed `type` AST (we are in the exporter, not a consumer of an
+    // imported type), so the AST half is safe to read here.
     auto* td = dynamic_cast<const ast::TypeDecl*>(type.decl);
     if (td) {
         for (const auto& member : td->members) {
