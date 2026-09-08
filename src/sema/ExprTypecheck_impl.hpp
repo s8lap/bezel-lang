@@ -497,6 +497,15 @@ private:
     // an await there suspends the lambda's state machine, not the atom's
     // enclosing frame).
     bool inBindAtom_ = false;
+    // narrow #4059 (§9.5, v0.295): set (saved/restored) around the visit of
+    // a `WithExpr`'s `source` so `checkNewExprArgs`'s §9.1/§9.2 body-only-record
+    // rejection (#4059) does not fire when `new T() with(F := v)` is parsed —
+    // the `with(...)` clause IS the construction form (§9.5), so the implicit-
+    // default premise ("no declared ctor → error") is moot when the with-clause
+    // supplies every field. Reset to false across a lambda boundary by virtue
+    // of being a per-visit bool on the visitor itself, mirroring `inBindAtom_`'s
+    // pattern.
+    bool inWithExprSource_ = false;
     // §28.3 A7 (v0.209, #2080): the ONE expression node currently admitted to
     // be a MarkedTransferExpr — set (saved/restored) around the visit of each
     // admitted child: an if-expression branch (ConditionalExpr then/else) or
@@ -2490,6 +2499,15 @@ private:
     // takes no arguments. Multiple constructors → overload resolution
     // is deferred, so skip.
     void checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t);
+
+    // narrow #4059 (§9.1 / §9.2, v0.295): true iff the body record has at
+    // least one body field or auto-property with an `:=` initializer.
+    // Local records read the AST decl; imported records ask the wire side
+    // table (`importedInstanceFieldInitText`). Drives the four-way gate
+    // that distinguishes the silent-zero-fill defect shape from every
+    // legitimate §9.1/§9.2 memberwise-construction path. Defined in
+    // ExprTypecheck_Calls.cpp.
+    bool recordHasFieldOrPropertyInit(const TypeSymbol& t);
 
     // fix #3141 (family F3 of umbrella #3152) — §9.1 / §22.5 / §5.1 / §2.8.3
     // rule 4: the positional-record arm of checkNewExprArgs for a record whose

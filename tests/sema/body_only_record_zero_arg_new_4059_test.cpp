@@ -162,25 +162,27 @@ BEZEL_TEST(body_only_record_zero_arg_new_4059, zero_arg_new_body_record_rejected
 }
 
 // ============================================================================
-// T2 — any-argument overload of the same shape: a body-only record has NO
-// declared ctor at all, so `new Foo(5)` is the same defect at a different
-// arity. Must reject with the same diagnostic; this rows the gate
-// widening by ensuring the new body-record arm does not even argue arity.
+// T2 — narrow #4059 flip (was: REJECT, is: ACCEPT). The original #4059 fix
+// rejected `new Foo(5)` on a body-only record as the "any-arg overload of
+// the headline bug" — but the headline bug is the ZERO-ARG silent zero-fill
+// defect. Any-arg on a body-only record is the §9.1/§9.2 memberwise path
+// the pre-fix codebase relied on (positional / named args supply values
+// even without a positional-field ctor). The narrow four-condition gate
+// admits this shape and lets codegen bind the args. Pin the new behaviour
+// so a future re-tightening of the gate does not silently re-over-reject
+// `new Foo(5)`. (T2b-5 covers the multi-arg `new T(a, b)` variant of the
+// same path; T2 covers the single-arg `new T(v)` variant.)
 // ============================================================================
-BEZEL_TEST(body_only_record_zero_arg_new_4059, any_arg_new_body_record_rejected) {
-    auto r = runAot(
+BEZEL_TEST(body_only_record_zero_arg_new_4059, any_arg_new_body_record_accepted_spec_9_2) {
+    BEZEL_EXPECT_EQ(run(
         "module M; "
         "record Foo4059T2 "
         "  public property Bar: int; "
         "end Foo4059T2; "
         "class C public static method Main(): int "
         "  var f := new Foo4059T2(5); "
-        "  return f.Bar; "
-        "end Main; end C;");
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasErrorMsg(r, "requires a declared constructor"));
-    BEZEL_EXPECT_TRUE(hasErrorMsg(r, "implicit default constructor"));
-    BEZEL_EXPECT_FALSE(r.ran);
+        "  return f.Bar; "                      // 5
+        "end Main; end C;"), 5);
 }
 
 // ============================================================================
@@ -334,4 +336,101 @@ BEZEL_TEST(body_only_record_zero_arg_new_4059,
         "  var k := new K4059(); "
         "  return k.v; "
         "end Main; end C;"), 0);
+}
+
+// ============================================================================
+// T2b — narrow #4059 (§9.1 / §9.2, v0.295) cell. The original #4059 fix
+// over-rejected FOUR legitimate §9.1/§9.2 memberwise-construction paths on
+// body-only records: zero-arg WITH field initializers, `with(...)` clauses,
+// positional args, and named args. The narrow fix gates the §9.1/§9.2
+// rejection on ALL FOUR conditions holding simultaneously:
+//   * `ctors.empty()` (no declared ctor — already)
+//   * `ne.args.empty()` (no positional/named memberwise args)
+//   * `!inWithExprSource_` (no `with(...)` clause)
+//   * `!recordHasFieldOrPropertyInit` (no field/property `:= ...` inits)
+// Anything that supplies values via any other channel is a legitimate
+// construction form and is accepted; only the silent zero-fill defect
+// shape (none of the four supplying values) is rejected.
+//
+// T2b-1..T2b-5 exercise every cell of the four-way gate:
+//   T2b-1: zero-arg WITH field initializer   → ACCEPT (§9.1 inits supply)
+//   T2b-2: `with(...)` clause (positive T2b)  → ACCEPT (§9.5 IS construction)
+//   T2b-3: named-args                         → ACCEPT (§9.1 memberwise)
+//   T2b-4: zero-arg NO initializer (T1 retest) → REJECT (headline #4059)
+//   T2b-5: positional args                    → ACCEPT (§9.1 memberwise)
+// Each row is a single-source-of-truth pin so a future widening of the
+// four-way gate does not silently re-over-reject one of these.
+// ============================================================================
+BEZEL_TEST(body_only_record_zero_arg_new_4059,
+           zero_arg_with_field_initializer_accepted_spec_9_1) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "record Pt4059T2b1 "
+        "  public property X: int := 5; "
+        "  public property Y: int := 7; "
+        "end Pt4059T2b1; "
+        "class C public static method Main(): int "
+        "  var p := new Pt4059T2b1(); "
+        "  return p.X + p.Y; "                // 12
+        "end Main; end C;"), 12);
+}
+
+BEZEL_TEST(body_only_record_zero_arg_new_4059,
+           with_clause_on_new_body_record_accepted_spec_9_5) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "record Rect4059T2b2 "
+        "  public property Width: int; "
+        "  public property Height: int; "
+        "end Rect4059T2b2; "
+        "class C public static method Main(): int "
+        "  var r := new Rect4059T2b2() with(Width := 6, Height := 7); "
+        "  return r.Width + r.Height; "        // 13
+        "end Main; end C;"), 13);
+}
+
+BEZEL_TEST(body_only_record_zero_arg_new_4059,
+           named_args_on_body_record_accepted_spec_9_2) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "record Named4059T2b3 "
+        "  public property A: int; "
+        "  public property B: int; "
+        "end Named4059T2b3; "
+        "class C public static method Main(): int "
+        "  var n := new Named4059T2b3(A := 3, B := 4); "
+        "  return n.A + n.B; "                 // 7
+        "end Main; end C;"), 7);
+}
+
+BEZEL_TEST(body_only_record_zero_arg_new_4059,
+           zero_arg_no_initializer_still_rejected_headline_4059) {
+    auto r = runAot(
+        "module M; "
+        "record Foo4059T2b4 "
+        "  public property Bar: int; "
+        "  public property Qux: int; "
+        "end Foo4059T2b4; "
+        "class C public static method Main(): int "
+        "  var f := new Foo4059T2b4(); "
+        "  return f.Bar + f.Qux; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMsg(r, "requires a declared constructor"));
+    BEZEL_EXPECT_TRUE(hasErrorMsg(r, "implicit default constructor"));
+    BEZEL_EXPECT_FALSE(r.ran);
+}
+
+BEZEL_TEST(body_only_record_zero_arg_new_4059,
+           positional_args_on_body_record_accepted_spec_9_2) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "record Pos4059T2b5 "
+        "  public property X: int; "
+        "  public property Y: int; "
+        "end Pos4059T2b5; "
+        "class C public static method Main(): int "
+        "  var p := new Pos4059T2b5(11, 22); "
+        "  return p.X + p.Y; "                 // 33
+        "end Main; end C;"), 33);
 }

@@ -10554,7 +10554,19 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         // falls through with no action (§19.6).
         checkCaseExhaustiveness(*ce, scrutTy);
     } else if (auto* we = dynamic_cast<const ast::WithExpr*>(&e)) {
+        // narrow #4059 (§9.5, v0.295): the `with(...)` clause IS the
+        // construction form for a body-only record source (§9.5: "EXPR with
+        // ( InitAssign ("," InitAssign)* ","?)" applies to any record-typed
+        // source, and the source itself need not be default-constructible
+        // when the with-clause supplies every field). Teach
+        // `checkNewExprArgs`'s §9.1/§9.2 body-only-record rejection to step
+        // aside for `new T() with(F := v, ...)` — the with-clause assigns
+        // the fields directly, no implicit default ctor is needed. Mirrors
+        // the `inBindAtom_` save/restore pattern at the BindExpr arm.
+        bool savedInWithExprSource = inWithExprSource_;
+        inWithExprSource_ = true;
         if (we->source) visitExpr(*we->source);
+        inWithExprSource_ = savedInWithExprSource;
         // §9.5 (v0.188, #1735, proposal 0037 graduation): the source
         // expression of a `with` MUST be record-typed; a class- (or
         // interface-)typed source is a compile error naming this rule,

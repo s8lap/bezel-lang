@@ -12822,6 +12822,50 @@ void ExprTC::checkArgsAgainstParams(
     }
 }
 
+// narrow #4059 (§9.1 / §9.2, v0.295): true iff the body record has at
+// least one body field (`x: int := 5;`) or auto-property
+// (`public property X: int := 5;`) with an `:=` initializer — the §9.1
+// memberwise path the silent-zero-fill rejection is trying to defend
+// against. For a LOCAL record the AST `FieldDecl::initializer` /
+// `PropertyDecl::autoInitializer` are authoritative. For an IMPORTED
+// record (decl is null) the wire metadata carries the field-init text
+// on the per-member side-table (`importedInstanceFieldInitText`) for
+// any field or auto-property that crossed the boundary with a `:=`
+// initializer; absence means no init. Returns false for an IMPORTED
+// record with no field inits (the headline #4059 defect shape) and
+// true for one WITH field inits.
+bool ExprTC::recordHasFieldOrPropertyInit(const TypeSymbol& t) {
+    if (t.decl) {
+        for (const Symbol* m : t.members) {
+            if (auto* fs = dynamic_cast<const FieldSymbol*>(m)) {
+                if (auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl))
+                    if (fd->initializer) return true;
+            } else if (auto* ps = dynamic_cast<const PropertySymbol*>(m)) {
+                if (ps->isIndexer) continue;
+                if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl))
+                    if (pd->autoInitializer) return true;
+            }
+        }
+        return false;
+    }
+    // Imported record: ask the wire side-table. Either an instance-field
+    // init text (`importedInstanceFieldInitText` — populated for every
+    // non-static record/generic field with a `:= ...`, regardless of
+    // foldability) OR a constant-folded value (`importedConstValue` —
+    // populated when the writer could fold the init into a textual
+    // value) signals that field initializers will replay across the
+    // module boundary at construction time, so the silent-zero-fill
+    // defect the #4059 fix targets cannot occur.
+    for (const Symbol* m : t.members) {
+        if (dynamic_cast<const FieldSymbol*>(m) ||
+            dynamic_cast<const PropertySymbol*>(m)) {
+            if (ctx_.importedInstanceFieldInitText(m) != nullptr) return true;
+            if (ctx_.importedConstValue(m) != nullptr) return true;
+        }
+    }
+    return false;
+}
+
 // Slice T7 / §22.6: check `new T(args)` against T's constructors. Zero
 // declared constructors → the implicit default ctor takes no arguments.
 // One constructor → argument count/type check. Multiple constructors →
@@ -13378,7 +13422,28 @@ void ExprTC::checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t) {
         // remained correctly accepted by the implicit-default branch
         // below. Diagnostic names both remedies (default-value form and
         // declared-ctor form) so the fix-validator rows stay green-tick.
-        if (t->kind == ast::TypeDeclKind::Record) {
+        //
+        // narrow #4059 (§9.1 / §9.2, v0.295): the SILENT ZERO-FILL defect
+        // the fix measured only occurs when ALL four of:
+        //   * `ctors.empty()` (no declared instance ctor — already checked)
+        //   * `ne.args.empty()` (no positional / named memberwise args)
+        //   * `!inWithExprSource_` (no `with(...)` construction form, §9.5)
+        //   * NO field/property initializers on the body record (`x: int := 5`
+        //     or `public property X: int := 5`) — otherwise the field
+        //     initializers themselves supply every value, no implicit-default
+        //     zero-fill can occur.
+        // Each alternative is a legitimate §9.1/§9.2 memberwise-construction
+        // path that pre-fix code relied on: positional/named args, a `with`
+        // clause, or field initializers on the body. The original #4059 fix
+        // over-rejected all four paths; this narrow re-tightens to the exact
+        // shape the silent-zero-fill repro requires (the T1 row's
+        // `record Foo { public property Bar: int; } end Foo; var f := new Foo();`
+        // producing `Bar=0` rather than a compile error). The implicit-
+        // default premise is the right rule for a CLASS (§22.7) but, for a
+        // body-only record, the implicit default is only WRONG when nothing
+        // else is supplying values — anything else IS the construction.
+        if (t->kind == ast::TypeDeclKind::Record && !inWithExprSource_ &&
+            ne.args.empty() && !recordHasFieldOrPropertyInit(*t)) {
             ctx_.diagnostics().report(
                 Severity::Error, ne.span.begin,
                 std::string("`new ") + std::string(t->name) +
@@ -13395,7 +13460,22 @@ void ExprTC::checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t) {
         // no-arg default for a class with no primary-ctor parameter list
         // (§22.10). Any argument — named or positional — is too many for
         // a zero-parameter constructor.
-        if (!ne.args.empty()) {
+        //
+        // narrow #4059 (§9.1 / §9.2, v0.295): the §22.7 implicit-default
+        // premise applies ONLY to a CLASS — for a body-only RECORD, the
+        // memberwise-construction paths (positional / named args, with-
+        // clause, field initializers) are legitimate §9.1/§9.2 forms whose
+        // binding is the caller's responsibility, NOT the implicit-default
+        // arity check. Pre-#4059 a body-only record with args skipped
+        // `checkNewExprArgs` entirely (`t->hasPositionalFields` gate), so
+        // the `new T(a, b)` and `new T(name := v)` shapes were accepted;
+        // #4059's gate widening brought them here and the implicit-default
+        // arm's "X args but takes 0" message started firing on legitimate
+        // memberwise constructions. Gate the arity check on `Record` so a
+        // body-only record with memberwise args falls through to the
+        // ctors.size() == 1 branch (which is empty here too) and on to
+        // codegen, matching the pre-#4059 memberwise-bind behaviour.
+        if (t->kind != ast::TypeDeclKind::Record && !ne.args.empty()) {
             ctx_.diagnostics().report(
                 Severity::Error, ne.span.begin,
                 std::string("`new ") + std::string(t->name) +
@@ -13714,7 +13794,27 @@ void ExprTC::checkImportedNewExprArgs(
         // instance — see the local twin's diagnostic for the full repro
         // shape). The class arm below is unchanged: classes keep their
         // implicit-default semantics per §22.7.
-        if (t->kind == ast::TypeDeclKind::Record) {
+        //
+        // narrow #4059 (§9.5, v0.295): same `inWithExprSource_` carve-out
+        // as the local twin — `new T() with(F := v, ...)` is valid even
+        // for an IMPORTED body-only record, because the `with`-clause IS
+        // the construction form. See `checkNewExprArgs` for the full note.
+        //
+        // narrow #4059 (§9.1 / §9.2, v0.295): the local twin's stricter
+        // four-condition gate (also requires `ne.args.empty()` AND no
+        // field/property initializers) DOES apply here — `recordHasFieldOr
+        // PropertyInit` consults the wire side-table
+        // (`importedInstanceFieldInitText`) for imported members, so an
+        // imported body-only record WITH field initializers (the gate-
+        // failing `xmod_record_body_field_init_replay_2467` shape) is
+        // accepted at zero-arg construction; an imported body-only record
+        // WITHOUT field initializers (the T4 negative control) is still
+        // rejected with the same diagnostic. For records WITH
+        // positional/named args (the memberwise path), the §22.7 arity
+        // check below is also gated on `kind != Record` (same rationale
+        // as the local twin).
+        if (t->kind == ast::TypeDeclKind::Record && !inWithExprSource_ &&
+            ne.args.empty() && !recordHasFieldOrPropertyInit(*t)) {
             ctx_.diagnostics().report(
                 Severity::Error, ne.span.begin,
                 std::string("`new ") + std::string(t->name) +
@@ -13726,7 +13826,7 @@ void ExprTC::checkImportedNewExprArgs(
             return;
         }
         // Class: §22.7 implicit default — zero parameters.
-        if (!ne.args.empty())
+        if (t->kind != ast::TypeDeclKind::Record && !ne.args.empty())
             ctx_.diagnostics().report(
                 Severity::Error, ne.span.begin,
                 std::string("`new ") + std::string(t->name) + "` has " +
