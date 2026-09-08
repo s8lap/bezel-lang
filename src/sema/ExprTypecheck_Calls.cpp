@@ -22189,7 +22189,7 @@ bool ExprTC::isSendable(const TypeRef* rt,
 //       any local or parameter from the enclosing scope).
 // ===========================================================================
 
-bool ExprTC::isCaptureFreeEntry(const ast::Expr* entryExpr) const {
+bool ExprTC::isCaptureFreeEntry(const ast::Expr* entryExpr) {
     if (!entryExpr) return false;
 
     // (a) Static method reference, qualified: MemberAccessExpr whose target

@@ -2927,7 +2927,7 @@ private:
     // capture-free: a static-method-reference (MemberAccessExpr whose
     // target is a TypeSymbol) or a non-capturing lambda (a LambdaExpr
     // whose body references no locals from the enclosing scope).
-    bool isCaptureFreeEntry(const ast::Expr* entryExpr) const;
+    bool isCaptureFreeEntry(const ast::Expr* entryExpr);
 
     // Helper: does the lambda body (recursively) reference any identifier
     // whose resolved symbol is NOT in `ownParamSyms` and is a local or
