@@ -89,7 +89,7 @@ BEZEL_TEST(type_alias_enum_from_underlying_4072,
         "class C "
         "  public static method Main(): int "
         "    var c: ColorMiss4072? := AliasColorMiss4072.FromUnderlyingOrNull(99); "
-        "    if c = null then return 42 else return 0; end; "
+        "    return (if c = null then 42 else 0); "
         "  end Main; "
         "end C;"), 42);
 }
@@ -115,7 +115,8 @@ BEZEL_TEST(type_alias_enum_from_underlying_4072,
 
 // §10.4 boundary idiom: `AliasColor4072.FromUnderlyingOrNull(bad) ??
 // AliasColor4072.Low` must compose through the alias form exactly like
-// the direct form.
+// the direct form. bad=99 misses (Low=0), good=1 hits Medium (=1), so
+// int(a)*10 + int(b) = 0*10 + 1 = 1.
 BEZEL_TEST(type_alias_enum_from_underlying_4072,
            alias_coalesce_default_spec_10_4) {
     BEZEL_EXPECT_EQ(run(
@@ -132,7 +133,7 @@ BEZEL_TEST(type_alias_enum_from_underlying_4072,
         "        ?? AliasCoCo4072.High; "
         "    return int(a) * 10 + int(b); "
         "  end Main; "
-        "end C;"), 2);
+        "end C;"), 1);
 }
 
 // Argument validation through the alias form: an OUT-OF-RANGE value is
