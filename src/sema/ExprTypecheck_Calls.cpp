@@ -14758,9 +14758,43 @@ void ExprTC::resolveExtensionMember(const ast::MemberAccessExpr& ma,
                 // type-name-qualifier form exactly like a direct type name.
                 if (!unboundExtRef) {
                     if (auto* aliasSym =
-                            dynamic_cast<TypeAliasSymbol*>(tgtSym))
-                        unboundExtRef =
-                            resolveAliasToTypeSymbol(aliasSym) != nullptr;
+                            dynamic_cast<TypeAliasSymbol*>(tgtSym)) {
+                        if (resolveAliasToTypeSymbol(aliasSym)) {
+                            unboundExtRef = true;
+                        } else if (auto* aliasDecl =
+                                       dynamic_cast<const ast::TypeAlias*>(
+                                           aliasSym->decl)) {
+                            // fix #4080 (§27.6 / §27.8, v0.294): the
+                            // shared `resolveAliasToTypeSymbol` helper is
+                            // Named-only — its signature returns
+                            // TypeSymbol* and its guard
+                            // (`underlying->kind != TypeRef::Kind::Named`)
+                            // excludes every Primitive-kind underlying by
+                            // construction. A `type` alias of a PRIMITIVE
+                            // (`type MyInt := int;`) has a Primitive-kind
+                            // `aliasedType`, so the helper above returns
+                            // null and `unboundExtRef` stays false —
+                            // mirroring the class/record/interface/enum
+                            // alias gap #4070 closed for Named underlyings
+                            // on the exact same classification site. The
+                            // `else if` arm below this block already
+                            // detects `int.Doubled` (the bare primitive-
+                            // keyword spelling, §27.6's "the reference
+                            // uses the extended type's name as
+                            // qualifier"), so an alias of a primitive
+                            // names the extended type in qualifier
+                            // position just as much — treat it as the
+                            // unbound form and prepend the receiver
+                            // parameter §27.6 requires.
+                            if (aliasDecl->aliasedType) {
+                                if (auto* underlying = ctx_.resolvedType(
+                                        *aliasDecl->aliasedType)) {
+                                    unboundExtRef = underlying->kind ==
+                                        TypeRef::Kind::Primitive;
+                                }
+                            }
+                        }
+                    }
                 }
             } else if (auto* tid = dynamic_cast<const ast::IdentifierExpr*>(
                            ma.target.get())) {
@@ -16584,10 +16618,22 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 // the `type` declaration itself was processed
                 // (Resolver::resolveTopDecl), so `ctx_.resolvedType(...)` has
                 // it by the time any method body is typechecked. Only a Named
-                // underlying (a class/record/interface/enum) has static
-                // members to look up; a primitive/function/generic-parameter
-                // alias target has none and is left for the existing
-                // "no such member" handling below.
+                // underlying (a class/record/interface/enum) has a TypeSymbol
+                // to stamp into `targetType`; a Primitive alias
+                // (`type MyInt := int;`) has no user TypeSymbol and stays a
+                // null `targetType`, but the receiver-type-driven extension
+                // lookup further down (~line 19625, the §26.5
+                // primitive-receiver arm) consults `ctx_.exprType(*ma.target)`
+                // directly and needs the underlying Primitive TypeRef to find
+                // a user `extension int` method through the alias — exactly
+                // the shape #4070 closed for Named underlyings on the same
+                // classification site and that #4080 widens to Primitive
+                // underlyings (§27.6 / §27.8, v0.294). Always attach the
+                // resolved TypeRef to the target identifier so any downstream
+                // code that re-reads `ctx_.exprType(*ma.target)` directly sees
+                // the real aliased type, not an untyped alias name — the
+                // generic-instantiation static-global redirect (codegen) and
+                // the primitive-receiver extension lookup (sema) included.
                 if (const auto* aliasDecl =
                         dynamic_cast<const ast::TypeAlias*>(aliasSym->decl)) {
                     if (aliasDecl->aliasedType) {
@@ -16595,18 +16641,43 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                                 ctx_.resolvedType(*aliasDecl->aliasedType)) {
                             if (underlying->kind == TypeRef::Kind::Named) {
                                 targetType = underlying->declaration;
-                                // Mirror the §11.8 GenericParamSymbol arm
-                                // above: attach the resolved (possibly
-                                // generic-instantiated, e.g. `type A :=
-                                // G<int>;`) TypeRef to the target identifier
-                                // itself so any downstream code that re-reads
-                                // `ctx_.exprType(*ma.target)` directly (rather
-                                // than through `targetType`) — codegen's
-                                // generic-instantiation static-global redirect
-                                // included — sees the real aliased type, not
-                                // an untyped alias name.
                                 if (targetType)
                                     ctx_.setExprType(ma.target.get(), underlying);
+                            } else if (underlying->kind ==
+                                           TypeRef::Kind::Primitive) {
+                                // fix #4080 (§27.6 / §27.8, v0.294): a `type`
+                                // alias of a Primitive (`type MyInt := int;`)
+                                // used as the receiver of an extension-method
+                                // access (`MyInt.Doubled`) has no user
+                                // TypeSymbol to stamp into `targetType`, so
+                                // attach the underlying Primitive TypeRef to
+                                // the target identifier itself. The §26.5
+                                // primitive-receiver extension lookup below
+                                // (~line 19625) keys off `ctx_.exprType
+                                // (*ma.target)`, which without this setExprType
+                                // call stays null for an alias qualifier and
+                                // silently misses the extension. Without this,
+                                // an UNBOUND extension-method reference
+                                // through a primitive alias is BOTH:
+                                //   (a) misclassified as BOUND by
+                                //       resolveExtensionMember (the
+                                //       shared `resolveAliasToTypeSymbol`
+                                //       helper returns null for Primitive-kind
+                                //       underlyings, mirroring the Named
+                                //       alias gap #4070 closed on the same
+                                //       classification site), so the Function
+                                //       TypeRef built for the reference omits
+                                //       the leading receiver parameter §27.6
+                                //       requires; AND
+                                //   (b) reached through the runtime adapter
+                                //       codegen synthesises, where the missing
+                                //       receiver param + the alias qualifier's
+                                //       null exprType together degrade through
+                                //       the #2434/#2491 backstops to a
+                                //       zero-initialised slot (a SIGSEGV when
+                                //       the body reads `this`) — the precise
+                                //       behavior the issue filed.
+                                ctx_.setExprType(ma.target.get(), underlying);
                             }
                         }
                     }

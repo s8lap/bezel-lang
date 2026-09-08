@@ -12,7 +12,7 @@
 // RUN: %bezelc -c -o %t.o %s
 // RUN: %bezelc -c %s 2>&1 | FileCheck --check-prefix=NODIAG --allow-empty %s
 
-module M; class C public static method Take(scoped f: () -> ()): owned C f(); return new C(); end Take; public static method Main(): int var g: (scoped () -> ()) -> () := C.Take; return 0; end Main; end C;
+module M; class C public static method Take(scoped f: () -> ()): owned C f(); return new C(); end Take; public static method Main(): int var g: (scoped () -> ()) -> owned C := C.Take; return 0; end Main; end C;
 
 // NODIAG-NOT: error
 // NODIAG-NOT: §

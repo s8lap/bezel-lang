@@ -4449,6 +4449,46 @@ void ExprTC::checkAssignable(TypeRef* from, TypeRef* to,
                 return;
             }
         }
+        // §27.6 / fix #4081 (v0.294): the FORMATION-site shape check
+        // (§27.6's "parameter and return types unify with the target's
+        // under the standard implicit-conversion rules (§5.1)"). The
+        // `skipShapeCheck` carve above admitted every pair for a fresh
+        // method/property reference (the pre-fix "Formation sites keep
+        // their prior (unchanged) permissive behavior" comment) — the
+        // runtime adapter was asked to bridge a pair it had no path
+        // between (Primitive `int` ↔ user Named class, the #4081
+        // reproducer's `int → ExtTargetErrU4070` for the leading receiver
+        // parameter of an unbound extension-method reference), and
+        // dereferenced unmapped memory: a SIGSEGV at the receiver. Apply
+        // the §5.1 rule per slot — the BROADER rule that may bridge any
+        // §5.1 implicit conversion by synthesizing an adapter at the
+        // reference site, distinct from the narrower §27.1.1 invariance
+        // the formed-value arm enforces above. Param slots contravariant
+        // (target → source must be §5.1-convertible), return slot
+        // covariant (source → target must be §5.1-convertible); identity
+        // accepted at each slot (identity is not a §5.1 conversion per
+        // ExprTC::implicitlyConvertible's docstring, so the structural
+        // equality predicate must run first). The freshLambda carve
+        // stays unchanged (a lambda literal is target-typed — its params
+        // are inferred FROM the target, not independently — so no
+        // formation-site check applies; the formed-value arm above is
+        // also skipped for freshLambda).
+        if (freshReferenceFormation && !freshLambda) {
+            for (std::size_t i = 0; i < from->funcParams.size(); ++i) {
+                const TypeRef* targetParam = to->funcParams[i].type;
+                const TypeRef* sourceParam = from->funcParams[i].type;
+                if (!functionSlotTypeRefEqual(targetParam, sourceParam) &&
+                    !implicitlyConvertible(targetParam, sourceParam)) {
+                    reportNotConvertible();
+                    return;
+                }
+            }
+            if (!functionSlotTypeRefEqual(from->funcReturn, to->funcReturn) &&
+                !implicitlyConvertible(from->funcReturn, to->funcReturn)) {
+                reportNotConvertible();
+                return;
+            }
+        }
         // §27.6 / fix #1820 (v0.223 ruling delta (5); carried in v0.282): a
         // method reference over a STATIC callee whose declared return type
         // (nullability stripped) is one of the eight §29.3/§30.7 iterable or
