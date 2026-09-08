@@ -3780,11 +3780,48 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                    : par->resolvedDeclType;
         }
         if (!isMethodOrCtor && ft && ft->kind == TypeRef::Kind::Function) {
-            // Defer named / modifier / discard arguments (by-ref delegate
-            // binding is not modeled here), mirroring checkImportedCallArity.
+            // fix #4085 / §27.1 (v0.294): calls THROUGH a function-typed
+            // callee are positional — §27.1, verbatim, "Function types may
+            // include parameter names. Names are documentation only; they do
+            // not affect type identity … Calls are positional." The named-
+            // argument form (`Identifier :=`, §22.5) is NOT admitted at a
+            // function-value call: the parser's `Parser::parseArgList`
+            // (shared with method calls and `new T(args)`, A.4) populates
+            // `a.name` for the `Identifier :=` prefix, the codegen layer
+            // then discards the name and binds the argument by its textual
+            // POSITION, and the names written in the call never reach
+            // `checkAssignable` either (this branch below bails when
+            // `simple=false`). The result is a SILENT WRONG-VALUE call
+            // (measured on #4085 against `caller: (a:int, b:int) -> int`:
+            // `caller(b := 2, a := 100)` ran as `caller(2, 100)` and returned
+            // 2100) with no diagnostic. Reject the form here, mirroring
+            // §23.5's indexer treatment (#2758) — index arguments are
+            // positional-only too, and the spec gives the same reasoning:
+            // a function-type's parameter names are declaration-internal,
+            // not caller-bindable API surface. (A genuine method CALL goes
+            // through `checkArgsAgainstParams` above and honors the named
+            // form per §22.5 — this branch is reached only when the callee
+            // symbol is NOT a method/constructor.)
+            for (const auto& a : ce.args) {
+                if (a.name.empty()) continue;
+                ctx_.diagnostics().report(
+                    Severity::Error,
+                    a.value ? a.value->span.begin : ce.span.begin,
+                    "the named-argument form `" + std::string(a.name) +
+                        " := \xE2\x80\xA6` is not admitted at a function-value "
+                        "call site \xE2\x80\x94 calls are positional: a "
+                        "function-type's parameter names are "
+                        "declaration-internal, not caller-bindable API "
+                        "surface (\xC2\xA7""27.1). Drop the `" +
+                        std::string(a.name) +
+                        " := ` prefix and pass the argument positionally "
+                        "(\xC2\xA7""27.1)");
+            }
+            // Defer modifier / discard arguments (by-ref delegate binding
+            // is not modeled here), mirroring checkImportedCallArity.
             bool simple = true;
             for (const auto& a : ce.args)
-                if (!a.name.empty() || !a.modifier.empty() || a.isDiscard) {
+                if (!a.modifier.empty() || a.isDiscard) {
                     simple = false;
                     break;
                 }
