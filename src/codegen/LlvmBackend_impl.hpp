@@ -11807,6 +11807,13 @@ private:
               closureReleaseEligible_(e.closureReleaseEligible_),
               closureReleaseEligibleFn_(e.closureReleaseEligibleFn_),
               closureLocalCandidates_(e.closureLocalCandidates_),  // fix #3757 follow-up
+              // fix #3927 (§27.5 / §28.9, v0.295): see the field-side comment
+              // below. Same two-halves-of-one-contract rule (LANE_RULES §8):
+              // the borrow-side sets are populated by the SAME
+              // collectClosureReleaseEligible call this scope guards, so they
+              // need the identical save/restore protection.
+              closureBorrowAll_(e.closureBorrowAll_),
+              closureBorrowRetainEligible_(e.closureBorrowRetainEligible_),
               boxCaptureLocals_(e.boxCaptureLocals_),
               singleCaptureLocals_(e.singleCaptureLocals_),
               assignedCaptureVars_(e.assignedCaptureVars_),
@@ -11821,6 +11828,13 @@ private:
             e_.closureReleaseEligibleFn_ = closureReleaseEligibleFn_;
             e_.closureLocalCandidates_ =
                 std::move(closureLocalCandidates_);  // fix #3757 follow-up
+            // fix #3927 (§27.5 / §28.9, v0.295): see the field-side comment.
+            // Restoring these so the outer method body's await-Task<closure>
+            // locals still see the right eligibility set after a nested async
+            // lambda body has finished lowering.
+            e_.closureBorrowAll_ = std::move(closureBorrowAll_);
+            e_.closureBorrowRetainEligible_ =
+                std::move(closureBorrowRetainEligible_);
             e_.boxCaptureLocals_ = std::move(boxCaptureLocals_);
             e_.singleCaptureLocals_ = std::move(singleCaptureLocals_);
             e_.assignedCaptureVars_ = std::move(assignedCaptureVars_);
@@ -11842,6 +11856,22 @@ private:
         std::unordered_set<const void*> closureReleaseEligible_;
         llvm::Function* closureReleaseEligibleFn_;
         std::unordered_set<const void*> closureLocalCandidates_;  // fix #3757 follow-up
+        // fix #3927 (§27.5 / §28.9, v0.295): closureBorrowAll_ and
+        // closureBorrowRetainEligible_ are populated by the SAME
+        // collectClosureReleaseEligible call this scope guards, so they need
+        // the identical save/restore protection (LANE_RULES §8's two-halves-
+        // of-one-contract rule). Without them, an async-lambda body nested
+        // inside an async method body CLEARS them at the lambda's
+        // collectClosureReleaseEligible entry (Setup.cpp ~L26453), then
+        // repopulates for the LAMBDA's body — and the destructor only restores
+        // the half this scope knew about. Every `var g := await asyncF();`
+        // declared AFTER the inner lambda's local-decl lowering in the outer
+        // method body then sees empty borrow sets at its own
+        // armClosureLocalRefcount call and the awaited closure +1 leaks
+        // (measured 20000 B / 500 allocations — exactly the 40-byte
+        // rc=1 cell per activation the issue names).
+        std::unordered_set<const void*> closureBorrowAll_;
+        std::unordered_set<const void*> closureBorrowRetainEligible_;
         std::unordered_set<const void*> boxCaptureLocals_;
         std::unordered_set<const void*> singleCaptureLocals_;
         std::unordered_set<const void*> assignedCaptureVars_;
@@ -13914,6 +13944,13 @@ private:
     // statically-known case the decline was protecting AGAINST this fix
     // misfiring on.
     bool isLambdaClosureReturnCall(const ast::Expr* init) const;
+    // fix #3927 (§27.5 / §28.9, v0.295): awaited sibling of the two predicates
+    // above. `var g := await f();` is the Task<closure>-consumer shape (#3788 /
+    // #3773 mints +1 on the producer side, transferred into `g`'s slot); both
+    // existing predicates require a bare CallExpr init, so without this the
+    // `await` wrapper is misclassified as a borrow. Declared here for the
+    // same access reasons as the producer predicates above.
+    bool isAwaitedClosureReturnCall(const ast::Expr* init) const;
     // fix #3498 (§28.14 / §27.5 / §28.9, v0.283): is syntactic argument `ai` of
     // `call` a §28.14 CALL-BOUNDED function-typed parameter position — i.e. one
     // where the callee provably holds no reference to the callback once the call

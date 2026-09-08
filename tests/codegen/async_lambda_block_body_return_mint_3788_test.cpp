@@ -301,3 +301,46 @@ BEZEL_TEST(async_lambda_block_body_return_mint_3788,
         kMain),
         "total=1400\n");
 }
+
+// ── Row 10, THE CONSUMER-SIDE PAIR OF #3788, fix #3927 (§27.5 / §28.9, v0.295):
+// the SAME captured-closure-local body and the SAME awaited-result-with-no-
+// consumer shape as row 9, loop-amplified to 500 iterations and asserted with
+// the STRICT oracle (runAotChecked — both ASan AND LSan on) so a residual
+// leak fails the test instead of merely warning. On the parent commit
+// (r15-cycle-1 = 6460ea7) the run leaks DIRECTLY at the awaited-result calloc
+// site — 20000 B / 500 allocations (one 40-byte rc=1 closure cell per
+// activation, exactly the +1 #3788 minted on the producer side and the
+// consumer-side slot never discharged). With fix #3927 (the consumer-side
+// twin of #3788's mint: a) armClosureLocalRefcount wired into lowerLocalDecl
+// for every plain `var`/`const` local — the function was defined by #2714 but
+// never invoked; and b) CaptureReclaimSetScope (LlvmBackend_impl.hpp) widened
+// to also save/restore closureBorrowAll_ + closureBorrowRetainEligible_ so
+// a nested async-lambda body inside the outer async method body does not
+// clear the OUTER body's eligibility sets and leave them empty when the
+// outer body's subsequent lowerLocalDecls read them) the run is clean — 0
+// leaked, exit 0, total=3500 unchanged. inner()=7, total = 500*7 = 3500.
+BEZEL_TEST(async_lambda_block_body_return_mint_3788,
+           awaited_closure_result_loop_amplified_no_leak_3927_spec_28_9) {
+    auto r = runAotChecked(
+        std::string(kHdr) +
+        "class C "
+        "  public static async method Run(): Task<int> "
+        "    var inner := lambda() => 7; "
+        "    var f := async lambda() => do return inner; end; "
+        "    var g := await f(); "
+        "    return g(); "
+        "  end Run; "
+        "  public static async method Main(): Task<int> "
+        "    var total := 0; "
+        "    var i := 0; "
+        "    while i < 500 do "
+        "      total := total + await C.Run(); "
+        "      i := i + 1; "
+        "    end; "
+        "    Console.WriteLine(\"total=\" + total.ToString()); "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_EQ(r.ran ? r.stdoutText : std::string("<did-not-run>"),
+                    "total=3500\n");
+}

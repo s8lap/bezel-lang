@@ -25010,6 +25010,31 @@ bool Emitter::isLambdaClosureReturnCall(const ast::Expr* init) const {
 }
 
 
+// fix #3927 (§27.5 / §28.9, v0.295): the awaited sibling of
+// isLambdaClosureReturnCall / isUserMethodClosureReturnCall. `var g := await
+// f();` is the canonical Task<closure>-consumer shape: the awaited task's
+// state machine completes with a +1 reference to the closure cell (#3788 /
+// #3773 mints it on the producer side), and that +1 is transferred into `g`'s
+// slot. The two sibling predicates both require a bare CallExpr init — they
+// KEY ON THE CALL'S RESULT TYPE BEING A FUNCTION, but for an async lambda /
+// async method the call's result is `Task<closure>`, not `closure`, so they
+// decline. Awaiting a Task<closure> at the consumer is the SINGLE shape that
+// produces a closure-type value the producer side has already minted, so
+// recognizing it here (and only here) keeps the producer/borrow
+// classification symmetric. Mirrors `arrivesFromCallee` in the lambda-return
+// mint (LlvmBackend_Async.cpp ~L2390): the awaited shape is a callee that
+// mints on return, by spec.
+bool Emitter::isAwaitedClosureReturnCall(const ast::Expr* init) const {
+    auto* un = dynamic_cast<const ast::UnaryExpr*>(init);
+    if (!un || un->op != "await" || !un->operand) return false;
+    // The awaited type — `Task<T>` unwrapped to `T` — must be a non-nullable
+    // function type. The unwrap is automatic: `ctx_.exprType(*un)` returns the
+    // awaited element type, not the wrapping Task.
+    const sema::TypeRef* t = ctx_.exprType(*un);
+    return t && !t->nullable && t->kind == sema::TypeRef::Kind::Function;
+}
+
+
 // fix #3498 (§28.14 / §27.5 / §28.9, v0.283): see the declaration in
 // LlvmBackend_impl.hpp for the §28.14 argument and for why this is a strict
 // UNDER-approximation of lowerCall's `callBoundedClosureArgs` rather than a
@@ -26516,7 +26541,8 @@ void Emitter::collectClosureReleaseEligible(
             if (v.init && !v.isUsing) {
                 if (isPlusOneClosureProducer(v.init) ||
                     isUserMethodClosureReturnCall(v.init) ||
-                    isLambdaClosureReturnCall(v.init)) {
+                    isLambdaClosureReturnCall(v.init) ||
+                    isAwaitedClosureReturnCall(v.init)) {
                     candidates.push_back(s);
                     // fix #3757 follow-up: this decl belongs to the body being
                     // analyzed — see closureLocalCandidates_'s declaration.
