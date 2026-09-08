@@ -7239,21 +7239,48 @@ bool Resolver::argSatisfiesNew(const TypeRef* arg, bool& decided) {
             // symbol-side full-storage enumeration — positional fields,
             // body fields, and auto-properties together — so this now
             // reads it instead of leaving body storage unverified.
+            //
+            // fix #4002 (§17.11/§14.2/§9.7, v0.294): #3988 widened this
+            // arm's field ENUMERATION to `recordStorageMembers`, but never
+            // substituted the record's OWN generic parameter against the
+            // concrete instantiation — the sibling gap of #3986 in
+            // `ExprTC::defaultIllFormed` (ExprTypecheck_Exprs.cpp). For
+            // `record Box<T>(V: T)`, `rsm.type` for `V` is the bare,
+            // declaration-less `T`; `categorize(ft)` on an unresolved
+            // bare parameter does not classify as `TypeCategory::Reference`,
+            // so `nonDefaultable` never got set regardless of what `T` was
+            // actually bound to. Seed a `common::RecordSubstEnv` from the
+            // record's own generic parameters against `arg`'s
+            // `genericArgs` (the SAME primitives `ExprTC::defaultIllFormed`
+            // uses for the identically-shaped substitution; the
+            // symbol-side `seedRecordSubstEnv` overload is correct for an
+            // imported record too — `TypeSymbol::genericParams` is
+            // populated by ModuleLoader, unlike `decl`) and apply
+            // `common::resolveRecordFieldSubst` per member before the
+            // `nullable`/`categorize` checks.
             decided = true;
             bool unresolved = false;
             bool nonDefaultable = false;
+            common::RecordSubstEnv env;
+            common::seedRecordSubstEnv(*d, *arg, /*incoming=*/nullptr, env);
+            const common::RecordSubstEnv* fieldEnv =
+                env.map.empty() ? nullptr : &env;
             recordStorageMembers(
                 d, ctx_,
                 [&](const RecordStorageMember& rsm) {
                     const TypeRef* ft = rsm.type;
                     if (!ft) { unresolved = true; return false; }  // can't verify
-                    if (ft->nullable) return true;  // nullable → defaults null
-                    if (categorize(ft) == TypeCategory::Reference) {
+                    const TypeRef* subFt =
+                        common::resolveRecordFieldSubst(ft, fieldEnv).ty;
+                    if (!subFt) { unresolved = true; return false; }
+                    if (subFt->nullable) return true;  // nullable → defaults null
+                    if (categorize(subFt) == TypeCategory::Reference) {
                         nonDefaultable = true;
                         return false;  // non-nullable reference: no default
                     }
                     return true;
-                });
+                },
+                /*env=*/nullptr);
             if (unresolved) { decided = false; return false; }
             return !nonDefaultable;
         }
