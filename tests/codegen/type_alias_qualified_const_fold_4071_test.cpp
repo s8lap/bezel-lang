@@ -29,10 +29,12 @@
 // re-reads the name).
 
 #include "support/aot_support.hpp"
+#include "support/aot_result_asserts.hpp"
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
 using bezel::test::runAot;
+using bezel::test::failedAtCompileTimeWithRealLocation;
 
 namespace {
 int run(const std::string& prog) {
@@ -122,6 +124,11 @@ BEZEL_TEST(type_alias_qualified_const_fold_4071,
         "  end Main; "
         "end C;");
     BEZEL_EXPECT_FALSE(r.ran);
+    // narrow #3892 (v0.294): a bare `!ran` cannot distinguish a genuine
+    // §5.1 narrowing reject from a runtime crash/signal/timeout/ASan.
+    // The narrowing reject carries a real `<path>:<line>:<col>` prefix;
+    // the synthetic failure shapes never do.
+    BEZEL_EXPECT_TRUE(bezel::test::failedAtCompileTimeWithRealLocation(r));
 }
 
 // ── KNOWN-OPEN CONTROL for #4047 ─────────────────────────────────────────
@@ -168,6 +175,11 @@ BEZEL_TEST(type_alias_qualified_const_fold_4071,
     if (r.ran) {
         BEZEL_EXPECT_TRUE(r.exitCode != 5);  // not the correct fold value
     } else {
-        BEZEL_EXPECT_FALSE(r.ran);  // compile-reject is also valid
+        // narrow #3892 (v0.294): when the program does NOT run, the only
+        // valid #4047-inherited outcome is a real §5.1 narrowing reject
+        // (real `<path>:<line>:<col>` prefix) - never a runtime crash/signal
+        // /timeout/ASan report, which never carries such a prefix.
+        BEZEL_EXPECT_TRUE(
+            bezel::test::failedAtCompileTimeWithRealLocation(r));
     }
 }

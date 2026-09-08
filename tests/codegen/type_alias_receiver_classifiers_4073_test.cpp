@@ -40,10 +40,12 @@
 // at length as the wrong fix for #4076's shape).
 
 #include "support/aot_support.hpp"  // runAot
+#include "support/aot_result_asserts.hpp"
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
 using bezel::test::runAot;
+using bezel::test::failedAtCompileTimeWithRealLocation;
 
 // ── (1) Universal-member arity gate, alias-as-type-name receiver ───────────
 //
@@ -283,5 +285,9 @@ BEZEL_TEST(type_alias_receiver_classifiers_4073,
     // been resolved when the outer alias's resolution runs). The correct
     // behavior is for this to ACCEPT and return 42 — that's the
     // resolution-order gap, separately tracked by #4047.
-    BEZEL_EXPECT_FALSE(r.ran);  // rejected pre-fix; rejected post-fix too
+    // narrow #3892 (v0.294): a bare `!ran` cannot tell a §30.14 reject
+    // from a runtime crash/signal/timeout/ASan report; the genuine §30.14
+    // reject carries a real `<path>:<line>:<col>` prefix, the synthetics
+    // never do.
+    BEZEL_EXPECT_TRUE(bezel::test::failedAtCompileTimeWithRealLocation(r));
 }
