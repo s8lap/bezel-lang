@@ -53,6 +53,7 @@ record UR(A: string, B: string, C: string);
 
 record BR
   public N: int := 3;
+  public constructor() end constructor;
 end BR;
 
 class MyGuid
@@ -101,7 +102,9 @@ class ACC
     total := total + mine.N;
 
     // The identically-shaped user record, and a body record's parameterless
-    // form.
+    // form (declared no-arg ctor; a body record without one would not have
+    // a `new BR()` admit, per §9.1 / §9.2 / #4059 — see the sibling lit
+    // test `body_only_record_zero_arg_new_4059` for the rejection shape).
     var ur := new UR("a", "bb", "ccc");
     var br := new BR();
     total := total + ur.A.Length + br.N;

@@ -13355,10 +13355,46 @@ void ExprTC::checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t) {
         return;
     }
     if (ctors.empty()) {
-        // Implicit default constructor: zero parameters. (A primary
-        // constructor would surface as a ConstructorSymbol, so the
-        // empty case really is the no-arg default.) Any argument — named
-        // or positional — is too many for a zero-parameter constructor.
+        // fix #4059 (§9.1 / §9.2 / §22.7, v0.295): a body-only RECORD
+        // declares no implicit default constructor, so `new T(...)` on
+        // such a type (no positional fields, no declared instance ctor) is
+        // a compile error — before this, it silently constructed a
+        // zero-filled value. The implicit-default premise below is right
+        // for a CLASS (§22.7) but wrong for a body-only record: §9.1
+        // generates a primary ctor ONLY for positional records (§9.1's
+        // "for each positional record, the compiler generates:"), and
+        // §9.2 declares body records constructible only via `default(T)`
+        // or a user-declared ctor — the latter path of which, when at
+        // least one ctor is declared, runs the ctors.size() == 1 branch
+        // below. The positional-fields arm above already returns for any
+        // record with `hasPositionalFields`; this branch only fires for
+        // body-only shapes.
+        //
+        // MEASURED pre-fix: `record Foo { public property Bar: int; }
+        // end Foo; var f := new Foo();` type-checked cleanly and produced
+        // Bar=0 at runtime — measurable as `return f.Bar;` returning 0
+        // rather than rejecting at compile time. The same spelling on a
+        // class (`class Foo { public property Bar: int; } end Foo;`)
+        // remained correctly accepted by the implicit-default branch
+        // below. Diagnostic names both remedies (default-value form and
+        // declared-ctor form) so the fix-validator rows stay green-tick.
+        if (t->kind == ast::TypeDeclKind::Record) {
+            ctx_.diagnostics().report(
+                Severity::Error, ne.span.begin,
+                std::string("`new ") + std::string(t->name) +
+                "()` requires a declared constructor — body records do "
+                "not synthesize an implicit default constructor (§9.1 / "
+                "§9.2, #4059); declare a parameterless constructor, or use "
+                "`default(" + std::string(t->name) +
+                ")` for the zero value");
+            return;
+        }
+        // Class (or other non-record type): implicit default ctor — zero
+        // parameters, as §22.7 specifies. A primary constructor would
+        // surface as a ConstructorSymbol, so the empty case really is the
+        // no-arg default for a class with no primary-ctor parameter list
+        // (§22.10). Any argument — named or positional — is too many for
+        // a zero-parameter constructor.
         if (!ne.args.empty()) {
             ctx_.diagnostics().report(
                 Severity::Error, ne.span.begin,
@@ -13668,7 +13704,28 @@ void ExprTC::checkImportedNewExprArgs(
         }
     }
     if (ctors.empty()) {
-        // §22.7: no declared ctor → implicit default takes zero arguments.
+        // fix #4059 (§9.1 / §9.2 / §22.7, v0.295) — the SAME bug the local
+        // `checkNewExprArgs` arm above closes, on the import side. A
+        // body-only IMPORTED record has no implicit default constructor
+        // either: §9.1 generates a primary ctor only for positional
+        // records, and §9.2 keeps body records constructible via
+        // `default(T)` or a user-declared ctor only. Reject the silent
+        // zero-fill (`new Foo()` typed cleanly and produced a 0-valued
+        // instance — see the local twin's diagnostic for the full repro
+        // shape). The class arm below is unchanged: classes keep their
+        // implicit-default semantics per §22.7.
+        if (t->kind == ast::TypeDeclKind::Record) {
+            ctx_.diagnostics().report(
+                Severity::Error, ne.span.begin,
+                std::string("`new ") + std::string(t->name) +
+                "()` requires a declared constructor — body records do "
+                "not synthesize an implicit default constructor (§9.1 / "
+                "§9.2, #4059); declare a parameterless constructor, or use "
+                "`default(" + std::string(t->name) +
+                ")` for the zero value");
+            return;
+        }
+        // Class: §22.7 implicit default — zero parameters.
         if (!ne.args.empty())
             ctx_.diagnostics().report(
                 Severity::Error, ne.span.begin,

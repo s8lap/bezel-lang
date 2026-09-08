@@ -4631,8 +4631,25 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                         // a differently-sized field — never ran across a module
                         // boundary. `hasPositionalFields` is mirrored onto the
                         // TypeSymbol on both sides (#501), so read it there.
-                        if (t->hasPositionalFields)
-                            checkNewExprArgs(*ne, t);
+                        //
+                        // fix #4059 (§9.1 / §9.2 / §22.7, v0.295): the
+                        // pre-existing `hasPositionalFields` gate ALSO skipped
+                        // any arg check for a body-only record (positional-field
+                        // count is zero), where §9.1 has nothing to validate
+                        // and §9.2 declares no implicit default ctor — until
+                        // §4059 fix's `ctors.empty()` arm rejects the silent
+                        // zero-fill (`new Foo()` type-checked clean and minted
+                        // a 0-valued record; `return f.Bar;` returned 0). The
+                        // fix opens this gate so every record — positional,
+                        // body-only, or combined-form — runs through
+                        // `checkNewExprArgs`. The function already has the
+                        // right arms: `t->hasPositionalFields` routes the
+                        // positional-record binder; the ctors-collection arm
+                        // handles body records with explicit ctors; and the
+                        // new body-record reject (added in the same fix's
+                        // parallel edit to `checkNewExprArgs`) closes the
+                        // zero-fill hole for body records with no ctors.
+                        checkNewExprArgs(*ne, t);
                     }
                     // fix #3719 (§17.11 / §3.6 rule 2, v0.242): this
                     // construction IS the instantiation site (§3.6 rule 2)
