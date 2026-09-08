@@ -913,6 +913,31 @@ void ExprTC::checkIndexArgNullability(const ast::IndexExpr& ix,
         return substituteMemberType(p, ix.target.get(), ps->parent);
     };
 
+    // fix #4084 (§28.3 / §23.4 / §14.1, v0.294): cache the substituted
+    // declared parameter types per indexer-access slot so the ownership pass
+    // (`recordCallArgDirectLambdaTargetsFromIndexer`,
+    // Ownership_Checks.cpp, fix #4075) can read them — pre-fix, that
+    // resolver read the RAW declared `T` off `pd->indexerParams` /
+    // `ps->indexerParams` and never called `substituteMemberType`, so a
+    // generic indexer whose parameter is a bare type parameter `T`
+    // (`property [mk: T]`) instantiated at a call site with a function
+    // type (`Box<() -> owned Res>`) silently bypassed the
+    // borrow-owned-return check (#4075's own defect class reopened through
+    // generics). Populated here at the SAME point the §7 nullability check
+    // computed each substitution — the `substituteMemberType` call
+    // immediately above — so no work is duplicated and the cache cannot
+    // disagree with the §7 verdict. Skipped for the dictionary / non-`ps`
+    // cases: `recordCallArgDirectLambdaTargetsFromIndexer` only reads this
+    // cache when `ps` (a user-defined indexer) is present, and a dictionary
+    // never declares a function-typed index parameter anyway.
+    if (ps) {
+        std::vector<sema::TypeRef*> sub;
+        sub.reserve(ix.indices.size());
+        for (std::size_t k = 0; k < ix.indices.size(); ++k)
+            sub.push_back(declaredIndexParam(k));
+        ctx_.setIndexerSubstitutedParamTypes(&ix, std::move(sub));
+    }
+
     // The diagnostic's subject. `<Receiver>[i]` (or `[key]` for a dictionary)
     // for the single-index case — the wording #2613 introduced — and an
     // ordinal for a multi-parameter indexer, where "the index argument" alone

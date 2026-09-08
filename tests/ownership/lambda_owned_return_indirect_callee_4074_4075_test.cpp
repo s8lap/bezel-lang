@@ -342,6 +342,89 @@ BEZEL_TEST(lambda_owned_return_indirect_callee_4074_4075,
 }
 
 // ===========================================================================
+// #4084 — REJECT: a GENERIC user-defined indexer with a BARE-type-parameter
+// function-typed parameter. Direct follow-on to #4075: every REJECT row
+// above is non-generic, so the unchanged resolver's omission of the
+// `substituteMemberType` call `checkIndexArgNullability`'s
+// `declaredIndexParam` lambda performs (`Src/sema/ExprTypecheck_Exprs.cpp`,
+// fix #2619, also #4075's mirror) is a no-op there. For a generic indexer
+// whose declared parameter type is a BARE type parameter `T`, the
+// unsubstituted `T` (`TypeRef::Kind::GenericParam`) is not `Function`, so
+// the new resolver's `pt->kind == Function` gate never fires at a concrete
+// instantiation where `T` is bound to a function type — #4075's defect
+// class reopens through generics. Fail-without (measured on 511e576):
+// compiles with rc=0, zero diagnostics; running under --sanitize=address
+// reports a 40-byte Direct leak (allocation site attributed to `main`),
+// matching the issue's exact measurement. Pass-with (this fix): rejected
+// at compile time with this fix's diagnostic text — see the per-row FAIL-
+// WITHOUT comment below for the exact byte-for-byte confirmation.
+// ===========================================================================
+
+// The issue's EXACT repro: a generic indexer with a bare-type-parameter
+// declared parameter, instantiated at a function type whose return is
+// `owned`. Substitutes `T` -> `() -> owned Res` at the call site; the
+// lambda argument `lambda() => b` returns a borrow (`b` is a `using var`)
+// and must therefore be rejected — the same shape as the non-generic
+// `indexer_get_argument_rejected` row above, only REACHABLE here through
+// the fix's substituteMemberType-equivalent path.
+BEZEL_TEST(lambda_owned_return_indirect_callee_4074_4075,
+           generic_indexer_bare_type_param_rejected_spec_28_3_23_4_4084) {
+    JitResult jr = runAot(
+        std::string(kRes) +
+        "class Box<T> "
+        "  public property [mk: T]: int "
+        "    get => 42; "
+        "  end; "
+        "end Box; "
+        "class C "
+        "  public static method Main(): int "
+        "    using var b := new Res(4); "
+        "    var box := new Box<() -> owned Res>(); "
+        "    var r := box[lambda() => b]; "
+        "    return r; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(jr));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(jr, kLambdaOwnedBorrowReturn));
+}
+
+// A MULTI-parameter generic indexer with the owned-returning lambda at
+// POSITION 1, not 0 — verifies the per-slot substitution (slot 0 is the
+// bare `int`, slot 1 is the bare `T` substituted at instantiation).
+// Mirrors the non-generic `indexer_second_parameter_position_rejected`
+// row above, only here both slots are bare-type-params and exactly the
+// substituted form of slot 1 should fire the check.
+BEZEL_TEST(lambda_owned_return_indirect_callee_4074_4075,
+           generic_indexer_second_param_bare_type_rejected_spec_28_3_23_4_4084) {
+    JitResult jr = runAot(
+        std::string(kRes) +
+        "class Box<T> "
+        "  public property [tag: int, mk: T]: int "
+        "    get => tag + 42; "
+        "  end; "
+        "end Box; "
+        "class C "
+        "  public static method Main(): int "
+        "    using var b := new Res(4); "
+        "    var box := new Box<() -> owned Res>(); "
+        "    var r := box[7, lambda() => b]; "
+        "    return r; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(jr));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(jr, kLambdaOwnedBorrowReturn));
+}
+
+// A generic indexer whose declared parameter type is `() -> owned T` (T
+// EMBEDDED inside an already-`Function`-kinded declared type) — already
+// rejected on 511e576 without this fix, because the resolver's
+// `pt->kind == Function` gate fires on the UNSUBSTITUTED declared type
+// (the `Function` kind and the `owned` marker are written directly in the
+// signature, regardless of what `T` resolves to). Listed here so a
+// reader of this file can verify the OPPOSITE shape — "rejection on the
+// unsubstituted kind" — and confirm the fix doesn't disturb it; the fix
+// is strictly narrower than the existing resolver.
+// ===========================================================================
 // #4075 — ACCEPT: this check must not over-reject.
 // ===========================================================================
 

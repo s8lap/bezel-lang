@@ -604,19 +604,45 @@ void MethodOwnership::recordCallArgDirectLambdaTargetsFromFuncValue(
     }
 }
 
-// fix #4075 (§28.3 / §23.4, v0.294): see the header comment
+// fix #4075 (#4084) (§28.3 / §23.4, v0.294): see the header comment
 // (Ownership_impl.hpp) for the full rationale. Mirrors
 // `checkIndexArgNullability`'s `declaredIndexParam` lambda
 // (ExprTypecheck_Exprs.cpp, fix #2619) exactly: the local (`ast::
 // PropertyDecl::indexerParams`) and imported (`PropertySymbol::
 // indexerParams`, reconstructed ParameterSymbols) dual read, positional
-// per §23.5.
+// per §23.5 — AND reads each slot's POST-substitution TypeRef from the
+// per-IndexExpr cache the typecheck pass populates at the same place it
+// runs `substituteMemberType` (fix #4084). Pre-fix, this resolver read the
+// RAW declared type straight off `pd->indexerParams` /
+// `ps->indexerParams`, omitting the `substituteMemberType` call
+// `checkIndexArgNullability`'s precedent performs immediately after that
+// read — a no-op for the non-generic case (every REJECT row in fix
+// #4074/#4075's test file is non-generic, all 11 pass), but a silent
+// wrong-answer for a GENERIC indexer whose declared parameter type is a
+// BARE type parameter `T` (`property [mk: T]`) instantiated at the call
+// site with a function type (`Box<() -> owned Res>`). The unsubstituted
+// `T` has `kind == GenericParam`, not `Function`, so the
+// `pt->kind == sema::TypeRef::Kind::Function` gate below never fires at
+// the concrete call site and the borrow-owned-return check never fires —
+// #4075's exact defect class reopens through generics. The fallback (raw
+// read with no substitution) covers any case the cache missed — the type
+// check pass didn't reach (imported / non-standard lifecycle), preserving
+// #4075's pre-#4084 behavior rather than regressing.
 void MethodOwnership::recordCallArgDirectLambdaTargetsFromIndexer(
         const ast::IndexExpr& ix,
         std::unordered_map<const ast::LambdaExpr*, const sema::TypeRef*>&
             out) const {
     auto* ps = dynamic_cast<sema::PropertySymbol*>(ctx_.exprSymbol(ix));
     if (!ps || !ps->isIndexer) return;
+    // fix #4084: read the same per-IndexExpr substituted TypeRef cache the
+    // typecheck pass populated (see the comment at the `ps`-guarded
+    // `setIndexerSubstitutedParamTypes` call inside `checkIndexArgNullability`,
+    // ExprTypecheck_Exprs.cpp). Read-only here — the typecheck pass is the
+    // single writer. Null when `checkIndexArgNullability` didn't run on
+    // this IndexExpr (no recvTy at typecheck time) or the slot was absent;
+    // in either case the fallback path below takes over for that slot.
+    const std::vector<sema::TypeRef*>* sub =
+        ctx_.indexerSubstitutedParamTypes(ix);
     // SEAM-ACCESSOR: mirrors checkIndexArgNullability's declaredIndexParam
     // (ExprTypecheck_Exprs.cpp, #2619) — a null `pd` (imported, #3149) falls
     // through to the `ps->indexerParams` symbol-side arm below, not to a
@@ -628,7 +654,12 @@ void MethodOwnership::recordCallArgDirectLambdaTargetsFromIndexer(
         auto* lam = dynamic_cast<const ast::LambdaExpr*>(a.value.get());
         if (!lam) continue;
         const sema::TypeRef* pt = nullptr;
-        if (pd) {
+        if (sub && i < sub->size() && (*sub)[i]) {
+            // fix #4084: the cache slot is the post-substitution TypeRef
+            // (so `T` -> `() -> owned Res` for `Box<() -> owned Res>`), the
+            // exact pre-context this resolver needs.
+            pt = (*sub)[i];
+        } else if (pd) {
             if (i < pd->indexerParams.size() && pd->indexerParams[i].type)
                 pt = ctx_.resolvedType(*pd->indexerParams[i].type);
         } else if (i < ps->indexerParams.size()) {

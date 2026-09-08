@@ -292,6 +292,29 @@ public:
         const ast::NewExpr& ne) const {
         return positionalBinding(ne);
     }
+    // fix #4084 (§28.3 / §23.4 / §14.1, v0.294): per-IndexExpr substituted
+    // indexer-parameter TypeRefs — see `indexerSubstitutedParamTypes_` below
+    // for the rationale. Populated by the typecheck pass from
+    // `checkIndexArgNullability`'s `declaredIndexParam` lambda (which already
+    // computed the substitution for its own §7 nullability check); read by
+    // the ownership pass from `recordCallArgDirectLambdaTargetsFromIndexer`
+    // (Ownership_Checks.cpp, fix #4075/#4084). Length is exactly
+    // `ix.indices.size()`; slot k is `nullptr` when the typecheck pass
+    // couldn't substitute one (non-user-indexer case, or no declared form for
+    // that slot). Mirrors `setPositionalBinding` / `pos positionalBinding`'s
+    // `const std::vector<int>*`-returning shape so the call site can null-
+    // check without a special-case for "indexer not yet processed".
+    void setIndexerSubstitutedParamTypes(const ast::IndexExpr* ix,
+                                         std::vector<TypeRef*> types) {
+        indexerSubstitutedParamTypes_[ix] = std::move(types);
+    }
+    const std::vector<TypeRef*>* indexerSubstitutedParamTypes(
+        const ast::IndexExpr& ix) const {
+        auto it = indexerSubstitutedParamTypes_.find(&ix);
+        return it == indexerSubstitutedParamTypes_.end()
+                   ? nullptr
+                   : &it->second;
+    }
     // §14.1/#783: iterate all AST-type→TypeRef and expr→TypeRef entries. Used by
     // ModuleLoader to COPY a re-parsed generic method body's resolved/expr types
     // from the fresh context into the main context, so codegen's per-instantiation
@@ -960,6 +983,25 @@ private:
     // has two call sites, one binder).
     std::unordered_map<const ast::Expr*, std::vector<int>>
         newExprPositionalBindings_;
+    // fix #4084 (§28.3 / §23.4 / §14.1, v0.294): per-IndexExpr substituted
+    // indexer-parameter TypeRefs. Populated by the typecheck pass at the
+    // SAME site it computes `substituteMemberType` for the §7
+    // nullability check (ExprTypecheck_Exprs.cpp's `declaredIndexParam`
+    // lambda inside `checkIndexArgNullability`), so the ownership pass
+    // (`MethodOwnership::recordCallArgDirectLambdaTargetsFromIndexer`,
+    // Ownership_Checks.cpp) can read the SAME post-substitution TypeRef
+    // without re-deriving the generic-instantiation context. Mirrors the
+    // function-value sibling of #4075's resolver, which avoids the same
+    // re-derivation by reading `ctx_.exprType` (the typecheck pass caches
+    // per-expression types — #4074's mirror); this is the per-indexer-
+    // parameter-slot equivalent for the §23.4 case, where no such cache
+    // previously existed. Entry is exactly `ix.indices.size()` long; slot k
+    // is `nullptr` when the typecheck pass didn't substitute one
+    // (non-user-indexer case, or no declared form for slot k). Lifetime
+    // matches `exprTypes_` — keys are AST nodes kept alive by the owning
+    // source file / `ownImportedAst`.
+    std::unordered_map<const ast::IndexExpr*, std::vector<TypeRef*>>
+        indexerSubstitutedParamTypes_;
     // fix #3628 (§22.15 rule 6 / §25.1 / §17.6, v0.286): resolved §25
     // operator for a STATEMENT operator form (`a += b`, `t++`). See
     // `setStmtOperatorSymbol`/`stmtOperatorSymbol` above.

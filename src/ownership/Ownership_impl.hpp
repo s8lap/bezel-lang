@@ -1599,6 +1599,30 @@ private:
     // ONLY the lambda-owned-target collector below, exactly like the
     // function-value sibling above — it does not touch `CalleeFormals` or
     // any of its other consumers.
+    //
+    // fix #4084 (§28.3 / §23.4 / §14.1, v0.294) NARROWS THAT MIRROR for the
+    // GENERIC-INDEXER axis: `checkIndexArgNullability`'s `declaredIndexParam`
+    // lambda calls `substituteMemberType` to substitute the receiver's
+    // concrete generic type arguments into the declared `T` (so a
+    // `Box<() -> owned Res>` indexing `property [mk: T]` reports the
+    // resolved `mk`-slot type as `() -> owned Res`, not the bare parameter
+    // `T`); this fix reads each slot's post-substitution TypeRef from a
+    // per-IndexExpr cache the typecheck pass populates from that exact
+    // `substituteMemberType` call site. Pre-fix, the resolver read the RAW
+    // declared type straight off `pd->indexerParams` / `ps->indexerParams`
+    // (the unresolved `T`, `kind == GenericParam`), so a generic indexer
+    // with a BARE-type-parameter declared slot and a function-typed
+    // concrete instantiation bypassed the `pt->kind == Function` gate and
+    // #4075's defect class reopened through generics — measured 40-byte
+    // LSan leak on the issue's exact repro. Mirroring the function-value
+    // sibling above, which avoids the same re-derivation by reading
+    // `ctx_.exprType` (an existing per-expression cache); the per-indexer-
+    // parameter-slot cache here is the indexer-specific equivalent the
+    // typecheck pass's existing per-IndexExpr work did not previously
+    // publish. The raw-read fallback below the cache branch preserves
+    // pre-fix behavior for any case the typecheck pass didn't reach (e.g.,
+    // a no-`recvTy` early-out in `checkIndexArgNullability`), so this fix
+    // does not regress #4075's existing non-generic surface.
     void recordCallArgDirectLambdaTargetsFromIndexer(
         const ast::IndexExpr& ix,
         std::unordered_map<const ast::LambdaExpr*, const sema::TypeRef*>&
