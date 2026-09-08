@@ -11276,17 +11276,40 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
                 }
                 return nullptr;
             };
+            // fix #4079 / §19.5 / §2.8.3 rule 4 (v0.294): the local pass
+            // below is module-local only — `ctx_.symbols()` is `symbols_`
+            // (SemaContext.hpp:90), so an imported record/enum's TypeSymbol
+            // (loaded into `importedSymbols_` by ModuleLoader) never
+            // appears here, and a bare type-test pattern over an imported
+            // record/enum (`case p of LibPt` after `import Lib;` declaring
+            // `record LibPt`) falls through every arm to the #1847 backstop
+            // diagnostic — a false reject of a program ExprTC's
+            // `checkTopLevelNamedPattern` already accepts. Mirror the
+            // established widening the #2845 fix applied to the class/
+            // interface sibling `descriptorForPatternName` a few hundred
+            // lines above in Setup.cpp: local pass first, then imported
+            // pass over `ctx_.importedSymbols()`. The same widening the
+            // #2844/#3197 fixes applied at sibling sites documented in
+            // `descriptorForPatternName`'s comment
+            // (LlvmBackend_Stmts.cpp:7657-7666, LlvmBackend_Assign.cpp:
+            // 10008-10020). Orthogonal to the #4076 `TypeAliasSymbol`
+            // arm — that arm added alias recognition INSIDE the local
+            // loop; this widens the loop's scope.
+            auto checkSym = [&](const sema::Symbol* s) -> llvm::Value* {
+                const sema::TypeSymbol* ts = matchRecordOrEnumSym(s);
+                if (!ts) return nullptr;
+                if (ts->kind != ast::TypeDeclKind::Record &&
+                    ts->kind != ast::TypeDeclKind::Enum) return nullptr;
+                if (scrut->getType()->isPointerTy())
+                    return builder_.getInt1(false);
+                bool sameType = scrutTy && scrutTy->declaration == ts;
+                return builder_.getInt1(sameType);
+            };
             for (const auto& sym : ctx_.symbols()) {
-                const sema::TypeSymbol* ts = matchRecordOrEnumSym(sym.get());
-                if (!ts) continue;
-                if (ts->kind == ast::TypeDeclKind::Record ||
-                    ts->kind == ast::TypeDeclKind::Enum) {
-                    if (scrut->getType()->isPointerTy())
-                        return builder_.getInt1(false);
-                    bool sameType =
-                        scrutTy && scrutTy->declaration == ts;
-                    return builder_.getInt1(sameType);
-                }
+                if (llvm::Value* v = checkSym(sym.get())) return v;
+            }
+            for (const sema::Symbol* sym : ctx_.importedSymbols()) {
+                if (llvm::Value* v = checkSym(sym)) return v;
             }
         }
         // §19.3 (v0.182, #1852): a bare TYPE-PARAMETER pattern `case x of T`. In
