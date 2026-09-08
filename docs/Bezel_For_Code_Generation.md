@@ -1,6 +1,6 @@
 # Bezel for Code Generation
 
-*Validated against v0.294. Companion to the Bezel Language Specification — a writing reference, not a normative document.*
+*Validated against v0.295. Companion to the Bezel Language Specification — a writing reference, not a normative document.*
 
 A dense reference for writing correct Bezel without reading the spec. It covers the syntax surface, the ownership rules, the standard-library name index, the idioms that work, and the shapes that look right and are rejected.
 
@@ -1614,6 +1614,7 @@ if count then ... end;                                        // WRONG: no truth
 var (a, b) := point;                                        // WRONG: destructuring is pattern-position only
 public method Log(params items: Array<string>);             // WRONG: no `params`
 var c := new Config() with(Timeout := 30);                  // WRONG: `with` needs a RECORD source
+var caller: (a: int, b: int) -> int := Sub;  caller(b := 2, a := 100);   // WRONG: a call through a FUNCTION VALUE admits no named argument (§27.1, v0.295)
 ```
 
 > §21.4/A.6: the loop is `for … in … do … end;`. A.7's `PrimarySuffix` admits `.`, `?.`, `[…]`, `(…)`, `?(…)`, `!`, `with(…)` — and no `?[`. §14.5: class/record/interface type arguments are never inferred; §15.4: a collection literal is well-typed only where a target type is supplied. §20: the conditional is a parenthesized atom. §17.6, §17.2: `++`/`--` and assignments are statements. §4.1: conditions are `bool`. §19.3, §27.4: destructuring lives in patterns and lambda parameters. §22.14: pass an `Array<T>` and write the literal at the call site. §9.5: `with` on a class-typed source is the retired object-initializer reading.
@@ -1629,6 +1630,7 @@ if count <> 0 then ... end;
 case point of Point(var a, var b) => Use(a, b) end;
 public method Log(items: Array<string>);     Log(["a", "b", "c"]);
 var c := new Config(timeout := 30, retries := 3);             // named constructor arguments
+var caller: (a: int, b: int) -> int := Sub;  caller(100, 2);              // a function type's names are documentation only; the call is positional
 ```
 
 Also absent, with the landed spelling beside it: `goto`/`break 2`/labels on non-loop statements → labeled loops (`scan: for … break scan;`); `let`/`val`/`readonly var` → `const x := e;`; `defer`/`errdefer` → `using var`, `finally`, `ScopeGuard`; `do…while`/`repeat…until` → `while` with a leading flag; local functions → a lambda bound to a local; attributes `[Obsolete]` → the closed clause vocabulary (`serialized`, `equality skip`, `when true`); `#if`/`#region` → runtime branching; `import M.{X}`/`import M.*`/`public import` → plain `import M;` (+ `as`); tuples, anonymous types, comprehensions, a value-form `(try E catch …)`, block expressions → a `record` (possibly method-local), the lazy operators, the `try` statement, and the binding atom `(var x := e; body)`; `x not in c` → `not (x in c)`; `not is` → `is not`; `default(SomeChoice)` → construct a case, or use `C?`; implicit/explicit conversion **operators** → named `To…`/`From…` methods; `operator ==` on a class → `=` always calls `Equals` (records, enums, and choices may overload); member hiding, `protected internal`, `default interface methods`, `ref` returns, class deconstruction — all rejected.
