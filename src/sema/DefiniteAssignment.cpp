@@ -2196,9 +2196,20 @@ private:
     // storage).
     void gateChainPositionFieldRead(const ast::Expr& e,
                                     const SourceLocation& loc) {
-        if (!ctorMode_ || !inChainingPosition_) return;
+        // fix #4066: gate this on `ctorMode_ || recordCtorMode_` (mirroring
+        // gateObservation, fix #4014) — §12.8 / §22.10's "any field or
+        // auto-property of the not-yet-constructed `this`" rule is independent
+        // of inheritance and reproduces on a record identically. Records have
+        // no primary-constructor parameter arm to worry about (§22.10 admits
+        // none on records either), so the rule itself is uniform; only the
+        // gate's activation and the declaring-type check below needed the
+        // parallel arm. Without this, `this(this.Field)` on a record compiles
+        // clean and SIGSEGVs at runtime (issue #4066's own repro).
+        if (!(ctorMode_ || recordCtorMode_) || !inChainingPosition_) return;
         if (auto* fs = dynamic_cast<FieldSymbol*>(ctx_.exprSymbol(e))) {
-            if (!fs->parent || fs->parent->kind != ast::TypeDeclKind::Class)
+            if (!fs->parent ||
+                (fs->parent->kind != ast::TypeDeclKind::Class &&
+                 fs->parent->kind != ast::TypeDeclKind::Record))
                 return;
             // §12.8: "the only reads a `base(...)`/`this(...)` argument may
             // make are of the constructor's own parameters, constants, and
@@ -2220,18 +2231,26 @@ private:
                     "arguments are evaluated, so the parameter has no value "
                     "here (§22.8 step 0, §22.10)");
             } else {
+                // fix #4066: "declaring type" — records also reach this branch
+                // (the gate's class-only check above is now widened). The
+                // phrasing mirrors the existing §12.8 / §22.10 wording exactly
+                // and is correct for both classes and records.
                 ctx_.diagnostics().report(
                     Severity::Error, loc,
                     std::string("cannot read field `") + std::string(fs->name) +
                     "` in the chaining position — a `this(...)`/`base(...)` "
-                    "argument runs before any field of the declaring class is "
+                    "argument runs before any field of the declaring type is "
                     "assigned, so the field has no value here (§12.8, §22.10)");
             }
             return;
         }
         if (auto* ps = dynamic_cast<PropertySymbol*>(ctx_.exprSymbol(e))) {
             if (ps->isIndexer || !isAutoPropertyStorageSymbol(ps, ctx_)) return;
-            if (!ps->parent || ps->parent->kind != ast::TypeDeclKind::Class)
+            // fix #4066: same parallel record arm as the FieldSymbol branch
+            // above — see the comment on the ctorMode_/recordCtorMode_ gate.
+            if (!ps->parent ||
+                (ps->parent->kind != ast::TypeDeclKind::Class &&
+                 ps->parent->kind != ast::TypeDeclKind::Record))
                 return;
             // §12.8 admits "the constructor's own parameters, constants, and
             // statics". A static auto-property is already excluded ABOVE, by
@@ -2246,12 +2265,14 @@ private:
             // behaviour so the guarantee survives either mechanism.
             for (auto mod : ps->modifiers)
                 if (mod == "static") return;
+            // fix #4066: "declaring type" — same rationale as the FieldSymbol
+            // branch above.
             ctx_.diagnostics().report(
                 Severity::Error, loc,
                 std::string("cannot read auto-property `") +
                 std::string(ps->name) +
                 "` in the chaining position — a `this(...)`/`base(...)` "
-                "argument runs before any field of the declaring class is "
+                "argument runs before any field of the declaring type is "
                 "assigned, so the auto-property's backing storage has no "
                 "value here (§12.8, §22.10)");
         }
