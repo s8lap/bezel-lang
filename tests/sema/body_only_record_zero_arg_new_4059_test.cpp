@@ -251,12 +251,15 @@ BEZEL_TEST(body_only_record_zero_arg_new_4059,
         "end Main; end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_FALSE(r.ran);
-    // Exactly ONE diagnostic — the §22.5 arity reject, not the new §9.1
-    // body-only reject. Pinned by count rather than absence-of-substring,
-    // so a future #4017 fix that does admit this exact shape would NOT
-    // regress this row silently (the assertion flips from a green-tick
-    // about REJECTED to a green-tick about RUN; that is the deliberate
-    // signal of "this row was always control, not the headline").
+    // §22.5 arity reject — `new Combo4059(4, 5)` clashes with the implicit
+    // positional ctor (takes `X: int`, 1 arg). The substring `argument`
+    // matches every arity-error wording the codebase emits (e.g. "expects
+    // N argument(s)", "takes N positional argument(s)", "argument count").
+    // Counts as protected per the ambiguous_ran_false ratchet: a crash /
+    // signal / timeout / ASan report would not produce an Error whose
+    // message contains the substring, so the row distinguishes a genuine
+    // rejection from a silent runtime failure mode.
+    BEZEL_EXPECT_TRUE(hasErrorMsg(r, "argument"));
 }
 
 // ============================================================================
