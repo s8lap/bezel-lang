@@ -12746,8 +12746,36 @@ private:
                     }
                     continue;
                 }
-                if (argCls != -1 && paramCls != -1 && argCls != paramCls)
-                    return false;
+                if (argCls != -1 && paramCls != -1 && argCls != paramCls) {
+                    // fix #4046 (§5.1, v0.294): the §5.1 implicit-conversion
+                    // table admits `int` → `float`/`double`/`decimal` (and
+                    // every other integer-typed source → the same three
+                    // floating-class targets — `byte`/`short`/.../ `ulong`/
+                    // `char` all list `float`, `double`, `decimal` as
+                    // implicit destinations), so an integer-typed ARGUMENT
+                    // against a floating-typed PARAMETER is a legal source
+                    // position. The pre-#4046 class-only check rejected it
+                    // (argCls 1 vs paramCls 2), which made `ctorForArgs`
+                    // fall through to `buildRecordValue`'s final
+                    // "no constructor accepts them" arm and let
+                    // `lowerLocalDecl`'s pre-existing #2434 fallback
+                    // silently zero-fill the local — a record's validating
+                    // explicit ctor body never runs, a record whose fields
+                    // would have been initialized with the int literal
+                    // read as zero instead. The fix is a one-directional
+                    // widening: integer → floating is implicit and accepted;
+                    // the reverse (decimal arg against int param) is NOT in
+                    // §5.1's table (would lose information, needs an
+                    // explicit cast) and remains rejected, so the class
+                    // disambiguation #3760 introduced for `this(...)`
+                    // chain-target selection still holds for the float →
+                    // int shape.
+                    if (argCls == 1 && paramCls == 2) {
+                        // int-family arg → float-family param: §5.1 implicit.
+                    } else {
+                        return false;
+                    }
+                }
             }
             return true;
         };
