@@ -2185,6 +2185,27 @@ void Emitter::emitAsyncLambda(const ast::LambdaExpr& lam, llvm::Function* fn,
             // retains >= releases on every path: a surplus retain leaks one
             // reference per resume, it can never over-release.
             if (paramSyms) retainAssignedStringParams(lam.stmts, *paramSyms);
+        } else {
+            // fix #4044 (§22.4 / §28.9 / §30.1 / §30.6, v0.295): the
+            // EXPRESSION-bodied async lambda arm — `Lam.exprBody` is a single
+            // `ast::Expr*` (no statement list to pin), so without these two
+            // pins `outVarStringReleaseEligible` (gate 4 of
+            // `registerOutVarStringRelease` and
+            // `registerCtorOutVarStringRelease`) bails before any verdict:
+            //   * gate 3 (`currentFn_ != stringReleaseEligibleFn_`) fails —
+            //     the recipient's scope-end release registration is therefore
+            //     never run, and the `n := s + "-tail"` producer reference
+            //     stored into the recipient's bare `entryAlloca` is never
+            //     decremented. Measured 20500 B / 1000 iterations on the
+            //     sibling test's SCOPE NOTE repro.
+            //   * gate 4 (the StringEscapeWalker) is short-circuited on the
+            //     null body pin and answers false — the leak-over-UAF safe
+            //     default.
+            // The pins are saved and restored around this call by lowerLambda
+            // (#2641 pattern), so an inner lambda's pin cannot leak back into
+            // the outer body that is building the closure.
+            stringReleaseEligibleFn_ = resumeFn;
+            stringReleaseAnalyzedExpr_ = lam.exprBody.get();
         }
         (void)paramSyms;  // params are restored via caps (paramSlots_) above
 

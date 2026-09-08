@@ -1280,6 +1280,13 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     // sets themselves, in the UAF direction rather than the leak direction.
     const std::vector<std::unique_ptr<ast::Stmt>>* savedStringReleaseBody =
         stringReleaseAnalyzedBody_;
+    // fix #4044 (§22.4 / §28.9 / §30.1 / §30.6, v0.295): same pattern as the
+    // body pin above, but for an EXPRESSION-bodied async lambda's expr pin —
+    // emitAsyncLambda's `lam.exprBody` arm sets
+    // `stringReleaseAnalyzedExpr_ = lam.exprBody.get()`, and without this
+    // restore the enclosing body's later inline `out var` recipients would be
+    // escape-walked against the LAMBDA's expression body (the wrong scope).
+    const ast::Expr* savedStringReleaseAnalyzedExpr = stringReleaseAnalyzedExpr_;
 
     // §27.5: the set of outer locals/params the body references.
     std::unordered_set<const sema::Symbol*> capturedSyms;
@@ -3056,6 +3063,7 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         std::move(savedValueLikeChoiceStrReleaseEligible);
     stringReleaseEligibleFn_ = savedStringReleaseEligibleFn;
     stringReleaseAnalyzedBody_ = savedStringReleaseBody;   // fix #2641
+    stringReleaseAnalyzedExpr_ = savedStringReleaseAnalyzedExpr;  // fix #4044
     currentReturnTypeNode_ = savedCurrentReturnTypeNode;  // #2515
     currentLambdaReturnSemaTy_ = savedLambdaRetSemaTy;    // fix #2688
     lambdaParamTypeHint_ = std::move(savedLambdaParamHints);

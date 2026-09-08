@@ -13821,6 +13821,17 @@ private:
     // that helper answer false — the leak-over-UAF default.
     const std::vector<std::unique_ptr<ast::Stmt>>* stringReleaseAnalyzedBody_ =
         nullptr;
+    // fix #4044 / §22.4 / §22.3 / §28.9 / §30.1 / §30.6: sibling field for an
+    // EXPRESSION-bodied async lambda — `Lam.exprBody` is a single `ast::Expr*`,
+    // not a `std::vector<std::unique_ptr<ast::Stmt>>`, so the statement-list
+    // pointer above cannot name it. `emitAsyncLambda` pins `lam.exprBody.get()`
+    // here at the same moment it pins `stringReleaseEligibleFn_ = resumeFn`,
+    // and `outVarStringReleaseEligible` prefers THIS field over the body pin
+    // when both are set (the outer Main body pin would walk the LambdaExpr with
+    // `inLambda = true` and flag every `nm.Length` safe-read as escaped — the
+    // exact leak this fix closes). When neither is set the helper bails (the
+    // pre-existing, safe default). per §28.9, §30.1, §30.6 (v0.295)
+    const ast::Expr* stringReleaseAnalyzedExpr_ = nullptr;
     // fix #2641 / §22.4 / §22.3 / §28.9: is the inline `out var` recipient
     // introduced at `id` provably NON-ESCAPING within the analyzed body, so its
     // copied-out +1 may be released at scope end? Runs the SAME StringEscapeWalker

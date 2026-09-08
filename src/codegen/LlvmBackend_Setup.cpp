@@ -26827,16 +26827,33 @@ void Emitter::collectStringReleaseEligible(
 // the ANSWER must stay identical as those relaxations evolve, so this must not
 // grow a private variant of them.
 bool Emitter::outVarStringReleaseEligible(const ast::IdentifierExpr* id) {
-    if (!id || !stringReleaseAnalyzedBody_) return false;
+    if (!id) return false;
+    // fix #4044 (§22.4 / §28.9 / §30.1 / §30.6, v0.295): a pinned
+    // `stringReleaseAnalyzedExpr_` wins over the body pin — when both are set
+    // (an async lambda body nested inside Main's `for` loop, which IS the
+    // shape the regression tests use), the body pin names Main's statement
+    // list, whose walk would descend into the LambdaExpr and re-walk
+    // `exprBody` with `inLambda = true`, flagging every `nm.Length` safe-read
+    // (whose `nm` shares its LocalSymbol with the intro site, so isTargetIdent
+    // answers true) as escaped. The conservative-safe direction, but the exact
+    // leak this fix is closing: a leak-over-UAF safe verdict that registers
+    // NO release for a recipient whose `entryAlloca` holds the producer's +1.
+    // The expr pin walks the expression body directly with `inLambda` still
+    // false, so the recipient's `nm.Length` reads are correctly non-escaping.
+    if (!stringReleaseAnalyzedBody_ && !stringReleaseAnalyzedExpr_) return false;
     StringEscapeWalker w{ctx_, static_cast<const void*>(id)};
     w.stringReleaseMode = true;      // #1997
     w.scrutineeBorrowMode = true;    // fix #2481
     w.borrowRetainedAliases = &stringBorrowAll_;          // fix #2764
     w.objectStringBorrowAliases = &objectStringBorrowAll_;  // fix #2900
     w.outVarIntroSite = static_cast<const void*>(id);
-    for (auto& s : *stringReleaseAnalyzedBody_) {
-        w.stmt(s.get());
-        if (w.escaped) break;
+    if (stringReleaseAnalyzedExpr_) {
+        w.expr(stringReleaseAnalyzedExpr_, /*safeRead=*/false);
+    } else {
+        for (auto& s : *stringReleaseAnalyzedBody_) {
+            w.stmt(s.get());
+            if (w.escaped) break;
+        }
     }
     return !w.escaped;
 }
