@@ -2893,6 +2893,35 @@ static std::string buildSyntheticMethodSource(const MetaTypeDecl& td,
         for (const std::string& mod : mm.modifiers) src += " " + mod;
         src += " " + mm.name + " : " + metaTypeToSourceText(mm.type) + ";\n";
     }
+    // fix #3994 (§14.1 / §2.5, v0.295): include PROPERTY declarations too, so
+    // a method body that names an auto-property (`public method IsVNull():
+    // bool => V = null;` over a `record Box<T>(public readonly property V:
+    // T)`) resolves `V` in the fresh context. Without this, `V` is an
+    // unresolved identifier — the §14.1/#783 soundness gate rejects the body
+    // (`semaDiag->hasErrors()` true), `ms->decl` stays null, and codegen's
+    // `emitInlineGenericMethod` / `buildSpecializedMethodFn` cannot monomorphize
+    // the body per instantiation. The importer falls back to the library's
+    // `bz$<Type>$M`, which was compiled against the unspecialized `%record.Box =
+    // { i32 }` layout with T → i32 placeholder, so the `V = null` comparison
+    // reads 4 bytes as i32 (the library's view) from 8 bytes of ptr storage (the
+    // importer's spec0 view) — exit 1 instead of 9. Mirror the ctor-body source
+    // (`buildSyntheticClassSource`, the same wire bit #2478 reads on the
+    // importer side) and emit `public [readonly] property NAME: TYPE;` per
+    // MetaMember of kind Property, exactly the cross-module auto-property stub
+    // (the bare declaration is enough — the body is a self-call forward, never
+    // reads property accessors; if it did, the same #710/#2290 sibling
+    // re-parse failure the ctor-body comment notes would surface, but bodies
+    // that name only own members like `=> V = null` sema-clean here).
+    for (const MetaMember& mm : td.members) {
+        if (mm.kind != MetaMemberKind::Property) continue;
+        if (mm.type == MetaType{}) continue;
+        src += "  " + metaVisibilityToKeyword(mm.visibility);
+        for (const std::string& mod : mm.modifiers) src += " " + mod;
+        src += " property " + mm.name + " : " + metaTypeToSourceText(mm.type);
+        if (!mm.valueText.empty())
+            src += " := " + mm.valueText;
+        src += ";\n";
+    }
     // fix #3226 (§25 / §14.1, v0.254): the operator body for our record-return
     // case constructs a new Vec3226<T> with named-arg syntax
     // (`new Vec3226<T>(a := x.a, b := y.b)`). The synthetic class carries fields
@@ -2999,7 +3028,9 @@ static bool parseAndAttachMethodBody(
     Lexer freshLex(source, freshDiag);
     Parser freshParser(freshLex, freshDiag);
     auto sf = freshParser.parseCompilationUnit();
-    if (!sf || freshDiag.hasErrors()) return false;
+    if (!sf || freshDiag.hasErrors()) {
+      return false;
+    }
 
     // §14.1 / #783: the fresh context AND its diagnostics must OUTLIVE this
     // function — codegen monomorphizes the body per instantiation and queries
@@ -3123,6 +3154,39 @@ static bool parseAndAttachMethodBody(
         }
     }
 
+    // fix #3994 (§9.2 / §2.5, v0.295): a method body that names an auto-property
+    // of `this` (`=> V = null` over `public readonly property V: T`) parses
+    // against the SYNTHETIC TypeSymbol the body source declares. The fresh
+    // PropertySymbol is distinct from the IMPORTED PropertySymbol, so without a
+    // remap codegen's `storageMemberOf` accepts the fresh symbol (its freshly-
+    // parsed PropertyDecl has bodyKind == Auto → `isAutoPropertyStorageSymbol`
+    // true) but `fieldIndex_` is keyed on the imported symbol and the fresh
+    // symbol is absent. The body's `V` IdentifierExpr lowers to null, the
+    // surrounding `V = null` BinaryExpr lowers to null, the whole method
+    // body lowers to null, and the call falls through to a no-op stub — exit
+    // 1 instead of the expected 9. Mirrors the ctor-body auto-property remap
+    // at line 2163 (which #3207 added for the ctor path) and reads the same
+    // `mm.isAutoProperty` wire bit #2478 publishes (the importer-only context
+    // side-table isn't populated yet at this mid-pass point, so the wire bit
+    // is the load-bearing source). Gated on `isAutoProperty` because a
+    // COMPUTED property's fresh decl carries accessor bodies the inlined
+    // getter/setter path relies on; those bodies cannot be re-parsed
+    // faithfully in the single-type synthetic context (#710/#2290), exactly
+    // the predicate #2478 already ships.
+    std::unordered_map<std::string_view, sema::Symbol*> importedAutoPropStorage;
+    {
+        std::size_t importedIdx = 0;
+        for (const MetaMember& mmItem : td.members) {
+            if (mmItem.kind != MetaMemberKind::Property) continue;
+            if (importedIdx >= importedType.members.size()) break;
+            sema::Symbol* sym = importedType.members[importedIdx++];
+            auto* ps = dynamic_cast<sema::PropertySymbol*>(sym);
+            if (!ps || ps->isIndexer || sym->name.empty()) continue;
+            if (mmItem.isAutoProperty)
+                importedAutoPropStorage[sym->name] = sym;
+        }
+    }
+
     // Param remap: the target method's own parameters (by position).
     const std::vector<sema::Symbol*>& importedParams = importedMs->params;
 
@@ -3144,6 +3208,17 @@ static bool parseAndAttachMethodBody(
         if (dynamic_cast<sema::FieldSymbol*>(freshSym)) {
             auto it = importedFields.find(freshSym->name);
             if (it != importedFields.end())
+                mainCtx.setExprSymbol(expr, it->second);
+        } else if (auto* freshPs = dynamic_cast<sema::PropertySymbol*>(freshSym)) {
+            // fix #3994 (§9.2 / §2.5, v0.295): remap an auto-property
+            // reference inside the re-parsed method body to the IMPORTED
+            // PropertySymbol — see the importedAutoPropStorage map built
+            // above for why the fresh-vs-imported symbol split is the load-
+            // bearing difference (storageMemberOf would otherwise key on the
+            // synthetic self-type whose struct is never built and whose
+            // fieldIndex_ entry does not exist).
+            auto it = importedAutoPropStorage.find(freshPs->name);
+            if (it != importedAutoPropStorage.end())
                 mainCtx.setExprSymbol(expr, it->second);
         } else if (dynamic_cast<sema::ParameterSymbol*>(freshSym)) {
             // fix #2839: a LAMBDA parameter is not the enclosing method's — it
