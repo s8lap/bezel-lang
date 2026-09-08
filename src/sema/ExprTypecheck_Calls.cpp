@@ -12856,15 +12856,15 @@ bool ExprTC::recordAllowsZeroArgNew(const TypeSymbol& t) {
                 // SEAM-DEBT: #4059 — guarded by `if (t.decl)`; local-AST
                 // record path. Imported records route to the side-table
                 // branch below.
-                hasBodyFieldOrProperty = true;
                 if (auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl))
                     if (fd->initializer) return true;  // init wins
+                hasBodyFieldOrProperty = true;
             } else if (auto* ps = dynamic_cast<const PropertySymbol*>(m)) {
                 if (ps->isIndexer) continue;
                 // SEAM-DEBT: #4059 — same local-AST guard as `fs->decl`.
-                hasBodyFieldOrProperty = true;
                 if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl))
                     if (pd->autoInitializer) return true;  // init wins
+                hasBodyFieldOrProperty = true;
             }
         }
         // No body fields/properties at all (methods-only body or
