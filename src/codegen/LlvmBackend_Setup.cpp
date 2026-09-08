@@ -18965,6 +18965,51 @@ const sema::TypeSymbol* Emitter::unwindOwnedLocalClass(const ast::LocalDecl* ld)
                 return reinterpret_cast<const sema::TypeSymbol*>(1);
             }
         }
+        // fix #3968 (§28.3 / §28.11 / §28.8.1, v0.295): a plain
+        // `var y := move x;` — the SOURCE is a plain identifier (a plain owned
+        // local, NOT a collection index slot as in (a-move) above), and y now
+        // SOLELY owns the value. Sema's ownership pass ALREADY classifies `y`
+        // Owned on this shape (Ownership.cpp's `move <class/interface>`
+        // generic rule — the same rule that admits the move at all), so the
+        // §28.3 dispose obligation is on `y`'s slot, not on `x`'s. Without
+        // this arm, `unwindOwnedLocalClass(ld)` returned null: an explicit
+        // `y.Dispose()` then fell out of explicitDisposeOwnedReceiverSlot's
+        // slot-reclaim arm (none of `isUsing` / (a)/(a-move) / out-owned /
+        // etc. matched) AND out of `isFreshOwnedClassProducer(y)` (y is an
+        // IdentifierExpr, not a NewExpr/CallExpr), landing on the bare
+        // `emitDynamicDispose(recv)` path — the destructor ran, but the heap
+        // block was NEVER reclaimed (the #3968 finding: 7984 B / 499
+        // allocations at 500 iterations, byte-identical before and after
+        // #3950). The scope-end auto-drop path was unaffected: it routes
+        // through `registerUsingDisposal` keyed on the TYPE and reclaimed
+        // correctly, which is precisely why the leak surfaced only on the
+        // explicit-Dispose arm and stayed invisible to one-shot LSan.
+        //
+        // Mirror (a-move)'s structure exactly: classify the result as a class/
+        // interface, return the concrete class symbol when its disposer is
+        // known (so `disposerFns_` finds it in `emitDisposals`), else a
+        // sentinel that drives dynamic dispatch. Sema rejects `move` of a
+        // borrowing/non-owned source (`b` is not allowed to be `move`d unless
+        // it is itself an owned slot), so the source-side ownership test is
+        // already done upstream and we don't need to re-verify it here. The
+        // affine AUTO-DROP variant (no explicit discharge,
+        // ld->autoDropAtScopeEnd) is unaffected — that path is keyed on the
+        // TYPE through registerUsingDisposal and was already leak-free
+        // (which is exactly why explicit Dispose leaked while the loop body
+        // itself, with no explicit Dispose, was clean). // per §28.3, §28.11
+        if (ue->op == "move" && ue->operand &&
+            dynamic_cast<const ast::IdentifierExpr*>(ue->operand.get())) {
+            const sema::TypeRef* initTy = ctx_.exprType(*ld->initializer);
+            if (isClassOrInterfaceRef(initTy) ||
+                isClassOrInterfaceRef(resolveTypeParamRef(initTy))) {
+                if (initTy && initTy->kind == sema::TypeRef::Kind::Named &&
+                    initTy->declaration &&
+                    initTy->declaration->kind == ast::TypeDeclKind::Class &&
+                    disposerFns_.find(initTy->declaration) != disposerFns_.end())
+                    return initTy->declaration;
+                return reinterpret_cast<const sema::TypeSymbol*>(1);
+            }
+        }
     }
     // (a) `new ClassType(...)` — an owned class instance.
     if (auto* ne = dynamic_cast<const ast::NewExpr*>(ld->initializer.get())) {
