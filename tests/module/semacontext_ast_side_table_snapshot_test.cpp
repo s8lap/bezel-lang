@@ -141,6 +141,29 @@ const Entry kAstKeyedTables[] = {
      "never runs on freshCtx). If that conservative skip is ever tightened, "
      "or `checkPureBodies` is ever extended to run per-instantiation, this "
      "table's disposition must be re-examined together with it."},
+    {"indexerSubstitutedParamTypes_",
+     "NOT carried, and INERT for the same reason as `stmtOperatorSymbols_` "
+     "above: a fresh-context reparse populates the table (fix #4084's "
+     "write site is `ExprTC::checkIndexArgNullability`'s "
+     "`declaredIndexParam` lambda, called from `typecheckExpressions`, "
+     "which every ModuleLoader `parseAndAttach*` body invokes against "
+     "`freshCtx` — §28.3/§23.4/§14.1, v0.294) but the sole consumer, "
+     "`Ownership::recordCallArgDirectLambdaTargetsFromIndexer` "
+     "(Ownership_Checks.cpp, fix #4075 widening for #4084's generic-"
+     "instantiation case), is reached only from `Ownership::checkOwnership` "
+     "(Ownership.cpp), which runs against the driver's own top-level "
+     "`SemaContext` for the SourceFile being compiled (0 occurrences of "
+     "`checkOwnership` in ModuleLoader.cpp — the same topology as "
+     "`stmtOperatorSymbols_`'s `checkPureBodies`). A re-parsed dependency "
+     "body's `freshCtx` entry is therefore structurally never read: "
+     "disposal-tracked lambda targets on a generic-indexer call are "
+     "verified exactly once, when the DEPENDENCY's own declaring module "
+     "is compiled as the root. Pre-#4084 the read used a per-call "
+     "raw-resolve fallback (the `substituteMemberType(p, ix.target.get(), "
+     "ps->parent)` chain #4084 calls at the same site in the typecheck "
+     "path) that closed #4075's defect for non-generic indexers; #4084's "
+     "side-table just lifts the generic case onto the same machinery "
+     "without changing the topology."},
 };
 
 // Every member name declared as `std::unordered_map<const ast::…> name_;`,
