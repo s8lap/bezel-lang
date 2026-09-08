@@ -10862,6 +10862,75 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
             if (np->name && !np->name->parts.empty() && scrutTy->declaration &&
                 np->name->parts.back() == scrutTy->declaration->name)
                 return hasVal;
+            // fix #4083 / §19.3 / §19.5 / §27.8 (v0.294): a `type` alias
+            // whose underlying type is a NULLABLE primitive (`type X :=
+            // int?;`), used in a bare NamedPattern position on a
+            // nullable-VALUE scrutinee, is the NamedPattern-path twin of
+            // the `TypePattern` "case x of int? => …" handled at L11115 —
+            // both names resolve to the SAME nullable primitive, so the
+            // test reduces to `hasVal` exactly when the value is present
+            // (§19.5 "matches only non-null values"). The sibling shared
+            // helper `sema::resolveAliasToTypeSymbol` rejects non-`Named`
+            // `TypeRef::Kind`s (function, primitive, InlineArray, …), so
+            // this site has its OWN nullable-primitive-aware lookup.
+            // Without this arm the alias name fell through to the `return
+            // nullptr` below — basic block unterminated, the LLVM IR
+            // verifier crashed ("Basic Block … does not have terminator" +
+            // the #2491 backstop; pre-existing on `eae547e`, NOT a #4076
+            // regression — #4076's new arm correctly returns null/continue
+            // for a non-`Named` `resolveAliasToTypeSymbol` result). For an
+            // alias whose underlying kind is anything ELSE (function type,
+            // non-matching primitive, primitive array, …), the same
+            // #4083 root cause means we must NOT propagate `nullptr` either
+            // — mirror the single-member NamedPattern #1847 backstop: emit
+            // the §19.3 diagnostic once per arm and OR a never-match
+            // (`getInt1(false)`) into the case so `case.end` stays
+            // terminated and the rest of the arm chain still emits
+            // correctly (the same shape the #2227 alt-list fix uses for
+            // the adjacent type-mismatch case, but for a member that does
+            // not lower at all rather than one that lowers to a mismatched
+            // type). Without an alias at all, fall through to the existing
+            // `return nullptr` — no shape in scope today reaches it through
+            // this isNullableVal branch besides a bare NAMED-PRIMITIVE-
+            // pattern match this branch already handled above, so the
+            // remaining `nullptr` is genuinely-deferred here.
+            if (np->name && !np->name->parts.empty() &&
+                scrutTy->kind == sema::TypeRef::Kind::Primitive &&
+                scrutTy->nullable &&
+                scrutTy->primitive != sema::PrimitiveType::None) {
+                const sema::TypeAliasSymbol* aliasSym = nullptr;
+                for (const auto& sym : ctx_.symbols()) {
+                    auto* as = dynamic_cast<const sema::TypeAliasSymbol*>(
+                        sym.get());
+                    if (as && as->name == np->name->parts.back()) {
+                        aliasSym = as;
+                        break;
+                    }
+                }
+                if (aliasSym) {
+                    auto* aliasDecl =
+                        dynamic_cast<const ast::TypeAlias*>(aliasSym->decl);
+                    const sema::TypeRef* underlying =
+                        (aliasDecl && aliasDecl->aliasedType)
+                            ? ctx_.resolvedType(*aliasDecl->aliasedType)
+                            : nullptr;
+                    if (underlying &&
+                        underlying->kind ==
+                            sema::TypeRef::Kind::Primitive &&
+                        underlying->nullable &&
+                        underlying->primitive == scrutTy->primitive) {
+                        return hasVal;  // matching nullable-primitive alias
+                    }
+                    ctx_.diagnostics().report(
+                        Severity::Error, np->span.begin,
+                        "the `case`/`when` pattern `" +
+                        std::string(np->name->parts.back()) +
+                        "` is not supported by the backend: it did not "
+                        "resolve to a type, enum constant, or named "
+                        "constant to match against (\xC2\xA7""19.3)");
+                    return builder_.getInt1(false);
+                }
+            }
             return nullptr;  // type-test pattern deferred
         }
 
@@ -10900,7 +10969,49 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
                 llvm::Value* cv = litAtWidth(*c, innerVal->getType());  // #836
                 if (!cv) cv = reconcile(lowerExpr(*c), innerVal->getType());
                 if (!cv) cv = enumConstantOfPatternExpr(*c, enumTy);
-                if (!cv) return nullptr;
+                // fix #4062 / §19.3 / §19.5 (v0.294): a ConstantPattern
+                // member that fails to lower to any LLVM value at all.
+                // Sema's `ExprTC::altPartsNameType` classifies a `|`
+                // alternative-list member as a "constant" if it does NOT
+                // resolve to a user TypeSymbol (a function-type alias, an
+                // unbound extension-method reference, a primitive alias,
+                // …) and `checkAltMembersConstant` lets it through to
+                // codegen — codegen then has no value to lower for it.
+                // The pre-fix `if (!cv) return nullptr;` propagated out of
+                // `patternMatches` and left `case.end` unterminated — the
+                // LLVM IR verifier crashed with "Basic Block … does not
+                // have terminator" + the #2491 backstop (measured crash
+                // signature IDENTICAL to #4048's own original repro for
+                // the alias-of-class case; #4048 closed that one at sema
+                // for `TypeAliasSymbol`-of-Named, this codegen site
+                // survives because `resolveAliasToTypeSymbol`'s null-is-
+                // not-a-Type contract — §27.8 + the #4048 doc comment —
+                // means any alias whose underlying kind is Function,
+                // Primitive, or InlineArray falls through into this
+                // unguarded path). Mirror the single-member NamedPattern
+                // #1847 backstop diagnostic AND the #2227 alt-list "OR a
+                // never-match `false` into `any`" pattern: emit the §19.3
+                // diagnostic ONCE per arm (first bad member only — keeps
+                // compiler output clean when several bad members share a
+                // pattern; same fire-at-most-once discipline #2227 uses)
+                // and `continue` so the rest of the arm's other `|`
+                // members still participate in `any`. The IR remains
+                // well-formed; the wildcard arm or a later genuine member
+                // selects the case. Closing this codegen hole kills the
+                // WHOLE crash-class, not one symbol-kind at a time as
+                // #4048's sema-side fix did.
+                if (!cv) {
+                    if (!cp->constants.empty() &&
+                        c.get() == cp->constants.front().get())
+                        ctx_.diagnostics().report(
+                            Severity::Error, c->span.begin,
+                            "a `|`-alternative member could not be "
+                            "lowered to a value to match against the "
+                            "scrutinee — the case pattern did not "
+                            "resolve to a constant in scope "
+                            "(\xC2\xA7""19.3)");
+                    continue;
+                }
                 llvm::Value* eq = emitEquals(innerVal, cv, /*isStr=*/false);
                 llvm::Value* match = builder_.CreateAnd(hasVal, eq, "nv.val.match");
                 any = builder_.CreateOr(any, match);
@@ -11482,7 +11593,36 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
             // no resolved symbol on the pattern expression, so lowerExpr
             // misses; resolve it by name against the scrutinee's enum.
             if (!cv) cv = enumConstantOfPatternExpr(*c, enumTy);
-            if (!cv) return nullptr;
+            // fix #4062 / §19.3 / §19.5 (v0.294): sibling of the
+            // nullable-value-scrutinee ConstantPattern guard directly
+            // above (isNullableVal branch): a ConstantPattern member that
+            // fails to lower to any LLVM value at all — same root cause
+            // (sema's `altPartsNameType` lets a member that does NOT
+            // resolve to a user TypeSymbol through to codegen, codegen
+            // has no value to lower for it). The pre-fix `if (!cv)
+            // return nullptr;` propagated out of `patternMatches` and
+            // left `case.end` unterminated — the LLVM IR verifier
+            // crashed with "Basic Block … does not have terminator" + the
+            // #2491 backstop. Mirror the single-member NamedPattern
+            // #1847 backstop diagnostic AND the #2227 alt-list "OR a
+            // never-match `false` into `any`" pattern: emit the §19.3
+            // diagnostic ONCE per arm and `continue` so the rest of the
+            // arm's other `|` members still participate in `any`. Closing
+            // this codegen hole at both `if (!cv) return nullptr;` sites
+            // kills the WHOLE crash-class, not one symbol-kind at a time
+            // as the parallel sema-side fix enumeration family (#4038,
+            // #4048, #4050, #4051, #4052) does.
+            if (!cv) {
+                if (!cp->constants.empty() &&
+                    c.get() == cp->constants.front().get())
+                    ctx_.diagnostics().report(
+                        Severity::Error, c->span.begin,
+                        "a `|`-alternative member could not be lowered "
+                        "to a value to match against the scrutinee — "
+                        "the case pattern did not resolve to a constant "
+                        "in scope (\xC2\xA7""19.3)");
+                continue;
+            }
             // #836: reconcile a non-literal constant's width to the scrutinee
             // (no-op for string / enum / already-matching types).
             if (!isStr) cv = reconcile(cv, scrut->getType());
