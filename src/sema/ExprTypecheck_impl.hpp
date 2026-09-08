@@ -2500,14 +2500,21 @@ private:
     // is deferred, so skip.
     void checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t);
 
-    // narrow #4059 (§9.1 / §9.2, v0.295): true iff the body record has at
-    // least one body field or auto-property with an `:=` initializer.
-    // Local records read the AST decl; imported records ask the wire side
-    // table (`importedInstanceFieldInitText`). Drives the four-way gate
-    // that distinguishes the silent-zero-fill defect shape from every
-    // legitimate §9.1/§9.2 memberwise-construction path. Defined in
-    // ExprTypecheck_Calls.cpp.
-    bool recordHasFieldOrPropertyInit(const TypeSymbol& t);
+    // narrow #4059 further (§9.1 / §9.2 / §9.5, v0.295): true iff
+    // `new T()` is permitted on this body record (i.e. NOT the
+    // silent-zero-fill defect shape). Returns true when the record
+    // (a) has at least one body field/auto-property WITH an `:=`
+    // initializer — the field-init text IS the construction (§9.1), or
+    // (b) has NO body fields or auto-properties at all (methods-only
+    // body or literally-empty body — nothing to silently zero-fill).
+    // Returns false only when the body record has at least one body
+    // field/auto-property AND NONE of them carry an initializer — the
+    // exact shape of the #4059 silent-zero-fill defect. Local records
+    // read the AST decl (`FieldDecl::initializer` /
+    // `PropertyDecl::autoInitializer`); imported records ask the wire
+    // side table (`importedInstanceFieldInitText`,
+    // `importedConstValue`). Defined in ExprTypecheck_Calls.cpp.
+    bool recordAllowsZeroArgNew(const TypeSymbol& t);
 
     // fix #3141 (family F3 of umbrella #3152) — §9.1 / §22.5 / §5.1 / §2.8.3
     // rule 4: the positional-record arm of checkNewExprArgs for a record whose

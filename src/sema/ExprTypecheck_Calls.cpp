@@ -12822,34 +12822,56 @@ void ExprTC::checkArgsAgainstParams(
     }
 }
 
-// narrow #4059 (§9.1 / §9.2, v0.295): true iff the body record has at
-// least one body field (`x: int := 5;`) or auto-property
-// (`public property X: int := 5;`) with an `:=` initializer — the §9.1
-// memberwise path the silent-zero-fill rejection is trying to defend
-// against. For a LOCAL record the AST `FieldDecl::initializer` /
+// narrow #4059 further (§9.1 / §9.2 / §9.5, v0.295): true iff `new T()` is
+// permitted on this body record. The original #4059 fix measured a
+// SILENT ZERO-FILL defect on a body record that had body fields or
+// auto-properties WITHOUT `:=` initializers and no other supplying
+// channel (no memberwise args, no with-clause). The defect shape is
+// *body fields/properties without initializers*: every body field is
+// zero-filled, the user observes a value that no constructor produced,
+// and the compiler silently let it through. We REJECT only when the
+// record has at least one body field/auto-property AND NONE of them
+// carry an `:=` initializer — the silent-zero-fill defect shape.
+//
+// All other shapes admit `new T()`:
+//   * record has at least one body field/auto-property WITH an
+//     initializer — the field-init text IS the construction (§9.1)
+//   * record has NO body fields or auto-properties at all — methods-
+//     only bodies and literally-empty bodies have nothing to silently
+//     zero-fill, so `new T()` is harmless (every observable value is
+//     determined by the type, not a hidden zero-fill)
+//
+// For a LOCAL record the AST `FieldDecl::initializer` /
 // `PropertyDecl::autoInitializer` are authoritative. For an IMPORTED
 // record (decl is null) the wire metadata carries the field-init text
 // on the per-member side-table (`importedInstanceFieldInitText`) for
 // any field or auto-property that crossed the boundary with a `:=`
-// initializer; absence means no init. Returns false for an IMPORTED
-// record with no field inits (the headline #4059 defect shape) and
-// true for one WITH field inits.
-bool ExprTC::recordHasFieldOrPropertyInit(const TypeSymbol& t) {
+// initializer; absence means no init. The local and imported paths
+// share the boolean contract.
+bool ExprTC::recordAllowsZeroArgNew(const TypeSymbol& t) {
+    bool hasBodyFieldOrProperty = false;
     if (t.decl) {
         for (const Symbol* m : t.members) {
             if (auto* fs = dynamic_cast<const FieldSymbol*>(m)) {
                 // SEAM-DEBT: #4059 — guarded by `if (t.decl)`; local-AST
                 // record path. Imported records route to the side-table
                 // branch below.
+                hasBodyFieldOrProperty = true;
                 if (auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl))
-                    if (fd->initializer) return true;
+                    if (fd->initializer) return true;  // init wins
             } else if (auto* ps = dynamic_cast<const PropertySymbol*>(m)) {
                 if (ps->isIndexer) continue;
                 // SEAM-DEBT: #4059 — same local-AST guard as `fs->decl`.
+                hasBodyFieldOrProperty = true;
                 if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl))
-                    if (pd->autoInitializer) return true;
+                    if (pd->autoInitializer) return true;  // init wins
             }
         }
+        // No body fields/properties at all (methods-only body or
+        // literally-empty body) — nothing to silently zero-fill.
+        if (!hasBodyFieldOrProperty) return true;
+        // Body fields/properties exist, but NONE have an `:=`
+        // initializer — the headline silent-zero-fill defect shape.
         return false;
     }
     // Imported record: ask the wire side-table. Either an instance-field
@@ -12863,11 +12885,14 @@ bool ExprTC::recordHasFieldOrPropertyInit(const TypeSymbol& t) {
     for (const Symbol* m : t.members) {
         if (dynamic_cast<const FieldSymbol*>(m) ||
             dynamic_cast<const PropertySymbol*>(m)) {
+            hasBodyFieldOrProperty = true;
             if (ctx_.importedInstanceFieldInitText(m) != nullptr) return true;
             if (ctx_.importedConstValue(m) != nullptr) return true;
         }
     }
-    return false;
+    // Same logic as the local path: imported methods-only or empty
+    // record → allow; imported body record with no field inits → reject.
+    return !hasBodyFieldOrProperty;
 }
 
 // Slice T7 / §22.6: check `new T(args)` against T's constructors. Zero
@@ -13432,22 +13457,22 @@ void ExprTC::checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t) {
         //   * `ctors.empty()` (no declared instance ctor — already checked)
         //   * `ne.args.empty()` (no positional / named memberwise args)
         //   * `!inWithExprSource_` (no `with(...)` construction form, §9.5)
-        //   * NO field/property initializers on the body record (`x: int := 5`
-        //     or `public property X: int := 5`) — otherwise the field
-        //     initializers themselves supply every value, no implicit-default
-        //     zero-fill can occur.
+        //   * the body record has body fields/properties WITHOUT initializers
+        //     (the `recordAllowsZeroArgNew` predicate returns false ONLY for
+        //     the silent-zero-fill defect shape — body fields/properties with
+        //     no `:=` inits and no methods to construct via)
         // Each alternative is a legitimate §9.1/§9.2 memberwise-construction
         // path that pre-fix code relied on: positional/named args, a `with`
-        // clause, or field initializers on the body. The original #4059 fix
-        // over-rejected all four paths; this narrow re-tightens to the exact
-        // shape the silent-zero-fill repro requires (the T1 row's
-        // `record Foo { public property Bar: int; } end Foo; var f := new Foo();`
-        // producing `Bar=0` rather than a compile error). The implicit-
-        // default premise is the right rule for a CLASS (§22.7) but, for a
-        // body-only record, the implicit default is only WRONG when nothing
-        // else is supplying values — anything else IS the construction.
+        // clause, or field initializers on the body. The narrow further-fix
+        // (`recordAllowsZeroArgNew`) adds one more allow: a record with NO
+        // body fields/properties at all (methods-only body or literally-empty
+        // body) — there is nothing to silently zero-fill, so `new T()` is
+        // harmless. The implicit-default premise is the right rule for a
+        // CLASS (§22.7) but, for a body-only record, the implicit default is
+        // only WRONG when nothing else is supplying values — anything else IS
+        // the construction.
         if (t->kind == ast::TypeDeclKind::Record && !inWithExprSource_ &&
-            ne.args.empty() && !recordHasFieldOrPropertyInit(*t)) {
+            ne.args.empty() && !recordAllowsZeroArgNew(*t)) {
             ctx_.diagnostics().report(
                 Severity::Error, ne.span.begin,
                 std::string("`new ") + std::string(t->name) +
@@ -13806,19 +13831,20 @@ void ExprTC::checkImportedNewExprArgs(
         //
         // narrow #4059 (§9.1 / §9.2, v0.295): the local twin's stricter
         // four-condition gate (also requires `ne.args.empty()` AND no
-        // field/property initializers) DOES apply here — `recordHasFieldOr
-        // PropertyInit` consults the wire side-table
-        // (`importedInstanceFieldInitText`) for imported members, so an
-        // imported body-only record WITH field initializers (the gate-
-        // failing `xmod_record_body_field_init_replay_2467` shape) is
-        // accepted at zero-arg construction; an imported body-only record
-        // WITHOUT field initializers (the T4 negative control) is still
-        // rejected with the same diagnostic. For records WITH
-        // positional/named args (the memberwise path), the §22.7 arity
-        // check below is also gated on `kind != Record` (same rationale
-        // as the local twin).
+        // field/property initializers) DOES apply here — `recordAllowsZeroArgNew`
+        // consults the wire side-table (`importedInstanceFieldInitText`) for
+        // imported members, so an imported body-only record WITH field
+        // initializers (the gate-failing `xmod_record_body_field_init_replay_2467`
+        // shape) is accepted at zero-arg construction; an imported body-only
+        // record WITHOUT field initializers (the T4 negative control) is
+        // still rejected with the same diagnostic. The further-narrow adds
+        // the methods-only / empty-body allow: an imported record with NO
+        // body fields/properties (only methods, or nothing) admits zero-arg
+        // construction too. For records WITH positional/named args (the
+        // memberwise path), the §22.7 arity check below is also gated on
+        // `kind != Record` (same rationale as the local twin).
         if (t->kind == ast::TypeDeclKind::Record && !inWithExprSource_ &&
-            ne.args.empty() && !recordHasFieldOrPropertyInit(*t)) {
+            ne.args.empty() && !recordAllowsZeroArgNew(*t)) {
             ctx_.diagnostics().report(
                 Severity::Error, ne.span.begin,
                 std::string("`new ") + std::string(t->name) +

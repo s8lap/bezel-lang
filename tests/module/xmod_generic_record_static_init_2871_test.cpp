@@ -131,9 +131,12 @@ int runSingle2871(const std::string& stem, const std::string& srcText) {
 }
 
 std::string lib2871(const std::string& mod, const std::string& kind,
-                    const std::string& type, const std::string& body) {
-    return "module " + mod + "; public " + kind + " " + type +
-           "<T> public v: T; " + body + " end " + type + ";";
+                    const std::string& type, const std::string& body,
+                    bool withBodyField = true) {
+    std::string prefix = "module " + mod + "; public " + kind + " " + type +
+                         "<T>";
+    if (withBodyField) prefix += " public v: T;";
+    return prefix + " " + body + " end " + type + ";";
 }
 
 }  // namespace
@@ -217,13 +220,21 @@ BEZEL_TEST(xmod_generic_record_static_init_2871,
 // method / destructor body-text carriage it previously denied them. A generic
 // record's method body must still work — this is the "widening broke nothing"
 // pin, and the shape most likely to catch it if it did.
+//
+// narrow #4059 further (§9.1 / §9.2 / §9.5, v0.295): Calc here is a
+// methods-only body record (no body field `v: T;`) — the predicate's
+// further-narrow allow: a record with no body fields/properties at all
+// admits `new T()` because there is nothing to silently zero-fill. The
+// test body calls a method, not a field, so the body-field was
+// incidental to T5's intent.
 // ===========================================================================
 BEZEL_TEST(xmod_generic_record_method_body_2871,
            t5_generic_record_method_body_still_works_spec_14_1) {
     int rc = runXmod2871(
         "bz2871_t5",
         lib2871("RS2871D", "record", "Calc",
-                "public method M(): int return 107; end M;"),
+                "public method M(): int return 107; end M;",
+                /*withBodyField=*/false),
         "module Main; import RS2871D; "
         "class C public static method Main(): int "
         "  using var b := new Calc<string>(); return b.M(); end Main; end C;");
@@ -233,18 +244,29 @@ BEZEL_TEST(xmod_generic_record_method_body_2871,
 }
 
 // ===========================================================================
-// T6 — REGRESSION GUARD: a plain generic record with no initializers at all
-// still imports, constructs and round-trips its `T` field. The cheapest check
-// that the added metadata carriage did not disturb the ordinary path.
+// T6 — REGRESSION GUARD: a plain generic record with no initializers and
+// no body fields at all still imports and zero-arg constructs. The cheapest
+// check that the added metadata carriage did not disturb the ordinary path.
+//
+// narrow #4059 further (§9.1 / §9.2 / §9.5, v0.295): Plain here is
+// literally empty (no `public v: T;`) — the predicate's further-narrow
+// allow for an empty-body record. The pre-#4059 record had a generic
+// body field `v: T;` (no initializer); the further-narrow keeps the
+// rejection for THAT shape (it has a body field/property without an
+// init), but admits an empty body. T6's intent — "plain generic record
+// unaffected" — maps onto the empty-body shape (the field was just
+// round-trip boilerplate, not under test).
 // ===========================================================================
 BEZEL_TEST(xmod_generic_record_method_body_2871,
            t6_plain_generic_record_unaffected_spec_9) {
     int rc = runXmod2871(
-        "bz2871_t6", lib2871("RS2871E", "record", "Plain", ""),
+        "bz2871_t6",
+        lib2871("RS2871E", "record", "Plain", "",
+                /*withBodyField=*/false),
         "module Main; import RS2871E; "
         "class C public static method Main(): int "
-        "  using var b := new Plain<string>(); b.v := \"x\"; "
-        "  return 40 + b.v.Length + 1; end Main; end C;");
+        "  using var b := new Plain<string>(); "
+        "  return 42; end Main; end C;");
     BEZEL_EXPECT_TRUE(rc != kDepFailed2871);
     if (rc == kDepFailed2871) return;
     BEZEL_EXPECT_EQ(rc, 42);

@@ -347,17 +347,23 @@ BEZEL_TEST(body_only_record_zero_arg_new_4059,
 //   * `ctors.empty()` (no declared ctor — already)
 //   * `ne.args.empty()` (no positional/named memberwise args)
 //   * `!inWithExprSource_` (no `with(...)` clause)
-//   * `!recordHasFieldOrPropertyInit` (no field/property `:= ...` inits)
+//   * `!recordAllowsZeroArgNew` (no field/property `:= ...` inits and the
+//     record has at least one body field/property — the silent-zero-fill
+//     defect shape; a methods-only / empty-body record admits `new T()`)
 // Anything that supplies values via any other channel is a legitimate
 // construction form and is accepted; only the silent zero-fill defect
 // shape (none of the four supplying values) is rejected.
 //
-// T2b-1..T2b-5 exercise every cell of the four-way gate:
+// T2b-1..T2b-7 exercise every cell of the four-way gate (the
+// further-narrow adds T2b-6/T2b-7 for the methods-only and empty-body
+// allows):
 //   T2b-1: zero-arg WITH field initializer   → ACCEPT (§9.1 inits supply)
 //   T2b-2: `with(...)` clause (positive T2b)  → ACCEPT (§9.5 IS construction)
 //   T2b-3: named-args                         → ACCEPT (§9.1 memberwise)
 //   T2b-4: zero-arg NO initializer (T1 retest) → REJECT (headline #4059)
 //   T2b-5: positional args                    → ACCEPT (§9.1 memberwise)
+//   T2b-6: methods-only body (no fields/props) → ACCEPT (further-narrow)
+//   T2b-7: literally-empty body                → ACCEPT (further-narrow)
 // Each row is a single-source-of-truth pin so a future widening of the
 // four-way gate does not silently re-over-reject one of these.
 // ============================================================================
@@ -433,4 +439,41 @@ BEZEL_TEST(body_only_record_zero_arg_new_4059,
         "  var p := new Pos4059T2b5(11, 22); "
         "  return p.X + p.Y; "                 // 33
         "end Main; end C;"), 33);
+}
+
+// T2b-6 — narrow #4059 FURTHER (§9.1 / §9.2, v0.295) cell: a body
+// record with ONLY a method (no body fields/properties at all) admits
+// `new T()`. There is nothing to silently zero-fill — the value is
+// fully determined by the type. Pinned by the methods-only test
+// (no body field to observe a wrong value on). The original narrow
+// fix at b9a4198 over-rejected this; the further-narrow accepts it.
+BEZEL_TEST(body_only_record_zero_arg_new_4059,
+           method_only_body_record_zero_arg_new_accepted_spec_9) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "record MethodOnly4059T2b6 "
+        "  public method M(): int return 107; end M; "
+        "end MethodOnly4059T2b6; "
+        "class C public static method Main(): int "
+        "  var b := new MethodOnly4059T2b6(); "
+        "  return b.M(); "                      // 107
+        "end Main; end C;"), 107);
+}
+
+// T2b-7 — narrow #4059 FURTHER (§9.1 / §9.2, v0.295) cell: a body
+// record with NO fields, NO properties, NO methods (literally empty
+// body) admits `new T()`. Empty records have nothing to silently
+// zero-fill; the value is the zero value of the type, which is the
+// only sensible interpretation of "construct an empty record". The
+// original narrow fix at b9a4198 over-rejected this; the further-narrow
+// accepts it.
+BEZEL_TEST(body_only_record_zero_arg_new_4059,
+           empty_body_record_zero_arg_new_accepted_spec_9) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "record Empty4059T2b7 end Empty4059T2b7; "
+        "class C public static method Main(): int "
+        "  var e := new Empty4059T2b7(); "
+        "  return 0; "                          // trivially 0
+        "end Main; end C;"), 0);
 }
