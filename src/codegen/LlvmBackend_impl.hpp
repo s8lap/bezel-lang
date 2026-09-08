@@ -5237,6 +5237,16 @@ private:
         const sema::TypeSymbol* recvDecl,
         const std::vector<llvm::Value*>& argVals,
         bool accessorResultEscapes);
+    // fix #4078 (§28.14 / §27.5 / §28.9, v0.294): the closure-arg twin of the
+    // string release above. Drops the producer's +1 on every +1 closure-producer
+    // index argument (lambda literal / method reference) after the indexer
+    // getter body has read it. §23.5 forbids `ref`/`out`/`owned` on indexer
+    // parameters, so the caller's +1 is provably the sole remaining reference
+    // once the getter returns (the body never stored the callback). See the
+    // definition for the gate details.
+    void releaseIndexArgClosureProducers(
+        const ast::IndexExpr& ix, const sema::PropertySymbol* ps,
+        const std::vector<llvm::Value*>& argVals);
 
     // fix #508 / stdlib §4.4 / §4.5 / §17.15: compound assignment `arr[i] OP= v`
     // on a HEAP-collection Array<T>/OwningArray<T>/Dictionary<K,V> indexer.

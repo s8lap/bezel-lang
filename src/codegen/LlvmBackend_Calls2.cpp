@@ -5479,6 +5479,22 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
         // Build call args first so we can reconcile types.
         std::vector<llvm::Value*> args;
         args.push_back(envPtr);  // env_ptr first
+        // fix #4078 (§28.14 / §27.5 / §28.9, v0.294): a +1 closure-producer
+        // argument (a lambda literal or method reference) passed to a function-
+        // typed parameter WITHOUT a `scoped`/`owned`/ref modifier is a
+        // call-bounded callback — the callee provably holds no reference to the
+        // cell once the call returns, so the producer's +1 is the caller's to
+        // drop. Without this release the 40-byte closure cell (and its 8-byte
+        // env) leaks per call (LSan-measured 40 B per call on the #4078 repro).
+        // Mirrors the per-method release that #1073 / #3498 installed in the
+        // METHOD-call path (LlvmBackend_Calls2.cpp ~11000–11056); here the callee
+        // is a function VALUE (parameter/local/field/method-ref), so the gate is
+        // re-stated against the function-TYPE's `funcParams[pi].modifier` — the
+        // shape #1921/#2248 proved can never silently arm wrongly (a bare `T` is
+        // `Kind::Named` at every instantiation). Every clause fails closed: a
+        // non-producer arg, a non-empty modifier, or a non-function-typed formal
+        // skips the release and the +1 simply leaks (the safe direction).
+        std::vector<llvm::Value*> callBoundedClosures;
         for (std::size_t pi = 0; pi < call.args.size(); ++pi) {
             const auto& a = call.args[pi];
             if (!a.value) return nullptr;
@@ -5497,6 +5513,25 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                 if (!addr) return nullptr;
                 args.push_back(addr);
                 continue;
+            }
+            // Gate the post-call release: producer AST AND empty-modifier
+            // function-typed formal. Resolve through genericSubst_ so a
+            // instantiated `T → () -> int` parameter is still recognised —
+            // a bare `T` parameter in the function TYPE is `Kind::Named` at
+            // the AST source (and would not arm at any substitution), but
+            // a SPELLED-OUT function type under a generic wrapper is still
+            // `Kind::Function` after substitution. The `producerArg` check
+            // excludes non-closure arg exprs (an int literal, a local read,
+            // etc.) — those carry no +1 to drop.
+            bool producerArg = isPlusOneClosureProducer(a.value.get());
+            bool callBoundedFormal = false;
+            if (producerArg && pi < rt->funcParams.size()) {
+                const auto& fp = rt->funcParams[pi];
+                if (fp.modifier.empty() && fp.type) {
+                    const sema::TypeRef* fpTy = resolveTypeParamRef(fp.type);
+                    if (fpTy && fpTy->kind == sema::TypeRef::Kind::Function)
+                        callBoundedFormal = true;
+                }
             }
             llvm::Value* v = lowerExpr(*a.value);
             // fix #3137 / §4.7 / §27.1: the function-VALUE invoke path builds
@@ -5545,6 +5580,14 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
             }
             if (!v) return nullptr;
             args.push_back(v);
+            // fix #4078 (§28.14 / §27.5 / §28.9, v0.294): collect the lowered
+            // closure-cell value for the post-call release when the AST was a
+            // +1 producer AND the formal parameter is call-bounded (computed
+            // above). Stored in call order; released in the same order below.
+            // Gated on a pointer-typed `v` so a non-closure lowering error
+            // cannot smuggle an unrelated value into the release set.
+            if (callBoundedFormal && v && v->getType()->isPointerTy())
+                callBoundedClosures.push_back(v);
         }
         // Build function type: (ptr env, user_params...) -> ret.
         // Use the actual argument LLVM types where the declared type resolves
@@ -5734,6 +5777,20 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
         // path when the exception slot is set; non-throwing calls just fall through.
         llvm::Value* r = builder_.CreateCall(fnTy, fnPtr, args);
         emitPendingCheck();
+        // fix #4078 (§28.14 / §27.5 / §28.9, v0.294): drop the producer's +1
+        // for every call-bounded closure argument on the NORMAL return edge.
+        // Gated on `!diverged_` (mirror #429's `!diverged_` discipline at line
+        // 7834) so the release is not emitted into unreachable IR after an
+        // accessor that threw. The unwind edge's caller (the surrounding
+        // try/finally or scope-end cleanup) is responsible for the throw path
+        // — leaks on the unwind edge are the safe direction. `emitClosureRelease`
+        // is null-safe and idempotent-safe (the rc==0 free is gated on the
+        // atomic sub_fetch returning <= 0, so a spurious double release on a
+        // transferred closure would be caught as a use-after-free, not a
+        // double-free).
+        if (!diverged_) {
+            for (llvm::Value* cl : callBoundedClosures) emitClosureRelease(cl);
+        }
         return retTy->isVoidTy() ? nullptr : r;
     };
     if (auto* par = dynamic_cast<sema::ParameterSymbol*>(calleeSym)) {

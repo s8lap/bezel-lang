@@ -2209,6 +2209,15 @@ llvm::Value* Emitter::lowerIndexerGet(const ast::IndexExpr& ix) {
         // (`!diverged_`) discipline and the safe direction.
         releaseIndexArgStringProducers(ix, ps, recvDecl, idxArgVals,
                                        /*accessorResultEscapes=*/true);
+        // fix #4078 (§28.14 / §27.5 / §28.9, v0.294): the closure-arg twin of
+        // the string release above. The standalone getter body never stored the
+        // callback (§23.5 forbids ref/out/owned on indexer params; the body is
+        // verified by MethodOwnership::callBoundedScan), so the producer's +1
+        // is the caller's to drop on the normal-return edge. See the
+        // expression-bodied indexer-getter twin's call site below for the same
+        // pattern. `diverged_` is already false here — the release sits past
+        // emitPendingCheck on the post-call straight-line.
+        releaseIndexArgClosureProducers(ix, ps, idxArgVals);
         // fix #2814 (§28.3 "Unbound owned temporaries", v0.240): the INDEX half
         // of the same sentence the property half (#2751) covers — "used only by
         // borrowing operations within the expression … as a member or INDEX
@@ -2364,6 +2373,18 @@ llvm::Value* Emitter::lowerIndexerGet(const ast::IndexExpr& ix) {
     // `result` can never alias what this releases.
     releaseIndexArgStringProducers(ix, ps, recvDecl, argVals,
                                    /*accessorResultEscapes=*/true);
+    // fix #4078 (§28.14 / §27.5 / §28.9, v0.294): the closure-arg twin of the
+    // string release above. A lambda literal or method reference passed as an
+    // INDEX argument is a +1 closure producer; §23.5 forbids `ref`/`out`/`owned`
+    // on indexer parameters, so the parameter is empty-modifier and therefore
+    // call-bounded (the getter body provably holds no reference to the cell
+    // once the call returns). Drop the producer's +1 on the normal-return edge
+    // here — guarded on `!diverged_` (the inline body threw) so the release is
+    // not emitted into unreachable IR. The unwind edge's leak is the safe
+    // direction; an exact mirror of the §28.14 release already established in
+    // the method-call path (LlvmBackend_Calls2.cpp ~11000) and in the
+    // function-value call path (#4078's own other half).
+    if (!diverged_) releaseIndexArgClosureProducers(ix, ps, argVals);
     currentThis_ = savedThis;
     locals_ = std::move(savedLocals);
     paramSlots_ = std::move(savedParams);
@@ -2517,6 +2538,58 @@ void Emitter::releaseIndexArgStringProducers(
         if (exprValueOverride_.count(ie)) continue;
         if (!isPlusOneStringProducer(ie)) continue;
         emitStringRelease(argVals[k]);   // null/sentinel-safe, NOT idempotent
+    }
+}
+
+// fix #4078 (§28.14 / §27.5 / §28.9, v0.294): the closure-arg twin of
+// `releaseIndexArgStringProducers` (immediately above). Drops the producer's
+// +1 on every +1 closure-producer index argument after the indexer getter has
+// consumed it.
+//
+// WHY A RELEASE IS OWED. The same §28.14 / §23.5 / #429 logic the string
+// release cites: §23.5 forbids `ref`/`out`/`owned` on indexer parameters, so
+// an index argument is always an unmodified by-value borrow — the getter body
+// never consumes it — and a producer temporary (`box[lambda() => ...]`) is
+// bound to no local, so no scope-end release covers it. The §28.14
+// call-boundedness guarantee runs on the getter body: `MethodOwnership::callBoundedScan`
+// (or its function-value equivalent) rejects every sink, so the producer's +1
+// is provably the sole remaining reference once the getter returns.
+//
+// WHY IT CANNOT OVER-RELEASE. The predicate is `isPlusOneClosureProducer`, the
+// same predicate #429 / #1073 / #3498 use. It admits ONLY a LambdaExpr literal
+// or a bare/qualified method reference (the codegen-internal +1 producers); a
+// CALLER-OWNED LOCAL passed as an index (`var g := lambda() => …; t[g];`) is
+// NOT matched — its +1 belongs to the local's own scope, and an extra release
+// here would be a double-free (the local's scope-end release runs and frees
+// again). Mirrors `releaseIndexArgStringProducers`'s identifier-exclusion
+// exactly.
+//
+// GATED ON `!diverged_` (already enforced by every call site that names this
+// helper): on a path the getter body diverged from (a `throw`), the release
+// would be in unreachable IR. The unwind edge's leak is the safe direction —
+// an exact mirror of #429's `!diverged_` discipline at line 7834.
+//
+// RELEASE TARGET. `emitClosureRelease` (defined in LlvmBackend_Disposal.cpp)
+// is null-safe and decrements the rc atomically; a spurious double release on
+// a transferred closure would be caught as a use-after-free by the bz_closure_
+// release atomic sub_fetch returning > 0.
+void Emitter::releaseIndexArgClosureProducers(
+        const ast::IndexExpr& ix, const sema::PropertySymbol* ps,
+        const std::vector<llvm::Value*>& argVals) {
+    if (!ps) return;
+    for (std::size_t k = 0; k < ps->indexerParams.size() &&
+         k < ix.indices.size() && k < argVals.size(); ++k) {
+        const ast::Expr* ie = ix.indices[k].value.get();
+        if (!ie || !argVals[k] || !argVals[k]->getType()->isPointerTy())
+            continue;
+        // §22.3: the same PINNED index exclusion the string release applies
+        // — a `ref`/`out` copy-in/copy-out bracket owns the index's lifetime
+        // across both getter and setter halves, and releasing here would
+        // double-free it. The indexer parameter list itself forbids `ref`/`out`
+        // per §23.5, so exprValueOverride_ is the only way this arm fires.
+        if (exprValueOverride_.count(ie)) continue;
+        if (!isPlusOneClosureProducer(ie)) continue;
+        emitClosureRelease(argVals[k]);  // null-safe; atomic rc dec
     }
 }
 
