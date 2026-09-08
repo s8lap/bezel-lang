@@ -9676,6 +9676,17 @@ llvm::Value* Emitter::buildRecordValue(
         auto savedLocals = locals_;
         auto savedParams = paramSlots_;
         auto savedRefParams = refParams_;  // fix #2283
+        // fix #4056 / §9.4 / CG29 / §22.3 (v0.294): a record ctor body inlined
+        // here lowers `this`-using expressions (e.g. `R.Touch(this)`) against
+        // `currentThis_` = the by-value receiver pointer (CG29). `currentReceiverRecordType`
+        // needs the parent record TypeSymbol so `coerceThisRecordValue` can load
+        // the struct out at the call argument site — the methodFns_ lookup misses
+        // (no MethodSymbol for a ctor body) and `currentSpecMethodSymbol_` is null
+        // here. The sibling record-ctor paths (emitConstructorBody / inlineCtorBody)
+        // already install the same fallback; this is its twin for the buildRecordValue
+        // explicit-ctor inline path that lowerNew reaches for `new R(...)`.
+        const sema::TypeSymbol* savedCtorParentRecord = currentCtorParentRecord_;
+        currentCtorParentRecord_ = t;
         currentThis_ = slot;
         locals_.clear();
         paramSlots_.clear();
@@ -9761,6 +9772,10 @@ llvm::Value* Emitter::buildRecordValue(
         locals_ = std::move(savedLocals);
         paramSlots_ = std::move(savedParams);
         refParams_ = std::move(savedRefParams);
+        // fix #4056: restore the enclosing body's ctor-parent slot so a sibling
+        // record construction in the same scope sees the caller's value, not the
+        // just-finished ctor's parent.
+        currentCtorParentRecord_ = savedCtorParentRecord;
         // fix #2319 / §22.3: flush the copy-OUT half of every accessor-
         // mediated `ref`/`out` argument. Skipped on the throw edge per
         // §22.3's "on an exception exit no write-back occurs", matching

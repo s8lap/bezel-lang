@@ -2261,6 +2261,20 @@ private:
     // carries the ORIGINAL MethodSymbol* being specialized so lowerWith can find
     // the parent TypeSymbol without requiring specFn to be in methodFns_.
     sema::MethodSymbol* currentSpecMethodSymbol_ = nullptr;
+    // fix #4056 / §9.4 / CG29 / §22.3 (v0.294): the record TypeSymbol of the
+    // CONSTRUCTOR currently being emitted. `currentReceiverRecordType`'s
+    // methodFns_/currentSpecMethodSymbol_ lookup misses ctor bodies because
+    // ctor functions are not registered in methodFns_ (and have no
+    // MethodSymbol), so `currentThis_` inside a record's own constructor —
+    // kept as a pointer by CG29 — would otherwise fail `coerceThisRecordValue`'s
+    // `currentReceiverRecordType() != null` guard and never get loaded into
+    // the record struct when it reaches a CALLEE expecting the struct by
+    // value (e.g. a static method's record parameter or a non-`this`
+    // instance-method parameter of a record type). Set in
+    // `emitConstructorBody` to `cs->parent` when the ctor's parent is a
+    // Record; cleared at exit. Null between bodies and for class/choice/enum
+    // ctors.
+    const sema::TypeSymbol* currentCtorParentRecord_ = nullptr;
     // fix #3611 (§22.16, v0.286): the method (or constructor) currently being
     // emitted, so `emitRequiresPrologue` can rebind inherited-clause
     // `IdentifierExpr`s against the OVERRIDE's parameter symbols (the

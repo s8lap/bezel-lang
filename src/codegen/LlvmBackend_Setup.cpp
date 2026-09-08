@@ -10819,6 +10819,20 @@ void Emitter::emitConstructorBody(sema::ConstructorSymbol* cs, llvm::Function* f
                                 // shape — so the empty list is sound).
     auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
     if (!cd) { currentMethod_ = savedCurrentMethod; return; }
+    // fix #4056 / §9.4 / CG29 / §22.3 (v0.294): a record CONSTRUCTOR's `this`
+    // is the receiver POINTER (CG29), but callees expecting the record STRUCT
+    // (e.g. a static method's record parameter or a non-`this` instance-method
+    // parameter of a record type) need the struct loaded at the call site. The
+    // receiver-pointer → record-struct load is `coerceThisRecordValue`'s job,
+    // and that consults `currentReceiverRecordType()` — which uses a
+    // methodFns_/currentSpecMethodSymbol_ reverse-lookup that misses ctor
+    // bodies (ctors have no MethodSymbol and are never registered in
+    // methodFns_). Stash the ctor's parent TypeSymbol here so the lookup
+    // falls through to it; cleared on every exit below.
+    const sema::TypeSymbol* savedCtorParentRecord = currentCtorParentRecord_;
+    currentCtorParentRecord_ = (cs->parent &&
+        cs->parent->kind == ast::TypeDeclKind::Record)
+        ? cs->parent : nullptr;
     currentFn_ = fn;
     currentReturnTypeNode_ = nullptr;  // ctors return void
     currentThis_ = nullptr;
@@ -11082,6 +11096,11 @@ void Emitter::emitConstructorBody(sema::ConstructorSymbol* cs, llvm::Function* f
     // save/restore shape uniform and matches `emitFunctionBody`'s RAII — every
     // entry/exit pair updates the slot identically).
     currentMethod_ = savedCurrentMethod;
+    // fix #4056: restore `currentCtorParentRecord_` so a nested body emission
+    // (e.g. a local function inside the ctor) sees the OUTER ctor's parent
+    // rather than this one's, and a sibling ctor emitted after this one
+    // starts from null as it should.
+    currentCtorParentRecord_ = savedCtorParentRecord;
 }
 
 
@@ -12729,6 +12748,16 @@ void Emitter::inlineCtorBody(sema::ConstructorSymbol* cs, llvm::Value* obj) {
     auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
     if (!cd) return;
     currentThis_ = obj;
+    // fix #4056 / §9.4 / CG29 / §22.3 (v0.294): a record ctor body's `this` is
+    // the receiver POINTER (CG29), but callees expecting the record STRUCT
+    // need it loaded. `currentReceiverRecordType`'s methodFns_ lookup misses
+    // ctor bodies, so install the ctor's parent record here too — same
+    // fallback the standalone emitConstructorBody uses (see the
+    // currentCtorParentRecord_ block at its entry).
+    const sema::TypeSymbol* savedCtorParentRecord = currentCtorParentRecord_;
+    currentCtorParentRecord_ = (cs->parent &&
+        cs->parent->kind == ast::TypeDeclKind::Record)
+        ? cs->parent : nullptr;
     // fix #2696 / §28.1 / §28.9: an INLINED constructor body is lowered into the
     // ENCLOSING function — this function never touches currentFn_ — so when the
     // enclosing body is the analyzed one, `currentFn_ == stringReleaseEligibleFn_`
@@ -12890,6 +12919,9 @@ void Emitter::inlineCtorBody(sema::ConstructorSymbol* cs, llvm::Value* obj) {
         valueLikeChoiceStrReleaseEligible_ =
             std::move(savedInlineValueLikeChoiceStrRelease);
     }
+    // fix #4056: restore the enclosing body's ctor-parent slot so a sibling
+    // inlined body (or the standalone ctor) sees the right one.
+    currentCtorParentRecord_ = savedCtorParentRecord;
 }
 
 

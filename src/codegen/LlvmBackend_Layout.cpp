@@ -2268,7 +2268,13 @@ llvm::StructType* Emitter::choiceStruct(const sema::TypeSymbol* t) {
 // owner recovery lowerWith uses for `this with … end` (#575 / #628): the
 // reverse-lookup of currentFn_ in methodFns_ handles ordinary bodies, and the
 // currentSpecMethodSymbol_ fallback handles a specialized generic body that
-// buildSpecializedMethodFn never registered in methodFns_.
+// buildSpecializedMethodFn never registered in methodFns_. The
+// currentCtorParentRecord_ fallback (fix #4056) handles record CONSTRUCTOR
+// bodies, where currentFn_ is the ctor's function (which is never registered
+// in methodFns_ — and has no MethodSymbol) and currentSpecMethodSymbol_ is
+// null, but `this` is still a pointer to a record (CG29) that needs to be
+// loaded into the record struct when it reaches a callee expecting the
+// struct by value (§9.4, §22.3).
 const sema::TypeSymbol* Emitter::currentReceiverRecordType() {
     if (!currentThis_) return nullptr;
     if (currentFn_) {
@@ -2280,6 +2286,9 @@ const sema::TypeSymbol* Emitter::currentReceiverRecordType() {
     if (currentSpecMethodSymbol_ && currentSpecMethodSymbol_->parent &&
         currentSpecMethodSymbol_->parent->kind == ast::TypeDeclKind::Record)
         return currentSpecMethodSymbol_->parent;
+    if (currentCtorParentRecord_ &&
+        currentCtorParentRecord_->kind == ast::TypeDeclKind::Record)
+        return currentCtorParentRecord_;
     return nullptr;
 }
 
@@ -2551,6 +2560,21 @@ llvm::Value* Emitter::coerceExprValueToSlot(llvm::Value* v, llvm::Type* slotTy,
                                             const ast::Expr* e,
                                             bool srcUnsigned) {
     if (!v || !slotTy) return v;
+    // fix #4056 / §9.4 / CG29 / §22.3 (v0.294): inside a record method or
+    // constructor `this` is kept as a POINTER to the by-value receiver slot
+    // (CG29, §9.4 — spilled so `this.field` reuses record field access). When
+    // `this` reaches a CALL ARGUMENT position whose callee expects the record
+    // STRUCT — a static method's record parameter (`R.Touch(this)`), or a
+    // non-`this` instance-method parameter of a record type (`this.Combine(this)`
+    // → the non-receiver arg) — the load needs to happen HERE, exactly the way
+    // `emitReturn` loads it for `return this` (fix #1759). Without this the
+    // ptr reaches the call site unchanged and LLVM's verifier rejects the
+    // module (`Call parameter type does not match function signature! / IR
+    // verification failed`). A no-op for every other value (v !=
+    // currentThis_), every non-record receiver (class/enum), and every
+    // non-matching destination type — `coerceThisRecordValue`'s own equality
+    // guard rejects them and returns v unchanged.
+    v = coerceThisRecordValue(v, slotTy);
     llvm::Type* want = slotPayloadTy(slotTy);
     if (v->getType() == want) return v;
     // §5.1's WIDENING direction is unconditional and unchanged — the target
