@@ -13750,7 +13750,20 @@ void ExprTC::checkImportedNewExprArgs(
     // object with zero-initialized fields and the correct vtable pointer.  Classes
     // WITH an explicit constructor body remain gated: the ctor body is not carried
     // in the dependency's metadata (Foundation C / Blocker 3).
-    if (!t->genericParams.empty()) {
+    //
+    // #4086 narrow (#4059 follow-up, v0.295): the §14/#662 gate is CLASS-only.
+    // A generic record has no vtable to install (records are value-typed and
+    // never participate in interface dispatch), so the per-instantiation
+    // infrastructure Foundation A delivers is unnecessary on the record arm —
+    // and forcing every imported generic record through the gate's three-case
+    // shape rejected `new ImportedRecord(args)` for body-field records (which
+    // have no ConstructorSymbol but DO have a working construction path
+    // through field-named args, #3141/#3162). The Class kind check narrows the
+    // gate to the only kind it applies to; records fall through to the
+    // ctors.empty() arm below, which carries the body-record reject (#4059)
+    // and the implicit-default accept (§22.7) for the class-only half.
+    if (!t->genericParams.empty() &&
+        t->kind == ast::TypeDeclKind::Class) {
         // §14/#662 gate for imported generic CLASS construction.
         // Foundation A: a class with NO explicit constructor → zero-arg implicit
         //   path, vtable installed by buildImportedGenericVtable.
