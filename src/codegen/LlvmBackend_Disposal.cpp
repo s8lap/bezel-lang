@@ -129,6 +129,29 @@ void Emitter::emitDisposerCore(const sema::TypeSymbol* ts, llvm::Function* fn) {
     // Invisible to any test that does not instantiate an owned-`T` generic in
     // the same body that also captures.
     CaptureReclaimSetScope captureReclaimScope(*this);
+    // fix #3926 (§28.3 / §28.4 / §28.5 / §28.9, v0.294): the SAVE/RESTORE
+    // halves of the §28.3 STRING-release and §28.9 BOX-release clear+re-pin
+    // blocks below (fix #2807's string half, fix #2854's companion).  Same
+    // two-halves-of-one-contract rule as #3921's `CaptureReclaimSetScope`
+    // above: `emitDisposerCore` clears and re-pins these families for the
+    // destructor body it is about to emit, but the two mid-emission call
+    // paths (`emitSpecializedDisposer` and `specializedDisposerCoreFor`) leave
+    // us MID-EMISSION of an outer body, so without the restore the outer
+    // body's own `var s := "abc" + n.ToString();` and `var o: Object := n;`
+    // silently lose their bind-time retain / scope-end release (19392 B /
+    // 1000 allocs and 12000 B / 500 allocs at 500 iterations, issue #3926).
+    //
+    // Both scopes are header-local RAII beside `CaptureReclaimSetScope` in
+    // `LlvmBackend_impl.hpp` so the two new scopes stay byte-identical to
+    // `buildSpecializedMethodFn`'s hand-rolled six-member string block and
+    // three-member box block (LANE_RULES §6 — one authority, not a second
+    // drifting copy).  The `BoxReclaimSetScope` deliberately does NOT
+    // re-pin `boxReleaseEligibleFn_` inside the destructor body — the
+    // destructor's entries are AST-keyed and the outer body's token is
+    // exactly what we want to leave in place when emission returns.  See the
+    // issue body for the measured figures.
+    StringReclaimSetScope stringReclaimScope(*this);
+    BoxReclaimSetScope boxReclaimScope(*this);
     currentFn_ = fn;
     currentThis_ = &*fn->args().begin();
     locals_.clear();
@@ -3272,6 +3295,110 @@ void Emitter::emitChoiceStringFieldReleases_impl(
 }
 
 
+// fix #3974 (§9.7 / §28.9 / stdlib §4.8, v0.294): box-mint-side counterpart
+// to emitChoiceStringFieldReleases_impl. Same tag-switched skeleton (one
+// arm per case, collapsed to the join when the case owns no string),
+// same `caseOwnsString` per-case guard, same per-payload walk. The
+// per-string field path is `load → emitStringRetain` (no nulling — the
+// box now owns the slot, and the box's `free` at disposal time drops
+// the rc to zero). The nested record/choice arm recurses into the
+// respective retain walker. See emitRecordStringFieldRetains_impl's
+// header for the rationale and the boxValueNeedsStringRetain dispatch
+// that decides whether this walker is reached at all.
+void Emitter::emitChoiceStringFieldRetains_impl(
+        llvm::Value* choiceAddr, const sema::TypeSymbol* choiceTy) {
+    if (!choiceAddr || !choiceTy || choiceTy->kind != ast::TypeDeclKind::Choice)
+        return;
+    if (!choiceHasStringFields(choiceTy)) return;  // also excludes generics
+    auto cases = choiceCasesOf(choiceTy);
+    if (cases.empty()) return;
+    llvm::StructType* st = choiceStruct(choiceTy);
+    if (!st) return;
+    llvm::Value* tagAddr =
+        builder_.CreateStructGEP(st, choiceAddr, 0, "chsft.tag.addr");
+    llvm::Value* tag = builder_.CreateLoad(i32(), tagAddr, "chsft.tag");
+    auto* joinBB = llvm::BasicBlock::Create(llvm_, "chsft.join", currentFn_);
+    auto* switchBB = llvm::BasicBlock::Create(llvm_, "chsft.switch", currentFn_);
+    builder_.CreateBr(switchBB);
+    builder_.SetInsertPoint(switchBB);
+    auto* sw = builder_.CreateSwitch(
+        tag, joinBB, static_cast<unsigned>(cases.size()));
+    for (std::size_t i = 0; i < cases.size(); ++i) {
+        const sema::ChoiceCaseSymbol* cc = cases[i];
+        if (!cc || !cc->caseDecl) continue;
+        // Does THIS case own a string, directly or transitively? Skip the
+        // arm entirely (collapses to the join) if not — mirrors the
+        // release walker's identical guard.
+        bool caseOwnsString = false;
+        for (const ast::Param& pf : cc->caseDecl->payload) {
+            if (!pf.type) continue;
+            const sema::TypeRef* ft = ctx_.resolvedType(*pf.type);
+            if (!ft) continue;
+            if (ft->kind == sema::TypeRef::Kind::Primitive &&
+                ft->primitive == sema::PrimitiveType::String) {
+                caseOwnsString = true;
+                break;
+            }
+            if (ft->nullable || ft->kind != sema::TypeRef::Kind::Named ||
+                !ft->declaration)
+                continue;
+            if ((ft->declaration->kind == ast::TypeDeclKind::Record &&
+                 recordHasStringFields(ft)) ||
+                (ft->declaration->kind == ast::TypeDeclKind::Choice &&
+                 choiceHasStringFields(ft->declaration))) {
+                caseOwnsString = true;
+                break;
+            }
+        }
+        if (!caseOwnsString) continue;
+        auto* armBB = llvm::BasicBlock::Create(llvm_, "chsft.arm", currentFn_);
+        sw->addCase(llvm::ConstantInt::get(llvm::Type::getInt32Ty(llvm_), i),
+                    armBB);
+        builder_.SetInsertPoint(armBB);
+        llvm::Value* payloadAddr = builder_.CreateStructGEP(
+            st, choiceAddr, 1 + (unsigned)i, "chsft.case.addr");
+        llvm::Type* payloadTy = st->getElementType(1 + (unsigned)i);
+        auto* payloadStruct = llvm::dyn_cast<llvm::StructType>(payloadTy);
+        for (std::size_t j = 0; j < cc->caseDecl->payload.size(); ++j) {
+            const ast::Param& pf = cc->caseDecl->payload[j];
+            if (!pf.type) continue;
+            const sema::TypeRef* ft = ctx_.resolvedType(*pf.type);
+            if (!ft || !payloadStruct || j >= payloadStruct->getNumElements())
+                continue;
+            if (ft->kind == sema::TypeRef::Kind::Primitive &&
+                ft->primitive == sema::PrimitiveType::String) {
+                llvm::Value* fAddr = builder_.CreateStructGEP(
+                    payloadStruct, payloadAddr, (unsigned)j, "chsft.str.addr");
+                llvm::Value* fVal =
+                    builder_.CreateLoad(ptrTy(), fAddr, "chsft.str.val");
+                emitStringRetain(fVal);
+                continue;
+            }
+            if (ft->nullable || ft->kind != sema::TypeRef::Kind::Named ||
+                !ft->declaration)
+                continue;
+            if (ft->declaration->kind == ast::TypeDeclKind::Record &&
+                recordHasStringFields(ft)) {
+                llvm::Value* nestedAddr = builder_.CreateStructGEP(
+                    payloadStruct, payloadAddr, (unsigned)j,
+                    "chsft.nested.rec.addr");
+                emitRecordStringFieldRetains_impl(nestedAddr, ft);
+                continue;
+            }
+            if (ft->declaration->kind == ast::TypeDeclKind::Choice &&
+                choiceHasStringFields(ft->declaration)) {
+                llvm::Value* nestedAddr = builder_.CreateStructGEP(
+                    payloadStruct, payloadAddr, (unsigned)j,
+                    "chsft.nested.ch.addr");
+                emitChoiceStringFieldRetains_impl(nestedAddr, ft->declaration);
+            }
+        }
+        builder_.CreateBr(joinBB);
+    }
+    builder_.SetInsertPoint(joinBB);
+}
+
+
 // fix #2326 / §9.8 v0.228: does the (statically-resolved) element type `tr`
 // of a non-nullable inline array carry a string — directly (a `string`
 // element), or transitively (through a non-nullable nested record / choice /
@@ -3412,6 +3539,62 @@ void Emitter::emitInlineArrayStringReleases_impl(
         if (elemTy->declaration->kind == ast::TypeDeclKind::Choice &&
             choiceHasStringFields(elemTy->declaration)) {
             emitChoiceStringFieldReleases_impl(slotAddr, elemTy->declaration);
+        }
+    }
+}
+
+
+// fix #3974 (§9.7 / §28.9 / stdlib §4.8, v0.294): box-mint-side counterpart
+// to emitInlineArrayStringReleases_impl — walks N unrolled slots and
+// RETAINS each string-typed slot (or recurses into a nested record/choice/
+// inline-array element). Mirrors the release walker exactly in shape: same
+// `inlineArrayElementCarriesString` guard, same dispatch on each slot's
+// static type, same `recordSubst` guard via the outer `RecordSubstGuard`
+// installed at the call site. The retain is `load → emitStringRetain` — no
+// nulling, since the box now owns the slot with a higher rc and the box's
+// `free` at disposal time drops the rc to zero (the source's own +1
+// remains, released at its scope end). See
+// emitRecordStringFieldRetains_impl's header for the rationale and the
+// boxValueNeedsStringRetain dispatch.
+void Emitter::emitInlineArrayStringRetains_impl(
+        llvm::Value* arrAddr, const sema::TypeRef* arrayTy) {
+    if (!arrAddr || !arrayTy) return;
+    const sema::TypeRef* elemTy = arrayTy->arrayElement;
+    int n_signed = arrayTy->arraySizeValue;
+    if (!elemTy || n_signed < 0) return;
+    if (elemTy->nullable) return;
+    if (!inlineArrayElementCarriesString(elemTy)) return;
+    unsigned n = static_cast<unsigned>(n_signed);
+    llvm::Type* elemLlvmTy = lowerTypeRef(elemTy);
+    if (!elemLlvmTy) return;
+    auto* arrLlvmTy = llvm::ArrayType::get(elemLlvmTy, n);
+    for (unsigned i = 0; i < n; ++i) {
+        llvm::Value* slotAddr = builder_.CreateConstGEP2_64(
+            arrLlvmTy, arrAddr, 0, i, "inlarr.ret.elem.addr");
+        if (elemTy->kind == sema::TypeRef::Kind::Primitive &&
+            elemTy->primitive == sema::PrimitiveType::String) {
+            llvm::Value* v =
+                builder_.CreateLoad(ptrTy(), slotAddr, "inlarr.ret.str.val");
+            emitStringRetain(v);
+            continue;
+        }
+        if (elemTy->kind == sema::TypeRef::Kind::InlineArray) {
+            // Same defensive recursion as the release twin (§15.1 forbids
+            // this in practice; left in place in case §15.1 ever changes).
+            emitInlineArrayStringRetains_impl(slotAddr, elemTy);
+            continue;
+        }
+        if (elemTy->nullable || elemTy->kind != sema::TypeRef::Kind::Named ||
+            !elemTy->declaration)
+            continue;
+        if (elemTy->declaration->kind == ast::TypeDeclKind::Record &&
+            recordHasStringFields(elemTy)) {
+            emitRecordStringFieldRetains_impl(slotAddr, elemTy);
+            continue;
+        }
+        if (elemTy->declaration->kind == ast::TypeDeclKind::Choice &&
+            choiceHasStringFields(elemTy->declaration)) {
+            emitChoiceStringFieldRetains_impl(slotAddr, elemTy->declaration);
         }
     }
 }
@@ -4846,6 +5029,89 @@ llvm::Function* Emitter::dictValueBoxFreer(const sema::TypeRef* dictTy) {
         }
     }
     return valueBoxFreeThunk();
+}
+
+
+// fix #3974 (§9.7 / §28.9 / stdlib §4.8, v0.294): should the borrowing-
+// Dictionary<K, V> box-mint site RETAINS V's string fields? The per-V
+// boxedRecordValueFreer / boxedChoiceValueFreer is emitted per TYPE, so it
+// cannot know per-insertion whether the construction transferred +1 to
+// the fields (the box release balances correctly — no retain needed) or
+// borrowed them (the box release would free a string its real owner
+// still uses — heap-use-after-free — a retain at the box site is
+// needed). Returns true (retain) when the construction shape is NOT
+// provably a +1-producer construction, mirroring the gate set the
+// scope-end recordStringFields Disposal already uses (so the two paths
+// are exactly inverse: where the scope-end path "declines and leaks"
+// when it cannot prove the +1 is the local's to release, this path
+// "retains" when it cannot prove the field already owns the +1 the
+// box release will consume).
+//
+//  * valueExpr is a NewExpr: isFreshRecordConstructionOfExactType
+//    (the #2448 gate) for record V — the construction site already
+//    transferred the +1 to the field; the box release balances it; no
+//    retain needed.
+//  * valueExpr is a CallExpr naming a record-factory method:
+//    isProvablyFreshRecordFactoryMethod must be true; otherwise the
+//    callee may have returned a borrowed value, the field is a
+//    borrow pointer, and the box must retain.
+//  * valueExpr is a CallExpr naming a synthesized record / choice
+//    Deserialize: unconditionally provably fresh — no retain needed.
+//  * any other shape (IdentifierExpr reading a local/field/param,
+//    MemberAccessExpr, a non-fresh CallExpr, an arbitrary expression):
+//    retain (conservative). The box becomes a genuine +1 owner; the
+//    source's +1 is released separately at its scope end.
+//  * valueExpr is null: retain (defensive). The "is this V type
+//    eligible for boxing at all" filter (V must be a record/choice
+//    with string fields) is the caller's responsibility — this helper
+//    only answers the per-insertion decision.
+//
+// Choice V: a call to a case constructor (`Shape.Circle(s)`) is
+// treated as the shape-spec equivalent of a record NewExpr. The
+// fresh-construction check for a call-result returns a record/choice
+// is isSynthesizedValueLikeChoiceDeserializeCall (or
+// isSynthesizedRecordDeserializeCall for record V). A call that
+// matches NEITHER is conservatively retained — the box becomes a
+// genuine +1 owner and the call result's own +1 is released
+// separately.
+bool Emitter::boxValueNeedsStringRetain(const ast::Expr* valueExpr,
+                                          const sema::TypeRef* valTy) const {
+    if (!valTy || !valTy->declaration) return false;  // nothing to retain
+    if (valTy->nullable) return false;  // nullable handled separately
+    if (valTy->declaration->kind == ast::TypeDeclKind::Record) {
+        // Empty valueExpr (defensive): retain.
+        if (!valueExpr) return true;
+        // NewExpr: isFreshRecordConstructionOfExactType must be true
+        // for the construction to have transferred +1 to the field.
+        if (auto* ne = dynamic_cast<const ast::NewExpr*>(valueExpr)) {
+            return !isFreshRecordConstructionOfExactType(
+                ne, valTy->declaration);
+        }
+        // CallExpr: either a synthesized Deserialize (always fresh) or
+        // a provably-fresh factory method. Anything else → retain.
+        if (auto* call = dynamic_cast<const ast::CallExpr*>(valueExpr)) {
+            if (isSynthesizedRecordDeserializeCall(call, valTy->declaration))
+                return false;
+            if (const sema::MethodSymbol* ms = dynamic_cast<
+                    const sema::MethodSymbol*>(
+                        ctx_.exprSymbol(*call->callee))) {
+                return !isProvablyFreshRecordFactoryMethod(
+                    ms, valTy->declaration);
+            }
+            return true;
+        }
+        // Any other shape: retain (conservative).
+        return true;
+    }
+    if (valTy->declaration->kind == ast::TypeDeclKind::Choice) {
+        if (!valueExpr) return true;
+        if (auto* call = dynamic_cast<const ast::CallExpr*>(valueExpr)) {
+            if (isSynthesizedValueLikeChoiceDeserializeCall(call))
+                return false;
+        }
+        return true;
+    }
+    return false;
 }
 
 

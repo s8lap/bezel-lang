@@ -3898,6 +3898,88 @@ private:
         }
     }
 
+    // fix #3974 (§9.7 / §28.9 / stdlib §4.8, v0.294): the box-MINT-SIDE
+    // counterpart to emitRecordStringFieldReleases_impl. Walks V's string
+    // fields and RETAINS each, making the malloc'd dict-value box a
+    // GENUINE OWNER of its string fields' +1s. The boxedRecordValueFreer
+    // emits an unconditional release on each — which is correct ONLY when
+    // the box actually owns those +1s. For a producer-bound construction
+    // (every string argument a literal or +1 producer) the construction
+    // site already transferred the +1 to the field, so the box release is
+    // correct and no retain is needed here. For a borrow-init construction
+    // (a local identifier, a field read, a call result), the field holds
+    // a borrow pointer with no +1 of its own, and the box release would
+    // free a string its real owner still uses — a heap-use-after-free
+    // (issue #3974's repro: a borrow-init `s` whose `d[7] := new Box(s, 1)`
+    // is freed by `bz$recValBoxFree$Box` and then read by `s.Length`).
+    // The dispatch (whether to retain) is on the INSERTION site, because
+    // the boxed-record freer is emitted per V TYPE, not per insertion
+    // (mirroring scope-end Disposal's argument-level eligibility proof
+    // moving to the construction site for the same reason).
+    //
+    // Mirrors the release walker EXACTLY in shape: same `isStringStorage-
+    // MemberResolved` test, same nested-record / choice / inline-array
+    // recursion. For a string storage member, the retain is `load → emit-
+    // StringRetain → store` (no nulling — the box now owns the same
+    // pointer with a higher rc; the corresponding release at box free
+    // time is the box's `free`, after which the string is gone). For a
+    // non-nullable nested record / choice / inline-array carrying
+    // strings, recurse with the same field GEP. The null-pointer literal
+    // case is excluded by `isStringStorageMemberResolved`'s own gate.
+    void emitRecordStringFieldRetains_impl(llvm::Value* recAddr,
+                                            const sema::TypeRef* tr) {
+        if (!recAddr || !tr || tr->kind != sema::TypeRef::Kind::Named ||
+            !tr->declaration ||
+            tr->declaration->kind != ast::TypeDeclKind::Record)
+            return;
+        const sema::TypeSymbol* ts = tr->declaration;
+        RecordSubstGuard guard(this, tr);
+        llvm::StructType* st = recordStruct(ts);
+        if (!st) return;
+        std::vector<const sema::Symbol*> storage;
+        collectRecordStorage(ts, storage);
+        for (const sema::Symbol* m : storage) {
+            auto idxIt = fieldIndex_.find(m);
+            if (idxIt == fieldIndex_.end()) continue;
+            if (isStringStorageMemberResolved(m)) {
+                llvm::Value* addr =
+                    builder_.CreateStructGEP(st, recAddr, idxIt->second,
+                                              "recstrf.ret.addr");
+                llvm::Value* val =
+                    builder_.CreateLoad(ptrTy(), addr, "recstrf.ret.val");
+                emitStringRetain(val);
+                continue;
+            }
+            const sema::TypeRef* mty = recordMemberTypeResolved(m);
+            if (mty && !mty->nullable &&
+                mty->kind == sema::TypeRef::Kind::Named && mty->declaration &&
+                mty->declaration->kind == ast::TypeDeclKind::Record &&
+                recordHasStringFields(mty)) {
+                llvm::Value* nestedAddr = builder_.CreateStructGEP(
+                    st, recAddr, idxIt->second, "recstrf.ret.nested.addr");
+                emitRecordStringFieldRetains_impl(nestedAddr, mty);
+                continue;
+            }
+            if (mty && !mty->nullable &&
+                mty->kind == sema::TypeRef::Kind::Named && mty->declaration &&
+                mty->declaration->kind == ast::TypeDeclKind::Choice &&
+                choiceHasStringFields(mty->declaration)) {
+                llvm::Value* nestedAddr = builder_.CreateStructGEP(
+                    st, recAddr, idxIt->second, "recstrf.ret.nested.ch.addr");
+                emitChoiceStringFieldRetains_impl(nestedAddr, mty->declaration);
+                continue;
+            }
+            if (mty && !mty->nullable &&
+                mty->kind == sema::TypeRef::Kind::InlineArray &&
+                mty->arrayElement &&
+                inlineArrayElementCarriesString(mty->arrayElement)) {
+                llvm::Value* arrAddr = builder_.CreateStructGEP(
+                    st, recAddr, idxIt->second, "recstrf.ret.arr.addr");
+                emitInlineArrayStringRetains_impl(arrAddr, mty);
+            }
+        }
+    }
+
     // Load the data pointer (field 0) from a bz_string pointer.
     llvm::Value* loadStringData(llvm::Value* strPtr) {
         llvm::Value* p = builder_.CreateStructGEP(stringType(), strPtr, 0);
@@ -10707,6 +10789,33 @@ private:
         emitInlineArrayStringReleases_impl(arrAddr, arrayTy);
     }
 
+    // fix #3974 (§9.7 / §28.9 / stdlib §4.8, v0.294): the box-mint-side
+    // counterparts to emitChoiceStringFieldReleases_impl /
+    // emitInlineArrayStringReleases_impl. The choice-side walker is the
+    // tag-switched mirror (per active case, retain each string payload);
+    // the inline-array walker is the per-element mirror. See
+    // emitRecordStringFieldRetains_impl (above) for the retain-side
+    // rationale and the dispatch rule (insertion-site check via
+    // boxValueNeedsStringRetain decides whether the box owns its
+    // strings — fresh-producer construction does NOT need a retain,
+    // borrow-init construction DOES). The shape mirrors the release
+    // walkers exactly: a switch on the choice tag with one arm per
+    // string-owning case (collapses to the join otherwise), and an
+    // unrolled N loop for the inline array. Defined in
+    // LlvmBackend_Disposal.cpp next to the release twins.
+    void emitChoiceStringFieldRetains_impl(llvm::Value* choiceAddr,
+                                            const sema::TypeSymbol* choiceTy);
+    void emitChoiceStringFieldRetains(llvm::Value* choiceAddr,
+                                       const sema::TypeSymbol* choiceTy) {
+        emitChoiceStringFieldRetains_impl(choiceAddr, choiceTy);
+    }
+    void emitInlineArrayStringRetains_impl(llvm::Value* arrAddr,
+                                            const sema::TypeRef* arrayTy);
+    void emitInlineArrayStringRetains(llvm::Value* arrAddr,
+                                       const sema::TypeRef* arrayTy) {
+        emitInlineArrayStringRetains_impl(arrAddr, arrayTy);
+    }
+
     // fix #1747 / §28.9 / §9.7 / §28.3: is `tr` a (non-nullable) record
     // TypeRef whose record owns at least one `string` field? Convenience
     // classifier used at return sites (the callee retain) and the caller's
@@ -10851,6 +10960,44 @@ private:
     // matching #2425's own documented generic decline.
     bool isSynthesizedValueLikeChoiceDeserializeCall(
         const ast::CallExpr* call) const;
+
+    // fix #3974 (§9.7 / §28.9 / stdlib §4.8, v0.294): should the
+    // borrowing-Dictionary<K, V> box-mint site RETAINS V's string fields
+    // before copying the struct bytes into the malloc'd box? The
+    // boxedRecordValueFreer / boxedChoiceValueFreer is emitted per V
+    // TYPE (one thunk per V), so it cannot know per-insertion whether
+    // the boxed record was constructed with producer-bound string
+    // arguments (the construction transferred the +1 to the field, and
+    // the box release balances it correctly) or with borrow arguments
+    // (the field is a borrow pointer with no +1 of its own, and the
+    // box release would free a string its real owner still uses — the
+    // heap-use-after-free this whole issue describes). The decision has
+    // to be made at the insertion site, where the source expression is
+    // still in view. Returns `true` (retain) when the construction
+    // shape is NOT provably a +1-producer construction:
+    //   * valueExpr is a NewExpr: isFreshRecordConstructionOfExactType
+    //     (for record V) — the same gate the scope-end recordStringFields
+    //     Disposal uses (#2448) — must be true; otherwise the field is
+    //     a borrow and the box must retain.
+    //   * valueExpr is a CallExpr naming a record-factory method:
+    //     isProvablyFreshRecordFactoryMethod (the same gate) must be
+    //     true; otherwise retain.
+    //   * valueExpr is a CallExpr naming a synthesized record /
+    //     choice Deserialize: unconditionally provably fresh — no retain.
+    //   * any other shape (IdentifierExpr, MemberAccessExpr, an
+    //     arbitrary CallExpr we cannot prove fresh, …): retain
+    //     (conservative — the box becomes a genuine +1 owner, the
+    //     source's +1 is released separately at its scope end).
+    //   * valueExpr is null (defensive, in case the call site omits it
+    //     for some reason): retain. The "is this V type eligible at
+    //     all" filter (V must be a record/choice with string fields)
+    //     is the caller's responsibility — this helper only returns
+    //     the per-insertion decision.
+    //
+    // DEFINED in LlvmBackend_Disposal.cpp next to the
+    // boxedRecordValueFreer / boxedChoiceValueFreer that depend on it.
+    bool boxValueNeedsStringRetain(const ast::Expr* valueExpr,
+                                    const sema::TypeRef* valTy) const;
 
     // fix #2428 / §9.8 / §28.9 / §35.4: the set of plain `var` VALUE-LIKE
     // CHOICE LocalDecl nodes whose initializer is a call recognized by
@@ -11984,6 +12131,119 @@ private:
         std::unordered_set<const void*> takeCurrentDictFreeEligible_;  // #3880
         llvm::Function* takeCurrentDictFreeEligibleFn_;                // #3880
         std::unordered_set<const void*> literalTreeAggregateEligible_;
+    };
+
+    // fix #3926 (§28.3 / §28.4 / §28.5 / §28.9, v0.294): the STRING-release
+    // twin of `CaptureReclaimSetScope` above — save and restore the §28.3
+    // string-local eligibility SETS, the §28.9 string-borrow SETS, and the
+    // one function TOKEN across ONE nested body emission. Same contract, same
+    // reason (LANE_RULES §8): a `clear()` on per-lowering emitter state and a
+    // save/restore around nested emission are two halves of ONE contract, and
+    // every emitter that re-establishes this family for its own body needs
+    // both halves.
+    //
+    // HOISTED HERE BY fix #3926. The member list is BYTE-IDENTICAL to the
+    // six-member hand-written save/restore `LlvmBackend_Calls2.cpp` ~L13001-
+    // 13007 saves and ~L13334-13340 restores inside `buildSpecializedMethodFn`,
+    // for the same reason (`emitDisposerCore` runs MID-EMISSION of an outer
+    // body on the two paths #3921 already named — `emitSpecializedDisposer`
+    // and `specializedDisposerCoreFor` — and clobbers the outer body's string
+    // eligibility). It is deliberately NOT merged with that hand-written
+    // block: `buildSpecializedMethodFn`'s restore fires at a deliberate
+    // ordering relative to its other restores (see the comment at the
+    // `emitDisposerCore` change site, LlvmBackend_Disposal.cpp ~#3926), and
+    // this lane does not own that file.
+    //
+    // DIRECTION IF MISSING: the outer body resumes lowering with every
+    // string-local eligibility keyed to the NESTED body's fn, so every gate
+    // in `lowerLocalDecl` (`currentFn_ == stringReleaseEligibleFn_`) goes
+    // false and the outer body's own `var s := "abc" + n.ToString();` (or any
+    // other +1 string producer — §28.3) silently loses both its bind-time
+    // retain and its scope-end release. Measured at 19392 B / 1000 allocations
+    // for 500 Run() activations (38.78 B per activation: 24-byte bz_string
+    // header + per-iteration concat payload for n>9) — issue #3926's own
+    // figure, byte-identical to the canonical "leak shape" the issue names.
+    struct StringReclaimSetScope {
+        explicit StringReclaimSetScope(Emitter& e)
+            : e_(e),
+              stringReleaseEligible_(e.stringReleaseEligible_),
+              stringBorrowRetainEligible_(e.stringBorrowRetainEligible_),
+              stringBorrowAll_(e.stringBorrowAll_),
+              stringLocalCandidates_(e.stringLocalCandidates_),  // fix #2817
+              valueLikeChoiceStrReleaseEligible_(
+                  e.valueLikeChoiceStrReleaseEligible_),
+              stringReleaseEligibleFn_(e.stringReleaseEligibleFn_) {}
+        ~StringReclaimSetScope() {
+            e_.stringReleaseEligible_ =
+                std::move(stringReleaseEligible_);
+            e_.stringBorrowRetainEligible_ =
+                std::move(stringBorrowRetainEligible_);
+            e_.stringBorrowAll_ = std::move(stringBorrowAll_);
+            e_.stringLocalCandidates_ =
+                std::move(stringLocalCandidates_);  // fix #2817
+            e_.valueLikeChoiceStrReleaseEligible_ =
+                std::move(valueLikeChoiceStrReleaseEligible_);
+            e_.stringReleaseEligibleFn_ = stringReleaseEligibleFn_;
+        }
+        StringReclaimSetScope(const StringReclaimSetScope&) = delete;
+        StringReclaimSetScope& operator=(const StringReclaimSetScope&) =
+            delete;
+
+    private:
+        Emitter& e_;
+        std::unordered_set<const void*> stringReleaseEligible_;
+        std::unordered_set<const void*> stringBorrowRetainEligible_;
+        std::unordered_set<const void*> stringBorrowAll_;
+        std::unordered_set<const void*> stringLocalCandidates_;  // #2817
+        std::unordered_set<const void*>
+            valueLikeChoiceStrReleaseEligible_;
+        llvm::Function* stringReleaseEligibleFn_;
+    };
+
+    // fix #3926 (§28.3 / §28.4 / §28.5 / §28.9, v0.294): the BOX-release
+    // twin of `CaptureReclaimSetScope` / `StringReclaimSetScope` above — save
+    // and restore the two §28.9 box-release eligibility SETS and the one
+    // function TOKEN across ONE nested body emission. Same contract, same
+    // reason (LANE_RULES §8).
+    //
+    // The BOX-release family is the smaller of the three siblings. Note that
+    // `emitDisposerCore` deliberately does NOT re-pin `boxReleaseEligibleFn_`
+    // — the destructor's own entries (added by `collectBoxReleaseEligible`)
+    // stay keyed by AST node, and the token's role is purely a freshness gate
+    // that keeps a stale-entry from a previous body mis-admitting a local.
+    // Because the destructor body's local AST nodes are different from the
+    // outer body's, the outer's eligibility entries remain the only ones that
+    // matter; preserving the OUTER token on return is exactly what this scope
+    // does.
+    //
+    // DIRECTION IF MISSING: the outer body resumes lowering with every
+    // box-release eligibility keyed to the NESTED body's analysis walk, so
+    // every gate in `lowerLocalDecl` (the `boxReleaseEligibleFn_` token check
+    // and the `boxReleaseEligible_` set membership) goes false and the outer
+    // body's own `var o: Object := n;` (or any other §28.9 box producer —
+    // value-typed coercion) silently loses its scope-end `bz_box_release`.
+    // Measured at 12000 B / 500 allocations for 500 Run() activations (24 B
+    // per activation — the box itself, `{ vtable*, i64 rc, payload }` for an
+    // 8-byte payload) — issue #3926's own figure.
+    struct BoxReclaimSetScope {
+        explicit BoxReclaimSetScope(Emitter& e)
+            : e_(e),
+              boxReleaseEligible_(e.boxReleaseEligible_),
+              boxReassignedLocals_(e.boxReassignedLocals_),
+              boxReleaseEligibleFn_(e.boxReleaseEligibleFn_) {}
+        ~BoxReclaimSetScope() {
+            e_.boxReleaseEligible_ = std::move(boxReleaseEligible_);
+            e_.boxReassignedLocals_ = std::move(boxReassignedLocals_);
+            e_.boxReleaseEligibleFn_ = boxReleaseEligibleFn_;
+        }
+        BoxReclaimSetScope(const BoxReclaimSetScope&) = delete;
+        BoxReclaimSetScope& operator=(const BoxReclaimSetScope&) = delete;
+
+    private:
+        Emitter& e_;
+        std::unordered_set<const void*> boxReleaseEligible_;
+        std::unordered_set<const void*> boxReassignedLocals_;
+        llvm::Function* boxReleaseEligibleFn_;
     };
 
     // fix #3699 (§15.3 / §15.1.1 / §28.10 / §29.7 / §30.7, v0.286): the same
