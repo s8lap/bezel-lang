@@ -619,8 +619,38 @@ llvm::Value* Emitter::lowerUnary(const ast::UnaryExpr& un) {
                 // LocalSymbol is set ONLY for out-owned recipients — a regular
                 // plain `var`'s auto-drop lives on its LocalDecl — so this does
                 // not disturb the plain-`var` borrow-after-move idiom.)
+                //
+                // fix #4049 (§28.3/§28.8, v0.294): a plain-`var` LOCAL whose
+                // OWN `autoDropAtScopeEnd` (LocalDecl's flag, set by
+                // Ownership.cpp's nested-scope loop ~:1117) is armed — the
+                // ownership pass's dataflow never runs inside lambda bodies, so
+                // a `move x` reached inside a lambda body is invisible to
+                // `everDischarged_` and the auto-drop is wrongly armed even
+                // though `move x` actually transfers the value out. Nulling
+                // here is the SAME null-site fix case (c) applies for the
+                // out-owned-recipient twin — the scope-end disposal is
+                // null-guarded (registerUsingDisposal's dynamicDispose, fired
+                // by lowerStmt's emitAllDisposals), so nulling keeps the
+                // dispose a no-op and prevents the lambda-body double-free
+                // (the moved-out pointer otherwise reaches the caller AND the
+                // lambda's scope-end dispose fires on the SAME slot — measured
+                // heap-use-after-free under ASan). SAFETY: gated on
+                // `everDischarged_.count(x) == 0` in the ownership pass's
+                // nested-scope auto-drop loop (the loop above), so this null
+                // never overlaps a method-body shape where the move is on a
+                // conditional path and the slot must remain live for a
+                // subsequent borrow — the plain-`var` borrow-after-move idiom
+                // (`new T(move n, n)`) keeps its UN-nulled slot because n's
+                // autoDropAtScopeEnd is false there. // per §28.3, §28.8
+                const bool isPlainVarAutoDropAtScopeEnd = [&]() -> bool {
+                    if (auto* ld =
+                            dynamic_cast<const ast::LocalDecl*>(loc->decl))
+                        return ld->autoDropAtScopeEnd;
+                    return false;
+                }();
                 if (loc->isUsing || isIterVarAutoDrop ||
-                    loc->autoDropAtScopeEnd || isArmTransferDischarge) {
+                    loc->autoDropAtScopeEnd || isArmTransferDischarge ||
+                    isPlainVarAutoDropAtScopeEnd) {
                     if (llvm::AllocaInst* slotAI = localSlot(*id)) {
                         llvm::Type* ety = nullptr;
                         llvm::Value* addr = boxedStorage(slotAI, ety);
