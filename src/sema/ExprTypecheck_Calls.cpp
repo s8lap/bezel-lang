@@ -3932,8 +3932,17 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
             bool targetIsStaticReceiver = false;
             if (umTarget && dynamic_cast<const ast::IdentifierExpr*>(umTarget)) {
                 if (auto* tSym = ctx_.exprSymbol(*umTarget)) {
-                    targetIsStaticReceiver =
-                        dynamic_cast<sema::TypeSymbol*>(tSym) != nullptr;
+                    // §27.8 / fix #4073: a `type X := T` alias receiver resolves
+                    // to a TypeAliasSymbol, not a TypeSymbol — resolve through
+                    // the shared #4050/#4051 helper so an alias receiver is
+                    // recognized as the same static-receiver shape as `T` itself.
+                    if (dynamic_cast<sema::TypeSymbol*>(tSym) != nullptr) {
+                        targetIsStaticReceiver = true;
+                    } else if (auto* aliasSym =
+                                   dynamic_cast<sema::TypeAliasSymbol*>(tSym)) {
+                        targetIsStaticReceiver =
+                            resolveAliasToTypeSymbol(aliasSym) != nullptr;
+                    }
                 } else {
                     targetIsStaticReceiver = true;
                 }
@@ -22190,6 +22199,18 @@ bool ExprTC::isCaptureFreeEntry(const ast::Expr* entryExpr) const {
         if (ma->target) {
             Symbol* tgtSym = ctx_.exprSymbol(*ma->target);
             if (dynamic_cast<TypeSymbol*>(tgtSym)) return true; // static ref
+            // §27.8 / fix #4073: a `type X := T` alias receiver resolves to
+            // a TypeAliasSymbol, not a TypeSymbol — resolve through the
+            // shared #4050/#4051 free function (TypeResolution.hpp, the
+            // third hoisting seam those fixes established — this helper is
+            // const, so it calls the free function directly rather than the
+            // non-const member on `ExprTC`) so an alias-receiver static
+            // method reference is recognized as capture-free exactly like
+            // `T.Method`.
+            if (auto* aliasSym =
+                    dynamic_cast<TypeAliasSymbol*>(tgtSym)) {
+                return sema::resolveAliasToTypeSymbol(ctx_, aliasSym) != nullptr;
+            }
         }
         return false; // instance method ref
     }
