@@ -449,6 +449,38 @@ const sema::TypeRef* Emitter::genericBackingType(const sema::TypeRef* collTy,
     // above: the side-effecting half (actually building the comparator) is
     // `buildRecordCompareToThunk`, called only by an actual consumer
     // (`buildSortedObjectKeyIdentity`, from `lowerNew`'s allocation path).
+    // fix #3948 (stdlib §4.17, v0.294): `SortedDictionary<K, V>` KEY twin of
+    // the `SortedSet<T>` ELEMENT exception immediately above — a record KEY
+    // that is NOT auto-hashable (`recordTypeOfRef` excluded it above) but
+    // DOES declare a dispatchable single-parameter `CompareTo` (§4.17's
+    // `where K: IComparable<K>` shape). Before this line the `isSet` gate
+    // kept this branch from firing for the KEY side (#3740 named `SortedSet`
+    // explicitly for the same reason, never widening to the dictionary
+    // family), so a `SortedDictionary<Cmp, V>` returned nullptr here and the
+    // downstream diagnostic (LlvmBackend_Calls.cpp's `isDict` block, fix
+    // #3865) reported `"not yet supported in codegen"` — the legal-key
+    // shape the issue's own commit body records as a distinct diagnostic
+    // from the false "does not implement IComparable" claim an actual
+    // non-comparable record gets. Soundness is preserved by the existing
+    // downstream: `lowerNew` (LlvmBackend_Exprs2.cpp) ALREADY calls
+    // `buildSortedObjectKeyIdentity` for `colName == "SortedDictionary"`
+    // (line 5557-5558), which itself ALREADY tries `buildRecordCompareToThunk`
+    // for the `!recordTypeOfRef(keyTy)` shape (line 1083), so this branch's
+    // eligibility widening and that comparator builder land together as
+    // #3740's own fix insisted on — widening eligibility WITHOUT that
+    // thunk would route through `buildValueHashTrampoline` /
+    // `buildValueEqTrampoline`'s STRUCTURAL pair (silent-wrong-identity
+    // regression; same shape #3740's commit body warned against for the
+    // SortedSet ELEMENT case). Named explicitly to `SortedDictionary` for
+    // the same reason `SortedSet` is: `Dictionary`/`OwningDictionary` must
+    // NOT widen here (their stored identity is §8.3's `Equals`/`GetHashCode`
+    // per §4.8/§4.9, not `CompareTo`-equality — §4.17's rule for
+    // SortedDictionary is the strict exception), and the `recordTypeOfRef`
+    // path immediately above already covers an AUTO-HASHABLE record (which
+    // may or may not also declare CompareTo) without a behavior change.
+    else if (!isSet && collTy && collTy->headName() == "SortedDictionary" &&
+             !ty->nullable && recordHasDispatchableCompareTo(ty))
+        eligible = true;
     else if (isSet && collTy && collTy->headName() == "SortedSet" &&
              !ty->nullable && recordHasDispatchableCompareTo(ty))
         eligible = true;

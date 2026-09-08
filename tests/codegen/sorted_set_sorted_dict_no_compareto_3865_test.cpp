@@ -49,13 +49,15 @@
 //     GEP base pointer is not a vector or a vector of pointers
 //       %12 = getelementptr inbounds nuw %bz.string, %record.NoCmp %11, ...
 //
-// — for BOTH a record with no `CompareTo` at all (illegal per §4.17) AND,
-// separately, a record that DOES declare a dispatchable `CompareTo` (a LEGAL
-// §4.17 key that fix #3740 admitted for `SortedSet<T>`'s ELEMENT but never
-// extended to `SortedDictionary<K, V>`'s KEY, since that exception is gated
-// on `isSet` inside `genericBackingType`) — the latter gets a DIFFERENT,
-// "not yet implemented" diagnostic below (`NEEDLE_DICT_NOT_YET_IMPL`) rather
-// than the false "does not implement IComparable" claim.
+// — for a record with no `CompareTo` at all (illegal per §4.17); the
+// DISTINCT legal-`CompareTo` shape (a record that DOES declare a dispatchable
+// `CompareTo`, which fix #3740 admitted for `SortedSet<T>`'s ELEMENT but had
+// not extended to `SortedDictionary<K, V>`'s KEY, since that exception was
+// gated on `isSet` inside `genericBackingType`) was tracked as a follow-up
+// issue from #3865's own sweep, fixed by #3948, and now exercises a full
+// functional surface in sorteddictionary_cmp_key_3948_test.cpp — that file
+// is the regression test that pins the record-`CompareTo` KEY analogue
+// `SortedSet<T>`'s ELEMENT analogue got from #3740.
 //
 // THE FIX. `tryLowerCollectionInstanceCall`'s `SortedSet` arm and its
 // `isDict` block's `SortedDictionary` handling both now report ONE located,
@@ -463,31 +465,43 @@ BEZEL_TEST(sorted_set_no_compareto_3865, sortedset_cmp_element_full_functional) 
 // branch, fix #3740) — this fix's new `!cmpFn` guard in
 // LlvmBackend_Exprs.cpp must not reject it.
 BEZEL_TEST(sorted_set_no_compareto_3865, sorteddictionary_cmp_key_firstkey_still_works) {
-    // `Run`'s body is never actually INVOKED by `Main` (SortedDictionary<Cmp,
-    // int> cannot be constructed in-unit — see
-    // sorteddictionary_cmp_key_add_not_yet_implemented below), so this proves
-    // only that `.FirstKey` over this receiver COMPILES without the new
-    // guard rejecting it — `Main`'s own body (unconditional `return 0;`)
-    // still runs and determines the observed exit code.
+    // Pre-#3948 this test proved only that `.FirstKey` over a borrowed
+    // `SortedDictionary<Cmp, int>` receiver COMPILES (`buildSortedKeyComparator`
+    // already handled a record-`CompareTo` key from #3740) without the new
+    // `!cmpFn` guard rejecting it; `Main`'s body (unconditional `return 0;`)
+    // ran and determined the observed exit code. Post-#3948 the receiver is
+    // actually USABLE end-to-end — see sorteddictionary_cmp_key_3948_test.cpp
+    // for the full functional coverage — but the property-syntax `.FirstKey`
+    // twin of the call-syntax diagnostic remains in force, so this row still
+    // pins that guard does not reject the legal CompareTo-declaring shape.
     BEZEL_EXPECT_EQ(run(borrowedParamProg(
         "d: SortedDictionary<Cmp, int>",
         "var k := d.FirstKey; return k.Item; ")),
         0);
 }
 
-// `SortedDictionary<Cmp, int>.Add` is a LEGAL key per §4.17, but codegen's
-// dict-key dispatch (unlike `SortedSet`'s ELEMENT dispatch, fix #3740) has
-// never implemented the record-`CompareTo` case — measured on this tree, a
-// malformed-IR crash (`%record.Cmp` fed into `%bz.string`-shaped GEP/load)
-// identical in SHAPE to `NoCmp`'s, despite `Cmp` satisfying §4.17. The
-// message must say "not yet supported", never the FALSE "does not implement
-// IComparable" claim `NoCmp` correctly gets above.
-BEZEL_TEST(sorted_set_no_compareto_3865, sorteddictionary_cmp_key_add_not_yet_implemented) {
+// `SortedDictionary<Cmp, int>.Add` is a LEGAL key per §4.17, and was the
+// "not yet supported" diagnostic this fix (#3865) returned for a record key
+// with a dispatchable `CompareTo` — a shape `SortedSet<T>`'s ELEMENT dispatch
+// admitted under fix #3740 but whose KEY analogue had not been implemented.
+// Fix #3948 closed that gap: `genericBackingType` now admits the record KEY
+// the same way it admitted the ELEMENT, and the comparator build at
+// construction (`buildSortedObjectKeyIdentity`, called for
+// `colName == "SortedDictionary"` since fix #3488) and at `FirstKey`/
+// `LastKey` (`buildSortedKeyComparator`'s own record-`CompareTo` arm from
+// #3740) cover the runtime side. The dedicated regression file for that fix
+// (sorteddictionary_cmp_key_3948_test.cpp) exercises this end-to-end; here
+// we keep the false-reject guard below — `SortedDictionary<NoCmp, int>` (no
+// `CompareTo`) MUST still get the "does not implement IComparable<K>"
+// diagnostic, never the false positive that #3948's widening might
+// accidentally produce if `recordHasDispatchableCompareTo` were ever called
+// with the wrong type or the eligibility gate were dropped wholesale.
+BEZEL_TEST(sorted_set_no_compareto_3865, sorteddictionary_nocmp_key_still_rejected) {
     const std::string src = borrowedParamProg(
-        "d: SortedDictionary<Cmp, int>",
-        "var k := new Cmp(5); d.Add(k, 1); ");
-    BEZEL_EXPECT_TRUE(rejectsWith(src, NEEDLE_DICT_NOT_YET_IMPL));
-    BEZEL_EXPECT_TRUE(lacks(src, "does not implement `IComparable<K>`"));
+        "d: SortedDictionary<NoCmp, int>",
+        "var k := new NoCmp(5); d.Add(k, 1); ");
+    BEZEL_EXPECT_TRUE(rejectsWith(src, NEEDLE_DICT));
+    BEZEL_EXPECT_TRUE(lacks(src, NEEDLE_DICT_NOT_YET_IMPL));
 }
 
 // ── FALSE-REJECT GUARDS: this fix must not widen the rejection ──────────────
