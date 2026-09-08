@@ -73,6 +73,7 @@
 //       the #2491/#3079 warning backstop (`bezelc` exiting 0 while the
 //       comparison silently vanishes at run time).
 
+#include <cstring>
 #include <string>
 
 #include "support/aot_result_asserts.hpp"  // failedAtCompileTimeWithRealLocation
@@ -214,6 +215,16 @@ BEZEL_TEST(codegen_choice_equals_universal_argument_3893,
 // reversed that choice — this arm's own text was found strictly more useful
 // — and updated T6 (and added a T8) to assert THIS arm's text instead, so
 // both access spellings now report the identical diagnostic below.
+//
+// ⚠ THE ROW REVERSES (fix #3914, §8.1/§8.3/§8.6/§35.4/§35.7, v0.294). The
+// resolve-first change at the choice arm routes `Foo<int>(s, 7)` through
+// `equalsArgSettlesFalse(int, Sh)` — an `int` is a primitive, `Sh` is a
+// choice, §8.3 settles the answer at `False` — and emits `False` directly
+// from the dispatch core. The statement shape (`Console.WriteLine(...)`)
+// now PRINTS `False` rather than silently vanishing. The non-struct #3925
+// guard stays in place for the dead abstract-template pass; the row name
+// and `not_degraded_3925` suffix are kept (the degrade fix itself is not
+// undone), but the assertion below is updated for the new `False` answer.
 BEZEL_TEST(codegen_choice_equals_universal_argument_3893,
            choice_equals_non_struct_generic_arg_fails_closed_not_degraded_3925) {
     auto r = runAot(
@@ -231,20 +242,10 @@ BEZEL_TEST(codegen_choice_equals_universal_argument_3893,
         "    return 0; "
         "  end Main; "
         "end C;");
-    BEZEL_EXPECT_FALSE(r.ran);
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    bool named = false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("member `Equals`") != std::string::npos &&
-            d.message.find("`M3893D.Sh`") != std::string::npos)
-            named = true;
-    BEZEL_EXPECT_TRUE(named);
-    bool explainsWhy = false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("does not resolve to a value of that choice") !=
-            std::string::npos)
-            explainsWhy = true;
-    BEZEL_EXPECT_TRUE(explainsWhy);
+    // fix #3914: the program now COMPILES and prints "before\nFalse\nafter\n".
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("before\nFalse\nafter\n"));
 }
 
 // ── T5 (fix #3925 false-decline control) — the SAME unresolved-parameter
@@ -302,6 +303,17 @@ BEZEL_TEST(codegen_choice_equals_universal_argument_3893,
 // `BEZEL_EXPECT_FALSE(r.ran)` cannot tell "rejected at compile time" apart
 // from a runtime crash or an ASan report (issue #3892) — this row uses
 // `failedAtCompileTimeWithRealLocation` instead.
+//
+// ⚠ THE ROW REVERSES (fix #3914, §8.1/§8.3/§8.6/§35.4/§35.7, v0.294). The
+// resolve-first change at the choice arm routes `Foo<Pair>(s, new Pair(1,2))`
+// through `equalsArgSettlesFalse(Pair, Sh)` — different record/choice types
+// per §8.3 — and emits `False` directly from the dispatch core. The
+// struct-mismatch #3913 guard stays in place for the dead abstract-template
+// pass (where `resolveTypeParamRef` returns the bare-unresolved ref
+// unchanged and any subsequent struct-shape mismatch is still caught); the
+// row name and `plain_dot_3939` suffix are kept (the silent-degrade fix
+// itself is not undone), but the assertion below is updated for the new
+// `False` answer.
 BEZEL_TEST(codegen_choice_equals_universal_argument_3893,
            choice_equals_struct_mismatch_generic_arg_fails_closed_plain_dot_3939) {
     auto r = runAot(
@@ -319,13 +331,87 @@ BEZEL_TEST(codegen_choice_equals_universal_argument_3893,
         "    return 0; "
         "  end Main; "
         "end C;");
+    // fix #3914: the program now COMPILES and prints `False` per §8.3/§8.6.
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("False\n"));
+}
+
+// ── T7 (test #3955 — fix #3955's own repro, §8.1/§35.4/§35.7, v0.294) — the
+// GENERIC-INSTANTIATION-rendering sibling of T6. Issue #3955 observed that
+// the choice-arm diagnostic's receiver-name rendering used
+// `spec85QualifiedTypeName(ts)` (a `TypeSymbol`-only helper), which drops
+// generic args and so for a generic choice receiver produced just
+// `ModuleName.Box` instead of `ModuleName.Box<int>`. The diagnostic's
+// "give the argument the choice type" hint then became ambiguous — for a
+// `Box<int>.Equals(someBoxOfString)` mistake the user had to guess between
+// `Box<int>` and `Box<string>` because the receiver's instantiation was
+// already lost from the rendered name.
+//
+// This row exercises the STRUCT-MISMATCH arm (the more interesting site per
+// the issue: `at->declaration == ts` matches across DIFFERENT instantiations
+// of the same generic choice, so `equalsArgIsOwnTypeOrUnresolved` admits
+// the call to the structural-equality path and the loaded `Box<string>` value
+// then differs from `st == Box<int>`'s struct, triggering the struct-
+// mismatch guard). The plain `.` spelling avoids the `?.` wrapper so the
+// guard fires directly. The fix switches both choice-arm guards' name
+// rendering to `spec85TypeRefQualifiedName(recvTy)`, which produces the
+// universal-arg rendering (`Box<int>`).
+//
+// FAIL-WITHOUT (revert the two `spec85TypeRefQualifiedName(recvTy)` swaps
+// back to `spec85QualifiedTypeName(ts)`): the diagnostic renders
+// `` `M3955repro.Box` `` — the receiver's `<int>` instantiation is missing
+// and `BEZEL_EXPECT_TRUE(namedFullInstantiation)` fails. PASS-WITH: the
+// diagnostic renders `` `M3955repro.Box<int>` ``. The pre-existing
+// `failedAtCompileTimeWithRealLocation` and `explainsWhy` checks remain
+// green both before and after — they pin the structural fact of the
+// rejection, which the fix does not change.
+BEZEL_TEST(codegen_choice_equals_universal_argument_3893,
+           choice_equals_struct_mismatch_generic_receiver_renders_instantiation_3955) {
+    auto r = runAot(
+        "module M3955repro; "
+        "choice Box<T> Full(V: T), Empty; end Box; "
+        "class C "
+        "  public static method Main(): int "
+        "    var b: Box<int> := Box<int>.Full(1); "
+        "    var other: Box<string> := Box<string>.Full(\"x\"); "
+        "    var ans := b.Equals(other); "
+        "    Console.WriteLine(ans.ToString()); "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
     BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
-    bool named = false;
+    bool namedHeader = false;
     for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("member `Equals`") != std::string::npos &&
-            d.message.find("`M3939repro.Sh`") != std::string::npos)
-            named = true;
-    BEZEL_EXPECT_TRUE(named);
+        if (d.message.find("member `Equals`") != std::string::npos)
+            namedHeader = true;
+    BEZEL_EXPECT_TRUE(namedHeader);
+    // fix #3955's primary claim: the rendered receiver name carries the
+    // generic args (`<int>`), not just the bare declaration (`Box`). The
+    // pre-fix code rendered `MGCO.Box` — losing the `<int>` that names the
+    // receiver's instantiation.
+    bool namedFullInstantiation = false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("`M3955repro.Box<int>`") != std::string::npos)
+            namedFullInstantiation = true;
+    BEZEL_EXPECT_TRUE(namedFullInstantiation);
+    // Negative side of the same check: the bare-declaration form
+    // `` `M3955repro.Box` `` (no `<…>`) must NOT appear. If a future
+    // refactor re-introduces a `TypeSymbol`-only rendering here the
+    // text would match this and FAIL the row.
+    bool renderedBareDeclaration = false;
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        // match `` `M3955repro.Box` `` (closing backtick right after Box),
+        // distinct from `` `M3955repro.Box<int>` ``.
+        auto pos = d.message.find("`M3955repro.Box`");
+        if (pos == std::string::npos) continue;
+        // ensure the match is the *closing-backtick* form, not the start of
+        // `` `M3955repro.Box<int>` `` (which contains "`M3955repro.Box" as
+        // a prefix).
+        if (pos + std::strlen("`M3955repro.Box`") <= d.message.size())
+            renderedBareDeclaration = true;
+    }
+    BEZEL_EXPECT_FALSE(renderedBareDeclaration);
     bool explainsWhy = false;
     for (const auto& d : r.diagnostics.diagnostics())
         if (d.message.find("does not resolve to a value of that choice") !=

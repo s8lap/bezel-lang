@@ -3216,9 +3216,29 @@ llvm::Value* Emitter::lowerValueSemMethodOn(const sema::TypeRef* recvTy,
         // change there, since that body never runs.
         if (!other->getType()->isStructTy()) {
             if (emittingGenericTemplateBody_) return nullptr;
+            // fix #3955 (§8.1/§35.4/§35.7, v0.294): render the receiver's
+            // ACTUAL instantiation (`Box<int>`), not just the declaration
+            // symbol (`Box`). `spec85QualifiedTypeName(ts)` used the
+            // per-`TypeSymbol` name and dropped the generic args entirely, so
+            // for a generic receiver the diagnostic's "give the argument the
+            // choice type" wording was ambiguous (the user had to guess
+            // between `Box<int>` and `Box<string>` after a `Box<int>.Equals
+            // (someBoxOfString)` mistake). The universal-arg
+            // (`spec85TypeRefQualifiedName`) rendering handles a non-generic
+            // receiver identically to the prior form (`MGCO.Shape` is still
+            // `MGCO.Shape` — `recvTy->genericArgs` is empty and the rule-3
+            // `<<args>>` branch is skipped).
+            // fix #3900/#3905: the second remedy ("compare through an
+            // `Object`-typed operand") is currently unreachable for a
+            // GENERIC choice receiver — `isBoxableValueType` admits a
+            // non-generic choice (#3900) but declines a generic one because
+            // no per-instantiation box vtable exists yet (#3905). Once
+            // #3905 lands, this diagnostic text becomes accurate for that
+            // arm too — the rendered instantiation from this commit is the
+            // only half of the fix the text needed today.
             ctx_.diagnostics().report(
                 Severity::Error, call.span.begin,
-                "member `Equals` on a `" + spec85QualifiedTypeName(ts) +
+                "member `Equals` on a `" + spec85TypeRefQualifiedName(recvTy) +
                 "` receiver was given an argument whose type this "
                 "instantiation does not resolve to a value of that choice, "
                 "and \xC2\xA7""35.7's choice equality is defined over the "
@@ -3280,9 +3300,27 @@ llvm::Value* Emitter::lowerValueSemMethodOn(const sema::TypeRef* recvTy,
         // established (if previously undocumented) pattern rather than being
         // a special case.
         if (other->getType() != st) {
+            // fix #3955 (§8.1/§35.4/§35.7, v0.294): same instantiation-
+            // rendering fix as the non-struct guard above. The struct-
+            // mismatch guard is the more interesting site for this fix —
+            // it's where the issue's `Box<int>.Equals(someBoxOfString)`
+            // measurement lands (different instantiations of the same
+            // generic choice share `at->declaration == ts`, so
+            // `equalsArgIsOwnTypeOrUnresolved` admits the call to the
+            // structural-equality path; the loaded argument type then
+            // differs from `st` and THIS guard rejects it). Without this
+            // commit's rendering fix, the diagnostic said "member `Equals`
+            // on a `MGCO.Box` receiver..." — the receiver's INSTANTIATION
+            // was lost, and the user's "give the argument the choice type"
+            // hint became a guess between `Box<int>` and `Box<string>`.
+            // Same caveat about #3905's `Object`-typed operand remedy as
+            // the non-struct guard carries — generic choices can't be
+            // boxed to `Object` until #3905 lands, but the rendered
+            // instantiation from this commit makes the first remedy
+            // actionable today.
             ctx_.diagnostics().report(
                 Severity::Error, call.span.begin,
-                "member `Equals` on a `" + spec85QualifiedTypeName(ts) +
+                "member `Equals` on a `" + spec85TypeRefQualifiedName(recvTy) +
                 "` receiver was given an argument whose type this "
                 "instantiation does not resolve to a value of that choice, "
                 "and \xC2\xA7""35.7's choice equality is defined over the "
