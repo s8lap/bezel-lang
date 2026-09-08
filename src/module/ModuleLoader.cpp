@@ -2515,6 +2515,332 @@ static bool parseAndAttachDtorBody(
     return true;
 }
 
+// §22.8 step 1 / §22.10 / §11.1 (#3911/#3916): build a synthetic class source
+// for re-parsing a generic imported class's OWN inheritance-clause ARGUMENT
+// LIST. The header carries the class with its primary-ctor parameter list
+// AND its base clause (the base type comes from `td.baseTypes[0]`, the
+// argument list comes from the `baseCtorArgsText` wire carriage), so the
+// parser produces a fresh `ast::TypeDecl::primaryBaseCtorArgs` whose
+// expressions reference positional FieldSymbols (from the primary-ctor
+// params) and any other symbols that survive in the synthetic context.
+//
+// Field stubs are emitted for every instance field (`members` of kind Field,
+// excluding the primary-ctor positional fields that the `(mp: int)` header
+// itself declares as FieldSymbols) so a non-positional field reference in
+// the base-clause expression resolves; method stubs are emitted for the
+// same reason the ctor/dtor/method paths emit them — a base-clause argument
+// that calls a sibling method must resolve in the fresh context. The
+// resulting source is byte-identical in SHAPE to buildSyntheticClassSource
+// (module head + class header + field/method stubs + class end) so the
+// remap discipline below mirrors the ctor/dtor/method paths unchanged.
+//
+// `metaTypeToSourceText` is the same source-text canonicalizer the rest of
+// ModuleLoader uses for sibling-type spellings (#2375/#3645); the base type
+// here is the exporter's own declaration, so the spelling matches by
+// construction.
+static std::string buildSyntheticBaseClassSource(
+    const MetaTypeDecl& td, const std::string& baseCtorArgsText) {
+    std::string src = "module _3911_reparsed_base_;\n";
+    // Stub declaration of the BASE TYPE so the `Base3911` name in the
+    // inheritance clause resolves in the fresh module's symbol table — the
+    // fresh module is a fresh empty module with no imports, and the base
+    // type lives in the IMPORTED module, so the parser cannot find it by
+    // name without a local stub. The stub is a one-line forward-style
+    // declaration (empty body); what matters is that the base type's
+    // symbol exists and the inheritance-clause `Base3911` reference binds
+    // to it. The argument EXPRESSIONS are what this fix attaches to
+    // `importedPrimaryBaseCtorArgs` — codegen reads those expressions and
+    // does NOT call into the stub base type, so the stub's empty body is
+    // sound (it never has methods to call). Only emitted when the
+    // inheritance clause has a non-empty argument list (the entire point
+    // of this path is the inherited-argument re-parse).
+    if (!td.baseTypes.empty() && !baseCtorArgsText.empty()) {
+        if (td.baseTypes[0].kind == TypeKind::Named) {
+            std::string baseSimple = metaNamedSimpleName(td.baseTypes[0]);
+            if (!baseSimple.empty()) {
+                src += "public class " + baseSimple + " end " + baseSimple +
+                       ";\n";
+            }
+        }
+    }
+    src += metaVisibilityToKeyword(td.visibility);
+    src += " ";
+    src += (td.kind == MetaTypeDeclKind::Record ? "record " : "class ");
+    src += td.name;
+    if (!td.genericParams.empty()) {
+        src += "<";
+        for (std::size_t i = 0; i < td.genericParams.size(); ++i) {
+            if (i) src += ", ";
+            if (!td.genericParams[i].variance.empty() &&
+                td.genericParams[i].variance != "none") {
+                src += td.genericParams[i].variance + " ";
+            }
+            src += td.genericParams[i].name;
+        }
+        src += ">";
+    }
+    // Primary-ctor parameter list (the `hasPositionalFields` `(mp: int)`
+    // form) — emitted so the synthetic class's positional FieldSymbols
+    // exist for the inheritance-clause argument expressions to reference.
+    // The list itself is built by walking `td.members` for the FIRST `n`
+    // FieldSymbols that are positional (the same discipline
+    // `recordPositionalFieldSymbols` uses on the import side), then
+    // serializing each one's `type` via `metaTypeToSourceText`. Mirrors the
+    // argument-list shape `Parser_Decls.cpp:3120-323` accepts at parse time.
+    std::vector<const MetaMember*> positional;
+    for (const MetaMember& mm : td.members) {
+        if (mm.kind != MetaMemberKind::Field) continue;
+        if (!mm.isPositional) continue;
+        positional.push_back(&mm);
+    }
+    if (!positional.empty()) {
+        src += "(";
+        for (std::size_t i = 0; i < positional.size(); ++i) {
+            if (i) src += ", ";
+            src += positional[i]->name + " : " +
+                   metaTypeToSourceText(positional[i]->type);
+        }
+        src += ")";
+    }
+    // Base clause: ` : <BaseType>(<args>)` — the base type comes from
+    // `td.baseTypes[0]` (the documented convention that the first entry, if
+    // it is a class, is the base class; see ModuleMetadata.hpp's
+    // `baseTypes` comment), and the argument list is the wire carriage
+    // verbatim. The argument text is already what the exporter wrote
+    // (span-extracted from `CallArgument::value->span`, joined with `", "`),
+    // so re-parsing it in this synthetic context reproduces the original
+    // `primaryBaseCtorArgs` shape.
+    if (!td.baseTypes.empty() && !baseCtorArgsText.empty()) {
+        src += " : " + metaTypeToSourceText(td.baseTypes[0]) +
+               "(" + baseCtorArgsText + ")";
+    }
+    src += "\n";
+    // Field stubs for NON-positional fields (the primary-ctor params already
+    // declare their own positional FieldSymbols via the `(mp: int)` header
+    // above). A base-clause argument expression that references a
+    // non-positional field needs this stub so the symbol resolves in the
+    // fresh context; the remap loop below redirects it at the imported
+    // FieldSymbol in mainCtx.
+    for (const MetaMember& mm : td.members) {
+        if (mm.kind != MetaMemberKind::Field) continue;
+        if (mm.isPositional) continue;
+        src += "  " + metaVisibilityToKeyword(mm.visibility);
+        for (const std::string& mod : mm.modifiers) src += " " + mod;
+        src += " " + mm.name + " : " + metaTypeToSourceText(mm.type) + ";\n";
+    }
+    // Method stubs for self-call resolution (same discipline as
+    // buildSyntheticClassSource / buildSyntheticDtorSource). A base-clause
+    // argument expression that calls a sibling method needs the stub.
+    for (const MetaMember& mm : td.members) {
+        if (mm.kind != MetaMemberKind::Method) continue;
+        if (mm.isOperator) continue;
+        std::string stub = buildMethodStub(mm, td, /*importsModule=*/false);
+        if (!stub.empty()) src += stub + "\n";
+    }
+    src += "end " + td.name + ";\n";
+    return src;
+}
+
+// §22.8 step 1 / §22.10 / §11.1 (#3911/#3916): parse `td.baseCtorArgsText`
+// (the wire carriage from the exporter) in a FRESH SemaContext with the
+// synthetic class header above, extract the fresh
+// `ast::TypeDecl::primaryBaseCtorArgs`, remap the symbols those expressions
+// reference into the IMPORTED class's symbol table in mainCtx, and store the
+// remapped `CallArgument`s on `importedType.importedPrimaryBaseCtorArgs` so
+// `primaryBaseCtorArgsOf` (Symbol.hpp) reads them. Returns false (and leaves
+// the field empty) when the parse fails or sema cannot bind the fresh
+// symbols back to the imported ones.
+//
+// Symbol remap discipline mirrors the ctor-body path (`parseAndAttachCtorBody`):
+//   fresh IdentifierExpr* → fresh FieldSymbol   →  mainCtx[same expr*] = importedFieldSym
+//   fresh IdentifierExpr* → fresh ParamSymbol   →  mainCtx[same expr*] = importedParamSym
+//   fresh IdentifierExpr* → fresh MethodSymbol  →  mainCtx[same expr*] = importedMethodSym
+//   fresh IdentifierExpr* → fresh LocalSymbol   →  mainCtx[same expr*] = SAME freshSym
+// … with both the fresh arena and the fresh SourceFile kept alive via
+// `mainCtx.ownImported*`, exactly as the ctor/dtor/method paths do. This
+// keeps the fresh `Expr*` nodes (the `CallArgument::value` unique_ptrs we
+// copy into the attached vector) reachable for codegen, and keeps the
+// symbol-table side entries `lowerExpr` consults populated for the same
+// expr pointers.
+static bool parseAndAttachBaseCtorArgs(
+    const MetaTypeDecl& td,
+    sema::TypeSymbol& importedType,
+    sema::SemaContext& mainCtx) {
+    if (td.baseCtorArgsText.empty()) return false;
+    if (td.baseTypes.empty()) return false;
+
+    std::string source = buildSyntheticBaseClassSource(td, td.baseCtorArgsText);
+
+    // Fresh lexer/parser for the mini class with the base clause.
+    DiagnosticEngine freshDiag;
+    Lexer freshLex(source, freshDiag);
+    Parser freshParser(freshLex, freshDiag);
+    auto sf = freshParser.parseCompilationUnit();
+    if (!sf) return false;
+    if (freshDiag.hasErrors()) return false;
+
+    // The fresh context AND its diagnostics must OUTLIVE this function, for
+    // the same reason parseAndAttachCtorBody / parseAndAttachDtorBody / the
+    // others keep their fresh contexts alive: the attached `primaryBaseCtorArgs`
+    // Expr* nodes point into the fresh arena, and codegen keys its symbol
+    // remaps off `ctx_.exprSymbol(expr)` which holds pointers into that arena.
+    // Heap-allocate both; the engine is destroyed LAST (SemaContext holds a
+    // DiagnosticEngine&), so push the engine FIRST.
+    auto semaDiagPtr = std::make_shared<DiagnosticEngine>();
+    DiagnosticEngine& semaDiag = *semaDiagPtr;
+    auto freshCtxPtr = std::make_shared<sema::SemaContext>(semaDiag);
+    sema::SemaContext& freshCtx = *freshCtxPtr;
+    sema::collectSymbols(*sf, freshCtx);
+    if (semaDiag.hasErrors()) return false;
+    sema::resolveTypes(*sf, freshCtx);
+    if (semaDiag.hasErrors()) return false;
+    sema::typecheckExpressions(*sf, freshCtx);
+    // Mirror the ctor-body path: tolerate post-typecheck sema errors so a
+    // base-clause argument that fails a §22.5 / §5.1 check still produces
+    // the fresh symbols and expr-type entries codegen needs.
+    // Mirror the ctor-body path: tolerate post-typecheck sema errors so a
+    // base-clause argument that fails a §22.5 / §5.1 check still produces
+    // the fresh symbols and expr-type entries codegen needs. A hard parse
+    // failure is caught above; sema errors here are usually benign for the
+    // subset we are interested in (positional-param field reads, self-method
+    // calls that the synthetic stub already gates — see #2842).
+
+    // Locate the fresh TypeSymbol in the fresh module.
+    sema::TypeSymbol* freshType = nullptr;
+    if (freshCtx.module()) {
+        for (sema::Symbol* child : freshCtx.module()->children) {
+            auto* ts = dynamic_cast<sema::TypeSymbol*>(child);
+            if (ts && std::string(ts->name) == td.name) {
+                freshType = ts;
+                break;
+            }
+        }
+    }
+    if (!freshType) return false;
+    auto* freshTd = dynamic_cast<const ast::TypeDecl*>(freshType->decl);
+    if (!freshTd) return false;
+    if (freshTd->primaryBaseCtorArgs.empty()) return false;
+
+    // Build name→FieldSymbol/ParameterSymbol/MethodSymbol maps for the
+    // imported type so a fresh reference resolves to the IMPORTED symbol
+    // (the ctor-body remap loop's discipline).
+    std::unordered_map<std::string_view, sema::Symbol*> importedFields;
+    std::unordered_map<std::string, sema::Symbol*> importedMethods;
+    for (sema::Symbol* m : importedType.members) {
+        if (!m || m->name.empty()) continue;
+        if (dynamic_cast<sema::FieldSymbol*>(m)) {
+            importedFields[m->name] = m;
+        }
+    }
+    {
+        std::size_t importedIdx = 0;
+        for (const MetaMember& mmItem : td.members) {
+            if (!metaMemberProducesSymbol(mmItem)) continue;
+            if (importedIdx >= importedType.members.size()) break;
+            sema::Symbol* sym = importedType.members[importedIdx++];
+            if (mmItem.kind == MetaMemberKind::Method && !mmItem.isOperator) {
+                importedMethods[metaMemberSigKey(mmItem.name, mmItem.params)] =
+                    sym;
+            }
+        }
+    }
+
+    // Lambda-parameter symbol set — a parameter declared inside the
+    // expression (rare but possible — a base-clause argument that names a
+    // lambda's parameter) carries no importer-side counterpart and must be
+    // carried verbatim. Same set the ctor-body / method-body / dtor-body
+    // paths build for the same reason.
+    std::unordered_set<const sema::Symbol*> freshLambdaParamSyms;
+    for (const auto& [lam, syms] : freshCtx.allLambdaParams())
+        for (sema::Symbol* ps : syms)
+            if (ps) freshLambdaParamSyms.insert(ps);
+
+    // Remap fresh symbols into mainCtx. Mirrors parseAndAttachCtorBody's
+    // remap loop exactly, so the ctor-body's own logic is byte-for-byte the
+    // same predicate across the two paths.
+    for (const auto& [expr, freshSym] : freshCtx.allExprSymbols()) {
+        if (!expr || !freshSym) continue;
+        if (dynamic_cast<sema::FieldSymbol*>(freshSym)) {
+            // A base-clause argument that names a positional primary-ctor
+            // parameter is the typical case (`Base(mp)` reads the fresh
+            // FieldSymbol for `mp`); a non-positional field reference also
+            // remaps by name.
+            auto it = importedFields.find(freshSym->name);
+            if (it != importedFields.end())
+                mainCtx.setExprSymbol(expr, it->second);
+        } else if (auto* freshPs = dynamic_cast<sema::ParameterSymbol*>(freshSym)) {
+            // A lambda parameter — carried verbatim (no importer-side
+            // counterpart), guarded on membership in the fresh context's
+            // lambda-param set so an unrelated ParameterSymbol is declined.
+            if (freshLambdaParamSyms.count(freshSym))
+                mainCtx.setExprSymbol(expr, freshSym);
+        } else if (auto* freshMs = dynamic_cast<sema::MethodSymbol*>(freshSym)) {
+            // A sibling-method call inside the base-clause expression — the
+            // same signature-keyed remap the ctor-body path uses (#705).
+            auto it = importedMethods.find(freshMethodSigKey(freshMs));
+            if (it != importedMethods.end())
+                mainCtx.setExprSymbol(expr, it->second);
+        } else if (dynamic_cast<sema::LocalSymbol*>(freshSym)) {
+            // A local declared inside the base-clause expression — rare, but
+            // the ctor-body / dtor-body / method-body paths all carry
+            // Locals verbatim (#2290 bug 1, #2818).
+            mainCtx.setExprSymbol(expr, freshSym);
+        }
+    }
+
+    // Copy the fresh context's resolved-type and expr-type entries into
+    // mainCtx so codegen's per-instantiation `ctx_.resolvedType(decl)` /
+    // `ctx_.exprType(expr)` lookups find a TypeRef for the re-parsed nodes.
+    // Verbatim copy, as the ctor/dtor/method paths do — the keys are
+    // unique to the fresh AST, and the values point into the fresh arena
+    // (kept alive at the tail via ownImportedAuxiliary).
+    //
+    // Rebind self-TypeRefs to the imported type, mirroring parseAndAttachCtorBody
+    // (#2954): a TypeRef naming the class being reconstructed would point
+    // at the SYNTHETIC self-class with no field initializers / vtable / its
+    // own struct identity. Without the rebind, a base-clause argument that
+    // names the enclosing class (`class Mid<T> { ... Mid(...) }` is not
+    // valid syntax in a base clause, but the rebind is safe for the
+    // generic-arg form which IS reachable — `class Mid<T> : Container<Mid>`).
+    rebindSelfTypeRefsIn(freshCtx, freshType, &importedType);
+    for (const auto& [astTy, ref] : freshCtx.allResolvedTypes())
+        if (astTy && ref) mainCtx.setResolvedType(astTy, ref);
+    for (const auto& [expr, ref] : freshCtx.allExprTypes())
+        if (expr && ref) mainCtx.setExprType(expr, ref);
+    // Lambda-parameter lists (carried verbatim so `lowerLambda` finds them
+    // when the base-clause expression closes over a sibling lambda — rare
+    // but covered for symmetry with the ctor/dtor/method paths, #2839).
+    for (const auto& [lam, syms] : freshCtx.allLambdaParams())
+        if (lam) mainCtx.setLambdaParams(lam, syms);
+    // Pattern symbols (rare in a base-clause expression, but `is` patterns
+    // over local declarations would land here — copied verbatim so codegen
+    // sees the same symbol the parser bound).
+    for (const auto& [pat, sym] : freshCtx.allPatternSymbols())
+        if (pat && sym) mainCtx.setPatternSymbol(pat, sym);
+
+    // Attach the parsed primaryBaseCtorArgs to the IMPORTED type symbol.
+    // The vector's `CallArgument::value` Expr* nodes live in the fresh arena
+    // (kept alive at the tail); copying them here transfers ownership of the
+    // Expr* (unique_ptr move) into the imported symbol, so the imported
+    // class's `primaryBaseCtorArgsOf` reads them with the right pointer
+    // identity for codegen's `ctx_.exprSymbol(expr)` side-table lookups.
+    importedType.importedPrimaryBaseCtorArgs =
+        std::move(const_cast<std::vector<ast::CallArgument>&>(
+            freshTd->primaryBaseCtorArgs));
+
+    // Keep the backing synthetic source string alive (string_view fields in
+    // the re-parsed AST point into it), the SourceFile, and the fresh
+    // SemaContext + diagnostics. Order matters: importedAuxiliary_ destroys
+    // in REVERSE insertion order, and SemaContext holds a DiagnosticEngine&,
+    // so push the engine FIRST (destroyed last) and the context SECOND
+    // (destroyed first) — context-then-engine, never dangling.
+    mainCtx.ownImportedSource(std::move(source));
+    mainCtx.ownImportedAst(std::move(sf));
+    mainCtx.ownImportedAuxiliary(semaDiagPtr);
+    mainCtx.ownImportedAuxiliary(freshCtxPtr);
+    return true;
+}
+
 // §14.1 / #783: build a synthetic class source for re-parsing ONE imported
 // generic method's body.  All fields are declared (so field references resolve),
 // every OTHER method is emitted as a signature-only stub (so self-calls resolve),
@@ -4499,6 +4825,29 @@ static void loadMetadataPass2(
         // Dtor body: the dtorBodyText is on the MetaTypeDecl itself.
         if (!td.dtorBodyText.empty()) {
             parseAndAttachDtorBody(td, td.dtorBodyText, *t, ctx);
+        }
+
+        // §22.8 step 1 / §22.10 / §11.1 (#3911/#3916): inheritance-clause
+        // argument list — `baseCtorArgsText` is on the MetaTypeDecl itself.
+        // Re-parse the argument text in a fresh SemaContext with a synthetic
+        // class header (base type from `td.baseTypes[0]`, primary-ctor
+        // parameters from `td.members` filtered to positional fields) so a
+        // generic imported MIDDLE ancestor's OWN base clause can be replayed
+        // by `emitImplicitBase` / `prePopulateBasePositionalFields`, which
+        // both read `primaryBaseCtorArgs` via `dynamic_cast<ast::TypeDecl*>
+        // (cls->decl)` — and `cls->decl` is null for every imported type
+        // (the #2374-class gap; `TypeSymbol::decl` stays null on purpose —
+        // widening it is a separate, much larger risk this fix declines to
+        // take). The freshly-parsed `ast::CallArgument` vector is attached
+        // to `t->importedPrimaryBaseCtorArgs`, exposed via
+        // `primaryBaseCtorArgsOf` (Symbol.hpp).
+        //
+        // Gated on `hasPositionalFields` for symmetry with the exporter's
+        // emission gate — a non-positional-ctor class has no
+        // `primaryBaseCtorArgs` shape (the wire format's carriage is empty
+        // for it), so this is a no-op rather than a malformed re-parse.
+        if (t->hasPositionalFields && !td.baseCtorArgsText.empty()) {
+            parseAndAttachBaseCtorArgs(td, *t, ctx);
         }
     }
 

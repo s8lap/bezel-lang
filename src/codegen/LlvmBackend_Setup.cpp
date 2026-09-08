@@ -13019,9 +13019,23 @@ void Emitter::emitImplicitBase(const sema::TypeSymbol* cls, llvm::Value* obj,
     // primary / no-explicit-ctor base has no ConstructorSymbol, so ctorByArity
     // returns null and control falls through to prePopulateBasePositionalFields +
     // the no-ctor field-init below — keeping the two mechanisms mutually exclusive.
-    if (auto* td = dynamic_cast<const ast::TypeDecl*>(cls->decl)) {
-        if (!td->primaryBaseCtorArgs.empty()) {
-            std::size_t n = td->primaryBaseCtorArgs.size();
+    // §22.8 step 1 / §22.10 / §11.1 (#3911/#3916): read the inheritance-
+    // clause argument EXPRESSIONS via `primaryBaseCtorArgsOf`, NOT a raw
+    // `dynamic_cast<ast::TypeDecl*>(cls->decl)` — the latter is null for
+    // every imported class (the #2374-class gap, deliberately load-bearing
+    // elsewhere — see CLAUDE.md §6 / Symbol.hpp), and that nullity is
+    // exactly the gap that dropped a generic imported MIDDLE ancestor's
+    // OWN base clause arguments (measured: `bp=0` instead of `bp=7` on
+    // `class Derived(a): Mid<int>(a)` over an imported `Mid<T>(mp): Base(mp)`
+    // because this arm saw no `primaryBaseCtorArgs` to evaluate for `mid`).
+    // The accessor returns the local vector when `cls` has a real decl, the
+    // imported-replay vector when it does not, and null when neither
+    // applies — a `if (auto* args = ...)` guard mirrors the ctor/dtor/
+    // method-body accessor's call pattern.
+    if (const std::vector<ast::CallArgument>* clsBaseArgs =
+            sema::primaryBaseCtorArgsOf(cls)) {
+        if (!clsBaseArgs->empty()) {
+            std::size_t n = clsBaseArgs->size();
             // fix #3731 (§22.8 step 1 / §22.10, v0.286): resolve the base
             // call with `ctorForArgs` — the SAME resolver `new` uses to pick
             // between a class's explicit constructors and its §22.10 PRIMARY
@@ -13050,15 +13064,14 @@ void Emitter::emitImplicitBase(const sema::TypeSymbol* cls, llvm::Value* obj,
             // arity-0 fallback below and NOT into the route-to-primary `else
             // if`); `.fn` is the callable.
             BaseClauseExplicitCtor bce =
-                baseClauseExplicitCtor(b, td->primaryBaseCtorArgs);
+                baseClauseExplicitCtor(b, *clsBaseArgs);
             if (sema::ConstructorSymbol* bt = bce.cs) {
                 if (bce.fn) {
                     std::vector<llvm::Value*> args;
                     args.push_back(obj);
                     bool ok = true;
-                    for (std::size_t i = 0; i < td->primaryBaseCtorArgs.size();
-                         ++i) {
-                        const auto& a = td->primaryBaseCtorArgs[i];
+                    for (std::size_t i = 0; i < clsBaseArgs->size(); ++i) {
+                        const auto& a = (*clsBaseArgs)[i];
                         if (!a.value) { ok = false; break; }
                         llvm::Value* v = lowerExpr(*a.value);
                         // fix #3433 (§4.7 / §22.8 / §11.1, v0.283): the
@@ -13137,8 +13150,8 @@ void Emitter::emitImplicitBase(const sema::TypeSymbol* cls, llvm::Value* obj,
                         // per §22.10 / §28.9, issue #3759; sibling #3742.
                         if (!diverged_) {
                             for (std::size_t ai = 0;
-                                 ai < td->primaryBaseCtorArgs.size(); ++ai) {
-                                const auto& a = td->primaryBaseCtorArgs[ai];
+                                 ai < clsBaseArgs->size(); ++ai) {
+                                const auto& a = (*clsBaseArgs)[ai];
                                 // Skip args past the ctor's declared arity —
                                 // these are the §22.5 defaults
                                 // `fillOmittedCtorArgs` materialized above
@@ -13172,10 +13185,11 @@ void Emitter::emitImplicitBase(const sema::TypeSymbol* cls, llvm::Value* obj,
                 //
                 // `b`'s own positional-param fields are ALREADY populated:
                 // `prePopulateBasePositionalFields` (LlvmBackend_Exprs2.cpp)
-                // stores `td->primaryBaseCtorArgs` — the SAME values read
-                // above — into them at the construction entry point (the
-                // `new` site locally, `emitInitEntryBody` across a module),
-                // strictly before this function runs. So there is nothing to
+                // stores the inheritance-clause argument VALUES (the SAME
+                // values read above via `primaryBaseCtorArgsOf`) into them
+                // at the construction entry point (the `new` site locally,
+                // `emitInitEntryBody` across a module), strictly before this
+                // function runs. So there is nothing to
                 // (re-)store here; what remains is exactly §22.8 steps 1+2
                 // for `b` ITSELF — its own base chain, then its own field
                 // initializers — run UNCONDITIONALLY, because `b`'s explicit

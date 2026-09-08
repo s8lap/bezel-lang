@@ -142,7 +142,23 @@ enum RecordCode : unsigned {
     // silent §7.9 default for a stale not-yet-recompiled dependency, same
     // dependency-direction safety as REC_POSPARAM_DEFAULT.
     REC_AUTO_PROP_INIT = 14,
-    // 15.. additive; unknown codes are skipRecord()'d by the reader
+    // §22.8 step 1 / §22.10 / §11.1 (#3911/#3916, additive within v7):
+    // TYPE_BLOCK — the source text of this class's OWN inheritance-clause
+    // argument list (the `(args...)` after the first base type), as a string
+    // payload under its OWN code. Emitted only when non-empty, so a module
+    // whose types declare no `hasPositionalFields` base-clause argument list
+    // is byte-identical to a pre-#3916 build. A distinct code (rather than
+    // reusing #662c's trailing `dtorBodyText` REC_STRING) for the same
+    // reason REC_EXC_BASE / REC_DISPOSE_VERDICT above are coded: those
+    // fields are independent of `dtorBodyText` (none of them share its
+    // positional slot in the type block) and may be absent or present in
+    // arbitrary combinations. Absent (an OLD artifact) reads as "" — the
+    // pre-fix behaviour, which is the §3911 silent-wrong-value defect the
+    // importer-side `parseAndAttachBaseCtorArgs` closes. See
+    // MetaTypeDecl::baseCtorArgsText for the byte-identical-serialization
+    // rationale and the dependency-direction staleness contract.
+    REC_BASE_CTOR_ARGS = 15,
+    // 16.. additive; unknown codes are skipRecord()'d by the reader
     REC_UNKNOWN_FUTURE = 90, // test-only: a record code this reader skips
 };
 
@@ -372,6 +388,16 @@ void hashTypeDecl(std::uint64_t& h, const MetaTypeDecl& ty) {
     hashBool(h, ty.hasPositionalFields);
     // §14 / #662c (schema v5): destructor body source text for generic classes.
     hashStr(h, ty.dtorBodyText);
+    // §22.8 step 1 / §22.10 / §11.1 (#3911/#3916): the inheritance-clause
+    // argument list source text. Public-interface content — adding or
+    // removing a positional-param binding (`class Mid<T>(mp: int): Base(mp)`
+    // vs `: Base(0)`) changes the construction sequence and so changes
+    // every consumer's emitted initializer (§2.8.3 rule 3 staleness must
+    // track it). GUARDED ON EXACTLY THE EMISSION'S CONDITION (emitTypeDecl
+    // below): the same rule #2950 / #3139 / #3144 / #3191 / #3179 state —
+    // a fold the writer never wrote moves the VBR-encoded header hash of
+    // every artifact for a change that wrote nothing.
+    if (!ty.baseCtorArgsText.empty()) hashStr(h, ty.baseCtorArgsText);
     // §12 / §31.4 (#2950): the built-in exception base. It decides the class's
     // LAYOUT on both sides of the boundary, so it is public-interface content
     // that staleness detection must track — a dependency that gains or loses
@@ -713,6 +739,11 @@ bool MetaTypeDecl::operator==(const MetaTypeDecl& o) const {
            invariants == o.invariants &&
            hasPositionalFields == o.hasPositionalFields &&
            dtorBodyText == o.dtorBodyText &&
+           // §22.8 step 1 / §22.10 (#3911/#3916): the inheritance-clause
+           // argument list text — part of the public contract (§2.8.3 rule 3
+           // staleness must track it), so two metadata values differing only
+           // in it are NOT equal.
+           baseCtorArgsText == o.baseCtorArgsText &&
            builtinExceptionBase == o.builtinExceptionBase &&
            builtinInterfaceBases == o.builtinInterfaceBases &&
            // §35.1 (#3144): the case list is part of a choice's identity.
@@ -1156,6 +1187,20 @@ void emitTypeDecl(llvm::BitstreamWriter& w, const MetaTypeDecl& ty) {
     // is silently ignored (tolerant skip-unknown). Only emit for generic classes.
     if (!ty.genericParams.empty())
         emitString(w, ty.dtorBodyText);
+    // §22.8 step 1 / §22.10 / §11.1 (#3911/#3916): the class's inheritance-
+    // clause argument LIST source text, under its own record code (REC_BASE_CTOR_ARGS)
+    // so it is independent of #662c's trailing `dtorBodyText` REC_STRING
+    // above. The first carries base-CLAUSE ARGUMENTS, the second carries a
+    // DESTRUCTOR body; a third positional REC_STRING would make a future
+    // field's `capIdx` ordering load-bearing for `dtorBodyText` vs
+    // `baseCtorArgsText` (a coded record is self-describing — see REC_SER_TYPE_SHAPE
+    // and the ⚠ block above this section's 8th scalar). Emitted only when
+    // non-empty, so a module with no inheritance-clause arg list anywhere is
+    // BYTE-IDENTICAL to a pre-#3916 build. Position after the dtorBodyText
+    // trailing string and before the REC_EXC_BASE trailing capture record
+    // mirrors the order hashTypeDecl folds them in.
+    if (!ty.baseCtorArgsText.empty())
+        emitStringAs(w, REC_BASE_CTOR_ARGS, ty.baseCtorArgsText);
     // §12 / §31.4 (#2950): the built-in exception base, under its own record
     // code so it is independent of the trailing dtorBodyText string above.
     // Emitted only when non-empty, so a module with no exception subclass
@@ -1515,6 +1560,17 @@ bool enterSubblock(Reader& r, unsigned wantId) {
 // when it is null — every caller but readTypeDeclBody — the block is
 // SkipBlock()'d exactly as an unknown subblock id always was, which is also
 // precisely what a reader predating this field does.
+//
+// §22.8 step 1 / §22.10 (#3911/#3916): a THIRD coded string capture for
+// REC_BASE_CTOR_ARGS. Same shape as `secondCodedCapture` below (the
+// #3179 family) — independent, self-describing, `skipRecord()`'d by any
+// reader predating the field, nullptrable so this stays a strict extension
+// of the previous 9-argument API. `secondCodedCapture` and `thirdCodedCapture`
+// coexist because TYPE_BLOCK now holds TWO independent optional strings
+// alongside `codedCapture` (REC_EXC_BASE) — `serializedShape` (#3179) and
+// `baseCtorArgsText` (#3911/#3916) — and conflating them via a single slot
+// would be exactly the silent misparse the comment on `emitTypeDecl`'s 8th
+// scalar warns about.
 bool readChoiceCaseBody(Reader& r, MetaChoiceCase& cc);  // fwd (#3144)
 bool readPolyCaseBody(Reader& r,
                       MetaTypeDecl::MetaPolyCase& pc);  // fwd (#3179)
@@ -1536,7 +1592,15 @@ bool finishBlockImpl(Reader& r, std::string* captureString,
                      unsigned secondCapturedCode = 0,
                      std::string* secondCodedCapture = nullptr,
                      std::vector<MetaTypeDecl::MetaPolyCase>* polyCases =
-                         nullptr) {
+                         nullptr,
+                     // §22.8 step 1 / §22.10 / §11.1 (#3911/#3916): a THIRD
+                     // coded string capture for REC_BASE_CTOR_ARGS. See the
+                     // header comment above. nullptrable; the unconditional
+                     // capture-string-pointer test below is widened to include
+                     // this new slot so an absent record is still `skipRecord()`'d
+                     // for a reader predating the field — the pre-fix reading.
+                     unsigned thirdCapturedCode = 0,
+                     std::string* thirdCodedCapture = nullptr) {
     while (true) {
         unsigned id = 0;
         Next n = nextEntry(r, id);
@@ -1547,7 +1611,7 @@ bool finishBlockImpl(Reader& r, std::string* captureString,
         }
         if (n == Next::Record) {
             if (captureString != nullptr || codedCapture != nullptr ||
-                disposeVerdict != nullptr) {
+                disposeVerdict != nullptr || thirdCodedCapture != nullptr) {
                 // Read this record; capture it if it is one we are waiting for.
                 llvm::SmallVector<std::uint64_t, 32> vals;
                 auto got = r.cursor.readRecord(id, vals);
@@ -1583,6 +1647,16 @@ bool finishBlockImpl(Reader& r, std::string* captureString,
                     // the pre-fix reading.
                     dst = secondCodedCapture;
                     secondCodedCapture = nullptr;
+                } else if (thirdCodedCapture != nullptr &&
+                           code == thirdCapturedCode) {
+                    // §22.8 step 1 / §22.10 (#3911/#3916): the third
+                    // coded-capture slot. Same shape and semantics as the
+                    // `secondCodedCapture` arm above (decode bytes, last
+                    // record wins — at most one REC_BASE_CTOR_ARGS exists
+                    // per type, so "last wins" is unreachable in practice).
+                    // Absent leaves the field empty, the pre-fix reading.
+                    dst = thirdCodedCapture;
+                    thirdCodedCapture = nullptr;
                 }
                 if (dst != nullptr) {
                     dst->clear();
@@ -2091,11 +2165,19 @@ bool readTypeDeclBody(Reader& r, MetaTypeDecl& ty) {
     // matching the emission's self-describing layout. Absent on either is the
     // pre-fix reading: an empty `serializedShape` and an empty registry, both
     // of which a non-§9.8-class wants anyway.
+    //
+    // §22.8 step 1 / §22.10 / §11.1 (#3911/#3916): the `baseCtorArgsText`
+    // inheritance-clause argument list source text, through the new
+    // `thirdCodedCapture` slot. Same independent, self-describing record-code
+    // shape — absent leaves the field empty, the pre-fix reading, which is
+    // exactly the §3911 silent-wrong-value defect the importer-side
+    // `parseAndAttachBaseCtorArgs` closes.
     return finishBlockImpl(
         r, !ty.genericParams.empty() ? &ty.dtorBodyText : nullptr,
         REC_EXC_BASE, &ty.builtinExceptionBase, &ty.choiceCases,
         &ty.nonTrivialDispose,
-        REC_SER_TYPE_SHAPE, &ty.serializedShape, &ty.serializedPolyCases);
+        REC_SER_TYPE_SHAPE, &ty.serializedShape, &ty.serializedPolyCases,
+        REC_BASE_CTOR_ARGS, &ty.baseCtorArgsText);
 }
 
 bool readTypeDecl(Reader& r, MetaTypeDecl& ty) {

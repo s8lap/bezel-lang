@@ -3999,7 +3999,19 @@ void Emitter::prePopulateBasePositionalFields(
 
     std::vector<llvm::Value*> baseArgVals;
 
-    auto* td = dynamic_cast<const ast::TypeDecl*>(t->decl);
+    // §22.8 step 1 / §22.10 / §11.1 (#3911/#3916): read the inheritance-
+    // clause argument EXPRESSIONS via `primaryBaseCtorArgsOf`, NOT a raw
+    // `dynamic_cast<ast::TypeDecl*>(t->decl)` — the latter is null for
+    // every imported class (the #2374-class gap, deliberately load-bearing
+    // elsewhere — see CLAUDE.md §6 / Symbol.hpp), and that nullity is
+    // exactly the gap that dropped a generic imported MIDDLE ancestor's
+    // OWN base-clause arguments (measured: `bp=0` instead of `bp=7` on
+    // `class Derived(a): Mid<int>(a)` over an imported `Mid<T>(mp): Base(mp)`
+    // because this case-a loop saw no `primaryBaseCtorArgs` to evaluate for
+    // `Mid`, `baseArgVals` stayed empty, and the store loop below landed
+    // nothing in `Base`'s `bp` slot).
+    const std::vector<ast::CallArgument>* baseArgs =
+        sema::primaryBaseCtorArgsOf(t);
 
     // --- Case (a): primary-ctor class with primaryBaseCtorArgs ---
     // fix #3742 (§22.8 step 1 / §22.10, v0.286): ...but NOT when the base call
@@ -4014,10 +4026,9 @@ void Emitter::prePopulateBasePositionalFields(
     // `.fn`, not `.cs`: a resolved-but-not-callable constructor makes
     // `emitImplicitBase` fall through WITHOUT lowering anything, so the
     // pre-population still owes the arguments there.
-    if (td && td->kind == ast::TypeDeclKind::Class &&
-        !td->primaryBaseCtorArgs.empty() &&
-        !baseClauseExplicitCtor(baseTs, td->primaryBaseCtorArgs).fn) {
-        for (const auto& arg : td->primaryBaseCtorArgs) {
+    if (t->kind == ast::TypeDeclKind::Class && baseArgs && !baseArgs->empty() &&
+        !baseClauseExplicitCtor(baseTs, *baseArgs).fn) {
+        for (const auto& arg : *baseArgs) {
             if (!arg.value) { baseArgVals.clear(); break; }
             llvm::Value* v = lowerExpr(*arg.value);
             // fix #3502 (§4.7 / §22.10 / §11.1, v0.283): the inheritance-clause

@@ -2210,6 +2210,49 @@ MetaTypeDecl convertTypeDecl(const sema::TypeSymbol& t, sema::SemaContext& ctx,
         }
     }
 
+    // §22.8 step 1 / §22.10 / §11.1 (#3911/#3916): the source text of this
+    // class's OWN inheritance-clause argument list (the `(args...)` after the
+    // first base type), for any class that declares one. The whole class-level
+    // source carriage exists so a generic imported MIDDLE ancestor's OWN base
+    // clause can be replayed locally (the #2374-class gap keeps
+    // `TypeSymbol::decl` null for every import — see ModuleLoader.cpp's
+    // TypeSymbol-shell comment — and the codegen helpers
+    // `emitImplicitBase` / `prePopulateBasePositionalFields` both read
+    // `primaryBaseCtorArgs` via `dynamic_cast<ast::TypeDecl*>(cls->decl)`).
+    // Read from `t.decl->primaryBaseCtorArgs` (an `ast::TypeDecl`-only field —
+    // a class-level property of the class's OWN decl, not of any member) for
+    // exactly the same reason the ctor-body / method-body / field-init
+    // carriages read from the AST's stamped spans: the parser stamps
+    // `CallArgument::value->span` (#873 / Parser_Decls.cpp:3120-323), and
+    // span-extracting the source gives the exporter-exact argument text.
+    // The exporter does NOT canonicalize or rewrite — the importer re-parses
+    // this text verbatim in a fresh SemaContext with a synthetic class header,
+    // mirroring #662c's `dtorBodyText` (re-parses the dtor body verbatim in a
+    // synthetic class header). Conditional on `hasPositionalFields` AND a
+    // non-empty `primaryBaseCtorArgs`, so a class with no `hasPositionalFields`
+    // base clause argument list is BYTE-IDENTICAL to a pre-#3916 build (the
+    // field is left empty, `emitTypeDecl`'s guard skips the record, and the
+    // module's header hash is unchanged).
+    if (t.hasPositionalFields && !source.empty()) {
+        if (auto* td = dynamic_cast<const ast::TypeDecl*>(t.decl)) {
+            if (!td->primaryBaseCtorArgs.empty()) {
+                std::string joined;
+                for (std::size_t i = 0; i < td->primaryBaseCtorArgs.size(); ++i) {
+                    const auto& a = td->primaryBaseCtorArgs[i];
+                    if (!a.value) continue;
+                    const std::size_t begin = a.value->span.begin.offset;
+                    const std::size_t end = a.value->span.end.offset;
+                    if (begin >= end || end > source.size() ||
+                        a.value->span.begin.line == 0)
+                        continue;
+                    if (i > 0) joined += ", ";
+                    joined.append(source.substr(begin, end - begin));
+                }
+                out.baseCtorArgsText = std::move(joined);
+            }
+        }
+    }
+
     // §9.8 / §2.8.3 rule 4 (#3179, family F10 of umbrella #3152): the
     // §9.8 class wire SHAPE and `polymorphic(...)` REGISTRY, on the symbol
     // side (mirrors the place #3140's F2 work wrote them — see

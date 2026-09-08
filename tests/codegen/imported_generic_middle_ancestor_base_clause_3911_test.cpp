@@ -29,14 +29,37 @@
 // exactly the constraint fix #3747 documents) and so MUST be replayed via the
 // reconstructed-AST family (`ctorBodyText`/`fieldInitText`) — which carries
 // member bodies and field initializers but has NO channel at all for
-// `primaryBaseCtorArgs` (verified: no `baseCtorArgsText`-shaped field exists
-// anywhere in `src/module/ModuleMetadata.hpp`, unlike `dtorBodyText`,
-// `ctorBodyText`, `fieldInitText`). T1/T2 below hit this gap through BOTH
-// call sites that recurse into the middle ancestor: `emitImplicitBase`'s
-// bottom fallback -> `emitImportedBaseFieldInit`'s #2524 generic arm (which
-// calls `emitImplicitBase(Mid, ...)` recursively, LlvmBackend_Setup.cpp:12929)
-// and, independently, `prePopulateBasePositionalFields`'s own recursion
+// `primaryBaseCtorArgs` (verified before this fix: no `baseCtorArgsText`-
+// shaped field exists anywhere in `src/module/ModuleMetadata.hpp`, unlike
+// `dtorBodyText`, `ctorBodyText`, `fieldInitText`). T1/T2 below hit this gap
+// through BOTH call sites that recurse into the middle ancestor:
+// `emitImplicitBase`'s bottom fallback -> `emitImportedBaseFieldInit`'s
+// #2524 generic arm (which calls `emitImplicitBase(Mid, ...)` recursively,
+// LlvmBackend_Setup.cpp:12929) and, independently,
+// `prePopulateBasePositionalFields`'s own recursion
 // (LlvmBackend_Exprs2.cpp:4116) — both read `Mid->decl`, both find null.
+//
+// ── FIX (#3911 + #3916, this lane) ────────────────────────────────────────
+//
+// Add a new wire-format channel `baseCtorArgsText` on `MetaTypeDecl`,
+// carried as the new REC_BASE_CTOR_ARGS record code (#3916 side: exporter +
+// loader + wire schema). On the import side, the loader
+// `parseAndAttachBaseCtorArgs` re-parses the argument text in a fresh
+// SemaContext with a synthetic class header (the imported class with its
+// primary-ctor parameter list + base clause; a minimal stub of the base
+// type is emitted before the class so the inheritance-clause type name
+// resolves in the fresh module). The freshly-parsed `ast::CallArgument`
+// vector is attached to `TypeSymbol::importedPrimaryBaseCtorArgs` and read
+// via `sema::primaryBaseCtorArgsOf` (a small accessor that prefers the
+// local `TypeDecl::primaryBaseCtorArgs` when present, falls back to the
+// imported vector otherwise). The two codegen call sites that previously
+// read `cls->decl`/`td->primaryBaseCtorArgs` directly are rerouted through
+// the accessor, which is null-safe for the import case. This matches the
+// family pattern the existing `ctorBodyText` / `dtorBodyText` /
+// `fieldInitText` already use to carry member bodies across the boundary,
+// keeping `TypeSymbol::decl` null for imports (the #2374-class gap is NOT
+// widened; the issue's "Suggested fix direction" is taken, but the
+// widening-`decl` alternative is declined for the reasons the gap exists).
 //
 // ── SCOPE CORRECTION vs. the issue as filed ────────────────────────────────
 //
@@ -49,36 +72,15 @@
 // times, because `emitImportedBaseFieldInit`'s non-generic arm
 // (LlvmBackend_Setup.cpp:12959) routes through the exported `bz$<Mid>$init`
 // entry point, compiled with Mid's REAL local decl in Mid's own module. Only
-// the GENERIC variant reproduces the drop. T3/T4 pin the non-generic
-// correctness as regression controls; T1/T2 pin the generic gap as KNOWN_GAP
-// rows (mirrors the `KNOWN_GAP_...` naming convention already used in this
-// suite, e.g. tests/codegen/builtin_closed_ctor_surface_2994_test.cpp) so a
-// future fix flips these two names and their asserted value together.
+// the GENERIC variant reproduced the drop. T3/T4 pin the non-generic
+// correctness as regression controls; T1/T2 pin the generic case as the
+// fix's primary target.
 //
-// ── WHY THIS LANE DOES NOT FIX IT ───────────────────────────────────────────
-//
-// The general fix requires a NEW wire-format channel carrying a generic
-// middle ancestor's own inheritance-clause ARGUMENT EXPRESSIONS across the
-// module boundary (the issue's own "Suggested fix direction": a
-// `baseCtorArgsText`-shaped field on `MetaTypeDecl`, parsed and remapped by
-// the SAME family that already carries `ctorBodyText`/`fieldInitText`,
-// analogous to `dtorBodyText`), PLUS a place to attach the reconstructed
-// argument list that both `emitImplicitBase` and
-// `prePopulateBasePositionalFields` can read given only a `TypeSymbol*` (NOT
-// `TypeSymbol::decl`, which the #2374-class gap deliberately keeps null for
-// every import — widening that would be its own, much larger risk). That is
-// exporter + wire-schema + loader + two codegen call sites, the same class of
-// multi-file surface the `ctorBodyText`/`dtorBodyText` family took its own
-// dedicated fixes to land soundly (see e.g. `dtorBodyText`'s own comment in
-// ModuleMetadata.hpp on the byte-identical-serialization verification this
-// project expects of a wire-format addition). Filed as issue #3916 with this
-// evidence and the concrete design; #3911 itself is narrowed (not closed) to
-// record the generic-only scope.
-//
-// per §22.8 step 1 "The base or chained constructor call", issue #3911
+// per §22.8 step 1 "The base or chained constructor call", fix #3911
 // per §22.10 (v0.294) — "This replaces an explicit `base(...)` call"
 // per fix #3747 — the sibling this issue was discovered while verifying
 // per #3162 — the base-clause-argument asymmetry family
+// per #3916 — the wire-format / loader side of this fix
 
 #include <cstdio>
 #include <filesystem>
@@ -188,17 +190,18 @@ AppHandle buildApp(const std::string& libObjPath, const std::string& appSrc) {
 }  // namespace
 
 // ═══════════════════════════════════════════════════════════════════════════
-// T1 — KNOWN_GAP: imported GENERIC middle ancestor, NO explicit constructor.
+// T1 — fix #3911: imported GENERIC middle ancestor, NO explicit constructor.
 // The exact shape #3911 was filed with: `Mid<T>(mp): Base(mp)`, no explicit
-// ctor, reached via `Derived: Mid<int>(a)`.
-// MEASURED (this lane, bezelc built at 1fae852+3747): `a=7 mp=7 bp=0 bz=22
-// bx=11` — `bp` should be 7 (Mid's own base clause `Base(mp)` is never
-// evaluated because `emitImportedBaseFieldInit`'s #2524 generic arm recurses
-// into `emitImplicitBase(Mid, ...)`, whose `Mid->decl` is null).
+// ctor, reached via `Derived: Mid<int>(a)`. The middle ancestor's OWN base
+// clause `Base(mp)` must be evaluated; before the fix the argument was
+// silently dropped, producing `bp=0`. After the fix (this lane, exporter
+// REC_BASE_CTOR_ARGS + loader `parseAndAttachBaseCtorArgs` + codegen
+// `primaryBaseCtorArgsOf`), `bp=7` propagates end-to-end.
+// MEASURED (this lane): `a=7 mp=7 bp=7 bz=22 bx=11`.
 // ═══════════════════════════════════════════════════════════════════════════
-// per §22.8 step 1 / §22.10, issue #3911 (KNOWN GAP — not yet fixed)
+// per §22.8 step 1 / §22.10, fix #3911
 BEZEL_TEST(imported_generic_middle_ancestor_base_clause_3911,
-           KNOWN_GAP_generic_middle_no_explicit_ctor_drops_own_base_clause) {
+           generic_middle_no_explicit_ctor_propagates_own_base_clause) {
     const std::string lib =
         "module XL3911a; "
         "public class Base3911a(bp: int) "
@@ -230,26 +233,23 @@ BEZEL_TEST(imported_generic_middle_ancestor_base_clause_3911,
     if (!a.ok) return;
     auto [code, out] = runCapture(a.exePath);
     BEZEL_EXPECT_EQ(code, 0);
-    // Pins the CURRENT (wrong) behavior: mp propagates, bp does not. When
-    // #3911's exporter/loader half (filed as #3916) lands, this row must be
-    // renamed (drop KNOWN_GAP_) and re-asserted as "a=7 mp=7 bp=7 bz=22 bx=11".
     BEZEL_EXPECT_TRUE(
-        out.find("a=7 mp=7 bp=0 bz=22 bx=11") != std::string::npos);
+        out.find("a=7 mp=7 bp=7 bz=22 bx=11") != std::string::npos);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// T2 — KNOWN_GAP: imported GENERIC middle ancestor, BOTH primary and an
+// T2 — fix #3911: imported GENERIC middle ancestor, BOTH primary and an
 // explicit constructor. Same root cause as T1, reached the same way — the
-// middle ancestor's OWN base clause is dropped regardless of whether it also
-// declares an explicit constructor (fix #3747 only addressed the CALLER's
-// resolution of the middle ancestor itself, one level up; it does not touch
-// the middle ancestor's OWN base-clause propagation, which is #3911's
-// subject).
-// MEASURED (this lane): `a=7 mp=7 bp=0 bz=22 bx=11` — identical failure to T1.
+// middle ancestor's OWN base clause must be evaluated regardless of whether
+// it also declares an explicit constructor (fix #3747 only addressed the
+// CALLER's resolution of the middle ancestor itself, one level up; it does
+// not touch the middle ancestor's OWN base-clause propagation, which is
+// #3911's subject).
+// MEASURED (this lane): `a=7 mp=7 bp=7 bz=22 bx=11`.
 // ═══════════════════════════════════════════════════════════════════════════
-// per §22.8 step 1 / §22.10, issue #3911 (KNOWN GAP — not yet fixed)
+// per §22.8 step 1 / §22.10, fix #3911
 BEZEL_TEST(imported_generic_middle_ancestor_base_clause_3911,
-           KNOWN_GAP_generic_middle_both_ctor_forms_drops_own_base_clause) {
+           generic_middle_both_ctor_forms_propagates_own_base_clause) {
     const std::string lib =
         "module XL3911b; "
         "public class Base3911b(bp: int) "
@@ -285,7 +285,7 @@ BEZEL_TEST(imported_generic_middle_ancestor_base_clause_3911,
     auto [code, out] = runCapture(a.exePath);
     BEZEL_EXPECT_EQ(code, 0);
     BEZEL_EXPECT_TRUE(
-        out.find("a=7 mp=7 bp=0 bz=22 bx=11") != std::string::npos);
+        out.find("a=7 mp=7 bp=7 bz=22 bx=11") != std::string::npos);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -296,7 +296,7 @@ BEZEL_TEST(imported_generic_middle_ancestor_base_clause_3911,
 // replaying `Mid`'s AST locally.
 // MEASURED (this lane): `a=7 mp=7 bp=7 bz=22 bx=11`.
 // ═══════════════════════════════════════════════════════════════════════════
-// per §22.8 step 1 / §22.10, issue #3911 (regression control — non-generic
+// per §22.8 step 1 / §22.10, fix #3911 (regression control — non-generic
 // scope correction)
 BEZEL_TEST(imported_generic_middle_ancestor_base_clause_3911,
            control_non_generic_middle_no_explicit_ctor_propagates_base_clause) {
@@ -342,7 +342,7 @@ BEZEL_TEST(imported_generic_middle_ancestor_base_clause_3911,
 // already correct.
 // MEASURED (this lane): `a=7 mp=7 bp=7 bz=22 bx=11`.
 // ═══════════════════════════════════════════════════════════════════════════
-// per §22.8 step 1 / §22.10, issue #3911 (regression control — non-generic
+// per §22.8 step 1 / §22.10, fix #3911 (regression control — non-generic
 // scope correction)
 BEZEL_TEST(imported_generic_middle_ancestor_base_clause_3911,
            control_non_generic_middle_both_ctor_forms_propagates_base_clause) {

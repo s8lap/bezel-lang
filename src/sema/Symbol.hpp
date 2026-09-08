@@ -347,6 +347,33 @@ struct TypeSymbol : Symbol {
     // replaces had no such guard (the same distinction #2950 records for
     // `Exception`).
     bool isSynthesizedBuiltinInterface = false;
+
+    // §22.8 step 1 / §22.10 / §11.1 (#3911/#3916): the inheritance-clause
+    // argument EXPRESSIONS for an IMPORTED class — populated by
+    // `ModuleLoader::parseAndAttachBaseCtorArgs` from the
+    // `MetaTypeDecl::baseCtorArgsText` wire carriage, parsed in a fresh
+    // SemaContext with a synthetic class header (mirroring the
+    // `ctorBodyText` / `dtorBodyText` / `methodBodyText` / `fieldInitText`
+    // precedent), then remapped into the main context. Empty for every
+    // LOCAL class (their `primaryBaseCtorArgs` live on the
+    // `ast::TypeDecl::decl` reachable via `dynamic_cast`) and for every
+    // imported class whose wire text is empty (the pre-fix reading, which
+    // is the §3911 silent-wrong-value defect the importer-side carriage
+    // closes). Read through `primaryBaseCtorArgsOf` below, NEVER directly,
+    // so the local-decl / imported-replay split stays in one accessor —
+    // the CLAUDE.md §6 "extend these, never invent a parallel vocabulary"
+    // rule the ctor/dtor/method/field-init helpers all satisfy.
+    //
+    // Why NOT widening `TypeSymbol::decl` to carry an `ast::TypeDecl` for
+    // imports (#2374-class gap): the gap is deliberately load-bearing
+    // elsewhere — every other "does this AST have an `ast::TypeDecl`"
+    // check is a `cls->decl == null` predicate on the imported side, and
+    // populating it for an import would silently make each of those
+    // answers YES, with downstream effects in the layout, ownership, and
+    // dispose walks that have not been audited against that change.
+    // Localizing the replay to a dedicated vector keeps the gap intact
+    // and makes the new code's effect auditable in this single accessor.
+    std::vector<ast::CallArgument> importedPrimaryBaseCtorArgs;
 };
 
 // §11.7 / §12.5 / §19.6 (v0.242, #3052): the class-shape modifier predicates,
@@ -374,6 +401,47 @@ inline bool typeSymbolHasModifier(const TypeSymbol* t, std::string_view m) {
     for (std::string_view mod : t->modifiers)
         if (mod == m) return true;
     return false;
+}
+
+// §22.8 step 1 / §22.10 / §11.1 (#3911/#3916): the class's OWN inheritance-
+// clause argument EXPRESSIONS (`primaryBaseCtorArgs`), accessed through ONE
+// helper from both codegen call sites (`emitImplicitBase`,
+// `prePopulateBasePositionalFields`) — the CLAUDE.md §6 "extend these, never
+// invent a parallel vocabulary" rule the ctor/dtor/method/field-init bodies
+// all satisfy. Returns a pointer to the relevant vector, or null when `t` has
+// no inheritance-clause argument list at all (so a `if (auto* args = ...)`
+// guard falls through to the pre-fix codepath for the case the carriage
+// never reached).
+//
+// The two-source split mirrors what the ctor/dtor/method-body accessors do
+// for their own facts: LOCAL classes still carry their `primaryBaseCtorArgs`
+// on the `ast::TypeDecl` reachable via `dynamic_cast<TypeDecl*>(t->decl)`
+// (a real `ast::TypeDecl` is the local-side source — see CLAUDE.md §6 on
+// why "fixing" the #2374-class gap by widening `TypeSymbol::decl` is its own
+// much-larger risk and was explicitly declined), and IMPORTED classes
+// carry the same facts on `TypeSymbol::importedPrimaryBaseCtorArgs`,
+// populated by `ModuleLoader::parseAndAttachBaseCtorArgs` from
+// `MetaTypeDecl::baseCtorArgsText`. A LOCAL class's decl is consulted first
+// because it carries the canonical parser-built `ast::CallArgument` nodes
+// (their `value->span` is set by the local parser and the local codegen
+// already keys layout off it), and the IMPORTED path is the replay-shaped
+// reconstruction that #662c / #783 / #695 already established for the rest
+// of an imported generic class's own-class-level facts. Both branches
+// return a pointer to a `std::vector<ast::CallArgument>` with the SAME
+// shape, so the codegen arms are byte-identical across the two sources.
+inline const std::vector<ast::CallArgument>* primaryBaseCtorArgsOf(
+    const sema::TypeSymbol* t) {
+    if (!t) return nullptr;
+    if (auto* td = dynamic_cast<const ast::TypeDecl*>(t->decl)) {
+        // LOCAL: trust the canonical parser-built vector. Empty here means
+        // "no inheritance-clause arg list" and is reported as null — a caller
+        // asking "any base-clause args?" gets the same answer as for an
+        // imported class whose wire text was empty.
+        if (!td->primaryBaseCtorArgs.empty()) return &td->primaryBaseCtorArgs;
+    }
+    if (!t->importedPrimaryBaseCtorArgs.empty())
+        return &t->importedPrimaryBaseCtorArgs;
+    return nullptr;
 }
 
 // §11.7: does `t` carry the `closed` modifier?

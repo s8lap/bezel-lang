@@ -1130,6 +1130,33 @@ struct MetaTypeDecl {
     // Empty means "no user destructor body" (structural disposal still runs).
     std::string dtorBodyText;         // §14/#662c: dtor source text for generics
 
+    // §22.8 step 1 / §22.10 / §11.1 (#3911/#3916, additive within v7): the
+    // source text of this class's OWN inheritance-clause argument LIST — the
+    // `(args...)` after the first base type — for any class declaring one.
+    // `MetaTypeDecl::baseTypes` already carries the base TYPE; this field
+    // carries the argument EXPRESSIONS (`Mid<T>(mp: int): Base(mp)` →
+    // `"mp"`). The exporter extracts each argument's source-text span (a
+    // CallArgument's `value->span` is stamped by the parser, exactly as
+    // #662c's `dtorBodyText` does for the destructor body) and joins them
+    // with `", "`. The importer re-parses this in a fresh SemaContext with a
+    // synthetic class header (the base type comes from `baseTypes[0]`, the
+    // primary-ctor parameter list comes from `genericParams` + the field
+    // stubs derived from `members`) so a generic imported MIDDLE ancestor's
+    // OWN base clause can be evaluated by `emitImplicitBase` and
+    // `prePopulateBasePositionalFields`, which both read
+    // `primaryBaseCtorArgs` via `dynamic_cast<ast::TypeDecl*>(cls->decl)` —
+    // and `cls->decl` is null for every imported type (#2374-class gap,
+    // `TypeSymbol::decl` stays null on purpose — widening it is a separate,
+    // much larger risk this fix declines to take). Carried as REC_BASE_CTOR_ARGS
+    // under its own record code so a pre-#3916 reader `skipRecord()`s it and
+    // the field defaults to empty (the pre-fix reading — the exporter emits
+    // only when non-empty, so a class with no inheritance-clause arg list is
+    // BYTE-IDENTICAL to a pre-#3916 build). See the `additive within v7`
+    // precedent: #2950's `builtinExceptionBase` (#2950, REC_EXC_BASE),
+    // #3144's `choiceCases` (CHOICE_CASE_BLOCK), #3191's `nonTrivialDispose`
+    // (REC_DISPOSE_VERDICT), #3179's `serializedShape` (REC_SER_TYPE_SHAPE).
+    std::string baseCtorArgsText;
+
     // §12 / §31.4 / §2.8.2 (#2950, additive within v7): the name of the
     // BUILT-IN exception type this class names directly as its base
     // ("Exception", "IOException", …), empty when it names none.
