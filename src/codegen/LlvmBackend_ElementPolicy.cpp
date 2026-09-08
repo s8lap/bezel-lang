@@ -172,6 +172,71 @@ Emitter::ElementPolicy Emitter::elementPolicyFor(const sema::TypeRef* elemTy,
         }
     }
 
+    // fix #4054 / §28.11 / §28.9: the BORROWING family of built-in collection
+    // element types (Array<T> / Stack<T> / Queue<T> / LinkedList<T> /
+    // FrozenArray<T> / Dictionary<K,V> / SortedDictionary<K,V>) — these have
+    // declaration==nullptr (compiler-known builtins, same as the Owning family
+    // above) so they fall past the declaration-based class check below →
+    // without this arm an OwningArray<Array<int>>'s element was typed as
+    // Value (null disposer) and bz_array_free was called with NULL element
+    // disposer; the inner bz_array_t header + data buffer leaked per stored
+    // element (issue #4054, 96,120 B at 800 iterations). The borrow family
+    // does NOT own its elements, so the matching runtime free fn is called
+    // with NULL inner disposer (the recursive-element-axis counterpart of
+    // nestedCollectionDisposerThunks_'s Owning case).
+    //
+    // SortedSet / Set have a DYNAMIC backing (genericBackingType is non-null
+    // for record/primitive/string T; null for class T), so they fall through
+    // here too — but the free fn name is determined solely by the head and
+    // matches the static-backing choice for the SHAPES the borrow family
+    // admits (only class-typed T for SortedSet/Set; that case is array-backed).
+    // The free-fn selection here mirrors nestedCollectionDisposerThunk's
+    // (Array/Stack/Queue/FrozenArray → bz_array_free; LinkedList → bz_llist_free;
+    // Dictionary/SortedDictionary → bz_dict_free).
+    auto isBorrowingBuiltinCollection = [](const sema::TypeRef* t)
+        -> std::optional<std::string_view> {
+        if (!t || t->kind != sema::TypeRef::Kind::Named) return std::nullopt;
+        if (t->declaration) return std::nullopt;
+        if (!t->astNode || !t->astNode->name || t->astNode->name->parts.empty())
+            return std::nullopt;
+        std::string_view n = t->headName();
+        if (n == "Array" || n == "Stack" || n == "Queue" ||
+            n == "LinkedList" ||
+            n == "OwningBuffer" ||  // §4.14: OwningBuffer<T> is OWNING for T (a
+                                    // class), but its borrow-family sibling —
+                                    // borrowed array buffer — uses the same
+                                    // bz_array_t* representation. The free fn
+                                    // is the same; the OWNING case is handled
+                                    // by isOwningBuiltinCollection above.
+            n == "FrozenArray" || n == "Dictionary" || n == "SortedDictionary")
+            return n;
+        // SortedSet / Set are excluded here — they have dynamic backing.
+        return std::nullopt;
+    };
+    if (auto collName = isBorrowingBuiltinCollection(elemTy)) {
+        if (owningFamily) {
+            // per §28.11, #4054: owned slot holding a BORROWING collection —
+            // the inner must be freed via its matching runtime free fn with
+            // a NULL inner disposer (the borrow family does not own its
+            // elements; passing the inner's element disposer would double-
+            // free values whose real owner is elsewhere).
+            return ElementPolicy{
+                ElementPolicy::Category::ClassOwned,
+                ptrTy(),
+                borrowingCollectionDisposerThunk(elemTy, *collName),
+                /*retainRelease=*/false
+            };
+        }
+        // per §28.11, #4054: borrowing outer holding a borrowing inner —
+        // neither disposes anything; borrow-only slot.
+        return ElementPolicy{
+            ElementPolicy::Category::ClassBorrow,
+            ptrTy(),
+            /*disposerThunk=*/nullptr,
+            /*retainRelease=*/false
+        };
+    }
+
     // §30.5 / §28.11 (#1889): an owning collection of Task-family values
     // (Task / Task<T> / OwningTask<T>) owns each task frame, and disposing the
     // collection must also dispose the unconsumed class result and the fault

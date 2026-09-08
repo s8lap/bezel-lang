@@ -4077,6 +4077,78 @@ llvm::Function* Emitter::nestedCollectionDisposerThunk(const sema::TypeRef* elem
 }
 
 
+// fix #4054 / §28.11 / §28.9: void(void*) thunk that frees a BORROWING
+// built-in collection held in an OWNING slot (e.g. the Array<int> inside
+// an OwningArray<Array<int>>). Mirrors nestedCollectionDisposerThunk above
+// in shape (own IRBuilder, null check, call free fn, return void; cached per
+// inner TypeRef*) but is fixed at NULL for the inner disposer — the borrow
+// family does not own its elements, so passing the recursive inner-element
+// disposer (what nestedCollectionDisposerThunk does for the OWNING case)
+// would double-free values whose real owner is elsewhere.
+//
+// Free-fn selection (mirrors nestedCollectionDisposerThunk's, with SortedSet
+// / Set excluded — they have dynamic backing, see #2726):
+//   Array / Stack / Queue / OwningBuffer / FrozenArray → bz_array_free
+//   LinkedList                                          → bz_llist_free
+//   Dictionary / SortedDictionary                       → bz_dict_free
+//
+// `collName` is the head name already known to the caller (the std::optional
+// returned by the isBorrowingBuiltinCollection detection lambda in
+// elementPolicyFor), avoiding a second head-name decode here.
+llvm::Function* Emitter::borrowingCollectionDisposerThunk(
+        const sema::TypeRef* elemCollTy, std::string_view collName) {
+    // Cache hit.
+    auto it = borrowingCollectionDisposerThunks_.find(elemCollTy);
+    if (it != borrowingCollectionDisposerThunks_.end()) return it->second;
+
+    bool isLL   = (collName == "LinkedList");
+    bool isDict = (collName == "Dictionary" || collName == "SortedDictionary");
+
+    const char* freeName = isLL ? "bz_llist_free"
+                         : isDict ? "bz_dict_free"
+                         : "bz_array_free";
+
+    // Build the thunk: void(void* innerCollPtr) { if(!ptr) return;
+    //                                              freeFn(ptr, null); }
+    auto* fnTy = llvm::FunctionType::get(llvm::Type::getVoidTy(llvm_),
+                                         {ptrTy()}, /*isVarArg=*/false);
+    // fix #3548: name from the type's §2.8.3 rule 3 identity
+    // (mangleTypeRefForSymbol), not the cache-key POINTER — a pointer value
+    // is a fresh heap address every process, so the old spelling made
+    // `bezelc`'s output non-reproducible (same defect #3548 pinned for
+    // nestedCollectionDisposerThunk above).
+    std::string thunkName = std::string("bz$borrowFree$") + std::string(collName);
+    if (module_->getFunction(thunkName)) {
+        thunkName += "$" + mangleTypeRefForSymbol(elemCollTy);
+    }
+    auto* fn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage,
+                                      thunkName, module_.get());
+    llvm::Argument* ptr = &*fn->args().begin();
+    auto* entry  = llvm::BasicBlock::Create(llvm_, "entry",    fn);
+    auto* freeBB = llvm::BasicBlock::Create(llvm_, "coll.free", fn);
+    auto* retBB  = llvm::BasicBlock::Create(llvm_, "coll.ret",  fn);
+    llvm::IRBuilder<> b(entry);
+    // Null-guard (mirrors nestedCollectionDisposerThunk).
+    b.CreateCondBr(
+        b.CreateICmpEQ(ptr, llvm::ConstantPointerNull::get(ptrTy())),
+        retBB, freeBB);
+    b.SetInsertPoint(freeBB);
+    // Inner disposer is FIXED at NULL (the borrow family does not own its
+    // elements; see header).
+    auto* freeFn = declareC(freeName,
+                            llvm::Type::getVoidTy(llvm_),
+                            {ptrTy(), ptrTy()});
+    b.CreateCall(freeFn,
+        {ptr, llvm::ConstantPointerNull::get(ptrTy())});
+    b.CreateBr(retBB);
+    b.SetInsertPoint(retBB);
+    b.CreateRetVoid();
+
+    borrowingCollectionDisposerThunks_[elemCollTy] = fn;
+    return fn;
+}
+
+
 // fix #1889 / §28.6 / §30.5: dispose one Task / Task<T> / OwningTask<T>
 // element owned by an owning collection. Collection free callbacks have the
 // same `void(void*)` ABI as the class-element thunks above (passed to

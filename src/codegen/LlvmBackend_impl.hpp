@@ -1905,6 +1905,18 @@ private:
     // collections (e.g. OwningArray<OwningArray<R>>). Keyed by the TypeRef* of
     // the inner collection element type (unique per sema type).
     std::map<const sema::TypeRef*, llvm::Function*> nestedCollectionDisposerThunks_;
+    // fix #4054 / §28.11: per-element-collection-type thunks for an Owning
+    // outer holding a BORROWING inner (e.g. OwningArray<Array<int>>). The
+    // borrowing inner does not own its elements, so the matching runtime
+    // free fn (bz_array_free / bz_llist_free / bz_dict_free) is called with
+    // a NULL inner disposer (the recursive-element-axis counterpart of
+    // nestedCollectionDisposerThunks_, but with the owning/borrowing axis
+    // fixed at the OUTER collection: a borrowing inner passes NULL).
+    // Without this cache, an OwningArray<Array<int>>'s element cascade had
+    // a null disposerThunk and the inner bz_array_t header + data buffer
+    // leaked per stored element (issue #4054, measured 56 B × 801 + 64 B ×
+    // 801 = 96,120 B at 800 iterations).
+    std::map<const sema::TypeRef*, llvm::Function*> borrowingCollectionDisposerThunks_;
     // fix #1889 / §28.6 / §30.5: per-Task-family-type element thunks for owning
     // collections of Task / Task<T> / OwningTask<T>. Each thunk runs the complete
     // non-blocking task drop protocol (fault_obj prelude, per-T result_disposer
@@ -9680,6 +9692,18 @@ private:
     // OwningArray<OwningArray<R>>). Recursively resolves the inner element's
     // disposer via elementPolicyFor. Cached per element-collection TypeRef*.
     llvm::Function* nestedCollectionDisposerThunk(const sema::TypeRef* elemCollTy);
+    // fix #4054 / §28.11 / §28.9: void(void*) thunk that frees a BORROWING
+    // built-in collection held in an OWNING slot (e.g. the Array<int> inside
+    // an OwningArray<Array<int>>). Calls the matching runtime free fn
+    // (bz_array_free / bz_llist_free / bz_dict_free, selected from collName)
+    // with NULL inner disposer — the borrow family does not own its elements,
+    // so the recursive element-axis resolution nestedCollectionDisposerThunk
+    // performs is fixed at NULL here. `collName` is the borrow-family head
+    // string already known to the caller (it is the std::optional returned by
+    // the isBorrowingBuiltinCollection detection lambda in elementPolicyFor),
+    // avoiding a second head-name decode. Cached per element TypeRef*.
+    llvm::Function* borrowingCollectionDisposerThunk(const sema::TypeRef* elemCollTy,
+                                                     std::string_view collName);
     // fix #1889 / §28.6 / §30.5: void(void*) thunk for a Task / Task<T> /
     // OwningTask<T> element of an owning collection (e.g. OwningArray<OwningTask<T>>).
     // Runs the same complete non-blocking disposal protocol as a task local / an
