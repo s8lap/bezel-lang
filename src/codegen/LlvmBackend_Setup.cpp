@@ -10855,6 +10855,25 @@ void Emitter::emitConstructorBody(sema::ConstructorSymbol* cs, llvm::Function* f
     moveOnlyArrayTransferred_.clear();
     moveOnlyArrayTransferredFn_ = fn;
     collectMoveOnlyArrayTransferred(cd->body);  // §15.3 (#747)
+    // fix #4077 (§27.5 / §28.14, v0.295): capture-cell eligibility for the
+    // CONSTRUCTOR BODY. The chain-call lowering at emitChainCall (#4077) ends
+    // its §28.14 release half by calling consumeLastLambdaCapturedCells() —
+    // the helper reads `lastLambdaCapturedCells_`, which `boxLocalSlot`
+    // populates ONLY when `currentFn_ == cellFreeEligibleFn_`. emitFunctionBody
+    // sets that token (line 9346) so method bodies already track and free
+    // their captured cells; emitConstructorBody never did, so a chain-call
+    // ctor with a lambda argument (which allocates a fresh capture cell for
+    // each captured local/param inside lowerLambda) leaked that cell at the
+    // chain-call site. Mirror the function-body setup: token + collect on the
+    // ctor's own `cd->body`, before bindParameters and the chain call. The
+    // pure walk has no IR effect and the helper's per-cell soundness checks
+    // (#966 owner-disposal deferral, #969/#3403 shallower-scope skip) gate
+    // every actual free.
+    cellFreeEligible_.clear();
+    unwindUnsafeCellFree_.clear();      // fix #2334
+    sharedCellEnvdtorFreeOwner_.clear();  // fix #3426
+    cellFreeEligibleFn_ = fn;
+    collectCellFreeEligible(cd->body);
     bindParameters(fn, /*hasThis=*/true, &cs->params);
     // fix #2817 / #2807 / #429 / §4.6 / §28.9 / §28.3 / §22.8 (v0.240): run the
     // `var` STRING-local refcount analysis for the COMPILED constructor body and
@@ -12714,8 +12733,118 @@ void Emitter::emitChainCall(const ast::CallExpr* call, bool isThis,
         genericSubst_ = std::move(savedSubstForBase);
         genericSubstSemaTy_ = std::move(savedSemaTyForBase);
     }
+    // fix #4077 (§22.10 "Constructor chaining" / §28.14 / §28.9, v0.295): the
+    // chain-target ctor's call-bounded closure ARGUMENT-PASS release. A lambda
+    // literal (or other +1 closure producer) passed as a chain argument is a
+    // TRANSIENT — its closure cell (40 B) + env (env-sized) + capture cells
+    // leak per call (LSan Direct in `bz$M.Derived$ctor`, measured 20000+8000
+    // +2000 B / 500 iters) because the chain-call lowering path never
+    // released the producer's +1 on return. The non-chain `new T(args)` site
+    // already does this (LlvmBackend_Exprs2.cpp:7945 fix #2305), as does the
+    // generic-method-call site (LlvmBackend_Calls2.cpp:10780 fix #1073): this
+    // site was the missing twin. Collect the closures BEFORE the call, install
+    // the unwind edge that drops them on a throw, then release on normal
+    // return — exactly the #1073/#2305 discipline the `lowerNew`/`lowerCall`
+    // sites already enforce, transplanted to the chain-call lowering. The
+    // detection gate is the same triple the existing sites use: a formal
+    // whose declared type is a function type, a source argument that is
+    // recognized as a +1 closure producer, and a value bound into the call's
+    // `args` vector — narrowed to the chain target's parameter index via the
+    // same `paramToArg` map the §22.5 binding loop above already maintains.
+    std::vector<llvm::Value*> chainClosureArgs;
+    if (!diverged_) {
+        for (std::size_t pi = 0; pi < target->params.size(); ++pi) {
+            auto* ps = dynamic_cast<sema::ParameterSymbol*>(
+                target->params[pi]);
+            // Match the §22.3 widening: only a plain (un-modified) function-
+            // typed parameter can be the chain target's +1 closure slot. A
+            // `ref`/`out`/`scoped` parameter is NOT call-bounded — the callee
+            // may store it (§28.14), so we cannot drop the producer's +1 here.
+            if (!ps || !ps->modifier.empty()) continue;
+            sema::TypeRef* pt = paramTypeOf(ps);
+            if (!pt || pt->kind != sema::TypeRef::Kind::Function) continue;
+            const int ai = paramToArg[pi];
+            if (ai < 0 || static_cast<std::size_t>(ai) >= call->args.size() ||
+                !call->args[ai].value) continue;
+            if (!isPlusOneClosureProducer(call->args[ai].value.get())) continue;
+            const std::size_t argSlot = pi + 1;
+            if (argSlot >= args.size() || !args[argSlot]) continue;
+            chainClosureArgs.push_back(args[argSlot]);
+        }
+    }
     if (args.size() == it->second->arg_size()) {
+        // fix #4077: install the unwind edge for the throw / propagate path.
+        // Mirrors lowerCall's `closureArgUnwindCleanup` half (mutually
+        // exclusive with the post-call release on every concrete edge).
+        llvm::BasicBlock* savedClArgUnwind = unwindTarget_;
+        if (!chainClosureArgs.empty())
+            unwindTarget_ = closureArgUnwindCleanup(chainClosureArgs);
         builder_.CreateCall(it->second, args);
+        unwindTarget_ = savedClArgUnwind;
+        // fix #4077: normal-edge release. The throw / propagate edge already
+        // dropped these via the unwind cleanup above (mutually exclusive
+        // branches, exactly the lowerCall / lowerNew discipline). Skipped
+        // when the call diverged so we never double-release.
+        if (!diverged_) {
+            for (llvm::Value* cl : chainClosureArgs)
+                emitClosureRelease(cl);
+            // fix #4077 (cell half, §27.5 / §28.9, v0.295): the §28.14
+            // CAPTURE-CELL half of the closure release above. The closure's
+            // ENV pointed at a freshly-allocated capture cell (the boxed `x`
+            // for `lambda() => new Res(x)`, allocated inline by lowerLambda
+            // in this same Derived$ctor frame); the envdtor drops the env's
+            // contents but, per its documented PRIME-DIRECTIVE posture, NOT
+            // the capture cell itself. `lowerLambda` recorded those cells
+            // in `lastLambdaCapturedCells_`; consume them here so the cell
+            // is freed at THIS call site rather than leaking until the
+            // outer (Derived$ctor body) scope ends — a leak the pre-fix
+            // measurement pinned at 4 B/iter × 500 = 2000 B over the
+            // repro's 500 iterations (LSan Direct in
+            // `bz$M.Derived$ctor`). Mirrors `lowerCall`'s §28.14 release
+            // loop at LlvmBackend_Calls2.cpp:11052 — gated on the same
+            // vector the closure release uses, so it is exactly as wide
+            // and never misses a slot. The helper re-runs every per-cell
+            // soundness check (#966 / #1017 owner-disposal deferral,
+            // #969/#3403 shallower-scope skip) so the addition here is
+            // purely the opportunity to decide.
+            // fix #4077 (§27.5 / §28.9 / §28.14, v0.295, the chain-call
+            // site): the chain call is the CONSTRUCTOR's first lowering
+            // step — it runs in emitConstructorBody BEFORE any scoped body
+            // block has been pushed onto `disposeStack_`, so
+            // `consumeLastLambdaCapturedCells`'s default arm (which writes
+            // the cell-free disposal onto `disposeStack_.back()` to be
+            // discharged at the nearest scope end) would dereference an
+            // empty stack and SIGSEGV. The chain-call ctor body is the
+            // captured cell's enclosing scope — there's no further body in
+            // the typical chain-only ctor, so a transient disposal-scope
+            // pushed here, drained by `emitDisposals` immediately, is the
+            // right lifetime: the cell is freed at the chain-call return
+            // point, mirroring `lowerCall` / `lowerNew`'s §28.14 discipline
+            // (which run inside a scope already on the stack). The
+            // helper's #966/#1017/#969/#3403 soundness checks still gate
+            // every entry — owner-disposal deferral still pushes onto
+            // `disposeStack_[ownerScopeIdx]` if a higher-scope disposal
+            // reads through the cell (the helper's `if (disposeStack_
+            // .empty())` at line 16259, however, would never fire here:
+            // we just pushed the transient scope, and that scope is at
+            // index 0). Empty after — the transient scope is local to
+            // this site.
+            if (!chainClosureArgs.empty() && !disposeStack_.empty()) {
+                consumeLastLambdaCapturedCells();
+            } else if (!chainClosureArgs.empty()) {
+                // Empty stack arm: chain-call ctor with no enclosing
+                // scope. Push a transient scope, let the helper register
+                // the cell-free on it, then drain it here at the
+                // chain-call's normal-return edge. The helper's
+                // `disposeStack_.back().push_back(dc)` at line 16379
+                // writes to THIS scope (now at index 0), not to a
+                // stale empty stack.
+                disposeStack_.emplace_back();
+                consumeLastLambdaCapturedCells();
+                emitDisposals(disposeStack_.back(), /*isUnwind=*/false);
+                disposeStack_.pop_back();
+            }
+        }
         // fix #2579 / §22.3: flush the copy-OUT of every accessor-mediated
         // ref/out argument now that the chain-target ctor call has returned
         // normally (!diverged_) — skipped on the throw edge per §22.3's "on
@@ -13157,7 +13286,80 @@ void Emitter::emitImplicitBase(const sema::TypeSymbol* cls, llvm::Value* obj,
                                   /*outIsLocal=*/nullptr))
                         ok = false;
                     if (ok && args.size() == nBaseFormals + 1) {
+                        // fix #4077 (§22.10 "Constructor chaining" / §28.14 /
+                        // §28.9, v0.295): the §22.10 INHERITANCE-CLAUSE twin
+                        // of the emitChainCall fix above. The base-ctor
+                        // call here is the §22.10 inheritance-clause face
+                        // of the same gap: a lambda LITERAL in the clause
+                        // is a +1 closure producer whose closure cell + env
+                        // + capture cells leak per construction. The
+                        // §22.10 explicit `base(...)` arm (emitChainCall)
+                        // and the generic-method-call site (lowerCall,
+                        // #1073) already enforce the §28.14 release; this
+                        // site was the third twin. The base ctor body for
+                        // an inheritance-clause class has no separate
+                        // `bz$M.Derived$ctor` function to release in (the
+                        // chain is inlined INTO the caller, exactly as the
+                        // IR shows for `class D(x): Base(lambda() =>
+                        // new Res(x)) end D` — `Main` builds the closure
+                        // cell, env, and capture cells itself, then calls
+                        // `bz$M.Base$ctor` directly with no follow-up
+                        // release). The fix: collect the closure-arg
+                        // release set BEFORE the call (same triple as
+                        // emitChainCall — function-typed formal, +1
+                        // closure producer source arg, bound value),
+                        // install the unwind edge, then release on
+                        // normal return + drain the captured cells via
+                        // `consumeLastLambdaCapturedCells()` (the
+                        // `lastLambdaCapturedCells_` was populated by
+                        // `lowerLambda` IF `currentFn_ ==
+                        // cellFreeEligibleFn_` — for an inlined base
+                        // ctor that's typically true; if not, the empty-
+                        // stack fallback below handles the chain-only
+                        // ctor shape).
+                        std::vector<llvm::Value*> baseClauseClosureArgs;
+                        if (!diverged_) {
+                            for (std::size_t pi = 0;
+                                 pi < bce.cs->params.size(); ++pi) {
+                                auto* ps = dynamic_cast<
+                                    sema::ParameterSymbol*>(
+                                        bce.cs->params[pi]);
+                                if (!ps || !ps->modifier.empty()) continue;
+                                sema::TypeRef* pt = paramTypeOf(ps);
+                                if (!pt ||
+                                    pt->kind != sema::TypeRef::Kind::Function)
+                                    continue;
+                                if (pi >= clsBaseArgs->size()) break;
+                                const auto& a = (*clsBaseArgs)[pi];
+                                if (!a.value) continue;
+                                if (!isPlusOneClosureProducer(a.value.get()))
+                                    continue;
+                                const std::size_t argSlot = pi + 1;
+                                if (argSlot >= args.size() || !args[argSlot])
+                                    continue;
+                                baseClauseClosureArgs.push_back(args[argSlot]);
+                            }
+                        }
+                        llvm::BasicBlock* savedBCUnwind = unwindTarget_;
+                        if (!baseClauseClosureArgs.empty())
+                            unwindTarget_ = closureArgUnwindCleanup(
+                                baseClauseClosureArgs);
                         builder_.CreateCall(bce.fn, args);
+                        unwindTarget_ = savedBCUnwind;
+                        if (!diverged_) {
+                            for (llvm::Value* cl : baseClauseClosureArgs)
+                                emitClosureRelease(cl);
+                            if (!baseClauseClosureArgs.empty() &&
+                                !disposeStack_.empty())
+                                consumeLastLambdaCapturedCells();
+                            else if (!baseClauseClosureArgs.empty()) {
+                                disposeStack_.emplace_back();
+                                consumeLastLambdaCapturedCells();
+                                emitDisposals(disposeStack_.back(),
+                                              /*isUnwind=*/false);
+                                disposeStack_.pop_back();
+                            }
+                        }
                         // fix #3759 (§22.8 step 1 / §22.10 / §28.9, v0.286):
                         // the §22.10 base-clause twin of #429 (ARGUMENT-PASS)
                         // in `lowerCall`. A +1 string producer (interpolation
@@ -30869,6 +31071,51 @@ void Emitter::collectCellFreeEligible(
             if (auto* m = dynamic_cast<const ast::NullCondMemberExpr*>(e)) {
                 expr(m->target.get(), false); return; }
             if (auto* c = dynamic_cast<const ast::CallExpr*>(e)) {
+                // fix #4077 (§22.10 *Constructor chaining* / §28.14 / §27.5 /
+                // §28.9, v0.295): a chain call (`base(...)` / `this(...)`)
+                // is a CallExpr whose callee is the IdentifierExpr "base" /
+                // "this" — NOT a MethodSymbol — so isCallBoundedClosureArgPosition
+                // returns false (its `ms = ctx_.exprSymbol(*call.callee)` is
+                // null) and the generic `expr(arg, false)` recursion below
+                // classifies any lambda argument as ESCAPING. emitChainCall
+                // now treats the chain target's +1 closure args as
+                // call-bounded (mirroring lowerCall / lowerNew), so the
+                // captured cell is freed at the chain-call site rather than
+                // leaking at the ctor's outer scope. Match the same
+                // condition here: any lambda LITERAL passed as a chain-call
+                // arg is NON-escaping, so the captured symbol lands in
+                // cellFreeEligible_ and `lowerLambda` registers it in
+                // `lastLambdaCapturedCells_` (which `consumeLastLambdaCaptured
+                // Cells()` then drains at the chain call site). The chain
+                // target's parameter arity / type / modifier shape is the
+                // §22.10 binding loop's responsibility, NOT this admission;
+                // a callee that takes a `scoped` / `owned` / non-function
+                // parameter is already rejected by emitChainCall's own
+                // `!ps->modifier.empty()` / `pt->kind != Function` gates, so
+                // a lambda literal reaching here is always a true +1
+                // call-bounded producer in this context.
+                if (c->callee) {
+                    if (auto* cid =
+                            dynamic_cast<const ast::IdentifierExpr*>(
+                                c->callee.get())) {
+                        if (cid->name == "base" || cid->name == "this") {
+                            bool anyLambda = false;
+                            for (std::size_t ai = 0; ai < c->args.size(); ++ai) {
+                                if (auto* argLam = dynamic_cast<
+                                        const ast::LambdaExpr*>(
+                                        c->args[ai].value.get())) {
+                                    collectLambdaCaptures(
+                                        argLam, em,
+                                        /*isNonEscaping=*/true);
+                                    anyLambda = true;
+                                } else {
+                                    expr(c->args[ai].value.get(), false);
+                                }
+                            }
+                            if (anyLambda) return;
+                        }
+                    }
+                }
                 // #2182 / §28.3: an IIFE — CallExpr whose callee is a
                 // LambdaExpr — is NON-escaping. Calls2.cpp emits the closure
                 // call immediately followed by emitClosureRelease, so the
