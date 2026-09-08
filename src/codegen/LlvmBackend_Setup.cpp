@@ -6528,6 +6528,27 @@ void Emitter::emitThrowValue(llvm::Value* excVal, const ast::Expr* excAst) {
             const auto* id = dynamic_cast<const ast::IdentifierExpr*>(excAst);
             isDirectRethrow = id && id->name == currentCaughtName_;
         }
+        // §28.3 / §31.1 (issue #4000, v0.294): the named exception operand
+        // transfers ownership to the exception machinery. A `throw exc;`
+        // therefore owns `exc` even when the throw is nested in one if/else
+        // arm, but the normal method-exit auto-dispose is still reachable from
+        // the other arm. Clear the source local/parameter slot after lowering
+        // the operand so the two ownership domains cannot both free the same
+        // object. Direct catch re-throws are deliberately excluded: the caught
+        // exception is still the live in-flight object and must not be nulled
+        // from the catch binding's slot.
+        if (!isDirectRethrow && excAst) {
+            if (auto* slot = localSlot(*excAst)) {
+                llvm::Type* elemTy = nullptr;
+                if (llvm::Value* storage = boxedStorage(slot, elemTy);
+                    storage && elemTy) {
+                    if (auto* ptrTy = llvm::dyn_cast<llvm::PointerType>(elemTy)) {
+                        builder_.CreateStore(
+                            llvm::ConstantPointerNull::get(ptrTy), storage);
+                    }
+                }
+            }
+        }
         // #866: free the caught exception ONLY when this throw actually LEAVES
         // the enclosing catch arm — i.e. its unwind target is the arm-leaving
         // target. A throw caught by an INNER try/catch within the arm targets
