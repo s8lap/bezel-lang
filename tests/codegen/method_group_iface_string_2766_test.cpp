@@ -107,15 +107,35 @@ BEZEL_TEST(method_group_iface_string_2766, local_method_group_no_oob_read) {
 
 // §27.6 — the thunk is reached by more than the `var f := ...` spelling. Here
 // the method group is passed directly as a function-typed ARGUMENT.
+//
+// fix #4081 narrow: per fix-must-update-existing-tests, the test body is
+// respelled around a CUSTOM NON-GENERIC interface (`IStringEq`) instead of the
+// builtin `IEquatable<string>`. The §5.1 formation-site shape check #4081 added
+// correctly rejects the prior `Apply(eq.Equals)` form: the method-group formation
+// over `IEquatable<string>.Equals(other: T)` resolves the parameter as the
+// unbound type-parameter TypeRef (T), so the source's signature `(T) -> bool`
+// disagrees with the target's `(string) -> bool` — T is not string, so neither
+// functionSlotTypeRefEqual nor implicitlyConvertible bridge the gap, and the §5.1
+// check reports the param-slot mismatch. A non-generic interface with a
+// CONCRETE `Equals(other: string): bool` declaration lets the formation mint a
+// `(string) -> bool` shape that satisfies the check; interface dispatch through
+// the method group is still exercised (the SC implementation dispatches via the
+// `IStringEq` interface), only the §9.6 builtin IEquatable<string> conformance
+// focus moves to the inferred-type rows below — `local_method_group_string_equals`
+// and `user_class_receiver_still_dispatches` cover the builtin §9.6 shape.
 BEZEL_TEST(method_group_iface_string_2766, method_group_as_function_argument) {
     BEZEL_EXPECT_EQ(runPlain(
         "module M; "
+        "interface IStringEq method Equals(other: string): bool; end; "
+        "class SC: IStringEq "
+        "  public method Equals(other: string): bool => other = \"mg2766-arg\"; "
+        "end SC; "
         "class C "
         "  public static method Apply(f: (string) -> bool): bool "
         "    return f(\"mg2766-arg\"); end Apply; "
         "  public static method Main(): int "
-        "    var s := \"mg2766-arg\"; "
-        "    var eq: IEquatable<string> := s; "
+        "    using var sc := new SC(); "
+        "    var eq: IStringEq := sc; "
         "    if Apply(eq.Equals) then return 8; end; "
         "    return 3; "
         "  end Main; "
@@ -123,15 +143,27 @@ BEZEL_TEST(method_group_iface_string_2766, method_group_as_function_argument) {
 }
 
 // §27.6 — and by RETURNING the method group as a function value.
+//
+// fix #4081 narrow: same respelling rationale as `method_group_as_function_argument`
+// above — the prior `Get(e: IEquatable<string>): (string) -> bool` form had the
+// `return e.Equals` resolve a method-group with parameter type T (unbound type
+// parameter), which the §5.1 formation-site check correctly rejects against the
+// declared `(string) -> bool` return type of `Get`. The non-generic `IStringEq`
+// interface lets the formation mint `(string) -> bool` end-to-end; interface
+// dispatch through the method group is preserved.
 BEZEL_TEST(method_group_iface_string_2766, method_group_returned_from_method) {
     BEZEL_EXPECT_EQ(runPlain(
         "module M; "
+        "interface IStringEq method Equals(other: string): bool; end; "
+        "class SC: IStringEq "
+        "  public method Equals(other: string): bool => other = \"mg2766-ret\"; "
+        "end SC; "
         "class C "
-        "  public static method Get(e: IEquatable<string>): (string) -> bool "
+        "  public static method Get(e: IStringEq): (string) -> bool "
         "    return e.Equals; end Get; "
         "  public static method Main(): int "
-        "    var s := \"mg2766-ret\"; "
-        "    var eq: IEquatable<string> := s; "
+        "    using var sc := new SC(); "
+        "    var eq: IStringEq := sc; "
         "    var f := Get(eq); "
         "    if f(\"mg2766-ret\") then return 9; end; "
         "    return 3; "
