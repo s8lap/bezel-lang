@@ -12838,10 +12838,14 @@ bool ExprTC::recordHasFieldOrPropertyInit(const TypeSymbol& t) {
     if (t.decl) {
         for (const Symbol* m : t.members) {
             if (auto* fs = dynamic_cast<const FieldSymbol*>(m)) {
+                // SEAM-DEBT: #4059 — guarded by `if (t.decl)`; local-AST
+                // record path. Imported records route to the side-table
+                // branch below.
                 if (auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl))
                     if (fd->initializer) return true;
             } else if (auto* ps = dynamic_cast<const PropertySymbol*>(m)) {
                 if (ps->isIndexer) continue;
+                // SEAM-DEBT: #4059 — same local-AST guard as `fs->decl`.
                 if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl))
                     if (pd->autoInitializer) return true;
             }
