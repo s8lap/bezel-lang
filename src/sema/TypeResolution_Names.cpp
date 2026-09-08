@@ -575,6 +575,57 @@ void Resolver::resolveTopDecl(const ast::TopDecl& decl, Scope* parent) {
     }
 }
 
+// fix #4047 (§27.8, v0.294): see the declaration comment in
+// TypeResolution_impl.hpp for the full rationale. After the single forward
+// pass over `src.topDecls` has resolved every top-level alias's
+// `aliasedType` once, an outer alias whose target was an inner alias
+// declared textually LATER sits with a `TypeRef::Kind::Named`,
+// `declaration == nullptr` silent-unresolved state. Re-resolve every
+// alias that matches that shape until either progress stops or the
+// iteration cap is hit. A user-written alias cycle (A := B; B := A) is
+// not a bug this fix is chartered to handle; the iteration cap makes the
+// pass deterministic rather than infinite-looping, and the resulting
+// still-unresolved state will surface as the same downstream diagnostic
+// it does today.
+void Resolver::resolveAliasForwardReferences(const ast::SourceFile& src,
+                                              Scope* parent) {
+    for (int iter = 0; iter < 32; ++iter) {
+        bool anyResolved = false;
+        for (const auto& decl : src.topDecls) {
+            if (!decl) continue;
+            auto* alias = dynamic_cast<const ast::TypeAlias*>(decl.get());
+            if (!alias || !alias->aliasedType) continue;
+            TypeRef* current = ctx_.resolvedType(*alias->aliasedType);
+            // Only the buggy shape: Named with no declaration. Any other
+            // shape (Primitive / Function / InlineArray / a Named that did
+            // resolve) is left alone — re-running resolveType on a
+            // correctly-resolved alias would just allocate a fresh TypeRef
+            // and discard the old, costing nothing semantically but
+            // producing no progress.
+            if (!current) continue;
+            if (current->kind != TypeRef::Kind::Named) continue;
+            if (current->declaration != nullptr) continue;
+            // Rebuild the same per-alias generic-parameter scope that
+            // resolveTopDecl used on the first pass, so a generic alias
+            // (`type A<T> := B<T>;`) sees its own type parameter `T`
+            // bound when the alias-transparency arm walks the inner
+            // alias's aliasedType through it.
+            Scope aliasScope;
+            aliasScope.parent = parent;
+            for (const auto& g : alias->genericParams) {
+                aliasScope.names[g.name] = nullptr;
+            }
+            TypeRef* retried =
+                resolveType(*alias->aliasedType, &aliasScope);
+            if (retried && (retried->declaration != nullptr ||
+                            retried->kind != TypeRef::Kind::Named)) {
+                anyResolved = true;
+            }
+        }
+        if (!anyResolved) return;
+    }
+}
+
 void Resolver::resolveTypeDecl(const ast::TypeDecl& td, Scope* parent) {
     Scope typeScope;
     typeScope.parent = parent;

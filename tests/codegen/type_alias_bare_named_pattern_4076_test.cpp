@@ -216,8 +216,19 @@ BEZEL_TEST(type_alias_bare_named_pattern_4076,
 // or after the alias (its TypeSymbol is registered in an earlier
 // discovery pass) — this row isolates the CHAINED case specifically.
 BEZEL_TEST(type_alias_bare_named_pattern_4076,
-           chained_alias_outer_first_bare_pattern_known_open_4047) {
-    auto r = runAot(
+           chained_alias_outer_first_bare_pattern_4047) {
+    // FIXED (#4047): was a clean #1847 "not supported by the backend"
+    // rejection (the chained alias didn't resolve through to
+    // PtChain4076's TypeSymbol because the inner alias's aliasedType
+    // hadn't been resolved when the outer alias's aliasedType was
+    // resolved), now 7 — matches the inner-before-outer chained-aliased
+    // control pinned below and the direct-alias bare-named-pattern
+    // control pinned above. The fixed-point re-resolution sweep in
+    // `Resolver::resolveAliasForwardReferences` closes the upstream
+    // ordering gap; the alias-qualified bare-named pattern then
+    // resolves through to PtChain4076's TypeSymbol exactly like the
+    // direct-name spelling.
+    BEZEL_EXPECT_EQ(run(
         "module M; "
         "type AliasChainOuter4076 := AliasChainInner4076; "
         "type AliasChainInner4076 := PtChain4076; "
@@ -227,15 +238,7 @@ BEZEL_TEST(type_alias_bare_named_pattern_4076,
         "    var p := new PtChain4076(1, 2); "
         "    return (case p of AliasChainOuter4076 => 7, _ => 0); "
         "  end Main; "
-        "end C;");
-    // KNOWN-OPEN (#4047): correct behavior is 7 (matching the
-    // inner-before-outer order pinned below); measured actual is the SAME
-    // clean #1847 "not supported by the backend" rejection #4076 itself
-    // fixes for the non-chained case, inherited from the upstream
-    // #4047 ordering gap in `resolveAliasToTypeSymbol`'s single-pass
-    // dependency on `ctx_.resolvedType`.
-    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
-    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, kBackstopMsg));
+        "end C;"), 7);
 }
 
 // Companion to the KNOWN-OPEN row above: the WORKING declaration order

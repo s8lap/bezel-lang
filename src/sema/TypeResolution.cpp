@@ -277,6 +277,18 @@ void Resolver::run(const ast::SourceFile& src) {
         if (!decl) continue;
         resolveTopDecl(*decl, &moduleScope);
     }
+    // fix #4047 (§27.8, v0.294): the forward pass above walks
+    // `src.topDecls` in declaration order, so a chained alias-of-alias
+    // whose OUTER alias is declared TEXTUALLY BEFORE the inner alias it
+    // names leaves the outer alias's `aliasedType` in the "Named, no
+    // declaration" silent-unresolved state — the alias-transparency arm
+    // in resolveNamed (fix #578) only sees through to the underlying
+    // type when the inner alias's `aliasedType` has already been
+    // resolved by an earlier call. After the forward pass every alias's
+    // `aliasedType` has been visited at least once, so a fixed-point
+    // re-resolution sweep closes the gap. See the comment on
+    // `Resolver::resolveAliasForwardReferences` for the full rationale.
+    resolveAliasForwardReferences(src, &moduleScope);
     // §14.2: now that every instantiation site and every deferred
     // nested-generic obligation has been recorded, join them and re-check the
     // inner constraints with the outer parameter bound to each concrete

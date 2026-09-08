@@ -263,7 +263,7 @@ BEZEL_TEST(type_alias_receiver_classifiers_4073,
 // forward pass would resolve it; that's a resolution-shape change too
 // broad for a narrow alias-focused sweep like this one.
 BEZEL_TEST(type_alias_receiver_classifiers_4073,
-           chained_alias_outer_first_spawn_known_open_4047) {
+           chained_alias_outer_first_spawn_4047) {
     auto r = runAot(
         "module M; "
         "type AliasOuter4073 := AliasInner4073; "
@@ -279,15 +279,17 @@ BEZEL_TEST(type_alias_receiver_classifiers_4073,
         "    return 42; "
         "  end Main; "
         "end C;");
-    // KNOWN-OPEN (#4047): pre-fix and post-fix both reject with the
-    // §30.14/#600 message because `resolveAliasToTypeSymbol` returns null
-    // for the outer alias (its aliasedType, the inner alias, has not yet
-    // been resolved when the outer alias's resolution runs). The correct
-    // behavior is for this to ACCEPT and return 42 — that's the
-    // resolution-order gap, separately tracked by #4047.
-    // narrow #3892 (v0.294): a bare `!ran` cannot tell a §30.14 reject
-    // from a runtime crash/signal/timeout/ASan report; the genuine §30.14
-    // reject carries a real `<path>:<line>:<col>` prefix, the synthetics
-    // never do.
-    BEZEL_EXPECT_TRUE(bezel::test::failedAtCompileTimeWithRealLocation(r));
+    // FIXED (#4047): was a §30.14/#600 capture-free reject (because
+    // `resolveAliasToTypeSymbol` returned null for the outer alias —
+    // its aliasedType, the inner alias, had not yet been resolved when
+    // the outer alias's resolution ran), now 42 — matches the direct-
+    // alias `spawn_alias_receiver_static_method_capture_free_accepted`
+    // control pinned above. The fixed-point re-resolution sweep in
+    // `Resolver::resolveAliasForwardReferences` closes the upstream
+    // ordering gap; the alias-qualified §30.14 entry classifier then
+    // classifies the chained-aliased static-method reference exactly
+    // like the direct-alias spelling.
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_EQ(r.exitCode, 42);
 }

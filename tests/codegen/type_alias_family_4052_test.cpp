@@ -194,8 +194,16 @@ BEZEL_TEST(type_alias_family_4052, enum_direct_FromUnderlyingOrNull_regression) 
 // Pin by asserting the program ran with the zero-initialized degraded
 // value — identical to pre-fix and post-fix states.
 BEZEL_TEST(type_alias_family_4052,
-           enum_chained_alias_outer_first_FromUnderlyingOrNull_known_open_4047) {
-    auto r = runAot(
+           enum_chained_alias_outer_first_FromUnderlyingOrNull_4047) {
+    // FIXED (#4047): was a #2434-degraded 0 (the silent-wrong-answer
+    // symptom), now 2 — matches the inner-first chained-aliased shape
+    // pinned at `enum_chained_alias_inner_first_FromUnderlyingOrNull_works`
+    // above and the direct-name anti-regression control. The fixed-point
+    // re-resolution sweep in `Resolver::resolveAliasForwardReferences`
+    // closes the upstream ordering gap; the alias-qualified
+    // `FromUnderlyingOrNull` then dispatches through the same
+    // `TypeAliasSymbol` arms #4050/#4052 added.
+    BEZEL_EXPECT_EQ(run(
         "module M; "
         "type AliasEnumOuter4052 := AliasEnumInner4052; "
         "type AliasEnumInner4052 := EnumChained4052; "
@@ -206,13 +214,7 @@ BEZEL_TEST(type_alias_family_4052,
         "    var p := AliasEnumOuter4052.FromUnderlyingOrNull(n); "
         "    return int(p!); "
         "  end Main; "
-        "end C;");
-    // Known-open #4047: chained outer-first ordering gap. Pin by
-    // asserting the SAME degraded-zero behavior holds on this fix:
-    // program ran (silent wrong answer), exit 0, r.diagnostics empty.
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 0);
-    BEZEL_EXPECT_EQ(r.diagnostics.errorCount(), 0u);
+        "end C;"), 2);
 }
 
 // Companion to the known-open control: declaring the chain INNER-FIRST
@@ -296,8 +298,17 @@ BEZEL_TEST(type_alias_family_4052, class_direct_universal_Equals_0arg_regression
 // call supplies 0 (§8.1)". Pin by asserting the SAME §8.1 rejection
 // holds on this fix.
 BEZEL_TEST(type_alias_family_4052,
-           class_chained_alias_outer_first_static_Equals_known_open_4047) {
-    auto r = runAot(
+           class_chained_alias_outer_first_static_Equals_4047) {
+    // FIXED (#4047): was a §8.1 universal-member arity rejection
+    // (targetIsStaticReceiver stayed false because the outer alias
+    // didn't resolve through to ClsChained4052), now 1 — the user-
+    // declared static `Equals() => true` resolves through the chained
+    // alias and the `if` takes the truthy branch. The fixed-point re-
+    // resolution sweep in `Resolver::resolveAliasForwardReferences`
+    // closes the upstream ordering gap; the alias-qualified type-name
+    // receiver then sees through to ClsChained4052 and the §8.1 arity
+    // check is suppressed exactly like the direct-name spelling.
+    BEZEL_EXPECT_EQ(run(
         "module M; "
         "type AliasClsOuter4052 := AliasClsInner4052; "
         "type AliasClsInner4052 := ClsChained4052; "
@@ -309,13 +320,7 @@ BEZEL_TEST(type_alias_family_4052,
         "  public static method Main(): int "
         "    if AliasClsOuter4052.Equals() then return 1; else return 0; end if; "
         "  end Main; "
-        "end C;");
-    // Known-open #4047: chained outer-first ordering gap — pinned to
-    // current behavior, not affected by this fix. The §8.1 arity
-    // rejection is identical to pre-fix and post-fix states.
-    BEZEL_EXPECT_FALSE(r.ran);
-    BEZEL_EXPECT_TRUE(
-        diagnosticMessageContains(r, "the universal `Object.Equals` member"));
+        "end C;"), 1);
 }
 
 // ============================================================================
@@ -384,7 +389,7 @@ BEZEL_TEST(type_alias_family_4052,
 // fix has nothing to dispatch on. Pin by asserting the SAME §30.14
 // rejection holds on this fix.
 BEZEL_TEST(type_alias_family_4052,
-           class_chained_alias_outer_first_DomainSpawn_known_open_4047) {
+           class_chained_alias_outer_first_DomainSpawn_4047) {
     auto r = runAot(
         "module M; "
         "type AliasEntryOuter4052 := AliasEntryInner4052; "
@@ -398,12 +403,17 @@ BEZEL_TEST(type_alias_family_4052,
         "    return 0; "
         "  end Main; "
         "end C;");
-    // Known-open #4047: chained outer-first ordering gap — pinned to
-    // current behavior, not affected by this fix. The rejection text
-    // IS the §30.14 capture-free diagnostic, identical to the pre-fix
-    // and post-fix states.
-    BEZEL_EXPECT_FALSE(r.ran);
-    BEZEL_EXPECT_TRUE(
+    // FIXED (#4047): was a §30.14 capture-free rejection (the outer
+    // alias didn't resolve through to EntryChained4052, so the entry
+    // was misclassified as not-capture-free), now the spawn runs
+    // without the capture-free rejection — matches the direct-alias
+    // `class_alias_DomainSpawn_static_method_ref` control pinned
+    // above. The fixed-point re-resolution sweep in
+    // `Resolver::resolveAliasForwardReferences` closes the upstream
+    // ordering gap; the alias-qualified static-method reference then
+    // resolves exactly like the direct-name spelling.
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_FALSE(
         diagnosticMessageContains(r, "Domain.Spawn entry must be capture-free"));
 }
 
@@ -468,8 +478,14 @@ BEZEL_TEST(type_alias_family_4052, class_direct_const_narrows_to_byte_regression
 // the zero-initialized degraded value — the inherited state, identical
 // to pre-fix and post-fix, this fix has nothing to dispatch on.
 BEZEL_TEST(type_alias_family_4052,
-           class_chained_alias_outer_first_const_known_open_4047) {
-    auto r = runAot(
+           class_chained_alias_outer_first_const_4047) {
+    // FIXED (#4047): was a #2434-degraded 0 (the silent-wrong-answer
+    // symptom), now 5 — matches the direct-alias const-narrows-to-byte
+    // control pinned above. The fixed-point re-resolution sweep in
+    // `Resolver::resolveAliasForwardReferences` closes the upstream
+    // ordering gap; the alias-qualified qualified-const fold then
+    // drives §5.1 narrowing exactly like the direct-name spelling.
+    BEZEL_EXPECT_EQ(run(
         "module M; "
         "type AliasClsOuter4052c := AliasClsInner4052c; "
         "type AliasClsInner4052c := ClsChained4052c; "
@@ -481,11 +497,5 @@ BEZEL_TEST(type_alias_family_4052,
         "    var x: byte := AliasClsOuter4052c.K; "
         "    return x; "
         "  end Main; "
-        "end C;");
-    // Known-open #4047: chained outer-first ordering gap. Pin by
-    // asserting the SAME degraded-zero behavior holds on this fix:
-    // program ran (silent wrong answer), exit 0, r.diagnostics empty.
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 0);
-    BEZEL_EXPECT_EQ(r.diagnostics.errorCount(), 0u);
+        "end C;"), 5);
 }

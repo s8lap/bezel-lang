@@ -187,8 +187,16 @@ BEZEL_TEST(type_alias_destructuring_pattern_4050,
 // `sema::resolveAliasToTypeSymbol` returning null for BOTH the sema arms and
 // codegen's `patternMatches` arm, so the ORIGINAL crash reproduces.
 BEZEL_TEST(type_alias_destructuring_pattern_4050,
-           chained_alias_REVERSE_ORDER_destructure_known_open_4047) {
-    auto r = runAot(
+           chained_alias_REVERSE_ORDER_destructure_4047) {
+    // FIXED (#4047): was a compiler CRASH (`!r.ran`, no clean diagnostic)
+    // because `resolveAliasToTypeSymbol` returned null for the outer alias
+    // and codegen's `patternMatches` had nothing to dispatch on. Now 7
+    // (3 + 4) — matches the direct-alias record-destructure control pinned
+    // above. The fixed-point re-resolution sweep in
+    // `Resolver::resolveAliasForwardReferences` closes the upstream
+    // ordering gap; the alias-qualified destructuring pattern then
+    // resolves exactly like the direct-name spelling.
+    BEZEL_EXPECT_EQ(run(
         "module M; "
         "type AliasPointRevOuter4050 := AliasPointRevInner4050; "
         "type AliasPointRevInner4050 := PointRevOuter4050; "
@@ -198,12 +206,5 @@ BEZEL_TEST(type_alias_destructuring_pattern_4050,
         "    var p: Object := new PointRevOuter4050(3, 4); "
         "    return (case p of AliasPointRevOuter4050(x, y) => x + y, _ => 0); "
         "  end Main; "
-        "end C;");
-    // KNOWN-OPEN (#4047): correct behavior is 7 (matching the
-    // inner-before-outer order above); measured actual is a compiler CRASH
-    // (`!r.ran`, no clean diagnostic) — the exact pre-#4050-fix symptom,
-    // inherited from the upstream ordering gap.
-    BEZEL_EXPECT_TRUE(!r.ran);
-    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "does not have terminator") ||
-                       diagnosticMessageContains(r, "IR verification failed"));
+        "end C;"), 7);
 }

@@ -751,6 +751,22 @@ private:
 
     void resolveTopDecl(const ast::TopDecl& decl, Scope* parent);
 
+    // fix #4047 (§27.8, v0.294): a chained alias-of-alias where the OUTER
+    // alias is declared TEXTUALLY BEFORE the (one or more) inner aliases it
+    // names cannot resolve through to the underlying type at the outer-alias
+    // point — the inner alias's own `aliasedType` has not been processed
+    // yet, so the alias-transparency arm in resolveNamed sees a null
+    // `ctx_.resolvedType(...)` and falls through to the "Named, no
+    // declaration" silent-unresolved state. After the forward pass every
+    // inner alias's `aliasedType` IS populated, so we re-resolve any outer
+    // alias that came back with the unresolved state and is now reachable.
+    // Iterates to a fixed point so chains of arbitrary depth resolve in one
+    // follow-on sweep (length-2 chains resolve in one iteration, longer
+    // chains in O(chainLength); the iteration cap makes a user-written
+    // alias cycle deterministic rather than infinite-loop).
+    void resolveAliasForwardReferences(const ast::SourceFile& src,
+                                        Scope* parent);
+
     // §26.4/§26.5 (#1599): recursively walks an extension target type's
     // generic-argument tree, binding each bare single-segment non-nullable
     // identifier as a block-level type parameter — at ANY nesting depth

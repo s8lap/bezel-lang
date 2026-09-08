@@ -176,8 +176,15 @@ BEZEL_TEST(type_alias_extension_method_ref_4070, bound_ref_via_alias_typed_local
 // 42) — with two internal backstop diagnostics on stderr, not the SIGSEGV
 // #4070 itself was filed against.
 BEZEL_TEST(type_alias_extension_method_ref_4070,
-           chained_alias_REVERSE_ORDER_ref_known_open_4047) {
-    auto r = runAot(
+           chained_alias_REVERSE_ORDER_ref_4047) {
+    // FIXED (#4047): was a #2434/#2491-degraded 0 (the silent-wrong-value
+    // symptom), now 42 — matches the direct-alias unbound-ref control
+    // pinned above. The fixed-point re-resolution sweep in
+    // `Resolver::resolveAliasForwardReferences` closes the upstream
+    // ordering gap; the alias-qualified extension-method reference then
+    // resolves through to the underlying extension target exactly like
+    // the direct-alias spelling.
+    BEZEL_EXPECT_EQ(run(
         "module M; "
         "type AliasExtOuterRev4070 := AliasExtInnerRev4070; "
         "type AliasExtInnerRev4070 := ExtTargetRev4070; "
@@ -193,10 +200,5 @@ BEZEL_TEST(type_alias_extension_method_ref_4070,
         "    using var t := new ExtTargetRev4070(); "
         "    return f(t); "
         "  end Main; "
-        "end C;");
-    // KNOWN-OPEN (#4047): correct behavior is either the reference resolving
-    // correctly (42) or a clean rejection; measured actual is the degraded 0,
-    // inherited from the upstream ordering gap, not reintroduced by this fix.
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 0);
+        "end C;"), 42);
 }

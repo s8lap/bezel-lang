@@ -151,8 +151,17 @@ BEZEL_TEST(type_alias_qualified_const_fold_4071,
 // TypeAliasSymbol needs its OWN `aliasedType` resolved first) —
 // confirmed separately, not itself a #4047 case, and not pinned here.
 BEZEL_TEST(type_alias_qualified_const_fold_4071,
-           chained_alias_REVERSE_ORDER_const_fold_known_open_4047) {
-    auto r = runAot(
+           chained_alias_REVERSE_ORDER_const_fold_4047) {
+    // FIXED (#4047): was either a #2434/#2491-degraded 0 or a §5.1
+    // narrowing reject (the chained alias fell through with no fold at
+    // all because the outer alias didn't resolve through to K4071rev's
+    // `V`), now 5 — matches the direct-alias qualified-const fold
+    // control pinned elsewhere in this file. The fixed-point re-
+    // resolution sweep in `Resolver::resolveAliasForwardReferences`
+    // closes the upstream ordering gap; the alias-qualified qualified-
+    // const fold then drives §5.1 narrowing exactly like the
+    // direct-name spelling.
+    BEZEL_EXPECT_EQ(run(
         "module M; "
         "type AliasOuter4071 := AliasInner4071; "
         "type AliasInner4071 := K4071rev; "
@@ -164,22 +173,5 @@ BEZEL_TEST(type_alias_qualified_const_fold_4071,
         "    var b: byte := AliasOuter4071.V; "
         "    return int(b); "
         "  end Main; "
-        "end C;");
-    // KNOWN-OPEN (#4047): the program does NOT produce the correct
-    // alias-form fold to 5. Either it compile-rejects (pre-#4071
-    // symptom, the §5.1 narrowing diagnostic fires), OR it compiles
-    // and runs with the wrong value 0 through the #2434/#2491 backstop
-    // (measured on a6e270d's successor — the chained alias falls
-    // through with no fold at all). Both are valid #4047-inherited
-    // outcomes; this fix does NOT close the upstream ordering gap.
-    if (r.ran) {
-        BEZEL_EXPECT_TRUE(r.exitCode != 5);  // not the correct fold value
-    } else {
-        // narrow #3892 (v0.294): when the program does NOT run, the only
-        // valid #4047-inherited outcome is a real §5.1 narrowing reject
-        // (real `<path>:<line>:<col>` prefix) - never a runtime crash/signal
-        // /timeout/ASan report, which never carries such a prefix.
-        BEZEL_EXPECT_TRUE(
-            bezel::test::failedAtCompileTimeWithRealLocation(r));
-    }
+        "end C;"), 5);
 }

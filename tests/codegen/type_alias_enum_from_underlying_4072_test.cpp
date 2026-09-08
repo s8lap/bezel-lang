@@ -162,23 +162,30 @@ BEZEL_TEST(type_alias_enum_from_underlying_4072,
     }
 }
 
-// ── KNOWN-OPEN CONTROL for #4047 ─────────────────────────────────────────
+// ── REGRESSION for #4047 (§27.8, v0.294) ─────────────────────────────────
 //
-// A CHAINED alias (outer declared textually BEFORE inner) inherits
-// #4047's resolution-order gap: `Resolver::resolveTopDecl`'s single
-// forward pass has not yet resolved the inner alias's `aliasedType`
-// when the outer alias's own `aliasedType` (a reference to the inner
-// alias) is resolved, so `sema::resolveAliasToTypeSymbol` returns null
-// and both #4072's sema fix and the parallel codegen fix have nothing
-// to dispatch on — the original silent-wrong-value bug reproduces. A
-// DIRECT (non-chained) alias declared before its target enum is
-// UNAFFECTED (the target's TypeSymbol exists from symbol collection
-// regardless of declaration order; only a TypeAliasSymbol needs its OWN
-// `aliasedType` resolved first) — confirmed separately, not itself a
-// #4047 case, and not pinned here.
+// A CHAINED alias (outer declared textually BEFORE inner) used to
+// inherit #4047's resolution-order gap: `Resolver::resolveTopDecl`'s
+// single forward pass had not yet resolved the inner alias's
+// `aliasedType` when the outer alias's own `aliasedType` (a reference
+// to the inner alias) was resolved, so `sema::resolveAliasToTypeSymbol`
+// returned null and both #4072's sema fix and the parallel codegen fix
+// had nothing to dispatch on — the original silent-wrong-value bug
+// reproduced (#2434/#2491 backstop degrading to 0).
+//
+// Fix #4047 adds `Resolver::resolveAliasForwardReferences` (a fixed-
+// point re-resolution sweep over the top-level alias list) so the
+// reverse declaration order now resolves exactly like the working
+// inner-before-outer order — and `FromUnderlyingOrNull(1)` then folds
+// to `Green` (= 7), same as the alias-form control pinned elsewhere
+// in this file. A DIRECT (non-chained) alias declared before its
+// target enum was UNAFFECTED (the target's TypeSymbol exists from
+// symbol collection regardless of declaration order; only a
+// TypeAliasSymbol needs its OWN `aliasedType` resolved first) —
+// confirmed separately, not itself a #4047 case, and not pinned here.
 BEZEL_TEST(type_alias_enum_from_underlying_4072,
-           chained_alias_REVERSE_ORDER_from_underlying_known_open_4047) {
-    auto r = runAot(
+           chained_alias_REVERSE_ORDER_from_underlying_4047) {
+    BEZEL_EXPECT_EQ(run(
         "module M; "
         "type AliasEnumOuter4072 := AliasEnumInner4072; "
         "type AliasEnumInner4072 := ColorEnum4072; "
@@ -189,13 +196,5 @@ BEZEL_TEST(type_alias_enum_from_underlying_4072,
         "        AliasEnumOuter4072.FromUnderlyingOrNull(1); "
         "    return (case c of ColorEnum4072.Green => 7, _ => 0); "
         "  end Main; "
-        "end C;");
-    // KNOWN-OPEN (#4047): correct behavior is the alias-form fold to
-    // Green (matching the inner-before-outer order above); measured
-    // actual is the pre-#4072 silent-wrong-value symptom (returns 0).
-    // The slot degraded through the #2434/#2491 backstop — the
-    // exact pre-#4072-fix symptom, inherited from the upstream
-    // ordering gap, not reintroduced by this fix.
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 0);
+        "end C;"), 7);
 }

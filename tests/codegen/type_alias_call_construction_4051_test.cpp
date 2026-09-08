@@ -134,21 +134,29 @@ BEZEL_TEST(type_alias_call_construction_4051,
         r, "is not the underlying value of any declared constant"));
 }
 
-// ── KNOWN-OPEN CONTROL for #4047 ─────────────────────────────────────────
+// ── REGRESSION for #4047 (§27.8, v0.294) ─────────────────────────────────
 //
-// A CHAINED alias (outer declared textually BEFORE inner) inherits #4047's
-// resolution-order gap: `Resolver::resolveTopDecl`'s single forward pass has
-// not yet resolved the inner alias's `aliasedType` when the outer alias's
-// own `aliasedType` (a reference to the inner alias) is resolved, so
-// `sema::resolveAliasToTypeSymbol` returns null and #4051's fix has nothing
-// to dispatch on — the ORIGINAL silent-wrong-value bug reproduces. A
-// DIRECT (non-chained) alias declared before its target class/record is
-// UNAFFECTED (its target's TypeSymbol exists from symbol collection
-// regardless of declaration order; only a TypeAliasSymbol needs its OWN
-// `aliasedType` resolved first) — confirmed separately, not itself a #4047
-// case, and not pinned here.
+// A CHAINED alias (outer declared textually BEFORE inner) used to inherit
+// #4047's resolution-order gap: `Resolver::resolveTopDecl`'s single
+// forward pass had not yet resolved the inner alias's `aliasedType` when
+// the outer alias's own `aliasedType` (a reference to the inner alias)
+// was resolved, so `sema::resolveAliasToTypeSymbol` returned null and
+// #4051's fix had nothing to dispatch on — the original silent-wrong-
+// value bug reproduced (#2434/#2491 backstop degrading to 0).
+//
+// Fix #4047 adds `Resolver::resolveAliasForwardReferences` (a fixed-
+// point re-resolution sweep over the top-level alias list) so the
+// reverse declaration order now resolves exactly like the working
+// inner-before-outer order — and the §9.5 record-call rejection that
+// #4051's fix dispatches then fires on the same name, with the same
+// diagnostic, regardless of declaration order. A DIRECT (non-chained)
+// alias declared before its target class/record was UNAFFECTED (its
+// target's TypeSymbol exists from symbol collection regardless of
+// declaration order; only a TypeAliasSymbol needs its OWN `aliasedType`
+// resolved first) — confirmed separately, not itself a #4047 case, and
+// not pinned here.
 BEZEL_TEST(type_alias_call_construction_4051,
-           chained_alias_REVERSE_ORDER_call_known_open_4047) {
+           chained_alias_REVERSE_ORDER_call_4047) {
     auto r = runAot(
         "module M; "
         "type AliasRecCallRevOuter4051 := AliasRecCallRevInner4051; "
@@ -160,10 +168,9 @@ BEZEL_TEST(type_alias_call_construction_4051,
         "    return r.A + r.B; "
         "  end Main; "
         "end C;");
-    // KNOWN-OPEN (#4047): correct behavior is the §9.5 rejection (matching
-    // the inner-before-outer order above); measured actual is a #2434/#2491
-    // degraded 0 — the exact pre-#4051-fix symptom, inherited from the
-    // upstream ordering gap, not reintroduced by this fix.
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    // FIXED (#4047): was a #2434/#2491-degraded 0, now the §9.5
+    // rejection that #4051's fix dispatches — same diagnostic the
+    // direct-record-call control pins above.
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, kCtorMsg));
 }
