@@ -2824,6 +2824,18 @@ bool Emitter::lowerIndexerSet(const ast::IndexExpr& ix, llvm::Value* val,
         emitPendingCheck();
         releaseIndexArgStringProducers(ix, ps, recvDecl, idxArgVals,
                                        /*accessorResultEscapes=*/false);
+        // fix #4078 (§28.14 / §27.5 / §28.9, v0.294): the SETTER twin of the
+        // GETTER-side `releaseIndexArgClosureProducers` call wired in by
+        // #4078's first half. §23.5 forbids `ref`/`out`/`owned` on indexer
+        // parameters so the imported setter receives a plain by-value borrow
+        // and never consumes the callback; once it returns the producer's +1
+        // is the caller's to drop on the normal-return edge (the setter body
+        // is verified call-bounded by `MethodOwnership::callBoundedScan`).
+        // Gated on `!diverged_` (mirror #429's `!diverged_` discipline at line
+        // 7834) so the release is not emitted into unreachable IR after a
+        // setter that threw. The unwind edge's caller is responsible for the
+        // throw path — leaks on the unwind edge are the safe direction.
+        if (!diverged_) releaseIndexArgClosureProducers(ix, ps, idxArgVals);
         return true;
     }
     // fix #2548 (§23.4/§28.9/§4.6, v0.236): the INDEXER twin of
@@ -3119,6 +3131,19 @@ bool Emitter::lowerIndexerSet(const ast::IndexExpr& ix, llvm::Value* val,
                 emitPendingCheck();
                 releaseIndexArgStringProducers(ix, ps, recvDecl, idxArgVals,
                                                /*accessorResultEscapes=*/false);
+                // fix #4078 (§28.14 / §27.5 / §28.9, v0.294): the SETTER twin
+                // of the GETTER-side closure release wired in by #4078's first
+                // half. The class-vtable setter path here dispatches through
+                // `vt[propSetSlot_]`, which is always a class's OWN slot (a
+                // vtable slot is never record-backed — §9), so the setter
+                // receives a plain by-value borrow of the closure (§23.5
+                // forbids `ref`/`out`/`owned` on indexer parameters) and the
+                // producer's +1 is the caller's to drop on the normal-return
+                // edge. Gated on `!diverged_` (mirror #429's `!diverged_`
+                // discipline at line 7834) so the release is not emitted into
+                // unreachable IR after a setter that threw. Leaks on the
+                // unwind edge are the safe direction.
+                if (!diverged_) releaseIndexArgClosureProducers(ix, ps, idxArgVals);
                 // fix #2548 (§23.4/§28.9/§4.6, v0.236): the CLASS-VTABLE
                 // twin of the interface-dispatch classBB emitProducerRelease
                 // above. The class-vtable path is unconditional-class-backed
@@ -3289,6 +3314,20 @@ bool Emitter::lowerIndexerSet(const ast::IndexExpr& ix, llvm::Value* val,
     // than whatever #2712's retain/drop-on-overwrite pair left in the slot.
     releaseIndexArgStringProducers(ix, ps, recvDecl, argVals,
                                    /*accessorResultEscapes=*/false);
+    // fix #4078 (§28.14 / §27.5 / §28.9, v0.294): the SETTER twin of the
+    // GETTER-side `releaseIndexArgClosureProducers` call wired in by #4078's
+    // first half. A lambda literal or method reference passed as an INDEX
+    // argument is a +1 closure producer; §23.5 forbids `ref`/`out`/`owned`
+    // on indexer parameters, so the parameter is empty-modifier and therefore
+    // call-bounded (the setter body provably holds no reference to the cell
+    // once the call returns). Drop the producer's +1 on the normal-return
+    // edge here — guarded on `!diverged_` (the inline body threw) so the
+    // release is not emitted into unreachable IR. The unwind edge's leak is
+    // the safe direction; an exact mirror of the §28.14 release already
+    // established in the method-call path (LlvmBackend_Calls2.cpp ~11000),
+    // in the function-value call path (#4078's own other half), and in the
+    // GETTER twin's expression-bodied and block-form paths above.
+    if (!diverged_) releaseIndexArgClosureProducers(ix, ps, argVals);
     currentThis_ = savedThis;
     locals_ = std::move(savedLocals);
     paramSlots_ = std::move(savedParams);
