@@ -9159,6 +9159,21 @@ llvm::Value* Emitter::buildRecordValue(
     // a second `ctorForArgs` call.
     sema::ConstructorSymbol* explicitCs = ctorForArgs(t, args);
     bool skipPreambleFieldInit = false;
+    // fix #4022 (§22.8 / §12.8 / §22.7, v0.294): an IMPORTED record whose
+    // explicit ctor body could not be re-parsed (parseAndAttachCtorBody's
+    // `methodSignatureIsStubSafe` declined — typically because the body names
+    // a sibling class that the synthetic source never declared, e.g. a
+    // `this(new Sibling(args))` chain over an imported-only sibling) leaves
+    // the reconstructed `importedCs->decl` nullptr. The exported library's
+    // `bz$<T>$ctor/<cs>` function in ctorFns_ still does §22.8 steps 0+1+2
+    // correctly — the EXPORTER had the AST and ran the same once-only
+    // authority (the `!isThis` gate in emitConstructorBody) — so we just CALL
+    // it from the explicit-ctor branch below. The PREAMBLE's field-init loop
+    // then has nothing to do and would otherwise double-run the body-side
+    // initializers that the compiled function also runs at the chain bottom,
+    // so flip `skipPreambleFieldInit` to true.
+    const bool explicitCsIsImportedRecordNoBody =
+        explicitCs && !explicitCs->decl && ctx_.isImported(t);
     if (explicitCs) {
         // This read is AST-gated, so it answers "not chaining" for every
         // IMPORTED record: `ConstructorSymbol::decl` is nullptr across a
@@ -9177,6 +9192,12 @@ llvm::Value* Emitter::buildRecordValue(
                 chainCallOf(*explicitCd->body[0], peekIsThis) && peekIsThis) {
                 skipPreambleFieldInit = true;
             }
+        } else if (explicitCsIsImportedRecordNoBody) {
+            // fix #4022 (companion of the above SEAM-DEBT): an imported
+            // record ctor whose body is gone does its step 0/1/2 in the
+            // compiled `bz$<T>$ctor/<cs>` function — see the comment block
+            // introducing `explicitCsIsImportedRecordNoBody` above.
+            skipPreambleFieldInit = true;
         }
     }
 
@@ -9682,7 +9703,72 @@ llvm::Value* Emitter::buildRecordValue(
     // a second time.
     if (sema::ConstructorSymbol* cs = explicitCs) {
         auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
-        if (!cd) return nullptr;
+        if (!cd) {
+            // fix #4022 (§22.8 / §12.8 / §22.7, v0.294): imported record ctor
+            // whose body could not be reconstructed on the importer side
+            // (parseAndAttachCtorBody declined — see
+            // `explicitCsIsImportedRecordNoBody` above for the gate). The
+            // EXPORTER compiled `bz$<T>$ctor/<cs>` with the chain handling
+            // baked in (its own `emitConstructorBody` runs the once-only
+            // `!isThis` gate at the bottom of the chain), so just call it.
+            // The slot has already been zeroed and (with
+            // `skipPreambleFieldInit = true` above) the field-init loop did
+            // not run, so the compiled function's step 0 fills the positional
+            // slots and step 2 runs the body field initializers — exactly the
+            // §22.8 sequence a non-imported record's local inline path runs.
+            //
+            // Argument lowering is the same hand-rolled shape the class-side
+            // imported ctor path (line 7401+ above) uses: declare the external
+            // function, lower each positional arg through `lowerExpr`, apply
+            // §5.1 numeric coercion against the formal's type, fill any
+            // omitted trailing formals with `importedCtorDefaultArgValue`.
+            // `ctorForArgs` above already matched this `cs`, so the arity
+            // agrees; the lower-level guards (modifier handling, discard,
+            // named-arg, by-ref alias vs bracket) are FILES rather than
+            // silently fixed here — a `new R(out x)` against an imported
+            // record with the same shape that needed the class-side widening
+            // is a separate scope.
+            if (explicitCsIsImportedRecordNoBody) {
+                llvm::Function* ctorFn = declareImportedCtor(cs);
+                auto* fnTy = ctorFn->getFunctionType();
+                std::vector<llvm::Value*> callArgs;
+                callArgs.push_back(slot);
+                for (std::size_t ai = 0;
+                     ai < args.size() && ai + 1 < fnTy->getNumParams();
+                     ++ai) {
+                    if (!args[ai].value) return nullptr;
+                    llvm::Value* v = lowerExpr(*args[ai].value);
+                    if (!v) return nullptr;
+                    v = coerceNumericToType(
+                        v, fnTy->getParamType(ai + 1),
+                        isUnsignedTargetExpr(*args[ai].value));
+                    callArgs.push_back(v);
+                }
+                // §22.5 / #3082: omitted-trailing defaults, mirroring
+                // lowerNew's imported-ctor fill loop above. The same wire
+                // channel (`ParameterSymbol::defaultText`) the method-call
+                // sibling uses, with the same §5.1 numeric coercion.
+                for (std::size_t pi = args.size() + 1;
+                     pi < fnTy->getNumParams();
+                     ++pi) {
+                    llvm::Value* dv =
+                        importedCtorDefaultArgValue(*cs, pi - 1);
+                    if (!dv) return nullptr;
+                    dv = coerceNumericToType(
+                        dv, fnTy->getParamType(pi), false);
+                    callArgs.push_back(dv);
+                }
+                builder_.CreateCall(ctorFn, callArgs);
+                // §22.8 step 4 / §28: an imported ctor may throw. The
+                // record value lives in the entry-block slot, not a heap
+                // block, so there is nothing to reclaim here — only the
+                // exception slot to surface, exactly as the local inline
+                // path's `emitPendingCheck()` does above.
+                emitPendingCheck();
+                return builder_.CreateLoad(st, slot);
+            }
+            return nullptr;
+        }
         // Inline the constructor body with `this` = the record slot pointer
         // (record methods access fields through a struct pointer, §9.4) and
         // the parameters bound to fresh slots.

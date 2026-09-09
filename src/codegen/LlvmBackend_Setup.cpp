@@ -2459,6 +2459,55 @@ void Emitter::declareImportedFunctions() {
             fnType, linkage, functionName(ms), module_.get());
         methodFns_[ms] = fn;
     }
+    // fix #4022 (§22.7 / §12.8 / §2.5 / §2.8.3 rule 4, v0.294): pre-declare
+    // every IMPORTED constructor upfront, mirroring `declareImportedFunctions`
+    // above for methods. Two reasons:
+    //
+    //   (1) LLVM's `Function::Create` adds a `.1`, `.2`, … suffix when a name
+    //       is reused on a different signature — so an importer that lazy-
+    //       declares one ctor (e.g. on the first `new T(args)` it lowers) gets
+    //       the unsuffixed `bz$<cls>$ctor` for THAT arity and a `.1` for the
+    //       next, while the EXPORTER's loop declared them in source order —
+    //       so the importer's call to `bz$<cls>$ctor` resolves to whichever
+    //       arity the exporter declared first, not the arity the call wanted.
+    //       MEASURED pre-fix: `new Lib4022J.Widget4022J()` against a `class`
+    //       with `constructor() this(99); constructor(c: int) ...;` — the
+    //       importer declared the 0-arg ctor with no suffix, the exporter's
+    //       1-arg ctor had the unsuffixed name, and the call passed no `99`,
+    //       so `Count` was set from a register's garbage and `Render` returned
+    //       16 instead of 99. Same shape reproduced on a record.
+    //
+    //   (2) Without pre-declaration, the record-side fix at
+    //       LlvmBackend_Exprs2.cpp:9732 (fix #4022) can't run — it needs the
+    //       call to land on the SAME LLVM `Function` object the linker
+    //       resolves to the exporter's compiled ctor.
+    //
+    // Declaring every imported ctor in `importedSymbols()` order (load order,
+    // which mirrors the exporter's source order through the metadata's
+    // member-by-member emit) makes the suffix assignments agree end to end.
+    for (sema::Symbol* sym : ctx_.importedSymbols()) {
+        auto* cs = dynamic_cast<sema::ConstructorSymbol*>(sym);
+        if (!cs || cs->isStatic || ctorFns_.count(cs)) continue;
+        std::vector<llvm::Type*> paramTys;
+        paramTys.push_back(ptrTy());  // this
+        for (sema::Symbol* p : cs->params) {
+            auto* ps = dynamic_cast<sema::ParameterSymbol*>(p);
+            sema::TypeRef* pt = ps ? ps->resolvedDeclType : nullptr;
+            // fix #3095 / §4.7: lowerParamTypeRef — the imported-ctor face
+            // (matching declareImportedFunctions's method loop above).
+            paramTys.push_back(isByRefMod(ps ? ps->modifier
+                                              : std::string_view())
+                                   ? ptrTy()
+                                   : (pt ? lowerParamTypeRef(pt) : i32()));
+        }
+        auto* fnType = llvm::FunctionType::get(
+            llvm::Type::getVoidTy(llvm_), paramTys, /*isVarArg=*/false);
+        std::string cls = cs->parent ? mangledTypeName(cs->parent) : "";
+        auto* fn = llvm::Function::Create(
+            fnType, llvm::Function::ExternalLinkage,
+            "bz$" + cls + "$ctor", module_.get());
+        ctorFns_[cs] = fn;
+    }
 }
 
 // §2.5 / §22.9 (issue #503): emit a named, ExternalLinkage getter function for
