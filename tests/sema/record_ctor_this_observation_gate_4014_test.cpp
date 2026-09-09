@@ -399,13 +399,29 @@ BEZEL_TEST(sema_record_ctor_observation_gate_4014,
 // (`runRecordConstructor` seeds `assignedFields_` from `fieldsNeedingInit_`
 // on a `this(...)` chain, mirroring `runConstructor`) — an instance call in
 // the chaining constructor's OWN body must be ACCEPTED.
+//
+// fix #4095 (§9.7 / §22.7 / §22.8, v0.295): the pre-#4095 shape — a chain
+// argument that is a fresh producer (`this(new Widget4014(42))`) — is now
+// REJECTED at sema time. The rule inverts: a record constructor's leading
+// `this(...)` chain argument MUST NOT be a fresh owned producer flowing
+// into a non-`owned` chain-target formal — §9.7's no-temporary-source rule
+// applies one level deeper, to the chain's argument list. The observation
+// gate's original purpose (instance call AFTER chain-allocated fields are
+// seeded) is moot here, because the chain itself never compiles. This row
+// now pins the §9.7 REJECT instead of the chain-side observation gate —
+// the canonical regression test for fix #4095's record-ctor half. (The
+// dedicated §9.7 test in `record_chain_fresh_producer_reject_4095_test.cpp`
+// pins the same rule across every other documented arm; this row pins the
+// SPECIFIC interaction with the §22.7 observation gate's pre-existing
+// ACCEPT path.)
 BEZEL_TEST(sema_record_ctor_observation_gate_4014,
            this_chaining_ctor_body_call_accepted_spec_22_7) {
-    BEZEL_EXPECT_EQ(runProg(std::string(kWidget4014) +
+    auto r = runAot(std::string(kWidget4014) +
         "public record RecordObsChain4014 "
         "  public readonly property Extra: Widget4014; "
         "  public constructor(w: Widget4014) Extra := w; end constructor; "
-        "  public constructor() this(new Widget4014(42)); "
+        "  public constructor() "
+        "    this(new Widget4014(42)); "
         "    var x := this.Peek(); "
         "  end constructor; "
         "  public method Peek(): int return Extra.Render(); end Peek; "
@@ -415,8 +431,16 @@ BEZEL_TEST(sema_record_ctor_observation_gate_4014,
         "    var c := new RecordObsChain4014(); "
         "    return c.Peek(); "
         "  end Main; "
-        "end C;"),
-        42);
+        "end C;");
+    // fix #4095 (§9.7 / §22.7 / §22.8, v0.295): the chain arg
+    // `new Widget4014(42)` is rejected before the observation gate would
+    // have a chance to run. The §9.7 diagnostic cites the no-temporary-
+    // source rule by name.
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagContains(r, "fresh producer"));
+    BEZEL_EXPECT_TRUE(diagContains(r, "this(...)"));
+    BEZEL_EXPECT_TRUE(diagContains(r, "9.7"));
+    BEZEL_EXPECT_FALSE(r.ran);
 }
 
 // Class control (unaffected by this fix — pins that the class path's

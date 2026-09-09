@@ -1284,6 +1284,22 @@ private:
     void recordMovesInArgs(const std::vector<ast::CallArgument>& args,
                            const ast::Expr* callee = nullptr);
 
+    // fix #4095 (§9.7 / §22.7 / §22.8, v0.295): a record constructor's leading
+    // `this(...)` chain argument that is a fresh owned producer (`new T(...)`)
+    // destined for a NON-`owned` chain-target formal is rejected up front. The
+    // shape produces a dangling borrow: the chain target stores the producer's
+    // reference into the record's borrow-carrying field, but the producer's
+    // frame ends the moment the chain call returns, so the record outlives its
+    // borrow source. The narrow check rejects ONLY `ast::NewExpr*` arguments
+    // whose bound formal is not `owned`; `this(42)` / `this(n)` (literal or
+    // named owned binding), `this(owned x)` (the legal `owned` transfer), and
+    // `this(move x)` are all unaffected. Runs at the top of the constructor
+    // body's analysis, gated on the declaring type being a RECORD. See
+    // Ownership_Checks.cpp for the diagnostic text and §9.7's no-temporary-
+    // source rule. // per §9.7, §22.7, §22.8, v0.295
+    void checkRecordChainFreshProducerArgs(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body);
+
     // fix #3751 (§22.10 / §22.3 / §28.8, v0.286): the formals of a `this(...)`
     // / `base(...)` constructor CHAIN call's target, resolved by the SAME
     // `resolveCtorFormals` a `new T(args)` site resolves through and against

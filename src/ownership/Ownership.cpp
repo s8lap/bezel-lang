@@ -214,6 +214,20 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
     // §28.8.1 (#3241 R2): clear the per-method side state for the deferred
     // in-`try` throwable checks. Fresh method = empty queue.
     pendingThrowableInTryChecks_.clear();
+    // fix #4095 (§9.7 / §22.7 / §22.8, v0.295): a record constructor's leading
+    // `this(...)` chain call that hands a fresh owned producer (`new T(...)`)
+    // into a NON-`owned` chain-target formal is rejected up front. The shape
+    // produces a dangling borrow — the chain target stores the producer's
+    // reference into the record's borrow-carrying field, but the producer's
+    // frame ends the moment the chain call returns. The check is structural
+    // (no dataflow involvement) and runs FIRST so a clean rejection is reported
+    // before any once-only / observation-gate / field-initializer downstream
+    // check could misfire on the same source. The declaration's `enclosingCtor_`
+    // field is set by the `ConstructorDecl` arm of `checkMember` before this
+    // call; for every other body kind (methods, destructors, operators,
+    // lambdas, field initializers) `enclosingCtor_` is null and the check
+    // returns immediately. // per §9.7, §22.7, §22.8, v0.295
+    checkRecordChainFreshProducerArgs(body);
     // §28.8.1 "Exception paths are not exempt" (#3080): record which statements a
     // `try` lexically encloses, so the exception-edge restoration check can skip
     // them — an exception caught in-method is not a method exit, and the catch arm

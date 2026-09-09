@@ -37,6 +37,7 @@
 // store of the same constant is indistinguishable from a single store) —
 // every field-initializer test below uses a non-idempotent initializer
 // (a static counter) so a double execution is observable as a wrong value.
+#include "support/aot_result_asserts.hpp"
 #include "support/aot_support.hpp"
 #include "test_harness.hpp"
 
@@ -96,9 +97,22 @@ BEZEL_TEST(codegen_record_this_chain_4013, class_this_chain_control_unaffected) 
 // chained-to constructor; DefiniteAssignment.cpp's `runRecordConstructor`
 // correctly treats the `this(...)` chain as discharging the §7.9
 // obligation, so no compile-time diagnostic caught it either.
+//
+// fix #4095 (§9.7 / §22.7 / §22.8, v0.295): the same shape is now REJECTED at
+// sema time. §9.7's no-temporary-source rule (already enforced for the OUTER
+// call `new Bag([10, 20, 30])` where `Bag` borrows the literal) applies one
+// level deeper, to a record-constructor's `this(new T(...))` chain whose
+// target stores the producer into a borrow-carrying field. The fresh
+// producer's +1 dies at the end of the chain call, while the record still
+// carries a pointer to it — a dangling borrow (§9.7). The remedy names the
+// source first: bind it to a local and pass the local. The accept-arm test
+// `record_ctor_this_observation_gate_4014_test.cpp::this_chaining_ctor_body_
+// call_accepted_spec_22_7` exercises the same record-shape chain but with the
+// producer pre-bound to a local, and must keep passing on both sides. //
+// per §9.7, §22.7, §22.8, v0.295
 BEZEL_TEST(codegen_record_this_chain_4013,
            record_this_chain_discharges_reference_field) {
-    BEZEL_EXPECT_EQ(run(
+    auto r = runAot(
         "module M; "
         "public class Widget4013 "
         "  public Count: int; "
@@ -114,7 +128,15 @@ BEZEL_TEST(codegen_record_this_chain_4013,
         "  public static method Main(): int "
         "    var c := new R4013B(); return c.Extra.Render(); "
         "  end Main; "
-        "end Program4013B;"), 88);
+        "end Program4013B;");
+    // §9.7 reject — the chain arg is a fresh owned producer into a non-`owned`
+    // chain-target formal; the record's borrow-carrying field would dangle.
+    // (LANE_RULES §3 + ambiguous-ran-false ratchet: pin the diagnostic by
+    // message text + real location, not just `hasErrors()` / `r.ran`.)
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "fresh producer"));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "this(...)"));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "section 9.7"));
 }
 
 // A two-hop record chain: ctor() -> this(42) -> this(42, 7) -> the ctor

@@ -168,6 +168,71 @@ int runSingleModule4022(const std::string& src) {
     return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 }
 
+// fix #4095 (§9.7 / §22.7 / §22.8, v0.295): the same compile-and-run
+// harness as `compileImportAndRun4022`, but it expects the importer-side
+// build to be REJECTED at sema time (the chain argument `new Widget4022A(88)`
+// is a fresh owned producer flowing into a non-`owned` chain target formal
+// on a record ctor — §9.7's no-temporary-source rule rejects the shape
+// before codegen). The library itself does not carry the reject — it is a
+// plain record whose `constructor(w: Widget4022A)` is valid; the reject is
+// in the APP's `constructor() this(new Widget4022A(88));` chain body, so
+// the library must still build cleanly to prove the diagnostic is targeted
+// and not collateral. Returns `rejected=true` when the APP's compile fails;
+// `skipToolchain=true` when the dependency toolchain is unavailable.
+struct CompileOutcome4022 {
+    bool rejected = false;
+    bool skipToolchain = false;
+};
+
+CompileOutcome4022 compileImportAndRun4022Rejects(const std::string& libSrc,
+                                                  const std::string& appSrc) {
+    CompileOutcome4022 out;
+    auto dir = fs::temp_directory_path();
+    std::string stem = "bz4022r_" + unique_stem("");
+    TempFile4022 aSrc((dir / (stem + "_a.bzl")).string());
+    TempFile4022 aObj((dir / (stem + "_a.o")).string());
+    writeSource4022(aSrc.path, libSrc);
+    {
+        bezel::Driver driver;
+        if (!driver.compileObject(aSrc.path, aObj.path).success) {
+            out.skipToolchain = true;
+            return out;
+        }
+    }
+    if (!std::ifstream(aObj.path).good()) {
+        out.skipToolchain = true;
+        return out;
+    }
+    TempFile4022 bSrc((dir / (stem + "_b.bzl")).string());
+    TempFile4022 bExe((dir / stem).string());
+    writeSource4022(bSrc.path, appSrc);
+    bezel::Driver driver;
+    std::vector<bezel::Dependency> deps;
+    bezel::Dependency d;
+    d.metadataPath = aObj.path;
+    d.objectPath = aObj.path;
+    deps.push_back(d);
+    auto r = bezel::test::compileFileForTest(driver, bSrc.path, bExe.path,
+                                             deps);
+    out.rejected = !r.success;
+    return out;
+}
+
+// Single-module twin of `compileImportAndRun4022Rejects`. The lib-and-app
+// are a single source, and the expected outcome is a clean §9.7 reject.
+CompileOutcome4022 runSingleModule4022Rejects(const std::string& src) {
+    CompileOutcome4022 out;
+    auto dir = fs::temp_directory_path();
+    std::string stem = "bz4022ctlr_" + unique_stem("");
+    TempFile4022 sSrc((dir / (stem + ".bzl")).string());
+    TempFile4022 sExe((dir / stem).string());
+    writeSource4022(sSrc.path, src);
+    bezel::Driver driver;
+    auto r = bezel::test::compileFileForTest(driver, sSrc.path, sExe.path);
+    out.rejected = !r.success;
+    return out;
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // The HEADLINE LIBRARY: a record whose 0-arg ctor chains via
 // `this(new Widget4022(88))` to a 1-arg ctor that sets a reference-typed
@@ -418,20 +483,44 @@ const char* kAppT4 =
 // `exit=88`; T1b alone would pass on a compiler that already handled
 // #4013 but never knew about #4022. Both together pin "the importer
 // agrees with the twin".
+//
+// fix #4095 (§9.7 / §22.7 / §22.8, v0.295): both rows now REJECT at sema
+// time. The chain argument `new Widget4022A(88)` is a fresh owned producer
+// flowing into the chain target's NON-`owned` `w: Widget4022A` formal,
+// which stores it into the record's borrow-carrying field `Extra` — §9.7's
+// no-temporary-source rule rejects this shape. The expected compile-time
+// diagnostic is the new `Ownership_Checks.cpp::checkRecordChainFreshProducer
+// Args` reject; see also the test `tests/sema/record_chain_fresh_producer_
+// reject_4095_test.cpp` for the single-module pinning and the accept-arm
+// shape (bind to a named local first).
 // ===========================================================================
 BEZEL_TEST(xmod_record_this_chain_ctor_imported_4022,
            t1_imported_record_this_chain_discharges_reference_field) {
-    int rc = compileImportAndRun4022(kLib4022A, kAppT1);
-    if (rc == -2) return;  // dependency toolchain unavailable — skip
-    BEZEL_EXPECT_EQ(rc, 88);
+    // §9.7 reject — `this(new Widget4022A(88))` is a fresh producer into
+    // a non-`owned` chain target formal on a record ctor; the chain target
+    // stores it into `Extra` (a borrow-carrying field), so the record would
+    // outlive the producer's frame. The sema reject fires for both the
+    // imported side (this row) and the single-module side (T1b below). The
+    // pre-#4095 importers' separate `chain never runs` defect (the original
+    // #4022 SIGSEGV) is closed upstream by fix #4022 itself; this test no
+    // longer exercises that path because the chain is rejected before any
+    // codegen runs.
+    auto r = compileImportAndRun4022Rejects(kLib4022A, kAppT1);
+    if (r.skipToolchain) return;
+    BEZEL_EXPECT_TRUE(r.rejected);
 }
 
 // T1b — single-module twin of T1. Must keep returning 88 on both sides of
 // the fix (#4013's own single-module coverage already pins this; the row
 // exists here to make the T1/T1b pair a differential claim).
+//
+// fix #4095: also REJECTED at sema time, for the same §9.7 reason — the
+// chain target's `w: Widget4022AT1b` formal is non-`owned` and stores the
+// borrow into the record's `Extra` field.
 BEZEL_TEST(xmod_record_this_chain_ctor_imported_4022,
            t1b_single_module_record_this_chain_discharges_reference_field) {
-    BEZEL_EXPECT_EQ(runSingleModule4022(kLocalT1), 88);
+    auto r = runSingleModule4022Rejects(kLocalT1);
+    BEZEL_EXPECT_TRUE(r.rejected);
 }
 
 // ===========================================================================

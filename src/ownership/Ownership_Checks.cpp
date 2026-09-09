@@ -11448,6 +11448,132 @@ void MethodOwnership::checkFieldInitializer(const ast::FieldDecl& fd,
     }
 }
 
+// fix #4095 (§9.7 / §22.7 / §22.8, v0.295): a record constructor's leading
+// `this(...)` chain call that hands a fresh owned producer (`new T(...)`) into
+// a NON-`owned` chain-target formal is rejected at sema time.
+//
+// Why the rule exists (the issue's §9.7 reading): §9.7 already forbids
+// constructing a borrow-bearing record from a temporary bound to one of its
+// borrow-carrying fields — `new Bag([10, 20, 30])` where `Bag` borrows the
+// literal is rejected, with the remedy "bind the source to a named local
+// first". The 4013 / 4022 test pattern is the same shape, one level deeper:
+// the `this(new T(88))` argument to the chain target's `constructor(w: T)`
+// form is a fresh owned producer whose +1 reference lands in the record's
+// borrow-carrying field, but whose frame dies at the end of the chain call
+// (which is also the moment the record's own §22.8 once-only obligation
+// completes). The chain target's stored borrow then dangles from the moment
+// the constructor returns; the `c.Extra.Render()` read at the next
+// statement observes it (LSan Direct leak on plain, heap-use-after-free on
+// ASan when codegen is asked to release the +1). §9.7's no-temporary-source
+// rule applies verbatim, and the language has no general lifetime-extension
+// mechanism — the record's borrow field is exactly the shape §9.7 rejects.
+//
+// Why this is narrow enough to be the rule: the rejection is keyed on
+// (a) the declaring type being a RECORD (a class's `this(new T(...))` is a
+// different shape — the class instance owns its fields outright, so the
+// borrowed source is the chain call's frame, but the class instance lives
+// across any number of subsequent method calls regardless; the borrow is
+// scoped to the call, not to the object, and §28.3's borrow-lifetime rule
+// for instance fields already constrains it through the
+// `recordMovesInArgs`-` + `isImplicitOwned`-` chain. Issue #4095's defect
+// is specifically the RECORD's borrow-CARRYING field), and
+// (b) the chain argument being a `ast::NewExpr*` whose bound chain-target
+// formal is NOT `owned`. The narrow rule admits:
+//   * `this(42)` / `this(n)` — a literal or a named owned binding. Neither
+//     is a fresh producer, and the chain target takes a value copy.
+//   * `this(owned x)` — the §22.3 call-site `owned` marker, the LEGAL
+//     `owned` transfer. The marker carries the +1 into the chain target's
+//     `owned` formal, which disposes it at end of ctor.
+//   * `this(move b)` of a borrow — handled by the §28.8.1 move-on-place
+//     source check that already routes through `recordMovesInArgs`. The
+//     chain target gets a borrow with the moved-out place's source, but the
+//     place is owned and the move discharges it.
+//   * `this(new T())` where the chain target's formal IS `owned` — the
+//     chain target takes ownership of the +1, disposes it at end of ctor.
+//     Legal.
+// And rejects:
+//   * `this(new T())` into a non-`owned` chain-target formal — the §9.7
+//     no-temporary-source shape, one level deeper than the surface rule.
+//
+// Why the chain arg has to walk through `boundParamIndex` (not the source
+// position): §22.5 admits a NAMED argument (`this(w := new T(8))`) and
+// §22.10 admits reordered named-and-positional argument lists. A source-
+// position map is wrong for both; `boundParamIndex` is the SAME predicate
+// the two existing chain-arg consumers (`recordMovesInArgs`,
+// `isImplicitOwned`) already use to bind each argument to its formal
+// position, so the modifier lookup here matches the modifier lookup there.
+//
+// The diagnostic cites §9.7's no-temporary-source rule by name and names
+// the two-step fix (bind to a local first; or change the chain target's
+// parameter to `owned`). Runs at the TOP of the constructor body's
+// analysis so a clean rejection is reported before any field-initializer /
+// once-only / observation-gate downstream check would have a chance to
+// misfire on the same source — the rejection is structural, not dataflow.
+void MethodOwnership::checkRecordChainFreshProducerArgs(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body) {
+    if (!enclosingCtor_ || !enclosingCtor_->parent) return;
+    // §9.7's "instance field of a class" / "borrow-carrying record component"
+    // distinction: the rule is record-specific. A CLASS constructor's
+    // `this(new T())` argument goes through the same chain-target machinery
+    // (codegen's `emitChainCall` lowers identically), but the class instance
+    // owns its fields outright and the borrow's lifetime is scoped to the
+    // chain call by `recordMovesInArgs`/`isImplicitOwned` already. Admitting
+    // the class-side shape is consistent with #1020's field-initializer rule,
+    // which is gated on `enclosingType->kind == Class || Interface` (see
+    // `checkFieldInitializer` above).
+    if (enclosingCtor_->parent->kind != ast::TypeDeclKind::Record) return;
+    if (body.empty()) return;
+    // `chainCallOfStmt` is the ONE chain-call recognizer — every other
+    // caller (DefiniteAssignment, sema::TypeResolution_Checks,
+    // LlvmBackend_Exprs2) goes through it, so a `this(...)` body detected
+    // here is exactly the same chain codegen lowers against. `isThis` is
+    // set true; `base(...)` is the explicit base-class-init chain (§22.7)
+    // and has the same shape but is a CLASS-only concern — `base(...)` is
+    // not legal on a record (records have no base classes, §9.6) and the
+    // enclosing-type kind gate above already excludes it from this code.
+    bool isThis = false;
+    const ast::CallExpr* chain = ast::chainCallOfStmt(*body.front(), isThis);
+    if (!chain || !isThis) return;
+    // Reuse `resolveChainCtorParams` — it already targets the enclosing
+    // type's ctors excluding the enclosing ctor (§22.10's no-self-chain)
+    // and runs the same pass sequence `emitChainCall` lowers against, so
+    // the parameter list here is byte-identical to the one the chain target
+    // stores its arguments into.
+    const CalleeFormals formals = resolveChainCtorParams(chain->callee.get(),
+                                                        chain->args);
+    if (!formals.valid()) return;
+    for (std::size_t i = 0; i < chain->args.size(); ++i) {
+        const ast::CallArgument& a = chain->args[i];
+        if (!a.value) continue;
+        // The rule is §9.7's NO-TEMPORARY-SOURCE: a fresh owned producer
+        // (`new T(args)`) passed to a non-`owned` borrow slot. A literal,
+        // an identifier, a `move` form, or an `owned`-marked call result
+        // are NOT this shape and are NOT rejected here — they flow through
+        // the existing `recordMovesInArgs` / `isImplicitOwned` paths and
+        // are classified by their own pre-existing rules.
+        const auto* ne = dynamic_cast<const ast::NewExpr*>(a.value.get());
+        if (!ne) continue;
+        const std::size_t boundPos = boundParamIndex(chain->args, i, formals);
+        if (boundPos >= formals.size()) continue;
+        // The legal `owned` transfer: chain arg is `new T(...)` AND chain
+        // target's formal is `owned` — the chain target takes +1 ownership
+        // and disposes it at end of ctor (§22.3 / §28.5). Admit.
+        if (formals.modifier(boundPos) == "owned") continue;
+        report(Severity::Error, ne->span.begin,
+               std::string(
+                   "a fresh producer (new ...) cannot be the argument to a "
+                   "this(...) chain of a record constructor -- the chain "
+                   "target stores it into a borrow-carrying field whose "
+                   "lifetime outlives the chain call's frame, so the unbound "
+                   "owned temporary dies at the end of the chain call while "
+                   "the record still carries a pointer to it (spec section "
+                   "9.7 no-temporary-source rule, extended to record-"
+                   "constructor chain arguments; sections 22.7 / 22.8, "
+                   "v0.295). Bind the producer to a named local first, or "
+                   "change the chain target parameter to owned."));
+    }
+}
+
 // #2168 / §23.1 / §28.6 (v0.226): an auto-property initializer stores into the
 // compiler-generated backing field. That field has no `owned` marker or disposal
 // cascade, so a fresh owned producer would be abandoned exactly as in the
