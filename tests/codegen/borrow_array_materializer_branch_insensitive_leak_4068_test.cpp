@@ -175,12 +175,24 @@ BEZEL_TEST(codegen_borrow_array_materializer_branch_insensitive_leak_4068,
 // (Struct StringEscapeWalker ~L24481) is wired identically to the IfStmt
 // arm. Without the fix: -999 (LSan leak); with: 0 (the while body runs
 // zero times because flag=false on entry; total stays 0).
+//
+// §7.9 — `Data` carries a field initializer (`:= new Array<int>()`); per
+// §7.9's "given a field initializer at its declaration" clause, an
+// initializer-carrying non-nullable reference field does NOT need to be
+// assigned in every ctor body (DefiniteAssignment.cpp's
+// `isSevenNineStrictField` early-returns `false` on `f.initializer`).
+// Without that initializer the post-#4025 §7.9 strict-storage predicate
+// correctly identifies `Array<int>` as a heap-pointer builtin (§28.11) and
+// rejects the ctor — the body only assigns `Data` inside a `while`, whose
+// normal-exit path includes "0 iterations" by the zero-trip-loop rule, so
+// `Data` is not definitely assigned there. The initializer is the
+// spec-clean way to keep the WhileStmt-arm test pattern intact.
 BEZEL_TEST(codegen_borrow_array_materializer_branch_insensitive_leak_4068,
            while_loop_field_store_spec_28_3) {
     std::string src =
         "module M; "
         "class Holder "
-        "  public owned Data: Array<int>; "
+        "  public owned Data: Array<int> := new Array<int>(); "
         "  public constructor(seq: Array<int>, flag: bool) "
         "    var items := seq.Sorted(); "
         "    var done := false; "
