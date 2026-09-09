@@ -273,7 +273,19 @@ std::unique_ptr<ast::Expr> Parser::parseBinaryExpression(int minPrecedence) {
             // §A.7 example). The precedence climber does not descend to the
             // ThrowExpr level (A.7's grammar is informal; §17.12 governs),
             // so parse a leading `throw` as a full expression here.
-            auto right = isKeyword("throw") ? parseExpressionImpl()
+            //
+            // fix #3998 (§17.12, v0.295): call `parseExpression()`, not
+            // `parseExpressionImpl()` — the latter builds the ThrowExpr node
+            // but skips `stampSpan` (only `parseExpression()`'s wrapper at
+            // line ~113 applies it), so a `throw` reached ONLY via this
+            // binary-RHS path (e.g. `b ?? throw new E()`) kept its
+            // default-constructed span (line 0, col 0). Any diagnostic
+            // anchored to that node's own span — e.g. §22.15's pure-body
+            // "`throw` is not admitted in a pure body" rejection inside a
+            // §22.16 contract clause (PureChecker.cpp's `clauseMode_` arm,
+            // which reports at `te->span.begin`) — printed at `0:0` instead
+            // of the throw token's real location.
+            auto right = isKeyword("throw") ? parseExpression()
                                             : parseBinaryExpression(nextMin);
             auto bin = std::make_unique<ast::BinaryExpr>();
             bin->op = opText;
