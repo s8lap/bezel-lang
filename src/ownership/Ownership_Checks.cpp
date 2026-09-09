@@ -1841,30 +1841,54 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
         // Strategy: if this is `x.Dispose()` and x is currently Disposed,
         // skip checkRead (markDisposedByName will diagnose); otherwise call
         // checkRead normally. // per §28.2
-        bool skipCalleeReadForDispose = false;
+        //
+        // fix #3984 (§28.2, v0.295): the callee's (target, member) pair is
+        // read from EITHER a MemberAccessExpr (`x.Dispose()` / the
+        // lookThroughForceUnwrap'd `x!.Dispose()`) or a NullCondMemberExpr
+        // (`x?.Dispose()`) — the latter newly reachable now that the
+        // NullCondMemberExpr arm above sends `checkRead` into its target.
+        // Without this, `x?.Dispose(); x?.Dispose();` on an already-Disposed
+        // `x` let checkRead's generic Disposed-use WARNING (which POISONS
+        // the record) run first and pre-empt markDisposedByName's precise
+        // "is disposed again here — the second `.Dispose()` is a no-op"
+        // message below — the same #3941 poison-preemption shape, now for
+        // the `?.` spelling specifically. markDisposedByName's own
+        // NullCondMemberExpr recognition (this file, ~line 2164) already
+        // handles the discharge itself; this only decides whether checkRead
+        // runs FIRST and steals its diagnostic.
+        const ast::Expr* disposeTarget = nullptr;
+        std::string_view disposeMember;
         if (call->callee) {
             if (auto* cma = dynamic_cast<const ast::MemberAccessExpr*>(
                     call->callee.get())) {
-                if (cma->member == "Dispose") {
-                    if (auto* tid = dynamic_cast<const ast::IdentifierExpr*>(
-                            cma->target.get())) {
-                        // Only skip read-check if the local is already Disposed
-                        // (the double-dispose case that markDisposedByName
-                        // handles), OR maybe-consumed (§28.3 #1626: disposing
-                        // a maybe-consumed local — owned on one branch,
-                        // moved-from on the other — is the use-after-free /
-                        // double-dispose the lattice state exists to reject;
-                        // markDisposedByName emits the precise message, so
-                        // suppress the generic read diagnostic here to avoid a
-                        // double report).
-                        for (auto& [s, lo] : states_) {
-                            if (s->name == tid->name) {
-                                skipCalleeReadForDispose =
-                                    (lo.state == OwnershipState::Disposed) ||
-                                    lo.maybeConsumed;
-                                break;
-                            }
-                        }
+                disposeTarget = cma->target.get();
+                disposeMember = cma->member;
+            } else if (auto* ncma =
+                           dynamic_cast<const ast::NullCondMemberExpr*>(
+                               call->callee.get())) {
+                disposeTarget = ncma->target.get();
+                disposeMember = ncma->member;
+            }
+        }
+        bool skipCalleeReadForDispose = false;
+        if (disposeTarget && disposeMember == "Dispose") {
+            if (auto* tid =
+                    dynamic_cast<const ast::IdentifierExpr*>(disposeTarget)) {
+                // Only skip read-check if the local is already Disposed
+                // (the double-dispose case that markDisposedByName
+                // handles), OR maybe-consumed (§28.3 #1626: disposing
+                // a maybe-consumed local — owned on one branch,
+                // moved-from on the other — is the use-after-free /
+                // double-dispose the lattice state exists to reject;
+                // markDisposedByName emits the precise message, so
+                // suppress the generic read diagnostic here to avoid a
+                // double report).
+                for (auto& [s, lo] : states_) {
+                    if (s->name == tid->name) {
+                        skipCalleeReadForDispose =
+                            (lo.state == OwnershipState::Disposed) ||
+                            lo.maybeConsumed;
+                        break;
                     }
                 }
             }
@@ -2913,35 +2937,39 @@ void MethodOwnership::checkRead(const ast::Expr& e, bool selfTarget) {
         return;
     }
     // §17.1: `NullCondMemberExpr` (`t?.M`) and `NullCondCallExpr` (`f?(args)`)
-    // are the TWO node kinds this fix deliberately does NOT add, though they
-    // are in the same remainder and their repros are the same measured
-    // heap-use-after-free (`var xn: Res? := new Res(1); var t :=
-    // Sink.Take(move xn!); var u := xn?.tag;` — rc=0, zero diagnostics, "READ
-    // of size 4" freed in `bz$M.Sink$Take`; likewise `xn?.Get()`).
-    //
-    // The four-line arms DO close both repros — measured — but `?.` is the
-    // last read spelling that escapes issue 3983, a PRE-EXISTING false
-    // diagnostic in which a nullable owned local's plain null-CHECK (`if item
-    // <> null then … end;`, no discharge on either branch) arms
-    // `disposedOnSomePath`, so every subsequent read draws "local `item` may
-    // have already been disposed on another branch". That already fires for
-    // `item!.Val` on an unpatched tree; adding these arms extends it to the
-    // canonical `?.Dispose()` discharge idiom and breaks six shipped codegen
-    // tests written that way (owned_collection_trypop_831 ×4,
-    // owned_set_take_1476 ×2) — all on
-    //   `var ok := a.TryPopFirst(out owned var item);
-    //    var v := 0; if item <> null then v := item.Val; end;
-    //    item?.Dispose();`
-    // Those programs are correct; the rejection would be 3983's bug, not a
-    // finding, and repairing the fixtures around a false diagnostic is the
-    // wrong direction. The arms are therefore withheld until 3983 lands, and
-    // the residual is filed as issue 3984 with the measurement and the
-    // ordering. (3984 also records the second thing they need: widening
-    // `handleDischarge`'s `skipCalleeReadForDispose` — this file, ~line 1186 —
-    // to recognise a `NullCondMemberExpr` callee, or `x?.Dispose()` on an
-    // already-disposed `x` loses `markDisposedByName`'s precise idempotent-
-    // dispose message to the #3941 poison-preemption.)
-    // // per §17.1, §28.3, v0.294, issue 3983, issue 3984
+    // — the residual half of #3971, filed as issue 3984 and landed once its
+    // blocker (issue 3983, the null-check disposedOnSomePath false-positive)
+    // was fixed. Before this arm, `var xn: Res? := new Res(1); var t :=
+    // Sink.Take(move xn!); var u := xn?.tag;` compiled with rc=0 and zero
+    // diagnostics and heap-use-after-freed under `--sanitize=address`
+    // ("READ of size 4" freed in `bz$M.Sink$Take`); likewise `xn?.Get()`.
+    // Mirrors the MemberAccessExpr/CallExpr arms above exactly — a pure read
+    // walk over the target/callee/args, no consume/mark/transfer — so with
+    // #3983 fixed there is no longer a false-positive to multiply onto the
+    // `item?.Dispose()` discharge idiom (own_collection_trypop_831,
+    // owned_set_take_1476 stay green — see the #3984 commit's FAIL-WITHOUT
+    // sweep). // per §17.1, §28.3 K1.3/K7, §28.2, v0.295, issue 3984
+    if (auto* ncm = dynamic_cast<const ast::NullCondMemberExpr*>(&e)) {
+        if (ncm->target) checkRead(*ncm->target, /*selfTarget=*/false);
+        return;
+    }
+    if (auto* ncc = dynamic_cast<const ast::NullCondCallExpr*>(&e)) {
+        if (ncc->callee) checkRead(*ncc->callee, /*selfTarget=*/true);
+        std::size_t pos = 0;
+        for (const auto& a : ncc->args) {
+            if (!a.value) { ++pos; continue; }
+            // Mirror the CallExpr arm's `out owned var` WRITE-target
+            // carve-out (#2436) — the null-conditional invocation spelling
+            // deposits a fresh owned value exactly the same way.
+            if (a.modifier == "out owned var" ||
+                builtinOutOwnedArg(ncc->callee.get(), pos)) {
+                ++pos; continue;
+            }
+            checkRead(*a.value, false);
+            ++pos;
+        }
+        return;
+    }
     // §17.4: `x is T` / `x is not T` / `x as T` read `x` — an `is` test reads
     // the instance's type tag out of the object, so on a freed instance it is a
     // heap-use-after-free like any other member read. // per §17.4
