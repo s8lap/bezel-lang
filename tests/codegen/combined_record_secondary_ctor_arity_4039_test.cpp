@@ -62,6 +62,23 @@
 //       issue #3892's remedy for exactly this "cannot pin exact message
 //       text everywhere, but MUST distinguish reject from crash" shape).
 //
+// UPDATE — fix #4058 (§9.1/§9.3/§7.9, v0.295): condition (ii) above ("record's
+// TOTAL storage equals its positional-field count", i.e. ZERO body storage)
+// was a strict subset of what is actually sound. The preamble field-init
+// loop that runs unconditionally before this gate already correctly
+// initializes any body field/auto-property that carries ITS OWN
+// initializer, regardless of which construction path follows below it — so
+// such a member is not "storage this path could leave uninitialized" after
+// all. #4058 widens condition (ii) to: every body-storage member either is
+// positional, or has a real local initializer the preamble loop will run
+// (an IMPORTED body member with no local decl stays conservative, i.e.
+// still declines — a separate concern, #2467/#3671/#3723). T8 below was
+// originally a control pinning this exact shape as a decline (see git
+// history); #4058 flips it to an accept-and-runs-correctly assertion, since
+// the shape genuinely IS sound. T9's shape (a body field with NO
+// initializer at all) is unaffected and still correctly declines — #4001
+// remains the open general field-completion gap.
+//
 // Related but DISTINCT: issue #4017 (a combined-form record's explicit
 // secondary constructor of a different arity is REJECTED by SEMA when the
 // call's arity matches THAT constructor, not the positional fields —
@@ -307,26 +324,35 @@ BEZEL_TEST(codegen_combined_record_secondary_ctor_arity_4039,
 }
 
 // ===========================================================================
-// T8 — the fast path must still zero-initialize/run body member initializers
-// correctly when it fires for a combined-form record with a different-arity
-// ctor: a body field WITH ITS OWN INITIALIZER (unlike T9's uninitialized
-// field) keeps the record's TOTAL storage larger than its positional-field
-// count, so per condition (ii) this shape is NOT admitted by this fix's
-// widening and still hits the (b) Error arm — pinned here as a control
-// showing the fix's deliberately conservative boundary, not a regression.
+// T8 — fix #4058 (§9.1/§9.3/§7.9, v0.295): the fast path must fire and
+// construct correctly for a combined-form record with a different-arity
+// explicit ctor when the body carries a field WITH ITS OWN INITIALIZER
+// (contrast T9's genuinely-uninitialized body field, which still declines).
+// Originally #4039 declined this shape too (condition (ii) was "record's
+// TOTAL storage equals its positional-field count", i.e. ZERO body storage)
+// — over-broad, since the preamble field-init loop above (`if
+// (!skipPreambleFieldInit) { for (const sema::Symbol* m : fields) ... }`)
+// already runs `extra`'s own initializer unconditionally, before this gate,
+// regardless of which construction path follows. #4058 widens the gate to
+// admit any body member with a real initializer; this now ACCEPTS and runs,
+// same runtime value as the pre-#4039 shape with no secondary ctor at all
+// (see the #4058 issue's own control repro). Formerly a control pinning a
+// compile-time reject (`body_field_with_initializer_still_declines_
+// pending_4001_control_spec_7_9`) — updated in the same commit as the fix,
+// per CLAUDE.md's "a fix that reverses a prior rejection must update the
+// existing tests that pinned the old behaviour."
 // ===========================================================================
-BEZEL_TEST(
-    codegen_combined_record_secondary_ctor_arity_4039,
-    body_field_with_initializer_still_declines_pending_4001_control_spec_7_9) {
-    auto r = runAot(
-        "module M; record Combo4039T8(x: int) "
-        "  public extra: int := 42; "
-        "  public constructor(a: int, b: int) this.x := a + b; end constructor; "
-        "end Combo4039T8; "
-        "class C public static method Main(): int "
-        "  var r := new Combo4039T8(9); return r.x + r.extra; "
-        "end Main; end C;");
-    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+BEZEL_TEST(codegen_combined_record_secondary_ctor_arity_4039,
+           body_field_with_initializer_now_accepted_spec_9_1_9_3_4058) {
+    BEZEL_EXPECT_EQ(
+        run("module M; record Combo4039T8(x: int) "
+            "  public extra: int := 42; "
+            "  public constructor(a: int, b: int) this.x := a + b; end constructor; "
+            "end Combo4039T8; "
+            "class C public static method Main(): int "
+            "  var r := new Combo4039T8(9); return r.x + r.extra; "
+            "end Main; end C;"),
+        51);
 }
 
 // ===========================================================================
@@ -411,4 +437,138 @@ BEZEL_TEST(codegen_combined_record_secondary_ctor_arity_4039,
         "  var c := new ComboX4039(9); return c.x; "
         "end Main; end Program4039;";
     BEZEL_EXPECT_EQ(runXmod4039(lib, app), 9);
+}
+
+// ===========================================================================
+// T12-T17 — issue #4058 breadth grid. #4058 widens condition (ii) of the
+// #4039 fast-path gate from "zero body storage" to "every body member either
+// is positional, or has a real initializer the preamble loop already runs"
+// (`Emitter::buildRecordValue`'s `bodyStorageAdmitsFastPath`,
+// LlvmBackend_Exprs2.cpp). These pin the shapes adjacent to T8 that exercise
+// that predicate's actual code paths: the PropertyDecl arm (not just
+// FieldDecl), walking MULTIPLE body members (not just one), and the
+// still-conservative IMPORTED axis — plus a generic instantiation, since the
+// predicate reads `m->decl` (AST-level), not the substituted type.
+// ===========================================================================
+
+// T12 — the PropertyDecl/`autoInitializer` arm of `bodyStorageAdmitsFastPath`
+// (T8 exercises the FieldDecl/`initializer` arm only): a body AUTO-PROPERTY
+// with its own initializer must be admitted and construct correctly, exactly
+// like a plain field.
+BEZEL_TEST(codegen_combined_record_secondary_ctor_arity_4039,
+           body_autoproperty_with_initializer_accepted_spec_9_2_4058) {
+    BEZEL_EXPECT_EQ(
+        run("module M; record Combo4058T12(x: int) "
+            "  public property extra: int := 42; "
+            "  public constructor(a: int, b: int) this.x := a + b; end constructor; "
+            "end Combo4058T12; "
+            "class C public static method Main(): int "
+            "  var r := new Combo4058T12(9); return r.x + r.extra; "
+            "end Main; end C;"),
+        51);
+}
+
+// T13 — a body AUTO-PROPERTY with NO initializer (unlike T12), assigned only
+// inside the different-arity secondary constructor, remains correctly
+// declined: §7.9's definite-assignment concern (#4001, not fixed by #4058)
+// is real for this shape — the primary ctor's fast path has no way to run
+// that assignment, so admitting it would leave `extra` at its zero default
+// regardless of what the (unreachable-from-here) secondary ctor says.
+BEZEL_TEST(codegen_combined_record_secondary_ctor_arity_4039,
+           body_autoproperty_no_initializer_still_declines_spec_7_9_4058) {
+    auto r = runAot(
+        "module M; record Combo4058T13(x: int) "
+        "  public property extra: int; "
+        "  public constructor(a: int, b: int) this.x := a + b; this.extra := a; "
+        "  end constructor; "
+        "end Combo4058T13; "
+        "class C public static method Main(): int "
+        "  var r := new Combo4058T13(9); return r.x + r.extra; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+}
+
+// T14 — MULTIPLE body fields, ALL with initializers: `bodyStorageAdmitsFastPath`
+// must walk every body-storage member, not just the first, and admit only
+// when every one qualifies.
+BEZEL_TEST(codegen_combined_record_secondary_ctor_arity_4039,
+           multiple_body_fields_all_initialized_accepted_spec_9_3_4058) {
+    BEZEL_EXPECT_EQ(
+        run("module M; record Combo4058T14(x: int) "
+            "  public a: int := 10; "
+            "  public b: int := 20; "
+            "  public constructor(p: int, q: int) this.x := p + q; end constructor; "
+            "end Combo4058T14; "
+            "class C public static method Main(): int "
+            "  var r := new Combo4058T14(9); return r.x + r.a + r.b; "
+            "end Main; end C;"),
+        39);
+}
+
+// T15 — MIXED: one body field initialized, a SECOND with no initializer.
+// `bodyStorageAdmitsFastPath` requires EVERY body member to qualify — a
+// single uninitialized member must still decline the whole call, not just
+// leave that one field unwritten.
+BEZEL_TEST(codegen_combined_record_secondary_ctor_arity_4039,
+           multiple_body_fields_one_uninitialized_still_declines_spec_7_9_4058) {
+    auto r = runAot(
+        "module M; record Combo4058T15(x: int) "
+        "  public a: int := 10; "
+        "  public b: int; "
+        "  public constructor(p: int, q: int) this.x := p + q; this.b := p; "
+        "  end constructor; "
+        "end Combo4058T15; "
+        "class C public static method Main(): int "
+        "  var r := new Combo4058T15(9); return r.x + r.a + r.b; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+}
+
+// T16 — GENERIC axis: the same T8 shape, but the record is generic and the
+// call site is a concrete instantiation. `bodyStorageAdmitsFastPath` reads
+// `m->decl` (the AST `FieldDecl`/`PropertyDecl`), not the substituted type,
+// so genericity is not expected to matter — measured rather than assumed
+// (mirrors #4039's own local/cross-module double-check discipline).
+BEZEL_TEST(codegen_combined_record_secondary_ctor_arity_4039,
+           generic_body_field_with_initializer_accepted_spec_9_1_4058) {
+    BEZEL_EXPECT_EQ(
+        run("module M; record Combo4058T16<T>(x: T) "
+            "  public extra: int := 42; "
+            "  public constructor(a: T, b: T) this.x := a; end constructor; "
+            "end Combo4058T16; "
+            "class C public static method Main(): int "
+            "  var r := new Combo4058T16<int>(9); return r.x + r.extra; "
+            "end Main; end C;"),
+        51);
+}
+
+// T17 — CROSS-MODULE negative control: the T8 shape, but the record is
+// IMPORTED. `m->decl` is nullptr for every imported body member (no
+// `ast::FieldDecl`/`PropertyDecl` crosses the module boundary — the same
+// seam #3671's comment documents), so `bodyStorageAdmitsFastPath` cannot see
+// the exporter's initializer and stays conservative BY DESIGN (per the
+// #4058 issue's own scoping — an imported body member's initializer-
+// presence question is #2467/#3671/#3723, not folded in here). This must
+// still be a LOCATED compile-time Error, never a silent wrong value or a
+// crash — the exact hazard #4039 fixed in the first place.
+BEZEL_TEST(codegen_combined_record_secondary_ctor_arity_4039,
+           cross_module_body_field_with_initializer_still_declines_spec_4058) {
+    const std::string lib =
+        "module Lib4058; "
+        "public record ComboXM4058(x: int) "
+        "  public extra: int := 42; "
+        "  public constructor(a: int, b: int) this.x := a + b; end constructor; "
+        "end ComboXM4058;";
+    const std::string app =
+        "module App4058; import Lib4058; "
+        "class Program4058 public static method Main(): int "
+        "  var r := new ComboXM4058(9); return r.x + r.extra; "
+        "end Main; end Program4058;";
+    // runXmod4039 collapses every compile failure to -999 (see its
+    // definition above) — it cannot distinguish a location from a crash,
+    // so this only pins "still rejected", not "rejected loudly". The LOCAL
+    // twin (T13/T15) already pins the located-not-crashed distinction via
+    // `failedAtCompileTimeWithRealLocation`; this cell shares the same
+    // `buildRecordValue` Error-reporting arm (b), not a separate one.
+    BEZEL_EXPECT_EQ(runXmod4039(lib, app), -999);
 }

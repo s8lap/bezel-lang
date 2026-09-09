@@ -37,7 +37,7 @@
 29   src/codegen/LlvmBackend_Calls2.cpp
 3    src/codegen/LlvmBackend_Disposal.cpp
 8    src/codegen/LlvmBackend_Exprs.cpp
-9    src/codegen/LlvmBackend_Exprs2.cpp
+11   src/codegen/LlvmBackend_Exprs2.cpp
 3    src/codegen/LlvmBackend_Layout.cpp
 8    src/codegen/LlvmBackend_Serialization.cpp
 10   src/codegen/LlvmBackend_Setup.cpp

@@ -9456,26 +9456,69 @@ llvm::Value* Emitter::buildRecordValue(
     // which used to return a bare `nullptr` (see that arm's #4039 comment for
     // the resulting silent Warning-then-SIGSEGV). Widening is gated STRICTLY
     // to the case that is provably sound without depending on the record's
-    // own field-completion checking (issue #4001, separately tracked, not
-    // fixed here): a record whose TOTAL storage (`fields`, positional + body)
-    // is EXACTLY its positional fields (`sema::recordPositionalFieldSymbols`)
-    // has no body storage this path could leave uninitialized, so there is
-    // nothing for §7.9 to say about a shape this narrow — every other
-    // combined-form shape (a body field/auto-property beyond the positional
-    // set) still falls through to that arm's Error, which is the correct,
-    // sound answer for a shape codegen cannot prove complete on its own
-    // (§9.3's own "combined form" text says nothing about implicit field
+    // own general field-completion checking (issue #4001, separately
+    // tracked, not fixed here).
+    //
+    // fix #4058 (§9.1/§9.3/§7.9, v0.295): #4039 drew that soundness line at
+    // "the record's TOTAL storage is EXACTLY its positional fields" — i.e.
+    // ZERO body storage — which is a strict subset of what is actually sound.
+    // The preamble loop directly above (`if (!skipPreambleFieldInit) { for
+    // (const sema::Symbol* m : fields) ... }`) runs UNCONDITIONALLY before
+    // this gate and already correctly initializes every LOCAL body
+    // field/auto-property that carries its own initializer (its `init` is
+    // `dynamic_cast<FieldDecl>(m->decl)->initializer` or
+    // `dynamic_cast<PropertyDecl>(m->decl)->autoInitializer`), regardless of
+    // which construction path follows — so a body member with an initializer
+    // is not actually "storage this path could leave uninitialized" the way
+    // #4039's comment worried about; it is already written by the time this
+    // gate runs. `bodyStorageAdmitsFastPath` below mirrors that EXACT
+    // predicate (CLAUDE.md §6 — feed the same fact the preamble loop already
+    // computes rather than a second, drifting one) over the body-storage
+    // slice of `fields` (per the fix #2464 comment above, the positional
+    // fields are always the trailing `recPosFieldCount` entries of `fields`
+    // on BOTH the local and imported axis — `posParam` itself is not set for
+    // an imported field, so this walks the structural block instead of
+    // filtering on it). A body member with NO local decl (`m->decl ==
+    // nullptr`, i.e. IMPORTED) is left conservative — still declined by this
+    // predicate — since whether ITS initializer crossed the module boundary
+    // is a separate, already-tracked concern (#2467/#3671/#3723) this fix
+    // does not fold in. Every other combined-form shape (a body
+    // field/auto-property with no initializer, local or imported) still
+    // falls through to that arm's Error, which remains the correct, sound
+    // answer for a shape codegen cannot prove complete on its own (§9.3's
+    // own "combined form" text says nothing about implicit field
     // completeness — §7.9 owns that, and #4001 is where it is being closed).
-    // `args.size() == fields.size()` (rather than the pre-existing `<=`) is
-    // exact-arity for this branch specifically, since `fields.size() ==
-    // posFieldCount` here makes the two bounds the same value; the
-    // pre-existing `!hasAnyConstructor(t)` arm's own `<=` bound is untouched.
     const std::size_t recPosFieldCount =
         sema::recordPositionalFieldSymbols(t).size();
+    const bool bodyStorageAdmitsFastPath = [&] {
+        for (auto it = fields.begin();
+             it != fields.end() -
+                        static_cast<std::ptrdiff_t>(recPosFieldCount);
+             ++it) {
+            const sema::Symbol* m = *it;
+            // SEAM-DEBT: #4058 `m->decl` is nullptr for an IMPORTED body
+            // member (no ast::FieldDecl crosses the module boundary, the
+            // #3671-documented seam) — this reads as "no initializer", the
+            // deliberately conservative answer this fix's own comment above
+            // scopes to, not a silent wrong one (measured cross-module,
+            // T17 in combined_record_secondary_ctor_arity_4039_test.cpp:
+            // still a located Error, never a crash or a wrong value).
+            if (auto* fd = dynamic_cast<const ast::FieldDecl*>(m->decl)) {
+                if (fd->initializer) continue;
+            }
+            // SEAM-DEBT: #4058 same imported-conservative rationale as the
+            // FieldDecl arm immediately above.
+            if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(m->decl)) {
+                if (pd->autoInitializer) continue;
+            }
+            return false;  // no initializer (or imported: m->decl == nullptr)
+        }
+        return true;
+    }();
     if (!args.empty() && args.size() <= fields.size() &&
         (!hasAnyConstructor(t) ||
-         (fields.size() == recPosFieldCount && args.size() == fields.size() &&
-          explicitCs == nullptr))) {
+         (args.size() == recPosFieldCount && explicitCs == nullptr &&
+          bodyStorageAdmitsFastPath))) {
         // fix #2464: the positional fields are the TRAILING args.size()
         // entries of `fields` (see the comment above) — never fields[0..N).
         std::vector<const sema::Symbol*> posFields(
