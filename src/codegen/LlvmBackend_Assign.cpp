@@ -5431,6 +5431,38 @@ llvm::Function* Emitter::ensurePropertyAccessorFn(const sema::TypeSymbol* cls,
     const ast::PropertyAccessor* blockGet = nullptr;
     const ast::PropertyAccessor* setAcc = nullptr;
     bool isAuto = (pd->bodyKind == ast::PropertyBodyKind::Auto);
+    // fix #4036 (§12.5, v0.295): an ABSTRACT-SHORTHAND named property
+    // (`abstract property Name: T;`) shares `PropertyBodyKind::Auto` with a
+    // real auto-property, but #4020's `isAutoPropertyStorageSymbol` already
+    // excludes it from `storage` (no backing field exists for it — #4018).
+    // Without this early decline, the `isAuto` getter/setter branches below
+    // fall into the `fieldIndex_.find(ps)` miss and its
+    // `Constant::getNullValue` fallback, SYNTHESIZING a live function that
+    // unconditionally returns null/zero — installed as a real vtable/itable
+    // slot — instead of leaving the slot null the way an abstract METHOD or
+    // an abstract INDEXER already do (methods: `MethodBodyKind::Abstract`
+    // has no body to emit; indexers: `ensureIndexerGetterFn`/
+    // `ensureIndexerSetterFn` have no "Auto" branch at all — the shape is
+    // structurally unreachable there, not declined by an explicit check).
+    // Decline here too, so the failure mode of a sema gap that ever lets an
+    // uninstantiable abstract class's own vtable slot get READ is a loud
+    // null-pointer fault, not a silently-returned wrong value.
+    //
+    // NOT (yet) independently observed as reachable: #4020 requires every
+    // concrete class to override an inherited abstract property, so the
+    // owning (abstract) class's OWN vtable/itable slot — the one this
+    // synthesized stub fills — is never installed as the RUNTIME vtable of
+    // any live object (an abstract class cannot be `new`'d). Separately
+    // probed here: even the classic "virtual dispatch during base
+    // construction" footgun (a non-virtual helper, called from the abstract
+    // base's own constructor, reading `this.Current` before the derived
+    // override's backing field is assigned) still resolves through the
+    // DERIVED class's vtable slot, not the base's own — Bezel installs the
+    // vtable pointer once at allocation to the leaf class; there is no
+    // per-subobject vtable phase during base construction the way C++ has.
+    // So this is defense-in-depth (the #3641/row-12 precedent), not a fix
+    // for an observed bug.
+    if (isAuto && sema::isAbstractPropertyShorthand(*pd)) return nullptr;
     if (!isSet) {
         if (pd->bodyKind == ast::PropertyBodyKind::Expression)
             getterExpr = pd->exprBody.get();
