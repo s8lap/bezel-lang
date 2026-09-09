@@ -43,6 +43,7 @@
 // call result, must not touch the pre-existing IdentifierExpr/IndexExpr arms,
 // and must still admit the standard `!`-forgiving remedy on a call result.
 
+#include "support/aot_result_asserts.hpp"  // diagnosticMessageContains, fix #3932
 #include "support/aot_support.hpp"  // runAot — end-to-end accept/crash control
 #include "support/sema_support.hpp"
 #include "test_harness.hpp"
@@ -51,6 +52,7 @@
 
 namespace {
 
+using bezel::test::diagnosticMessageContains;
 using bezel::test::runAot;
 
 bezel::test::SemaResult parseSemaAll(std::string_view src) {
@@ -203,4 +205,92 @@ BEZEL_TEST(sema_call_result_nullable_receiver_3912,
         "end Main;"));
     BEZEL_EXPECT_TRUE(hasError(r, "on a nullable value requires narrowing"));
     BEZEL_EXPECT_FALSE(hasError(r, kNullableResultDiag));
+}
+
+// =========================================================================
+// #3932 — a NullCondMemberExpr (`x?.Y`) sibling shape of the #3912 bug
+// class, discovered while reviewing commit 0468fc2 (this file's own fix).
+//
+// `resolveNullCondMember` (ExprTypecheck_Calls.cpp, ~line 22413) types a
+// `?.` access UNCONDITIONALLY nullable per §7.5 ("the result type is always
+// nullable" — the whole `?.` access yields `null` when the receiver is
+// null, regardless of the accessed member's own nullability):
+//
+//   if (memberTy->nullable) {
+//       ctx_.setExprType(&nm, memberTy);  // already nullable
+//   } else {
+//       TypeRef* nn = ctx_.makeTypeRef(*memberTy);
+//       nn->nullable = true;
+//       ctx_.setExprType(&nm, nn);
+//   }
+//
+// So `N()?.Length` (where `N(): string?` and `.Length` is `int`, itself
+// non-nullable) has exprType `int?` — and a FURTHER plain `.` access on
+// that result (`N()?.Length.ToString()`) reaches `resolveMemberAccess`
+// with `ma.target` a NullCondMemberExpr. `NullCondMemberExpr` is NOT a
+// subtype of `MemberAccessExpr` (a sibling `Expr` node, ast/Node.hpp), so
+// this does not match the MemberAccessExpr arm above — it falls to the
+// #3912 catch-all `else` arm, whose `tgt->nullable` check DOES fire here
+// (`tgt` is the lifted `int?`), correctly rejecting the access. This is
+// the CORRECT #3912-class rejection (same class of bug #3912 fixes: a
+// nullable-typed, non-narrowable expression result reaching a further
+// plain `.member` unguarded) — it was a SILENT side effect of 0468fc2's
+// fix, with no dedicated test and a commit-message/in-code comment that
+// INCORRECTLY claimed NullCondMemberExpr targets "are already non-nullable
+// at this point ... and never trip the check below" (fixed by this commit,
+// see the corrected comment at the #3912 catch-all `else` arm above).
+//
+// TEST-GAP issue, not a behavior fix (LANE_RULES §3 applies with no
+// "without" side in src/ — the rejection already exists on HEAD, verified
+// against the real `build/bezelc -c` before writing these rows). Written
+// on `runAot`, per LANE_RULES §3, matching this file's own existing
+// `runAot`-based accept-side controls above.
+
+// #3932's own measured repro, verbatim: `N()?.Length.ToString()` where
+// `N(): string?` and `string.Length: int` (non-nullable) — the `?.`
+// lifts `Length`'s access to `int?`, and the further unguarded `.ToString`
+// must be rejected exactly like the #3912 sibling shapes.
+BEZEL_TEST(sema_call_result_nullable_receiver_3912,
+           null_cond_member_further_plain_access_rejected_7_4_7_5) {
+    auto r = runAot(prog(
+        "public static method Main(): int "
+        "  const w := N()?.Length.ToString(); "
+        "  return 0; "
+        "end Main;"));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, kNullableResultDiag));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, kSec74));
+}
+
+// ACCEPT control — the `?.` access ALONE (no further plain member access)
+// must keep compiling: `N()?.Length` by itself is the ordinary, admitted
+// null-conditional idiom (§7.5) and is untouched by the catch-all (nothing
+// ever accesses `.Length`'s OWN result further here). Pins that the
+// #3912-class rejection fires only on the FURTHER unguarded `.member`, not
+// on the `?.` form by itself.
+BEZEL_TEST(sema_call_result_nullable_receiver_3912,
+           null_cond_member_alone_accepted_7_5) {
+    auto r = bezel::test::runAot(prog(
+        "public static method Main(): int "
+        "  const w := N()?.Length; "
+        "  return 0; "
+        "end Main;"));
+    BEZEL_EXPECT_TRUE(r.diagnostics.diagnostics().empty());
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+}
+
+// ACCEPT control — a further access GUARDED by a second `?.` (`N()?.Length
+// ?.ToString()` spelled with the standard remedy the diagnostic names,
+// `x?.Y?.Z`) must compile and run: the standard null-conditional chaining
+// idiom is unaffected by the #3912-class rejection of the UNGUARDED form.
+BEZEL_TEST(sema_call_result_nullable_receiver_3912,
+           null_cond_member_chained_guard_accepted_7_5) {
+    auto r = bezel::test::runAot(prog(
+        "public static method Main(): int "
+        "  const w := N()?.Length?.ToString(); "
+        "  return 0; "
+        "end Main;"));
+    BEZEL_EXPECT_TRUE(r.diagnostics.diagnostics().empty());
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
 }

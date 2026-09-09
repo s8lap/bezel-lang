@@ -15814,9 +15814,20 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
             // IdentifierExpr, MemberAccessExpr, and IndexExpr but had no
             // default, so a CallExpr receiver fell through the whole gate,
             // resolved as if non-nullable, and null-derefed at runtime —
-            // the bug #3912 reports). `x!.M` (PostfixBangExpr) and `x?.M`
-            // (NullCondMemberExpr) targets are already non-nullable at this
-            // point, so they reach here too but never trip the check below.
+            // the bug #3912 reports). `x!.M` (PostfixBangExpr) is already
+            // non-nullable at this point, so it reaches here too but never
+            // trips the check below. `x?.M` (NullCondMemberExpr) is NOT in
+            // the same boat and DOES trip it (narrow #3932, corrects this
+            // comment's earlier claim otherwise): `resolveNullCondMember`
+            // (this file, ~line 22413) unconditionally lifts the accessed
+            // member's type to nullable per §7.5 ("the result type is
+            // always nullable") — even when the member itself is
+            // non-nullable — so `x?.Y.Z` (a further plain `.Z` on a `?.Y`
+            // target whose own member `Y` is non-nullable) DOES reach here
+            // with `tgt->nullable == true` and IS correctly rejected below,
+            // exactly like the sibling shapes above. See
+            // tests/sema/call_result_nullable_receiver_3912_test.cpp's
+            // `null_cond_member_*` cases for the regression coverage.
             TypeRef* tgt = ctx_.exprType(*ma.target);
             if (tgt && tgt->nullable) {
                 ctx_.diagnostics().report(
