@@ -30698,6 +30698,24 @@ Emitter::collectTransparentForwardTargets(
                 }
                 if (auto* r = dynamic_cast<const ast::ReturnStmt*>(stp)) {
                     ++returnCount;
+                    // fix #3704 (§27.5 / §15.3 / §28.9, v0.294): `return
+                    // lambda() => …;` — a BARE LambdaExpr literal directly in
+                    // the return, with no intermediate `var`/`const`
+                    // binding. Mirror the bare-expression-body branch above
+                    // (`target = g->exprBody` when THAT is itself a
+                    // LambdaExpr) — the value every call to `g` produces is
+                    // exactly as identifiable here as there. Before this arm,
+                    // this shape fell through to the `else` below and forced
+                    // `found` to null, so `g` was never recognized as a
+                    // transparent forwarder: collectDefinitelyEscapingLambdas
+                    // could not mark the literal as definitely-escaping via
+                    // `return outer();`, leaking its capture cell.
+                    if (auto* litLam =
+                            dynamic_cast<const ast::LambdaExpr*>(
+                                r->value.get())) {
+                        found = litLam;
+                        continue;
+                    }
                     auto* id = dynamic_cast<const ast::IdentifierExpr*>(
                         r->value.get());
                     auto* lsym = id ? dynamic_cast<sema::LocalSymbol*>(
