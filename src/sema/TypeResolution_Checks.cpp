@@ -609,35 +609,84 @@ void Resolver::checkTypeMethodBodies(TypeSymbol* t) {
     bool isInterface = t->kind == ast::TypeDeclKind::Interface;
     for (Symbol* m : t->members) {
         auto* ms = dynamic_cast<MethodSymbol*>(m);
-        if (!ms) continue;
-        // SEAM-ACCESSOR: `ms` is a member of the locally-declared `t` (forEachTypeAndNested,
-        // #3574); a method-body-kind check is declaration-site only (#3152).
-        auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
-        if (!md) continue;
-        bool noBody = md->bodyKind == ast::MethodBodyKind::Abstract;
-        bool isAbstract = hasMod(ms, "abstract");
-        if (isInterface) {
-            if (!noBody) {
+        if (ms) {
+            // SEAM-ACCESSOR: `ms` is a member of the locally-declared `t` (forEachTypeAndNested,
+            // #3574); a method-body-kind check is declaration-site only (#3152).
+            auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
+            if (!md) continue;
+            bool noBody = md->bodyKind == ast::MethodBodyKind::Abstract;
+            bool isAbstract = hasMod(ms, "abstract");
+            if (isInterface) {
+                if (!noBody) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, m->declLoc,
+                        std::string("interface method `") +
+                        std::string(ms->name) +
+                        "` may not have a body (§11.2)");
+                }
+                continue;
+            }
+            if (isAbstract && !noBody) {
                 ctx_.diagnostics().report(
                     Severity::Error, m->declLoc,
-                    std::string("interface method `") +
+                    std::string("abstract method `") +
                     std::string(ms->name) +
-                    "` may not have a body (§11.2)");
+                    "` may not have a body (§12.5)");
+            } else if (!isAbstract && noBody) {
+                ctx_.diagnostics().report(
+                    Severity::Error, m->declLoc,
+                    std::string("non-abstract method `") +
+                    std::string(ms->name) +
+                    "` must have a body (§12.5)");
             }
             continue;
         }
-        if (isAbstract && !noBody) {
+
+        // fix #4101 (§12.5/§23.4, v0.295): the indexer analogue of the
+        // method-body-presence rule just above. §23.4: "Indexers ...
+        // participate in virtual/override/sealed/abstract like methods."
+        // An indexer never gets automatic backing storage the way a plain
+        // named auto-property does (§23.2's Auto form has a compiler-
+        // synthesized field to read/write; an indexer's Auto form has no
+        // per-instance storage an index expression could address), so its
+        // Auto-bodied shape (no accessors, no expression body --
+        // `public property [i: int]: int;`) is legal ONLY as the §12.5
+        // abstract shorthand. `isAbstractPropertyShorthand`
+        // (sema/Symbol.hpp) explicitly EXCLUDES indexers by design (its
+        // own `p.isIndexer` guard, documented there as "a separate
+        // mechanism ... handles the indexer abstract shorthand"), so this
+        // rule cannot reuse it and instead reads the same two AST facts
+        // (bodyKind, the `abstract` modifier) the method arm above reads.
+        // Interface indexer signatures are the interface's WHOLE contract
+        // (§23.4: "Indexers may be declared in interfaces with the
+        // body-less form") and stay excluded exactly like the interface
+        // method arm's `continue` above, but only on the ACCEPT side --
+        // unlike §11.2 for methods, §23.4 does not forbid an interface
+        // indexer from carrying a body, so mirroring that half of the
+        // method rule here would be a new, unrelated rejection outside
+        // this issue's scope (left to a separate issue if it is ever
+        // measured to be live).
+        //
+        // Without this check, `public property [i: int]: int;` (no
+        // accessors, no `abstract`) compiled clean and reached codegen,
+        // where `ensureIndexerGetterFn` correctly declines to synthesize
+        // a getter for it (it has no Auto branch at all) and the caller
+        // silently degraded to a zero value through #2434's
+        // degrade-disposition fallback -- an "internal:" stderr note at
+        // runtime instead of a compile-time rejection naming the rule.
+        auto* ps = dynamic_cast<PropertySymbol*>(m);
+        if (!ps || !ps->isIndexer || isInterface) continue;
+        // SEAM-ACCESSOR: `ps` is a member of the locally-declared `t`
+        // (forEachTypeAndNested, #3574); same declaration-site-only
+        // reasoning as the method arm above (#3152).
+        auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
+        if (!pd) continue;
+        bool noBody = pd->bodyKind == ast::PropertyBodyKind::Auto;
+        bool isAbstract = hasMod(ps, "abstract");
+        if (!isAbstract && noBody) {
             ctx_.diagnostics().report(
                 Severity::Error, m->declLoc,
-                std::string("abstract method `") +
-                std::string(ms->name) +
-                "` may not have a body (§12.5)");
-        } else if (!isAbstract && noBody) {
-            ctx_.diagnostics().report(
-                Severity::Error, m->declLoc,
-                std::string("non-abstract method `") +
-                std::string(ms->name) +
-                "` must have a body (§12.5)");
+                "non-abstract indexer must have a body (§12.5/§23.4)");
         }
     }
 }
