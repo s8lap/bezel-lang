@@ -119,6 +119,7 @@ BEZEL_TEST(sema_param, named_param_identifier_typed) {
         "  public method M(d: D) _ := d; end M; "
         "end C;");
     auto* id = firstDiscardIdentExpr(r);
+    BEZEL_EXPECT_TRUE(id != nullptr);
     if (id) {
         auto* t = r.ctx->exprType(*id);
         BEZEL_EXPECT_TRUE(t && t->kind == TypeRef::Kind::Named);
@@ -152,6 +153,7 @@ BEZEL_TEST(sema_param, owned_param_modifier_carried) {
         "  public method M(owned d: D) _ := d; end M; "
         "end C;");
     auto* id = firstDiscardIdentExpr(r);
+    BEZEL_EXPECT_TRUE(id != nullptr);
     if (id) {
         auto* sym = r.ctx->exprSymbol(*id);
         auto* par = dynamic_cast<ParameterSymbol*>(sym);

@@ -80,6 +80,7 @@ BEZEL_TEST(sema_call, method_call_returns_named) {
         "  public method M() _ := this.Make(); end M; "
         "end C;");
     auto* e = firstCallDiscardValue(r);
+    BEZEL_EXPECT_TRUE(e != nullptr);
     if (e) {
         auto* t = r.ctx->exprType(*e);
         BEZEL_EXPECT_TRUE(t && t->kind == TypeRef::Kind::Named);
@@ -94,6 +95,7 @@ BEZEL_TEST(sema_call, method_without_return_type_is_unit) {
         "  public method M() _ := this.Side(); end M; "
         "end C;");
     auto* e = firstCallDiscardValue(r);
+    BEZEL_EXPECT_TRUE(e != nullptr);
     if (e) {
         auto* t = r.ctx->exprType(*e);
         BEZEL_EXPECT_TRUE(t && t->kind == TypeRef::Kind::Unit);
@@ -108,6 +110,7 @@ BEZEL_TEST(sema_call, call_on_param_resolves) {
         "  public method M(t: T) _ := t.Read(); end M; "
         "end C;");
     auto* e = firstCallDiscardValue(r);
+    BEZEL_EXPECT_TRUE(e != nullptr);
     if (e) {
         auto* t = r.ctx->exprType(*e);
         BEZEL_EXPECT_TRUE(t && t->primitive == PrimitiveType::Int);
@@ -132,6 +135,7 @@ BEZEL_TEST(sema_call, call_on_inferred_local_resolves) {
     const auto* ds =
         dynamic_cast<const bezel::ast::DiscardStmt*>(md->stmts[1].get());
     auto* e = ds->value.get();
+    BEZEL_EXPECT_TRUE(e != nullptr);
     if (e) {
         auto* t = r.ctx->exprType(*e);
         BEZEL_EXPECT_TRUE(t && t->primitive == PrimitiveType::Int);
