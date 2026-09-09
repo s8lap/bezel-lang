@@ -35305,7 +35305,16 @@ void Emitter::setupBoxDescriptors() {
             // bodies access fields via fieldIndex_, which recordStruct()
             // populates lazily. Pass C runs before method bodies are emitted,
             // so fieldIndex_ may not yet exist for this record type.
-            // classStruct routes to recordStruct for records (§9.4).
+            // classStruct routes to recordStruct for records (§9.4) and, as
+            // of fix #4114 (§35.1/§35.8), to choiceStruct for choices — this
+            // loop also runs for `ts` a Choice (fix #3900 widened Pass C to
+            // Record/Enum/Choice alike). Before #4114, classStruct had no
+            // Choice branch and fell through to its generic class-layout
+            // path, building and CACHING a bogus zero-field `{vtable*,
+            // disposed-flag}` struct into the structs_ map that
+            // choiceStruct() itself reads — poisoning every later
+            // choiceStruct(ts) call for this type (e.g. boxToStringThunk's
+            // default-ToString synthesis) for the rest of codegen.
             classStruct(ts);
             for (sema::PropertySymbol* ip : ifaceProps) {
                 // #730 / §23.4: a record's interface-indexer slot holds a box

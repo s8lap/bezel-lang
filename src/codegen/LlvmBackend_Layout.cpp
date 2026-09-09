@@ -1833,6 +1833,26 @@ llvm::StructType* Emitter::classStruct(const sema::TypeSymbol* t) {
     // CG29: a record has no vtable header; route to recordStruct so every
     // classStruct caller (field access, etc.) gets the right layout.
     if (t->kind == ast::TypeDeclKind::Record) return recordStruct(t);
+    // fix #4114 (§35.1/§35.8, v0.295): a choice's instance storage is its
+    // cases' tagged payloads (choiceStruct's `{i32 tag, case0, case1, …}`),
+    // never a class's `{vtable*, disposed-flag, fields…}` shape — a choice
+    // has no instance fields at all (§35.1: "Choices cannot have …
+    // instance fields, block-form or storage-backed properties"). Route
+    // here exactly like Record so that ANY caller reaching classStruct with
+    // a Choice TypeSymbol (setupBoxDescriptors's box-vtable Pass C, added
+    // for choices by fix #3900, is the one that crashed) gets the real
+    // layout instead of building and caching a bogus zero-field class
+    // struct. That bogus struct was cached into the SHARED `structs_` map
+    // keyed on `t` — the same map choiceStruct() itself reads — so a later
+    // choiceStruct(t) call (e.g. boxToStringThunk's default-ToString
+    // synthesis via emitChoiceToString) retrieved the poisoned `{ptr, i8}`
+    // entry instead of the real tag+payload layout. emitChoiceToString's
+    // multi-index `CreateExtractValue(val, {1+ci, pi})` then indexed a
+    // second level into the `i8` field (not a struct), which LLVM's
+    // (non-assertions) release build resolves to a null-typed extract —
+    // SIGSEGV inside llvm::Value::setName on construction, not a bounds
+    // check we could catch here.
+    if (t->kind == ast::TypeDeclKind::Choice) return choiceStruct(t);
 
     // fix #2889 (§14.1 "Generic declarations" / §12 "Inheritance and
     // Dispatch" / §22.8 "Field initializers", v0.240) — the ALLOCATION face of
