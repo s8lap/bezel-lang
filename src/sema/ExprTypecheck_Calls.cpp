@@ -20540,6 +20540,72 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
         return;
     }
     if (!member) {
+        // fix #3907 (stdlib §4.19, mirroring #3896's kResidualAuditedNames
+        // carve-out — ExprTypecheck_Calls.cpp's isAuditedElsewhere block,
+        // and its CODEGEN sibling in LlvmBackend_Calls2.cpp): `FrozenArray<
+        // T>.From(...)`'s static-factory-result TypeRef shape
+        // (`declaration == builtinClassSym("FrozenArray")`) reaches THIS
+        // generic fallback, not the isAuditedElsewhere block earlier in
+        // this function — `targetType` was already set to that same
+        // synthetic TypeSymbol a few hundred lines up (`if (tt &&
+        // tt->kind == Named) { targetType = tt->declaration; }`, the
+        // general "declared-type member lookup" resolution), which routes
+        // this receiver through the ordinary "declared type, no member
+        // found" path instead of the isAuditedElsewhere block (which only
+        // ever runs while `targetType` is still null — confirmed live: a
+        // checkpoint trace showed execution skip straight from that
+        // assignment to `lookupMember(targetType, ...)` above, never
+        // touching isAuditedElsewhere's block at all). Two forms need the
+        // SAME carve-out #3896 already gives the bare-annotation shape:
+        //   (a) `CompareTo` — stdlib §4.19 declares no `IComparable<T>`
+        //       conformance for FrozenArray<T>; without this the call
+        //       reaches codegen's generic "no dispatch arm" backstop
+        //       instead of a diagnostic naming the real reason.
+        //   (b) a BARE (uncalled) reference to `ToString`/`Equals`/
+        //       `GetHashCode` — the unconditional `ctx_.setExprType(&ma,
+        //       string)` further below (`mm == "ToString"`) types the
+        //       bare reference as if it formed a real function value, but
+        //       codegen has no MethodSymbol-independent way to FORM one
+        //       for this receiver (only to dispatch the CALL form
+        //       directly), so without this carve-out the bare reference
+        //       silently degrades to the #2434 zero-initialized-slot
+        //       fallback (a Warning, not a compile Error) instead of a
+        //       real diagnostic. The CALL form (`&ma ==
+        //       calleeOfCallCtx_`) is exempted, exactly like #3883/#3896.
+        bool isFrozenArrayDeclShape = targetType->name == "FrozenArray" &&
+                                      targetType->decl == nullptr &&
+                                      targetType->moduleName.empty();
+        if (isFrozenArrayDeclShape && ma.member == "CompareTo") {
+            auto loc = ma.span.begin;
+            if (loc.line == 0 && ma.target) loc = ma.target->span.begin;
+            ctx_.diagnostics().report(
+                Severity::Error, loc,
+                "no member `CompareTo` on `FrozenArray<T>` (stdlib "
+                "\xC2\xA7""4.19 declares no `IComparable<T>` conformance "
+                "for this type)");
+            return;
+        }
+        if (isFrozenArrayDeclShape &&
+                (ma.member == "ToString" || ma.member == "Equals" ||
+                 ma.member == "GetHashCode") &&
+                &ma != calleeOfCallCtx_) {
+            auto loc = ma.span.begin;
+            if (loc.line == 0 && ma.target) loc = ma.target->span.begin;
+            ctx_.diagnostics().report(
+                Severity::Error, loc,
+                std::string("a bare reference to `") +
+                    std::string(ma.member) +
+                    "` (language spec \xC2\xA7""27.6) is not yet supported "
+                    "on `FrozenArray<T>` (language spec "
+                    "\xC2\xA7""8.1/\xC2\xA7""8.3/\xC2\xA7""8.5, #2470): `" +
+                    std::string(ma.member) + "` is a real universal Object "
+                    "member, but this builtin type dispatches it "
+                    "structurally rather than through a real method "
+                    "symbol, so no function value can be formed for it yet "
+                    "-- call it directly instead (`." +
+                    std::string(ma.member) + "(...)`)");
+            return;
+        }
         // fix #2513 / spec §35.2 (v0.236): stdlib `Result<T, E>` carries four
         // COMPILER-PROVIDED per-instantiation combinators (Map / MapError /
         // AndThen / UnwrapOr). They have no MethodSymbol — the prelude's

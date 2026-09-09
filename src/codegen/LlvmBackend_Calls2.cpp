@@ -6318,11 +6318,33 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                 ctx_.exprType(*cg_ma->target);
             if (cg_recvTy) {
                 using CG_K = sema::TypeRef::Kind;
+                // fix #3907 (stdlib §4.19): `FrozenArray<T>.From(...)`'s
+                // static-factory-result TypeRef carries `declaration ==
+                // builtinClassSym("FrozenArray")` — a SYNTHETIC TypeSymbol
+                // stub with `kind = ast::TypeDeclKind::Class` (set
+                // unconditionally by `builtinClassSym`, SemaContext.hpp) but
+                // `decl == nullptr` and no vtable — it is `bz_array_t*`-
+                // backed, not an object-model class instance. Before this
+                // fix `cg_isClass` matched it (declaration non-null,
+                // kind==Class is exactly what a real user class ALSO looks
+                // like), so this receiver dispatched through
+                // `lowerObjectToString` (vtable slot 3) below — reading
+                // FrozenArray's array-storage payload as if it had a class
+                // vtable header. Measured: garbage bytes returned instead of
+                // a real string, with no crash (whatever bytes sit at the
+                // assumed vtable-slot-3 offset happened to be readable). A
+                // genuine user class's TypeSymbol always has `decl != nullptr`
+                // (its own `ast::TypeDecl`), so `builtinTypeName` — which
+                // requires `!declaration->decl` to return a name at all
+                // (LlvmBackend_Calls.cpp:767) — returns "" for every real
+                // class and is a no-op exclusion for them; it returns
+                // "FrozenArray" ONLY for this one synthetic shape.
                 bool cg_isClass =
                     cg_recvTy->kind == CG_K::Named &&
                     cg_recvTy->declaration &&
                     cg_recvTy->declaration->kind ==
-                        ast::TypeDeclKind::Class;
+                        ast::TypeDeclKind::Class &&
+                    builtinTypeName(cg_recvTy) != "FrozenArray";
                 // Built-in exception types: Named with no declaration, AND
                 // the type name is actually in the builtin exception set
                 // (isBuiltinExceptionTypeRef -- see its own doc comment,
@@ -6753,11 +6775,26 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                 // `OwningArray`, so this chain does not join the #3419
                 // class-F shape (`check_enumerable_grid_spellings.py
                 // --strict` verified clean after this fix).
-                if (recvTy && recvTy->kind == K::Named &&
-                        !recvTy->declaration && recvTy->astNode &&
-                        recvTy->astNode->name &&
-                        !recvTy->astNode->name->parts.empty()) {
-                    std::string_view arn = recvTy->headName();
+                //
+                // fix #3907 (stdlib §4.19): the hand-rolled
+                // `!recvTy->declaration && recvTy->astNode...` shape check
+                // only admits the bare-annotation TypeRef shape
+                // (`var f: FrozenArray<T> := ...`); `FrozenArray<T>.From(...)`'s
+                // static-factory-result shape (`declaration ==
+                // builtinClassSym("FrozenArray")`, no astNode — the far more
+                // idiomatic form) fell through entirely, past
+                // `isNamedClassRecv` below, and dispatched through the
+                // general class vtable ToString path instead — reading
+                // FrozenArray's `bz_array_t*` payload as if it had a class
+                // vtable header and returning garbage (measured: reading
+                // whatever bytes sit at the assumed vtable-slot-3 offset).
+                // `Emitter::builtinTypeName` (LlvmBackend_Calls.cpp:767)
+                // already handles both shapes robustly — it is the same
+                // authority `isCollectionTypeName` reads for this identical
+                // two-shape problem — so read it once instead of re-deriving
+                // the shape test here.
+                if (std::string_view arn = builtinTypeName(recvTy);
+                        !arn.empty()) {
                     if (common::isArrayEnumeratorWrapSourceName(arn) ||
                         arn == "Set" || arn == "OwningSet" ||
                         arn == "SortedSet" || arn == "FrozenArray" ||
@@ -7112,16 +7149,33 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                 // statement, so it does not join the #3419 class-F shape
                 // (`check_enumerable_grid_spellings.py --strict` verified
                 // clean after this fix).
+                //
+                // fix #3907 (stdlib §4.19): unlike its seven siblings above,
+                // `FrozenArray<T>` has a SECOND TypeRef shape —
+                // `FrozenArray<T>.From(...)`'s static-factory result
+                // (`declaration == builtinClassSym("FrozenArray")`, no
+                // astNode) — that `isBuiltinIdentityHeadCandidate` (gated on
+                // `!declaration`) does not admit. Read through
+                // `builtinTypeName` (LlvmBackend_Calls.cpp:767, the same
+                // dual-shape authority `isCollectionTypeName` already uses)
+                // instead of `isBuiltinIdentityHeadCandidate`/`headName()` so
+                // this default reaches BOTH shapes; the other seven names
+                // never construct via a declaration-set shape (confirmed: no
+                // `builtinClassSym("Array"|"OwningArray"|"Stack"|
+                // "OwningStack"|"Queue"|"OwningQueue"|"OwningBuffer"|"Set"|
+                // "OwningSet"|"SortedSet"|"Dictionary"|"OwningDictionary"|
+                // "LinkedList"|"OwningLinkedList")` call site exists in
+                // src/sema), so this widening is a no-op for them.
+                std::string_view residualIdentityName = builtinTypeName(recvTy);
                 bool isBuiltinIdentityResidualCollection =
-                    isBuiltinIdentityHeadCandidate &&
-                    (recvTy->headName() == "Set" ||
-                     recvTy->headName() == "OwningSet" ||
-                     recvTy->headName() == "SortedSet" ||
-                     recvTy->headName() == "FrozenArray" ||
-                     recvTy->headName() == "Dictionary" ||
-                     recvTy->headName() == "OwningDictionary" ||
-                     recvTy->headName() == "LinkedList" ||
-                     recvTy->headName() == "OwningLinkedList");
+                    residualIdentityName == "Set" ||
+                    residualIdentityName == "OwningSet" ||
+                    residualIdentityName == "SortedSet" ||
+                    residualIdentityName == "FrozenArray" ||
+                    residualIdentityName == "Dictionary" ||
+                    residualIdentityName == "OwningDictionary" ||
+                    residualIdentityName == "LinkedList" ||
+                    residualIdentityName == "OwningLinkedList";
                 bool isBuiltinIdentityRecv =
                     isBuiltinIdentityIterHead || isBuiltinIdentityArrayFamily ||
                     isBuiltinIdentityResidualCollection;
