@@ -406,6 +406,12 @@ void Resolver::run(const ast::SourceFile& src) {
     checkGenericConstraintConsistency();
     // Slice S33: method body-presence rules (§12.5 / §11.2).
     checkMethodBodies();
+    // fix #4026 (§12.5, v0.295): an abstract Auto-shorthand property's
+    // initializer has no backing storage to write into and can never run —
+    // reject it, mirroring checkMethodBodies' abstract-member-has-no-body
+    // posture for the property/indexer analog of a "body" (the auto
+    // initializer).
+    checkAbstractPropertyInitializers();
     // Slice S34: static members may not be virtual (§12.1).
     checkStaticNotVirtual();
     // Slice S35: `async abstract` is a compile error (§12.6).

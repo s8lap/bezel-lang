@@ -286,8 +286,20 @@ BEZEL_TEST(sema_abstract_property_shorthand_4018_4020,
 // field", which an abstract shorthand property never gets.
 // =====================================================================
 
+// fix #4026 (§12.5, v0.295) updated this test's expectation: the shape below
+// no longer compiles clean. #4026 added a dedicated rejection for an
+// abstract-shorthand property's initializer (it has no backing storage to
+// write into, so the expression could never run) — TypeResolution_Checks.cpp
+// runs before Ownership_Checks.cpp's `checkAutoPropertyInitializer`, so this
+// program is now rejected for the NEW §12.5 reason. Renamed from
+// `..._accepted_...` (its pre-#4026 name) to make that reversal visible.
+// The assertion that #2168's ownership check does NOT ALSO fire is
+// preserved — this program must be rejected for the #4026 dead-initializer
+// reason, not re-acquire the WRONG "leaks into a non-owned backing field"
+// diagnostic this test file's own #4018/#4020 fix stopped from firing on
+// this exact shape.
 BEZEL_TEST(sema_abstract_property_shorthand_4018_4020,
-           abstract_property_owned_initializer_accepted_spec_12_5_28_6) {
+           abstract_property_owned_initializer_now_rejected_by_4026_spec_12_5) {
     auto r = runAot(
         "module M; "
         "class Widget4018 end Widget4018; "
@@ -299,7 +311,11 @@ BEZEL_TEST(sema_abstract_property_shorthand_4018_4020,
         "    return 0; "
         "  end Main; "
         "end C;");
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagContains(r, "may not declare an initializer"));
+    BEZEL_EXPECT_TRUE(diagContains(r, "§12.5"));
+    BEZEL_EXPECT_FALSE(diagContains(
+        r, "freshly-produced owned value cannot initialize"));
 }
 
 // Control: the identical owned-`new`-initializer shape on an ORDINARY

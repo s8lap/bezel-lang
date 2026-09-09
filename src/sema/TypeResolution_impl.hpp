@@ -305,6 +305,21 @@ private:
 
     void checkTypeMethodBodies(TypeSymbol* t);
 
+    // fix #4026 (§12.5, v0.295): an abstract Auto-shorthand property
+    // (`abstract property Name: T := expr;`) has no backing storage —
+    // `isAbstractPropertyShorthand` (sema/Symbol.hpp) already excludes it
+    // from every storage-generating pass — so an initializer on one can
+    // never execute. Mirrors checkTypeMethodBodies' "abstract member has
+    // no body" posture, one level down: methods reject the combination
+    // structurally (a distinct `MethodBodyKind::Abstract`); a property's
+    // abstract shorthand shares `PropertyBodyKind::Auto` with a normal
+    // auto-property (which legitimately has an initializer), so the
+    // rejection has to key on the shorthand predicate instead of the body
+    // kind alone.
+    void checkAbstractPropertyInitializers();
+
+    void checkTypeAbstractPropertyInitializers(TypeSymbol* t);
+
     // Slice S32 (§10.5): an enum may not declare instance fields,
     // constructors, nested types, or indexers, and its methods may not
     // be virtual / abstract / sealed override. `override` is admitted

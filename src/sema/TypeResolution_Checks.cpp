@@ -642,6 +642,43 @@ void Resolver::checkTypeMethodBodies(TypeSymbol* t) {
     }
 }
 
+void Resolver::checkAbstractPropertyInitializers() {
+    // fix #4026 (§12.5, v0.295): shared recursive walk (§11.6, v0.286),
+    // matching every other per-member modifier-combination check in this
+    // file.
+    forEachTypeAndNested(
+        [&](TypeSymbol* t) { checkTypeAbstractPropertyInitializers(t); });
+}
+
+void Resolver::checkTypeAbstractPropertyInitializers(TypeSymbol* t) {
+    for (Symbol* m : t->members) {
+        auto* ps = dynamic_cast<PropertySymbol*>(m);
+        if (!ps) continue;
+        // SEAM-ACCESSOR: `ps` is a member of the locally-declared `t`
+        // (forEachTypeAndNested, #3574); an abstract-shorthand-initializer
+        // check is declaration-site only (#3152), matching
+        // checkTypeMethodBodies just above.
+        auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
+        if (!pd) continue;
+        // §12.5: the shared predicate (sema/Symbol.hpp's
+        // `isAbstractPropertyShorthand`) already excludes indexers by
+        // design (a separate mechanism handles the indexer abstract
+        // shorthand, #4037) and non-Auto bodies (an abstract property with
+        // explicit `get;`/`set;` accessors is Block-bodied and carries no
+        // `autoInitializer` slot at all — the grammar has nowhere to put
+        // one there). Only a plain `abstract property Name: T := expr;`
+        // reaches this branch.
+        if (!isAbstractPropertyShorthand(*pd)) continue;
+        if (!pd->autoInitializer) continue;
+        ctx_.diagnostics().report(
+            Severity::Error, pd->autoInitializer->span.begin,
+            std::string("abstract property `") + std::string(ps->name) +
+            "` may not declare an initializer — an abstract member has no "
+            "backing storage for it to write into, so the initializer "
+            "could never run (§12.5)");
+    }
+}
+
 // §10.5 / §35.2 (v0.288, #3837): true iff `ms` is one of the three
 // `Object`-virtual members whose replacement §10.5 admits spelling with
 // `override` — `Equals` (arity 1: the co-declared `Equals(T)` §25.2
