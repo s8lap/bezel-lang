@@ -140,6 +140,53 @@ bool ownedParamIsFrameDisposable(const sema::ParameterSymbol& ps,
            !pt->declaration->isValueBuiltin;
 }
 
+// §19.6 (v0.295): a syntactic proxy for "can this `case` STATEMENT's
+// no-match fallthrough ever actually be reached?" — an unguarded `_`
+// (DiscardPattern) or unguarded untyped `var x` (BindingPattern with no type
+// annotation) among `cs.arms` matches ANY scrutinee value (§19.6: "Guarded
+// arms contribute nothing... an irrefutable arm absorbs any value"), so the
+// residual "no arm selected" space §19.6 §4167 describes ("falls through
+// with no action") is empty whenever one is present.
+//
+// fix #4116 (§19.6, §28.3 K1.4, v0.295): this is the load-bearing carve-out
+// for the CaseStmt arm-join fix a few hundred lines below (this file,
+// visitStmt's CaseStmt arm) — without it, joining the pre-case snapshot into
+// EVERY case's result (to model the no-match fallthrough §19.6 permits)
+// would falsely mark `x` maybe-consumed even when a wildcard arm ALSO
+// consumes it, over-rejecting the direct `case` analogue of #3967's own
+// accept-side control (`if`/`else` where BOTH arms consume — accepted, since
+// every path is a definite move, not a maybe-move).
+//
+// Mirrors `isUnguardedCatchAll` (sema/ExprTypecheck.cpp) on exactly the two
+// irrefutable-pattern shapes it recognizes; NOT reused directly — that
+// function is anonymous-namespace-local to ExprTypecheck.cpp's translation
+// unit and unreachable from this pass, and threading a shared declaration
+// through a header for one four-line predicate was judged not worth doing
+// for this narrow fix (see the LANE_RULES duplicated-classification-
+// predicate rule — recorded here rather than silently re-derived).
+//
+// RESIDUAL (declared, not silently accepted): this is a SYNTACTIC test only.
+// A `case` the compiler proves exhaustive by CLOSED-HIERARCHY analysis
+// (§19.6 — a sealed class hierarchy, a full enum, or a full choice's case
+// set) with NO wildcard arm and every leaf arm consuming the same outer
+// local is not recognized here, so the join still folds in the pre-case
+// snapshot for that shape and can over-reject a subsequent legitimate
+// reassignment/move/read of that local. That is a false reject, not a
+// soundness hole (see the fix site's own comment for why the direction is
+// safe), and is left as a known limitation rather than a reason to hold this
+// fix — replicating sema's full §19.6 closed-value-space proof here would be
+// a much larger change for a narrower payoff.
+bool caseHasUnguardedCatchAllArm(const ast::CaseStmt& cs) {
+    for (const auto& arm : cs.arms) {
+        if (arm.guard) continue;  // a guard can fail at runtime (§19.6)
+        const ast::Pattern* p = arm.pattern.get();
+        if (dynamic_cast<const ast::DiscardPattern*>(p)) return true;
+        if (auto* bp = dynamic_cast<const ast::BindingPattern*>(p))
+            if (bp->type == nullptr) return true;  // untyped `var x`
+    }
+    return false;
+}
+
 // fix #3037 / §28.3 (v0.240): the source location of a §28.3 owned-binding
 // diagnostic. Most owned-binding kinds carry `obligationOrigin` populated by the
 // analysis (a back-pointer to the AST node where the obligation was created,
@@ -2977,8 +3024,49 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
     // argument check) never fire on a call inside a case arm (`Box(a) =>
     // Prog.Sink(a)` handed the borrowed destructure binding `a` to an `owned`
     // sink undetected → double-free). Each arm is a mutually-exclusive branch;
-    // visit it from the pre-case state and restore afterward (conservative — the
-    // arm-local discharge tracking does not leak into the post-case state).
+    // visit it from the pre-case state, then JOIN every arm's end state back
+    // into the post-case state (§28.3, mirroring the real IfStmt join a few
+    // hundred lines below in this same function).
+    //
+    // fix #4116 (§19, §28.3 K1.4, v0.295): this used to restore `saved`
+    // UNCONDITIONALLY after the arm loop, discarding every arm's effect on
+    // `states_` outright — so a `case` arm that consumed (`move`d /
+    // transferred-out) an owned local left that local looking exactly as it
+    // did before the `case`, with no `maybeConsumed` marker and no
+    // diagnostic, while the byte-identical `if`/`while`(`break`)/`try` shapes
+    // were already correctly rejecting a post-join reassignment or read
+    // (`narrow #3967`). Measured: the scrutinee-less repro in #4116 compiled
+    // rc=0 with zero relevant diagnostics and heap-use-after-freed under
+    // `--sanitize=address` on the FIRST outer-loop iteration.
+    //
+    // §19.6 (v0.295): "A `case` with no `_` arm is permitted. In statement
+    // position, an unmatched value falls through with no action" — so the
+    // pre-case `saved` state is folded into the join as an extra operand
+    // standing in for that no-match completion, exactly the role IfStmt's
+    // implicit `entry` fallthrough plays when `!hasElse` — UNLESS
+    // `caseHasUnguardedCatchAllArm` finds an unguarded `_`/untyped-`var` arm,
+    // in which case the no-match edge is provably empty and `saved` is left
+    // out, so a `case` where every arm (the catch-all included) consumes the
+    // same outer local still converges to a definite discharge rather than a
+    // spuriously conservative maybe-consumed — the direct `case` analogue of
+    // #3967's own `ifelse_both_branches_consume_reassign_accepted_28_3`
+    // accept-side control. When no such arm is present, including `saved`
+    // can only push the joined result to a MORE cautious lattice state
+    // (Owned+maybeConsumed instead of a clean discharge), never a less-
+    // checked one — `joinInto`'s lattice has no direction back down — so it
+    // cannot mask a real hazard, at the cost of occasionally flagging a
+    // later read/reassign of a local in the one residual shape
+    // `caseHasUnguardedCatchAllArm`'s own header comment names (a closed-
+    // hierarchy exhaustiveness proof with no wildcard arm) — a declared,
+    // known-safe-direction limitation, not a reason to hold this fix.
+    //
+    // `emitClash` is passed `false` (mirroring the sibling expression-form
+    // join, `joinMarkerFreeArmEnds`, this file's ~line 1408): an
+    // Owned/Borrowed mismatch across case arms is a real §28.3 hazard IfStmt
+    // already diagnoses, but this fix's scope is the maybeConsumed gap only —
+    // turning on a brand-new clash diagnostic for `case` arms is a separate,
+    // larger blast radius left for its own issue if it turns out to matter.
+    // // per §19, §19.6, §28.3 K1.4, v0.295, #4116
     if (auto* cs = dynamic_cast<const ast::CaseStmt*>(&s)) {
         if (cs->scrutinee) checkRead(*cs->scrutinee, /*selfTarget=*/false);
         // K8 full-expression boundary (#1795): the K8 boundary for an
@@ -3006,6 +3094,8 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
                 const_cast<ast::CaseStmt*>(cs)->disposeOwnedScrutinee = true;
         }
         BlockState saved = states_;
+        std::vector<BlockState> armEnds;
+        armEnds.reserve(cs->arms.size());
         for (const auto& arm : cs->arms) {
             states_ = saved;
             if (arm.guard) checkRead(*arm.guard, /*selfTarget=*/false);
@@ -3014,8 +3104,21 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
             } else {
                 for (const auto& bs : arm.stmts) if (bs) visitStmt(*bs);
             }
+            armEnds.push_back(states_);
         }
-        states_ = std::move(saved);
+        // fix #4116: join every arm's end state, plus `saved` for the
+        // statement-`case`'s possible no-match fallthrough (§19.6) UNLESS a
+        // syntactic catch-all arm proves that edge empty, instead of
+        // discarding all of it back to `saved`. See the header comment
+        // above for the full rationale.
+        std::vector<BlockState> joinOperands = std::move(armEnds);
+        if (!caseHasUnguardedCatchAllArm(*cs))
+            joinOperands.push_back(saved);
+        auto joined = std::move(joinOperands.front());
+        for (std::size_t i = 1; i < joinOperands.size(); ++i)
+            joinInto(joined, joinOperands[i], cs->span.begin,
+                     /*emitClash=*/false, /*unionKeys=*/false);
+        states_ = std::move(joined);
         return;
     }
     if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(&s)) {
