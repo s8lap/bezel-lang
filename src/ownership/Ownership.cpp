@@ -6460,6 +6460,66 @@ void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
             // exit) — so the endState fall-through error below skips
             // `out owned` parameters instead (companion fix). // per §22.4,
             // §28.8
+            // fix #3967 (§28.3 K1.4 / §28.7, v0.295): a MAYBE-CONSUMED local
+            // (Owned ⊓ MovedFrom join — K7.4; K1.4 states its scope-end
+            // disposal must be PER-PATH) reassigned here is a drop-on-
+            // overwrite (disposeDisplacedOwnedClassLocal, LlvmBackend_
+            // Disposal.cpp) with no static answer: on the branch that
+            // consumed the value, the slot holds a pointer the consumer
+            // already freed (the `move`d-into-an-owned-sink lowering
+            // deliberately leaves a plain `var`'s slot populated — the
+            // borrow-after-move idiom `new T(move n, n)` needs to read it
+            // again — so there is no null to guard on); on the branch that
+            // did not consume, the same slot is still live and must be
+            // disposed. #3950 covers the case where EVERY path consumes
+            // (state converges to definite `MovedFrom`, `lhsMovedFromAtStore`
+            // skips the disposal entirely) — that mechanism cannot answer
+            // here because the state is `Owned` with `maybeConsumed`, not
+            // `MovedFrom`; codegen's null-guard alone silently disposes the
+            // already-freed pointer on the consumed path. Measured (this
+            // branch's own base, 2e25915, `--sanitize=address`):
+            // `var x := new Res(5); if Sink.Flag() then Sink.Take(move x);
+            // end; x := new Res(7); x.Dispose();` compiles rc=0 with zero
+            // ownership diagnostics and heap-use-after-frees. §28.3's own
+            // words for the sibling consuming operations — markMovedByName /
+            // markDisposedByName reject "cannot consume/dispose `x`: it may
+            // have already been consumed on another branch" for a `move` /
+            // `.Dispose()` of a maybe-consumed local — do not cover
+            // REASSIGNMENT, the one remaining consuming-adjacent operation
+            // that silently fell through. The genuine fix the spec's K1.4
+            // wording calls for is a per-path RUNTIME bit threaded through
+            // the move lowering and disposeDisplacedOwnedClassLocal's guard
+            // — out of scope for this pass (it touches the move-lowering
+            // machinery `new T(move n, n)` and three other established
+            // null-site special cases depend on, LlvmBackend_Exprs2.cpp).
+            // Reject instead of silently corrupting: scoped via
+            // `localDropOnOverwriteCovered` — the SAME predicate the #1465
+            // drop-on-overwrite acceptance and #3950 use to decide "does
+            // codegen actually run disposeDisplacedOwnedClassLocal for this
+            // reassignment" — so a maybe-consumed local reassigned into a
+            // collection/wrapper/task (whose overwrite does not dispose via
+            // class dispatch and so cannot double-free) is unaffected and
+            // keeps whatever verdict it already had. // per §28.3 K1.4, §28.7,
+            // v0.295, #3950
+            if (st.state == OwnershipState::Owned && st.maybeConsumed &&
+                localDropOnOverwriteCovered(sym)) {
+                report(Severity::Error, as.target->span.begin,
+                       std::string("cannot reassign `") +
+                           std::string(id->name) +
+                           "`: it may have already been consumed on another "
+                           "branch (maybe-consumed join, §28.3 K1.4) — "
+                           "reassigning it here would silently dispose a "
+                           "value the consuming branch may already have "
+                           "disposed (a use-after-free); per-path disposal "
+                           "for this shape is not yet implemented (§28.3 "
+                           "K1.4). Discharge `" +
+                           std::string(id->name) +
+                           "` explicitly on every path before this "
+                           "reassignment, or restructure so the consume and "
+                           "this reassignment are not both reachable");
+                if (!suppressDiag_) st.state = OwnershipState::Poisoned;
+                return;
+            }
             // §28.3 / §28.7 (v0.180) consume-site freeze: reassigning an OWNED
             // local is a drop-on-overwrite that silently disposes the displaced
             // value. If a live local borrow of that value exists, the overwrite
