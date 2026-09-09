@@ -63,18 +63,25 @@ public sealed class Store<T> where T: value, sendable
 
   public async method Add(create: (int) -> T): Task<T>                     // the id is minted under the guard
     using var guard := await _map.Get().LockAsync();
+
     var id := (guard.Value.Keys.MaxOrNull() ?? 0) + 1;                     // never collides with a live key
     var item := create(id);
     guard.Value[id] := item;
+
     return item;
   end Add;
 
   public async method Update(id: int, change: (T) -> T): Task<T?>          // null ⇒ absent; read-modify-write is atomic
     using var guard := await _map.Get().LockAsync();
+
     var current := guard.Value.GetOrNull(id);
-    if current = null then return null; end;                               // a local narrows (§7.4)
-    var updated := change(current);
+    if current = null then
+      return null;
+    end;
+
+    var updated := change(current);                                        // `current` narrowed by the early return (§7.4)
     guard.Value[id] := updated;
+
     return updated;
   end Update;
 
@@ -114,8 +121,10 @@ public sealed class Api: IHttpService
     if req.Path <> "/health" and req.Headers.Get("Authorization") = null then
       return Http.Status(401);
     end;
+
     var resp := await next(req);                                            // [A1] awaited to settlement
     _deps.Logger.Info($"{HttpMethod.NameOf(req.Method)} {req.Path} -> {resp.Status}");
+
     return resp;
   end Guard;
 end Api;
@@ -145,7 +154,10 @@ public sealed class TodoApi: IHttpService
       await _todos.Add(lambda(id) => new Todo(id, body.Title, false));
 
   public async method Replace(id: int, body: Todo): Task<Todo?>
-    if body.Id <> id then throw new HttpResponseException(400, "body id does not match the route"); end;
+    if body.Id <> id then
+      throw new HttpResponseException(400, "body id does not match the route");
+    end;
+
     return await _todos.Update(id, lambda(_) => body);
   end Replace;
 
@@ -153,7 +165,9 @@ public sealed class TodoApi: IHttpService
       await _todos.Update(id, lambda(todo) => todo with(Done := true));
 
   public async method Remove(id: int): Task                                 // completes ⇒ 204
-    if not await _todos.Remove(id) then throw new HttpResponseException(404); end;
+    if not await _todos.Remove(id) then
+      throw new HttpResponseException(404);
+    end;
   end Remove;
 end TodoApi;
 
@@ -163,11 +177,13 @@ public static class Program
     await using var hub := new LogHub(new ConsoleSink(), minLevel := LogLevel.Info);   // 0021 §4.2
     var sinkLoop := hub.RunAsync();                                         // drains the log channel, on this domain
     using var todos := new Store<Todo>();                                   // one map; one handle per worker (§28.13)
+
     // `deps` runs on THIS domain once per worker; each result is moved into its worker (§30.14). It may capture
     // Main's locals because `Listen` is awaited to settlement in this very statement (§28.14 frame residence).
     var exitCode := await HttpServer.Listen(port := 8080,
         service := lambda(owned deps: Deps) => new Api(move deps),          // [F] capture-free: a spawn position
         deps := lambda(worker) => new Deps(todos.Clone(), hub.NewLogger($"http-{worker}")));   // [M1]
+
     await sinkLoop;    // every worker's ChannelLogger died with its service ⇒ channel closed ⇒ sink drained
     return exitCode;
   end Main;
@@ -183,27 +199,31 @@ import System.Testing;            // 0022 §5, §8 — explicit import by design
 import System.Net.Http;
 
 public class TodoApiTests
-  public static async method CreateIsAnOrdinaryMethodCall(): Task          // no request, no JSON, no table
+  public static async method CreateReturnsTheStoredTodo(): Task            // a handler called as the method it is
     using var store := new Store<Todo>();                                   // fixture = using var (0022 §7)
     using var api := new TodoApi(store);                                    // the service borrows the store, which outlives it
-    var todo := await api.Create(new NewTodo("write the server proposal"));
-    Assert.Equal(new Todo(1, "write the server proposal", false), todo);    // every component admissible ⇒ hashable (§9.2, §3.6)
-  end CreateIsAnOrdinaryMethodCall;
 
-  public static async method NonNumericIdIsA400(): Task                    // binding happens in the table, before GetById runs
+    var todo := await api.Create(new NewTodo("write the server proposal"));
+
+    Assert.Equal(new Todo(1, "write the server proposal", false), todo);    // every component admissible ⇒ hashable (§9.2, §3.6)
+  end CreateReturnsTheStoredTodo;
+
+  public static async method GetByIdRejectsANonNumericId(): Task           // binding happens in the table, before GetById runs
     using var store := new Store<Todo>();
     using var api := new TodoApi(store);
     using var req := new HttpRequest(HttpMethod.Get, "/not-a-number");      // the service's own path, dispatched directly
+
     using var resp := await api.Routes.Dispatch(req);                       // Pattern B
+
     Assert.Equal(400, resp.Status);                                         // int.Parse ⇒ HttpResponseException(400) ⇒ converted
-  end NonNumericIdIsA400;
+  end GetByIdRejectsANonNumericId;
 end TodoApiTests;
 
 public static class TestMain
   public static async method Main(): Task<int>                              // 0022 §3.2 (b): the registration runner
     using var runner := new TestRunner();
-    runner.Add("CreateIsAnOrdinaryMethodCall", TodoApiTests.CreateIsAnOrdinaryMethodCall);   // static references: capture-free
-    runner.Add("NonNumericIdIsA400",           TodoApiTests.NonNumericIdIsA400);
+    runner.Add("CreateReturnsTheStoredTodo",    TodoApiTests.CreateReturnsTheStoredTodo);    // static references: capture-free
+    runner.Add("GetByIdRejectsANonNumericId",   TodoApiTests.GetByIdRejectsANonNumericId);
     return await runner.RunAsync();
   end Main;
 end TestMain;
