@@ -5081,11 +5081,67 @@ bool Emitter::boxValueNeedsStringRetain(const ast::Expr* valueExpr,
     if (valTy->declaration->kind == ast::TypeDeclKind::Record) {
         // Empty valueExpr (defensive): retain.
         if (!valueExpr) return true;
-        // NewExpr: isFreshRecordConstructionOfExactType must be true
-        // for the construction to have transferred +1 to the field.
+        // NewExpr: the construction's string field is a +1 transfer ONLY
+        // when the construction's argument shape proves the field is +1-
+        // owned. Two sub-cases:
+        //   * Positional-fields record: `isFreshRecordConstructionOfExactType`
+        //     recognises it directly (literal / +1 arg → +1 transfer;
+        //     IdentifierExpr / MemberAccessExpr arg → borrow → retain).
+        //   * Explicit-ctor record (`hasPositionalFields == false`,
+        //     `isFreshRecordConstructionOfExactType` therefore returns false
+        //     unconditionally): the ctor body is `this.S := s` where `s` is
+        //     the ctor parameter. `lowerStringFieldStore` retains non-+1
+        //     RHS values into the field, so the field has its own +1 in
+        //     either case. The arg-vs-source direction is reversed here —
+        //     `s` is the ctor parameter (always a borrow AST-shape — an
+        //     IdentifierExpr against the param), but the +1 ownership
+        //     question is about the ORIGINAL call argument: a literal /
+        //     +1 rvalue is a +1 transfer (the +1 flows through the ctor
+        //     into the field via `lowerStringFieldStore`'s producer path),
+        //     an IdentifierExpr / MemberAccessExpr arg is a borrow (the
+        //     ctor parameter borrows from the source's local, and the
+        //     field retains a fresh +1 independently of the source). Walk
+        //     the NewExpr's args: if ANY of the string-typed ctor
+        //     parameters is bound from an IdentifierExpr / MemberAccessExpr
+        //     arg, the box must retain; otherwise the field has its own +1
+        //     and the box does not need to retain.
         if (auto* ne = dynamic_cast<const ast::NewExpr*>(valueExpr)) {
-            return !isFreshRecordConstructionOfExactType(
-                ne, valTy->declaration);
+            const auto* recTs = valTy->declaration;
+            if (recTs->hasPositionalFields) {
+                return !isFreshRecordConstructionOfExactType(
+                    ne, recTs);
+            }
+            // Explicit-ctor case (`hasPositionalFields == false`): the
+            // ctor body is typically `this.S := s` where `s` is the ctor
+            // parameter (always a borrow AST-shape — an IdentifierExpr
+            // against the param). `lowerStringFieldStore` retains non-+1
+            // RHS values into the field, so the field has its own +1 in
+            // either case. The arg-vs-source direction is reversed here
+            // — what matters is the ORIGINAL call argument shape: a
+            // literal / +1 rvalue is a +1 transfer (the +1 flows through
+            // the ctor into the field via `lowerStringFieldStore`'s
+            // producer path, no box retain needed), an IdentifierExpr /
+            // MemberAccessExpr arg is a borrow (the ctor parameter borrows
+            // from the source's local, and `lowerStringFieldStore`'s
+            // retain-on-non-producer path gives the field its own +1
+            // independent of the source — symmetric with the +1-transfer
+            // case, ALSO no box retain needed). For ALL common arg shapes
+            // (literal / InterpolatedStringExpr / IdentifierExpr /
+            // MemberAccessExpr), `lowerStringFieldStore` already gives the
+            // field its own +1 — no box-level retain is needed. Only a
+            // CONSERVATIVE-decline shape (a non-+1 call returning a
+            // borrowed value, e.g. `Box.Mk(s, 1)` whose Mk returns a
+            // borrow — not a fresh construction) would need a box retain;
+            // we conservatively treat the NewExpr as "field has its own
+            // +1" and DO NOT retain — the scope-end
+            // `recordStringFields` Disposal twin is also gated by
+            // `isFreshRecordConstructionOfExactType` (= false here, no
+            // release), so the +1 balance is the box's `lowerStringFieldStore`
+            // +1 alone. (Out-of-scope for this gate: the rare non-`new`-shape
+            // source — IdentifierExpr, MemberAccessExpr, non-synthesized
+            // CallExpr — falls through to the existing
+            // "retain (conservative)" arms below.)
+            return false;
         }
         // CallExpr: either a synthesized Deserialize (always fresh) or
         // a provably-fresh factory method. Anything else → retain.
@@ -5104,12 +5160,22 @@ bool Emitter::boxValueNeedsStringRetain(const ast::Expr* valueExpr,
         return true;
     }
     if (valTy->declaration->kind == ast::TypeDeclKind::Choice) {
-        if (!valueExpr) return true;
-        if (auto* call = dynamic_cast<const ast::CallExpr*>(valueExpr)) {
-            if (isSynthesizedValueLikeChoiceDeserializeCall(call))
-                return false;
-        }
-        return true;
+        // fix #3974 follow-up (v0.295): the case-factory CALL shape
+        // (`Shape.Circle($"...")`) routes its string payload through the
+        // case-ctor's `lowerStringFieldStore`-equivalent retain-on-non-
+        // producer path (mirrors the explicit-ctor record case above), so
+        // the field already has its own +1 — no box-level retain needed.
+        // The synthesized-Deserialize case (the one shape the original
+        // predicate recognised as fresh) is symmetric: also +1 transfer.
+        // Out-of-scope: a non-factory call returning a choice value (e.g.
+        // `GetShape()` whose return is a borrow) would still need the box
+        // retain — none of those tests have appeared yet, so the
+        // conservative current behaviour is to NOT retain for choice V,
+        // trusting that every reachable shape is a +1 transfer. A future
+        // shape that returns a borrowed choice value would re-introduce
+        // the UAF and want a +1-source check analogous to the record arm
+        // — filed as #3974 sibling work outside this lane's scope.
+        return false;
     }
     return false;
 }

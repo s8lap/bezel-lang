@@ -7052,6 +7052,33 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             builder_.CreateStore(k, slot);
             return slot;
         };
+        // fix #3974 / §9.7 / §28.9 / stdlib §4.8 (v0.295 follow-up): distinguish
+        // borrow-source from +1-transfer-source at the insertion site so the
+        // retain walker ONLY fires when the box's fields are not already +1
+        // owners. The unconditional retain of the prior cycle 5 attempt
+        // (commit 4356b91's gate was just `recordHasStringFields`) over-retained
+        // the explicit-ctor + +1-arg case — `new Box($"...")` where the ctor's
+        // `this.S := s` already routes through `lowerStringFieldStore`'s
+        // retain-new / release-old and transfers the +1 to the field — and
+        // broke #3798 (4 tests) + #3802 (4 tests). The fix is a per-source
+        // gate: fire retain when the source's string field is provably a
+        // BORROW (an IdentifierExpr / MemberAccessExpr arg, a fresh non-+1
+        // call), skip it when the construction is a +1 transfer.
+        //
+        // `valueExpr` is the original argument expression (`call.args[1]` —
+        // the value being inserted); `boxValueNeedsStringRetain` consults it
+        // to decide whether the construction is a +1 transfer (returns
+        // false → don't retain) or a borrow (returns true → retain). For
+        // Add / TryAdd / Set / GetOrAdd paths that all dispatch through
+        // this lambda, `call.args[1]` is always the value expression.
+        const ast::Expr* valueExpr =
+            (call.args.size() >= 2 && call.args[1].value)
+                ? call.args[1].value.get() : nullptr;
+        const sema::TypeSymbol* valRec3974 =
+            (valTy && valTy->kind == sema::TypeRef::Kind::Named &&
+             valTy->declaration &&
+             valTy->declaration->kind == ast::TypeDeclKind::Record)
+                ? valTy->declaration : nullptr;
         // Encode a value as the stored void*. Pointer values store directly;
         // integer/float values widen to i64 and inttoptr so each stored value is
         // self-contained (no shared-alloca aliasing across loop iterations);
@@ -7109,6 +7136,56 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 llvm::Value* box =
                     builder_.CreateCall(mallocFn, {builder_.getInt64((int64_t)vsz)});
                 builder_.CreateStore(v, box);   // copy the struct bytes into the box
+                // fix #3974 (§9.7 / §28.9 / stdlib §4.8, v0.295 follow-up):
+                // when the source's string field is a BORROW (an
+                // IdentifierExpr / MemberAccessExpr, a non-+1 call, etc.),
+                // make the box a genuine +1 owner by retaining each reachable
+                // string field — symmetric with `boxedRecordValueFreer` /
+                // `boxedChoiceValueFreer`'s assumption (the freer drains those
+                // +1s at scope-end / Clear / indexer-overwrite / Remove).
+                // Without this retain the box's string-field copy is a
+                // BORROW of the source and the freer's release frees a +1
+                // the source still owns — heap-use-after-free (issue repro:
+                // `new Box(s, 1)` where `s` is a plain local).
+                //
+                // Gating (`boxValueNeedsStringRetain`, fix #3974 v0.294,
+                // refined v0.295): the predicate returns false (don't
+                // retain) when the construction is provably a +1 transfer;
+                // true (retain) when the field is a borrow. For positional-
+                // field records, `isFreshRecordConstructionOfExactType`
+                // recognises the literal / +1 case directly. For explicit-
+                // ctor records, the predicate's NewExpr-arm walks the args
+                // and treats a literal / +1 rvalue as a +1 transfer (the
+                // ctor's `this.S := s` routes through `lowerStringFieldStore`'s
+                // retain-on-non-producer path, giving the field its own +1
+                // — no box-level retain needed) and an IdentifierExpr /
+                // MemberAccessExpr as a borrow (the field shares the source's
+                // +1, so the box needs its own retain).
+                //
+                // Nullable V (`Box?`, `Choice?`): GEP element 1 of the {i8,
+                // T} wrapper, walk T's string fields unchanged. Same
+                // adjustment the freer's release twin does.
+                if (valTy) {
+                    llvm::Value* recAddr = box;
+                    if (valNullableVal) {
+                        llvm::StructType* wrapTy = nullableValueStructTy(valTy);
+                        recAddr = builder_.CreateStructGEP(
+                            wrapTy, box, 1, "dvbxre.nrec.payload");
+                    }
+                    if (valRec3974 && recordHasStringFields(valTy) &&
+                        boxValueNeedsStringRetain(valueExpr, valTy)) {
+                        emitRecordStringFieldRetains_impl(recAddr, valTy);
+                    } else if (!valNullableVal && valTy->kind ==
+                                   sema::TypeRef::Kind::Named &&
+                               valTy->declaration &&
+                               valTy->declaration->kind ==
+                                   ast::TypeDeclKind::Choice &&
+                               choiceHasStringFields(valTy->declaration) &&
+                               boxValueNeedsStringRetain(valueExpr, valTy)) {
+                        emitChoiceStringFieldRetains_impl(
+                            recAddr, valTy->declaration);
+                    }
+                }
                 return box;
             }
             if (v->getType()->isPointerTy()) return v;

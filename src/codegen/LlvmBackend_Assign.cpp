@@ -1250,6 +1250,23 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
     // issue #539 / §4.8 / §7: nullable value types lower to a tagged {i8,T}
     // struct and must be heap-boxed the same way non-nullable records are.
     bool valNullableVal = valTy && isNullableValueTy(valTy);
+    // fix #3974 / §9.7 / §28.9 / stdlib §4.8 (v0.295 follow-up): distinguish
+    // borrow-source from +1-transfer-source at the insertion site so the
+    // retain walker ONLY fires when the box's fields are not already +1
+    // owners. The unconditional retain of the prior cycle 5 attempt
+    // (commit 4356b91's gate was just `recordHasStringFields`) over-retained
+    // the explicit-ctor + +1-arg case — `new Box($"...")` where the ctor's
+    // `this.S := s` already routes through `lowerStringFieldStore`'s
+    // retain-new / release-old and transfers the +1 to the field — and
+    // broke #3798 (4 tests) + #3802 (4 tests). The fix is a per-source
+    // gate: fire retain when the source's string field is provably a
+    // BORROW (an IdentifierExpr / MemberAccessExpr arg, a fresh non-+1
+    // call), skip it when the construction is a +1 transfer.
+    const sema::TypeSymbol* valRec3974 =
+        (valTy && valTy->kind == sema::TypeRef::Kind::Named &&
+         valTy->declaration &&
+         valTy->declaration->kind == ast::TypeDeclKind::Record)
+            ? valTy->declaration : nullptr;
     // Encode the value as the stored void* (mirror the dict Add path in
     // LlvmBackend_Calls.cpp). The cases are: a record or nullable-value-type
     // tagged struct — heap-boxed (malloc + store of its bytes), the box pointer
@@ -1297,6 +1314,54 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
             llvm::Value* box =
                 builder_.CreateCall(mallocFn, {builder_.getInt64((int64_t)vsz)});
             builder_.CreateStore(v, box);   // copy the struct bytes into the box
+            // fix #3974 (§9.7 / §28.9 / stdlib §4.8, v0.295 follow-up): when
+            // the source's string field is a BORROW (an IdentifierExpr /
+            // MemberAccessExpr, a non-+1 call, etc.), make the box a genuine
+            // +1 owner by retaining each reachable string field — symmetric
+            // with `boxedRecordValueFreer` / `boxedChoiceValueFreer`'s
+            // assumption (the freer drains those +1s at scope-end / Clear /
+            // indexer-overwrite / Remove). Without this retain the box's
+            // string-field copy is a BORROW of the source and the freer's
+            // release frees a +1 the source still owns — heap-use-after-free
+            // (issue repro: `new Box(s, 1)` where `s` is a plain local).
+            //
+            // Gating (`boxValueNeedsStringRetain`, fix #3974 v0.294, refined
+            // v0.295): the predicate returns false (don't retain) when the
+            // construction is provably a +1 transfer. For positional-field
+            // records, `isFreshRecordConstructionOfExactType` recognises it
+            // directly. For explicit-ctor records, `boxValueNeedsStringRetain`
+            // is keyed on the NewExpr's args themselves: a literal / +1
+            // rvalue arg to the string field's ctor parameter is treated as
+            // +1 transfer (the ctor's `this.S := s` routes through
+            // `lowerStringFieldStore`'s retain-on-non-producer path, giving
+            // the field its own +1 — no box-level retain needed); an
+            // IdentifierExpr / MemberAccessExpr arg is a borrow (the field
+            // shares the source's +1), so the box needs its own retain.
+            //
+            // Nullable V (`Box?`, `Choice?`) is supported: GEP element 1 of
+            // the {i8, T} wrapper, walk T's string fields unchanged. Same
+            // adjustment the freer's release twin does.
+            if (valTy) {
+                llvm::Value* recAddr = box;
+                if (valNullableVal) {
+                    llvm::StructType* wrapTy = nullableValueStructTy(valTy);
+                    recAddr = builder_.CreateStructGEP(
+                        wrapTy, box, 1, "dvbxre.nrec.payload");
+                }
+                if (valRec3974 && recordHasStringFields(valTy) &&
+                    boxValueNeedsStringRetain(valueExpr, valTy)) {
+                    emitRecordStringFieldRetains_impl(recAddr, valTy);
+                } else if (!valNullableVal && valTy->kind ==
+                               sema::TypeRef::Kind::Named &&
+                           valTy->declaration &&
+                           valTy->declaration->kind ==
+                               ast::TypeDeclKind::Choice &&
+                           choiceHasStringFields(valTy->declaration) &&
+                           boxValueNeedsStringRetain(valueExpr, valTy)) {
+                    emitChoiceStringFieldRetains_impl(
+                        recAddr, valTy->declaration);
+                }
+            }
             return box;
         }
         if (v->getType()->isPointerTy()) return v;
