@@ -2122,10 +2122,32 @@ FlowState MethodOwnership::runDataflow(
             const BlockState& peBase = dischargeEdge ? peDischarged : peRaw;
             // §28.3/§28.7 (#764): on the edge where x is provably null, x carries
             // no disposal obligation ("disposal of null is a no-op"). Feed x as
-            // Disposed into THIS edge's contribution only — the other (non-null)
+            // PolyNull into THIS edge's contribution only — the other (non-null)
             // edge keeps x Owned, so a genuine leak there (e.g. a then-branch
             // that never disposes, or a null branch that re-acquires ownership)
-            // still surfaces at the merge join.
+            // still surfaces at the merge join: PolyNull absorbs (`joinInto`'s
+            // `PolyNull ⊓ X = X`), so the merge takes on whatever the non-null
+            // edge left behind — Owned if undischarged, Disposed if it disposed.
+            //
+            // fix #3983 (§28.3 K1 polymorphic-null / K7.4, v0.295): this used to
+            // feed Disposed instead of PolyNull. Disposed is a state that means
+            // "an explicit `.Dispose()` announced a kill here" (K4.2) — a real
+            // signal that `joinInto`'s `ownedDischargedSplit` arm (Owned ⊓
+            // Disposed) reads and arms `disposedOnSomePath` for, so that a
+            // genuinely-disposed-on-one-branch local's later read is flagged
+            // (use-after-dispose danger on that branch). A null test is not a
+            // kill announcement — there was never an object on this path to
+            // dispose — so feeding Disposed here made an ordinary `if x <> null
+            // then v := x.Val; end;` (which leaves x Owned on the non-null arm)
+            // look identical, to `ownedDischargedSplit`, to a REAL one-branch
+            // `.Dispose()`, arming `disposedOnSomePath` and false-rejecting
+            // every later read of x with "may have already been disposed on
+            // another branch". PolyNull is K1's dedicated "no obligation established
+            // on this path" state (already used for the sibling out-owned-var
+            // TryPop demotion just below) and its `joinInto` arm is pure
+            // absorption — no flag is armed — so the merge still lands on
+            // Owned/Disposed correctly (per the paragraph above) without the
+            // false diagnostic.
             BlockState peGuard;
             const BlockState* pePtr = &peBase;
             if (std::string_view nn = nullEdgeName(p, b); !nn.empty()) {
@@ -2133,7 +2155,7 @@ FlowState MethodOwnership::runDataflow(
                 for (auto& [sym, lo] : peGuard)
                     if (sym && sym->name == nn &&
                         lo.state == OwnershipState::Owned)
-                        lo.state = OwnershipState::Disposed;
+                        lo.state = OwnershipState::PolyNull;
                 pePtr = &peGuard;
             }
             // §28.3 / #1407: on the FALSE edge (succs[1]) of a non-loop
