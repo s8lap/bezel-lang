@@ -5659,6 +5659,17 @@ llvm::Function* Emitter::ensurePropertyAccessorFn(const sema::TypeSymbol* cls,
     if (cls && cls->kind == ast::TypeDeclKind::Enum)
         currentEnumMethod_ = cls;
 
+    // fix #4113 (§35.2/§35.5, v0.295): the choice twin of the enum
+    // workaround above — a choice property's BLOCK-bodied getter/setter (or
+    // an interface/box-dispatch accessor built here) whose body is
+    // `case this of …` needs the identical choiceTypeOf() recovery: this
+    // accessor function is never registered in methodFns_ (it is not a
+    // MethodSymbol), so choiceTypeOf's existing "this" recovery would
+    // otherwise find nothing.
+    const sema::TypeSymbol* savedChoiceMethod2 = currentChoiceMethod_;
+    if (cls && cls->kind == ast::TypeDeclKind::Choice)
+        currentChoiceMethod_ = cls;
+
     if (!isSet) {
         // --- Getter body. ---
         if (isAuto && isStaticProp) {
@@ -5990,6 +6001,7 @@ llvm::Function* Emitter::ensurePropertyAccessorFn(const sema::TypeSymbol* cls,
 
     // --- Restore state. ---
     currentEnumMethod_   = savedEnumMethod2;
+    currentChoiceMethod_ = savedChoiceMethod2;
     currentFn_          = savedFn;
     currentThis_        = savedThis;
     locals_             = std::move(savedLocals);

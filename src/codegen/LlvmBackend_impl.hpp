@@ -2281,6 +2281,21 @@ private:
     // currentEnumMethod_: when we're emitting an enum instance method, set to
     // the enum TypeSymbol so that `case this` knows the scrutinee's enum type.
     const sema::TypeSymbol* currentEnumMethod_ = nullptr;
+    // fix #4113 (§35.2/§35.5, v0.295): the choice-typed twin of
+    // currentEnumMethod_. A genuine choice INSTANCE METHOD body needs no
+    // help — choiceTypeOf's `this` recovery finds it via methodFns_/
+    // currentSpecMethodSymbol_ (fix #2047). But a choice PROPERTY's getter
+    // (expression- or block-bodied, or read as a function value) is never
+    // itself registered there: an expression-bodied getter is INLINED at
+    // each call site (currentFn_ is the CALLER's function, e.g. `main`),
+    // and a block-bodied/thunk accessor function is built by
+    // ensurePropertyAccessorFn/makePropertyThunk, which populate neither
+    // map either. Every one of those three sites already sets
+    // currentEnumMethod_ for an enum receiver (CG30/#2501/#574) around the
+    // getter body's evaluation; this is the same workaround for choice, set
+    // at the same three sites, so choiceTypeOf("this") resolves inside a
+    // choice property exactly as it already does inside a choice method.
+    const sema::TypeSymbol* currentChoiceMethod_ = nullptr;
     // fix #628 / §9.5 / §14.2: when emitting a SPECIALIZED method body via
     // buildSpecializedMethodFn, currentFn_ is set to the freshly-created specFn
     // which is NOT registered in methodFns_.  lowerWith's §575 reverse-lookup

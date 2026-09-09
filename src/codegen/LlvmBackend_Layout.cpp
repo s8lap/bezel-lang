@@ -5721,6 +5721,13 @@ llvm::Value* Emitter::makePropertyThunk(sema::PropertySymbol* ps,
             const sema::TypeSymbol* savedEnumMethod = currentEnumMethod_;
             if (ps->parent && ps->parent->kind == ast::TypeDeclKind::Enum)
                 currentEnumMethod_ = ps->parent;
+            // fix #4113 (§35.2/§35.5, v0.295): the choice twin of the enum
+            // workaround above — a choice property read as a function value
+            // (`var f: () -> T := s.SomeProperty;`) whose getter body is
+            // `case this of …` needs the identical choiceTypeOf() recovery.
+            const sema::TypeSymbol* savedChoiceMethod = currentChoiceMethod_;
+            if (ps->parent && ps->parent->kind == ast::TypeDeclKind::Choice)
+                currentChoiceMethod_ = ps->parent;
             result = lowerExpr(*getter);
             // fix #2761 (§8.6 "Boxing" / §27.6, v0.240): the PROPERTY-AS-
             // FUNCTION-VALUE face of the same expression getter. Its `ret` is
@@ -5733,6 +5740,7 @@ llvm::Value* Emitter::makePropertyThunk(sema::PropertySymbol* ps,
                 result = boxForTarget(result, ctx_.resolvedType(*pd->type),
                                       getter);
             currentEnumMethod_ = savedEnumMethod;
+            currentChoiceMethod_ = savedChoiceMethod;
         } else if (const ast::PropertyAccessor* acc = blockGetterOf(ps)) {
             if (llvm::Function* fn = ensurePropertyBlockGetter(pd, acc)) {
                 // fix #2501 (§9.2/§27.6, v0.236): ensurePropertyBlockGetter's

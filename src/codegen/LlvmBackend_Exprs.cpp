@@ -5769,6 +5769,19 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
             if (propSym && propSym->parent &&
                 propSym->parent->kind == ast::TypeDeclKind::Enum)
                 currentEnumMethod_ = propSym->parent;
+            // fix #4113 (§35.2/§35.5, v0.295): the choice twin of the enum
+            // workaround directly above — a choice computed property whose
+            // getter body is `case this of …` relies on choiceTypeOf() to
+            // resolve `this` as the declaring choice type (sema attaches no
+            // exprType to `this` here either). Without this, `case this of`
+            // found no scrutinee choice type, patternMatches returned null,
+            // and lowerCaseExpr bailed leaving `case.end` unterminated — an
+            // IR-verification crash ("Basic Block ... does not have
+            // terminator!"), degraded through the #2491 backstop.
+            const sema::TypeSymbol* savedChoiceMethod = currentChoiceMethod_;
+            if (propSym && propSym->parent &&
+                propSym->parent->kind == ast::TypeDeclKind::Choice)
+                currentChoiceMethod_ = propSym->parent;
             llvm::Value* v = lowerExpr(*getter);
             // §23.2/§23.3 (#1168): a `T?`-declared expression-bodied property
             // whose body yields the bare inner `T` must wrap the result to the
@@ -5814,6 +5827,7 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
             // wraps above without re-doing their work.
             v = wrapPropertyArrayAsIEnumerable(v, ctx_.exprType(*ma), getter, ma);
             currentEnumMethod_ = savedEnumMethod;
+            currentChoiceMethod_ = savedChoiceMethod;
             currentThis_ = saved;
             genericSubst_ = std::move(savedSubst);
             genericSubstSemaTy_ = std::move(savedSemaTy);

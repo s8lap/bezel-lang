@@ -345,6 +345,16 @@ const sema::TypeSymbol* Emitter::choiceTypeOf(const ast::Expr& e) {
                 currentSpecMethodSymbol_->parent->kind ==
                     ast::TypeDeclKind::Choice)
                 return currentSpecMethodSymbol_->parent;
+            // fix #4113 (§35.2/§35.5, v0.295): a choice PROPERTY's getter
+            // (inlined expression-bodied read, block-bodied accessor
+            // function, or property-as-function-value thunk) reaches this
+            // with `currentFn_` set to neither a methodFns_ entry nor
+            // currentSpecMethodSymbol_ — those two recover only a genuine
+            // choice METHOD body (#2047). currentChoiceMethod_ is the
+            // enum-precedent (currentEnumMethod_/CG30) workaround: the
+            // three property-accessor call sites set it around the
+            // getter's evaluation, exactly as they already do for enum.
+            if (currentChoiceMethod_) return currentChoiceMethod_;
         }
     }
     const sema::TypeRef* rt = ctx_.exprType(e);
