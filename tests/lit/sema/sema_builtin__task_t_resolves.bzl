@@ -6,7 +6,7 @@
 // RUN: %bezelc -c -o %t.o %s
 // RUN: %bezelc -c %s 2>&1 | FileCheck --check-prefix=NODIAG --allow-empty %s
 
-module M; class C public _x: Task<int>; end C;
+module M; class C public _x: Task<int>?; end C;
 
 // NODIAG-NOT: error
 // NODIAG-NOT: §

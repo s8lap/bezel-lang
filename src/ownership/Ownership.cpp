@@ -11257,6 +11257,27 @@ void checkMember(const ast::Member& m, sema::SemaContext& ctx,
 // construction that cannot satisfy the field) is reported here, at the field's
 // declaration site.
 
+// fix #4025 / §7.9: a builtin class/interface type (e.g. `Mutex`,
+// `Semaphore`, `IEnumerable<T>`, `Task<T>`) resolves with
+// `rt->declaration == nullptr` because the compiler has no parsed AST body
+// for it — the BuiltinRegistry snapshot
+// (src/common/BuiltinRegistry.cpp's kHeapPointerReferenceBuiltins /
+// kNonHeapReservedBuiltins) holds the authority on its name and arity.
+// Such a type IS still class-typed (a heap-pointer reference), so a non-
+// nullable field/auto-prop of that type MUST count as §7.9-strict —
+// otherwise it compiles clean with no initializer and SIGSEGVs on first
+// use, since `new Mutex()` is not implicit. The mirrored predicate in
+// DefiniteAssignment.cpp (isSevenNineStrictField et al.) carries the same
+// helper — see isBuiltinClassTypeRef there for the full rationale.
+bool isBuiltinClassTypeRef(const sema::TypeRef* rt) {
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named) return false;
+    if (rt->declaration) return false;
+    std::string_view n = rt->headName();
+    if (n.empty()) return false;
+    return common::isReservedBuiltinTypeName(n) &&
+           common::isHeapPointerReferenceBuiltin(n);
+}
+
 // §7.9: a field of non-nullable *reference* type (class, interface,
 // string, function, non-nullable Object) has no default value and must
 // be assigned by a field initializer or in every constructor. Value
@@ -11288,7 +11309,19 @@ bool isNonNullableReferenceField(const ast::FieldDecl& f,
         case sema::TypeRef::Kind::Function:
             return true;
         case sema::TypeRef::Kind::Named:
-            if (!rt->declaration) return false;  // built-in/generic — skip
+            // fix #4025 / §7.9: a builtin class/interface type (e.g.
+            // `Mutex`, `Semaphore`, `IEnumerable<T>`, `Task<T>`) has no
+            // parsed AST body — `rt->declaration` is null — but it IS still
+            // class-typed (a heap-pointer reference per the BuiltinRegistry
+            // snapshot). Previously this early-out silently skipped every
+            // heap-pointer builtin, so a non-nullable field/auto-prop of
+            // that type compiled clean and SIGSEGVed on first use (issue
+            // #4025's measured repro, on both class and record, instance and
+            // static). The same BuiltinRegistry snapshot also handles the
+            // value-shaped half (Ownership.cpp:4225-4247), so the two
+            // populations are read off the same authority rather than two
+            // hand-maintained name lists.
+            if (!rt->declaration) return isBuiltinClassTypeRef(rt);
             // fix #3072 / §7.9 / §17.11: zero-less enum CARVE-OUT.
             // enumHasZeroConstant returns nullopt when the enum's declared
             // values cannot be decided (a non-constant initializer, already
@@ -11366,7 +11399,9 @@ bool isNonNullableReferenceAutoProp(const ast::PropertyDecl& p,
         case sema::TypeRef::Kind::Function:
             return true;
         case sema::TypeRef::Kind::Named:
-            if (!rt->declaration) return false;  // built-in/generic — skip
+            // fix #4025 / §7.9: see isNonNullableReferenceField above — the
+            // same builtin-class carve-out applies to auto-properties.
+            if (!rt->declaration) return isBuiltinClassTypeRef(rt);
             if (rt->declaration->kind == ast::TypeDeclKind::Enum) {
                 std::optional<bool> hasZero =
                     enumHasZeroConstant(*rt->declaration);

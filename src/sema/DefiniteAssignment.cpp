@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "ast/Node.hpp"
+#include "common/BuiltinRegistry.hpp"  // isReservedBuiltinTypeName / isHeapPointerReferenceBuiltin — fix #4025
 #include "sema/EnumValues.hpp"  // enumHasZeroConstant — §7.9 / §17.11 enum row (#3072)
 #include "sema/SemaContext.hpp"
 #include "sema/Symbol.hpp"
@@ -15,6 +16,41 @@
 namespace bezel::sema {
 
 namespace {
+
+// fix #4025 / §7.9: a builtin class/interface type (e.g. `Mutex`, `Semaphore`,
+// `Lock`, `StringBuilder`, `IEnumerable<T>`, `Task<T>`) resolves with
+// `rt->declaration == nullptr` because the compiler has no parsed AST body for
+// it — the BuiltinRegistry snapshot (src/common/BuiltinRegistry.cpp) holds the
+// authority on its name and arity instead. Such a type IS still class-typed (a
+// heap-pointer reference), so a non-nullable field/auto-prop of that type
+// MUST count as §7.9-strict — otherwise it compiles clean with no initializer
+// and SIGSEGVs on first use, since `new Mutex()` is not implicit.
+//
+// The predicate returns true exactly when the type's head name is a heap-pointer
+// builtin — i.e. it is in `kHeapPointerReferenceBuiltins`, the same table the
+// existing value-shaped-half check (`Ownership.cpp`'s
+// `isReservedBuiltinTypeName(n) && !isHeapPointerReferenceBuiltin(n)`) consults
+// at line 4227. Genuine generic type parameters (`T` in a generic class) are
+// NOT in either builtin set, so this returns false for them — matching the
+// pre-#4025 behavior on that population. Value-shaped builtins (`Range`,
+// `DateTime`, `Guid`, the span shapes, `JsonOptions`, `ExceptionInfo`) are
+// in `kNonHeapReservedBuiltins` but NOT in `kHeapPointerReferenceBuiltins`,
+// so they also return false — they have a value-typed default and §7.9 does
+// not require them to be assigned.
+//
+// `headName()` returns the alias-transparent head (TypeRef.hpp:80), so a type
+// alias `type MyMutex = Mutex;` still classifies correctly: the alias
+// resolution passes through to "Mutex" at type-resolution time.
+bool isBuiltinClassTypeRef(const sema::TypeRef* rt) {
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named) return false;
+    if (rt->declaration) return false;
+    std::string_view n = rt->headName();
+    if (n.empty()) return false;
+    return common::isReservedBuiltinTypeName(n) &&
+           common::isHeapPointerReferenceBuiltin(n);
+}
+
+
 
 // ---------- §22.7 (v0.184) construction-time `this`-observation helpers ------
 //
@@ -45,7 +81,14 @@ bool isSevenNineStrictField(const ast::FieldDecl& f, SemaContext& ctx) {
         case TypeRef::Kind::Function:
             return true;
         case TypeRef::Kind::Named:
-            if (!rt->declaration) return false;  // built-in / generic — skip
+            // fix #4025 / §7.9: a builtin class/interface type with no
+            // parsed AST body (e.g. `Mutex`, `Semaphore`, `IEnumerable<T>`)
+            // classifies as §7.9-strict — see isBuiltinClassTypeRef above.
+            // Previously this `if (!rt->declaration) return false;` early-out
+            // silently skipped every heap-pointer builtin, so a non-nullable
+            // field/auto-prop of that type compiled with no initializer and
+            // SIGSEGVed on first use (issue #4025's measured repro).
+            if (!rt->declaration) return isBuiltinClassTypeRef(rt);
             // fix #3072 / §7.9 / §17.11: a zero-less enum field has no
             // well-defined default — `default(E)` is ill-formed for it
             // (and zero-fill leaves the slot holding an undeclared value, in
@@ -105,7 +148,9 @@ bool isSevenNineStrictAutoProp(const ast::PropertyDecl& p, SemaContext& ctx) {
         case TypeRef::Kind::Function:
             return true;
         case TypeRef::Kind::Named:
-            if (!rt->declaration) return false;
+            // fix #4025 / §7.9: see isSevenNineStrictField above — the same
+            // builtin-class carve-out applies to auto-properties.
+            if (!rt->declaration) return isBuiltinClassTypeRef(rt);
             // fix #3072 / §7.9 / §17.11: zero-less enum auto-prop storage is
             // §7.9-strict (same reasoning as isSevenNineStrictField).
             if (rt->declaration->kind == ast::TypeDeclKind::Enum) {
@@ -152,7 +197,9 @@ bool isSevenNineStrictStaticField(const ast::FieldDecl& f, SemaContext& ctx) {
         case TypeRef::Kind::Function:
             return true;
         case TypeRef::Kind::Named:
-            if (!rt->declaration) return false;  // built-in / generic — skip
+            // fix #4025 / §7.9: see isSevenNineStrictField above — the same
+            // builtin-class carve-out applies to static fields.
+            if (!rt->declaration) return isBuiltinClassTypeRef(rt);
             if (rt->declaration->kind == ast::TypeDeclKind::Enum) {
                 std::optional<bool> hasZero =
                     enumHasZeroConstant(*rt->declaration);
@@ -201,7 +248,9 @@ bool isSevenNineStrictStaticAutoProp(const ast::PropertyDecl& p,
         case TypeRef::Kind::Function:
             return true;
         case TypeRef::Kind::Named:
-            if (!rt->declaration) return false;
+            // fix #4025 / §7.9: see isSevenNineStrictField above — the same
+            // builtin-class carve-out applies to static auto-properties.
+            if (!rt->declaration) return isBuiltinClassTypeRef(rt);
             if (rt->declaration->kind == ast::TypeDeclKind::Enum) {
                 std::optional<bool> hasZero =
                     enumHasZeroConstant(*rt->declaration);
@@ -213,6 +262,31 @@ bool isSevenNineStrictStaticAutoProp(const ast::PropertyDecl& p,
             return false;
     }
 }
+
+// fix #4025 / §7.9: a builtin class/interface type (e.g. `Mutex`, `Semaphore`,
+// `Lock`, `StringBuilder`, `IEnumerable<T>`, `Task<T>`) resolves with
+// `rt->declaration == nullptr` because the compiler has no parsed AST body for
+// it — the BuiltinRegistry snapshot (src/common/BuiltinRegistry.cpp) holds the
+// authority on its name and arity instead. Such a type IS still class-typed (a
+// heap-pointer reference), so a non-nullable field/auto-prop of that type
+// MUST count as §7.9-strict — otherwise it compiles clean with no initializer
+// and SIGSEGVs on first use, since `new Mutex()` is not implicit.
+//
+// The predicate returns true exactly when the type's head name is a heap-pointer
+// builtin — i.e. it is in `kHeapPointerReferenceBuiltins`, the same table the
+// existing value-shaped-half check (`Ownership.cpp`'s
+// `isReservedBuiltinTypeName(n) && !isHeapPointerReferenceBuiltin(n)`) consults
+// at line 4227. Genuine generic type parameters (`T` in a generic class) are
+// NOT in either builtin set, so this returns false for them — matching the
+// pre-#4025 behavior on that population. Value-shaped builtins (`Range`,
+// `DateTime`, `Guid`, the span shapes, `JsonOptions`, `ExceptionInfo`) are
+// in `kNonHeapReservedBuiltins` but NOT in `kHeapPointerReferenceBuiltins`,
+// so they also return false — they have a value-typed default and §7.9 does
+// not require them to be assigned.
+//
+// `headName()` returns the alias-transparent head (TypeRef.hpp:80), so a type
+// alias `type MyMutex = Mutex;` still classifies correctly: the alias
+// resolution passes through to "Mutex" at type-resolution time.
 
 // True when `e` is the bare `this`/`base` keyword (stored as an IdentifierExpr
 // with the keyword lexeme, per Parser_Exprs §22.3).
