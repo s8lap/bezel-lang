@@ -38,6 +38,18 @@ namespace {
 // so they also return false — they have a value-typed default and §7.9 does
 // not require them to be assigned.
 //
+// BUILTIN EXCEPTIONS (§31, the `kBuiltinExceptionHierarchy` rows like
+// `Exception`, `IOException`, `ArgumentException`) live OUTSIDE both
+// `kHeapPointerReferenceBuiltins` and `kNonHeapReservedBuiltins` — they are
+// heap-allocated class types with no parsed `ast::TypeDecl` body, so they
+// resolve with `rt->declaration == nullptr` AND are absent from the heap-
+// pointer table this predicate otherwise consults. As the
+// `IOException`/etc. cases for #4025's predicate gap, treating them as
+// NOT-class-typed silently skipped the §7.9 strict-storage check, so a
+// `public E: IOException;` field with no initializer compiled clean and
+// SIGSEGVed on first use. `isBuiltinExceptionName(n)` (BuiltinRegistry.hpp
+// :478) is the predicate that recognizes them.
+//
 // `headName()` returns the alias-transparent head (TypeRef.hpp:80), so a type
 // alias `type MyMutex = Mutex;` still classifies correctly: the alias
 // resolution passes through to "Mutex" at type-resolution time.
@@ -46,6 +58,7 @@ bool isBuiltinClassTypeRef(const sema::TypeRef* rt) {
     if (rt->declaration) return false;
     std::string_view n = rt->headName();
     if (n.empty()) return false;
+    if (common::isBuiltinExceptionName(n)) return true;
     return common::isReservedBuiltinTypeName(n) &&
            common::isHeapPointerReferenceBuiltin(n);
 }
@@ -262,31 +275,6 @@ bool isSevenNineStrictStaticAutoProp(const ast::PropertyDecl& p,
             return false;
     }
 }
-
-// fix #4025 / §7.9: a builtin class/interface type (e.g. `Mutex`, `Semaphore`,
-// `Lock`, `StringBuilder`, `IEnumerable<T>`, `Task<T>`) resolves with
-// `rt->declaration == nullptr` because the compiler has no parsed AST body for
-// it — the BuiltinRegistry snapshot (src/common/BuiltinRegistry.cpp) holds the
-// authority on its name and arity instead. Such a type IS still class-typed (a
-// heap-pointer reference), so a non-nullable field/auto-prop of that type
-// MUST count as §7.9-strict — otherwise it compiles clean with no initializer
-// and SIGSEGVs on first use, since `new Mutex()` is not implicit.
-//
-// The predicate returns true exactly when the type's head name is a heap-pointer
-// builtin — i.e. it is in `kHeapPointerReferenceBuiltins`, the same table the
-// existing value-shaped-half check (`Ownership.cpp`'s
-// `isReservedBuiltinTypeName(n) && !isHeapPointerReferenceBuiltin(n)`) consults
-// at line 4227. Genuine generic type parameters (`T` in a generic class) are
-// NOT in either builtin set, so this returns false for them — matching the
-// pre-#4025 behavior on that population. Value-shaped builtins (`Range`,
-// `DateTime`, `Guid`, the span shapes, `JsonOptions`, `ExceptionInfo`) are
-// in `kNonHeapReservedBuiltins` but NOT in `kHeapPointerReferenceBuiltins`,
-// so they also return false — they have a value-typed default and §7.9 does
-// not require them to be assigned.
-//
-// `headName()` returns the alias-transparent head (TypeRef.hpp:80), so a type
-// alias `type MyMutex = Mutex;` still classifies correctly: the alias
-// resolution passes through to "Mutex" at type-resolution time.
 
 // True when `e` is the bare `this`/`base` keyword (stored as an IdentifierExpr
 // with the keyword lexeme, per Parser_Exprs §22.3).

@@ -11269,11 +11269,20 @@ void checkMember(const ast::Member& m, sema::SemaContext& ctx,
 // use, since `new Mutex()` is not implicit. The mirrored predicate in
 // DefiniteAssignment.cpp (isSevenNineStrictField et al.) carries the same
 // helper — see isBuiltinClassTypeRef there for the full rationale.
+//
+// Builtin EXCEPTIONS (§31, `kBuiltinExceptionHierarchy` rows like
+// `Exception`, `IOException`, `ArgumentException`) live OUTSIDE both the
+// heap-pointer and value-shaped builtin tables, so they too resolve with
+// `rt->declaration == nullptr` and would otherwise slip through the
+// `isHeapPointerReferenceBuiltin(n)` conjunct. `isBuiltinExceptionName(n)`
+// recognises them — the same widening the DefiniteAssignment.cpp twin
+// applies.
 bool isBuiltinClassTypeRef(const sema::TypeRef* rt) {
     if (!rt || rt->kind != sema::TypeRef::Kind::Named) return false;
     if (rt->declaration) return false;
     std::string_view n = rt->headName();
     if (n.empty()) return false;
+    if (common::isBuiltinExceptionName(n)) return true;
     return common::isReservedBuiltinTypeName(n) &&
            common::isHeapPointerReferenceBuiltin(n);
 }

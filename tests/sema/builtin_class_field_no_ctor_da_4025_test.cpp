@@ -353,6 +353,40 @@ BEZEL_TEST(sema_builtin_class_field_da_4025,
 }
 
 // =====================================================================
+// REJECT arm 8 — instance FIELD of a builtin EXCEPTION class type
+// (`IOException`, from `kBuiltinExceptionHierarchy`, §31). The heap-
+// pointer table (`kHeapPointerReferenceBuiltins`) does NOT contain
+// exception names — they live in their own hierarchy table because
+// they have their own `isA` vtable (§31.2.1) and runtime allocation
+// path, structurally distinct from the rest. Before #4025's widening
+// to also consult `isBuiltinExceptionName(n)`, a non-nullable field of
+// a built-in exception class type compiled clean with no initializer
+// (the heap-pointer check missed it, AND no synthesized declaration
+// exists to take the user-classified branch) — so this test pins the
+// extension. Module path follows `tests/codegen/builtin_member_
+// population_2998_test.cpp`'s IOException row: `import System.IO; import
+// System.Threading;`.
+// =====================================================================
+
+BEZEL_TEST(sema_builtin_class_field_da_4025,
+           class_instance_field_of_ioexception_no_ctor_rejected_spec_7_9) {
+    auto r = runAot(
+        "module M; import System.IO; import System.Threading; "
+        "public class Guard4025IO "
+        "  public E: IOException; "
+        "end Guard4025IO; "
+        "class C "
+        "  public static method Main(): int "
+        "    var g := new Guard4025IO(); "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagContains(r, "non-nullable field `E`"));
+    BEZEL_EXPECT_TRUE(diagContains(r, "§7.9"));
+}
+
+// =====================================================================
 // OVER-REJECTION GUARD — a value-shaped builtin (IntPtr) is in
 // kNonHeapReservedBuiltins (NOT kHeapPointerReferenceBuiltins), so
 // `isBuiltinClassTypeRef` correctly returns false for it and a
