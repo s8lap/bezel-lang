@@ -6337,14 +6337,72 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                 // (its own `ast::TypeDecl`), so `builtinTypeName` — which
                 // requires `!declaration->decl` to return a name at all
                 // (LlvmBackend_Calls.cpp:767) — returns "" for every real
-                // class and is a no-op exclusion for them; it returns
-                // "FrozenArray" ONLY for this one synthetic shape.
+                // class and is a no-op exclusion for them.
+                //
+                // fix #4120 (stdlib §10.1/§10.2/§10.3, v0.295): the #3907
+                // exclusion above named exactly ONE synthetic builtin
+                // ("FrozenArray"); `CString`/`WString`/`RawBytes` are three
+                // MORE names `SemaContext::builtinClassSym` stamps
+                // `kind = Class` for unconditionally, with no dedicated
+                // ToString interceptor in `tryLowerBuiltinClassCall`
+                // (LlvmBackend_Calls.cpp — that file's own blocks for these
+                // three cover only `ToBytes`/`CopyTo`), so they match
+                // `cg_isClass` here exactly like FrozenArray did pre-#3907.
+                // Measured live: `CString.From("hi").ToString()` / `WString.
+                // From("hi").ToString()` returned `""` (their receiver's raw
+                // buffer pointer read as a class vtable header, landing on a
+                // null "vtable pointer" -> lowerObjectToString's OWN
+                // null-receiver branch, which renders the SENTINEL "null" for
+                // what is actually a non-null FFI buffer); `RawBytes.From
+                // (arr).ToString()` returned memory-layout-dependent garbage
+                // bytes (its `{ptr,len}` struct's `ptr` field misread as a
+                // vtable pointer, then walked `kToStringSlot` slots further
+                // into whatever happens to be mapped there).
+                //
+                // Excluded via `isFfiBufferTypeRef` (LlvmBackend_Calls.cpp:~809,
+                // `common::isFfiBufferBuiltinName(builtinTypeName(rt))` over
+                // the closed `kFfiBufferBuiltins` = {CString, WString,
+                // RawBytes} registry row, BuiltinRegistry.cpp) rather than a
+                // fourth `builtinTypeName(...) != "X"` literal appended here,
+                // or a fully general `builtinTypeName(...).empty()` that
+                // would ALSO exclude the other `builtinClassSym`-stamped
+                // names (CancellationToken, Range, Guid, Stopwatch, …):
+                // several of THOSE were measured (while verifying this fix)
+                // to have the SAME "wrong value, no crash" defect on this
+                // path today — but excluding them here with no replacement
+                // dispatch turns that into a hard crash (confirmed: excluding
+                // via the fully general predicate alone made
+                // `CancellationToken.None.ToString()` and
+                // `Stopwatch.StartNew().ToString()` SIGSEGV instead of
+                // returning a wrong value). Fixing those correctly needs
+                // per-type work this issue does not cover (filed as issue
+                // 4126); `isFfiBufferTypeRef` scopes the exclusion to
+                // exactly the three names this fix ALSO gives a correct
+                // replacement dispatch below (the qualified-name §8.5
+                // default, via the same literal chain FrozenArray's
+                // `.ToString()` already uses) and via the reference-identity
+                // Equals/GetHashCode default (`isBuiltinIdentityRecv` below)
+                // — so no `builtinClassSym`-stamped receiver is left with
+                // NO dispatch after this change. A genuine user or imported
+                // class is unaffected either way (`isFfiBufferTypeRef` is a
+                // no-op for both, exactly as the single-name form was).
+                //
+                // ⚠ MUST keep the pre-existing `!= "FrozenArray"` test
+                // ALONGSIDE `!isFfiBufferTypeRef` here, not replace it: this
+                // early interceptor is the ONLY occurrence in this function
+                // that fires before `ms`/the ToString literal chain are ever
+                // reached, so FrozenArray's OWN #3907 fix (a qualified-name
+                // rendering further down, reached only via the `ms == null`
+                // path) depends on THIS check still excluding it too, or a
+                // no-arg `.ToString()` on FrozenArray is caught here first
+                // and never reaches its own fix again.
                 bool cg_isClass =
                     cg_recvTy->kind == CG_K::Named &&
                     cg_recvTy->declaration &&
                     cg_recvTy->declaration->kind ==
                         ast::TypeDeclKind::Class &&
-                    builtinTypeName(cg_recvTy) != "FrozenArray";
+                    builtinTypeName(cg_recvTy) != "FrozenArray" &&
+                    !isFfiBufferTypeRef(cg_recvTy);
                 // Built-in exception types: Named with no declaration, AND
                 // the type name is actually in the builtin exception set
                 // (isBuiltinExceptionTypeRef -- see its own doc comment,
@@ -6793,13 +6851,31 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                 // authority `isCollectionTypeName` reads for this identical
                 // two-shape problem — so read it once instead of re-deriving
                 // the shape test here.
+                //
+                // fix #4120 (stdlib §10.1/§10.2/§10.3, v0.295): CString/
+                // WString/RawBytes join this literal chain too. They are
+                // `public class` with NO declared ToString override (stdlib
+                // §10.1-§10.3 list only From/FromBytes/Length/Pointer/
+                // ToBytes/CopyTo/destructor), so the §8.5 no-override default
+                // — the qualified type name this chain already renders for
+                // FrozenArray and the other seven residual names — is the
+                // CORRECT value, not a name-only special case: routing them
+                // here is what makes it SAFE to exclude them from the
+                // `cg_isClass`/`isNamedClassRecv` vtable-misdispatch checks
+                // elsewhere in this function (see `isFfiBufferTypeRef`'s use
+                // there) without leaving them with no dispatch at all.
+                // `common::isFfiBufferBuiltinName` (`kFfiBufferBuiltins` =
+                // {CString, WString, RawBytes}, BuiltinRegistry.cpp) is the
+                // existing authority for exactly this three-name set — used
+                // instead of three more `arn == "X"` literals here.
                 if (std::string_view arn = builtinTypeName(recvTy);
                         !arn.empty()) {
                     if (common::isArrayEnumeratorWrapSourceName(arn) ||
                         arn == "Set" || arn == "OwningSet" ||
                         arn == "SortedSet" || arn == "FrozenArray" ||
                         arn == "Dictionary" || arn == "OwningDictionary" ||
-                        arn == "LinkedList" || arn == "OwningLinkedList") {
+                        arn == "LinkedList" || arn == "OwningLinkedList" ||
+                        common::isFfiBufferBuiltinName(arn)) {
                         std::string_view mod =
                             common::builtinClassModulePathOf(arn);
                         std::string rendered = mod.empty()
@@ -6839,9 +6915,29 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                 // ms==nullptr. Extend the dispatch to include named Class receivers
                 // so they use the same lowerObjectToString path as Object/interface.
                 // per §8.5 (v0.134).
+                //
+                // fix #4120 (stdlib §10.1/§10.2/§10.3, v0.295): this is the
+                // SECOND occurrence of the exact `cg_isClass` shape fixed a
+                // few thousand lines up in this same function — the early
+                // one intercepts and returns for a no-arg `.ToString()` call
+                // whenever the receiver's pointer form is available; a
+                // `CString`/`WString`/`RawBytes` receiver whose FIRST fix
+                // occurrence above now declines reaches HERE via the `ms ==
+                // null` fallback. Apply the SAME `isFfiBufferTypeRef`
+                // exclusion (see that occurrence's comment for why this is
+                // scoped to the three FFI-buffer names rather than every
+                // `builtinClassSym`-stamped name); the literal chain a few
+                // lines above this (the `builtinTypeName(recvTy)` qualified-
+                // name rendering) now ALSO admits these three names, so a
+                // CString/WString/RawBytes `.ToString()` call resolves THERE
+                // instead of ever reaching this `isNamedClassRecv` (it is
+                // excluded here only as a backstop against a future
+                // reordering). A genuine user or imported class is
+                // unaffected (`isFfiBufferTypeRef` is a no-op for both).
                 bool isNamedClassRecv =
                     recvTy && recvTy->kind == K::Named && recvTy->declaration &&
-                    recvTy->declaration->kind == ast::TypeDeclKind::Class;
+                    recvTy->declaration->kind == ast::TypeDeclKind::Class &&
+                    !isFfiBufferTypeRef(recvTy);
                 // #608 / §8.5 / §31: built-in exception types (Named with no
                 // declaration) in a GENERIC context (genericSubstSemaTy_ active)
                 // can reach here when the type-param substitution lookup above
@@ -7176,9 +7272,27 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                     residualIdentityName == "OwningDictionary" ||
                     residualIdentityName == "LinkedList" ||
                     residualIdentityName == "OwningLinkedList";
+                // fix #4120 (stdlib §10.1/§10.2/§10.3, v0.295): CString/
+                // WString/RawBytes are ALSO genuine heap-allocated `public
+                // class` receivers with a stable pointer identity and NO
+                // declared Equals/GetHashCode override — the same §8.3
+                // "opaque heap pointer, no vtable" shape the eight residual
+                // collection names above have, just not a collection. Kept
+                // as its own boolean (not folded into
+                // `isBuiltinIdentityResidualCollection`) because that one is
+                // deliberately the #3896 EIGHT-name residual-collection set
+                // (its own comment states the count); a distinct boolean
+                // keeps that invariant checkable and keeps the #3419
+                // class-F enumerable-grid ratchet scoped to array/collection
+                // names only, per `common::isFfiBufferBuiltinName`'s own
+                // three-name registry row (`kFfiBufferBuiltins`,
+                // BuiltinRegistry.cpp) rather than three more literals here.
+                bool isBuiltinIdentityFfiBuffer =
+                    common::isFfiBufferBuiltinName(residualIdentityName);
                 bool isBuiltinIdentityRecv =
                     isBuiltinIdentityIterHead || isBuiltinIdentityArrayFamily ||
-                    isBuiltinIdentityResidualCollection;
+                    isBuiltinIdentityResidualCollection ||
+                    isBuiltinIdentityFfiBuffer;
                 if (isBuiltinIdentityRecv) {
                     llvm::Value* recv = lowerExpr(*ma->target);
                     if (isEqualsCall) {
@@ -7208,9 +7322,25 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                 // the default Equals/GetHashCode on a class mis-lowered: a bare
                 // field load that returned false and crashed an `if` branch with
                 // `br i32` (defects 1 + 3). Mirrors the ToString gate above.
+                //
+                // fix #4120 (stdlib §10.1/§10.2/§10.3, v0.295): same
+                // `isFfiBufferTypeRef` exclusion as the two ToString
+                // occurrences above (see the first one's comment for the
+                // scoping rationale) — a CString/WString/RawBytes receiver
+                // is NOT "a concrete CLASS receiver" in the sense this
+                // comment means (no vtable, no Object header); it must not
+                // join isNamedClassRecv here either, or Equals/GetHashCode
+                // read the same misinterpreted memory ToString did. Measured:
+                // `RawBytes.From(arr).GetHashCode()` returned a value read
+                // from inside the receiver's OWN byte buffer, not a real
+                // identity hash. These three now get a correct §8.3
+                // reference-identity default via `isBuiltinIdentityRecv`
+                // above instead (this `isNamedClassRecv` is excluded only as
+                // a backstop). A genuine user/imported class is unaffected.
                 bool isNamedClassRecv =
                     recvTy && recvTy->kind == K::Named && recvTy->declaration &&
-                    recvTy->declaration->kind == ast::TypeDeclKind::Class;
+                    recvTy->declaration->kind == ast::TypeDeclKind::Class &&
+                    !isFfiBufferTypeRef(recvTy);
                 if (isObjectRecv || isIfaceRecv || isNamedClassRecv) {
                     llvm::Value* recv = lowerExpr(*ma->target);
                     if (isEqualsCall) {
@@ -14085,6 +14215,20 @@ llvm::Value* Emitter::lowerNullCondCall(const ast::CallExpr& call,
                     recvTy0->kind == sema::TypeRef::Kind::Named &&
                     recvTy0->declaration &&
                     recvTy0->declaration->kind == ast::TypeDeclKind::Interface;
+                // NOT widened by fix #4120: the `?.` nullable sibling of the
+                // three `.`-form occurrences fixed elsewhere in this file
+                // (`someCString?.ToString()`) shares the SAME defect shape,
+                // but this function has no `builtinTypeName`-based qualified-
+                // name/identity replacement dispatch to fall back to the way
+                // the `.` form's literal chain and `isBuiltinIdentityRecv`
+                // do — excluding CString/WString/RawBytes here with no
+                // replacement risks the same "wrong value -> crash"
+                // regression #4120's `.`-form fix found and avoided (see that
+                // fix's own comment). Left as-is deliberately; measured and
+                // recorded on issue 4126 (the `?.` form still degrades
+                // `someCString?.ToString()` to `null` via the #2434
+                // zero-initialized-slot fallback) rather than fixed blind
+                // here.
                 bool ncoIsClass =
                     recvTy0->kind == sema::TypeRef::Kind::Named &&
                     recvTy0->declaration &&

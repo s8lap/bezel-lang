@@ -820,10 +820,13 @@ BEZEL_TEST(builtin_registry_snapshot, disposable_builtin_head_name_set_spec_28_3
 // deliberately does not name them) stay OUT — they render lowercase or
 // not at all, respectively.
 BEZEL_TEST(builtin_registry_snapshot, builtin_class_module_path_set) {
-    static constexpr std::array<std::string_view, 79> kSnapshot = {
+    static constexpr std::array<std::string_view, 82> kSnapshot = {
         // §2 System — §2.5/§2.6 value-builtins whose box thunk renders the
         // type-name literal (fix #3119 (a)).
         "DateTime", "TimeSpan", "DateOnly", "TimeOnly", "Guid",
+        // fix #4120 (stdlib §10.1/§10.2/§10.3, v0.295): the FFI-boundary
+        // buffer classes — §10's preamble states they live in `System`.
+        "CString", "WString", "RawBytes",
         // §2.17 — built-in EXCEPTIONS, all in `System`.
         "Exception", "ArgumentException", "ArgumentNullException",
         "ArgumentOutOfRangeException", "ArithmeticException", "OverflowException",

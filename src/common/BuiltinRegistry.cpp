@@ -1122,7 +1122,7 @@ struct BuiltinClassModulePath {
     std::string_view name;
     std::string_view modulePath;
 };
-constexpr std::array<BuiltinClassModulePath, 79> kBuiltinClassModulePaths = {{
+constexpr std::array<BuiltinClassModulePath, 82> kBuiltinClassModulePaths = {{
     // stdlib §2 (System) — the §2.5/§2.6 temporal/identity value types are
     // value-shaped (§3.1) but their BOX thunk (`valueBuiltinBoxToStringThunk`)
     // is in the §8.5 default path, so they belong here too.
@@ -1131,6 +1131,16 @@ constexpr std::array<BuiltinClassModulePath, 79> kBuiltinClassModulePaths = {{
     {"DateOnly", "System"},
     {"TimeOnly", "System"},
     {"Guid", "System"},
+    // fix #4120 (stdlib §10.1/§10.2/§10.3, v0.295): the FFI-boundary BUFFER
+    // classes (`kFfiBufferBuiltins` above) — "types of §10.0-§10.4 live in
+    // the System module and are auto-imported" (stdlib §10 preamble). Class-
+    // shaped (heap-allocated, `decl == nullptr`), no declared ToString
+    // override, so the §8.5 no-override default (qualified type name) is
+    // the correct rendering, read through this table by the same
+    // `LlvmBackend_Calls2.cpp` literal chain FrozenArray's row above serves.
+    {"CString", "System"},
+    {"WString", "System"},
+    {"RawBytes", "System"},
     // stdlib §2.17 (#1621): built-in EXCEPTIONS — all live in `System` per
     // the stdlib's section structure. Each renders as "System.<Name>".
     {"Exception", "System"},
