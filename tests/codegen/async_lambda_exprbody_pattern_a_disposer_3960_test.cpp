@@ -135,9 +135,24 @@ const char* kBlockBody =
 // wrongly ALSO attached; the two arms are mutually exclusive by construction
 // in emitAsyncPatternAResultDecision).
 std::string kind2ChainedProgram(bool neverAwaited) {
+    // issue #4119: the `neverAwaited` arm originally checked liveness only
+    // AFTER the `do...end` scope closed, so a premature (pre-#3960-fix) free
+    // and a correctly-deferred (post-fix) free both land on `n == 0` there -
+    // the row could not discriminate. Mirroring the awaited sibling below,
+    // `ChainAsync()`'s whole chain (ChainAsync -> f() -> await C3960.P()) has
+    // no genuine suspension - C3960.P() never awaits anything, so per the
+    // synchronous-prefix rule (spec §30.1, v0.295: "An exception thrown in
+    // the synchronous prefix of an async method (before any await) faults
+    // the returned task, not the immediate caller") the whole chain runs to
+    // completion synchronously before `C3960.ChainAsync()` even returns.
+    // `outer` is therefore already a COMPLETED task holding the chained
+    // Widget3960 the moment it is bound - added intermediate check confirms
+    // the widget is still alive at that point, before `outer`'s own
+    // disposal at `end;`.
     std::string mainBody = neverAwaited
         ? "  do "
           "    using var outer := C3960.ChainAsync(); "
+          "    if Widget3960.n <> 1 then return 94; end; "
           "  end; "
           "  if Widget3960.n <> 0 then return 92; end; "
           "  return 0; "
