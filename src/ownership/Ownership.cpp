@@ -8779,6 +8779,32 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
     }
     if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(&s)) {
         if (es->expr) {
+            // fix #3951 (§28.3 K1.3/K3.5, v0.295): a bare-statement `owned`-
+            // parameter transfer (`Sink.Take(move x);`) inside a lambda body
+            // never recorded the move — `visitStmt`'s own ExpressionStmt arm
+            // (Ownership.cpp) runs `handleDischarge` for exactly this shape at
+            // the method level, but the dataflow that drives `visitStmt` never
+            // enters a lambda body (see this function's header comment), so
+            // this pre-pass is the only place left to run it. Without this,
+            // `x`'s obligation stayed "never discharged" for the REST of this
+            // walk: `everDischarged_` (consulted by the end-of-method auto-drop
+            // loop, Ownership.cpp ~1131) never gained `x`'s symbol, so a
+            // properly-discharged lambda-body local drew the spurious "owned
+            // value is implicitly disposed... auto-drop" warning; and a SECOND
+            // consume of the same local was silently accepted (`states_` never
+            // saw it move to MovedFrom), passing the moved-from local's now-
+            // null slot into the second `owned` sink — measured: SIGSEGV /
+            // AddressSanitizer SEGV (null-pointer read) in the callee, for
+            // `Sink.Take(move x); Sink.Take(move x);` inside a lambda body, rc=0
+            // with zero ownership diagnostics. The byte-identical method-body
+            // spelling is correctly rejected ("owned value in `x` was already
+            // moved out at this point (§28.3)") since #3949. Run BEFORE the
+            // nested-lambda collection below — mirrors `visitStmt`'s own
+            // ordering and neither call observes state the other one sets: a
+            // NESTED lambda gets its own fresh `states_`
+            // (`applyUsingVarBorrowPinInLambdaBody`), so this call cannot
+            // affect it. // per §28.3 K1.3/K3.5, v0.295
+            handleDischarge(*es->expr);
             std::vector<const ast::LambdaExpr*> nestedLambdas;
             collectBodyLambdasExpr(*es->expr, nestedLambdas);
             for (const ast::LambdaExpr* nested : nestedLambdas)
@@ -8787,6 +8813,46 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
         return;
     }
     if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&s)) {
+        // fix #3951 (§28.3 K1.3/K3.5, v0.295): the ASSIGNMENT-RHS sibling of
+        // the ExpressionStmt fix above — `t := t + Sink.Take(move x);` inside
+        // a lambda body. Deliberately NARROW: only `checkRead` (the read-
+        // position check) + `recordMovesIn` (the move-recording authority)
+        // over `as.value` — the two `states_`-only calls #3949 added to the
+        // real `handleAssignment` for exactly this RHS position — NOT the
+        // full `handleAssignment`, which also runs `checkBorrowStoreEscape` /
+        // `checkIndexerSetBorrowStoreEscape` / `checkRefOutLambdaCaptureOnStore`
+        // at their METHOD-scoped default. Those three are ALREADY run
+        // correctly-scoped for every lambda-body AssignmentStmt by
+        // `scanLambdaBodyBorrowStores` (`EscapeScope::LambdaBody`), called
+        // separately from `checkOneLambdaBodyEscapes`. Calling the full
+        // `handleAssignment` here ran them a SECOND time at the wrong scope
+        // and broke a sibling fix: `checkBorrowStoreEscape`'s own #3800 gate
+        // ("the skip is only sound at METHOD scope") checks
+        // `scope != EscapeScope::LambdaBody` — the unscoped call defaults to
+        // Method, so `b.a := r;` (a same-frame owned-field store of a
+        // borrowed-from local, #3800's own repro) wrongly took the move-on-
+        // read skip and called `markMovedByName("r", ...)`, which inserts
+        // `r` into the PERSISTENT `everDischarged_` set — persistent because
+        // `applyUsingVarBorrowPinInLambdas` only saves/restores `states_` /
+        // `fieldMovedFrom_`, not `everDischarged_`. That made the method-
+        // level end-of-scope loop (Ownership.cpp ~1131) believe `r` was
+        // already discharged and skip flagging its `autoDropAtScopeEnd`,
+        // which in turn made `seedLambdaBodyOwnedLocals`'s
+        // `localIsOwnedObligation` check (which reads exactly that flag)
+        // decline to seed `r` for the escape check — so the LATER, correctly
+        // `EscapeScope::LambdaBody`-scoped `checkBorrowStoreEscape` call
+        // could no longer find `r` as an owned source and silently accepted
+        // the store. Measured: 2308/2309 lit tests passed with the full
+        // `handleAssignment` call; the one regression was exactly
+        // `lambda_body_escape_3800__same_frame_owned_field_store_in_lambda_
+        // body_rejected.bzl` losing its rejection. Run before the
+        // nested-lambda collection so a nested lambda captured in
+        // `as.target`/`as.value` is unaffected (it gets its own fresh
+        // `states_`). // per §28.3 K1.3/K3.5, v0.295
+        if (as->value && !as->valueHasOwnedMarker &&
+            !isTopLevelConsumingForm(*as->value))
+            checkRead(*as->value, /*selfTarget=*/false);
+        if (as->value) recordMovesIn(*as->value);
         if (as->target) {
             std::vector<const ast::LambdaExpr*> nestedLambdas;
             collectBodyLambdasExpr(*as->target, nestedLambdas);
@@ -8817,8 +8883,28 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
             for (const ast::LambdaExpr* nested : nestedLambdas)
                 applyUsingVarBorrowPinInLambdaBody(*nested);
         }
+        // fix #3951 (§28.3 K1.3/K7, v0.295): mutually-exclusive-ARM save/
+        // restore, so #3951's new move-recording (handleAssignment /
+        // handleDischarge, added above) does not leak a move recorded on one
+        // arm into a SIBLING arm — this walker is flow-INSENSITIVE (no real
+        // CFG join), so without the restore, `if c then Sink.Take(move x);
+        // else Sink.Take(move x); end;` (each arm independently, and legally,
+        // consuming `x` — accepted at the method level since #3950) would
+        // read the `else` arm's `move x` as a re-move of an already-MovedFrom
+        // `x` and reject it as "already moved out" — a false reject on
+        // working code. Mirrors `handleDischarge`'s own CaseExpr arm
+        // (Ownership_Checks.cpp), which saves/restores `states_` around each
+        // mutually-exclusive arm for the identical reason. Conservative in
+        // the other direction too: nothing an arm records survives past the
+        // whole `if`, matching this pre-pass's existing flow-insensitive
+        // stance elsewhere (`seedLambdaBodyOwnedLocals`'s header comment:
+        // imprecision "cannot admit an escape, only over-reject one" is
+        // accepted; here the equivalent is "cannot admit a false accept,
+        // only under-detect a real one"). // per §28.3 K1.3/K7, v0.295
+        BlockState savedIfStates = states_;
         for (const auto& bs : ifs->ifBranch.body)
             if (bs) applyUsingVarBorrowPinInLambdaStmt(*bs);
+        states_ = savedIfStates;
         for (const auto& el : ifs->elifBranches) {
             if (el.condition) {
                 std::vector<const ast::LambdaExpr*> nestedLambdas;
@@ -8828,9 +8914,11 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
             }
             for (const auto& bs : el.body)
                 if (bs) applyUsingVarBorrowPinInLambdaStmt(*bs);
+            states_ = savedIfStates;
         }
         for (const auto& bs : ifs->elseBody)
             if (bs) applyUsingVarBorrowPinInLambdaStmt(*bs);
+        states_ = std::move(savedIfStates);
         return;
     }
     if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&s)) {
@@ -8840,8 +8928,20 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
             for (const ast::LambdaExpr* nested : nestedLambdas)
                 applyUsingVarBorrowPinInLambdaBody(*nested);
         }
+        // fix #3951 (§28.3 K1.3, v0.295): save/restore around the loop body —
+        // this walker has no real fixpoint over back edges (unlike the
+        // method-level dataflow), so it cannot know whether the body runs 0,
+        // 1, or N times. Restoring afterward means a move recorded inside the
+        // body never leaks to code after the loop as a false "already moved"
+        // — the same under-detect-not-over-reject stance as the IfStmt arm
+        // above, applied to "maybe executed at all" instead of "mutually
+        // exclusive". A double-move WITHIN one straight-line pass through the
+        // body (this fix's own repro shape) is still caught, since the walk
+        // through the body itself is sequential. // per §28.3 K1.3, v0.295
+        BlockState savedWhileStates = states_;
         for (const auto& bs : ws->body)
             if (bs) applyUsingVarBorrowPinInLambdaStmt(*bs);
+        states_ = std::move(savedWhileStates);
         return;
     }
     if (auto* fs = dynamic_cast<const ast::ForStmt*>(&s)) {
@@ -8857,8 +8957,13 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
             for (const ast::LambdaExpr* nested : nestedLambdas)
                 applyUsingVarBorrowPinInLambdaBody(*nested);
         }
+        // fix #3951 (§28.3 K1.3, v0.295): same save/restore as the WhileStmt
+        // arm above, and for the same reason (a for-loop body may run 0, 1,
+        // or N times). // per §28.3 K1.3, v0.295
+        BlockState savedForStates = states_;
         for (const auto& bs : fs->body)
             if (bs) applyUsingVarBorrowPinInLambdaStmt(*bs);
+        states_ = std::move(savedForStates);
         return;
     }
     if (auto* db = dynamic_cast<const ast::DoEndBlock*>(&s)) {
@@ -8894,9 +8999,23 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
         return;
     }
     if (auto* trys = dynamic_cast<const ast::TryStmt*>(&s)) {
+        // fix #3951 (§28.3 K1.3/§28.8.1, v0.295): a `try` body may throw and
+        // unwind to a catch arm at ANY statement inside it, so a move
+        // recorded partway through the body is not a reliable fact for a
+        // catch arm (or `finally`) to see — each of those must be reachable
+        // from the state as of ENTERING the try, not from wherever the body
+        // walk happened to land. Save before the body, restore before each
+        // catch arm and before `finally`, and restore once more after the
+        // whole statement so nothing the try/catch/finally did leaks past
+        // it — the same conservative, mutually-exclusive-arm stance as the
+        // IfStmt/CaseStmt arms. A double-move straight through the BODY
+        // alone (no intervening throw) is still caught, since the body's own
+        // walk is sequential. // per §28.3 K1.3, §28.8.1, v0.295
+        BlockState savedTryStates = states_;
         for (const auto& bs : trys->body)
             if (bs) applyUsingVarBorrowPinInLambdaStmt(*bs);
         for (const auto& arm : trys->catches) {
+            states_ = savedTryStates;
             if (arm.guard) {
                 std::vector<const ast::LambdaExpr*> nestedLambdas;
                 collectBodyLambdasExpr(*arm.guard, nestedLambdas);
@@ -8905,8 +9024,10 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
             }
             if (arm.body) applyUsingVarBorrowPinInLambdaStmt(*arm.body);
         }
+        states_ = savedTryStates;
         for (const auto& bs : trys->finallyBody)
             if (bs) applyUsingVarBorrowPinInLambdaStmt(*bs);
+        states_ = std::move(savedTryStates);
         return;
     }
     if (auto* cs = dynamic_cast<const ast::CaseStmt*>(&s)) {
@@ -8916,7 +9037,15 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
             for (const ast::LambdaExpr* nested : nestedLambdas)
                 applyUsingVarBorrowPinInLambdaBody(*nested);
         }
+        // fix #3951 (§28.3 K1.3/K7, v0.295): mutually-exclusive-ARM save/
+        // restore, mirroring the IfStmt arm above and `handleDischarge`'s own
+        // CaseExpr arm (Ownership_Checks.cpp) — each `case` arm is a
+        // mutually-exclusive branch, so a move recorded in one arm must not
+        // be visible to a sibling arm or to code after the whole `case`.
+        // // per §28.3 K1.3/K7, v0.295
+        BlockState savedCaseStates = states_;
         for (const auto& arm : cs->arms) {
+            states_ = savedCaseStates;
             if (arm.guard) {
                 std::vector<const ast::LambdaExpr*> nestedLambdas;
                 collectBodyLambdasExpr(*arm.guard, nestedLambdas);
@@ -8932,6 +9061,7 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
             for (const auto& bs : arm.stmts)
                 if (bs) applyUsingVarBorrowPinInLambdaStmt(*bs);
         }
+        states_ = std::move(savedCaseStates);
         return;
     }
     // Break / Continue / etc.: no child expressions reachable.
