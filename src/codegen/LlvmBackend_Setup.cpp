@@ -17134,6 +17134,143 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
         }
     }
 
+    // fix #4093 / §29.1 / §30.7 / §28.3 (v0.295): the IAsyncEnumerator<T> /
+    // IOwningAsyncEnumerator<T> ASYNC-ITERATOR-FRAME twin of the sync
+    // iterator-format `isSyncIterEnum` arm above — moved OUT of the
+    // `await using` branch where it previously lived, because it was gated on
+    // `isAwaitUsing` and so missed the plain `using var e := Gen();` spelling
+    // where `Gen` is an async iterator method returning one of those heads
+    // DIRECTLY (the §30.7 enumerator-direct-return form, the owning sibling
+    // of `IAsyncEnumerator<T>`-direct fixed under #759). Pre-#4093 the
+    // enumerator OBJECT (a 64-byte state-machine frame allocated by the
+    // construction entry, `bz$M.Gen$Produce` in the trace) was never
+    // registered for scope-end disposal; the iterator-format Dispose vtable
+    // slot 1 (the same slot-1-Dispose path the sync `isSyncIterEnum` arm
+    // takes for IOwningEnumerable/IOwningEnumerator/IEnumerator/IEnumerable)
+    // was never wired up, and the frame survived every iteration's scope end
+    // — measured: 3200 B / 50 allocs for a 50-iteration `using var e :=
+    // Gen();` loop, the enumerator-object remainder after #4092's
+    // yielded-value portion is subtracted.
+    //
+    // The arm handles both spellings now because the iterator-format slot-1
+    // Dispose is synchronous regardless of whether the binding was
+    // `using var` or `await using var` (the iterator-format frame's vtable
+    // layout `[0]=td,[1]=Dispose,[2]=MoveNextAsync,[3]=Current` puts the
+    // sync Dispose at slot 1 — `await using` would await an IAsyncDisposable
+    // `DisposeAsync`, but the iterator-format frame does not carry one; §30.7
+    // verbatim says the sync fallback (§29.7) runs for an iterator-format
+    // `await using`, the same fallback #3437 already wired for
+    // IOwningAsyncEnumerable). // per §29.1, §30.7, §28.3, #4093, #759, #3437
+    if (ld->initializer) {
+        if (const sema::TypeRef* lt = ctx_.exprType(*ld->initializer)) {
+            bool isAsyncIterEnum =
+                lt->kind == sema::TypeRef::Kind::Named && !lt->declaration &&
+                lt->astNode && lt->astNode->name &&
+                !lt->astNode->name->parts.empty() &&
+                (lt->headName() == "IAsyncEnumerator" ||
+                 lt->headName() == "IOwningAsyncEnumerator");
+            if (isAsyncIterEnum) {
+                // fix #2356 / §29.3 §29.8 §29.11 (v0.234): a hand-written
+                // `using var en := src.GetAsyncEnumerator();` (or its
+                // `await using` twin) where `src` is a NAMED local/param/field
+                // of an owned-param async-iterator type. For such an iterator,
+                // vtable slot 4 (GetAsyncEnumerator, LlvmBackend_Async.cpp's
+                // `hasOwnedParamCapture` branch) returns `self` unchanged:
+                // §29.8's affine owned parameter cannot be duplicated across
+                // two frames, so the enumerABLE and the enumerATOR are
+                // literally the SAME heap object. `en` therefore ALIASES
+                // `src` at runtime — statically indistinguishable from the
+                // ordinary case, since a user `IAsyncEnumerable<T>`
+                // implementation (or the no-owned-param clone path, #1268)
+                // returns a genuinely INDEPENDENT object, and only a
+                // runtime identity check can tell the two apart. Without
+                // this guard, `en`'s own scope-end disposal (below) AND
+                // `src`'s separately-registered named-local scope-end
+                // disposal both fire on the SAME object — a double free /
+                // use-after-free.
+                //
+                // `await for`'s own desugaring (lowerAwaitFor,
+                // LlvmBackend_Stmts.cpp, `afor.enown`) has carried the
+                // identical runtime select since #1268; this mirrors it for
+                // the hand-written manual-protocol spelling. Gated on the
+                // receiver being a NAMED symbol (Local/Parameter/Field/
+                // auto-property, matching lowerAwaitFor's own
+                // `sourceIsNamedLocal` test) — an UNBOUND temporary
+                // receiver (`Gen().GetAsyncEnumerator()`) has no competing
+                // disposal to alias against, and is already handled at the
+                // call site (LlvmBackend_Calls2.cpp's GetAsyncEnumerator
+                // lowering, the `!ctx_.exprSymbol` branch) by disposing the
+                // temporary inline instead.
+                llvm::AllocaInst* ownSlot = it->second;
+                if (auto* ce = dynamic_cast<const ast::CallExpr*>(
+                        ld->initializer.get())) {
+                    if (auto* gma = dynamic_cast<const ast::MemberAccessExpr*>(
+                            ce->callee.get())) {
+                        if (gma->member == "GetAsyncEnumerator" &&
+                                gma->target) {
+                            // fix #2485 (§9.2/§22.8/§29.8, v0.235):
+                            // isAutoPropertyStorageSymbol — the manual-protocol
+                            // `.GetAsyncEnumerator()` twin of the sibling
+                            // fixes above; an imported auto-property
+                            // receiver was misclassified as unnamed, so
+                            // the self-alias guard never armed and the
+                            // enumerator's own scope-end disposal
+                            // collided with the source's separate
+                            // disposal (double free / use-after-free).
+                            bool srcIsNamed = false;
+                            if (sema::Symbol* sym =
+                                    ctx_.exprSymbol(*gma->target)) {
+                                if (dynamic_cast<sema::LocalSymbol*>(sym) ||
+                                    dynamic_cast<sema::ParameterSymbol*>(
+                                        sym) ||
+                                    dynamic_cast<sema::FieldSymbol*>(sym)) {
+                                    srcIsNamed = true;
+                                } else if (auto* ps = dynamic_cast<
+                                               sema::PropertySymbol*>(sym)) {
+                                    srcIsNamed =
+                                        sema::isAutoPropertyStorageSymbol(
+                                            ps, ctx_);
+                                }
+                            }
+                            if (srcIsNamed) {
+                                llvm::Value* srcPtr =
+                                    lowerExpr(*gma->target);
+                                if (srcPtr) {
+                                    llvm::Value* enPtr = builder_.CreateLoad(
+                                        ptrTy(), it->second,
+                                        "en.aliascheck");
+                                    llvm::Value* enumIsSrc =
+                                        builder_.CreateICmpEQ(
+                                            enPtr, srcPtr, "en.selfen");
+                                    auto* guarded = entryAlloca(ptrTy());
+                                    builder_.CreateStore(
+                                        builder_.CreateSelect(
+                                            enumIsSrc,
+                                            llvm::ConstantPointerNull::get(
+                                                ptrTy()),
+                                            enPtr, "en.disposeguard"),
+                                        guarded);
+                                    // Frame-back it (#792): this decl's own
+                                    // scope may end after further `await`s,
+                                    // and a plain stack alloca would not
+                                    // survive a cross-suspend resume.
+                                    if (smStateStruct_ && smSelf_)
+                                        asyncHandlerSpillSlots_.push_back(
+                                            guarded);
+                                    ownSlot = guarded;
+                                }
+                            }
+                        }
+                    }
+                }
+                Disposal d{ownSlot, nullptr};
+                d.iterEnumDispose = true;
+                disposeStack_.back().push_back(d);
+                return;
+            }
+        }
+    }
+
     // stdlib §6.10 (v0.175, #808): an `await using var` (or, defensively, a
     // `using var` that slipped past the ownership §6.10 reject) bound to a
     // TaskScope. Recognised BEFORE the generic isAwaitUsing branch below —
@@ -17399,124 +17536,6 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
                 }
             }
             if (isAwaitCollection) return;
-        }
-        // issue #759 (UNMASK): an async-iterator enumerator frame
-        // (IAsyncEnumerator<T> / IOwningAsyncEnumerator<T>) has the iterator vtable
-        // layout [0]=td,[1]=Dispose,[2]=MoveNextAsync,[3]=Current. The generic
-        // asyncDispose path below reclaims via emitDynamicDispose → vtable SLOT 2,
-        // which for THIS frame is MoveNextAsync (not Dispose) — calling it then
-        // freeing the frame corrupts the heap. Route scope-end disposal through
-        // the iterator-format slot-1 Dispose (iterEnumDispose), exactly as the
-        // sync `for` / `await for` loops do (§29.7); it runs the state machine's
-        // pending finally blocks (state → -1) then frees the frame.
-        if (ld->initializer) {
-            if (const sema::TypeRef* lt = ctx_.exprType(*ld->initializer)) {
-                bool isAsyncIterEnum =
-                    lt->kind == sema::TypeRef::Kind::Named && !lt->declaration &&
-                    lt->astNode && lt->astNode->name &&
-                    !lt->astNode->name->parts.empty() &&
-                    (lt->headName() == "IAsyncEnumerator" ||
-                     lt->headName() == "IOwningAsyncEnumerator");
-                if (isAsyncIterEnum) {
-                    // fix #2356 / §29.3 §29.8 §29.11 (v0.234): a hand-written
-                    // `await using var en := src.GetAsyncEnumerator();` where
-                    // `src` is a NAMED local/param/field of an owned-param
-                    // async-iterator type. For such an iterator, vtable slot 4
-                    // (GetAsyncEnumerator, LlvmBackend_Async.cpp's
-                    // `hasOwnedParamCapture` branch) returns `self` unchanged:
-                    // §29.8's affine owned parameter cannot be duplicated across
-                    // two frames, so the enumerABLE and the enumerATOR are
-                    // literally the SAME heap object. `en` therefore ALIASES
-                    // `src` at runtime — statically indistinguishable from the
-                    // ordinary case, since a user `IAsyncEnumerable<T>`
-                    // implementation (or the no-owned-param clone path, #1268)
-                    // returns a genuinely INDEPENDENT object, and only a
-                    // runtime identity check can tell the two apart. Without
-                    // this guard, `en`'s own `await using` scope-end disposal
-                    // (below) AND `src`'s separately-registered named-local
-                    // scope-end disposal both fire on the SAME object — a
-                    // double free / use-after-free.
-                    //
-                    // `await for`'s own desugaring (lowerAwaitFor,
-                    // LlvmBackend_Stmts.cpp, `afor.enown`) has carried the
-                    // identical runtime select since #1268; this mirrors it for
-                    // the hand-written manual-protocol spelling. Gated on the
-                    // receiver being a NAMED symbol (Local/Parameter/Field/
-                    // auto-property, matching lowerAwaitFor's own
-                    // `sourceIsNamedLocal` test) — an UNBOUND temporary
-                    // receiver (`Gen().GetAsyncEnumerator()`) has no competing
-                    // disposal to alias against, and is already handled at the
-                    // call site (LlvmBackend_Calls2.cpp's GetAsyncEnumerator
-                    // lowering, the `!ctx_.exprSymbol` branch) by disposing the
-                    // temporary inline instead.
-                    llvm::AllocaInst* ownSlot = it->second;
-                    if (auto* ce = dynamic_cast<const ast::CallExpr*>(
-                            ld->initializer.get())) {
-                        if (auto* gma = dynamic_cast<const ast::MemberAccessExpr*>(
-                                ce->callee.get())) {
-                            if (gma->member == "GetAsyncEnumerator" &&
-                                    gma->target) {
-                                // fix #2485 (§9.2/§22.8/§29.8, v0.235):
-                                // isAutoPropertyStorageSymbol — the manual-protocol
-                                // `.GetAsyncEnumerator()` twin of the sibling
-                                // fixes above; an imported auto-property
-                                // receiver was misclassified as unnamed, so
-                                // the self-alias guard never armed and the
-                                // enumerator's own scope-end disposal
-                                // collided with the source's separate
-                                // disposal (double free / use-after-free).
-                                bool srcIsNamed = false;
-                                if (sema::Symbol* sym =
-                                        ctx_.exprSymbol(*gma->target)) {
-                                    if (dynamic_cast<sema::LocalSymbol*>(sym) ||
-                                        dynamic_cast<sema::ParameterSymbol*>(
-                                            sym) ||
-                                        dynamic_cast<sema::FieldSymbol*>(sym)) {
-                                        srcIsNamed = true;
-                                    } else if (auto* ps = dynamic_cast<
-                                                   sema::PropertySymbol*>(sym)) {
-                                        srcIsNamed =
-                                            sema::isAutoPropertyStorageSymbol(
-                                                ps, ctx_);
-                                    }
-                                }
-                                if (srcIsNamed) {
-                                    llvm::Value* srcPtr =
-                                        lowerExpr(*gma->target);
-                                    if (srcPtr) {
-                                        llvm::Value* enPtr = builder_.CreateLoad(
-                                            ptrTy(), it->second,
-                                            "en.aliascheck");
-                                        llvm::Value* enumIsSrc =
-                                            builder_.CreateICmpEQ(
-                                                enPtr, srcPtr, "en.selfen");
-                                        auto* guarded = entryAlloca(ptrTy());
-                                        builder_.CreateStore(
-                                            builder_.CreateSelect(
-                                                enumIsSrc,
-                                                llvm::ConstantPointerNull::get(
-                                                    ptrTy()),
-                                                enPtr, "en.disposeguard"),
-                                            guarded);
-                                        // Frame-back it (#792): this decl's own
-                                        // scope may end after further `await`s,
-                                        // and a plain stack alloca would not
-                                        // survive a cross-suspend resume.
-                                        if (smStateStruct_ && smSelf_)
-                                            asyncHandlerSpillSlots_.push_back(
-                                                guarded);
-                                        ownSlot = guarded;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    Disposal d{ownSlot, nullptr};
-                    d.iterEnumDispose = true;
-                    disposeStack_.back().push_back(d);
-                    return;
-                }
-            }
         }
         // fix #3437 (§28.12 / §29.1 / §28.9, v0.283): REPRESENTATION GUARD on
         // the generic fallback below. That fallback's premise is that the slot
