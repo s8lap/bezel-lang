@@ -3812,6 +3812,84 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                             builder_.CreateStore(
                                 builder_.getInt8(yieldIsNew ? 1 : 0), ownedFld);
                         }
+                        // fix #4092 (§29.2 / §30.7, v0.294): the ASYNC twin
+                        // of the sync §29 (#1120) block above — for an
+                        // `IAsyncEnumerable<C>` / `IAsyncEnumerator<C>`
+                        // iterator (iteratorElemIsOwnedClass_ set,
+                        // iterIsOwningIter_ clear by construction), the
+                        // YieldStmt must dispose the PREVIOUS outstanding
+                        // `current_val` before overwriting it (a 2nd+ yield)
+                        // AND set the owned flag for the new value based on
+                        // whether the yielded expression is a `new C(...)`
+                        // mint. Identical structure to the sync block
+                        // (same null guard, same dispose-prev-if-owned, same
+                        // owned-flag predicate), distinct basic-block
+                        // labels (`aity.prev.*`) so the IR is searchable
+                        // for the async-vs-sync axis. The emit-context
+                        // difference: `currentFn_` here is the async
+                        // iterator's `resumeFn` (set in LlvmBackend_Async.cpp
+                        // at line 3136, before the body lowering), so the
+                        // dispose-then-yield happens on the resume body,
+                        // not on MoveNext. Mutually exclusive with the sync
+                        // arm above by `smKind_` (Yield vs AsyncYield) and
+                        // mutually exclusive with the owning-form dispose
+                        // below by `iterIsOwningIter_` (this arm is for
+                        // `iterElemIsOwnedClass_`, which is gated on
+                        // `!isOwningIter` in the emitter). The owning-form
+                        // async counterpart lives at `#2621`'s
+                        // `iterIsOwningIter_` arm further down.
+                        else if (smKind_ == SuspendKind::AsyncYield &&
+                                 iterElemIsOwnedClass_) {
+                            llvm::Value* ownedFld = builder_.CreateStructGEP(
+                                smStateStruct_, smSelf_,
+                                iterCurrentValOwnedField_);
+                            // --- dispose previous if owned ---
+                            llvm::Value* prevVal = builder_.CreateLoad(
+                                iterElemTy_, cvField, "aity.prev");
+                            llvm::Value* prevIsNull = builder_.CreateICmpEQ(
+                                prevVal,
+                                llvm::ConstantPointerNull::get(ptrTy()),
+                                "aity.prevnull");
+                            auto* prevNonNullBB = llvm::BasicBlock::Create(
+                                llvm_, "aity.prev.nonnull", currentFn_);
+                            auto* prevContBB = llvm::BasicBlock::Create(
+                                llvm_, "aity.prev.cont", currentFn_);
+                            builder_.CreateCondBr(
+                                prevIsNull, prevContBB, prevNonNullBB);
+                            builder_.SetInsertPoint(prevNonNullBB);
+                            llvm::Value* prevOwned = builder_.CreateLoad(
+                                i8(), ownedFld, "aity.prevowned");
+                            llvm::Value* prevIsOwned = builder_.CreateICmpNE(
+                                prevOwned, builder_.getInt8(0),
+                                "aity.previso");
+                            auto* dispBB = llvm::BasicBlock::Create(
+                                llvm_, "aity.prev.disp", currentFn_);
+                            auto* skipBB = llvm::BasicBlock::Create(
+                                llvm_, "aity.prev.skip", currentFn_);
+                            auto* afterDispBB = llvm::BasicBlock::Create(
+                                llvm_, "aity.prev.after", currentFn_);
+                            builder_.CreateCondBr(
+                                prevIsOwned, dispBB, skipBB);
+                            builder_.SetInsertPoint(dispBB);
+                            emitDisposeAndReclaim(prevVal);
+                            builder_.CreateBr(afterDispBB);
+                            builder_.SetInsertPoint(skipBB);
+                            builder_.CreateBr(afterDispBB);
+                            builder_.SetInsertPoint(afterDispBB);
+                            builder_.CreateBr(prevContBB);
+                            builder_.SetInsertPoint(prevContBB);
+                            // --- set owned flag for new value ---
+                            // Same predicate as the sync arm: enumerator
+                            // owns it only when the expression is a direct
+                            // `new` mint; variable references (using-var
+                            // locals, params) are re-borrowed.
+                            bool yieldIsNew =
+                                dynamic_cast<const ast::NewExpr*>(
+                                    ys->value.get()) != nullptr;
+                            builder_.CreateStore(
+                                builder_.getInt8(yieldIsNew ? 1 : 0),
+                                ownedFld);
+                        }
                         // fix #2738 / §28.3 / §29.2 (v0.282): mirror the class-element gate above for
                         // the runtime-managed primitive element kind (non-nullable
                         // `string`). The YieldStmt's full-expression boundary

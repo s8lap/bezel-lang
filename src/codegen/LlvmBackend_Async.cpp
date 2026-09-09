@@ -2653,27 +2653,67 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
                             rn == "IOwningAsyncEnumerator");
         }
     }
+    // fix #4092 (§29.2 / §30.7, v0.294): the BORROWING async-iterator form
+    // (IAsyncEnumerable<T> / IAsyncEnumerator<T>) with a CLASS-TYPED element.
+    // Per §29.2 the enumerator owns the most-recently-yielded class value
+    // (when it was produced by `new C(...)`); the consumer's iteration
+    // variable is a §29.2 BORROW — the compiler refuses `x.Dispose()` against
+    // it — so the iterator is the sole party that can discharge the value.
+    // Pre-#4092 this arm had no codegen: the `current_val` trailing field
+    // survived into Dispose unchanged, leaking every `yield return new C()`
+    // on completion (2400 B / 150 allocs in a 50-iter × 3-yield `await for`
+    // loop, observed). Mirror the sync iterator's §29 (#1120) machinery —
+    // `elemIsOwnedClass` + a `current_val_owned` flag in the frame, with the
+    // YieldStmt's advance-dispose, the exhaustion dispose, and the iterator's
+    // Dispose all consulting the flag. Mutually exclusive with `isOwningIter`
+    // by construction (the owning form already has a single unconditional
+    // disposes via #2591's `disposeYieldedVal`; the borrow form needs the
+    // owned-flag gate because a `yield return <local>` is itself a borrow and
+    // must NOT be released here). Only fires on pointer element types so an
+    // unspecialized generic template (T unresolved → i32 placeholder) elides
+    // cleanly, matching the existing `isOwningIter && elemTy->isPointerTy()`
+    // gate at TakeCurrent (§29.1) and the sync #1120 `... isPointerTy()` gate.
+    bool elemIsOwnedClass = false;
+    if (!isOwningIter && elemSemaTy &&
+        elemSemaTy->kind == sema::TypeRef::Kind::Named &&
+        elemSemaTy->declaration != nullptr &&
+        (elemSemaTy->declaration->kind == ast::TypeDeclKind::Class ||
+         elemSemaTy->declaration->kind == ast::TypeDeclKind::Interface)) {
+        elemIsOwnedClass = true;
+    }
     // The per-advance MoveNextAsync result is Task<bool>; the await-result type
     // the Resume completes is bool (i1). asyncResultTy_ sizes bz_task_complete.
     asyncResultTy_ = i1();
 
-    // Frame: locals + [ T current_val, ptr perAdvanceTask, ptr pendingTask,
-    //                   ptr spill, ptr token ].
+    // Frame: locals + [ T current_val, i8 current_val_owned, ptr perAdvanceTask,
+    //                   ptr pendingTask, ptr spill, ptr token ].
     // §30.7 (v0.228, #1525): TOKEN_FIELD is the CancellationToken cell captured
     // by GetAsyncEnumerator(token) — null (CancellationToken.None) by default
     // (calloc-zeroed at construction), never cancels until GetAsyncEnumerator
     // stores a real token.
+    // fix #4092 (§29.2 / §30.7, v0.294): the `current_val_owned` i8 flag mirrors
+    // the sync iterator's §29 (#1120) discipline — 1 if the iterator owns the
+    // current_val (it was produced by `new C(...)`), 0 if it is a borrow (a
+    // `yield return <local>` re-borrow where the local's existing disposal
+    // handles release). Inserted between `current_val` and `perAdvanceTask` so
+    // the existing PER_ADVANCE_TASK/PENDING_TASK/SPILL/TOKEN offsets all shift
+    // by +1 and the constant arithmetic below stays correct. The flag is
+    // ALWAYS reserved in the layout (mirroring the sync iterator's `{elemTy,
+    // i8(), ptrTy()}` triplet) — only the BORROWING class-element codegen
+    // reads/writes it, but the slot is allocated to keep the frame shape
+    // uniform across owning, borrowing-class, and value-typed iterators.
     StateMachineFrame frame = buildStateMachineFrame(
-        ms, *ci.stmts, {elemTy, ptrTy(), ptrTy(), ptrTy(), ptrTy()},
+        ms, *ci.stmts, {elemTy, i8(), ptrTy(), ptrTy(), ptrTy(), ptrTy()},
         std::string("asynciter.") + std::string(ms->name));
     auto* stateStructTy = frame.structTy;
     const unsigned VTABLE_FIELD = frame.vtableField;
     const unsigned STATE_FIELD = frame.stateField;
     const unsigned CURRENT_VAL_FIELD = frame.currentValField;       // first trailing
-    const unsigned PER_ADVANCE_TASK_FIELD = frame.currentValField + 1;
-    const unsigned PENDING_TASK_FIELD = frame.currentValField + 2;
-    const unsigned SPILL_PTR_FIELD = frame.currentValField + 3;
-    const unsigned TOKEN_FIELD = frame.currentValField + 4;
+    const unsigned CURRENT_VAL_OWNED_FIELD = frame.currentValField + 1;  // fix #4092
+    const unsigned PER_ADVANCE_TASK_FIELD = frame.currentValField + 2;
+    const unsigned PENDING_TASK_FIELD = frame.currentValField + 3;
+    const unsigned SPILL_PTR_FIELD = frame.currentValField + 4;
+    const unsigned TOKEN_FIELD = frame.currentValField + 5;
     // The Resume completes the per-advance task; reuse asyncOuterTaskField_ for it.
     asyncOuterTaskField_ = PER_ADVANCE_TASK_FIELD;
     asyncPendingTaskField_ = PENDING_TASK_FIELD;
@@ -2947,6 +2987,22 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
             gb.CreateStructGEP(stateStructTy, clone, STATE_FIELD));
         gb.CreateStore(llvm::Constant::getNullValue(elemTy),
             gb.CreateStructGEP(stateStructTy, clone, CURRENT_VAL_FIELD));
+        // fix #4092 / §29.2 / §30.7 (v0.294): the byte-copy above copied a
+        // possibly-1 `current_val_owned` from the source (a partially-consumed
+        // source's last yield left it set). Null current_val on the line above,
+        // but a stale 1 in this slot would make a fresh iteration's own
+        // dispose branch fire against the freshly-yielded value on the WRONG
+        // cycle (the bit would be consulted BEFORE the first yield store
+        // resets it via #1120's pattern). Defensive clear to 0 — the only
+        // writes happen in the YieldStmt handler / `disposeCurrentValOnExhaust`/
+        // the iter's Dispose below, all of which also reset to 0 after dispose,
+        // so this clone-side zeroing is purely a defense for the
+        // first-MoveNext-of-a-fresh-clone path.
+        if (elemIsOwnedClass) {
+            gb.CreateStore(builder_.getInt8(0),
+                gb.CreateStructGEP(stateStructTy, clone,
+                                   CURRENT_VAL_OWNED_FIELD));
+        }
         gb.CreateStore(llvm::ConstantPointerNull::get(ptrTy()),
             gb.CreateStructGEP(stateStructTy, clone,
                                PER_ADVANCE_TASK_FIELD));
@@ -3471,6 +3527,21 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
         iterCurrentValField_ = CURRENT_VAL_FIELD;
         iterElemTy_ = elemTy;
         iterElemSemaTy_ = elemSemaTy;  // #1102B (nullable-value element coercion)
+        // fix #4092 (§29.2 / §30.7, v0.294): thread the BORROWING class-element
+        // ownership through the YieldStmt handler — the YieldStmt disposes the
+        // PREVIOUS owned `current_val` before overwriting it (mirror of sync
+        // §29 (#1120) `smKind_ == Yield && iterElemIsOwnedClass_`) and sets
+        // the owned flag for the new value based on whether the yielded
+        // expression is a direct `new C(...)` mint. The async frame's
+        // `current_val_owned` slot lives at `CURRENT_VAL_OWNED_FIELD`. Both
+        // are mutually exclusive with `iterIsOwningIter_` (`isOwningIter`
+        // already has #2591's unconditional dispose path and consumes
+        // `current_val` itself) — the borrow-class form is the only one that
+        // needs the flag.
+        iterElemIsOwnedClass_ = elemIsOwnedClass;
+        iterCurrentValOwnedField_ =
+            elemIsOwnedClass ? CURRENT_VAL_OWNED_FIELD : 0;
+        iterIsOwningIter_ = isOwningIter;  // fix #2621 §29.1 mirror
 
         // Publish the live sm*_ state BEFORE emitResumeDispatch so the emitDone
         // lambda below (which emitResumeDispatch runs before it itself publishes
@@ -3504,23 +3575,86 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
         // null guard, so whichever runs first leaves the slot null for the
         // other.
         auto disposeCurrentValOnExhaust = [&]() {
-            if (!isOwningIter || !elemTy->isPointerTy()) return;
-            llvm::Value* cvField = builder_.CreateStructGEP(
-                stateStructTy, self, CURRENT_VAL_FIELD);
-            llvm::Value* yv = builder_.CreateLoad(elemTy, cvField, "aity.ex.yv");
-            llvm::Value* isNull = builder_.CreateICmpEQ(
-                yv, llvm::ConstantPointerNull::get(ptrTy()), "aity.ex.yvnull");
-            auto* nonNullBB = llvm::BasicBlock::Create(
-                llvm_, "aity.ex.yv.nonnull", resumeFn);
-            auto* contBB = llvm::BasicBlock::Create(
-                llvm_, "aity.ex.yv.cont", resumeFn);
-            builder_.CreateCondBr(isNull, contBB, nonNullBB);
-            builder_.SetInsertPoint(nonNullBB);
-            emitDisposeAndReclaim(yv);
-            builder_.CreateStore(
-                llvm::ConstantPointerNull::get(ptrTy()), cvField);
-            builder_.CreateBr(contBB);
-            builder_.SetInsertPoint(contBB);
+            // OWNING form (existing #2627 fix): unconditional dispose of a
+            // non-null current_val — the §29.1 v0.236 contract transfers
+            // ownership at TakeCurrent, so a stale value at exhaustion is
+            // owned by the enumerator and must be released. The slot is then
+            // nulled so a later TakeCurrent raises InvalidOperationException.
+            if (isOwningIter && elemTy->isPointerTy()) {
+                llvm::Value* cvField = builder_.CreateStructGEP(
+                    stateStructTy, self, CURRENT_VAL_FIELD);
+                llvm::Value* yv = builder_.CreateLoad(
+                    elemTy, cvField, "aity.ex.yv");
+                llvm::Value* isNull = builder_.CreateICmpEQ(
+                    yv, llvm::ConstantPointerNull::get(ptrTy()),
+                    "aity.ex.yvnull");
+                auto* nonNullBB = llvm::BasicBlock::Create(
+                    llvm_, "aity.ex.yv.nonnull", resumeFn);
+                auto* contBB = llvm::BasicBlock::Create(
+                    llvm_, "aity.ex.yv.cont", resumeFn);
+                builder_.CreateCondBr(isNull, contBB, nonNullBB);
+                builder_.SetInsertPoint(nonNullBB);
+                emitDisposeAndReclaim(yv);
+                builder_.CreateStore(
+                    llvm::ConstantPointerNull::get(ptrTy()), cvField);
+                builder_.CreateBr(contBB);
+                builder_.SetInsertPoint(contBB);
+                return;
+            }
+            // fix #4092 (§29.2 / §30.7, v0.294): BORROWING class-element
+            // form — dispose iff the §29 (#1120) `current_val_owned` flag is
+            // set (the yield was a `new C(...)` mint). The flag's persistent
+            // guest-zero on a never-yielded frame makes this a safe no-op for
+            // any path that reaches exhaustion without ever entering the
+            // YieldStmt. Mirrors the sync iterator's exhaustive-dispose
+            // transition (LlvmBackend_Iterators.cpp after lowerBody, the
+            // §29 (#1120) `ity.last` block) and the dispose-yielded-val path
+            // in emitIteratorMethod's Dispose. Exactly-once across the three
+            // sites (yield-advance in YieldStmt, exhaust here, Dispose in
+            // emitFreeAndReturn below) under the same dispose-then-null
+            // invariant — whichever runs first leaves the slot null for the
+            // others, never a double-free. The owning form above already
+            // unconditionally disposes so this arm is `elemIsOwnedClass`-only
+            // by construction (mutually exclusive with `isOwningIter`).
+            if (elemIsOwnedClass && elemTy->isPointerTy()) {
+                llvm::Value* cvField = builder_.CreateStructGEP(
+                    stateStructTy, self, CURRENT_VAL_FIELD);
+                llvm::Value* ownedFld = builder_.CreateStructGEP(
+                    stateStructTy, self, CURRENT_VAL_OWNED_FIELD);
+                llvm::Value* yv = builder_.CreateLoad(
+                    elemTy, cvField, "aity.bex.yv");
+                llvm::Value* isNull = builder_.CreateICmpEQ(
+                    yv, llvm::ConstantPointerNull::get(ptrTy()),
+                    "aity.bex.yvnull");
+                auto* nonNullBB = llvm::BasicBlock::Create(
+                    llvm_, "aity.bex.yv.nonnull", resumeFn);
+                auto* contBB = llvm::BasicBlock::Create(
+                    llvm_, "aity.bex.yv.cont", resumeFn);
+                builder_.CreateCondBr(isNull, contBB, nonNullBB);
+                builder_.SetInsertPoint(nonNullBB);
+                llvm::Value* ownedByte = builder_.CreateLoad(
+                    i8(), ownedFld, "aity.bex.yvowned");
+                llvm::Value* isOwned = builder_.CreateICmpNE(
+                    ownedByte, builder_.getInt8(0), "aity.bex.yviso");
+                auto* dispBB = llvm::BasicBlock::Create(
+                    llvm_, "aity.bex.yv.disp", resumeFn);
+                auto* skipBB = llvm::BasicBlock::Create(
+                    llvm_, "aity.bex.yv.skip", resumeFn);
+                auto* afterBB = llvm::BasicBlock::Create(
+                    llvm_, "aity.bex.yv.after", resumeFn);
+                builder_.CreateCondBr(isOwned, dispBB, skipBB);
+                builder_.SetInsertPoint(dispBB);
+                emitDisposeAndReclaim(yv);
+                builder_.CreateBr(afterBB);
+                builder_.SetInsertPoint(skipBB);
+                builder_.CreateBr(afterBB);
+                builder_.SetInsertPoint(afterBB);
+                builder_.CreateStore(
+                    llvm::ConstantPointerNull::get(ptrTy()), cvField);
+                builder_.CreateStore(builder_.getInt8(0), ownedFld);
+                builder_.CreateBr(contBB);
+                builder_.SetInsertPoint(contBB);
+            }
         };
 
         // "Done" (exhausted / fall-off / state -1): complete the per-advance task
@@ -3735,12 +3869,7 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
             // calling TakeCurrent — the §29.1 "advanced-but-untaken" pending
             // value. Dispose it exactly once (null-guarded) and null the slot.
             // Mirrors the sync isOwningIter branch (unconditional dispose of a
-            // non-null current_val): the async frame carries no current_val_owned
-            // flag (there is no IAsyncEnumerable<owned T> flag form — only the
-            // owning interfaces transfer ownership per §29.1), so only the
-            // owning form (isOwningIter) with a pointer element type is handled.
-            // Null-guarded so full consumption (TakeCurrent already nulled the
-            // slot) and a re-entrant Dispose are no-ops — never a double-free.
+            // non-null current_val).
             // Runs BEFORE the owned-param/local sweeps, matching the sync
             // Dispose's ordering (disposeYieldedVal → disposeOwnedParams → …);
             // current_val is a dedicated trailing field that never aliases any
@@ -3760,6 +3889,68 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
                 emitDisposeAndReclaim(yv);
                 builder_.CreateStore(
                     llvm::ConstantPointerNull::get(ptrTy()), cvField);
+                builder_.CreateBr(contBB);
+                builder_.SetInsertPoint(contBB);
+            }
+            // fix #4092 (§29.2 / §30.7, v0.294): BORROWING class-element form
+            // — for IAsyncEnumerable<C> / IAsyncEnumerator<C> (with `C` a
+            // class), the enumerator owns the most-recently-yielded `new
+            // C(...)` value and the consumer's iteration variable is a §29.2
+            // BORROW the compiler REFUSES to `Dispose()` — so on iterator
+            // abandonment (break / exhaustion / explicit Dispose) the
+            // enumerator is the sole party that can discharge. Mirrors the
+            // sync iterator's `disposeYieldedVal` (LlvmBackend_Iterators.cpp
+            // `ity.yv.*` block — `elemIsOwnedClass` arm, NOT the
+            // `isOwningIter` arm above): null-guard `current_val`, gate on
+            // the §29 (#1120) `current_val_owned` flag byte (1 = enumerator
+            // owns the slot, set by YieldStmt's `isNew` predicate; 0 = `yield
+            // return <local>` re-borrow, the local's existing disposal
+            // handles it), dispose, then null both. Null-guarded so a
+            // re-entrant Dispose is a no-op; exactly-once across the three
+            // sites — yield-advance dispose in YieldStmt, exhaust dispose in
+            // `disposeCurrentValOnExhaust` above, and this disposal — all
+            // are dispose-then-null under the same null guard. Mutually
+            // exclusive with the owning form above by construction
+            // (`elemIsOwnedClass` is gated on `!isOwningIter`). Only fires
+            // on pointer element types so an unspecialized generic template
+            // (T unresolved → i32 placeholder) elides cleanly, matching the
+            // existing `elemTy->isPointerTy()` guard at the sync site.
+            if (elemIsOwnedClass && elemTy->isPointerTy()) {
+                llvm::Value* cvField = builder_.CreateStructGEP(
+                    stateStructTy, self, CURRENT_VAL_FIELD);
+                llvm::Value* ownedFld = builder_.CreateStructGEP(
+                    stateStructTy, self, CURRENT_VAL_OWNED_FIELD);
+                llvm::Value* yv = builder_.CreateLoad(
+                    elemTy, cvField, "aity.byv");
+                llvm::Value* isNull = builder_.CreateICmpEQ(
+                    yv, llvm::ConstantPointerNull::get(ptrTy()),
+                    "aity.byvnull");
+                auto* nonNullBB = llvm::BasicBlock::Create(
+                    llvm_, "aity.byv.nonnull", disposeFn);
+                auto* contBB = llvm::BasicBlock::Create(
+                    llvm_, "aity.byv.cont", disposeFn);
+                builder_.CreateCondBr(isNull, contBB, nonNullBB);
+                builder_.SetInsertPoint(nonNullBB);
+                llvm::Value* ownedByte = builder_.CreateLoad(
+                    i8(), ownedFld, "aity.byvowned");
+                llvm::Value* isOwned = builder_.CreateICmpNE(
+                    ownedByte, builder_.getInt8(0), "aity.byviso");
+                auto* dispBB = llvm::BasicBlock::Create(
+                    llvm_, "aity.byv.disp", disposeFn);
+                auto* skipBB = llvm::BasicBlock::Create(
+                    llvm_, "aity.byv.skip", disposeFn);
+                auto* afterBB = llvm::BasicBlock::Create(
+                    llvm_, "aity.byv.after", disposeFn);
+                builder_.CreateCondBr(isOwned, dispBB, skipBB);
+                builder_.SetInsertPoint(dispBB);
+                emitDisposeAndReclaim(yv);
+                builder_.CreateBr(afterBB);
+                builder_.SetInsertPoint(skipBB);
+                builder_.CreateBr(afterBB);
+                builder_.SetInsertPoint(afterBB);
+                builder_.CreateStore(
+                    llvm::ConstantPointerNull::get(ptrTy()), cvField);
+                builder_.CreateStore(builder_.getInt8(0), ownedFld);
                 builder_.CreateBr(contBB);
                 builder_.SetInsertPoint(contBB);
             }
@@ -4059,6 +4250,27 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
         smIterCleanupAtState_.clear();     // fix #1567 §29.7/§28.10 (v0.182)
         smIterEnumFrameSlot_.clear();      // §29.7 (#944)
         finallyBodyStack_.clear();
+        // fix #4092 (§29.2 / §30.7, v0.294): the iter* live state must be
+        // cleared at the close of the async-iterator emitter exactly like
+        // the sync iterator does after MoveNext (LlvmBackend_Iterators.cpp
+        // lines 2380-2382). emitAsyncIteratorMethod is reached mid-emission
+        // of an OUTER body by instantiateGenericSpecialization and the
+        // SmFrameSaveScope's restore (the comment block above) does NOT
+        // cover these flags; without this clear the next method compiled
+        // would observe a stale `iterElemIsOwnedClass_=true` /
+        // `iterCurrentValOwnedField_=<this frame>` pair and the next
+        // YieldStmt (in a wholly unrelated body) could consult the wrong
+        // field index. The iterElemIsRuntimeManagedPrimitive_ mirror is
+        // cleared for symmetry (the async iterator never sets it — #2738
+        // is sync-only — but the zero default is what every other state
+        // machine observes).
+        iterCurrentValField_ = 0;
+        iterElemTy_ = nullptr;
+        iterElemSemaTy_ = nullptr;
+        iterElemIsOwnedClass_ = false;
+        iterCurrentValOwnedField_ = 0;
+        iterIsOwningIter_ = false;
+        iterElemIsRuntimeManagedPrimitive_ = false;
     }
 }
 
