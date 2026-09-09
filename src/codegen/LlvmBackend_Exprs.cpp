@@ -6091,8 +6091,31 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                     // slot (LLVM GEP needs a pointer; a struct SSA value must
                     // be spilled first).
                     if (llvm::AllocaInst* slot = localSlot(*ma->target)) {
+                        // fix #3876 (§27.5 / stdlib §4.8, v0.295): a
+                        // DictionaryEntry local CAPTURED by a closure (§27.5)
+                        // has its `locals_` entry REBOUND to the ptr-sized
+                        // cell-HOLDER alloca (boxLocalSlot / lowerLambda's
+                        // env-restore loop, LlvmBackend_Exprs2.cpp) — the real
+                        // {K,V} struct lives in the heap cell the holder
+                        // points AT, not in the holder itself. GEP'ing
+                        // directly into `slot` (as this arm did pre-fix)
+                        // treated the 8-byte pointer holder as if it WERE the
+                        // {K,V} struct: in-bounds-but-garbage for a same-size
+                        // DictionaryEntry<int,int> ({i32,i32}, 8 B) and a
+                        // genuine stack-buffer-overflow for a wider one like
+                        // DictionaryEntry<string,int> ({ptr,i32}, 16 B) —
+                        // issue #3876's measured ASan stack-buffer-overflow.
+                        // `boxedStorage` is the existing §27.5 funnel every
+                        // other boxed read/write already goes through: it
+                        // dereferences the holder when `slot` is a capture
+                        // cell (loading the cell pointer and handing back ITS
+                        // address) and returns `slot` unchanged otherwise (an
+                        // ordinary, non-captured local) — so the pre-fix
+                        // non-captured behaviour is unaffected.
+                        llvm::Type* baseElemTy = nullptr;
+                        llvm::Value* base = boxedStorage(slot, baseElemTy);
                         llvm::Value* fieldPtr = builder_.CreateStructGEP(
-                            entryStTy, slot, fi, "de.fld");
+                            entryStTy, base, fi, "de.fld");
                         return builder_.CreateLoad(
                             entryStTy->getElementType(fi), fieldPtr, "de.load");
                     } else if (llvm::Value* v = lowerExpr(*ma->target)) {
@@ -6123,8 +6146,16 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                         llvm::Type* vTy = lowerTypeRef(tt->genericArgs[1]);
                         llvm::StructType* entryStTy =
                             llvm::StructType::get(llvm_, {kTy, vTy});
+                        // fix #3876 (§27.5 / stdlib §4.9, v0.295): same
+                        // capture-cell-holder-vs-heap-cell defect as the
+                        // DictionaryEntry arm above — see its comment. Route
+                        // through boxedStorage so a captured DrainedEntry
+                        // loop variable dereferences the shared cell instead
+                        // of GEP'ing the ptr-sized holder alloca directly.
+                        llvm::Type* baseElemTy = nullptr;
+                        llvm::Value* base = boxedStorage(slot, baseElemTy);
                         llvm::Value* fieldPtr = builder_.CreateStructGEP(
-                            entryStTy, slot, fi, "dde.fld");
+                            entryStTy, base, fi, "dde.fld");
                         return builder_.CreateLoad(
                             entryStTy->getElementType(fi), fieldPtr, "dde.load");
                     }
