@@ -945,8 +945,6 @@ bool isEventSubscribeCall(const ast::CallExpr& call,
            head == "AsyncEventSource" || head == "SharedEventSource";
 }
 
-namespace {
-
 // Recursively scan every `return EXPR;` reachable in statement `s` (the same
 // statement forms that can carry a nested return as
 // MethodOwnership::scanReturnsForWrapperReceiverBorrow, Ownership_Checks.cpp —
@@ -1025,8 +1023,6 @@ void scanReturnsAllFreshOwned(const ast::Stmt* s, const sema::SemaContext& ctx,
     // IncrementStmt / BreakStmt / ContinueStmt / ThrowStmt / LocalDecl: none
     // can carry a nested `return` of the enclosing method.
 }
-
-}  // namespace
 
 bool staticFactoryReturnsFreshOwned(const ast::MethodDecl& md,
                                     const sema::TypeRef* resultTy,

@@ -707,6 +707,17 @@ bool isEventSubscribeCall(const ast::CallExpr& call,
 // sound only opposite the callee-side borrow-return prohibition, §28.3
 // "Factory methods" non-normative note / borrow-lifetime rules; #1499).
 //
+// fix #4027: `scanReturnsAllFreshOwned` — the recursive `return`-path
+// walk this helper drives internally — is also exported (used by
+// ExprTypecheck's LambdaExpr arm to classify an UNTYPED lambda literal's
+// own body for `funcReturnOwned` inference; see #4027's own block-body
+// case). Per-statement descent matches `scanReturnsForWrapperReceiverBorrow`
+// (Ownership_Checks.cpp); see OwnershipFacts.cpp:958's own header comment
+// for the nested-closure descent rule.
+void scanReturnsAllFreshOwned(const ast::Stmt* s, const sema::SemaContext& ctx,
+                              const TypeParamResolver& resolveParam,
+                              bool& sawReturn, bool& allFresh);
+//
 // Callers must have already established `md.returnOwned == false` (an explicit
 // `owned` return is owned directly, without this rule). `resolveParam` is the
 // shared type-parameter resolver hook, threaded into isFreshOwnedClassProducer.

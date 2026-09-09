@@ -9608,6 +9608,77 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                 inferredReturn = taskTy;
             }
             lamTy->funcReturn = inferredReturn;
+            // fix #4027 (§28.3 *Factory methods and sourceless returns*,
+            // v0.295): an UNTYPED lambda literal — neither a return-type
+            // ascription (`hasAscription` true) NOR a target function type
+            // whose return slot is marked `owned` (`lamTargetRetOwned` true)
+            // NOR any target return at all (`lamTargetRet` null) — must
+            // still set `funcReturnOwned = true` on its inferred function
+            // type when its body UNCONDITIONALLY returns a fresh owned
+            // class production. Without this the producerState classifier
+            // at Ownership.cpp's CallExpr arm (~line 4597,
+            // `calleeTy->kind == Function && calleeTy->funcReturnOwned`)
+            // classifies the call result BORROWED for the untyped lambda's
+            // own `() -> T` callee TypeRef — `lamTy->funcReturnOwned` is
+            // never set here even when the body's inferred return IS a
+            // fresh owned production — so the freshly-allocated object is
+            // never tracked for disposal and LEAKS (the issue's measured
+            // 16 B leak on `var f := lambda() => new Res(9); var c := f();`).
+            // Mirrors `staticFactoryReturnsFreshOwned` (OwnershipFacts.cpp)
+            // for the named-method / static-factory case: that helper is
+            // already consulted by producerState for every non-`owned`
+            // static return whose body is unambiguously fresh — the
+            // lambda form was simply never wired into the same signal.
+            // Gated on `!hasAscription && !lamTargetRetOwned && !lamTargetRet`:
+            //   - `!hasAscription` — the user explicitly typed the return,
+            //     do not override the declaration they wrote;
+            //   - `!lamTargetRetOwned` — the existing concrete-slot and
+            //     owned-target paths (#1820, #4005) already cover the case
+            //     where a target is present (target-side is read by
+            //     checkOneLambdaOwnedReturnDirectBorrow / -TaskFamilyBorrow
+            //     Return via `expectedFnType` OR'd into `effOwned` at
+            //     Ownership.cpp:9628, distinct from the lambda literal's
+            //     OWN `lamTy->funcReturnOwned` this fix populates);
+            //   - `!lamTargetRet` — when a target function type IS present
+            //     but its return slot is plain `T` (not `owned T`), the
+            //     concrete-slot callee-side admission (§28.3 *Concrete-slot
+            //     function bodies*) rejects the fresh-production return
+            //     path; marking the lambda literal's own `funcReturnOwned`
+            //     here would BOTH bypass that rejection (the OR'd
+            //     `expectedFnType` would be the dominant signal but the
+            //     lambda-literal type itself would still read as owned) and
+            //     flip the classifier when called against an unannotated
+            //     local — keep the two regimes separate.
+            // Gated on a class result type: a record/struct/enum/value-
+            // builtin return carries no heap obligation; the body's
+            // classification is correct but the call classifier never
+            // promotes such a return to Owned regardless of `owned`. // per
+            // §28.3, #4027
+            if (!hasAscription && !lamTargetRetOwned && !lamTargetRet &&
+                inferredReturn &&
+                inferredReturn->kind == sema::TypeRef::Kind::Named &&
+                inferredReturn->declaration &&
+                inferredReturn->declaration->kind ==
+                    ast::TypeDeclKind::Class &&
+                !inferredReturn->declaration->isValueBuiltin) {
+                auto identityResolver =
+                    [](const sema::TypeRef* t) { return t; };
+                bool bodyIsFreshOwned = false;
+                if (lam->exprBody) {
+                    bodyIsFreshOwned =
+                        common::isFreshOwnedClassProducer(
+                            lam->exprBody.get(), ctx_, identityResolver);
+                } else if (!lam->stmts.empty()) {
+                    bool sawReturn = false;
+                    bool allFresh = true;
+                    for (const auto& s : lam->stmts)
+                        common::scanReturnsAllFreshOwned(
+                            s.get(), ctx_, identityResolver,
+                            sawReturn, allFresh);
+                    bodyIsFreshOwned = sawReturn && allFresh;
+                }
+                if (bodyIsFreshOwned) lamTy->funcReturnOwned = true;
+            }
             ctx_.setExprType(lam, lamTy);
         }
     } else if (auto* ce = dynamic_cast<const ast::CaseExpr*>(&e)) {
