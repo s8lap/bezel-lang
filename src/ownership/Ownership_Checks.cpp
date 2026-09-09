@@ -10783,6 +10783,41 @@ bool MethodOwnership::ownedArgSourceIsBorrow(const ast::Expr& argValue) {
         }
     }
     const auto* id = dynamic_cast<const ast::IdentifierExpr*>(e);
+    // fix #4008 (§28.3 / §20, v0.294): a borrow returned through either
+    // arm of an `(if cond then A else B)` conditional expression
+    // (grammar A.7 `ConditionalExpr`) reached the `if (!id) return false;`
+    // short-circuit below and was never flagged. `ConditionalExpr` is a
+    // non-identifier expression form, so the bare-identifier gate did not
+    // see it; the runtime evaluates exactly one arm and if THAT arm is a
+    // borrow the caller's `owned` return-slot disposer and the borrow's
+    // real owner both dispose the same object, a heap-use-after-free
+    // measured under generated-code AddressSanitizer (#4008's repro at
+    // Ownership_Checks.cpp:10786 short-circuited without ever entering
+    // the bare-identifier arm of this classifier). Recurse into both
+    // `thenValue` and `elseValue` and return true iff EITHER arm is
+    // itself classified as a borrow. An elif chain right-nests in
+    // `elseValue` (grammar A.7), so the same recursion reaches every
+    // else-arm of an arbitrary `if/elif/.../else` chain without further
+    // work. The OR is conservative: a conditional where ONE arm is a
+    // borrow is rejected regardless of what the OTHER arm produces, on
+    // the ground that the runtime evaluates exactly one arm and the only
+    // sound answer is to require BOTH arms to be a fresh production.
+    // The recursive call sees the new move-unwrap above on the way in
+    // (a `move b` arm is unwrapped to the bare place `b` and recursed,
+    // so the inner borrow-classification branches fire correctly for a
+    // `move` arm too — the K3.4 arm-transfer marker check at the
+    // if-expression's own site reports independently of this recursion).
+    // The sibling CaseExpr is filed separately (#4008's own body defers
+    // it; structurally identical, but not independently measured). The
+    // sibling CallExpr-relay (#4009, a relayed call to a non-`owned`-
+    // returning callee) is filed separately and is the same `if (!id)
+    // return false;` short-circuit reached one call deeper; the fix
+    // here is the conditional-expression arm of that classifier only.
+    // // per §28.3, §20, #4008
+    if (auto* ce = dynamic_cast<const ast::ConditionalExpr*>(e)) {
+        return (ce->thenValue && ownedArgSourceIsBorrow(*ce->thenValue)) ||
+               (ce->elseValue && ownedArgSourceIsBorrow(*ce->elseValue));
+    }
     if (!id) return false;  // new / call / other member / literal: not flagged
     // §28.3 (issue #403): a bare `this` is Borrowed ("`this` | Borrowed (source:
     // caller)"). A class can never transfer ownership of itself, so `this` is
