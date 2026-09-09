@@ -1582,9 +1582,17 @@ bool isAutoEqualityBearingBodyRecord(const TypeSymbol* rec,
 //
 // #2047: `inst` is the concrete instantiation TypeRef (with genericArgs) when
 // known, so §28.1 per-instantiation erasure of `owned` payload markers applies
-// (`Result<int, string>` — markers erased — is auto-hashable). Null
-// judges against the bare template (a non-generic choice, or a nested-payload
-// recursive call where no instantiation is available).
+// (`Result<int, string>` — markers erased — is auto-hashable). Null judges
+// against the bare template (a non-generic choice, or a genuinely
+// uninstantiated context). fix #3933: a nested-payload recursive call (a
+// choice component inside another choice's own payload,
+// `isAdmissibleComponentType`'s Choice arm) DOES have an instantiation
+// available — the caller's own already-substituted component type — and must
+// thread it, or a nested choice is always judged at its bare declaration
+// regardless of what it is actually instantiated at (`Pair<Pair<int>>` was
+// falsely rejected this way: `Pair`'s bare, uninstantiated `T` payload
+// conservatively classifies borrow-bearing, so `Pair` read as inadmissible no
+// matter the argument).
 bool isAutoEqualityBearingChoice(const TypeSymbol* ch,
                                  const SemaContext& ctx,
                                  const TypeRef* inst = nullptr);

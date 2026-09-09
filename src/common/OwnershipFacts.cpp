@@ -1131,19 +1131,34 @@ bool isReferenceTypeForRecordField(const sema::TypeRef* rt) {
 // `choiceSeen` (#2159) is the shared cycle guard for the record↔choice mutual
 // recursion §9.7 transitivity opens (a record field of choice type consults the
 // choice classifier, whose payloads may recurse back into a record): the set of
-// choice TYPE SYMBOLS on the CURRENT classification path. Null at a pure-record
-// entry point (no choice frame open yet).
+// choice TypeRef INSTANTIATIONS on the CURRENT classification path. Null at a
+// pure-record entry point (no choice frame open yet).
 //
-// fix #3144 (family F9 of #3152): the guard is keyed on `sema::TypeSymbol`, not
-// on `ast::TypeDecl`. An IMPORTED choice has no `ast::TypeDecl` at all, so a
-// TypeDecl-keyed path set could not even represent it — every imported frame
-// would have hashed to the same null key and the guard would have fired on the
-// FIRST nested imported choice, silently reporting it value-like. The TypeSymbol
-// is the one identity both sides have.
+// fix #3144 (family F9 of #3152): the guard's key must be an identity both an
+// imported and a local choice have. An IMPORTED choice has no `ast::TypeDecl`
+// at all, so a TypeDecl-keyed path set could not even represent it — every
+// imported frame would have hashed to the same null key and the guard would
+// have fired on the FIRST nested imported choice, silently reporting it
+// value-like.
+//
+// fix #3933 (§35.11/§35.4, v0.295): the key was `sema::TypeSymbol*` — the bare
+// generic DECLARATION, shared by every instantiation of one generic choice
+// (`Pair<int>`, `Pair<Box>`, `Pair<Pair<Box>>` all point at the same `Pair`
+// TypeSymbol). Classifying `Pair<Pair<Box>>` inserts `Pair`'s decl, then
+// recurses into the INNER `Pair<Box>` instantiation while still on that
+// stack frame — same decl, so the guard fired as a false "self-referential
+// cycle" for a legitimate, non-recursive nesting at a DIFFERENT type
+// argument. Re-keyed on the `sema::TypeRef*` instantiation itself (the `rt`
+// each recursive call already carries, exactly the identity
+// `isBorrowBearingRecordCommon`'s own `seen` guard below uses for the same
+// record↔record problem, #2145) — two different instantiations of the same
+// generic choice no longer collide, while a genuine same-instantiation cycle
+// (independently rejected by §35.1/§9's no-self-containment rule; this guard
+// only defends against it) still terminates.
 bool isBorrowBearingRecordCommon(
     const sema::TypeRef* rt, const sema::SemaContext& ctx,
     std::unordered_set<const sema::TypeRef*>& seen, const RecordSubstEnv* env,
-    std::unordered_set<const sema::TypeSymbol*>* choiceSeen = nullptr);
+    std::unordered_set<const sema::TypeRef*>* choiceSeen = nullptr);
 
 // The §35.4 choice-classification core (defined below near classifyChoiceType),
 // forward-declared here so the record field walk can consult it for a Choice-
@@ -1152,7 +1167,7 @@ bool isBorrowBearingRecordCommon(
 std::optional<ChoiceClassification> classifyChoiceCore(
     const sema::TypeRef* rt, const sema::SemaContext& ctx,
     const RecordSubstEnv* env,
-    std::unordered_set<const sema::TypeSymbol*>& choiceSeen);
+    std::unordered_set<const sema::TypeRef*>& choiceSeen);
 
 // §28.1 (v0.226, #2130): the file-local `owned`-marker erasure oracle impl,
 // forward-declared here so classifyChoiceCore's owning leg can thread its
@@ -1160,7 +1175,7 @@ std::optional<ChoiceClassification> classifyChoiceCore(
 // typed payload opens. Defined alongside classifyChoiceCore below.
 bool ownedMarkerActiveOnInstantiatedTypeImpl(
     const sema::TypeRef* ft, const sema::SemaContext& ctx,
-    std::unordered_set<const sema::TypeSymbol*>& choiceSeen);
+    std::unordered_set<const sema::TypeRef*>& choiceSeen);
 
 // §9.7's borrow-carrying-field kinds, applied to one resolved field type in
 // the substitution environment `env` (which governs `ft`'s OWN bare-parameter
@@ -1170,7 +1185,7 @@ bool ownedMarkerActiveOnInstantiatedTypeImpl(
 bool recordFieldTypeIsBorrowCarryingCommon(
     const sema::TypeRef* ft, const sema::SemaContext& ctx,
     std::unordered_set<const sema::TypeRef*>& seen, const RecordSubstEnv* env,
-    std::unordered_set<const sema::TypeSymbol*>* choiceSeen = nullptr) {
+    std::unordered_set<const sema::TypeRef*>* choiceSeen = nullptr) {
     if (!ft) return false;
     // §9.7 transitivity / §4.14 / §4.15 (#2127): a builtin span VIEW field
     // (Span / ReadOnlySpan / ArraySpan / ReadOnlyArraySpan) carries a borrow
@@ -1223,7 +1238,7 @@ bool recordFieldTypeIsBorrowCarryingCommon(
             // choices are move-only and may not be a record field — rejected
             // separately), so only the borrow-bearing verdict matters here.
             if (ft->declaration->kind == ast::TypeDeclKind::Choice) {
-                std::unordered_set<const sema::TypeSymbol*> localChoiceSeen;
+                std::unordered_set<const sema::TypeRef*> localChoiceSeen;
                 auto& cs = choiceSeen ? *choiceSeen : localChoiceSeen;
                 auto cls = classifyChoiceCore(ft, ctx, env, cs);
                 return cls && *cls == ChoiceClassification::BorrowBearing;
@@ -1247,7 +1262,7 @@ bool recordFieldTypeIsBorrowCarryingCommon(
 bool isBorrowBearingRecordCommon(
     const sema::TypeRef* rt, const sema::SemaContext& ctx,
     std::unordered_set<const sema::TypeRef*>& seen, const RecordSubstEnv* env,
-    std::unordered_set<const sema::TypeSymbol*>* choiceSeen) {
+    std::unordered_set<const sema::TypeRef*>* choiceSeen) {
     if (!rt || rt->kind != sema::TypeRef::Kind::Named || !rt->declaration)
         return false;
     // fix #3145 (§2.8.3 rule 4, v0.252): the record test and the field walk both
@@ -1514,7 +1529,7 @@ bool payloadFieldTypeIsMoveOnly(
 bool payloadFieldTypeIsBorrowCarrying(
     const sema::TypeRef* ft,
     const sema::SemaContext& ctx,
-    std::unordered_set<const sema::TypeSymbol*>& choiceSeen,
+    std::unordered_set<const sema::TypeRef*>& choiceSeen,
     const RecordSubstEnv* env) {
     if (!ft) return false;
     switch (ft->kind) {
@@ -1596,7 +1611,7 @@ bool payloadFieldTypeIsBorrowCarrying(
 std::optional<ChoiceClassification> classifyChoiceCore(
     const sema::TypeRef* rt, const sema::SemaContext& ctx,
     const RecordSubstEnv* env,
-    std::unordered_set<const sema::TypeSymbol*>& choiceSeen) {
+    std::unordered_set<const sema::TypeRef*>& choiceSeen) {
     if (!rt || rt->kind != sema::TypeRef::Kind::Named || !rt->declaration)
         return std::nullopt;
     if (rt->declaration->kind != ast::TypeDeclKind::Choice)
@@ -1620,13 +1635,20 @@ std::optional<ChoiceClassification> classifyChoiceCore(
     // is recoverable; a data race is not.
     if (cases.empty()) return std::nullopt;
 
-    // #2159 cycle guard (PATH semantics): a choice already being classified on
-    // the current path — reached only through a record↔choice value cycle,
-    // itself rejected by §35.1/§9's no-self-containment rule, defended here —
-    // contributes no new borrow information; treat it as value-like FOR THIS
-    // EDGE and stop. Erased on exit so a SIBLING component re-classifies it
-    // under its own env (the #2145 diamond, applied to choices).
-    if (!choiceSeen.insert(decl).second)
+    // #2159 cycle guard (PATH semantics): a choice INSTANTIATION already being
+    // classified on the current path — reached only through a record↔choice
+    // value cycle, itself rejected by §35.1/§9's no-self-containment rule,
+    // defended here — contributes no new borrow information; treat it as
+    // value-like FOR THIS EDGE and stop. Erased on exit so a SIBLING component
+    // re-classifies it under its own env (the #2145 diamond, applied to
+    // choices).
+    //
+    // fix #3933 (§35.11/§35.4, v0.295): keyed on `rt` (the instantiation),
+    // not `decl` (the bare declaration) — see the header comment on
+    // `isBorrowBearingRecordCommon` above for the false-cycle this used to
+    // produce for a generic choice nested in itself at a DIFFERENT type
+    // argument (`Pair<Pair<Box>>`, `Pair<Pair<int>>`).
+    if (!choiceSeen.insert(rt).second)
         return ChoiceClassification::ValueLike;
 
     // §9.7 / §35.4 / §30.1 (#2183): this instantiation's substitution env for
@@ -1684,7 +1706,7 @@ std::optional<ChoiceClassification> classifyChoiceCore(
         // §35.4.3: VALUE-LIKE.
         return ChoiceClassification::ValueLike;
     }();
-    choiceSeen.erase(decl);
+    choiceSeen.erase(rt);
     return verdict;
 }
 
@@ -1704,7 +1726,7 @@ std::optional<ChoiceClassification> classifyChoiceCore(
 // frames re-classify under their own env (the #2145 diamond).
 bool ownedMarkerActiveOnInstantiatedTypeImpl(
     const sema::TypeRef* ft, const sema::SemaContext& ctx,
-    std::unordered_set<const sema::TypeSymbol*>& choiceSeen) {
+    std::unordered_set<const sema::TypeRef*>& choiceSeen) {
     if (!ft) return true;  // unknown → conservative (owning)
     switch (ft->kind) {
         case sema::TypeRef::Kind::InlineArray:
@@ -1758,7 +1780,7 @@ bool ownedMarkerActiveOnInstantiatedType(const sema::TypeRef* ft,
     // recursion (an `owned` payload whose type is a choice) consults the
     // file-local impl directly with the classifier's threaded `choiceSeen`,
     // which is where the #2130 cycle guard fires. // per §28.1, #2130
-    std::unordered_set<const sema::TypeSymbol*> choiceSeen;
+    std::unordered_set<const sema::TypeRef*> choiceSeen;
     return ownedMarkerActiveOnInstantiatedTypeImpl(ft, ctx, choiceSeen);
 }
 
@@ -1804,7 +1826,7 @@ std::optional<ChoiceClassification> classifyChoiceType(
     // recursion). `env` (default null) supplies substitutions for `rt`'s own
     // bare-parameter arguments when this choice is a component of an enclosing
     // generic type (#2183). Concrete `rt->genericArgs` are threaded regardless.
-    std::unordered_set<const sema::TypeSymbol*> choiceSeen;
+    std::unordered_set<const sema::TypeRef*> choiceSeen;
     return classifyChoiceCore(rt, ctx, env, choiceSeen);
 }
 

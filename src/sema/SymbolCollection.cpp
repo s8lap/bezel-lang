@@ -1644,8 +1644,25 @@ static bool isAdmissibleComponentType(const TypeRef* ty, const SemaContext& ctx,
             // is the same predicate used by isEqualityBearing as a hash-key
             // check (and codegen uses it to dispatch the choice-specific
             // Equals/GetHashCode synthesis) — see isAutoEqualityBearingChoice.
+            //
+            // fix #3933 (§35.11/§35.4/§9.2, v0.295): `ty` (this call's OWN
+            // parameter — already the substituted, fully-instantiated
+            // component type, e.g. `substitutedChoicePayloadType`'s result)
+            // was being discarded, so a nested choice component was always
+            // judged at its BARE, uninstantiated declaration — an
+            // uninstantiated generic choice's own bare-parameter payload
+            // conservatively classifies borrow-bearing (§9.7's documented
+            // "might carry a borrow" posture), which made `Pair` inadmissible
+            // as a component NO MATTER what it was instantiated at, falsely
+            // rejecting `Pair<Pair<int>>.Equals`/`=` (every payload `int`) as
+            // well as correctly-but-differently-reasoned `Pair<Pair<Box>>`.
+            // Threading `ty` mirrors the Record arm just above (which needs no
+            // such thread — records carry no `owned` markers, §9.7 — but
+            // §28.1's per-instantiation `owned`-marker erasure means a choice's
+            // admissibility genuinely depends on the instantiation, exactly as
+            // `checkEqualityMemberUseSite`'s own top-level call already does).
             if (decl->kind == ast::TypeDeclKind::Choice)
-                return isAutoEqualityBearingChoice(decl, ctx);
+                return isAutoEqualityBearingChoice(decl, ctx, ty);
             // class / interface — reference types are not admissible.
             return false;
         }
