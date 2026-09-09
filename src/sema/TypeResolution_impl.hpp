@@ -344,7 +344,9 @@ private:
     // out of scope. §35.1 states plainly: "Choices cannot have destructors,
     // constructors, instance fields, block-form or storage-backed
     // properties, indexers, or nested types — the same restriction set as
-    // enums (§10.5), for the same reasons." Mirrors checkEnumRestrictions's
+    // enums (§10.5), for the same reasons, plus one: a choice's instance
+    // storage IS its cases' payloads, declared in the case list and
+    // reachable only through matching." Mirrors checkEnumRestrictions's
     // non-dispatch-modifier member-kind checks (below) rather than
     // inventing a second spelling of the same decision — the dispatch-
     // modifier sub-rule stays checkChoiceDispatchModifiers's job so this

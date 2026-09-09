@@ -1008,7 +1008,8 @@ void Resolver::checkChoiceDispatchModifiers() {
 // have destructors, constructors, instance fields, block-form or
 // storage-backed properties, indexers, or nested types — the same
 // restriction set as enums (§10.5), for the same reasons, plus one: a
-// choice's instance storage IS its cases' payloads." §35.2 independently
+// choice's instance storage IS its cases' payloads, declared in the case
+// list and reachable only through matching." §35.2 independently
 // confirms the admitted-member list ("instance methods, expression-bodied
 // read-only instance properties, static methods, `static readonly`
 // fields..., `const` members, and operator overloads ... this list rejects
@@ -1030,11 +1031,12 @@ void Resolver::checkChoiceDispatchModifiers() {
 // both because §35.1 names a strictly larger reject set than §10.5's enum
 // list:
 //   - `destructor` is ALSO rejected here (§35.1 names it explicitly, cited
-//     under §8.7 by the spec's own Appendix A.9 over-admission-index row
-//     for `Member` in an enum-or-choice body); checkEnumRestrictions has NO
-//     destructor check at all (a separate, pre-existing enum-side gap this
-//     fix does not touch — filed alongside #3840's other enum/choice
-//     over-admission catalog).
+//     under §8.7 by the spec's own Appendix A "Shared-production
+//     over-admissions" index — an unnumbered table in the Appendix A
+//     preamble, before A.1 — in its `Member` in an enum-or-choice body
+//     row); checkEnumRestrictions has NO destructor check at all (a
+//     separate, pre-existing enum-side gap this fix does not touch —
+//     filed alongside #3840's other enum/choice over-admission catalog).
 //   - the `event` rejection is worded from §35.2's admitted-list boundary
 //     ("not part of" the list), not enum's/record's §24.1/§9.7 "not an
 //     owning disposable container" reasoning — an OWNING choice IS a real
@@ -1053,9 +1055,11 @@ void Resolver::checkChoiceDispatchModifiers() {
 // NOT covered — `t->members` never carries one (it is a distinct AST/side-
 // table construct, `TypeSymbol::invariantContracts`, not a `Symbol`
 // subclass at all), so neither this walk nor checkEnumRestrictions's can
-// see it; that gap (named in the spec's own Appendix A.9 row, "invariant by
-// §22.16") is uncovered for BOTH enum and choice bodies today and is
-// out of this fix's scope — filed separately.
+// see it; that gap (named in the spec's own Appendix A preamble's
+// "Shared-production over-admissions" index — the unnumbered table before
+// A.1 — in its `Member` in an enum-or-choice body row's "invariant by
+// §22.16" clause) is uncovered for BOTH enum and choice bodies today and
+// is out of this fix's scope — filed separately.
 void Resolver::checkChoiceRestrictions() {
     if (!ctx_.module()) return;
     forEachTypeAndNested([&](TypeSymbol* t) {
