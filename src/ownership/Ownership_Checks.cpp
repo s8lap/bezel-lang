@@ -2949,12 +2949,43 @@ void MethodOwnership::checkRead(const ast::Expr& e, bool selfTarget) {
     // `item?.Dispose()` discharge idiom (own_collection_trypop_831,
     // owned_set_take_1476 stay green — see the #3984 commit's FAIL-WITHOUT
     // sweep). // per §17.1, §28.3 K1.3/K7, §28.2, v0.295, issue 3984
+    //
+    // fix-forward (v0.295, R17): scoped guard, added on top of #3984 without
+    // touching the plain `CallExpr`/`MemberAccessExpr` arms above (issue 3975
+    // is an OWNER HOLD on whether a `move`-of-Disposed call ARGUMENT is a
+    // §28.2 warning or a §28.3 error, and those two arms' behavior on that
+    // question is the pre-existing status quo this fix-forward must not
+    // relitigate). `readNullCondReceiver` restores the PRE-#3984 status quo
+    // for exactly the `?.`/`?()` RECEIVER position: before #3984, `checkRead`
+    // had no arm for these two node kinds at all, so it never reached into a
+    // wrapped call's own argument list through them. #3984's actual, tested
+    // value (`nullcond_checkread_moved_from_disposed_3984_test.cpp`) is
+    // entirely about the receiver resolving to a TRACKED LOCAL (`xn?.tag`,
+    // `xn?.Get()`, `xn?.Dispose()`, all bare-identifier or nested-`?.`
+    // receivers) — none of its rows have a `CallExpr`/`NewExpr`/
+    // `NullCondCallExpr` receiver, so this guard costs it nothing. A fresh
+    // call/ctor result is never itself an entry in `states_` (never
+    // Disposed/MovedFrom), so recursing `checkRead` into ONE is never needed
+    // to answer "is the receiver itself bad" — it was only ever a side
+    // channel into that call's OWN argument walk, which `recordMovesIn`'s
+    // existing `NullCondMemberExpr`/`NullCondCallExpr` wrapper arms (this
+    // file, ~line 1045/1127, from #4003) already fully validate and mark
+    // regardless of whether `checkRead` ever visits them.
+    auto readNullCondReceiver = [&](const ast::Expr* op, bool selfTarget) {
+        if (!op || isTopLevelConsumingForm(*op)) return;
+        if (dynamic_cast<const ast::CallExpr*>(op) ||
+            dynamic_cast<const ast::NewExpr*>(op) ||
+            dynamic_cast<const ast::NullCondCallExpr*>(op)) {
+            return;
+        }
+        checkRead(*op, selfTarget);
+    };
     if (auto* ncm = dynamic_cast<const ast::NullCondMemberExpr*>(&e)) {
-        if (ncm->target) checkRead(*ncm->target, /*selfTarget=*/false);
+        readNullCondReceiver(ncm->target.get(), /*selfTarget=*/false);
         return;
     }
     if (auto* ncc = dynamic_cast<const ast::NullCondCallExpr*>(&e)) {
-        if (ncc->callee) checkRead(*ncc->callee, /*selfTarget=*/true);
+        readNullCondReceiver(ncc->callee.get(), /*selfTarget=*/true);
         std::size_t pos = 0;
         for (const auto& a : ncc->args) {
             if (!a.value) { ++pos; continue; }
@@ -2963,6 +2994,19 @@ void MethodOwnership::checkRead(const ast::Expr& e, bool selfTarget) {
             // deposits a fresh owned value exactly the same way.
             if (a.modifier == "out owned var" ||
                 builtinOutOwnedArg(ncc->callee.get(), pos)) {
+                ++pos; continue;
+            }
+            // fix-forward (v0.295, R17): a bare top-level `move`/`await`
+            // ARGUMENT (`f?(move x)`) hits the identical #3941 poison-
+            // preemption shape directly — no nested call needed, `move x`
+            // IS the argument. `isTopLevelConsumingForm` (the same
+            // predicate `readNullCondReceiver` above and the pre-existing
+            // `NewExpr` ctor-arg loop already use) declines exactly this one
+            // shape and nothing else, deferring to `recordMovesIn`'s more
+            // precise diagnostic — it does NOT touch what a nested call's
+            // OWN argument walk does (that remains issue 3975's open territory,
+            // reachable only through the plain `CallExpr` arm, unchanged).
+            if (a.value && isTopLevelConsumingForm(*a.value)) {
                 ++pos; continue;
             }
             checkRead(*a.value, false);
