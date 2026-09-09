@@ -1,0 +1,12 @@
+# null_guard_vacuous.baseline - ratchet for issue #3992: a row
+# pinning `if (<ptr>) { ...EXPECT... }` with no unconditional
+# non-null assertion on <ptr> first executes ZERO assertions when
+# the lookup returns null, and gtest still reports [ OK ].
+#
+# Regenerate with scripts/check_null_guard_vacuous.py --update after
+# fixing (protecting) a row.  --update refuses to raise a count.
+#
+# EXACT, not a ceiling: a count below baseline fails as STALE
+# HEADROOM (see the script docstring - same rule as every other
+# ratchet in this family).
+count = 32

@@ -713,6 +713,48 @@ if ! python3 scripts/check_ambiguous_ran_false.py --strict \
 fi
 say "ambiguous-ran-false phase: GREEN ($(tail -1 "$LOGDIR/${TAG}_ranfalse.log"))"
 
+# ── NULL-GUARD VACUOUS PHASE (#3992) ───────────────────────────────────────
+# A pointer-typed local bound from a lookup/finder call and then guarded with
+# a bare truthy `if (ptr) { ...EXPECT... }` (braced or brace-less) before any
+# EXPECT runs inside it executes ZERO assertions when the lookup returns
+# null — a compiler regression, a fixture that stopped parsing, or simply a
+# fixture bug. gtest still reports `[ OK ]`: the same three-outcomes-
+# collapsed-to-one-boolean discriminator problem #3892 already names for
+# `runAot`'s `.ran`, generalized to any pointer-returning lookup helper.
+#
+# Found LIVE TWICE while fixing #3985 (tests/sema/base_member_lookup_test.cpp
+# ::interface_member_resolves and tests/sema/member_access_resolution_test.cpp
+# ::qualified_field_access_resolves — one compounded with a genuine parse
+# failure, the other with NO parse defect at all, just a fixture declaring
+# an unrelated class first) — "a prose ratchet is not a ratchet" (CLAUDE.md)
+# applies directly: this shape recurred with no gate-enforced check for it,
+# exactly the asymmetry that motivated check_deprecated_jit_oracle.py.
+#
+# --self-test runs first and is not optional, for the reason recorded in
+# every sibling phase above: a green from a matcher that matched nothing is
+# worth nothing, and this detector's own self-test reconstructs BOTH known
+# live instances as its ground truth.
+say "null-guard-vacuous phase: detector self-test + ratchet (#3992)"
+if ! python3 scripts/check_null_guard_vacuous.py --self-test \
+      > "$LOGDIR/${TAG}_nullguard.log" 2>&1; then
+  say "CYCLE FAILURE: check_null_guard_vacuous SELF-TEST failed — the"
+  say "  detector is broken, so its verdict means nothing. See $LOGDIR/${TAG}_nullguard.log"
+  sed -n '1,20p' "$LOGDIR/${TAG}_nullguard.log" 2>/dev/null | sed 's/^/  | /' \
+    | tee -a "$CYCLE_LOG" >/dev/null
+  exit 1
+fi
+if ! python3 scripts/check_null_guard_vacuous.py --strict \
+      >> "$LOGDIR/${TAG}_nullguard.log" 2>&1; then
+  say "CYCLE FAILURE: a new row guards \`if (<ptr>) { ...EXPECT... }\` with no"
+  say "  unconditional non-null assertion on <ptr> first (#3992) — a null"
+  say "  lookup would execute zero assertions and still report [ OK ]. See"
+  say "  $LOGDIR/${TAG}_nullguard.log"
+  sed -n '/check_null_guard_vacuous:/,$p' "$LOGDIR/${TAG}_nullguard.log" 2>/dev/null \
+    | head -40 | sed 's/^/  | /' | tee -a "$CYCLE_LOG" >/dev/null
+  exit 1
+fi
+say "null-guard-vacuous phase: GREEN ($(tail -1 "$LOGDIR/${TAG}_nullguard.log"))"
+
 # ── GATE SELF-TEST PHASE (#3415) ───────────────────────────────────────────
 # The fourth source-level check, and the one that guards the checkers rather
 # than the tree. `scripts/gate/tests/` holds the self-tests for the gate's own
