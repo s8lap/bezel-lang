@@ -1216,6 +1216,23 @@ private:
         // key slots carry a co-owned +1 per string element. At scope end the
         // disposal emits bz_set_string_keys_release(tbl) before bz_dict_free.
         bool dictStringKeys = false;
+        // fix #4091 / §28.11 / §28.9: per-key disposer for a dict-backed
+        // `OwningSet<T>` whose T is a BORROWING built-in collection (Array /
+        // Stack / Queue / LinkedList / FrozenArray / Dictionary /
+        // SortedDictionary). The set stores each element as a void* in the
+        // generic-key table's key slot (key_size == sizeof(void*)), and the
+        // set OWNS those inner collections — at scope end each non-null key
+        // must be freed via the matching runtime free fn (bz_array_free /
+        // bz_llist_free / bz_dict_free, selected by `borrowingCollection-
+        // DisposerThunk` from elementPolicyFor's #4054 arm). null when the
+        // element is value-typed (no per-element obligation), a user class
+        // (handled via the array-backed path, genericBackingType declines
+        // classes), a string (handled via dictStringKeys + bz_set_string_keys_
+        // release), or a borrowing-set element (the set only borrows). At
+        // scope end the disposal emits bz_set_coll_keys_dispose(tbl, disp)
+        // BEFORE bz_dict_free(tbl, null); the subsequent bz_dict_free
+        // reclaims the key copies and the table itself.
+        llvm::Value* dictKeyDisposer = nullptr;
         // per §4.6/§4.7: a `using var` bound to a LinkedList<T> or
         // OwningLinkedList<T>. At scope end it is freed via bz_llist_free.
         // `collectionElemDisposer` (reused) is the per-element dispose callback

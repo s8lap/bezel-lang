@@ -462,6 +462,18 @@ void bz_set_string_keys_release(void* d);
 void bz_dict_clear_set_strings(void* d);
 bool bz_dict_remove_set_string(void* d, const void* key);
 
+// fix #4091 / §28.11 / §28.9: free each live element of a dict-backed
+// `OwningSet<T>` whose T is itself a BORROWING built-in collection (Array /
+// Stack / Queue / LinkedList / FrozenArray / Dictionary / SortedDictionary).
+// The set stores each element as a void* in the generic-key table's key slot
+// (key_size == sizeof(void*)); this helper calls `dispose_coll` (a thunk
+// built by codegen that invokes the matching runtime free fn — bz_array_free,
+// bz_llist_free, or bz_dict_free — with NULL inner disposer, per #4054) on
+// each non-null live key, then the subsequent bz_dict_free(d, null) reclaims
+// the key copies and the table itself. null/empty-table safe; a no-op on a
+// non-generic table (key_size != sizeof(void*), e.g. a primitive-element Set).
+void bz_set_coll_keys_dispose(void* d, void (*dispose_coll)(void*));
+
 // issue #389 / stdlib §5: wrap a dict-backed Set<T> (§4.10) as a lazy LINQ
 // source (Set is IEnumerable<T> via ICollection<T>, §4.3). Snapshots the set's
 // element keys (bz_dict_keys_gen) into an owned buffer iterated by index; the

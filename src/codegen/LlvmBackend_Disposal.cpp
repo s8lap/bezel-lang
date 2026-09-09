@@ -6417,6 +6417,28 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
                                        llvm::Type::getVoidTy(llvm_), {ptrTy()});
                 builder_.CreateCall(relFn, {tbl});
             }
+            // fix #4091 / §28.11 / §28.9: OwningSet<T> with T a BORROWING
+            // built-in collection — free each non-null key (the inner
+            // collection pointer stored in the generic-key table's key slot)
+            // BEFORE bz_dict_free reclaims the key copies. The dictKeyDisposer
+            // is the per-TypeRef thunk built by elementPolicyFor's #4054
+            // borrowing-builtin arm — calls bz_array_free / bz_llist_free /
+            // bz_dict_free with NULL inner disposer. Without this an
+            // `OwningSet<Array<int>>` (`OwningSet<Stack<int>>` /
+            // `OwningSet<Queue<int>>` / `OwningSet<LinkedList<int>>` /
+            // `OwningSet<FrozenArray<int>>` / `OwningSet<Dictionary<int,int>>` /
+            // `OwningSet<SortedDictionary<int,int>>`) leaks its inner
+            // collection's header + data buffer per stored element (issue
+            // #4091, measured 96,120 B at 800 iterations for Array<int>).
+            // The subsequent bz_dict_free(tbl, null) reclaims the key copies
+            // and the table itself — dictKeyDisposer and dictValueDisposer
+            // are mutually exclusive here (Set stores elements as KEYS; the
+            // value is a sentinel never disposed).
+            if (it->dictKeyDisposer) {
+                auto* keysDispFn = declareC("bz_set_coll_keys_dispose",
+                    llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()});
+                builder_.CreateCall(keysDispFn, {tbl, it->dictKeyDisposer});
+            }
             llvm::Value* disp = it->dictValueDisposer
                 ? llvm::cast<llvm::Value>(it->dictValueDisposer)
                 : llvm::ConstantPointerNull::get(ptrTy());

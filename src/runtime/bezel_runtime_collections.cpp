@@ -1432,6 +1432,39 @@ void bz_set_string_keys_release(void* dp) {
     }
 }
 
+// fix #4091 / §28.11 / §28.9: free each live element of a dict-backed
+// `OwningSet<T>` whose T is a BORROWING built-in collection (Array / Stack /
+// Queue / LinkedList / FrozenArray / Dictionary / SortedDictionary). The set
+// stores each element as a void* in the generic-key table's key slot
+// (key_size == sizeof(void*)); for each non-null live key this reads the
+// pointer value and calls `dispose_coll` on it (the per-TypeRef thunk codegen
+// builds in elementPolicyFor's #4054 borrowing-builtin arm, which calls the
+// matching runtime free fn — bz_array_free / bz_llist_free / bz_dict_free —
+// with NULL inner disposer). The borrow family does not own its elements, so
+// the recursive element-axis is fixed at NULL; the dispose_coll thunk reclaims
+// the inner collection's header + backing exactly once.
+//
+// Call this immediately before bz_dict_free(d, null) — after this call the
+// inner collections have been freed; the subsequent bz_dict_free reclaims the
+// key copies and the table itself. null/empty-table safe; a no-op on a
+// non-generic table (key_size != sizeof(void*)). The dispose_coll argument may
+// be null, in which case the helper is a no-op — the caller is responsible for
+// never passing an OwningSet whose element type lacks a built-in collection
+// disposer (codegen never sets dictKeyDisposer to null, by construction).
+void bz_set_coll_keys_dispose(void* dp, void (*dispose_coll)(void*)) {
+    if (!dp || !dispose_coll) return;
+    auto* d = (bz_dict_t*)dp;
+    if (d->key_size != (int64_t)sizeof(void*)) return;  // not a pointer-key set
+    for (int64_t i = 0; i < d->capacity; i++) {
+        bz_entry_t& e = d->buckets[i];
+        if (e.key && !e.deleted) {
+            void* collPtr;
+            memcpy(&collPtr, e.key, sizeof(void*));
+            if (collPtr) dispose_coll(collPtr);
+        }
+    }
+}
+
 // issue #429 / §28.9 / §4.10: like bz_dict_clear(d, null) but also releases
 // each live element's string +1 before freeing the key copy. Used by
 // Set<string>.Clear() so that cleared string elements are reclaimed (else

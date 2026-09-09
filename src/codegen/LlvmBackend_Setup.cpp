@@ -17364,6 +17364,21 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
                         d.dict = true;
                         if (isStrElem(collTy, /*owning=*/false))
                             d.dictStringKeys = true;
+                        // fix #4091 / §28.11 / §28.9: OwningSet<T> with T a
+                        // BORROWING built-in collection — set dictKeyDisposer
+                        // (mirror of the sync sibling above; see the sync arm's
+                        // own comment for the full rationale). The Set-family
+                        // async path is otherwise identical to the sync one
+                        // (same disposeStack_, same d.dict emission), so the
+                        // same key-side cascade applies.
+                        if (collIsOwning && collTy && collTy->genericArgs.size() == 1) {
+                            const sema::TypeRef* collEl = collTy->genericArgs[0];
+                            ElementPolicy kp = elementPolicyFor(collEl, /*owningFamily=*/true);
+                            if (kp.disposerThunk &&
+                                kp.cat == ElementPolicy::Category::ClassOwned) {
+                                d.dictKeyDisposer = kp.disposerThunk;
+                            }
+                        }
                         disposeStack_.back().push_back(d);
                     } else {
                         Disposal d{it->second, nullptr};
@@ -18527,6 +18542,37 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
                 d.dict = true;
                 if (isStrElem(collTy, /*owning=*/false))
                     d.dictStringKeys = true;  // string keys: release +1 before free
+                // fix #4091 / §28.11 / §28.9: an OwningSet<T> whose T is itself a
+                // BORROWING built-in collection (Array / Stack / Queue /
+                // LinkedList / FrozenArray / Dictionary / SortedDictionary) —
+                // the set stores each element as a void* in the generic-key
+                // table's key slot (key_size == sizeof(void*)), and the OWNING
+                // set must reclaim each non-null inner collection at scope end
+                // via its matching runtime free fn (bz_array_free / bz_llist_free
+                // / bz_dict_free), with NULL inner disposer (the borrow family
+                // does not own its own elements). Set `dictKeyDisposer` to the
+                // per-TypeRef thunk built by elementPolicyFor's #4054
+                // borrowing-builtin arm — at scope end the disposal emits
+                // bz_set_coll_keys_dispose(tbl, disp) BEFORE bz_dict_free(tbl,
+                // null); the subsequent bz_dict_free reclaims the key copies and
+                // the table itself.
+                //
+                // Skipped for the borrowing `Set<T>` (the set only borrows the
+                // inner collection; its real owner is elsewhere and would double-
+                // free if this site disposed too) and for SortedSet (rejected by
+                // sema — SortedSet<T> requires `where T: IComparable<T>` which
+                // excludes built-in collections). Skipped for value-typed and
+                // record/enum/choice elements (no per-element obligation;
+                // bz_dict_free(tbl, null) reclaims the value-byte key copies
+                // directly).
+                if (collIsOwning && collTy && collTy->genericArgs.size() == 1) {
+                    const sema::TypeRef* collEl = collTy->genericArgs[0];
+                    ElementPolicy kp = elementPolicyFor(collEl, /*owningFamily=*/true);
+                    if (kp.disposerThunk &&
+                        kp.cat == ElementPolicy::Category::ClassOwned) {
+                        d.dictKeyDisposer = kp.disposerThunk;
+                    }
+                }
                 disposeStack_.back().push_back(d);
                 return;
             }
