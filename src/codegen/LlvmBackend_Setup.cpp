@@ -24976,6 +24976,48 @@ Emitter::LocalDeclInitView Emitter::localDeclInitView(const ast::Node* n) {
 bool Emitter::isPlusOneClosureProducer(const ast::Expr* init) const {
     if (!init) return false;
     if (dynamic_cast<const ast::LambdaExpr*>(init)) return true;
+    // fix #4040 (§17/§20 if-expression / §28.3 producers arm-meet, v0.294):
+    // a `(if c then v1 else v2)` whose two branches are themselves +1 closure
+    // producers lowers to a PHI of the two arms' closure pointers
+    // (lowerConditional, LlvmBackend_Exprs2.cpp); only the runtime-selected
+    // arm's lambda cell is allocated, so the merged value carries exactly one
+    // reference. Recognizing this conditional as a single +1 producer lets the
+    // LocalDecl's scope-end arming register one `bz_closure_release` for the
+    // selected cell, instead of leaking it (issue #4040: 40 B per occurrence,
+    // regardless of which arm is selected or whether the local is ever called).
+    // The recognition is the closure twin of the `string` `ConditionalExpr` row
+    // above — same arm-meet logic, same non-nullable result-type guard
+    // (mirroring isPlusOneStringProducer's `rt->nullable` arm gate), same
+    // recursive recursion into both arms.
+    //
+    // Soundness:
+    //  (a) only the runtime-selected arm's LambdaExpr runs; the unselected arm
+    //      does not allocate a cell, so there is exactly one live reference at
+    //      the join;
+    //  (b) the consumer (return / assign / bind) treats the merged value as a
+    //      single +1 (no extra retain), and the scope-end release fires once
+    //      for it — no double-free, no leak;
+    //  (c) a nullable result type is declined: the merge of null + closure
+    //      pointer is not a uniform +1, and a per-branch release decision is
+    //      not what the scope-end arm fires (it fires once for the merged
+    //      value). Same gate as the string `ConditionalExpr` row, line for
+    //      line; the original #4005 rejection test's "else" arm uses an
+    //      owned-borrow lambda and is unaffected because the conditional here
+    //      has two +1 producer arms.
+    //  (d) the case where ONE arm is a +1 producer and the other is a borrow
+    //      (e.g. `(if c then lambda() => new R() else lambda() => b)`) is
+    //      rejected by #4005 itself at compile time — the borrow arm makes the
+    //      whole conditional non-producer — so by the time we get here, sema
+    //      has rejected programs that would be unsound; this predicate's
+    //      recursion still recurses through both arms and answers false, in
+    //      lockstep with the rule itself.
+    if (auto* cond = dynamic_cast<const ast::ConditionalExpr*>(init)) {
+        const sema::TypeRef* rt = ctx_.exprType(*cond);
+        if (!rt || rt->nullable) return false;          // non-nullable only
+        if (rt->kind != sema::TypeRef::Kind::Function) return false;
+        return isPlusOneClosureProducer(cond->thenValue.get()) &&
+               isPlusOneClosureProducer(cond->elseValue.get());
+    }
     // A method reference used as a VALUE: a bare IdentifierExpr (a static method
     // of the current type) or a MemberAccessExpr `T.M` / `obj.M` whose resolved
     // symbol is a MethodSymbol — the exact shape codegen lowers to a fresh +1

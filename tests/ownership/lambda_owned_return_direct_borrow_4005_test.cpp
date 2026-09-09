@@ -404,6 +404,88 @@ BEZEL_TEST(lambda_owned_return_direct_borrow_4005,
     BEZEL_EXPECT_TRUE(jr.ran);
 }
 
+// fix #4040 (§17 if-expression / §20 / §28.3 producers arm-meet, v0.294):
+// the ACCEPT twin above compiles and runs, but it deliberately did NOT
+// exercise `runAotChecked` — that earlier check (in the comment it carried)
+// explicitly filed #4040 as a codegen-only leak of 40 B per conditional-
+// expression LocalDecl initializer, exactly the gap that fix now closes.
+//
+// A `(if c then lambda() => new R() else lambda() => new R())` conditional
+// lowers via lowerConditional to a PHI of the two arms' closure-cell
+// pointers; only the runtime-selected arm's calloc'd 40-byte
+// {fn,env,rc,envdtor,kind} cell is allocated, so the merged value carries
+// exactly one +1 reference. The pre-#4040 `isPlusOneClosureProducer`
+// predicate only recognized a DIRECT `LambdaExpr` and missed the
+// `ConditionalExpr` wrapper, so the LocalDecl never entered
+// `closureReleaseEligible_`, no scope-end `bz_closure_release` was armed,
+// and the selected cell leaked regardless of which arm was chosen. #4040
+// adds a `ConditionalExpr` arm to that predicate that recursively requires
+// BOTH arms to be +1 closure producers, mirroring the
+// `isPlusOneStringProducer` conditional arm (§28.3 arm-meet for `string`)
+// line for line.
+//
+// Two test rows pin both halves of the fix:
+//
+//   * the SINGLE-OCCURRENCE shape (issue's exact repro) — proves the
+//     no-leak invariant at the unit-of-defect;
+//   * a LOOP-AMPLIFIED shape — proves the disposal still fires when the
+//     conditional initializer is repeatedly bound and discarded, catching
+//     any disposal-stack/state-machine regression the predicate widening
+//     could introduce for compound scopes (LANE_RULES §10).
+//
+// Both run under `runAotChecked` (ASan/LSan); the leak detector's exit
+// signal (non-zero on any leak) is what catches the regression — no manual
+// `Res.live` arithmetic is needed because the destructor fires once per
+// `using var c` and the closure release fires once per `mk` initializer,
+// neither side observes the other.
+BEZEL_TEST(lambda_owned_return_direct_borrow_4005,
+           conditional_expr_both_arms_fresh_no_leak_spec_28_3) {
+    std::string src =
+        std::string(kRes) +
+        "class C "
+        "  public static method Main(): int "
+        "    var flag := false; "
+        "    var mk: () -> owned Res := "
+        "      (if flag then lambda() => new Res(1) else lambda() => new Res(2)); "
+        "    using var c := mk(); "
+        "    return 0; "
+        "  end Main; "
+        "end C;";
+    JitResult jr = runAotChecked(src);
+    BEZEL_EXPECT_TRUE(jr.ran);
+    BEZEL_EXPECT_EQ(jr.exitCode, 0);
+}
+
+BEZEL_TEST(lambda_owned_return_direct_borrow_4040,
+           conditional_expr_both_arms_fresh_loop_no_leak_spec_28_3) {
+    // Loop-amplified 500-iterations shape. With #4040 unfixed, each of the
+    // 501 iterations leaks one 40-byte closure cell (20040 B total, easily
+    // over the LSan threshold). With #4040 fixed, the scope-end
+    // `bz_closure_release` arms once per iteration; no leak. The local
+    // `Res` destructor also fires once per `using var c` so `Res.live`
+    // ends at 0 — but the LSan check is the load-bearing assertion.
+    std::string src =
+        std::string(kRes) +
+        "class C "
+        "  public static method Main(): int "
+        "    var total := 0; "
+        "    for var i in 0..500 do "
+        "      var flag: bool := (i mod 2) = 0; "
+        "      var mk: () -> owned Res := "
+        "        (if flag then lambda() => new Res(1) "
+        "                 else lambda() => new Res(2)); "
+        "      using var c := mk(); "
+        "      total := total + c.tag; "
+        "    end for; "
+        "    return total; "
+        "  end Main; "
+        "end C;";
+    JitResult jr = runAotChecked(src);
+    BEZEL_EXPECT_TRUE(jr.ran);
+    // expected total = 251*1 + 250*2 = 751; 751 mod 256 = 239
+    BEZEL_EXPECT_EQ(jr.exitCode, 239);
+}
+
 // ===========================================================================
 // NON-REGRESSION — the shared `common::isNonOwningIterFormatEnumerableHead`
 // predicate (BuiltinRegistry.hpp/#4004, factored out of a duplicated
