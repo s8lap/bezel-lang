@@ -49,29 +49,29 @@ public sealed class Store<T> where T: value, sendable
     _map := map;
   end constructor;
 
-  public method Clone(): owned Store<T> => new Store<T>(_map.Clone());     // a second handle to the same map
+  public method Clone(): owned Store<T> => new Store<T>(_map.Clone());      // a second handle to the same map
 
-  public async method All(): Task<Array<T>>                                // a snapshot, copied under the guard
-    using var guard := await _map.Get().LockAsync();                       // Pattern B (§30.5); the scope is the critical section
+  public async method All(): Task<Array<T>>                                 // a snapshot, copied under the guard
+    using var guard := await _map.Get().LockAsync();                        // Pattern B (§30.5); the scope is the critical section
     return guard.Value.Values.ToArray();
   end All;
 
   public async method Find(id: int): Task<T?>
     using var guard := await _map.Get().LockAsync();
-    return guard.Value.GetOrNull(id);                                      // a copy, or null (stdlib §4.8)
+    return guard.Value.GetOrNull(id);                                       // a copy, or null (stdlib §4.8)
   end Find;
 
-  public async method Add(create: (int) -> T): Task<T>                     // the id is minted under the guard
+  public async method Add(create: (int) -> T): Task<T>                      // the id is minted under the guard
     using var guard := await _map.Get().LockAsync();
 
-    var id := (guard.Value.Keys.MaxOrNull() ?? 0) + 1;                     // never collides with a live key
+    var id := (guard.Value.Keys.MaxOrNull() ?? 0) + 1;                      // never collides with a live key
     var item := create(id);
     guard.Value[id] := item;
 
     return item;
   end Add;
 
-  public async method Update(id: int, change: (T) -> T): Task<T?>          // null ⇒ absent; read-modify-write is atomic
+  public async method Update(id: int, change: (T) -> T): Task<T?>           // null ⇒ absent; read-modify-write is atomic
     using var guard := await _map.Get().LockAsync();
 
     var current := guard.Value.GetOrNull(id);
@@ -79,7 +79,7 @@ public sealed class Store<T> where T: value, sendable
       return null;
     end;
 
-    var updated := change(current);                                        // `current` narrowed by the early return (§7.4)
+    var updated := change(current);                                         // `current` narrowed by the early return (§7.4)
     guard.Value[id] := updated;
 
     return updated;
@@ -94,7 +94,7 @@ end Store;
 // ── Per-worker dependencies. Sendable by §30.14's class rule: sealed, every field an owned sendable class. ──
 public sealed class Deps
   public owned readonly Todos: Store<Todo>;
-  public owned readonly Logger: ChannelLogger;                             // one per worker (0021 §3)
+  public owned readonly Logger: ChannelLogger;                              // one per worker (0021 §3)
 
   public constructor(owned todos: Store<Todo>, owned logger: ChannelLogger)
     Todos := todos;
@@ -105,8 +105,7 @@ end Deps;
 // ── The root service: owns the deps, mounts the resources, carries the cross-cutting policy ──
 public sealed class Api: IHttpService
   private owned readonly _deps: Deps;
-  private owned readonly _routes: RouteTable := new();                     // the LAST owned field — §4.1
-  public property Routes: RouteTable => _routes;                           // IHttpService (§28.6)
+  private owned readonly _routes: RouteTable := new();                      // the LAST owned field — §4.1
 
   public constructor(owned deps: Deps)
     _deps := deps;                                                          // [R0]
@@ -114,6 +113,8 @@ public sealed class Api: IHttpService
     _routes.Get("/health", async lambda() => "ok");                         // [R2] Task<string> ⇒ 200 text/plain
     _routes.Mount("/todos", new TodoApi(_deps.Todos));                      // [R3] the child borrows the store; _deps outlives it
   end constructor;
+
+  public property Routes: RouteTable => _routes;                            // IHttpService (§28.6)
 
   // Auth, then one access-log line, for the whole tree. `next` is call-bounded: invoke and await it, never store it.
   private async method Guard(req: HttpRequest,
@@ -131,19 +132,20 @@ end Api;
 
 // ── One resource: six handlers that are ordinary methods over the store it borrows from the root ──
 public sealed class TodoApi: IHttpService
-  private readonly _todos: Store<Todo>;                                    // back-reference (§28.3); the root's _deps outlives it
-  private owned readonly _routes: RouteTable := new();                     // LAST
-  public property Routes: RouteTable => _routes;
+  private readonly _todos: Store<Todo>;                                     // back-reference (§28.3); the root's _deps outlives it
+  private owned readonly _routes: RouteTable := new();                      // LAST
 
   public constructor(todos: Store<Todo>)
     _todos := todos;
-    _routes.Get("/",           List);                                       // [T1] () -> Task<Array<Todo>>     ⇒ 200 JSON array
-    _routes.Get("/{id}",       GetById);                                    // [T2] (int) -> Task<Todo?>        ⇒ 200 JSON or 404
-    _routes.Post("/",          Create);                                     // [T3] (NewTodo) -> Task<Todo>     ⇒ 201 JSON; the body
-    _routes.Put("/{id}",       Replace);                                    // [T4] (int, Todo) -> Task<Todo?>  ⇒ {id}, then the body
+    _routes.Get("/",            List);                                      // [T1] () -> Task<Array<Todo>>     ⇒ 200 JSON array
+    _routes.Get("/{id}",        GetById);                                   // [T2] (int) -> Task<Todo?>        ⇒ 200 JSON or 404
+    _routes.Post("/",           Create);                                    // [T3] (NewTodo) -> Task<Todo>     ⇒ 201 JSON; the body
+    _routes.Put("/{id}",        Replace);                                   // [T4] (int, Todo) -> Task<Todo?>  ⇒ {id}, then the body
     _routes.Patch("/{id}/done", MarkDone);                                  // [T5] (int) -> Task<Todo?>
-    _routes.Delete("/{id}",    Remove);                                     // [T6] (int) -> Task              ⇒ 204
+    _routes.Delete("/{id}",     Remove);                                    // [T6] (int) -> Task               ⇒ 204
   end constructor;
+
+  public property Routes: RouteTable => _routes;
 
   // Public on purpose: the table calls these per request, and a test calls them directly.
   public async method List(): Task<Array<Todo>> => await _todos.All();
@@ -174,14 +176,14 @@ end TodoApi;
 // ── Composition root (D-0001: constructor wiring, no container) ──
 public static class Program
   public static async method Main(): Task<int>
-    await using var hub := new LogHub(new ConsoleSink(), minLevel := LogLevel.Info);   // 0021 §4.2
-    var sinkLoop := hub.RunAsync();                                         // drains the log channel, on this domain
-    using var todos := new Store<Todo>();                                   // one map; one handle per worker (§28.13)
+    await using var hub := new LogHub(new ConsoleSink(), minLevel := LogLevel.Info);  // 0021 §4.2
+    var sinkLoop := hub.RunAsync();                                                   // drains the log channel, on this domain
+    using var todos := new Store<Todo>();                                             // one map; one handle per worker (§28.13)
 
     // `deps` runs on THIS domain once per worker; each result is moved into its worker (§30.14). It may capture
     // Main's locals because `Listen` is awaited to settlement in this very statement (§28.14 frame residence).
     var exitCode := await HttpServer.Listen(port := 8080,
-        service := lambda(owned deps: Deps) => new Api(move deps),          // [F] capture-free: a spawn position
+        service := lambda(owned deps: Deps) => new Api(move deps),                             // [F] capture-free: a spawn position
         deps := lambda(worker) => new Deps(todos.Clone(), hub.NewLogger($"http-{worker}")));   // [M1]
 
     await sinkLoop;    // every worker's ChannelLogger died with its service ⇒ channel closed ⇒ sink drained
@@ -199,7 +201,7 @@ import System.Testing;            // 0022 §5, §8 — explicit import by design
 import System.Net.Http;
 
 public class TodoApiTests
-  public static async method CreateReturnsTheStoredTodo(): Task            // a handler called as the method it is
+  public static async method CreateReturnsTheStoredTodo(): Task             // a handler called as the method it is
     using var store := new Store<Todo>();                                   // fixture = using var (0022 §7)
     using var api := new TodoApi(store);                                    // the service borrows the store, which outlives it
 
@@ -208,7 +210,7 @@ public class TodoApiTests
     Assert.Equal(new Todo(1, "write the server proposal", false), todo);    // every component admissible ⇒ hashable (§9.2, §3.6)
   end CreateReturnsTheStoredTodo;
 
-  public static async method GetByIdRejectsANonNumericId(): Task           // binding happens in the table, before GetById runs
+  public static async method GetByIdRejectsANonNumericId(): Task            // binding happens in the table, before GetById runs
     using var store := new Store<Todo>();
     using var api := new TodoApi(store);
     using var req := new HttpRequest(HttpMethod.Get, "/not-a-number");      // the service's own path, dispatched directly
@@ -220,7 +222,7 @@ public class TodoApiTests
 end TodoApiTests;
 
 public static class TestMain
-  public static async method Main(): Task<int>                              // 0022 §3.2 (b): the registration runner
+  public static async method Main(): Task<int>                                               // 0022 §3.2 (b): the registration runner
     using var runner := new TestRunner();
     runner.Add("CreateReturnsTheStoredTodo",    TodoApiTests.CreateReturnsTheStoredTodo);    // static references: capture-free
     runner.Add("GetByIdRejectsANonNumericId",   TodoApiTests.GetByIdRejectsANonNumericId);
@@ -256,40 +258,44 @@ public class HttpResponse /* … */ end HttpResponse;   // 0001 §3.3 — Status
 // ── The incoming request: borrowed by handlers, domain-local, disposed by whoever constructed it ──
 public class HttpRequest                                                                                     // NEW
   public constructor(verb: HttpMethod, path: string, body: string := "",                // the test seam (§7 Q8);
-                     contentType: string := "", headers: HttpHeaders? := null);          //   headers are copied in
+                     contentType: string := "", headers: HttpHeaders? := null);         //   headers are copied in
+
   public readonly property Method: HttpMethod;        // the enum, not a string — 0001 symmetry
   public readonly property Path: string;              // decoded, no query; ALWAYS the full path, even under Mount
   public readonly property Headers: HttpHeaders;      // read-only view (borrow)
-  public method Param(name: string): string;                                  // route capture; unknown name ⇒ ArgumentException (band 1)
-  public method Param<T>(name: string): owned T where T: IParsable<T>;        // T.Parse (§11.8; stdlib §2.19); any Parse fault ⇒ HttpResponseException(400, …, cause)
-  public method Query(name: string): string?;                                 // first value; null = absent (band 2)
-  public method Query<T>(name: string): owned T? where T: IParsable<T>;       // null = absent; malformed ⇒ HttpResponseException(400)
+
+  public method Param(name: string): string;                                          // route capture; unknown name ⇒ ArgumentException (band 1)
+  public method Param<T>(name: string): owned T where T: IParsable<T>;                // T.Parse (§11.8; stdlib §2.19); any Parse fault ⇒ HttpResponseException(400, …, cause)
+  public method Query(name: string): string?;                                         // first value; null = absent (band 2)
+  public method Query<T>(name: string): owned T? where T: IParsable<T>;               // null = absent; malformed ⇒ HttpResponseException(400)
   public method QueryAll(name: string): owned Array<string>;
-  public async method Text(): Task<string>;                                   // single-consumption — 0001 §4.3's contract
+  public async method Text(): Task<string>;                                           // single-consumption — 0001 §4.3's contract
   public async method Bytes(): OwningTask<Array<byte>>;
-  public async method Json<T>(): Task<T> where T: IDeserializable;            // compiler-known, the 0001 §3.3 / stdlib §2.15 split (#1402):
-  public async method JsonOwned<T>(): OwningTask<T> where T: class, IDeserializable;   //   value T ⇒ Json, class T ⇒ JsonOwned;
-                                                                              //   SerializationException ⇒ HttpResponseException(400, …, cause)
+  public async method Json<T>(): Task<T> where T: IDeserializable;                    // compiler-known, the 0001 §3.3 / stdlib §2.15 split (#1402):
+  public async method JsonOwned<T>(): OwningTask<T> where T: class, IDeserializable;  //   value T ⇒ Json, class T ⇒ JsonOwned;
+                                                                                      //   SerializationException ⇒ HttpResponseException(400, …, cause)
 end HttpRequest;
 
 // ── Response constructors on 0001 §3.1's facade: the server-direction mirror of 0001 §3.3's accessors ──
 public static class Http                              // 0001 §3.1's class, extended — every member below is NEW
-  public static method Text(body: string, status: int := 200, contentType: string := "text/plain; charset=utf-8"): owned HttpResponse;
-  public static method Json<T>(value: T, status: int := 200): owned HttpResponse where T: ISerializable;        // stdlib §2.15's write path underneath
-  public static method JsonArray<T>(items: IEnumerable<T>, status: int := 200): owned HttpResponse             // BeginArray / item.Serialize / EndArray:
-      where T: ISerializable;                                                                                  //   no collection conforms to ISerializable (§7 Q5)
-  public static method JsonOrNotFound<T>(value: T?): owned HttpResponse where T: ISerializable;                 // null ⇒ empty 404, else 200 JSON
-  public static method Bytes(owned body: Array<byte>, status: int := 200, contentType: string := "application/octet-stream"): owned HttpResponse;
-  public static method Status(status: int): owned HttpResponse;               // empty body: 204, 404, 401, …
-  public static method Redirect(location: string, permanent: bool := false): owned HttpResponse;   // 302 / 301
+  public static method Text(body: string, status: int := 200,
+      contentType: string := "text/plain; charset=utf-8"): owned HttpResponse;
+  public static method Json<T>(value: T, status: int := 200): owned HttpResponse where T: ISerializable;  // stdlib §2.15's write path underneath
+  public static method JsonArray<T>(items: IEnumerable<T>, status: int := 200): owned HttpResponse        // BeginArray / item.Serialize / EndArray:
+      where T: ISerializable;                                                                             //   no collection conforms to ISerializable (§7 Q5)
+  public static method JsonOrNotFound<T>(value: T?): owned HttpResponse where T: ISerializable;           // null ⇒ empty 404, else 200 JSON
+  public static method Bytes(owned body: Array<byte>, status: int := 200,
+      contentType: string := "application/octet-stream"): owned HttpResponse;
+  public static method Status(status: int): owned HttpResponse;                                           // empty body: 204, 404, 401, …
+  public static method Redirect(location: string, permanent: bool := false): owned HttpResponse;          // 302 / 301
 end Http;
 
 // ── The one server-side exception: "answer with this status" ──
 public class HttpResponseException: HttpException     // NEW; root: 0001 §3.5; producer-local (§31.4)
-  public constructor(status: int, message: string := "");   // `message` is server-side only: it reaches the
-                                                            //   diagnostic channel, never the response body (§1 principle 5)
-  public constructor(status: int, message: string, cause: Exception);   // snapshot chaining (§31.4) — Param/Json use it
-  public readonly property Status: int;               // strings and values only (§31.1)
+  public constructor(status: int, message: string := "");              // `message` is server-side only: it reaches the
+                                                                       //   diagnostic channel, never the response body (§1 principle 5)
+  public constructor(status: int, message: string, cause: Exception);  // snapshot chaining (§31.4) — Param/Json use it
+  public readonly property Status: int;                                // strings and values only (§31.1)
 end HttpResponseException;
 
 // ── What a service is: an object that exposes the table it owns ──
@@ -428,13 +434,14 @@ public class RouteTable                                                         
   public method Route<A, B, C>   (verb: HttpMethod, route: string, scoped handler: (A, B, C) -> OwningTask<HttpResponse>);
   // Composition: `prefix/…` is dispatched to `child` — its hooks, then its table, on the remaining path.
   // The child is owned here; the owned-field cascade (§28.5) disposes the tree bottom-up.
-  public method Mount (prefix: string, owned child: IHttpService);
+  public method Mount(prefix: string, owned child: IHttpService);
   // Cross-cutting, opt-in. The hook wraps this table's own routes AND every mounted child. AT MOST ONE hook
   // per table: a second `Around` on the same table is an ArgumentException at the registering call (band 1,
   // the duplicate-route rule). Nesting is by mount order — a parent's hook wraps its children's, outermost first.
   // `next` is CALL-BOUNDED inside the hook: invoke it, await it to settlement, never store or return the task.
   // `next` is the stored handler — typed, void, raw or classic — composed with its binding and its response shape (§9b).
-  public method Around(scoped hook: (HttpRequest, (HttpRequest) -> OwningTask<HttpResponse>) -> OwningTask<HttpResponse>);
+  public method Around(
+      scoped hook: (HttpRequest, (HttpRequest) -> OwningTask<HttpResponse>) -> OwningTask<HttpResponse>);
   // In-process dispatch — what the worker loop calls, and what a test calls. Borrows the request.
   // hooks ⇒ match ⇒ bind (captures left to right, then the body) ⇒ handler ⇒ shape. HttpResponseException from a
   // hook, a handler, or binding ⇒ its status, converted at the innermost table (so an enclosing hook sees a
