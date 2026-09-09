@@ -3650,8 +3650,17 @@ static bool staticReadonlyFieldIsReferenceTyped(const TypeRef* rt,
                                                 const SemaContext& ctx);
 static bool isStaticallyNullExpr(const ast::Expr* e);
 static bool isStaticallyDefaultExpr(const ast::Expr* e);
-static void checkStaticReadonlyRecordInit(
+// fix #3973 (§9.7, v0.295): returns true iff a diagnostic was reported (the
+// walk is now recursive — see the definition below).
+static bool checkStaticReadonlyRecordInit(
     SemaContext& ctx, const ast::NewExpr& nx, const TypeRef* declTy,
+    SourceLocation loc, std::string_view what, std::string_view name);
+// fix #3973 (§9.7, v0.295): handles a positional slot (record field or
+// choice payload) that is not ITSELF directly reference-typed but may
+// still carry a nested borrow one or more levels down — see the definition
+// below, just above `checkStaticReadonlyRecordInit`.
+static bool checkNestedBorrowBearingSlot(
+    SemaContext& ctx, const TypeRef* pft, const ast::Expr* argExpr,
     SourceLocation loc, std::string_view what, std::string_view name);
 
 // §22.12 rule 3/4 (v0.262, #3272): classify a CONCRETE substitution at the
@@ -11678,17 +11687,115 @@ bool isStaticallyDefaultExpr(const ast::Expr* e) {
     return dynamic_cast<const ast::DefaultExpr*>(e) != nullptr;
 }
 
+// fix #3973 (§9.7, v0.295): a positional slot (record field / choice
+// payload) whose OWN resolved type `pft` is not directly reference-typed
+// (`staticReadonlyFieldIsReferenceTyped(pft, ctx)` is false) may still
+// carry a nested borrow. Two shapes reach here:
+//
+//   (a) `pft` is a Named type with a REAL TypeSymbol declaration of kind
+//       Record or Choice — an ordinary user-declared (or imported) nested
+//       record/choice. Recurse into its own `new T(...)` initializer via
+//       `checkStaticReadonlyRecordInit` (mutual recursion — forward-
+//       declared above).
+//
+//   (b) `pft` is one of the four builtin span views (`Span<T>`,
+//       `ReadOnlySpan<T>`, `ArraySpan<T>`, `ReadOnlyArraySpan<T>` — stdlib
+//       §4.14/§4.15). MEASURED: despite being ordinary `record`
+//       declarations in the stdlib's own prose, these are represented
+//       internally as declaration-LESS Named TypeRefs (`BuiltinRegistry.cpp`'s
+//       `kNonHeapReservedBuiltins` / `kBuiltinCtorParamNames` — a compiler-
+//       intrinsic `{ptr, i32, i32}` shape with no `TypeSymbol`, the exact
+//       same representation `common::isBorrowBearingRecordOrSpan` documents
+//       and recognizes by NAME rather than by walking fields), so shape (a)'s
+//       `recordPositionalFieldSymbols`/`choiceCasesOf` recursion cannot
+//       descend into one — there is no TypeSymbol to enumerate fields from.
+//       Handled by name instead: each of the four heads' own FIRST
+//       constructor argument (`Buffer` for `Span`/`ReadOnlySpan`, `Source`
+//       for `ArraySpan`/`ReadOnlyArraySpan` — `kBuiltinCtorParamNames`'s
+//       rows for these four heads, all four "lowered by POSITION", so a
+//       reorder via named arguments is independently rejected and index 0
+//       is always the backing reference) is the live borrow of its backing
+//       `Array`/`OwningBuffer`; the trailing `Start`/`Length` arguments are
+//       plain ints, irrelevant to §9.7.
+//
+// Returns true iff a diagnostic was reported.
+bool checkNestedBorrowBearingSlot(
+    SemaContext& ctx, const TypeRef* pft, const ast::Expr* argExpr,
+    SourceLocation loc, std::string_view what, std::string_view name) {
+    if (!pft || pft->kind != TypeRef::Kind::Named) return false;
+    if (pft->declaration) {
+        if (pft->declaration->kind != ast::TypeDeclKind::Record &&
+            pft->declaration->kind != ast::TypeDeclKind::Choice)
+            return false;
+        if (auto* nestedNew = dynamic_cast<const ast::NewExpr*>(argExpr))
+            return checkStaticReadonlyRecordInit(ctx, *nestedNew, pft, loc,
+                                                 what, name);
+        return false;
+    }
+    // Declaration-less: only the four builtin span views are handled; every
+    // other declaration-less Named type (Array<T>, Channel<T>, a bare
+    // still-uninstantiated generic parameter, …) is not itself a nested
+    // record/choice and is left alone (unreachable via this predicate's
+    // caller anyway, since `staticReadonlyFieldIsReferenceTyped` already
+    // classifies every OTHER declaration-less builtin as reference-typed —
+    // see its own `Kind::Named, !rt->declaration` arm above — so control
+    // only reaches here when that check already answered false).
+    const std::string_view h = pft->headName();
+    std::string_view backingFieldName;
+    if (h == "Span" || h == "ReadOnlySpan") backingFieldName = "Buffer";
+    else if (h == "ArraySpan" || h == "ReadOnlyArraySpan") backingFieldName = "Source";
+    else return false;
+    auto* nestedNew = dynamic_cast<const ast::NewExpr*>(argExpr);
+    if (!nestedNew || nestedNew->args.empty()) return false;
+    if (isStaticallyNullExpr(nestedNew->args[0].value.get())) return false;
+    ctx.diagnostics().report(
+        Severity::Error, loc,
+        std::string("static readonly ") + std::string(what) + " `" +
+        std::string(name) + "` has record value with non-null "
+        "reference-typed field `" + std::string(backingFieldName) +
+        "`; §9.7 requires the null-source form (every reference-typed "
+        "component must be null) (§22.12 rule 4 residual + \xC2\xA7""9.7, "
+        "v0.265, #3273 / #3290)");
+    return true;
+}
+
 // Walk the positional arguments of a `new Tok(...)` expression against the
 // record/choice's field/payload shape and verify every reference-typed
 // component is null. Named-argument or positional-only mismatches are
 // reported at the call site. `loc` is the `NewExpr` site; the diagnostic
-// uses it as a fallback when argument resolution is impossible.
-void checkStaticReadonlyRecordInit(
+// uses it as a fallback when argument resolution is impossible. Returns
+// true iff a diagnostic was reported — callers (including this function's
+// own recursive calls) use this to stop after the first, preserving the
+// "one diagnostic per site" contract.
+//
+// fix #3973 (§9.7, v0.295): this walk was originally SHALLOW / one level —
+// a positional field/payload slot whose OWN resolved type is itself a
+// record or choice was always treated as value-typed (records and choices
+// of value types are values) and skipped outright, with no look at what
+// that nested record/choice itself contains. So a slot that is ITSELF a
+// borrow-bearing record — the canonical case being any of the span views
+// (`Span<T>` / `ReadOnlySpan<T>` / `ArraySpan<T>` / `ReadOnlyArraySpan<T>`,
+// ordinary user-level records per stdlib §4.14/§4.15) nested as a field,
+// e.g. `SpanHolder(V: ReadOnlyArraySpan<int>)` — got zero §9.7 enforcement
+// no matter what its own constructor argument held. Fixed by recursing:
+// when a slot's type is itself Named with a Record or Choice declaration,
+// and the slot's own initializer expression is statically a `new T(...)`,
+// re-run this same per-slot walk against THAT nested `NewExpr`'s own
+// arguments. The recursion is structurally bounded — no separate depth
+// limit is needed — because neither a record nor a choice may transitively
+// contain itself by value (§9 / #1272 for records; §35.1 / #2208 for
+// choices; both enforced at declaration time by
+// `Resolver::recordValueContainsSelf`, ~line 1716 above). A nested slot's
+// initializer that is NOT statically a `new T(...)` (a variable, a call
+// result, `null`, `default(...)`) is left alone, matching this function's
+// own top-level caller's policy just above (the static analysis cannot
+// disprove null-source for a non-trivial initializer).
+bool checkStaticReadonlyRecordInit(
     SemaContext& ctx, const ast::NewExpr& nx, const TypeRef* declTy,
     SourceLocation loc, std::string_view what,
     std::string_view name) {
     if (!declTy || declTy->kind != TypeRef::Kind::Named || !declTy->declaration)
-        return;
+        return false;
     const TypeSymbol* ts = declTy->declaration;
     // fix #3970 (§9.7/§22.12 rule 4, v0.294): this used to cast
     // `declTy->declaration->decl` to an `ast::TypeDecl` and walk ITS
@@ -11716,25 +11823,34 @@ void checkStaticReadonlyRecordInit(
         const std::vector<const Symbol*> fields =
             recordPositionalFieldSymbols(ts);
         std::size_t arity = fields.size();
-        if (nx.args.size() != arity) return;  // mismatch — typecheck reports
+        if (nx.args.size() != arity) return false;  // mismatch — typecheck reports
         for (std::size_t i = 0; i < arity; ++i) {
             const TypeRef* pft = storageComponentType(fields[i], ctx);
             if (!pft) continue;
-            if (!staticReadonlyFieldIsReferenceTyped(pft, ctx)) continue;
-            if (isStaticallyNullExpr(nx.args[i].value.get())) continue;
-            // Non-null reference-typed field: reject.
-            std::string pname = std::string(fields[i]->name);
-            ctx.diagnostics().report(
-                Severity::Error, loc,
-                std::string("static readonly ") + std::string(what) + " `"
-                + std::string(name) + "` has record value with non-null "
-                "reference-typed field `" + pname + "`; §9.7 requires the "
-                "null-source form (every reference-typed component must be "
-                "null) (§22.12 rule 4 residual + \xC2\xA7""9.7, v0.265, "
-                "#3273 / #3290)");
-            return;  // one diagnostic per site
+            const ast::Expr* argExpr = nx.args[i].value.get();
+            if (staticReadonlyFieldIsReferenceTyped(pft, ctx)) {
+                if (isStaticallyNullExpr(argExpr)) continue;
+                // Non-null reference-typed field: reject.
+                std::string pname = std::string(fields[i]->name);
+                ctx.diagnostics().report(
+                    Severity::Error, loc,
+                    std::string("static readonly ") + std::string(what) + " `"
+                    + std::string(name) + "` has record value with non-null "
+                    "reference-typed field `" + pname + "`; §9.7 requires the "
+                    "null-source form (every reference-typed component must be "
+                    "null) (§22.12 rule 4 residual + \xC2\xA7""9.7, v0.265, "
+                    "#3273 / #3290)");
+                return true;  // one diagnostic per site
+            }
+            // fix #3973: `pft` is not itself reference-typed, but it may be
+            // a NESTED record/choice (or one of the four declaration-less
+            // builtin span views) that carries a reference-typed component
+            // further down.
+            if (checkNestedBorrowBearingSlot(ctx, pft, argExpr, loc, what,
+                                             name))
+                return true;
         }
-        return;
+        return false;
     }
     if (ts->kind == ast::TypeDeclKind::Choice) {
         // For a choice, only the case being constructed is null-source at
@@ -11752,23 +11868,32 @@ void checkStaticReadonlyRecordInit(
                 if (!pf.type) continue;
                 const TypeRef* pft = ctx.resolvedType(*pf.type);
                 if (!pft) continue;
-                if (!staticReadonlyFieldIsReferenceTyped(pft, ctx)) continue;
-                if (isStaticallyNullExpr(nx.args[i].value.get())) continue;
-                std::string pname = std::string(pf.name);
-                ctx.diagnostics().report(
-                    Severity::Error, loc,
-                    std::string("static readonly ") + std::string(what) + " `"
-                    + std::string(name) + "` has choice value with non-null "
-                    "reference-typed payload `" + pname + "`; \xC2\xA7""9.7 "
-                    "requires the null-source form (every reference-typed "
-                    "component must be null) (\xC2\xA7""22.12 rule 4 residual "
-                    "+ \xC2\xA7""9.7, v0.265, #3273 / #3290)");
-                return;  // one diagnostic per site
+                const ast::Expr* argExpr = nx.args[i].value.get();
+                if (staticReadonlyFieldIsReferenceTyped(pft, ctx)) {
+                    if (isStaticallyNullExpr(argExpr)) continue;
+                    std::string pname = std::string(pf.name);
+                    ctx.diagnostics().report(
+                        Severity::Error, loc,
+                        std::string("static readonly ") + std::string(what) + " `"
+                        + std::string(name) + "` has choice value with non-null "
+                        "reference-typed payload `" + pname + "`; \xC2\xA7""9.7 "
+                        "requires the null-source form (every reference-typed "
+                        "component must be null) (\xC2\xA7""22.12 rule 4 residual "
+                        "+ \xC2\xA7""9.7, v0.265, #3273 / #3290)");
+                    return true;  // one diagnostic per site
+                }
+                // fix #3973: same nested-slot handling as the record arm
+                // above (nested record/choice, or a declaration-less
+                // builtin span view).
+                if (checkNestedBorrowBearingSlot(ctx, pft, argExpr, loc, what,
+                                                 name))
+                    return true;
             }
-            return;  // first matching case wins
+            return false;  // first matching case wins
         }
-        return;
+        return false;
     }
+    return false;
 }
 
 void Resolver::checkStaticReadonlyNullSource() {
@@ -11849,25 +11974,30 @@ void Resolver::checkStaticReadonlyNullSource() {
             // arrays that are NOT borrow-bearing take the default warning
             // and are not §9.7-deferred.
             //
-            // ⚠ issue filed (not fixed here): unlike `reportRule4`'s
-            // declaration-site defer test (above, ~line 10829), which ORs
+            // fix #3973 (§9.7, v0.295): unlike `reportRule4`'s
+            // declaration-site defer test (above, ~line 11172), which ORs
             // `common::isBorrowBearingRecordOrSpan` with
-            // `isBorrowBearingRecordForStaticReadonly`, this gate consults
-            // only the narrower predicate. Adding the shared predicate here
-            // was investigated for fix #3970 (§9.7/§22.12 rule 4, v0.294)
-            // and found OBSERVATIONALLY INERT against every shape reachable
-            // through `checkStaticReadonlyRecordInit` below: that walk's own
-            // per-field test (`staticReadonlyFieldIsReferenceTyped`) is
-            // documented as a SHALLOW, one-level check that classifies
-            // every record/choice-typed field as value-typed regardless of
-            // what it recursively contains, so a record field that is
-            // ITSELF a borrow-bearing record (a span-view field being the
-            // measured case: `SpanHolder(V: ReadOnlySpan<int>)`) is never
-            // flagged even once `deferred` is forced true. Closing this
-            // needs `checkStaticReadonlyRecordInit` to recurse into a
-            // nested record/choice field's own constructor arguments — a
-            // real, structural, non-import-specific gap, filed separately.
+            // `isBorrowBearingRecordForStaticReadonly`, this gate used to
+            // consult only the narrower predicate. Adding the shared
+            // predicate here was investigated for fix #3970 (§9.7/§22.12
+            // rule 4, v0.294) and found OBSERVATIONALLY INERT at the time
+            // against every shape reachable through
+            // `checkStaticReadonlyRecordInit` below: that walk's own
+            // per-field test (`staticReadonlyFieldIsReferenceTyped`) was a
+            // SHALLOW, one-level check that classified every
+            // record/choice-typed field as value-typed regardless of what
+            // it recursively contained, so a record field that is ITSELF a
+            // borrow-bearing record (a span-view field being the measured
+            // case: `SpanHolder(V: ReadOnlySpan<int>)`) was never flagged
+            // even with `deferred` forced true. `checkStaticReadonlyRecordInit`
+            // now recurses into a nested record/choice field's own
+            // constructor arguments (fix #3973), so the shared predicate is
+            // added here too — WITHOUT it, a field like `SpanHolder` above
+            // never reaches that recursive walk at all, because `deferred`
+            // stays false and the member is skipped outright (`continue`
+            // below) before `checkStaticReadonlyRecordInit` is ever called.
             bool deferred = isBorrowBearingRecordForStaticReadonly(rt, ctx_) ||
+                            common::isBorrowBearingRecordOrSpan(rt, ctx_) ||
                             isHoldsBorrowsChoice(rt, ctx_) ||
                             isPlainInlineArrayCarryingBorrows(rt, ctx_);
             if (!deferred) continue;
