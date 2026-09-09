@@ -1004,6 +1004,116 @@ void Resolver::checkChoiceDispatchModifiers() {
     });
 }
 
+// fix #3869 (§35.1 / §35.2, v0.295): §35.1 states plainly "Choices cannot
+// have destructors, constructors, instance fields, block-form or
+// storage-backed properties, indexers, or nested types — the same
+// restriction set as enums (§10.5), for the same reasons, plus one: a
+// choice's instance storage IS its cases' payloads." §35.2 independently
+// confirms the admitted-member list ("instance methods, expression-bodied
+// read-only instance properties, static methods, `static readonly`
+// fields..., `const` members, and operator overloads ... this list rejects
+// the rest") and separately: "A choice has no user constructors, instance
+// fields, or storage-backed properties by design."
+//
+// Before this fix NOTHING enforced any of this at sema — measured on
+// origin/main `7561e19`: a choice body declaring an instance field, a
+// constructor, a nested type, an indexer, a block-form or storage-backed
+// (Auto) property, an `event` member, or a destructor compiled at exit 0
+// with zero diagnostics, for every one of those eight forms (verified live
+// with a probe per form before writing this check, not assumed from the
+// spec text alone).
+//
+// Mirrors checkEnumRestrictions's non-dispatch-modifier member-kind checks
+// (above) rather than inventing a second spelling of the same decision —
+// same predicates (hasMod, PropertyBodyKind), same message shape, "choice"
+// substituted for "enum". Two DELIBERATE differences from the enum mirror,
+// both because §35.1 names a strictly larger reject set than §10.5's enum
+// list:
+//   - `destructor` is ALSO rejected here (§35.1 names it explicitly, cited
+//     under §8.7 by the spec's own Appendix A.9 over-admission-index row
+//     for `Member` in an enum-or-choice body); checkEnumRestrictions has NO
+//     destructor check at all (a separate, pre-existing enum-side gap this
+//     fix does not touch — filed alongside #3840's other enum/choice
+//     over-admission catalog).
+//   - the `event` rejection is worded from §35.2's admitted-list boundary
+//     ("not part of" the list), not enum's/record's §24.1/§9.7 "not an
+//     owning disposable container" reasoning — an OWNING choice IS a real
+//     disposal-obligated container (§35.4 rule 1), so that container-based
+//     claim would be FALSE for it; the admitted-list boundary holds
+//     regardless of classification.
+//
+// Deliberately NOT covered here (same scope line checkChoiceDispatchModifiers
+// draws, issue #3840's own catalog): a `static` field/property/constructor
+// MODIFIER-correctness gap identical to enum's (a mutable or non-`readonly`
+// static field, a static constructor, and a `static` property of any body
+// kind — including Expression — are still admitted here exactly as
+// checkEnumRestrictions itself still admits them for enums; #3840 tracks
+// fixing BOTH sides together, not this fix, which only closes the
+// admissible-KIND gap #3869 describes). An `invariant` member is likewise
+// NOT covered — `t->members` never carries one (it is a distinct AST/side-
+// table construct, `TypeSymbol::invariantContracts`, not a `Symbol`
+// subclass at all), so neither this walk nor checkEnumRestrictions's can
+// see it; that gap (named in the spec's own Appendix A.9 row, "invariant by
+// §22.16") is uncovered for BOTH enum and choice bodies today and is
+// out of this fix's scope — filed separately.
+void Resolver::checkChoiceRestrictions() {
+    if (!ctx_.module()) return;
+    forEachTypeAndNested([&](TypeSymbol* t) {
+        if (t->kind != ast::TypeDeclKind::Choice) return;
+        for (Symbol* m : t->members) {
+            auto bad = [&](std::string_view what) {
+                ctx_.diagnostics().report(
+                    Severity::Error, m->declLoc,
+                    std::string("choice `") + std::string(t->name) +
+                    "` may not declare " + std::string(what) +
+                    " (§35.1 / §35.2)");
+            };
+            if (dynamic_cast<DestructorSymbol*>(m)) {
+                bad("a destructor");
+                continue;
+            }
+            if (auto* fs = dynamic_cast<FieldSymbol*>(m)) {
+                if (!hasMod(fs, "static")) bad("an instance field");
+                continue;
+            }
+            if (auto* cs = dynamic_cast<ConstructorSymbol*>(m)) {
+                if (!cs->isStatic) bad("a constructor");
+                continue;
+            }
+            if (dynamic_cast<NestedTypeSymbol*>(m)) {
+                bad("a nested type");
+                continue;
+            }
+            if (auto* ps = dynamic_cast<PropertySymbol*>(m)) {
+                if (ps->isIndexer) { bad("an indexer"); continue; }
+                // SEAM-ACCESSOR: `ps` is a member of the locally-declared
+                // choice `t` (forEachTypeAndNested, #3574) — this §35.2
+                // property-form check never sees an imported member
+                // (#3152), mirroring checkEnumRestrictions's identical
+                // comment on the same pattern.
+                if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl)) {
+                    if (pd->bodyKind == ast::PropertyBodyKind::Block)
+                        bad("a block-form property");
+                    else if (pd->bodyKind == ast::PropertyBodyKind::Auto)
+                        bad("a property with backing storage");
+                }
+                continue;
+            }
+            if (dynamic_cast<EventSymbol*>(m)) {
+                ctx_.diagnostics().report(
+                    Severity::Error, m->declLoc,
+                    std::string("choice `") + std::string(t->name) +
+                    "` may not declare an `event` member — §35.2's "
+                    "admitted-member list has no `event` entry (instance "
+                    "methods, expression-bodied read-only instance "
+                    "properties, static methods, `static readonly` fields, "
+                    "`const` members, and operator overloads only)");
+                continue;
+            }
+        }
+    });
+}
+
 void Resolver::checkGenericConstraintConsistency() {
     if (!ctx_.module()) return;
     // §14.2: "Contradictory constraint combinations (e.g. class, value) are

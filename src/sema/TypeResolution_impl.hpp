@@ -339,6 +339,18 @@ private:
     // pre-existing gap (issue filed) out of this fix's scope.
     void checkChoiceDispatchModifiers();
 
+    // fix #3869 (§35.1 / §35.2, v0.295): the admissible-MEMBER-KIND half
+    // checkChoiceDispatchModifiers's own comment (above) deliberately left
+    // out of scope. §35.1 states plainly: "Choices cannot have destructors,
+    // constructors, instance fields, block-form or storage-backed
+    // properties, indexers, or nested types — the same restriction set as
+    // enums (§10.5), for the same reasons." Mirrors checkEnumRestrictions's
+    // non-dispatch-modifier member-kind checks (below) rather than
+    // inventing a second spelling of the same decision — the dispatch-
+    // modifier sub-rule stays checkChoiceDispatchModifiers's job so this
+    // function does not double-report it.
+    void checkChoiceRestrictions();
+
     // §14.2 (#746): a type parameter may not carry contradictory constraints
     // (e.g. both `class` and `value`). Checked once per generic declaration
     // (type + method `where` clauses), independent of instantiation.

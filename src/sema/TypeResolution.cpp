@@ -402,6 +402,12 @@ void Resolver::run(const ast::SourceFile& src) {
     // (virtual/abstract always rejected; override admitted only on the
     // Equals/GetHashCode/ToString trio, mirroring enums).
     checkChoiceDispatchModifiers();
+    // fix #3869 (§35.1 / §35.2, v0.295): choice member-KIND restrictions
+    // (instance fields, constructors, destructors, block-form/storage-backed
+    // properties, indexers, nested types, event members) — the admissible-
+    // kind half checkChoiceDispatchModifiers's own comment deliberately left
+    // out of scope, mirroring checkEnumRestrictions above.
+    checkChoiceRestrictions();
     // §14.2 (#746): contradictory generic constraints (e.g. class + value).
     checkGenericConstraintConsistency();
     // Slice S33: method body-presence rules (§12.5 / §11.2).
