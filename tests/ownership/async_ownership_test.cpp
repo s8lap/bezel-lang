@@ -670,6 +670,27 @@ BEZEL_TEST(async_own_patternB, single_await_of_bound_task_clean) {
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
+// fix #4064 (§30.5, v0.294): the binding-context half of `await <OwningTask>`
+// in an `owned` argument position is just as owned-consuming as the bare-
+// statement half — `var y := Sink(await p.MakeOwned());` transfers the
+// produced `Conn` into the call exactly as `Sink(await p.MakeOwned());` does.
+// The walker had the rule right for the bare `ExpressionStmt` arm (it walks
+// the call's arguments); the LocalDecl / AssignmentStmt / ReturnStmt /
+// YieldStmt / DiscardStmt arms only `awaitRoot`-checked the whole RHS and
+// therefore false-rejected a call-arg position that was reached through any
+// value-producing statement form.
+BEZEL_TEST(async_own_patternB, await_into_owned_arg_localdecl_clean) {
+    auto r = parseAndCheckOwnership(wrap(
+        "var y := Sink(await p.MakeOwned()); "));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+BEZEL_TEST(async_own_patternB, await_into_owned_arg_discard_clean) {
+    auto r = parseAndCheckOwnership(wrap(
+        "_ := Sink(await p.MakeOwned()); "));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
 // ---------------------------------------------------------------------------
 // (3) Await of `Task` (no result) — no ownership obligation either way.
 // ---------------------------------------------------------------------------

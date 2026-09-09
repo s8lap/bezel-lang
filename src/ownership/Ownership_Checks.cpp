@@ -12179,20 +12179,36 @@ void MethodOwnership::collectOwnedConsumingAwaitsStmt(
         // deliberately WITHOUT a LocalConstDecl one for this reason.
         // LOCALDECL-ONLY: #3591 see above
         if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&cur)) {
-            if (ld->initializer)
+            if (ld->initializer) {
+                // fix #4064 (§30.5, v0.294): the top-level `await` form
+                // (`var x := await ...`) is owned-consuming, AND a call-arg
+                // form (`var x := Sink(await ...)`) is owned-consuming too
+                // when the awaited OwningTask lands in an `owned` parameter.
+                // The `awaitRoot` half covers the first; the deeper walk
+                // covers the second — matching the bare-ExpressionStmt arm
+                // that already used `collectOwnedConsumingInExpr`.
                 if (auto* a = awaitRoot(*ld->initializer)) out.insert(a);
+                collectOwnedConsumingInExpr(*ld->initializer, out);
+            }
             return;
         }
         if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(&cur)) {
             // #1826 / §30.5 / §17.13: `_ := await ...;` is owned-consuming.
-            if (ds->value)
+            // fix #4064: same call-arg extension as the LocalDecl arm above
+            // (`_ := Sink(await ...)` is owned-consuming when the formal is
+            // `owned`).
+            if (ds->value) {
                 if (auto* a = awaitRoot(*ds->value)) out.insert(a);
+                collectOwnedConsumingInExpr(*ds->value, out);
+            }
             return;
         }
         if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&cur)) {
             // `target := await ...` is owned-consuming when the target is an
             // owned storage location — a local (re-assigned owned local), an
             // `owned` field, or an owning-collection slot.
+            // fix #4064: also admit `target := Sink(await ...)` for the same
+            // reason as the LocalDecl/DiscardStmt arms above.
             if (as->op == ":=" && as->value) {
                 if (auto* a = awaitRoot(*as->value)) {
                     bool ownedTarget =
@@ -12202,6 +12218,7 @@ void MethodOwnership::collectOwnedConsumingAwaitsStmt(
                          indexerSetterTakesOwned(*as->target));
                     if (ownedTarget) out.insert(a);
                 }
+                collectOwnedConsumingInExpr(*as->value, out);
             }
             return;
         }
@@ -12209,17 +12226,25 @@ void MethodOwnership::collectOwnedConsumingAwaitsStmt(
             // `return await ...` — owned-consuming unconditionally; a
             // Pattern A `return await Producer()` is also admitted and
             // recorded in returnPositionAwaits_.
-            if (rs->value)
+            // fix #4064: also admit `return Sink(await ...)` for an owned
+            // return type — the await consumed by an `owned` formal IS the
+            // ownership transfer.
+            if (rs->value) {
                 if (auto* a = awaitRoot(*rs->value)) {
                     out.insert(a);
                     returnPositionAwaits_.insert(a);
                 }
+                collectOwnedConsumingInExpr(*rs->value, out);
+            }
             return;
         }
         if (auto* ys = dynamic_cast<const ast::YieldStmt*>(&cur)) {
             // `yield return await ...` in an owned-yielding iterator (§29.2).
-            if (ys->value)
+            // fix #4064: same call-arg extension as the LocalDecl arm above.
+            if (ys->value) {
                 if (auto* a = awaitRoot(*ys->value)) out.insert(a);
+                collectOwnedConsumingInExpr(*ys->value, out);
+            }
             return;
         }
         if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(&cur)) {
