@@ -2,27 +2,27 @@
 
 | | |
 |---|---|
-| **Status** | accepted — accepted (2026-07-24, delegated ruling); re-drafted 2026-09-06 on the v0.294 §28.14 trace (owner-accepted in session) |
+| **Status** | accepted — accepted (2026-07-24, delegated ruling); re-drafted 2026-09-06 on the v0.294 §28.14 trace (owner-accepted in session); typed handlers 2026-09-09 (owner-directed API change, pass 3) |
 | **Tracking issue** | [#1402](https://github.com/s8lap/bezel-lang/issues/1402) |
 | **Target module** | `System.Net.Http` (proposal 0001's module) |
-| **Written against** | spec/stdlib **v0.294** |
+| **Written against** | spec/stdlib **v0.295** |
 | **Depends on** | Proposal 0001 (client; shared `HttpResponse`/`HttpHeaders`/`HttpMethod`/`Http`), proposal 0007 (`System.Net` substrate — `TcpListener`), stdlib §7 Stream family (#1394/#645; proposal 0006), timers (#1378). `Locked<T>` is stdlib §6.11 (proposal 0003 graduated v0.186 — no longer a dependency). The tour additionally uses proposal 0021 (`ILogger`/`LogHub`) and proposal 0022 (`System.Testing`) as *example* material only; nothing in §3 depends on either. |
-| **Design influences** | ASP.NET **Minimal APIs** and **Express** for the routing surface (the two independently converged on the same shape); WHATWG fetch for the `Request → Response` handler symmetry; the stdlib §6.5 event pattern for the registration shape (`_clicked += OnClicked` is `_routes.Get("/x", OnX)` with a route in front); **not** full ASP.NET (no controllers, no DI container, no middleware pipeline in v1), **not** raw Node `http` |
+| **Design influences** | ASP.NET **Minimal APIs** and **Express** for the routing surface (the two independently converged on the same shape); WHATWG fetch for the `Request → Response` handler symmetry; ASP.NET Minimal APIs' *return-the-value* handlers and Axum's signature binding for the typed handler shape — bound by type and position, with no trait solver and no reflection; the stdlib §6.5 event pattern for the registration shape (`_clicked += OnClicked` is `_routes.Get("/x", OnX)` with a route in front); **not** full ASP.NET (no controllers, no DI container, no middleware pipeline in v1), **not** raw Node `http` |
 | **Bezel-native leverage** | Handlers run on worker **domains**; §30.14 sendability makes data-race freedom a *compile-time* property of the server. Registration is **ownership-shaped**: a service owns its `RouteTable`, so a `this`-bound handler is admitted by §28.14's form 4 exactly as an event handler is — the same rule that makes an event subscription sound makes a route registration sound, and the table's teardown severs every handler. |
-| **Redraft note** | Rewritten 2026-09-06 against three defects in the 2026-07-24 text. (1) `HttpApp.Get(route, handler)` declared a *plain* function parameter and stored it — §28.14's call-bounded default (v0.177) forbids storing a plain function-typed parameter anywhere, so the table could not hold a handler at all. (2) The route builder received the table as a *parameter* (`Routes(app: HttpApp)`), and a bounding object that is a parameter admits capture-free callbacks only (§28.14), so `app.Get("/todos/{id}", api.GetById)` — a method reference whose capture is its receiver `api` — did not compile even with `scoped` on the parameter. (3) `lambda(req) => Http.Text("ok")` infers `owned HttpResponse` at an `OwningTask<HttpResponse>` slot, and no §5.1 conversion bridges the two (§22.6 *Lambda-literal arguments*), so the sync-lambda showcase was a type error. Tour simplified 2026-09-09 (owner-directed): a generic `Store<T>` takes the lock protocol out of every handler, the factories and the duplicate resource class go, and the tour's `Count + 1` id minting — which could overwrite a live key after a delete — is replaced by minting under the guard. |
+| **Redraft note** | Rewritten 2026-09-06 against three defects in the 2026-07-24 text. (1) `HttpApp.Get(route, handler)` declared a *plain* function parameter and stored it — §28.14's call-bounded default (v0.177) forbids storing a plain function-typed parameter anywhere, so the table could not hold a handler at all. (2) The route builder received the table as a *parameter* (`Routes(app: HttpApp)`), and a bounding object that is a parameter admits capture-free callbacks only (§28.14), so `app.Get("/todos/{id}", api.GetById)` — a method reference whose capture is its receiver `api` — did not compile even with `scoped` on the parameter. (3) `lambda(req) => Http.Text("ok")` infers `owned HttpResponse` at an `OwningTask<HttpResponse>` slot, and no §5.1 conversion bridges the two (§22.6 *Lambda-literal arguments*), so the sync-lambda showcase was a type error. Tour simplified 2026-09-09 (owner-directed): a generic `Store<T>` takes the lock protocol out of every handler, the factories and the duplicate resource class go, and the tour's `Count + 1` id minting — which could overwrite a live key after a delete — is replaced by minting under the guard. Typed handlers 2026-09-09 (owner-directed): a handler is an ordinary `async` method whose parameters bind the route captures and the JSON body by type and position and whose `Task<R>` result *is* the response (§7 Q3, Q4); the classic `(HttpRequest) -> OwningTask<HttpResponse>` shape remains as one member of the family; `RouteTable` gains one thirteen-member family per verb (§3) and two derived type properties (§9e). |
 
 ## 1. Design principles
 
-1. **A handler is a function from request to response, and it is async.** `(HttpRequest) -> OwningTask<HttpResponse>` — the service-worker shape, always a task. A real handler awaits a lock, a body, or a store; the spelling for the rare synchronous one is `async lambda(req) => Http.Text("ok")` (§30.6). No controllers, no reflection-discovered actions. What you register is what runs.
+1. **A handler is an ordinary `async` method; its signature is the contract.** `GetById(id: int): Task<Todo?>` — the parameters bind the route captures and the JSON body by *type and position* (an `HttpRequest` slot is the request; `string`/`IParsable<X>` slots are the captures in order; an `IDeserializable` value-type slot last on `Post`/`Put`/`Patch` is the body), and the result type is the response: `Task<R>` → JSON (201 on `Post`), `Task<R?>` → JSON or 404, `Task<Array<S>>` → a JSON array, `Task<string>` → text/plain, `Task` → 204, `OwningTask<HttpResponse>` → as is. Full control is the same family: take `HttpRequest`, return `OwningTask<HttpResponse>` — the classic service-worker shape, one member among thirteen per verb, and the spelling of a raw lambda (`async lambda(req) => Http.Text("ok")`). Always a task (§7 Q3). No controllers, no reflection-discovered actions, no names: what you register is what runs, and a test calls it as the method it is.
 2. **Registration is ownership-shaped.** A service *owns* its route table (`private owned readonly _routes: RouteTable := new();`) and registers its own methods on it in its constructor: `_routes.Get("/{id}", GetById)`. That call's receiver chain is `this._routes`, one `owned`-field hop, so §28.14 form 4 resolves the bounding object to `this` and admits a `this`-bound method reference — the stdlib §6.5 event pattern's trace, verbatim. The table's disposal severs the handlers; nothing outlives what it captures.
 3. **Symmetric vocabulary with 0001.** The server's `HttpResponse` is the type the client receives; `HttpHeaders` and `HttpMethod` are shared; body accessors (`Text`/`Bytes`/`Json<T>`/`JsonOwned<T>`) read the same on an incoming request as on a client response, including the §29.11 single-consumption rule. `Http.*` gains response *constructors*, the server-direction mirror of the client's *accessors*.
 4. **Concurrency = domains, checked by the compiler.** `HttpServer.Listen` spawns worker domains and constructs one service object *on each* from a capture-free factory — a §30.14 spawn position, so a handler is born on its worker and never asked to cross a boundary (function values are never sendable). What a worker needs from the composition root arrives as one **sendable deps object per worker**, moved through the spawn (stdlib §6.8's `(owned A) -> owned R` shape); state shared across workers rides inside it as `Shared<Locked<…>>` handles (§28.13's payload set). Reaching unsynchronized shared state from a handler is a compile error naming the failing sendability rule.
-5. **Binding without reflection; faults closed by default.** `req.Param<int>("id")` is ordinary §11.8 static-interface dispatch over `IParsable<T>` (stdlib §2.19) — no typed route patterns, no attribute binding. A malformed parameter or body raises the one server exception, `HttpResponseException(400, …)`, and the innermost dispatcher converts it to the response — stdlib §1's failure-signal rule, band 4: the dispatcher *is* the protocol boundary. Anything else a handler throws becomes an opaque 500 with a server-side report; nothing streams an exception message to a client.
+5. **Binding without reflection; faults closed by default.** A typed slot is exactly what `req.Param<int>("id")` and `req.Json<NewTodo>()` are — ordinary §11.8 static-interface dispatch over `IParsable<T>` (stdlib §2.19) and the compiler-known `Json<T>` read (stdlib §2.15) — performed by the table from the handler's *types*: a slot type's **binding capability** is structural (a §3.6 derived type property, §9e) and its assignment to the route is decided by count at registration — no typed route patterns, no attribute binding, no name matching. A malformed capture or body raises the one server exception, `HttpResponseException(400, …)`, before the handler runs, and the innermost dispatcher converts it to the response — stdlib §1's failure-signal rule, band 4: the dispatcher *is* the protocol boundary. A handler whose slot list does not fit its route is a registration-time `ArgumentException` (band 1), never a request-time surprise. Anything else a handler throws becomes an opaque 500 with a server-side report; nothing streams an exception message to a client.
 6. **Testable without sockets.** A service is an ordinary object; `new HttpRequest(HttpMethod.Get, "/7")` plus `await service.Routes.Dispatch(req)` runs the full auth → match → handler path in-process, with no port, no domain, no `Listen`.
 
 ## 2. Tour by example
 
-Two resources, seven endpoints, a forty-line generic `Store<T>` that hides the shared map's lock behind one-line calls, a per-worker deps object carrying a store and a logger, `Main`, and two tests. Written to be extrapolated: fifty endpoints is about eight of these resource classes, each a top-to-bottom read over the one `Store<T>`.
+Two resources, seven endpoints — six of them ordinary `async` methods the table binds from their signatures — a forty-line generic `Store<T>` that hides the shared map's lock behind one-line calls, a per-worker deps object carrying a store and a logger, `Main`, and two tests. Written to be extrapolated: fifty endpoints is about eight of these resource classes, each a top-to-bottom read over the one `Store<T>`.
 
 ```bezel
 module TodoService;
@@ -95,7 +95,7 @@ public sealed class Api: IHttpService
   public constructor(owned deps: Deps)
     _deps := deps;                                                          // [R0]
     _routes.Around(Guard);                                                  // [R1] wraps every route below and every mounted child
-    _routes.Get("/health", async lambda(req) => Http.Text("ok"));           // [R2] capture-free: admitted at any bounding object
+    _routes.Get("/health", async lambda() => "ok");                         // [R2] Task<string> ⇒ 200 text/plain; capture-free
     _routes.Mount("/todos", new TodoApi(_deps.Todos));                      // [R3] the child borrows the store; `_deps` outlives it
   end constructor;
 
@@ -111,7 +111,7 @@ public sealed class Api: IHttpService
   end Guard;
 end Api;
 
-// ── One resource class: six one-line handlers over the store it borrows from the root ──
+// ── One resource class: six handlers that are ordinary methods over the store it borrows from the root ──
 public sealed class TodoApi: IHttpService
   private readonly _todos: Store<Todo>;                                    // back-reference (§28.3): the root's `_deps` outlives this child
   private owned readonly _routes: RouteTable := new();                     // LAST
@@ -119,41 +119,25 @@ public sealed class TodoApi: IHttpService
 
   public constructor(todos: Store<Todo>)
     _todos := todos;
-    _routes.Get   ("/",          List);                                     // [T1]
-    _routes.Get   ("/{id}",      GetById);                                  // [T2]
-    _routes.Post  ("/",          Create);                                   // [T3]
-    _routes.Put   ("/{id}",      Replace);                                  // [T4]
-    _routes.Patch ("/{id}/done", MarkDone);                                 // [T5]
-    _routes.Delete("/{id}",      Remove);                                   // [T6]
+    _routes.Get   ("/",          List);                                     // [T1] () -> Task<Array<Todo>>    ⇒ 200 JSON array
+    _routes.Get   ("/{id}",      GetById);                                  // [T2] (int) -> Task<Todo?>       ⇒ 200 JSON, or 404
+    _routes.Post  ("/",          Create);                                   // [T3] (NewTodo) -> Task<Todo>    ⇒ 201 JSON; NewTodo is the body
+    _routes.Put   ("/{id}",      Replace);                                  // [T4] (int, Todo) -> Task<Todo?> ⇒ {id}, then the body
+    _routes.Patch ("/{id}/done", MarkDone);                                 // [T5] (int) -> Task<Todo?>
+    _routes.Delete("/{id}",      Remove);                                   // [T6] (int) -> Task             ⇒ 204
   end constructor;
 
-  private async method List(req: HttpRequest): OwningTask<HttpResponse>
-    return Http.JsonArray(await _todos.All());                              // Pattern A: the snapshot dies with the statement (§30.5)
-  end List;
-
-  private async method GetById(req: HttpRequest): OwningTask<HttpResponse>
-    return Http.JsonOrNotFound(await _todos.Find(req.Param<int>("id")));   // "/abc" ⇒ 400 before any state is touched; null ⇒ 404
-  end GetById;
-
-  private async method Create(req: HttpRequest): OwningTask<HttpResponse>
-    var body := await req.Json<NewTodo>();                                  // malformed body ⇒ 400
-    var todo := await _todos.Add(lambda(id) => new Todo(id, body.Title, false));
-    return Http.Json(todo, status := 201);
-  end Create;
-
-  private async method Replace(req: HttpRequest): OwningTask<HttpResponse>
-    var id := req.Param<int>("id");
-    var body := await req.Json<Todo>();
+  // Public on purpose: the table calls these per request, and a test calls them directly (no request, no JSON).
+  public async method List(): Task<Array<Todo>> => await _todos.All();
+  public async method GetById(id: int): Task<Todo?> => await _todos.Find(id);
+  public async method Create(body: NewTodo): Task<Todo> => await _todos.Add(lambda(id) => new Todo(id, body.Title, false));
+  public async method Replace(id: int, body: Todo): Task<Todo?>
     if body.Id <> id then throw new HttpResponseException(400, "body id does not match the route"); end;
-    return Http.JsonOrNotFound(await _todos.Update(id, lambda(_) => body));
+    return await _todos.Update(id, lambda(_) => body);
   end Replace;
-
-  private async method MarkDone(req: HttpRequest): OwningTask<HttpResponse>
-    return Http.JsonOrNotFound(await _todos.Update(req.Param<int>("id"), lambda(t) => t with(Done := true)));
-  end MarkDone;
-
-  private async method Remove(req: HttpRequest): OwningTask<HttpResponse>
-    return Http.Status((if await _todos.Remove(req.Param<int>("id")) then 204 else 404));
+  public async method MarkDone(id: int): Task<Todo?> => await _todos.Update(id, lambda(t) => t with(Done := true));
+  public async method Remove(id: int): Task                                  // falls off the end ⇒ 204
+    if not await _todos.Remove(id) then throw new HttpResponseException(404); end;
   end Remove;
 end TodoApi;
 
@@ -174,7 +158,7 @@ public static class Program
 end Program;
 ```
 
-The tests: no sockets, no domains, no `Listen`. A resource class is constructed over a `Store<Todo>` the test owns and seeds, and dispatched directly — the path is the service's own (`/{id}`, not `/todos/{id}`, because the `/todos` prefix belongs to the root's `Mount`).
+The tests: no sockets, no domains, no `Listen`. The first calls a handler as the method it is — no request, no JSON, no table. The second dispatches one request through the table to prove the binding; the path is the service's own (`/{id}`, not `/todos/{id}`, because the `/todos` prefix belongs to the root's `Mount`).
 
 ```bezel
 module TodoService.Tests;
@@ -183,30 +167,27 @@ import System.Testing;            // 0022 §5, §8 — explicit import by design
 import System.Net.Http;
 
 public class TodoApiTests
-  public static async method GetByIdReturnsTheTodo(): Task
+  public static async method CreateIsAnOrdinaryMethodCall(): Task          // (a) no request, no JSON, no table
     using var store := new Store<Todo>();                                   // fixture = using var (0022 §7)
-    var todo := await store.Add(lambda(id) => new Todo(id, "write the server proposal", false));
     using var api := new TodoApi(store);                                    // the service borrows the store, which outlives it
-    using var req := new HttpRequest(HttpMethod.Get, $"/{todo.Id}");        // dispatched directly: the service's own path
-    using var resp := await api.Routes.Dispatch(req);                       // Pattern B
-    Assert.Equal(200, resp.Status);
-    Assert.Equal(todo, await resp.Json<Todo>());                            // an all-value positional record is hashable (§9.1, §3.6)
-  end GetByIdReturnsTheTodo;
+    var todo := await api.Create(new NewTodo("write the server proposal")); // the handler IS the domain method
+    Assert.Equal(new Todo(1, "write the server proposal", false), todo);    // every component admissible ⇒ hashable (§9.2, §3.6)
+  end CreateIsAnOrdinaryMethodCall;
 
-  public static async method NonNumericIdIsA400(): Task
+  public static async method NonNumericIdIsA400(): Task                    // (b) binding happens in the table, before GetById runs
     using var store := new Store<Todo>();
     using var api := new TodoApi(store);
-    using var req := new HttpRequest(HttpMethod.Get, "/not-a-number");
-    using var resp := await api.Routes.Dispatch(req);
-    Assert.Equal(400, resp.Status);                                         // Param<int> ⇒ HttpResponseException(400) ⇒ converted
+    using var req := new HttpRequest(HttpMethod.Get, "/not-a-number");      // dispatched directly: the service's own path
+    using var resp := await api.Routes.Dispatch(req);                       // Pattern B
+    Assert.Equal(400, resp.Status);                                         // int.Parse ⇒ HttpResponseException(400) ⇒ converted
   end NonNumericIdIsA400;
 end TodoApiTests;
 
 public static class TestMain
   public static async method Main(): Task<int>                              // 0022 §3.2 (b): the registration runner
     using var runner := new TestRunner();
-    runner.Add("GetByIdReturnsTheTodo", TodoApiTests.GetByIdReturnsTheTodo);   // static references: capture-free, admitted
-    runner.Add("NonNumericIdIsA400",    TodoApiTests.NonNumericIdIsA400);
+    runner.Add("CreateIsAnOrdinaryMethodCall", TodoApiTests.CreateIsAnOrdinaryMethodCall);   // static references: capture-free, admitted
+    runner.Add("NonNumericIdIsA400",           TodoApiTests.NonNumericIdIsA400);
     return await runner.RunAsync();
   end Main;
 end TestMain;
@@ -214,12 +195,13 @@ end TestMain;
 
 Things to notice:
 
-- Every registration line has the same shape — `_routes.<Verb>(route, Method)` — and the same ownership trace (§4.1): receiver `this._routes`, bounding object `this`, capture `this`. The registrations live in the constructor because that is where the object is being assembled, not because the rule requires it: anywhere `this._routes` is the receiver, the trace is identical. The one lambda (`/health`) captures nothing and is admitted at any bounding object; `async lambda(req) => …` is the spelling for a handler with nothing to await.
+- Every registration line has the same shape — `_routes.<Verb>(route, Method)` — and the same ownership trace (§4.1): receiver `this._routes`, bounding object `this`, capture `this`. The registrations live in the constructor because that is where the object is being assembled, not because the rule requires it: anywhere `this._routes` is the receiver, the trace is identical. The *binding* is read off the method's signature (§3, §4.1): `GetById(id: int)` takes `{id}` parsed by `int.Parse`; `Replace(id: int, body: Todo)` takes `{id}` then the body; `Create(body: NewTodo)` takes only the body; `List()` takes nothing. The result type answers: `Task<Todo?>` is 200 or 404, `Task<Todo>` on `Post` is 201, `Task<Array<Todo>>` is a JSON array, `Task` is 204. The one lambda (`/health`) captures nothing and is admitted at any bounding object; `async lambda() => "ok"` is a `Task<string>` handler, answered as text/plain — the smallest handler there is. A raw lambda is `async lambda(req) => Http.Text("ok")`, resolved to the classic `(HttpRequest) -> OwningTask<HttpResponse>` member, whose *closed* slot is what fixes an async lambda's `Task`/`OwningTask` wrapper (§7 Q3); a typed-input raw-output lambda is spelled as a method or with an explicit type-argument list.
 - The children are **owned by the table** (`Mount(prefix, owned child)`). The one borrow a child holds — its `Store<Todo>` — is sourced from the root's `_deps`, which is declared *before* `_routes` and is therefore disposed *after* it (§28.4 step 2, reverse declaration order). That ordering is the whole discipline: **later fields borrow from earlier ones**, and `_routes` — the field whose disposal tears down everything that borrows — goes last.
-- `Http.Text(…)`, `Http.Json(…)`, `Http.JsonArray(…)`, `Http.JsonOrNotFound(…)`, `Http.Status(404)` are the response **constructors**. A handler that wants a header sets it with the indexer before returning: `var r := Http.Json(todo); r.Headers["ETag"] := tag; return r;` (0001 §3.4's indexer-set; there is no `Set`).
+- `Http.Text(…)`, `Http.Json(…)`, `Http.JsonArray(…)`, `Http.JsonOrNotFound(…)`, `Http.Status(404)` are the response **constructors** — the vocabulary of a handler that returns `OwningTask<HttpResponse>` for full control (a header, a redirect, bytes, a status the shapes do not name). Such a handler is registered on the same line as a typed one; `Http.JsonOrNotFound(await _todos.Find(id))` is what `Task<Todo?>` means. A handler that wants a header sets it with the indexer before returning: `var r := Http.Json(todo); r.Headers["ETag"] := tag; return r;` (0001 §3.4's indexer-set; there is no `Set`).
 - `Listen` is the only blocking point and it is `await`ed — no `Run()`/`RunAsync()` split, no sync surface (#1362). The factory (`lambda(owned d: Deps) => new Api(move d)`) is a non-capturing lambda: capture-free, hence admitted at a spawn position (a static method reference is the other admitted spelling); the moment it captures, the compiler rejects it with the §30.14 spawn-entry diagnostic.
-- `Store<T>` is ordinary user code — no compiler-known part, forty lines, reusable by every resource. It keeps the lock protocol in one place: each method acquires its guard with its *last* `await` and does synchronous work under it, so no guard is ever live across a suspension (stdlib §6.11's lint has nothing to fire on), and a handler reads as one `return Http.…(await _todos.…)` line. `All()` returns `Task<Array<T>>` — Pattern A — precisely so that `Http.JsonArray(await _todos.All())` is admitted (§30.5: a Pattern B await may not sit in a plain argument position). Its `where T: value, sendable` is what lets `Locked<Dictionary<int, T>>` be instantiated in the body: §14.2 makes `T` count as sendable there, §30.14 makes a borrowing collection of sendable values sendable, §28.11 makes a non-move-only value a copy slot, and stdlib §6.11 admits that interior — `sendable` is not redundant beside `value`, since `value` alone admits the move-only kinds §28.11 rejects as elements. Ids are minted under the guard (`Keys.MaxOrNull() ?? 0` plus one), so a delete never makes the next `Add` overwrite a live key.
-- If a future `route` modifier lands (§11), each `[T]` line becomes a modifier on the method it names and the constructor loses those lines; nothing else changes.
+- `Store<T>` is ordinary user code — no compiler-known part, forty lines, reusable by every resource. It keeps the lock protocol in one place: each method acquires its guard with its *last* `await` and does synchronous work under it, so no guard is ever live across a suspension (stdlib §6.11's lint has nothing to fire on), and a handler reads as one `=> await _todos.…` line. `All()` returns `Task<Array<T>>` — Pattern A — so that `List(): Task<Array<Todo>> => await _todos.All()` is §30.5's chained slot (the outer task moves the inner into its result slot; a task *move*, not a borrow escape) and the table's JSON-array shape. Its `where T: value, sendable` is what lets `Locked<Dictionary<int, T>>` be instantiated in the body: §14.2 makes `T` count as sendable there, §30.14 makes a borrowing collection of sendable values sendable, §28.11 makes a non-move-only value a copy slot, and stdlib §6.11 admits that interior — `sendable` is not redundant beside `value`, since `value` alone admits the move-only kinds §28.11 rejects as elements. Ids are minted under the guard (`Keys.MaxOrNull() ?? 0` plus one), so a delete never makes the next `Add` overwrite a live key.
+- The handlers are `public` because they are the class's callable surface for *two* callers: the table per request, and a test directly (`await api.Create(new NewTodo("…"))`). Registration needs no visibility — form 4 is capture-based — so `private` would register just as well and hide the seam. Comparing a `Task<Todo?>` result directly needs `Assert.Equal<Todo?>(expected, await api.GetById(id))`: `Equal<T>(expected: T, actual: T)` would bind `T` to both `Todo` and `Todo?`, which §14.5's *Agreement* rule rejects; the explicit list makes the `Todo` argument convert (§5.1).
+- If a future `route` modifier lands (§11), each `[T]` line becomes a modifier on the method it names — `public route(Get, "/{id}") method GetById(id: int): Task<Todo?>` — and the constructor loses those lines; the binding, read from the same signature, does not change.
 
 ## 3. Proposed API surface
 
@@ -279,18 +261,135 @@ public interface IHttpService                                                   
   readonly property Routes: RouteTable;               // the implementer's `owned` field, read through an expression-bodied property
 end IHttpService;
 
-// ── The per-worker table. Compiler-known: it STORES scoped handlers (§28.14's stdlib retention register, §9b) ──
+// ── The per-worker table. Compiler-known: it STORES scoped handlers (§28.14's stdlib retention register, §9b) and
+//    BINDS them by type (the Json<T>/Parse<T> dispensation, stdlib §2.15/§6.7; §3.6's behavior-dispatch reservation, §9e) ──
 public class RouteTable                                                                                      // NEW
   public constructor();                               // `private owned readonly _routes: RouteTable := new();` (§17.7)
-  // Route syntax: literal segments, {name} captures, {*rest} tail capture. Longest literal prefix wins.
-  // A duplicate verb+route, or a Mount prefix colliding with a literal route (either direction), is an
-  // ArgumentException at the registering call (band 1) — at construction, never at request time.
-  public method Get   (route: string, scoped handler: (HttpRequest) -> OwningTask<HttpResponse>);
-  public method Post  (route: string, scoped handler: (HttpRequest) -> OwningTask<HttpResponse>);
-  public method Put   (route: string, scoped handler: (HttpRequest) -> OwningTask<HttpResponse>);
-  public method Patch (route: string, scoped handler: (HttpRequest) -> OwningTask<HttpResponse>);
-  public method Delete(route: string, scoped handler: (HttpRequest) -> OwningTask<HttpResponse>);
-  public method Route (verb: HttpMethod, route: string, scoped handler: (HttpRequest) -> OwningTask<HttpResponse>);
+  // Route syntax: literal segments, {name} captures, {*rest} tail capture (an empty tail is the empty string,
+  // never an absence). Longest literal prefix wins. A duplicate verb+route, a Mount prefix colliding with a
+  // literal route (either direction), or a handler whose slot list does not fit its route (the binding rule
+  // below) is an ArgumentException at the registering call (band 1) — at construction, never at request time.
+  //
+  // ── Handlers: one binding rule, three result arms, arity 0..3, plus the classic shape (§4.1; §7 Q3, Q4) ────
+  // Each slot A, B, C binds by TYPE and POSITION — names are documentation only (§27.1). A slot type's
+  // BINDING CAPABILITY is structural (§3.6, §9e):
+  //   HttpRequest                                   → request (at most one, anywhere in the list);
+  //   string, or an IParsable<X> conformer          → capture: the next route capture in route order, X.Parse
+  //                                                    (§11.8); a parse fault ⇒ HttpResponseException(400, …, cause);
+  //   an IDeserializable VALUE type (§9.8)          → body: read as req.Json<X>(); a class type is not admitted
+  //                                                    (HttpRequest + JsonOwned<X>); a type that is both capture-
+  //                                                    and body-capable is admitted anywhere;
+  //   anything else                                 → a compile error at the registration line naming the
+  //                                                    capability rule and the remedy.
+  // The ASSIGNMENT of capabilities to the route happens at registration, by count: with m non-request slots
+  // and k route captures, m = k ⇒ every slot is a capture; m = k + 1 on Post/Put/Patch with a body-capable
+  // LAST slot ⇒ the last slot is the body; anything else is the ArgumentException above. On the verb-named
+  // members a body-ONLY type not in the last slot, or on Get/Delete, is a compile error; through Route, whose
+  // verb is a runtime argument, the same condition is the ArgumentException at registration.
+  // The result slot classifies R with `?` stripped — its RESPONSE SHAPE (§3.6, §9e):
+  //   Task<R>, R: ISerializable            → JSON, 200 — 201 on Post;  Task<R?>: the same, or an empty 404 on null
+  //   Task<Array<S>>, S an ISerializable value type → JSON array, same statuses (Array<S>? ⇒ 404 on null)
+  //   Task<string>                          → text/plain; charset=utf-8, 200 — 201 on Post (string? ⇒ 404 on null)
+  //   Task                                  → empty body, `status` (204 unless named: 202, 205, …)
+  //   OwningTask<HttpResponse>              → sent as is: headers, any status, bytes, redirects — full control
+  //   any other R                           → a compile error at the registration line (HttpResponse ⇒ "declare
+  //                                            OwningTask<HttpResponse>"); a fourth slot ⇒ no overload — read it
+  //                                            from an HttpRequest slot instead.
+  // Resolution (§4.1): the three arms partition method references because Task<T> and OwningTask<T> are
+  // siblings under Task (§30.3, v0.295 — the partition rests on that one declaration), and the plain-Task arm
+  // is the family's top; its `status` default is LOAD-BEARING — it is what lets §22.6's defaulted-arity
+  // tie-break prefer the typed/raw candidate and keeps the arity-0 non-generic preference from routing a
+  // Task<R> handler to the void arm. The classic non-generic member is kept beside Get<A> raw because an async
+  // LAMBDA at the raw arm needs a CLOSED target slot: §30.6/§30.1 state no rule choosing its Task/OwningTask
+  // wrapper against a free Task<R> slot, and §22.6's non-generic preference decides the pair. A typed-input,
+  // raw-output lambda (`async lambda(id: int) => Http.Text(…)`) is spelled as a method or with an explicit
+  // type-argument list (`Get<int>(…)`); a method reference is never affected — its declared return fixes the
+  // wrapper. An explicit `status` argument selects the void arms only (three supplied arguments): a Task<R>
+  // handler registered with one answers an empty `status` and its result is disposed unread — a documented
+  // choice, not a diagnostic.
+  public method Get             (route: string, scoped handler: (HttpRequest) -> OwningTask<HttpResponse>);   // classic
+  public method Get<R>          (route: string, scoped handler: () -> Task<R>);
+  public method Get<A, R>       (route: string, scoped handler: (A) -> Task<R>);
+  public method Get<A, B, R>    (route: string, scoped handler: (A, B) -> Task<R>);
+  public method Get<A, B, C, R> (route: string, scoped handler: (A, B, C) -> Task<R>);
+  public method Get             (route: string, scoped handler: () -> Task,        status: int := 204);
+  public method Get<A>          (route: string, scoped handler: (A) -> Task,       status: int := 204);
+  public method Get<A, B>       (route: string, scoped handler: (A, B) -> Task,    status: int := 204);
+  public method Get<A, B, C>    (route: string, scoped handler: (A, B, C) -> Task, status: int := 204);
+  public method Get             (route: string, scoped handler: () -> OwningTask<HttpResponse>);
+  public method Get<A>          (route: string, scoped handler: (A) -> OwningTask<HttpResponse>);
+  public method Get<A, B>       (route: string, scoped handler: (A, B) -> OwningTask<HttpResponse>);
+  public method Get<A, B, C>    (route: string, scoped handler: (A, B, C) -> OwningTask<HttpResponse>);
+  // Post: the same thirteen; a body slot is admitted; a Task<R>/Task<string> result answers 201.
+  public method Post             (route: string, scoped handler: (HttpRequest) -> OwningTask<HttpResponse>);  // classic
+  public method Post<R>          (route: string, scoped handler: () -> Task<R>);
+  public method Post<A, R>       (route: string, scoped handler: (A) -> Task<R>);
+  public method Post<A, B, R>    (route: string, scoped handler: (A, B) -> Task<R>);
+  public method Post<A, B, C, R> (route: string, scoped handler: (A, B, C) -> Task<R>);
+  public method Post             (route: string, scoped handler: () -> Task,        status: int := 204);
+  public method Post<A>          (route: string, scoped handler: (A) -> Task,       status: int := 204);
+  public method Post<A, B>       (route: string, scoped handler: (A, B) -> Task,    status: int := 204);
+  public method Post<A, B, C>    (route: string, scoped handler: (A, B, C) -> Task, status: int := 204);
+  public method Post             (route: string, scoped handler: () -> OwningTask<HttpResponse>);
+  public method Post<A>          (route: string, scoped handler: (A) -> OwningTask<HttpResponse>);
+  public method Post<A, B>       (route: string, scoped handler: (A, B) -> OwningTask<HttpResponse>);
+  public method Post<A, B, C>    (route: string, scoped handler: (A, B, C) -> OwningTask<HttpResponse>);
+  // Put, Patch: the same thirteen; a body slot is admitted.
+  public method Put              (route: string, scoped handler: (HttpRequest) -> OwningTask<HttpResponse>);  // classic
+  public method Put<R>           (route: string, scoped handler: () -> Task<R>);
+  public method Put<A, R>        (route: string, scoped handler: (A) -> Task<R>);
+  public method Put<A, B, R>     (route: string, scoped handler: (A, B) -> Task<R>);
+  public method Put<A, B, C, R>  (route: string, scoped handler: (A, B, C) -> Task<R>);
+  public method Put              (route: string, scoped handler: () -> Task,        status: int := 204);
+  public method Put<A>           (route: string, scoped handler: (A) -> Task,       status: int := 204);
+  public method Put<A, B>        (route: string, scoped handler: (A, B) -> Task,    status: int := 204);
+  public method Put<A, B, C>     (route: string, scoped handler: (A, B, C) -> Task, status: int := 204);
+  public method Put              (route: string, scoped handler: () -> OwningTask<HttpResponse>);
+  public method Put<A>           (route: string, scoped handler: (A) -> OwningTask<HttpResponse>);
+  public method Put<A, B>        (route: string, scoped handler: (A, B) -> OwningTask<HttpResponse>);
+  public method Put<A, B, C>     (route: string, scoped handler: (A, B, C) -> OwningTask<HttpResponse>);
+  public method Patch            (route: string, scoped handler: (HttpRequest) -> OwningTask<HttpResponse>);  // classic
+  public method Patch<R>         (route: string, scoped handler: () -> Task<R>);
+  public method Patch<A, R>      (route: string, scoped handler: (A) -> Task<R>);
+  public method Patch<A, B, R>   (route: string, scoped handler: (A, B) -> Task<R>);
+  public method Patch<A, B, C, R>(route: string, scoped handler: (A, B, C) -> Task<R>);
+  public method Patch            (route: string, scoped handler: () -> Task,        status: int := 204);
+  public method Patch<A>         (route: string, scoped handler: (A) -> Task,       status: int := 204);
+  public method Patch<A, B>      (route: string, scoped handler: (A, B) -> Task,    status: int := 204);
+  public method Patch<A, B, C>   (route: string, scoped handler: (A, B, C) -> Task, status: int := 204);
+  public method Patch            (route: string, scoped handler: () -> OwningTask<HttpResponse>);
+  public method Patch<A>         (route: string, scoped handler: (A) -> OwningTask<HttpResponse>);
+  public method Patch<A, B>      (route: string, scoped handler: (A, B) -> OwningTask<HttpResponse>);
+  public method Patch<A, B, C>   (route: string, scoped handler: (A, B, C) -> OwningTask<HttpResponse>);
+  // Delete: the same thirteen; no body slot (a body-only type is the compile error above).
+  public method Delete            (route: string, scoped handler: (HttpRequest) -> OwningTask<HttpResponse>); // classic
+  public method Delete<R>         (route: string, scoped handler: () -> Task<R>);
+  public method Delete<A, R>      (route: string, scoped handler: (A) -> Task<R>);
+  public method Delete<A, B, R>   (route: string, scoped handler: (A, B) -> Task<R>);
+  public method Delete<A, B, C, R>(route: string, scoped handler: (A, B, C) -> Task<R>);
+  public method Delete            (route: string, scoped handler: () -> Task,        status: int := 204);
+  public method Delete<A>         (route: string, scoped handler: (A) -> Task,       status: int := 204);
+  public method Delete<A, B>      (route: string, scoped handler: (A, B) -> Task,    status: int := 204);
+  public method Delete<A, B, C>   (route: string, scoped handler: (A, B, C) -> Task, status: int := 204);
+  public method Delete            (route: string, scoped handler: () -> OwningTask<HttpResponse>);
+  public method Delete<A>         (route: string, scoped handler: (A) -> OwningTask<HttpResponse>);
+  public method Delete<A, B>      (route: string, scoped handler: (A, B) -> OwningTask<HttpResponse>);
+  public method Delete<A, B, C>   (route: string, scoped handler: (A, B, C) -> OwningTask<HttpResponse>);
+  // Route: any verb, the same thirteen. `verb` is a runtime argument: the body admission, the body-position
+  // check and the 201 rule key on it at registration (an ArgumentException, never a compile error, there).
+  public method Route            (verb: HttpMethod, route: string, scoped handler: (HttpRequest) -> OwningTask<HttpResponse>);  // classic
+  public method Route<R>         (verb: HttpMethod, route: string, scoped handler: () -> Task<R>);
+  public method Route<A, R>      (verb: HttpMethod, route: string, scoped handler: (A) -> Task<R>);
+  public method Route<A, B, R>   (verb: HttpMethod, route: string, scoped handler: (A, B) -> Task<R>);
+  public method Route<A, B, C, R>(verb: HttpMethod, route: string, scoped handler: (A, B, C) -> Task<R>);
+  public method Route            (verb: HttpMethod, route: string, scoped handler: () -> Task,        status: int := 204);
+  public method Route<A>         (verb: HttpMethod, route: string, scoped handler: (A) -> Task,       status: int := 204);
+  public method Route<A, B>      (verb: HttpMethod, route: string, scoped handler: (A, B) -> Task,    status: int := 204);
+  public method Route<A, B, C>   (verb: HttpMethod, route: string, scoped handler: (A, B, C) -> Task, status: int := 204);
+  public method Route            (verb: HttpMethod, route: string, scoped handler: () -> OwningTask<HttpResponse>);
+  public method Route<A>         (verb: HttpMethod, route: string, scoped handler: (A) -> OwningTask<HttpResponse>);
+  public method Route<A, B>      (verb: HttpMethod, route: string, scoped handler: (A, B) -> OwningTask<HttpResponse>);
+  public method Route<A, B, C>   (verb: HttpMethod, route: string, scoped handler: (A, B, C) -> OwningTask<HttpResponse>);
   // Composition: `prefix/…` is dispatched to `child` — its hooks, then its table, on the remaining path.
   // The child is owned here; the owned-field cascade (§28.5) disposes the tree bottom-up.
   public method Mount (prefix: string, owned child: IHttpService);
@@ -298,12 +397,13 @@ public class RouteTable                                                         
   // per table: a second `Around` on the same table is an ArgumentException at the registering call (band 1,
   // the duplicate-route rule). Nesting is by mount order — a parent's hook wraps its children's, outermost first.
   // `next` is CALL-BOUNDED inside the hook: invoke it, await it to settlement, never store or return the task.
+  // `next` is the stored handler — typed, void, raw or classic — composed with its binding and its response shape (§9b).
   public method Around(scoped hook: (HttpRequest, (HttpRequest) -> OwningTask<HttpResponse>) -> OwningTask<HttpResponse>);
   // In-process dispatch — what the worker loop calls, and what a test calls. Borrows the request.
-  // hooks ⇒ match ⇒ handler. HttpResponseException from a hook, a handler, or Param/Json ⇒ its status, converted at the
-  // innermost table (so an enclosing hook sees a response); no route ⇒ empty 404; any other exception ⇒ propagates
-  // through the hooks (catch it in one to answer through your ILogger) ⇒ the outermost Dispatch answers an opaque 500
-  // and reports on the diagnostic channel.
+  // hooks ⇒ match ⇒ bind (captures left to right, then the body) ⇒ handler ⇒ shape. HttpResponseException from a
+  // hook, a handler, or binding ⇒ its status, converted at the innermost table (so an enclosing hook sees a
+  // response); no route ⇒ empty 404; any other exception ⇒ propagates through the hooks (catch it in one to answer
+  // through your ILogger) ⇒ the outermost Dispatch answers an opaque 500 and reports on the diagnostic channel.
   public async method Dispatch(req: HttpRequest): OwningTask<HttpResponse>;
   destructor;   // severs the handler and hook lists before reclamation (§28.14 quiescence, stated normatively as for
                 //   EventSource — §9b); the owned-field cascade disposes mounted children
@@ -329,20 +429,24 @@ public static class HttpServer                                                  
 end HttpServer;
 ```
 
-Not in v1, each declined with reasons in §7 or deferred in §6: `HttpApp`; `NotFound`/`OnError` hooks (subsumed by `{*rest}` and `Around`); a sync handler overload; route-pattern typing `{id:int}`; `Before`/`After`; groups as a separate concept (a group *is* a mount); a `Register()` phase; a middleware pipeline.
+Not in v1, each declined with reasons in §7 or deferred in §6: `HttpApp`; `NotFound`/`OnError` hooks (subsumed by `{*rest}` and `Around`); a sync handler arm (now structurally excluded, §7 Q3); route-pattern typing `{id:int}`; name-based binding of captures or query parameters; a `Body<T>` marker; a fourth handler parameter (`HttpRequest` is the escape hatch); class-typed bodies at a typed slot (`req.JsonOwned<T>()`); `Before`/`After`; groups as a separate concept (a group *is* a mount); a `Register()` phase; a middleware pipeline.
 
-Concept count: five new types (`IHttpService`, `RouteTable`, `HttpServer`, `HttpRequest`, `HttpResponseException`), one hook, seven response constructors, over 0001's shared vocabulary.
+Concept count: five new types (`IHttpService`, `RouteTable`, `HttpServer`, `HttpRequest`, `HttpResponseException`), one hook, seven response constructors, one binding rule with two derived type properties (**binding capability**, **response shape** — §9e) realized as thirteen registration members per verb, over 0001's shared vocabulary.
 
 ## 4. Ownership, domains, faults
 
 ### 4.1 The §28.14 trace of every registration line
 
-§28.14 resolves a `scoped` call's **bounding object** by testing five forms in order — 1 constructor call → 2 `owned` return initializing a `using var` → 3 `owned` return into an `owned` field of `this` → 4 a receiver chain of `owned` fields rooted at `this` or a local → 5 the receiver. A capture-bearing argument is admitted iff the bounding object is a `using var` local declared after every captured source, or `this` with every capture `this`-derived. A capture-free argument is admitted at any bounding object. The verified argument forms are lambda literals and method references, whose capture is the receiver (v1 admission bound 3).
+§28.14 resolves a `scoped` call's **bounding object** by testing five forms in order — 1 constructor call → 2 `owned` return initializing a `using var` → 3 `owned` return into an `owned` field of `this` → 4 a receiver chain of `owned` fields rooted at `this` or a local → 5 the receiver. A capture-bearing argument is admitted iff the bounding object is a `using var` local declared after every captured source, or `this` with every capture `this`-derived. A capture-free argument is admitted at any bounding object. The verified argument forms are lambda literals and method references, whose capture is the receiver (v1 admission bound 3). Each line also resolves an **overload** (§3's thirteen per verb): §14.5 phase 2 resolves a method-reference argument "against the substituted target per §27.6", so a candidate whose function-type arity differs cannot unify and is inapplicable; among the same-arity arms, a `Task<X>` return binds `R` in the typed arm (component-wise, invariantly), reaches no `Task<>` instantiation from a plain `Task` or an `OwningTask<HttpResponse>` — the typed arm is then inapplicable, because `Task<T>` and `OwningTask<T>` are siblings under `Task` (§30.3, v0.295) — converts base-to-derived nowhere (the raw arms admit only their own type), and converts class-to-base *within the family* to the void arm's plain `Task` (§27.1.1). A `Task` reference therefore has exactly one applicable candidate; a `Task<X>` or `OwningTask<HttpResponse>` reference also reaches the void arm, and the typed/raw candidate wins on the **defaulted-arity tie-break** — it fills no `status` default (§22.6 *Generic candidates*: "`M(n: int, m: int := 0)` and `M<T>(x: T)` on the call `M(5)` resolve to the *generic* candidate — it fills no default") — as well as on exactness where a reference position ranks as a lambda's does. **The void arms' `status` default is load-bearing:** without it the tie-break is dead, and at arity 0 — where the void and raw arms are non-generic and `Get<R>` is generic — §22.6's non-generic preference would route `_routes.Get("/", List)` to the void arm *silently*, answering an empty 204. A raw `(HttpRequest) -> OwningTask<HttpResponse>` reference additionally reaches the classic non-generic member, which the non-generic preference selects over the generic raw arm — the same handler either way. The explicit list — `_routes.Get<int, Todo?>("/{id}", GetById)` — is a total remedy at any line.
 
 | Line | Call | Form → bounding object | Argument's captures | Verdict |
 |---|---|---|---|---|
-| [T1]–[T6] | `_routes.Get("/{id}", GetById)` etc. | receiver chain `this._routes`, one hop, an `owned` field → **form 4 → `this`** | an instance method reference: captures `this` | **admitted** — every capture is `this`. Identical to stdlib §6.5's `_clicked += OnClicked`. |
-| [R2] | `_routes.Get("/health", async lambda(req) => Http.Text("ok"))` | **form 4 → `this`** | a lambda literal with no captures | **admitted** at any bounding object; the `async` lambda's inferred return is `OwningTask<HttpResponse>` (§30.6), equal to the slot (§7 Q3) |
+| [T1] | `_routes.Get("/", List)` — `() -> Task<Array<Todo>>` | receiver chain `this._routes`, one hop, an `owned` field → **form 4 → `this`** | an instance method reference: captures `this` | **admitted** — every capture is `this`. Identical to stdlib §6.5's `_clicked += OnClicked`. Overload: typed `Get<R>`, `R := Array<Todo>` — shape *JSON array* (`Array<S>`, `S = Todo` an `ISerializable` value record); the non-generic void `Get` converts and fills `status` — it is the `status` default that keeps the non-generic preference from selecting it — and the raw `Get` is inapplicable. Zero slots, zero captures. |
+| [T2], [T5] | `_routes.Get("/{id}", GetById)`, `_routes.Patch("/{id}/done", MarkDone)` — `(int) -> Task<Todo?>` | **form 4 → `this`** | captures `this` | **admitted**. Overload: typed `Get<A, R>`/`Patch<A, R>`, `A := int` (capability *capture*: `int` conforms to `IParsable<int>`, §11.8's compiler-provided conformance), `R := Todo?` — stripped `Todo` conforms to `ISerializable` — shape *JSON or 404*. One slot, one capture. |
+| [T3] | `_routes.Post("/", Create)` — `(NewTodo) -> Task<Todo>` | **form 4 → `this`** | captures `this` | **admitted**. Overload: typed `Post<A, R>`, `A := NewTodo` (capability *body*: an `IDeserializable` value record that conforms to no `IParsable`; the last slot; verb `Post`), `R := Todo` — shape *JSON, 201*. Assignment: one non-request slot = zero captures + one ⇒ the body. |
+| [T4] | `_routes.Put("/{id}", Replace)` — `(int, Todo) -> Task<Todo?>` | **form 4 → `this`** | captures `this` | **admitted**. Overload: typed `Put<A, B, R>`, `A := int` (capture), `B := Todo` (body-only type, last, verb `Put`), `R := Todo?` — *JSON or 404*. Assignment: two slots = one capture + one ⇒ `{id}`, then the body, bound left to right — a bad id answers 400 before the body is read. |
+| [T6] | `_routes.Delete("/{id}", Remove)` — `(int) -> Task` | **form 4 → `this`** | captures `this` | **admitted**. Overload: **void** `Delete<A>`, `A := int`, `status` defaulted to 204 — the only applicable candidate (`Task` reaches no `Task<>` instantiation; nothing converts to `OwningTask<HttpResponse>`). |
+| [R2] | `_routes.Get("/health", async lambda() => "ok")` | **form 4 → `this`** | a lambda literal with no captures | **admitted** at any bounding object. Overload: typed `Get<R>` — §14.5 phase 2 has no parameter position to close, types the body as `string`, gives the `async` lambda the type `() -> Task<string>` (§30.6; §30.5 admits no other wrapper for `string`) and binds `R := string` — shape *text/plain*; the void `Get` is applicable by `Task<string>` → `Task` and ranks *converting* (§22.6 *Lambda-literal arguments*: "exact … when the inferred return type equals the return slot after type-argument substitution, and *converting* otherwise"), the raw `Get` is inapplicable. Exact wins. |
 | [R1] | `_routes.Around(Guard)` | **form 4 → `this`** — `Around` is a `scoped` position like `Get` | `Guard` captures `this` | **admitted** |
 | [R3] | `_routes.Mount("/todos", new TodoApi(_deps.Todos))` | not a `scoped` position — `owned child` is an ordinary transfer (§28.8); the fresh `new` is the owned production and needs no marker (§22.3) | constructor argument: `_deps.Todos` is a bare read through two owned fields (lends, §28.6) into a plain `Store<Todo>` parameter, stored by the child as a **back-reference** (§28.3's borrowed-field store rule: parameter-sourced, admitted with the caller-side residual that the source outlives the child) | **admitted**; the residual is discharged by field order — below |
 | [R0] | `_deps := deps` | owned parameter into an owned field: marker-free store (§28.3) | — | fine; `_deps` is definitely assigned at [R1]–[R4] (§7.9) |
@@ -357,7 +461,7 @@ Concept count: five new types (`IHttpService`, `RouteTable`, `HttpServer`, `Http
 
 **Why a service's registration bound is intact after `Mount`.** §28.14's *registration-lifetime residual* concerns moving the *storing member* out past its bounding object. At [R3] the whole bounding object (the child) moves, its `_routes` with it: the bound travels intact, and the child's table is disposed with the child, which the root's table disposes with the root.
 
-**Handler-body ownership, once.** `req` is a plain parameter of an `async` method — a borrow held until settlement (§30.1); the dispatcher awaits the handler's task before the request is reclaimed, so the source-outlives-settlement obligation is discharged by the dominant shape. Inside `Store<T>`, `using var g := await _map.Get().LockAsync()` is Pattern B into a `using var` (§30.5); the `Get()` borrow is sourced from the owned handle field (§28.13) and rides `LockAsync`'s frame only within the awaiting full expression; the handlers hold no guard at all — `All()` is Pattern A so that `Http.JsonArray(await _todos.All())` is an admitted unbound-temporary await (§30.5), and every other store call returns a value. `Http.*` results are fresh owned productions returned through an `OwningTask` return, marker-free (§28.3). No guard is ever live across an `await` (stdlib §6.11's warning): the only guards in the program are `Store<T>`'s five, each acquired by the last `await` of its body, and every body-reading `await` in a handler precedes the store call.
+**Handler-body ownership, once.** `req` is a plain parameter of an `async` method — a borrow held until settlement (§30.1); the dispatcher awaits the handler's task before the request is reclaimed, so the source-outlives-settlement obligation is discharged by the dominant shape. Inside `Store<T>`, `using var g := await _map.Get().LockAsync()` is Pattern B into a `using var` (§30.5); the `Get()` borrow is sourced from the owned handle field (§28.13) and rides `LockAsync`'s frame only within the awaiting full expression; the handlers hold no guard at all — `All()` is Pattern A so that `List(): Task<Array<Todo>> => await _todos.All()` is §30.5's chained slot (the inner task moves into the outer task's result slot; the table awaits the outer, borrows the array within one full expression, serializes, disposes), and every other store call returns a value, which a `Task<R>`/`Task<R?>` handler returns by value. A typed slot's value (`id`, `body`) is a plain value parameter of an `async` method — no borrow, no obligation — and `Create`'s lambda captures `body` under §28.14's value-typed-capture exemption (bound 1) into the call-bounded `Add(make)`. On the raw arm, `Http.*` results are fresh owned productions returned through an `OwningTask` return, marker-free (§28.3). No guard is ever live across an `await` (stdlib §6.11's warning): the only guards in the program are `Store<T>`'s five, each acquired by the last `await` of its body, and the body, when a handler takes one, is read by the table before the handler runs.
 
 ### 4.2 The worker-domain model
 
@@ -370,7 +474,7 @@ Concept count: five new types (`IHttpService`, `RouteTable`, `HttpServer`, `Http
 
 ### 4.3 Response ownership is a Pattern-B handoff
 
-A handler returns `OwningTask<HttpResponse>`: a fresh, single-consumer resource whose disposal is connection hygiene (§30.5's producer rule). The dispatcher is that single consumer — it serializes, then disposes. A handler that constructs a response and then throws leaks nothing: §28.3's unwind disposal covers the local, and the dispatcher builds its own response for the fault. A `Task<HttpResponse>` slot would admit a *borrowed* response (a cached field) the dispatcher could neither take nor dispose — and for a class result the form is a compile error anyway.
+A handler returns `OwningTask<HttpResponse>`: a fresh, single-consumer resource whose disposal is connection hygiene (§30.5's producer rule). The dispatcher is that single consumer — it serializes, then disposes. A handler that constructs a response and then throws leaks nothing: §28.3's unwind disposal covers the local, and the dispatcher builds its own response for the fault. A `Task<HttpResponse>` slot would admit a *borrowed* response (a cached field) the dispatcher could neither take nor dispose — and for a class result the form is a compile error anyway. A **typed** result is the other half of the same rule: `Task<R>` at a value `R` (or `string`) carries no obligation across the await; at a class `R` — `Array<Todo>`, a synthesized `ISerializable` class — it is Pattern A, the task owning (kind 1) or chaining (kind 2) its result, and the table consumes it as `Process(await Producer())` does (§30.5): borrow within one full expression, serialize, dispose the task. The response the table *sends* is its own fresh `HttpResponse`, built from the shape — the connection-hygiene disposal above, unchanged.
 
 ### 4.4 Fault taxonomy
 
@@ -378,8 +482,11 @@ A handler returns `OwningTask<HttpResponse>`: a fresh, single-consumer resource 
 |---|---|
 | No route matched | empty 404 from the outermost table; a `{*rest}` route on the root table is the custom-404 hook |
 | Malformed request line/headers, oversize headers | 400, connection closed; nothing user-authored runs |
-| `Param<T>` / `Query<T>` / `Json<T>` / `JsonOwned<T>` cannot parse | `HttpResponseException(400, message, cause)` — snapshot-chained (§31.4) — converted by the **innermost** table's `Dispatch` into a 400 response; every enclosing `Around` sees a *response* and can log it |
+| A typed capture slot's `X.Parse`, or a typed body slot's `Json<X>`, faults — or, on the raw arm, `Param<T>` / `Query<T>` / `Json<T>` / `JsonOwned<T>` cannot parse | `HttpResponseException(400, message, cause)` — snapshot-chained (§31.4) — converted by the **innermost** table's `Dispatch` into a 400 response; every enclosing `Around` sees a *response* and can log it. Typed slots bind captures left to right, then the body, **before the handler runs** — `/not-a-number` against `(id: int)` never reaches `GetById` |
 | Unknown `Param` name | `ArgumentException` (band 1): a route/handler mismatch is a bug, not a client fault — propagates as below |
+| A handler's slot list does not fit its route: non-request slots ≠ captures, and ≠ captures + 1 with a body-capable last slot on `Post`/`Put`/`Patch`; through `Route`, whose verb is a runtime argument, also a body-only type not last or on a bodiless verb | `ArgumentException` at the registering call (band 1, the duplicate-route class) — in the constructor, on the worker at `Listen`, before the first accept, and in any `Dispatch` test; the server never serves a broken table |
+| A typed `Task<R?>` handler returns `null` / a `Task` handler returns | empty 404 / empty body with the registered `status` (204) |
+| A slot type with no binding capability (`int?`, a class body, `HttpResponse`); two `HttpRequest` slots; on the verb-named members a body-only type not last or on `Get`/`Delete`; a result with no response shape (`Task<int>`, `Task<HttpResponse>`); four slots; an unannotated lambda parameter at a generic slot | **compile error at the registration line** naming the rule and the remedy (§7 Q4's list); never a runtime condition |
 | A handler (or a helper beneath it) throws `HttpResponseException(s, …)` | a response with status `s` and an empty body (band 4: the dispatcher is the protocol boundary) |
 | An `Around` hook throws `HttpResponseException(s, …)` (before or after `next`) | converted by the table the hook is registered on — the same conversion the handler row states, applied at the hook's own layer; an enclosing parent hook sees a response, not an exception |
 | A handler throws anything else | propagates through the `Around` layers — a hook may `catch`, log through its `ILogger`, and `return Http.Status(500)` — else the outermost `Dispatch` answers an opaque 500 and writes a §33.3-style report to the diagnostic channel |
@@ -390,14 +497,14 @@ A handler returns `OwningTask<HttpResponse>`: a fresh, single-consumer resource 
 
 - **Middleware pipelines** (ASP.NET) / **`app.use` chains** (Express): ordering lore, per-request mutable context bags, and ownership questions about the in-flight request. One `Around` hook per table, nesting as the only order, covers auth, logging, timing, and exception conversion for v1; a pipeline stays deferred as one design with 0001's client hooks (§6).
 - **Controllers, model binding, DI, filters** (ASP.NET): reflection-shaped; Bezel has no member-access reflection (rationale §5.18). Composition is constructor parameters with ownership contracts (DECLINED.md D-0001).
-- **Extractor-style signature binding** (Axum): compile-checked binding sugar that costs a trait-solver; ours is access-time `Param<T>`/`Query<T>` — explicit, greppable, and one line.
+- **Trait-solved extractors** (Axum): binding sugar whose *mechanism* is a trait solver, and whose failure mode is the page-long error. Ours binds from the signature too, but by type and position under one rule with no solver — a slot is the request, a capture, or the body, a mismatch is one registration-time `ArgumentException` — and stops there: no typed query/header extractors (`req.Query<T>` is the access-time spelling, because a query parameter is *named* and *optional*, which a positional slot is not), no custom extractor protocol.
 - **Raw stream req/res objects** (Node `http`): the level below `Text`/`Bytes`/`Json` is the `System.Net` substrate (0007), which stays available.
 - **Ambient per-request context** (`HttpContext.Current`, AsyncLocal): anti-sendable by construction; state travels in arguments and in `D`.
 - **A route-builder callback** (this proposal's own 2026-07-24 shape): a table received as a parameter admits capture-free handlers only (§28.14). The table is owned, not lent.
 
 ## 6. Deferred (v2+, rough priority)
 
-Middleware/hooks pipeline (shared design with 0001 §7) · a `CancellationToken` on `Listen` succeeding the static `Stop()` (0007 §4.4 already says `Stop()` should drive `Accept`'s token) · TLS termination (cert config on `Listen`; the seam is 0007 §6's) · static-file serving · WebSocket upgrade · streaming/chunked response bodies (needs the Stream span work, #1394) · request cancellation tied to disconnect · a sync handler overload (§7 Q3: addable at no call-site cost) · `HEAD`/`OPTIONS` auto-handling · compression · HTTP/2 · signal handling (§8).
+Middleware/hooks pipeline (shared design with 0001 §7) · a `CancellationToken` on `Listen` succeeding the static `Stop()` (0007 §4.4 already says `Stop()` should drive `Accept`'s token) · TLS termination (cert config on `Listen`; the seam is 0007 §6's) · static-file serving · WebSocket upgrade · streaming/chunked response bodies (needs the Stream span work, #1394) · request cancellation tied to disconnect · typed query/header slots and a fourth handler slot (§7 Q4: `HttpRequest` is the escape hatch; name-based binding is declined, not deferred) · `HEAD`/`OPTIONS` auto-handling · compression · HTTP/2 · signal handling (§8).
 
 ## 7. Decision records
 
@@ -415,18 +522,25 @@ Middleware/hooks pipeline (shared design with 0001 §7) · a `CancellationToken`
 - *(iii) what is sendable inside `D`:* `Shared<T>` for `T` in §28.13's payload set (`Mutex`, `Atomic<T>`, `AtomicInteger<T>`, `Semaphore`, `Locked<T>`, `RwLocked<T>`, `FrozenArray<T>`, `CancellationTokenSource`), `ChannelSender<T>`, and any sealed transfer-closed class. Not sendable, and not needed: the service.
 - *0021 wiring under this design:* `Deps.Log: owned ChannelLogger`; the root owns `_deps`; a child holds back-references into it (the store; the logger too if it logs); `Main` holds no logger, so the channel closes when the last worker's service is disposed at `Listen`'s return, and `await pump` drains — 0021 §4.3's open question 2 answered by ownership alone.
 
-**Q3 — Handler signature: async-only `(HttpRequest) -> OwningTask<HttpResponse>`; request borrowed; `OwningTask` is right.**
-- §22.6 *Lambda-literal arguments*: applicability is decided by the lambda's inferred return type, which must equal, implicitly convert to (§5.1), or bind the slot; `lambda(req) => Http.Text("ok")` infers `owned HttpResponse`, and no conversion reaches `OwningTask<HttpResponse>`. The spelling is `async lambda(req) => Http.Text("ok")` (§30.6 assigns `OwningTask<T>` to a class result) or an `async method`.
-- A sync overload `Get(route, scoped h: (HttpRequest) -> owned HttpResponse)` is declarable (§22.6: the function types differ — `scoped` alone would not distinguish, the parameter types do) and resolvable (no lambda is applicable to both). Declined for v1: twelve members instead of six, two dispatcher paths, and a real handler almost always awaits. Adding it later re-routes no existing call.
-- `OwningTask<HttpResponse>` over `Task<HttpResponse>`: §4.3.
+**Q3 — Handler signature: an ordinary `async` method; the classic member plus three result arms at arity 0–3; async-only; the void arm's `status` default is load-bearing; `OwningTask` is right for the raw arm.**
+- The family (§3): per verb, the classic non-generic `(HttpRequest) -> OwningTask<HttpResponse>`, then `-> Task<R>` (typed), `-> Task` with `status := 204` (void), `-> OwningTask<HttpResponse>` (raw), at arity 0–3 — thirteen members. Every arm is an `async` method's return type (§30.1), so a handler is registered by name and called by a test by name. The arms partition method references (§4.1): a `Task<X>` return binds `R`; a plain `Task` reaches no `Task<>` instantiation and converts to no `OwningTask`; an `OwningTask<HttpResponse>` reaches no `Task<>` instantiation — `Task<T>` and `OwningTask<T>` are siblings under `Task` (§30.3, v0.295; the partition rests on that one declaration) — and is exactly the raw slot; and the plain-`Task` slot, the family's top, admits both by §27.1.1's within-family conversion.
+- **Why the void arm carries `status: int := 204` — a resolution reason, stated.** §22.6 spells exact-versus-converting ranking for lambda literals only; for a method reference it is a reading. The default makes the typed/raw-versus-void pair decidable under *both* readings: the typed/raw candidate fills no default, the void candidate fills one, and §22.6 *Generic candidates*' defaulted-arity tie-break "applies first: `M(n: int, m: int := 0)` and `M<T>(x: T)` on the call `M(5)` resolve to the *generic* candidate — it fills no default". Without it the tie-break is dead, and at **arity 0** — where the void and raw arms are non-generic and `Get<R>` is generic — the non-generic preference would select the void arm for `_routes.Get("/", List)` with no diagnostic: an empty 204, the array disposed unread. The knob is also a real knob (202 Accepted, 205 Reset Content): a void result's status is free where a typed result's is a function of its shape. An explicit `status` argument selects the void arms only (three supplied arguments); a `Task<R>` handler registered with one answers an empty `status` and its result is disposed unread — a documented choice, not a diagnostic.
+- **Why the classic non-generic member stays beside `Get<A>` raw.** An async *lambda* at the raw arm needs a **closed** target slot: §30.6 says the wrapper choice "follows the same rules as for async methods (§30.1)", and §30.1 lists admissible declared types without an inference rule, so against `Get<A, R>`'s free `Task<R>` slot `async lambda(req: HttpRequest) => Http.Text("ok")` is `OwningTask<HttpResponse>` under a body-fixed reading and could be `Task<HttpResponse>` (binding `R := HttpResponse`, tying with the generic raw arm) under a target-directed one. The classic slot is closed, and §22.6 decides the pair under either reading: "When a non-generic candidate and a generic candidate are both applicable, and neither the ranking below nor the defaulted-arity tie-break separates them, the **non-generic candidate is selected**." It also keeps the unannotated `async lambda(req) => …` (its parameter is closed there). A typed-input, raw-output *lambda* (`async lambda(id: int) => Http.Text(…)`) is spelled as a method or with an explicit type-argument list (`_routes.Get<int>("/{id}", …)`); a method *reference* is never affected — its declared return fixes the wrapper. The §30.6 question is a §9(f) tracking item.
+- **Async-only, now structurally.** A sync arm `(A) -> R` cannot coexist with `(A) -> Task<R>`: §14.5 phase 1 binds a bare `X` "to the argument's static type", so `(int) -> Task<Todo>` binds `R := Task<Todo>` against the sync slot as exactly as `R := Todo` against the async one — two exact generic candidates, "subject to the ordinary ambiguity rule" (§22.6). The spelling stays `async lambda() => …` / `async method`; a sync `lambda() => "ok"` at the family is a no-candidate error (`string` reaches no `Task<>` instantiation and converts to no `Task`), whose remedy is the `async` keyword.
+- **`Task<R>` / `Task<R?>` is one member, not two.** A reference returning `Task<Todo?>` binds `R := Todo?` against `Task<R>` and `R := Todo` against `Task<R?>` (§14.5: "an argument of type `U?` binds `X` to `U`"); both substituted slots are `Task<Todo?>`, both exact, ambiguous. And a `where R: ISerializable` separates nothing — constraints "do not act as inference sources" and are checked after inference (§14.5), and `Todo?` would fail it (§14.2: "a `null` value satisfies no interface contract"). So the member strips `?` and classifies (Q4).
+- `OwningTask<HttpResponse>` over `Task<HttpResponse>` for the raw arm: §4.3. `Task<HttpResponse>` as a *typed* result is a compile error directing to the raw arm.
 
-**Q4 — Binding: access-time `req.Param<T>`, `req.Query<T>: T?`, compiler-known `Json<T>`/`JsonOwned<T>`; failure is one typed exception the dispatcher maps to 400.**
-- Route-pattern typing `{id:int}` needs the table to *hold* typed values without knowing `T` — reflection-shaped (rationale §5.18). Access-time `Param<T>` is §11.8 constraint dispatch (`T.Parse`), zero reflection; the non-generic `Param(name): string` stands beside it (§22.6's non-generic preference for the bare call; explicit `<int>` selects the generic) — and it *is* the string form: `string` witnesses no `IParsable` (stdlib §2.19), so `Param<string>` fails the constraint at compile time. The return is `owned T` because a bare-`T` instance return is a borrow of the receiver (§28.3 announcement table) and cannot carry a fresh parse; the marker erases at value substitutions (§28.1), so `Param<int>` reads as `int`.
-- Where a parse failure goes: *(a) an exception mapped by the dispatcher* — the dispatcher is stdlib §1 band 4's "converted to a protocol answer" boundary, and program logic never branches on the failure. *(b) nullable* / *(c) `Result`* — one `if … then return Http.Status(400)` per parameter per endpoint, and the wrong band (band 2 is *absence*, not malformation). Chosen: (a), one type. Unknown parameter *name* stays band 1 (`ArgumentException`: a bug). `Query<T>` returns `T?` for absence and throws only on malformation.
-- Malformed JSON: `req.Json<T>` catches `SerializationException` and rethrows `HttpResponseException(400, msg, cause)` (snapshot chaining, §31.4) rather than the dispatcher mapping every `SerializationException` — a handler's *own* serialization fault must stay a 500.
+**Q4 — Binding: from the signature, by type and position — a structural binding *capability* per slot type, assigned to the route by count at registration; `req.Param<T>`, `req.Query<T>: T?`, `Json<T>`/`JsonOwned<T>` remain as the raw arm's accessors; failure is one typed exception the dispatcher maps to 400.**
+- **Binding capability** (a §3.6 derived type property, §9e — computed, never declared): `HttpRequest` → *request* (at most one, anywhere); `string` or an `IParsable<X>` conformer → *capture*, parsed by §11.8's `X.Parse` — exactly `req.Param<X>`; an `IDeserializable` **value** type (§9.8's synthesis set) → *body*, exactly `req.Json<X>()`; a type conforming to both → *both*; anything else → *none*, a compile error at the registration line naming the rule and the remedy (a class body reads as `req.JsonOwned<X>()` from an `HttpRequest` slot). **Assignment** is a registration-time rule keyed on the route's capture count *k* — a string the compiler does not read: with *m* non-request slots, *m = k* ⇒ every slot is a capture, in route order; *m = k + 1* on `Post`/`Put`/`Patch` with a body-capable last slot ⇒ the last slot is the body; else `ArgumentException` (band 1). On the verb-named members the compiler additionally rejects a body-*only* type that is not last or sits on `Get`/`Delete`; through `Route`, whose `verb` is a runtime argument, that condition is the same registration-time `ArgumentException`.
+- **Why no names.** "Names are documentation only; they do not affect type identity" (§27.1, v0.295), and a formed method reference carries the callee's function type, which may drop or relabel them: a rule keyed on `id` ↔ `{id}` would read what the type system has erased. Positional binding needs no reflection and no name table — rationale §5.18 untouched.
+- **Why not a `Body<T>` marker.** It makes the body's role compile-time exact (at most one; none on `Get`/`Delete`) at the price of `Body<NewTodo>`, `body.Value.Title` and `api.Create(new Body<NewTodo>(…))` on every body handler and every direct test call — the ordinary-method bar this pass exists for — while the one check it moves is already caught at construction, before any request. Declined with a reopening bar (`DECLINED.md`).
+- **Why the `where` clauses are absent** and every admission lives in the member's per-instantiation check: `A` may be `HttpRequest`, `string`, or a body record, `R` may be `Todo?`, `string` or `Array<Todo>`, and a constraint filters no candidate at resolution anyway (§14.5). This is the `Json<T>` dispensation — stdlib §2.15's `Parse<T>` "rejects a class-typed `T` at compile time with a diagnostic directing to `ParseOwned<T>`", a check beyond its `where T: IDeserializable`, because "no generic body can reach the recognized `T.Deserialize(d)` factory through a constraint" — applied to a slot the member cannot constrain at all. The *behavior* half (JSON / text / 204 / 404 by the shape of `R`) is §3.6's reserved dispatch on a derived type property, admitted to compiler-known types; `RouteTable` is compiler-known for §28.14 retention already (§9b), and §9e adds it to §3.6's behavior-dispatch set with the two properties named.
+- Route-pattern typing `{id:int}` stays declined for its original reason — the table would hold typed values without knowing `T` — and is now also redundant: the type is in the signature. The non-generic `Param(name): string` and `Param<T>` stand as before (`string` witnesses no `IParsable`, so `string` is the verbatim-capture type at a typed slot too).
+- Where a parse failure goes: *(a) an exception mapped by the dispatcher* — the dispatcher is stdlib §1 band 4's "converted to a protocol answer" boundary, and program logic never branches on the failure. *(b) nullable* / *(c) `Result`* — one `if … then return Http.Status(400)` per parameter per endpoint, and the wrong band (band 2 is *absence*, not malformation). Chosen: (a), one type, raised by the table for typed slots and by the accessors for raw ones. Unknown parameter *name* stays band 1 (`ArgumentException`: a bug). `Query<T>` returns `T?` for absence and throws only on malformation.
+- Malformed JSON: the table's body read, like `req.Json<T>`, catches `SerializationException` and rethrows `HttpResponseException(400, msg, cause)` (snapshot chaining, §31.4) rather than the dispatcher mapping every `SerializationException` — a handler's *own* serialization fault must stay a 500.
 
 **Q5 — Responses: seven constructors; `HttpResponseException` yes.**
-- 0002's five stand. `JsonOrNotFound<T>(value: T?)`: lookup-by-id is a third of any CRUD surface, `null` is already the stdlib's absence signal (`GetOrNull`), and the constructor composes with it directly. `JsonArray<T>(items: IEnumerable<T>)`: **no collection conforms to `ISerializable`** (stdlib §2.14/§4 declare none) and a heap-collection component makes a record serialization-ineligible (§9.8), so without it every list endpoint needs an owning envelope class; the member is ordinary generic code over stdlib §2.14's agents (`BeginArray`, `item.Serialize(s)`, `EndArray`). `NoContent`/`Created` are `Status(204)`/`Json(v, status := 201)` — the named arguments already say it.
+- 0002's five stand. `JsonOrNotFound<T>(value: T?)`: lookup-by-id is a third of any CRUD surface, `null` is already the stdlib's absence signal (`GetOrNull`), and the constructor composes with it directly. `JsonArray<T>(items: IEnumerable<T>)`: **no collection conforms to `ISerializable`** (stdlib §2.14/§4 declare none) and a heap-collection component makes a record serialization-ineligible (§9.8), so without it every list endpoint needs an owning envelope class; the member is ordinary generic code over stdlib §2.14's agents (`BeginArray`, `item.Serialize(s)`, `EndArray`). `NoContent`/`Created` are `Status(204)`/`Json(v, status := 201)` — the named arguments already say it. The typed arms answer by rule instead: a present result is 200 — **201 on `Post`**, chosen over 200-everywhere because the commonest POST (create) would otherwise need the raw arm for its correct status — `null` from `Task<R?>` is 404, a `Task` handler is its registered `status` (204), and `string` is text/plain (the smallest handler, `async lambda() => "ok"`). The asymmetry is deliberate and stated once: the raw arm keeps `Http.*`'s 200 defaults, so a raw `Post` handler that wants 201 writes `Http.Json(v, status := 201)` — two surfaces, one convention each.
 - `HttpResponseException(status, message[, cause])`: a deep helper that wants a 404/409 throws it; the innermost dispatcher converts it. It carries an `int` and strings (§31.1), derives from 0001's `HttpException` root so `catch HttpException` still means "HTTP-shaped", and is not `HttpStatusException` (that is the client's `EnsureSuccess` producer — §31.4 producer locality).
 - Headers on a constructed response: the indexer (`r.Headers["ETag"] := tag;`) or `Add`; 0001 §3.4's read-only clause narrows to *received* responses (§9c).
 
@@ -442,7 +556,7 @@ Middleware/hooks pipeline (shared design with 0001 §7) · a `CancellationToken`
 - Where exceptions surface: `HttpResponseException` → a response at the *innermost* table (so a hook sees a 400 as a response); everything else propagates through the hooks to the outermost `Dispatch` → opaque 500. Hence no `OnError` hook: `Around` with a `catch` *is* one.
 
 **Q8 — Testing: a public `HttpRequest` constructor + `Dispatch` on the table.**
-- A constructor beats `Http.Request(…)`: it is the ordinary spelling, and `Http` is 0001's client facade. Body accessors on a constructed request or response read the in-memory body under the unchanged single-consumption rule. `Dispatch` lives on `RouteTable` — the object that does the work — and is reached as `service.Routes.Dispatch(req)`. The tests in §2 use only 0022's `Assert.Equal` (hashable records) and `using var` fixtures; seeding is `await store.Add(lambda(id) => …)` on the same `Store<Todo>` the service borrows, so a test never spells a lock.
+- A constructor beats `Http.Request(…)`: it is the ordinary spelling, and `Http` is 0001's client facade. Body accessors on a constructed request or response read the in-memory body under the unchanged single-consumption rule. `Dispatch` lives on `RouteTable` — the object that does the work — and is reached as `service.Routes.Dispatch(req)`. The tests in §2 use only 0022's `Assert.Equal` (hashable records) and `using var` fixtures. The first test needs no request at all — `await api.Create(new NewTodo("…"))` calls the handler as the method it is; the second dispatches `/not-a-number` to prove the table binds before the handler runs. Seeding, where a test needs it, is `await store.Add(lambda(id) => …)` on the same `Store<Todo>` the service borrows, so a test never spells a lock.
 
 **Q9 — Lifecycle: `Listen(…): Task<int>` + static `Stop()`; the deps overload; `Serve` as the fallback.**
 - `Listen` stays the only blocking point and is awaited (#1362). `Stop()` static and idempotent per #1402 — one server per process is the v1 posture; the natural successor is a `token: CancellationToken` on `Listen`, a compatible addition (§6).
@@ -459,7 +573,7 @@ Middleware/hooks pipeline (shared design with 0001 §7) · a `CancellationToken`
 3. Default bind host `127.0.0.1` — safe by default; containers opt into `0.0.0.0`, and the diagnostic when a container health-check fails should name the flag.
 4. v1 ships `Stop()` only; signal translation (SIGINT/SIGTERM → `Stop()`) is wired when the process/OS surface lands (proposal 0014's channel is the natural carrier).
 
-**Superseded by this redraft** (the 2026-07-24 text's): the `HttpApp` class and its capture-free *route builder* `routes: (HttpApp) -> ()`; plain-parameter handler storage; the `NotFound`/`OnError` hooks (now `{*rest}` and `Around`); `Method: string` and `Route(verb: string, …)` (now `HttpMethod`); `Param`'s `KeyNotFoundException` (now `ArgumentException`, band 1); `Json<T>(): OwningTask<T>` as the single body accessor (now the split above); `r.Headers.Set(…)` (now the indexer); the §4.3 row mapping a `Param`/`Json` failure to a 500 (now a 400 through `HttpResponseException`); and the §2.1 showcase's `app.Get("/todos/{id}", api.GetById)` (now `_routes.Get("/{id}", GetById)` on the owned table). The sync-lambda `app.Get("/health", lambda(req) => Http.Text("ok"))` is superseded by the `async` spelling.
+**Superseded by this redraft** (the 2026-07-24 text's): the `HttpApp` class and its capture-free *route builder* `routes: (HttpApp) -> ()`; plain-parameter handler storage; the `NotFound`/`OnError` hooks (now `{*rest}` and `Around`); `Method: string` and `Route(verb: string, …)` (now `HttpMethod`); `Param`'s `KeyNotFoundException` (now `ArgumentException`, band 1); `Json<T>(): OwningTask<T>` as the single body accessor (now the split above); `r.Headers.Set(…)` (now the indexer); the §4.3 row mapping a `Param`/`Json` failure to a 500 (now a 400 through `HttpResponseException`); and the §2.1 showcase's `app.Get("/todos/{id}", api.GetById)` (now `_routes.Get("/{id}", GetById)` on the owned table). The sync-lambda `app.Get("/health", lambda(req) => Http.Text("ok"))` is superseded by the `async` spelling. **Superseded by the typed-handler pass (2026-09-09)** (the 2026-09-06 text's): the six single-shape `(HttpRequest) -> OwningTask<HttpResponse>` registration members as the *whole* surface (now the classic member of each thirteen-member family); the `/health` line `async lambda(req) => Http.Text("ok")` in the tour (now `async lambda() => "ok"` — the classic spelling remains admitted); the `private` tour handlers (now `public`: the class's surface for the table and for a test); §7 Q3's cost-only ground for declining a sync arm (now structural: a bare-`R` slot unifies against an `async` reference exactly); the first test (now a direct call).
 
 ## 9. What must change elsewhere
 
@@ -471,6 +585,10 @@ Middleware/hooks pipeline (shared design with 0001 §7) · a `CancellationToken`
 
 **(d) Only for the fallback:** `TcpListener` declares the **synchronized** fact on a stdlib §1 *Facts* line, so that `Shared<TcpListener>` enters §28.13's payload set and N user-spawned workers can reach one listener. 0007 §3 already classifies `TcpListener` as compiler-known **sendable**, but §30.14 crosses a sendable class as an *owned transfer* with a single destination, so that classification alone seats one worker on the listener, not N; the **synchronized** fact is what admits the `Shared<TcpListener>` handle each worker needs. 0007 §3 already asserts the property in prose and its Q1 ruling confirms it; the fact line is the formal carrier. Not needed if (a) lands.
 
+**(e) Two derived type properties, §3.6 table rows at graduation — a ruling-class edit.** §3.6 reserves *behavior* dispatch on a structural classification to compiler-known standard-library types and requires that "New rules … that need a structural classification of types must define it as a derived type property under the rules of this section". The typed arms dispatch behavior (JSON / text / 204 / 404) on the structure of `R`, and admit slots by a disjunction no `where` clause expresses; §3's listing therefore defines **binding capability** (of a handler slot type: request / capture / body / both / none — keyed on identity with `HttpRequest`, `string`, `IParsable<X>` conformance, `IDeserializable` conformance at a value kind; purely structural, §3.6 rule 1) and **response shape** (of a result type with `?` stripped: JSON / JSON array / text / none — keyed on `ISerializable` conformance, `Array<S>` of an `ISerializable` value type, `string`). The registration-time *assignment* of capabilities to a route by count is a rule of the member, not a property, and claims no row. Graduation adds the two rows to §3.6's table, each "Defined in" the server's stdlib section, obeying rules 1–4 unchanged (computed, per-instantiation, public-contract — making `Todo` a class flips both — and named in diagnostics). `RouteTable` is compiler-known for §28.14 retention already (§9b); this item admits it to §3.6's behavior-dispatch set for the first time. Classified under spec-change-process.md §2 as a **ruling** (it decides how §3.6's existing reservation admits one more compiler-known dispatch; no rule changes); body-locality **local** (a per-registration-line check). **If the rows are refused**, the fallback is stdlib §2.15's posture for `Parse<T>`: state the classification and its diagnostics at the member, with no §3.6 row — the API is unchanged, only where the words live.
+
+**(f) Tracking-issue items — spec clarity, none blocking.** Three readings this design was traced against are readings, not rules, and each deserves an issue: (1) §22.6 — how a **method-reference** argument ranks (exact / converting) at an overloaded callee; the section spells the rule for lambda literals only, and §27.6's exact-preferred ranking selects among the *reference's* overloads, not the callee's. (2) §14.5/§22.6 — that a function-typed argument whose arity differs from the slot's "fails inference" and drops out as inapplicable; the text says "unify", never "arity". (3) §30.6 — how an `async` lambda's `Task`/`OwningTask` wrapper is chosen at a return slot containing a **free** type parameter (`Task<R>`); §30.6 defers to §30.1, which lists admissible declared types and states no inference rule. The family is designed so that none of the three decides a tour line: the void arm's `status` default settles (1) by the defaulted-arity tie-break, the classic non-generic member settles (3) by the non-generic preference, and (2) is the reading every arity-differing candidate needs to drop out cleanly.
+
 ## 10. Relationship to existing work
 
 - **0001**: shares `HttpResponse`, `HttpHeaders`, `HttpMethod`, the `Http` facade, the `HttpException` root, and the substrate; the fetch symmetry is why the two read as one API. One clause narrows (§9c).
@@ -480,8 +598,8 @@ Middleware/hooks pipeline (shared design with 0001 §7) · a `CancellationToken`
 - **#1376**: the umbrella networking issue; this proposal is its server half. **#1402**: the tracking issue and the ruling record (§8).
 - **§28.14 / §30.14 / §28.13 / §22.12**: the design rests on existing surface — form-4 admission for `this`-bound registration, spawn positions for the factory, `Shared<Locked<…>>` for shared state — plus the one roster edit of §9a. **§28.4**'s reverse-declaration-order disposal is what §4.1's field discipline leans on.
 - **#1394/#645 (Stream), #1378 (timers), #703 (serialization — landed as stdlib §2.14/§2.15)**: sequencing dependencies noted inline.
-- **networking-design-comparison.md**: the server rows' "manual `int.Parse` + `!`" and "~5 types" phrases are updated with this redraft (companion edit).
+- **networking-design-comparison.md**: the server rows' "manual `int.Parse` + `!`" and "~5 types" phrases were updated with the 2026-09-06 redraft; the Axum and ASP.NET cells are updated again with the typed-handler pass — Bezel now binds from the signature, by type and position, without a trait solver (companion edit).
 
 ## 11. Forward compatibility with a `route` modifier
 
-A future `public route(Get, "/{id}") method GetById(req: HttpRequest): OwningTask<HttpResponse>` re-expresses each `[T]` line mechanically: the compiler emits `_routes.<Verb>(<route>, <Method>)` at the end of every non-chaining constructor of the declaring class, in declaration order, at the body's end — the same *set* of constructors §22.8 step 2 runs field initializers in (those whose step 1 is `base(...)` or the implicit `base()`), but at step 3's tail rather than at step 2, because a registration must follow the body's own assignments to the dependency fields the handlers read — targeting the `owned` field that the class's `IHttpService.Routes` expression body reads (the compiler emits the *field* spelling, so the trace is form 4 exactly as today and no getter-hop lift is needed). No new admission rule, no runtime change: `RouteTable`, `Dispatch`, `Listen` are untouched, exactly as 0022 §3.4 keeps its runner under fork (a). Nothing here should be built until the evidence bar 0022 §3.4 sets is met; the point is only that today's spelling has a total, per-declaration, closed re-expression (rationale §5.19's `serialized` discipline), and that the constructor-tail registration — not a `Register()` phase — is the synthesis target.
+A future `public route(Get, "/{id}") method GetById(id: int): Task<Todo?>` re-expresses each `[T]` line mechanically — the emitted `_routes.Get("/{id}", GetById)` resolves through §3's family with the same per-instantiation checks, so the modifier adds no binding rule of its own: the compiler emits `_routes.<Verb>(<route>, <Method>)` at the end of every non-chaining constructor of the declaring class, in declaration order, at the body's end — the same *set* of constructors §22.8 step 2 runs field initializers in (those whose step 1 is `base(...)` or the implicit `base()`), but at step 3's tail rather than at step 2, because a registration must follow the body's own assignments to the dependency fields the handlers read — targeting the `owned` field that the class's `IHttpService.Routes` expression body reads (the compiler emits the *field* spelling, so the trace is form 4 exactly as today and no getter-hop lift is needed). No new admission rule, no runtime change: `RouteTable`, `Dispatch`, `Listen` are untouched, exactly as 0022 §3.4 keeps its runner under fork (a). Nothing here should be built until the evidence bar 0022 §3.4 sets is met; the point is only that today's spelling has a total, per-declaration, closed re-expression (rationale §5.19's `serialized` discipline), and that the constructor-tail registration — not a `Register()` phase — is the synthesis target.
