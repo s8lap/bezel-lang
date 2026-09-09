@@ -9047,28 +9047,44 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
                 applyUsingVarBorrowPinInLambdaBody(*nested);
         }
         // fix #3951 (§28.3 K1.3/K7, v0.295): mutually-exclusive-ARM save/
-        // restore, so #3951's new move-recording (handleAssignment /
-        // handleDischarge, added above) does not leak a move recorded on one
-        // arm into a SIBLING arm — this walker is flow-INSENSITIVE (no real
-        // CFG join), so without the restore, `if c then Sink.Take(move x);
-        // else Sink.Take(move x); end;` (each arm independently, and legally,
-        // consuming `x` — accepted at the method level since #3950) would
-        // read the `else` arm's `move x` as a re-move of an already-MovedFrom
-        // `x` and reject it as "already moved out" — a false reject on
-        // working code. Mirrors `handleDischarge`'s own CaseExpr arm
-        // (Ownership_Checks.cpp), which saves/restores `states_` around each
-        // mutually-exclusive arm for the identical reason. Conservative in
-        // the other direction too: nothing an arm records survives past the
-        // whole `if`, matching this pre-pass's existing flow-insensitive
-        // stance elsewhere (`seedLambdaBodyOwnedLocals`'s header comment:
-        // imprecision "cannot admit an escape, only over-reject one" is
-        // accepted; here the equivalent is "cannot admit a false accept,
-        // only under-detect a real one"). // per §28.3 K1.3/K7, v0.295
+        // restore BEFORE each arm, so #3951's new move-recording
+        // (handleAssignment / handleDischarge, added above) does not leak a
+        // move recorded on one arm into a SIBLING arm — this walker is flow-
+        // INSENSITIVE (no real CFG join), so without the restore, `if c then
+        // Sink.Take(move x); else Sink.Take(move x); end;` (each arm
+        // independently, and legally, consuming `x` — accepted at the method
+        // level since #3950) would read the `else` arm's `move x` as a
+        // re-move of an already-MovedFrom `x` and reject it as "already
+        // moved out" — a false reject on working code. That part is
+        // unchanged below.
+        //
+        // fix #4117 (§28.3 K1.3/K7, v0.295): #3951 ALSO restored to the
+        // pre-if snapshot unconditionally AFTER every arm ran, discarding
+        // each arm's exit state instead of joining it — so `x` looked
+        // untouched to whatever followed the whole `if`, and a second `move
+        // x` right after it was silently accepted as a fresh first move.
+        // Measured: `if Sink.Flag(true) then t := t + Sink.Take(move x); end;
+        // t := t + Sink.Take(move x);` inside a lambda body compiled rc=0
+        // with zero relevant diagnostics and heap-use-after-freed under
+        // `--sanitize=address`. Fixed by JOINING every arm's end state
+        // (mirroring the real per-method IfStmt join, this file's ~line
+        // 3447, and `joinInto`'s own §28.3 Owned⊓MovedFrom maybe-consumed
+        // rule) instead of discarding to the snapshot — the no-else case
+        // still folds in the pre-if snapshot itself as the implicit false-
+        // edge fallthrough, exactly as the real join does for `!hasElse`.
+        // `emitClash=false` (as `joinMarkerFreeArmEnds`, Ownership_Checks.cpp
+        // ~1408, already uses for the sibling CaseExpr arm-meet): a genuine
+        // Owned/Borrowed clash across lambda-body if-arms is a real §28.3
+        // hazard, but turning on a brand-new diagnostic for it is a separate,
+        // larger blast radius left for its own issue. // per §28.3 K1.3/K7,
+        // v0.295, #3951, #4117
         BlockState savedIfStates = states_;
+        std::vector<BlockState> armEnds;
         for (const auto& bs : ifs->ifBranch.body)
             if (bs) applyUsingVarBorrowPinInLambdaStmt(*bs);
-        states_ = savedIfStates;
+        armEnds.push_back(states_);
         for (const auto& el : ifs->elifBranches) {
+            states_ = savedIfStates;
             if (el.condition) {
                 std::vector<const ast::LambdaExpr*> nestedLambdas;
                 collectBodyLambdasExpr(*el.condition, nestedLambdas);
@@ -9077,11 +9093,21 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
             }
             for (const auto& bs : el.body)
                 if (bs) applyUsingVarBorrowPinInLambdaStmt(*bs);
-            states_ = savedIfStates;
+            armEnds.push_back(states_);
         }
-        for (const auto& bs : ifs->elseBody)
-            if (bs) applyUsingVarBorrowPinInLambdaStmt(*bs);
-        states_ = std::move(savedIfStates);
+        if (ifs->hasElse) {
+            states_ = savedIfStates;
+            for (const auto& bs : ifs->elseBody)
+                if (bs) applyUsingVarBorrowPinInLambdaStmt(*bs);
+            armEnds.push_back(states_);
+        } else {
+            armEnds.push_back(savedIfStates);
+        }
+        auto ifJoined = std::move(armEnds.front());
+        for (std::size_t i = 1; i < armEnds.size(); ++i)
+            joinInto(ifJoined, armEnds[i], ifs->span.begin,
+                     /*emitClash=*/false, /*unionKeys=*/false);
+        states_ = std::move(ifJoined);
         return;
     }
     if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&s)) {
@@ -9091,20 +9117,35 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
             for (const ast::LambdaExpr* nested : nestedLambdas)
                 applyUsingVarBorrowPinInLambdaBody(*nested);
         }
-        // fix #3951 (§28.3 K1.3, v0.295): save/restore around the loop body —
-        // this walker has no real fixpoint over back edges (unlike the
-        // method-level dataflow), so it cannot know whether the body runs 0,
-        // 1, or N times. Restoring afterward means a move recorded inside the
-        // body never leaks to code after the loop as a false "already moved"
-        // — the same under-detect-not-over-reject stance as the IfStmt arm
-        // above, applied to "maybe executed at all" instead of "mutually
-        // exclusive". A double-move WITHIN one straight-line pass through the
-        // body (this fix's own repro shape) is still caught, since the walk
-        // through the body itself is sequential. // per §28.3 K1.3, v0.295
+        // fix #3951 (§28.3 K1.3, v0.295): save around the loop body — this
+        // walker has no real fixpoint over back edges (unlike the method-
+        // level dataflow), so it cannot know whether the body runs 0, 1, or
+        // N times.
+        //
+        // fix #4117 (§28.3 K1.3, v0.295): #3951 then unconditionally
+        // RESTORED to the pre-loop snapshot, discarding whatever the body
+        // recorded instead of joining the "0 iterations" (skip) and "ran the
+        // body" edges — so a move made inside the loop body was invisible to
+        // code after the loop, and a second `move x` right after it was
+        // silently accepted. Diagnostic-silence confirmed (issue table); not
+        // independently reproduced under ASan for `while` specifically, but
+        // it is the identical mechanism the `if`/`try`/`for` shapes were
+        // measured on. Fixed by joining the body's exit state with the
+        // pre-loop snapshot (standing in for the always-possible 0-iteration
+        // edge) via the same `joinInto` the real per-method dataflow uses,
+        // instead of discarding to the snapshot. A double-move WITHIN one
+        // straight-line pass through the body (this fix's own repro shape)
+        // is still caught, since the walk through the body itself is
+        // sequential; a double-move split ACROSS loop iterations remains
+        // unmodeled by this flow-insensitive walker, as before — this walker
+        // has no back-edge fixpoint to catch that with, and widening it to
+        // one is out of this fix's scope. // per §28.3 K1.3, v0.295, #3951,
+        // #4117
         BlockState savedWhileStates = states_;
         for (const auto& bs : ws->body)
             if (bs) applyUsingVarBorrowPinInLambdaStmt(*bs);
-        states_ = std::move(savedWhileStates);
+        joinInto(states_, savedWhileStates, ws->span.begin,
+                 /*emitClash=*/false, /*unionKeys=*/false);
         return;
     }
     if (auto* fs = dynamic_cast<const ast::ForStmt*>(&s)) {
@@ -9120,13 +9161,18 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
             for (const ast::LambdaExpr* nested : nestedLambdas)
                 applyUsingVarBorrowPinInLambdaBody(*nested);
         }
-        // fix #3951 (§28.3 K1.3, v0.295): same save/restore as the WhileStmt
-        // arm above, and for the same reason (a for-loop body may run 0, 1,
-        // or N times). // per §28.3 K1.3, v0.295
+        // fix #3951 / fix #4117 (§28.3 K1.3, v0.295): same save-then-join as
+        // the WhileStmt arm above, and for the same reason (a for-loop body
+        // may run 0, 1, or N times) — ASan-confirmed for this construct
+        // specifically (issue #4117): `for` inside a lambda body, `move x`
+        // inside the loop then `move x` again right after it, compiled rc=0
+        // with zero diagnostics and heap-use-after-freed. // per §28.3 K1.3,
+        // v0.295, #3951, #4117
         BlockState savedForStates = states_;
         for (const auto& bs : fs->body)
             if (bs) applyUsingVarBorrowPinInLambdaStmt(*bs);
-        states_ = std::move(savedForStates);
+        joinInto(states_, savedForStates, fs->span.begin,
+                 /*emitClash=*/false, /*unionKeys=*/false);
         return;
     }
     if (auto* db = dynamic_cast<const ast::DoEndBlock*>(&s)) {
@@ -9165,18 +9211,37 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
         // fix #3951 (§28.3 K1.3/§28.8.1, v0.295): a `try` body may throw and
         // unwind to a catch arm at ANY statement inside it, so a move
         // recorded partway through the body is not a reliable fact for a
-        // catch arm (or `finally`) to see — each of those must be reachable
-        // from the state as of ENTERING the try, not from wherever the body
-        // walk happened to land. Save before the body, restore before each
-        // catch arm and before `finally`, and restore once more after the
-        // whole statement so nothing the try/catch/finally did leaks past
-        // it — the same conservative, mutually-exclusive-arm stance as the
-        // IfStmt/CaseStmt arms. A double-move straight through the BODY
-        // alone (no intervening throw) is still caught, since the body's own
-        // walk is sequential. // per §28.3 K1.3, §28.8.1, v0.295
+        // catch arm to see — each catch arm must be reachable from the state
+        // as of ENTERING the try, not from wherever the body walk happened to
+        // land. Save before the body, restore before each catch arm. That
+        // part is unchanged below.
+        //
+        // fix #4117 (§28.3 K1.3/§28.8.1, v0.295): #3951 then restored to the
+        // pre-try snapshot AGAIN before `finally` and once more after the
+        // whole statement, discarding the body's and every catch arm's exit
+        // state rather than joining them — so a move made in the try body (or
+        // in a catch arm) was invisible to `finally` and to code after the
+        // whole `try`, and a second `move x` there was silently accepted.
+        // ASan-confirmed (issue #4117): `try`/`catch` inside a lambda body,
+        // `move x` inside the `try` block then `move x` again right after the
+        // whole `try` statement, compiled rc=0 with zero diagnostics and
+        // heap-use-after-freed. Fixed by JOINING the try-body's normal-
+        // completion exit state with every catch arm's exit state (mutually
+        // exclusive: either the body completed with no throw, or exactly one
+        // catch arm ran) into the state `finally` sees and that survives past
+        // the whole statement — mirrors the IfStmt arm's arm-join above,
+        // generalized from 2+ mutually-exclusive arms to
+        // {body-normal-completion} ∪ {catch arms}. An exception that
+        // propagates unmatched (no catch arm applies) is NOT modeled as a
+        // separate edge here, same as before this fix — this walker has no
+        // real exception-edge machinery (unlike the CFG-driven per-method
+        // dataflow), and widening it to one is out of this fix's scope.
+        // // per §28.3 K1.3, §28.8.1, v0.295, #3951, #4117
         BlockState savedTryStates = states_;
         for (const auto& bs : trys->body)
             if (bs) applyUsingVarBorrowPinInLambdaStmt(*bs);
+        std::vector<BlockState> tryEnds;
+        tryEnds.push_back(states_);  // normal completion, no throw
         for (const auto& arm : trys->catches) {
             states_ = savedTryStates;
             if (arm.guard) {
@@ -9186,11 +9251,15 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
                     applyUsingVarBorrowPinInLambdaBody(*nested);
             }
             if (arm.body) applyUsingVarBorrowPinInLambdaStmt(*arm.body);
+            tryEnds.push_back(states_);
         }
-        states_ = savedTryStates;
+        auto tryJoined = std::move(tryEnds.front());
+        for (std::size_t i = 1; i < tryEnds.size(); ++i)
+            joinInto(tryJoined, tryEnds[i], trys->span.begin,
+                     /*emitClash=*/false, /*unionKeys=*/false);
+        states_ = std::move(tryJoined);
         for (const auto& bs : trys->finallyBody)
             if (bs) applyUsingVarBorrowPinInLambdaStmt(*bs);
-        states_ = std::move(savedTryStates);
         return;
     }
     if (auto* cs = dynamic_cast<const ast::CaseStmt*>(&s)) {
@@ -9200,13 +9269,33 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
             for (const ast::LambdaExpr* nested : nestedLambdas)
                 applyUsingVarBorrowPinInLambdaBody(*nested);
         }
-        // fix #3951 (§28.3 K1.3/K7, v0.295): mutually-exclusive-ARM save/
-        // restore, mirroring the IfStmt arm above and `handleDischarge`'s own
-        // CaseExpr arm (Ownership_Checks.cpp) — each `case` arm is a
-        // mutually-exclusive branch, so a move recorded in one arm must not
-        // be visible to a sibling arm or to code after the whole `case`.
-        // // per §28.3 K1.3/K7, v0.295
+        // fix #3951 (§28.3 K1.3/K7, v0.295): mutually-exclusive-ARM save
+        // before each arm, mirroring the IfStmt arm above and
+        // `handleDischarge`'s own CaseExpr arm (Ownership_Checks.cpp) — each
+        // `case` arm is a mutually-exclusive branch, so a move recorded in
+        // one arm must not be visible to a sibling arm. That part is
+        // unchanged below.
+        //
+        // fix #4117 (§28.3 K1.3/K7, v0.295): #3951 then restored to the
+        // pre-case snapshot unconditionally after every arm ran, discarding
+        // each arm's exit state — the identical shape as #4116's fix to the
+        // REAL per-method CaseStmt join (`MethodOwnership::visitStmt`'s own
+        // CaseStmt arm, this file, ~line 3008), just in THIS flow-insensitive
+        // lambda-body pre-pass instead. Not independently reproduced under
+        // ASan for this construct (the issue's own measured table covers
+        // `if`/`try`/`for`, not this walker's `case` arm specifically), but
+        // it is the same save/restore-discards-a-move mechanism, so it is
+        // fixed identically: join every arm's exit state, PLUS the pre-case
+        // snapshot standing in for the statement-`case`'s no-match
+        // fallthrough (§19.6 — "falls through with no action") UNLESS
+        // `caseHasUnguardedCatchAllArm` proves that edge empty — see
+        // #4116's fuller rationale at ~line 3008, including why this
+        // carve-out matters: without it, a `case` where every arm (a
+        // catch-all included) consumes the same captured local would be
+        // falsely marked maybe-consumed instead of definitely-consumed. //
+        // per §28.3 K1.3/K7, §19.6, v0.295, #3951, #4116, #4117
         BlockState savedCaseStates = states_;
+        std::vector<BlockState> caseArmEnds;
         for (const auto& arm : cs->arms) {
             states_ = savedCaseStates;
             if (arm.guard) {
@@ -9223,8 +9312,15 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
             }
             for (const auto& bs : arm.stmts)
                 if (bs) applyUsingVarBorrowPinInLambdaStmt(*bs);
+            caseArmEnds.push_back(states_);
         }
-        states_ = std::move(savedCaseStates);
+        if (!caseHasUnguardedCatchAllArm(*cs))
+            caseArmEnds.push_back(savedCaseStates);
+        auto caseJoined = std::move(caseArmEnds.front());
+        for (std::size_t i = 1; i < caseArmEnds.size(); ++i)
+            joinInto(caseJoined, caseArmEnds[i], cs->span.begin,
+                     /*emitClash=*/false, /*unionKeys=*/false);
+        states_ = std::move(caseJoined);
         return;
     }
     // Break / Continue / etc.: no child expressions reachable.
