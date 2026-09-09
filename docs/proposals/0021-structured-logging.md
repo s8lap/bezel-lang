@@ -352,9 +352,10 @@ import System.Net.Http;
 // The logger is a constructor dependency, carried as an owned field — no container (D-0001).
 public sealed class Deps
   public owned readonly Todos: Shared<Locked<Dictionary<int, Todo>>>;
-  public owned readonly Log: ChannelLogger;
-  public constructor(owned todos: Shared<Locked<Dictionary<int, Todo>>>, owned log: ChannelLogger)
-    Todos := todos;  Log := log;
+  public owned readonly Logger: ChannelLogger;
+  public constructor(owned todos: Shared<Locked<Dictionary<int, Todo>>>, owned logger: ChannelLogger)
+    Todos := todos;
+    Logger := logger;
   end constructor;
 end Deps;
 
@@ -364,7 +365,7 @@ public sealed class Api: IHttpService
   public property Routes: RouteTable => _routes;
   public constructor(owned deps: Deps)
     _deps := deps;
-    _routes.Mount("/todos", new TodoApi(_deps.Todos.Clone(), _deps.Log));   // a child that logs borrows the ILogger (0002 §4.1)
+    _routes.Mount("/todos", new TodoApi(_deps.Todos.Clone(), _deps.Logger));   // a child that logs borrows the ILogger (0002 §4.1)
   end constructor;
 end Api;
 
@@ -376,8 +377,8 @@ public static class Program
         new Locked<Dictionary<int, Todo>>(new Dictionary<int, Todo>()));
     // `deps` runs on this domain once per worker; each result is moved into worker i and handed to
     // the service factory there (0002 §3, §4.2). Main holds no logger, so the channel closes with the last worker.
-    var code := await HttpServer.Listen(port := 8080, service := lambda(owned d: Deps) => new Api(move d),
-        deps := lambda(i) => new Deps(todos.Clone(), hub.NewLogger($"http-{i}")));   // serves until Stop()
+    var code := await HttpServer.Listen(port := 8080, service := lambda(owned deps: Deps) => new Api(move deps),
+        deps := lambda(worker) => new Deps(todos.Clone(), hub.NewLogger($"http-{worker}")));   // serves until Stop()
     await pump;                                       // every worker's ChannelLogger disposed ⇒ channel closed ⇒ sink drains
     return code;
   end Main;
