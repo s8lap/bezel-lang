@@ -2046,7 +2046,7 @@ Through v0.245 the marker was spelled `owned` at binding positions. After v0.246
 | The exact wording of a rule, the grammar (Appendix A), the enforced invariants (Appendix C) | `Bezel_Language_Spec.md` |
 | *Why* a rule is what it is; what was declined | `Bezel_Design_Rationale.md`, `docs/proposals/DECLINED.md` |
 | Migration across revisions | `Bezel_Changelog.md` |
-| Worked, example-first teaching | the six guides |
+| Worked, example-first teaching | the seven guides |
 | Extern/FFI declarations, serialization clauses, inline arrays, `Shared`/`Weak` topologies, domains and sendability, the `polymorphic` registry, static initialization order | spec §32, §9.8, §15.1, §28.13, §30.13–§30.14, §11.1, §22.13 |
 
 **One seam worth closing here: `Task<T>` versus `OwningTask<T>` results** (§30.5). Both are mint-announcing, so the *container* obligation is identical — the caller owns the task. The **result** rules differ:

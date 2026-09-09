@@ -10,7 +10,7 @@ The design is mostly settled — a normative spec (with rationale, stdlib, and g
 
 ## The documents (read these before doing anything)
 
-Eleven documents in `docs/`. Their roles are distinct; consult the right one for the question at hand.
+Twelve documents in `docs/`. Their roles are distinct; consult the right one for the question at hand.
 
 **If you are about to *write* Bezel code, read [`Bezel_For_Code_Generation.md`](docs/Bezel_For_Code_Generation.md) first.** It is a dense writing reference — syntax surface, the ownership rules as obligations, a stdlib name index with exact signatures, the idioms, and a *looks-right-is-rejected* section — at roughly a fifteenth the size of the spec plus stdlib, so it is cheap enough to keep in context alongside the code you are producing. It is **not normative**: where it and the spec disagree, the spec wins and the disagreement is a defect to report.
 
@@ -19,7 +19,7 @@ Eleven documents in `docs/`. Their roles are distinct; consult the right one for
 - **`Bezel_Design_Rationale.md`** — explains *why* each decision was made and what alternatives were considered and declined. When the spec says "X is forbidden," the rationale typically says why and what was tried instead. Read this when you're tempted to wonder "why doesn't Bezel just do Y?" — the answer is usually there.
 - **`Bezel_Changelog.md`** — the per-revision narrative history: one entry per revision, oldest first, normative for migration. Pinned history — entries are written at their revision and never retroactively edited; never the place to look up a current rule.
 - **`Bezel_For_Code_Generation.md`** — the writing reference described above. Derived, pinned to a revision, and re-validated like the guides; `scripts/check_docs.sh`'s PIN check **fails** if it falls more than three revisions behind, because a stale line there is wrong code rather than stale teaching.
-- **`Bezel_Guide_01_Memory_and_Ownership.md`**, **`Bezel_Guide_02_Errors_and_Nullability.md`**, **`Bezel_Guide_03_Modeling_Data.md`**, **`Bezel_Guide_04_Concurrency.md`**, **`Bezel_Guide_05_Collections_and_Iteration.md`**, and **`Bezel_Guide_06_Contracts_and_Purity.md`** — short example-first guides showing idiomatic Bezel. Useful for understanding what *good* Bezel code looks like, and for spec-derived test material.
+- **`Bezel_Guide_01_Memory_and_Ownership.md`**, **`Bezel_Guide_02_Errors_and_Nullability.md`**, **`Bezel_Guide_03_Modeling_Data.md`**, **`Bezel_Guide_04_Concurrency.md`**, **`Bezel_Guide_05_Collections_and_Iteration.md`**, **`Bezel_Guide_06_Contracts_and_Purity.md`**, and **`Bezel_Guide_07_Style.md`** — short example-first guides showing idiomatic Bezel. Useful for understanding what *good* Bezel code looks like, and for spec-derived test material.
 
 The filenames are stable across revisions (since v0.131; earlier revisions carried the version in the filename, e.g. `Bezel_Language_Spec_0_130.md` — such citations refer to that archived revision in git history). The current revision number lives in each document's header and in the changelog (`Bezel_Changelog.md`). When citing the spec in a PR, test, or issue, cite the section *and* the revision (e.g. "spec §28.2, v0.131") so the reference stays pinned as revisions land.
 

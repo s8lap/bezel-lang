@@ -87,6 +87,7 @@ DOCS = {
     'guide04':   'docs/Bezel_Guide_04_Concurrency.md',
     'guide05':   'docs/Bezel_Guide_05_Collections_and_Iteration.md',
     'guide06':   'docs/Bezel_Guide_06_Contracts_and_Purity.md',
+    'guide07':   'docs/Bezel_Guide_07_Style.md',
 }
 text = {}
 for k, p in DOCS.items():
@@ -656,7 +657,7 @@ fi
 # recommendation; it is neither a compiler diagnostic nor a lint over user code
 # or tests/, and it must not be wired into gate.sh or agent_check.sh, which
 # gate the compiler, not the prose. Scope: every fenced code block (any tag) of
-# the nine non-changelog documents — the proposal's "six live normative
+# the ten non-changelog documents — the proposal's "six live normative
 # documents" implemented as the full non-changelog set, a superset that is a
 # no-op wherever no clause-bearing fence exists (recorded deviation, the
 # 0095-Q4 shape: a hardcoded six would drift as guides gain or lose contract
@@ -682,7 +683,8 @@ DOCS = ['docs/Bezel_Language_Spec.md', 'docs/Bezel_Standard_Library.md',
         'docs/Bezel_Guide_03_Modeling_Data.md',
         'docs/Bezel_Guide_04_Concurrency.md',
         'docs/Bezel_Guide_05_Collections_and_Iteration.md',
-        'docs/Bezel_Guide_06_Contracts_and_Purity.md']
+        'docs/Bezel_Guide_06_Contracts_and_Purity.md',
+        'docs/Bezel_Guide_07_Style.md']
 clause = re.compile(r'^\s*(?:static\s+)?(?:requires|ensures)\(.*\)\s*(?://.*)?$')
 member = re.compile(r'\b(?:method|constructor)\s*(\w*)')
 bad = []
@@ -714,7 +716,7 @@ if bad:
     print(f"STYLE: {len(bad)} clause-region/body adjacency violation(s) (§22.16 recommended style, v0.260):")
     print('\n'.join(bad))
     sys.exit(1)
-print(f"STYLE: clean ({checked} clause-region seam(s) checked across the nine non-changelog docs)")
+print(f"STYLE: clean ({checked} clause-region seam(s) checked across the ten non-changelog docs)")
 PY
 [ $? -ne 0 ] && STRUCT=1
 
