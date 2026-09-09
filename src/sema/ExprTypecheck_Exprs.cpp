@@ -6267,6 +6267,54 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
         // String type which is not Named, so this does not affect it.)
         if (lt && lt->kind == TypeRef::Kind::Named &&
             (op == "+" || op == "-" || op == "*" || op == "/" || op == "mod")) {
+            // fix #3930 (§25.2/§11.8, v0.295): `lt->declaration` is null both
+            // for a bare, unconstrained generic type parameter AND for a
+            // null-declaration builtin (`Array<T>`, `IntPtr`, …) — the code
+            // below folded both into the literal placeholder string "?",
+            // which for a type parameter is doubly wrong: it hides the real
+            // name (`T`, not "?") AND the remedy text ("declare `static
+            // method operator +(a: ?, b: ?)` inside `?`") is unactionable —
+            // a type parameter declares no members of its own (§11.8), so
+            // nothing can be declared "inside" one. `isInScopeTypeParam`
+            // (the SAME test the §11.8 constraint-dispatch block above uses
+            // via its own `typeParamNameOf` lambda) tells the two null-
+            // declaration shapes apart, so this branch fires ONLY for the
+            // real type-parameter case and leaves the builtin one on the
+            // pre-existing "?" wording below unchanged. Mirrors the ordering-
+            // operator diagnostic (`< > <= >=`) a few hundred lines above,
+            // same §11.8 authority: a type parameter's operator candidate
+            // set is drawn from its static-interface constraints, not the
+            // parameter itself.
+            if (isInScopeTypeParam(lt->headName())) {
+                const std::string tp(lt->headName());
+                if (op == "mod") {
+                    // Unlike the other four, NEITHER stdlib static-interface
+                    // abstraction declares `mod` (`INumber<T>` has `+ - * /`
+                    // and `<`; `ISteppable<T>` has `Step` and `<`) — so there
+                    // is no single existing bound to name; the real remedy is
+                    // a user-declared interface with a matching operator.
+                    ctx_.diagnostics().report(
+                        Severity::Error, be.span.begin,
+                        "operator `mod` is not available on type parameter `" +
+                        tp + "` — a type parameter declares no operators of "
+                        "its own, and no stdlib static-interface abstraction "
+                        "declares `mod` (`INumber<" + tp + ">`/`ISteppable<" +
+                        tp + ">` both omit it); declare a `static operator "
+                        "mod(a: " + tp + ", b: " + tp + "): " + tp +
+                        "` on your own interface and add a matching `where " +
+                        tp + ": ...` bound (\xC2\xA7""25.2/\xC2\xA7""11.8)");
+                } else {
+                    ctx_.diagnostics().report(
+                        Severity::Error, be.span.begin,
+                        "operator `" + std::string(op) + "` is not available "
+                        "on type parameter `" + tp + "` — a type parameter "
+                        "declares no operators of its own, and none of its "
+                        "constraints declares an arithmetic operator; add a "
+                        "`where " + tp + ": INumber<" + tp + ">` bound "
+                        "(\xC2\xA7""25.2/\xC2\xA7""11.8)");
+                }
+                return;
+            }
             std::string typeName =
                 lt->declaration ? std::string(lt->declaration->name) : "?";
             ctx_.diagnostics().report(
