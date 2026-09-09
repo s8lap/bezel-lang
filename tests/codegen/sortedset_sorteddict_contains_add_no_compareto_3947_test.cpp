@@ -75,15 +75,15 @@
 // restraint for the SortedSet-element analogue) — this fix is strictly about
 // the "no comparator at all" shape, not a semantic widening.
 //
-// DOCUMENTED RESIDUAL (issue #3976, filed alongside this fix): the
-// dictionary INDEXER (`sd[k]` / `sd[k] := v`, LlvmBackend_Assign.cpp) and
-// `for`-in iteration (LlvmBackend_Stmts.cpp) consult `genericBackingType`
-// through SEPARATE call sites this fix does not touch, so they still
-// silently admit the identical no-`CompareTo` shape — pinned here as a KNOWN
-// scope boundary (not a regression this file should mask), matching the
-// project's own precedent for the "genuinely ineligible" shape
-// (`sorted_set_sorted_dict_no_compareto_3865_test.cpp`'s
-// `count_and_iteration_stay_unrejected_dormant`).
+// RESIDUAL, NOW CLOSED (issue #3976, filed alongside this fix, closed by
+// fix #3976, v0.295): the dictionary INDEXER (`sd[k]` / `sd[k] := v`,
+// LlvmBackend_Assign.cpp) and `for`-in iteration (LlvmBackend_Stmts.cpp)
+// consult `genericBackingType` through SEPARATE call sites this fix did not
+// touch, so they used to silently admit the identical no-`CompareTo` shape —
+// pinned below (see `residual_indexer_now_rejected_by_fix_3976` /
+// `residual_forin_now_rejected_by_fix_3976`) as CLOSED, not still open. Full
+// regression coverage for the fix lives in
+// `sorted_sorteddict_indexer_forin_compareto_3976_test.cpp`.
 //
 // A rejection is asserted on the diagnostic TEXT, never via a coarse
 // `hasErrors()` or a bare "did not run": `runAot`'s WIFSIGNALED path
@@ -102,11 +102,11 @@ using bezel::test::runAotOut;
 
 namespace {
 
-int run(const std::string& src) {
-    auto r = runAot(src);
-    return r.ran ? r.exitCode : -999;
-}
-
+// fix #3976 (v0.295): this file's `run()` helper (bare exit-code channel) is
+// no longer used — both rows that used it (the indexer / for-in residuals)
+// now assert a compile-time REJECTION via `rejectsWith` instead of a runtime
+// value, since fix #3976 closed the residual those rows used to pin as
+// still-open. Removed rather than left dead (would warn -Wunused-function).
 std::string out(const std::string& src) { return runAotOut(src); }
 
 // A genuine compile-time rejection carrying `needle` in its message.
@@ -336,44 +336,53 @@ BEZEL_TEST(sortedset_sorteddict_contains_add_no_compareto_3947,
         std::string("2\n10"));
 }
 
-// ── DOCUMENTED RESIDUAL SCOPE BOUNDARY (issue #3976) ───────────────────────
-// ── The indexer and for-in loop are SEPARATE call sites this fix does ─────
-// ── not touch — pinned as KNOWN, not silently regressed into a crash. ─────
+// ── RESIDUAL SCOPE BOUNDARY (issue #3976) — NOW CLOSED ─────────────────────
+// ── The indexer and for-in loop were SEPARATE call sites this fix did NOT ──
+// ── touch when it landed; fix #3976 (v0.295) closed both. Rows below ───────
+// ── UPDATED (LANE_RULES §7 / CLAUDE.md rule 4): they used to pin the ───────
+// ── OLD "stays silently admitted / dormant" behavior as a documented, ──────
+// ── deliberately-unclosed residual — that residual is now closed, so the ──
+// ── behavior these rows pin has itself changed. See ─────────────────────
+// ── sorted_sorteddict_indexer_forin_compareto_3976_test.cpp for the full ───
+// ── fix-#3976 regression coverage (accept-side sweep included); these two ──
+// ── rows stay HERE (not moved) because they are the exact shapes this ──────
+// ── file's own #3947 fix originally left open, and updating them in place ──
+// ── is the record of that closure.
 
-// The indexer (`d[k] := v` / `d[k]`) still silently admits a no-`CompareTo`
+// The indexer (`d[k] := v` / `d[k]`) used to silently admit a no-`CompareTo`
 // class key via structural (§8.3) identity — LlvmBackend_Assign.cpp's own
-// `genericBackingType` consultation, untouched by this fix. UNLIKE the
-// rejected-member rows above, `SortedDictionary<ClsNoCmp, int>` CAN still be
-// constructed and populated (via the indexer, not `.Add`/`.TryAdd`, both
-// rejected above) in a well-typed program, so this is a REAL, INVOKED
-// runtime-VALUE check (via `prog()`/`Main`, not the never-invoked
-// `borrowedParamProg` shape the rejection rows use) — not merely "compiles".
+// `genericBackingType` consultation, untouched by fix #3947. Fix #3976
+// (stdlib §4.17, v0.295) added the identical `needsOrdering && !hasOrdering`
+// rejection #3947 gave `.Add`/`.TryAdd` to this call site too: `SortedDictionary
+// <ClsNoCmp, int>` CAN still be CONSTRUCTED (no construction-time check for a
+// class key, unlike SortedSet's element — narrow #3428), but every write/read
+// through the indexer now rejects with a located diagnostic instead of
+// silently storing/reading by reference identity.
 BEZEL_TEST(sortedset_sorteddict_contains_add_no_compareto_3947,
-           residual_indexer_still_admits_no_compareto_key_issue_3976) {
-    BEZEL_EXPECT_EQ(run(prog(
+           residual_indexer_now_rejected_by_fix_3976) {
+    BEZEL_EXPECT_TRUE(rejectsWith(prog(
         "  var d := new SortedDictionary<ClsNoCmp, int>(); "
         "  var k := new ClsNoCmp(5); "
         "  d[k] := 1; "
-        "  return d[k]; ")),
-        1);
+        "  return d[k]; "),
+        "requires the key type to implement `IComparable<K>`"));
 }
 
 // `for`-in iteration over a `SortedSet<T>` whose element has no `CompareTo`
-// at all stays reachable and compiling (LlvmBackend_Stmts.cpp) — this row's
-// oracle is COMPILE-STABILITY, not a runtime value: `Pt` can no longer be
-// legally INSERTED into a `SortedSet<Pt>` at all (every insertion member is
-// rejected above), so no well-typed program can ever produce a non-empty
-// receiver to iterate and observe a value from — `run()` here only proves
-// `bezelc` still lowers this dead-but-declared method body without a
-// malformed-IR crash (every declared method is codegen'd whether or not it
-// is ever called), mirroring
-// `sorted_set_sorted_dict_no_compareto_3865_test.cpp`'s own
-// `count_and_iteration_stay_unrejected_dormant` precedent for the
-// "genuinely ineligible" shape.
+// at all USED TO stay reachable and compiling (LlvmBackend_Stmts.cpp),
+// falling back to `lowerIEnumerableFor`'s SortedSet-aware wrap rather than
+// rejecting — this row's oracle used to be COMPILE-STABILITY, not a runtime
+// value ("`bezelc` still lowers this dead-but-declared method body without a
+// malformed-IR crash"). Fix #3976 (stdlib §4.18, v0.295) closed this: `for`-in
+// now consults the SAME authority `.Add`/`.Contains` do
+// (`reportSortedElementNeedsCompareTo`) BEFORE any loop codegen, so this
+// dead-but-declared body (every declared method is codegen'd whether or not
+// it is ever called, per AOT compilation) now fails to compile with a located
+// diagnostic instead of silently lowering.
 BEZEL_TEST(sortedset_sorteddict_contains_add_no_compareto_3947,
-           residual_forin_iteration_stays_unrejected_dormant_issue_3976) {
-    BEZEL_EXPECT_EQ(run(borrowedParamProg(
+           residual_forin_now_rejected_by_fix_3976) {
+    BEZEL_EXPECT_TRUE(rejectsWith(borrowedParamProg(
         "s: SortedSet<Pt>",
-        "var n := 0; for var e in s do n := n + e.X; end; return n; ")),
-        0);
+        "var n := 0; for var e in s do n := n + e.X; end; return n; "),
+        "requires the element type to implement `IComparable<T>`"));
 }

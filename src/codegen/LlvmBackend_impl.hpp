@@ -16817,6 +16817,20 @@ private:
     // Unsupported types (record, decimal, enum, unresolved T): returns null.
     llvm::Function* buildSortedKeyComparator(const sema::TypeRef* keyTy);
 
+    // fix #3976 (stdlib §4.17/§4.18, v0.295): the ONE authority for "does this
+    // SortedSet<T>/SortedDictionary<K,V> element/key, already found ELIGIBLE
+    // by genericBackingType, actually have a dispatchable CompareTo?" — the
+    // `needsOrdering && !hasOrdering` predicate + diagnostic fix #3947 added
+    // inline, twice, in tryLowerCollectionInstanceCall (LlvmBackend_Calls.cpp).
+    // Factored out so the indexer (LlvmBackend_Assign.cpp) and for-in
+    // (LlvmBackend_Stmts.cpp) call sites #3947 did not cover feed the SAME
+    // authority rather than re-deriving it. See the .cpp definition for the
+    // full contract.
+    bool reportSortedElementNeedsCompareTo(const sema::TypeRef* recvTy,
+                                           const sema::TypeRef* elemOrKeyTy,
+                                           SourceLocation loc,
+                                           const char* memberDesc);
+
     // narrow #3717 / §4.8 / §28.9: the per-index `DictionaryEntry<K,V>` decode
     // shared by `lowerDictEntryFor` (for-in), `wrapDictionaryAsIEnumerable`
     // (the GetEnumerator materializer), and #3576's First/Last/ElementAt arm

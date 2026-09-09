@@ -6877,7 +6877,26 @@ bool Emitter::lowerDictBackedSetFor(const ast::ForStmt& fs) {
     // comparator from #2550, the dictionary-entry wrap for records, etc.) so
     // the §4.18 promise holds for every SortedSet element type the wrapper
     // supports.
-    if (n == "SortedSet" && !buildSortedKeyComparator(elemTy)) return false;
+    if (n == "SortedSet" && !buildSortedKeyComparator(elemTy)) {
+        // fix #3976 (stdlib §4.18, v0.295): fix #3947 rejected a no-CompareTo
+        // eligible element at `.Add`/`.Contains`/etc (LlvmBackend_Calls.cpp's
+        // Set-family arm) but for-in iteration is a SEPARATE call site that
+        // also consults `genericBackingType` and was left silently admitting
+        // the identical shape (falling through to `lowerIEnumerableFor`'s
+        // SortedSet-aware wrap, which degrades to an unsorted/empty snapshot
+        // rather than rejecting). Reuse the ONE authority fix #3947
+        // established. A LEGITIMATE defer (string/decimal/user-choice
+        // element — `buildSortedKeyComparator` null for a reason unrelated
+        // to missing `CompareTo`) is unaffected: `elemTy` there is neither
+        // `recordTypeOfRef` nor `hasObjectHeaderEquality`, so
+        // `reportSortedElementNeedsCompareTo` correctly declines and this
+        // still falls through to `lowerIEnumerableFor` below, unchanged.
+        if (reportSortedElementNeedsCompareTo(iterTy, elemTy,
+                                              fs.span.begin,
+                                              "`for`-in iteration"))
+            return true;  // reported; no codegen — compile fails on this Error
+        return false;
+    }
     llvm::Value* setObj = lowerExpr(*fs.iterable);
     if (!setObj) return false;
     bool sorted = (n == "SortedSet");
@@ -7257,6 +7276,29 @@ bool Emitter::lowerDictEntryFor(const ast::ForStmt& fs) {
 
     const sema::TypeRef* keyTy = dictTy->genericArgs[0];
     const sema::TypeRef* valTy = dictTy->genericArgs[1];
+
+    // fix #3976 (stdlib §4.17, v0.295): fix #3947 rejected a no-CompareTo
+    // eligible key at `.Add`/`.ContainsKey`/etc (LlvmBackend_Calls.cpp's
+    // isDict block) but entry for-in iteration (`for var e in sd`) is a
+    // SEPARATE call site that also consults `genericBackingType` (via
+    // `useGen`/`kTy` below, for the SORT step) and was left silently
+    // admitting the identical shape — pre-fix, the sort step's own `cmpFn`
+    // check just silently declined and iteration fell back to hash/
+    // insertion order rather than rejecting. Checked here, BEFORE any
+    // codegen for this loop (the snapshot calls, the sort, the loop body),
+    // reusing the ONE authority fix #3947 established rather than a third
+    // inline copy of the same predicate. `genericBackingType` is queried
+    // again below (as `kTy`) for the sort step's own purpose (finding the
+    // comparator on an ALREADY-admitted key) — this earlier call is a
+    // classification-only query with no side effects, so recomputing it is
+    // not the duplicated-PREDICATE hazard CLAUDE.md warns about.
+    if (dictTy->headName() == "SortedDictionary") {
+        const sema::TypeRef* genKeyTy =
+            genericBackingType(dictTy, 0, /*isSet=*/false, nullptr);
+        if (reportSortedElementNeedsCompareTo(dictTy, genKeyTy, fs.span.begin,
+                                              "`for`-in iteration"))
+            return true;  // reported; no codegen — compile fails on this Error
+    }
 
     // fix #3758: `valRec` still selects a debug-name prefix below;
     // decodeDictValueAt's struct-vs-scalar decision no longer needs a

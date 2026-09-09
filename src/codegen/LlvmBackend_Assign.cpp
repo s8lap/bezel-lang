@@ -573,6 +573,21 @@ llvm::Value* Emitter::lowerCollectionIndexerGet(const ast::IndexExpr& ix) {
     // KeyNotFoundException (§4.8). Mirrors the TryGetValue decode path.
     const sema::TypeRef* keyTy =
         genericBackingType(recvTy, 0, /*isSet=*/false, nullptr);
+    // fix #3976 (stdlib §4.17, v0.295): fix #3947 rejected a no-CompareTo
+    // eligible key at `.ContainsKey`/`.Add`/etc (LlvmBackend_Calls.cpp's
+    // isDict block) but this indexer GET is a SEPARATE call site that also
+    // consults `genericBackingType` and was left silently admitting the
+    // identical shape — `sd[k]` read via structural (§9.1/§9.2) identity
+    // where §4.17 requires `CompareTo`-equality. Reuse the ONE authority
+    // fix #3947 established rather than a third inline copy of the same
+    // predicate.
+    if (reportSortedElementNeedsCompareTo(recvTy, keyTy, ix.span.begin,
+                                          "the `[key]` indexer")) {
+        llvm::Type* resTy = i32();
+        if (sema::TypeRef* rt = ctx_.exprType(ix))
+            if (llvm::Type* lt = lowerTypeRef(rt)) resTy = lt;
+        return llvm::PoisonValue::get(resTy);
+    }
     bool keyIsRecord = keyTy && recordTypeOfRef(keyTy) != nullptr;
     const sema::TypeRef* valTy =
         (recvTy && recvTy->genericArgs.size() > 1) ? recvTy->genericArgs[1]
@@ -1238,6 +1253,16 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
     // stored (§4.9); a borrowing Dictionary<K,V> just overwrites (§4.8).
     const sema::TypeRef* keyTy =
         genericBackingType(recvTy, 0, /*isSet=*/false, nullptr);
+    // fix #3976 (stdlib §4.17, v0.295): the SET twin of the indexer-get check
+    // above (`lowerCollectionIndexerGet`) — `sd[k] := v` is a SEPARATE call
+    // site that also consults `genericBackingType` and silently admitted a
+    // no-CompareTo eligible key via structural identity. Reject before any
+    // codegen for this operation, matching #3947's own member-family
+    // rejection; the caller's `val` was already lowered and is simply left
+    // unused (the compile fails on this Error regardless).
+    if (reportSortedElementNeedsCompareTo(recvTy, keyTy, ix.span.begin,
+                                          "the `[key]` indexer"))
+        return true;
     bool keyIsRecord = keyTy && recordTypeOfRef(keyTy) != nullptr;
     const sema::TypeRef* valTy =
         (recvTy && recvTy->genericArgs.size() > 1) ? recvTy->genericArgs[1]

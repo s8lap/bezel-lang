@@ -1257,6 +1257,82 @@ llvm::Function* Emitter::buildSortedKeyComparator(const sema::TypeRef* keyTy) {
     return fn;
 }
 
+// fix #3976 (stdlib §4.17/§4.18, v0.295): the ONE authority for "is this
+// SortedSet<T>/SortedDictionary<K,V> element/key, already found ELIGIBLE by
+// genericBackingType, actually orderable?" — genericBackingType's own
+// auto-hashable-RECORD (recordTypeOfRef) and class/interface
+// (hasObjectHeaderEquality) branches admit an element/key regardless of
+// ordering (they exist to serve Set<T>/Dictionary<K,V>, which need only
+// hashing); a SortedSet/SortedDictionary merely inherits them, so `elemOrKeyTy`
+// reaching a call site as non-null does not by itself mean it has a
+// dispatchable `CompareTo`. Fix #3947 added exactly this
+// `needsOrdering && !hasOrdering` check + diagnostic, but only at the CallExpr
+// member-dispatch site (tryLowerCollectionInstanceCall, LlvmBackend_Calls.cpp)
+// — TWICE, once for the SortedSet Set-family arm and once for the
+// SortedDictionary isDict arm, with the diagnostic text written out inline
+// both times. Issue #3976 is explicitly the set of OTHER call sites that
+// consult genericBackingType and were left silently admitting the same
+// no-CompareTo shape: the indexer (LlvmBackend_Assign.cpp) and for-in
+// iteration (LlvmBackend_Stmts.cpp). Factored out here — rather than a third
+// and fourth inline copy of the same predicate and message — per this
+// project's own standing rule against duplicated classification predicates
+// (CLAUDE.md rule "the dominant defect generator here"): those two new call
+// sites feed this ONE authority instead of re-deriving the decision.
+//
+// Deliberately NOT retrofitted onto #3947's own two call sites in
+// LlvmBackend_Calls.cpp — out of this fix's scope (LANE_RULES "no while we're
+// at it expansions"); they keep their own inline copies, unchanged.
+//
+// `recvTy` is the SortedSet<T>/SortedDictionary<K,V> receiver type (read only
+// for `headName()` — NOT re-validated; every caller already knows which
+// family it is in from its own dispatch). `elemOrKeyTy` is the
+// ALREADY-`genericBackingType`-resolved, non-null element/key TypeRef.
+// `memberDesc` names the rejected surface for the diagnostic text (e.g. "the
+// `[key]` indexer", "`for`-in iteration"). Returns true — and reports a
+// located Error identical in wording to #3947's own — exactly when
+// `elemOrKeyTy` is eligible ONLY via the hash-only branches and has no
+// dispatchable `CompareTo`; the caller must then skip the operation (a
+// well-formed no-op — a poison value for an expression, no codegen at all for
+// a for-loop) instead of lowering it.
+bool Emitter::reportSortedElementNeedsCompareTo(const sema::TypeRef* recvTy,
+                                                const sema::TypeRef* elemOrKeyTy,
+                                                SourceLocation loc,
+                                                const char* memberDesc) {
+    if (!recvTy || !elemOrKeyTy) return false;
+    bool isSet = recvTy->headName() == "SortedSet";
+    bool isDict = recvTy->headName() == "SortedDictionary";
+    if (!isSet && !isDict) return false;
+    bool isRecord = recordTypeOfRef(elemOrKeyTy) != nullptr;
+    bool needsOrdering = isRecord || hasObjectHeaderEquality(elemOrKeyTy);
+    bool hasOrdering = isRecord
+        ? recordHasDispatchableCompareTo(elemOrKeyTy)
+        : buildObjectCompareToThunk(elemOrKeyTy) != nullptr;
+    if (!needsOrdering || hasOrdering) return false;
+
+    const sema::TypeRef* raw = resolveTypeParamRef(elemOrKeyTy);
+    std::string name = isSet ? "the element type" : "the key type";
+    if (raw && raw->kind == sema::TypeRef::Kind::Named && raw->declaration)
+        name = "`" + std::string(raw->declaration->name) + "`";
+    std::string reason =
+        isRecord
+            ? "it declares no dispatchable single-parameter `CompareTo`, and "
+              "being auto-hashable (stdlib \xC2\xA7""9.2) is not sufficient — "
+              "hashable and orderable are different properties"
+            : "it declares no dispatchable single-argument `CompareTo` — a "
+              "class/interface's identity or structural equality does not "
+              "establish an ordering";
+    std::string collName = isSet ? "SortedSet<T>" : "SortedDictionary<K, V>";
+    std::string sectionRef = isSet ? "\xC2\xA7""4.18" : "\xC2\xA7""4.17";
+    std::string constraintName = isSet ? "IComparable<T>" : "IComparable<K>";
+    ctx_.diagnostics().report(
+        Severity::Error, loc,
+        std::string(memberDesc) + " on `" + collName + "` (stdlib " +
+            sectionRef + ") requires " + (isSet ? "the element" : "the key") +
+            " type to implement `" + constraintName + "`; " + name +
+            " does not (" + reason + ").");
+    return true;
+}
+
 llvm::Function* Emitter::buildLinqTrampoline(int kind, llvm::Type* elemTy,
                                              llvm::Type* outTy,
                                              const sema::TypeSymbol* elemRec,
