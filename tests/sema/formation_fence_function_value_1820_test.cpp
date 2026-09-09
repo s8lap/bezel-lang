@@ -82,7 +82,7 @@ const char* kPrelude =
     "  public property T: int := 7; "
     "end Holder; "
     "class TaskHolder "
-    "  public property Tk: Task<int>; "
+    "  public property Tk: Task<int>?; "
     "end TaskHolder; "
     "class C "
     "  public static method Nums(): IEnumerable<int> "
