@@ -6101,6 +6101,12 @@ void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
                     // i.e. exactly the case the flag is for. // per §28.7,
                     // §28.3, #1625
                     if (producerState(*as.value) == OwnershipState::Owned) {
+                        // LOCALDECL-DEBT: #3980 — the `??=` rhs-prod path only
+                        // ever fires for an Owned RHS assigned into a
+                        // null-init plain local; a `const` local cannot be
+                        // reassigned in this shape (§21.1 forbids the
+                        // initializer that would admit it), so the missing
+                        // LocalConstDecl arm is unreachable here.
                         if (auto* lsym =
                                 dynamic_cast<sema::LocalSymbol*>(sym)) {
                             if (auto* ld2 = dynamic_cast<const ast::LocalDecl*>(
