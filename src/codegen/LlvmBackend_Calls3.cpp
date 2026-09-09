@@ -1106,13 +1106,28 @@ bool Emitter::buildSortedObjectKeyIdentity(const sema::TypeRef* keyTy,
     // problem a reference key has (this function's own header comment above)
     // — `buildObjectCompareToThunk` is null for EVERY record (it only ever
     // inspects a class/interface), so try the record analogue next.
-    // `!recordTypeOfRef(keyTy)` keeps this NARROW to exactly the shape
-    // `genericBackingType`'s own new eligibility branch admits: an
-    // AUTO-HASHABLE record (recordTypeOfRef non-null) that also happens to
-    // implement `CompareTo` keeps its EXISTING structural §9.1/§9.2 identity
-    // unchanged — widening that pair to CompareTo-equality is a distinct,
-    // unmeasured semantic change this fix does not make.
-    if (!cmp && !recordTypeOfRef(keyTy)) cmp = buildRecordCompareToThunk(keyTy);
+    //
+    // fix #3987 (stdlib §4.17/§4.18, v0.295): this used to gate the record
+    // fallback on `!recordTypeOfRef(keyTy)` — "NARROW to exactly the shape
+    // `genericBackingType`'s eligibility branch admits: an AUTO-HASHABLE
+    // record that ALSO implements `CompareTo` keeps its EXISTING structural
+    // §9.1/§9.2 identity unchanged". That restraint (matching #3740's own,
+    // for a DIFFERENT — non-hashable — record shape) is itself the bug:
+    // §4.17/§4.18 state the SOLE membership rule as `CompareTo`-equality,
+    // unconditionally, with no carve-out for a record that also happens to
+    // be hashable — hashability (§3.6/§9.2) is a distinct property. MEASURED
+    // (issue 3987's own repro, `SortedSet<P>` with `P` auto-hashable +
+    // `CompareTo`): `s.Add(new P(1,2)); s.Add(new P(1,3));` — CompareTo-equal
+    // (`X` matches) but structurally distinct (`Y` differs) — landed as
+    // `Count == 2` where §4.18 ("adding an equal element leaves the set
+    // unmodified") requires `1`. `buildRecordCompareToThunk` already gates on
+    // `recordHasDispatchableCompareTo` internally, so dropping the
+    // `!recordTypeOfRef` guard here is a no-op for a record with no
+    // `CompareTo` (cmp stays null, structural pair unchanged — the #3947
+    // rejection at every member catches that shape) and ONLY changes the
+    // auto-hashable-WITH-`CompareTo` shape to the CompareTo-based identity
+    // §4.17/§4.18 actually specify.
+    if (!cmp) cmp = buildRecordCompareToThunk(keyTy);
     // Null for `Object`, for a reference type that declares no `CompareTo`
     // — §4.17 constrains `K: IComparable<K>`, but nothing checks that for a
     // builtin generic (#3490), so such a key stays on today's §8.3 pair rather
@@ -1187,12 +1202,27 @@ llvm::Function* Emitter::buildSortedKeyComparator(const sema::TypeRef* keyTy) {
     // fix #3740 (stdlib §4.18, v0.291): a non-auto-hashable RECORD key/element
     // with a dispatchable `CompareTo` — the value-type analogue of the
     // class/interface branch immediately above, admitting exactly the shape
-    // `genericBackingType`'s own new SortedSet exception admits. `!recordTypeOfRef`
-    // keeps this narrow to that shape only: an AUTO-HASHABLE record (already
-    // routed through `recordTypeOfRef` elsewhere) stays on today's `nullptr`
-    // — widening ordering to every record is a distinct, unmeasured change
-    // (and was already `nullptr` before this fix, so nothing regresses).
-    else if (!recordTypeOfRef(keyTy) && recordHasDispatchableCompareTo(keyTy))
+    // `genericBackingType`'s own new SortedSet exception admits.
+    //
+    // fix #3987 (stdlib §4.17/§4.18, v0.295): this used to additionally gate
+    // on `!recordTypeOfRef(keyTy)` — "an AUTO-HASHABLE record stays on
+    // today's `nullptr`". That left `buildSortedObjectKeyIdentity`'s sibling
+    // fix (above, same commit) half-applied: once dedup identity (`.Add`/
+    // `.Contains`) uses `CompareTo`-equality for an auto-hashable record with
+    // `CompareTo`, leaving ITS ORDERING comparator null reintroduces the
+    // identical "accept by one member family, reject by another" defect
+    // #3947 was filed to close — just in the opposite direction (`.Add`
+    // correctly accepts and dedups; `.First`/`.Last`/`FirstKey`/`LastKey`/
+    // sorted iteration falsely reject the SAME value with "does not
+    // implement IComparable<T>", even though it does). MEASURED pre-fix: a
+    // `SortedSet<AutoHashCmp>` (`AutoHashCmp` auto-hashable + `CompareTo`)
+    // rejected `.First` with exactly that message. `recordHasDispatchableCompareTo`
+    // already excludes a record with no `CompareTo` (returns false — falls to
+    // the `else return nullptr` arm below unchanged), so dropping
+    // `!recordTypeOfRef` here only changes the auto-hashable-WITH-`CompareTo`
+    // shape, matching `buildSortedObjectKeyIdentity`'s identical widening so
+    // hash/eq/ordering agree, per issue 3987's own suggested resolution (a).
+    else if (recordHasDispatchableCompareTo(keyTy))
         return buildRecordCompareToThunk(keyTy);
     else return nullptr;  // unsupported (other records, decimal, etc.)
 
