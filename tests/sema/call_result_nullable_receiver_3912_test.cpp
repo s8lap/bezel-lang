@@ -294,3 +294,38 @@ BEZEL_TEST(sema_call_result_nullable_receiver_3912,
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
+
+// =========================================================================
+// #4104 — a NullCondCallExpr (`x?(args).Z`) sibling shape of #3912/#3932,
+// flagged (but left untested) by #3932's own "Ask".
+//
+// `NullCondCallExpr` (`f?(args)`, §7.6) has zero special-casing in
+// ExprTypecheck_Calls.cpp's `resolveMemberAccess` — like NullCondMemberExpr,
+// it is not an IdentifierExpr/MemberAccessExpr/IndexExpr, so a further plain
+// `.member` on it falls to the #3912 catch-all `else` arm (this file's
+// header, ~line 15831). §7.6 is verbatim: "The result type is nullable (or
+// `()` for procedure-typed values)" — the SAME unconditional-nullable lift
+// §7.5 states for `?.`, applied in ExprTypecheck_Exprs.cpp's NullCondCallExpr
+// arm (`r->nullable = true` regardless of the callee's own declared return
+// nullability). So `f?(3)` — even though `f`'s declared return type
+// (`string`) is non-nullable — is itself typed `string?`, and a further
+// direct `.Length` on that node (not stored to a narrowable local, and not
+// itself guarded by a second `?.`) must reject exactly like the
+// `null_cond_member_*` rows above.
+//
+// TEST-GAP issue, not a behavior fix: verified against the real
+// `build/bezelc -c` on this tree BEFORE writing this row that the rejection
+// already fires (see this commit's body for the non-vacuity proof — a
+// scratch-only short-circuit of the catch-all's `tgt->nullable` check moves
+// this row from PASS to FAIL alongside #3932's 6, for 7 of 12 total).
+BEZEL_TEST(sema_call_result_nullable_receiver_3912,
+           null_cond_call_further_plain_access_rejected_7_4_7_6) {
+    auto r = runAot(prog(
+        "public static method Main(): int "
+        "  var f: ((int) -> string)? := lambda(x: int) => \"v\"; "
+        "  const w := f?(3).Length; "
+        "  return 0; "
+        "end Main;"));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, kNullableResultDiag));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, kSec74));
+}
