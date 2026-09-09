@@ -2050,96 +2050,23 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         // below is widened to also handle dict literals via the same
         // materializeHeapDictLiteral helper that #534 introduced for local-decls.
         // §30.5 / #1332 (v0.162): detect `return await <source>` with a pointer-typed
-        // result inside an async method — Pattern A chained return. If detected, set
-        // asyncChainedReturn_ so lowerAwait does NOT free the source task immediately;
-        // lowerStmt will chain the source task to the outer task after the await.
-        // (v0.252 / fix #3096: `<source>` is an anonymous producer CALL *or* an
-        // OWNED named task local — see the widening note on the inner `if`.)
-        // §30.5 / #1332 (v0.162): detect `return await <source>` with a pointer-typed
-        // result inside an async method — Pattern A chained return. If detected, set
-        // asyncChainedReturn_ so lowerAwait does NOT free the source task immediately;
-        // lowerStmt will chain the source task to the outer task after the await.
-        // (v0.252 / fix #3096: `<source>` is an anonymous producer CALL *or* an
-        // OWNED named task local — see the widening note on the inner `if`.)
-        // fix #3129 / §30.5 Pattern A: the detection runs UNCONDITIONALLY now —
-        // even when an enclosing `finally` is in flight — because the routed-
-        // through-finally edge MUST also land in §30.5's kind 2 (chained slot)
-        // and the post-finally dispatch in lowerTry is the place that calls
-        // bz_task_set_chained. The earlier `&& finallyStack_.empty()` gate left
-        // that edge as a silent nothing — neither kind — so the source's scope
-        // end freed a result the caller still borrows. The flag is recorded on
-        // the FinallyFrame at the routing site below so it survives to lowerTry's
+        // result inside an async method — Pattern A chained/borrowed return. If
+        // chained, this sets asyncChainedReturn_ so lowerAwait does NOT free the
+        // source task immediately; lowerStmt will chain the source task to the
+        // outer task after the await. Runs UNCONDITIONALLY (fix #3129) — even when
+        // an enclosing `finally` is in flight — because the routed-through-finally
+        // edge must also land in §30.5's kind 2/3; the flag is recorded on the
+        // FinallyFrame at the routing site below so it survives to lowerTry's
         // mode-5 dispatch.
-        // Guard: asyncResultTy_ is a pointer type (class/string, not int/bool/struct).
-        if (rs->value && smKind_ == SuspendKind::Await && smStateStruct_ &&
-            asyncResultTy_ && asyncResultTy_->isPointerTy()) {
-            // fix #3096 / §30.5 kind 2 *Chaining from a scope-bound source*
-            // (v0.252): the CallExpr test was the WHOLE gate, so
-            // `using var task := P(); return await task;` — the very shape
-            // §30.5 works out, and the one that needs its "no move occurs,
-            // disposal is deferred" dispensation — never called
-            // bz_task_set_chained at all. The outer task therefore took no
-            // ownership of the source, and the
-            // `else if (v && asyncPatternAResultDisposer_)` arm below fired
-            // instead, giving the borrowed result TWO owners: the source task
-            // (via its own scope-end disposal, which runs FIRST and frees the
-            // result through the #1503 per-`T` disposer — the use-after-free in
-            // the report) and the outer task (via the kind-1 disposer just
-            // attached — the double free behind it).
-            // chainedReturnOwnedTaskSource admits exactly the OWNED named
-            // sources; a kind-3 BORROWED source stays out, because no transfer
-            // is possible there (§30.5 kind 3).
-            //
-            // fix #3129: the same predicate also feeds fr.chainedAsyncReturn on
-            // the finally-routed edge below (a `return await <source>` inside
-            // a `try/finally` must STILL chain). // per §30.5 kind 2, v0.252
-            // fix #3126: also admit the `owned` PARAMETER source
-            // (chainedReturnOwnedTaskParamSource) — kind 2's move-out half —
-            // so the chained-return detection covers the SAME row the
-            // chained-edge suppression below and #3129's fr.chainedAsyncReturn
-            // propagate to. // per §30.5 kind 2, v0.254
-            if (const auto* awaitUE =
-                    dynamic_cast<const ast::UnaryExpr*>(rs->value.get())) {
-                if (awaitUE->op == "await" && awaitUE->operand) {
-                    // §30.5 kind 2 (chained) — see the chainedReturnOwnedTaskSource
-                    // comment above for the full derivation. An anonymous
-                    // producer, an OWNED LOCAL source, OR an OWNED PARAMETER
-                    // source (#3126) transfers the source task into the outer
-                    // task's chained slot.
-                    if (dynamic_cast<const ast::CallExpr*>(
-                            awaitUE->operand.get()) != nullptr ||
-                        chainedReturnOwnedTaskSource(*awaitUE->operand) != nullptr ||
-                        chainedReturnOwnedTaskParamSource(*awaitUE->operand) !=
-                            nullptr) {
-                        asyncChainedReturn_ = true;
-                    }
-                    // fix #3125: §30.5 Pattern A **kind 3** — every other
-                    // Pattern A `Task<T:class>` source this body does NOT own
-                    // (a plain parameter, an `owned` field of `this` read
-                    // without `move`, a borrow field, an owning-collection
-                    // slot, a borrowing-iteration variable, an admitted static
-                    // task field/property, a §28.10 borrow PIN
-                    // `using var t2 := task;` — registered no `d.task`, so
-                    // this body never owned the frame, etc.). §30.5 says the
-                    // outer task's teardown disposes nothing on this link —
-                    // the source's owner keeps disposing the source task
-                    // transitively. Without this flag the `else if (v &&
-                    // asyncPatternAResultDisposer_)` arm below fires and
-                    // attaches the kind-1 disposer, giving the borrowed
-                    // result TWO owners — heap-use-after-free + double free.
-                    // Mutual exclusion with kind 2 is structural: the three
-                    // predicates (chainedReturnOwnedTaskSource,
-                    // chainedReturnOwnedTaskParamSource, and
-                    // chainedReturnBorrowedTaskSource) are asked of the same
-                    // operand and share patternAResultDisposerFor as their
-                    // Pattern-A source of truth, so only one can fire on any
-                    // given site.
-                    else if (chainedReturnBorrowedTaskSource(*awaitUE->operand)) {
-                        asyncBorrowedReturn_ = true;
-                    }
-                }
-            }
-        }
+        //
+        // fix #3960 (§30.5, v0.295): extracted into detectAsyncPatternAKind
+        // (LlvmBackend_Async.cpp, beside the three predicates it calls) so an
+        // expression-bodied async lambda's completing value — which has no
+        // ReturnStmt AST node at all — can share the exact same detection
+        // instead of a second, drifting copy. See that function's doc comment
+        // for the full kind-1/kind-2/kind-3 derivation this block used to carry
+        // inline.
+        detectAsyncPatternAKind(rs->value.get());
         llvm::Value* v = nullptr;
         if (rs->value) {
             if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(
@@ -2458,32 +2385,11 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 // null-guard skips this parameter on this edge (the §30.1
                 // auto-drop would otherwise double-dispose a Cell the chained
                 // task already owns transitively).
-                if (chainedReturn && rs->value) {
-                    if (const auto* awaitUE =
-                            dynamic_cast<const ast::UnaryExpr*>(
-                                rs->value.get())) {
-                        if (awaitUE->op == "await" && awaitUE->operand) {
-                            if (const ast::LocalDecl* srcLd =
-                                    chainedReturnOwnedTaskSource(
-                                        *awaitUE->operand)) {
-                                auto sit = locals_.find(srcLd);
-                                if (sit != locals_.end()) {
-                                    llvm::Type* sety = nullptr;
-                                    llvm::Value* saddr =
-                                        boxedStorage(sit->second, sety);
-                                    builder_.CreateStore(
-                                        llvm::ConstantPointerNull::get(
-                                            ptrTy()),
-                                        saddr);
-                                }
-                            } else if (chainedReturnOwnedTaskParamSource(
-                                           *awaitUE->operand)) {
-                                nullStateMachineOwnedParamCapture(
-                                    awaitUE->operand.get());
-                            }
-                        }
-                    }
-                }
+                // fix #3960: shared with the non-finally branch below and with
+                // emitAsyncLambda's expression-body completion — see
+                // deferChainedAsyncReturnSource (LlvmBackend_Async.cpp).
+                if (chainedReturn && rs->value)
+                    deferChainedAsyncReturnSource(rs->value.get());
                 emitDisposalsInRange(fr.disposeDepthAtEntry, disposeStack_.size());
                 if (v && fr.asyncRetSlot)
                     builder_.CreateStore(v, fr.asyncRetSlot);
@@ -2529,36 +2435,11 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
             // the chained branch below still finds it. The window between this
             // store and bz_task_set_chained is the same one the anonymous-
             // CallExpr source has always had.
-            if (chainedReturn && rs->value) {
-                if (const auto* awaitUE =
-                        dynamic_cast<const ast::UnaryExpr*>(rs->value.get())) {
-                    if (awaitUE->op == "await" && awaitUE->operand) {
-                        if (const ast::LocalDecl* srcLd =
-                                chainedReturnOwnedTaskSource(*awaitUE->operand)) {
-                            auto sit = locals_.find(srcLd);
-                            if (sit != locals_.end()) {
-                                llvm::Type* sety = nullptr;
-                                llvm::Value* saddr =
-                                    boxedStorage(sit->second, sety);
-                                builder_.CreateStore(
-                                    llvm::ConstantPointerNull::get(ptrTy()),
-                                    saddr);
-                            }
-                        } else if (chainedReturnOwnedTaskParamSource(
-                                       *awaitUE->operand)) {
-                            // fix #3126 (§30.5 kind 2, v0.254): the
-                            // MOVE-OUT HALF — `return await <owned
-                            // parameter>`. The dispensation targets the
-                            // FRAME capture slot (the §30.1 auto-drop
-                            // reads it), not a local slot. Nulling it
-                            // here is the per-edge "moved-out" flag for
-                            // the §30.5 move-out half.
-                            nullStateMachineOwnedParamCapture(
-                                awaitUE->operand.get());
-                        }
-                    }
-                }
-            }
+            // fix #3960: shared helper — see deferChainedAsyncReturnSource
+            // (LlvmBackend_Async.cpp), also used by the finally-routed branch
+            // above and by emitAsyncLambda's expression-body completion.
+            if (chainedReturn && rs->value)
+                deferChainedAsyncReturnSource(rs->value.get());
             // No enclosing finally: dispose all live scopes, then complete.
             emitAllDisposals();
             // fix #3129 / §30.5 Pattern A: hoist the §30.5 kind 1 / kind 2 decision

@@ -11573,6 +11573,33 @@ private:
     // chainedReturnOwnedTaskSource.
     bool chainedReturnBorrowedTaskSource(const ast::Expr& operand);
 
+    // fix #3960 (§30.5, v0.295): shared §30.5 kind-1/2/3 DETECTION for the
+    // value expression that completes an async body — a block body's
+    // `return <expr>;` (rs->value) or an expression-bodied async lambda's
+    // WHOLE body (lam.exprBody), which §30.6 treats as an implicit return of
+    // that value. Sets asyncChainedReturn_ / asyncBorrowedReturn_ exactly as
+    // lowerReturnStmt's inline detection did before this fix extracted it —
+    // pure extraction, no behavior change for the block-body call site.
+    // `valueExpr` may be null (a bare `return;`); a no-op then. Must be called
+    // BEFORE lowerExpr(valueExpr): lowerAwait reads asyncChainedReturn_ to
+    // decide whether to suppress the source task's immediate free.
+    void detectAsyncPatternAKind(const ast::Expr* valueExpr);
+
+    // fix #3960 companion: the kind-2 CHAINED deferral half — null the
+    // source's own scope-end disposal slot (a named `using var`/plain-owned
+    // local's frame cell via chainedReturnOwnedTaskSource, or an `owned`
+    // PARAMETER's frame capture via chainedReturnOwnedTaskParamSource + fix
+    // #3126's nullStateMachineOwnedParamCapture) so the ordinary scope-end /
+    // auto-drop disposal that runs AFTER this call does not double-dispose
+    // the task this edge is about to move into the outer task's chained
+    // slot. Call only when the caller's own chainedReturn flag is true, with
+    // the SAME valueExpr passed to detectAsyncPatternAKind. Extracted from
+    // lowerReturnStmt's two (pre-existing, already-identical) copies of this
+    // block — the finally-routed branch and the non-finally branch — so a
+    // third call site (emitAsyncLambda's expression-body completion) does
+    // not become a third drifting copy.
+    void deferChainedAsyncReturnSource(const ast::Expr* valueExpr);
+
     // #2279 (§30.5 Pattern A, v0.236): when the result type of a Pattern A
     // `Task<T:class>` is itself an INTRINSIC COLLECTION (Array<T> / Set<T> /
     // Dictionary<K,V> / LinkedList<T> / Stack<T> / Queue<T> / OwningBuffer<T> /

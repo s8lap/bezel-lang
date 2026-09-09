@@ -959,6 +959,95 @@ bool Emitter::chainedReturnBorrowedTaskSource(const ast::Expr& operand) {
 }
 
 
+// fix #3960 (§30.5 "Pattern A result slots are of three kinds", v0.295):
+// shared kind-1/2/3 DETECTION for the value expression that completes an
+// async body. Extracted from lowerReturnStmt's inline detection (added by
+// #3096/#3125/#3126/#3129), which read `rs->value` — the block body's
+// `return <expr>;` operand. An expression-bodied async lambda/method has NO
+// ReturnStmt node at all: §30.6 treats the WHOLE body expression as the
+// implicit return value, so `lam.exprBody.get()` is the exact analogue of
+// `rs->value.get()` here.
+//
+// THE DEFECT this closes (#3960). `emitAsyncLambda`'s expression-body
+// completion branch (below, in the `if (lam.exprBody)` arm) called
+// `emitAsyncComplete` directly and never called this detection OR
+// `emitAsyncPatternAResultDecision` at all — so a §30.5 kind-1 "fresh owned
+// class value" (`async lambda() => new Widget()`) attached NO result
+// disposer, while the byte-for-byte equivalent block body
+// (`async lambda() => do return new Widget(); end`) attached one. MEASURED
+// (BEZEL_DUMP_IR=1, an explicit `() -> Task<Widget>` call-site annotation so
+// both bodies derive the SAME declaredTaskTy, isolating this from the
+// separate declaredTaskTy-derivation gap #3960 also named): the block form
+// emits one `call void @bz_task_set_result_disposer`; the expression form
+// emits zero.
+//
+// Sets asyncChainedReturn_ / asyncBorrowedReturn_ exactly as the pre-#3960
+// inline block did (pure extraction for the existing ReturnStmt call site —
+// no behavior change there); `valueExpr` may be null (a bare `return;`, never
+// true for an expression body), a no-op then. MUST be called BEFORE
+// lowerExpr(valueExpr) is invoked on the same expression: lowerAwait reads
+// asyncChainedReturn_ to decide whether to suppress the source task's
+// immediate free, and that decision has to be in place before the await
+// lowers.
+void Emitter::detectAsyncPatternAKind(const ast::Expr* valueExpr) {
+    // Guard: asyncResultTy_ is a pointer type (class/string, not int/bool/struct).
+    if (!valueExpr || smKind_ != SuspendKind::Await || !smStateStruct_ ||
+        !asyncResultTy_ || !asyncResultTy_->isPointerTy())
+        return;
+    const auto* awaitUE = dynamic_cast<const ast::UnaryExpr*>(valueExpr);
+    if (!awaitUE || awaitUE->op != "await" || !awaitUE->operand) return;
+    // §30.5 kind 2 (chained) — an anonymous producer, an OWNED LOCAL source,
+    // or an OWNED PARAMETER source (#3126) transfers the source task into
+    // the outer task's chained slot.
+    if (dynamic_cast<const ast::CallExpr*>(awaitUE->operand.get()) != nullptr ||
+        chainedReturnOwnedTaskSource(*awaitUE->operand) != nullptr ||
+        chainedReturnOwnedTaskParamSource(*awaitUE->operand) != nullptr) {
+        asyncChainedReturn_ = true;
+        return;
+    }
+    // fix #3125: §30.5 Pattern A **kind 3** — every other Pattern A
+    // `Task<T:class>` source this body does NOT own. Without this flag,
+    // `emitAsyncPatternAResultDecision`'s `else if (asyncPatternAResultDisposer_)`
+    // arm fires and attaches the kind-1 disposer, giving the borrowed result
+    // TWO owners — heap-use-after-free + double free. Mutual exclusion with
+    // kind 2 is structural: all three predicates share
+    // patternAResultDisposerFor as their Pattern-A source of truth, so only
+    // one can fire on any given operand.
+    if (chainedReturnBorrowedTaskSource(*awaitUE->operand))
+        asyncBorrowedReturn_ = true;
+}
+
+// fix #3960 companion: the kind-2 CHAINED deferral half, extracted from the
+// two (pre-existing, already byte-for-byte identical) copies in
+// lowerReturnStmt — the finally-routed branch and the non-finally branch.
+// Null the source's own scope-end disposal slot so the ordinary scope-end /
+// auto-drop disposal that runs immediately AFTER this call does not
+// double-dispose the task this edge is about to move into the outer task's
+// chained slot (§30.5: "the chained-slot arrangement defers its disposal
+// from the frame's scope end to the outer task's teardown"). The caller must
+// gate this on its own `chainedReturn` flag (as both existing call sites do)
+// and pass the SAME valueExpr given to detectAsyncPatternAKind.
+void Emitter::deferChainedAsyncReturnSource(const ast::Expr* valueExpr) {
+    const auto* awaitUE = dynamic_cast<const ast::UnaryExpr*>(valueExpr);
+    if (!awaitUE || awaitUE->op != "await" || !awaitUE->operand) return;
+    if (const ast::LocalDecl* srcLd =
+            chainedReturnOwnedTaskSource(*awaitUE->operand)) {
+        auto sit = locals_.find(srcLd);
+        if (sit != locals_.end()) {
+            llvm::Type* sety = nullptr;
+            llvm::Value* saddr = boxedStorage(sit->second, sety);
+            builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()),
+                                 saddr);
+        }
+    } else if (chainedReturnOwnedTaskParamSource(*awaitUE->operand)) {
+        // fix #3126 (§30.5 kind 2, v0.254): the MOVE-OUT HALF — `await
+        // <owned parameter>`. The dispensation targets the FRAME capture
+        // slot (the §30.1 auto-drop reads it), not a local slot.
+        nullStateMachineOwnedParamCapture(awaitUE->operand.get());
+    }
+}
+
+
 void Emitter::emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,
                               const CallableInfo& ci) {
     if (!ci.stmts) return;
@@ -2283,7 +2372,25 @@ void Emitter::emitAsyncLambda(const ast::LambdaExpr& lam, llvm::Function* fn,
             // expression lowers as a suspend point; the resulting value is what
             // completes the task. A no-value `Task` lambda (resultTy == null)
             // ignores the value and completes with no result.
+            //
+            // fix #3960 (§30.5, v0.295): detect the §30.5 kind-2/kind-3 shape
+            // of THIS body expression before lowering it — mirrors
+            // lowerReturnStmt's block-body detection (detectAsyncPatternAKind
+            // is the shared helper). MUST run before lowerExpr: lowerAwait
+            // reads asyncChainedReturn_ during the await lowering below to
+            // decide whether to suppress the source task's immediate free.
+            detectAsyncPatternAKind(lam.exprBody.get());
             llvm::Value* v = lowerExpr(*lam.exprBody);
+            // fix #3960: read-and-reset, exactly like lowerReturnStmt's
+            // block-body twin (LlvmBackend_Stmts.cpp) — lowerAwait has now
+            // consumed the flag (if set) to suppress the source task's free;
+            // reset before any possible re-entry (a nested async lambda
+            // compiled while lowering a larger enclosing expression, though
+            // none exists on this direct path today).
+            bool chainedReturn = asyncChainedReturn_;
+            asyncChainedReturn_ = false;
+            bool borrowedReturn = asyncBorrowedReturn_;
+            asyncBorrowedReturn_ = false;
             // fix #3773 (§27.3 / §27.5 / §28.9 / §30.6, v0.286): mint the
             // return-site +1 for the value that completes the outer task,
             // mirroring `lowerLambda`'s OWN expression-body mint
@@ -2439,9 +2546,29 @@ void Emitter::emitAsyncLambda(const ast::LambdaExpr& lam, llvm::Function* fn,
             // temporary (only bound names/backstops are registered), so
             // disposing the scope here cannot free the value being handed to
             // `emitAsyncComplete`.
+            //
+            // fix #3960 (§30.5 kind 2, v0.295): defer the chained source's own
+            // scope-end disposal BEFORE the scope-dispose call below, exactly
+            // as lowerReturnStmt's non-finally branch does relative to
+            // `emitAllDisposals()` — see deferChainedAsyncReturnSource. Guarded
+            // by the same terminator check as the disposal/completion below (an
+            // expression that threw already diverted control to `faultBB` and
+            // left the block terminated; emitting a Store into a terminated
+            // block is invalid IR).
+            if (chainedReturn && !builder_.GetInsertBlock()->getTerminator())
+                deferChainedAsyncReturnSource(lam.exprBody.get());
             if (!builder_.GetInsertBlock()->getTerminator())
                 emitDisposals(disposeStack_.back());
             if (!builder_.GetInsertBlock()->getTerminator()) {
+                // fix #3960 (§30.5 kind 1/2, v0.295): attach the kind-1 per-T
+                // result disposer (or the kind-2 chained slot) to the outer
+                // task BEFORE emitAsyncComplete — same race-safety ordering
+                // emitAsyncPatternAResultDecision's own doc comment states:
+                // bz_task_complete notifies continuations that may free the
+                // outer task on a racing thread, so any attachment chained
+                // AFTER complete would touch freed memory. This is the call
+                // the pre-fix expression-body branch never made at all.
+                emitAsyncPatternAResultDecision(chainedReturn, borrowedReturn);
                 emitAsyncComplete(resultTy ? v : nullptr);
                 builder_.CreateRetVoid();
             }
