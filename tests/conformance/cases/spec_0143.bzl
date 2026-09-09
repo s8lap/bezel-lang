@@ -1,4 +1,4 @@
-private owned _cache: OwningDictionary<string, Connection>;
+private owned _cache: OwningDictionary<string, Connection> := new OwningDictionary<string, Connection>();
 
 public method TryPopCached(name: string, out owned conn: Connection? when true): bool
   if not _cache.ContainsKey(name) then
