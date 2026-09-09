@@ -350,23 +350,22 @@ import System.Net.Http;
 
 // One sendable object per worker (spec §30.14: sealed, every field an owned sendable class).
 // The logger is a constructor dependency, carried as an owned field — no container (D-0001).
-public sealed class WorkerDeps
+public sealed class Deps
   public owned readonly Todos: Shared<Locked<Dictionary<int, Todo>>>;
   public owned readonly Log: ChannelLogger;
   public constructor(owned todos: Shared<Locked<Dictionary<int, Todo>>>, owned log: ChannelLogger)
     Todos := todos;  Log := log;
   end constructor;
-end WorkerDeps;
+end Deps;
 
 public sealed class Api: IHttpService
-  private owned readonly _deps: WorkerDeps;               // the root service owns the deps — and so the logger
+  private owned readonly _deps: Deps;                     // the root service owns the deps — and so the logger
   private owned readonly _routes: RouteTable := new();    // declared last: disposed before _deps (0002 §4.1)
   public property Routes: RouteTable => _routes;
-  public constructor(owned deps: WorkerDeps)
+  public constructor(owned deps: Deps)
     _deps := deps;
-    _routes.Mount("/todos", new TodoApi(_deps.Todos.Clone(), _deps.Log));   // the child borrows the ILogger (0002 §2)
+    _routes.Mount("/todos", new TodoApi(_deps.Todos.Clone(), _deps.Log));   // a child that logs borrows the ILogger (0002 §4.1)
   end constructor;
-  public static method Create(owned deps: WorkerDeps): owned Api => new Api(move deps);
 end Api;
 
 public static class Program
@@ -376,9 +375,9 @@ public static class Program
     using var todos := new Shared<Locked<Dictionary<int, Todo>>>(
         new Locked<Dictionary<int, Todo>>(new Dictionary<int, Todo>()));
     // `deps` runs on this domain once per worker; each result is moved into worker i and handed to
-    // Api.Create there (0002 §3, §4.2). Main holds no logger, so the channel closes with the last worker.
-    var code := await HttpServer.Listen(port := 8080, service := Api.Create,
-        deps := lambda(i) => new WorkerDeps(todos.Clone(), hub.NewLogger($"http-{i}")));   // serves until Stop()
+    // the service factory there (0002 §3, §4.2). Main holds no logger, so the channel closes with the last worker.
+    var code := await HttpServer.Listen(port := 8080, service := lambda(owned d: Deps) => new Api(move d),
+        deps := lambda(i) => new Deps(todos.Clone(), hub.NewLogger($"http-{i}")));   // serves until Stop()
     await pump;                                       // every worker's ChannelLogger disposed ⇒ channel closed ⇒ sink drains
     return code;
   end Main;

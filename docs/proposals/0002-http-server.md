@@ -9,7 +9,7 @@
 | **Depends on** | Proposal 0001 (client; shared `HttpResponse`/`HttpHeaders`/`HttpMethod`/`Http`), proposal 0007 (`System.Net` substrate — `TcpListener`), stdlib §7 Stream family (#1394/#645; proposal 0006), timers (#1378). `Locked<T>` is stdlib §6.11 (proposal 0003 graduated v0.186 — no longer a dependency). The tour additionally uses proposal 0021 (`ILogger`/`LogHub`) and proposal 0022 (`System.Testing`) as *example* material only; nothing in §3 depends on either. |
 | **Design influences** | ASP.NET **Minimal APIs** and **Express** for the routing surface (the two independently converged on the same shape); WHATWG fetch for the `Request → Response` handler symmetry; the stdlib §6.5 event pattern for the registration shape (`_clicked += OnClicked` is `_routes.Get("/x", OnX)` with a route in front); **not** full ASP.NET (no controllers, no DI container, no middleware pipeline in v1), **not** raw Node `http` |
 | **Bezel-native leverage** | Handlers run on worker **domains**; §30.14 sendability makes data-race freedom a *compile-time* property of the server. Registration is **ownership-shaped**: a service owns its `RouteTable`, so a `this`-bound handler is admitted by §28.14's form 4 exactly as an event handler is — the same rule that makes an event subscription sound makes a route registration sound, and the table's teardown severs every handler. |
-| **Redraft note** | Rewritten 2026-09-06 against three defects in the 2026-07-24 text. (1) `HttpApp.Get(route, handler)` declared a *plain* function parameter and stored it — §28.14's call-bounded default (v0.177) forbids storing a plain function-typed parameter anywhere, so the table could not hold a handler at all. (2) The route builder received the table as a *parameter* (`Routes(app: HttpApp)`), and a bounding object that is a parameter admits capture-free callbacks only (§28.14), so `app.Get("/todos/{id}", api.GetById)` — a method reference whose capture is its receiver `api` — did not compile even with `scoped` on the parameter. (3) `lambda(req) => Http.Text("ok")` infers `owned HttpResponse` at an `OwningTask<HttpResponse>` slot, and no §5.1 conversion bridges the two (§22.6 *Lambda-literal arguments*), so the sync-lambda showcase was a type error. |
+| **Redraft note** | Rewritten 2026-09-06 against three defects in the 2026-07-24 text. (1) `HttpApp.Get(route, handler)` declared a *plain* function parameter and stored it — §28.14's call-bounded default (v0.177) forbids storing a plain function-typed parameter anywhere, so the table could not hold a handler at all. (2) The route builder received the table as a *parameter* (`Routes(app: HttpApp)`), and a bounding object that is a parameter admits capture-free callbacks only (§28.14), so `app.Get("/todos/{id}", api.GetById)` — a method reference whose capture is its receiver `api` — did not compile even with `scoped` on the parameter. (3) `lambda(req) => Http.Text("ok")` infers `owned HttpResponse` at an `OwningTask<HttpResponse>` slot, and no §5.1 conversion bridges the two (§22.6 *Lambda-literal arguments*), so the sync-lambda showcase was a type error. Tour simplified 2026-09-09 (owner-directed): a generic `Store<T>` takes the lock protocol out of every handler, the factories and the duplicate resource class go, and the tour's `Count + 1` id minting — which could overwrite a live key after a delete — is replaced by minting under the guard. |
 
 ## 1. Design principles
 
@@ -22,45 +22,81 @@
 
 ## 2. Tour by example
 
-Three resources, eleven endpoints, a per-worker deps object carrying a shared store and a logger, `Main`, and two tests. Written to be extrapolated: fifty endpoints is about eight of these resource classes, each a top-to-bottom read.
+Two resources, seven endpoints, a forty-line generic `Store<T>` that hides the shared map's lock behind one-line calls, a per-worker deps object carrying a store and a logger, `Main`, and two tests. Written to be extrapolated: fifty endpoints is about eight of these resource classes, each a top-to-bottom read over the one `Store<T>`.
 
 ```bezel
 module TodoService;
 import System.Net.Http;
 import System.Threading;          // Locked<T> (stdlib §6.11); Shared<T> is auto-imported (stdlib §2.16)
-import System.Diagnostics;        // ILogger/ChannelLogger/LogHub/ConsoleSink/NullLogger (0021 §3); Stopwatch (stdlib §8.1)
+import System.Diagnostics;        // ChannelLogger/LogHub/ConsoleSink/LogLevel (0021 §3)
 
 // ── Wire shapes: value records, serialization synthesized (§9.8) ──
 public record Todo(Id: int, Title: string, Done: bool): ISerializable, IDeserializable;
 public record NewTodo(Title: string): ISerializable, IDeserializable;
-public record User(Id: int, Name: string): ISerializable, IDeserializable;
-public record NewUser(Name: string): ISerializable, IDeserializable;
 
-// ── Per-worker dependencies. Sendable by §30.14's class rule: sealed; every field an `owned` field of a
-//    sendable class type (Shared<Locked<…>>: §28.13's payload set; ChannelLogger: 0021 §3, minted per producer).
-public sealed class WorkerDeps
-  public owned readonly Todos: Shared<Locked<Dictionary<int, Todo>>>;   // Locked<Dictionary<K, value>> is admitted (stdlib §6.11)
-  public owned readonly Users: Shared<Locked<Dictionary<int, User>>>;
-  public owned readonly Log: ChannelLogger;
-  public constructor(owned todos: Shared<Locked<Dictionary<int, Todo>>>,
-                     owned users: Shared<Locked<Dictionary<int, User>>>,
-                     owned log: ChannelLogger)
-    Todos := todos;  Users := users;  Log := log;              // owned-slot stores are marker-free (§28.3)
+// ── A store of value records keyed by int, shared across workers. Ordinary user code: one owned handle
+//    (§28.13) around a data-owning lock (stdlib §6.11); every guard is acquired last and never held across
+//    an `await`. Sendable at every instantiation (§30.14's class rule: sealed, one `owned` sendable field).
+public sealed class Store<T> where T: value, sendable
+  private owned readonly _map: Shared<Locked<Dictionary<int, T>>>;
+
+  public constructor()
+    _map := new Shared<Locked<Dictionary<int, T>>>(new Locked<Dictionary<int, T>>(new Dictionary<int, T>()));
   end constructor;
-end WorkerDeps;
+  private constructor(owned map: Shared<Locked<Dictionary<int, T>>>)  _map := map;  end constructor;
+  public method Clone(): owned Store<T> => new Store<T>(_map.Clone());     // a second handle to the same map
+
+  public async method All(): Task<Array<T>>                                // a snapshot, copied under the guard
+    using var g := await _map.Get().LockAsync();                           // Pattern B guard (§30.5); the scope is the critical section
+    return g.Value.Values.ToArray();
+  end All;
+
+  public async method Find(id: int): Task<T?>
+    using var g := await _map.Get().LockAsync();
+    return g.Value.GetOrNull(id);                                          // a copy, or null (stdlib §4.8)
+  end Find;
+
+  public async method Add(make: (int) -> T): Task<T>                       // the id is minted under the guard
+    using var g := await _map.Get().LockAsync();
+    var id := (g.Value.Keys.MaxOrNull() ?? 0) + 1;                         // never collides with a live key
+    var item := make(id);
+    g.Value[id] := item;
+    return item;
+  end Add;
+
+  public async method Update(id: int, f: (T) -> T): Task<T?>               // null ⇒ absent; read-modify-write is atomic
+    using var g := await _map.Get().LockAsync();
+    var cur := g.Value.GetOrNull(id);
+    if cur = null then return null; end;                                   // `cur` is a local: it narrows (§7.4)
+    var next := f(cur);
+    g.Value[id] := next;
+    return next;
+  end Update;
+
+  public async method Remove(id: int): Task<bool>
+    using var g := await _map.Get().LockAsync();
+    return g.Value.Remove(id);
+  end Remove;
+end Store;
+
+// ── Per-worker dependencies. Sendable by §30.14's class rule: sealed; every field an `owned` sendable class. ──
+public sealed class Deps
+  public owned readonly Todos: Store<Todo>;
+  public owned readonly Log: ChannelLogger;                                // one per worker (0021 §3)
+  public constructor(owned todos: Store<Todo>, owned log: ChannelLogger)  Todos := todos;  Log := log;  end constructor;
+end Deps;
 
 // ── The root service: owns the deps, mounts the resources, carries the cross-cutting policy ──
 public sealed class Api: IHttpService
-  private owned readonly _deps: WorkerDeps;
-  private owned readonly _routes: RouteTable := new();       // LAST owned field — see §4.1
-  public property Routes: RouteTable => _routes;             // IHttpService: a receiver-sourced borrow (§28.6)
+  private owned readonly _deps: Deps;
+  private owned readonly _routes: RouteTable := new();                     // LAST owned field — see §4.1
+  public property Routes: RouteTable => _routes;                           // IHttpService: a receiver-sourced borrow (§28.6)
 
-  public constructor(owned deps: WorkerDeps)
-    _deps := deps;                                                            // [R0]
-    _routes.Around(Guard);                                                    // [R1] wraps every route below and every mounted child
-    _routes.Get("/health", Health);                                           // [R2]
-    _routes.Mount("/todos", new TodoApi(_deps.Todos.Clone(), _deps.Log));     // [R3] child owns a handle, borrows the logger
-    _routes.Mount("/users", new UserApi(_deps.Users.Clone(), _deps.Log));     // [R4]
+  public constructor(owned deps: Deps)
+    _deps := deps;                                                          // [R0]
+    _routes.Around(Guard);                                                  // [R1] wraps every route below and every mounted child
+    _routes.Get("/health", async lambda(req) => Http.Text("ok"));           // [R2] capture-free: admitted at any bounding object
+    _routes.Mount("/todos", new TodoApi(_deps.Todos));                      // [R3] the child borrows the store; `_deps` outlives it
   end constructor;
 
   // Auth + one access-log line for the whole tree. `next` is call-bounded: invoke it, await it, never store it.
@@ -69,53 +105,39 @@ public sealed class Api: IHttpService
     if req.Path <> "/health" and req.Headers.Get("Authorization") = null then
       return Http.Status(401);
     end;
-    using var sw := Stopwatch.StartNew();
-    var resp := await next(req);                                              // [A1] awaited to settlement
-    _deps.Log.Info($"{HttpMethod.NameOf(req.Method)} {req.Path} -> {resp.Status} in {sw.ElapsedMilliseconds}ms");
-    return resp;                                                              // owned local through an OwningTask return: marker-free
+    var resp := await next(req);                                            // [A1] awaited to settlement
+    _deps.Log.Info($"{HttpMethod.NameOf(req.Method)} {req.Path} -> {resp.Status}");
+    return resp;                                                            // owned local through an OwningTask return: marker-free
   end Guard;
-
-  private async method Health(req: HttpRequest): OwningTask<HttpResponse>
-    return Http.Text("ok");
-  end Health;
-
-  public static method Create(owned deps: WorkerDeps): owned Api => new Api(move deps);   // [F] the spawn entry
 end Api;
 
-// ── One resource class. Its store is its own Shared handle; its logger is a back-reference to the root's. ──
+// ── One resource class: six one-line handlers over the store it borrows from the root ──
 public sealed class TodoApi: IHttpService
-  private owned readonly _todos: Shared<Locked<Dictionary<int, Todo>>>;   // own handle (§28.13): no borrow to keep alive
-  private readonly _log: ILogger;                                          // back-reference (§28.3): the root's deps outlive this child
+  private readonly _todos: Store<Todo>;                                    // back-reference (§28.3): the root's `_deps` outlives this child
   private owned readonly _routes: RouteTable := new();                     // LAST
   public property Routes: RouteTable => _routes;
 
-  public constructor(owned todos: Shared<Locked<Dictionary<int, Todo>>>, log: ILogger)
-    _todos := todos;  _log := log;
-    _routes.Get   ("/",          List);                                      // [T1]
-    _routes.Get   ("/{id}",      GetById);                                   // [T2]
-    _routes.Post  ("/",          Create);                                    // [T3]
-    _routes.Put   ("/{id}",      Replace);                                   // [T4]
-    _routes.Patch ("/{id}/done", MarkDone);                                  // [T5]
-    _routes.Delete("/{id}",      Remove);                                    // [T6]
+  public constructor(todos: Store<Todo>)
+    _todos := todos;
+    _routes.Get   ("/",          List);                                     // [T1]
+    _routes.Get   ("/{id}",      GetById);                                  // [T2]
+    _routes.Post  ("/",          Create);                                   // [T3]
+    _routes.Put   ("/{id}",      Replace);                                  // [T4]
+    _routes.Patch ("/{id}/done", MarkDone);                                 // [T5]
+    _routes.Delete("/{id}",      Remove);                                   // [T6]
   end constructor;
 
   private async method List(req: HttpRequest): OwningTask<HttpResponse>
-    using var g := await _todos.Get().LockAsync();                           // Pattern B guard; the scope is the critical section
-    return Http.JsonArray(g.Value.Values);                                   // serialized under the guard, synchronously
+    return Http.JsonArray(await _todos.All());                              // Pattern A: the snapshot dies with the statement (§30.5)
   end List;
 
   private async method GetById(req: HttpRequest): OwningTask<HttpResponse>
-    var id := req.Param<int>("id");                                          // "/abc" ⇒ 400 before any state is touched
-    using var g := await _todos.Get().LockAsync();
-    return Http.JsonOrNotFound(g.Value.GetOrNull(id));                       // Todo? — the 404 is the constructor's job
+    return Http.JsonOrNotFound(await _todos.Find(req.Param<int>("id")));   // "/abc" ⇒ 400 before any state is touched; null ⇒ 404
   end GetById;
 
   private async method Create(req: HttpRequest): OwningTask<HttpResponse>
-    var body := await req.Json<NewTodo>();                                   // malformed body ⇒ 400; awaited BEFORE the lock
-    using var g := await _todos.Get().LockAsync();
-    var todo := new Todo(g.Value.Count + 1, body.Title, false);
-    g.Value[todo.Id] := todo;                                                // add-or-update (stdlib §4.8)
-    _log.Info($"todo {todo.Id} created");
+    var body := await req.Json<NewTodo>();                                  // malformed body ⇒ 400
+    var todo := await _todos.Add(lambda(id) => new Todo(id, body.Title, false));
     return Http.Json(todo, status := 201);
   end Create;
 
@@ -123,120 +145,57 @@ public sealed class TodoApi: IHttpService
     var id := req.Param<int>("id");
     var body := await req.Json<Todo>();
     if body.Id <> id then throw new HttpResponseException(400, "body id does not match the route"); end;
-    using var g := await _todos.Get().LockAsync();
-    if not g.Value.ContainsKey(id) then return Http.Status(404); end;
-    g.Value[id] := body;
-    return Http.Json(body);
+    return Http.JsonOrNotFound(await _todos.Update(id, lambda(_) => body));
   end Replace;
 
   private async method MarkDone(req: HttpRequest): OwningTask<HttpResponse>
-    var id := req.Param<int>("id");
-    using var g := await _todos.Get().LockAsync();
-    var cur := g.Value.GetOrNull(id);
-    if cur = null then return Http.Status(404); end;                         // `cur` is a local: it narrows (§7.4)
-    var done := cur with(Done := true);
-    g.Value[id] := done;
-    return Http.Json(done);
+    return Http.JsonOrNotFound(await _todos.Update(req.Param<int>("id"), lambda(t) => t with(Done := true)));
   end MarkDone;
 
   private async method Remove(req: HttpRequest): OwningTask<HttpResponse>
-    var id := req.Param<int>("id");
-    using var g := await _todos.Get().LockAsync();
-    return Http.Status((if g.Value.Remove(id) then 204 else 404));
+    return Http.Status((if await _todos.Remove(req.Param<int>("id")) then 204 else 404));
   end Remove;
 end TodoApi;
-
-public sealed class UserApi: IHttpService
-  private owned readonly _users: Shared<Locked<Dictionary<int, User>>>;
-  private readonly _log: ILogger;
-  private owned readonly _routes: RouteTable := new();
-  public property Routes: RouteTable => _routes;
-
-  public constructor(owned users: Shared<Locked<Dictionary<int, User>>>, log: ILogger)
-    _users := users;  _log := log;
-    _routes.Get   ("/",      List);                                          // [U1]
-    _routes.Get   ("/{id}",  GetById);                                       // [U2]
-    _routes.Post  ("/",      Create);                                        // [U3]
-    _routes.Delete("/{id}",  Remove);                                        // [U4]
-  end constructor;
-
-  private async method List(req: HttpRequest): OwningTask<HttpResponse>
-    using var g := await _users.Get().LockAsync();
-    return Http.JsonArray(g.Value.Values);
-  end List;
-
-  private async method GetById(req: HttpRequest): OwningTask<HttpResponse>
-    var id := req.Param<int>("id");
-    using var g := await _users.Get().LockAsync();
-    return Http.JsonOrNotFound(g.Value.GetOrNull(id));
-  end GetById;
-
-  private async method Create(req: HttpRequest): OwningTask<HttpResponse>
-    var body := await req.Json<NewUser>();
-    using var g := await _users.Get().LockAsync();
-    var user := new User(g.Value.Count + 1, body.Name);
-    g.Value[user.Id] := user;
-    _log.Info($"user {user.Id} created");
-    return Http.Json(user, status := 201);
-  end Create;
-
-  private async method Remove(req: HttpRequest): OwningTask<HttpResponse>
-    var id := req.Param<int>("id");
-    using var g := await _users.Get().LockAsync();
-    return Http.Status((if g.Value.Remove(id) then 204 else 404));
-  end Remove;
-end UserApi;
 
 // ── Composition root (D-0001: constructor wiring, no container) ──
 public static class Program
   public static async method Main(): Task<int>
     await using var hub := new LogHub(new ConsoleSink(), minLevel := LogLevel.Info);   // 0021 §4.2
     var pump := hub.RunAsync();                                             // the sink loop, on this domain
-    using var todos := new Shared<Locked<Dictionary<int, Todo>>>(
-        new Locked<Dictionary<int, Todo>>(new Dictionary<int, Todo>()));   // §28.13: one value, many handles
-    using var users := new Shared<Locked<Dictionary<int, User>>>(
-        new Locked<Dictionary<int, User>>(new Dictionary<int, User>()));
+    using var todos := new Store<Todo>();                                   // one map, one handle per worker (§28.13)
     // `deps` runs on THIS domain, once per worker, and each result is moved into worker i (§30.14).
     // It may capture Main's locals: `Listen` is awaited to settlement in this very statement (§28.14 frame residence).
-    var code := await HttpServer.Listen(port := 8080, service := Api.Create,                                   // [M1]
-        deps := lambda(i) => new WorkerDeps(todos.Clone(), users.Clone(), hub.NewLogger($"http-{i}")));
+    var code := await HttpServer.Listen(port := 8080,
+        service := lambda(owned d: Deps) => new Api(move d),                // [F] capture-free: a spawn position
+        deps := lambda(i) => new Deps(todos.Clone(), hub.NewLogger($"http-{i}")));   // [M1]
     await pump;      // every worker's ChannelLogger died with its service ⇒ channel closed ⇒ sink drained
     return code;
   end Main;
 end Program;
 ```
 
-The tests: no sockets, no domains, no `Listen`. A resource class is constructed with its own store handle and a `NullLogger`, and dispatched directly — the path is the service's own (`/7`, not `/todos/7`, because the `/todos` prefix belongs to the root's `Mount`).
+The tests: no sockets, no domains, no `Listen`. A resource class is constructed over a `Store<Todo>` the test owns and seeds, and dispatched directly — the path is the service's own (`/{id}`, not `/todos/{id}`, because the `/todos` prefix belongs to the root's `Mount`).
 
 ```bezel
 module TodoService.Tests;
 import TodoService;
 import System.Testing;            // 0022 §5, §8 — explicit import by design (0022 §5.6)
-import System.Threading;
-import System.Diagnostics;
 import System.Net.Http;
 
 public class TodoApiTests
   public static async method GetByIdReturnsTheTodo(): Task
-    using var store := new Shared<Locked<Dictionary<int, Todo>>>(
-        new Locked<Dictionary<int, Todo>>(new Dictionary<int, Todo>()));   // fixture = using var (0022 §7)
-    do
-      using var g := await store.Get().LockAsync();
-      g.Value[7] := new Todo(7, "write the server proposal", false);
-    end;
-    using var log := new NullLogger();
-    using var api := new TodoApi(store.Clone(), log);                       // the service owns its own handle
-    using var req := new HttpRequest(HttpMethod.Get, "/7");                 // dispatched directly: the service's own path
+    using var store := new Store<Todo>();                                   // fixture = using var (0022 §7)
+    var todo := await store.Add(lambda(id) => new Todo(id, "write the server proposal", false));
+    using var api := new TodoApi(store);                                    // the service borrows the store, which outlives it
+    using var req := new HttpRequest(HttpMethod.Get, $"/{todo.Id}");        // dispatched directly: the service's own path
     using var resp := await api.Routes.Dispatch(req);                       // Pattern B
     Assert.Equal(200, resp.Status);
-    Assert.Equal(new Todo(7, "write the server proposal", false), await resp.Json<Todo>());   // an all-value positional record is hashable (§9.1, §3.6) — `Assert.Equal<T>`'s `where T: hashable`
+    Assert.Equal(todo, await resp.Json<Todo>());                            // an all-value positional record is hashable (§9.1, §3.6)
   end GetByIdReturnsTheTodo;
 
   public static async method NonNumericIdIsA400(): Task
-    using var store := new Shared<Locked<Dictionary<int, Todo>>>(
-        new Locked<Dictionary<int, Todo>>(new Dictionary<int, Todo>()));
-    using var log := new NullLogger();
-    using var api := new TodoApi(store.Clone(), log);
+    using var store := new Store<Todo>();
+    using var api := new TodoApi(store);
     using var req := new HttpRequest(HttpMethod.Get, "/not-a-number");
     using var resp := await api.Routes.Dispatch(req);
     Assert.Equal(400, resp.Status);                                         // Param<int> ⇒ HttpResponseException(400) ⇒ converted
@@ -255,10 +214,11 @@ end TestMain;
 
 Things to notice:
 
-- Every registration line has the same shape — `_routes.<Verb>(route, Method)` — and the same ownership trace (§4.1): receiver `this._routes`, bounding object `this`, capture `this`. The registrations live in the constructor because that is where the object is being assembled, not because the rule requires it: anywhere `this._routes` is the receiver, the trace is identical.
-- The children are **owned by the table** (`Mount(prefix, owned child)`), and each child owns its own `Shared` handle. The one borrow a child holds — the `ILogger` — is sourced from the root's `_deps`, which is declared *before* `_routes` and is therefore disposed *after* it (§28.4 step 2, reverse declaration order). That ordering is the whole discipline: **later fields borrow from earlier ones**, and `_routes` — the field whose disposal tears down everything that borrows — goes last.
+- Every registration line has the same shape — `_routes.<Verb>(route, Method)` — and the same ownership trace (§4.1): receiver `this._routes`, bounding object `this`, capture `this`. The registrations live in the constructor because that is where the object is being assembled, not because the rule requires it: anywhere `this._routes` is the receiver, the trace is identical. The one lambda (`/health`) captures nothing and is admitted at any bounding object; `async lambda(req) => …` is the spelling for a handler with nothing to await.
+- The children are **owned by the table** (`Mount(prefix, owned child)`). The one borrow a child holds — its `Store<Todo>` — is sourced from the root's `_deps`, which is declared *before* `_routes` and is therefore disposed *after* it (§28.4 step 2, reverse declaration order). That ordering is the whole discipline: **later fields borrow from earlier ones**, and `_routes` — the field whose disposal tears down everything that borrows — goes last.
 - `Http.Text(…)`, `Http.Json(…)`, `Http.JsonArray(…)`, `Http.JsonOrNotFound(…)`, `Http.Status(404)` are the response **constructors**. A handler that wants a header sets it with the indexer before returning: `var r := Http.Json(todo); r.Headers["ETag"] := tag; return r;` (0001 §3.4's indexer-set; there is no `Set`).
-- `Listen` is the only blocking point and it is `await`ed — no `Run()`/`RunAsync()` split, no sync surface (#1362). The factory (`Api.Create`) is a static method reference: capture-free, hence admitted at a spawn position; the moment it captures, the compiler rejects it with the §30.14 spawn-entry diagnostic.
+- `Listen` is the only blocking point and it is `await`ed — no `Run()`/`RunAsync()` split, no sync surface (#1362). The factory (`lambda(owned d: Deps) => new Api(move d)`) is a non-capturing lambda: capture-free, hence admitted at a spawn position (a static method reference is the other admitted spelling); the moment it captures, the compiler rejects it with the §30.14 spawn-entry diagnostic.
+- `Store<T>` is ordinary user code — no compiler-known part, forty lines, reusable by every resource. It keeps the lock protocol in one place: each method acquires its guard with its *last* `await` and does synchronous work under it, so no guard is ever live across a suspension (stdlib §6.11's lint has nothing to fire on), and a handler reads as one `return Http.…(await _todos.…)` line. `All()` returns `Task<Array<T>>` — Pattern A — precisely so that `Http.JsonArray(await _todos.All())` is admitted (§30.5: a Pattern B await may not sit in a plain argument position). Its `where T: value, sendable` is what lets `Locked<Dictionary<int, T>>` be instantiated in the body: §14.2 makes `T` count as sendable there, §30.14 makes a borrowing collection of sendable values sendable, §28.11 makes a non-move-only value a copy slot, and stdlib §6.11 admits that interior — `sendable` is not redundant beside `value`, since `value` alone admits the move-only kinds §28.11 rejects as elements. Ids are minted under the guard (`Keys.MaxOrNull() ?? 0` plus one), so a delete never makes the next `Add` overwrite a live key.
 - If a future `route` modifier lands (§11), each `[T]` line becomes a modifier on the method it names and the constructor loses those lines; nothing else changes.
 
 ## 3. Proposed API surface
@@ -381,22 +341,23 @@ Concept count: five new types (`IHttpService`, `RouteTable`, `HttpServer`, `Http
 
 | Line | Call | Form → bounding object | Argument's captures | Verdict |
 |---|---|---|---|---|
-| [R2], [T1]–[T6], [U1]–[U4] | `_routes.Get("/{id}", GetById)` etc. | receiver chain `this._routes`, one hop, an `owned` field → **form 4 → `this`** | an instance method reference: captures `this` | **admitted** — every capture is `this`. Identical to stdlib §6.5's `_clicked += OnClicked`. |
+| [T1]–[T6] | `_routes.Get("/{id}", GetById)` etc. | receiver chain `this._routes`, one hop, an `owned` field → **form 4 → `this`** | an instance method reference: captures `this` | **admitted** — every capture is `this`. Identical to stdlib §6.5's `_clicked += OnClicked`. |
+| [R2] | `_routes.Get("/health", async lambda(req) => Http.Text("ok"))` | **form 4 → `this`** | a lambda literal with no captures | **admitted** at any bounding object; the `async` lambda's inferred return is `OwningTask<HttpResponse>` (§30.6), equal to the slot (§7 Q3) |
 | [R1] | `_routes.Around(Guard)` | **form 4 → `this`** — `Around` is a `scoped` position like `Get` | `Guard` captures `this` | **admitted** |
-| [R3] [R4] | `_routes.Mount("/todos", new TodoApi(…))` | not a `scoped` position — `owned child` is an ordinary transfer (§28.8); the fresh `new` is the owned production and needs no marker (§22.3) | constructor arguments: `_deps.Todos.Clone()` mints a fresh handle (§28.13) into the child's `owned` parameter — marker-free; `_deps.Log` is a bare read of an owned field (lends, §28.6) into a plain `ILogger` parameter, stored by the child as a **back-reference** (§28.3's borrowed-field store rule: parameter-sourced, admitted with the caller-side residual that the source outlives the child) | **admitted**; the residual is discharged by field order — below |
+| [R3] | `_routes.Mount("/todos", new TodoApi(_deps.Todos))` | not a `scoped` position — `owned child` is an ordinary transfer (§28.8); the fresh `new` is the owned production and needs no marker (§22.3) | constructor argument: `_deps.Todos` is a bare read through two owned fields (lends, §28.6) into a plain `Store<Todo>` parameter, stored by the child as a **back-reference** (§28.3's borrowed-field store rule: parameter-sourced, admitted with the caller-side residual that the source outlives the child) | **admitted**; the residual is discharged by field order — below |
 | [R0] | `_deps := deps` | owned parameter into an owned field: marker-free store (§28.3) | — | fine; `_deps` is definitely assigned at [R1]–[R4] (§7.9) |
 | [A1] | `await next(req)` inside `Guard` | `next` is a **call-bounded** plain function parameter (§28.14's default). Callee side: it may be invoked, and the minted task must be consumed to settlement before the callee returns — the `await` does exactly that (*Call-bounded × deferred activation* (2)); `return next(req);` un-awaited, or storing the task, is rejected there as an escape sink. Caller side (the runtime invoking the hook): any closure is admitted | — | **admitted**. `next` is admissible as an `async` method's parameter: function types are runtime-managed and therefore not borrow-bearing (§9.7), so §30.1's borrow-bearing-parameter bar is not engaged |
-| [F] | `Api.Create` passed to `Listen`'s `service` | a **spawn position** (§30.14's category; §9a): a static method reference or non-capturing lambda | none | **admitted**; `(owned WorkerDeps) -> owned Api` binds `D := WorkerDeps`, `S := Api` under §14.5 phase 2 (a method-reference argument resolves against the substituted target per §27.6) |
-| [M1] | the `deps` lambda passed to `Listen` | a plain (call-bounded) parameter of an **async** callee → frame residence (§28.14): the lambda's captured sources — `todos`, `users` (`using var`), `hub` (`await using var`) — become carried sources of the returned task, bounded by its settlement (§30.1) | `todos`, `users`, `hub` — all locals of `Main`, all outliving the `await` in the same statement | **admitted**; each `Clone()`/`NewLogger()` result is a fresh producer into `WorkerDeps`'s `owned` parameters — marker-free. (Inference is over-determined, not marginal: phase 2 walks the function-typed arguments left to right, `Api.Create` binds `D := WorkerDeps` and `S := Api` off the winning candidate's signature (§27.6), and the `deps` lambda — whose one parameter slot is the closed `int` — independently unifies its inferred return `owned WorkerDeps` against `owned D`. Both bindings agree, so §14.5's *Agreement* rule is satisfied; `HttpServer.Listen<Api, WorkerDeps>(…)` remains writable and changes nothing.) |
+| [F] | `lambda(owned d: Deps) => new Api(move d)` passed to `Listen`'s `service` | a **spawn position** (§30.14's category; §9a): a non-capturing lambda or static method reference | none — it names only types | **admitted**; the annotated parameter binds `D := Deps` in §14.5 phase 1 (modifier slot `owned` matching exactly, §27.1), and the lambda's inferred return `owned Api` binds `S := Api` in phase 2; `move d` is the ordinary marker on the lambda's own `owned` parameter (§28.1's `lambda(owned x: T)` form, §22.3) |
+| [M1] | the `deps` lambda passed to `Listen` | a plain (call-bounded) parameter of an **async** callee → frame residence (§28.14): the lambda's captured sources — `todos` (`using var`), `hub` (`await using var`) — become carried sources of the returned task, bounded by its settlement (§30.1) | `todos`, `hub` — both locals of `Main`, all outliving the `await` in the same statement | **admitted**; each `Clone()`/`NewLogger()` result is a fresh producer into `Deps`'s `owned` parameters — marker-free. (Inference is over-determined, not marginal: phase 1 binds `D := Deps` off the service lambda's annotated parameter and phase 2 binds `S := Api` off its inferred return, and the `deps` lambda — whose one parameter slot is the closed `int` — independently unifies its inferred return `owned Deps` against `owned D`. Both bindings agree, so §14.5's *Agreement* rule is satisfied; `HttpServer.Listen<Api, Deps>(…)` remains writable and changes nothing.) |
 | ctor-time capture | every [R]/[T]/[U] line | §22.7 rule 3: capturing `this` in a method reference is not a synchronous observation; rule 1's gate is not engaged — `_routes.Get(…)` has receiver `_routes`, and field reads are not observations; rule 2 is satisfied (the classes are `sealed`, `RouteTable.Get` is not virtual) | — | no construction-time hazard: no request is dispatched before `Listen` holds the service (§30.13 domain-serial) |
 | test | `runner.Add(name, TodoApiTests.X)` | `scoped body` on a `using var` runner (0022 §8.1) | static method reference: capture-free | **admitted** unconditionally |
 | test | `api.Routes.Dispatch(req)` | not a `scoped` position; `Routes` is an expression-bodied property returning a receiver-sourced borrow of `_routes` (§28.6), and `Dispatch` borrows `req` | — | fine — a getter hop disqualifies a chain only for *registration* (form 4); dispatch stores nothing |
 
-**Why `_routes` is declared last — the disposal-order argument.** §28.4's generated `Dispose()` disposes owned-bearing fields in **reverse declaration order** and then chains to the base. A mounted child holds borrows sourced from the root's earlier fields (`_log` ← `Api._deps.Log`); the child is owned by `Api._routes`. With `_routes` declared *after* `_deps`, `_routes` is disposed first — the children die while `_deps` is intact — and `_deps` second. The §28.3 back-reference residual ("the source outlives the object") is thereby discharged **structurally**, by declaration order, with no runtime backstop needed. Had the table lived in a base class, the derived class's `_deps` would have been disposed *before* the base's `_routes` (§28.4: subclass fields, then the base chain), inverting the order — the ground on which a stdlib base class was declined (§7 Q1). The rule generalizes: **a later field may borrow from an earlier one, never the reverse**, and the field that owns the borrowers goes last. The residual is about the field's *current* value (§28.6 — a §28.7 overwrite or a `move` could end it early), and both `Api._deps` and `WorkerDeps.Log` are `readonly`, so no overwrite can. Children that hold `Shared` clones instead of borrows (the store handles in §2) are indifferent to the order — the handle keeps the value alive (§28.13) — which is why the example gives each child its own handle and reserves the borrow for the logger.
+**Why `_routes` is declared last — the disposal-order argument.** §28.4's generated `Dispose()` disposes owned-bearing fields in **reverse declaration order** and then chains to the base. A mounted child holds borrows sourced from the root's earlier fields (`_todos` ← `Api._deps.Todos`); the child is owned by `Api._routes`. With `_routes` declared *after* `_deps`, `_routes` is disposed first — the children die while `_deps` is intact — and `_deps` second. The §28.3 back-reference residual ("the source outlives the object") is thereby discharged **structurally**, by declaration order, with no runtime backstop needed. Had the table lived in a base class, the derived class's `_deps` would have been disposed *before* the base's `_routes` (§28.4: subclass fields, then the base chain), inverting the order — the ground on which a stdlib base class was declined (§7 Q1). The rule generalizes: **a later field may borrow from an earlier one, never the reverse**, and the field that owns the borrowers goes last. The residual is about the field's *current* value (§28.6 — a §28.7 overwrite or a `move` could end it early), and both `Api._deps` and `Deps.Todos` are `readonly`, so no overwrite can. A child that held a `Store<Todo>.Clone()` instead of a borrow would be indifferent to the order — the handle keeps the value alive (§28.13) — at the price of a `Clone()` on the `Mount` line and a handle of its own in every test; the borrow is the smaller spelling, and the field order is what makes it sound. A child that also logs takes `_deps.Log` as a second back-reference the same way.
 
 **Why a service's registration bound is intact after `Mount`.** §28.14's *registration-lifetime residual* concerns moving the *storing member* out past its bounding object. At [R3] the whole bounding object (the child) moves, its `_routes` with it: the bound travels intact, and the child's table is disposed with the child, which the root's table disposes with the root.
 
-**Handler-body ownership, once.** `req` is a plain parameter of an `async` method — a borrow held until settlement (§30.1); the dispatcher awaits the handler's task before the request is reclaimed, so the source-outlives-settlement obligation is discharged by the dominant shape. `using var g := await _todos.Get().LockAsync()` is Pattern B into a `using var` (§30.5); the `Get()` borrow is sourced from the owned handle field (§28.13) and rides `LockAsync`'s frame only within the awaiting full expression. `Http.*` results are fresh owned productions returned through an `OwningTask` return, marker-free (§28.3). No example holds a guard across an `await` (stdlib §6.11's warning): every body-reading `await` precedes its lock.
+**Handler-body ownership, once.** `req` is a plain parameter of an `async` method — a borrow held until settlement (§30.1); the dispatcher awaits the handler's task before the request is reclaimed, so the source-outlives-settlement obligation is discharged by the dominant shape. Inside `Store<T>`, `using var g := await _map.Get().LockAsync()` is Pattern B into a `using var` (§30.5); the `Get()` borrow is sourced from the owned handle field (§28.13) and rides `LockAsync`'s frame only within the awaiting full expression; the handlers hold no guard at all — `All()` is Pattern A so that `Http.JsonArray(await _todos.All())` is an admitted unbound-temporary await (§30.5), and every other store call returns a value. `Http.*` results are fresh owned productions returned through an `OwningTask` return, marker-free (§28.3). No guard is ever live across an `await` (stdlib §6.11's warning): the only guards in the program are `Store<T>`'s five, each acquired by the last `await` of its body, and every body-reading `await` in a handler precedes the store call.
 
 ### 4.2 The worker-domain model
 
@@ -452,7 +413,7 @@ Middleware/hooks pipeline (shared design with 0001 §7) · a `CancellationToken`
 - *(i) synchronized statics only* — works for a store (stdlib §6.11's registry idiom) but cannot give each worker its own `ChannelLogger` (not synchronized; 0021 mints one per producer), and statics defeat the test seam. Kept for genuinely ambient state.
 - *(ii) `deps: owned OwningArray<D>` built by a hand-written N-loop in `Main`* — sound, but the loop repeats `Environment.ProcessorCount` and the worker count at two sites. Replaced by *(ii′) `deps: (int) -> owned D`*: a plain call-bounded parameter of an async callee (frame residence, §28.14), invoked `workers` times on the calling domain; it may capture `Main`'s `using var` locals because `Main` awaits `Listen` to settlement in the same statement. Each result is moved into worker `i` (§30.14 spawn argument). Chosen.
 - *(iii) what is sendable inside `D`:* `Shared<T>` for `T` in §28.13's payload set (`Mutex`, `Atomic<T>`, `AtomicInteger<T>`, `Semaphore`, `Locked<T>`, `RwLocked<T>`, `FrozenArray<T>`, `CancellationTokenSource`), `ChannelSender<T>`, and any sealed transfer-closed class. Not sendable, and not needed: the service.
-- *0021 wiring under this design:* `WorkerDeps.Log: owned ChannelLogger`; the root owns `_deps`; children hold `ILogger` back-references; `Main` holds no logger, so the channel closes when the last worker's service is disposed at `Listen`'s return, and `await pump` drains — 0021 §4.3's open question 2 answered by ownership alone.
+- *0021 wiring under this design:* `Deps.Log: owned ChannelLogger`; the root owns `_deps`; a child holds back-references into it (the store; the logger too if it logs); `Main` holds no logger, so the channel closes when the last worker's service is disposed at `Listen`'s return, and `await pump` drains — 0021 §4.3's open question 2 answered by ownership alone.
 
 **Q3 — Handler signature: async-only `(HttpRequest) -> OwningTask<HttpResponse>`; request borrowed; `OwningTask` is right.**
 - §22.6 *Lambda-literal arguments*: applicability is decided by the lambda's inferred return type, which must equal, implicitly convert to (§5.1), or bind the slot; `lambda(req) => Http.Text("ok")` infers `owned HttpResponse`, and no conversion reaches `OwningTask<HttpResponse>`. The spelling is `async lambda(req) => Http.Text("ok")` (§30.6 assigns `OwningTask<T>` to a class result) or an `async method`.
@@ -481,7 +442,7 @@ Middleware/hooks pipeline (shared design with 0001 §7) · a `CancellationToken`
 - Where exceptions surface: `HttpResponseException` → a response at the *innermost* table (so a hook sees a 400 as a response); everything else propagates through the hooks to the outermost `Dispatch` → opaque 500. Hence no `OnError` hook: `Around` with a `catch` *is* one.
 
 **Q8 — Testing: a public `HttpRequest` constructor + `Dispatch` on the table.**
-- A constructor beats `Http.Request(…)`: it is the ordinary spelling, and `Http` is 0001's client facade. Body accessors on a constructed request or response read the in-memory body under the unchanged single-consumption rule. `Dispatch` lives on `RouteTable` — the object that does the work — and is reached as `service.Routes.Dispatch(req)`. The tests in §2 use only 0022's `Assert.Equal` (hashable records) and `using var` fixtures.
+- A constructor beats `Http.Request(…)`: it is the ordinary spelling, and `Http` is 0001's client facade. Body accessors on a constructed request or response read the in-memory body under the unchanged single-consumption rule. `Dispatch` lives on `RouteTable` — the object that does the work — and is reached as `service.Routes.Dispatch(req)`. The tests in §2 use only 0022's `Assert.Equal` (hashable records) and `using var` fixtures; seeding is `await store.Add(lambda(id) => …)` on the same `Store<Todo>` the service borrows, so a test never spells a lock.
 
 **Q9 — Lifecycle: `Listen(…): Task<int>` + static `Stop()`; the deps overload; `Serve` as the fallback.**
 - `Listen` stays the only blocking point and is awaited (#1362). `Stop()` static and idempotent per #1402 — one server per process is the v1 posture; the natural successor is a `token: CancellationToken` on `Listen`, a compatible addition (§6).
@@ -514,7 +475,7 @@ Middleware/hooks pipeline (shared design with 0001 §7) · a `CancellationToken`
 
 - **0001**: shares `HttpResponse`, `HttpHeaders`, `HttpMethod`, the `Http` facade, the `HttpException` root, and the substrate; the fetch symmetry is why the two read as one API. One clause narrows (§9c).
 - **0007**: the `TcpListener` `Listen` binds is 0007 §4.4's; the per-worker accept topology is 0007 §3's, whose acceptance test this proposal is. 0007 §4.4's graceful-stop path (cancel `Accept`'s token) is what `Stop()` drives.
-- **0021**: the first customer. §2's `WorkerDeps.Log: owned ChannelLogger` and the children's `ILogger` back-references are the wiring 0021 §4.3 shows; the sink-loop lifecycle 0021 left open closes by ownership (§7 Q2).
+- **0021**: the first customer. §2's `Deps.Log: owned ChannelLogger` and the root's `_deps.Log.Info` line are the wiring 0021 §4.3 shows (a child that logs takes the same back-reference its store takes); the sink-loop lifecycle 0021 left open closes by ownership (§7 Q2).
 - **0022**: `TestRunner`/`Assert` are the test material in §2; `TestRunner.Add`'s `scoped body` is the same storing-position shape as `RouteTable.Get`.
 - **#1376**: the umbrella networking issue; this proposal is its server half. **#1402**: the tracking issue and the ruling record (§8).
 - **§28.14 / §30.14 / §28.13 / §22.12**: the design rests on existing surface — form-4 admission for `this`-bound registration, spawn positions for the factory, `Shared<Locked<…>>` for shared state — plus the one roster edit of §9a. **§28.4**'s reverse-declaration-order disposal is what §4.1's field discipline leans on.
