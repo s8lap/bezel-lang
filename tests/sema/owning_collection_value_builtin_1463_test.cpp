@@ -156,5 +156,11 @@ BEZEL_TEST(owning_collection_value_builtin_1463, generic_type_param_admitted_con
         "class Box<T> where T: class "
         "  public owned items: OwningArray<T> := new OwningArray<T>(); "
         "end Box;");
+    // fix #3997: an absence-only claim on ONE diagnostic also holds when
+    // the fixture never parsed at all (gated by `parseSemaAll` ->
+    // `parseAndResolveGated`). `!r.diagnostics.hasErrors()` is a real
+    // discriminator: the gate makes "parsed+resolved clean" and "gated
+    // off by a parse error" mutually exclusive.
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_FALSE(hasOwningElementError(r));
 }

@@ -270,5 +270,15 @@ BEZEL_TEST(choice_equality_35_7,
         "  var a: Opt := Opt.None; "
         "  return (if a.Equals(a) then 1 else 0); "
         "end Main; end C;");
+    // fix #3997: `lacksErrDiagWith` on its own is an absence-only claim
+    // that cannot FAIL-WITHOUT for the right reason — it is equally
+    // satisfied by "the §35.7 rule correctly did not fire" and by "sema
+    // never ran at all" (a broken/unparseable fixture, gated by
+    // `semaAll` -> `parseAndTypecheckGated`, produces a PARSE-error
+    // diagnostic that also does not mention "is not available on
+    // choice"). `!r.diagnostics.hasErrors()` is a real, sound
+    // discriminator here: the gate makes "parsed and typechecked with
+    // zero errors" and "gated off by a parse error" mutually exclusive.
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(lacksErrDiagWith(r, "is not available on choice"));
 }

@@ -138,6 +138,12 @@ BEZEL_TEST(choice_self_containment_2208,
         "record Outer(B: Box); "
         "class C public static method Main(): int return 0; "
         "end Main; end C;");
+    // fix #3997: an absence-only claim on ONE diagnostic substring also
+    // holds when the fixture never parsed at all (gated by `semaAll` ->
+    // `parseAndTypecheckGated`). `!r.diagnostics.hasErrors()` is a real
+    // discriminator: the gate makes "parsed+typechecked clean" and "gated
+    // off by a parse error" mutually exclusive.
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_FALSE(hasErrDiagWith(r,
         "cannot recursively contain itself by value"));
 }

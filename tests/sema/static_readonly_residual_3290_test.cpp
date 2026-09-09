@@ -445,6 +445,14 @@ BEZEL_TEST(static_readonly_residual_3290,
         "    return 0; "
         "  end Main; "
         "end Program;");
+    // fix #3997: `hasMsg(r, "owning-classified")` is an absence-only claim
+    // that also holds when the fixture never parsed (gated by
+    // `parseSemaAll` -> `parseAndTypecheckGated`, whose parse-error
+    // diagnostic never mentions "owning-classified" either). Assert the
+    // pipeline actually ran clean end to end first — a real discriminator,
+    // since the gate makes "parsed+typechecked clean" and "gated off by a
+    // parse error" mutually exclusive.
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     // Instance-level readonly: §22.12's static-and-domains check does
     // not visit instance fields, so the rejection does not fire.
     BEZEL_EXPECT_FALSE(hasMsg(r, "owning-classified"));

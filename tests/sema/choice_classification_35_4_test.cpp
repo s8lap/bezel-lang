@@ -264,6 +264,16 @@ BEZEL_TEST(choice_classification_35_4,
     // test.
     auto r = resolveAll(
         "module M; class C end C; record Rec(x: int);");
+    // fix #3997: `classify(...).has_value() == false` is equally true when
+    // the classifier correctly declines a non-choice type AND when the
+    // fixture never parsed at all (findType returns nullptr either way,
+    // since `resolveAll` -> `parseAndResolveGated` skips collectSymbols
+    // entirely on a parse error). `!r.diagnostics.hasErrors()` discriminates:
+    // a parse failure trips it (the gate makes "parsed+resolved clean" and
+    // "gated off by a parse error" mutually exclusive), so the nullopt
+    // claims below are now known to come from the classifier's own kind
+    // gate, not from the types never having been found at all.
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_FALSE(classify(r, "C").has_value());
     BEZEL_EXPECT_FALSE(classify(r, "Rec").has_value());
 }

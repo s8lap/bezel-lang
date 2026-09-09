@@ -259,6 +259,13 @@ BEZEL_TEST(auto_hashable_choice_equality_3333,
         "  var a: Opt := Opt.None; "
         "  return (if a.Equals(a) then 1 else 0); "
         "end Main; end C;");
+    // fix #3997: an absence-only claim on ONE specific diagnostic cannot
+    // FAIL-WITHOUT for the right reason (a broken/unparseable fixture,
+    // gated by `semaAll` -> `parseAndTypecheckGated`, also does not
+    // mention this specific message). `!r.diagnostics.hasErrors()` is a
+    // real discriminator: the gate makes "parsed+typechecked clean" and
+    // "gated off by a parse error" mutually exclusive.
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_FALSE(hasNotAvailableMemberError(r));
 }
 

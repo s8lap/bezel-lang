@@ -140,6 +140,13 @@ BEZEL_TEST(hashable_constraint_2087, method_call_interface_accepted_spec_3_6) {
         "class C public static method Main(): int "
         "  return Box.Hold<IShape>(); "
         "end Main; end C;");
+    // fix #3997: `hasConstraintError` on its own is an absence-only claim
+    // that also holds when the fixture never parsed (gated by
+    // `parseSemaAll` -> `parseAndTypecheckGated`). `!r.diagnostics.
+    // hasErrors()` is a real discriminator: the gate makes "parsed+
+    // typechecked clean" and "gated off by a parse error" mutually
+    // exclusive.
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_FALSE(hasConstraintError(r));
 }
 

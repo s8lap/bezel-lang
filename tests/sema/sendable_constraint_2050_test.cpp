@@ -110,6 +110,12 @@ BEZEL_TEST(sendable_constraint_2050,
         "class C public static method Main(): int "
         "  return Box.Hold(new Point(3, 4)); "
         "end Main; end C;");
+    // fix #3997: an absence-only claim on ONE diagnostic also holds when
+    // the fixture never parsed at all (gated by `parseSemaAll` ->
+    // `parseAndTypecheckGated`). `!r.diagnostics.hasErrors()` is a real
+    // discriminator: the gate makes "parsed+typechecked clean" and "gated
+    // off by a parse error" mutually exclusive.
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(!hasConstraintError(r));
 }
 

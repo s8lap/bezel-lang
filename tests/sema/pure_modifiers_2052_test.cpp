@@ -327,6 +327,12 @@ BEZEL_TEST(pure_modifiers_2052, pure_record_return_not_flagged_spec_22_15) {
         "class C "
         "  public static pure method Make(): R => new R(0); "
         "end C;");
+    // fix #3997: an absence-only claim on ONE diagnostic substring also
+    // holds when the fixture never parsed at all (gated by `parseSemaAll`
+    // -> `parseAndCheckPureGated`). `!r.diagnostics.hasErrors()` is a real
+    // discriminator: the gate makes "parsed+checked clean" and "gated off
+    // by a parse error" mutually exclusive.
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     // No "owned class-typed return" diagnostic should fire.
     BEZEL_EXPECT_FALSE(hasMsg(r, "no `owned` class-typed return"));
 }
