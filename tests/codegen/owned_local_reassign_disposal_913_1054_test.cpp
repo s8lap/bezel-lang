@@ -20,6 +20,22 @@
 // Counter's ctor bumps the static counter n (+1), its destructor decrements it
 // (-1); `return Counter.n` after a `do…end` scope is the disposed-exactly-once
 // balance.
+//
+// ⚠ RETIRED (the #913 half only) by fix #3978 (§25.1/§17.6, v0.295). §25.1's
+// not-overloadable list, verbatim: "The increment and decrement statements
+// `++` and `--` ... not operators of the expression grammar." `operator ++`
+// is no longer admissible at ALL, so #913's `c++` half of this file's
+// premise (the `Counter` shape below with `operator ++`) is now a
+// declaration-site compile error, independent of ownership/borrow status.
+// `plain_increment_disposes_displaced_913` and
+// `borrow_param_increment_no_double_free_913` are FLIPPED to REJECT below.
+// The #1054 half (plain `c := new Counter(...)` reassignment, no
+// `operator ++` involved at all) is UNCHANGED: `prog()` below had its
+// `operator ++` declaration removed (it was never actually exercised by
+// `plain_assign_disposes_displaced_1054`, which uses a fresh, non-shared
+// Counter class below purely to keep this file's fixture-repair minimal and
+// self-contained) and `borrow_param_assign_no_double_free_1054` already
+// used its own separate `Counter` class with no `operator ++` at all.
 
 #include <cstdio>
 #include <cstdlib>
@@ -36,6 +52,7 @@
 #include "sema/SemaContext.hpp"
 #include "sema/SymbolCollection.hpp"
 #include "sema/TypeResolution.hpp"
+#include "support/aot_result_asserts.hpp"
 #include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration, P1)
 #include "support/codegen_support.hpp"
 #include "support/Diagnostic.hpp"
@@ -45,6 +62,7 @@
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 
+using bezel::test::failedAtCompileTimeWithRealLocation;
 using bezel::test::runAot;
 
 namespace {
@@ -54,6 +72,12 @@ namespace fs = std::filesystem;
 int run(const std::string& src) {
     auto r = runAot(src);
     return r.ran ? r.exitCode : -999;
+}
+
+bool diagContains913(const bezel::test::JitResult& r, const char* sub) {
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find(sub) != std::string::npos) return true;
+    return false;
 }
 
 int runUnderLeakSanitizer(const std::string& source, bool detectLeaks = true) {
@@ -105,7 +129,9 @@ void expectDisposedAndLeakFree(const std::string& source, int expectedExitCode) 
     BEZEL_EXPECT_EQ(lsan, 0);
 }
 
-// Counter with operator++ returning a fresh owned Counter; ctor +1 / dtor -1.
+// Counter WITHOUT operator++ (fix #3978 removed it — see file header; this
+// helper is used only by #1054's plain-reassignment test, which never
+// exercised `c++` at all). ctor +1 / dtor -1.
 std::string prog(const std::string& mainBody) {
     return
         "module M; "
@@ -113,8 +139,6 @@ std::string prog(const std::string& mainBody) {
         "  public static n: int := 0; "
         "  public Value: int; "
         "  public constructor(v: int) n := n + 1; Value := v; end constructor; "
-        "  public static method operator ++(c: Counter): owned Counter => "
-        "    new Counter(c.Value + 1); "
         "  destructor n := n - 1; end destructor; "
         "end Counter; "
         "class C public static method Main(): int " + mainBody + " end Main; end C;";
@@ -129,19 +153,40 @@ BEZEL_TEST(owned_local_reassign_913_1054, plain_assign_disposes_displaced_1054) 
              "var m := Counter.n; c.Dispose(); return m; end;"), 1);
 }
 
-// #913 (plain-var slice): `c++` on an owned plain class local disposes the
-// displaced Counter(0); only Counter(1) is alive after → n == 1.
-BEZEL_TEST(owned_local_reassign_913_1054, plain_increment_disposes_displaced_913) {
-    expectDisposedAndLeakFree(
-        prog("do var c := new Counter(0); c++; "
-             "var m := Counter.n; c.Dispose(); return m; end;"), 1);
+// ⚠ FLIPPED by fix #3978 (§25.1/§17.6, v0.295). Pre-fix comment (kept for
+// history): "#913 (plain-var slice): `c++` on an owned plain class local
+// disposes the displaced Counter(0); only Counter(1) is alive after →
+// n == 1." `operator ++` is no longer admissible on any declaring type
+// (§25.1) — the declaration itself is now rejected, independent of the
+// ownership-disposal machinery this row used to exercise.
+BEZEL_TEST(owned_local_reassign_913_1054,
+           plain_increment_declaration_rejected_spec_25_1_issue_3978) {
+    auto r = runAot(
+        "module M; "
+        "class Counter "
+        "  public static n: int := 0; "
+        "  public Value: int; "
+        "  public constructor(v: int) n := n + 1; Value := v; end constructor; "
+        "  public static method operator ++(c: Counter): owned Counter => "
+        "    new Counter(c.Value + 1); "
+        "  destructor n := n - 1; end destructor; "
+        "end Counter; "
+        "class C public static method Main(): int "
+        "  do var c := new Counter(0); c++; "
+        "  var m := Counter.n; c.Dispose(); return m; end; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagContains913(r, "operator `++` may not be overloaded (§25.1)"));
 }
 
-// CRITICAL CONTROL: `c++` on a BORROW param must NOT dispose the displaced
-// (borrowed) value — that is owned by the caller; disposing it would be a
-// double-free. The new value created leaks (sound), so leak-detection is off;
-// the load-bearing assertion is NO double-free / use-after-free.
-BEZEL_TEST(owned_local_reassign_913_1054, borrow_param_increment_no_double_free_913) {
+// ⚠ FLIPPED by fix #3978 (§25.1/§17.6, v0.295). Pre-fix comment (kept for
+// history): "CRITICAL CONTROL: `c++` on a BORROW param must NOT dispose the
+// displaced (borrowed) value ... the load-bearing assertion is NO
+// double-free / use-after-free." That double-free question is moot once
+// `operator ++` cannot be declared at all — the program is now rejected at
+// the declaration, before any borrow/ownership question is reachable.
+BEZEL_TEST(owned_local_reassign_913_1054,
+           borrow_param_increment_declaration_rejected_spec_25_1_issue_3978) {
     std::string src =
         "module M; "
         "class Counter public static n: int := 0; public Value: int; "
@@ -155,10 +200,9 @@ BEZEL_TEST(owned_local_reassign_913_1054, borrow_param_increment_no_double_free_
         "  public static method Main(): int "
         "    using var c := new Counter(10); return Bump(c); end Main; "
         "end C;";
-    BEZEL_EXPECT_EQ(run(src), 11);
-    int lsan = runUnderLeakSanitizer(src, /*detectLeaks=*/false);
-    if (lsan == -1) return;
-    BEZEL_EXPECT_EQ(lsan, 0);  // no double-free / use-after-free
+    auto r = runAot(src);
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagContains913(r, "operator `++` may not be overloaded (§25.1)"));
 }
 
 // CONTROL: `c := newOwned` on a BORROW param likewise must not double-free the

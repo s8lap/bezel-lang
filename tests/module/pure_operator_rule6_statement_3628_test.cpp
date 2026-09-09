@@ -99,6 +99,7 @@
 #include <vector>
 
 #include "driver/Driver.hpp"
+#include "support/aot_result_asserts.hpp"
 #include "support/aot_support.hpp"
 #include "support/scratch_dir.hpp"
 #include "support/unique_stem.hpp"
@@ -136,6 +137,17 @@ std::string compoundAssignLocal(const char* mark) {
 
 // ---------------------------------------------------------------------------
 // B1 / B2 — the increment/decrement half (§17.6 / §25).
+//
+// ⚠ RETIRED by fix #3978 (§25.1/§17.6, v0.295). `operator ++` is no longer
+// admissible on any declaring type — B1/B2 below no longer test rule 6's
+// PURITY distinction at all (both the "impure" and "pure"-marked variants
+// now fail identically at the declaration, before purity is ever
+// consulted); they are kept as REJECT pins (not removed) because this file
+// is the one place that exercised the retired `stmtOperatorSymbols_`
+// publish for `IncrementStmt` specifically (see ExprTypecheck.cpp's fix
+// #3978 comment: no fact is published for this statement any more, so
+// PureChecker's `checkOperatorOverloadPurity` read of it degrades to its
+// documented null case).
 // ---------------------------------------------------------------------------
 
 std::string incrementLocal(const char* mark) {
@@ -378,22 +390,39 @@ BEZEL_TEST(pure_operator_rule6_statement_3628,
 }
 
 // ===========================================================================
-// B1 / B2 — increment, THE FILED DEFECT (issue #3628 measurement 2). Pre-fix:
-// compiled clean, program exited 5 — the impure `operator ++` body RAN.
+// B1 / B2 — increment. Pre-#3978, this was "THE FILED DEFECT (issue #3628
+// measurement 2)": pre-#3610-fix, compiled clean, program exited 5 — the
+// impure `operator ++` body RAN inside the `pure` method. Post-#3610-fix
+// (pre-#3978): rejected with the §22.15-rule-6 purity diagnostic
+// (`increment_impure_operator_rejected`'s ORIGINAL assertion, kept here for
+// history) for the impure mark, accepted for the `pure`-marked one.
+//
+// ⚠ FLIPPED by fix #3978 (§25.1/§17.6, v0.295): `operator ++` cannot be
+// declared AT ALL any more, `pure` mark or not — both variants below are now
+// REJECT, and neither's diagnostic is the rule-6 purity one any more (see
+// this file's header and `incrementLocal`'s comment): the declaration-site
+// §25.1 reject fires before rule 6 is ever reached, so
+// `sawPureOperatorReject` (which looks for the rule-6-specific "not admitted
+// in a pure body" text) would no longer find anything to match on the
+// impure row either.
 // ===========================================================================
 
 BEZEL_TEST(pure_operator_rule6_statement_3628,
-          increment_impure_operator_rejected) {
+          increment_operator_declaration_rejected_impure_mark_spec_25_1_issue_3978) {
     auto r = test::runAot(incrementLocal(""));
-    BEZEL_EXPECT_FALSE(r.ran);
-    BEZEL_EXPECT_TRUE(sawPureOperatorReject(diagText(r), "++"));
+    BEZEL_EXPECT_TRUE(test::failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagText(r).find("operator `++` may not be overloaded (§25.1)") !=
+                       std::string::npos);
 }
 
 BEZEL_TEST(pure_operator_rule6_statement_3628,
-          increment_pure_operator_accepted) {
+          increment_operator_declaration_rejected_pure_mark_spec_25_1_issue_3978) {
+    // The `pure` mark does not rescue the declaration — §25.1 rejects
+    // `operator ++` unconditionally, regardless of purity.
     auto r = test::runAot(incrementLocal("pure "));
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 5);
+    BEZEL_EXPECT_TRUE(test::failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagText(r).find("operator `++` may not be overloaded (§25.1)") !=
+                       std::string::npos);
 }
 
 // ===========================================================================

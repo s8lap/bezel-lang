@@ -16580,83 +16580,67 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                         "over `T?` (§7.11, v0.267)");
                 }
                 else if (isRefType || isValueTypeRecord) {
-                    // Look for a user-defined `operator ++`/`operator --` on
-                    // the target's Named type (§25 overload resolution).
-                    // Both reference types and value-type records resolve
-                    // through the same overload lookup (a record's
-                    // `operator ++` admits it under §17.6 category (1)).
-                    bool hasOverload = false;
-                    if (targetTy->kind == sema::TypeRef::Kind::Named &&
-                        targetTy->declaration) {
-                        for (sema::Symbol* m :
-                             targetTy->declaration->members) {
-                            auto* ms =
-                                dynamic_cast<sema::MethodSymbol*>(m);
-                            if (ms && ms->isOperator &&
-                                ms->operatorToken == is->op &&
-                                ms->params.size() == 1) {
-                                hasOverload = true;
-                                // fix #3628 (§22.15 rule 6 / §17.6, v0.286):
-                                // this is the SAME resolution codegen's own
-                                // IncrementStmt lowering repeats
-                                // (LlvmBackend_Stmts.cpp's `opMethod` scan —
-                                // direct members only, no inherited chain, so
-                                // this walk and that one always agree).
-                                // Publish it so `PureBodyWalker` can ask
-                                // `callTargetIsPure` about a fact this site
-                                // already computed, instead of re-resolving.
-                                ctx_.setStmtOperatorSymbol(is, ms);
-                                break;
-                            }
-                        }
-                    }
-                    if (!hasOverload) {
-                        // Format the type name for the diagnostic. headName()
-                        // covers Named types; the String/Object primitives
-                        // spell themselves; fall back to a generic label.
-                        std::string tyName;
-                        if (targetTy->kind ==
+                    // fix #3978 (§17.6 / §25.1, v0.295): `++`/`--` are NEVER
+                    // user-overloadable — retires the v0.236 reading below
+                    // ("admit a reference/value-type-record operand IFF its
+                    // type overloads the operator", fix #2585/#2599). §17.6,
+                    // verbatim: "On an operand of any other type the
+                    // statement is a compile error on a separate ground:
+                    // `++`/`--` are not user-overloadable (§25.1), so a type
+                    // spells advancement as `x := x + 1` under its own
+                    // `operator +`, or as a named method." So a reference
+                    // type or a value-type record operand is now rejected
+                    // UNCONDITIONALLY — no overload lookup, no escape hatch.
+                    // §25.1's declaration-site reject
+                    // (TypeResolution_Checks.cpp's `checkOperatorGroups`)
+                    // makes an `operator ++`/`operator --` declaration a
+                    // compile error on its own, independently of this check
+                    // — but this check does not rely on that ordering: it
+                    // rejects the USE directly, so a program that (in error)
+                    // still carries such a declaration is rejected at every
+                    // `x++`/`x--` site too, not just at the declaration.
+                    // This also means no fact is published via
+                    // `ctx_.setStmtOperatorSymbol` for this statement any
+                    // more (§22.15 rule 6 / fix #3628's PureChecker read of
+                    // it degrades to its documented null case — there is no
+                    // longer any overload for it to find).
+                    //
+                    // Format the type name for the diagnostic. headName()
+                    // covers Named types; the String/Object primitives
+                    // spell themselves; fall back to a generic label.
+                    std::string tyName;
+                    if (targetTy->kind == sema::TypeRef::Kind::Primitive &&
+                        targetTy->primitive == sema::PrimitiveType::String)
+                        tyName = "string";
+                    else if (targetTy->kind ==
                                 sema::TypeRef::Kind::Primitive &&
-                            targetTy->primitive ==
-                                sema::PrimitiveType::String)
-                            tyName = "string";
-                        else if (targetTy->kind ==
-                                    sema::TypeRef::Kind::Primitive &&
-                                 targetTy->primitive ==
-                                    sema::PrimitiveType::Object)
-                            tyName = "Object";
-                        else if (targetTy->kind ==
-                                    sema::TypeRef::Kind::Function)
-                            tyName = "function type";
-                        else if (std::string_view h =
-                                     targetTy->headName();
-                                 !h.empty())
-                            tyName = std::string(h);
-                        else
-                            tyName = isValueTypeRecord ? "record"
-                                                       : "reference type";
-                        // §17.6 diagnostic: the clause wording is category-
-                        // specific (reference type vs value-type record), but
-                        // both name §17.6 and the missing overload.
-                        std::string categoryWord =
-                            isValueTypeRecord ? "record type"
-                                              : "reference type";
-                        std::string clauseWord =
-                            isValueTypeRecord
-                                ? "on a value-type record"
-                                : "on a reference type";
-                        std::string overloadWord =
-                            isValueTypeRecord ? "the record"
-                                              : "the type";
-                        ctx_.diagnostics().report(
-                            Severity::Error, is->target->span.begin,
-                            std::string("`") + std::string(is->op) +
-                            "` is not defined on " + categoryWord + " `" +
-                            tyName + "` — per §17.6, `++`/`--` " + clauseWord +
-                            " apply only when " + overloadWord +
-                            " overloads the operator (and `" + tyName +
-                            "` does not)");
-                    }
+                             targetTy->primitive ==
+                                sema::PrimitiveType::Object)
+                        tyName = "Object";
+                    else if (targetTy->kind == sema::TypeRef::Kind::Function)
+                        tyName = "function type";
+                    else if (std::string_view h = targetTy->headName();
+                             !h.empty())
+                        tyName = std::string(h);
+                    else
+                        tyName = isValueTypeRecord ? "record"
+                                                   : "reference type";
+                    // §17.6 diagnostic: the clause wording is category-
+                    // specific (reference type vs value-type record), both
+                    // cite §17.6 and §25.1.
+                    std::string categoryWord =
+                        isValueTypeRecord ? "record type" : "reference type";
+                    std::string clauseWord =
+                        isValueTypeRecord ? "on a value-type record"
+                                          : "on a reference type";
+                    ctx_.diagnostics().report(
+                        Severity::Error, is->target->span.begin,
+                        std::string("`") + std::string(is->op) +
+                        "` is not defined on " + categoryWord + " `" +
+                        tyName + "` — `++`/`--` are not user-overloadable "
+                        "(§25.1) " + clauseWord + "; per §17.6 a type "
+                        "spells advancement as `x := x + 1` under its own "
+                        "`operator +`, or as a named method");
                 }
                 // §7.11 / proposal 0114 / v0.267 (#3298): `++`/`--` do not
                 // lift over a nullable value type. The §17.6 desugaring is

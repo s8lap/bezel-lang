@@ -4,10 +4,12 @@
 // are emitted via the shared callable-shape path (they carry an
 // `OperatorDecl` rather than a `MethodDecl`). Observable via exit code.
 
+#include "support/aot_result_asserts.hpp"
 #include "support/aot_support.hpp"
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
+using bezel::test::failedAtCompileTimeWithRealLocation;
 using bezel::test::runAot;
 using bezel::test::runAotOut;
 
@@ -15,6 +17,12 @@ namespace {
 int run(const std::string& program) {
     auto r = runAot(program);
     return r.ran ? r.exitCode : -999;
+}
+
+bool diagContainsOp(const bezel::test::JitResult& r, const char* sub) {
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find(sub) != std::string::npos) return true;
+    return false;
 }
 } // namespace
 
@@ -203,45 +211,57 @@ BEZEL_TEST(codegen_cg48, generic_record_operator_inferred_bare_param_result_1260
         "end Main; end C;"), 8);
 }
 
-// #1219 / §25.2 / §14 / §9.5: `++` on a GENERIC record with a `new`-body operator.
-// Before the fix: call site loaded record.Box$spec0 but called unspecialized
-// bz$Box$op$++ (expects record.Box) → LLVM IR_FAIL.  After the fix: the per-
-// instantiation substitution is established before emitMethodCall so the operator
-// is specialized to match the concrete struct → clean IR, exit 6.
-BEZEL_TEST(codegen_cg48, generic_record_increment_new_body_1219) {
-    BEZEL_EXPECT_EQ(run(
+// ⚠ FLIPPED by fix #3978 (§25.1/§17.6, v0.295). Pre-fix comment (kept for
+// history): "#1219 / §25.2 / §14 / §9.5: `++` on a GENERIC record with a
+// `new`-body operator ... After the fix: the per-instantiation substitution
+// is established before emitMethodCall so the operator is specialized to
+// match the concrete struct → clean IR, exit 6." §25.1/§17.6 retire the
+// `operator ++`/`operator --` mechanism outright at v0.295 — the
+// generic-specialization machinery #1219 fixed is now unreachable because
+// the declaration itself is rejected first.
+BEZEL_TEST(codegen_cg48, generic_record_increment_declaration_rejected_spec_25_1) {
+    auto r = runAot(
         "module M; "
         "record Box<T>(V: int) "
         "  public static method operator ++(b: Box<T>): Box<T> => new Box<T>(b.V + 1); "
         "end Box; "
         "class C public static method Main(): int "
         "  var b: Box<string> := new Box<string>(5); b++; return b.V; "
-        "end Main; end C;"), 6);
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagContainsOp(r, "operator `++` may not be overloaded (§25.1)"));
 }
 
-// #1219 / §25.2 / §9.5: `++` on a generic record with a `with`-body operator.
-// The `with` expression copies the struct with one field changed; before the fix
-// the operator was called unspecialized → IR_FAIL (and when the JIT ran anyway
-// the `with` reinit path returned 0).  After the fix: 10 + 3×1 = 13.
-BEZEL_TEST(codegen_cg48, generic_record_increment_with_body_1219) {
-    BEZEL_EXPECT_EQ(run(
+// ⚠ FLIPPED by fix #3978 (§25.1/§17.6, v0.295). Pre-fix comment (kept for
+// history): "`++` on a generic record with a `with`-body operator ... After
+// the fix: 10 + 3×1 = 13." Same retirement as above — the `with`-body
+// operator's own declaration is rejected before any of the three `c++`
+// calls are reached.
+BEZEL_TEST(codegen_cg48, generic_record_increment_with_body_declaration_rejected_spec_25_1) {
+    auto r = runAot(
         "module M; "
         "record Cnt<T>(V: int) "
         "  public static method operator ++(c: Cnt<T>): Cnt<T> => c with(V := c.V + 1); "
         "end Cnt; "
         "class C public static method Main(): int "
         "  var c: Cnt<string> := new Cnt<string>(10); c++; c++; c++; return c.V; "
-        "end Main; end C;"), 13);
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagContainsOp(r, "operator `++` may not be overloaded (§25.1)"));
 }
 
-// #1219 / §25.2: `--` on a generic record — same fix path as `++`.
-BEZEL_TEST(codegen_cg48, generic_record_decrement_new_body_1219) {
-    BEZEL_EXPECT_EQ(run(
+// ⚠ FLIPPED by fix #3978 (§25.1/§17.6, v0.295). Pre-fix comment (kept for
+// history): "#1219 / §25.2: `--` on a generic record — same fix path as
+// `++`." Same retirement, the `--` twin.
+BEZEL_TEST(codegen_cg48, generic_record_decrement_declaration_rejected_spec_25_1) {
+    auto r = runAot(
         "module M; "
         "record Box<T>(V: int) "
         "  public static method operator --(b: Box<T>): Box<T> => new Box<T>(b.V - 1); "
         "end Box; "
         "class C public static method Main(): int "
         "  var b: Box<string> := new Box<string>(20); b--; b--; return b.V; "
-        "end Main; end C;"), 18);
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagContainsOp(r, "operator `--` may not be overloaded (§25.1)"));
 }

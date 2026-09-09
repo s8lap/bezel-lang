@@ -257,12 +257,15 @@ BEZEL_TEST(getter_only_increment_2868,
         "  return 0;"))), 0);
 }
 
-// §17.6's category (1): "For a value-type operand whose type T overloads
-// `operator ++`, the statement `x++` is equivalent to `x := T.operator++(x)`".
-// The overload must still be selected — the new check must not intercept it.
+// ⚠ FLIPPED by fix #3978 (§25.1/§17.6, v0.295). Pre-fix comment (kept for
+// history): "§17.6's category (1) ... the statement `x++` is equivalent to
+// `x := T.operator++(x)`. The overload must still be selected." §25.1/§17.6
+// retire category (1) entirely at v0.295 — `Counter`'s `operator ++`
+// declaration is now rejected on its own, and `c++` is independently
+// rejected at the use.
 BEZEL_TEST(getter_only_increment_2868,
-           user_operator_increment_overload_still_selected_spec_17_6) {
-    BEZEL_EXPECT_EQ(run(runAot(
+           user_operator_increment_declaration_rejected_spec_25_1_issue_3978) {
+    const std::string program =
         "module M; "
         "record Counter(N: int) "
         "  public static method operator ++(c: Counter): Counter "
@@ -271,7 +274,11 @@ BEZEL_TEST(getter_only_increment_2868,
         "end Counter; "
         "class C public static method Main(): int "
         "  var c := new Counter(4); c++; return c.N; "
-        "end Main; end C;")), 5);
+        "end Main; end C;";
+    BEZEL_EXPECT_TRUE(errorSays(program,
+        {"operator `++` may not be overloaded", "§25.1"}));
+    BEZEL_EXPECT_TRUE(errorSays(program,
+        {"`++` is not defined on record type `Counter`", "§17.6"}));
 }
 
 // A plain local and a plain writable field are §17.6's other two operand

@@ -1148,9 +1148,17 @@ BEZEL_TEST(lifted_operators_rejected_3298, increment_on_nullable_record_with_ove
     BEZEL_EXPECT_TRUE(hit);
 }
 
-BEZEL_TEST(lifted_operators_rejected_3298, increment_on_nonnullable_record_with_overload_accepted) {
-    // The control: §17.6 admits `x++` on a record that overloads the operator.
-    // The nullability test above must not have swallowed that.
+// ⚠ FLIPPED by fix #3978 (§25.1/§17.6, v0.295). Pre-fix comment (kept for
+// history): "The control: §17.6 admits `x++` on a record that overloads the
+// operator. The nullability test above must not have swallowed that."
+// §25.1/§17.6 retire that admission entirely — `operator ++` is rejected at
+// its own declaration, and the non-nullable `m++` use is independently
+// rejected too. The test ABOVE this one
+// (`increment_on_nullable_record_with_overload_rejected`) is UNCHANGED: its
+// nullable-type reject fires before this branch is ever reached, so it is
+// unaffected by this fix either way.
+BEZEL_TEST(lifted_operators_rejected_3298,
+           increment_on_nonnullable_record_with_overload_rejected_spec_25_1_issue_3978) {
     auto r = parseSemaAll(
         "module M; "
         "record Counter(N: int) "
@@ -1162,7 +1170,18 @@ BEZEL_TEST(lifted_operators_rejected_3298, increment_on_nonnullable_record_with_
         "  m++; "
         "  return 0; "
         "end Main; end C;");
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    bool citedDecl = false, citedUse = false;
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        if (d.message.find("operator `++` may not be overloaded (§25.1)") !=
+            std::string::npos)
+            citedDecl = true;
+        if (d.message.find("`++` is not defined on record type `Counter`") !=
+            std::string::npos)
+            citedUse = true;
+    }
+    BEZEL_EXPECT_TRUE(citedDecl);
+    BEZEL_EXPECT_TRUE(citedUse);
 }
 
 // ---------------------------------------------------------------------------

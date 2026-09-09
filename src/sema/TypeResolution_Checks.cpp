@@ -2450,6 +2450,40 @@ void Resolver::checkOperatorGroups() {
                     "automatically");
                 continue;
             }
+            // fix #3978 (§25.1 / §17.6, v0.295): `++`/`--` are not in Appendix
+            // A.4's `OpToken` production at all (§25.1, verbatim: "`++` and
+            // `--` are not an `OpToken`, so such a declaration is a syntax
+            // error at the token"). The parser does not validate a declared
+            // operator's token against the grammar's closed set
+            // (`parseOperatorDeclBody` consumes whatever token follows
+            // `operator` unconditionally), so `operator ++`/`operator --`
+            // were silently accepted as ordinary overloads and dispatched
+            // through at both the codegen `opMethod` path and the sema
+            // `IncrementStmt` "does the type overload it" check below — the
+            // retired v0.236 reading. §25.1's own not-overloadable list,
+            // verbatim: "The increment and decrement statements `++` and
+            // `--` — built-in statements over the operand types §6.6's
+            // compound form admits (§17.6), not operators of the expression
+            // grammar; a type spells advancement as `x := x + 1` under its
+            // own `operator +`, or as a named method." Diagnosed here
+            // (alongside `not`/`!`/`??`/... and the compound-assignment
+            // tokens above) rather than as a parser syntax error: this is
+            // already the one place that validates a declared token against
+            // §25.1's exclusion list post-parse, which keeps the diagnostic
+            // able to name the declaring type and match its neighbors'
+            // remedy wording.
+            if (tok == "++" || tok == "--") {
+                ctx_.diagnostics().report(
+                    Severity::Error, m->declLoc,
+                    "operator `" + std::string(tok) +
+                    "` may not be overloaded (§25.1) — `++`/`--` are "
+                    "built-in statements over the operand types §6.6's "
+                    "compound form admits (§17.6), not operators of the "
+                    "expression grammar; a type spells advancement as "
+                    "`x := x + 1` under its own `operator +`, or as a "
+                    "named method");
+                continue;
+            }
             // §11.8 (v0.176, #807): a STATIC INTERFACE operator member is a
             // contract, not an overload declaration — its parameters are the
             // constrained type parameter (`(a: T, b: T)`), it is implicitly

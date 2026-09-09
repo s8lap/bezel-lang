@@ -62,6 +62,7 @@
 // #2859 (a NULLABLE-typed virtual property still cannot be written on any
 // spelling — out of scope here and untouched).
 
+#include "support/aot_result_asserts.hpp"
 #include "support/aot_support.hpp"
 #include "test_harness.hpp"
 
@@ -69,6 +70,7 @@
 
 namespace {
 
+using bezel::test::failedAtCompileTimeWithRealLocation;
 using bezel::test::runAot;
 using bezel::test::runAotOut;
 
@@ -444,13 +446,16 @@ BEZEL_TEST(codegen_property_increment_virtual_2858,
         "end Main; end C;")), 6);
 }
 
-// A user-defined `operator ++` on a record-typed FIELD. §17.6, verbatim: "For a
-// value-type operand whose type T overloads `operator ++`, the statement `x++`
-// is equivalent to `x := T.operator++(x)`". The new branch is gated on
-// `!opMethod` so this keeps the operator path. 10 before and after.
+// ⚠ FLIPPED by fix #3978 (§25.1/§17.6, v0.295). Pre-fix comment (kept for
+// history): "A user-defined `operator ++` on a record-typed FIELD ... The
+// new branch is gated on `!opMethod` so this keeps the operator path. 10
+// before and after." §25.1/§17.6 retire the `operator ++`/`operator --`
+// overload mechanism outright at v0.295 — `Counter`'s declaration is now
+// rejected on its own, and `h.C++` is independently rejected at the use
+// site regardless of the (now-illegal) declaration.
 BEZEL_TEST(codegen_property_increment_virtual_2858,
-           user_operator_increment_unchanged_25_3) {
-    BEZEL_EXPECT_EQ(run(runAot(
+           user_operator_increment_declaration_rejected_spec_25_1_issue_3978) {
+    auto r = runAot(
         "module M; "
         "record Counter "
         "  public V: int := 0; "
@@ -462,7 +467,19 @@ BEZEL_TEST(codegen_property_increment_virtual_2858,
         "class H  public C: Counter := new Counter(0);  end H; "
         "class C public static method Main(): int "
         "  using var h := new H(); h.C++; return h.C.V; "
-        "end Main; end C;")), 10);
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    bool citedDecl = false, citedUse = false;
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        if (d.message.find("operator `++` may not be overloaded (§25.1)") !=
+            std::string::npos)
+            citedDecl = true;
+        if (d.message.find("`++` is not defined on record type `Counter`") !=
+            std::string::npos)
+            citedUse = true;
+    }
+    BEZEL_EXPECT_TRUE(citedDecl);
+    BEZEL_EXPECT_TRUE(citedUse);
 }
 
 // A NON-VIRTUAL property and a NON-VIRTUAL auto-property have no vtable slot,

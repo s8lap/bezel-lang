@@ -8,11 +8,32 @@
 // (sadd.with.overflow on an aggregate / class pointer).
 //
 // Spec coverage: §17.6 (increment/decrement statement), §25 (operator overloads).
+//
+// ⚠ RETIRED by fix #3978 (§25.1/§17.6, v0.295). §25.1's not-overloadable
+// list, verbatim: "The increment and decrement statements `++` and `--` —
+// built-in statements over the operand types §6.6's compound form admits
+// (§17.6), not operators of the expression grammar." The dispatch-to-
+// overload behavior this file's tests pinned no longer exists —
+// `operator ++`/`operator --` is a compile error at its OWN declaration.
+// `record_operator_increment_postfix`, `record_operator_decrement_postfix`,
+// and `class_operator_increment_local_var` are FLIPPED to REJECT below.
+// `record_operator_increment_twice`, `record_operator_increment_in_loop`,
+// `record_operator_increment_in_loop_simple`, and
+// `record_operator_increment_loop_single_iter` are REMOVED (not flipped):
+// each declared the identical `Counter` shape as
+// `record_operator_increment_postfix` and differed only in how many times
+// the (now uncompilable) `c++` ran afterward — once the declaration itself
+// is rejected, all four fail at the exact same diagnostic, so keeping them
+// would be four duplicate pins of one rejection rather than four distinct
+// regression rows. The `builtin_int_increment_control` /
+// `builtin_long_decrement_control` CONTROLs are unaffected and unchanged.
 
+#include "support/aot_result_asserts.hpp"
 #include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration, P1)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
+using bezel::test::failedAtCompileTimeWithRealLocation;
 using bezel::test::runAot;
 
 namespace {
@@ -20,104 +41,51 @@ int run(const std::string& program) {
     auto r = runAot(program);
     return r.ran ? r.exitCode : -999;
 }
+
+bool diagContains498(const bezel::test::JitResult& r, const char* sub) {
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find(sub) != std::string::npos) return true;
+    return false;
+}
 } // namespace
 
-// §17.6 / §25: record with operator ++ — c++ increments via overload.
-// Equivalent: c := Counter.operator++(c); return c.value; → 1.
-BEZEL_TEST(codegen_498, record_operator_increment_postfix) {
-    BEZEL_EXPECT_EQ(run(
+// ⚠ FLIPPED by fix #3978 (§25.1/§17.6, v0.295). Pre-fix comment (kept for
+// history): "record with operator ++ — c++ increments via overload.
+// Equivalent: c := Counter.operator++(c); return c.value; → 1."
+BEZEL_TEST(codegen_498, record_operator_increment_declaration_rejected_spec_25_1) {
+    auto r = runAot(
         "module M; "
         "record Counter(value: int) "
         "  public static method operator ++(c: Counter): Counter => new Counter(c.value + 1); "
         "end Counter; "
         "class C public static method Main(): int "
         "  var c := new Counter(0); c++; return c.value; "
-        "end Main; end C;"), 1);
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagContains498(r, "operator `++` may not be overloaded (§25.1)"));
 }
 
-// §17.6 / §25: record with operator -- — c-- decrements via overload.
-// Equivalent: c := Counter.operator--(c); return c.value; → 9.
-BEZEL_TEST(codegen_498, record_operator_decrement_postfix) {
-    BEZEL_EXPECT_EQ(run(
+// ⚠ FLIPPED by fix #3978 (§25.1/§17.6, v0.295). Pre-fix comment (kept for
+// history): "record with operator -- — c-- decrements via overload.
+// Equivalent: c := Counter.operator--(c); return c.value; → 9."
+BEZEL_TEST(codegen_498, record_operator_decrement_declaration_rejected_spec_25_1) {
+    auto r = runAot(
         "module M; "
         "record Counter(value: int) "
         "  public static method operator --(c: Counter): Counter => new Counter(c.value - 1); "
         "end Counter; "
         "class C public static method Main(): int "
         "  var c := new Counter(10); c--; return c.value; "
-        "end Main; end C;"), 9);
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagContains498(r, "operator `--` may not be overloaded (§25.1)"));
 }
 
-// §17.6 / §25: operator ++ applied twice explicitly — value = 2.
-BEZEL_TEST(codegen_498, record_operator_increment_twice) {
-    BEZEL_EXPECT_EQ(run(
-        "module M; "
-        "record Counter(value: int) "
-        "  public static method operator ++(c: Counter): Counter => new Counter(c.value + 1); "
-        "end Counter; "
-        "class C public static method Main(): int "
-        "  var c := new Counter(0); c++; c++; return c.value; "
-        "end Main; end C;"), 2);
-}
-
-// §17.6 / §25: operator ++ in a loop — 5 iterations → value = 5.
-BEZEL_TEST(codegen_498, record_operator_increment_in_loop) {
-    BEZEL_EXPECT_EQ(run(
-        "module M; "
-        "record Counter(value: int) "
-        "  public static method operator ++(c: Counter): Counter => new Counter(c.value + 1); "
-        "end Counter; "
-        "class C public static method Main(): int "
-        "  var c := new Counter(0); "
-        "  var i := 0; "
-        "  while i < 5 do "
-        "    c++; i++; "
-        "  end;"
-        "  return c.value; "
-        "end Main; end C;"), 5);
-}
-
-// §17.6 / §25: operator ++ in a loop (only Counter, no int i) — 3 iterations → value = 3.
-BEZEL_TEST(codegen_498, record_operator_increment_in_loop_simple) {
-    BEZEL_EXPECT_EQ(run(
-        "module M; "
-        "record Counter(value: int) "
-        "  public static method operator ++(c: Counter): Counter => new Counter(c.value + 1); "
-        "end Counter; "
-        "class C public static method Main(): int "
-        "  var c := new Counter(0); "
-        "  var n := 3; "
-        "  while n > 0 do "
-        "    c++; n := n - 1; "
-        "  end;"
-        "  return c.value; "
-        "end Main; end C;"), 3);
-}
-
-// §17.6 / §25: operator ++ in a while loop, single iteration — value = 1.
-// (Separate from the 5-iteration test to verify that 1 iteration also works.)
-BEZEL_TEST(codegen_498, record_operator_increment_loop_single_iter) {
-    BEZEL_EXPECT_EQ(run(
-        "module M; "
-        "record Counter(value: int) "
-        "  public static method operator ++(c: Counter): Counter => new Counter(c.value + 1); "
-        "end Counter; "
-        "class C public static method Main(): int "
-        "  var c := new Counter(0); "
-        "  var i := 0; "
-        "  while i < 1 do "
-        "    c++; i++; "
-        "  end;"
-        "  return c.value; "
-        "end Main; end C;"), 1);
-}
-
-// §17.6 / §25: class with operator ++ — local class var, operator returns new instance.
-// After c++, c.value should be 1.
-// v0.201 (#2048): a fresh-producing operator's class-typed result is spelled
-// `owned Box` per the declaration-site static-return rule.
-BEZEL_TEST(codegen_498, class_operator_increment_local_var) {
-    BEZEL_EXPECT_EQ(run(
+// ⚠ FLIPPED by fix #3978 (§25.1/§17.6, v0.295). Pre-fix comment (kept for
+// history): "class with operator ++ — local class var, operator returns new
+// instance. After c++, c.value should be 1."
+BEZEL_TEST(codegen_498, class_operator_increment_declaration_rejected_spec_25_1) {
+    auto r = runAot(
         "module M; "
         "class Box "
         "  public value: int := 0; "
@@ -127,7 +95,9 @@ BEZEL_TEST(codegen_498, class_operator_increment_local_var) {
         "end Box; "
         "class C public static method Main(): int "
         "  var b := new Box(); b.value := 0; b++; return b.value; "
-        "end Main; end C;"), 1);
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagContains498(r, "operator `++` may not be overloaded (§25.1)"));
 }
 
 // CONTROL: built-in int x++ still works — must not regress.

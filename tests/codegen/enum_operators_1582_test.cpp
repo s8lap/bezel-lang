@@ -13,10 +13,12 @@
 // all) would produce, so a passing test proves dispatch actually reached the
 // user's declaration rather than some other codegen path.
 
+#include "support/aot_result_asserts.hpp"
 #include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration, P1)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
+using bezel::test::failedAtCompileTimeWithRealLocation;
 using bezel::test::runAot;
 
 namespace {
@@ -113,11 +115,20 @@ BEZEL_TEST(codegen_enum_operators_1582,
         "end Main; end C;"), 1);
 }
 
-// §17.6/§25: `p++` on an enum dispatches to `operator ++` (postfix-only,
+// ⚠ FLIPPED by fix #3978 (§25.1/§17.6, v0.295). Pre-fix comment (kept for
+// history): "`p++` on an enum dispatches to `operator ++` (postfix-only,
 // statement-only, §25.2) and writes the result back — two increments from
-// `Low` (0) land on `High` (2).
-BEZEL_TEST(codegen_enum_operators_1582, postfix_increment_spec_17_6_25_2) {
-    BEZEL_EXPECT_EQ(run(
+// `Low` (0) land on `High` (2)." §25.1 (v0.295), verbatim, in the *not
+// overloadable* list: "The increment and decrement statements `++` and
+// `--` — built-in statements over the operand types §6.6's compound form
+// admits (§17.6), not operators of the expression grammar." The
+// declaration itself is now a compile error (TypeResolution_Checks.cpp's
+// `checkOperatorGroups`, which already rejects `not`/`!`/`??`/... by the
+// same mechanism) — this row now pins the rejection instead of the
+// dispatch value.
+BEZEL_TEST(codegen_enum_operators_1582,
+           postfix_increment_declaration_rejected_spec_25_1_issue_3978) {
+    auto r = runAot(
         "module M; "
         "enum Priority Low, Medium, High; "
         "  public static method operator ++(p: Priority): Priority => Priority(int(p) + 1); "
@@ -126,7 +137,14 @@ BEZEL_TEST(codegen_enum_operators_1582, postfix_increment_spec_17_6_25_2) {
         "  var p: Priority := Priority.Low; "
         "  p++; p++; "
         "  return int(p); "
-        "end Main; end C;"), 2);
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    bool citedDecl = false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("operator `++` may not be overloaded (§25.1)") !=
+            std::string::npos)
+            citedDecl = true;
+    BEZEL_EXPECT_TRUE(citedDecl);
 }
 
 // §10.4: an enum operator overload coexists with an ordinary instance method

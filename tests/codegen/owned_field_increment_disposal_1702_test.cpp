@@ -32,12 +32,35 @@
 //
 // Spec citations: §17.6 (increment/decrement on an owned class field, v0.185),
 // §28.7 (drop-on-overwrite, v0.161), §25 (operator overloading).
+//
+// ⚠ RETIRED by fix #3978 (§25.1/§17.6, v0.295). §25.1's not-overloadable list,
+// verbatim: "The increment and decrement statements `++` and `--` — built-in
+// statements over the operand types §6.6's compound form admits (§17.6), not
+// operators of the expression grammar." `operator ++`/`operator --` are no
+// longer admissible at ALL — the drop-on-overwrite machinery this file
+// exercises (the `opMethod` branch of `LlvmBackend_Stmts.cpp`'s IncrementStmt
+// handler, and `lowerOwnedClassFieldStore`'s call from it) is now dead code:
+// no program can reach it, because `Counter`'s own `operator ++`/`operator --`
+// declaration is rejected before any `_c++`/`_c--`/`c++` use is ever lowered.
+// `field_increment_disposes_displaced_spec_28_7_v0_185`,
+// `field_decrement_disposes_displaced_spec_28_7_v0_185`, and
+// `owned_local_increment_still_disposes_spec_28_7` all shared `kCounterHdr`
+// (which declares BOTH `operator ++` and `operator --`), so all three fail
+// identically at the SAME declaration-site diagnostic regardless of which
+// operator or which lvalue category (field vs. local) they exercised —
+// consolidated into ONE reject test below rather than kept as three
+// duplicate pins of the same rejection. The soundness CONTROL
+// (`non_owned_int_field_increment_unchanged_spec_17_6`, no `Counter`
+// involved at all) is unaffected and unchanged.
 
 #include <string>
 
-#include "support/aot_support.hpp"   // runAotChecked — AOT + ASan/LSan oracle
+#include "support/aot_result_asserts.hpp"
+#include "support/aot_support.hpp"   // runAot / runAotChecked — AOT harness
 #include "test_harness.hpp"
 
+using bezel::test::failedAtCompileTimeWithRealLocation;
+using bezel::test::runAot;
 using bezel::test::runAotChecked;
 
 namespace {
@@ -52,6 +75,12 @@ int run(const std::string& src) {
 
 void expectDisposedAndLeakFree(const std::string& source, int expectedExitCode) {
     BEZEL_EXPECT_EQ(run(source), expectedExitCode);
+}
+
+bool diagContains1702(const bezel::test::JitResult& r, const char* sub) {
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find(sub) != std::string::npos) return true;
+    return false;
 }
 
 // Counter: ctor +1 / dtor -1; operator ++/-- return a fresh owned Counter.
@@ -71,49 +100,36 @@ const std::string kCounterHdr =
 }  // namespace
 
 
-// §17.6 / §28.7 / #1702: `_field++` on an owned class field disposes the
-// displaced value exactly once. Box holds `owned _c: Counter` (ctor sets it);
-// three `_c++` displace three previous Counters — the ctor's Counter(0), then
-// Counter(1), then Counter(2). Without the fix each displaced value LEAKS (LSan
-// fires → -999). With the fix each is disposed exactly once; only Counter(3) is
-// live inside the scope (Counter.n == 1), and it is disposed when the Box's
-// `using var` scope ends → Counter.n == 0.
+// ⚠ CONSOLIDATED by fix #3978 (§25.1/§17.6, v0.295) from three separate
+// pre-fix tests (`field_increment_disposes_displaced_spec_28_7_v0_185`,
+// `field_decrement_disposes_displaced_spec_28_7_v0_185`, and
+// `owned_local_increment_still_disposes_spec_28_7`, kept below in this
+// comment for history): each pinned that `_c++`/`_c--`/plain-local `c++`
+// through `Counter`'s `operator ++`/`operator --` disposed the displaced
+// value exactly once. §25.1/§17.6 retire the overload mechanism outright —
+// `Counter`'s declaration is rejected on its own, so every one of those
+// three programs now fails identically at the SAME declaration-site
+// diagnostic (the field/local/op distinction they exercised is moot once
+// the declaration itself cannot compile).
 BEZEL_TEST(owned_field_increment_1702,
-           field_increment_disposes_displaced_spec_28_7_v0_185) {
-    expectDisposedAndLeakFree(kCounterHdr +
+           counter_operator_declaration_rejected_spec_25_1_issue_3978) {
+    auto r = runAot(kCounterHdr +
         "class Box "
         "  public owned _c: Counter; "
         "  public constructor() _c := new Counter(0); end constructor; "
         "  public method Bump() _c++; end Bump; "
-        "  destructor end destructor; "
-        "end Box; "
-        "class C public static method Main(): int "
-        "  do using var b := new Box(); "
-        "    b.Bump(); b.Bump(); b.Bump(); "
-        "    if Counter.n <> 1 then return 101; end; "  // only Counter(3) live
-        "  end; "                                       // Box disposes _c
-        "  return Counter.n; "                          // 0
-        "end Main; end C;", 0);
-}
-
-// §17.6 / §28.7 / #1702: the decrement form `_field--` behaves identically — the
-// displaced value is disposed exactly once, leak-clean.
-BEZEL_TEST(owned_field_increment_1702,
-           field_decrement_disposes_displaced_spec_28_7_v0_185) {
-    expectDisposedAndLeakFree(kCounterHdr +
-        "class Box "
-        "  public owned _c: Counter; "
-        "  public constructor() _c := new Counter(10); end constructor; "
         "  public method Dec() _c--; end Dec; "
         "  destructor end destructor; "
         "end Box; "
         "class C public static method Main(): int "
-        "  do using var b := new Box(); "
-        "    b.Dec(); b.Dec(); "                         // Counter(10),(9) disposed
-        "    if Counter.n <> 1 then return 101; end; "   // only Counter(8) live
+        "  do var c := new Counter(0); c++; c.Dispose(); "
+        "    using var b := new Box(); b.Bump(); b.Dec(); "
         "  end; "
-        "  return Counter.n; "                           // 0
-        "end Main; end C;", 0);
+        "  return Counter.n; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagContains1702(r, "operator `++` may not be overloaded (§25.1)"));
+    BEZEL_EXPECT_TRUE(diagContains1702(r, "operator `--` may not be overloaded (§25.1)"));
 }
 
 // CONTROL (soundness): a NON-owned `int` field `_count++` must be untouched by
@@ -137,17 +153,11 @@ BEZEL_TEST(owned_field_increment_1702,
         "end Main; end C;", 3);
 }
 
-// CONTROL (regression guard for the fallback path): an owned class LOCAL `c++`
-// must still dispose the displaced value through disposeDisplacedOwnedClassLocal
-// — lowerOwnedClassFieldStore returns false for a local, so the store falls
-// through to the local path unchanged. Two `c++` displace Counter(0),(1); only
-// Counter(2) is live (n == 1), then explicitly disposed. Leak-clean.
-BEZEL_TEST(owned_field_increment_1702,
-           owned_local_increment_still_disposes_spec_28_7) {
-    expectDisposedAndLeakFree(kCounterHdr +
-        "class C public static method Main(): int "
-        "  do var c := new Counter(0); c++; c++; "
-        "    var m := Counter.n; c.Dispose(); return m; "  // 1
-        "  end; "
-        "end Main; end C;", 1);
-}
+// ⚠ REMOVED by fix #3978 (§25.1/§17.6, v0.295): the pre-fix
+// `owned_local_increment_still_disposes_spec_28_7` control ("an owned class
+// LOCAL `c++` must still dispose the displaced value through
+// disposeDisplacedOwnedClassLocal ... Leak-clean") is folded into
+// `counter_operator_declaration_rejected_spec_25_1_issue_3978` above — it
+// used the same `kCounterHdr` `Counter` class and so fails at the identical
+// declaration-site diagnostic; kept as one program there rather than a
+// fourth duplicate rejection pin.

@@ -26,9 +26,16 @@
 // lookup at LlvmBackend_Stmts.cpp ~line 1158), a §17.6 diagnostic is
 // reported and codegen never runs on the operand. Value-type numeric
 // primitives keep their built-in `++` (§17.6: "For built-in numeric
-// types, `x++` is equivalent to `x := x + 1`"), and a record/class that
-// DOES overload `++` still resolves through the overload (the §17.6
-// `Counter` example, §25.3) — both proven by the ACCEPT controls below.
+// types, `x++` is equivalent to `x := x + 1`").
+//
+// ⚠ RETIRED by fix #3978 (§25.1/§17.6, v0.295): rows 11/12 below pinned "a
+// record/class that DOES overload `++` still resolves through the
+// overload (the §17.6 `Counter` example, §25.3)" as an ACCEPT control —
+// that was the v0.236 reading of §17.6, which v0.295 retires outright:
+// `++`/`--` are NEVER user-overloadable (§25.1), so `operator ++` is now
+// rejected at its own declaration too. Rows 11/12 are FLIPPED to REJECT
+// (see their own comments) rather than removed, so the file keeps a
+// regression pin on the retired escape hatch.
 //
 // Tests (REJECT = the bug; ACCEPT = no-false-reject control):
 //   REJECT shapes (§17.6 violation — was an ICE pre-fix):
@@ -44,12 +51,11 @@
 //    8. `d++` on a double local
 //    9. `ch++` on a char local
 //   10. `arr[0]++` on an inline-array int element
-//   11. `c++` on a record that overloads `operator ++` (the §17.6 / §25.3
-//       `Counter` shape — proves the overload-lookup path still admits a
-//       reference... record value type with an overload)
-//   12. `c++` on a CLASS that overloads `operator ++` (the literal §17.6
-//       reference-type-with-overload admit — the primary no-false-reject
-//       axis for the reference-type branch)
+//   REJECT shapes added by fix #3978 (§25.1/§17.6, v0.295 — the retired
+//   v0.236 escape hatch, formerly rows 11/12's ACCEPT controls):
+//   11. `c++` on a record that overloads `operator ++` — now REJECTED at
+//       both the declaration (§25.1) and the use (§17.6)
+//   12. `c++` on a CLASS that overloads `operator ++` — likewise REJECTED
 
 #include "support/sema_support.hpp"
 #include "test_harness.hpp"
@@ -263,13 +269,15 @@ BEZEL_TEST(increment_reference_type_2585,
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// §17.6 / §25.3 (the `Counter` example): a RECORD that overloads
-// `operator ++` — `c++` desugars to `c := Counter.operator++(c)`. The
-// overload-lookup path MUST still admit this (the new check skips when
-// `hasOverload` is true). This is the canonical no-false-reject guard
-// for the value-type-with-overload axis.
+// ⚠ FLIPPED by fix #3978 (§25.1/§17.6, v0.295). Pre-fix comment (kept for
+// history): "a RECORD that overloads `operator ++` ... the overload-lookup
+// path MUST still admit this." That reading is the v0.236 rule §25.1/§17.6
+// RETIRE at v0.295: `++`/`--` are never user-overloadable, so `operator ++`
+// is rejected at its OWN declaration (checkOperatorGroups, §25.1) and `c++`
+// is rejected independently at the use site too (§17.6) — this row now pins
+// BOTH rejections on the same program that used to compile clean.
 BEZEL_TEST(increment_reference_type_2585,
-           record_with_operator_increment_accepted_spec_17_6_spec_25_3) {
+           record_with_operator_increment_rejected_spec_25_1_issue_3978) {
     auto r = parseSemaAll(
         "module M; "
         "record Counter(value: int) "
@@ -283,18 +291,19 @@ BEZEL_TEST(increment_reference_type_2585,
         "    return c.value; "
         "  end Main; "
         "end C;");
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasMsg(r, "operator `++` may not be overloaded (§25.1)"));
+    BEZEL_EXPECT_TRUE(hasMsg(r, "`++` is not defined on record type `Counter`"));
 }
 
-// §17.6 (the reference-type admit clause): a CLASS that overloads
-// `operator ++` — "Overloading `++`/`--` on a class is permitted but
-// uncommon" — `c++` MUST still compile. This is the PRIMARY
-// no-false-reject axis for the new reference-type branch: a class is a
-// reference type, so the new check FIRES, finds the user-declared
-// overload, and admits the statement. A false reject here would break
-// the §17.6 class-overload idiom the spec explicitly admits.
+// ⚠ FLIPPED by fix #3978 (§25.1/§17.6, v0.295). Pre-fix comment (kept for
+// history): "a CLASS that overloads `operator ++` ... `c++` MUST still
+// compile ... A false reject here would break the §17.6 class-overload
+// idiom the spec explicitly admits." §25.1/§17.6 retire that idiom entirely
+// at v0.295 — this is now the PRIMARY reject axis for the reference-type
+// branch, not an accept control.
 BEZEL_TEST(increment_reference_type_2585,
-           class_with_operator_increment_accepted_spec_17_6) {
+           class_with_operator_increment_rejected_spec_25_1_issue_3978) {
     auto r = parseSemaAll(
         "module M; "
         "class Counter "
@@ -310,7 +319,9 @@ BEZEL_TEST(increment_reference_type_2585,
         "    return c.value; "
         "  end Main; "
         "end C;");
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasMsg(r, "operator `++` may not be overloaded (§25.1)"));
+    BEZEL_EXPECT_TRUE(hasMsg(r, "`++` is not defined on reference type `Counter`"));
 }
 
 // =========================================================================
@@ -345,9 +356,13 @@ BEZEL_TEST(increment_reference_type_2585,
 // also fire for a value-type RECORD (TypeDeclKind::Record) operand that
 // has no `operator ++`/`operator --` overload, with a §17.6 diagnostic
 // whose wording names the value-type-record category. Numeric primitives
-// keep their built-in `++` (the check's `default` branch skips them); a
+// keep their built-in `++` (the check's `default` branch skips them).
+//
+// ⚠ RETIRED by fix #3978 (§25.1/§17.6, v0.295): row 5 below pinned "a
 // record that DOES overload `++` (§25.3 `Counter`) is admitted by the
-// `hasOverload` guard — the key false-reject axis proven below.
+// `hasOverload` guard — the key false-reject axis" as an ACCEPT control.
+// v0.295 retires that guard outright — `++`/`--` are NEVER
+// user-overloadable — so row 5 is FLIPPED to REJECT below.
 //
 // Tests (REJECT = the bug; ACCEPT = no-false-reject control):
 //   REJECT shapes (§17.6 violation — was an ICE pre-fix):
@@ -358,8 +373,8 @@ BEZEL_TEST(increment_reference_type_2585,
 //       non-local target too — same code path, different lvalue category)
 //   ACCEPT shapes (no false reject — a regression here is worse than #2599):
 //    4. `i++` on an int local (built-in numeric — §17.6 category (2))
+//   REJECT shape added by fix #3978 (formerly row 5's ACCEPT control):
 //    5. `c++` on a record that overloads `operator ++` (§25.3 `Counter` —
-//       §17.6 category (1); the KEY false-reject axis: a record WITH an
 //       overload MUST still compile)
 // =========================================================================
 
@@ -445,14 +460,14 @@ BEZEL_TEST(increment_record_value_type_2599,
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// §17.6 / §25.3 (the `Counter` example): a RECORD that overloads
-// `operator ++` — `c++` desugars to `c := Counter.operator++(c)` (§17.6
-// category (1)). This is the KEY no-false-reject axis for the #2599
-// record branch: the new check FIRES on the record operand, finds the
-// user-declared overload, and admits the statement. A false reject here
-// would break the §25.3 `Counter` idiom the spec explicitly demonstrates.
+// ⚠ FLIPPED by fix #3978 (§25.1/§17.6, v0.295). Pre-fix comment (kept for
+// history): "the KEY no-false-reject axis for the #2599 record branch ...
+// A false reject here would break the §25.3 `Counter` idiom." §25.1/§17.6
+// retire the idiom at v0.295 (this is the THIRD occurrence of the same
+// now-illegal shape in this file — #2585's suite above pins the same
+// program's rejection with the record and class variants).
 BEZEL_TEST(increment_record_value_type_2599,
-           record_with_operator_increment_accepted_spec_17_6_spec_25_3_issue_2599) {
+           record_with_operator_increment_rejected_spec_25_1_issue_3978) {
     auto r = parseSemaAll(
         "module M; "
         "record Counter(value: int) "
@@ -466,5 +481,7 @@ BEZEL_TEST(increment_record_value_type_2599,
         "    return c.value; "
         "  end Main; "
         "end C;");
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasMsg(r, "operator `++` may not be overloaded (§25.1)"));
+    BEZEL_EXPECT_TRUE(hasMsg(r, "`++` is not defined on record type `Counter`"));
 }
