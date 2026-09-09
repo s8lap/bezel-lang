@@ -39,10 +39,19 @@ namespace {
 // returning `Task<Conn>` (class Conn — Pattern A) and `OwningTask<Conn>`
 // (Pattern B, for the regression guard below), plus a class C hosting the
 // SYNCHRONOUS method under test `M`. `Use(c: Conn)` is a borrow-consuming
-// helper for the argument-position tests; `t` is an `owned` field of type
-// `Task<Conn>` for the owned-field-receiver test. Mirrors the `wrap` helper
+// helper for the argument-position tests. Mirrors the `wrap` helper
 // in async_ownership_test.cpp, minus `async`. `sig` lets a test override the
 // signature of `M` to add a parameter (owned or borrow).
+//
+// Post-#4025 §7.9 (v0.295, cycles-6/7): a non-nullable field of any
+// heap-pointer builtin (Mutex, Semaphore, Task<T>, IEnumerable<T>, …)
+// requires an explicit initializer or ctor assignment; pre-fix such a
+// field declared `owned t: Task<Conn>;` with no initializer silently
+// compiled and SIGSEGV'd on first access. The default helper omits `t`
+// entirely so the ten tests that don't read `t` keep their original
+// fixture. `wrapField` (below) is reserved for `result_owned_field_clean`,
+// which exercises the `t` admitted owning-location rule, and supplies the
+// initializing ctor `#4025` requires.
 std::string wrap(const std::string& body, const std::string& sig = "M()") {
     return std::string("module M; "
         "class Conn end Conn; "
@@ -57,7 +66,35 @@ std::string wrap(const std::string& body, const std::string& sig = "M()") {
         "  method MakeInt(): Task<int>; "
         "end Producer; "
         "class C(p: Producer) "
+        "  public method Use(c: Conn) end Use; "
+        "  public method ") + sig + " " + body + " end M; "
+        "end C;";
+}
+
+// fixture for the single test that exercises an `owned t: Task<Conn>`
+// field as an admitted §30.3/§30.5 owning location for `.Result`. Per
+// #4025 the field has a post-#4025 strict-storage obligation — Task<T>
+// is a heap-pointer builtin (§7.9 v0.295), so a non-nullable field of
+// that type MUST be initialized (no default exists). Drop the primary
+// ctor and supply an explicit one that captures `p` as a public field
+// and binds `x` (an owned `Task<Conn>` parameter) into `t`. The test
+// only parses/typechecks (`parseAndCheckOwnership`); instantiation is
+// not exercised, so this ctor needs to compile, not actually run.
+std::string wrapField(const std::string& body, const std::string& sig = "M()") {
+    return std::string("module M; "
+        "class Conn end Conn; "
+        "interface Producer "
+        "  method MakeShared(): Task<Conn>; "
+        "  method MakeOwned(): OwningTask<Conn>; "
+        "  method MakeInt(): Task<int>; "
+        "end Producer; "
+        "class C "
+        "  public p: Producer; "
         "  public owned t: Task<Conn>; "
+        "  public constructor(prod: Producer, owned x: Task<Conn>) "
+        "    p := prod; "
+        "    t := x; "
+        "  end constructor; "
         "  public method Use(c: Conn) end Use; "
         "  public method ") + sig + " " + body + " end M; "
         "end C;";
@@ -184,7 +221,7 @@ BEZEL_TEST(result_own_patternA, result_borrow_param_task_clean) {
 // An `owned` FIELD of `this` is an admitted owning location — its lifetime
 // spans `this`'s lifetime. // per §30.3, §30.5
 BEZEL_TEST(result_own_patternA, result_owned_field_clean) {
-    auto r = parseAndCheckOwnership(wrap(
+    auto r = parseAndCheckOwnership(wrapField(
         "var r := t.Result; "
         "Use(r); "));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
