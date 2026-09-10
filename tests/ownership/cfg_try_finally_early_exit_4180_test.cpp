@@ -125,11 +125,17 @@ const std::string kMaybeConsumedConsumeMsg =
 
 // ===========================================================================
 // Reject-side rows (parseAndCheckOwnership) — the measured bug itself.
-// FAIL-WITHOUT: each compiles with rc=0 and ZERO diagnostics about `x` on
-// the pre-fix compiler (the finally's own move of `x` was analysis-
-// unreachable); heap-use-after-frees under ASan on first execution (Row 1
-// measured directly — see this fix's commit body for the ASan trace).
-// PASS-WITH: correctly rejected at compile time, with a real location.
+// MECHANICALLY VERIFIED (§3/§20): reverting src/flow/CFG.cpp + src/ownership/
+// Ownership.cpp to this commit's parent with this test file kept — 3 of these
+// 4 rows FAIL WITHOUT the fix (Row 1 `return`: both assertions fail, rc=0
+// with zero diagnostics about `x` pre-fix — Row 1 is also the shape measured
+// directly under ASan, heap-use-after-free on first execution, see the
+// commit body; Row 2 `break`: the STRONGER `kAlreadyMovedMsg` assertion
+// fails pre-fix, though the row already rejected for an unrelated, narrower
+// reason — see Row 2's own comment; Row 4 catch-arm-throw: both assertions
+// fail pre-fix). Row 3 `continue` passes IDENTICALLY on both sides — NOT a
+// fail-without row; see its own comment for why. PASS-WITH: all 4 correctly
+// rejected post-fix, with a real location.
 // ===========================================================================
 
 // Row 1: `return` — the issue's own filed repro, non-lambda (the real
@@ -164,18 +170,19 @@ BEZEL_TEST(cfg_try_finally_early_exit_4180,
 
 // Row 2: `break` — the same shape, early exit is a `break` out of the
 // enclosing loop instead of a `return`. Measured pre-fix: REJECTED, but for
-// the WRONG (narrower) reason — "owned value in `x` would be dropped here
-// without disposal", pointing at the declaration, not the finally's
+// the WRONG (narrower) reason — only "owned value in `x` would be dropped
+// here without disposal", pointing at the declaration, not the finally's
 // maybe-consumed move (visitWhile wires both a true- and false-condition
 // edge even for a literal `while true`, so the unreachable false edge's
 // pre-loop state pollutes the after-loop merge — a separate, narrower
 // artifact #4180's issue flagged as "circumstantial", not independently
-// root-caused there). Post-fix: correctly rejected with BOTH the definite
-// "already moved out" (the finally's real double-move) and the discharge
-// diagnostic. This row pins the STRONGER, now-correct diagnostic; it does
-// not assert the pre-fix wording (already superseded, not a FAIL-WITHOUT
-// this row needs — see Row 1 for the mechanically proven fail-without).
-// per §21.5, §28.3, v0.298
+// root-caused there). This IS a FAIL-WITHOUT row: `kAlreadyMovedMsg` (the
+// finally's real double-move) is NOT among the pre-fix diagnostics —
+// mechanically confirmed by reverting src/flow/CFG.cpp + src/ownership/
+// Ownership.cpp to this commit's parent with this test file kept (see the
+// commit body). Post-fix: correctly rejected with BOTH the definite
+// "already moved out" and the discharge diagnostic; this row asserts the
+// STRONGER, now-present message. per §21.5, §28.3, v0.298
 BEZEL_TEST(cfg_try_finally_early_exit_4180,
            break_through_active_finally_rejects_double_move_21_5) {
     std::string src =
@@ -201,10 +208,17 @@ BEZEL_TEST(cfg_try_finally_early_exit_4180,
 }
 
 // Row 3: `continue` — same shape, early exit is `continue` (the loop
-// condition then re-evaluates false and the loop ends normally). Post-fix:
-// correctly rejected via the maybe-consumed join (the continue-routed
-// finally-clone's move joins with the loop header's own entry state).
-// per §21.5, §28.3, v0.298
+// condition then re-evaluates false and the loop ends normally). NOT a
+// FAIL-WITHOUT row (measured, do not assume): this exact maybe-consumed
+// diagnostic already fires on the pre-fix compiler too — the SAME
+// `visitWhile` "both edges wired even for a literal condition" artifact
+// noted on Row 2 incidentally produces a (differently-reasoned, but
+// textually matching one of these two messages) maybe-consumed rejection
+// for the continue shape specifically, independent of this fix. This is a
+// reject-side row that passes IDENTICALLY on both sides (§20): kept as a
+// control pinning that the now-correctly-routed finally continues to
+// produce a real diagnostic here, not a regression check for this
+// specific fix. per §21.5, §28.3, v0.298
 BEZEL_TEST(cfg_try_finally_early_exit_4180,
            continue_through_active_finally_rejects_double_move_21_5) {
     std::string src =
