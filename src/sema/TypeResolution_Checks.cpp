@@ -3672,9 +3672,15 @@ static bool checkNestedBorrowBearingSlot(
 // case; here the callee already resolved to one EXACT case, so there is
 // no ambiguity to guess through. See the definition below, just after
 // `checkStaticReadonlyRecordInit`.
+// fix #4133 (§9.7, v0.295): `choiceTy` is the CONCRETE instantiation TypeRef
+// of the choice being constructed (carries `genericArgs` when the choice is
+// generic) — needed to substitute a bare-type-parameter payload field
+// through the actual instantiation, exactly as the record arm does. See the
+// definition for the full rationale.
 static bool checkStaticReadonlyChoiceCaseInit(
     SemaContext& ctx, const ast::CallExpr& ce, const ChoiceCaseSymbol* cs,
-    SourceLocation loc, std::string_view what, std::string_view name);
+    const TypeRef* choiceTy, SourceLocation loc, std::string_view what,
+    std::string_view name);
 
 // §22.12 rule 3/4 (v0.262, #3272): classify a CONCRETE substitution at the
 // instantiation site for a `static readonly` bare-parameter declaration,
@@ -11755,8 +11761,8 @@ bool checkNestedBorrowBearingSlot(
                 Symbol* calleeSym = ctx.exprSymbol(*nestedCall->callee);
                 if (auto* ccs = dynamic_cast<ChoiceCaseSymbol*>(calleeSym))
                     return checkStaticReadonlyChoiceCaseInit(ctx, *nestedCall,
-                                                             ccs, loc, what,
-                                                             name);
+                                                             ccs, pft, loc,
+                                                             what, name);
             }
         }
         return false;
@@ -11853,8 +11859,31 @@ bool checkStaticReadonlyRecordInit(
             recordPositionalFieldSymbols(ts);
         std::size_t arity = fields.size();
         if (nx.args.size() != arity) return false;  // mismatch — typecheck reports
+        // fix #4133 (§9.7, v0.295): `storageComponentType` reads a field's
+        // type off the DECLARATION side, so a generic record's field
+        // declared as a bare type parameter (`V: T` in `record
+        // Box<T>(V: T)`) resolves to the unsubstituted `T` regardless of
+        // what THIS instantiation (`declTy`) actually binds `T` to —
+        // `staticReadonlyFieldIsReferenceTyped` can then never classify it
+        // as reference-typed, no matter how reference-heavy the concrete
+        // instantiation is. Seed a `common::RecordSubstEnv` from `ts`'s own
+        // generic parameters against `declTy`'s concrete `genericArgs` —
+        // the SAME machinery fix #4002 uses for the identically-shaped
+        // `where T: new()` gap (this file's `where T: new()` arm, ~line
+        // 7543) — and substitute each field's type through it before
+        // classifying. `seedRecordSubstEnv`/`resolveRecordFieldSubst` are
+        // no-ops (empty map / unchanged `ft`) for a non-generic record or
+        // an unresolved/uninstantiated use, so this is exactly the prior
+        // behaviour whenever there is nothing to substitute.
+        common::RecordSubstEnv env;
+        common::seedRecordSubstEnv(*ts, *declTy, /*incoming=*/nullptr, env);
+        const common::RecordSubstEnv* fieldEnv =
+            env.map.empty() ? nullptr : &env;
         for (std::size_t i = 0; i < arity; ++i) {
-            const TypeRef* pft = storageComponentType(fields[i], ctx);
+            const TypeRef* rawPft = storageComponentType(fields[i], ctx);
+            if (!rawPft) continue;
+            const TypeRef* pft =
+                common::resolveRecordFieldSubst(rawPft, fieldEnv).ty;
             if (!pft) continue;
             const ast::Expr* argExpr = nx.args[i].value.get();
             if (staticReadonlyFieldIsReferenceTyped(pft, ctx)) {
@@ -11888,6 +11917,13 @@ bool checkStaticReadonlyRecordInit(
         // resolution we can only conservatively accept (the constructor's
         // shape must be inspected case by case, which a value-site check
         // before typecheck could not do).
+        // fix #4133 (§9.7, v0.295): same generic-substitution gap as the
+        // record arm above, applied to a choice's payload fields — see that
+        // arm's comment for the full rationale.
+        common::RecordSubstEnv env;
+        common::seedRecordSubstEnv(*ts, *declTy, /*incoming=*/nullptr, env);
+        const common::RecordSubstEnv* fieldEnv =
+            env.map.empty() ? nullptr : &env;
         for (const ChoiceCaseSymbol* cs : choiceCasesOf(ts)) {
             if (!cs->caseDecl) continue;
             std::size_t arity = cs->caseDecl->payload.size();
@@ -11895,7 +11931,10 @@ bool checkStaticReadonlyRecordInit(
             for (std::size_t i = 0; i < arity; ++i) {
                 const ast::Param& pf = cs->caseDecl->payload[i];
                 if (!pf.type) continue;
-                const TypeRef* pft = ctx.resolvedType(*pf.type);
+                const TypeRef* rawPft = ctx.resolvedType(*pf.type);
+                if (!rawPft) continue;
+                const TypeRef* pft =
+                    common::resolveRecordFieldSubst(rawPft, fieldEnv).ty;
                 if (!pft) continue;
                 const ast::Expr* argExpr = nx.args[i].value.get();
                 if (staticReadonlyFieldIsReferenceTyped(pft, ctx)) {
@@ -11947,14 +11986,27 @@ bool checkStaticReadonlyRecordInit(
 // reported.
 bool checkStaticReadonlyChoiceCaseInit(
     SemaContext& ctx, const ast::CallExpr& ce, const ChoiceCaseSymbol* cs,
-    SourceLocation loc, std::string_view what, std::string_view name) {
+    const TypeRef* choiceTy, SourceLocation loc, std::string_view what,
+    std::string_view name) {
     if (!cs || !cs->caseDecl) return false;
     std::size_t arity = cs->caseDecl->payload.size();
     if (ce.args.size() != arity) return false;  // mismatch — typecheck reports
+    // fix #4133 (§9.7, v0.295): identical generic-substitution gap as
+    // checkStaticReadonlyRecordInit's record/choice arms — a case payload
+    // declared as a bare type parameter never saw what a concrete
+    // instantiation (`choiceTy`) actually binds it to. `cs->parent` is the
+    // choice's own declaring TypeSymbol (its `genericParams`); `choiceTy`
+    // carries the instantiation's concrete `genericArgs`.
+    common::RecordSubstEnv env;
+    if (auto* choiceTs = dynamic_cast<TypeSymbol*>(cs->parent); choiceTs && choiceTy)
+        common::seedRecordSubstEnv(*choiceTs, *choiceTy, /*incoming=*/nullptr, env);
+    const common::RecordSubstEnv* fieldEnv = env.map.empty() ? nullptr : &env;
     for (std::size_t i = 0; i < arity; ++i) {
         const ast::Param& pf = cs->caseDecl->payload[i];
         if (!pf.type) continue;
-        const TypeRef* pft = ctx.resolvedType(*pf.type);
+        const TypeRef* rawPft = ctx.resolvedType(*pf.type);
+        if (!rawPft) continue;
+        const TypeRef* pft = common::resolveRecordFieldSubst(rawPft, fieldEnv).ty;
         if (!pft) continue;
         const ast::Expr* argExpr = ce.args[i].value.get();
         if (!argExpr) continue;  // discard argument: no source to inspect
@@ -12138,7 +12190,7 @@ void Resolver::checkStaticReadonlyNullSource() {
                     rt->declaration->kind == ast::TypeDeclKind::Choice) {
                     Symbol* calleeSym = ctx_.exprSymbol(*ce->callee);
                     if (auto* ccs = dynamic_cast<ChoiceCaseSymbol*>(calleeSym))
-                        checkStaticReadonlyChoiceCaseInit(ctx_, *ce, ccs,
+                        checkStaticReadonlyChoiceCaseInit(ctx_, *ce, ccs, rt,
                                                           init->span.begin,
                                                           what, memberName);
                 }
