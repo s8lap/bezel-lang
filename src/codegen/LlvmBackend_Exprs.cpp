@@ -4357,10 +4357,22 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                                  ElementPolicy::Category::ClassOwned);
                         }
                         if (isOwnedClass) {
+                            // fix #4189 (§30.5, v0.298): a `.Result` read is
+                            // never the operand of a §30.5 chained return
+                            // (`detectAsyncPatternAKind` only matches a
+                            // literal `await <...>` value expression, never a
+                            // property/member access — see
+                            // LlvmBackend_Async.cpp's own detection), so this
+                            // extraction is always terminal: drain `task`'s
+                            // whole upstream chain unconditionally, the same
+                            // as a terminal bound `await` (lowerAwait's
+                            // `drainChainOnTake`).
                             auto* takeResultFn = declareC(
-                                "bz_task_take_result",
-                                llvm::Type::getVoidTy(llvm_), {ptrTy()});
-                            builder_.CreateCall(takeResultFn, {task});
+                                "bz_task_take_result", llvm::Type::getVoidTy(llvm_),
+                                {ptrTy(), llvm::Type::getInt8Ty(llvm_)});
+                            llvm::Value* drainArg = llvm::ConstantInt::get(
+                                llvm::Type::getInt8Ty(llvm_), 1);
+                            builder_.CreateCall(takeResultFn, {task, drainArg});
                         }
                     }
                     return resultVal;

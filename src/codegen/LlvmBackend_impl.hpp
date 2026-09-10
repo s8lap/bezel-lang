@@ -11855,6 +11855,27 @@ private:
     // use-after-free. The scope-end reclaim is later (bounded over-live, not
     // a leak) but never earlier than the loop finishes, since the enclosing
     // block scope necessarily contains the whole for-statement.
+    // drainChainOnTake=true (fix #4189 / §30.5, v0.298): only meaningful when
+    // takeResultAfter is also true. Tells the `bz_task_take_result` call
+    // (below) to ALSO walk `task`'s own §30.5 `chained_source` chain
+    // transitively and null each upstream hop's own `result` — preventing an
+    // upstream hop's still-attached `result_disposer` from firing again when
+    // the chain is eventually reclaimed, on a value this await already
+    // handed to a plain bound local (`using var w := await outer;`). MUST be
+    // false whenever this await's extracted value is instead about to be
+    // re-chained by an ACTIVE enclosing §30.5 chained return (`return await
+    // f()`, `asyncChainedReturn_` true at the call site) — that idiom relies
+    // on the chain's upstream `result` fields staying populated until
+    // `bz_task_needs_caller_disposal` / `bz_task_free` walk them later;
+    // draining here would make that decision wrongly and leak the value
+    // (measured: draining unconditionally regressed
+    // `using_var_direct_closure_chain_double_free_4162_test.cpp`'s own
+    // `routed_through_async_method_control_clean_30_5` control from a clean
+    // disposal to a leak). `lowerAwait` computes this from
+    // `takeResultAfter && !asyncChainedReturn_`. Every other caller (the
+    // `await for` desugaring) leaves it at its default (false; that call
+    // site also always passes takeResultAfter=false, so the flag has no
+    // effect there regardless).
     llvm::Value* emitAwaitSuspend(llvm::Value* task, llvm::Type* resultTy,
                                   bool freeTaskAfter,
                                   bool takeResultAfter = false,
@@ -11862,7 +11883,8 @@ private:
                                   bool deferTaskFree = false,
                                   bool freeOnFault = false,
                                   const std::function<void()>& onFault = {},
-                                  bool deferToScopeOnly = false);
+                                  bool deferToScopeOnly = false,
+                                  bool drainChainOnTake = false);
 
     // §28.12 / §30 (`await using` normal-exit path): call DisposeAsync() on `obj`
     // stdlib §6.10 (v0.175, #808): emit the TaskScope disposal for one scope

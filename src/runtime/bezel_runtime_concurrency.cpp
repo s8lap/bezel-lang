@@ -4170,17 +4170,87 @@ extern "C" {
 // now-caller-owned class object.
 // Safe on any bz_task_t regardless of whether it came from a TCS: if result is already
 // null (no result, or already consumed) free(nullptr) is a no-op.
-void bz_task_take_result(void* tp) {
+//
+// fix #4189 (§30.5 "Disposing an unconsumed OwningTask<T>", v0.298): `tp`'s own
+// result buffer can be a BORROW-ALIAS of a value produced further up a §30.5
+// Pattern A chain (bz_task_set_chained) rather than an independently-owned
+// copy: every hop of a chain stores the SAME pointer VALUE in its own,
+// separate result buffer, and a hop whose own body was a genuinely orphaned
+// Pattern-B kind-1 extraction still carries its OWN result_disposer (fix
+// #4159's "nothing else will ever dispose this" case). Nulling only `tp`'s
+// own slot (as this function always has) leaves every UPSTREAM hop's result
+// field populated with that same pointer and its disposer still attached, so
+// when the chain is eventually reclaimed (bz_task_free's recursive
+// `chained_source` walk) an upstream hop's disposer fires again on the exact
+// object this call is handing to the caller — a double free (measured:
+// `var f := async lambda() => await <Task<T:class> source>; using var outer
+// := f(); using var w := await outer;`, heap-use-after-free in
+// bz$elemDispose, freed once by `w`'s own correct disposal, freed again when
+// `outer`'s later scope-end disposal walks into the chain's true origin).
+//
+// Fix: when `drainChain` is nonzero, once the caller has taken ownership of
+// `tp`'s own result above, walk `chained_source` transitively (a chain may be
+// more than one hop deep) and null each upstream hop's own `result` the same
+// way — never touching `chained_source` itself, which bz_task_free still
+// needs to recurse into for memory reclaim. Nulling `result` is exactly what
+// makes bz_task_free's own `task->result == null` guard skip that hop's
+// result_disposer once the chain is freed, mirroring how it already protects
+// `tp`'s own slot. Safe without locking each hop's mutex against a
+// CONCURRENT producer: every task reachable via `chained_source` has, by
+// construction, already fully settled by the time `tp` (the task at the head
+// of the chain) itself settled enough to be awaited here — the same "no
+// other thread still touches the struct" invariant bz_task_free and
+// bz_task_needs_caller_disposal already rely on for these same fields. The
+// lock is still taken per hop, matching every other writer of these fields
+// in this file.
+//
+// `drainChain` MUST be 0 when `tp`'s extracted value is instead about to be
+// RE-CHAINED by an ACTIVE enclosing §30.5 chained return (`return await
+// f()`) — codegen's own `asyncChainedReturn_` is exactly that
+// discriminator (LlvmBackend_Async.cpp's `lowerAwait` computes
+// `drainChainOnTake = takeResultAfter && !asyncChainedReturn_`). That idiom
+// (the pre-existing, already-tested "route an unawaited chained task through
+// an intermediate async method" pattern every `chained_return_*` /
+// `async_lambda_exprbody_pattern_a_3960` test exercises) relies on the
+// chain's upstream `result` fields staying POPULATED until
+// `bz_task_needs_caller_disposal` (queried by the ENCLOSING body's own
+// completion, right after it re-chains onto `tp`) and `bz_task_free` walk
+// them later — draining here unconditionally would make that decision
+// wrongly (every upstream hop already looks "handled" via a null `result`
+// no disposer will ever reach) and LEAK the value instead of disposing it.
+// Measured: shipping this fix with `drainChain` unconditionally true
+// regressed `using_var_direct_closure_chain_double_free_4162_test.cpp`'s own
+// `routed_through_async_method_control_clean_30_5` control (plus three
+// sibling #4159/#4118/#3960 controls exercising the identical
+// intermediate-async-method idiom) from a clean disposal to a leak, caught
+// by this fix's own pre-commit sweep.
+void bz_task_take_result(void* tp, int8_t drainChain) {
     if (!tp) return;
     auto* task = static_cast<bz_task_t*>(tp);
     void* buf = nullptr;
+    void* chainedSrc = nullptr;
     {
         std::lock_guard<std::mutex> lk(task->mtx);
         buf = task->result;
         task->result = nullptr;
         task->result_size = 0;
+        chainedSrc = drainChain ? task->chained_source : nullptr;
     }
     free(buf);
+    while (chainedSrc) {
+        auto* src = static_cast<bz_task_t*>(chainedSrc);
+        void* srcBuf = nullptr;
+        void* next = nullptr;
+        {
+            std::lock_guard<std::mutex> lk(src->mtx);
+            srcBuf = src->result;
+            src->result = nullptr;
+            src->result_size = 0;
+            next = src->chained_source;
+        }
+        free(srcBuf);
+        chainedSrc = next;
+    }
 }
 
 // §30.5 / #1258, #1503: an unconsumed OwningTask<T:class>'s produced result is

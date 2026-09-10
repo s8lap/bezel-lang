@@ -4483,6 +4483,40 @@ llvm::Value* Emitter::lowerAwait(const ast::UnaryExpr& un) {
             }
         }
     }
+    // fix #4189 (§30.5 "Disposing an unconsumed OwningTask<T>", v0.298):
+    // `takeResultAfter` also fires for a §30.5 CHAINED-RETURN's own inner
+    // await (`return await f()` where `f()`'s static type is OwningTask —
+    // `asyncChainedReturn_` is true here PRECISELY because the operand is a
+    // CallExpr and this await sits under an active chained return, per
+    // `freeTaskAfter`'s own `!asyncChainedReturn_` guard above). In THAT
+    // shape the value this await extracts is immediately handed BACK to the
+    // ENCLOSING body's own `emitAsyncPatternAResultDecision`, which chains
+    // the enclosing task onto `f`'s task and asks
+    // `bz_task_needs_caller_disposal` whether IT must attach its own
+    // disposer — a decision that reads `f`'s task's `chained_source` and
+    // (transitively, once the whole tree is freed) that source's own
+    // `result` field. Draining `f`'s WHOLE upstream chain here, before that
+    // decision runs, would silently answer it wrong (every upstream hop's
+    // `result` already null) and leak the value instead of disposing it —
+    // measured: `using_var_direct_closure_chain_double_free_4162_test.cpp`'s
+    // own `routed_through_async_method_control_clean_30_5` control (and
+    // three sibling #4159/#4118/#3960 controls exercising the same
+    // "intermediate async method" idiom) regressed from a clean disposal to
+    // a leak when this fix's chain-drain first shipped unconditionally.
+    //
+    // So: only drain the chain when this await's extracted value is NOT
+    // about to be re-chained by an active enclosing chained return — i.e.
+    // exactly the #4189 shape (`using var w := await outer;`, a plain bound
+    // local with no further task-wrapping of its own). `asyncChainedReturn_`
+    // is exactly that discriminator: true means "my caller is about to
+    // re-chain onto the task I'm awaiting", false means "this extraction is
+    // terminal". Computed here (not read again inside emitAwaitSuspend's
+    // body) because nothing between here and the emitAwaitSuspend call below
+    // writes `asyncChainedReturn_`, and passing it as an explicit parameter
+    // — rather than re-reading emitter state deep inside a shared, nested
+    // emission helper — avoids exactly the "reads possibly-stale emitter
+    // state" hazard CLAUDE.md §6/§7 warn about.
+    bool drainChainOnTake = takeResultAfter && !asyncChainedReturn_;
     // fix #3070 / §30.5 + §28.3 *Unbound owned temporaries* (v0.249): when the
     // anonymous producer's task is Pattern A `Task<T>` for a class (or intrinsic
     // collection) T, the awaited value is a BORROW of the task's result and
@@ -4562,7 +4596,7 @@ llvm::Value* Emitter::lowerAwait(const ast::UnaryExpr& un) {
     }
     return emitAwaitSuspend(task, resultTy, freeTaskAfter, takeResultAfter,
                             markSpentAfter, deferTaskFree, freeOnFault,
-                            /*onFault=*/{}, deferToScopeOnly);
+                            /*onFault=*/{}, deferToScopeOnly, drainChainOnTake);
 }
 
 
@@ -4581,7 +4615,8 @@ llvm::Value* Emitter::emitAwaitSuspend(llvm::Value* task, llvm::Type* resultTy,
                                        bool deferTaskFree,
                                        bool freeOnFault,
                                        const std::function<void()>& onFault,
-                                       bool deferToScopeOnly) {
+                                       bool deferToScopeOnly,
+                                       bool drainChainOnTake) {
     if (!task) return nullptr;
 
     // Store the awaited task into the frame's pending-task slot so the resumed
@@ -4852,9 +4887,12 @@ llvm::Value* Emitter::emitAwaitSuspend(llvm::Value* task, llvm::Type* resultTy,
         // buffer after loading (consumed-tracking). bz_tcs_dispose_owned_result
         // checks task->result; a null here tells it the result was already taken.
         if (takeResultAfter) {
-            auto* takeResultFn = declareC("bz_task_take_result",
-                                          llvm::Type::getVoidTy(llvm_), {ptrTy()});
-            builder_.CreateCall(takeResultFn, {awaitedTask});
+            auto* takeResultFn = declareC(
+                "bz_task_take_result", llvm::Type::getVoidTy(llvm_),
+                {ptrTy(), llvm::Type::getInt8Ty(llvm_)});
+            llvm::Value* drainArg = llvm::ConstantInt::get(
+                llvm::Type::getInt8Ty(llvm_), drainChainOnTake ? 1 : 0);
+            builder_.CreateCall(takeResultFn, {awaitedTask, drainArg});
         }
     }
     // §30.5 (v0.162 / #1352): mark OwningTask spent after successful result
