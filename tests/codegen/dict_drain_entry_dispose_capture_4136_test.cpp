@@ -170,9 +170,17 @@ bool has(const std::string& hay, const char* needle) {
 // Measured on this worktree's HEAD (b802527): the pre-rewrite program FAILS
 // to compile with fix #4156's new diagnostic ("... is a closure capturing
 // `entry`, which was explicitly disposed before this return ..."); this
-// rewritten program PASSES (r.ran=true, stdout contains "key=7"). Logs:
-// /var/tmp/bezel-scratch/r17/ff-4136/logs/l1-4136-probe-pre-rewrite.log
-// (rejection) and .../l1-4136-probe-post-rewrite.log (key=7, clean run).
+// rewritten program PASSES (r.ran=true, stdout contains "key=7"). Reproduce
+// with `scripts/agent_check.sh --probe --asan <file>.bzl` against the
+// pre-rewrite source (the ORIGINAL `MakeClosure(): () -> int` shape that
+// used to live here -- `return`s the closure and reads `entry.Key` from
+// `Main()` afterward) versus the post-rewrite source (this file's own
+// `intKeyProgram()` below, verbatim): the two Bezel source files this was
+// last checked against are `/var/tmp/bezel-scratch/r17/ff-4136/probe/
+// intkey.bzl` (pre-rewrite shape, rejected) and `.../probe/intkey_v2.bzl`
+// (post-rewrite shape, matches `intKeyProgram()` below, compiles and prints
+// "key=7") -- both are Bezel SOURCE, not logs; scratch and not committed,
+// so re-run the command above to reproduce rather than trusting a path.
 // The sibling `string_key_captured_loop_var_explicit_dispose_no_stack_overflow`
 // row below needed NO change: its lambda is assigned to the discard `_` and
 // never returned, so it never reaches #4156's return-escape check.
