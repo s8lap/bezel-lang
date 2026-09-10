@@ -2527,6 +2527,40 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         // duration of the nested call so the lambda's own completion sites see
         // "no owned-param frame" (a correct no-op).
         asyncOwnedParamFrame_ = nullptr;
+        // fix #4118 (§30.5, v0.295): asyncChainedReturn_ / asyncBorrowedReturn_
+        // are the §30.5 Pattern A return-kind detection flags — deliberately
+        // NOT part of BEZEL_SM_FRAME_MEMBERS (LlvmBackend_impl.hpp's own
+        // comment: "saved where they are needed, by name, because they are
+        // not clearSmFrame()'s business"), so SmFrameSaveScope above does not
+        // touch them. They are a TRANSIENT publish/consume channel: an
+        // enclosing `return await <call>` sets one of them true BEFORE
+        // lowering its operand, and reads it back (read-and-reset) AFTER —
+        // see LlvmBackend_Assign.cpp's NestedBodyScope comment on fix #2731
+        // item 1. When that operand is itself an async-lambda IIFE
+        // (`return await (async lambda() => ...)()`), lowering it reaches
+        // HERE and calls emitAsyncLambda for the NESTED lambda's own
+        // machine — whose own completion (LlvmBackend_Async.cpp) does the
+        // identical unconditional read-and-reset for ITSELF. Without a
+        // save/reset/restore around that nested call, the nested body
+        // inherits the OUTER's already-set flag (misclassifying its OWN
+        // return kind and attaching the wrong runtime disposer call to
+        // itself) and then clears it to false, so the outer's own read-back
+        // sees `false` and ALSO misclassifies (its kind-2 chained return
+        // looks like a plain kind-1 return) — the two kind decisions swap.
+        // This mirrors fix #2747's identical treatment in the SYNC branch
+        // below (the sync branch's own nested body reads/resets the exact
+        // same flags via emitReturn) and NestedBodyScope's by-name handling —
+        // added here by name, NOT by folding into BEZEL_SM_FRAME_MEMBERS,
+        // because these two are DESTRUCTIVE (they select which
+        // bz_task_set_chained / bz_task_set_result_disposer call is emitted,
+        // not a soft hint), and folding them into the macro would also
+        // reshape NestedBodyScope's already-correct-by-name handling of the
+        // identical pair into duplicate macro-generated members — out of
+        // scope here per LANE_RULES coordination with the #4143 lane.
+        bool savedAsyncChainedReturn = asyncChainedReturn_;
+        bool savedAsyncBorrowedReturn = asyncBorrowedReturn_;
+        asyncChainedReturn_ = false;
+        asyncBorrowedReturn_ = false;
         // emitAsyncLambda recomputes closure-release AND capture-cell-free
         // eligibility for the LAMBDA's own body and keys them to the lambda resume
         // fn. The ENCLOSING function's eligibility (which governs whether THIS
@@ -2651,9 +2685,13 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         moveOnlyArrayTransferred_ = std::move(savedMoveOnlyArrayTransferred);
         moveOnlyArrayTransferredFn_ = savedMoveOnlyArrayTransferredFn;
         // fix #3505: the whole sm*_/async*_ frame is put back by smFrameSave's
-        // destructor at the end of this block. Only the member that is NOT part
-        // of the retracted frame is restored by hand.
+        // destructor at the end of this block. Only the members that are NOT
+        // part of the retracted frame are restored by hand.
         asyncHandlerSpillSlots_ = std::move(savedAsyncHandlerSpillSlots);
+        // fix #4118: restore the §30.5 Pattern A flags the save/reset above
+        // set aside — see the comment there.
+        asyncChainedReturn_ = savedAsyncChainedReturn;
+        asyncBorrowedReturn_ = savedAsyncBorrowedReturn;
     } else {
     // fix #3237: a SYNC lambda body nested inside an async method also needs
     // the enclosing machine's sm*_/async*_ fields cleared — the sync lambda
