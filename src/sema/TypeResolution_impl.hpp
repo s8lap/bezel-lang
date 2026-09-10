@@ -754,6 +754,26 @@ private:
         TypeRef* tr,
         const std::unordered_map<std::string_view, TypeRef*>& genericSubst);
 
+    // fix #4188 (§27.8, v0.298): a GENERIC alias's cached underlying TypeRef
+    // (`aliasDecl->aliasedType`, resolved ONCE against a throwaway scope that
+    // binds the alias's own parameters to nullptr markers — see
+    // resolveTopDecl's TypeAlias arm) still carries those parameters
+    // UNBOUND. `applyGenericSubst` above only substitutes a TOP-LEVEL bare
+    // parameter reference, which is not enough here: §27.8's own example
+    // (`type Lookup<K, V> := Dictionary<K, Array<V>>`) buries the
+    // parameters INSIDE the underlying type's own generic-argument tree.
+    // Recursively substitute every bare occurrence of a name bound in
+    // `subst` (Named leaf, InlineArray element, Function param/return, and
+    // any depth of nested Named genericArgs) and return a FRESH TypeRef
+    // whenever anything beneath `tr` changed — the alias's cached
+    // `underlying` TypeRef is shared by every reference site of the alias
+    // and must never be mutated in place. Returns `tr` unchanged (no
+    // allocation) when nothing beneath it needs substitution, which also
+    // covers a non-generic alias (`subst` empty).
+    TypeRef* substituteAliasGenericArgs(
+        TypeRef* tr,
+        const std::unordered_map<std::string_view, TypeRef*>& subst);
+
     void checkOverrideSignatureMatch(MemberSymbol* derivedSym,
                                      MemberSymbol* baseSym);
 

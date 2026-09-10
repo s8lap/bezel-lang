@@ -1731,6 +1731,83 @@ ConstShiftDomainFault Resolver::findConstShiftDomainFaultInScope(
     return findConstShiftDomainFault(e, resolve);
 }
 
+// fix #4188 (§27.8, v0.298): see the declaration comment in
+// TypeResolution_impl.hpp. `tr` is a node reachable from a generic alias's
+// cached `aliasedType` TypeRef; `subst` maps the alias's OWN generic
+// parameter names to the CONCRETE type arguments supplied at a particular
+// reference site.
+TypeRef* Resolver::substituteAliasGenericArgs(
+        TypeRef* tr,
+        const std::unordered_map<std::string_view, TypeRef*>& subst) {
+    if (!tr || subst.empty()) return tr;
+    switch (tr->kind) {
+        case TypeRef::Kind::Named: {
+            // A bare, unbound type-parameter reference — the same shape
+            // applyGenericSubst's leaf case recognises (Named, no
+            // declaration, single-part syntactic name).
+            if (!tr->declaration && tr->astNode && tr->astNode->name &&
+                tr->astNode->name->parts.size() == 1) {
+                auto it = subst.find(tr->headName());
+                if (it != subst.end()) {
+                    TypeRef* substituted = it->second;
+                    // Preserve the nullable modifier: `T?` → `int?` when
+                    // T→int, mirroring applyGenericSubst.
+                    if (tr->nullable && substituted && !substituted->nullable) {
+                        TypeRef* nn = ctx_.makeTypeRef(*substituted);
+                        nn->nullable = true;
+                        return nn;
+                    }
+                    return substituted;
+                }
+            }
+            // Not a bare parameter itself (a concrete/builtin head, or a
+            // parameter name not in `subst`) — recurse into its own
+            // generic-argument list, since the parameter may be buried
+            // arbitrarily deep (`Dictionary<K, Array<V>>`, spec §27.8's own
+            // generic-alias example).
+            if (tr->genericArgs.empty()) return tr;
+            bool changed = false;
+            std::vector<TypeRef*> newArgs;
+            newArgs.reserve(tr->genericArgs.size());
+            for (TypeRef* arg : tr->genericArgs) {
+                TypeRef* na = substituteAliasGenericArgs(arg, subst);
+                if (na != arg) changed = true;
+                newArgs.push_back(na);
+            }
+            if (!changed) return tr;
+            TypeRef* nn = ctx_.makeTypeRef(*tr);
+            nn->genericArgs = std::move(newArgs);
+            return nn;
+        }
+        case TypeRef::Kind::InlineArray: {
+            if (!tr->arrayElement) return tr;
+            TypeRef* ne = substituteAliasGenericArgs(tr->arrayElement, subst);
+            if (ne == tr->arrayElement) return tr;
+            TypeRef* nn = ctx_.makeTypeRef(*tr);
+            nn->arrayElement = ne;
+            return nn;
+        }
+        case TypeRef::Kind::Function: {
+            bool changed = false;
+            std::vector<TypeRef::FuncParam> newParams = tr->funcParams;
+            for (auto& p : newParams) {
+                TypeRef* np = substituteAliasGenericArgs(p.type, subst);
+                if (np != p.type) { p.type = np; changed = true; }
+            }
+            TypeRef* newRet =
+                substituteAliasGenericArgs(tr->funcReturn, subst);
+            if (newRet != tr->funcReturn) changed = true;
+            if (!changed) return tr;
+            TypeRef* nn = ctx_.makeTypeRef(*tr);
+            nn->funcParams = std::move(newParams);
+            nn->funcReturn = newRet;
+            return nn;
+        }
+        default:
+            return tr;
+    }
+}
+
 void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
     if (!t.name || t.name->parts.empty()) {
         ref.kind = TypeRef::Kind::Error;
@@ -2462,6 +2539,38 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                 }
                 if (TypeRef* underlying =
                         ctx_.resolvedType(*aliasDecl->aliasedType)) {
+                    // fix #4188 (§27.8, v0.298): `underlying` is the alias's
+                    // CACHED TypeRef, resolved once at the alias's own
+                    // declaration against a throwaway scope that binds the
+                    // alias's own parameters to nullptr markers
+                    // (resolveTopDecl's TypeAlias arm) — so it still carries
+                    // those parameters UNBOUND. Without substituting THIS
+                    // reference site's concrete arguments in, a generic
+                    // alias used as e.g. a call argument's local type
+                    // resolved to `declaration = Box` (correct, #1462) but
+                    // `genericArgs = [T-unbound]` instead of `[int]` — the
+                    // spec's own "each instantiation of the alias is
+                    // interchangeable with the corresponding instantiation
+                    // of the aliased type" (§27.8) requires the latter.
+                    // Downstream, a bare/unbound `T` here is indistinguishable
+                    // from "cannot infer this generic method type parameter
+                    // from this argument", so a call passing such a value
+                    // silently fell back to the UNSPECIALIZED generic-method
+                    // template — an IR-verifier failure (call parameter type
+                    // vs. the concrete argument's specialized struct type).
+                    std::unordered_map<std::string_view, TypeRef*> aliasSubst;
+                    for (std::size_t gi = 0;
+                         gi < aliasDecl->genericParams.size() &&
+                         gi < t.genericArgs.size(); ++gi) {
+                        if (!t.genericArgs[gi]) continue;
+                        TypeRef* concreteArg =
+                            resolveType(*t.genericArgs[gi], scope);
+                        if (!concreteArg) continue;
+                        aliasSubst[aliasDecl->genericParams[gi].name] =
+                            concreteArg;
+                    }
+                    underlying =
+                        substituteAliasGenericArgs(underlying, aliasSubst);
                     // Copy the underlying kind and payload into ref. The nullable
                     // flag on ref was already set from the syntactic `?` suffix in
                     // resolveType; the underlying type's nullable flag is

@@ -192,17 +192,19 @@ BEZEL_TEST(generic_param_unification_conformance_walk_4183,
 }
 
 // Additional coverage per review request #5 — a generic type alias on the
-// ARGUMENT side. SEMA-level check only: asserting full execution here would
-// collide with issue #4188, a SEPARATE, PRE-EXISTING codegen defect
-// (measured identically on base `2c0ac3e`, unaffected by this fix) where a
-// local variable's OWN declared-alias type derives a different LLVM
-// monomorphization key than the callee's parameter type, an IR-verifier
-// crash unrelated to type-argument INFERENCE. What this row actually pins:
-// sema itself accepts the call and does NOT emit this fix's "cannot infer"
-// diagnostic for an argument-side alias — i.e. unification correctly reads
-// through the argument's alias-transparent `declaration` (already the real
-// `Box` TypeSymbol, set by the standard alias-resolution convention,
-// independent of anything this fix added) rather than rejecting.
+// ARGUMENT side. Originally SEMA-level only (asserting full execution would
+// have collided with issue #4188, then a SEPARATE, pre-existing codegen
+// defect measured identically on base `2c0ac3e`). #4188 is now fixed —
+// its root cause was an under-substituted alias TypeRef in
+// `Resolver::resolveNamed` (the alias's own generic parameter stayed
+// unbound in `genericArgs`, so THIS unification correctly found nothing to
+// reject but also nothing concrete to bind, and the call fell through to
+// the unspecialized template at codegen — see
+// type_alias_generic_arg_monomorphization_4188_test.cpp for the full
+// analysis and the dedicated regression rows). Strengthened here to assert
+// full execution, matching `param_side_generic_alias` just above: sema
+// accepts the call (no "cannot infer" misfire) AND the alias-typed
+// argument now runs correctly end to end.
 BEZEL_TEST(generic_param_unification_conformance_walk_4183,
            arg_side_alias_static_type_known) {
     auto r = runAot(
@@ -220,12 +222,9 @@ BEZEL_TEST(generic_param_unification_conformance_walk_4183,
         "    return Util.Unwrap(a); "
         "  end Main; "
         "end C;");
-    // #4188: this specific program crashes CODEGEN (IR verification
-    // failure), pre-existing and unaffected by this fix — so `r.ran` is
-    // NOT asserted true here. What IS asserted: whatever diagnostics ARE
-    // present, none of them is this fix's own "cannot infer" rejection —
-    // sema's type-argument binding for the argument-side alias is sound.
     BEZEL_EXPECT_FALSE(diagnosticMessageContains(r, "cannot infer the type argument"));
+    BEZEL_EXPECT_TRUE(r.ran);
+    if (r.ran) BEZEL_EXPECT_EQ(r.exitCode, 55);
 }
 
 // Additional coverage per review request #5 — "a class implementing the
