@@ -418,6 +418,11 @@ void Resolver::run(const ast::SourceFile& src) {
     // posture for the property/indexer analog of a "body" (the auto
     // initializer).
     checkAbstractPropertyInitializers();
+    // fix #4110 (§12.5/§23.4, v0.298): an abstract NAMED property or
+    // indexer given an explicit `=>`/block body (as opposed to
+    // checkAbstractPropertyInitializers' Auto-shorthand-plus-initializer
+    // shape) has no reachable call site either — the body is dead code.
+    checkAbstractPropertyBodies();
     // Slice S34: static members may not be virtual (§12.1).
     checkStaticNotVirtual();
     // Slice S35: `async abstract` is a compile error (§12.6).

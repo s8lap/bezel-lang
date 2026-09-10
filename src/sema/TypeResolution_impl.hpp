@@ -320,6 +320,26 @@ private:
 
     void checkTypeAbstractPropertyInitializers(TypeSymbol* t);
 
+    // fix #4110 (§12.5/§23.4, v0.298): the sibling gap #4026 and the
+    // indexer body-presence branch of checkTypeMethodBodies (fix #4101)
+    // leave open — an `abstract` NAMED property or indexer given an
+    // EXPLICIT `=>` expression body, or a Block body whose accessors carry
+    // real code (as opposed to every accessor being the bare `;` abstract
+    // stub, #4026's own accepted control), compiles clean with the body
+    // reached by nothing: dispatch through a base-typed reference always
+    // resolves to the most-derived override (§12.1), so an abstract
+    // member's own body — if it had one — could never run. Cannot reuse
+    // `isAbstractPropertyShorthand` (sema/Symbol.hpp): it is deliberately
+    // narrowed to `PropertyBodyKind::Auto` and deliberately excludes
+    // indexers (narrow #4037 measured that a naive substitution for the
+    // indexer domain silently accepts an illegally-added indexer setter),
+    // so this reads the same raw AST facts — bodyKind, the `abstract`
+    // modifier, and each accessor's own `PropertyAccessorBodyKind` — the
+    // same discipline checkTypeMethodBodies uses for methods.
+    void checkAbstractPropertyBodies();
+
+    void checkTypeAbstractPropertyBodies(TypeSymbol* t);
+
     // Slice S32 (§10.5): an enum may not declare instance fields,
     // constructors, nested types, or indexers, and its methods may not
     // be virtual / abstract / sealed override. `override` is admitted

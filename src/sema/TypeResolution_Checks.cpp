@@ -728,6 +728,74 @@ void Resolver::checkTypeAbstractPropertyInitializers(TypeSymbol* t) {
     }
 }
 
+void Resolver::checkAbstractPropertyBodies() {
+    // fix #4110 (§12.5/§23.4, v0.298): shared recursive walk (§11.6,
+    // v0.286), matching every other per-member modifier-combination check
+    // in this file.
+    forEachTypeAndNested(
+        [&](TypeSymbol* t) { checkTypeAbstractPropertyBodies(t); });
+}
+
+void Resolver::checkTypeAbstractPropertyBodies(TypeSymbol* t) {
+    for (Symbol* m : t->members) {
+        auto* ps = dynamic_cast<PropertySymbol*>(m);
+        if (!ps) continue;
+        // SEAM-ACCESSOR: `ps` is a member of the locally-declared `t`
+        // (forEachTypeAndNested, #3574); an abstract-member-body check is
+        // declaration-site only (#3152), matching
+        // checkTypeAbstractPropertyInitializers just above.
+        auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
+        if (!pd) continue;
+        if (!hasMod(ps, "abstract")) continue;
+        // §12.5 / §23.4: an `abstract` member has no backing storage and
+        // no reachable call site of its own (dispatch through a base-typed
+        // reference always resolves to the most-derived override, §12.1),
+        // so a body it declares can never run. A `PropertyBodyKind::Auto`
+        // body is out of scope here entirely — checkAbstractPropertyInitializers
+        // (named properties, via `isAbstractPropertyShorthand`) and the
+        // indexer body-presence branch of checkTypeMethodBodies (#4101)
+        // already cover the Auto-body shapes; this check only ever fires
+        // for `Expression` or `Block`.
+        bool hasRealBody = false;
+        if (pd->bodyKind == ast::PropertyBodyKind::Expression) {
+            // `=> expr;` always carries real, unreachable code.
+            hasRealBody = true;
+        } else if (pd->bodyKind == ast::PropertyBodyKind::Block) {
+            // The Block form is ALSO the legitimate way to spell an
+            // abstract member needing more than the Auto shorthand's
+            // implicit get-only accessor (e.g. both `get;` and `set;`
+            // stubs, #4026's own accepted control
+            // `abstract_block_form_accessors_accepted_control_spec_12_5`)
+            // — every accessor there is itself
+            // `PropertyAccessorBodyKind::Abstract` (the bare `;` form).
+            // Only an accessor carrying REAL code (`Expression`/`Block`)
+            // is the #4110 defect.
+            for (const auto& acc : pd->accessors) {
+                if (acc.bodyKind != ast::PropertyAccessorBodyKind::Abstract) {
+                    hasRealBody = true;
+                    break;
+                }
+            }
+        }
+        if (!hasRealBody) continue;
+        if (pd->isIndexer) {
+            ctx_.diagnostics().report(
+                Severity::Error, m->declLoc,
+                "abstract indexer may not have a body — an abstract member "
+                "has no backing storage and no reachable call site of its "
+                "own, so the body could never run (\xC2\xA7"
+                "12.5/\xC2\xA7""23.4)");
+        } else {
+            ctx_.diagnostics().report(
+                Severity::Error, m->declLoc,
+                std::string("abstract property `") + std::string(ps->name) +
+                "` may not have a body — an abstract member has no backing "
+                "storage and no reachable call site of its own, so the "
+                "body could never run (\xC2\xA7""12.5)");
+        }
+    }
+}
+
 // §10.5 / §35.2 (v0.288, #3837): true iff `ms` is one of the three
 // `Object`-virtual members whose replacement §10.5 admits spelling with
 // `override` — `Equals` (arity 1: the co-declared `Equals(T)` §25.2
