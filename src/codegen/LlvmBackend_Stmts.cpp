@@ -3234,30 +3234,49 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                     //
                     // Recover the slot directly via `lvalueAddr` — bypassing
                     // `unwindOwnedLocalClass` rather than widening it — when the
-                    // discarded value's TYPE is a KNOWN vtable-less builtin.
+                    // discarded value's TYPE is one `emitVtablelessBuiltinRelease`
+                    // (two lines below) actually KNOWS HOW TO RELEASE.
                     // `ds->discardOutOwnedVar` is set by the ownership pass only
                     // for a genuinely Owned named binding (Ownership.cpp ~line
                     // 3283: `dstate->state == OwnershipState::Owned`), so this
-                    // fallback is never reached for a borrow. The release two
-                    // lines below is already gated on the SAME
-                    // `common::isVtableLessBuiltinClassName` authority the caller
-                    // used to decide whether to look here at all, so the
-                    // generic-class `emitDisposeAndReclaim` fallback further down
-                    // — the wild vtable jump #2675 exists to prevent — can never
-                    // fire on the object recovered through this path. Widening
-                    // `unwindOwnedLocalClass` itself was rejected: it also drives
-                    // `registerUnwindOwnedLocal`'s EXCEPTION-unwind registration,
-                    // which dispatches through `emitDisposeAndReclaim`'s vtable
-                    // call — exactly the #2675 wild jump — so making it truthy
-                    // for a vtable-less builtin would reintroduce that crash on
-                    // the unwind edge. // per §17.13, §28.3, §28.9, #2675, #4185
+                    // fallback is never reached for a borrow.
+                    //
+                    // fix-forward (review NEEDS-FIX, §25): the FIRST version of
+                    // this fallback gated on `common::isVtableLessBuiltinClass
+                    // Name` — which proves only "carries no Bezel vtable", a
+                    // STRICT SUPERSET (47 names) of the 18
+                    // `emitVtablelessBuiltinRelease` handles. For a name in the
+                    // gap (`Shared<T>`, `Weak<T>`, `JsonSerializer`, …) that
+                    // predicate is TRUE, `emitVtablelessBuiltinRelease` returns
+                    // false (no arm matches), and the `else` branch below —
+                    // unchanged, pre-existing code — calls
+                    // `emitDisposeAndReclaim(obj)` on the slot THIS fallback
+                    // just newly supplied: the exact wild jump #2675 exists to
+                    // prevent, converting a leak into a SIGSEGV. Measured on
+                    // that version: `var sh := new Shared<Widget>(new Widget());
+                    // _ := sh;` → "SEGV ... Maybe a wild jump?"; `var js := new
+                    // JsonSerializer(); _ := js;` → "SEGV on unknown address
+                    // 0x000000000010". `vtablelessBuiltinReleaseIsKnown` answers
+                    // the NARROWER, correct question ("will the release two
+                    // lines below actually succeed"), so a name in the gap now
+                    // leaves `slotAddr` null and this whole branch emits
+                    // NOTHING for it — a leak, the pre-#4185 (and still safe)
+                    // behaviour — instead of reaching `emitDisposeAndReclaim`.
+                    // Widening `unwindOwnedLocalClass` itself remains rejected
+                    // for the reason already on record: it also drives
+                    // `registerUnwindOwnedLocal`'s EXCEPTION-unwind
+                    // registration, which dispatches through the SAME
+                    // `emitDisposeAndReclaim` vtable call, so making it truthy
+                    // for a vtable-less builtin would reintroduce the #2675
+                    // jump on the unwind edge instead. // per §17.13, §28.3,
+                    // §28.9, §25, #2675, #4185
                     if (!slotAddr) {
                         std::string_view fbBn;
                         if (const sema::TypeRef* fbRt =
                                 ctx_.exprType(*ds->value))
                             fbBn = builtinTypeName(fbRt);
                         if (!fbBn.empty() &&
-                            common::isVtableLessBuiltinClassName(fbBn))
+                            vtablelessBuiltinReleaseIsKnown(fbBn))
                             slotAddr = lvalueAddr(*ds->value, slotTy);
                     }
                     if (slotAddr) {

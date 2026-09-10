@@ -2641,6 +2641,29 @@ const char* Emitter::usingAutoDropVtablelessBuiltin(std::string_view n) {
 }
 
 
+// fix-forward #4185 (review NEEDS-FIX, §25): the exact name population
+// `emitVtablelessBuiltinRelease` below handles — 18 names, kept
+// byte-for-byte in sync with that function's `if (bn == "...")` arms (one
+// entry per arm; the two-name-per-arm cases — Atomic/AtomicInteger,
+// EventSource/AsyncEventSource, TaskCompletionSource/
+// OwningTaskCompletionSource — each contribute two entries here). See the
+// declaration in LlvmBackend_impl.hpp for why this is a second listing
+// rather than a call into the function itself.
+bool Emitter::vtablelessBuiltinReleaseIsKnown(std::string_view bn) {
+    static constexpr std::array<std::string_view, 18> kKnown = {
+        "StringBuilder",       "Random",
+        "Atomic",              "AtomicInteger",
+        "EventSource",         "AsyncEventSource",
+        "TaskCompletionSource", "OwningTaskCompletionSource",
+        "Channel",             "ChannelSender",
+        "Stopwatch",           "Mutex",
+        "Lock",                "Semaphore",
+        "SemaphoreToken",      "CancellationTokenSource",
+        "FileStream",          "Subscription",
+    };
+    return std::find(kKnown.begin(), kKnown.end(), bn) != kKnown.end();
+}
+
 bool Emitter::emitVtablelessBuiltinRelease(std::string_view bn,
                                            llvm::Value* recv) {
     if (bn.empty() || !recv || !recv->getType()->isPointerTy()) return false;

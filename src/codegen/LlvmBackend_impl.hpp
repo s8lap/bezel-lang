@@ -9726,6 +9726,26 @@ private:
     // trade a false return deliberately takes.
     bool emitVtablelessBuiltinRelease(std::string_view bn, llvm::Value* recv);
 
+    // fix-forward #4185 (review NEEDS-FIX, §25): `common::isVtableLessBuiltin
+    // ClassName` answers "does this receiver carry no Bezel vtable" — a
+    // STRICT SUPERSET (47 names) of what `emitVtablelessBuiltinRelease`
+    // above actually handles (18 names; see its definition). A caller that
+    // gates a NEW `emitDisposeAndReclaim`-reachable code path on the former
+    // alone (as the #4185 DiscardStmt fallback originally did) admits the
+    // 29-name gap — Shared<T>, Weak<T>, the serializer family, etc. — into
+    // the exact wild jump `emitVtablelessBuiltinRelease`'s own declaration
+    // comment forbids ("callers must NOT fall back to emitDisposeAndReclaim
+    // on a false return"). This predicate answers the NARROWER, correct
+    // question — "will `emitVtablelessBuiltinRelease` actually succeed for
+    // `bn`" — so a caller deciding whether to open a code path onto that
+    // function can gate on this instead of the "no vtable" fact alone. A
+    // second listing (not a call into `emitVtablelessBuiltinRelease` itself)
+    // because that function EMITS IR on every success arm — there is no way
+    // to "ask" it without inserting live instructions for a receiver it may
+    // then discard. Keep byte-for-byte in sync with the `if (bn == "...")`
+    // arms of `emitVtablelessBuiltinRelease`; see that definition. // per §25
+    static bool vtablelessBuiltinReleaseIsKnown(std::string_view bn);
+
     // fix #2973 (§28.3 / §28.9, stdlib §6.4, v0.240): if `n` names a built-in
     // whose `using var` SCOPE-EXIT auto-drop routes through
     // emitVtablelessBuiltinRelease, return that built-in's canonical name (a
