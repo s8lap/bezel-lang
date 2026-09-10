@@ -6532,6 +6532,27 @@ static bool typeArgSameBase(const TypeRef* a, const TypeRef* b) {
     return false;
 }
 
+// §14.1 / §14.5 phase 1 (issue #1180, #4199): true when `t` is a FREE generic
+// type-parameter reference — a Named TypeRef with no resolved declaration, no
+// generic arguments of its own, and a non-empty name. Within a resolved
+// TypeRef reached from a method or type signature, a bare Named type with a
+// null declaration can only be such a reference (an unresolved ordinary
+// identifier would already have been rejected by name resolution), so this is
+// a structural test, not a name-set membership test.
+//
+// Free variables accept any binding without variance or identity restriction
+// here — the only constraint on what they may bind to is enforced at the call
+// site (§14.5's own Agreement rule via `unifyArgSubst`'s conflict detection,
+// and the §14.2 constraint check after inference completes), not by this
+// assignability walk. Extracted so every site that needs this recognition
+// shares ONE definition (LANE_RULES §6) rather than growing a second,
+// drifting spelling — `variantGenericAssignable`'s per-argument loop below
+// used to inline this same test.
+static bool isFreeGenericTypeVarRef(const TypeRef* t) {
+    return t && t->kind == TypeRef::Kind::Named && !t->declaration &&
+           t->genericArgs.empty() && !namedTypeSimpleName(t).empty();
+}
+
 // §12.9: recursive type-argument IDENTITY. Two arguments are identical when
 // their bases match (typeArgSameBase) AND every nested generic argument is
 // identical, component-wise. This is the only relation an INVARIANT position
@@ -6546,8 +6567,27 @@ static bool typeArgSameBase(const TypeRef* a, const TypeRef* b) {
 // Recurse into those components directly so e.g. `Box<[3]Array<int>>` is
 // distinct from `Box<[3]Array<string>>` and `Box<(int)->int>` from
 // `Box<(string)->int>` (per §5.1 identity and §15.1 "size is part of the type").
+//
+// fix #4199 (§14.5 phase 1, v0.298): "a constructed parameter type
+// G<P1,…,Pn> unifies component-wise" is a RECURSIVE rule — a nested
+// constructed argument (`Box<Box<T>>`) unifies its own nested constructed
+// argument (`Box<T>`) the same way, arbitrarily deep. This function is the
+// recursion that carries out that component-wise walk for an INVARIANT
+// (record/class) position, but before this fix it had no knowledge of a free
+// type-parameter reference at any depth past the immediate caller
+// (`variantGenericAssignable`'s own loop, which tested only its OWN
+// `to->genericArgs[i]` slot). So `Box<Box<T>>` vs `Box<Box<int>>` recursed
+// one level structurally (Box vs Box, fine) and then reached THIS function
+// comparing `Box<T>` against `Box<int>` — itself not a free reference (it is
+// a compound type) — which recursed again into `typeArgIdentical(T, int)`,
+// where `typeArgSameBase` rejected on a bare Kind mismatch (Named vs
+// Primitive) before ever asking whether `T` was a free variable. A single
+// level of nesting (`Box<T>` vs `Box<int>`) never reached this function at
+// all — `variantGenericAssignable`'s own top-level loop already saw the bare
+// `T` and skipped it — which is why one level worked and two did not.
 static bool typeArgIdentical(const TypeRef* a, const TypeRef* b) {
     if (!a || !b) return a == b;
+    if (isFreeGenericTypeVarRef(a) || isFreeGenericTypeVarRef(b)) return true;
     if (!typeArgSameBase(a, b)) return false;
     if (a->kind == TypeRef::Kind::InlineArray)
         return typeArgIdentical(a->arrayElement, b->arrayElement);
@@ -6803,18 +6843,11 @@ static bool variantGenericAssignable(
         // genericArgs is a free type variable (generic method/type parameter
         // like A, B, T). Free variables accept any binding without variance
         // restriction — the only constraint is the concrete substitution, which
-        // is enforced at the call site, not here.
-        {
-            bool toArgFree = toArg->kind == TypeRef::Kind::Named &&
-                             !toArg->declaration &&
-                             toArg->genericArgs.empty() &&
-                             !namedTypeSimpleName(toArg).empty();
-            bool fromArgFree = fromArg->kind == TypeRef::Kind::Named &&
-                               !fromArg->declaration &&
-                               fromArg->genericArgs.empty() &&
-                               !namedTypeSimpleName(fromArg).empty();
-            if (toArgFree || fromArgFree) continue;
-        }
+        // is enforced at the call site, not here. (fix #4199: now shared with
+        // `typeArgIdentical`'s own recursion via `isFreeGenericTypeVarRef`,
+        // rather than this loop being the only place that recognised the shape.)
+        if (isFreeGenericTypeVarRef(toArg) || isFreeGenericTypeVarRef(fromArg))
+            continue;
 
         // Determine variance of `to`'s i-th parameter.
         std::string_view variance;
