@@ -4539,6 +4539,59 @@ void Emitter::emitAsyncPatternAResultDecision(bool chainedReturn,
             "bz_task_set_chained", llvm::Type::getVoidTy(llvm_),
             {ptrTy(), ptrTy()});
         builder_.CreateCall(setChainedFn, {outerTask, sourceTask});
+        // fix #4159 (§30.5 "Disposing an unconsumed OwningTask<T>", v0.298):
+        // detectAsyncPatternAKind's CallExpr arm (LlvmBackend_Async.cpp) does
+        // not distinguish a genuine Pattern A `Task<T:class>` chain source
+        // from a Pattern B `OwningTask<T:class>` one — both reach here as
+        // `chainedReturn`. A Pattern A source's own kind-1/kind-2 completion
+        // ALWAYS leaves it with a chained_source or a result_disposer of its
+        // own (transitively reaching a real disposer), so chaining alone
+        // already disposes the result exactly once. A Pattern B source
+        // produced by a genuinely kind-1 body (a bare fresh value, no
+        // further await — e.g. an unannotated `async lambda() => new
+        // Widget()` IIFE, whose own declared/inferred type is OwningTask
+        // per ExprTypecheck_Exprs.cpp's #800-Layer-2 wrap, not Pattern A —
+        // patternAResultDisposerFor's Task-only guard means NOTHING attaches
+        // a disposer to it) leaves NEITHER field set: the value this body
+        // just extracted from it is genuinely orphaned, and THIS body's own
+        // kind-1 disposer (asyncPatternAResultDisposer_, already correct for
+        // OUR OWN declared Pattern A return type) must additionally be
+        // attached to our own task, or nothing ever disposes it — measured
+        // 3200 B / 200 objects leaked without this.
+        //
+        // Which case applies is a RUNTIME fact (the source's chained_source
+        // / result_disposer fields, not a static type), because the source
+        // may be a NAMED local bound to an arbitrary lambda whose own body
+        // codegen cannot inspect from here — so query it via
+        // bz_task_needs_caller_disposal rather than re-deriving a static
+        // guess. Doing so is always SAFE to check unconditionally (a
+        // genuine Pattern A chain source reliably answers "already
+        // handled", a no-op here) and is the one place that can distinguish
+        // the two without risking a double free.
+        if (asyncPatternAResultDisposer_) {
+            auto* needsDisposalFn = declareC(
+                "bz_task_needs_caller_disposal", llvm::Type::getInt8Ty(llvm_),
+                {ptrTy()});
+            llvm::Value* needsDisposal =
+                builder_.CreateCall(needsDisposalFn, {sourceTask});
+            llvm::Value* needsDisposalCond = builder_.CreateICmpNE(
+                needsDisposal,
+                llvm::ConstantInt::get(llvm::Type::getInt8Ty(llvm_), 0));
+            llvm::Function* curFn = builder_.GetInsertBlock()->getParent();
+            auto* attachBB =
+                llvm::BasicBlock::Create(llvm_, "patternb.orphan.attach", curFn);
+            auto* contBB =
+                llvm::BasicBlock::Create(llvm_, "patternb.orphan.cont", curFn);
+            builder_.CreateCondBr(needsDisposalCond, attachBB, contBB);
+            builder_.SetInsertPoint(attachBB);
+            auto* setDisposerFn2 = declareC(
+                "bz_task_set_result_disposer", llvm::Type::getVoidTy(llvm_),
+                {ptrTy(), ptrTy()});
+            builder_.CreateCall(setDisposerFn2,
+                                {outerTask, asyncPatternAResultDisposer_});
+            builder_.CreateBr(contBB);
+            builder_.SetInsertPoint(contBB);
+        }
     } else if (asyncPatternAResultDisposer_) {
         // §30.5 / #1503: Pattern A (Task<T:class>) NON-chained return —
         // the async body produced a FRESH owned value, so the task owns

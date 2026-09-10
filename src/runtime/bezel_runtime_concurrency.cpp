@@ -942,6 +942,38 @@ void bz_task_set_result_disposer(void* tp, void (*disposer)(void*)) {
     task->result_disposer = disposer;
 }
 
+// fix #4159 (§30.5 "Disposing an unconsumed OwningTask<T>", v0.298): queried
+// by emitAsyncPatternAResultDecision's kind-2 (chained) arm, right after
+// bz_task_set_chained, to decide whether THIS body's own outer task must
+// ALSO get a kind-1 disposer attached for the value it just extracted from
+// `source` (an anonymous-producer §30.5 chain source, which may be a
+// genuine Pattern A `Task<T:class>` OR a Pattern B `OwningTask<T:class>` --
+// detectAsyncPatternAKind's CallExpr detection does not distinguish the two
+// [LlvmBackend_Async.cpp]).
+//
+// Returns 1 ("orphaned -- the caller must attach its own disposer") iff
+// `source` has settled with NEITHER a chained_source of its own NOR a
+// result_disposer of its own: i.e. nothing else will ever dispose the value
+// this call is about to extract from it. Returns 0 ("already handled") when
+// EITHER is set -- a genuine Pattern A chain (whose own chained_source
+// reaches a real disposer further down, or whose own result_disposer is set
+// directly) already disposes the result transitively; attaching a second
+// disposer here would double-free it.
+//
+// Race-safety: this task has SETTLED by the time an awaiter reaches this
+// call (that is what `await` resuming past suspension means), and the SAME
+// mutex bz_task_set_chained / bz_task_set_result_disposer take to WRITE
+// these two fields establishes the happens-before edge for this READ --
+// mirroring bz_task_free's own "no other thread still touches the struct"
+// invariant, but taken defensively here (unlike bz_task_free, this does not
+// run as part of the task's own teardown).
+int8_t bz_task_needs_caller_disposal(void* tp) {
+    if (!tp) return 0;
+    auto* task = (bz_task_t*)tp;
+    std::lock_guard<std::mutex> lk(task->mtx);
+    return (!task->chained_source && !task->result_disposer) ? 1 : 0;
+}
+
 // §30.13 / bz_task_await_sync: the main OS thread (emitted by the async-Main
 // wrapper in LlvmBackend_Async.cpp) blocks here until the top-level Task
 // completes.  This function is NOT a domain continuation: the main thread is

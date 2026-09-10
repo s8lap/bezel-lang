@@ -887,6 +887,17 @@ void  bz_task_set_chained(void* outer, void* source);
 // that disposes the produced result whenever it appears").
 void  bz_task_set_result_disposer(void* task, void (*disposer)(void*));
 
+// fix #4159 (§30.5 "Disposing an unconsumed OwningTask<T>", v0.298): queried
+// by emitAsyncPatternAResultDecision right after bz_task_set_chained, to
+// decide whether the chaining body must ALSO attach its own kind-1 disposer
+// for the value it just extracted from `source`. Returns 1 ("orphaned — the
+// caller must attach its own disposer") iff `source` has settled with
+// NEITHER a chained_source NOR a result_disposer of its own — i.e. nothing
+// else will ever dispose the value about to be extracted from it. Returns 0
+// when either is set: a genuine Pattern A chain already disposes the result
+// transitively, and attaching a second disposer would double-free it.
+int8_t bz_task_needs_caller_disposal(void* source);
+
 // Block the calling thread until the task completes. Returns a pointer to the
 // result buffer (owned by the task; valid until bz_task_free). Returns null on error.
 void* bz_task_await_sync(void* task);
