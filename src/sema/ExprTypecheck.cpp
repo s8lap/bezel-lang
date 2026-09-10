@@ -16782,6 +16782,19 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         TypeRef* scrutTy =
             cs->scrutinee ? ctx_.exprType(*cs->scrutinee) : nullptr;
         scrutTy = recoverChoiceThisScrutTy(cs->scrutinee.get(), scrutTy);
+        // fix #4139 (§19.6, v0.298): cache the shared exhaustiveness
+        // verdict — "does this case's no-match fallthrough edge provably
+        // never execute" — on the AST for the ownership pass's CaseStmt
+        // arm-join to consult (Node.hpp's CaseStmt::noMatchEdgeStatically-
+        // Dead carries the full rationale). quiet=true: no diagnostic (the
+        // statement-position form is exempt from the §19.6 non-
+        // exhaustiveness warning, unlike CaseExpr's checkCaseExhaustiveness
+        // caller) and the §5.1 pattern-range side-check is skipped here
+        // since checkCasePatternConstantRanges runs it explicitly two lines
+        // below regardless of this verdict. // per §19.6, v0.298, #4139
+        const_cast<ast::CaseStmt*>(cs)->noMatchEdgeStaticallyDead =
+            caseArmsExhaustive(cs->arms, cs->scrutinee.get(), scrutTy,
+                                s.span.begin, /*quiet=*/true);
         // §19.3 / §16.6 / §7.11 (v0.286, #3298): the statement-position form
         // takes the same rule as the CaseExpr site — one shared checker, so
         // the two spellings of `case` cannot drift apart on this verdict.

@@ -140,52 +140,36 @@ bool ownedParamIsFrameDisposable(const sema::ParameterSymbol& ps,
            !pt->declaration->isValueBuiltin;
 }
 
-// §19.6 (v0.295): a syntactic proxy for "can this `case` STATEMENT's
-// no-match fallthrough ever actually be reached?" — an unguarded `_`
-// (DiscardPattern) or unguarded untyped `var x` (BindingPattern with no type
-// annotation) among `cs.arms` matches ANY scrutinee value (§19.6: "Guarded
-// arms contribute nothing... an irrefutable arm absorbs any value"), so the
-// residual "no arm selected" space §19.6 §4167 describes ("falls through
-// with no action") is empty whenever one is present.
+// §19.6 (v0.295, superseded v0.298 #4139): "can this `case` STATEMENT's
+// no-match fallthrough ever actually be reached?" used to be answered here
+// by a purely SYNTACTIC proxy — an unguarded `_`/untyped-`var` catch-all
+// arm — which is the load-bearing carve-out fix #4116 needed for the
+// CaseStmt arm-join a few hundred lines below: without excluding the
+// no-match operand when it is provably dead, joining the pre-case snapshot
+// into EVERY case's result would falsely mark a local maybe-consumed even
+// when every arm (a catch-all included) definitely consumes it — the
+// direct `case` analogue of #3967's own `ifelse_both_branches_consume_
+// reassign_accepted_28_3` accept-side control.
 //
-// fix #4116 (§19.6, §28.3 K1.4, v0.295): this is the load-bearing carve-out
-// for the CaseStmt arm-join fix a few hundred lines below (this file,
-// visitStmt's CaseStmt arm) — without it, joining the pre-case snapshot into
-// EVERY case's result (to model the no-match fallthrough §19.6 permits)
-// would falsely mark `x` maybe-consumed even when a wildcard arm ALSO
-// consumes it, over-rejecting the direct `case` analogue of #3967's own
-// accept-side control (`if`/`else` where BOTH arms consume — accepted, since
-// every path is a definite move, not a maybe-move).
-//
-// Mirrors `isUnguardedCatchAll` (sema/ExprTypecheck.cpp) on exactly the two
-// irrefutable-pattern shapes it recognizes; NOT reused directly — that
-// function is anonymous-namespace-local to ExprTypecheck.cpp's translation
-// unit and unreachable from this pass, and threading a shared declaration
-// through a header for one four-line predicate was judged not worth doing
-// for this narrow fix (see the LANE_RULES duplicated-classification-
-// predicate rule — recorded here rather than silently re-derived).
-//
-// RESIDUAL (declared, not silently accepted): this is a SYNTACTIC test only.
-// A `case` the compiler proves exhaustive by CLOSED-HIERARCHY analysis
-// (§19.6 — a sealed class hierarchy, a full enum, or a full choice's case
-// set) with NO wildcard arm and every leaf arm consuming the same outer
-// local is not recognized here, so the join still folds in the pre-case
-// snapshot for that shape and can over-reject a subsequent legitimate
-// reassignment/move/read of that local. That is a false reject, not a
-// soundness hole (see the fix site's own comment for why the direction is
-// safe), and is left as a known limitation rather than a reason to hold this
-// fix — replicating sema's full §19.6 closed-value-space proof here would be
-// a much larger change for a narrower payoff.
-bool caseHasUnguardedCatchAllArm(const ast::CaseStmt& cs) {
-    for (const auto& arm : cs.arms) {
-        if (arm.guard) continue;  // a guard can fail at runtime (§19.6)
-        const ast::Pattern* p = arm.pattern.get();
-        if (dynamic_cast<const ast::DiscardPattern*>(p)) return true;
-        if (auto* bp = dynamic_cast<const ast::BindingPattern*>(p))
-            if (bp->type == nullptr) return true;  // untyped `var x`
-    }
-    return false;
-}
+// fix #4139 (§19.6, v0.298): that syntactic-only proxy missed the sibling
+// shape — a `case` the compiler proves exhaustive by CLOSED-VALUE-SPACE
+// analysis (every enum constant, both bool literals, every choice case,
+// every closed-hierarchy leaf) with NO wildcard arm — so a legitimate
+// enum/choice/sealed-hierarchy `case` where every leaf arm consumed the
+// same local was falsely rejected on a subsequent reassign/move/read. Fixed
+// by feeding the ownership pass the compiler's REAL §19.6 exhaustiveness
+// verdict instead of re-deriving a narrower one: `ExprTC::caseArmsExhaustive`
+// (sema/ExprTypecheck.cpp) already computes exactly this fact for the
+// expression-position non-exhaustiveness warning, and — per the LANE_RULES
+// duplicated-classification-predicate rule ("is there a fact the compiler
+// ALREADY COMPUTES that decides this?") — its verdict is now cached on the
+// AST as `CaseStmt::noMatchEdgeStaticallyDead` (Node.hpp; full rationale
+// there) by `ExprTC::visitStmt`'s CaseStmt arm, unconditionally (no "every
+// arm diverges" conjunction), and read directly at both join sites below.
+// It is a strict superset of the old syntactic-only predicate (the same
+// catch-all check is `caseArmsExhaustive`'s own first branch), so this
+// removes the syntactic proxy rather than keeping it alongside a second,
+// drifting spelling of the same decision. // per §19.6, v0.298, #4139
 
 bool armNeverFallsThrough(const std::vector<std::unique_ptr<ast::Stmt>>& stmts);
 
@@ -234,9 +218,12 @@ bool armNeverFallsThrough(const std::vector<std::unique_ptr<ast::Stmt>>& stmts);
 // what THIS predicate ended up needing too (once break/continue were
 // dropped) — but it is a private, `ctx_`-bound member of a different
 // translation unit's sema pass, unreachable from here for the same reason
-// `caseHasUnguardedCatchAllArm`'s own header comment gives for not reusing
-// `isUnguardedCatchAll` directly, and it additionally covers non-terminating
-// `while true` and exhaustive-case/try shapes this narrow fix does not need.
+// this file's CaseStmt exhaustiveness fix (#4139, a few hundred lines below)
+// reads a cached AST field rather than calling `sema::ExprTC` members
+// directly — `stmtAlwaysExits` is `ctx_`-bound to a different translation
+// unit's pass and not itself cached — and it additionally covers
+// non-terminating `while true` and exhaustive-case/try shapes this narrow
+// fix does not need.
 //
 // A syntactic, non-CFG check only: recurses into a fully-covered nested
 // `if` (every branch, including a required `else`) and a `do … end` block,
@@ -3146,21 +3133,29 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
     // pre-case `saved` state is folded into the join as an extra operand
     // standing in for that no-match completion, exactly the role IfStmt's
     // implicit `entry` fallthrough plays when `!hasElse` — UNLESS
-    // `caseHasUnguardedCatchAllArm` finds an unguarded `_`/untyped-`var` arm,
-    // in which case the no-match edge is provably empty and `saved` is left
-    // out, so a `case` where every arm (the catch-all included) consumes the
-    // same outer local still converges to a definite discharge rather than a
-    // spuriously conservative maybe-consumed — the direct `case` analogue of
-    // #3967's own `ifelse_both_branches_consume_reassign_accepted_28_3`
-    // accept-side control. When no such arm is present, including `saved`
-    // can only push the joined result to a MORE cautious lattice state
-    // (Owned+maybeConsumed instead of a clean discharge), never a less-
-    // checked one — `joinInto`'s lattice has no direction back down — so it
-    // cannot mask a real hazard, at the cost of occasionally flagging a
-    // later read/reassign of a local in the one residual shape
-    // `caseHasUnguardedCatchAllArm`'s own header comment names (a closed-
-    // hierarchy exhaustiveness proof with no wildcard arm) — a declared,
-    // known-safe-direction limitation, not a reason to hold this fix.
+    // `cs->noMatchEdgeStaticallyDead` is set, in which case the no-match
+    // edge is provably empty and `saved` is left out, so a `case` where
+    // every arm (a catch-all included, or every closed-value-space leaf)
+    // consumes the same outer local still converges to a definite discharge
+    // rather than a spuriously conservative maybe-consumed — the direct
+    // `case` analogue of #3967's own `ifelse_both_branches_consume_
+    // reassign_accepted_28_3` accept-side control. When the field is unset,
+    // including `saved` can only push the joined result to a MORE cautious
+    // lattice state (Owned+maybeConsumed instead of a clean discharge),
+    // never a less-checked one — `joinInto`'s lattice has no direction back
+    // down — so it cannot mask a real hazard.
+    //
+    // fix #4139 (§19.6, v0.298): through v0.295 this carve-out was gated on
+    // a purely SYNTACTIC catch-all check (`caseHasUnguardedCatchAllArm`,
+    // removed) that missed the sibling shape — a `case` the compiler proves
+    // exhaustive by CLOSED-VALUE-SPACE analysis (an exhaustive enum/choice/
+    // sealed-hierarchy `case` with NO wildcard arm) — falsely rejecting a
+    // legitimate reassign/move/read of a local every leaf arm consumed. See
+    // `CaseStmt::noMatchEdgeStaticallyDead`'s doc (Node.hpp) for the full
+    // rationale; it is the same §19.6 verdict `ExprTC::caseArmsExhaustive`
+    // computes for the expression-position non-exhaustiveness warning,
+    // cached on the AST by sema (which runs before this pass) instead of
+    // re-derived here.
     //
     // `emitClash` is passed `false` (mirroring the sibling expression-form
     // join, `joinMarkerFreeArmEnds`, this file's ~line 1408): an
@@ -3222,17 +3217,18 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
             if (!armNeverReachesJoin) armEnds.push_back(states_);
         }
         // fix #4116: join every arm's end state, plus `saved` for the
-        // statement-`case`'s possible no-match fallthrough (§19.6) UNLESS a
-        // syntactic catch-all arm proves that edge empty, instead of
-        // discarding all of it back to `saved`. See the header comment
-        // above for the full rationale.
+        // statement-`case`'s possible no-match fallthrough (§19.6) UNLESS
+        // the cached §19.6 exhaustiveness verdict proves that edge empty
+        // (fix #4139), instead of discarding all of it back to `saved`. See
+        // the header comment above for the full rationale.
         std::vector<BlockState> joinOperands = std::move(armEnds);
-        if (!caseHasUnguardedCatchAllArm(*cs))
+        if (!cs->noMatchEdgeStaticallyDead)
             joinOperands.push_back(saved);
         if (joinOperands.empty()) {
-            // fix #4138: every arm (a present unguarded catch-all included)
-            // provably never falls through -- the code after this `case` is
-            // unreachable via any live path. Fall back to `saved` rather
+            // fix #4138: every arm (a present unguarded catch-all included,
+            // or every closed-value-space leaf) provably never falls
+            // through -- the code after this `case` is unreachable via any
+            // live path. Fall back to `saved` rather
             // than dereference an empty vector; soundness is moot for
             // provably-unreachable code (`armNeverFallsThrough` never
             // over-claims termination, so this branch is only reached when
@@ -9489,12 +9485,17 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
         // fixed identically: join every arm's exit state, PLUS the pre-case
         // snapshot standing in for the statement-`case`'s no-match
         // fallthrough (§19.6 — "falls through with no action") UNLESS
-        // `caseHasUnguardedCatchAllArm` proves that edge empty — see
+        // `cs->noMatchEdgeStaticallyDead` proves that edge empty — see
         // #4116's fuller rationale at ~line 3008, including why this
         // carve-out matters: without it, a `case` where every arm (a
-        // catch-all included) consumes the same captured local would be
-        // falsely marked maybe-consumed instead of definitely-consumed. //
-        // per §28.3 K1.3/K7, §19.6, v0.295, #3951, #4116, #4117
+        // catch-all included, or every closed-value-space leaf) consumes
+        // the same captured local would be falsely marked maybe-consumed
+        // instead of definitely-consumed. fix #4139 (§19.6, v0.298) widened
+        // the carve-out from a syntactic catch-all-only check to the
+        // cached, full §19.6 exhaustiveness verdict — see
+        // `CaseStmt::noMatchEdgeStaticallyDead`'s doc (Node.hpp) and the
+        // #4116 join's own updated rationale at ~line 3140. //
+        // per §28.3 K1.3/K7, §19.6, v0.295/v0.298, #3951, #4116, #4117, #4139
         BlockState savedCaseStates = states_;
         std::vector<BlockState> caseArmEnds;
         for (const auto& arm : cs->arms) {
@@ -9522,12 +9523,13 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
             if (!armNeverFallsThrough(arm.stmts))
                 caseArmEnds.push_back(states_);
         }
-        if (!caseHasUnguardedCatchAllArm(*cs))
+        if (!cs->noMatchEdgeStaticallyDead)
             caseArmEnds.push_back(savedCaseStates);
         if (caseArmEnds.empty()) {
-            // fix #4138: every arm (a present unguarded catch-all included)
-            // provably never falls through. See the identical fallback on
-            // the real per-method CaseStmt join (this file, ~line 3255).
+            // fix #4138: every arm (a present unguarded catch-all included,
+            // or every closed-value-space leaf) provably never falls
+            // through. See the identical fallback on the real per-method
+            // CaseStmt join (this file, ~line 3255).
             states_ = savedCaseStates;
         } else {
             auto caseJoined = std::move(caseArmEnds.front());

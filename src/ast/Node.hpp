@@ -1414,6 +1414,32 @@ struct CaseStmt : Stmt {
     // by Emitter::lowerCaseStmt, so a single AST-mutable field is sufficient
     // (no need for a SemaContext side table).
     bool totalityGranted = false;
+    // fix #4139 (§19.6, v0.298): true when this CaseStmt's no-match
+    // fallthrough edge is PROVABLY unreachable — either an unguarded
+    // catch-all arm (`_` / untyped `var x`) or full closed-value-space
+    // coverage (every enum constant, both bool literals, every choice
+    // case, every closed-hierarchy leaf, each in its nullable variant) —
+    // the SAME §19.6 exhaustiveness verdict `ExprTC::caseArmsExhaustive`
+    // computes for the expression-position non-exhaustiveness warning.
+    // Deliberately WITHOUT `totalityGranted`'s additional "every arm
+    // diverges" conjunction (§21.7): that conjunction only matters for
+    // `totalityGranted`'s own consumer (does this case STATEMENT return on
+    // every path?); this field answers a narrower, unconditional question
+    // ("is the no-match edge dead?") that stays meaningful even when arms
+    // do NOT all diverge — which is exactly the ownership pass's use: the
+    // CaseStmt arm-join (`MethodOwnership::visitStmt` and the lambda-body
+    // pre-pass `applyUsingVarBorrowPinInLambdaStmt`, both Ownership.cpp)
+    // fold the pre-case snapshot into the join as a stand-in for the
+    // §19.6 no-match fallthrough UNLESS this field is set, in which case
+    // that edge is known-dead and folding it in would only over-reject a
+    // legitimate reassignment/move/read of a local every live arm
+    // consumes. Set unconditionally by ExprTC::visitStmt's CaseStmt arm
+    // (sema runs before ownership, Driver.cpp); read only by the
+    // ownership pass. Supersedes the ownership pass's own prior syntactic-
+    // only `caseHasUnguardedCatchAllArm` predicate, which covered only the
+    // catch-all disjunct — see #4139 for the exhaustive-with-no-wildcard
+    // false-reject that predicate could not catch.
+    bool noMatchEdgeStaticallyDead = false;
     // K8 full-expression boundary flag (#1795): mirrors
     // CaseExpr::disposeOwnedScrutinee for the statement-position form. Set
     // by the ownership pass; read by Emitter::lowerCaseStmt.
