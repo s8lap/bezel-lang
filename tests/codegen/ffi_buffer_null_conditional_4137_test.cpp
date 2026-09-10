@@ -82,6 +82,14 @@ BEZEL_TEST(ffi_buffer_nco_4137, cstring_extern_annotation_tostring_correct_value
     BEZEL_EXPECT_EQ(run(p), 42);
 }
 
+// fix-forward for a vacuous pass caught by this lane's own FAIL-WITHOUT
+// measurement: the original row asserted `h1 = h2 and h1 <> 0`, which is
+// TRUE when both are `null` too (`null = null` and `null <> 0` both hold
+// per §7.11's nullable-value comparison semantics), so it passed on BOTH
+// sides of the fix — pre-fix, `copy?.GetHashCode()` degrades the WHOLE
+// nullable local to `null` via the `!ms` bail (LANE_RULES §18: an
+// unexpectedly-low FAIL-WITHOUT count is a finding, not a rounding error).
+// Explicitly reject `null` first so a real int value is required.
 BEZEL_TEST(ffi_buffer_nco_4137, cstring_extern_annotation_gethashcode_correct_value_spec_8_3) {
     const std::string p =
         "module M; "
@@ -91,7 +99,10 @@ BEZEL_TEST(ffi_buffer_nco_4137, cstring_extern_annotation_gethashcode_correct_va
         "  using var copy := strdup(name); "
         "  var h1 := copy?.GetHashCode(); "
         "  var h2 := copy?.GetHashCode(); "
-        "  return (if h1 = h2 and h1 <> 0 then 42 else 1); "
+        "  if h1 = null then return 2; end; "
+        "  if h1 <> h2 then return 3; end; "
+        "  if h1! = 0 then return 4; end; "
+        "  return 42; "
         "end Main; end C;";
     BEZEL_EXPECT_TRUE(runAot(p).ran);
     BEZEL_EXPECT_EQ(run(p), 42);
