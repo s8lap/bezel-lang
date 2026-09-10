@@ -90,6 +90,24 @@
 // established mirroring discipline already documented at every other
 // `argSatisfiesNew` fix comment in this arm's history.
 //
+// REVIEW FOLLOW-UP (§9/§35.1 cycle guard, v0.298): the first version of
+// this fix recursed with no cycle guard — `ExprTC::defaultIllFormed`,
+// the function it was ported from, has none either, and shares the same
+// hazard via `default(...)`. A self-referential record
+// (`record Self<T>(N: Self<int>, V: T)`, already independently rejected
+// by `recordValueContainsSelf` at declaration time) recurses unboundedly
+// through field `N` and SIGSEGVs, because `Resolver::run` still evaluates
+// `where T: new()` after that earlier rejection. Before this port, only an
+// explicit `default(SelfReferentialRecord<...>)` could reach the
+// unguarded recursion; after, ANY `where T: new()` instantiation site can
+// (generic factories, DI-style code) — a much larger trigger surface, so
+// the guard is required here even though the sibling it was ported from
+// still lacks one. `recordFieldTypeHasNoDefaultWalk` now threads a PATH
+// cycle guard (`std::unordered_set<const TypeRef*>`, insert-on-entry/
+// erase-on-exit) mirroring `common::isBorrowBearingRecordCommon`
+// (OwnershipFacts.cpp) — see that function's own doc comment and this
+// file's row (8) below.
+//
 // SHAPE SWEEP (every row measured before/after the fix on this fix's
 // parent; see the commit body for the FAIL-WITHOUT / PASS-WITH counts):
 //   - delegating generic record, inner leaf bound to a non-nullable class
@@ -117,6 +135,10 @@
 //   - REGRESSION CONTROL: #3988's combined-form body-field shape (no
 //       generics, no delegation) keeps working
 //       (`where_T_new_rejects_combined_form_body_field_3988_control`)
+//   - CYCLE GUARD: a self-referential record reached through
+//       `where T: new()` -> REJECT with the CLEAN two-diagnostic outcome
+//       (§9 self-containment + §14.2 constraint), not a crash
+//       (`where_T_new_self_referential_record_rejects_cleanly_no_crash`)
 
 #include "support/aot_result_asserts.hpp"  // failedAtCompileTimeWithRealLocation, diagnosticMessageContains
 #include "support/aot_support.hpp"         // runAot
@@ -298,4 +320,54 @@ BEZEL_TEST(arg_satisfies_new_delegating_generic_record_4166,
         "    return b.Extra.Count; "
         "  end Main; "
         "end Program4166g;");
+}
+
+// ── (8) CYCLE GUARD (review follow-up, §9/§35.1, v0.298): a malformed
+//        self-referential record (`record Self<T>(N: Self<int>, V: T)`) —
+//        already rejected independently by `recordValueContainsSelf` at
+//        declaration time (§9) — reached through `where T: new()`.
+//        WITHOUT a cycle guard in `recordFieldTypeHasNoDefaultWalk`'s
+//        Record-kind recursion, field `N`'s declaration-site type
+//        `Self<int>` is the SAME `TypeRef*` on every recursive step (a
+//        NAMED, non-bare field is never substituted to a new pointer by
+//        `resolveRecordFieldSubst`), so the walk never terminates —
+//        SIGSEGV. `Resolver::run` still evaluates `where T: new()` AFTER
+//        the §9 rejection, so this shape is reachable regardless of that
+//        earlier diagnostic.
+//
+//        Asserts the CLEAN two-diagnostic rejection, not merely "no
+//        crash": field `N`'s cycle must DEFER (return "has a default",
+//        not "non-defaultable") so the walk still reaches field `V`,
+//        whose binding to a non-nullable class correctly triggers the
+//        §14.2 diagnostic too — exactly the two diagnostics the pre-#4166
+//        code (which never recursed into `N` at all, so never hit this
+//        hazard, but also never caught a genuinely delegating record)
+//        produced for this shape. ──────────────────────────────────────
+BEZEL_TEST(arg_satisfies_new_delegating_generic_record_4166,
+           where_T_new_self_referential_record_rejects_cleanly_no_crash_spec_9_14_2) {
+    auto r = runAot(
+        std::string("module M4166h; ") + kWidget4166 +
+        "public record SelfRP2h<T>(N: SelfRP2h<int>, V: T); "
+        "class Holder4166h<T> where T: new() "
+        "  public static method Make(): owned T => new T(); "
+        "end Holder4166h; "
+        "class Program4166h "
+        "  public static method Main(): int "
+        "    var b := Holder4166h<SelfRP2h<Widget4166>>.Make(); "
+        "    return b.V.Count; "
+        "  end Main; "
+        "end Program4166h;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    // §9 (checkRecordRestrictions / recordValueContainsSelf): the record's
+    // own value-self-containment, rejected independently of this fix.
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(
+        r, "cannot recursively contain itself by value"));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "\xC2\xA7""9)"));
+    // §14.2: the `where T: new()` constraint, correctly still evaluated —
+    // and still rejected, via field `V` — after field `N`'s cycle is
+    // safely deferred rather than crashing.
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(
+        r, "does not satisfy the constraint `where T: new()`"));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "\xC2\xA7""14.2"));
 }

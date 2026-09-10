@@ -1130,8 +1130,29 @@ private:
     // Record arm; never sets a `decided` flag itself — an unresolved nested
     // field defers to "defaultable" (returns false), matching
     // `defaultIllFormed`'s own conservative precedent for the identical case.
+    // Thin entry point: seeds an empty cycle-guard set and delegates to
+    // `recordFieldTypeHasNoDefaultWalk` below.
     bool recordFieldTypeHasNoDefault(const TypeRef* t,
                                       const common::RecordSubstEnv* incoming);
+
+    // fix #4166 review follow-up (§9/§35.1 cycle-guard precedent, v0.298):
+    // the recursive workhorse behind `recordFieldTypeHasNoDefault`, with an
+    // explicit PATH cycle guard (`seen`: insert on entry to the Record-kind
+    // branch, erase on exit) — mirrors `common::isBorrowBearingRecordCommon`
+    // (OwnershipFacts.cpp)'s own `seen` guard for the identically-shaped
+    // problem, keyed the SAME way (by `const TypeRef*` INSTANTIATION
+    // identity, never by the bare `TypeSymbol*` declaration — #3933 in that
+    // file records why a TypeSymbol*-keyed guard false-positives on two
+    // legitimate, non-cyclic instantiations of the same generic record). A
+    // self-referential record (`record Self<T>(N: Self<int>, V: T)`) is
+    // independently rejected with a clean diagnostic by
+    // `recordValueContainsSelf` at declaration time (§9); `Resolver::run`
+    // still evaluates `where T: new()` afterward, so this guard exists to
+    // stop THAT unbounded recursion from also reaching this later check —
+    // see the definition for the full rationale and the measured repro.
+    bool recordFieldTypeHasNoDefaultWalk(
+        const TypeRef* t, const common::RecordSubstEnv* incoming,
+        std::unordered_set<const TypeRef*>& seen);
 
     // §12.9 / issue #431: for each interface with variant generic parameters
     // (`out T` or `in T`), verify that every direct occurrence of those

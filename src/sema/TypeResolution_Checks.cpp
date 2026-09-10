@@ -7942,11 +7942,70 @@ bool Resolver::argSatisfiesNew(const TypeRef* arg, bool& decided) {
 // local, checked after the walk), so a deep, rare unresolved-nested-field
 // case defaults to the conservative-toward-acceptance direction rather
 // than manufacturing a false reject.
+//
+// This is a thin entry point that seeds an empty PATH cycle-guard set (see
+// `recordFieldTypeHasNoDefaultWalk`'s own comment, immediately below, for
+// why the guard is needed and what it is keyed on) — every EXTERNAL caller
+// (`argSatisfiesNew`'s per-member lambda) starts a fresh walk here, never
+// the guarded recursive helper directly.
 bool Resolver::recordFieldTypeHasNoDefault(
     const TypeRef* t, const common::RecordSubstEnv* incoming) {
+    std::unordered_set<const TypeRef*> seen;
+    return recordFieldTypeHasNoDefaultWalk(t, incoming, seen);
+}
+
+// fix #4166 review follow-up (§9/§35.1 cycle guard, v0.298): the recursive
+// workhorse. WITHOUT `seen`, a self-referential record —
+// `record Self<T>(N: Self<int>, V: T)`, `#9`'s own worked-example shape —
+// recurses unboundedly and SIGSEGVs (measured: `HolderSRP2<Self<Widget>>.
+// Make()` at a `where T: new()` site). The cause: for a NAMED (non-bare)
+// Record-kind field, `resolveRecordFieldSubst` returns `{ft, env}`
+// UNCHANGED (only a BARE parameter gets substituted to a different
+// pointer — see its own doc comment, OwnershipFacts.hpp) — so `N`'s
+// declared type `Self<int>` is the SAME `TypeRef*` on every recursive
+// step: seeding `Self`'s own generic params against `Self<int>`'s OWN
+// (already-concrete) `genericArgs=[int]` reproduces an IDENTICAL
+// environment every time, and the field walk revisits the IDENTICAL `t`
+// pointer forever, independent of what the OUTER instantiation's `T` was
+// ever bound to.
+//
+// `seen` is keyed by `const TypeRef*` — the INSTANTIATION identity, never
+// the bare `TypeSymbol*` declaration — with PATH semantics (insert on
+// entry to the Record-kind branch below, erase before returning), exactly
+// mirroring `common::isBorrowBearingRecordCommon`'s own guard
+// (OwnershipFacts.cpp) for the identically-shaped §9.7 field-walk problem.
+// That file's fix #3933 is why the key is the TypeRef instantiation and
+// not the TypeSymbol: two DIFFERENT, non-cyclic instantiations of the same
+// generic record (`Wrap<Pair<int>>` alongside `Wrap<Pair<Widget>>` on
+// sibling paths) share one `TypeSymbol*` but must each get their own
+// fresh walk — a TypeSymbol*-keyed guard would collide them and silently
+// under-report. PATH semantics (erase on exit, not permanent memoization)
+// is what makes that safe: a legitimate diamond (the same instantiation
+// reached via two non-nested sibling fields) resets between them, while a
+// GENUINE cycle (the same pointer reappearing while still on the current
+// recursion stack) is exactly what re-inserting into a non-empty `seen`
+// catches.
+//
+// On a detected cycle this returns `false` ("has a default" / fine, not
+// "non-defaultable") — the conservative direction, and the CORRECT one
+// here specifically: a self-referential record is ALREADY rejected with
+// its own clean diagnostic by `recordValueContainsSelf` at declaration
+// time (checkRecordRestrictions, this file, §9), independent of this
+// function. Returning `false` on the cyclic field lets the walk continue
+// to the record's OTHER fields — e.g. `V: T` in the repro above, which
+// correctly still triggers the `where T: new()` §14.2 rejection when `T`
+// is bound to a non-nullable class — reproducing the SAME two diagnostics
+// (§9 self-containment + §14.2 constraint) the pre-#4166 code produced for
+// this shape (its shallow `categorize()`-only check never recursed into
+// `N` at all, so it never had this hazard, but also never caught a
+// genuinely delegating record — the gap #4166 fixes).
+bool Resolver::recordFieldTypeHasNoDefaultWalk(
+    const TypeRef* t, const common::RecordSubstEnv* incoming,
+    std::unordered_set<const TypeRef*>& seen) {
     if (!t || t->nullable) return false;  // nullable → defaults null, fine
     if (t->kind == TypeRef::Kind::Named && t->declaration &&
         t->declaration->kind == ast::TypeDeclKind::Record) {
+        if (!seen.insert(t).second) return false;  // cycle: defer (fine)
         common::RecordSubstEnv env;
         common::seedRecordSubstEnv(*t->declaration, *t, incoming, env);
         const common::RecordSubstEnv* fieldEnv =
@@ -7958,13 +8017,14 @@ bool Resolver::recordFieldTypeHasNoDefault(
                 if (!rsm.type) return true;  // unresolved — defer (fine)
                 common::RecordSubstEnv::Entry sub =
                     common::resolveRecordFieldSubst(rsm.type, fieldEnv);
-                if (recordFieldTypeHasNoDefault(sub.ty, sub.env)) {
+                if (recordFieldTypeHasNoDefaultWalk(sub.ty, sub.env, seen)) {
                     nonDefaultable = true;
                     return false;  // stop
                 }
                 return true;
             },
             /*env=*/nullptr);
+        seen.erase(t);  // PATH semantics — see the function's own comment
         return nonDefaultable;
     }
     return categorize(t) == TypeCategory::Reference;
