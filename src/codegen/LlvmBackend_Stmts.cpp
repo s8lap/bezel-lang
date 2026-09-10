@@ -7344,6 +7344,28 @@ bool Emitter::lowerDictEntryFor(const ast::ForStmt& fs) {
             builder_.CreateStructGEP(entryStTy, varSlot, 1));
     }
 
+    // fix #4129 (§29.12/§28.3, stdlib §4.8, v0.295): register the snapshot
+    // spine (keysArr/lensArr/valsArr + the in-flight string Key) as its own
+    // disposeStack_ scope BEFORE loopStack_'s own entry, so a `return`/`throw`
+    // from inside the body reclaims it (see the field declarations in
+    // LlvmBackend_impl.hpp for the full derivation). Pushed AFTER the
+    // snapshot's own allocas exist so the registration can carry them; popped
+    // WITHOUT emission once the manual endBB code below has run (see there).
+    disposeStack_.push_back({});
+    {
+        Disposal d{nullptr, nullptr};
+        d.dictEntryForSnapshot = true;
+        d.dictEntryForKeysOutSlot = keysOutSlot;
+        d.dictEntryForLensOutSlot = isStringKey ? lensOutSlot : nullptr;
+        d.dictEntryForValsOutSlot = valsOutSlot;
+        d.dictEntryForCntSlot = cntSlot;
+        d.dictEntryForIdxSlot = idxSlot;
+        d.dictEntryForIsStringKey = isStringKey;
+        d.dictEntryForUseGen = useGen;
+        d.dictEntryForVarSlot = varSlot;
+        disposeStack_.back().push_back(d);
+    }
+
     loopStack_.push_back({incBB, endBB, disposeStack_.size()});
     bool term = lowerForBody(fs);
     loopStack_.pop_back();
@@ -7414,6 +7436,16 @@ bool Emitter::lowerDictEntryFor(const ast::ForStmt& fs) {
     if (isStringKey)
         builder_.CreateCall(freeFn, {lensArr});
     builder_.CreateCall(freeFn, {valsArr});
+    // fix #4129: the manual frees just above did EXACTLY what the
+    // dictEntryForSnapshot scope pushed before loopStack_ would do — pop it
+    // WITHOUT emission (a plain std::vector pop; nothing is emitted) so a
+    // LATER return/throw elsewhere in this method does not walk it a second
+    // time and double-free this snapshot. Every `return`/`throw` reachable
+    // from INSIDE the loop body already fired it (via emitAllDisposals /
+    // emitDisposalsInRange / the unwind walk) before control could reach
+    // here, so this pop is reached only by normal completion or `break` —
+    // the two exits the manual code above already covers.
+    disposeStack_.pop_back();
     // #1055: a fresh `owned Dictionary` materializer iterated directly as the
     // for-in source (`for var e in src.ToDictionary(k) do … end`) is owned by
     // nothing and leaks. Reclaim it here at the loop exit, which both normal

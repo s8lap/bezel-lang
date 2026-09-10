@@ -1831,6 +1831,46 @@ private:
         // back to for a runtime-managed value it cannot prove non-escaping).
         // Fires on BOTH the normal and unwind exit, mirroring `grouping`.
         bool dictEntryKeyRelease = false;
+        // fix #4129 (§29.12 / §28.3, stdlib §4.8, v0.295): a `for var entry in
+        // dict` entry-iteration's own key/value SNAPSHOT SPINE arrays — the
+        // malloc'd arrays bz_dict_keys_str/bz_dict_keys_gen/bz_dict_values_str/
+        // bz_dict_values_gen hand back before the loop starts
+        // (lowerDictEntryFor's keysOutSlot/lensOutSlot/valsOutSlot/cntSlot) —
+        // plus, for a STRING key, the in-flight iteration's rebuilt
+        // `bz_string*` Key (the loop-var struct's field 0) and any per-key
+        // snapshot boxes at [idxSlot, cnt) the increment block has not yet
+        // freed. lowerDictEntryFor's own manual endBB code reclaims all of
+        // this on every normal-completion and `break` exit — but a
+        // `return`/`throw` FROM INSIDE THE LOOP BODY diverges before reaching
+        // endBB and previously leaked it all (measured: 62 B / 6 allocations
+        // per call for a single-entry string-keyed dict; #4129). Registered as
+        // its OWN disposeStack_ scope, pushed right after the snapshot is
+        // taken and BEFORE loopStack_'s own entry — so `break`/`continue`
+        // (whose emitLoopDisposals only unwinds scopes AT OR ABOVE the loop's
+        // recorded depth) never see it and keep using the existing manual
+        // endBB code exclusively — and popped WITHOUT emission once that
+        // manual code has run (it already did the identical work; emitting
+        // this scope too would double-free). A `return`'s emitAllDisposals /
+        // emitDisposalsInRange and a `throw`'s unwind walk both still hold
+        // this scope open at the point they fire, so both now reclaim it
+        // exactly once. The generic `slot`/`cls` fields are unused — this
+        // kind needs five independent slots, carried below (all entry-block
+        // allocas, so they dominate — and are readable from — any point
+        // later in the function, including deep inside the loop body).
+        bool dictEntryForSnapshot = false;
+        llvm::AllocaInst* dictEntryForKeysOutSlot = nullptr;  // ptr* (char**/void**)
+        llvm::AllocaInst* dictEntryForLensOutSlot = nullptr;  // ptr* (i64*); null unless string key
+        llvm::AllocaInst* dictEntryForValsOutSlot = nullptr;  // ptr* (void**)
+        llvm::AllocaInst* dictEntryForCntSlot     = nullptr;  // i64* — snapshot count
+        llvm::AllocaInst* dictEntryForIdxSlot     = nullptr;  // i64* — current cursor
+        bool dictEntryForIsStringKey = false;
+        bool dictEntryForUseGen = false;
+        // The loop-var struct alloca — consulted ONLY when
+        // dictEntryForIsStringKey, to release the in-flight iteration's
+        // rebuilt Key at field 0 exactly as endBB's own isStringKey branch
+        // does (its struct type is read back via getAllocatedType(),
+        // mirroring `dictEntryKeyRelease` just above).
+        llvm::AllocaInst* dictEntryForVarSlot = nullptr;
         // §35.4 (v0.200, #2045 stage 3): an OWNING-CLASSIFIED choice local
         // (a sum whose classification is Owning, e.g. one with an `owned`
         // payload slot per §35.4.1). At scope end the active case's owned

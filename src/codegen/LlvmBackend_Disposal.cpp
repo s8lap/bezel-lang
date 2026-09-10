@@ -5912,6 +5912,74 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
             }
             continue;
         }
+        // fix #4129 (§29.12/§28.3, stdlib §4.8, v0.295): a `for var entry in
+        // dict` loop's key/value snapshot spine — see the field declarations
+        // in LlvmBackend_impl.hpp for the full derivation. Mirrors
+        // lowerDictEntryFor's own manual endBB code (LlvmBackend_Stmts.cpp)
+        // exactly, reading every value back through its slot because this
+        // arm fires from a `return`/`throw` reached from an arbitrary point
+        // deep inside the loop body, not from a block dominated by the
+        // original SSA values (only the entry-block allocas are).
+        if (it->dictEntryForSnapshot) {
+            auto* freeFnD =
+                declareC("free", llvm::Type::getVoidTy(llvm_), {ptrTy()});
+            llvm::Value* keysArrD = builder_.CreateLoad(
+                ptrTy(), it->dictEntryForKeysOutSlot, "def.keys");
+            llvm::Value* valsArrD = builder_.CreateLoad(
+                ptrTy(), it->dictEntryForValsOutSlot, "def.vals");
+            llvm::Value* cntD =
+                builder_.CreateLoad(i64(), it->dictEntryForCntSlot, "def.cnt");
+            // String key: release the in-flight iteration's rebuilt Key
+            // (loop-var struct field 0) — null-safe, mirrors endBB's own
+            // isStringKey branch.
+            if (it->dictEntryForIsStringKey && it->dictEntryForVarSlot) {
+                if (auto* st = llvm::dyn_cast_or_null<llvm::StructType>(
+                        it->dictEntryForVarSlot->getAllocatedType())) {
+                    llvm::Value* keyAddr = builder_.CreateStructGEP(
+                        st, it->dictEntryForVarSlot, 0, "def.key.addr");
+                    llvm::Value* keyVal =
+                        builder_.CreateLoad(ptrTy(), keyAddr, "def.key.val");
+                    emitStringRelease(keyVal);
+                }
+            }
+            // Free the remaining per-key snapshot boxes at [idx, cnt) — the
+            // increment block already freed [0, idx); mirrors endBB's own
+            // break-path closing loop verbatim (including mutating the
+            // original idxSlot in place — safe, since this arm only runs on
+            // a path that is about to leave the function/unwind, and no
+            // consumer reads idxSlot again after this point).
+            if (it->dictEntryForIsStringKey || it->dictEntryForUseGen) {
+                auto* clCondBB = llvm::BasicBlock::Create(
+                    llvm_, "def.cl.cond", currentFn_);
+                auto* clBodyBB = llvm::BasicBlock::Create(
+                    llvm_, "def.cl.body", currentFn_);
+                auto* clEndBB = llvm::BasicBlock::Create(
+                    llvm_, "def.cl.end", currentFn_);
+                builder_.CreateBr(clCondBB);
+                builder_.SetInsertPoint(clCondBB);
+                llvm::Value* ci = builder_.CreateLoad(
+                    i64(), it->dictEntryForIdxSlot, "def.cl.idx");
+                builder_.CreateCondBr(
+                    builder_.CreateICmpSLT(ci, cntD), clBodyBB, clEndBB);
+                builder_.SetInsertPoint(clBodyBB);
+                llvm::Value* ckp = builder_.CreateLoad(
+                    ptrTy(), builder_.CreateGEP(ptrTy(), keysArrD, ci));
+                builder_.CreateCall(freeFnD, {ckp});
+                builder_.CreateStore(
+                    builder_.CreateAdd(ci, builder_.getInt64(1)),
+                    it->dictEntryForIdxSlot);
+                builder_.CreateBr(clCondBB);
+                builder_.SetInsertPoint(clEndBB);
+            }
+            builder_.CreateCall(freeFnD, {keysArrD});
+            if (it->dictEntryForIsStringKey) {
+                llvm::Value* lensArrD = builder_.CreateLoad(
+                    ptrTy(), it->dictEntryForLensOutSlot, "def.lens");
+                builder_.CreateCall(freeFnD, {lensArrD});
+            }
+            builder_.CreateCall(freeFnD, {valsArrD});
+            continue;
+        }
         // #422 / #2960 / §8.6 / §28.9: a provably-non-escaping `var`
         // Object/interface local whose box-vs-class contents are tracked by the
         // placement layer. Reassignable slots carry `boxReleaseState`: release
