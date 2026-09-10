@@ -61,14 +61,40 @@
 // true, correct output, and the Key still LEAKS by design (the closure
 // genuinely escapes here) — 500x-amplified LSan measurement of the same
 // shape (`scripts/agent_check.sh --probe --asan`, `C.MakeClosure()` + `g()`
-// called in a 500-iteration loop): 17500 B / 500 allocations leaked, i.e. 35
-// B / 1 allocation per call (32 B calloc'd `bz_string_t` header + 3 B "xy\0"
-// payload malloc) — the SAME per-call shape #4127's own measurement reports
-// for the analogous `.First()`-bound-local case, confirming this is the
-// SAME, already-accepted trade-off applied to the for-loop-variable family.
+// called in a 500-iteration loop): 45500 B / 2000 allocations leaked (91 B /
+// call, across 4 allocation call sites) — but NOT all of that is this fix's
+// own leak. Decomposed with a second, isolating probe (see below): 35 B /
+// call (32 B calloc'd `bz_string_t` header, indirect + 3 B "xy\0" payload
+// malloc, indirect — 17500 B / 500 calls total) IS this fix's own
+// safe-direction leak, the SAME per-call shape #4127's own measurement
+// reports for the analogous `.First()`-bound-local case; the remaining 56 B
+// / call is TWO separate, pre-existing, unrelated leaks this fix neither
+// introduces nor fixes:
+//   * 16 B / call — the boxed for-loop-variable capture CELL itself (a
+//     `{bz_string* Key, int Value}` struct, padded). This is #793's OWN
+//     explicitly-accepted residual scope: that (closed) issue's fix frees
+//     the cell only for a captured-and-PROVEN-NON-ESCAPING for-var
+//     (`for_var_capture_leak_793_test.cpp`'s own header: "An ESCAPING
+//     capture's cell is NOT freed ... it keeps leaking, the safe
+//     direction") — untouched by #4161, which only ever gates the Key
+//     release, never the cell's.
+//   * 40 B / call — NEWLY FOUND while isolating the figure above: a plain
+//     `var f: () -> int := lambda() => 0; f := lambda() => <escaping>;`
+//     REASSIGNMENT never releases the DISPLACED first closure value, with
+//     no dict/capture/loop involvement at all. Isolated with two control
+//     probes: the exact same reassignment shape with NO dict/loop leaks 40
+//     B/call standalone; the same method with the reassignment step removed
+//     (`return lambda() => 42;` directly) is completely clean. Filed as
+//     #4174 — a pre-existing §28.9 runtime-managed-reclaim gap for
+//     function-typed locals, unrelated to `lowerDictEntryFor` and not fixed
+//     here (out of this fix's scope: it is not specific to dict-entry
+//     for-loops, and every row in THIS file that assigns the escaping
+//     closure to an outer `var` co-incurs it, unavoidably, because that
+//     reassignment is the only way to make a for-loop-variable capture
+//     escape without a direct `return` — mirroring the issue's own repro).
 //
 // PRE-EXISTING, UNRELATED LEAKS IN THE SAME AREA (explicitly NOT this fix's
-// bytes — read and ruled out before trusting the numbers above/below):
+// bytes — read and ruled out before trusting the numbers above):
 //   * #4165 (a NON-escaping closure capture of a `.First()`/`.Last()`-bound
 //     DictionaryEntry LOCAL leaks its rebuilt Key) — a different eligibility
 //     family (`isFreshDictEntryKeyReleaseTerminalLocal`/#3720's own scope-end
@@ -86,8 +112,9 @@
 //     VARIABLE leaks a 4 B capture cell) — requires a `while`/counted loop
 //     whose counter a lambda reads; no row here declares a lambda over a
 //     loop counter, only over the dict-entry for-var itself.
-// None of the four apply to any row in this file, so every measured byte
-// above/below is attributable to #4161 alone.
+// None of the four apply to any row in this file. Combined with the #793 and
+// #4174 accounting above, the 91 B / call raw measurement is now fully
+// decomposed: 35 B (#4161, this fix) + 16 B (#793) + 40 B (#4174) = 91 B.
 //
 // ORACLE. The escaping-capture (UAF) rows use `runAotCheckedLenient` (ASan
 // crash detection, LeakSanitizer OFF) — exactly the disposition sibling file
