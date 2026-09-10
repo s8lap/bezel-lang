@@ -2399,6 +2399,56 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
             const auto* aliasDecl =
                 dynamic_cast<const ast::TypeAlias*>(aliasSym->decl);
             if (aliasDecl && aliasDecl->aliasedType) {
+                // fix #4167 (§27.8, v0.298): a reference to a GENERIC alias
+                // that does not supply exactly the alias's own declared
+                // number of type arguments has no sound resolution — this
+                // branch below copies the alias's CACHED underlying TypeRef
+                // (resolved once, at the alias's own declaration site, with
+                // the alias's generic params bound as `nullptr` markers in a
+                // throwaway scope) verbatim into every reference site; it
+                // never substitutes `t.genericArgs` into that cached ref, so
+                // an omitted or miscounted argument list is silently
+                // ignored rather than caught. For an alias whose body IS (or
+                // reduces to) one of its own type parameters —
+                // `type IdP11<T> := T;` — a bare reference's cached
+                // underlying TypeRef is `Kind::Named` with
+                // `declaration == nullptr`: exactly the shape §26.2 reserves
+                // for "the target is a type parameter", and nothing
+                // downstream can tell it apart from the legitimate
+                // declaration-less shape locally-resolved builtins use
+                // (`Array<T>`, `IEnumerable<T>`, …) — `extension IdP11`
+                // (bare) reached codegen with a permanently dead, uncallable
+                // member block and zero diagnostics (issue #4167). This
+                // check closes the hole at its root, for every reference
+                // context a bare/miscounted generic-alias name can appear in
+                // (locals, fields, parameters, extension targets, …), not
+                // just extension targets — completing, for aliases, the
+                // same generic-arity check §11.3/Appendix C.4 already gives
+                // ordinary TypeSymbol references a few lines below. Unlike
+                // that check, a wholly bare (zero-argument) reference is
+                // ALSO rejected here when the alias is generic: the
+                // TypeSymbol check tolerates an omitted argument list (a
+                // "raw" reference to the real declared type, which still
+                // carries a genuine declaration downstream); a generic
+                // alias has no such safe fallback; its cached underlying
+                // ref is the ONLY representation available and — as above —
+                // is indistinguishable from a bare type-parameter reference
+                // when the alias's body is one.
+                if (t.genericArgs.size() != aliasDecl->genericParams.size()) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, t.span.begin,
+                        "generic-argument count does not match type "
+                        "alias `" + std::string(aliasDecl->name) +
+                        "`'s generic-parameter count (\xC2\xA7""27.8)");
+                    // Resolve any supplied args anyway so the AST is fully
+                    // visited (matches the primitive-generic-args error
+                    // path above).
+                    for (const auto& ga : t.genericArgs) {
+                        if (ga) resolveType(*ga, scope);
+                    }
+                    ref.kind = TypeRef::Kind::Error;
+                    return;
+                }
                 if (TypeRef* underlying =
                         ctx_.resolvedType(*aliasDecl->aliasedType)) {
                     // Copy the underlying kind and payload into ref. The nullable
