@@ -50,9 +50,15 @@
 // right target: an exception from within a try's own body always lands at
 // THAT try's own `catchDispatch` directly, with nothing being "exited" yet.
 //
-// SCOPE, EXPLICITLY: a throwable call inside a CATCH ARM's own body has
-// never had this coarse modeling either (before or after this fix) — a
-// separate, still-open, narrower-still gap, filed as #4201, not touched here.
+// SCOPE, EXPLICITLY (AT THE TIME): a throwable call inside a CATCH ARM's own
+// body had never had this coarse modeling either (before or after this fix)
+// — a separate, narrower-still gap, filed as #4201. ⚠ #4201 has SINCE closed
+// that gap (`Builder::addApproximateTryBodyExceptionEdge` no longer excludes
+// `isArmContext` frames, and the arm-building loop in `visitTry` mirrors
+// `tryBodyEnd`'s own fall-through exception edge for `armEnd`) — Row 7 below,
+// which this scope note originally justified as an ACCEPT, had its own
+// verdict corrected to REJECT in #4201's commit; see that row's comment for
+// why the correction is sound, not a new over-rejection.
 //
 // REVIEW FIX (still #4194, same commit as the review that found it): the
 // FIRST version of `addApproximateTryBodyExceptionEdge`'s `!isArmContext`
@@ -62,17 +68,23 @@
 // frame was pushed at all, so an arm's Builder inherited `tryHandlers_`
 // UNCHANGED and `.back()` named the OUTER frame instead of "am I inside this
 // arm" — the guard silently tested the wrong thing. MEASURED false reject:
-// two SIBLING (mutually exclusive) catch arms on a nested try/no-finally,
-// each independently `move`ing and returning the SAME local, were wrongly
-// rejected as a double-move (compiles clean, runs correctly exit 1, at
-// `3999278`; wrongly rejected at the first `a3ebff6` cut of this fix). THE
-// FIX: push the arm frame UNCONDITIONALLY (`finallyEntry`/`finallyClones`
-// null when there is none) — see visitTry's own comment on that push; both
-// `exceptionTarget()` and `routeExitThroughFinally` already treat a
-// null-`finallyEntry` frame as "nothing to hop through" and are unaffected.
-// Row 7 below pins this mechanically.
+// two SIBLING (mutually exclusive, or so they looked before #4201 — see
+// above) catch arms on a nested try/no-finally, each independently `move`ing
+// and returning the SAME local, were wrongly rejected as a double-move
+// (compiles clean, runs correctly exit 1, at `3999278`; wrongly rejected at
+// the first `a3ebff6` cut of this fix). THE FIX: push the arm frame
+// UNCONDITIONALLY (`finallyEntry`/`finallyClones` null when there is none) —
+// see visitTry's own comment on that push; both `exceptionTarget()` and
+// `routeExitThroughFinally` already treat a null-`finallyEntry` frame as
+// "nothing to hop through" and are unaffected. Row 7 below still pins this
+// mechanically: `armInner.tryHandlers_.back()` (read by both
+// `exceptionTarget()` and #4201's new coarse edge) must name the arm frame,
+// not the outer one, in the no-finally case Row 7 exercises — a regression
+// of THIS fix would misroute Row 7's diagnostic to the wrong `catchDispatch`
+// (or lose it) rather than merely changing accept/reject.
 //
-// per §21.5, §21.7, §28.3, §30.5, §31.2, v0.298, #4194 (adjacent to #4180)
+// per §21.5, §21.7, §28.3, §30.5, §31.2, v0.298, #4194 (adjacent to #4180),
+// #4201
 
 #include <string>
 
@@ -379,22 +391,41 @@ BEZEL_TEST(cfg_try_terminator_exception_edge_4194,
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
 
-// Row 7: REVIEW-FOUND false reject (see this file's header comment, "REVIEW
-// FIX"). A nested try with NO finally on either level: the inner try
-// (catches `MyErr`) and outer try (catches `Exception`) each have a catch
-// arm that independently `move`s the SAME local `x` and returns — the two
-// arms are MUTUALLY EXCLUSIVE (only one ever executes), so this is
-// idiomatic sibling-cleanup code, not a real double-move. The first cut of
-// this fix's `!isArmContext` guard (before `visitTry` pushed the arm frame
-// unconditionally) tested the OUTER frame instead of "am I inside this arm"
-// whenever there was no finally, and wrongly rejected this as a double-move.
-// MEASURED (isolated worktree): compiles clean and returns 1 at `3999278`
-// (baseline); wrongly rejected with "owned value in `x` was already moved
-// out at this point (§28.3)" at the first `a3ebff6` cut of this fix; clean
-// and returns 1 again after pushing the arm frame unconditionally.
-// per §21.5, §28.3, §31.1, §31.2, v0.298
+// Row 7: REVIEW-FOUND false reject at the time (see this file's header
+// comment, "REVIEW FIX"), **superseded by fix #4201** (below) — this row's
+// own ACCEPT verdict is now the WRONG one and had to be corrected in the
+// same commit that closed #4201, per CLAUDE.md's "a fix that reverses a
+// prior [verdict] must update the existing tests that pinned the OLD
+// behaviour."
+//
+// A nested try with NO finally on either level: the inner try (catches
+// `MyErr`) and outer try (catches `Exception`) each have a catch arm that
+// independently `move`s the SAME local `x` and returns. When this row was
+// written, the two arms LOOKED mutually exclusive (only one ever executes
+// at runtime, since `Sink.Take` never actually throws) — but that read
+// relied entirely on catch-ARM bodies having NO throwable-call
+// exception-edge modeling at all (exactly the gap #4201 filed and fixed:
+// this same file's own Row 1, directly above, already established that a
+// coarse maybe-throw call — `Sink.Take(move x)`, which cannot actually
+// throw either — is correctly treated as a possible exception source for a
+// TRY BODY; #4201 extends the identical coarse modeling to a CATCH ARM's
+// own body). Once the inner arm's own `Sink.Take(move x)` is treated the
+// same way, `x` is provably ALREADY MOVED the instant that call is reached
+// (argument evaluation happens before the call, unconditionally) — so the
+// coarse "this call might have thrown" edge correctly propagates that
+// Moved state past the inner arm (whose own try does NOT catch it — the
+// same #4180 invariant this file's header already documents) to the OUTER
+// (`Exception`) catch, whose own `move x` is now a genuine possible
+// double-move the compiler cannot disprove (it has no purity/nothrow
+// annotation for `Sink.Take` to rule this out).
+//
+// MEASURED: compiles clean and returns 1 at `3999278` (baseline, pre-#4201)
+// and still at the #4201 base commit (0a0d8ef, #4194 alone); rejects with
+// `kAlreadyMovedMsg` at the outer arm's `move x` once #4201's arm-body
+// coarse exception edge lands — FAIL-WITHOUT / PASS-WITH for this row.
+// per §21.5, §28.3, §31.1, §31.2, v0.298, #4201
 BEZEL_TEST(cfg_try_terminator_exception_edge_4194,
-           sibling_catch_arms_no_finally_independent_move_accepted) {
+           sibling_catch_arms_no_finally_independent_move_rejected_4201) {
     std::string src =
         std::string(kPrelude) +
         "class C "
@@ -419,7 +450,7 @@ BEZEL_TEST(cfg_try_terminator_exception_edge_4194,
         "    return Helper(); "
         "  end Main; "
         "end C;";
-    JitResult r = runAotChecked(src);
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 1);
+    OwnershipResult r = parseAndCheckOwnership(src);
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(r, kAlreadyMovedMsg));
 }

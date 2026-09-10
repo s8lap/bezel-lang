@@ -276,22 +276,34 @@ private:
     // `return`) has no CFG edge showing it might have thrown before that
     // return's own (correctly #4180-routed) normal-exit edge took effect.
     //
-    // Scoped to a real (non-arm) try-body frame via `!isArmContext`: a
-    // throwable call inside a CATCH ARM's own body has never had this
-    // coarse modeling either (before or after #4180), which is a separate,
-    // still-open gap (filed #4201) that this fix does not extend to. This
-    // fires while still lexically inside a try's own body — directly, or
-    // nested through if/while/nested-try (each of which threads
-    // `tryHandlers_` down via its own sub-Builder, so `tryHandlers_.back()`
-    // always names the innermost SUCH try) — at exactly the same nesting
-    // scope `tryBodyEnd`'s edge already covers for the fall-through case.
+    // fix #4201 (same §§, v0.298): fires for a CATCH ARM's own body too, not
+    // just a try body. #4194 originally excluded arm frames here via
+    // `!isArmContext`, because nothing modeled the arm body's FALL-THROUGH
+    // tail either — landing here only for the terminator case (return /
+    // break / continue), with nothing for the fall-through case, would have
+    // been an inconsistent partial model, so both ship together: see the
+    // mirrored `cfg_.addExceptionEdge(armEnd, armInner.exceptionTarget())`
+    // added right after `armInner.visitStmt` in the arm-building loop below.
+    // `exceptionTarget()` already answers correctly for both frame kinds
+    // without any change here: a normal (non-arm) frame's `catchDispatch`
+    // IS the landing point, while an arm frame (`isArmContext`) hops through
+    // THIS try's finally (if any) before reaching the OUTER target instead
+    // (#4180's routing, reused unchanged) — matching the invariant that a
+    // throw inside a catch arm is never caught by that arm's own try.
+    //
+    // This fires while still lexically inside a try's own body, or a catch
+    // arm's own body — directly, or nested through if/while/nested-try (each
+    // of which threads `tryHandlers_` down via its own sub-Builder, so
+    // `tryHandlers_.back()` always names the innermost SUCH frame) — at
+    // exactly the same nesting scope the fall-through edge already covers.
     // `exceptionTarget()` (not `routeExitThroughFinally`) is deliberately
-    // the target: an exception from within a try's own body always lands at
-    // THAT try's own `catchDispatch` directly, with no finally-hop needed —
-    // there is nothing being "exited" yet, unlike a break/continue/return
-    // that must hop through finally chains to reach an OUTER destination.
+    // the target: an exception from within a try's own body, or a catch
+    // arm's own body, always lands at that frame's own computed target
+    // directly, with no separate hop needed here — there is nothing being
+    // "exited" yet, unlike a break/continue/return that must hop through
+    // finally chains to reach an OUTER destination.
     void addApproximateTryBodyExceptionEdge(CFGBlock* from) {
-        if (tryHandlers_.empty() || tryHandlers_.back().isArmContext) return;
+        if (tryHandlers_.empty()) return;
         cfg_.addExceptionEdge(from, exceptionTarget());
     }
 
@@ -753,6 +765,29 @@ private:
             if (armEnd) {
                 cfg_.addEdge(armEnd,
                              finallyEntry ? finallyEntry : afterTry);
+                // fix #4201 (§21.5/§21.7/§28.3/§31.2, v0.298): mirror
+                // `tryBodyEnd`'s own coarse "a throwable call somewhere in
+                // this body might have thrown" exception edge (above, at
+                // `cfg_.addExceptionEdge(tryBodyEnd, catchDispatch)`) for the
+                // ARM's own body falling through. Before this fix, a
+                // throwable call inside a catch arm's body that was not an
+                // explicit `throw` (e.g. `this.Risky(); x.Dispose();`) had
+                // NO CFG representation of "this call might have thrown
+                // before `x.Dispose()` ran" at all — an explicit `throw` was
+                // already correctly modeled via #4180's `exceptionTarget()`
+                // arm hop, but nothing approximated any OTHER throwable call.
+                // `armInner.exceptionTarget()` reads
+                // `armInner.tryHandlers_.back()` — still the arm frame
+                // pushed above, since visiting the body never pops it — so
+                // it resolves exactly like an explicit `throw` written right
+                // here would: NOT this try's own `catchDispatch` (a throw in
+                // a catch arm is not caught by its own try), but the OUTER
+                // target, hopping through this try's finally first when one
+                // is active (#4180's isArmContext routing, reused
+                // unchanged). See addApproximateTryBodyExceptionEdge's
+                // comment for the sibling terminator-case (return / break /
+                // continue inside the arm body) half of this same fix.
+                cfg_.addExceptionEdge(armEnd, armInner.exceptionTarget());
             }
         }
 
