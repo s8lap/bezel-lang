@@ -3662,6 +3662,19 @@ static bool checkStaticReadonlyRecordInit(
 static bool checkNestedBorrowBearingSlot(
     SemaContext& ctx, const TypeRef* pft, const ast::Expr* argExpr,
     SourceLocation loc, std::string_view what, std::string_view name);
+// fix #4134 (§9.7, v0.295): a choice VALUE is constructed via a case CALL
+// (`Type.Case(args)`, resolved to a ChoiceCaseSymbol) — never a `new`
+// expression (§35.1: "a choice's construction *is* case selection"; spec
+// prose at the field-initializer admission list states this explicitly:
+// "it is not a `new` expression"). `checkStaticReadonlyRecordInit`'s own
+// Choice arm is keyed to a `new`-expression's argument list and can only
+// GUESS which case is intended by matching arity across every declared
+// case; here the callee already resolved to one EXACT case, so there is
+// no ambiguity to guess through. See the definition below, just after
+// `checkStaticReadonlyRecordInit`.
+static bool checkStaticReadonlyChoiceCaseInit(
+    SemaContext& ctx, const ast::CallExpr& ce, const ChoiceCaseSymbol* cs,
+    SourceLocation loc, std::string_view what, std::string_view name);
 
 // §22.12 rule 3/4 (v0.262, #3272): classify a CONCRETE substitution at the
 // instantiation site for a `static readonly` bare-parameter declaration,
@@ -11730,6 +11743,22 @@ bool checkNestedBorrowBearingSlot(
         if (auto* nestedNew = dynamic_cast<const ast::NewExpr*>(argExpr))
             return checkStaticReadonlyRecordInit(ctx, *nestedNew, pft, loc,
                                                  what, name);
+        // fix #4134 (§9.7, v0.295): a nested slot whose OWN type is a
+        // Choice is never initialized with a `new` expression (choices
+        // have no constructors, §35.1) — its real spelling is a case CALL
+        // (`Type.Case(...)`). Recognize that spelling here too, exactly as
+        // `checkStaticReadonlyNullSource`'s own top-level gate now does,
+        // so a record/choice field of choice type is not silently
+        // skipped just because it is one level down.
+        if (pft->declaration->kind == ast::TypeDeclKind::Choice) {
+            if (auto* nestedCall = dynamic_cast<const ast::CallExpr*>(argExpr)) {
+                Symbol* calleeSym = ctx.exprSymbol(*nestedCall->callee);
+                if (auto* ccs = dynamic_cast<ChoiceCaseSymbol*>(calleeSym))
+                    return checkStaticReadonlyChoiceCaseInit(ctx, *nestedCall,
+                                                             ccs, loc, what,
+                                                             name);
+            }
+        }
         return false;
     }
     // Declaration-less: only the four builtin span views are handled; every
@@ -11896,6 +11925,61 @@ bool checkStaticReadonlyRecordInit(
     return false;
 }
 
+// fix #4134 (§9.7, v0.295): the choice-value counterpart of
+// `checkStaticReadonlyRecordInit`, keyed to a SPECIFIC, already-resolved
+// `ChoiceCaseSymbol` rather than a `new`-expression's bare argument list.
+//
+// `checkStaticReadonlyRecordInit`'s own Choice arm (just above) exists to
+// serve a `new Tok(...)` NewExpr, which carries no case identity at all —
+// it has to iterate every declared case and guess by matching arity. That
+// guess is unsound in general (two cases of the same arity are
+// indistinguishable to it) and, per the spec's own field-initializer
+// admission list (§5130-area prose: "it is not a `new` expression … a
+// choice's construction *is* case selection", §35.1), a `new`-expression
+// is not how a choice value is ever legitimately constructed in the first
+// place — the real spelling is a qualified case CALL, `Type.Case(args)`,
+// which resolves through ordinary call typechecking to a `ChoiceCaseSymbol`
+// (`ExprTypecheck_Calls.cpp`'s `ChoiceCaseSymbol` stamp). Every caller of
+// this function already has that resolved symbol in hand, so there is no
+// arity-guessing here: `cs` names the EXACT case, and `ce.args` are its
+// EXACT arguments — the same per-payload null-source walk as the Choice
+// arm above, applied without ambiguity. Returns true iff a diagnostic was
+// reported.
+bool checkStaticReadonlyChoiceCaseInit(
+    SemaContext& ctx, const ast::CallExpr& ce, const ChoiceCaseSymbol* cs,
+    SourceLocation loc, std::string_view what, std::string_view name) {
+    if (!cs || !cs->caseDecl) return false;
+    std::size_t arity = cs->caseDecl->payload.size();
+    if (ce.args.size() != arity) return false;  // mismatch — typecheck reports
+    for (std::size_t i = 0; i < arity; ++i) {
+        const ast::Param& pf = cs->caseDecl->payload[i];
+        if (!pf.type) continue;
+        const TypeRef* pft = ctx.resolvedType(*pf.type);
+        if (!pft) continue;
+        const ast::Expr* argExpr = ce.args[i].value.get();
+        if (!argExpr) continue;  // discard argument: no source to inspect
+        if (staticReadonlyFieldIsReferenceTyped(pft, ctx)) {
+            if (isStaticallyNullExpr(argExpr)) continue;
+            std::string pname = std::string(pf.name);
+            ctx.diagnostics().report(
+                Severity::Error, loc,
+                std::string("static readonly ") + std::string(what) + " `"
+                + std::string(name) + "` has choice value with non-null "
+                "reference-typed payload `" + pname + "`; \xC2\xA7""9.7 "
+                "requires the null-source form (every reference-typed "
+                "component must be null) (\xC2\xA7""22.12 rule 4 residual "
+                "+ \xC2\xA7""9.7, v0.265, #3273 / #3290)");
+            return true;  // one diagnostic per site
+        }
+        // fix #4134: same nested-slot handling as checkStaticReadonlyRecordInit's
+        // record/choice arms (nested record/choice, or a declaration-less
+        // builtin span view).
+        if (checkNestedBorrowBearingSlot(ctx, pft, argExpr, loc, what, name))
+            return true;
+    }
+    return false;
+}
+
 void Resolver::checkStaticReadonlyNullSource() {
     // Walk every type in the program. For each type's static readonly
     // field / auto-property whose declared type is one of the three §9.7-
@@ -12038,6 +12122,26 @@ void Resolver::checkStaticReadonlyNullSource() {
                 // form the issue explicitly cites, and the negative test
                 // in static_readonly_residual_3290_test.cpp's own record
                 // case pins the spec's wording.
+                continue;
+            }
+            // fix #4134 (§9.7, v0.295): a CHOICE value's real construction
+            // spelling is a case CALL (`Type.Case(args)`), never a `new`
+            // expression — the NewExpr-only branch above therefore never
+            // reached `checkStaticReadonlyRecordInit`'s Choice arm for any
+            // spec-compliant choice-typed static readonly initializer.
+            // Recognize the real spelling: the callee resolves to a
+            // `ChoiceCaseSymbol` exactly when the call constructs a case of
+            // THIS declared choice type (§35.3), the same test
+            // `ExprTypecheck_Calls.cpp`'s own call-typing arm uses.
+            if (auto* ce = dynamic_cast<const ast::CallExpr*>(init)) {
+                if (rt->kind == TypeRef::Kind::Named && rt->declaration &&
+                    rt->declaration->kind == ast::TypeDeclKind::Choice) {
+                    Symbol* calleeSym = ctx_.exprSymbol(*ce->callee);
+                    if (auto* ccs = dynamic_cast<ChoiceCaseSymbol*>(calleeSym))
+                        checkStaticReadonlyChoiceCaseInit(ctx_, *ce, ccs,
+                                                          init->span.begin,
+                                                          what, memberName);
+                }
                 continue;
             }
             // Any other initializer (call result, captured variable,
