@@ -12291,11 +12291,32 @@ void ExprTC::visitMember(const ast::Member& m) {
                             // too, instead of a third spelling.
                             bool nonInstantiable =
                                 rejectNewOnNonInstantiableKind(*shNe, fty);
+                            // fix #4190 (§17.7 / §9.1, v0.298): the sibling
+                            // gap to #4176 immediately above — this guard
+                            // ran `checkNewExprArgs` for
+                            // `TypeDeclKind::Class` only, never for
+                            // `TypeDeclKind::Record`, so a field
+                            // shorthand-`new`'d to a record skipped BOTH
+                            // arity and per-argument type checking (the
+                            // explicit `new T(...)` arm in
+                            // ExprTypecheck_Exprs.cpp runs
+                            // `checkNewExprArgs` for Class AND Record —
+                            // see its #1105/#4059 comments). Measured:
+                            // `private _p: PointF2 := new(3);` against
+                            // `record PointF2(X: int, Y: int)` compiled
+                            // clean and left `X` unbound (read back as 0,
+                            // not 3) — the same silent-miscompilation shape
+                            // #1105/§9.1 closed for the explicit spelling.
+                            // `checkNewExprArgs` already has the Record arm
+                            // (`t->hasPositionalFields`); it just needed to
+                            // be reachable from here too.
                             if (!nonInstantiable &&
                                 fty->kind == TypeRef::Kind::Named &&
                                 fty->declaration &&
-                                fty->declaration->kind ==
-                                    ast::TypeDeclKind::Class)
+                                (fty->declaration->kind ==
+                                     ast::TypeDeclKind::Class ||
+                                 fty->declaration->kind ==
+                                     ast::TypeDeclKind::Record))
                                 checkNewExprArgs(*shNe, fty->declaration);
                             // fix #2994 (§17.7, v0.241): the shorthand is the
                             // SAME construction with the type taken from the
@@ -13442,11 +13463,25 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                             // predicate the explicit site now calls too.
                             bool nonInstantiable = rejectNewOnNonInstantiableKind(
                                 *shNe, lsym->declType);
+                            // fix #4190 (§17.7 / §9.1, v0.298): local-
+                            // declaration twin of the field-initializer fix
+                            // above — this guard ran `checkNewExprArgs` for
+                            // `TypeDeclKind::Class` only, never Record, so
+                            // `var p: PointBADARGS4176B := new(3);` against
+                            // a 2-field record compiled clean and bound
+                            // nothing (measured: `p.X` read back as 0, not
+                            // 3 — exit 100 on the issue's own repro). The
+                            // explicit `new T(...)` arm has run
+                            // `checkNewExprArgs` for Record since #1105/
+                            // #4059; this shorthand path just never reached
+                            // it.
                             if (!nonInstantiable &&
                                 lsym->declType->kind == TypeRef::Kind::Named &&
                                 lsym->declType->declaration &&
-                                lsym->declType->declaration->kind ==
-                                    ast::TypeDeclKind::Class)
+                                (lsym->declType->declaration->kind ==
+                                     ast::TypeDeclKind::Class ||
+                                 lsym->declType->declaration->kind ==
+                                     ast::TypeDeclKind::Record))
                                 checkNewExprArgs(
                                     *shNe, lsym->declType->declaration);
                             // fix #2994 (§17.7, v0.241): the local-declaration

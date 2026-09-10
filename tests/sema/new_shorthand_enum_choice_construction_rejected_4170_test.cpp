@@ -318,6 +318,23 @@ BEZEL_TEST(sema_new_shorthand_enum_choice_construction_rejected_4170,
         9);
 }
 
+// UPDATE (fix #4190, §17.7/§9.1, v0.298): these two rows originally called
+// the record shorthand with ZERO args against a 2-required-field record
+// (`new()` against `record PointACR4170(X: int, Y: int)`) and asserted
+// exit 0 — i.e. both fields silently left at their zero default. That was
+// not a legitimate accept case; it was #4190's own bug (the shorthand
+// never validated record constructor args at all), caught only because
+// zero happened to be both the "no args supplied" result AND the expected
+// sum. #4190 wires `checkNewExprArgs` into these two shorthand call sites
+// for `TypeDeclKind::Record` (previously Class-only), so a positional
+// record's required fields are now enforced here exactly as they always
+// were for the explicit `new T(...)` spelling (§9.1, #1105/#4059). Updated
+// to supply the correct 2 args, matching the sibling accept-side record
+// row in `new_shorthand_interface_abstract_construction_rejected_4176_test.cpp`
+// (`accept_record_local_decl_shorthand_compiles_and_runs_spec_17_7`, which
+// already used `new(3, 4)`) — these rows still prove what they were meant
+// to prove: this file's own enum/choice-rejection predicate does not
+// spuriously reject a legitimate record shorthand construction.
 BEZEL_TEST(sema_new_shorthand_enum_choice_construction_rejected_4170,
            accept_record_local_decl_shorthand_compiles_and_runs_spec_17_7) {
     BEZEL_EXPECT_EQ(runProg(
@@ -325,11 +342,11 @@ BEZEL_TEST(sema_new_shorthand_enum_choice_construction_rejected_4170,
         "public record PointACR4170(X: int, Y: int); "
         "class ProgramACR4170 "
         "  public static method Main(): int "
-        "    var p: PointACR4170 := new(); "
+        "    var p: PointACR4170 := new(3, 4); "
         "    return p.X + p.Y; "
         "  end Main; "
         "end ProgramACR4170;"),
-        0);
+        7);
 }
 
 BEZEL_TEST(sema_new_shorthand_enum_choice_construction_rejected_4170,
@@ -338,7 +355,7 @@ BEZEL_TEST(sema_new_shorthand_enum_choice_construction_rejected_4170,
         "module M; "
         "public record PointACRF4170(X: int, Y: int); "
         "class HolderACRF4170 "
-        "  public Slot: PointACRF4170 := new(); "
+        "  public Slot: PointACRF4170 := new(3, 4); "
         "end HolderACRF4170; "
         "class ProgramACRF4170 "
         "  public static method Main(): int "
@@ -346,7 +363,30 @@ BEZEL_TEST(sema_new_shorthand_enum_choice_construction_rejected_4170,
         "    return h.Slot.X + h.Slot.Y; "
         "  end Main; "
         "end ProgramACRF4170;"),
-        0);
+        7);
+}
+
+// NEW (fix #4190, §17.7/§9.1, v0.298): reject-side twin of the two rows
+// above — the actual bug this fix closes. Before this fix, `new(3)` (one
+// arg) against the same 2-required-field record compiled clean via the
+// shorthand and left `Y` unbound (measured pre-fix: `p.X + p.Y` returned
+// `3`, not the arity error the explicit spelling has always given). See
+// `tests/sema/new_shorthand_record_arg_validation_4190_test.cpp` for the
+// full FAIL-WITHOUT/PASS-WITH-pinned regression coverage; this one row is
+// kept here too since it sits beside the two rows it corrects above.
+BEZEL_TEST(sema_new_shorthand_enum_choice_construction_rejected_4170,
+           reject_record_local_decl_shorthand_wrong_arity_spec_17_7_9_1) {
+    auto r = runAot(
+        "module M; "
+        "public record PointRWA4170(X: int, Y: int); "
+        "class ProgramRWA4170 "
+        "  public static method Main(): int "
+        "    var p: PointRWA4170 := new(3); "
+        "    return p.X + p.Y; "
+        "  end Main; "
+        "end ProgramRWA4170;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "not supplied"));
 }
 
 BEZEL_TEST(sema_new_shorthand_enum_choice_construction_rejected_4170,
