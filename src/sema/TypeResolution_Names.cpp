@@ -494,6 +494,109 @@ void Resolver::bindExtensionTargetTypeParams(const ast::Type& target,
     }
 }
 
+// fix #4144 (§26.2, v0.295): the extendable-target list is CLOSED — the
+// section states exactly which kinds may be extended (classes including
+// `Object`, interfaces, records, enums, built-in primitives) and exactly
+// which may not (type parameters, nullable types directly, function types,
+// choices, inline-array types) — but nothing in `src/sema/` gated
+// `ExtensionDecl`'s resolved target kind against that list. A `choice`
+// target reached codegen and crashed with an unterminated basic block
+// (`case this of` lowering has no extension-aware branch, #4144); a nullable
+// target (`extension int?`) reaches a DIFFERENT codegen crash (a
+// call-parameter-type IR-verifier failure), because
+// `extensionTargetMatchesReceiver` (ExprTypecheck.cpp ~6150) explicitly
+// documents "ignoring nullability... because §26.2 forbids `extension
+// int?`" — an invariant nothing was enforcing; a function-type target
+// silently compiles and runs with the extension member's body degraded to
+// a no-op via the #3079 backstop. Inline-array targets are the one kind
+// that does NOT reach a crash today — an unrelated, pre-existing blanket
+// member-lookup gate (ExprTypecheck_Calls.cpp ~15859) already rejects any
+// non-allow-listed member access on an inline-array RECEIVER, citing
+// §26.2 — but the extension DECLARATION itself still compiles clean with
+// dead, uncallable members, which is not what a closed list means. Reject
+// all four live-crash/live-gap kinds here, at the declaration site, right
+// after the target type resolves — before any member of the block is
+// typechecked or reaches codegen.
+//
+// "Type parameters" (`extension T` is meaningless, §26.2) is the fifth
+// listed kind and is deliberately NOT given a case here: an extension's
+// own §26.4 type-parameter binding only auto-binds a bare identifier
+// found in the target type's GENERIC ARGUMENT positions
+// (`bindExtensionTargetTypeParams` above), never the target type's own
+// head, so a bare `extension T` can only ever resolve `T` as an ordinary
+// name lookup — succeeding only if `T` names a real declared type (in
+// which case it extends that concrete type, which is legitimate and not
+// an instance of this rule at all) or failing with the existing, general
+// "unresolved type name" diagnostic. There is no TypeRef shape a live
+// program can produce here that represents "the target IS a type
+// parameter", so there is nothing this gate could observe and reject that
+// current behavior does not already handle correctly.
+void Resolver::rejectDisallowedExtensionTarget(const ast::ExtensionDecl& ext) {
+    if (!ext.targetType) return;
+    const TypeRef* ref = ctx_.resolvedType(*ext.targetType);
+    if (!ref) return;
+    const SourceLocation loc = ext.targetType->span.begin;
+    // §26.2: "Nullable types directly (`extension int?`). Extend the
+    // non-nullable form; callers handle nullability at the call site with
+    // `?.` (§7.5)." — the TOP-LEVEL nullable marker on the target type
+    // itself; a nullable type nested inside a generic argument position
+    // (`extension Array<int?>`) is unaffected — §26.4 already covers that
+    // a bare block-level parameter unifies with nullable arguments.
+    if (ref->nullable) {
+        ctx_.diagnostics().report(
+            Severity::Error, loc,
+            "cannot extend a nullable type directly (\xC2\xA7""26.2): "
+            "extend the non-nullable form instead \xE2\x80\x94 callers "
+            "handle nullability at the call site with `?.` "
+            "(\xC2\xA7""7.5)");
+        return;
+    }
+    switch (ref->kind) {
+        case TypeRef::Kind::Named: {
+            // §26.2: "Choices. The extendable list above is closed against
+            // the choice kind..."
+            if (ref->declaration &&
+                ref->declaration->kind == ast::TypeDeclKind::Choice) {
+                ctx_.diagnostics().report(
+                    Severity::Error, loc,
+                    "cannot extend a choice type `" +
+                    std::string(ref->declaration->name) +
+                    "` (\xC2\xA7""26.2): the extendable list is closed "
+                    "against the choice kind \xE2\x80\x94 no \xC2\xA7""14.2 "
+                    "constraint names the value-like classification bound a "
+                    "payload-generic extension surface would need, and "
+                    "stdlib `Result<T, E>`'s value-payload combinator "
+                    "surface is compiler-provided (\xC2\xA7""35.2), not an "
+                    "extension block");
+            }
+            return;
+        }
+        case TypeRef::Kind::Function:
+            // §26.2: "Function types."
+            ctx_.diagnostics().report(
+                Severity::Error, loc,
+                "cannot extend a function type (\xC2\xA7""26.2)");
+            return;
+        case TypeRef::Kind::InlineArray:
+            // §26.2: "Inline-array types (`extension [N]T`). Inline arrays
+            // are value-typed but their identity is per-size... so an
+            // extension declaration would have to fix N, making the form
+            // rarely useful."
+            ctx_.diagnostics().report(
+                Severity::Error, loc,
+                "cannot extend an inline-array type (\xC2\xA7""26.2): inline "
+                "arrays are value-typed but their identity is per-size "
+                "(`[3]int` and `[4]int` are distinct types), so an "
+                "extension declaration would have to fix N \xE2\x80\x94 "
+                "write a static method that takes a specific inline-array "
+                "type per overload, or a heap-array view (`Array<T>`) the "
+                "caller constructs from the inline array's contents");
+            return;
+        default:
+            return;
+    }
+}
+
 void Resolver::resolveTopDecl(const ast::TopDecl& decl, Scope* parent) {
     if (auto* td = dynamic_cast<const ast::TypeDecl*>(&decl)) {
         resolveTypeDecl(*td, parent);
@@ -541,6 +644,10 @@ void Resolver::resolveTopDecl(const ast::TopDecl& decl, Scope* parent) {
             bindExtensionTargetTypeParams(*ext->targetType, extScope, parent);
         }
         if (ext->targetType) resolveType(*ext->targetType, &extScope);
+        // fix #4144 (§26.2, v0.295): reject a target kind the closed
+        // extendable list excludes, before any member of the block is
+        // resolved further or reaches codegen.
+        rejectDisallowedExtensionTarget(*ext);
         for (const auto& gc : ext->genericConstraints) {
             for (const auto& item : gc.items) {
                 if (item.typeArg) resolveType(*item.typeArg, &extScope);

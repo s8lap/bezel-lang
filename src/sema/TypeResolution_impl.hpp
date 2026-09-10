@@ -808,6 +808,13 @@ private:
     void bindExtensionTargetTypeParams(const ast::Type& target,
                                         Scope& extScope, Scope* parent);
 
+    // fix #4144 (§26.2, v0.295): reject an ExtensionDecl whose resolved
+    // target kind is outside §26.2's closed extendable list (a nullable
+    // type directly, a choice, a function type, or an inline-array type).
+    // Must run after `ext.targetType` has been resolved (its resolved
+    // TypeRef is read via `ctx_.resolvedType`).
+    void rejectDisallowedExtensionTarget(const ast::ExtensionDecl& ext);
+
     void resolveTypeDecl(const ast::TypeDecl& td, Scope* parent);
 
     void resolveMember(const ast::Member& m, Scope* parent);
