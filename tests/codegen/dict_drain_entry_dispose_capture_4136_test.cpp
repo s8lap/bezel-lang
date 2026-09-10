@@ -96,6 +96,15 @@
 // answer; the two programs below deliberately avoid invoking a closure that
 // reads a field `Dispose()` has released, so as to isolate the
 // stack-buffer-overflow this fix actually targets.
+//
+// UPDATE (R17 fix-forward): #4156 was subsequently FIXED, later in this same
+// batch, by a DIFFERENT mechanism than the above paragraph anticipated --
+// not permitting the post-Dispose read at all, but rejecting at COMPILE TIME
+// any closure that captures an already-explicitly-disposed local and then
+// escapes the method via `return` (§28.2/§28.9). That correctly caught the
+// K=int row's program below too (it also returned its capturing closure),
+// which forced a rewrite -- see the comment immediately above
+// `intKeyProgram()`.
 
 #include <string>
 
@@ -119,13 +128,56 @@ bool has(const std::string& hay, const char* needle) {
     return hay.find(needle) != std::string::npos;
 }
 
+// R17 fix-forward (narrow, test-only; gate cycle 3 went RED on exactly this
+// row). The program below was REWRITTEN because fix #4156
+// (`checkIndirectEscapeOnReturn`'s new Disposed-source arm, §28.2/§28.9,
+// v0.294) landed LATER in this same 26-commit batch than this file, and its
+// new diagnostic correctly rejects the ORIGINAL program that used to live
+// here: `entry` was captured by a lambda `f`, `entry.Dispose()` ran, and `f`
+// was then `return`ed from `MakeClosure` (escaping the method), relying on
+// `Main()` invoking the returned closure afterward to read `entry.Key` -- a
+// field #4136's fix proved is never touched by `Dispose()` for a K=int
+// entry, so that specific runtime read was safe.
+//
+// But the ORIGINAL program was unsound independent of Dispose timing or
+// which field the closure reads: per spec §28.3 "Local variables,
+// ownership, and borrows", the "Captured owned local inside a closure"
+// producers row (docs/Bezel_Language_Spec.md) states the capture is
+// "Borrowed (source: the local's enclosing scope) ... the closure cannot
+// outlive the local's scope", and the borrow-lifetime-rules bullet on
+// closures repeats it: a closure "may not be ... returned from the
+// enclosing method ... while its source set is non-empty". `entry`'s scope
+// is the `for`-loop's per-iteration body -- strictly narrower than
+// `MakeClosure` -- so a closure capturing it may never be returned from
+// `MakeClosure`, disposed or not. The Owned-state instance of exactly this
+// shape was ALREADY a compile error before this batch
+// (`checkClosureEscapesOnReturn`'s `st.state == Owned` arm); fix #4156
+// closes the SAME rule's Disposed-state gap, which is the ONLY reason the
+// original program here used to compile at all -- it was pinning a missed
+// rejection (a compiler bug), not a legitimate accept case (LANE_RULES
+// §15 case (a): "the row pinned unsound behaviour and must change").
+//
+// Rewritten to invoke `f()` and consume its value BEFORE `entry.Dispose()`,
+// entirely inside the loop body -- the closure is never returned and never
+// outlives `entry`'s scope, so fix #4156 does not apply. `entry` is still
+// captured by a lambda literal appearing in its scope, which per the file
+// header above forces §27.5 capture boxing of its slot for the local's
+// WHOLE lexical lifetime independent of invocation order, so
+// `entry.Dispose()` below still resolves through the boxed cell and still
+// exercises fix #4136's `boxedStorage`-routed disposal GEP -- the actual
+// defect class this file exists to pin.
+//
+// Measured on this worktree's HEAD (b802527): the pre-rewrite program FAILS
+// to compile with fix #4156's new diagnostic ("... is a closure capturing
+// `entry`, which was explicitly disposed before this return ..."); this
+// rewritten program PASSES (r.ran=true, stdout contains "key=7"). Logs:
+// /var/tmp/bezel-scratch/r17/ff-4136/logs/l1-4136-probe-pre-rewrite.log
+// (rejection) and .../l1-4136-probe-post-rewrite.log (key=7, clean run).
+// The sibling `string_key_captured_loop_var_explicit_dispose_no_stack_overflow`
+// row below needed NO change: its lambda is assigned to the discard `_` and
+// never returned, so it never reaches #4156's return-escape check.
+//
 // K=int: DrainedEntry<int, Widget> = {i32(padded to 8), ptr} = 16 bytes.
-// `entry` is captured by `f` (forcing §27.5 capture boxing of its slot); the
-// closure reads only `entry.Key` (an `int`, never touched by `Dispose()` --
-// only `Value` is disposed and only a STRING `Key` is released/nulled), so
-// invoking the returned closure AFTER the explicit `Dispose()` call under
-// test is safe and exercises a genuine runtime value, not just "did not
-// crash".
 std::string intKeyProgram() {
     return
         "module M; public class Widget "
@@ -135,19 +187,20 @@ std::string intKeyProgram() {
         "  end constructor; "
         "end Widget; "
         "class C "
-        "  public static method MakeClosure(): () -> int "
+        "  public static method MakeValue(): int "
         "    using var d := new OwningDictionary<int, Widget>(); "
         "    d.Add(7, new Widget(9)); "
         "    for var entry in d.Drain() do "
         "      var f := lambda() => entry.Key; "
+        "      var k := f(); "
         "      entry.Dispose(); "
-        "      return f; "
+        "      return k; "
         "    end; "
-        "    return lambda() => -1; "
-        "  end MakeClosure; "
+        "    return -1; "
+        "  end MakeValue; "
         "  public static method Main(): int "
-        "    var f := MakeClosure(); "
-        "    Console.WriteLine($\"key={f()}\"); "
+        "    var k := MakeValue(); "
+        "    Console.WriteLine($\"key={k}\"); "
         "    return 0; "
         "  end Main; "
         "end C;";
