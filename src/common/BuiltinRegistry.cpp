@@ -227,6 +227,16 @@ constexpr std::array<std::string_view, 3> kFfiBufferBuiltins = {
     "CString", "WString", "RawBytes",
 };
 
+// fix #4126 (stdlib §6.1/§8.1, v0.295): see the header for the full
+// rationale. Two builtin heap-pointer classes sharing the FFI-buffer trio's
+// exact defect shape (no vtable, no dedicated Object-contract interceptor),
+// kept as their own row rather than folded into `kFfiBufferBuiltins` (which
+// also drives FFI-specific malloc/free disposal and member dispatch that
+// does not apply to either of these).
+constexpr std::array<std::string_view, 2> kNoOverrideIdentityBuiltins = {
+    "Stopwatch", "CancellationToken",
+};
+
 // The heap-pointer reference builtins shared by BOTH codegen rep paths in
 // LlvmBackend_Layout.cpp (see header).  This is the intersection of the two
 // pre-refactor hand-lists: OwningBuffer (astNode-only) and the FFI class names
@@ -866,6 +876,10 @@ bool isLinkedListName(std::string_view n) {
 bool isFfiBufferBuiltinName(std::string_view n) {
     return contains(kFfiBufferBuiltins, n);
 }  // per §32.5 / stdlib §10.1–§10.3 (#2809) — the raw-buffer FFI classes
+
+bool isNoOverrideIdentityBuiltinName(std::string_view n) {
+    return contains(kNoOverrideIdentityBuiltins, n);
+}  // per §6.1 / §8.1 (#4126) — Stopwatch / CancellationToken, no-vtable heap ptrs
 
 bool isHeapPointerReferenceBuiltin(std::string_view n) {
     return contains(kHeapPointerReferenceBuiltins, n);

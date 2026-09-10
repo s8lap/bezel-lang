@@ -6396,13 +6396,36 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                 // path) depends on THIS check still excluding it too, or a
                 // no-arg `.ToString()` on FrozenArray is caught here first
                 // and never reaches its own fix again.
+                // fix #4126 (stdlib §6.1/§8.1, v0.295): Stopwatch and
+                // CancellationToken share #4120's exact shape one line above
+                // — measured: `Stopwatch.StartNew().ToString()` SIGSEGVed in
+                // `bz_string_to_utf8z` (this receiver's raw `bz_stopwatch_t*`
+                // misread as a vtable pointer, the misread "vtable slot"
+                // happening to point at invalid memory); `CancellationToken.
+                // None.ToString()` rendered the null-receiver sentinel
+                // "null" for `.None`, and a NON-null token's `.ToString()`
+                // ALSO SIGSEGVed the same way as Stopwatch (the issue's own
+                // filing measured only `.None`, which is representationally
+                // a null pointer and so happened to hit
+                // `lowerObjectToString`'s dedicated null-receiver branch
+                // instead of the wild vtable jump). Excluded via
+                // `isNoOverrideIdentityTypeRef` (`kNoOverrideIdentityBuiltins`,
+                // BuiltinRegistry.cpp) — kept separate from
+                // `isFfiBufferTypeRef` because that set also drives
+                // FFI-specific malloc/free disposal and member dispatch
+                // (LANE_RULES §6: a shared boolean would misstate the two
+                // families as interchangeable). Given a correct replacement
+                // dispatch below (the qualified-name literal chain and the
+                // reference-identity Equals/GetHashCode default), exactly as
+                // #4120 did for CString/WString/RawBytes.
                 bool cg_isClass =
                     cg_recvTy->kind == CG_K::Named &&
                     cg_recvTy->declaration &&
                     cg_recvTy->declaration->kind ==
                         ast::TypeDeclKind::Class &&
                     builtinTypeName(cg_recvTy) != "FrozenArray" &&
-                    !isFfiBufferTypeRef(cg_recvTy);
+                    !isFfiBufferTypeRef(cg_recvTy) &&
+                    !isNoOverrideIdentityTypeRef(cg_recvTy);
                 // Built-in exception types: Named with no declaration, AND
                 // the type name is actually in the builtin exception set
                 // (isBuiltinExceptionTypeRef -- see its own doc comment,
@@ -6868,6 +6891,17 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                 // {CString, WString, RawBytes}, BuiltinRegistry.cpp) is the
                 // existing authority for exactly this three-name set — used
                 // instead of three more `arn == "X"` literals here.
+                // fix #4126 (stdlib §6.1/§8.1, v0.295): Stopwatch /
+                // CancellationToken join this literal chain too — both are
+                // `public class` (Stopwatch) / `public record` with an
+                // opaque compiler-internal representation (CancellationToken)
+                // with NO declared ToString override, so the §8.5
+                // no-override qualified-name default is correct for both
+                // (`kBuiltinClassModulePaths` already carries "Stopwatch" ->
+                // "System.Diagnostics" and "CancellationToken" ->
+                // "System.Threading" from before this fix). Routing them
+                // here is what makes it safe to exclude them from
+                // `cg_isClass`/`isNamedClassRecv` above/below.
                 if (std::string_view arn = builtinTypeName(recvTy);
                         !arn.empty()) {
                     if (common::isArrayEnumeratorWrapSourceName(arn) ||
@@ -6875,7 +6909,8 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                         arn == "SortedSet" || arn == "FrozenArray" ||
                         arn == "Dictionary" || arn == "OwningDictionary" ||
                         arn == "LinkedList" || arn == "OwningLinkedList" ||
-                        common::isFfiBufferBuiltinName(arn)) {
+                        common::isFfiBufferBuiltinName(arn) ||
+                        common::isNoOverrideIdentityBuiltinName(arn)) {
                         std::string_view mod =
                             common::builtinClassModulePathOf(arn);
                         std::string rendered = mod.empty()
@@ -6937,7 +6972,12 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                 bool isNamedClassRecv =
                     recvTy && recvTy->kind == K::Named && recvTy->declaration &&
                     recvTy->declaration->kind == ast::TypeDeclKind::Class &&
-                    !isFfiBufferTypeRef(recvTy);
+                    !isFfiBufferTypeRef(recvTy) &&
+                    // fix #4126: same backstop exclusion as
+                    // `isFfiBufferTypeRef` above — Stopwatch/CancellationToken
+                    // resolve at the literal chain a few lines above this,
+                    // never reaching here in practice.
+                    !isNoOverrideIdentityTypeRef(recvTy);
                 // #608 / §8.5 / §31: built-in exception types (Named with no
                 // declaration) in a GENERIC context (genericSubstSemaTy_ active)
                 // can reach here when the type-param substitution lookup above
@@ -7289,10 +7329,33 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                 // BuiltinRegistry.cpp) rather than three more literals here.
                 bool isBuiltinIdentityFfiBuffer =
                     common::isFfiBufferBuiltinName(residualIdentityName);
+                // fix #4126 (stdlib §6.1/§8.1, v0.295): Stopwatch and
+                // CancellationToken are ALSO genuine heap-pointer receivers
+                // with no vtable and no declared Equals/GetHashCode
+                // override — the same shape as the FFI-buffer trio above,
+                // just not an FFI buffer. For CancellationToken specifically
+                // this is not merely "a plausible default": its declared
+                // stdlib §6.1 surface (`None`, `IsCancellationRequested`,
+                // `ThrowIfCancellationRequested`, `Register`) exposes no
+                // stored property for a record auto-equality synthesis to
+                // read, and its ENTIRE runtime state IS the one pointer
+                // `recv` already is (null for `.None`, the shared
+                // cancellation-state pointer otherwise) — so pointer
+                // equality on `recv` IS content equality of that one opaque
+                // field, and `bz_obj_identity_hash(recv)` is stable per
+                // distinct state pointer and 0 for `.None`, exactly
+                // matching Equals. Measured pre-fix: two tokens from
+                // DIFFERENT `CancellationTokenSource`s compared Equal (both
+                // routed through the wild vtable-slot jump this fix
+                // excludes them from) and `.GetHashCode()` was always 0
+                // regardless of receiver.
+                bool isBuiltinIdentityNoOverride =
+                    common::isNoOverrideIdentityBuiltinName(
+                        residualIdentityName);
                 bool isBuiltinIdentityRecv =
                     isBuiltinIdentityIterHead || isBuiltinIdentityArrayFamily ||
                     isBuiltinIdentityResidualCollection ||
-                    isBuiltinIdentityFfiBuffer;
+                    isBuiltinIdentityFfiBuffer || isBuiltinIdentityNoOverride;
                 if (isBuiltinIdentityRecv) {
                     llvm::Value* recv = lowerExpr(*ma->target);
                     if (isEqualsCall) {
@@ -7340,7 +7403,12 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                 bool isNamedClassRecv =
                     recvTy && recvTy->kind == K::Named && recvTy->declaration &&
                     recvTy->declaration->kind == ast::TypeDeclKind::Class &&
-                    !isFfiBufferTypeRef(recvTy);
+                    !isFfiBufferTypeRef(recvTy) &&
+                    // fix #4126: same backstop exclusion as
+                    // `isFfiBufferTypeRef` above — Stopwatch/
+                    // CancellationToken resolve at `isBuiltinIdentityRecv`
+                    // above, never reaching here in practice.
+                    !isNoOverrideIdentityTypeRef(recvTy);
                 if (isObjectRecv || isIfaceRecv || isNamedClassRecv) {
                     llvm::Value* recv = lowerExpr(*ma->target);
                     if (isEqualsCall) {

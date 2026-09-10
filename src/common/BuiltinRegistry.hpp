@@ -253,6 +253,31 @@ bool isLinkedListName(std::string_view n);
 // per §32.5 / stdlib §10.1–§10.3
 bool isFfiBufferBuiltinName(std::string_view n);
 
+// fix #4126 (stdlib §6.1/§8.1, v0.295): the two builtin HEAP-POINTER classes
+// — `Stopwatch` (stdlib §8.1, a `bz_stopwatch_t*`) and `CancellationToken`
+// (stdlib §6.1, a bare pointer to shared cancellation state, null for
+// `.None`) — that share the exact shape #4120 fixed for the three FFI-buffer
+// classes: `SemaContext::builtinClassSym` stamps `kind = Class`
+// unconditionally, neither has a Bezel vtable at word 0, and neither has a
+// dedicated `.ToString()`/`.Equals()`/`.GetHashCode()` interceptor in
+// `tryLowerBuiltinClassCall`, so a call to any of the three universal-Object
+// members misread the receiver's raw pointer as a class-vtable object
+// (`cg_isClass`/`isNamedClassRecv`, LlvmBackend_Calls2.cpp) — confirmed as a
+// live SIGSEGV in `bz_string_to_utf8z` for `Stopwatch.StartNew().ToString()`
+// and `.GetHashCode()`, and as silently wrong values (`CancellationToken`'s
+// `.ToString()` rendering the null-receiver sentinel "null", `.Equals()`
+// comparing unrelated tokens equal, `.GetHashCode()` always 0) for a
+// `CancellationToken`.
+//
+// Kept as its own registry row rather than folded into `kFfiBufferBuiltins`:
+// that set also feeds FFI-buffer-SPECIFIC behavior (malloc/free disposal,
+// `.Length`/`.Pointer`/`.ToBytes`/`.CopyTo` dispatch) that does not apply to
+// either of these two — a shared boolean would give a reader the false
+// impression the two families are interchangeable.
+// per §6.1 / §8.1, stdlib preamble (both live in `System.*` per
+// `kBuiltinClassModulePaths`, BuiltinRegistry.cpp)
+bool isNoOverrideIdentityBuiltinName(std::string_view n);
+
 // The heap-pointer reference builtins shared by BOTH codegen representation
 // paths (the astNode-name path and the imported-name path in
 // LlvmBackend_Layout.cpp): collections, iteration/collection interfaces, task

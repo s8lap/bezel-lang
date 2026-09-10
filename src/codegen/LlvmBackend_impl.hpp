@@ -16536,6 +16536,14 @@ private:
     // ExprTypecheck_Calls.cpp, and #2734's `isFfiBuiltin`).
     static bool isFfiBufferTypeRef(const sema::TypeRef* rt);
 
+    // fix #4126 (stdlib §6.1/§8.1, v0.295): is `rt` `Stopwatch` or
+    // `CancellationToken` — the two builtin heap-pointer classes sharing the
+    // FFI-buffer trio's exact "no vtable, no dedicated Object-contract
+    // interceptor" shape (see `kNoOverrideIdentityBuiltins`,
+    // BuiltinRegistry.cpp, for why they are a separate registry row). Same
+    // dual-TypeRef-shape read as `isFfiBufferTypeRef` above.
+    static bool isNoOverrideIdentityTypeRef(const sema::TypeRef* rt);
+
     // fix #568: is `name` a BUILTIN type name that lowerTypeRef recognizes (a
     // collection / interface / task / FFI / value builtin / exception), as
     // opposed to a user-chosen generic type PARAMETER? A bare single-part Named

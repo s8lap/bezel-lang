@@ -640,6 +640,9 @@ int32_t bz_guid_parse(const void* str, bz_guid_t* out);
 
 // Bytewise equality: returns 1 if *a == *b, 0 otherwise.
 int32_t bz_guid_equals(const bz_guid_t* a, const bz_guid_t* b);
+// fix #4126 / stdlib §2.6 / §8.3 (v0.295): content hash consistent with
+// bz_guid_equals (equal Guids hash identically).
+int32_t bz_guid_hash(const bz_guid_t* g);
 // per stdlib §2.6 / #1357: CompareTo — 16-byte lexicographic (canonical byte order).
 // Returns negative/0/positive like memcmp.
 int32_t bz_guid_compare(const bz_guid_t* a, const bz_guid_t* b);

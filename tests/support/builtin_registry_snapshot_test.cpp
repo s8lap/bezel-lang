@@ -400,6 +400,23 @@ BEZEL_TEST(builtin_registry_snapshot, ffi_buffer_builtin_set) {
         BEZEL_EXPECT_FALSE(isFfiBufferBuiltinName(n));
 }
 
+// --- isNoOverrideIdentityBuiltinName (#4126, stdlib §6.1/§8.1): the two
+// builtin heap-pointer CLASSES (Stopwatch, CancellationToken) sharing the
+// FFI-buffer trio's "no vtable, no dedicated Object-contract interceptor"
+// shape but kept as their own registry row (see BuiltinRegistry.cpp for
+// why a shared boolean with kFfiBufferBuiltins would misstate the two
+// families as interchangeable). ---
+BEZEL_TEST(builtin_registry_snapshot, no_override_identity_builtin_set) {
+    static constexpr std::array<std::string_view, 2> kSnapshot = {
+        "Stopwatch", "CancellationToken",
+    };
+    for (auto n : kSnapshot) BEZEL_EXPECT_TRUE(isNoOverrideIdentityBuiltinName(n));
+    for (std::string_view n : {"CString", "WString", "RawBytes", "Guid",
+                               "Range", "DateTime", "TimeSpan",
+                               "CancellationTokenSource", "Random", ""})
+        BEZEL_EXPECT_FALSE(isNoOverrideIdentityBuiltinName(n));
+}
+
 // --- isIterableInterfaceHead (§28.3/§29.3/§30.7 v0.201, #2048 / proposal 0048):
 // the iterable/enumerator interface heads whose unmarked return type is the
 // iterator convention's announced caller-owned frame. A static signature
