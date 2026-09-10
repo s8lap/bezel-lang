@@ -6208,8 +6208,56 @@ static bool extensionTargetMatchesReceiver(
             }
             return true;
         }
+        // fix #4168 (§26.5 rule 2, v0.298): a Function-kind TypeRef reaches
+        // this switch ONLY through the genericArgs recursion two cases above
+        // (`extensionTargetMatchesReceiver(ta, ra, freeVars)`) — never as the
+        // top-level extension TARGET itself, which §26.2 already forbids
+        // ("Function types" under "What cannot be extended") at the
+        // declaration site, long before this matcher runs. A generic
+        // ARGUMENT that happens to be a function type — `extension
+        // Array<(int) -> int>`, matching a receiver `Array<(int) -> int>` —
+        // is a completely different position §26.2's restriction says
+        // nothing about, and §26.5 rule 2 requires the receiver to unify
+        // against the declared head "exactly and structurally": the
+        // `default` arm below unconditionally answered false for this case
+        // (its own comment's "function/array/unit types are not extensible"
+        // conflated the top-level-target rule with this recursive
+        // argument-position call), so an otherwise-exact function-type
+        // generic argument could never match ANY receiver — the extension's
+        // declaration compiled clean (§26.2 permits the class-typed target
+        // `Array<T>`) but silently never resolved at any call site (#4168).
+        // Structurally compare parameter modifiers/types and the return
+        // type/`owned`-return marker — the same shape `Resolver::
+        // typeRefEqual`'s Function arm (TypeResolution_Checks.cpp) checks
+        // for ordinary type equality — but recurse through THIS function
+        // (not typeRefEqual) so a free type variable nested inside a
+        // parameter or return type (e.g. `extension Array<(T) -> T> where
+        // T: class`) still unifies against the receiver's corresponding
+        // slot, exactly like the Named-kind generic-argument recursion
+        // above. `nullable` is deliberately not compared, matching every
+        // other arm of this function (see the function's own header
+        // comment: "ignoring nullability on both sides").
+        case TypeRef::Kind::Function: {
+            if (target->funcParams.size() != recv->funcParams.size())
+                return false;
+            for (std::size_t i = 0; i < target->funcParams.size(); ++i) {
+                if (target->funcParams[i].modifier !=
+                    recv->funcParams[i].modifier)
+                    return false;
+                if (!extensionTargetMatchesReceiver(
+                        target->funcParams[i].type,
+                        recv->funcParams[i].type, freeVars))
+                    return false;
+            }
+            if (target->funcReturnOwned != recv->funcReturnOwned)
+                return false;
+            return extensionTargetMatchesReceiver(
+                target->funcReturn, recv->funcReturn, freeVars);
+        }
         default:
-            return false;  // function/array/unit types are not extensible
+            return false;  // array/unit/error types are not extensible, and
+                            // never arise as a generic-argument position a
+                            // real receiver's TypeRef would carry either.
     }
 }
 
