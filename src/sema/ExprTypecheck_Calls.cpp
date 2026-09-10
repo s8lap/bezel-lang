@@ -1026,121 +1026,6 @@ bool returnCarriesParametricRecord(
     }
 }
 
-// §14.1 (#785, #850): structurally unify a value parameter's declared type
-// (`pt`, AST) against the call argument's resolved type (`argTy`), binding each
-// method type parameter named in `paramNames` to the matching component of the
-// argument's type. A bare `p: T` binds T; a generic-typed `p: Pair<A, B>`
-// recurses pairwise into the generic args (binding A and B from a
-// `Pair<int, string>` argument). The first binding for a name wins (a later or
-// already-receiver-bound occurrence is left). Mirrors codegen's
-// unifyMethodReturnTypeArg.
-// §14.1 / #850: when the parameter is `T?` (nullable named type-param) and the
-// argument is `int?` (or another nullable type), peel the shared `?` so that T
-// is bound to `int` (non-nullable), not `int?`. This makes `where T: value`
-// hold (int satisfies value, int? does not) and the return type `T` stays
-// non-nullable. A bare `T` parameter (pt->nullable == false) with a nullable
-// argument still binds T = int? and is correctly rejected by the constraint
-// check. ctx is used to allocate a stable non-nullable TypeRef in the peel
-// case. // per §14.1
-// §14.1 / #896: `conflicts` (optional) receives the name of any type parameter
-// whose second-occurrence inferred binding is DIFFERENT from the first-occurrence
-// binding (e.g. T already bound to int, now seeing bool from a second T? arg).
-// The caller emits a §14.1 compile error and aborts the call. Without this
-// detection the first-binding-wins logic silently drops the conflict, and codegen
-// later produces a PHINode mixing int and bool → SIGABRT.
-void unifyArgSubst(
-    const ast::Type* pt, TypeRef* argTy,
-    const std::unordered_set<std::string_view>& paramNames,
-    std::unordered_map<std::string_view, TypeRef*>& argSubst,
-    SemaContext& ctx,
-    std::unordered_set<std::string_view>* conflicts = nullptr) {
-    if (!pt || !argTy) return;
-    if (pt->kind == ast::TypeKind::Named && pt->name &&
-        pt->name->parts.size() == 1 && paramNames.count(pt->name->parts[0])) {
-        std::string_view nm = pt->name->parts[0];
-        // Compute the would-be-bound TypeRef applying the same §14.1/#850
-        // nullable-peeling rule used on the first occurrence.
-        TypeRef* bound = argTy;
-        if (pt->nullable && argTy->nullable) {
-            if (argTy->kind == TypeRef::Kind::Primitive) {
-                bound = ctx.primitiveTypeRef(argTy->primitive, /*nullable=*/false);
-            } else {
-                TypeRef* nn = ctx.makeTypeRef();
-                *nn = *argTy;
-                nn->nullable = false;
-                bound = nn;
-            }
-        }
-        if (!argSubst.count(nm)) {
-            // §14.1 / #850: peel the nullable when the parameter declares `T?`
-            // and the argument is also nullable — infer the non-nullable T so
-            // `where T: value` and the non-nullable return type `T` work
-            // correctly. A bare `T` parameter (pt->nullable == false) with a
-            // nullable argument is left as-is and rejected downstream.
-            argSubst[nm] = bound;
-        } else if (conflicts && !typeRefEqual(argSubst[nm], bound)) {
-            // §14.1 / #896: existing binding for `nm` disagrees with what this
-            // argument would bind — record the conflict so the caller can emit a
-            // clean compile error instead of silently accepting the inconsistency
-            // and letting codegen crash (PHINode type mismatch).
-            conflicts->insert(nm);
-        }
-        return;
-    }
-    if (!pt->genericArgs.empty() &&
-        argTy->kind == TypeRef::Kind::Named &&
-        argTy->genericArgs.size() == pt->genericArgs.size()) {
-        // fix #4089/#4090 (§14.5 phase 1, v0.296): "unifies ... invariantly
-        // against an argument of the SAME generic type" — same HEAD, not
-        // merely the same generic-argument count. Without this guard, a
-        // declared `Task<R>` parameter position unified against an
-        // `OwningTask<Widget>` argument purely because both are single-
-        // generic-argument Named types, binding R to Widget even though
-        // OwningTask is not an instantiation of Task<T> (they are siblings
-        // under Task — stdlib §30.3) — a silently WRONG substitution that let
-        // a call proceed with a Task<R>/OwningTask<C> ABI mismatch (measured:
-        // an async-lambda producing a fresh owned class at a free `Task<R>`
-        // slot bound R to the class and read garbage downstream through the
-        // mismatched layout). A head mismatch now contributes no binding —
-        // matching §22.6/§30.6's "reaches no instantiation ... inapplicable"
-        // outcome for the single-candidate inference case (below).
-        std::string_view ptHead;
-        if (pt->name && !pt->name->parts.empty()) ptHead = pt->name->parts.back();
-        if (ptHead.empty() || ptHead == argTy->headName()) {
-            for (std::size_t i = 0; i < pt->genericArgs.size(); ++i)
-                unifyArgSubst(pt->genericArgs[i].get(), argTy->genericArgs[i],
-                              paramNames, argSubst, ctx, conflicts);
-        }
-        return;
-    }
-    // fix #4089 (§14.5 phase 1 / §22.6 *Parameter count at a function-typed
-    // position*, v0.296): "a function-typed parameter unifies component-wise
-    // — each parameter slot against the argument's slot in order, the return
-    // slot against the return slot — and only against a function type of the
-    // SAME parameter count: an argument whose function type has a different
-    // number of parameter slots reaches no unification, and the candidate is
-    // inapplicable — an inference failure that drops it out ... never an
-    // error reported at that candidate." Before this arm, `unifyArgSubst` had
-    // no case for `ast::TypeKind::Function` at all, so a function-typed
-    // parameter (a method reference, a lambda already typed, or a plain
-    // function-typed value argument) contributed ZERO bindings — silently,
-    // regardless of whether the argument's own arity matched (§14.5's own
-    // phase-1 bullet is quoted above; this is that bullet, implemented).
-    if (pt->kind == ast::TypeKind::Function) {
-        if (argTy->kind != TypeRef::Kind::Function) return;
-        if (pt->funcParams.size() != argTy->funcParams.size()) return;  // drop out silently
-        for (std::size_t i = 0; i < pt->funcParams.size(); ++i) {
-            if (!pt->funcParams[i].type) continue;
-            TypeRef* argParamTy = argTy->funcParams[i].type;
-            if (argParamTy)
-                unifyArgSubst(pt->funcParams[i].type.get(), argParamTy,
-                              paramNames, argSubst, ctx, conflicts);
-        }
-        if (pt->funcReturn && argTy->funcReturn)
-            unifyArgSubst(pt->funcReturn.get(), argTy->funcReturn, paramNames,
-                          argSubst, ctx, conflicts);
-    }
-}
 
 // A printable signature for a method candidate, e.g. "F(int, long)".
 std::string methodSignatureString(std::string_view name,
@@ -1219,6 +1104,186 @@ bool containsMethodTypeParam(
 }
 
 }  // namespace
+
+// §14.1 (#785, #850): structurally unify a value parameter's declared type
+// (`pt`, AST) against the call argument's resolved type (`argTy`), binding each
+// method type parameter named in `paramNames` to the matching component of the
+// argument's type. A bare `p: T` binds T; a generic-typed `p: Pair<A, B>`
+// recurses pairwise into the generic args (binding A and B from a
+// `Pair<int, string>` argument). The first binding for a name wins (a later or
+// already-receiver-bound occurrence is left). Mirrors codegen's
+// unifyMethodReturnTypeArg.
+// §14.1 / #850: when the parameter is `T?` (nullable named type-param) and the
+// argument is `int?` (or another nullable type), peel the shared `?` so that T
+// is bound to `int` (non-nullable), not `int?`. This makes `where T: value`
+// hold (int satisfies value, int? does not) and the return type `T` stays
+// non-nullable. A bare `T` parameter (pt->nullable == false) with a nullable
+// argument still binds T = int? and is correctly rejected by the constraint
+// check. ctx_ is used to allocate a stable non-nullable TypeRef in the peel
+// case. // per §14.1
+//
+// fix #4183: moved from a free function to an ExprTC member (was: a `ctx`
+// parameter plus, briefly on this branch, an `ExprTC& self` parameter) —
+// the constructed-generic-type case below needs the private
+// collectAncestorInstantiationsOf, which only a member function may call.
+// §14.1 / #896: `conflicts` (optional) receives the name of any type parameter
+// whose second-occurrence inferred binding is DIFFERENT from the first-occurrence
+// binding (e.g. T already bound to int, now seeing bool from a second T? arg).
+// The caller emits a §14.1 compile error and aborts the call. Without this
+// detection the first-binding-wins logic silently drops the conflict, and codegen
+// later produces a PHINode mixing int and bool → SIGABRT.
+void ExprTC::unifyArgSubst(
+    const ast::Type* pt, TypeRef* argTy,
+    const std::unordered_set<std::string_view>& paramNames,
+    std::unordered_map<std::string_view, TypeRef*>& argSubst,
+    std::unordered_set<std::string_view>* conflicts) {
+    if (!pt || !argTy) return;
+    if (pt->kind == ast::TypeKind::Named && pt->name &&
+        pt->name->parts.size() == 1 && paramNames.count(pt->name->parts[0])) {
+        std::string_view nm = pt->name->parts[0];
+        // Compute the would-be-bound TypeRef applying the same §14.1/#850
+        // nullable-peeling rule used on the first occurrence.
+        TypeRef* bound = argTy;
+        if (pt->nullable && argTy->nullable) {
+            if (argTy->kind == TypeRef::Kind::Primitive) {
+                bound = ctx_.primitiveTypeRef(argTy->primitive, /*nullable=*/false);
+            } else {
+                TypeRef* nn = ctx_.makeTypeRef();
+                *nn = *argTy;
+                nn->nullable = false;
+                bound = nn;
+            }
+        }
+        if (!argSubst.count(nm)) {
+            // §14.1 / #850: peel the nullable when the parameter declares `T?`
+            // and the argument is also nullable — infer the non-nullable T so
+            // `where T: value` and the non-nullable return type `T` work
+            // correctly. A bare `T` parameter (pt->nullable == false) with a
+            // nullable argument is left as-is and rejected downstream.
+            argSubst[nm] = bound;
+        } else if (conflicts && !typeRefEqual(argSubst[nm], bound)) {
+            // §14.1 / #896: existing binding for `nm` disagrees with what this
+            // argument would bind — record the conflict so the caller can emit a
+            // clean compile error instead of silently accepting the inconsistency
+            // and letting codegen crash (PHINode type mismatch).
+            conflicts->insert(nm);
+        }
+        return;
+    }
+    if (!pt->genericArgs.empty()) {
+        // fix #4183 (§14.5 phase 1, v0.296/v0.298 — full sentence; narrows
+        // #4089's own #7ec92f7 guard, which implemented only the first half):
+        // "a constructed parameter type G<P1,…,Pn> unifies component-wise and
+        // invariantly against an argument of the same generic type, OR
+        // against THE UNIQUE INSTANTIATION OF G THAT THE ARGUMENT'S TYPE
+        // IMPLEMENTS OR EXTENDS (an `Array<int>` argument against
+        // `xs: IEnumerable<T>` binds T to int); an argument whose type
+        // reaches no instantiation of G makes the candidate inapplicable,
+        // and so does one whose type reaches more than one ... a non-unique
+        // instantiation is never resolved by choice."
+        //
+        // #7ec92f7's fix compared `pt`'s raw syntactic head name against
+        // `argTy->headName()` for exact string equality — sound for the
+        // Task<R>-vs-OwningTask<Widget> case it was written to close, but it
+        // silently dropped every legitimate binding through an interface, a
+        // base class, or a generic type ALIAS on the parameter side (#4183:
+        // `Array<int>` against `IReadOnlyList<T>`, a `Derived<T>` against
+        // `Base<T>`, and `Wrapper<T> := Box<T>` all regressed — none of
+        // those three programs even has a function-typed parameter, yet all
+        // were rejected by the (mis-firing) "mentioned only inside a
+        // function-typed parameter's slot" diagnostic).
+        //
+        // Resolve `pt` to find G's declaration — this ALSO resolves a
+        // generic alias on the parameter side transparently: alias
+        // resolution copies the aliased type's `declaration` into the alias
+        // TypeRef (#1462), so `ptResolved->declaration` is already the REAL
+        // underlying type (`Box`, never a synthetic `Wrapper` symbol) per
+        // §27.8's "type aliases ... see through ... for ... overload
+        // resolution".
+        //
+        // `collectAncestorInstantiationsOf` (ExprTypecheck.cpp; #1920) is
+        // the established BFS ancestor/conformance walker §19.3's generic-
+        // instantiation-impossible checks already use for exactly this
+        // "which instantiation of G does this concrete type implement or
+        // extend" question — reused here rather than growing a second,
+        // drifting classification predicate (LANE_RULES §6). It naturally
+        // covers the "same generic type" half of the spec sentence too:
+        // `argTy` itself is the first node its BFS visits, so `d == g`
+        // fires immediately when argTy's OWN declaration already is G — and
+        // it already implements the "implemented-twice" no-choice case (the
+        // spec's "more than one" clause), returning every distinct
+        // instantiation reached rather than merging or picking one.
+        TypeRef* ptResolved = ctx_.resolvedType(*pt);
+        TypeSymbol* g = ptResolved ? ptResolved->declaration : nullptr;
+        std::vector<TypeRef*> insts;
+        // Owns any synthesised builtin-ancestor TypeRefs so `insts`' pointers
+        // into them stay valid through the recursive unifyArgSubst calls
+        // below (collectBuiltinAncestorInstantiationsOf's contract).
+        std::vector<std::unique_ptr<TypeRef>> builtinOwned;
+        if (g && argTy->kind == TypeRef::Kind::Named && argTy->declaration) {
+            // The USER-DECLARED side: G has a real TypeSymbol.
+            collectAncestorInstantiationsOf(argTy, g, insts);
+        } else if (!g && ptResolved &&
+                   ptResolved->kind == TypeRef::Kind::Named) {
+            // fix #4183: G is a BUILTIN (no TypeSymbol — e.g. `IReadOnlyList`,
+            // the spec's own worked example) — collectAncestorInstantiationsOf
+            // finds nothing for it (it requires a TypeSymbol on BOTH sides);
+            // walk the builtin interface hierarchy instead. Handles a builtin
+            // argument (`Array<int>` implements `IList`/`IReadOnlyList`/
+            // `ICollection`/`IReadOnlyCollection`/`IEnumerable` transitively,
+            // §26.5) against a builtin-named G. (A user-declared argument
+            // extending a builtin interface generically is a residual this
+            // does not cover — #4147/#4148-class scope, not required by any
+            // of #4183's three repros.)
+            std::string_view gName = ptResolved->headName();
+            if (!gName.empty())
+                collectBuiltinAncestorInstantiationsOf(argTy, gName, insts,
+                                                       builtinOwned);
+        }
+        // "reaches no instantiation" (insts empty) or "reaches more than
+        // one" (insts.size() > 1 — the implemented-twice shape, or a
+        // diamond in the builtin table reaching the SAME ancestor via two
+        // paths) — both make the candidate inapplicable: no binding,
+        // silently, matching §22.6/§30.6's own "candidate is inapplicable"
+        // wording for the single-candidate inference case below, never an
+        // error reported at THIS point.
+        if (insts.size() == 1 &&
+            insts[0]->genericArgs.size() == pt->genericArgs.size()) {
+            for (std::size_t i = 0; i < pt->genericArgs.size(); ++i)
+                unifyArgSubst(pt->genericArgs[i].get(),
+                              insts[0]->genericArgs[i], paramNames,
+                              argSubst, conflicts);
+        }
+        return;
+    }
+    // fix #4089 (§14.5 phase 1 / §22.6 *Parameter count at a function-typed
+    // position*, v0.296): "a function-typed parameter unifies component-wise
+    // — each parameter slot against the argument's slot in order, the return
+    // slot against the return slot — and only against a function type of the
+    // SAME parameter count: an argument whose function type has a different
+    // number of parameter slots reaches no unification, and the candidate is
+    // inapplicable — an inference failure that drops it out ... never an
+    // error reported at that candidate." Before this arm, `unifyArgSubst` had
+    // no case for `ast::TypeKind::Function` at all, so a function-typed
+    // parameter (a method reference, a lambda already typed, or a plain
+    // function-typed value argument) contributed ZERO bindings — silently,
+    // regardless of whether the argument's own arity matched (§14.5's own
+    // phase-1 bullet is quoted above; this is that bullet, implemented).
+    if (pt->kind == ast::TypeKind::Function) {
+        if (argTy->kind != TypeRef::Kind::Function) return;
+        if (pt->funcParams.size() != argTy->funcParams.size()) return;  // drop out silently
+        for (std::size_t i = 0; i < pt->funcParams.size(); ++i) {
+            if (!pt->funcParams[i].type) continue;
+            TypeRef* argParamTy = argTy->funcParams[i].type;
+            if (argParamTy)
+                unifyArgSubst(pt->funcParams[i].type.get(), argParamTy,
+                              paramNames, argSubst, conflicts);
+        }
+        if (pt->funcReturn && argTy->funcReturn)
+            unifyArgSubst(pt->funcReturn.get(), argTy->funcReturn, paramNames,
+                          argSubst, conflicts);
+    }
+}
 
 // §22.3 / §14.5 (#2266): true when `t` mentions one of `tpNames` ANYWHERE in its
 // structure. It additionally walks function parameter/return slots beyond
@@ -1862,7 +1927,7 @@ bool ExprTC::checkGenericRefOutExactUnification(const ast::CallExpr& ce,
                 argTy->primitive == PrimitiveType::Object && argTy->nullable)
                 continue;
             unifyArgSubst(md->params[pi].type.get(), argTy, gpNames, subst,
-                          ctx_, &conflicts);
+                          &conflicts);
         }
         if (!conflicts.empty()) {
             for (std::string_view cnm : conflicts) {
@@ -2787,7 +2852,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         TypeRef* argTy = ctx_.exprType(*ce.args[pi].value);
                         if (!argTy) continue;
                         unifyArgSubst(md->params[pi].type.get(), argTy,
-                                      paramNames, outSubst, ctx_);
+                                      paramNames, outSubst);
                     }
                 }
                 if (!outSubst.empty()) {
@@ -3500,8 +3565,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             argTy->nullable)
                             continue;
                         unifyArgSubst(md->params[pi].type.get(), argTy,
-                                      paramNames, argSubst, ctx_,
-                                      &inferConflicts);
+                                      paramNames, argSubst, &inferConflicts);
                     }
                     // §14.1 / #896: if any type parameter was bound to two
                     // incompatible types across the arguments, emit a compile
@@ -3635,19 +3699,33 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             if (mentionedInArg) stillUnbound.insert(gp.name);
                         }
                         if (!stillUnbound.empty()) {
+                            // fix #4183: generalized wording — this check
+                            // fires for BOTH a function-typed parameter
+                            // (§22.6 *Parameter count at a function-typed
+                            // position*, #4089's arity-mismatch case) AND a
+                            // constructed-generic-type parameter whose
+                            // argument reaches no instantiation, or more
+                            // than one, of the declared type (§14.5's "or
+                            // against the unique instantiation of G ...").
+                            // The pre-#4183 wording named only the first —
+                            // wrong even in wording for the second, which
+                            // has no function-typed parameter at all.
                             for (std::string_view nm : stillUnbound) {
                                 ctx_.diagnostics().report(
                                     Severity::Error, ce.span.begin,
                                     "cannot infer the type argument `" +
                                     std::string(nm) + "` of `" +
                                     std::string(md->name) + "`'s call — it "
-                                    "is mentioned only inside a function-"
-                                    "typed parameter's slot, and no "
-                                    "argument's actual shape bound it there "
-                                    "(§14.5, §22.6); supply an explicit type "
-                                    "argument, or give the function-typed "
-                                    "argument a return-type ascription that "
-                                    "names the intended type");
+                                    "is mentioned only inside a parameter "
+                                    "whose declared type did not unify with "
+                                    "that argument's actual type (a function-"
+                                    "typed slot of a different arity, or a "
+                                    "constructed generic type reaching no "
+                                    "instantiation — or more than one — of "
+                                    "the declared type) (§14.5, §22.6); "
+                                    "supply an explicit type argument, or "
+                                    "give the argument a type/return-type "
+                                    "ascription that resolves the mismatch");
                             }
                             return;
                         }

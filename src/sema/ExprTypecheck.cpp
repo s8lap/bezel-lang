@@ -6386,6 +6386,40 @@ static std::vector<const TypeRef*> builtinInterfaceAncestorsOf(
         const_cast<std::vector<TypeRef*>&>(recv->genericArgs), owned);
 }
 
+// fix #4183 (§14.5 phase 1, §26.5, v0.296/v0.298): see the header comment
+// (ExprTypecheck_impl.hpp). Exposes builtinInterfaceAncestorsOf (this TU's
+// internal-linkage §26.5 table) to unifyArgSubst (ExprTypecheck_Calls.cpp),
+// filtered to entries matching `ifaceName` — the builtin-hierarchy analogue
+// of collectAncestorInstantiationsOf above, which handles only
+// TypeSymbol-declaration-bearing (user) types.
+void ExprTC::collectBuiltinAncestorInstantiationsOf(
+    const TypeRef* classTy, std::string_view ifaceName,
+    std::vector<TypeRef*>& out, std::vector<std::unique_ptr<TypeRef>>& owned) {
+    if (!classTy || classTy->kind != TypeRef::Kind::Named ||
+        classTy->declaration || ifaceName.empty())
+        return;
+    // `classTy` itself may already BE the target (`Array<T>` queried for
+    // `"Array"`) — mirrors collectAncestorInstantiationsOf's own
+    // `d == ifaceDecl` check on the BFS's starting node.
+    auto pushDeduped = [&](TypeRef* cand) {
+        // The builtin hierarchy table has diamonds (e.g. IList reaches
+        // IReadOnlyCollection via BOTH IReadOnlyList and ICollection) that
+        // its own BFS (builtinInterfaceAncestors) does not dedupe — matching
+        // collectAncestorInstantiationsOf's own "deduplicated only by
+        // structural identity" contract keeps a genuine diamond (the SAME
+        // instantiation reached twice) from spuriously looking like the
+        // spec's "reaches more than one [DISTINCT] instantiation" case.
+        for (TypeRef* existing : out)
+            if (typeRefEqual(existing, cand)) return;
+        out.push_back(cand);
+    };
+    if (namedTypeSimpleName(classTy) == ifaceName)
+        pushDeduped(const_cast<TypeRef*>(classTy));
+    for (const TypeRef* anc : builtinInterfaceAncestorsOf(classTy, owned))
+        if (namedTypeSimpleName(anc) == ifaceName)
+            pushDeduped(const_cast<TypeRef*>(anc));
+}
+
 // §5.1/§12.9 (#1851): the arity-1 BORROWING-collection builtin generics whose
 // COMPLETE generic-interface set is captured by builtinInterfaceAncestors above
 // — the concrete borrowing collections (each implements exactly one collection

@@ -1079,6 +1079,53 @@ private:
                                          TypeSymbol* ifaceDecl,
                                          std::vector<TypeRef*>& out);
 
+    // fix #4183 (§14.5 phase 1, §26.5, v0.296/v0.298): the BUILTIN
+    // counterpart of collectAncestorInstantiationsOf above. A builtin
+    // collection type (`Array<T>`, `IList<T>`, ...) has no TypeSymbol —
+    // `declaration` is null — so collectAncestorInstantiationsOf's
+    // `baseTypeRefs` walk finds nothing for it; its interface hierarchy is
+    // instead modelled by `builtinInterfaceAncestorsOf`
+    // (ExprTypecheck.cpp, §26.5's extension-target matcher) — the SAME
+    // table checkAssignable's own `variantGenericAssignable` already
+    // consults for ordinary `Array<int>` → `IReadOnlyList<int>`
+    // assignability (v0.180/#1180). Exposed as a member here (that helper
+    // has internal linkage, file-local to ExprTypecheck.cpp) purely so
+    // unifyArgSubst's constructed-generic-type case
+    // (ExprTypecheck_Calls.cpp) can reuse it — no second, drifting builtin-
+    // hierarchy table. `classTy` must be a null-declaration Named builtin;
+    // `ifaceName` is the target's simple builtin name (`"IReadOnlyList"`,
+    // never alias- or declaration-bearing — builtins are never aliased).
+    // Appends every reached ancestor whose name matches (`classTy` itself
+    // counts, mirroring collectAncestorInstantiationsOf's "argTy IS the
+    // declaration" case) to `out`; `owned` keeps the synthesised ancestor
+    // TypeRefs alive for the caller's use of `out`.
+    void collectBuiltinAncestorInstantiationsOf(
+        const TypeRef* classTy, std::string_view ifaceName,
+        std::vector<TypeRef*>& out,
+        std::vector<std::unique_ptr<TypeRef>>& owned);
+
+    // §14.1/§14.5 phase 1 (#785, #850, #896, #4089/#4183): structurally
+    // unify a value parameter's declared type (`pt`, AST) against the call
+    // argument's resolved type (`argTy`), binding each method type
+    // parameter named in `paramNames` to the matching component of the
+    // argument's type — a bare `p: T` binds T; a generic-typed
+    // `p: Pair<A, B>` recurses pairwise into the generic args; a
+    // constructed `p: G<...>` also unifies against the UNIQUE instantiation
+    // of G that argTy's declared type implements or extends, via
+    // collectAncestorInstantiationsOf (§14.5's full sentence — see #4183);
+    // a function-typed `p: (...) -> ...` unifies component-wise over equal
+    // parameter counts only (§14.5/§22.6, #4089). A member function (not a
+    // free function) because the constructed-generic-type case needs
+    // collectAncestorInstantiationsOf, which is private. `conflicts`
+    // (optional) receives the name of any type parameter whose second-
+    // occurrence inferred binding is DIFFERENT from the first-occurrence
+    // binding.
+    void unifyArgSubst(
+        const ast::Type* pt, TypeRef* argTy,
+        const std::unordered_set<std::string_view>& paramNames,
+        std::unordered_map<std::string_view, TypeRef*>& argSubst,
+        std::unordered_set<std::string_view>* conflicts = nullptr);
+
     // §19.3/§19.5/§5.1/§12.9 (v0.197, #1920): the INTERFACE-scrutinee
     // counterpart of typeTestGenericInstantiationImpossible. Is the typed
     // binding `var x: patTy` (a class pattern) a type-test that NO runtime value
