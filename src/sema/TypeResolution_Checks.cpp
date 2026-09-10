@@ -3920,16 +3920,31 @@ static bool isStaticallyNullExpr(const ast::Expr* e);
 static bool isStaticallyDefaultExpr(const ast::Expr* e);
 // fix #3973 (§9.7, v0.295): returns true iff a diagnostic was reported (the
 // walk is now recursive — see the definition below).
+// fix #4164 (§9.7, v0.295): `incoming` is the ENCLOSING frame's own
+// `common::RecordSubstEnv*` (null at the top of the recursion) — needed so
+// `declTy` itself, when it is a COMPOUND generic type that mentions the
+// enclosing record's own bare parameter (`InnerCG<T>` as a field of
+// `OuterCG<T>`), resolves its own `genericArgs` through the outer binding
+// before this frame seeds its own environment. See the definition for the
+// full rationale.
 static bool checkStaticReadonlyRecordInit(
     SemaContext& ctx, const ast::NewExpr& nx, const TypeRef* declTy,
-    SourceLocation loc, std::string_view what, std::string_view name);
+    const common::RecordSubstEnv* incoming, SourceLocation loc,
+    std::string_view what, std::string_view name);
 // fix #3973 (§9.7, v0.295): handles a positional slot (record field or
 // choice payload) that is not ITSELF directly reference-typed but may
 // still carry a nested borrow one or more levels down — see the definition
 // below, just above `checkStaticReadonlyRecordInit`.
+// fix #4164 (§9.7, v0.295): `incoming` is `pft`'s OWN substitution
+// environment (the `.env` half of the `RecordSubstEnv::Entry` the caller
+// already resolved `pft` through) — threaded to the nested frame exactly
+// as `common::isBorrowBearingRecordCommon`'s own walk already does, so a
+// compound nested type's bare mentions of the ENCLOSING generic's own
+// parameter compose instead of resolving to nothing.
 static bool checkNestedBorrowBearingSlot(
-    SemaContext& ctx, const TypeRef* pft, const ast::Expr* argExpr,
-    SourceLocation loc, std::string_view what, std::string_view name);
+    SemaContext& ctx, const TypeRef* pft, const common::RecordSubstEnv* incoming,
+    const ast::Expr* argExpr, SourceLocation loc, std::string_view what,
+    std::string_view name);
 // fix #4134 (§9.7, v0.295): a choice VALUE is constructed via a case CALL
 // (`Type.Case(args)`, resolved to a ChoiceCaseSymbol) — never a `new`
 // expression (§35.1: "a choice's construction *is* case selection"; spec
@@ -3945,10 +3960,15 @@ static bool checkNestedBorrowBearingSlot(
 // generic) — needed to substitute a bare-type-parameter payload field
 // through the actual instantiation, exactly as the record arm does. See the
 // definition for the full rationale.
+// fix #4164 (§9.7, v0.295): `incoming` is the enclosing frame's substitution
+// environment, threaded down for the identical reason as
+// `checkStaticReadonlyRecordInit`'s own `incoming` — null at the top of the
+// recursion (this choice is the static readonly field's own declared type),
+// `pft`'s own `.env` when reached via `checkNestedBorrowBearingSlot`.
 static bool checkStaticReadonlyChoiceCaseInit(
     SemaContext& ctx, const ast::CallExpr& ce, const ChoiceCaseSymbol* cs,
-    const TypeRef* choiceTy, SourceLocation loc, std::string_view what,
-    std::string_view name);
+    const TypeRef* choiceTy, const common::RecordSubstEnv* incoming,
+    SourceLocation loc, std::string_view what, std::string_view name);
 
 // §22.12 rule 3/4 (v0.262, #3272): classify a CONCRETE substitution at the
 // instantiation site for a `static readonly` bare-parameter declaration,
@@ -12007,17 +12027,37 @@ bool isStaticallyDefaultExpr(const ast::Expr* e) {
 //       plain ints, irrelevant to §9.7.
 //
 // Returns true iff a diagnostic was reported.
+//
+// fix #4164 (§9.7, v0.295): `incoming` is `pft`'s OWN substitution
+// environment — the caller already resolved `pft` via
+// `common::resolveRecordFieldSubst(rawPft, callerFieldEnv)`, whose returned
+// `Entry::env` is precisely the environment `pft`'s own bare-parameter
+// mentions resolve through (unchanged to `callerFieldEnv` itself when `pft`
+// is a COMPOUND type such as `InnerCG<T>`, per that function's contract).
+// Threading it into the nested frame's own `seedRecordSubstEnv` call below
+// (instead of the previous hardcoded `nullptr`) is the "one composition
+// hop" `common::RecordSubstEnv::Entry::env` exists for — mirrors
+// `common::isBorrowBearingRecordCommon`'s own walk, the ORIGINAL consumer of
+// `RecordSubstEnv`, which already threads its `env` parameter the same way
+// when recursing into a Record-kind field (`recordFieldTypeIsBorrowCarryingCommon`,
+// src/common/OwnershipFacts.cpp). Before this fix `incoming` did not exist
+// here at all and every nested frame seeded from `nullptr`, so a compound
+// field mentioning the ENCLOSING generic's own bare parameter (`I:
+// InnerCG<T>` as a field of `OuterCG<T>`) recursed with `T` still
+// unresolved, and the leaf field's own bare mention had nothing left to
+// substitute it with (issue #4164's exact diagnosis).
 bool checkNestedBorrowBearingSlot(
-    SemaContext& ctx, const TypeRef* pft, const ast::Expr* argExpr,
-    SourceLocation loc, std::string_view what, std::string_view name) {
+    SemaContext& ctx, const TypeRef* pft, const common::RecordSubstEnv* incoming,
+    const ast::Expr* argExpr, SourceLocation loc, std::string_view what,
+    std::string_view name) {
     if (!pft || pft->kind != TypeRef::Kind::Named) return false;
     if (pft->declaration) {
         if (pft->declaration->kind != ast::TypeDeclKind::Record &&
             pft->declaration->kind != ast::TypeDeclKind::Choice)
             return false;
         if (auto* nestedNew = dynamic_cast<const ast::NewExpr*>(argExpr))
-            return checkStaticReadonlyRecordInit(ctx, *nestedNew, pft, loc,
-                                                 what, name);
+            return checkStaticReadonlyRecordInit(ctx, *nestedNew, pft,
+                                                 incoming, loc, what, name);
         // fix #4134 (§9.7, v0.295): a nested slot whose OWN type is a
         // Choice is never initialized with a `new` expression (choices
         // have no constructors, §35.1) — its real spelling is a case CALL
@@ -12030,7 +12070,8 @@ bool checkNestedBorrowBearingSlot(
                 Symbol* calleeSym = ctx.exprSymbol(*nestedCall->callee);
                 if (auto* ccs = dynamic_cast<ChoiceCaseSymbol*>(calleeSym))
                     return checkStaticReadonlyChoiceCaseInit(ctx, *nestedCall,
-                                                             ccs, pft, loc,
+                                                             ccs, pft,
+                                                             incoming, loc,
                                                              what, name);
             }
         }
@@ -12096,8 +12137,8 @@ bool checkNestedBorrowBearingSlot(
 // disprove null-source for a non-trivial initializer).
 bool checkStaticReadonlyRecordInit(
     SemaContext& ctx, const ast::NewExpr& nx, const TypeRef* declTy,
-    SourceLocation loc, std::string_view what,
-    std::string_view name) {
+    const common::RecordSubstEnv* incoming, SourceLocation loc,
+    std::string_view what, std::string_view name) {
     if (!declTy || declTy->kind != TypeRef::Kind::Named || !declTy->declaration)
         return false;
     const TypeSymbol* ts = declTy->declaration;
@@ -12144,15 +12185,26 @@ bool checkStaticReadonlyRecordInit(
         // no-ops (empty map / unchanged `ft`) for a non-generic record or
         // an unresolved/uninstantiated use, so this is exactly the prior
         // behaviour whenever there is nothing to substitute.
+        // fix #4164 (§9.7, v0.295): seed THIS frame's env through `incoming`
+        // (the enclosing frame's env, null at the top of the recursion)
+        // rather than a hardcoded `nullptr` — `declTy`'s own `genericArgs`
+        // may themselves be bare mentions of an ENCLOSING generic's
+        // parameter (`declTy == InnerCG<T>` when `T` is `OuterCG`'s own
+        // parameter), and `seedRecordSubstEnv` already resolves each
+        // argument through its `incoming` param before storing it (see its
+        // header contract's "one composition hop") — the same composition
+        // `common::isBorrowBearingRecordCommon` already performs for the
+        // §9.7 dangling-borrow check.
         common::RecordSubstEnv env;
-        common::seedRecordSubstEnv(*ts, *declTy, /*incoming=*/nullptr, env);
+        common::seedRecordSubstEnv(*ts, *declTy, incoming, env);
         const common::RecordSubstEnv* fieldEnv =
             env.map.empty() ? nullptr : &env;
         for (std::size_t i = 0; i < arity; ++i) {
             const TypeRef* rawPft = storageComponentType(fields[i], ctx);
             if (!rawPft) continue;
-            const TypeRef* pft =
-                common::resolveRecordFieldSubst(rawPft, fieldEnv).ty;
+            const common::RecordSubstEnv::Entry sub =
+                common::resolveRecordFieldSubst(rawPft, fieldEnv);
+            const TypeRef* pft = sub.ty;
             if (!pft) continue;
             const ast::Expr* argExpr = nx.args[i].value.get();
             if (staticReadonlyFieldIsReferenceTyped(pft, ctx)) {
@@ -12172,9 +12224,11 @@ bool checkStaticReadonlyRecordInit(
             // fix #3973: `pft` is not itself reference-typed, but it may be
             // a NESTED record/choice (or one of the four declaration-less
             // builtin span views) that carries a reference-typed component
-            // further down.
-            if (checkNestedBorrowBearingSlot(ctx, pft, argExpr, loc, what,
-                                             name))
+            // further down. fix #4164: thread `sub.env` — `pft`'s own
+            // substitution environment — down as the nested frame's
+            // `incoming` (see `checkNestedBorrowBearingSlot`'s header).
+            if (checkNestedBorrowBearingSlot(ctx, pft, sub.env, argExpr, loc,
+                                             what, name))
                 return true;
         }
         return false;
@@ -12189,8 +12243,10 @@ bool checkStaticReadonlyRecordInit(
         // fix #4133 (§9.7, v0.295): same generic-substitution gap as the
         // record arm above, applied to a choice's payload fields — see that
         // arm's comment for the full rationale.
+        // fix #4164 (§9.7, v0.295): thread `incoming` here too — see the
+        // record arm's comment just above for the full rationale.
         common::RecordSubstEnv env;
-        common::seedRecordSubstEnv(*ts, *declTy, /*incoming=*/nullptr, env);
+        common::seedRecordSubstEnv(*ts, *declTy, incoming, env);
         const common::RecordSubstEnv* fieldEnv =
             env.map.empty() ? nullptr : &env;
         for (const ChoiceCaseSymbol* cs : choiceCasesOf(ts)) {
@@ -12202,8 +12258,9 @@ bool checkStaticReadonlyRecordInit(
                 if (!pf.type) continue;
                 const TypeRef* rawPft = ctx.resolvedType(*pf.type);
                 if (!rawPft) continue;
-                const TypeRef* pft =
-                    common::resolveRecordFieldSubst(rawPft, fieldEnv).ty;
+                const common::RecordSubstEnv::Entry sub =
+                    common::resolveRecordFieldSubst(rawPft, fieldEnv);
+                const TypeRef* pft = sub.ty;
                 if (!pft) continue;
                 const ast::Expr* argExpr = nx.args[i].value.get();
                 if (staticReadonlyFieldIsReferenceTyped(pft, ctx)) {
@@ -12221,9 +12278,9 @@ bool checkStaticReadonlyRecordInit(
                 }
                 // fix #3973: same nested-slot handling as the record arm
                 // above (nested record/choice, or a declaration-less
-                // builtin span view).
-                if (checkNestedBorrowBearingSlot(ctx, pft, argExpr, loc, what,
-                                                 name))
+                // builtin span view). fix #4164: thread `sub.env` down.
+                if (checkNestedBorrowBearingSlot(ctx, pft, sub.env, argExpr,
+                                                 loc, what, name))
                     return true;
             }
             return false;  // first matching case wins
@@ -12255,8 +12312,8 @@ bool checkStaticReadonlyRecordInit(
 // reported.
 bool checkStaticReadonlyChoiceCaseInit(
     SemaContext& ctx, const ast::CallExpr& ce, const ChoiceCaseSymbol* cs,
-    const TypeRef* choiceTy, SourceLocation loc, std::string_view what,
-    std::string_view name) {
+    const TypeRef* choiceTy, const common::RecordSubstEnv* incoming,
+    SourceLocation loc, std::string_view what, std::string_view name) {
     if (!cs || !cs->caseDecl) return false;
     std::size_t arity = cs->caseDecl->payload.size();
     if (ce.args.size() != arity) return false;  // mismatch — typecheck reports
@@ -12266,16 +12323,22 @@ bool checkStaticReadonlyChoiceCaseInit(
     // instantiation (`choiceTy`) actually binds it to. `cs->parent` is the
     // choice's own declaring TypeSymbol (its `genericParams`); `choiceTy`
     // carries the instantiation's concrete `genericArgs`.
+    // fix #4164 (§9.7, v0.295): seed through `incoming` (the enclosing
+    // frame's env, null at the top of the recursion) rather than a
+    // hardcoded `nullptr` — same composition rationale as
+    // checkStaticReadonlyRecordInit's record arm.
     common::RecordSubstEnv env;
     if (auto* choiceTs = dynamic_cast<TypeSymbol*>(cs->parent); choiceTs && choiceTy)
-        common::seedRecordSubstEnv(*choiceTs, *choiceTy, /*incoming=*/nullptr, env);
+        common::seedRecordSubstEnv(*choiceTs, *choiceTy, incoming, env);
     const common::RecordSubstEnv* fieldEnv = env.map.empty() ? nullptr : &env;
     for (std::size_t i = 0; i < arity; ++i) {
         const ast::Param& pf = cs->caseDecl->payload[i];
         if (!pf.type) continue;
         const TypeRef* rawPft = ctx.resolvedType(*pf.type);
         if (!rawPft) continue;
-        const TypeRef* pft = common::resolveRecordFieldSubst(rawPft, fieldEnv).ty;
+        const common::RecordSubstEnv::Entry sub =
+            common::resolveRecordFieldSubst(rawPft, fieldEnv);
+        const TypeRef* pft = sub.ty;
         if (!pft) continue;
         const ast::Expr* argExpr = ce.args[i].value.get();
         if (!argExpr) continue;  // discard argument: no source to inspect
@@ -12294,8 +12357,9 @@ bool checkStaticReadonlyChoiceCaseInit(
         }
         // fix #4134: same nested-slot handling as checkStaticReadonlyRecordInit's
         // record/choice arms (nested record/choice, or a declaration-less
-        // builtin span view).
-        if (checkNestedBorrowBearingSlot(ctx, pft, argExpr, loc, what, name))
+        // builtin span view). fix #4164: thread `sub.env` down.
+        if (checkNestedBorrowBearingSlot(ctx, pft, sub.env, argExpr, loc,
+                                         what, name))
             return true;
     }
     return false;
@@ -12428,6 +12492,7 @@ void Resolver::checkStaticReadonlyNullSource() {
                     (rt->declaration->kind == ast::TypeDeclKind::Record ||
                      rt->declaration->kind == ast::TypeDeclKind::Choice)) {
                     checkStaticReadonlyRecordInit(ctx_, *nx, rt,
+                                                  /*incoming=*/nullptr,
                                                   init->span.begin, what,
                                                   memberName);
                 }
@@ -12460,6 +12525,7 @@ void Resolver::checkStaticReadonlyNullSource() {
                     Symbol* calleeSym = ctx_.exprSymbol(*ce->callee);
                     if (auto* ccs = dynamic_cast<ChoiceCaseSymbol*>(calleeSym))
                         checkStaticReadonlyChoiceCaseInit(ctx_, *ce, ccs, rt,
+                                                          /*incoming=*/nullptr,
                                                           init->span.begin,
                                                           what, memberName);
                 }
