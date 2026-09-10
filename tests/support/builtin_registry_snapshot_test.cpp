@@ -446,7 +446,7 @@ BEZEL_TEST(builtin_registry_snapshot, iterable_interface_head_set) {
 // (imported-only) are deliberately NOT in the shared set — they are the small
 // site-local deltas the two call sites still test explicitly.
 BEZEL_TEST(builtin_registry_snapshot, heap_pointer_reference_builtin_set) {
-    static constexpr std::array<std::string_view, 69> kSnapshot = {
+    static constexpr std::array<std::string_view, 70> kSnapshot = {
         "Array", "OwningArray", "Dictionary", "OwningDictionary",
         // INTENTIONAL addition (stdlib §4.18, #1426): SortedSet — bz_dict_t*
         // rep on both the astNode and imported paths.
@@ -483,6 +483,12 @@ BEZEL_TEST(builtin_registry_snapshot, heap_pointer_reference_builtin_set) {
         "Subscription", "CancellationToken", "CancellationTokenSource",
         "TaskScope",
         "Shared", "Weak", "Channel", "ChannelSender", "IGrouping",
+        // INTENTIONAL addition (issue #4178): IOrderedEnumerable<T> —
+        // same bz_lazy_t* ptr rep as IEnumerable/IGrouping above; without
+        // it, a function whose declared return type is an explicit
+        // `IOrderedEnumerable<T>` annotation IR-verify-fails ("Function
+        // return type does not match operand type of return inst!").
+        "IOrderedEnumerable",
         // INTENTIONAL addition (stdlib §6.5, fix #1536): EventSource<T> /
         // AsyncEventSource<T> — the producer-side event face (§24.3), same
         // ptr rep as IEvent<T>/IAsyncEvent<T>.
@@ -570,7 +576,10 @@ BEZEL_TEST(builtin_registry_snapshot, reserved_builtin_type_name_set) {
                                "BinaryDeserializer", "JsonSerializer",
                                "JsonDeserializer",
                                "Array", "Dictionary", "Task", "Shared",
-                               "Mutex", "Buffer", "IGrouping"})
+                               "Mutex", "Buffer", "IGrouping",
+                               // #4178: IOrderedEnumerable<T> joined the heap
+                               // table alongside its sibling IGrouping above.
+                               "IOrderedEnumerable"})
         BEZEL_EXPECT_TRUE(isReservedBuiltinTypeName(n));
     // (c) OUT: ordinary generic type-parameter spellings must stay classifiable
     // as parameters — this is the whole point of the negative test.

@@ -241,7 +241,7 @@ constexpr std::array<std::string_view, 2> kNoOverrideIdentityBuiltins = {
 // LlvmBackend_Layout.cpp (see header).  This is the intersection of the two
 // pre-refactor hand-lists: OwningBuffer (astNode-only) and the FFI class names
 // (imported-only) are NOT here — they stay as explicit deltas at the sites.
-constexpr std::array<std::string_view, 69> kHeapPointerReferenceBuiltins = {
+constexpr std::array<std::string_view, 70> kHeapPointerReferenceBuiltins = {
     // §4 collections (SortedSet: stdlib §4.18/#1426 — bz_dict_t* rep, both paths)
     "Array", "OwningArray", "Dictionary", "OwningDictionary",
     "SortedDictionary", "SortedSet", "Stack", "OwningStack", "Queue", "OwningQueue",
@@ -284,6 +284,17 @@ constexpr std::array<std::string_view, 69> kHeapPointerReferenceBuiltins = {
     "Subscription", "CancellationToken", "CancellationTokenSource", "TaskScope",
     // §28.13 / §2.16 Shared/Weak; §30.14/§30.15 channels; §5 groupings
     "Shared", "Weak", "Channel", "ChannelSender", "IGrouping",
+    // issue #4178: IOrderedEnumerable<T> — the OrderBy/OrderByDescending
+    // result interface (stdlib §5). Same bz_lazy_t* ptr rep as IEnumerable
+    // above and its sibling IGrouping (both already in this table); this
+    // was the actual root cause of "Function return type does not match
+    // operand type of return inst! ret ptr ... / i32" — an IR-verifier
+    // failure, not a clean diagnostic — on any function whose declared
+    // return type is an EXPLICIT `IOrderedEnumerable<T>` annotation:
+    // lowerTypeRef's Named case fell through both this table's astNode-path
+    // and imported-name-path checks to the i32 default, mismatching the
+    // ptr the LINQ runtime actually produces.
+    "IOrderedEnumerable",
     // §24.3 event sources; §6.5 / fix #1536: EventSource<T>/AsyncEventSource<T>
     // (the producer-side face, §24.3) are heap-allocated like the IEvent<T>/
     // IAsyncEvent<T> interfaces above — same ptr rep, no user TypeDecl.
