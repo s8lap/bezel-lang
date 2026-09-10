@@ -2423,9 +2423,20 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                 // context a bare/miscounted generic-alias name can appear in
                 // (locals, fields, parameters, extension targets, …), not
                 // just extension targets — completing, for aliases, the
-                // same generic-arity check §11.3/Appendix C.4 already gives
-                // ordinary TypeSymbol references a few lines below. Unlike
-                // that check, a wholly bare (zero-argument) reference is
+                // same generic-arity check the ordinary-TypeSymbol arm gives
+                // a few lines below (search this file for "Generic-arity
+                // check"). NOTE (narrow #4167, review-caught): no normative
+                // spec section states this reference-site arity rule for
+                // EITHER arm — searched §11.3 "Member body" (member-clash
+                // rules, unrelated), Appendix C.4 "Generics" (entirely
+                // `where`-clause constraint/substitution semantics, no
+                // argument-count rule), §14.1-§14.6 (§14.5 states the
+                // omit-or-supply-in-full rule for a generic METHOD CALL's
+                // type-argument list, a different subject), and Appendix
+                // C.1 "Type system" (no matching bullet); filed as issue
+                // #4181 — a genuine spec gap, not a citation this comment
+                // can correctly make. Unlike the ordinary-TypeSymbol arm, a
+                // wholly bare (zero-argument) reference is
                 // ALSO rejected here when the alias is generic: the
                 // TypeSymbol check tolerates an omitted argument list (a
                 // "raw" reference to the real declared type, which still
