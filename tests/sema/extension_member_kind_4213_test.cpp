@@ -214,6 +214,36 @@ BEZEL_TEST(extension_member_kind_4213,
     BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "§26.3"));
 }
 
+// REJECT — EventDecl. Not named by the issue and not itself part of
+// Appendix A.4's `Member` production in this spec revision (a separate,
+// out-of-#4213-scope discrepancy — `event` is not documented anywhere in
+// docs/Bezel_Language_Spec.md at all), but reachable via the SAME
+// `parseMember()` an extension body's loop calls, and caught by the
+// default-deny catch-all the same as any other non-`MethodDecl`/
+// non-`PropertyDecl` kind. Found via this fix's own self-review testing:
+// the catch-all's generic fallback labeled it "a `member` member" (the
+// unnamed-kind default) before an explicit `EventDecl` arm was added to
+// give it a proper "event" label — pinning the labeled text here catches a
+// regression to the awkward fallback wording.
+BEZEL_TEST(extension_member_kind_4213, extension_event_rejected_spec_26_3) {
+    auto r = runAot(
+        "module M; "
+        "class WidgetE4213 "
+        "  public X: int; "
+        "end WidgetE4213; "
+        "extension WidgetE4213 "
+        "  public event Bell4213: int; "
+        "  public method DoIt(): int => this.X; "
+        "end extension; "
+        "class CEv4213 public static method Main(): int "
+        "  return 0; "
+        "end Main; end CEv4213;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(
+        r, "an extension block may not declare an `event` member"));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "§26.3"));
+}
+
 // REJECT — IndexerDecl (a `PropertyDecl` with `isIndexer = true`; not named
 // by the issue, but §26.3 is explicit: "No indexers."). Pre-fix this was
 // NOT silently admitted — it reached `visitMember` (the existing

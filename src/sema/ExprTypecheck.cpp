@@ -11361,7 +11361,20 @@ void ExprTC::visitTopDecl(const ast::TopDecl& d) {
             // here for six releases.
             if (!dynamic_cast<const ast::MethodDecl*>(m.get()) &&
                 !dynamic_cast<const ast::PropertyDecl*>(m.get())) {
-                std::string_view kind = "member";
+                // Default label/note for any `Member` kind this arm has no
+                // dedicated case for below (a genuinely unenumerable
+                // fallback — every A.4 alternative this revision defines
+                // DOES have a case: `EventDecl` is the one live example,
+                // handled explicitly just below rather than falling
+                // through to this generic text, since "a `member` member"
+                // reads badly and `EventDecl` is real reachable syntax
+                // (`public event Foo: int;` inside an extension body,
+                // measured admitted with zero diagnostics pre-fix — even
+                // though `EventDecl` is not itself part of A.4's `Member`
+                // production in this spec revision, a separate,
+                // out-of-#4213-scope discrepancy). This text is reached
+                // only for a genuinely future `Member` alternative.
+                std::string_view kind = "unsupported";
                 std::string_view note =
                     "Appendix A.4's `ExtensionMember` grammar admits only "
                     "methods and expression-bodied properties";
@@ -11395,11 +11408,21 @@ void ExprTC::visitTopDecl(const ast::TopDecl& d) {
                     kind = "nested type";
                     note = "§26.3's first bullet is exhaustive (\"Only "
                            "methods and computed read-only properties.\")";
+                } else if (dynamic_cast<const ast::EventDecl*>(m.get())) {
+                    kind = "event";
+                    note = "§26.3's first bullet is exhaustive (\"Only "
+                           "methods and computed read-only properties.\")";
                 }
+                // "a"/"an" per `kind`'s leading sound — only "event" and
+                // the "unsupported" fallback start with a vowel sound
+                // among the kinds this arm produces.
+                const char* article =
+                    (kind == "event" || kind == "unsupported") ? "an" : "a";
                 ctx_.diagnostics().report(
                     Severity::Error, m->span.begin,
-                    "an extension block may not declare a `" +
-                    std::string(kind) + "` member — " + std::string(note) +
+                    "an extension block may not declare " +
+                    std::string(article) + " `" + std::string(kind) +
+                    "` member — " + std::string(note) +
                     "; declare it on the extended type's own declaration "
                     "or at module scope instead (§26.3)");
                 continue;
