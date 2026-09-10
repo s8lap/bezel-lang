@@ -9416,6 +9416,27 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                     call.callee.get())) {
                 if (ma->target) {
                     const sema::TypeRef* recvTy = ctx_.exprType(*ma->target);
+                    // fix issue 4193 (stdlib §8.1/§23.2-§23.3, v0.298): when
+                    // `ma->target` is a bare identifier that resolves to a
+                    // computed/block-form property getter,
+                    // `postGetterFootprint_` (populated by
+                    // `lowerExprInner`'s `IdentifierExpr` handling —
+                    // LlvmBackend_Exprs.cpp) carries a footprint taken right
+                    // after THAT getter finished evaluating. Using it instead
+                    // of `dispatchEntry` for both `emittedSideEffectSince`
+                    // reads below excludes the getter's own side effects from
+                    // the "did the MEMBER dispatch" question — see
+                    // `postGetterFootprint_`'s declaration in
+                    // LlvmBackend_impl.hpp for the full derivation. A miss
+                    // (every other identifier shape: locals, parameters,
+                    // fields; and any non-identifier receiver, which keeps
+                    // #4171's existing always-warn behaviour) falls back to
+                    // `dispatchEntry`, unchanged.
+                    const IrFootprint effectiveDispatchEntry = [&]() -> IrFootprint {
+                        auto it = postGetterFootprint_.find(ma->target.get());
+                        return it != postGetterFootprint_.end() ? it->second
+                                                                 : dispatchEntry;
+                    }();
                     using K = sema::TypeRef::Kind;
                     using P = sema::PrimitiveType;
                     // Reaching here means the whole `if (!ms)` dispatch chain
@@ -9705,8 +9726,12 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                         // documented-but-unimplemented (#2457) — are the whole
                         // set.
                         std::string ftMember, ftApplied;
+                        // fix issue 4193: `effectiveDispatchEntry` (see above)
+                        // instead of `dispatchEntry` directly — see that
+                        // declaration for why a getter-backed identifier
+                        // receiver needs the more precise anchor.
                         const std::string ftRecv =
-                            !emittedSideEffectSince(dispatchEntry)
+                            !emittedSideEffectSince(effectiveDispatchEntry)
                                 ? builtinReceiverOfMemberCall(&call, &ftMember,
                                                               &ftApplied)
                                 : std::string();
@@ -9865,13 +9890,68 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                     // 4182 tracks the receiver-shape-general fix (e.g. a
                     // plain field read) should one ever surface as more than
                     // a hypothetical.
+                    //
+                    // fix issue 4193 (stdlib §8.1/§23.2-§23.3, v0.298): a bare
+                    // `IdentifierExpr` is NOT always "one non-side-effecting
+                    // load" — the paragraph above claims it, but that claim is
+                    // false whenever the identifier resolves to a COMPUTED or
+                    // BLOCK-FORM property getter (`property Sw: Stopwatch get
+                    // => Stopwatch.StartNew(); end;`). Reading a bare `Sw`
+                    // evaluates the getter body against `this`
+                    // (`lowerExprInner`'s own `IdentifierExpr` handling,
+                    // LlvmBackend_Exprs.cpp ~6369/~6391), which can emit a
+                    // real side-effecting call before `ma->member` is ever
+                    // compared — exactly the `Stopwatch.StartNew().Bogus()`
+                    // hazard above, one hop earlier. Measured pre-fix:
+                    // `Sw.TotallyBogusMember();` compiled with ZERO
+                    // diagnostics (`Sw`'s declared type is a declaration-less
+                    // builtin — the SAME accident of typing #4171's own
+                    // comment above records — so `isConcreteType` was already
+                    // false for it and this Warning never had a chance to
+                    // fire; the `ftRecv`/#2935 Error a few dozen lines up is
+                    // what actually diagnoses this repro, gated the same
+                    // `!emittedSideEffectSince` way).
+                    //
+                    // The fix is NOT to exclude getter-backed identifiers from
+                    // `receiverIsPlainLocalRead` (that was tried FIRST and is
+                    // measurably wrong the same way "any instruction" was
+                    // wrong for #2963 above: it also excludes the LEGITIMATE
+                    // dispatches through the identical receiver shape —
+                    // `Sw.Start()`/`Sw.Stop()`/`Sw.Reset()` reach this exact
+                    // fallthrough too, per the `tryLowerBuiltinClassCall` note
+                    // above, and reintroducing the always-warn fallback for
+                    // them regressed EXACTLY the class of spurious warning
+                    // #4171 was filed to fix — MEASURED: `Sw.Start();` under
+                    // that first attempt produced the same "internal: cannot
+                    // dispatch member 'Start'" warning `sw.Start()` used to,
+                    // pre-#4171). `receiverIsPlainLocalRead` therefore stays
+                    // exactly what it was before this fix: true for ANY bare
+                    // `IdentifierExpr`, getter-backed or not.
+                    //
+                    // Instead, `emittedSideEffectSince` below is asked against
+                    // `effectiveDispatchEntry` (computed above, right after
+                    // `recvTy`) rather than `dispatchEntry` directly, for
+                    // whichever receiver TYPE eventually DOES make
+                    // `isConcreteType` true for a getter-backed identifier
+                    // (a computed/block-form property of a PRIMITIVE type, or
+                    // of a declaration-HAVING builtin, should one exist).
+                    // `postGetterFootprint_` anchors the "did anything happen"
+                    // question to AFTER the getter finished, so the getter's
+                    // own side effects no longer masquerade as "the member
+                    // dispatched" — the same discriminator that makes the
+                    // `ftRecv` fix above sound. Every other identifier shape
+                    // (locals, parameters, fields, and a getter-backed
+                    // identifier whose declared type stays declaration-less
+                    // like `Sw` above) has no `postGetterFootprint_` entry, or
+                    // reaches `isConcreteType` == false regardless, so this
+                    // line is unchanged from before this fix for them.
                     bool receiverIsPlainLocalRead =
                         ma->target &&
                         dynamic_cast<const ast::IdentifierExpr*>(
                             ma->target.get()) != nullptr;
                     bool memberAlreadyDispatched =
                         receiverIsPlainLocalRead &&
-                        emittedSideEffectSince(dispatchEntry);
+                        emittedSideEffectSince(effectiveDispatchEntry);
                     if (!memberAlreadyDispatched &&
                         (isConcreteType ? !isUniversalObjMember
                                         : isBareTypeParamInDeadTemplate)) {

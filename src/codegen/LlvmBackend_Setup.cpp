@@ -9157,6 +9157,19 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
         // a type-parameter pattern in the (dead) template body is recognizable
         // even with no active substitution (genericSubstSemaTy_ empty there).
         templateGenericParamNames_.clear();
+        // fix #4193 (per-method codegen state; #3505's "clear() + nested
+        // save/restore are one contract" ratchet, cited a few lines above):
+        // `postGetterFootprint_` is populated by `lowerExprInner`'s
+        // `IdentifierExpr` handling (LlvmBackend_Exprs.cpp) and consumed
+        // within the SAME statement's `lowerCallDispatch`
+        // (LlvmBackend_Calls2.cpp) — never across an `emitFunctionBody`
+        // boundary — so nothing here needs to survive into the NEXT method's
+        // lowering. Left uncleared it accumulates for the whole
+        // `Emitter::run()` lifetime instead of bounding to one method's worth
+        // of entries, the same class of defect `smLocalFields_` /
+        // `smForInSrcFields_` / `frameLocalPreBoxTy_` are `.clear()`'d against
+        // at their own (state-machine-specific) lowering boundaries.
+        postGetterFootprint_.clear();
         // fix #3143 (§14.1 / §2.5, v0.254): the parent's parameter names through
         // the one both-sources walk. (`emitFunctionBody` returns above for an
         // imported method, so no imported parent reaches here today — converted

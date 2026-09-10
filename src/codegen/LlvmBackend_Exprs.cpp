@@ -6397,7 +6397,17 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
             // not a pure IEnumerable-family interface or the getter's type is
             // not array-backed, so the bare read keeps its existing shape for
             // every other property).
-            return wrapPropertyArrayAsIEnumerable(bv, ctx_.exprType(e), getter, &e);
+            llvm::Value* result =
+                wrapPropertyArrayAsIEnumerable(bv, ctx_.exprType(e), getter, &e);
+            // fix issue 4193 (stdlib §8.1/§23.2-§23.3, v0.298): record the
+            // footprint right after this getter's own evaluation completes —
+            // see `postGetterFootprint_`'s declaration for why a bare
+            // getter-backed identifier is NOT "one non-side-effecting load"
+            // for `emittedSideEffectSince(dispatchEntry)`'s purposes, and why
+            // anchoring here (rather than at `dispatchEntry`) lets a caller
+            // tell "the getter ran" apart from "the MEMBER dispatched".
+            postGetterFootprint_[&e] = irFootprint();
+            return result;
         }
         // CG33b: block-form getter (`get => do … end;`) accessed bare.
         if (const ast::PropertyAccessor* acc = blockGetterOf(ctx_.exprSymbol(e))) {
@@ -6409,6 +6419,8 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
             // §31.1/§31.2 (FINDING [4]): see the qualified block-getter read
             // above — a throw inside the standalone getter must propagate.
             emitPendingCheck();
+            // fix issue 4193: see the `computedGetterOf` arm above.
+            postGetterFootprint_[&e] = irFootprint();
             return res;
         }
         // CG12: a bare identifier resolving to a static field reads

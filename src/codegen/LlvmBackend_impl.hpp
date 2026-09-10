@@ -17676,6 +17676,46 @@ private:
         return since.prev != nullptr;
     }
 
+    // fix issue 4193 (stdlib §8.1/§23.2-§23.3, v0.298): `emittedSideEffectSince
+    // (dispatchEntry)` conflates "the RECEIVER's own evaluation had a side
+    // effect" with "the MEMBER dispatched" whenever the receiver is not a
+    // trivial load. #4171 already found this for a receiver that is itself a
+    // CALL (`Stopwatch.StartNew().Bogus();` — evaluating the receiver emits
+    // `bz_stopwatch_start`/`alloc` before the member name is even compared)
+    // and declined to fix it there, keeping the pre-existing always-warn
+    // behaviour. The SAME hazard exists one hop earlier for a bare
+    // `IdentifierExpr` that resolves to a COMPUTED or BLOCK-FORM property
+    // getter (`property Sw: Stopwatch get => Stopwatch.StartNew(); end;` —
+    // reading bare `Sw` evaluates the getter body, `LlvmBackend_Exprs.cpp`'s
+    // own `IdentifierExpr` handling, ~6369/~6391) — measured to silently drop
+    // BOTH the `ftRecv`/#2935 Error and this file's Shape 1/2 Warning for
+    // `Sw.TotallyBogusMember();` (zero diagnostics), because the getter's own
+    // internal call already satisfies `emittedSideEffectSince(dispatchEntry)`
+    // before `TotallyBogusMember` is ever compared against Stopwatch's known
+    // members.
+    //
+    // Unlike the call-shaped receiver, a bare identifier's getter evaluation
+    // has exactly ONE canonical lowering site — `lowerExprInner`'s
+    // `IdentifierExpr` arm — so that site can record a footprint immediately
+    // AFTER the getter finishes, keyed by the identifier node. Consulting
+    // THAT footprint instead of `dispatchEntry` for a getter-backed receiver
+    // disentangles the two facts precisely: `emittedSideEffectSince(that
+    // footprint)` is true only when something happened AFTER the getter
+    // returned — i.e. the member itself dispatched — not merely because the
+    // getter was non-trivial. Measured: `Sw.Start()` (Start() really
+    // dispatches) leaves a `bz_stopwatch_start` call after this anchor and
+    // correctly stays silent; `Sw.TotallyBogusMember()` leaves nothing after
+    // it and correctly warns. A receiver that IS itself a call (no bare
+    // identifier to key on) has no entry here and keeps #4171's existing
+    // always-warn behaviour, unchanged.
+    //
+    // Populated only in `lowerExprInner`'s `IdentifierExpr`
+    // `computedGetterOf`/`blockGetterOf` arms; every other identifier read
+    // (locals, parameters, plain fields, static fields) never inserts an
+    // entry, so a lookup miss here always falls back to `dispatchEntry`
+    // unchanged.
+    std::unordered_map<const ast::Expr*, IrFootprint> postGetterFootprint_;
+
     // fix #2963: set by `lowerCall` (the wrapper) on EVERY return — true exactly
     // when the call produced no value AND emitted IR, i.e. "an arm lowered it
     // and the result is unit". Assigned in ONE place so no arm has to remember
