@@ -2522,6 +2522,29 @@ private:
     // apply to the same node.
     bool rejectNewOnEnumOrChoice(const ast::NewExpr& ne, const TypeRef* rt);
 
+    // fix #4176 (§3.1/§3.2, §11.7, §12.5, §17.7, v0.298): sibling of
+    // `rejectNewOnEnumOrChoice` just above, same shape — the single
+    // authority for "does `new` construct a value of this NAMED
+    // CLASS-SHAPED kind": an abstract class, a `closed` class, a `static`
+    // class, and an interface all have no instance to mint. This logic
+    // ("Slice S11") already existed inline in the explicit `new T(...)`
+    // NewExpr-typing arm (ExprTypecheck_Exprs.cpp); #4176 found the two
+    // §17.7 typeless `new()` shorthand call sites in this file
+    // (field-initializer and local-decl) never reached it at all — their
+    // own `rt`-resolution routed straight to `checkNewExprArgs` for
+    // `TypeDeclKind::Class` and nothing else — so `w: ISomeInterface :=
+    // new();` with no implementing class in scope reached codegen with no
+    // vtable to install and SEGFAULTed on first virtual dispatch (exit
+    // 139); `w: AbstractThing := new();` crashes identically through the
+    // same shorthand gap. Reports the appropriate diagnostic and returns
+    // true iff `rt` names one of the four non-instantiable kinds;
+    // callers should treat a `true` return the same way the explicit
+    // arm's original if/else-if chain did — diagnose and skip the
+    // Class/Record constructor-arg check below, since there is no
+    // constructor to check args against.
+    bool rejectNewOnNonInstantiableKind(const ast::NewExpr& ne,
+                                         const TypeRef* rt);
+
     // narrow #4059 further (§9.1 / §9.2 / §9.5, v0.295): true iff
     // `new T()` is permitted on this body record (i.e. NOT the
     // silent-zero-fill defect shape). Returns true when the record

@@ -12194,7 +12194,23 @@ void ExprTC::visitMember(const ast::Member& m) {
                             // IR-verifier backstop instead. Shares the one
                             // predicate the explicit site now calls too.
                             rejectNewOnEnumOrChoice(*shNe, fty);
-                            if (fty->kind == TypeRef::Kind::Named &&
+                            // fix #4176 (§3.1/§3.2, §11.7, §12.5, §17.7,
+                            // v0.298): the explicit `new T(...)` site's
+                            // abstract/closed/static/interface rejection
+                            // ("Slice S11") never ran for this shorthand
+                            // node either — same gap #4170 closed for
+                            // Enum/Choice above, but for the four
+                            // class-shaped non-instantiable kinds. A field
+                            // shorthand-`new`'d to an interface (or an
+                            // abstract class) reached codegen with no
+                            // vtable to install and crashed on first
+                            // virtual dispatch (SIGSEGV, measured). Shares
+                            // the one predicate the explicit site now calls
+                            // too, instead of a third spelling.
+                            bool nonInstantiable =
+                                rejectNewOnNonInstantiableKind(*shNe, fty);
+                            if (!nonInstantiable &&
+                                fty->kind == TypeRef::Kind::Named &&
                                 fty->declaration &&
                                 fty->declaration->kind ==
                                     ast::TypeDeclKind::Class)
@@ -13330,7 +13346,22 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                             // one predicate the explicit site now calls
                             // too, instead of a third spelling.
                             rejectNewOnEnumOrChoice(*shNe, lsym->declType);
-                            if (lsym->declType->kind == TypeRef::Kind::Named &&
+                            // fix #4176 (§3.1/§3.2, §11.7, §12.5, §17.7,
+                            // v0.298): local-declaration twin of the
+                            // field-initializer check above — the
+                            // explicit `new T(...)` site's abstract/
+                            // closed/static/interface rejection ("Slice
+                            // S11") never ran for this shorthand node
+                            // either, so `var w: ISomeInterface := new();`
+                            // (or an abstract-class target) reached
+                            // codegen with no vtable to install and
+                            // crashed on first virtual dispatch (SIGSEGV,
+                            // measured, exit 139). Shares the one
+                            // predicate the explicit site now calls too.
+                            bool nonInstantiable = rejectNewOnNonInstantiableKind(
+                                *shNe, lsym->declType);
+                            if (!nonInstantiable &&
+                                lsym->declType->kind == TypeRef::Kind::Named &&
                                 lsym->declType->declaration &&
                                 lsym->declType->declaration->kind ==
                                     ast::TypeDeclKind::Class)

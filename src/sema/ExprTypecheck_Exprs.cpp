@@ -1222,6 +1222,80 @@ bool ExprTC::rejectNewOnEnumOrChoice(const ast::NewExpr& ne,
     return false;
 }
 
+// fix #4176 (§3.1/§3.2, §11.7, §12.5, §17.7, v0.298; sibling to
+// `rejectNewOnEnumOrChoice` above, same shape as #4170's own fix): the
+// single authority for "does `new` construct a value of this NAMED
+// CLASS-SHAPED kind" — an abstract class, a `closed` class, a `static`
+// class, and an interface all have no instance for `new` to mint. This
+// logic ("Slice S11") already existed, inline, in the explicit
+// `new T(...)` NewExpr-typing arm below; #4176 found it was NEVER reached
+// from the two §17.7 typeless `new()` shorthand call sites in
+// ExprTypecheck.cpp — their own `rt`-resolution routed straight to
+// `checkNewExprArgs` for `TypeDeclKind::Class` and nothing else — so
+// `using var w: ISomeInterface := new();` with no implementing class in
+// scope reached codegen with no vtable to install and SEGFAULTed on the
+// first virtual dispatch through it (measured, exit 139): the same
+// "unconstructable kind reaches codegen with nothing to construct" defect
+// class #4163/#4170 closed for Enum/Choice, but for the four class-shaped
+// non-instantiable kinds. `new AbstractThing()` through the SAME shorthand
+// path crashes identically (measured, exit 139) — abstract classes are
+// `TypeDeclKind::Class`, not Interface, so #4170's own enum/choice
+// predicate could never have caught either gap. `closed`/`static` class
+// shorthand do not crash the same way (both are otherwise fully concrete
+// — no unresolved vtable slot or missing override — so the mis-
+// construction is silently ACCEPTED rather than fatal), but are folded
+// into this one shared predicate anyway rather than hand-picked out of
+// the block they have always lived in together, per CLAUDE.md /
+// LANE_RULES.md §6 ("prefer feeding the existing authority" over a
+// narrower, second spelling of the same four-way classification).
+// Diagnostic text and citations are copied verbatim from the pre-existing
+// explicit-`new` arm this replaces — not a wording change, a pure
+// factoring, exactly as #4170's own commit did for enum/choice.
+bool ExprTC::rejectNewOnNonInstantiableKind(const ast::NewExpr& ne,
+                                             const TypeRef* rt) {
+    if (!(rt->kind == TypeRef::Kind::Named && rt->declaration)) return false;
+    TypeSymbol* t = rt->declaration;
+    bool isAbstract = false;
+    bool isStatic = false;
+    for (auto mod : t->modifiers) {
+        if (mod == "abstract") isAbstract = true;
+        if (mod == "static") isStatic = true;
+    }
+    // §12.5 (v0.242, #3052), verbatim: "`new` on an abstract
+    // or `closed` class is a compile error." The two spellings
+    // are named separately so the diagnostic points at the
+    // modifier the author actually wrote.
+    const bool isClosed = typeIsClosed(t);
+    if (isAbstract || isClosed) {
+        ctx_.diagnostics().report(
+            Severity::Error, ne.span.begin,
+            std::string("cannot instantiate ") +
+            (isAbstract ? "abstract" : "`closed`") +
+            " class `" +
+            std::string(t->name) + "` with `new` "
+            "(§12.5)");
+        return true;
+    }
+    if (isStatic) {
+        ctx_.diagnostics().report(
+            Severity::Error, ne.span.begin,
+            std::string("cannot instantiate static "
+                        "class `") +
+            std::string(t->name) + "` with `new` "
+            "(§11.7)");
+        return true;
+    }
+    if (t->kind == ast::TypeDeclKind::Interface) {
+        ctx_.diagnostics().report(
+            Severity::Error, ne.span.begin,
+            std::string("cannot instantiate interface `") +
+            std::string(t->name) +
+            "` with `new` (§11.2)");
+        return true;
+    }
+    return false;
+}
+
 void ExprTC::checkBuiltinClosedConstructorSurface(const ast::NewExpr& ne) {
     // Resolved exactly as `lowerNew` resolves it (and as codegen's #2974 twin
     // does): the explicit `ne.type` when present, else the §17.7 `new(...)`
@@ -4616,81 +4690,58 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                 // Slice S11: forbid `new` on abstract or static
                 // class types. Interfaces and (purely declarative)
                 // static-only types are also non-instantiable.
+                //
+                // fix #4176 (v0.298): the four-way abstract/closed/static/
+                // interface classification below now lives in
+                // `rejectNewOnNonInstantiableKind` (defined above, beside
+                // `rejectNewOnEnumOrChoice`) so the two §17.7 shorthand
+                // call sites in ExprTypecheck.cpp can share it instead of
+                // leaving it unreachable from the shorthand path entirely.
+                // Diagnostic text/citations are unchanged — pure factoring.
                 if (rt->kind == TypeRef::Kind::Named && rt->declaration) {
                     TypeSymbol* t = rt->declaration;
-                    bool isAbstract = false;
-                    bool isStatic = false;
-                    for (auto mod : t->modifiers) {
-                        if (mod == "abstract") isAbstract = true;
-                        if (mod == "static") isStatic = true;
-                    }
-                    // §12.5 (v0.242, #3052), verbatim: "`new` on an abstract
-                    // or `closed` class is a compile error." The two spellings
-                    // are named separately so the diagnostic points at the
-                    // modifier the author actually wrote.
-                    const bool isClosed = typeIsClosed(t);
-                    if (isAbstract || isClosed) {
-                        ctx_.diagnostics().report(
-                            Severity::Error, ne->span.begin,
-                            std::string("cannot instantiate ") +
-                            (isAbstract ? "abstract" : "`closed`") +
-                            " class `" +
-                            std::string(t->name) + "` with `new` "
-                            "(§12.5)");
-                    } else if (isStatic) {
-                        ctx_.diagnostics().report(
-                            Severity::Error, ne->span.begin,
-                            std::string("cannot instantiate static "
-                                        "class `") +
-                            std::string(t->name) + "` with `new` "
-                            "(§11.7)");
-                    } else if (t->kind ==
-                               ast::TypeDeclKind::Interface) {
-                        ctx_.diagnostics().report(
-                            Severity::Error, ne->span.begin,
-                            std::string("cannot instantiate interface `") +
-                            std::string(t->name) +
-                            "` with `new` (§11.2)");
-                    } else if (t->kind == ast::TypeDeclKind::Class) {
-                        // Slice T7: constructor arity / arg types.
-                        checkNewExprArgs(*ne, t);
-                    } else if (t->kind == ast::TypeDeclKind::Record) {
-                        // #1105 (§9.1): validate a POSITIONAL record's primary-
-                        // constructor `new` args (count + per-field type). Record
-                        // construction previously skipped all arg checking, so
-                        // too-few / too-many / wrong-typed args were silently
-                        // accepted and miscompiled. Only positional records are
-                        // routed here; checkNewExprArgs validates the positional
-                        // fields and returns (generic records defer to #428).
-                        //
-                        // fix #3141 (family F3 of umbrella #3152, §2.8.3 rule 4):
-                        // this gate used to ask the record's `ast::TypeDecl`.
-                        // `ModuleLoader` never assigns `Symbol::decl` for an
-                        // imported type, so the gate was false for EVERY import
-                        // and #1105's arg check — the one that stopped a
-                        // wrong-typed positional argument from being stored into
-                        // a differently-sized field — never ran across a module
-                        // boundary. `hasPositionalFields` is mirrored onto the
-                        // TypeSymbol on both sides (#501), so read it there.
-                        //
-                        // fix #4059 (§9.1 / §9.2 / §22.7, v0.295): the
-                        // pre-existing `hasPositionalFields` gate ALSO skipped
-                        // any arg check for a body-only record (positional-field
-                        // count is zero), where §9.1 has nothing to validate
-                        // and §9.2 declares no implicit default ctor — until
-                        // §4059 fix's `ctors.empty()` arm rejects the silent
-                        // zero-fill (`new Foo()` type-checked clean and minted
-                        // a 0-valued record; `return f.Bar;` returned 0). The
-                        // fix opens this gate so every record — positional,
-                        // body-only, or combined-form — runs through
-                        // `checkNewExprArgs`. The function already has the
-                        // right arms: `t->hasPositionalFields` routes the
-                        // positional-record binder; the ctors-collection arm
-                        // handles body records with explicit ctors; and the
-                        // new body-record reject (added in the same fix's
-                        // parallel edit to `checkNewExprArgs`) closes the
-                        // zero-fill hole for body records with no ctors.
-                        checkNewExprArgs(*ne, t);
+                    if (!rejectNewOnNonInstantiableKind(*ne, rt)) {
+                        if (t->kind == ast::TypeDeclKind::Class) {
+                            // Slice T7: constructor arity / arg types.
+                            checkNewExprArgs(*ne, t);
+                        } else if (t->kind == ast::TypeDeclKind::Record) {
+                            // #1105 (§9.1): validate a POSITIONAL record's primary-
+                            // constructor `new` args (count + per-field type). Record
+                            // construction previously skipped all arg checking, so
+                            // too-few / too-many / wrong-typed args were silently
+                            // accepted and miscompiled. Only positional records are
+                            // routed here; checkNewExprArgs validates the positional
+                            // fields and returns (generic records defer to #428).
+                            //
+                            // fix #3141 (family F3 of umbrella #3152, §2.8.3 rule 4):
+                            // this gate used to ask the record's `ast::TypeDecl`.
+                            // `ModuleLoader` never assigns `Symbol::decl` for an
+                            // imported type, so the gate was false for EVERY import
+                            // and #1105's arg check — the one that stopped a
+                            // wrong-typed positional argument from being stored into
+                            // a differently-sized field — never ran across a module
+                            // boundary. `hasPositionalFields` is mirrored onto the
+                            // TypeSymbol on both sides (#501), so read it there.
+                            //
+                            // fix #4059 (§9.1 / §9.2 / §22.7, v0.295): the
+                            // pre-existing `hasPositionalFields` gate ALSO skipped
+                            // any arg check for a body-only record (positional-field
+                            // count is zero), where §9.1 has nothing to validate
+                            // and §9.2 declares no implicit default ctor — until
+                            // §4059 fix's `ctors.empty()` arm rejects the silent
+                            // zero-fill (`new Foo()` type-checked clean and minted
+                            // a 0-valued record; `return f.Bar;` returned 0). The
+                            // fix opens this gate so every record — positional,
+                            // body-only, or combined-form — runs through
+                            // `checkNewExprArgs`. The function already has the
+                            // right arms: `t->hasPositionalFields` routes the
+                            // positional-record binder; the ctors-collection arm
+                            // handles body records with explicit ctors; and the
+                            // new body-record reject (added in the same fix's
+                            // parallel edit to `checkNewExprArgs`) closes the
+                            // zero-fill hole for body records with no ctors.
+                            checkNewExprArgs(*ne, t);
+                        }
                     }
                     // fix #3719 (§17.11 / §3.6 rule 2, v0.242): this
                     // construction IS the instantiation site (§3.6 rule 2)
