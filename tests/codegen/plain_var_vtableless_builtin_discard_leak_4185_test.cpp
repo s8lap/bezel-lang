@@ -50,26 +50,41 @@
 // dispatches through the SAME vtable call — widening it would reintroduce
 // the #2675 wild-jump crash on the unwind edge.
 //
-// fix-forward (review NEEDS-FIX, §25): the FIRST version of this fix gated
-// the fallback on `common::isVtableLessBuiltinClassName` alone — a predicate
-// validated to answer "carries no Bezel vtable" (47 names), a STRICT
-// SUPERSET of what `emitVtablelessBuiltinRelease` actually handles (18
-// names). For a name in the 29-name gap (`Shared<T>`, `Weak<T>`,
+// fix-forward round 1 (review NEEDS-FIX, §25): the FIRST version of this fix
+// gated the fallback on `common::isVtableLessBuiltinClassName` alone — a
+// predicate validated to answer "carries no Bezel vtable" (47 names), a
+// STRICT SUPERSET of what `emitVtablelessBuiltinRelease` actually handles
+// (18 names). For a name in the 29-name gap (`Shared<T>`, `Weak<T>`,
 // `JsonSerializer`, `BinarySerializer`, `JsonDeserializer`,
 // `BinaryDeserializer`, `SharedEventSource<T>`, `Buffer`, `TaskScope`, ...)
 // that version's fallback found a slot, `emitVtablelessBuiltinRelease`
 // returned false, and the pre-existing `else` branch called
 // `emitDisposeAndReclaim` on it — the SAME #2675 wild jump, converting a
-// leak into a SIGSEGV. Measured on that version, `--sanitize=address`:
-// `var sh := new Shared<Widget>(new Widget()); _ := sh;` -> SEGV, "Maybe a
-// wild jump?"; `var js := new JsonSerializer(); _ := js;` -> "SEGV on
-// unknown address 0x000000000010". `vtablelessBuiltinReleaseIsKnown` (a
-// second, small, explicitly-synced listing — `emitVtablelessBuiltinRelease`
-// cannot be asked without emitting IR) answers the narrower question, so a
-// name in the gap now leaves the fallback's slot null and the branch emits
-// nothing for it — a leak, matching PRE-#4185 behaviour for that untested
-// tail, never a crash. `shared_uncovered_builtin_still_leaks_not_crashes`
-// below is the control row the review asked for.
+// leak into a crash. Measured (reviewer's independent build) on
+// `var sh := new Shared<Widget>(new Widget()); _ := sh;`: a
+// **heap-buffer-overflow**, not a SEGV — the wild read landed inside mapped
+// memory, so ASan's redzone check fired first (see the control row below
+// for the "wild jump is a crash FAMILY, not one signature" note).
+//
+// fix-forward round 1's remedy was `vtablelessBuiltinReleaseIsKnown`, a
+// second, small, hand-synced 18-name array — justified at the time as
+// unavoidable because `emitVtablelessBuiltinRelease` cannot be asked
+// "would you handle this" without emitting IR on every success arm. Review
+// round 2 found the actual unavoidable constraint narrower than that: only
+// the EMISSION half of that function needs IR access, not the NAME-MATCHING
+// half. `emitVtablelessBuiltinRelease` (LlvmBackend_Disposal.cpp) is now
+// split into a pure `classifyVtablelessBuiltinRelease` (bn -> which arm, if
+// any — zero IR side effects) and an emission switch that consumes its
+// result; `vtablelessBuiltinReleaseIsKnown` also calls the classifier
+// instead of carrying its own list. One name-matching site, not two — the
+// hand-synced array from round 1 is gone entirely, closing the "no ratchet
+// covers table drift" gap the round-2 review flagged (§6).
+//
+// Either round's fix leaves a name in the 29-name gap with the fallback's
+// slot null and the branch emitting nothing for it — a leak, matching
+// PRE-#4185 behaviour for that untested tail, never a crash.
+// `shared_uncovered_builtin_still_leaks_not_crashes` below is the control
+// row round 1's review asked for.
 //
 // EXACTLY-ONCE ORACLE: `runAotChecked` compiles the generated code with
 // AddressSanitizer and runs it under LeakSanitizer (detect_leaks=1); a leak,
@@ -207,15 +222,24 @@ BEZEL_TEST(plain_var_vtableless_builtin_discard_leak_4185, using_and_plain_var_m
 // is unproven without a control from the excluded set). The FIRST version
 // of this fix gated its fallback on `common::isVtableLessBuiltinClassName`
 // alone (proves only "no vtable", true for `Shared<T>` too) and this exact
-// program SEGV'd — "AddressSanitizer: SEGV ... Maybe a wild jump?" — because
-// `emitVtablelessBuiltinRelease` returned false for "Shared" and the
-// pre-existing `else` branch dispatched `emitDisposeAndReclaim` on the
-// newly-recovered slot. `vtablelessBuiltinReleaseIsKnown` narrows the gate
-// to exactly the covered set, so `Shared<T>` now leaves the fallback's slot
-// null and the branch emits nothing — a leak (the pre-#4185, still-safe
-// outcome for this untested tail), asserted below by a LeakSanitizer report
-// with NO SEGV / wild-jump / DEADLYSIGNAL text anywhere in the diagnostics.
-// Looped 200x for the same one-shot-LSan reason the rows above are.
+// program crashed under `--sanitize=address` — the reviewer's independent
+// build reproduced a **heap-buffer-overflow**, not a SEGV: the wild
+// `emitDisposeAndReclaim` read of word 0 / slot 2 landed inside a mapped
+// (allocated) region rather than an unmapped page, so ASan's own
+// out-of-bounds check fires before any illegal instruction fetch would —
+// a reminder that "wild jump" is a FAMILY of crash shapes (SEGV,
+// heap-buffer-overflow, occasionally a clean abort), not one fixed
+// signature, because it depends on what happens to be mapped at the bogus
+// address `emitDisposeAndReclaim` computes. `emitVtablelessBuiltinRelease`
+// returned false for "Shared" and the pre-existing `else` branch dispatched
+// `emitDisposeAndReclaim` on the newly-recovered slot regardless.
+// `vtablelessBuiltinReleaseIsKnown` narrows the gate to exactly the covered
+// set, so `Shared<T>` now leaves the fallback's slot null and the branch
+// emits nothing — a leak (the pre-#4185, still-safe outcome for this
+// untested tail), asserted below by a LeakSanitizer report with NO
+// SEGV / heap-buffer-overflow / wild-jump / DEADLYSIGNAL text anywhere in
+// the diagnostics. Looped 200x for the same one-shot-LSan reason the rows
+// above are.
 // per §25, §28.13 "Shared ownership" (`Shared<T>`), issue #4185
 BEZEL_TEST(plain_var_vtableless_builtin_discard_leak_4185, shared_uncovered_builtin_still_leaks_not_crashes) {
     const std::string prog =
@@ -238,8 +262,12 @@ BEZEL_TEST(plain_var_vtableless_builtin_discard_leak_4185, shared_uncovered_buil
     // Under ASan/LSan the accumulated leak IS caught (ran flips false) —
     // that is the EXPECTED outcome for a name outside
     // `emitVtablelessBuiltinRelease`'s coverage. The load-bearing check is
-    // the SHAPE of the failure: a LeakSanitizer report, never a SEGV /
-    // wild-jump / DEADLYSIGNAL signature.
+    // the SHAPE of the failure: a LeakSanitizer report, never any of the
+    // "wild jump" crash family's known signatures — SEGV, DEADLYSIGNAL, or
+    // (the reviewer's own reproduction of THIS exact program, pre-fix)
+    // heap-buffer-overflow: the bogus `emitDisposeAndReclaim` read can land
+    // inside mapped memory rather than an unmapped page, so ASan's redzone
+    // check fires before any illegal fetch would.
     auto r = runAotChecked(prog);
     BEZEL_EXPECT_FALSE(r.ran);
     bool sawLeakReport = false;
@@ -247,6 +275,8 @@ BEZEL_TEST(plain_var_vtableless_builtin_discard_leak_4185, shared_uncovered_buil
         BEZEL_EXPECT_EQ(d.message.find("SEGV"), std::string::npos);
         BEZEL_EXPECT_EQ(d.message.find("DEADLYSIGNAL"), std::string::npos);
         BEZEL_EXPECT_EQ(d.message.find("wild jump"), std::string::npos);
+        BEZEL_EXPECT_EQ(d.message.find("heap-buffer-overflow"),
+                        std::string::npos);
         if (d.message.find("LeakSanitizer") != std::string::npos ||
             d.message.find("detected memory leaks") != std::string::npos)
             sawLeakReport = true;

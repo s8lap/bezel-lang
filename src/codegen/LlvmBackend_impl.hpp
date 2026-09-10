@@ -9717,33 +9717,53 @@ private:
     // `tcs.Dispose()`.
     void emitTcsRelease(llvm::Value* tcs);
 
+    // fix-forward #4185 (review round 2, §25 / §6): PURE classification —
+    // which `emitVtablelessBuiltinRelease` arm (if any) `bn` names, with
+    // ZERO IR side effects. This is now the ONE place the name population
+    // is spelled; `emitVtablelessBuiltinRelease` below and
+    // `vtablelessBuiltinReleaseIsKnown` are its only two consumers, so there
+    // is exactly one positive list to drift out of sync with — not two.
+    // (Round 1 of #4185 introduced a second, hand-synced 18-name array
+    // specifically to avoid calling the emit function speculatively; round
+    // 2 pointed out that a classify/emit split removes the need for that
+    // second list entirely, since classification alone has nothing to emit.)
+    // `AtomicFamily`/`EventSourceFamily`/`TaskCompletionSourceFamily` each
+    // collapse two builtin names that release identically — see the
+    // definition for which. // per §25, §6
+    enum class VtablelessBuiltinReleaseArm {
+        None, StringBuilder, Random, AtomicFamily, EventSourceFamily,
+        TaskCompletionSourceFamily, Channel, ChannelSender, Stopwatch, Mutex,
+        Lock, Semaphore, SemaphoreToken, CancellationTokenSource, FileStream,
+        Subscription,
+    };
+    static VtablelessBuiltinReleaseArm
+    classifyVtablelessBuiltinRelease(std::string_view bn);
+
     // fix #2921 (spec §28.2 / §28.9 / §8.1, v0.240): emit the release of a
     // VTABLE-LESS BUILT-IN CLASS receiver (`common::isVtableLessBuiltinClass
     // Name(bn)`), returning false when no release is known for `bn`. Callers
     // must NOT fall back to `emitDisposeAndReclaim` on a false return: such a
     // receiver has no vtable at word 0, so the slot-2 dispatch is a wild jump.
     // See the definition for the measured failure and the leak-over-wild-jump
-    // trade a false return deliberately takes.
+    // trade a false return deliberately takes. Dispatches on
+    // `classifyVtablelessBuiltinRelease` above — the name-matching itself
+    // lives there now, not here.
     bool emitVtablelessBuiltinRelease(std::string_view bn, llvm::Value* recv);
 
-    // fix-forward #4185 (review NEEDS-FIX, §25): `common::isVtableLessBuiltin
-    // ClassName` answers "does this receiver carry no Bezel vtable" — a
-    // STRICT SUPERSET (47 names) of what `emitVtablelessBuiltinRelease`
-    // above actually handles (18 names; see its definition). A caller that
-    // gates a NEW `emitDisposeAndReclaim`-reachable code path on the former
-    // alone (as the #4185 DiscardStmt fallback originally did) admits the
-    // 29-name gap — Shared<T>, Weak<T>, the serializer family, etc. — into
-    // the exact wild jump `emitVtablelessBuiltinRelease`'s own declaration
-    // comment forbids ("callers must NOT fall back to emitDisposeAndReclaim
-    // on a false return"). This predicate answers the NARROWER, correct
-    // question — "will `emitVtablelessBuiltinRelease` actually succeed for
-    // `bn`" — so a caller deciding whether to open a code path onto that
-    // function can gate on this instead of the "no vtable" fact alone. A
-    // second listing (not a call into `emitVtablelessBuiltinRelease` itself)
-    // because that function EMITS IR on every success arm — there is no way
-    // to "ask" it without inserting live instructions for a receiver it may
-    // then discard. Keep byte-for-byte in sync with the `if (bn == "...")`
-    // arms of `emitVtablelessBuiltinRelease`; see that definition. // per §25
+    // fix-forward #4185 (review NEEDS-FIX round 1, §25): `common::isVtable
+    // LessBuiltinClassName` answers "does this receiver carry no Bezel
+    // vtable" — a STRICT SUPERSET (47 names) of what
+    // `emitVtablelessBuiltinRelease` above actually handles (18 names). A
+    // caller that gates a NEW `emitDisposeAndReclaim`-reachable code path on
+    // the former alone (as the #4185 DiscardStmt fallback originally did)
+    // admits the 29-name gap — Shared<T>, Weak<T>, the serializer family,
+    // etc. — into the exact wild jump `emitVtablelessBuiltinRelease`'s own
+    // declaration comment forbids. This predicate answers the NARROWER,
+    // correct question — "will `emitVtablelessBuiltinRelease` actually
+    // succeed for `bn`" — by testing `classifyVtablelessBuiltinRelease(bn) !=
+    // None`, the SAME classification `emitVtablelessBuiltinRelease` itself
+    // dispatches on: no second list (round 2 removed it), so nothing here
+    // can drift out of sync with the emitter. // per §25
     static bool vtablelessBuiltinReleaseIsKnown(std::string_view bn);
 
     // fix #2973 (§28.3 / §28.9, stdlib §6.4, v0.240): if `n` names a built-in

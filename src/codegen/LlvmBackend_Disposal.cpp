@@ -2641,27 +2641,46 @@ const char* Emitter::usingAutoDropVtablelessBuiltin(std::string_view n) {
 }
 
 
-// fix-forward #4185 (review NEEDS-FIX, §25): the exact name population
-// `emitVtablelessBuiltinRelease` below handles — 18 names, kept
-// byte-for-byte in sync with that function's `if (bn == "...")` arms (one
-// entry per arm; the two-name-per-arm cases — Atomic/AtomicInteger,
-// EventSource/AsyncEventSource, TaskCompletionSource/
-// OwningTaskCompletionSource — each contribute two entries here). See the
-// declaration in LlvmBackend_impl.hpp for why this is a second listing
-// rather than a call into the function itself.
+// fix-forward #4185 (review round 2, §25 / §6): the ONE place `bn` is
+// compared against this builtin-family's names. Pure — no IR emitted, no
+// Emitter state read beyond the argument — so both
+// `emitVtablelessBuiltinRelease` (which switches on the result to decide
+// WHAT to emit) and `vtablelessBuiltinReleaseIsKnown` (which only asks
+// whether a match exists) are downstream of this single classification;
+// there is no second list left to drift out of sync with it. See the
+// declaration in LlvmBackend_impl.hpp for the round-1-vs-round-2 history.
+Emitter::VtablelessBuiltinReleaseArm
+Emitter::classifyVtablelessBuiltinRelease(std::string_view bn) {
+    if (bn == "StringBuilder") return VtablelessBuiltinReleaseArm::StringBuilder;
+    if (bn == "Random") return VtablelessBuiltinReleaseArm::Random;
+    if (bn == "Atomic" || bn == "AtomicInteger")
+        return VtablelessBuiltinReleaseArm::AtomicFamily;
+    if (bn == "EventSource" || bn == "AsyncEventSource")
+        return VtablelessBuiltinReleaseArm::EventSourceFamily;
+    if (bn == "TaskCompletionSource" || bn == "OwningTaskCompletionSource")
+        return VtablelessBuiltinReleaseArm::TaskCompletionSourceFamily;
+    if (bn == "Channel") return VtablelessBuiltinReleaseArm::Channel;
+    if (bn == "ChannelSender") return VtablelessBuiltinReleaseArm::ChannelSender;
+    if (bn == "Stopwatch") return VtablelessBuiltinReleaseArm::Stopwatch;
+    if (bn == "Mutex") return VtablelessBuiltinReleaseArm::Mutex;
+    if (bn == "Lock") return VtablelessBuiltinReleaseArm::Lock;
+    if (bn == "Semaphore") return VtablelessBuiltinReleaseArm::Semaphore;
+    if (bn == "SemaphoreToken")
+        return VtablelessBuiltinReleaseArm::SemaphoreToken;
+    if (bn == "CancellationTokenSource")
+        return VtablelessBuiltinReleaseArm::CancellationTokenSource;
+    if (bn == "FileStream") return VtablelessBuiltinReleaseArm::FileStream;
+    if (bn == "Subscription") return VtablelessBuiltinReleaseArm::Subscription;
+    return VtablelessBuiltinReleaseArm::None;
+}
+
+// fix-forward #4185 (review round 2, §25): "did classification find a
+// match" — no name list of its own (round 1's hand-synced array is gone;
+// this and `emitVtablelessBuiltinRelease` below both ask
+// `classifyVtablelessBuiltinRelease`, the one place names are spelled).
 bool Emitter::vtablelessBuiltinReleaseIsKnown(std::string_view bn) {
-    static constexpr std::array<std::string_view, 18> kKnown = {
-        "StringBuilder",       "Random",
-        "Atomic",              "AtomicInteger",
-        "EventSource",         "AsyncEventSource",
-        "TaskCompletionSource", "OwningTaskCompletionSource",
-        "Channel",             "ChannelSender",
-        "Stopwatch",           "Mutex",
-        "Lock",                "Semaphore",
-        "SemaphoreToken",      "CancellationTokenSource",
-        "FileStream",          "Subscription",
-    };
-    return std::find(kKnown.begin(), kKnown.end(), bn) != kKnown.end();
+    return classifyVtablelessBuiltinRelease(bn) !=
+           VtablelessBuiltinReleaseArm::None;
 }
 
 bool Emitter::emitVtablelessBuiltinRelease(std::string_view bn,
@@ -2672,9 +2691,10 @@ bool Emitter::emitVtablelessBuiltinRelease(std::string_view bn,
         builder_.CreateCall(declareC(fn, llvm::Type::getVoidTy(llvm_), ps),
                             args);
     };
+    switch (classifyVtablelessBuiltinRelease(bn)) {
     // stdlib §3.1 / #1185: a StringBuilder IS a `bz_array_t*` of string parts
     // and owns a +1 per part; the string-element release thunk discharges each.
-    if (bn == "StringBuilder") {
+    case VtablelessBuiltinReleaseArm::StringBuilder: {
         llvm::Value* disp = stringElementReleaseThunk();
         builder_.CreateCall(
             declareC("bz_array_free", llvm::Type::getVoidTy(llvm_),
@@ -2692,7 +2712,9 @@ bool Emitter::emitVtablelessBuiltinRelease(std::string_view bn,
     // restates as "A trivial-dispose class's instances are compiler-freed at
     // their owner's release point". `bz_random_alloc` mallocs one and
     // `bz_random_free` is a plain `free`.
-    if (bn == "Random") { callVoid("bz_random_free", {recv}); return true; }
+    case VtablelessBuiltinReleaseArm::Random:
+        callVoid("bz_random_free", {recv});
+        return true;
     // fix #2973 (§28.3 / §28.9, stdlib §6.4, v0.240): `Atomic<T>` /
     // `AtomicInteger<T>`. `bz_atomic_dispose` FREES — verified in the runtime,
     // not inferred: it flips a `disposed.exchange(true)` once and then calls
@@ -2707,21 +2729,18 @@ bool Emitter::emitVtablelessBuiltinRelease(std::string_view bn,
     // `vtablelessBuiltin` scope-exit path null-GUARDS its reload — measured
     // clean here under generated-code ASan for `using var` + explicit
     // `Dispose()` in the same 200-iteration loop.
-    if (bn == "Atomic" || bn == "AtomicInteger") {
+    case VtablelessBuiltinReleaseArm::AtomicFamily:
         callVoid("bz_atomic_dispose", {recv});
         return true;
-    }
     // §24.3 / §6.5 / #2026: sync and async sources share one runtime
     // representation, so both free identically (null-safe).
-    if (bn == "EventSource" || bn == "AsyncEventSource") {
+    case VtablelessBuiltinReleaseArm::EventSourceFamily:
         callVoid("bz_event_source_free", {recv});
         return true;
-    }
     // §6.6 / §30.11 / #974: the four-step TCS release (see emitTcsRelease).
-    if (bn == "TaskCompletionSource" || bn == "OwningTaskCompletionSource") {
+    case VtablelessBuiltinReleaseArm::TaskCompletionSourceFamily:
         emitTcsRelease(recv);
         return true;
-    }
     // §30.15 (#600 phase c): a Channel<T>. Dispose via bz_channel_dispose
     // (closes, faults pending receivers with ChannelClosedException, disposes
     // undelivered items in reverse order per §28.11, frees the struct). The
@@ -2729,7 +2748,7 @@ bool Emitter::emitVtablelessBuiltinRelease(std::string_view bn,
     // setupBuiltinExceptions); may be null if Channel<T> reaches this path
     // before setup — bz_channel_dispose tolerates a null second argument
     // (verified in the runtime).
-    if (bn == "Channel") {
+    case VtablelessBuiltinReleaseArm::Channel: {
         llvm::Value* cceVt = llvm::ConstantPointerNull::get(ptrTy());
         {   auto vit = builtinVtable_.find("ChannelClosedException");
             if (vit != builtinVtable_.end()) cceVt = vit->second;
@@ -2741,65 +2760,59 @@ bool Emitter::emitVtablelessBuiltinRelease(std::string_view bn,
     }
     // §30.15: a ChannelSender<T>. bz_channel_sender_release decrements the
     // sender count (may close the channel if it reaches zero).
-    if (bn == "ChannelSender") {
+    case VtablelessBuiltinReleaseArm::ChannelSender:
         callVoid("bz_channel_sender_release", {recv});
         return true;
-    }
     // §8.1 / #646: a Stopwatch — a `bz_stopwatch_t*` freed via
     // bz_stopwatch_free (null-safe). Same release the `using var` arm emits.
-    if (bn == "Stopwatch") {
+    case VtablelessBuiltinReleaseArm::Stopwatch:
         callVoid("bz_stopwatch_free", {recv});
         return true;
-    }
     // §6.2 / #647: a Mutex. bz_mutex_dispose marks disposed and drops the
     // Mutex object's core ref. Idempotent per §28.2 (the disposed flag
     // prevents double-release). Null-safe (handles Mutex?).
-    if (bn == "Mutex") {
+    case VtablelessBuiltinReleaseArm::Mutex:
         callVoid("bz_mutex_dispose", {recv});
         return true;
-    }
     // §6.2 / #647: a Lock (owned guard returned by Mutex.Acquire /
     // TryAcquire). bz_lock_release checks the released flag, null-safe.
-    if (bn == "Lock") {
+    case VtablelessBuiltinReleaseArm::Lock:
         callVoid("bz_lock_release", {recv});
         return true;
-    }
     // §6.3 / #647: a Semaphore. bz_semaphore_dispose marks disposed and drops
     // the Semaphore object's core ref. Idempotent.
-    if (bn == "Semaphore") {
+    case VtablelessBuiltinReleaseArm::Semaphore:
         callVoid("bz_semaphore_dispose", {recv});
         return true;
-    }
     // §6.3 / #647: a SemaphoreToken (owned permit). bz_semaphore_token_release
     // checks the released flag, null-safe.
-    if (bn == "SemaphoreToken") {
+    case VtablelessBuiltinReleaseArm::SemaphoreToken:
         callVoid("bz_semaphore_token_release", {recv});
         return true;
-    }
     // #463: a CancellationTokenSource. bz_cts_dispose signals all tokens and
     // frees the source. Idempotent (signalled flag prevents double-signal).
-    if (bn == "CancellationTokenSource") {
+    case VtablelessBuiltinReleaseArm::CancellationTokenSource:
         callVoid("bz_cts_dispose", {recv});
         return true;
-    }
     // stdlib §7.2 / #645: a FileStream — a `bz_filestream_t*` disposed via
     // bz_filestream_dispose (flush + close the OS handle, free the wrapper).
     // Null-safe (a failed open stores null).
-    if (bn == "FileStream") {
+    case VtablelessBuiltinReleaseArm::FileStream:
         callVoid("bz_filestream_dispose", {recv});
         return true;
-    }
     // §2.11 / §24.4: disposing a Subscription removes the handler from its
     // event source. The explicit-Dispose chain reaches this only when
     // `isSubscriptionExpr`'s STRUCTURAL detection (the local's initializer is an
     // event `Subscribe(...)` call) did not fire — a Subscription-typed
     // parameter/field, say — where the fall-through was the wild jump. Same
     // release call as that arm.
-    if (bn == "Subscription") {
+    case VtablelessBuiltinReleaseArm::Subscription:
         callVoid("bz_subscription_dispose", {recv});
         return true;
+    case VtablelessBuiltinReleaseArm::None:
+        return false;
     }
-    return false;
+    return false;  // unreachable — every enumerator handled above
 }
 
 
