@@ -2697,6 +2697,33 @@ private:
     // the §9.7 param-borrow control.)
     bool isOwnedTrackedLocal(sema::Symbol* sym) const;
 
+    // fix #4156 (§28.2 / §28.9, v0.294): true when `sym` is a tracked local
+    // currently in the Disposed state — an explicit `.Dispose()` call has
+    // already run and dominates this program point (the same fact
+    // `checkRead`'s IdentifierExpr arm consults for its own §28.2
+    // dominating-Dispose warning). Sibling of `isOwnedTrackedLocal` above,
+    // used ONLY by the returned-closure escape checks
+    // (`checkIndirectEscapeOnReturn`, `checkClosureEscapesOnReturn`) to
+    // recognize that a closure capturing `sym` by reference and escaping the
+    // method will read the ALREADY-disposed cell on every future invocation
+    // — the gap #4156 filed: capturing an owned local that is STILL Owned at
+    // the return already errors (the arm just below), but a local the
+    // enclosing scope explicitly disposed BEFORE the return fell through
+    // silently, because it is no longer Owned and `isEscapeBoundLocal` never
+    // considered Disposed a live hazard. Deliberately NOT folded into
+    // `isEscapeBoundLocal` itself: that predicate is shared by the §9.7
+    // span/record-borrow escape checks and the bare-type-param-call escape
+    // check, whose "already disposed/moved ⇒ no live borrow to dangle"
+    // reasoning (see `checkIndirectEscapeOnReturn`'s header comment) is
+    // correct for THOSE shapes — a stale reference alias is a different,
+    // already-diagnosed hazard (`checkRead`'s own Disposed-arm fires on the
+    // re-borrowing read itself). Only a closure's capture is a standing
+    // ALIAS to a SHARED, MUTATED cell whose read is deferred to an
+    // unknowable future call outside this function's dominance analysis, so
+    // the two call sites gate this check on a function-typed holder /
+    // literal lambda specifically. // per §28.2, §28.9
+    bool isDisposedTrackedLocal(sema::Symbol* sym) const;
+
     // Issue #392 / §31.1: true when `sym` is a catch-bound exception variable
     // (`var ex: T` in a catch arm pattern). Per §31.1 "Exception ownership" the
     // binding is a BORROW of the in-flight exception whose lifetime is the arm

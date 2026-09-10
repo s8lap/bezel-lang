@@ -4599,6 +4599,29 @@ void MethodOwnership::checkClosureEscapesOnReturn(const ast::Expr& e,
             // scope-bound discharge obligation — a value-typed or
             // runtime-managed (string/function) local is never Owned, so
             // capturing one is not constrained and is not diagnosed here.
+            //
+            // fix #4156 investigation note: a Disposed-state twin of this arm
+            // (mirroring `checkIndirectEscapeOnReturn`'s new arm just above)
+            // was tried here and measured DEAD — for a directly-embedded
+            // literal (`return lambda() => entry.Key.Length;` after
+            // `entry.Dispose();`), the literal's creation point IS this
+            // return statement, so `reportMovedFromCapturesIn`'s own
+            // Disposed leg (fired earlier, per-statement, from
+            // `checkCapturedOwnedConsumeInStmt`) always reports first and at
+            // identical severity; a probe confirmed only ITS Warning printed,
+            // never a second diagnostic from here. The one shape where the
+            // two points could differ (the #3702 `return mk();` CallExpr
+            // indirection, where the inner literal's creation statement
+            // precedes the outer return) was probed too (`var mk := lambda():
+            // () -> int => lambda() => entry.Key.Length; entry.Dispose();
+            // return mk();`) and compiled with NO diagnostic at all on either
+            // side — `checkOneLambdaBodyEscapes`'s per-lambda-body `states_`
+            // reseed (§28.9, fix #3564) appears to make the outer `entry`
+            // unresolvable from within that nested walk, a DIFFERENT,
+            // deeper gap outside this issue's scope (filed separately).
+            // Left as `== Owned` only, unchanged from before this fix — the
+            // real gap #4156 reports is the indirect holder-bound form,
+            // closed above.
             if (st.state != OwnershipState::Owned) continue;
             // Belt-and-braces: confirm the captured local's declared type is
             // a class/interface reference (the only thing a §28.9 borrow can
@@ -5301,6 +5324,16 @@ bool MethodOwnership::isOwnedTrackedLocal(sema::Symbol* sym) const {
            it->second.state == OwnershipState::Owned;
 }
 
+// fix #4156 (§28.2 / §28.9, v0.294): see the header declaration for the full
+// rationale. Sibling of isOwnedTrackedLocal, checking Disposed instead of
+// Owned.
+bool MethodOwnership::isDisposedTrackedLocal(sema::Symbol* sym) const {
+    if (!sym) return false;
+    auto it = states_.find(sym);
+    return it != states_.end() &&
+           it->second.state == OwnershipState::Disposed;
+}
+
 bool MethodOwnership::isCatchBorrow(sema::Symbol* sym) const {
     // fix #3521 (§31.1 / §31.2.1, v0.283): read the ONE spelling of this
     // classification — the flag sema sets where it already anchors the catch
@@ -5840,7 +5873,60 @@ void MethodOwnership::checkIndirectEscapeOnReturn(const ast::Expr& e) {
     // disposed / moved out, there is no live borrow to dangle (and a separate
     // diagnostic would have covered misuse); a catch binding is always live
     // within its arm.
-    if (!isEscapeBoundLocal(st->source->sym)) return;
+    if (!isEscapeBoundLocal(st->source->sym)) {
+        // fix #4156 (§28.2 / §28.9, v0.294): the "already disposed ⇒ no live
+        // borrow to dangle" premise just above is correct for a plain
+        // re-borrow (a stale reference alias is a DIFFERENT, already-
+        // diagnosed hazard — checkRead's own dominating-Dispose warning
+        // fires on the re-borrowing read itself, e.g. `var b := r;` after
+        // `r.Dispose();`) but wrong for a CLOSURE: a closure captures its
+        // source by a standing alias into a SHARED, MUTATED cell (Dispose()
+        // nulls the disposed fields, #4136), and its body is read at an
+        // unknowable FUTURE invocation this function's dominance analysis
+        // cannot see — exactly the gap #4156 filed (`checkRead`'s own
+        // dominating-Dispose warning fires for a direct, non-captured read,
+        // but nothing fires for the identical read reached only through a
+        // captured closure). Gate on a function-typed holder specifically —
+        // Shape 3 of `borrowSourceForExpr` above is the only producer that
+        // sets `.source` from a closure capture, and the type check keeps
+        // this arm from ever firing on Shape 1's plain re-borrow (a
+        // class-typed holder) or Shape 2's record construction. Severity
+        // matches this function's OWN sibling arms (Error, not the §28.2
+        // read-site Warning) — this is a completion of the ALREADY-Error
+        // §28.9 "captures an owned local whose source is disposed at scope
+        // end" rule below (the `st.state == Owned` arm in
+        // checkClosureEscapesOnReturn), not a new severity decision on the
+        // separately-open §3975/§3979/§4023 question (which is about
+        // `checkRead`'s OWN warning-vs-error split across read positions in
+        // a single function, a different code path).
+        const sema::TypeRef* holderTy = ctx_.exprType(e);
+        const bool holderIsClosure =
+            holderTy && holderTy->kind == sema::TypeRef::Kind::Function;
+        if (!holderIsClosure || !isDisposedTrackedLocal(st->source->sym))
+            return;
+        sema::Symbol* srcSym = st->source->sym;
+        report(
+            Severity::Error, id->span.begin,
+            std::string("returned `") + std::string(id->name) +
+            "` is a closure capturing `" + std::string(srcSym->name) +
+            "`, which was explicitly disposed before this return — a "
+            "closure captures its source by reference, not by value, so "
+            "every future invocation of the returned closure reads the "
+            "ALREADY-disposed `" + std::string(srcSym->name) +
+            "` (use-after-dispose). (§28.2 dominating-Dispose rule, "
+            "extended to a capture-escaping binding per §28.9; keep `" +
+            std::string(srcSym->name) +
+            "` alive for as long as the closure may be called, or copy the "
+            "data the closure needs out of it before disposing)");
+        auto srcIt = states_.find(srcSym);
+        if (srcIt != states_.end() && srcIt->second.explicitlyDisposed &&
+            srcIt->second.explicitDisposeLoc.line != 0) {
+            report(Severity::Note, srcIt->second.explicitDisposeLoc,
+                   std::string("explicit Dispose() of `") +
+                       std::string(srcSym->name) + "` was here");
+        }
+        return;
+    }
     std::string_view srcName = st->source->sym->name;
     if (isCatchBorrow(st->source->sym)) {
         // §31.1: the holder re-borrows the in-flight exception. Returning it
