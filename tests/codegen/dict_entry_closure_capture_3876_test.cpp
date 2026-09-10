@@ -69,22 +69,31 @@
 // second, independently-reachable instance of the SAME defect this fix
 // closes (not a distinct row the FAIL-WITHOUT count above claims).
 //
-// A SEPARATE, PRE-EXISTING, ALREADY-DOCUMENTED FINDING (NOT fixed here): the
-// string-key rows leak the rebuilt `bz_string*` Key (32+3 B, measured) under
-// the strict `runAotChecked` (ASan+LSan) oracle. This is fix #3720's OWN
-// documented trade-off ("An ESCAPING local (returned, stored, captured,
-// reassigned, passed elsewhere) is simply not registered [for the scope-end
-// release], so its rebuilt Key leaks ... never a UAF, never a double-free --
-// only ever a leak"): `isFreshDictEntryKeyReleaseTerminalLocal`'s eligibility
-// walk does not (and, per that fix's own stated scope, was never meant to)
-// admit a local that escapes via closure capture. This fix does not touch
-// that eligibility logic, so the leak is unchanged by it -- which is why the
-// string-key rows below use `runAotCheckedLenient` (generated-code ASan
-// active; LeakSanitizer off) rather than `runAotChecked`: the stricter oracle
-// would fail these rows on the ALREADY-KNOWN, ALREADY-ACCEPTED leak instead
-// of on the crash this fix targets. Filed as issue #4127 for that leak
-// specifically (a capture-cell-holder is a valid disposal-eligibility shape
-// `isFreshDictEntryKeyReleaseTerminalLocal`'s escape walk does not consider).
+// A SEPARATE, PRE-EXISTING, formerly-undischarged FINDING, NOW FIXED by
+// #4127 (this file's two plain-`.First()`-bound-local string-key rows below
+// were tightened from `runAotCheckedLenient` to `runAotChecked` in that
+// commit): the string-key rows used to leak the rebuilt `bz_string*` Key
+// (32+3 B, measured) under the strict `runAotChecked` (ASan+LSan) oracle.
+// This was fix #3720's OWN documented trade-off ("An ESCAPING local
+// (returned, stored, captured, reassigned, passed elsewhere) is simply not
+// registered [for the scope-end release], so its rebuilt Key leaks ... never
+// a UAF, never a double-free -- only ever a leak"):
+// `isFreshDictEntryKeyReleaseTerminalLocal`'s eligibility walk does not (and,
+// per that fix's own stated scope, was never meant to) admit a local that
+// escapes via closure capture -- #3876 did not touch that eligibility logic,
+// so the leak was unchanged by it. #4127 closes it from the OTHER side: the
+// per-lambda envdtor (LlvmBackend_Exprs2.cpp's `lowerLambda`) now recognizes
+// a captured `DictionaryEntry<string,V>` local's own §694 `freeCellInEnvdtor`
+// eligibility (exactly one capturing closure, which definitely escapes) and
+// releases the Key there too, immediately before freeing the cell itself --
+// the single-holder/definite-escape proof that already makes the cell-free
+// sound applies identically to the Key it contains (`isDictEntryStringKeyTypeRef`,
+// LlvmBackend_impl.hpp). Deliberately narrower than the for-loop-VARIABLE
+// sibling below (`for_loop_variable_string_key_capture_no_stack_overflow`):
+// a for-var's cell is fresh per iteration, so `!isForVar` is a hard
+// precondition of `freeCellInEnvdtor` itself -- that shape stays on
+// `runAotCheckedLenient` (still leaks the Key; #4129/#4161 territory,
+// unaffected by #4127).
 
 #include <string>
 
@@ -170,18 +179,21 @@ BEZEL_TEST(dict_entry_closure_capture_3876,
 
 // ---------------------------------------------------------------------------
 // String key: the issue's Repro 2 (genuine ASan stack-buffer-overflow).
-// `runAotCheckedLenient`, NOT `runAotChecked` -- see the file header's note
-// on the separate, pre-existing, already-documented #3720 escaping-local Key
-// leak this fix does not touch.
+// `runAotChecked` (STRICT: ASan+LSan) since fix #4127 -- see the file
+// header's note. Pre-#4127 these two rows used `runAotCheckedLenient`
+// (LeakSanitizer off) to route around the then-undischarged rebuilt Key.
 // ---------------------------------------------------------------------------
 
 BEZEL_TEST(dict_entry_closure_capture_3876,
            string_key_var_captured_across_return_no_stack_overflow) {
-    JitResult r = runAotCheckedLenient(stringKeyProgram("var"));
+    JitResult r = runAotChecked(stringKeyProgram("var"));
     if (wasSkipped(r)) return;
-    // Pre-fix: r.ran is false here -- a genuine AddressSanitizer
+    // Pre-#3876: r.ran is false here -- a genuine AddressSanitizer
     // stack-buffer-overflow report in `diagnostics`, exactly the issue's
-    // measured crash.
+    // measured crash. Pre-#4127 (post-#3876): r.ran is true but LeakSanitizer
+    // reports 35 B / 2 allocations (the rebuilt Key's calloc'd header +
+    // malloc'd payload) -- this row would have failed under the strict
+    // oracle used here now.
     BEZEL_EXPECT_TRUE(r.ran);
     // 2 (Key.Length) + 9 (Value) = 11.
     BEZEL_EXPECT_TRUE(has(r.stdoutText, "total=11"));
@@ -189,7 +201,7 @@ BEZEL_TEST(dict_entry_closure_capture_3876,
 
 BEZEL_TEST(dict_entry_closure_capture_3876,
            string_key_const_captured_across_return_no_stack_overflow) {
-    JitResult r = runAotCheckedLenient(stringKeyProgram("const"));
+    JitResult r = runAotChecked(stringKeyProgram("const"));
     if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_TRUE(has(r.stdoutText, "total=11"));

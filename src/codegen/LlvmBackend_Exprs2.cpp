@@ -3283,6 +3283,41 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
                     llvm::Value* box =
                         builder_.CreateLoad(ptrTy(), cell, "box");
                     emitBoxRelease(box);
+                } else if (ce.freeCellInEnvdtor &&
+                           isDictEntryStringKeyTypeRef(ce.semaTy)) {
+                    // fix #4127 (§27.5/§28.9, stdlib §4.8, v0.295): a
+                    // string-keyed `DictionaryEntry<string,V>` local (bound
+                    // directly to `d.First()`/`.Last()`/`.Single()`/
+                    // `.ElementAt(i)`, per isFreshDictEntryKeyReleaseTerminalLocal
+                    // / #3720) captured by the sole, definitely-escaping
+                    // closure this envdtor belongs to (the SAME
+                    // freeCellInEnvdtor proof that makes freeing the cell
+                    // below safe: exactly one holder, and that holder
+                    // outlives the frame — #694). The local's own scope-end
+                    // `dictEntryKeyRelease` disposal was never registered for
+                    // it (StringEscapeWalker treats ANY capture as an escape,
+                    // per that disposal's own eligibility walk), so the
+                    // rebuilt Key's single producer +1 is otherwise never
+                    // discharged — exactly #4127's leak. The cell holds the
+                    // `{ptr Key, V Value}` struct BY VALUE; Key is field 0,
+                    // so loading a `ptr` directly off the cell's base address
+                    // (no GEP needed — field 0 is always at offset 0) reads
+                    // it, identical in shape to the plain-string-capture
+                    // branch above. `entry.Value` is never touched here: a
+                    // Dictionary<K,V> keeps ownership of its values (stdlib
+                    // §4.8) — `Value` is always a borrow, never released.
+                    // NOT extended to a for-loop variable's DictionaryEntry
+                    // capture (`entry` in `for var entry in d`): `!isForVar`
+                    // is a hard precondition of `freeCellInEnvdtor` itself
+                    // (a for-var's cell is fresh per iteration, so no single
+                    // envdtor could be its one reclaim site) — that shape is
+                    // #4129/#4161's territory, unaffected by this branch. No
+                    // retain-balancing concern either: singleCaptureLocals_
+                    // guarantees no OTHER capture of this local exists to
+                    // share the +1 with.
+                    llvm::Value* key =
+                        builder_.CreateLoad(ptrTy(), cell, "dictek.envdtor");
+                    emitStringRelease(key);
                 }
                 // All other capture types (value, class borrow): no action.
                 // §27.5 / #694: free the 8-byte capture CELL itself when this is

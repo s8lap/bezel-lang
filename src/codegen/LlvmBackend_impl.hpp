@@ -11136,6 +11136,27 @@ private:
                rt->primitive == sema::PrimitiveType::String;
     }
 
+    // fix #4127 (§27.5 / §28.9, stdlib §4.8, v0.295): is `rt` the synthetic
+    // DictionaryEntry<string,V> shape LlvmBackend_Calls.cpp's isDict block
+    // rebuilds a fresh, independently-owned bz_string* Key for (field 0 of
+    // the {K,V} struct)? Same gate as isFreshDictEntryKeyReleaseTerminalLocal
+    // (LlvmBackend_Setup.cpp), reused here rather than re-derived, but tested
+    // on a bare TypeRef — a captured local's `declType` — since a capture
+    // site has no LocalDeclInitView (there is no initializer expression to
+    // read; the local may have been declared anywhere earlier in the body).
+    // Deliberately narrower than #4135's DrainedEntry sibling — that type is
+    // reached through a different lowering path (lowerDictDrainFor) with a
+    // different, larger set of owned fields, and is not this issue's scope.
+    bool isDictEntryStringKeyTypeRef(const sema::TypeRef* rt) const {
+        if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
+            return false;
+        if (rt->headName() != "DictionaryEntry") return false;
+        if (rt->genericArgs.size() < 2 || !rt->genericArgs[0]) return false;
+        const sema::TypeRef* kt = rt->genericArgs[0];
+        return kt->kind == sema::TypeRef::Kind::Primitive &&
+               kt->primitive == sema::PrimitiveType::String && !kt->nullable;
+    }
+
     // ====================================================================
     // Suspend/resume state-machine scaffolding (§29 iterators / §30 async).
     //
