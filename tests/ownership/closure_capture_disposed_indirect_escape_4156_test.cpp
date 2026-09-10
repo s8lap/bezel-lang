@@ -103,7 +103,7 @@ BEZEL_TEST(closure_capture_disposed_indirect_escape,
            "before this return"));
     BEZEL_EXPECT_TRUE(hasErrorMessage(
         r, "(§28.2 dominating-Dispose rule, extended to a capture-escaping "
-           "binding per §28.9"));
+           "binding per §28.3"));
 }
 
 // CONTROL (§28.9, pre-existing, unaffected by this fix): the NEVER-disposed
@@ -124,7 +124,7 @@ BEZEL_TEST(closure_capture_disposed_indirect_escape,
     BEZEL_EXPECT_TRUE(hasErrorMessage(
         r, "carries a borrow of `r` whose source is disposed at scope end "
            "— the value aliases an owned scope-bound local and returning "
-           "it lets the borrow outlive that local (§28.9 / §9.7 "
+           "it lets the borrow outlive that local (§28.3 / §9.7 "
            "borrow-lifetime rule"));
 }
 
@@ -267,7 +267,7 @@ BEZEL_TEST(closure_capture_disposed_indirect_escape,
            "before this return"));
     BEZEL_EXPECT_TRUE(hasErrorMessage(
         r, "(§28.2 dominating-Dispose rule, extended to a capture-escaping "
-           "binding per §28.9"));
+           "binding per §28.3"));
 }
 
 BEZEL_TEST(closure_capture_disposed_indirect_escape,
@@ -296,5 +296,5 @@ BEZEL_TEST(closure_capture_disposed_indirect_escape,
            "before this return"));
     BEZEL_EXPECT_TRUE(hasErrorMessage(
         r, "(§28.2 dominating-Dispose rule, extended to a capture-escaping "
-           "binding per §28.9"));
+           "binding per §28.3"));
 }
