@@ -165,16 +165,49 @@ BEZEL_TEST(object_contract_unlowered_member_2922,
         hasError(toStringThenLength("new Mutex()"), kUnimplemented));
 }
 
+// ── `Stopwatch` is no longer a #2922 rejection example (superseded by #4126) ─
+//
+// Unlike `Random`/`Mutex` above, `Stopwatch` (stdlib §8.1) has a PUBLIC
+// CONSTRUCTOR (`public constructor();`), so `new Stopwatch()` types to a
+// declaration-less Named receiver distinct from `Stopwatch.StartNew()`'s.
+// `narrow #4126` (stdlib §8.1/§6.1/§2.6, v0.295) gave exactly that receiver
+// shape a real, correct dispatch for all three universal-Object members —
+// a qualified-name `ToString()` (the same `kBuiltinClassModulePaths` literal
+// `array_tostring_still_returns_qualified_name_spec_8_5` below already pins
+// for `Array`/`Stack`) and a reference-identity `Equals()`/`GetHashCode()`
+// (§8.3's class default). The #2922 "not yet implemented" rejection these
+// two rows used to pin is therefore now WRONG — the member is implemented —
+// so §7 of this project's lane discipline requires updating the pin rather
+// than treating the broken rows as a regression.
+//
+// Independently re-verified (fix-forward for #4126, 2026-09-10) under ASan
+// across the full `new Stopwatch()` surface (construct, Start/Stop/
+// IsRunning/Elapsed accessors, ToString, Equals, GetHashCode, and the same
+// via `StartNew()`): no crash, no leak, correct values on every member.
+// Kept in THIS file (rather than deleted) rather than moved, because the
+// shape — a built-in with a public constructor, reached through the
+// universal-Object gate — is exactly the population #2922/#4126 are both
+// about, and a reader tracing either issue should find the current, not the
+// superseded, behavior here.
+
 BEZEL_TEST(object_contract_unlowered_member_2922,
-           tostring_then_length_on_stopwatch_rejected_spec_8_1_8_5) {
-    BEZEL_EXPECT_TRUE(
-        hasError(toStringThenLength("new Stopwatch()"), kUnimplemented));
+           tostring_then_length_on_stopwatch_dispatches_qualified_name_spec_8_1_8_5) {
+    // #4126 (stdlib §8.1, v0.295): "System.Diagnostics.Stopwatch" (28 chars)
+    // — the qualified-name default, not a rejection.
+    auto r = runAot(toStringThenLength("new Stopwatch()"));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(28, r.exitCode);
 }
 
 BEZEL_TEST(object_contract_unlowered_member_2922,
-           equals_then_branch_on_stopwatch_rejected_spec_8_1_8_3) {
-    BEZEL_EXPECT_TRUE(
-        hasError(equalsThenBranch("new Stopwatch()"), kUnimplemented));
+           equals_then_branch_on_stopwatch_reference_identity_spec_8_1_8_3) {
+    // #4126 (stdlib §8.1/§8.3, v0.295): reference-identity Equals — a
+    // Stopwatch compared to itself is equal and the branch is taken, the
+    // same shape as array_equals_reflexive_still_true_spec_8_3 below.
+    auto r = runAot(equalsThenBranch("new Stopwatch()"));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(0, r.exitCode);
+    BEZEL_EXPECT_TRUE(r.stdoutText.find("eq") != std::string::npos);
 }
 
 // A generic-typed receiver reaches the same fallthrough through a different

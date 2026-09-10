@@ -256,6 +256,21 @@ BEZEL_TEST(no_override_identity_4126, guid_parsed_equal_values_hash_identically_
     BEZEL_EXPECT_EQ(run(p), 42);
 }
 
+// The converse of the above: only equal-hashes-equal was pinned; this closes
+// the distribution direction so a collision between two DISTINCT Guid values
+// (e.g. `bz_guid_hash` degenerating to a constant, or folding only one of the
+// two 64-bit halves) would not stand unnoticed.
+BEZEL_TEST(no_override_identity_4126, guid_distinct_values_hash_differently_spec_2_6) {
+    const std::string p = prog(
+        "  var h1 := Guid.Empty.GetHashCode(); "
+        "  var g2 := Guid.Parse(\"12345678-1234-5678-1234-567812345678\"); "
+        "  var h2 := g2.GetHashCode(); "
+        "  if h1 = h2 then return 1; end; "
+        "  return 42; ");
+    BEZEL_EXPECT_TRUE(runAot(p).ran);
+    BEZEL_EXPECT_EQ(run(p), 42);
+}
+
 // ═══════════ Accept side (§15): a real user class must keep working ═══════
 // A user class literally NAMED "Stopwatch"/"CancellationToken" is NOT a
 // `builtinClassSym` stub (its TypeSymbol has `decl != nullptr`), so
