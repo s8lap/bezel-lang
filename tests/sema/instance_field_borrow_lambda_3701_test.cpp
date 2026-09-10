@@ -171,7 +171,7 @@ BEZEL_TEST(instance_field_borrow_lambda_3701,
 // =============================================================================
 // ROW 4 — ACCEPT. The §9.7 rule's destination bullet is "an instance field
 // of a class". A store to a LOCAL is not §9.7's destination — it is §28.3's
-// (or, for closure-capture shapes, §28.9's). This row stores a borrow-bearing
+// (including for closure-capture shapes). This row stores a borrow-bearing
 // record into a lambda-body LOCAL — which §9.7 does not forbid, and which
 // the §28.3 lifetime rule accepts when the local is a same-scope capture.
 // Pre-fix the lambda-body store was reachable through no path; post-fix the

@@ -1920,7 +1920,7 @@ private:
     // in a local-identifier root, verify the root isn't a `using var`.
     void checkBorrowEscapesOnReturn(const ast::Expr& e);
 
-    // §28.9 closure-escape (issue #360, D1): a returned lambda whose
+    // §28.3 closure-escape (issue #360, D1): a returned lambda whose
     // captured set includes an owned (`using var` or owned-producing)
     // method-scope local of reference type. Capturing such a local does
     // not transfer ownership; the capture is a borrow whose source is the

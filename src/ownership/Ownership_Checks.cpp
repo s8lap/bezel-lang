@@ -3273,7 +3273,7 @@ void MethodOwnership::checkBorrowEscapesOnReturn(const ast::Expr& e) {
 }
 
 // ---------------------------------------------------------------------------
-// §28.9 closure-escape and §9.7 borrow-bearing-record escape (issue #360).
+// §28.3 closure-escape and §9.7 borrow-bearing-record escape (issue #360).
 //
 // The direct-return forms of two soundness holes: a returned closure that
 // captures an owned scope-bound local (the closure outlives the local's
@@ -4646,7 +4646,7 @@ void MethodOwnership::checkClosureEscapesOnReturn(const ast::Expr& e,
                 "` whose source is disposed at scope end — capturing an "
                 "owned local does not transfer ownership; the capture is a "
                 "borrow of the enclosing scope and the returned closure "
-                "would outlive it (use-after-dispose). (§28.9 closure-"
+                "would outlive it (use-after-dispose). (§28.3 closure-"
                 "capture escape; keep the owned location in a longer-lived "
                 "scope, or restructure so the closure does not escape)");
             return;  // one diagnostic per return is enough
@@ -5656,7 +5656,7 @@ sema::Symbol* MethodOwnership::borrowSourceForExpr(const ast::Expr& rhs) {
             }
         }
     }
-    // Shape 3 — a closure capturing an Owned local (§28.9), a catch-bound
+    // Shape 3 — a closure capturing an Owned local (§28.3), a catch-bound
     // exception variable (§31.1), or a borrow-bearing record / span local
     // (§9.7, #2144). Capturing an owned class-typed local — or the in-flight
     // exception — does not transfer ownership; the capture is a borrow whose
@@ -5853,7 +5853,7 @@ void MethodOwnership::checkIndirectEscapeOnReturn(const ast::Expr& e) {
                     std::string(src->name) +
                     "` is an owned scope-bound local disposed at scope end, so "
                     "returning the borrow lets it outlive that local (§28.3 "
-                    "bare-type-parameter returns / §28.9 / §9.7 borrow-lifetime "
+                    "bare-type-parameter returns / §9.7 borrow-lifetime "
                     "rule; bind the source in the caller's scope and build the "
                     "aliasing value there instead)");
             }
@@ -5914,7 +5914,7 @@ void MethodOwnership::checkIndirectEscapeOnReturn(const ast::Expr& e) {
             "every future invocation of the returned closure reads the "
             "ALREADY-disposed `" + std::string(srcSym->name) +
             "` (use-after-dispose). (§28.2 dominating-Dispose rule, "
-            "extended to a capture-escaping binding per §28.9; keep `" +
+            "extended to a capture-escaping binding per §28.3; keep `" +
             std::string(srcSym->name) +
             "` alive for as long as the closure may be called, or copy the "
             "data the closure needs out of it before disposing)");
@@ -5979,7 +5979,7 @@ void MethodOwnership::checkIndirectEscapeOnReturn(const ast::Expr& e) {
         "` carries a borrow of `" + std::string(srcName) +
         "` whose source is disposed at scope end — the value aliases an "
         "owned scope-bound local and returning it lets the borrow outlive "
-        "that local (§28.9 / §9.7 borrow-lifetime rule; bind the source in "
+        "that local (§28.3 / §9.7 borrow-lifetime rule; bind the source in "
         "the caller's scope and build the aliasing value there instead)");
 }
 
@@ -6012,7 +6012,7 @@ sema::Symbol* MethodOwnership::ownedLocalBorrowSource(const ast::Expr& rhs,
     // sourced" borrows rests on its own stated premise — "the caller-side
     // source outlives the constructed object" — which an `owned` parameter
     // falsifies: *Auto-drop (affine)* disposes it "at the end of the method".
-    // `checkClosureEscapesOnReturn`'s §28.9 leg already reads it that way (it
+    // `checkClosureEscapesOnReturn`'s §28.3 leg already reads it that way (it
     // resolves through `states_`, which holds the `owned` parameters, and has
     // its own `ParameterSymbol` arm), so this is one rule's two channels being
     // made to agree, not a new rule. // per §28.3, §28.8, §28.9, v0.286

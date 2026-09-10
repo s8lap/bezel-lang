@@ -300,7 +300,7 @@ BEZEL_TEST(own_multihop_escape, return_two_hop_reborrow_of_using_var_diagnosed_2
         "end Leak;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(hasErrorMessage(
-        r, "§28.9 / §9.7 borrow-lifetime rule"));
+        r, "§28.3 / §9.7 borrow-lifetime rule"));
 }
 
 // Three-hop chain, exercising the transitive follow more than once.
@@ -315,7 +315,7 @@ BEZEL_TEST(own_multihop_escape, return_three_hop_reborrow_of_using_var_diagnosed
         "end Leak;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(hasErrorMessage(
-        r, "§28.9 / §9.7 borrow-lifetime rule"));
+        r, "§28.3 / §9.7 borrow-lifetime rule"));
 }
 
 // Multi-hop where the FINAL escape is a store-to-field rather than a return:

@@ -435,7 +435,7 @@ BEZEL_TEST(lambda_body_escape, owned_local_returned_closure_rejected_28_9) {
     BEZEL_EXPECT_TRUE(hasErrorMessage(
         r, "returned closure captures `q` whose source is disposed at scope "
            "end"));
-    BEZEL_EXPECT_TRUE(hasErrorMessage(r, "(§28.9 closure-capture escape"));
+    BEZEL_EXPECT_TRUE(hasErrorMessage(r, "(§28.3 closure-capture escape"));
 }
 
 // POSITIVE (§28.9, #3564): the same escape with the owned local at the lambda
@@ -456,7 +456,7 @@ BEZEL_TEST(lambda_body_escape, owned_top_level_local_returned_closure_rejected_2
     BEZEL_EXPECT_TRUE(hasErrorMessage(
         r, "returned closure captures `q` whose source is disposed at scope "
            "end"));
-    BEZEL_EXPECT_TRUE(hasErrorMessage(r, "(§28.9 closure-capture escape"));
+    BEZEL_EXPECT_TRUE(hasErrorMessage(r, "(§28.3 closure-capture escape"));
 }
 
 // NEGATIVE (§28.9, #3564) — the ESCAPE boundary. Same owned local, same
