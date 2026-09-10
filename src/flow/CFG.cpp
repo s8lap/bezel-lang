@@ -1,5 +1,8 @@
 #include "flow/CFG.hpp"
 
+#include <functional>
+#include <unordered_map>
+
 #include "ast/Node.hpp"
 #include "common/AwaitScan.hpp"  // fix #3587: the shared await-site walk
 
@@ -65,6 +68,23 @@ struct LoopContext {
     CFGBlock* afterEnd; // break target
 };
 
+// fix #4180 (§21.7/§21.5/§31.2, v0.298): per-try state shared by every copy of
+// its TryHandlerContext frame (the frame is threaded by VALUE through every
+// nested Builder as tryHandlers_ propagates downward, so this must be the
+// SAME object across all of them — hence shared_ptr, not a plain member).
+// `makeClone(target)` builds ONE clone of this try's finally body whose own
+// end (if it falls through) connects to `target`, and returns the clone's
+// entry block; it captures (by value, at the point the try was entered) the
+// finally AST + the enclosing loop/try context, mirroring the ORIGINAL
+// (fall-through-triggered) finally build in visitTry so a clone sees
+// identical nesting. `byTarget` memoizes one clone per distinct ultimate
+// target so N early exits that must hop through the SAME finally to the SAME
+// target reuse one clone instead of rebuilding the finally body N times.
+struct FinallyCloneState {
+    std::function<CFGBlock*(CFGBlock* target)> makeClone;
+    std::unordered_map<CFGBlock*, CFGBlock*> byTarget;
+};
+
 // Try-statement handler context. Updated as the builder enters / exits
 // a `try` block. Throws inside a try statement route to the catch
 // dispatcher (F2). Normal exits route through the finally (if any) on
@@ -73,6 +93,29 @@ struct TryHandlerContext {
     CFGBlock* catchDispatch = nullptr; // first catch's entry (Branch)
     CFGBlock* finallyEntry  = nullptr; // null when no finally
     CFGBlock* afterTry      = nullptr; // post-finally continuation
+
+    // fix #4180: loops_.size() measured when this frame was pushed (i.e. the
+    // loop nesting depth the try/arm body was ENTERED at). A break/continue
+    // targeting a loop already on the stack at that depth is exiting THIS
+    // try (the loop is outside it); a break/continue targeting a loop pushed
+    // AFTER (nested inside the try/arm's own body) never leaves it. See
+    // Builder::routeExitThroughFinally.
+    std::size_t loopDepthAtEntry = 0;
+
+    // fix #4180: null when finallyEntry is null (nothing to hop through).
+    std::shared_ptr<FinallyCloneState> finallyClones;
+
+    // fix #4180: true only for the synthetic frame pushed while building a
+    // CATCH ARM's body (see visitTry). Such a frame is never itself the
+    // landing point for a throw escaping the arm (a throw inside a catch
+    // handler is not caught by its OWN try — the pre-existing comment on the
+    // arm-building loop below) — `catchDispatch` here is the OUTER target a
+    // throw should reach, and `exceptionTarget()` must hop through
+    // `finallyEntry` before landing there, unlike a normal (non-arm) frame
+    // whose `catchDispatch` IS the landing point (finally already runs AFTER
+    // catch dispatch via the pre-existing armEnd/catches.empty() edges, so no
+    // hop is added there).
+    bool isArmContext = false;
 };
 
 class Builder {
@@ -123,21 +166,100 @@ private:
     // (0 = innermost). Precondition: loops_ non-empty. An out-of-range offset
     // (only reachable when sema already reported an unresolved label and left
     // targetLoopOffset at its 0 default, or a malformed offset) clamps to the
-    // innermost, so the CFG never indexes out of bounds.
-    const LoopContext& loopAtOffset(int offset) const {
+    // innermost, so the CFG never indexes out of bounds. fix #4180: split out
+    // of loopAtOffset so routeExitThroughFinally can get the target loop's
+    // 0-based stack INDEX (for the loopDepthAtEntry comparison) without a
+    // second, possibly-inconsistent clamp.
+    std::size_t loopIndexAtOffset(int offset) const {
         if (offset < 0 || static_cast<std::size_t>(offset) >= loops_.size())
             offset = 0;
-        return loops_[loops_.size() - 1 - static_cast<std::size_t>(offset)];
+        return loops_.size() - 1 - static_cast<std::size_t>(offset);
+    }
+    const LoopContext& loopAtOffset(int offset) const {
+        return loops_[loopIndexAtOffset(offset)];
     }
 
     // Where should an exception (from a throwable call or an explicit
     // throw) route to? Nearest enclosing catch dispatcher, or the
     // function-level exit if none. Used by ThrowStmt visit.
-    CFGBlock* exceptionTarget() const {
-        if (!tryHandlers_.empty()) {
-            return tryHandlers_.back().catchDispatch;
+    //
+    // fix #4180 (§31.2, v0.298): when the innermost frame is a catch-arm
+    // context (`isArmContext`), a throw here does not land in that try's OWN
+    // catch (it already didn't, pre-fix — see the arm-building loop's
+    // comment) — but it DOES still need to run that try's `finally` before
+    // reaching `catchDispatch` (the OUTER target), which pre-fix it skipped
+    // entirely. A normal (non-arm) frame's `catchDispatch` IS the landing
+    // point, so no hop is added there — its finally already runs AFTER catch
+    // dispatch via the pre-existing edges (see visitTry).
+    CFGBlock* exceptionTarget() {
+        if (tryHandlers_.empty()) return cfg_.exit();
+        TryHandlerContext& top = tryHandlers_.back();
+        if (top.isArmContext && top.finallyEntry) {
+            return getOrMakeFinallyClone(top, top.catchDispatch);
         }
-        return cfg_.exit();
+        return top.catchDispatch;
+    }
+
+    // fix #4180 (§21.7 return / §21.5 break,continue / §31.2 try-finally,
+    // v0.298): route an early exit's edge to `ultimateTarget` through every
+    // enclosing try frame's ACTIVE finally that the exit actually leaves,
+    // innermost first — mirroring what ThrowStmt already got from
+    // exceptionTarget() (now itself extended above), which ReturnStmt /
+    // BreakStmt / ContinueStmt bypassed entirely before this fix (issue
+    // #4180: `tryBodyEnd`/`armEnd` comes back null for a body ending in one
+    // of these, so visitTry's own `if (tryBodyEnd) addEdge(..., finallyEntry
+    // ...)` never ran — finallyEntry could end up with NO predecessor
+    // reachable from cfg_.entry() at all, so the ownership dataflow never
+    // visited it).
+    //
+    // `exitsAllFrames = true` (return; also the "no active loop" defensive
+    // fallback for a malformed break/continue) routes through EVERY
+    // enclosing frame's finally unconditionally — a return leaves the whole
+    // method, so every active try is exited. `exitsAllFrames = false`
+    // (break/continue) instead compares each frame's `loopDepthAtEntry`
+    // against `targetLoopIdx` (the target loop's 0-based index in the
+    // CURRENT loops_, from loopIndexAtOffset): a frame entered while the
+    // target loop was ALREADY on the stack (loopDepthAtEntry > targetLoopIdx)
+    // is exited by this break/continue and gets a hop; a frame entered
+    // AFTER the target loop (the loop is nested INSIDE the try/arm) is not
+    // exited and gets none. This is monotonic scanning outward — loops_ only
+    // grows walking inward, so an outer frame's loopDepthAtEntry is never
+    // greater than an inner one's — so the scan can stop at the first
+    // ineligible frame.
+    CFGBlock* routeExitThroughFinally(CFGBlock* ultimateTarget,
+                                       bool exitsAllFrames,
+                                       std::size_t targetLoopIdx) {
+        if (tryHandlers_.empty()) return ultimateTarget;
+        std::vector<TryHandlerContext*> eligible; // innermost first
+        for (auto it = tryHandlers_.rbegin(); it != tryHandlers_.rend();
+             ++it) {
+            if (!exitsAllFrames && it->loopDepthAtEntry <= targetLoopIdx)
+                break;
+            eligible.push_back(&*it);
+        }
+        // Wire hops from the OUTERMOST eligible frame inward, so the
+        // terminator's own edge (below) lands on the INNERMOST clone —
+        // finally runs innermost-first, matching real execution order.
+        CFGBlock* target = ultimateTarget;
+        for (auto it = eligible.rbegin(); it != eligible.rend(); ++it) {
+            TryHandlerContext* frame = *it;
+            if (!frame->finallyEntry) continue; // try…catch, no finally
+            target = getOrMakeFinallyClone(*frame, target);
+        }
+        return target;
+    }
+
+    // fix #4180: return the memoized clone of `frame`'s finally body that
+    // routes to `target`, building one on first request. See
+    // FinallyCloneState's comment for what the closure captures.
+    CFGBlock* getOrMakeFinallyClone(TryHandlerContext& frame,
+                                     CFGBlock* target) {
+        auto& state = *frame.finallyClones;
+        auto it = state.byTarget.find(target);
+        if (it != state.byTarget.end()) return it->second;
+        CFGBlock* entry = state.makeClone(target);
+        state.byTarget[target] = entry;
+        return entry;
     }
 
     // Async-readiness 3a: record into `block` every `await` suspend site
@@ -216,7 +338,11 @@ private:
         if (dynamic_cast<const ast::ReturnStmt*>(&s)) {
             from->stmts.push_back(&s);
             recordStmtAwaits(from, s); // async-readiness 3a (additive)
-            cfg_.addEdge(from, cfg_.exit());
+            // fix #4180 (§21.7, v0.298): a return leaves every enclosing
+            // try, so route through each one's active finally first — see
+            // routeExitThroughFinally.
+            cfg_.addEdge(from, routeExitThroughFinally(
+                                    cfg_.exit(), /*exitsAllFrames=*/true, 0));
             return nullptr;
         }
         if (dynamic_cast<const ast::ThrowStmt*>(&s)) {
@@ -244,23 +370,43 @@ private:
         }
         if (auto* brk = dynamic_cast<const ast::BreakStmt*>(&s)) {
             from->stmts.push_back(&s);
+            // fix #4180 (§21.5, v0.298): route through the finally of every
+            // enclosing try this break actually EXITS (the target loop was
+            // already active when that try was entered) before reaching the
+            // loop's `afterEnd` — see routeExitThroughFinally. `loops_`
+            // empty is the pre-existing defensive fallback for a malformed
+            // break outside any loop (sema-rejected in practice); treat it
+            // like a return (exits every active frame) rather than leaving
+            // it unrouted.
             if (!loops_.empty()) {
                 // §21.5 (v0.201, #2051): a labeled `break` exits the target loop
                 // `targetLoopOffset` levels out (0 = innermost), which sema
                 // resolved. The loops_ nesting matches, so index from the back.
-                cfg_.addEdge(from, loopAtOffset(brk->targetLoopOffset).afterEnd);
+                std::size_t idx = loopIndexAtOffset(brk->targetLoopOffset);
+                cfg_.addEdge(from, routeExitThroughFinally(
+                                        loops_[idx].afterEnd,
+                                        /*exitsAllFrames=*/false, idx));
             } else {
-                cfg_.addEdge(from, cfg_.exit());
+                cfg_.addEdge(from, routeExitThroughFinally(
+                                        cfg_.exit(),
+                                        /*exitsAllFrames=*/true, 0));
             }
             return nullptr;
         }
         if (auto* cnt = dynamic_cast<const ast::ContinueStmt*>(&s)) {
             from->stmts.push_back(&s);
+            // fix #4180: same routing as BreakStmt above, targeting the
+            // loop's `header` instead of `afterEnd`.
             if (!loops_.empty()) {
                 // §21.5 (v0.201): a labeled `continue` advances the target loop.
-                cfg_.addEdge(from, loopAtOffset(cnt->targetLoopOffset).header);
+                std::size_t idx = loopIndexAtOffset(cnt->targetLoopOffset);
+                cfg_.addEdge(from, routeExitThroughFinally(
+                                        loops_[idx].header,
+                                        /*exitsAllFrames=*/false, idx));
             } else {
-                cfg_.addEdge(from, cfg_.exit());
+                cfg_.addEdge(from, routeExitThroughFinally(
+                                        cfg_.exit(),
+                                        /*exitsAllFrames=*/true, 0));
             }
             return nullptr;
         }
@@ -445,11 +591,45 @@ private:
 
         cfg_.addEdge(from, tryEntry);
 
+        // fix #4180 (§31.2, v0.298): build the per-target finally-clone state
+        // used to route an early return/break/continue/throw out of the try
+        // body OR a catch arm through this finally before reaching its real
+        // target (routeExitThroughFinally / exceptionTarget). Captures the
+        // finally AST + the OUTER loop/try context by value — the same
+        // context the ORIGINAL fall-through finally build below uses
+        // (`finallyInner.loops_ = loops_; finallyInner.tryHandlers_ =
+        // tryHandlers_;`) — so a clone sees identical enclosing nesting. Null
+        // when there is no finally (nothing to hop through).
+        std::shared_ptr<FinallyCloneState> finallyClones;
+        if (finallyEntry) {
+            finallyClones = std::make_shared<FinallyCloneState>();
+            bool opaque = treatTryAsOpaque_;
+            std::vector<LoopContext> outerLoops = loops_;
+            std::vector<TryHandlerContext> outerTryHandlers = tryHandlers_;
+            const std::vector<std::unique_ptr<ast::Stmt>>* finallyBodyPtr =
+                &s.finallyBody;
+            CFG* cfgPtr = &cfg_;
+            finallyClones->makeClone =
+                [cfgPtr, opaque, outerLoops, outerTryHandlers,
+                 finallyBodyPtr](CFGBlock* target) -> CFGBlock* {
+                CFGBlock* cloneEntry = cfgPtr->makeBlock(CFGBlock::Kind::Linear);
+                Builder cloneBuilder(*cfgPtr, opaque);
+                cloneBuilder.loops_ = outerLoops;
+                cloneBuilder.tryHandlers_ = outerTryHandlers;
+                CFGBlock* cloneEnd =
+                    cloneBuilder.runInto(*finallyBodyPtr, cloneEntry);
+                if (cloneEnd) cfgPtr->addEdge(cloneEnd, target);
+                return cloneEntry;
+            };
+        }
+
         // Build try body with this handler context active.
         Builder inner(cfg_, treatTryAsOpaque_);
         inner.loops_ = loops_;
         inner.tryHandlers_ = tryHandlers_;
-        inner.tryHandlers_.push_back({catchDispatch, finallyEntry, afterTry});
+        inner.tryHandlers_.push_back(
+            {catchDispatch, finallyEntry, afterTry, loops_.size(),
+             finallyClones, /*isArmContext=*/false});
         CFGBlock* tryBodyEnd = inner.runInto(s.body, tryEntry);
         if (tryBodyEnd) {
             // Normal exit from the try body: route through finally (if any)
@@ -482,6 +662,25 @@ private:
             Builder armInner(cfg_, treatTryAsOpaque_);
             armInner.loops_ = loops_;
             armInner.tryHandlers_ = tryHandlers_;
+            // fix #4180: give the arm body a frame for THIS try's OWN
+            // finally, so an early return/break/continue/throw inside the
+            // arm still runs it before leaving — pre-fix, an arm body had NO
+            // path to this try's finally at all except the "falls through"
+            // edge below. `catchDispatch` here is deliberately the OUTER
+            // exceptionTarget() (evaluated on `this`, i.e. BEFORE `inner`'s
+            // push above — the outer, one-frame-popped stack), not this
+            // try's own dispatch — a throw in a catch handler is still not
+            // caught by its own try (unchanged from before this fix).
+            // `isArmContext=true` tells exceptionTarget() to hop through
+            // `finallyEntry` before landing at that outer target instead of
+            // landing here directly, matching what routeExitThroughFinally
+            // now does for return/break/continue via loopDepthAtEntry.
+            if (finallyEntry) {
+                armInner.tryHandlers_.push_back(
+                    {/*catchDispatch=*/exceptionTarget(), finallyEntry,
+                     afterTry, loops_.size(), finallyClones,
+                     /*isArmContext=*/true});
+            }
             CFGBlock* armEnd = armEntry;
             if (arm.body) {
                 armEnd = armInner.visitStmt(*arm.body, armEntry);

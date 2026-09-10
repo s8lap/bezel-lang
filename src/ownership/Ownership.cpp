@@ -7529,6 +7529,28 @@ void MethodOwnership::handleReturn(const ast::Expr& e) {
                 st->state = OwnershipState::Poisoned;
                 return;
             }
+            // fix #4180 (§28.3, v0.298): a Borrowed binding carries no
+            // discharge obligation for this pessimistic marking to satisfy
+            // — `producerState`'s catch-all default for anything not a
+            // recognized owned producer (a plain value-typed local like
+            // `int`, a genuine borrow, ...) is exactly Borrowed. Calling
+            // markDisposedByName here unconditionally (as before this fix)
+            // clobbers a Borrowed symbol's tracked state to Disposed
+            // regardless — harmless in isolation (`run()`'s leak check
+            // already gates on `state == Owned`, so a Borrowed local was
+            // never at risk of a false leak report either way), but WRONG
+            // once something downstream can observe the bogus Disposed
+            // state and read the binding again: an active `finally` that
+            // re-reads the same plain local after an early `return` — the
+            // exact path #4180 makes reachable and analysed for the first
+            // time. Every OTHER state (Owned/MovedFrom/Disposed/
+            // maybeConsumed/PolyNull/Poisoned/Uninitialized) still falls
+            // through to the call below, unchanged: Owned records the real
+            // discharge; MovedFrom/Disposed/maybeConsumed need their own
+            // correct diagnostic from markDisposedByName's early-return
+            // arms (e.g. `move x; return x;` must still reject — measured
+            // in the #4180 fix commit body).
+            if (st->state == OwnershipState::Borrowed) return;
         }
         markDisposedByName(id->name, id->span.begin);
         return;
