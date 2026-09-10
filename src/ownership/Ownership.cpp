@@ -9160,6 +9160,87 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
             !isTopLevelConsumingForm(*as->value))
             checkRead(*as->value, /*selfTarget=*/false);
         if (as->value) recordMovesIn(*as->value);
+        // fix #4187 / #3972 (§28.3 K1.3, v0.295): the TARGET side of a plain
+        // `:=` reassignment inside a lambda body. Everything above this point
+        // in this arm (#3951) only ever touches `states_` for the
+        // assignment's RHS — nothing updates `states_[targetSym]` itself, so
+        // the target's PRE-assignment state (most commonly MovedFrom from an
+        // earlier `move`) survives the rebind unchanged. A later read/dispose
+        // of the freshly-reassigned local is then falsely rejected as
+        // "already moved out" (#4187 — reproduces with a single straight-line
+        // unconditional move, no branching required), and — the leak face,
+        // #3972 — the reverse shape (a stale Owned/live state surviving a
+        // reassignment that should have discharged it) was never at risk
+        // here since nothing discharges without `recordMovesIn` seeing a
+        // `move`, but the *target*'s own moved-from state never clearing
+        // means a legal post-reassignment read is over-rejected exactly as
+        // §28.3 K1, item 3 says it must not be ("unreadable until
+        // reassigned" — the read here IS after the reassignment).
+        //
+        // Mirror `handleAssignment`'s bare-identifier target-state
+        // transition (Ownership.cpp, ~line 6650 on) NARROWLY: only the
+        // `states_`-local bookkeeping — producer-state adoption, the
+        // maybe-consumed / disposed-on-some-path / await-spent clears, the
+        // #3950 `lhsMovedFromAtStore` flag (so codegen's §28.7 drop-on-
+        // overwrite correctly skips disposing a slot that held nothing live
+        // — #3972's own "second consequence": leaving this unset here would
+        // trade the over-rejection for the exact use-after-free #3950 fixed
+        // at method scope), and the #3967 maybe-consumed-owned reject (a
+        // maybe-consumed join, reachable here via #4116/#4117's if/while/for
+        // joins, has no static per-path disposal answer — silently clearing
+        // it would trade the over-rejection for a possible double-free/leak,
+        // the same class of mistake lane-rules §25 warns about). Deliberately
+        // NOT run: `checkConsumeFreeze` (its liveness query is not
+        // exercised for a lambda-body local by any existing lambda-arm call
+        // site — a separate, narrower gap, not this issue's), the §28.9
+        // borrow-source recompute, and the null-init `becomesOwnedViaReassign`
+        // flag (both pre-existing, orthogonal gaps for lambda-body locals,
+        // unrelated to either repro). Scoped to `:=` only — a COMPOUND
+        // assignment (`+=`, …) must NOT reclassify the target, exactly as
+        // `handleAssignment`'s own header comment explains (~line 6253:
+        // "Leaving the target's state untouched is... the right answer").
+        // Run BEFORE the nested-lambda collection below, matching this arm's
+        // existing ordering. // per §28.3 K1.3, §28.7, v0.295, #4187, #3972
+        if (as->op == ":=" && as->target) {
+            if (const auto* tid = dynamic_cast<const ast::IdentifierExpr*>(
+                    as->target.get())) {
+                for (auto& [sym, st] : states_) {
+                    if (sym->name != tid->name) continue;
+                    if (st.state == OwnershipState::Owned && st.maybeConsumed &&
+                        localDropOnOverwriteCovered(sym)) {
+                        report(Severity::Error, as->target->span.begin,
+                               std::string("cannot reassign `") +
+                                   std::string(tid->name) +
+                                   "`: it may have already been consumed on "
+                                   "another branch (maybe-consumed join, "
+                                   "§28.3 K1.4) — reassigning it here would "
+                                   "silently dispose a value the consuming "
+                                   "branch may already have disposed (a "
+                                   "use-after-free); per-path disposal for "
+                                   "this shape is not yet implemented (§28.3 "
+                                   "K1.4). Discharge `" +
+                                   std::string(tid->name) +
+                                   "` explicitly on every path before this "
+                                   "reassignment, or restructure so the "
+                                   "consume and this reassignment are not "
+                                   "both reachable");
+                        if (!suppressDiag_) st.state = OwnershipState::Poisoned;
+                        break;
+                    }
+                    if (!suppressDiag_ && st.state == OwnershipState::MovedFrom)
+                        const_cast<ast::AssignmentStmt*>(as)
+                            ->lhsMovedFromAtStore = true;
+                    st.state = producerState(*as->value);
+                    st.obligationOrigin = as;
+                    st.maybeConsumed = false;
+                    st.disposedOnSomePath = false;
+                    st.awaitSpent = false;
+                    if (st.state == OwnershipState::Owned)
+                        definitelyRestoredLocals_.insert(sym);
+                    break;
+                }
+            }
+        }
         if (as->target) {
             std::vector<const ast::LambdaExpr*> nestedLambdas;
             collectBodyLambdasExpr(*as->target, nestedLambdas);
