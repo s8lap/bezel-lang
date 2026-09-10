@@ -9204,6 +9204,37 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
         if (as->op == ":=" && as->target) {
             if (const auto* tid = dynamic_cast<const ast::IdentifierExpr*>(
                     as->target.get())) {
+                // fix #4216 / #4217 / #4218 (§28.3/§28.7/§28.9, v0.298):
+                // port the three pieces of `handleAssignment`'s bare-
+                // identifier target transition the original #4187/#3972 fix
+                // deliberately left out, believing (WRONGLY — a claim review
+                // measured false, not asserted false) that they were
+                // unreachable from this arm. All three are real, MEASURED
+                // defects reachable through this exact arm, two of them
+                // heap-use-after-free:
+                //   - `checkConsumeFreeze` already runs from THIS arm's own
+                //     context: the `recordMovesIn` call above (RHS handling)
+                //     routes `move x` through `markMovedByName`, which calls
+                //     `checkConsumeFreeze` (Ownership_Checks.cpp:9620) — so
+                //     its absence HERE (the reassignment-of-a-borrowed-owned-
+                //     local site) was the one call site in the family
+                //     missing it, not a function nothing in this arm ever
+                //     reaches. `var y := x; x := new Res(9); var t := y.tag;`
+                //     inside a lambda body compiled with zero ownership
+                //     errors and read freed memory (#4216).
+                //   - The §28.9 borrow-source recompute's absence left a
+                //     rebound borrow holder's `source` stale, so a later
+                //     `move` of the NEW source froze nothing and the stale-
+                //     sourced holder read freed memory after (#4217).
+                //   - The null-init `becomesOwnedViaReassign` flag's absence
+                //     left a local first adopted as owned inside a lambda
+                //     body unclassified for codegen's disposal ceremony, so
+                //     an explicit `.Dispose()` did not free it (measured 32
+                //     bytes / 2 allocations leaked, #4218).
+                // Computed BEFORE the states_ scan (mirrors handleAssignment,
+                // Ownership.cpp ~6650) so it observes the pre-reassignment
+                // Owned state of any source local.
+                sema::Symbol* src = borrowSourceForExpr(*as->value);
                 for (auto& [sym, st] : states_) {
                     if (sym->name != tid->name) continue;
                     if (st.state == OwnershipState::Owned && st.maybeConsumed &&
@@ -9227,6 +9258,12 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
                         if (!suppressDiag_) st.state = OwnershipState::Poisoned;
                         break;
                     }
+                    // fix #4216 (§28.3/§28.7/§30.14, v0.298): the consume-
+                    // site freeze — a live local borrow of the value THIS
+                    // reassignment is about to displace must reject, exactly
+                    // as `handleAssignment` (Ownership.cpp ~6758) does.
+                    if (st.state == OwnershipState::Owned)
+                        checkConsumeFreeze(tid->name, as->target->span.begin);
                     if (!suppressDiag_ && st.state == OwnershipState::MovedFrom)
                         const_cast<ast::AssignmentStmt*>(as)
                             ->lhsMovedFromAtStore = true;
@@ -9237,6 +9274,42 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
                     st.awaitSpent = false;
                     if (st.state == OwnershipState::Owned)
                         definitelyRestoredLocals_.insert(sym);
+                    // fix #4218 (§28.7/§28.3, v0.298): mirrors
+                    // handleAssignment's #1625 null-init flag (Ownership.cpp
+                    // ~6844) — a null-initialized plain local's FIRST Owned
+                    // adoption via reassignment must be flagged so codegen's
+                    // unwindOwnedLocalClass classifies it as an owned class
+                    // local (drop-on-overwrite + scope-end/explicit-Dispose
+                    // disposal). LOCALDECL-ONLY: `sym` here is always a var
+                    // LocalDecl — a §21.1 `const` local can never be
+                    // reassigned, so the missing LocalConstDecl arm is
+                    // unreachable, exactly as the mirrored site's own
+                    // comment states. // per §28.7, §28.3, §21.1, #1625,
+                    // #4218
+                    if (st.state == OwnershipState::Owned) {
+                        if (auto* lsym = dynamic_cast<sema::LocalSymbol*>(sym)) {
+                            if (auto* ld2 = dynamic_cast<const ast::LocalDecl*>(
+                                    lsym->decl))
+                                if (ld2->initializer &&
+                                    dynamic_cast<const ast::NullLiteralExpr*>(
+                                        ld2->initializer.get()))
+                                    const_cast<ast::LocalDecl*>(ld2)
+                                        ->becomesOwnedViaReassign = true;
+                        }
+                    }
+                    // fix #4217 (§28.9/§9.7, v0.298): recompute the target's
+                    // borrow source so a LATER consume-site freeze query
+                    // (checkConsumeFreeze, above) sees the CURRENT source
+                    // rather than whatever the target borrowed before this
+                    // reassignment — mirrors handleAssignment (Ownership.cpp
+                    // ~6870).
+                    if (src && src != sym) {
+                        BorrowSource bs;
+                        bs.sym = src;
+                        st.source = bs;
+                    } else {
+                        st.source.reset();
+                    }
                     break;
                 }
             }
