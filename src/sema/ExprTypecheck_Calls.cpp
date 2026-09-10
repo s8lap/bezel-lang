@@ -11707,6 +11707,19 @@ void ExprTC::checkImportedCallArity(const ast::CallExpr& ce, MethodSymbol* ms) {
     BindResult b = bindArgsToParams(sema::FormalsView::of(*ms), ce.args,
                                     ce.span.begin, desc, /*emit=*/true);
     if (!b.ok) return;  // the binder reported; no cascade
+    // fix #4199 (NEEDS-FIX round 1): the imported method's own generic
+    // parameters, the cross-module sibling of `checkArgsAgainstParams`'s
+    // identical `calleeMethodGenericParamNames` a few hundred lines below.
+    // `MethodSymbol::genericParams` is populated on BOTH the local and
+    // imported side (GenericParams.hpp's header comment) — an imported
+    // generic method's own `T` reaches the per-argument `checkAssignable`
+    // call below exactly as a local one's does, and without this it would
+    // be silently under-checked (never recognised as free at ANY depth,
+    // where a local call's callee-supplied set still recognises it at
+    // depth 1) rather than correctly at every recursion depth.
+    std::unordered_set<std::string_view> calleeMethodGenericParamNames;
+    for (Symbol* gp : ms->genericParams)
+        if (gp) calleeMethodGenericParamNames.insert(gp->name);
     const std::size_t nparams = sema::formalParamCount(*ms);
     for (std::size_t j = 0; j < nparams; ++j) {
         const int ai = b.paramToArg[j];
@@ -11744,7 +11757,8 @@ void ExprTC::checkImportedCallArity(const ast::CallExpr& ce, MethodSymbol* ms) {
         checkAssignable(ctx_.exprType(*a.value), pt,
                         a.value->span.begin,
                         desc + ": argument " + std::to_string(ai + 1),
-                        a.value.get());  // per §7.4 / §27.6 (#1191)
+                        a.value.get(),  // per §7.4 / §27.6 (#1191)
+                        &calleeMethodGenericParamNames);  // fix #4199
     }
 }
 
@@ -12865,6 +12879,21 @@ void ExprTC::checkArgsAgainstParams(
     // per-parameter mapping to type-check, so stop here.
     BindResult b = bindArgsToParams(params, args, loc, calleeDesc, /*emit=*/true);
     if (!b.ok) return;
+    // fix #4199 (§14.5 phase 1, NEEDS-FIX round 1): the CALLEE method's own
+    // still-being-inferred generic type parameters — the ONLY names this
+    // call's per-argument `checkAssignable` below is entitled to treat as a
+    // free/rigid type variable rather than a concrete type. NOT the
+    // receiver class's own params (`classParent`): those are already
+    // substituted into `paramTy` via `substituteMemberType` below, before
+    // `checkAssignable` ever runs, so a class-level name should never still
+    // be free by that point. Ground truth from `calleeMethodDecl`'s actual
+    // declaration, never inferred from a TypeRef's own shape (a
+    // null-declaration TypeRef is ALSO how ~50 stdlib builtins resolve —
+    // see `isFreeGenericTypeVarRef`'s comment in ExprTypecheck.cpp).
+    std::unordered_set<std::string_view> calleeMethodGenericParamNames;
+    if (calleeMethodDecl)
+        for (const auto& gp : calleeMethodDecl->genericParams)
+            calleeMethodGenericParamNames.insert(gp.name);
     // per §5.1: each bound argument must be assignable to its parameter.
     // Iterate in parameter order so a reordered named-arg call checks each
     // argument against the parameter it actually fills.
@@ -13038,7 +13067,8 @@ void ExprTC::checkArgsAgainstParams(
                         a.value->span.begin,
                         std::string("argument `") + std::string(p.name) +
                         "` to " + calleeDesc,
-                        a.value.get());  // per §7.4 / §27.6 (#1191)
+                        a.value.get(),  // per §7.4 / §27.6 (#1191)
+                        &calleeMethodGenericParamNames);  // fix #4199
     }
 }
 

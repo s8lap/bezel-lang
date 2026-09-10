@@ -1818,8 +1818,13 @@ static bool armCoversDeterminedLeaf(
 // Forward declaration (defined below): §12.9 variance-aware generic
 // assignability, reused by checkCaseExhaustiveness's #784/#1874 typed-binding
 // coverage check to make a same-declaration generic binding arg-SENSITIVE.
-static bool variantGenericAssignable(const TypeRef*, const TypeRef*,
-                                     bool (*)(TypeSymbol*, TypeSymbol*));
+// `freeNames` (#4199): the set of names this call is entitled to treat as a
+// free/rigid type variable rather than a concrete type — see
+// `isFreeGenericTypeVarRef`'s comment. Null means none (ground-truth
+// conservative default).
+static bool variantGenericAssignable(
+    const TypeRef*, const TypeRef*, bool (*)(TypeSymbol*, TypeSymbol*),
+    const std::unordered_set<std::string_view>* freeNames);
 
 // §19.6 v0.196 (#1874/#1912): does an unguarded typed binding `var x: bt` cover
 // EVERY non-null value of a scrutinee whose instantiation projected to `bt`'s
@@ -1834,7 +1839,13 @@ static bool variantGenericAssignable(const TypeRef*, const TypeRef*,
 bool ExprTC::typedBindingCoversAllValues(const TypeRef* proj,
                                          const TypeRef* bt) {
     if (!proj || !bt) return false;
-    bool covers = variantGenericAssignable(proj, bt, isSubtype);
+    // fix #4199: the "rigid enclosing-body type parameter" this function's
+    // own comment relies on is `currentScopeGenericParamNames()`'s ground
+    // truth, not any Named TypeRef with a null declaration (which also
+    // matches ~50 null-declaration stdlib builtins — #4199's actual defect).
+    std::unordered_set<std::string_view> freeNames =
+        currentScopeGenericParamNames();
+    bool covers = variantGenericAssignable(proj, bt, isSubtype, &freeNames);
     if (covers && proj->genericArgs.size() == bt->genericArgs.size()) {
         for (std::size_t gi = 0; gi < proj->genericArgs.size(); ++gi) {
             const TypeRef* sa = proj->genericArgs[gi];
@@ -3387,8 +3398,9 @@ bool ExprTC::primitiveWidens(PrimitiveType from, PrimitiveType to) {
 // All are defined after builtinInterfaceAncestorsOf (the §26.5 hierarchy
 // section), which they depend on.
 static std::string_view namedTypeSimpleName(const TypeRef*);
-static bool variantGenericAssignable(const TypeRef*, const TypeRef*,
-                                      bool (*)(TypeSymbol*, TypeSymbol*));
+static bool variantGenericAssignable(
+    const TypeRef*, const TypeRef*, bool (*)(TypeSymbol*, TypeSymbol*),
+    const std::unordered_set<std::string_view>* freeNames);
 
 // Slice T4: is `from` a subtype of `to` — i.e. does `to` appear in
 // `from`'s transitive base-type chain (base class or implemented
@@ -3711,6 +3723,51 @@ bool ExprTC::mentionsUnsubstitutedTypeParam(const TypeRef* t) const {
     return refOutParamTypeMentionsTypeParam(t, tpNames);
 }
 
+// §14.1 / §12.9 (#4199) — see the header comment. The enclosing type's own
+// generic params, the enclosing method's own, and (§26.4/#3083) an enclosing
+// extension's target-type parameter names.
+std::unordered_set<std::string_view> ExprTC::currentScopeGenericParamNames()
+    const {
+    std::unordered_set<std::string_view> names;
+    if (currentType_)
+        for (Symbol* gp : currentType_->genericParams)
+            if (gp) names.insert(gp->name);
+    if (currentMethodDecl_)
+        for (const auto& gp : currentMethodDecl_->genericParams)
+            names.insert(gp.name);
+    if (currentExtension_ && currentExtension_->decl) {
+        if (auto* ed = dynamic_cast<const ast::ExtensionDecl*>(
+                currentExtension_->decl)) {
+            if (ed->targetType)
+                collectExtensionTargetTypeParamNames(*ed->targetType, names);
+        }
+    }
+    return names;
+}
+
+// Sibling of `isExtensionTargetTypeParam` (tests one name) — same walk
+// (§26.4), collecting every bound name instead of testing a single one.
+void ExprTC::collectExtensionTargetTypeParamNames(
+    const ast::Type& target, std::unordered_set<std::string_view>& out)
+    const {
+    for (const auto& ga : target.genericArgs) {
+        if (!ga) continue;
+        if (ga->kind != ast::TypeKind::Named || !ga->name ||
+            ga->name->parts.size() != 1)
+            continue;
+        std::string_view n = ga->name->parts[0];
+        if (!ga->genericArgs.empty()) {
+            // A concrete generic-instantiation head is never itself a free
+            // parameter — recurse to find the params in its own args
+            // (mirrors `isExtensionTargetTypeParam`'s identical recursion).
+            collectExtensionTargetTypeParamNames(*ga, out);
+            continue;
+        }
+        if (ga->nullable) continue;  // `T?` rejects binding (§26.4)
+        out.insert(n);
+    }
+}
+
 // Slices T1/T4: assignability check (§5.1, §7, §12 subtyping).
 // Handles two cases and conservatively skips everything else
 // (mixed primitive/named, generics, null, Object target) so it
@@ -3718,9 +3775,10 @@ bool ExprTC::mentionsUnsubstitutedTypeParam(const TypeRef* t) const {
 //   - primitive → primitive: identity or §5.1 widening.
 //   - named → named (non-generic): identity or subclass/interface.
 // A non-nullable target accepting a nullable source is rejected.
-void ExprTC::checkAssignable(TypeRef* from, TypeRef* to,
-                             SourceLocation loc, const std::string& what,
-                             const ast::Expr* fromExpr) {
+void ExprTC::checkAssignable(
+    TypeRef* from, TypeRef* to, SourceLocation loc, const std::string& what,
+    const ast::Expr* fromExpr,
+    const std::unordered_set<std::string_view>* freeTypeParamNames) {
     if (!from || !to) return;
     // §5.1 "Constant narrowing" (#2925): applied HERE, once, for every §5.1
     // conversion site — see narrowIntConstantToTarget above.
@@ -4067,7 +4125,7 @@ void ExprTC::checkAssignable(TypeRef* from, TypeRef* to,
                 !from->genericArgs.empty() &&
                 from->genericArgs.size() == to->genericArgs.size()) {
                 // Same-declaration: enforce declared variance per §12.9.
-                if (!variantGenericAssignable(from, to, isSubtype)) {
+                if (!variantGenericAssignable(from, to, isSubtype, freeTypeParamNames)) {
                     reportNotConvertible();
                     return;
                 }
@@ -4216,7 +4274,7 @@ void ExprTC::checkAssignable(TypeRef* from, TypeRef* to,
             reportNotConvertible();
             return;
         }
-        if (!variantGenericAssignable(from, to, isSubtype)) {
+        if (!variantGenericAssignable(from, to, isSubtype, freeTypeParamNames)) {
             reportNotConvertible();
             return;
         }
@@ -6533,12 +6591,35 @@ static bool typeArgSameBase(const TypeRef* a, const TypeRef* b) {
 }
 
 // §14.1 / §14.5 phase 1 (issue #1180, #4199): true when `t` is a FREE generic
-// type-parameter reference — a Named TypeRef with no resolved declaration, no
-// generic arguments of its own, and a non-empty name. Within a resolved
-// TypeRef reached from a method or type signature, a bare Named type with a
-// null declaration can only be such a reference (an unresolved ordinary
-// identifier would already have been rejected by name resolution), so this is
-// a structural test, not a name-set membership test.
+// type-parameter reference IN `freeNames` — a Named TypeRef with no resolved
+// declaration, no generic arguments of its own, a non-empty name, AND that
+// name present in the caller-supplied `freeNames` set.
+//
+// ⚠ NEEDS-FIX correction (review round 1, #4199): an earlier version of this
+// predicate tested SHAPE ALONE (Named + null declaration + no generic args),
+// on the theory that "a bare Named type with a null declaration can only be
+// [a rigid type-parameter reference] — an unresolved ordinary identifier
+// would already have been rejected by name resolution". That reasoning is
+// false, and `isFullyGroundTypeRef`'s own comment a few hundred lines above
+// already says so: "A `Named` TypeRef with `declaration == nullptr` is a
+// rigid type-parameter reference ... OR a null-declaration stdlib builtin;
+// BOTH are treated as non-ground" — `TypeResolution_Names.cpp`'s
+// always-available-builtins table resolves ~50 names (`Task`, `Exception`,
+// `IDisposable`, `Mutex`, `DateTime`, ...) to EXACTLY that shape. The
+// shape-only version silently treated `Box<Box<Task>>`'s `Task` as an
+// unbound method type parameter and accepted it against `Box<Box<int>>` —
+// sema wrongly admits the call, and codegen crashes with an IR verification
+// failure (a real reject became an ICE). MEASURED, `628c4c5` vs the
+// shape-only fix: `TakesBoxBoxTask(b: Box<Box<Task>>)` called with
+// `Box<Box<int>>` correctly rejects pre-fix (clean §5.1 diagnostic) and was
+// wrongly accepted by the shape-only fix.
+//
+// Ground truth instead: `freeNames` is populated by the CALLER from an
+// actual declaration's generic parameters (`ExprTC::currentScopeGenericParamNames`
+// for an enclosing-scope rigid parameter, or the callee method's own
+// `genericParams` at a call-argument check — see `checkArgsAgainstParams`),
+// never inferred from a TypeRef's own shape. A null-declaration builtin
+// never appears in either set, so it is never misclassified as free.
 //
 // Free variables accept any binding without variance or identity restriction
 // here — the only constraint on what they may bind to is enforced at the call
@@ -6548,9 +6629,14 @@ static bool typeArgSameBase(const TypeRef* a, const TypeRef* b) {
 // shares ONE definition (LANE_RULES §6) rather than growing a second,
 // drifting spelling — `variantGenericAssignable`'s per-argument loop below
 // used to inline this same test.
-static bool isFreeGenericTypeVarRef(const TypeRef* t) {
-    return t && t->kind == TypeRef::Kind::Named && !t->declaration &&
-           t->genericArgs.empty() && !namedTypeSimpleName(t).empty();
+static bool isFreeGenericTypeVarRef(
+    const TypeRef* t, const std::unordered_set<std::string_view>* freeNames) {
+    if (!t || t->kind != TypeRef::Kind::Named || t->declaration ||
+        !t->genericArgs.empty())
+        return false;
+    if (!freeNames) return false;
+    std::string_view nm = namedTypeSimpleName(t);
+    return !nm.empty() && freeNames->count(nm) > 0;
 }
 
 // §12.9: recursive type-argument IDENTITY. Two arguments are identical when
@@ -6585,21 +6671,26 @@ static bool isFreeGenericTypeVarRef(const TypeRef* t) {
 // level of nesting (`Box<T>` vs `Box<int>`) never reached this function at
 // all — `variantGenericAssignable`'s own top-level loop already saw the bare
 // `T` and skipped it — which is why one level worked and two did not.
-static bool typeArgIdentical(const TypeRef* a, const TypeRef* b) {
+static bool typeArgIdentical(
+    const TypeRef* a, const TypeRef* b,
+    const std::unordered_set<std::string_view>* freeNames) {
     if (!a || !b) return a == b;
-    if (isFreeGenericTypeVarRef(a) || isFreeGenericTypeVarRef(b)) return true;
+    if (isFreeGenericTypeVarRef(a, freeNames) ||
+        isFreeGenericTypeVarRef(b, freeNames))
+        return true;
     if (!typeArgSameBase(a, b)) return false;
     if (a->kind == TypeRef::Kind::InlineArray)
-        return typeArgIdentical(a->arrayElement, b->arrayElement);
+        return typeArgIdentical(a->arrayElement, b->arrayElement, freeNames);
     if (a->kind == TypeRef::Kind::Function) {
         for (std::size_t i = 0; i < a->funcParams.size(); ++i)
-            if (!typeArgIdentical(a->funcParams[i].type, b->funcParams[i].type))
+            if (!typeArgIdentical(a->funcParams[i].type, b->funcParams[i].type,
+                                  freeNames))
                 return false;
-        return typeArgIdentical(a->funcReturn, b->funcReturn);
+        return typeArgIdentical(a->funcReturn, b->funcReturn, freeNames);
     }
     if (a->genericArgs.size() != b->genericArgs.size()) return false;
     for (std::size_t i = 0; i < a->genericArgs.size(); ++i)
-        if (!typeArgIdentical(a->genericArgs[i], b->genericArgs[i]))
+        if (!typeArgIdentical(a->genericArgs[i], b->genericArgs[i], freeNames))
             return false;
     return true;
 }
@@ -6622,10 +6713,11 @@ static bool typeArgIdentical(const TypeRef* a, const TypeRef* b) {
 // Returns false on a genuine mismatch; the caller reports the §5.1 error.
 static bool typeArgCovariantAssignable(
     const TypeRef* fromArg, const TypeRef* toArg,
-    bool (*isSubtypeFn)(TypeSymbol*, TypeSymbol*)) {
+    bool (*isSubtypeFn)(TypeSymbol*, TypeSymbol*),
+    const std::unordered_set<std::string_view>* freeNames) {
     if (!fromArg || !toArg) return fromArg == toArg;
     // Identity (recursive) is always a legal conversion.
-    if (typeArgIdentical(fromArg, toArg)) return true;
+    if (typeArgIdentical(fromArg, toArg, freeNames)) return true;
     // §12.9 L1592: a value-typed argument admits no variant conversion — only
     // identity (already ruled out). Checked before the Object root so
     // `IEnumerable<int>` is NOT covariantly assignable to `IEnumerable<Object>`.
@@ -6642,7 +6734,7 @@ static bool typeArgCovariantAssignable(
     // variantGenericAssignable, which reads the declared/hardcoded variance and
     // requires argument identity for an invariant base (e.g. Array).
     if (typeArgSameBase(fromArg, toArg))
-        return variantGenericAssignable(fromArg, toArg, isSubtypeFn);
+        return variantGenericAssignable(fromArg, toArg, isSubtypeFn, freeNames);
     // Different base, both builtin: `fromArg`'s base must reference-convert to
     // `toArg`'s base via the builtin interface hierarchy (e.g.
     // Array<Dog>→IEnumerable<Dog>). Find the ancestor whose base matches
@@ -6656,7 +6748,8 @@ static bool typeArgCovariantAssignable(
         std::vector<std::unique_ptr<TypeRef>> owned;
         for (const TypeRef* anc : builtinInterfaceAncestorsOf(fromArg, owned))
             if (namedTypeSimpleName(anc) == toName)
-                return variantGenericAssignable(anc, toArg, isSubtypeFn);
+                return variantGenericAssignable(anc, toArg, isSubtypeFn,
+                                                freeNames);
         return false;
     }
     // Different base, both user-declared: the base must be a subtype. Recursing
@@ -6774,7 +6867,8 @@ bool ExprTC::userTypeImplementsBuiltinIface(TypeRef* from,
 //      conservatively-accepted residual (deferred to the full §12.9 milestone).
 static bool variantGenericAssignable(
     const TypeRef* from, const TypeRef* to,
-    bool (*isSubtypeFn)(TypeSymbol*, TypeSymbol*)) {
+    bool (*isSubtypeFn)(TypeSymbol*, TypeSymbol*),
+    const std::unordered_set<std::string_view>* freeNames) {
     if (!from || !to) return true;
     if (from->kind != TypeRef::Kind::Named ||
         to->kind != TypeRef::Kind::Named) return true;
@@ -6840,13 +6934,16 @@ static bool variantGenericAssignable(
         if (!fromArg || !toArg) continue;  // conservative skip on unresolved
 
         // §14.1 (issue #1180): a Named TypeRef with null declaration and no
-        // genericArgs is a free type variable (generic method/type parameter
-        // like A, B, T). Free variables accept any binding without variance
-        // restriction — the only constraint is the concrete substitution, which
-        // is enforced at the call site, not here. (fix #4199: now shared with
-        // `typeArgIdentical`'s own recursion via `isFreeGenericTypeVarRef`,
-        // rather than this loop being the only place that recognised the shape.)
-        if (isFreeGenericTypeVarRef(toArg) || isFreeGenericTypeVarRef(fromArg))
+        // genericArgs, whose NAME is in `freeNames` (ground truth — see
+        // `isFreeGenericTypeVarRef`'s comment, #4199 NEEDS-FIX round 1), is a
+        // free type variable (generic method/type parameter like A, B, T).
+        // Free variables accept any binding without variance restriction —
+        // the only constraint is the concrete substitution, which is enforced
+        // at the call site, not here. Shared with `typeArgIdentical`'s own
+        // recursion via `isFreeGenericTypeVarRef`, rather than this loop being
+        // the only place that recognised the shape.
+        if (isFreeGenericTypeVarRef(toArg, freeNames) ||
+            isFreeGenericTypeVarRef(fromArg, freeNames))
             continue;
 
         // Determine variance of `to`'s i-th parameter.
@@ -6879,16 +6976,18 @@ static bool variantGenericAssignable(
             // recursively through nested generic arguments (§12.9 — a nested
             // invariant base such as Array requires argument identity, so
             // `IEnumerable<Array<Dog>>` does NOT admit `IEnumerable<Array<Animal>>`).
-            ok = typeArgCovariantAssignable(fromArg, toArg, isSubtypeFn);
+            ok = typeArgCovariantAssignable(fromArg, toArg, isSubtypeFn,
+                                            freeNames);
         } else if (variance == "in") {
             // Contravariant: toArg must reference-convert to fromArg (operands
             // swapped), same recursive composition.
-            ok = typeArgCovariantAssignable(toArg, fromArg, isSubtypeFn);
+            ok = typeArgCovariantAssignable(toArg, fromArg, isSubtypeFn,
+                                            freeNames);
         } else {
             // Invariant (or unknown variance): recursive argument identity —
             // NOT a shallow same-base check, which would ignore nested args and
             // treat `Array<Dog>` as identical to `Array<Animal>` (§12.9).
-            ok = typeArgIdentical(fromArg, toArg);
+            ok = typeArgIdentical(fromArg, toArg, freeNames);
         }
 
         if (!ok) return false;
@@ -6975,8 +7074,16 @@ bool ExprTC::typeTestGenericInstantiationImpossible(const TypeRef* scrutTy,
     // contravariance handled by variantGenericAssignable; a rigid/free type
     // parameter is treated as compatible, so a rigid scrutinee is never
     // over-rejected — a type pattern is tested per instantiation, §19.3 v0.182).
-    if (variantGenericAssignable(a, b, isSubtype) ||
-        variantGenericAssignable(b, a, isSubtype))
+    // fix #4199 (NEEDS-FIX round 1): the "rigid/free type parameter" is now
+    // ground-truthed against `currentScopeGenericParamNames()` (this method's
+    // and enclosing type's own declared params), not any Named TypeRef with a
+    // null declaration — the prior shape-only test also matched null-
+    // declaration stdlib builtins (`Task`, `Exception`, ...), which are never
+    // "rigid" here.
+    std::unordered_set<std::string_view> freeNames =
+        currentScopeGenericParamNames();
+    if (variantGenericAssignable(a, b, isSubtype, &freeNames) ||
+        variantGenericAssignable(b, a, isSubtype, &freeNames))
         return false;
     return true;  // provably incompatible instantiation — reject
 }
@@ -7108,9 +7215,13 @@ bool ExprTC::typeTestInterfaceInstantiationImpossible(const TypeRef* scrutTy,
     // Provably impossible iff NONE does: a FINAL class means no subclass can
     // supply another instantiation, so no value of the scrutinee type can be a
     // `patTy`, and the erased test would bind at a wrong static type.
+    // fix #4199 (NEEDS-FIX round 1): ground-truthed free-variable set, see
+    // `typeTestGenericInstantiationImpossible`'s identical note above.
+    std::unordered_set<std::string_view> freeNames =
+        currentScopeGenericParamNames();
     for (TypeRef* impl : impls)
-        if (variantGenericAssignable(impl, scrutTy, isSubtype) ||
-            variantGenericAssignable(scrutTy, impl, isSubtype))
+        if (variantGenericAssignable(impl, scrutTy, isSubtype, &freeNames) ||
+            variantGenericAssignable(scrutTy, impl, isSubtype, &freeNames))
             return false;  // a compatible implementation exists — admit
     return true;  // every implemented instantiation is incompatible — reject
 }
@@ -7472,9 +7583,13 @@ ExprTC::IfaceBindReject ExprTC::typeTestInterfaceBindAmbiguous(
         collectAncestorInstantiationsOf(patTy, sd, concImpls);
         if (concImpls.empty())
             return IfaceBindReject::None;  // doesn't implement `I` — #1920's job.
+        // fix #4199 (NEEDS-FIX round 1): ground-truthed free-variable set, see
+        // `typeTestGenericInstantiationImpossible`'s identical note above.
+        std::unordered_set<std::string_view> freeNames =
+            currentScopeGenericParamNames();
         for (TypeRef* impl : concImpls)
-            if (variantGenericAssignable(impl, scrutTy, isSubtype) ||
-                variantGenericAssignable(scrutTy, impl, isSubtype))
+            if (variantGenericAssignable(impl, scrutTy, isSubtype, &freeNames) ||
+                variantGenericAssignable(scrutTy, impl, isSubtype, &freeNames))
                 return IfaceBindReject::None;  // conforms — LIVE + precise, admit.
         return IfaceBindReject::Unreachable;   // DEAD arm.
     }

@@ -1444,9 +1444,19 @@ private:
     //   - primitive → primitive: identity or §5.1 widening.
     //   - named → named (non-generic): identity or subclass/interface.
     // A non-nullable target accepting a nullable source is rejected.
-    void checkAssignable(TypeRef* from, TypeRef* to,
-                         SourceLocation loc, const std::string& what,
-                         const ast::Expr* fromExpr = nullptr);
+    // `freeTypeParamNames` (#4199): the set of type-parameter names this
+    // specific call is entitled to treat as a FREE/rigid variable rather than
+    // a concrete type — e.g. the callee method's own still-being-inferred
+    // generic parameters at a call-argument check, or the enclosing scope's
+    // rigid parameters at a pattern-exhaustiveness check. Null (the default)
+    // means NONE — the ground-truth-conservative default every call site
+    // that is not explicitly reasoning about a specific free-variable set
+    // gets, matching `isFullyGroundTypeRef`'s existing conservative stance.
+    void checkAssignable(
+        TypeRef* from, TypeRef* to, SourceLocation loc,
+        const std::string& what, const ast::Expr* fromExpr = nullptr,
+        const std::unordered_set<std::string_view>* freeTypeParamNames =
+            nullptr);
 
     // §5.1 "Constant narrowing" (#2925) — the ONE definition of the rule, for
     // every §5.1 conversion site. Verbatim (v0.240):
@@ -1481,6 +1491,35 @@ private:
     // §22.3's ref/out deferral uses for the same reason (#1756: a narrower
     // guard is what made that check false-reject and get reverted four times).
     bool mentionsUnsubstitutedTypeParam(const TypeRef* t) const;
+
+    // §14.1 / §12.9 (#4199): the SET of type-parameter names in scope at the
+    // current position — the enclosing type's (currentType_), the enclosing
+    // method's (currentMethodDecl_), and an enclosing extension's target-type
+    // parameters (§26.4/#3083, the same rule `isExtensionTargetTypeParam`
+    // tests one name at a time). Ground truth for "is a Named TypeRef with a
+    // null declaration a genuinely FREE/rigid type variable, or a
+    // null-declaration stdlib builtin that merely has the same shape" — see
+    // `isFreeGenericTypeVarRef` (ExprTypecheck.cpp): a bare Named TypeRef with
+    // no declaration is NOT sufficient on its own (issue #4199 — ~50 stdlib
+    // builtins, e.g. `Task`, `Exception`, `IDisposable`, resolve to exactly
+    // that shape, per `isFullyGroundTypeRef`'s own comment a few hundred
+    // lines above: "a null-declaration stdlib builtin ... treated as
+    // non-ground" — the SAME ambiguity that function already resolves
+    // conservatively).
+    //
+    // Deliberately a SEPARATE small scan from `mentionsUnsubstitutedTypeParam`
+    // (not a shared refactor of it): that function answers a boolean
+    // "mentions any" question via `refOutParamTypeMentionsTypeParam` and its
+    // existing callers/behaviour are out of this fix's scope; this one needs
+    // to RETURN the set so `variantGenericAssignable`'s recursion can test
+    // membership at arbitrary nesting depth.
+    std::unordered_set<std::string_view> currentScopeGenericParamNames() const;
+    // Sibling of `isExtensionTargetTypeParam` (which tests one name) that
+    // collects EVERY name the same walk would recognize, for
+    // `currentScopeGenericParamNames`'s extension arm.
+    void collectExtensionTargetTypeParamNames(
+        const ast::Type& target,
+        std::unordered_set<std::string_view>& out) const;
 
     // Slice S18: a condition must be `bool` (§21.2 if, §21.3 while,
     // §20 if-expression). Only flags when the condition has a resolved
