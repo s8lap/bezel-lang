@@ -7364,6 +7364,44 @@ bool Emitter::lowerDictEntryFor(const ast::ForStmt& fs) {
     // declaration). The snapshot-array frees themselves are unaffected: no
     // capture ever aliases them.
     bool forVarCaptured = forVarCapturedInBody(fs);
+    // fix #4161 (§27.5/§28.9/§28.3, stdlib §4.8, v0.295): #4129 gated ONLY
+    // its own new dictEntryForSnapshot disposal (the return/throw path) on
+    // `forVarCaptured` — a coarse, escape-BLIND predicate, true the instant
+    // ANY closure in the body references the loop var at all, whether or not
+    // that closure outlives the iteration. incBB/endBB's own #1058
+    // per-iteration/end-of-loop release below had the IDENTICAL hazard on
+    // the normal-completion/`break` path (no return/throw needed at all —
+    // #4161's own repro) and was left completely ungated.
+    //
+    // A bare `!forVarCaptured` gate for incBB/endBB would trade the UAF for
+    // a leak on EVERY capture, including the common, provably-safe shape
+    // (`for var e in d do var f := lambda() => e.Key; f(); end;` — a purely
+    // local, non-escaping closure invoked and disposed inside the SAME
+    // iteration's body, before incBB ever runs). `cellFreeEligible_` is the
+    // escape-aware authority that already answers this precisely: it is the
+    // SAME whole-body pre-pass `lowerForBody` (below) consults, keyed by
+    // `&fs` exactly like `forVarCapturedInBody`, to decide whether the
+    // for-var's own boxed capture CELL can be freed at each iteration's body
+    // end (`collectCellFreeEligible`, LlvmBackend_Setup.cpp). It contains
+    // `&fs` iff (a) at least one lambda captures the for-var, AND (b) NO
+    // escaping lambda captures it — condition (b) is exactly "does the
+    // closure actually outlive the iteration". When it holds, EVERY
+    // capturing closure's env — and with it, the boxed cell's own alias of
+    // this same `bz_string*` pointer — is disposed by `lowerForBody`'s own
+    // scope-end/break-unwind handling strictly BEFORE control reaches
+    // incBB/endBB for this iteration (`forVarFreshCell`'s `boxedCellFree`
+    // disposal is pushed INSIDE the body's own scope and fires on both the
+    // fall-through and the loop-unwind-via-`break` edges, both before this
+    // function's incBB/endBB code runs), so releasing the ORIGINAL pointer
+    // here is sound. Falls back to the coarse, always-safe "any capture
+    // leaks" answer when `cellFreeEligible_` was not computed for the
+    // CURRENT function (`currentFn_ != cellFreeEligibleFn_`, e.g. a for-loop
+    // lowered inside a lambda body analyzed separately) — the pre-existing
+    // conservative default every other cellFreeEligible_ consumer in this
+    // file already uses.
+    bool forVarCapturedEscaping = forVarCaptured &&
+        !(currentFn_ == cellFreeEligibleFn_ &&
+          cellFreeEligible_.count(static_cast<const void*>(&fs)));
     disposeStack_.push_back({});
     {
         Disposal d{nullptr, nullptr};
@@ -7376,7 +7414,7 @@ bool Emitter::lowerDictEntryFor(const ast::ForStmt& fs) {
         d.dictEntryForIsStringKey = isStringKey;
         d.dictEntryForUseGen = useGen;
         d.dictEntryForVarSlot = varSlot;
-        d.dictEntryForReleaseInFlightKey = isStringKey && !forVarCaptured;
+        d.dictEntryForReleaseInFlightKey = isStringKey && !forVarCapturedEscaping;
         disposeStack_.back().push_back(d);
     }
 
@@ -7392,13 +7430,29 @@ bool Emitter::lowerDictEntryFor(const ast::ForStmt& fs) {
             // #1058 / §28/§4.8: release the per-iteration string key object
             // (rc 1→0 → free dataCpy + strObj header).  Null field 0 so the
             // endBB release below is a no-op on normal completion.
-            llvm::Value* so = builder_.CreateLoad(
-                ptrTy(), builder_.CreateStructGEP(entryStTy, varSlot, 0));
-            emitStringRelease(so);
-            builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()),
-                builder_.CreateStructGEP(entryStTy, varSlot, 0));
+            //
+            // fix #4161: gated on !forVarCapturedEscaping (see its
+            // declaration above, at the dictEntryForSnapshot registration).
+            // An escaping closure's boxed cell may still alias this exact
+            // `bz_string*` pointer, so both the release AND the null-out are
+            // skipped together — endBB below carries the SAME gate, so
+            // leaving field 0 non-null here does not risk a double-release
+            // there; the value is simply never released (a bounded leak,
+            // the safe direction, matching dictEntryForReleaseInFlightKey's
+            // return/throw-path fallback).
+            if (!forVarCapturedEscaping) {
+                llvm::Value* so = builder_.CreateLoad(
+                    ptrTy(), builder_.CreateStructGEP(entryStTy, varSlot, 0));
+                emitStringRelease(so);
+                builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()),
+                    builder_.CreateStructGEP(entryStTy, varSlot, 0));
+            }
             // Free the strndup'd char* data for this iteration (mirrors
-            // lowerDictKeysFor's per-slot free in the increment block).
+            // lowerDictKeysFor's per-slot free in the increment block). This
+            // buffer (`kp2`) is decodeDictStringKeyAt's SOURCE bytes — a
+            // malloc'd allocation distinct from the `bz_string*` built from
+            // it (`so` above) — never aliased by a capturing closure, so
+            // freeing it is unconditionally safe regardless of capture.
             llvm::Value* kpPtr2 = builder_.CreateGEP(ptrTy(), keysArr, idxI);
             llvm::Value* kp2    = builder_.CreateLoad(ptrTy(), kpPtr2);
             builder_.CreateCall(freeFn, {kp2});
@@ -7418,7 +7472,16 @@ bool Emitter::lowerDictEntryFor(const ast::ForStmt& fs) {
     // #1058 / §28/§4.8: on `break` incBB is skipped — release the in-progress
     // iteration's strObj now.  On normal completion field 0 was nulled by incBB,
     // so bz_string_release(null) is a no-op (no double-free).
-    if (isStringKey) {
+    //
+    // fix #4161: gated on !forVarCapturedEscaping (see its declaration above,
+    // at the dictEntryForSnapshot registration) — same reasoning as incBB's
+    // own gate. An escaping closure's boxed cell may still alias this
+    // iteration's `so`, whether reached via `break` (field 0 holds the
+    // in-progress iteration's un-nulled value) or via normal completion
+    // (field 0 holds whatever the last incBB left there, un-nulled under
+    // this same gate). Skipping here is the safe-direction leak, not a
+    // use-after-free.
+    if (isStringKey && !forVarCapturedEscaping) {
         llvm::Value* so = builder_.CreateLoad(
             ptrTy(), builder_.CreateStructGEP(entryStTy, varSlot, 0));
         emitStringRelease(so);  // null-safe

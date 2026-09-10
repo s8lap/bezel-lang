@@ -1888,17 +1888,29 @@ private:
         // complete normally, no `return`/`break` involved) — but THIS fix
         // must not open a NEW way to reach it via `return`/`throw` (never
         // trade a leak for a UAF). So dictEntryForSnapshot's registration
-        // computes `!forVarCapturedInBody(fs)` ONCE (a static, conservative,
-        // whole-body AST scan — true the moment ANY closure in the body
-        // captures the loop variable AT ALL, regardless of whether that
-        // closure provably escapes) and stores it here; false leaves the
-        // Key on the pre-existing safe-direction leak (unchanged from
-        // before this fix), exactly like every other sibling family in this
-        // file that cannot prove non-escape. This flag does NOT gate freeing
-        // the snapshot spine arrays or the remaining per-key raw byte boxes
-        // — `entry.Key`/`entry.Value` are decoded (VALUE) copies out of
-        // those, never aliases of them, so freeing them is unconditionally
-        // safe regardless of capture.
+        // stores `!forVarCapturedEscaping` here (LlvmBackend_Stmts.cpp,
+        // `lowerDictEntryFor`); false leaves the Key on the pre-existing
+        // safe-direction leak, exactly like every other sibling family in
+        // this file that cannot prove non-escape. This flag does NOT gate
+        // freeing the snapshot spine arrays or the remaining per-key raw
+        // byte boxes — `entry.Key`/`entry.Value` are decoded (VALUE) copies
+        // out of those, never aliases of them, so freeing them is
+        // unconditionally safe regardless of capture.
+        //
+        // fix #4161 (§27.5/§28.9/§28.3, stdlib §4.8, v0.295):
+        // `forVarCapturedEscaping` REPLACES the original `forVarCapturedIn-
+        // Body(fs)` here — that predicate was escape-BLIND (true whenever
+        // ANY closure references the loop var, non-escaping ones included),
+        // which was sound but left this same flag ALSO gating incBB/endBB's
+        // own #1058 per-iteration/end-of-loop release too coarse to close
+        // #4161 (a real UAF on normal loop completion, no return/throw
+        // involved) without leaking every merely-referenced, non-escaping
+        // capture. `forVarCapturedEscaping` refines the answer using
+        // `cellFreeEligible_` (see its declaration and
+        // `lowerDictEntryFor`'s own comment for the full derivation) — the
+        // same escape-aware, whole-body authority `lowerForBody` already
+        // consults to decide whether the for-var's boxed capture cell can
+        // be freed per iteration.
         bool dictEntryForReleaseInFlightKey = false;
         // §35.4 (v0.200, #2045 stage 3): an OWNING-CLASSIFIED choice local
         // (a sum whose classification is Owning, e.g. one with an `owned`
