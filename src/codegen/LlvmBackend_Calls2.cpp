@@ -13472,6 +13472,44 @@ llvm::Function* Emitter::buildSpecializedMethodFn(
     bool savedAsyncBorrowedReturn = asyncBorrowedReturn_;
     asyncChainedReturn_ = false;
     asyncBorrowedReturn_ = false;
+    // fix #4173 (§28.3 / §30.1, v0.298): pendingOwnedParams_ / pendingArgsDisposal_
+    // are the same §2731-item-3 ROOT-SCOPE REGISTRATION channels NestedBodyScope
+    // already saves/clears/restores by name for the OTHER nested-emission venues
+    // (property/choice-method getter/setter bodies — see that ctor/dtor pair,
+    // LlvmBackend_Assign.cpp ~5140/~5158/~5200, and its own comment's "REACHED by
+    // a `requires` clause" analysis). Neither is folded into BEZEL_SM_FRAME_MEMBERS
+    // for the same reason asyncChainedReturn_/asyncBorrowedReturn_ (fix #4157,
+    // just above) are not: both are ALSO hand-declared members of NestedBodyScope
+    // (LlvmBackend_impl.hpp ~12728-12730), so folding them into the macro would
+    // double-declare there (confirmed the same way #4157 confirmed it — the
+    // macro edit does not compile).
+    //
+    // `bindParameters` (LlvmBackend_Setup.cpp ~13934) unconditionally
+    // `.clear()`s pendingOwnedParams_ as its FIRST statement, before this
+    // function's own save point existed to protect anything. Every path below
+    // (the plain branch's own bindParameters call, and each of
+    // emitIteratorMethod/emitAsyncMethod/emitAsyncIteratorMethod's own internal
+    // bindParameters call) reaches it. A `requires` clause is lowered
+    // (emitRequiresPrologue) strictly between an OUTER method's own
+    // bindParameters and that outer body's own root-scope `lowerScopedBlock` —
+    // exactly the window the sibling NestedBodyScope leak's own repro already
+    // proves reachable — and a `requires` clause may call a first-time generic
+    // `pure` method, which routes through THIS function. Without this save, that
+    // nested call's own bindParameters wipes the OUTER method's still-pending
+    // `owned` parameter registration outright: MEASURED, 800 B / 50 allocations
+    // leaked for an `owned` param + a `requires` clause calling a first-time
+    // generic pure method (issue 4173's review comment; reproduced again below
+    // by this fix's own FAIL-WITHOUT cycle). pendingArgsDisposal_ shares the
+    // exact mechanism (its own producer, the variadic-args-array prologue in
+    // emitAsyncMethod ~1223 and the non-SM prologue in Setup.cpp ~9473, runs
+    // before the SAME root-scope drain) and is protected symmetrically even
+    // though only the pendingOwnedParams_ half was independently measured —
+    // leaving one half of a proven-identical pair unprotected would be exactly
+    // the "two halves of one contract" gap LANE_RULES warns about.
+    auto savedPendingOwnedParams = std::move(pendingOwnedParams_);
+    auto savedPendingArgsDisposal = std::move(pendingArgsDisposal_);
+    pendingOwnedParams_.clear();
+    pendingArgsDisposal_.reset();
 
     currentFn_ = specFn;
     // #1060 / #1061: a STATE-MACHINE method (async / iterator) must have its
@@ -13721,6 +13759,13 @@ llvm::Function* Emitter::buildSpecializedMethodFn(
     // single restore here covers every exit.
     asyncChainedReturn_ = savedAsyncChainedReturn;
     asyncBorrowedReturn_ = savedAsyncBorrowedReturn;
+    // fix #4173: restore the root-scope registration channels the save/reset
+    // above set aside — see the comment there. Same single-exit-path argument
+    // #4157 makes just above (the only earlier `return`, the cache-hit
+    // `return cit->second;`, is well before this save), so one restore here
+    // covers every exit.
+    pendingOwnedParams_ = std::move(savedPendingOwnedParams);
+    pendingArgsDisposal_ = std::move(savedPendingArgsDisposal);
 
     return specFn;
 }
