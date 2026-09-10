@@ -11274,7 +11274,34 @@ void ExprTC::visitTopDecl(const ast::TopDecl& d) {
             // §26.3 (#1346, v0.160): extension properties are expression-bodied
             // only (`property Name: Type => expr;`); the block-accessor and
             // auto-property forms are not admitted in extension blocks.
+            //
+            // fix #4213 (§26.3 "No indexers.", Appendix A.4, v0.298): an
+            // indexer parses as a `PropertyDecl` with `isIndexer` set (the
+            // `[ParamList]`/`this[ParamList]` name-position alternative,
+            // Parser_Decls.cpp's `isKeyword("property")` arm) rather than as
+            // its own AST node — A.4 has no distinct `IndexerDecl` struct.
+            // Checked FIRST, ahead of the body-kind check just below: an
+            // indexer can be expression-bodied (`property [i: int]: int =>
+            // i;`), which would otherwise sail through that check and reach
+            // `visitMember`, where it was measured (this issue's repro) to
+            // fail downstream with a confusing "unresolved identifier `i`"
+            // instead of naming the real §26.3 rule. `ExtensionMember`'s
+            // second alternative is `ExpressionPropertyDecl`, whose own A.4
+            // production (`Visibility "pure"? "readonly"? "property"
+            // Identifier ":" Type "=>" Expression ";"`) takes a plain
+            // `Identifier`, never the indexer's `"[" ParamList "]"` form —
+            // so an indexer is excluded by the grammar independent of
+            // §26.3's explicit "No indexers." bullet.
             if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(m.get())) {
+                if (pd->isIndexer) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, pd->span.begin,
+                        "an extension block may not declare an indexer — "
+                        "§26.3's restriction list is explicit (\"No "
+                        "indexers.\"); declare the indexer on the extended "
+                        "type's own declaration instead (§26.3)");
+                    continue;
+                }
                 if (pd->bodyKind != ast::PropertyBodyKind::Expression) {
                     std::string_view formName =
                         (pd->bodyKind == ast::PropertyBodyKind::Block)
@@ -11287,6 +11314,95 @@ void ExprTC::visitTopDecl(const ast::TopDecl& d) {
                         " form is not admitted in extension blocks (§26.3)");
                     continue;
                 }
+            }
+            // fix #4213 (§26.3, Appendix A.4 `ExtensionMember` grammar,
+            // v0.298): default-deny catch-all for every remaining `Member`
+            // alternative. A.4's `Member` production currently lists eleven
+            // forms (`FieldDecl | MethodDecl | PropertyDecl | IndexerDecl |
+            // ConstructorDecl | DestructorDecl | OperatorDecl |
+            // NestedTypeDecl | ConstDecl | PolymorphicMember |
+            // InvariantDecl`), but `ExtensionMember ::= MethodDecl |
+            // ExpressionPropertyDecl` admits only two. Fix #4204 closed the
+            // `InvariantDecl` gap with a dedicated arm above (its own review
+            // found the loop checked only 4 of the (then-)9 non-
+            // `ExtensionMember` alternatives); this issue's own repro found
+            // FieldDecl and ConstDecl silently admitted with zero
+            // diagnostics, and measuring the rest turned up
+            // ConstructorDecl reaching a SIGSEGV in codegen
+            // (`Emitter::emitImplicitBase`, LlvmBackend_Setup.cpp) rather
+            // than a clean rejection, plus DestructorDecl and
+            // NestedTypeMember (the AST wrapper for `NestedTypeDecl`, A.4:
+            // `NestedTypeDecl ::= ClassDecl | InterfaceDecl | RecordDecl |
+            // EnumDecl`) both silently admitted too — five more per-kind
+            // arms with the identical shape as OperatorDecl/InvariantDecl
+            // above. A sixth near-duplicate arm was written and then
+            // discarded for `PolymorphicMember`: it has no AST `Member`
+            // subclass at all (A.4's `PolymorphicMember` clause mutates the
+            // enclosing `TypeDecl::serializedClass` directly,
+            // Parser_Decls.cpp's `parsePolymorphicMember`) and is reachable
+            // only from `parseTypeDeclBody`'s class/record member loop, never
+            // from the `parseMember()` this extension body's loop calls
+            // (`Parser::parseExtensionDecl`) — so `polymorphic(...)` inside
+            // an extension already fails to parse (measured: cascading
+            // "expected member visibility ... or member-kind keyword"
+            // errors) before any AST `Member` node exists to check here; it
+            // was REFUTED as a silent-admission instance of this bug, though
+            // its cascading parse-error diagnostics are their own quality
+            // gap (issue filed separately). Given a sixth near-duplicate
+            // arm would not even have a node to match against, and the
+            // five that would compile are exactly as `dynamic_cast`-shaped
+            // as the two arms already here, this closes the class instead:
+            // anything that is not a `MethodDecl` and not a (by this point
+            // in the loop, guaranteed non-indexer, expression-bodied)
+            // `PropertyDecl` is inadmissible per the grammar's closed
+            // two-alternative list, independent of which concrete kind it
+            // is — including a future twelfth `Member` alternative, which a
+            // per-kind allowlist would silently admit exactly as it did
+            // here for six releases.
+            if (!dynamic_cast<const ast::MethodDecl*>(m.get()) &&
+                !dynamic_cast<const ast::PropertyDecl*>(m.get())) {
+                std::string_view kind = "member";
+                std::string_view note =
+                    "Appendix A.4's `ExtensionMember` grammar admits only "
+                    "methods and expression-bodied properties";
+                if (dynamic_cast<const ast::FieldDecl*>(m.get())) {
+                    kind = "field";
+                    note = "§26.3's restriction list is explicit (\"No "
+                           "fields, auto-properties, constructors, "
+                           "destructors, or `owned` fields.\")";
+                } else if (dynamic_cast<const ast::ConstructorDecl*>(
+                               m.get())) {
+                    kind = "constructor";
+                    note = "§26.3's restriction list is explicit (\"No "
+                           "fields, auto-properties, constructors, "
+                           "destructors, or `owned` fields.\"); an "
+                           "extension has no storage of its own to "
+                           "initialize";
+                } else if (dynamic_cast<const ast::DestructorDecl*>(
+                               m.get())) {
+                    kind = "destructor";
+                    note = "§26.3's restriction list is explicit (\"No "
+                           "fields, auto-properties, constructors, "
+                           "destructors, or `owned` fields.\"); an "
+                           "extension adds no storage for a destructor to "
+                           "release";
+                } else if (dynamic_cast<const ast::ConstDecl*>(m.get())) {
+                    kind = "const";
+                    note = "§26.3's first bullet is exhaustive (\"Only "
+                           "methods and computed read-only properties.\")";
+                } else if (dynamic_cast<const ast::NestedTypeMember*>(
+                               m.get())) {
+                    kind = "nested type";
+                    note = "§26.3's first bullet is exhaustive (\"Only "
+                           "methods and computed read-only properties.\")";
+                }
+                ctx_.diagnostics().report(
+                    Severity::Error, m->span.begin,
+                    "an extension block may not declare a `" +
+                    std::string(kind) + "` member — " + std::string(note) +
+                    "; declare it on the extended type's own declaration "
+                    "or at module scope instead (§26.3)");
+                continue;
             }
             visitMember(*m);
         }
