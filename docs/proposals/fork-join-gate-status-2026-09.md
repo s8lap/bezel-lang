@@ -44,6 +44,8 @@ Dependency 1 makes the gate structurally unreachable until one of two things hap
 
 Until one is chosen the gate stays where it is, the issue stays open, and nothing in this memo changes a normative document.
 
+**Decision (2026-09-10, recorded on #1725): option (a).** Sequence 0027's graduation first; the Stage-2 landing follows as 0032's recorded design once `SplitSpans`/`StringSplitCursor` exist. The gate stays closed and #1725 stays open as the tracker until then; no re-scoped proposal under (b) is to be opened.
+
 ## 6. Size, for planning
 
 Assuming (a) and no design changes: 30–50 h of drafting across five normative documents (spec §3.6/§28.14/§30.12/§30.13/§30.14/§22.12 + Appendix A + the axiom register; stdlib §4.14–§4.16 lend-span family + §6.12; rationale §12.9 rewritten from *recorded* to *shipped*; changelog; Guides 01 + 04), plus `DECLINED.md`, the code-generation reference, and the conformance corpus. Under (b), the proposal precedes all of that.
