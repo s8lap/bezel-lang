@@ -3295,8 +3295,37 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                                 ctx_.exprType(*ds->value)) {
                             bn = builtinTypeName(rt);
                         }
-                        if (!bn.empty() &&
-                            common::isVtableLessBuiltinClassName(bn) &&
+                        // fix #4224 (§17.13 / §28.3 / §28.9, v0.298): whether
+                        // `bn` is a vtable-less builtin AT ALL — the SAME
+                        // `common::isVtableLessBuiltinClassName` authority the
+                        // release-arm condition below already consults — must
+                        // be known BEFORE deciding the `else` arm can safely
+                        // call `emitDisposeAndReclaim`. Previously that arm's
+                        // comment read "class/interface (or a vtable-less
+                        // builtin no arm names yet — leak-before-wild-jump,
+                        // #2973)" and called `emitDisposeAndReclaim`
+                        // unconditionally either way. That was safe only while
+                        // `slotAddr` could exclusively come from a genuine
+                        // user-class `unwindOwnedLocalClass` resolution. Once
+                        // `explicitDisposeOwnedReceiverSlot`'s `loc->isUsing`
+                        // short-circuit (LlvmBackend_Calls2.cpp ~line 4622)
+                        // started handing back a real slot for ANY `using var`
+                        // binding regardless of type, an UNCOVERED vtable-less
+                        // builtin (`Shared<T>`, `Weak<T>`, `JsonSerializer`,
+                        // `BinarySerializer`, `SharedEventSource<T>`, the
+                        // Buffer family, …) reaches this `else` with a real
+                        // slot and no #4185 fallback gate in front of it (that
+                        // fallback only fires when `explicitDisposeOwnedReceiverSlot`
+                        // returned null in the first place — moot here, since
+                        // the `using`-short-circuit already returned non-null).
+                        // Measured: `using var sh := new Shared<Widget>(new
+                        // Widget()); _ := sh;` → AddressSanitizer
+                        // heap-buffer-overflow, 16-byte region (`bz_shared_new`'s
+                        // allocation) — the exact #2675 wild jump, one level up.
+                        bool isVtablelessBuiltin =
+                            !bn.empty() &&
+                            common::isVtableLessBuiltinClassName(bn);
+                        if (isVtablelessBuiltin &&
                             emitVtablelessBuiltinRelease(bn, obj)) {
                             // vtable-less path: builtin released; null the
                             // slot so a following scope-exit / unwind
@@ -3310,9 +3339,14 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                             // per §29.8 / §30.1
                             nullStateMachineOwnedParamCapture(
                                 ds->value.get());
-                        } else {
-                            // class/interface (or a vtable-less builtin no
-                            // arm names yet — leak-before-wild-jump, #2973).
+                        } else if (!isVtablelessBuiltin) {
+                            // Genuine user class/interface, OR a reserved
+                            // builtin INTERFACE head (isVtableLessBuiltinClassName
+                            // excludes those by its own contract — they keep
+                            // real dynamic dispatch, per BuiltinRegistry.cpp's
+                            // isBuiltinInterfaceHead comment). Word 0 is a real
+                            // Bezel vtable either way, so the slot-2
+                            // dynamicDispose dispatch is safe.
                             emitDisposeAndReclaim(obj);
                             builder_.CreateStore(nullVal, slotAddr);
                             // #2310 / §29.8 / §30.1 (#973a residual): also null the
@@ -3320,6 +3354,29 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                             // this `_ := p` discard just consumed (no-op outside a
                             // state-machine body, for non-parameter sources, for
                             // non-owned parameters). per §29.8 / §30.1
+                            nullStateMachineOwnedParamCapture(ds->value.get());
+                        } else {
+                            // fix #4224: `bn` IS a vtable-less builtin
+                            // (`isVtableLessBuiltinClassName` true) but
+                            // `emitVtablelessBuiltinRelease` names no arm for
+                            // it — a plain C struct with no Bezel vtable at
+                            // word 0, so `emitDisposeAndReclaim` would be the
+                            // #2675 wild jump. Leak instead (the same
+                            // leak-before-wild-jump trade #2973 / #4185 make
+                            // for this exact gap elsewhere): still null the
+                            // slot so a following scope-exit/unwind auto-drop
+                            // reloads null and no-ops — exactly-once "no
+                            // dispose", never a double free. Collections
+                            // (OwningArray/OwningDictionary/OwningSet/
+                            // OwningStack/OwningQueue/OwningLinkedList) do NOT
+                            // reach this arm — `discardOutOwnedVar`'s
+                            // collection branch above (line ~3134) claims them
+                            // first, for both `using var` and plain `var`; the
+                            // collection gap on the UNRELATED explicit
+                            // `?.Dispose()` path is #4221, open, deliberately
+                            // left untouched here. // per §17.13, §28.3,
+                            // §28.9, #2675, #2973, #4185, #4221
+                            builder_.CreateStore(nullVal, slotAddr);
                             nullStateMachineOwnedParamCapture(ds->value.get());
                         }
                         builder_.CreateBr(contBB);
