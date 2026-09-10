@@ -1,6 +1,6 @@
 # Bezel for Code Generation
 
-*Validated against v0.297. Companion to the Bezel Language Specification — a writing reference, not a normative document.*
+*Validated against v0.298. Companion to the Bezel Language Specification — a writing reference, not a normative document.*
 
 A dense reference for writing correct Bezel without reading the spec. It covers the syntax surface, the ownership rules, the standard-library name index, the idioms that work, and the shapes that look right and are rejected.
 
@@ -527,7 +527,7 @@ A borrow is valid only where **every** source in its source set is live; joins, 
 - A borrow may **not** be assigned to a local whose scope strictly encloses its source's scope — including flowing around a loop back edge. Rejected **at the assignment**, not at the later use.
 - A borrow of a **scope-bound local** may not be stored in a field or in a longer-lived collection. A borrow whose source *does* outlive the object **is** admissible: the **back-reference** idiom binds a constructor parameter into a plain (non-`owned`) class-typed field (`private _owner: Customer;`). The check is structural — sourced from a parameter that is not `owned` (plain or `scoped`) or from the receiver: admitted; locals, temporaries **and `owned` parameters**: rejected (an `owned` parameter is disposed at the method's end, so it is scope-bound — §28.3, v0.288).
 - A borrow may not be returned unless its source is one every caller can re-establish: receiver-sourced from an instance method, the receiver-parameter borrow of an extension method, or static storage through a **static property getter**.
-- A borrow may not be captured by a closure that may outlive its source (immediately-invoked closures, closures bound to a `using var` of function type, and closures passed to a function-typed parameter are fine).
+- A closure — or a method reference over an instance receiver — is a **borrow-carrying value**: its source set is the union of its captures' sources (calling a closure yields a value carrying the closure's own set), and every rule in this list applies to it by that set (§28.3, v0.298). So: bind it to any local, plain `var` or `using var`, whose scope does not strictly enclose a source's (a local helper lambda over a borrow needs no `using var`); invoke it; pass it to a function-typed parameter (§28.14). While it captures anything, do **not** store it in a field or a collection, write it through `out`/`ref`, or return it from the method — a function type announces no sources, so the only storage route for a capture-bearing closure is a `scoped` parameter (§28.14); a capture-free closure goes anywhere. Reassigning a plain function-typed local is fine — each assignment is checked on its own; `using var` on a function-typed local adds only non-reassignability.
 - Every field-, collection- or async-frame-held borrow carries the obligation not to transfer the borrowed object to another domain. This has **no runtime backstop** — it is a data race (§30.14).
 
 **Merges must agree** (§28.3). owned ⊓ owned = owned. borrowed ⊓ borrowed = borrowed, sources unioned. **owned ⊓ borrowed = rejected.** owned ⊓ moved-from = maybe-consumed (unreadable). The rule governs `if` statements, `if` expressions, `??`, and expression-`case` arms identically.
