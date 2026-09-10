@@ -1,6 +1,6 @@
 # Bezel Language Specification
 
-**Version 0.295 — September 2026**
+**Version 0.296 — September 2026**
 
 Bezel is a compiled language for services and tools, with ownership-based memory management and no garbage collector. The compiler tracks ownership of every heap object and ensures that each one is disposed exactly once. Borrowing lets you pass references without transferring ownership, with lifetimes checked at compile time rather than enforced by a runtime. The result aims to give you the safety of a managed language and the predictability of a manual one, without the ceremony of either.
 
@@ -573,7 +573,7 @@ An integer literal without a suffix has type `int` if it fits in `int`'s range; 
 
 **Boundary carve-out.** The decimal literal of magnitude 2³¹ (unsuffixed) or 2⁶³ (`L`-suffixed) is admitted **only** as the immediate operand of unary `-`, denoting `int.MinValue` / `long.MinValue` respectively (`-2147483648`, `-9223372036854775808L`); anywhere else those magnitudes remain errors. Without this carve-out the most negative values would be unwritable as literals (the magnitude alone overflows before the `-` applies).
 
-**Target-typed integer constants.** An unsuffixed integer literal (decimal, hexadecimal, or binary spelling alike) whose value exceeds `int`'s range has **no standalone type**: it is an integer compile-time constant ([§17.14](#sec-constant-expressions)) admitted exactly where [§5.1](#sec-implicit-conversions)'s constant narrowing admits one — at a declared integer target whose range contains it, taking that target's type: `var x: long := 3_000_000_000;`, a typed field initializer, a call argument, an assignment to `x: long`, a `return` in a method returning `long`, a record positional argument, a collection-literal element, a default argument, an enum constant value ([§10.2](#sec-explicit-values)) — and it participates in overload-resolution applicability on the same terms ([§22.6](#sec-overloading)): `f(3_000_000_000)` against `f(long)` and `f(double)` selects `f(long)`, the `double` candidate being inapplicable because the constant is admitted at integer targets only. The suffix discipline's purpose (no *accidental* width) is preserved: the wider type is taken only from a written integer target, and the value is range-checked against it. In an **untyped** context (`var x := 3_000_000_000;`), and at a non-integer target (`var d: double := 3_000_000_000;`), the literal is a compile error directing to a suffix (`3_000_000_000L`, which then converts by §5.1).
+**Target-typed integer constants.** An unsuffixed integer literal (decimal, hexadecimal, or binary spelling alike) whose value exceeds `int`'s range has **no standalone type**: it is an integer compile-time constant ([§17.14](#sec-constant-expressions)) admitted exactly where [§5.1](#sec-implicit-conversions)'s constant narrowing admits one — at a declared integer target whose range contains it, taking that target's type — every [written-declared-type position](#sec-written-declared-type-positions) ([§17.7](#sec-the-new-operator), v0.296) whose written type is an integer type is one (`var x: long := 3_000_000_000;`, a typed field initializer, a default argument, an assignment to `x: long`, a `return` in a method returning `long`, an expression body under `: long`, a lambda's `: long` ascription ([§27.3](#sec-lambda-expressions)), a call argument, a record positional argument), as are the two component-typed sites beside the family that §5.1 names, a collection-literal element and an enum constant value ([§10.2](#sec-explicit-values)); the governing rule remains §5.1's — and it participates in overload-resolution applicability on the same terms ([§22.6](#sec-overloading)): `f(3_000_000_000)` against `f(long)` and `f(double)` selects `f(long)`, the `double` candidate being inapplicable because the constant is admitted at integer targets only. The suffix discipline's purpose (no *accidental* width) is preserved: the wider type is taken only from a written integer target, and the value is range-checked against it. In an **untyped** context (`var x := 3_000_000_000;`), and at a non-integer target (`var d: double := 3_000_000_000;`), the literal is a compile error directing to a suffix (`3_000_000_000L`, which then converts by §5.1).
 
 <a id="sec-floating-point-types"></a>
 ### 4.3 Floating-point types
@@ -687,7 +687,7 @@ The following are **never implicit**:
 - Between an enum and its underlying integer.
 - Between integers and `bool`.
 
-**Constant narrowing.** An expression of integer type that is a **compile-time constant** ([§17.14](#sec-constant-expressions)) implicitly converts to any integer type whose range contains its value: `var b: byte := 50;`, `Set(level: byte)` called as `Set(3)`, and enum constants of the underlying type ([§10.2](#sec-explicit-values)) are all well-typed by this rule. The rule is **value-based, not type-based**: the source may be a compile-time constant of **any** integer type — not only `int` — and the target any integer type whose range contains the value, **across signedness** (`const N: long := 8; var b: byte := N;` is well-typed; a `uint`-typed constant `7` is admissible where `int` is expected); for non-constant expressions the conversion table and the never-implicit list above govern unchanged. A constant whose value does not fit the target's range is a **compile error** at the conversion site — never a silent truncation. The rule applies to constants only; a run-time `int` value still requires the explicit `byte(x)` narrowing of [§5.2](#sec-explicit-conversions). Constant narrowing applies at **every** position where this section's implicit conversions apply — there is no position carve-out: initializers, assignments, call arguments (`Set(3)`), returns, record positional arguments, collection-literal elements ([§15.4](#sec-collection-literals)), and default arguments — and it participates in overload-resolution applicability ([§22.6](#sec-overloading)) and in the nullable lifting below. An unsuffixed literal beyond `int`'s range — [§4.2](#sec-integer-types)'s target-typed integer constant — is admitted by this rule wherever it applies; what it additionally requires is a **written** integer target, so an untyped context (`var x := …`) and a non-integer target remain the §4.2 error.
+**Constant narrowing.** An expression of integer type that is a **compile-time constant** ([§17.14](#sec-constant-expressions)) implicitly converts to any integer type whose range contains its value: `var b: byte := 50;`, `Set(level: byte)` called as `Set(3)`, and enum constants of the underlying type ([§10.2](#sec-explicit-values)) are all well-typed by this rule. The rule is **value-based, not type-based**: the source may be a compile-time constant of **any** integer type — not only `int` — and the target any integer type whose range contains the value, **across signedness** (`const N: long := 8; var b: byte := N;` is well-typed; a `uint`-typed constant `7` is admissible where `int` is expected); for non-constant expressions the conversion table and the never-implicit list above govern unchanged. A constant whose value does not fit the target's range is a **compile error** at the conversion site — never a silent truncation. The rule applies to constants only; a run-time `int` value still requires the explicit `byte(x)` narrowing of [§5.2](#sec-explicit-conversions). Constant narrowing applies at **every** position where this section's implicit conversions apply — there is no position carve-out: initializers, assignments, call arguments (`Set(3)`), returns, record positional arguments, collection-literal elements ([§15.4](#sec-collection-literals)), and default arguments — the list is illustrative, not closed: it covers every [written-declared-type position](#sec-written-declared-type-positions) ([§17.7](#sec-the-new-operator), v0.296) and the two component-typed sites beside that family (a collection-literal element, an enum constant value), and applies equally wherever else this section's conversions apply — and it participates in overload-resolution applicability ([§22.6](#sec-overloading)) and in the nullable lifting below. An unsuffixed literal beyond `int`'s range — [§4.2](#sec-integer-types)'s target-typed integer constant — is admitted by this rule wherever it applies; what it additionally requires is a **written** integer target, so an untyped context (`var x := …`) and a non-integer target remain the §4.2 error.
 
 **Nullable conversions.** For any type `T`, `T` implicitly converts to `T?`: for a reference type, the same reference viewed as nullable ([§7.1](#sec-non-nullable-and-nullable-types)); for a value type, the present-value wrapping ([§7.2](#sec-nullable-value-types)). Each implicit conversion of this section also **lifts** to the nullable forms: `S?` implicitly converts to `T?` whenever `S` implicitly converts to `T` — a present value converts by the underlying conversion, `null` converts to `null` (`int?` → `long?`); constant narrowing (above) participates for a present constant value. The two rules compose through at most one `?` on each side ([§7.10](#sec-generics-and-nullability): `?` is idempotent): `S` converts to `T?` via `S → T → T?`, so an `int` is admissible where a `long?` is expected.
 
@@ -2642,9 +2642,17 @@ one **agreement rule** stated after them.
      against `p: I<X>`) — a non-unique instantiation is never resolved by
      choice (*Agreement* below); cast the argument to the intended
      instantiation or supply explicit type arguments (v0.292);
-   - a function-typed parameter unifies component-wise; modifier slots
-     (`owned`/`ref`/`out`/`out owned`/`scoped`) must match exactly
-     ([§27.1](#sec-function-types));
+   - a function-typed parameter unifies component-wise — each parameter
+     slot against the argument's slot in order, the return slot against the
+     return slot — and only against a function type of the **same parameter
+     count**: an argument whose function type has a different number of
+     parameter slots reaches no unification, and the candidate is
+     **inapplicable** — an inference failure that drops it out (*Interaction
+     with overloading* below), never an error reported at that candidate
+     (v0.296; the same at every function-typed position —
+     [§22.6](#sec-overloading)'s *Parameter count at a function-typed
+     position*); modifier slots (`owned`/`ref`/`out`/`out owned`/`scoped`)
+     must match exactly ([§27.1](#sec-function-types));
    - a `ref` or `out` parameter position unifies **exactly**: the parameter
      aliases the caller's location, so no conversion is admitted at the
      binding or later at the applicability check
@@ -2677,8 +2685,10 @@ one **agreement rule** stated after them.
    against the substituted target per [§27.6](#sec-method-references); type
    parameters free in that target are bound by the winning candidate's
    signature under the exact-preferred ranking of
-   [§27.6](#sec-method-references-to-overloaded-methods). If a
-   lambda's parameter positions are still open after this phase, inference
+   [§27.6](#sec-method-references-to-overloaded-methods) — and the formed
+   reference then ranks among the *callee's* candidates as
+   [§22.6](#sec-overloading)'s *Method-reference arguments* states (v0.296).
+   If a lambda's parameter positions are still open after this phase, inference
    fails: annotate the lambda's parameters or supply explicit type arguments.
    Two shapes contribute **no return binding** (v0.292). A lambda whose
    body — its expression body, or a `return` operand — is a **collection
@@ -2714,7 +2724,11 @@ one **agreement rule** stated after them.
    argument position whose parameter type is closed once the enclosing call's
    own phase-1 bindings are applied — [§17.7](#sec-the-new-operator)'s
    `new()`-shorthand contexts, extended by typed assignments and determined
-   argument positions. The target never overrides an argument-derived binding;
+   argument positions — groups (i), (ii), (iii), (iv), (vi) and the `return e;`
+   statement of (v) of the
+   [written-declared-type family](#sec-written-declared-type-positions)
+   (v0.296; this list is §14.5's own). The target never overrides an
+   argument-derived binding;
    it only completes. A type parameter that remains unbound — it appears in no
    self-determined argument position and no target context supplies it — is a
    compile error naming the parameter: supply explicit type arguments, or give
@@ -3498,7 +3512,10 @@ private owned _config: Config := new(verbose := true);   //   value is `owned` (
 var xs: Array<int> := new();
 ```
 
-The shorthand is permitted in field initializers, typed local-variable declarations, return statements (when the method has a declared return type), and default parameter values. It is not permitted in general expression contexts where the type would have to be inferred from broader context (overload resolution, `var` without annotation).
+<a id="sec-written-declared-type-positions"></a>
+**The written-declared-type positions (v0.296).** Several rules let a *written* declared type flow inward into the expression at a position; each names its own subset of one family, defined here once. The **written-declared-type positions** are: (i) a **typed field initializer**; (ii) a **typed local initializer** — a `var`/`const` declaration with a written type, and each ascribed clause of a binding atom ([§17.15](#sec-the-binding-atom)); (iii) a **default parameter value**; (iv) a **typed assignment target**; (v) the **declared-result positions** of [§35.3](#sec-choice-construction), as that section defines them — a `return e;` operand under a declared return type, a member's or accessor's expression body checked against a declared type ([§22.2](#sec-expression-bodied-methods), [§23.2](#sec-expression-bodied-read-only-properties), [§23.3](#sec-block-form-properties), [§23.4](#sec-indexers)), and a `return` operand or expression body checked against a lambda's return-type ascription ([§27.3](#sec-lambda-expressions)); in an `async` body the written type at the position is the declared `Task<T>`'s result type, per §35.3; and (vi) an **argument at a determined parameter type** — a non-generic candidate's declared parameter type, or a generic candidate's once [§14.5](#sec-type-argument-inference)'s bindings are substituted (a record positional argument is one). A lambda whose return type arrives only by target inference, a `var` initializer without a written type, and a subexpression of any of these positions are outside the family. The subsets, each stated at its own rule: the `new()` shorthand below takes (i), (ii), (iii) and the `return e;` statement of (v); [§35.3](#sec-choice-construction)'s case reading takes (v) alone; [§4.2](#sec-integer-types)'s target-typed integer constant reaches every position of the family whose written type is an integer type, among the sites [§5.1](#sec-implicit-conversions) governs; [§14.5](#sec-type-argument-inference)'s target contexts are (i), (ii), (iii), (iv), (vi) and the `return e;` statement of (v) — its own list, kept there.
+
+The shorthand is permitted at the written-declared-type positions (i), (ii), (iii) and the `return e;` statement of (v) above: field initializers, typed local-variable declarations, default parameter values, and return statements (when the method has a declared return type). It is **not** permitted at an expression body or at a lambda's ascribed return (the family's other declared-result members — the case reading of [§35.3](#sec-choice-construction) takes all three, this shorthand takes only the statement), nor at a typed assignment target (`xs := new();` — [§14.5](#sec-type-argument-inference)'s target contexts include assignments; this shorthand does not), nor in general expression contexts where the type would have to be inferred from broader context (overload resolution, `var` without annotation).
 
 <a id="sec-the-null-forgiving-operator"></a>
 ### 17.8 The null-forgiving operator `!`
@@ -4847,7 +4864,16 @@ the candidate's return slot, implicitly converts to it
 ([§14.5](#sec-type-argument-inference) phase 2 — a return slot containing a
 free type parameter); for a procedure slot (`-> ()`),
 [§27.3](#sec-lambda-expressions)'s value/procedure classification decides
-instead. The candidate is **exact** at the position when the inferred return
+instead — an expression-bodied lambda whose body is not of type `()` is
+**applicable** at a procedure slot (`-> ()`) as
+[§27.3](#sec-lambda-expressions)'s result-discarding procedure lambda and ranks
+*converting* there, while a unit-typed body or a `: ()` ascription is exact and
+a block-bodied lambda that returns a value is inapplicable (v0.296):
+`M(f: () -> ())` beside `M(f: () -> int)` on `M(lambda() => 42)` resolves to
+the second, exact where the first converts; for an `async` lambda at a `-> Task`
+slot [§30.6](#sec-async-lambdas)'s closed-slot conformance decides
+applicability instead — a valued body does not conform to `Task`. The candidate
+is **exact** at the position when the inferred return
 type equals the return slot after type-argument substitution, and *converting*
 otherwise — which is how `xs.Average(lambda(x) => x * 2)` over an `Array<int>`
 selects the `(T) -> int` overload of the stdlib `Average` family: the
@@ -4864,13 +4890,63 @@ there (`M(f: (int) -> Array<int>)` beside `M(f: (int) -> Set<int>)`, called as
 `M(lambda(x) => [x])`) fall to the ambiguity below, remedied by a block body
 whose explicitly typed local names the collection.
 
+**Method-reference arguments (v0.296).** A method-reference argument
+([§27.6](#sec-method-references)) likewise has no static type of its own until
+it is formed against a target; at an overloaded callee it is formed **per
+candidate** against that candidate's parameter type — the substituted type, for
+a generic candidate ([§14.5](#sec-type-argument-inference) phase 2, which binds
+the slot's free type parameters from the selected overload's signature); the
+declared type, for a non-generic one — and it ranks as a lambda literal does.
+The candidate is **applicable** at the position when formation succeeds under
+§27.6's criteria — signature equality, or an adapter the compiler synthesizes at
+the formation site for a [§5.1](#sec-implicit-conversions) conversion at a
+parameter or return slot (`Task<Todo?>` at a `Task` slot is the ordinary
+derived-to-base reference conversion), with modifier slots matching exactly and
+[§27.1.1](#sec-function-type-assignability)'s mint-announcing family boundary
+respected at the return slot. Where the referenced name is overloaded,
+[§27.6](#sec-method-references-to-overloaded-methods)'s exact-preferred ranking
+selects the reference's overload against the candidate's slot first; where that
+ranking finds no unique winner against a candidate's slot, **formation fails at
+that candidate** and the candidate is inapplicable at the position — the
+drop-out of an inference failure ([§14.5](#sec-type-argument-inference)'s
+*Interaction with overloading*), never an error reported at that candidate;
+§27.6's ambiguity is reported only where the reference has a single target. The
+candidate is **exact** at the position when the selected signature equals the
+slot, slot for slot, after type-argument substitution, and *converting*
+otherwise. So against `Get<A, R>(route: string, h: (A) -> Task<R>)` beside
+`Get<A>(route: string, h: (A) -> Task, status: int := 204)`, the reference
+`GetById: (int) -> Task<Todo?>` binds `A := int, R := Todo?` at the first and
+is exact there, binds `A := int` at the second and converts there
+(`Task<Todo?>` → `Task`), and the first is unambiguously better — the
+exact-match ranking decides before the defaulted-arity tie-break is reached.
+Where two candidates are exact at a method-reference position, the explicit-cast
+remedy below is inexpressible — a reference has no static type to cast — so the
+diagnostic names the reference remedies instead: an explicit type-argument list
+on the call, or a lambda that spells the intended overload
+([§27.6](#sec-method-references-to-overloaded-methods)'s own disambiguation).
+§27.6's exact-preferred ranking is the mirror direction (which overload of the
+*reference* is selected against one target); this paragraph is the callee's
+direction.
+
+**Parameter count at a function-typed position (v0.296).** Whatever the
+argument's form — a function-typed value, a lambda literal, a method reference —
+a candidate whose function-typed slot has a different number of parameter slots
+from the argument's (a value's or reference's parameter slots; a lambda's
+parameter count) is **inapplicable** at that position, exactly as a candidate
+whose parameter type admits no conversion is, and never an error reported at
+that candidate ([§14.5](#sec-type-argument-inference)'s phase-1 bullet states it
+for a function-typed **value** at a generic candidate; a lambda literal and a
+method reference reach the slot at phase 2, where the same count prerequisite
+governs; [§27.1.1](#sec-function-type-assignability)'s rules are slot-wise over
+equal counts, so no conversion crosses a count difference).
+
 A candidate is **unambiguously better** than another when it is better-or-equal on every argument position and strictly better (an exact match where the other converts) on at least one. The call resolves to a candidate that is unambiguously better than every other applicable candidate.
 
 **Defaulted-arity tie-break.** When the applicable candidates differ in whether defaults must be filled for omitted optional parameters ([§22.5](#sec-optional-parameters-and-named-arguments)), one further comparison applies before declaring ambiguity: a candidate applicable **without filling any default** is preferred over a candidate that fills one or more, provided the no-defaults candidate is better-or-equal at every supplied-argument position under the ranking above. `M(5)` against `M(n: int)` and `M(n: int, m: int := 0)` resolves to `M(int)` — without this rule the call would be permanently ambiguous, and the explicit-cast remedy below cannot express "the fewer-parameter candidate". The tie-break distinguishes only all-arguments-supplied from some-defaults-filled; two candidates that both fill defaults remain subject to the ambiguity rule (the compiler declines to guess which omission the caller meant). This is C#'s rule, adopted with C#'s reasoning: adding an optional parameter to an overload set must not break existing calls that were exact against the shorter signature. The tie-break also separates generic from non-generic candidates, and does so **before** the non-generic-over-generic preference (the generic-candidates paragraph above): `M(5)` against `M(n: int, m: int := 0)` and `M<T>(x: T)` resolves to the generic — the candidate that fills no default — so this rule's compatibility reasoning holds for generic overload sets too.
 
 If no candidate is unambiguously better — because each of two candidates is exact on a different argument, or because the remaining candidates all rely on implicit conversions that this rule treats as equally ranked — the call is **ambiguous** and is a compile error. The compiler reports the error and cites the candidate overloads; it never silently selects one. The caller resolves the ambiguity by adding an explicit cast ([§5.2](#sec-explicit-conversions)) to an argument so that exactly one candidate becomes an exact match (or so that all but one candidate become inapplicable). One exception: at an ambiguity between the two members of an ordinary-`owned` pair — clauses (3) and (4) of the ownership-mode applicability rule above — the explicit-cast remedy is inexpressible, the pair's parameter types being identical, so the diagnostic instead names the ownership-mode remedies: bind first and pass the binding (the plain member), or transfer a named owned binding with `M(move x)` (the owned member).
 
-If no candidate is applicable at all — every candidate would require a conversion that §5.1 does not admit as implicit — the call is a compile error with no candidates cited, because no overload was reachable.
+If no candidate is applicable at all — no candidate is reachable: a conversion §5.1 does not admit as implicit, a parameter-count difference at a function-typed slot, a method-reference formation that fails, or an inference that finds no binding (v0.296) — the call is a compile error with no candidates cited, because no overload was reachable.
 
 This mirrors the resolution of overloaded method references ([§27.6](#sec-method-references-to-overloaded-methods)), where the absence of a unique winner is likewise a compile error citing the candidates, and it follows the same "explicit over implicit" stance that motivates Bezel's omission of user-defined conversion operators ([§25.4](#sec-no-user-defined-conversion-operators)): when two overloads serve a call equally well, the compiler declines to guess and requires the call site to be explicit.
 
@@ -6110,7 +6186,7 @@ var handler: (itemId: int, quantity: int, priority: int) -> bool;
 <a id="sec-function-type-assignability"></a>
 #### 27.1.1 Function-type assignability
 
-A function-typed **value** may be used where a different function type is expected under one narrow variance rule; everything else requires an exact match:
+A function-typed **value** may be used where a different function type is expected under one narrow variance rule; everything else requires an exact match — and every rule below is slot-wise over **equal parameter counts**: a value is never usable at a function type with a different number of parameter slots, whatever the slots' types (stated v0.296; at an overloaded call [§22.6](#sec-implicit-conversion-ranking)'s *Parameter count at a function-typed position* makes such a candidate inapplicable at the position):
 
 - **Parameter slots** of class or interface type are **contravariant**: the target's parameter type must implicitly *reference*-convert to the value's ([§5.1](#sec-implicit-conversions), reference conversions only) — a `(Animal) -> ()` value is usable where `(Dog) -> ()` is expected.
 - The **return slot**, when of class or interface type, is **covariant**: the value's return type must implicitly reference-convert to the target's — a `() -> Dog` value is usable as `() -> Animal`.
@@ -6184,7 +6260,7 @@ Expression-bodied lambdas need no inference rule: the body expression's type is 
 
 **Admission at a target-typed non-call position (v0.292).** A lambda literal at a position that supplies a function-typed target other than a call argument — the initializer of a declared function-typed local or field, an assignment to a function-typed location, a `return` against a declared function-typed return type — is admitted under the argument-position rule of [§14.5](#sec-type-argument-inference) phase 2 and [§22.6](#sec-overloading) (*Lambda-literal arguments*): its parameters take the target's parameter types ([§27.4](#sec-parameter-type-inference)), the body is typed, and its inferred return type must equal the target's return slot or implicitly convert to it ([§5.1](#sec-implicit-conversions)); otherwise the lambda is a compile error at the position (`var f: (int) -> long := lambda(x) => x * 2;` is admitted, the `int` body widening to `long`). The conversion is admitted for the reason [§27.1.1](#sec-function-type-assignability) gives for method-reference formation — the compiler types the body at the site and can bridge it; a function-typed **value** at the same position is not a literal and takes §27.1.1's narrower rule unchanged. An ascribed lambda's ascription is its written return type and must agree with the target as the ascription paragraph above states — judged as a value's return type under §27.1.1 — so an ascription narrows what the position admits: `var g: (int) -> long := lambda(x): int => x * 2;` is rejected where the unascribed form is admitted.
 
-For procedure lambdas, the body may also be a single expression whose result is discarded:
+For procedure lambdas, the body may also be a single expression whose result is discarded — a target-driven classification: at an overloaded call such a lambda is applicable at a procedure slot (`-> ()`) and ranks *converting* there ([§22.6](#sec-overloading) *Lambda-literal arguments*, v0.296); the discarded result is under [§21.9](#sec-statement-form-of-expressions)'s expression-statement regime — a warning for a copyable, `string`, runtime-managed or trivial-dispose result, and for a non-trivial-dispose class, an interface-typed or a `Task`-family result the hard error directing to `_ := …` or `using var _ := …` ([§17.13](#sec-the-discard-_)) in a block body (v0.296):
 ```bezel
 var log := lambda(msg: string) => Console.WriteLine(msg);
 ```
@@ -6287,7 +6363,13 @@ ambiguous and the compiler reports the candidates. This is the
 **exact-preferred ranking** that [§14.5](#sec-type-argument-inference) phase 2
 cites: `numbers.OrderBy(Math.Abs)` over `Array<int>` selects `Abs(int): int` —
 exact at the closed parameter position, binding `TKey := int` — and the
-converting overloads lose to it.
+converting overloads lose to it. The mirror direction — how a formed reference
+ranks among the *callee's* overloads when it is an argument to an overloaded
+call — is [§22.6](#sec-implicit-conversion-ranking)'s *Method-reference
+arguments* (v0.296): exact where the selected overload's signature equals the
+substituted slot, converting where formation bridges a conversion; a candidate
+against whose slot this ranking finds no unique winner is inapplicable there,
+and the ambiguity above is reported only at a single target.
 
 When no target type is available (e.g., `var f := Math.Abs;` with no annotation), the reference is ambiguous and the compiler reports an error pointing to the candidate overloads. The user disambiguates by adding a type annotation: `var f: (int) -> int := Math.Abs;`.
 
@@ -8581,7 +8663,9 @@ var loader: (string) -> OwningTask<Resource> := async lambda(path) => do
 end;
 ```
 
-The function type of an async lambda has a `Task`, `Task<T>`, or `OwningTask<T>` return type. The choice follows the same rules as for async methods ([§30.1](#sec-async-methods)): `Task` for void, `Task<T>` for borrowing or value-typed results, `OwningTask<T>` for class-typed results that transfer ownership to the awaiter (Pattern B; see [§30.5](#sec-result-lifetime-and-task-disposal)). The parameter slots of an async lambda's function type are plain, `owned`, or `scoped` only: a target type carrying a `ref` or `out` slot is rejected for an `async` lambda ([§30.1](#sec-async-methods)).
+The function type of an async lambda has a `Task`, `Task<T>`, or `OwningTask<T>` return type. The choice follows the same rules as for async methods ([§30.1](#sec-async-methods)): `Task` for void, `Task<T>` for borrowing or value-typed results, `OwningTask<T>` for class-typed results that transfer ownership to the awaiter (Pattern B; see [§30.5](#sec-result-lifetime-and-task-disposal)).
+
+**Which wrapper, and from where (v0.296).** An `async` method writes its wrapper; an `async` lambda's is fixed by the first of three sources that applies. (1) A **return-type ascription** ([§27.3](#sec-lambda-expressions)) names it. (2) Otherwise a **closed target return slot** names it — any position supplying a closed function-typed target ([§27.3](#sec-lambda-expressions)'s non-call positions; a call candidate's parameter type once [§14.5](#sec-type-argument-inference)'s bindings are substituted, [§22.6](#sec-overloading)) whose return slot contains no free type parameter — and the body must conform to the named type exactly as an `async` method's body conforms to its declared type under [§30.1](#sec-async-methods) and [§30.5](#sec-result-lifetime-and-task-disposal): a fresh owned class result is admitted under either `Task<C>` (Pattern A, kind 1 — the task owns the result) or `OwningTask<C>` (Pattern B), so the target decides between them, and a valued body does not conform to a plain `Task`; a closed head binds nothing, so reading it is reading a declared type, not an inference. At an overloaded call, two closed candidates that differ only in the wrapper are both exact for a fresh-owned-class body and fall to [§22.6](#sec-overloading)'s ambiguity, remedied by an ascription. (3) Otherwise — no target, or a target return slot that still contains a **free type parameter** — the wrapper follows from the **body alone**, by the sentence above. That inferred type then unifies against the slot as any lambda's inferred return type does ([§14.5](#sec-type-argument-inference) phase 2): `async lambda(x: int) => 42` at an `(int) -> Task<R>` slot binds `R := int`; `async lambda(req: HttpRequest) => Http.Text("ok")`, whose body is a fresh owned class result, infers `(HttpRequest) -> OwningTask<HttpResponse>`, which reaches no instantiation of `Task<T>` ([§30.3](#sec-the-task-taskt-and-ownedtaskt-types): `Task<T>` and `OwningTask<T>` are siblings under `Task`) — that candidate is **inapplicable**, and a sibling candidate whose slot is `(A) -> OwningTask<HttpResponse>` is the one that applies. The head of a free slot is never read as the wrapper: a written `Task<R>` names no declared type for the body until `R` is bound, and binding `R` from the head would be a target-directed inference §14.5 does not have. A fresh-owned-class body meant for a `Task<R>` slot says so with an ascription (`async lambda(req: HttpRequest): Task<HttpResponse> => …` — source (1), binding `R := HttpResponse`) or with an explicit type-argument list. The parameter slots of an async lambda's function type are plain, `owned`, or `scoped` only: a target type carrying a `ref` or `out` slot is rejected for an `async` lambda ([§30.1](#sec-async-methods)).
 
 <a id="sec-asynchronous-programming-async-iterators"></a>
 ### 30.7 Async iterators
@@ -10249,7 +10333,7 @@ Construction is qualified, resolving exactly as enum constants do ([§10.1](#sec
 
 **Declared-result target-typing (v0.233).** In a **declared-result position** — the top-level operand of a `return e;` statement in a body with a declared return type ([§21.7](#sec-the-return-statement)); the expression body of a member or accessor checked against a declared type ([§22.2](#sec-expression-bodied-methods), [§23.2](#sec-expression-bodied-read-only-properties), [§23.3](#sec-block-form-properties), indexers per [§23.4](#sec-indexers)); or a `return e;` statement or expression body checked against a lambda's **return-type ascription** ([§27.3](#sec-lambda-expressions)) — where the declared type — for an `async` body, the declared `Task<T>`'s result type, per [§30.1](#sec-async-methods)'s completion rule — nullability stripped, is a **choice instantiation** `C<…>` (or non-generic choice `C`) that declares a case named `N`: the form `N(args)` is a **case construction** of `C<…>.N(args)`, and the bare identifier `N` is the payload-free case value `C<…>.N`. The declared type supplies the choice type and all its type arguments whole; nothing is inferred from the construction's arguments ([§14.5](#sec-type-argument-inference)'s posture above is untouched), and partial qualification does not join the family — `Result.Ok(v)`, the generic type with no arguments, remains an error; the admitted spellings are the fully qualified form and the bare case name. Payload-argument binding and ownership are exactly the qualified form's (below): the form is resolved to a case construction before classification or any ownership rule runs. A declared nullable `C<…>?` target-types through the stripped form and the result converts by [§5.1](#sec-implicit-conversions)'s `T → T?` wrapping. The rule reads the declared type **as written**, with the enclosing declaration's type parameters rigid: it does not fire on a bare type parameter (`method M<R>(): R` declares no choice), while a written choice instantiation inside a generic body (`method M<T>(): Result<T, string>`) fires normally; a non-`async` method declared over a `Task`-family type returns a task, not a choice, so the case reading never fires in its body. When the declared type is not a choice, or is a choice without a case of the written name, the form is an ordinary expression under ordinary resolution — nothing changes. Within a declared-result position whose type *is* such a choice, the case reading is **authoritative**: it wins over any same-named local, parameter, member, or type in scope, and the compiler warns on such shadowing — naming the case and the shadowed declaration, with the remedy (qualify the intended member call, bind its result to a differently-named local first, or rename the shadowed binding — a local or parameter cannot be qualified). A payload case written bare, or a payload-free case written with an argument list, is the arity error [§35.5](#sec-choice-matching) names on the pattern side. The qualified construction remains valid everywhere.
 
-The case reading does not extend beyond the written-declared-type family: not to lambdas whose return type arrives only by target inference (no ascription written), not to argument position (the [§17.7](#sec-the-new-operator) `new()` shorthand draws the same line), not to `var` initialization, typed local declarations, field initializers, or default parameter values, and not to subexpression positions within a return operand — in `return (if c then Ok(v) else Error(e));` the branches are operands of the `(if …)` atom ([§20](#sec-the-if-expression)) and resolve ordinarily; write two `return` statements, or the qualified form. (A redundant parenthesized grouping around the whole operand — `return (Ok(v));` — is transparent for this purpose.) Outside the family a bare case-named form keeps its ordinary resolution (or its ordinary-resolution error); when that error arises in a body whose declared result type is a choice with the written case name, the diagnostic carries a note naming the two remedies (move the construction to a declared-result position, or qualify it).
+The case reading takes exactly the **declared-result** group — group (v) — of the [written-declared-type positions](#sec-written-declared-type-positions) ([§17.7](#sec-the-new-operator), v0.296) and does not extend beyond it: not to lambdas whose return type arrives only by target inference (no ascription written), not to argument position (the [§17.7](#sec-the-new-operator) `new()` shorthand draws the same line), not to `var` initialization, typed local declarations, field initializers, default parameter values, or typed assignment targets (the family's other groups — the `new()` shorthand takes three of them, this rule none), and not to subexpression positions within a return operand — in `return (if c then Ok(v) else Error(e));` the branches are operands of the `(if …)` atom ([§20](#sec-the-if-expression)) and resolve ordinarily; write two `return` statements, or the qualified form. (A redundant parenthesized grouping around the whole operand — `return (Ok(v));` — is transparent for this purpose.) Outside the family a bare case-named form keeps its ordinary resolution (or its ordinary-resolution error); when that error arises in a body whose declared result type is a choice with the written case name, the diagnostic carries a note naming the two remedies (move the construction to a declared-result position, or qualify it).
 
 ```bezel
 // Declared-result positions: the declared type supplies Result<int, string> whole.

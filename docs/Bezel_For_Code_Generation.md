@@ -1,6 +1,6 @@
 # Bezel for Code Generation
 
-*Validated against v0.295. Companion to the Bezel Language Specification — a writing reference, not a normative document.*
+*Validated against v0.296. Companion to the Bezel Language Specification — a writing reference, not a normative document.*
 
 A dense reference for writing correct Bezel without reading the spec. It covers the syntax surface, the ownership rules, the standard-library name index, the idioms that work, and the shapes that look right and are rejected.
 
@@ -331,6 +331,8 @@ nameof(amount)   typeof(BankAccount)   default(int)
 int.Parse(s)   int.MaxValue   short(x)   long?(n)    // primitive keyword in expression position; casts
 this   base.Speak()
 ```
+
+`new()` — the target-typed shorthand — is admitted at a typed field or local initializer (the two forms the compiler accepts today), and by §17.7 (v0.296) also at a default parameter value and as a `return new();` statement under a declared return type — those two are spec-defined and not yet accepted by the compiler. It is **not** admitted at an expression body (`=> new()`), an ascribed lambda's return, an assignment target (`xs := new();`) or an argument.
 
 The paren atoms:
 
@@ -1793,7 +1795,7 @@ r.Append(move new Widget());             // ERROR: a fresh producer announces it
 return move fresh;                       // ERROR: `return` under `owned` is a marker-free position
 ```
 
-> §22.6: ordinary-parameter `owned` distinguishes overloads (under the erasure declaration guard — `where T: class` does **not** qualify, since it admits `string`); `owned` on an `out` parameter and `scoped` never do. The library's convention is **distinct names** for the borrow/take pair: `TryGetValue` vs `TryPopValue`, `TryPeek` vs `TryPop`/`TryDequeue`.
+> §22.6: ordinary-parameter `owned` distinguishes overloads (under the erasure declaration guard — `where T: class` does **not** qualify, since it admits `string`); `owned` on an `out` parameter and `scoped` never do. The library's convention is **distinct names** for the borrow/take pair: `TryGetValue` vs `TryPopValue`, `TryPeek` vs `TryPop`/`TryDequeue`. §22.6/§14.5 (v0.296): a method-reference argument ranks at an overloaded callee as a lambda literal does — exact where its signature equals the (substituted) slot, converting where formation bridges (`Task<X>` → `Task`) — and a candidate whose function-typed slot has a different parameter count from the argument's is simply inapplicable, so an overload family keyed on handler arity resolves to the one member that fits.
 
 ```bezel
 method TryGetCached(k: string, out v: Conn? when true): bool;        // borrow
@@ -2056,4 +2058,4 @@ Through v0.245 the marker was spelled `owned` at binding positions. After v0.246
 - **`OwningTask<T>` for class T — Pattern B:** the task produces a single **owned** result; awaiting transfers ownership, and the await must appear in an owned-consuming context (`using var x := await …`, `var x := await …`, an `owned` argument or slot store, a `return` under `owned T`, an owning `yield return`, or `_ := await …;`). The task may be awaited at most once for a successful result; a second await raises `InvalidOperationException`. The await **consumes its operand** when that operand is an owned task value — and the position is marker-free, so it takes **no `move`**.
 - `OwningTask<T>` over a value, `string`, or runtime-managed T is a compile error, as is either task type over a **move-only** value (an owning choice, an owning inline array).
 
-Choose by intent: `OwningTask<T>` for resource acquisition (one fresh single-consumer result), `Task<T>` for fan-out (several subscribers reading the same eventual result).
+Choose by intent: `OwningTask<T>` for resource acquisition (one fresh single-consumer result), `Task<T>` for fan-out (several subscribers reading the same eventual result). An `async` **lambda** takes its wrapper from its ascription, else from a closed target slot, else from its own body — and a body returning a fresh owned class infers `OwningTask<C>`, so at a generic `(…) -> Task<R>` slot such a lambda is **inapplicable** (the candidate drops out): write `async lambda(x): Task<C> => …` to bind `R` (§30.6, v0.296).
