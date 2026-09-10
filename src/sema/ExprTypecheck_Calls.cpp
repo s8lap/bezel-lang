@@ -1090,9 +1090,55 @@ void unifyArgSubst(
     if (!pt->genericArgs.empty() &&
         argTy->kind == TypeRef::Kind::Named &&
         argTy->genericArgs.size() == pt->genericArgs.size()) {
-        for (std::size_t i = 0; i < pt->genericArgs.size(); ++i)
-            unifyArgSubst(pt->genericArgs[i].get(), argTy->genericArgs[i],
-                          paramNames, argSubst, ctx, conflicts);
+        // fix #4089/#4090 (§14.5 phase 1, v0.296): "unifies ... invariantly
+        // against an argument of the SAME generic type" — same HEAD, not
+        // merely the same generic-argument count. Without this guard, a
+        // declared `Task<R>` parameter position unified against an
+        // `OwningTask<Widget>` argument purely because both are single-
+        // generic-argument Named types, binding R to Widget even though
+        // OwningTask is not an instantiation of Task<T> (they are siblings
+        // under Task — stdlib §30.3) — a silently WRONG substitution that let
+        // a call proceed with a Task<R>/OwningTask<C> ABI mismatch (measured:
+        // an async-lambda producing a fresh owned class at a free `Task<R>`
+        // slot bound R to the class and read garbage downstream through the
+        // mismatched layout). A head mismatch now contributes no binding —
+        // matching §22.6/§30.6's "reaches no instantiation ... inapplicable"
+        // outcome for the single-candidate inference case (below).
+        std::string_view ptHead;
+        if (pt->name && !pt->name->parts.empty()) ptHead = pt->name->parts.back();
+        if (ptHead.empty() || ptHead == argTy->headName()) {
+            for (std::size_t i = 0; i < pt->genericArgs.size(); ++i)
+                unifyArgSubst(pt->genericArgs[i].get(), argTy->genericArgs[i],
+                              paramNames, argSubst, ctx, conflicts);
+        }
+        return;
+    }
+    // fix #4089 (§14.5 phase 1 / §22.6 *Parameter count at a function-typed
+    // position*, v0.296): "a function-typed parameter unifies component-wise
+    // — each parameter slot against the argument's slot in order, the return
+    // slot against the return slot — and only against a function type of the
+    // SAME parameter count: an argument whose function type has a different
+    // number of parameter slots reaches no unification, and the candidate is
+    // inapplicable — an inference failure that drops it out ... never an
+    // error reported at that candidate." Before this arm, `unifyArgSubst` had
+    // no case for `ast::TypeKind::Function` at all, so a function-typed
+    // parameter (a method reference, a lambda already typed, or a plain
+    // function-typed value argument) contributed ZERO bindings — silently,
+    // regardless of whether the argument's own arity matched (§14.5's own
+    // phase-1 bullet is quoted above; this is that bullet, implemented).
+    if (pt->kind == ast::TypeKind::Function) {
+        if (argTy->kind != TypeRef::Kind::Function) return;
+        if (pt->funcParams.size() != argTy->funcParams.size()) return;  // drop out silently
+        for (std::size_t i = 0; i < pt->funcParams.size(); ++i) {
+            if (!pt->funcParams[i].type) continue;
+            TypeRef* argParamTy = argTy->funcParams[i].type;
+            if (argParamTy)
+                unifyArgSubst(pt->funcParams[i].type.get(), argParamTy,
+                              paramNames, argSubst, ctx, conflicts);
+        }
+        if (pt->funcReturn && argTy->funcReturn)
+            unifyArgSubst(pt->funcReturn.get(), argTy->funcReturn, paramNames,
+                          argSubst, ctx, conflicts);
     }
 }
 
@@ -3537,6 +3583,75 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     // Apply substitution to the (possibly compound) return type.
                     if (!argSubst.empty())
                         rt = substituteReturnType(rt, argSubst);
+                    // fix #4089/#4090 (§14.5/§22.6/§30.6, v0.296): a
+                    // function-typed argument's component-wise unification
+                    // (the Function arm above) can legitimately fail to bind
+                    // a type parameter that is mentioned ONLY inside a
+                    // function-typed parameter's slot — e.g. a fresh-owned-
+                    // class async-lambda body infers `OwningTask<C>` against
+                    // a declared `(A) -> Task<R>` slot, and `OwningTask<C>`
+                    // reaches no instantiation of `Task<T>` (siblings under
+                    // `Task`, stdlib §30.3), so R is never bound. Before this
+                    // check the call proceeded anyway: `collectBoundParamNames`
+                    // (consulted only by `inferReturnTargetTypeArgs`, far
+                    // below in this file) treats ANY syntactic mention inside
+                    // a function-typed parameter as "argument-bound" and so
+                    // never invokes target-based completion for it either —
+                    // so nothing ever reported the gap, and the call's result
+                    // type carried the raw, unsubstituted type parameter
+                    // straight through (measured: #4090's probe reached
+                    // codegen and returned a wrong value with no diagnostic
+                    // at all — `r.ToString()` on such a result resolved
+                    // against the bare parameter `R` rather than the actual
+                    // instantiation). This check fires ONLY for a parameter
+                    // genuinely mentioned in some ARGUMENT position (the
+                    // `mentionedInArg` test below) — a parameter that
+                    // appears ONLY in the return type is the existing,
+                    // legitimate "needs a target" case that
+                    // inferReturnTargetTypeArgs/reportNoTargetInferenceIfNeeded
+                    // already own, unchanged, elsewhere.
+                    if (!hadExplicitTypeArgs && !paramNames.empty()) {
+                        std::unordered_set<std::string_view> stillUnbound;
+                        for (const auto& gp : md->genericParams) {
+                            if (argSubst.count(gp.name)) continue;
+                            std::unordered_set<std::string_view> single{gp.name};
+                            // per §22.3/§14.5 #2266: `containsMethodTypeParam`
+                            // does NOT walk function-type param/return slots
+                            // (`refOutParamTypeMentionsTypeParam` is the
+                            // established superset that does — reused here
+                            // rather than growing a fourth private copy).
+                            if (!refOutParamTypeMentionsTypeParam(rt, single))
+                                continue;
+                            bool mentionedInArg = false;
+                            for (const auto& p2 : md->params) {
+                                if (!p2.type) continue;
+                                TypeRef* pty2 = ctx_.resolvedType(*p2.type);
+                                if (pty2 &&
+                                    refOutParamTypeMentionsTypeParam(pty2, single)) {
+                                    mentionedInArg = true;
+                                    break;
+                                }
+                            }
+                            if (mentionedInArg) stillUnbound.insert(gp.name);
+                        }
+                        if (!stillUnbound.empty()) {
+                            for (std::string_view nm : stillUnbound) {
+                                ctx_.diagnostics().report(
+                                    Severity::Error, ce.span.begin,
+                                    "cannot infer the type argument `" +
+                                    std::string(nm) + "` of `" +
+                                    std::string(md->name) + "`'s call — it "
+                                    "is mentioned only inside a function-"
+                                    "typed parameter's slot, and no "
+                                    "argument's actual shape bound it there "
+                                    "(§14.5, §22.6); supply an explicit type "
+                                    "argument, or give the function-typed "
+                                    "argument a return-type ascription that "
+                                    "names the intended type");
+                            }
+                            return;
+                        }
+                    }
                 }
                 ctx_.setExprType(&ce, rt);
             }
