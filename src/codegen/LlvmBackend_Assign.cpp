@@ -5045,6 +5045,25 @@ const ast::PropertyAccessor* Emitter::blockGetterOf(sema::Symbol* sym) {
 //     `return;` inside a nested body branches to it (LlvmBackend_Stmts.cpp
 //     ~1777). Latent (sema rejects a valueless return in a value-returning
 //     accessor) but a cross-function `br` if ever reached.
+//   * currentChoiceMethod_ — fix #4143 (§35.2/§35.5, v0.295), found by the R17
+//     review of fix #4113 (which ADDED this member without adding it here).
+//     `choiceTypeOf` (LlvmBackend_Setup.cpp) falls back to it to resolve a
+//     bare `this`/`base` at a choice property's three accessor call sites
+//     (LlvmBackend_Exprs.cpp inline getter read, `ensurePropertyAccessorFn`,
+//     `makePropertyThunk`). Unlike currentEnumMethod_ below, this one IS
+//     cleared here — see the member's own declaration comment
+//     (LlvmBackend_impl.hpp) and the NestedBodyScope struct's comment on
+//     `choiceMethod_` for the destructive-vs-soft-hint distinction that makes
+//     the two asymmetric. Repro: a class property (`Animal.Sound`, a BLOCK-
+//     form getter reached via `ensurePropertyBlockGetter`, one of this
+//     guard's six emitters) whose body is `case this of Dog => ..., Cat =>
+//     ...` printed the wildcard arm instead of the correct one when first
+//     touched from inside a `choice` property's getter window — the leaked
+//     `currentChoiceMethod_` (the CALLER's choice type) got folded into
+//     `Animal`'s own CaseExpr scrutinee TypeRef at LlvmBackend_Exprs2.cpp's
+//     "scrutTy not already a Choice" guard, silently reclassifying a class
+//     receiver as the wrong choice type. A crash would have been loud; this
+//     was a silent wrong answer.
 //
 // ── DELIBERATELY INHERITED (resetting these would be a NEW bug) ──
 // This list is the reason this guard is not simply "reset everything". Each
@@ -5061,14 +5080,30 @@ const ast::PropertyAccessor* Emitter::blockGetterOf(sema::Symbol* sym) {
 //     so a `new Foo<T>()` inside a getter body desynchronised the two halves)
 //     but likewise NOT cleared, for the same reason.
 //   * currentEnumMethod_ — `enumTypeOf` (LlvmBackend_Setup.cpp ~288) falls back
-//     to it to resolve a bare `this` in an enum member. The correct value
-//     inside a block getter is the getter's OWN owning type when that type is
-//     an enum (which is precisely what `ensurePropertyAccessorFn` sets for
-//     itself, #574) and null otherwise — NOT null unconditionally. The two
-//     block-getter entry points do not receive the owning `TypeSymbol`, so
-//     resetting it blind here would break a block-bodied ENUM property read
-//     from inside an enum member, which works today. Left inherited on
-//     purpose; #2702 item 3 stays open for the set-from-owner fix.
+//     to it to resolve a bare `this` in an enum member. DECLINED alongside
+//     the #4143 choice fix above rather than bundled with it (fix #4143
+//     revisited this entry and re-verified rather than trusting it as
+//     written): the original "resetting would break a block-bodied ENUM
+//     property, which works today" claim is now STALE — spec §10.5 forbids
+//     an enum from declaring ANY block-form or storage-backed property or
+//     indexer at all (confirmed mechanically: `enum E ... property P: int
+//     get => 7; end P; end E;` is REJECTED, "enum `E` may not declare a
+//     block-form property (§10.5)", also enforced by fix #2499), so none of
+//     this guard's six memoized builders can ever be reached with an
+//     enum-typed OWNING type for its own accessor — the scenario the old
+//     comment worried about is unreachable. But UNLIKE choice's leak, an
+//     enum's leaked value does not destructively overwrite the CaseExpr
+//     scrutinee TypeRef (there is no enum-side analogue of choice's "scrutTy
+//     not already a Choice" overwrite guard in LlvmBackend_Exprs2.cpp) — it
+//     only feeds `enumTy`, a separate parameter `patternMatches` consults to
+//     resolve a BARE identifier pattern as an enum-constant NAME
+//     (`enumConstantByName`). Whether a leaked cross-type `enumTy` can still
+//     cause a wrong match for some OTHER (class/record) body whose `case
+//     this` pattern names happen to collide with the leaked enum's constant
+//     names is a real but narrower and unmeasured question, out of scope for
+//     an unblocking fix — filed as a follow-up (#4143's issue) rather than
+//     guessed at and clobbered here. Left inherited; #2702 item 3 stays open
+//     for the set-from-owner fix that would make clearing it safe in general.
 //   * currentSpecMethodSymbol_ / emittingGenericTemplateBody_ /
 //     templateGenericParamNames_ — same shape as currentEnumMethod_: the right
 //     value depends on whether the getter's OWN owner is an unspecialised
@@ -5081,7 +5116,8 @@ Emitter::NestedBodyScope::NestedBodyScope(Emitter& e)
       retNode_(e.currentReturnTypeNode_),
       lamRet_(e.currentLambdaReturnSemaTy_),
       accessorRetNode_(e.accessorReturnTypeNode_),   // #2703
-      accessorRetFn_(e.accessorReturnTypeFn_)        // #2703
+      accessorRetFn_(e.accessorReturnTypeFn_),       // #2703
+      choiceMethod_(e.currentChoiceMethod_)          // #4143
 // fix #3551 (§29.3 / §30.1 / §30.7, v0.286): the suspend/resume frame members
 // (save+clear at ctor, restore at dtor) are generated from
 // BEZEL_SM_FRAME_MEMBERS so a member added to the macro is handled in all
@@ -5109,6 +5145,7 @@ Emitter::NestedBodyScope::NestedBodyScope(Emitter& e)
     e.currentLambdaReturnSemaTy_ = nullptr;
     e.accessorReturnTypeNode_    = nullptr;              // #2703
     e.accessorReturnTypeFn_      = nullptr;              // #2703
+    e.currentChoiceMethod_       = nullptr;              // #4143
     e.emittingDisposerBody_      = false;
     e.disposerEntryExc_          = nullptr;
     e.currentCaughtName_         = {};
@@ -5150,6 +5187,7 @@ Emitter::NestedBodyScope::~NestedBodyScope() {
     e_.currentLambdaReturnSemaTy_ = lamRet_;
     e_.accessorReturnTypeNode_    = accessorRetNode_;   // #2703
     e_.accessorReturnTypeFn_      = accessorRetFn_;     // #2703
+    e_.currentChoiceMethod_       = choiceMethod_;      // #4143
     e_.emittingDisposerBody_      = emittingDisposerBody_;
     e_.disposerEntryExc_          = disposerEntryExc_;
     e_.currentCaughtName_         = currentCaughtName_;
@@ -5666,9 +5704,20 @@ llvm::Function* Emitter::ensurePropertyAccessorFn(const sema::TypeSymbol* cls,
     // accessor function is never registered in methodFns_ (it is not a
     // MethodSymbol), so choiceTypeOf's existing "this" recovery would
     // otherwise find nothing.
+    //
+    // fix #4143 (§35.2/§35.5, v0.295): SET-FROM-OWNER, not conditionally-
+    // set-else-inherit, for consistency with the other two property-
+    // accessor sites (LlvmBackend_Exprs.cpp, LlvmBackend_Layout.cpp) fixed
+    // alongside this one. `NestedBodyScope` (constructed above in this
+    // function) already clears `currentChoiceMethod_` to null before this
+    // point runs, so the `else` branch is defensive rather than
+    // load-bearing here today — but this function's OWN identity should
+    // not depend on a caller of a different guard having gotten its clear
+    // list right; see that guard's `choiceMethod_` member for the
+    // destructive-overwrite mechanism this protects against.
     const sema::TypeSymbol* savedChoiceMethod2 = currentChoiceMethod_;
-    if (cls && cls->kind == ast::TypeDeclKind::Choice)
-        currentChoiceMethod_ = cls;
+    currentChoiceMethod_ =
+        (cls && cls->kind == ast::TypeDeclKind::Choice) ? cls : nullptr;
 
     if (!isSet) {
         // --- Getter body. ---

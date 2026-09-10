@@ -5725,9 +5725,22 @@ llvm::Value* Emitter::makePropertyThunk(sema::PropertySymbol* ps,
             // workaround above — a choice property read as a function value
             // (`var f: () -> T := s.SomeProperty;`) whose getter body is
             // `case this of …` needs the identical choiceTypeOf() recovery.
+            //
+            // fix #4143 (§35.2/§35.5, v0.295): SET-FROM-OWNER, not
+            // conditionally-set-else-inherit — this thunk switches
+            // `currentFn_` to a genuinely separate, memoized function
+            // (`pthunk$N`, `propertyThunks_`) via its OWN hand-rolled
+            // save/restore above, NOT the `NestedBodyScope` guard (this
+            // function predates it and is not one of the six builders that
+            // guard wraps), so an unconditional-else-untouched write here
+            // leaks a caller's `currentChoiceMethod_` into this thunk's body
+            // exactly as the inline read site did (LlvmBackend_Exprs.cpp) —
+            // same mechanism, different call site.
             const sema::TypeSymbol* savedChoiceMethod = currentChoiceMethod_;
-            if (ps->parent && ps->parent->kind == ast::TypeDeclKind::Choice)
-                currentChoiceMethod_ = ps->parent;
+            currentChoiceMethod_ =
+                (ps->parent && ps->parent->kind == ast::TypeDeclKind::Choice)
+                    ? ps->parent
+                    : nullptr;
             result = lowerExpr(*getter);
             // fix #2761 (§8.6 "Boxing" / §27.6, v0.240): the PROPERTY-AS-
             // FUNCTION-VALUE face of the same expression getter. Its `ret` is

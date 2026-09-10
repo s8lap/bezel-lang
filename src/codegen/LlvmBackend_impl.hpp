@@ -2295,6 +2295,12 @@ private:
     // getter body's evaluation; this is the same workaround for choice, set
     // at the same three sites, so choiceTypeOf("this") resolves inside a
     // choice property exactly as it already does inside a choice method.
+    // fix #4143: also saved+cleared+restored by NestedBodyScope (the guard
+    // wrapping the six lazily-memoized accessor builders below) so a value
+    // set here for ONE property-getter window cannot leak into an unrelated
+    // nested accessor body first-touched from inside it — see that guard's
+    // struct definition for why this member needed it and its enum twin,
+    // deliberately, did not.
     const sema::TypeSymbol* currentChoiceMethod_ = nullptr;
     // fix #628 / §9.5 / §14.2: when emitting a SPECIALIZED method body via
     // buildSpecializedMethodFn, currentFn_ is set to the freshly-created specFn
@@ -12530,6 +12536,31 @@ private:
         // rather than depending on a second mechanism.)
         const ast::Type*     accessorRetNode_;
         llvm::Function*      accessorRetFn_;
+        // --- choice receiver-identity recovery (fix #4143, §35.2/§35.5) ---
+        // currentChoiceMethod_ is saved+cleared+restored here, UNLIKE its
+        // enum twin currentEnumMethod_ (deliberately left inherited three
+        // lines below in the .cpp — see that comment). The two precedents
+        // look identical but are not: enumTypeOf's leaked value only ever
+        // feeds a bare enum-constant NAME lookup alongside a separately
+        // resolved scrutinee TypeRef, so a wrong value there is a soft miss.
+        // choiceTypeOf's leaked value is folded DESTRUCTIVELY into the
+        // CaseExpr's own scrutinee TypeRef (LlvmBackend_Exprs2.cpp, the
+        // "scrutTy not already a Choice" guard) whenever it fires, so a
+        // leaked choice from a caller's property-getter window silently
+        // reclassifies an unrelated `this` (a CLASS or record) as that
+        // caller's choice type — confirmed to make a real `case this of`
+        // fall through to `_` instead of matching its true arms. Clearing
+        // it here is safe: every site that legitimately NEEDS a non-null
+        // value here sets it FOR ITSELF from its own owning type
+        // (ensurePropertyAccessorFn's `cls`-gated set two hundred-odd lines
+        // below runs AFTER this scope's ctor and does not depend on
+        // inheriting a caller's value), and no memoized builder this scope
+        // guards can ever be reached with an owning type of Choice (or
+        // Enum) for its OWN accessor — choices and enums are both
+        // forbidden from declaring block-form/storage-backed properties or
+        // indexers (spec §10.5, and §35 for choices, which cites §10.5's
+        // restriction set directly).
+        const sema::TypeSymbol* choiceMethod_;
         // --- suspend/resume frame (#2170 + #2701 + #2702 + #3505 + #3531 + #3551) ---
         // fix #3551 (§29.3 / §30.1 / §30.7, v0.286): generated from
         // `BEZEL_SM_FRAME_MEMBERS` so adding a member to the macro cannot

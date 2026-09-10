@@ -5778,10 +5778,36 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
             // and lowerCaseExpr bailed leaving `case.end` unterminated — an
             // IR-verification crash ("Basic Block ... does not have
             // terminator!"), degraded through the #2491 backstop.
+            //
+            // fix #4143 (§35.2/§35.5, v0.295): SET-FROM-OWNER, not
+            // conditionally-set-else-inherit. This is an INLINE evaluation
+            // (currentFn_ stays the CALLER's function; there is no
+            // NestedBodyScope boundary here at all, unlike the block-getter/
+            // itable-accessor family), so a bare `if (Choice) set` — leaving
+            // the field untouched for every OTHER receiver kind — passes a
+            // caller's choice window straight through into THIS getter's own
+            // body unmodified. Measured: `Animal.Sound` (a CLASS property
+            // whose getter is `get => (case this of Dog => …, Cat => …, _ =>
+            // …)`, itself reached through this SAME inline path since an
+            // accessor with an EXPRESSION body classifies as
+            // `computedGetterOf` regardless of whether the enclosing
+            // property is arrow- or block-declared — see that function's own
+            // comment), first touched from inside `ShapeQ.Kind`'s
+            // choice-property getter (`(case this of CircleQ(r) => new
+            // Dog().Sound, …)`), inherited `currentChoiceMethod_ == ShapeQ`
+            // straight through this unconditional-else-untouched code and
+            // fell into lowerCaseExpr's "scrutTy not already a Choice"
+            // overwrite guard (LlvmBackend_Exprs2.cpp) — silently
+            // reclassifying `Animal`'s `this` as a `ShapeQ` scrutinee.
+            // `patternMatches` then found no `Dog`/`Cat` cases in `ShapeQ`
+            // and fell through to `_`, printing "..." instead of "Woof": a
+            // SILENT WRONG ANSWER, not a crash.
             const sema::TypeSymbol* savedChoiceMethod = currentChoiceMethod_;
-            if (propSym && propSym->parent &&
-                propSym->parent->kind == ast::TypeDeclKind::Choice)
-                currentChoiceMethod_ = propSym->parent;
+            currentChoiceMethod_ =
+                (propSym && propSym->parent &&
+                 propSym->parent->kind == ast::TypeDeclKind::Choice)
+                    ? propSym->parent
+                    : nullptr;
             llvm::Value* v = lowerExpr(*getter);
             // §23.2/§23.3 (#1168): a `T?`-declared expression-bodied property
             // whose body yields the bare inner `T` must wrap the result to the
