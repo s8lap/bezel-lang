@@ -1866,11 +1866,40 @@ private:
         bool dictEntryForIsStringKey = false;
         bool dictEntryForUseGen = false;
         // The loop-var struct alloca — consulted ONLY when
-        // dictEntryForIsStringKey, to release the in-flight iteration's
-        // rebuilt Key at field 0 exactly as endBB's own isStringKey branch
-        // does (its struct type is read back via getAllocatedType(),
-        // mirroring `dictEntryKeyRelease` just above).
+        // dictEntryForReleaseInFlightKey, to release the in-flight
+        // iteration's rebuilt Key at field 0 exactly as endBB's own
+        // isStringKey branch does (its struct type is read back via
+        // getAllocatedType(), mirroring `dictEntryKeyRelease` just above).
         llvm::AllocaInst* dictEntryForVarSlot = nullptr;
+        // fix #4129 review self-pass (§4.8, v0.295): whether it is SAFE to
+        // release the in-flight rebuilt string Key at dictEntryForVarSlot
+        // field 0 from THIS disposal. Measured true-positive UAF, fixed
+        // before landing: `for var entry in d do return lambda() =>
+        // entry.Key...; end;` — the escaping lambda captures `entry` by
+        // boxing its struct into a heap cell (LlvmBackend_Stmts.cpp's
+        // lowerForBody, forVarCapturedInBody), and that cell holds a COPY of
+        // the SAME `bz_string*` pointer this disposal would release; the
+        // closure reads it after MakeClosure returns, i.e., after the
+        // release — a use-after-free. The identical hazard is PRE-EXISTING
+        // and unrelated to this fix on the normal-completion/`break` path
+        // too (endBB's own isStringKey release has always had it — confirmed
+        // by reproducing it on the unmodified parent commit with a program
+        // that assigns the escaping lambda every iteration and lets the loop
+        // complete normally, no `return`/`break` involved) — but THIS fix
+        // must not open a NEW way to reach it via `return`/`throw` (never
+        // trade a leak for a UAF). So dictEntryForSnapshot's registration
+        // computes `!forVarCapturedInBody(fs)` ONCE (a static, conservative,
+        // whole-body AST scan — true the moment ANY closure in the body
+        // captures the loop variable AT ALL, regardless of whether that
+        // closure provably escapes) and stores it here; false leaves the
+        // Key on the pre-existing safe-direction leak (unchanged from
+        // before this fix), exactly like every other sibling family in this
+        // file that cannot prove non-escape. This flag does NOT gate freeing
+        // the snapshot spine arrays or the remaining per-key raw byte boxes
+        // — `entry.Key`/`entry.Value` are decoded (VALUE) copies out of
+        // those, never aliases of them, so freeing them is unconditionally
+        // safe regardless of capture.
+        bool dictEntryForReleaseInFlightKey = false;
         // §35.4 (v0.200, #2045 stage 3): an OWNING-CLASSIFIED choice local
         // (a sum whose classification is Owning, e.g. one with an `owned`
         // payload slot per §35.4.1). At scope end the active case's owned

@@ -5929,10 +5929,19 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
                 ptrTy(), it->dictEntryForValsOutSlot, "def.vals");
             llvm::Value* cntD =
                 builder_.CreateLoad(i64(), it->dictEntryForCntSlot, "def.cnt");
-            // String key: release the in-flight iteration's rebuilt Key
-            // (loop-var struct field 0) — null-safe, mirrors endBB's own
-            // isStringKey branch.
-            if (it->dictEntryForIsStringKey && it->dictEntryForVarSlot) {
+            // String key AND the loop variable is not captured by any
+            // closure in the body: release the in-flight iteration's
+            // rebuilt Key (loop-var struct field 0) — null-safe, mirrors
+            // endBB's own isStringKey branch. Gated on
+            // dictEntryForReleaseInFlightKey (see its declaration,
+            // LlvmBackend_impl.hpp) — a captured loop variable's struct was
+            // boxed into a heap cell holding a COPY of this same pointer,
+            // which an escaping closure may read after this disposal fires;
+            // releasing here would free it out from under that alias (a
+            // measured use-after-free, fixed before landing). The snapshot
+            // spine frees below are unaffected by this gate — they are
+            // never aliased by anything Bezel code can observe.
+            if (it->dictEntryForReleaseInFlightKey && it->dictEntryForVarSlot) {
                 if (auto* st = llvm::dyn_cast_or_null<llvm::StructType>(
                         it->dictEntryForVarSlot->getAllocatedType())) {
                     llvm::Value* keyAddr = builder_.CreateStructGEP(

@@ -7351,6 +7351,19 @@ bool Emitter::lowerDictEntryFor(const ast::ForStmt& fs) {
     // LlvmBackend_impl.hpp for the full derivation). Pushed AFTER the
     // snapshot's own allocas exist so the registration can carry them; popped
     // WITHOUT emission once the manual endBB code below has run (see there).
+    //
+    // fix #4129 review self-pass: `forVarCapturedInBody(fs)` is the SAME
+    // static, whole-body AST scan `lowerForBody` (below) uses to decide
+    // whether to box `entry` for a capturing closure — computed once here,
+    // BEFORE lowerForBody runs, so it reflects the body regardless of
+    // whether boxing actually happens for this specific loop. When true, a
+    // captured `entry`'s struct was copied into a heap cell an escaping
+    // closure may read after this disposal fires; releasing the in-flight
+    // string Key here would be a use-after-free on that alias (measured,
+    // fixed before landing — see dictEntryForReleaseInFlightKey's
+    // declaration). The snapshot-array frees themselves are unaffected: no
+    // capture ever aliases them.
+    bool forVarCaptured = forVarCapturedInBody(fs);
     disposeStack_.push_back({});
     {
         Disposal d{nullptr, nullptr};
@@ -7363,6 +7376,7 @@ bool Emitter::lowerDictEntryFor(const ast::ForStmt& fs) {
         d.dictEntryForIsStringKey = isStringKey;
         d.dictEntryForUseGen = useGen;
         d.dictEntryForVarSlot = varSlot;
+        d.dictEntryForReleaseInFlightKey = isStringKey && !forVarCaptured;
         disposeStack_.back().push_back(d);
     }
 
