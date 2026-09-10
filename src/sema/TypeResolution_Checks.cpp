@@ -676,6 +676,29 @@ void Resolver::checkTypeMethodBodies(TypeSymbol* t) {
         // runtime instead of a compile-time rejection naming the rule.
         auto* ps = dynamic_cast<PropertySymbol*>(m);
         if (!ps || !ps->isIndexer || isInterface) continue;
+        // fix #4111 (§10.5/§35.1, v0.298): an indexer on an enum or choice
+        // body is already unconditionally rejected regardless of body
+        // presence — checkEnumRestrictions's and checkChoiceRestrictions's
+        // own `PropertySymbol` arms both `bad("an indexer")`/continue on
+        // `ps->isIndexer` before ever looking at body kind. MEASURED on
+        // this HEAD (pre-fix): a BARE (bodyless, non-abstract) indexer on
+        // either kind tripped BOTH that rejection AND this arm's
+        // "non-abstract indexer must have a body" — two diagnostics, same
+        // location, for one member (`enum Color ... public property [i:
+        // int]: int; end Color;` reported both "enum `Color` may not
+        // declare an indexer (§10.5)" and "non-abstract indexer must have a
+        // body (§12.5/§23.4)"; the choice shape reported the analogous
+        // pair). Both are individually correct — no false accept, no false
+        // reject — but this codebase has explicit precedent for treating
+        // that as a defect anyway: #3601's changelog entry records
+        // retiring an earlier duplicate enum loop specifically "to avoid
+        // double-reporting". Short-circuit here rather than weaken either
+        // membership rejection — this function's OWN body-presence rule
+        // has nothing further to add once the member kind itself is
+        // rejected outright.
+        if (t->kind == ast::TypeDeclKind::Enum ||
+            t->kind == ast::TypeDeclKind::Choice)
+            continue;
         // SEAM-ACCESSOR: `ps` is a member of the locally-declared `t`
         // (forEachTypeAndNested, #3574); same declaration-site-only
         // reasoning as the method arm above (#3152).

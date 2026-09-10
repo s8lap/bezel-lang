@@ -301,6 +301,17 @@ private:
     // Records / enums: treated like classes (their methods are
     // concrete). Operators are always concrete and handled by the
     // parser's body requirement.
+    // fix #4101 (§12.5/§23.4, v0.295): the same body-presence rule also
+    // covers INDEXERS (`PropertySymbol` where `isIndexer`) — a non-abstract
+    // indexer with no accessors/expression body (`PropertyBodyKind::Auto`,
+    // which has no legal indexer meaning: an indexer's Auto form has no
+    // per-instance storage to address) must be rejected the same way a
+    // bodyless non-abstract method is. Interface indexer signatures are
+    // excluded from this arm (like interface methods), and — narrow #4111
+    // (v0.298) — an enum or choice indexer is excluded too, because
+    // checkEnumRestrictions/checkChoiceRestrictions already reject any
+    // indexer on those two kinds outright, regardless of body; running
+    // this arm on them as well would double-report a bare one.
     void checkMethodBodies();
 
     void checkTypeMethodBodies(TypeSymbol* t);
