@@ -14449,6 +14449,72 @@ llvm::Value* Emitter::lowerNullCondCall(const ast::CallExpr& call,
                     recvD, llvm::ConstantPointerNull::get(ptrTy())),
                 doBB, endBB);
             builder_.SetInsertPoint(doBB);
+            // fix #4209 (§28.2/§28.9/§8.1, v0.298): a VTABLE-LESS BUILTIN
+            // receiver (StringBuilder, Mutex, Stopwatch, ...) must be
+            // intercepted HERE, before `explicitDisposeOwnedReceiverSlot`
+            // runs — mirroring the non-`?.` `.Dispose()` arm's dispatch
+            // ORDER (this file's `if (!ms) ... else if` chain, ~line 9222):
+            // that chain matches on the receiver's TYPE first, through a
+            // dedicated `isVtableLessBuiltinClassName` arm, and only falls
+            // to the scope-ownership-driven general path
+            // (`explicitDisposeOwnedReceiverSlot` / `emitDynamicDispose`)
+            // in its own final `else` — reached only by a true user class.
+            // This `?.` arm had no equivalent type-first match:
+            // `explicitDisposeOwnedReceiverSlot` ran UNCONDITIONALLY for
+            // every class-shaped receiver, built-in or not, and both of its
+            // outcomes wild-jump on a built-in — which carries no Bezel
+            // vtable at word 0:
+            //   * a PLAIN `var` builtin — `unwindOwnedLocalClass` has no
+            //     entry for a built-in, so `slot` comes back null and the
+            //     `else` arm's `emitDynamicDispose(recvD)` dispatches
+            //     through word 0 as if it were a vtable slot. MEASURED
+            //     (filed with #4209, reconfirmed on 3999278 before this
+            //     fix): `var sb := new StringBuilder("hi"); sb?.Dispose();`
+            //     — AddressSanitizer SEGV, pc/bp at the zero page.
+            //   * a `using var` builtin — `loc->isUsing` short-circuits
+            //     `explicitDisposeOwnedReceiverSlot` to a REAL slot
+            //     regardless of receiver type, so `slot` is non-null and
+            //     `emitDisposeAndReclaim(recvD)` (itself
+            //     `emitDynamicDispose` + reclaim) wild-jumps the same way.
+            //     #4209 flagged this shape as "not investigated further" —
+            //     covered by the same guard below and by this fix's
+            //     regression test.
+            // Route through the SAME release the non-`?.` arm's
+            // `isVtableLessBuiltinClassName` branch uses —
+            // `emitVtablelessBuiltinRelease`, a COMPLETE release (dispatch
+            // + reclaim in one call; a built-in has no separate vtable
+            // Dispose slot to dispatch through) — gated on ITS OWN success
+            // (not merely on `isVtableLessBuiltinClassName`, which is also
+            // true of Array/Dictionary/Set/... — those have NO arm in
+            // `emitVtablelessBuiltinRelease` and instead need the
+            // element-aware cascading disposal the `.` form's dedicated
+            // `isCollectionTypeName`/`isDictTypeName`/... arms perform,
+            // never ported to this `?.` arm; MEASURED still broken via
+            // `?.Dispose()` after this fix — filed separately, see this
+            // lane's report). `emitVtablelessBuiltinRelease` emits nothing
+            // and returns false for such a name, so falling through to the
+            // pre-existing logic below is exactly a no-op here — it leaves
+            // that population's behaviour UNCHANGED (still the pre-existing
+            // wild jump, not newly introduced by this fix, not silently
+            // "fixed" into an undiagnosed leak either). For a name it DOES
+            // know, null the slot the same way the non-`?.` chain's single
+            // §28.2 exactly-once exit does (`nullExplicitlyDisposedBuiltinSlot`,
+            // #2967), so a following scope-exit / unwind auto-drop reloads
+            // null and discharges nothing. A type PARAMETER receiver
+            // (`recvIsTypeParam` above) is deliberately not routed here:
+            // `builtinTypeName(recvTy0)` reads the type param's own name
+            // ("T"), not its resolved substitution, so this condition is
+            // false and behaviour is unchanged for that shape too (tracked
+            // separately, filed).
+            if (std::string_view ncDisposeBn = builtinTypeName(recvTy0);
+                    !ncDisposeBn.empty() &&
+                    common::isVtableLessBuiltinClassName(ncDisposeBn) &&
+                    emitVtablelessBuiltinRelease(ncDisposeBn, recvD)) {
+                nullExplicitlyDisposedBuiltinSlot(*nm.target);
+                builder_.CreateBr(endBB);
+                builder_.SetInsertPoint(endBB);
+                return nullptr;
+            }
             llvm::Type* slotTy = nullptr;
             llvm::Value* slot =
                 explicitDisposeOwnedReceiverSlot(*nm.target, slotTy);
