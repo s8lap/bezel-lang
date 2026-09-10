@@ -9429,6 +9429,7 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
     boxCaptureLocals_.clear();
     singleCaptureLocals_.clear();          // #694
     assignedCaptureVars_.clear();          // fix #2706
+    returnedCaptureVars_.clear();          // fix #4198
     definitelyEscapingLambdas_.clear();    // #694
     boxCaptureLocalsFn_ = fn;
     // #429 / §27.5: which captured locals/params have ALL-non-escaping lambdas
@@ -30705,6 +30706,7 @@ void Emitter::collectBoxCaptureLocals(
     boxCaptureLocals_.clear();
     singleCaptureLocals_.clear();  // #694
     assignedCaptureVars_.clear();  // fix #2706
+    returnedCaptureVars_.clear();  // fix #4198
 
     // Candidate box-producer locals (same predicate as collectBoxReleaseEligible).
     //
@@ -30879,6 +30881,56 @@ void Emitter::collectBoxCaptureLocals(
     for (auto& s : body) scanAssign(s.get());
     for (const ast::LambdaExpr* lam : lambdas)
         for (auto& s : lam->stmts) scanAssign(s.get());
+
+    // fix #4198 (§27.5 / §28.9, v0.298): record every LOCAL/PARAMETER this
+    // function body directly RETURNS BY NAME (`return x;`), under the SAME
+    // key space assignedCaptureVars_ above uses. See returnedCaptureVars_'s
+    // declaration (header) for why this is a hazard independent of the
+    // written-cell one #2706 already covers.
+    //
+    // UNLIKE scanAssign, this walk does NOT descend into lambda bodies — a
+    // nested lambda's own `return` escapes THAT lambda's frame, not this
+    // function's, so attributing it to the enclosing function would be a
+    // different (and wrong) claim.
+    std::function<void(const ast::Stmt*)> scanReturn = [&](const ast::Stmt* s) {
+        if (!s) return;
+        if (auto* r = dynamic_cast<const ast::ReturnStmt*>(s)) {
+            if (auto* id =
+                    dynamic_cast<const ast::IdentifierExpr*>(r->value.get())) {
+                if (sema::Symbol* sym = ctx_.exprSymbol(*id)) {
+                    if (auto* loc = dynamic_cast<sema::LocalSymbol*>(sym)) {
+                        if (loc->decl)
+                            returnedCaptureVars_.insert(
+                                static_cast<const void*>(loc->decl));
+                    } else if (dynamic_cast<sema::ParameterSymbol*>(sym)) {
+                        returnedCaptureVars_.insert(
+                            static_cast<const void*>(sym));
+                    }
+                }
+            }
+            return;
+        }
+        if (auto* is = dynamic_cast<const ast::IfStmt*>(s)) {
+            for (auto& b : is->ifBranch.body) scanReturn(b.get());
+            for (auto& br : is->elifBranches)
+                for (auto& b : br.body) scanReturn(b.get());
+            for (auto& b : is->elseBody) scanReturn(b.get());
+        } else if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s)) {
+            for (auto& b : ws->body) scanReturn(b.get());
+        } else if (auto* fs = dynamic_cast<const ast::ForStmt*>(s)) {
+            for (auto& b : fs->body) scanReturn(b.get());
+        } else if (auto* d = dynamic_cast<const ast::DoEndBlock*>(s)) {
+            for (auto& b : d->body) scanReturn(b.get());
+        } else if (auto* ts = dynamic_cast<const ast::TryStmt*>(s)) {
+            for (auto& b : ts->body) scanReturn(b.get());
+            for (auto& c : ts->catches) scanReturn(c.body.get());
+            for (auto& b : ts->finallyBody) scanReturn(b.get());
+        } else if (auto* cs = dynamic_cast<const ast::CaseStmt*>(s)) {
+            for (auto& arm : cs->arms)
+                for (auto& a : arm.stmts) scanReturn(a.get());
+        }
+    };
+    for (auto& s : body) scanReturn(s.get());
 }
 
 

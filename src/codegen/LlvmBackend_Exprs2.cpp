@@ -1458,9 +1458,18 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         // than one env can share it — see armMutatedSharedCaptureCell. The
         // retain and the envdtor release are then suppressed TOGETHER; keeping
         // the retain alone would merely move the leak.
-        ce.suppressContentRcInEnvdtor = mutatedSharedCaptureCell(
-            static_cast<const void*>(sym), ce.semaTy,
-            /*freshCellPerIteration=*/false);
+        //
+        // fix #4198: OR when the parameter is directly RETURNED BY NAME from
+        // this function — see capturedLocalReturnedByName's declaration for
+        // why that is a second, independent hazard (the return's silent
+        // transfer and the envdtor's content release both claim the same
+        // reference).
+        ce.suppressContentRcInEnvdtor =
+            mutatedSharedCaptureCell(
+                static_cast<const void*>(sym), ce.semaTy,
+                /*freshCellPerIteration=*/false) ||
+            capturedLocalReturnedByName(static_cast<const void*>(sym),
+                                         ce.semaTy);
         if (!ce.suppressContentRcInEnvdtor) {
             if (isStringTypeRefNonNull(ce.semaTy)) {
                 llvm::Value* str =
@@ -1995,9 +2004,20 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         // strings. Note the flag is consulted for EVERY capture of such a
         // variable, not only the `alreadyBoxed` ones, because it is the ENVDTOR
         // release (which the first env also emits) that must go away.
-        ce.suppressContentRcInEnvdtor = mutatedSharedCaptureCell(
-            static_cast<const void*>(decl), ce.semaTy,
-            /*freshCellPerIteration=*/forceFresh);
+        //
+        // fix #4198: OR when `decl` is directly RETURNED BY NAME from this
+        // function — capturedLocalReturnedByName's declaration has the full
+        // argument. Independent of assignedCaptureVars_: a READ-ONLY capture
+        // that is separately returned hits the identical heap-use-after-free
+        // (the return's silent transfer and the envdtor's content release
+        // both claim the frame's one reference), with no write anywhere in
+        // the program.
+        ce.suppressContentRcInEnvdtor =
+            mutatedSharedCaptureCell(
+                static_cast<const void*>(decl), ce.semaTy,
+                /*freshCellPerIteration=*/forceFresh) ||
+            capturedLocalReturnedByName(static_cast<const void*>(decl),
+                                         ce.semaTy);
         // fix #3752 (§28.2 / §27.5 / §28.9, v0.286): THE FIRST capture's
         // envdtor is the captured local's DEFERRED SCOPE-END RELEASE — and a
         // deferred release is only sound when the env dies at or AFTER the
@@ -2586,6 +2606,7 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         auto savedBoxCaptureLocals = boxCaptureLocals_;
         auto savedSingleCaptureLocals = singleCaptureLocals_;
         auto savedAssignedCaptureVars = assignedCaptureVars_;  // fix #2706
+        auto savedReturnedCaptureVars = returnedCaptureVars_;  // fix #4198
         llvm::Function* savedBoxCaptureLocalsFn = boxCaptureLocalsFn_;
         auto savedDefinitelyEscaping = definitelyEscapingLambdas_;
         // #2132: emitAsyncLambda now ALSO recomputes the borrowing-array /
@@ -2661,6 +2682,7 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         boxCaptureLocals_ = std::move(savedBoxCaptureLocals);
         singleCaptureLocals_ = std::move(savedSingleCaptureLocals);
         assignedCaptureVars_ = std::move(savedAssignedCaptureVars);  // fix #2706
+        returnedCaptureVars_ = std::move(savedReturnedCaptureVars);  // fix #4198
         boxCaptureLocalsFn_ = savedBoxCaptureLocalsFn;
         definitelyEscapingLambdas_ = std::move(savedDefinitelyEscaping);
         borrowingArrayFreeEligible_ = std::move(savedBorrowingArrayFreeElig);
@@ -2846,6 +2868,7 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         singleCaptureLocals_.clear();
     }
     assignedCaptureVars_.clear();          // fix #2706
+    returnedCaptureVars_.clear();          // fix #4198
     definitelyEscapingLambdas_.clear();
     boxCaptureLocalsFn_ = fn;
     cellFreeEligible_.clear();

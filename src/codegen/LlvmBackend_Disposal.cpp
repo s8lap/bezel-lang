@@ -260,6 +260,7 @@ void Emitter::emitDisposerCore(const sema::TypeSymbol* ts, llvm::Function* fn) {
         boxCaptureLocals_.clear();
         singleCaptureLocals_.clear();
         assignedCaptureVars_.clear();
+        returnedCaptureVars_.clear();  // fix #4198
         definitelyEscapingLambdas_.clear();
         boxCaptureLocalsFn_ = fn;
         cellFreeEligible_.clear();

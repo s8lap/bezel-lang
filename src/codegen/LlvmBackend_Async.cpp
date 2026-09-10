@@ -1502,6 +1502,7 @@ void Emitter::emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         boxCaptureLocals_.clear();
         singleCaptureLocals_.clear();
         assignedCaptureVars_.clear();  // fix #2706
+        returnedCaptureVars_.clear();  // fix #4198
         definitelyEscapingLambdas_.clear();
         boxCaptureLocalsFn_ = resumeFn;
         cellFreeEligible_.clear();
@@ -2086,6 +2087,7 @@ void Emitter::emitAsyncLambda(const ast::LambdaExpr& lam, llvm::Function* fn,
         boxCaptureLocals_.clear();
         singleCaptureLocals_.clear();
         assignedCaptureVars_.clear();  // fix #2706
+        returnedCaptureVars_.clear();  // fix #4198
         definitelyEscapingLambdas_.clear();
         boxCaptureLocalsFn_ = resumeFn;
         cellFreeEligible_.clear();
@@ -3563,6 +3565,7 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
         boxCaptureLocals_.clear();
         singleCaptureLocals_.clear();          // #694
         assignedCaptureVars_.clear();          // fix #2706
+        returnedCaptureVars_.clear();          // fix #4198
         definitelyEscapingLambdas_.clear();    // #694
         boxCaptureLocalsFn_ = resumeFn;
         cellFreeEligible_.clear();

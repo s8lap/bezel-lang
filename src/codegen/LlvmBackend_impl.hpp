@@ -12222,6 +12222,7 @@ private:
               boxCaptureLocals_(e.boxCaptureLocals_),
               singleCaptureLocals_(e.singleCaptureLocals_),
               assignedCaptureVars_(e.assignedCaptureVars_),
+              returnedCaptureVars_(e.returnedCaptureVars_),  // fix #4198
               definitelyEscapingLambdas_(e.definitelyEscapingLambdas_),
               boxCaptureLocalsFn_(e.boxCaptureLocalsFn_),
               cellFreeEligible_(e.cellFreeEligible_),
@@ -12243,6 +12244,8 @@ private:
             e_.boxCaptureLocals_ = std::move(boxCaptureLocals_);
             e_.singleCaptureLocals_ = std::move(singleCaptureLocals_);
             e_.assignedCaptureVars_ = std::move(assignedCaptureVars_);
+            e_.returnedCaptureVars_ =
+                std::move(returnedCaptureVars_);  // fix #4198
             e_.definitelyEscapingLambdas_ =
                 std::move(definitelyEscapingLambdas_);
             e_.boxCaptureLocalsFn_ = boxCaptureLocalsFn_;
@@ -12280,6 +12283,7 @@ private:
         std::unordered_set<const void*> boxCaptureLocals_;
         std::unordered_set<const void*> singleCaptureLocals_;
         std::unordered_set<const void*> assignedCaptureVars_;
+        std::unordered_set<const void*> returnedCaptureVars_;  // fix #4198
         std::unordered_set<const void*> definitelyEscapingLambdas_;
         llvm::Function* boxCaptureLocalsFn_;
         std::unordered_set<const void*> cellFreeEligible_;
@@ -14846,6 +14850,63 @@ private:
             !singleCaptureLocals_.count(key) ||
             (!loopStack_.empty() && !freshCellPerIteration);
         return manyEnvsShareOneCell;
+    }
+    // fix #4198 / §27.5 / §28.9 (v0.298): LOCAL DECL NODES and PARAMETER
+    // SYMBOLS that this function body directly RETURNS BY NAME (`return x;`,
+    // `x` a bare IdentifierExpr naming the local/parameter — not a call
+    // through it, not a field read off it). Computed alongside
+    // assignedCaptureVars_ by the SAME collectBoxCaptureLocals pass (same key
+    // space, same boxCaptureLocalsFn_ guard) — but that scan's own `scanReturn`
+    // does NOT descend into lambda bodies: a nested lambda's own `return`
+    // escapes THAT lambda's frame, not this function's, so attributing it
+    // here would be a different (and wrong) claim.
+    //
+    // WHY THIS IS A SEPARATE HAZARD FROM assignedCaptureVars_/
+    // mutatedSharedCaptureCell. A captured local's OWN scope-end release is
+    // suppressed whenever it is captured at all — the "first capture
+    // transfers the producer's suppressed release to the envdtor" model (see
+    // the captured-LOCALS loop below). That model assumes the envdtor is the
+    // ONLY remaining consumer of the cell's content. `return x;` is a SECOND,
+    // independent consumer: it hands the raw reference to the caller with no
+    // retain (the ordinary "return a local, transfer, don't release" idiom —
+    // correct in isolation, and the only reason a plain, uncaptured closure
+    // return works at all). When the same local is BOTH captured AND
+    // returned, the envdtor's content release and the return's silent
+    // transfer both claim the SAME single reference: the envdtor frees it
+    // during THIS frame's own scope-end cleanup (which runs after the return
+    // value is computed but before control reaches the caller), so the
+    // caller receives a pointer that is already dangling.
+    //
+    // Measured (issue #4198): `heap-use-after-free ... freed by ... in
+    // bz$lam$N$envdtor ... previously allocated ... in lam$N ... READ ... in
+    // main` — a single call, no loop, 100% reproducible.
+    //
+    // NOT specific to a MUTATED cell. #4198's own repro reassigns the
+    // captured local from inside the capturing lambda, but a READ-ONLY
+    // capture that is independently returned hits the identical UAF
+    // (measured: same crash signature, with assignedCaptureVars_ empty for
+    // that program — see this fix's own regression test's
+    // read_only_capture_returned_no_mutation_fully_clean_spec_27_5 row,
+    // which REFUTES the issue's own "this needs the mutation ... being
+    // exercised" scope note). So this set and its consumer below are
+    // independent of assignedCaptureVars_ / singleCaptureLocals_ /
+    // loopStack_, and every env sharing the cell suppresses its release
+    // uniformly (mirrors mutatedSharedCaptureCell's own "suppress retain and
+    // release together" trade — a bounded leak on the OTHER captures, never
+    // an over-release — rather than trying to pick which one env's release
+    // should "win").
+    std::unordered_set<const void*> returnedCaptureVars_;
+    // fix #4198 / §27.5 / §28.9 (v0.298): does this capture's envdtor content
+    // release need suppressing because the captured local/parameter is ALSO
+    // directly returned by name from the enclosing function? See
+    // returnedCaptureVars_'s declaration just above for the full argument.
+    bool capturedLocalReturnedByName(const void* key,
+                                      const sema::TypeRef* semaTy) {
+        if (currentFn_ != boxCaptureLocalsFn_) return false;
+        if (!isStringTypeRefNonNull(semaTy) &&
+            !(semaTy && semaTy->kind == sema::TypeRef::Kind::Function))
+            return false;
+        return returnedCaptureVars_.count(key) != 0;
     }
     // §27.5 / #694: LambdaExpr nodes that DEFINITELY escape the function (directly
     // returned). Computed once per body by collectDefinitelyEscapingLambdas;

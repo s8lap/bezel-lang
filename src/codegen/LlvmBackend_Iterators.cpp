@@ -2123,6 +2123,7 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         boxCaptureLocals_.clear();
         singleCaptureLocals_.clear();          // #694
         assignedCaptureVars_.clear();          // fix #2706
+        returnedCaptureVars_.clear();          // fix #4198
         definitelyEscapingLambdas_.clear();    // #694
         boxCaptureLocalsFn_ = moveNextFn;
         cellFreeEligible_.clear();
