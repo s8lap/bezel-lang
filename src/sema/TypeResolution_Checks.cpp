@@ -7831,6 +7831,19 @@ bool Resolver::argSatisfiesNew(const TypeRef* arg, bool& decided) {
             // populated by ModuleLoader, unlike `decl`) and apply
             // `common::resolveRecordFieldSubst` per member before the
             // `nullable`/`categorize` checks.
+            //
+            // fix #4166 (§14.2/§17.11, v0.295): #4002 substituted a BARE
+            // field (`V: T`), but a field that is ITSELF a Record after
+            // substitution (`In: Inner<T>` in a delegating
+            // `record Outer<T>(In: Inner<T>)`) was still only run through
+            // `categorize()`, which answers "Record ⇒ Value" for ANY
+            // record — true of the record AS A TYPE, but silent on whether
+            // ITS OWN fields are defaultable once ITS generic parameters
+            // are bound. `recordFieldTypeHasNoDefault` recurses into a
+            // Record-kind field instead of stopping at `categorize()`,
+            // threading `resolveRecordFieldSubst`'s `Entry::env` into the
+            // inner frame exactly as `ExprTC::defaultIllFormed` does (fix
+            // #3995) — the identically-shaped composition, ported.
             decided = true;
             bool unresolved = false;
             bool nonDefaultable = false;
@@ -7843,13 +7856,12 @@ bool Resolver::argSatisfiesNew(const TypeRef* arg, bool& decided) {
                 [&](const RecordStorageMember& rsm) {
                     const TypeRef* ft = rsm.type;
                     if (!ft) { unresolved = true; return false; }  // can't verify
-                    const TypeRef* subFt =
-                        common::resolveRecordFieldSubst(ft, fieldEnv).ty;
-                    if (!subFt) { unresolved = true; return false; }
-                    if (subFt->nullable) return true;  // nullable → defaults null
-                    if (categorize(subFt) == TypeCategory::Reference) {
+                    common::RecordSubstEnv::Entry sub =
+                        common::resolveRecordFieldSubst(ft, fieldEnv);
+                    if (!sub.ty) { unresolved = true; return false; }
+                    if (recordFieldTypeHasNoDefault(sub.ty, sub.env)) {
                         nonDefaultable = true;
-                        return false;  // non-nullable reference: no default
+                        return false;  // no default at this member
                     }
                     return true;
                 },
@@ -7899,6 +7911,63 @@ bool Resolver::argSatisfiesNew(const TypeRef* arg, bool& decided) {
     }
     // Built-ins, generic params, function/inline-array args: defer.
     return false;
+}
+
+// fix #4166 (§14.2/§17.11, v0.295): recursive sibling of the field-
+// defaultability walk in `argSatisfiesNew`'s Record arm above — does `t` (a
+// storage-member type already substituted through the enclosing frame's
+// `incoming` env) have NO well-defined default? `categorize()` alone
+// answers this correctly for every LEAF field kind (a non-nullable class/
+// interface is a Reference, everything else a Value), but a field that is
+// ITSELF a Record needs its OWN storage members checked too — `categorize`
+// answers "Record ⇒ Value" unconditionally, true of the record as a TYPE
+// but silent on whether its fields are defaultable once ITS generic
+// parameters are bound by `t`'s `genericArgs`. A delegating generic record
+// (`record Outer<T>(In: Inner<T>)`) needs that inner frame recursed with
+// the composed env `resolveRecordFieldSubst` returns (`Entry::env`) —
+// exactly the composition `ExprTC::defaultIllFormed` threads for the
+// identically-shaped question (fix #3995, ExprTypecheck_Exprs.cpp), ported
+// here since `Resolver::run` (type resolution) executes before `ExprTC`
+// exists (Driver.cpp: `resolveTypes` then `typecheckExpressions`), so this
+// arm cannot simply call `defaultIllFormed` itself.
+//
+// An unresolved nested field member (`rsm.type == nullptr`, or a
+// substitution that fails to resolve) is treated as defaultable — i.e.
+// this function returns false, deferring to "fine" rather than flagging
+// non-defaultable — mirroring `defaultIllFormed`'s own established
+// precedent for the identical case ("unresolved — defer", continuing the
+// walk rather than stopping it). This function has no `decided` output of
+// its own to signal "can't tell"; the outer `argSatisfiesNew` call already
+// owns that contract for the TOP record's OWN fields (its `unresolved`
+// local, checked after the walk), so a deep, rare unresolved-nested-field
+// case defaults to the conservative-toward-acceptance direction rather
+// than manufacturing a false reject.
+bool Resolver::recordFieldTypeHasNoDefault(
+    const TypeRef* t, const common::RecordSubstEnv* incoming) {
+    if (!t || t->nullable) return false;  // nullable → defaults null, fine
+    if (t->kind == TypeRef::Kind::Named && t->declaration &&
+        t->declaration->kind == ast::TypeDeclKind::Record) {
+        common::RecordSubstEnv env;
+        common::seedRecordSubstEnv(*t->declaration, *t, incoming, env);
+        const common::RecordSubstEnv* fieldEnv =
+            env.map.empty() ? nullptr : &env;
+        bool nonDefaultable = false;
+        recordStorageMembers(
+            t->declaration, ctx_,
+            [&](const RecordStorageMember& rsm) {
+                if (!rsm.type) return true;  // unresolved — defer (fine)
+                common::RecordSubstEnv::Entry sub =
+                    common::resolveRecordFieldSubst(rsm.type, fieldEnv);
+                if (recordFieldTypeHasNoDefault(sub.ty, sub.env)) {
+                    nonDefaultable = true;
+                    return false;  // stop
+                }
+                return true;
+            },
+            /*env=*/nullptr);
+        return nonDefaultable;
+    }
+    return categorize(t) == TypeCategory::Reference;
 }
 
 namespace {

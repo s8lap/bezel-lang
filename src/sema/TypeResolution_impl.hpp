@@ -29,6 +29,14 @@
 #include "sema/Symbol.hpp"
 #include "sema/TypeRef.hpp"
 
+// Forward-declared rather than `#include "common/OwnershipFacts.hpp"`: this
+// header is used only by-pointer below (recordFieldTypeHasNoDefault's
+// `incoming` parameter), and pulling in the full definition here would add
+// an include-graph edge every implementation TU of Resolver pays for.
+namespace bezel::common {
+struct RecordSubstEnv;
+}  // namespace bezel::common
+
 namespace bezel::sema {
 
 // Walker for type-resolution. Threads a Scope* through the AST visit.
@@ -1109,6 +1117,21 @@ private:
     // can't be classified (built-ins, unresolved, generic param) so the
     // caller defers; otherwise sets `decided=true` and returns the verdict.
     bool argSatisfiesNew(const TypeRef* arg, bool& decided);
+
+    // fix #4166 (§14.2/§17.11, v0.295): does storage-member type `t` (already
+    // resolved through the enclosing frame's `incoming` substitution
+    // environment) have NO well-defined default — i.e. would `new T()`/
+    // `default(T)` at this position be ill-formed? A plain leaf answers via
+    // `categorize()`; a field that is ITSELF a Record recurses into ITS OWN
+    // storage members, composing `incoming` with a frame seeded from that
+    // record's own generic parameters (mirrors `ExprTC::defaultIllFormed`'s
+    // fix #3995 `Entry::env` composition — see definition for the
+    // delegating-generic-record rationale). Called from `argSatisfiesNew`'s
+    // Record arm; never sets a `decided` flag itself — an unresolved nested
+    // field defers to "defaultable" (returns false), matching
+    // `defaultIllFormed`'s own conservative precedent for the identical case.
+    bool recordFieldTypeHasNoDefault(const TypeRef* t,
+                                      const common::RecordSubstEnv* incoming);
 
     // §12.9 / issue #431: for each interface with variant generic parameters
     // (`out T` or `in T`), verify that every direct occurrence of those
