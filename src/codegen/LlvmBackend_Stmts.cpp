@@ -3216,6 +3216,50 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                     llvm::Type* slotTy = nullptr;
                     llvm::Value* slotAddr =
                         explicitDisposeOwnedReceiverSlot(*ds->value, slotTy);
+                    // fix #4185 (§17.13 / §28.3 / §28.9): `explicitDisposeOwnedReceiverSlot`'s
+                    // LocalSymbol arm only recognizes a plain (non-`using`) `var`
+                    // local as a slot this scope must reclaim via
+                    // `unwindOwnedLocalClass` — which is scoped to a USER class/
+                    // interface with a generated Dispose (a `disposerFns_` entry).
+                    // A vtable-less BUILTIN (StringBuilder, Mutex, Stopwatch, …)
+                    // never has one, so a plain `var y := new StringBuilder();
+                    // _ := y;` found NO slot here and this whole branch emitted
+                    // NOTHING — measured: 568 B leaked under LSan (issue #4185,
+                    // amplified at x200: `var y1 := new StringBuilder(); _ := y1;`
+                    // repeated leaks one per iteration). The `using var` spelling
+                    // of the identical discard was unaffected: `loc->isUsing`
+                    // short-circuits to `lvalueAddr` before
+                    // `unwindOwnedLocalClass` is ever consulted — which is why
+                    // the defect surfaced only for the plain-`var` form.
+                    //
+                    // Recover the slot directly via `lvalueAddr` — bypassing
+                    // `unwindOwnedLocalClass` rather than widening it — when the
+                    // discarded value's TYPE is a KNOWN vtable-less builtin.
+                    // `ds->discardOutOwnedVar` is set by the ownership pass only
+                    // for a genuinely Owned named binding (Ownership.cpp ~line
+                    // 3283: `dstate->state == OwnershipState::Owned`), so this
+                    // fallback is never reached for a borrow. The release two
+                    // lines below is already gated on the SAME
+                    // `common::isVtableLessBuiltinClassName` authority the caller
+                    // used to decide whether to look here at all, so the
+                    // generic-class `emitDisposeAndReclaim` fallback further down
+                    // — the wild vtable jump #2675 exists to prevent — can never
+                    // fire on the object recovered through this path. Widening
+                    // `unwindOwnedLocalClass` itself was rejected: it also drives
+                    // `registerUnwindOwnedLocal`'s EXCEPTION-unwind registration,
+                    // which dispatches through `emitDisposeAndReclaim`'s vtable
+                    // call — exactly the #2675 wild jump — so making it truthy
+                    // for a vtable-less builtin would reintroduce that crash on
+                    // the unwind edge. // per §17.13, §28.3, §28.9, #2675, #4185
+                    if (!slotAddr) {
+                        std::string_view fbBn;
+                        if (const sema::TypeRef* fbRt =
+                                ctx_.exprType(*ds->value))
+                            fbBn = builtinTypeName(fbRt);
+                        if (!fbBn.empty() &&
+                            common::isVtableLessBuiltinClassName(fbBn))
+                            slotAddr = lvalueAddr(*ds->value, slotTy);
+                    }
                     if (slotAddr) {
                         llvm::Value* obj =
                             builder_.CreateLoad(ptrTy(), slotAddr);
