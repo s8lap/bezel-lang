@@ -1,6 +1,6 @@
 # Bezel for Code Generation
 
-*Validated against v0.296. Companion to the Bezel Language Specification — a writing reference, not a normative document.*
+*Validated against v0.297. Companion to the Bezel Language Specification — a writing reference, not a normative document.*
 
 A dense reference for writing correct Bezel without reading the spec. It covers the syntax surface, the ownership rules, the standard-library name index, the idioms that work, and the shapes that look right and are rejected.
 
@@ -1776,9 +1776,17 @@ public record Tally
 end Tally;
 
 public record Session(owned Log: FileStream);      // ERROR: records cannot carry disposal obligations
+
+public record Version(Major: int)
+  public virtual method Label(): string => $"v{Major}";   // ERROR: no `virtual`/`abstract`/`sealed override` on a record member (§9.2)
+end Version;
+
+public enum Level: ISerializable
+  Low serialized "x", High serialized "x";                 // ERROR: two constants under one serialized name (§9.8)
+end Level;
 ```
 
-> §9.4: in every instance member body of a value kind, a store landing in the receiver's own storage is rejected — compound assignment and `++`/`--` included, through their desugarings. §28.5: copy-semantics holders cannot own; use a `class`.
+> §9.4: in every instance member body of a value kind, a store landing in the receiver's own storage is rejected — compound assignment and `++`/`--` included, through their desugarings. §28.5: copy-semantics holders cannot own; use a `class`. §9.2/§10.5/§35.2: a record, enum, or choice member — method, property, or indexer — admits no `virtual`, `abstract`, or `sealed override`, and `override` only on `Equals`/`GetHashCode`/`ToString`; value kinds are sealed and dispatch statically. §9.8: a serialized name (the rename, or the identifier where none is declared; compared ordinally) must be unique across a type's components, its enum constants, and its choice cases — a choice's payload fields are unique **within their own case**, two cases never sharing a wire object.
 
 ```bezel
 public method Bumped(): Tally => this with(Hits := Hits + 1);   // return the updated value
