@@ -11968,6 +11968,22 @@ private:
     // absent: those are saved where they are needed, by name, because they are
     // not `clearSmFrame()`'s business.
     //
+    // fix #4158 / #4169 (§29.1/§29.7/§30.7, v0.295): iterElemIsRuntimeManagedPrimitive_
+    // and smIterEnumFrameSlot_ were two more members in the #3505 gap — siblings
+    // of iterElemIsOwnedClass_/iterIsOwningIter_/smForInSrcFields_ (already on
+    // this list), written by the exact same emitIteratorMethod /
+    // emitAsyncIteratorMethod entry prologues and read only from inside THAT
+    // same emission (write-before-read within one emitter run, exactly like
+    // their already-listed siblings) — but never folded in, so
+    // `buildSpecializedMethodFn`'s nested emission silently clobbered the
+    // OUTER's copy with the INNER's for the rest of the outer body. UNLIKE the
+    // §30.5 Pattern A return flags two lines up, neither collides with a
+    // hand-declared `NestedBodyScope` member of the same name (verified:
+    // `git grep -n 'iterElemIsRuntimeManagedPrimitive_\|smIterEnumFrameSlot_'
+    // src/codegen/LlvmBackend_Assign.cpp` returns nothing), so folding them in
+    // is a plain, safe addition rather than the duplicate-declaration hazard
+    // that keeps the two flags out.
+    //
     // The aliases exist only so a member type containing a comma can be passed
     // as a single macro argument.
     using SmFrameBlockVec       = std::vector<llvm::BasicBlock*>;
@@ -11984,6 +12000,11 @@ private:
     // order, which is driven by the AST walk and therefore reproducible.
     using SmFrameAllocaFieldMap = llvm::MapVector<llvm::AllocaInst*, unsigned>;
     using SmFrameAllocaSet      = std::unordered_set<llvm::AllocaInst*>;
+    // fix #4169: smIterEnumFrameSlot_'s own declared type (LlvmBackend_impl.hpp
+    // ~L2162) is a plain std::unordered_map, NOT the MapVector SmFrameAllocaFieldMap
+    // above — this fold must not silently change its container (and hence its
+    // iteration-order properties) as a side effect of protecting it.
+    using SmFrameAllocaIndexMap = std::unordered_map<llvm::AllocaInst*, unsigned>;
 
 #define BEZEL_SM_FRAME_MEMBERS(X)                                              \
     /* kind-agnostic frame scaffolding */                                      \
@@ -12002,6 +12023,10 @@ private:
     X(SmFrameNodeFieldMap,    smLocalPreBoxField_,       {}) /* #3484 f/u */   \
     X(SmFrameAllocaSet,       smRestoredParamSlots_,     {}) /* #3484 f/u */   \
     X(llvm::Function*,        smCellFrameFn_,            nullptr)              \
+    /* fix #4169: sibling of smForInSrcFields_ above (same §29.7 #944 tag,     \
+       same "reset per iterator body" contract) -- was not folded in when     \
+       #3505 first built this list. */                                        \
+    X(SmFrameAllocaIndexMap,  smIterEnumFrameSlot_,      {}) /* §29.7 (#944) */\
     /* iterator-specific half */                                               \
     X(unsigned,               iterCurrentValField_,      0)                    \
     X(llvm::Type*,            iterElemTy_,               nullptr)              \
@@ -12009,6 +12034,10 @@ private:
     X(bool,                   iterElemIsOwnedClass_,     false)   /* #1120 */  \
     X(unsigned,               iterCurrentValOwnedField_, 0)       /* #1120 */  \
     X(bool,                   iterIsOwningIter_,         false)   /* #2621 */  \
+    /* fix #4158: sibling of iterElemIsOwnedClass_/iterIsOwningIter_ just      \
+       above -- same exhaustive three-way dispatch, same emitters, was never  \
+       folded in alongside them. */                                           \
+    X(bool,      iterElemIsRuntimeManagedPrimitive_,     false)   /* #2738 */  \
     /* async-specific half */                                                  \
     X(unsigned,               asyncOuterTaskField_,      0)                    \
     X(unsigned,               asyncPendingTaskField_,    0)                    \

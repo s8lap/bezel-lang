@@ -13383,6 +13383,36 @@ llvm::Function* Emitter::buildSpecializedMethodFn(
     asyncResultSemaType_ = nullptr;
     asyncPatternAResultDisposer_ = nullptr;
     asyncOwnedParamFrame_ = nullptr;  // §30.1 (#1521); emitAsyncMethod republishes it
+    // fix #4157 (§30.5, v0.295): asyncChainedReturn_ / asyncBorrowedReturn_ are
+    // the §30.5 Pattern A return-kind detection flags — deliberately NOT part
+    // of BEZEL_SM_FRAME_MEMBERS (see that macro's own comment: "saved where
+    // they are needed, by name"), so smFrameSave above does not touch them,
+    // and they are NOT write-before-read the way the macro members are: unlike
+    // this function's other by-name saves (savedSmIterCleanup /
+    // savedAsyncHandlerSpill, just above), a genuinely kind-1 inner body never
+    // explicitly sets these to false — detectAsyncPatternAKind only sets them
+    // TRUE for a detected kind-2 chain and otherwise leaves whatever was
+    // already there (LlvmBackend_Async.cpp ~L992). Mirrors fix #4118's
+    // identical treatment in `lowerLambda`'s async branch, the sibling site
+    // for the exact same pair: if an ENCLOSING `return await <call>` has
+    // already set one of these true before lowering its own operand, and that
+    // operand's lowering reaches HERE (a first-time generic async/iterator
+    // method specialization, built lazily mid-emission of the outer body),
+    // the inner specialization's own emit*Method call below would otherwise
+    // inherit the outer's stale flag, misclassify ITS OWN return kind (wrong
+    // runtime disposer attached to the inner's own task), and then clobber the
+    // flag on its way out — so the outer's own post-operand read then
+    // misclassifies too. The two §30.5 kind decisions swap, exactly as #4118
+    // measured (a live heap-use-after-free / double-free), reached through a
+    // generic specialization boundary instead of an inline async-lambda IIFE.
+    // DESTRUCTIVE, not a soft hint: this flag alone selects which runtime
+    // intrinsic emitReturn/lowerAwait emit (bz_task_set_chained vs
+    // bz_task_set_result_disposer), so a leaked value is a miscompile, not a
+    // degraded heuristic — the same classification #4118's own fix recorded.
+    bool savedAsyncChainedReturn = asyncChainedReturn_;
+    bool savedAsyncBorrowedReturn = asyncBorrowedReturn_;
+    asyncChainedReturn_ = false;
+    asyncBorrowedReturn_ = false;
 
     currentFn_ = specFn;
     // #1060 / #1061: a STATE-MACHINE method (async / iterator) must have its
@@ -13625,6 +13655,13 @@ llvm::Function* Emitter::buildSpecializedMethodFn(
     // this function returns; only the members outside it are by hand.
     smIterCleanupAtState_ = std::move(savedSmIterCleanup);  // fix #1567
     asyncHandlerSpillSlots_ = std::move(savedAsyncHandlerSpill);
+    // fix #4157: restore the §30.5 Pattern A flags the save/reset above set
+    // aside — see the comment there. This is the ONLY exit path in this
+    // function after the save point (the sole earlier `return`, the cache-hit
+    // `return cit->second;`, is well before smFrameSave/this save), so a
+    // single restore here covers every exit.
+    asyncChainedReturn_ = savedAsyncChainedReturn;
+    asyncBorrowedReturn_ = savedAsyncBorrowedReturn;
 
     return specFn;
 }
