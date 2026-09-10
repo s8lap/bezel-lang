@@ -280,6 +280,31 @@ TypeSymbol* resolveAliasToTypeSymbol(SemaContext& ctx, TypeAliasSymbol* aliasSym
 // would have silently reintroduced a false accept there (measured against
 // `xmod_imported_positional_new_args_3141_test.cpp`).
 //
+// A second such divergence, caught by review after the first landed: a
+// null-declaration `Named` type is not only an unresolved generic
+// parameter — it is also how every always-available builtin (`Array`,
+// `Dictionary`, `Set`, `OwningTask`, …) is represented, and
+// `defaultIllFormed`'s prior text unconditionally treated ALL of them as
+// defaultable, `argSatisfiesNew`'s regression relative to its own
+// pre-hoist `categorize()`-based behavior. Fixed NARROWLY, by builtin
+// NAME, for the stdlib collection family
+// (`Array`/`Dictionary`/`Set`/`Stack`/`Queue`/`LinkedList`/
+// `SortedDictionary`/`SortedSet`, their `Owning*` counterparts, and
+// `Task`/`OwningTask`) rather than by mirroring `Resolver::categorize`'s
+// `astNode`/`builtinTypeArity` fallback wholesale — that fallback does
+// not distinguish these REFERENCE builtins from VALUE ones (`Guid`,
+// `IntPtr`, `DateTime`, …), and a first attempt at the wholesale mirror
+// broke `default(Guid)` / `default(IntPtr)`
+// (tests/lit/builtin_closed_ctor_surface_accept_2994.bzl), which
+// `defaultIllFormed`'s ORIGINAL text had always accepted. See
+// `typeHasNoDefaultWalk`'s Named-arm comment (TypeResolution_Checks.cpp)
+// for the full account. Third occurrence in this run of the same defect
+// class — a predicate over a null-declaration `Named` type that silently
+// drops the ~50-builtin population (issue #4229 tracks two more;
+// `fix #4199` was a fourth) — and a caution for the next one: verify
+// against BOTH the `where T: new()` and `default(...)` call paths before
+// picking a fallback, not just the one the regression report named.
+//
 // `incoming` is the enclosing frame's substitution environment (null/empty
 // at a top-level, non-nested call — every existing call site passes what
 // it already did).

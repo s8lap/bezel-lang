@@ -7932,7 +7932,7 @@ bool Resolver::argSatisfiesNew(const TypeRef* arg, bool& decided) {
 // version's Resolver-local `recordFieldTypeHasNoDefault`/
 // `recordFieldTypeHasNoDefaultWalk` pair, and what call sites it unifies).
 // `typeHasNoDefaultWalk` below is a port of `ExprTC::defaultIllFormed`'s
-// full per-kind switch (ExprTypecheck_Exprs.cpp), with TWO deliberate
+// full per-kind switch (ExprTypecheck_Exprs.cpp), with THREE deliberate
 // changes from that function's exact prior text:
 //
 //   1. The `seen` cycle guard around the Record-kind recursion (PATH
@@ -7955,6 +7955,29 @@ bool Resolver::argSatisfiesNew(const TypeRef* arg, bool& decided) {
 //      direction would have silently reintroduced a false accept —
 //      MEASURED regression, caught by this fix's own broad sweep against
 //      `xmod_imported_positional_new_args_3141_test.cpp`).
+//   3. The Named arm's `!t->declaration` branch now falls back to
+//      `isBuiltinTypeName` before deferring (see that branch's own
+//      comment below). `defaultIllFormed`'s prior text unconditionally
+//      returned `false` ("defaultable") for EVERY null-declaration Named
+//      type — both a genuine unresolved generic parameter AND every
+//      always-available builtin (`Array`, `Dictionary`, `Set`, `OwningTask`,
+//      …, TypeResolution_Names.cpp's ~50-name Slice-S24 population, which
+//      is represented with a null declaration precisely because it has no
+//      user `TypeSymbol`). `Resolver::categorize` already distinguished
+//      these via an `astNode`/`builtinTypeArity` fallback;
+//      `argSatisfiesNew`'s pre-hoist, categorize()-based leaf test
+//      inherited that distinction and correctly rejected a builtin-
+//      collection-typed record field under `where T: new()` — the naive
+//      port of `defaultIllFormed`'s text (which never had that
+//      distinction) silently dropped it, a REGRESSION relative to
+//      `argSatisfiesNew`'s own prior behavior review caught with a live
+//      A/B measurement (`record Box(A: Array<int>)`: REJECT on parent
+//      `1e6d80f`, silent ACCEPT on the un-fixed hoist). This is the THIRD
+//      predicate in this run caught misclassifying this same ~50-builtin
+//      population — issue #4229 already tracks two others
+//      (`refMentionsTypeVariable`, `refMentionsAnyOf`), and `fix #4199`
+//      was sent back for a fourth; "no declaration" keeps getting
+//      silently read as "generic parameter only", and it never has been.
 //
 // On a detected cycle this returns `false` ("has a default" — defer, not
 // "non-defaultable"): a self-referential record is ALREADY rejected with
@@ -8007,7 +8030,120 @@ bool typeHasNoDefaultWalk(const TypeRef* t, const common::RecordSubstEnv* incomi
             return typeHasNoDefaultWalk(sub.ty, sub.env, ctx, seen);
         }
         case TypeRef::Kind::Named: {
-            if (!t->declaration) return false;  // generic param / unresolved
+            if (!t->declaration) {
+                // fix #4166 review follow-up #3 (§2.3/§14.2, v0.298): a
+                // null-declaration Named type is NOT only a generic param
+                // or an unresolved name — it is also how EVERY
+                // always-available builtin (`Array`, `OwningArray`,
+                // `Dictionary`, `Set`, `SortedDictionary`, `OwningTask`,
+                // and the rest of the ~50-name Slice-S24 population,
+                // TypeResolution_Names.cpp) is represented: that file's own
+                // comment says they "have no user TypeSymbol, so we record
+                // a Named ref with a null declaration".
+                //
+                // MEASURED gap this closes: `record BoxArr(A: Array<int>)`
+                // used at a `where T: new()` site — REJECT on parent
+                // `1e6d80f`, silently ACCEPT on this fix before this
+                // change (the unconditional `return false` two lines
+                // below never consulted anything about the builtin name).
+                //
+                // review's literal suggestion — mirror `categorize()`'s
+                // `astNode`/`builtinTypeArity` fallback, which flags EVERY
+                // builtin as a non-defaultable reference type — was TRIED
+                // and REVERTED: `categorize()` does not distinguish
+                // VALUE builtins (`Guid`, `IntPtr`, `DateTime`, …) from
+                // REFERENCE ones (`Array`, `Dictionary`, …) either — a
+                // separate, pre-existing imprecision in `categorize()`
+                // itself, out of scope here — and mirroring it broke
+                // `default(Guid)` / `default(IntPtr)`
+                // (tests/lit/builtin_closed_ctor_surface_accept_2994.bzl),
+                // which `defaultIllFormed`'s ORIGINAL text had always
+                // accepted (ITS null-declaration branch returned `false`
+                // unconditionally, for every null-declaration builtin, not
+                // narrowly — so this was passing by accident of a blanket
+                // accept, not by any deliberate Guid/IntPtr handling).
+                //
+                // So this checks by NAME against the STDLIB COLLECTION
+                // FAMILY specifically (docs/Bezel_For_Code_Generation.md's
+                // collection-family table — the borrowing forms and their
+                // `Owning*` counterparts) plus `Task`/`OwningTask` — the
+                // exact population review's own repro named, and the
+                // ONLY subset this fix's own regression sweep (including
+                // the full 2311-test lit diagnostic track) verifies stays
+                // correct on both the `where T: new()` and `default(...)`
+                // paths. A complete, verified value-vs-reference table for
+                // the FULL null-declaration builtin population (~50 names)
+                // is future work, not attempted here — narrower-but-correct
+                // over broader-but-regressing.
+                //
+                // A leaf that returns unconditionally on the FIRST line of
+                // a branch, with no fallback for the builtin population at
+                // all, is a recurring shape this run has hit before —
+                // #4229 (`refMentionsTypeVariable`, `refMentionsAnyOf`) and
+                // the returned `fix #4199` — so this walk joins that
+                // family; the next predicate over a null-declaration Named
+                // type should check that issue before assuming "no
+                // declaration" means "generic parameter", AND should
+                // verify against `default(...)`-context tests too, not
+                // only `where T: new()` ones — this fix's own first
+                // attempt did not, and it cost a lit-track regression.
+                if (t->astNode && t->astNode->name &&
+                    t->astNode->name->parts.size() == 1) {
+                    std::string_view head = t->headName();
+                    if (head == "Array" || head == "OwningArray" ||
+                        head == "Dictionary" || head == "OwningDictionary" ||
+                        head == "Set" || head == "OwningSet" ||
+                        head == "SortedDictionary" || head == "SortedSet" ||
+                        head == "Stack" || head == "OwningStack" ||
+                        head == "Queue" || head == "OwningQueue" ||
+                        head == "LinkedList" || head == "OwningLinkedList" ||
+                        head == "Task" || head == "OwningTask") {
+                        return true;  // heap collection/task: no default
+                    }
+                    // fix #4166 review follow-up #3b (stdlib §10.1, v0.298):
+                    // `CString`/`WString`/`RawBytes` — the §10 FFI-boundary
+                    // classes, resolved through this SAME null-declaration
+                    // path (TypeResolution_Names.cpp:390, one combined
+                    // check with these three names) — "none has a public
+                    // constructor" (stdlib §10.1/§10.2/§10.3), so like the
+                    // collection family above they are non-nullable
+                    // reference types with no default. MEASURED: `record
+                    // Box(C: CString, N: int)` under `where T: new()` /
+                    // `default(...)` compiled clean (exit 0) and, when
+                    // `.Length` was read on the zero-initialized field,
+                    // SIGSEGV'd (exit 139) — identically reproduced on
+                    // parent `1e6d80f` (this defect predates this whole
+                    // fix chain; it was never introduced or worsened by
+                    // it, only left unmeasured). `WString`/`RawBytes` did
+                    // not crash on the SAME `.Length` probe (their layout
+                    // apparently tolerates a null-initialized internal
+                    // pointer for that one accessor), but the §17.11
+                    // classification is identical for all three — a
+                    // non-nullable reference type with no public
+                    // constructor is not defaultable regardless of
+                    // whether a given accessor happens to fault.
+                    //
+                    // NOT reused: `isFfiBoundaryNamedType` (this file,
+                    // ~8869) groups these three with `IntPtr`/`UIntPtr` —
+                    // correctly, for ITS question ("is this type
+                    // FFI-signature-compatible", §32.5). `IntPtr`/`UIntPtr`
+                    // ARE defaultable (value types; `default(IntPtr)` is
+                    // pinned accepted by
+                    // tests/lit/builtin_closed_ctor_surface_accept_2994.bzl),
+                    // so answering MY question ("is this type
+                    // defaultable") with that predicate would have
+                    // wrongly flagged `IntPtr`/`UIntPtr` too — precisely
+                    // the §25 trap ("what was this predicate validated to
+                    // answer, not what it correlates with") this fix's
+                    // own review already caught once this cycle for
+                    // `categorize()`'s builtin fallback.
+                    if (head == "CString" || head == "WString" ||
+                        head == "RawBytes") {
+                        return true;  // FFI-boundary class: no default
+                    }
+                }
+                return false;  // generic param / unresolved / other builtin — defer
+            }
             auto k = t->declaration->kind;
             // fix #3108 (§16.3/§16.4): `default(Range<T>)` is a compile
             // error — the all-zero default would falsify Range's own "no

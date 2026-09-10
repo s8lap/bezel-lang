@@ -414,18 +414,42 @@ bool typeTestTargetMentionsTypeVariable(const TypeRef* t) {
 // are close to a dozen across this file and ExprTypecheck.cpp — keeps the
 // same signature with the implementation hoisted.
 //
-// ONE deliberate behavior change survives the hoist: a non-nullable
-// `Object`-typed component now ALSO reports non-defaultable (previously
-// excluded here — "left out... to keep this consistent with the original
-// #951 scope — a separate consideration", this function's own prior text).
-// `Resolver::argSatisfiesNew`'s pre-existing, tested behavior already
-// correctly rejected `Object` (categorize() classifies it Reference), and
-// unifying toward the narrower exclusion instead would have silently
-// reintroduced a false accept there (caught by this fix's own broad
-// regression sweep). §17.11's "defaultable" definition is unambiguous
-// here regardless of which side moved: "Not defaultable: non-nullable
-// reference types" includes `Object`. See `typeHasNoDefaultWalk`'s own
-// Primitive-arm comment (TypeResolution_Checks.cpp) for the full note.
+// TWO deliberate behavior changes survive the hoist, both in
+// `argSatisfiesNew`'s favor because its pre-hoist, categorize()-based leaf
+// test was stricter than this function's own prior text on each:
+//
+//   * a non-nullable `Object`-typed component now ALSO reports
+//     non-defaultable (previously excluded here — "left out... to keep
+//     this consistent with the original #951 scope — a separate
+//     consideration", this function's own prior text). §17.11's
+//     "defaultable" definition is unambiguous regardless of which side
+//     moved: "Not defaultable: non-nullable reference types" includes
+//     `Object`.
+//   * a null-declaration `Named` type naming a stdlib COLLECTION or `Task`
+//     builtin (`Array`, `Dictionary`, `Set`, `OwningTask`, …) now ALSO
+//     reports non-defaultable. This function's prior text returned
+//     `false` unconditionally for the WHOLE null-declaration population
+//     (collections and value builtins like `Guid`/`IntPtr`/`DateTime`
+//     alike); `argSatisfiesNew`'s pre-hoist `categorize()`-based leaf test
+//     inherited a coarser but directionally-correct distinction (every
+//     builtin ⇒ reference) from its own fallback. Review caught the
+//     regression this hoist created (`record Box(A: Array<int>)`: REJECT
+//     on the parent, silent ACCEPT on the un-fixed hoist) — the THIRD
+//     predicate this run caught misclassifying this same ~50-builtin
+//     null-declaration population (issue #4229 tracks two more;
+//     `fix #4199` a fourth). The fix here is narrower than
+//     `categorize()`'s own fallback, BY NAME, scoped to the collection/
+//     `Task` family only — see `typeHasNoDefaultWalk`'s Named-arm comment
+//     (TypeResolution_Checks.cpp) for why the wholesale mirror was tried
+//     and reverted (it broke `default(Guid)` / `default(IntPtr)`,
+//     tests/lit/builtin_closed_ctor_surface_accept_2994.bzl, which this
+//     function's OWN prior text had always accepted).
+//
+// Unifying toward this function's OWN narrower prior text on either would
+// have silently reintroduced a false accept in `argSatisfiesNew` — caught
+// by this fix's own broad regression sweeps. See `typeHasNoDefaultWalk`'s
+// Primitive-arm and Named-arm comments (TypeResolution_Checks.cpp) for the
+// full notes on each.
 bool ExprTC::defaultIllFormed(const TypeRef* t,
                               const common::RecordSubstEnv* incoming) {
     return sema::typeHasNoDefault(t, ctx_, incoming);
