@@ -8694,11 +8694,33 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                                 llvm::StructType* entStTy =
                                     llvm::StructType::get(
                                         llvm_, {kTyLlvm, vTyLlvm});
+                                // fix #4136 (§27.5 / stdlib §4.9, v0.295):
+                                // same capture-cell-holder-vs-heap-cell defect
+                                // as fix #3876's `.Key`/`.Value` READ
+                                // intercept (LlvmBackend_Exprs.cpp) -- see its
+                                // comment there for the full mechanism. When
+                                // `entry` (a DrainedEntry<K,V> loop variable)
+                                // has been captured by an escaping closure,
+                                // `locals_[entry]`'s `localSlot()` alloca is
+                                // REBOUND (§27.5 capture boxing) to a
+                                // ptr-sized cell-holder, not the `{K,V}`
+                                // struct itself -- GEP'ing `slot` directly (as
+                                // this arm did pre-fix) treats the 8-byte
+                                // holder as if it WERE the wider struct.
+                                // `boxedStorage` is the existing §27.5 funnel:
+                                // it dereferences the holder when `slot` is a
+                                // capture cell and returns `slot` unchanged
+                                // otherwise (an ordinary, non-captured local),
+                                // so the already-working non-captured shape is
+                                // unaffected.
+                                llvm::Type* baseElemTy = nullptr;
+                                llvm::Value* base =
+                                    boxedStorage(slot, baseElemTy);
                                 // Step 1: dispose V (field[1]) and null it.
                                 if (vTyLlvm->isPointerTy()) {
                                     llvm::Value* valFldPtr =
                                         builder_.CreateStructGEP(
-                                            entStTy, slot, 1, "de.val.ptr");
+                                            entStTy, base, 1, "de.val.ptr");
                                     llvm::Value* valPtr =
                                         builder_.CreateLoad(
                                             ptrTy(), valFldPtr, "de.val");
@@ -8730,7 +8752,7 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                                         sema::PrimitiveType::String) {
                                     llvm::Value* keyFldPtr =
                                         builder_.CreateStructGEP(
-                                            entStTy, slot, 0, "de.key.ptr");
+                                            entStTy, base, 0, "de.key.ptr");
                                     llvm::Value* keyPtr =
                                         builder_.CreateLoad(
                                             ptrTy(), keyFldPtr, "de.key");
