@@ -1290,7 +1290,7 @@ bool ExprTC::rejectNewOnNonInstantiableKind(const ast::NewExpr& ne,
             Severity::Error, ne.span.begin,
             std::string("cannot instantiate interface `") +
             std::string(t->name) +
-            "` with `new` (§11.2)");
+            "` with `new` (§3.1 / §3.2 / §17.7)");
         return true;
     }
     return false;

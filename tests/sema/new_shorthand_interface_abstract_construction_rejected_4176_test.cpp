@@ -111,7 +111,7 @@ BEZEL_TEST(sema_new_shorthand_interface_abstract_construction_rejected_4176,
     BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
     BEZEL_EXPECT_TRUE(
         diagnosticMessageContains(r, "cannot instantiate interface"));
-    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "§11.2"));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "§3.1"));
 }
 
 BEZEL_TEST(sema_new_shorthand_interface_abstract_construction_rejected_4176,

@@ -1505,7 +1505,8 @@ bool ExprTC::groundSatisfiesNew(const TypeRef* arg, bool& decided) {
         }
         if (d->kind == ast::TypeDeclKind::Interface) {
             decided = true;
-            return false;  // interfaces are not constructible (§11.2)
+            return false;  // interfaces are not constructible (§14.2: "Interface
+                            // substitutions never satisfy `new()`")
         }
         // §35.10 (v0.200, #2044): "Choices never satisfy the value-type arm:
         // `default(C)` is undefined for every choice type." So `where T: new()`

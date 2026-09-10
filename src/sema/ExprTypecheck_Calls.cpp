@@ -3297,7 +3297,8 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                         satisfied = false;
                                     } else if (argDecl->kind == ast::TypeDeclKind::Interface) {
                                         decided = true;
-                                        satisfied = false;  // §11.2: not constructible
+                                        satisfied = false;  // §14.2: interface substitutions
+                                                            // never satisfy `new()`
                                     } else if (argDecl->kind == ast::TypeDeclKind::Class) {
                                         // fix #3141 (family F3 of umbrella
                                         // #3152, §2.8.3 rule 4): the primary

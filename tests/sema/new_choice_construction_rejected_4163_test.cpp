@@ -303,7 +303,8 @@ BEZEL_TEST(sema_new_choice_construction_rejected_4163,
 }
 
 // Control: `new` on an INTERFACE is a PRE-EXISTING, separately-fixed
-// rejection (§11.2) — this fix must not change its message or behavior.
+// rejection (§3.1 / §3.2 / §17.7) — this fix must not change its message or
+// behavior.
 BEZEL_TEST(sema_new_choice_construction_rejected_4163,
            control_new_interface_still_rejected_pre_existing_spec_11_2) {
     auto r = runAot(
