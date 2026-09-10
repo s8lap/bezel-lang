@@ -89,8 +89,10 @@
 //     - the enclosing type is a `record`, matching the reject-side control
 //
 // Spec citations verified verbatim against docs/Bezel_Language_Spec.md at
-// v0.295: §9.7 "Records and disposal"; §35.1 "Choice declaration" ("a
-// choice's construction *is* case selection"); §35.3 "Choice construction".
+// v0.295: §9.7 "Records and disposal"; §35.1 "Declaration" (anchor
+// sec-choice-declaration; "a choice's construction *is* case selection" is
+// this section's own §35.2 "Members" paragraph, quoted again at §22.8
+// "Field initializers"); §35.3 "Construction and payload ownership".
 
 #include "support/aot_result_asserts.hpp"  // failedAtCompileTimeWithRealLocation, diagnosticMessageContains
 #include "support/aot_support.hpp"         // runAot
