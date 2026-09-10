@@ -1187,6 +1187,41 @@ bool ExprTC::isEnclosingGenericTypeParamName(std::string_view name) const {
 // or (imported) a non-empty `moduleName`; both are excluded before the name is
 // consulted, exactly as in codegen's `unconstructedBuiltinNewName` twin. A user
 // `class Guid` therefore keeps constructing.
+// fix #4170 (§35.1/§35.2/§35.3, v0.295; mirrors #4163's §5.4/§10 enum
+// rejection): the single authority for "does `new` construct a value of
+// this kind" — neither an enum nor a choice has a constructor. See the
+// declaration in ExprTypecheck_impl.hpp for the full rationale; this is
+// the same logic the explicit `new T(...)` NewExpr-typing arm used to
+// spell out inline (moved here so the two §17.7 shorthand call sites in
+// ExprTypecheck.cpp can share it instead of duplicating the predicate a
+// third and fourth time, per this repo's own "duplicated classification
+// predicates" caution, CLAUDE.md / LANE_RULES.md §6).
+bool ExprTC::rejectNewOnEnumOrChoice(const ast::NewExpr& ne,
+                                      const TypeRef* rt) {
+    if (!(rt->kind == TypeRef::Kind::Named && rt->declaration)) return false;
+    if (rt->declaration->kind == ast::TypeDeclKind::Enum) {
+        ctx_.diagnostics().report(
+            Severity::Error, ne.span.begin,
+            "`new` cannot construct an enum — an enum value is "
+            "produced by the cast `" +
+            std::string(rt->declaration->name) +
+            "(n)` from its underlying integer, not with `new` "
+            "(§5.4/§10)");
+        return true;
+    }
+    if (rt->declaration->kind == ast::TypeDeclKind::Choice) {
+        ctx_.diagnostics().report(
+            Severity::Error, ne.span.begin,
+            "`new` cannot construct a choice — a choice has no "
+            "constructors; a choice's construction is case "
+            "selection, written `" +
+            std::string(rt->declaration->name) +
+            ".Case(args)` instead of `new` (§35.1/§35.2/§35.3)");
+        return true;
+    }
+    return false;
+}
+
 void ExprTC::checkBuiltinClosedConstructorSurface(const ast::NewExpr& ne) {
     // Resolved exactly as `lowerNew` resolves it (and as codegen's #2974 twin
     // does): the explicit `ne.type` when present, else the §17.7 `new(...)`
@@ -3845,60 +3880,28 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                 // here; the §17.7 `new()` shorthand is checked at the two
                 // sites that give it its target type (ExprTypecheck.cpp).
                 checkBuiltinClosedConstructorSurface(*ne);
-                // §5.4 / §10 (#960): `new` cannot construct an enum. An enum
-                // value is produced by the int→enum CAST `E(n)` (§5.4), not by
-                // construction — an enum has no constructor (§10). `new E(...)`
-                // (and nested `new Outer.E(...)`) were silently accepted; reject
-                // and point at the cast form. (The correct cast `E(n)` is a
-                // CallExpr, not a NewExpr, and is unaffected.)
-                if (rt->kind == TypeRef::Kind::Named && rt->declaration &&
-                    rt->declaration->kind == ast::TypeDeclKind::Enum) {
-                    ctx_.diagnostics().report(
-                        Severity::Error, ne->span.begin,
-                        "`new` cannot construct an enum — an enum value is "
-                        "produced by the cast `" +
-                        std::string(rt->declaration->name) +
-                        "(n)` from its underlying integer, not with `new` "
-                        "(§5.4/§10)");
-                }
-                // fix #4163 (§35.1/§35.2/§35.3, v0.295): `new` cannot
-                // construct a choice, mirroring the enum rejection just
-                // above. §35.1 "Declaration": "Choices cannot have
-                // destructors, constructors, instance fields, block-form or
-                // storage-backed properties, indexers, or nested types" —
-                // there is no constructor for `new` to resolve to. §35.2
-                // "Members": "a choice's construction *is* case selection"
-                // — a choice value is produced by a qualified CASE CALL
-                // (§35.3 "Construction and payload ownership": "Construction
-                // is qualified, resolving exactly as enum constants do
-                // (§10.1): `FetchOutcome.NotModified` for a payload-free
-                // case ..., `FetchOutcome.Failed(504, "upstream timeout")`
-                // for a payload case"), never a `new` expression. Before
-                // this fix `new ChoiceType(args)` was silently ACCEPTED
-                // with no case identity at all — the value carried no
-                // discriminant a real case construction would set — and
-                // running a `case` statement over such a value crashed the
-                // compiler (SIGSEGV, #4163) because codegen's `case`-
-                // statement lowering assumes every choice-typed scrutinee
-                // it sees was produced by a real case construction. (The
-                // correct qualified-case form `Type.Case(args)` is a
-                // CallExpr, not a NewExpr, and is unaffected.) The
-                // diagnostic names only the qualified spelling as the
-                // remedy — §35.3's OTHER admitted spelling, the bare case
-                // name in a declared-result position, is a real but
-                // SEPARATE gap in this compiler (issue #2354, "declared-
-                // result target-typing of choice-case constructions"); do
-                // not point users at a spelling that does not yet resolve.
-                if (rt->kind == TypeRef::Kind::Named && rt->declaration &&
-                    rt->declaration->kind == ast::TypeDeclKind::Choice) {
-                    ctx_.diagnostics().report(
-                        Severity::Error, ne->span.begin,
-                        "`new` cannot construct a choice — a choice has no "
-                        "constructors; a choice's construction is case "
-                        "selection, written `" +
-                        std::string(rt->declaration->name) +
-                        ".Case(args)` instead of `new` (§35.1/§35.2/§35.3)");
-                }
+                // §5.4/§10 (#960) and §35.1/§35.2/§35.3 (#4163): `new`
+                // cannot construct an enum (an enum value comes from the
+                // int→enum CAST `E(n)`, §5.4 — an enum has no constructor,
+                // §10) or a choice (§35.1 "Declaration": "Choices cannot
+                // have destructors, constructors, instance fields,
+                // block-form or storage-backed properties, indexers, or
+                // nested types"; §35.2 "Members": "a choice's construction
+                // *is* case selection", produced only by the qualified
+                // case call `Type.Case(args)`, §35.3). `new E(...)` /
+                // `new ChoiceType(args)` were silently accepted; the
+                // choice case additionally reached codegen with no case
+                // discriminant and crashed the compiler on the first
+                // `case` statement over the result (SIGSEGV, #4163). Both
+                // the qualified case call and the enum cast are CallExprs,
+                // not NewExprs, and are unaffected. fix #4170 (v0.295)
+                // factored this out to `rejectNewOnEnumOrChoice` so the
+                // §17.7 typeless `new()` shorthand sites in
+                // ExprTypecheck.cpp (which reach the same `rt`-resolution
+                // but never ran through this NewExpr-typing block) share
+                // this one authority instead of a third/fourth spelling
+                // of the same two checks.
+                rejectNewOnEnumOrChoice(*ne, rt);
                 // §14.5 Scope (v0.184, #1687): "Class-, record-, and
                 // interface-level type arguments are never inferred from
                 // constructor arguments: `new Pair(1, "x")` against `record

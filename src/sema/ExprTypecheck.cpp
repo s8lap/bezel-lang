@@ -12182,6 +12182,18 @@ void ExprTC::visitMember(const ast::Member& m) {
                     if (!shNe->type) {
                         if (auto* fty = ctx_.resolvedType(*fd->type)) {
                             ctx_.setExprType(fd->initializer.get(), fty);
+                            // fix #4170 (§35.1/§35.2/§35.3, v0.295): the
+                            // explicit `new T(...)` site's Enum/Choice
+                            // rejection (fix #960/#4163) never ran for this
+                            // shorthand node — `ne->type` is null by
+                            // definition of "shorthand" — so a field
+                            // shorthand-`new`'d to a Choice reached codegen
+                            // with no case discriminant and crashed the
+                            // compiler on the first `case` statement over
+                            // it (SIGSEGV); the Enum analogue hit an
+                            // IR-verifier backstop instead. Shares the one
+                            // predicate the explicit site now calls too.
+                            rejectNewOnEnumOrChoice(*shNe, fty);
                             if (fty->kind == TypeRef::Kind::Named &&
                                 fty->declaration &&
                                 fty->declaration->kind ==
@@ -13305,6 +13317,19 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                         if (!shNe->type) {
                             ctx_.setExprType(ld->initializer.get(),
                                              lsym->declType);
+                            // fix #4170 (§35.1/§35.2/§35.3, v0.295): the
+                            // local-declaration twin of the field-
+                            // initializer shorthand check below — the
+                            // explicit `new T(...)` site's Enum/Choice
+                            // rejection (fix #960/#4163) never ran for
+                            // this shorthand node, so `var x: ChoiceType
+                            // := new();` reached codegen with no case
+                            // discriminant and crashed the compiler on
+                            // the first `case` statement over it
+                            // (measured: SIGSEGV, exit 139). Shares the
+                            // one predicate the explicit site now calls
+                            // too, instead of a third spelling.
+                            rejectNewOnEnumOrChoice(*shNe, lsym->declType);
                             if (lsym->declType->kind == TypeRef::Kind::Named &&
                                 lsym->declType->declaration &&
                                 lsym->declType->declaration->kind ==

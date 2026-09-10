@@ -2500,6 +2500,28 @@ private:
     // is deferred, so skip.
     void checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t);
 
+    // fix #4170 (§35.1/§35.2/§35.3, v0.295; mirrors #4163's §5.4/§10
+    // enum rejection): neither an enum nor a choice has a constructor
+    // for `new` to resolve to — an enum value comes from the int→enum
+    // cast `E(n)` (§5.4/§10, #960), a choice's construction *is* case
+    // selection, `Type.Case(args)` (§35.1/§35.2/§35.3, #4163). This is
+    // the SINGLE authority both `rt`-resolution sites feed: the
+    // explicit `new T(...)` NewExpr-typing arm (ExprTypecheck_Exprs.cpp)
+    // and the two §17.7 typeless `new()` shorthand call sites in this
+    // file (field-initializer and local-decl) — before #4170 the
+    // shorthand sites had no Enum/Choice arm at all, so `new()`
+    // target-typed to either kind was silently typed and reached
+    // codegen exactly as the (#4163-fixed) explicit spelling once did:
+    // a SIGSEGV for choice (no case discriminant reaches the
+    // `case`-statement lowering) and an IR-verifier backstop for enum.
+    // Reports the appropriate diagnostic and returns true iff `rt`
+    // names an Enum or Choice (i.e. iff it rejected); callers should
+    // treat a `true` return the same way the explicit arm's original
+    // two `if` blocks did — diagnose and continue, since later checks
+    // in the same NewExpr-typing block (e.g. §14.5 generic-arity) still
+    // apply to the same node.
+    bool rejectNewOnEnumOrChoice(const ast::NewExpr& ne, const TypeRef* rt);
+
     // narrow #4059 further (§9.1 / §9.2 / §9.5, v0.295): true iff
     // `new T()` is permitted on this body record (i.e. NOT the
     // silent-zero-fill defect shape). Returns true when the record
