@@ -1108,8 +1108,50 @@ void bz_task_free(void* tp) {
     // it, the captured pointer would dangle and the aggregate's re-raise
     // would UAF); (b) the fast path already-nulled error_obj path is the
     // SCOPE-END disposal's job, not bz_task_free's.
+    //
+    // fix #4162 (§30.5 "Disposing an unconsumed OwningTask<T>" / "Pattern A
+    // result slots are of three kinds", v0.298): a task whose own result
+    // buffer is a genuine Pattern A kind-2 BORROW through its chained_source
+    // (not an independently-owned value) must NOT also run its own
+    // result_disposer — the chained_source transitively owns disposal (the
+    // recursive bz_task_free(chainedSrc) below already reaches it). Two
+    // INDEPENDENT producers can each legitimately attach a disposer/chain to
+    // the SAME task without either knowing about the other: a `using var`
+    // consumer registers a disposer purely from the LOCAL's declared
+    // OwningTask<T:class> type (LlvmBackend_Disposal.cpp's
+    // attachOwningTaskResultDisposer), while the task's OWN producer body —
+    // e.g. an async lambda whose whole body is `return await <Pattern A
+    // source>` — independently sets chained_source via bz_task_set_chained.
+    // When BOTH are set AND the chained source's result is STILL POPULATED,
+    // this task's "result" is that SAME borrowed pointer value, not
+    // something this task owns — invoking result_disposer here would
+    // dispose it, and the chain recursion below would dispose the identical
+    // object again through the chained source's OWN disposer: a double free
+    // (measured, issue #4162: `var f := async lambda() => await P(); using
+    // var outer := f();`, never awaited, disposed directly rather than
+    // through an intermediate async method — ASan: heap-use-after-free in
+    // bz$elemDispose, the same Widget3960 freed twice).
+    //
+    // The chained source's result being NULL (rather than the chain being
+    // simply absent) is the fix #4159 case: an ORPHANED Pattern B
+    // extraction where THIS task's own result is independently owned (a
+    // fresh, just-extracted value) and chained_source is a drained,
+    // now-empty container kept only for its own reclaim — there, this
+    // task's result_disposer is the ONLY thing that will ever dispose the
+    // value, and correctly still fires. Checking the chained source's OWN
+    // result (not merely whether chained_source is set) is what
+    // distinguishes the two. Reading it here is safe: by the time
+    // bz_task_free ever runs on THIS task, chained_source's own producer has
+    // already fully settled (the chain is always set, by construction,
+    // before this task's own bz_task_complete runs) — the same "no other
+    // thread still touches the struct" invariant this function's own top
+    // comment already relies on extends transitively to it.
+    bool chainedSourceOwnsResult =
+        task->chained_source &&
+        static_cast<bz_task_t*>(task->chained_source)->result != nullptr;
     if (task->result_disposer && !task->is_error && task->result &&
-        task->result_size >= (int64_t)sizeof(void*)) {
+        task->result_size >= (int64_t)sizeof(void*) &&
+        !chainedSourceOwnsResult) {
         void* obj = *(void**)task->result;
         if (obj) task->result_disposer(obj);
     }
