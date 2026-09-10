@@ -9814,8 +9814,67 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                         !recvTy->astNode->name->parts.empty() &&
                         templateGenericParamNames_.count(
                             recvTy->astNode->name->parts.back());
-                    if (isConcreteType ? !isUniversalObjMember
-                                        : isBareTypeParamInDeadTemplate) {
+                    // fix #4171 (stdlib §8.1, v0.298): the same #2963
+                    // discriminator the `ftRecv` check above already applies
+                    // to its own "produced no value" Error belongs HERE too —
+                    // this Shape 1/2 Warning is the OTHER end-of-chain
+                    // fallthrough of the identical `if (auto* v =
+                    // tryLowerBuiltinClassCall(call)) return v;` ambiguity
+                    // (line ~4964): a void-returning arm that DID dispatch the
+                    // call (e.g. `Stopwatch.StartNew()`'s `sw.Stop()`, whose
+                    // dedicated instance-method block in LlvmBackend_Calls.cpp
+                    // ~13121 emits the real `bz_stopwatch_stop` call and
+                    // correctly returns nullptr for its unit result) looks
+                    // identical, from here, to an arm that declined outright.
+                    // `Stopwatch.StartNew()`'s receiver types with a non-null
+                    // `declaration` (ExprTypecheck_Calls.cpp ~8160,
+                    // ~21011 — `builtinClassSym("Stopwatch")`, so that
+                    // `isConcreteType` reads true), while `new Stopwatch()`'s
+                    // receiver resolves through TypeResolution_Names.cpp's
+                    // "nullary stdlib class" list with a NULL declaration —
+                    // an accident of how the two call shapes were typed, not a
+                    // difference in whether the member dispatches — so only
+                    // the `StartNew()` shape ever reached this warning.
+                    //
+                    // `emittedSideEffectSince(dispatchEntry)` is the same fact
+                    // #2963 already established for this ambiguity (see the
+                    // block above) — but MEASURED here to be unsafe on its
+                    // own: `dispatchEntry` is a snapshot from the top of
+                    // `lowerCallDispatch`, and when the RECEIVER expression is
+                    // itself a call (`Stopwatch.StartNew().Bogus();`, no
+                    // intermediate binding), evaluating the receiver — which
+                    // every candidate arm does unconditionally, including the
+                    // Stopwatch block's `lowerExpr(*ma2->target)`, BEFORE it
+                    // even compares the member name — emits `bz_stopwatch_
+                    // alloc`/`bz_stopwatch_start` and makes
+                    // `emittedSideEffectSince` read true regardless of
+                    // whether the MEMBER itself ever dispatched. Trusting it
+                    // there would silently drop the #2963 diagnostic for a
+                    // genuinely-undispatched chained member — measured:
+                    // `Stopwatch.StartNew().TotallyBogus();` went from
+                    // warning to ZERO diagnostics under a footprint-only
+                    // gate. So the footprint is trusted ONLY when the
+                    // receiver is a bare `IdentifierExpr` (a local/parameter
+                    // read — always exactly one non-side-effecting `load`,
+                    // per the #2963 comment above this block) — precisely
+                    // the issue's own repro shape (`using var sw :=
+                    // Stopwatch.StartNew(); sw.Stop();`). A receiver that is
+                    // itself a call keeps the PRE-existing (always-warn)
+                    // behaviour, unchanged. Scope boundary recorded rather
+                    // than silently narrowed, per CLAUDE.md rule 4 — issue
+                    // 4182 tracks the receiver-shape-general fix (e.g. a
+                    // plain field read) should one ever surface as more than
+                    // a hypothetical.
+                    bool receiverIsPlainLocalRead =
+                        ma->target &&
+                        dynamic_cast<const ast::IdentifierExpr*>(
+                            ma->target.get()) != nullptr;
+                    bool memberAlreadyDispatched =
+                        receiverIsPlainLocalRead &&
+                        emittedSideEffectSince(dispatchEntry);
+                    if (!memberAlreadyDispatched &&
+                        (isConcreteType ? !isUniversalObjMember
+                                        : isBareTypeParamInDeadTemplate)) {
                         // Same derivation the §8.1 reject above uses — one
                         // `receiverName` lambda, not two copies (#2924's
                         // four-way-mirror finding).
