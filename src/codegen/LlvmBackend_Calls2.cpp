@@ -14305,25 +14305,35 @@ llvm::Value* Emitter::lowerNullCondCall(const ast::CallExpr& call,
                     recvTy0->kind == sema::TypeRef::Kind::Named &&
                     recvTy0->declaration &&
                     recvTy0->declaration->kind == ast::TypeDeclKind::Interface;
-                // NOT widened by fix #4120: the `?.` nullable sibling of the
-                // three `.`-form occurrences fixed elsewhere in this file
-                // (`someCString?.ToString()`) shares the SAME defect shape,
-                // but this function has no `builtinTypeName`-based qualified-
-                // name/identity replacement dispatch to fall back to the way
-                // the `.` form's literal chain and `isBuiltinIdentityRecv`
-                // do — excluding CString/WString/RawBytes here with no
-                // replacement risks the same "wrong value -> crash"
-                // regression #4120's `.`-form fix found and avoided (see that
-                // fix's own comment). Left as-is deliberately; measured and
-                // recorded on issue 4126 (the `?.` form still degrades
-                // `someCString?.ToString()` to `null` via the #2434
-                // zero-initialized-slot fallback) rather than fixed blind
-                // here.
+                // fix #4137 (stdlib §10.1/§10.2/§10.3, v0.295): the `?.`
+                // sibling of narrow #4120's `.`-form fix, deliberately left
+                // unwidened there (see #4120's own commit body) because this
+                // function had no qualified-name/identity replacement
+                // dispatch to fall back to — a bare exclusion here would risk
+                // the same "wrong value -> crash" regression #4120 measured
+                // and avoided for the `.` form. This fix supplies that
+                // replacement (below), so it is now safe to exclude
+                // CString/WString/RawBytes from the generic `ncoIsClass`
+                // vtable dispatch. `isFfiBufferTypeRef` reads BOTH TypeRef
+                // shapes (LlvmBackend_Calls.cpp:~808): for the ANNOTATION
+                // shape (`c: CString?`, `declaration == nullptr`) `ncoIsClass`
+                // below was ALREADY false (it requires a non-null
+                // `declaration`), so that shape reached no branch in this
+                // function at all and fell through to the #2434
+                // zero-initialized-slot degrade; for the FACTORY shape
+                // (`declaration == builtinClassSym(...)`, `kind == Class`)
+                // `ncoIsClass` WAS true and misdispatched exactly like the
+                // `.` form did pre-#4120. Measured pre-fix (base 2aa5b1d, a
+                // genuinely non-null `CString?` from `extern "c" strdup`):
+                // `c?.ToString()` / `c?.GetHashCode()` / `c?.Equals(c)` all
+                // degraded to "NULL" via #2434 (the annotation-shape path).
+                bool ncoIsFfiBuffer = isFfiBufferTypeRef(recvTy0);
                 bool ncoIsClass =
                     recvTy0->kind == sema::TypeRef::Kind::Named &&
                     recvTy0->declaration &&
-                    recvTy0->declaration->kind == ast::TypeDeclKind::Class;
-                if (ncoIsObj || ncoIsIface || ncoIsClass) {
+                    recvTy0->declaration->kind == ast::TypeDeclKind::Class &&
+                    !ncoIsFfiBuffer;
+                if (ncoIsObj || ncoIsIface || ncoIsClass || ncoIsFfiBuffer) {
                     llvm::Value* recv = lowerExpr(*nm.target);
                     if (recv && recv->getType()->isPointerTy()) {
                         // §7.5 null-receiver short-circuit (a nullable class /
@@ -14342,7 +14352,49 @@ llvm::Value* Emitter::lowerNullCondCall(const ast::CallExpr& call,
                         // for the universal Object surface on a class / Object /
                         // interface receiver with no override.
                         llvm::Value* ncoRes = nullptr;
-                        if (isToString) {
+                        if (ncoIsFfiBuffer) {
+                            // fix #4137: the qualified-name §8.5 no-override
+                            // default for ToString (the SAME rendering the
+                            // `.` form's literal chain gives these three
+                            // names, LlvmBackend_Calls2.cpp ~6871) and the
+                            // §8.3 reference-identity default for
+                            // Equals/GetHashCode (the SAME ops
+                            // `isBuiltinIdentityRecv` gives them, ~7330) —
+                            // reusing `lowerExpr` rather than
+                            // `lowerUniversalEqualsArg` for the Equals
+                            // argument, matching `isBuiltinIdentityRecv`'s own
+                            // choice: a CString/WString/RawBytes argument is
+                            // already reference-shaped (a bare pointer), so
+                            // no §8.6 boxing is needed to compare it by
+                            // identity.
+                            if (isToString) {
+                                std::string_view arn = builtinTypeName(recvTy0);
+                                std::string_view mod =
+                                    common::builtinClassModulePathOf(arn);
+                                std::string rendered =
+                                    mod.empty()
+                                        ? std::string(arn)
+                                        : (std::string(mod) + "." +
+                                           std::string(arn));
+                                ncoRes = lowerStringLiteral(
+                                    std::string("\"") + rendered + "\"",
+                                    false);
+                            } else if (isGetHashCode) {
+                                ncoRes = builder_.CreateCall(
+                                    declareC("bz_obj_identity_hash", i32(),
+                                             {ptrTy()}),
+                                    {recv}, "nco.ffi.hash");
+                            } else {
+                                // §7.5: lowered here, inside the non-null-
+                                // receiver arm, so a null receiver never
+                                // evaluates the argument.
+                                llvm::Value* ncoOther =
+                                    lowerExpr(*call.args[0].value);
+                                if (ncoOther)
+                                    ncoRes = builder_.CreateICmpEQ(
+                                        recv, ncoOther, "nco.ffi.eq");
+                            }
+                        } else if (isToString) {
                             ncoRes = lowerObjectToString(recv);
                         } else if (isGetHashCode) {
                             ncoRes = lowerObjectGetHashCode(recv);
