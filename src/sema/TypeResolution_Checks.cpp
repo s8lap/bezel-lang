@@ -860,6 +860,39 @@ void Resolver::checkEnumRestrictions() {
                     "it (§10.4)");
                 continue;
             }
+            // fix #4121 (§10.4, §8.7, v0.298): §10.4's positive list of what
+            // an enum "may declare exactly" — instance methods, expression-
+            // bodied read-only instance properties, static methods,
+            // `static readonly` fields, `const` members, operator overloads —
+            // has no destructor entry, and §8.7 states plainly that "Static
+            // classes, records, enums, choices, primitives, and inline
+            // arrays do not implement `IDisposable`" — so an enum has no
+            // Dispose() surface for a destructor to hook. MEASURED on this
+            // HEAD (pre-fix): `enum Color: int Red, Green, Blue; destructor
+            // end destructor; end Color;` compiled at exit 0, zero
+            // diagnostics — this loop had no DestructorSymbol arm at all.
+            // checkChoiceRestrictions already rejects the identical shape on
+            // choices (fix #3869, "choice `Shape` may not declare a
+            // destructor (§35.1 / §35.2)"); the spec's own Appendix A
+            // preamble "Shared-production over-admissions" index (the
+            // unnumbered table immediately before A.1, NOT a numbered
+            // "Appendix A.9" — no such subsection exists, A stops at A.8)
+            // already names this exact enum-side gap in its `Member` in an
+            // enum-or-choice body row: "...destructors by §8.7" — for BOTH
+            // kinds. #3869 explicitly declined to touch the enum side (see
+            // that fix's own comment on checkChoiceRestrictions below), so
+            // choice was the one made correct then; this fix makes enum
+            // agree with choice, not the other way — choice's existing
+            // rejection is the one the spec supports.
+            if (dynamic_cast<DestructorSymbol*>(m)) {
+                ctx_.diagnostics().report(
+                    Severity::Error, m->declLoc,
+                    std::string("enum `") + std::string(t->name) +
+                    "` may not declare a destructor — an enum never "
+                    "implements `IDisposable` (§8.7) and a destructor is "
+                    "not part of §10.4's exhaustive admitted-member list");
+                continue;
+            }
             if (auto* fs = dynamic_cast<FieldSymbol*>(m)) {
                 if (!hasMod(fs, "static")) bad("an instance field");
                 continue;
