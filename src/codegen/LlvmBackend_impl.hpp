@@ -13785,6 +13785,31 @@ private:
         const std::vector<sema::Symbol*>& params,
         const ast::PropertyDecl* setterValueAnchor = nullptr);
 
+    // fix #4174 follow-up (review NEEDS-FIX) / §28.1: the closure twin of
+    // retainAssignedStringParams — see that function's own comment for the
+    // full rationale, which applies here unchanged. lowerClosureLocalReassign's
+    // drop-on-overwrite release (fix #4174) is gated on localSlot(), which
+    // resolves a ParameterSymbol exactly as it resolves a LocalSymbol; a
+    // by-value closure-typed PARAMETER's slot was given NO independent +1 at
+    // bind (§28.1: `owned` is a compile error on a function type — a real,
+    // narrow citation for "this parameter can never own a disposal
+    // obligation", NOT a claim that any section mandates the retain/release
+    // MECHANISM itself; see the regression test file's header for that
+    // discussion — so a closure-typed parameter is ALWAYS an unmodified
+    // borrow whose single reference belongs to the CALLER). The first `:=`
+    // therefore released a reference this frame never owned, freeing the
+    // CALLER's closure under it — a use-after-free, confirmed measured
+    // (review probe: `p(): int` parameter reassigned inside the callee,
+    // caller's own binding read afterward — heap-use-after-free, freed in
+    // the callee, allocated in the caller). Give every such parameter this
+    // frame ASSIGNS TO an independent +1 at bind, exactly as the string
+    // sibling does — call right after bindParameters, paired 1:1 with every
+    // collectClosureReleaseEligible / closureReleaseEligibleFn_ pin (see the
+    // .cpp for the full argument and the CO-GATE rationale).
+    void retainAssignedClosureParams(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body,
+        const std::vector<sema::Symbol*>& params);
+
     // fix #2115 / §28.9 / §35.4: the set of `var` value-like choice LocalDecl
     // nodes whose initializer is a choice construction every string payload arg
     // of which is a +1 producer or a literal, AND a conservative whole-body walk
@@ -14505,8 +14530,8 @@ private:
     // lowerStringFieldStore. Returns true when handled.
     bool lowerClosureFieldStore(const ast::Expr& target, llvm::Value* fieldAddr,
                                 llvm::Value* newVal, const ast::Expr* valueExpr);
-    // fix #4174 / §27.5 / §28.9: REASSIGNMENT `f := newVal` where `f` is a
-    // closure (function-typed) LOCAL/parameter SLOT. Retain-new (transfer a
+    // fix #4174: REASSIGNMENT `f := newVal` where `f` is a closure
+    // (function-typed) LOCAL/parameter SLOT. Retain-new (transfer a
     // producer) / store / release-old, so the slot keeps owning an
     // independent +1 across the reassignment — without this, the DISPLACED
     // previous closure value (e.g. the `lambda() => 0` a later `f := lambda()
@@ -14516,6 +14541,17 @@ private:
     // producer test lowerClosureFieldStore uses (isPlusOneClosureProducer ||
     // isUserMethodClosureReturnCall). Returns true when handled (caller must
     // NOT also store); false when `target` is not a closure-typed local slot.
+    // NOTE this admits a closure-typed PARAMETER too (localSlot() resolves a
+    // ParameterSymbol the same way it resolves a LocalSymbol) — a parameter's
+    // slot owns nothing at bind, so this release is only sound when PAIRED
+    // with retainAssignedClosureParams' bind-time retain (below); the two
+    // move together exactly as lowerStringLocalReassign and
+    // retainAssignedStringParams do for `string` (fix #2696). Internal
+    // refcounting-soundness fix, not an implementation of a specific spec
+    // rule — §28.9 declares function values runtime-managed but explicitly
+    // disclaims the reclaim MECHANISM ("reference counting... is not part
+    // of this specification"); see the regression test file's header for
+    // the full citation discussion.
     bool lowerClosureLocalReassign(const ast::Expr& target, llvm::Value* slotAddr,
                                    llvm::Type* elemTy, llvm::Value* newVal,
                                    const ast::Expr* valueExpr);

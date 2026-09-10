@@ -2172,6 +2172,11 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         // and never re-spilled), so retains >= releases on every path: a surplus
         // retain leaks one reference per advance, it can never over-release.
         retainAssignedStringParams(*ci.stmts, ms->params);
+        // fix #4174 follow-up: the closure twin — see
+        // retainAssignedClosureParams' own comment. Paired with the
+        // collectClosureReleaseEligible(*ci.stmts) / closureReleaseEligibleFn_
+        // = moveNextFn pin above.
+        retainAssignedClosureParams(*ci.stmts, ms->params);
 
         // State field GEP — read by the resume dispatch, written at each yield.
         llvm::Value* stateGEP =

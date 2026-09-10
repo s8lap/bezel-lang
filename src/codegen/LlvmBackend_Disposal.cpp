@@ -267,6 +267,13 @@ void Emitter::emitDisposerCore(const sema::TypeSymbol* ts, llvm::Function* fn) {
         sharedCellEnvdtorFreeOwner_.clear();  // fix #3426
         cellFreeEligibleFn_ = fn;
         collectClosureReleaseEligible(dd->body);
+        // fix #4174 follow-up: the closure twin of the string parameter
+        // retain above — see retainAssignedClosureParams' own comment. A
+        // destructor takes no parameters (§18), so this is a structural
+        // no-op (mirrors the CO-GATED PARAMETER RETAIN note above for
+        // strings) — called to keep the retain/release invariant checkable
+        // at review, exactly as retainAssignedStringParams(dd->body, {}) is.
+        retainAssignedClosureParams(dd->body, /*params=*/{});
         collectBoxReleaseEligible(dd->body);
         collectBoxCaptureLocals(dd->body);
         collectDefinitelyEscapingLambdas(dd->body);

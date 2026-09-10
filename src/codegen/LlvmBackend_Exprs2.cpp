@@ -2927,6 +2927,14 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     for (const auto& [k, v] : ancestorSharedCellOwner3804)
         sharedCellEnvdtorFreeOwner_.emplace(k, v);
     closureReleaseEligibleFn_ = fn;
+    // fix #4174 follow-up: the closure twin of the string parameter retain
+    // above (line ~2479) — see retainAssignedClosureParams' own comment.
+    // Paired with the closureReleaseEligibleFn_ = fn pin just above and the
+    // !lam.exprBody collectClosureReleaseEligible(lam.stmts) call earlier in
+    // this function; an expression body has no assignment statement, so it
+    // is excluded exactly as the string sibling excludes it.
+    if (!lam.exprBody && paramSyms)
+        retainAssignedClosureParams(lam.stmts, *paramSyms);
     // Emit body.
     if (lam.exprBody) {
         llvm::Value* v = nullptr;

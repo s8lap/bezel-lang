@@ -13740,6 +13740,12 @@ llvm::Function* Emitter::buildSpecializedMethodFn(
         // #2854 regression test).
         collectClosureReleaseEligible(*ci.stmts);
         closureReleaseEligibleFn_ = specFn;
+        // fix #4174 follow-up: the closure twin of the string parameter
+        // retain above — see retainAssignedClosureParams' own comment.
+        // Paired with the closureReleaseEligibleFn_ = specFn pin just above,
+        // exactly as retainAssignedStringParams is paired with
+        // stringReleaseEligibleFn_ = specFn above it.
+        retainAssignedClosureParams(*ci.stmts, ms->params);
     }
 
     // Emit the body. fix #580: handle both EXPRESSION and block bodies, so a

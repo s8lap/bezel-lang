@@ -1162,15 +1162,22 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 if (!handled)
                     handled = lowerClosureFieldStore(*as->target, addr, rhs,
                                                      as->value.get());
-                // fix #4174 / §27.5 / §28.9: closure-typed LOCAL/parameter
-                // reassignment — the closure twin of lowerStringLocalReassign
-                // just above. Without this, `f := lambda() => 42;` plain-
-                // stores the new closure and the DISPLACED previous value
-                // (the producer +1 a prior binding transferred into the
-                // slot) is never released — a 40-byte-per-reassignment leak
-                // (issue #4174, LSan-measured). Gated on the analyzed
-                // function (closureReleaseEligibleFn_) exactly as the string
-                // twin is gated on stringReleaseEligibleFn_.
+                // fix #4174: closure-typed LOCAL/parameter reassignment —
+                // the closure twin of lowerStringLocalReassign just above
+                // (internal refcounting-soundness fix; see that function's
+                // own comment and the regression test file's header for why
+                // no spec section is cited as authority for the mechanism).
+                // Without this, `f := lambda() => 42;` plain-stores the new
+                // closure and the DISPLACED previous value (the producer +1
+                // a prior binding transferred into the slot) is never
+                // released — a 40-byte-per-reassignment leak (issue #4174,
+                // LSan-measured). Gated on the analyzed function
+                // (closureReleaseEligibleFn_) exactly as the string twin is
+                // gated on stringReleaseEligibleFn_. A PARAMETER target is
+                // sound here only because retainAssignedClosureParams (fix
+                // #4174 follow-up, review NEEDS-FIX) gives it its own
+                // independent +1 at bind before this release can ever run
+                // against it — see that function's comment.
                 if (!handled && currentFn_ == closureReleaseEligibleFn_)
                     handled = lowerClosureLocalReassign(*as->target, addr,
                                                         elemTy, rhs,

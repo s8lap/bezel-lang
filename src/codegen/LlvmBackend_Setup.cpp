@@ -9498,6 +9498,12 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
     // expression body has no assignment statement.
     if (ci.bodyKind == ast::MethodBodyKind::Block && ci.stmts)
         retainAssignedStringParams(*ci.stmts, ms->params);
+    // fix #4174 follow-up: the closure twin of the retain just above — see
+    // retainAssignedClosureParams' own comment. Paired with the
+    // collectClosureReleaseEligible(*ci.stmts) / closureReleaseEligibleFn_ =
+    // fn pin earlier in this function.
+    if (ci.bodyKind == ast::MethodBodyKind::Block && ci.stmts)
+        retainAssignedClosureParams(*ci.stmts, ms->params);
 
     // §28.2 v0.134 / issue #601: checked disposal mode guard.
     // For every instance method of a class (not static, not the entry point,
@@ -22578,6 +22584,126 @@ void Emitter::retainAssignedStringParams(
 }
 
 
+// fix #4174 follow-up (review NEEDS-FIX) / §28.1: the closure twin of
+// retainAssignedStringParams (above) — a non-nullable function-typed
+// PARAMETER that this body ASSIGNS TO is retained at bind, so its slot owns
+// an INDEPENDENT +1 before lowerClosureLocalReassign's drop-on-overwrite
+// release (fix #4174) ever runs against it. Internal refcounting-soundness
+// fix, not an implementation of a specific spec rule — see the regression
+// test file's header for the full citation discussion (§27.5 never mentions
+// reassignment, and §28.7's drop-on-overwrite rule explicitly scopes itself
+// away from function-typed locals, which can never be `owned`).
+//
+// WHY IT IS NEEDED. lowerClosureLocalReassign's gate is localSlot(), which
+// resolves a ParameterSymbol through paramSlots_ exactly as it resolves a
+// LocalSymbol (LlvmBackend_Layout.cpp) — fix #4174 copied the gate from
+// lowerStringLocalReassign verbatim, inheriting the SAME parameter hazard
+// #2696 already fixed for `string`. §28.1's "Where the `owned` modifier can
+// appear" makes `owned` a compile error on a function type — a real, narrow
+// citation for "this parameter can never own a disposal obligation" — so a
+// closure-typed parameter is ALWAYS an unmodified borrow whose single
+// reference belongs to the CALLER. The first assignment therefore released
+// a reference this frame never owned, freeing the caller's closure under it
+// — a use-after-free from ordinary code (review probe: `Reassign(p: () ->
+// int)` does `p := lambda() => 99;`; the CALLER's own `h` — the argument
+// bound to `p` — is freed inside `Reassign` and reading `h()` afterward is a
+// heap-use-after-free).
+//
+// WHY A RETAIN AND NOT A SUPPRESSION, AND WHAT IS STILL NOT BALANCED: see
+// retainAssignedStringParams' own comment — both arguments apply here
+// unchanged (a retain can only convert a crash into a bounded per-call leak,
+// never create an over-release; the parameter's own final value is left
+// unreleased at scope end, matching every other unmanaged-parameter leak in
+// this codebase, e.g. #2696's string parameter and #4174's own closure-local
+// "final value" trade-off).
+//
+// SCOPE. Mirrors retainAssignedStringParams exactly: assignments nested in
+// if/while/for/do/try/case bodies count; an assignment that appears only
+// inside a LAMBDA body is deliberately not counted (a nested lambda's own
+// body is analyzed separately, under its OWN closureReleaseEligibleFn_
+// token); `ref`/`out` closure parameters are excluded (they alias the
+// caller's slot, which genuinely owns its value — no lowerClosureLocalReassign
+// path admits them either, since localSlot() does not resolve a ref/out
+// param the same way — but the modifier check is kept here for parity and
+// defense in depth). No `setterValueAnchor` twin: closure-typed computed
+// accessors never pin closureReleaseEligibleFn_ (no Assign.cpp call site
+// does), so lowerClosureLocalReassign's gate is already false for every
+// setter `value` parameter — nothing to retain there.
+void Emitter::retainAssignedClosureParams(
+    const std::vector<std::unique_ptr<ast::Stmt>>& body,
+    const std::vector<sema::Symbol*>& params) {
+    // 0. CO-GATE WITH THE RELEASE. lowerClosureLocalReassign's own call site
+    //    (LlvmBackend_Stmts.cpp) is gated on `currentFn_ ==
+    //    closureReleaseEligibleFn_`, mirroring retainAssignedStringParams'
+    //    step 0. Agreement between the retain and release predicates is the
+    //    invariant: a caller with this gate false emits a plain store that
+    //    releases nothing, and a retain would mint a +1 pairing NOTHING — a
+    //    leak this fix would have introduced.
+    if (currentFn_ != closureReleaseEligibleFn_) return;
+    // 1. Candidates: by-value, non-nullable function-typed parameters with a
+    //    slot.
+    std::unordered_set<const sema::Symbol*> candidates;
+    for (sema::Symbol* s : params) {
+        auto* ps = dynamic_cast<sema::ParameterSymbol*>(s);
+        if (!ps) continue;
+        if (isByRefMod(ps->modifier)) continue;  // aliases the caller's slot
+        const sema::TypeRef* ty =
+            ps->resolvedDeclType
+                ? ps->resolvedDeclType
+                : (ps->declType ? ctx_.resolvedType(*ps->declType) : nullptr);
+        if (!ty || ty->nullable) continue;
+        if (ty->kind != sema::TypeRef::Kind::Function) continue;
+        if (paramSlots_.find(s) == paramSlots_.end()) continue;
+        candidates.insert(s);
+    }
+    if (candidates.empty()) return;
+
+    // 2. Does the body assign to one? Mirrors retainAssignedStringParams'
+    //    step 2 exactly (same recursion, NOT into lambdas).
+    std::unordered_set<const sema::Symbol*> assigned;
+    std::function<void(const ast::Stmt*)> scan = [&](const ast::Stmt* s) {
+        if (!s) return;
+        if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(s)) {
+            if (auto* id =
+                    dynamic_cast<const ast::IdentifierExpr*>(as->target.get()))
+                if (sema::Symbol* sym = ctx_.exprSymbol(*id))
+                    if (candidates.count(sym)) assigned.insert(sym);
+        }
+        if (auto* is = dynamic_cast<const ast::IfStmt*>(s)) {
+            for (auto& b : is->ifBranch.body) scan(b.get());
+            for (auto& br : is->elifBranches)
+                for (auto& b : br.body) scan(b.get());
+            for (auto& b : is->elseBody) scan(b.get());
+        } else if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s)) {
+            for (auto& b : ws->body) scan(b.get());
+        } else if (auto* fs = dynamic_cast<const ast::ForStmt*>(s)) {
+            for (auto& b : fs->body) scan(b.get());
+        } else if (auto* d = dynamic_cast<const ast::DoEndBlock*>(s)) {
+            for (auto& b : d->body) scan(b.get());
+        } else if (auto* ts = dynamic_cast<const ast::TryStmt*>(s)) {
+            for (auto& b : ts->body) scan(b.get());
+            for (auto& c : ts->catches) scan(c.body.get());
+            for (auto& b : ts->finallyBody) scan(b.get());
+        } else if (auto* cs = dynamic_cast<const ast::CaseStmt*>(s)) {
+            for (auto& arm : cs->arms)
+                for (auto& a : arm.stmts) scan(a.get());
+        }
+    };
+    for (auto& s : body) scan(s.get());
+    if (assigned.empty()) return;
+
+    // 3. Mint the frame's own reference. Emitted in the prologue, where the
+    //    builder still sits in the entry block right after bindParameters
+    //    stored the incoming argument. bz_closure_retain is null-safe, so a
+    //    null-ish argument costs nothing.
+    for (const sema::Symbol* sym : assigned) {
+        llvm::AllocaInst* slot = paramSlots_[const_cast<sema::Symbol*>(sym)];
+        if (!slot) continue;
+        emitClosureRetain(builder_.CreateLoad(ptrTy(), slot, "clo.parm"));
+    }
+}
+
+
 void Emitter::armValueLikeChoiceStrRelease(const void* declNode,
                                            llvm::AllocaInst* slot,
                                            const ast::Node* ld) {
@@ -25521,13 +25647,23 @@ bool Emitter::lowerClosureFieldStore(const ast::Expr& target,
 }
 
 
-// fix #4174 / §27.5 / §28.9: reassign a closure (function-typed) LOCAL/
-// parameter slot with retain-new / release-old, keeping the slot's
-// independent +1 across the overwrite. Without this, `f := lambda() => 42;`
-// plain-stores the new value and the DISPLACED previous value (e.g. the
-// `lambda() => 0` a prior `var f: () -> int := lambda() => 0;` transferred
-// into the slot) is never released — measured as a 40-byte-per-reassignment
-// LeakSanitizer leak (issue #4174's own repro). Order: load-old →
+// fix #4174: reassign a closure (function-typed) LOCAL/parameter slot with
+// retain-new / release-old, keeping the slot's independent +1 across the
+// overwrite. Internal refcounting-soundness fix, not an implementation of a
+// specific spec rule (§27.5 never mentions reassignment; §28.9 declares
+// function values runtime-managed but disclaims the reclaim MECHANISM;
+// §28.7's drop-on-overwrite rule scopes itself away from function-typed
+// locals, which can never be `owned` — see the regression test file's
+// header for the full discussion). PARAMETER admission requires the paired
+// bind-time retain in retainAssignedClosureParams (below) — a parameter's
+// slot owns nothing at bind, so this release alone is unsound against one;
+// see that function's own comment (fix #4174 follow-up).
+//
+// Without this, `f := lambda() => 42;` plain-stores the new value and the
+// DISPLACED previous value (e.g. the `lambda() => 0` a prior `var f: () ->
+// int := lambda() => 0;` transferred into the slot) is never released —
+// measured as a 40-byte-per-reassignment LeakSanitizer leak (issue #4174's
+// own repro). Order: load-old →
 // retain-or-transfer-new → store-new → release-old (retain-before-release
 // keeps a self-assignment `f := f;` transiently safe — the count dips +1
 // then back, never transiently 0). A +1 producer (a lambda expression, a

@@ -1614,6 +1614,11 @@ void Emitter::emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         // separate, pre-existing async defect this fix neither causes nor
         // fixes; the retain-per-activation is what keeps it leak-safe.)
         retainAssignedStringParams(*ci.stmts, ms->params);
+        // fix #4174 follow-up: the closure twin — see
+        // retainAssignedClosureParams' own comment. Paired with this
+        // function's own collectClosureReleaseEligible(*ci.stmts) /
+        // closureReleaseEligibleFn_ = resumeFn pin above.
+        retainAssignedClosureParams(*ci.stmts, ms->params);
 
         // State field GEP — read by the resume dispatch, written at each await.
         llvm::Value* stateGEP =
@@ -2274,6 +2279,11 @@ void Emitter::emitAsyncLambda(const ast::LambdaExpr& lam, llvm::Function* fn,
             // retains >= releases on every path: a surplus retain leaks one
             // reference per resume, it can never over-release.
             if (paramSyms) retainAssignedStringParams(lam.stmts, *paramSyms);
+            // fix #4174 follow-up: the closure twin — see
+            // retainAssignedClosureParams' own comment. Paired with this
+            // branch's own collectClosureReleaseEligible(lam.stmts) /
+            // closureReleaseEligibleFn_ = resumeFn pin (below, this venue).
+            if (paramSyms) retainAssignedClosureParams(lam.stmts, *paramSyms);
         } else {
             // fix #4044 (§22.4 / §28.9 / §30.1 / §30.6, v0.295): the
             // EXPRESSION-bodied async lambda arm — `Lam.exprBody` is a single
@@ -3587,6 +3597,11 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
         // given activation can release the incoming value at most once — so
         // retains >= releases on every path.
         retainAssignedStringParams(*ci.stmts, ms->params);
+        // fix #4174 follow-up: the closure twin — see
+        // retainAssignedClosureParams' own comment. Paired with this
+        // function's own collectClosureReleaseEligible(*ci.stmts) /
+        // closureReleaseEligibleFn_ = resumeFn pin above.
+        retainAssignedClosureParams(*ci.stmts, ms->params);
 
         // §30.7 (v0.228, #1525): "every MoveNextAsync() performs an implicit
         // token.ThrowIfCancellationRequested() — on entry, and at each resume
