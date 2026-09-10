@@ -262,6 +262,39 @@ private:
         return entry;
     }
 
+    // fix #4194 (§21.5/§21.7/§28.3/§31.2, v0.298): the SAME coarse
+    // "throwable call somewhere in this try body might have thrown"
+    // over-approximation visitTry adds from `tryBodyEnd` (the fall-through
+    // tail) — `cfg_.addExceptionEdge(tryBodyEnd, catchDispatch)` — but from
+    // an early-exit statement's own block instead. Without this, a try body
+    // whose reachable tail is a return/break/continue rather than a
+    // fall-through gets NO exception-edge modeling of its throwable calls at
+    // all: `inner.runInto(s.body, tryEntry)` returns null for any body
+    // ending in one of these terminators (see runInto's dead-block comment),
+    // so visitTry's own `if (tryBodyEnd) { ... addExceptionEdge(...) }`
+    // never runs — a call earlier in the body (e.g. `this.Risky()` before a
+    // `return`) has no CFG edge showing it might have thrown before that
+    // return's own (correctly #4180-routed) normal-exit edge took effect.
+    //
+    // Scoped to a real (non-arm) try-body frame via `!isArmContext`: a
+    // throwable call inside a CATCH ARM's own body has never had this
+    // coarse modeling either (before or after #4180), which is a separate,
+    // still-open gap (filed #4201) that this fix does not extend to. This
+    // fires while still lexically inside a try's own body — directly, or
+    // nested through if/while/nested-try (each of which threads
+    // `tryHandlers_` down via its own sub-Builder, so `tryHandlers_.back()`
+    // always names the innermost SUCH try) — at exactly the same nesting
+    // scope `tryBodyEnd`'s edge already covers for the fall-through case.
+    // `exceptionTarget()` (not `routeExitThroughFinally`) is deliberately
+    // the target: an exception from within a try's own body always lands at
+    // THAT try's own `catchDispatch` directly, with no finally-hop needed —
+    // there is nothing being "exited" yet, unlike a break/continue/return
+    // that must hop through finally chains to reach an OUTER destination.
+    void addApproximateTryBodyExceptionEdge(CFGBlock* from) {
+        if (tryHandlers_.empty() || tryHandlers_.back().isArmContext) return;
+        cfg_.addExceptionEdge(from, exceptionTarget());
+    }
+
     // Async-readiness 3a: record into `block` every `await` suspend site
     // carried by the *direct* expressions of the linear / terminator
     // statement `s` (the kinds that `visitStmt` appends to a block). Nested
@@ -338,6 +371,10 @@ private:
         if (dynamic_cast<const ast::ReturnStmt*>(&s)) {
             from->stmts.push_back(&s);
             recordStmtAwaits(from, s); // async-readiness 3a (additive)
+            // fix #4194: a throwable call earlier in this try body could
+            // have thrown before this return runs — see
+            // addApproximateTryBodyExceptionEdge.
+            addApproximateTryBodyExceptionEdge(from);
             // fix #4180 (§21.7, v0.298): a return leaves every enclosing
             // try, so route through each one's active finally first — see
             // routeExitThroughFinally.
@@ -370,6 +407,10 @@ private:
         }
         if (auto* brk = dynamic_cast<const ast::BreakStmt*>(&s)) {
             from->stmts.push_back(&s);
+            // fix #4194: a throwable call earlier in this try body could
+            // have thrown before this break runs — see
+            // addApproximateTryBodyExceptionEdge.
+            addApproximateTryBodyExceptionEdge(from);
             // fix #4180 (§21.5, v0.298): route through the finally of every
             // enclosing try this break actually EXITS (the target loop was
             // already active when that try was entered) before reaching the
@@ -395,6 +436,10 @@ private:
         }
         if (auto* cnt = dynamic_cast<const ast::ContinueStmt*>(&s)) {
             from->stmts.push_back(&s);
+            // fix #4194: a throwable call earlier in this try body could
+            // have thrown before this continue runs — see
+            // addApproximateTryBodyExceptionEdge.
+            addApproximateTryBodyExceptionEdge(from);
             // fix #4180: same routing as BreakStmt above, targeting the
             // loop's `header` instead of `afterEnd`.
             if (!loops_.empty()) {
@@ -675,12 +720,32 @@ private:
             // `finallyEntry` before landing at that outer target instead of
             // landing here directly, matching what routeExitThroughFinally
             // now does for return/break/continue via loopDepthAtEntry.
-            if (finallyEntry) {
-                armInner.tryHandlers_.push_back(
-                    {/*catchDispatch=*/exceptionTarget(), finallyEntry,
-                     afterTry, loops_.size(), finallyClones,
-                     /*isArmContext=*/true});
-            }
+            //
+            // narrow #4194 (§21.5/§21.7/§28.3/§31.2, v0.298): pushed
+            // UNCONDITIONALLY now, not just `if (finallyEntry)` — a
+            // no-finally arm's Builder used to inherit `tryHandlers_`
+            // UNCHANGED, so `armInner.tryHandlers_.back()` named the OUTER
+            // frame, not "am I directly inside this arm's own body". That
+            // silently broke `addApproximateTryBodyExceptionEdge`'s
+            // `!isArmContext` guard (added by this same fix) for any try
+            // with catch arms and no finally: the guard read the wrong
+            // frame and could scope a coarse try-body exception edge as if
+            // it were still inside an OUTER try's body while actually
+            // inside a sibling catch arm — measured false reject on two
+            // mutually exclusive catch arms that each `move x` and
+            // `return` (see this fix's own test row). `finallyEntry`/
+            // `finallyClones` stay null when there is no finally — both
+            // `exceptionTarget()` (`top.isArmContext && top.finallyEntry`)
+            // and `routeExitThroughFinally` (`if (!frame->finallyEntry)
+            // continue;`) already treat a null-finallyEntry frame as
+            // "nothing to hop through" and never dereference
+            // `finallyClones` in that case, so this is transparent to both
+            // — the ONLY thing it changes is that `.back().isArmContext`
+            // now always answers correctly for arm-body statements.
+            armInner.tryHandlers_.push_back(
+                {/*catchDispatch=*/exceptionTarget(), finallyEntry,
+                 afterTry, loops_.size(), finallyClones,
+                 /*isArmContext=*/true});
             CFGBlock* armEnd = armEntry;
             if (arm.body) {
                 armEnd = armInner.visitStmt(*arm.body, armEntry);

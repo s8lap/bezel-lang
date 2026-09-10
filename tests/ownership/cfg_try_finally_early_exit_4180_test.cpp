@@ -125,17 +125,23 @@ const std::string kMaybeConsumedConsumeMsg =
 
 // ===========================================================================
 // Reject-side rows (parseAndCheckOwnership) — the measured bug itself.
-// MECHANICALLY VERIFIED (§3/§20): reverting src/flow/CFG.cpp + src/ownership/
-// Ownership.cpp to this commit's parent with this test file kept — 3 of these
-// 4 rows FAIL WITHOUT the fix (Row 1 `return`: both assertions fail, rc=0
-// with zero diagnostics about `x` pre-fix — Row 1 is also the shape measured
-// directly under ASan, heap-use-after-free on first execution, see the
-// commit body; Row 2 `break`: the STRONGER `kAlreadyMovedMsg` assertion
-// fails pre-fix, though the row already rejected for an unrelated, narrower
-// reason — see Row 2's own comment; Row 4 catch-arm-throw: both assertions
-// fail pre-fix). Row 3 `continue` passes IDENTICALLY on both sides — NOT a
-// fail-without row; see its own comment for why. PASS-WITH: all 4 correctly
-// rejected post-fix, with a real location.
+// MECHANICALLY VERIFIED (§3/§20) AGAINST #4180's OWN PARENT COMMIT: reverting
+// src/flow/CFG.cpp + src/ownership/Ownership.cpp to that commit's parent with
+// this test file kept — 3 of these 4 rows FAIL WITHOUT the #4180 fix (Row 1
+// `return`: both assertions fail, rc=0 with zero diagnostics about `x`
+// pre-fix — Row 1 is also the shape measured directly under ASan,
+// heap-use-after-free on first execution, see the #4180 commit body; Row 2
+// `break`: at #4180 landing time the STRONGER `kAlreadyMovedMsg` assertion
+// failed pre-#4180-fix, though the row already rejected for an unrelated,
+// narrower reason; Row 4 catch-arm-throw: both assertions fail pre-fix). Row
+// 3 `continue` passes IDENTICALLY on both sides of #4180 — NOT a
+// fail-without row for #4180; see its own comment for why. PASS-WITH (at
+// #4180 landing time): all 4 correctly rejected, with a real location.
+//
+// narrow #4194 (§21.5/§28.3, v0.298): Row 2's assertion was UPDATED (see its
+// own comment) after #4194's fix changed WHICH diagnostic that one row's
+// program gets — still `hasErrors()` either side of #4194, so this is not a
+// soundness change, just a wording one this file's assertion now tracks.
 // ===========================================================================
 
 // Row 1: `return` — the issue's own filed repro, non-lambda (the real
@@ -169,20 +175,55 @@ BEZEL_TEST(cfg_try_finally_early_exit_4180,
 }
 
 // Row 2: `break` — the same shape, early exit is a `break` out of the
-// enclosing loop instead of a `return`. Measured pre-fix: REJECTED, but for
-// the WRONG (narrower) reason — only "owned value in `x` would be dropped
-// here without disposal", pointing at the declaration, not the finally's
-// maybe-consumed move (visitWhile wires both a true- and false-condition
-// edge even for a literal `while true`, so the unreachable false edge's
-// pre-loop state pollutes the after-loop merge — a separate, narrower
-// artifact #4180's issue flagged as "circumstantial", not independently
-// root-caused there). This IS a FAIL-WITHOUT row: `kAlreadyMovedMsg` (the
-// finally's real double-move) is NOT among the pre-fix diagnostics —
-// mechanically confirmed by reverting src/flow/CFG.cpp + src/ownership/
-// Ownership.cpp to this commit's parent with this test file kept (see the
-// commit body). Post-fix: correctly rejected with BOTH the definite
-// "already moved out" and the discharge diagnostic; this row asserts the
-// STRONGER, now-present message. per §21.5, §28.3, v0.298
+// enclosing loop instead of a `return`. Measured pre-#4180 (this commit's own
+// parent): REJECTED, but for the WRONG (narrower) reason — only "owned value
+// in `x` would be dropped here without disposal", pointing at the
+// declaration, not the finally's move. This WAS a FAIL-WITHOUT row against
+// that baseline: `kAlreadyMovedMsg` (the finally's real double-move, reached
+// via the break's own `routeExitThroughFinally` CLONE of the finally body)
+// was NOT among the pre-#4180 diagnostics — mechanically confirmed at the
+// time by reverting src/flow/CFG.cpp + src/ownership/Ownership.cpp to this
+// commit's parent with this test file kept (see the commit body).
+//
+// narrow #4194 (§21.5/§28.3, v0.298) UPDATED this row's assertion: #4194's
+// fix additionally makes the try's OWN (non-clone) `finallyEntry` reachable
+// for the FIRST time in this exact shape too — via `catchDispatch`'s
+// pre-existing `catches.empty()` pass-through, now fed by #4194's new coarse
+// exception edge on the `break` statement — so the finally body is now
+// analyzed via TWO independent CFG paths: the #4180 CLONE (reached directly
+// from the break's own block, carrying a clean already-moved `x`) and the
+// REAL finally (reached via catchDispatch, carrying the SAME already-moved
+// `x`, but whose own exit — `afterTry`, unlike the clone's `afterEnd` target
+// — feeds the enclosing `while true`'s back edge). That back edge is the
+// SAME pre-existing `visitWhile` "both edges wired even for a literal
+// condition" artifact Row 2/3 already named (#4180's issue called it
+// "circumstantial"): it carries the real finally's post-move state of `x`
+// around into the try body's OWN first `move x` on the (statically dead, but
+// CFG-modeled) next iteration, downgrading BOTH sites from the CLONE's clean
+// "already moved out" to the weaker maybe-consumed family. MEASURED (this
+// exact program, both binaries built from an isolated worktree): pre-#4194
+// (i.e. #4180 alone) — `kAlreadyMovedMsg` at the finally's move + "would be
+// dropped" at the declaration, no maybe-consumed text at all; post-#4194 —
+// `kAlreadyMovedMsg` and "would be dropped" are BOTH GONE, replaced entirely
+// by `kMaybeConsumedReadMsg`/`kMaybeConsumedConsumeMsg` at the try body's
+// first move AND (twice — once per CFG copy of the finally body) at the
+// finally's own move. Still `hasErrors()` either way — this is a
+// diagnostic-WORDING change on an already-rejecting program, not a
+// soundness regression: assert the family Row 3 already uses instead of the
+// single message that no longer fires in THIS shape.
+//
+// ⚠ KNOWN GAP, filed as issue 4211: this row no longer DISCRIMINATES a
+// regression in #4180's OWN clone-based routing mechanism
+// (`routeExitThroughFinally`/`getOrMakeFinallyClone`) specifically.
+// MEASURED (three isolated `CFG.cpp` variants built against this exact
+// program): with #4180's `break` routing reverted to its pre-#4180 direct
+// edge (so the clone does nothing) but #4194's new coarse exception edge
+// kept, the SAME maybe-consumed diagnostics still fire — #4194's edge alone
+// is now sufficient to make the real (non-clone) finally reachable and trip
+// the SAME unrelated back-edge artifact. If #4180's clone routing regressed
+// tomorrow, this row would not catch it. See issue 4211 for the fix
+// direction (an uncontaminated #4180-only row, or accepting the narrower
+// claim this row now makes). per §21.5, §28.3, v0.298
 BEZEL_TEST(cfg_try_finally_early_exit_4180,
            break_through_active_finally_rejects_double_move_21_5) {
     std::string src =
@@ -204,7 +245,8 @@ BEZEL_TEST(cfg_try_finally_early_exit_4180,
         "end C;";
     OwnershipResult r = parseAndCheckOwnership(src);
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasErrorMessage(r, kAlreadyMovedMsg));
+    BEZEL_EXPECT_TRUE(hasErrorMessage(r, kMaybeConsumedReadMsg) ||
+                       hasErrorMessage(r, kMaybeConsumedConsumeMsg));
 }
 
 // Row 3: `continue` — same shape, early exit is `continue` (the loop
