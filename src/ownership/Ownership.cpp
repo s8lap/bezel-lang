@@ -187,6 +187,108 @@ bool caseHasUnguardedCatchAllArm(const ast::CaseStmt& cs) {
     return false;
 }
 
+bool armNeverFallsThrough(const std::vector<std::unique_ptr<ast::Stmt>>& stmts);
+
+// fix #4138 (§19/§19.6/§28.2/§28.3, v0.295): does the LAST reachable
+// top-level statement of an arm provably divert control away from the
+// point directly after the ENCLOSING case/if/while/for construct, so this
+// arm's (or loop body's) end state must be EXCLUDED from that construct's
+// own join (#4116, #4117) rather than folded into it?
+//
+// ONLY `return` and `throw` are recognized here — NOT `break`/`continue`,
+// despite both being equally "does not fall through to this exact merge
+// point" in the abstract. That asymmetry is deliberate, and was reached by
+// MEASURING a regression this predicate's first draft introduced, not by
+// design up front:
+//
+// `return`/`throw` leave the ENCLOSING CALLABLE outright. Nothing else in
+// the callable can ever observe a state that only exists on a path that
+// already left it, so dropping that operand from a join is always safe —
+// the state has nowhere else it needs to go.
+//
+// `break`/`continue` do NOT leave the callable — they reach a different,
+// but very much still-live, merge point (the nearest enclosing loop's own
+// post-loop merge, or its header, respectively). A first draft of this fix
+// excluded them too, on the theory that "doesn't reach THIS merge" was the
+// right test; measured counter-example: `while cond do if flag then move x;
+// break; end; end; move x;` — the `if`'s own join excluded the `break`-arm
+// (correct: `break` never reaches the `if`'s merge), but excluding it
+// DISCARDED the move information entirely instead of forwarding it to the
+// enclosing `while`'s own join, where it very much still belongs (a
+// `break` inside an `if` inside a `while` is exactly how a real program
+// exits a loop early) — silently un-rejecting a genuine double-move this
+// same batch's #3951/#4117 exists to catch. This walker has no general
+// mechanism to forward a "diverted" operand to a DIFFERENT construct's
+// join several levels up (that would need real inter-procedural plumbing,
+// well beyond this narrow fix), so the safe, correct, and properly-scoped
+// choice is: leave `break`/`continue` OUT of this predicate entirely, and
+// accept that the over-conservative false-reject #4138 filed for
+// `return`/`throw` remains UNFIXED for `break`/`continue` (filed as a
+// follow-up, #4141) — a known limitation, not a silent gap: excluding
+// nothing is exactly the pre-#4138 (safe-direction-only) behavior these
+// two terminators already had.
+//
+// Deliberately NOT `sema::ExprTC::stmtAlwaysExits` (ExprTypecheck.cpp):
+// that helper answers "does control leave the ENCLOSING CALLABLE" for the
+// unrelated §21.7 always-returns-a-value check, which is in fact exactly
+// what THIS predicate ended up needing too (once break/continue were
+// dropped) — but it is a private, `ctx_`-bound member of a different
+// translation unit's sema pass, unreachable from here for the same reason
+// `caseHasUnguardedCatchAllArm`'s own header comment gives for not reusing
+// `isUnguardedCatchAll` directly, and it additionally covers non-terminating
+// `while true` and exhaustive-case/try shapes this narrow fix does not need.
+//
+// A syntactic, non-CFG check only: recurses into a fully-covered nested
+// `if` (every branch, including a required `else`) and a `do … end` block,
+// the two shapes most likely to end an arm written with an early
+// return/throw threaded through nested control flow, but does not attempt
+// a `while`/`for`/`try`/`case` as the arm's OWN last statement —
+// under-approximating "never falls through" is always the SAFE direction
+// (it just leaves the pre-existing over-conservative join as-is for that
+// shape), so an exotic shape this misses degrades to the pre-existing,
+// safe-direction-only false-reject rather than ever masking a real hazard.
+bool stmtNeverFallsThrough(const ast::Stmt& s) {
+    if (dynamic_cast<const ast::ReturnStmt*>(&s)) return true;
+    if (dynamic_cast<const ast::ThrowStmt*>(&s)) return true;
+    // §31.2.2 (mirrors stmtAlwaysExits, ExprTypecheck.cpp ~601): an
+    // expression-form rethrow (`throw;` / `throw expr` with no disambiguating
+    // statement keyword — reachable as a case-arm single-statement body,
+    // Parser_Stmts.cpp parseCaseStmtArm's form-3 fallthrough) parses as an
+    // ExpressionStmt wrapping a ThrowExpr, not a ThrowStmt.
+    if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(&s))
+        return es->expr &&
+               dynamic_cast<const ast::ThrowExpr*>(es->expr.get()) != nullptr;
+    if (auto* dob = dynamic_cast<const ast::DoEndBlock*>(&s))
+        return armNeverFallsThrough(dob->body);
+    if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&s)) {
+        if (!ifs->hasElse) return false;  // the false edge falls through
+        if (!armNeverFallsThrough(ifs->ifBranch.body)) return false;
+        for (const auto& el : ifs->elifBranches)
+            if (!armNeverFallsThrough(el.body)) return false;
+        return armNeverFallsThrough(ifs->elseBody);
+    }
+    return false;
+}
+
+// The arm-level predicate this fix's join sites actually call: does this
+// statement list, taken as a whole, never fall through? An empty body
+// falls through by definition (there is nothing to divert control). Used
+// for a case/if ARM (excluded from that construct's own join) and,
+// identically, for a while/for loop BODY (excluded from the loop's own
+// "ran the body" ∪ "0 iterations" join, this file's While/For arms in
+// `applyUsingVarBorrowPinInLambdaStmt`) — since only return/throw are
+// recognized (see the header comment above), there is no longer any
+// semantic difference between the two call sites that would justify a
+// second, loop-specific spelling of this predicate (an earlier draft had
+// one, keyed on treating `break` differently; it was removed once
+// break/continue stopped being excluded at all).
+bool armNeverFallsThrough(const std::vector<std::unique_ptr<ast::Stmt>>& stmts) {
+    for (auto it = stmts.rbegin(); it != stmts.rend(); ++it) {
+        if (*it) return stmtNeverFallsThrough(**it);
+    }
+    return false;
+}
+
 // fix #3037 / §28.3 (v0.240): the source location of a §28.3 owned-binding
 // diagnostic. Most owned-binding kinds carry `obligationOrigin` populated by the
 // analysis (a back-pointer to the AST node where the obligation was created,
@@ -3099,12 +3201,25 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
         for (const auto& arm : cs->arms) {
             states_ = saved;
             if (arm.guard) checkRead(*arm.guard, /*selfTarget=*/false);
+            bool armNeverReachesJoin = false;
             if (arm.bodyKind == ast::CaseArmBodyKind::Expression) {
                 if (arm.exprBody) handleDischarge(*arm.exprBody);
             } else {
                 for (const auto& bs : arm.stmts) if (bs) visitStmt(*bs);
+                // fix #4138 (§19/§28.2/§28.3, v0.295): an arm whose last
+                // reachable statement is `return`/`throw` leaves the
+                // callable outright and so never reaches the point directly
+                // after this `case` -- see `armNeverFallsThrough`'s header
+                // comment a few hundred lines above (including why
+                // `break`/`continue` are deliberately NOT recognized there).
+                // Excluding it here is what #4138 adds on top of #4116's
+                // join: without this, a throwing arm's end state (however it
+                // left `x`) was wrongly folded in alongside a sibling arm
+                // that never touched `x`, poisoning the ONLY reachable path
+                // with a spurious maybe-consumed.
+                armNeverReachesJoin = armNeverFallsThrough(arm.stmts);
             }
-            armEnds.push_back(states_);
+            if (!armNeverReachesJoin) armEnds.push_back(states_);
         }
         // fix #4116: join every arm's end state, plus `saved` for the
         // statement-`case`'s possible no-match fallthrough (§19.6) UNLESS a
@@ -3114,11 +3229,22 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
         std::vector<BlockState> joinOperands = std::move(armEnds);
         if (!caseHasUnguardedCatchAllArm(*cs))
             joinOperands.push_back(saved);
-        auto joined = std::move(joinOperands.front());
-        for (std::size_t i = 1; i < joinOperands.size(); ++i)
-            joinInto(joined, joinOperands[i], cs->span.begin,
-                     /*emitClash=*/false, /*unionKeys=*/false);
-        states_ = std::move(joined);
+        if (joinOperands.empty()) {
+            // fix #4138: every arm (a present unguarded catch-all included)
+            // provably never falls through -- the code after this `case` is
+            // unreachable via any live path. Fall back to `saved` rather
+            // than dereference an empty vector; soundness is moot for
+            // provably-unreachable code (`armNeverFallsThrough` never
+            // over-claims termination, so this branch is only reached when
+            // the fallthrough truly cannot happen).
+            states_ = saved;
+        } else {
+            auto joined = std::move(joinOperands.front());
+            for (std::size_t i = 1; i < joinOperands.size(); ++i)
+                joinInto(joined, joinOperands[i], cs->span.begin,
+                         /*emitClash=*/false, /*unionKeys=*/false);
+            states_ = std::move(joined);
+        }
         return;
     }
     if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(&s)) {
@@ -9082,7 +9208,19 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
         std::vector<BlockState> armEnds;
         for (const auto& bs : ifs->ifBranch.body)
             if (bs) applyUsingVarBorrowPinInLambdaStmt(*bs);
-        armEnds.push_back(states_);
+        // fix #4138 (§19/§28.2/§28.3, v0.295): an arm ending in
+        // return/throw leaves the callable outright and so never reaches
+        // the point directly after this `if`, so it must not be folded into
+        // the join below -- see `armNeverFallsThrough`'s header comment
+        // (this file, ~line 190), including why `break`/`continue` are
+        // deliberately NOT recognized there. Without this, #4117's join
+        // wrongly poisoned the sibling (reachable) arm's clean state with a
+        // throwing/returning arm's own end state. The implicit false-edge
+        // fallthrough (`savedIfStates`, pushed below when there is no
+        // `else`) is NOT a real arm body and is always reachable, so it is
+        // never subject to this check.
+        if (!armNeverFallsThrough(ifs->ifBranch.body))
+            armEnds.push_back(states_);
         for (const auto& el : ifs->elifBranches) {
             states_ = savedIfStates;
             if (el.condition) {
@@ -9093,21 +9231,33 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
             }
             for (const auto& bs : el.body)
                 if (bs) applyUsingVarBorrowPinInLambdaStmt(*bs);
-            armEnds.push_back(states_);
+            if (!armNeverFallsThrough(el.body))
+                armEnds.push_back(states_);
         }
         if (ifs->hasElse) {
             states_ = savedIfStates;
             for (const auto& bs : ifs->elseBody)
                 if (bs) applyUsingVarBorrowPinInLambdaStmt(*bs);
-            armEnds.push_back(states_);
+            if (!armNeverFallsThrough(ifs->elseBody))
+                armEnds.push_back(states_);
         } else {
             armEnds.push_back(savedIfStates);
         }
-        auto ifJoined = std::move(armEnds.front());
-        for (std::size_t i = 1; i < armEnds.size(); ++i)
-            joinInto(ifJoined, armEnds[i], ifs->span.begin,
-                     /*emitClash=*/false, /*unionKeys=*/false);
-        states_ = std::move(ifJoined);
+        if (armEnds.empty()) {
+            // fix #4138: every arm (a present `else` included) provably
+            // never falls through -- the code after this `if` is
+            // unreachable via any live path. Fall back to the pre-if
+            // snapshot rather than dereference an empty vector; see the
+            // identical CaseStmt fallback (this file, ~line 3255) for why
+            // soundness is moot here.
+            states_ = savedIfStates;
+        } else {
+            auto ifJoined = std::move(armEnds.front());
+            for (std::size_t i = 1; i < armEnds.size(); ++i)
+                joinInto(ifJoined, armEnds[i], ifs->span.begin,
+                         /*emitClash=*/false, /*unionKeys=*/false);
+            states_ = std::move(ifJoined);
+        }
         return;
     }
     if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&s)) {
@@ -9144,8 +9294,21 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
         BlockState savedWhileStates = states_;
         for (const auto& bs : ws->body)
             if (bs) applyUsingVarBorrowPinInLambdaStmt(*bs);
-        joinInto(states_, savedWhileStates, ws->span.begin,
-                 /*emitClash=*/false, /*unionKeys=*/false);
+        // fix #4138 (§21.5/§28.3, v0.295): a body whose last reachable
+        // statement is return/throw never reaches the point directly after
+        // this loop (it leaves the callable outright), so it must not be
+        // folded into the "ran the body" operand -- see
+        // `armNeverFallsThrough`'s header comment (this file, ~line 190),
+        // including why `break`/`continue` are deliberately NOT recognized
+        // there. When the body never falls through, the ONLY live operand
+        // is the always-possible 0-iteration edge, so `states_` is simply
+        // the pre-loop snapshot -- no join needed.
+        if (armNeverFallsThrough(ws->body)) {
+            states_ = savedWhileStates;
+        } else {
+            joinInto(states_, savedWhileStates, ws->span.begin,
+                     /*emitClash=*/false, /*unionKeys=*/false);
+        }
         return;
     }
     if (auto* fs = dynamic_cast<const ast::ForStmt*>(&s)) {
@@ -9171,8 +9334,14 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
         BlockState savedForStates = states_;
         for (const auto& bs : fs->body)
             if (bs) applyUsingVarBorrowPinInLambdaStmt(*bs);
-        joinInto(states_, savedForStates, fs->span.begin,
-                 /*emitClash=*/false, /*unionKeys=*/false);
+        // fix #4138 (§21.5/§28.3, v0.295): see the identical WhileStmt
+        // exclusion just above.
+        if (armNeverFallsThrough(fs->body)) {
+            states_ = savedForStates;
+        } else {
+            joinInto(states_, savedForStates, fs->span.begin,
+                     /*emitClash=*/false, /*unionKeys=*/false);
+        }
         return;
     }
     if (auto* db = dynamic_cast<const ast::DoEndBlock*>(&s)) {
@@ -9237,6 +9406,38 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
         // real exception-edge machinery (unlike the CFG-driven per-method
         // dataflow), and widening it to one is out of this fix's scope.
         // // per §28.3 K1.3, §28.8.1, v0.295, #3951, #4117
+        //
+        // #4138 (declined here — see issue #4142): the try-body's normal-
+        // completion path has the identical false-reject shape as the
+        // Case/If joins above when it ends in `return`/`throw` (measured:
+        // `try t := t + Take(move x); return t; catch E => t := 0; end; t
+        // := t + Take(move x);` compiles clean on origin/main, falsely
+        // rejected on this batch's base) — but excluding it here the same
+        // way is UNSOUND, not merely incomplete, because of `finally`.
+        // `finally` ALWAYS runs, on every path including one that is about
+        // to return/throw, so the state fed into `finally`'s own walk below
+        // must be the union of EVERY path, terminated or not — dropping a
+        // terminated operand here is invisible when there is no `finally`,
+        // but reopens a real double-move once one is added: measured, `try
+        // t := t + Take(move x); return t; finally t := t + Take(move x);
+        // end;` (no catch arm at all) correctly rejects "already moved out"
+        // at `102d29f`/`3bdae03` alike (a single-operand join, the body's
+        // own MovedFrom state, feeds `finally` directly) but silently
+        // ACCEPTED once this arm was excluded from `tryEnds` the same way
+        // the Case/If arms are — `finally` was walked from the wrong
+        // (too-optimistic) state. `finally`'s state and "state that
+        // survives past the whole `try`" are the SAME variable in this
+        // walker (`states_`, mutated in place) precisely because `finally`
+        // is walked exactly once, not once per tryEnds operand — so there
+        // is no way to filter one consumer without also filtering the
+        // other with the tools this walker has. A correct fix needs the two
+        // uses separated (an unfiltered union for `finally`'s own walk, and
+        // a further reachability re-filter of ITS OWN result afterward for
+        // what continues past the whole `try`) — a larger, more careful
+        // change than this narrow batch fix-forward should make under time
+        // pressure. Left EXACTLY as #4117 landed it (unconditional), so the
+        // known-safe `finally` behavior is preserved and #4138's Try
+        // sub-case remains a declared, open false-reject (issue #4142).
         BlockState savedTryStates = states_;
         for (const auto& bs : trys->body)
             if (bs) applyUsingVarBorrowPinInLambdaStmt(*bs);
@@ -9312,15 +9513,29 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
             }
             for (const auto& bs : arm.stmts)
                 if (bs) applyUsingVarBorrowPinInLambdaStmt(*bs);
-            caseArmEnds.push_back(states_);
+            // fix #4138 (§19/§28.2/§28.3, v0.295): see the identical
+            // exclusion on the real per-method CaseStmt join (this file,
+            // ~line 3180) and on the If arm just above -- an arm ending in
+            // return/throw leaves the callable outright and so never
+            // reaches the point directly after this `case`, so its end
+            // state must not be folded in.
+            if (!armNeverFallsThrough(arm.stmts))
+                caseArmEnds.push_back(states_);
         }
         if (!caseHasUnguardedCatchAllArm(*cs))
             caseArmEnds.push_back(savedCaseStates);
-        auto caseJoined = std::move(caseArmEnds.front());
-        for (std::size_t i = 1; i < caseArmEnds.size(); ++i)
-            joinInto(caseJoined, caseArmEnds[i], cs->span.begin,
-                     /*emitClash=*/false, /*unionKeys=*/false);
-        states_ = std::move(caseJoined);
+        if (caseArmEnds.empty()) {
+            // fix #4138: every arm (a present unguarded catch-all included)
+            // provably never falls through. See the identical fallback on
+            // the real per-method CaseStmt join (this file, ~line 3255).
+            states_ = savedCaseStates;
+        } else {
+            auto caseJoined = std::move(caseArmEnds.front());
+            for (std::size_t i = 1; i < caseArmEnds.size(); ++i)
+                joinInto(caseJoined, caseArmEnds[i], cs->span.begin,
+                         /*emitClash=*/false, /*unionKeys=*/false);
+            states_ = std::move(caseJoined);
+        }
         return;
     }
     // Break / Continue / etc.: no child expressions reachable.
