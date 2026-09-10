@@ -408,6 +408,10 @@ void Resolver::run(const ast::SourceFile& src) {
     // kind half checkChoiceDispatchModifiers's own comment deliberately left
     // out of scope, mirroring checkEnumRestrictions above.
     checkChoiceRestrictions();
+    // fix #4115 (§22.16, v0.298): an `invariant` member on an enum or choice
+    // body — invisible to both member-kind walks just above, since
+    // `invariant` clauses are not a `Symbol` subclass at all.
+    checkEnumChoiceInvariantMembers();
     // §14.2 (#746): contradictory generic constraints (e.g. class + value).
     checkGenericConstraintConsistency();
     // Slice S33: method body-presence rules (§12.5 / §11.2).

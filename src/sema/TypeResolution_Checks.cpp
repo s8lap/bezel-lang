@@ -1153,14 +1153,15 @@ void Resolver::checkChoiceDispatchModifiers() {
 // checkEnumRestrictions itself still admits them for enums; #3840 tracks
 // fixing BOTH sides together, not this fix, which only closes the
 // admissible-KIND gap #3869 describes). An `invariant` member is likewise
-// NOT covered — `t->members` never carries one (it is a distinct AST/side-
-// table construct, `TypeSymbol::invariantContracts`, not a `Symbol`
-// subclass at all), so neither this walk nor checkEnumRestrictions's can
-// see it; that gap (named in the spec's own Appendix A preamble's
+// NOT covered here — `t->members` never carries one (it is a distinct
+// AST/side-table construct, `TypeSymbol::invariantContracts`, not a
+// `Symbol` subclass at all), so neither this walk nor checkEnumRestrictions's
+// can see it; that gap (named in the spec's own Appendix A preamble's
 // "Shared-production over-admissions" index — the unnumbered table before
 // A.1 — in its `Member` in an enum-or-choice body row's "invariant by
-// §22.16" clause) is uncovered for BOTH enum and choice bodies today and
-// is out of this fix's scope — filed separately.
+// §22.16" clause) was left uncovered for BOTH enum and choice bodies by
+// this fix — closed separately by fix #4115's checkEnumChoiceInvariantMembers
+// below, which reads the raw AST member list instead of `t->members`.
 void Resolver::checkChoiceRestrictions() {
     if (!ctx_.module()) return;
     forEachTypeAndNested([&](TypeSymbol* t) {
@@ -1215,6 +1216,81 @@ void Resolver::checkChoiceRestrictions() {
                     "`const` members, and operator overloads only)");
                 continue;
             }
+        }
+    });
+}
+
+// fix #4115 (§22.16, Appendix A preamble "Shared-production over-admissions"
+// index, v0.298): an `invariant` member on an enum or choice body compiles
+// with zero diagnostics — MEASURED on this HEAD (pre-fix): both
+//   choice Shape Circle(radius: double), Square(side: double); invariant(true); end Shape;
+// and
+//   enum Color Red, Green, Blue; invariant(true); end Color;
+// compile at exit 0, zero diagnostics. Neither checkEnumRestrictions nor
+// checkChoiceRestrictions (above) can see this: `invariant` clauses are not
+// modeled as a `Symbol` subclass in `TypeSymbol::members` at all —
+// SymbolCollection never creates one for `ast::InvariantDecl` — they live
+// only in `TypeSymbol::invariantContracts`, a side-table `ModuleLoader`
+// populates for an IMPORTED class from the exporting module's already-
+// validated metadata (ModuleLoader.cpp), never for a local declaration
+// (Symbol.hpp's own comment on the field: "Local classes derive these from
+// their AST; imported classes have no AST, so the loader publishes this
+// side-table vector"). A LOCAL enum or choice's invariant member is
+// therefore readable only from the raw AST: `t->decl`'s
+// `ast::TypeDecl::members` (populated because the parser's EnumMember*/
+// ChoiceMember* productions both route through the shared `parseMember()`
+// used for class bodies — Parser_Decls.cpp's own comment there: "We accept
+// the full Member grammar at the parse level and let sema filter" — so an
+// `ast::InvariantDecl` parses into an enum/choice body exactly as it does
+// into a class body; nothing at the grammar layer excludes it).
+//
+// Citation note: the issue that reported this (#4115) titled itself
+// "Appendix A.9" for the admissions-index table; VERIFIED against
+// docs/Bezel_Language_Spec.md that no such subsection exists — Appendix A's
+// numbered subsections run A.1 through A.8 only (grep `^### A\.` — A.1
+// Lexical .. A.8 Constants and literals). The table is the UNNUMBERED one
+// in the Appendix A preamble, introduced "Shared-production over-admissions
+// (index, not a rule)" just before A.1, whose `Member` in an enum-or-choice
+// body row reads (verbatim): "invariant by [§22.16](#sec-contract-clauses),
+// destructors by [§8.7](#sec-dispose-is-not-on-object)". §22.16 itself
+// ("Contract clauses") states the scope directly: "a class body may declare
+// invariant members" — an enum or choice is not a class, so this is the
+// primary authority; the Appendix A table is the index confirming the
+// rejection is deliberate policy, not an oversight.
+//
+// One check for both kinds (unlike the split checkEnumRestrictions /
+// checkChoiceRestrictions pair): the AST-read, the message shape, and the
+// citation are identical for both, and unlike those two functions this one
+// has no other kind-specific rule to carry, so a single small function
+// reading `t->kind` beats two near-duplicate ones.
+void Resolver::checkEnumChoiceInvariantMembers() {
+    if (!ctx_.module()) return;
+    forEachTypeAndNested([&](TypeSymbol* t) {
+        if (t->kind != ast::TypeDeclKind::Enum &&
+            t->kind != ast::TypeDeclKind::Choice) return;
+        // `t` is drawn from forEachTypeAndNested (#3574), which walks only
+        // this module's own local declaration tree — never an imported type
+        // (#3152). An imported enum/choice's invariant member, if the
+        // exporting module's own compile somehow let one through, is out of
+        // this check's reach (it has no AST here) but also out of scope:
+        // the exporting module's compile is where this same check would
+        // have run and rejected it before the artifact interface (§2.8.2)
+        // could ever publish it.
+        // SEAM-ACCESSOR: `t->decl` is always a real `ast::TypeDecl*` here.
+        auto* td = dynamic_cast<const ast::TypeDecl*>(t->decl);
+        if (!td) return;
+        const bool isEnum = t->kind == ast::TypeDeclKind::Enum;
+        for (const auto& mp : td->members) {
+            auto* inv = dynamic_cast<const ast::InvariantDecl*>(mp.get());
+            if (!inv) continue;
+            ctx_.diagnostics().report(
+                Severity::Error, inv->loc,
+                std::string(isEnum ? "enum `" : "choice `") +
+                std::string(t->name) +
+                "` may not declare an `invariant` member — §22.16 scopes "
+                "invariant members to class bodies, and " +
+                std::string(isEnum ? "an enum" : "a choice") +
+                " is not a class (§22.16)");
         }
     });
 }

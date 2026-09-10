@@ -373,6 +373,17 @@ private:
     // function does not double-report it.
     void checkChoiceRestrictions();
 
+    // fix #4115 (§22.16, Appendix A preamble "Shared-production
+    // over-admissions" index, v0.298): an `invariant` member is not modeled
+    // as a `Symbol` subclass at all (it lives only in
+    // `TypeSymbol::invariantContracts`, a side-table `ModuleLoader`
+    // populates for imported types), so neither checkEnumRestrictions's nor
+    // checkChoiceRestrictions's `t->members` walk (above) can see one. This
+    // reads the raw AST member list (`t->decl`) directly, for both kinds at
+    // once, and rejects any `ast::InvariantDecl` it finds — §22.16 scopes
+    // invariant members to class bodies.
+    void checkEnumChoiceInvariantMembers();
+
     // §14.2 (#746): a type parameter may not carry contradictory constraints
     // (e.g. both `class` and `value`). Checked once per generic declaration
     // (type + method `where` clauses), independent of instantiation.
