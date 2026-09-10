@@ -384,241 +384,51 @@ bool typeTestTargetMentionsTypeVariable(const TypeRef* t) {
 }  // namespace
 
 // §17.11 (#951): does `default(T)` have no well-defined zero value? See the
-// header declaration. Recurses into a record's positional fields and an inline
+// header declaration. Recurses into a record's storage members and an inline
 // array's element type.
 //
-// fix #3995 (§17.11/§9.7/§3.6 rule 2, v0.294): `incoming` is threaded through
-// EVERY recursive call in this function — the InlineArray element and the
-// Record field walk below — exactly as `common::isBorrowBearingRecordCommon`
-// threads its own `env` parameter through the identically-shaped §9.7
-// recursion (OwnershipFacts.cpp). Without this, a DELEGATING generic record
-// (`record Outer<T>(In: Inner<T>)`) silently escaped substitution: the OUTER
-// frame correctly resolves `In`'s type to the concrete `Inner<T>` TypeRef
-// (its own genericArgs are literal source text, e.g. `Inner<T>` where `T`
-// is Outer's own bare parameter — NOT yet resolved to `WidgetDG1`), but the
-// recursive call used to reseed the INNER frame with `incoming=nullptr`,
-// so `Inner`'s own `T` genericArg — itself a bare mention of Outer's
-// parameter — never got looked up anywhere, and the bare-parameter early
-// return two lines below then fired on the STILL-GENERIC field, silently
-// accepting. MEASURED: `record InnerDG1<T>(V: T); record
-// OuterDG1<T>(In: InnerDG1<T>); default(OuterDG1<WidgetDG1>)` (WidgetDG1 a
-// non-nullable class) compiled at exit 0 and SIGSEGV'd (exit 139) on the
-// arm that fixed #3986/#3982 without this composition.
+// fix #3982/#3986/#3988/#3995 (§17.11/§9.7/§9.3/§3.6 rule 2, v0.294): this
+// function's history — symbol-side (not `TypeSymbol::decl`, null for every
+// imported type) field enumeration; generic-parameter substitution via
+// `common::RecordSubstEnv`; full `recordStorageMembers` coverage (positional
+// + body + auto-properties, not positional-only); and `incoming`-env
+// composition so a DELEGATING generic record's inner frame resolves its own
+// bare-parameter mentions. See git history / #3995's issue for the full
+// per-fix rationale and measured repros — preserved there rather than
+// duplicated here now that the implementation itself has moved.
+//
+// fix #4166 review follow-up (§14.2/§17.11/§35.10, v0.298): the
+// implementation is now the SHARED free function `sema::typeHasNoDefault`
+// (TypeResolution.hpp / TypeResolution_Checks.cpp), which
+// `Resolver::argSatisfiesNew`'s Record arm also calls for the identically-
+// shaped `where T: new()` question — see that declaration's comment for
+// why the two needed unifying (they had drifted: `argSatisfiesNew`'s own
+// port covered only Record-kind recursion, diverging from this function's
+// full per-kind switch on Enum/Choice/InlineArray and the
+// `isValueBuiltin`-aware Class/Interface test — issues #4219, #4223) and
+// what the shared function gained in the process (a cycle guard THIS
+// function itself never had — a self-referential record reached through
+// `default(...)` SIGSEGV'd here identically to the `where T: new()` shape
+// that review caught, on every revision before this one). This wrapper
+// exists so every existing call site of `ExprTC::defaultIllFormed` — there
+// are close to a dozen across this file and ExprTypecheck.cpp — keeps the
+// same signature with the implementation hoisted.
+//
+// ONE deliberate behavior change survives the hoist: a non-nullable
+// `Object`-typed component now ALSO reports non-defaultable (previously
+// excluded here — "left out... to keep this consistent with the original
+// #951 scope — a separate consideration", this function's own prior text).
+// `Resolver::argSatisfiesNew`'s pre-existing, tested behavior already
+// correctly rejected `Object` (categorize() classifies it Reference), and
+// unifying toward the narrower exclusion instead would have silently
+// reintroduced a false accept there (caught by this fix's own broad
+// regression sweep). §17.11's "defaultable" definition is unambiguous
+// here regardless of which side moved: "Not defaultable: non-nullable
+// reference types" includes `Object`. See `typeHasNoDefaultWalk`'s own
+// Primitive-arm comment (TypeResolution_Checks.cpp) for the full note.
 bool ExprTC::defaultIllFormed(const TypeRef* t,
                               const common::RecordSubstEnv* incoming) {
-    if (!t || t->nullable) return false;  // nullable defaults to null — OK
-    switch (t->kind) {
-        case TypeRef::Kind::Primitive:
-            // `string` is a runtime-managed reference (§4.6) with no zero. Value
-            // primitives (int/bool/char/…) have a zero. (Non-nullable Object is
-            // also a reference type, but left out here to keep this consistent
-            // with the original #951 scope — a separate consideration.)
-            return t->primitive == PrimitiveType::String;
-        case TypeRef::Kind::Function:
-            return true;  // a function value (§28.9) has no zero
-        case TypeRef::Kind::InlineArray: {
-            // fix #3995: a bare-parameter element (`[N]T`) needs the SAME
-            // substitution a record field does — resolve it through
-            // `incoming` before recursing, threading the substituted
-            // entry's own env (so a `[N]Inner<T>` element composes exactly
-            // as the Record arm's field walk does below).
-            common::RecordSubstEnv::Entry sub =
-                common::resolveRecordFieldSubst(t->arrayElement, incoming);
-            return defaultIllFormed(sub.ty, sub.env);
-        }
-        case TypeRef::Kind::Named: {
-            if (!t->declaration) return false;  // generic param / unresolved
-            auto k = t->declaration->kind;
-            // fix #3108 (§16.3/§16.4, v0.242): `default(Range<T>)` is a compile
-            // error for the COMPILER-INTRINSIC `Range<T>` — §16.4 promises "no
-            // `Range<T>` value with a zero step can exist" and the `default`
-            // form all-zeroes `Range<T>` would yield step=0, falsifying the
-            // invariant. The spec's own enumeration of `Range<T>` producers
-            // (range expressions; the deserialization path for `Range<char>`)
-            // excludes `default`, so the well-formedness check joins §17.11's
-            // rejection set alongside non-nullable references, enums with no
-            // zero-valued constant, and choices. The identity is the builtin
-            // `Range` (range expressions (§16.4) and the §16.3 closure of
-            // constructors), NOT a user-declared class `class Range<T>` — §11.3
-            // reserves no names, so `class Range<T>` is legal, and the builtin
-            // vs user-class distinction is the same `declaration ==
-            // builtinClassSym("Range")` pointer-equality the §5 LINQ receiver
-            // gate uses (ExprTypecheck_Calls.cpp:3872's #3022n precedent). The
-            // check runs BEFORE the Class arm so the builtin isn't admitted
-            // through `!isValueBuiltin` = false (the builtin is a `Class`-
-            // typed `TypeSymbol` with `isValueBuiltin=true`).
-            if (t->declaration == ctx_.builtinClassSym("Range")) return true;
-            if (k == ast::TypeDeclKind::Class ||
-                k == ast::TypeDeclKind::Interface)
-                return !t->declaration->isValueBuiltin;
-            // fix #3044 (§17.11, v0.242): `default(E)` is a compile error for
-            // "an enum type with no declared constant of underlying value 0".
-            // Escalated from a warning by proposal 0078's Q3 rider: it is the
-            // LAST producer of a value equal to no declared constant, and
-            // §5.4's invariant ("there is no value of an enum type that is not
-            // equal to a declared constant") — on which §19.6's restored
-            // exhaustiveness guarantee and §21.7's totality grant both rest —
-            // is only true with it closed. An enum whose declared-value set
-            // cannot be decided (a non-constant initializer, already
-            // diagnosed) is NOT rejected: enumHasZeroConstant returns nullopt
-            // and the default is treated as well-formed, matching the
-            // conservative posture of the record arm below.
-            if (k == ast::TypeDeclKind::Enum) {
-                std::optional<bool> hasZero =
-                    enumHasZeroConstant(*t->declaration);
-                return hasZero && !*hasZero;
-            }
-            // §35.10 (v0.200, #2044): `default(C)` is a compile error for
-            // EVERY choice type — a sum has no principled zero (electing a
-            // case would make meaning depend on declaration order). The
-            // nullable form `default(C?)` is the valid null and stays
-            // accepted (t->nullable returned false above for the non-null
-            // case, which is what reaches here).
-            if (k == ast::TypeDeclKind::Choice) return true;
-            if (k == ast::TypeDeclKind::Record) {
-                // fix #3982 (§17.11, v0.294): this used to cast
-                // `t->declaration->decl` to `ast::TypeDecl*` and walk ITS
-                // `positionalFields`, returning "well-formed" (accept)
-                // whenever that cast failed. `TypeSymbol::decl` is NEVER
-                // assigned for an imported type (Symbol.hpp; the same fact
-                // #3911/#3957/#3970 each independently hit for sibling
-                // AST-side reads), so `default(T)` over ANY imported record
-                // was silently accepted regardless of its fields' types —
-                // including a non-nullable class-typed field, which §17.11
-                // says makes the record non-defaultable. Unlike #3970's
-                // sibling gap this one is a real SIGSEGV, not just a static-
-                // checking hole: codegen's `default(T)` lowering recursively
-                // default-constructs each field, so the non-nullable
-                // reference field's "default" is a null pointer with no
-                // diagnostic ever having fired, and a subsequent member
-                // access null-derefs.
-                //
-                // fix #3986 (§17.11, v0.294): a field's DECLARED type can
-                // still be a bare, declaration-less reference to the
-                // record's OWN generic parameter (`V: T` in `record
-                // Box<T>(V: T)`), which line ~403's `!t->declaration`
-                // early-return treats as an unresolved parameter and
-                // unconditionally accepts, regardless of what `t` (the
-                // CONCRETE instantiation being checked, e.g.
-                // `Box<WidgetGL>`) actually binds T to. Substitute it via
-                // the SAME instantiation-site environment the §9.7
-                // borrow-bearing walk and the §35.4/§35.11 choice-payload
-                // walk already use for identically-shaped generic
-                // substitution (`common::RecordSubstEnv` /
-                // `seedRecordSubstEnv` / `resolveRecordFieldSubst`,
-                // OwnershipFacts.hpp, #2145) — no new predicate. This uses
-                // the SYMBOL-side `seedRecordSubstEnv(TypeSymbol&, ...)`
-                // overload (rather than the AST-side one, which needs a
-                // `td` this arm no longer materializes — re-adding that
-                // cast would silently reintroduce #3982 for every imported
-                // generic record), so it seeds correctly for an imported
-                // generic record too: `TypeSymbol::genericParams` is
-                // populated by ModuleLoader for an imported type
-                // (ModuleLoader.cpp), unlike `decl`.
-                //
-                // fix #3995 (§17.11/§9.7/§3.6 rule 2, v0.294): seed THIS
-                // frame's own environment with `incoming` (the caller's
-                // composed env), not a bare `nullptr` — mirroring
-                // `common::isBorrowBearingRecordCommon`'s own
-                // `seedRecordSubstEnv(*ts, *rt, env, myEnv)` call
-                // (OwnershipFacts.cpp), which passes its CALLER's `env`
-                // through as `incoming` for exactly this reason. Without
-                // it, a DELEGATING generic record
-                // (`record Outer<T>(In: Inner<T>)`) breaks: `In`'s
-                // resolved-but-unsubstituted type is the concrete-looking
-                // Named TypeRef `Inner<T>` (declaration set — NOT a bare
-                // parameter itself, so `resolveRecordFieldSubst` below
-                // passes it through unchanged), but recursing into
-                // `defaultIllFormed(Inner<T>, incoming=nullptr)` would
-                // reseed the INNER frame from a `nullptr` incoming, so
-                // `Inner`'s own `genericArgs[0]` (itself a bare mention of
-                // OUTER's `T`) could never be looked up anywhere, and the
-                // bare-parameter early return (`!t->declaration` above)
-                // would fire on the STILL-GENERIC substituted field,
-                // silently accepting — MEASURED: `record InnerDG1<T>(V: T);
-                // record OuterDG1<T>(In: InnerDG1<T>);
-                // default(OuterDG1<WidgetDG1>)` (WidgetDG1 non-nullable)
-                // compiled clean and SIGSEGV'd without this composition,
-                // reproducing identically against `91e353f` (#3982 alone).
-                // `resolveRecordFieldSubst`'s returned `Entry::env` is
-                // exactly the incoming env to recurse with for EITHER
-                // shape (a substituted bare-parameter leaf, or an
-                // unchanged composite field like `Inner<T>`) — see its own
-                // doc comment and `recordFieldTypeIsBorrowCarryingCommon`'s
-                // identical two-shape dispatch (OwnershipFacts.cpp) for the
-                // established precedent this mirrors.
-                //
-                // fix #3988 (§17.11/§9.3, v0.294): §17.11's opening clause is
-                // "Records all of whose DECLARED FIELDS are defaultable" — for
-                // a combined-form record (§9.3: positional fields AND a body)
-                // that is positional fields UNION body storage (fields and
-                // auto-properties alike), mirroring §9.3's own admissibility
-                // rule ("the positional fields counted as storage components
-                // alongside the body's auto-properties"). The field walk
-                // above used to cover only POSITIONAL fields
-                // (`recordPositionalFieldSymbols`) — empty for EVERY
-                // body-only record and for the body half of EVERY
-                // combined-form record, so a non-nullable reference-typed
-                // body field/auto-property was invisible here and
-                // `default(T)` was silently accepted, then codegen's
-                // recursive per-field default-construction null-derefed the
-                // manufactured null at runtime. `recordStorageMembers`
-                // (sema/Symbol.hpp) is the ONE symbol-side full-storage
-                // enumeration — positional fields, body fields, and
-                // auto-properties together, answering identically for a
-                // local and an imported record — so this reads it instead
-                // of re-deriving a second, narrower walk.
-                common::RecordSubstEnv env;
-                common::seedRecordSubstEnv(*t->declaration, *t, incoming, env);
-                const common::RecordSubstEnv* fieldEnv =
-                    env.map.empty() ? nullptr : &env;
-                // ⚠ #3995 interaction, verified rather than assumed: it is
-                // tempting to pass `fieldEnv` straight into
-                // `recordStorageMembers`'s own `env` parameter and drop the
-                // per-field `resolveRecordFieldSubst` call entirely (that
-                // function DOES apply substitution internally per member,
-                // SymbolCollection.cpp fix #3171) — but it keeps only the
-                // substituted `Entry::ty`, discarding `Entry::env`. For a
-                // DELEGATING field (`In: Inner<T>`), the correct recursive
-                // call is `defaultIllFormed(Inner<T>, thisFramesEnv)` — the
-                // type is unchanged (not a bare parameter itself) but the
-                // ENV to recurse with is still needed so the INNER frame can
-                // resolve ITS OWN bare mention of `T`. Losing `Entry::env`
-                // here would silently reintroduce #3995 for exactly the
-                // shape #3988 exists to cover (a delegating GENERIC record
-                // reached through body/combined-form storage) — measured:
-                // without this, `default(Outer<Widget>)` for an imported
-                // combined-form `Outer<T>(X: int) { public In: Inner<T>; }`
-                // compiles clean and SIGSEGVs, identically to #3995's own
-                // pre-fix repro. So `recordStorageMembers` is called with
-                // `env=nullptr` (yielding the RAW, unsubstituted declared
-                // type per member — identical to what `storageComponentType`
-                // alone would give the old positional-only walk) and this
-                // arm performs its OWN `resolveRecordFieldSubst` +
-                // `Entry::env`-threaded recursion per member, exactly
-                // mirroring the positional-field loop's own pattern above,
-                // just applied to the WIDER enumeration.
-                bool illFormed = false;
-                recordStorageMembers(
-                    t->declaration, ctx_,
-                    [&](const RecordStorageMember& rsm) {
-                        if (!rsm.type) return true;  // unresolved — defer
-                        common::RecordSubstEnv::Entry sub =
-                            common::resolveRecordFieldSubst(rsm.type, fieldEnv);
-                        if (defaultIllFormed(sub.ty, sub.env)) {
-                            illFormed = true;
-                            return false;  // stop
-                        }
-                        return true;
-                    },
-                    /*env=*/nullptr);
-                return illFormed;
-            }
-            return false;
-        }
-        default:
-            return false;  // Unit / Error
-    }
+    return sema::typeHasNoDefault(t, ctx_, incoming);
 }
 
 // per §27.4 (v0.183, #1408) / A.7 LambdaDestructure. See declaration

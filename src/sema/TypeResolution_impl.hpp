@@ -29,14 +29,6 @@
 #include "sema/Symbol.hpp"
 #include "sema/TypeRef.hpp"
 
-// Forward-declared rather than `#include "common/OwnershipFacts.hpp"`: this
-// header is used only by-pointer below (recordFieldTypeHasNoDefault's
-// `incoming` parameter), and pulling in the full definition here would add
-// an include-graph edge every implementation TU of Resolver pays for.
-namespace bezel::common {
-struct RecordSubstEnv;
-}  // namespace bezel::common
-
 namespace bezel::sema {
 
 // Walker for type-resolution. Threads a Scope* through the AST visit.
@@ -1118,41 +1110,17 @@ private:
     // caller defers; otherwise sets `decided=true` and returns the verdict.
     bool argSatisfiesNew(const TypeRef* arg, bool& decided);
 
-    // fix #4166 (§14.2/§17.11, v0.295): does storage-member type `t` (already
-    // resolved through the enclosing frame's `incoming` substitution
-    // environment) have NO well-defined default — i.e. would `new T()`/
-    // `default(T)` at this position be ill-formed? A plain leaf answers via
-    // `categorize()`; a field that is ITSELF a Record recurses into ITS OWN
-    // storage members, composing `incoming` with a frame seeded from that
-    // record's own generic parameters (mirrors `ExprTC::defaultIllFormed`'s
-    // fix #3995 `Entry::env` composition — see definition for the
-    // delegating-generic-record rationale). Called from `argSatisfiesNew`'s
-    // Record arm; never sets a `decided` flag itself — an unresolved nested
-    // field defers to "defaultable" (returns false), matching
-    // `defaultIllFormed`'s own conservative precedent for the identical case.
-    // Thin entry point: seeds an empty cycle-guard set and delegates to
-    // `recordFieldTypeHasNoDefaultWalk` below.
-    bool recordFieldTypeHasNoDefault(const TypeRef* t,
-                                      const common::RecordSubstEnv* incoming);
-
-    // fix #4166 review follow-up (§9/§35.1 cycle-guard precedent, v0.298):
-    // the recursive workhorse behind `recordFieldTypeHasNoDefault`, with an
-    // explicit PATH cycle guard (`seen`: insert on entry to the Record-kind
-    // branch, erase on exit) — mirrors `common::isBorrowBearingRecordCommon`
-    // (OwnershipFacts.cpp)'s own `seen` guard for the identically-shaped
-    // problem, keyed the SAME way (by `const TypeRef*` INSTANTIATION
-    // identity, never by the bare `TypeSymbol*` declaration — #3933 in that
-    // file records why a TypeSymbol*-keyed guard false-positives on two
-    // legitimate, non-cyclic instantiations of the same generic record). A
-    // self-referential record (`record Self<T>(N: Self<int>, V: T)`) is
-    // independently rejected with a clean diagnostic by
-    // `recordValueContainsSelf` at declaration time (§9); `Resolver::run`
-    // still evaluates `where T: new()` afterward, so this guard exists to
-    // stop THAT unbounded recursion from also reaching this later check —
-    // see the definition for the full rationale and the measured repro.
-    bool recordFieldTypeHasNoDefaultWalk(
-        const TypeRef* t, const common::RecordSubstEnv* incoming,
-        std::unordered_set<const TypeRef*>& seen);
+    // fix #4166 review follow-up (§14.2/§17.11, v0.298): a storage member's
+    // own defaultability (used by `argSatisfiesNew`'s Record arm) is now
+    // answered by the SHARED free function `sema::typeHasNoDefault`
+    // (TypeResolution.hpp / .cpp — also called by `ExprTC::defaultIllFormed`,
+    // ExprTypecheck_Exprs.cpp), not a Resolver-local method. The first
+    // version of this fix (71dc4ce) added
+    // `recordFieldTypeHasNoDefault`/`recordFieldTypeHasNoDefaultWalk` here;
+    // both were removed once their logic was hoisted to the shared
+    // function, per review's "strongly recommended" direction — see
+    // TypeResolution.hpp's `typeHasNoDefault` declaration for the full
+    // rationale.
 
     // §12.9 / issue #431: for each interface with variant generic parameters
     // (`out T` or `in T`), verify that every direct occurrence of those

@@ -7839,11 +7839,24 @@ bool Resolver::argSatisfiesNew(const TypeRef* arg, bool& decided) {
             // `categorize()`, which answers "Record ⇒ Value" for ANY
             // record — true of the record AS A TYPE, but silent on whether
             // ITS OWN fields are defaultable once ITS generic parameters
-            // are bound. `recordFieldTypeHasNoDefault` recurses into a
-            // Record-kind field instead of stopping at `categorize()`,
-            // threading `resolveRecordFieldSubst`'s `Entry::env` into the
-            // inner frame exactly as `ExprTC::defaultIllFormed` does (fix
-            // #3995) — the identically-shaped composition, ported.
+            // are bound.
+            //
+            // fix #4166 review follow-up (v0.298): the first version of
+            // this arm called a LOCAL Resolver method
+            // (`recordFieldTypeHasNoDefault`) that ported only the
+            // Record-kind recursion from `ExprTC::defaultIllFormed`,
+            // leaving its own leaf test at the narrower `categorize() ==
+            // Reference` — which diverges from `defaultIllFormed`'s full
+            // per-kind switch on Enum/Choice/InlineArray and
+            // `isValueBuiltin`-aware Class/Interface (issues #4219,
+            // #4223), and initially had no cycle guard for a
+            // self-referential record (review-caught SIGSEGV). This now
+            // calls the SHARED authority, `sema::typeHasNoDefault`
+            // (TypeResolution.hpp), which `ExprTC::defaultIllFormed`
+            // itself now also forwards to — one implementation, the same
+            // cycle guard, for both the `default` operator's own
+            // well-formedness check and this `where T: new()` constraint
+            // check.
             decided = true;
             bool unresolved = false;
             bool nonDefaultable = false;
@@ -7859,7 +7872,7 @@ bool Resolver::argSatisfiesNew(const TypeRef* arg, bool& decided) {
                     common::RecordSubstEnv::Entry sub =
                         common::resolveRecordFieldSubst(ft, fieldEnv);
                     if (!sub.ty) { unresolved = true; return false; }
-                    if (recordFieldTypeHasNoDefault(sub.ty, sub.env)) {
+                    if (typeHasNoDefault(sub.ty, ctx_, sub.env)) {
                         nonDefaultable = true;
                         return false;  // no default at this member
                     }
@@ -7913,121 +7926,149 @@ bool Resolver::argSatisfiesNew(const TypeRef* arg, bool& decided) {
     return false;
 }
 
-// fix #4166 (§14.2/§17.11, v0.295): recursive sibling of the field-
-// defaultability walk in `argSatisfiesNew`'s Record arm above — does `t` (a
-// storage-member type already substituted through the enclosing frame's
-// `incoming` env) have NO well-defined default? `categorize()` alone
-// answers this correctly for every LEAF field kind (a non-nullable class/
-// interface is a Reference, everything else a Value), but a field that is
-// ITSELF a Record needs its OWN storage members checked too — `categorize`
-// answers "Record ⇒ Value" unconditionally, true of the record as a TYPE
-// but silent on whether its fields are defaultable once ITS generic
-// parameters are bound by `t`'s `genericArgs`. A delegating generic record
-// (`record Outer<T>(In: Inner<T>)`) needs that inner frame recursed with
-// the composed env `resolveRecordFieldSubst` returns (`Entry::env`) —
-// exactly the composition `ExprTC::defaultIllFormed` threads for the
-// identically-shaped question (fix #3995, ExprTypecheck_Exprs.cpp), ported
-// here since `Resolver::run` (type resolution) executes before `ExprTC`
-// exists (Driver.cpp: `resolveTypes` then `typecheckExpressions`), so this
-// arm cannot simply call `defaultIllFormed` itself.
+// fix #4166 review follow-up (§14.2/§17.11/§35.10, v0.298): the shared
+// authority declared in TypeResolution.hpp — see that declaration's
+// comment for the full rationale (why this exists, replacing the first
+// version's Resolver-local `recordFieldTypeHasNoDefault`/
+// `recordFieldTypeHasNoDefaultWalk` pair, and what call sites it unifies).
+// `typeHasNoDefaultWalk` below is a port of `ExprTC::defaultIllFormed`'s
+// full per-kind switch (ExprTypecheck_Exprs.cpp), with TWO deliberate
+// changes from that function's exact prior text:
 //
-// An unresolved nested field member (`rsm.type == nullptr`, or a
-// substitution that fails to resolve) is treated as defaultable — i.e.
-// this function returns false, deferring to "fine" rather than flagging
-// non-defaultable — mirroring `defaultIllFormed`'s own established
-// precedent for the identical case ("unresolved — defer", continuing the
-// walk rather than stopping it). This function has no `decided` output of
-// its own to signal "can't tell"; the outer `argSatisfiesNew` call already
-// owns that contract for the TOP record's OWN fields (its `unresolved`
-// local, checked after the walk), so a deep, rare unresolved-nested-field
-// case defaults to the conservative-toward-acceptance direction rather
-// than manufacturing a false reject.
+//   1. The `seen` cycle guard around the Record-kind recursion (PATH
+//      semantics — insert on entry, erase on exit — keyed by
+//      `const TypeRef*` instantiation identity, mirroring
+//      `common::isBorrowBearingRecordCommon`, OwnershipFacts.cpp, and that
+//      file's fix #3933 for why the key is the instantiation and not the
+//      bare `TypeSymbol*` declaration). `defaultIllFormed` itself had no
+//      such guard; a self-referential record
+//      (`record Self<T>(N: Self<int>, V: T)`) reached through an explicit
+//      `default(...)` SIGSEGVs on it identically to the `where T: new()`
+//      shape this fix's own review caught — this closes both at once,
+//      since `ExprTC::defaultIllFormed` now forwards here too.
+//   2. The Primitive arm now also flags a non-nullable `Object` as
+//      non-defaultable (see that arm's own comment below for why:
+//      `defaultIllFormed`'s prior text deliberately excluded it as a
+//      documented, separate #951-era scope decision, but
+//      `Resolver::argSatisfiesNew`'s pre-existing, tested behavior
+//      correctly rejects it, and unifying in `defaultIllFormed`'s
+//      direction would have silently reintroduced a false accept —
+//      MEASURED regression, caught by this fix's own broad sweep against
+//      `xmod_imported_positional_new_args_3141_test.cpp`).
 //
-// This is a thin entry point that seeds an empty PATH cycle-guard set (see
-// `recordFieldTypeHasNoDefaultWalk`'s own comment, immediately below, for
-// why the guard is needed and what it is keyed on) — every EXTERNAL caller
-// (`argSatisfiesNew`'s per-member lambda) starts a fresh walk here, never
-// the guarded recursive helper directly.
-bool Resolver::recordFieldTypeHasNoDefault(
-    const TypeRef* t, const common::RecordSubstEnv* incoming) {
-    std::unordered_set<const TypeRef*> seen;
-    return recordFieldTypeHasNoDefaultWalk(t, incoming, seen);
+// On a detected cycle this returns `false` ("has a default" — defer, not
+// "non-defaultable"): a self-referential record is ALREADY rejected with
+// its own clean §9 diagnostic by `recordValueContainsSelf`
+// (checkRecordRestrictions, this file), independent of this function, so
+// deferring on the cyclic field lets the walk continue to the record's
+// OTHER fields (e.g. a `V: T` field bound to a non-nullable class still
+// correctly triggers rejection) rather than manufacturing a crash.
+//
+// An unresolved field member (`rsm.type == nullptr`, or a substitution
+// that fails to resolve) is likewise treated as defaultable (defer) —
+// matching `defaultIllFormed`'s own established "unresolved — defer"
+// precedent for the identical case, continuing the walk rather than
+// stopping it.
+namespace {
+
+bool typeHasNoDefaultWalk(const TypeRef* t, const common::RecordSubstEnv* incoming,
+                          SemaContext& ctx,
+                          std::unordered_set<const TypeRef*>& seen) {
+    if (!t || t->nullable) return false;  // nullable defaults to null — OK
+    switch (t->kind) {
+        case TypeRef::Kind::Primitive:
+            // `string`/`Object` are runtime-managed/reference primitives
+            // (§4.6) with no zero; every value primitive (int/bool/char/…)
+            // has a zero.
+            //
+            // fix #4166 review follow-up: `ExprTC::defaultIllFormed`'s
+            // pre-unification version deliberately excluded `Object` here
+            // ("left out... to keep this consistent with the original #951
+            // scope — a separate consideration"), but §17.11's own
+            // "defaultable" definition is unambiguous — "Not defaultable:
+            // non-nullable reference types" — and `Object` (non-nullable,
+            // which is what reaches here; the nullable case already
+            // returned above) is one. `Resolver::argSatisfiesNew` already
+            // correctly rejected a non-nullable `Object`-typed record field
+            // via `categorize()` before this unification (MEASURED:
+            // `record RefRec3141(R: Object, N: int)` under
+            // `where T: new()`, tests/module/
+            // xmod_imported_positional_new_args_3141_test.cpp) — including
+            // it here, rather than porting the narrower exclusion, is what
+            // keeps that existing, correct, spec-cited rejection working
+            // under the shared function.
+            return t->primitive == PrimitiveType::String ||
+                   t->primitive == PrimitiveType::Object;
+        case TypeRef::Kind::Function:
+            return true;  // a function value (§28.9) has no zero
+        case TypeRef::Kind::InlineArray: {
+            common::RecordSubstEnv::Entry sub =
+                common::resolveRecordFieldSubst(t->arrayElement, incoming);
+            return typeHasNoDefaultWalk(sub.ty, sub.env, ctx, seen);
+        }
+        case TypeRef::Kind::Named: {
+            if (!t->declaration) return false;  // generic param / unresolved
+            auto k = t->declaration->kind;
+            // fix #3108 (§16.3/§16.4): `default(Range<T>)` is a compile
+            // error — the all-zero default would falsify Range's own "no
+            // zero-step" invariant. Checked before the general Class/
+            // Interface arm so the builtin isn't admitted through
+            // `!isValueBuiltin` (Range IS a value builtin).
+            if (t->declaration == ctx.builtinClassSym("Range")) return true;
+            if (k == ast::TypeDeclKind::Class ||
+                k == ast::TypeDeclKind::Interface)
+                return !t->declaration->isValueBuiltin;
+            // fix #3044 (§17.11): `default(E)` is a compile error for an
+            // enum with no declared constant of underlying value 0. An
+            // enum whose declared-value set cannot be decided is treated
+            // as well-formed (conservative — matches enumHasZeroConstant's
+            // own documented default).
+            if (k == ast::TypeDeclKind::Enum) {
+                std::optional<bool> hasZero =
+                    enumHasZeroConstant(*t->declaration);
+                return hasZero && !*hasZero;
+            }
+            // §35.10 (v0.200, #2044): every choice type is non-defaultable,
+            // independent of substitution.
+            if (k == ast::TypeDeclKind::Choice) return true;
+            if (k == ast::TypeDeclKind::Record) {
+                if (!seen.insert(t).second) return false;  // cycle: defer
+                common::RecordSubstEnv env;
+                common::seedRecordSubstEnv(*t->declaration, *t, incoming, env);
+                const common::RecordSubstEnv* fieldEnv =
+                    env.map.empty() ? nullptr : &env;
+                bool illFormed = false;
+                recordStorageMembers(
+                    t->declaration, ctx,
+                    [&](const RecordStorageMember& rsm) {
+                        if (!rsm.type) return true;  // unresolved — defer
+                        common::RecordSubstEnv::Entry sub =
+                            common::resolveRecordFieldSubst(rsm.type,
+                                                            fieldEnv);
+                        if (typeHasNoDefaultWalk(sub.ty, sub.env, ctx,
+                                                 seen)) {
+                            illFormed = true;
+                            return false;  // stop
+                        }
+                        return true;
+                    },
+                    /*env=*/nullptr);
+                seen.erase(t);  // PATH semantics — see the header comment
+                return illFormed;
+            }
+            return false;
+        }
+        default:
+            return false;  // Unit / Error
+    }
 }
 
-// fix #4166 review follow-up (§9/§35.1 cycle guard, v0.298): the recursive
-// workhorse. WITHOUT `seen`, a self-referential record —
-// `record Self<T>(N: Self<int>, V: T)`, `#9`'s own worked-example shape —
-// recurses unboundedly and SIGSEGVs (measured: `HolderSRP2<Self<Widget>>.
-// Make()` at a `where T: new()` site). The cause: for a NAMED (non-bare)
-// Record-kind field, `resolveRecordFieldSubst` returns `{ft, env}`
-// UNCHANGED (only a BARE parameter gets substituted to a different
-// pointer — see its own doc comment, OwnershipFacts.hpp) — so `N`'s
-// declared type `Self<int>` is the SAME `TypeRef*` on every recursive
-// step: seeding `Self`'s own generic params against `Self<int>`'s OWN
-// (already-concrete) `genericArgs=[int]` reproduces an IDENTICAL
-// environment every time, and the field walk revisits the IDENTICAL `t`
-// pointer forever, independent of what the OUTER instantiation's `T` was
-// ever bound to.
-//
-// `seen` is keyed by `const TypeRef*` — the INSTANTIATION identity, never
-// the bare `TypeSymbol*` declaration — with PATH semantics (insert on
-// entry to the Record-kind branch below, erase before returning), exactly
-// mirroring `common::isBorrowBearingRecordCommon`'s own guard
-// (OwnershipFacts.cpp) for the identically-shaped §9.7 field-walk problem.
-// That file's fix #3933 is why the key is the TypeRef instantiation and
-// not the TypeSymbol: two DIFFERENT, non-cyclic instantiations of the same
-// generic record (`Wrap<Pair<int>>` alongside `Wrap<Pair<Widget>>` on
-// sibling paths) share one `TypeSymbol*` but must each get their own
-// fresh walk — a TypeSymbol*-keyed guard would collide them and silently
-// under-report. PATH semantics (erase on exit, not permanent memoization)
-// is what makes that safe: a legitimate diamond (the same instantiation
-// reached via two non-nested sibling fields) resets between them, while a
-// GENUINE cycle (the same pointer reappearing while still on the current
-// recursion stack) is exactly what re-inserting into a non-empty `seen`
-// catches.
-//
-// On a detected cycle this returns `false` ("has a default" / fine, not
-// "non-defaultable") — the conservative direction, and the CORRECT one
-// here specifically: a self-referential record is ALREADY rejected with
-// its own clean diagnostic by `recordValueContainsSelf` at declaration
-// time (checkRecordRestrictions, this file, §9), independent of this
-// function. Returning `false` on the cyclic field lets the walk continue
-// to the record's OTHER fields — e.g. `V: T` in the repro above, which
-// correctly still triggers the `where T: new()` §14.2 rejection when `T`
-// is bound to a non-nullable class — reproducing the SAME two diagnostics
-// (§9 self-containment + §14.2 constraint) the pre-#4166 code produced for
-// this shape (its shallow `categorize()`-only check never recursed into
-// `N` at all, so it never had this hazard, but also never caught a
-// genuinely delegating record — the gap #4166 fixes).
-bool Resolver::recordFieldTypeHasNoDefaultWalk(
-    const TypeRef* t, const common::RecordSubstEnv* incoming,
-    std::unordered_set<const TypeRef*>& seen) {
-    if (!t || t->nullable) return false;  // nullable → defaults null, fine
-    if (t->kind == TypeRef::Kind::Named && t->declaration &&
-        t->declaration->kind == ast::TypeDeclKind::Record) {
-        if (!seen.insert(t).second) return false;  // cycle: defer (fine)
-        common::RecordSubstEnv env;
-        common::seedRecordSubstEnv(*t->declaration, *t, incoming, env);
-        const common::RecordSubstEnv* fieldEnv =
-            env.map.empty() ? nullptr : &env;
-        bool nonDefaultable = false;
-        recordStorageMembers(
-            t->declaration, ctx_,
-            [&](const RecordStorageMember& rsm) {
-                if (!rsm.type) return true;  // unresolved — defer (fine)
-                common::RecordSubstEnv::Entry sub =
-                    common::resolveRecordFieldSubst(rsm.type, fieldEnv);
-                if (recordFieldTypeHasNoDefaultWalk(sub.ty, sub.env, seen)) {
-                    nonDefaultable = true;
-                    return false;  // stop
-                }
-                return true;
-            },
-            /*env=*/nullptr);
-        seen.erase(t);  // PATH semantics — see the function's own comment
-        return nonDefaultable;
-    }
-    return categorize(t) == TypeCategory::Reference;
+}  // namespace
+
+bool typeHasNoDefault(const TypeRef* t, SemaContext& ctx,
+                      const common::RecordSubstEnv* incoming) {
+    std::unordered_set<const TypeRef*> seen;
+    return typeHasNoDefaultWalk(t, incoming, ctx, seen);
 }
 
 namespace {

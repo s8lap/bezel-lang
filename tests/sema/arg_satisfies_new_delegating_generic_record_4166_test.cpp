@@ -78,22 +78,20 @@
 //   on the assumption sema already rejected any field for which that has no
 //   valid value.
 //
-// THE FIX adds `Resolver::recordFieldTypeHasNoDefault`
-// (TypeResolution_Checks.cpp), which recurses into a Record-kind field
+// THE FIX (first version, commit 71dc4ce) added a Resolver-local method,
+// `recordFieldTypeHasNoDefault`, which recursed into a Record-kind field
 // instead of stopping at `categorize()`, threading
 // `resolveRecordFieldSubst`'s `Entry::env` into the inner frame — the SAME
 // composition `ExprTC::defaultIllFormed` threads for the identically-shaped
 // `default(T)` well-formedness question (fix #3995). `Resolver::run` (type
 // resolution) executes before `ExprTC` exists (Driver.cpp: `resolveTypes`
-// then `typecheckExpressions`), so this cannot simply call
-// `defaultIllFormed` itself — the logic is ported, not shared, matching the
-// established mirroring discipline already documented at every other
-// `argSatisfiesNew` fix comment in this arm's history.
+// then `typecheckExpressions`), so it could not simply call
+// `defaultIllFormed` itself.
 //
-// REVIEW FOLLOW-UP (§9/§35.1 cycle guard, v0.298): the first version of
-// this fix recursed with no cycle guard — `ExprTC::defaultIllFormed`,
-// the function it was ported from, has none either, and shares the same
-// hazard via `default(...)`. A self-referential record
+// REVIEW FOLLOW-UP #1 (§9/§35.1 cycle guard, v0.298): that first version
+// recursed with no cycle guard — `ExprTC::defaultIllFormed`, the function
+// it was ported from, had none either, and shared the same hazard via
+// `default(...)`. A self-referential record
 // (`record Self<T>(N: Self<int>, V: T)`, already independently rejected
 // by `recordValueContainsSelf` at declaration time) recurses unboundedly
 // through field `N` and SIGSEGVs, because `Resolver::run` still evaluates
@@ -101,12 +99,25 @@
 // explicit `default(SelfReferentialRecord<...>)` could reach the
 // unguarded recursion; after, ANY `where T: new()` instantiation site can
 // (generic factories, DI-style code) — a much larger trigger surface, so
-// the guard is required here even though the sibling it was ported from
-// still lacks one. `recordFieldTypeHasNoDefaultWalk` now threads a PATH
-// cycle guard (`std::unordered_set<const TypeRef*>`, insert-on-entry/
-// erase-on-exit) mirroring `common::isBorrowBearingRecordCommon`
-// (OwnershipFacts.cpp) — see that function's own doc comment and this
-// file's row (8) below.
+// the guard was required here even though the sibling it was ported from
+// still lacked one at that point. See row (8) below.
+//
+// REVIEW FOLLOW-UP #2 (§14.2/§17.11/§35.10, v0.298): the Resolver-local
+// pair was then REPLACED with a SHARED free function,
+// `sema::typeHasNoDefault` (TypeResolution.hpp / TypeResolution_Checks.cpp),
+// which BOTH `Resolver::argSatisfiesNew`'s Record arm and
+// `ExprTC::defaultIllFormed` now call — a faithful, EXTENDED port of
+// `defaultIllFormed`'s full 8-way per-kind switch (not just its Record-kind
+// recursion, which is all the first version ported), gaining the cycle
+// guard as a shared PATH-semantics `std::unordered_set<const TypeRef*>`
+// (insert-on-entry/erase-on-exit) mirroring
+// `common::isBorrowBearingRecordCommon` (OwnershipFacts.cpp). This closed
+// two more divergences the review's line-by-line comparison found between
+// the two independently-drifting copies — Enum/Choice/InlineArray handling
+// and the `isValueBuiltin`-aware Class/Interface test (issues #4219,
+// #4223) — and means `ExprTC::defaultIllFormed`'s OWN pre-existing
+// self-referential-record SIGSEGV (via `default(...)`, not just
+// `where T: new()`) is fixed too, since it now shares this same guard.
 //
 // SHAPE SWEEP (every row measured before/after the fix on this fix's
 // parent; see the commit body for the FAIL-WITHOUT / PASS-WITH counts):
@@ -139,6 +150,20 @@
 //       `where T: new()` -> REJECT with the CLEAN two-diagnostic outcome
 //       (§9 self-containment + §14.2 constraint), not a crash
 //       (`where_T_new_self_referential_record_rejects_cleanly_no_crash`)
+//   - SHARED-FUNCTION UNIFICATION: a record field of Choice type -> REJECT
+//       (`where_T_new_rejects_record_with_choice_field`, closes #4219);
+//       a record field of a zero-less Enum -> REJECT
+//       (`where_T_new_rejects_record_with_zeroless_enum_field`, closes
+//       #4219); a record field that is an inline array of a
+//       non-defaultable generic record -> REJECT
+//       (`where_T_new_rejects_record_with_inline_array_of_generic_record_field`,
+//       closes #4223); a record field of non-nullable `Object` -> REJECT
+//       (`where_T_new_rejects_record_with_object_field`, regression
+//       control for the divergence this fix's own broad sweep caught);
+//       a record field of builtin value type `DateTime` -> ACCEPT
+//       (`where_T_new_accepts_record_with_datetime_field`, positive
+//       control proving the `isValueBuiltin`-aware test doesn't
+//       over-reject)
 
 #include "support/aot_result_asserts.hpp"  // failedAtCompileTimeWithRealLocation, diagnosticMessageContains
 #include "support/aot_support.hpp"         // runAot
@@ -326,8 +351,9 @@ BEZEL_TEST(arg_satisfies_new_delegating_generic_record_4166,
 //        self-referential record (`record Self<T>(N: Self<int>, V: T)`) —
 //        already rejected independently by `recordValueContainsSelf` at
 //        declaration time (§9) — reached through `where T: new()`.
-//        WITHOUT a cycle guard in `recordFieldTypeHasNoDefaultWalk`'s
-//        Record-kind recursion, field `N`'s declaration-site type
+//        WITHOUT a cycle guard in the field-defaultability walk's
+//        Record-kind recursion (`sema::typeHasNoDefaultWalk`,
+//        TypeResolution_Checks.cpp), field `N`'s declaration-site type
 //        `Self<int>` is the SAME `TypeRef*` on every recursive step (a
 //        NAMED, non-bare field is never substituted to a new pointer by
 //        `resolveRecordFieldSubst`), so the walk never terminates —
@@ -370,4 +396,139 @@ BEZEL_TEST(arg_satisfies_new_delegating_generic_record_4166,
     BEZEL_EXPECT_TRUE(diagnosticMessageContains(
         r, "does not satisfy the constraint `where T: new()`"));
     BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "\xC2\xA7""14.2"));
+}
+
+// ── (9)-(13) SHARED-FUNCTION UNIFICATION (review follow-up #2, §14.2/
+//        §17.11/§35.10, v0.298): `argSatisfiesNew`'s Record-arm field walk
+//        now goes through `sema::typeHasNoDefault`'s FULL per-kind switch
+//        (ported from `ExprTC::defaultIllFormed`) instead of the narrower
+//        `categorize() == Reference` leaf test the first two fixes used.
+//        These rows exercise the field kinds that switch adds coverage
+//        for — a record field that is a Choice, an Enum with no
+//        zero-valued constant, an inline array of a non-defaultable
+//        generic record, and a non-nullable `Object` (closes issues
+//        #4219, #4223, and the `Object` divergence this fix's own broad
+//        sweep caught against `xmod_imported_positional_new_args_3141`)
+//        — plus a positive control proving the `isValueBuiltin`-aware
+//        Class/Interface test does NOT over-reject a builtin value type
+//        with a real default (`DateTime`). ──────────────────────────────
+
+// (9) a record field of CHOICE type: §35.10 says no choice is
+//     defaultable, unconditionally — `categorize()` alone (Choice ⇒
+//     Value) never caught this.
+BEZEL_TEST(arg_satisfies_new_delegating_generic_record_4166,
+           where_T_new_rejects_record_with_choice_field_spec_14_2_35_10) {
+    expectWhereNewRejected(
+        std::string("module M4166i; ") + kWidget4166 +
+        "choice Opt4166i "
+        "  Some(V: Widget4166), None; "
+        "end Opt4166i; "
+        "public record BoxChoice4166i(O: Opt4166i); "
+        "class Holder4166i<T> where T: new() "
+        "  public static method Make(): owned T => new T(); "
+        "end Holder4166i; "
+        "class Program4166i "
+        "  public static method Main(): int "
+        "    var b := Holder4166i<BoxChoice4166i>.Make(); "
+        "    return (case b.O of Some(w) => w.Count, _ => -1); "
+        "  end Main; "
+        "end Program4166i;");
+}
+
+// (10) a record field of an ENUM with NO zero-valued constant: §17.11
+//      says such an enum is not defaultable — `categorize()` alone
+//      (Enum ⇒ Value) never caught this either.
+BEZEL_TEST(arg_satisfies_new_delegating_generic_record_4166,
+           where_T_new_rejects_record_with_zeroless_enum_field_spec_14_2_17_11) {
+    expectWhereNewRejected(
+        "module M4166j; "
+        "enum Priority4166j "
+        "  Low := 1, High := 2; "
+        "end Priority4166j; "
+        "public record BoxEnum4166j(P: Priority4166j); "
+        "class Holder4166j<T> where T: new() "
+        "  public static method Make(): owned T => new T(); "
+        "end Holder4166j; "
+        "class Program4166j "
+        "  public static method Main(): int "
+        "    var b := Holder4166j<BoxEnum4166j>.Make(); "
+        "    return 0; "
+        "  end Main; "
+        "end Program4166j;");
+}
+
+// (11) a record field that is an INLINE ARRAY of a non-defaultable
+//      generic record — the InlineArray recursion arm (dropped entirely
+//      by the `categorize()`-only leaf test, since `categorize` answers
+//      `InlineArray ⇒ Value` with no recursion into the element type).
+BEZEL_TEST(arg_satisfies_new_delegating_generic_record_4166,
+           where_T_new_rejects_record_with_inline_array_of_generic_record_field_spec_14_2_17_11) {
+    expectWhereNewRejected(
+        std::string("module M4166k; ") + kWidget4166 +
+        "public record Box4166k<T>(V: T); "
+        "public record ArrHolder4166k(Arr: [2]Box4166k<Widget4166>); "
+        "class Holder4166k<T> where T: new() "
+        "  public static method Make(): owned T => new T(); "
+        "end Holder4166k; "
+        "class Program4166k "
+        "  public static method Main(): int "
+        "    var b := Holder4166k<ArrHolder4166k>.Make(); "
+        "    return b.Arr[0].V.Count; "
+        "  end Main; "
+        "end Program4166k;");
+}
+
+// (12) a record field of non-nullable `Object`: a REGRESSION CONTROL for
+//      the divergence this fix's own broad sweep caught — unifying
+//      toward `defaultIllFormed`'s ORIGINAL text (which deliberately
+//      excluded `Object`, a documented #951-era scope decision) would
+//      have silently reintroduced a false accept here, since
+//      `argSatisfiesNew`'s pre-existing `categorize()`-based test already
+//      correctly rejected it (categorize: Object ⇒ Reference). Mirrors
+//      `xmod_imported_positional_new_args_3141_test.cpp`'s
+//      `RefRec3141(R: Object, N: int)` shape (module-local here instead
+//      of cross-module).
+BEZEL_TEST(arg_satisfies_new_delegating_generic_record_4166,
+           where_T_new_rejects_record_with_object_field_spec_14_2_17_11) {
+    expectWhereNewRejected(
+        "module M4166l; "
+        "public record BoxObject4166l(O: Object, N: int); "
+        "class Holder4166l<T> where T: new() "
+        "  public static method Make(): owned T => new T(); "
+        "end Holder4166l; "
+        "class Program4166l "
+        "  public static method Main(): int "
+        "    var b := Holder4166l<BoxObject4166l>.Make(); "
+        "    return b.N; "
+        "  end Main; "
+        "end Program4166l;");
+}
+
+// (13) POSITIVE CONTROL: a record field of a builtin VALUE type
+//      (`DateTime`, `isValueBuiltin=true` despite being a `Class`-kind
+//      `TypeSymbol` internally, SemaContext.hpp's `builtinClassSym`) has
+//      a real default and must NOT be flagged non-defaultable — proving
+//      the `isValueBuiltin`-aware Class/Interface test
+//      (`!t->declaration->isValueBuiltin`) does not over-reject. A flat
+//      `categorize()`-based leaf test would have gotten this WRONG too
+//      (categorize: Class ⇒ Reference, unconditionally, ignoring
+//      isValueBuiltin) — this row would have FALSE-REJECTED under the
+//      narrower leaf test if `DateTime` used it; the shared function is
+//      what makes it correctly accept.
+BEZEL_TEST(arg_satisfies_new_delegating_generic_record_4166,
+           where_T_new_accepts_record_with_datetime_field_spec_14_2) {
+    auto r = runAot(
+        "module M4166m; "
+        "public record BoxDate4166m(D: DateTime, N: int); "
+        "class Holder4166m<T> where T: new() "
+        "  public static method Make(): owned T => new T(); "
+        "end Holder4166m; "
+        "class Program4166m "
+        "  public static method Main(): int "
+        "    var b := Holder4166m<BoxDate4166m>.Make(); "
+        "    return b.N; "
+        "  end Main; "
+        "end Program4166m;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
 }

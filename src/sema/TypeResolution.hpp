@@ -36,6 +36,12 @@
 #include "sema/SemaContext.hpp"
 #include "sema/TypeRef.hpp"
 
+// Forward-declared rather than `#include "common/OwnershipFacts.hpp"`: used
+// only by-pointer below (`typeHasNoDefault`'s `incoming` parameter).
+namespace bezel::common {
+struct RecordSubstEnv;
+}  // namespace bezel::common
+
 namespace bezel::sema {
 
 bool resolveTypes(const ast::SourceFile& src, SemaContext& ctx);
@@ -238,5 +244,46 @@ std::string degenerateAsTargetReason(const TypeRef* target);
 // garbage TypeSymbol*). Callers inherit that same known-open ordering gap;
 // #4047 tracks it, not this function.
 TypeSymbol* resolveAliasToTypeSymbol(SemaContext& ctx, TypeAliasSymbol* aliasSym);
+
+// fix #4166 review follow-up (§14.2/§17.11/§35.10, v0.298): THE shared
+// authority for "does `default(T)` (equivalently, at a value-type
+// substitution, `new T()`) have NO well-defined value?" — the §17.11
+// "defaultable" glossary entry, applied recursively. Two independent
+// copies of this question existed on two different classes:
+// `ExprTC::defaultIllFormed` (ExprTypecheck_Exprs.cpp, the `default`
+// operator's own well-formedness check, fix #3982/#3986/#3988/#3995) and
+// `Resolver::argSatisfiesNew`'s Record arm (TypeResolution_Checks.cpp, the
+// `where T: new()` constraint check, fix #3141/#3988/#4002/#4166) — the
+// SAME mirroring-not-sharing constraint `resolveAliasToTypeSymbol` above
+// already documents applies here too (`Resolver::run` executes before
+// `ExprTC` exists, Driver.cpp), except this time the two copies had
+// drifted: `argSatisfiesNew`'s port (#4166) covered only the Record-kind
+// recursion, leaving Enum/Choice/InlineArray/`isValueBuiltin`-aware-Class
+// divergences from `defaultIllFormed`'s full switch (see #4219, #4223).
+// `ExprTC::defaultIllFormed` now forwards here; `argSatisfiesNew` calls
+// this directly. Both share ONE cycle guard (PATH semantics, keyed by
+// `const TypeRef*` instantiation identity — mirrors
+// `common::isBorrowBearingRecordCommon`, OwnershipFacts.cpp, and that
+// file's own fix #3933 for why the key is the TypeRef instantiation and
+// not the bare TypeSymbol* declaration) — `defaultIllFormed` had none
+// before this, and a self-referential record reached through an explicit
+// `default(...)` SIGSEGV'd identically to the `where T: new()` shape
+// #4166's own review caught.
+//
+// One divergence resolved in `argSatisfiesNew`'s favor rather than
+// `defaultIllFormed`'s: a non-nullable `Object`-typed component IS
+// non-defaultable here (§17.11's own definition: "Not defaultable:
+// non-nullable reference types"), even though `defaultIllFormed`'s
+// pre-unification text deliberately excluded `Object` as a separate,
+// out-of-scope #951-era decision — `argSatisfiesNew`'s existing, tested
+// behavior already rejected it, and porting the narrower exclusion instead
+// would have silently reintroduced a false accept there (measured against
+// `xmod_imported_positional_new_args_3141_test.cpp`).
+//
+// `incoming` is the enclosing frame's substitution environment (null/empty
+// at a top-level, non-nested call — every existing call site passes what
+// it already did).
+bool typeHasNoDefault(const TypeRef* t, SemaContext& ctx,
+                      const common::RecordSubstEnv* incoming = nullptr);
 
 } // namespace bezel::sema
