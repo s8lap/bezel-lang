@@ -3861,6 +3861,44 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                         "(n)` from its underlying integer, not with `new` "
                         "(§5.4/§10)");
                 }
+                // fix #4163 (§35.1/§35.2/§35.3, v0.295): `new` cannot
+                // construct a choice, mirroring the enum rejection just
+                // above. §35.1 "Declaration": "Choices cannot have
+                // destructors, constructors, instance fields, block-form or
+                // storage-backed properties, indexers, or nested types" —
+                // there is no constructor for `new` to resolve to. §35.2
+                // "Members": "a choice's construction *is* case selection"
+                // — a choice value is produced by a qualified CASE CALL
+                // (§35.3 "Construction and payload ownership": "Construction
+                // is qualified, resolving exactly as enum constants do
+                // (§10.1): `FetchOutcome.NotModified` for a payload-free
+                // case ..., `FetchOutcome.Failed(504, "upstream timeout")`
+                // for a payload case"), never a `new` expression. Before
+                // this fix `new ChoiceType(args)` was silently ACCEPTED
+                // with no case identity at all — the value carried no
+                // discriminant a real case construction would set — and
+                // running a `case` statement over such a value crashed the
+                // compiler (SIGSEGV, #4163) because codegen's `case`-
+                // statement lowering assumes every choice-typed scrutinee
+                // it sees was produced by a real case construction. (The
+                // correct qualified-case form `Type.Case(args)` is a
+                // CallExpr, not a NewExpr, and is unaffected.) The
+                // diagnostic names only the qualified spelling as the
+                // remedy — §35.3's OTHER admitted spelling, the bare case
+                // name in a declared-result position, is a real but
+                // SEPARATE gap in this compiler (issue #2354, "declared-
+                // result target-typing of choice-case constructions"); do
+                // not point users at a spelling that does not yet resolve.
+                if (rt->kind == TypeRef::Kind::Named && rt->declaration &&
+                    rt->declaration->kind == ast::TypeDeclKind::Choice) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, ne->span.begin,
+                        "`new` cannot construct a choice — a choice has no "
+                        "constructors; a choice's construction is case "
+                        "selection, written `" +
+                        std::string(rt->declaration->name) +
+                        ".Case(args)` instead of `new` (§35.1/§35.2/§35.3)");
+                }
                 // §14.5 Scope (v0.184, #1687): "Class-, record-, and
                 // interface-level type arguments are never inferred from
                 // constructor arguments: `new Pair(1, "x")` against `record
