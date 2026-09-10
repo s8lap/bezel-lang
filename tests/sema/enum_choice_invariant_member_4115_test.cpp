@@ -200,29 +200,12 @@ BEZEL_TEST(enum_choice_invariant_4115, generic_choice_accepted_control_spec_35_1
         42);
 }
 
-// KNOWN GAP, filed separately as #4186 (not this issue's scope — #4115 is
-// enum/choice only): §22.16's own wording ("a class body may declare
-// invariant members") and the AST's own `InvariantDecl` doc comment
-// ("Class-body-only per A.4; semantically rejected in records, static
-// classes, and outside class bodies") together imply a RECORD or a
-// `static class` body should also reject an `invariant` member — but
-// MEASURED live on this same fixed HEAD: neither is rejected anywhere in
-// sema today (this fix's `checkEnumChoiceInvariantMembers` is gated to
-// `TypeDeclKind::Enum`/`TypeDeclKind::Choice` only, by design — #4115's own
-// scope). Pinned here as an explicit "still open" control, not silently
-// left unasserted, so a future record/static-class fix (#4186) does not
-// mistake this row for evidence the gap is already closed.
-BEZEL_TEST(enum_choice_invariant_4115,
-           record_invariant_still_admitted_known_gap_not_this_issue) {
-    BEZEL_EXPECT_EQ(runProg(
-        "module M; "
-        "record Point4115 "
-        "  public X: int; "
-        "  public Y: int; "
-        "  invariant(true); "
-        "end Point4115; "
-        "class C4115g public static method Main(): int "
-        "  return 42; "
-        "end Main; end C4115g;"),
-        42);
-}
+// A record's own `invariant` member was left uncovered by THIS fix (#4115
+// scoped to enum/choice only) and was, until fix #4186 landed, admitted with
+// zero diagnostics — see that fix's own
+// tests/sema/record_static_class_invariant_member_4186_test.cpp for the
+// reject-side coverage (records and static classes both) now that the gap
+// is closed. Not re-asserted here: this file's scope is enum/choice, and a
+// stale "still admitted" control here would silently rot the day #4186's
+// fix changes this program's outcome, exactly the failure mode #4186's test
+// file guards against directly.

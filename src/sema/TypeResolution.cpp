@@ -412,6 +412,10 @@ void Resolver::run(const ast::SourceFile& src) {
     // body — invisible to both member-kind walks just above, since
     // `invariant` clauses are not a `Symbol` subclass at all.
     checkEnumChoiceInvariantMembers();
+    // fix #4186 (§22.16, Appendix A.4 `InvariantDecl`, v0.298): the same gap
+    // for a record body or a `static class` body — #4115's own scope
+    // deliberately excluded these two shapes.
+    checkRecordAndStaticClassInvariantMembers();
     // §14.2 (#746): contradictory generic constraints (e.g. class + value).
     checkGenericConstraintConsistency();
     // Slice S33: method body-presence rules (§12.5 / §11.2).

@@ -1318,6 +1318,74 @@ void Resolver::checkEnumChoiceInvariantMembers() {
     });
 }
 
+// fix #4186 (§22.16 "Class invariants", Appendix A.4 `InvariantDecl`
+// production comment, v0.298): an `invariant` member on a RECORD body or a
+// `static class` body compiles with zero diagnostics — MEASURED on this
+// HEAD (pre-fix), both
+//   record Point4186 public X: int; public Y: int; invariant(true); end Point4186;
+// and
+//   static class Utils4186 invariant(true); end Utils4186;
+// compile via `runAot` at exit 0, zero diagnostics. Same root cause as fix
+// #4115's checkEnumChoiceInvariantMembers just above (and explicitly left
+// out of that fix's scope — its own trailing "KNOWN GAP" test row cites this
+// issue by number): `invariant` clauses are not modeled as a `Symbol`
+// subclass in `TypeSymbol::members` at all (SymbolCollection never creates
+// one for `ast::InvariantDecl`), so a `t->members`-based walk cannot see
+// one; the raw AST (`t->decl`'s `ast::TypeDecl::members`) is the only place
+// a LOCAL declaration's invariant member is visible.
+//
+// Authority: A.4's `InvariantDecl` grammar production comment states the
+// scope directly — "class bodies only; rejected semantically in records and
+// static classes (§22.16)" — and `ast::InvariantDecl`'s own doc comment
+// (src/ast/Node.hpp) repeats it verbatim ("Class-body-only per A.4;
+// semantically rejected in records, static classes, and outside class
+// bodies"). §22.16's opening sentence independently backs the record half
+// ("a class body may declare invariant members" — a record is not a
+// class), and its "Class invariants" subsection's own "Out of scope in this
+// revision" list backs the static-class half explicitly: "static-class and
+// static-state invariants (an `invariant` in a static class is a compile
+// error — no instance boundary exists)".
+//
+// A record's positional-field constructor and a static class's absent
+// instance boundary are UNRELATED reasons (worth two distinct diagnostics,
+// like the enum/choice split above), so this walks both kinds in one
+// function — mirroring checkEnumChoiceInvariantMembers's own "one function,
+// kind-specific message" shape — rather than duplicating the AST-read loop.
+void Resolver::checkRecordAndStaticClassInvariantMembers() {
+    if (!ctx_.module()) return;
+    forEachTypeAndNested([&](TypeSymbol* t) {
+        const bool isRecord = t->kind == ast::TypeDeclKind::Record;
+        bool isStaticClass = false;
+        if (t->kind == ast::TypeDeclKind::Class) {
+            for (auto mod : t->modifiers)
+                if (mod == "static") { isStaticClass = true; break; }
+        }
+        if (!isRecord && !isStaticClass) return;
+        // `t` is drawn from forEachTypeAndNested (#3574): this module's own
+        // local declaration tree only, never an imported type (#3152) —
+        // same reach argument as checkEnumChoiceInvariantMembers above.
+        // SEAM-ACCESSOR: `t->decl` is always a real `ast::TypeDecl*` here.
+        auto* td = dynamic_cast<const ast::TypeDecl*>(t->decl);
+        if (!td) return;
+        for (const auto& mp : td->members) {
+            auto* inv = dynamic_cast<const ast::InvariantDecl*>(mp.get());
+            if (!inv) continue;
+            ctx_.diagnostics().report(
+                Severity::Error, inv->loc,
+                isRecord
+                    ? (std::string("record `") + std::string(t->name) +
+                       "` may not declare an `invariant` member — §22.16 "
+                       "scopes invariant members to class bodies, and a "
+                       "record is not a class (§22.16)")
+                    : (std::string("static class `") + std::string(t->name) +
+                       "` may not declare an `invariant` member — §22.16 "
+                       "states an `invariant` in a static class is a "
+                       "compile error: no instance boundary exists "
+                       "(§22.16)"));
+        }
+    });
+}
+
 void Resolver::checkGenericConstraintConsistency() {
     if (!ctx_.module()) return;
     // §14.2: "Contradictory constraint combinations (e.g. class, value) are

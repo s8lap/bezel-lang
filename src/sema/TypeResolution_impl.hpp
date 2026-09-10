@@ -395,6 +395,14 @@ private:
     // invariant members to class bodies.
     void checkEnumChoiceInvariantMembers();
 
+    // fix #4186 (§22.16, Appendix A.4 `InvariantDecl` production comment,
+    // v0.298): same gap as checkEnumChoiceInvariantMembers just above, for
+    // the two other shapes A.4's `InvariantDecl` comment names — a RECORD
+    // body and a `static class` body. Reads the raw AST member list
+    // directly for the same reason (an `invariant` member is not a
+    // `Symbol` subclass, so `t->members` cannot see one).
+    void checkRecordAndStaticClassInvariantMembers();
+
     // §14.2 (#746): a type parameter may not carry contradictory constraints
     // (e.g. both `class` and `value`). Checked once per generic declaration
     // (type + method `where` clauses), independent of instantiation.
