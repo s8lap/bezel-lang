@@ -11156,6 +11156,65 @@ void ExprTC::visitTopDecl(const ast::TopDecl& d) {
                     "`operator " + std::string(od->opToken) + "` (§26.3)");
                 continue;
             }
+            // fix #4204 (§22.16 "Contract clauses" / "Scope", Appendix A.4
+            // `ExtensionMember` grammar, v0.298): an extension block may not
+            // declare an `invariant` member — third instance of the bug class
+            // fix #4115 (enum/choice) and fix #4186 (record/static-class)
+            // closed. §22.16 opens by scoping the member to a *class* body
+            // ("a class body may declare invariant members") and its own
+            // "Scope" subsection states directly, in the record/enum-methods
+            // parenthetical, that "the *invariant* member is class-only" — an
+            // extension body is not a class body. Appendix A.4 confirms it
+            // structurally, independent of §22.16's prose:
+            //   ExtensionMember ::= MethodDecl | ExpressionPropertyDecl
+            // `InvariantDecl` is not one of the two alternatives — this is
+            // not a gap the spec left open, unlike the "no invariant" bullet
+            // list in §22.16's "Out of scope in this revision", which never
+            // had occasion to mention extensions at all. `invariant` reaches
+            // this loop only because `Parser::parseExtensionDecl` calls the
+            // general `parseMember()` (the shared-production over-admission
+            // Appendix A's preamble names) instead of a dedicated
+            // extension-only parse function — same over-admission Appendix
+            // A's preamble already indexes for other body kinds, closed here
+            // semantically rather than by narrowing the parser, matching the
+            // project's existing choice for records/static-classes (#4186)
+            // over rewriting `parseExtensionDecl` to a dedicated member
+            // parser mirroring `parseInterfaceMember`'s shape — a
+            // significantly larger, higher-blast-radius change for the same
+            // outcome.
+            //
+            // Placed here — the existing §26.3 per-member restriction loop —
+            // rather than as a new free-standing Resolver pass (the shape
+            // fix #4115/#4186 used): `Resolver::forEachTypeAndNested`
+            // (NestedTypeWalk.hpp) deliberately never visits an
+            // `ExtensionSymbol` (it is not a `TypeSymbol`), so a
+            // `checkExtensionInvariantMembers`-style pass would have to
+            // invent its own `module()->children` walk from scratch — a
+            // THIRD hand-rolled "walk members, dynamic_cast InvariantDecl,
+            // report" spelling of the same decision (CLAUDE.md §6). This
+            // loop already walks `ext->members` and already rejects one
+            // other flat-out-forbidden AST member kind (`OperatorDecl`,
+            // just above) with the identical shape, so extending it is the
+            // one-spelling answer rather than a second walking mechanism.
+            //
+            // `invariant` clauses are not modeled as a `Symbol` subclass at
+            // all (`SymbolCollection::collectMemberImpl` has no
+            // `ast::InvariantDecl` arm and returns null for it — "Unknown
+            // Member kind" — same root cause as #4115/#4186), so
+            // `ExtensionSymbol::members` never carries one either; only the
+            // raw AST (`ext->members`, already in hand here) can see it.
+            // `continue`s before `visitMember` ever sees an AST node with no
+            // backing `Symbol`.
+            if (auto* inv = dynamic_cast<const ast::InvariantDecl*>(m.get())) {
+                ctx_.diagnostics().report(
+                    Severity::Error, inv->loc,
+                    "an extension block may not declare an `invariant` "
+                    "member — §22.16 scopes invariant members to class "
+                    "bodies, and Appendix A.4's `ExtensionMember` grammar "
+                    "admits only methods and expression-bodied properties "
+                    "(§26.3)");
+                continue;
+            }
             // §26.3 (v0.183, #1581): an extension block may not declare a
             // `static` member. An extension block adds receiver-directed
             // members only; statics resolve against the extended type's own
