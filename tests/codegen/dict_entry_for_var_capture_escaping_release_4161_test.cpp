@@ -276,11 +276,15 @@ BEZEL_TEST(
     BEZEL_EXPECT_TRUE(has(r.stdoutText, "total=11"));
 }
 
-// A `const` local reading `entry.Key` alongside (not instead of) the direct
-// `entry` capture -- mirrors #4129's own
-// `const_local_in_body_before_return_leak_free` coverage, confirming the
-// escape-aware gate is indifferent to additional local declarations sharing
-// the loop body.
+// A `const` local reading `entry.Value` alongside (not instead of) the
+// direct `entry` capture -- mirrors #4129's own
+// `const_local_in_body_before_return_leak_free` coverage exactly (that row
+// also binds `entry.Value`, not `entry.Key`: a `const` of the STRING Key
+// would take its own reference-counted hold on the same `bz_string*`, which
+// would mask a use-after-free by keeping the object's refcount above zero
+// through incBB/endBB's release -- an int has no such ownership dynamics),
+// confirming the escape-aware gate is indifferent to additional local
+// declarations sharing the loop body.
 BEZEL_TEST(dict_entry_for_var_capture_escaping_release_4161,
            const_local_before_escaping_capture_no_use_after_free) {
     const std::string src =
@@ -290,8 +294,8 @@ BEZEL_TEST(dict_entry_for_var_capture_escaping_release_4161,
         "    d.Add(\"xy\", 9); "
         "    var f: () -> int := lambda() => 0; "
         "    for var entry in d do "
-        "      const tag := entry.Key; "
-        "      f := lambda() => entry.Key.Length + entry.Value + (tag.Length - tag.Length); "
+        "      const v := entry.Value; "
+        "      f := lambda() => entry.Key.Length + entry.Value + (v - v); "
         "    end; "
         "    return f; "
         "  end MakeClosure; "
