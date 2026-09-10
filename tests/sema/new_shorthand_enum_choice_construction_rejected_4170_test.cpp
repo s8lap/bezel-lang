@@ -57,6 +57,33 @@
 // (with a real location) fires instead. Message-text is asserted on every
 // row regardless, per §18's lesson that the location helper alone is not
 // sufficient when the pre-fix behavior routes through a backstop.
+//
+// CORRECTION (narrow #4170, same session as the landing commit 9e06aff):
+// that commit's body claimed "10 of 10" REJECT rows fail without the fix.
+// The MEASURED number (src/ reverted to 2c0ac3e — the pre-#4170 commit,
+// i.e. #4163 already applied — rebuilt, `agent_check.sh
+// new_shorthand_enum_choice_construction_rejected_4170` re-run, restored,
+// rebuilt, re-confirmed green) is **8 of 8** of the SHORTHAND-path rows:
+// new_choice_local_decl_shorthand_then_case_no_longer_crashes_rejected_spec_35_1_17_7,
+// new_enum_local_decl_shorthand_then_case_hits_ir_verifier_pre_fix_rejected_spec_5_4_10_17_7,
+// new_choice_field_initializer_shorthand_rejected_spec_35_1_17_7,
+// new_enum_field_initializer_shorthand_rejected_spec_5_4_10_17_7,
+// new_choice_local_decl_shorthand_via_type_alias_rejected_spec_35_1_17_7,
+// new_enum_local_decl_shorthand_via_type_alias_rejected_spec_5_4_10_17_7,
+// new_choice_local_decl_shorthand_with_payload_args_rejected_spec_35_1_17_7,
+// new_generic_stdlib_choice_local_decl_shorthand_rejected_spec_35_1_17_7.
+// The other 2 REJECT-shaped rows in this file —
+// control_explicit_new_enum_still_rejected_unchanged_spec_5_4_10 and
+// control_explicit_new_choice_still_rejected_unchanged_spec_35_1 — are
+// deliberate CONTROLS over the EXPLICIT `new Type(...)` spelling, which
+// #4163 already rejected before this commit; they pass identically on
+// both sides BY DESIGN (proving the shared-predicate refactor did not
+// change that pre-existing behavior), not "fail without". The landing
+// commit's body conflated these 2 controls with the 8 genuine
+// fail-without rows into "10 of 10"; that arithmetic was wrong (LANE_RULES
+// §20: state FAIL-WITHOUT as "N of M" and name the N — this is that
+// correction). All 6 ACCEPT rows continue to pass identically on both
+// sides as intended.
 
 #include "support/aot_result_asserts.hpp"
 #include "support/aot_support.hpp"
