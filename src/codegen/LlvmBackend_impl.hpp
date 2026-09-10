@@ -14505,6 +14505,20 @@ private:
     // lowerStringFieldStore. Returns true when handled.
     bool lowerClosureFieldStore(const ast::Expr& target, llvm::Value* fieldAddr,
                                 llvm::Value* newVal, const ast::Expr* valueExpr);
+    // fix #4174 / §27.5 / §28.9: REASSIGNMENT `f := newVal` where `f` is a
+    // closure (function-typed) LOCAL/parameter SLOT. Retain-new (transfer a
+    // producer) / store / release-old, so the slot keeps owning an
+    // independent +1 across the reassignment — without this, the DISPLACED
+    // previous closure value (e.g. the `lambda() => 0` a later `f := lambda()
+    // => 42;` overwrites) is never released: a 40-byte-per-reassignment leak
+    // (measured, LSan). Mirrors lowerStringLocalReassign exactly (load-old →
+    // retain-or-transfer-new → store-new → release-old), using the SAME
+    // producer test lowerClosureFieldStore uses (isPlusOneClosureProducer ||
+    // isUserMethodClosureReturnCall). Returns true when handled (caller must
+    // NOT also store); false when `target` is not a closure-typed local slot.
+    bool lowerClosureLocalReassign(const ast::Expr& target, llvm::Value* slotAddr,
+                                   llvm::Type* elemTy, llvm::Value* newVal,
+                                   const ast::Expr* valueExpr);
 
     // #422 / §27.5 / §28.9: the set of `var` closure (function-typed) LocalDecl
     // nodes PROVABLY eligible for scope-end bz_closure_release — initialized

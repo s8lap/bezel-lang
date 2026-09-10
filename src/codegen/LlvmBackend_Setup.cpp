@@ -25521,6 +25521,64 @@ bool Emitter::lowerClosureFieldStore(const ast::Expr& target,
 }
 
 
+// fix #4174 / §27.5 / §28.9: reassign a closure (function-typed) LOCAL/
+// parameter slot with retain-new / release-old, keeping the slot's
+// independent +1 across the overwrite. Without this, `f := lambda() => 42;`
+// plain-stores the new value and the DISPLACED previous value (e.g. the
+// `lambda() => 0` a prior `var f: () -> int := lambda() => 0;` transferred
+// into the slot) is never released — measured as a 40-byte-per-reassignment
+// LeakSanitizer leak (issue #4174's own repro). Order: load-old →
+// retain-or-transfer-new → store-new → release-old (retain-before-release
+// keeps a self-assignment `f := f;` transiently safe — the count dips +1
+// then back, never transiently 0). A +1 producer (a lambda expression, a
+// method reference, or a call to a user-defined closure-returning method —
+// #429 RETURN category) is TRANSFERRED (no retain — its single reference
+// becomes the slot's); anything else (a borrow: an existing closure-typed
+// local/parameter/field read) is RETAINED so the slot owns an independent
+// +1 (mirroring lowerClosureFieldStore's own retain-vs-transfer decision,
+// same predicates). Restricted to a closure-typed LOCAL/parameter slot (NOT
+// a field — that is lowerClosureFieldStore; NOT an array element / ref-out
+// param / static field), matching lowerStringLocalReassign's own scope.
+//
+// The reassigned slot keeps owning its final value; ClosureEscapeWalker's
+// AssignmentStmt arm marks ANY reassignment of the target as an escape
+// ("Reassigning the local itself → escape (overwrite handling is out of
+// this increment)" — this fix is that increment's overwrite handling), so a
+// reassigned local is never in closureReleaseEligible_ and its FINAL value
+// is NOT auto-released at scope end — it simply leaks if never returned or
+// otherwise consumed, the same safe-direction trade-off
+// lowerStringLocalReassign's own doc comment describes for strings (never a
+// UAF, never a double-free — only ever a leak, and only for the one final
+// value, not every displaced intermediate one, which this function now
+// reclaims).
+bool Emitter::lowerClosureLocalReassign(const ast::Expr& target,
+                                        llvm::Value* slotAddr, llvm::Type* elemTy,
+                                        llvm::Value* newVal,
+                                        const ast::Expr* valueExpr) {
+    if (!slotAddr || !newVal) return false;
+    if (!newVal->getType()->isPointerTy()) return false;
+    // Must be an actual LOCAL/parameter slot, closure-typed, a bare `ptr` slot.
+    if (!localSlot(target)) return false;                  // not a local/param
+    if (!elemTy || !elemTy->isPointerTy()) return false;    // not a `ptr` slot
+    const sema::TypeRef* tt = ctx_.exprType(target);
+    if (!tt || tt->kind != sema::TypeRef::Kind::Function) return false;  // not closure-typed
+    // A nullable function-typed slot is left as a plain store (matches
+    // lowerStringLocalReassign's / collectClosureReleaseEligible's own
+    // non-nullable scope) — bz_closure_retain/release are null-safe, but the
+    // conservative scope keeps this increment in step with the rest of the
+    // closure-local machinery rather than reasoning about a new surface.
+    if (tt->nullable) return false;
+    llvm::Value* oldVal = builder_.CreateLoad(ptrTy(), slotAddr, "clol.old");
+    bool isProducer = isPlusOneClosureProducer(valueExpr) ||
+                      isUserMethodClosureReturnCall(valueExpr);
+    if (!isProducer)
+        emitClosureRetain(newVal);
+    builder_.CreateStore(newVal, slotAddr);
+    emitClosureRelease(oldVal);
+    return true;
+}
+
+
 // #429 (box RETURN category) / §8.6 / §28.9: see the declaration in
 // LlvmBackend_impl.hpp. Recognize a CallExpr whose resolved callee is a
 // USER-DEFINED, LOCALLY-COMPILED MethodSymbol (backed by an ast::MethodDecl,

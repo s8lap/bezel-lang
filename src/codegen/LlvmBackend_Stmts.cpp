@@ -1162,6 +1162,19 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 if (!handled)
                     handled = lowerClosureFieldStore(*as->target, addr, rhs,
                                                      as->value.get());
+                // fix #4174 / §27.5 / §28.9: closure-typed LOCAL/parameter
+                // reassignment — the closure twin of lowerStringLocalReassign
+                // just above. Without this, `f := lambda() => 42;` plain-
+                // stores the new closure and the DISPLACED previous value
+                // (the producer +1 a prior binding transferred into the
+                // slot) is never released — a 40-byte-per-reassignment leak
+                // (issue #4174, LSan-measured). Gated on the analyzed
+                // function (closureReleaseEligibleFn_) exactly as the string
+                // twin is gated on stringReleaseEligibleFn_.
+                if (!handled && currentFn_ == closureReleaseEligibleFn_)
+                    handled = lowerClosureLocalReassign(*as->target, addr,
+                                                        elemTy, rhs,
+                                                        as->value.get());
                 // #429 (box FIELD-STORE category) / §8.6 / §28.9: a store into
                 // a CLASS Object/interface field whose every store (per the
                 // collectBoxStorageFields pre-pass) uses a boxable value source
