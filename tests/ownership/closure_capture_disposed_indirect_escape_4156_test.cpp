@@ -205,3 +205,96 @@ BEZEL_TEST(closure_capture_disposed_indirect_escape,
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(hasErrorMessage(r, "whose source is disposed at scope end"));
 }
+
+// COVERAGE (issue #4197, filling a gap left by #4156/#4136): the loop-
+// CARRIED `DrainedEntry<K,V>` binding of `for var entry in d.Drain() do
+// ... end` (stdlib §4.9) is a DIFFERENT declaration/capture-boxing shape
+// than the plain `using var` local every row above exercises — a distinct
+// AST node (a for-loop variable, not a LocalDecl), a per-ITERATION scope
+// rather than a method-body scope, and (per fix #4136's own header comment
+// in tests/codegen/dict_drain_entry_dispose_capture_4136_test.cpp) a
+// closure capturing it forces §27.5 cell-boxing of ITS OWN dedicated kind,
+// routed through a codegen-level `boxedStorage` GEP that #4136 fixed only
+// months after the plain-local capture path was already correct. Issue
+// #4136's SEGV repro and issue #4156's fix were BOTH motivated by exactly
+// this shape, yet no test anywhere in the tree exercised "return a closure
+// over a disposed DrainedEntry for-loop variable" — #4156's own regression
+// suite (above) used only a minimal generic `using var` fixture, and
+// #4136's suite (tests/codegen/dict_drain_entry_dispose_capture_4136_test.cpp)
+// deliberately never returns its capturing closures (see that file's header,
+// "the two programs below deliberately avoid invoking a closure that reads
+// a field Dispose() has released"). `checkIndirectEscapeOnReturn`'s
+// Disposed-source arm (Ownership_Checks.cpp, `isDisposedTrackedLocal`) is a
+// SYMBOL-STATE check keyed on `states_[sym]`, not an AST-node-kind walk, so
+// there is no known reason it would treat a for-loop variable's symbol
+// differently from a `using var` local's — but that is exactly the kind of
+// assumption this project's regression-test discipline says must be PINNED,
+// not left to reasoning by analogy (issue #4197's own filing, echoing
+// #4136's header: "the DrainedEntry for-loop-variable path has its own,
+// previously-undetected, codegen-level peculiarities that a generic `using
+// var` fixture did not exercise"). Both a K=int and a K=string
+// `DrainedEntry<K,V>` loop variable are pinned below, per #4197's proposal.
+//
+// `Widget` (a class T for `V: class`, stdlib §4.9's OwningDictionary/
+// DrainedEntry constraint) mirrors dict_drain_entry_dispose_capture_4136_
+// test.cpp's own fixture exactly, so this row exercises the identical
+// capture-boxing shape that file's rows exercise, just returned instead of
+// invoked-then-discarded.
+
+BEZEL_TEST(closure_capture_disposed_indirect_escape,
+           drain_entry_int_key_loop_var_disposed_before_return_rejected_4156_4197) {
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "public class Widget "
+        "  public property N: int; "
+        "  public constructor(n: int) N := n; end constructor; "
+        "end Widget; "
+        "class C "
+        "  public static method Mk(): () -> int "
+        "    using var d := new OwningDictionary<int, Widget>(); "
+        "    d.Add(7, new Widget(9)); "
+        "    for var entry in d.Drain() do "
+        "      var f := lambda(): int => entry.Key; "
+        "      entry.Dispose(); "
+        "      return f; "
+        "    end; "
+        "    return lambda(): int => 0; "
+        "  end Mk; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "is a closure capturing `entry`, which was explicitly disposed "
+           "before this return"));
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "(§28.2 dominating-Dispose rule, extended to a capture-escaping "
+           "binding per §28.9"));
+}
+
+BEZEL_TEST(closure_capture_disposed_indirect_escape,
+           drain_entry_string_key_loop_var_disposed_before_return_rejected_4156_4197) {
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "public class Widget "
+        "  public property N: int; "
+        "  public constructor(n: int) N := n; end constructor; "
+        "end Widget; "
+        "class C "
+        "  public static method Mk(): () -> int "
+        "    using var d := new OwningDictionary<string, Widget>(); "
+        "    d.Add(\"xy\", new Widget(9)); "
+        "    for var entry in d.Drain() do "
+        "      var f := lambda(): int => entry.Key.Length; "
+        "      entry.Dispose(); "
+        "      return f; "
+        "    end; "
+        "    return lambda(): int => 0; "
+        "  end Mk; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "is a closure capturing `entry`, which was explicitly disposed "
+           "before this return"));
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "(§28.2 dominating-Dispose rule, extended to a capture-escaping "
+           "binding per §28.9"));
+}
