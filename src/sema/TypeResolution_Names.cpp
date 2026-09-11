@@ -1341,11 +1341,7 @@ TypeRef* Resolver::resolveType(const ast::Type& t, Scope* scope) {
                 // literal initialization miscompiled (garbage/OOB reads).
                 if (ref->arrayElement &&
                     ref->arrayElement->kind == TypeRef::Kind::InlineArray) {
-                    ctx_.diagnostics().report(
-                        Severity::Error, t.span.begin,
-                        "an inline array may not be the element of another "
-                        "inline array (`[N][M]T`) — multi-dimensional inline "
-                        "arrays are not admitted (§15.1)");
+                    reportNestedInlineArrayError(t.span.begin);
                 }
             }
             // §15.1 (issue #734): N must be a compile-time integer expression
@@ -1768,9 +1764,23 @@ ConstShiftDomainFault Resolver::findConstShiftDomainFaultInScope(
 // cached `aliasedType` TypeRef; `subst` maps the alias's OWN generic
 // parameter names to the CONCRETE type arguments supplied at a particular
 // reference site.
+// §15.1 (#953): "an inline array may not be the element of another inline
+// array (`[N][M]T`)". Shared text for both the direct-syntax check
+// (resolveType's InlineArray case, above) and the alias-substitution
+// re-validation (substituteAliasGenericArgs, below) — one spelling, not a
+// drifting second copy (LANE_RULES §6).
+void Resolver::reportNestedInlineArrayError(SourceLocation loc) {
+    ctx_.diagnostics().report(
+        Severity::Error, loc,
+        "an inline array may not be the element of another "
+        "inline array (`[N][M]T`) — multi-dimensional inline "
+        "arrays are not admitted (§15.1)");
+}
+
 TypeRef* Resolver::substituteAliasGenericArgs(
         TypeRef* tr,
-        const std::unordered_map<std::string_view, TypeRef*>& subst) {
+        const std::unordered_map<std::string_view, TypeRef*>& subst,
+        SourceLocation useLoc) {
     if (!tr || subst.empty()) return tr;
     switch (tr->kind) {
         case TypeRef::Kind::Named: {
@@ -1802,7 +1812,7 @@ TypeRef* Resolver::substituteAliasGenericArgs(
             std::vector<TypeRef*> newArgs;
             newArgs.reserve(tr->genericArgs.size());
             for (TypeRef* arg : tr->genericArgs) {
-                TypeRef* na = substituteAliasGenericArgs(arg, subst);
+                TypeRef* na = substituteAliasGenericArgs(arg, subst, useLoc);
                 if (na != arg) changed = true;
                 newArgs.push_back(na);
             }
@@ -1813,8 +1823,23 @@ TypeRef* Resolver::substituteAliasGenericArgs(
         }
         case TypeRef::Kind::InlineArray: {
             if (!tr->arrayElement) return tr;
-            TypeRef* ne = substituteAliasGenericArgs(tr->arrayElement, subst);
+            TypeRef* ne =
+                substituteAliasGenericArgs(tr->arrayElement, subst, useLoc);
             if (ne == tr->arrayElement) return tr;
+            // §15.1 (send-back for fix #4280): resolveType's
+            // direct-syntax check (above, in the InlineArray case) only sees
+            // the alias's own literal body at the ALIAS's declaration site
+            // (`type Nested<T> := [1]T`, where T is still unbound) — it
+            // cannot see that substitution at THIS reference site just
+            // replaced T with an inline array itself
+            // (`Nested<[1]string>`), which builds a genuine `[N][1]string`
+            // with no re-validation anywhere else. Re-run the identical
+            // check at the point substitution actually creates the nested
+            // shape, so the rejection fires "wherever a nested inline array
+            // is formed" rather than only through direct syntax.
+            if (ne->kind == TypeRef::Kind::InlineArray) {
+                reportNestedInlineArrayError(useLoc);
+            }
             TypeRef* nn = ctx_.makeTypeRef(*tr);
             nn->arrayElement = ne;
             return nn;
@@ -1823,11 +1848,11 @@ TypeRef* Resolver::substituteAliasGenericArgs(
             bool changed = false;
             std::vector<TypeRef::FuncParam> newParams = tr->funcParams;
             for (auto& p : newParams) {
-                TypeRef* np = substituteAliasGenericArgs(p.type, subst);
+                TypeRef* np = substituteAliasGenericArgs(p.type, subst, useLoc);
                 if (np != p.type) { p.type = np; changed = true; }
             }
             TypeRef* newRet =
-                substituteAliasGenericArgs(tr->funcReturn, subst);
+                substituteAliasGenericArgs(tr->funcReturn, subst, useLoc);
             if (newRet != tr->funcReturn) changed = true;
             if (!changed) return tr;
             TypeRef* nn = ctx_.makeTypeRef(*tr);
@@ -2602,7 +2627,8 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                             concreteArg;
                     }
                     underlying =
-                        substituteAliasGenericArgs(underlying, aliasSubst);
+                        substituteAliasGenericArgs(underlying, aliasSubst,
+                                                    t.span.begin);
                     // Copy the underlying kind and payload into ref. The nullable
                     // flag on ref was already set from the syntactic `?` suffix in
                     // resolveType; the underlying type's nullable flag is

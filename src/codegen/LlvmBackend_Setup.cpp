@@ -23496,15 +23496,32 @@ struct StringEscapeWalker {
         // NOT generalized to "any Named `arrayElement`": a CLASS-typed
         // element is deliberately excluded, because (mirroring the
         // existing top-level CLASS control) a class's own constructor
-        // retains a borrowed string field via `lowerStringFieldStore`,
-        // so suppressing the caller-side release for a class-element
-        // array would be pure over-suppression — an unforced extra leak,
-        // not a fix. Control row `inline_array_owned_class_element_
-        // control_stays_clean_not_over_suppressed` (inline_array_record_
-        // choice_element_call_result_param_alias_uaf_4280_test.cpp) pins
-        // this boundary: MEASURED clean (no ASan/LSan finding, exit 5) on
-        // this tree both before and after this fix, since the helper
-        // never matches a Class declaration.
+        // retains a borrowed string field via `lowerStringFieldStore` —
+        // *when that field is itself `string`-typed*. Control row
+        // `inline_array_owned_class_element_control_stays_clean_not_
+        // over_suppressed` (inline_array_record_choice_element_call_
+        // result_param_alias_uaf_4280_test.cpp) pins exactly that shape
+        // (`Widget.V: string`): MEASURED clean (no ASan/LSan finding,
+        // exit 5) on this tree both before and after this fix, since the
+        // helper never matches a Class declaration.
+        //
+        // CORRECTION (send-back for this fix): the send-back review
+        // measured that the claim above does NOT generalize — a
+        // class whose OWN field is instead Record/Choice-typed, whose
+        // constructor embeds the argument into THAT field via `new
+        // SomeRecord(arg)`, hits the identical raw-store fast path one
+        // level further in, and `lowerStringFieldStore` never fires at
+        // all (the field being stored, `W`, is Record-typed, not
+        // `string`-typed). MEASURED: a real heap-use-after-free, both as
+        // a bare `[1]Widget2` array element and — more fundamentally —
+        // with NO array involved at all (`static method Wrap(s: string):
+        // owned Widget2`), and confirmed to PRE-DATE this whole fix
+        // family (reproduces identically on an isolated worktree at
+        // `f8b12ba`, i.e. before fix #4265). This is a pre-existing gap in
+        // `isRecordOrChoiceDeclared`'s original top-level arm (fix #4254),
+        // not something #4280 introduced or could have widened to cover
+        // without a materially larger constructor-body dataflow analysis
+        // — filed as issue 4300 rather than attempted here.
         bool calleeReturnMayAliasArgUnretained = false;
         if (stringReleaseMode && ms) {
             const sema::TypeRef* crt = nullptr;

@@ -770,9 +770,22 @@ private:
     // and must never be mutated in place. Returns `tr` unchanged (no
     // allocation) when nothing beneath it needs substitution, which also
     // covers a non-generic alias (`subst` empty).
+    //
+    // `useLoc` is the ALIAS REFERENCE SITE's own source location (e.g. the
+    // `Nested<[1]string>` mention, not the alias's `type Nested<T> := [1]T`
+    // declaration) — threaded through every recursive call so the §15.1
+    // re-validation below (send-back for fix #4280) can report at the
+    // location that actually produces the illegal shape.
     TypeRef* substituteAliasGenericArgs(
         TypeRef* tr,
-        const std::unordered_map<std::string_view, TypeRef*>& subst);
+        const std::unordered_map<std::string_view, TypeRef*>& subst,
+        SourceLocation useLoc);
+
+    // Shared with resolveType's direct-syntax `[N][M]T` check (§15.1,
+    // issue #953) — factored so the alias-substitution re-validation below
+    // reports the identical diagnostic text rather than a drifting second
+    // copy (LANE_RULES §6).
+    void reportNestedInlineArrayError(SourceLocation loc);
 
     void checkOverrideSignatureMatch(MemberSymbol* derivedSym,
                                      MemberSymbol* baseSym);
