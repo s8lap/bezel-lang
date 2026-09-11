@@ -53,9 +53,16 @@
 // and 2 now assert `leaksAtLeast` (a measured, margined leak-magnitude
 // floor, immune to LeakSanitizer's own conservative-scan jitter -- see
 // that helper's comment) and a factory-method-path row was added to record
-// an independently-discovered, only-partially-explained discrepancy
-// between the direct-local and call-result admission paths (issue #4258).
-// See each row's own comment for what was measured and what remains open.
+// an independently-discovered discrepancy between the direct-local and
+// call-result admission paths (issue #4258).
+//
+// R18 UPDATE (post-`fix #4254`, §9.7/§28.9, v0.298): #4258's discrepancy is
+// now RESOLVED, not merely pinned -- #4254 narrows the #1430 string-arg
+// relaxation for exactly the "callee returns a record/choice" shape the
+// factory row exercises, so the factory path now safely leaks too, matching
+// row 2 instead of diverging from it. That row was updated in the same
+// commit that closed #4258 and no longer carries the `_open_question`
+// framing. See each row's own comment for what was measured.
 
 #include <regex>
 
@@ -338,46 +345,66 @@ BEZEL_TEST(nested_record_string_field_leak_4237,
 }
 
 // ===========================================================================
-// Factory-method-path control (send-back FB-4237): the SAME borrowed-string-
-// through-a-nested-construction shape as row 2, but reached via
+// Factory-method-path control — UPDATED post-`fix #4254` (§9.7/§28.9,
+// v0.298), which resolves the "open question" this row was originally filed
+// under (issue #4258). The row is the SAME borrowed-string-through-a-
+// nested-construction shape as row 2 above, but reached via
 // `isProvablyFreshRecordFactoryMethod`'s callee-body walk
 // (`Factory.Make(s): Outer => new Outer(new Inner(s))`, called as
-// `var o := Factory.Make(s);`) rather than a direct local `new`. This
-// call-result path was UNTESTED by the original fix's suite (which only
-// covers direct-local NewExpr registration) and behaves DIFFERENTLY from
-// row 2: MEASURED (this lane's own rebuild, 3 runs, plain + repeated) the
-// real fix is CLEAN here — no leak at all — where row 2's identical shape,
-// one level removed via a direct local, safely leaks. Two paths, same
-// shape, different answers; this row exists to PIN the currently-observed
-// behavior so it cannot silently change, not to claim the discrepancy is
-// fully understood.
+// `var o := Factory.Make(s);`) rather than a direct local `new`.
 //
-// What IS traced (not merely asserted): `isFreshRecordConstructionOfExact
-// Type` is the SAME shared authority both paths call — for THIS shape it
-// returns false in both (an identifier read is never a +1 producer,
-// whether the identifier is Main's local `s` or Factory.Make's OWN
-// parameter `s`), so `isProvablyFreshRecordFactoryMethod` declines `o` for
-// release exactly as `isFreshRecordConstructionOfExactType` declines
-// `outer` in row 2 — the ELIGIBILITY answer is identical on both paths.
-// The difference must therefore be in whether anything else independently
-// disposes of the underlying string, which this fix's own eligibility
-// proof has no visibility into either way.
+// ORIGINALLY (this file's own fix #4237, before #4254 landed): MEASURED
+// CLEAN — no leak at all — where row 2's byte-identical shape, one level
+// removed via a direct local, safely leaked. Issue #4258 filed that
+// asymmetry as an open question: both paths share the identical
+// `isFreshRecordConstructionOfExactType` eligibility authority and it
+// DECLINES both shapes identically, so why did the observable behavior
+// differ? #4258's own leading hypothesis was that `s`'s OWN natural
+// scope-end release (the #1430 relaxation's call-bounded-borrow admission)
+// fired UNSUPPRESSED on the factory path (no `new`-argument-position
+// suppression applies to an ordinary method call), correctly freeing the
+// one underlying buffer exactly once — accidentally sound, not exercising
+// this fix's own eligibility gate at all.
 //
-// What is NOT fully traced: the exact codegen mechanism that makes the
-// factory path clean rather than leaking (a partially-evidenced hypothesis,
-// not an established fact). Filed as issue #4258 rather than guessed at
-// here.
+// `fix #4254` (landed after #4237/#4258, this same integration branch)
+// narrows exactly that #1430 relaxation: a plain string argument passed to
+// a method whose declared return type is a record/choice is no longer
+// treated as a safe call-bounded borrow, because the callee can embed it in
+// a freshly-constructed VALUE with no independent retain (returning it
+// ALIASED). `Factory.Make(s: string): Outer` is precisely that shape. Post-
+// #4254, `s`'s own scope-end release is suppressed too — so NEITHER `s`'s
+// own release NOR `o.I.S`'s field release (still correctly declined by this
+// file's #4237 eligibility gate) ever fires, and the one underlying string
+// buffer leaks instead of being freed exactly once. MEASURED (this lane,
+// `scripts/agent_check.sh --probe --asan`, 3 runs, identical binary):
+// "AddressSanitizer: 12490 byte(s) leaked in 600 allocation(s)" every time
+// (9600 B / 300 direct + 2890 B / 300 indirect) — no LSan conservative-scan
+// jitter observed on this exact program across 3 runs, unlike rows 1/2's
+// margined floor.
 //
-// This row DOES have teeth, independently of the open question: under the
-// SAME hand-built wrong variant used for rows 1/2, this exact program goes
-// from clean to a REPRODUCIBLE SEGV (measured 2/2 runs) — wrongly admitting
-// `o` for release now double-frees the same string `s`'s own scope-end
-// disposal also releases. The correct (fixed) behavior is asserted with
-// `runChecked` (LSan-clean AND exit 0), the strongest oracle available —
-// it fails on EITHER a reappeared leak or a reintroduced crash.
+// This RESOLVES #4258's practical discrepancy: the factory path and the
+// direct-local path (row 2) now BOTH safely leak, matching — the
+// observable asymmetry #4258 tracked is gone. #4258 is closed by this
+// commit citing this row. The `_open_question` name is retired; `runChecked
+// == 0` is replaced with the same `leaksAtLeast` margined-floor oracle rows
+// 1/2 use (send-back FB-4237's own reasoning applies identically here — a
+// bare `didNotCrash`/clean-exit assertion would pass vacuously under an
+// eligibility gate wrongly widened enough to make the leak disappear).
+//
+// This row still has the teeth send-back FB-4237 gave it, unrelated to
+// #4254: under the SAME hand-built wrong variant used for rows 1/2 (a
+// shallow, non-recursive `fix #4237`), this exact program goes from a
+// leak to a REPRODUCIBLE SEGV (measured 2/2 runs, #4258's own record) —
+// wrongly admitting `o` for release now double-frees the same string `s`'s
+// own (suppressed-since-#4254, but still eventually collected) storage.
+// `leaksAtLeast` catches a WRONGLY-CLEAN result the same way the other two
+// rows' floor does; the wrong variant's SEGV is caught by `r.ran` being
+// false for a reason other than a leak summary (leaksAtLeast's own
+// documented "sanitizer fired but not with a leak SUMMARY" fallthrough).
+// // per §9.7, §28.9, v0.298, #4237, #4254, #4258
 BEZEL_TEST(nested_record_string_field_leak_4237,
-           factory_method_borrowed_string_arg_clean_no_uaf_open_question) {
-    BEZEL_EXPECT_EQ(runChecked(
+           factory_method_borrowed_string_arg_leaks_post_4254_no_uaf) {
+    const char* prog =
         "module M; record Inner(S: string); record Outer(I: Inner); "
         "class Factory "
         "  public static method Make(s: string): Outer "
@@ -393,7 +420,8 @@ BEZEL_TEST(nested_record_string_field_leak_4237,
         "    i += 1; "
         "  end; "
         "  return 0; "
-        "end Main; end C;"), 0);
+        "end Main; end C;";
+    BEZEL_EXPECT_TRUE(leaksAtLeast(prog, 11000));
 }
 
 // Control: a NESTED CHOICE-typed field is UNCHANGED by this fix — still
