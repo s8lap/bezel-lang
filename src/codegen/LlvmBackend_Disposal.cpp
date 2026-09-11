@@ -1714,17 +1714,34 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
                     if (fmod == "readonly") { isReadonly = true; break; }
             if (!isReadonly) continue;
             const ast::Expr* init = nullptr;
-            // SEAM-DEBT: #4279 `m->decl` is nullptr for an IMPORTED field
-            // (no ast::FieldDecl crosses the module boundary, the #3671
-            // seam) -- this reads as "no initializer", the deliberately
-            // conservative answer (the field keeps its pre-existing safe
-            // leak; the new release below simply never fires for it).
+            // SEAM-ACCESSOR: `m->decl` is nullptr for an IMPORTED field (no
+            // ast::FieldDecl crosses the module boundary, the #3671 seam) --
+            // the fallback immediately below (ctx_.importedInstanceFieldInitExpr)
+            // is the sanctioned both-sources accessor for exactly this arm,
+            // the same one emitOwnFieldInit (LlvmBackend_Setup.cpp) and the
+            // record-preamble init walk (LlvmBackend_Exprs2.cpp) already use.
             if (auto* fd = dynamic_cast<const ast::FieldDecl*>(m->decl))
                 init = fd->initializer.get();
-            // SEAM-DEBT: #4279 same imported-conservative rationale as the
-            // FieldDecl arm immediately above.
+            // SEAM-ACCESSOR: ditto -- see the FieldDecl arm immediately above.
             else if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(m->decl))
                 init = pd->autoInitializer.get();
+            // fix #4279 (§9.7/§28.9, v0.298): an imported field/property has
+            // no ast::FieldDecl/PropertyDecl at all (m->decl == nullptr), so
+            // the two arms above always miss for it and this walk's release
+            // silently never fired for an imported record-typed field --
+            // narrow relative to the local case, but NOT a wrong answer: it
+            // just never released. `importedInstanceFieldInitExpr` is the
+            // #2874 load-time-reconstructed ast::Expr* for exactly this case
+            // (ModuleLoader re-parses and sema-types the exporting module's
+            // initializer text, then publishes the resolved Expr* here) --
+            // the SAME accessor emitOwnFieldInit and the record-preamble
+            // init walk already consult for the identical m->decl==nullptr
+            // gap, reused verbatim rather than re-derived (LANE_RULES §6/§25).
+            if (!init && m->decl == nullptr) {
+                if (const ast::Expr* parsedInit =
+                        ctx_.importedInstanceFieldInitExpr(m))
+                    init = parsedInit;
+            }
             if (!init) continue;
             if (!isFreshRecordConstructionOfExactType(init,
                                                        fieldTr->declaration))

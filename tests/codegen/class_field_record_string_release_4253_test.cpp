@@ -273,16 +273,33 @@ BEZEL_TEST(class_field_record_string_release_4253,
     BEZEL_EXPECT_TRUE(leaksAtLeast(prog, 6000));
 }
 
-// Axis: fresh-construction eligibility, the LOAD-BEARING soundness proof.
-// Otherwise identical to row 1 (sealed, readonly, no explicit constructor)
-// but the field's declaration initializer's nested string argument is a
-// BORROWED identifier read (`s2`), not a literal or a +1 producer -- the
-// exact shape #4237's own row 2 exercises for the LOCAL case. `s2` is read
-// again AFTER `h` is constructed, so a wrongly-admitted `h` would free
-// `s2`'s reference out from under this later read (heap-use-after-free).
-// This is the row that PROVES reusing isFreshRecordConstructionOfExactType
-// (rather than a shallower, home-grown "is this a NewExpr of the right
-// type" check) is what keeps the new class-field walk sound.
+// Axis: fresh-construction eligibility. Otherwise identical to row 1
+// (sealed, readonly, no explicit constructor) but the field's OWN
+// declaration initializer is `P := b` -- a bare read of the primary-ctor
+// parameter `b` (itself `Box`-typed), not a `new Box(...)` call at all.
+// CORRECTED (send-back on this fix's review): an earlier revision of this
+// comment described this row as exercising #4237's own row 2 (a nested
+// BORROWED string argument inside an ADMITTED `new Box(...)` call, declined
+// by the nested-argument nested string-producer check) -- that is a
+// DIFFERENT, deeper shape this row does not exercise. `P := b` declines at
+// `isFreshRecordConstructionOfExactType`'s very FIRST check
+// (`dynamic_cast<const ast::NewExpr*>(expr)` fails immediately, since `b`
+// is an IdentifierExpr, not a NewExpr) -- the shallowest possible decline,
+// before any nested-argument analysis is ever reached. It still proves a
+// real thing: a plain aliasing property assignment is correctly declined by
+// the coarse "is this even a NewExpr" gate, so a wrongly-admitted `h` would
+// alias `b`'s (and hence `s2`'s) string -- `s2` is read again AFTER `h` is
+// constructed, so a wrongly-admitted `h` would free `s2`'s reference out
+// from under this later read (heap-use-after-free), still a real UAF-shaped
+// oracle, just via the coarser mechanism. `new Box(b.Value)` -- a borrowed
+// FIELD read as the constructor argument, the shape the ORIGINAL comment
+// described -- was separately measured (this send-back, `agent_check.sh
+// --probe --asan`, same 200-iteration shape): declines at the NESTED
+// check instead (`b.Value` is neither a string literal nor a +1 producer),
+// still safe-leaks cleanly -- "Direct leak of 6400 byte(s) in 200 object(s)"
+// + "Indirect leak of 1890 byte(s) in 200 object(s)", SUMMARY 8290 B / 400
+// allocations, no crash -- exercising the nested-argument check this row's
+// own program does not reach.
 BEZEL_TEST(class_field_record_string_release_4253,
            borrowed_string_arg_not_admitted_no_uaf_axis_eligibility) {
     const char* prog =
