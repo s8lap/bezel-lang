@@ -31,16 +31,34 @@
 // sibling 4222 test staying green (byte-identical diagnostic) is the
 // PASS-side proof of that, not a coincidence.
 //
-// Post-fix, this file produces exactly TWO diagnostics: the same §26.3
-// rejection (now pointing at the same line:col as before — the recovery
-// bound does not change where the ORIGINAL diagnostic is reported), plus
-// "expected ';' after return statement" INSIDE `class CC4257`'s `Main`
-// method body (this file deliberately omits the `;` after `return 0` so
-// that a diagnostic naming that exact construct is direct proof the parser
-// resynced at the real `end extension;` boundary and went on to parse
-// `class CC4257`'s interior — not merely "produced no further diagnostics",
-// which alone would be consistent with either recovering correctly or
-// silently discarding the class with nothing to say about it).
+// Post-fix (this commit), this file produces exactly TWO diagnostics: the
+// same §26.3 rejection (now pointing at the same line:col as before — the
+// recovery bound does not change where the ORIGINAL diagnostic is
+// reported), plus "expected ';' after return statement" INSIDE
+// `class CC4257`'s `Main` method body (this file deliberately omits the
+// `;` after `return 0` so that a diagnostic naming that exact construct is
+// direct proof the parser resynced at the real `end extension;` boundary
+// and went on to parse `class CC4257`'s interior — not merely "produced no
+// further diagnostics", which alone would be consistent with either
+// recovering correctly or silently discarding the class with nothing to
+// say about it).
+//
+// fix #4264 (send-back on #4257, same §, v0.298): the two diagnostics above
+// named ONLY the placement rejection, with nothing at that site hinting the
+// clause's own `(` is unmatched — a user who follows the §26.3 message's
+// evident fix (relocate the clause onto the extended type's own class
+// body, where `polymorphic(...)` is legal) would hit the unclosed-paren
+// error as an unrelated-looking surprise only AFTER making that move.
+// `parseAndDiscardExtensionPolymorphicMember` now tracks whether its
+// paren-depth scan ever reaches `depth == 0` (a matched `)`) versus exiting
+// via the `isKeyword("end")`/EOF bound above; on the latter it emits one
+// supplementary `Severity::Note` at the `(` token itself. This file now
+// produces exactly THREE diagnostics: the §26.3 rejection, the new note
+// (pointing at the SAME `(` this file leaves unclosed below), then
+// the same "expected ';' after return statement" as before — the note does
+// not disturb the resync proof, since it carries `Severity::Note` and does
+// not bump `errorCount()` (verified against `DiagnosticEngine::report`,
+// `src/support/Diagnostic.cpp`).
 
 // RUN: %not %bezelc -c %s 2>&1 | FileCheck %s
 // RUN: %not %bezelc -c %s 2>&1 | wc -l | FileCheck %s --check-prefix=COUNT
@@ -64,6 +82,7 @@ end CC4257;
 // CHECK: {{.*}}:{{[0-9]+}}:{{[0-9]+}}: an extension block may not declare a `polymorphic` member registry
 // CHECK-SAME: §26.3
 // CHECK-NOT: expected 'end' to close extension block
+// CHECK: {{.*}}:{{[0-9]+}}:14: `(` opened here has no matching `)`
 // CHECK: {{.*}}:{{[0-9]+}}:{{[0-9]+}}: expected ';' after return statement
 
-// COUNT: {{^2$}}
+// COUNT: {{^3$}}

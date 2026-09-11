@@ -2255,6 +2255,18 @@ void Parser::parsePolymorphicMember(ast::TypeDecl& decl) {
 void Parser::parseAndDiscardExtensionPolymorphicMember() {
     const SourceLocation loc = current_.location;  // the `polymorphic` token
     advance();  // past `polymorphic`
+    // fix #4264 (send-back on #4257, §26.3/A.4, v0.298): remember the `(`
+    // token's own location and whether the discard scan below ever finds
+    // its matching `)`, so an unclosed-paren clause can get a supplementary
+    // note pointing at the unmatched `(` instead of leaving the user to
+    // discover the clause is ALSO malformed only after relocating it.
+    SourceLocation parenLoc{};
+    bool sawOpenParen = false;
+    bool parenMatched = false;
+    if (isPunctuator("(")) {
+        parenLoc = current_.location;
+        sawOpenParen = true;
+    }
     if (consumePunctuator("(")) {
         int depth = 1;
         // fix #4257 (send-back on #4222): also bound the scan by `end`, not
@@ -2287,6 +2299,7 @@ void Parser::parseAndDiscardExtensionPolymorphicMember() {
                 --depth;
                 if (depth == 0) {
                     advance();  // consume the closing ')'
+                    parenMatched = true;
                     break;
                 }
             }
@@ -2299,6 +2312,19 @@ void Parser::parseAndDiscardExtensionPolymorphicMember() {
         "an extension block may not declare a `polymorphic` member "
         "registry — Appendix A.4's `ExtensionMember` grammar admits only "
         "methods and expression-bodied properties (§26.3)");
+    // fix #4264: `sawOpenParen && !parenMatched` means the discard scan
+    // above exited via #4257's `isKeyword("end")`/EOF bound rather than by
+    // finding the matching `)` — i.e. the clause's own parens are
+    // unbalanced, independently of the §26.3 placement rejection above. A
+    // user who follows the §26.3 diagnostic's evident fix (move the clause
+    // onto the extended type's own class body, where `polymorphic(...)` is
+    // legal) would otherwise hit this unrelated-looking parse error only
+    // AFTER making that move, with nothing at the original site to hint the
+    // clause itself is also malformed on its own terms.
+    if (sawOpenParen && !parenMatched) {
+        diagnostics_.report(Severity::Note, parenLoc,
+                             "`(` opened here has no matching `)`");
+    }
 }
 
 std::unique_ptr<ast::MethodDecl> Parser::parseMethodDeclBody(
