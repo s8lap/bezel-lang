@@ -9475,22 +9475,57 @@ void MethodOwnership::collectAliasBorrowSource(const ast::Node& ld) {
 void MethodOwnership::recollectAliasBorrowSourceOnReassign(
         const sema::Symbol* lsym, const ast::Expr& producer,
         std::uint32_t reassignOffset) {
-    // issue #4225: same pre-pass-phase restriction as
-    // collectAliasBorrowSource (states_ is not live yet — see its comment) —
-    // close every still-open window at the reassignment offset (whatever the
-    // OLD alias was, it no longer holds from here on), then open a new one
-    // iff the new RHS is itself a bare identifier naming a different symbol.
-    // A rebind to anything else (a fresh `new`, a call, a ternary, a member
-    // access) closes without reopening — sound, since the real forward walk
-    // resolves those exact shapes to no source too (borrowSourceForExpr's
-    // gates all fail), so states_[lsym].source is cleared there regardless of
-    // whether this map tracks it.
-    auto it = aliasBorrowSourceWindows_.find(lsym);
-    if (it != aliasBorrowSourceWindows_.end())
-        for (RecordBorrowSource& e : it->second)
-            if (e.until == UINT32_MAX) e.until = reassignOffset;
+    // issue #4225 / #4250 (send-back — measured heap-use-after-free): examine
+    // the RHS BEFORE deciding whether to retire any open window, rather than
+    // closing unconditionally and only conditionally reopening as the
+    // original #4225 fix did. That unconditional close was unsound in two
+    // ways #4250 measured directly:
+    //
+    //  (a) SELF-ASSIGNMENT (`y := y;`) is a complete no-op for the tracked
+    //      alias — the RHS evaluates `lsym`'s CURRENT value, so whatever
+    //      `lsym` aliased before this statement, it still aliases after it.
+    //      Closing unconditionally retired a genuinely still-open window;
+    //      the reopen check then called resolveAliasChainRoot(lsym), which,
+    //      having JUST been closed, found no `until == UINT32_MAX` entry to
+    //      follow and returned `lsym` itself — `src == lsym` failed the
+    //      reopen guard, so the window stayed closed forever while real
+    //      dataflow kept tracking the alias. Measured as a real
+    //      heap-use-after-free, method AND lambda scope (issue #4250).
+    //
+    //  (b) Any OTHER RHS shape this pre-scan does not structurally recognize
+    //      as a bare identifier (`this.w`, `x.Field`, `w[0]`, `w!`, and any
+    //      future shape) was ALSO closed unconditionally, on the reasoning
+    //      that "the real forward walk resolves those exact shapes to no
+    //      source too". That reasoning is false: `borrowSourceForExpr`'s own
+    //      Shape 1 (~line 5556 above) DOES recognize MemberAccessExpr /
+    //      NullCondMemberExpr / IndexExpr RHS as alias-producing, and this
+    //      state-free pre-pass has no way to evaluate Shape 1's live-states_
+    //      gates to know whether a given instance actually does. Closing
+    //      anyway silently retired a window real dataflow may still consider
+    //      open — measured for `y := x.other;` (compiles rc=0, zero
+    //      diagnostics, while gate 1's live states_ still says the alias
+    //      holds).
+    //
+    // FAIL CLOSED BY DEFAULT fixes both: only self-assignment (a) and a
+    // bare identifier naming a DIFFERENT symbol (unchanged from before) may
+    // close-then-reopen, and only a `new` expression (the one shape this
+    // fix's own regression tests rely on closing without reopening) may
+    // close outright. EVERY OTHER shape — enumerated here or not — leaves
+    // every open window untouched, so the old, conservative, unbounded
+    // query stays in force for that holder/source pair: always sound (it
+    // can only over-reject, never under-reject), and a shape nobody has
+    // written a case for yet is safe by construction rather than by
+    // accident. // per §28.3, #4225, #4250
+    auto closeOpenWindows = [&] {
+        auto it = aliasBorrowSourceWindows_.find(lsym);
+        if (it != aliasBorrowSourceWindows_.end())
+            for (RecordBorrowSource& e : it->second)
+                if (e.until == UINT32_MAX) e.until = reassignOffset;
+    };
     if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&producer)) {
         if (sema::Symbol* rawSrc = ctx_.exprSymbol(*id)) {
+            if (rawSrc == lsym) return;  // (a) self-assignment: untouched
+            closeOpenWindows();
             // issue #4225: resolve through an intermediate alias holder, same
             // as collectAliasBorrowSource — `y := w;` where `w` itself
             // aliases `x` must record `y`'s new window against `x`, not `w`.
@@ -9498,8 +9533,19 @@ void MethodOwnership::recollectAliasBorrowSourceOnReassign(
             if (src && src != lsym)
                 aliasBorrowSourceWindows_[lsym].push_back(
                     {src, reassignOffset, UINT32_MAX});
+            return;
         }
+        // An identifier with no resolvable symbol: fall through to the
+        // fail-closed default below rather than guessing.
     }
+    if (dynamic_cast<const ast::NewExpr*>(&producer)) {
+        // issue #4250: the one shape this fix explicitly trusts to close
+        // without reopening (see the function comment above).
+        closeOpenWindows();
+        return;
+    }
+    // issue #4250: fail-closed default — every other RHS shape leaves every
+    // open window exactly as it was.
 }
 
 const sema::Symbol* MethodOwnership::resolveAliasChainRoot(

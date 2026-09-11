@@ -301,3 +301,218 @@ BEZEL_TEST(rebind_bounded_consume_freeze_4225,
     BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
     BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, kFreezeWording));
 }
+
+// ===========================================================================
+// Send-back #4250 — the original #4225 fix's `recollectAliasBorrowSourceOnReassign`
+// closed a holder's tracked-alias window UNCONDITIONALLY before examining the
+// new RHS, and only conditionally reopened it for a bare-identifier RHS. Two
+// RHS shapes fell through that gap:
+//
+//  (a) SELF-ASSIGNMENT (`y := y;`): closing unconditionally retired a
+//      genuinely still-open window; the reopen check
+//      (`resolveAliasChainRoot(lsym)`) then found the entry it had JUST
+//      closed, returned `lsym` itself, and the reopen guard (`src != lsym`)
+//      failed — the window stayed closed forever. Measured (#4250) as a REAL
+//      heap-use-after-free, method AND lambda scope.
+//
+//  (b) Any RHS this pre-scan does not structurally recognize as a bare
+//      identifier (`this.w`, `x.Field`, `w[0]`) was ALSO closed
+//      unconditionally, on the (false) reasoning that the real forward walk
+//      resolves those shapes to no source either. `borrowSourceForExpr`'s own
+//      Shape 1 (Ownership_Checks.cpp, ~line 5556) DOES recognize
+//      MemberAccessExpr / NullCondMemberExpr / IndexExpr as alias-producing
+//      when their root is a still-owned local — closing anyway silently
+//      retired a window real dataflow still considered open. Measured
+//      (#4250) as "compiles rc=0, zero diagnostics" for `y := x.other;`.
+//
+// Fix: `recollectAliasBorrowSourceOnReassign` now FAILS CLOSED BY DEFAULT.
+// Only self-assignment (a no-op: touch nothing) and a bare identifier naming
+// a DIFFERENT symbol (close-then-reopen, unchanged) or a `new` expression
+// (close only) are trusted to retire a window; every other RHS shape leaves
+// every open window untouched, so the old unbounded query stays in force —
+// sound by construction rather than by enumeration.
+//
+// Rows below are ASan-run (`runAotChecked`, the full AOT pipeline), not
+// compile-only: the member-access/index shapes' FAIL-WITHOUT symptom is
+// "rc=0, zero diagnostics", which only `runAotChecked` exercises through the
+// same native pipeline the `--full` ASan gate runs these through (a bare
+// `parseAndCheckOwnership` call never reaches codegen or a sanitizer at all).
+//
+// per §28.3, §28.7, §30.14, v0.180, #4225, #4250
+// ===========================================================================
+
+namespace {
+
+// A Res whose `other` PROPERTY (not field) returns `this` — a genuine alias,
+// not merely a structurally-recognized shape with an uninitialized payload.
+// `x.other` therefore really does read through `x`'s own memory, so a
+// FAIL-WITHOUT run (the unfixed `4c65122` mechanism) is a measured
+// heap-use-after-free, not just a static inconsistency.
+const char* kResWithOtherProperty =
+    "module M; "
+    "class Res "
+    "  public tag: int; "
+    "  public constructor(t: int) this.tag := t; end constructor; "
+    "  public property other: Res => this; "
+    "  destructor end destructor; "
+    "end Res; ";
+
+// Same trick for the indexer shape: `x[0]` genuinely aliases `x`.
+const char* kResWithIndexer =
+    "module M; "
+    "class Res "
+    "  public tag: int; "
+    "  public constructor(t: int) this.tag := t; end constructor; "
+    "  public property [i: int]: Res => this; "
+    "  destructor end destructor; "
+    "end Res; ";
+
+}  // namespace
+
+// Row 9 (real execution, method scope, issue #4250's own repro 1):
+// self-assignment (`y := y;`) between the declaration that opens `y`'s
+// window and the later consume must NOT retire it. FAIL-WITHOUT this fix
+// (measured on `4c65122`): accepts rc=0, zero diagnostics, and crashes under
+// ASan with a heap-use-after-free reading `y.tag` after `x`'s reassignment
+// frees the original `Res(5)`. PASS-WITH: rejects with the exact freeze
+// wording, matching the no-rebind-at-all control (row 3) — self-assignment
+// is a no-op for the tracked alias, so it must behave identically.
+BEZEL_TEST(rebind_bounded_consume_freeze_4225,
+           method_self_assignment_before_consume_rejected_4250) {
+    std::string src =
+        std::string(kRes) +
+        "class C "
+        "  public static method Main(): int "
+        "    var x := new Res(5); "
+        "    var y := x; "
+        "    y := y; "
+        "    x := new Res(9); "
+        "    var t := y.tag; "
+        "    x.Dispose(); "
+        "    return t; "
+        "  end Main; "
+        "end C;";
+    JitResult r = runAotChecked(src);
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, kFreezeWording));
+}
+
+// Row 10 (real execution, lambda scope, issue #4250's own repro 2): the same
+// self-assignment shape inside a lambda body, reached via the pre-existing
+// `move`-RHS consuming path. FAIL-WITHOUT: accepts, ASan heap-use-after-free
+// reading `y.tag` after `Sink.Take(move x)` frees the original value.
+// PASS-WITH: rejects with the exact freeze wording.
+BEZEL_TEST(rebind_bounded_consume_freeze_4225,
+           lambda_self_assignment_before_consume_rejected_4250) {
+    std::string src =
+        std::string(kRes) +
+        "class C "
+        "  public static method Main(): int "
+        "    var f := lambda(): int => do "
+        "      var x := new Res(5); "
+        "      var y := x; "
+        "      y := y; "
+        "      var t := Sink.Take(move x); "
+        "      var u := y.tag; "
+        "      return t + u; "
+        "    end; "
+        "    return f(); "
+        "  end Main; "
+        "end C;";
+    JitResult r = runAotChecked(src);
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, kFreezeWording));
+}
+
+// Row 11 (real execution, method scope): `y := x.other;` where `other` is a
+// PROPERTY (not a field) that returns `this` — a genuine self-alias, so a
+// FAIL-WITHOUT run measures an actual heap-use-after-free, not merely a
+// static inconsistency (the send-back's own construction hit a null deref
+// instead, leaving the UAF unconfirmed for this shape; this variant closes
+// that gap). `borrowSourceForExpr`'s Shape 1 recognizes a MemberAccessExpr
+// RHS rooted at a still-owned local as alias-producing regardless of what
+// member is actually read, so `y` genuinely still aliases `x` afterward.
+// PASS-WITH: rejects with the exact freeze wording.
+BEZEL_TEST(rebind_bounded_consume_freeze_4225,
+           method_member_access_reassign_rejected_4250) {
+    std::string src =
+        std::string(kResWithOtherProperty) +
+        "class C "
+        "  public static method Main(): int "
+        "    var x := new Res(5); "
+        "    var y := x; "
+        "    y := x.other; "
+        "    x := new Res(9); "
+        "    var t := y.tag; "
+        "    x.Dispose(); "
+        "    return t; "
+        "  end Main; "
+        "end C;";
+    JitResult r = runAotChecked(src);
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, kFreezeWording));
+}
+
+// Row 12 (real execution, method scope): `y := x[0];` — the send-back's own
+// "not probed" IndexExpr shape, "same by code reading" as the member-access
+// row. The indexer property returns `this`, so this is a genuine self-alias
+// and a FAIL-WITHOUT run measures a real heap-use-after-free. PASS-WITH:
+// rejects with the exact freeze wording.
+BEZEL_TEST(rebind_bounded_consume_freeze_4225,
+           method_index_reassign_rejected_4250) {
+    std::string src =
+        std::string(kResWithIndexer) +
+        "class C "
+        "  public static method Main(): int "
+        "    var x := new Res(5); "
+        "    var y := x; "
+        "    y := x[0]; "
+        "    x := new Res(9); "
+        "    var t := y.tag; "
+        "    x.Dispose(); "
+        "    return t; "
+        "  end Main; "
+        "end C;";
+    JitResult r = runAotChecked(src);
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, kFreezeWording));
+}
+
+// Row 13 (real execution, method scope, CONTROL — not a hole): the
+// send-back's other "not probed" shape, `y := w!;` (a `PostfixBangExpr` RHS)
+// reassigning a holder that previously tracked `x`. Measured: this accepts
+// identically on `6f46a73` (baseline), `4c65122` (the unfixed #4225 commit),
+// and this fix — `borrowSourceForExpr`'s Shape 1 dynamic_casts only match
+// IdentifierExpr / MemberAccessExpr / NullCondMemberExpr / IndexExpr as the
+// RHS's OUTER node; a `PostfixBangExpr` wrapper never enters that arm at
+// all (checked: no `PostfixBangExpr` handling anywhere in Shape 1's body,
+// Ownership_Checks.cpp:5459-5986), so `states_[y].source` is unconditionally
+// CLEARED by the real forward walk the moment `y := w!;` executes — gate 1's
+// own live `states_[holder].source == consumed` check (unmodified by any of
+// this) excludes `y` from the holder loop entirely, before this fix's window
+// (open or closed) is ever consulted. This fix's fail-closed default leaves
+// the window open here too (a `PostfixBangExpr` is not a recognized
+// close-safe shape either), but that is inert: gate 1 already retired the
+// holder. Kept as a control asserting the accept is unaffected, not folded
+// into the "must reject" rows above. per §28.3, #4250
+BEZEL_TEST(rebind_bounded_consume_freeze_4225,
+           method_bang_reassign_unrelated_symbol_control_4250) {
+    std::string src =
+        std::string(kRes) +
+        "class C "
+        "  public static method Main(): int "
+        "    var x := new Res(5); "
+        "    var w: Res? := new Res(7); "
+        "    var y := x; "
+        "    y := w!; "
+        "    x := new Res(9); "
+        "    var t := y.tag; "
+        "    x.Dispose(); "
+        "    w!.Dispose(); "
+        "    return t; "
+        "  end Main; "
+        "end C;";
+    JitResult r = runAotChecked(src);
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 7);
+}

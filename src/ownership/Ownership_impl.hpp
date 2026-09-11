@@ -2674,18 +2674,36 @@ private:
     // the measured failure of an earlier draft that tried). Called from the
     // freeze pre-pass at each LocalDecl / LocalConstDecl. // per §28.3, #4225
     void collectAliasBorrowSource(const ast::Node& ld);
-    // issue #4225: re-collect a plain alias holder's tracked-source window
-    // when it is REASSIGNED (`y := <producer>;`) at source offset
-    // `reassignOffset` — the plain-alias sibling of
-    // recollectRecordBorrowSourceOnReassign. Closes every still-open window
-    // at `reassignOffset` (the old alias is retired there) and opens a new
-    // one iff the new RHS is itself a bare identifier naming a different
-    // symbol — the same purely structural match collectAliasBorrowSource
-    // uses, for the same pre-pass-phase reason (states_ is not live yet).
+    // issue #4225 / #4250 (send-back — measured heap-use-after-free):
+    // re-collect a plain alias holder's tracked-source window when it is
+    // REASSIGNED (`y := <producer>;`) at source offset `reassignOffset` —
+    // the plain-alias sibling of recollectRecordBorrowSourceOnReassign.
+    // FAILS CLOSED BY DEFAULT: only two RHS shapes are trusted to retire
+    // (close-without-reopening, or close-then-reopen) a window —
+    //   (1) self-assignment (the RHS names `lsym` itself) is a no-op: it
+    //       touches nothing, since assigning a holder to its own current
+    //       value cannot change what it aliases;
+    //   (2) a bare identifier naming a DIFFERENT symbol closes then opens a
+    //       new window against the chain-resolved root (unchanged from the
+    //       original #4225 fix);
+    //   (3) a `new` expression closes without reopening (the one shape this
+    //       fix's own regression tests rely on).
+    // EVERY OTHER RHS shape — `this.w`, `x.Field`, `w[0]`, `w!`, a call, and
+    // any future shape nobody has written a case for — leaves every open
+    // window untouched, so the old unbounded, conservative query stays in
+    // force for that holder/source pair. #4250 measured that the prior
+    // "close unconditionally, reopen only for a bare identifier" default
+    // silently retired a window real dataflow still considered open, for
+    // both self-assignment (a live heap-use-after-free) and member-access
+    // RHS (`borrowSourceForExpr`'s own Shape 1 recognizes
+    // MemberAccessExpr/NullCondMemberExpr/IndexExpr as alias-producing;
+    // this state-free pre-pass cannot evaluate those live-states_ gates to
+    // know whether a given instance actually does, so it must not guess).
     // Called only at depth 0 (an unconditional rebind), matching
     // recollectRecordBorrowSourceOnReassign's own §1741 depth-0 restriction:
     // a conditional rebind might not execute, so the old window must stay
-    // open on the not-taken path (sound over-rejection). // per §28.3, #4225
+    // open on the not-taken path (sound over-rejection). // per §28.3,
+    // #4225, #4250
     void recollectAliasBorrowSourceOnReassign(const sema::Symbol* lsym,
                                               const ast::Expr& producer,
                                               std::uint32_t reassignOffset);
