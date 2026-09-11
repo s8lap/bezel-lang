@@ -5764,6 +5764,27 @@ void MethodOwnership::handleLocalDecl(const ast::LocalDecl& ld) {
                 bs.sym = src;
                 states_[lsym].source = bs;
             }
+            // fix #4236 / §28.3, §28.6 (v0.298): `disposeAliasSource` — see
+            // its header comment (OwnershipState.hpp) for why this is a
+            // dedicated field rather than a reuse of `source` above.
+            // Narrowly recognizes ONLY a bare IDENTIFIER read (never a
+            // member/index/other projection — those can be value-typed
+            // copies, and this check intentionally does not consult
+            // isBorrowableType to tell) whose resolved symbol is, right now,
+            // a still-Owned tracked local (isOwnedTrackedLocal — the same
+            // authority borrowSourceForExpr's own Shape 1 uses internally,
+            // just not gated on returnedExprMayBorrow first). This is sound
+            // for a bare identifier specifically: an identifier read of a
+            // class-, interface-, or collection-typed OWNED local is always
+            // a reference alias, never a copy (§28.3 K1.5) — the value/copy
+            // ambiguity the gate exists to resolve cannot arise here.
+            if (auto* rid =
+                    dynamic_cast<const ast::IdentifierExpr*>(
+                        ld.initializer.get())) {
+                sema::Symbol* rsym = ctx_.exprSymbol(*rid);
+                if (isOwnedTrackedLocal(rsym))
+                    states_[lsym].disposeAliasSource = rsym;
+            }
         }
     }
     // #2073 / §28.10 (v0.215): vacuous-pin lint. The `using var` keyword admits
@@ -6655,6 +6676,20 @@ void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
         // and CLEARED otherwise so a stale source does not linger across a
         // rebind to a non-borrowing value (e.g. `b := null;`).
         sema::Symbol* src = borrowSourceForExpr(*as.value);
+        // fix #4236 (§28.3, §28.6, v0.298): same recompute-before-the-loop
+        // discipline for `disposeAliasSource` (OwnershipState.hpp) — a bare
+        // identifier RHS whose root is, right now, a still-Owned tracked
+        // local. Recomputed on every reassignment so a rebind away from an
+        // alias (`b := a; b := c;`) does not leave a stale alias-source
+        // pointing at `a`, and a rebind ONTO one (`b := someBorrow; b := a;`)
+        // newly records it — mirroring `src` above exactly, just via the
+        // ungated bare-identifier check (see handleLocalDecl's sibling
+        // comment for why this does not go through borrowSourceForExpr).
+        sema::Symbol* aliasSrc = nullptr;
+        if (auto* rid = dynamic_cast<const ast::IdentifierExpr*>(as.value.get())) {
+            sema::Symbol* rsym = ctx_.exprSymbol(*rid);
+            if (isOwnedTrackedLocal(rsym)) aliasSrc = rsym;
+        }
         for (auto& [sym, st] : states_) {
             if (sym->name != id->name) continue;
             // §22.3 + §28.8: assigning an owned value to an `out owned`
@@ -6869,6 +6904,9 @@ void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
             } else {
                 st.source.reset();
             }
+            // fix #4236: mirror the reset/set above for disposeAliasSource.
+            st.disposeAliasSource =
+                (aliasSrc && aliasSrc != sym) ? aliasSrc : nullptr;
             return;
         }
         // §28.8.1 / #825: name not found in local states — this bare identifier
@@ -7895,6 +7933,50 @@ void MethodOwnership::checkDisposeReceiverOwnership(const ast::Expr& recv,
                         "collection directly, or bind the item to an owned "
                         "location first");
                 }
+                return;
+            }
+            // fix #4236 / §28.6 "Who may call Dispose()" + §28.3 "Ownership
+            // state of locals" (v0.298): the recorded gap above is that a
+            // plain-local `Borrowed` state is indistinguishable from an
+            // owned disposable call result IN GENERAL — but
+            // `states_[sym].disposeAliasSource` (see its header comment,
+            // OwnershipState.hpp) already carries a NARROWER, unambiguous
+            // signal for exactly one shape: a bare IDENTIFIER read whose
+            // root, at THIS local's own declaration, was a still-Owned
+            // tracked local — set at the LocalDecl (handleLocalDecl), never
+            // for a CallExpr initializer. So a local with a recorded
+            // `disposeAliasSource` is a genuine alias of an identifiable
+            // owned binding: `var b: Array<int> := a;` is an unmarked read
+            // of the named owned binding `a`, which §28.3's *Ownership state
+            // of locals* states is ALWAYS a borrow ("A read of a named owned
+            // binding on the right-hand side is a borrow unless it carries
+            // the explicit transfer marker") — so `b.Dispose()` must be
+            // rejected under §28.6's "Dispose() through a borrow is a
+            // compile error", exactly as a borrowed parameter or field read
+            // already is above. Pre-fix, the collection-dispatch codegen
+            // arms (LlvmBackend_Calls2.cpp's emitExplicitDisposeChain, #4221)
+            // freed `a`'s backing through the alias `b` with no diagnostic,
+            // and `a`'s own scope-end auto-drop then freed it again — a
+            // double-free. This narrows the gap by exactly one shape and
+            // leaves the call-result gap (no recorded source) untouched, so
+            // the enumerator/subscription/unwind admissions the gap note
+            // documents are unaffected — this check never fires for them.
+            if (auto it = states_.find(sym); it != states_.end() &&
+                it->second.disposeAliasSource) {
+                sema::Symbol* srcSym = it->second.disposeAliasSource;
+                report(
+                    Severity::Error, loc,
+                    std::string("cannot call `Dispose()` on `") +
+                    std::string(id->name) +
+                    "`: it is a borrow (an alias) of `" +
+                    std::string(srcSym->name) +
+                    "`, which still owns it (§28.6 \"Who may call "
+                    "Dispose()\", §28.3 \"Ownership state of locals\") — an "
+                    "unmarked assignment from a named owned binding is "
+                    "always a borrow; dispose `" +
+                    std::string(srcSym->name) +
+                    "` instead, or bind `" + std::string(id->name) +
+                    "` with `move` to take ownership");
                 return;
             }
             // A plain `var`/`using var` local (LocalDecl decl), or a local

@@ -47,6 +47,27 @@ struct LocalOwnership {
     OwnershipState state = OwnershipState::Uninitialized;
     // Populated when state == Borrowed.
     std::optional<BorrowSource> source;
+    // fix #4236 / §28.3 "Ownership state of locals", §28.6 "Who may call
+    // Dispose()" (v0.298): a DEDICATED, narrower sibling of `source` above,
+    // consumed ONLY by checkDisposeReceiverOwnership. Populated at this
+    // local's LocalDecl (never re-derived later, so it is immune to the
+    // source's own later state changes — e.g. a subsequent `move` of it)
+    // when the declaration is a plain (non-`using`, non-`owned`-marked) bare
+    // IDENTIFIER read whose resolved symbol was, AT THAT DECLARATION POINT,
+    // a still-Owned tracked local. Deliberately NOT reused from `source`
+    // (borrowSourceForExpr's Shape 1): that field's populate gate
+    // (returnedExprMayBorrow -> isBorrowableType) answers FALSE for every
+    // compiler-builtin collection (Array/Dictionary/Set/LinkedList/...) — a
+    // Named TypeRef with a null `declaration` is the same shape
+    // isBorrowableType uses for an unresolved generic parameter, and its
+    // null-declaration branch recognizes only the builtin-exception
+    // hierarchy positively — so `source` is never set for a collection-typed
+    // alias local at all (measured: #4236's repro). Widening `source`
+    // itself would also change every OTHER consumer of it (the borrow-
+    // escape-on-return/-store checks), an unvalidated, unrelated blast
+    // radius this fix does not take on; a separate field keeps the change
+    // exactly as narrow as the bug it fixes.
+    sema::Symbol* disposeAliasSource = nullptr;
     // For Owned: a back-pointer to the AST node where the obligation
     // was created (the `:= EXPR` site), used for diagnostic notes.
     const ast::Node* obligationOrigin = nullptr;
