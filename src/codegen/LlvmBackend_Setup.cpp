@@ -23343,6 +23343,75 @@ struct StringEscapeWalker {
                     ctx.exprSymbol(*callee));
             }
         }
+        // fix #4254 (§9.7 "Records and disposal" / §28.9 "Runtime-managed
+        // types", v0.298): the #1430 SOUNDNESS note two screens below claims
+        // its four onward-ownership channels are exhaustive — "a field store
+        // retains ..., a return of the param mints ..., a closure capture
+        // retains ..., and an onward pass repeats this rule one level down".
+        // They are not: a callee whose declared return type is a RECORD or a
+        // value-like CHOICE can embed the plain-parameter argument into a
+        // freshly-constructed VALUE and return THAT, going through NEITHER
+        // channel. A positional record's auto-generated constructor
+        // (`buildRecordValue`'s fast path, LlvmBackend_Exprs2.cpp) stores a
+        // positional argument into its field with a bare `CreateStore` — no
+        // `emitStringRetain` at all (unlike an explicit `this.f := x;` field
+        // store, which DOES retain a borrow via `lowerStringFieldStore`); a
+        // choice case-constructor argument is the identical raw-memcpy shape
+        // (already the reason the #2115 choice walk below never enables
+        // `stringReleaseMode` at all — this is that fact's mirror image for
+        // the STRING-typed-PARAMETER direction, where `stringReleaseMode` IS
+        // active). So `Helper.MakeInner(s: string): Box<string> return new
+        // Box<string>(s); end MakeInner;` called as `var inner :=
+        // Helper.MakeInner(s);` returns a value whose `Value` field ALIASES
+        // the caller's `s` with no independent +1 — the #1430 relaxation
+        // nonetheless marked `s` a safe, call-bounded read, arming `s`'s own
+        // scope-end release. MEASURED (issue #4254): `s` (and a further
+        // `inner`) scoped inside a `do ... end;` block narrower than an
+        // `outer := new Box<Box<string>>(inner)` declared outside it —
+        // `outer.Value.Value.Length` read after the block — is a genuine
+        // `AddressSanitizer: heap-use-after-free` (freed by the block's own
+        // scope-end release, in `main`; the identical program with the
+        // INLINE control `new Box<Box<string>>(new Box<string>(s))` in place
+        // of the helper call is ASan-clean). A flat, single-scope caller
+        // never observes the dangling alias (the read always precedes
+        // scope-end disposal there), but the accounting defect — and the
+        // same risk for any caller whose scopes nest this way — is identical
+        // regardless of scope shape.
+        //
+        // Narrow the relaxation rather than add a retain to the record/
+        // choice construction fast paths: retroactively retaining there
+        // would have to be undone for the many argument shapes already
+        // proven producer-owned by #2448/#2866/#3974's own case analysis,
+        // trading this UAF-shaped risk for a double-free-shaped one over a
+        // much larger surface. Declining the relaxation only WIDENS the
+        // pre-existing leak-over-UAF safe default for this one combination
+        // — a string argument to a plain method whose return type is a
+        // record/choice — costing a possible extra leak, never new
+        // unsoundness (§28.9's "how [runtime-managed reclamation happens] is
+        // not specified" leaves that leak within the spec's own silence).
+        //
+        // An IMPORTED method (`ms->decl == nullptr`) is not walked here —
+        // its return type is not re-derivable from this AST-only read, so
+        // the relaxation stays admitted, UNCHANGED from before this fix, on
+        // that axis. Filed as a follow-up rather than widened into this fix
+        // (CLAUDE.md "no while we're at it" — the local axis is #4254's own
+        // measured repro).
+        bool calleeReturnMayAliasArgUnretained = false;
+        if (stringReleaseMode && ms) {
+            // SEAM-DEBT: #4260 AST-only — null for an imported method (see
+            // this block's own comment above); the relaxation stays
+            // admitted, unchanged, for that axis.
+            const auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
+            if (md && md->returnType) {
+                const sema::TypeRef* crt = ctx.resolvedType(*md->returnType);
+                if (crt && crt->kind == sema::TypeRef::Kind::Named &&
+                    crt->declaration &&
+                    (crt->declaration->kind == ast::TypeDeclKind::Record ||
+                     crt->declaration->kind == ast::TypeDeclKind::Choice)) {
+                    calleeReturnMayAliasArgUnretained = true;
+                }
+            }
+        }
         // fix #3886 (§4.8/§4.9/§28.9): the walkCallArgs twin of fix #3872's
         // IndexExpr arm above (in this same struct). #3872 taught the walker
         // that a bare string-local KEY argument to a built-in
@@ -23476,6 +23545,7 @@ struct StringEscapeWalker {
             // soundness is not asserted by any test, and the conservative
             // direction is leak-over-UAF, the safe default).
             if ((stringReleaseMode || borrowingArrayMode) && ms &&
+                !calleeReturnMayAliasArgUnretained &&
                 a.modifier.empty() && a.name.empty() &&
                 i < ms->params.size() && isTargetIdent(a.value.get())) {
                 auto* ps =
