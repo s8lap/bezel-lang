@@ -9365,6 +9365,33 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
                 // Ownership.cpp ~6650) so it observes the pre-reassignment
                 // Owned state of any source local.
                 sema::Symbol* src = borrowSourceForExpr(*as->value);
+                // fix #4269 (§28.3/§28.6, v0.298): the `disposeAliasSource`
+                // twin of `src` above — this arm ports `handleAssignment`'s
+                // `st.source` recompute (fix #4217, below) but never got the
+                // sibling `disposeAliasSource` recompute fix #4236 added to
+                // the METHOD-scope arm (Ownership.cpp ~6717-6731,~6955-6957).
+                // Left stale, a lambda-body local's DECLARATION-time alias
+                // fact (set by `handleLocalDecl`, which this pre-pass's
+                // LocalDecl arm already calls — see
+                // `applyUsingVarBorrowPinInLambdaStmt`'s LocalDecl case above)
+                // survives a later reassignment to a FRESH owned value
+                // unchanged, so `checkDisposeReceiverOwnership` still finds
+                // the old alias source and rejects a legal `.Dispose()` on
+                // the new value: `var x := new Res(5); var y := x; y := new
+                // Res(1); y.Dispose();` FALSE-REJECTS inside a lambda body
+                // ("cannot call `Dispose()` on `y`: it is a borrow (an alias)
+                // of `x`") while the byte-identical method-scope spelling is
+                // correctly accepted (#4236's own arm clears it). Mirrors
+                // `handleAssignment`'s aliasSrc computation exactly: a bare
+                // IDENTIFIER RHS whose resolved symbol is, right now, a
+                // still-Owned tracked local. // per §28.3, §28.6, v0.298,
+                // #4269
+                sema::Symbol* aliasSrc = nullptr;
+                if (auto* rid = dynamic_cast<const ast::IdentifierExpr*>(
+                        as->value.get())) {
+                    sema::Symbol* rsym = ctx_.exprSymbol(*rid);
+                    if (isOwnedTrackedLocal(rsym)) aliasSrc = rsym;
+                }
                 for (auto& [sym, st] : states_) {
                     if (sym->name != tid->name) continue;
                     if (st.state == OwnershipState::Owned && st.maybeConsumed &&
@@ -9440,6 +9467,11 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
                     } else {
                         st.source.reset();
                     }
+                    // fix #4269: mirror the reset/set above for
+                    // disposeAliasSource — see this arm's own #4269 comment
+                    // above (~line 9364) for why this line was missing.
+                    st.disposeAliasSource =
+                        (aliasSrc && aliasSrc != sym) ? aliasSrc : nullptr;
                     break;
                 }
             }
