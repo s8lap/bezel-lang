@@ -62,20 +62,35 @@
 //     is a safe no-op. The issue's "possible double-dispose" framing does not
 //     hold up under measurement — it is not a crash on the disposed arm.
 //   * The single-shot (unamplified) READ variant (`var t := y.tag;` in place
-//     of the second `.Dispose()`) reproduces the issue's own "16 byte(s)
-//     leaked in 1 object(s)" LSan report — but amplifying the SAME shape to
-//     200 loop iterations (`repro2b_leak_amplified.bzl`, this lane's scratch)
-//     does NOT leak more — it SEGVs:
+//     of the second `.Dispose()`) is the issue's OWN "Measured runtime
+//     behaviour (single-shot...)" repro, which its filing reported as a
+//     "16 byte(s) leaked in 1 object(s)" LSan report and nothing else.
+//     RE-MEASURED (send-back review of this commit, then independently
+//     re-measured a second time by the C3-4247-fixback lane): the issue's
+//     verbatim single-shot repro run 20 times, isolated, against the
+//     PARENT commit's rebuilt binary — **20 of 20 deterministic SEGV**, not
+//     one leak:
 //       AddressSanitizer: SEGV on unknown address 0x00000000000c
 //       ==...==The signal is caused by a READ memory access.
 //       #0 ... in main
-//     i.e. a genuine heap-use-after-free crash once the freed `Res(1)` block
-//     is reused by a later allocation, not merely a leak. The single-shot
-//     "leak" was a coincidence of the allocator not having reused that block
-//     yet. So the correct characterization is: **a real use-after-dispose
-//     read crash, with an occasional-leak presentation depending on
-//     allocator timing** — not a double-dispose, and not reliably "just" a
-//     leak either.
+//     Amplifying the SAME shape to 200 loop iterations
+//     (`repro2b_leak_amplified.bzl`, this lane's scratch) reproduces the
+//     identical signature (same near-null address, same READ access, same
+//     frame). So the single-shot repro is itself a deterministic crash on
+//     this tree/hardware, not merely a leak, and NOT an allocator-timing
+//     coincidence revealed only by amplification — amplification was never
+//     needed to see it here. The near-null address and total determinism
+//     point at a read through an explicitly nulled disposed-flag slot,
+//     which is consistent with a crash on every run rather than reuse of a
+//     freed block on only *some* runs. The issue's own one-shot "leaked"
+//     report is a plausible outcome elsewhere (LSan's conservative stack
+//     scan is real, §30 of this run's LANE_RULES), but it is not what this
+//     lane's or this send-back's repeated measurement produced — the two
+//     disagree, and that disagreement is itself worth recording rather than
+//     papering over with an "allocator timing" story neither measurement
+//     actually observed. Either way, the correct characterization is: **a
+//     real use-after-dispose read crash** — not a double-dispose, and not
+//     reliably "just" a leak.
 //
 // THE FIX, and why REJECTION (not "make it dispose correctly on the
 // not-taken path") is the right response: a program that never touches the
@@ -124,9 +139,14 @@
 //
 // Files touched: src/ownership/OwnershipState.hpp (`disposedOnSomePath`
 // field comment), src/ownership/Ownership_Checks.cpp (`joinInto`'s
-// same-state branch ~8590-8610 and its new `borrowedDischargedSplit` arm
-// ~8797-8876 in the fixed tree; `checkRead`'s `disposedOnSomePath` consumer
-// ~2581-2596).
+// same-state branch 8606-8625 and its new `borrowedDischargedSplit` arm
+// 8812-8889 in the fixed tree; `checkRead`'s `disposedOnSomePath` consumer
+// 2582-2607). Re-measured directly against the fixed tree by the
+// C3-4247-fixback send-back lane — the original commit's `~8590-8610` /
+// `~8797-8876` citations were off by ~15-35 lines (the `~8797-8876` range
+// ended BEFORE the `const bool borrowedDischargedSplit = ...` declaration
+// it was meant to cover); do not re-copy these without re-measuring, since
+// any further edit to this file shifts everything below it again.
 
 #include <string>
 

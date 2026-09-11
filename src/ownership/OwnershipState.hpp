@@ -228,8 +228,9 @@ struct LocalOwnership {
     // `markDisposedByName`, all unconditional on state) or was never gated on
     // Owned in the first place. The lambda-capture read check
     // (Ownership_Checks.cpp's `disposedOnSomePathAtLiteral`) is DELIBERATELY
-    // NOT widened — a captured Borrowed+disposedOnSomePath local is a known,
-    // separately-filed gap, not this join.
+    // NOT widened — a captured Borrowed+disposedOnSomePath local is a real,
+    // reachable use-after-dispose (confirmed heap-UAF at 200x amplification)
+    // left OPEN as issue 4313, not this join.
     bool disposedOnSomePath = false;
 };
 

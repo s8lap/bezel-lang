@@ -8911,8 +8911,10 @@ void MethodOwnership::joinInto(std::unordered_map<sema::Symbol*, LocalOwnership>
         // so nothing downstream relied on an Owned-only invariant. `checkRead`
         // is widened alongside this join change to actually consult the flag
         // on a Borrowed record (see its own comment); the lambda-capture
-        // sibling is NOT widened here — deliberately out of scope, filed
-        // separately (§21.1-shaped capture gap, not this join) — and neither
+        // sibling is NOT widened here — deliberately out of scope: a captured
+        // Borrowed+disposedOnSomePath local is a real, reachable
+        // use-after-dispose (confirmed heap-UAF at 200x amplification) left
+        // OPEN as issue 4313, not this join — and neither
         // is the symmetric Borrowed ⊓ MovedFrom split (a `move`/`owned`-
         // transfer discharge of the rebound value instead of `.Dispose()`),
         // which this fix's measured repro does not exercise and which would
