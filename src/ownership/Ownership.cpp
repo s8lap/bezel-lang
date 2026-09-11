@@ -3116,6 +3116,19 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
                 sema::Symbol* rsym = ctx_.exprSymbol(*rid);
                 if (isOwnedTrackedLocal(rsym)) aliasSrc = rsym;
             }
+            // fix #4283 (§28.3/§28.6, v0.298): mirrors `handleLocalDecl`'s own
+            // #4283 widening one arm above — see that site's comment for the
+            // full rationale (`isOwnedTrackedLocal` cannot see a FieldSymbol
+            // at all, bare or member-access; `exprIsOwnedFieldRead` is the
+            // existing authority that answers from the leaf field's `owned`
+            // modifier regardless of chain depth or receiver identity).
+            // `const b := this._arr; b.Dispose();` reproduced the identical
+            // `bz_array_free` double-free (measured) as the `var` shape,
+            // exactly as #4236's original identifier-alias bug did for
+            // `const` before the send-back above added this arm's parallel
+            // write at all.
+            if (!aliasSrc && exprIsOwnedFieldRead(*lc->value))
+                aliasSrc = ctx_.exprSymbol(*lc->value);
             if (src || aliasSrc) {
                 if (sema::LocalSymbol* lsym = findLocalSymbol(*lc)) {
                     LocalOwnership lo;
@@ -5871,6 +5884,64 @@ void MethodOwnership::handleLocalDecl(const ast::LocalDecl& ld) {
                 sema::Symbol* rsym = ctx_.exprSymbol(*rid);
                 if (isOwnedTrackedLocal(rsym))
                     states_[lsym].disposeAliasSource = rsym;
+            }
+            // fix #4283 (§28.3 "Ownership state of locals" / §28.6 "Who may
+            // call Dispose()", v0.298): the IdentifierExpr check above can
+            // only ever populate `disposeAliasSource` from a LOCAL/
+            // PARAMETER symbol — `isOwnedTrackedLocal` reads `states_`,
+            // which a FieldSymbol never occupies (fields are object state,
+            // not scope state, per §K9), so it silently answers false for
+            // EVERY field read, bare (`_arr`, implicit `this`) or member-
+            // access (`this._arr`, `p._arr`, `this._a._b`, a qualified
+            // static field) alike — this is true even when the initializer
+            // IS an IdentifierExpr (a bare owned-field read), not only for
+            // the MemberAccessExpr shapes the dynamic_cast above rejects by
+            // construction. §28.6's field-read arm (this function's own
+            // dispose-receiver check, above in checkDisposeReceiverOwnership)
+            // already establishes that a field read is a borrow — disposable
+            // only through the direct `this.<owned>` idiom (§28.7's dispose-
+            // then-assign / #1230 destructor pattern) — so aliasing it into a
+            // local and disposing the LOCAL must be rejected identically to
+            // #4236/#4268's local/parameter alias case; it was not, because
+            // this LocalDecl site never populated `disposeAliasSource` for a
+            // field root at all. Measured (issue #4283): `var b := this._arr;
+            // b.Dispose();` — and the identical `using var` spelling —
+            // compiled clean and double-freed in `bz_array_free`,
+            // byte-for-byte the #4236/#4268 crash signature.
+            //
+            // Fixed by feeding the SAME already-validated authority
+            // `checkDisposeReceiverOwnership`'s own field-read arm uses
+            // (LANE_RULES §6/§25: reuse, don't re-derive) —
+            // `exprIsOwnedFieldRead` (§28.3, issue #398) — which already
+            // treats a bare identifier (implicit `this.f`) and an explicit
+            // `recv.f`/`this.f.g` MemberAccessExpr chain of ANY depth
+            // identically, and answers purely from the LEAF field's `owned`
+            // modifier, so it needs no `states_`-style liveness tracking: an
+            // `owned` field's declared type is always a heap-owning
+            // reference type (never a value type copied by read), so a read
+            // of it is always a reference alias — the same §28.3 K1.5
+            // reasoning the bare-identifier/local case above relies on,
+            // applied to the field axis. This is a SEPARATE `if` (not an
+            // `else`) from the IdentifierExpr branch above: the two can never
+            // both match (a FieldSymbol always fails `isOwnedTrackedLocal`,
+            // and a Local/ParameterSymbol always fails `exprIsOwnedFieldRead`
+            // — disjoint symbol kinds), so this only ever adds coverage,
+            // never overrides the branch above.
+            //
+            // SCOPE (LANE_RULES §6, deliberate): only the DECLARATION sites
+            // (this function and the parallel `LocalConstDecl` arm) are
+            // widened here. `handleAssignment` and the lambda-body
+            // reassignment arm are NOT touched — `fix #4272` (banked this
+            // same batch) added reassignment-axis test rows
+            // (`y := h.item; y.Dispose();`) that deliberately pin the
+            // CURRENT accept-and-runtime-protected reassignment behavior;
+            // widening `handleAssignment` too would flip those rows to a
+            // compile-time rejection and needs its own accept-side sweep —
+            // filed as a follow-up (issue TBD, see commit body) rather than
+            // folded in here.
+            if (exprIsOwnedFieldRead(*ld.initializer)) {
+                if (sema::Symbol* fsym = ctx_.exprSymbol(*ld.initializer))
+                    states_[lsym].disposeAliasSource = fsym;
             }
         }
     }
