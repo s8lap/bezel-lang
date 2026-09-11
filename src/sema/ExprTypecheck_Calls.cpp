@@ -12593,7 +12593,22 @@ void ExprTC::checkBuiltinCollectionCallArgs(const ast::CallExpr& ce) {
         // at run time", which is false for the value slot and would send the
         // next reader hunting a fault that program does not produce.
         if (pos == 0 && (
-            (m == "Add"    && (colName == "Set" || colName == "SortedSet" ||
+            // fix #4310 (§5.1/§11.2): `Array<T>.Add(item: T)` (stdlib §4.4)
+            // is a plain (non-`owned`) parameter exactly like the families
+            // already listed here, but was left out — the header comment a
+            // few screens up ("Two §4.1 slots stay UNcovered … `ICollection
+            // <T>.Add(item: T)` — the pos-0 `Add` block is name-gated to the
+            // concrete families") already named this as a known gap.
+            // Without it, neither the §7 nullability check NOR the §5.1/
+            // §11.2 conformance check (`checkAssignable`, the SAME call this
+            // whole helper feeds) ever ran for `Array<T>.Add()`'s argument,
+            // so a class that does not implement the element interface was
+            // silently accepted (measured, #4310/#4302). `OwningArray` is
+            // deliberately NOT added: its `Add(owned item: T)` carries the
+            // §22.3 `owned` modifier and is already skipped by the modifier
+            // guard above, exactly like `OwningDictionary`/`OwningSet`.
+            (m == "Add"    && (colName == "Array" ||
+                               colName == "Set" || colName == "SortedSet" ||
                                colName == "LinkedList" ||
                                colName == "Dictionary" ||
                                colName == "OwningDictionary" ||
@@ -13110,6 +13125,18 @@ void ExprTC::checkArgsAgainstParams(
                         ctx_.diagnostics(), a.value->span.begin, paramTy);
                 continue;
             }
+            // fix #4310 (§5.1/§11.2): the general call/constructor-argument
+            // twin of `checkCollectionLiteralElementAssignability`'s other
+            // call sites (LocalDecl/FieldDecl/PropertyDecl/ReturnStmt,
+            // ExprTypecheck.cpp) — this is the path a record's primary-
+            // constructor call goes through, so it is also what makes an
+            // interface element in a record field's initializer conform
+            // (e.g. `new RecordType([new Widget3(s)])` for `record
+            // RecordType(Items: [1]IHolder)`). Same reasoning: the
+            // admissibility gate above sets the literal's own exprType to
+            // `paramTy`, so the `checkAssignable` call just below would
+            // trivially pass without this.
+            checkCollectionLiteralElementAssignability(*cl, paramTy);
         }
         checkAssignable(ctx_.exprType(*a.value),
                         paramTy,

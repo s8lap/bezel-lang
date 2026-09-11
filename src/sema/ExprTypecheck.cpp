@@ -12760,6 +12760,93 @@ void ExprTC::checkBorrowingFamilyLiteralElements(
                  /*owningFamilyIsARemedy=*/!userBorrowTarget, valueElementTy);
 }
 
+// fix #4310 (§5.1 *Implicit conversions* / §11.2 *Interface declaration*,
+// v0.298): the per-ELEMENT sibling of `checkBorrowingFamilyLiteralElements`
+// above. §11.2 states conformance as: "A class implements an interface
+// implicitly: by declaring matching public members" — read together with
+// §11.1's "A class may declare ... any number of interfaces" (the `: I1,
+// I2` inheritance-clause list a conforming class must appear in): the
+// "implicitly" clause waives PER-MEMBER `override`/qualification syntax, it
+// does not waive appearing in that list. This is not a fresh reading
+// introduced by this fix — it is the interpretation `checkAssignable`'s
+// existing `isSubtype` walk (over `TypeSymbol::baseTypes`, populated from
+// the inheritance clause) already enforces, MEASURED correct at a plain
+// variable declaration and an ordinary call argument before this fix
+// touched anything.
+//
+// MEASURED root cause: `checkAssignable` (this file, ~L3828) already
+// performs the §5.1 conversion check — including the class→interface §11.2
+// nominal-conformance test via `isSubtype` — and it correctly fires for a
+// plain variable declaration and an ordinary call argument. But every call
+// site that types a collection literal against a known target
+// (LocalDecl/FieldDecl/PropertyDecl/ReturnStmt below, and the call-argument
+// site in ExprTypecheck_Calls.cpp) sets the literal's OWN `exprType` to the
+// TARGET type via `ctx_.setExprType` before running the general
+// `checkAssignable(ctx_.exprType(*initializer), target, …)` call that
+// follows — so that call compares the target type to itself and trivially
+// passes, never descending into the literal's element expressions. A class
+// that never lists the target interface in its inheritance clause is
+// therefore silently accepted into an interface-typed collection element,
+// and interface dispatch on it reads a null itable slot (SIGSEGV, #4302).
+//
+// `checkAssignable` itself was not the right place to fix this: it has no
+// way to reach a `CollectionLiteralExpr`'s per-element sub-expressions from
+// a bare `TypeRef* from` (the literal's own already-collapsed type), and
+// giving it that reach would require threading the AST node through every
+// one of its ~40 call sites. Reusing it PER ELEMENT here, instead of
+// re-deriving the §5.1/§11.2 judgment, keeps exactly one place that decides
+// "is type A assignable to type B" (per this run's lane rules §6:
+// duplicated classification predicates are the dominant defect generator
+// in this codebase — not a language-spec citation).
+//
+// Scope: an inline array (`[N]T`) checks each element against `arrayElement`,
+// recursing when an element is itself a nested literal (`[1]Array<IHolder>`,
+// §4310's nested case) — the recursive call re-derives the SAME judgment one
+// level down rather than assuming the outer check covers it. A §15.4
+// builtin-collection head (`Array<T>`, `OwningArray<T>`, `Set<T>`, …,
+// `Dictionary<K, V>`, `OwningDictionary<K, V>`) checks each element/key
+// against `genericArgs[0]` and, for the dict form, each value against
+// `genericArgs[1]`. A user type (`declaration != nullptr`, e.g. a
+// `FromCollectionLiteral` opt-in) is out of scope — its element type is not
+// exposed the same way and #4310 did not measure a gap there.
+void ExprTC::checkCollectionLiteralElementAssignability(
+    const ast::CollectionLiteralExpr& cl, TypeRef* target) {
+    if (!target) return;
+    auto checkOne = [&](const ast::Expr* el, TypeRef* elemTarget,
+                        const char* position) {
+        if (!el || !elemTarget) return;
+        if (auto* nestedCl =
+                dynamic_cast<const ast::CollectionLiteralExpr*>(el)) {
+            // Mirrors `checkBorrowingFamilyLiteralElements`'s identical
+            // pre-set: a nested literal's type is set only by a target-
+            // aware caller (LocalDecl/ReturnStmt/…), never by the generic
+            // `visitExpr` walk, so seed it here before recursing.
+            if (!ctx_.exprType(*el))
+                ctx_.setExprType(const_cast<ast::Expr*>(el), elemTarget);
+            checkCollectionLiteralElementAssignability(*nestedCl, elemTarget);
+            return;
+        }
+        checkAssignable(ctx_.exprType(*el), elemTarget, el->span.begin,
+                        std::string("collection-literal ") + position,
+                        el);
+    };
+    if (target->kind == TypeRef::Kind::InlineArray) {
+        if (!target->arrayElement) return;
+        for (const auto& el : cl.elements)
+            checkOne(el.get(), target->arrayElement, "element");
+        return;
+    }
+    if (target->kind != TypeRef::Kind::Named || target->declaration ||
+        target->genericArgs.empty())
+        return;
+    TypeRef* elemTy = target->genericArgs[0];
+    TypeRef* valueTy = (cl.isDict && target->genericArgs.size() >= 2)
+        ? target->genericArgs[1] : elemTy;
+    for (const auto& k : cl.keys) checkOne(k.get(), elemTy, "key");
+    for (const auto& v : cl.elements)
+        checkOne(v.get(), valueTy, cl.isDict ? "value" : "element");
+}
+
 // stdlib §4.13 (v0.196, #1645): the owning-enumeration interfaces
 // `IOwningEnumerable<T>`, `IOwningEnumerator<T>`, and the async pair each
 // constrain `where T: class` — ownership transfer through iteration is
@@ -13078,6 +13165,16 @@ void ExprTC::visitMember(const ast::Member& m) {
                             return;  // reported; skip the
                                      // assignability check below
                         }
+                        // fix #4310 (§5.1/§11.2): per-element type
+                        // conformance for a collection-literal field
+                        // initializer — see that function's header comment.
+                        // Same `mentionsUnsubstitutedTypeParam` deferral as
+                        // the whole-literal check just below, for the same
+                        // reason (an unsubstituted generic field type is
+                        // judged at instantiation, not declaration).
+                        if (!mentionsUnsubstitutedTypeParam(fty))
+                            checkCollectionLiteralElementAssignability(
+                                *cl, fty);
                     }
                     // The §5.1 / §22.8 / §23.1 assignability check that
                     // #2926 added still defers on `mentionsUnsubstitutedTypeParam`
@@ -13421,6 +13518,12 @@ void ExprTC::visitMember(const ast::Member& m) {
                             return;  // reported; skip the
                                      // assignability check below
                         }
+                        // fix #4310 (§5.1/§11.2): per-element type
+                        // conformance — the auto-property twin of the
+                        // FieldDecl arm's identical check above.
+                        if (!mentionsUnsubstitutedTypeParam(pty))
+                            checkCollectionLiteralElementAssignability(
+                                *cl, pty);
                     }
                     // The assignability half still defers on
                     // `mentionsUnsubstitutedTypeParam` for the same reason
@@ -14251,6 +14354,14 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                     // is a no-op for the owning family — `OwningArray<Conn>
                     // := [new Conn(1)]` takes ownership and stays admissible.
                     checkBorrowingFamilyLiteralElements(*cl, lsym->declType);
+                    // fix #4310 (§5.1/§11.2): the per-element type-
+                    // conformance check the admissibility gate above does
+                    // NOT perform — see that function's header comment.
+                    // Covers both the inline-array target (`[N]IHolder`)
+                    // and the §15.4 builtin-collection target
+                    // (`Array<IHolder>`), including nested inline arrays.
+                    checkCollectionLiteralElementAssignability(
+                        *cl, lsym->declType);
                 }
                 // per §14.1/§14.2 + §A.7 (issue #391): return-target generic
                 // type-argument inference. When the initializer is a call to a
@@ -14410,6 +14521,17 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                         std::string("initializer for `") +
                             std::string(lc->name) + "`",
                         lc->value.get());
+                    // fix #4310 (§5.1/§11.2): the `const` twin of the
+                    // `var` LocalDecl per-element check above.
+                    // `LocalConstDecl` is a DIFFERENT AST node from
+                    // `LocalDecl` (§21.1's runtime const), so the earlier
+                    // fix at the `var` site does not reach it — measured:
+                    // `const arr: Array<IHolder> := [w];` (#4310's own
+                    // case 4) still compiled clean without this call.
+                    if (auto* rcl = dynamic_cast<
+                            const ast::CollectionLiteralExpr*>(
+                            lc->value.get()))
+                        checkCollectionLiteralElementAssignability(*rcl, rt);
                 }
             }
         }
@@ -14687,6 +14809,14 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                         currentReturnType_);
                 return;  // skip the assignability check below
             }
+            // fix #4310 (§5.1/§11.2): per-element type conformance — the
+            // `return` twin of the LocalDecl/FieldDecl checks above. See
+            // `checkCollectionLiteralElementAssignability`'s header comment;
+            // this closes the exact shape #4302 measured (a function
+            // returning `[1]IHolder` from a collection literal).
+            if (returnCtx_ == ReturnCtx::ValueMethod)
+                checkCollectionLiteralElementAssignability(
+                    *retCl, currentReturnType_);
         }
         // Slice T3: a returned value must be primitive-assignable to
         // the callable's return type.

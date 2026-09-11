@@ -757,6 +757,26 @@ private:
     void checkBorrowingFamilyLiteralElements(
         const ast::CollectionLiteralExpr& cl, const TypeRef* target);
 
+    // fix #4310 (§5.1/§11.2): the per-ELEMENT type-conformance sibling of
+    // checkBorrowingFamilyLiteralElements above. `checkAssignable` performs
+    // the §5.1 conversion check (including class→interface §11.2 nominal
+    // conformance via `isSubtype`) for a plain variable declaration or an
+    // ordinary call argument, but has zero handling for
+    // `TypeRef::Kind::InlineArray` — every call site that types a collection
+    // literal pre-sets the literal's OWN exprType to the target type
+    // (`ctx_.setExprType`) before the general `checkAssignable(ctx_.exprType
+    // (*initializer), target, …)` call that follows, so that call trivially
+    // compares the target to itself and never descends into the literal's
+    // element expressions. This walks the literal's elements (and, for a
+    // dict-form literal at a keyed target, its keys) and runs the ordinary
+    // §5.1 check on each one individually — recursing for a nested literal
+    // element (`[1]Array<IHolder>`) so the same gap one level down is closed
+    // too. `target` must already be resolved to the collection's own type
+    // (`[N]T` or a §15.4 builtin-collection head); a non-collection or
+    // unresolved target is a no-op.
+    void checkCollectionLiteralElementAssignability(
+        const ast::CollectionLiteralExpr& cl, TypeRef* target);
+
     // stdlib §5 (D7): the source element type T of a LINQ operator/aggregate
     // call whose lambda argument is `(T) -> …` (Where/Select/Count/Any/All/
     // First/OrderBy/…), or null otherwise. Used to set pendingLambdaParamType_
