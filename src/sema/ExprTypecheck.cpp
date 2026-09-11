@@ -12382,6 +12382,47 @@ static bool isSec154BuiltinCollectionNonTrivialDispose(
     return common::isNonTrivialDisposeClass(elem, ctx);
 }
 
+// fix #3857 (§15.4.1 D4, v0.272): does `t` name a user type that opted into
+// the sequence-literal protocol via the BORROWING form — a static, single-
+// parameter `FromCollectionLiteral` whose parameter's carrier is
+// `ReadOnlyArraySpan<T>`? Mirrors the walk `Resolver::
+// checkCollectionLiteralFactoryConjuncts` (TypeResolution_Checks.cpp) and
+// `Emitter::materializeUserTypeCollectionLiteral` (LlvmBackend_Setup.cpp)
+// already do to classify the SAME method, asked here from a third site —
+// `checkBorrowingFamilyLiteralElements` below needs it to answer "is this
+// target ALSO a borrowing-family target for §15.4's fresh-producer
+// rejection", which is D4 of the v0.272 changelog entry and is mandatory,
+// not opportunistic: "landing D1 [the carrier rename] alone would convert
+// an ill-typed program into a well-typed leak". `isCollectionLiteralAdmissibleTarget`
+// (ExprTypecheck_Calls.cpp) is not reused because it answers a broader
+// question — ANY recognized FromCollectionLiteral, either form — not
+// specifically the borrowing one this rejection needs.
+static bool isUserBorrowFormFclTarget(const TypeRef* t,
+                                       const SemaContext& ctx) {
+    if (!t || t->kind != TypeRef::Kind::Named || !t->declaration) return false;
+    for (const Symbol* m : t->declaration->members) {
+        const auto* ms = dynamic_cast<const MethodSymbol*>(m);
+        if (!ms || ms->name != "FromCollectionLiteral" || ms->params.empty())
+            continue;
+        bool isStatic = false;
+        for (auto mod : ms->modifiers)
+            if (mod == "static") { isStatic = true; break; }
+        if (!isStatic) continue;
+        const auto* param =
+            dynamic_cast<const ParameterSymbol*>(ms->params.front());
+        if (!param) continue;
+        const TypeRef* paramTy = param->declType
+                                      ? ctx.resolvedType(*param->declType)
+                                      : param->resolvedDeclType;
+        if (paramTy && paramTy->kind == TypeRef::Kind::Named &&
+            paramTy->astNode && paramTy->astNode->name &&
+            !paramTy->astNode->name->parts.empty() &&
+            paramTy->astNode->name->parts.back() == "ReadOnlyArraySpan")
+            return true;
+    }
+    return false;
+}
+
 // per §15.4 (v0.268, fix #2673): "For **borrowing-family** targets …, each
 // element expression of **non-trivial-dispose class type** (§28.9) must be a
 // **borrow** whose source satisfies the store rule of §28.11; an element
@@ -12433,15 +12474,24 @@ static bool isSec154BuiltinCollectionNonTrivialDispose(
 void ExprTC::checkBorrowingFamilyLiteralElements(
     const ast::CollectionLiteralExpr& cl, const TypeRef* target) {
     if (!target || target->kind != TypeRef::Kind::Named) return;
-    // The borrowing collections are builtin named types with no user TypeDecl;
-    // a user type (including a `FromCollectionLiteral` opt-in, §15.4.1) is not
-    // on §15.4's borrowing-family list and is left alone.
-    if (target->declaration) return;
-    if (!target->astNode || !target->astNode->name ||
-        target->astNode->name->parts.empty())
-        return;
-    const std::string_view head = target->headName();
-    if (!isSec154BorrowingFamilyHead(head)) return;
+    // fix #3857 (§15.4.1 D4, v0.272): a user type that opted into the
+    // sequence-literal protocol via the BORROWING form is ALSO a borrowing-
+    // family target for this rejection (mandatory per D4 — see
+    // `isUserBorrowFormFclTarget` above). It has no §15.4 head name and no
+    // built-in owning-family remedy, so it is handled as its own arm rather
+    // than folded into the builtin-head lookup below.
+    const bool userBorrowTarget = isUserBorrowFormFclTarget(target, ctx_);
+    std::string_view head;
+    if (target->declaration) {
+        if (!userBorrowTarget) return;
+        head = target->declaration->name;
+    } else {
+        if (!target->astNode || !target->astNode->name ||
+            target->astNode->name->parts.empty())
+            return;
+        head = target->headName();
+        if (!isSec154BorrowingFamilyHead(head)) return;
+    }
 
     auto checkOne = [&](const ast::Expr* el, const char* position,
                         bool owningFamilyIsARemedy,
@@ -12545,7 +12595,10 @@ void ExprTC::checkBorrowingFamilyLiteralElements(
         checkOne(k.get(), "key", /*owningFamilyIsARemedy=*/false, elemElementTy);
     for (const auto& v : cl.elements)
         checkOne(v.get(), cl.isDict ? "value" : "element",
-                 /*owningFamilyIsARemedy=*/true, valueElementTy);
+                 // fix #3857 (§15.4.1 D4): a user borrow-form target has no
+                 // built-in "Owning<Head>" alternative to name as a remedy —
+                 // §15.4.1 declares exactly one form per type.
+                 /*owningFamilyIsARemedy=*/!userBorrowTarget, valueElementTy);
 }
 
 // stdlib §4.13 (v0.196, #1645): the owning-enumeration interfaces

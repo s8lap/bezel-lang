@@ -33392,8 +33392,8 @@ llvm::Value* Emitter::materializeHeapCollectionLiteral(
 
     // fix #2957 (§15.4.1, v0.240): a USER-DEFINED target type that opts into
     // the literal protocol via a static `FromCollectionLiteral` factory —
-    // §15.4.1's two recognized signatures (ReadOnlySpan<U> borrowing form,
-    // owned OwningArray<U> owning form). Intercepted BEFORE the
+    // §15.4.1's two recognized signatures (ReadOnlyArraySpan<U> borrowing
+    // form, owned OwningArray<U> owning form). Intercepted BEFORE the
     // `!isCollectionTypeName(collTy)` guard below because user types have
     // rt->declaration != null (the #2997 empty-moduleName split: a real
     // declaration means NOT a builtin) so the name-based collection check
@@ -33777,7 +33777,7 @@ llvm::Value* Emitter::materializeCollectionLiteralForArg(
 // against a USER-DEFINED target type C<U> that opts into the literal protocol by
 // declaring a static `FromCollectionLiteral` factory (§15.4.1). The protocol
 // has two recognized signatures:
-//   * BORROWING form — `FromCollectionLiteral(elements: ReadOnlySpan<U>):
+//   * BORROWING form — `FromCollectionLiteral(elements: ReadOnlyArraySpan<U>):
 //     owned C<U>` for a C<U> whose elements are borrows.
 //   * OWNING    form — `FromCollectionLiteral(elements: owned
 //     OwningArray<U>): owned C<U>` for a C<U> that owns its elements
@@ -33796,7 +33796,7 @@ llvm::Value* Emitter::materializeCollectionLiteralForArg(
 // call ourselves. For the BORROWING form we allocate an `[N x U]` buffer in
 // the function's entry block, store the lowered element values into it
 // (lifetime encloses only the call — §15.4.1 "Lowering" Borrowing form), and
-// build the ReadOnlySpan<U> value via buildArraySpan (the {ptr, i32, i32}
+// build the ReadOnlyArraySpan<U> value via buildArraySpan (the {ptr, i32, i32}
 // bz.arrayspan struct). For the OWNING form we delegate to
 // materializeHeapCollectionLiteral on a synthesized `OwningArray<U>` TypeRef,
 // so the resulting `bz_array_t*` has the standard class-element disposer
@@ -33882,7 +33882,9 @@ llvm::Value* Emitter::materializeUserTypeCollectionLiteral(
     if (!fclFn) return nullptr;
 
     // Identify the form from the (sole) parameter's resolved type.
-    //   * ReadOnlySpan<U>    → BORROWING form
+    //   * ReadOnlyArraySpan<U> → BORROWING form (fix #3857, §15.4.1, v0.272:
+    //     renamed from `ReadOnlySpan<U>`, which is no longer recognized —
+    //     sema rejects it at the declaration, so it never reaches codegen.)
     //   * OwningArray<U>     → OWNING form (the spec requires `U: class`,
     //                          but sema owns that check — we accept any U
     //                          and let dispose semantics in the runtime
@@ -33903,7 +33905,7 @@ llvm::Value* Emitter::materializeUserTypeCollectionLiteral(
     // ─── BORROWING form ────────────────────────────────────────────────────
     // Build a heap-allocated bz_array_t<U> as the span's backing storage, fill
     // it with the n element values via bz_array_add, and pass it as the
-    // source field of the ReadOnlySpan<U> value. The span's indexer reads
+    // source field of the ReadOnlyArraySpan<U> value. The span's indexer reads
     // through bz_array_len / bz_array_get (LlvmBackend_Assign.cpp lines 374
     // and 383), so the source MUST be a real bz_array_t* — not a raw element
     // buffer; the spec's "the storage for the span may be stack-allocated"
@@ -33919,7 +33921,7 @@ llvm::Value* Emitter::materializeUserTypeCollectionLiteral(
     // so the receiver's parameter type (a bz.arrayspan-shaped struct) matches
     // the lowered parameter type declared by `declareFunctions()` for the FCL
     // method.
-    if (paramName == "ReadOnlySpan") {
+    if (paramName == "ReadOnlyArraySpan") {
         llvm::Type* elemLlvmTy = elemTy ? lowerTypeRef(elemTy) : i32();
         std::size_t n = cl->elements.size();
         int64_t esz = collectionElemSize(paramTy);
@@ -33972,7 +33974,7 @@ llvm::Value* Emitter::materializeUserTypeCollectionLiteral(
                 builder_.CreateCall(addFn, {arr, slot, builder_.getInt64(esz)});
             }
         }
-        // Build the ReadOnlySpan<U> value { ptr source=arr, i32 start=0,
+        // Build the ReadOnlyArraySpan<U> value { ptr source=arr, i32 start=0,
         // i32 length=n }. The bz_array_t backing is scope-end-disposed
         // (registered below) — released "after the call returns" per §15.4.1
         // "Lowering" Borrowing form. Scope-end is a sound relaxation: the
@@ -34043,7 +34045,7 @@ llvm::Value* Emitter::materializeUserTypeCollectionLiteral(
     }
     else {
         // Unrecognised `FromCollectionLiteral` signature — neither
-        // ReadOnlySpan nor OwningArray. §15.4.1 lists exactly two;
+        // ReadOnlyArraySpan nor OwningArray. §15.4.1 lists exactly two;
         // anything else is a programmer error the sema gate should have
         // caught (and a future fix may reject here with a sourced
         // diagnostic).

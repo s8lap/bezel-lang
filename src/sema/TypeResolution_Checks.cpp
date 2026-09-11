@@ -2107,7 +2107,7 @@ void Resolver::checkTopLevelVisibility() {
 
 // fix #3032 (§15.4.1, v0.262): a type declaring a static
 // `FromCollectionLiteral` whose carrier is a recognized form
-// (`ReadOnlySpan<T>` or `owned OwningArray<T>`) must be `public` and must
+// (`ReadOnlyArraySpan<T>` or `owned OwningArray<T>`) must be `public` and must
 // return `owned C<T>` at the enclosing type's own arity; declaring both
 // carriers on the same type is a compile error. #2957 deliberately scoped
 // the recognition predicate to the three mechanically-distinguishable
@@ -2183,12 +2183,32 @@ void Resolver::checkCollectionLiteralFactoryConjuncts() {
                 continue;
             std::string_view carrierName =
                 paramTy->astNode->name->parts.back();
-            // The borrowing form's `ReadOnlySpan<T>` is read by-value into
-            // the factory; the owning form's `OwningArray<T>` is read
+            // The borrowing form's `ReadOnlyArraySpan<T>` is read by-value
+            // into the factory; the owning form's `OwningArray<T>` is read
             // `owned` (the spec example writes `owned elements: OwningArray<T>`).
             // The carrier NAME is the discriminator — the modifier is
             // irrelevant to the §15.4.1 form split.
-            const bool isBorrowForm = (carrierName == "ReadOnlySpan");
+            // fix #3857 (§15.4.1, v0.272): proposal 0115 renamed the
+            // borrowing carrier from `ReadOnlySpan<T>` (the OWNING family's
+            // view, backed by `OwningBuffer<T>`) to `ReadOnlyArraySpan<T>`
+            // (the borrowing family's view, backed by `Array<T>`) — the old
+            // spelling was ownership-incoherent for a protocol whose
+            // elements are borrows. The old spelling is no longer part of
+            // the protocol at all: reject it here with a remedy naming the
+            // current carrier, rather than leaving it silently unrecognized
+            // (which left `isCollectionLiteralAdmissibleTarget` admitting
+            // the literal on name alone and crashed codegen — #3857).
+            if (carrierName == "ReadOnlySpan") {
+                ctx_.diagnostics().report(
+                    Severity::Error, ms->declLoc,
+                    std::string("`FromCollectionLiteral` on type `") +
+                    std::string(t->name) +
+                    "` declares its borrowing carrier as `ReadOnlySpan<T>`, "
+                    "which is no longer recognized; the borrowing carrier "
+                    "is `ReadOnlyArraySpan<T>` as of spec v0.272 (§15.4.1)");
+                continue;
+            }
+            const bool isBorrowForm = (carrierName == "ReadOnlyArraySpan");
             const bool isOwningForm = (carrierName == "OwningArray");
             if (!isBorrowForm && !isOwningForm) continue;
             // Conjunct 1: visibility must be `public`. §15.4.1: "The method
@@ -2271,7 +2291,7 @@ void Resolver::checkCollectionLiteralFactoryConjuncts() {
                     // is `owned C` — no element type exists to compare
                     // against the carrier's element type, and
                     // `retElemTy == nullptr` while `elemTy` is the
-                    // carrier's (e.g. `int` from `ReadOnlySpan<int>`).
+                    // carrier's (e.g. `int` from `ReadOnlyArraySpan<int>`).
                     // Without this carve the conjunct rejected every
                     // non-generic-owning form (with no T to bind, the
                     // carrier's T is whatever the user wrote).
@@ -2295,7 +2315,7 @@ void Resolver::checkCollectionLiteralFactoryConjuncts() {
                         Severity::Error, ms->declLoc,
                         "type `" + std::string(t->name) +
                         "` declares both recognized `FromCollectionLiteral` "
-                        "carriers (`ReadOnlySpan<T>` and `OwningArray<T>" +
+                        "carriers (`ReadOnlyArraySpan<T>` and `OwningArray<T>" +
                         "`); exactly one may be declared on a given type "
                         "(§15.4.1)");
                 }
@@ -2306,7 +2326,7 @@ void Resolver::checkCollectionLiteralFactoryConjuncts() {
                         Severity::Error, ms->declLoc,
                         "type `" + std::string(t->name) +
                         "` declares both recognized `FromCollectionLiteral` "
-                        "carriers (`ReadOnlySpan<T>` and `OwningArray<T>" +
+                        "carriers (`ReadOnlyArraySpan<T>` and `OwningArray<T>" +
                         "`); exactly one may be declared on a given type "
                         "(§15.4.1)");
                 }
