@@ -3079,6 +3079,102 @@ private:
     // why this split mirrors `collectBodyLambdas`'s own base-case/loop shape.
     void collectReassignedOwnedLocalsStmt(const ast::Stmt& s);
 
+    // fix #4321 (§28.3 / §28.6 / §28.9, v0.298): closes the sibling gap
+    // #4314 itself documented as deferred — a captured local's DECLARATION
+    // and REASSIGNMENT both live inside a DIFFERENT (outer) lambda's own
+    // body, not this method's top-level statement tree, and only a lambda
+    // nested inside THAT outer lambda aliases+disposes it:
+    //
+    //   var f := lambda() => do
+    //     var a: Array<int>; a := new Array<int>(2);
+    //     var inner := lambda() => do var b := a; b.Dispose(); end;
+    //   end;
+    //
+    // `collectReassignedOwnedLocals(body)` is bounded to the METHOD's own
+    // top-level `body` by design (see its declaration above) — `a`'s
+    // reassignment lives inside `f`'s own `stmts`, one frame deeper, so it
+    // is never found and `inner`'s alias-check retry sees an empty set.
+    //
+    // Called ONCE from `run()`, immediately after `collectReassignedOwnedLocals
+    // (body)`, ADDITIONALLY reuses `collectBodyLambdas` (the SAME flattening
+    // authority `applyUsingVarBorrowPinInLambdas` itself uses) to enumerate
+    // every `LambdaExpr` reachable from `body` AT EVERY NESTING DEPTH —
+    // `collectBodyLambdasExpr`'s own `LambdaExpr` case recurses into a found
+    // lambda's body to collect further-nested lambdas too, so the flat list
+    // already includes `inner` as well as `f`. For each lambda in that list,
+    // scans ITS OWN top-level `stmts` with the UNCHANGED
+    // `collectReassignedOwnedLocals` — so `f`'s own reassignment of `a` is
+    // found by scanning `f->stmts` directly, and both scans feed the SAME
+    // `reassignedOwnedLocals_` set `isReassignedOwnedLocalInEnclosingFrame`
+    // already consults.
+    //
+    // SOUNDNESS OF ONE FLAT SET ACROSS FRAMES (deliberately NOT keyed per
+    // lambda-frame): `reassignedOwnedLocals_` is keyed by `sema::Symbol*`,
+    // one per DECLARATION, never by name. `isReassignedOwnedLocalInEnclosingFrame`
+    // is only ever consulted with `rsym = ctx_.exprSymbol(*rid)` for an
+    // identifier occurrence that SEMA has already resolved according to real
+    // lexical scoping — so `rsym`'s own declaring scope is necessarily an
+    // ANCESTOR of (or equal to) the frame the identifier occurs in; sema
+    // cannot have resolved it to a symbol declared in a sibling or unrelated
+    // lambda (that would be a name-resolution error, a different diagnostic
+    // entirely, reported long before ownership analysis runs). So a lambda's
+    // OWN locally-declared symbol can only ever be looked up from a scope
+    // nested inside that lambda (itself or a lambda nested within it) —
+    // membership in one flat set answers "was `rsym` reassigned to an owned
+    // value anywhere within its own accessible lexical extent", which is
+    // exactly the question this predicate needs answered, regardless of
+    // which physical frame recorded it. No frame-keyed map is needed for
+    // correctness; this mirrors #4314's own choice not to key
+    // `everDischarged_` (Ownership_impl.hpp) per frame for the same reason.
+    //
+    // Deliberately does NOT touch `applyUsingVarBorrowPinInLambdaStmt`'s own
+    // fenced `AssignmentStmt` arm (~line 9518, the #4272 mechanism) — that
+    // arm updates `states_` DYNAMICALLY, scoped to the lambda currently being
+    // walked, to answer a DIFFERENT, narrower question (is THIS identifier,
+    // read from THIS SAME frame, currently Owned in `states_`); this function
+    // is a parallel, independent STATIC fact-gathering pass that only ever
+    // feeds `isReassignedOwnedLocalInEnclosingFrame`, so the two cannot
+    // observe or corrupt each other's state.
+    void collectReassignedOwnedLocalsInLambdaFrames(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body);
+
+    // fix #4304 (§28.3 "Captured owned bindings" / §28.6, v0.298): sibling of
+    // `isOwnedTrackedLocalInEnclosingFrame` above, for an `owned` PARAMETER
+    // captured by a lambda body rather than a local:
+    //
+    //   public static method Run(owned p: Array<int>): int
+    //     var f := lambda() => do var b := p; b.Dispose(); end;
+    //
+    // `isOwnedTrackedLocalInEnclosingFrame`'s `dynamic_cast<sema::LocalSymbol*>`
+    // returns null for a `ParameterSymbol` root and answers false outright —
+    // an `owned` parameter has no `LocalDecl`/initializer to classify via
+    // `producerState` in the first place.
+    //
+    // Answers via `symbolIsOwnedObligation` (Ownership_Checks.cpp; #3746) —
+    // restricted HERE to its `ParameterSymbol` arm only
+    // (`dynamic_cast<sema::ParameterSymbol*>` first; never falls through to
+    // its `LocalSymbol` arm). That restriction is deliberate, not
+    // incidental: `symbolIsOwnedObligation`'s `LocalSymbol` arm bottoms out
+    // in `localIsOwnedObligation`, which is exactly the seed #4286 measured
+    // and rejected for the identical reason `isOwnedTrackedLocalInEnclosingFrame`'s
+    // own declaration comment documents above (`ld->autoDropAtScopeEnd` is
+    // set only at the very END of `run()`'s main dataflow, well after this
+    // fix's early lambda-body pre-pass runs, and reads false regardless for
+    // an explicitly-`.Dispose()`d local) — calling `symbolIsOwnedObligation`
+    // unrestricted would silently reintroduce that exact dataflow-timing
+    // trap for a captured LOCAL while only fixing the PARAMETER axis.
+    //
+    // `symbolIsOwnedObligation`'s OWN `ParameterSymbol` arm
+    // (`ps->modifier == "owned"`) has no such dependency: `modifier` is a
+    // plain AST/symbol-table field set during parsing/sema, available
+    // unconditionally from before `run()` even begins — so restricting to
+    // that one arm carries none of the timing risk the unrestricted call
+    // would. `out owned` is excluded by that same arm (§28.3/§22.3: the
+    // caller's frame disposes an `out owned` value, not this one), matching
+    // `isOwnedTrackedLocalInEnclosingFrame`'s own `LocalSymbol`-only
+    // restriction for the sibling axis. // per §28.3, §28.6, §22.3, v0.298
+    bool isOwnedParameterInEnclosingFrame(sema::Symbol* sym);
+
     // Issue #392 / §31.1: a returned bare catch-binding identifier
     // (`return ex;`) lets the in-flight exception instance escape the arm
     // whose body the runtime disposes it after — a use-after-free. Diagnoses

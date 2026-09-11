@@ -455,6 +455,17 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
     // this point (that flag is set by the MAIN dataflow below, not by this
     // static AST scan). // per §28.3, §28.6, §28.9, v0.298, #4314
     collectReassignedOwnedLocals(body);
+    // fix #4321 (§28.3 / §28.6 / §28.9, v0.298): the sibling gap #4314 left
+    // open — a captured local's DECLARATION and REASSIGNMENT both live
+    // inside a DIFFERENT (outer) lambda's own body, one frame deeper than
+    // `collectReassignedOwnedLocals(body)`'s method-top-level-only scan
+    // reaches. Also a pure static AST walk (see its declaration,
+    // Ownership_impl.hpp, for the full rationale and the soundness argument
+    // for feeding the SAME flat `reassignedOwnedLocals_` set), so it has the
+    // same no-dataflow-order dependency and must run before
+    // `applyUsingVarBorrowPinInLambdas` for the identical reason.
+    // // per §28.3, §28.6, §28.9, v0.298, #4321
+    collectReassignedOwnedLocalsInLambdaFrames(body);
     applyUsingVarBorrowPinInLambdas(body);
     // fix #2674 / §28.3 / §17.13 / §28.9 (v0.282): the four OWNERSHIP-pass-
     // set end-of-statement reclaim flags (DiscardStmt::disposeOwnedValue /
@@ -5898,7 +5909,16 @@ void MethodOwnership::handleLocalDecl(const ast::LocalDecl& ld,
                     states_[lsym].disposeAliasSource = rsym;
                 } else if (fromLambdaBody &&
                            (isOwnedTrackedLocalInEnclosingFrame(rsym) ||
-                            isReassignedOwnedLocalInEnclosingFrame(rsym))) {
+                            isReassignedOwnedLocalInEnclosingFrame(rsym) ||
+                            isOwnedParameterInEnclosingFrame(rsym))) {
+                    // fix #4304 (§28.3/§28.6/§22.3, v0.298):
+                    // `isOwnedParameterInEnclosingFrame` — sibling of the
+                    // #4286/#4314 retries below, for a captured `owned`
+                    // PARAMETER (rather than a local) — see that predicate's
+                    // declaration (Ownership_impl.hpp) for why it is
+                    // restricted to `symbolIsOwnedObligation`'s
+                    // `ParameterSymbol` arm only.
+                    //
                     // fix #4314 (§28.3/§28.6/§28.9, v0.298):
                     // `isReassignedOwnedLocalInEnclosingFrame` — sibling of
                     // the #4286 retry just below, for a captured local that
@@ -9450,6 +9470,12 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
                     // just above — see that predicate's declaration
                     // (Ownership_impl.hpp) for the full rationale.
                     aliasSrc = rsym;
+                } else if (isOwnedParameterInEnclosingFrame(rsym)) {
+                    // fix #4304 (§28.3/§28.6/§22.3, v0.298): the captured-
+                    // `owned`-PARAMETER (rather than local) sibling of the
+                    // two arms just above — see that predicate's declaration
+                    // (Ownership_impl.hpp) for the full rationale.
+                    aliasSrc = rsym;
                 }
             }
             if (!aliasSrc && exprIsOwnedFieldRead(*lc->value))
@@ -10626,6 +10652,43 @@ bool MethodOwnership::isReassignedOwnedLocalInEnclosingFrame(
     auto* ls = dynamic_cast<sema::LocalSymbol*>(sym);
     if (!ls) return false;
     return reassignedOwnedLocals_.count(ls) != 0;
+}
+
+// fix #4321 (§28.3 / §28.6 / §28.9, v0.298): see the declaration
+// (Ownership_impl.hpp) for the full rationale, including the soundness
+// argument for feeding the SAME flat `reassignedOwnedLocals_` set from every
+// lambda frame rather than a per-frame-keyed map.
+//
+// `collectBodyLambdas` is the SAME flattening authority
+// `applyUsingVarBorrowPinInLambdas` (just below) uses to enumerate every
+// lambda in `body` at EVERY nesting depth — its own `LambdaExpr` case
+// (`collectBodyLambdasExpr`) recurses into a found lambda's body to collect
+// further-nested lambdas too, so this single pass reaches a lambda nested
+// inside another lambda nested inside another, with no depth limit.
+void MethodOwnership::collectReassignedOwnedLocalsInLambdaFrames(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body) {
+    std::vector<const ast::LambdaExpr*> lambdas;
+    for (const auto& s : body)
+        if (s) collectBodyLambdas(*s, lambdas);
+    for (const ast::LambdaExpr* lam : lambdas) {
+        // An expression-bodied lambda's `exprBody` is a single EXPRESSION —
+        // it can never directly contain an `AssignmentStmt` (assignment is a
+        // statement, never nested inside an expression in this grammar), so
+        // nothing to scan there; any LambdaExpr nested within `exprBody` is
+        // already a separate entry in `lambdas` above (collectBodyLambdasExpr
+        // descends into `exprBody` too). Only `stmts` needs scanning.
+        collectReassignedOwnedLocals(lam->stmts);
+    }
+}
+
+// fix #4304 (§28.3 "Captured owned bindings" / §28.6, v0.298): see the
+// declaration (Ownership_impl.hpp) for the full rationale, including why
+// this deliberately calls `symbolIsOwnedObligation` restricted to its
+// `ParameterSymbol` arm only rather than delegating to it unrestricted.
+bool MethodOwnership::isOwnedParameterInEnclosingFrame(sema::Symbol* sym) {
+    auto* ps = dynamic_cast<sema::ParameterSymbol*>(sym);
+    if (!ps) return false;
+    return symbolIsOwnedObligation(ps);
 }
 
 // §28.3 SB01-B (v0.190, #1919): collect every LambdaExpr appearing anywhere in a
