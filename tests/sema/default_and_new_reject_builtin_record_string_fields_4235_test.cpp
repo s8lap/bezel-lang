@@ -553,3 +553,264 @@ BEZEL_TEST(default_and_new_reject_builtin_record_string_fields_4235,
         "  end Main; "
         "end ProgROAS4235q;");
 }
+
+// ── fix #4245: DictionaryEntry<K,V> — the SIXTH+ name #4245 found, and the
+//    ONE its own review left open ("real design work needing its own
+//    mechanism, not a name-list entry") because it is architecturally
+//    DIFFERENT from the six names above: stdlib §4.8 declares
+//    `public record DictionaryEntry<K, V>(Key: K, Value: V);` — the declared
+//    fields ARE the generic parameters themselves (no wrapping), so
+//    defaultability is INSTANTIATION-DEPENDENT — `DictionaryEntry<int,int>`
+//    IS defaultable; `DictionaryEntry<string,int>` is NOT — unlike Span/
+//    ArraySpan/ExceptionInfo/ReadOnlyStringSpan, which are non-defaultable
+//    for EVERY instantiation and decided by name alone.
+//
+//    Fixed in `typeHasNoDefaultWalk`'s null-declaration branch and
+//    `Resolver::argSatisfiesNew`'s top-level dispatch (both
+//    TypeResolution_Checks.cpp) by recursing into `t->genericArgs`
+//    (DictionaryEntry's two "virtual fields") through the SAME
+//    `common::resolveRecordFieldSubst`/`RecordSubstEnv` substitution
+//    primitive the Record-kind arm already uses for a real record's field
+//    walk — not a new mechanism, and not a re-generalization to every
+//    null-declaration builtin (§25): this is the one builtin whose field
+//    composition is the raw identity of its own generic parameters, so no
+//    `TypeSymbol`/`seedRecordSubstEnv` call is needed to know what the
+//    "fields" are.
+//
+// MEASURED on this file's own parent `8ca85ce` (clean tree, `bezelc`
+// rebuilt directly before this edit, `bezelc --version` confirmed
+// `v0.279-wave3-eabfa69-905-g8ca85ce`, no `-modified` suffix) — **4 of 4
+// REJECT rows below fail without this fix**:
+//
+//   default(DictionaryEntry<string, int>)/.Key.Length      -> compile 0,
+//                                                              run 139
+//                                                              (SIGSEGV)
+//   HolderDE<DictionaryEntry<string,int>>.Make()
+//     where T:new(), then .Key.Length                      -> compile 0
+//                                                              (only the
+//                                                              #2477/#2491
+//                                                              backstop
+//                                                              notes, no
+//                                                              §14.2
+//                                                              diagnostic),
+//                                                              run 139
+//                                                              (SIGSEGV)
+//   record BoxDE(D: DictionaryEntry<string,int>, N: int)
+//     under where T:new()                                   -> compile 0
+//                                                              (silently
+//                                                              accepted)
+//   record Wrap<T>(D: DictionaryEntry<T, int>), Wrap<string>
+//     under where U:new()                                   -> compile 0
+//                                                              (silently
+//                                                              accepted —
+//                                                              the nested-
+//                                                              generic /
+//                                                              `incoming`-
+//                                                              env
+//                                                              threading
+//                                                              case)
+//
+// PASS-WITH this fix, same 4 probes rebuilt against the fixed `bezelc`: all
+// 4 reject cleanly with a real-location §17.11 or §14.2 diagnostic (compile
+// exit 1) — no crash on either axis.
+//
+// The 4 ACCEPT-side positive controls below (DictionaryEntry<int,int> at
+// every one of the same 4 sites) compile clean on BOTH the parent and this
+// fix, identically — the desired outcome proving the fix is
+// instantiation-dependent, not a blanket rejection of the name. A real
+// `Dictionary<K,V>` iteration yielding genuine `DictionaryEntry` values from
+// live `for var entry in dict do ... end;` iteration (the actual production
+// use this fix must not disturb) is already covered by the pre-existing
+// suite — e.g. `dict_entry_iter_548_test.cpp`,
+// `dict_entry_key_release_capture_envdtor_4127_test.cpp`,
+// `dict_entry_for_var_capture_escaping_release_4161_test.cpp` — swept green
+// alongside this file's own filter as part of this fix's own regression
+// sweep (see this fix's commit body for the exact pass counts); not
+// duplicated here.
+
+BEZEL_TEST(default_and_new_reject_builtin_record_string_fields_4235,
+           default_operator_rejects_dictionary_entry_top_level_spec_17_11_stdlib_4_8) {
+    expectDefaultRejected(
+        "module M4245a; "
+        "class ProgDE4245a "
+        "  public static method Main(): int "
+        "    var x := default(DictionaryEntry<string, int>); "
+        "    return x.Key.Length; "
+        "  end Main; "
+        "end ProgDE4245a;");
+}
+
+BEZEL_TEST(default_and_new_reject_builtin_record_string_fields_4235,
+           default_operator_accepts_dictionary_entry_intint_top_level_spec_17_11_control) {
+    auto r = runAot(
+        "module M4245b; "
+        "class ProgDEii4245b "
+        "  public static method Main(): int "
+        "    var x := default(DictionaryEntry<int, int>); "
+        "    _ := x; "
+        "    return 0; "
+        "  end Main; "
+        "end ProgDEii4245b;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+}
+
+BEZEL_TEST(default_and_new_reject_builtin_record_string_fields_4235,
+           where_T_new_rejects_dictionary_entry_top_level_substitution_spec_14_2) {
+    expectWhereNewRejected(
+        "module M4245c; "
+        "class HolderDE4245c<T> where T: new() "
+        "  public static method Make(): owned T => new T(); "
+        "end HolderDE4245c; "
+        "class ProgDE4245c "
+        "  public static method Main(): int "
+        "    var b := HolderDE4245c<DictionaryEntry<string, int>>.Make(); "
+        "    return b.Key.Length; "
+        "  end Main; "
+        "end ProgDE4245c;");
+}
+
+BEZEL_TEST(default_and_new_reject_builtin_record_string_fields_4235,
+           where_T_new_accepts_dictionary_entry_intint_top_level_substitution_spec_14_2_control) {
+    auto r = runAot(
+        "module M4245d; "
+        "class HolderDEii4245d<T> where T: new() "
+        "  public static method Make(): owned T => new T(); "
+        "end HolderDEii4245d; "
+        "class ProgDEii4245d "
+        "  public static method Main(): int "
+        "    var b := HolderDEii4245d<DictionaryEntry<int, int>>.Make(); "
+        "    _ := b; "
+        "    return 0; "
+        "  end Main; "
+        "end ProgDEii4245d;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+}
+
+// ── field-wrapped composition: DictionaryEntry as a RECORD FIELD (not the
+//    top-level substitution) under where T: new() — proves the fix composes
+//    through the PRE-EXISTING Record-arm recursion in
+//    `Resolver::argSatisfiesNew`, not only the new top-level dispatch. ────
+BEZEL_TEST(default_and_new_reject_builtin_record_string_fields_4235,
+           where_T_new_rejects_record_with_dictionary_entry_field_spec_14_2) {
+    expectWhereNewRejected(
+        "module M4245e; "
+        "public record BoxDE4245e(D: DictionaryEntry<string, int>, N: int); "
+        "class HolderBoxDE4245e<T> where T: new() "
+        "  public static method Make(): owned T => new T(); "
+        "end HolderBoxDE4245e; "
+        "class ProgBoxDE4245e "
+        "  public static method Main(): int "
+        "    var b := HolderBoxDE4245e<BoxDE4245e>.Make(); "
+        "    return b.N; "
+        "  end Main; "
+        "end ProgBoxDE4245e;");
+}
+
+BEZEL_TEST(default_and_new_reject_builtin_record_string_fields_4235,
+           where_T_new_accepts_record_with_dictionary_entry_intint_field_spec_14_2_control) {
+    auto r = runAot(
+        "module M4245f; "
+        "public record BoxDE4245f(D: DictionaryEntry<int, int>, N: int); "
+        "class HolderBoxDE4245f<T> where T: new() "
+        "  public static method Make(): owned T => new T(); "
+        "end HolderBoxDE4245f; "
+        "class ProgBoxDE4245f "
+        "  public static method Main(): int "
+        "    var b := HolderBoxDE4245f<BoxDE4245f>.Make(); "
+        "    return b.N; "
+        "  end Main; "
+        "end ProgBoxDE4245f;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+}
+
+// ── nested-generic composition, the `incoming`-env threading case: a
+//    generic record `Wrap<T>(D: DictionaryEntry<T, int>)` instantiated at
+//    `Wrap<string>` under `where U: new()`. Before this recursion sees
+//    genericArgs[0] (a BARE reference to `T`, the enclosing record's own
+//    generic parameter) it must resolve `T` through the incoming
+//    `RecordSubstEnv` the Record-arm seeded from `Wrap<string>`'s own
+//    `genericArgs` — exactly the composition
+//    `common::resolveRecordFieldSubst`/`RecordSubstEnv` exist for. This is
+//    the row that would have failed had the fix's recursion passed
+//    `incoming=nullptr` instead of threading it through. ──────────────────
+BEZEL_TEST(default_and_new_reject_builtin_record_string_fields_4235,
+           where_T_new_rejects_nested_generic_dictionary_entry_field_spec_14_2) {
+    expectWhereNewRejected(
+        "module M4245g; "
+        "public record Wrap4245g<T>(D: DictionaryEntry<T, int>); "
+        "class HolderWrap4245g<T> where T: new() "
+        "  public static method Make(): owned T => new T(); "
+        "end HolderWrap4245g; "
+        "class ProgWrap4245g "
+        "  public static method Main(): int "
+        "    var w := HolderWrap4245g<Wrap4245g<string>>.Make(); "
+        "    _ := w; "
+        "    return 0; "
+        "  end Main; "
+        "end ProgWrap4245g;");
+}
+
+BEZEL_TEST(default_and_new_reject_builtin_record_string_fields_4235,
+           where_T_new_accepts_nested_generic_dictionary_entry_intint_field_spec_14_2_control) {
+    auto r = runAot(
+        "module M4245h; "
+        "public record Wrap4245h<T>(D: DictionaryEntry<T, int>); "
+        "class HolderWrap4245h<T> where T: new() "
+        "  public static method Make(): owned T => new T(); "
+        "end HolderWrap4245h; "
+        "class ProgWrap4245h "
+        "  public static method Main(): int "
+        "    var w := HolderWrap4245h<Wrap4245h<int>>.Make(); "
+        "    _ := w; "
+        "    return 0; "
+        "  end Main; "
+        "end ProgWrap4245h;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+}
+
+// ── default(...) side of the field-wrapped and nested-generic composition
+//    rows above — proves the SAME recursion also composes through
+//    `typeHasNoDefaultWalk`'s pre-existing Record-kind arm (the
+//    `default(...)` operator path, not just the `where T: new()` path). ──
+BEZEL_TEST(default_and_new_reject_builtin_record_string_fields_4235,
+           default_operator_rejects_record_with_dictionary_entry_field_spec_17_11) {
+    auto r = runAot(
+        "module M4245i; "
+        "public record BoxDE4245i(D: DictionaryEntry<string, int>, N: int); "
+        "class ProgBoxDE4245i "
+        "  public static method Main(): int "
+        "    var x := default(BoxDE4245i); "
+        "    return x.N; "
+        "  end Main; "
+        "end ProgBoxDE4245i;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(
+        r, "`default(T)` is a compile error for a record any of whose "
+           "fields is a non-nullable reference type"));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "\xC2\xA7""17.11"));
+}
+
+BEZEL_TEST(default_and_new_reject_builtin_record_string_fields_4235,
+           default_operator_rejects_nested_generic_dictionary_entry_field_spec_17_11) {
+    auto r = runAot(
+        "module M4245j; "
+        "public record Wrap4245j<T>(D: DictionaryEntry<T, int>); "
+        "class ProgWrap4245j "
+        "  public static method Main(): int "
+        "    var x := default(Wrap4245j<string>); "
+        "    _ := x; "
+        "    return 0; "
+        "  end Main; "
+        "end ProgWrap4245j;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(
+        r, "`default(T)` is a compile error for a record any of whose "
+           "fields is a non-nullable reference type"));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "\xC2\xA7""17.11"));
+}

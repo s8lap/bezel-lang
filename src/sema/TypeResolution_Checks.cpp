@@ -8011,17 +8011,34 @@ bool Resolver::argSatisfiesNew(const TypeRef* arg, bool& decided) {
         // list and continues to satisfy `where T: new()` via §14.2's
         // class arm, never via defaultability (see row (7)/the
         // regression-pin test this file's suite already carries).
-        // `DictionaryEntry<K,V>` (stdlib §4.8) is DELIBERATELY not added
-        // here: its declared fields ARE the generic parameters `K`/`V`
-        // themselves, so its defaultability is instantiation-dependent
-        // and cannot be decided by a flat by-name check — left open on
-        // #4245 as real design work, not a name-list gap.
         if ((head == "ExceptionInfo" || head == "ReadOnlyStringSpan" ||
              head == "Span" || head == "ReadOnlySpan" ||
              head == "ArraySpan" || head == "ReadOnlyArraySpan") &&
             typeHasNoDefault(arg, ctx_, /*incoming=*/nullptr)) {
             decided = true;
             return false;
+        }
+        // fix #4245 (§14.2/§17.11/stdlib §4.8, v0.298): `DictionaryEntry<K,V>`
+        // is handled as its OWN branch, not folded into the six-name list
+        // above, because — unlike those six, which are unconditionally
+        // non-defaultable — `DictionaryEntry<K,V>`'s defaultability is
+        // INSTANTIATION-DEPENDENT (see `typeHasNoDefaultWalk`'s own
+        // null-declaration comment, this file, for the full reasoning and the
+        // `t->genericArgs` recursion this shares). The six-name check above
+        // only ever DECIDES the "does not satisfy" outcome (harmless there,
+        // since none of those six is ever defaultable) — `DictionaryEntry`
+        // needs both outcomes decided: `DictionaryEntry<int,int>` DOES
+        // satisfy `where T: new()` (every field defaults), so `decided` must
+        // be set unconditionally here, not only on the non-defaultable path.
+        //
+        // MEASURED (issue #4245, this file's own parent `8ca85ce`, clean
+        // tree): `HolderDE<DictionaryEntry<string,int>>.Make()` under
+        // `where T: new()` compiled with no §14.2 diagnostic (only the
+        // pre-existing #2477/#2491 dead-abstract-template-body backstop
+        // notes) and SIGSEGV'd at runtime (exit 139) reading `.Key.Length`.
+        if (head == "DictionaryEntry") {
+            decided = true;
+            return !typeHasNoDefault(arg, ctx_, /*incoming=*/nullptr);
         }
     }
     // Built-ins, generic params, function/inline-array args: defer.
@@ -8335,20 +8352,57 @@ bool typeHasNoDefaultWalk(const TypeRef* t, const common::RecordSubstEnv* incomi
                     // never reaches codegen with an unmonomorphized
                     // builtin type parameter in the first place.
                     //
-                    // `DictionaryEntry<K,V>` (stdlib §4.8) is DELIBERATELY
-                    // left off this list: its declared fields are the
-                    // generic parameters `K`/`V` themselves, so whether it
-                    // is defaultable depends on the SUBSTITUTED types, and
-                    // this null-declaration leaf has no real `TypeSymbol`
-                    // to attach a `RecordSubstEnv` to for that recursion
-                    // (see this function's null-declaration comment
-                    // above). That is real design work, not a name-list
-                    // entry — left open on #4245.
                     if (head == "ExceptionInfo" ||
                         head == "ReadOnlyStringSpan" ||
                         head == "Span" || head == "ReadOnlySpan" ||
                         head == "ArraySpan" || head == "ReadOnlyArraySpan") {
                         return true;  // non-nullable string/class field(s): no default
+                    }
+                    // fix #4245 (§17.11/stdlib §4.8, v0.298): `DictionaryEntry<K,V>`
+                    // is a DIFFERENT shape from the six names above — those are
+                    // non-defaultable UNCONDITIONALLY (a fixed class/string field
+                    // independent of the substitution). `DictionaryEntry<K,V>`'s
+                    // declared fields ARE its own generic parameters (stdlib §4.8:
+                    // "public record DictionaryEntry<K, V>(Key: K, Value: V);" —
+                    // `Key: K`, `Value: V`, no wrapping), so its defaultability is
+                    // INSTANTIATION-DEPENDENT: `DictionaryEntry<int,int>` IS
+                    // defaultable (every field defaults); `DictionaryEntry<string,
+                    // int>` is NOT (`Key: string` has no default, §17.11) — the
+                    // exact same per-field rule the Record-kind arm below applies
+                    // to a user record, just with no `TypeSymbol` to
+                    // `recordStorageMembers`-walk.
+                    //
+                    // This null-declaration leaf still doesn't need a
+                    // `seedRecordSubstEnv` call (that needs an `ast::TypeDecl`/
+                    // `TypeSymbol`, which `DictionaryEntry` has neither) — because
+                    // unlike an arbitrary generic record, whose fields may compose
+                    // their generic parameters into some other shape entirely,
+                    // `DictionaryEntry`'s two "virtual fields" ARE the identity of
+                    // K/V. `t->genericArgs` is already exactly what a
+                    // `recordStorageMembers` walk would have produced: the
+                    // resolved, substituted-at-THIS-use-site K/V
+                    // (`TypeResolution_Names.cpp`'s builtin-arity branch populates
+                    // `ref.genericArgs` via `resolveType`, same as every other
+                    // null-declaration builtin generic argument). Each is still run
+                    // through `common::resolveRecordFieldSubst(ga, incoming)` —
+                    // the SAME substitution primitive the Record-kind arm below
+                    // uses, not a new mechanism — so a K/V that is itself a bare,
+                    // not-yet-substituted OUTER generic parameter (DictionaryEntry
+                    // appearing as a field of some other generic record, `incoming`
+                    // carrying that record's own env) still resolves correctly.
+                    //
+                    // MEASURED (issue #4245, this file's own parent `8ca85ce`,
+                    // clean tree): `default(DictionaryEntry<string, int>)` compiled
+                    // clean (exit 0) and SIGSEGV'd at runtime (exit 139) reading
+                    // `.Key.Length`.
+                    if (head == "DictionaryEntry" && t->genericArgs.size() == 2) {
+                        for (const TypeRef* ga : t->genericArgs) {
+                            common::RecordSubstEnv::Entry sub =
+                                common::resolveRecordFieldSubst(ga, incoming);
+                            if (typeHasNoDefaultWalk(sub.ty, sub.env, ctx, seen))
+                                return true;
+                        }
+                        return false;  // both Key/Value defaultable
                     }
                 }
                 return false;  // generic param / unresolved / other builtin — defer
