@@ -1,5 +1,8 @@
 #include "sema/TypeResolution_impl.hpp"
 
+#include <cstdio>   // send-back #4305: unhandledNullDeclClassConstraintSlot
+#include <cstdlib>  // send-back #4305: unhandledNullDeclClassConstraintSlot
+
 #include "common/BuiltinRegistry.hpp"  // isBuiltinExceptionName — §31.4 (#2950)
 #include "common/OwnershipFacts.hpp"   // isMoveOnlyValueType — §14.4 / §15.3 (#3794)
 #include "sema/ConstFold.hpp"
@@ -81,6 +84,30 @@ static std::string_view ownedBareTypeParamOfField(const FieldSymbol& fs,
     // branch rejects it via `parts.size() != 1` and this is the same rejection.
     if (n.empty() || n.find('.') != std::string_view::npos) return {};
     return n;
+}
+
+// Loud, UNCONDITIONAL failure (never compiled out by NDEBUG — matching
+// src/common/AwaitScan.cpp's convention rather than a plain `assert()`,
+// which release builds strip) for a `kNullDeclClassConstraints` table entry
+// (§14.2/§14.4, fix #4305, send-back review) whose recorded slot has fallen
+// out of range for its own name's `builtinTypeArity`. The table is
+// hand-typed and nothing else pins its shape against the arity table it
+// depends on: if a listed name's arity ever changes, the bounds check at
+// the call site (`c.slot < ref.genericArgs.size()`) would otherwise
+// silently stop firing for it — no crash, no failing test, just a quietly
+// disarmed §14.2/§14.4 check. This makes that failure mode loud instead.
+[[noreturn]] static void unhandledNullDeclClassConstraintSlot(
+    std::string_view name, std::size_t slot, int arity) {
+    std::fprintf(stderr,
+        "internal compiler error: src/sema/TypeResolution_Names.cpp's "
+        "kNullDeclClassConstraints table names `%.*s` slot %zu, but "
+        "Resolver::builtinTypeArity(\"%.*s\") now reports arity %d -- the "
+        "table entry is stale relative to the arity table it depends on "
+        "(see fix #4305)\n",
+        static_cast<int>(name.size()), name.data(),
+        static_cast<std::size_t>(slot),
+        static_cast<int>(name.size()), name.data(), arity);
+    std::abort();
 }
 
 int Resolver::builtinTypeArity(std::string_view n) {
@@ -2121,8 +2148,9 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                             "<\xE2\x80\xA6>` for value elements.");
                     }
                 }
-                // §14.2 (fix #4305): a null-declaration builtin generic (this
-                // whole `if (arity != kNotBuiltin)` branch — no synthesized
+                // §14.2/§14.4 (fix #4305, SHARPENED by send-back review): a
+                // null-declaration builtin generic (this whole
+                // `if (arity != kNotBuiltin)` branch — no synthesized
                 // TypeSymbol) has no `tsym` for `checkGenericConstraints`
                 // below (its `if (tsym && ...)` gate) to run against, so a
                 // `where <slot>: class` constraint declared on the type's OWN
@@ -2131,20 +2159,70 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                 // SomeRecord>)` compiled and ran clean despite `DrainedEntry
                 // <K, V>: IDisposable where V: class` (stdlib §4.9).
                 //
+                // Spec §14.4's "Class-only restriction on owning generics"
+                // paragraph (v0.298; heading "`owned` and generic type
+                // arguments" > "Generic constraints and class types" — NOT
+                // §14.2, which only defines the general `where T: class`
+                // meaning) names THIRTEEN types under one sentence: "Most
+                // standard-library owning types (`OwningArray<T>`,
+                // `OwningLinkedList<T>`, `OwningSet<T>`, `OwningStack<T>`,
+                // `OwningQueue<T>`, `OwningDictionary<K, V>`, `OwningTask<T>`,
+                // `IOwningEnumerable<T>`, `IOwningEnumerator<T>`,
+                // `IOwningAsyncEnumerable<T>`, `IOwningAsyncEnumerator<T>`,
+                // `IOwningCollection<T>`, `IOwningList<T>`) restrict their
+                // element type T to class and interface types. ... the
+                // standard-library owning types are compiler-enforced to
+                // reject the runtime-managed reference types (`string`,
+                // function values)." That is STRICTER than the general
+                // `where T: class` (§14.2: "Non-nullable reference types
+                // only — classes ..., interfaces, `string`, function
+                // types" — string/function ARE admitted generically) and
+                // the very next spec sentence adds a second divergence:
+                // "Nullable class types and interfaces are admitted. The
+                // owning-type instantiation rule checks the *underlying*
+                // type, not the nullable-wrapper" — the opposite of the
+                // general `where T: class`, which requires non-null T.
+                //
                 // This table covers every null-declaration builtin generic
                 // whose stdlib declaration carries a plain `where <slot>:
                 // class` constraint AND is not already enforced by a
-                // different, purpose-built check:
+                // different, purpose-built check. The candidate set was
+                // derived MECHANICALLY (send-back review of the original
+                // fix, which re-read the doc by eye and missed two): every
+                // arity>=1 name in `builtinTypeArity` above was
+                // cross-referenced against every TYPE-LEVEL (not
+                // method-level) `where <slot>: ...` declaration clause in
+                // docs/Bezel_Standard_Library.md. That sweep added exactly
+                // two names beyond the eight below: `IOwningCollection<T>`
+                // and `IOwningList<T>` (stdlib §4.2, arity 1, slot 0) — both
+                // named in the identical §14.4 sentence quoted above as
+                // their four already-covered `IOwning*Enumerable/Enumerator`
+                // siblings, in neither this table nor the `ownedSlot`
+                // exclusion below. No other name fell out of the sweep:
                 //   - OwningArray/OwningSet/OwningStack/OwningQueue/
                 //     OwningLinkedList (slot 0) and OwningDictionary (slot 1)
                 //     are DELIBERATELY EXCLUDED: the `ownedSlot` /
                 //     `owningElementBadDesc` check immediately above (stdlib
                 //     §4.2/§14.4, #1327) already enforces their identical
-                //     "class or interface element" requirement — measured
-                //     `default(OwningArray<SomeRecord>)` already rejects
-                //     ("requires a class or interface element type"), so a
-                //     second check here would duplicate that diagnostic for
-                //     the same condition rather than close a real gap.
+                //     requirement.
+                //   - `OwningTask<T>` is in `builtinTypeArity` but has no
+                //     standalone type-level `where` clause anywhere in the
+                //     stdlib doc to register — every `where T: class` hit
+                //     naming it (`Task.FromOwnedResult<T>`, `Task.WhenAll<T>`)
+                //     is a constraint on that STATIC METHOD's own T, checked
+                //     via the method's real TypeSymbol/genericParams, not
+                //     this null-declaration-TYPE gap.
+                //   - IComparable/IEquatable/IEqualityComparer/IReadOnlySpan/
+                //     INumber/ISteppable/IParsable (the latter three declare
+                //     a self-referential `where T: <IName><T>` type-bound,
+                //     not a `class`-kind constraint, on their OWN type
+                //     parameter) get a REAL synthesized TypeSymbol
+                //     (`SemaContext::isSynthesizedBuiltinInterfaceName`,
+                //     `ctx_.builtinInterfaceSym` a few lines below) — `tsym`
+                //     is non-null for them, so `checkGenericConstraints`'s
+                //     `if (tsym && ...)` gate below already runs for them;
+                //     they were never part of the null-declaration
+                //     population this fix patches.
                 //   - Atomic/AtomicInteger (`where T: value`), Channel/
                 //     ChannelSender (`where T: sendable`), and
                 //     SortedDictionary/SortedSet (`where K/T:
@@ -2152,15 +2230,33 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                 //     DIFFERENT constraint kind each — not `class` — and are
                 //     out of scope for this table; measured still-open and
                 //     filed separately (issue #4318).
-                // Reuses `checkOneConstraint` — the SAME authority that
-                // verifies a `where T: class` clause for a real TypeSymbol
-                // (TypeResolution_Checks.cpp) — with a synthesized
-                // `GenericParamConstraint{kind="class"}` standing in for the
-                // constraint a real TypeSymbol would have carried. This is
-                // not a new classification predicate (§6/§25): it is the
-                // existing "does this arg satisfy a `class` bound" check,
-                // called for a population that had no TypeSymbol to attach
-                // its own declared constraint to.
+                //
+                // Reuses `owningElementBadDesc` (TypeResolution_Checks.cpp,
+                // NOT modified by this fix — held this cycle) directly,
+                // rather than `checkOneConstraint`'s `kind="class"` arm the
+                // original fix used: `owningElementBadDesc` is the SAME
+                // authority the `ownedSlot` check immediately above calls,
+                // and §14.4 enumerates this table's names in the identical
+                // sentence as the six `ownedSlot` covers — provably the same
+                // question (§6/§25), not a predicate reused on a hunch.
+                // `checkOneConstraint`'s generic `"class"` arm was measured
+                // to answer that question WRONG on both divergences quoted
+                // above: (a) it calls `categorize()`, whose Primitive/
+                // Function arms classify `string`/`Function` as `Reference`
+                // — not `Value` — so it never rejects them (measured:
+                // `IOwningEnumerable<string>` compiled clean on the
+                // original fix's binary); (b) it unconditionally rejects
+                // `arg->nullable`, the OPPOSITE of §14.4's nullable-class-
+                // admitted carve-out. `owningElementBadDesc` gets both
+                // right already: it never inspects `->nullable` (a value
+                // kind is bad whether or not it is nullable; a class/
+                // interface kind is fine either way), and its Primitive/
+                // Function arms reject `string`/function outright. The
+                // deferred-generic-parameter behaviour is unchanged: an
+                // unresolved type parameter reaches `owningElementBadDesc`'s
+                // same "no declaration, not a value builtin" fallthrough
+                // that returns "" (admitted/deferred), matching
+                // `checkOneConstraint`'s `categorize() == Unknown` defer.
                 {
                     struct NullDeclClassConstraint {
                         std::string_view name;
@@ -2172,21 +2268,84 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                             {"DrainedEntry", 1, "V"},               // §4.9
                             {"Shared", 0, "T"},                     // §2.16
                             {"Weak", 0, "T"},                       // §2.16
-                            {"IOwningEnumerable", 0, "T"},          // §4
-                            {"IOwningEnumerator", 0, "T"},          // §4
-                            {"IOwningAsyncEnumerable", 0, "T"},     // §4
-                            {"IOwningAsyncEnumerator", 0, "T"},     // §4
+                            {"IOwningEnumerable", 0, "T"},          // §4.13
+                            {"IOwningEnumerator", 0, "T"},          // §4.13
+                            {"IOwningAsyncEnumerable", 0, "T"},     // §4.13
+                            {"IOwningAsyncEnumerator", 0, "T"},     // §4.13
                             {"OwningTaskCompletionSource", 0, "T"}, // §6.6
+                            {"IOwningCollection", 0, "T"},          // §4.2
+                            {"IOwningList", 0, "T"},                // §4.2
                         };
                     for (const auto& c : kNullDeclClassConstraints) {
                         if (first != c.name) continue;
+                        // §send-back-#4305 fold-in: the table is hand-typed
+                        // and the bounds check below (`c.slot <
+                        // ref.genericArgs.size()`) would silently stop
+                        // firing — no crash, no failing test — if a listed
+                        // name's arity ever changed underneath it. Validate
+                        // against the SAME authority (`builtinTypeArity`)
+                        // every time this entry matches, so a future arity
+                        // change fails loudly the first time any program
+                        // (including this fix's own regression tests, which
+                        // exercise all ten entries) uses the name.
+                        // Every entry's declared arity must be a plain
+                        // positive count (never `kNotBuiltin` == -1 or
+                        // `kBuiltinTaskLike` == -2 — neither sentinel is
+                        // meaningful for a name this table expects to carry
+                        // a fixed `where <slot>: class` clause), and the
+                        // slot must fall inside it.
+                        int declaredArity = builtinTypeArity(c.name);
+                        bool slotInRange =
+                            declaredArity > 0 &&
+                            c.slot < static_cast<std::size_t>(declaredArity);
+                        if (!slotInRange) {
+                            unhandledNullDeclClassConstraintSlot(
+                                c.name, c.slot, declaredArity);
+                        }
                         if (c.slot < ref.genericArgs.size() &&
                             c.slot < t.genericArgs.size()) {
-                            checkOneConstraint(
-                                t.span.begin, c.paramName,
-                                GenericParamConstraint{.kind = "class"},
-                                t.genericArgs[c.slot].get(),
-                                ref.genericArgs[c.slot], scope);
+                            TypeRef* carg = ref.genericArgs[c.slot];
+                            std::string badDesc = owningElementBadDesc(carg);
+                            if (!badDesc.empty()) {
+                                // Render the WRITTEN argument spelling for
+                                // the diagnostic. Mirrors argSpelling()
+                                // (TypeResolution_Checks.cpp, anonymous
+                                // namespace — not externally callable, and
+                                // that file is held this cycle) at a scale
+                                // too small to justify exposing it: this is
+                                // string rendering for a message, not a
+                                // second spelling of a classification
+                                // decision (§6).
+                                const ast::Type* argAst =
+                                    t.genericArgs[c.slot].get();
+                                std::string argName = "<type>";
+                                if (argAst &&
+                                    argAst->kind == ast::TypeKind::Named &&
+                                    argAst->name) {
+                                    argName.clear();
+                                    for (std::size_t i = 0;
+                                         i < argAst->name->parts.size();
+                                         ++i) {
+                                        if (i) argName += '.';
+                                        argName += std::string(
+                                            argAst->name->parts[i]);
+                                    }
+                                    if (argAst->nullable) argName += '?';
+                                }
+                                ctx_.diagnostics().report(
+                                    Severity::Error, t.span.begin,
+                                    std::string("type argument `") +
+                                    argName +
+                                    "` does not satisfy the constraint "
+                                    "`where " + std::string(c.paramName) +
+                                    ": class` (\xC2\xA7""14.2) \xE2\x80\x94 " +
+                                    badDesc + " has no disposal obligation "
+                                    "and cannot satisfy `" +
+                                    std::string(c.name) + "<" +
+                                    std::string(c.paramName) +
+                                    ">`'s class-only owning-generic "
+                                    "restriction (\xC2\xA7""14.4).");
+                            }
                         }
                         break;
                     }
