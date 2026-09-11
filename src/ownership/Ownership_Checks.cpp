@@ -2578,8 +2578,22 @@ void MethodOwnership::checkRead(const ast::Expr& e, bool selfTarget) {
         // end; Reader.Peek(n);` inside a loop compiled clean with zero
         // diagnostics, silently accepting a read on the disposed-branch
         // path every iteration after the first.
+        //
+        // fix #4247 (§28.3, v0.298): widened from `state == Owned` alone to
+        // also fire on `state == Borrowed` — `joinInto`'s new
+        // `borrowedDischargedSplit` (Ownership_Checks.cpp, this file) now
+        // populates this SAME flag on a Borrowed record (a rebind-then-
+        // dispose on one if-arm of a plain alias holder, the other arm a live
+        // untouched borrow); a read of that merged local is exactly the same
+        // "may observe freed memory on the disposed-branch path" danger this
+        // guard already exists to catch, just for a holder whose surviving
+        // state is Borrowed instead of Owned. See the join-site comment for
+        // why Owned was the only producer of this flag until now, and why
+        // widening the CONSUMER here (rather than adding a parallel flag) is
+        // the minimal change. // per §28.3, v0.298
         if (st->disposedOnSomePath &&
-            st->state == OwnershipState::Owned) {
+            (st->state == OwnershipState::Owned ||
+             st->state == OwnershipState::Borrowed)) {
             report(
                 Severity::Error, id->span.begin,
                 std::string("local `") + std::string(id->name) +
@@ -8639,6 +8653,26 @@ void MethodOwnership::joinInto(std::unordered_map<sema::Symbol*, LocalOwnership>
             // pushed down one field. // per §28.3, §28.6
             st.explicitDisposeReclaimedSlot =
                 st.explicitDisposeReclaimedSlot && o.explicitDisposeReclaimedSlot;
+            // fix #4247 (§28.3, v0.298): OR `disposedOnSomePath` across a
+            // same-state merge too — the SAME order-dependency #4236 fixed for
+            // `disposeAliasSource` two fields up, one flag over. Before this
+            // fix the flag was untouched here entirely (silently kept only
+            // `st`'s side), which was latent for the pre-existing Owned⊓Disposed
+            // producer of this flag (a nested if / loop back-edge could wash it
+            // out depending on branch order) and became load-bearing the moment
+            // `borrowedDischargedSplit` below also began setting it on a
+            // Borrowed record: a nested-if outer join with one inner arm
+            // producing Borrowed+disposedOnSomePath and the other a fresh,
+            // never-touched Borrowed must still carry the flag forward, or the
+            // outer join's own later read check (`checkRead`) silently loses
+            // the fact this exact bug is about. OR is correct because the
+            // unsafe direction is "disposed on at least one reachable path",
+            // which — once true on either incoming edge — remains true of the
+            // merged local; losing it would let a read through that may
+            // observe freed memory on the reachable disposed-branch path.
+            // // per §28.3, v0.298
+            if (!st.disposedOnSomePath && o.disposedOnSomePath)
+                st.disposedOnSomePath = true;
             continue;
         }
         // PolyNull absorbs: PolyNull ⊓ X = X.
@@ -8823,6 +8857,82 @@ void MethodOwnership::joinInto(std::unordered_map<sema::Symbol*, LocalOwnership>
             if (dischargedState == OwnershipState::Disposed &&
                 !dischargedAwaitSpent)
                 st.disposedOnSomePath = true;
+            continue;
+        }
+        // fix #4247 (§28.3 "Ownership state of locals" / branch-join rules,
+        // v0.298): Borrowed ⊓ Disposed split. A plain-identifier alias holder
+        // (`var y := x;`, tracked via `states_[y].source`/`disposeAliasSource`,
+        // NOT an owned local) can be REBOUND to a fresh owned value on one
+        // arm of an if-WITHOUT-else and explicitly disposed there (`y := new
+        // Res(1); y.Dispose();`), while the other arm never touches `y` at
+        // all — it is still the original live borrow of `x`. Before this fix
+        // this mismatch fell all the way through to the generic "other
+        // mismatches" catch-all below, which POISONS SILENTLY (no
+        // diagnostic): `y`'s `disposeAliasSource` (the alias-of-`x` fact) was
+        // discarded along with everything else, so (a) a later `.Dispose()`
+        // on `y` no longer tripped the existing #4236 alias-dispose rejection
+        // (a false ACCEPT — a would-be double-dispose is idempotent at
+        // runtime via the checked-mode disposed-flag, MEASURED harmless via
+        // `agent_check.sh --probe --asan` at 200x loop amplification, so this
+        // half is a missed rejection, not a crash), and (b) a later READ of
+        // `y` (e.g. `y.tag`) was accepted with zero diagnostics and observes
+        // freed memory on the taken-arm path — MEASURED via
+        // `agent_check.sh --probe --asan` on a 200-iteration loop-amplified
+        // repro: `AddressSanitizer: SEGV ... READ memory access` at a
+        // near-null offset, i.e. a genuine use-after-dispose crash, not
+        // merely the 16-byte leak the single-shot (unamplified) repro showed.
+        //
+        // This is NOT treated as `ownedBorrowedClash` (reject unconditionally
+        // at the join): unlike Owned vs Borrowed, which is ALWAYS a leak or a
+        // double-owner regardless of what happens next, a Borrowed ⊓ Disposed
+        // merge that is never touched again is completely sound (§15
+        // accept-side control: "an if-without-else that disposes on the taken
+        // path and never touches the holder again" must keep compiling) — the
+        // disposal on the taken arm discharged a value `y` itself came to own
+        // via the rebind, not the borrowed source, and the not-taken arm's
+        // borrow of `x` remains `x`'s obligation to discharge, not `y`'s.
+        // Rejecting at the join would false-reject that legitimate program.
+        //
+        // So — mirroring `ownedDischargedSplit` above, one field over — KEEP
+        // the BORROWED side's full record (so its `source`/`disposeAliasSource`
+        // survive the join for (a) above) and set `disposedOnSomePath`, the
+        // SAME flag `ownedDischargedSplit` already uses for the analogous
+        // Owned ⊓ Disposed split, widened here to populate on a Borrowed
+        // record for the first time. This is a widening of what the flag is
+        // POPULATED from, not a new question: its documented meaning is "may
+        // have been disposed on some incoming path, so a read may observe
+        // freed memory" (OwnershipState.hpp), which is exactly (b) above; the
+        // existing `state == Owned` guards at its two consuming sites
+        // (`checkRead`, the lambda-capture read check) are an artifact of
+        // `disposedOnSomePath` previously only ever being set on an Owned
+        // record, not a deliberate restriction — every reset site
+        // (`handleAssignment`'s several arms, `markDisposedByName`) already
+        // clears it unconditionally on any reassignment regardless of state,
+        // so nothing downstream relied on an Owned-only invariant. `checkRead`
+        // is widened alongside this join change to actually consult the flag
+        // on a Borrowed record (see its own comment); the lambda-capture
+        // sibling is NOT widened here — deliberately out of scope, filed
+        // separately (§21.1-shaped capture gap, not this join) — and neither
+        // is the symmetric Borrowed ⊓ MovedFrom split (a `move`/`owned`-
+        // transfer discharge of the rebound value instead of `.Dispose()`),
+        // which this fix's measured repro does not exercise and which would
+        // need `maybeConsumed`'s own `state == Owned` guard widened too — left
+        // for a follow-up issue to keep this change scoped to the split this
+        // fix actually measured.
+        //
+        // `markDisposedByName` needs no change: a repeat `.Dispose()` on the
+        // merged local is independently caught by the PRE-EXISTING
+        // `disposeAliasSource` alias check (`checkDisposeReceiverOwnership`,
+        // fix #4236) now that this join stops discarding that record — see
+        // (a) above. // per §28.3, v0.298
+        const bool borrowedDischargedSplit =
+            (st.state == OwnershipState::Borrowed &&
+             o.state == OwnershipState::Disposed) ||
+            (st.state == OwnershipState::Disposed &&
+             o.state == OwnershipState::Borrowed);
+        if (borrowedDischargedSplit) {
+            if (st.state != OwnershipState::Borrowed) st = o;
+            st.disposedOnSomePath = true;
             continue;
         }
         // Other mismatches (e.g. Uninitialized on one side at a non-loop

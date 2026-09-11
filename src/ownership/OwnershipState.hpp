@@ -216,6 +216,20 @@ struct LocalOwnership {
     // surviving Owned record (reassignment clears it via handleAssignment,
     // exactly like maybeConsumed — the local is then definitely owned again).
     // // per §28.3, §28.2
+    //
+    // fix #4247 (§28.3, v0.298): ALSO set on a surviving BORROWED record by
+    // joinInto's `borrowedDischargedSplit` — a plain alias holder rebound to
+    // a fresh owned value and disposed on one if-arm, left a live untouched
+    // borrow on the other. The flag's MEANING is unchanged ("a read here may
+    // observe freed memory on some incoming path"); only the set of states it
+    // is populated on widened, because every existing consumer/reset site
+    // either already handles both states (`checkRead`, widened alongside
+    // this fix; every reassignment reset in `handleAssignment` and
+    // `markDisposedByName`, all unconditional on state) or was never gated on
+    // Owned in the first place. The lambda-capture read check
+    // (Ownership_Checks.cpp's `disposedOnSomePathAtLiteral`) is DELIBERATELY
+    // NOT widened — a captured Borrowed+disposedOnSomePath local is a known,
+    // separately-filed gap, not this join.
     bool disposedOnSomePath = false;
 };
 
