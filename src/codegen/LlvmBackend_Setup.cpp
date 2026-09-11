@@ -15937,7 +15937,24 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
     // function (a lambda/thunk body lowered mid-function is not analyzed
     // → its record locals just leak, never double-freed). disposeStack_ is
     // non-empty inside any lowered block body.
-    if (v && currentFn_ == recordCallResultReleaseEligibleFn_ &&
+    //
+    // fix #4266 (§9.7 / §28.9): `v` is the LOWERED INITIALIZER's value
+    // (`init ? lowerExpr(*init) : nullptr` above) and is null for a
+    // "declare, then assign" candidate (`var outer: P;` has no
+    // initializer at all — its value arrives later, via the AssignmentStmt
+    // collectRecordCallResultReleaseEligible independently proved fresh).
+    // Requiring `v` here was never load-bearing for THIS arm (the body
+    // below never reads `v`; it recovers the type from `declType`, which a
+    // no-init declaration still carries) — it was simply always true for
+    // every pre-#4266 candidate, which is exclusively `var p := <call>;`-
+    // shaped. `recordDeclareThenAssignSite_.count(declNode)` is the
+    // precise membership test for the new shape, so the `v ||` widening
+    // admits ONLY declNodes collectRecordCallResultReleaseEligible itself
+    // already vetted — no broader than `recordCallResultReleaseEligible_`
+    // itself already gates two lines down.
+    if ((v || recordDeclareThenAssignSite_.count(
+                   static_cast<const void*>(declNode))) &&
+        currentFn_ == recordCallResultReleaseEligibleFn_ &&
         recordCallResultReleaseEligible_.count(
             static_cast<const void*>(declNode)) &&
         !disposeStack_.empty()) {
@@ -23118,6 +23135,25 @@ struct StringEscapeWalker {
     // bit-identical.
     const void* outVarIntroSite = nullptr;
 
+    // fix #4266 (§9.7 / §28.9): OPT-IN — the identity of the ONE
+    // AssignmentStmt node that is a "declare, then assign" candidate's SOLE
+    // initializing store (`var outer: P; ...; outer := <call>;`), set only
+    // by collectRecordCallResultReleaseEligible via
+    // Emitter::recordDeclareThenAssignSite_. Null for every OTHER candidate
+    // (the ordinary `var p := <call>;` shape never visits its own
+    // initializer as a generic statement, so it needs no such exclusion —
+    // see the AssignmentStmt arm below, which otherwise treats ANY plain
+    // `:=` reassignment of the tracked target as an escape in
+    // recordFieldReleaseMode). The collector proves, BEFORE setting this,
+    // that this is the target's ONLY assignment anywhere in the body and
+    // that its RHS independently satisfies the exact same freshness proof
+    // (isProvablyFreshRecordFactoryMethod / imported twin /
+    // isSynthesizedRecordDeserializeCall / isFreshRecordConstructionOf
+    // ExactType) a LocalDecl initializer would need — so recognizing this
+    // one store as safe is exactly as sound as the existing LocalDecl-init
+    // admission, not a new soundness argument.
+    const void* recordDeclareThenAssignSite = nullptr;
+
     // fix #3729 / §9.7 / §28.9: OPT-IN pointer to the WHOLE enclosing
     // function body (the same statement list collectRecordCallResultReleaseEligible
     // walks each candidate against), used ONLY by the record-copy-alias
@@ -24956,6 +24992,23 @@ struct StringEscapeWalker {
                 // locals). Those walks leave stringReleaseMode false and fall to the
                 // `escaped = true` below.
                 if (stringReleaseMode) {
+                    expr(as->value.get(), /*safeRead=*/true);
+                    return;
+                }
+                // fix #4266 (§9.7 / §28.9): the "declare, then assign"
+                // twin of the stringReleaseMode relaxation just above —
+                // narrower by identity, not by mode. Only the ONE
+                // AssignmentStmt node collectRecordCallResultReleaseEligible
+                // already proved is this candidate's SOLE assignment, with
+                // an independently fresh RHS, is treated as the candidate's
+                // (non-escaping) initializer; ANY other `:=` to the same
+                // target — a second assignment the collector would have
+                // seen and therefore never armed this pointer for — still
+                // falls through to `escaped = true` below, so a multiply-
+                // assigned local stays conservatively excluded exactly as
+                // before this fix.
+                if (recordDeclareThenAssignSite &&
+                    static_cast<const void*>(as) == recordDeclareThenAssignSite) {
                     expr(as->value.get(), /*safeRead=*/true);
                     return;
                 }
@@ -27706,6 +27759,7 @@ static bool isProvablyFreshImportedRecordFactoryMethod_(
 void Emitter::collectRecordCallResultReleaseEligible(
         const std::vector<std::unique_ptr<ast::Stmt>>& body) {
     recordCallResultReleaseEligible_.clear();
+    recordDeclareThenAssignSite_.clear();
     // fix #3436 (§21.1 / §9.7 / §28.9, v0.283): `const ast::Node*`, and the
     // declaration is read through the shared `Emitter::localDeclInitView` —
     // the single authority #3402 hoisted for exactly this split. The scan was
@@ -27722,6 +27776,65 @@ void Emitter::collectRecordCallResultReleaseEligible(
     // codegen's own, the same single reference the `var` path already
     // releases, at the same point, under the same StringEscapeWalker.
     std::vector<const ast::Node*> candidates;
+
+    // fix #4266 (§9.7 / §28.9): "declare, then assign" — `var outer: P;`
+    // with NO initializer, whose value comes from a LATER plain `outer :=
+    // <call>;` / `outer := new P(...);` rather than the LocalDecl's own
+    // `initializer` field. Neither the LocalDeclInitView scan above (its
+    // `v.init` is null) nor `lowerLocalDecl`'s registration cares HOW the
+    // eligibility was proved — it only reads `recordCallResultReleaseEligible_`
+    // and the declared/inferred type — so admitting these candidates needs
+    // no change on the registration side, only here and in the escape
+    // walker's own new `recordDeclareThenAssignSite` field.
+    //
+    // Tracked per no-init LocalDecl during the SAME single walk below
+    // (`scan` visits statements in program order and Bezel's definite-
+    // assignment rule requires the declaration to precede any assignment
+    // to it, so the declared-type entry always exists before the first
+    // matching AssignmentStmt is seen). `assignCount` disqualifies a
+    // multiply-assigned target — this fix proves soundness for EXACTLY one
+    // assignment site (mirroring the inherently-single-assignment `var p
+    // := <call>;` shape); a second assignment falls back to the pre-
+    // existing safe-leak behaviour rather than attempting a "release
+    // displaced old value" argument this fix does not make.
+    struct NoInitAssignState {
+        const sema::TypeRef* declaredType = nullptr;
+        int assignCount = 0;
+        const ast::AssignmentStmt* soleAssign = nullptr;
+        bool soleAssignFresh = false;
+    };
+    std::unordered_map<const ast::Node*, NoInitAssignState> noInitDecls;
+
+    // fix #4266: the SAME freshness authorities the LocalDeclInitView
+    // CallExpr/NewExpr arms below already call
+    // (isProvablyFreshRecordFactoryMethod / its imported twin /
+    // isSynthesizedRecordDeserializeCall / isFreshRecordConstructionOf
+    // ExactType) — factored out ONLY so the AssignmentStmt scan can apply
+    // them identically without duplicating the dispatch logic (§6: reuse
+    // the existing authority, do not re-derive a sibling predicate). The
+    // authorities themselves are untouched and the LocalDeclInitView arms
+    // below are UNCHANGED (still call them directly) to keep zero risk to
+    // the already-covered `var p := <call>;` shape.
+    auto rhsIsFreshRecordSource = [&](const ast::Expr* rhs,
+                                       const sema::TypeRef* tr) -> bool {
+        if (!tr || !isRecordWithStringFieldsTypeRef(tr)) return false;
+        if (auto* call = dynamic_cast<const ast::CallExpr*>(rhs)) {
+            if (!call->callee) return false;
+            const auto* ms = dynamic_cast<const sema::MethodSymbol*>(
+                ctx_.exprSymbol(*call->callee));
+            return (ms &&
+                    (isProvablyFreshRecordFactoryMethod(ms, tr->declaration) ||
+                     isProvablyFreshImportedRecordFactoryMethod_(
+                         ms, tr->declaration, ctx_))) ||
+                   isSynthesizedRecordDeserializeCall(call, tr->declaration);
+        }
+        if (auto* ne = dynamic_cast<const ast::NewExpr*>(rhs)) {
+            return ne->type &&
+                   isFreshRecordConstructionOfExactType(ne, tr->declaration);
+        }
+        return false;
+    };
+
     std::function<void(const ast::Stmt*)> scan = [&](const ast::Stmt* s) {
         if (!s) return;
         {
@@ -27856,6 +27969,60 @@ void Emitter::collectRecordCallResultReleaseEligible(
                         candidates.push_back(s);
                     }
                 }
+            } else if (!v.init) {
+                // fix #4266 (§9.7 / §28.9): a plain `var outer: P;` with NO
+                // initializer — record it as a "declare, then assign" root
+                // if its declared type is a record with string fields. A
+                // §21.1 `const` (LocalConstDecl) always carries a `value`
+                // (`v.init` is never null for one via `localDeclInitView`),
+                // so it can never reach this no-init branch, and it can
+                // never be the target of a later `:=` either (§21.1: a
+                // runtime `const` is single-assignment at its own
+                // declaration) — the explicit `ast::LocalDecl` cast below
+                // is the actual gate this arm needs, not an accident.
+                // LOCALDECL-ONLY: no const local can ever reach here (above).
+                if (dynamic_cast<const ast::LocalDecl*>(s) && v.type) {
+                    if (const sema::TypeRef* tr = ctx_.resolvedType(*v.type)) {
+                        if (isRecordWithStringFieldsTypeRef(tr))
+                            noInitDecls[s].declaredType = tr;
+                    }
+                }
+            }
+        }
+        // fix #4266: does THIS statement assign to a previously-seen
+        // "declare, then assign" root? Standalone (not an `else if` off the
+        // block above) — an AssignmentStmt is never simultaneously a
+        // LocalDecl/LocalConstDecl, so there is no ambiguity, and this must
+        // run for EVERY statement (including ones the block above ignored)
+        // to see every candidate's assignment site(s).
+        if (auto* as2 = dynamic_cast<const ast::AssignmentStmt*>(s)) {
+            if (as2->op == ":=") {
+                if (auto* id =
+                        dynamic_cast<const ast::IdentifierExpr*>(as2->target.get())) {
+                    if (auto* loc =
+                            dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*id))) {
+                        auto it = noInitDecls.find(loc->decl);
+                        if (it != noInitDecls.end()) {
+                            NoInitAssignState& st = it->second;
+                            st.assignCount++;
+                            if (st.assignCount == 1) {
+                                st.soleAssign = as2;
+                                st.soleAssignFresh = rhsIsFreshRecordSource(
+                                    as2->value.get(), st.declaredType);
+                            } else {
+                                // fix #4266: a SECOND assignment to the same
+                                // target disqualifies it — this fix proves
+                                // soundness for exactly one assignment site
+                                // (see the NoInitAssignState comment above);
+                                // permanently clear so the admission loop
+                                // below skips it regardless of how many more
+                                // assignments follow.
+                                st.soleAssign = nullptr;
+                                st.soleAssignFresh = false;
+                            }
+                        }
+                    }
+                }
             }
         }
         if (auto* is = dynamic_cast<const ast::IfStmt*>(s)) {
@@ -27880,12 +28047,35 @@ void Emitter::collectRecordCallResultReleaseEligible(
     };
     for (auto& s : body) scan(s.get());
 
+    // fix #4266: admit every "declare, then assign" root that ended the
+    // scan with EXACTLY one assignment site and a proven-fresh RHS — the
+    // same bar `candidates` already holds every LocalDeclInitView entry to.
+    for (const auto& kv : noInitDecls) {
+        const NoInitAssignState& st = kv.second;
+        if (st.assignCount == 1 && st.soleAssignFresh && st.soleAssign) {
+            candidates.push_back(kv.first);
+            recordDeclareThenAssignSite_[static_cast<const void*>(kv.first)] =
+                st.soleAssign;
+        }
+    }
+
     for (const ast::Node* ld : candidates) {
         StringEscapeWalker w{ctx_, static_cast<const void*>(ld)};
         // recordFieldReleaseMode = true (the gate above); the other modes
         // stay false so the string-release / borrowing-Array / value-like-
         // choice relaxation never affects this pass.
         w.recordFieldReleaseMode = true;
+        // fix #4266: arm the declare-then-assign exclusion ONLY for a
+        // candidate admitted via that path — a map-lookup miss for the
+        // ordinary `var p := <call>;` candidates leaves this null, so
+        // their behaviour is bit-for-bit unchanged.
+        {
+            auto dtaIt = recordDeclareThenAssignSite_.find(
+                static_cast<const void*>(ld));
+            if (dtaIt != recordDeclareThenAssignSite_.end())
+                w.recordDeclareThenAssignSite =
+                    static_cast<const void*>(dtaIt->second);
+        }
         // fix #3729 / §9.7 / §28.9: the WHOLE function body, for the
         // copy-alias relaxation's own nested non-escape check (see the
         // `wholeBody` member comment and the `LocalDecl`/`LocalConstDecl`

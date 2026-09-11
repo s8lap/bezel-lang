@@ -11208,6 +11208,25 @@ private:
     std::unordered_set<const void*> recordCallResultReleaseEligible_;
     llvm::Function* recordCallResultReleaseEligibleFn_ = nullptr;
 
+    // fix #4266 (§9.7 / §28.9): the "declare, then assign" twin of the set
+    // above — a plain `var outer: P;` (NO initializer) whose SOLE
+    // reassignment anywhere in the body is `outer := <call>;` /
+    // `outer := new P(...);`, independently proven fresh by the same
+    // authorities the `var p := <call>;` shape uses
+    // (isProvablyFreshRecordFactoryMethod / its imported twin /
+    // isSynthesizedRecordDeserializeCall / isFreshRecordConstructionOf
+    // ExactType). Maps the candidate's OWN LocalDecl node (the
+    // `recordCallResultReleaseEligible_` key) to the ONE AssignmentStmt
+    // node that gives it its value, so the escape walker
+    // (StringEscapeWalker::recordDeclareThenAssignSite) can recognize that
+    // ONE store as the non-escaping "initializer" a LocalDeclInitView-based
+    // candidate never needs to special-case (its init is never visited as
+    // a generic statement at all). Populated only by
+    // collectRecordCallResultReleaseEligible; empty for every candidate
+    // admitted the ordinary way.
+    std::unordered_map<const void*, const ast::AssignmentStmt*>
+        recordDeclareThenAssignSite_;
+
     // fix #1747: walk the function body, classifying each plain-`var`
     // record-call-result LocalDecl by escape verdict.
     void collectRecordCallResultReleaseEligible(
