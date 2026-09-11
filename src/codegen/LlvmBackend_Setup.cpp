@@ -23390,26 +23390,41 @@ struct StringEscapeWalker {
         // unsoundness (§28.9's "how [runtime-managed reclamation happens] is
         // not specified" leaves that leak within the spec's own silence).
         //
-        // An IMPORTED method (`ms->decl == nullptr`) is not walked here —
-        // its return type is not re-derivable from this AST-only read, so
-        // the relaxation stays admitted, UNCHANGED from before this fix, on
-        // that axis. Filed as a follow-up rather than widened into this fix
-        // (CLAUDE.md "no while we're at it" — the local axis is #4254's own
-        // measured repro).
+        // fix #4260: an IMPORTED method (`ms->decl == nullptr`) IS walked
+        // here too, mirroring the established local/imported split already
+        // used by `isUserMethodStringReturnCall` / `isUserMethodClosureReturnCall`
+        // a few hundred lines from this site — branch on `ctx.isImported(ms)`
+        // first and read the declared return type via `ctx.importedReturnType`
+        // for the imported leg (the wire-side channel: the loader publishes
+        // `TypeSymbol::kind` for an imported Record/Choice exactly as it does
+        // locally, so `crt->declaration->kind` reads identically on both
+        // legs). `ms` reaching this point with `ms->decl == nullptr` is a
+        // routine, reachable path, not a rare edge: `ctx.isImported(ms)` is
+        // already called five lines above this block to decide whether `ms`
+        // survives at all. The original fix left this leg unhandled (filed
+        // as #4260) on the reasoning that "the return type is not
+        // re-derivable from this AST-only read" — that reasoning was wrong;
+        // it is re-derivable, via the SAME accessor the two sibling
+        // predicates already use, so there is no reason to defer.
         bool calleeReturnMayAliasArgUnretained = false;
         if (stringReleaseMode && ms) {
-            // SEAM-DEBT: #4260 AST-only — null for an imported method (see
-            // this block's own comment above); the relaxation stays
-            // admitted, unchanged, for that axis.
-            const auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
-            if (md && md->returnType) {
-                const sema::TypeRef* crt = ctx.resolvedType(*md->returnType);
-                if (crt && crt->kind == sema::TypeRef::Kind::Named &&
-                    crt->declaration &&
-                    (crt->declaration->kind == ast::TypeDeclKind::Record ||
-                     crt->declaration->kind == ast::TypeDeclKind::Choice)) {
-                    calleeReturnMayAliasArgUnretained = true;
+            const sema::TypeRef* crt = nullptr;
+            if (ctx.isImported(ms)) {
+                crt = ctx.importedReturnType(ms);
+            } else {
+                // SEAM-ACCESSOR: local-path cast; `if (ctx.isImported(ms))`
+                // above returns early for the imported case via
+                // ctx.importedReturnType. #3152
+                const auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
+                if (md && md->returnType) {
+                    crt = ctx.resolvedType(*md->returnType);
                 }
+            }
+            if (crt && crt->kind == sema::TypeRef::Kind::Named &&
+                crt->declaration &&
+                (crt->declaration->kind == ast::TypeDeclKind::Record ||
+                 crt->declaration->kind == ast::TypeDeclKind::Choice)) {
+                calleeReturnMayAliasArgUnretained = true;
             }
         }
         // fix #3886 (§4.8/§4.9/§28.9): the walkCallArgs twin of fix #3872's
