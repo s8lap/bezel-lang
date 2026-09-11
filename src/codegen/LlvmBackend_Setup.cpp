@@ -23406,6 +23406,60 @@ struct StringEscapeWalker {
         // re-derivable from this AST-only read" — that reasoning was wrong;
         // it is re-derivable, via the SAME accessor the two sibling
         // predicates already use, so there is no reason to defer.
+        // fix #4265 (§15.1 "Inline arrays" / §9.7 / §28.9, v0.298): a SIXTH
+        // channel uncovered by #4254/#4260's Record/Choice guard above. A
+        // callee whose declared return type is an INLINE ARRAY of `string`
+        // elements (`sema::TypeRef::Kind::InlineArray`, not `Kind::Named`)
+        // can embed the plain-parameter string argument into the returned
+        // `[N x elem]` aggregate the identical unretained way: the
+        // ReturnStmt inline-array materialization block (LlvmBackend_Stmts
+        // .cpp, the §15.3 `return [e1, …]` branch) stores each element with
+        // a bare `builder_.CreateStore(ev, gep)` — no `emitStringRetain` —
+        // the same raw-store shape `buildRecordValue`'s positional fast path
+        // has for records. `return [s];` against a declared `[1]string`
+        // return type therefore aliases the caller's `s` with no
+        // independent +1, exactly as `return new Str(s);` does for a
+        // record, but `crt->kind` there is `InlineArray`, which the
+        // Record/Choice-only guard above never matches.
+        //
+        // §15.1's own "Lifetime of inline arrays carrying borrows" paragraph
+        // independently confirms `string` is in the runtime-managed
+        // reference-type family this walker already treats as escaping via
+        // the Record/Choice arm: "Inline arrays of value-typed elements,
+        // runtime-managed reference-typed elements (`string`, function
+        // values), ... are not borrow-bearing" — i.e. the compiler does not
+        // borrow-track a string-element inline array at all, so nothing
+        // else stands in for the missing retain either.
+        //
+        // Same direction as #4254: NARROW the relaxation (suppress the
+        // caller-side release) rather than add a retain to the ReturnStmt
+        // inline-array materialization's store loop. That loop is the
+        // general local-decl/return inline-array literal path (§15.3),
+        // reached for every element source, not just a plain-parameter
+        // string local aliased from a call site; retroactively retaining
+        // there would need the same re-proof against already-established
+        // producer-owned element shapes that #4254's own rationale declined
+        // for the record/choice fast path, over a surface this fix has not
+        // measured. Suppressing only widens the pre-existing
+        // leak-over-UAF safe default for this one combination (a string
+        // argument to a plain method whose return type is a string-element
+        // inline array) — a possible extra leak, never new unsoundness.
+        //
+        // This fix does NOT widen to function-VALUED inline-array elements
+        // (§15.1's other listed runtime-managed member) even though the
+        // spec paragraph quoted above names both: `stringReleaseMode` (the
+        // `if` below) gates this entire walker to STRING-typed tracked
+        // locals only (see `collectStringReleaseEligible`), so the argument
+        // this walker ever classifies is always a string — a function-typed
+        // return element is not reachable through this predicate regardless
+        // of how the guard is written, and closures have their own,
+        // separate capture-list retain/release accounting elsewhere in this
+        // file, not exercised or measured by this fix.
+        //
+        // The channel list stood at four when #4254 opened, five when
+        // #4254 itself found the Record/Choice gap, and is six as of this
+        // fix. This does not make the enumeration exhaustive — see the
+        // commit body for what was and was not checked.
         bool calleeReturnMayAliasArgUnretained = false;
         if (stringReleaseMode && ms) {
             const sema::TypeRef* crt = nullptr;
@@ -23424,6 +23478,22 @@ struct StringEscapeWalker {
                 crt->declaration &&
                 (crt->declaration->kind == ast::TypeDeclKind::Record ||
                  crt->declaration->kind == ast::TypeDeclKind::Choice)) {
+                calleeReturnMayAliasArgUnretained = true;
+            } else if (crt && crt->kind == sema::TypeRef::Kind::InlineArray &&
+                       crt->arrayElement &&
+                       crt->arrayElement->kind ==
+                           sema::TypeRef::Kind::Primitive &&
+                       crt->arrayElement->primitive ==
+                           sema::PrimitiveType::String) {
+                // fix #4265: the InlineArray/string-element sixth channel
+                // documented above. `arrayElement` is populated identically
+                // for a locally-resolved and an imported InlineArray TypeRef
+                // (ModuleLoader.cpp's `convert`: `ref->arrayElement =
+                // convert(mt.children.front())`), so this arm covers both
+                // the local and imported legs of the `if` above with no
+                // further branching, mirroring how #4260 found the
+                // Record/Choice arm already leg-agnostic once `crt` itself
+                // is resolved correctly.
                 calleeReturnMayAliasArgUnretained = true;
             }
         }
