@@ -9823,6 +9823,19 @@ private:
     llvm::Value* explicitDisposeOwnedReceiverSlot(const ast::Expr& receiver,
                                                   llvm::Type*& slotTy);
 
+    // fix #4221 (spec §28.2/§28.9/§8.1, v0.298): the FULL explicit-Dispose()
+    // dispatch chain — collection/dict/linked-list/list-interface/
+    // collection-interface classification, the vtable-less-builtin release,
+    // and the general user-class fallback — factored out of
+    // `lowerCallDispatch`'s `.Dispose()` arm so `?.Dispose()`
+    // (lowerNullCondCall) shares the SAME classification instead of a
+    // second, partial copy (measured drift: `?.Dispose()` on a collection
+    // receiver read past the collection's runtime header — see the
+    // definition's comment and issue #4221). `target` is the receiver AST
+    // node; `recv` is its already-lowered pointer value. Returns false
+    // (emits nothing) when `recv` is not a non-null pointer value.
+    bool emitExplicitDisposeChain(const ast::Expr& target, llvm::Value* recv);
+
     // ── §28.11 v0.134 element-slot policy ────────────────────────────────
     // #602: a classification of a single collection element type and family
     // that drives all per-slot bookkeeping decisions.  The factory
