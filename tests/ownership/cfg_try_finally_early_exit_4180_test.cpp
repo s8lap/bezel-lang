@@ -152,6 +152,25 @@ const std::string kMaybeConsumedConsumeMsg =
 // through `catchDispatch` reaches it when the try body itself ends in
 // `return` and no `throw`/throwable-call is textually present), so the
 // finally's move went unanalyzed. per §21.7, §28.3, v0.298
+//
+// ⚠ KNOWN GAP, filed/closed as issue 4211 (this row's half of it): this row
+// no longer DISCRIMINATES a regression in #4180's OWN clone-based routing
+// mechanism (`routeExitThroughFinally`/`getOrMakeFinallyClone`) either —
+// same root cause as Row 2's own note below, confirmed by MEASUREMENT (not
+// just the issue's own "reasoned suspicion") with the identical 3-variant
+// methodology: reverting `ReturnStmt`'s call to `routeExitThroughFinally`
+// to its pre-#4180 direct edge (`cfg_.addEdge(from, cfg_.exit())`), while
+// keeping #4194's `addApproximateTryBodyExceptionEdge` intact, leaves this
+// row's assertions passing UNCHANGED. Reason: for this shape (single,
+// unnested try/finally, no catch arms), #4194's coarse edge from the
+// `return`'s own block ALWAYS reaches `catchDispatch`, and since
+// `s.catches.empty()`, `catchDispatch`'s unconditional pass-through ALWAYS
+// then reaches the REAL (non-clone) `finallyEntry` too — carrying the SAME
+// already-moved state as the `routeExitThroughFinally` edge, because both
+// edges originate from the SAME block. This is structural to the shape, not
+// a defect in this row: see `tests/flow/cfg_finally_clone_routing_4211_test.cpp`
+// (fix #4211) for a STRUCTURAL CFG-edge test that isolates
+// `routeExitThroughFinally` specifically, immune to this contamination.
 BEZEL_TEST(cfg_try_finally_early_exit_4180,
            return_through_active_finally_rejects_double_move_21_7) {
     std::string src =
@@ -212,18 +231,28 @@ BEZEL_TEST(cfg_try_finally_early_exit_4180,
 // soundness regression: assert the family Row 3 already uses instead of the
 // single message that no longer fires in THIS shape.
 //
-// ⚠ KNOWN GAP, filed as issue 4211: this row no longer DISCRIMINATES a
+// ⚠ KNOWN GAP, closed as issue 4211 by accepting the narrower claim (this
+// row's own suggested option 2): this row no longer DISCRIMINATES a
 // regression in #4180's OWN clone-based routing mechanism
 // (`routeExitThroughFinally`/`getOrMakeFinallyClone`) specifically.
 // MEASURED (three isolated `CFG.cpp` variants built against this exact
-// program): with #4180's `break` routing reverted to its pre-#4180 direct
-// edge (so the clone does nothing) but #4194's new coarse exception edge
-// kept, the SAME maybe-consumed diagnostics still fire — #4194's edge alone
-// is now sufficient to make the real (non-clone) finally reachable and trip
-// the SAME unrelated back-edge artifact. If #4180's clone routing regressed
-// tomorrow, this row would not catch it. See issue 4211 for the fix
-// direction (an uncontaminated #4180-only row, or accepting the narrower
-// claim this row now makes). per §21.5, §28.3, v0.298
+// program, `/var/tmp/bezel-scratch/r18/iso-4211-neutered`): with #4180's
+// `break` routing reverted to its pre-#4180 direct edge (so the clone does
+// nothing) but #4194's new coarse exception edge kept, the SAME
+// maybe-consumed diagnostics still fire — #4194's edge alone is now
+// sufficient to make the real (non-clone) finally reachable and trip the
+// SAME unrelated back-edge artifact. If #4180's clone routing regressed
+// tomorrow, this row would not catch it — it would still report the same
+// maybe-consumed diagnostics via #4194's edge alone. This row (and Row 1,
+// see its own note above — measured the same way, same root cause) now
+// primarily pins "the try body + finally still reject a real double-move in
+// this shape", not "#4180's specific routing mechanism".
+// `tests/flow/cfg_finally_clone_routing_4211_test.cpp` (fix #4211) carries a
+// DIFFERENT, uncontaminated regression test for `routeExitThroughFinally`
+// specifically — a direct structural assertion on the CFG's own edges,
+// immune to #4194's coarse-edge contamination (its target block carries no
+// `stmts`, so it can never be mistaken for a finally clone's entry). per
+// §21.5, §28.3, v0.298
 BEZEL_TEST(cfg_try_finally_early_exit_4180,
            break_through_active_finally_rejects_double_move_21_5) {
     std::string src =
