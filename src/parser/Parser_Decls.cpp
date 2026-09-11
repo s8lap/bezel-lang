@@ -632,6 +632,21 @@ std::unique_ptr<ast::TopDecl> Parser::parseExtensionDecl(
     ext->genericConstraints = parseGenericConstraints();
     while (!isKeyword("end") &&
            current_.kind != TokenKind::EndOfFile) {
+        // fix #4222 (§26.3, Appendix A.4, v0.298): mirrors
+        // `parseTypeDeclBody`'s class/record special-case peek just above
+        // (`isKeyword("polymorphic") && peekAt(1).text == "("`) — `polymorphic`
+        // is contextual (only a member clause when immediately followed by
+        // `(`; otherwise it is an ordinary identifier, e.g. a field or method
+        // name). Without this peek, `parseMember()` below has no arm for a
+        // bare `polymorphic` identifier and cascades one generic parse-error
+        // diagnostic per stray token instead of the one clean §26.3
+        // rejection this produces.
+        if (current_.kind == TokenKind::Identifier &&
+            current_.text == "polymorphic" &&
+            peekAt(1).text == "(") {
+            parseAndDiscardExtensionPolymorphicMember();
+            continue;
+        }
         auto m = parseMember();
         if (m) {
             ext->members.push_back(std::move(m));
@@ -2220,6 +2235,48 @@ void Parser::parsePolymorphicMember(ast::TypeDecl& decl) {
     }
 }
 
+// fix #4222 (§26.3 "Restrictions" / Appendix A.4 `PolymorphicMember` clause,
+// v0.298): `parseExtensionDecl`'s member loop's own peek-and-discard for a
+// `polymorphic(...)` clause. Deliberately NOT a call to
+// `parsePolymorphicMember(ast::TypeDecl&)` above — that function's token-
+// consumption logic was validated for a context that HAS a `TypeDecl` to
+// mutate (`decl.serializedClass->polyCases`); an extension body has no
+// `TypeDecl` at all, so calling it here would need a `TypeDecl&` to hand it
+// that does not exist (LANE_RULES §25: ask what a helper was validated for,
+// not what it looks like it does). Instead this walks the same token shape
+// — `"polymorphic" "(" (StringLiteral ":" Type)? ("," (StringLiteral ":"
+// Type))* ","? ")" ";"` — tracking only paren depth, and discards every
+// piece: no `PolyCase`, no `Type` AST is built, because nothing here owns a
+// place to put them. `depth` also survives a malformed clause without
+// looping forever: the `!= EndOfFile` guard bounds it even if a `)` is
+// missing, and a missing trailing `;` is simply not consumed (the outer
+// member loop's own `else if (current_.kind != TokenKind::EndOfFile)
+// advance();` fallback still makes progress on whatever comes next).
+void Parser::parseAndDiscardExtensionPolymorphicMember() {
+    const SourceLocation loc = current_.location;  // the `polymorphic` token
+    advance();  // past `polymorphic`
+    if (consumePunctuator("(")) {
+        int depth = 1;
+        while (depth > 0 && current_.kind != TokenKind::EndOfFile) {
+            if (isPunctuator("(")) {
+                ++depth;
+            } else if (isPunctuator(")")) {
+                --depth;
+                if (depth == 0) {
+                    advance();  // consume the closing ')'
+                    break;
+                }
+            }
+            advance();
+        }
+    }
+    consumePunctuator(";");
+    diagnostics_.report(
+        Severity::Error, loc,
+        "an extension block may not declare a `polymorphic` member "
+        "registry — Appendix A.4's `ExtensionMember` grammar admits only "
+        "methods and expression-bodied properties (§26.3)");
+}
 
 std::unique_ptr<ast::MethodDecl> Parser::parseMethodDeclBody(
     ast::Visibility visibility, std::vector<std::string_view> modifiers,
