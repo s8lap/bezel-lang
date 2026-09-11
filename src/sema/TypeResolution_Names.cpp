@@ -2121,6 +2121,76 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                             "<\xE2\x80\xA6>` for value elements.");
                     }
                 }
+                // §14.2 (fix #4305): a null-declaration builtin generic (this
+                // whole `if (arity != kNotBuiltin)` branch — no synthesized
+                // TypeSymbol) has no `tsym` for `checkGenericConstraints`
+                // below (its `if (tsym && ...)` gate) to run against, so a
+                // `where <slot>: class` constraint declared on the type's OWN
+                // stdlib signature was never verified for any of them.
+                // Measured (issue #4305): `default(DrainedEntry<int,
+                // SomeRecord>)` compiled and ran clean despite `DrainedEntry
+                // <K, V>: IDisposable where V: class` (stdlib §4.9).
+                //
+                // This table covers every null-declaration builtin generic
+                // whose stdlib declaration carries a plain `where <slot>:
+                // class` constraint AND is not already enforced by a
+                // different, purpose-built check:
+                //   - OwningArray/OwningSet/OwningStack/OwningQueue/
+                //     OwningLinkedList (slot 0) and OwningDictionary (slot 1)
+                //     are DELIBERATELY EXCLUDED: the `ownedSlot` /
+                //     `owningElementBadDesc` check immediately above (stdlib
+                //     §4.2/§14.4, #1327) already enforces their identical
+                //     "class or interface element" requirement — measured
+                //     `default(OwningArray<SomeRecord>)` already rejects
+                //     ("requires a class or interface element type"), so a
+                //     second check here would duplicate that diagnostic for
+                //     the same condition rather than close a real gap.
+                //   - Atomic/AtomicInteger (`where T: value`), Channel/
+                //     ChannelSender (`where T: sendable`), and
+                //     SortedDictionary/SortedSet (`where K/T:
+                //     IComparable<K/T>`, a self-referential type bound) are a
+                //     DIFFERENT constraint kind each — not `class` — and are
+                //     out of scope for this table; measured still-open and
+                //     filed separately (issue #4318).
+                // Reuses `checkOneConstraint` — the SAME authority that
+                // verifies a `where T: class` clause for a real TypeSymbol
+                // (TypeResolution_Checks.cpp) — with a synthesized
+                // `GenericParamConstraint{kind="class"}` standing in for the
+                // constraint a real TypeSymbol would have carried. This is
+                // not a new classification predicate (§6/§25): it is the
+                // existing "does this arg satisfy a `class` bound" check,
+                // called for a population that had no TypeSymbol to attach
+                // its own declared constraint to.
+                {
+                    struct NullDeclClassConstraint {
+                        std::string_view name;
+                        std::size_t slot;
+                        std::string_view paramName;
+                    };
+                    static constexpr NullDeclClassConstraint
+                        kNullDeclClassConstraints[] = {
+                            {"DrainedEntry", 1, "V"},               // §4.9
+                            {"Shared", 0, "T"},                     // §2.16
+                            {"Weak", 0, "T"},                       // §2.16
+                            {"IOwningEnumerable", 0, "T"},          // §4
+                            {"IOwningEnumerator", 0, "T"},          // §4
+                            {"IOwningAsyncEnumerable", 0, "T"},     // §4
+                            {"IOwningAsyncEnumerator", 0, "T"},     // §4
+                            {"OwningTaskCompletionSource", 0, "T"}, // §6.6
+                        };
+                    for (const auto& c : kNullDeclClassConstraints) {
+                        if (first != c.name) continue;
+                        if (c.slot < ref.genericArgs.size() &&
+                            c.slot < t.genericArgs.size()) {
+                            checkOneConstraint(
+                                t.span.begin, c.paramName,
+                                GenericParamConstraint{.kind = "class"},
+                                t.genericArgs[c.slot].get(),
+                                ref.genericArgs[c.slot], scope);
+                        }
+                        break;
+                    }
+                }
                 // §3.6 / §8.3 (v0.158, #1338): record a hash-container key /
                 // element instantiation (`Dictionary`/`OwningDictionary` key K,
                 // `Set`/`OwningSet` element T) so checkHashContainerKeys can
