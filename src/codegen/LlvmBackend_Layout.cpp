@@ -6252,6 +6252,29 @@ llvm::Value* Emitter::emitValueEquality(llvm::Value* l, llvm::Value* r,
     if (fieldTy && fieldTy->kind == K::Named && fieldTy->declaration &&
         fieldTy->declaration->kind == ast::TypeDeclKind::Record &&
         l->getType()->isStructTy()) {
+        // fix #4251 (§9.1/§14.1/§4.6, v0.298): install THIS field's own
+        // generic substitution before the memoized helper's body is (first)
+        // built. Issue #462 installs `RecordSubstGuard` only at the
+        // TOP-LEVEL `=`/`Equals` dispatch (LlvmBackend_Exprs.cpp's
+        // `eqSubst`); a NON-generic outer record whose FIELD is a generic
+        // record (`record SoloStr(BS: Box<string>)`) never gets any guard
+        // for that field's own instantiation, so `recordEqualityHelperFn`'s
+        // body (built via `emitStructEquality` on `Box`'s AST decl) ran
+        // `recordMemberTypeResolved` on Box's `V: T` field under an EMPTY
+        // `genericSubstSemaTy_` — it came back bare, unresolved `T`, which
+        // the string-content-equality arm above never matches, so it fell
+        // to the raw-shape fallback's `ICmpEQ` on the two `bz_string*`
+        // pointers: REFERENCE equality, not §4.6 content equality (measured:
+        // `SoloStr(Box("hi")) = SoloStr(Box("hi"))` was `False`). `fieldTy`
+        // here already carries the CONCRETE `genericArgs` (`Box<string>`),
+        // so a guard keyed on it binds `T` -> `string` for exactly this
+        // (first) build. A no-op for a non-generic nested record (empty
+        // `genericArgs`) or an already-concrete one. `RecordSubstGuard`'s
+        // own ctor resolves each arg through the CURRENTLY active (outer)
+        // substitution before overwriting it, so this also chains correctly
+        // when the outer record is itself generic and this field's arg is
+        // that outer type parameter.
+        RecordSubstGuard fieldSubst(this, fieldTy);
         auto* recTy = llvm::cast<llvm::StructType>(l->getType());
         llvm::Function* helper =
             recordEqualityHelperFn(fieldTy->declaration, recTy);

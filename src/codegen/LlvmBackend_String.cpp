@@ -3254,6 +3254,15 @@ llvm::Value* Emitter::emitValueToString(llvm::Value* val,
             // correct struct type, not one re-derived from `ts` alone.
             // Spill `val` so the helper can take it by pointer (the same
             // spill idiom the user-override arm above already uses).
+            //
+            // fix #4251 (§9.1/§14.1/§8.5, v0.298): install THIS field's own
+            // generic substitution before the memoized helper's body is
+            // (first) built — the ToString sibling of the identical
+            // Equals/GetHashCode gap (see emitValueEquality's nested-record
+            // arm, LlvmBackend_Layout.cpp, for the full mechanism). `fieldTy`
+            // already carries the CONCRETE `genericArgs` for this field
+            // (e.g. `Box<string>`); a no-op for a non-generic nested record.
+            RecordSubstGuard fieldSubst(this, fieldTy);
             auto* recTy = llvm::cast<llvm::StructType>(val->getType());
             llvm::Function* helper = recordToStringHelperFn(ts, recTy);
             llvm::AllocaInst* spill = entryAlloca(recTy);
@@ -4104,6 +4113,21 @@ llvm::Value* Emitter::emitValueHashCode(llvm::Value* val,
     if (fieldTy && fieldTy->kind == K::Named && fieldTy->declaration &&
         fieldTy->declaration->kind == ast::TypeDeclKind::Record &&
         val->getType()->isStructTy()) {
+        // fix #4251 (§9.1/§14.1/§4.6, v0.298): install THIS field's own
+        // generic substitution before the memoized helper's body is (first)
+        // built — the GetHashCode sibling of the identical Equals gap (see
+        // emitValueEquality's nested-record arm, LlvmBackend_Layout.cpp, for
+        // the full mechanism). Pre-fix, `recordMemberTypeResolved` returned
+        // Box's `V: T` field bare-unresolved under the empty ambient subst,
+        // and NEITHER the string-hash arm (which requires `fieldTy->kind ==
+        // Primitive`) nor any other typed arm matched a bare `Named`/no-decl
+        // `T` — it fell all the way to this function's final catch-all
+        // `return builder_.getInt32(0)`, a CONTENT-INDEPENDENT CONSTANT
+        // (measured: `SoloStr(Box("hi")).GetHashCode() ==
+        // SoloStr(Box("bye")).GetHashCode()`, both hashing to the same
+        // value). `fieldTy` already carries the CONCRETE `genericArgs`
+        // (`Box<string>`); a no-op for a non-generic nested record.
+        RecordSubstGuard fieldSubst(this, fieldTy);
         auto* recTy = llvm::cast<llvm::StructType>(val->getType());
         llvm::Function* helper =
             recordHashCodeHelperFn(fieldTy->declaration, recTy);
