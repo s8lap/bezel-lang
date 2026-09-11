@@ -12,6 +12,7 @@
 #include "sema/TypeResolution.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <functional>
 #include <set>
@@ -7765,6 +7766,88 @@ bool Resolver::argSatisfiesTypeBound(const TypeRef* arg, const TypeRef* bound) {
     return false;
 }
 
+namespace {
+// fix #4309 (§14.2/§17.11, v0.298; send-back on #4294) — the CLOSED set of
+// builtin, null-declaration INTERFACE names consulted by BOTH
+// `Resolver::argSatisfiesNew` and `typeHasNoDefaultWalk` below, replacing
+// two independent by-name lists (§6: "two spellings of one set is how the
+// next omission happens" — exactly how #4294 itself covered `IGrouping`
+// without covering its 25 siblings).
+//
+// DERIVED, NOT RE-TYPED: every name here is (a) an `I*` head present in
+// `Resolver::builtinTypeArity`'s table (TypeResolution_Names.cpp) — so it
+// resolves as a builtin type at all — and (b) NOT one of the seven names
+// `SemaContext::isSynthesizedBuiltinInterfaceName` mints a REAL synthesized
+// `TypeSymbol` for (IComparable, IEquatable, IEqualityComparer,
+// IReadOnlySpan, INumber, ISteppable, IParsable). Those seven already reach
+// the TypeSymbol-backed `d->kind == ast::TypeDeclKind::Interface` arms
+// directly (both below) and need no entry here.
+//
+// `IGrouping` is DELIBERATELY excluded even though it is a null-declaration
+// interface in `builtinTypeArity`: fix #4294 gave it its own two-line
+// branch (this file, both sites, search "fix #4294") on a considered
+// judgement call — that it is a separate, self-contained addition, not a
+// candidate for folding into a shared list this round. This set should not
+// silently re-merge it; if `IGrouping` is ever folded in, that is its own
+// decision to record, not a side effect of this one.
+//
+// `tests/sema/*4309*` asserts, for every name in this array,
+// `isBuiltinTypeName(name)` is true (still present in `builtinTypeArity`)
+// and `SemaContext::isSynthesizedBuiltinInterfaceName(name)` is false
+// (still absent from the synthesized set) — so a future change to EITHER
+// authoritative table that would silently invalidate this derivation fails
+// that test instead of silently changing what §14.2/§17.11 reject.
+//
+// §14.2 makes every member unconditionally non-constructible ("Interface
+// substitutions never satisfy `new()` — no constructor exists") and §17.11
+// makes every member unconditionally non-defaultable ("Not defaultable:
+// non-nullable reference types" — every interface is one). Both rules are
+// categorical, with no per-type fact to get wrong (unlike DictionaryEntry/
+// DrainedEntry, whose defaultability/constraint checking is instantiation-
+// dependent) — so one closed, enumerable set safely answers BOTH questions.
+//
+// NOT `common::BuiltinRegistry.cpp`'s `kBuiltinInterfaceHeads` (22 names,
+// ~line 424): that table is validated for a DIFFERENT question — "whose
+// runtime value may be a USER class" (the exact complement of
+// `isVtableLessBuiltinClassName`, a runtime-representation/disposal
+// classification), and its own membership proves the mismatch: it
+// deliberately EXCLUDES `IDisposable`/`IAsyncDisposable` (different
+// runtime representation), lacks `IOrderedEnumerable`/`IFormattable`
+// entirely, and INCLUDES `IGrouping` (excluded here, see above). Agreeing
+// on 18 of 22 names is not the same question (§25) — reusing it here would
+// silently drop four names from this fix's coverage and wrongly fold
+// `IGrouping` back in.
+constexpr std::array<std::string_view, 25>
+    kNonConstructibleBuiltinInterfaceNames = {
+        // arity-0 (stdlib §2.14/§2.15/§2.18; builtinTypeArity's first block)
+        "IDisposable", "IAsyncDisposable", "ISerializable",
+        "IDeserializable", "ISerializer", "IDeserializer", "IFormattable",
+        // arity-1 (stdlib §2.8-§2.9/§4/§5/§6.5; builtinTypeArity's arity-1
+        // block)
+        "IEnumerable", "IEnumerator", "IOrderedEnumerable",
+        "IAsyncEnumerable", "IAsyncEnumerator", "IOwningEnumerable",
+        "IOwningEnumerator", "IOwningAsyncEnumerable",
+        "IOwningAsyncEnumerator", "IReadOnlyCollection", "IReadOnlyList",
+        "ICollection", "IList", "IOwningCollection", "IOwningList",
+        "IEvent", "IAsyncEvent", "ISharedEvent",
+};
+
+bool isNonConstructibleBuiltinInterfaceName(std::string_view head) {
+    return std::find(kNonConstructibleBuiltinInterfaceNames.begin(),
+                      kNonConstructibleBuiltinInterfaceNames.end(),
+                      head) != kNonConstructibleBuiltinInterfaceNames.end();
+}
+}  // namespace
+
+// Free-function wrapper exposing `kNonConstructibleBuiltinInterfaceNames`
+// (just above) for `tests/sema/*4309*`'s membership assertion — see that
+// array's own comment, and the header declaration in TypeResolution.hpp,
+// for why this is a `const&` onto the SAME array both call sites below
+// consult, not a second copy.
+const std::array<std::string_view, 25>& nonConstructibleBuiltinInterfaceNames() {
+    return kNonConstructibleBuiltinInterfaceNames;
+}
+
 bool Resolver::argSatisfiesNew(const TypeRef* arg, bool& decided) {
     decided = false;
     if (!arg) return false;
@@ -8051,6 +8134,29 @@ bool Resolver::argSatisfiesNew(const TypeRef* arg, bool& decided) {
         // template-body backstop notes) and ran (exit 0) — a silent,
         // degraded-to-zero accept of a non-constructible substitution.
         if (head == "IGrouping") {
+            decided = true;
+            return false;  // interfaces are not constructible (§14.2), same
+                            // rule as the TypeSymbol-backed Interface arm
+        }
+        // fix #4309 (§14.2, v0.298; send-back on #4294): the 25-name closed
+        // set of every OTHER null-declaration builtin interface — see
+        // `kNonConstructibleBuiltinInterfaceNames`'s own comment above for
+        // the derivation and why `IGrouping` (just above) and the
+        // TypeSymbol-backed seven (IComparable/IEquatable/
+        // IEqualityComparer/IReadOnlySpan/INumber/ISteppable/IParsable)
+        // are not in it. Same rule as the TypeSymbol-backed Interface arm
+        // and the IGrouping branch immediately above: §14.2, "Interface
+        // substitutions never satisfy `new()` — no constructor exists".
+        //
+        // MEASURED (issue #4309, this file's own parent `e0182bc`, clean
+        // tree, `bezelc` rebuilt directly): e.g. `HolderX<IEnumerable<int>>
+        // .Make()`, `HolderY<IDisposable>.Make()`,
+        // `HolderZ<IOrderedEnumerable<int>>.Make()` under `where T: new()`
+        // all compiled with no §14.2 diagnostic (only the pre-existing
+        // #2477/#2491 dead-abstract-template-body backstop notes) and ran
+        // (exit 0) — the identical silent-accept symptom #4294 fixed for
+        // `IGrouping` alone, reproduced on every other name in the set.
+        if (isNonConstructibleBuiltinInterfaceName(head)) {
             decided = true;
             return false;  // interfaces are not constructible (§14.2), same
                             // rule as the TypeSymbol-backed Interface arm
@@ -8423,6 +8529,32 @@ bool typeHasNoDefaultWalk(const TypeRef* t, const common::RecordSubstEnv* incomi
                     // non-nullable reference types") requires a compile-time
                     // error.
                     if (head == "IGrouping") {
+                        return true;  // interface: non-nullable reference
+                                      // type (§17.11), unconditionally
+                    }
+                    // fix #4309 (§17.11, v0.298; send-back on #4294): the
+                    // 25-name closed set of every OTHER null-declaration
+                    // builtin interface — see
+                    // `kNonConstructibleBuiltinInterfaceNames`'s own
+                    // comment (this file, above `Resolver::
+                    // argSatisfiesNew`) for the derivation and why
+                    // `IGrouping` (just above) and the TypeSymbol-backed
+                    // seven are not in it. Same rule as the TypeSymbol-
+                    // backed arm below (`k == Class || k == Interface ->
+                    // return !isValueBuiltin`, unconditionally true for
+                    // every interface): §17.11, "Not defaultable:
+                    // non-nullable reference types".
+                    //
+                    // MEASURED (issue #4309, this file's own parent
+                    // `e0182bc`, clean tree, `bezelc` rebuilt directly):
+                    // e.g. `default(IEnumerable<int>)`,
+                    // `default(IDisposable)`,
+                    // `default(IOrderedEnumerable<int>)` all compiled
+                    // clean (exit 0) and ran clean (exit 0) — the identical
+                    // silent zero-initialized-value symptom #4294 fixed for
+                    // `IGrouping` alone, reproduced on every other name in
+                    // the set.
+                    if (isNonConstructibleBuiltinInterfaceName(head)) {
                         return true;  // interface: non-nullable reference
                                       // type (§17.11), unconditionally
                     }

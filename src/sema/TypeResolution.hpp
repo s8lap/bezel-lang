@@ -29,6 +29,7 @@
 //   - Constraint-clause resolution (sema slice with constraint handling).
 //   - Variance compatibility checks (typecheck-time).
 
+#include <array>
 #include <string>
 #include <string_view>
 
@@ -169,6 +170,21 @@ bool overrideParamTypeMatches(const TypeRef* derivedTy, const TypeRef* baseTy,
 // without duplicating the built-in name list. Single source of truth:
 // delegates to Resolver::isBuiltinTypeName.
 bool isBuiltinTypeName(std::string_view n);
+
+// fix #4309 (§14.2/§17.11, v0.298; send-back on #4294): the closed set of
+// builtin, null-declaration INTERFACE names that `Resolver::argSatisfiesNew`
+// and `typeHasNoDefaultWalk` (TypeResolution_Checks.cpp) both reject
+// unconditionally as non-constructible (§14.2) / non-defaultable (§17.11) —
+// every `I*` name in `Resolver::builtinTypeArity`'s table EXCEPT the seven
+// `SemaContext::isSynthesizedBuiltinInterfaceName` names (which already get
+// a real, TypeSymbol-backed Interface arm) and `IGrouping` (fix #4294's own
+// deliberately separate two-line branch, kept apart — see that fix's commit
+// and TypeResolution_Checks.cpp's own comment beside this array's
+// definition). Exposed as a `const&` — not merely a membership predicate —
+// so `tests/sema/*4309*` can assert the SAME array both call sites consult
+// against the two authoritative tables it was derived from, rather than
+// re-typing a third copy of the name list in test code.
+const std::array<std::string_view, 25>& nonConstructibleBuiltinInterfaceNames();
 
 // §2.8.3 rule 4/§12.7/§19.3 (#1946, #2069): the STRICT runtime-reification oracle. A
 // type argument is runtime-reified — the per-monomorphization descriptor (#1843)
