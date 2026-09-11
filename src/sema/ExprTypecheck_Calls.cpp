@@ -20779,6 +20779,50 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
         const TypeRef* recvTy = ctx_.exprType(*ma.target);
         TypeRef synth;
         if (!recvTy) {
+            // fix #4238 (§26.4/§26.5, v0.298): a `this.Method(...)` self-call
+            // to a SIBLING member of the SAME generic extension block must
+            // resolve against `this`'s real static type — the extension's own
+            // declared target AS WRITTEN (`Box<W>`, with `W` still the free/
+            // unresolved type variable, since no external receiver has bound
+            // it yet) — not a bare zero-generic-argument `Box` reference.
+            // `this` is deliberately left untyped by the IdentifierExpr arm
+            // for a NAMED-type extension (ExprTypecheck_Exprs.cpp's #456/
+            // #2795 comments: publishing a general exprType for `this` would
+            // turn on every exprType(`this`) reader at once, including
+            // codegen's specialization-aware `indexReceiverDecl` path), so
+            // this fallback used to rebuild a receiver from `targetType`
+            // alone — the raw TypeSymbol pointer, which carries NO generic-
+            // argument list at all. For a NON-generic extension target that
+            // is harmless (0 genericArgs on both the synthesized receiver and
+            // the declared target), which is why `extension Box { ... this.
+            // Test(x) ... }` already worked — but for `extension Box<W>` the
+            // synthesized receiver had 0 args against the declared target's
+            // 1-arg head, so `extensionTargetMatchesReceiver`'s
+            // `target->genericArgs.size() != recv->genericArgs.size()` arity
+            // check always failed and `extensionFindMatchingAncestor` never
+            // matched — every self-call inside a multi-method generic
+            // extension was unresolvable, independent of whether the called
+            // member's own signature mentioned the free variable at all
+            // (distinct from #4233, which is about a member signature
+            // mentioning the free var). Reuse the SAME resolved TypeRef the
+            // per-candidate loop in `lookupExtensionMember` computes for
+            // `target` (`ctx_.resolvedType` caches by AST node, so this is
+            // the identical object, e.g. `Box<W>` with `W` unifying with
+            // itself trivially) — confined to the `this`-inside-its-own-
+            // extension shape, so no other exprType(`this`) reader is
+            // affected, matching #2795's own "resolved locally" precedent.
+            if (auto* tid = dynamic_cast<const ast::IdentifierExpr*>(
+                    ma.target.get())) {
+                if (tid->name == "this" && currentExtension_) {
+                    if (auto* ed = dynamic_cast<const ast::ExtensionDecl*>(
+                            currentExtension_->decl)) {
+                        if (ed->targetType)
+                            recvTy = ctx_.resolvedType(*ed->targetType);
+                    }
+                }
+            }
+        }
+        if (!recvTy) {
             synth.kind = TypeRef::Kind::Named;
             synth.declaration = targetType;
             recvTy = &synth;

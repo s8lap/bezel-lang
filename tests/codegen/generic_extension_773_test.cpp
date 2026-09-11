@@ -43,6 +43,8 @@
 // take the tests below as proof that discrepancy is explained, only that it
 // was not reproducible under the conditions tested here.
 
+#include "support/aot_result_asserts.hpp"  // diagnosticMessageContains,
+                                            // failedAtCompileTimeWithRealLocation
 #include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
@@ -285,4 +287,165 @@ BEZEL_TEST(generic_extension_773,
         "  using var o := new Other(); "
         "  return b.Combine(w1, o); "
         "end Main; end P;"));
+}
+
+// fix #4238 (§26.4/§26.5, v0.298): a `this.Method(...)` self-call to a
+// SIBLING member of the SAME GENERIC extension block never resolved at all —
+// "no extension method `Test` on type `Box` takes 1 argument(s) (§26.5)" —
+// even when NEITHER member's signature mentions the extension's free type
+// variable. Root cause: `this`'s static type inside a NAMED-type extension
+// is deliberately left unpublished (ExprTypecheck_Exprs.cpp's #456/#2795
+// comments), so `resolveMemberAccess`'s extension-lookup fallback (a `this`
+// target with no `exprType`) synthesized a receiver from `memberTargetType`'s
+// bare `TypeSymbol*` alone — carrying ZERO generic arguments, always,
+// regardless of how many the extended type actually declares. For a
+// GENERIC target (`extension Box<W>`) that 0-arg synthesized receiver could
+// never structurally match the extension's own declared 1-arg head
+// (`extensionTargetMatchesReceiver`'s `target->genericArgs.size() !=
+// recv->genericArgs.size()` arity check), so `extensionFindMatchingAncestor`
+// never matched and every candidate was silently dropped before the #4233
+// free-var-substitution code path is ever reached (confirmed: the arity-
+// specific diagnostic fired here comes from the SEPARATE `anySameNamedExtension`
+// name-only scan in resolveMemberAccess, which runs only after the arity-aware
+// `lookupExtensionMember` calls above it already returned null). Distinct
+// from #4233 (a member's own SIGNATURE mentioning the free var): this
+// reproduces even when neither `Test` nor `Caller` mentions `W` anywhere.
+// This test pins the MEASURED result value (7 + 1 = 8), not just "compiles",
+// so a call that silently degraded through the #2491/#2547 permissive-
+// member-access backstop (which returns a zero-initialized value) could not
+// pass this assertion.
+BEZEL_TEST(generic_extension_773,
+           self_call_inside_generic_extension_resolves_and_runs_4238) {
+    BEZEL_EXPECT_EQ(runFull(
+        "module M; "
+        "class Box<U> end Box; "
+        "extension Box<W> "
+        "  public method Test(x: int): int "
+        "    return x + 1; "
+        "  end Test; "
+        "  public method Caller(x: int): int "
+        "    return this.Test(x); "
+        "  end Caller; "
+        "end; "
+        "class C "
+        "  public static method Main(): int "
+        "    using var b := new Box<int>(); "
+        "    return b.Caller(7); "
+        "  end Main; "
+        "end C;"),
+        8);
+}
+
+// fix #4238 ACCEPT-SIDE CONTROL 1: the identical self-call shape inside a
+// NON-generic extension already worked (the 0-arg synthesized receiver
+// happened to match the target's 0-arg declared head by coincidence) and
+// must keep working after the fix. Uses a DIFFERENT input (10 -> 11) than
+// the generic-target row above so the two cannot be confused for one
+// another if either regresses.
+BEZEL_TEST(generic_extension_773,
+           self_call_inside_nongeneric_extension_control_keeps_working_4238) {
+    BEZEL_EXPECT_EQ(runFull(
+        "module M; "
+        "class Box end Box; "
+        "extension Box "
+        "  public method Test(x: int): int "
+        "    return x + 1; "
+        "  end Test; "
+        "  public method Caller(x: int): int "
+        "    return this.Test(x); "
+        "  end Caller; "
+        "end; "
+        "class C "
+        "  public static method Main(): int "
+        "    using var b := new Box(); "
+        "    return b.Caller(10); "
+        "  end Main; "
+        "end C;"),
+        11);
+}
+
+// fix #4238 ACCEPT-SIDE CONTROL 2: an EXTERNAL call (`b.Test(...)` from
+// outside the extension, not `this.` from a sibling member) on a GENERIC
+// extension target already worked — `ma.target`'s exprType is the concrete
+// `Box<int>` set by `new Box<int>()`, so this call never took the `this`-
+// synthesized-receiver fallback path this fix touches. Must keep working
+// unchanged.
+BEZEL_TEST(generic_extension_773,
+           external_call_on_generic_extension_control_keeps_working_4238) {
+    BEZEL_EXPECT_EQ(runFull(
+        "module M; "
+        "class Box<U> end Box; "
+        "extension Box<W> "
+        "  public method Test(x: int): int "
+        "    return x + 1; "
+        "  end Test; "
+        "end; "
+        "class C "
+        "  public static method Main(): int "
+        "    using var b := new Box<int>(); "
+        "    return b.Test(7); "
+        "  end Main; "
+        "end C;"),
+        8);
+}
+
+// fix #4238 + #4233 COMBINED: a self-call to a sibling member whose
+// signature DOES mention the extension's free type variable (`Peek(): W`)
+// must resolve AND substitute correctly through the self-call path too —
+// the binding `lookupExtensionMember` computes for a `this` receiver maps
+// the free var to itself (no external instantiation has bound it yet
+// inside the extension's own body), so `checkArgsAgainstParams`'s #4233
+// substitution is a no-op here, but the CALL must still resolve at all
+// (the #4238 defect this file's other new tests pin) and the field read
+// through `this._v` must reach the correct storage. Pins a value (199)
+// that neither a zero-initialized degrade nor a mismatched-field-offset
+// read could plausibly produce.
+BEZEL_TEST(generic_extension_773,
+           self_call_free_var_signature_member_resolves_and_runs_4238) {
+    BEZEL_EXPECT_EQ(runFull(
+        "module M; "
+        "class Box<U> "
+        "  public _v: U; "
+        "  public constructor(v: U) _v := v; end; "
+        "end Box; "
+        "extension Box<W> "
+        "  public method Peek(): W => this._v; "
+        "  public method CallPeek(): W => this.Peek(); "
+        "end; "
+        "class C "
+        "  public static method Main(): int "
+        "    using var b := new Box<int>(199); "
+        "    return b.CallPeek(); "
+        "  end Main; "
+        "end C;"),
+        199);
+}
+
+// fix #4238 SOUNDNESS CONTROL: a self-call to a member name that is not
+// declared ANYWHERE (not on the extension, not on the extended type) must
+// stay cleanly rejected, with a real diagnostic naming the missing member —
+// the fix widens WHICH receivers the extension-lookup fallback matches, and
+// must not turn "no such member" into a silent accept. Asserts the
+// diagnostic TEXT (not just `hasErrors()`/`!ran`), per this run's own
+// discipline that `failedAtCompileTimeWithRealLocation` alone is true for a
+// compiler crash too — paired here with the real location check as well.
+BEZEL_TEST(generic_extension_773,
+           self_call_genuinely_undefined_member_still_rejected_4238) {
+    auto r = runAot(
+        "module M; "
+        "class Box<U> end Box; "
+        "extension Box<W> "
+        "  public method Caller(x: int): int "
+        "    return this.NoSuchMethod(x); "
+        "  end Caller; "
+        "end; "
+        "class C "
+        "  public static method Main(): int "
+        "    using var b := new Box<int>(); "
+        "    return b.Caller(7); "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(bezel::test::failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(
+        r, "no member `NoSuchMethod` on type `Box`"));
 }
