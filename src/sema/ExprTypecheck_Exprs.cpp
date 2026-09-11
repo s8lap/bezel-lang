@@ -9288,6 +9288,7 @@ void ExprTC::visitChildren(const ast::Expr& e) {
             // per §15.4 (#3031): the predicate also consults the literal's
             // FORM. The empty literal `[]` is admitted at every §15.4
             // collection target — the empty carve-out is membership-only.
+            const ast::CollectionLiteralExpr* lamBodyAdmittedLiteral = nullptr;
             if (auto* clE = dynamic_cast<const ast::CollectionLiteralExpr*>(
                     lam->exprBody.get())) {
                 const bool isEmpty = !clE->isDict && clE->elements.empty();
@@ -9299,9 +9300,34 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                                                          clE->isDict)));
                 if (admitted) {
                     ctx_.setExprType(lam->exprBody.get(), lamTargetRet);
+                    lamBodyAdmittedLiteral = clE;
                 }
             }
             visitExpr(*lam->exprBody);
+            // fix #4323 (§5.1/§11.2, v0.298): the SEVENTH site fix #4310
+            // missed — an expression-bodied lambda's collection-literal body
+            // typed via an outer (INFERRED, not written) function-type
+            // target `lamTargetRet`. The admissibility gate above only
+            // re-derives "is this target on §15.4's list", exactly like
+            // #4310's other six call sites before that fix — it pre-sets the
+            // literal's own exprType to the target and never descends into
+            // the element expressions, so a class that never lists the
+            // target interface in its inheritance clause was silently
+            // accepted and interface dispatch on it read a null itable slot
+            // (measured SIGSEGV, #4323's own repro: `var f: () -> [1]IHolder
+            // := lambda() => [new Widget3(s)];` for a non-conforming
+            // `Widget3`). Call the SAME shared helper #4310 factored rather
+            // than hand-rolling an eighth element walk (§6/§25) — this is
+            // its seventh caller, not a new authority. Runs AFTER
+            // `visitExpr` above (unlike the other six sites, which visit
+            // their initializer/argument BEFORE this check) because here the
+            // target-threading and the literal's own visit happen in the
+            // opposite order — the elements must already be typed before
+            // `checkCollectionLiteralElementAssignability` reads their
+            // `exprType`.
+            if (lamBodyAdmittedLiteral)
+                checkCollectionLiteralElementAssignability(
+                    *lamBodyAdmittedLiteral, lamTargetRet);
         }
         currentLiteralWideningHint_ = saveLamWideningHint;
         // per §15.4 (#1693): a collection literal has no standalone type — it is
