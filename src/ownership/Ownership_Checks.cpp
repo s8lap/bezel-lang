@@ -5,6 +5,10 @@
                                     // written walkers' per-kind dispatch)
 
 #include <algorithm>
+#include <cstdio>   // fix #4312/#4313 (§28.3, v0.298): std::fprintf for the
+                    // loud joinInto catch-all audit check, below
+#include <cstdlib>  // ... and std::abort, matching src/common/AwaitScan.cpp's
+                    // / src/sema/TypeResolution_Names.cpp's convention
 #include <functional>
 #include <optional>
 #include <string>
@@ -2540,8 +2544,20 @@ void MethodOwnership::checkRead(const ast::Expr& e, bool selfTarget) {
         // Sink.Take(move n); end; Reader.Peek(n);` inside a loop compiled
         // clean with zero diagnostics even after the markMovedByName fix
         // below, silently accepting a borrow of what may be freed memory.
+        //
+        // fix #4312 (§28.3, v0.298): widened from `state == Owned` alone to
+        // also fire on `state == Borrowed` — `joinInto`'s new
+        // `borrowedMovedFromSplit` (Ownership_Checks.cpp, this file) now
+        // populates this SAME flag on a Borrowed record (a rebind-then-move
+        // on one if-arm of a plain alias holder, the other arm a live
+        // untouched borrow), the exact same widening shape `fix #4247`
+        // already applied to `disposedOnSomePath` two guards below. See that
+        // join arm's own comment for why `maybeConsumed` (not
+        // `disposedOnSomePath`) is the right flag for the move-discharge
+        // case. // per §28.3, v0.298, #4312
         if (st->maybeConsumed &&
-            st->state == OwnershipState::Owned) {
+            (st->state == OwnershipState::Owned ||
+             st->state == OwnershipState::Borrowed)) {
             report(
                 Severity::Error, id->span.begin,
                 std::string("local `") + std::string(id->name) +
@@ -3677,10 +3693,32 @@ void MethodOwnership::reportMovedFromCapturesIn(const ast::LambdaExpr& lam,
         // here would silently suppress the second). The reportedMovedFromCaptures_
         // set de-duplicates per IdentifierExpr pointer so a nested lambda
         // doesn't double-report.
+        //
+        // fix #4312/#4313 (§28.3, v0.298): BOTH gates below widened from
+        // `state == Owned` alone to also fire on `state == Borrowed`. This
+        // closes issue 4313: `fix #4247`'s own new comment in
+        // OwnershipState.hpp (~L230) claimed the Borrowed+disposedOnSomePath
+        // capture gap was "separately-filed" when no such issue existed — a
+        // captured Borrowed+disposedOnSomePath local (e.g. `var y := x; if
+        // cond then y := new Res(1); y.Dispose(); end; var f := lambda(): int
+        // => y.tag;`) compiled with ZERO diagnostics and, 200x
+        // loop-amplified, crashed `AddressSanitizer: SEGV` inside the
+        // lambda body (issue 4313's own repro). `maybeConsumedAtLiteral` is
+        // widened for the same reason and by the same shape: `joinInto`'s new
+        // `borrowedMovedFromSplit` (fix #4312, this file) populates
+        // `maybeConsumed` on a Borrowed record for the first time, exactly as
+        // `borrowedDischargedSplit` (fix #4247) did for `disposedOnSomePath`
+        // — leaving this gate Owned-only would silently reopen the identical
+        // capture-read gap for the move-discharge sibling of #4313's own
+        // dispose-discharge case. // per §28.3, v0.298, #4312, #4313
         const bool maybeConsumedAtLiteral =
-            st.maybeConsumed && st.state == OwnershipState::Owned;
+            st.maybeConsumed &&
+            (st.state == OwnershipState::Owned ||
+             st.state == OwnershipState::Borrowed);
         const bool disposedOnSomePathAtLiteral =
-            st.disposedOnSomePath && st.state == OwnershipState::Owned;
+            st.disposedOnSomePath &&
+            (st.state == OwnershipState::Owned ||
+             st.state == OwnershipState::Borrowed);
         const bool disposedAtLiteral =
             st.state == OwnershipState::Disposed;
         // fix #3755 (review follow-up): the same-STATEMENT leg — the states
@@ -8583,6 +8621,67 @@ const ast::IdentifierExpr* MethodOwnership::identifierRoot(const ast::Expr& e) {
     return nullptr;
 }
 
+// fix #4312/#4313 (§28.3, v0.298): the four OwnershipState values that carry
+// a live discharge obligation, a live borrow, or a specific discharge
+// history — as opposed to Uninitialized/PolyNull/Poisoned, which are
+// bookkeeping states `joinInto`'s catch-all is intentionally still allowed
+// to reach (see that catch-all's own comment for why each of those three is
+// safe). Used only by `unhandledCoreOwnershipStateJoin`'s guard, below.
+static bool isCoreOwnershipStateForJoinAudit(OwnershipState s) {
+    return s == OwnershipState::Owned || s == OwnershipState::Borrowed ||
+           s == OwnershipState::MovedFrom || s == OwnershipState::Disposed;
+}
+
+// Loud, UNCONDITIONAL failure (never compiled out by NDEBUG — matching
+// src/common/AwaitScan.cpp's and src/sema/TypeResolution_Names.cpp's
+// `unhandledNullDeclClassConstraintSlot` convention rather than a plain
+// assert(), which release builds strip) for a mismatched pair of CORE
+// ownership states reaching `joinInto`'s generic "other mismatches"
+// catch-all.
+//
+// fix #4312/#4313 (§28.3, v0.298) audited `joinInto`'s full state-pair
+// matrix: of the 21 unordered mismatched pairs among OwnershipState's 7
+// values, every pair drawn from {Owned, Borrowed, MovedFrom, Disposed} now
+// has a named arm (`ownedBorrowedClash`; `ownedDischargedSplit` for
+// Owned⊓{Disposed,MovedFrom}; `borrowedDischargedSplit` for
+// Borrowed⊓Disposed, fix #4247; `borrowedMovedFromSplit` and
+// `movedFromDischargedSplit`, both added by this fix, for Borrowed⊓MovedFrom
+// and MovedFrom⊓Disposed). This is exactly what this fix closed: BEFORE it,
+// both Borrowed⊓MovedFrom and MovedFrom⊓Disposed fell through to the
+// catch-all silently, and were confirmed measured heap-UAF/SEGV crashes
+// (issue 4312) — a "safety check that has never been seen to fire is
+// indistinguishable from one that cannot fire" (this run's LANE_RULES §31),
+// except in the OTHER direction: there was no check at all, just silence.
+//
+// Every remaining pair the catch-all is STILL meant to reach involves
+// Uninitialized, PolyNull, or Poisoned, and each is safe by a DIFFERENT,
+// already-audited mechanism (see the catch-all's own comment), so a
+// mismatch where BOTH sides are core states reaching here can only mean an
+// 8th OwnershipState value was added without a matching `joinInto` arm, or
+// this audit's completeness has silently gone stale under a later edit.
+// Crashing loudly in EVERY build (not just debug) turns that silent-failure
+// mode into an immediate, attributable compiler crash instead of a
+// re-poisoned local that quietly stops being checked — the exact failure
+// shape #4247/#4312/#4313 all are. // per §28.3, v0.298
+[[noreturn]] static void unhandledCoreOwnershipStateJoin(
+        std::string_view symName, OwnershipState a, OwnershipState b,
+        SourceLocation loc) {
+    std::string_view an = ownershipStateName(a);
+    std::string_view bn = ownershipStateName(b);
+    std::fprintf(stderr,
+        "internal compiler error: src/ownership/Ownership_Checks.cpp's "
+        "MethodOwnership::joinInto has no named arm for the mismatched pair "
+        "(%.*s, %.*s) on local `%.*s` at %u:%u -- fix #4312/#4313's audit "
+        "assumed every Owned/Borrowed/MovedFrom/Disposed mismatch is named; "
+        "either a new OwnershipState value was added without a matching "
+        "joinInto arm, or that assumption is now stale (§28.3, v0.298)\n",
+        static_cast<int>(an.size()), an.data(),
+        static_cast<int>(bn.size()), bn.data(),
+        static_cast<int>(symName.size()), symName.data(),
+        loc.line, loc.column);
+    std::abort();
+}
+
 void MethodOwnership::joinInto(std::unordered_map<sema::Symbol*, LocalOwnership>& into,
               const std::unordered_map<sema::Symbol*,
                                        LocalOwnership>& other,
@@ -8593,18 +8692,28 @@ void MethodOwnership::joinInto(std::unordered_map<sema::Symbol*, LocalOwnership>
         const LocalOwnership& o = it->second;
         if (st.state == o.state) {
             // §28.3 (#1626): preserve the maybe-consumed marker across a
-            // same-state Owned ⊓ Owned merge (OR it). The marker is only ever
-            // set on the Owned state (the ownedDischargedSplit rule below, for
-            // the Owned ⊓ MovedFrom split only — see the rework note there), so
-            // this branch is the only same-state case where it is live. OR-ing
+            // same-state Owned ⊓ Owned merge (OR it). The marker was only
+            // ever set on the Owned state (the ownedDischargedSplit rule
+            // below, for the Owned ⊓ MovedFrom split only — see the rework
+            // note there) UNTIL fix #4312/#4313 (§28.3, v0.298) added a
+            // second producer — `borrowedMovedFromSplit` below now sets it on
+            // a surviving BORROWED record too (the alias-rebind mirror of
+            // `borrowedDischargedSplit`'s `disposedOnSomePath`). OR-ing
             // — rather than keeping `st`'s flag — is what makes the marker
-            // survive a loop back-edge: a loop-carried Owned local that became
-            // maybe-consumed (moved on one path in the body) inside the body
-            // must stay maybe-consumed at the header so a use in a later
-            // iteration (flowing around the back edge, which the spec forbids)
-            // is rejected. Keeping only `st`'s flag would let the freshly-owned
-            // incoming path wash the marker out and re-admit the use. // per §28.3
-            if (st.state == OwnershipState::Owned)
+            // survive a loop back-edge: a loop-carried Owned OR Borrowed
+            // local that became maybe-consumed (moved on one path in the
+            // body) inside the body must stay maybe-consumed at the header so
+            // a use in a later iteration (flowing around the back edge, which
+            // the spec forbids) is rejected. Keeping only `st`'s flag would
+            // let the freshly-unmarked incoming path wash the marker out and
+            // re-admit the use — EXACTLY the nested-if outer-join gap
+            // `borrowedDischargedSplit`'s own same-state `disposedOnSomePath`
+            // OR-merge (a few lines below) was widened to close for its flag;
+            // gating this OR-merge to `Owned` alone after `maybeConsumed`
+            // became populate-able on `Borrowed` would silently reopen the
+            // identical gap one flag over. // per §28.3, v0.298, #4312, #4313
+            if (st.state == OwnershipState::Owned ||
+                st.state == OwnershipState::Borrowed)
                 st.maybeConsumed = st.maybeConsumed || o.maybeConsumed;
             // fix #4236 send-back / §28.3, §28.6 (v0.298): this same-state
             // early `continue` kept ONLY `st`'s (branchEndStates.front(), the
@@ -8937,10 +9046,150 @@ void MethodOwnership::joinInto(std::unordered_map<sema::Symbol*, LocalOwnership>
             st.disposedOnSomePath = true;
             continue;
         }
-        // Other mismatches (e.g. Uninitialized on one side at a non-loop
-        // merge) — poison. The Owned ⊓ Uninitialized non-loop case retains
-        // the existing O4 treatment (silent poison; a subsequent read
-        // diagnoses), which the O4 branch-join tests pin.
+        // fix #4312 (§28.3, v0.298): MovedFrom ⊓ Disposed split — one
+        // incoming branch transferred the value OUT (`move`, an
+        // `owned`-argument transfer), the other explicitly `.Dispose()`d it.
+        // Filed alongside `borrowedMovedFromSplit` below as the other of the
+        // two remaining reachable cells `fix #4247`'s own audit missed (that
+        // fix closed Borrowed⊓Disposed only). Measured: pre-fix, `var x :=
+        // new Res(5); if cond then x.Dispose(); else Sink.Take(move x); end;
+        // var t := x.tag;` compiled with ZERO diagnostics and, 200x
+        // loop-amplified, crashed `AddressSanitizer: SEGV ... READ memory
+        // access` at a near-null address (issue 4312 repro 1).
+        //
+        // Unlike `ownedDischargedSplit`, NEITHER side here is Owned, so there
+        // is no still-live discharge obligation to retain for the
+        // end-of-scope leak check: both incoming edges already fully
+        // discharged the local, just via different mechanisms (this file's
+        // `checkConsumeFreeze` already treats MovedFrom and Disposed
+        // identically as "already consumed/dead, cannot dangle" — see that
+        // function, above).
+        //
+        // THE MERGE OPERATOR: pick the STRICTER of the two terminal
+        // classifications — an OR over DANGER SEVERITY, not over a boolean
+        // flag, but the same "favor soundness over permissiveness" posture
+        // `ownedBorrowedClash` and `explicitDisposeReclaimedSlot`'s AND-merge
+        // already apply one level up. A subsequent read/dispose/move is
+        // unsafe on BOTH incoming paths, but the two states' existing
+        // consumers diagnose that danger at different severities: the
+        // MovedFrom edge's value may already be PHYSICALLY FREED by its new
+        // owner, and `checkRead`'s `state == MovedFrom` arm reports a hard
+        // §28.3 ERROR unconditionally for exactly that; the Disposed edge's
+        // value was explicitly freed by `.Dispose()`, and `checkRead`'s
+        // `state == Disposed` arm reports only a §28.2 WARNING (the
+        // checked-mode disposed-flag backstop makes a dominating
+        // use-after-dispose merely undefined-in-UNCHECKED-mode, not
+        // definitely-already-freed-by-someone-else). Merging to Disposed
+        // would under-diagnose the MovedFrom edge's read with a mere
+        // WARNING; merging to MovedFrom makes every consumer (`checkRead`,
+        // `markMovedByName`, `markDisposedByName` — none of which gate this
+        // arm on `Owned`/`Borrowed`, so no further widening is needed) reject
+        // with ERROR regardless of which edge is live. The one thing this
+        // costs is a false reject of a post-join repeat-`.Dispose()` that
+        // would have been the Disposed edge's own idempotent no-op — but
+        // that shape is REACHABLE ONLY TOGETHER WITH the MovedFrom edge's
+        // genuine use-after-free danger in the very same program, so
+        // rejecting the whole program is sound, not an over-reject (the
+        // identical asymmetric choice `ownedBorrowedClash` already makes for
+        // Owned-vs-Borrowed). // per §28.3, v0.298, #4312
+        const bool movedFromDischargedSplit =
+            (st.state == OwnershipState::MovedFrom &&
+             o.state == OwnershipState::Disposed) ||
+            (st.state == OwnershipState::Disposed &&
+             o.state == OwnershipState::MovedFrom);
+        if (movedFromDischargedSplit) {
+            st.state = OwnershipState::MovedFrom;
+            continue;
+        }
+        // fix #4312 (§28.3, v0.298): Borrowed ⊓ MovedFrom split — the exact
+        // symmetric case `fix #4247`'s own commit body named and explicitly
+        // deferred ("neither is the symmetric Borrowed ⊓ MovedFrom split ...
+        // left for a follow-up issue to keep this change scoped to the split
+        // this fix actually measured"). Same shape as `borrowedDischargedSplit`
+        // immediately above — a plain-identifier alias holder (`var y := x;`)
+        // rebound to a fresh owned value on one arm, the other arm a live
+        // untouched borrow of `x` — but the rebound value is discharged via
+        // `move`/an owned-argument transfer instead of `.Dispose()`. Measured:
+        // pre-fix, `var y := x; if cond then y := new Res(1); Sink.Take(move
+        // y); end; var t := y.tag;` compiled with ZERO diagnostics and, 200x
+        // loop-amplified, crashed `AddressSanitizer: heap-use-after-free`,
+        // freed inside `Sink.Take` (issue 4312 repro 2).
+        //
+        // THE MERGE OPERATOR: unlike `movedFromDischargedSplit` above, this
+        // is NOT a same-severity-upgrade choice between two terminal states
+        // — per #4312's own suggested fix shape, this needs `maybeConsumed`
+        // (the MOVED-FROM split's use-after-free marker — see
+        // `ownedDischargedSplit` above and OwnershipState.hpp's field
+        // comment), NOT `disposedOnSomePath`: the danger here is the
+        // MovedFrom side's use-after-free (the object may be physically
+        // freed by the receiver the value was moved into), which
+        // `maybeConsumed` already exists to flag; `disposedOnSomePath`'s
+        // semantics carve out an idempotent-Dispose exception that does not
+        // apply to a move. KEEP the BORROWED side's full record (so
+        // `source`/`disposeAliasSource` survive the join, mirroring
+        // `borrowedDischargedSplit`) and OR the flag in (`st.maybeConsumed =
+        // true` — the first time this arm runs on a given pair, `st` is
+        // whichever operand IS Borrowed and has never carried the flag
+        // before, since this is the first `joinInto` arm that ever populates
+        // `maybeConsumed` on a Borrowed record). Making `checkRead`'s
+        // existing `maybeConsumed` arm and `reportMovedFromCapturesIn`'s
+        // `maybeConsumedAtLiteral` gate (Ownership_Checks.cpp) — and this
+        // function's OWN same-state OR-merge for the flag, above — also fire
+        // on `state == Borrowed` is fix #4312/#4313's OTHER half; see those
+        // sites' own comments. `markDisposedByName` and `markMovedByName`
+        // already consult `maybeConsumed` UNCONDITIONALLY on state, so a
+        // post-join Dispose()/move needs no further change.
+        //
+        // Not `ownedBorrowedClash` (unconditional reject): mirroring
+        // `borrowedDischargedSplit`'s own reasoning, a Borrowed⊓MovedFrom
+        // merge NEVER touched again after the join is completely sound (§15
+        // accept-side control) — the move on the taken arm discharged a
+        // value `y` itself came to own via the rebind, and the not-taken
+        // arm's borrow of `x` remains `x`'s own obligation. Rejecting
+        // unconditionally at the join would false-reject that legitimate
+        // program. // per §28.3, v0.298, #4312
+        const bool borrowedMovedFromSplit =
+            (st.state == OwnershipState::Borrowed &&
+             o.state == OwnershipState::MovedFrom) ||
+            (st.state == OwnershipState::MovedFrom &&
+             o.state == OwnershipState::Borrowed);
+        if (borrowedMovedFromSplit) {
+            if (st.state != OwnershipState::Borrowed) st = o;
+            st.maybeConsumed = true;
+            continue;
+        }
+        // fix #4312/#4313 (§28.3, v0.298): LOUD, unconditional audit — see
+        // `unhandledCoreOwnershipStateJoin` and `isCoreOwnershipStateForJoinAudit`
+        // above this function — that a mismatch between two CORE states
+        // (Owned, Borrowed, MovedFrom, Disposed) never reaches the silent
+        // catch-all below. Deliberately NOT gated to Uninitialized / PolyNull
+        // / Poisoned — see the catch-all's own comment immediately below for
+        // why those three are still expected here. // per §28.3, v0.298
+        if (isCoreOwnershipStateForJoinAudit(st.state) &&
+            isCoreOwnershipStateForJoinAudit(o.state)) {
+            unhandledCoreOwnershipStateJoin(sym->name, st.state, o.state,
+                                             joinLoc);
+        }
+        // Other mismatches — poison. Every pair that still reaches here is
+        // one of:
+        //   * Uninitialized on one side at a NON-loop merge (loop merges are
+        //     handled by the union-key widening above): the Owned ⊓
+        //     Uninitialized case retains the existing O4 treatment (silent
+        //     poison; a subsequent read diagnoses), which the O4 branch-join
+        //     tests pin. This is NOT an independent soundness hole for any
+        //     Uninitialized pairing — a SEPARATE definite-assignment pass
+        //     independently rejects the read before this silence matters
+        //     (fix #4312's own measurement: `build/bezelc -c` on an
+        //     Uninitialized⊓Disposed program prints the DA "read of
+        //     unassigned local" diagnostic, not a silent accept).
+        //   * Poisoned on one side: "suppress cascades" for a diagnostic
+        //     ALREADY emitted by whatever produced the Poisoned state in the
+        //     first place (`ownedBorrowedClash`'s loud reject, or an earlier
+        //     pass entirely) — neither of this fix's two new arms ever
+        //     poisons, so Poisoned here is never THIS join's own doing — not
+        //     new information loss (fix #4312's own analysis, "What is NOT
+        //     dangerous in the same matrix").
+        // per §28.3, v0.298, #4312, #4313
         st.state = OwnershipState::Poisoned;
     }
     // O3b union-key meet (loop back-edge / zero-trip-skip merges only):

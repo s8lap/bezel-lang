@@ -188,6 +188,22 @@ struct LocalOwnership {
     // (the spec's "diagnostics should point at the offending use, not the
     // declaration"). Reassignment to a fresh owned value clears the flag
     // (the local is then definitely owned again). // per §28.3, §28.2
+    //
+    // fix #4312 (§28.3, v0.298): ALSO set on a surviving BORROWED record by
+    // joinInto's `borrowedMovedFromSplit` — the move-discharge sibling of
+    // `disposedOnSomePath`'s own Borrowed widening below: a plain alias
+    // holder rebound to a fresh owned value and `move`d/transferred-out on
+    // one if-arm, leaving a live untouched borrow on the other. The flag's
+    // MEANING is unchanged ("a read/consume/dispose here may observe
+    // freed-by-someone-else memory on some incoming path"); only the set of
+    // states it is populated on widened. `markMovedByName` and
+    // `markDisposedByName` already consult it unconditionally on state, so
+    // only `checkRead`'s IdentifierExpr arm,
+    // `reportMovedFromCapturesIn`'s `maybeConsumedAtLiteral`
+    // (Ownership_Checks.cpp), and joinInto's OWN same-state OR-merge for
+    // this flag needed widening from `Owned`-only to also cover `Borrowed`
+    // — the same three sites `disposedOnSomePath`'s #4247 widening touched,
+    // one flag over.
     bool maybeConsumed = false;
 
     // #1869 (§30.5 / Appendix C.6): set on a Disposed record produced by a
@@ -227,10 +243,15 @@ struct LocalOwnership {
     // this fix; every reassignment reset in `handleAssignment` and
     // `markDisposedByName`, all unconditional on state) or was never gated on
     // Owned in the first place. The lambda-capture read check
-    // (Ownership_Checks.cpp's `disposedOnSomePathAtLiteral`) is DELIBERATELY
-    // NOT widened — a captured Borrowed+disposedOnSomePath local is a real,
-    // reachable use-after-dispose (confirmed heap-UAF at 200x amplification)
-    // left OPEN as issue 4313, not this join.
+    // (Ownership_Checks.cpp's `disposedOnSomePathAtLiteral`) was DELIBERATELY
+    // left NOT widened by this fix, on the claim that a captured
+    // Borrowed+disposedOnSomePath local's use-after-dispose was
+    // "separately-filed" as issue 4313 — ⚠ THAT CLAIM WAS FALSE: no such
+    // issue existed at the time (confirmed by the #4312/#4313 review that
+    // filed it after the fact). Fixed by fix #4312/#4313 (§28.3, v0.298):
+    // `disposedOnSomePathAtLiteral` is now widened alongside `maybeConsumed`'s
+    // own new `maybeConsumedAtLiteral` gate (see that flag's field comment
+    // above) to also fire on `state == Borrowed`.
     bool disposedOnSomePath = false;
 };
 
