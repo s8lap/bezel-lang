@@ -1614,7 +1614,73 @@ bool ExprTC::groundSatisfiesNew(const TypeRef* arg, bool& decided) {
             return false;
         }
     }
-    // Built-ins / generic-param / function args: defer (decided stays false).
+    // fix #4298 (§14.2/§17.11, v0.298): the null-declaration BUILTIN
+    // population (`DictionaryEntry`/`Span`/`IEnumerable`/etc. — issue 4229's
+    // ~130-name catalogue) has no arm above (every arm above this point
+    // requires `arg->declaration`), so it fell straight through to the
+    // unconditional "defer" below at EITHER of this function's two call
+    // sites — verified exactly two, not "at least one, maybe more":
+    // `leafSolutionViolatesScalarConstraint`'s §19.6 exhaustiveness filter
+    // and `extConstraintItemProvablyViolated`'s §26.4 applicability filter,
+    // both further down this file (`grep -n 'groundSatisfiesNew(arg,
+    // decided)' ExprTypecheck.cpp` finds exactly these two call sites).
+    //
+    // Decide the CATEGORICAL slice only: the closed 25-name set of
+    // null-declaration builtin INTERFACES `Resolver::argSatisfiesNew`
+    // already exposes via `nonConstructibleBuiltinInterfaceNames()`
+    // (TypeResolution_Checks.cpp, fix #4309), plus `IGrouping` (fix #4294's
+    // own deliberately-separate one-off in that same file) — both
+    // provably non-constructible per §14.2 ("Interface substitutions never
+    // satisfy `new()` — no constructor exists"), with NO per-type fact to
+    // get wrong (that array's own comment: "no per-type fact to get wrong
+    // (unlike DictionaryEntry/DrainedEntry, whose defaultability ... is
+    // instantiation-dependent)"). Reusing the SAME exposed authority rather
+    // than re-typing a third copy of the name list (§6/§25).
+    //
+    // The INSTANTIATION-DEPENDENT remainder of the null-declaration
+    // population (`DictionaryEntry`, the `Span` family, `ExceptionInfo`,
+    // `ReadOnlyStringSpan`) is DELIBERATELY left deferred here — routing
+    // those through `typeHasNoDefault` unconditionally is exactly the shape
+    // fix #4235's FIRST attempt tried and had to be REVERTED (it
+    // measurably regressed `Array`/`Dictionary`-typed pinned tests — see
+    // `Resolver::argSatisfiesNew`'s own null-declaration arm comment,
+    // TypeResolution_Checks.cpp, for the full account). Porting that
+    // gating correctly for TWO more, differently-shaped consumers (an
+    // exhaustiveness leaf filter and a block-applicability filter, neither
+    // previously exercised against this population) needs its own
+    // characterization and tests, not a fold-in here — filed as a
+    // follow-up (issue 4333) rather than guessed at silently.
+    //
+    // ⚠ CORRECTION to issue 4298's own "both call sites" framing, measured
+    // while writing this fix's tests (LANE_RULES §1): this arm is reached
+    // from BOTH call sites symmetrically, but its effect is OBSERVABLE
+    // through only ONE of them. `leafSolutionViolatesScalarConstraint`'s
+    // own `violates` lambda gates on `isFullyGroundTypeRef(arg)` BEFORE
+    // ever inspecting `item.kind` — and that predicate's own header
+    // comment (a few hundred lines above) is explicit that a null-
+    // declaration `Named` TypeRef is treated as non-ground
+    // UNCONDITIONALLY, deliberately, "fewer exemptions, never a wrong
+    // one." So a null-declaration-builtin-bound leaf never reaches this
+    // arm through that consumer at all — confirmed by measurement, see
+    // `ground_satisfies_new_null_decl_builtin_4298_test.cpp`'s row (1).
+    // Fixing `groundSatisfiesNew` itself, rather than special-casing only
+    // its §26.4 call site, is still the right shape: it is the general,
+    // correct answer to "does a fully-ground σ satisfy `new()`", available
+    // to a future third consumer or a future loosening of
+    // `isFullyGroundTypeRef` — but do not expect a change here to be
+    // independently observable via the §19.6 exhaustiveness path today.
+    if (arg->kind == TypeRef::Kind::Named && !arg->declaration) {
+        std::string_view head = arg->headName();
+        const auto& nonCtorIfaces = nonConstructibleBuiltinInterfaceNames();
+        if (head == "IGrouping" ||
+            std::find(nonCtorIfaces.begin(), nonCtorIfaces.end(), head) !=
+                nonCtorIfaces.end()) {
+            decided = true;
+            return false;  // interfaces are not constructible (§14.2)
+        }
+    }
+    // Built-ins (remaining) / generic-param / function args: defer (decided
+    // stays false).
     return false;
 }
 
