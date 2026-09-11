@@ -3245,7 +3245,21 @@ llvm::Value* Emitter::emitValueToString(llvm::Value* val,
                 return lowerStringLiteral(
                     std::string("\"") + spec85QualifiedTypeName(ts) + "\"",
                     false);
-            return emitRecordToString(val, ts);          // §9.1 recurse
+            // fix #4234 (§9.1, v0.298): route the NESTED (field-level)
+            // recursion through a per-INSTANTIATION MEMOIZED helper (a real
+            // `call`) instead of re-inlining `emitRecordToString`'s body —
+            // see `recordToStringHelperFn`'s header comment
+            // (LlvmBackend_Setup.cpp) for the exponential-blowup this fixes
+            // AND for why the key/load type must be `val`'s OWN already-
+            // correct struct type, not one re-derived from `ts` alone.
+            // Spill `val` so the helper can take it by pointer (the same
+            // spill idiom the user-override arm above already uses).
+            auto* recTy = llvm::cast<llvm::StructType>(val->getType());
+            llvm::Function* helper = recordToStringHelperFn(ts, recTy);
+            llvm::AllocaInst* spill = entryAlloca(recTy);
+            builder_.CreateStore(val, spill);
+            return builder_.CreateCall(helper->getFunctionType(), helper,
+                                       {spill});
         }
         if (ts->kind == ast::TypeDeclKind::Enum)
             // per §10.5 (v0.183): a user `ToString(): string` replaces the §8.5
@@ -4077,10 +4091,27 @@ llvm::Value* Emitter::emitValueHashCode(llvm::Value* val,
                                         const sema::TypeRef* fieldTy) {
     using K = sema::TypeRef::Kind;
     // Nested record (§9.1 transitivity): combine its own field hashes.
+    //
+    // fix #4234 (§9.1, v0.298): route through a per-INSTANTIATION MEMOIZED
+    // helper (a real `call`) instead of re-inlining `emitRecordHashCode`'s
+    // body here — the GetHashCode sibling of the identical ToString/Equals
+    // fix (recordToStringHelperFn / recordEqualityHelperFn,
+    // LlvmBackend_Setup.cpp; see recordToStringHelperFn's comment for why
+    // the key/load type must be `val`'s OWN struct type, not one re-derived
+    // from `fieldTy->declaration` alone): a shared nested record type
+    // reached from `branch` sibling FIELD positions otherwise re-expands
+    // its entire recursive hash combination at EVERY occurrence.
     if (fieldTy && fieldTy->kind == K::Named && fieldTy->declaration &&
         fieldTy->declaration->kind == ast::TypeDeclKind::Record &&
-        val->getType()->isStructTy())
-        return emitRecordHashCode(val, fieldTy->declaration);
+        val->getType()->isStructTy()) {
+        auto* recTy = llvm::cast<llvm::StructType>(val->getType());
+        llvm::Function* helper =
+            recordHashCodeHelperFn(fieldTy->declaration, recTy);
+        llvm::AllocaInst* spill = entryAlloca(recTy);
+        builder_.CreateStore(val, spill);
+        return builder_.CreateCall(helper->getFunctionType(), helper,
+                                   {spill});
+    }
     // Inline array (§8.3 / §9.2 v0.158): "Hash combining element hashes in slot
     // order." Fold each slot's hash (h = h*31 + elemHash), the same order and
     // combiner as the record/positional hash — consistent with the element-wise

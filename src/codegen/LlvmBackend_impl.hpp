@@ -2758,6 +2758,48 @@ private:
     std::unordered_map<const sema::TypeSymbol*, llvm::Function*> classToStringFns_;
     std::unordered_map<const sema::TypeSymbol*, llvm::Function*> boxToStringFns_;
     std::unordered_map<std::string, llvm::Function*> primBoxToStringFns_;
+    // fix #4234 (§9.1, v0.298): per-INSTANTIATION MEMOIZED helper wrapping
+    // emitRecordToString's UNBOXED field-listing body — see
+    // recordToStringHelperFn's own comment (LlvmBackend_Setup.cpp) for why
+    // this exists (a diamond of shared nested record field types otherwise
+    // re-expands its whole subtree at every occurrence, O(branch^depth) IR
+    // instructions for a program that only declares the types). Distinct
+    // from boxToStringFns_ above: that cache holds the BOXED vtable-slot
+    // thunk (`ptr(ptr box)`, payload two words in); this one takes the
+    // record's raw unboxed struct value by pointer and is used only for the
+    // NESTED (field-level) recursion inside emitValueToString.
+    //
+    // ⚠ Keyed on `llvm::StructType*` (the CONCRETE, already-specialized
+    // struct type — recordStruct's own per-instantiation `specializedStructs_`
+    // key granularity), NOT on `const TypeSymbol*`. A first version of this
+    // fix keyed on the bare TypeSymbol* and re-derived the struct type
+    // in-function via `recordStruct(rec)` under whatever ambient
+    // `genericSubst_` happened to be active at first-build time — review
+    // caught this returning WRONG DATA (not just wasted work) for a
+    // generic record with more than one instantiation reachable
+    // (`Box<Box<int>>`'s outer vs. inner `Box<int>`, tests/codegen/
+    // boxed_generic_record_equals_2176_test.cpp's
+    // nested_generic_record_equal_9_1): the cached function's `CreateLoad`
+    // would reinterpret a DIFFERENT instantiation's bytes using the FIRST
+    // instantiation's layout, since `genericSubst_` is ambient state that
+    // is not re-scoped when recursing into a nested field (mirroring the
+    // pre-fix direct-recursion code, which never re-derived the type
+    // either — it always trusted the VALUE's own already-correct
+    // `l->getType()`). Keying on the caller-supplied concrete StructType*
+    // is the fix: two calls presenting the SAME concrete type share a
+    // helper; two different instantiations (different StructType*) get
+    // separate helpers, exactly mirroring recordStruct's own
+    // specialization granularity.
+    std::unordered_map<llvm::StructType*, llvm::Function*>
+        recordToStringHelperFns_;
+    // fix #4234 (§9.1, v0.298): the equality/hash siblings of
+    // recordToStringHelperFns_ above — same rationale, same memoization
+    // discipline (keyed on the concrete StructType*, not TypeSymbol*), one
+    // cache per synthesized member kind.
+    std::unordered_map<llvm::StructType*, llvm::Function*>
+        recordEqualityHelperFns_;
+    std::unordered_map<llvm::StructType*, llvm::Function*>
+        recordHashCodeHelperFns_;
     // §9.6 (#946/#947/#948): per-class Equals/GetHashCode thunk caches (slot
     // kEqualsSlot / kGetHashCodeSlot) and the shared box-default thunks.
     std::unordered_map<const sema::TypeSymbol*, llvm::Function*> classEqualsFns_;
@@ -4238,6 +4280,37 @@ private:
     // The format specifier depends on the primitive type.
     llvm::Value* emitPrimitiveToString(llvm::Value* val,
                                        sema::PrimitiveType prim);
+
+    // fix #4234 (§9.1, v0.298): a per-INSTANTIATION (keyed on the concrete
+    // `llvm::StructType*`, NOT bare `TypeSymbol*`) MEMOIZED helper function
+    // wrapping emitRecordToString's field-listing body — see
+    // recordToStringHelperFns_'s declaration comment for why this exists
+    // and why the key must be the concrete struct type.
+    // `recTy` is the CALLER's own already-correct type for the value being
+    // formatted (`val->getType()`, cast to StructType) — this function does
+    // NOT re-derive it via `recordStruct(rec)`, because for a generic
+    // record `recordStruct` consults ambient substitution state
+    // (`genericSubst_`) that is NOT re-scoped when recursing into a nested
+    // field (mirroring the pre-fix direct-recursion behaviour, which
+    // trusted the VALUE's own already-correct type rather than
+    // re-deriving it): building/keying off `recordStruct(rec)` instead of
+    // the caller's `recTy` was review-caught as WRONG for a genuinely
+    // generic record with more than one instantiation reachable (e.g.
+    // `Box<Box<int>>`'s outer vs inner `Box<int>` field) — the cached
+    // function's `CreateLoad` would silently reinterpret a `Box<string>`
+    // (or any other instantiation)'s bytes using the FIRST instantiation's
+    // layout. Builds (and caches) a small internal-linkage function
+    // `bz$vtostr$<name>$<n>` of type `ptr(ptr)`: loads the record struct
+    // (as `recTy`) from the incoming pointer and returns
+    // emitRecordToString's fresh +1 string. `emitValueToString`'s
+    // Record-kind arm calls this (a `call` instruction) instead of
+    // re-inlining emitRecordToString directly, so a record type reached
+    // from `branch` sibling FIELD positions AT THE SAME INSTANTIATION
+    // re-uses one function instead of re-expanding its whole recursive
+    // body at every occurrence; a DIFFERENT instantiation (a different
+    // `recTy`) gets its own separate cached helper.
+    llvm::Function* recordToStringHelperFn(const sema::TypeSymbol* rec,
+                                           llvm::StructType* recTy);
 
     // §8 / §9 / §10: compiler-synthesized value-semantics members for records
     // and enums. Each returns the lowered value, or null if the member is not
@@ -16146,6 +16219,23 @@ private:
     llvm::Value* emitStructEquality(llvm::Value* l, llvm::Value* r,
                                     llvm::StructType* st,
                                     const sema::TypeSymbol* rec = nullptr);
+    // fix #4234 (§9.1, v0.298): a per-INSTANTIATION (keyed on the concrete
+    // `llvm::StructType*` `recTy` — see recordToStringHelperFn's comment
+    // for why bare `TypeSymbol*` is the WRONG key for a generic record)
+    // MEMOIZED helper wrapping emitStructEquality's field-by-field body —
+    // the equality sibling of recordToStringHelperFn (see its comment for
+    // the exponential-blowup rationale). `emitValueEquality`'s Record-kind
+    // arm calls this instead of re-inlining emitStructEquality for a
+    // nested record field. `recTy` is the CALLER's own already-correct
+    // type for `l`/`r` (both operands share one type by construction).
+    llvm::Function* recordEqualityHelperFn(const sema::TypeSymbol* rec,
+                                           llvm::StructType* recTy);
+    // fix #4234 (§9.1, v0.298): the GetHashCode sibling — wraps
+    // emitRecordHashCode, same per-instantiation `recTy` keying.
+    // `emitValueHashCode`'s Record-kind arm calls this instead of
+    // re-inlining emitRecordHashCode for a nested record field.
+    llvm::Function* recordHashCodeHelperFn(const sema::TypeSymbol* rec,
+                                           llvm::StructType* recTy);
     // §8.3 (equality table) / §15.1.2: element-by-element value equality of two
     // inline-array `[N]T` values. `at` is the LLVM `[N x elem]` type; `elemTy`
     // is the element's declared Bezel type (so string elements compare by

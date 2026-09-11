@@ -37208,6 +37208,138 @@ llvm::Constant* Emitter::boxToStringThunk(const sema::TypeSymbol* ts) {
 }
 
 
+// fix #4234 (§9.1, v0.298): a per-INSTANTIATION MEMOIZED helper wrapping
+// emitRecordToString's UNBOXED field-listing body, so a record type reached
+// as a FIELD from several sibling positions re-uses ONE function instead of
+// re-expanding emitRecordToString's entire recursive body at every
+// occurrence. Before this fix, `emitValueToString`'s Record-kind arm called
+// `emitRecordToString(val, ts)` directly (inline C++ recursion, no
+// memoization) for EVERY field whose type is itself a record — so a
+// generic-record "diamond" (`Ri` with `branch` fields all of type
+// `R(i-1)`, `branch` deep at each of `depth` levels) re-expanded the WHOLE
+// shared subtree at each sibling occurrence: O(branch^depth) LLVM IR
+// instructions from a program that only DECLARES the types (no use, no
+// instantiation). Measured: one `bz$boxtostr$R4` body alone was 122,545 IR
+// lines at branch=3/depth=4, growing ~3x per added level — 75.1s wall /
+// 1.5GB RSS at depth=6 (#4234).
+//
+// ⚠ `recTy` is the CALLER's OWN already-correct struct type (`val->getType()`
+// at the call site) — this function does NOT call `recordStruct(rec)` to
+// re-derive it, and keys its cache on `recTy`, NOT on `rec`. A first version
+// of this fix did both, and review caught it returning WRONG DATA (not just
+// wasted work): `recordStruct(rec)` consults ambient generic-substitution
+// state (`genericSubst_`) that is NOT re-scoped when recursing into a nested
+// field, so for a generic record with more than one reachable instantiation
+// (`Box<Box<int>>`'s outer vs. inner `Box<int>` field,
+// tests/codegen/boxed_generic_record_equals_2176_test.cpp's
+// nested_generic_record_equal_9_1) the FIRST-built cached function's
+// `CreateLoad` silently reinterpreted a LATER, differently-laid-out
+// instantiation's bytes using the FIRST instantiation's layout. The pre-fix
+// direct-recursion code never had this problem because it always trusted the
+// VALUE's own already-correct `l->getType()` rather than re-deriving one —
+// keying (and loading) off the caller-supplied `recTy` restores exactly that
+// guarantee while still memoizing: two calls presenting the SAME concrete
+// type share a helper, and a different instantiation (different `recTy`)
+// gets its own separate one, mirroring `recordStruct`'s own
+// `specializedStructs_` granularity.
+//
+// Distinct from `boxToStringThunk` above: that thunk's receiver is a BOXED
+// pointer (vtable + refcount header, payload two words in) and is keyed in
+// `boxToStringFns_`; this helper's receiver is a plain pointer to the raw
+// unboxed record struct, keyed in the separate `recordToStringHelperFns_`
+// map, and exists purely so the NESTED (field-level) recursion inside
+// `emitValueToString` can emit a `call` instead of inlining. The TOP-LEVEL
+// direct-dispatch call sites (`LlvmBackend_Calls2.cpp`'s `.ToString()`
+// dispatch, `boxToStringThunk` itself, and `LlvmBackend_Exprs.cpp`'s
+// interpolation arm) are UNCHANGED — each still calls `emitRecordToString`
+// directly for the outermost type, which is now only ONE level's worth of
+// inline expansion (its own immediate fields), because any Record-kind
+// field it touches is capped by this cache rather than re-expanding
+// further.
+llvm::Function* Emitter::recordToStringHelperFn(const sema::TypeSymbol* rec,
+                                                llvm::StructType* recTy) {
+    auto it = recordToStringHelperFns_.find(recTy);
+    if (it != recordToStringHelperFns_.end()) return it->second;
+
+    auto* fnTy = llvm::FunctionType::get(ptrTy(), {ptrTy()}, /*isVarArg=*/false);
+    auto* fn = llvm::Function::Create(
+        fnTy, llvm::Function::InternalLinkage,
+        "bz$vtostr$" + std::string(rec->name) + "$" +
+            std::to_string(recordToStringHelperFns_.size()),
+        module_.get());
+    // Memoize BEFORE building the body — mirrors every other thunk cache in
+    // this file (boxToStringThunk above, classToStringThunk, …) so a
+    // self-referential shape (already rejected at sema by
+    // Resolver::recordValueContainsSelf, §9) could not recurse unboundedly
+    // even if one slipped through.
+    recordToStringHelperFns_[recTy] = fn;
+    auto* entry = llvm::BasicBlock::Create(llvm_, "entry", fn);
+    {
+        ThunkScope scope(currentFn_, builder_, fn, entry);
+        llvm::Value* recVal =
+            builder_.CreateLoad(recTy, fn->getArg(0), "vtostr.load");
+        llvm::Value* result = emitRecordToString(recVal, rec);
+        builder_.CreateRet(result);
+    }
+    return fn;
+}
+
+// fix #4234 (§9.1, v0.298): the equality sibling of recordToStringHelperFn
+// just above — same rationale AND same per-instantiation `recTy` keying
+// (see its comment for why bare `TypeSymbol*` is the wrong key). Type
+// `i1(ptr, ptr)`: loads both operands' structs (as `recTy` — both operands
+// share one type by construction, a well-typed `=`/`Equals` never compares
+// across instantiations) from the incoming pointers and returns
+// emitStructEquality's per-field AND-chain.
+llvm::Function* Emitter::recordEqualityHelperFn(const sema::TypeSymbol* rec,
+                                                llvm::StructType* recTy) {
+    auto it = recordEqualityHelperFns_.find(recTy);
+    if (it != recordEqualityHelperFns_.end()) return it->second;
+
+    auto* fnTy = llvm::FunctionType::get(i1(), {ptrTy(), ptrTy()},
+                                         /*isVarArg=*/false);
+    auto* fn = llvm::Function::Create(
+        fnTy, llvm::Function::InternalLinkage,
+        "bz$veq$" + std::string(rec->name) + "$" +
+            std::to_string(recordEqualityHelperFns_.size()),
+        module_.get());
+    recordEqualityHelperFns_[recTy] = fn;  // memoize before building the body
+    auto* entry = llvm::BasicBlock::Create(llvm_, "entry", fn);
+    {
+        ThunkScope scope(currentFn_, builder_, fn, entry);
+        llvm::Value* lVal = builder_.CreateLoad(recTy, fn->getArg(0), "veq.l");
+        llvm::Value* rVal = builder_.CreateLoad(recTy, fn->getArg(1), "veq.r");
+        llvm::Value* result = emitStructEquality(lVal, rVal, recTy, rec);
+        builder_.CreateRet(result);
+    }
+    return fn;
+}
+
+// fix #4234 (§9.1, v0.298): the GetHashCode sibling — wraps
+// emitRecordHashCode, same per-instantiation `recTy` keying. Type `i32(ptr)`.
+llvm::Function* Emitter::recordHashCodeHelperFn(const sema::TypeSymbol* rec,
+                                                llvm::StructType* recTy) {
+    auto it = recordHashCodeHelperFns_.find(recTy);
+    if (it != recordHashCodeHelperFns_.end()) return it->second;
+
+    auto* fnTy = llvm::FunctionType::get(i32(), {ptrTy()}, /*isVarArg=*/false);
+    auto* fn = llvm::Function::Create(
+        fnTy, llvm::Function::InternalLinkage,
+        "bz$vhash$" + std::string(rec->name) + "$" +
+            std::to_string(recordHashCodeHelperFns_.size()),
+        module_.get());
+    recordHashCodeHelperFns_[recTy] = fn;  // memoize before building the body
+    auto* entry = llvm::BasicBlock::Create(llvm_, "entry", fn);
+    {
+        ThunkScope scope(currentFn_, builder_, fn, entry);
+        llvm::Value* recVal =
+            builder_.CreateLoad(recTy, fn->getArg(0), "vhash.load");
+        llvm::Value* result = emitRecordHashCode(recVal, rec);
+        builder_.CreateRet(result);
+    }
+    return fn;
+}
+
 // §8.5 / §8.6 (#417): the uniform ToString thunk for a boxed PRIMITIVE. The
 // receiver is the BOX pointer; the scalar value lives two words in. The thunk
 // loads the value and formats it via emitPrimitiveToString (int → decimal,

@@ -6234,11 +6234,33 @@ llvm::Value* Emitter::emitValueEquality(llvm::Value* l, llvm::Value* r,
     }
     // Nested record (§9.1 transitivity): recurse with its own type so that
     // record's string fields are likewise compared by content.
+    //
+    // fix #4234 (§9.1, v0.298): route through a per-INSTANTIATION MEMOIZED
+    // helper (a real `call`) instead of re-inlining `emitStructEquality`'s
+    // body here — see recordToStringHelperFn's comment (LlvmBackend_Setup.cpp)
+    // for why the key/load type must be the operand's OWN struct type, not
+    // one re-derived from `fieldTy->declaration` alone. A shared nested
+    // record type reached from `branch` sibling FIELD positions otherwise
+    // re-expands its entire recursive comparison at EVERY occurrence —
+    // O(branch^depth) LLVM IR instructions for a program that only declares
+    // the types (measured: an unfixed depth=8/branch=3 diamond alone cost
+    // 167s once the sibling ToString blowup was fixed, confirming this arm
+    // reproduces the identical defect class one level of nesting later).
+    // `l`/`r` share one type by construction (a well-typed record `=`/
+    // `Equals` never compares across instantiations), so `l`'s type keys
+    // and loads both operands.
     if (fieldTy && fieldTy->kind == K::Named && fieldTy->declaration &&
         fieldTy->declaration->kind == ast::TypeDeclKind::Record &&
         l->getType()->isStructTy()) {
-        if (auto* nested = llvm::dyn_cast<llvm::StructType>(l->getType()))
-            return emitStructEquality(l, r, nested, fieldTy->declaration);
+        auto* recTy = llvm::cast<llvm::StructType>(l->getType());
+        llvm::Function* helper =
+            recordEqualityHelperFn(fieldTy->declaration, recTy);
+        llvm::AllocaInst* lSpill = entryAlloca(recTy);
+        llvm::AllocaInst* rSpill = entryAlloca(recTy);
+        builder_.CreateStore(l, lSpill);
+        builder_.CreateStore(r, rSpill);
+        return builder_.CreateCall(helper->getFunctionType(), helper,
+                                   {lSpill, rSpill});
     }
     // §9.2 v0.210 (#2083) / §35.7: a value-like choice component — the
     // declared type is a Named with declaration's kind == Choice and the
