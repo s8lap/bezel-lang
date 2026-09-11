@@ -1894,6 +1894,36 @@ private:
     // // per §28.6
     void checkOwnedFieldReturn(const ast::Expr& e);
 
+    // fix #4311 (§30.5 "Result lifetime and task disposal", Pattern A result
+    // slots kind 1, §28.3 *Producers*, v0.298): the ownership-pass sibling of
+    // `fix #4285`'s codegen check (`detectAsyncPatternAKind`,
+    // LlvmBackend_Async.cpp), which rejects a Pattern-A `Task<T>` (class T)
+    // async producer's non-`await` `return` of a `MemberAccessExpr` /
+    // `NullCondMemberExpr` / `IndexExpr` (an unconditional borrow) but
+    // DELIBERATELY did not extend to a bare `IdentifierExpr` — that shape may
+    // legitimately name a still-owned local or `owned` parameter, and telling
+    // it apart from a BORROWED one needs this pass's own per-local flow
+    // state (`states_`/`lookupState`), which codegen does not carry. Rejects
+    // a bare identifier naming: a local currently tracked `Borrowed`
+    // (`lookupState`); a plain (non-`owned`) parameter; or an implicit-`this`
+    // field read (a `FieldSymbol` — the same bare-identifier spelling
+    // `exprIsOwnedFieldRead` recognizes, §28.6 — is the SAME unconditional
+    // borrow #4285 rejects via the explicit `this.f` / `obj.f` spelling, just
+    // reached through the unqualified name). Admits: a local tracked `Owned`
+    // (a plain `var` — a genuine kind-1 fresh-owned source) and an `owned` /
+    // `out owned` parameter. Scoped to the PLAIN `Task` head only, never
+    // `OwningTask` (Pattern B) — mirrors `checkBorrowReturnedThroughOwningType`'s
+    // `plainTaskInSyncBody` gate's documented two-pattern split. Fires from
+    // handleReturn (block bodies) and runExprBodyOwningReturnCheck (`=>`
+    // expression bodies). // per §30.5, §28.3, §28.6
+    void checkAsyncPatternABorrowedIdentifierReturn(const ast::Expr& e);
+
+    // fix #4311: shared diagnostic for
+    // `checkAsyncPatternABorrowedIdentifierReturn`, worded identically to
+    // `fix #4285`'s codegen diagnostic (LlvmBackend_Async.cpp) so the two AST
+    // shapes of the same §30.5 kind-1 violation read as ONE rule to the user.
+    void reportAsyncPatternABorrowedIdentifierReturn(const ast::Expr& e);
+
     // §28.3 / §5.11 (#1007): the name-head of an owning-collection / owning-
     // wrapper type (the set whose value the caller must discharge). True for
     // `OwningArray`/`OwningDictionary`/…/`Shared`/`Weak`/`OwningTask`/etc.

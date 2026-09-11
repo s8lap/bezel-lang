@@ -1506,6 +1506,12 @@ void MethodOwnership::runExprBodyOwningReturnCheck(
     // rejects `Take(): Cell? => move v;` (the bare-read `=> v;` borrow is
     // legal). // per §28.6
     checkOwnedFieldReturn(exprBody);
+    // fix #4311 (§30.5 Pattern A kind 1, §28.3 Producers, v0.298): the `=>`
+    // expression-body sibling of the handleReturn call — rejects
+    // `GetAsync(h: Box): Task<Cell> => borrowed;` naming a borrowed
+    // local/parameter/implicit field. A no-op outside an async Pattern-A
+    // `Task<T>` body. // per §30.5, §28.3
+    checkAsyncPatternABorrowedIdentifierReturn(exprBody);
     // §28.6 / §28.8 / §28.8.1 (#1995): the `=>` expression-body sibling of the
     // handleReturn call — rejects `Take(b: Cell): owned Cell => move b;` where
     // `b` is a BORROW returned as owned (double-free). A no-op unless the return
@@ -7761,6 +7767,14 @@ void MethodOwnership::handleReturn(const ast::Expr& e) {
     // borrow and is not flagged. Exempt when the return type is `owned` (the
     // legal transfer). // per §28.6
     checkOwnedFieldReturn(e);
+    // fix #4311 (§30.5 Pattern A kind 1, §28.3 Producers, v0.298): reject a
+    // bare-identifier return from a plain `Task<T>` async producer naming a
+    // BORROWED local, a plain (non-`owned`) parameter, or an implicit-`this`
+    // field read — the ownership-pass sibling of `fix #4285`'s codegen
+    // MemberAccessExpr/IndexExpr rejection, needing this pass's own flow
+    // state to tell a borrow apart from a genuinely owned local/parameter.
+    // A no-op outside an async Pattern-A `Task<T>` body. // per §30.5, §28.3
+    checkAsyncPatternABorrowedIdentifierReturn(e);
     // #2175(a) / §28.3 (v0.226) "Returning a deferred-activation frame":
     // `return a.Drain();` (the owning-collection builtin alias) over a
     // SCOPE-BOUND receiver escapes the receiver's scope. §28.3: "A returned
@@ -11905,12 +11919,224 @@ void MethodOwnership::checkOwnedFieldReturn(const ast::Expr& e) {
     // remains a leak.)
     if (!exprIsOwnedFieldRead(*lookThroughForceUnwrap(un->operand.get())))
         return;
+    // fix #4319 (§30.5 "Result lifetime and task disposal", Pattern A result
+    // slots kind 1, v0.298): a plain `Task<T>` (class T) async producer's
+    // non-`await` return does NOT hand the caller a `T` with "no owner" the
+    // way this #1005 rule assumes for a sync method — §30.5 kind 1 is
+    // explicit that "a `return` of an owned expression" mints a task that
+    // "owns the result and its destructor disposes it directly." `move
+    // <owned field>` is Owned per §28.3 *Producers* ("`move obj.f` where `f`
+    // is `owned`: Owned"), so it is exactly kind 1's admitted shape: the
+    // freshly-minted TASK becomes the field value's new owner. This #1005
+    // rule was written for the SYNC non-`owned`-return case (the spec's own
+    // `Take(): Cell? => move v;` example, where the caller's bare `Cell?`
+    // really is ownerless) and, pre-fix, had no carve-out for the async
+    // Task-family case — unlike its sibling declaration-site check
+    // (`staticReturnTypeRejected`, ~L12197: "`if (common::isTaskFamilyHead(
+    // head)) return {};  // §28.3 v0.190 carve`"). Scoped to the PLAIN
+    // `Task` head only (never `OwningTask`, Pattern B — a separate,
+    // unmeasured question left alone here, see issue 4319's follow-up) and
+    // to an `isAsync_` body only, mirroring
+    // `checkBorrowReturnedThroughOwningType`'s `plainTaskInSyncBody` gate's
+    // documented two-pattern split ("OwningTask is already an owning-type
+    // head (rejected in BOTH sync and async bodies, unchanged)").
+    // // per §30.5, §28.3, §28.6
+    if (isAsync_ && returnType_ &&
+        returnType_->kind == ast::TypeKind::Named && returnType_->name &&
+        !returnType_->name->parts.empty() &&
+        returnType_->name->parts.front() == "Task")
+        return;
     report(
         Severity::Error, e.span.begin,
         "cannot return an owned field's `move`d value through a non-`owned` "
         "return (§28.6); `move` transfers the field's value out, leaving it with "
         "no owner — declare the return type `owned` (e.g. `: owned T`) to "
         "transfer ownership to the caller");
+}
+
+// fix #4311 (§30.5 "Result lifetime and task disposal", Pattern A result
+// slots kind 1, §28.3 *Producers*, v0.298): the ownership-pass sibling of
+// `fix #4285`'s codegen check (`detectAsyncPatternAKind`,
+// LlvmBackend_Async.cpp), which rejects a Pattern-A `Task<T>` (class T) async
+// producer's non-`await` `return` of a `MemberAccessExpr` /
+// `NullCondMemberExpr` / `IndexExpr` (an unconditional borrow per §28.3
+// Producers) but deliberately did NOT extend to a bare `IdentifierExpr` —
+// that shape may legitimately name a still-owned local or `owned` parameter
+// (§28.3 *Factory methods and sourceless returns*'s admitted-source list),
+// and telling it apart from a BORROWED one needs this pass's own per-local
+// flow state (`states_` / `lookupState`), which codegen does not carry.
+//
+// MEASURED (§30-AMENDED amplification, on the r18-c4 base `f99d7c4`, before
+// this fix): `var borrowed := h.item; return borrowed;` from the SAME
+// Pattern-A producer shape #4285 fixed — 50/50 runs crash identically under
+// ASan, the SAME 3-frame signature (`bz$elemDispose` <- `bz_task_free` <-
+// the async resume frame), freed by the real owner's explicit `.Dispose()`.
+//
+// Rejects a bare identifier naming:
+//   - a LOCAL currently tracked `Borrowed` (`lookupState` — populated for
+//     every LocalDecl, owned or borrowed alike, unconditionally in
+//     `handleLocalDecl`);
+//   - a plain (non-`owned`) PARAMETER (`ParameterSymbol` with no
+//     `owned`/`out owned` modifier — a plain parameter is never seeded into
+//     `states_`, so `lookupState` finds nothing and the symbol lookup below
+//     is the only way to see it; per §25, ONLY the `ParameterSymbol` arm is
+//     consulted here, never a `LocalSymbol` arm reached through a different
+//     table, avoiding the exact stale-ordering hazard that arm is known for
+//     elsewhere in this run);
+//   - an implicit-`this` FIELD read (a bare identifier resolving to a
+//     `FieldSymbol` — the SAME unconditional borrow #4285 rejects via the
+//     explicit `this.f` / `obj.f` spelling, reached here through the
+//     unqualified name `exprIsOwnedFieldRead` also recognizes, §28.6).
+//
+// Admits (does nothing, so the existing accept path is unchanged):
+//   - a local tracked `Owned` (a plain `var` — the genuine kind-1
+//     fresh-owned source; #4285's own
+//     `accept_bare_owned_local_return_unaffected_30_5` row pins this);
+//   - an `owned` / `out owned` parameter (transferred into the callee,
+//     genuinely owned by this frame).
+//
+// Scoped to the PLAIN `Task` head only, never `OwningTask` (Pattern B) —
+// mirrors `checkBorrowReturnedThroughOwningType`'s `plainTaskInSyncBody`
+// gate's documented two-pattern split; Pattern B's producer-side rules for
+// this shape are a separate, unmeasured question (filed alongside this fix).
+// Fires from handleReturn (block bodies) and runExprBodyOwningReturnCheck
+// (`=>` expression bodies). // per §30.5, §28.3, §28.6
+//
+// CLASS-T GATE (send-back during self-testing, TWO rounds):
+//
+// Round 1 — `Work<T>(x: T): Task<T> return x; end Work;`, a GENERIC
+// Pattern-A declaration whose T is later instantiated to
+// `int`/`string`/a value-only record/`CancellationToken` (9 lit-test
+// regressions, e.g. `sema/async_generic_instantiation_1595__param_inferred_
+// int_accepted.bzl`) — false-rejected by an earlier version of this check
+// that gated on the head name alone. §30.5's kind-1/2/3 producer regime is
+// scoped to "`Task<T>` for CLASS T" ("Pattern A"); the sibling row, "`Task`
+// and `Task<T>` for copyable value type, string, or runtime-managed T: …
+// no ownership obligation crosses the await boundary", is a DIFFERENT,
+// no-obligation regime this check must not touch.
+//
+// Round 2 (bigger finding) — `tests/lit/ownership/task_family_borrow_
+// return_1786__accept.bzl` (a pinned #1786/SB01-B ACCEPT control, unrelated
+// to this fix, predating it by 100+ revisions) regressed:
+// `public async method Produce(): Task<Conn> return _c; end Produce;` where
+// `Conn` is a class with NO destructor and no `owned` field
+// (`class Conn public method Use(): int => 1; end Conn;`). A class/interface
+// gate alone (`isClassOrInterfaceResult`) is not enough — `Conn` IS a class,
+// so that gate alone still rejected it. The reason the ACCEPT is correct:
+// with no destructor and no `owned` field, `Conn` carries NO disposal
+// obligation at all (§28.9's non-trivial-dispose classification), so there
+// is nothing for the produced task's teardown to double-free — codegen's own
+// `asyncPatternAResultDisposer_` gate (`patternAResultDisposerFor`,
+// LlvmBackend_Async.cpp — a FREE file) makes exactly this distinction via
+// `elementPolicyFor(...).cat == ClassOwned`, and #4285's own diagnostic
+// text is conditioned on `asyncPatternAResultDisposer_` being non-null for
+// precisely this reason ("a no-op without it, so nothing to mis-attach").
+//
+// The ownership-pass-level equivalent of that question is
+// `common::isNonTrivialDisposeClass` (`src/common/OwnershipFacts.hpp` — a
+// FREE file, not held this cycle): "True when `rt` is a class/interface
+// that carries a real disposal obligation — a non-trivial-dispose USER
+// class (has a destructor or `owned` field anywhere in its base chain,
+// §28.9)". It is ALREADY the predicate `Ownership.cpp`'s own §28.3 auto-drop
+// warning gate consults (this file, ~L6375: `common::isNonTrivialDisposeClass(
+// t, ctx_)`) for the analogous question "does producing this class-typed
+// value create a disposal obligation" — the SAME question this check needs
+// to ask about the Pattern-A result, not a coincidentally-similar one (§25).
+// It subsumes the plain class/interface gate (a non-Class declaration
+// short-circuits to `false` at its own top, `OwnershipFacts.cpp` ~L237), so
+// `isClassOrInterfaceResult` is no longer needed here.
+//
+// `MethodOwnership::rhsIsDisposableClassType` (this file, ~L6379) was
+// considered and REJECTED for this gate: its own header comment documents
+// FIVE axes where it disagrees with `isNonTrivialDisposeClass` (base-chain
+// walk, owning-inline-array, captured primary-ctor param, `static owned`,
+// imported-carried-verdict) and states plainly it "answers a coarser,
+// differently scoped question for the §28.10 vacuous-pin lint" — reusing it
+// here would be exactly the "predicate validated for a different question"
+// hazard §25 names, not a shortcut past it.
+//
+// Deliberately does NOT port `taskResultArgIsClass`'s (held
+// `Ownership_Checks.cpp`, #4247) built-in-owning/borrowing-COLLECTION-result
+// carve (fix #3638) — that carve exists for TASK-TEARDOWN disposal
+// classification of a builtin collection result (`Task<Array<T>>`), an axis
+// this check's bare-identifier gate has not measured; such a program is left
+// ungated by this fix rather than risking a wrong classification on
+// unverified ground (filed as a follow-up alongside this fix, issue 4311's
+// discovery note).
+namespace {
+bool isAsyncPatternAClassResultType(const sema::TypeRef* rt,
+                                     sema::SemaContext& ctx) {
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->nullable)
+        return false;
+    if (rt->headName() != "Task") return false;
+    if (rt->genericArgs.empty() || !rt->genericArgs.front())
+        return false;  // plain `Task` (unit) — no result to classify
+    return common::isNonTrivialDisposeClass(rt->genericArgs.front(), ctx);
+}
+}  // namespace
+
+void MethodOwnership::checkAsyncPatternABorrowedIdentifierReturn(
+        const ast::Expr& e) {
+    if (!isAsync_ || !returnType_) return;
+    if (!isAsyncPatternAClassResultType(ctx_.resolvedType(*returnType_), ctx_))
+        return;
+    auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e);
+    if (!id) return;
+    if (auto* st = lookupState(id->name)) {
+        // A tracked local: Owned (plain `var`, genuine kind-1 source) is
+        // admitted; Borrowed is the measured defect. Any other tracked state
+        // (Disposed / MovedFrom / PolyNull / Poisoned) is some OTHER check's
+        // business — stay silent rather than double-diagnose.
+        if (st->state != OwnershipState::Borrowed) return;
+        reportAsyncPatternABorrowedIdentifierReturn(e);
+        return;
+    }
+    auto* sym = ctx_.exprSymbol(*id);
+    if (!sym) return;
+    if (auto* ps = dynamic_cast<sema::ParameterSymbol*>(sym)) {
+        if (ps->modifier == "owned" || ps->modifier == "out owned")
+            return;  // genuinely owned parameter — admitted
+        reportAsyncPatternABorrowedIdentifierReturn(e);
+        return;
+    }
+    if (dynamic_cast<sema::FieldSymbol*>(sym)) {
+        // Implicit-`this` bare field read — unconditionally a borrow per
+        // §28.3 Producers, exactly like the explicit `this.f` spelling
+        // #4285 already rejects (MemberAccessExpr).
+        reportAsyncPatternABorrowedIdentifierReturn(e);
+        return;
+    }
+    // Anything else (an unresolved symbol, a type name in expression
+    // position, …) — not this check's business.
+}
+
+// fix #4311: shared diagnostic for `checkAsyncPatternABorrowedIdentifierReturn`
+// — deliberately WORDED IDENTICALLY to `fix #4285`'s
+// `detectAsyncPatternAKind` diagnostic (LlvmBackend_Async.cpp) so the two
+// AST shapes of the SAME §30.5 kind-1 violation (a direct field/property/
+// indexer read vs. a bare identifier naming a borrowed local/parameter/
+// implicit field) read to the user as ONE rule, not two — including the
+// exact fragment ("§30.5 Pattern A) may only `return` an OWNED expression")
+// #4285's own regression test keys its diagnostic-text assertion on.
+void MethodOwnership::reportAsyncPatternABorrowedIdentifierReturn(
+        const ast::Expr& e) {
+    report(
+        Severity::Error, e.span.begin,
+        "an async method returning a class-typed `Task<T>` (§30.5 "
+        "Pattern A) may only `return` an OWNED expression on a "
+        "non-`await` return path — §30.5 kind 1: \"a `return` of an "
+        "owned expression: the task owns the result and its "
+        "destructor disposes it directly.\" A bare identifier naming a "
+        "BORROWED local, a plain (non-`owned`) parameter, or an "
+        "implicit-`this` field read is a BORROW with no admitted "
+        "producer-side chain (§28.3 *Producers*: a plain field/property/"
+        "indexer read is Borrowed even when the field itself is `owned` — "
+        "only `move obj.f` transfers it), so the task's teardown "
+        "would dispose a value it never owned, a use-after-free once "
+        "the real owner disposes it independently. If the value is "
+        "genuinely owned by this frame, return the owned local/parameter "
+        "directly (or transfer a field with `move`); otherwise return "
+        "`await` an admitted Pattern A source instead");
 }
 
 // #2175(a) / §28.3 v0.226 (spec "Returning a deferred-activation frame"):
