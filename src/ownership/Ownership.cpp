@@ -6877,6 +6877,15 @@ void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
             // definite fresh value, not the conditionally-disposed one.
             st.disposedOnSomePath = false;
             st.awaitSpent = false;  // #1869: fresh value — not an await-spend
+            // fix #4246 (§28.3 / §28.6, v0.298): the reassignment overwrites
+            // the slot's CONTENT, so any earlier "an explicit dispose on
+            // this local already reclaimed" fact is stale — see the field
+            // comment on `explicitDisposeReclaimedSlot`. Cleared UNCONDITIONALLY
+            // here (mirroring maybeConsumed/disposedOnSomePath/awaitSpent
+            // above): if this reassignment's producer is ALSO Owned, the
+            // flag is re-derived from scratch at this local's next explicit
+            // `.Dispose()` call.
+            st.explicitDisposeReclaimedSlot = false;
             // §28.3 (#1900): a reassignment of an owned-value slot restores
             // the slot's "definitely holds a fresh value" status, which the
             // scope-end auto-drop gate uses (alongside `everDischarged_ == 0`)

@@ -3260,6 +3260,16 @@ private:
 
     void markDisposedByName(std::string_view name, SourceLocation loc);
 
+    // fix #4246 (§28.3 / §28.6, v0.298): stamp `id` (an explicit
+    // `.Dispose()`/`?.Dispose()` receiver) with `disposeReclaimsReassigned-
+    // Borrow` when the dataflow's OWN current state for this local is
+    // Owned — MUST be called before the caller transitions that state via
+    // `markDisposedByName` (this reads `states_` as it stands at the call
+    // site, not after). See IdentifierExpr's field comment for why this is
+    // a per-occurrence fact rather than a per-declaration one.
+    void markExplicitDisposeReclaimIfReassignedBorrow(
+        const ast::IdentifierExpr& id);
+
     void markMovedByName(std::string_view name, SourceLocation loc);
 
     // §22.3 (v0.169, #1348): true when `e` is a NAMED OWNED BINDING — a bare

@@ -4621,6 +4621,62 @@ llvm::Value* Emitter::explicitDisposeOwnedReceiverSlot(
             // reclaims elsewhere, so reclaiming here would double-free.
             if (loc->isUsing) return lvalueAddr(receiver, slotTy);
             if (unwindOwnedLocalClass(ld)) return lvalueAddr(receiver, slotTy);
+            // fix #4246 (§28.3 / §28.6, v0.298): `unwindOwnedLocalClass`
+            // classifies purely from ld's DECLARATION initializer form and
+            // returns null for a borrow-initialized local (`var y := x;`),
+            // even when a LATER plain reassignment (`y := new Res(1);`) made
+            // y's CURRENT value owned. The ownership pass already proved
+            // exactly that, for exactly THIS call site, via its `states_`
+            // dataflow — see `markExplicitDisposeReclaimIfReassignedBorrow`
+            // and the field comment on `disposeReclaimsReassignedBorrow`.
+            // Deliberately keyed on the RECEIVER OCCURRENCE (`id`), not on
+            // `ld`: the same local may ALSO be legally `.Dispose()`d at an
+            // EARLIER point while still a genuine borrow (§28.6's recorded
+            // gap), and reclaiming there would free a value another owner
+            // still holds — a double-free this per-occurrence flag avoids by
+            // construction, since only the call site(s) the dataflow proved
+            // Owned are stamped.
+            //
+            // EXCEPTION (measured regression, destructor_field_move_runtime_
+            // 763): `var taken := move this._inner;` / `var taken := move
+            // _inner;` INSIDE A DESTRUCTOR BODY is `states_`-Owned exactly
+            // like any other owned local, so the check above alone stamps
+            // this call too — but LlvmBackend_Exprs2.cpp's move-lowering
+            // (#383/#763 design) DELIBERATELY leaves the field slot NON-null
+            // in this one case: "the SOLE disposal site is the owned-field
+            // auto-dispose pass (emitOwnedFieldDisposals) ... nulling the
+            // field here would make that pass skip the still-owned object —
+            // a LEAK." So `taken` and the field are the SAME live pointer,
+            // and the field's OWN auto-dispose cascade — which does NOT
+            // know this call reclaimed anything — is the intended sole
+            // reclaimer. Trusting the flag here freed the block via
+            // `taken.Dispose()` and again via the field cascade: a measured
+            // heap-use-after-free in `Outer$DisposeCore`. Excluded by
+            // checking for the EXACT shape the null-suppression site
+            // guards, so every other reassigned-borrow shape (including a
+            // plain local reassignment inside a destructor unrelated to a
+            // field) is unaffected. // per §28.3, §28.6, §28.8.1, #763
+            bool isDestructorFieldMoveInit = false;
+            if (emittingDisposerBody_ && ld->initializer) {
+                if (auto* mv = dynamic_cast<const ast::UnaryExpr*>(
+                        ld->initializer.get());
+                    mv && mv->op == "move" && mv->operand) {
+                    sema::FieldSymbol* fs = nullptr;
+                    if (dynamic_cast<const ast::IdentifierExpr*>(
+                            mv->operand.get()) ||
+                        dynamic_cast<const ast::MemberAccessExpr*>(
+                            mv->operand.get()))
+                        fs = dynamic_cast<sema::FieldSymbol*>(
+                            ctx_.exprSymbol(*mv->operand));
+                    if (fs && (isOwnedReferenceField(fs) ||
+                               isOwnedIteratorInterfaceField(fs) ||
+                               ownedCollectionFieldType(fs) != nullptr))
+                        isDestructorFieldMoveInit = true;
+                }
+            }
+            if (id->disposeReclaimsReassignedBorrow &&
+                !isDestructorFieldMoveInit)
+                return lvalueAddr(receiver, slotTy);
             // §28.11 / #889: a local that RECEIVED a moved-out owned element via
             // `out owned` (e.g. `s.TryPop(out owned item)`) is the sole owner of
             // that element — recorded in outOwnedRecipients_ at the call site. Its
@@ -5209,7 +5265,37 @@ bool Emitter::emitExplicitDisposeChain(const ast::Expr& target,
             // reclaims via ITS slot), so it stays dispatch-only.
             emitDisposeAndReclaim(recv);
         } else {
+            // fix #4246 follow-up (§28.3 / §28.6, v0.298): null-guard the
+            // dispatch. Every PRE-#4246 shape reaching this arm (a borrow,
+            // a non-owned field, and so on) has `recv` PROVABLY non-null —
+            // nothing before #4246 ever nulled a slot this arm reads from —
+            // so this guard was previously always-true and added nothing
+            // observable. It stopped being always-true once a borrow-
+            // declared local could become reclaim-eligible (this file's
+            // `disposeReclaimsReassignedBorrow`/`explicitDisposeReclaimed-
+            // Slot` machinery): a branch-join can leave `explicitDispose-
+            // ReclaimedSlot` conservatively false (§25's double-free-vs-leak
+            // trade, taken deliberately in `joinInto`'s AND-merge) for a
+            // POST-MERGE dispose call reachable from an arm that DID
+            // reclaim+null this same local's slot on an EARLIER dispose.
+            // That arm's null is a RUNTIME fact the merge's static under-
+            // approximation cannot erase, so the unconditional dispatch
+            // below would read the vtable pointer through a null receiver
+            // — a SIGSEGV, measured before this guard existed. Guarding
+            // costs nothing on the provably-non-null shapes and turns the
+            // ambiguous-merge shape into the pre-#4246 idempotent no-op
+            // instead of a crash.
+            llvm::Value* nonNull = builder_.CreateICmpNE(
+                recv, llvm::ConstantPointerNull::get(ptrTy()));
+            auto* dnn = llvm::BasicBlock::Create(
+                llvm_, "disp.dispatch.nn", currentFn_);
+            auto* dcont = llvm::BasicBlock::Create(
+                llvm_, "disp.dispatch.cont", currentFn_);
+            builder_.CreateCondBr(nonNull, dnn, dcont);
+            builder_.SetInsertPoint(dnn);
             emitDynamicDispose(recv);
+            builder_.CreateBr(dcont);
+            builder_.SetInsertPoint(dcont);
         }
     }
     // fix #2967 (spec §28.2 / §28.3, v0.240): THE chain's single

@@ -1067,6 +1067,33 @@ struct NullLiteralExpr : Expr {};
 struct IdentifierExpr : Expr {
     std::string_view name;
     std::vector<std::unique_ptr<Type>> typeArgs;
+    // fix #4246 (§28.3 / §28.6, v0.298): set by the ownership pass on the
+    // RECEIVER occurrence of an explicit `x.Dispose()` / `x?.Dispose()` /
+    // `x!.Dispose()` call whose LOCAL is, at THIS exact program point (per
+    // the checker's `states_` dataflow, read in `markExplicitDisposeReceiver`
+    // just before the call transitions it to Disposed), in the Owned state —
+    // even when the local's DECLARATION is a plain borrow alias
+    // (`var y := x;`) that only became Owned later via a plain reassignment
+    // (`y := new Res(1);`). Codegen's `unwindOwnedLocalClass` classifies
+    // purely from the DECLARATION's initializer form and returns null for a
+    // borrow-initialized local, so `explicitDisposeOwnedReceiverSlot` fell to
+    // dispatch-only — the destructor ran but the heap block LEAKED (the
+    // #4246 finding).
+    //
+    // Deliberately a PER-OCCURRENCE fact (a fresh IdentifierExpr node per
+    // source occurrence), NOT a per-declaration one like
+    // `LocalDecl::becomesOwnedViaReassign`. That distinction is load-bearing:
+    // the SAME local can legally be `.Dispose()`d at a point where it is
+    // STILL a genuine borrow (§28.6's documented "recorded gap" — a plain
+    // local's borrow-dispose is unenforced, e.g. `var y := x; y.Dispose();
+    // y := new Res(1); y.Dispose();` compiles today) as well as later, after
+    // it becomes owned. A per-declaration flag would make the EARLIER
+    // (still-borrow) call ALSO reclaim — freeing a value another owner (`x`)
+    // still holds, a double-free that does not exist today. Reading the
+    // dataflow's OWN Owned/Borrowed classification at the EXACT call site is
+    // sound however many such calls a program contains, in either order.
+    // // per §28.3, §28.6
+    bool disposeReclaimsReassignedBorrow = false;
 };
 
 // Source-level parentheses (`(expr)`) are NOT represented as their own AST

@@ -98,6 +98,31 @@ struct LocalOwnership {
     // pass through the ownership-checker code path that reads the state).
     bool explicitlyDisposed = false;
 
+    // fix #4246 (§28.3 / §28.6, v0.298): true once an explicit `.Dispose()`
+    // call, for THIS local's CURRENT value-epoch, was classified as
+    // reclaim-eligible by `markExplicitDisposeReclaimIfReassignedBorrow`
+    // (i.e. `state == Owned` at that call, on a borrow-initialized local
+    // that became owned via reassignment — the shape `unwindOwnedLocalClass`
+    // cannot see because it only reads the DECLARATION). Sticky ACROSS the
+    // Owned -> Disposed transition that same call causes, so a REPEATED
+    // `.Dispose()` on the same value-epoch (§28.2 idempotence) is recognised
+    // too: codegen must return the same slot on the repeat call as it did on
+    // the reclaiming one, or the repeat call's dispatch-only fallback reads
+    // through the pointer the reclaim already nulled — a null-deref SIGSEGV
+    // (measured: `y := new Res(1); y.Dispose(); y.Dispose();` after a
+    // borrow-init `var y := x;`, before this field existed).
+    //
+    // RESET on every plain `:=` reassignment (`handleAssignment`, alongside
+    // `maybeConsumed`/`disposedOnSomePath`/`awaitSpent`) — load-bearing:
+    // the slot's CONTENT changes at a reassignment, so a stale `true` would
+    // make a LATER, unrelated dispose on a freshly-reassigned genuine borrow
+    // also reclaim, double-freeing a value this local never owned. Because
+    // the reset always runs before `state` can become Owned again, a
+    // following reassignment to another owned producer re-derives this flag
+    // from scratch at its own next explicit dispose, and the two owned
+    // "epochs" cannot bleed into each other.
+    bool explicitDisposeReclaimedSlot = false;
+
     // Async-readiness 3c: SuspendLocal annotation (§30.5 / §30.9). True when
     // this owned local's live range crosses at least one `await` suspend
     // point in an async method — i.e. it is still live when the method

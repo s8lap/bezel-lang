@@ -2175,6 +2175,7 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
                 // discharge just like the bare `x.Dispose()` form. // per §28.3
                 if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
                         lookThroughForceUnwrap(ma->target.get()))) {
+                    markExplicitDisposeReclaimIfReassignedBorrow(*id);
                     markDisposedByName(id->name, id->span.begin);
                 }
             }
@@ -2197,6 +2198,7 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
                                                    nm->target->span.begin);
                 if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
                         nm->target.get())) {
+                    markExplicitDisposeReclaimIfReassignedBorrow(*id);
                     markDisposedByName(id->name, id->span.begin);
                 }
             }
@@ -8565,6 +8567,28 @@ void MethodOwnership::joinInto(std::unordered_map<sema::Symbol*, LocalOwnership>
             // // per §28.3, §28.6
             if (!st.disposeAliasSource && o.disposeAliasSource)
                 st.disposeAliasSource = o.disposeAliasSource;
+            // fix #4246 (§28.3 / §28.6, v0.298): AND (not OR, and not the
+            // implicit "keep `st`'s side" this same-state branch otherwise
+            // does for every field it does not name) the sticky
+            // `explicitDisposeReclaimedSlot` bit across a same-state merge.
+            // Unlike `maybeConsumed` above, where losing precision means
+            // REJECTING a program that is actually fine, losing precision
+            // here in the wrong direction means CODEGEN RECLAIMS A SLOT ONE
+            // INCOMING PATH NEVER MADE RECLAIM-ELIGIBLE — a double-free, not
+            // a false reject. Example: `if c then y := new R(); y.Dispose();
+            // else y.Dispose(); end;` (else leaves `y` a genuine, still-live
+            // borrow — no reassignment on that arm) — both arms end in
+            // `Disposed`, so `st.state == o.state` is exactly this branch,
+            // and keeping only `st`'s flag (whichever operand order the
+            // caller happened to pass) would make a LATER dispose on the
+            // merged `y` reclaim-eligible even on the path that never
+            // reassigned it. AND is the sound choice: the merged local is
+            // reclaim-eligible only where EVERY incoming path already
+            // proved it so — the same "worst case wins" asymmetry
+            // `ownedBorrowedClash` below applies to Owned-vs-Borrowed,
+            // pushed down one field. // per §28.3, §28.6
+            st.explicitDisposeReclaimedSlot =
+                st.explicitDisposeReclaimedSlot && o.explicitDisposeReclaimedSlot;
             continue;
         }
         // PolyNull absorbs: PolyNull ⊓ X = X.
@@ -8787,6 +8811,34 @@ LocalOwnership* MethodOwnership::lookupState(std::string_view name) {
         if (sym->name == name) return &st;
     }
     return nullptr;
+}
+
+// fix #4246 (§28.3 / §28.6, v0.298): see IdentifierExpr::disposeReclaims-
+// ReassignedBorrow's field comment for the full rationale. Reads `states_`
+// (via `lookupState`, non-mutating) for `id`'s CURRENT classification at
+// THIS exact `.Dispose()` call and, when it is Owned, stamps the flag on
+// THIS occurrence only — never on the LocalDecl, which would make every
+// call site on the local share one answer regardless of program order. Must
+// run before the caller's `markDisposedByName`, which mutates the state to
+// Disposed. // per §28.3, §28.6
+void MethodOwnership::markExplicitDisposeReclaimIfReassignedBorrow(
+        const ast::IdentifierExpr& id) {
+    if (LocalOwnership* st = lookupState(id.name)) {
+        // fix #4246 follow-up: `state == Owned` covers the FIRST dispose of
+        // this value-epoch; `explicitDisposeReclaimedSlot` (already true)
+        // covers a REPEATED dispose of the SAME epoch after the first one
+        // already flipped `state` to Disposed — see that field's comment for
+        // why a repeat call must see this too (§28.2 idempotence: the second
+        // call must land on the SAME null-guarded slot the first reclaimed,
+        // not fall to the dispatch-only path that assumes a never-nulled
+        // receiver).
+        if (st->state == OwnershipState::Owned ||
+            st->explicitDisposeReclaimedSlot) {
+            const_cast<ast::IdentifierExpr&>(id).disposeReclaimsReassignedBorrow =
+                true;
+            st->explicitDisposeReclaimedSlot = true;
+        }
+    }
 }
 
 void MethodOwnership::markDisposedByName(std::string_view name, SourceLocation loc) {
