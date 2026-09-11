@@ -349,7 +349,27 @@ std::unique_ptr<ast::TypeDecl> Parser::parseTypeOrInterfaceDecl(
                             peekNext().text != ")";
                         int depth = 1;
                         advance();
-                        while (depth > 0 && current_.kind != TokenKind::EndOfFile) {
+                        // fix #4341 (§26.3-analogous discard-loop hardening,
+                        // Appendix A.3, v0.298): bound this discard scan by
+                        // `isKeyword("end")` in addition to depth/EOF, the
+                        // same shape #4257 applied to the extension
+                        // `polymorphic(...)` discard loop. Without this
+                        // bound, an unclosed `(` on a non-first InheritItem
+                        // (e.g. `class Foo(x: int): Base(x), IBar(unclosed`)
+                        // consumed the type's own `end Foo;` terminator and
+                        // every subsequent top-level declaration to EOF —
+                        // measured directly: this exact probe shape produced
+                        // only "expected 'end'" at EOF, swallowing a
+                        // deliberately-malformed following class whole. This
+                        // cannot misfire on well-formed input: `ArgList`
+                        // (Appendix A) admits only expression tokens inside
+                        // the parens, and `end` is a reserved keyword
+                        // (`Lexer.cpp`'s `isReservedKeyword`), so it can
+                        // never be part of a well-formed argument — a
+                        // well-formed list can never be at depth >= 1 when
+                        // the current token is `end`.
+                        while (depth > 0 && current_.kind != TokenKind::EndOfFile &&
+                               !isKeyword("end")) {
                             if (isPunctuator("("))      ++depth;
                             else if (isPunctuator(")")) --depth;
                             advance();
