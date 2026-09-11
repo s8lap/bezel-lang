@@ -9429,6 +9429,33 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
                     st.maybeConsumed = false;
                     st.disposedOnSomePath = false;
                     st.awaitSpent = false;
+                    // fix #4270 (§28.3/§28.6, v0.298): the sibling of fix
+                    // #4269's `disposeAliasSource` clear, one field over —
+                    // this arm ported every OTHER `handleAssignment` reset
+                    // (maybeConsumed/disposedOnSomePath/awaitSpent above,
+                    // disposeAliasSource below via #4269) but never got fix
+                    // #4246's `explicitDisposeReclaimedSlot` reset
+                    // (Ownership.cpp ~6888). Left stale, a lambda-body local
+                    // whose FIRST explicit `.Dispose()` reclaimed a fresh
+                    // owned value keeps that sticky `true` bit across a LATER
+                    // reassignment to a genuine borrow: the checker admits
+                    // the borrow's own `.Dispose()` (no `disposeAliasSource`
+                    // rejection — the RHS was not a bare-identifier-of-an-
+                    // Owned-local), but
+                    // `markExplicitDisposeReclaimIfReassignedBorrow`'s `state
+                    // == Owned || explicitDisposeReclaimedSlot` condition
+                    // fires on the stale flag alone, so codegen frees the
+                    // slot's CURRENT pointer — the borrowed-from object's own
+                    // memory, owned by someone else — a double-free/UAF, not
+                    // a leak. Direction of travel: clearing the flag more
+                    // eagerly can only turn a wrongly-reclaiming dispose into
+                    // a dispatch-only one (a missed reclaim leaks, never
+                    // crashes) — the safe direction per the field's own
+                    // comment (OwnershipState.hpp ~115-123). Measured FAIL-
+                    // WITHOUT/PASS-WITH in
+                    // lambda_reassign_explicit_dispose_reclaimed_slot_4270_
+                    // test.cpp. // per §28.3, §28.6, v0.298, #4270
+                    st.explicitDisposeReclaimedSlot = false;
                     if (st.state == OwnershipState::Owned)
                         definitelyRestoredLocals_.insert(sym);
                     // fix #4218 (§28.7/§28.3, v0.298): mirrors
