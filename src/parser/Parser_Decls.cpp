@@ -3333,7 +3333,22 @@ std::vector<std::unique_ptr<ast::Type>> Parser::parseInheritance(
             // Skip a balanced parenthesised group without parsing its contents.
             int depth = 1;
             advance();
-            while (depth > 0 && current_.kind != TokenKind::EndOfFile) {
+            // fix #4343 (same §26.3-analogous discard-loop class as #4257 /
+            // #4341, Appendix A.3, v0.298): bound this discard scan by
+            // `isKeyword("end")` in addition to depth/EOF. Without this
+            // bound, an unclosed `(` on a non-first `InheritItem` here (this
+            // function serves record/interface decls and classes with no
+            // primary constructor — the `hasPositionalFields` branch above
+            // has its own, now-identically-hardened copy of this same loop)
+            // consumed the type's own `end TypeName;` terminator and every
+            // subsequent top-level declaration to EOF. Cannot misfire on
+            // well-formed input for the same reason as those two fixes:
+            // Appendix A's `ArgList` grammar admits only expression tokens
+            // inside the parens, and `end` is a reserved keyword
+            // (`Lexer.cpp`'s `isReservedKeyword`), so it can never appear
+            // inside a well-formed argument list.
+            while (depth > 0 && current_.kind != TokenKind::EndOfFile &&
+                   !isKeyword("end")) {
                 if (isPunctuator("("))      ++depth;
                 else if (isPunctuator(")")) --depth;
                 advance();
