@@ -241,7 +241,7 @@ constexpr std::array<std::string_view, 2> kNoOverrideIdentityBuiltins = {
 // LlvmBackend_Layout.cpp (see header).  This is the intersection of the two
 // pre-refactor hand-lists: OwningBuffer (astNode-only) and the FFI class names
 // (imported-only) are NOT here — they stay as explicit deltas at the sites.
-constexpr std::array<std::string_view, 70> kHeapPointerReferenceBuiltins = {
+constexpr std::array<std::string_view, 73> kHeapPointerReferenceBuiltins = {
     // §4 collections (SortedSet: stdlib §4.18/#1426 — bz_dict_t* rep, both paths)
     "Array", "OwningArray", "Dictionary", "OwningDictionary",
     "SortedDictionary", "SortedSet", "Stack", "OwningStack", "Queue", "OwningQueue",
@@ -317,6 +317,26 @@ constexpr std::array<std::string_view, 70> kHeapPointerReferenceBuiltins = {
     "ISerializer", "IDeserializer", "ISerializable", "IDeserializable",
     "BinarySerializer", "BinaryDeserializer", "JsonSerializer",
     "JsonDeserializer",
+    // fix #4326 (stdlib §2.10/§2.18, §28.2/§28.12/§18.5): IDisposable,
+    // IAsyncDisposable and IFormattable are null-declaration builtin
+    // interfaces (`Resolver::builtinTypeArity`, TypeResolution_Names.cpp,
+    // all three arity-0) with NO user TypeDecl — the exact shape
+    // IOrderedEnumerable was missing this table for (issue #4178, directly
+    // above). Naming any of the three as a parameter, return, field, or
+    // local-annotation type IR-verifier-crashed ("Call parameter type does
+    // not match function signature!" / the return/field/local twins of
+    // that message) because lowerTypeRef's Named case fell through both
+    // this table's astNode-path and imported-name-path checks
+    // (LlvmBackend_Layout.cpp) to the i32 default, mismatching the `ptr`
+    // every conforming value (any class instance, for IDisposable/
+    // IAsyncDisposable; any IFormattable-implementing class) actually is.
+    // MEASURED (issue #4326, this file's own parent `f99d7c4`, clean tree,
+    // `bezelc` rebuilt directly): a parameter typed `IDisposable`, a
+    // parameter typed `IFormattable`, and — found by this fix's own
+    // mechanical derivation over the full null-declaration-interface
+    // population, NOT named in the filed issue — a parameter typed
+    // `IAsyncDisposable` all reproduced the identical crash.
+    "IDisposable", "IAsyncDisposable", "IFormattable",
 };
 
 // #2757: the RESERVED builtin type names that lowerTypeRef's Named case
@@ -421,7 +441,7 @@ kPositionalCtorOnlyBuiltinRecordArities = {{
 // every OTHER reserved name denotes a concrete built-in whose runtime value is
 // a header-less C struct. See the header for why the derivation runs in this
 // direction (a forgotten entry here costs a leak, never a wild jump).
-constexpr std::array<std::string_view, 22> kBuiltinInterfaceHeads = {
+constexpr std::array<std::string_view, 25> kBuiltinInterfaceHeads = {
     // §29 iteration / collection interfaces
     "IEnumerable", "IEnumerator", "IOwningEnumerable", "IOwningEnumerator",
     "IAsyncEnumerable", "IAsyncEnumerator", "IOwningAsyncEnumerable",
@@ -431,6 +451,33 @@ constexpr std::array<std::string_view, 22> kBuiltinInterfaceHeads = {
     "IEvent", "IAsyncEvent", "ISharedEvent", "IGrouping",
     // §2.14–§2.15 serialization vocabulary
     "ISerializer", "IDeserializer", "ISerializable", "IDeserializable",
+    // fix #4326 (§28.2/§28.12/§18.5): IDisposable, IAsyncDisposable,
+    // IFormattable — a NECESSARY companion of that fix's
+    // `kHeapPointerReferenceBuiltins` addition, not a second, independent
+    // change. Adding these three to the heap-pointer table made them newly
+    // `isReservedBuiltinTypeName`-true; `isVtableLessBuiltinClassName` is
+    // DERIVED as "reserved MINUS this table" (see the header), so leaving
+    // them out of THIS table would have made `isVtableLessBuiltinClassName`
+    // silently start answering `true` for all three — exactly the #2921/
+    // #2923 wild-jump/double-free shape this table exists to prevent,
+    // applied to receivers whose runtime value may be ANY user class (every
+    // class implicitly implements `IDisposable`, stdlib §2.10; a class may
+    // explicitly implement `IAsyncDisposable`/`IFormattable`, stdlib §2.10/
+    // §2.18 — measured: `class Money: IFormattable ... end Money;` compiles
+    // and a `var f: IFormattable := new Money(...);` dispatches through it).
+    // MEASURED without this addition (fix #4326's own investigation, same
+    // rebuilt `bezelc`): `d.Dispose()` through an `owned d: IDisposable`
+    // parameter/local silently did NOT run the real class's destructor (no
+    // crash, no diagnostic — `isVtableLessBuiltinClassName("IDisposable")`
+    // was wrongly `true`, routing the call through the vtable-less path
+    // instead of the real dynamic-dispatch slot), and `$"{f:X}"` on an
+    // `IFormattable`-typed receiver printed the literal text "IFormattable"
+    // instead of dispatching to the real `ToString(format)` override
+    // (`LlvmBackend_String.cpp`'s §2969 routing falls back to the vtable-
+    // less-builtin renderer). Both are FIXED by this addition (see the
+    // regression tests in
+    // idisposable_iasyncdisposable_iformattable_heap_ptr_4326_test.cpp).
+    "IDisposable", "IAsyncDisposable", "IFormattable",
 };
 
 // §31.4 / #1621: the built-in exception hierarchy (child name -> parent

@@ -446,7 +446,7 @@ BEZEL_TEST(builtin_registry_snapshot, iterable_interface_head_set) {
 // (imported-only) are deliberately NOT in the shared set — they are the small
 // site-local deltas the two call sites still test explicitly.
 BEZEL_TEST(builtin_registry_snapshot, heap_pointer_reference_builtin_set) {
-    static constexpr std::array<std::string_view, 70> kSnapshot = {
+    static constexpr std::array<std::string_view, 73> kSnapshot = {
         "Array", "OwningArray", "Dictionary", "OwningDictionary",
         // INTENTIONAL addition (stdlib §4.18, #1426): SortedSet — bz_dict_t*
         // rep on both the astNode and imported paths.
@@ -506,6 +506,13 @@ BEZEL_TEST(builtin_registry_snapshot, heap_pointer_reference_builtin_set) {
         "ISerializer", "IDeserializer", "ISerializable", "IDeserializable",
         "BinarySerializer", "BinaryDeserializer", "JsonSerializer",
         "JsonDeserializer",
+        // INTENTIONAL addition (fix #4326, stdlib §2.10/§2.18, §28.2/
+        // §28.12/§18.5): IDisposable, IAsyncDisposable, IFormattable — three
+        // more null-declaration builtin interfaces sharing IOrderedEnumerable's
+        // exact shape (directly above): naming one as a parameter or return
+        // type IR-verifier-crashed because lowerTypeRef's Named case fell
+        // through to the i32 default instead of ptr.
+        "IDisposable", "IAsyncDisposable", "IFormattable",
     };
     for (auto n : kSnapshot) BEZEL_EXPECT_TRUE(isHeapPointerReferenceBuiltin(n));
     // The site-local deltas must NOT be in the shared set. (OwningBuffer was
@@ -658,13 +665,19 @@ BEZEL_TEST(builtin_registry_snapshot, vtable_less_builtin_class_name_set) {
     // (b) OUT: every reserved INTERFACE head — the receivers that may hold a
     // user class and must keep dispatching through its vtable. This is the
     // whole content of the subtraction, so it is pinned name-for-name.
-    static constexpr std::array<std::string_view, 22> kInterfaceHeads = {
+    static constexpr std::array<std::string_view, 25> kInterfaceHeads = {
         "IEnumerable", "IEnumerator", "IOwningEnumerable", "IOwningEnumerator",
         "IAsyncEnumerable", "IAsyncEnumerator", "IOwningAsyncEnumerable",
         "IOwningAsyncEnumerator", "IReadOnlyCollection", "IReadOnlyList",
         "ICollection", "IList", "IOwningCollection", "IOwningList",
         "IEvent", "IAsyncEvent", "ISharedEvent", "IGrouping",
         "ISerializer", "IDeserializer", "ISerializable", "IDeserializable",
+        // INTENTIONAL addition (fix #4326): IDisposable, IAsyncDisposable,
+        // IFormattable — the necessary companion of that fix's
+        // kHeapPointerReferenceBuiltins addition; see BuiltinRegistry.cpp's
+        // comment on kBuiltinInterfaceHeads for why leaving these out would
+        // have made isVtableLessBuiltinClassName wrongly true for them.
+        "IDisposable", "IAsyncDisposable", "IFormattable",
     };
     for (auto n : kInterfaceHeads) {
         BEZEL_EXPECT_FALSE(isVtableLessBuiltinClassName(n));
@@ -696,13 +709,16 @@ BEZEL_TEST(builtin_registry_snapshot, vtable_less_builtin_class_name_set) {
 // reads, so any drift between this snapshot and the `kBuiltinInterfaceHeads`
 // array it mirrors is the regression shape.
 BEZEL_TEST(builtin_registry_snapshot, builtin_interface_head_set_8_1) {
-    static constexpr std::array<std::string_view, 22> kInterfaceHeads = {
+    static constexpr std::array<std::string_view, 25> kInterfaceHeads = {
         "IEnumerable", "IEnumerator", "IOwningEnumerable", "IOwningEnumerator",
         "IAsyncEnumerable", "IAsyncEnumerator", "IOwningAsyncEnumerable",
         "IOwningAsyncEnumerator", "IReadOnlyCollection", "IReadOnlyList",
         "ICollection", "IList", "IOwningCollection", "IOwningList",
         "IEvent", "IAsyncEvent", "ISharedEvent", "IGrouping",
         "ISerializer", "IDeserializer", "ISerializable", "IDeserializable",
+        // INTENTIONAL addition (fix #4326) — see the companion snapshot
+        // above (vtable_less_builtin_class_name_set) for the full rationale.
+        "IDisposable", "IAsyncDisposable", "IFormattable",
     };
     for (auto n : kInterfaceHeads) {
         BEZEL_EXPECT_TRUE(isBuiltinInterfaceHead(n));
