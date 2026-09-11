@@ -336,6 +336,23 @@ static bool isLiteralDerivedExpr(const ast::Expr* e) {
     return false;
 }
 
+// fix #4330 (§9.5/§15.4, v0.298): simple (last-component) name of a Named
+// TypeRef, or empty for non-Named. A file-local copy of ExprTypecheck.cpp's
+// `namedTypeSimpleName`, which is `static` to its own translation unit —
+// `ExprTypecheck_Calls.cpp` carries the identical copy under
+// `callsNamedTypeSimpleName` for the same reason (needed by
+// `reportCollectionLiteralInterfaceTarget`'s call site here, the `with`-
+// expression admissibility gate below).
+static std::string_view exprsNamedTypeSimpleName(const TypeRef* ref) {
+    if (!ref || ref->kind != TypeRef::Kind::Named) return {};
+    if (ref->declaration) return ref->declaration->name;
+    if (!ref->importedName.empty()) return ref->importedName;
+    if (ref->astNode && ref->astNode->name &&
+        !ref->astNode->name->parts.empty())
+        return ref->astNode->name->parts.back();
+    return {};
+}
+
 // #625 / §12 / §31 / fix #2950 / fix #2971: the "does `ts` inherit a built-in
 // exception" wrapper that used to live here is gone. It answered only half the
 // question the unqualified-identifier resolver actually asks — the other half
@@ -10724,6 +10741,62 @@ void ExprTC::visitChildren(const ast::Expr& e) {
             if (!srcTs) continue;
             SourceLocation valLoc =
                 ia.value ? ia.value->span.begin : we->span.begin;
+            // fix #4330 (§9.5/§5.1/§11.2/§15.4, v0.298): a `with`-clause
+            // replacement value is NEVER target-typed at all — unlike every
+            // other #4310-family position (LocalDecl/FieldDecl/PropertyDecl/
+            // ReturnStmt/call-arg/lambda-body), this handler visits
+            // `ia.value` (`visitExpr` a few lines above) BEFORE it even
+            // looks up the target field's type, so there is no
+            // `ctx_.setExprType`, no §15.4 admissibility gate, and
+            // (consequently) #4310's shared per-element walk is never
+            // reached either — measured SIGSEGV: `b1 with(Items :=
+            // [new Widget3Bad(s)])` for a non-conforming `Widget3Bad`
+            // dispatches `.GetV()` through a null itable slot, #4302's
+            // signature.
+            //
+            // Runs the SAME admissibility-gate-then-per-element-walk pattern
+            // #4310's other positions use, called once here rather than
+            // duplicated by hand at the PropertySymbol and FieldSymbol arms
+            // below (LANE_RULES §6/§25 — reuse the existing authorities, not
+            // a ninth hand-rolled element walk). Returns true when it
+            // reported a diagnostic; the caller then `continue`s, mirroring
+            // the other positions' early `return` on a rejected literal.
+            auto gateWithTargetCollectionLiteral =
+                [&](const TypeRef* fieldTyConst) -> bool {
+                if (!ia.value) return false;
+                auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(
+                    ia.value.get());
+                if (!cl) return false;
+                TypeRef* fieldTy = const_cast<TypeRef*>(fieldTyConst);
+                const bool isEmpty = !cl->isDict && cl->elements.empty();
+                const bool admitted =
+                    isEmpty
+                        ? isCollectionLiteralEmptyAdmissibleTarget(fieldTy)
+                        : isCollectionLiteralAdmissibleTarget(fieldTy,
+                                                              cl->isDict);
+                if (fieldTy && fieldTy->kind != TypeRef::Kind::Error &&
+                    !admitted) {
+                    if (isCollectionLiteralInterfaceTarget(fieldTy))
+                        reportCollectionLiteralInterfaceTarget(
+                            ctx_.diagnostics(), valLoc,
+                            exprsNamedTypeSimpleName(fieldTy));
+                    else if (cl->isDict &&
+                             isCollectionLiteralAdmissibleTarget(
+                                 fieldTy, /*isDict=*/false))
+                        reportCollectionLiteralDictFormBadTarget(
+                            ctx_.diagnostics(), valLoc, fieldTy);
+                    else
+                        reportCollectionLiteralBadTarget(
+                            ctx_.diagnostics(), valLoc, fieldTy);
+                    return true;
+                }
+                // per §5.1/§11.2 — #4310's shared per-element interface-
+                // conformance walk, reused rather than a ninth hand-rolled
+                // copy. Closes #4302's exact crash signature at this
+                // position (filed as #4330).
+                checkCollectionLiteralElementAssignability(*cl, fieldTy);
+                return false;
+            };
             Symbol* mem = lookupMember(srcTs, ia.name);
             if (!mem) {
                 // #876: nonexistent field name.
@@ -10792,12 +10865,26 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                 // rejected with the §5.1 diagnostic.
                 if (ia.value) {
                     TypeRef* valTy = ctx_.exprType(*ia.value);
-                    if (const TypeRef* fieldTy = storageComponentType(ps, ctx_))
+                    if (const TypeRef* fieldTy = storageComponentType(ps, ctx_)) {
+                        // fix #4330: §15.4 admissibility gate + #4310's
+                        // per-element interface-conformance walk — see
+                        // `gateWithTargetCollectionLiteral`'s header comment
+                        // above. A rejected literal reports its own
+                        // diagnostic and skips the whole-value
+                        // `checkAssignable` below (its `fromTy` is null for
+                        // a collection literal at every #4310-family
+                        // position, so calling it too would be a harmless
+                        // no-op, not a double diagnostic — skipped anyway
+                        // for symmetry with the other positions' early
+                        // `return`).
+                        if (gateWithTargetCollectionLiteral(fieldTy))
+                            continue;
                         checkAssignable(
                             valTy, const_cast<TypeRef*>(fieldTy), valLoc,
                             "replacement value for `" +
                             std::string(ia.name) + "`",
                             ia.value.get());
+                    }
                 }
                 continue;
             }
@@ -10814,12 +10901,17 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                 // `A=4438432|B=0`.
                 if (ia.value) {
                     TypeRef* valTy = ctx_.exprType(*ia.value);
-                    if (const TypeRef* fieldTy = storageComponentType(fs, ctx_))
+                    if (const TypeRef* fieldTy = storageComponentType(fs, ctx_)) {
+                        // fix #4330: the positional-field twin of the
+                        // auto-property arm's gate above.
+                        if (gateWithTargetCollectionLiteral(fieldTy))
+                            continue;
                         checkAssignable(
                             valTy, const_cast<TypeRef*>(fieldTy), valLoc,
                             "replacement value for `" +
                             std::string(ia.name) + "`",
                             ia.value.get());
+                    }
                 }
                 continue;
             }
