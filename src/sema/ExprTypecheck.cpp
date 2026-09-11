@@ -11395,6 +11395,54 @@ void ExprTC::visitTopDecl(const ast::TopDecl& d) {
                     continue;
                 }
             }
+            // fix #4228 (§26.3, v0.298): "No `virtual`, `override`,
+            // `abstract`, or `sealed` — extensions are statically
+            // dispatched." Same shape as the `static` check just above (and
+            // its own §26.3 rationale bullet a few lines up in the same
+            // section): an extension block has no declaring class and no
+            // inheritance, so a `VirtualKind` modifier denotes nothing
+            // meaningful on an extension member. A.4's shared `MethodDecl`/
+            // `PropertyDecl` productions admit `VirtualKind?` unconditionally
+            // (`Visibility "static"? "async"? VirtualKind? "method" ...` /
+            // `Visibility "static"? VirtualKind? "readonly"? "property" ...`)
+            // — the grammar over-admits and this bullet is rejected
+            // semantically, exactly the split the `static` check above and
+            // `ExtensionMember`'s own A.4 comment already document for
+            // `static`. Before this fix nothing read this slot at all: a
+            // `virtual`/`override`/`abstract`/`sealed override` extension
+            // method or expression-bodied property compiled clean, linked,
+            // and ran (measured: exit 0, zero diagnostics, on all 4
+            // spellings x {method, expression-bodied property} = 8 rows).
+            {
+                const std::vector<std::string_view>* mods = nullptr;
+                SourceLocation loc{};
+                if (auto* md = dynamic_cast<const ast::MethodDecl*>(m.get())) {
+                    mods = &md->modifiers; loc = md->span.begin;
+                } else if (auto* pd =
+                               dynamic_cast<const ast::PropertyDecl*>(m.get())) {
+                    mods = &pd->modifiers; loc = pd->span.begin;
+                }
+                std::string_view virtualKindMod;
+                if (mods) {
+                    for (auto mod : *mods) {
+                        if (mod == "virtual" || mod == "override" ||
+                            mod == "abstract" || mod == "sealed") {
+                            virtualKindMod = mod;
+                            break;
+                        }
+                    }
+                }
+                if (!virtualKindMod.empty()) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, loc,
+                        "an extension member may not be declared `" +
+                        std::string(virtualKindMod) + "` — extensions are "
+                        "statically dispatched; no `virtual`, `override`, "
+                        "`abstract`, or `sealed` modifier is admitted on an "
+                        "extension member (§26.3)");
+                    continue;
+                }
+            }
             // §26.3 (#1346, v0.160): extension members must be `public` or
             // `internal`; `protected` and `private` are compile errors — an
             // extension block has no declaring class and no inheritance, so
