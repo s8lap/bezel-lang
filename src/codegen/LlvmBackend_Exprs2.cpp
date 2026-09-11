@@ -2868,6 +2868,26 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         singleCaptureLocals_.clear();
     }
     assignedCaptureVars_.clear();          // fix #2706
+    // fix #4226 (§27.5 / §28.9, v0.298): snapshot the ANCESTOR scope's
+    // already-computed returnedCaptureVars_ before it is cleared for THIS
+    // nested lambda's own re-scan — see the merge just below (after the
+    // #3804 sharedCellEnvdtorFreeOwner_ merge, same pattern) for the full
+    // argument. Without this, a local declared and returned TWO OR MORE
+    // scopes up (e.g. `f` in a grandparent function, `return f;` there, `f`
+    // captured transitively by an intermediate lambda purely to hand it down
+    // to a lambda nested inside THAT lambda) loses the fact once the
+    // intermediate lambda's own collectBoxCaptureLocals rescan clears and
+    // repopulates returnedCaptureVars_ from ONLY its own top-level `return`
+    // statements (there are none — the intermediate lambda never itself
+    // returns `f`) — so the doubly-nested lambda's own capture-loop entry for
+    // `f` (consulted while currentFn_ == boxCaptureLocalsFn_ == the
+    // INTERMEDIATE lambda's fn) sees an empty set and never suppresses its
+    // own envdtor's content release, freeing `f`'s cell while the value is
+    // still needed by the true caller (issue #4226; #4198 only reached the
+    // one-level case, where the returning function IS the one whose
+    // collectBoxCaptureLocals call sees `f`'s capturer directly).
+    const std::unordered_set<const void*> ancestorReturnedCaptureVars4226 =
+        returnedCaptureVars_;
     returnedCaptureVars_.clear();          // fix #4198
     definitelyEscapingLambdas_.clear();
     boxCaptureLocalsFn_ = fn;
@@ -2949,6 +2969,18 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     // `outer`) reproduce this precisely.
     for (const auto& [k, v] : ancestorSharedCellOwner3804)
         sharedCellEnvdtorFreeOwner_.emplace(k, v);
+    // fix #4226 (§27.5 / §28.9, v0.298): merge the ancestor's
+    // returnedCaptureVars_ back in for any key THIS body's own rescan (just
+    // above, inside collectBoxCaptureLocals for a block body, or left empty
+    // for an expression body — same "applies to BOTH branches" reasoning as
+    // the #3804 merge immediately above) does not know about. A plain
+    // `insert` is correct (not `emplace`-into-a-map): the set is a pure
+    // membership fact ("returned by name somewhere in the enclosing chain"),
+    // so a union is always sound and this lambda's own fresh discoveries
+    // (if it itself directly returns the same decl) are simply ALSO in the
+    // set either way.
+    for (const void* k : ancestorReturnedCaptureVars4226)
+        returnedCaptureVars_.insert(k);
     closureReleaseEligibleFn_ = fn;
     // fix #4174 follow-up: the closure twin of the string parameter retain
     // above (line ~2479) — see retainAssignedClosureParams' own comment.
