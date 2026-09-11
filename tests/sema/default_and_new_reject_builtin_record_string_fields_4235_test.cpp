@@ -814,3 +814,238 @@ BEZEL_TEST(default_and_new_reject_builtin_record_string_fields_4235,
            "fields is a non-nullable reference type"));
     BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "\xC2\xA7""17.11"));
 }
+
+// ── fix #4294: IGrouping<TKey,T> — the SEVENTH name on this file's null-
+//    declaration-builtin list, found while re-measuring #4245's own table
+//    (issue #4294's own filing). `IGrouping<TKey, T>` (stdlib §5: `public
+//    interface IGrouping<TKey, T>: IEnumerable<T> readonly property Key:
+//    TKey; end IGrouping;`) is a null-declaration builtin — arity-2, no
+//    user `TypeSymbol` (TypeResolution_Names.cpp's arity table, alongside
+//    DictionaryEntry/DrainedEntry) — but architecturally SIMPLER than
+//    DictionaryEntry: it is an INTERFACE, unconditionally, regardless of
+//    `TKey`/`T`, so — like the six-name Span/ExceptionInfo block above —
+//    a flat by-name check decides it with no per-argument recursion.
+//
+//    Quoted in full, the two spec facts this section pins:
+//
+//      §17.11's "defaultable" glossary entry: "Not defaultable: non-
+//      nullable reference types...". Every interface is a non-nullable
+//      reference type (no `?`), so `default(IGrouping<...>)` is ill-formed
+//      exactly as `default(SomeUserInterface)` already was for a REAL
+//      (TypeSymbol-backed) interface — see this file's
+//      `typeHasNoDefaultWalk`'s `k == Class || k == Interface -> return
+//      !isValueBuiltin` arm, which already covers that case; IGrouping
+//      just has no `TypeSymbol` to reach it through.
+//
+//      §14.2: "Interface substitutions never satisfy `new()` — no
+//      constructor exists." The TypeSymbol-backed `d->kind ==
+//      ast::TypeDeclKind::Interface` arm in `Resolver::argSatisfiesNew`
+//      already applies this unconditionally for a real interface;
+//      IGrouping needs the identical, unconditional conclusion.
+//
+//    Fixed in `TypeResolution_Checks.cpp` as TWO NEW, SELF-CONTAINED
+//    branches (not folded into the pre-existing six-name Span/
+//    ExceptionInfo block in either function) — see this fix's commit body
+//    for why: that block's gate is validated to answer a DIFFERENT
+//    question ("is this builtin RECORD's fixed field composition always
+//    non-defaultable"), and folding IGrouping into it would reach the
+//    right answer only by two independently-true facts agreeing, not by
+//    reusing a check for the question it was built to answer (§25).
+//
+// MEASURED on this file's own parent `f3d3a4d` (clean tree, `bezelc`
+// rebuilt directly before this edit, `bezelc --version` confirmed
+// `v0.279-wave3-eabfa69-909-g3986876`, no `-modified` suffix) — **6 of 6
+// REJECT rows below fail without this fix**:
+//
+//   default(IGrouping<string, int>)                        -> compile 0,
+//                                                              run 0
+//   HolderIG<IGrouping<string,int>>.Make() where T:new()   -> compile 0
+//                                                              (only the
+//                                                              #2477/#2491
+//                                                              backstop
+//                                                              notes, no
+//                                                              §14.2
+//                                                              diagnostic),
+//                                                              run 0
+//   record BoxIG(G: IGrouping<string,int>, N: int)
+//     under default(...)                                    -> compile 0
+//   record BoxIG2(G: IGrouping<string,int>, N: int)
+//     under where T:new()                                   -> compile 0
+//   record Wrap<T>(G: IGrouping<T,int>), Wrap<string>
+//     under default(...)                                     -> compile 0
+//   record Wrap<T>(G: IGrouping<T,int>), Wrap<string>
+//     under where U:new()                                    -> compile 0
+//
+// PASS-WITH this fix, same 6 probes rebuilt against the fixed `bezelc`:
+// all 6 reject cleanly with a real-location §17.11 or §14.2 diagnostic
+// (compile exit 1) — verified by direct manual probe before writing these
+// gtest rows, then re-verified mechanically via this file's own filter
+// (see this fix's commit body for the exact FAIL-WITHOUT/PASS-WITH gtest
+// counts and pass rates).
+//
+// UNLIKE `DictionaryEntry<K,V>`, there is no defaultable IGrouping
+// instantiation to use as a per-row ACCEPT-side positive control — an
+// interface is non-defaultable regardless of `TKey`/`T`, so there is no
+// "IGrouping<int,int>" analogue of DictionaryEntry's int/int rows. The
+// accept-side control this section carries instead is the actual
+// production use this fix must not disturb: a REAL `IGrouping` obtained
+// from `IEnumerable<T>.GroupBy` (stdlib §5) used legitimately — reading
+// `.Key` and iterating its elements — which never reaches `default(...)`
+// or `where T: new()` at all and must keep compiling and computing the
+// right value. The existing accept-side controls for the OTHER names this
+// file's `argSatisfiesNew`/`typeHasNoDefaultWalk` branches touch (`Guid`
+// at rows (5)/(6), `Array<int>` at row (7), `DictionaryEntry<int,int>` at
+// the #4245 rows above) are re-swept as part of this fix's own filter run
+// rather than duplicated here, since this fix adds two brand-new,
+// self-contained branches that do not modify their existing conditions.
+
+BEZEL_TEST(default_and_new_reject_builtin_record_string_fields_4235,
+           default_operator_rejects_igrouping_top_level_spec_17_11_stdlib_5) {
+    expectDefaultRejected(
+        "module M4294a; "
+        "class ProgIG4294a "
+        "  public static method Main(): int "
+        "    var x := default(IGrouping<string, int>); "
+        "    _ := x; "
+        "    return 0; "
+        "  end Main; "
+        "end ProgIG4294a;");
+}
+
+BEZEL_TEST(default_and_new_reject_builtin_record_string_fields_4235,
+           where_T_new_rejects_igrouping_top_level_substitution_spec_14_2) {
+    expectWhereNewRejected(
+        "module M4294b; "
+        "class HolderIG4294b<T> where T: new() "
+        "  public static method Make(): owned T => new T(); "
+        "end HolderIG4294b; "
+        "class ProgIG4294b "
+        "  public static method Main(): int "
+        "    var b := HolderIG4294b<IGrouping<string, int>>.Make(); "
+        "    _ := b; "
+        "    return 0; "
+        "  end Main; "
+        "end ProgIG4294b;");
+}
+
+// ── field-wrapped composition: IGrouping as a RECORD FIELD (not the
+//    top-level substitution) under `default(...)` and `where T: new()` —
+//    proves the fix composes through the PRE-EXISTING Record-arm
+//    recursion (`typeHasNoDefaultWalk`'s `Record`-kind arm /
+//    `argSatisfiesNew`'s `Record`-kind arm's `recordStorageMembers` walk),
+//    not only the new top-level dispatch. ─────────────────────────────
+BEZEL_TEST(default_and_new_reject_builtin_record_string_fields_4235,
+           default_operator_rejects_record_with_igrouping_field_spec_17_11) {
+    auto r = runAot(
+        "module M4294c; "
+        "public record BoxIG4294c(G: IGrouping<string, int>, N: int); "
+        "class ProgBoxIG4294c "
+        "  public static method Main(): int "
+        "    var x := default(BoxIG4294c); "
+        "    _ := x; "
+        "    return 0; "
+        "  end Main; "
+        "end ProgBoxIG4294c;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(
+        r, "`default(T)` is a compile error for a record any of whose "
+           "fields is a non-nullable reference type"));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "\xC2\xA7""17.11"));
+}
+
+BEZEL_TEST(default_and_new_reject_builtin_record_string_fields_4235,
+           where_T_new_rejects_record_with_igrouping_field_spec_14_2) {
+    expectWhereNewRejected(
+        "module M4294d; "
+        "public record BoxIG4294d(G: IGrouping<string, int>, N: int); "
+        "class HolderBoxIG4294d<T> where T: new() "
+        "  public static method Make(): owned T => new T(); "
+        "end HolderBoxIG4294d; "
+        "class ProgBoxIG4294d "
+        "  public static method Main(): int "
+        "    var b := HolderBoxIG4294d<BoxIG4294d>.Make(); "
+        "    return b.N; "
+        "  end Main; "
+        "end ProgBoxIG4294d;");
+}
+
+// ── nested-generic composition, the `incoming`-env threading case: a
+//    generic record `Wrap<T>(G: IGrouping<T, int>)` instantiated at
+//    `Wrap<string>` — mirrors the #4245 DictionaryEntry nested-generic
+//    rows, proving `IGrouping`'s new branches are reached identically
+//    whether the outer generic argument is a literal name or a bare,
+//    not-yet-substituted outer type parameter. ─────────────────────────
+BEZEL_TEST(default_and_new_reject_builtin_record_string_fields_4235,
+           default_operator_rejects_nested_generic_igrouping_field_spec_17_11) {
+    auto r = runAot(
+        "module M4294e; "
+        "public record Wrap4294e<T>(G: IGrouping<T, int>); "
+        "class ProgWrap4294e "
+        "  public static method Main(): int "
+        "    var x := default(Wrap4294e<string>); "
+        "    _ := x; "
+        "    return 0; "
+        "  end Main; "
+        "end ProgWrap4294e;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(
+        r, "`default(T)` is a compile error for a record any of whose "
+           "fields is a non-nullable reference type"));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "\xC2\xA7""17.11"));
+}
+
+BEZEL_TEST(default_and_new_reject_builtin_record_string_fields_4235,
+           where_T_new_rejects_nested_generic_igrouping_field_spec_14_2) {
+    expectWhereNewRejected(
+        "module M4294f; "
+        "public record Wrap4294f<T>(G: IGrouping<T, int>); "
+        "class HolderWrap4294f<T> where T: new() "
+        "  public static method Make(): owned T => new T(); "
+        "end HolderWrap4294f; "
+        "class ProgWrap4294f "
+        "  public static method Main(): int "
+        "    var w := HolderWrap4294f<Wrap4294f<string>>.Make(); "
+        "    _ := w; "
+        "    return 0; "
+        "  end Main; "
+        "end ProgWrap4294f;");
+}
+
+// ── ACCEPT-SIDE CONTROL, REQUIRED (LANE_RULES §15): a REAL `IGrouping`
+//    produced by `IEnumerable<T>.GroupBy` (stdlib §5) and used
+//    legitimately — reading `.Key`, iterating its elements — must keep
+//    compiling AND computing the right value. This never reaches
+//    `default(...)` or `where T: new()` (GroupBy always returns a live,
+//    materialized grouping, never a zero-initialized one), so it is
+//    orthogonal to both new branches, but it is the actual production use
+//    those branches must not disturb.
+//
+//    xs = [1,2,3,4] keyed `x mod 2` -> two groups: key 1 (odd) = {1,3},
+//    key 0 (even) = {2,4}. total = (1*100 + 1+3) + (0*100 + 2+4) = 104 +
+//    6 = 110 — the identical shape and expected value as the pre-existing
+//    `kInnerForThenKey` case in
+//    `tests/codegen/igrouping_value_model_755_test.cpp` (issue #755),
+//    confirming this row exercises the same, already-correct GroupBy
+//    value model this fix's sema-only change does not touch. ──────────
+BEZEL_TEST(default_and_new_reject_builtin_record_string_fields_4235,
+           groupby_real_usage_accept_igrouping_spec_5_control) {
+    auto r = runAot(
+        "module M4294g; "
+        "import System.Collections.Linq; "
+        "class ProgAccept4294g "
+        "  public static method Main(): int "
+        "    var xs := new Array<int>(); "
+        "    xs.Add(1); xs.Add(2); xs.Add(3); xs.Add(4); "
+        "    var total := 0; "
+        "    for var g in xs.GroupBy(lambda(x: int) => x mod 2) do "
+        "      total := total + g.Key * 100; "
+        "      for var el in g do total := total + el; end; "
+        "    end; "
+        "    return total; "
+        "  end Main; "
+        "end ProgAccept4294g;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 110);
+}

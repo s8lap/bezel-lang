@@ -8018,6 +8018,43 @@ bool Resolver::argSatisfiesNew(const TypeRef* arg, bool& decided) {
             decided = true;
             return false;
         }
+        // fix #4294 (§14.2, v0.298): `IGrouping<TKey,T>` (stdlib §5: `public
+        // interface IGrouping<TKey, T>: IEnumerable<T>`) is a null-
+        // declaration builtin (TypeResolution_Names.cpp's arity-2 table,
+        // alongside DictionaryEntry/DrainedEntry — no user `TypeSymbol`), so
+        // it never reaches the TypeSymbol-backed `d->kind ==
+        // ast::TypeDeclKind::Interface` arm above (~line 7939), which
+        // already rejects a REAL interface unconditionally: "decided = true;
+        // return false; // interfaces are not constructible (§14.2:
+        // 'Interface substitutions never satisfy `new()`')".
+        //
+        // This is a DELIBERATE new branch, not a fold into the six-name
+        // block immediately above (§25: ask what a check was validated to
+        // answer, not what it happens to agree with). Those six are
+        // RECORDS, which can fail `new()` only via §14.2's value-type/
+        // defaultability route (gated on `typeHasNoDefault` — a record
+        // could in principle satisfy `new()` if every declared field
+        // defaulted). An interface has no such route at all: §14.2
+        // excludes it categorically, the same unconditional rule the real
+        // TypeSymbol-backed arm above applies, independent of
+        // defaultability. Gating IGrouping through `typeHasNoDefault`
+        // instead would reach the same answer only because this commit
+        // ALSO teaches `typeHasNoDefaultWalk`'s null-declaration arm (below)
+        // that IGrouping is non-defaultable — two independently-true facts
+        // that happen to agree, not one fact reused for its validated
+        // question.
+        //
+        // MEASURED (issue #4294, this file's own parent `f3d3a4d`, clean
+        // tree, `bezelc` rebuilt directly): `HolderIG<IGrouping<string,
+        // int>>.Make()` under `where T: new()` compiled with no §14.2
+        // diagnostic (only the pre-existing #2477/#2491 dead-abstract-
+        // template-body backstop notes) and ran (exit 0) — a silent,
+        // degraded-to-zero accept of a non-constructible substitution.
+        if (head == "IGrouping") {
+            decided = true;
+            return false;  // interfaces are not constructible (§14.2), same
+                            // rule as the TypeSymbol-backed Interface arm
+        }
         // fix #4245 (§14.2/§17.11/stdlib §4.8, v0.298): `DictionaryEntry<K,V>`
         // is handled as its OWN branch, not folded into the six-name list
         // above, because — unlike those six, which are unconditionally
@@ -8357,6 +8394,37 @@ bool typeHasNoDefaultWalk(const TypeRef* t, const common::RecordSubstEnv* incomi
                         head == "Span" || head == "ReadOnlySpan" ||
                         head == "ArraySpan" || head == "ReadOnlyArraySpan") {
                         return true;  // non-nullable string/class field(s): no default
+                    }
+                    // fix #4294 (§17.11, v0.298): `IGrouping<TKey,T>` (stdlib
+                    // §5: `public interface IGrouping<TKey, T>: IEnumerable
+                    // <T>`) is, like the six names immediately above,
+                    // unconditionally non-defaultable — but for a DIFFERENT
+                    // reason, so it gets its own check rather than joining
+                    // their list: those six are RECORDS whose declared
+                    // FIELDS happen to include a non-nullable one; IGrouping
+                    // is an INTERFACE, which §17.11 classifies as a non-
+                    // nullable reference type outright, with no field
+                    // composition to inspect at all. This is exactly the
+                    // reasoning the TypeSymbol-backed arm below already
+                    // applies to any REAL interface (`k == Class || k ==
+                    // Interface -> return !t->declaration->isValueBuiltin` —
+                    // true for every interface, since there is no such thing
+                    // as a "value builtin interface"); IGrouping needs the
+                    // identical conclusion because it has no `TypeSymbol` to
+                    // reach that arm through (it is a null-declaration
+                    // builtin, TypeResolution_Names.cpp's arity-2 table,
+                    // alongside DictionaryEntry/DrainedEntry).
+                    //
+                    // MEASURED (issue #4294, this file's own parent
+                    // `f3d3a4d`, clean tree, `bezelc` rebuilt directly):
+                    // `default(IGrouping<string, int>)` compiled clean (exit
+                    // 0) and ran clean (exit 0) — a silent, unrejected
+                    // zero-initialized value where §17.11 ("Not defaultable:
+                    // non-nullable reference types") requires a compile-time
+                    // error.
+                    if (head == "IGrouping") {
+                        return true;  // interface: non-nullable reference
+                                      // type (§17.11), unconditionally
                     }
                     // fix #4245 (§17.11/stdlib §4.8, v0.298): `DictionaryEntry<K,V>`
                     // is a DIFFERENT shape from the six names above — those are
