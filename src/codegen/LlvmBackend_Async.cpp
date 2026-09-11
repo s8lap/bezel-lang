@@ -995,7 +995,66 @@ void Emitter::detectAsyncPatternAKind(const ast::Expr* valueExpr) {
         !asyncResultTy_ || !asyncResultTy_->isPointerTy())
         return;
     const auto* awaitUE = dynamic_cast<const ast::UnaryExpr*>(valueExpr);
-    if (!awaitUE || awaitUE->op != "await" || !awaitUE->operand) return;
+    if (!awaitUE || awaitUE->op != "await" || !awaitUE->operand) {
+        // fix #4285 (§30.5 "Pattern A result slots are of three kinds", kind
+        // 1, v0.298): a non-`await` return in a Pattern-A `Task<T:class>`
+        // body falls through to `emitAsyncPatternAResultDecision`'s kind-1
+        // arm (LlvmBackend_Stmts.cpp), which attaches the per-T disposer to
+        // EVERY such return UNCONDITIONALLY — nothing upstream ever verified
+        // the operand is actually OWNED. §30.5 kind 1 is explicit that it is
+        // not: "A fresh owned value (a `return` of an owned expression): the
+        // task owns the result and its destructor disposes it directly" —
+        // the parenthetical is the operative word, and neither kind 2 nor
+        // kind 3 admits a bare (non-`await`) return at all.
+        //
+        // Per §28.3 *Producers*, a field/property/indexer read is ALWAYS a
+        // borrow, with no exception for an `owned` field read without
+        // `move`: "Field access `obj.f` where `f` is not `owned`: Borrowed
+        // (source: `obj`)" and "Field access `obj.f` where `f` is `owned`:
+        // Borrowed (source: `obj`)" (only "`move obj.f` where `f` is
+        // `owned`" is Owned) — so `return h.item;` mints a Pattern-A task
+        // whose destructor disposes a value it never owned. MEASURED
+        // (`scripts/agent_check.sh --probe --asan`, #4285's repro, 300
+        // iterations): heap-use-after-free in `bz$elemDispose`, called from
+        // `bz_task_free` (bezel_runtime_concurrency.cpp:1156), freed earlier
+        // by the value's real owner's own explicit `.Dispose()`.
+        //
+        // Reject the shapes the Producers table classifies as an
+        // UNCONDITIONAL borrow (MemberAccessExpr / NullCondMemberExpr /
+        // IndexExpr at the TOP LEVEL of the return value — `move` wraps the
+        // operand in a UnaryExpr, so a genuinely-transferred `move obj.f`
+        // does not match here and is left alone). An IdentifierExpr is
+        // deliberately NOT flagged: it may name a genuinely-owned local or
+        // `owned` parameter (a legitimate kind-1 return per §28.3 *Factory
+        // methods and sourceless returns*'s admitted-source list, "an owned
+        // frame local or `owned` parameter"), and proving that case needs
+        // the ownership pass's own per-local flow state — deliberately out
+        // of scope here to avoid a duplicated, drifting classification
+        // (LANE_RULES §6) and a false-reject regression on that shape.
+        // // per §30.5 kind 1, §28.3 Producers, v0.298
+        if (asyncPatternAResultDisposer_ &&
+            (dynamic_cast<const ast::MemberAccessExpr*>(valueExpr) ||
+             dynamic_cast<const ast::NullCondMemberExpr*>(valueExpr) ||
+             dynamic_cast<const ast::IndexExpr*>(valueExpr))) {
+            ctx_.diagnostics().report(
+                Severity::Error, valueExpr->span.begin,
+                "an async method returning a class-typed `Task<T>` (§30.5 "
+                "Pattern A) may only `return` an OWNED expression on a "
+                "non-`await` return path — §30.5 kind 1: \"a `return` of an "
+                "owned expression: the task owns the result and its "
+                "destructor disposes it directly.\" A field, property, or "
+                "indexer read is a BORROW with no admitted producer-side "
+                "chain (§28.3 *Producers*: a plain field/property/indexer "
+                "read is Borrowed even when the field itself is `owned` — "
+                "only `move obj.f` transfers it), so the task's teardown "
+                "would dispose a value it never owned, a use-after-free once "
+                "the real owner disposes it independently. If the value is "
+                "genuinely owned by this frame, transfer it explicitly "
+                "(`move`); otherwise return `await` an admitted Pattern A "
+                "source instead");
+        }
+        return;
+    }
     // §30.5 kind 2 (chained) — an anonymous producer, an OWNED LOCAL source,
     // or an OWNED PARAMETER source (#3126) transfers the source task into
     // the outer task's chained slot.
