@@ -11610,13 +11610,29 @@ void ExprTC::checkCallArity(const ast::CallExpr& ce, MethodSymbol* ms) {
     // class's own type parameters (extensions don't see them, §26.4).
     if (md && ms->extensionDecl) {
         const ast::Expr* recvTarget = nullptr;
+        // fix #4233 (§26.4/§26.5, v0.298): when this call's callee
+        // MemberAccessExpr carries a recorded free-var binding (set by
+        // `lookupExtensionMember`/`resolveMemberAccess` via
+        // `ctx_.setExprExtBinding` — non-null only when the extension has
+        // free type variables AND the matched ancestor bound them), pass it
+        // through so `checkArgsAgainstParams` can substitute the extension's
+        // free var into each parameter's declared type before the §5.1
+        // assignability check. Without this, `Test(x: W)` checked the
+        // argument against the unresolved `W` itself, which either
+        // false-rejected or (via checkAssignable's permissive
+        // generic-parameter fallback) silently accepted ANY primitive
+        // argument regardless of W's actual binding.
+        const std::vector<std::pair<std::string, TypeRef*>>* extBinding =
+            nullptr;
         if (auto* ma =
-                dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get()))
+                dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get())) {
             recvTarget = ma->target.get();
+            extBinding = ctx_.exprExtBinding(*ma);
+        }
         checkArgsAgainstParams(
             md->params, ce.args, ce.span.begin,
             std::string("call to `") + std::string(ms->name) + "`",
-            recvTarget, /*classParent=*/nullptr, md);
+            recvTarget, /*classParent=*/nullptr, md, extBinding);
         return;
     }
     if (!md || !ms->parent) return;
@@ -12873,12 +12889,32 @@ void ExprTC::checkArgsAgainstParams(
     const std::vector<ast::CallArgument>& args, SourceLocation loc,
     const std::string& calleeDesc, const ast::Expr* classTarget,
     TypeSymbol* classParent,
-    const ast::MethodDecl* calleeMethodDecl) {
+    const ast::MethodDecl* calleeMethodDecl,
+    const std::vector<std::pair<std::string, TypeRef*>>* extBinding) {
     // per §22.5: bind arguments to parameters. The binding emits its own
     // arity / named-arg diagnostics; on failure there is no consistent
     // per-parameter mapping to type-check, so stop here.
     BindResult b = bindArgsToParams(params, args, loc, calleeDesc, /*emit=*/true);
     if (!b.ok) return;
+    // fix #4233 (§26.4/§26.5, v0.298): flatten the extension's free-var
+    // binding (T -> concrete TypeRef) into the map shape
+    // `substituteReturnType` takes — the same substitution
+    // `ExprTC::typeCall` already runs on the call's RETURN type
+    // (ExprTypecheck_Calls.cpp, `!ms->parent && ms->extensionDecl` gate) for
+    // the identical `exprExtBinding`. Applying it here too closes the
+    // parameter-type half of the same gap: `checkAssignable` has no other
+    // way to know `W` is bound to `int` for this call, so an unsubstituted
+    // `W` either false-rejected a correct argument or (via the "generic-
+    // parameter case: skip" fallback a few hundred lines into
+    // `checkAssignable`) silently accepted a WRONGLY-typed one straight
+    // through to a codegen IR-verifier crash — MEASURED for the latter on
+    // the already-resolving builtin-extension path (`extension
+    // IEnumerable<T> method Echo(x: T): T` called as `xs.Echo("wrong")` on
+    // an `Array<int>` compiled clean pre-fix and crashed codegen).
+    std::unordered_map<std::string_view, TypeRef*> extSubst;
+    if (extBinding)
+        for (const auto& [nm, ty] : *extBinding)
+            if (ty) extSubst[nm] = ty;
     // fix #4199 (§14.5 phase 1, NEEDS-FIX round 1): the CALLEE method's own
     // still-being-inferred generic type parameters — the ONLY names this
     // call's per-argument `checkAssignable` below is entitled to treat as a
@@ -12973,6 +13009,13 @@ void ExprTC::checkArgsAgainstParams(
             if (rparamTy && classTarget && classParent)
                 rparamTy = substituteMemberType(rparamTy, classTarget,
                                                 classParent);
+            // fix #4233 (§26.4/§26.5, v0.298): substitute the extension's
+            // free var into the referent type BEFORE the type-param-mention
+            // skip below, so a fully-bound referent (e.g. `W`->`int`) runs
+            // the ordinary §22.3 exact-match check instead of being treated
+            // as still-unresolved and skipped.
+            if (rparamTy && !extSubst.empty())
+                rparamTy = substituteReturnType(rparamTy, extSubst);
             std::unordered_set<std::string_view> tpNames;
             if (calleeMethodDecl)
                 for (const auto& gp : calleeMethodDecl->genericParams)
@@ -13013,6 +13056,12 @@ void ExprTC::checkArgsAgainstParams(
         // the valid function-type identity case.
         if (paramTy && classTarget && classParent)
             paramTy = substituteMemberType(paramTy, classTarget, classParent);
+        // fix #4233 (§26.4/§26.5, v0.298): substitute the extension's own
+        // free type variable (e.g. `W`->`int`) into the parameter type
+        // before the assignability check below — see this function's
+        // header comment (ExprTypecheck_impl.hpp) for why.
+        if (paramTy && !extSubst.empty())
+            paramTy = substituteReturnType(paramTy, extSubst);
         // per §15.4 (#1174): a collection literal passed directly to a
         // parameter of interface type (IEnumerable<T>/IList<T>/ICollection<T>/
         // IReadOnly*) is not admissible — the literal has no concrete backing

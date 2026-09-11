@@ -7885,34 +7885,37 @@ static bool typeNamesFreeVar(
     return false;
 }
 
-// §26.5 (#773): true when an extension method's parameter types, return
-// type, or own generic constraints reference a free type variable of the
-// extension — the case whose codegen substitution is deferred for
-// user-declared extension targets (see lookupExtensionMember). For
-// builtin-target extensions (§26.5 #714), the binding-and-codegen path is
-// now implemented, so this check is not applied.
+// §26.5 (#3672; narrowed by fix #4233, §26.4/§26.5, v0.298): true when an
+// extension method's OWN generic constraints (NOT its parameter or return
+// types — see #4233 below) reference a free type variable of the extension.
 //
-// fix #3672 (§26.4/§26.5, v0.286): every Type-shape question here routes
-// through `typeNamesFreeVar` — the single both-sources `ast::Type` walker —
-// rather than re-testing shapes locally; this function only enumerates
-// WHERE in an `ast::MethodDecl` a `Type` can occur. `genericConstraints` is
-// the addition: a method's own type-bound constraint (`where U: T`, §14.2
-// "Type-parameter bounds") can name the extension's free var as the bound
-// even when neither the return type nor any parameter does (e.g. `method
-// Foo<U>(): int where U: T`). Before this fix such a method was NOT
-// deferred — `Foo<Z>()` compiled and ran on a `Bag<W>` receiver with no
-// diagnostic even though `Z` does not satisfy `T`'s receiver-bound
-// instantiation (`W`), because the constraint-satisfaction check has no
-// concrete type to check `Z` against when the bound is an unresolved free
-// var. That is exactly the #773 deferred case, silently NOT deferred: this
-// closes a silent-accept gap, not a LOUD->QUIET regression (see the
-// `ExtSignatureFreeVar3672` sema tests for the FAIL-WITHOUT/PASS-WITH pin).
-static bool extSignatureUsesFreeVar(
+// A method-level type-bound constraint (`where U: T`, §14.2 "Type-parameter
+// bounds") can name the extension's free var as the bound (`method Foo<U>():
+// int where U: T`). Admitting such a candidate needs
+// `checkMethodGenericConstraints` (the call-site §14.2 enforcement,
+// ExprTypecheck_Calls.cpp) to substitute the extension's concrete binding
+// into the bound before checking the call's actual type argument against
+// it — that substitution does not exist, so admitting the candidate would
+// silently skip the constraint check entirely: `b.Foo<Z>()` on a `Bag<W>`
+// receiver, where `Z` does not satisfy `T`'s receiver-bound instantiation
+// (`W`), would compile and run with no diagnostic (#3672's own false-accept;
+// `ExtSignatureFreeVar3672` sema tests pin this deferral).
+//
+// fix #4233: this predicate USED TO also cover a param/return-type mention
+// of the free var (e.g. `Test(x: W): int`) and defer those too, for
+// user-declared extension targets only (`lookupExtensionMember`'s
+// `!targetIsBuiltin` gate) — #773's original scope. That half was stale:
+// #714 already made the free-var BINDING (`exprExtBinding`) drive return-type
+// substitution (`resolveExtensionMember`) and codegen's `genericSubst_`
+// unconditionally, regardless of whether the target is builtin, and #4233
+// completes the picture by substituting the SAME binding into parameter
+// types before the per-argument assignability check
+// (`checkArgsAgainstParams`, ExprTypecheck_Calls.cpp). So a param/return
+// mention is now fully resolved and checked, not deferred; only the
+// genuinely-still-unimplemented own-constraint case above remains.
+static bool extMethodOwnConstraintUsesFreeVar(
     const ast::MethodDecl* md,
     const std::unordered_set<std::string_view>& freeVars) {
-    if (typeNamesFreeVar(md->returnType.get(), freeVars)) return true;
-    for (const auto& p : md->params)
-        if (typeNamesFreeVar(p.type.get(), freeVars)) return true;
     for (const auto& gc : md->genericConstraints)
         for (const auto& item : gc.items)
             if (typeNamesFreeVar(item.typeArg.get(), freeVars)) return true;
@@ -8315,12 +8318,18 @@ Symbol* ExprTC::lookupExtensionMember(
             extWhereClauseProvablyViolated(*decl, binding))
             continue;
         // Determine whether the extension target is a builtin (null-decl) type.
-        // For builtin-target extensions (e.g. `extension IEnumerable<T>`), the
-        // full binding-and-codegen path is implemented (#714). For user-declared
-        // extension targets (e.g. `extension Bag<T> where T: class`), methods
-        // whose SIGNATURES use the free type variable are still deferred (#773):
-        // skip them so the lookup falls through to a clean diagnostic rather than
-        // generating type-mismatched IR.
+        // fix #4233 (§26.4/§26.5, v0.298): a param/return mention of the
+        // extension's free var used to be deferred here too, for
+        // user-declared targets only — #773's original scope, stale since
+        // #714 made the free-var BINDING (not target-builtin-ness) drive
+        // substitution unconditionally (see `extMethodOwnConstraintUsesFreeVar`'s
+        // comment for the measured evidence: the builtin path already both
+        // resolves AND, pre-fix, silently mis-accepted a wrongly-typed
+        // argument into an IR-verifier crash — `checkArgsAgainstParams` below
+        // now substitutes the binding into parameter types for BOTH target
+        // kinds, closing that gap generically). `targetIsBuiltin` is kept only
+        // to scope the one deferral that remains genuine (§3672's own-generic-
+        // constraint case), matching that fix's original, unwidened scope.
         bool targetIsBuiltin =
             target && target->kind == TypeRef::Kind::Named && !target->declaration;
         for (Symbol* m : ext->members) {
@@ -8336,14 +8345,16 @@ Symbol* ExprTC::lookupExtensionMember(
                     continue;
             }
             if (!freeVars.empty() && !targetIsBuiltin) {
-                // User-declared generic extension (#773): skip methods whose
-                // signatures reference a free type variable — that case is
-                // deferred. Methods that do NOT use the free var in their
-                // signatures (e.g. `IsEmpty(): bool` on a `Bag<T>`) are fine.
+                // fix #3672 (§26.4/§26.5, v0.286, UNCHANGED by #4233): a
+                // method whose OWN generic constraint (not its param/return
+                // types — those are handled generically now, see #4233's
+                // comment above) references the extension's free var as a
+                // bound is still deferred.
                 if (auto* ms = dynamic_cast<MethodSymbol*>(m)) {
                     if (auto* md =
                             dynamic_cast<const ast::MethodDecl*>(ms->decl)) {
-                        if (extSignatureUsesFreeVar(md, freeVars)) continue;
+                        if (extMethodOwnConstraintUsesFreeVar(md, freeVars))
+                            continue;
                     }
                 }
             }

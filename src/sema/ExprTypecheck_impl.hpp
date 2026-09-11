@@ -2572,13 +2572,28 @@ private:
     // total] (optional params lower the minimum), then per-argument
     // assignability. Callers must have already ruled out named args
     // and overload ambiguity.
+    //
+    // fix #4233 (§26.4/§26.5, v0.298): `extBinding` is the extension's own
+    // free-type-variable → concrete-TypeRef binding (the same one
+    // `lookupExtensionMember` computes and `ctx_.setExprExtBinding` records
+    // on the call's MemberAccessExpr, keyed by `ctx_.exprExtBinding`) — non-
+    // null only for a call to an extension method whose signature mentions
+    // the extension's free var. When present, each parameter's declared type
+    // is substituted through it (mirroring the return-type substitution
+    // `ExprTC::typeCall` already runs for the same call) before the
+    // assignability check, so `Test(x: W)` on a `Box<int>` receiver checks
+    // the argument against `int`, not the unresolved `W` — closing both the
+    // #4233 arity-diagnostic-for-a-correct-call defect AND a wrongly-typed
+    // argument silently reaching codegen as a type-mismatched IR crash.
     void checkArgsAgainstParams(
         const std::vector<ast::Param>& params,
         const std::vector<ast::CallArgument>& args, SourceLocation loc,
         const std::string& calleeDesc,
         const ast::Expr* classTarget = nullptr,
         TypeSymbol* classParent = nullptr,
-        const ast::MethodDecl* calleeMethodDecl = nullptr);
+        const ast::MethodDecl* calleeMethodDecl = nullptr,
+        const std::vector<std::pair<std::string, TypeRef*>>* extBinding =
+            nullptr);
 
     // Slice T7: check `new T(args)` against T's sole constructor (if
     // any). Zero declared constructors → the implicit default ctor
