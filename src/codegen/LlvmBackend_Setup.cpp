@@ -27714,12 +27714,51 @@ void Emitter::collectRecordCallResultReleaseEligible(
 //     of what any individual constructor does).
 //   * every argument is POSITIONAL (no name/ref/out/owned modifier, no
 //     discard) — named/reordered args are conservatively out of scope.
-//   * a NESTED record- or choice-typed positional field disqualifies the
-//     WHOLE type (this check reasons about DIRECT string fields only; a
-//     record with any nested value-type component falls back to the
-//     pre-existing safe-leak behaviour for every call to it, matching
-//     #2425's own choice of a separate walker for the nested-depth case
-//     rather than proving a nested construction is ALSO alias-free here).
+//   * a NESTED CHOICE-typed positional field disqualifies the WHOLE type
+//     (a choice's active-case payload is not statically known here, so its
+//     alias-freedom cannot be proven at this call site — falls back to the
+//     pre-existing safe-leak behaviour for every call to it).
+//   * a NESTED RECORD-typed positional field is admitted when — and only
+//     when — its OWN corresponding argument is ITSELF a provably fresh,
+//     alias-free construction of exactly that nested record type: this
+//     function calls itself on the argument expression against the
+//     field's record declaration (fix #4237, §9.7 / §28.9). Before this,
+//     ANY nested-record field unconditionally disqualified the whole outer
+//     construction, so a string owned only through a nested record
+//     (`new Outer(new Inner("s"))`) fell to the safe-direction leak at
+//     every depth >= 2 even though the release WALK
+//     (recordHasStringFields / emitRecordStringFieldReleases_impl,
+//     LlvmBackend_impl.hpp) already finds and releases such a field
+//     correctly — the gap was purely in this eligibility PROOF, not in
+//     the release emission. This recursion runs over the literal, already-
+//     parsed ARGUMENT EXPRESSION tree (`arg.value` is a genuine strict
+//     subexpression of `expr`, owned by a distinct unique_ptr — never an
+//     alias back to `expr` or an ancestor), so each call strictly
+//     decreases AST depth and the recursion terminates for any finite
+//     source program. This is NOT a walk over the record TYPE declaration
+//     graph (the kind that needs a visited-set guard against mutual
+//     nullable-field recursion, e.g. recordHasStringFields's own
+//     RecordSubstGuard/path handling) — no back-edge is possible because
+//     there is no graph here, only a tree already fixed by parsing.
+//     Contrast with #4166's sibling recursive walker
+//     (Resolver::argSatisfiesNew / recordFieldTypeHasNoDefaultWalk,
+//     src/sema/TypeResolution_Checks.cpp): that one needed a PATH/visited-
+//     set cycle guard for two independent reasons neither of which applies
+//     here. First, it is SEMA-SIDE, walking the record TYPE-DECLARATION
+//     graph (a record's own field-type edges, which a mutually- or self-
+//     referential generic instantiation can turn into an actual cycle);
+//     this function is CODEGEN-ONLY, walking the literal, already-parsed
+//     ARGUMENT-EXPRESSION tree of one construction site — there is no
+//     shared graph to re-enter, only a tree fixed by parsing, so no two
+//     recursive calls can ever land on the same node. Second, sema
+//     CONTINUES past its own diagnostics within a single pass — a rejected
+//     construct does not stop the walk that found it, so an unguarded
+//     sema-side recursion over a genuinely cyclic graph can still not
+//     terminate even though the program it is checking will ultimately be
+//     rejected; this function runs during codegen, which — per Driver.cpp's
+//     `!diagnostics.hasErrors()` gate — never executes at all once sema has
+//     reported an error, so even a hypothetically cyclic input can never
+//     reach this walk to begin with.
 //   * each STRING-typed field's corresponding argument is a string literal
 //     (an immortal sentinel) or a +1-producer expression
 //     (isPlusOneStringProducer) — never a borrow (a field/param/identifier
@@ -27797,9 +27836,18 @@ bool Emitter::isFreshRecordConstructionOfExactType(
         }
         if (!fty->nullable && fty->kind == sema::TypeRef::Kind::Named &&
             fty->declaration &&
-            (fty->declaration->kind == ast::TypeDeclKind::Record ||
-             fty->declaration->kind == ast::TypeDeclKind::Choice)) {
-            return false;  // nested value-type component — out of scope here
+            fty->declaration->kind == ast::TypeDeclKind::Choice) {
+            return false;  // nested choice component — out of scope here
+        }
+        if (!fty->nullable && fty->kind == sema::TypeRef::Kind::Named &&
+            fty->declaration &&
+            fty->declaration->kind == ast::TypeDeclKind::Record) {
+            // fix #4237 (§9.7 / §28.9): recurse — see the function-header
+            // comment above for the termination argument (AST-tree descent,
+            // not a record type-graph walk, so no visited-set is needed).
+            if (!isFreshRecordConstructionOfExactType(arg.value.get(),
+                                                       fty->declaration))
+                return false;  // nested arg not itself a provably-fresh ctor
         }
         if (!fty->nullable && fty->kind == sema::TypeRef::Kind::Primitive &&
             fty->primitive == sema::PrimitiveType::String) {
