@@ -9006,6 +9006,36 @@ void MethodOwnership::recordBorrowUseExpr(const ast::Expr& e,
         if (lam->exprBody) recordBorrowUseExpr(*lam->exprBody, attributeOffset);
         for (const auto& st : lam->stmts)
             if (st) {
+                // issue #4225: a lambda-body statement gets none of
+                // collectBorrowUsesStmt's per-statement dispatch (identifiers
+                // are gathered flatly below instead), so a TOP-LEVEL
+                // declaration or bare-identifier rebind inside a lambda never
+                // opened/closed an aliasBorrowSourceWindows_ window the way
+                // the identical statement would at method scope — the
+                // false-reject this issue reports reproduces identically
+                // inside a lambda body via the pre-existing `move`-RHS
+                // consuming path. Mirror the two window-affecting shapes
+                // collectBorrowUsesStmt already handles, restricted (like its
+                // own depth-0 restriction) to a statement that is a DIRECT,
+                // unconditional statement of the lambda body — a rebind
+                // nested inside an if/while INSIDE the lambda keeps the old,
+                // sound, over-rejecting default. // per §28.3, #4225
+                if (auto* ld = dynamic_cast<const ast::LocalDecl*>(st.get())) {
+                    collectAliasBorrowSource(*ld);
+                } else if (auto* lcd = dynamic_cast<const ast::LocalConstDecl*>(
+                               st.get())) {
+                    collectAliasBorrowSource(*lcd);
+                } else if (auto* as =
+                               dynamic_cast<const ast::AssignmentStmt*>(
+                                   st.get())) {
+                    auto* tid = dynamic_cast<const ast::IdentifierExpr*>(
+                        as->target.get());
+                    if (tid && as->op == ":=" && as->value) {
+                        if (sema::Symbol* lsym = ctx_.exprSymbol(*tid))
+                            recollectAliasBorrowSourceOnReassign(
+                                lsym, *as->value, tid->span.begin.offset);
+                    }
+                }
                 std::vector<const ast::IdentifierExpr*> ids;
                 collectIdentifiersInStmt(*st, ids);
                 for (const ast::IdentifierExpr* id : ids) {
@@ -9047,9 +9077,18 @@ void MethodOwnership::collectBorrowUsesStmt(const ast::Stmt& s) {
                 // not execute, so the old source stays live on the not-taken
                 // paths (windows left open — sound over-rejection).
                 if (borrowUseCondDepth_ == 0 && as->value)
-                    if (sema::Symbol* lsym = ctx_.exprSymbol(*tid))
+                    if (sema::Symbol* lsym = ctx_.exprSymbol(*tid)) {
                         recollectRecordBorrowSourceOnReassign(
                             lsym, *as->value, tid->span.begin.offset);
+                        // issue #4225: sibling re-collection for a PLAIN
+                        // identifier alias holder — see
+                        // aliasBorrowSourceWindows_'s comment. Same depth-0
+                        // gate: a conditional rebind might not execute, so
+                        // the old window must stay open on the not-taken
+                        // path.
+                        recollectAliasBorrowSourceOnReassign(
+                            lsym, *as->value, tid->span.begin.offset);
+                    }
             } else {
                 recordBorrowUseExpr(*as->target);
             }
@@ -9071,6 +9110,10 @@ void MethodOwnership::collectBorrowUsesStmt(const ast::Stmt& s) {
         // plain args, so consuming a contributing source while the result is live
         // must freeze exactly as a live span over that source does.
         collectBareTypeParamCallBorrowSource(*ld);
+        // issue #4225: DISJOINT sibling — a PLAIN identifier alias of a
+        // class/interface-typed source (`var y := x;`) opens its own
+        // rebind-bounded window (aliasBorrowSourceWindows_).
+        collectAliasBorrowSource(*ld);
         return;
     }
     // fix #3591 (§28.3 v0.180 #1741, v0.286): §21.1's runtime `const` is a
@@ -9099,6 +9142,7 @@ void MethodOwnership::collectBorrowUsesStmt(const ast::Stmt& s) {
         if (lcd->value) recordBorrowUseExpr(*lcd->value);
         collectRecordBorrowSource(*lcd);
         collectBareTypeParamCallBorrowSource(*lcd);
+        collectAliasBorrowSource(*lcd);  // issue #4225
         return;
     }
     if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(&s)) {
@@ -9380,6 +9424,118 @@ void MethodOwnership::recollectRecordBorrowSourceOnReassign(
     }
 }
 
+void MethodOwnership::collectAliasBorrowSource(const ast::Node& ld) {
+    // issue #4225 (§28.3/§28.7/§30.14 v0.180): see aliasBorrowSourceWindows_'s
+    // comment.
+    //
+    // ⚠ This runs from the collectBorrowUses PRE-PASS (Ownership.cpp:381),
+    // called ONCE before the forward dataflow walk even starts — states_ has
+    // NO entries at all yet. borrowSourceForExpr is therefore NOT usable
+    // here: its Shape-1 owned-re-borrow arm gates on isOwnedTrackedLocal /
+    // isEscapeBoundLocal, both direct reads of states_, so it would return
+    // null for every ordinary case at this phase and the map would never
+    // populate. (Measured: an earlier draft of this fix called
+    // borrowSourceForExpr here and left the false-reject completely
+    // unfixed — same message, same offset, before and after.)
+    //
+    // No such authority is needed anyway. This map is consulted ONLY from
+    // checkConsumeFreeze's states_-based holder loop, which has ALREADY used
+    // the REAL, live states_[holder].source to confirm `holder` currently
+    // aliases `consumed` at the consume site — this map's only job is to say
+    // WHEN that already-confirmed alias later retires. A plain structural
+    // match (the initializer is a bare identifier naming some symbol S) is
+    // sufficient: recording a window for a harmless non-borrow S (e.g. a
+    // value-typed copy) is inert, because states_[holder].source was never
+    // set for it by the real walk in the first place, so loop 1's own first
+    // gate already skips that holder before this map is ever consulted.
+    // // per §28.3, #4225
+    const ast::Expr* init = nullptr;
+    if (auto* d = dynamic_cast<const ast::LocalDecl*>(&ld)) {
+        if (d->isUsing || d->initializerHasOwnedMarker) return;
+        init = d->initializer.get();
+    } else if (auto* c = dynamic_cast<const ast::LocalConstDecl*>(&ld)) {
+        init = c->value.get();
+    }
+    if (!init) return;
+    auto* id = dynamic_cast<const ast::IdentifierExpr*>(init);
+    if (!id) return;
+    sema::Symbol* rawSrc = ctx_.exprSymbol(*id);
+    if (!rawSrc) return;
+    // issue #4225: resolve THROUGH an intermediate alias holder to its
+    // ultimate root (`var w := x; var y := w;` records `y`'s source as `x`,
+    // not `w`) — see resolveAliasChainRoot's comment for why this is
+    // required for soundness, not just precision.
+    const sema::Symbol* src = resolveAliasChainRoot(rawSrc);
+    sema::LocalSymbol* lsym = findLocalSymbol(ld);
+    if (!lsym || src == lsym) return;
+    aliasBorrowSourceWindows_[lsym].push_back(
+        {src, init->span.begin.offset, UINT32_MAX});
+}
+
+void MethodOwnership::recollectAliasBorrowSourceOnReassign(
+        const sema::Symbol* lsym, const ast::Expr& producer,
+        std::uint32_t reassignOffset) {
+    // issue #4225: same pre-pass-phase restriction as
+    // collectAliasBorrowSource (states_ is not live yet — see its comment) —
+    // close every still-open window at the reassignment offset (whatever the
+    // OLD alias was, it no longer holds from here on), then open a new one
+    // iff the new RHS is itself a bare identifier naming a different symbol.
+    // A rebind to anything else (a fresh `new`, a call, a ternary, a member
+    // access) closes without reopening — sound, since the real forward walk
+    // resolves those exact shapes to no source too (borrowSourceForExpr's
+    // gates all fail), so states_[lsym].source is cleared there regardless of
+    // whether this map tracks it.
+    auto it = aliasBorrowSourceWindows_.find(lsym);
+    if (it != aliasBorrowSourceWindows_.end())
+        for (RecordBorrowSource& e : it->second)
+            if (e.until == UINT32_MAX) e.until = reassignOffset;
+    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&producer)) {
+        if (sema::Symbol* rawSrc = ctx_.exprSymbol(*id)) {
+            // issue #4225: resolve through an intermediate alias holder, same
+            // as collectAliasBorrowSource — `y := w;` where `w` itself
+            // aliases `x` must record `y`'s new window against `x`, not `w`.
+            const sema::Symbol* src = resolveAliasChainRoot(rawSrc);
+            if (src && src != lsym)
+                aliasBorrowSourceWindows_[lsym].push_back(
+                    {src, reassignOffset, UINT32_MAX});
+        }
+    }
+}
+
+const sema::Symbol* MethodOwnership::resolveAliasChainRoot(
+        const sema::Symbol* sym) const {
+    std::unordered_set<const sema::Symbol*> seen;
+    while (sym) {
+        if (!seen.insert(sym).second) return sym;  // cycle guard
+        auto it = aliasBorrowSourceWindows_.find(sym);
+        if (it == aliasBorrowSourceWindows_.end()) return sym;
+        const sema::Symbol* next = nullptr;
+        for (const RecordBorrowSource& e : it->second) {
+            if (e.until == UINT32_MAX) { next = e.source; break; }
+        }
+        if (!next) return sym;  // no currently-open tracked alias
+        sym = next;
+    }
+    return sym;
+}
+
+std::optional<std::pair<std::uint32_t, std::uint32_t>>
+MethodOwnership::aliasBorrowConsumedWindow(const sema::Symbol* holder,
+                                           const sema::Symbol* consumed) const {
+    auto it = aliasBorrowSourceWindows_.find(holder);
+    if (it == aliasBorrowSourceWindows_.end()) return std::nullopt;
+    std::optional<std::pair<std::uint32_t, std::uint32_t>> best;
+    for (const RecordBorrowSource& e : it->second) {
+        if (e.source != consumed) continue;
+        if (!best) best = {e.from, e.until};
+        else {
+            best->first = std::min(best->first, e.from);
+            best->second = std::max(best->second, e.until);
+        }
+    }
+    return best;
+}
+
 bool MethodOwnership::recordBorrowAliasesConsumed(
     const sema::Symbol* recLocal, const sema::Symbol* consumed) const {
     // DFS over recordBorrowLocalSource_ following each record local's carried
@@ -9474,8 +9630,25 @@ void MethodOwnership::checkConsumeFreeze(std::string_view consumedName,
         // A `using var` borrow-pin keeps the borrow live to its scope end
         // (§28.10); otherwise the borrow is live iff it has a reachable later
         // use (directly, or through the closure value the holder names).
-        bool live = st.implicitDischarge ||
-                    borrowHolderUsedAfter(holder, consumeLoc.offset);
+        //
+        // issue #4225: bound that "later use" query to the window over which
+        // `holder` actually tracked `consumed` as its source
+        // (aliasBorrowSourceWindows_), when one was recorded — a use of
+        // `holder` after it was REBOUND away from `consumed` (`y := new
+        // Res(1);`) no longer keeps the OLD alias live, exactly as
+        // recordBorrowConsumedWindow already does for the record/span case
+        // below. Falls back to the unbounded whole-body query when no window
+        // was tracked (e.g. a parameter, or an alias shape
+        // collectAliasBorrowSource does not model) — the pre-#4225 sound
+        // over-rejection default.
+        bool live = st.implicitDischarge;
+        if (!live) {
+            if (auto win = aliasBorrowConsumedWindow(holder, consumed))
+                live = borrowHolderUsedAfterInWindow(holder, consumeLoc.offset,
+                                                     win->first, win->second);
+            else
+                live = borrowHolderUsedAfter(holder, consumeLoc.offset);
+        }
         if (!live) continue;
         report(Severity::Error, consumeLoc,
                std::string("cannot consume `") + std::string(consumedName) +

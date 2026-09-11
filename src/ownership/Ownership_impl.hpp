@@ -868,6 +868,39 @@ private:
     };
     std::unordered_map<const sema::Symbol*, std::vector<RecordBorrowSource>>
         recordBorrowLocalSource_;
+    // issue #4225 (§28.3/§28.7/§30.14 v0.180): the sibling window table for a
+    // PLAIN identifier alias holder (`var y := x;` / `y := x;` where the
+    // source is a class/interface-typed local, tracked via
+    // `states_[holder].source`, NOT a borrow-bearing record/span/choice
+    // value). `recordBorrowLocalSource_` is documented above as being for
+    // locals that carry "NO LocalOwnership.source" — a plain alias holder
+    // does carry one, and checkConsumeFreeze's states_-based holder loop
+    // already reads it to decide which holder currently aliases `consumed`.
+    // What that loop lacked was a WINDOW bound on "later use": once `y` is
+    // rebound away from `x` (`y := new Res(1);`), any further touch of `y`
+    // was still counted as a live use of the OLD alias, because
+    // `borrowUseOffsets_` is a whole-body pre-scan with no notion of when an
+    // alias retires. This map closes that gap with the exact window
+    // discipline `recordBorrowLocalSource_` already uses (#1741): each entry
+    // is the offset range over which `holder`'s tracked source equals a given
+    // symbol, closed at a later unconditional rebind and reopened (or left
+    // closed) whenever the rebind's RHS is itself a bare identifier naming a
+    // different symbol — a purely STRUCTURAL match, not `borrowSourceForExpr`
+    // (which cannot run in this pre-pass at all; see
+    // collectAliasBorrowSource's comment for why). It does not need to be
+    // authoritative about "is this really a borrow": it is consulted only
+    // for a holder checkConsumeFreeze's states_-based loop has ALREADY
+    // confirmed, from the live `states_[holder].source`, aliases `consumed`
+    // right now — this map only answers WHEN that confirmed alias retires.
+    // Kept SEPARATE from
+    // `recordBorrowLocalSource_` rather than merged into it: that map's
+    // second checkConsumeFreeze loop has no "holder still alive" guard
+    // (unneeded there, since record/span locals never reach Disposed/
+    // MovedFrom) — merging would need that guard added defensively, whereas
+    // here the existing states_-based loop already performs it for the
+    // holder before ever consulting this map. // per §28.3, #1741
+    std::unordered_map<const sema::Symbol*, std::vector<RecordBorrowSource>>
+        aliasBorrowSourceWindows_;
     // §28.3 (#1741): conditional-nesting depth of the freeze pre-pass walk. The
     // method body and unconditional `do…end` blocks are depth 0; each if / elif
     // / else / while / for / try-catch-finally body adds one. A reassignment's
@@ -2612,6 +2645,65 @@ private:
     void recollectRecordBorrowSourceOnReassign(const sema::Symbol* lsym,
                                                const ast::Expr& producer,
                                                std::uint32_t reassignOffset);
+    // issue #4225: follow a chain of PLAIN alias holders already recorded in
+    // aliasBorrowSourceWindows_ EARLIER in this same forward pre-scan pass
+    // (only statements already visited have entries, since the scan is a
+    // straightforward single forward pass) to its ultimate root — the
+    // state-independent equivalent of borrowSourceForExpr's own "multi-hop
+    // alias chain" resolution (Shape 1, Ownership_Checks.cpp), which cannot
+    // run here (states_ is not live yet). Needed for soundness, not just
+    // precision: without it, `var w := x; y := w;` would record `y`'s window
+    // against `w` instead of `x`, so `aliasBorrowConsumedWindow(y, x)` would
+    // find nothing and checkConsumeFreeze's holder loop would silently
+    // MISS-reject a later consume of `x` while `y` (via `w`) still has a
+    // reachable use — the false ACCEPT this issue's own steering warned
+    // against. Returns `sym` itself when it carries no currently-open
+    // tracked alias (the base case: an unaliased identifier, or a plain
+    // owned root). `seen` guards a cycle (structurally not expected, cheap
+    // to defend). // per §28.3, #4225
+    const sema::Symbol* resolveAliasChainRoot(const sema::Symbol* sym) const;
+    // issue #4225 (§28.3/§28.7/§30.14 v0.180): sibling of
+    // collectRecordBorrowSource for a PLAIN identifier alias of a
+    // class/interface-typed source (`var y := x;`) — see
+    // aliasBorrowSourceWindows_'s comment for why this is a separate map
+    // rather than a widening of collectRecordBorrowSource. Records a
+    // STRUCTURAL match only (the initializer is a bare identifier naming
+    // symbol S) — NOT borrowSourceForExpr, which reads live states_ and
+    // cannot run in this pre-pass at all (states_ has no entries yet when
+    // collectBorrowUses runs; see this function's own definition comment for
+    // the measured failure of an earlier draft that tried). Called from the
+    // freeze pre-pass at each LocalDecl / LocalConstDecl. // per §28.3, #4225
+    void collectAliasBorrowSource(const ast::Node& ld);
+    // issue #4225: re-collect a plain alias holder's tracked-source window
+    // when it is REASSIGNED (`y := <producer>;`) at source offset
+    // `reassignOffset` — the plain-alias sibling of
+    // recollectRecordBorrowSourceOnReassign. Closes every still-open window
+    // at `reassignOffset` (the old alias is retired there) and opens a new
+    // one iff the new RHS is itself a bare identifier naming a different
+    // symbol — the same purely structural match collectAliasBorrowSource
+    // uses, for the same pre-pass-phase reason (states_ is not live yet).
+    // Called only at depth 0 (an unconditional rebind), matching
+    // recollectRecordBorrowSourceOnReassign's own §1741 depth-0 restriction:
+    // a conditional rebind might not execute, so the old window must stay
+    // open on the not-taken path (sound over-rejection). // per §28.3, #4225
+    void recollectAliasBorrowSourceOnReassign(const sema::Symbol* lsym,
+                                              const ast::Expr& producer,
+                                              std::uint32_t reassignOffset);
+    // issue #4225: the source-offset window [from, until) during which
+    // `holder`'s tracked alias (via aliasBorrowSourceWindows_) is `consumed`,
+    // unioned across entries the same way recordBorrowConsumedWindow does —
+    // or nullopt if `holder` was never tracked as aliasing `consumed` at all.
+    // ⚠ KNOWN SCOPE LIMIT vs. recordBorrowConsumedWindow's record-local case:
+    // no multi-hop chain resolution. `var b := r; var c := b;` records `c`'s
+    // tracked source as `b` (the immediate RHS identifier), NOT the ultimate
+    // owned root `r` — a consume of `r` while `c` (but not `b`) has a later
+    // use falls back to the unbounded, sound-over-rejecting default in
+    // checkConsumeFreeze, rather than this window. Only the direct,
+    // single-hop alias this issue's repro exercises is covered; chained
+    // aliasing is left for a follow-up. // per §28.3, #4225
+    std::optional<std::pair<std::uint32_t, std::uint32_t>>
+    aliasBorrowConsumedWindow(const sema::Symbol* holder,
+                              const sema::Symbol* consumed) const;
     // §28.3: collect the identifier-root source symbols the borrow-bearing
     // producer `e` carries (the initializer chain root, or every arg root of a
     // `new Rec(...)`) into `srcs`, excluding the local `self` itself (a
