@@ -7922,6 +7922,88 @@ bool Resolver::argSatisfiesNew(const TypeRef* arg, bool& decided) {
                             // substitutions never satisfy `new()`")
         }
     }
+    // fix #4235 (§14.2/§17.11/§31.4/stdlib §3.3, v0.298): a null-declaration
+    // `Named` arg reaching here has no `TypeSymbol`, so none of the
+    // `arg->declaration` arms above ever ran for it — this is the
+    // TOP-LEVEL substitution case (`Holder<T>` instantiated directly at a
+    // builtin name), distinct from a builtin appearing as a RECORD FIELD,
+    // which the Record arm above already recurses into via
+    // `typeHasNoDefault` (see the `recordStorageMembers` loop a few lines
+    // up). Before this fix, no builtin name was ever consulted here at
+    // all, so a substitution straight at one of them fell through to the
+    // unconditional defer below and was silently ACCEPTED.
+    //
+    // MEASURED (issue #4235, parent `ea66776`): `HolderEINF<ExceptionInfo>
+    // .Make()` under `where T: new()` compiled with no §14.2 diagnostic
+    // and SIGSEGV'd at runtime.
+    //
+    // ⚠ FIRST VERSION OF THIS FIX (reverted — see the broad sweep this
+    // commit's body cites) routed EVERY null-declaration `Named` arg
+    // through `typeHasNoDefault`, reasoning that it would also close the
+    // identically-shaped top-level gap for the collection family
+    // (`Holder<Array<int>>.Make()` was ALSO measured silently accepted on
+    // this same parent). That is a REAL, separate gap, but fixing it that
+    // way was WRONG: §14.2 gives a substitution TWO independent routes to
+    // satisfy `where T: new()` — "class types with a public parameterless
+    // constructor" OR "defaultable value types" — and a stdlib
+    // COLLECTION is documented as the FORMER (stdlib §4.4: `Array<T>` is a
+    // `public class` with a `public constructor()`), never evaluated
+    // against defaultability at the top level. `typeHasNoDefault` answers
+    // the SECOND question only; routing every builtin name through it
+    // MEASURABLY regressed two pinned codegen tests —
+    // `codegen_generic_new_builtin_collection_2017`
+    // (`generic_new_builtin_collection_2017_test.cpp`, whose own comment
+    // quotes exactly this §14.2 class-arm reasoning for `Array`/
+    // `Dictionary`) — which this fix's own broad, no-`--area` sweep
+    // (LANE_RULES §2/§15) caught before landing. `ExceptionInfo` and
+    // `ReadOnlyStringSpan`, by contrast, are `record`s — §14.2's
+    // VALUE-type arm is the only one that could ever apply to them (a
+    // record is never "a class type" for this purpose), so evaluating
+    // exactly these two names against defaultability is correct; every
+    // OTHER null-declaration builtin name is left alone here rather than
+    // guessed at. (`CString`/`WString`/`RawBytes` were separately measured
+    // to ALREADY reject correctly at this exact top-level site on this
+    // corrected version, without this arm ever naming them — some other,
+    // pre-existing path resolves them with a real `declaration` at a
+    // generic-argument position and routes them through the ordinary
+    // Class-kind arm above, unlike a plain type annotation. That
+    // mechanism was not traced further — it predates this fix, this fix
+    // does not disturb it, and there is no measured defect in it — so
+    // it is left alone rather than described speculatively.)
+    if (arg->kind == TypeRef::Kind::Named && !arg->declaration) {
+        std::string_view head = arg->headName();
+        // fix #4235 review send-back (#4245, §14.2/§17.11/stdlib
+        // §4.14/§4.15, v0.298): `Span`/`ReadOnlySpan` (stdlib §4.14) and
+        // `ArraySpan`/`ReadOnlyArraySpan` (stdlib §4.15) are the SAME
+        // shape as `ExceptionInfo`/`ReadOnlyStringSpan` above — builtin
+        // records whose declared field composition makes them
+        // non-defaultable for EVERY `T`, not merely some. `Span<T>`/
+        // `ReadOnlySpan<T>` always carry `Buffer: OwningBuffer<T>`
+        // (stdlib §4.14: `public record Span<T>(Buffer: OwningBuffer<T>,
+        // Start: int, Length: int): ...`) and `ArraySpan<T>`/
+        // `ReadOnlyArraySpan<T>` always carry `Source: Array<T>` (stdlib
+        // §4.15) — `OwningBuffer<T>` and `Array<T>` are both `public
+        // class`es, so the field is class-typed (a non-nullable reference
+        // type, §17.11) regardless of what `T` is substituted with. This
+        // is four more names on the SAME by-name list, for the SAME
+        // reason as the two above — not a re-generalization to a
+        // structural predicate (§25): `Array<T>` itself stays OFF this
+        // list and continues to satisfy `where T: new()` via §14.2's
+        // class arm, never via defaultability (see row (7)/the
+        // regression-pin test this file's suite already carries).
+        // `DictionaryEntry<K,V>` (stdlib §4.8) is DELIBERATELY not added
+        // here: its declared fields ARE the generic parameters `K`/`V`
+        // themselves, so its defaultability is instantiation-dependent
+        // and cannot be decided by a flat by-name check — left open on
+        // #4245 as real design work, not a name-list gap.
+        if ((head == "ExceptionInfo" || head == "ReadOnlyStringSpan" ||
+             head == "Span" || head == "ReadOnlySpan" ||
+             head == "ArraySpan" || head == "ReadOnlyArraySpan") &&
+            typeHasNoDefault(arg, ctx_, /*incoming=*/nullptr)) {
+            decided = true;
+            return false;
+        }
+    }
     // Built-ins, generic params, function/inline-array args: defer.
     return false;
 }
@@ -8140,6 +8222,113 @@ bool typeHasNoDefaultWalk(const TypeRef* t, const common::RecordSubstEnv* incomi
                     if (head == "CString" || head == "WString" ||
                         head == "RawBytes") {
                         return true;  // FFI-boundary class: no default
+                    }
+                    // fix #4235 (§17.11/§31.4/stdlib §3.3, v0.298): a
+                    // DIFFERENT reason than the two blocks above — those are
+                    // non-defaultable because they ARE reference types
+                    // (collections) or declare no public constructor (FFI
+                    // classes); `ExceptionInfo` and `ReadOnlyStringSpan` are
+                    // ordinary VALUE-shaped records (§17.11's Record arm
+                    // would apply to them exactly as it does to any local
+                    // record, if they had a real `TypeSymbol` to recurse
+                    // into) whose declared fields happen to include at
+                    // least one non-nullable `string` — a Reference
+                    // primitive (§17.11), hence non-defaultable by the
+                    // SAME per-field rule the Record-kind arm below applies
+                    // to a user record.
+                    //
+                    // `record ExceptionInfo(TypeName: string, Message:
+                    // string, StackTrace: string)` (§31.4) — all three
+                    // fields are non-nullable `string`.
+                    // `record ReadOnlyStringSpan(Source: string, Start:
+                    // int, Length: int): IReadOnlySpan<char>` (stdlib
+                    // §3.3) — `Source` is a non-nullable `string`; `Start`/
+                    // `Length` would default fine alone, but §17.11 needs
+                    // only ONE non-defaultable declared field ("a record
+                    // any of whose declared fields is not defaultable").
+                    // Field names/arities are pinned by
+                    // `BuiltinRegistry.cpp`'s `kBuiltinCtorParamNames`
+                    // (`{"ExceptionInfo", ..., {"TypeName", "Message",
+                    // "StackTrace", ""}}`, `{"ReadOnlyStringSpan", ...,
+                    // {"Source", "Start", "Length", ""}}`) — the same
+                    // fixed, closed shapes §17.7's own closed-constructor-
+                    // surface rule already relies on.
+                    //
+                    // Both are, like the collection/FFI names above,
+                    // resolved through this null-declaration path with no
+                    // real `TypeSymbol` (TypeResolution_Names.cpp), so
+                    // there is no `recordStorageMembers` walk to recurse
+                    // into for them — the field composition is hardcoded
+                    // here rather than walked, since it is fixed and
+                    // spec-declared, not user-editable.
+                    //
+                    // MEASURED on parent `ea66776` (issue #4235): `default(
+                    // ExceptionInfo)` compiled clean and SIGSEGV'd (exit
+                    // 139) on `.TypeName.Length`; `default(
+                    // ReadOnlyStringSpan)` compiled with only the #2491
+                    // degraded-value backstop and silently read `.Length`
+                    // as 0 instead of the expected value — the exact
+                    // null-string-deref class already fixed here for
+                    // `CString`/`WString`/`RawBytes`, just for two names
+                    // outside that scoped list. See
+                    // `Resolver::argSatisfiesNew`'s own comment (this
+                    // file) for the THIRD symptom this issue reported —
+                    // `where T: new()` accepting these two names at a
+                    // TOP-LEVEL substitution never reaches this walk at
+                    // all, and needed its own fix.
+                    // fix #4235 review send-back (#4245, §17.11/stdlib
+                    // §4.14/§4.15, v0.298): `Span`/`ReadOnlySpan` (stdlib
+                    // §4.14) and `ArraySpan`/`ReadOnlyArraySpan` (stdlib
+                    // §4.15) are the SAME shape as `ExceptionInfo`/
+                    // `ReadOnlyStringSpan` immediately above, one level up
+                    // in this same block: builtin records with an
+                    // always-non-defaultable declared field. `Span<T>`/
+                    // `ReadOnlySpan<T>` always carry a non-nullable
+                    // class-typed `Buffer: OwningBuffer<T>` (stdlib §4.14);
+                    // `ArraySpan<T>`/`ReadOnlyArraySpan<T>` always carry a
+                    // non-nullable class-typed `Source: Array<T>` (stdlib
+                    // §4.15) — both fields are class-typed regardless of
+                    // `T`'s category, so all four are non-defaultable for
+                    // EVERY instantiation, exactly like the fixed-shape
+                    // records above; no per-`T` recursion is needed (this
+                    // walker has no `TypeSymbol` to recurse into for a
+                    // null-declaration builtin anyway).
+                    //
+                    // MEASURED (issue #4245; re-verified identically on
+                    // this file's own parent `9ba93e3` before this edit):
+                    // `default(Span<int>)`, `default(ReadOnlySpan<int>)`,
+                    // `default(ArraySpan<int>)`, `default(
+                    // ReadOnlyArraySpan<int>)` all compiled clean (exit 0)
+                    // and ran clean (exit 0), `.Length` silently reading
+                    // back 0 instead of being rejected — the same
+                    // degrade-to-zero symptom already measured above for
+                    // `ReadOnlyStringSpan`. The `where T: new()` top-level
+                    // substitution axis was WORSE: `HolderSpan<Span<int>>
+                    // .Make()` (and the sibling ReadOnlySpan/ArraySpan/
+                    // ReadOnlyArraySpan substitutions) crashed the
+                    // COMPILER ITSELF (SIGSEGV, `Emitter::lowerExprInner`,
+                    // `LlvmBackend_Exprs.cpp:3830`, `CreateExtractValue`
+                    // on a bad aggregate) rather than the generated
+                    // program — see `Resolver::argSatisfiesNew`'s own
+                    // comment (this file) for that axis's fix; rejecting
+                    // here means `default(...)`/the record-field recursion
+                    // never reaches codegen with an unmonomorphized
+                    // builtin type parameter in the first place.
+                    //
+                    // `DictionaryEntry<K,V>` (stdlib §4.8) is DELIBERATELY
+                    // left off this list: its declared fields are the
+                    // generic parameters `K`/`V` themselves, so whether it
+                    // is defaultable depends on the SUBSTITUTED types, and
+                    // this null-declaration leaf has no real `TypeSymbol`
+                    // to attach a `RecordSubstEnv` to for that recursion
+                    // (see this function's null-declaration comment
+                    // above). That is real design work, not a name-list
+                    // entry — left open on #4245.
+                    if (head == "ExceptionInfo" ||
+                        head == "ReadOnlyStringSpan" ||
+                        head == "Span" || head == "ReadOnlySpan" ||
+                        head == "ArraySpan" || head == "ReadOnlyArraySpan") {
+                        return true;  // non-nullable string/class field(s): no default
                     }
                 }
                 return false;  // generic param / unresolved / other builtin — defer
