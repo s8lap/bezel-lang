@@ -2889,6 +2889,22 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     const std::unordered_set<const void*> ancestorReturnedCaptureVars4226 =
         returnedCaptureVars_;
     returnedCaptureVars_.clear();          // fix #4198
+    // fix #4240 (§27.5 / §28.9, v0.298): snapshot the ANCESTOR scope's
+    // already-computed multiCaptureLocals_ before collectBoxCaptureLocals
+    // (below) clears+recomputes it for THIS nested lambda's own re-scan — see
+    // the merge just below (after the #4226 returnedCaptureVars_ merge, same
+    // pattern) and multiCaptureLocals_'s own declaration for the full
+    // argument. Without this, a cell shared by an ANCESTOR env (which holds
+    // a reference PURELY to hand it down to a lambda nested inside it,
+    // without itself appearing in `lam.stmts`'s own collectAllLambdas result)
+    // is undercounted by exactly the ancestor's own +1 contribution, so a
+    // truly 2+-env cell looks single-captured from this narrower rescan —
+    // which flips mutatedSharedCaptureCell's verdict on a WRITTEN cell from
+    // "suppress both retain and release" to "suppress neither", unbalancing
+    // the pair (issue #4240: heap-use-after-free, `freed by ... envdtor`, on
+    // a mutated-not-returned two-level-nested capture).
+    const std::unordered_set<const void*> ancestorMultiCaptureLocals4240 =
+        multiCaptureLocals_;
     definitelyEscapingLambdas_.clear();
     boxCaptureLocalsFn_ = fn;
     cellFreeEligible_.clear();
@@ -2981,6 +2997,26 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     // set either way.
     for (const void* k : ancestorReturnedCaptureVars4226)
         returnedCaptureVars_.insert(k);
+    // fix #4240 (§27.5 / §28.9, v0.298): merge the ancestor's
+    // multiCaptureLocals_ back in for any key THIS body's own rescan does
+    // not know about (same "applies to BOTH branches" reasoning as the two
+    // merges immediately above — the expr-body branch never touches
+    // multiCaptureLocals_ at all, so the loop below is a harmless self-union
+    // there), AND ERASE those same keys from THIS scan's singleCaptureLocals_.
+    // A plain union alone is not enough: singleCaptureLocals_'s callers
+    // (mutatedSharedCaptureCell, the two #694/#3426 sole-holder cell-free
+    // gates) all read singleCaptureLocals_ directly, so the ancestor's
+    // "known shared by 2+" verdict must overturn a wrong "looks single"
+    // membership THIS rescan produced, not merely coexist with it in a
+    // second set nobody consults. Erasing is sound in only one direction,
+    // and it is the safe one: it can only REMOVE a key from
+    // singleCaptureLocals_, never add one, so it can only make the
+    // sole-holder gates MORE conservative (a bounded leak on the newly
+    // excluded key, never an over-free) — never less.
+    for (const void* k : ancestorMultiCaptureLocals4240) {
+        multiCaptureLocals_.insert(k);
+        singleCaptureLocals_.erase(k);
+    }
     closureReleaseEligibleFn_ = fn;
     // fix #4174 follow-up: the closure twin of the string parameter retain
     // above (line ~2479) — see retainAssignedClosureParams' own comment.

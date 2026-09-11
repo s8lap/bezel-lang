@@ -12378,6 +12378,7 @@ private:
               closureBorrowRetainEligible_(e.closureBorrowRetainEligible_),
               boxCaptureLocals_(e.boxCaptureLocals_),
               singleCaptureLocals_(e.singleCaptureLocals_),
+              multiCaptureLocals_(e.multiCaptureLocals_),  // fix #4240
               assignedCaptureVars_(e.assignedCaptureVars_),
               returnedCaptureVars_(e.returnedCaptureVars_),  // fix #4198
               definitelyEscapingLambdas_(e.definitelyEscapingLambdas_),
@@ -12400,6 +12401,7 @@ private:
                 std::move(closureBorrowRetainEligible_);
             e_.boxCaptureLocals_ = std::move(boxCaptureLocals_);
             e_.singleCaptureLocals_ = std::move(singleCaptureLocals_);
+            e_.multiCaptureLocals_ = std::move(multiCaptureLocals_);  // fix #4240
             e_.assignedCaptureVars_ = std::move(assignedCaptureVars_);
             e_.returnedCaptureVars_ =
                 std::move(returnedCaptureVars_);  // fix #4198
@@ -12439,6 +12441,7 @@ private:
         std::unordered_set<const void*> closureBorrowRetainEligible_;
         std::unordered_set<const void*> boxCaptureLocals_;
         std::unordered_set<const void*> singleCaptureLocals_;
+        std::unordered_set<const void*> multiCaptureLocals_;  // fix #4240
         std::unordered_set<const void*> assignedCaptureVars_;
         std::unordered_set<const void*> returnedCaptureVars_;  // fix #4198
         std::unordered_set<const void*> definitelyEscapingLambdas_;
@@ -14962,6 +14965,47 @@ private:
     // ⇒ no double-free; definite escape ⇒ the outer scope is gone before the
     // closure dies ⇒ no UAF.
     std::unordered_set<const void*> singleCaptureLocals_;
+    // fix #4240 (§27.5 / §28.9, v0.298): LOCAL DECL NODES and PARAMETER SYMBOLS
+    // known captured by TWO OR MORE lambda envs (computed alongside
+    // singleCaptureLocals_ in the SAME tally, guarded by boxCaptureLocalsFn_ —
+    // the two sets are mutually exclusive by construction, n==1 vs n>=2 from
+    // one captureCount map).
+    //
+    // WHY A SEPARATE SET, RATHER THAN JUST "NOT IN singleCaptureLocals_".
+    // `collectBoxCaptureLocals` is re-invoked once per lambda, over ONLY that
+    // lambda's OWN `stmts` (lowerLambda), to discover what ITS nested lambdas
+    // capture. That re-scan's `collectAllLambdas` root is `lam.stmts` itself,
+    // so it can never find `lam` AS a capturing env of its own free
+    // variables — an ancestor lambda that captures a cell PURELY to hand it
+    // down to a lambda nested inside it (never referencing the cell in its
+    // own top-level statements) is invisible to this narrower re-scan, the
+    // same "outer doesn't count itself" blind spot #4226 fixed for
+    // returnedCaptureVars_ and #3804 fixed for sharedCellEnvdtorFreeOwner_.
+    // So a TRUE 2+-env cell can come back n==1 from a nested rescan's own
+    // narrower vantage and land in singleCaptureLocals_ WRONGLY unless the
+    // ancestor's already-proven "multi" verdict is preserved and used to
+    // ERASE that wrong membership after the rescan (lowerLambda's
+    // ancestorMultiCaptureLocals4240 merge) — a plain union onto
+    // singleCaptureLocals_ cannot do that (it only ever ADDS members, and
+    // fixing this needs a REMOVAL). multiCaptureLocals_ is therefore the
+    // ancestor-merged, monotonic-OR "known shared by 2+" fact (once true at
+    // any scope level, true at every descendant level too, since a narrower
+    // rescan can only find a SUBSET of the true capturers) — merged forward
+    // exactly like returnedCaptureVars_, and consulted ONLY to correct
+    // singleCaptureLocals_ itself, so every existing consumer
+    // (mutatedSharedCaptureCell, and the two #694/#3426 sole-holder
+    // cell-free gates) needs no change.
+    //
+    // Issue #4240: `mutatedSharedCaptureCell`'s "manyEnvsShareOneCell" check
+    // read singleCaptureLocals_ alone, so a captured-and-MUTATED cell shared
+    // by an ancestor lambda and a lambda nested two levels deep inside it hit
+    // n==1 from the inner lambda's own body-lowering rescan, left its content
+    // release unsuppressed while the ancestor's OWN capture-of-the-same-cell
+    // (correctly suppressed, using the top-level whole-function scan's
+    // n==2 answer) also went unretained — an unbalanced release: heap-use-
+    // after-free, `freed by ... envdtor`, on the very value the inner lambda
+    // itself had just produced.
+    std::unordered_set<const void*> multiCaptureLocals_;
     // fix #2706 / §27.5 / §28.9 (v0.240): LOCAL DECL NODES and PARAMETER SYMBOLS
     // that this function body ASSIGNS TO (`x := e` / `x += e`), including from
     // inside a lambda body. Computed alongside boxCaptureLocals_/

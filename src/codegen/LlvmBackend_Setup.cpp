@@ -30753,6 +30753,7 @@ void Emitter::collectBoxCaptureLocals(
         const std::vector<std::unique_ptr<ast::Stmt>>& body) {
     boxCaptureLocals_.clear();
     singleCaptureLocals_.clear();  // #694
+    multiCaptureLocals_.clear();   // fix #4240
     assignedCaptureVars_.clear();  // fix #2706
     returnedCaptureVars_.clear();  // fix #4198
 
@@ -30867,6 +30868,13 @@ void Emitter::collectBoxCaptureLocals(
             boxCaptureLocals_.insert(d);      // #802: any captured box producer
         if (n == 1)
             singleCaptureLocals_.insert(d);   // #694: captured by exactly one env
+        // fix #4240 (§27.5 / §28.9, v0.298): captured by 2+ envs, from THIS
+        // scan's own (possibly narrower, ancestor-blind) vantage — see
+        // multiCaptureLocals_'s declaration (LlvmBackend_impl.hpp) for why
+        // this is not simply "not in singleCaptureLocals_" to a caller that
+        // needs the ancestor-merged, monotonic fact.
+        if (n >= 2)
+            multiCaptureLocals_.insert(d);
     }
 
     // fix #2706 / §27.5 / §28.9 (v0.240): record every LOCAL/PARAMETER this body
