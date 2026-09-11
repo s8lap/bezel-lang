@@ -734,10 +734,28 @@ struct DestructorDecl : Member {
 // invariant of C is the conjunction of every InvariantDecl of C and every
 // base class, evaluated base-first, declaration order within each class
 // (§22.16 "Class invariants"). Class-body-only per A.4; semantically
-// rejected in records, static classes, and outside class bodies.
-// `static invariant` parses from day one (the prover fragment, when it
-// lands, gives it meaning); in this revision a `static` invariant is
-// accepted at parse, rejected at sema as out-of-fragment.
+// rejected in records, static classes, and outside class bodies (fix
+// #4115/#4186).
+//
+// fix-forward #4206 (§22.16 "Class invariants", "Out of scope in this
+// revision", v0.298; corrects this comment, no behavior change): the
+// `"static"?` qualifier on an invariant clause INSIDE AN ORDINARY (non-
+// static) class body is NOT rejected at sema in this revision — an earlier
+// revision of this comment claimed it was ("rejected at sema as
+// out-of-fragment"), but no sema check ever existed for it (issue #4206,
+// filed reviewing #4186, whose commit had quoted this comment as supporting
+// authority for a claim it did not make). §22.16's own "Out of scope in
+// this revision" list says only: "`static invariant` parses from day one
+// and is useful when the prover fragment lands" — silent on rejection, and
+// the codegen side (`Emitter::emitInvariantCheck`, `LlvmBackend_Setup.cpp`)
+// confirms the intended reading: it simply excludes `isStatic` invariants
+// from runtime instrumentation (`if (inv->expr && !inv->isStatic)`), i.e.
+// INERT-until-the-prover-lands, not rejected.
+// `checkRecordAndStaticClassInvariantMembers` / `checkEnumChoiceInvariantMembers`
+// (TypeResolution_Checks.cpp) reject the wrong BODY KIND (record / static
+// class / enum / choice); neither reads `isStatic`, and nothing else does
+// either — a `static invariant` in an ordinary class compiles clean today,
+// and per the spec text above, should.
 //
 // Slice 1 carries the parsed member only; instrumentation, instrumentation
 // set, and the checked/unchecked face split land in later slices.
