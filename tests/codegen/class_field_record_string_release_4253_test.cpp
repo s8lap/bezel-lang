@@ -28,9 +28,28 @@
 //          body, no diagnostic.
 //        - #4276: a DERIVED class's constructor can currently reassign a
 //          readonly property INHERITED from its base, no diagnostic.
-//      Rows 9 and 10 below exercise exactly these two shapes and confirm
-//      the fix's guard keeps them SAFE (still leaking, never a UAF) even
-//      though the underlying sema gaps remain open.
+//      Rows 9 and 10 below exercise exactly these two shapes. Investigating
+//      them found #4275's own premise wrong ("this should be rejected") —
+//      §22.8's own scope statement and DECLINED.md ("Extending §22.8's
+//      single-assignment rule to readonly auto-properties", v0.271) record
+//      that the once-ness rule deliberately does NOT extend to auto-
+//      properties; #3207's own test pins the override taking effect at
+//      runtime. So #4275 stays UNFIXED by design and row 9 keeps proving
+//      this fix's guard is safe against it (still leaking, never a UAF,
+//      because `hasAnyConstructor(ts)` alone already excludes it). #4276
+//      WAS a real gap — a plain implementation inconsistency between two
+//      spellings of the same store (`this.P := e` vs bare `P := e`) — and
+//      is fixed by issue 4276 (ExprTypecheck.cpp, `currentType_ ==
+//      fs->parent`/`ps->parent` added at the four readonly-write gates).
+//      Row 10 below is updated to assert the new REJECTION instead of
+//      "still safely leaks": the program it names no longer compiles, so
+//      this fix's own release condition 2 (`sealed` + `!hasAnyConstructor`)
+//      is now redundant against this ONE vector specifically — condition 2
+//      stays as-is regardless (it is still independently load-bearing
+//      against #4275 and against the general non-sealed/has-a-constructor
+//      cases rows 4-5 exercise), per this run's brief: "do not touch
+//      anything else in 12e6f1e0's guard; if you think your fix makes part
+//      of it unnecessary, file an issue saying so, do not edit it."
 //   3. The field's OWN declaration initializer is provably a fresh,
 //      alias-free construction of exactly the declared record type —
 //      `Emitter::isFreshRecordConstructionOfExactType`, the SAME
@@ -40,9 +59,11 @@
 // DIRECTION: this fix only ever ADDS a release where none existed (a safe-
 // direction leak becomes balanced) — never removes one. Rows 1-2 prove the
 // leak closes; rows 4-8 prove the three gates are each independently
-// load-bearing (an accept-side sweep, not a volume of green); rows 9-10
-// prove the two adjacent sema gaps do NOT turn this fix's guard into a
-// double-free/UAF.
+// load-bearing (an accept-side sweep, not a volume of green); row 9 proves
+// the #4275 sema gap (a settled, DECLINED-to-fix behaviour) does NOT turn
+// this fix's guard into a double-free/UAF; row 10, post-issue-4276, proves
+// the program it used to exercise is now a REJECT (the gap it exercised is
+// fixed) rather than re-proving crash-freedom against an accepted program.
 //
 // Residual (NOT fixed here, filed as #4277): a field assigned via a
 // CONSTRUCTOR-BODY statement (`this.P := new Box(...);`) rather than its
@@ -52,10 +73,12 @@
 
 #include <regex>
 
+#include "support/aot_result_asserts.hpp"
 #include "support/aot_support.hpp"
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
+using bezel::test::failedAtCompileTimeWithRealLocation;
 using bezel::test::runAot;
 using bezel::test::runAotChecked;
 using bezel::test::runAotCheckedLenient;
@@ -348,14 +371,13 @@ BEZEL_TEST(class_field_record_string_release_4253,
 }
 
 // ===========================================================================
-// Direct proofs that the two adjacent, independently-filed sema gaps
-// (#4275, #4276) do NOT turn this fix's guard into a double-free/UAF --
-// the exact reassignment shapes that motivated the `sealed` and
-// `!hasAnyConstructor` conditions, run against the REAL (guarded) fix.
-// Both rows are expected to compile, run, and still safely leak (the sema
-// gaps remain open, so the reassignment itself is accepted -- but this
-// fix's own release never mis-fires against the reassigned value, because
-// its gate declines both shapes outright).
+// UPDATED post-issue-4276 (see that fix's own commit for the full
+// analysis): row 9 still proves the #4275 shape (a DECLINED-to-fix,
+// deliberately-accepted behaviour, DECLINED.md v0.271) does not turn this
+// fix's guard into a double-free/UAF. Row 10 no longer proves the parallel
+// claim for #4276 -- that shape is now a compile-time REJECTION, so there
+// is no longer a reassigned value for this fix's release to mis-fire
+// against; row 10 asserts the rejection directly instead.
 // ===========================================================================
 
 // Shape of issue #4275: a readonly field with a declaration initializer,
@@ -393,14 +415,22 @@ BEZEL_TEST(class_field_record_string_release_4253,
     BEZEL_EXPECT_TRUE(didNotCrash(prog));
 }
 
-// Shape of issue #4276: a derived class's constructor reassigns a readonly
-// property inherited from its (non-sealed) base. `Base` is not `sealed`,
-// so this fix's own release never registers for `Base.P` at all -- no UAF
-// at `Derived`'s disposal (which chains to `Base`'s core disposer), even
-// though sema currently accepts the reassignment in `Derived`'s
-// constructor.
+// Shape of issue #4276, UPDATED post-fix-#4276 (was
+// `sema_gap_4276_shape_still_safe_no_uaf`, asserting `didNotCrash` on an
+// ACCEPTED program): a derived class's constructor reassigning a readonly
+// property inherited from its (non-sealed) base is now a compile-time
+// REJECTION — issue 4276 added the missing `currentType_ ==
+// ps->parent`/`fs->parent` declaring-type check to the four readonly-write
+// gates in ExprTypecheck.cpp, closing exactly this shape (the explicit
+// `this.P` spelling now agrees with the bare `P := e` spelling, which was
+// already rejected). The program below therefore no longer compiles at
+// all, so this fix's own release condition 2 (`sealed` +
+// `!hasAnyConstructor`) never gets a chance to matter for THIS vector —
+// but it is unchanged and stays independently load-bearing against #4275
+// (row 9 above) and the general non-sealed / has-a-constructor cases
+// (rows 4-5 above), per this run's instruction not to re-scope it.
 BEZEL_TEST(class_field_record_string_release_4253,
-           sema_gap_4276_shape_still_safe_no_uaf) {
+           derived_ctor_inherited_readonly_reassignment_rejected_spec_23_1_issue_4276) {
     const char* prog =
         "module M; record Box(Value: string); "
         "class Base "
@@ -421,5 +451,9 @@ BEZEL_TEST(class_field_record_string_release_4253,
         "  end; "
         "  return acc mod 100; "
         "end Main; end C;";
-    BEZEL_EXPECT_TRUE(didNotCrash(prog));
+    auto r = runAot(prog);
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(
+        r, "cannot assign to readonly property `P`"));
+    BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(r, "§23.1"));
 }

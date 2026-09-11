@@ -5383,11 +5383,27 @@ void ExprTC::checkReadonlyAssignment(const ast::AssignmentStmt& as) {
     // constructor body writing `c._f` (where `_f` is C's readonly) was
     // also accepted; the same this-rooted check rejects that shape
     // (the chain's base is `c`, not `this`).
+    //
+    // fix #4276 (§22.8, v0.298): `isThisRootedLValueTarget` answers ONLY
+    // "is the chain's base literally `this`" — for the explicit `this.F`
+    // spelling it does not also check the field's OWN declaring type,
+    // unlike its bare-identifier branch (`fs->parent == currentType_`,
+    // see that function). That asymmetry let a DERIVED class's own
+    // constructor reassign a readonly field it INHERITS from a base —
+    // `this` in `Derived::ctor` names the very same instance, so the
+    // this-rooted check alone passed it, while the bare spelling of the
+    // identical store (`F := e` with no `this.`) was ALREADY rejected by
+    // the parent check the sibling branch carries (MEASURED: the two
+    // spellings of the same store disagreed). `currentType_ == fs->parent`
+    // makes the explicit spelling consult the SAME fact the bare spelling
+    // already does, rather than duplicating a second, narrower one.
     if (inConstructor_) {
         bool isStatic = false;
         for (auto mod : fs->modifiers)
             if (mod == "static") { isStatic = true; break; }
-        if (isStatic || isThisRootedLValueTarget(*as.target)) return;
+        if (isStatic ||
+            (currentType_ == fs->parent && isThisRootedLValueTarget(*as.target)))
+            return;
     }
     // §22.8 (#747 R42): a readonly field may be assigned only in a field
     // initializer or a constructor body; assignment anywhere else is a compile
@@ -5618,12 +5634,30 @@ void ExprTC::checkPropertyWriteTarget(const ast::Expr& target,
         // field branch uses); for a `static readonly` auto-property
         // the carve-out is preserved (per-instance vs per-type does
         // not reach it, v0.270 records the case as open).
+        //
+        // fix #4276 (§23.1, v0.298): `isThisRootedLValueTarget`'s
+        // explicit-`this.P` branch does not check the property's own
+        // declaring type — only its bare-identifier branch does
+        // (`ps->parent == currentType_`). That let a DERIVED class's
+        // constructor reassign a readonly auto-property it INHERITS from
+        // a base via `this.P := e`, while the bare spelling of the exact
+        // same store (`P := e`, no `this.`) was already rejected by the
+        // sibling check (MEASURED: the two spellings disagreed). This
+        // does not reach #4275 (a same-class readonly property re-
+        // assigned over its own declaration initializer): §22.8's own
+        // scope statement, and DECLINED.md's "Extending §22.8's single-
+        // assignment rule to readonly auto-properties" row (v0.271),
+        // record that the ONCE-NESS counting rule deliberately does not
+        // extend to auto-properties — only the WHERE (declaring-type)
+        // rule is fixed here, which #4275's same-class shape already
+        // satisfies (`currentType_ == ps->parent` holds there).
         bool propIsStatic = false;
         for (auto mod : pd->modifiers)
             if (mod == "static") { propIsStatic = true; break; }
         bool readonlyAllowed;
         if (propIsStatic) readonlyAllowed = inConstructor_;
-        else readonlyAllowed = inConstructor_ && isThisRootedLValueTarget(target);
+        else readonlyAllowed = inConstructor_ && currentType_ == ps->parent &&
+                                isThisRootedLValueTarget(target);
         if (!hasSetter) {
             // #2851: `propName` is empty for an indexer (its symbol name is
             // the synthetic ".this"), so name the construct rather than
@@ -5966,10 +6000,20 @@ void ExprTC::checkRefOutFieldOperand(FieldSymbol& fs, const ast::Expr& target,
     // vs per-type does not reach it, v0.270 records the case as
     // open). `checkRefOutFieldOperand` is the ref/out twin of the
     // `:=`-target `checkReadonlyAssignment` above.
+    //
+    // fix #4276 (§22.3 / §22.8, v0.298): mirrors that same-named fix's
+    // reasoning exactly — `isThisRootedLValueTarget`'s explicit-`this.F`
+    // branch does not check the field's declaring type, so a DERIVED
+    // class's constructor could bind an INHERITED readonly field to a
+    // `ref`/`out` parameter via `this.F` while the bare spelling of the
+    // identical store was already rejected. `currentType_ == fs.parent`
+    // closes the same gap here, matching the positional-record branch
+    // above which already carries this exact check.
     if (isReadonly) {
         bool readonlyAllowed;
         if (isStatic) readonlyAllowed = inConstructor_;
-        else readonlyAllowed = inConstructor_ && isThisRootedLValueTarget(target);
+        else readonlyAllowed = inConstructor_ && currentType_ == fs.parent &&
+                                isThisRootedLValueTarget(target);
         if (!readonlyAllowed) {
             ctx_.diagnostics().report(
                 Severity::Error, target.span.begin,
@@ -6173,13 +6217,19 @@ void ExprTC::checkRefOutPropertyOperand(PropertySymbol& ps,
     // a `static readonly` auto-property the carve-out is preserved
     // (per-instance vs per-type does not reach it, v0.270 records the
     // case as open).
+    //
+    // fix #4276 (§22.3 / §23.1, v0.298): the ref/out twin of
+    // `checkPropertyWriteTarget`'s same-numbered fix — `currentType_ ==
+    // ps.parent` closes the identical declaring-type gap for a `ref`/
+    // `out` binding of an INHERITED readonly auto-property.
     if (isReadonlyAuto) {
         bool propIsStatic = false;
         for (auto mod : pd->modifiers)
             if (mod == "static") { propIsStatic = true; break; }
         bool readonlyAllowed;
         if (propIsStatic) readonlyAllowed = inConstructor_;
-        else readonlyAllowed = inConstructor_ && isThisRootedLValueTarget(target);
+        else readonlyAllowed = inConstructor_ && currentType_ == ps.parent &&
+                                isThisRootedLValueTarget(target);
         if (!readonlyAllowed) {
             ctx_.diagnostics().report(
                 Severity::Error, target.span.begin,
