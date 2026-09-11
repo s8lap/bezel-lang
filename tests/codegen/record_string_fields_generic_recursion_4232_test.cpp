@@ -320,15 +320,32 @@ BEZEL_TEST(record_string_fields_generic_recursion_4232, outer_string_field_detec
 // so it does NOT crash even pre-fix (verified: T resolves all the way to
 // the concrete `string` primitive at the innermost frame, a genuine fixed
 // point, not a loop). Its purpose is not FAIL-WITHOUT/PASS-WITH — it is a
-// control pinning the guard's KEY CHOICE: had the fix keyed the path guard
-// on the record's `TypeSymbol*` (the shared declaration "Box") instead of
-// the `TypeRef*` instantiation, this program would have REGRESSED — the
-// OUTER `Box<Box<string>>` frame would insert "Box" into a TypeSymbol-keyed
-// `seen`, and the INNER `Box<string>` frame (a DIFFERENT instantiation of
-// the identical declaration, reached while the outer frame is still active
-// on the path) would collide with it and be wrongly treated as a cycle,
-// silently losing the inner `string` field. This row must remain green on
-// both sides of #4232's fix; it is not itself a fail-without row.
+// control intended to pin the guard's KEY CHOICE (`TypeRef*` instantiation
+// rather than the record's shared `TypeSymbol*` "Box").
+//
+// ⚠ CORRECTED per the #4232 review (R18): THIS ROW DOES NOT ACTUALLY PIN
+// THAT CHOICE, and an earlier version of this comment claimed it did.
+// Measured: patching the guard to `TypeSymbol*` keying and diffing the
+// emitted IR (`BEZEL_DUMP_IR=1`) for this exact program against the shipped
+// fix gives a BYTE-IDENTICAL module (`diff` = 0 lines), and the program's
+// leak footprint is identical under both keyings (12190 B / 600 allocations
+// at loop x300). Two independent reasons: (a) the assertion is a field READ
+// (`b.Value.Value.Length`), and `recordHasStringFields` only ever decides
+// DISPOSAL, never value correctness — so no keying can change this answer;
+// (b) the disposal difference that WOULD be observable is masked by the
+// pre-existing eligibility gap tracked as #4237 and its broader class-field
+// cousin, which declines the local's disposal registration regardless of how
+// the guard classifies it.
+//
+// The KEY CHOICE is still correct — traced directly: `Box<Box<string>>`'s
+// field `Value` resolves to `Box<string>`, which shares the `TypeSymbol`
+// "Box" with the outer frame, so a `TypeSymbol*`-keyed guard collides
+// immediately even though the two instantiations are semantically distinct.
+// But that collision could not be made OBSERVABLE through execution in any
+// construction tried (plain locals, helper-returned locals, borrowed
+// parameters, class fields) — every path is blocked by an unrelated
+// pre-existing gap. Whoever fixes #4237 should revisit this row and give it
+// real discriminating power. Until then it is a smoke test, not a control.
 // ===========================================================================
 BEZEL_TEST(record_string_fields_generic_recursion_4232, distinct_generic_instantiations_not_treated_as_cycle) {
     const char* prog =
@@ -388,8 +405,17 @@ BEZEL_TEST(record_string_fields_generic_recursion_4232, sibling_fields_benign_fi
 // all), so this is not a #4232 crash risk in itself; it pins that the path
 // guard (erase-on-exit, no cross-branch memoization) does not misclassify a
 // legitimate, finite, heavily-shared DAG as cyclic, and that walking it
-// (81 leaf visits, unmemoized) compiles and runs promptly rather than
-// hanging.
+// compiles and runs promptly rather than hanging.
+//
+// ⚠ CORRECTED per the #4232 review (R18): an earlier version of this comment
+// said "81 leaf visits, unmemoized". That is wrong — `Leaf` HAS a string
+// field, so every level's field loop short-circuits (`found = true; break`)
+// on its FIRST field. The actual traversal is O(depth), not O(branch^depth),
+// and this row never exercises the exponential path at all. The row is still
+// a valid DAG-not-cycle smoke test; it is not a blowup test. The genuine
+// compile-time blowup is measured and tracked separately as #4234 (branch=3
+// depth=6 measured at ~21.9 s / 542 MB, IDENTICAL on this fix and on its
+// parent `6f46a73` — this fix neither causes nor worsens it).
 //
 // ⚠ Uses the SAME leak-tolerant oracle as the two tests above, for the same
 // reason: a NESTED record-typed constructor argument (`new Mid(leaf, leaf,
