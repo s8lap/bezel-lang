@@ -449,3 +449,202 @@ BEZEL_TEST(generic_extension_773,
     BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(
         r, "no member `NoSuchMethod` on type `Box`"));
 }
+
+// --- fix #4292 (§26.4/§26.5, v0.298) --------------------------------------
+//
+// #4238's self-call receiver synthesis above (the `this`/`currentExtension_`
+// branch in `ExprTC::resolveMemberAccess`) supplies `lookupExtensionMember`
+// a receiver whose generic argument is `currentExtension_`'s OWN declared
+// free type variable, UNRESOLVED (`declaration == nullptr` — the #4229
+// null-declaration shape). `extWhereClauseProvablyViolated`'s
+// `groundCategorize` necessarily reads that as `GroundCat::Unknown`, and its
+// documented "defer on undecidable => keep the candidate" direction then
+// silently ADMITTED a sibling `where`-constrained block's member even when
+// the constraint is not satisfied for the receiver's real instantiation —
+// while the IDENTICAL call made externally (`b.Method()`) was correctly
+// rejected on the same instantiation. This could not manifest before #4238
+// (every self-call inside a generic extension failed outright for its own,
+// unrelated reason), so it is a hole #4238's fix opened, not one it
+// inherited.
+//
+// The four tests below (rowA-rowD) are additional #4238 SELF-CALL coverage
+// the review measured by hand but did not commit — different axes
+// (2-free-var target, a `where`-constrained same-block self-call, a
+// self-call from inside a captured lambda, a self-call to a computed
+// PROPERTY rather than a method). FAIL-WITHOUT / PASS-WITH, measured on
+// this lane's own tree: built `bezelc` at r18-c3's base `10bb24d` (the
+// commit immediately BEFORE #4238) in an isolated worktree and ran all four
+// verbatim — every one is a compile-time reject there ("no extension
+// method ... (§26.5)" / "no member `Value` on type `Box`"), and every one
+// compiles and runs to the value asserted below on this lane's patched
+// tree (`bezelc --version` confirmed at each build; not merely assumed from
+// the review's report). That is 4 of 4 FAIL-WITHOUT / PASS-WITH.
+//
+// The final two tests (the constraint-gap fix itself) are the actual
+// #4292 regression pair: `unsatisfied_constraint_...` FAILS on `c5c7237`
+// (this lane's own pre-#4292-fix commit — it compiles and RUNS to exit 5,
+// which is the bug) and PASSES (rejected, correct diagnostic text) on the
+// patched tree; `satisfied_constraint_...` is the accept-side control and
+// passes identically on both (a caller block that independently declares
+// the SAME `where W: class` constraint on its own free var must keep
+// resolving the self-call — this is the "must not regress" shape #4292's
+// own writeup calls out).
+
+// fix #4292 coverage row A: TWO free type variables (`Pair<K, V>`), a
+// self-call chain (`Wrapper` -> `ReadK`) reading a REAL field (`this._k`,
+// not a constant), asserting the measured VALUE (217) so a zero-initialized
+// #2491/#2547 degrade or a mismatched-field-offset read could not pass.
+BEZEL_TEST(generic_extension_773, self_call_two_free_vars_reads_real_field_4292) {
+    BEZEL_EXPECT_EQ(runFull(
+        "module M; "
+        "class Pair<K, V> "
+        "  public _k: K; "
+        "  public _v: V; "
+        "  public constructor(k: K, v: V) _k := k; _v := v; end; "
+        "end Pair; "
+        "extension Pair<K, V> "
+        "  public method ReadK(): K => this._k; "
+        "  public method Wrapper(): K => this.ReadK(); "
+        "end; "
+        "class C "
+        "  public static method Main(): int "
+        "    using var p := new Pair<int, bool>(217, true); "
+        "    return p.Wrapper(); "
+        "  end Main; "
+        "end C;"),
+        217);
+}
+
+// fix #4292 coverage row B: a self-call WITHIN a `where W: class`-
+// constrained extension block (`Outer` calling `Inner`, both declared in the
+// SAME constrained block) — the #4238 defect blocked this shape too (the
+// arity check on the synthesized 0-arg receiver failed independent of any
+// `where` clause), and it must keep resolving after #4292's applicability
+// re-check (`foundDecl == callerDecl` trivially satisfies its own clause).
+BEZEL_TEST(generic_extension_773, self_call_inside_constrained_block_4292) {
+    BEZEL_EXPECT_EQ(runFull(
+        "module M; "
+        "class Box<W> end Box; "
+        "extension Box<W> where W: class "
+        "  public method Inner(): int => 1; "
+        "  public method Outer(): int => this.Inner() + 1; "
+        "end; "
+        "class SomeClass end SomeClass; "
+        "class C "
+        "  public static method Main(): int "
+        "    using var b := new Box<SomeClass>(); "
+        "    return b.Outer(); "
+        "  end Main; "
+        "end C;"),
+        2);
+}
+
+// fix #4292 coverage row C: a self-call made from INSIDE a lambda that
+// captures `this` (`lambda(): int => this.Test(x)`), not directly from the
+// enclosing method body — a different AST shape for the same `this`-rooted
+// MemberAccessExpr the #4238 synthesis handles.
+BEZEL_TEST(generic_extension_773, self_call_inside_captured_lambda_4292) {
+    BEZEL_EXPECT_EQ(runFull(
+        "module M; "
+        "class Box<U> end Box; "
+        "extension Box<W> "
+        "  public method Test(x: int): int => x + 1; "
+        "  public method Caller(x: int): int "
+        "    var f := lambda(): int => this.Test(x); "
+        "    return f(); "
+        "  end Caller; "
+        "end; "
+        "class C "
+        "  public static method Main(): int "
+        "    using var b := new Box<int>(); "
+        "    return b.Caller(7); "
+        "  end Main; "
+        "end C;"),
+        8);
+}
+
+// fix #4292 coverage row D: a self-call to a COMPUTED PROPERTY (`Echo` reads
+// `this.Value`, itself a computed property reading `this._v`), not a
+// method — exercises the same synthesized-receiver fallback in
+// `resolveMemberAccess` for a PropertySymbol lookup rather than a
+// MethodSymbol one.
+BEZEL_TEST(generic_extension_773, self_call_to_computed_property_4292) {
+    BEZEL_EXPECT_EQ(runFull(
+        "module M; "
+        "class Box<U> "
+        "  public _v: U; "
+        "  public constructor(v: U) _v := v; end; "
+        "end Box; "
+        "extension Box<W> "
+        "  public property Value: W => this._v; "
+        "  public property Echo: W => this.Value; "
+        "end; "
+        "class C "
+        "  public static method Main(): int "
+        "    using var b := new Box<int>(199); "
+        "    return b.Echo; "
+        "  end Main; "
+        "end C;"),
+        199);
+}
+
+// fix #4292 (§26.4/§26.5, v0.298) — THE REGRESSION ROW: `Box<int>.Caller()`
+// (an UNCONSTRAINED sibling extension block) self-calls `this.OnlyForClass()`
+// declared in a DIFFERENT block carrying `where W: class`. `int` does not
+// satisfy `class`, so this must be a compile error — and the IDENTICAL call
+// made externally (`b.OnlyForClass()`, `external_call_...` in this file's
+// earlier tests family) already is one. Pre-#4292-fix (`c5c7237`) this
+// compiled and RAN, returning 5 — the traced soundness hole. Asserts the
+// diagnostic TEXT, matched VERBATIM to the external call's own wording for
+// the identical rejection (measured on this tree: both read "no extension
+// method `OnlyForClass` on type `Box` takes 0 argument(s) (§26.5)"),
+// because `failedAtCompileTimeWithRealLocation` alone is true for a
+// compiler crash too (this run's own discipline).
+BEZEL_TEST(generic_extension_773, unsatisfied_constraint_self_call_rejected_4292) {
+    auto r = runAot(
+        "module M; "
+        "class Box<U> end Box; "
+        "extension Box<W> where W: class "
+        "  public method OnlyForClass(): int => 5; "
+        "end; "
+        "extension Box<W> "
+        "  public method Caller(): int => this.OnlyForClass(); "
+        "end; "
+        "class C "
+        "  public static method Main(): int "
+        "    using var b := new Box<int>(); "
+        "    return b.Caller(); "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(bezel::test::failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(
+        r, "no extension method `OnlyForClass` on type `Box` takes 0 "
+           "argument(s)"));
+}
+
+// fix #4292 ACCEPT-SIDE CONTROL: the satisfied-constraint counterpart of the
+// row above — `Caller`'s OWN block independently declares the SAME
+// `where W: class` constraint on its own free var, so every legal
+// instantiation of `Caller` is guaranteed (by `Caller`'s own declaration) to
+// satisfy `OnlyForClass`'s clause too. Must keep resolving and running after
+// #4292's applicability re-check — this is the "must not over-reject" shape
+// the fix's own soundness argument depends on, not merely a nice-to-have.
+BEZEL_TEST(generic_extension_773, satisfied_constraint_self_call_keeps_working_4292) {
+    BEZEL_EXPECT_EQ(runFull(
+        "module M; "
+        "class Box<U> end Box; "
+        "extension Box<W> where W: class "
+        "  public method OnlyForClass(): int => 5; "
+        "end; "
+        "extension Box<W> where W: class "
+        "  public method Caller(): int => this.OnlyForClass(); "
+        "end; "
+        "class SomeClass end SomeClass; "
+        "class C "
+        "  public static method Main(): int "
+        "    using var b := new Box<SomeClass>(); "
+        "    return b.Caller(); "
+        "  end Main; "
+        "end C;"),
+        5);
+}

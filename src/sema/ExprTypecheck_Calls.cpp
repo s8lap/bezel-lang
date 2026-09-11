@@ -15881,6 +15881,132 @@ void ExprTC::declineUnsupportedImportedPropertyAccess(PropertySymbol* ips,
     }
 }
 
+namespace {
+// fix #4292 (§26.4/§26.5, v0.298): find the `ast::ExtensionDecl` that
+// declares member symbol `m`, scanning the SAME candidate set
+// `ExprTC::lookupExtensionMember` itself scans (this module's own extension
+// blocks plus the imported ones) — an ownership lookup only, not a
+// re-derivation of any applicability decision, so it cannot drift from what
+// `lookupExtensionMember` actually resolved.
+const ast::ExtensionDecl* owningExtensionDeclOf(
+    SemaContext& ctx,
+    const std::vector<ExtensionSymbol*>& importedExtensions,
+    Symbol* m) {
+    if (!m) return nullptr;
+    auto scan = [&](ExtensionSymbol* e) -> const ast::ExtensionDecl* {
+        for (Symbol* cand : e->members)
+            if (cand == m)
+                return dynamic_cast<const ast::ExtensionDecl*>(e->decl);
+        return nullptr;
+    };
+    if (ctx.module()) {
+        for (Symbol* child : ctx.module()->children) {
+            if (auto* e = dynamic_cast<ExtensionSymbol*>(child)) {
+                if (const auto* d = scan(e)) return d;
+            }
+        }
+    }
+    for (ExtensionSymbol* e : importedExtensions) {
+        if (const auto* d = scan(e)) return d;
+    }
+    return nullptr;
+}
+
+// fix #4292 (§26.4/§26.5, v0.298): #4238's self-call receiver synthesis (see
+// the `this`/`currentExtension_` branch inside `ExprTC::resolveMemberAccess`
+// below) feeds `lookupExtensionMember` a receiver whose generic argument is
+// `currentExtension_`'s OWN declared free type variable, still UNRESOLVED
+// (`declaration == nullptr`, no generic args — the same shape #4229
+// catalogues elsewhere). That is the only path that can hand
+// `lookupExtensionMember` a non-ground receiver: an external `b.Method()`
+// call, or a self-call whose target type is non-generic, always supplies a
+// receiver with a real `declaration`.
+// `extWhereClauseProvablyViolated` (ExprTypecheck.cpp §26.4, `fix #3336`)
+// necessarily reads such a free var as `GroundCat::Unknown` via
+// `groundCategorize`, and its own documented "defer on undecidable => keep
+// the candidate" direction then admits a sibling `where`-constrained
+// block's member even when the constraint is unsatisfied for the receiver's
+// real (but, at self-call body-check time, generically UNDETERMINED)
+// instantiation — #4292's traced soundness hole (`Box<int>.Caller()` ->
+// `this.OnlyForClass()`, sibling block `where W: class`, compiled and ran
+// on `int`, while the identical EXTERNAL call was correctly rejected).
+//
+// `currentExtension_`'s own body is typechecked exactly ONCE, generically
+// over its own free var(s), independent of any call site — there is no
+// single "the concrete instantiation" to recover here; the body must be
+// well-typed for EVERY legal instantiation `currentExtension_`'s own
+// `where` clause admits. So the only SOUND basis for admitting `foundDecl`'s
+// member is that `currentExtension_`'s OWN `where` clause, for the free var
+// `lookupExtensionMember`'s binding bound to `foundDecl`'s free var, ALREADY
+// contains every constraint item `foundDecl` requires — i.e. every legal
+// instantiation of `currentExtension_` is guaranteed, by
+// `currentExtension_`'s own declaration, to also satisfy `foundDecl`'s
+// clause. A same-block self-call (`foundDecl == callerDecl`) trivially
+// passes (a block's constraints are, tautologically, contained in
+// themselves), matching #4238's "already worked" control. Anything this
+// function cannot positively match is treated as UNSATISFIED (reject),
+// never as satisfied — the same "provable violation only, never a false
+// exemption" discipline `extConstraintItemProvablyViolated` documents for
+// the ground case.
+bool selfCallSiblingWhereSatisfiedByCaller(
+    SemaContext& ctx,
+    const ast::ExtensionDecl& callerDecl,
+    const ast::ExtensionDecl& foundDecl,
+    const std::vector<std::pair<std::string, TypeRef*>>& binding) {
+    for (const auto& gc : foundDecl.genericConstraints) {
+        // §14.4 modifier form (`where T is owned`), removed at v0.97 —
+        // mirrors extWhereClauseProvablyViolated's own "treat
+        // conservatively" skip (populators already filter this out;
+        // defensive here too).
+        if (!gc.modifierConstraint.empty()) continue;
+        TypeRef* arg = nullptr;
+        for (const auto& kv : binding) {
+            if (kv.first == gc.typeParam) { arg = kv.second; break; }
+        }
+        if (!arg) continue;  // unbound at this call site -- nothing to verify
+        // Only an UNRESOLVED free variable (declaration == nullptr, no
+        // generic args -- the exact shape `lookupExtensionMember`'s own
+        // `scanFreeVars` uses to recognise a free type variable) is the
+        // #4238-synthesis case this function exists for. A GROUND arg here
+        // means the receiver was concrete after all -- trust the
+        // ground-based filter that already ran inside `lookupExtensionMember`.
+        if (arg->kind != TypeRef::Kind::Named || arg->declaration ||
+            !arg->genericArgs.empty())
+            continue;
+        std::string_view argName = arg->headName();
+        if (argName.empty()) return false;  // can't identify -- reject
+        const ast::GenericConstraint* callerGc = nullptr;
+        for (const auto& cgc : callerDecl.genericConstraints) {
+            if (cgc.typeParam == argName) { callerGc = &cgc; break; }
+        }
+        if (!callerGc) return false;  // caller declares no matching constraint
+        for (const auto& item : gc.items) {
+            bool matched = false;
+            for (const auto& citem : callerGc->items) {
+                if (citem.kind != item.kind) continue;
+                if (item.kind == "type") {
+                    TypeRef* want =
+                        item.typeArg ? ctx.resolvedType(*item.typeArg) : nullptr;
+                    TypeRef* have =
+                        citem.typeArg ? ctx.resolvedType(*citem.typeArg) : nullptr;
+                    if (want && have && want->kind == TypeRef::Kind::Named &&
+                        have->kind == TypeRef::Kind::Named && want->declaration &&
+                        want->declaration == have->declaration) {
+                        matched = true;
+                        break;
+                    }
+                    continue;
+                }
+                matched = true;
+                break;
+            }
+            if (!matched) return false;
+        }
+    }
+    return true;
+}
+}  // namespace
+
 void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
     // per §24.3: the event visibility fence. When the access target resolves
     // to an event member, the producer-side operations (`Raise`, `RaiseAsync`,
@@ -20778,6 +20904,14 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
     if (!member && ma.target) {
         const TypeRef* recvTy = ctx_.exprType(*ma.target);
         TypeRef synth;
+        // fix #4292 (§26.4/§26.5, v0.298): true only when the #4238 self-call
+        // synthesis below actually fires — scopes the extra applicability
+        // re-check after the lookup to exactly the shape that can hand
+        // `lookupExtensionMember` a non-ground (unresolved-free-var)
+        // receiver. The external-call path (recvTy already set from
+        // ctx_.exprType, or a non-generic target's real declaration) never
+        // sets this, so it is provably unaffected by the re-check below.
+        bool selfCallExtSynth = false;
         if (!recvTy) {
             // fix #4238 (§26.4/§26.5, v0.298): a `this.Method(...)` self-call
             // to a SIBLING member of the SAME generic extension block must
@@ -20816,8 +20950,10 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 if (tid->name == "this" && currentExtension_) {
                     if (auto* ed = dynamic_cast<const ast::ExtensionDecl*>(
                             currentExtension_->decl)) {
-                        if (ed->targetType)
+                        if (ed->targetType) {
                             recvTy = ctx_.resolvedType(*ed->targetType);
+                            selfCallExtSynth = recvTy != nullptr;
+                        }
                     }
                 }
             }
@@ -20836,10 +20972,36 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
         if (Symbol* ext = lookupExtensionMember(
                 recvTy, ma.member, &binding, extLoc,
                 /*reportAmbiguity=*/true, currentCallArity_)) {
-            if (!binding.empty())
-                ctx_.setExprExtBinding(&ma, std::move(binding));
-            resolveExtensionMember(ma, ext);
-            return;
+            // fix #4292 (§26.4/§26.5, v0.298): re-verify a #4238 self-call
+            // synthesis result against the ORIGIN extension block's own
+            // where-clause before trusting it — see
+            // `selfCallSiblingWhereSatisfiedByCaller`'s header comment
+            // above for why `lookupExtensionMember`'s ground-only filter
+            // cannot decide this by itself. Unaffected: the external-call
+            // path (`selfCallExtSynth == false`) always takes the `admit`
+            // path unchanged.
+            bool admit = true;
+            if (selfCallExtSynth && currentExtension_) {
+                if (auto* callerDecl = dynamic_cast<const ast::ExtensionDecl*>(
+                        currentExtension_->decl)) {
+                    if (auto* foundDecl = owningExtensionDeclOf(
+                            ctx_, importedExtensions_, ext)) {
+                        admit = selfCallSiblingWhereSatisfiedByCaller(
+                            ctx_, *callerDecl, *foundDecl, binding);
+                    }
+                }
+            }
+            if (admit) {
+                if (!binding.empty())
+                    ctx_.setExprExtBinding(&ma, std::move(binding));
+                resolveExtensionMember(ma, ext);
+                return;
+            }
+            // else: fall through to the rest of resolveMemberAccess, which
+            // reports "no such member" exactly as if lookupExtensionMember
+            // had found nothing — matching the identical EXTERNAL call's
+            // rejection of the same unsatisfied-constraint instantiation
+            // (#4292's Control A).
         }
     }
     // fix #3342 (§26.5 rule 1 / stdlib §4.4, v0.278): for receivers whose
