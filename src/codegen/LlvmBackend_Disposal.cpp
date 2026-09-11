@@ -1623,6 +1623,118 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
         }
     }
 
+    // fix #4253 (§9.7 / §28.9, v0.298): release every RECORD-typed field /
+    // auto-property of THIS class whose declared type owns at least one
+    // `string` field (isRecordWithStringFieldsTypeRef — recurses through
+    // nested records/choices, same authority the LOCAL scope-end release
+    // uses) and whose OWN declaration initializer is provably a fresh,
+    // alias-free construction of exactly that record type
+    // (isFreshRecordConstructionOfExactType — the SAME eligibility proof
+    // #2448/#4237 established for a plain `var` record local; reused
+    // verbatim, not re-derived, per LANE_RULES §6/§25).
+    //
+    // BEFORE THIS FIX there was NO release path for this shape AT ALL:
+    // emitOwnedFieldDisposals (this function) only ever walks `owned`-
+    // annotated fields (reference types) — a record can never carry
+    // `owned` (§9.7 forbids it; records are value types embedded inline)
+    // — so a class field like `public readonly property P: Box := new
+    // Box("s");` (`record Box(Value: string);`) leaked its string
+    // unconditionally, at ONE level of nesting, no generics, no cycle
+    // (issue #4253 — measured 11290 B / 600 allocations at 300 loop
+    // iterations, identical in magnitude to #4237's own local-variable
+    // figures for the analogous shape). Own members only (mirrors the
+    // string/closure/box walks above): an inherited slot is released by
+    // the base CORE disposer via emitBaseDisposeChain.
+    //
+    // DIRECTION / SAFETY: this walk only ever ADDS a release where none
+    // existed (a safe-direction leak becomes balanced). It can turn that
+    // leak into a double-free / UAF only if the field's value at Dispose
+    // time could differ from what the admitted initializer constructed,
+    // or could alias another live binding. Three conditions below close
+    // every reassignment vector found while investigating this issue —
+    // each verified against the REAL compiler, not assumed:
+    //   1. `readonly` — MEASURED: an ordinary (non-constructor) method
+    //      assigning `this.P := ...` to a readonly property is REJECTED
+    //      ("cannot assign to readonly property `P` outside a field
+    //      initializer or constructor (\xC2\xA7 23.1)"). Closes the
+    //      arbitrary-method-reassignment vector.
+    //   2. `!hasAnyConstructor(ts)` — no EXPLICIT constructor exists on
+    //      THIS type, so there is no user-written constructor BODY that
+    //      could reassign the field after its own declaration initializer
+    //      runs. Worth recording because it is NOT redundant with (1):
+    //      MEASURED that a readonly property WITH a declaration
+    //      initializer can currently ALSO be reassigned a second time
+    //      inside an explicit constructor body with NO diagnostic at
+    //      all — sema does not yet enforce §22.8's "at most once,
+    //      counting the field initializer and every constructor body in
+    //      the this(...) chain together" rule when an initializer is
+    //      already present (filed as issue #4275 — a sema gap, out of
+    //      scope for this codegen fix). This condition is the guard
+    //      against it: no constructor body exists to exploit the gap.
+    //   3. `sealed` on `ts` — MEASURED: a DERIVED class's constructor can
+    //      currently reassign a readonly property INHERITED from its
+    //      base with NO diagnostic (a second, broader sema gap than #2 —
+    //      filed as issue #4276). `hasAnyConstructor` only inspects
+    //      `ts`'s OWN members, so it cannot see a subclass's
+    //      constructor; requiring `ts` to be `sealed` closes the vector
+    //      structurally — no subclass can exist to hold such a
+    //      constructor, in this module or any importer.
+    // Together: the field is assigned EXACTLY ONCE, by its own
+    // declaration initializer, for the entire lifetime of every
+    // instance — no other write site exists (own methods barred by (1),
+    // an own constructor body doesn't exist by (2), a derived-class
+    // constructor cannot exist by (3)). The initializer's own
+    // eligibility proof (isFreshRecordConstructionOfExactType) is what
+    // makes that ONE assignment's value provably alias-free.
+    //
+    // A field lacking any of these three properties, or whose
+    // initializer is not a provably-fresh NewExpr of the declared type,
+    // is UNCHANGED — still safe-leaks exactly as before this fix
+    // (deliberately narrow, matching #2866/#4237's own local-binding
+    // admission). The residual — constructor-body-assigned fields,
+    // non-sealed classes — is filed as issue #4277.
+    {
+        llvm::StructType* rst = classStruct(ts);
+        bool tsSealed = false;
+        for (auto tmod : ts->modifiers)
+            if (tmod == "sealed") { tsSealed = true; break; }
+        bool tsHasCtor = hasAnyConstructor(ts);
+        for (const sema::Symbol* m : ts->members) {
+            bool isField = dynamic_cast<const sema::FieldSymbol*>(m) != nullptr;
+            if (!isField && !sema::isAutoPropertyStorageSymbol(m, ctx_))
+                continue;  // fix #3152 — see the string walk above
+            auto idxIt = fieldIndex_.find(m);
+            if (idxIt == fieldIndex_.end()) continue;
+            if (!tsSealed || tsHasCtor) continue;
+            const sema::TypeRef* fieldTr = recordMemberType(m);
+            if (!isRecordWithStringFieldsTypeRef(fieldTr)) continue;
+            bool isReadonly = false;
+            if (auto* ms = dynamic_cast<const sema::MemberSymbol*>(m))
+                for (auto fmod : ms->modifiers)
+                    if (fmod == "readonly") { isReadonly = true; break; }
+            if (!isReadonly) continue;
+            const ast::Expr* init = nullptr;
+            // SEAM-DEBT: #4279 `m->decl` is nullptr for an IMPORTED field
+            // (no ast::FieldDecl crosses the module boundary, the #3671
+            // seam) -- this reads as "no initializer", the deliberately
+            // conservative answer (the field keeps its pre-existing safe
+            // leak; the new release below simply never fires for it).
+            if (auto* fd = dynamic_cast<const ast::FieldDecl*>(m->decl))
+                init = fd->initializer.get();
+            // SEAM-DEBT: #4279 same imported-conservative rationale as the
+            // FieldDecl arm immediately above.
+            else if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(m->decl))
+                init = pd->autoInitializer.get();
+            if (!init) continue;
+            if (!isFreshRecordConstructionOfExactType(init,
+                                                       fieldTr->declaration))
+                continue;
+            llvm::Value* addr = builder_.CreateStructGEP(
+                rst, currentThis_, idxIt->second, "recf.addr");
+            emitRecordStringFieldReleases(addr, fieldTr);
+        }
+    }
+
     // #480 / §24.1 / §24.5 / §28 (#1176): free each instance event's backing
     // EventSource. emitInstanceInit allocated one bz_event_source_new per
     // instance EventSymbol (sync and async); those allocations are NOT visited
