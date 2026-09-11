@@ -5397,30 +5397,78 @@ void ExprTC::checkReadonlyAssignment(const ast::AssignmentStmt& as) {
     // spellings of the same store disagreed). `currentType_ == fs->parent`
     // makes the explicit spelling consult the SAME fact the bare spelling
     // already does, rather than duplicating a second, narrower one.
+    // fix #4290 (§17.6/§22.8, v0.298): the carve-out and readonly-modifier
+    // check below are extracted into `checkReadonlyFieldWriteTarget` — the
+    // same shared-authority shape #2868 already used for
+    // `checkPropertyWriteTarget` — so the IncrementStmt arm can run the
+    // SAME check instead of the gap it had. `_f++`/`_f--` on a plain
+    // readonly field resolves a FieldSymbol, not a PropertySymbol, and
+    // `checkPropertyWriteTarget` early-returns for that (`if (!ps)
+    // return;`), so before this fix NO readonly check ran for `++`/`--` on
+    // a plain field: a second assignment through the increment spelling
+    // compiled clean and mutated the field at runtime, while the identical
+    // `:=` and `+=` spellings of the same store were already rejected here.
+    // Passing `nullptr` for `incOp` keeps this call's diagnostic
+    // byte-identical to the pre-extraction message.
+    checkReadonlyFieldWriteTarget(*as.target, as.span.begin, /*incOp=*/nullptr);
+}
+
+// §17.6/§22.8 (v0.298, #4290): the shared readonly-FIELD write-target
+// check — the construction-window carve-out (§22.8/§23.1's v0.270
+// per-instance narrowing, #3299/#3316/#4276) plus the `readonly` modifier
+// rejection. Extracted out of `checkReadonlyAssignment` (see its header
+// comment above for the fuller history of the carve-out's shape) so that
+// BOTH statement forms that write through grammar A.6's `LValue` —
+// AssignmentStmt (`x := e`, `x op= e`, via `checkReadonlyAssignment`) and
+// IncrementStmt (`x++`/`x--`) — consult ONE implementation, exactly the
+// #2868 shape already used for `checkPropertyWriteTarget`. Does NOT
+// handle a positional record's auto-generated property (structurally
+// read-only, no `readonly` modifier of its own — see the comment at the
+// `fs->posParam && Record` branch in `checkReadonlyAssignment`); each
+// statement form keeps its own dedicated diagnostic for that case
+// (`checkReadonlyAssignment`'s early branch above; the IncrementStmt
+// arm's own `fs->posParam && Record` branch), so this helper returns
+// early for it rather than risk a redundant second report.
+//
+// `incOp` is null for an assignment target and the operator token
+// ("++"/"--") for an increment target — the same convention
+// `checkPropertyWriteTarget` uses — and selects the diagnostic's verb and
+// adds the §17.6 citation; with `incOp == nullptr` the message is
+// byte-identical to what `checkReadonlyAssignment` reported inline before
+// this extraction.
+void ExprTC::checkReadonlyFieldWriteTarget(const ast::Expr& target,
+                                            const SourceLocation& loc,
+                                            const char* incOp) {
+    auto* fs = dynamic_cast<FieldSymbol*>(ctx_.exprSymbol(target));
+    if (!fs) return;
+    if (fs->posParam && fs->parent &&
+        fs->parent->kind == ast::TypeDeclKind::Record) {
+        return;
+    }
     if (inConstructor_) {
         bool isStatic = false;
         for (auto mod : fs->modifiers)
             if (mod == "static") { isStatic = true; break; }
         if (isStatic ||
-            (currentType_ == fs->parent && isThisRootedLValueTarget(*as.target)))
+            (currentType_ == fs->parent && isThisRootedLValueTarget(target)))
             return;
     }
     // §22.8 (#747 R42): a readonly field may be assigned only in a field
-    // initializer or a constructor body; assignment anywhere else is a compile
-    // error. Resolve the target's field symbol directly so EVERY receiver shape
-    // is covered — `this.f`, `c.f`, `Type.f`, and a bare `f`. The previous check
-    // matched only `this.f`, so an instance- or type-qualified readonly write
-    // (e.g. `Config.MaxSize := 50` in a normal method) slipped through and was
-    // silently dropped at runtime.
-    // Check the readonly modifier on the field's MemberSymbol.
+    // initializer or a constructor body; assignment/increment anywhere
+    // else is a compile error. Resolve the target's field symbol directly
+    // so EVERY receiver shape is covered — `this.f`, `c.f`, `Type.f`, and
+    // a bare `f`.
     for (auto mod : fs->modifiers) {
         if (mod == "readonly") {
+            const std::string verb =
+                incOp ? "increment/decrement " : "assign to ";
+            const std::string cite = incOp ? "§17.6 / " : "";
             ctx_.diagnostics().report(
-                Severity::Error, as.span.begin,
-                std::string("cannot assign to readonly field `") +
+                Severity::Error, loc,
+                "cannot " + verb + "readonly field `" +
                 std::string(fs->name) +
-                "` outside the declaring class's constructor "
-                "(§22.8)");
+                "` outside the declaring class's constructor (" + cite +
+                "§22.8)");
             return;
         }
     }
@@ -17286,6 +17334,28 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         // can never both fire).
         if (is->target)
             checkPropertyWriteTarget(
+                *is->target, is->target->span.begin,
+                /*incOp=*/(is->op == "--" ? "--" : "++"));
+        // fix #4290 (§17.6/§22.8, v0.298): the FIELD sibling of the
+        // `checkPropertyWriteTarget` call directly above — that call's
+        // `dynamic_cast<PropertySymbol*>` fails for a plain
+        // `FieldSymbol` target and it early-returns
+        // (`if (!ps) return;`), so a readonly ORDINARY field's `++`/`--`
+        // reached NO readonly check at all before this: it compiled
+        // clean and mutated the field at runtime, while the identical
+        // `:=`/`+=` stores were already rejected by
+        // `checkReadonlyAssignment` on the AssignmentStmt arm. Calls the
+        // SAME shared helper that arm now uses
+        // (`checkReadonlyFieldWriteTarget`, extracted from it) rather
+        // than a third hand-written copy of the carve-out rules — the
+        // #2868 lesson repeated for fields instead of properties. The
+        // `is->op` argument selects the increment wording and adds the
+        // §17.6 citation; the #2309 positional-record branch above keeps
+        // its own distinct diagnostic (a positional field carries no
+        // `readonly` modifier of its own, so this helper is a no-op for
+        // it — see its own comment — and the two can never both fire).
+        if (is->target)
+            checkReadonlyFieldWriteTarget(
                 *is->target, is->target->span.begin,
                 /*incOp=*/(is->op == "--" ? "--" : "++"));
         // §17.6 (v0.236, #2585 / #2599): the increment/decrement operators

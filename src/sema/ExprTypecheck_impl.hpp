@@ -1682,6 +1682,18 @@ private:
     // tracking that we don't have yet (and rarely matters in practice).
     void checkReadonlyAssignment(const ast::AssignmentStmt& as);
 
+    // §17.6/§22.8 (v0.298, #4290): the shared readonly-FIELD write-target
+    // check (construction-window carve-out + `readonly` modifier
+    // rejection), factored out of `checkReadonlyAssignment` so BOTH
+    // AssignmentStmt and IncrementStmt consult ONE implementation instead
+    // of IncrementStmt having none at all — the same #2868 shape already
+    // used for `checkPropertyWriteTarget`. `incOp` is null for an
+    // assignment target and the operator token ("++"/"--") for an
+    // increment target.
+    void checkReadonlyFieldWriteTarget(const ast::Expr& target,
+                                        const SourceLocation& loc,
+                                        const char* incOp);
+
     // §6.6 / A.6 (v0.184, #1690): reject an assignment/increment `target`
     // whose lvalue chain bases on a method-call result — grammar A.6
     // restricts an LValue's base to `Identifier | "this"`, and §6.6 states
