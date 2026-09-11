@@ -3242,36 +3242,70 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
             auto* tt = ctx_.exprType(*ma->target);
             if (tt && tt->kind == sema::TypeRef::Kind::Primitive &&
                 tt->primitive == sema::PrimitiveType::String) {
-                llvm::Value* strPtr = lowerExpr(*ma->target);
-                if (!strPtr) return nullptr;
-                if (ma->member == "Length") {
-                    // stdlib §9.6: Length: int — number of char code points.
-                    llvm::Value* len64 = loadStringLen(strPtr);
-                    // #429 (OPERATOR-OPERAND category) / §4.6 / §28.9: if the
-                    // receiver is a +1 string producer (concat, interpolation,
-                    // primitive-ToString, user-method-return, range-slice), it has
-                    // no named-local owner and no scope-end release — release it
-                    // here, AFTER loading the length, so the string lives long
-                    // enough for the length-field read.  bz_string_release on a
-                    // sentinel is a no-op (safe for literal receivers).
-                    if (isPlusOneStringProducer(ma->target.get()))
-                        emitStringRelease(strPtr);
-                    return builder_.CreateTrunc(len64, i32(), "str.len.i32");
+                // fix #4243 (§26.1/§4.6, v0.298): `Length`/`IsAscii` are the
+                // ONLY two true string intrinsics reachable through a bare
+                // (no-parens) MemberAccessExpr — every other string METHOD
+                // (Trim, Substring, ...) is called with parens and goes
+                // through lowerCall instead, never this arm. The comment
+                // below this block ("Other string members deferred — sema
+                // would have flagged any unknown member already") predates
+                // fix #702 (ExprTypecheck_Calls.cpp, "before reporting 'not
+                // yet supported', try a user-defined extension method on
+                // string"): sema's CG27a twin now ALSO accepts a bare
+                // access whose name resolves to a user `extension string`
+                // COMPUTED PROPERTY (§26.1's own worked `IsBlank` example),
+                // via the identical no-parens syntax. Unconditionally
+                // intercepting every non-Length/IsAscii name here — as the
+                // old code did — swallowed that access before it ever
+                // reached the generic computed/block-getter dispatch
+                // (CG33b, further down this function) that every OTHER
+                // extension-property receiver (int/bool/record/class) already
+                // goes through, returning a bare `nullptr` that degraded the
+                // whole read to the #2491 zero/null backstop with only a
+                // Warning — silently wrong, not rejected. Gate the intercept
+                // to the two real intrinsics; anything else that is a real
+                // extension property (computedGetterOf/blockGetterOf resolve
+                // it — the same predicate the existing degenerate-receiver
+                // `Length` fallback arm a few lines below already checks)
+                // falls through this whole `if` unevaluated, so CG33b lowers
+                // it exactly like any other receiver kind. `ma->target` is
+                // deliberately NOT lowered on that path here — CG33b lowers
+                // it itself, and lowering it twice would double any receiver
+                // side effect / +1 string-producer refcount.
+                if (ma->member != "Length" && ma->member != "IsAscii") {
+                    if (!computedGetterOf(ctx_.exprSymbol(e)) &&
+                        !blockGetterOf(ctx_.exprSymbol(e)))
+                        return nullptr;
+                    // fall through — handled by CG33b below.
+                } else {
+                    llvm::Value* strPtr = lowerExpr(*ma->target);
+                    if (!strPtr) return nullptr;
+                    if (ma->member == "Length") {
+                        // stdlib §9.6: Length: int — number of char code points.
+                        llvm::Value* len64 = loadStringLen(strPtr);
+                        // #429 (OPERATOR-OPERAND category) / §4.6 / §28.9: if the
+                        // receiver is a +1 string producer (concat, interpolation,
+                        // primitive-ToString, user-method-return, range-slice), it has
+                        // no named-local owner and no scope-end release — release it
+                        // here, AFTER loading the length, so the string lives long
+                        // enough for the length-field read.  bz_string_release on a
+                        // sentinel is a no-op (safe for literal receivers).
+                        if (isPlusOneStringProducer(ma->target.get()))
+                            emitStringRelease(strPtr);
+                        return builder_.CreateTrunc(len64, i32(), "str.len.i32");
+                    }
+                    // stdlib §9.6 (#741): IsAscii — true iff every code point < 128.
+                    // No codegen case existed, so the read returned an uninitialized
+                    // i1 slot (always false). Scan via bz_string_is_ascii.
+                    if (ma->member == "IsAscii") {
+                        auto* fn = declareC("bz_string_is_ascii", i32(), {ptrTy()});
+                        llvm::Value* r = builder_.CreateCall(fn, {strPtr}, "str.ascii");
+                        if (isPlusOneStringProducer(ma->target.get()))
+                            emitStringRelease(strPtr);
+                        return builder_.CreateICmpNE(r, builder_.getInt32(0),
+                                                     "str.isascii");
+                    }
                 }
-                // stdlib §9.6 (#741): IsAscii — true iff every code point < 128.
-                // No codegen case existed, so the read returned an uninitialized
-                // i1 slot (always false). Scan via bz_string_is_ascii.
-                if (ma->member == "IsAscii") {
-                    auto* fn = declareC("bz_string_is_ascii", i32(), {ptrTy()});
-                    llvm::Value* r = builder_.CreateCall(fn, {strPtr}, "str.ascii");
-                    if (isPlusOneStringProducer(ma->target.get()))
-                        emitStringRelease(strPtr);
-                    return builder_.CreateICmpNE(r, builder_.getInt32(0),
-                                                 "str.isascii");
-                }
-                // Other string members deferred — sema would have flagged
-                // any unknown member already.
-                return nullptr;
             }
             // FIX #2933: positive list. Return true ONLY when the receiver
             // gives us NO information to rule a `%bz.string` layout out
