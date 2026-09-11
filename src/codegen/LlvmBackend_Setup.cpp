@@ -28192,7 +28192,8 @@ void Emitter::collectRecordCallResultReleaseEligible(
 // See isProvablyFreshRecordFactoryMethod below for how this is applied
 // across a whole callee body.
 bool Emitter::isFreshRecordConstructionOfExactType(
-        const ast::Expr* expr, const sema::TypeSymbol* recTs) const {
+        const ast::Expr* expr, const sema::TypeSymbol* recTs,
+        const sema::MethodSymbol* enclosingFactory) const {
     if (!expr || !recTs || recTs->kind != ast::TypeDeclKind::Record)
         return false;
     auto* ne = dynamic_cast<const ast::NewExpr*>(expr);
@@ -28216,6 +28217,32 @@ bool Emitter::isFreshRecordConstructionOfExactType(
         sema::recordPositionalFieldSymbols(recTs);
     if (posFields.empty()) return false;
     if (ne->args.size() != posFields.size()) return false;
+    // fix #4295 (§9.7/§28.9, v0.298): pre-count how many times each of
+    // `enclosingFactory`'s OWN parameters is read (as a bare identifier)
+    // among THIS construction's own positional arguments. A parameter
+    // occurring MORE than once (`new P(s, s)`) is excluded for EVERY
+    // occurrence: embedding the same pointer into two fields would each be
+    // independently released by the record's own scope-end
+    // recordStringFields disposal walk — a double-free the single-embed
+    // soundness argument below (see the STRING arm) does not cover.
+    // Scanning the WHOLE argument list, not just string-typed positions, is
+    // still correct: a given ParameterSymbol has one declared type, so it
+    // can only be passed to a field whose type matches it (a string
+    // parameter can only ever bind a string-typed field).
+    std::unordered_map<const sema::ParameterSymbol*, int> factoryParamArgCounts;
+    if (enclosingFactory) {
+        for (const auto& a : ne->args) {
+            if (!a.value) continue;
+            auto* id = dynamic_cast<const ast::IdentifierExpr*>(a.value.get());
+            if (!id) continue;
+            auto* ps = dynamic_cast<sema::ParameterSymbol*>(ctx_.exprSymbol(*id));
+            if (!ps) continue;
+            bool isOwnParam = false;
+            for (const sema::Symbol* p : enclosingFactory->params)
+                if (p == ps) { isOwnParam = true; break; }
+            if (isOwnParam) ++factoryParamArgCounts[ps];
+        }
+    }
     for (std::size_t i = 0; i < ne->args.size(); ++i) {
         const ast::CallArgument& arg = ne->args[i];
         if (!arg.name.empty() || !arg.modifier.empty() || arg.isDiscard ||
@@ -28280,7 +28307,48 @@ bool Emitter::isFreshRecordConstructionOfExactType(
             const ast::Expr* a = arg.value.get();
             bool isLiteral = dynamic_cast<const ast::StringLiteralExpr*>(a) ||
                              dynamic_cast<const ast::VerbatimStringExpr*>(a);
-            if (!isLiteral && !isPlusOneStringProducer(a)) return false;
+            if (!isLiteral && !isPlusOneStringProducer(a)) {
+                // fix #4295 (§9.7/§28.9, v0.298): admit a bare read-once
+                // passthrough of `enclosingFactory`'s OWN plain (unmarked)
+                // parameter — `Wrap(s: string): P return new P(s); end
+                // Wrap;`. Read the record-construction fast path
+                // (LlvmBackend_Exprs2.cpp, the positional-field store loop
+                // ~9899) before trusting this: it stores the lowered
+                // argument value with a bare `CreateStore`, no
+                // `emitStringRetain` — `new P(s)` therefore ALIASES `s`'s
+                // heap string, it does not copy it. Admitting that alias as
+                // "provably fresh" is sound ONLY because the CALLER-side
+                // suppression is ALREADY shipped and is call-wide, not
+                // context-specific: `calleeReturnMayAliasArgUnretained`
+                // (walkCallArgs, ~line 23561) marks EVERY call whose callee
+                // returns a Record/Choice as "may alias an arg unretained",
+                // which withholds ALL of that call's own argument-locals
+                // from their own scope-end release — so the single +1 the
+                // original producer minted is never independently released
+                // at the call site that PASSES `s` into `Wrap`. This
+                // construction site then becomes the SOLE place that claims
+                // it (via the caller-of-Wrap's record-local scope-end
+                // recordStringFields release, isProvablyFreshRecordFactory
+                // Method's own caller) — exactly one release for exactly
+                // one +1. The `factoryParamArgCounts[ps] == 1` guard rules
+                // out `new P(s, s)`, and `ps->modifier.empty()` restricts
+                // this to the plain-borrow parameter convention the alias
+                // argument above reasons about (an `owned`/`ref`/`out`
+                // parameter has a different ownership contract, out of
+                // scope here).
+                bool passthrough = false;
+                if (enclosingFactory) {
+                    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(a)) {
+                        auto* ps = dynamic_cast<sema::ParameterSymbol*>(
+                            ctx_.exprSymbol(*id));
+                        if (ps && ps->modifier.empty() &&
+                            factoryParamArgCounts[ps] == 1) {
+                            passthrough = true;
+                        }
+                    }
+                }
+                if (!passthrough) return false;
+            }
         }
     }
     return true;
@@ -28333,7 +28401,13 @@ bool Emitter::isProvablyFreshRecordFactoryMethod(
     const auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
     if (!md) return false;
     if (md->bodyKind == ast::MethodBodyKind::Expression) {
-        return isFreshRecordConstructionOfExactType(md->exprBody.get(), recTs);
+        // fix #4295: `ms` threaded through as the enclosing factory — see
+        // isFreshRecordConstructionOfExactType's header comment. Every
+        // OTHER caller of that predicate (the #4237 nested-record
+        // recursion inside it, the #2866/#4253 direct-NewExpr admissions,
+        // boxValueNeedsStringRetain) omits it and is unaffected.
+        return isFreshRecordConstructionOfExactType(md->exprBody.get(), recTs,
+                                                      ms);
     }
     if (md->bodyKind == ast::MethodBodyKind::Block) {
         // fix #3745 / §9.7 / §28.9 (v0.286): also admit the two-statement
@@ -28353,7 +28427,10 @@ bool Emitter::isProvablyFreshRecordFactoryMethod(
         if (md->stmts.size() == 1) {
             auto* rs = dynamic_cast<const ast::ReturnStmt*>(md->stmts[0].get());
             if (!rs) return false;
-            return isFreshRecordConstructionOfExactType(rs->value.get(), recTs);
+            // fix #4295: `ms` threaded through — see the expression-bodied
+            // arm above.
+            return isFreshRecordConstructionOfExactType(rs->value.get(),
+                                                          recTs, ms);
         }
         if (md->stmts.size() == 2) {
             // fix #3591 (LOCALDECL-ONLY WALKER RATCHET): the prior shape
@@ -28381,7 +28458,9 @@ bool Emitter::isProvablyFreshRecordFactoryMethod(
             // for the const arm.
             if (view.isUsing) return false;
             // Initializer must be a provably-fresh construction of recTs.
-            if (!isFreshRecordConstructionOfExactType(view.init, recTs))
+            // fix #4295: `ms` threaded through — see the expression-bodied
+            // arm above.
+            if (!isFreshRecordConstructionOfExactType(view.init, recTs, ms))
                 return false;
             // Return value must be a bare-identifier read of THAT local —
             // not a field access, member call, indexer, or any other

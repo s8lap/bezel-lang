@@ -11235,8 +11235,23 @@ private:
     // fix #2448 / §9.7 / §28.9 (v0.235): is `expr` a provably fresh, alias-
     // free construction of EXACTLY record type `recTs`? See the definition
     // (LlvmBackend_Setup.cpp) for the full rationale.
+    //
+    // fix #4295 (§9.7 / §28.9, v0.298): `enclosingFactory`, defaulted to
+    // null, admits ONE additional STRING-field argument shape — a bare
+    // read of `enclosingFactory`'s OWN plain (unmarked) parameter, used
+    // EXACTLY once across the whole construction — when this call is
+    // reached from isProvablyFreshRecordFactoryMethod's callee-body walk
+    // (the only caller that passes it). Every OTHER call site (the #4237
+    // nested-record recursion immediately below, the #2866/#4253 direct
+    // NewExpr admissions, the boxValueNeedsStringRetain query) omits the
+    // argument and is UNCHANGED — see the definition for why widening is
+    // sound only paired with the caller-side calleeReturnMayAliasArg
+    // Unretained suppression (walkCallArgs), which is call-wide, not
+    // context-specific, so admitting it anywhere else would arm a release
+    // with no matching suppression.
     bool isFreshRecordConstructionOfExactType(
-        const ast::Expr* expr, const sema::TypeSymbol* recTs) const;
+        const ast::Expr* expr, const sema::TypeSymbol* recTs,
+        const sema::MethodSymbol* enclosingFactory = nullptr) const;
 
     // fix #2448 / §9.7 / §28.9 (v0.235): is MethodSymbol `ms` provably a
     // "fresh record factory" for record `recTs`? Consulted by

@@ -59,20 +59,31 @@
 // `recordCallResultReleaseEligible_` itself already requires two lines down.
 //
 // ── SCOPE — WHAT THIS FIX DOES NOT REACH (separate, deeper, PRE-EXISTING
-// gap; filed, not fixed here) ──────────────────────────────────────────
+// gap at the time this file was written; CLOSED by fix #4295, see below) ──
 //
 // `isFreshRecordConstructionOfExactType`'s `string`-field check requires
 // the field's constructor ARGUMENT be a literal or `isPlusOneStringProducer`
 // (a `+`/interpolation/etc.) — a BARE PARAMETER READ (`return new P(s);`
-// where `s` is the callee's OWN string parameter) is neither, so it is
-// REJECTED. This is a SEPARATE, pre-existing gap: it ALSO rejects the
+// where `s` is the callee's OWN string parameter) is neither, so it was
+// REJECTED. This was a SEPARATE, pre-existing gap: it ALSO rejected the
 // already-shipped `var p := Mk(s)` LocalDecl-with-init shape (measured
 // below, both module axes) — independent of this fix's declare-then-assign
 // scan, and independent of which module the factory lives in. #4266's own
-// filed repro happens to use exactly this bare-parameter shape, so this fix
-// does NOT make #4266's own program leak-clean — see
-// `bare_parameter_passthrough_control_still_leaks_separate_gap` below and
-// the commit body for the filed follow-up issue.
+// filed repro happened to use exactly this bare-parameter shape, so this
+// fix alone did NOT make #4266's own program leak-clean — filed as issue
+// 4295.
+//
+// `fix #4295` (record_factory_param_passthrough_admitted_4295_test.cpp)
+// closes that gap: `isProvablyFreshRecordFactoryMethod`'s callee-body walk
+// now admits a bare-identifier string-field argument that resolves to the
+// enclosing factory's OWN plain (unmarked) parameter, read EXACTLY ONCE.
+// The row immediately below (renamed from `..._still_leaks_separate_gap`
+// to `..._now_admitted_no_leak`) is updated to match, per LANE_RULES §7 (a
+// fix that reverses a prior rejection must update the test that pinned the
+// old behaviour in the same commit) — see #4295's own file for the full
+// soundness argument (why the alias-not-copy construction is safe to admit
+// only paired with the already-shipped `calleeReturnMayAliasArgUnretained`
+// caller-side suppression) and its dedicated FAIL-WITHOUT/PASS-WITH rows.
 //
 // MEASURED (isolated worktree, this tree — commit FIRST, then `git checkout
 // --` to strip the fix, rebuild `bezelc` explicitly per LANE_RULES §23,
@@ -87,12 +98,18 @@
 //     iters, two-step `bezelc -c` / `bezelc --import --sanitize=address`
 //     build): FAIL-WITHOUT is the IDENTICAL 20848 B / 998 allocations
 //     signature. PASS-WITH: exit 38, no ASan/LSan output.
-// So 2 of 2 leak rows fail without the fix and pass with it (named above).
-// The bare-parameter-passthrough control and the multi-assignment-site
-// safety control are NOT FAIL-WITHOUT rows — both are UNAFFECTED by this
-// fix by design (see each row's own comment) and are included to pin the
-// fix's boundary and its soundness restriction, not to re-measure the fix
-// itself.
+// So 2 of 2 leak rows fail without THIS fix and pass with it (named above).
+// The multi-assignment-site safety control is NOT a FAIL-WITHOUT row for
+// THIS fix — it is UNAFFECTED by this fix by design (see its own comment)
+// and is included to pin this fix's boundary, not to re-measure it.
+//
+// `bare_parameter_passthrough_control_now_admitted_no_leak` (renamed from
+// `..._still_leaks_separate_gap`) IS a FAIL-WITHOUT/PASS-WITH row, but for
+// `fix #4295`, not this fix — it was NOT affected by #4266's own change
+// (the declare-then-assign scan), only by #4295's later, separate
+// admission widening. See that row's own comment and
+// record_factory_param_passthrough_admitted_4295_test.cpp for #4295's
+// dedicated FAIL-WITHOUT/PASS-WITH measurement of this exact shape.
 //
 // See tests/README.md for the `runAot`/`runAotChecked` harness, and
 // imported_record_string_field_call_scope_end_release_3621_test.cpp for the
@@ -285,15 +302,26 @@ const std::string kLocalSrc4266 =
     "  end Main; "
     "end C4266; ";
 
-// BOUNDARY CONTROL — the bare-parameter-passthrough shape (#4266's own
-// filed repro, verbatim in structure): `Wrap(s: string): P return new
-// P(s); end Wrap;`. NOT admitted by `isFreshRecordConstructionOfExactType`
-// (a bare parameter read is neither a literal nor a `+1` producer) — a
-// separate, pre-existing gap this fix does not reach (see file header).
-// Still leaks post-fix; loop-amplified (500 iters) and measured with a
-// FLOOR (§30 — LeakSanitizer's conservative stack scan is nondeterministic,
-// never assert an exact byte count). Measured this tree, post-fix: 20390 B
-// / 1000 allocations.
+// FIX #4295 REGRESSION PIN (was: BOUNDARY CONTROL) — the bare-parameter-
+// passthrough shape (#4266's own filed repro, verbatim in structure):
+// `Wrap(s: string): P return new P(s); end Wrap;`, combined with THIS
+// file's own "declare, then assign" binding shape. At the time this file
+// was written, `isFreshRecordConstructionOfExactType` did not admit a bare
+// parameter read (neither a literal nor a `+1` producer) — a separate,
+// pre-existing gap this fix (#4266) did not reach (see file header), filed
+// as issue 4295 and CLOSED by `fix #4295`
+// (record_factory_param_passthrough_admitted_4295_test.cpp), which now
+// admits a bare read-once passthrough of the factory's own plain
+// parameter. Per LANE_RULES §7 (a fix that reverses a prior rejection must
+// update the test that pinned the old behaviour in the same commit), this
+// row is updated in #4295's commit from `leaksAtLeast(..., 15000)` to a
+// clean-run assertion. MEASURED, #4295's own worktree (`agent_check.sh
+// --probe --asan` against the identical program, src reverted to
+// pre-#4295): FAIL-WITHOUT is a real LeakSanitizer report, 20390 B / 1000
+// allocations (§30: the exact count is nondeterministic run to run — see
+// #4295's own dedicated test file for its own two independently-measured
+// rows, 20390 B/1000 and 20349 B/998, on the identical construction).
+// PASS-WITH: exit 50, no ASan/LSan output.
 const std::string kBareParamSrc4266 =
     "module BareParam4266; "
     "public record Str4266bp(V: string); "
@@ -403,17 +431,22 @@ BEZEL_TEST(record_declare_then_assign_call_result_release_4266,
     BEZEL_EXPECT_TRUE(rr.out.find("Indirect leak") == std::string::npos);
 }
 
-// ── BOUNDARY CONTROL — bare-parameter-passthrough factory still leaks ────
+// ── FIX #4295 REGRESSION PIN — bare-parameter-passthrough factory no
+// longer leaks (was: BOUNDARY CONTROL "still leaks", separate gap) ───────
 //
-// NOT a FAIL-WITHOUT/PASS-WITH row: unaffected by this fix in either
-// direction (a separate, pre-existing gap — see file header SCOPE
-// section). Pins that this fix does not silently paper over #4266's own
-// exact repro shape; the follow-up issue for THIS gap is cited in the
-// commit body.
+// NOT a FAIL-WITHOUT/PASS-WITH row for #4266 (this file's own fix): the
+// declare-then-assign admission #4266 adds is unaffected in either
+// direction by this row's change. IS a FAIL-WITHOUT/PASS-WITH row for
+// `fix #4295` — see this file's header SCOPE section and
+// record_factory_param_passthrough_admitted_4295_test.cpp for the
+// dedicated measurement and soundness argument.
 // ───────────────────────────────────────────────────────────────────────
 BEZEL_TEST(record_declare_then_assign_call_result_release_4266,
-           bare_parameter_passthrough_control_still_leaks_separate_gap) {
-    BEZEL_EXPECT_TRUE(leaksAtLeast(kBareParamSrc4266, 15000));
+           bare_parameter_passthrough_control_now_admitted_no_leak) {
+    auto r = bezel::test::runAotChecked(kBareParamSrc4266);
+    BEZEL_EXPECT_TRUE(r.ran);
+    if (!r.ran) return;
+    BEZEL_EXPECT_EQ(r.exitCode, 50);
 }
 
 // ── SAFETY CONTROL — a multiply-assigned target stays safe (no UAF) ──────
