@@ -11953,6 +11953,41 @@ void ExprTC::runMethodBody(
         }
         forwardParamRef_.clear();
         visitExpr(*params[i].defaultValue);
+        // fix #4208 (§17.7, v0.298): a default parameter value is one of the
+        // FOUR written-declared-type positions §17.7 authorises for the
+        // new() shorthand ("field initializers, typed local-variable
+        // declarations, default parameter values, and return statements")
+        // — but unlike the field-initializer and local-decl positions
+        // (§17.7/#987/#979, ~line 12608/13781 below), this one was never
+        // wired: `method M(p: T := new(...))` left the shorthand NewExpr
+        // untyped, so codegen's #2491 backstop silently degraded it to a
+        // zero/null default value instead of constructing T — a silent
+        // wrong-answer, not a false-reject. Wire the SAME authorities the
+        // other two positions already use, in the same order, so it also
+        // inherits #4190's Class/Record `checkNewExprArgs` validation —
+        // same predicates, same diagnostics, no new classification (§6/§25).
+        if (params[i].type) {
+            if (auto* shNe = dynamic_cast<const ast::NewExpr*>(
+                    params[i].defaultValue.get())) {
+                if (!shNe->type) {
+                    if (auto* pty = ctx_.resolvedType(*params[i].type)) {
+                        ctx_.setExprType(params[i].defaultValue.get(), pty);
+                        rejectNewOnEnumOrChoice(*shNe, pty);
+                        bool nonInstantiable =
+                            rejectNewOnNonInstantiableKind(*shNe, pty);
+                        if (!nonInstantiable &&
+                            pty->kind == TypeRef::Kind::Named &&
+                            pty->declaration &&
+                            (pty->declaration->kind ==
+                                 ast::TypeDeclKind::Class ||
+                             pty->declaration->kind ==
+                                 ast::TypeDeclKind::Record))
+                            checkNewExprArgs(*shNe, pty->declaration);
+                        checkBuiltinClosedConstructorSurface(*shNe);
+                    }
+                }
+            }
+        }
         if (!forwardParamRef_.empty()) {
             ctx_.diagnostics().report(
                 Severity::Error, params[i].defaultValue->span.begin,
@@ -14285,6 +14320,51 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         pendingLambdaTargetReturnOwned_ = savedLamTargetRetOwned;
         pendingLambdaParamTypes_ = savedLamParams;
         currentLiteralWideningHint_ = savedRetHint;
+        // fix #4208 (§17.7, v0.298): `return e;` is one of the FOUR written-
+        // declared-type positions §17.7 authorises for the new() shorthand
+        // ("field initializers, typed local-variable declarations, default
+        // parameter values, and return statements") — but unlike the
+        // field-initializer and local-decl positions (§17.7/#987/#979,
+        // ~line 12608/13781 above), this one was never wired: `return
+        // new(...);` in a method with a declared return type left the
+        // shorthand NewExpr untyped, so codegen's #2491 backstop silently
+        // degraded it to a zero/null return value instead of constructing
+        // the declared type — a silent wrong-answer, not a false-reject.
+        // §17.7 explicitly excludes a LAMBDA's ascribed return from this
+        // list ("It is not permitted at ... a lambda's ascribed return"),
+        // even though a lambda body's own `return` statements reuse this
+        // same returnCtx_ == ValueMethod machinery (§27.3/#2101, see
+        // ExprTypecheck_Exprs.cpp's lambda-visiting block) — gate on
+        // `!inLambda_` (the existing §29.9/#747 lambda-body marker) so that
+        // carve-out holds; an ordinary member/accessor/operator body (async
+        // included — asyncReturnCtxAndType already peels Task<T> to T
+        // before this point, per §35.3) never sets inLambda_. Wire the SAME
+        // authorities the other two positions already use, in the same
+        // order, so it also inherits #4190's Class/Record
+        // `checkNewExprArgs` validation — same predicates, same
+        // diagnostics, no new classification (§6/§25).
+        if (rs->value && returnCtx_ == ReturnCtx::ValueMethod &&
+            currentReturnType_ && !inLambda_) {
+            if (auto* shNe =
+                    dynamic_cast<const ast::NewExpr*>(rs->value.get())) {
+                if (!shNe->type) {
+                    ctx_.setExprType(rs->value.get(), currentReturnType_);
+                    rejectNewOnEnumOrChoice(*shNe, currentReturnType_);
+                    bool nonInstantiable = rejectNewOnNonInstantiableKind(
+                        *shNe, currentReturnType_);
+                    if (!nonInstantiable &&
+                        currentReturnType_->kind == TypeRef::Kind::Named &&
+                        currentReturnType_->declaration &&
+                        (currentReturnType_->declaration->kind ==
+                             ast::TypeDeclKind::Class ||
+                         currentReturnType_->declaration->kind ==
+                             ast::TypeDeclKind::Record))
+                        checkNewExprArgs(*shNe,
+                                          currentReturnType_->declaration);
+                    checkBuiltinClosedConstructorSurface(*shNe);
+                }
+            }
+        }
         // §22.4 (v0.183, #1585): a `return E;` that may produce a postcondition's
         // stated constant must leave the out parameter provably non-null.
         checkOutPostcondAtReturn(rs->value.get(), rs->span.begin);
