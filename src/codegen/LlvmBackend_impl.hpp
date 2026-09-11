@@ -10833,27 +10833,91 @@ private:
     // reached by the recursion below resolves correctly too (the recursive
     // call passes `mty`, the caller's OWN resolved TypeRef, not just its
     // declaration).
+    //
+    // fix #4232 (§9.7 / §28.9 / §14.1, v0.298): the #2405/#3945 comments'
+    // termination argument ("sema rejects a record that transitively
+    // contains itself by value, so this walk is over a finite DAG") is a
+    // DECLARATION-graph guarantee, not an INSTANTIATION-graph one — it says
+    // nothing about a still-GENERIC method's own rigid (unbound) type
+    // parameter. Measured (gdb, ~43,500 identical frames):
+    // `Util.Rewrap<T>(x: Box<T>)`'s `var y: Box<Box<T>> := new
+    // Box<Box<T>>(x);` calls this with `tr = Box<Box<T>>`. The
+    // RecordSubstGuard binds Box's own param name "T" to `resolveTypeParamRef(
+    // Box<T>)` — and since `Box<T>` is a Named ref WITH a declaration,
+    // `resolveTypeParamRef` returns it unchanged, so `genericSubstSemaTy_["T"]`
+    // becomes the exact `Box<T>` TypeRef node the recursion is about to visit.
+    // One level down, `recordMemberTypeResolved` on the field `Value: T`
+    // (Box's OWN declared field, also bare "T") looks up that SAME binding
+    // and yields the SAME `Box<T>` node again — the recursive call target is
+    // pointer-IDENTICAL to the frame's own `tr`, forever: the substitution's
+    // fixed point is "T ↦ Box<T>", which a ground (fully-monomorphized)
+    // generic record can never reach (sema's self-containment check forbids
+    // it), but an UNRESOLVED method type parameter can, because no ground
+    // type is ever substituted for it here. sema correctly accepts the
+    // program (`T` never needs to resolve until `Rewrap` is itself
+    // instantiated at a call site) — the defect is purely this codegen walk's
+    // failure to detect the resulting instantiation-level cycle.
+    //
+    // Fixed with a PATH guard on the concrete `TypeRef*` being visited,
+    // matching the established shape of `common::isBorrowBearingRecordCommon`'s
+    // own `seen` (OwnershipFacts.cpp) — insert-on-entry / erase-on-exit, not a
+    // permanent visited-set memoization (a sibling field reached through a
+    // DIFFERENT instantiation must still be free to re-classify a TypeRef that
+    // an unrelated, already-completed branch also touched). Keyed on the
+    // TypeRef INSTANTIATION, not the record's TypeSymbol declaration: two
+    // different instantiations of the same generic record (`Box<int>` and
+    // `Box<string>` both siblings under one enclosing record) must not
+    // collide — `TypeSymbol*` is shared by every instantiation, `TypeRef*`
+    // is not (see #3933's identical correction to
+    // `isBorrowBearingRecordCommon`'s own guard key, OwnershipFacts.cpp).
+    // Only `recordHasStringFields`'s OWN self-recursion needs the guard: the
+    // only way to reach a rigid, still-unbound `T` here is through a LOCAL
+    // (method-body) instantiation, and neither `choiceHasStringFields` (bails
+    // outright on any generic choice) nor `inlineArrayElementCarriesString`
+    // (bails on a bare-type-parameter element, never installs a
+    // RecordSubstGuard) can themselves walk a bare type parameter through a
+    // substitution — a fresh, empty `seen` set at each of THEIR calls back
+    // into `recordHasStringFields` is therefore sound; a cross-kind cycle
+    // through a choice/array hop is not reachable here (a top-level Choice
+    // declaration cannot mention an enclosing generic METHOD's type
+    // parameter at all — it would have to be generic itself, and
+    // `choiceHasStringFields` already refuses that case unconditionally).
     bool recordHasStringFields(const sema::TypeRef* tr) {
+        std::unordered_set<const sema::TypeRef*> seen;
+        return recordHasStringFieldsOnPath(tr, seen);
+    }
+    bool recordHasStringFieldsOnPath(
+            const sema::TypeRef* tr,
+            std::unordered_set<const sema::TypeRef*>& seen) {
         if (!tr || tr->kind != sema::TypeRef::Kind::Named || !tr->declaration)
             return false;
         const sema::TypeSymbol* ts = tr->declaration;
         if (ts->kind != ast::TypeDeclKind::Record) return false;
+        // fix #4232: PATH guard — see the header comment above for why this
+        // is keyed on `tr` (the instantiation) rather than `ts` (the shared
+        // declaration), and why it un-marks on exit rather than memoizing.
+        if (!seen.insert(tr).second) return false;
         RecordSubstGuard guard(this, tr);  // fix #3945: see comment above.
         std::vector<const sema::Symbol*> storage;
         collectRecordStorage(ts, storage);
+        bool found = false;
         for (const sema::Symbol* m : storage) {
-            if (isStringStorageMemberResolved(m)) return true;
+            if (isStringStorageMemberResolved(m)) { found = true; break; }
             const sema::TypeRef* mty = recordMemberTypeResolved(m);
             if (mty && !mty->nullable &&
                 mty->kind == sema::TypeRef::Kind::Named && mty->declaration &&
                 mty->declaration->kind == ast::TypeDeclKind::Record &&
-                recordHasStringFields(mty))
-                return true;
+                recordHasStringFieldsOnPath(mty, seen)) {
+                found = true;
+                break;
+            }
             if (mty && !mty->nullable &&
                 mty->kind == sema::TypeRef::Kind::Named && mty->declaration &&
                 mty->declaration->kind == ast::TypeDeclKind::Choice &&
-                choiceHasStringFields(mty->declaration))
-                return true;
+                choiceHasStringFields(mty->declaration)) {
+                found = true;
+                break;
+            }
             // fix #2326 / §9.8 v0.228: a non-nullable INLINE-ARRAY field whose
             // element type (recursively, through nested record/choice/inline-
             // array) carries a string needs the release walker to recurse into
@@ -10870,10 +10934,17 @@ private:
             if (mty && !mty->nullable &&
                 mty->kind == sema::TypeRef::Kind::InlineArray &&
                 mty->arrayElement &&
-                inlineArrayElementCarriesString(mty->arrayElement))
-                return true;
+                inlineArrayElementCarriesString(mty->arrayElement)) {
+                found = true;
+                break;
+            }
         }
-        return false;
+        // PATH semantics, not visited-set memoization — mirrors
+        // isBorrowBearingRecordCommon's identical un-mark-on-exit (#2145):
+        // un-mark on exit so a sibling field reached through a different
+        // branch can still re-classify this same TypeRef.
+        seen.erase(tr);
+        return found;
     }
 
     // fix #2326 / §9.8 v0.228: does the element type of a non-nullable inline
