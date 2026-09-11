@@ -444,6 +444,17 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
     // method body's dataflow so the FLAG is set before codegen reads it;
     // saves/restores member state per lambda so the method body's state is
     // unmodified. // per §28.10 v0.220, #2166
+    //
+    // fix #4314 (§28.3 / §28.6 / §28.9, v0.298): populate
+    // `reassignedOwnedLocals_` (the "Pattern 2"/reassignment-becomes-owned
+    // sibling of #4286's initializer-only `isOwnedTrackedLocalInEnclosingFrame`)
+    // BEFORE `applyUsingVarBorrowPinInLambdas` runs, so the lambda-body
+    // pre-pass's retry (`isReassignedOwnedLocalInEnclosingFrame`, reached from
+    // the same two #4286 declaration call sites) observes a fully-populated
+    // set rather than the empty one `ld->becomesOwnedViaReassign` would be at
+    // this point (that flag is set by the MAIN dataflow below, not by this
+    // static AST scan). // per §28.3, §28.6, §28.9, v0.298, #4314
+    collectReassignedOwnedLocals(body);
     applyUsingVarBorrowPinInLambdas(body);
     // fix #2674 / §28.3 / §17.13 / §28.9 (v0.282): the four OWNERSHIP-pass-
     // set end-of-statement reclaim flags (DiscardStmt::disposeOwnedValue /
@@ -5886,7 +5897,19 @@ void MethodOwnership::handleLocalDecl(const ast::LocalDecl& ld,
                 if (isOwnedTrackedLocal(rsym)) {
                     states_[lsym].disposeAliasSource = rsym;
                 } else if (fromLambdaBody &&
-                           isOwnedTrackedLocalInEnclosingFrame(rsym)) {
+                           (isOwnedTrackedLocalInEnclosingFrame(rsym) ||
+                            isReassignedOwnedLocalInEnclosingFrame(rsym))) {
+                    // fix #4314 (§28.3/§28.6/§28.9, v0.298):
+                    // `isReassignedOwnedLocalInEnclosingFrame` — sibling of
+                    // the #4286 retry just below, for a captured local that
+                    // becomes owned via a later plain REASSIGNMENT rather
+                    // than its own declaration initializer (`var a:
+                    // Array<int>; a := new Array<int>(2);` — the spec's own
+                    // "Pattern 2" idiom, §K1.7/K3.11). See that predicate's
+                    // declaration (Ownership_impl.hpp) for why it is a
+                    // separate static AST scan rather than a reuse of
+                    // `ld->becomesOwnedViaReassign`.
+                    //
                     // fix #4286 (§28.3 "Ownership state of locals" / §28.6
                     // "Who may call Dispose()", v0.298): LAMBDA-BODY-ONLY
                     // retry. `isOwnedTrackedLocal` above reads `states_`,
@@ -9421,6 +9444,12 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
                     // why the latter silently never fires for a captured
                     // builtin-collection local (this issue's own repro type).
                     aliasSrc = rsym;
+                } else if (isReassignedOwnedLocalInEnclosingFrame(rsym)) {
+                    // fix #4314 (§28.3/§28.6/§28.9, v0.298): the
+                    // reassignment-becomes-owned sibling of the #4286 arm
+                    // just above — see that predicate's declaration
+                    // (Ownership_impl.hpp) for the full rationale.
+                    aliasSrc = rsym;
                 }
             }
             if (!aliasSrc && exprIsOwnedFieldRead(*lc->value))
@@ -10503,6 +10532,101 @@ void MethodOwnership::applyLambdaBodyDiscardStmtFlagsStmt(
     // Break / Continue / etc.: no child expressions reachable.
 }
 
+
+// fix #4314 (§28.3 / §28.6 / §28.9, v0.298): populate `reassignedOwnedLocals_`
+// (see its declaration, Ownership_impl.hpp, for the full rationale). A BOUNDED
+// forward scan of `stmts` — recurses into every nested CONTROL-FLOW statement
+// list (if/elif/else, while, for, do…end, try/catch/finally, case arms), the
+// SAME statement-kind coverage `collectBodyLambdas` just below establishes as
+// this file's completeness bar, but deliberately does NOT descend into any
+// `LambdaExpr`'s own `stmts`/`exprBody` — `AssignmentStmt` is never embedded
+// inside an expression in this grammar (only inside a statement list), so
+// simply never walking into a LambdaExpr's body is sufficient to exclude
+// lambda-interior reassignments from this scan; no separate lambda-detection
+// arm is needed the way `collectBodyLambdas` needs one.
+//
+// Restricted to a bare-identifier `:=` target resolving to a `LocalSymbol`
+// (mirrors `isOwnedTrackedLocalInEnclosingFrame`'s own `LocalSymbol`
+// restriction) — a compound assignment (`+=`, …) never reclassifies its
+// target's producer state (see `handleAssignment`'s own header comment,
+// ~line 6253), so only `:=` is checked, matching the main dataflow's own
+// bare-identifier target-state transition this scan mirrors (Ownership.cpp,
+// the `handleAssignment` bare-identifier arm).
+void MethodOwnership::collectReassignedOwnedLocals(
+        const std::vector<std::unique_ptr<ast::Stmt>>& stmts) {
+    for (const auto& sp : stmts)
+        if (sp) collectReassignedOwnedLocalsStmt(*sp);
+}
+
+// fix #4314: single-statement primitive for `collectReassignedOwnedLocals`
+// above — mirrors `collectBodyLambdas`'s own base-case/loop-wrapper split
+// (that function takes a single `const ast::Stmt&`; its own callers loop).
+// Not declared in the header: only the vector-taking entry point above is a
+// public call site (`run()`'s pre-pass call, and this function's own
+// recursive control-flow arms).
+void MethodOwnership::collectReassignedOwnedLocalsStmt(const ast::Stmt& s) {
+    if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&s)) {
+        if (as->op == ":=" && as->target && as->value) {
+            if (auto* tid = dynamic_cast<const ast::IdentifierExpr*>(
+                    as->target.get())) {
+                sema::Symbol* tsym = ctx_.exprSymbol(*tid);
+                if (auto* lsym = dynamic_cast<sema::LocalSymbol*>(tsym)) {
+                    if (producerState(*as->value) == OwnershipState::Owned)
+                        reassignedOwnedLocals_.insert(lsym);
+                }
+            }
+        }
+        return;
+    }
+    if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&s)) {
+        collectReassignedOwnedLocals(ifs->ifBranch.body);
+        for (const auto& el : ifs->elifBranches)
+            collectReassignedOwnedLocals(el.body);
+        collectReassignedOwnedLocals(ifs->elseBody);
+        return;
+    }
+    if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&s)) {
+        collectReassignedOwnedLocals(ws->body);
+        return;
+    }
+    if (auto* fs = dynamic_cast<const ast::ForStmt*>(&s)) {
+        collectReassignedOwnedLocals(fs->body);
+        return;
+    }
+    if (auto* db = dynamic_cast<const ast::DoEndBlock*>(&s)) {
+        collectReassignedOwnedLocals(db->body);
+        return;
+    }
+    if (auto* trys = dynamic_cast<const ast::TryStmt*>(&s)) {
+        collectReassignedOwnedLocals(trys->body);
+        for (const auto& arm : trys->catches)
+            if (arm.body) collectReassignedOwnedLocalsStmt(*arm.body);
+        collectReassignedOwnedLocals(trys->finallyBody);
+        return;
+    }
+    if (auto* cs = dynamic_cast<const ast::CaseStmt*>(&s)) {
+        for (const auto& arm : cs->arms)
+            collectReassignedOwnedLocals(arm.stmts);
+        return;
+    }
+    // LocalDecl / LocalConstDecl / ReturnStmt / ExpressionStmt / ThrowStmt /
+    // IncrementStmt / DiscardStmt / YieldStmt / Break / Continue: none
+    // contain a nested STATEMENT list an AssignmentStmt could live in
+    // (assignment is a statement, never nested inside an expression in this
+    // grammar), so nothing further to walk.
+}
+
+// fix #4314 (§28.3 / §28.6 / §28.9, v0.298): see the declaration
+// (Ownership_impl.hpp) for the full "why not `ld->becomesOwnedViaReassign`"
+// rationale. A simple membership test against the set
+// `collectReassignedOwnedLocals` populates BEFORE
+// `applyUsingVarBorrowPinInLambdas` runs (see that call site in `run()`).
+bool MethodOwnership::isReassignedOwnedLocalInEnclosingFrame(
+        sema::Symbol* sym) {
+    auto* ls = dynamic_cast<sema::LocalSymbol*>(sym);
+    if (!ls) return false;
+    return reassignedOwnedLocals_.count(ls) != 0;
+}
 
 // §28.3 SB01-B (v0.190, #1919): collect every LambdaExpr appearing anywhere in a
 // statement (including nested lambdas — collectBodyLambdasExpr descends into a

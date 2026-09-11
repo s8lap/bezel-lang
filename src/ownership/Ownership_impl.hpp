@@ -750,6 +750,21 @@ private:
     // out, so auto-disposing would risk a double-free). Monotone (grows only), so
     // it is fixpoint-safe across the dataflow's block re-evaluations.
     std::unordered_set<sema::Symbol*> everDischarged_;
+    // fix #4314 (§28.3 / §28.6 / §28.9, v0.298): local symbols whose own
+    // DECLARING scope contains a plain bare-identifier reassignment
+    // (`sym := E;`) with `producerState(E) == Owned` — the "Pattern 2"
+    // (§K1.7/K3.11) idiom of a local that becomes owned via reassignment
+    // rather than its own initializer. Populated ONCE per `run()` by
+    // `collectReassignedOwnedLocals`, called BEFORE
+    // `applyUsingVarBorrowPinInLambdas` (see that call site) so the set is
+    // fully populated before the lambda-body pre-pass consults it via
+    // `isReassignedOwnedLocalInEnclosingFrame` — unlike `ld->
+    // becomesOwnedViaReassign` (set by the MAIN dataflow, which runs AFTER
+    // this pre-pass; see that predicate's declaration comment for the
+    // measured ordering trap this set exists to avoid). Deliberately NOT
+    // cleared/rebuilt per lambda the way `states_` is: this is a per-METHOD
+    // static fact, independent of which lambda is currently being walked.
+    std::unordered_set<sema::Symbol*> reassignedOwnedLocals_;
     // §28.3 (#1900): locals whose slot DEFINITELY holds a fresh value at the
     // current program point — i.e. the LAST state-changing operation on the local
     // was an UNCONDITIONAL reassignment (`x := new T()` at straight-line scope,
@@ -3009,6 +3024,60 @@ private:
     // to a `LocalSymbol` (an `owned` PARAMETER capture is a deliberately-
     // unclosed sibling gap — see the commit body). // per §28.3, §28.6, v0.298
     bool isOwnedTrackedLocalInEnclosingFrame(sema::Symbol* sym);
+
+    // fix #4314 (§28.3 / §28.6 / §28.9, v0.298): sibling of
+    // `isOwnedTrackedLocalInEnclosingFrame` above, for the "Pattern 2" idiom
+    // the spec itself names (§K1.7/K3.11 worked example — "the same
+    // declaration `var x: Stream;` leaves `x` borrowed in Pattern 1 and owned
+    // in Pattern 2 — the ASSIGNMENTS decide, not the declaration"): a captured
+    // local that becomes owned via a later plain REASSIGNMENT rather than its
+    // own declaration initializer (`var a: Array<int>; a := new
+    // Array<int>(2);`). `isOwnedTrackedLocalInEnclosingFrame` is blind to
+    // this — it only ever inspects `ld->initializer`, which is null here.
+    //
+    // Answers via `reassignedOwnedLocals_` — a STATIC AST scan of this
+    // method's own top-level `body`, computed ONCE by
+    // `collectReassignedOwnedLocals` and populated BEFORE
+    // `applyUsingVarBorrowPinInLambdas` runs (see the call site in `run()`).
+    // Deliberately NOT `ld->becomesOwnedViaReassign` — measured (issue
+    // #4314) that flag is stamped by `handleAssignment` as part of the MAIN
+    // per-statement dataflow walk over the method body, which runs strictly
+    // AFTER this fix's early lambda-body pre-pass; at the point this
+    // predicate is consulted the flag is exactly as unset as
+    // `ld->autoDropAtScopeEnd` was measured to be for #4286's own rejected
+    // `enclosingFrameOwnedLocalBorrowSource` reuse — the identical
+    // dataflow-timing trap, one level over. `collectReassignedOwnedLocals`
+    // has no such dependency: it is a pure AST walk using `producerState`
+    // (the same classifier `isOwnedTrackedLocalInEnclosingFrame` uses),
+    // available at any point regardless of when it runs.
+    //
+    // Restricted to a `LocalSymbol` (an `owned` PARAMETER has no bare-
+    // identifier reassignment shape of this kind reachable the same way —
+    // out of scope here exactly as it is for #4286/#4304).
+    bool isReassignedOwnedLocalInEnclosingFrame(sema::Symbol* sym);
+
+    // fix #4314: populates `reassignedOwnedLocals_` — see that member's
+    // declaration and `isReassignedOwnedLocalInEnclosingFrame` above for the
+    // full rationale. A BOUNDED forward scan of `stmts` (this method's own
+    // top-level body): recurses into every nested CONTROL-FLOW statement
+    // list (if/elif/else, while, for, do…end, try/catch/finally, case arms —
+    // the same statement-kind coverage `collectBodyLambdas` already
+    // establishes as the completeness bar for this file), but deliberately
+    // does NOT descend into any `LambdaExpr`'s own body: `AssignmentStmt` is
+    // never embedded inside an expression in this grammar (only inside a
+    // statement list), so the only way a lambda-interior reassignment could
+    // reach this scan is by explicitly walking into `LambdaExpr::stmts` —
+    // which this function does not do. A reassignment happening inside a
+    // DIFFERENT lambda's own frame reassigning the SAME captured-by-
+    // reference local is a separate, materially harder case (that lambda's
+    // own frame is the one #4272's fenced reassignment arm, ~line 9518,
+    // already governs) left to a follow-up issue rather than folded in here.
+    void collectReassignedOwnedLocals(
+        const std::vector<std::unique_ptr<ast::Stmt>>& stmts);
+    // fix #4314: single-statement primitive `collectReassignedOwnedLocals`
+    // above loops over — see that function's definition (Ownership.cpp) for
+    // why this split mirrors `collectBodyLambdas`'s own base-case/loop shape.
+    void collectReassignedOwnedLocalsStmt(const ast::Stmt& s);
 
     // Issue #392 / §31.1: a returned bare catch-binding identifier
     // (`return ex;`) lets the in-flight exception instance escape the arm
