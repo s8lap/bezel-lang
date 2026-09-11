@@ -1526,15 +1526,65 @@ bool ExprTC::groundSatisfiesNew(const TypeRef* arg, bool& decided) {
             // new()` bound was silently satisfied by an imported record with a
             // non-nullable `Object` field that the byte-identical local record
             // is rejected for (measured both ways).
+            //
+            // fix #4220 (§14.2/§17.11/§19.6, v0.298): this arm never substituted
+            // the record's OWN generic parameter against `arg`'s `genericArgs`
+            // at all — the identical #4002 gap `Resolver::argSatisfiesNew`'s
+            // sibling Record arm had, never ported here. `storageComponentType`
+            // returns the bare, declaration-less field type AS WRITTEN (e.g. `T`
+            // for `record Box<T>(V: T)`), unsubstituted — and the old
+            // `nullable`/`groundCategorize` leaf test never classified a bare
+            // declaration-less Named type as `GroundCat::Reference` (only
+            // `Unknown`), so the loop never tripped regardless of what `T` was
+            // actually ground-bound to: every record with a bare-parameter field
+            // (or one nested inside a delegating record) satisfied `new()`
+            // unconditionally, wrongly keeping a provably-uninhabited leaf as
+            // exhaustiveness-required (§19.6) instead of exempting it.
+            //
+            // §25: is this the SAME question `Resolver::argSatisfiesNew`'s
+            // Record arm (TypeResolution_Checks.cpp) answers for a record type
+            // argument — "is `default(R<ground args>)` well-formed, given
+            // `arg`'s `genericArgs`"? Yes: `groundSatisfiesNew`'s own
+            // precondition ("a FULLY-GROUND solved type", this function's
+            // header comment) makes `arg` exactly that same shape here too —
+            // a Named TypeRef with `declaration == d` and ground `genericArgs`,
+            // nothing left to solve. So this ports the identical composition
+            // fix #4166's review follow-up already unified `argSatisfiesNew`
+            // onto, rather than hand-rolling a fourth spelling (#4229): seed a
+            // `common::RecordSubstEnv` from `d`'s own generic params against
+            // `arg`'s `genericArgs`, walk the FULL `recordStorageMembers`
+            // enumeration (positional + body + auto-property — matching
+            // #3988's widening, so a body-only/combined-form field is not
+            // silently skipped here either), substitute each member through the
+            // env, and test the substituted type with the SAME shared
+            // authority, `sema::typeHasNoDefault` (TypeResolution.hpp) — which
+            // also already closes #4219's class of gap (a Choice- or
+            // zero-less-Enum-typed field) and carries its own cycle guard, so a
+            // self-referential record reached this way cannot SIGSEGV either.
             decided = true;
-            for (const Symbol* pf : recordPositionalFieldSymbols(d)) {
-                const TypeRef* ft = storageComponentType(pf, ctx_);
-                if (!ft) { decided = false; return false; }  // can't verify
-                if (ft->nullable) continue;  // nullable field → defaults null
-                if (groundCategorize(ft) == GroundCat::Reference)
-                    return false;  // non-nullable reference field: no default
-            }
-            return true;
+            bool unresolved = false;
+            bool nonDefaultable = false;
+            common::RecordSubstEnv env;
+            common::seedRecordSubstEnv(*d, *arg, /*incoming=*/nullptr, env);
+            const common::RecordSubstEnv* fieldEnv =
+                env.map.empty() ? nullptr : &env;
+            recordStorageMembers(
+                d, ctx_,
+                [&](const RecordStorageMember& rsm) {
+                    const TypeRef* ft = rsm.type;
+                    if (!ft) { unresolved = true; return false; }  // can't verify
+                    common::RecordSubstEnv::Entry sub =
+                        common::resolveRecordFieldSubst(ft, fieldEnv);
+                    if (!sub.ty) { unresolved = true; return false; }
+                    if (typeHasNoDefault(sub.ty, ctx_, sub.env)) {
+                        nonDefaultable = true;
+                        return false;  // no default at this member
+                    }
+                    return true;
+                },
+                /*env=*/nullptr);
+            if (unresolved) { decided = false; return false; }
+            return !nonDefaultable;
         }
         if (d->kind == ast::TypeDeclKind::Class) {
             // A class satisfies new() iff it has an accessible parameterless
