@@ -1,6 +1,10 @@
 // Spec-derived tests for fix #4236 — explicit `.Dispose()` / `?.Dispose()`
 // through an ALIAS of a still-in-scope owned collection local double-frees,
-// with no compile-time diagnostic.
+// with no compile-time diagnostic. EXTENDED by fix #4268 (§28.10, v0.298,
+// below the send-back sections) to the identical shape spelled `using var`
+// instead of plain `var`/`const` — see that section's own header for why the
+// original fix's `!ld.isUsing` exclusion was a misreading of §28.10, not a
+// deliberate narrowing.
 //
 // §28.3 "Ownership state of locals" (v0.298): "`var x := expr;` takes the
 // ownership state of `expr` ... A read of a named owned binding on the
@@ -289,6 +293,174 @@ BEZEL_TEST(ownership_dispose_aliased_collection_4236,
         "while i < 200 do "
         "  var a := new Array<int>(2); a.Add(1); "
         "  var b: Array<int> := a; "
+        "  var n := b.Count; "
+        "  i := i + n - n; "
+        "  i := i + 1; "
+        "end; "
+        "return 0;"));
+    BEZEL_EXPECT_TRUE(r.ran);
+    if (r.ran) BEZEL_EXPECT_EQ(r.exitCode, 0);
+}
+
+// =====================================================================
+// fix #4268 (§28.10, v0.298) — the identical alias shape, spelled `using var`
+// instead of plain `var`/`const`. `Ownership.cpp`'s `handleLocalDecl` gated
+// `disposeAliasSource`'s population on `!ld.isUsing`, reasoned (per its own,
+// now-corrected, comment) as "a `using var` is itself Owned, not a
+// re-borrow". §28.10's OWN dedicated subsection, "using var initialized from
+// a borrow", says the opposite BY NAME for this exact RHS shape — "a
+// method call without an `owned` return ... an *unmarked* read of a named
+// owned binding[: ...] the `using var` does **not** assume a disposal
+// obligation ... the value is not owned by this scope" — and §28.10's
+// *Adopting a named owned binding* bullet restates it from the adopt side:
+// "An **unmarked** `using var y := x;` where `x` is a named owned binding
+// does *not* adopt: it is a borrow". That is the SAME K3.13 "marker economy"
+// rule (§28.3, "An unmarked read of a class-typed binding never consumes")
+// this file's #4236 rows already rely on for plain `var`/`const` — `using
+// var` carries no exemption from it. So `using var b := a;` (no `move`) is a
+// borrow exactly like `var b := a;`, and §28.6 "Who may call Dispose()"
+// ("Dispose() through a borrow is a compile error") applies identically:
+// `b.Dispose()` must be rejected. The fix widens `disposeAliasSource`'s
+// existing, already-validated population to also run for `using var` —
+// feeding the SAME authority #4236 established rather than adding a new
+// predicate (LANE_RULES §6/§25) — rather than adding a NEW check that
+// consults the vacuous-pin lint's own (separate, differently-scoped)
+// classifier.
+// =====================================================================
+
+BEZEL_TEST(ownership_dispose_aliased_collection_4236,
+           using_var_alias_dot_dispose_rejected_28_10) {
+    auto r = runAot(prog(
+        "var a := new Array<int>(2); a.Add(1); "
+        "using var b: Array<int> := a; b.Dispose(); return 0;"));
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagContains(r, "cannot call `Dispose()` on `b`"));
+    BEZEL_EXPECT_TRUE(diagContains(r, "borrow (an alias) of `a`"));
+    BEZEL_EXPECT_TRUE(diagContains(r, "§28.6"));
+}
+
+BEZEL_TEST(ownership_dispose_aliased_collection_4236,
+           using_var_alias_nullcond_dispose_rejected_28_10) {
+    auto r = runAot(prog(
+        "var a := new Array<int>(2); a.Add(1); "
+        "using var b: Array<int> := a; b?.Dispose(); return 0;"));
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagContains(r, "cannot call `Dispose()` on `b`"));
+    BEZEL_EXPECT_TRUE(diagContains(r, "borrow (an alias) of `a`"));
+}
+
+// Order independence, mirroring the plain-`var` row above: the rejection is
+// a static classification of `b` fixed at its declaration, so it must fire
+// whether or not the original was ALREADY disposed first (`a.Dispose()` here
+// is itself legitimate — `a` genuinely owns the value).
+BEZEL_TEST(ownership_dispose_aliased_collection_4236,
+           using_var_alias_dispose_after_original_disposed_rejected_28_10) {
+    auto r = runAot(prog(
+        "var a := new Array<int>(2); a.Add(1); "
+        "using var b: Array<int> := a; a.Dispose(); b.Dispose(); return 0;"));
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagContains(r, "cannot call `Dispose()` on `b`"));
+    BEZEL_EXPECT_TRUE(diagContains(r, "borrow (an alias) of `a`"));
+}
+
+// The axis this file's earlier rows do not cover: an alias of an OWNED
+// PARAMETER (not a local). `isOwnedTrackedLocal` reads `states_[sym].state`,
+// which is seeded Owned for an `owned` parameter exactly as for a fresh
+// local, so the same bare-identifier check fires. `a.Dispose()` after the
+// rejected `b.Dispose()` line discharges the parameter's own separate,
+// unrelated "owned parameter must be discharged" obligation (§28.3) so this
+// row's ONE diagnostic is unambiguously the alias rejection under test.
+BEZEL_TEST(ownership_dispose_aliased_collection_4236,
+           using_var_alias_of_owned_parameter_dispose_rejected_28_10) {
+    auto r = runAot(
+        "module M; class C "
+        "public static method Take(owned a: Array<int>): int "
+        "using var b: Array<int> := a; b.Dispose(); a.Dispose(); return 0; "
+        "end Take; "
+        "public static method Main(): int "
+        "var a := new Array<int>(2); a.Add(1); return Take(move a); "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagContains(r, "cannot call `Dispose()` on `b`"));
+    BEZEL_EXPECT_TRUE(diagContains(r, "borrow (an alias) of `a`"));
+}
+
+// =====================================================================
+// fix #4268 ACCEPT-side controls (LANE_RULES §15) — the two `using var`
+// shapes §28.10 requires to KEEP working must not be false-rejected by the
+// widened check. Neither initializer is an `IdentifierExpr` (a `NewExpr` and
+// a `CallExpr` respectively), so `disposeAliasSource`'s dynamic_cast fails
+// for both by CONSTRUCTION, not merely by measurement — the widening moves
+// along exactly one axis (bare-identifier-of-a-still-owned-local) and no
+// other. Loop-amplified 200x under `runAotChecked` (generated-code ASan/LSan
+// per-test, LANE_RULES §3/§30): a false-reject would show as a compile
+// failure (r.ran false); a wrongly-reintroduced double-free or a leak from
+// this widening would show as an ASan/LSan report on the SAME line.
+// =====================================================================
+
+BEZEL_TEST(ownership_dispose_aliased_collection_4236,
+           using_var_fresh_producer_still_compiles_and_runs_28_10) {
+    auto r = runAotChecked(prog(
+        "var i := 0; "
+        "while i < 200 do "
+        "  using var b := new Array<int>(2); b.Add(1); "
+        "  var n := b.Count; "
+        "  i := i + n - n; "
+        "  i := i + 1; "
+        "end; "
+        "return 0;"));
+    BEZEL_EXPECT_TRUE(r.ran);
+    if (r.ran) BEZEL_EXPECT_EQ(r.exitCode, 0);
+}
+
+// The same fresh-producer shape, but ALSO explicitly `.Dispose()`d before
+// scope end — `using var` is one of §28.6's own listed owning receivers
+// ("an owned local ... a `using var` ...") for a GENUINE producer, and that
+// must stay legal; the disposed-flag machinery (§28.2, idempotent) means
+// scope end then no-ops rather than double-freeing.
+BEZEL_TEST(ownership_dispose_aliased_collection_4236,
+           using_var_fresh_producer_explicit_dispose_still_compiles_28_10) {
+    auto r = runAotChecked(prog(
+        "var i := 0; "
+        "while i < 200 do "
+        "  using var b := new Array<int>(2); b.Add(1); "
+        "  b.Dispose(); "
+        "  i := i + 1; "
+        "end; "
+        "return 0;"));
+    BEZEL_EXPECT_TRUE(r.ran);
+    if (r.ran) BEZEL_EXPECT_EQ(r.exitCode, 0);
+}
+
+BEZEL_TEST(ownership_dispose_aliased_collection_4236,
+           using_var_call_result_dispose_still_compiles_28_10) {
+    auto r = runAotChecked(prog(
+        "var i := 0; "
+        "while i < 200 do "
+        "  using var b := Helper.Make(); b.Dispose(); "
+        "  i := i + 1; "
+        "end; "
+        "return 0;",
+        "class Helper public static method Make(): owned Array<int> "
+        "var x := new Array<int>(2); x.Add(1); return x; end Make; "
+        "end Helper; "));
+    BEZEL_EXPECT_TRUE(r.ran);
+    if (r.ran) BEZEL_EXPECT_EQ(r.exitCode, 0);
+}
+
+// The plain-`var` sibling row's exact control, spelled `using var`: an alias
+// that is declared but NEVER explicitly disposed must still compile (this
+// check only ever fires AT a `.Dispose()`/`?.Dispose()` call site) — and per
+// §28.10's "using var initialized from a borrow", `b`'s own scope end calls
+// NO `Dispose()` at all (it never assumed the obligation), so `a`'s scope-end
+// auto-drop is the ONLY free, exactly once, every iteration.
+BEZEL_TEST(ownership_dispose_aliased_collection_4236,
+           using_var_alias_never_disposed_frees_exactly_once_28_10) {
+    auto r = runAotChecked(prog(
+        "var i := 0; "
+        "while i < 200 do "
+        "  var a := new Array<int>(2); a.Add(1); "
+        "  using var b: Array<int> := a; "
         "  var n := b.Count; "
         "  i := i + n - n; "
         "  i := i + 1; "

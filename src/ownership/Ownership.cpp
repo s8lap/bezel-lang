@@ -5792,20 +5792,68 @@ void MethodOwnership::handleLocalDecl(const ast::LocalDecl& ld) {
         // a closure capturing `r`), record that owned source on this local so
         // a later `return b;` can be diagnosed as a borrow escape. Computed
         // AFTER recordMovesIn so a `move`d-out source (now MovedFrom, not
-        // Owned) is correctly NOT treated as a live borrow source. A `using
-        // var` is itself Owned, not a re-borrow, so it never gets a source.
+        // Owned) is correctly NOT treated as a live borrow source.
         // A §28.3 (v0.180) `owned`-marked binding (`var y := owned x;`) MOVED the
         // source: `y` is a new OWNER, not a borrow of `x`, so it takes no borrow
         // source (a later `return y;` is an owned return, not a borrow escape).
-        if (!ld.isUsing && !ld.initializerHasOwnedMarker) {
-            if (sema::Symbol* src = borrowSourceForExpr(*ld.initializer)) {
-                BorrowSource bs;
-                bs.sym = src;
-                states_[lsym].source = bs;
+        if (!ld.initializerHasOwnedMarker) {
+            // fix #4268 (§28.10, v0.298): `source` (the `return b;`
+            // borrow-escape signal) stays scoped to plain `var`/`const` — a
+            // `using var` borrow-pin's liveness obligation is already
+            // enforced by codegen's separate pin-extension machinery
+            // (§28.10 "using var initialized from a borrow": "the compiler
+            // enforces it by extending the source's required-liveness range
+            // to cover the using-var's scope"), and a `using var` local can
+            // never itself `return` (it is scope-bound), so widening this
+            // borrow-escape source to `using var` would add a predicate with
+            // no reachable consumer. Left exactly as before; only
+            // `disposeAliasSource` below changes.
+            if (!ld.isUsing) {
+                if (sema::Symbol* src = borrowSourceForExpr(*ld.initializer)) {
+                    BorrowSource bs;
+                    bs.sym = src;
+                    states_[lsym].source = bs;
+                }
             }
-            // fix #4236 / §28.3, §28.6 (v0.298): `disposeAliasSource` — see
-            // its header comment (OwnershipState.hpp) for why this is a
-            // dedicated field rather than a reuse of `source` above.
+            // fix #4236 / §28.3, §28.6 (v0.298), widened by fix #4268 (§28.10,
+            // v0.298): `disposeAliasSource` — see its header comment
+            // (OwnershipState.hpp) for why this is a dedicated field rather
+            // than a reuse of `source` above.
+            //
+            // #4268: this used to also require `!ld.isUsing`, reasoned (see
+            // the removed comment above) as "a `using var` is itself Owned,
+            // not a re-borrow". §28.10's own dedicated subsection ("using var
+            // initialized from a borrow") contradicts that reasoning by name
+            // for exactly this RHS shape: "[when the RHS is] an *unmarked*
+            // read of a named owned binding[, ...] the `using var` does NOT
+            // assume a disposal obligation ... the value is not owned by
+            // this scope" — and §28.10's *Adopting a named owned binding*
+            // bullet states the SAME thing from the adopt side: "An
+            // unmarked `using var y := x;` where `x` is a named owned
+            // binding does *not* adopt: it is a borrow, pinned per the
+            // subsection below, and `x` retains the obligation." That is the
+            // identical K3.13 "marker economy" rule a plain `var`/`const`
+            // alias is already held to ("An unmarked read of a class-typed
+            // binding never consumes") — `using var` carries no exemption
+            // from it. So a `using var` over a bare identifier read of a
+            // still-owned local is a BORROW exactly like the plain-`var`
+            // case fix #4236 already rejects, and per §28.6 "Who may call
+            // Dispose()" ("Dispose() through a borrow is a compile error")
+            // its explicit `.Dispose()` must be rejected identically. The
+            // `!ld.isUsing` exclusion was therefore the wrong classification,
+            // not a deliberate narrowing — it is what let `.Dispose()`
+            // double-free through the alias (issue #4268).
+            //
+            // Removing the exclusion does not touch either accept-side shape
+            // §28.10 requires to keep working: `using var b := new
+            // Array<int>(2);` (a `NewExpr` initializer, never an
+            // `IdentifierExpr`) and a call-result `using var` (a `CallExpr`
+            // initializer) both fail the `IdentifierExpr` dynamic_cast below
+            // exactly as they did before, so `disposeAliasSource` stays
+            // unset and their `.Dispose()` stays legal — this widens
+            // rejection along exactly one axis (bare-identifier-of-an-owned-
+            // local) and no other.
+            //
             // Narrowly recognizes ONLY a bare IDENTIFIER read (never a
             // member/index/other projection — those can be value-typed
             // copies, and this check intentionally does not consult
@@ -8027,12 +8075,21 @@ void MethodOwnership::checkDisposeReceiverOwnership(const ast::Expr& recv,
                     "` with `move` to take ownership");
                 return;
             }
-            // A plain `var`/`using var` local (LocalDecl decl), or a local
-            // absent from states_ (unreachable / other-block position): NOT
-            // rejected — the recorded gap (a genuine local-held borrow is
-            // indistinguishable from an owned disposable here). A `using var`
-            // is genuinely owned; a plain owned local is genuinely owned; a
-            // borrow local is the unenforced gap.
+            // A plain `var`/`using var` local (LocalDecl decl) with no
+            // recorded `disposeAliasSource`, or a local absent from states_
+            // (unreachable / other-block position): NOT rejected — the
+            // recorded gap (a genuine local-held borrow is indistinguishable
+            // from an owned disposable here). fix #4268 (§28.10, v0.298):
+            // this reached the fallback for a `using var` alias of a
+            // still-owned local before this fix (`b.Dispose()` on `using var
+            // b := a;`) because `disposeAliasSource` was never populated for
+            // `using var` at all — that shape is now caught above instead. A
+            // `using var` over a genuine fresh production (`new`/owned-
+            // returning call) or a `move`-adopted binding IS genuinely
+            // owned, and a plain owned local (fresh production or `move`)
+            // is genuinely owned; a plain-local-held borrow (this local's
+            // OWN `Borrowed` state, e.g. from a call result — no identifiable
+            // named-binding source) remains the unenforced gap.
             return;
         }
         // Unresolved / other: conservatively not rejected.
