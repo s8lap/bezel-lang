@@ -161,6 +161,99 @@ inline bool isBuiltinDictionaryTypeRef(const sema::TypeRef* rt) {
     return common::isDictionaryName(rt->headName());
 }
 
+// fix #4322 (§9.7 "Records and disposal" / §28.3 / §28.9, v0.298): does
+// METHOD `ms`'s declared return type provably embed a plain string ARGUMENT
+// unretained — a Named Record/Choice return (the #4254 channel), or an
+// InlineArray return whose element is `string` or a Named Record/Choice
+// (the #4265/#4280 channel)?
+//
+// ONE DEFINITION, TWO CONSUMERS, deliberately in this shared header (same
+// shape as `isBuiltinDictionaryTypeRef` above) rather than duplicated:
+// `StringEscapeWalker::walkCallArgs` (LlvmBackend_Setup.cpp) computed this
+// inline as `calleeReturnMayAliasArgUnretained` to suppress a NAMED-
+// IDENTIFIER argument's own scope-end release, but that walker is a
+// namespace-scope struct, not an `Emitter` member, so it cannot call a
+// PRIVATE `Emitter` method — and `Emitter::lowerCallDispatch`
+// (LlvmBackend_Calls2.cpp) is a different translation unit than the
+// walker's original inline lambda pair. A free `inline` function in this
+// shared header is visible to both without either restriction.
+//
+// WHY lowerCallDispatch NEEDS IT (issue #4322): the #429 "+1 string
+// producer passed directly as a call argument" post-call release
+// (`isPlusOneStringProducer(argExprs[ai])` -> unconditional
+// `emitStringRelease(args[ai])`) ran with NO awareness of whether the
+// callee's return value goes on to alias the very reference it just freed.
+// `Helper.Wrap(s: string): Str return new Str(s); end Wrap;` called as
+// `var outer := Helper.Wrap("he" + "llo" + i.ToString());` — the argument is
+// an UNBOUND temporary (no LocalDecl, so walkCallArgs' `isTargetIdent`-gated
+// suppression never even considers it), `buildRecordValue`'s positional
+// fast path stores it into `Str.V` with a bare `CreateStore` (no
+// `emitStringRetain`, the same raw-store fact #4254 established), and the
+// old unconditional release then freed that same allocation before
+// `outer.V.Length` read it — a measured `AddressSanitizer:
+// heap-use-after-free`. This predicate lets that release site skip exactly
+// the argument positions the #4254/#4265/#4280 record/choice/inline-array
+// suppression already covers for named locals.
+//
+// CALL-WIDE, not per-argument-position: matches walkCallArgs' own
+// documented contract (`isFreshRecordConstructionOfExactType`'s comment
+// below: "widening is sound only paired with the caller-side
+// calleeReturnMayAliasArgUnretained suppression ... which is call-wide, not
+// context-specific"). A call with a SECOND, unrelated +1-producer argument
+// that the callee does NOT embed also has its release suppressed — the
+// pre-existing leak-over-UAF safe default (fix #4280's own comment), not a
+// new one; `record_factory_unbound_temporary_argument_uaf_4322_test.cpp`'s
+// `unrelated_second_argument_no_longer_uaf_but_leaks_call_wide` row pins
+// this (measured: 19890 B / 1000 allocations, a floor per LANE_RULES §30).
+inline bool calleeReturnMayAliasStringArgUnretained(
+        const sema::SemaContext& ctx, const sema::MethodSymbol* ms) {
+    if (!ms) return false;
+    const sema::TypeRef* crt = nullptr;
+    if (ctx.isImported(ms)) {
+        crt = ctx.importedReturnType(ms);
+    } else {
+        // SEAM-ACCESSOR: local-path cast; `if (ctx.isImported(ms))` above
+        // returns early for the imported case via ctx.importedReturnType.
+        // #3152
+        const auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
+        if (md && md->returnType) {
+            crt = ctx.resolvedType(*md->returnType);
+        }
+    }
+    // fix #4280: shared Record/Choice test — ONE spelling for both the
+    // top-level `crt` arm and the InlineArray-element arm below (§6).
+    auto isRecordOrChoiceDeclared = [](const sema::TypeRef* t) {
+        return t && t->kind == sema::TypeRef::Kind::Named &&
+               t->declaration &&
+               (t->declaration->kind == ast::TypeDeclKind::Record ||
+                t->declaration->kind == ast::TypeDeclKind::Choice);
+    };
+    // fix #4265 / #4280: does an INLINE-ARRAY ELEMENT type embed a plain
+    // string argument via a bare per-slot store with no retain? Two proven
+    // shapes: the element IS `string` (#4265), or the element is a
+    // Record/Choice whose own fast-path constructor store is the identical
+    // raw shape (#4280). Deliberately NOT "any Named" — a CLASS-typed
+    // element retains via `lowerStringFieldStore` when ITS OWN field is
+    // `string`-typed (see the walkCallArgs call site's CLASS-exclusion
+    // history for the send-back that measured the one case where that is
+    // NOT true: a class whose field is Record/Choice-typed one level in).
+    auto elementMayEmbedStringArgUnretained =
+        [&](const sema::TypeRef* elem) {
+            if (!elem) return false;
+            if (elem->kind == sema::TypeRef::Kind::Primitive &&
+                elem->primitive == sema::PrimitiveType::String) {
+                return true;
+            }
+            return isRecordOrChoiceDeclared(elem);
+        };
+    if (isRecordOrChoiceDeclared(crt)) return true;
+    if (crt && crt->kind == sema::TypeRef::Kind::InlineArray &&
+        elementMayEmbedStringArgUnretained(crt->arrayElement)) {
+        return true;
+    }
+    return false;
+}
+
 // Parse a Bezel integer literal lexeme to its value.
 //
 // fix #2936: the implementation MOVED to common/IntLiteral.hpp and this is a

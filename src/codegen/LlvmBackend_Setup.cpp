@@ -23558,62 +23558,19 @@ struct StringEscapeWalker {
         // not something #4280 introduced or could have widened to cover
         // without a materially larger constructor-body dataflow analysis
         // — filed as issue 4300 rather than attempted here.
-        bool calleeReturnMayAliasArgUnretained = false;
-        if (stringReleaseMode && ms) {
-            const sema::TypeRef* crt = nullptr;
-            if (ctx.isImported(ms)) {
-                crt = ctx.importedReturnType(ms);
-            } else {
-                // SEAM-ACCESSOR: local-path cast; `if (ctx.isImported(ms))`
-                // above returns early for the imported case via
-                // ctx.importedReturnType. #3152
-                const auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
-                if (md && md->returnType) {
-                    crt = ctx.resolvedType(*md->returnType);
-                }
-            }
-            // fix #4280: shared Record/Choice test — ONE spelling for both
-            // the top-level `crt` arm (below) and the InlineArray-element
-            // arm, rather than a second, driftable copy (§6).
-            auto isRecordOrChoiceDeclared = [](const sema::TypeRef* t) {
-                return t && t->kind == sema::TypeRef::Kind::Named &&
-                       t->declaration &&
-                       (t->declaration->kind == ast::TypeDeclKind::Record ||
-                        t->declaration->kind == ast::TypeDeclKind::Choice);
-            };
-            // fix #4265 / #4280: does an INLINE-ARRAY ELEMENT type embed a
-            // plain string argument via a bare per-slot store with no
-            // retain? Two proven shapes: the element IS `string` (#4265),
-            // or the element is a Record/Choice whose own fast-path
-            // constructor store is the identical raw shape (#4280).
-            // Deliberately NOT "any Named" — see the CLASS-exclusion note
-            // above the outer `if`.
-            auto elementMayEmbedStringArgUnretained =
-                [&](const sema::TypeRef* elem) {
-                    if (!elem) return false;
-                    if (elem->kind == sema::TypeRef::Kind::Primitive &&
-                        elem->primitive == sema::PrimitiveType::String) {
-                        return true;
-                    }
-                    return isRecordOrChoiceDeclared(elem);
-                };
-            if (isRecordOrChoiceDeclared(crt)) {
-                calleeReturnMayAliasArgUnretained = true;
-            } else if (crt && crt->kind == sema::TypeRef::Kind::InlineArray &&
-                       elementMayEmbedStringArgUnretained(
-                           crt->arrayElement)) {
-                // fix #4265 (string element) / fix #4280 (Record/Choice
-                // element). `arrayElement` is populated identically for a
-                // locally-resolved and an imported InlineArray TypeRef
-                // (ModuleLoader.cpp's `convert`: `ref->arrayElement =
-                // convert(mt.children.front())`), so this arm covers both
-                // the local and imported legs of the `if` above with no
-                // further branching, mirroring how #4260 found the
-                // Record/Choice arm already leg-agnostic once `crt` itself
-                // is resolved correctly.
-                calleeReturnMayAliasArgUnretained = true;
-            }
-        }
+        // fix #4322 (§9.7/§28.3/§28.9, v0.298): this computation MOVED to
+        // the shared free function `calleeReturnMayAliasStringArgUnretained`
+        // (LlvmBackend_impl.hpp, next to `isBuiltinDictionaryTypeRef` —
+        // same "one definition, two consumers" shape) so
+        // `Emitter::lowerCallDispatch`'s UNBOUND-TEMPORARY argument release
+        // (LlvmBackend_Calls2.cpp, a different translation unit) can
+        // consult the identical call-wide fact instead of only ever
+        // suppressing a NAMED local's own release. See that function's
+        // definition for the full #4254/#4265/#4280/#4322 rationale this
+        // block used to carry inline.
+        bool calleeReturnMayAliasArgUnretained =
+            stringReleaseMode && ms &&
+            calleeReturnMayAliasStringArgUnretained(ctx, ms);
         // fix #3886 (§4.8/§4.9/§28.9): the walkCallArgs twin of fix #3872's
         // IndexExpr arm above (in this same struct). #3872 taught the walker
         // that a bare string-local KEY argument to a built-in

@@ -11732,10 +11732,32 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
     // args.  For instance methods args[0] = receiver (argExprs[0] = nullptr);
     // for static methods the args start at index 0.  We scan from argOffset
     // to args.size() and release any argument whose expression is a +1 producer.
+    //
+    // fix #4322 (§9.7/§28.3/§28.9, v0.298): SKIP this release, call-wide,
+    // when `calleeReturnMayAliasStringArgUnretained(ctx_, ms)` — the SAME
+    // fact `StringEscapeWalker::walkCallArgs` uses to suppress a NAMED
+    // local's own scope-end release (fix #4254/#4265/#4280) — says the
+    // callee's return type may embed a plain string argument via a bare,
+    // unretained store (a Record/Choice return, or an InlineArray return of
+    // `string`/Record/Choice elements). Before this fix an UNBOUND
+    // temporary argument (no LocalDecl, so walkCallArgs' `isTargetIdent`
+    // gate never even considered it) had this release fire
+    // UNCONDITIONALLY: `Helper.Wrap(s: string): Str return new Str(s); end
+    // Wrap;` called as `var outer := Helper.Wrap("he"+"llo"+i.ToString());`
+    // freed the argument's allocation here while `outer.V` still aliased it
+    // (`buildRecordValue`'s positional fast path is a bare `CreateStore`,
+    // no `emitStringRetain`) — measured, `AddressSanitizer:
+    // heap-use-after-free`, issue #4322. This is call-wide like its sibling
+    // (a second, unrelated +1-producer argument to the same call ALSO loses
+    // its release — leaking instead of being reclaimed — the pre-existing
+    // leak-over-UAF safe default), not per-argument.
     if (!diverged_ && !args.empty()) {
         std::size_t argOffset = isStaticMethod(ms) ? 0 : 1;
+        bool calleeMayAliasArg =
+            calleeReturnMayAliasStringArgUnretained(ctx_, ms);
         for (std::size_t ai = argOffset; ai < args.size() && ai < argExprs.size(); ++ai) {
-            if (argExprs[ai] && isPlusOneStringProducer(argExprs[ai]))
+            if (argExprs[ai] && isPlusOneStringProducer(argExprs[ai]) &&
+                !calleeMayAliasArg)
                 emitStringRelease(args[ai]);
         }
     }
