@@ -23457,9 +23457,54 @@ struct StringEscapeWalker {
         // file, not exercised or measured by this fix.
         //
         // The channel list stood at four when #4254 opened, five when
-        // #4254 itself found the Record/Choice gap, and is six as of this
-        // fix. This does not make the enumeration exhaustive — see the
-        // commit body for what was and was not checked.
+        // #4254 itself found the Record/Choice gap, six when #4265 added
+        // the InlineArray/string-element arm below, and is SEVEN as of
+        // this fix (#4280).
+        //
+        // fix #4280 (§15.1/§9.7/§28.9, v0.298) — CORRECTION of #4265's own
+        // commit body: that commit listed "inline arrays of CLASS-typed or
+        // CHOICE-typed elements (different lowering path entirely)" as
+        // explicitly out of scope, asserting they were safe. That
+        // assertion was measured wrong, not merely unverified: a callee
+        // returning `[N]SomeRecord` or `[N]SomeChoice` embeds the string
+        // argument into the array via a positional/payload constructor
+        // call whose own store is ALSO a bare `CreateStore` with no
+        // `emitStringRetain` (`buildRecordValue`'s fast path — the exact
+        // mechanism #4254 found for a bare `return new Str(s);`), so the
+        // SAME raw-store shape #4265 fixed for `string` elements applies
+        // one level down for Record/Choice elements. MEASURED (this
+        // fix's own worktree, `scripts/agent_check.sh --probe --asan`,
+        // this tree, `0c45cb6` — i.e. WITH #4265's fix already applied):
+        // both `[1]Str` (`record Str(V: string)`) and `[1]Tag`
+        // (`Tag.Named(s)` choice) are real `AddressSanitizer:
+        // heap-use-after-free` — the identical 32-byte `bz.string`-header
+        // signature #4254/#4260/#4265's own rows measure.
+        //
+        // GENERALIZED rather than enumerated as a third/fourth special
+        // case: `elementMayEmbedStringArgUnretained` below is the SAME
+        // Record/Choice test the top-level arm uses (factored to one
+        // spelling per §6, not a second copy that could drift), plus the
+        // Primitive/String test #4265 already established, applied to
+        // `arrayElement` instead of `crt`. This is bounded to ONE level,
+        // not open-ended recursion: §15.1 states "Inline arrays may not
+        // be elements of inline arrays in the form `[N][M]T` ... The
+        // current spec admits only one-dimensional inline arrays" — an
+        // `arrayElement` can never itself be `Kind::InlineArray`, so
+        // there is no possible eighth, doubly-nested channel for this
+        // helper to miss.
+        //
+        // NOT generalized to "any Named `arrayElement`": a CLASS-typed
+        // element is deliberately excluded, because (mirroring the
+        // existing top-level CLASS control) a class's own constructor
+        // retains a borrowed string field via `lowerStringFieldStore`,
+        // so suppressing the caller-side release for a class-element
+        // array would be pure over-suppression — an unforced extra leak,
+        // not a fix. Control row `inline_array_owned_class_element_
+        // control_stays_clean_not_over_suppressed` (inline_array_record_
+        // choice_element_call_result_param_alias_uaf_4280_test.cpp) pins
+        // this boundary: MEASURED clean (no ASan/LSan finding, exit 5) on
+        // this tree both before and after this fix, since the helper
+        // never matches a Class declaration.
         bool calleeReturnMayAliasArgUnretained = false;
         if (stringReleaseMode && ms) {
             const sema::TypeRef* crt = nullptr;
@@ -23474,20 +23519,39 @@ struct StringEscapeWalker {
                     crt = ctx.resolvedType(*md->returnType);
                 }
             }
-            if (crt && crt->kind == sema::TypeRef::Kind::Named &&
-                crt->declaration &&
-                (crt->declaration->kind == ast::TypeDeclKind::Record ||
-                 crt->declaration->kind == ast::TypeDeclKind::Choice)) {
+            // fix #4280: shared Record/Choice test — ONE spelling for both
+            // the top-level `crt` arm (below) and the InlineArray-element
+            // arm, rather than a second, driftable copy (§6).
+            auto isRecordOrChoiceDeclared = [](const sema::TypeRef* t) {
+                return t && t->kind == sema::TypeRef::Kind::Named &&
+                       t->declaration &&
+                       (t->declaration->kind == ast::TypeDeclKind::Record ||
+                        t->declaration->kind == ast::TypeDeclKind::Choice);
+            };
+            // fix #4265 / #4280: does an INLINE-ARRAY ELEMENT type embed a
+            // plain string argument via a bare per-slot store with no
+            // retain? Two proven shapes: the element IS `string` (#4265),
+            // or the element is a Record/Choice whose own fast-path
+            // constructor store is the identical raw shape (#4280).
+            // Deliberately NOT "any Named" — see the CLASS-exclusion note
+            // above the outer `if`.
+            auto elementMayEmbedStringArgUnretained =
+                [&](const sema::TypeRef* elem) {
+                    if (!elem) return false;
+                    if (elem->kind == sema::TypeRef::Kind::Primitive &&
+                        elem->primitive == sema::PrimitiveType::String) {
+                        return true;
+                    }
+                    return isRecordOrChoiceDeclared(elem);
+                };
+            if (isRecordOrChoiceDeclared(crt)) {
                 calleeReturnMayAliasArgUnretained = true;
             } else if (crt && crt->kind == sema::TypeRef::Kind::InlineArray &&
-                       crt->arrayElement &&
-                       crt->arrayElement->kind ==
-                           sema::TypeRef::Kind::Primitive &&
-                       crt->arrayElement->primitive ==
-                           sema::PrimitiveType::String) {
-                // fix #4265: the InlineArray/string-element sixth channel
-                // documented above. `arrayElement` is populated identically
-                // for a locally-resolved and an imported InlineArray TypeRef
+                       elementMayEmbedStringArgUnretained(
+                           crt->arrayElement)) {
+                // fix #4265 (string element) / fix #4280 (Record/Choice
+                // element). `arrayElement` is populated identically for a
+                // locally-resolved and an imported InlineArray TypeRef
                 // (ModuleLoader.cpp's `convert`: `ref->arrayElement =
                 // convert(mt.children.front())`), so this arm covers both
                 // the local and imported legs of the `if` above with no

@@ -48,9 +48,20 @@
 //
 // ⚠ CHANNEL COUNT, NOT CLAIMED EXHAUSTIVE: four when #4254 opened, five when
 // #4254 itself found the Record/Choice gap, six as of this fix. See the
-// commit body for what was checked and what was not (e.g. inline arrays of
-// CLASS-typed or CHOICE-typed elements go through a different lowering path
-// entirely and are NOT covered by this fix — untested here).
+// commit body for what was checked and what was not.
+//
+// CORRECTION (fix #4280 send-back): this file originally claimed, right
+// here, that "inline arrays of CLASS-typed or CHOICE-typed elements go
+// through a different lowering path entirely and are NOT covered by this
+// fix". That claim was WRONG for the RECORD/CHOICE half, not merely
+// unverified — measured (see #4280), a `[N]SomeRecord`/`[N]SomeChoice`
+// return goes through the IDENTICAL raw-`CreateStore` shape this file's
+// own PIN rows fix for `string` elements, and was a live, unfixed UAF on
+// this file's own commit (`0c45cb6`). The CLASS half of the claim holds
+// (a class field-store retains via `lowerStringFieldStore` — see the
+// class-element control in the #4280 sibling file). See
+// inline_array_record_choice_element_call_result_param_alias_uaf_4280
+// _test.cpp for the Record/Choice channel this file's fix did NOT close.
 //
 // MEASURED (isolated worktree, both legs this tree — `git diff` captured
 // before reverting, `git checkout --` to strip the fix, `cmake --build
@@ -85,8 +96,14 @@
 // LocalDecl-only scan never covering an `outer := <call>;` assignment
 // target") — not a new defect this fix introduces, and not proven identical
 // to 4266 here (a DIFFERENT collector very likely owns inline-array
-// call-result release eligibility). Filed as issue 4267 with the measured
-// repro rather than guessed at or silently folded into 4266.
+// call-result release eligibility). Filed as issue 4274 with the measured
+// repro rather than guessed at or silently folded into 4266. (fix #4280
+// send-back: this comment previously misspelled the citation as "issue
+// 4267" — 4267 is a real, unrelated, open issue, a different lane's
+// producerState move-classifier finding. Corrected here; a dedicated
+// regression row for this imported-axis leak now lives in
+// inline_array_record_choice_element_call_result_param_alias_uaf_4280
+// _test.cpp, reusing #4260's LibHandle/AppHandle two-module harness.)
 //
 // See tests/README.md for the `runAot`/`runAotChecked` harness this file
 // uses exclusively, and record_choice_call_result_param_alias_uaf_4254_test
@@ -291,4 +308,49 @@ BEZEL_TEST(inline_array_string_call_result_param_alias_uaf_4265,
         "  end Main; "
         "end C;";
     BEZEL_EXPECT_TRUE(leaksAtLeast(prog, 2000));
+}
+
+// ===========================================================================
+// NULLABLE-ELEMENT PIN (fix #4280 send-back review finding 3) — the SAME
+// channel this file's fix already closes, for `[1]string?` rather than
+// `[1]string`. The guard's InlineArray arm (`elementMayEmbedStringArgUnretained`
+// in LlvmBackend_Setup.cpp) tests `arrayElement->kind == Primitive &&
+// primitive == String` and does NOT read `arrayElement->nullable` — so a
+// nullable-string-element array is suppressed identically to a non-nullable
+// one, with no code change needed for this row. Filed as a gap ("no
+// dedicated row pins this") in `fix #4265`'s own commit body; this row is
+// that pin.
+//
+// MEASURED, both legs:
+//   - FAIL-WITHOUT (isolated worktree at `f8b12ba`, one commit before
+//     #4265's fix, `scripts/agent_check.sh --probe --asan`): a real
+//     `AddressSanitizer: heap-use-after-free`, READ of size 8, freed in
+//     `main`, previously allocated in `main`, the identical 32-byte
+//     `bz.string`-header region signature every other row in this family
+//     measures.
+//   - PASS-WITH (this tree, `0c45cb6` / HEAD, same probe): clean, exit 5,
+//     no ASan/LSan output.
+// So this row fails without the fix and passes with it, using the EXISTING
+// (unmodified by this send-back) `string`-element arm.
+// ===========================================================================
+BEZEL_TEST(inline_array_string_call_result_param_alias_uaf_4265,
+           narrow_scope_helper_returned_nullable_string_element_array_no_longer_uaf) {
+    const char* prog =
+        "module M; "
+        "class Helper "
+        "  public static method Wrap(s: string): [1]string? "
+        "    return [s]; "
+        "  end Wrap; "
+        "end Helper; "
+        "class C "
+        "  public static method Main(): int "
+        "    var outer: [1]string?; "
+        "    do "
+        "      var s := \"he\" + \"llo\"; "
+        "      outer := Helper.Wrap(s); "
+        "    end; "
+        "    return outer[0]!.Length; "
+        "  end Main; "
+        "end C;";
+    BEZEL_EXPECT_EQ(runChecked(prog), 5);
 }
