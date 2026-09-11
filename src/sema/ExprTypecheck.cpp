@@ -16510,6 +16510,58 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                         }
                     }
                 }
+                // fix #4316 (§5.1/§15.4/§11.2, v0.298): a plain `outer :=
+                // [...]` reassignment had NO admissibility gate and NO
+                // per-element conformance check at all — a strictly LARGER
+                // gap than #4310's six original positions and #4323's
+                // lambda-body seventh, which at least ran
+                // `isCollectionLiteralAdmissibleTarget` before #4310 landed.
+                // Nothing sets a collection literal's own `exprType` at any
+                // of those positions either (see
+                // `checkCollectionLiteralElementAssignability`'s header
+                // comment) — `fromTy` above is simply null for a
+                // `CollectionLiteralExpr` RHS — so the `checkAssignable`
+                // call below silently no-ops on its `if (!from) return`
+                // guard and the RHS reached codegen completely unchecked
+                // (measured SIGSEGV: a non-conforming class stored through
+                // `outer[0].GetV()` dispatches a null itable slot, #4302's
+                // signature). Mirror the ReturnStmt/LocalDecl/FieldDecl
+                // positions: gate on §15.4 membership first (the SAME three
+                // diagnostics those positions report), then run #4310's
+                // shared per-element walk against the RESOLVED TARGET TYPE
+                // directly — not through `ctx_.exprType`, which the literal
+                // never carries at any position.
+                if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(
+                        as->value.get())) {
+                    const bool isEmpty = !cl->isDict && cl->elements.empty();
+                    const bool admitted =
+                        isEmpty ? isCollectionLiteralEmptyAdmissibleTarget(toTy)
+                                : isCollectionLiteralAdmissibleTarget(
+                                      toTy, cl->isDict);
+                    if (toTy && toTy->kind != TypeRef::Kind::Error &&
+                        !admitted) {
+                        if (isCollectionLiteralInterfaceTarget(toTy))
+                            reportCollectionLiteralInterfaceTarget(
+                                ctx_.diagnostics(), as->value->span.begin,
+                                namedTypeSimpleName(toTy));
+                        else if (cl->isDict &&
+                                 isCollectionLiteralAdmissibleTarget(
+                                     toTy, /*isDict=*/false))
+                            reportCollectionLiteralDictFormBadTarget(
+                                ctx_.diagnostics(), as->value->span.begin,
+                                toTy);
+                        else
+                            reportCollectionLiteralBadTarget(
+                                ctx_.diagnostics(), as->value->span.begin,
+                                toTy);
+                    } else {
+                        // per §5.1/§11.2 — #4310's shared per-element walk,
+                        // reused rather than an eighth hand-rolled copy
+                        // (LANE_RULES §6/§25). Closes #4302's exact crash
+                        // signature at this position (filed as #4316).
+                        checkCollectionLiteralElementAssignability(*cl, toTy);
+                    }
+                }
                 // §5.1 "Constant narrowing" (#738, one definition since
                 // #2925): the re-type lives in checkAssignable
                 // (narrowIntConstantToTarget), which this arm's own copy used
