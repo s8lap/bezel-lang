@@ -633,3 +633,109 @@ BEZEL_TEST(explicit_dispose_borrow_became_owned_leak_4246,
     BEZEL_EXPECT_TRUE(jr.ran);
     BEZEL_EXPECT_EQ(jr.exitCode, 0);
 }
+
+// ============================================================================
+// BRANCH-JOIN NULL-GUARD REGRESSION GUARD — CALL-RESULT AXIS (issue #4272,
+// follow-up to the member-access row above). C3-L9's axis sweep for #4272
+// enumerated every non-`IdentifierExpr` RHS shape the issue's own text names
+// or suggests (member access, call result, cast, ternary, `await`, `move`)
+// against the SAME branch-join shape as the member-access row above, to
+// bound what `fix #4246`'s null-guard is actually protecting. Table
+// (MEASURED, `scripts/agent_check.sh --probe [--asan]`, this lane):
+//
+//   member access (`y := h.item;`)         reaches the null-guard, clean — landed above
+//   call result   (`y := h.Get();`)        reaches the null-guard, clean — THIS row
+//   cast          (`y := (h.item as Res) ?? h.item;`)   reaches it, clean (measured, no new row)
+//   ternary       (`y := (if c then h.item else h.item);`) reaches it, clean (measured, no new row)
+//   `move` of a non-owned field (`y := move h.item;`)   DIFFERENT bug: a
+//     straight-line (no branch, no merge, no null-guard involvement at all)
+//     `move` of a plain (non-`owned`) field is wrongly ACCEPTED — spec says
+//     "`move` is also an error on ... a borrow" — and codegen treats the
+//     moved-from read as a fresh owned value, so `y.Dispose()` reclaims the
+//     SAME object `x` still owns; `x.Dispose()` then reads/frees it again —
+//     a measured heap-use-after-free with ZERO branching. Filed separately
+//     (issue 4284) — not this issue's null-guard at all.
+//   `await` of a Pattern-A class-typed task result (`using var t := ...;
+//     y := await t;`)                       DIFFERENT bug: also reproduces
+//     straight-line (no branch) as a heap-use-after-free inside
+//     `bz$elemDispose` / `bz_task_free` (bezel_runtime_concurrency.cpp:1156)
+//     when the `using var` task local's own scope ends — the task frame's
+//     result-element disposal does not know the borrowed result was already
+//     independently discharged by its real owner. Filed separately (issue
+//     4285) — a `Task`/`OwningTask` frame-teardown gap, not codegen's
+//     dispatch-only fallback or the null-guard.
+//
+// So 4 of 6 candidate axes reach the EXACT null-guard path (mixed
+// true/false `explicitDisposeReclaimedSlot` AND-merge, one arm's slot
+// already nulled by its own reclaim); the other 2 hit unrelated,
+// independently-filed bugs before ever reaching branch-join territory. This
+// row adds the CALL-RESULT axis as a second, AST-distinct (`CallExpr`, not
+// `MemberAccessExpr`) discriminator alongside the member-access row, so the
+// suite does not depend on a single expression-node shape to prove the
+// guard live. Structure identical to the member-access row: one arm
+// reassigns-and-disposes a FRESH owned value (reclaim-eligible, nulls the
+// slot); the other reassigns via `h.Get()` (a plain, non-`owned`-announced
+// instance method returning `this.item` — a borrow, same as the field read)
+// and disposes it (dispatch-only, correctly, since reclaiming would
+// double-free `x`); the shared post-merge dispose hits the mixed AND-merge.
+//
+// MECHANICALLY VERIFIED (this lane, C3-L9, not merely argued): with the
+// null-guard temporarily removed from `emitExplicitDisposeChain`'s
+// dispatch-only fallback (LlvmBackend_Calls2.cpp, the
+// `builder_.CreateCondBr(nonNull, dnn, dcont)` guard replaced with an
+// unconditional `emitDynamicDispose(recv)`), BOTH this row and the
+// member-access row above SIGSEGV under a plain (non-ASan) rebuild — the
+// pre-existing member-access row is not just "untested", the underlying
+// mechanism is exercised by both axes identically. Restored on the
+// original guard, both rows pass again, clean under ASan. // per §28.3,
+// §28.6, v0.298, #4236, #4246, #4272
+// ============================================================================
+
+BEZEL_TEST(explicit_dispose_borrow_became_owned_leak_4246,
+           branch_join_mixed_reclaim_via_call_result_borrow_no_crash_28_3_4272) {
+    JitResult jr = runAotChecked(
+        "module M; "
+        "class Res "
+        "  public tag: int; "
+        "  public constructor(t: int) this.tag := t; end constructor; "
+        "  destructor end destructor; "
+        "end Res; "
+        "class Holder "
+        "  public item: Res; "
+        "  public constructor(r: Res) this.item := r; end constructor; "
+        "  public method Get(): Res "
+        "    return this.item; "
+        "  end Get; "
+        "end Holder; "
+        "class C "
+        "  public static method OneIteration(cond: bool): int "
+        "    var x := new Res(5); "
+        "    var y := x; "
+        "    var h := new Holder(x); "
+        "    if cond then "
+        "      y := new Res(1); "
+        "      y.Dispose(); "
+        "    else "
+        "      y := h.Get(); "
+        "      y.Dispose(); "
+        "    end; "
+        "    y.Dispose(); "
+        "    x.Dispose(); "
+        "    return 1; "
+        "  end OneIteration; "
+        "  public static method Main(): int "
+        "    var i := 0; "
+        "    var acc := 0; "
+        "    while i < 300 do "
+        "      acc := acc + C.OneIteration(i mod 2 = 0); "
+        "      i := i + 1; "
+        "    end; "
+        "    return acc - 300; "
+        "  end Main; "
+        "end C; ");
+    if (wasSkipped(jr)) return;
+    // MEASURED: exit=0 (each OneIteration returns 1, 300 calls, minus 300;
+    // 150 reclaiming-arm + 150 borrow-arm calls, alternating, never crash).
+    BEZEL_EXPECT_TRUE(jr.ran);
+    BEZEL_EXPECT_EQ(jr.exitCode, 0);
+}
