@@ -2257,7 +2257,30 @@ void Parser::parseAndDiscardExtensionPolymorphicMember() {
     advance();  // past `polymorphic`
     if (consumePunctuator("(")) {
         int depth = 1;
-        while (depth > 0 && current_.kind != TokenKind::EndOfFile) {
+        // fix #4257 (send-back on #4222): also bound the scan by `end`, not
+        // just EOF/depth-0, mirroring this loop's own caller
+        // (`parseExtensionDecl`'s member loop condition is
+        // `!isKeyword("end") && current_.kind != TokenKind::EndOfFile`).
+        // Without this, an unclosed `(` — the single most likely real typo
+        // here — made the depth-tracking scan consume the extension's own
+        // `end extension;` terminator and every subsequent top-level
+        // declaration to EOF (#4257's measured repro).
+        //
+        // This cannot misfire on well-formed input: A.4's
+        // `PolymorphicMember ::= "polymorphic" "(" PolyCase ("," PolyCase)*
+        // ","? ")" ";"` and `PolyCase ::= StringLiteral ":" QualifiedName`
+        // (QualifiedName ::= Identifier ("." Identifier)*) admit only
+        // StringLiteral / ":" / "," / "." / Identifier tokens (and the
+        // closing ")") inside the parens — never a nested "(" and never a
+        // bare `end`, because `end` is in the Lexer's reserved-keyword list
+        // (`Lexer.cpp:113`) and so always lexes as `TokenKind::Keyword`,
+        // never as an `Identifier` a `QualifiedName` could contain. So a
+        // well-formed clause can never be at depth >= 1 when the current
+        // token is the `end` keyword, and this bound is unreachable on the
+        // happy path — verified structurally, not just by the existing
+        // lit test staying green.
+        while (depth > 0 && current_.kind != TokenKind::EndOfFile &&
+               !isKeyword("end")) {
             if (isPunctuator("(")) {
                 ++depth;
             } else if (isPunctuator(")")) {
