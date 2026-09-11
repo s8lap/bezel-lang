@@ -3080,13 +3080,52 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
         // directly without consulting this local's own `.state`. // per
         // §21.1, §28.3, #3687
         if (lc->value) {
-            if (sema::Symbol* src = borrowSourceForExpr(*lc->value)) {
+            sema::Symbol* src = borrowSourceForExpr(*lc->value);
+            // fix #4236 send-back / §28.3, §28.6 (v0.298), LANE_RULES §6 sibling
+            // trap: `disposeAliasSource` (OwnershipState.hpp) is the DEDICATED
+            // field `checkDisposeReceiverOwnership` reads to reject `.Dispose()`
+            // through a named alias, and it is written at `handleLocalDecl`
+            // (the `var` twin) and at plain reassignment (`handleAssignment`) —
+            // but never here, because `ast::LocalConstDecl` is a different AST
+            // node from `ast::LocalDecl` and this arm was never given the
+            // parallel write. `fix #3687` immediately above already established
+            // that a `const` is tracked as a borrow "exactly as a plain
+            // unmarked `var` alias" for `.source`; this is the same statement
+            // for `disposeAliasSource`. Recomputed independently of `src`
+            // above (mirroring handleLocalDecl exactly) rather than gated on
+            // it succeeding: `src`/`borrowSourceForExpr` answers null for
+            // every compiler-builtin collection (Array/Dictionary/Set/
+            // LinkedList/...; see disposeAliasSource's header comment for
+            // why), so `const b: Array<int> := a;` would otherwise never even
+            // reach the `states_[lsym] = lo` write below — `b` would stay
+            // absent from `states_` entirely and `b.Dispose()` would fall
+            // through checkDisposeReceiverOwnership's "local absent from
+            // states_" catch-all, uncaught. Measured pre-fix: this exact
+            // program compiled clean and double-freed identically to the
+            // `var` shape #4236 fixed. Narrowly recognizes ONLY a bare
+            // IDENTIFIER read (never member/index/other projection) whose
+            // resolved symbol is, right now, a still-Owned tracked local
+            // (isOwnedTrackedLocal) — sound for the same §28.3 K1.5 reason
+            // handleLocalDecl's comment gives: an identifier read of a
+            // class-/interface-/collection-typed OWNED local is always a
+            // reference alias, never a value copy. // per §21.1, §28.3,
+            // §28.6, #3687, #4236
+            sema::Symbol* aliasSrc = nullptr;
+            if (auto* rid =
+                    dynamic_cast<const ast::IdentifierExpr*>(lc->value.get())) {
+                sema::Symbol* rsym = ctx_.exprSymbol(*rid);
+                if (isOwnedTrackedLocal(rsym)) aliasSrc = rsym;
+            }
+            if (src || aliasSrc) {
                 if (sema::LocalSymbol* lsym = findLocalSymbol(*lc)) {
-                    BorrowSource bs;
-                    bs.sym = src;
                     LocalOwnership lo;
                     lo.state = OwnershipState::Borrowed;
-                    lo.source = bs;
+                    if (src) {
+                        BorrowSource bs;
+                        bs.sym = src;
+                        lo.source = bs;
+                    }
+                    if (aliasSrc) lo.disposeAliasSource = aliasSrc;
                     states_[lsym] = lo;
                 }
             }

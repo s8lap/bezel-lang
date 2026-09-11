@@ -21,14 +21,32 @@
 // had a documented, deliberate gap for "a plain `var`/`using var` local" that
 // could not (in general) distinguish a genuine identifier re-borrow from an
 // owned call-result disposable (an IEnumerator from GetEnumerator(), a
-// Subscription from Subscribe(), ...) — and admitted BOTH. The fix narrows
-// that gap using an authority the ownership pass ALREADY computes for a
-// different purpose (borrow-escape diagnostics): `states_[sym].source`,
-// populated by `borrowSourceForExpr`'s Shape 1 ONLY for an identifier/field/
-// index re-borrow rooted at a still-tracked owned local — NEVER for a
-// CallExpr initializer. A Borrowed local WITH a recorded source is
-// unambiguous; a Borrowed local with none is untouched (the accept-side
-// control rows below pin that).
+// Subscription from Subscribe(), ...) — and admitted BOTH.
+//
+// THE MECHANISM, ACTUALLY SHIPPED (an earlier revision of this comment
+// described a first attempt — reusing `states_[sym].source`, populated by
+// `borrowSourceForExpr` — that was abandoned: `borrowSourceForExpr`'s Shape 1
+// gate, `returnedExprMayBorrow -> isBorrowableType`, answers FALSE for every
+// compiler-builtin collection (Array/Dictionary/Set/LinkedList/...) — a Named
+// TypeRef with a null `declaration` is the SAME SHAPE `isBorrowableType` uses
+// for an unresolved generic parameter — so `.source` is never populated for a
+// collection-typed alias local at all, and that first attempt built and ran
+// green on its own tests while producing ZERO rejections on any of #4236's
+// collection repros. Do not repeat that attempt.): a new, DEDICATED field,
+// `LocalOwnership::disposeAliasSource` (OwnershipState.hpp), consumed ONLY by
+// `checkDisposeReceiverOwnership`. Populated at a plain LocalDecl
+// (`handleLocalDecl`), at a `const` LocalConstDecl (`visitStmt`'s
+// LocalConstDecl arm — a send-back fix; the field is a DIFFERENT AST node
+// from LocalDecl and was originally missed there, LANE_RULES §6's sibling
+// trap), re-derived at every plain reassignment (`handleAssignment`), and
+// OR-merged across a branch join that converges to the same state
+// (`joinInto`, Ownership_Checks.cpp — also a send-back fix, see the
+// branch-order-luck rows below) — always via the SAME narrow test: a bare
+// IDENTIFIER read (never a member/index/other projection) whose resolved
+// symbol is, right now, a still-Owned tracked local (`isOwnedTrackedLocal`).
+// A local WITH a recorded `disposeAliasSource` is an unambiguous alias; a
+// local with none is untouched (the accept-side control rows below pin
+// that).
 //
 // DIRECTION OF TRAVEL: this fix SUPPRESSES a free by rejecting the call
 // before codegen ever emits it — it does not change codegen's own
@@ -159,6 +177,68 @@ BEZEL_TEST(ownership_dispose_aliased_collection_4236,
     auto r = runAot(prog(
         "var a := new Array<int>(2); a.Add(1); "
         "var b: Array<int> := a; a.Dispose(); b.Dispose(); return 0;"));
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagContains(r, "cannot call `Dispose()` on `b`"));
+    BEZEL_EXPECT_TRUE(diagContains(r, "borrow (an alias) of `a`"));
+}
+
+// =====================================================================
+// SEND-BACK gap (a) — a `const` alias is a DIFFERENT AST node
+// (`ast::LocalConstDecl`, not `ast::LocalDecl`) and was never visited by the
+// original fix at all: it reproduced the identical `free(): invalid pointer`
+// / SIGABRT 134 crash the whole fix exists to close. §21.1/#3687 established
+// a `const` is tracked "exactly as a plain unmarked `var` alias" — this row
+// is that statement's Dispose() consequence.
+// =====================================================================
+
+BEZEL_TEST(ownership_dispose_aliased_collection_4236,
+           const_array_alias_dot_dispose_rejected_28_6) {
+    auto r = runAot(prog(
+        "var a := new Array<int>(2); a.Add(1); "
+        "const b: Array<int> := a; b.Dispose(); return 0;"));
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagContains(r, "cannot call `Dispose()` on `b`"));
+    BEZEL_EXPECT_TRUE(diagContains(r, "borrow (an alias) of `a`"));
+}
+
+// =====================================================================
+// SEND-BACK gap (b) — `joinInto`'s same-state early `continue` kept only the
+// FIRST-LISTED branch's `disposeAliasSource`, so whether this program was
+// rejected was pure branch-order luck. Both arm orders must reject
+// IDENTICALLY: swapping `then`/`else` must not change the verdict.
+// =====================================================================
+
+// `then` sets the alias (front branch, previously WON the join) — was
+// already correctly rejected pre-send-back; pinned here as the control that
+// proves the merge fix did not disturb the order that already worked.
+BEZEL_TEST(ownership_dispose_aliased_collection_4236,
+           branch_join_alias_then_arm_rejected_28_3) {
+    auto r = runAot(prog(
+        "var cond := false; "
+        "var a := new Array<int>(2); a.Add(1); "
+        "var b: Array<int>; "
+        "if cond then b := a; else b := Helper.Peek(a); end; "
+        "b.Dispose(); return 0;",
+        "class Helper public static method Peek(x: Array<int>): Array<int> "
+        "return x; end Peek; end Helper; "));
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagContains(r, "cannot call `Dispose()` on `b`"));
+    BEZEL_EXPECT_TRUE(diagContains(r, "borrow (an alias) of `a`"));
+}
+
+// `else` sets the alias (second-listed branch, previously LOST the join and
+// its `disposeAliasSource` was discarded) — this is the shape that was
+// silently ACCEPTED and double-freed pre-send-back.
+BEZEL_TEST(ownership_dispose_aliased_collection_4236,
+           branch_join_alias_else_arm_rejected_28_3) {
+    auto r = runAot(prog(
+        "var cond := false; "
+        "var a := new Array<int>(2); a.Add(1); "
+        "var b: Array<int>; "
+        "if cond then b := Helper.Peek(a); else b := a; end; "
+        "b.Dispose(); return 0;",
+        "class Helper public static method Peek(x: Array<int>): Array<int> "
+        "return x; end Peek; end Helper; "));
     BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
     BEZEL_EXPECT_TRUE(diagContains(r, "cannot call `Dispose()` on `b`"));
     BEZEL_EXPECT_TRUE(diagContains(r, "borrow (an alias) of `a`"));

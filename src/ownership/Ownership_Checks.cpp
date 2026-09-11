@@ -8540,6 +8540,31 @@ void MethodOwnership::joinInto(std::unordered_map<sema::Symbol*, LocalOwnership>
             // incoming path wash the marker out and re-admit the use. // per §28.3
             if (st.state == OwnershipState::Owned)
                 st.maybeConsumed = st.maybeConsumed || o.maybeConsumed;
+            // fix #4236 send-back / §28.3, §28.6 (v0.298): this same-state
+            // early `continue` kept ONLY `st`'s (branchEndStates.front(), the
+            // `if`-branch's — see the IfStmt join call site) `disposeAliasSource`
+            // verbatim, silently discarding `other`'s when both branches land
+            // on Borrowed but only one of them is a recognized alias — e.g.
+            // `if cond then b := Helper.Peek(a); else b := a; end; b.Dispose();`:
+            // the `then` branch's CallExpr producer leaves `disposeAliasSource`
+            // null, the `else` branch's bare-identifier alias sets it to `a`,
+            // and keeping only the front branch's record made the whole
+            // rejection PURE BRANCH-ORDER LUCK — swapping the two arms (an
+            // otherwise-identical program) flipped `.Dispose()` from correctly
+            // rejected to silently accepted and double-freed. `disposeAliasSource`
+            // is populated ONLY when a branch's own producer left it Borrowed
+            // via a recognized bare-identifier alias (OwnershipState.hpp's
+            // header comment; the three setters in Ownership.cpp), so an
+            // OR-style merge here can only ever ADD a genuine alias fact, never
+            // invent one: if EITHER incoming branch is a known alias of a named
+            // owned binding, the merged local is aliased on at least that
+            // reachable path, and §28.6's "Dispose() through a borrow is a
+            // compile error" must still reject it post-join — exactly the
+            // same asymmetric, favor-soundness-over-permissiveness posture
+            // this function's `ownedDischargedSplit` arm below already takes.
+            // // per §28.3, §28.6
+            if (!st.disposeAliasSource && o.disposeAliasSource)
+                st.disposeAliasSource = o.disposeAliasSource;
             continue;
         }
         // PolyNull absorbs: PolyNull ⊓ X = X.

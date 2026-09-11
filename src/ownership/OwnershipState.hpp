@@ -49,12 +49,23 @@ struct LocalOwnership {
     std::optional<BorrowSource> source;
     // fix #4236 / §28.3 "Ownership state of locals", §28.6 "Who may call
     // Dispose()" (v0.298): a DEDICATED, narrower sibling of `source` above,
-    // consumed ONLY by checkDisposeReceiverOwnership. Populated at this
-    // local's LocalDecl (never re-derived later, so it is immune to the
-    // source's own later state changes — e.g. a subsequent `move` of it)
-    // when the declaration is a plain (non-`using`, non-`owned`-marked) bare
-    // IDENTIFIER read whose resolved symbol was, AT THAT DECLARATION POINT,
-    // a still-Owned tracked local. Deliberately NOT reused from `source`
+    // consumed ONLY by checkDisposeReceiverOwnership. Populated at THREE
+    // sites, all in Ownership.cpp, all applying the same narrow bare-
+    // IDENTIFIER-of-a-still-Owned-tracked-local test: `handleLocalDecl` (a
+    // plain, non-`using`, non-`owned`-marked local declaration), the
+    // LocalConstDecl arm (a `const`, fix #4236 send-back — §21.1/#3687
+    // already established a `const` is tracked exactly as a plain unmarked
+    // `var` alias for `source`; this is that statement for
+    // `disposeAliasSource`), and `handleAssignment`, which RE-DERIVES
+    // (set-or-cleared) it on every plain reassignment of the local so a
+    // rebind away from an alias (`b := a; b := c;`) does not leave a stale
+    // alias-source and a rebind onto one is newly recognized — it is NOT
+    // immune to later state changes, it is recomputed alongside `source` at
+    // every one of them. `joinInto` (Ownership_Checks.cpp, fix #4236
+    // send-back) additionally OR-merges it across a branch join that
+    // converges to the same state, so which arm is listed first cannot
+    // change whether a post-join alias is recognized. Deliberately NOT
+    // reused from `source`
     // (borrowSourceForExpr's Shape 1): that field's populate gate
     // (returnedExprMayBorrow -> isBorrowableType) answers FALSE for every
     // compiler-builtin collection (Array/Dictionary/Set/LinkedList/...) — a
