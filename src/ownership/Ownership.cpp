@@ -5489,7 +5489,8 @@ bool MethodOwnership::usingVarInitIsRecognizedBorrow(const ast::Expr& init) cons
     return false;
 }
 
-void MethodOwnership::handleLocalDecl(const ast::LocalDecl& ld) {
+void MethodOwnership::handleLocalDecl(const ast::LocalDecl& ld,
+                                      bool fromLambdaBody) {
     // #1066 / §9.7 (v0.153): `var b := new Bag([…])` from a temporary is a
     // dangling borrow. Checked before the lsym early-return so it runs for a
     // value-typed (record) binding too, matching the handleReturn/handleAssignment
@@ -5882,8 +5883,46 @@ void MethodOwnership::handleLocalDecl(const ast::LocalDecl& ld) {
                     dynamic_cast<const ast::IdentifierExpr*>(
                         ld.initializer.get())) {
                 sema::Symbol* rsym = ctx_.exprSymbol(*rid);
-                if (isOwnedTrackedLocal(rsym))
+                if (isOwnedTrackedLocal(rsym)) {
                     states_[lsym].disposeAliasSource = rsym;
+                } else if (fromLambdaBody &&
+                           isOwnedTrackedLocalInEnclosingFrame(rsym)) {
+                    // fix #4286 (§28.3 "Ownership state of locals" / §28.6
+                    // "Who may call Dispose()", v0.298): LAMBDA-BODY-ONLY
+                    // retry. `isOwnedTrackedLocal` above reads `states_`,
+                    // which `applyUsingVarBorrowPinInLambdas` (#2166) clears
+                    // and rebuilds from scratch for EACH lambda body — a
+                    // CAPTURED owned local from an enclosing frame (the
+                    // method, or an outer lambda) is therefore never a key
+                    // of it, even though §28.9 "Capturing an owned
+                    // class-typed local" makes the capture a borrow exactly
+                    // like the method-level identifier-alias case above.
+                    // Measured (issue #4286): `var a := new Array<int>(2);
+                    // var f := lambda() => do var b := a; b.Dispose(); ...
+                    // end;` — and the `using var` twin — compiled clean and
+                    // double-freed in `bz_array_free`, byte-for-byte the
+                    // #4236 crash signature, one capture hop over.
+                    //
+                    // Gated on `fromLambdaBody` so the method-level call
+                    // site (whose own dataflow has already populated
+                    // `states_` for every local declared earlier in program
+                    // order) never reaches this retry — it would be
+                    // unreachable there anyway (the primary check above is
+                    // already sufficient), but gating keeps that path
+                    // provably byte-identical rather than relying on it.
+                    //
+                    // `isOwnedTrackedLocalInEnclosingFrame`, NOT
+                    // `enclosingFrameOwnedLocalBorrowSource` — see the
+                    // former's declaration comment for why the latter (built
+                    // on `borrowSourceForExpr`, whose Shape 1 gates on
+                    // `returnedExprMayBorrow` and answers false for every
+                    // builtin collection) silently never fires for exactly
+                    // this issue's own `Array<int>` repro. An `owned`
+                    // PARAMETER capture is a deliberately-unclosed sibling
+                    // gap — see this fix's commit body / issue #4286's
+                    // tracking comment for the follow-up.
+                    states_[lsym].disposeAliasSource = rsym;
+                }
             }
             // fix #4283 (§28.3 "Ownership state of locals" / §28.6 "Who may
             // call Dispose()", v0.298): the IdentifierExpr check above can
@@ -9321,11 +9360,79 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdas(
 // (a conservative over-adopt → ASan trip), so completeness is the bar.
 void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
     if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
-        handleLocalDecl(*ld);
+        // fix #4286: `fromLambdaBody=true` — see `handleLocalDecl`'s own
+        // #4286 comment for why this call site needs the retry the
+        // method-level `visitStmt` call site (Ownership.cpp) does not.
+        handleLocalDecl(*ld, /*fromLambdaBody=*/true);
         return;
     }
     if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(&s)) {
         if (lc->value) {
+            // fix #4286 (§28.3 "Ownership state of locals" / §28.6 "Who may
+            // call Dispose()", v0.298): populate `disposeAliasSource` for a
+            // `const` declared INSIDE a lambda body. Unlike the LocalDecl
+            // arm just above (which reuses `handleLocalDecl` — the SAME
+            // function the method-level `visitStmt` LocalDecl arm calls),
+            // this arm previously did nothing but hunt for nested lambdas:
+            // there is no shared "handleLocalConstDecl" this call site could
+            // reuse, because `visitStmt`'s own `LocalConstDecl` arm
+            // (Ownership.cpp, the alias-detection block a few hundred lines
+            // above this file's `handleAssignment`) is written inline there,
+            // never factored into a callable function. So a lambda-body
+            // `const` reached NEITHER the own-frame identifier check NOR the
+            // #4283 field-read check NOR (this fix's addition) the
+            // enclosing-frame capture retry — all three are mirrored here,
+            // narrowly, rather than reused, because there is nothing to
+            // reuse for this call site.
+            //
+            // Measured (issue #4286): `const b := a; b.Dispose();` (`a` a
+            // captured owned local) AND `const b := this._arr;
+            // b.Dispose();` (an owned-field alias) both compiled clean
+            // inside a lambda body and double-freed in `bz_array_free`,
+            // identically to the `var`/`using var` shapes fixed alongside
+            // this arm — the `const` twin of both the capture gap this fix
+            // closes and the #4283 field-alias gap (already closed for
+            // `var`/`using var` because `handleLocalDecl` IS reused for
+            // lambda bodies, via the LocalDecl arm above).
+            //
+            // Mirrors `visitStmt`'s `LocalConstDecl` arm's alias-detection
+            // shape exactly (own-frame identifier check via
+            // `isOwnedTrackedLocal`, then the #4283 `exprIsOwnedFieldRead`
+            // field-read check), PLUS the enclosing-frame retry
+            // `handleLocalDecl`'s own #4286 addition uses — see that
+            // comment for the full authority-reuse rationale
+            // (`enclosingFrameOwnedLocalBorrowSource`, `LocalOnly`).
+            // Deliberately does NOT port the method-level arm's `.source`/
+            // `BorrowSource` population (fix #3687) — that field is
+            // consumed by a DIFFERENT check (the borrow-store-escape
+            // channel), unrelated to this fix's `disposeAliasSource`
+            // double-free, and porting it is untested, out-of-scope blast
+            // radius this fix does not take on.
+            sema::Symbol* aliasSrc = nullptr;
+            if (auto* rid = dynamic_cast<const ast::IdentifierExpr*>(
+                    lc->value.get())) {
+                sema::Symbol* rsym = ctx_.exprSymbol(*rid);
+                if (isOwnedTrackedLocal(rsym)) {
+                    aliasSrc = rsym;
+                } else if (isOwnedTrackedLocalInEnclosingFrame(rsym)) {
+                    // fix #4286: `isOwnedTrackedLocalInEnclosingFrame`, NOT
+                    // `enclosingFrameOwnedLocalBorrowSource` — see that
+                    // function's declaration comment (Ownership_impl.hpp) for
+                    // why the latter silently never fires for a captured
+                    // builtin-collection local (this issue's own repro type).
+                    aliasSrc = rsym;
+                }
+            }
+            if (!aliasSrc && exprIsOwnedFieldRead(*lc->value))
+                aliasSrc = ctx_.exprSymbol(*lc->value);
+            if (aliasSrc) {
+                if (sema::LocalSymbol* lsym = findLocalSymbol(*lc)) {
+                    LocalOwnership lo;
+                    lo.state = OwnershipState::Borrowed;
+                    lo.disposeAliasSource = aliasSrc;
+                    states_[lsym] = lo;
+                }
+            }
             std::vector<const ast::LambdaExpr*> nestedLambdas;
             collectBodyLambdasExpr(*lc->value, nestedLambdas);
             for (const ast::LambdaExpr* nested : nestedLambdas)

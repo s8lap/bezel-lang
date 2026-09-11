@@ -1162,7 +1162,17 @@ private:
     // position `case`/`when` whose arms mix an owned value with a borrow.
     void checkArmMeetMixed(const ast::Expr& e);
 
-    void handleLocalDecl(const ast::LocalDecl& ld);
+    // fix #4286 (§28.3 / §28.6, v0.298): `fromLambdaBody` mirrors the
+    // established `fromLambdaBody` convention (`checkCollectionBorrowStoreEscape`
+    // / `checkIndexerSetBorrowStoreEscape`, fix #3799) — true ONLY when this
+    // call is driven from `applyUsingVarBorrowPinInLambdaStmt` (the #2166
+    // lambda-body pre-pass), never from the method-level `visitStmt` call site.
+    // Gates a RETRY of the bare-identifier alias check (see the definition)
+    // against the enclosing frame's owned-obligation seed, needed because a
+    // lambda body's own `states_` is cleared and rebuilt from scratch per
+    // lambda and so never contains a CAPTURED owned local from an enclosing
+    // frame. Defaulted so every pre-existing call site is unaffected.
+    void handleLocalDecl(const ast::LocalDecl& ld, bool fromLambdaBody = false);
 
     // §17.15 / K8.5 (v0.216, #2098): process a binding atom `(var x := E;
     // body)` in evaluation order — each clause through handleLocalDecl (the
@@ -2952,6 +2962,53 @@ private:
     // // per §28.3, §28.9, §27.5, v0.286
     sema::Symbol* enclosingFrameOwnedLocalBorrowSource(const ast::Expr& rhs,
                                                        OwnedSourceKinds kinds);
+
+    // fix #4286 (§28.3 "Ownership state of locals" / §28.6 "Who may call
+    // Dispose()", v0.298): answers "is `sym` a LOCAL whose OWN declaration is
+    // a fresh owned production" — a purely DECLARATION-SITE fact, usable from
+    // the EARLY lambda-body pre-pass this fix's call sites run in.
+    //
+    // Deliberately NOT built on `enclosingFrameOwnedLocalBorrowSource` above,
+    // and NOT the `enclosingFrameOwnedStates_`/`localIsOwnedObligation` seed
+    // that helper uses — TWO independent, both-measured reasons:
+    //  1. `localIsOwnedObligation` answers "will this declaration need a
+    //     SYNTHESIZED end-of-scope auto-drop" (`ld->autoDropAtScopeEnd` /
+    //     `ld->becomesOwnedViaReassign`) — both flags are set by
+    //     Ownership.cpp's OWN dataflow, `autoDropAtScopeEnd` only by the
+    //     end-of-method auto-drop sweep (Ownership.cpp ~line 921) that runs
+    //     at the very END of `run()`. This fix's call site
+    //     (`applyUsingVarBorrowPinInLambdas`, #2166) runs at the TOP of
+    //     `run()` — well before that sweep, and `autoDropAtScopeEnd` is
+    //     FALSE outright for a local (this issue's own repro `a`) that is
+    //     later explicitly `.Dispose()`d, since an explicitly-discharged
+    //     local needs no synthesized auto-drop.
+    //  2. Even queried at the right TIME, `enclosingFrameOwnedLocalBorrowSource`
+    //     bottoms out in `ownedLocalBorrowSource` -> `borrowSourceForExpr`,
+    //     whose Shape 1 gates on `returnedExprMayBorrow` (`isBorrowableType`),
+    //     which — per `disposeAliasSource`'s OWN header comment
+    //     (OwnershipState.hpp) — answers FALSE for every compiler-builtin
+    //     collection (Array/Dictionary/Set/LinkedList/...; a Named TypeRef
+    //     with a null `declaration`, the same shape an unresolved generic
+    //     parameter has). That gate is EXACTLY why `disposeAliasSource`
+    //     exists as a separate field rather than a reuse of `.source` in the
+    //     first place (fix #4236's own header comment).
+    // MEASURED: reusing `enclosingFrameOwnedLocalBorrowSource` for this fix
+    // left every one of this issue's own repro programs (`var a := new
+    // Array<int>(2); ... var b := a; b.Dispose();` inside a lambda, and the
+    // `using var`/`const` twins) compiling clean — the fix appeared to do
+    // nothing, for reason 1 above (the `Array<int>` repro type ALSO trips
+    // reason 2, independently).
+    //
+    // `producerState` has neither dependency — it classifies an EXPRESSION
+    // (`new T(...)`, an owned-returning call, `move`, …) as Owned/Borrowed
+    // purely from its AST shape and static type, available at any point.
+    // It is the SAME classifier `handleLocalDecl` itself uses for its FIRST-
+    // CUT classification of a local's own declaration (`lo.state =
+    // producerState(*ld.initializer);`) — this helper asks that identical
+    // question about the CAPTURED symbol's declaration instead. Restricted
+    // to a `LocalSymbol` (an `owned` PARAMETER capture is a deliberately-
+    // unclosed sibling gap — see the commit body). // per §28.3, §28.6, v0.298
+    bool isOwnedTrackedLocalInEnclosingFrame(sema::Symbol* sym);
 
     // Issue #392 / §31.1: a returned bare catch-binding identifier
     // (`return ex;`) lets the in-flight exception instance escape the arm

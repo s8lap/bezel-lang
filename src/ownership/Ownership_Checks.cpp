@@ -6509,6 +6509,56 @@ bool MethodOwnership::frameSiteStrictlyEncloses(
     return outer.blockDepth < inner.blockDepth;
 }
 
+// fix #4286 (§28.3 / §28.6, v0.298): answers "is `sym` a local whose OWN
+// declaration is a fresh owned production" — a purely DECLARATION-SITE fact,
+// deliberately NOT the `enclosingFrameOwnedStates_`/`localIsOwnedObligation`
+// seed `enclosingFrameOwnedLocalBorrowSource` below uses. See the
+// declaration (Ownership_impl.hpp) for the full measured reason: that seed's
+// `localIsOwnedObligation` answers "will this declaration need a
+// SYNTHESIZED end-of-scope auto-drop" (`ld->autoDropAtScopeEnd` /
+// `ld->becomesOwnedViaReassign`), and BOTH of those flags are set by
+// Ownership.cpp's OWN dataflow — `autoDropAtScopeEnd` only by the
+// end-of-method auto-drop sweep (Ownership.cpp ~line 921), which runs at the
+// very END of `run()`, and is FALSE outright for a local (like this issue's
+// own repro `a`) that IS later explicitly `.Dispose()`d, since an explicitly-
+// discharged local needs no synthesized auto-drop. This fix's call site
+// (`applyUsingVarBorrowPinInLambdas`, #2166) runs at the TOP of `run()` —
+// MEASURED: reusing that seed here (via `enclosingFrameOwnedLocalBorrowSource`)
+// left every one of this issue's own repro programs compiling clean, because
+// the seed the query consulted was built from a flag that had not been (and,
+// for an explicitly-disposed local, never would be) set to true.
+//
+// `producerState` has no such dependency — it classifies an EXPRESSION
+// (`new T(...)`, an owned-returning call, `move`, …) as Owned/Borrowed purely
+// from its AST shape and static type (Ownership.cpp, used identically by
+// `handleLocalDecl`'s own FIRST-CUT classification of ITS local, `lo.state =
+// producerState(*ld.initializer);`) — available at any point, including this
+// early pre-pass. Restricted to a `LocalSymbol` (an `owned` PARAMETER capture
+// is a deliberately-unclosed sibling gap — see the commit body).
+//
+// LOCALDECL-ONLY, provably (#3591's family, see the marker just below the
+// cast): `ls->decl` for a `const`-declared symbol is an `ast::LocalConstDecl`,
+// never an `ast::LocalDecl`, so it falls through this cast to the `!ld`
+// early-return with no sibling arm. That is correct, not a gap — §21.1
+// (Ownership.cpp ~line 2767, "a `const` LOCAL is NEVER-OWNED") REJECTS a
+// `const` declaration outright when its initializer's `producerState` is
+// Owned ("The initializer must not be an owned production ... any other
+// producerState == Owned form"). So a program that reaches this function
+// with `sym` bound to a `const` can never have had an Owned-producing
+// initializer in the first place: the question this function asks is
+// unconditionally false for it, with or without a `LocalConstDecl` arm — the
+// SAME reasoning `enclosingFrameOwnedLocalBorrowSource` below already carries
+// its own `LOCALDECL-ONLY` marker for.
+bool MethodOwnership::isOwnedTrackedLocalInEnclosingFrame(sema::Symbol* sym) {
+    auto* ls = dynamic_cast<sema::LocalSymbol*>(sym);
+    if (!ls) return false;
+    // LOCALDECL-ONLY: a const's initializer can never be Owned (§21.1) — see
+    // this function's header comment above for the full reasoning.
+    const auto* ld = dynamic_cast<const ast::LocalDecl*>(ls->decl);
+    if (!ld || !ld->initializer) return false;
+    return producerState(*ld->initializer) == OwnershipState::Owned;
+}
+
 sema::Symbol* MethodOwnership::enclosingFrameOwnedLocalBorrowSource(
     const ast::Expr& rhs, OwnedSourceKinds kinds) {
     // fix #3727 (§28.3 / §28.9 / §27.5, v0.286). See the declaration for why
