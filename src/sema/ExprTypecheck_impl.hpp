@@ -1424,7 +1424,21 @@ private:
     // Slice T4: is `from` a subtype of `to` — i.e. does `to` appear in
     // `from`'s transitive base-type chain (base class or implemented
     // interface)? BFS, cycle-guarded.
+    //
+    // fix #4306 (§26.4/§26.5, v0.298): widened from `private` to `public`
+    // (bracketed rather than moved, to keep this declaration beside its
+    // Slice T4 neighbours) so the free function
+    // `selfCallSiblingWhereSatisfiedByCaller` (ExprTypecheck_Calls.cpp,
+    // outside this class, in an anonymous namespace) can reuse this EXACT
+    // authority for its own `type`-item subtype-entailment check, instead
+    // of a second, drifting spelling of the same BFS (§6 in this run's
+    // standing lane rules: "is there a fact the compiler ALREADY COMPUTES
+    // that decides this? Prefer feeding the existing authority"). No other
+    // change — same signature, same body, every existing call site
+    // unaffected by widened (never narrowed) access.
+public:
     static bool isSubtype(TypeSymbol* from, TypeSymbol* to);
+private:
 
     // fix #3559 (stdlib §5, v0.285): the shared REMOVED-at-v0.284 diagnostic
     // text both `OfType<U>()` typing arms raise — unconditionally, since the

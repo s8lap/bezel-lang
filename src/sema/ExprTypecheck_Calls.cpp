@@ -15970,11 +15970,17 @@ const ast::ExtensionDecl* owningExtensionDeclOf(
 // `currentExtension_`'s own declaration, to also satisfy `foundDecl`'s
 // clause. A same-block self-call (`foundDecl == callerDecl`) trivially
 // passes (a block's constraints are, tautologically, contained in
-// themselves), matching #4238's "already worked" control. Anything this
-// function cannot positively match is treated as UNSATISFIED (reject),
-// never as satisfied — the same "provable violation only, never a false
-// exemption" discipline `extConstraintItemProvablyViolated` documents for
-// the ground case.
+// themselves), matching #4238's "already worked" control. "Satisfies" for
+// a `type` item (fix #4306, §26.4/§26.5, v0.298) means §14.2 declaration
+// subtyping ENTAILMENT — the caller's own declared bound need not be the
+// literal same declaration as `foundDecl`'s, only a subtype of it (every
+// legal instantiation of a narrower bound is provably an instantiation of
+// the wider one too); every other item kind (`class`/`value`/`notnull`/
+// `new`) still needs literal kind presence, since those carry no further
+// argument to entail against. Anything this function cannot positively
+// match is treated as UNSATISFIED (reject), never as satisfied — the same
+// "provable violation only, never a false exemption" discipline
+// `extConstraintItemProvablyViolated` documents for the ground case.
 bool selfCallSiblingWhereSatisfiedByCaller(
     SemaContext& ctx,
     const ast::ExtensionDecl& callerDecl,
@@ -16016,9 +16022,28 @@ bool selfCallSiblingWhereSatisfiedByCaller(
                         item.typeArg ? ctx.resolvedType(*item.typeArg) : nullptr;
                     TypeRef* have =
                         citem.typeArg ? ctx.resolvedType(*citem.typeArg) : nullptr;
+                    // fix #4306 (§26.4/§26.5, v0.298): ENTAILMENT, not literal
+                    // declaration identity. Every legal instantiation `have`
+                    // (the caller's OWN declared bound) admits must also
+                    // satisfy `want` (the sibling candidate's declared
+                    // bound) — that holds exactly when `have` is a
+                    // (reflexively-included) §14.2 subtype of `want`, the
+                    // same declaration-based `isSubtype` walk
+                    // `groundSatisfiesTypeBound`'s ground-case `type` arm
+                    // documents as the sound direction for this exact
+                    // question (ExprTypecheck.cpp:1653). Literal identity
+                    // was strictly narrower than sound: it rejected a
+                    // caller bound to an interface's implementer (`where
+                    // W: Base` against a sibling's `where W: IFoo` when
+                    // `Base : IFoo`) even though every admissible `W` is
+                    // provably a `Base`, hence provably an `IFoo`. Either
+                    // side missing a declaration (non-Named / unresolved)
+                    // stays undecidable here -> not matched (reject) —
+                    // `isSubtype` requires a non-null `from`.
                     if (want && have && want->kind == TypeRef::Kind::Named &&
                         have->kind == TypeRef::Kind::Named && want->declaration &&
-                        want->declaration == have->declaration) {
+                        have->declaration &&
+                        ExprTC::isSubtype(have->declaration, want->declaration)) {
                         matched = true;
                         break;
                     }

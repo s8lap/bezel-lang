@@ -648,3 +648,157 @@ BEZEL_TEST(generic_extension_773, satisfied_constraint_self_call_keeps_working_4
         "end C;"),
         5);
 }
+
+// --- fix #4306 (§26.4/§26.5, v0.298) --------------------------------------
+//
+// `fix #4292`'s `selfCallSiblingWhereSatisfiedByCaller` (immediately above,
+// this file's own history) re-checks a sibling-block self-call against the
+// CALLER block's own `where` clause, but for a `type` (interface/class
+// bound) constraint item its ORIGINAL check compared `want->declaration ==
+// have->declaration` — LITERAL identity of the declared bound, never
+// subtype entailment. That is sound (never falsely admits) but incomplete:
+// a caller whose own declared bound is a nominal SUBTYPE of the sibling
+// candidate's bound (an implementer vs. the interface it implements) was
+// wrongly rejected, even though every legal instantiation the caller
+// admits provably satisfies the candidate's clause too. #4306 fixes the
+// `type` arm to test entailment via `ExprTC::isSubtype` (the same
+// declaration-based walk `groundSatisfiesTypeBound`'s ground-case `type`
+// arm already uses for the analogous ground question, ExprTypecheck.cpp
+// §19.6/§14.2).
+
+// fix #4306 THE REGRESSION ROW (issue's own repro, ExprTypecheck_Calls.cpp
+// `selfCallSiblingWhereSatisfiedByCaller`): `Caller`'s own block declares
+// `where W: BaseImpl4306` (a class implementing `IFoo4306`); the sibling
+// candidate `OnlyForFoo` declares `where W: IFoo4306`. Every legal `W` the
+// caller admits (every `BaseImpl4306` or subclass) is, by `BaseImpl4306`'s
+// own declaration, provably an `IFoo4306` — so this must compile and
+// return 5. Pre-#4306, literal-identity rejected this
+// ("no extension method `OnlyForFoo` on type `Box4306` takes 0
+// argument(s) (§26.5)"), measured FAIL-WITHOUT below.
+BEZEL_TEST(generic_extension_773, subtype_entailment_self_call_accepted_4306) {
+    BEZEL_EXPECT_EQ(runFull(
+        "module M; "
+        "public interface IFoo4306 method Ping(): int; end IFoo4306; "
+        "class BaseImpl4306 : IFoo4306 "
+        "  public method Ping(): int => 9; "
+        "end BaseImpl4306; "
+        "class Box4306<U> end Box4306; "
+        "extension Box4306<W> where W: IFoo4306 "
+        "  public method OnlyForFoo(): int => 5; "
+        "end; "
+        "extension Box4306<W> where W: BaseImpl4306 "
+        "  public method Caller(): int => this.OnlyForFoo(); "
+        "end; "
+        "class C4306 "
+        "  public static method Main(): int "
+        "    using var b := new Box4306<BaseImpl4306>(); "
+        "    return b.Caller(); "
+        "  end Main; "
+        "end C4306;"),
+        5);
+}
+
+// fix #4306 SOUNDNESS CONTROL — WRONG DIRECTION: the mirror of the row
+// above, entailment reversed. `Caller`'s own block declares the WIDER
+// bound `where W: IFoo4306B` (an interface); the sibling candidate
+// `OnlyForBase` declares the NARROWER bound `where W: BaseImpl4306B` (one
+// particular implementer). Not every `IFoo4306B` is a `BaseImpl4306B`, so
+// this must stay rejected — proves the fix checks `have` (caller) is a
+// subtype of `want` (candidate), not the reverse, which an inverted
+// `isSubtype(want->declaration, have->declaration)` would have wrongly
+// accepted. The call-site instantiation (`Box4306B<BaseImpl4306B>`) is
+// deliberately chosen so it WOULD satisfy the narrower bound if the check
+// were instantiation-based rather than block-declaration-based, isolating
+// exactly the defect this control targets.
+BEZEL_TEST(generic_extension_773,
+           subtype_entailment_wrong_direction_still_rejected_4306) {
+    auto r = runAot(
+        "module M; "
+        "public interface IFoo4306B method Ping(): int; end IFoo4306B; "
+        "class BaseImpl4306B : IFoo4306B "
+        "  public method Ping(): int => 9; "
+        "end BaseImpl4306B; "
+        "class Box4306B<U> end Box4306B; "
+        "extension Box4306B<W> where W: BaseImpl4306B "
+        "  public method OnlyForBase(): int => 5; "
+        "end; "
+        "extension Box4306B<W> where W: IFoo4306B "
+        "  public method Caller(): int => this.OnlyForBase(); "
+        "end; "
+        "class C4306B "
+        "  public static method Main(): int "
+        "    using var b := new Box4306B<BaseImpl4306B>(); "
+        "    return b.Caller(); "
+        "  end Main; "
+        "end C4306B;");
+    BEZEL_EXPECT_TRUE(bezel::test::failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(
+        r, "no extension method `OnlyForBase` on type `Box4306B` takes 0 "
+           "argument(s)"));
+}
+
+// fix #4306 REGRESSION CONTROL — LITERAL IDENTITY (still the reflexive
+// case of subtype entailment): caller and candidate declare the IDENTICAL
+// interface bound. This is the shape #4292's original check already
+// accepted (`want->declaration == have->declaration`); pins that #4306's
+// entailment rewrite keeps accepting it (`isSubtype(X, X)` is true — the
+// BFS in `ExprTC::isSubtype` checks `t == to` before walking any base),
+// since this exact `type`-item identity shape had no dedicated test before
+// this fix.
+BEZEL_TEST(generic_extension_773,
+           literal_identity_type_bound_self_call_keeps_working_4306) {
+    BEZEL_EXPECT_EQ(runFull(
+        "module M; "
+        "public interface IFoo4306C method Ping(): int; end IFoo4306C; "
+        "class Impl4306C : IFoo4306C "
+        "  public method Ping(): int => 9; "
+        "end Impl4306C; "
+        "class Box4306C<U> end Box4306C; "
+        "extension Box4306C<W> where W: IFoo4306C "
+        "  public method OnlyForFooC(): int => 5; "
+        "end; "
+        "extension Box4306C<W> where W: IFoo4306C "
+        "  public method Caller(): int => this.OnlyForFooC(); "
+        "end; "
+        "class C4306C "
+        "  public static method Main(): int "
+        "    using var b := new Box4306C<Impl4306C>(); "
+        "    return b.Caller(); "
+        "  end Main; "
+        "end C4306C;"),
+        5);
+}
+
+// fix #4306 SOUNDNESS CONTROL — UNRELATED BOUND: caller's own declared
+// bound (`IBar4306D`) is a completely unrelated interface to the
+// candidate's (`IFoo4306D`) — neither is a subtype of the other. Must
+// stay rejected; guards against a defective `isSubtype` call (e.g. a typo
+// swapping args to an unconditional-true shape) reading as a blanket
+// accept.
+BEZEL_TEST(generic_extension_773,
+           subtype_entailment_unrelated_bound_still_rejected_4306) {
+    auto r = runAot(
+        "module M; "
+        "public interface IFoo4306D method Ping(): int; end IFoo4306D; "
+        "public interface IBar4306D method Pong(): int; end IBar4306D; "
+        "class Impl4306D : IBar4306D "
+        "  public method Pong(): int => 9; "
+        "end Impl4306D; "
+        "class Box4306D<U> end Box4306D; "
+        "extension Box4306D<W> where W: IFoo4306D "
+        "  public method OnlyForFooD(): int => 5; "
+        "end; "
+        "extension Box4306D<W> where W: IBar4306D "
+        "  public method Caller(): int => this.OnlyForFooD(); "
+        "end; "
+        "class C4306D "
+        "  public static method Main(): int "
+        "    using var b := new Box4306D<Impl4306D>(); "
+        "    return b.Caller(); "
+        "  end Main; "
+        "end C4306D;");
+    BEZEL_EXPECT_TRUE(bezel::test::failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(
+        r, "no extension method `OnlyForFooD` on type `Box4306D` takes 0 "
+           "argument(s)"));
+}
