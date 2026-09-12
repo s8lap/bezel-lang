@@ -4449,8 +4449,29 @@ bool MethodOwnership::constInitializerRejected(const ast::Expr& e) {
     // (zero diagnostics) — the spec's "the marked transfer `const y := move
     // x;` included — not a form" was unsound. Reject the shape here so the
     // `LocalConstDecl` arm reports it with §21.1's mandated diagnostic.
-    if (auto* mue = dynamic_cast<const ast::UnaryExpr*>(&e))
-        if (mue->op == "move") return true;
+    // narrow #4287 (§21.1, v0.298): the blanket `move`-reject introduced by
+    // #4287 was over-broad — `producerState(*mue->operand)` already returns
+    // Owned for `move` of a user-declared owning class (#1388 path B) and for
+    // `move` of a heap-pointer reference builtin (the #3709 / #4191 / #4196
+    // fix in producerState's `move` arm); the only `move` shapes that fall
+    // through to Borrowed in producerState are (a) value-typed operands
+    // (records, primitives — no disposal, no reject needed) and (b) the
+    // 15-name `isNoDisposalObligationBuiltinName` set (CancellationToken,
+    // DateTime/TimeSpan/DateOnly/TimeOnly/Guid, Range, IntPtr/UIntPtr, the
+    // four *Span views, Boolean — #4191). For (a) and (b) a `const y := move
+    // x;` is a value-binding of a value-typed operand, NOT an owned
+    // production (§28.3's "Move semantics" adopted-state rule keys on the
+    // OPERAND's storage, not on the syntactic `move` form). Rejecting those
+    // is exactly the #4191 false-reject the predicate was added to prevent —
+    // measured: pre-#4191, `const t2 := move tok;` over a CancellationToken
+    // hard-rejected (rc=1) a program that compiled clean before; the
+    // narrowing below restores that accept-side while keeping the
+    // disposal-bearing builtin reject-side (#4287 / #4196's `Buffer`
+    // row, since `Buffer` is NOT a member of the no-disposal set).
+    if (auto* mue = dynamic_cast<const ast::UnaryExpr*>(&e)) {
+        if (mue->op == "move" && producerState(*mue->operand) == OwnershipState::Owned)
+            return true;
+    }
     if (auto* ce = dynamic_cast<const ast::CallExpr*>(&e)) {
         // §29.11 deferred-activation producer (#2146).
         if (common::isOwningCollectionDrainAliasCall(*ce, ctx_)) return true;
