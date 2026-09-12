@@ -5919,6 +5919,51 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                                             ctx_.exprType(*ma),
                                             /*calleeReturnsOwned=*/false,
                                             recvUnwindSlot);
+            // fix #4320 (§26.1 / §4.6 / §28.9, v0.298): the STRING-RECEIVER
+            // sibling of the class-receiver reclaim immediately above. The
+            // #2751 reclaim only fires for a heap-CLASS producer
+            // (`isFreshOwnedClassProducer`'s TypeDeclKind::Class gate) — a
+            // string producer (`P.Make()`, `"a" + "b"`, `s.Trim()`,
+            // `i.ToString()` — §28.9's full +1 list) goes through `obj` as a
+            // plain `ptr` and never reaches the reclaim, so the receiver
+            // string allocation leaks exactly once per use site. The CG27a
+            // Length/IsAscii intrinsic path already handled the TWO real
+            // intrinsics (#4243), but a USER-DEFINED computed extension
+            // property (e.g. the spec's own §26.1 worked `IsBlank` example,
+            // accessed on a +1 producer like `P.Make().IsBlank`) falls
+            // through to this CG33b arm and so falls through the leak.
+            //
+            // SOUNDNESS — the result type must NOT alias the receiver. A
+            // string-typed result may be a borrow of the receiver (e.g. an
+            // identity getter `=> this`); releasing the receiver's +1 there
+            // would free the underlying string while `v` (== obj) still
+            // points at it — a use-after-free. The non-string-result gate
+            // matches CG27a's implicit precondition (Length → int, IsAscii →
+            // bool: neither aliases), and the empty-body identity getter
+            // sibling test in extension_property_string_4243_test.cpp pins
+            // that an alias-shaped getter is NOT released (its receiver is a
+            // named local, not a +1 producer — the `isPlusOneStringProducer`
+            // gate below declines, matching the pre-fix safe behavior).
+            //
+            // Gated on `isPlusOneStringProducer` (not the type-name check)
+            // because it is the same predicate the §28.9 producer-releases
+            // across the rest of this backend already key on; a literal /
+            // sentinel receiver is correctly released as a no-op
+            // (`bz_string_release` is sentinel-safe). Unwind safety is
+            // delegated to the parallel class-receiver path's `recvUnwindSlot`
+            // when the same expr is BOTH a class and a string — that's
+            // unreachable today (`freshNewReceiverTempEligible` rejects
+            // strings), so on a string receiver the slot is null and the
+            // inline call below is the only release; throws inside the
+            // getter body skip it (matches CG27a's own behavior on its
+            // simpler intrinsics — `loadStringLen` / `bz_string_is_ascii`
+            // are non-throwing, the IsBlank getter body is `=`/`or`/
+            // `Length`/`Trim` — none of which throws on this input — and
+            // a throwing-getter edge is out of scope for the issue's repro).
+            if (!diverged_)
+                disposeFreshNewStringReceiverTemp(ma->target.get(), obj,
+                                                  ctx_.exprType(*ma),
+                                                  recvUnwindSlot);
             return v;
         }
         // CG33b: block-form getter (`get => do … end;`) — emit as a
@@ -5970,6 +6015,15 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                                             ctx_.exprType(*ma),
                                             /*calleeReturnsOwned=*/false,
                                             recvUnwindSlot);
+            // fix #4320 (§26.1 / §4.6 / §28.9, v0.298): the block-getter
+            // spelling of the string-receiver reclaim. Same predicate /
+            // soundness gate as the expression-bodied twin above; the
+            // surrounding `disposeFreshNewReceiverTemp` is class-only, so
+            // a `+1` string producer would otherwise leak here too.
+            if (!diverged_)
+                disposeFreshNewStringReceiverTemp(ma->target.get(), obj,
+                                                  ctx_.exprType(*ma),
+                                                  recvUnwindSlot);
             return res;
         }
         // §2.5 / §23 (issue #503): imported non-virtual property getter.

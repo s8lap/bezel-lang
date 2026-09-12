@@ -16585,6 +16585,42 @@ private:
     // body, so an erasure at the reclaim would lose it.
     void dischargeFreshNewReceiverTempUnwind(llvm::AllocaInst* slot);
 
+    // fix #4320 (§26.1 / §4.6 / §28.9, v0.298): the STRING-RECEIVER sibling of
+    // `disposeFreshNewReceiverTemp`. The class-receiver reclaim only fires for
+    // a heap-CLASS producer (`isFreshOwnedClassProducer`'s TypeDeclKind::Class
+    // gate); a `+1` STRING producer (the §28.9 list — `P.Make()`, `"a"+"b"`,
+    // `s.Trim()`, `i.ToString()`, interpolation, range slice) reaches this path
+    // as a plain `ptr` and never reaches the reclaim, leaking its allocation.
+    //
+    // THE TWO GATES (mirroring CG27a's intrinsic Length/IsAscii path's
+    // implicit precondition):
+    //   1. The receiver is a `+1` string producer — `isPlusOneStringProducer`
+    //      (the same predicate every other §28.9 producer-release in this
+    //      backend keys on; a literal / sentinel receiver is correctly
+    //      released as a no-op via `bz_string_release`'s sentinel-safety).
+    //   2. The PROPERTY RESULT is NOT `string` — the result must not alias
+    //      the receiver. An identity getter `=> this` returns the receiver
+    //      itself; releasing the receiver's +1 there would free the underlying
+    //      string while `v` (= obj) still points at it — a use-after-free.
+    //      Length/IsAscii trivially satisfy this (int/bool ≠ string), and
+    //      every other primitive / enum / unit / class-result extension
+    //      property does too; only a string-typed result is the suspect, and
+    //      this is exactly the documented "an aliased result is NOT
+    //      disposed" soundness stance #1039 documented for the class path.
+    //
+    // `unwindSlot` is the SLOT returned by `registerFreshNewReceiverTempUnwind`
+    // — always null for a string receiver today (the class-only predicate
+    // rejects strings), but threaded through for symmetry with the class twin
+    // and so a future unified eligibility predicate that admits both can plug
+    // in without touching every call site. Throws inside the getter body skip
+    // the inline release (matching CG27a's own behavior on its simpler
+    // intrinsics — `loadStringLen` / `bz_string_is_ascii` are non-throwing;
+    // a throwing-getter edge is out of scope for the issue's repro).
+    void disposeFreshNewStringReceiverTemp(const ast::Expr* recvExpr,
+                                            llvm::Value* recvPtr,
+                                            const sema::TypeRef* resultTy,
+                                            llvm::AllocaInst* unwindSlot);
+
     // fix #3377 / §28.3 / §29.1 / §30.1 (v0.282): the fresh receiver of a
     // deferred-activation call (an iterator / async-task frame whose
     // settlement may still read `this`) is correctly kept alive past the call

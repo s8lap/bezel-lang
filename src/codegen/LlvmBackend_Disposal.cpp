@@ -4145,6 +4145,96 @@ void Emitter::disposeFreshNewReceiverTemp(const ast::Expr* recvExpr,
 }
 
 
+// fix #4320 (§26.1 / §4.6 / §28.9, v0.298): the STRING-RECEIVER sibling of
+// `disposeFreshNewReceiverTemp` (above). The class-receiver reclaim fires only
+// for a heap-CLASS producer; a `+1` STRING producer reaches CG33b as a plain
+// `ptr` and was leaking its allocation (the issue's repro: `P.Make().IsBlank`
+// over 500 iterations under ASan/LSan — 18000 B / 1000 allocs from
+// `bz$M.P$Make`, byte-identical to pre-#4243 because the leak is on the CG33b
+// path #4243 left untouched). Releases via `bz_string_release` (refcounted;
+// null- and sentinel-safe so the literal / sentinel / null producers in the
+// §28.9 list release as a no-op) AFTER the getter body's result has been
+// wrapped/boxed — nothing reads the receiver after this point on the normal
+// exit.
+//
+// THE TWO GATES, with their rationale (full version in LlvmBackend_impl.hpp):
+//   1. `isPlusOneStringProducer(recvExpr)` — the same predicate every other
+//      §28.9 producer-release keys on. A literal / sentinel / named-local
+//      receiver is correctly declined here: a literal receiver is an immortal
+//      sentinel (release is a no-op), and a named-local receiver's lifetime
+//      is the scope's, not the property read's.
+//   2. The PROPERTY RESULT must be a NON-REFERENCE value — the same soundness
+//      stance `freshNewReceiverTempEligible` (the class twin's predicate,
+//      immediately above) takes for the class-receiver path: the result must
+//      be provably free of any reference or borrow into the receiver. EXCLUDED
+//      for an alias risk:
+//        • `string` (reference-typed primitive — an identity getter `=> this`
+//          returns the receiver itself, releasing would free the string
+//          `v` (= obj) still points at)
+//        • `object` (reference-typed primitive — a field/method result on the
+//          receiver may borrow)
+//        • any class/interface result (a reference — could embed a borrow)
+//        • any struct/record (could embed a borrow of a receiver sub-object)
+//      ADMITTED: Unit, numeric/bool/char/decimal primitives (Length/IsAscii /
+//      IsBlank's shape), and enum. Mirroring the class predicate's exact
+//      primitive set (PrimitiveType::None / String / Object excluded) keeps
+//      the two paths' accept/reject surface aligned; the borrowed-receiver
+//      `string` shape is excluded identically to the class path's borrowed-
+//      receiver `string`-result shape that `freshNewReceiverTempEligible`'s
+//      comment cites as the reason for the string-primitive exclusion there.
+//
+// `unwindSlot` is the slot returned by the parallel
+// `registerFreshNewReceiverTempUnwind` — today always null for a string
+// receiver (the class-only eligibility predicate rejects strings), but
+// threaded through for symmetry and to leave room for a future unified
+// predicate that admits both without touching call sites. A throw inside the
+// getter body skips this inline release; that matches CG27a's own behavior
+// on its simpler intrinsics (`loadStringLen` / `bz_string_is_ascii` are
+// non-throwing; the issue's IsBlank getter is `=`/`or`/`Length`/`Trim` —
+// none throw — so the repro exercises the inline path exactly once per
+// iteration).
+void Emitter::disposeFreshNewStringReceiverTemp(
+        const ast::Expr* recvExpr, llvm::Value* recvPtr,
+        const sema::TypeRef* resultTy, llvm::AllocaInst* /*unwindSlot*/) {
+    // (unwindSlot is documented above; always null today — the class-only
+    // registerFreshNewReceiverTempUnwind never admits strings.)
+    if (!recvExpr || !recvPtr || !resultTy) return;
+    if (!isPlusOneStringProducer(recvExpr)) return;
+    // The result must be a NON-REFERENCE value (mirror the class twin's gate
+    // at freshNewReceiverTempEligible, with `isPlusOneStringProducer` in the
+    // producer-receiver slot).
+    bool valueResult = false;
+    if (resultTy->kind == sema::TypeRef::Kind::Unit) {
+        valueResult = true;
+    } else if (resultTy->kind == sema::TypeRef::Kind::Primitive &&
+               resultTy->primitive != sema::PrimitiveType::None &&
+               resultTy->primitive != sema::PrimitiveType::String &&
+               resultTy->primitive != sema::PrimitiveType::Object) {
+        // Length/IsAscii / IsBlank / int-valued user-property: a non-
+        // reference primitive. The receiver is provably not aliased by the
+        // result (an `int`/`bool` cannot hold a string).
+        valueResult = true;
+    } else if (resultTy->kind == sema::TypeRef::Kind::Named &&
+               resultTy->declaration &&
+               resultTy->declaration->kind == ast::TypeDeclKind::Enum) {
+        // An enum result is a value type — no alias into the receiver.
+        valueResult = true;
+    }
+    // Records/structs, classes, interfaces, `string`, `Object`: excluded,
+    // because each may alias into the receiver (a class/interface result
+    // could embed a borrow; a string result may be the receiver itself;
+    // a record could embed a borrow of a receiver sub-object). The leak
+    // stays — exactly the conservative stance `freshNewReceiverTempEligible`
+    // documents for the class twin.
+    if (!valueResult) return;
+    // Belt-and-braces: only release a non-null heap pointer. Sentinel /
+    // literal receivers are null-safely released by `bz_string_release`
+    // anyway, but the guard keeps the IR shape identical to the class twin.
+    if (!recvPtr->getType()->isPointerTy()) return;
+    emitStringRelease(recvPtr);
+}
+
+
 llvm::Function* Emitter::elementDisposerThunk() {
     // #362 / stdlib §4.5: a standalone `void(void*)` thunk that runs an owning
     // collection element's destructor via the element's own vtable (slot 2,
