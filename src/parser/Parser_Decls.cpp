@@ -25,6 +25,12 @@ NodePtr stampSpan(NodePtr node, const SourceLocation& start,
 } // namespace
 
 std::unique_ptr<ast::SourceFile> Parser::parseCompilationUnit() {
+    // fix #4348: a parse run starts with the expression-recursion depth at
+    // zero (the Parser may be reused if a host calls parseCompilationUnit
+    // twice, though in practice the Driver constructs a fresh one per
+    // file). Resetting here keeps the guard honest without depending on
+    // the Parser being constructed fresh.
+    expressionRecursionDepth_ = 0;
     auto sourceFile = std::make_unique<ast::SourceFile>();
 
     // §2.1: "Every source file declares its module on its first non-comment,

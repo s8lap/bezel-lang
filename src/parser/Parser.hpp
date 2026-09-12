@@ -365,6 +365,17 @@ private:
     // and expression parts. Fills `e.parts` in place.
     void splitInterpolation(ast::InterpolatedStringExpr& e);
 
+    // Bounded guard on expression-recursion depth (fix #4348). A
+    // parenthesized sub-expression recurses through `parseExpression()` from
+    // `parsePrimaryExpressionImpl()`'s `(` arm — without a depth bound,
+    // deeply nested but valid source overflows the native call stack and
+    // SIGSEGVs the compiler. Each `parseExpressionImpl()` entry bumps this
+    // counter and bails with a located diagnostic once it exceeds the cap
+    // (no real Bezel program gets anywhere near it). Reset at the start of
+    // `parseCompilationUnit()` so a parse run starts clean.
+    static constexpr std::size_t kMaxExpressionRecursion = 1000;
+    std::size_t expressionRecursionDepth_ = 0;
+
     Lexer& lexer_;
     DiagnosticEngine& diagnostics_;
     Token current_{};

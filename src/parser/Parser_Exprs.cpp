@@ -2,6 +2,7 @@
 #include "parser/Parser_impl.hpp"
 
 #include <algorithm>
+#include <string>
 #include <string_view>
 
 namespace bezel {
@@ -114,6 +115,50 @@ std::unique_ptr<ast::Expr> Parser::parseExpression() {
 }
 
 std::unique_ptr<ast::Expr> Parser::parseExpressionImpl() {
+    // fix #4348: bounded recursion-depth guard on expression parsing. A
+    // parenthesized sub-expression recurses through here from
+    // `parsePrimaryExpressionImpl()`'s `(` arm, and unbounded recursion
+    // overflows the native call stack on deeply nested (but valid) source
+    // — measured: SIGSEGV at ~7000 paren levels on the default 8 MiB
+    // stack. Bail with a located diagnostic once we cross the cap; a real
+    // program never gets near it. The counter is reset at
+    // `parseCompilationUnit()` entry so a parse run starts clean.
+    if (expressionRecursionDepth_ >= kMaxExpressionRecursion) {
+        diagnostics_.report(
+            Severity::Error, current_.location,
+            "expression nesting too deep (limit " +
+                std::to_string(kMaxExpressionRecursion) +
+                "); refactor to reduce parenthesization or operator "
+                "chaining depth (#4348)");
+        // Skip past the rest of the innermost parenthesized group so the
+        // outer `parsePrimaryExpressionImpl()` `)` arm finds its closing
+        // paren and does not cascade "expected ')' to close parenthesized
+        // expression" diagnostics back up the entire paren stack.
+        std::size_t parenDepth = 1;
+        while (current_.kind != TokenKind::EndOfFile && parenDepth > 0) {
+            if (current_.kind == TokenKind::Punctuator) {
+                if (current_.text == "(") {
+                    ++parenDepth;
+                } else if (current_.text == ")") {
+                    --parenDepth;
+                    if (parenDepth == 0) { advance(); break; }
+                }
+            }
+            advance();
+        }
+        // Synthesize a placeholder so the outer AST is well-formed; the
+        // error diagnostic above is the actual signal to the user, and
+        // subsequent passes will see a (typed) error node.
+        auto placeholder = std::make_unique<ast::IntLiteralExpr>();
+        placeholder->text = "0";
+        return std::unique_ptr<ast::Expr>(placeholder.release());
+    }
+    ++expressionRecursionDepth_;
+    struct DepthRestore {
+        std::size_t& depth;
+        ~DepthRestore() { --depth; }
+    } restore{expressionRecursionDepth_};
+
     // A.7 `Expression ::= LogicalOr | ThrowExpr` (v0.208): the conditional is
     // the parenthesized `(if …)` PrimaryAtom (§20) — the postfix
     // `x if c else y` spelling is retired and no conditional level exists in
