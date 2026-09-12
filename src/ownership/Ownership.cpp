@@ -8898,6 +8898,34 @@ void MethodOwnership::checkLambdaTaskFamilyBorrowReturns(
             if (it != callArgDirect.end()) ownedExpected = it->second;
         }
         checkOneLambdaOwnedReturnDirectBorrow(*lam, ownedExpected);
+        // fix #4349 (§30.5 Pattern A / §28.3 Producers, v0.298): the
+        // lambda-body reach for `fix #4311`'s
+        // `checkAsyncPatternABorrowedIdentifierReturn`. The sibling check
+        // (Ownership.cpp, handleReturn / runExprBodyOwningReturnCheck arm)
+        // only fires for a top-level METHOD's own body — lambda bodies
+        // would otherwise be unreachable for the bare-identifier Pattern-A
+        // shape, leaving the exact heap-UAF the issue measures. Drive the
+        // same check over the lambda's own body with the lambda's own
+        // `isAsync` / return type — driven from this same collected-lambda
+        // set so it reaches a lambda anywhere in this body a lambda can
+        // appear (a local-decl initializer, a direct return, a field/
+        // property/operator position, …), exactly as the sibling calls
+        // above do. A no-op when the lambda is not `async` (its body then
+        // returns a task directly, SB01-B's territory — see the new
+        // function's own header). Pass `ownedExpected` rather than
+        // `expected`: an `async` lambda whose declared return is
+        // `() -> Task<T:class>` (the measured repro: `var f: () -> Task<Cell>
+        // := async lambda() => do … end;`) has its lambda-typed-slot target
+        // in `localDeclDirect` / `callArgDirect`, while the typechecker's
+        // OWN `lamTy->funcReturn` is `OwningTask<T>` (sema auto-wraps a
+        // class-typed async result in `OwningTask` per §30.5 Pattern B, the
+        // inferred-coercion path) — Pattern A's gate is on the
+        // USER-DECLARED `Task<T>`, not the typechecker's auto-derived
+        // `OwningTask<T>`, so the `expectedFnType` parameter must carry
+        // the declared function type's `funcReturn` for the gate to fire.
+        // // per §30.5, §28.3, §28.6
+        checkOneLambdaAsyncPatternABorrowedIdentifierReturn(*lam,
+                                                            ownedExpected);
     }
 }
 
@@ -9557,6 +9585,18 @@ void MethodOwnership::checkLambdaTaskFamilyBorrowReturnsExpr(
             if (it != callArgDirect.end()) ownedExpected = it->second;
         }
         checkOneLambdaOwnedReturnDirectBorrow(*lam, ownedExpected);
+        // fix #4349 (§30.5 Pattern A / §28.3 Producers, v0.298): the
+        // `=>` expression-body sibling of the block-body driver's same
+        // call — see checkOneLambdaAsyncPatternABorrowedIdentifierReturn's
+        // own header comment for the gap #4311 left in lambda bodies and
+        // for why this is a no-op on a non-`async` lambda. The expr-body
+        // sibling uses the same `ownedExpected` resolution
+        // (callArgDirect fallback, mirror of the block body's
+        // localDeclDirect) — see the block-body driver's comment for why
+        // `ownedExpected` and not `expected` carries the user-declared
+        // `Task<T>` return for the gate. // per §30.5, §28.3, §28.6
+        checkOneLambdaAsyncPatternABorrowedIdentifierReturn(*lam,
+                                                            ownedExpected);
     }
 }
 
@@ -12359,6 +12399,222 @@ void MethodOwnership::reportAsyncPatternABorrowedIdentifierReturn(
         "genuinely owned by this frame, return the owned local/parameter "
         "directly (or transfer a field with `move`); otherwise return "
         "`await` an admitted Pattern A source instead");
+}
+
+// fix #4349 (§30.5 Pattern A / §28.3 Producers, v0.298): the LAMBDA-BODY
+// sibling of `checkAsyncPatternABorrowedIdentifierReturn`. The latter is wired
+// only into `handleReturn` / `runExprBodyOwningReturnCheck` (the entry points
+// for a top-level METHOD's own return statements / expression body) and is
+// NEVER invoked for a lambda's own body — lambda bodies are walked by the
+// separate `checkLambdaTaskFamilyBorrowReturns{,Expr}` pre-pass (SB01-B),
+// which answers a DIFFERENT, narrower question (whether the lambda VALUE
+// itself is a borrow of a task-family object, not whether the lambda's OWN
+// async body borrows its produced T). Consequence: an `async lambda` that is
+// itself a Pattern-A `Task<T:class>` producer and returns a bare
+// `IdentifierExpr` naming a borrowed local compiles clean and reproduces the
+// EXACT §30.5 kind-1 heap-use-after-free #4311 exists to close — just reached
+// through a lambda instead of a method. (The codegen sibling from #4285 IS
+// reached correctly for the same lambda body — codegen's `detectAsyncPattern
+// AKind` reaches lambda bodies via the shared `lowerReturnStmt` /
+// `emitAsyncLambda` path. Only the ownership-pass bare-identifier check
+// #4311 added fails to reach lambdas.)
+//
+// Drive the check over each lambda's own body with the LAMBDA's own `isAsync`
+// and effective return type. The lambda's body has NOT been dataflowed by the
+// enclosing method's `run()`, so a fresh `MethodOwnership sub` has no
+// `states_` to consult and the existing check's `lookupState` path is
+// unavailable here — instead, resolve a same-lambda local to its own
+// LocalDecl / LocalConstDecl and classify the initializer via
+// `producerState` (the SAME one the existing check uses for the
+// `MemberAccessExpr` arm via `isBorrowableType`, just exposed via a
+// different lever). This mirrors `checkOneLambdaOwnedReturnDirectBorrow`'s
+// structure (Ownership.cpp, #4005) for the owned-target sibling case.
+//
+// Scoped identically to `checkAsyncPatternABorrowedIdentifierReturn`:
+//   * PLAIN `Task` head only — never `OwningTask` (Pattern B is a separate,
+//     unmeasured question, see the boundary row in the sibling fix's test
+//     file).
+//   * Result T must be a class with a real disposal obligation (§28.9 —
+//     `isNonTrivialDisposeClass`); a value / unit / runtime-managed / no-
+//     dispose class result has nothing for the produced task's teardown to
+//     double-free, so is admitted.
+//   * A non-`async` lambda (or one whose effective return type we cannot
+//     resolve) is OUT — its body returns a task directly, governed by SB01-B
+//     instead. The SB01-B sibling check makes the same observation at its own
+//     `if (lam.isAsync) return;` guard (an `async` lambda auto-satisfies
+//     SB01-B because its body returns T, not a task).
+//
+// Rejects (mirroring the sibling check's arms):
+//   * a LAMBDA parameter that is non-`owned` (a borrow of the caller's
+//     argument);
+//   * an implicit-`this` field read (the bare-identifier spelling of the
+//     SAME unconditional borrow #4285 rejects via the explicit `this.f`
+//     spelling);
+//   * a CAPTURED local from an ENCLOSING scope (always a borrow — the
+//     lambda did not itself produce the value; the enclosing scope's own
+//     discharge / `using var` scope-end auto-drop disposes it);
+//   * a same-lambda local whose initializer classifies `Borrowed` via
+//     `producerState` (a plain field / property / indexer read, a non-`move`
+//     `obj.f`, a borrowed parameter pass-through, a captured value rebind,
+//     … — the measured defect shape: `var borrowed := h.item; return
+//     borrowed;`).
+//
+// Admits:
+//   * a fresh producer (`new T(...)`, an `owned`-returning call, `move` of
+//     an OWNED source);
+//   * a same-lambda local whose initializer is NOT Borrowed (the local
+//     itself is then a genuine kind-1 source);
+//   * an `owned` / `out owned` parameter (genuinely owned, transferred into
+//     the callee);
+//   * anything `producerState` cannot positively classify — conservative,
+//     so a legal kind-1 return is never over-rejected.
+// // per §30.5, §28.3, §28.6
+void MethodOwnership::checkOneLambdaAsyncPatternABorrowedIdentifierReturn(
+        const ast::LambdaExpr& lam,
+        const sema::TypeRef* expectedFnType) {
+    // Same gating the sibling check does at the top
+    // (`if (!isAsync_ || !returnType_) return;`) — applied to the LAMBDA's
+    // own `isAsync` (an `async` lambda's body is its awaited value, T, not
+    // a task frame; only then is the lambda a Pattern-A producer) and the
+    // LAMBDA's own effective return type (resolved exactly as
+    // checkOneLambdaTaskFamilyBorrowReturn does it — `lamTy->funcReturn`
+    // first, falling back to the caller-supplied `expectedFnType` for a
+    // lambda whose type is dictated by its position but left un-inferred
+    // there, see its own header comment). // per §30.1, §30.5
+    if (!lam.isAsync) return;
+    // Pattern A's authority is the USER-DECLARED `Task<T>` slot — Pattern A
+    // is per §30.5 the rule that applies to a `Task<T:class>` async
+    // producer's bare-`return` result lifetime, and codegen uses exactly
+    // this same declared-task-type for its `patternAResultDisposerFor(
+    // declaredTaskTy)` gate (LlvmBackend_Async.cpp:1198 and :1863 — the
+    // two `asyncPatternAResultDisposer_` setters; the per-lambda one at
+    // 1863 receives `declaredTaskTy` straight from
+    // `lowerLambda`'s `lambdaReturnType` resolution). The lambda LITERAL's
+    // own `lamTy->funcReturn`, by contrast, is the typechecker's
+    // auto-coercion — an `async lambda() => do … end;` whose body returns
+    // a class T is INFERRED as `() -> OwningTask<T>` (Pattern B), not
+    // `() -> Task<T>` (Pattern A), per the `if (!hasAscription &&
+    // lam->isAsync && inferredReturn)` arm in sema's LambdaExpr handler
+    // (ExprTypecheck_Exprs.cpp:9610-9626). A user-declared
+    // `() -> Task<T>` slot can carry an inferred `() -> OwningTask<T>`
+    // inside it (Pattern B's auto-wrap of an un-ascribed async result
+    // happens regardless of the target's head name); the runtime's task
+    // is then built as an `OwningTask<T>`, and codegen's
+    // `asyncPatternAResultDisposer_` is set from `declaredTaskTy` (the
+    // user's `Task<T>`, not the inferred `OwningTask<T>`). So this
+    // ownership-pass twin must gate on `expectedFnType` FIRST (the
+    // declared function type, when present), and only fall back to
+    // `lamTy->funcReturn` when no declared type is in scope (the bare
+    // `var f := async lambda() => do … end;` shape, which has no
+    // declared `Task<T>` to gate against anyway, since the inferred
+    // `OwningTask<T>` already implies Pattern B's stricter rule applies
+    // and is governed by `checkOneLambdaOwnedReturnDirectBorrow`).
+    // // per §30.5, §28.3
+    const sema::TypeRef* lamTy = ctx_.exprType(lam);
+    const sema::TypeRef* effRet = nullptr;
+    if (expectedFnType &&
+        expectedFnType->kind == sema::TypeRef::Kind::Function &&
+        expectedFnType->funcReturn) {
+        effRet = expectedFnType->funcReturn;
+    } else if (lamTy && lamTy->kind == sema::TypeRef::Kind::Function &&
+               lamTy->funcReturn) {
+        effRet = lamTy->funcReturn;
+    }
+    if (!effRet) return;
+    // The two-pattern split mirrors
+    // `checkAsyncPatternABorrowedIdentifierReturn` — Pattern A only (plain
+    // `Task` head; Pattern B's producer-side rules for this shape are a
+    // separate, unmeasured question, filed alongside #4311). The class-
+    // with-disposal-obligation gate uses the SAME `isNonTrivialDisposeClass`
+    // predicate the sibling check lives by — "True when `rt` is a
+    // class/interface that carries a real disposal obligation" — so a
+    // no-dispose class (or value / unit / runtime-managed T) does not
+    // mis-fire. // per §30.5, §28.9
+    if (!isAsyncPatternAClassResultType(effRet, ctx_)) return;
+    auto classifyReturn = [&](const ast::Expr& re) {
+        auto* id = dynamic_cast<const ast::IdentifierExpr*>(&re);
+        if (!id) return;  // the sibling check's own first guard
+        sema::Symbol* sym = ctx_.exprSymbol(*id);
+        if (!sym) return;  // the sibling check's own second guard
+        if (auto* ps = dynamic_cast<sema::ParameterSymbol*>(sym)) {
+            // A lambda parameter that is non-`owned` is a borrow of the
+            // caller's argument (§28.3 producers: "Parameter `p` (no
+            // modifier) | Borrowed (source: caller)"). An `owned` /
+            // `out owned` parameter is genuinely owned by this frame
+            // (transferred in) and is admitted. // per §28.3, §30.5
+            if (ps->modifier == "owned" || ps->modifier == "out owned")
+                return;
+            reportAsyncPatternABorrowedIdentifierReturn(re);
+            return;
+        }
+        if (dynamic_cast<sema::FieldSymbol*>(sym)) {
+            // Implicit-`this` bare field read — unconditionally a borrow
+            // per §28.3 Producers, exactly like the explicit `this.f` /
+            // `obj.f` spelling #4285 already rejects (MemberAccessExpr).
+            // // per §28.3, §30.5
+            reportAsyncPatternABorrowedIdentifierReturn(re);
+            return;
+        }
+        if (auto* ls = dynamic_cast<sema::LocalSymbol*>(sym)) {
+            // The lambda body has NOT been dataflowed by the enclosing
+            // method's `run()` — a fresh `MethodOwnership sub` has no
+            // `states_` to consult, so the sibling check's `lookupState`
+            // path is unavailable here. Resolve the local to its own
+            // declaration and classify the initializer via `producerState`
+            // — the SAME classifier `checkOneLambdaOwnedReturnDirectBorrow`
+            // uses for the owned-target sibling case (see that function's
+            // own comment for the rationale: a same-lambda local is
+            // reclassified by its own initializer, not by an enclosing
+            // method's `states_`).
+            //
+            // A CAPTURED local from an enclosing scope is unconditionally a
+            // borrow for this lambda's purposes — the lambda did not itself
+            // produce the value, the enclosing scope's own discharge (a
+            // `using var`'s scope-end auto-drop, or an ordinary owned-
+            // local discharge) is what disposes it. Returning it bare here
+            // would mint a SECOND discharge path (the freshly-produced
+            // task owns it per §30.5 kind 1) for the same object — the
+            // exact `var mk: () -> owned Res := lambda() => b;` shape
+            // #4005 closes for the owned-target case. Distinguish by span
+            // containment exactly as `checkOneLambdaOwnedReturnDirectBorrow`
+            // does. // per §30.5, §28.3, §28.6
+            if (!ls->decl) return;  // no decl reachable — conservative
+            const bool declaredInLambda =
+                ls->decl->span.begin.offset >= lam.span.begin.offset &&
+                ls->decl->span.end.offset <= lam.span.end.offset;
+            if (!declaredInLambda) {
+                reportAsyncPatternABorrowedIdentifierReturn(re);
+                return;
+            }
+            const ast::Expr* init = nullptr;
+            if (auto* ld = dynamic_cast<const ast::LocalDecl*>(ls->decl))
+                init = ld->initializer.get();
+            else if (auto* lc =
+                         dynamic_cast<const ast::LocalConstDecl*>(ls->decl))
+                init = lc->value.get();
+            if (!init) return;  // no initializer reachable — conservative
+            MethodOwnership sub(ctx_);
+            if (sub.producerState(*init) == OwnershipState::Borrowed)
+                reportAsyncPatternABorrowedIdentifierReturn(re);
+            return;
+        }
+        // Anything else (an unresolved symbol, a type name in expression
+        // position, …) — not this check's business. Mirrors the sibling
+        // check's tail.
+    };
+    // Block body: walk every `return EXPR` reachable without crossing a
+    // nested lambda (a nested lambda's returns belong to it and are
+    // checked when the collector reaches it separately — exactly the
+    // contract `scanReturnsIn` documents). Expression body: classify the
+    // single expression directly. Mirrors
+    // `checkOneLambdaTaskFamilyBorrowReturn` / `-OwnedReturnDirectBorrow`'s
+    // own tail structure verbatim. // per §28.3, §30.5
+    if (lam.exprBody) {
+        classifyReturn(*lam.exprBody);
+        return;
+    }
+    for (const auto& s : lam.stmts)
+        if (s) scanReturnsIn(*s, classifyReturn);
 }
 
 // #2175(a) / §28.3 v0.226 (spec "Returning a deferred-activation frame"):

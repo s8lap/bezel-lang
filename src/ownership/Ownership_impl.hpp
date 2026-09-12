@@ -1924,6 +1924,39 @@ private:
     // shapes of the same §30.5 kind-1 violation read as ONE rule to the user.
     void reportAsyncPatternABorrowedIdentifierReturn(const ast::Expr& e);
 
+    // fix #4349 (§30.5 Pattern A / §28.3 Producers, v0.298): the LAMBDA-BODY
+    // sibling of `checkAsyncPatternABorrowedIdentifierReturn`. The latter is
+    // wired only into `handleReturn` / `runExprBodyOwningReturnCheck` (the
+    // entry points for a top-level METHOD's own return statements / expression
+    // body) and is never invoked for a lambda's own body — lambda bodies are
+    // walked by the separate `checkLambdaTaskFamilyBorrowReturns{,Expr}`
+    // pre-pass (SB01-B), a DIFFERENT, narrower question (whether the lambda
+    // VALUE itself is a borrow of a task-family object, not whether the
+    // lambda's OWN async body borrows its produced T). Consequence: an
+    // `async lambda` that is itself a Pattern-A `Task<T:class>` producer and
+    // returns a bare `IdentifierExpr` naming a borrowed local compiles clean
+    // and reproduces the EXACT §30.5 kind-1 heap-use-after-free #4311 exists
+    // to close — just reached through a lambda instead of a method. (The
+    // sibling codegen check from #4285 IS reached correctly for the same
+    // lambda body — codegen's `detectAsyncPatternAKind` reaches lambda
+    // bodies via the shared `lowerReturnStmt` / `emitAsyncLambda` path. Only
+    // the ownership-pass bare-identifier check #4311 added fails to reach
+    // lambdas.) Drive the check over each lambda's own body with the
+    // LAMBDA's own `isAsync` / return type — mirroring
+    // `checkOneLambdaOwnedReturnDirectBorrow`'s shape (uses a fresh
+    // `MethodOwnership sub` to classify the local's own initializer
+    // independently of the enclosing dataflow). Fires from
+    // `checkLambdaTaskFamilyBorrowReturns` (block-body driver) and
+    // `checkLambdaTaskFamilyBorrowReturnsExpr` (`=>` expression-body driver),
+    // the same two entry points the sibling lambda pre-passes use. Scoped
+    // identically to `checkAsyncPatternABorrowedIdentifierReturn`: PLAIN
+    // `Task` head only (never `OwningTask` — Pattern B), and only when the
+    // result T is a class with a real disposal obligation (§28.9 —
+    // `isNonTrivialDisposeClass`). // per §30.5, §28.3, §28.6
+    void checkOneLambdaAsyncPatternABorrowedIdentifierReturn(
+        const ast::LambdaExpr& lam,
+        const sema::TypeRef* expectedFnType = nullptr);
+
     // §28.3 / §5.11 (#1007): the name-head of an owning-collection / owning-
     // wrapper type (the set whose value the caller must discharge). True for
     // `OwningArray`/`OwningDictionary`/…/`Shared`/`Weak`/`OwningTask`/etc.
