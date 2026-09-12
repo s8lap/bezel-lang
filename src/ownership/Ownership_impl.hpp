@@ -615,6 +615,17 @@ public:
     // bound to a borrow-carrying field is a temporary (not a named place). Keeps
     // long-lived-borrow construction (`var xs := […]; new Bag(xs)`) legal.
     void checkRecordFromTemporary(const ast::NewExpr& ne);
+    // fix #4344 (§9.7 / §28.3, v0.298): the `with(name := value, …)` non-
+    // destructive-update sibling of `checkRecordFromTemporary`. Same rule, same
+    // reject, but the `WithExpr::assigns` list is name-keyed (`InitAssign{name,
+    // value}`), so each override is matched to its borrow-carrying field by
+    // looking the name up in the source record's `members` (not by positional
+    // indexing as `NewExpr::args` does). The sema phase already validated every
+    // `InitAssign.name` against the source record's declared members (ExprType-
+    // check_Exprs.cpp:10697-10710), so an unresolvable name is impossible here;
+    // a null field symbol means the source's record type did not resolve (e.g.
+    // a generic-body error-recovery AST), which is a no-op for this check.
+    void checkRecordWithFromTemporary(const ast::WithExpr& we);
     // True when `ft` is a borrow-carrying field type (a class/interface
     // reference — including the BUILTIN heap collections Array/Dictionary/… that
     // carry no user TypeDecl — an inline array of references, or a transitively
