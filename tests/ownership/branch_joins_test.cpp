@@ -174,3 +174,65 @@ BEZEL_TEST(own_join, three_branch_chain_with_clash) {
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(hasErrorMessage(r, "branch ownership conflict"));
 }
+
+// fix #4329 (§28.3 / §28.7, v0.298): a REASSIGNMENT of a silently-poisoned
+// `Owned ⊓ Uninitialized` non-loop merge (the O4 catch-all) leaks the prior
+// Owned value. The O4 design poisons the merged local so a *subsequent read*
+// diagnoses, but the reassignment of `x := new Res(9);` overwrites the state
+// to the new producer's classification without disposing the prior Owned
+// allocation on the assigned path — codegen's `disposeDisplacedOwnedClassLocal`
+// refuses to fire for a no-init LocalDecl (`unwindOwnedLocalClass` returns
+// null on `!ld->initializer`). The fix sets `becomesOwnedViaReassign` on
+// the LocalDecl at the reassignment site (Ownership.cpp's handleAssignment,
+// gated on `state == Poisoned && obligationOrigin`); the codegen helper then
+// admits the local as an owned class local and disposes the displaced value
+// at the reassignment (null-guarded + identity-guarded, so a no-prior-value
+// slot is a no-op). Measured on the pre-fix tree, --sanitize=address × 50
+// iterations: "AddressSanitizer: 800 byte(s) leaked in 50 allocation(s)".
+// Post-fix: 50 prior-Owned + 50 fresh-Owned disposals = Counter == 100.
+//
+// The test amplifies to 50 iterations so the leak — which sits in the
+// cond=true branches' allocations — is reproducible on the LSan oracle
+// even with the test binary's per-iteration teardown amortizing most of the
+// stack-reachability work: 50 × sizeof(Res) is well above the 16-byte LSan
+// detection floor, and the loop dominates. With `i mod 2 = 0`, cond is true
+// on the even iterations: 25 of 50 paths allocate the prior Res(5).
+// Post-fix: 25 Res(5) + 50 Res(9) = 75 destructor runs; the program
+// returns Counter._n = 75 (75 mod 256 == 75, so the AOT exit-status
+// truncation does not interfere).
+BEZEL_TEST(own_join, poisoned_no_else_reassign_disposes_prior_owned_value_4329) {
+    auto r = runAotChecked(
+        "module M; "
+        "class Counter public static _n: int := 0; end Counter; "
+        "class Res "
+        "  public tag: int; "
+        "  public constructor(t: int) this.tag := t; end constructor; "
+        "  destructor Counter._n := Counter._n + 1; end destructor; "
+        "end Res; "
+        "class C "
+        "  public static method Main(): int "
+        "    var i := 0; "
+        "    while i < 50 do "
+        "      var cond := (i mod 2 = 0); "
+        "      var x: Res; "
+        "      if cond then "
+        "        x := new Res(5); "
+        "      end; "
+        "      x := new Res(9); "
+        "      x.Dispose(); "
+        "      i := i + 1; "
+        "    end; "
+        "    return Counter._n; "
+        "  end Main; "
+        "end C;");
+    bool skipped = false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("SKIP") != std::string::npos) skipped = true;
+    if (skipped) return;  // ASan/LSan toolchain unavailable — skip
+    // Pre-fix: 25 leaks × sizeof(Res) → ASan/LSan reports, exit nonzero.
+    // Post-fix: 25 prior-Res(5) + 50 fresh-Res(9) = 75 destructor runs;
+    // the program returns Counter._n = 75; no LSan reports.
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 75);
+}

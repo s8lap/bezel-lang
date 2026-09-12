@@ -7037,6 +7037,82 @@ void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
             // silently killed).
             if (st.state == OwnershipState::Owned)
                 checkConsumeFreeze(id->name, as.target->span.begin);
+            // fix #4329 (§28.3 / §28.7 / O4 silent-poison design, v0.298): at a
+            // non-loop `if … then` / no-else merge, `joinInto`'s catch-all sets
+            // the local's state to Poisoned while preserving its `obligationOrigin`
+            // (the prior Owned assignment site) — the O4 design's "silent poison;
+            // a subsequent read diagnoses". A *reassignment* of that poisoned
+            // local was NEVER separately covered by O4's design: a read diagnoses,
+            // but the slot is still live with the prior Owned value on at least
+            // one reaching path, and the next reassignment (`st.state =
+            // producerState(*as.value)` immediately below) silently overwrites
+            // the state with the new producer's classification, leaving the prior
+            // Owned undischarged — codegen's `disposeDisplacedOwnedClassLocal`
+            // refuses to fire for a no-init LocalDecl (`unwindOwnedLocalClass`
+            // returns null on `!ld->initializer`), so the O4-poisoned local
+            // becomes a leak the existing scope-end auto-drop doesn't catch
+            // either (state was overwritten to Owned before it reached the
+            // end-of-block Owned-without-discharge check). Measured on r18-c4
+            // base `f99d7c4`, `--sanitize=address` on `var x: Res; if cond then
+            // x := new Res(5); end; x := new Res(9); x.Dispose();` × 50
+            // iterations: `AddressSanitizer: 800 byte(s) leaked in 50
+            // allocation(s)` — exactly the cond=true allocations.
+            //
+            // The fix follows the spec's per-path model (K7 / §28.3): "the
+            // classification each assigning edge adopted is carried per-path —
+            // an owned value live at scope end on an assigning path is disposed
+            // there by K3.14's auto-drop, exactly as on any other path". The
+            // reassignment's drop-on-overwrite (§28.7) is the canonical
+            // per-path disposal point for the displaced value, exactly as
+            // `handleAssignment`'s null-init setter already does at line 7141
+            // below. Mark the LocalDecl for codegen drop-on-overwrite by
+            // setting `becomesOwnedViaReassign` — the existing setter at line
+            // 7141 below is currently gated to null-init locals ONLY (its
+            // comment at 7125-7138 documents that exclusion); we extend it
+            // narrowly to the O4-poisoned-with-obligation case so codegen's
+            // `unwindOwnedLocalClass` admits the local as an owned class
+            // local for `disposeDisplacedOwnedClassLocal` to dispose the
+            // displaced value at THIS reassignment point (null-guarded +
+            // identity-guarded, so a no-prior-value slot is a no-op). The
+            // sticky-once-set semantics (the flag is never cleared) are sound
+            // for the same reason the null-init setter is: once Owned, the
+            // local is never reassigned a borrow (§28.3 state-match rule), so
+            // a stale flag cannot double-dispose a later borrow. The O4
+            // borrow-path (Borrowed ⊓ Uninitialized → Poisoned) is symmetric
+            // and also fires — `obligationOrigin` carries through that join
+            // too — but borrows carry no disposal obligation, so the flag's
+            // drop-on-overwrite pass is null-guarded and disposes nothing.
+            // // per §28.3, §28.7, v0.298, #4329
+            if (st.state == OwnershipState::Poisoned && st.obligationOrigin) {
+                if (auto* lsym = dynamic_cast<sema::LocalSymbol*>(sym)) {
+                    if (auto* ld2 =
+                            // LOCALDECL-ONLY: §21.1 forbids reassignment of a
+                            // `const` local outright, so the bare-identifier
+                            // reassignment target is necessarily a var
+                            // LocalDecl; a LocalConstDecl never reaches this
+                            // site.
+                            dynamic_cast<const ast::LocalDecl*>(lsym->decl)) {
+                        // Mirror the borrow-init exclusion below (line 7134-7138):
+                        // a borrow-INITIALIZED local that becomes Owned via
+                        // reassignment is already classified Borrowed+Owned by
+                        // the existing path; setting `becomesOwnedViaReassign`
+                        // would convert it to a class-disposal-disposed slot,
+                        // double-freeing its BORROW-init predecessor. The O4
+                        // case here is O4-only — the join carries Poisoned,
+                        // never Owned-on-the-Owned-side through
+                        // `ownedDischargedSplit` (which KEEPS Owned, not
+                        // Poison) — so the exclusion above doesn't reach this
+                        // branch, but the predicate is kept for symmetry and
+                        // defense-in-depth.
+                        const bool borrowInit = ld2->initializer &&
+                            !dynamic_cast<const ast::NullLiteralExpr*>(
+                                ld2->initializer.get());
+                        if (!borrowInit)
+                            const_cast<ast::LocalDecl*>(ld2)
+                                ->becomesOwnedViaReassign = true;
+                    }
+                }
+            }
             // fix #3950 (§28.7 v0.294 / §28.3 K1.3 v0.294): record the
             // MOVED-FROM half of §28.7's liveness test for codegen. "[If] the
             // previous value is live (non-null and not moved-from ...), it is

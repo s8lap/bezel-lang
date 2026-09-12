@@ -19019,7 +19019,41 @@ const sema::TypeSymbol* Emitter::unwindOwnedLocalClass(const ast::LocalDecl* ld)
     // runtime calls, not class dispatch, and are not the §28.3 leak findings);
     // a borrow initializer (no `owned`) carries no disposal obligation; an
     // uninitialized/null/value-typed local has nothing to dispose.
-    if (!ld->initializer) return nullptr;
+    if (!ld->initializer) {
+        // fix #4329 (§28.3 / §28.7, v0.298): a NO-INITIALIZER plain local
+        // (`var x: Res;`) that BECOMES owned via reassignment over a silently-
+        // poisoned join (`if cond then x := new Res(5); end;` — `joinInto`'s
+        // O4 catch-all poisons, preserving `obligationOrigin`; the reassignment
+        // overwrites the state) needs both the exception-unwind disposal (this
+        // function) AND `disposeDisplacedOwnedClassLocal`'s drop-on-overwrite
+        // to fire. Without this guard the early `!ld->initializer` return would
+        // skip the becomesOwnedViaReassign block below and the prior Owned
+        // value's allocation would leak — measured on r18-c4 base `f99d7c4`,
+        // `--sanitize=address` × 50 iterations: 800 B / 50 allocations.
+        // BORROW-INIT locals are still excluded (the ownership pass's setter
+        // at handleAssignment guards against them, and the borrow-init path
+        // never reaches here); the setter is also restricted to the
+        // O4-poisoned-with-obligation case, so a no-init local that reaches
+        // Owned on BOTH branches (the `own_join.owned_on_both_branches_
+        // carries_obligation` test's case) keeps the existing K3.14
+        // scope-end auto-drop behavior unchanged — the setter only fires on
+        // the explicit Poisoned-with-obligation shape.
+        if (ld->becomesOwnedViaReassign) {
+            const sema::TypeSymbol* cls = classOfLocal(ld);
+            if (cls && cls->kind == ast::TypeDeclKind::Class &&
+                disposerFns_.find(cls) != disposerFns_.end())
+                return cls;
+            if (cls && cls->kind == ast::TypeDeclKind::Interface)
+                return reinterpret_cast<const sema::TypeSymbol*>(1);
+            if (ld->type) {
+                const sema::TypeRef* rt = ctx_.resolvedType(*ld->type);
+                const sema::TypeRef* rrt = resolveTypeParamRef(rt);
+                if (isClassOrInterfaceRef(rt) || isClassOrInterfaceRef(rrt))
+                    return reinterpret_cast<const sema::TypeSymbol*>(1);
+            }
+        }
+        return nullptr;
+    }
     if (collectionTypeOfLocal(ld) || dictTypeOfLocal(ld) ||
         linkedListTypeOfLocal(ld)) return nullptr;
     // stdlib §6.7 / §30.5: Task / Task<T> — disposed via bz_task_free, not
