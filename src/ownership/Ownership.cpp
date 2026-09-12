@@ -2948,6 +2948,31 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
                     "compiler-recognized `Slice(r)` form) that the binding "
                     "would never dispose, so the value would leak; bind it "
                     "with `using var` (§21.1 / §28.3)");
+            } else if (auto* mue =
+                           dynamic_cast<const ast::UnaryExpr*>(lc->value.get());
+                       mue && mue->op == "move") {
+                // fix #4287 (§21.1, v0.298): §21.1 explicitly rejects a
+                // marked-transfer `move` as a const initializer, with the
+                // spec quote "the marked transfer `const y := move x;`
+                // included — not a form". Reaches here for a `move` whose
+                // operand is a BUILT-IN class (Array<T>, Dictionary<…>, the
+                // FFI buffers, …) or a value type — those the producerState
+                // disjunct above classifies Borrowed, so without this branch
+                // the new `move` predicate disjunct (#4287) would REJECT-BUT-
+                // SAY-NOTHING (falling through to the generic "must not take
+                // an owned production" fallback below, which is the wrong
+                // shape for the move-specific cite). The wording keeps §21.1
+                // and the `using var` remedy the spec mandates, and names the
+                // `move` form so the diagnostic teaches the actual culprit.
+                // // per §21.1 v0.298, #4287
+                ctx_.diagnostics().report(
+                    Severity::Error, lc->value->span.begin,
+                    std::string("a `const` local (`") +
+                    std::string(lc->name) +
+                    "`) must not take an owned production — a `move` is a "
+                    "transfer (§28.3) that the binding cannot take; bind the "
+                    "source with `using var` and read it through the const, "
+                    "or omit the `move` (§21.1 / §28.3)");
             } else if (producerState(*lc->value) == OwnershipState::Owned) {
                 ctx_.diagnostics().report(
                     Severity::Error, lc->value->span.begin,
@@ -4412,6 +4437,20 @@ bool MethodOwnership::checkBareBorrowLoopCarriedEscape(
 // retain, no state.
 bool MethodOwnership::constInitializerRejected(const ast::Expr& e) {
     if (producerState(e) == OwnershipState::Owned) return true;
+    // fix #4287 (§21.1, v0.298): §21.1 rejects `a move` outright, independent
+    // of the moved value's type. The producerState disjunct above catches a
+    // `move` whose OPERAND is a user-declared class/interface (#1388 path B,
+    // Ownership.cpp:~5036) or whose RESULT type is an owning-collection head
+    // (`OwningArray`/..., #1107 D, Ownership.cpp:~4628) — but a `move` of a
+    // BUILT-IN class type (`Array<int>`, `Dictionary<...>`, the FFI buffers,
+    // …) has a null declaration on the operand side, so both arms fall through
+    // and producerState returns Borrowed. The `#4287` repro measures exactly
+    // that: `var a := new Array<int>(2); const c := move a;` compiled clean
+    // (zero diagnostics) — the spec's "the marked transfer `const y := move
+    // x;` included — not a form" was unsound. Reject the shape here so the
+    // `LocalConstDecl` arm reports it with §21.1's mandated diagnostic.
+    if (auto* mue = dynamic_cast<const ast::UnaryExpr*>(&e))
+        if (mue->op == "move") return true;
     if (auto* ce = dynamic_cast<const ast::CallExpr*>(&e)) {
         // §29.11 deferred-activation producer (#2146).
         if (common::isOwningCollectionDrainAliasCall(*ce, ctx_)) return true;

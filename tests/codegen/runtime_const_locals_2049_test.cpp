@@ -429,3 +429,78 @@ BEZEL_TEST(runtime_const_locals_2049, borrow_initializer_admitted) {
         "  end Main; "
         "end C;"), 42);
 }
+
+// §21.1 (v0.298) / #4287: a `const` local bound to a marked-transfer
+// `move` of a BUILT-IN class type (Array<int>, Dictionary<…>, the FFI
+// buffers, …) is rejected. §21.1's text names "a `move` (the marked
+// transfer `const y := move x;` included — not a form)" as a rejected
+// initializer form. The fix: the `constInitializerRejected` predicate now
+// catches any UnaryExpr with `op == "move"` (the producerState disjunct
+// alone misses built-ins because their declarations are null — see
+// Ownership.cpp:~5036 vs. ~4628). Pre-fix the program compiled clean
+// (zero diagnostics) — the issue's measured repro on `rev/4268` @ 60e57be.
+// The diagnostic must (a) cite §21.1 and (b) name the `using var` remedy
+// (§21.1's mandated wording). FAILS WITHOUT the fix (compileFails is false).
+BEZEL_TEST(runtime_const_locals_2049, const_move_of_builtin_array_rejected_4287) {
+    BEZEL_EXPECT_TRUE(compileFails(
+        "module M; class C "
+        "  public static method Main(): int "
+        "    var a := new Array<int>(2); a.Add(1); "
+        "    const c := move a; "       // §21.1: a move is a rejected form
+        "    return c.Count; "
+        "  end Main; "
+        "end C;"));
+}
+
+// §21.1 (v0.298) / #4287: a `const` local bound to a `move` of a
+// borrowing-collection value (Dictionary, Set, Stack, Queue, LinkedList)
+// is rejected for the same reason as the Array<int> case — the move form
+// is rejected irrespective of the moved type per §21.1's text. A second
+// data point (beyond the Array repro) — the predicate catches the shape,
+// not the type. FAILS WITHOUT the fix.
+BEZEL_TEST(runtime_const_locals_2049,
+           const_move_of_builtin_dictionary_rejected_4287) {
+    BEZEL_EXPECT_TRUE(compileFails(
+        "module M; class C "
+        "  public static method Main(): int "
+        "    var d := new Dictionary<string, int>(); "
+        "    d[\"k\"] := 7; "
+        "    const c := move d; "       // §21.1: a move is a rejected form
+        "    return 0; "
+        "  end Main; "
+        "end C;"));
+}
+
+// §21.1 (v0.298) / #4287: the SAME move form on a VALUE-typed operand
+// (a record) is still rejected — §21.1's "a `move`" qualifier does not
+// exempt value-typed moves. The const binding never takes a transfer
+// regardless of the moved type. FAILS WITHOUT the fix.
+BEZEL_TEST(runtime_const_locals_2049,
+           const_move_of_value_typed_record_rejected_4287) {
+    BEZEL_EXPECT_TRUE(compileFails(
+        "module M; record R(n: int); class C "
+        "  public static method Main(): int "
+        "    var r := new R(7); "
+        "    const c := move r; "       // §21.1: a move is a rejected form
+        "    return c.n; "
+        "  end Main; "
+        "end C;"));
+}
+
+// §21.1 (v0.298) / #4287 — ACCEPT CONTROL: a const bound to a plain
+// BORROW of a built-in class (`const c := a;` with no `move`) keeps
+// working — the rule rejects a `move` form specifically, never the bare
+// read. This is the spec's borrow-const idiom on a built-in class shape
+// (the same shape the false-accept path used). The fix MUST NOT widen
+// to a bare borrow; that is an accept-direction over-reject.
+BEZEL_TEST(runtime_const_locals_2049,
+           const_borrow_of_builtin_array_admitted_4287_control) {
+    BEZEL_EXPECT_FALSE(compileFails(
+        "module M; class C "
+        "  public static method Main(): int "
+        "    var a := new Array<int>(2); a.Add(1); "
+        "    const c := a; "            // borrow of a (no move) — admitted
+        "    return c.Count; "
+        "  end Main; "
+        "end C;"));
+}
