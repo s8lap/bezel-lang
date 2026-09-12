@@ -669,7 +669,58 @@ private:
     // of return paths the inference sees.
     template <typename F>
     void forEachLambdaReturnValue(
-        const ast::LambdaExpr& lam, F&& fn) const;
+        const ast::LambdaExpr& lam, F&& fn) const {
+        if (lam.exprBody) fn(lam.exprBody.get());
+        std::vector<const ast::Stmt*> stack;
+        for (const auto& s : lam.stmts) stack.push_back(s.get());
+        while (!stack.empty()) {
+            const ast::Stmt* s = stack.back();
+            stack.pop_back();
+            if (!s) continue;
+            if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(s)) {
+                if (rs->value) fn(rs->value.get());
+                continue;
+            }
+            if (auto* bs = dynamic_cast<const ast::DoEndBlock*>(s)) {
+                for (const auto& s2 : bs->body) stack.push_back(s2.get());
+                continue;
+            }
+            if (auto* ifs = dynamic_cast<const ast::IfStmt*>(s)) {
+                for (const auto& s2 : ifs->ifBranch.body)
+                    stack.push_back(s2.get());
+                for (const auto& el : ifs->elifBranches)
+                    for (const auto& s2 : el.body) stack.push_back(s2.get());
+                for (const auto& s2 : ifs->elseBody) stack.push_back(s2.get());
+                continue;
+            }
+            if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s)) {
+                for (const auto& s2 : ws->body) stack.push_back(s2.get());
+                continue;
+            }
+            if (auto* fs = dynamic_cast<const ast::ForStmt*>(s)) {
+                for (const auto& s2 : fs->body) stack.push_back(s2.get());
+                continue;
+            }
+            if (auto* ts = dynamic_cast<const ast::TryStmt*>(s)) {
+                for (const auto& s2 : ts->body) stack.push_back(s2.get());
+                for (const auto& arm : ts->catches)
+                    stack.push_back(arm.body.get());
+                for (const auto& s2 : ts->finallyBody) stack.push_back(s2.get());
+                continue;
+            }
+            if (auto* cs = dynamic_cast<const ast::CaseStmt*>(s)) {
+                for (const auto& arm : cs->arms)
+                    if (arm.bodyKind == ast::CaseArmBodyKind::Block)
+                        for (const auto& s2 : arm.stmts)
+                            stack.push_back(s2.get());
+                continue;
+            }
+            // LocalDecl, AssignmentStmt, ExpressionStmt, BreakStmt,
+            // ContinueStmt, ThrowStmt, YieldStmt, DiscardStmt — carry
+            // expressions, not returns; nested lambdas inside those
+            // expressions have their own callable and are excluded.
+        }
+    }
 
     // fix #1820 (§28.3): Concrete-slot function bodies callee-side check.
     // When a lambda is being type-checked at a function-type target whose

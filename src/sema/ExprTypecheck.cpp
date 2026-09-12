@@ -3278,60 +3278,12 @@ bool ExprTC::isFreshOwnedProducerExpr(const ast::Expr& e) const {
 // wrappers, same case-block bodyKind gate, same exclusion of nested
 // lambdas — so the rejection sees the same return-path set the
 // inference sees.
-template <typename F>
-void ExprTC::forEachLambdaReturnValue(
-    const ast::LambdaExpr& lam, F&& fn) const {
-    if (lam.exprBody) fn(lam.exprBody.get());
-    std::vector<const ast::Stmt*> stack;
-    for (const auto& s : lam.stmts) stack.push_back(s.get());
-    while (!stack.empty()) {
-        const ast::Stmt* s = stack.back();
-        stack.pop_back();
-        if (!s) continue;
-        if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(s)) {
-            if (rs->value) fn(rs->value.get());
-            continue;
-        }
-        if (auto* bs = dynamic_cast<const ast::DoEndBlock*>(s)) {
-            for (const auto& s2 : bs->body) stack.push_back(s2.get());
-            continue;
-        }
-        if (auto* ifs = dynamic_cast<const ast::IfStmt*>(s)) {
-            for (const auto& s2 : ifs->ifBranch.body)
-                stack.push_back(s2.get());
-            for (const auto& el : ifs->elifBranches)
-                for (const auto& s2 : el.body) stack.push_back(s2.get());
-            for (const auto& s2 : ifs->elseBody) stack.push_back(s2.get());
-            continue;
-        }
-        if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s)) {
-            for (const auto& s2 : ws->body) stack.push_back(s2.get());
-            continue;
-        }
-        if (auto* fs = dynamic_cast<const ast::ForStmt*>(s)) {
-            for (const auto& s2 : fs->body) stack.push_back(s2.get());
-            continue;
-        }
-        if (auto* ts = dynamic_cast<const ast::TryStmt*>(s)) {
-            for (const auto& s2 : ts->body) stack.push_back(s2.get());
-            for (const auto& arm : ts->catches)
-                stack.push_back(arm.body.get());
-            for (const auto& s2 : ts->finallyBody) stack.push_back(s2.get());
-            continue;
-        }
-        if (auto* cs = dynamic_cast<const ast::CaseStmt*>(s)) {
-            for (const auto& arm : cs->arms)
-                if (arm.bodyKind == ast::CaseArmBodyKind::Block)
-                    for (const auto& s2 : arm.stmts)
-                        stack.push_back(s2.get());
-            continue;
-        }
-        // LocalDecl, AssignmentStmt, ExpressionStmt, BreakStmt,
-        // ContinueStmt, ThrowStmt, YieldStmt, DiscardStmt — carry
-        // expressions, not returns; nested lambdas inside those
-        // expressions have their own callable and are excluded.
-    }
-}
+//
+// (Defined inline in `ExprTypecheck_impl.hpp`, the only translation unit
+// that needs it; previously only `ExprTypecheck.cpp` instantiated it via
+// the `checkConcreteSlotLambdaBody` call site, but `ExprTypecheck_Exprs.cpp`
+// now also needs it for fix #4340.)
+
 
 // fix #1820 (§28.3, v0.223 ruling; carried in v0.282): the callee-side
 // check for the §28.3 "function-value invocation of a concrete class /

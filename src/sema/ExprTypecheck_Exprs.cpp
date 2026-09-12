@@ -9434,6 +9434,87 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                                         lamTargetRetOwned,
                                         /*savedCurrentReturnType=*/nullptr);
         }
+        // fix #4340 (§5.1/§11.2, v0.298): the EIGHTH site fix #4310 missed —
+        // a BLOCK-bodied lambda's `return` statement whose value is a
+        // collection literal, typed via an outer (INFERRED, not written)
+        // function-type target `lamTargetRet`. #4323 fixed the
+        // EXPRESSION-bodied mirror (`lam->exprBody` is a collection literal);
+        // this is its block-bodied twin — `do return [...]; end`. Both have
+        // the identical §5.1/§11.2 element-conformance question, and both
+        // miss the existing `ReturnStmt` site's `returnCtx_ == ValueMethod &&
+        // currentReturnType_` gate: this branch leaves `returnCtx_ = None`
+        // and `currentReturnType_ = nullptr` when `!hasAscription`, so the
+        // site never re-reads the per-element types left behind by
+        // `visitStmt`, the literal stays untyped (`ctx_.exprType(*literal)
+        // == nullptr`), codegen's #2491 backstop silently degrades the
+        // return value to a null/zero slot, and the typed-local caller then
+        // SIGSEGVs on the first interface dispatch (#4323's signature).
+        //
+        // The fix mirrors #4323's pattern exactly — `setExprType` so the
+        // literal is materialisable against `lamTargetRet` at codegen, then
+        // the SAME shared `checkCollectionLiteralElementAssignability`
+        // helper #4310 factored (§6/§25: "is there a fact the compiler
+        // ALREADY COMPUTES that decides this?"; this is its EIGHTH caller,
+        // not a new hand-rolled element walk). Walks every value-carrying
+        // `return e;` in the block body (descending through do/end, if/elif/
+        // else, while, for, try/catch/finally, statement-position case
+        // block arms) via the same `forEachLambdaReturnValue` helper
+        // `checkConcreteSlotLambdaBody` (#1820) uses, so the rejection sees
+        // the same return-path set the inference sees.
+        //
+        // Scoped to the unascribed-but-target-typed form (the exact twin of
+        // #4323's mirror arm): `lam->isBlockBody` (not the expression-body
+        // case `#4323` already patched), `!hasAscription` (the ascription
+        // branch above already sets `returnCtx_ = ValueMethod`/
+        // `currentReturnType_ = ascribedRet` and reaches the same
+        // per-element check through #4310's own first-return twin at
+        // `ExprTypecheck.cpp:14885-14918`), and `lamTargetRet` is on
+        // §15.4's closed collection-target list (the empty carve-out
+        // included — `[]` is admissible at every §15.4 collection target;
+        // the form-vs-target question is carried through unchanged). A
+        // non-collection `lamTargetRet` (the `var f: () -> int := …` body
+        // where every `return e;` happens to be a literal-free expression)
+        // is unaffected, so the broader "every target return checks
+        // returnable values" question (a real but separate defect class)
+        // stays out of scope — its shape differs enough that bundling would
+        // dilute this regression test.
+        if (!hasAscription && !lam->isAsync && lam->isBlockBody &&
+            lamTargetRet && !lamTargetRetOwned &&
+            (isCollectionLiteralAdmissibleTarget(lamTargetRet,
+                                                 /*isDict=*/false) ||
+             isCollectionLiteralEmptyAdmissibleTarget(lamTargetRet))) {
+            forEachLambdaReturnValue(*lam, [&](const ast::Expr* retVal) {
+                if (!retVal) return;
+                auto* clE =
+                    dynamic_cast<const ast::CollectionLiteralExpr*>(retVal);
+                if (!clE) return;
+                // The expression-body arm `lam->exprBody` is non-null
+                // ONLY for #4323's case (an expression-bodied lambda); we
+                // require `isBlockBody` above, so `lam->exprBody` is null
+                // and `forEachLambdaReturnValue` will not visit it here.
+                // The dynamic_cast inside `forEachLambdaReturnValue`'s
+                // expr-body slot would anyway only fire for an expression-
+                // bodied lambda — its visited body is the literal, and the
+                // #4323 fix already threads it; double-checking would
+                // duplicate the same diagnostic if it ever leaked through.
+                // Skip the form-vs-target mismatch (`[k: v]` at a
+                // sequence-shaped target — distinct from the
+                // bad/missing-target question, which `reportCollection-
+                // LiteralBadTarget` would handle at L14885+ when that gate
+                // is reached via the ascribed path; here we just refuse to
+                // materialise the mismatched form against the target).
+                const bool isEmpty =
+                    !clE->isDict && clE->elements.empty();
+                const bool retValAdmitted = isEmpty
+                    ? isCollectionLiteralEmptyAdmissibleTarget(lamTargetRet)
+                    : isCollectionLiteralAdmissibleTarget(lamTargetRet,
+                                                          clE->isDict);
+                if (!retValAdmitted) return;
+                ctx_.setExprType(clE, lamTargetRet);
+                checkCollectionLiteralElementAssignability(
+                    *clE, lamTargetRet);
+            });
+        }
         // issue #777 / §30.6: forgotten `await` in an expression-bodied async
         // lambda. The body must produce the element type T threaded in as
         // lamRetHint, not a `Task` value. A Task-shaped body where T is not
