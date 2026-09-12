@@ -8464,6 +8464,77 @@ void MethodOwnership::checkDisposeReceiverOwnership(const ast::Expr& recv,
                     "` with `move` to take ownership");
                 return;
             }
+            // fix #4334 (§28.6 "Who may call Dispose()", v0.298): a plain-
+            // local alias of a NON-OWNED PARAMETER is itself a borrow — the
+            // parameter is a borrow (§28.6: "the caller retains ownership"),
+            // and an unmarked `var b := p;` (or `const b := p;`) is an
+            // alias whose disposal frees a value the parameter's caller
+            // still owns (a double-dispose — the borrowed-axis twin of the
+            // #4236/#4268/#4283/#4286/#4304/#4314/#4321 owned-source family
+            // fixed in v0.298). The ParameterSymbol arm above (line 8193)
+            // already rejects `p.Dispose()` directly — this arm extends the
+            // SAME rule to a one-hop identifier alias of `p`. Distinct from
+            // the whole `disposeAliasSource` family because that field is
+            // populated only for owned-source aliases by design (see
+            // OwnershipState.hpp's `disposeAliasSource` header comment and
+            // #4236's send-back for why a separate field is used); a
+            // non-owned parameter is NEVER an `isOwnedTrackedLocal` and so
+            // is invisible to that path.
+            //
+            // Performed in-place rather than via a new populate field
+            // (issue #4334's alternative (b)) so the change stays as narrow
+            // as the bug: the LocalSymbol carries `decl` directly back to
+            // the LocalDecl/LocalConstDecl node (the §21.1 #3687 sibling
+            // walker pattern), and the AST re-lookup is O(1). Restricted to
+            // a bare IDENTIFIER read (never a member/index/other projection
+            // — those can be value-typed copies, see §28.3 K1.5 in
+            // `disposeAliasSource`'s populate) of a NON-OWNED PARAMETER
+            // (modifier != "owned" and != "out owned"; an `owned`/`out owned`
+            // parameter IS the disposal-responsible owner and its one-hop
+            // alias is already caught by the `disposeAliasSource` arm above
+            // via `isOwnedTrackedLocalInEnclosingFrame`, #4304). Multi-hop
+            // alias chains of a borrow source (`var b := p; var c := b;
+            // c.Dispose()`) are a recorded gap, exactly like the owned-
+            // source chain case #4263 — left unenforced for now to keep
+            // this fix's blast radius narrow.
+            //
+            // Accept-side pin: an alias of a borrow that is NEVER disposed
+            // (the local is read or passed into a sink, never `.Dispose()`-
+            // called) must stay accepted — and does: this check fires only
+            // at the call site, not at the binding.
+            if (locSym->decl) {
+                const ast::Expr* init = nullptr;
+                if (auto* ld =
+                        dynamic_cast<const ast::LocalDecl*>(locSym->decl))
+                    init = ld->initializer.get();
+                else if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(
+                             locSym->decl))
+                    init = lc->value.get();
+                if (init) {
+                    if (auto* rid = dynamic_cast<const ast::IdentifierExpr*>(
+                            init)) {
+                        sema::Symbol* rsym = ctx_.exprSymbol(*rid);
+                        if (auto* ps = dynamic_cast<sema::ParameterSymbol*>(
+                                rsym)) {
+                            if (ps->modifier != "owned" &&
+                                ps->modifier != "out owned") {
+                                report(
+                                    Severity::Error, loc,
+                                    std::string("cannot call `Dispose()` on `") +
+                                    std::string(id->name) +
+                                    "`: it is a borrow (an alias) of parameter `" +
+                                    std::string(ps->name) +
+                                    "`, which is itself a borrow (§28.6 \"Who "
+                                    "may call Dispose()\") — the parameter's "
+                                    "caller still owns it; declare `" +
+                                    std::string(ps->name) +
+                                    "` `owned`, or let the caller dispose it");
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
             // A plain `var`/`using var` local (LocalDecl decl) with no
             // recorded `disposeAliasSource`, or a local absent from states_
             // (unreachable / other-block position): NOT rejected — the
