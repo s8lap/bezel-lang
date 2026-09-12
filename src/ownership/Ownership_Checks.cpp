@@ -9155,7 +9155,20 @@ void MethodOwnership::joinInto(std::unordered_map<sema::Symbol*, LocalOwnership>
              o.state == OwnershipState::Borrowed);
         if (borrowedMovedFromSplit) {
             if (st.state != OwnershipState::Borrowed) st = o;
-            st.maybeConsumed = true;
+            // c4-fix-4312-regression narrowing (§28.3, v0.298, #4068): only
+            // set maybeConsumed when the surviving Borrowed side carries an
+            // actual borrow-source pointer (`source` set by handleLocalDecl's
+            // borrowSourceForExpr path) — a plain alias of a named binding
+            // like `var y := x;`. A fresh-producer local classified Borrowed
+            // (a `var items := seq.Sorted()` on a borrowing-collection return
+            // type) has no `source`, and the field-store slot-nulling makes
+            // its post-move read safe (codegen's nullTransferredOwnedLocalSlot
+            // extension, paired with the null-deference guard, catches the
+            // access). 4068's `while_loop_field_store_spec_28_3` row
+            // continues to compile; 4312 repro 2 and the axis rows that use
+            // `var y := x;` retain the rejection. // per §28.3, v0.298, #4312
+            if (st.source.has_value())
+                st.maybeConsumed = true;
             continue;
         }
         // fix #4312/#4313 (§28.3, v0.298): LOUD, unconditional audit — see
