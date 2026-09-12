@@ -483,6 +483,31 @@ private:
         // Record the originating `if` on the merge so a forward analysis
         // can locate the §28.3 branch-join diagnostic at the if's span.
         merge->sourceStmt = &s;
+        // fix #4339 (§28.3, v0.298): the CFG builder's standard reuse
+        // pattern promotes `from` to a Branch block (visitBranch below).
+        // That is sound for a Linear predecessor — its kind carries no
+        // dataflow semantics — but is UNSOUND for a Merge predecessor:
+        // when a sibling (non-nested) second `if` statement follows a
+        // first whose branches clash, the first `if`'s Merge block IS the
+        // second `if`'s condition's predecessor (visitIf's `from` is the
+        // previous block; visitBranch then mutates that block in place).
+        // The in-place kind promotion overwrote `Merge` with `Branch`, so
+        // `computeEntry`'s `b->kind == flow::CFGBlock::Kind::Merge`
+        // gate (`isIfMerge`) was false on the final emit pass, the
+        // §28.3 branch-join clash report was suppressed, and the
+        // poisoned merge state silently leaked the rejected branch's
+        // value into codegen — measured as one Res per loop iteration
+        // under LeakSanitizer at 200x amplification, and zero diagnostics
+        // on a fresh build of the parent commit (issue 4339). Insert a
+        // fresh Linear block between Merge and the if's Branch when
+        // `from` is itself a Merge block; the fresh block then gets the
+        // usual Branch promotion in visitBranch, while Merge's kind
+        // survives intact for the dataflow's `isIfMerge` decision.
+        if (from->kind == CFGBlock::Kind::Merge) {
+            CFGBlock* bridge = cfg_.makeBlock(CFGBlock::Kind::Linear);
+            cfg_.addEdge(from, bridge);
+            from = bridge;
+        }
         visitIfBranches(s, from, merge);
         return merge;
     }
