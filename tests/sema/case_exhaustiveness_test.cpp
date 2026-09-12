@@ -413,6 +413,113 @@ BEZEL_TEST(sema_case_exhaust, sealed_hierarchy_bare_type_patterns_ok_spec_19_3) 
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
+// =============================================================================
+// §19.6 / #4195 (v0.298): an UNSUBSTITUTED generic type parameter constrained
+// to a closed/sealed hierarchy (`where T: Animal`, with `Animal` `closed` and
+// its subclasses `sealed`) is a `Named` TypeRef whose `declaration` is null —
+// the rigid-param shape `matchLeafRigid` keys on. The pre-#4195 closed-
+// hierarchy bullet gated on `scrutTy->declaration != nullptr`, so a `case`
+// over such a scrutinee fell through to the generic "cannot prove" path and
+// was falsely warned (expression position) — or, in statement position,
+// folded the no-match edge into the ownership arm-join as if it were live,
+// falsely rejecting a subsequent reassignment/dispose of a local every arm
+// consumed (the §28.3 K1.4 false reject the issue documents on its repro).
+//
+// The fix: `caseArmsExhaustive` resolves the parameter's declared constraint
+// bound through the same `forEachConstraintBound` walk the static-interface-
+// operator lookup uses, so the closed-hierarchy bullet re-runs against the
+// constraint's declaration when the scrutinee itself is the bare parameter.
+// =============================================================================
+
+// Generic type parameter `T` constrained to `closed Animal` with every
+// subclass `sealed` — every leaf covered, NO wildcard → no warning
+// (FAIL-WITHOUT on #4195: "scrutinee type cannot be proven exhaustive",
+// §19.6; PASS-WITH: clean).
+BEZEL_TEST(sema_case_exhaust,
+           generic_typeparam_constrained_to_closed_hierarchy_all_leaves_ok_spec_19_6) {
+    auto r = parseSemaAll(
+        "module M; "
+        "closed class Animal end Animal; "
+        "sealed class Dog: Animal end Dog; "
+        "sealed class Cat: Animal end Cat; "
+        "class C "
+        "  public static method M<T>(v: T): int where T: Animal "
+        "    return (case v of "
+        "      var d: Dog => 1, "
+        "      var c: Cat => 2); "
+        "  end M; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(hasNonExhaustiveWarning(r));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// Reject-side control (#4195 §15): same shape but a leaf UNCOVERED — must
+// still warn. Pins that the constraint-bound fallback does not also swallow a
+// genuinely non-exhaustive case (the safe-direction concern).
+BEZEL_TEST(sema_case_exhaust,
+           generic_typeparam_constrained_to_closed_hierarchy_missing_leaf_warns_spec_19_6) {
+    auto r = parseSemaAll(
+        "module M; "
+        "closed class Animal end Animal; "
+        "sealed class Dog: Animal end Dog; "
+        "sealed class Cat: Animal end Cat; "
+        "class C "
+        "  public static method M<T>(v: T): int where T: Animal "
+        "    return (case v of "
+        "      var d: Dog => 1); "
+        "  end M; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(hasNonExhaustiveWarning(r));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());  // warning, not error
+}
+
+// Reject-side control (#4195 §15): a NON-CLOSED base class with two
+// non-sealed subclasses — even when the constraint makes the parameter's
+// value space "open, but bounded by this base", the §11.7 closed-set
+// guarantee is absent so the case cannot be proven exhaustive without a
+// catch-all. The constraint-bound fallback must inherit this same
+// strictness: a non-`closed` / non-recursively-sealed base, even when it is
+// the only bound on `T`, is NOT a closed-value-space hierarchy and so still
+// warns.
+BEZEL_TEST(sema_case_exhaust,
+           generic_typeparam_constrained_to_open_hierarchy_still_warns_spec_19_6) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class Animal end Animal; "
+        "class Dog: Animal end Dog; "
+        "class Cat: Animal end Cat; "
+        "class C "
+        "  public static method M<T>(v: T): int where T: Animal "
+        "    return (case v of "
+        "      var d: Dog => 1, "
+        "      var c: Cat => 2); "
+        "  end M; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(hasNonExhaustiveWarning(r));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// Interface-only constraint (#4195 §15): a `where T: IFoo` where IFoo is
+// an INTERFACE has no closed-value-space guarantee — the constraint-bound
+// fallback must reject the interface case and fall through to the generic
+// "cannot prove" path, NOT silently treat the interface declaration as a
+// closed hierarchy. A `case` over such a scrutinee with no wildcard still
+// warns.
+BEZEL_TEST(sema_case_exhaust,
+           generic_typeparam_constrained_to_interface_only_still_warns_spec_19_6) {
+    auto r = parseSemaAll(
+        "module M; "
+        "interface IThing end IThing; "
+        "class C "
+        "  public static method M<T>(v: T): int where T: IThing "
+        "    return (case v of "
+        "      var d: IThing => 1); "
+        "  end M; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(hasNonExhaustiveWarning(r));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
 // --- Generic leaves: the determination rule (§19.6, v0.196) ----------------
 //
 // §19.6 (v0.196) "Generic leaves: the determination rule", the "No inhabiting

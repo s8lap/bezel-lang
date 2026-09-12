@@ -2190,6 +2190,38 @@ bool ExprTC::caseArmsExhaustive(
     TypeSymbol* sub = (scrutTy && scrutTy->kind == TypeRef::Kind::Named)
                           ? scrutTy->declaration
                           : nullptr;
+    // fix #4195 (§19.6, v0.298): an UNSUBSTITUTED generic type parameter
+    // (`where T: Animal`, with `Animal` `closed` and its subclasses `sealed`)
+    // resolves to a `Named` TypeRef whose `declaration` is null (a bare
+    // type-parameter reference, the same shape `isRigidParam` keys on).
+    // The closed-hierarchy/enum/choice bullets below gate on `sub != nullptr`,
+    // so this scrutinee shape fell through and was falsely rejected as
+    // non-exhaustive even when the arms cover every leaf of the parameter's
+    // declared constraint hierarchy. Resolve the constraint bound through the
+    // same `forEachConstraintBound` walk the static-interface-operator lookup
+    // uses (#1425 / #3617-family), so the classification pred-icate does not
+    // drift from a second spelling (§LANE_RULES duplicated-classification-
+    // predicate discipline).
+    if (!sub && scrutTy && scrutTy->kind == TypeRef::Kind::Named &&
+        !scrutTy->declaration) {
+        std::string_view paramName = scrutTy->headName();
+        if (!paramName.empty() && isInScopeTypeParam(paramName)) {
+            forEachConstraintBound(
+                paramName, [&](TypeRef* ctr) -> bool {
+                    if (ctr && ctr->kind == TypeRef::Kind::Named &&
+                        ctr->declaration &&
+                        (ctr->declaration->kind == ast::TypeDeclKind::Enum ||
+                         ctr->declaration->kind ==
+                             ast::TypeDeclKind::Choice ||
+                         ctr->declaration->kind ==
+                             ast::TypeDeclKind::Class)) {
+                        sub = ctr->declaration;
+                        return true;  // accept the first admitted bound
+                    }
+                    return false;
+                });
+        }
+    }
 
     if (sub && sub->kind == ast::TypeDeclKind::Enum) {
         // §19.6: every declared enum constant must have a matching pattern.
