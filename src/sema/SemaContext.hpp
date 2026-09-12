@@ -1177,6 +1177,51 @@ inline bool isValueBuiltinByName(std::string_view n) {
     return false;
 }
 
+// fix #4191 / #4196 (v0.298): the predicate that scopes "no disposal
+// obligation when directly held or moved" — a strictly narrower question
+// than `isValueBuiltinByName`, which answers "excluded from owning-
+// collection element types" (a question where Buffer is correctly
+// admitted as a value-shaped element type even though it owns its
+// backing buffer). The OWNERSHIP classification of a directly-held value
+// differs from its COLLECTION-ELEMENT classification for exactly one stdlib
+// type — `Buffer<T>` (the #545 arity-1 compiler-intrinsic primitive):
+// `new Buffer<T>(n)` allocates a heap buffer with a real disposal
+// obligation (measured: ASan reports a 4016-byte leak per `const b3 := move
+// b2;` over a `Buffer<int>(1000)`, fed168b's wrong fix's #4196 evidence),
+// yet `isValueBuiltinByName` lists it for owning-collection-element
+// reasons (a `Buffer` slot in a non-owning array is correctly a value-typed
+// copy with no obligation at the slot). All other `isValueBuiltinByName`
+// names ALSO carry no disposal obligation when directly held (they are
+// records, span views, FFI value types, or trivial primitives) and so
+// this predicate covers them all; only `Buffer` is excluded.
+//
+// `CancellationToken` (stdlib §6.1) is the live structural exception that
+// drove this split — it is a `public record` that is "borrow-bearing" with
+// no `Dispose()` and no destructor (so no disposal obligation when held),
+// yet is also pointer-represented (its record wraps a reference to shared
+// cancellation-source state), so it sits in `kHeapPointerReferenceBuiltins`
+// and the ownership pass needs a name-level filter to keep it Borrowed
+// under `move`. The full `isValueBuiltinByName` set is broader than the
+// ownership question demands (it includes `Buffer`, which IS disposal-
+// bearing when held) so the predicate is hand-listed here for the 15
+// names that share CancellationToken's "no disposal obligation when held"
+// property, with `Buffer` intentionally omitted. // per §28.3, v0.298,
+// #4191, #4196
+inline bool isNoDisposalObligationBuiltinName(std::string_view n) {
+    // §28.3 ownership classification of a directly-held value — the
+    // string-typed contract for this predicate, narrower than the
+    // collection-element question `isValueBuiltinByName` answers.
+    return n == "CancellationToken" ||
+           n == "DateTime" || n == "TimeSpan" ||
+           n == "DateOnly" || n == "TimeOnly" ||
+           n == "Guid" ||
+           n == "Range" ||
+           n == "IntPtr" || n == "UIntPtr" ||
+           n == "ReadOnlyStringSpan" || n == "Boolean" ||
+           n == "Span" || n == "ReadOnlySpan" ||
+           n == "ArraySpan" || n == "ReadOnlyArraySpan";
+}
+
 // #1115 / §2.8–§2.9 / #975 (stdlib §5): synthesize (and cache) a real Interface
 // TypeSymbol for the builtin generic interfaces IComparable<T> / IEquatable<T> /
 // IEqualityComparer<T>, mirroring the shape SymbolCollection produces for a user

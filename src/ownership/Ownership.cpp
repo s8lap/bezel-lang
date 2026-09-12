@@ -5043,6 +5043,92 @@ OwnershipState MethodOwnership::producerState(const ast::Expr& e) {
                     !opTy->declaration->isValueBuiltin) {
                     return OwnershipState::Owned;
                 }
+                // fix #3709 / #4191 / #4196 (§21.1 / §28.3 "Move semantics for
+                // owned locals" / §28.3 Producers "new T(...) | Owned",
+                // v0.298): the user-declaration arm above requires a user
+                // TypeSymbol (`opTy->declaration`), so a `move` of a
+                // DECLARATION-LESS builtin reference type — `StringBuilder`,
+                // `Random`, `Mutex`, `Array<T>`, `Task`, … (no user TypeDecl,
+                // per TypeResolution_Names.cpp's nullary-builtin registration)
+                // — fell all the way through to this function's Borrowed
+                // default, and §21.1's `const y := move x;` rejection (keyed
+                // on `producerState(e) == Owned`) never fired for one of
+                // these, though it correctly fires for a trivial-dispose USER
+                // class (has a `declaration`, no destructor — the arm above
+                // does not gate on dispose triviality at all) and for a
+                // non-trivial-dispose USER class. Spec: §28.3's own "Move
+                // semantics for owned locals" states a moved-from local
+                // binding "adopts owned state from the marked transfer,
+                // exactly as it would from a fresh producer" — and the
+                // Producers table's `new T(...)` row is unconditionally
+                // **Owned**, with no carve-out for a builtin or a
+                // trivial-dispose class. The `new T(...)` arm above (this
+                // function, the `NewExpr` case) already resolves that exact
+                // declaration-less-builtin question for a FRESH production —
+                // consulting `common::isHeapPointerReferenceBuiltin`, the
+                // SAME authority the codegen rep-layout tables use, to
+                // distinguish a heap-pointer reference builtin (Owned) from a
+                // value-shaped one (Borrowed, e.g. `DateTime`/`Guid`). Reuse
+                // it here so `move` classifies a declaration-less type
+                // exactly as constructing one fresh would — the "exactly as
+                // it would from a fresh producer" parity the spec states.
+                // (A bare, unresolved generic type parameter is ALSO a
+                // declaration-less Named TypeRef, but its head name never
+                // appears in the fixed `kHeapPointerReferenceBuiltins` table,
+                // so it is unaffected — stays Borrowed, no new false-reject.)
+                //
+                // fix #4191 / #4196 (review finding, v0.298):
+                // `common::isHeapPointerReferenceBuiltin` (BuiltinRegistry.cpp)
+                // is a CODEGEN-REPRESENTATION table ("is this declaration-
+                // less builtin's LLVM lowering a pointer"), not an OWNERSHIP
+                // authority, and the two questions diverge for at least one
+                // real stdlib type: `CancellationToken` (stdlib §6.1) is a
+                // `public record` — "a freely-copyable record" that "borrow-
+                // bears" the source — with no `Dispose()` and no disposal
+                // obligation — yet it IS pointer-represented (its record
+                // wraps a reference to shared cancellation-source state) and
+                // so IS listed in `kHeapPointerReferenceBuiltins` for that
+                // representation reason alone. The naive first landing of
+                // this branch used that table as the sole gate and so
+                // classified `move tok` (a `CancellationToken` local) as
+                // Owned — a NEW false-reject: `const t2 := move tok;` (a
+                // value-binding over a value-typed record) hard-rejected a
+                // program that compiled clean before. The correct authority
+                // for "does this declaration-less builtin carry a disposal
+                // obligation when directly held" is the new
+                // `sema::isNoDisposalObligationBuiltinName` predicate
+                // (SemaContext.hpp) — a 15-name list that excludes
+                // `Buffer` (#545 arity-1 compiler-intrinsic primitive,
+                // measured: `const b3 := move b2;` over a `new Buffer<int>(n)`
+                // LEAKS the buffer at scope end — a real disposal-bearing
+                // type that the fed168b narrow-fix attempt wrongly grouped
+                // with `CancellationToken` because it consulted the wider
+                // `isValueBuiltinByName` set, which is the
+                // owning-collection-element-type predicate and admits
+                // `Buffer` for that question's narrower scope). The new
+                // predicate's 15 names — `CancellationToken`, the six
+                // synthetic value-type builtins (`DateTime`/`TimeSpan`/
+                // `DateOnly`/`TimeOnly`/`Guid`), the value-record
+                // `Range`, the FFI value types (`IntPtr`/`UIntPtr`), the
+                // span-view records (`Span`/`ReadOnlySpan`/
+                // `ArraySpan`/`ReadOnlyArraySpan`/`ReadOnlyStringSpan`), and
+                // the trivial primitive `Boolean` — are exactly the names
+                // whose directly-held value carries no disposal obligation.
+                // `Buffer` is intentionally excluded (it owns its backing
+                // buffer). Applied as an EXCLUSION on top of the
+                // representation table, not a replacement:
+                // `isHeapPointerReferenceBuiltin` is still required to
+                // establish reference-SHAPE in the first place, so a bare
+                // unresolved generic type parameter — also declaration-less
+                // Named, but never a member of either fixed table — stays
+                // unaffected either way. // per §21.1, §28.3, v0.298,
+                // #3709, #4191, #4196
+                if (opTy->kind == sema::TypeRef::Kind::Named &&
+                    !opTy->declaration &&
+                    common::isHeapPointerReferenceBuiltin(opTy->headName()) &&
+                    !sema::isNoDisposalObligationBuiltinName(opTy->headName())) {
+                    return OwnershipState::Owned;
+                }
             }
         }
     }
