@@ -471,17 +471,31 @@ BEZEL_TEST(runtime_const_locals_2049,
         "end C;"));
 }
 
-// §21.1 (v0.298) / #4287: the SAME move form on a VALUE-typed operand
-// (a record) is still rejected — §21.1's "a `move`" qualifier does not
-// exempt value-typed moves. The const binding never takes a transfer
-// regardless of the moved type. FAILS WITHOUT the fix.
+// narrow #4287 (v0.298): ACCEPT-SIDE — `const c := move r;` over a
+// VALUE-typed record (`record R(n: int)`) compiles clean. §21.1's
+// "a `move`" qualifier rejects moves that adopt an OWNED state from
+// the marked transfer; per §28.3's "Move semantics" verbatim ("a fresh
+// declaration ... adopts owned state from the marked transfer, exactly
+// as it would from a fresh producer"), the adopt-state rule keys on
+// the moved operand's STORAGE, not on the syntactic `move` form — a
+// value-typed record has no disposal obligation (§28.9), so the move
+// does not adopt an owned state and the const binding is a value
+// copy of a value (the §28.3 row that says "from a fresh producer"
+// keys off `new`'s classification, which for `new R(7)` over a record
+// is Borrowed). This matches the same authority `producerState` uses
+// for the move arm's heap-pointer builtin gating (#3709 / #4191 /
+// #4196 — the no-disposal-obligation builtin predicate), and keeps
+// parity with `CancellationToken`'s accept-side (#4191). Pre-#4287
+// this already compiled clean (the #4287 cherry-pick's original test
+// expected REJECT, contradicting §28.3 — the expected-side is the
+// narrow fix, the original test was wrong).
 BEZEL_TEST(runtime_const_locals_2049,
-           const_move_of_value_typed_record_rejected_4287) {
-    BEZEL_EXPECT_TRUE(compileFails(
+           const_move_of_value_typed_record_accepted_narrow_4287) {
+    BEZEL_EXPECT_FALSE(compileFails(
         "module M; record R(n: int); class C "
         "  public static method Main(): int "
         "    var r := new R(7); "
-        "    const c := move r; "       // §21.1: a move is a rejected form
+        "    const c := move r; "       // §28.3: value-binding of a value
         "    return c.n; "
         "  end Main; "
         "end C;"));
