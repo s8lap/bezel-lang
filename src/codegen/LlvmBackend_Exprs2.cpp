@@ -11003,7 +11003,16 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
     // A choice's NamedPattern never resolves through the enum-constant or
     // type-test legs below (choice cases carry no enumValue_ entry and no
     // descriptor), so this early branch is the only path that admits them.
-    if (scrutTy && scrutTy->kind == sema::TypeRef::Kind::Named &&
+    // fix #4399 (v0.298): guard against nullable choice scrutinees — a
+    // `MyEnum?` type has scrutTy->declaration->kind==Choice, but the
+    // non-nullable path extracts field 0 of the LLVM value as the choice tag
+    // (i32). For a nullable scrutinee the LLVM value is {i8, ChoiceStruct},
+    // so field 0 is the i8 hasValue flag, causing "icmp eq i8, i32" IR
+    // verification failure. Route nullable choice scrutinees through the
+    // isNullableVal path below where nullablePrimValue extracts the inner
+    // ChoiceStruct first.
+    if (scrutTy && !scrutTy->nullable &&
+        scrutTy->kind == sema::TypeRef::Kind::Named &&
         scrutTy->declaration &&
         scrutTy->declaration->kind == ast::TypeDeclKind::Choice) {
         const sema::TypeSymbol* choiceTy = scrutTy->declaration;
@@ -11258,7 +11267,7 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
         if (op == "<")  return builder_.CreateICmpSLT(cmp, zero);
         if (op == "<=") return builder_.CreateICmpSLE(cmp, zero);
         if (op == ">")  return builder_.CreateICmpSGT(cmp, zero);
-        /* >= */        return builder_.CreateICmpSGE(cmp, zero);
+        return builder_.CreateICmpSGE(cmp, zero);
     };
     // §19.3 (#1152): lower a comparing-pattern operand (a range bound, a
     // relational bound, or a constant) as a `decimal` struct. A decimal LITERAL
@@ -11320,7 +11329,7 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
     //   DiscardPattern   → true (handled above, no change)
     // The non-nullable path is taken for all other scrutinee kinds.
     bool isNullableVal = scrutTy && isNullableValueTy(scrutTy) &&
-                         scrut->getType()->isStructTy();
+                         scrut && scrut->getType()->isStructTy();
     if (isNullableVal) {
         llvm::Value* hasVal = nullablePrimHasValue(scrut);  // i1
         llvm::Value* innerVal = nullablePrimValue(scrut);   // the T field
@@ -11336,6 +11345,33 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
                         enumConstantByName(enumTy, np->name->parts.back())) {
                     llvm::Value* eq = emitEquals(innerVal, cv, /*isStr=*/false);
                     return builder_.CreateAnd(hasVal, eq, "nv.enum.match");
+                }
+            }
+            // fix #4399 (v0.298, §35.9): a NamedPattern on a nullable CHOICE
+            // scrutinee (e.g. `None` on `Maybe?`) is a choice-case test: hasValue
+            // AND the choice tag matches the case. The existing NamedPattern
+            // handler above only covers enum constants; a bare choice-case name
+            // (which resolves to the CaseDecl, not to an enum constant) fell
+            // through to nullptr → lowerCaseExpr left `case.end` unterminated
+            // (IR-verify crash). Mirror the non-nullable choice NamedPattern
+            // handler above (lines 11011-11024): look up the name as a choice
+            // case, extract the tag from innerVal (the unwrapped choice struct),
+            // compare with the case's i32 tag, AND with hasValue.
+            if (np->name && !np->name->parts.empty() &&
+                scrutTy->kind == sema::TypeRef::Kind::Named &&
+                scrutTy->declaration &&
+                scrutTy->declaration->kind == ast::TypeDeclKind::Choice) {
+                const sema::TypeSymbol* choiceTy = scrutTy->declaration;
+                std::size_t tag = 0;
+                if (auto* cc = choiceCaseByName(
+                        choiceTy, np->name->parts.back(), &tag)) {
+                    (void)cc;
+                    llvm::Value* tagVal =
+                        builder_.CreateExtractValue(innerVal, {0}, "choice.tag");
+                    llvm::Value* matched = builder_.CreateICmpEQ(
+                        tagVal, llvm::ConstantInt::get(i32(), tag),
+                        "choice.tag.eq");
+                    return builder_.CreateAnd(hasVal, matched, "nv.choice.match");
                 }
             }
             // §19.5 (#1128): a bare TYPE-name pattern on a nullable record/enum
@@ -11693,15 +11729,35 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
         // nullable record `T?` matches only when the value is present. Extract
         // the unwrapped record value (nullablePrimValue → element 1) and run the
         // non-nullable destructuring extraction on it — which binds the field
-        // slots from the record's fields — then AND with hasValue. Passing a null
-        // scrutTy on the recursion takes the non-nullable path, reaching the
-        // DestructuringPattern handler below with the record struct as scrutinee.
-        // Without this the pattern fell through to the "deferred" null return
-        // below, and the case lowering then emitted an unterminated basic block
-        // (IR verification failure).
+        // slots from the record's fields — then AND with hasValue.
+        //
+        // fix #4399 (v0.298): when the underlying type IS a choice (e.g.
+        // `Maybe?` with a `Some(var v)` arm), passing scrutTy=null on the
+        // recursion skips the choice handler (which requires scrutTy to identify
+        // the choice type and emit the correct i32 tag constant), and instead
+        // falls through to the record/other handler. The record handler then
+        // extracts field 0 of the inner nullable wrapper `{i8 hasValue;
+        // ChoiceStruct}` as i8 (the hasValue flag) and compares it with i32
+        // 0 — an LLVM IR verification failure ("icmp eq i8, i32").
+        //
+        // The fix: when the nullable scrutinee's underlying type is a Named
+        // choice, construct a non-nullable Named TypeRef pointing to the same
+        // choice declaration and pass it to the recursive call so the choice
+        // path fires with the correct i32 tag constant.
         if (dynamic_cast<const ast::DestructuringPattern*>(pat)) {
+            const sema::TypeRef* recurseScrutTy = nullptr;
+            if (scrutTy && scrutTy->kind == sema::TypeRef::Kind::Named &&
+                scrutTy->declaration &&
+                scrutTy->declaration->kind == ast::TypeDeclKind::Choice) {
+                static sema::TypeRef choiceTy;
+                choiceTy.kind = sema::TypeRef::Kind::Named;
+                choiceTy.declaration = scrutTy->declaration;
+                choiceTy.nullable = false;
+                choiceTy.genericArgs = scrutTy->genericArgs;
+                recurseScrutTy = &choiceTy;
+            }
             llvm::Value* sub =
-                patternMatches(pat, innerVal, enumTy, isStr, /*scrutTy=*/nullptr);
+                patternMatches(pat, innerVal, enumTy, isStr, recurseScrutTy);
             if (!sub) return nullptr;
             return builder_.CreateAnd(hasVal, sub, "nv.destr.match");
         }
