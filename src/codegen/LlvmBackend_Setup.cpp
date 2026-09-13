@@ -15928,6 +15928,44 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
         }
         disposeStack_.back().push_back(d);
     }
+    // fix #4308 sibling: a plain `var arr := xs.GroupBy(sel).ToArray()` proven
+    // non-escaping holds the SOLE reference to the OWNING bz_array_t
+    // lowerGroupByMaterialize returns (Calls3.cpp ~2485 — the static type is
+    // `Array<IGrouping>` but the runtime bz_groupby_to_array result owns its
+    // groupings, exactly like the `using var` OwningArray<IGrouping> path).
+    // The borrowingArrayFreeEligible_ sibling block above would route this
+    // through elementPolicyFor(el, false) and bz_array_free(arr, null) —
+    // post-#4308 that returns ClassBorrow (null disposer), so every grouping
+    // leaks. Register a separate owning-family disposal here that uses
+    // elementPolicyFor(el, true) — the groupingFreeThunk branch, identical
+    // to the `using var` OwningArray<IGrouping> scope-end free. Eligibility
+    // comes from the same conservative escape walk the borrowing sibling
+    // uses (collectBorrowingArrayFreeEligible). The walk is path-sensitive
+    // like the borrowing sibling (the `arr.Add(<First()>)` argument-store
+    // the test exercises is excluded by the path-sensitive AssignmentStmt
+    // consume branch — exactly the reason the borrowing path also gates on
+    // the escape-walk proof). For a non-escaping local the scope-end free
+    // runs exactly once (no UAF, no double-free); an escaping local
+    // (returned / captured / stored into a field) is excluded, and the
+    // returned array then just leaks (safe direction, same as #1930's
+    // groupingFreeEligible_ sibling). Mirrors the registration shape of
+    // the borrowing block directly above — only the policy family flips
+    // from `false` to `true`.
+    if (v && currentFn_ == borrowingArrayFreeEligibleFn_ &&
+        groupByToArrayFreeEligible_.count(static_cast<const void*>(declNode)) &&
+        !disposeStack_.empty()) {
+        Disposal d{slot, nullptr};
+        d.collection = true;
+        LocalDeclInitView declView = localDeclInitView(declNode);
+        const sema::TypeRef* rt = nullptr;
+        if (declView.type) rt = ctx_.resolvedType(*declView.type);
+        if (!rt && declView.init) rt = ctx_.exprType(*declView.init);
+        const sema::TypeRef* el =
+            (rt && !rt->genericArgs.empty()) ? rt->genericArgs[0] : nullptr;
+        ElementPolicy ep = elementPolicyFor(el, /*owningFamily=*/true);
+        d.collectionElemDisposer = ep.disposerThunk;
+        disposeStack_.back().push_back(d);
+    }
     // #1028: a plain `var d := src.ToDictionary(...)` proven non-escaping holds the
     // sole reference to a fresh `owned Dictionary<K,V>`. Reclaim it at scope end via
     // bz_dict_free — the dict-backed analog of the #1003 array reclaim above. Per
@@ -29138,6 +29176,18 @@ bool Emitter::isFreshBorrowingArrayMaterializerLocal(
         auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call->callee.get());
         if (!ma) return false;
         std::string_view mm = ma->member;
+        // fix #4308 sibling: `xs.GroupBy(...).ToArray()` static-types as
+        // `Array<IGrouping>` but lowerGroupByMaterialize returns the OWNING
+        // bz_groupby_to_array result directly (Calls3.cpp ~2485), so the
+        // returned array OWNS its groupings — a borrowing-family scope-end
+        // `bz_array_free(arr, null)` would leak every grouping (the
+        // post-#4308 elementPolicyFor returns ClassBorrow for the borrowing
+        // family). Exclude it here so the candidate lands in a separate
+        // OWNING disposal registration that uses elementPolicyFor(el, true)
+        // (the groupingFreeThunk branch, identical to the `using var` path).
+        if (mm == "ToArray" && ma->target &&
+            isGroupByCall(ma->target.get()))
+            return false;
         // #1027 / stdlib §9.6: `string.Split(...)` returns a fresh `owned Array<string>`
         // whose substrings are created at rc=1 (the array is their sole owner). A plain
         // `var parts := s.Split(...)` was neither flagged for the §28.3 affine auto-drop
@@ -29169,6 +29219,40 @@ bool Emitter::isFreshBorrowingArrayMaterializerLocal(
     if (auto* ix = dynamic_cast<const ast::IndexExpr*>(view.init))
         return common::isBuiltinArrayRangeSliceIndex(*ix, ctx_);
     return false;
+}
+
+// fix #4308 sibling: OWNING-array twin of isFreshBorrowingArrayMaterializerLocal.
+// True if `ld` is a plain `var`/`const` local bound to `<recv>.GroupBy(sel).ToArray()`
+// — a GroupBy materializer call. The static result type is `Array<IGrouping>` (the
+// ToArray method's declared return) but lowerGroupByMaterialize returns the OWNING
+// bz_groupby_to_array result directly, so the runtime owns its groupings. The
+// borrowing sibling's `elementPolicyFor(el, false)` returns ClassBorrow post-#4308
+// (null disposer) — a leak. This predicate feeds a separate candidates vector +
+// an `elementPolicyFor(el, true)` disposal registration that uses groupingFreeThunk.
+// Narrow on purpose: only a plain `var`/`const` (NOT `using var`, whose disposal
+// comes from registerUsingDisposal), only a `ToArray()` call, and only when its
+// receiver IS a GroupBy call (the §5 shape that triggers the bz_groupby_to_array
+// short-circuit at Calls3.cpp ~2485 — every other ToArray target goes through
+// the normal materializer and the borrowed-classification path is correct).
+bool Emitter::isFreshGroupByToArrayLocal(const LocalDeclInitView& view) const {
+    if (view.isUsing || !view.init) return false;
+    const sema::TypeRef* rt = nullptr;
+    if (view.type) rt = ctx_.resolvedType(*view.type);
+    if (!rt) rt = ctx_.exprType(*view.init);
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
+        return false;
+    // The declared / expr-typed result must be a borrowing `Array<T>`. The runtime
+    // is owning (lowerGroupByMaterialize), but sema sees the method's normal return
+    // type — the spec wants the same shape the caller declared. Restrict to the
+    // "Array" name head so OwningArray<IGrouping> locals (a hypothetical explicit
+    // form) fall through to registerUsingDisposal instead of getting this narrower
+    // non-using path twice.
+    if (builtinTypeName(rt) != "Array") return false;
+    auto* call = dynamic_cast<const ast::CallExpr*>(view.init);
+    if (!call || !call->callee) return false;
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call->callee.get());
+    if (!ma || ma->member != "ToArray" || !ma->target) return false;
+    return isGroupByCall(ma->target.get());
 }
 
 
@@ -29706,6 +29790,8 @@ void Emitter::collectBorrowingArrayFreeEligible(
         const std::vector<std::unique_ptr<ast::Stmt>>& body,
         bool yieldIsBorrowIterYield) {
     borrowingArrayFreeEligible_.clear();
+    // fix #4308 sibling: OWNING-array twin (see member declaration comment).
+    groupByToArrayFreeEligible_.clear();
     dictMaterializerFreeEligible_.clear();  // #1028
     groupingFreeEligible_.clear();          // #1930
     dictEntryKeyReleaseEligible_.clear();    // #3720
@@ -29717,6 +29803,8 @@ void Emitter::collectBorrowingArrayFreeEligible(
     std::vector<const ast::Node*> candidates;
     std::vector<const ast::Node*> dictCandidates;  // #1028
     std::vector<const ast::Node*> groupingCandidates;  // #1930
+    // fix #4308 sibling: OWNING-array twin of the borrowing-array candidates.
+    std::vector<const ast::Node*> groupByToArrayCandidates;
     std::vector<const ast::Node*> dictEntryKeyCandidates;  // #3720
     std::vector<const ast::Node*> setLiteralCandidates;   // #2142
     std::vector<const ast::Node*> dictLiteralCandidates;  // #2143
@@ -29769,6 +29857,16 @@ void Emitter::collectBorrowingArrayFreeEligible(
                 dictEntryKeyCandidates.push_back(node);
             if (isFreshBorrowingArrayMaterializerLocal(v))
                 candidates.push_back(node);
+            // fix #4308 sibling: the OWNING-array twin of the branch above —
+            // `var arr := xs.GroupBy(sel).ToArray()`. Excluded from the
+            // borrowing sibling (it static-types as `Array<IGrouping>` but
+            // lowerGroupByMaterialize returns the OWNING bz_groupby_to_array
+            // result), so it lands in its own candidates vector and feeds a
+            // separate disposal registration that uses elementPolicyFor(el,
+            // true). Same conservative escape walk as the borrowing sibling
+            // (run via the dedicated loop below).
+            if (isFreshGroupByToArrayLocal(v))
+                groupByToArrayCandidates.push_back(node);
             // fix #3878 / §29.1 / §28.9 / §28.11: a plain `const`/`var` bound
             // to `<expr>.TakeCurrent()` on a builtin owning enumerator, at a
             // builtin `Array<T>` result type — mutually exclusive with the
@@ -29926,6 +30024,31 @@ void Emitter::collectBorrowingArrayFreeEligible(
         for (auto& s : body) { w.stmt(s.get()); if (w.escaped) break; }
         if (!w.escaped)
             groupingFreeEligible_.insert(static_cast<const void*>(ld));
+    }
+    // fix #4308 sibling: OWNING-array twin of the borrowingArrayFreeEligible_
+    // loop — `var arr := xs.GroupBy(sel).ToArray()`. Reuses the same
+    // conservative type-agnostic StringEscapeWalker (default mode, NOT
+    // borrowingArrayMode / safeViewAliases — the array OWNINGS its elements,
+    // so `arr[i]` / `arr.Count` are still safe reads but `for var x in arr`
+    // clones a per-loop enumerator that OWNS its current (a `+1` producer per
+    // element — exactly the borrow-vs-own distinction the walker's default
+    // mode enforces). An escaping local (returned / captured / stored into a
+    // field / added to an outer owning collection via `arr.Add(<other>`) is
+    // excluded — the OWNING array then just leaks (safe direction, identical
+    // to the borrowing sibling and #1930's groupingFreeEligible_). The
+    // path-sensitive AssignmentStmt consume branch (pathSensitiveBranchMode,
+    // enabled on the borrowingArrayFreeEligible_ loop just above) handles the
+    // test's `arr.Add(<First()>)` argument-store: the consume slot-null makes
+    // the scope-end free a no-op on the consumed path. Without that, an
+    // OWNING-array free after an `Add` argument-store would double-free the
+    // added grouping — the same UAF/double-free defect #1930 closed for the
+    // groupingFreeEligible_ sibling.
+    for (const ast::Node* ld : groupByToArrayCandidates) {
+        StringEscapeWalker w{ctx_, static_cast<const void*>(ld)};
+        w.pathSensitiveBranchMode = true;
+        for (auto& s : body) { w.stmt(s.get()); if (w.escaped) break; }
+        if (!w.escaped)
+            groupByToArrayFreeEligible_.insert(static_cast<const void*>(ld));
     }
     // fix #3720 / stdlib §5 / §4.8: the same conservative type-agnostic escape
     // walk for DictionaryEntry-Key-release candidates. A local proven never to

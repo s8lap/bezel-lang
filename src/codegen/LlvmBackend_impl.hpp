@@ -12735,6 +12735,11 @@ private:
             : e_(e),
               borrowingArrayFreeEligible_(e.borrowingArrayFreeEligible_),
               borrowingArrayFreeEligibleFn_(e.borrowingArrayFreeEligibleFn_),
+              // fix #4308 sibling: groupByToArrayFreeEligible_ is populated
+              // by the SAME collectBorrowingArrayFreeEligible call this scope
+              // guards, so it needs the identical save/restore protection
+              // (LANE_RULES §8's two-halves-of-one-contract rule).
+              groupByToArrayFreeEligible_(e.groupByToArrayFreeEligible_),
               dictMaterializerFreeEligible_(e.dictMaterializerFreeEligible_),
               dictMaterializerFreeEligibleFn_(e.dictMaterializerFreeEligibleFn_),
               groupingFreeEligible_(e.groupingFreeEligible_),
@@ -12761,6 +12766,9 @@ private:
             e_.borrowingArrayFreeEligible_ =
                 std::move(borrowingArrayFreeEligible_);
             e_.borrowingArrayFreeEligibleFn_ = borrowingArrayFreeEligibleFn_;
+            // fix #4308 sibling
+            e_.groupByToArrayFreeEligible_ =
+                std::move(groupByToArrayFreeEligible_);
             e_.dictMaterializerFreeEligible_ =
                 std::move(dictMaterializerFreeEligible_);
             e_.dictMaterializerFreeEligibleFn_ = dictMaterializerFreeEligibleFn_;
@@ -12789,6 +12797,8 @@ private:
         Emitter& e_;
         std::unordered_set<const void*> borrowingArrayFreeEligible_;
         llvm::Function* borrowingArrayFreeEligibleFn_;
+        // fix #4308 sibling
+        std::unordered_set<const void*> groupByToArrayFreeEligible_;
         std::unordered_set<const void*> dictMaterializerFreeEligible_;
         llvm::Function* dictMaterializerFreeEligibleFn_;
         std::unordered_set<const void*> groupingFreeEligible_;
@@ -14292,6 +14302,19 @@ private:
     // the target LocalDecl identifier), so a returned/moved/aliased/captured
     // local is excluded → never a UAF, never a double-free.
     std::unordered_set<const void*> borrowingArrayFreeEligible_;
+    // fix #4308 sibling: the OWNING-array twin of borrowingArrayFreeEligible_ —
+    // plain `var` locals bound to `xs.GroupBy(...).ToArray()`. The static type
+    // is `Array<IGrouping>` (sema sees the method's normal return type) but the
+    // runtime bz_groupby_to_array result owns its groupings (Calls3.cpp ~2485
+    // short-circuits the normal materializer). The borrowing sibling uses
+    // elementPolicyFor(el, false), which post-#4308 returns ClassBorrow
+    // (null disposer) for the borrowing family — a leak of every grouping.
+    // This set feeds a separate disposal registration that uses
+    // elementPolicyFor(el, true) — the groupingFreeThunk branch. Same
+    // conservative escape-walk key as borrowingArrayFreeEligible_ (so a
+    // returned/captured/aliased local is excluded → never a UAF, never a
+    // double-free).
+    std::unordered_set<const void*> groupByToArrayFreeEligible_;
     // The function for which borrowingArrayFreeEligible_ was computed (mirrors
     // stringReleaseEligibleFn_): a lambda/thunk body lowered mid-function
     // inherits no eligibility, so its array locals just leak (never double-freed).
@@ -14654,6 +14677,17 @@ private:
     // (LocalConstDecl) is recognized identically.
     bool isFreshBorrowingArrayMaterializerLocal(
         const LocalDeclInitView& view) const;
+    // fix #4308 sibling: the OWNING-array twin — a plain `var`/`const` local
+    // bound to `<recv>.GroupBy(sel).ToArray()`. Static-types as `Array<IGrouping>`
+    // (sema sees the method's normal return type) but the runtime is an OWNING
+    // bz_groupby_to_array result that owns its groupings (Calls3.cpp ~2485
+    // short-circuits the normal materializer). The borrowing sibling's
+    // `elementPolicyFor(el, false)` returns ClassBorrow post-#4308 → a null
+    // disposer → leak of every grouping. This predicate feeds a separate
+    // candidates vector + an elementPolicyFor(el, true) disposal registration
+    // that uses the groupingFreeThunk branch (identical to the `using var`
+    // OwningArray<IGrouping> scope-end free).
+    bool isFreshGroupByToArrayLocal(const LocalDeclInitView& view) const;
     // #1004: true if `e` is an EXPRESSION codegen lowers to a FRESH, OWNERLESS
     // borrowing `Array<T>` temporary — a fresh-array materializer CALL
     // (`recv.ToArray()`/`recv.Sorted(...)`/`recv.Reversed()`) whose result no
