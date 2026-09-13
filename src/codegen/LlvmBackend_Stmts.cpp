@@ -463,6 +463,74 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                     llvm::Type* elemTy2 = nullptr;
                     llvm::Value* addr2 = lvalueAddr(*as->target, elemTy2);
                     if (!addr2) return false;
+                    // fix #4336 (§15.1.1 / §15.3 / §28.7, v0.298): a
+                    // SINGLE-INDEX assignment into a plain inline-array slot
+                    // of an OWNING inline array `[N owned]T` / `[N owned]T?`
+                    // was missing the per-slot drop-on-overwrite pass. The
+                    // whole-array reassignment arm at line ~1055 already calls
+                    // `lowerOwningInlineArrayReassign` for that shape
+                    // (v0.260, #1385 / #3263), but this element-write fallback
+                    // overwrote the slot directly with `CreateStore` —
+                    // silently leaking the displaced owner on every iteration
+                    // of `outer[i] := new ...` (measured on the issue's repro
+                    // shape: 200 iterations × 24 B = 4800 B dropped at the
+                    // IndexExpr-arm `outer[0] := new Widget("hello")` site,
+                    // byte-identical to the leak rows the v0.260 whole-array
+                    // pass already closes for `outer := [...]`).
+                    // Dispose the OLD slot value (only for `arrayOwned` —
+                    // a non-owning `[N]IHolder` slot is, per §15.1, a borrow
+                    // whose owner lives elsewhere, and disposing it here
+                    // would double-free that owner's instance on a future
+                    // read through its borrow source). The slot's NEW value
+                    // remains under the local's existing scope-end disposal
+                    // (registered by `registerInlineOwnedArrayDisposal` at
+                    // the local-decl site for `[N owned]T` slots).
+                    //
+                    // The `as->target` here is the IndexExpr `outer[i]` —
+                    // its exprType is `IHolder` (the element), NOT the
+                    // enclosing array. Reach the array's type through the
+                    // IndexExpr's `target` member, which IS the whole-array
+                    // identifier.
+                    const sema::TypeRef* arrRt = nullptr;
+                    if (auto* ix2 = dynamic_cast<const ast::IndexExpr*>(
+                            as->target.get())) {
+                        arrRt = ctx_.exprType(*ix2->target);
+                    }
+                    if (arrRt && arrRt->kind ==
+                            sema::TypeRef::Kind::InlineArray &&
+                        arrRt->arrayOwned &&
+                        elemTy2 == ptrTy()) {
+                        // Element storage is `[N x ptr]`; load the old slot's
+                        // interface pointer. A null ptr (an empty slot) skips;
+                        // anything non-null dispatches via
+                        // `emitDisposeAndReclaim` exactly as the
+                        // whole-array reassignment arm does (§28.7's per-slot
+                        // dispose). We do NOT null the slot here — the
+                        // subsequent `CreateStore` overwrites it with the new
+                        // value, which is the simpler and identical
+                        // post-condition for a fresh non-null rhs (the slot's
+                        // NEW contents are fully replaced; only an rhs that
+                        // *equals* the slot's existing value would observe
+                        // the not-yet-nulled state, and such an rhs is a
+                        // self-assignment where disposal-then-same-store is
+                        // observably a no-op anyway).
+                        llvm::Value* oldSlot = builder_.CreateLoad(
+                            ptrTy(), addr2, "ioaw.old");
+                        llvm::Value* oldIsNull = builder_.CreateICmpEQ(
+                            oldSlot,
+                            llvm::ConstantPointerNull::get(ptrTy()),
+                            "ioaw.oldnull");
+                        auto* dispOldBB = llvm::BasicBlock::Create(
+                            llvm_, "ioaw.dispold", currentFn_);
+                        auto* contOldBB = llvm::BasicBlock::Create(
+                            llvm_, "ioaw.contold", currentFn_);
+                        builder_.CreateCondBr(
+                            oldIsNull, contOldBB, dispOldBB);
+                        builder_.SetInsertPoint(dispOldBB);
+                        emitDisposeAndReclaim(oldSlot);
+                        builder_.CreateBr(contOldBB);
+                        builder_.SetInsertPoint(contOldBB);
+                    }
                     // #813 / §15.1: an inline `[N]T?` element slot is a nullable-
                     // value struct `{i8, T}`; wrap the bare inner value so the
                     // hasValue byte is set (this fast path bypasses the general
