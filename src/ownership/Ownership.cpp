@@ -12,6 +12,7 @@
 #include "ast/Node.hpp"
 #include "common/BuiltinRegistry.hpp"  // #1414 stage 3: builtin name registry
 #include "common/OwnershipFacts.hpp"   // #1414 stage 4: shared ownership-facts core
+#include "common/PatternAResultCollection.hpp"  // fix #4338: builtin collections
 #include "flow/CFG.hpp"
 #include "ownership/OwnershipState.hpp"
 #include "ownership/StmtWalker.hpp"  // fix #3565: forEachNestedStmt — the
@@ -12388,14 +12389,17 @@ void MethodOwnership::checkOwnedFieldReturn(const ast::Expr& e) {
 // here would be exactly the "predicate validated for a different question"
 // hazard §25 names, not a shortcut past it.
 //
-// Deliberately does NOT port `taskResultArgIsClass`'s (held
-// `Ownership_Checks.cpp`, #4247) built-in-owning/borrowing-COLLECTION-result
-// carve (fix #3638) — that carve exists for TASK-TEARDOWN disposal
-// classification of a builtin collection result (`Task<Array<T>>`), an axis
-// this check's bare-identifier gate has not measured; such a program is left
-// ungated by this fix rather than risking a wrong classification on
-// unverified ground (filed as a follow-up alongside this fix, issue 4311's
-// discovery note).
+// fix #4338: port `taskResultArgIsClass`'s builtin-collection carve
+// (`Ownership_Checks.cpp` fix #3638, `common::isPatternAResultCollectionHead`)
+// into this gate. `isNonTrivialDisposeClass` returns `false` for null-
+// declaration builtin collections (Array, Dictionary, OwningArray, etc.), so
+// Task<Array<T>> was not classified as Pattern A and the bare-identifier
+// return check did not fire — leaving Task<Array<T>> borrowed returns ungated.
+// The `isPatternAResultCollectionHead` membership test (a closed table of the
+// fifteen builtin collection heads that codegen's `patternAResultCollection-
+// Disposer` frees at task teardown) closes the gap: identical to how
+// `awaitTaskKind` (`Ownership_Checks.cpp`) decides whether to demand the
+// owning-location binding from an `await` site (§30.5).
 namespace {
 bool isAsyncPatternAClassResultType(const sema::TypeRef* rt,
                                      sema::SemaContext& ctx) {
@@ -12404,7 +12408,19 @@ bool isAsyncPatternAClassResultType(const sema::TypeRef* rt,
     if (rt->headName() != "Task") return false;
     if (rt->genericArgs.empty() || !rt->genericArgs.front())
         return false;  // plain `Task` (unit) — no result to classify
-    return common::isNonTrivialDisposeClass(rt->genericArgs.front(), ctx);
+    const sema::TypeRef* arg = rt->genericArgs.front();
+    // User class with a disposal obligation — the primary arm.
+    if (common::isNonTrivialDisposeClass(arg, ctx)) return true;
+    // fix #4338 / #3638: builtin owning/borrowing collections (Array, Dictionary,
+    // OwningArray, etc.) carry disposal obligations but have null declarations.
+    // `isNonTrivialDisposeClass` returns false for them; close the gap with the
+    // same `isPatternAResultCollectionHead` check `awaitTaskKind` uses.
+    if (arg->kind == sema::TypeRef::Kind::Named && !arg->declaration &&
+        arg->astNode && arg->astNode->name &&
+        arg->astNode->name->parts.size() == 1 &&
+        common::isPatternAResultCollectionHead(arg->headName()))
+        return true;
+    return false;
 }
 }  // namespace
 

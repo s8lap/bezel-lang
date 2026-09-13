@@ -358,3 +358,69 @@ BEZEL_TEST(async_pattern_a_borrowed_identifier_return_4311,
     BEZEL_EXPECT_TRUE(!diagnosticMessageContains(
         r, "cannot return an owned field's `move`d value"));
 }
+
+// ---------------------------------------------------------------------------
+// fix #4338: Task<Array<T>> (builtin collection) bare-identifier borrowed
+// return.  Before this fix, `isAsyncPatternAClassResultType` used only
+// `isNonTrivialDisposeClass`, which returns `false` for null-declaration
+// builtin collections (Array, Dictionary, etc.) — leaving this shape
+// completely ungated.  The `isPatternAResultCollectionHead` port closes the
+// gap identically to how `awaitTaskKind` classifies `Task<Array<T>>` as
+// Pattern A (§30.5) for the `await` site.  FAIL-WITHOUT / PASS-WITH: the
+// reject row compiles cleanly without the fix and is rejected with the real
+// location and the diagnostic text WITH it.
+// ---------------------------------------------------------------------------
+
+// fix #4338 reject row: Task<Array<Cell>> bare identifier returning a borrow.
+BEZEL_TEST(async_pattern_a_borrowed_identifier_return_4311,
+          reject_borrowed_builtin_collection_return_4338) {
+    auto r = runAot(
+        "module M; " + std::string(kPlainCell) +
+        "class Box "
+        "  public item: Array<Cell>; "
+        "  public constructor(i: Array<Cell>) this.item := i; end constructor; "
+        "end Box; "
+        "class C "
+        "  public static async method GetAsync(b: Box): Task<Array<Cell>> "
+        "    var borrowed := b.item; "  // Borrowed — b.item is a field read
+        "    return borrowed; "         // IdentifierExpr — #4338's shape
+        "  end GetAsync; "
+        "  public static async method Main(): Task<int> "
+        "    var x := new Cell(1); "
+        "    var arr := new Array<Cell>(); arr.Add(x); "
+        "    var h := new Box(arr); "
+        "    using var t := C.GetAsync(h); "
+        "    var y := await t; "
+        "    x.Dispose(); "
+        "    return 1; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, kFixDiagFragment));
+}
+
+// fix #4338 accept row: Task<Array<int>> owned local return must still compile
+// and run correctly — the fix must not break genuinely owned sources.  Uses
+// Array<int> (trivial element type) to avoid disposal-counting complexities:
+// Array<Cell> elements are borrows, not owned, so Cell.n is not decremented
+// on array disposal — making kCell-based counting inapplicable here.
+BEZEL_TEST(async_pattern_a_borrowed_identifier_return_4311,
+          accept_owned_builtin_collection_return_4338) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class C "
+        "  public static async method MakeAsync(): Task<Array<int>> "
+        "    var arr := new Array<int>(); arr.Add(42); "
+        "    return arr; "  // owned local — admitted
+        "  end MakeAsync; "
+        "  public static async method Main(): Task<int> "
+        "    var i := 0; "
+        "    while i < 50 do "
+        "      do using var t := C.MakeAsync(); var a := await t; end; "
+        "      i := i + 1; "
+        "    end; "
+        "    return 0; "
+        "  end Main; "
+        "end C;"),
+        0);
+}
