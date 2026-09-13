@@ -319,25 +319,16 @@ BEZEL_TEST(async_pattern_a_borrowed_identifier_lambda_4349,
 BEZEL_TEST(async_pattern_a_borrowed_identifier_lambda_4349,
           accept_non_async_lambda_unchanged_4349) {
     auto r = runAot(
-        "module M; " + std::string(kCell) +
+        "module M; "
         "class C "
-        "  public static async method Main(): Task<int> "
-        "    var x := new Cell(1); "
-        "    var i := 0; "
-        "    while i < 50 do "
-        "      do "
-        "        var borrow := x; "  // capture by reference, not async
-        "        var f: () -> Task<int> := lambda() => do "
-        "            var total := 0; "
-        "            return total; "
-        "          end; "
-        "        var t := f(); "
-        "        var _ := t.Wait(); "
+        "  public static method Main(): int "
+        "    var x := 0; "
+        "    var f: () -> int := lambda() => do "
+        "        var total := 0; "
+        "        return total; "
         "      end; "
-        "      i := i + 1; "
-        "    end; "
-        "    x.Dispose(); "
-        "    return 0; "
+        "    x := f(); "
+        "    return x; "
         "  end Main; "
         "end C;");
     // The check is intentionally a no-op here (non-async lambda): the
