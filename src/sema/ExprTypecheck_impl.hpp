@@ -2464,7 +2464,22 @@ private:
     // resolved MethodSymbol.
     void typeCall(const ast::CallExpr& ce);
 
-    void checkCallArity(const ast::CallExpr& ce, MethodSymbol* ms);
+    // fix #4325 (§5.1 / §11.2, v0.298): `explicitSubst` is the METHOD's own
+    // type-parameter → concrete-TypeRef binding for the EXPLICITLY
+    // specified type arguments (`<TypeArg, …>`) at the call site, built by
+    // `typeCall` (see ~L3464–L3490). Non-null only when the call wrote
+    // `<…>`; threaded into `checkArgsAgainstParams` so the per-argument
+    // §5.1 assignability check runs against the substituted parameter
+    // type (e.g. `IHolder` from `MakeArr<IHolder>(new Widget3(s))`), not
+    // the bare type parameter (`T`) — without this, a non-conforming
+    // argument to an interface-typed explicit type argument silently
+    // slipped past `checkAssignable`'s free-type-var fallback and
+    // reached codegen as a SIGSEGV at the interface dispatch
+    // (measured, identical to #4302's signature).
+    void checkCallArity(
+        const ast::CallExpr& ce, MethodSymbol* ms,
+        const std::unordered_map<std::string_view, TypeRef*>* explicitSubst =
+            nullptr);
 
     // §2.2 / §2.5 / §2.6 step 3 (issue #328 inc 3): type-check a call to an
     // IMPORTED method (no ast::MethodDecl) against its reconstructed
@@ -2682,6 +2697,27 @@ private:
     // the argument against `int`, not the unresolved `W` — closing both the
     // #4233 arity-diagnostic-for-a-correct-call defect AND a wrongly-typed
     // argument silently reaching codegen as a type-mismatched IR crash.
+    //
+    // fix #4325 (§5.1 / §11.2, v0.298): `explicitSubst` is the METHOD's own
+    // type-parameter → concrete-TypeRef binding for the EXPLICITLY
+    // specified type arguments (`M<T: IBar>.Foo(arg)` — `T → IBar`) — non-
+    // null only for a call that wrote `<TypeArg, …>` at the call site. The
+    // `typeCall` slice already substitutes it into the call's RETURN type
+    // (`rt = substituteReturnType(rt, explicitSubst)`, ~L3490), but the
+    // per-argument §5.1 assignability check below ran against the raw,
+    // unsubstituted parameter type — so for `MakeArr<T>(x: T)` called as
+    // `MakeArr<IHolder>(new Widget3(s))` the parameter was typed as the
+    // bare `T`, `checkAssignable`'s free-type-var fallback silently
+    // accepted the non-conforming `Widget3` against `IHolder`'s constraint
+    // (§11.2 nominal-conformance via `isSubtype`), and codegen dispatched
+    // the interface call through a null itable slot — a SIGSEGV
+    // (measured, identical to #4302's crash signature). Substituting the
+    // explicit type args into `paramTy` BEFORE the §5.1 check lets the
+    // same `checkAssignable` authority that already rejects the
+    // non-generic twin (`plain_call_argument_noconform_rejected_control`,
+    // #4310's suite) reject this one too — `IHolder` is a Named with a
+    // declaration, so `Widget3` is not a subtype and the diagnostic
+    // fires.
     void checkArgsAgainstParams(
         const std::vector<ast::Param>& params,
         const std::vector<ast::CallArgument>& args, SourceLocation loc,
@@ -2690,6 +2726,8 @@ private:
         TypeSymbol* classParent = nullptr,
         const ast::MethodDecl* calleeMethodDecl = nullptr,
         const std::vector<std::pair<std::string, TypeRef*>>* extBinding =
+            nullptr,
+        const std::unordered_map<std::string_view, TypeRef*>* explicitSubst =
             nullptr);
 
     // Slice T7: check `new T(args)` against T's sole constructor (if

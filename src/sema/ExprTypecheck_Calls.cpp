@@ -2682,6 +2682,15 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
             return;
         }
     }
+    // fix #4325 (§5.1 / §11.2, v0.298): hoist the explicit type-argument
+    // substitution map out of the generic-method-instantiation block
+    // below so it can be threaded into the per-argument §5.1
+    // assignability check (`checkCallArity` → `checkArgsAgainstParams`)
+    // without rebuilding it from the AST a second time. Stays empty
+    // unless the call wrote `<TypeArg, …>`; `checkCallArity` is told
+    // the address of this map, and `checkArgsAgainstParams` substitutes
+    // it into each parameter's declared type before the §5.1 check.
+    std::unordered_map<std::string_view, TypeRef*> explicitSubst;
     // §22.6: overload resolution. The callee initially resolved to one
     // method of its name (first-in-source); re-select among the same-named
     // overloads. When the name has multiple same-arity all-positional
@@ -3434,6 +3443,12 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         }
                     };
                 bool hadExplicitTypeArgs = false;
+                // fix #4325 (§5.1 / §11.2, v0.298): the explicit type-
+                // argument substitution map is declared at `typeCall`'s
+                // outer scope (~L2685) so it can be threaded into
+                // `checkCallArity` (the per-argument §5.1 assignability
+                // check) below — see the header comment on
+                // `checkArgsAgainstParams` for the gap it closes.
                 if (!md->genericParams.empty()) {
                     // per §14.1 (issue #509/#561) + §7.5/§1278: explicit type
                     // args may appear on a MemberAccessExpr callee
@@ -3463,8 +3478,6 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         // Build the explicit substitution map:
                         // md->genericParams[i].name → resolved TypeRef for
                         // (*callTypeArgs)[i].
-                        std::unordered_map<std::string_view, TypeRef*>
-                            explicitSubst;
                         for (std::size_t gi = 0;
                              gi < md->genericParams.size() &&
                              gi < callTypeArgs->size(); ++gi) {
@@ -11367,7 +11380,14 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
         // in `resolveMemberAccess` (which sees `currentCallArity_`); the
         // per-arg type check is run below by the new extension branch in
         // `checkCallArity` itself. So this call site is unchanged.
-        checkCallArity(ce, ms);
+        //
+        // fix #4325 (§5.1 / §11.2, v0.298): pass the explicit type-argument
+        // substitution map (built from `M<T: IBar>.Foo(arg)`'s `<IBar>`) so
+        // `checkArgsAgainstParams` can substitute the method's own type
+        // params into each parameter's declared type before the §5.1 check
+        // — see that function's header for why the unsubstituted `T` would
+        // otherwise silently accept a non-conforming argument.
+        checkCallArity(ce, ms, &explicitSubst);
     }
 
     // §7 / stdlib §9.6 (#2315): a primitive `string` instance-method call
@@ -11582,7 +11602,9 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
     }
 }
 
-void ExprTC::checkCallArity(const ast::CallExpr& ce, MethodSymbol* ms) {
+void ExprTC::checkCallArity(
+    const ast::CallExpr& ce, MethodSymbol* ms,
+    const std::unordered_map<std::string_view, TypeRef*>* explicitSubst) {
     auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
     // §2.2 / §2.5 (issue #328 inc 3): an imported method has no ast::MethodDecl;
     // type-check the call against the imported signature (§2.6 step 3) using the
@@ -11632,7 +11654,8 @@ void ExprTC::checkCallArity(const ast::CallExpr& ce, MethodSymbol* ms) {
         checkArgsAgainstParams(
             md->params, ce.args, ce.span.begin,
             std::string("call to `") + std::string(ms->name) + "`",
-            recvTarget, /*classParent=*/nullptr, md, extBinding);
+            recvTarget, /*classParent=*/nullptr, md, extBinding,
+            explicitSubst);
         return;
     }
     if (!md || !ms->parent) return;
@@ -11672,13 +11695,15 @@ void ExprTC::checkCallArity(const ast::CallExpr& ce, MethodSymbol* ms) {
             checkArgsAgainstParams(md->params, ce.args, ce.span.begin,
                                    std::string("call to `") +
                                    std::string(ms->name) + "`",
-                                   recvTarget, ms->parent, md);
+                                   recvTarget, ms->parent, md, /*extBinding=*/nullptr,
+                                   explicitSubst);
         return;
     }
     checkArgsAgainstParams(md->params, ce.args, ce.span.begin,
                            std::string("call to `") +
                            std::string(ms->name) + "`",
-                           recvTarget, ms->parent, md);
+                           recvTarget, ms->parent, md, /*extBinding=*/nullptr,
+                           explicitSubst);
 }
 
 // §2.2 / §2.5 / §2.6 step 3 (issue #328 inc 3): type-check a call to an imported
@@ -12905,7 +12930,8 @@ void ExprTC::checkArgsAgainstParams(
     const std::string& calleeDesc, const ast::Expr* classTarget,
     TypeSymbol* classParent,
     const ast::MethodDecl* calleeMethodDecl,
-    const std::vector<std::pair<std::string, TypeRef*>>* extBinding) {
+    const std::vector<std::pair<std::string, TypeRef*>>* extBinding,
+    const std::unordered_map<std::string_view, TypeRef*>* explicitSubst) {
     // per §22.5: bind arguments to parameters. The binding emits its own
     // arity / named-arg diagnostics; on failure there is no consistent
     // per-parameter mapping to type-check, so stop here.
@@ -13077,6 +13103,33 @@ void ExprTC::checkArgsAgainstParams(
         // header comment (ExprTypecheck_impl.hpp) for why.
         if (paramTy && !extSubst.empty())
             paramTy = substituteReturnType(paramTy, extSubst);
+        // fix #4325 (§5.1 / §11.2, v0.298): substitute the METHOD's own
+        // explicit type-argument binding (e.g. `T`->`IHolder` for
+        // `MakeArr<IHolder>(new Widget3(s))`) into `paramTy` BEFORE the
+        // §5.1 assignability check, so a non-conforming argument to an
+        // interface-typed explicit type argument (`Widget3` does not list
+        // `IHolder` in its inheritance clause) is rejected by the same
+        // `checkAssignable` + `isSubtype` authority that already rejects
+        // the non-generic twin (#4310's
+        // `plain_call_argument_noconform_rejected_control`). Without this
+        // line, the parameter stayed as the bare `T` and the
+        // `calleeMethodGenericParamNames` free-type-var fallback in
+        // `checkAssignable` silently admitted the call — codegen then
+        // dispatched the interface call through a null itable slot and
+        // SIGSEGV'd (measured, identical to #4302's crash signature). The
+        // ORDERING matters: class-level substitution
+        // (`substituteMemberType` above) substitutes CLASS params from
+        // the receiver first; this line substitutes the METHOD's own
+        // type params from the call site. Class and method type-param
+        // namespaces are disjoint by construction (a method's `<T>` is
+        // not the receiver's `<U>`); when a method deliberately shadows a
+        // class-level name, the method's name wins by this ordering —
+        // which is the case #4310's
+        // `plain_call_argument_noconform_rejected_control` already
+        // exercised and which the spec's shadowing-warning policy covers
+        // (the compiler warns; substitution follows the warning).
+        if (paramTy && explicitSubst && !explicitSubst->empty())
+            paramTy = substituteReturnType(paramTy, *explicitSubst);
         // per §15.4 (#1174): a collection literal passed directly to a
         // parameter of interface type (IEnumerable<T>/IList<T>/ICollection<T>/
         // IReadOnly*) is not admissible — the literal has no concrete backing
