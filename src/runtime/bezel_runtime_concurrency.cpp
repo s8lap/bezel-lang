@@ -2498,7 +2498,10 @@ struct bz_channel_t {
     int64_t  capacity;
     int64_t  sender_count;
     bool     closed;
-    bool     disposed;
+    // disposed flag: set atomically by bz_channel_dispose so concurrent Dispose
+    // calls from two domains are safe (§28.2 / fix #4357 — TOCTOU double-free).
+    // exchange(true) ensures exactly one caller proceeds to channel_core_release.
+    std::atomic<bool> disposed{false};
     // per fix #634: refcount — Channel object holds +1, each sender holds +1;
     // last release (core_refs == 1 → 0) deletes.
     std::atomic<int> core_refs{1};
@@ -3115,6 +3118,7 @@ extern "C"
 void bz_channel_dispose(void* chp, void* cce_vtable) {
     if (!chp) return;
     auto* ch = (bz_channel_t*)chp;
+    if (ch->disposed.exchange(true)) return;  // already disposed → no-op (fix #4357)
     // Drain pending receivers with closed error.
     channel_close_and_drain_pending(ch, cce_vtable);
     // Dispose undelivered items in REVERSE insertion order (§28.11).
