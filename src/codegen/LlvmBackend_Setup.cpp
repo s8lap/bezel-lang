@@ -18968,6 +18968,58 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
         disposeStack_.back().push_back(d);
         return;
     }
+    // fix #4328 (§28.3 / §28.2 / §28.12, v0.298): a `using var` / `await using var`
+    // whose declared-type or initializer-type head is one of the BUILT-IN
+    // INTERFACE HEADS `IDisposable` / `IAsyncDisposable` (declaration-less
+    // Named refs, in `kBuiltinInterfaceHeads` since fix #4326 — that fix
+    // deliberately keeps them out of the vtable-less set, so the §28.10
+    // disposal-registration predicates above miss this population by
+    // construction). The runtime value is always a vtable-bearing user
+    // class instance per §8.1 (every class implicitly implements
+    // `IDisposable`; a class may explicitly implement `IAsyncDisposable`,
+    // stdlib §2.10), and the explicit-Dispose chain already confirms
+    // vtable-slot-2 = Dispose + reclaim is the right IR for it. Mirror
+    // `usingVarOwnsClassObjectDynamically`'s shape: register
+    // `d.dynamicDispose = true`, which `emitDisposals` lowers to vtable
+    // slot 2 + reclaim. For `await using var d: IAsyncDisposable := move r`
+    // this is the sync-fallback half of §28.12 — same trade #2739 records
+    // for the iterator-format / builtin-collection await-using twins and
+    // the same #3470 records for any class that lost its DisposeAsync
+    // resolution; the compiler does not yet mint an awaited-DisposeAsync
+    // state machine for this head, so vtable Dispose is the defined
+    // degraded behavior.
+    //
+    // Why a NEW arm rather than widening `usingVarOwnsClassObjectDynamically`:
+    // that predicate's `isClassOrInterfaceRef` (line 33388) explicitly
+    // requires `rt->declaration`, and the §2921/#4326 vtable-classification
+    // derivation forces the subtraction in the OTHER direction — adding
+    // these names to a "class-like" check would also widen the explicit-
+    // Dispose classification and risk silently treating them as vtable-
+    // less. Keeping the gate local to the `using var` site preserves the
+    // shape every other arm above already uses for a slot one this scope
+    // owns: dispose dynamically through the runtime vtable.
+    {
+        std::string_view dh;
+        const sema::TypeRef* dlt = ld->type
+            ? ctx_.resolvedType(*ld->type) : nullptr;
+        if (dlt && dlt->kind == sema::TypeRef::Kind::Named &&
+            !dlt->declaration && dlt->astNode && dlt->astNode->name &&
+            !dlt->astNode->name->parts.empty())
+            dh = dlt->headName();
+        if (dh.empty() && ld->initializer) {
+            const sema::TypeRef* initTR = ctx_.exprType(*ld->initializer);
+            if (initTR && initTR->kind == sema::TypeRef::Kind::Named &&
+                !initTR->declaration && initTR->astNode && initTR->astNode->name &&
+                !initTR->astNode->name->parts.empty())
+                dh = initTR->headName();
+        }
+        if (dh == "IDisposable" || dh == "IAsyncDisposable") {
+            Disposal d{it->second, nullptr};
+            d.dynamicDispose = true;
+            disposeStack_.back().push_back(d);
+            return;
+        }
+    }
 
     // fix #2992 (§28.3 / §28.9, v0.240): END-OF-CHAIN GUARD. Every arm above
     // tried and none claimed this `using var` local. If the local's type is a
@@ -19915,6 +19967,35 @@ void Emitter::registerUnwindOwnedParam(sema::Symbol* psym,
         d.releaseOnUnwindOnly = !ps->autoDropAtScopeEnd;
         disposeStack_.front().push_back(d);
         return;
+    }
+    // fix #4328 (§28.3 / §28.2 / §28.12, v0.298): the `IDisposable` /
+    // `IAsyncDisposable` BUILT-IN INTERFACE HEADS (declaration-less Named
+    // refs, in `kBuiltinInterfaceHeads` since fix #4326 — that fix deliberately
+    // keeps them out of the vtable-less set, so the prior arms above miss this
+    // population by construction; `isClassOrInterfaceRef` below also rejects
+    // them because `rt->declaration == nullptr`). The runtime value is a
+    // vtable-bearing user class per §8.1 (every class implicitly implements
+    // `IDisposable`; a class may explicitly implement `IAsyncDisposable`,
+    // stdlib §2.10), and vtable slot 2 = Dispose + reclaim is the right IR
+    // for both — the same path the explicit-Dispose chain takes and the same
+    // path the `usingVarOwnsClassObjectDynamically` #383 sibling takes for
+    // a class/interface-typed using-var. Register `d.dynamicDispose = true`,
+    // mirroring the class/interface branch below and the unwindOnly branch's
+    // discharge-aware split. (The async method's full DisposeAsync+await
+    // state machine is the wider question §28.12 defers; this sync fallback
+    // is the same degraded behavior the `await using` builtin heads already
+    // accept per #2739/#3437.) // per §28.3, §28.2, §28.12, fix #4328
+    if (rt && rt->kind == sema::TypeRef::Kind::Named && !rt->declaration &&
+        rt->astNode && rt->astNode->name &&
+        !rt->astNode->name->parts.empty()) {
+        std::string_view bn = rt->headName();
+        if (bn == "IDisposable" || bn == "IAsyncDisposable") {
+            Disposal d{slot, nullptr};
+            d.dynamicDispose = true;
+            d.releaseOnUnwindOnly = !ps->autoDropAtScopeEnd;
+            disposeStack_.front().push_back(d);
+            return;
+        }
     }
     if (!isClassOrInterfaceRef(rt) && !isClassOrInterfaceRef(resolveTypeParamRef(rt)))
         return;

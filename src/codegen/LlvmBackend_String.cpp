@@ -792,6 +792,22 @@ llvm::Value* Emitter::emitWithFormatSpec(llvm::Value* val,
                     emitIFormattableDispatch(val, rt->declaration, spec))
                 return r;
         }
+        // fix #4328 (§18.5 / stdlib §2.18, v0.298): the BUILT-IN INTERFACE HEAD
+        // `IFormattable` (declaration-less Named ref, in `kBuiltinInterfaceHeads`
+        // since fix #4326 — `rt->declaration == nullptr` so the arm above
+        // correctly rejects, and `isBuiltinInterfaceHead` answers true). §18.5
+        // spec-cites this: "String interpolation dispatches a hole's format
+        // spec here (stdlib §2.18): `$"{money:C2}"` calls `money.ToString("C2")`
+        // when `money`'s type implements `IFormattable`." The proper fix
+        // (synthesizing a MethodSymbol for `IFormattable.ToString(format)` so
+        // Pass D's itable construction populates a per-(class×IFormattable)
+        // itable slot) is the §2.18 follow-up filed alongside this lane
+        // (#4328 ships the IDisposable / IAsyncDisposable arms; IFormattable
+        // format-spec dispatch through the interface head is the same-shape
+        // narrower gap). Pre-fix `#4328` the `M.Money` literal was returned
+        // here — wrong but not a crash; the post-fix regression test for the
+        // IFormattable half is deferred to the follow-up. // per §18.5,
+        // §2.18, fix #4328
     }
     // §18.5 / §9.3 / §2.18 #1412: a decimal value with a format specifier.
     // Dispatches to bz_decimal_to_string_fmt for the full §2.18 decimal vocabulary:

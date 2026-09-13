@@ -917,7 +917,33 @@ void Emitter::emitOwnedParamCaptureDispose(sema::Symbol* p, llvm::Value* obj) {
         emitDisposeAndReclaim(obj);
         return;
     }
-    // (4) Anything unrecognised — LOUD `internal:` warning, do NOT take the
+    // (4) fix #4328 (§28.3 / §28.2 / §28.12, v0.298): an owned PARAMETER whose
+    // declared type is one of the BUILT-IN INTERFACE HEADS `IDisposable` /
+    // `IAsyncDisposable` (both declaration-less, in `kBuiltinInterfaceHeads` —
+    // fix #4326 deliberately KEEPS them out of the vtable-less set, so case
+    // (2) above correctly declines; the runtime value is always a vtable-
+    // bearing user class per §8.1, every class implicitly implements
+    // `IDisposable` and a class may explicitly implement `IAsyncDisposable`).
+    // `emitDisposeAndReclaim` loads vtable slot 2 = Dispose and reclaims —
+    // the SAME path the explicit-Dispose chain takes for an `IDisposable`-
+    // typed owned slot (lowerCall's `emitExplicitDisposeChain` else-branch),
+    // and the same path the explicit-Dispose chain takes when it IS the
+    // declared class. For an async method holding an `owned d: IAsyncDisposable`,
+    // this is a sync fallback (§28.12: "the synchronous-fallback path runs
+    // for an iterator-format `await using`"; the same sync fallback applies
+    // here — the compiler does not yet emit a DisposeAsync+await state
+    // machine for owned-param auto-drop, so the vtable Dispose is the
+    // defined degraded behavior, not a fresh defect).
+    if (pt && pt->kind == sema::TypeRef::Kind::Named && !pt->declaration &&
+        pt->astNode && pt->astNode->name &&
+        !pt->astNode->name->parts.empty()) {
+        std::string_view bn = pt->headName();
+        if (bn == "IDisposable" || bn == "IAsyncDisposable") {
+            emitDisposeAndReclaim(obj);
+            return;
+        }
+    }
+    // (5) Anything unrecognised — LOUD `internal:` warning, do NOT take the
     // silent vtable jump. The fix's premise is that the default must invert:
     // a path the existing classifier can answer takes its answer; a path it
     // cannot answer MUST surface the question, not paper over it.
