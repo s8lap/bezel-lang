@@ -131,7 +131,7 @@ BEZEL_TEST(with_heap_collection_literal_4346,
 }
 
 // §9.5 / §15.4 / #4346: a non-empty Array<T> literal `[1,2,3]` as a `with`
-// replacement. The heap materializer populates the new array (sum = 6).
+// replacement. The heap materializer populates the new array (sum = 15).
 BEZEL_TEST(with_heap_collection_literal_4346,
            array_nonempty_literal_with_replacement_4346) {
     BEZEL_EXPECT_EQ(run(
@@ -140,7 +140,8 @@ BEZEL_TEST(with_heap_collection_literal_4346,
         "record Box(Items: Array<int>); "
         "class C "
         "  public static method Main(): int "
-        "    var b1 := new Box([1, 2, 3]); "
+        "    var items1: Array<int> := [1, 2, 3]; "
+        "    var b1 := new Box(items1); "
         "    var b2 := b1 with(Items := [4, 5, 6]); "
         "    return b2.Items[0] + b2.Items[1] + b2.Items[2]; "
         "  end Main; "
