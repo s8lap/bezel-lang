@@ -695,22 +695,46 @@ ExprTC::OverloadResult ExprTC::resolveOverload(
         }
     };
     for (const TypeRef* a : argTypes)
-        if (!judgeable(a)) { res.outcome = OverloadOutcome::Undecidable; return res; }
-    for (const auto& pts : paramTypes) {
-        if (pts.size() != nArg) {
-            // arity already filtered upstream; defensively bail.
+        if (!judgeable(a)) {
+            // fix #NNNN (§22.6, v0.298): all candidates are inapplicable when
+            // the argument types themselves can't be judged.
+            res.applicable.assign(nCand, false);
             res.outcome = OverloadOutcome::Undecidable;
             return res;
         }
-        for (const TypeRef* p : pts)
-            if (!judgeable(p)) { res.outcome = OverloadOutcome::Undecidable; return res; }
+    // fix #NNNN (§22.6, v0.298): moved grid/applicable before the per-param
+    // judgeable check so we can mark individual candidates inapplicable rather
+    // than returning early and leaving all applicable[] at true (which caused
+    // arityFallback to select an overload that classifyArg would have rejected).
+    std::vector<std::vector<ArgMatch>> grid(nCand);
+    res.applicable.assign(nCand, true);
+    for (const auto& pts : paramTypes) {
+        if (pts.size() != nArg) {
+            // arity already filtered upstream; defensively bail.
+            res.applicable.assign(nCand, false);
+            res.outcome = OverloadOutcome::Undecidable;
+            return res;
+        }
+    }
+    // Per-candidate: if any parameter is unjudgeable, mark this candidate
+    // inapplicable and skip its classification. This allows other candidates
+    // with judgeable params to still be ranked, while arityFallback will not
+    // select a candidate whose params could not be judged.
+    for (std::size_t c = 0; c < nCand; ++c) {
+        for (std::size_t i = 0; i < nArg; ++i) {
+            if (!judgeable(paramTypes[c][i])) {
+                res.applicable[c] = false;
+                break;
+            }
+        }
     }
 
     // Classify every (candidate, argument) cell. ArgMatch::NotApplicable in
     // any cell removes that candidate from the applicable set (§22.6 step 1).
-    std::vector<std::vector<ArgMatch>> grid(nCand);
-    std::vector<bool> applicable(nCand, true);
+    // Skip classification for candidates already marked inapplicable (unjudgeable
+    // param types above).
     for (std::size_t c = 0; c < nCand; ++c) {
+        if (!res.applicable[c]) continue;  // already marked inapplicable above
         grid[c].resize(nArg);
         for (std::size_t i = 0; i < nArg; ++i) {
             // fix #2985 (§22.6 + §5.1 v0.240 *Constant narrowing*): delegate
@@ -750,13 +774,13 @@ ExprTC::OverloadResult ExprTC::resolveOverload(
             }
             ArgMatch m = classifyArg(argTy, paramTypes[c][i]);
             grid[c][i] = m;
-            if (m == ArgMatch::NotApplicable) applicable[c] = false;
+            if (m == ArgMatch::NotApplicable) res.applicable[c] = false;
         }
     }
 
     std::vector<std::size_t> appl;
     for (std::size_t c = 0; c < nCand; ++c)
-        if (applicable[c]) appl.push_back(c);
+        if (res.applicable[c]) appl.push_back(c);
 
     // §22.6 step 4: no applicable candidate → unreachable, no candidates
     // cited.
@@ -1808,8 +1832,30 @@ MethodSymbol* ExprTC::resolveMethodOverload(MethodSymbol* initial,
             // type is still inferred (keeps downstream typing best-effort);
             // arity fallback gives a deterministic choice.
             return arityFallback();
-        case OverloadOutcome::Undecidable:
-            return arityFallback();
+        case OverloadOutcome::Undecidable: {
+            // fix #NNNN (§22.6, v0.298): when type-based ranking could not
+            // decide (e.g. one overload has a generic parameter type like
+            // IVal<T> that is unjudgeable), arityFallback must not return an
+            // overload that classifyArg found NotApplicable. r.applicable[c]
+            // is indexed by candidate position in cands (not by overloads[]).
+            // cands[c] IS the MethodSymbol* so we can directly use cands[c]
+            // with r.applicable[c].
+            if (!hasNamed) {
+                for (std::size_t c = 0; c < cands.size(); ++c) {
+                    if (sema::formalParamCount(*cands[c]) == ce.args.size() &&
+                        r.applicable[c]) {
+                        return cands[c];
+                    }
+                }
+            } else {
+                if (canBindTo(*initial) && r.applicable[0]) return initial;
+                for (std::size_t c = 0; c < cands.size(); ++c) {
+                    if (canBindTo(*cands[c]) && r.applicable[c])
+                        return cands[c];
+                }
+            }
+            return initial;
+        }
     }
     return arityFallback();
 }

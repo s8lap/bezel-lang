@@ -2619,6 +2619,11 @@ private:
     struct OverloadResult {
         OverloadOutcome outcome = OverloadOutcome::Undecidable;
         std::size_t winnerIndex = 0;  // valid only when Resolved
+        // applicable[c] is true when candidate c's arguments were found
+        // applicable by classifyArg (per §22.6 step 1, NotApplicable removes
+        // the candidate). Used by the caller to avoid arityFallback selecting
+        // an overload whose classifyArg result was NotApplicable.
+        std::vector<bool> applicable;
     };
 
     // `paramTypes[i]` holds candidate i's ordered parameter TypeRefs (each
