@@ -6784,7 +6784,66 @@ const ast::PropertyAccessor* Emitter::computedSetterOf(const ast::Expr& target) 
 
 bool Emitter::lowerPropertySet(const ast::Expr& target, const ast::Expr& value) {
     if (!computedSetterOf(target)) return false;
-    llvm::Value* v = lowerExpr(value);
+    llvm::Value* v = nullptr;
+    // fix #4345 property-setter twin (§5.1/§11.2/§15.4, v0.298): the
+    // indexer-setter codegen had no case for a CollectionLiteralExpr RHS —
+    // `lowerExpr` returns null for one (§15.4), the assignment silently
+    // degraded via the pre-existing #4045 backstop, and the write never
+    // happened. The sema side (§4316's gate that admits the conforming
+    // program and rejects the non-conforming twin) applies here too.
+    // Mirror the indexer-setter / local-decl / return-stmt / field-init
+    // pattern exactly: a literal RHS targeting an INLINE-array property
+    // builds the [N x elem] aggregate by-value; a literal targeting a
+    // HEAP collection goes through materializeHeapCollectionLiteral /
+    // materializeHeapDictLiteral. Target type is read from
+    // ctx_.exprType(target) (the property's declared type).
+    if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(&value)) {
+        const sema::TypeRef* propTy = ctx_.exprType(target);
+        if (propTy && propTy->kind == sema::TypeRef::Kind::InlineArray &&
+            !cl->isDict) {
+            if (auto* aty = llvm::dyn_cast<llvm::ArrayType>(
+                    lowerTypeRef(propTy))) {
+                llvm::Type* elemTy = aty->getElementType();
+                llvm::AllocaInst* tmp = entryAlloca(aty);
+                for (std::size_t i = 0; i < cl->elements.size(); ++i) {
+                    if (!cl->elements[i]) continue;
+                    llvm::Value* ev = lowerExpr(*cl->elements[i]);
+                    if (!ev) {
+                        ev = lowerCollectionLiteralElementOrUnitNull(
+                            *cl->elements[i], elemTy);
+                        if (!ev) {
+                            ctx_.diagnostics().report(
+                                Severity::Error,
+                                cl->elements[i]->span.begin,
+                                "internal: lowerExpr returned null for "
+                                "property-setter inline-array collection-literal "
+                                "element — #1386");
+                            continue;
+                        }
+                    }
+                    if (ev->getType() != elemTy &&
+                        ev->getType()->isIntegerTy() &&
+                        elemTy->isIntegerTy()) {
+                        unsigned eb = ev->getType()->getIntegerBitWidth();
+                        unsigned db = elemTy->getIntegerBitWidth();
+                        ev = db > eb ? builder_.CreateSExt(ev, elemTy)
+                                     : builder_.CreateTrunc(ev, elemTy);
+                    }
+                    llvm::Value* gep = builder_.CreateGEP(
+                        aty, tmp,
+                        {builder_.getInt32(0),
+                         builder_.getInt32((unsigned)i)});
+                    builder_.CreateStore(ev, gep);
+                }
+                v = builder_.CreateLoad(aty, tmp, "pset.inlarr");
+            }
+        } else if (propTy && !cl->isDict) {
+            v = materializeHeapCollectionLiteral(cl, propTy);
+        } else if (propTy && !cl->keys.empty()) {
+            v = materializeHeapDictLiteral(cl, propTy);
+        }
+    }
+    if (!v) v = lowerExpr(value);
     // fix #2568: thread `value` through as valueExpr so lowerPropertySetValue
     // can release a +1 producer passed directly to a CLASS-owned computed
     // setter (see the comment on the lambda above). The `ref`/`out` write-
@@ -7324,7 +7383,60 @@ bool Emitter::lowerImportedPropertySet(const ast::Expr& target,
     // `value` is lowered, so a non-matching target never double-evaluates it).
     if (!importedPropSetterFns_.count(ps) &&
         !importedStaticPropSetterFns_.count(ps)) return false;
-    llvm::Value* v = lowerExpr(value);
+    llvm::Value* v = nullptr;
+    // fix #4345 imported-property-setter twin (§5.1/§11.2/§15.4, v0.298):
+    // mirrors the lowerPropertySet fix above. An imported property setter's
+    // RHS that is a CollectionLiteralExpr would silently degrade via the
+    // #4045 backstop — lowerExpr returns null for one (§15.4) and the
+    // write never happened. Use ctx_.exprType(target) for the property's
+    // declared type, exactly as lowerPropertySet does.
+    if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(&value)) {
+        const sema::TypeRef* propTy = ctx_.exprType(target);
+        if (propTy && propTy->kind == sema::TypeRef::Kind::InlineArray &&
+            !cl->isDict) {
+            if (auto* aty = llvm::dyn_cast<llvm::ArrayType>(
+                    lowerTypeRef(propTy))) {
+                llvm::Type* elemTy = aty->getElementType();
+                llvm::AllocaInst* tmp = entryAlloca(aty);
+                for (std::size_t i = 0; i < cl->elements.size(); ++i) {
+                    if (!cl->elements[i]) continue;
+                    llvm::Value* ev = lowerExpr(*cl->elements[i]);
+                    if (!ev) {
+                        ev = lowerCollectionLiteralElementOrUnitNull(
+                            *cl->elements[i], elemTy);
+                        if (!ev) {
+                            ctx_.diagnostics().report(
+                                Severity::Error,
+                                cl->elements[i]->span.begin,
+                                "internal: lowerExpr returned null for "
+                                "imported-property-setter inline-array "
+                                "collection-literal element — #1386");
+                            continue;
+                        }
+                    }
+                    if (ev->getType() != elemTy &&
+                        ev->getType()->isIntegerTy() &&
+                        elemTy->isIntegerTy()) {
+                        unsigned eb = ev->getType()->getIntegerBitWidth();
+                        unsigned db = elemTy->getIntegerBitWidth();
+                        ev = db > eb ? builder_.CreateSExt(ev, elemTy)
+                                     : builder_.CreateTrunc(ev, elemTy);
+                    }
+                    llvm::Value* gep = builder_.CreateGEP(
+                        aty, tmp,
+                        {builder_.getInt32(0),
+                         builder_.getInt32((unsigned)i)});
+                    builder_.CreateStore(ev, gep);
+                }
+                v = builder_.CreateLoad(aty, tmp, "ipset.inlarr");
+            }
+        } else if (propTy && !cl->isDict) {
+            v = materializeHeapCollectionLiteral(cl, propTy);
+        } else if (propTy && !cl->keys.empty()) {
+            v = materializeHeapDictLiteral(cl, propTy);
+        }
+    }
+    if (!v) v = lowerExpr(value);
     // fix #2490: thread `value` through as valueExpr so
     // lowerImportedPropertySetValue can release a +1 producer passed
     // directly (see its own comment for the full rationale).
