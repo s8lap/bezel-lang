@@ -12470,6 +12470,9 @@ void MethodOwnership::checkAsyncPatternABorrowedIdentifierReturn(
         // §28.3, §28.7
         if (auto* sym = ctx_.exprSymbol(*id)) {
             if (auto* ls = dynamic_cast<sema::LocalSymbol*>(sym)) {
+                // LOCALDECL-ONLY: a `const X: HeapCollection := [...];` is
+                // rejected by §21.1 before this gate; `using var X` already
+                // has lo.state Owned so the Borrowed early-return admits it.
                 if (auto* ld = dynamic_cast<const ast::LocalDecl*>(ls->decl)) {
                     if (dynamic_cast<const ast::CollectionLiteralExpr*>(
                             ld->initializer.get()) &&
