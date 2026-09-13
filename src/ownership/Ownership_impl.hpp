@@ -16,6 +16,7 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <set>
 #include <vector>
 
 #include "ast/Node.hpp"
@@ -2294,6 +2295,9 @@ private:
     void collectLambdaIdentifiers(
         const ast::LambdaExpr& lam,
         std::vector<const ast::IdentifierExpr*>& out) const;
+    void checkTransitiveCapturesDisposed(
+        const ast::LambdaExpr& lam,
+        std::set<const ast::LambdaExpr*>& visited);
     void collectIdentifiersIn(
         const ast::Expr& e,
         std::vector<const ast::IdentifierExpr*>& out) const;
