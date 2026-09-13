@@ -366,9 +366,39 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                 // discipline, three call sites.
                 llvm::Value* savedBoxMint = lastBoxMint_;
                 lastBoxMint_ = nullptr;
+                // fix #3513 (§18.5 / §28.3, v0.298): if `lowerExpr` itself
+                // contains a throwable call and it throws, `emitThrowValue`
+                // branches to `unwindBB` via `emitUnwindDisposals()` — but
+                // `acc` (the accumulated string built so far) was not registered
+                // in any disposal scope and is abandoned. Register it here so
+                // the unwind path reclaims it. Save/restore `diverged_` since
+                // it is a member that persists across calls; if it was already
+                // true before this call (a prior part diverged), we propagate
+                // that and skip `appendPart` on the normal path too.
+                bool savedDiverged = diverged_;
+                disposeStack_.push_back({});
+                llvm::AllocaInst* accSlot = entryAllocaNullPtr();
+                builder_.CreateStore(acc, accSlot);
+                Disposal d{accSlot, nullptr};
+                d.unwindOnly = true;
+                d.stringRelease = true;
+                disposeStack_.back().push_back(d);
                 ev = lowerExpr(*part.expr);
                 inlineBoxMint = lastBoxMint_;
                 lastBoxMint_ = savedBoxMint;
+                diverged_ = savedDiverged;
+                if (diverged_) {
+                    // Exception was thrown: `emitUnwindDisposals()` already
+                    // fired at the throw site and disposed `accSlot`.
+                    disposeStack_.pop_back();
+                    return llvm::PoisonValue::get(ptrTy());
+                }
+                // Normal path: null the slot so the scope's string disposal is
+                // a no-op (the prior `acc` was concat'd into the new string and
+                // will be released by `appendPart` below), then pop the scope.
+                builder_.CreateStore(
+                    llvm::ConstantPointerNull::get(ptrTy()), accSlot);
+                disposeStack_.pop_back();
                 // fix #3442 (§4.7 / §8.5 / §18.5, v0.283): a UNIT-typed hole is
                 // the one expression kind that legitimately lowers to NO value
                 // — `()` is LLVM `void`, so `lowerExpr` returns nullptr for it
@@ -500,6 +530,7 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                         appendPart(pv, ev, part.expr.get());
                         continue;
                     }
+                    // emitWithFormatSpec returned null: fall through.
                 }
                 auto* rt = ctx_.exprType(*part.expr);
                 // CG-nullable: for nullable value types (primitives, and a
