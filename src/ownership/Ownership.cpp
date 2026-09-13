@@ -12,7 +12,7 @@
 #include "ast/Node.hpp"
 #include "common/BuiltinRegistry.hpp"  // #1414 stage 3: builtin name registry
 #include "common/OwnershipFacts.hpp"   // #1414 stage 4: shared ownership-facts core
-#include "common/PatternAResultCollection.hpp"  // fix #4338: builtin collections
+#include "common/PatternAResultCollection.hpp"  // fix #4338: isPatternAResultCollectionHead
 #include "flow/CFG.hpp"
 #include "ownership/OwnershipState.hpp"
 #include "ownership/StmtWalker.hpp"  // fix #3565: forEachNestedStmt — the
@@ -5278,6 +5278,22 @@ OwnershipState MethodOwnership::producerState(const ast::Expr& e) {
     if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&e))
         if (common::isBuiltinArrayRangeSliceIndex(*ix, ctx_))
             return OwnershipState::Owned;
+    // fix #4338 (v0.298, §15.4 / §28.3 / §28.7): a collection literal whose
+    // backing storage is a heap-collection type (Array, Dictionary, OwningArray,
+    // etc.) is an OWNED producer — the literal allocates fresh heap backing
+    // and the local carries the disposal obligation. The predicate mirrors the
+    // one the NewExpr arm uses for `new Array<int>()`: if the literal's resolved
+    // type's head is in the heap-collection set, the initializer is Owned.
+    // A value-typed collection literal (none exists today) falls through to
+    // Borrowed. // per §15.4, §28.3, §28.7
+    if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(&e)) {
+        if (const sema::TypeRef* rt = ctx_.exprType(e)) {
+            if (rt->kind == sema::TypeRef::Kind::Named &&
+                !rt->headName().empty() &&
+                common::isPatternAResultCollectionHead(rt->headName()))
+                return OwnershipState::Owned;
+        }
+    }
     // Default: Borrowed.
     return OwnershipState::Borrowed;
 }
