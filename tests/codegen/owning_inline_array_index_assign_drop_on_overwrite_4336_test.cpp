@@ -150,20 +150,19 @@ BEZEL_TEST(owning_inline_array_index_assign_drop_on_overwrite_4336,
 
 // =============================================================================
 // #4336 — BORROW-SHAPE ACCEPT-SIDE CONTROL (per §15.1): a single-index write
-// into a NON-owning `[N]IHolder` slot (a borrow per §15.1) does NOT dispose
-// the slot value. The fix is gated on `arrRt->arrayOwned`; this control would
-// be the leak side of that gate (a borrow's owner lives elsewhere).
+// into a NON-owning `[N]Holder` slot (a borrow per §15.1) does NOT dispose
+// the slot value, AND the slot's value source lives elsewhere (the borrow
+// is the LHS here, not a fresh `new X()` — the test deliberately avoids the
+// latter shape because that is the spec-contradicting leak path #4351
+// filed for separate ruling). The fix is gated on `arrRt->arrayOwned`;
+// this control's job is "the fix does not introduce spurious disposal on
+// the borrow side" — only an owning-flag-true type enters the dispose
+// block.
 // =============================================================================
 //
-// We rely on the existing GlobalDataLength class side-effects as a runtime
-// witness that the program ran; we DO NOT assert disposal semantics here
-// because the borrow shape is outside the scope of this fix — a sibling
-// non-owning-shape observation is filed separately (see the issue body).
-//
-// This control's job is just "the fix does not over-reject / does not introduce
-// spurious disposal on the borrow side". `r.ran` is the gate; the borrowed
-// slot is read (no path through the dispose-pass of an owning-flag false
-// type) — only an owning-flag-true type enters the dispose block.
+// The program runs, exits 0 (7+5 mod 256 = 12), and is LSan-clean: `h`
+// owns its Holder, scope-end disposes it; the slot never holds a fresh
+// owned value, so no slot-disposal obligation arises.
 const char* kBorrowShapeOverwrite =
     "module M; "
     "class Holder "
@@ -178,7 +177,8 @@ const char* kBorrowShapeOverwrite =
     "    var arr: [1]Holder := [h]; "  // borrow-of-h (Holder is class, no
                                      // `owned` marker; per §15.1 borrow
                                      // only)
-    "    arr[0] := new Holder(7); "
+    "    arr[0] := h; "                // borrow again (slot->borrow
+                                     // overwrite; no fresh allocation)
     "    return arr[0].n + h.n; "
     "  end Main; "
     "end C;";
@@ -187,6 +187,6 @@ BEZEL_TEST(owning_inline_array_index_assign_drop_on_overwrite_4336,
     JitResult r = runAotChecked(kBorrowShapeOverwrite);
     if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, (7 + 5) % 256);
+    BEZEL_EXPECT_EQ(r.exitCode, (5 + 5) % 256);
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
