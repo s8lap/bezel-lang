@@ -11,6 +11,7 @@
                     // / src/sema/TypeResolution_Names.cpp's convention
 #include <functional>
 #include <optional>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -3515,6 +3516,42 @@ void MethodOwnership::collectLambdaIdentifiers(
     }
 }
 
+// fix #4399: recursively check whether any capture in the closure chain
+// (including transitive captures of nested closures) is in Disposed state.
+// The `visited` set prevents infinite loops on pathological code.
+void MethodOwnership::checkTransitiveCapturesDisposed(
+    const ast::LambdaExpr& lam,
+    std::set<const ast::LambdaExpr*>& visited) {
+    if (!visited.insert(&lam).second) return;  // already visited
+
+    std::vector<const ast::IdentifierExpr*> caps;
+    collectLambdaIdentifiers(lam, caps);
+    for (const auto* id : caps) {
+        sema::Symbol* capSym = ctx_.exprSymbol(*id);
+        if (!capSym) continue;
+        auto it = states_.find(capSym);
+        if (it == states_.end()) continue;
+        const LocalOwnership& st = it->second;
+        if (st.state == OwnershipState::Disposed) {
+            report(
+                Severity::Warning,
+                id->span.begin,
+                std::string("closure captures `") + std::string(id->name) +
+                    "` which was disposed before this invocation — a closure's "
+                    "captured borrow is read at invoke time, and this call "
+                    "reads a disposed value (§28.2 use-after-dispose)");
+        }
+        // Recurse: if this capture is itself a function-typed local holding
+        // a closure, check ITS captures transitively.
+        if (auto* ls = dynamic_cast<sema::LocalSymbol*>(capSym)) {
+            auto lit = scopedLambdaLocalInit_.find(ls);
+            if (lit != scopedLambdaLocalInit_.end()) {
+                checkTransitiveCapturesDisposed(*lit->second, visited);
+            }
+        }
+    }
+}
+
 // -------------------------------------------------------------------------
 // §28.3 (v0.184, #1958) captured-owned-binding consume inside a closure.
 //
@@ -3907,48 +3944,33 @@ void MethodOwnership::scanCapturedOwnedConsumeExpr(const ast::Expr& e,
             scanCapturedOwnedConsumeExpr(*call->callee,
                                          insideLambda || calleeIsLambda);
         }
-        // fix #4355: when a function-typed local holding a closure is invoked
-        // at the top level (not inside another lambda), check whether any of
-        // the closure's captured identifiers have been disposed since the closure
-        // was created. Unlike `reportMovedFromCapturesIn` (which fires at the
-        // closure literal's creation point with the entry state), this fires at
-        // the INVOCATION point with the current state — catching the
-        // dispose-between-creation-and-call gap:
+        // fix #4355 / fix #4399: when a function-typed local holding a closure
+        // is invoked, check whether any of the closure's captured identifiers
+        // have been disposed since the closure was created. Unlike
+        // `reportMovedFromCapturesIn` (which fires at the closure literal's
+        // creation point with the entry state), this fires at the INVOCATION
+        // point with the current state — catching the dispose-between-creation-
+        // and-call gap:
         //   var c := lambda(): int => x.Get();  // capture while Owned
         //   x.Dispose();                         // disposed AFTER creation
         //   _ := c();                            // reads disposed x at invoke
-        if (!insideLambda && call->callee) {
+        //
+        // The #4399 transitive extension removes the `!insideLambda` guard and
+        // uses checkTransitiveCapturesDisposed so the check fires inside a
+        // lambda body as well, transitively examining captures of nested closures:
+        //   var inner := lambda(): int => r.Get();
+        //   var outer := lambda(): int => inner();  // outer invokes inner
+        //   r.Dispose();
+        //   _ := outer();  // outer() -> inner() -> reads disposed r
+        if (call->callee) {
             if (const auto* calleeId =
                     dynamic_cast<const ast::IdentifierExpr*>(call->callee.get())) {
                 if (sema::Symbol* sym = ctx_.exprSymbol(*calleeId)) {
                     if (auto* ls = dynamic_cast<sema::LocalSymbol*>(sym)) {
                         auto lit = scopedLambdaLocalInit_.find(ls);
                         if (lit != scopedLambdaLocalInit_.end()) {
-                            std::vector<const ast::IdentifierExpr*> caps;
-                            collectLambdaIdentifiers(*lit->second, caps);
-                            for (const auto* id : caps) {
-                                sema::Symbol* capSym = ctx_.exprSymbol(*id);
-                                if (!capSym) continue;
-                                auto it = states_.find(capSym);
-                                if (it == states_.end()) continue;
-                                const LocalOwnership& st = it->second;
-                                // §28.2 / §28.3: a captured local in Disposed state
-                                // at the INVOCATION point is a use-after-dispose.
-                                // Match checkRead's own severity (Warning) for the
-                                // same shape on a direct read.
-                                if (st.state == OwnershipState::Disposed) {
-                                    report(
-                                        Severity::Warning,
-                                        id->span.begin,
-                                        std::string("closure captures `") +
-                                            std::string(id->name) +
-                                            "` which was disposed before this "
-                                            "invocation — a closure's captured "
-                                            "borrow is read at invoke time, and "
-                                            "this call reads a disposed value "
-                                            "(§28.2 use-after-dispose)");
-                                }
-                            }
+                            std::set<const ast::LambdaExpr*> visited;
+                            checkTransitiveCapturesDisposed(*lit->second, visited);
                         }
                     }
                 }
