@@ -209,13 +209,17 @@ inline bool calleeReturnMayAliasStringArgUnretained(
         const sema::SemaContext& ctx, const sema::MethodSymbol* ms) {
     if (!ms) return false;
     const sema::TypeRef* crt = nullptr;
+    // `md` is lifted to outer scope so the Class-field check below can use
+    // it; it is only non-null for non-imported methods (where `crt` is also
+    // resolved from the body). Imported methods have no body to inspect.
+    const ast::MethodDecl* md = nullptr;
     if (ctx.isImported(ms)) {
         crt = ctx.importedReturnType(ms);
     } else {
         // SEAM-ACCESSOR: local-path cast; `if (ctx.isImported(ms))` above
         // returns early for the imported case via ctx.importedReturnType.
         // #3152
-        const auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
+        md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
         if (md && md->returnType) {
             crt = ctx.resolvedType(*md->returnType);
         }
@@ -247,6 +251,47 @@ inline bool calleeReturnMayAliasStringArgUnretained(
             return isRecordOrChoiceDeclared(elem);
         };
     if (isRecordOrChoiceDeclared(crt)) return true;
+    // fix #4300 (§9.7/§28.3, v0.298): the top-level arm above correctly
+    // suppresses the caller-side release when the callee return type IS
+    // Record/Choice-declared, and `elementMayEmbedStringArgUnretained` (applied
+    // to InlineArray elements above) correctly covers Record/Choice element
+    // types.  BUT when the return type is a Class whose own field is
+    // Record/Choice-typed and whose constructor embeds the string argument into
+    // THAT field via `new SomeRecord(arg)`, the string argument is stored
+    // through the record's positional fast path one level in — the identical
+    // raw `CreateStore` shape `fix #4254` found for top-level record returns.
+    // `lowerStringFieldStore` never fires because the class's own field (`W`)
+    // is Record-typed, not `string`-typed.  A Class-typed return that has any
+    // field whose declared type is Record/Choice-declared is therefore also
+    // treated as "may embed the argument unretained" here — accepting the
+    // leak-over-UAF bias (suppressing a safe release is better than allowing
+    // an unsuppressed UAF).  The conservative one-level field walk uses the
+    // same `isRecordOrChoiceDeclared` test the rest of this function uses.
+    // `md` is only available in the non-imported branch (see above), so this
+    // check lives there too — imported class declarations cannot be examined
+    // without their body.
+    if (!ctx.isImported(ms) && md) {
+        if (crt && crt->kind == sema::TypeRef::Kind::Named &&
+            crt->declaration &&
+            crt->declaration->kind == ast::TypeDeclKind::Class) {
+            const sema::TypeSymbol* ts = crt->declaration;
+            for (const sema::Symbol* mem : ts->members) {
+                const auto* fs = dynamic_cast<const sema::FieldSymbol*>(mem);
+                if (!fs) continue;
+                // SEAM-DEBT: #4300 Class-field walk to detect Record/Choice-typed fields requires
+                // the AST; the read is dead for imported Class declarations (fs->decl == nullptr)
+                // and the !fs->decl gate above handles that. To drain, the imported-class case
+                // needs a parallel ctx.importedFieldTypeRef path — same SEAM-ACCESSOR split as
+                // ctx.importedReturnType above.
+                const auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
+                if (!fd || !fd->type) continue;
+                const sema::TypeRef* ftr = ctx.resolvedType(*fd->type);
+                if (isRecordOrChoiceDeclared(ftr)) {
+                    return true;
+                }
+            }
+        }
+    }
     if (crt && crt->kind == sema::TypeRef::Kind::InlineArray &&
         elementMayEmbedStringArgUnretained(crt->arrayElement)) {
         return true;
@@ -11341,6 +11386,22 @@ private:
     // the +1 producer argument — the pre-#4322 safe behaviour for those
     // shapes, with no leak.
     bool recordCallResultInitOutermost_ = false;
+
+    // fix #4300 (§9.7 / §28.3 / §28.9, v0.298): the Class-typed twin of
+    // the record-call-result suppression above. A `var outer: Widget2;`
+    // (Class with a Record field) assigned via `outer := Helper.Wrap(s)`
+    // must also suppress the caller's +1 argument release — the Class's
+    // own vtable-driven disposal (emitOwnedFieldDisposals /
+    // emitRecordStringFieldReleases from the class disposer cascade) is what
+    // reclaims the argument at the class instance's disposal, exactly as
+    // `recordStringFields` does for a record-typed local. Set by
+    // `lowerLocalDecl` for a Class-typed local in
+    // `classCallResultWithRecordFieldEligible_`, and separately by the
+    // AssignmentStmt arm of `collectRecordCallResultReleaseEligible` for a
+    // "declare, then assign" Class local.
+    std::unordered_map<const void*, const ast::AssignmentStmt*>
+        classCallResultWithRecordFieldEligible_;
+    bool recordCallResultInitOutermostClassWithRecordField_ = false;
 
     // fix #2448 / §9.7 / §28.9 (v0.235): is `expr` a provably fresh, alias-
     // free construction of EXACTLY record type `recTs`? See the definition
