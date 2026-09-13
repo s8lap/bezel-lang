@@ -11325,6 +11325,23 @@ private:
     void collectRecordCallResultReleaseEligible(
         const std::vector<std::unique_ptr<ast::Stmt>>& body);
 
+    // fix #4342 (§9.7 / §28.3 / §28.9, v0.298): the call-wide #429
+    // post-call argument release suppression that #4322 added for the
+    // `var outer := Helper.Wrap("...");` shape is sound ONLY when the
+    // call's result will actually be claimed downstream — i.e., this call
+    // IS the initializer of a LocalDecl/LocalConstDecl in
+    // `recordCallResultReleaseEligible_`. Set to `true` by `lowerLocalDecl`
+    // around the init lowering for such an eligible local; consulted at the
+    // start of `lowerCallDispatch` (and cleared, so nested calls inside
+    // args do not also see it as true) to gate the suppression. For any
+    // call whose result is NOT a record-call-result-eligible init (a
+    // discarded `Helper.Wrap(...);` statement, an inline
+    // `total + Helper.Wrap(...).V.Length` read, an argument to another
+    // call, etc.) the OLD unconditional #429 release fires and reclaims
+    // the +1 producer argument — the pre-#4322 safe behaviour for those
+    // shapes, with no leak.
+    bool recordCallResultInitOutermost_ = false;
+
     // fix #2448 / §9.7 / §28.9 (v0.235): is `expr` a provably fresh, alias-
     // free construction of EXACTLY record type `recTs`? See the definition
     // (LlvmBackend_Setup.cpp) for the full rationale.

@@ -14651,8 +14651,38 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
                 expectedFunctionType_ = declTR;
         }
     }
+    // fix #4342 (§9.7 / §28.3 / §28.9, v0.298): arm the
+    // `recordCallResultInitOutermost_` flag for the duration of the init
+    // lowering ONLY when this decl is a record-typed
+    // LocalDecl/LocalConstDecl in `recordCallResultReleaseEligible_` AND
+    // its initializer is a `CallExpr` — the shape `lowerCallDispatch`
+    // captures at entry to gate the call-wide #4322 argument-release
+    // suppression. A `NewExpr` init (`var p := new P(...)`) goes through
+    // `lowerNew`, never `lowerCallDispatch`, so the flag is irrelevant
+    // for it (and the constructor's own argument release path covers the
+    // +1 producer arguments the NewExpr sees). The save/restore around
+    // the init lowering makes the flag transparent to NESTED LocalDecl
+    // inits (rare but legal — `var x := (var y := Mk(); y)` was never
+    // accepted by sema anyway, so a simpler nested-lowering concern does
+    // not arise; the save/restore is for safety in case a future code
+    // path introduces one).
+    const bool savedRecordCallResultInitOutermost =
+        recordCallResultInitOutermost_;
+    if (init && currentFn_ == recordCallResultReleaseEligibleFn_ &&
+        recordCallResultReleaseEligible_.count(
+            static_cast<const void*>(declNode)) &&
+        dynamic_cast<const ast::CallExpr*>(init)) {
+        recordCallResultInitOutermost_ = true;
+    }
     llvm::Value* v = init ? lowerExpr(*init) : nullptr;
     expectedFunctionType_ = savedExpectedForLambdaDecl;
+    // fix #4342: restore the flag (saved above) so a subsequent LocalDecl
+    // in the same enclosing scope starts from the right state. The early-
+    // return paths below — the `if (diverged_) return;` after the throw-
+    // init divergence check, and the lambda-capture / disposal /
+    // closureRelease paths further down — all run AFTER this point, so a
+    // single restore here covers them all.
+    recordCallResultInitOutermost_ = savedRecordCallResultInitOutermost;
     // §9 / §9.1 (#1759): `var q := this` in a record method copies the record
     // value. `this` lowered to the receiver POINTER (CG29 / §9.2); load the
     // struct so the local holds a value-semantics copy, not the pointer bits — a
@@ -14682,6 +14712,12 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
     // initializer either, and §4.7 gives `()?` "two values, `null` and `()`",
     // so leaving the slot at its all-zero (null) pattern is a WRONG VALUE, not
     // a harmless no-op. A no-op for every non-`()?` declared type, so
+    // fix #4342 (§9.7 / §28.3 / §28.9, v0.298): see the save/restore and
+    // arming of `recordCallResultInitOutermost_` ABOVE the init lowering
+    // (just before `lowerExpr(*init)`); it covers every code path between
+    // there and here. The flag is restored BEFORE this `boxForTarget`
+    // arm so a re-entry into lowering that touches the flag sees the
+    // pre-LocalDecl state, not the LocalDecl's.
     // boxForTarget's Object case below is reached exactly as before.
     if (declType) {
         sema::TypeRef* declTy0 = ctx_.resolvedType(*declType);

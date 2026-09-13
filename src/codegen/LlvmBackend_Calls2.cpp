@@ -5347,6 +5347,24 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
 
 llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
     if (!call.callee) return nullptr;
+    // fix #4342 (§9.7 / §28.3 / §28.9, v0.298): capture the
+    // `recordCallResultInitOutermost_` flag at entry. The flag is set true
+    // by `lowerLocalDecl` ONLY when lowering the initializer of a record-
+    // typed LocalDecl/LocalConstDecl in `recordCallResultReleaseEligible_`
+    // (the #1747 set that drives the LocalDecl's own scope-end
+    // `recordStringFields Disposal`). Clearing it here ensures that any
+    // nested calls reached via the argument-lowering loop below — e.g.,
+    // the inner `Foo(s)` of `var p := Wrap(Foo(s))`, where `Wrap` is the
+    // outermost call whose result is bound to `p` — are NOT also seen as
+    // "the init", so their +1 producer arguments are released by the OLD
+    // unconditional #429 loop (they have no LocalDecl to claim them). The
+    // captured value is consumed by the call-wide #429 suppression gate
+    // ~700 lines below — only the OUTERMOST call's suppression is
+    // conditional on `calleeReturnMayAliasStringArgUnretained`, every
+    // nested call's release fires unconditionally like pre-#4322.
+    const bool wasRecordCallResultInitOutermost =
+        recordCallResultInitOutermost_;
+    recordCallResultInitOutermost_ = false;
     // §22.16 (v0.250, #3038): `old(E)` inside an `ensures` clause. The
     // capture slot was allocated by `allocateOldCaptureSlots` and the
     // entry-time value was stored there by `captureOldOperands` (both
@@ -11755,9 +11773,32 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
         std::size_t argOffset = isStaticMethod(ms) ? 0 : 1;
         bool calleeMayAliasArg =
             calleeReturnMayAliasStringArgUnretained(ctx_, ms);
+        // fix #4342 (§9.7 / §28.3 / §28.9, v0.298): the call-wide #4322
+        // suppression is sound ONLY when this call IS the initializer of a
+        // record-typed LocalDecl/LocalConstDecl in
+        // `recordCallResultReleaseEligible_` — captured at entry as
+        // `wasRecordCallResultInitOutermost` above. For every other shape
+        // (discarded `Helper.Wrap(...);` statement, inline
+        // `... + Helper.Wrap(...).V.Length` read, an argument passed to
+        // another call, etc.) nothing downstream claims the release, so
+        // suppressing it orphans the +1 producer argument's allocation:
+        // #4342 measured 20390 B / 1000 allocations at 500× loop
+        // amplification on the discarded shape — a regression from the
+        // pre-#4322 unconditional-release behaviour that reclaimed exactly
+        // that temporary. Restoring the unconditional release for those
+        // shapes is the safe default (leak-over-UAF): a UAF here would
+        // require the callee to alias the argument AND the discarded
+        // result to be read after the release — both true for
+        // `var outer := Helper.Wrap(s); outer.V.Length` (where the
+        // LocalDecl IS the init, the suppression stays armed, and the
+        // LocalDecl's scope-end `recordStringFields Disposal` reclaims
+        // the argument), and never true for the discarded/inline/arg
+        // shapes the flag distinguishes.
+        const bool suppressForCallResultClaim =
+            calleeMayAliasArg && wasRecordCallResultInitOutermost;
         for (std::size_t ai = argOffset; ai < args.size() && ai < argExprs.size(); ++ai) {
             if (argExprs[ai] && isPlusOneStringProducer(argExprs[ai]) &&
-                !calleeMayAliasArg)
+                !suppressForCallResultClaim)
                 emitStringRelease(args[ai]);
         }
     }
