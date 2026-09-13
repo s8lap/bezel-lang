@@ -11480,6 +11480,50 @@ private:
     void collectValueLikeChoiceCallResultReleaseEligible(
         const std::vector<std::unique_ptr<ast::Stmt>>& body);
 
+    // fix #4296 (§9.7 / §28.3, v0.298): the set of plain `var` INLINE-ARRAY
+    // LocalDecl nodes whose initializer is a CALL returning an inline array
+    // type whose element type carries strings
+    // (inlineArrayElementCarriesString), and which the conservative escape
+    // walk proved never to escape. Mirrors recordCallResultReleaseEligible_
+    // exactly — for the [N]string call-result shape the issue identified as
+    // having no release-eligibility mechanism at all. Consulted in
+    // lowerLocalDecl (LlvmBackend_Setup.cpp). The inlineArrayStringFields
+    // Disposal already exists (LlvmBackend_Disposal.cpp, wired for
+    // Serialize/Deserialize only) and emits bz_string_free on each element
+    // slot at scope end; this fix is the missing WIRING that admits the
+    // ordinary user-local shape into that Disposal.
+    //
+    // Freshness: unlike records (where a callee may return a BORROWED field
+    // already reachable from a longer-lived owner), an inline array is always
+    // returned BY VALUE — the call site receives a freshly constructed array
+    // whose elements may themselves be borrows of the caller's locals, but
+    // the array struct itself is always fresh at the call site. The callee
+    // does not hand back an existing heap allocation the caller must not
+    // reclaim; the caller IS the first/sole owner of the array struct.
+    // No factory-method body walk is needed for the array-level freshness
+    // argument; the string-releasability of the elements is a property of
+    // the element type alone (checked by inlineArrayElementCarriesString).
+    //
+    // Also covers the "declare, then assign" shape
+    // (`var outer: [N]string; ... outer := <call>;`) per the #4266 pattern.
+    std::unordered_set<const void*> inlineArrayStringCallResultReleaseEligible_;
+    llvm::Function* inlineArrayStringCallResultReleaseEligibleFn_ = nullptr;
+
+    // fix #4296 (§9.7 / §28.9): the "declare, then assign" twin of the set
+    // above — a plain `var outer: [N]string;` (NO initializer) whose SOLE
+    // reassignment anywhere in the body is `outer := <call>;`, independently
+    // proven fresh. Maps the candidate's OWN LocalDecl node to the ONE
+    // AssignmentStmt node that gives it its value. Mirrors
+    // recordDeclareThenAssignSite_ exactly. Populated only by
+    // collectInlineArrayStringCallResultReleaseEligible.
+    std::unordered_map<const void*, const ast::AssignmentStmt*>
+        inlineArrayStringDeclareThenAssignSite_;
+
+    // fix #4296: walk the function body, classifying each plain-`var`
+    // inline-array call-result LocalDecl by escape verdict.
+    void collectInlineArrayStringCallResultReleaseEligible(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body);
+
     // #429: is the resolved TypeRef `rt` a (non-nullable) `string`? Used to
     // zero-init a no-initializer `var s: string;` slot so reassignment's
     // release-old is null-safe. Nullable string? is excluded (left untouched).

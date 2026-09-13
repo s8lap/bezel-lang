@@ -9412,6 +9412,9 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
     // return type and a conservative non-escape verdict).
     recordCallResultReleaseEligible_.clear();
     recordCallResultReleaseEligibleFn_ = fn;
+    inlineArrayStringCallResultReleaseEligible_.clear();
+    inlineArrayStringCallResultReleaseEligibleFn_ = fn;
+    inlineArrayStringDeclareThenAssignSite_.clear();
     // fix #2428 / §9.8 / §28.9 / §35.4: which plain `var` VALUE-LIKE CHOICE
     // locals bound from a call to the type's own synthesized `Deserialize`
     // factory may have their reachable strings released at scope end
@@ -9448,6 +9451,7 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
         collectObjectStringReleaseEligible(*ci.stmts);
         collectStringReleaseEligible(*ci.stmts);
         collectRecordCallResultReleaseEligible(*ci.stmts);  // fix #1747
+        collectInlineArrayStringCallResultReleaseEligible(*ci.stmts);  // fix #4296
         collectValueLikeChoiceCallResultReleaseEligible(*ci.stmts);  // fix #2428
         collectBorrowingArrayFreeEligible(*ci.stmts);  // #1003
         collectClosureReleaseEligible(*ci.stmts);
@@ -16079,6 +16083,36 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
             choiceHasStringFields(tr->declaration)) {
             Disposal d{slot, tr->declaration};
             d.choiceStringFields = true;
+            disposeStack_.back().push_back(d);
+        }
+    }
+    // fix #4296 (§9.7 / §28.3, v0.298): if this plain `var` INLINE-ARRAY
+    // local was bound from a call returning an inline array type whose
+    // element type carries strings, and proven NON-escaping by the
+    // conservative escape walk (inlineArrayStringCallResultReleaseEligible_),
+    // register a scope-end release of each string element
+    // (inlineArrayStringFields Disposal — the arbitrary-depth walker that
+    // emitInlineArrayStringReleases already provides; this is the missing
+    // wiring that admits the ordinary user-local shape into it).
+    // Mirrors the recordCallResultReleaseEligible_ / recordStringFields pair
+    // exactly, and the valueLikeChoiceCallResultReleaseEligible_ /
+    // choiceStringFields pair. Gated on currentFn_ matching the analyzed
+    // function, mirroring every other eligibility-set consumer.
+    if ((v || inlineArrayStringDeclareThenAssignSite_.count(
+                   static_cast<const void*>(declNode))) &&
+        currentFn_ == inlineArrayStringCallResultReleaseEligibleFn_ &&
+        inlineArrayStringCallResultReleaseEligible_.count(
+            static_cast<const void*>(declNode)) &&
+        !disposeStack_.empty()) {
+        const sema::TypeRef* tr = nullptr;
+        if (declType) tr = ctx_.resolvedType(*declType);
+        if (!tr && init) tr = ctx_.exprType(*init);
+        if (tr && !tr->nullable &&
+            tr->kind == sema::TypeRef::Kind::InlineArray &&
+            inlineArrayElementCarriesString(tr)) {
+            Disposal d{slot, nullptr};
+            d.inlineArrayStringFields = true;
+            d.inlineArrayElemType = tr;
             disposeStack_.back().push_back(d);
         }
     }
@@ -28795,6 +28829,145 @@ void Emitter::collectValueLikeChoiceCallResultReleaseEligible(
         if (!w.escaped)
             valueLikeChoiceCallResultReleaseEligible_.insert(
                 static_cast<const void*>(ld));
+    }
+}
+
+
+void Emitter::collectInlineArrayStringCallResultReleaseEligible(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body) {
+    inlineArrayStringCallResultReleaseEligible_.clear();
+    inlineArrayStringDeclareThenAssignSite_.clear();
+
+    // fix #4296 (§9.7 / §28.3, v0.298): mirrors
+    // collectRecordCallResultReleaseEligible exactly — for the [N]string
+    // call-result shape the issue identified as having no release-eligibility
+    // mechanism at all. An inline array is always returned BY VALUE from a
+    // call, so no factory-method body walk is needed for the array-level
+    // freshness argument; the string-releasability of the elements is a
+    // property of the element type alone
+    // (inlineArrayElementCarriesString).
+
+    struct NoInitAssignState {
+        const sema::TypeRef* declaredType = nullptr;
+        int assignCount = 0;
+        const ast::AssignmentStmt* soleAssign = nullptr;
+    };
+    std::unordered_map<const ast::Node*, NoInitAssignState> noInitDecls;
+
+    std::function<void(const ast::Stmt*)> scan = [&](const ast::Stmt* s) {
+        if (!s) return;
+        {
+            LocalDeclInitView v = localDeclInitView(s);
+            if (v.init && !v.isUsing) {
+                // `var outer := Helper.Wrap(s);` shape: only a CALL initializer
+                // is in scope. Check the initializer's exprType is an inline
+                // array whose element type carries strings.
+                if (dynamic_cast<const ast::CallExpr*>(v.init)) {
+                    const sema::TypeRef* tr = nullptr;
+                    if (v.type) tr = ctx_.resolvedType(*v.type);
+                    if (!tr) tr = ctx_.exprType(*v.init);
+                    if (tr && !tr->nullable &&
+                        tr->kind == sema::TypeRef::Kind::InlineArray &&
+                        inlineArrayElementCarriesString(tr)) {
+                        // The escape walk for inline arrays uses the same
+                        // StringEscapeWalker infrastructure as records.
+                        StringEscapeWalker w{ctx_, static_cast<const void*>(s)};
+                        w.recordFieldReleaseMode = true;
+                        w.wholeBody = &body;
+                        w.scrutineeBorrowMode = true;
+                        for (auto& bs : body) {
+                            w.stmt(bs.get());
+                            if (w.escaped) break;
+                        }
+                        if (!w.escaped)
+                            inlineArrayStringCallResultReleaseEligible_.insert(
+                                static_cast<const void*>(s));
+                    }
+                }
+            } else if (!v.init) {
+                // fix #4296 declare-then-assign shape: `var outer: [N]string;`
+                // with NO initializer — record it if its declared type is an
+                // inline array whose element type carries strings.
+                if (dynamic_cast<const ast::LocalDecl*>(s) && v.type) {
+                    if (const sema::TypeRef* tr = ctx_.resolvedType(*v.type)) {
+                        if (!tr->nullable &&
+                            tr->kind == sema::TypeRef::Kind::InlineArray &&
+                            inlineArrayElementCarriesString(tr))
+                            noInitDecls[s].declaredType = tr;
+                    }
+                }
+            }
+        }
+        // Track "declare, then assign" assignments
+        if (auto* as2 = dynamic_cast<const ast::AssignmentStmt*>(s)) {
+            if (as2->op == ":=") {
+                if (auto* id =
+                        dynamic_cast<const ast::IdentifierExpr*>(as2->target.get())) {
+                    if (auto* loc =
+                            dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*id))) {
+                        auto it = noInitDecls.find(loc->decl);
+                        if (it != noInitDecls.end()) {
+                            NoInitAssignState& st = it->second;
+                            st.assignCount++;
+                            if (st.assignCount == 1) st.soleAssign = as2;
+                            else st.soleAssign = nullptr;
+                        }
+                    }
+                }
+            }
+        }
+        // Recurse into nested scopes
+        if (auto* is = dynamic_cast<const ast::IfStmt*>(s)) {
+            for (auto& b : is->ifBranch.body) scan(b.get());
+            for (auto& br : is->elifBranches)
+                for (auto& b : br.body) scan(b.get());
+            for (auto& b : is->elseBody) scan(b.get());
+        } else if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s)) {
+            for (auto& b : ws->body) scan(b.get());
+        } else if (auto* fs = dynamic_cast<const ast::ForStmt*>(s)) {
+            for (auto& b : fs->body) scan(b.get());
+        } else if (auto* d = dynamic_cast<const ast::DoEndBlock*>(s)) {
+            for (auto& b : d->body) scan(b.get());
+        } else if (auto* ts = dynamic_cast<const ast::TryStmt*>(s)) {
+            for (auto& b : ts->body) scan(b.get());
+            for (auto& c : ts->catches) scan(c.body.get());
+            for (auto& b : ts->finallyBody) scan(b.get());
+        } else if (auto* cs = dynamic_cast<const ast::CaseStmt*>(s)) {
+            for (auto& arm : cs->arms)
+                for (auto& a : arm.stmts) scan(a.get());
+        }
+    };
+    for (auto& s : body) scan(s.get());
+
+    // Admit every "declare, then assign" root with exactly one assignment
+    for (const auto& kv : noInitDecls) {
+        const NoInitAssignState& st = kv.second;
+        if (st.assignCount == 1 && st.soleAssign) {
+            const ast::AssignmentStmt* as = st.soleAssign;
+            const sema::TypeRef* tr = st.declaredType;
+            if (dynamic_cast<const ast::CallExpr*>(as->value.get())) {
+                if (tr && !tr->nullable &&
+                    tr->kind == sema::TypeRef::Kind::InlineArray &&
+                    inlineArrayElementCarriesString(tr)) {
+                    StringEscapeWalker w{ctx_, static_cast<const void*>(kv.first)};
+                    w.recordFieldReleaseMode = true;
+                    w.recordDeclareThenAssignSite =
+                        static_cast<const void*>(as);
+                    w.wholeBody = &body;
+                    w.scrutineeBorrowMode = true;
+                    for (auto& bs : body) {
+                        w.stmt(bs.get());
+                        if (w.escaped) break;
+                    }
+                    if (!w.escaped) {
+                        inlineArrayStringCallResultReleaseEligible_.insert(
+                            static_cast<const void*>(kv.first));
+                        inlineArrayStringDeclareThenAssignSite_[
+                            static_cast<const void*>(kv.first)] = as;
+                    }
+                }
+            }
+        }
     }
 }
 
