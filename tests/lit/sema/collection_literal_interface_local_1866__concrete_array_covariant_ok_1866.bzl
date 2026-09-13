@@ -5,6 +5,9 @@
 // assigning it is well-formed. Guards against over-rejection (a false positive
 // that would reject every concrete collection literal).
 //
+// NOTE: literal is now Owned per fix #4338 fix-forward; changed `var` to `const`
+// to avoid the auto-drop warning (value-typed Array<int> has no disposal obligation).
+//
 // Clean-compile ACCEPT control: bezelc -c must exit zero and emit no diagnostics.
 //
 // RUN: %bezelc -c -o %t.o %s
@@ -13,7 +16,7 @@
 module M;
 class P
   public static method Main(): int
-    var xs: Array<int> := [1, 2, 3];
+    const xs: Array<int> := [1, 2, 3];
     var v: IEnumerable<int> := xs;
     var total: int := 0;
     for var x in v do total := total + x; end;
