@@ -613,12 +613,47 @@ std::unique_ptr<ast::TypeDecl> Parser::parseTypeOrInterfaceDecl(
         advance();
         // §14: `end TypeName<T>;` — skip generic params in the end label so
         // that generic class declarations can label their end consistently.
+        // fix #4347 (§1.6 / Appendix A.3, v0.298): the discard loop here
+        // tracks only `<`/`>` depth, bounded solely by `depth == 0` or
+        // `EndOfFile`. On a malformed end-label with an unclosed `<` nothing
+        // bounded the scan, so it consumed the rest of the file. Unlike the
+        // three sibling discard-loop instances fixed this run (#4257,
+        // #4341, #4343), this loop runs AFTER the enclosing type's `end`
+        // keyword has already been consumed — there is no single reserved
+        // keyword that universally bounds it the way `end` does for the
+        // others, since the next top-level declaration can start with
+        // several different keywords (`Parser::parseTopDecl`). Bound by:
+        //   - `;` (the end-label's expected terminator; `;` cannot appear
+        //     inside a well-formed generic-parameter spelling — Appendix A.3
+        //     `GenericArgs` admits only `GenericArg` separated by `,`,
+        //     balanced `<`/`>`, no statement-level punctuation); and
+        //   - any TopDecl-starting keyword reachable from this position
+        //     (`type` / `extension` / `extern`, the four visibility
+        //     keywords, the four modifier keywords, the five kind keywords
+        //     `class`/`interface`/`record`/`enum`/`choice`). None of these
+        //     can appear inside a well-formed generic-parameter end-label
+        //     spelling (none is a valid type-parameter identifier; the
+        //     GenericArgs grammar's terminals are `Identifier`, `,`, `<`,
+        //     `>`). The pre-fix bug suppressed every diagnostic that would
+        //     otherwise be reported in the rest of the file.
         if (isPunctuator("<")) {
             advance();  // skip `<`
             int depth = 1;
             while (depth > 0 && current_.kind != TokenKind::EndOfFile) {
                 if (isPunctuator("<")) depth++;
                 else if (isPunctuator(">")) { depth--; if (depth == 0) break; }
+                else if (isPunctuator(";") ||
+                         isKeyword("type") || isKeyword("extension") ||
+                         isKeyword("extern") ||
+                         isKeyword("public") || isKeyword("private") ||
+                         isKeyword("internal") || isKeyword("protected") ||
+                         isKeyword("abstract") || isKeyword("closed") ||
+                         isKeyword("sealed") || isKeyword("static") ||
+                         isKeyword("class") || isKeyword("interface") ||
+                         isKeyword("record") || isKeyword("enum") ||
+                         isKeyword("choice")) {
+                    break;
+                }
                 advance();
             }
             if (isPunctuator(">")) advance();  // consume final `>`
