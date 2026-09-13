@@ -152,24 +152,32 @@ BEZEL_TEST(async_pattern_a_owned_field_move_return_4319,
     BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, k1005DiagFragment));
 }
 
-// Pattern B (`OwningTask<T>`) is NOT exempted by this fix — scoped to the
-// PLAIN `Task` head only. `move h.item` returned through `OwningTask<Cell>`
-// from an async body still hits the SAME #1005 rule, UNCHANGED (measured:
-// identical diagnostic text pre- and post-fix). Pattern B's producer-side
-// rules for this shape are a separate, unmeasured question (filed
-// alongside this fix, see issue 4319's follow-up) — this row pins the
-// CURRENT (unchanged) behaviour, not a claim that it is the FINAL word.
+// Pattern B (`OwningTask<T>`) IS NOW EXEMPTED by fix #4337 — the same §30.5
+// kind 1 reasoning that applies to plain `Task<T>` (fix #4319) also applies
+// to `OwningTask<T>` (fix #4337). `move h.item` returned through
+// `OwningTask<Cell>` from an async body is now ADMITTED (not rejected).
+// The accept behaviour is pinned by the dedicated fix #4337 test file
+// (tests/ownership/async_owning_task_owned_field_move_return_4337_test.cpp);
+// this row simply confirms the #4319 fix does NOT regress the accept.
 BEZEL_TEST(async_pattern_a_owned_field_move_return_4319,
-          boundary_owningtask_move_owned_field_unaffected) {
+          boundary_owningtask_move_owned_field_now_admitted_by_4337) {
     auto r = runAot(
         "module M; " + std::string(kCell) + std::string(kBox) +
         "class C "
         "  public static async method GetAsyncB(h: Box): OwningTask<Cell> "
-        "    return move h.item; "
+        "    return move h.item; "  // now admitted by fix #4337
         "  end GetAsyncB; "
+        "  public static async method Main(): Task<int> "
+        "    var x := new Cell(); "
+        "    var h := new Box(move x); "
+        "    using var t := C.GetAsyncB(h); "
+        "    var y := await t; "
+        "    y.Dispose(); "
+        "    h.Dispose(); "
+        "    return Cell.n; "
+        "  end Main; "
         "end C;");
-    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
-    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, k1005DiagFragment));
+    BEZEL_EXPECT_EQ(r.ran ? r.exitCode : -999, 0);
 }
 
 // A bare (non-`move`) read of the owned field through the SAME Pattern-A

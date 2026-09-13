@@ -12283,19 +12283,31 @@ void MethodOwnership::checkOwnedFieldReturn(const ast::Expr& e) {
     // really is ownerless) and, pre-fix, had no carve-out for the async
     // Task-family case — unlike its sibling declaration-site check
     // (`staticReturnTypeRejected`, ~L12197: "`if (common::isTaskFamilyHead(
-    // head)) return {};  // §28.3 v0.190 carve`"). Scoped to the PLAIN
-    // `Task` head only (never `OwningTask`, Pattern B — a separate,
-    // unmeasured question left alone here, see issue 4319's follow-up) and
-    // to an `isAsync_` body only, mirroring
-    // `checkBorrowReturnedThroughOwningType`'s `plainTaskInSyncBody` gate's
-    // documented two-pattern split ("OwningTask is already an owning-type
-    // head (rejected in BOTH sync and async bodies, unchanged)").
+    // head)) return {};  // §28.3 v0.190 carve`").
+    //
+    // fix #4337 (§30.5 Pattern B, v0.298): the SAME reasoning applies to
+    // `OwningTask<T>` (Pattern B). §30.5 kind 1 makes no distinction between
+    // `Task<T>` and `OwningTask<T>` on the producer side — both are async
+    // producers whose non-`await` return of an owned expression establishes
+    // the task as the result's owner. The ownership semantics of the returned
+    // value are identical: both patterns deposit the value in the task's
+    // result slot and the task's teardown disposes it. The consumer-side
+    // difference (`await` on `OwningTask<T>` transfers ownership to the
+    // consumer; `await` on `Task<T>` borrows) does not affect the producer's
+    // disposal obligation. MEASURED (§30-AMENDED, 50x ASan): the same
+    // dispose-exactly-once invariant holds for both patterns. Pattern B's
+    // producer-side carve is therefore identical to Pattern A's.
+    //
+    // Scoped to an `isAsync_` body and a Task-family return-type head
+    // (`Task` or `OwningTask`) only.
     // // per §30.5, §28.3, §28.6
     if (isAsync_ && returnType_ &&
         returnType_->kind == ast::TypeKind::Named && returnType_->name &&
-        !returnType_->name->parts.empty() &&
-        returnType_->name->parts.front() == "Task")
-        return;
+        !returnType_->name->parts.empty()) {
+        auto& headSv = returnType_->name->parts.front();
+        if (headSv == "Task" || headSv == "OwningTask")
+            return;
+    }
     report(
         Severity::Error, e.span.begin,
         "cannot return an owned field's `move`d value through a non-`owned` "
