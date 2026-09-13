@@ -8109,6 +8109,24 @@ void MethodOwnership::handleReturn(const ast::Expr& e) {
             // in the #4180 fix commit body).
             if (st->state == OwnershipState::Borrowed) return;
         }
+        // fix #4352 (§28.2 / §28.3, v0.298): if the bare identifier is
+        // already in the Disposed state (an explicit `.Dispose()` ran first),
+        // `return x;` returns a null/dangling pointer — a use-after-free.
+        // markDisposedByName warns for a SECOND explicit `.Dispose()` call
+        // (the idempotent §28.2 discharge), but `return x;` is not a second
+        // dispose: it is a USE of the already-disposed variable. Error here,
+        // and poison the state so the rest of the analysis skips this variable.
+        if (auto* st = lookupState(id->name)) {
+            if (st->state == OwnershipState::Disposed) {
+                report(
+                    Severity::Error, id->span.begin,
+                    std::string("local `") + std::string(id->name) +
+                    "` is already disposed — returning it after `.Dispose()` "
+                    "is a use-after-free (§28.2 / §28.3)");
+                st->state = OwnershipState::Poisoned;
+                return;
+            }
+        }
         markDisposedByName(id->name, id->span.begin);
         return;
     }
