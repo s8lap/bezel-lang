@@ -12591,14 +12591,14 @@ void ExprTC::checkBuiltinCollectionCallArgs(const ast::CallExpr& ce) {
             m == "PopValue" || m == "TryPopValue"))
             return true;
         // Borrowing-only pos-0 mutators: plain `item: T`. The owning twins
-        // declare `owned item: T` and are gated out by name (the call-site
-        // `owned` modifier carries §22.3, not §7); the name gate also keeps
-        // the diagnostic precise if the caller forgets the marker.
-        // `Dictionary<K,V>.Add(key: K, value: V)` and `OwningDictionary<K,V>.
-        // Add(key: K, owned value: V)` declare a NON-nullable key at pos 0
-        // (the value at pos 1 is handled by isDictValuePosition below). The
-        // owning form's value arg carries the §22.3 `owned` modifier and is
-        // skipped by the modifier guard below.
+        // declare `owned item: T` and go through the same gate below (the
+        // call-site `owned` modifier carries §22.3, not §7 — but conformance
+        // is orthogonal to ownership transfer, and §5.1/§11.2 must still be
+        // checked; the name gate keeps the diagnostic precise if the caller
+        // forgets the marker).
+        // `Dictionary<K,V>.Add(key: K, value: V)` declares a NON-nullable key
+        // at pos 0 (the value at pos 1 is handled by isDictValuePosition
+        // below).
         // fix #3399 / stdlib §4.17 (v0.283): `SortedDictionary<K, V>` joins
         // them. It declares `public method Add(key: K, value: V);`
         // (Bezel_Standard_Library.md:3322) — added at v0.282 by proposal 0119,
@@ -12628,28 +12628,34 @@ void ExprTC::checkBuiltinCollectionCallArgs(const ast::CallExpr& ce) {
             // §11.2 conformance check (`checkAssignable`, the SAME call this
             // whole helper feeds) ever ran for `Array<T>.Add()`'s argument,
             // so a class that does not implement the element interface was
-            // silently accepted (measured, #4310/#4302). `OwningArray` is
-            // deliberately NOT added: its `Add(owned item: T)` carries the
-            // §22.3 `owned` modifier and is already skipped by the modifier
-            // guard above, exactly like `OwningDictionary`/`OwningSet`.
+            // silently accepted (measured, #4310/#4302).
+            // fix #4324: the owning twins (`OwningArray<T>.Add(owned item: T)`
+            // etc.) were excluded here for the same reason — their `owned`
+            // modifier was thought to put them past the modifier guard — but
+            // conformance is orthogonal to ownership transfer: the §5.1/§11.2
+            // check must still run regardless of §22.3, exactly as the general
+            // call path (`checkArgsAgainstParams`) proves by running both.
             (m == "Add"    && (colName == "Array" ||
-                               colName == "Set" || colName == "SortedSet" ||
+                               colName == "OwningArray" ||
+                               colName == "Set" || colName == "OwningSet" ||
+                               colName == "SortedSet" ||
                                colName == "LinkedList" ||
+                               colName == "OwningLinkedList" ||
                                colName == "Dictionary" ||
                                colName == "OwningDictionary" ||
                                colName == "SortedDictionary")) ||
             // stdlib §4.8/§4.9/§4.17 (v0.282, #3372): the dictionary family's
             // `TryAdd(key: K, ...)` declares the same NON-nullable key at pos 0
             // that its `Add` twin above does.
-            (m == "TryAdd" && (colName == "Set" || colName == "SortedSet" ||
+            (m == "TryAdd" && (colName == "Set" || colName == "OwningSet" ||
+                               colName == "SortedSet" ||
                                colName == "Dictionary" ||
                                colName == "OwningDictionary" ||
                                colName == "SortedDictionary")) ||
-            (m == "Push"      && colName == "Stack") ||
-            (m == "Enqueue"   && colName == "Queue") ||
-            (m == "AddFirst"  && colName == "LinkedList") ||
-            (m == "AddLast"   && colName == "LinkedList")))
-            return true;
+            (m == "Push"      && (colName == "Stack" || colName == "OwningStack")) ||
+            (m == "Enqueue"   && (colName == "Queue" || colName == "OwningQueue")) ||
+            (m == "AddFirst"  && (colName == "LinkedList" || colName == "OwningLinkedList")) ||
+            (m == "AddLast"   && (colName == "LinkedList" || colName == "OwningLinkedList")))) return true;
         // §7 / stdlib §4.14/§4.15 (#2600): span-buffer IndexOf/Contains declare
         // NON-nullable `value: T` at pos 0 for every span-buffer family EXCEPT
         // class-T Span/ReadOnlySpan (whose param is `value: T?` — handled by
@@ -12761,13 +12767,17 @@ void ExprTC::checkBuiltinCollectionCallArgs(const ast::CallExpr& ce) {
     auto isDictValuePosition = [&](std::size_t pos) -> bool {
         // stdlib §4.8/§4.17 (v0.282, #3372): the borrowing `TryAdd(key: K,
         // value: V)` declares the same non-nullable value slot `Add` does.
-        // OwningDictionary is still excluded — its value param is `owned`, so
-        // §22.3 governs it (see the comment block above).
+        // fix #4324: `OwningDictionary<K,V>.Add(key: K, owned value: V)` — the
+        // owned value V (pos 1) goes through here (its param type is valueTy,
+        // not itemTy); the key K (pos 0) goes through isItemPosition(0) with
+        // itemTy = K.
         return pos == 1 && valueTy &&
                ((m == "Add" && (colName == "Dictionary" ||
-                                colName == "SortedDictionary")) ||
+                                colName == "SortedDictionary" ||
+                                colName == "OwningDictionary")) ||
                 (m == "TryAdd" && (colName == "Dictionary" ||
-                                   colName == "SortedDictionary")));
+                                   colName == "SortedDictionary" ||
+                                   colName == "OwningDictionary")));
     };
 
     for (std::size_t i = 0; i < ce.args.size(); ++i) {
@@ -12775,11 +12785,10 @@ void ExprTC::checkBuiltinCollectionCallArgs(const ast::CallExpr& ce) {
         if (!a.value || a.isDiscard) continue;
         // §22.3: a `ref`/`out`/`owned`/`scoped` modifier aliases or transfers
         // the caller slot under its own rule and is not a §7 nullable->non-
-        // nullable conversion; skip. This is what excludes the owning family's
-        // `Add(owned item: T)` / `Push(owned item: T)` / `Insert(index,
-        // owned item: T)` / etc. — the caller writes the `owned` marker, and
-        // the parameter's nullability is governed by the §22.3 transfer rule.
-        if (!a.modifier.empty()) continue;
+        // nullable conversion; skip the nullability check below. (Conformance
+        // via `checkAssignable` is orthogonal to ownership transfer — fix
+        // #4324 adds the owning-family entries to `isItemPosition` so the
+        // conformance check still runs regardless of the modifier.)
         // §7 / stdlib §4.8 (#2592): pick the slot's DECLARED type — the
         // element/key type for every position this helper covered before, and
         // `V` for `Dictionary<K, V>.Add`'s value at pos 1.
