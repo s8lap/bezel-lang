@@ -388,7 +388,101 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 // plain lvalue path below.
                 if (auto* ix = dynamic_cast<const ast::IndexExpr*>(
                         as->target.get())) {
-                    llvm::Value* rhsOnce = lowerExpr(*as->value);
+                    llvm::Value* rhsOnce = nullptr;
+                    // fix #4345 (§5.1/§11.2/§15.4, v0.298): the indexer-setter
+                    // RHS lowering had NO case for a CollectionLiteralExpr at
+                    // all — `lowerExpr` returns null for one (§15.4, not a
+                    // general expression value), the assignment silently
+                    // degraded via the pre-existing #3025 backstop, and the
+                    // write never happened (a conforming-element
+                    // `h[0] := [new Widget3Ok(s)]` ran
+                    // `IndexOutOfRangeException` at the read because `_items`
+                    // stayed the constructor-time empty array). `fix #4316`
+                    // (the sema-side gate that admits the conforming program
+                    // and rejects the non-conforming twin with
+                    // "not implicitly convertible to the target type") left
+                    // this codegen arm unchanged, so the materialization gap
+                    // survived — this is the codegen half of that pair, in
+                    // the same file #4316 named in its filing. Mirror the
+                    // local-decl / return-stmt / field-init pattern: a literal
+                    // RHS targeting an INLINE-array property builds the
+                    // `[N x elem]` aggregate by-value; a literal targeting a
+                    // HEAP collection goes through
+                    // `materializeHeapCollectionLiteral` /
+                    // `materializeHeapDictLiteral`. Target type is read from
+                    // `ctx_.exprType(*as->target)` (the indexer element type,
+                    // e.g. `Array<IHolder>`) rather than the literal's own
+                    // `ctx_.exprType(*as->value)` — no #4310-family position
+                    // ever sets a literal's exprType, so it is null here
+                    // exactly as it was at every sibling materialization
+                    // site.
+                    if (auto* cl = dynamic_cast<
+                                const ast::CollectionLiteralExpr*>(
+                            as->value.get())) {
+                        const sema::TypeRef* idxTy =
+                            ctx_.exprType(*as->target);
+                        if (idxTy &&
+                            idxTy->kind == sema::TypeRef::Kind::InlineArray &&
+                            !cl->isDict) {
+                            if (auto* aty = llvm::dyn_cast<llvm::ArrayType>(
+                                    lowerTypeRef(idxTy))) {
+                                llvm::Type* elemTy = aty->getElementType();
+                                llvm::AllocaInst* tmp = entryAlloca(aty);
+                                for (std::size_t i = 0;
+                                     i < cl->elements.size(); ++i) {
+                                    if (!cl->elements[i]) continue;
+                                    llvm::Value* ev =
+                                        lowerExpr(*cl->elements[i]);
+                                    if (!ev) {
+                                        // #1386: a UNIT-typed element is not a
+                                        // lowering failure — same shared
+                                        // helper the local-decl / return-stmt
+                                        // / field-init sites call. Mirrors
+                                        // fix #3712 / #3714 / #4340's identical
+                                        // inline-array-element rescue.
+                                        ev = lowerCollectionLiteralElementOrUnitNull(
+                                            *cl->elements[i], elemTy);
+                                        if (!ev) {
+                                            ctx_.diagnostics().report(
+                                                Severity::Error,
+                                                cl->elements[i]->span.begin,
+                                                "internal: lowerExpr returned "
+                                                "null for indexer-setter "
+                                                "inline-array collection-literal "
+                                                "element — #1386");
+                                            continue;
+                                        }
+                                    }
+                                    if (ev->getType() != elemTy &&
+                                        ev->getType()->isIntegerTy() &&
+                                        elemTy->isIntegerTy()) {
+                                        unsigned eb =
+                                            ev->getType()->getIntegerBitWidth();
+                                        unsigned db =
+                                            elemTy->getIntegerBitWidth();
+                                        ev = db > eb
+                                                 ? builder_.CreateSExt(
+                                                       ev, elemTy)
+                                                 : builder_.CreateTrunc(
+                                                       ev, elemTy);
+                                    }
+                                    llvm::Value* gep = builder_.CreateGEP(
+                                        aty, tmp,
+                                        {builder_.getInt32(0),
+                                         builder_.getInt32((unsigned)i)});
+                                    builder_.CreateStore(ev, gep);
+                                }
+                                rhsOnce = builder_.CreateLoad(
+                                    aty, tmp, "ixset.inlarr");
+                            }
+                        } else if (idxTy && !cl->isDict) {
+                            rhsOnce = materializeHeapCollectionLiteral(
+                                cl, idxTy);
+                        } else if (idxTy && !cl->keys.empty()) {
+                            rhsOnce = materializeHeapDictLiteral(cl, idxTy);
+                        }
+                    }
+                    if (!rhsOnce) rhsOnce = lowerExpr(*as->value);
                     // fix #3025 (§28.9/§28.3, v0.240): this dedicated
                     // indexer-setter arm precedes #2961's generic assignment
                     // fallback, so its null RHS still returned silently. Keep
