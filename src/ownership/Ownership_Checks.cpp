@@ -5378,7 +5378,7 @@ bool MethodOwnership::isOwnedTrackedLocal(sema::Symbol* sym) const {
            it->second.state == OwnershipState::Owned;
 }
 
-// fix #4156 (§28.2 / §28.9, v0.294): see the header declaration for the full
+// fix #4156 (§28.2 / §28.3, v0.294): see the header declaration for the full
 // rationale. Sibling of isOwnedTrackedLocal, checking Disposed instead of
 // Owned.
 bool MethodOwnership::isDisposedTrackedLocal(sema::Symbol* sym) const {
@@ -5729,7 +5729,7 @@ sema::Symbol* MethodOwnership::borrowSourceForExpr(const ast::Expr& rhs) {
             // closure therefore borrows the record's carried source, and its
             // holder inherits the first still-live escape-bound one — so the
             // existing escape checks (the #861 outer-local store, the field /
-            // out-param store, the §28.9/§9.7 indirect return) diagnose a
+            // out-param store, the §28.3/§9.7 indirect return) diagnose a
             // record-capturing closure exactly as one capturing the source
             // directly. A record whose sources all outlive the frame (a
             // param-backed span) resolves nothing and adds no constraint.
@@ -5738,7 +5738,7 @@ sema::Symbol* MethodOwnership::borrowSourceForExpr(const ast::Expr& rhs) {
             // re-borrows its carried source the same way, so a lambda capturing
             // it contributes that source and the existing store/return escape
             // checks (the #861 outer-local store especially) fire with no
-            // further code. // per §9.7, §35.4, §28.9
+            // further code. // per §9.7, §35.4, §28.3
             if (sym) {
                 const sema::TypeRef* capTy = nullptr;
                 if (auto* ls = dynamic_cast<sema::LocalSymbol*>(sym))
@@ -5831,7 +5831,7 @@ void MethodOwnership::checkIndirectEscapeOnReturn(const ast::Expr& e) {
     //
     // Both are the same escape: returning the bare holder lets the carried borrow
     // outlive a source that is still a live scope-bound obligation at the return —
-    // an owned scope-bound local disposed at scope end (§28.9/§9.7) or a catch
+    // an owned scope-bound local disposed at scope end (§28.3/§9.7) or a catch
     // binding (§31.1). Mirror the single-source path's guard precisely: reject
     // only when a carried source is still a live escape-bound obligation (a
     // parameter or a returned-through source outlives the return and is NOT
@@ -5839,7 +5839,7 @@ void MethodOwnership::checkIndirectEscapeOnReturn(const ast::Expr& e) {
     // array, `var s := a.AsSpan();`, accepted), and only while the source's view-
     // window is open at the return. The diagnostic wording forks on the holder
     // kind (span / borrow-bearing record vs class-typed bare-T result).
-    // // per §28.3, §28.9, §9.7, §4.14, §4.15, v0.194, #1966
+    // // per §28.3, §9.7, §4.14, §4.15, v0.194, #1966
     if (sym) {
         const sema::TypeRef* holderTy = ctx_.exprType(e);
         const bool holderIsRecordOrSpan = isBorrowBearingRecordOrSpan(holderTy);
@@ -5928,7 +5928,7 @@ void MethodOwnership::checkIndirectEscapeOnReturn(const ast::Expr& e) {
     // diagnostic would have covered misuse); a catch binding is always live
     // within its arm.
     if (!isEscapeBoundLocal(st->source->sym)) {
-        // fix #4156 (§28.2 / §28.9, v0.294): the "already disposed ⇒ no live
+        // fix #4156 (§28.2 / §28.3, v0.294): the "already disposed ⇒ no live
         // borrow to dangle" premise just above is correct for a plain
         // re-borrow (a stale reference alias is a DIFFERENT, already-
         // diagnosed hazard — checkRead's own dominating-Dispose warning
@@ -5947,7 +5947,7 @@ void MethodOwnership::checkIndirectEscapeOnReturn(const ast::Expr& e) {
         // class-typed holder) or Shape 2's record construction. Severity
         // matches this function's OWN sibling arms (Error, not the §28.2
         // read-site Warning) — this is a completion of the ALREADY-Error
-        // §28.9 "captures an owned local whose source is disposed at scope
+        // §28.3 "captures an owned local whose source is disposed at scope
         // end" rule below (the `st.state == Owned` arm in
         // checkClosureEscapesOnReturn), not a new severity decision on the
         // separately-open §3975/§3979/§4023 question (which is about
@@ -6008,7 +6008,7 @@ void MethodOwnership::checkIndirectEscapeOnReturn(const ast::Expr& e) {
     // task;` (kind 2): there ownership of the source task transfers into the
     // outer task's chained slot, the outer task's teardown disposes it, and the
     // borrowed result therefore outlives this frame. "Bind the source in the
-    // caller's scope" is the §28.9/§9.7 advice for an ordinary aliasing value;
+    // caller's scope" is the §28.3/§9.7 advice for an ordinary aliasing value;
     // here it is both unnecessary (no caller-side change is needed) and
     // misleading (the caller cannot make a frame-local task outlive the frame).
     // Fork only the remedy clause — the "carries a borrow of X whose source is
