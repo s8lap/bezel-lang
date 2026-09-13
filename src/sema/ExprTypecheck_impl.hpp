@@ -1844,7 +1844,7 @@ private:
     // forbids cycles; sema's class-graph validation slice will catch
     // them). First match wins; ambiguity resolution between sibling
     // interfaces is a separate slice.
-    Symbol* lookupMember(TypeSymbol* type, std::string_view name);
+    Symbol* lookupMember(TypeSymbol* type, std::string_view name) const;
 
     // §26.5: extension-member lookup. Consulted ONLY when no instance member
     // matches (instance members win — an extension never shadows a real
