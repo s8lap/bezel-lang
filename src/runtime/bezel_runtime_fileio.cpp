@@ -416,7 +416,12 @@ struct bz_filestream_t {
     int32_t can_read;
     int32_t can_write;
     int32_t can_seek;
-    int32_t closed;     // 1 once the handle has been closed (idempotent dispose)
+    // fix #4357-sibling (spec §28.2 v0.298): the dispose guard. Atomic so a
+    // second Dispose() from a concurrent domain is safe — exchange(1) makes
+    // the second caller observe the prior close and bail (the same pattern
+    // as fix #706 / #4357). exchange(1) is set in bz_filestream_dispose and
+    // read everywhere else via the implicit conversion to int.
+    std::atomic<int32_t> closed{0};
     int32_t last_op;    // 0 = none, 1 = read, 2 = write (see bz_fs_switch_to)
 };
 
@@ -501,18 +506,22 @@ void* bz_filestream_open(const char* path_data, int64_t path_len,
 }
 
 // per stdlib §7.2 "Disposal (flush-on-dispose)": flush buffered writes and
-// release the OS file handle. Idempotent and null-tolerant — `using var` scope
-// exit and an explicit `Dispose()` reach the same code, and §28.2's
-// exactly-once rule must not turn a second arrival into a double fclose.
+// release the OS file handle. Idempotent — fix #4357-sibling adds the
+// `closed.exchange(1)` entry guard so a second arrival (explicit Dispose()
+// after `using var` scope exit, or a concurrent Dispose from another
+// domain) sees the prior close and returns without touching freed memory.
+// Without the guard, line 510 reads `fs->closed` from freed memory after
+// `free(fs)` at line 518 below, and `free(fs->path)` / `free(fs)` are a
+// double-free. Null-tolerant per the prior contract.
 void bz_filestream_dispose(void* h) {
     auto* fs = (bz_filestream_t*)h;
     if (!fs) return;
-    if (!fs->closed && fs->fp) {
+    if (fs->closed.exchange(1)) return;   // already disposed → no-op (fix #4357 sibling, §28.2)
+    if (fs->fp) {
         fflush(fs->fp);
         fclose(fs->fp);
     }
     fs->fp = nullptr;
-    fs->closed = 1;
     free(fs->path);
     fs->path = nullptr;
     free(fs);
