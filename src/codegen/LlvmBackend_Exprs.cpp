@@ -9094,10 +9094,10 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
             if (lIsPtr && rIsPtr) {
                 // Both pointer — compare normally (fall through).
             } else if (lIsPtr) {
-                // Left is ptr, right is non-ptr value — compare left to null.
-                llvm::Value* eq = builder_.CreateICmpEQ(
-                    l, llvm::ConstantPointerNull::get(ptrTy()));
-                return op == "=" ? eq : builder_.CreateNot(eq);
+                // Left is ptr (the null literal), right is non-ptr value type —
+                // the non-ptr value can never be null: `= null` is always false,
+                // `<> null` is always true. Same as the symmetric rIsPtr case.
+                return builder_.getInt1(op == "<>");
             } else if (rIsPtr) {
                 // Right is ptr (the null literal), left is non-ptr — non-ptr
                 // can never be null: = null is always false, <> null is true.
