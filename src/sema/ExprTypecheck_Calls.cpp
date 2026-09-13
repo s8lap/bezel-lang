@@ -21899,8 +21899,16 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
         // separate §22.12 "static member must be accessed through the type
         // name" gate, since `lookupMember` finds them as real symbols; §11.8
         // is not otherwise implicated by this widening.)
-        bool importedKnownCompleteUserType =
-            ctx_.isImported(targetType) && targetType->genericParams.empty();
+        // fix #2287 (§2.5 / §11.3 / §12.1, v0.298): remove the `genericParams.empty()`
+        // check. The §2.5 metadata for an imported generic class carries every
+        // exported member, so unknown-member rejection (§11.3 / §12.1) is sound —
+        // the prior carve-out was a hedge against incomplete metadata that is no
+        // longer warranted. With this change an imported generic type is treated as
+        // a known-complete user type, and an unknown member access on it emits the
+        // same "no member" error a local type would, rather than silently
+        // falling through to codegen's permissive-acceptance backstop (which would
+        // degrade the slot to zero-init and produce a garbage runtime value).
+        bool importedKnownCompleteUserType = ctx_.isImported(targetType);
         bool knownCompleteUserType =
             (targetType->decl != nullptr || importedKnownCompleteUserType) &&
             (targetType->kind == ast::TypeDeclKind::Class ||
