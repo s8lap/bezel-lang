@@ -3043,10 +3043,70 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(
                 lam.exprBody.get())) {
             if (sema::TypeRef* rt = ctx_.exprType(*lam.exprBody)) {
-                if (!cl->isDict)
-                    v = materializeHeapCollectionLiteral(cl, rt);
-                else
+                if (!cl->isDict) {
+                    // fix #4331 (§15.1 / §8.6, v0.298): an expression-bodied
+                    // lambda returning an inline array (`() -> [N]T`) was never
+                    // handled here — `materializeHeapCollectionLiteral` returns
+                    // null for inline arrays (they are not heap collections), and
+                    // `lowerExpr` returns null for `CollectionLiteralExpr`, so
+                    // `v` stayed null and the lambda emitted a null/zero inline
+                    // array return. Mirror the inline-array materialization logic
+                    // from `lowerReturnStmt` (LlvmBackend_Stmts.cpp lines ~2139-
+                    // 2190) and `lowerLocalDecl` (LlvmBackend_Setup.cpp lines
+                    // ~14581-14637): build the inline array on the stack and
+                    // return it by value.
+                    if (rt->kind == sema::TypeRef::Kind::InlineArray) {
+                        if (auto* aty = llvm::dyn_cast<llvm::ArrayType>(
+                                lowerTypeRef(rt))) {
+                            llvm::Type* elemTy = aty->getElementType();
+                            llvm::AllocaInst* tmp = entryAlloca(aty);
+                            for (std::size_t i = 0;
+                                 i < cl->elements.size(); ++i) {
+                                if (!cl->elements[i]) continue;
+                                llvm::Value* ev = lowerExpr(*cl->elements[i]);
+                                if (!ev) {
+                                    ev = lowerCollectionLiteralElementOrUnitNull(
+                                        *cl->elements[i], elemTy);
+                                    if (!ev) continue;
+                                }
+                                if (ev->getType() != elemTy &&
+                                    ev->getType()->isIntegerTy() &&
+                                    elemTy->isIntegerTy()) {
+                                    unsigned eb =
+                                        ev->getType()->getIntegerBitWidth();
+                                    unsigned db =
+                                        elemTy->getIntegerBitWidth();
+                                    ev = db > eb
+                                             ? builder_.CreateSExt(ev, elemTy)
+                                             : builder_.CreateTrunc(ev,
+                                                                    elemTy);
+                                }
+                                // fix #4331 / §8.6: box a value-typed (record)
+                                // element into its box representation before the
+                                // nullable-slot wrap below — mirrors the same
+                                // boxForTarget call in `lowerReturnStmt` (#4317)
+                                // and `lowerLocalDecl` (#4335). No-op for a class
+                                // element (already a bare pointer) or a
+                                // non-Object/interface element type.
+                                ev = boxForTarget(ev, rt->arrayElement,
+                                                  cl->elements[i].get());
+                                llvm::Value* gep = builder_.CreateGEP(
+                                    aty, tmp,
+                                    {builder_.getInt32(0),
+                                     builder_.getInt32((int)i)});
+                                // #813 / §15.1: wrap into the nullable-value
+                                // slot struct `{i8, T}` for a `[N]T?` literal.
+                                builder_.CreateStore(
+                                    coerceToNullableSlot(elemTy, ev), gep);
+                            }
+                            v = builder_.CreateLoad(aty, tmp, "lam.inlarr");
+                        }
+                    } else {
+                        v = materializeHeapCollectionLiteral(cl, rt);
+                    }
+                } else {
                     v = materializeHeapDictLiteral(cl, rt);
+                }
             }
         }
         if (!v) v = lowerExpr(*lam.exprBody);
