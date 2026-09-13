@@ -5365,6 +5365,10 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
     const bool wasRecordCallResultInitOutermost =
         recordCallResultInitOutermost_;
     recordCallResultInitOutermost_ = false;
+    // fix #4300: also save/clear the Class-with-Record-field flag.
+    const bool wasRecordCallResultInitOutermostClassWithRecordField =
+        recordCallResultInitOutermostClassWithRecordField_;
+    recordCallResultInitOutermostClassWithRecordField_ = false;
     // §22.16 (v0.250, #3038): `old(E)` inside an `ensures` clause. The
     // capture slot was allocated by `allocateOldCaptureSlots` and the
     // entry-time value was stored there by `captureOldOperands` (both
@@ -11794,8 +11798,18 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
         // LocalDecl's scope-end `recordStringFields Disposal` reclaims
         // the argument), and never true for the discarded/inline/arg
         // shapes the flag distinguishes.
+        // fix #4300 (§9.7 / §28.3 / §28.9, v0.298): also suppress for
+        // Class-typed locals (var outer: Widget2) whose call-init or
+        // declare-then-assign result is in classCallResultWithRecordFieldEligible_.
+        // The suppression is sound because the Class's own vtable-driven
+        // disposal (emitOwnedFieldDisposals / emitRecordStringFieldReleases
+        // from the class disposer cascade) reclaims the +1 on the string
+        // argument at the class instance's disposal — the Class twin of
+        // recordStringFields for a record-typed local.
         const bool suppressForCallResultClaim =
-            calleeMayAliasArg && wasRecordCallResultInitOutermost;
+            calleeMayAliasArg &&
+            (wasRecordCallResultInitOutermost ||
+             wasRecordCallResultInitOutermostClassWithRecordField);
         for (std::size_t ai = argOffset; ai < args.size() && ai < argExprs.size(); ++ai) {
             if (argExprs[ai] && isPlusOneStringProducer(argExprs[ai]) &&
                 !suppressForCallResultClaim)

@@ -991,6 +991,24 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
             } else if (as->op == ":=" &&
                 dynamic_cast<const ast::IdentifierExpr*>(as->target.get()) &&
                 localSlot(*as->target) != nullptr) {
+                // fix #4300: if this assignment targets a Class-with-Record/Choice-field
+                // local in classCallResultWithRecordFieldEligible_ and the RHS is a
+                // CallExpr, arm the suppression flag before lowering the call so
+                // lowerCallDispatch sees it at entry.
+                if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
+                        as->target.get())) {
+                    if (auto* loc = dynamic_cast<sema::LocalSymbol*>(
+                            ctx_.exprSymbol(*id))) {
+                        if (classCallResultWithRecordFieldEligible_.count(
+                                static_cast<const void*>(loc->decl))) {
+                            if (auto* call = dynamic_cast<const ast::CallExpr*>(
+                                    as->value.get())) {
+                                recordCallResultInitOutermostClassWithRecordField_ =
+                                    true;
+                            }
+                        }
+                    }
+                }
                 rhs = lowerExpr(*as->value);
                 rhs = rescueUnitAssignRhs(rhs, *as);
                 // fix #2961 (§28.9/§28.3, v0.240): the `:=` arms of lowerStmt
@@ -1030,6 +1048,22 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 addr = lvalueAddr(*as->target, elemTy);
                 if (!addr) return false;
             } else {
+                // fix #4300: arm suppression for Class-with-Record-field "declare,
+                // then assign" targets before lowering the call.
+                if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
+                        as->target.get())) {
+                    if (auto* loc = dynamic_cast<sema::LocalSymbol*>(
+                            ctx_.exprSymbol(*id))) {
+                        if (classCallResultWithRecordFieldEligible_.count(
+                                static_cast<const void*>(loc->decl))) {
+                            if (auto* call = dynamic_cast<const ast::CallExpr*>(
+                                    as->value.get())) {
+                                recordCallResultInitOutermostClassWithRecordField_ =
+                                    true;
+                            }
+                        }
+                    }
+                }
                 addr = lvalueAddr(*as->target, elemTy);
                 // fix #4045 (§28.3/§28.9, v0.294): the generic lvalueAddr
                 // fallback's null-address exit was silently dropping the write

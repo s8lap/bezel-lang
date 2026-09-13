@@ -251,6 +251,42 @@ inline bool calleeReturnMayAliasStringArgUnretained(
         elementMayEmbedStringArgUnretained(crt->arrayElement)) {
         return true;
     }
+    // fix #4300 (§9.7 / §28.3 / §28.9, v0.298): also return true when the
+    // callee returns a Class that has a Record/Choice field — the identical
+    // bare-store-with-no-retain shape exists one level deeper: the Class's
+    // constructor stores the +1 string argument into the Record/Choice field
+    // via raw slot store (emitRecordStringFieldStores / the NewExpr fast path),
+    // no retain call, so the Record/Choice field aliases the +1 argument.
+    // The Class's own disposal chain (emitOwnedFieldDisposals /
+    // emitRecordStringFieldReleases) reclaims it when the class is disposed.
+    if (crt && crt->kind == sema::TypeRef::Kind::Named && !crt->nullable &&
+        crt->declaration &&
+        crt->declaration->kind == ast::TypeDeclKind::Class) {
+        // crt->declaration is a sema::TypeSymbol*; use ts->decl to get the
+        // ast::TypeDecl* for member access.
+        if (auto* ts = dynamic_cast<const sema::TypeSymbol*>(crt->declaration)) {
+            if (auto* cd = dynamic_cast<const ast::TypeDecl*>(ts->decl)) {
+                for (const auto& mem : cd->members) {
+                    const auto* fd = dynamic_cast<const ast::FieldDecl*>(mem.get());
+                    if (!fd || !fd->type) continue;
+                    const sema::TypeRef* ftr = ctx.resolvedType(*fd->type);
+                    if (!ftr || ftr->kind != sema::TypeRef::Kind::Named ||
+                        !ftr->declaration)
+                        continue;
+                    // ftr->declaration is also a sema::TypeSymbol*; use ts->decl.
+                    if (auto* fts =
+                            dynamic_cast<const sema::TypeSymbol*>(ftr->declaration)) {
+                        if (auto* fdecl =
+                                dynamic_cast<const ast::TypeDecl*>(fts->decl)) {
+                            if (fdecl->kind == ast::TypeDeclKind::Record ||
+                                fdecl->kind == ast::TypeDeclKind::Choice)
+                                return true;
+                        }
+                    }
+                }
+            }
+        }
+    }
     return false;
 }
 
@@ -11341,6 +11377,22 @@ private:
     // the +1 producer argument — the pre-#4322 safe behaviour for those
     // shapes, with no leak.
     bool recordCallResultInitOutermost_ = false;
+
+    // fix #4300 (§9.7 / §28.3 / §28.9, v0.298): the Class-typed twin of
+    // the record-call-result suppression above. A `var outer: Widget2;`
+    // (Class with a Record field) assigned via `outer := Helper.Wrap(s)`
+    // must also suppress the caller's +1 argument release — the Class's
+    // own vtable-driven disposal (emitOwnedFieldDisposals /
+    // emitRecordStringFieldReleases from the class disposer cascade) is what
+    // reclaims the argument at the class instance's disposal, exactly as
+    // `recordStringFields` does for a record-typed local. Set by
+    // `lowerLocalDecl` for a Class-typed local in
+    // `classCallResultWithRecordFieldEligible_`, and separately by the
+    // AssignmentStmt arm of `collectRecordCallResultReleaseEligible` for a
+    // "declare, then assign" Class local.
+    std::unordered_map<const void*, const ast::AssignmentStmt*>
+        classCallResultWithRecordFieldEligible_;
+    bool recordCallResultInitOutermostClassWithRecordField_ = false;
 
     // fix #2448 / §9.7 / §28.9 (v0.235): is `expr` a provably fresh, alias-
     // free construction of EXACTLY record type `recTs`? See the definition

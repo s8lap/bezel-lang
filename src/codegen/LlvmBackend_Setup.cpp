@@ -14709,21 +14709,35 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
     // path introduces one).
     const bool savedRecordCallResultInitOutermost =
         recordCallResultInitOutermost_;
+    // fix #4342: arm the record-typed-local flag.
     if (init && currentFn_ == recordCallResultReleaseEligibleFn_ &&
         recordCallResultReleaseEligible_.count(
             static_cast<const void*>(declNode)) &&
         dynamic_cast<const ast::CallExpr*>(init)) {
         recordCallResultInitOutermost_ = true;
     }
+    // fix #4300: also arm the Class-with-Record/Choice-field flag for a
+    // Class-typed local in classCallResultWithRecordFieldEligible_ whose
+    // initializer is a CallExpr.
+    const bool savedRecordCallResultInitOutermostClassWithRecordField =
+        recordCallResultInitOutermostClassWithRecordField_;
+    if (init && currentFn_ == recordCallResultReleaseEligibleFn_ &&
+        classCallResultWithRecordFieldEligible_.count(
+            static_cast<const void*>(declNode)) &&
+        dynamic_cast<const ast::CallExpr*>(init)) {
+        recordCallResultInitOutermostClassWithRecordField_ = true;
+    }
     llvm::Value* v = init ? lowerExpr(*init) : nullptr;
     expectedFunctionType_ = savedExpectedForLambdaDecl;
-    // fix #4342: restore the flag (saved above) so a subsequent LocalDecl
+    // fix #4342: restore the flags (saved above) so a subsequent LocalDecl
     // in the same enclosing scope starts from the right state. The early-
     // return paths below — the `if (diverged_) return;` after the throw-
     // init divergence check, and the lambda-capture / disposal /
     // closureRelease paths further down — all run AFTER this point, so a
     // single restore here covers them all.
     recordCallResultInitOutermost_ = savedRecordCallResultInitOutermost;
+    recordCallResultInitOutermostClassWithRecordField_ =
+        savedRecordCallResultInitOutermostClassWithRecordField;
     // §9 / §9.1 (#1759): `var q := this` in a record method copies the record
     // value. `this` lowered to the receiver POINTER (CG29 / §9.2); load the
     // struct so the local holds a value-semantics copy, not the pointer bits — a
@@ -27914,6 +27928,39 @@ static bool isProvablyFreshImportedRecordFactoryMethod_(
     return true;
 }
 
+// fix #4300 (§9.7 / §28.3, v0.298): does Class type `ct` have at least one
+// field whose declared type is a Record or Choice? Such a class can carry a
+// string argument unretained into its record/choice field, and the class's
+// own vtable-driven disposal (emitOwnedFieldDisposals /
+// emitRecordStringFieldReleases from the class disposer cascade) is what
+// reclaims the argument at the class instance's disposal — the Class-typed
+// twin of the `isRecordWithStringFieldsTypeRef` check for records.
+static bool isClassWithRecordOrChoiceField(const ast::TypeDecl* ct,
+                                           sema::SemaContext& ctx_) {
+    if (!ct ||
+        ct->kind != ast::TypeDeclKind::Class)
+        return false;
+    for (const auto& mem : ct->members) {
+        const auto* fd = dynamic_cast<const ast::FieldDecl*>(mem.get());
+        if (!fd || !fd->type) continue;
+        const sema::TypeRef* ftr = ctx_.resolvedType(*fd->type);
+        if (!ftr || ftr->kind != sema::TypeRef::Kind::Named ||
+            !ftr->declaration)
+            continue;
+        // fix #4300: ftr->declaration is a sema::TypeSymbol*; use ts->decl
+        // to get the ast::TypeDecl* and check its kind.
+        if (auto* ts = dynamic_cast<const sema::TypeSymbol*>(ftr->declaration)) {
+            if (auto* memDecl =
+                    dynamic_cast<const ast::TypeDecl*>(ts->decl)) {
+                if (memDecl->kind == ast::TypeDeclKind::Record ||
+                    memDecl->kind == ast::TypeDeclKind::Choice)
+                    return true;
+            }
+        }
+    }
+    return false;
+}
+
 
 // fix #1747 / §28.9 / §9.7 / §28.3: walk the function body and classify
 // every plain-`var` record-call-result LocalDecl — a `var p := <call>` whose
@@ -27939,6 +27986,7 @@ void Emitter::collectRecordCallResultReleaseEligible(
         const std::vector<std::unique_ptr<ast::Stmt>>& body) {
     recordCallResultReleaseEligible_.clear();
     recordDeclareThenAssignSite_.clear();
+    classCallResultWithRecordFieldEligible_.clear();
     // fix #3436 (§21.1 / §9.7 / §28.9, v0.283): `const ast::Node*`, and the
     // declaration is read through the shared `Emitter::localDeclInitView` —
     // the single authority #3402 hoisted for exactly this split. The scan was
@@ -27983,6 +28031,9 @@ void Emitter::collectRecordCallResultReleaseEligible(
         bool soleAssignFresh = false;
     };
     std::unordered_map<const ast::Node*, NoInitAssignState> noInitDecls;
+    // fix #4300: parallel map for Class-with-Record/Choice-field locals.
+    std::unordered_map<const ast::Node*, NoInitAssignState>
+        noInitClassDecls;
 
     // fix #4266: the SAME freshness authorities the LocalDeclInitView
     // CallExpr/NewExpr arms below already call
@@ -28164,6 +28215,24 @@ void Emitter::collectRecordCallResultReleaseEligible(
                     if (const sema::TypeRef* tr = ctx_.resolvedType(*v.type)) {
                         if (isRecordWithStringFieldsTypeRef(tr))
                             noInitDecls[s].declaredType = tr;
+                        // fix #4300: also record Class-with-Record/Choice-field
+                        // locals for the "declare, then assign" path.
+                        if (tr->kind == sema::TypeRef::Kind::Named &&
+                            !tr->nullable &&
+                            tr->declaration &&
+                            tr->declaration->kind == ast::TypeDeclKind::Class) {
+                            // fix #4300: tr->declaration is a sema::TypeSymbol; cast
+                            // to TypeSymbol* and use ts->decl to get the ast::TypeDecl*.
+                            if (auto* ts = dynamic_cast<const sema::TypeSymbol*>(
+                                    tr->declaration)) {
+                                if (auto* cd = dynamic_cast<const ast::TypeDecl*>(
+                                        ts->decl)) {
+                                    if (isClassWithRecordOrChoiceField(cd, ctx_)) {
+                                        noInitClassDecls[s].declaredType = tr;
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -28198,6 +28267,38 @@ void Emitter::collectRecordCallResultReleaseEligible(
                                 // assignments follow.
                                 st.soleAssign = nullptr;
                                 st.soleAssignFresh = false;
+                            }
+                        }
+                        // fix #4300: "declare, then assign" for Class-with-Record-field.
+                        auto it2 = noInitClassDecls.find(loc->decl);
+                        if (it2 != noInitClassDecls.end()) {
+                            NoInitAssignState& st2 = it2->second;
+                            st2.assignCount++;
+                            if (st2.assignCount == 1) {
+                                st2.soleAssign = as2;
+                                // fix #4300 (corrected): unconditionally admit
+                                // Class-with-Record/Choice-field locals for
+                                // "declare, then assign" from ANY CallExpr. The
+                                // calleeReturnMayAliasStringArgUnretained check
+                                // used for Record/Choice locals is inapplicable
+                                // here (it returns false for Class return types
+                                // even when the Class has Record/Choice fields).
+                                // The Class's own vtable-driven disposal chain
+                                // (emitOwnedFieldDisposals /
+                                // emitRecordStringFieldReleases) is what
+                                // reclaims the callee-minted +1 string at the
+                                // class instance's disposal time; the admission
+                                // here is solely to set the suppression flag in
+                                // lowerAssignment so lowerCallDispatch skips the
+                                // caller's premature +1 release. Over-admission
+                                // leaks (safe default); under-admission causes
+                                // UAF (unsafe). The StringEscapeWalker later
+                                // classifies the local's escape behaviour for
+                                // the disposal-side string release.
+                                st2.soleAssignFresh = true;
+                            } else {
+                                st2.soleAssign = nullptr;
+                                st2.soleAssignFresh = false;
                             }
                         }
                     }
@@ -28235,6 +28336,17 @@ void Emitter::collectRecordCallResultReleaseEligible(
             candidates.push_back(kv.first);
             recordDeclareThenAssignSite_[static_cast<const void*>(kv.first)] =
                 st.soleAssign;
+        }
+    }
+
+    // fix #4300: admit Class-with-Record/Choice-field "declare, then assign"
+    // candidates using the parallel map.
+    for (const auto& kv : noInitClassDecls) {
+        const NoInitAssignState& st2 = kv.second;
+        if (st2.assignCount == 1 && st2.soleAssignFresh && st2.soleAssign) {
+            candidates.push_back(kv.first);
+            classCallResultWithRecordFieldEligible_
+                [static_cast<const void*>(kv.first)] = st2.soleAssign;
         }
     }
 
