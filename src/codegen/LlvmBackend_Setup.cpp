@@ -14618,6 +14618,43 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
                         continue;
                     }
                 }
+                // fix #4335 / #4317 (§15.1 / §8.6, v0.298): the 4th of
+                // #4317's four inline-array store call sites — the
+                // LocalDecl-init branch here in `lowerLocalDecl`, the only
+                // one held back from that commit because this file was held
+                // for other concurrent work (#4315/#4322). Mirror the three
+                // Stmts.cpp sites: box a value-typed (record) element into
+                // its box representation before the store below. `declType`
+                // is the DECLARED local type; for an `[N]IHolder`-typed
+                // local this resolves to the `InlineArray` TypeRef whose
+                // `arrayElement` is the interface `IHolder` — exactly the
+                // `declTy` boxForTarget needs to classify an interface
+                // target. The inference fallback (`declType == nullptr`,
+                // `arrTy` derived from the first element) has no sema
+                // TypeRef to hand; `nullptr` is the safe no-op per
+                // boxForTarget's own guard (returns v unchanged on a null
+                // declTy) — and an *inferred* array type could not have
+                // deduced an interface element from a `new RecHolder(...)`
+                // first element in the first place, so the only case that
+                // matters (the declared-element-type case) is covered.
+                // boxForTarget is a no-op for a CLASS element (already a
+                // bare pointer, isBoxableValueType false) and for any
+                // non-Object/interface element type, so every
+                // already-working shape is unaffected — see the
+                // `*_class_element_unaffected_control` rows in #4317's
+                // test file (the analogous `local_decl_*` row that would
+                // have detected this exact gap was deliberately omitted
+                // there, with a `NOT FIXED HERE` header note naming it).
+                {
+                    const sema::TypeRef* arrSemaTy =
+                        declType ? ctx_.resolvedType(*declType) : nullptr;
+                    const sema::TypeRef* elemSemaTy =
+                        (arrSemaTy &&
+                         arrSemaTy->kind == sema::TypeRef::Kind::InlineArray)
+                            ? arrSemaTy->arrayElement
+                            : nullptr;
+                    ev = boxForTarget(ev, elemSemaTy, cl->elements[i].get());
+                }
                 // Coerce element to the array's element type if needed.
                 if (ev->getType() != elemTy) {
                     if (ev->getType()->isIntegerTy() && elemTy->isIntegerTy()) {
