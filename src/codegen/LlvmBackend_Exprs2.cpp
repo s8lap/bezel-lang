@@ -3709,6 +3709,20 @@ llvm::Value* Emitter::lowerWith(const ast::WithExpr& we) {
                         materializeCollectionLiteralForArg(cl, fldTy)) {
                     llvm::Value* fslot =
                         builder_.CreateStructGEP(st, base, idxIt->second);
+                    // fix #4350 / §28.9 / §21.1: the freshly-materialized heap
+                    // collection is stored into the result record's field. The
+                    // result record is a value type returned by `lowerWith` and
+                    // has no Dispose method (records are borrow-only for heap
+                    // collection fields — §9.7 "no disposer"); without this
+                    // registration the bz_array_t (and its backing for a
+                    // Dictionary) leaks. Register the disposal at the current
+                    // scope: create a shadow alloca holding the pointer so the
+                    // disposeStack_ entry is valid at scope-end emission.
+                    llvm::AllocaInst* shadow = entryAlloca(heapArr->getType());
+                    builder_.CreateStore(heapArr, shadow);
+                    if (!disposeStack_.empty())
+                        disposeStack_.back().push_back(
+                            buildCollectionTempDisposal(shadow, fldTy));
                     builder_.CreateStore(heapArr, fslot);
                     continue;  // field handled — skip the lowerExpr path below
                 }

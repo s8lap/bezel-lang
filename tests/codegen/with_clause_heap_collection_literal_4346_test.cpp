@@ -74,11 +74,20 @@
 #include "llvm/IR/Module.h"
 
 using bezel::test::runAot;
+using bezel::test::runAotChecked;
 
 namespace {
 
 int run(const std::string& src) {
     auto r = runAot(src);
+    return r.ran ? r.exitCode : -999;
+}
+
+// LSan-clean oracle: ASan/LSan-instrumented generated code. A leak of the
+// heap-collection literal's bz_array_t (and backing) shows up as a non-zero
+// exitCode with LeakSanitizer in the report text.
+int runChecked(const std::string& src) {
+    auto r = runAotChecked(src);
     return r.ran ? r.exitCode : -999;
 }
 
@@ -223,4 +232,41 @@ BEZEL_TEST(with_heap_collection_literal_4346,
         "  var r2 := r with(A := [1, 2, 9]); "
         "  return r2.A[0] + r2.A[1] + r2.A[2]; "
         "end Main; end C;"), 12);
+}
+
+// ── #4350 regression: heap-collection literal in with-expression leaks ────────
+//
+// fix #4350 / §28.9 / §21.1 / §9.5: a `with(Items := [...])` on a record
+// with a heap-collection field materializes the replacement array (fix #4346),
+// stores the pointer into the result record's `Items` slot, and returns the
+// result record by value. Records have no Dispose method (§9.7: "no disposer");
+// the result record is a bare value type with no scope-end disposal walk of its
+// field slots. Without the fix, the materialized bz_array_t (and its backing
+// allocation) leaks — measured as 56 bytes / 1 allocation (direct) + 64 bytes /
+// 1 allocation (indirect / backing) under LSan.
+//
+// The fix (LlvmBackend_Exprs2.cpp lowerWith): after materializing the heap
+// collection and storing the pointer into the result record's field slot,
+// also create a shadow alloca and register it on the disposeStack_ so the
+// scope-end disposal emits a bz_array_free call for the materialized collection.
+// This mirrors the pattern that every other heap-collection materialization site
+// (LocalDecl, FieldDecl, call-arg, return) already follows.
+//
+// This test uses runChecked (ASan+LSan): the leak manifests as a non-zero exit
+// code with a LeakSanitizer report. Before the fix: LSan reports 120 bytes
+// leaked in 2 allocations. After the fix: clean exit 0.
+BEZEL_TEST(with_heap_collection_literal_4346,
+           heap_collection_literal_disposed_at_scope_end_4350) {
+    BEZEL_EXPECT_EQ(runChecked(
+        "module M; "
+        "import System.Collections.Generic; "
+        "record R(Items: Array<int>); "
+        "class C "
+        "  public static method Main(): int "
+        "    var items1: Array<int> := [1, 2, 3]; "
+        "    var b1 := new R(items1); "
+        "    var b2 := b1 with(Items := [4, 5, 6]); "
+        "    return b2.Items[0]; "
+        "  end Main; "
+        "end C;"), 4);
 }
