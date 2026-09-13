@@ -5272,12 +5272,16 @@ bool ExprTC::isThisRootedLValueTarget(const ast::Expr& target) const {
     // PostfixBangExpr) to find the chain's base — same shape as
     // checkLValueChainNotCallBased above.
     const ast::Expr* e = &target;
+    const ast::Expr* parent = nullptr;
     for (;;) {
         if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(e)) {
+            parent = ma;
             e = ma->target.get();
         } else if (auto* ix = dynamic_cast<const ast::IndexExpr*>(e)) {
+            parent = ix;
             e = ix->target.get();
         } else if (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(e)) {
+            parent = pb;
             e = pb->operand.get();
         } else {
             break;
@@ -5288,7 +5292,22 @@ bool ExprTC::isThisRootedLValueTarget(const ast::Expr& target) const {
     // the bare implicit-this spelling.
     auto* id = dynamic_cast<const ast::IdentifierExpr*>(e);
     if (!id) return false;
-    if (id->name == "this") return true;
+    if (id->name == "this") {
+        // fix #4297 (§22.8/§23.1, v0.298): the bare-identifier branch
+        // already checks `fs->parent == currentType_` (the member's
+        // declaring type). The explicit `this.F` spelling must consult the
+        // SAME fact — but the chain base is the IdentifierExpr "this",
+        // not "F", so we look at the parent MemberAccessExpr to get the
+        // member name and resolve it through the current type.
+        if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(parent)) {
+            Symbol* sym = lookupMember(currentType_, ma->member);
+            if (auto* fs = dynamic_cast<FieldSymbol*>(sym))
+                return fs->parent == currentType_;
+            if (auto* ps = dynamic_cast<PropertySymbol*>(sym))
+                return ps->parent == currentType_;
+        }
+        return true;
+    }
     // Bare implicit-this: the identifier resolves to a FieldSymbol or
     // PropertySymbol whose parent is the current type — the §22.8
     // in-scope spelling. Both spellings are the same store (§2.7);
@@ -5403,8 +5422,11 @@ void ExprTC::checkReadonlyAssignment(const ast::AssignmentStmt& as) {
         // R's own constructor cannot write another R's positional
         // storage through `r.X := e` (a same-instance aliasing write
         // through read-only storage the previous fix left open).
+        //
+        // fix #4297 (§9.1/§22.8, v0.298): `isThisRootedLValueTarget`
+        // now checks `fs->parent == currentType_` internally, so this
+        // call site no longer carries the redundant conjunct.
         bool inDeclaringCtor = inConstructor_ &&
-                               currentType_ == fs->parent &&
                                isThisRootedLValueTarget(*as.target);
         if (!inDeclaringCtor) {
             std::string nm = std::string(fs->name);
@@ -5447,6 +5469,9 @@ void ExprTC::checkReadonlyAssignment(const ast::AssignmentStmt& as) {
     // spellings of the same store disagreed). `currentType_ == fs->parent`
     // makes the explicit spelling consult the SAME fact the bare spelling
     // already does, rather than duplicating a second, narrower one.
+    // fix #4297 (§22.8, v0.298) folds `currentType_ == fs->parent` into
+    // `isThisRootedLValueTarget` itself, so this call site no longer
+    // carries the redundant conjunct.
     // fix #4290 (§17.6/§22.8, v0.298): the carve-out and readonly-modifier
     // check below are extracted into `checkReadonlyFieldWriteTarget` — the
     // same shared-authority shape #2868 already used for
@@ -5500,7 +5525,7 @@ void ExprTC::checkReadonlyFieldWriteTarget(const ast::Expr& target,
         for (auto mod : fs->modifiers)
             if (mod == "static") { isStatic = true; break; }
         if (isStatic ||
-            (currentType_ == fs->parent && isThisRootedLValueTarget(target)))
+            isThisRootedLValueTarget(target))
             return;
     }
     // §22.8 (#747 R42): a readonly field may be assigned only in a field
@@ -5748,14 +5773,14 @@ void ExprTC::checkPropertyWriteTarget(const ast::Expr& target,
         // record that the ONCE-NESS counting rule deliberately does not
         // extend to auto-properties — only the WHERE (declaring-type)
         // rule is fixed here, which #4275's same-class shape already
-        // satisfies (`currentType_ == ps->parent` holds there).
+        // satisfies. fix #4297 (§23.1, v0.298) folds `ps->parent ==
+        // currentType_` into `isThisRootedLValueTarget` itself.
         bool propIsStatic = false;
         for (auto mod : pd->modifiers)
             if (mod == "static") { propIsStatic = true; break; }
         bool readonlyAllowed;
         if (propIsStatic) readonlyAllowed = inConstructor_;
-        else readonlyAllowed = inConstructor_ && currentType_ == ps->parent &&
-                                isThisRootedLValueTarget(target);
+        else readonlyAllowed = inConstructor_ && isThisRootedLValueTarget(target);
         if (!hasSetter) {
             // #2851: `propName` is empty for an indexer (its symbol name is
             // the synthetic ".this"), so name the construct rather than
@@ -6077,7 +6102,6 @@ void ExprTC::checkRefOutFieldOperand(FieldSymbol& fs, const ast::Expr& target,
     if (fs.posParam && fs.parent &&
         fs.parent->kind == ast::TypeDeclKind::Record) {
         bool inDeclaringCtor = inConstructor_ &&
-                               currentType_ == fs.parent &&
                                isThisRootedLValueTarget(target);
         if (!inDeclaringCtor) {
             ctx_.diagnostics().report(
@@ -6104,14 +6128,13 @@ void ExprTC::checkRefOutFieldOperand(FieldSymbol& fs, const ast::Expr& target,
     // branch does not check the field's declaring type, so a DERIVED
     // class's constructor could bind an INHERITED readonly field to a
     // `ref`/`out` parameter via `this.F` while the bare spelling of the
-    // identical store was already rejected. `currentType_ == fs.parent`
-    // closes the same gap here, matching the positional-record branch
-    // above which already carries this exact check.
+    // identical store was already rejected. fix #4297 (§22.3/§22.8, v0.298)
+    // folds `currentType_ == fs.parent` into `isThisRootedLValueTarget`
+    // itself, so this call site no longer carries the redundant conjunct.
     if (isReadonly) {
         bool readonlyAllowed;
         if (isStatic) readonlyAllowed = inConstructor_;
-        else readonlyAllowed = inConstructor_ && currentType_ == fs.parent &&
-                                isThisRootedLValueTarget(target);
+        else readonlyAllowed = inConstructor_ && isThisRootedLValueTarget(target);
         if (!readonlyAllowed) {
             ctx_.diagnostics().report(
                 Severity::Error, target.span.begin,
@@ -6317,17 +6340,17 @@ void ExprTC::checkRefOutPropertyOperand(PropertySymbol& ps,
     // case as open).
     //
     // fix #4276 (§22.3 / §23.1, v0.298): the ref/out twin of
-    // `checkPropertyWriteTarget`'s same-numbered fix — `currentType_ ==
-    // ps.parent` closes the identical declaring-type gap for a `ref`/
-    // `out` binding of an INHERITED readonly auto-property.
+    // `checkPropertyWriteTarget`'s same-numbered fix. fix #4297
+    // (§22.3/§23.1, v0.298) folds `currentType_ == ps.parent` into
+    // `isThisRootedLValueTarget` itself, so this call site no longer
+    // carries the redundant conjunct.
     if (isReadonlyAuto) {
         bool propIsStatic = false;
         for (auto mod : pd->modifiers)
             if (mod == "static") { propIsStatic = true; break; }
         bool readonlyAllowed;
         if (propIsStatic) readonlyAllowed = inConstructor_;
-        else readonlyAllowed = inConstructor_ && currentType_ == ps.parent &&
-                                isThisRootedLValueTarget(target);
+        else readonlyAllowed = inConstructor_ && isThisRootedLValueTarget(target);
         if (!readonlyAllowed) {
             ctx_.diagnostics().report(
                 Severity::Error, target.span.begin,
@@ -6374,7 +6397,7 @@ void ExprTC::checkRefOutPropertyOperand(PropertySymbol& ps,
 // forbids cycles; sema's class-graph validation slice will catch
 // them). First match wins; ambiguity resolution between sibling
 // interfaces is a separate slice.
-Symbol* ExprTC::lookupMember(TypeSymbol* type, std::string_view name) {
+Symbol* ExprTC::lookupMember(TypeSymbol* type, std::string_view name) const {
     std::vector<TypeSymbol*> frontier{type};
     std::size_t i = 0;
     while (i < frontier.size()) {

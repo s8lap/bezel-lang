@@ -221,6 +221,50 @@ BEZEL_TEST(readonly_derived_ctor_reassignment_4276,
     BEZEL_EXPECT_TRUE(diagContains(r, "§23.1"));
 }
 
+// fix #4290 (§17.6/§22.8, v0.298): `checkReadonlyFieldWriteTarget` now
+// gates field `++`/`--` (the same shared-authority shape the property
+// `++` test above exercises). These rows are the FIELD twin of that
+// test — the issue comment on #4297 noted that the property `++` row
+// existed but no field `++` twin had been written. Both spellings of
+// the same store are pinned here (explicit `this._n++` and bare `_n++`).
+BEZEL_TEST(readonly_derived_ctor_reassignment_4276,
+           derived_ctor_this_dot_increments_inherited_readonly_field_rejected_spec_17_6_22_8) {
+    auto r = runAot(
+        "module M; "
+        "class Base "
+        "  protected readonly _n: int := 1; "
+        "end Base; "
+        "class Derived: Base "
+        "  public constructor() "
+        "    this._n++; "
+        "  end constructor; "
+        "end Derived; "
+        "class C public static method Main(): int return 0; end Main; end C;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagContains(r, "cannot increment/decrement readonly field `_n`"));
+    BEZEL_EXPECT_TRUE(diagContains(r, "§17.6"));
+    BEZEL_EXPECT_TRUE(diagContains(r, "§22.8"));
+}
+
+BEZEL_TEST(readonly_derived_ctor_reassignment_4276,
+           derived_ctor_bare_increments_inherited_readonly_field_rejected_spec_17_6_22_8) {
+    auto r = runAot(
+        "module M; "
+        "class Base "
+        "  protected readonly _n: int := 1; "
+        "end Base; "
+        "class Derived: Base "
+        "  public constructor() "
+        "    _n++; "
+        "  end constructor; "
+        "end Derived; "
+        "class C public static method Main(): int return 0; end Main; end C;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagContains(r, "cannot increment/decrement readonly field `_n`"));
+    BEZEL_EXPECT_TRUE(diagContains(r, "§17.6"));
+    BEZEL_EXPECT_TRUE(diagContains(r, "§22.8"));
+}
+
 // =====================================================================
 // ACCEPT controls (LANE_RULES §15) — the legal shapes adjacent to what is
 // now rejected must keep compiling, AND keep producing the correct
