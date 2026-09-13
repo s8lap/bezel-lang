@@ -3629,6 +3629,31 @@ llvm::Value* Emitter::lowerWith(const ast::WithExpr& we) {
                 }
             }
         }
+        // fix #4346 / §15.4 / §9.5: a `with`-replacement value that is a
+        // collection literal `[e1, …]` targeting a HEAP-COLLECTION field
+        // (`Array<T>`, `Dictionary<K,V>`, etc.). lowerExpr returns null for
+        // CollectionLiteralExpr, so the plain `lowerExpr` + `if (!v) continue`
+        // below hit the #1386 backstop and ICEd. Mirror the LocalDecl /
+        // FieldDecl / ReturnStmt / call-arg paths: materialize a fresh
+        // `bz_array_t*` (or `bz_dict_t*`) and store the pointer into the
+        // field slot. The source record is unmodified and still owns its own
+        // collection — the new record owns the freshly-materialized one —
+        // so no dispose-old is needed here (the new slot's ownership is
+        // established when we store the new pointer; the source's collection
+        // outlives the with-expression because nothing has touched it).
+        if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(
+                a.value.get())) {
+            const sema::TypeRef* fldTy = recordMemberTypeResolved(m);
+            if (fldTy) {
+                if (llvm::Value* heapArr =
+                        materializeCollectionLiteralForArg(cl, fldTy)) {
+                    llvm::Value* fslot =
+                        builder_.CreateStructGEP(st, base, idxIt->second);
+                    builder_.CreateStore(heapArr, fslot);
+                    continue;  // field handled — skip the lowerExpr path below
+                }
+            }
+        }
         llvm::Value* v = lowerExpr(*a.value);
         if (!v) {
             // #1386: ICE — lowerExpr returned null for a with-expression field
