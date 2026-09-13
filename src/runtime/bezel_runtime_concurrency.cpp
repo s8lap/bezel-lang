@@ -2574,8 +2574,12 @@ void* bz_channel_new(void (*dispose_elem)(void*), int64_t capacity) {
 // bz_channel_sender_t -- a minted sender handle (§30.15 NewSender).
 // Each handle increments the channel's sender_count; releasing the last one
 // closes the channel.
+// released flag: set atomically by bz_channel_sender_release so concurrent
+// release from two domains (or a misuse-driven double release) is safe
+// (§28.2 / #4357 sibling — TOCTOU UAF/double-free on second release).
 struct bz_channel_sender_t {
     bz_channel_t* ch;
+    std::atomic<bool> released{false};
 };
 
 extern "C"
@@ -3087,10 +3091,18 @@ static void channel_close_and_drain_pending(bz_channel_t* ch,
 // sender, close the channel. cce_vtable is the ChannelClosedException vtable.
 // per fix #634: also drops the sender's core_refs reference so the channel
 // core can be freed when Channel.Dispose has already run.
+// Idempotency: tx->released is set atomically so a second release (whether
+// concurrent from two domains or a misuse-driven double release via a stale
+// pointer) is a no-op — without this guard the second arrival would
+// dereference tx->ch after `delete tx` (UAF), decrement ch->sender_count
+// on a freed/reused channel, and double-free the channel core via
+// channel_close_and_drain_pending / channel_core_release (#4357 sibling,
+// §28.2).
 extern "C"
 void bz_channel_sender_release(void* txp, void* cce_vtable) {
     if (!txp) return;
     auto* tx = (bz_channel_sender_t*)txp;
+    if (tx->released.exchange(true)) return;  // already released → no-op
     bz_channel_t* ch = tx->ch;
     delete tx;
 
