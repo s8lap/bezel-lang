@@ -13468,24 +13468,86 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
     // MemberAccessExpr.  Read it here to set up genericSubst_/
     // genericSubstSemaTy_ so that emitInlineGenericMethod specialises the body
     // with the correct concrete types (replacing the i32 placeholder).
+    //
+    // fix #4293 (§26.4 / §26.5 / §14.1, v0.298): the sema binding covers the
+    // EXTENSION's free type variables only — for `extension Box<W>` matching a
+    // `Box<string>` receiver the binding has `{W → string}`. The body may also
+    // REFERENCE THE RECEIVER CLASS'S OWN free variables through `this` —
+    // `this._v` where `_v: U` reads `_v`'s storage as type `U`. Without a
+    // binding for `U` in `genericSubst_`, `lowerTypeRef` on `U` falls through
+    // to the i32 placeholder (§14.1 placeholder lowering), so a value-typed
+    // receiver's field load reads 4 bytes of the wrong slot (silent "0" output,
+    // the int shape of the issue) and a reference-typed receiver's load reads
+    // half of a 64-bit pointer into a GEP operand — IR-verifier crash
+    // (`GEP base pointer is not a vector or a vector of pointers`, the string
+    // shape). Compose the receiver CLASS's free var binding from
+    // `recvTy->genericArgs` against `recvTy->declaration->genericParams` so
+    // `this.<field-of-class>` lowers through the same monomorphized layout the
+    // exclusive-class-method call site installs at L10958. The two name spaces
+    // (`W` vs `U` in the issue, identical names in #4233's `Bag<T>` test) do
+    // not collide — the class binding is added only for names the extension
+    // binding has not already set, so a same-name both-spellings case keeps
+    // the extension's value (the receiver's actual concrete type for that
+    // exactly-once substitution).
     if (!isStaticMethod(ms) && !ms->parent && ms->extensionDecl) {
         if (auto* callMa = dynamic_cast<const ast::MemberAccessExpr*>(
                 call.callee.get())) {
+            std::unordered_map<std::string_view, llvm::Type*> newSubst;
+            std::unordered_map<std::string_view,
+                               const sema::TypeRef*> newSema;
             if (const auto* bnd = ctx_.exprExtBinding(*callMa)) {
-                if (!bnd->empty()) {
-                    std::unordered_map<std::string_view, llvm::Type*> newSubst;
-                    std::unordered_map<std::string_view,
-                                       const sema::TypeRef*> newSema;
-                    for (const auto& [nm, ty] : *bnd) {
-                        if (!ty) continue;
-                        newSubst[nm] = lowerTypeRef(ty);
-                        newSema[nm] = ty;
-                    }
-                    if (!newSubst.empty()) {
-                        genericSubst_ = std::move(newSubst);
-                        genericSubstSemaTy_ = std::move(newSema);
+                for (const auto& [nm, ty] : *bnd) {
+                    if (!ty) continue;
+                    newSubst[nm] = lowerTypeRef(ty);
+                    newSema[nm] = ty;
+                }
+            }
+            // fix #4293 (cont.): bind the receiver CLASS's free variables from
+            // the receiver's actual genericArgs. `callMa->target` is the
+            // receiver expression (`b` in `b.Peek()`); its exprType is the
+            // concrete instantiation (`Box<string>`). Compose those args
+            // against the receiver class's parameter NAMES (which differ from
+            // the extension's free var names — `U` vs `W` — so this never
+            // collides with the extension binding above). An empty `genericArgs`
+            // (a non-generic receiver) is the 0 == 0 case and contributes
+            // nothing, exactly as the class-method call-site binding at L10958
+            // does. Without this, every user-declared generic-class extension
+            // method that returned its free var through `this.<receiver_field>`
+            // either printed the i32-placeholder value or crashed the IR
+            // verifier — measured on `Box<string>` / `Box<int>` reproducers.
+            if (const ast::Expr* recvExpr = callMa->target.get()) {
+                if (sema::TypeRef* recvTy = ctx_.exprType(*recvExpr)) {
+                    if (recvTy->kind == sema::TypeRef::Kind::Named &&
+                        recvTy->declaration &&
+                        !recvTy->genericArgs.empty()) {
+                        const std::vector<std::string_view> clsParams =
+                            sema::genericParamNames(recvTy->declaration);
+                        if (clsParams.size() == recvTy->genericArgs.size()) {
+                            for (std::size_t gi = 0; gi < clsParams.size();
+                                 ++gi) {
+                                const std::string_view pn = clsParams[gi];
+                                // Skip names the extension binding already
+                                // populated — they describe the SAME spelling
+                                // for the SAME instantiation, but the
+                                // extension's value is the concrete matched
+                                // ancestor's arg (e.g. `W → string` from
+                                // `Box<string>`); the receiver-class arg is
+                                // exactly that value too, but the extension
+                                // was bound first and we keep its entry.
+                                if (newSubst.count(pn)) continue;
+                                const sema::TypeRef* arg =
+                                    recvTy->genericArgs[gi];
+                                if (!arg) continue;
+                                newSubst[pn] = lowerTypeRef(arg);
+                                newSema[pn] = arg;
+                            }
+                        }
                     }
                 }
+            }
+            if (!newSubst.empty()) {
+                genericSubst_ = std::move(newSubst);
+                genericSubstSemaTy_ = std::move(newSema);
             }
         }
     }
