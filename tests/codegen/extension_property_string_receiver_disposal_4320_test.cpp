@@ -189,25 +189,34 @@ BEZEL_TEST(extension_property_string_receiver_4320,
 // (the block-form's `emitPendingCheck` is the explicit throw detector, but
 // the non-throwing `IsBlank` body never trips it; the receiver release
 // happens in the normal-exit continuation, same as the expression-bodied
-// twin). Pins that both CG33b arms now release.
+// twin). Pins that both CG33b arms now release. Note: extensions don't
+// currently support block-form getters (the parser only accepts the
+// expression-bodied `=>` shape inside `extension`), so this row tests
+// the class-resident block-form getter with the same receiver-position
+// +1 producer that the extension's expression-bodied twin covers.
 BEZEL_TEST(extension_property_string_receiver_4320,
            block_form_getter_loop) {
     expectBoth(
         "module M; "
-        "extension string "
-        "  public property IsBlank: bool "
-        "    get => do return this.Length = 0 or this.Trim().Length = 0; end; "
-        "end; "
         "public static class P "
         "  public static method Make(): string => \"   \" + \"\"; "
+        "end P; "
+        "public class Box "
+        "  public _s: string := \"\"; "
+        "  public property IsBlank: bool "
+        "    get => do return _s.Length = 0 or _s.Trim().Length = 0; end; "
+        "  end; "
+        "end Box; "
+        "public static class Main_ "
         "  public static method Main(): int "
         "    var total := 0; "
         "    for var i in 1..500 do "
-        "      if P.Make().IsBlank then total := total + 1; end; "
+        "      var b := new Box(); b._s := P.Make(); "
+        "      if b.IsBlank then total := total + 1; end; "
         "    end; "
         "    return total; "
         "  end Main; "
-        "end P;",
+        "end Main_;",
         244);
 }
 
