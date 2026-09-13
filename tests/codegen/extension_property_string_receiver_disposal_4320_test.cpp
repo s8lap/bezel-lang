@@ -112,7 +112,7 @@ BEZEL_TEST(extension_property_string_receiver_4320,
            issue_repro_loop_spec_26_1) {
     expectBoth(
         "module M; "
-        "public extension string "
+        "extension string "
         "  public property IsBlank: bool => "
         "    this.Length = 0 or this.Trim().Length = 0; "
         "end; "
@@ -138,7 +138,7 @@ BEZEL_TEST(extension_property_string_receiver_4320,
            range_slice_receiver_loop) {
     expectBoth(
         "module M; "
-        "public extension string "
+        "extension string "
         "  public property IsBlank: bool => "
         "    this.Length = 0 or this.Trim().Length = 0; "
         "end; "
@@ -146,7 +146,7 @@ BEZEL_TEST(extension_property_string_receiver_4320,
         "  public static method Main(): int "
         "    var total := 0; "
         "    for var i in 1..500 do "
-        "      if \"   abc\".Sub(1, 3).IsBlank then total := total + 1; end; "
+        "      if (\"   abc\"[1..3]).IsBlank then total := total + 1; end; "
         "    end; "
         "    return total; "
         "  end Main; "
@@ -167,7 +167,7 @@ BEZEL_TEST(extension_property_string_receiver_4320,
            named_local_receiver_control) {
     expectBoth(
         "module M; "
-        "public extension string "
+        "extension string "
         "  public property IsBlank: bool => "
         "    this.Length = 0 or this.Trim().Length = 0; "
         "end; "
@@ -194,7 +194,7 @@ BEZEL_TEST(extension_property_string_receiver_4320,
            block_form_getter_loop) {
     expectBoth(
         "module M; "
-        "public extension string "
+        "extension string "
         "  public property IsBlank: bool "
         "    get => do return this.Length = 0 or this.Trim().Length = 0; end; "
         "end; "
@@ -223,7 +223,7 @@ BEZEL_TEST(extension_property_string_receiver_4320,
            string_result_identity_getter_no_uaf) {
     expectBoth(
         "module M; "
-        "public extension string public property Loud: string => this; end; "
+        "extension string public property Loud: string => this; end; "
         "public static class P "
         "  public static method Main(): int "
         "    var s := \"hi\"; "
@@ -242,7 +242,7 @@ BEZEL_TEST(extension_property_string_receiver_4320,
            call_argument_position) {
     expectBoth(
         "module M; "
-        "public extension string "
+        "extension string "
         "  public property IsBlank: bool => "
         "    this.Length = 0 or this.Trim().Length = 0; "
         "end; "
@@ -270,7 +270,7 @@ BEZEL_TEST(extension_property_string_receiver_4320,
            interpolated_string_receiver_loop) {
     expectBoth(
         "module M; "
-        "public extension string "
+        "extension string "
         "  public property IsBlank: bool => "
         "    this.Length = 0 or this.Trim().Length = 0; "
         "end; "
