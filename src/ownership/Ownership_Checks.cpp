@@ -3907,6 +3907,53 @@ void MethodOwnership::scanCapturedOwnedConsumeExpr(const ast::Expr& e,
             scanCapturedOwnedConsumeExpr(*call->callee,
                                          insideLambda || calleeIsLambda);
         }
+        // fix #4355: when a function-typed local holding a closure is invoked
+        // at the top level (not inside another lambda), check whether any of
+        // the closure's captured identifiers have been disposed since the closure
+        // was created. Unlike `reportMovedFromCapturesIn` (which fires at the
+        // closure literal's creation point with the entry state), this fires at
+        // the INVOCATION point with the current state — catching the
+        // dispose-between-creation-and-call gap:
+        //   var c := lambda(): int => x.Get();  // capture while Owned
+        //   x.Dispose();                         // disposed AFTER creation
+        //   _ := c();                            // reads disposed x at invoke
+        if (!insideLambda && call->callee) {
+            if (const auto* calleeId =
+                    dynamic_cast<const ast::IdentifierExpr*>(call->callee.get())) {
+                if (sema::Symbol* sym = ctx_.exprSymbol(*calleeId)) {
+                    if (auto* ls = dynamic_cast<sema::LocalSymbol*>(sym)) {
+                        auto lit = scopedLambdaLocalInit_.find(ls);
+                        if (lit != scopedLambdaLocalInit_.end()) {
+                            std::vector<const ast::IdentifierExpr*> caps;
+                            collectLambdaIdentifiers(*lit->second, caps);
+                            for (const auto* id : caps) {
+                                sema::Symbol* capSym = ctx_.exprSymbol(*id);
+                                if (!capSym) continue;
+                                auto it = states_.find(capSym);
+                                if (it == states_.end()) continue;
+                                const LocalOwnership& st = it->second;
+                                // §28.2 / §28.3: a captured local in Disposed state
+                                // at the INVOCATION point is a use-after-dispose.
+                                // Match checkRead's own severity (Warning) for the
+                                // same shape on a direct read.
+                                if (st.state == OwnershipState::Disposed) {
+                                    report(
+                                        Severity::Warning,
+                                        id->span.begin,
+                                        std::string("closure captures `") +
+                                            std::string(id->name) +
+                                            "` which was disposed before this "
+                                            "invocation — a closure's captured "
+                                            "borrow is read at invoke time, and "
+                                            "this call reads a disposed value "
+                                            "(§28.2 use-after-dispose)");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
         for (const auto& a : call->args)
             if (a.value) scanCapturedOwnedConsumeExpr(*a.value, insideLambda);
         return;
