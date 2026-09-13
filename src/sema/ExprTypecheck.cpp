@@ -13809,12 +13809,15 @@ bool ExprTC::isConstInitExpr(const ast::Expr& e) {
         return c->condition && c->thenValue && c->elseValue &&
                isConstInitExpr(*c->condition) && isConstInitExpr(*c->thenValue) &&
                isConstInitExpr(*c->elseValue);
-    // A named reference is constant iff it resolves to another const member or
-    // an enum constant. A (non-const) field, property, or method reference is
-    // not — that is the runtime-dependent case this check rejects.
+    // A named reference is constant iff it resolves to another const member,
+    // an enum constant, or a local const (§21.1). A (non-const) field,
+    // property, or method reference is not — that is the runtime-dependent case
+    // this check rejects.
     if (dynamic_cast<const ast::IdentifierExpr*>(&e) ||
         dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
         Symbol* sym = ctx_.exprSymbol(e);
+        if (auto* ls = dynamic_cast<LocalSymbol*>(sym))
+            return ls->isConst;
         return dynamic_cast<ConstMemberSymbol*>(sym) != nullptr ||
                dynamic_cast<EnumConstantSymbol*>(sym) != nullptr;
     }

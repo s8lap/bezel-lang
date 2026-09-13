@@ -1579,7 +1579,84 @@ void Resolver::checkTypeConsts(TypeSymbol* t) {
         // SEAM-ACCESSOR: `cs` is a member of the locally-declared `t` (forEachTypeAndNested,
         // #3574); `t`'s OWN const members are always local (#3152).
         auto* cd = dynamic_cast<const ast::ConstDecl*>(cs->decl);
-        if (!cd || !cd->type) continue;  // inferred — deferred
+        // Build the `resolve` closure once — used by the (type-independent)
+        // div-by-zero probe below AND by the integer-range check further down.
+        //
+        // fix #3635 (§6.1 / Appendix C.11, v0.286): walk `t`'s own members
+        // AND its class base chain, so a bare name naming an INHERITED
+        // const resolves here too. Before this fix the walk covered only
+        // `t->members`; `fix #3619` deliberately DECLINED to fold this
+        // closure into the shared `resolveConstIdentInScope` (which already
+        // has this same walk) because the two differ in what happens on an
+        // unfoldable match — `resolveConstIdentInScope` falls through to
+        // let a same-named symbol further up shadow it, while this closure
+        // returns immediately once ANY level of the chain has a matching
+        // name, foldable or not. That contract is preserved: the widening
+        // is *which levels get searched*, not *what happens on a match*.
+        // Reachable: `Derived : Base` where `Derived`'s own const references
+        // `Base`'s by bare name — measured silently accepting an
+        // overflowing value (and, independently, a division by an inherited
+        // zero const) before this fix, since both `foldIntConst` and
+        // `containsConstDivByZero` share this one `resolve`.
+        std::function<std::optional<long long>(std::string_view, int)>
+            resolve = [&](std::string_view name,
+                          int depth) -> std::optional<long long> {
+            for (TypeSymbol* ts = t; ts;) {
+                for (Symbol* sm : ts->members) {
+                    auto* scs = dynamic_cast<ConstMemberSymbol*>(sm);
+                    if (!scs || scs->name != name) continue;
+                    if (auto* scd =
+                            // SEAM-ACCESSOR: `ts` here walks `t`'s class BASE CHAIN (`ts->baseTypes` below), which
+                            // DOES cross module boundaries, so `scs` can be an imported const. Fix
+                            // #3230 (family M11 of #3152) already covers that: when `scd` (this AST
+                            // cast) is null, the fallback three lines below reads the loader's
+                            // typed `scs->intValue` instead of silently no-opping.
+                            dynamic_cast<const ast::ConstDecl*>(scs->decl))
+                        if (scd->value)
+                            return foldIntConst(*scd->value, resolve,
+                                                 depth + 1);
+                    // fix #3230 (§17.14 / §15.1 / §22.12; family M11 of
+                    // umbrella #3152): an imported sibling const has no AST
+                    // TypeDecl (the symbol is reconstructed from
+                    // metadata), so the `scd->value` arm above returns
+                    // nullopt and the §6.1 / Appendix C.11 range check
+                    // below silently no-ops. Fall back to the typed value
+                    // the loader populated (parseImportedConstIntText in
+                    // ModuleLoader.cpp).
+                    if (scs->intValue) return *scs->intValue;
+                    return std::nullopt;
+                }
+                TypeSymbol* nb = nullptr;
+                for (TypeSymbol* base : ts->baseTypes)
+                    if (base && base->kind == ast::TypeDeclKind::Class) {
+                        nb = base;
+                        break;
+                    }
+                ts = nb;
+            }
+            return std::nullopt;
+        };
+
+        // fix #4391 (§17.14, v0.298): the div-by-zero probe must run even for
+        // inferred-type consts. Without this, `const C := 5 / Z` (where Z:=0)
+        // was silently accepted because the `!cd->type` guard below skipped the
+        // whole block. The probe is type-independent — it needs only the
+        // initializer expression — so it runs before that guard.
+        if (cd->value) {
+            bool hasDivZero = containsConstDivByZero(*cd->value, resolve);
+            if (hasDivZero) {
+                ctx_.diagnostics().report(
+                    Severity::Error, m->declLoc,
+                    std::string("const `") + std::string(cs->name) +
+                    "` initializer contains a division or modulo by "
+                    "zero — a const initializer must fold to a "
+                    "representable compile-time-constant value (§22.12)");
+            }
+        }
+
+        // The remaining checks (type admissibility and integer range) require an
+        // explicit type annotation — inferred types are deferred to ExprTypecheck.
+        if (!cd->type) continue;
         TypeRef* rt = ctx_.resolvedType(*cd->type);
         if (!rt) continue;
         // fix #3879 (§22.12, v0.294): routed through the ONE shared predicate
@@ -1610,66 +1687,9 @@ void Resolver::checkTypeConsts(TypeSymbol* t) {
             p == P::Byte || p == P::SByte || p == P::Short || p == P::UShort ||
             p == P::Int || p == P::UInt || p == P::Long || p == P::ULong;
         if (isIntConst && cd->value) {
-            // §17.14 (v0.184, #1688): fitsConstIntRange / containsConstDivByZero
-            // are shared with the local-`const` fault check (ExprTypecheck.cpp)
-            // so both const forms agree on exactly one "fits"/"div-by-zero"
-            // definition (ConstFold.hpp).
-            //
-            // fix #3635 (§6.1 / Appendix C.11, v0.286): walk `t`'s own members
-            // AND its class base chain, so a bare name naming an INHERITED
-            // const resolves here too. Before this fix the walk covered only
-            // `t->members`; `fix #3619` deliberately DECLINED to fold this
-            // closure into the shared `resolveConstIdentInScope` (which already
-            // has this same walk) because the two differ in what happens on an
-            // unfoldable match — `resolveConstIdentInScope` falls through to
-            // let a same-named symbol further up shadow it, while this closure
-            // (kept here, unchanged) returns immediately once ANY level of the
-            // chain has a matching name, foldable or not. That contract is
-            // preserved: the widening is *which levels get searched*, not
-            // *what happens on a match*. Reachable: `Derived : Base` where
-            // `Derived`'s own const references `Base`'s by bare name — measured
-            // silently accepting an overflowing value (and, independently, a
-            // division by an inherited zero const) before this fix, since both
-            // `foldIntConst` below and `containsConstDivByZero` in the nullopt
-            // arm share this one `resolve`.
-            std::function<std::optional<long long>(std::string_view, int)>
-                resolve = [&](std::string_view name,
-                              int depth) -> std::optional<long long> {
-                for (TypeSymbol* ts = t; ts;) {
-                    for (Symbol* sm : ts->members) {
-                        auto* scs = dynamic_cast<ConstMemberSymbol*>(sm);
-                        if (!scs || scs->name != name) continue;
-                        if (auto* scd =
-                                // SEAM-ACCESSOR: `ts` here walks `t`'s class BASE CHAIN (`ts->baseTypes` below), which
-                                // DOES cross module boundaries, so `scs` can be an imported const. Fix
-                                // #3230 (family M11 of #3152) already covers that: when `scd` (this AST
-                                // cast) is null, the fallback three lines below reads the loader's
-                                // typed `scs->intValue` instead of silently no-opping.
-                                dynamic_cast<const ast::ConstDecl*>(scs->decl))
-                            if (scd->value)
-                                return foldIntConst(*scd->value, resolve,
-                                                     depth + 1);
-                        // fix #3230 (§17.14 / §15.1 / §22.12; family M11 of
-                        // umbrella #3152): an imported sibling const has no AST
-                        // TypeDecl (the symbol is reconstructed from
-                        // metadata), so the `scd->value` arm above returns
-                        // nullopt and the §6.1 / Appendix C.11 range check
-                        // below silently no-ops. Fall back to the typed value
-                        // the loader populated (parseImportedConstIntText in
-                        // ModuleLoader.cpp).
-                        if (scs->intValue) return *scs->intValue;
-                        return std::nullopt;
-                    }
-                    TypeSymbol* nb = nullptr;
-                    for (TypeSymbol* base : ts->baseTypes)
-                        if (base && base->kind == ast::TypeDeclKind::Class) {
-                            nb = base;
-                            break;
-                        }
-                    ts = nb;
-                }
-                return std::nullopt;
-            };
+            // §17.14 (v0.184, #1688): fitsConstIntRange is shared with the
+            // local-`const` fault check (ExprTypecheck.cpp) so both const forms
+            // agree on exactly one "fits" definition (ConstFold.hpp).
             if (auto folded = foldIntConst(*cd->value, resolve)) {
                 if (!fitsConstIntRange(*folded, p)) {
                     ctx_.diagnostics().report(
@@ -1680,29 +1700,16 @@ void Resolver::checkTypeConsts(TypeSymbol* t) {
                         "must be a representable compile-time constant "
                         "(§6.1 / Appendix C.11)");
                 }
-            } else {
-                // per §22.12 (#1211): the initializer is structurally a
-                // constant expression (passed isConstInitExpr) but
-                // foldIntConst returned nullopt — report the specific cause
-                // when it is a division or modulo by zero.
-                if (containsConstDivByZero(*cd->value, resolve)) {
-                    ctx_.diagnostics().report(
-                        Severity::Error, m->declLoc,
-                        std::string("const `") + std::string(cs->name) +
-                        "` initializer contains a division or modulo by "
-                        "zero — a const initializer must fold to a "
-                        "representable compile-time-constant value (§22.12)");
-                }
-                // §6.5 / §17.14 (v0.242, #3045): the OTHER evaluation fault
-                // that leaves an otherwise-constant initializer unfoldable —
-                // "`const F := 1 << 64;` [is] rejected where [it is] written"
-                // (§17.14) — needs no probe here. Unlike a `/ 0`, the const's
-                // initializer expression is visited by ExprTC, whose
-                // checkShiftCountDomain reports the fault at the shift itself
-                // and with the left operand's real type (which this walk can
-                // only infer from the AST shape). A probe here would only
-                // double the diagnostic.
             }
+            // §6.5 / §17.14 (v0.242, #3045): the OTHER evaluation fault
+            // that leaves an otherwise-constant initializer unfoldable —
+            // "`const F := 1 << 64;` [is] rejected where [it is] written"
+            // (§17.14) — needs no probe here. Unlike a `/ 0`, the const's
+            // initializer expression is visited by ExprTC, whose
+            // checkShiftCountDomain reports the fault at the shift itself
+            // and with the left operand's real type (which this walk can
+            // only infer from the AST shape). A probe here would only
+            // double the diagnostic.
         }
     }
 }
