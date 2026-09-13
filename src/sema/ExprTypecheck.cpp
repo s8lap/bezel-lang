@@ -18398,6 +18398,57 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                             "`) instead");
                     }
                 }
+                // fix #4381 (§19.3, v0.298): after the class-head check, detect
+                // the dual: a pattern head that names a choice CASE (e.g.
+                // `Fetched(_)`) but a scrutinee that is NOT a choice. Sema
+                // must reject this rather than letting it through to codegen
+                // which would emit malformed IR (case.end has no terminator).
+                if (ctx_.module()) {
+                    bool isChoiceCaseHead = false;
+                    for (Symbol* child : ctx_.module()->children) {
+                        if (auto* ts = dynamic_cast<TypeSymbol*>(child)) {
+                            if (ts->kind == ast::TypeDeclKind::Choice) {
+                                for (Symbol* m : ts->members) {
+                                    if (auto* cc =
+                                            dynamic_cast<ChoiceCaseSymbol*>(m)) {
+                                        if (cc->name == lastName) {
+                                            isChoiceCaseHead = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                                if (isChoiceCaseHead) break;
+                            }
+                        }
+                    }
+                    if (!isChoiceCaseHead) {
+                        for (Symbol* sym : ctx_.importedSymbols()) {
+                            if (auto* ts = dynamic_cast<TypeSymbol*>(sym)) {
+                                if (ts->kind == ast::TypeDeclKind::Choice) {
+                                    for (Symbol* m : ts->members) {
+                                        if (auto* cc =
+                                                dynamic_cast<ChoiceCaseSymbol*>(m)) {
+                                            if (cc->name == lastName) {
+                                                isChoiceCaseHead = true;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    if (isChoiceCaseHead) break;
+                                }
+                            }
+                        }
+                    }
+                    if (isChoiceCaseHead) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, dp->span.begin,
+                            "case pattern head `" + std::string(lastName) +
+                                "(...)` names a choice case, but the scrutinee "
+                                "type is not a choice — a choice-case pattern is "
+                                "only valid when the scrutinee is that specific "
+                                "choice type (§19.3)");
+                    }
+                }
                 // fix #3957 (§19.3/§2.8.3 rule 4, v0.294): fall back to
                 // `ctx_.importedSymbols()` — mirroring codegen's own
                 // import-aware `patternMatches` lookup (LlvmBackend_Exprs2.cpp,
