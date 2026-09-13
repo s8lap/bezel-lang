@@ -4113,6 +4113,12 @@ void* bz_task_scope_join(void* scp) {
 // reached. Returns the dispose task; the scope struct is freed when it
 // completes. `normal_exit` distinguishes the source-visible normal path
 // (codegen's !isUnwind) from an explicit early-exit use.
+// fix #4353 (stdlib §6.10 / spec §30.14, v0.298): bump `sc->state->timer_gen`
+// BEFORE any signaling that can release `sc->state`. A `CancelAfter` timer
+// scheduled after `Join()` retains `sc->state` with rc=2; without the
+// generation bump, that timer's callback fires into the freed
+// `bz_cancel_state_t` once the scope's reference is dropped. Mirrors
+// `bz_cts_dispose` (line 2253).
 void* bz_task_scope_dispose_async(void* scp, int32_t normal_exit,
                                   void* ioe_vtable) {
     bz_main_domain_get();
@@ -4133,7 +4139,14 @@ void* bz_task_scope_dispose_async(void* scp, int32_t normal_exit,
         if (sc->ioe_vtable == nullptr) sc->ioe_vtable = ioe_vtable;
         sc->closed = true;
         sc->dispose_waiter = task;
-        if (sc->state) bz_cancel_state_signal(sc->state);  // cancel children
+        if (sc->state) {
+            // Cancel any pending CancelAfter timer entry BEFORE teardown —
+            // bump the generation so a not-yet-fired timer callback no-ops
+            // (it will not signal a state we are about to release). Mirrors
+            // bz_cts_dispose at line 2253 (#1413, §6.1/#1378).
+            sc->state->timer_gen.fetch_add(1, std::memory_order_acq_rel);
+            bz_cancel_state_signal(sc->state);  // cancel children
+        }
         if (sc->pending == 0) act = bz_scope_settle_locked(sc);
     }
     bz_scope_perform(act);
@@ -4143,6 +4156,9 @@ void* bz_task_scope_dispose_async(void* scp, int32_t normal_exit,
 // Dispose (unwind edge / sync fallback): cancel + non-blocking zombie drain.
 // Never raises; the scope struct is freed at the last child completion (or
 // here, when no children remain).
+// fix #4353 (stdlib §6.10 / spec §30.14, v0.298): same timer_gen bump as
+// bz_task_scope_dispose_async — a CancelAfter timer scheduled after Join()
+// retains sc->state and would otherwise fire into the freed state cell.
 void bz_task_scope_dispose_unwind(void* scp) {
     auto* sc = (bz_task_scope_t*)scp;
     if (!sc) return;
@@ -4153,7 +4169,10 @@ void bz_task_scope_dispose_unwind(void* scp) {
         sc->disposed = true;
         sc->closed = true;
         sc->zombie = true;
-        if (sc->state) bz_cancel_state_signal(sc->state);
+        if (sc->state) {
+            sc->state->timer_gen.fetch_add(1, std::memory_order_acq_rel);
+            bz_cancel_state_signal(sc->state);
+        }
         if (sc->pending == 0) act = bz_scope_settle_locked(sc);
     }
     bz_scope_perform(act);
