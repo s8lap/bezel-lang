@@ -28888,6 +28888,7 @@ void Emitter::collectInlineArrayStringCallResultReleaseEligible(
                 // fix #4296 declare-then-assign shape: `var outer: [N]string;`
                 // with NO initializer — record it if its declared type is an
                 // inline array whose element type carries strings.
+                // LOCALDECL-ONLY: no const local can ever reach here (above).
                 if (dynamic_cast<const ast::LocalDecl*>(s) && v.type) {
                     if (const sema::TypeRef* tr = ctx_.resolvedType(*v.type)) {
                         if (!tr->nullable &&
