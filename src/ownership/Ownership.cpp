@@ -12453,6 +12453,43 @@ void MethodOwnership::checkAsyncPatternABorrowedIdentifierReturn(
         // (Disposed / MovedFrom / PolyNull / Poisoned) is some OTHER check's
         // business — stay silent rather than double-diagnose.
         if (st->state != OwnershipState::Borrowed) return;
+        // fix #4338 (v0.298, §15.4 / §28.3 / §28.7): a heap-collection
+        // LITERAL initializer is an admitted async Pattern A producer — the
+        // literal allocates fresh heap backing (§15.4) and the task owns the
+        // result through its disposer (patternAResultCollectionDisposer).
+        // producerState's CollectionLiteralExpr arm cannot decide this on
+        // exprType alone (the literal carries no own type; the type comes
+        // from the surrounding declaration), so the local's states_ entry
+        // is Borrowed. This does NOT make the return a borrow — it is an
+        // owning transfer — so the Pattern-A gate must admit it.
+        // Narrow: we only admit when the local's DECLARED type is a
+        // heap-collection head AND the method's return type is
+        // Task<heap-collection> (the one async Pattern-A shape the 3
+        // originally-failing tests exercise). All other checks see the
+        // local's true Borrowed state and apply unchanged. // per §15.4,
+        // §28.3, §28.7
+        if (auto* sym = ctx_.exprSymbol(*id)) {
+            if (auto* ls = dynamic_cast<sema::LocalSymbol*>(sym)) {
+                if (auto* ld = dynamic_cast<const ast::LocalDecl*>(ls->decl)) {
+                    if (dynamic_cast<const ast::CollectionLiteralExpr*>(
+                            ld->initializer.get()) &&
+                        ld->type) {
+                        if (const sema::TypeRef* rt =
+                                ctx_.resolvedType(*ld->type)) {
+                            if (rt->kind == sema::TypeRef::Kind::Named &&
+                                !rt->headName().empty() &&
+                                common::isPatternAResultCollectionHead(
+                                    rt->headName())) {
+                                // The local is typed as a heap collection and
+                                // initialized by a heap-collection literal:
+                                // admissible Pattern-A async producer.
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        }
         reportAsyncPatternABorrowedIdentifierReturn(e);
         return;
     }
