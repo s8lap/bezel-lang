@@ -6254,8 +6254,25 @@ void MethodOwnership::handleLocalDecl(const ast::LocalDecl& ld,
     // `const a := xs.ToArray();`, the compiler accepted it, and the array
     // leaked. Routing through one function closes the loop BY CONSTRUCTION for
     // every category, present and future. // per §21.1, §28.10, #2709
+    // fix #4288 (§28.10, v0.298): also exclude a `move`-marked initializer
+    // (initializer-position adoption, §28.3 "Move semantics") from Case A.
+    // Like the binding-position `owned` marker (which the outer guard already
+    // excludes via `!ld.initializerHasOwnedMarker`), a `move`-marked initializer
+    // creates a genuine ownership adoption: `b` becomes the sole owner and
+    // `b.Dispose()` is load-bearing. The static RHS type is unchanged by the
+    // move, so without this exclusion Case A fires on every `using var b :=
+    // move a;` regardless of whether the type carries a disposal obligation.
+    // Mirrors rhsIsVacuousBorrowPin's own reasoning ("the unmarked-adoption
+    // of an owned binding is NOT a borrow, so it stays out of the classifier");
+    // both marked and unmarked adoption must stay out.
+    bool initializerIsMove = false;
+    if (ld.initializer) {
+        if (auto* ue = dynamic_cast<const ast::UnaryExpr*>(ld.initializer.get()))
+            initializerIsMove = (ue->op == "move");
+    }
     if (ld.isUsing && ld.initializer && !ld.initializerHasOwnedMarker &&
-        !isGenericBody_ && !constInitializerRejected(*ld.initializer)) {
+        !initializerIsMove && !isGenericBody_ &&
+        !constInitializerRejected(*ld.initializer)) {
         // Case A: inert RHS. Value-typed or runtime-managed types carry no
         // disposal obligation (§28.9), so the scope-end `Dispose()` a `using
         // var` would call is a no-op; the only effect is the reassignment lock

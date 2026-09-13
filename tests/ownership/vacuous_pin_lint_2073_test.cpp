@@ -189,6 +189,39 @@ BEZEL_TEST(vacuous_pin_lint_2073,
     BEZEL_EXPECT_FALSE(hasVacuousBorrowPinWarning(r, "c"));
 }
 
+// fix #4288 (§28.10, v0.298): `using var b := move a;` is an initializer-
+// position adoption (§28.3 "Move semantics"). `b` becomes the sole owner and
+// `b.Dispose()` is load-bearing — the same load-bearing obligation the
+// binding-position `owned` marker creates. Case A's outer guard must exclude
+// `move`-marked initializers exactly as it excludes `owned`-marked bindings
+// (the `!ld.initializerHasOwnedMarker` check on the outer guard); without
+// this fix Case A fires on every `using var b := move a;` regardless of
+// whether the type carries a disposal obligation, producing a misleading
+// "no disposal obligation" message for genuinely-owned types like Array<int>.
+//
+// Uses Array<int> specifically: Array IS in kChainClaimedBuiltinHeadNames
+// (the runtime DOES dispose it), but is NOT in kDisposableBuiltinHeadNames
+// (the lint does NOT know this), so rhsIsDisposableClassType returns false
+// and Case A fires without the fix. A user class with a destructor would NOT
+// expose the bug (rhsIsDisposableClassType = true for it, Case A is blocked
+// regardless of the move check).
+BEZEL_TEST(vacuous_pin_lint_2073,
+           move_initializer_load_bearing_no_warn_spec_28_10_4288) {
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "class C "
+        "  public method M(): int "
+        "    var a := new Array<int>(2); a.Add(1); "
+        "    using var b := move a; "
+        "    return 0; "
+        "  end M; "
+        "  public static method Main(): int return 0; end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(hasInertRhsWarning(r, "b"));
+    BEZEL_EXPECT_FALSE(hasVacuousBorrowPinWarning(r, "b"));
+}
+
 // Negative control — `using var y := owned x` (marked transfer) is a §28.3
 // binding-position adoption: load-bearing, no warning. The marker filter
 // (`!ld.initializerHasOwnedMarker`) excludes the adoption shape.
