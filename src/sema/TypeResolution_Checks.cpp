@@ -7817,6 +7817,16 @@ namespace {
 // on 18 of 22 names is not the same question (§25) — reusing it here would
 // silently drop four names from this fix's coverage and wrongly fold
 // `IGrouping` back in.
+//
+// ANTI-DRIFT ONLY, NOT ANTI-OMISSION (#4327, #4299): this array is the
+// authoritative closed set of non-constructible builtin interface names, and
+// every entry in `builtinTypeArity` that is a null-declaration, non-synthesized
+// interface IS mirrored here — so this set catches names that DRIFT out of
+// sync.  It provides ZERO signal if a 26th such interface is added to
+// `builtinTypeArity` without a corresponding entry here: no test would detect
+// the gap.  The population-growth signal is the per-issue review of
+// `builtinTypeArity`; this array requires manual upkeep and is validated only
+// by human review (CLAUDE.md rule 4: decline-with-reasons, not silently).
 constexpr std::array<std::string_view, 25>
     kNonConstructibleBuiltinInterfaceNames = {
         // arity-0 (stdlib §2.14/§2.15/§2.18; builtinTypeArity's first block)
