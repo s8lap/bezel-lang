@@ -13890,7 +13890,23 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
                                             // array; borrowing cases free only
                                             // the frame — never the shared
                                             // backing, exactly-once).
-                disposeStack_.back().push_back(d);
+                // fix #3695 ARGUMENT-face (stdlib §4.18 / stdlib §4.1 / §29.2 /
+                // §28.3, v0.298): register the iterEnumDispose on the OUTERMOST
+                // function-body scope (`disposeStack_[0]`) rather than
+                // `disposeStack_.back()`. The wrap's slot is allocated via
+                // `entryAlloca` (function-entry lifetime), so the disposal must
+                // fire at function end; pushing to a TEMPORARY inner scope —
+                // notably the string-interpolation part scope
+                // (`LlvmBackend_Exprs.cpp` ~L379–L401), which is popped without
+                // calling `emitDisposals` because its single accumulator entry
+                // is consumed in place — silently loses the wrap entry, and the
+                // wrap frame + its snapshot backing array leak (LSan: 120 B /
+                // 3 allocs). The OUTERMOST scope is always the function body
+                // for the current function in the non-lambda path and is the
+                // same scope the LOCAL-DECL/RETURN-face wraps land on, so the
+                // LOCAL-DECL/RETURN faces stay unchanged. Lambdas are out of
+                // scope for the regression's failing case.
+                disposeStack_.front().push_back(d);
             }
             // §9 / §9.1 (#1759): passing `this` of a record method by value —
             // `this` lowered to the receiver POINTER (CG29 / §9.2), but a
