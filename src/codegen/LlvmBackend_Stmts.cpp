@@ -625,6 +625,26 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                         builder_.CreateBr(contOldBB);
                         builder_.SetInsertPoint(contOldBB);
                     }
+                    // fix #4317 (§15.1 / §8.6, v0.298): box a value-typed RHS
+                    // (a conforming RECORD) into its box representation before
+                    // the store below. The generic lvalueAddr fallback further
+                    // down this function (the `boxForTarget` call a few dozen
+                    // lines below, guarding every non-IndexExpr target) already
+                    // does this — this IndexExpr arm `return false`s before
+                    // ever reaching it, so `outer[i] := new RecHolder(...)`
+                    // into an `[N]IHolder` slot never boxed. Measured under
+                    // ASan: `global-buffer-overflow`, READ of size 8, 2 bytes
+                    // past the string global whose 8-byte fat-pointer word
+                    // the record was stored as, and a later `.GetV()` dispatch
+                    // walked off. boxForTarget is a no-op for a CLASS element
+                    // (already a bare pointer, #399/isBoxableValueType false)
+                    // and for a plain (non-interface) element target, so this
+                    // is unaffected for every already-working shape (see the
+                    // `*_class_element_unaffected_control` rows in
+                    // inline_array_interface_record_element_store_boxing_
+                    // 4317_test.cpp).
+                    rhsOnce = boxForTarget(rhsOnce, ctx_.exprType(*as->target),
+                                           as->value.get());
                     // #813 / §15.1: an inline `[N]T?` element slot is a nullable-
                     // value struct `{i8, T}`; wrap the bare inner value so the
                     // hasValue byte is set (this fast path bypasses the general
@@ -798,6 +818,23 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                                 // empty state) and the literal-element read
                                 // of `move a[i]` sees a live slot.
                                 llvm::Type* et = aty->getElementType();
+                                // fix #4317 (§15.1 / §8.6, v0.298): the
+                                // element's DECLARED sema type, used below to
+                                // box a value-typed (record) literal element
+                                // into an Object/interface slot — mirrors
+                                // lowerLocalDecl's inline-array init loop
+                                // (LlvmBackend_Setup.cpp), which needs the
+                                // identical fix (tracked separately: that
+                                // call site is in a held file this lane could
+                                // not edit; see follow-up issue).
+                                const sema::TypeRef* wholeArrTy4317 =
+                                    ctx_.exprType(*as->target);
+                                const sema::TypeRef* elemSemaTy4317 =
+                                    (wholeArrTy4317 &&
+                                     wholeArrTy4317->kind ==
+                                         sema::TypeRef::Kind::InlineArray)
+                                        ? wholeArrTy4317->arrayElement
+                                        : nullptr;
                                 std::vector<llvm::Value*> elemTemps(
                                     cl->elements.size(), nullptr);
                                 for (std::size_t i = 0;
@@ -828,6 +865,16 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                                                  ? builder_.CreateSExt(ev, et)
                                                  : builder_.CreateTrunc(ev, et);
                                     }
+                                    // fix #4317 (§15.1 / §8.6, v0.298): box a
+                                    // value-typed (record) element into its box
+                                    // representation before the nullable-
+                                    // slot wrap below — see the detailed
+                                    // derivation at the sibling IndexExpr-arm
+                                    // fix a few dozen lines above. No-op for a
+                                    // class element (already a bare pointer)
+                                    // or a non-Object/interface element type.
+                                    ev = boxForTarget(ev, elemSemaTy4317,
+                                                      cl->elements[i].get());
                                     // #813 / §15.1: wrap into the nullable-value
                                     // slot struct for an `[N]T?` literal assign
                                     // — same wrapping the post-disposal store
@@ -2376,6 +2423,15 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                                              : builder_.CreateTrunc(ev,
                                                                     elemTy);
                                 }
+                                // fix #4317 (§15.1 / §8.6, v0.298): box a
+                                // value-typed (record) element into its box
+                                // representation before the store — see the
+                                // detailed derivation at the sibling
+                                // IndexExpr-arm fix earlier in this function.
+                                // No-op for a class element (already a bare
+                                // pointer) or a non-Object/interface element.
+                                ev = boxForTarget(ev, rrt->arrayElement,
+                                                  cl->elements[i].get());
                                 llvm::Value* gep = builder_.CreateGEP(
                                     aty, tmp,
                                     {builder_.getInt32(0),
