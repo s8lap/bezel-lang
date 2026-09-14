@@ -11746,10 +11746,15 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
         // path fires with the correct i32 tag constant.
         if (dynamic_cast<const ast::DestructuringPattern*>(pat)) {
             const sema::TypeRef* recurseScrutTy = nullptr;
+            // fix #3487 ratchet (v0.298): `choiceTy` must be at the same or
+            // shallower scope as `recurseScrutTy` so that `recurseScrutTy = &choiceTy`
+            // does not store the holder's address into a pointer that outlives it.
+            // Previously declared inside the inner `if` (depth 5), causing a
+            // stack-use-after-scope hit.  Hoisted to this outer scope (depth 4).
+            static sema::TypeRef choiceTy;
             if (scrutTy && scrutTy->kind == sema::TypeRef::Kind::Named &&
                 scrutTy->declaration &&
                 scrutTy->declaration->kind == ast::TypeDeclKind::Choice) {
-                static sema::TypeRef choiceTy;
                 choiceTy.kind = sema::TypeRef::Kind::Named;
                 choiceTy.declaration = scrutTy->declaration;
                 choiceTy.nullable = false;
