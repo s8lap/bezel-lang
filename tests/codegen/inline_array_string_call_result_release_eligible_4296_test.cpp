@@ -134,13 +134,20 @@ BEZEL_TEST(inline_array_string_call_result_release_eligible_4296,
 }
 
 // ===========================================================================
-// CONTROL — inline array constructed DIRECTLY (not from a call):
-// `outer := [s];` — no call, so the `collectCallResult` mechanism is never
-// involved. Clean on both sides. Confirms the fix is scoped to the call-result
-// binding shape, not the inline-array construction path.
+// DIRECT INLINE-ARRAY LITERAL CONSTRUCTION — `var outer: [1]string; outer := [s];`
+// Per #4296 follow-on (§9.7 / §28.3 / §28.9): the collector now admits a
+// declare-then-assign `CollectionLiteralExpr` (in addition to the original
+// `CallExpr` shape). The literal-element store path RETAINS borrowed
+// element sources so the slot owns its own +1 — symmetric with
+// `calleeReturnMayAliasStringArgUnretained`'s caller-side suppression for
+// the CALL path. Without the follow-on: `outer := [s]` aliases `s`'s +1
+// (no slot-side retain), the new collector admission would fire a scope-end
+// release, and the matching source release would double-free. With the
+// follow-on: literal retains borrowed sources → slot owns its own +1 →
+// scope-end release balances it, source release balances its own.
 // ===========================================================================
 BEZEL_TEST(inline_array_string_call_result_release_eligible_4296,
-           direct_inline_construction_stays_clean) {
+           direct_inline_construction_releases_strings) {
     const char* prog =
         "module M; "
         "class C "
@@ -223,13 +230,10 @@ BEZEL_TEST(inline_array_string_call_result_release_eligible_4296,
 BEZEL_TEST(inline_array_string_call_result_release_eligible_4296,
            record_element_inline_array_call_result_releases_record_string_fields) {
     const char* prog =
-        "module M; "
-        "record R "
-        "  field f1: string; "
-        "end R; "
+        "module M; record R(f1: string); "
         "class Helper "
         "  public static method Wrap(s: string): [1]R "
-        "    return [R(s)]; "
+        "    return [new R(s)]; "
         "  end Wrap; "
         "end Helper; "
         "class C "

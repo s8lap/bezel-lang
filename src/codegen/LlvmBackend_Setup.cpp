@@ -14668,6 +14668,45 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
                                      : builder_.CreateTrunc(ev, elemTy);
                     }
                 }
+                // fix #4296 follow-on (§9.7 / §28.3 / §28.9, v0.298): when the
+                // element type is `string` and the LITERAL ELEMENT SOURCE is a
+                // BORROW (an IdentifierExpr / MemberAccessExpr / other
+                // non-+1-producer shape — NOT a sentinel, NOT a +1 producer
+                // like `+`/`??`/`case`/conditional/range-slice/ToString), the
+                // literal slot would otherwise alias the source's +1 reference
+                // — `outer := [s]` would share `s`'s +1 with `outer[0]`,
+                // and the matching scope-end `inlineArrayStringFields` release
+                // the new collector admits would double-free the shared
+                // reference. Retain at the store for borrowed sources so the
+                // array slot owns its own +1 — symmetric with
+                // `calleeReturnMayAliasStringArgUnretained`'s caller-side
+                // suppression for the CALL path. `emitStringRetain` is
+                // null/sentinel-safe, so the `+1`-producer and sentinel arms
+                // (skipped by the producer/literal gates below) do not over-
+                // retain. A nullable `[N]T?` element is excluded — its slot
+                // is the `{i8, T}` wrapper, not a bare string ptr, so the
+                // element-source type check naturally rejects it.
+                if (elemTy == ptrTy() &&
+                    cl->elements[i] &&
+                    !dynamic_cast<const ast::StringLiteralExpr*>(
+                        cl->elements[i].get()) &&
+                    !isPlusOneStringProducer(cl->elements[i].get())) {
+                    const sema::TypeRef* arrSemaTyForRetain =
+                        declType ? ctx_.resolvedType(*declType) : nullptr;
+                    const sema::TypeRef* elemSemaTyForRetain =
+                        (arrSemaTyForRetain &&
+                         arrSemaTyForRetain->kind ==
+                             sema::TypeRef::Kind::InlineArray)
+                            ? arrSemaTyForRetain->arrayElement
+                            : nullptr;
+                    if (elemSemaTyForRetain &&
+                        elemSemaTyForRetain->kind ==
+                            sema::TypeRef::Kind::Primitive &&
+                        elemSemaTyForRetain->primitive ==
+                            sema::PrimitiveType::String) {
+                        emitStringRetain(ev);
+                    }
+                }
                 llvm::Value* gep = builder_.CreateGEP(
                     arrTy, slot, {builder_.getInt32(0), builder_.getInt32(i)});
                 // #813 / §15.1: wrap into the nullable-value slot struct
@@ -29023,10 +29062,19 @@ void Emitter::collectInlineArrayStringCallResultReleaseEligible(
         {
             LocalDeclInitView v = localDeclInitView(s);
             if (v.init && !v.isUsing) {
-                // `var outer := Helper.Wrap(s);` shape: only a CALL initializer
-                // is in scope. Check the initializer's exprType is an inline
-                // array whose element type carries strings.
-                if (dynamic_cast<const ast::CallExpr*>(v.init)) {
+                // `var outer := Helper.Wrap(s);` shape: a CALL initializer.
+                // Also admits `var outer := [s1, s2];` — the DIRECT inline-
+                // array literal shape, where each element is COPIED into
+                // the freshly-allocated array slot. The literal-element
+                // store path retains borrowed sources (an IdentifierExpr /
+                // MemberAccessExpr / ConditionalExpr / InterpolatedStringExpr
+                // read) into the slot so the array owns its own +1 per
+                // string element — symmetric with the callee-side
+                // `calleeReturnMayAliasStringArgUnretained` suppression for
+                // the CALL case. So both shapes need the same escape walk
+                // and the same scope-end `inlineArrayStringFields` Disposal.
+                if (dynamic_cast<const ast::CallExpr*>(v.init) ||
+                    dynamic_cast<const ast::CollectionLiteralExpr*>(v.init)) {
                     const sema::TypeRef* tr = nullptr;
                     if (v.type) tr = ctx_.resolvedType(*v.type);
                     if (!tr) tr = ctx_.exprType(*v.init);
@@ -29110,7 +29158,12 @@ void Emitter::collectInlineArrayStringCallResultReleaseEligible(
         if (st.assignCount == 1 && st.soleAssign) {
             const ast::AssignmentStmt* as = st.soleAssign;
             const sema::TypeRef* tr = st.declaredType;
-            if (dynamic_cast<const ast::CallExpr*>(as->value.get())) {
+            // admit both the CALL shape (`outer := Helper.Wrap(s)`) and the
+            // DIRECT inline-array literal shape (`outer := [s]`) — see the
+            // init-side comment above for the retain-on-borrowed-source
+            // soundness argument.
+            if (dynamic_cast<const ast::CallExpr*>(as->value.get()) ||
+                dynamic_cast<const ast::CollectionLiteralExpr*>(as->value.get())) {
                 if (tr && !tr->nullable &&
                     tr->kind == sema::TypeRef::Kind::InlineArray &&
                     inlineArrayElementCarriesString(tr)) {
