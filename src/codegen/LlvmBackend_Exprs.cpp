@@ -398,6 +398,32 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                 // will be released by `appendPart` below), then pop the scope.
                 builder_.CreateStore(
                     llvm::ConstantPointerNull::get(ptrTy()), accSlot);
+                // fix #3519 (narrow, §18.5 / §28.3 / §29.2 / §28.9, v0.298): the
+                // wrap #3513 added is `unwindOnly` + `stringRelease` (the sole
+                // intentional push); any OTHER Disposal entry landed here
+                // transitively, e.g. the `iterEnumDispose` an argument-coercion
+                // call inside `{Sum(d)}` registered via
+                // `wrapAsIEnumerableForTarget` at LlvmBackend_Assign.cpp:13880.
+                // The pop_back below silently drops those — without the lift,
+                // the snapshot's entries array (the wrap owns) leaks (152 B / 3
+                // allocs under LSan for the Dictionary-int,int wrap reproduced
+                // by `dictionary_passed_as_an_ienumerable_argument_is_wrapped_29_2`,
+                // gate x5 across cycle-7). Lift them to the parent so they
+                // survive; `accSlot` is the only entry left to pop. Skip the
+                // diverge path (line 393 above): `emitUnwindDisposals()` already
+                // fired this scope at the throw site, so the wrap disposed there.
+                if (!disposeStack_.empty() && disposeStack_.size() >= 2) {
+                    auto& top = disposeStack_.back();
+                    auto& parent = *(disposeStack_.end() - 2);
+                    for (auto it = top.begin(); it != top.end(); ) {
+                        if (it->slot != accSlot) {
+                            parent.push_back(std::move(*it));
+                            it = top.erase(it);
+                        } else {
+                            ++it;
+                        }
+                    }
+                }
                 disposeStack_.pop_back();
                 // fix #3442 (§4.7 / §8.5 / §18.5, v0.283): a UNIT-typed hole is
                 // the one expression kind that legitimately lowers to NO value
