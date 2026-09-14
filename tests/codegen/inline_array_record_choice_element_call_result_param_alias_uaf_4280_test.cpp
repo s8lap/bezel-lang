@@ -75,17 +75,22 @@
 // executable without ASan instrumentation wired the same way) never
 // instruments generated code the same way and its green would be a SKIP.
 // MEASURED: the cross-module CHOICE-element repro is a real
-// heap-use-after-free pre-fix (identical signature) and clean of any UAF
-// post-fix, but leaks — loop-amplified 100x below and asserted as a FLOOR
-// per LANE_RULES §30 (never an exact byte count: LeakSanitizer's
-// conservative stack scan is nondeterministic run to run). This residual
-// leak is the SAME shape #4260's own commit measured for the Record/Choice
-// channel's imported axis (filed as issue 4266) and #4265's commit
-// measured for the string-element channel's imported axis (filed as issue
-// 4274, correctly cited — NOT the same as the unrelated open issue 4267).
-// This fix does not attempt to close that residual leak; #4274 (assigned
-// to a different lane) and #4266 are the tracking issues for the
-// analogous shapes on the sibling channels.
+// heap-use-after-free pre-fix (identical signature). Post-fix the
+// IMPORTED axis is now clean of BOTH UAF and leak (loop-amplified 100x,
+// `imported_choice_element_array_clean_loop_amplified` row asserts the
+// no-leak/no-UAF outcome directly rather than the prior 500 B leak
+// floor — the original floor was the #4266/#4274-shaped residual this
+// file's first version expected to remain, but `fix #4296`'s
+// `inlineArrayStringDeclareThenAssignSite_` map closed that exact gap
+// for the inline-array-of-Choice-element channel too; the row's
+// assertion was updated per `fix-must-update-existing-tests.md`).
+// Issues #4266 (cross-module Record declare-then-assign leak — closed by
+// the same declare-then-assign mechanism) and #4274 (cross-module string-
+// element declare-then-assign leak, the InlineArray/string-element twin
+// — closed by #4296 directly) are the sibling tracking issues for the
+// analogous shapes on the Record-only and InlineArray/string-only
+// channels; both are addressed by the same declare-then-assign release-
+// eligibility collector and were verified closed at the same time.
 //
 // See tests/codegen/record_choice_call_result_param_alias_uaf_4254_test.cpp
 // for the top-level Record/Choice channel, tests/codegen/
@@ -386,17 +391,41 @@ BEZEL_TEST(inline_array_record_choice_element_call_result_param_alias_uaf_4280,
     BEZEL_EXPECT_TRUE(rr.out.find("AddressSanitizer") == std::string::npos);
 }
 
-// UAF-clean but leaks (the #4266/#4274-shaped residual, NOT fixed here —
-// see file header). Asserted as a measured FLOOR, not an exact count
-// (§30), parsed from the SAME two-module ASan-instrumented run's captured
-// stdout/stderr the UAF row above uses — NOT the single-file `runAotChecked`
-// pipeline (`leaksAtLeast`, defined above for a possible single-module use,
-// is unused by this row on purpose: concatenating two `module` sources into
-// one compilation unit is not a real two-module build). This row's job is
-// to prove the imported axis has SOME mechanical protection (it must never
-// regress to the UAF signature), not to certify zero leak.
+// Clean — no UAF AND no leak — on the IMPORTED-CHOICE axis, loop-
+// amplified 100x. Cycle-7 close-out: the #4266/#4274-shaped residual leak
+// this row originally measured (and pinned as an assert-foundLeak floor
+// per LANE_RULES §30) was CLOSED by `fix #4296`'s declare-then-assign
+// `inlineArrayStringDeclareThenAssignSite_` map, which admits the
+// `var outer: [1]Tag4280; outer := Helper.Wrap(s);` shape into
+// `inlineArrayStringCallResultReleaseEligible_`. After #4296
+// (commit 165489a, 2026-09-13) the +1 producer string argument's
+// `inlineArrayStringFields` Disposal (wired in `lowerLocalDecl`) reclaims
+// the buffer at `outer`'s own scope end — the SAME #4266/#4274-shaped
+// gap that the file header named, fully closed for the inline-array-of-
+// Choice-element channel.
+//
+// Per LANE_RULES `fix-must-update-existing-tests.md` ("When fix reverses
+// a prior rejection, tests pinned to OLD behavior must update in same
+// PR or gate reports as REAL regression") this row's expectation flips
+// from "leak floor >=500 B" (the pre-#4296 fingerprint) to "no leak at
+// all" (the post-#4296 reality). The UAF-clean half stays load-bearing —
+// reverting #4280's `walkCallArgs` InlineArray guard (the [N]Record/
+// [N]Choice half of `elementMayEmbedStringArgUnretained`) re-opens the
+// heap-use-after-free on this exact 100-iteration program, so the no-UAF
+// assertion below is the FAIL-WITHOUT pivot. The no-leak assertion is
+// the FAIL-WITHOUT pivot for #4296's release-eligibility gap. Both are
+// mechanically verified (see commit body).
+//
+// Reuses #4260's LibHandle/AppHandle two-module harness (`compileObject` /
+// `compileFile` with `CodegenOptions.sanitizeAddress`) verbatim rather
+// than hand-rolling a runner — a hand-rolled runner never instruments
+// generated code the same way and its green would be a SKIP
+// (LANE_RULES: "native ASan leg vacuous in lane worktrees"). 100x
+// amplification mirrors `inline_array_string_call_result_param_alias_
+// uaf_4265_test.cpp`'s `heap_array_string_factory_control` amplification
+// pattern.
 BEZEL_TEST(inline_array_record_choice_element_call_result_param_alias_uaf_4280,
-           imported_choice_element_array_leaks_not_uaf_loop_amplified) {
+           imported_choice_element_array_clean_loop_amplified) {
     auto dir = wtDir4280();
     LibHandle4280 libH = buildLib4280(dir, kLibSrcUaf4280);
     BEZEL_EXPECT_TRUE(libH.ok);
@@ -406,20 +435,11 @@ BEZEL_TEST(inline_array_record_choice_element_call_result_param_alias_uaf_4280,
     BEZEL_EXPECT_TRUE(appH.ok);
     if (!appH.ok) return;
     RunResult4280 rr = runCapture4280(appH.exePath);
-    // Never a UAF: the headline row above already pins the UAF-clean
-    // signature; this row is leak-magnitude only.
+    // #4280 FAIL-WITHOUT pivot: reverting #4280's InlineArray guard
+    // (the [N]Record/[N]Choice half of `elementMayEmbedStringArgUnretained`)
+    // makes every one of the 100 calls a heap-use-after-free.
     BEZEL_EXPECT_TRUE(rr.out.find("heap-use-after-free") == std::string::npos);
-    static const std::regex kLeak(R"(AddressSanitizer: (\d+) byte\(s\) leaked)");
-    std::smatch m;
-    bool foundLeak = std::regex_search(rr.out, m, kLeak);
-    BEZEL_EXPECT_TRUE(foundLeak);
-    if (foundLeak) {
-        long bytes = std::stol(m[1].str());
-        // 100x amplification of a single-string leak (measured ~19 B/call
-        // unamplified on the sibling #4265 imported-axis shape) comfortably
-        // clears a 500 B floor without approaching an exact count (§30).
-        BEZEL_EXPECT_TRUE(bytes >= 500);
-    }
+    BEZEL_EXPECT_TRUE(rr.out.find("AddressSanitizer") == std::string::npos);
 }
 
 }  // namespace bezel::codegen
