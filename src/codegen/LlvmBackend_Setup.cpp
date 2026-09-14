@@ -28445,6 +28445,10 @@ void Emitter::collectRecordCallResultReleaseEligible(
             classCallResultWithRecordFieldEligible_.count(
                 static_cast<const void*>(ld))) {
             // Check if this local's type is a Class with Record/Choice fields.
+            // LOCALDECL-ONLY: this set is populated only by admit sites that
+            // match `var ld := <call>();` (LocalDecl, single-assignment); a
+            // runtime `const` local cannot reach here — `classCallResultWithRecordFieldEligible_`
+            // is keyed on the LocalDecl's identity, never a LocalConstDecl.
             if (auto* ldDecl = dynamic_cast<const ast::LocalDecl*>(ld)) {
                 if (ldDecl->type) {
                     if (auto* tr = ctx_.resolvedType(*ldDecl->type)) {
