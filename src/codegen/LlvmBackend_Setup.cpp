@@ -23447,24 +23447,28 @@ struct StringEscapeWalker {
     // bit-identical.
     const void* outVarIntroSite = nullptr;
 
-    // fix #4266 (§9.7 / §28.9): OPT-IN — the identity of the ONE
-    // AssignmentStmt node that is a "declare, then assign" candidate's SOLE
-    // initializing store (`var outer: P; ...; outer := <call>;`), set only
-    // by collectRecordCallResultReleaseEligible via
-    // Emitter::recordDeclareThenAssignSite_. Null for every OTHER candidate
-    // (the ordinary `var p := <call>;` shape never visits its own
-    // initializer as a generic statement, so it needs no such exclusion —
-    // see the AssignmentStmt arm below, which otherwise treats ANY plain
-    // `:=` reassignment of the tracked target as an escape in
-    // recordFieldReleaseMode). The collector proves, BEFORE setting this,
-    // that this is the target's ONLY assignment anywhere in the body and
-    // that its RHS independently satisfies the exact same freshness proof
-    // (isProvablyFreshRecordFactoryMethod / imported twin /
-    // isSynthesizedRecordDeserializeCall / isFreshRecordConstructionOf
-    // ExactType) a LocalDecl initializer would need — so recognizing this
-    // one store as safe is exactly as sound as the existing LocalDecl-init
-    // admission, not a new soundness argument.
-    const void* recordDeclareThenAssignSite = nullptr;
+    // fix #4266 (§9.7 / §28.9): OPT-IN — the SET of AssignmentStmt
+    // nodes that are a "declare, then assign" candidate's initializing
+    // stores (`var outer: P; ...; outer := <call>;`), set only by
+    // collectRecordCallResultReleaseEligible via
+    // Emitter::recordDeclareThenAssignSite_. The plain #4266 case has
+    // exactly one member; #4307's mutually-exclusive-branches case has
+    // one member per branch (if-branch AND else-branch). Empty for every
+    // OTHER candidate (the ordinary `var p := <call>;` shape never
+    // visits its own initializer as a generic statement, so it needs no
+    // such exclusion — see the AssignmentStmt arm below, which otherwise
+    // treats ANY plain `:=` reassignment of the tracked target as an
+    // escape in recordFieldReleaseMode). The collector proves, BEFORE
+    // setting this, that every member is the target's ONLY assignment on
+    // its respective path and that its RHS independently satisfies the
+    // exact same freshness proof (isProvablyFreshRecordFactoryMethod /
+    // imported twin / isSynthesizedRecordDeserializeCall /
+    // isFreshRecordConstructionOfExactType) a LocalDecl initializer
+    // would need — so recognizing EACH member as safe is exactly as
+    // sound as the existing LocalDecl-init admission, not a new
+    // soundness argument.
+    const std::unordered_set<const ast::AssignmentStmt*>*
+        recordDeclareThenAssignSet = nullptr;
 
     // fix #3729 / §9.7 / §28.9: OPT-IN pointer to the WHOLE enclosing
     // function body (the same statement list collectRecordCallResultReleaseEligible
@@ -25350,18 +25354,26 @@ struct StringEscapeWalker {
                 }
                 // fix #4266 (§9.7 / §28.9): the "declare, then assign"
                 // twin of the stringReleaseMode relaxation just above —
-                // narrower by identity, not by mode. Only the ONE
+                // narrower by SET membership, not by mode. Every
                 // AssignmentStmt node collectRecordCallResultReleaseEligible
-                // already proved is this candidate's SOLE assignment, with
-                // an independently fresh RHS, is treated as the candidate's
-                // (non-escaping) initializer; ANY other `:=` to the same
-                // target — a second assignment the collector would have
-                // seen and therefore never armed this pointer for — still
-                // falls through to `escaped = true` below, so a multiply-
-                // assigned local stays conservatively excluded exactly as
-                // before this fix.
-                if (recordDeclareThenAssignSite &&
-                    static_cast<const void*>(as) == recordDeclareThenAssignSite) {
+                // already proved is this candidate's SOLE assignment on
+                // its path, with an independently fresh RHS, is treated
+                // as the candidate's (non-escaping) initializer; ANY other
+                // `:=` to the same target — a second assignment the
+                // collector would have seen and therefore never armed a
+                // pointer for — still falls through to `escaped = true`
+                // below, so a multiply-assigned local stays
+                // conservatively excluded exactly as before this fix.
+                //
+                // fix #4307: the set is no longer a singleton — a
+                // mutually-exclusive-branches candidate has one member
+                // per branch. Each branch's assignment is independently
+                // proven-fresh and on its own respective path, so BOTH
+                // are recognized here and neither falls through to
+                // `escaped = true` (which would taint the local and
+                // suppress the scope-end release on the OTHER branch).
+                if (recordDeclareThenAssignSet &&
+                    recordDeclareThenAssignSet->count(as) != 0) {
                     expr(as->value.get(), /*safeRead=*/true);
                     return;
                 }
@@ -28224,6 +28236,37 @@ void Emitter::collectRecordCallResultReleaseEligible(
         int assignCount = 0;
         const ast::AssignmentStmt* soleAssign = nullptr;
         bool soleAssignFresh = false;
+        // fix #4307 (§9.7 / §28.9 / §22.8): per-path tracking. The plain
+        // `assignCount` above is a SYNTACTIC sum over all assignments in
+        // program order — it INCORRECTLY rejects Gap 1 (mutually-exclusive
+        // branches, see issue #4307: an `if c then outer := A; else
+        // outer := B; end` is one assignment PER PATH, not two) and
+        // INCORRECTLY admits Gap 2 (a `while ... do outer := A; end` is
+        // ONE syntactic site but N dynamic assignments on the same path —
+        // only the LAST iteration's value is then scope-end released,
+        // leaking N-1). Both defects are "safe direction" — never a
+        // double-free/UAF — but they are exactly the gap the issue's
+        // suggested direction (per §22.8's single-assignment-on-any-path
+        // model) is supposed to close.
+        //
+        // perPathMaxCount: MAX of per-branch counts. Sequential assignments
+        // accumulate (so a plain `outer := A; outer := B;` still yields 2);
+        // mutually-exclusive-branch assignments take MAX (so the if/else
+        // shape above yields 1). Computed by scanning each branch
+        // independently and merging. -1 means "no assignments anywhere".
+        int perPathMaxCount = -1;
+        // anyAssignInLoop: OR across all assignments of "this assignment
+        // is inside a WhileStmt/ForStmt body". Loop bodies execute at least
+        // once (the iteration path), so an assignment inside one is a
+        // dynamic multi-assignment on that path and the per-path max count
+        // is therefore > 1 — admission is REJECTED when this is true.
+        bool anyAssignInLoop = false;
+        // fix #4307: every per-path fresh AssignmentStmt the second pass
+        // found, used to populate the recordDeclareThenAssignSite_ SET so
+        // the escape walker recognizes ALL branch assignments as the
+        // non-escaping initializer (not just the last one the sequential
+        // scan saw).
+        std::vector<const ast::AssignmentStmt*> perPathAllFreshAssigns;
     };
     std::unordered_map<const ast::Node*, NoInitAssignState> noInitDecls;
     // fix #4300: parallel map for Class-with-Record/Choice-field locals.
@@ -28507,22 +28550,421 @@ void Emitter::collectRecordCallResultReleaseEligible(
     };
     for (auto& s : body) scan(s.get());
 
+    // fix #4307 (§9.7 / §28.9 / §22.8): second pass over the body that
+    // refines the per-path admission gate. The main `scan` above still does
+    // the syntactic assignment counting (assignCount / soleAssign /
+    // soleAssignFresh) — it is the EXISTING #4266 instrumented machinery.
+    // This second pass is ADDITIVE: it only writes the two #4307 fields
+    // (anyAssignInLoop, perPathMaxCount), so the existing #4266 surface is
+    // bit-for-bit unchanged when both refinements resolve to "no change".
+    //
+    //   (a) `markInLoopAssignments` walks the body and, on every
+    //       AssignmentStmt found inside a WhileStmt/ForStmt body
+    //       (recursively — a loop inside an if inside a loop still
+    //       counts), sets the assigned decl's `anyAssignInLoop = true`.
+    //       Outside any loop body the flag stays false. Gap 2 closure.
+    //   (b) `computePerPathMaxCount` walks each IfStmt (recursively) and,
+    //       when the if has an else body, computes the per-branch count
+    //       of assignments to each noInit decl and merges via MAX
+    //       (mutually-exclusive branches → 1 assignment per path →
+    //       max=1). When counts differ across branches the merged
+    //       freshness follows the higher-count branch's first-fresh
+    //       AssignmentStmt — exactly the same "per-path first-fresh"
+    //       rule §22.8 names for fields. The existing assignCount /
+    //       soleAssign remain the SEQUENTIAL-count fallback for the
+    //       no-branch case. Gap 1 closure.
+    {
+        // fix #4307 (Gap 2): mark every decl whose assignment is in a
+        // loop body WHILE the decl itself was declared OUTSIDE that loop
+        // body (or any enclosing one). Recurse into nested control flow
+        // so a loop inside an if inside a while still inside a loop all
+        // count.
+        //
+        // The depth check is critical: a `var outer: P;` AND its
+        // reassignment `outer := A;` BOTH INSIDE the same WhileStmt body
+        // are PER-ITERATION — the scope-end release fires per iteration
+        // and the per-iteration local is fresh on every iteration (the
+        // #4266 admitted shape, already pinned in
+        // record_declare_then_assign_call_result_release_4266_test.cpp).
+        // A `var outer: P;` OUTSIDE the loop body and its reassignment
+        // INSIDE the body is the actual Gap 2 — N dynamic assignments on
+        // a single execution path; only the last survives scope-end
+        // release. The depth check correctly distinguishes them.
+        std::unordered_map<const ast::Node*, int> declDepthAtDecl;
+        std::function<void(const ast::Stmt*, int)> walkAll =
+            [&](const ast::Stmt* s, int depth) {
+            if (!s) return;
+            if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s)) {
+                if (noInitDecls.count(s) || noInitClassDecls.count(s))
+                    declDepthAtDecl[s] = depth;
+            }
+            if (auto* is = dynamic_cast<const ast::IfStmt*>(s)) {
+                for (auto& b : is->ifBranch.body) walkAll(b.get(), depth);
+                for (auto& br : is->elifBranches)
+                    for (auto& b : br.body) walkAll(b.get(), depth);
+                for (auto& b : is->elseBody) walkAll(b.get(), depth);
+                return;
+            }
+            if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s)) {
+                for (auto& b : ws->body) walkAll(b.get(), depth + 1);
+                return;
+            }
+            if (auto* fs = dynamic_cast<const ast::ForStmt*>(s)) {
+                for (auto& b : fs->body) walkAll(b.get(), depth + 1);
+                return;
+            }
+            if (auto* d = dynamic_cast<const ast::DoEndBlock*>(s)) {
+                for (auto& b : d->body) walkAll(b.get(), depth);
+                return;
+            }
+            if (auto* ts = dynamic_cast<const ast::TryStmt*>(s)) {
+                for (auto& b : ts->body) walkAll(b.get(), depth);
+                for (auto& c : ts->catches) walkAll(c.body.get(), depth);
+                for (auto& b : ts->finallyBody) walkAll(b.get(), depth);
+                return;
+            }
+            if (auto* cs = dynamic_cast<const ast::CaseStmt*>(s)) {
+                for (auto& arm : cs->arms)
+                    for (auto& a : arm.stmts) walkAll(a.get(), depth);
+                return;
+            }
+        };
+        for (auto& s : body) walkAll(s.get(), 0);
+
+        // fix #4307: second sub-pass — for every AssignmentStmt in the
+        // body, find the target decl's recorded depth and the assignment
+        // site's depth. If assignmentDepth > declDepth, the assignment
+        // targets an outer-scope decl from inside a deeper loop body →
+        // dynamic multi-assignment, mark anyAssignInLoop.
+        std::function<void(const ast::Stmt*, int)> markInLoop =
+            [&](const ast::Stmt* s, int depth) {
+            if (!s) return;
+            if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(s)) {
+                if (as->op == ":=") {
+                    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
+                            as->target.get())) {
+                        if (auto* loc = dynamic_cast<sema::LocalSymbol*>(
+                                ctx_.exprSymbol(*id))) {
+                            auto itDD = declDepthAtDecl.find(loc->decl);
+                            if (itDD != declDepthAtDecl.end() &&
+                                depth > itDD->second) {
+                                auto itNL = noInitDecls.find(loc->decl);
+                                if (itNL != noInitDecls.end())
+                                    itNL->second.anyAssignInLoop = true;
+                                auto itNL2 =
+                                    noInitClassDecls.find(loc->decl);
+                                if (itNL2 != noInitClassDecls.end())
+                                    itNL2->second.anyAssignInLoop = true;
+                            }
+                        }
+                    }
+                }
+            }
+            if (auto* is = dynamic_cast<const ast::IfStmt*>(s)) {
+                for (auto& b : is->ifBranch.body) markInLoop(b.get(), depth);
+                for (auto& br : is->elifBranches)
+                    for (auto& b : br.body) markInLoop(b.get(), depth);
+                for (auto& b : is->elseBody) markInLoop(b.get(), depth);
+                return;
+            }
+            if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s)) {
+                for (auto& b : ws->body) markInLoop(b.get(), depth + 1);
+                return;
+            }
+            if (auto* fs = dynamic_cast<const ast::ForStmt*>(s)) {
+                for (auto& b : fs->body) markInLoop(b.get(), depth + 1);
+                return;
+            }
+            if (auto* d = dynamic_cast<const ast::DoEndBlock*>(s)) {
+                for (auto& b : d->body) markInLoop(b.get(), depth);
+                return;
+            }
+            if (auto* ts = dynamic_cast<const ast::TryStmt*>(s)) {
+                for (auto& b : ts->body) markInLoop(b.get(), depth);
+                for (auto& c : ts->catches) markInLoop(c.body.get(), depth);
+                for (auto& b : ts->finallyBody) markInLoop(b.get(), depth);
+                return;
+            }
+            if (auto* cs = dynamic_cast<const ast::CaseStmt*>(s)) {
+                for (auto& arm : cs->arms)
+                    for (auto& a : arm.stmts) markInLoop(a.get(), depth);
+                return;
+            }
+        };
+        for (auto& s : body) markInLoop(s.get(), 0);
+
+        // fix #4307 (Gap 1): per-branch MAX counting for mutually
+        // exclusive branches. For each noInit decl with at least one
+        // assignment, find every IfStmt (recursively) that has an else
+        // body and whose if-branch / elif-branches / else-branch contain
+        // assignments to that decl; compute the per-branch count and merge
+        // via MAX into perPathMaxCount. Freshness is tracked via
+        // perVarAssign (the first fresh AssignmentStmt per branch), used
+        // when the merged max comes from a single-assigning branch so the
+        // recorded soleAssignFresh is meaningful.
+        //
+        // Algorithm per IfStmt (the inner if/elif/else partition):
+        //   for each branch b ∈ {ifBranch, elifBranches, elseBody}:
+        //     perVarCount[decl]    = number of `decl := ...` in b
+        //     perVarFirstFresh[decl] = first AssignmentStmt in b whose RHS
+        //                              is fresh (rhsIsFreshRecordSource),
+        //                              OR nullptr if no fresh assignment
+        //   then merge across branches: take MAX of counts, and:
+        //     - if counts equal across all branches assigning: AND of
+        //       per-branch "first was fresh" → single soleAssign
+        //     - if counts differ: pick the branch with the max count's
+        //       first-fresh AssignmentStmt as soleAssign (the lower-count
+        //       branches are irrelevant to the max)
+        struct BranchCount {
+            std::unordered_map<const ast::Node*, int> perVarCount;
+            std::unordered_map<const ast::Node*,
+                              const ast::AssignmentStmt*> perVarFirstFresh;
+            std::unordered_map<const ast::Node*, bool> perVarFirstFreshFlag;
+        };
+        auto scanBranch =
+            [&](const std::vector<std::unique_ptr<ast::Stmt>>& stmts,
+                BranchCount& bc) {
+            for (auto& bs : stmts) {
+                if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(
+                        bs.get())) {
+                    if (as->op == ":=") {
+                        if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
+                                as->target.get())) {
+                            if (auto* loc = dynamic_cast<sema::LocalSymbol*>(
+                                    ctx_.exprSymbol(*id))) {
+                                auto it2 = noInitDecls.find(loc->decl);
+                                if (it2 != noInitDecls.end()) {
+                                    bc.perVarCount[loc->decl] += 1;
+                                    if (bc.perVarFirstFreshFlag.find(
+                                            loc->decl) ==
+                                        bc.perVarFirstFreshFlag.end()) {
+                                        bool fresh = rhsIsFreshRecordSource(
+                                            as->value.get(),
+                                            it2->second.declaredType);
+                                        bc.perVarFirstFreshFlag[loc->decl] = fresh;
+                                        if (fresh)
+                                            bc.perVarFirstFresh[loc->decl] = as;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        };
+        std::function<void(const ast::Stmt*)> computePerPath =
+            [&](const ast::Stmt* s) {
+            if (!s) return;
+            if (auto* is = dynamic_cast<const ast::IfStmt*>(s)) {
+                if (!is->elseBody.empty()) {
+                    // Compute per-branch counts.
+                    std::vector<BranchCount> branches;
+                    BranchCount thenC;
+                    scanBranch(is->ifBranch.body, thenC);
+                    branches.push_back(std::move(thenC));
+                    for (auto& br : is->elifBranches) {
+                        BranchCount ec;
+                        scanBranch(br.body, ec);
+                        branches.push_back(std::move(ec));
+                    }
+                    BranchCount elseC;
+                    scanBranch(is->elseBody, elseC);
+                    branches.push_back(std::move(elseC));
+                    // Merge: for each decl in the union of perVarCount,
+                    // compute MAX count, then:
+                    //   - if all assigning branches agree on count: AND the
+                    //     per-branch first-fresh flags; pick the first
+                    //     branch's soleAssign
+                    //   - if counts differ: take the max-counting branch's
+                    //     first-fresh AssignmentStmt as soleAssign
+                    std::unordered_set<const ast::Node*> allDecls;
+                    for (auto& bc : branches)
+                        for (auto& kv : bc.perVarCount)
+                            allDecls.insert(kv.first);
+                    for (auto* d : allDecls) {
+                        auto it = noInitDecls.find(d);
+                        if (it == noInitDecls.end()) continue;
+                        NoInitAssignState& st = it->second;
+                        int maxCount = 0;
+                        for (auto& bc : branches)
+                            if (auto f = bc.perVarCount.find(d);
+                                f != bc.perVarCount.end())
+                                maxCount = std::max(maxCount, f->second);
+                        // Skip if no branch actually assigned.
+                        if (maxCount == 0) continue;
+                        // Count how many branches assign this decl.
+                        int assigningBranches = 0;
+                        int maxCountBranches = 0;
+                        bool allFresh = true;
+                        const ast::AssignmentStmt* maxFreshAssign = nullptr;
+                        for (auto& bc : branches) {
+                            if (auto f = bc.perVarCount.find(d);
+                                f != bc.perVarCount.end()) {
+                                assigningBranches++;
+                                if (f->second == maxCount) {
+                                    maxCountBranches++;
+                                    bool fresh = false;
+                                    if (auto ff = bc.perVarFirstFreshFlag.find(d);
+                                        ff != bc.perVarFirstFreshFlag.end())
+                                        fresh = ff->second;
+                                    if (!fresh) allFresh = false;
+                                    if (fresh) {
+                                        if (auto fa = bc.perVarFirstFresh.find(d);
+                                            fa != bc.perVarFirstFresh.end())
+                                            maxFreshAssign = fa->second;
+                                    }
+                                }
+                            }
+                        }
+                        // Update st.perPathMaxCount (MAX of current and this).
+                        if (st.perPathMaxCount < 0)
+                            st.perPathMaxCount = maxCount;
+                        else
+                            st.perPathMaxCount =
+                                std::max(st.perPathMaxCount, maxCount);
+                        // If counts agree across all assigning branches
+                        // AND all are fresh, take the first branch's
+                        // first-fresh as soleAssign. Otherwise (mismatch
+                        // or any non-fresh) reject by clearing the sole
+                        // admit info: the admission gate below will skip.
+                        if (assigningBranches == maxCountBranches &&
+                            maxCountBranches > 0 && allFresh &&
+                            maxCount == 1) {
+                            // All assigning branches assign exactly once
+                            // with a fresh RHS — admit by recording the
+                            // first branch's first-fresh AssignmentStmt.
+                            // This OVERRIDES the syntactic soleAssign
+                            // (which the main scan set to whichever stmt
+                            // was last visited) so the walker treats the
+                            // correct (per-path) initializing store as
+                            // non-escaping.
+                            if (maxFreshAssign) {
+                                // Find any branch's first-fresh for soleAssign.
+                                for (auto& bc : branches) {
+                                    if (auto f = bc.perVarFirstFresh.find(d);
+                                        f != bc.perVarFirstFresh.end()) {
+                                        st.soleAssign = f->second;
+                                        st.soleAssignFresh = true;
+                                        break;
+                                    }
+                                }
+                                // fix #4307: collect every per-path
+                                // fresh AssignmentStmt so the admission
+                                // gate can populate the SET the escape
+                                // walker checks. For a plain #4266
+                                // candidate this is one member; for
+                                // mutually-exclusive branches it's one
+                                // per branch.
+                                for (auto& bc : branches) {
+                                    if (auto f = bc.perVarFirstFresh.find(d);
+                                        f != bc.perVarFirstFresh.end()) {
+                                        st.perPathAllFreshAssigns.push_back(
+                                            f->second);
+                                    }
+                                }
+                            }
+                        } else if (maxCount > 1 ||
+                                   (assigningBranches > 0 && !allFresh)) {
+                            // Multi-assignment per path or fresh mismatch —
+                            // disqualify the candidate. Setting perPathMaxCount
+                            // > 1 is the gate the admission loop below
+                            // reads; clearing soleAssign keeps the existing
+                            // safe-leak fallback intact.
+                            st.soleAssign = nullptr;
+                            st.soleAssignFresh = false;
+                        }
+                    }
+                }
+                // Recurse into branches for nested IfStmts (a fresh
+                // IfStmt inside an outer if may itself have an else body
+                // and need its own per-branch MAX).
+                for (auto& b : is->ifBranch.body) computePerPath(b.get());
+                for (auto& br : is->elifBranches)
+                    for (auto& b : br.body) computePerPath(b.get());
+                for (auto& b : is->elseBody) computePerPath(b.get());
+                return;
+            }
+            if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s)) {
+                for (auto& b : ws->body) computePerPath(b.get());
+                return;
+            }
+            if (auto* fs = dynamic_cast<const ast::ForStmt*>(s)) {
+                for (auto& b : fs->body) computePerPath(b.get());
+                return;
+            }
+            if (auto* d = dynamic_cast<const ast::DoEndBlock*>(s)) {
+                for (auto& b : d->body) computePerPath(b.get());
+                return;
+            }
+            if (auto* ts = dynamic_cast<const ast::TryStmt*>(s)) {
+                for (auto& b : ts->body) computePerPath(b.get());
+                for (auto& c : ts->catches) computePerPath(c.body.get());
+                for (auto& b : ts->finallyBody) computePerPath(b.get());
+                return;
+            }
+            if (auto* cs = dynamic_cast<const ast::CaseStmt*>(s)) {
+                for (auto& arm : cs->arms)
+                    for (auto& a : arm.stmts) computePerPath(a.get());
+                return;
+            }
+        };
+        for (auto& s : body) computePerPath(s.get());
+    }
+
     // fix #4266: admit every "declare, then assign" root that ended the
     // scan with EXACTLY one assignment site and a proven-fresh RHS — the
     // same bar `candidates` already holds every LocalDeclInitView entry to.
+    //
+    // fix #4307 (§9.7 / §28.9 / §22.8): the admission's count check is
+    // now per-path. A decl that never appeared inside any if-with-else
+    // (`perPathMaxCount < 0`) keeps the #4266 syntactic-count check
+    // (`assignCount == 1`) — bit-for-bit unchanged for that surface, which
+    // is the most common case. A decl that DID participate in such an if
+    // uses the per-path max (mutually-exclusive-branch assignments →
+    // max=1; sequential or one-branch-multi-assignment → max>1, reject).
+    // The plain `assignCount` is still tracked for the bookkeeping that
+    // identifies "is there any assignment at all" and for the FAIL-WITHOUT
+    // shape on plain (no-branch) multi-assignment — its disappearance
+    // would break the #4266 admission of the in-statement-no-branches
+    // shape, which is unchanged by #4307 by design.
+    //
+    // ADDITIONALLY:
+    //   (a) `anyAssignInLoop` REJECTS Gap 2 (`for ... do outer := A; end`
+    //       is ONE syntactic site but N dynamic assignments on the same
+    //       path; per-path max > 1 → reject — falls back to safe leak).
+    //   (b) soleAssign / soleAssignFresh bookkeeping drops any
+    //       fresh-mismatch across branches (the second pass above clears
+    //       them when merging finds one branch with a non-fresh assignment
+    //       while another has a fresh one).
     for (const auto& kv : noInitDecls) {
         const NoInitAssignState& st = kv.second;
-        if (st.assignCount == 1 && st.soleAssignFresh && st.soleAssign) {
+        int effectiveCount =
+            (st.perPathMaxCount >= 0) ? st.perPathMaxCount : st.assignCount;
+        if (effectiveCount == 1 && st.soleAssignFresh && st.soleAssign &&
+            !st.anyAssignInLoop) {
             candidates.push_back(kv.first);
-            recordDeclareThenAssignSite_[static_cast<const void*>(kv.first)] =
-                st.soleAssign;
+            // fix #4307: populate the SET of valid assignment sites. For a
+            // plain (no-branch) #4266 candidate this is a single-member
+            // set; for a mutually-exclusive-branches candidate it has one
+            // member per branch (each on its own path, each proven-fresh).
+            auto& slotSet =
+                recordDeclareThenAssignSite_[static_cast<const void*>(kv.first)];
+            slotSet.insert(st.soleAssign);
+            // Also include any other fresh assignments that the per-path
+            // scan recorded (one per branch of the if-with-else case).
+            for (auto* otherAssign : st.perPathAllFreshAssigns) {
+                if (otherAssign) slotSet.insert(otherAssign);
+            }
         }
     }
     // fix #4300: admit Class-with-Record/Choice-field "declare, then assign"
     // candidates using the parallel map.
     for (const auto& kv : noInitClassDecls) {
         const NoInitAssignState& st2 = kv.second;
-        if (st2.assignCount == 1 && st2.soleAssignFresh && st2.soleAssign) {
+        int effectiveCount2 =
+            (st2.perPathMaxCount >= 0) ? st2.perPathMaxCount : st2.assignCount;
+        if (effectiveCount2 == 1 && st2.soleAssignFresh && st2.soleAssign &&
+            !st2.anyAssignInLoop) {
             candidates.push_back(kv.first);
             classCallResultWithRecordFieldEligible_
                 [static_cast<const void*>(kv.first)] = st2.soleAssign;
@@ -28539,12 +28981,16 @@ void Emitter::collectRecordCallResultReleaseEligible(
         // candidate admitted via that path — a map-lookup miss for the
         // ordinary `var p := <call>;` candidates leaves this null, so
         // their behaviour is bit-for-bit unchanged.
+        //
+        // fix #4307: the value is a SET of AssignmentStmt* (one per path
+        // — singleton for plain #4266, one-per-branch for mutually
+        // exclusive branches). Each member is independently proven-fresh
+        // by the collector (rhsIsFreshRecordSource) on its own path.
         {
             auto dtaIt = recordDeclareThenAssignSite_.find(
                 static_cast<const void*>(ld));
             if (dtaIt != recordDeclareThenAssignSite_.end())
-                w.recordDeclareThenAssignSite =
-                    static_cast<const void*>(dtaIt->second);
+                w.recordDeclareThenAssignSet = &dtaIt->second;
         }
         // fix #3729 / §9.7 / §28.9: the WHOLE function body, for the
         // copy-alias relaxation's own nested non-escape check (see the
@@ -29289,8 +29735,14 @@ void Emitter::collectInlineArrayStringCallResultReleaseEligible(
                     inlineArrayElementCarriesString(tr)) {
                     StringEscapeWalker w{ctx_, static_cast<const void*>(kv.first)};
                     w.recordFieldReleaseMode = true;
-                    w.recordDeclareThenAssignSite =
-                        static_cast<const void*>(as);
+                    // fix #4307: the SET (not single pointer) holds one
+                    // AssignmentStmt* per path; for this inline-array
+                    // single-path shape it has exactly one member.
+                    {
+                        auto& slotSet = recordDeclareThenAssignSite_[static_cast<const void*>(kv.first)];
+                        slotSet.insert(as);
+                        w.recordDeclareThenAssignSet = &slotSet;
+                    }
                     w.wholeBody = &body;
                     w.scrutineeBorrowMode = true;
                     for (auto& bs : body) {

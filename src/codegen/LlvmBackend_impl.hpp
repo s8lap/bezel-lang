@@ -11422,7 +11422,19 @@ private:
     // a generic statement at all). Populated only by
     // collectRecordCallResultReleaseEligible; empty for every candidate
     // admitted the ordinary way.
-    std::unordered_map<const void*, const ast::AssignmentStmt*>
+    //
+    // fix #4307 (§9.7 / §28.9 / §22.8): the value is now a SET, not a
+    // single AssignmentStmt*. The plain #4266 case has exactly one
+    // member (a single `outer := ...` site); the mutually-exclusive-
+    // branches case has one per branch (if-branch AND else-branch each
+    // contain a valid `outer := ...` site, and BOTH must be recognized
+    // by the escape walker as the non-escaping initializer — anything
+    // else marks one branch's assignment as an escape and taints the
+    // local globally, leaking that branch's record string fields at
+    // scope end). The escape walker's `recordDeclareThenAssignSet`
+    // membership check (a SET lookup, O(1) amortized) replaces the
+    // old pointer-equality check.
+    std::unordered_map<const void*, std::unordered_set<const ast::AssignmentStmt*>>
         recordDeclareThenAssignSite_;
 
     // fix #1747: walk the function body, classifying each plain-`var`
