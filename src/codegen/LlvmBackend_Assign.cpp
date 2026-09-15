@@ -5045,6 +5045,25 @@ const ast::PropertyAccessor* Emitter::blockGetterOf(sema::Symbol* sym) {
 //     `return;` inside a nested body branches to it (LlvmBackend_Stmts.cpp
 //     ~1777). Latent (sema rejects a valueless return in a value-returning
 //     accessor) but a cross-function `br` if ever reached.
+//   * currentChoiceMethod_ — fix #4143 (§35.2/§35.5, v0.295), found by the R17
+//     review of fix #4113 (which ADDED this member without adding it here).
+//     `choiceTypeOf` (LlvmBackend_Setup.cpp) falls back to it to resolve a
+//     bare `this`/`base` at a choice property's three accessor call sites
+//     (LlvmBackend_Exprs.cpp inline getter read, `ensurePropertyAccessorFn`,
+//     `makePropertyThunk`). Unlike currentEnumMethod_ below, this one IS
+//     cleared here — see the member's own declaration comment
+//     (LlvmBackend_impl.hpp) and the NestedBodyScope struct's comment on
+//     `choiceMethod_` for the destructive-vs-soft-hint distinction that makes
+//     the two asymmetric. Repro: a class property (`Animal.Sound`, a BLOCK-
+//     form getter reached via `ensurePropertyBlockGetter`, one of this
+//     guard's six emitters) whose body is `case this of Dog => ..., Cat =>
+//     ...` printed the wildcard arm instead of the correct one when first
+//     touched from inside a `choice` property's getter window — the leaked
+//     `currentChoiceMethod_` (the CALLER's choice type) got folded into
+//     `Animal`'s own CaseExpr scrutinee TypeRef at LlvmBackend_Exprs2.cpp's
+//     "scrutTy not already a Choice" guard, silently reclassifying a class
+//     receiver as the wrong choice type. A crash would have been loud; this
+//     was a silent wrong answer.
 //
 // ── DELIBERATELY INHERITED (resetting these would be a NEW bug) ──
 // This list is the reason this guard is not simply "reset everything". Each
@@ -5061,14 +5080,30 @@ const ast::PropertyAccessor* Emitter::blockGetterOf(sema::Symbol* sym) {
 //     so a `new Foo<T>()` inside a getter body desynchronised the two halves)
 //     but likewise NOT cleared, for the same reason.
 //   * currentEnumMethod_ — `enumTypeOf` (LlvmBackend_Setup.cpp ~288) falls back
-//     to it to resolve a bare `this` in an enum member. The correct value
-//     inside a block getter is the getter's OWN owning type when that type is
-//     an enum (which is precisely what `ensurePropertyAccessorFn` sets for
-//     itself, #574) and null otherwise — NOT null unconditionally. The two
-//     block-getter entry points do not receive the owning `TypeSymbol`, so
-//     resetting it blind here would break a block-bodied ENUM property read
-//     from inside an enum member, which works today. Left inherited on
-//     purpose; #2702 item 3 stays open for the set-from-owner fix.
+//     to it to resolve a bare `this` in an enum member. DECLINED alongside
+//     the #4143 choice fix above rather than bundled with it (fix #4143
+//     revisited this entry and re-verified rather than trusting it as
+//     written): the original "resetting would break a block-bodied ENUM
+//     property, which works today" claim is now STALE — spec §10.5 forbids
+//     an enum from declaring ANY block-form or storage-backed property or
+//     indexer at all (confirmed mechanically: `enum E ... property P: int
+//     get => 7; end P; end E;` is REJECTED, "enum `E` may not declare a
+//     block-form property (§10.5)", also enforced by fix #2499), so none of
+//     this guard's six memoized builders can ever be reached with an
+//     enum-typed OWNING type for its own accessor — the scenario the old
+//     comment worried about is unreachable. But UNLIKE choice's leak, an
+//     enum's leaked value does not destructively overwrite the CaseExpr
+//     scrutinee TypeRef (there is no enum-side analogue of choice's "scrutTy
+//     not already a Choice" overwrite guard in LlvmBackend_Exprs2.cpp) — it
+//     only feeds `enumTy`, a separate parameter `patternMatches` consults to
+//     resolve a BARE identifier pattern as an enum-constant NAME
+//     (`enumConstantByName`). Whether a leaked cross-type `enumTy` can still
+//     cause a wrong match for some OTHER (class/record) body whose `case
+//     this` pattern names happen to collide with the leaked enum's constant
+//     names is a real but narrower and unmeasured question, out of scope for
+//     an unblocking fix — filed as a follow-up (#4143's issue) rather than
+//     guessed at and clobbered here. Left inherited; #2702 item 3 stays open
+//     for the set-from-owner fix that would make clearing it safe in general.
 //   * currentSpecMethodSymbol_ / emittingGenericTemplateBody_ /
 //     templateGenericParamNames_ — same shape as currentEnumMethod_: the right
 //     value depends on whether the getter's OWN owner is an unspecialised
@@ -5081,7 +5116,8 @@ Emitter::NestedBodyScope::NestedBodyScope(Emitter& e)
       retNode_(e.currentReturnTypeNode_),
       lamRet_(e.currentLambdaReturnSemaTy_),
       accessorRetNode_(e.accessorReturnTypeNode_),   // #2703
-      accessorRetFn_(e.accessorReturnTypeFn_)        // #2703
+      accessorRetFn_(e.accessorReturnTypeFn_),       // #2703
+      choiceMethod_(e.currentChoiceMethod_)          // #4143
 // fix #3551 (§29.3 / §30.1 / §30.7, v0.286): the suspend/resume frame members
 // (save+clear at ctor, restore at dtor) are generated from
 // BEZEL_SM_FRAME_MEMBERS so a member added to the macro is handled in all
@@ -5109,6 +5145,7 @@ Emitter::NestedBodyScope::NestedBodyScope(Emitter& e)
     e.currentLambdaReturnSemaTy_ = nullptr;
     e.accessorReturnTypeNode_    = nullptr;              // #2703
     e.accessorReturnTypeFn_      = nullptr;              // #2703
+    e.currentChoiceMethod_       = nullptr;              // #4143
     e.emittingDisposerBody_      = false;
     e.disposerEntryExc_          = nullptr;
     e.currentCaughtName_         = {};
@@ -5150,6 +5187,7 @@ Emitter::NestedBodyScope::~NestedBodyScope() {
     e_.currentLambdaReturnSemaTy_ = lamRet_;
     e_.accessorReturnTypeNode_    = accessorRetNode_;   // #2703
     e_.accessorReturnTypeFn_      = accessorRetFn_;     // #2703
+    e_.currentChoiceMethod_       = choiceMethod_;      // #4143
     e_.emittingDisposerBody_      = emittingDisposerBody_;
     e_.disposerEntryExc_          = disposerEntryExc_;
     e_.currentCaughtName_         = currentCaughtName_;
@@ -5659,6 +5697,28 @@ llvm::Function* Emitter::ensurePropertyAccessorFn(const sema::TypeSymbol* cls,
     if (cls && cls->kind == ast::TypeDeclKind::Enum)
         currentEnumMethod_ = cls;
 
+    // fix #4113 (§35.2/§35.5, v0.295): the choice twin of the enum
+    // workaround above — a choice property's BLOCK-bodied getter/setter (or
+    // an interface/box-dispatch accessor built here) whose body is
+    // `case this of …` needs the identical choiceTypeOf() recovery: this
+    // accessor function is never registered in methodFns_ (it is not a
+    // MethodSymbol), so choiceTypeOf's existing "this" recovery would
+    // otherwise find nothing.
+    //
+    // fix #4143 (§35.2/§35.5, v0.295): SET-FROM-OWNER, not conditionally-
+    // set-else-inherit, for consistency with the other two property-
+    // accessor sites (LlvmBackend_Exprs.cpp, LlvmBackend_Layout.cpp) fixed
+    // alongside this one. `NestedBodyScope` (constructed above in this
+    // function) already clears `currentChoiceMethod_` to null before this
+    // point runs, so the `else` branch is defensive rather than
+    // load-bearing here today — but this function's OWN identity should
+    // not depend on a caller of a different guard having gotten its clear
+    // list right; see that guard's `choiceMethod_` member for the
+    // destructive-overwrite mechanism this protects against.
+    const sema::TypeSymbol* savedChoiceMethod2 = currentChoiceMethod_;
+    currentChoiceMethod_ =
+        (cls && cls->kind == ast::TypeDeclKind::Choice) ? cls : nullptr;
+
     if (!isSet) {
         // --- Getter body. ---
         if (isAuto && isStaticProp) {
@@ -5990,6 +6050,7 @@ llvm::Function* Emitter::ensurePropertyAccessorFn(const sema::TypeSymbol* cls,
 
     // --- Restore state. ---
     currentEnumMethod_   = savedEnumMethod2;
+    currentChoiceMethod_ = savedChoiceMethod2;
     currentFn_          = savedFn;
     currentThis_        = savedThis;
     locals_             = std::move(savedLocals);
@@ -6723,7 +6784,66 @@ const ast::PropertyAccessor* Emitter::computedSetterOf(const ast::Expr& target) 
 
 bool Emitter::lowerPropertySet(const ast::Expr& target, const ast::Expr& value) {
     if (!computedSetterOf(target)) return false;
-    llvm::Value* v = lowerExpr(value);
+    llvm::Value* v = nullptr;
+    // fix #4345 property-setter twin (§5.1/§11.2/§15.4, v0.298): the
+    // indexer-setter codegen had no case for a CollectionLiteralExpr RHS —
+    // `lowerExpr` returns null for one (§15.4), the assignment silently
+    // degraded via the pre-existing #4045 backstop, and the write never
+    // happened. The sema side (§4316's gate that admits the conforming
+    // program and rejects the non-conforming twin) applies here too.
+    // Mirror the indexer-setter / local-decl / return-stmt / field-init
+    // pattern exactly: a literal RHS targeting an INLINE-array property
+    // builds the [N x elem] aggregate by-value; a literal targeting a
+    // HEAP collection goes through materializeHeapCollectionLiteral /
+    // materializeHeapDictLiteral. Target type is read from
+    // ctx_.exprType(target) (the property's declared type).
+    if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(&value)) {
+        const sema::TypeRef* propTy = ctx_.exprType(target);
+        if (propTy && propTy->kind == sema::TypeRef::Kind::InlineArray &&
+            !cl->isDict) {
+            if (auto* aty = llvm::dyn_cast<llvm::ArrayType>(
+                    lowerTypeRef(propTy))) {
+                llvm::Type* elemTy = aty->getElementType();
+                llvm::AllocaInst* tmp = entryAlloca(aty);
+                for (std::size_t i = 0; i < cl->elements.size(); ++i) {
+                    if (!cl->elements[i]) continue;
+                    llvm::Value* ev = lowerExpr(*cl->elements[i]);
+                    if (!ev) {
+                        ev = lowerCollectionLiteralElementOrUnitNull(
+                            *cl->elements[i], elemTy);
+                        if (!ev) {
+                            ctx_.diagnostics().report(
+                                Severity::Error,
+                                cl->elements[i]->span.begin,
+                                "internal: lowerExpr returned null for "
+                                "property-setter inline-array collection-literal "
+                                "element — #1386");
+                            continue;
+                        }
+                    }
+                    if (ev->getType() != elemTy &&
+                        ev->getType()->isIntegerTy() &&
+                        elemTy->isIntegerTy()) {
+                        unsigned eb = ev->getType()->getIntegerBitWidth();
+                        unsigned db = elemTy->getIntegerBitWidth();
+                        ev = db > eb ? builder_.CreateSExt(ev, elemTy)
+                                     : builder_.CreateTrunc(ev, elemTy);
+                    }
+                    llvm::Value* gep = builder_.CreateGEP(
+                        aty, tmp,
+                        {builder_.getInt32(0),
+                         builder_.getInt32((unsigned)i)});
+                    builder_.CreateStore(ev, gep);
+                }
+                v = builder_.CreateLoad(aty, tmp, "pset.inlarr");
+            }
+        } else if (propTy && !cl->isDict) {
+            v = materializeHeapCollectionLiteral(cl, propTy);
+        } else if (propTy && !cl->keys.empty()) {
+            v = materializeHeapDictLiteral(cl, propTy);
+        }
+    }
+    if (!v) v = lowerExpr(value);
     // fix #2568: thread `value` through as valueExpr so lowerPropertySetValue
     // can release a +1 producer passed directly to a CLASS-owned computed
     // setter (see the comment on the lambda above). The `ref`/`out` write-
@@ -7263,7 +7383,60 @@ bool Emitter::lowerImportedPropertySet(const ast::Expr& target,
     // `value` is lowered, so a non-matching target never double-evaluates it).
     if (!importedPropSetterFns_.count(ps) &&
         !importedStaticPropSetterFns_.count(ps)) return false;
-    llvm::Value* v = lowerExpr(value);
+    llvm::Value* v = nullptr;
+    // fix #4345 imported-property-setter twin (§5.1/§11.2/§15.4, v0.298):
+    // mirrors the lowerPropertySet fix above. An imported property setter's
+    // RHS that is a CollectionLiteralExpr would silently degrade via the
+    // #4045 backstop — lowerExpr returns null for one (§15.4) and the
+    // write never happened. Use ctx_.exprType(target) for the property's
+    // declared type, exactly as lowerPropertySet does.
+    if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(&value)) {
+        const sema::TypeRef* propTy = ctx_.exprType(target);
+        if (propTy && propTy->kind == sema::TypeRef::Kind::InlineArray &&
+            !cl->isDict) {
+            if (auto* aty = llvm::dyn_cast<llvm::ArrayType>(
+                    lowerTypeRef(propTy))) {
+                llvm::Type* elemTy = aty->getElementType();
+                llvm::AllocaInst* tmp = entryAlloca(aty);
+                for (std::size_t i = 0; i < cl->elements.size(); ++i) {
+                    if (!cl->elements[i]) continue;
+                    llvm::Value* ev = lowerExpr(*cl->elements[i]);
+                    if (!ev) {
+                        ev = lowerCollectionLiteralElementOrUnitNull(
+                            *cl->elements[i], elemTy);
+                        if (!ev) {
+                            ctx_.diagnostics().report(
+                                Severity::Error,
+                                cl->elements[i]->span.begin,
+                                "internal: lowerExpr returned null for "
+                                "imported-property-setter inline-array "
+                                "collection-literal element — #1386");
+                            continue;
+                        }
+                    }
+                    if (ev->getType() != elemTy &&
+                        ev->getType()->isIntegerTy() &&
+                        elemTy->isIntegerTy()) {
+                        unsigned eb = ev->getType()->getIntegerBitWidth();
+                        unsigned db = elemTy->getIntegerBitWidth();
+                        ev = db > eb ? builder_.CreateSExt(ev, elemTy)
+                                     : builder_.CreateTrunc(ev, elemTy);
+                    }
+                    llvm::Value* gep = builder_.CreateGEP(
+                        aty, tmp,
+                        {builder_.getInt32(0),
+                         builder_.getInt32((unsigned)i)});
+                    builder_.CreateStore(ev, gep);
+                }
+                v = builder_.CreateLoad(aty, tmp, "ipset.inlarr");
+            }
+        } else if (propTy && !cl->isDict) {
+            v = materializeHeapCollectionLiteral(cl, propTy);
+        } else if (propTy && !cl->keys.empty()) {
+            v = materializeHeapDictLiteral(cl, propTy);
+        }
+    }
+    if (!v) v = lowerExpr(value);
     // fix #2490: thread `value` through as valueExpr so
     // lowerImportedPropertySetValue can release a +1 producer passed
     // directly (see its own comment for the full rationale).
@@ -13717,6 +13890,36 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
                                             // array; borrowing cases free only
                                             // the frame — never the shared
                                             // backing, exactly-once).
+                // fix #3695 ARGUMENT-face, NARROWED by fix-forward v3 (this
+                // commit) after d63b0fe's `disposeStack_.front()` was measured
+                // to leak 3 allocs × N iterations under a while/for-loop body
+                // (the borrowed `Dictionary<int, int?>` argument in
+                // `dict_snapshot_value_disposer_3568.borrowed_…_is_not_double_
+                // freed_28_3` — present=200 × 3 allocs/iter = 600 allocs
+                // leaked, 36 616 B; ASan: 199 wraps × 32 B + 199 array-data
+                // × 96 B + 199 array-header × 56 B). The forward fix is to
+                // re-register on the CURRENT inner scope (`back()`) — the
+                // scope #3519 narrow (commit 7b1cabc, lifted to r18-c7
+                // alongside this) lifts non-`accSlot` per-part entries to
+                // the parent before `pop_back` on the string-interpolation
+                // part scope (`LlvmBackend_Exprs.cpp` ~L379–L401), so the
+                // string-interp case this commit originally fixed is now
+                // handled by #3519. `back()` is therefore the right scope
+                // for every call site: the function-body scope when the
+                // call is at the top of the function (fires at function
+                // end, exactly once, same as #2298/#2299/#3354 do); the
+                // while/for-loop body scope when the call is inside a loop
+                // (fires at end of every iteration — the per-iteration
+                // cleanup that 200 iterations of a borrowed Dictionary
+                // argument require, and that `front()` was bypassing).
+                // The same fix restored `sortedset_ienumerable_getenumerator_
+                // 3695` row D (`Dictionary<int, int>` passed as
+                // `IEnumerable<DictionaryEntry<int, int>>` argument inside
+                // a `Console.WriteLine($"…{Sum(d)}…")`) to a green PASS,
+                // because #3519's lift moves the wrap entry to the
+                // enclosing statement's scope, which fires emitDisposals
+                // on the normal exit path. (#29.2 / stdlib §4.18 / §4.1 /
+                // §28.3, v0.298.)
                 disposeStack_.back().push_back(d);
             }
             // §9 / §9.1 (#1759): passing `this` of a record method by value —

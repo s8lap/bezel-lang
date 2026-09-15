@@ -366,9 +366,65 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                 // discipline, three call sites.
                 llvm::Value* savedBoxMint = lastBoxMint_;
                 lastBoxMint_ = nullptr;
+                // fix #3513 (§18.5 / §28.3, v0.298): if `lowerExpr` itself
+                // contains a throwable call and it throws, `emitThrowValue`
+                // branches to `unwindBB` via `emitUnwindDisposals()` — but
+                // `acc` (the accumulated string built so far) was not registered
+                // in any disposal scope and is abandoned. Register it here so
+                // the unwind path reclaims it. Save/restore `diverged_` since
+                // it is a member that persists across calls; if it was already
+                // true before this call (a prior part diverged), we propagate
+                // that and skip `appendPart` on the normal path too.
+                bool savedDiverged = diverged_;
+                disposeStack_.push_back({});
+                llvm::AllocaInst* accSlot = entryAllocaNullPtr();
+                builder_.CreateStore(acc, accSlot);
+                Disposal d{accSlot, nullptr};
+                d.unwindOnly = true;
+                d.stringRelease = true;
+                disposeStack_.back().push_back(d);
                 ev = lowerExpr(*part.expr);
                 inlineBoxMint = lastBoxMint_;
                 lastBoxMint_ = savedBoxMint;
+                diverged_ = savedDiverged;
+                if (diverged_) {
+                    // Exception was thrown: `emitUnwindDisposals()` already
+                    // fired at the throw site and disposed `accSlot`.
+                    disposeStack_.pop_back();
+                    return llvm::PoisonValue::get(ptrTy());
+                }
+                // Normal path: null the slot so the scope's string disposal is
+                // a no-op (the prior `acc` was concat'd into the new string and
+                // will be released by `appendPart` below), then pop the scope.
+                builder_.CreateStore(
+                    llvm::ConstantPointerNull::get(ptrTy()), accSlot);
+                // fix #3519 (narrow, §18.5 / §28.3 / §29.2 / §28.9, v0.298): the
+                // wrap #3513 added is `unwindOnly` + `stringRelease` (the sole
+                // intentional push); any OTHER Disposal entry landed here
+                // transitively, e.g. the `iterEnumDispose` an argument-coercion
+                // call inside `{Sum(d)}` registered via
+                // `wrapAsIEnumerableForTarget` at LlvmBackend_Assign.cpp:13880.
+                // The pop_back below silently drops those — without the lift,
+                // the snapshot's entries array (the wrap owns) leaks (152 B / 3
+                // allocs under LSan for the Dictionary-int,int wrap reproduced
+                // by `dictionary_passed_as_an_ienumerable_argument_is_wrapped_29_2`,
+                // gate x5 across cycle-7). Lift them to the parent so they
+                // survive; `accSlot` is the only entry left to pop. Skip the
+                // diverge path (line 393 above): `emitUnwindDisposals()` already
+                // fired this scope at the throw site, so the wrap disposed there.
+                if (!disposeStack_.empty() && disposeStack_.size() >= 2) {
+                    auto& top = disposeStack_.back();
+                    auto& parent = *(disposeStack_.end() - 2);
+                    for (auto it = top.begin(); it != top.end(); ) {
+                        if (it->slot != accSlot) {
+                            parent.push_back(std::move(*it));
+                            it = top.erase(it);
+                        } else {
+                            ++it;
+                        }
+                    }
+                }
+                disposeStack_.pop_back();
                 // fix #3442 (§4.7 / §8.5 / §18.5, v0.283): a UNIT-typed hole is
                 // the one expression kind that legitimately lowers to NO value
                 // — `()` is LLVM `void`, so `lowerExpr` returns nullptr for it
@@ -500,6 +556,7 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                         appendPart(pv, ev, part.expr.get());
                         continue;
                     }
+                    // emitWithFormatSpec returned null: fall through.
                 }
                 auto* rt = ctx_.exprType(*part.expr);
                 // CG-nullable: for nullable value types (primitives, and a
@@ -3242,36 +3299,70 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
             auto* tt = ctx_.exprType(*ma->target);
             if (tt && tt->kind == sema::TypeRef::Kind::Primitive &&
                 tt->primitive == sema::PrimitiveType::String) {
-                llvm::Value* strPtr = lowerExpr(*ma->target);
-                if (!strPtr) return nullptr;
-                if (ma->member == "Length") {
-                    // stdlib §9.6: Length: int — number of char code points.
-                    llvm::Value* len64 = loadStringLen(strPtr);
-                    // #429 (OPERATOR-OPERAND category) / §4.6 / §28.9: if the
-                    // receiver is a +1 string producer (concat, interpolation,
-                    // primitive-ToString, user-method-return, range-slice), it has
-                    // no named-local owner and no scope-end release — release it
-                    // here, AFTER loading the length, so the string lives long
-                    // enough for the length-field read.  bz_string_release on a
-                    // sentinel is a no-op (safe for literal receivers).
-                    if (isPlusOneStringProducer(ma->target.get()))
-                        emitStringRelease(strPtr);
-                    return builder_.CreateTrunc(len64, i32(), "str.len.i32");
+                // fix #4243 (§26.1/§4.6, v0.298): `Length`/`IsAscii` are the
+                // ONLY two true string intrinsics reachable through a bare
+                // (no-parens) MemberAccessExpr — every other string METHOD
+                // (Trim, Substring, ...) is called with parens and goes
+                // through lowerCall instead, never this arm. The comment
+                // below this block ("Other string members deferred — sema
+                // would have flagged any unknown member already") predates
+                // fix #702 (ExprTypecheck_Calls.cpp, "before reporting 'not
+                // yet supported', try a user-defined extension method on
+                // string"): sema's CG27a twin now ALSO accepts a bare
+                // access whose name resolves to a user `extension string`
+                // COMPUTED PROPERTY (§26.1's own worked `IsBlank` example),
+                // via the identical no-parens syntax. Unconditionally
+                // intercepting every non-Length/IsAscii name here — as the
+                // old code did — swallowed that access before it ever
+                // reached the generic computed/block-getter dispatch
+                // (CG33b, further down this function) that every OTHER
+                // extension-property receiver (int/bool/record/class) already
+                // goes through, returning a bare `nullptr` that degraded the
+                // whole read to the #2491 zero/null backstop with only a
+                // Warning — silently wrong, not rejected. Gate the intercept
+                // to the two real intrinsics; anything else that is a real
+                // extension property (computedGetterOf/blockGetterOf resolve
+                // it — the same predicate the existing degenerate-receiver
+                // `Length` fallback arm a few lines below already checks)
+                // falls through this whole `if` unevaluated, so CG33b lowers
+                // it exactly like any other receiver kind. `ma->target` is
+                // deliberately NOT lowered on that path here — CG33b lowers
+                // it itself, and lowering it twice would double any receiver
+                // side effect / +1 string-producer refcount.
+                if (ma->member != "Length" && ma->member != "IsAscii") {
+                    if (!computedGetterOf(ctx_.exprSymbol(e)) &&
+                        !blockGetterOf(ctx_.exprSymbol(e)))
+                        return nullptr;
+                    // fall through — handled by CG33b below.
+                } else {
+                    llvm::Value* strPtr = lowerExpr(*ma->target);
+                    if (!strPtr) return nullptr;
+                    if (ma->member == "Length") {
+                        // stdlib §9.6: Length: int — number of char code points.
+                        llvm::Value* len64 = loadStringLen(strPtr);
+                        // #429 (OPERATOR-OPERAND category) / §4.6 / §28.9: if the
+                        // receiver is a +1 string producer (concat, interpolation,
+                        // primitive-ToString, user-method-return, range-slice), it has
+                        // no named-local owner and no scope-end release — release it
+                        // here, AFTER loading the length, so the string lives long
+                        // enough for the length-field read.  bz_string_release on a
+                        // sentinel is a no-op (safe for literal receivers).
+                        if (isPlusOneStringProducer(ma->target.get()))
+                            emitStringRelease(strPtr);
+                        return builder_.CreateTrunc(len64, i32(), "str.len.i32");
+                    }
+                    // stdlib §9.6 (#741): IsAscii — true iff every code point < 128.
+                    // No codegen case existed, so the read returned an uninitialized
+                    // i1 slot (always false). Scan via bz_string_is_ascii.
+                    if (ma->member == "IsAscii") {
+                        auto* fn = declareC("bz_string_is_ascii", i32(), {ptrTy()});
+                        llvm::Value* r = builder_.CreateCall(fn, {strPtr}, "str.ascii");
+                        if (isPlusOneStringProducer(ma->target.get()))
+                            emitStringRelease(strPtr);
+                        return builder_.CreateICmpNE(r, builder_.getInt32(0),
+                                                     "str.isascii");
+                    }
                 }
-                // stdlib §9.6 (#741): IsAscii — true iff every code point < 128.
-                // No codegen case existed, so the read returned an uninitialized
-                // i1 slot (always false). Scan via bz_string_is_ascii.
-                if (ma->member == "IsAscii") {
-                    auto* fn = declareC("bz_string_is_ascii", i32(), {ptrTy()});
-                    llvm::Value* r = builder_.CreateCall(fn, {strPtr}, "str.ascii");
-                    if (isPlusOneStringProducer(ma->target.get()))
-                        emitStringRelease(strPtr);
-                    return builder_.CreateICmpNE(r, builder_.getInt32(0),
-                                                 "str.isascii");
-                }
-                // Other string members deferred — sema would have flagged
-                // any unknown member already.
-                return nullptr;
             }
             // FIX #2933: positive list. Return true ONLY when the receiver
             // gives us NO information to rule a `%bz.string` layout out
@@ -4357,10 +4448,22 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                                  ElementPolicy::Category::ClassOwned);
                         }
                         if (isOwnedClass) {
+                            // fix #4189 (§30.5, v0.298): a `.Result` read is
+                            // never the operand of a §30.5 chained return
+                            // (`detectAsyncPatternAKind` only matches a
+                            // literal `await <...>` value expression, never a
+                            // property/member access — see
+                            // LlvmBackend_Async.cpp's own detection), so this
+                            // extraction is always terminal: drain `task`'s
+                            // whole upstream chain unconditionally, the same
+                            // as a terminal bound `await` (lowerAwait's
+                            // `drainChainOnTake`).
                             auto* takeResultFn = declareC(
-                                "bz_task_take_result",
-                                llvm::Type::getVoidTy(llvm_), {ptrTy()});
-                            builder_.CreateCall(takeResultFn, {task});
+                                "bz_task_take_result", llvm::Type::getVoidTy(llvm_),
+                                {ptrTy(), llvm::Type::getInt8Ty(llvm_)});
+                            llvm::Value* drainArg = llvm::ConstantInt::get(
+                                llvm::Type::getInt8Ty(llvm_), 1);
+                            builder_.CreateCall(takeResultFn, {task, drainArg});
                         }
                     }
                     return resultVal;
@@ -5769,6 +5872,45 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
             if (propSym && propSym->parent &&
                 propSym->parent->kind == ast::TypeDeclKind::Enum)
                 currentEnumMethod_ = propSym->parent;
+            // fix #4113 (§35.2/§35.5, v0.295): the choice twin of the enum
+            // workaround directly above — a choice computed property whose
+            // getter body is `case this of …` relies on choiceTypeOf() to
+            // resolve `this` as the declaring choice type (sema attaches no
+            // exprType to `this` here either). Without this, `case this of`
+            // found no scrutinee choice type, patternMatches returned null,
+            // and lowerCaseExpr bailed leaving `case.end` unterminated — an
+            // IR-verification crash ("Basic Block ... does not have
+            // terminator!"), degraded through the #2491 backstop.
+            //
+            // fix #4143 (§35.2/§35.5, v0.295): SET-FROM-OWNER, not
+            // conditionally-set-else-inherit. This is an INLINE evaluation
+            // (currentFn_ stays the CALLER's function; there is no
+            // NestedBodyScope boundary here at all, unlike the block-getter/
+            // itable-accessor family), so a bare `if (Choice) set` — leaving
+            // the field untouched for every OTHER receiver kind — passes a
+            // caller's choice window straight through into THIS getter's own
+            // body unmodified. Measured: `Animal.Sound` (a CLASS property
+            // whose getter is `get => (case this of Dog => …, Cat => …, _ =>
+            // …)`, itself reached through this SAME inline path since an
+            // accessor with an EXPRESSION body classifies as
+            // `computedGetterOf` regardless of whether the enclosing
+            // property is arrow- or block-declared — see that function's own
+            // comment), first touched from inside `ShapeQ.Kind`'s
+            // choice-property getter (`(case this of CircleQ(r) => new
+            // Dog().Sound, …)`), inherited `currentChoiceMethod_ == ShapeQ`
+            // straight through this unconditional-else-untouched code and
+            // fell into lowerCaseExpr's "scrutTy not already a Choice"
+            // overwrite guard (LlvmBackend_Exprs2.cpp) — silently
+            // reclassifying `Animal`'s `this` as a `ShapeQ` scrutinee.
+            // `patternMatches` then found no `Dog`/`Cat` cases in `ShapeQ`
+            // and fell through to `_`, printing "..." instead of "Woof": a
+            // SILENT WRONG ANSWER, not a crash.
+            const sema::TypeSymbol* savedChoiceMethod = currentChoiceMethod_;
+            currentChoiceMethod_ =
+                (propSym && propSym->parent &&
+                 propSym->parent->kind == ast::TypeDeclKind::Choice)
+                    ? propSym->parent
+                    : nullptr;
             llvm::Value* v = lowerExpr(*getter);
             // §23.2/§23.3 (#1168): a `T?`-declared expression-bodied property
             // whose body yields the bare inner `T` must wrap the result to the
@@ -5814,6 +5956,7 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
             // wraps above without re-doing their work.
             v = wrapPropertyArrayAsIEnumerable(v, ctx_.exprType(*ma), getter, ma);
             currentEnumMethod_ = savedEnumMethod;
+            currentChoiceMethod_ = savedChoiceMethod;
             currentThis_ = saved;
             genericSubst_ = std::move(savedSubst);
             genericSubstSemaTy_ = std::move(savedSemaTy);
@@ -5833,6 +5976,51 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                                             ctx_.exprType(*ma),
                                             /*calleeReturnsOwned=*/false,
                                             recvUnwindSlot);
+            // fix #4320 (§26.1 / §4.6 / §28.9, v0.298): the STRING-RECEIVER
+            // sibling of the class-receiver reclaim immediately above. The
+            // #2751 reclaim only fires for a heap-CLASS producer
+            // (`isFreshOwnedClassProducer`'s TypeDeclKind::Class gate) — a
+            // string producer (`P.Make()`, `"a" + "b"`, `s.Trim()`,
+            // `i.ToString()` — §28.9's full +1 list) goes through `obj` as a
+            // plain `ptr` and never reaches the reclaim, so the receiver
+            // string allocation leaks exactly once per use site. The CG27a
+            // Length/IsAscii intrinsic path already handled the TWO real
+            // intrinsics (#4243), but a USER-DEFINED computed extension
+            // property (e.g. the spec's own §26.1 worked `IsBlank` example,
+            // accessed on a +1 producer like `P.Make().IsBlank`) falls
+            // through to this CG33b arm and so falls through the leak.
+            //
+            // SOUNDNESS — the result type must NOT alias the receiver. A
+            // string-typed result may be a borrow of the receiver (e.g. an
+            // identity getter `=> this`); releasing the receiver's +1 there
+            // would free the underlying string while `v` (== obj) still
+            // points at it — a use-after-free. The non-string-result gate
+            // matches CG27a's implicit precondition (Length → int, IsAscii →
+            // bool: neither aliases), and the empty-body identity getter
+            // sibling test in extension_property_string_4243_test.cpp pins
+            // that an alias-shaped getter is NOT released (its receiver is a
+            // named local, not a +1 producer — the `isPlusOneStringProducer`
+            // gate below declines, matching the pre-fix safe behavior).
+            //
+            // Gated on `isPlusOneStringProducer` (not the type-name check)
+            // because it is the same predicate the §28.9 producer-releases
+            // across the rest of this backend already key on; a literal /
+            // sentinel receiver is correctly released as a no-op
+            // (`bz_string_release` is sentinel-safe). Unwind safety is
+            // delegated to the parallel class-receiver path's `recvUnwindSlot`
+            // when the same expr is BOTH a class and a string — that's
+            // unreachable today (`freshNewReceiverTempEligible` rejects
+            // strings), so on a string receiver the slot is null and the
+            // inline call below is the only release; throws inside the
+            // getter body skip it (matches CG27a's own behavior on its
+            // simpler intrinsics — `loadStringLen` / `bz_string_is_ascii`
+            // are non-throwing, the IsBlank getter body is `=`/`or`/
+            // `Length`/`Trim` — none of which throws on this input — and
+            // a throwing-getter edge is out of scope for the issue's repro).
+            if (!diverged_)
+                disposeFreshNewStringReceiverTemp(ma->target.get(), obj,
+                                                  ctx_.exprType(*ma),
+                                                  recvUnwindSlot);
             return v;
         }
         // CG33b: block-form getter (`get => do … end;`) — emit as a
@@ -5884,6 +6072,15 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                                             ctx_.exprType(*ma),
                                             /*calleeReturnsOwned=*/false,
                                             recvUnwindSlot);
+            // fix #4320 (§26.1 / §4.6 / §28.9, v0.298): the block-getter
+            // spelling of the string-receiver reclaim. Same predicate /
+            // soundness gate as the expression-bodied twin above; the
+            // surrounding `disposeFreshNewReceiverTemp` is class-only, so
+            // a `+1` string producer would otherwise leak here too.
+            if (!diverged_)
+                disposeFreshNewStringReceiverTemp(ma->target.get(), obj,
+                                                  ctx_.exprType(*ma),
+                                                  recvUnwindSlot);
             return res;
         }
         // §2.5 / §23 (issue #503): imported non-virtual property getter.
@@ -6091,8 +6288,31 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                     // slot (LLVM GEP needs a pointer; a struct SSA value must
                     // be spilled first).
                     if (llvm::AllocaInst* slot = localSlot(*ma->target)) {
+                        // fix #3876 (§27.5 / stdlib §4.8, v0.295): a
+                        // DictionaryEntry local CAPTURED by a closure (§27.5)
+                        // has its `locals_` entry REBOUND to the ptr-sized
+                        // cell-HOLDER alloca (boxLocalSlot / lowerLambda's
+                        // env-restore loop, LlvmBackend_Exprs2.cpp) — the real
+                        // {K,V} struct lives in the heap cell the holder
+                        // points AT, not in the holder itself. GEP'ing
+                        // directly into `slot` (as this arm did pre-fix)
+                        // treated the 8-byte pointer holder as if it WERE the
+                        // {K,V} struct: in-bounds-but-garbage for a same-size
+                        // DictionaryEntry<int,int> ({i32,i32}, 8 B) and a
+                        // genuine stack-buffer-overflow for a wider one like
+                        // DictionaryEntry<string,int> ({ptr,i32}, 16 B) —
+                        // issue #3876's measured ASan stack-buffer-overflow.
+                        // `boxedStorage` is the existing §27.5 funnel every
+                        // other boxed read/write already goes through: it
+                        // dereferences the holder when `slot` is a capture
+                        // cell (loading the cell pointer and handing back ITS
+                        // address) and returns `slot` unchanged otherwise (an
+                        // ordinary, non-captured local) — so the pre-fix
+                        // non-captured behaviour is unaffected.
+                        llvm::Type* baseElemTy = nullptr;
+                        llvm::Value* base = boxedStorage(slot, baseElemTy);
                         llvm::Value* fieldPtr = builder_.CreateStructGEP(
-                            entryStTy, slot, fi, "de.fld");
+                            entryStTy, base, fi, "de.fld");
                         return builder_.CreateLoad(
                             entryStTy->getElementType(fi), fieldPtr, "de.load");
                     } else if (llvm::Value* v = lowerExpr(*ma->target)) {
@@ -6123,8 +6343,16 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                         llvm::Type* vTy = lowerTypeRef(tt->genericArgs[1]);
                         llvm::StructType* entryStTy =
                             llvm::StructType::get(llvm_, {kTy, vTy});
+                        // fix #3876 (§27.5 / stdlib §4.9, v0.295): same
+                        // capture-cell-holder-vs-heap-cell defect as the
+                        // DictionaryEntry arm above — see its comment. Route
+                        // through boxedStorage so a captured DrainedEntry
+                        // loop variable dereferences the shared cell instead
+                        // of GEP'ing the ptr-sized holder alloca directly.
+                        llvm::Type* baseElemTy = nullptr;
+                        llvm::Value* base = boxedStorage(slot, baseElemTy);
                         llvm::Value* fieldPtr = builder_.CreateStructGEP(
-                            entryStTy, slot, fi, "dde.fld");
+                            entryStTy, base, fi, "dde.fld");
                         return builder_.CreateLoad(
                             entryStTy->getElementType(fi), fieldPtr, "dde.load");
                     }
@@ -6314,7 +6542,17 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
             // not a pure IEnumerable-family interface or the getter's type is
             // not array-backed, so the bare read keeps its existing shape for
             // every other property).
-            return wrapPropertyArrayAsIEnumerable(bv, ctx_.exprType(e), getter, &e);
+            llvm::Value* result =
+                wrapPropertyArrayAsIEnumerable(bv, ctx_.exprType(e), getter, &e);
+            // fix issue 4193 (stdlib §8.1/§23.2-§23.3, v0.298): record the
+            // footprint right after this getter's own evaluation completes —
+            // see `postGetterFootprint_`'s declaration for why a bare
+            // getter-backed identifier is NOT "one non-side-effecting load"
+            // for `emittedSideEffectSince(dispatchEntry)`'s purposes, and why
+            // anchoring here (rather than at `dispatchEntry`) lets a caller
+            // tell "the getter ran" apart from "the MEMBER dispatched".
+            postGetterFootprint_[&e] = irFootprint();
+            return result;
         }
         // CG33b: block-form getter (`get => do … end;`) accessed bare.
         if (const ast::PropertyAccessor* acc = blockGetterOf(ctx_.exprSymbol(e))) {
@@ -6326,6 +6564,8 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
             // §31.1/§31.2 (FINDING [4]): see the qualified block-getter read
             // above — a throw inside the standalone getter must propagate.
             emitPendingCheck();
+            // fix issue 4193: see the `computedGetterOf` arm above.
+            postGetterFootprint_[&e] = irFootprint();
             return res;
         }
         // CG12: a bare identifier resolving to a static field reads
@@ -8911,10 +9151,10 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
             if (lIsPtr && rIsPtr) {
                 // Both pointer — compare normally (fall through).
             } else if (lIsPtr) {
-                // Left is ptr, right is non-ptr value — compare left to null.
-                llvm::Value* eq = builder_.CreateICmpEQ(
-                    l, llvm::ConstantPointerNull::get(ptrTy()));
-                return op == "=" ? eq : builder_.CreateNot(eq);
+                // Left is ptr (the null literal), right is non-ptr value type —
+                // the non-ptr value can never be null: `= null` is always false,
+                // `<> null` is always true. Same as the symmetric rIsPtr case.
+                return builder_.getInt1(op == "<>");
             } else if (rIsPtr) {
                 // Right is ptr (the null literal), left is non-ptr — non-ptr
                 // can never be null: = null is always false, <> null is true.

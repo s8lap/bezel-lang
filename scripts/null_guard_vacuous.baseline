@@ -9,4 +9,4 @@
 # EXACT, not a ceiling: a count below baseline fails as STALE
 # HEADROOM (see the script docstring - same rule as every other
 # ratchet in this family).
-count = 32
+count = 0

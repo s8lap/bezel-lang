@@ -56,11 +56,11 @@ std::string wrapRecord(const std::string& method) {
 
 } // namespace
 
-// --- D1: §28.9 returned-closure-capture escape (REJECT) -------------------
+// --- D1: §28.3 returned-closure-capture escape (REJECT) -------------------
 
 // The escape_closure.bzl reproducer: a closure capturing a `using var` owned
 // local is returned; the local is disposed at scope end, the closure reads it
-// after dispose. (§28.9: an owned capture is a borrow of the enclosing scope;
+// after dispose. (§28.3: an owned capture is a borrow of the enclosing scope;
 // the closure may not outlive that scope.)
 BEZEL_TEST(own_closure_escape, return_lambda_capturing_using_var_diagnosed_28_9) {
     auto r = parseAndCheckOwnership(wrapClosure(

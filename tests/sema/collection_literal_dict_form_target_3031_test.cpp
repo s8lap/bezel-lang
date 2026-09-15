@@ -227,6 +227,8 @@ BEZEL_TEST(sema_collection_literal_dict_form_target_3031,
 // Spec §15.4.1 line 2871 (v0.240): "The empty literal `[]` targeting
 // such a type is admitted: the borrowing form receives an empty
 // `ReadOnlySpan<U>`; the owning form receives an empty `OwningArray<U>`."
+// (verbatim quote of the v0.240 text — the carrier it names was the
+// pre-#3857/v0.272 spelling; see the narrow note below.)
 // A user type declaring `FromCollectionLiteral` is therefore on the
 // §15.4 list for the empty carve-out, exactly as it is for the non-
 // empty sequence form. The pre-fix predicate had a `if (t->declaration)
@@ -239,6 +241,13 @@ BEZEL_TEST(sema_collection_literal_dict_form_target_3031,
 // silently fall through to a zero-initialized slot (the same shape the
 // main #3031 fix targets), so the assertions check the Count AFTER the
 // empty literal is passed, not just that it compiled.
+//
+// narrow #3857 (test-only, §15.4.1, v0.272): the two `C<T>` factories below
+// spell the carrier `ReadOnlyArraySpan<T>`, not the `ReadOnlySpan<T>` the
+// v0.240 quote above names — proposal 0115 renamed it, and the old spelling
+// is now rejected at the declaration, which would fail BOTH programs to
+// compile (r.ran == false) for a reason unrelated to what these cells test.
+// Updated in the same commit as the recognition fix.
 // =====================================================================
 
 BEZEL_TEST(sema_collection_literal_dict_form_target_3031,
@@ -258,7 +267,7 @@ BEZEL_TEST(sema_collection_literal_dict_form_target_3031,
         "module M; "
         "class C<T> "
         "  public static method FromCollectionLiteral("
-        "      elements: ReadOnlySpan<T>): owned C<T> "
+        "      elements: ReadOnlyArraySpan<T>): owned C<T> "
         "    return new C<T>(); "
         "  end FromCollectionLiteral; "
         "end C; "
@@ -283,7 +292,7 @@ BEZEL_TEST(sema_collection_literal_dict_form_target_3031,
         "module M; "
         "class C<T> "
         "  public static method FromCollectionLiteral("
-        "      elements: ReadOnlySpan<T>): owned C<T> "
+        "      elements: ReadOnlyArraySpan<T>): owned C<T> "
         "    return new C<T>(); "
         "  end FromCollectionLiteral; "
         "end C; "

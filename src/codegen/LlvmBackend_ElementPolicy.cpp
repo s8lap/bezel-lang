@@ -91,9 +91,21 @@ Emitter::ElementPolicy Emitter::elementPolicyFor(const sema::TypeRef* elemTy,
         return n == "Shared" || n == "Weak";
     };
     // stdlib §5 (#651): IGrouping<TKey, T> elements are bz_grouping_t* pointers
-    // owned by the Array<IGrouping> produced by GroupBy(...).ToArray(). They need
-    // a disposer thunk that calls bz_grouping_free(ptr) to release the element
-    // array and key data. Always treated as owned (GroupBy produces fresh groups).
+    // produced by GroupBy(...). ToArray(). The producer LINQ path owns each
+    // grouping (the source lazy's bz_groupby_free_groups call at dispose, the
+    // §28.11 ownership chain), and only an OWNING collection that received
+    // them via transfer takes ownership — a borrowing Array<IGrouping> just
+    // BORROWS them, mirroring every other class/interface row in this table.
+    // Mirrors the Subscription row below: gated on `owningFamily`. Before
+    // #4308 the IGrouping arm unconditionally returned ClassOwned with the
+    // groupingFreeThunk disposer, so even a borrowing Array<IGrouping> tried
+    // to dispose each element at scope-end — a double-free against the lazy's
+    // own bz_groupby_free_groups at its dispose, measured as a SEGV inside the
+    // inner bz_array_free's `free(arr->data)` because the second free hits a
+    // grouping whose `elements` field was already recycled (ASan: SEGV on a
+    // near-NULL address — the freed chunk's recycled payload). Fix: match the
+    // class/interface row of §28.11 v0.135 — owning → ClassOwned with the
+    // groupingFreeThunk disposer; borrowing → ClassBorrow with a null disposer.
     auto isIGroupingElem = [](const sema::TypeRef* t) {
         if (!t || t->kind != sema::TypeRef::Kind::Named) return false;
         if (t->declaration) return false;
@@ -102,12 +114,24 @@ Emitter::ElementPolicy Emitter::elementPolicyFor(const sema::TypeRef* elemTy,
         return t->headName() == "IGrouping";
     };
     if (isIGroupingElem(elemTy)) {
-        // Use the cached groupingFreeThunk() (built once per module,
-        // null-checked, same pattern as sharedReleaseThunk).
+        if (owningFamily) {
+            // OwningArray<IGrouping>: the collection OWNS the elements, so
+            // dispose each at scope-end / remove / clear. Use the cached
+            // groupingFreeThunk() (built once per module, null-checked, same
+            // pattern as sharedReleaseThunk).
+            return ElementPolicy{
+                ElementPolicy::Category::ClassOwned,
+                ptrTy(),
+                groupingFreeThunk(),
+                /*retainRelease=*/false
+            };
+        }
+        // Borrowing Array<IGrouping>: just a borrow; no slot-side disposal
+        // (the source owns them and disposes via bz_groupby_free_groups).
         return ElementPolicy{
-            ElementPolicy::Category::ClassOwned,
+            ElementPolicy::Category::ClassBorrow,
             ptrTy(),
-            groupingFreeThunk(),
+            /*disposerThunk=*/nullptr,
             /*retainRelease=*/false
         };
     }

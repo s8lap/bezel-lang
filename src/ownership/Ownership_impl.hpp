@@ -16,6 +16,7 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <set>
 #include <vector>
 
 #include "ast/Node.hpp"
@@ -750,6 +751,21 @@ private:
     // out, so auto-disposing would risk a double-free). Monotone (grows only), so
     // it is fixpoint-safe across the dataflow's block re-evaluations.
     std::unordered_set<sema::Symbol*> everDischarged_;
+    // fix #4314 (§28.3 / §28.6 / §28.9, v0.298): local symbols whose own
+    // DECLARING scope contains a plain bare-identifier reassignment
+    // (`sym := E;`) with `producerState(E) == Owned` — the "Pattern 2"
+    // (§K1.7/K3.11) idiom of a local that becomes owned via reassignment
+    // rather than its own initializer. Populated ONCE per `run()` by
+    // `collectReassignedOwnedLocals`, called BEFORE
+    // `applyUsingVarBorrowPinInLambdas` (see that call site) so the set is
+    // fully populated before the lambda-body pre-pass consults it via
+    // `isReassignedOwnedLocalInEnclosingFrame` — unlike `ld->
+    // becomesOwnedViaReassign` (set by the MAIN dataflow, which runs AFTER
+    // this pre-pass; see that predicate's declaration comment for the
+    // measured ordering trap this set exists to avoid). Deliberately NOT
+    // cleared/rebuilt per lambda the way `states_` is: this is a per-METHOD
+    // static fact, independent of which lambda is currently being walked.
+    std::unordered_set<sema::Symbol*> reassignedOwnedLocals_;
     // §28.3 (#1900): locals whose slot DEFINITELY holds a fresh value at the
     // current program point — i.e. the LAST state-changing operation on the local
     // was an UNCONDITIONAL reassignment (`x := new T()` at straight-line scope,
@@ -868,6 +884,39 @@ private:
     };
     std::unordered_map<const sema::Symbol*, std::vector<RecordBorrowSource>>
         recordBorrowLocalSource_;
+    // issue #4225 (§28.3/§28.7/§30.14 v0.180): the sibling window table for a
+    // PLAIN identifier alias holder (`var y := x;` / `y := x;` where the
+    // source is a class/interface-typed local, tracked via
+    // `states_[holder].source`, NOT a borrow-bearing record/span/choice
+    // value). `recordBorrowLocalSource_` is documented above as being for
+    // locals that carry "NO LocalOwnership.source" — a plain alias holder
+    // does carry one, and checkConsumeFreeze's states_-based holder loop
+    // already reads it to decide which holder currently aliases `consumed`.
+    // What that loop lacked was a WINDOW bound on "later use": once `y` is
+    // rebound away from `x` (`y := new Res(1);`), any further touch of `y`
+    // was still counted as a live use of the OLD alias, because
+    // `borrowUseOffsets_` is a whole-body pre-scan with no notion of when an
+    // alias retires. This map closes that gap with the exact window
+    // discipline `recordBorrowLocalSource_` already uses (#1741): each entry
+    // is the offset range over which `holder`'s tracked source equals a given
+    // symbol, closed at a later unconditional rebind and reopened (or left
+    // closed) whenever the rebind's RHS is itself a bare identifier naming a
+    // different symbol — a purely STRUCTURAL match, not `borrowSourceForExpr`
+    // (which cannot run in this pre-pass at all; see
+    // collectAliasBorrowSource's comment for why). It does not need to be
+    // authoritative about "is this really a borrow": it is consulted only
+    // for a holder checkConsumeFreeze's states_-based loop has ALREADY
+    // confirmed, from the live `states_[holder].source`, aliases `consumed`
+    // right now — this map only answers WHEN that confirmed alias retires.
+    // Kept SEPARATE from
+    // `recordBorrowLocalSource_` rather than merged into it: that map's
+    // second checkConsumeFreeze loop has no "holder still alive" guard
+    // (unneeded there, since record/span locals never reach Disposed/
+    // MovedFrom) — merging would need that guard added defensively, whereas
+    // here the existing states_-based loop already performs it for the
+    // holder before ever consulting this map. // per §28.3, #1741
+    std::unordered_map<const sema::Symbol*, std::vector<RecordBorrowSource>>
+        aliasBorrowSourceWindows_;
     // §28.3 (#1741): conditional-nesting depth of the freeze pre-pass walk. The
     // method body and unconditional `do…end` blocks are depth 0; each if / elif
     // / else / while / for / try-catch-finally body adds one. A reassignment's
@@ -1129,7 +1178,17 @@ private:
     // position `case`/`when` whose arms mix an owned value with a borrow.
     void checkArmMeetMixed(const ast::Expr& e);
 
-    void handleLocalDecl(const ast::LocalDecl& ld);
+    // fix #4286 (§28.3 / §28.6, v0.298): `fromLambdaBody` mirrors the
+    // established `fromLambdaBody` convention (`checkCollectionBorrowStoreEscape`
+    // / `checkIndexerSetBorrowStoreEscape`, fix #3799) — true ONLY when this
+    // call is driven from `applyUsingVarBorrowPinInLambdaStmt` (the #2166
+    // lambda-body pre-pass), never from the method-level `visitStmt` call site.
+    // Gates a RETRY of the bare-identifier alias check (see the definition)
+    // against the enclosing frame's owned-obligation seed, needed because a
+    // lambda body's own `states_` is cleared and rebuilt from scratch per
+    // lambda and so never contains a CAPTURED owned local from an enclosing
+    // frame. Defaulted so every pre-existing call site is unaffected.
+    void handleLocalDecl(const ast::LocalDecl& ld, bool fromLambdaBody = false);
 
     // §17.15 / K8.5 (v0.216, #2098): process a binding atom `(var x := E;
     // body)` in evaluation order — each clause through handleLocalDecl (the
@@ -1836,6 +1895,69 @@ private:
     // // per §28.6
     void checkOwnedFieldReturn(const ast::Expr& e);
 
+    // fix #4311 (§30.5 "Result lifetime and task disposal", Pattern A result
+    // slots kind 1, §28.3 *Producers*, v0.298): the ownership-pass sibling of
+    // `fix #4285`'s codegen check (`detectAsyncPatternAKind`,
+    // LlvmBackend_Async.cpp), which rejects a Pattern-A `Task<T>` (class T)
+    // async producer's non-`await` `return` of a `MemberAccessExpr` /
+    // `NullCondMemberExpr` / `IndexExpr` (an unconditional borrow) but
+    // DELIBERATELY did not extend to a bare `IdentifierExpr` — that shape may
+    // legitimately name a still-owned local or `owned` parameter, and telling
+    // it apart from a BORROWED one needs this pass's own per-local flow
+    // state (`states_`/`lookupState`), which codegen does not carry. Rejects
+    // a bare identifier naming: a local currently tracked `Borrowed`
+    // (`lookupState`); a plain (non-`owned`) parameter; or an implicit-`this`
+    // field read (a `FieldSymbol` — the same bare-identifier spelling
+    // `exprIsOwnedFieldRead` recognizes, §28.6 — is the SAME unconditional
+    // borrow #4285 rejects via the explicit `this.f` / `obj.f` spelling, just
+    // reached through the unqualified name). Admits: a local tracked `Owned`
+    // (a plain `var` — a genuine kind-1 fresh-owned source) and an `owned` /
+    // `out owned` parameter. Scoped to the PLAIN `Task` head only, never
+    // `OwningTask` (Pattern B) — mirrors `checkBorrowReturnedThroughOwningType`'s
+    // `plainTaskInSyncBody` gate's documented two-pattern split. Fires from
+    // handleReturn (block bodies) and runExprBodyOwningReturnCheck (`=>`
+    // expression bodies). // per §30.5, §28.3, §28.6
+    void checkAsyncPatternABorrowedIdentifierReturn(const ast::Expr& e);
+
+    // fix #4311: shared diagnostic for
+    // `checkAsyncPatternABorrowedIdentifierReturn`, worded identically to
+    // `fix #4285`'s codegen diagnostic (LlvmBackend_Async.cpp) so the two AST
+    // shapes of the same §30.5 kind-1 violation read as ONE rule to the user.
+    void reportAsyncPatternABorrowedIdentifierReturn(const ast::Expr& e);
+
+    // fix #4349 (§30.5 Pattern A / §28.3 Producers, v0.298): the LAMBDA-BODY
+    // sibling of `checkAsyncPatternABorrowedIdentifierReturn`. The latter is
+    // wired only into `handleReturn` / `runExprBodyOwningReturnCheck` (the
+    // entry points for a top-level METHOD's own return statements / expression
+    // body) and is never invoked for a lambda's own body — lambda bodies are
+    // walked by the separate `checkLambdaTaskFamilyBorrowReturns{,Expr}`
+    // pre-pass (SB01-B), a DIFFERENT, narrower question (whether the lambda
+    // VALUE itself is a borrow of a task-family object, not whether the
+    // lambda's OWN async body borrows its produced T). Consequence: an
+    // `async lambda` that is itself a Pattern-A `Task<T:class>` producer and
+    // returns a bare `IdentifierExpr` naming a borrowed local compiles clean
+    // and reproduces the EXACT §30.5 kind-1 heap-use-after-free #4311 exists
+    // to close — just reached through a lambda instead of a method. (The
+    // sibling codegen check from #4285 IS reached correctly for the same
+    // lambda body — codegen's `detectAsyncPatternAKind` reaches lambda
+    // bodies via the shared `lowerReturnStmt` / `emitAsyncLambda` path. Only
+    // the ownership-pass bare-identifier check #4311 added fails to reach
+    // lambdas.) Drive the check over each lambda's own body with the
+    // LAMBDA's own `isAsync` / return type — mirroring
+    // `checkOneLambdaOwnedReturnDirectBorrow`'s shape (uses a fresh
+    // `MethodOwnership sub` to classify the local's own initializer
+    // independently of the enclosing dataflow). Fires from
+    // `checkLambdaTaskFamilyBorrowReturns` (block-body driver) and
+    // `checkLambdaTaskFamilyBorrowReturnsExpr` (`=>` expression-body driver),
+    // the same two entry points the sibling lambda pre-passes use. Scoped
+    // identically to `checkAsyncPatternABorrowedIdentifierReturn`: PLAIN
+    // `Task` head only (never `OwningTask` — Pattern B), and only when the
+    // result T is a class with a real disposal obligation (§28.9 —
+    // `isNonTrivialDisposeClass`). // per §30.5, §28.3, §28.6
+    void checkOneLambdaAsyncPatternABorrowedIdentifierReturn(
+        const ast::LambdaExpr& lam,
+        const sema::TypeRef* expectedFnType = nullptr);
+
     // §28.3 / §5.11 (#1007): the name-head of an owning-collection / owning-
     // wrapper type (the set whose value the caller must discharge). True for
     // `OwningArray`/`OwningDictionary`/…/`Shared`/`Weak`/`OwningTask`/etc.
@@ -1920,7 +2042,7 @@ private:
     // in a local-identifier root, verify the root isn't a `using var`.
     void checkBorrowEscapesOnReturn(const ast::Expr& e);
 
-    // §28.9 closure-escape (issue #360, D1): a returned lambda whose
+    // §28.3 closure-escape (issue #360, D1): a returned lambda whose
     // captured set includes an owned (`using var` or owned-producing)
     // method-scope local of reference type. Capturing such a local does
     // not transfer ownership; the capture is a borrow whose source is the
@@ -2173,6 +2295,9 @@ private:
     void collectLambdaIdentifiers(
         const ast::LambdaExpr& lam,
         std::vector<const ast::IdentifierExpr*>& out) const;
+    void checkTransitiveCapturesDisposed(
+        const ast::LambdaExpr& lam,
+        std::set<const ast::LambdaExpr*>& visited);
     void collectIdentifiersIn(
         const ast::Expr& e,
         std::vector<const ast::IdentifierExpr*>& out) const;
@@ -2612,6 +2737,83 @@ private:
     void recollectRecordBorrowSourceOnReassign(const sema::Symbol* lsym,
                                                const ast::Expr& producer,
                                                std::uint32_t reassignOffset);
+    // issue #4225: follow a chain of PLAIN alias holders already recorded in
+    // aliasBorrowSourceWindows_ EARLIER in this same forward pre-scan pass
+    // (only statements already visited have entries, since the scan is a
+    // straightforward single forward pass) to its ultimate root — the
+    // state-independent equivalent of borrowSourceForExpr's own "multi-hop
+    // alias chain" resolution (Shape 1, Ownership_Checks.cpp), which cannot
+    // run here (states_ is not live yet). Needed for soundness, not just
+    // precision: without it, `var w := x; y := w;` would record `y`'s window
+    // against `w` instead of `x`, so `aliasBorrowConsumedWindow(y, x)` would
+    // find nothing and checkConsumeFreeze's holder loop would silently
+    // MISS-reject a later consume of `x` while `y` (via `w`) still has a
+    // reachable use — the false ACCEPT this issue's own steering warned
+    // against. Returns `sym` itself when it carries no currently-open
+    // tracked alias (the base case: an unaliased identifier, or a plain
+    // owned root). `seen` guards a cycle (structurally not expected, cheap
+    // to defend). // per §28.3, #4225
+    const sema::Symbol* resolveAliasChainRoot(const sema::Symbol* sym) const;
+    // issue #4225 (§28.3/§28.7/§30.14 v0.180): sibling of
+    // collectRecordBorrowSource for a PLAIN identifier alias of a
+    // class/interface-typed source (`var y := x;`) — see
+    // aliasBorrowSourceWindows_'s comment for why this is a separate map
+    // rather than a widening of collectRecordBorrowSource. Records a
+    // STRUCTURAL match only (the initializer is a bare identifier naming
+    // symbol S) — NOT borrowSourceForExpr, which reads live states_ and
+    // cannot run in this pre-pass at all (states_ has no entries yet when
+    // collectBorrowUses runs; see this function's own definition comment for
+    // the measured failure of an earlier draft that tried). Called from the
+    // freeze pre-pass at each LocalDecl / LocalConstDecl. // per §28.3, #4225
+    void collectAliasBorrowSource(const ast::Node& ld);
+    // issue #4225 / #4250 (send-back — measured heap-use-after-free):
+    // re-collect a plain alias holder's tracked-source window when it is
+    // REASSIGNED (`y := <producer>;`) at source offset `reassignOffset` —
+    // the plain-alias sibling of recollectRecordBorrowSourceOnReassign.
+    // FAILS CLOSED BY DEFAULT: only two RHS shapes are trusted to retire
+    // (close-without-reopening, or close-then-reopen) a window —
+    //   (1) self-assignment (the RHS names `lsym` itself) is a no-op: it
+    //       touches nothing, since assigning a holder to its own current
+    //       value cannot change what it aliases;
+    //   (2) a bare identifier naming a DIFFERENT symbol closes then opens a
+    //       new window against the chain-resolved root (unchanged from the
+    //       original #4225 fix);
+    //   (3) a `new` expression closes without reopening (the one shape this
+    //       fix's own regression tests rely on).
+    // EVERY OTHER RHS shape — `this.w`, `x.Field`, `w[0]`, `w!`, a call, and
+    // any future shape nobody has written a case for — leaves every open
+    // window untouched, so the old unbounded, conservative query stays in
+    // force for that holder/source pair. #4250 measured that the prior
+    // "close unconditionally, reopen only for a bare identifier" default
+    // silently retired a window real dataflow still considered open, for
+    // both self-assignment (a live heap-use-after-free) and member-access
+    // RHS (`borrowSourceForExpr`'s own Shape 1 recognizes
+    // MemberAccessExpr/NullCondMemberExpr/IndexExpr as alias-producing;
+    // this state-free pre-pass cannot evaluate those live-states_ gates to
+    // know whether a given instance actually does, so it must not guess).
+    // Called only at depth 0 (an unconditional rebind), matching
+    // recollectRecordBorrowSourceOnReassign's own §1741 depth-0 restriction:
+    // a conditional rebind might not execute, so the old window must stay
+    // open on the not-taken path (sound over-rejection). // per §28.3,
+    // #4225, #4250
+    void recollectAliasBorrowSourceOnReassign(const sema::Symbol* lsym,
+                                              const ast::Expr& producer,
+                                              std::uint32_t reassignOffset);
+    // issue #4225: the source-offset window [from, until) during which
+    // `holder`'s tracked alias (via aliasBorrowSourceWindows_) is `consumed`,
+    // unioned across entries the same way recordBorrowConsumedWindow does —
+    // or nullopt if `holder` was never tracked as aliasing `consumed` at all.
+    // ⚠ KNOWN SCOPE LIMIT vs. recordBorrowConsumedWindow's record-local case:
+    // no multi-hop chain resolution. `var b := r; var c := b;` records `c`'s
+    // tracked source as `b` (the immediate RHS identifier), NOT the ultimate
+    // owned root `r` — a consume of `r` while `c` (but not `b`) has a later
+    // use falls back to the unbounded, sound-over-rejecting default in
+    // checkConsumeFreeze, rather than this window. Only the direct,
+    // single-hop alias this issue's repro exercises is covered; chained
+    // aliasing is left for a follow-up. // per §28.3, #4225
+    std::optional<std::pair<std::uint32_t, std::uint32_t>>
+    aliasBorrowConsumedWindow(const sema::Symbol* holder,
+                              const sema::Symbol* consumed) const;
     // §28.3: collect the identifier-root source symbols the borrow-bearing
     // producer `e` carries (the initializer chain root, or every arg root of a
     // `new Rec(...)`) into `srcs`, excluding the local `self` itself (a
@@ -2696,6 +2898,38 @@ private:
     // so plain-parameter borrows are correctly not treated as escapes — see
     // the §9.7 param-borrow control.)
     bool isOwnedTrackedLocal(sema::Symbol* sym) const;
+
+    // fix #4156 (§28.2 / §28.9, v0.294): true when `sym` is a tracked local
+    // currently in the Disposed state — an explicit `.Dispose()` call has
+    // already run and dominates this program point (the same fact
+    // `checkRead`'s IdentifierExpr arm consults for its own §28.2
+    // dominating-Dispose warning). Sibling of `isOwnedTrackedLocal` above.
+    // Currently called ONLY from `checkIndirectEscapeOnReturn` (the
+    // `return f;` bare-holder-of-a-closure escape check), to recognize that
+    // a closure capturing `sym` by reference and escaping the method will
+    // read the ALREADY-disposed cell on every future invocation — the gap
+    // #4156 filed: capturing an owned local that is STILL Owned at the
+    // return already errors (the arm just below), but a local the
+    // enclosing scope explicitly disposed BEFORE the return fell through
+    // silently, because it is no longer Owned and `isEscapeBoundLocal` never
+    // considered Disposed a live hazard. A same-shaped extension of
+    // `checkClosureEscapesOnReturn` (the direct-lambda-literal sibling) was
+    // written and reverted — every probe found it pre-empted by
+    // `reportMovedFromCapturesIn`'s existing #3771 Disposed leg, so that
+    // function does NOT call this helper; see the investigation note beside
+    // its `st.state != OwnershipState::Owned` gate. Deliberately NOT folded
+    // into `isEscapeBoundLocal` itself: that predicate is shared by the
+    // §9.7 span/record-borrow escape checks and the bare-type-param-call
+    // escape check, whose "already disposed/moved ⇒ no live borrow to
+    // dangle" reasoning (see `checkIndirectEscapeOnReturn`'s header comment)
+    // is correct for THOSE shapes — a stale reference alias is a different,
+    // already-diagnosed hazard (`checkRead`'s own Disposed-arm fires on the
+    // re-borrowing read itself). Only a closure's capture is a standing
+    // ALIAS to a SHARED, MUTATED cell whose read is deferred to an
+    // unknowable future call outside this function's dominance analysis, so
+    // the call site gates this check on a function-typed holder
+    // specifically. // per §28.2, §28.9
+    bool isDisposedTrackedLocal(sema::Symbol* sym) const;
 
     // Issue #392 / §31.1: true when `sym` is a catch-bound exception variable
     // (`var ex: T` in a catch arm pattern). Per §31.1 "Exception ownership" the
@@ -2810,6 +3044,203 @@ private:
     // // per §28.3, §28.9, §27.5, v0.286
     sema::Symbol* enclosingFrameOwnedLocalBorrowSource(const ast::Expr& rhs,
                                                        OwnedSourceKinds kinds);
+
+    // fix #4286 (§28.3 "Ownership state of locals" / §28.6 "Who may call
+    // Dispose()", v0.298): answers "is `sym` a LOCAL whose OWN declaration is
+    // a fresh owned production" — a purely DECLARATION-SITE fact, usable from
+    // the EARLY lambda-body pre-pass this fix's call sites run in.
+    //
+    // Deliberately NOT built on `enclosingFrameOwnedLocalBorrowSource` above,
+    // and NOT the `enclosingFrameOwnedStates_`/`localIsOwnedObligation` seed
+    // that helper uses — TWO independent, both-measured reasons:
+    //  1. `localIsOwnedObligation` answers "will this declaration need a
+    //     SYNTHESIZED end-of-scope auto-drop" (`ld->autoDropAtScopeEnd` /
+    //     `ld->becomesOwnedViaReassign`) — both flags are set by
+    //     Ownership.cpp's OWN dataflow, `autoDropAtScopeEnd` only by the
+    //     end-of-method auto-drop sweep (Ownership.cpp ~line 921) that runs
+    //     at the very END of `run()`. This fix's call site
+    //     (`applyUsingVarBorrowPinInLambdas`, #2166) runs at the TOP of
+    //     `run()` — well before that sweep, and `autoDropAtScopeEnd` is
+    //     FALSE outright for a local (this issue's own repro `a`) that is
+    //     later explicitly `.Dispose()`d, since an explicitly-discharged
+    //     local needs no synthesized auto-drop.
+    //  2. Even queried at the right TIME, `enclosingFrameOwnedLocalBorrowSource`
+    //     bottoms out in `ownedLocalBorrowSource` -> `borrowSourceForExpr`,
+    //     whose Shape 1 gates on `returnedExprMayBorrow` (`isBorrowableType`),
+    //     which — per `disposeAliasSource`'s OWN header comment
+    //     (OwnershipState.hpp) — answers FALSE for every compiler-builtin
+    //     collection (Array/Dictionary/Set/LinkedList/...; a Named TypeRef
+    //     with a null `declaration`, the same shape an unresolved generic
+    //     parameter has). That gate is EXACTLY why `disposeAliasSource`
+    //     exists as a separate field rather than a reuse of `.source` in the
+    //     first place (fix #4236's own header comment).
+    // MEASURED: reusing `enclosingFrameOwnedLocalBorrowSource` for this fix
+    // left every one of this issue's own repro programs (`var a := new
+    // Array<int>(2); ... var b := a; b.Dispose();` inside a lambda, and the
+    // `using var`/`const` twins) compiling clean — the fix appeared to do
+    // nothing, for reason 1 above (the `Array<int>` repro type ALSO trips
+    // reason 2, independently).
+    //
+    // `producerState` has neither dependency — it classifies an EXPRESSION
+    // (`new T(...)`, an owned-returning call, `move`, …) as Owned/Borrowed
+    // purely from its AST shape and static type, available at any point.
+    // It is the SAME classifier `handleLocalDecl` itself uses for its FIRST-
+    // CUT classification of a local's own declaration (`lo.state =
+    // producerState(*ld.initializer);`) — this helper asks that identical
+    // question about the CAPTURED symbol's declaration instead. Restricted
+    // to a `LocalSymbol` (an `owned` PARAMETER capture is a deliberately-
+    // unclosed sibling gap — see the commit body). // per §28.3, §28.6, v0.298
+    bool isOwnedTrackedLocalInEnclosingFrame(sema::Symbol* sym);
+
+    // fix #4314 (§28.3 / §28.6 / §28.9, v0.298): sibling of
+    // `isOwnedTrackedLocalInEnclosingFrame` above, for the "Pattern 2" idiom
+    // the spec itself names (§K1.7/K3.11 worked example — "the same
+    // declaration `var x: Stream;` leaves `x` borrowed in Pattern 1 and owned
+    // in Pattern 2 — the ASSIGNMENTS decide, not the declaration"): a captured
+    // local that becomes owned via a later plain REASSIGNMENT rather than its
+    // own declaration initializer (`var a: Array<int>; a := new
+    // Array<int>(2);`). `isOwnedTrackedLocalInEnclosingFrame` is blind to
+    // this — it only ever inspects `ld->initializer`, which is null here.
+    //
+    // Answers via `reassignedOwnedLocals_` — a STATIC AST scan of this
+    // method's own top-level `body`, computed ONCE by
+    // `collectReassignedOwnedLocals` and populated BEFORE
+    // `applyUsingVarBorrowPinInLambdas` runs (see the call site in `run()`).
+    // Deliberately NOT `ld->becomesOwnedViaReassign` — measured (issue
+    // #4314) that flag is stamped by `handleAssignment` as part of the MAIN
+    // per-statement dataflow walk over the method body, which runs strictly
+    // AFTER this fix's early lambda-body pre-pass; at the point this
+    // predicate is consulted the flag is exactly as unset as
+    // `ld->autoDropAtScopeEnd` was measured to be for #4286's own rejected
+    // `enclosingFrameOwnedLocalBorrowSource` reuse — the identical
+    // dataflow-timing trap, one level over. `collectReassignedOwnedLocals`
+    // has no such dependency: it is a pure AST walk using `producerState`
+    // (the same classifier `isOwnedTrackedLocalInEnclosingFrame` uses),
+    // available at any point regardless of when it runs.
+    //
+    // Restricted to a `LocalSymbol` (an `owned` PARAMETER has no bare-
+    // identifier reassignment shape of this kind reachable the same way —
+    // out of scope here exactly as it is for #4286/#4304).
+    bool isReassignedOwnedLocalInEnclosingFrame(sema::Symbol* sym);
+
+    // fix #4314: populates `reassignedOwnedLocals_` — see that member's
+    // declaration and `isReassignedOwnedLocalInEnclosingFrame` above for the
+    // full rationale. A BOUNDED forward scan of `stmts` (this method's own
+    // top-level body): recurses into every nested CONTROL-FLOW statement
+    // list (if/elif/else, while, for, do…end, try/catch/finally, case arms —
+    // the same statement-kind coverage `collectBodyLambdas` already
+    // establishes as the completeness bar for this file), but deliberately
+    // does NOT descend into any `LambdaExpr`'s own body: `AssignmentStmt` is
+    // never embedded inside an expression in this grammar (only inside a
+    // statement list), so the only way a lambda-interior reassignment could
+    // reach this scan is by explicitly walking into `LambdaExpr::stmts` —
+    // which this function does not do. A reassignment happening inside a
+    // DIFFERENT lambda's own frame reassigning the SAME captured-by-
+    // reference local is a separate, materially harder case (that lambda's
+    // own frame is the one #4272's fenced reassignment arm, ~line 9518,
+    // already governs) left to a follow-up issue rather than folded in here.
+    void collectReassignedOwnedLocals(
+        const std::vector<std::unique_ptr<ast::Stmt>>& stmts);
+    // fix #4314: single-statement primitive `collectReassignedOwnedLocals`
+    // above loops over — see that function's definition (Ownership.cpp) for
+    // why this split mirrors `collectBodyLambdas`'s own base-case/loop shape.
+    void collectReassignedOwnedLocalsStmt(const ast::Stmt& s);
+
+    // fix #4321 (§28.3 / §28.6 / §28.9, v0.298): closes the sibling gap
+    // #4314 itself documented as deferred — a captured local's DECLARATION
+    // and REASSIGNMENT both live inside a DIFFERENT (outer) lambda's own
+    // body, not this method's top-level statement tree, and only a lambda
+    // nested inside THAT outer lambda aliases+disposes it:
+    //
+    //   var f := lambda() => do
+    //     var a: Array<int>; a := new Array<int>(2);
+    //     var inner := lambda() => do var b := a; b.Dispose(); end;
+    //   end;
+    //
+    // `collectReassignedOwnedLocals(body)` is bounded to the METHOD's own
+    // top-level `body` by design (see its declaration above) — `a`'s
+    // reassignment lives inside `f`'s own `stmts`, one frame deeper, so it
+    // is never found and `inner`'s alias-check retry sees an empty set.
+    //
+    // Called ONCE from `run()`, immediately after `collectReassignedOwnedLocals
+    // (body)`, ADDITIONALLY reuses `collectBodyLambdas` (the SAME flattening
+    // authority `applyUsingVarBorrowPinInLambdas` itself uses) to enumerate
+    // every `LambdaExpr` reachable from `body` AT EVERY NESTING DEPTH —
+    // `collectBodyLambdasExpr`'s own `LambdaExpr` case recurses into a found
+    // lambda's body to collect further-nested lambdas too, so the flat list
+    // already includes `inner` as well as `f`. For each lambda in that list,
+    // scans ITS OWN top-level `stmts` with the UNCHANGED
+    // `collectReassignedOwnedLocals` — so `f`'s own reassignment of `a` is
+    // found by scanning `f->stmts` directly, and both scans feed the SAME
+    // `reassignedOwnedLocals_` set `isReassignedOwnedLocalInEnclosingFrame`
+    // already consults.
+    //
+    // SOUNDNESS OF ONE FLAT SET ACROSS FRAMES (deliberately NOT keyed per
+    // lambda-frame): `reassignedOwnedLocals_` is keyed by `sema::Symbol*`,
+    // one per DECLARATION, never by name. `isReassignedOwnedLocalInEnclosingFrame`
+    // is only ever consulted with `rsym = ctx_.exprSymbol(*rid)` for an
+    // identifier occurrence that SEMA has already resolved according to real
+    // lexical scoping — so `rsym`'s own declaring scope is necessarily an
+    // ANCESTOR of (or equal to) the frame the identifier occurs in; sema
+    // cannot have resolved it to a symbol declared in a sibling or unrelated
+    // lambda (that would be a name-resolution error, a different diagnostic
+    // entirely, reported long before ownership analysis runs). So a lambda's
+    // OWN locally-declared symbol can only ever be looked up from a scope
+    // nested inside that lambda (itself or a lambda nested within it) —
+    // membership in one flat set answers "was `rsym` reassigned to an owned
+    // value anywhere within its own accessible lexical extent", which is
+    // exactly the question this predicate needs answered, regardless of
+    // which physical frame recorded it. No frame-keyed map is needed for
+    // correctness; this mirrors #4314's own choice not to key
+    // `everDischarged_` (Ownership_impl.hpp) per frame for the same reason.
+    //
+    // Deliberately does NOT touch `applyUsingVarBorrowPinInLambdaStmt`'s own
+    // fenced `AssignmentStmt` arm (~line 9518, the #4272 mechanism) — that
+    // arm updates `states_` DYNAMICALLY, scoped to the lambda currently being
+    // walked, to answer a DIFFERENT, narrower question (is THIS identifier,
+    // read from THIS SAME frame, currently Owned in `states_`); this function
+    // is a parallel, independent STATIC fact-gathering pass that only ever
+    // feeds `isReassignedOwnedLocalInEnclosingFrame`, so the two cannot
+    // observe or corrupt each other's state.
+    void collectReassignedOwnedLocalsInLambdaFrames(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body);
+
+    // fix #4304 (§28.3 "Captured owned bindings" / §28.6, v0.298): sibling of
+    // `isOwnedTrackedLocalInEnclosingFrame` above, for an `owned` PARAMETER
+    // captured by a lambda body rather than a local:
+    //
+    //   public static method Run(owned p: Array<int>): int
+    //     var f := lambda() => do var b := p; b.Dispose(); end;
+    //
+    // `isOwnedTrackedLocalInEnclosingFrame`'s `dynamic_cast<sema::LocalSymbol*>`
+    // returns null for a `ParameterSymbol` root and answers false outright —
+    // an `owned` parameter has no `LocalDecl`/initializer to classify via
+    // `producerState` in the first place.
+    //
+    // Answers via `symbolIsOwnedObligation` (Ownership_Checks.cpp; #3746) —
+    // restricted HERE to its `ParameterSymbol` arm only
+    // (`dynamic_cast<sema::ParameterSymbol*>` first; never falls through to
+    // its `LocalSymbol` arm). That restriction is deliberate, not
+    // incidental: `symbolIsOwnedObligation`'s `LocalSymbol` arm bottoms out
+    // in `localIsOwnedObligation`, which is exactly the seed #4286 measured
+    // and rejected for the identical reason `isOwnedTrackedLocalInEnclosingFrame`'s
+    // own declaration comment documents above (`ld->autoDropAtScopeEnd` is
+    // set only at the very END of `run()`'s main dataflow, well after this
+    // fix's early lambda-body pre-pass runs, and reads false regardless for
+    // an explicitly-`.Dispose()`d local) — calling `symbolIsOwnedObligation`
+    // unrestricted would silently reintroduce that exact dataflow-timing
+    // trap for a captured LOCAL while only fixing the PARAMETER axis.
+    //
+    // `symbolIsOwnedObligation`'s OWN `ParameterSymbol` arm
+    // (`ps->modifier == "owned"`) has no such dependency: `modifier` is a
+    // plain AST/symbol-table field set during parsing/sema, available
+    // unconditionally from before `run()` even begins — so restricting to
+    // that one arm carries none of the timing risk the unrestricted call
+    // would. `out owned` is excluded by that same arm (§28.3/§22.3: the
+    // caller's frame disposes an `out owned` value, not this one), matching
+    // `isOwnedTrackedLocalInEnclosingFrame`'s own `LocalSymbol`-only
+    // restriction for the sibling axis. // per §28.3, §28.6, §22.3, v0.298
+    bool isOwnedParameterInEnclosingFrame(sema::Symbol* sym);
 
     // Issue #392 / §31.1: a returned bare catch-binding identifier
     // (`return ex;`) lets the in-flight exception instance escape the arm
@@ -3117,6 +3548,16 @@ private:
     LocalOwnership* lookupState(std::string_view name);
 
     void markDisposedByName(std::string_view name, SourceLocation loc);
+
+    // fix #4246 (§28.3 / §28.6, v0.298): stamp `id` (an explicit
+    // `.Dispose()`/`?.Dispose()` receiver) with `disposeReclaimsReassigned-
+    // Borrow` when the dataflow's OWN current state for this local is
+    // Owned — MUST be called before the caller transitions that state via
+    // `markDisposedByName` (this reads `states_` as it stands at the call
+    // site, not after). See IdentifierExpr's field comment for why this is
+    // a per-occurrence fact rather than a per-declaration one.
+    void markExplicitDisposeReclaimIfReassignedBorrow(
+        const ast::IdentifierExpr& id);
 
     void markMovedByName(std::string_view name, SourceLocation loc);
 

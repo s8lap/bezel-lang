@@ -6,4 +6,4 @@
 module M; interface I method M(); end I; class C public method M() _ := new I(); end M; end C;
 
 // CHECK: :{{[0-9]+}}:{{[0-9]+}}: cannot instantiate interface `I` with `new`
-// CHECK-SAME: (§11.2)
+// CHECK-SAME: (§3.1 / §3.2 / §17.7)

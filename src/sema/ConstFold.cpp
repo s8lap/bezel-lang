@@ -251,7 +251,14 @@ bool containsConstDivByZero(
         if (!b->left || !b->right) return false;
         if (b->op == "/" || b->op == "mod") {
             auto r = foldIntConst(*b->right, resolveIdent, depth + 1);
-            if (r && *r == 0) return true;
+            // §17.14 (v0.184, #1688): a division/modulo-by-zero in a const
+            // initializer is a compile error. When `foldIntConst` returns a
+            // value, check if it is zero. When it returns nullopt (the
+            // divisor's value cannot be folded — e.g. a forward reference, an
+            // imported const, or a non-integer const), we cannot prove the
+            // divisor is non-zero at compile time, so we conservatively report
+            // division-by-zero rather than silently accepting the const.
+            if (!r || *r == 0) return true;
         }
         return containsConstDivByZero(*b->left, resolveIdent, depth + 1) ||
                containsConstDivByZero(*b->right, resolveIdent, depth + 1);

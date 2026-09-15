@@ -5,8 +5,13 @@
                                     // written walkers' per-kind dispatch)
 
 #include <algorithm>
+#include <cstdio>   // fix #4312/#4313 (§28.3, v0.298): std::fprintf for the
+                    // loud joinInto catch-all audit check, below
+#include <cstdlib>  // ... and std::abort, matching src/common/AwaitScan.cpp's
+                    // / src/sema/TypeResolution_Names.cpp's convention
 #include <functional>
 #include <optional>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -2175,6 +2180,7 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
                 // discharge just like the bare `x.Dispose()` form. // per §28.3
                 if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
                         lookThroughForceUnwrap(ma->target.get()))) {
+                    markExplicitDisposeReclaimIfReassignedBorrow(*id);
                     markDisposedByName(id->name, id->span.begin);
                 }
             }
@@ -2197,6 +2203,7 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
                                                    nm->target->span.begin);
                 if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
                         nm->target.get())) {
+                    markExplicitDisposeReclaimIfReassignedBorrow(*id);
                     markDisposedByName(id->name, id->span.begin);
                 }
             }
@@ -2538,8 +2545,20 @@ void MethodOwnership::checkRead(const ast::Expr& e, bool selfTarget) {
         // Sink.Take(move n); end; Reader.Peek(n);` inside a loop compiled
         // clean with zero diagnostics even after the markMovedByName fix
         // below, silently accepting a borrow of what may be freed memory.
+        //
+        // fix #4312 (§28.3, v0.298): widened from `state == Owned` alone to
+        // also fire on `state == Borrowed` — `joinInto`'s new
+        // `borrowedMovedFromSplit` (Ownership_Checks.cpp, this file) now
+        // populates this SAME flag on a Borrowed record (a rebind-then-move
+        // on one if-arm of a plain alias holder, the other arm a live
+        // untouched borrow), the exact same widening shape `fix #4247`
+        // already applied to `disposedOnSomePath` two guards below. See that
+        // join arm's own comment for why `maybeConsumed` (not
+        // `disposedOnSomePath`) is the right flag for the move-discharge
+        // case. // per §28.3, v0.298, #4312
         if (st->maybeConsumed &&
-            st->state == OwnershipState::Owned) {
+            (st->state == OwnershipState::Owned ||
+             st->state == OwnershipState::Borrowed)) {
             report(
                 Severity::Error, id->span.begin,
                 std::string("local `") + std::string(id->name) +
@@ -2576,8 +2595,22 @@ void MethodOwnership::checkRead(const ast::Expr& e, bool selfTarget) {
         // end; Reader.Peek(n);` inside a loop compiled clean with zero
         // diagnostics, silently accepting a read on the disposed-branch
         // path every iteration after the first.
+        //
+        // fix #4247 (§28.3, v0.298): widened from `state == Owned` alone to
+        // also fire on `state == Borrowed` — `joinInto`'s new
+        // `borrowedDischargedSplit` (Ownership_Checks.cpp, this file) now
+        // populates this SAME flag on a Borrowed record (a rebind-then-
+        // dispose on one if-arm of a plain alias holder, the other arm a live
+        // untouched borrow); a read of that merged local is exactly the same
+        // "may observe freed memory on the disposed-branch path" danger this
+        // guard already exists to catch, just for a holder whose surviving
+        // state is Borrowed instead of Owned. See the join-site comment for
+        // why Owned was the only producer of this flag until now, and why
+        // widening the CONSUMER here (rather than adding a parallel flag) is
+        // the minimal change. // per §28.3, v0.298
         if (st->disposedOnSomePath &&
-            st->state == OwnershipState::Owned) {
+            (st->state == OwnershipState::Owned ||
+             st->state == OwnershipState::Borrowed)) {
             report(
                 Severity::Error, id->span.begin,
                 std::string("local `") + std::string(id->name) +
@@ -3273,7 +3306,7 @@ void MethodOwnership::checkBorrowEscapesOnReturn(const ast::Expr& e) {
 }
 
 // ---------------------------------------------------------------------------
-// §28.9 closure-escape and §9.7 borrow-bearing-record escape (issue #360).
+// §28.3 closure-escape and §9.7 borrow-bearing-record escape (issue #360).
 //
 // The direct-return forms of two soundness holes: a returned closure that
 // captures an owned scope-bound local (the closure outlives the local's
@@ -3483,6 +3516,42 @@ void MethodOwnership::collectLambdaIdentifiers(
     }
 }
 
+// fix #4399: recursively check whether any capture in the closure chain
+// (including transitive captures of nested closures) is in Disposed state.
+// The `visited` set prevents infinite loops on pathological code.
+void MethodOwnership::checkTransitiveCapturesDisposed(
+    const ast::LambdaExpr& lam,
+    std::set<const ast::LambdaExpr*>& visited) {
+    if (!visited.insert(&lam).second) return;  // already visited
+
+    std::vector<const ast::IdentifierExpr*> caps;
+    collectLambdaIdentifiers(lam, caps);
+    for (const auto* id : caps) {
+        sema::Symbol* capSym = ctx_.exprSymbol(*id);
+        if (!capSym) continue;
+        auto it = states_.find(capSym);
+        if (it == states_.end()) continue;
+        const LocalOwnership& st = it->second;
+        if (st.state == OwnershipState::Disposed) {
+            report(
+                Severity::Warning,
+                id->span.begin,
+                std::string("closure captures `") + std::string(id->name) +
+                    "` which was disposed before this invocation — a closure's "
+                    "captured borrow is read at invoke time, and this call "
+                    "reads a disposed value (§28.2 use-after-dispose)");
+        }
+        // Recurse: if this capture is itself a function-typed local holding
+        // a closure, check ITS captures transitively.
+        if (auto* ls = dynamic_cast<sema::LocalSymbol*>(capSym)) {
+            auto lit = scopedLambdaLocalInit_.find(ls);
+            if (lit != scopedLambdaLocalInit_.end()) {
+                checkTransitiveCapturesDisposed(*lit->second, visited);
+            }
+        }
+    }
+}
+
 // -------------------------------------------------------------------------
 // §28.3 (v0.184, #1958) captured-owned-binding consume inside a closure.
 //
@@ -3661,10 +3730,32 @@ void MethodOwnership::reportMovedFromCapturesIn(const ast::LambdaExpr& lam,
         // here would silently suppress the second). The reportedMovedFromCaptures_
         // set de-duplicates per IdentifierExpr pointer so a nested lambda
         // doesn't double-report.
+        //
+        // fix #4312/#4313 (§28.3, v0.298): BOTH gates below widened from
+        // `state == Owned` alone to also fire on `state == Borrowed`. This
+        // closes issue 4313: `fix #4247`'s own new comment in
+        // OwnershipState.hpp (~L230) claimed the Borrowed+disposedOnSomePath
+        // capture gap was "separately-filed" when no such issue existed — a
+        // captured Borrowed+disposedOnSomePath local (e.g. `var y := x; if
+        // cond then y := new Res(1); y.Dispose(); end; var f := lambda(): int
+        // => y.tag;`) compiled with ZERO diagnostics and, 200x
+        // loop-amplified, crashed `AddressSanitizer: SEGV` inside the
+        // lambda body (issue 4313's own repro). `maybeConsumedAtLiteral` is
+        // widened for the same reason and by the same shape: `joinInto`'s new
+        // `borrowedMovedFromSplit` (fix #4312, this file) populates
+        // `maybeConsumed` on a Borrowed record for the first time, exactly as
+        // `borrowedDischargedSplit` (fix #4247) did for `disposedOnSomePath`
+        // — leaving this gate Owned-only would silently reopen the identical
+        // capture-read gap for the move-discharge sibling of #4313's own
+        // dispose-discharge case. // per §28.3, v0.298, #4312, #4313
         const bool maybeConsumedAtLiteral =
-            st.maybeConsumed && st.state == OwnershipState::Owned;
+            st.maybeConsumed &&
+            (st.state == OwnershipState::Owned ||
+             st.state == OwnershipState::Borrowed);
         const bool disposedOnSomePathAtLiteral =
-            st.disposedOnSomePath && st.state == OwnershipState::Owned;
+            st.disposedOnSomePath &&
+            (st.state == OwnershipState::Owned ||
+             st.state == OwnershipState::Borrowed);
         const bool disposedAtLiteral =
             st.state == OwnershipState::Disposed;
         // fix #3755 (review follow-up): the same-STATEMENT leg — the states
@@ -3852,6 +3943,38 @@ void MethodOwnership::scanCapturedOwnedConsumeExpr(const ast::Expr& e,
                 nullptr;
             scanCapturedOwnedConsumeExpr(*call->callee,
                                          insideLambda || calleeIsLambda);
+        }
+        // fix #4355 / fix #4399: when a function-typed local holding a closure
+        // is invoked, check whether any of the closure's captured identifiers
+        // have been disposed since the closure was created. Unlike
+        // `reportMovedFromCapturesIn` (which fires at the closure literal's
+        // creation point with the entry state), this fires at the INVOCATION
+        // point with the current state — catching the dispose-between-creation-
+        // and-call gap:
+        //   var c := lambda(): int => x.Get();  // capture while Owned
+        //   x.Dispose();                         // disposed AFTER creation
+        //   _ := c();                            // reads disposed x at invoke
+        //
+        // The #4399 transitive extension removes the `!insideLambda` guard and
+        // uses checkTransitiveCapturesDisposed so the check fires inside a
+        // lambda body as well, transitively examining captures of nested closures:
+        //   var inner := lambda(): int => r.Get();
+        //   var outer := lambda(): int => inner();  // outer invokes inner
+        //   r.Dispose();
+        //   _ := outer();  // outer() -> inner() -> reads disposed r
+        if (call->callee) {
+            if (const auto* calleeId =
+                    dynamic_cast<const ast::IdentifierExpr*>(call->callee.get())) {
+                if (sema::Symbol* sym = ctx_.exprSymbol(*calleeId)) {
+                    if (auto* ls = dynamic_cast<sema::LocalSymbol*>(sym)) {
+                        auto lit = scopedLambdaLocalInit_.find(ls);
+                        if (lit != scopedLambdaLocalInit_.end()) {
+                            std::set<const ast::LambdaExpr*> visited;
+                            checkTransitiveCapturesDisposed(*lit->second, visited);
+                        }
+                    }
+                }
+            }
         }
         for (const auto& a : call->args)
             if (a.value) scanCapturedOwnedConsumeExpr(*a.value, insideLambda);
@@ -4599,6 +4722,29 @@ void MethodOwnership::checkClosureEscapesOnReturn(const ast::Expr& e,
             // scope-bound discharge obligation — a value-typed or
             // runtime-managed (string/function) local is never Owned, so
             // capturing one is not constrained and is not diagnosed here.
+            //
+            // fix #4156 investigation note: a Disposed-state twin of this arm
+            // (mirroring `checkIndirectEscapeOnReturn`'s new arm just above)
+            // was tried here and measured DEAD — for a directly-embedded
+            // literal (`return lambda() => entry.Key.Length;` after
+            // `entry.Dispose();`), the literal's creation point IS this
+            // return statement, so `reportMovedFromCapturesIn`'s own
+            // Disposed leg (fired earlier, per-statement, from
+            // `checkCapturedOwnedConsumeInStmt`) always reports first and at
+            // identical severity; a probe confirmed only ITS Warning printed,
+            // never a second diagnostic from here. The one shape where the
+            // two points could differ (the #3702 `return mk();` CallExpr
+            // indirection, where the inner literal's creation statement
+            // precedes the outer return) was probed too (`var mk := lambda():
+            // () -> int => lambda() => entry.Key.Length; entry.Dispose();
+            // return mk();`) and compiled with NO diagnostic at all on either
+            // side — `checkOneLambdaBodyEscapes`'s per-lambda-body `states_`
+            // reseed (§28.9, fix #3564) appears to make the outer `entry`
+            // unresolvable from within that nested walk, a DIFFERENT,
+            // deeper gap outside this issue's scope (filed separately).
+            // Left as `== Owned` only, unchanged from before this fix — the
+            // real gap #4156 reports is the indirect holder-bound form,
+            // closed above.
             if (st.state != OwnershipState::Owned) continue;
             // Belt-and-braces: confirm the captured local's declared type is
             // a class/interface reference (the only thing a §28.9 borrow can
@@ -4623,7 +4769,7 @@ void MethodOwnership::checkClosureEscapesOnReturn(const ast::Expr& e,
                 "` whose source is disposed at scope end — capturing an "
                 "owned local does not transfer ownership; the capture is a "
                 "borrow of the enclosing scope and the returned closure "
-                "would outlive it (use-after-dispose). (§28.9 closure-"
+                "would outlive it (use-after-dispose). (§28.3 closure-"
                 "capture escape; keep the owned location in a longer-lived "
                 "scope, or restructure so the closure does not escape)");
             return;  // one diagnostic per return is enough
@@ -5301,6 +5447,16 @@ bool MethodOwnership::isOwnedTrackedLocal(sema::Symbol* sym) const {
            it->second.state == OwnershipState::Owned;
 }
 
+// fix #4156 (§28.2 / §28.3, v0.294): see the header declaration for the full
+// rationale. Sibling of isOwnedTrackedLocal, checking Disposed instead of
+// Owned.
+bool MethodOwnership::isDisposedTrackedLocal(sema::Symbol* sym) const {
+    if (!sym) return false;
+    auto it = states_.find(sym);
+    return it != states_.end() &&
+           it->second.state == OwnershipState::Disposed;
+}
+
 bool MethodOwnership::isCatchBorrow(sema::Symbol* sym) const {
     // fix #3521 (§31.1 / §31.2.1, v0.283): read the ONE spelling of this
     // classification — the flag sema sets where it already anchors the catch
@@ -5623,7 +5779,7 @@ sema::Symbol* MethodOwnership::borrowSourceForExpr(const ast::Expr& rhs) {
             }
         }
     }
-    // Shape 3 — a closure capturing an Owned local (§28.9), a catch-bound
+    // Shape 3 — a closure capturing an Owned local (§28.3), a catch-bound
     // exception variable (§31.1), or a borrow-bearing record / span local
     // (§9.7, #2144). Capturing an owned class-typed local — or the in-flight
     // exception — does not transfer ownership; the capture is a borrow whose
@@ -5642,7 +5798,7 @@ sema::Symbol* MethodOwnership::borrowSourceForExpr(const ast::Expr& rhs) {
             // closure therefore borrows the record's carried source, and its
             // holder inherits the first still-live escape-bound one — so the
             // existing escape checks (the #861 outer-local store, the field /
-            // out-param store, the §28.9/§9.7 indirect return) diagnose a
+            // out-param store, the §28.3/§9.7 indirect return) diagnose a
             // record-capturing closure exactly as one capturing the source
             // directly. A record whose sources all outlive the frame (a
             // param-backed span) resolves nothing and adds no constraint.
@@ -5651,7 +5807,7 @@ sema::Symbol* MethodOwnership::borrowSourceForExpr(const ast::Expr& rhs) {
             // re-borrows its carried source the same way, so a lambda capturing
             // it contributes that source and the existing store/return escape
             // checks (the #861 outer-local store especially) fire with no
-            // further code. // per §9.7, §35.4, §28.9
+            // further code. // per §9.7, §35.4, §28.3
             if (sym) {
                 const sema::TypeRef* capTy = nullptr;
                 if (auto* ls = dynamic_cast<sema::LocalSymbol*>(sym))
@@ -5744,7 +5900,7 @@ void MethodOwnership::checkIndirectEscapeOnReturn(const ast::Expr& e) {
     //
     // Both are the same escape: returning the bare holder lets the carried borrow
     // outlive a source that is still a live scope-bound obligation at the return —
-    // an owned scope-bound local disposed at scope end (§28.9/§9.7) or a catch
+    // an owned scope-bound local disposed at scope end (§28.3/§9.7) or a catch
     // binding (§31.1). Mirror the single-source path's guard precisely: reject
     // only when a carried source is still a live escape-bound obligation (a
     // parameter or a returned-through source outlives the return and is NOT
@@ -5752,7 +5908,7 @@ void MethodOwnership::checkIndirectEscapeOnReturn(const ast::Expr& e) {
     // array, `var s := a.AsSpan();`, accepted), and only while the source's view-
     // window is open at the return. The diagnostic wording forks on the holder
     // kind (span / borrow-bearing record vs class-typed bare-T result).
-    // // per §28.3, §28.9, §9.7, §4.14, §4.15, v0.194, #1966
+    // // per §28.3, §9.7, §4.14, §4.15, v0.194, #1966
     if (sym) {
         const sema::TypeRef* holderTy = ctx_.exprType(e);
         const bool holderIsRecordOrSpan = isBorrowBearingRecordOrSpan(holderTy);
@@ -5820,7 +5976,7 @@ void MethodOwnership::checkIndirectEscapeOnReturn(const ast::Expr& e) {
                     std::string(src->name) +
                     "` is an owned scope-bound local disposed at scope end, so "
                     "returning the borrow lets it outlive that local (§28.3 "
-                    "bare-type-parameter returns / §28.9 / §9.7 borrow-lifetime "
+                    "bare-type-parameter returns / §9.7 borrow-lifetime "
                     "rule; bind the source in the caller's scope and build the "
                     "aliasing value there instead)");
             }
@@ -5840,7 +5996,60 @@ void MethodOwnership::checkIndirectEscapeOnReturn(const ast::Expr& e) {
     // disposed / moved out, there is no live borrow to dangle (and a separate
     // diagnostic would have covered misuse); a catch binding is always live
     // within its arm.
-    if (!isEscapeBoundLocal(st->source->sym)) return;
+    if (!isEscapeBoundLocal(st->source->sym)) {
+        // fix #4156 (§28.2 / §28.3, v0.294): the "already disposed ⇒ no live
+        // borrow to dangle" premise just above is correct for a plain
+        // re-borrow (a stale reference alias is a DIFFERENT, already-
+        // diagnosed hazard — checkRead's own dominating-Dispose warning
+        // fires on the re-borrowing read itself, e.g. `var b := r;` after
+        // `r.Dispose();`) but wrong for a CLOSURE: a closure captures its
+        // source by a standing alias into a SHARED, MUTATED cell (Dispose()
+        // nulls the disposed fields, #4136), and its body is read at an
+        // unknowable FUTURE invocation this function's dominance analysis
+        // cannot see — exactly the gap #4156 filed (`checkRead`'s own
+        // dominating-Dispose warning fires for a direct, non-captured read,
+        // but nothing fires for the identical read reached only through a
+        // captured closure). Gate on a function-typed holder specifically —
+        // Shape 3 of `borrowSourceForExpr` above is the only producer that
+        // sets `.source` from a closure capture, and the type check keeps
+        // this arm from ever firing on Shape 1's plain re-borrow (a
+        // class-typed holder) or Shape 2's record construction. Severity
+        // matches this function's OWN sibling arms (Error, not the §28.2
+        // read-site Warning) — this is a completion of the ALREADY-Error
+        // §28.3 "captures an owned local whose source is disposed at scope
+        // end" rule below (the `st.state == Owned` arm in
+        // checkClosureEscapesOnReturn), not a new severity decision on the
+        // separately-open §3975/§3979/§4023 question (which is about
+        // `checkRead`'s OWN warning-vs-error split across read positions in
+        // a single function, a different code path).
+        const sema::TypeRef* holderTy = ctx_.exprType(e);
+        const bool holderIsClosure =
+            holderTy && holderTy->kind == sema::TypeRef::Kind::Function;
+        if (!holderIsClosure || !isDisposedTrackedLocal(st->source->sym))
+            return;
+        sema::Symbol* srcSym = st->source->sym;
+        report(
+            Severity::Error, id->span.begin,
+            std::string("returned `") + std::string(id->name) +
+            "` is a closure capturing `" + std::string(srcSym->name) +
+            "`, which was explicitly disposed before this return — a "
+            "closure captures its source by reference, not by value, so "
+            "every future invocation of the returned closure reads the "
+            "ALREADY-disposed `" + std::string(srcSym->name) +
+            "` (use-after-dispose). (§28.2 dominating-Dispose rule, "
+            "extended to a capture-escaping binding per §28.3; keep `" +
+            std::string(srcSym->name) +
+            "` alive for as long as the closure may be called, or copy the "
+            "data the closure needs out of it before disposing)");
+        auto srcIt = states_.find(srcSym);
+        if (srcIt != states_.end() && srcIt->second.explicitlyDisposed &&
+            srcIt->second.explicitDisposeLoc.line != 0) {
+            report(Severity::Note, srcIt->second.explicitDisposeLoc,
+                   std::string("explicit Dispose() of `") +
+                       std::string(srcSym->name) + "` was here");
+        }
+        return;
+    }
     std::string_view srcName = st->source->sym->name;
     if (isCatchBorrow(st->source->sym)) {
         // §31.1: the holder re-borrows the in-flight exception. Returning it
@@ -5868,7 +6077,7 @@ void MethodOwnership::checkIndirectEscapeOnReturn(const ast::Expr& e) {
     // task;` (kind 2): there ownership of the source task transfers into the
     // outer task's chained slot, the outer task's teardown disposes it, and the
     // borrowed result therefore outlives this frame. "Bind the source in the
-    // caller's scope" is the §28.9/§9.7 advice for an ordinary aliasing value;
+    // caller's scope" is the §28.3/§9.7 advice for an ordinary aliasing value;
     // here it is both unnecessary (no caller-side change is needed) and
     // misleading (the caller cannot make a frame-local task outlive the frame).
     // Fork only the remedy clause — the "carries a borrow of X whose source is
@@ -5893,7 +6102,7 @@ void MethodOwnership::checkIndirectEscapeOnReturn(const ast::Expr& e) {
         "` carries a borrow of `" + std::string(srcName) +
         "` whose source is disposed at scope end — the value aliases an "
         "owned scope-bound local and returning it lets the borrow outlive "
-        "that local (§28.9 / §9.7 borrow-lifetime rule; bind the source in "
+        "that local (§28.3 / §9.7 borrow-lifetime rule; bind the source in "
         "the caller's scope and build the aliasing value there instead)");
 }
 
@@ -5926,7 +6135,7 @@ sema::Symbol* MethodOwnership::ownedLocalBorrowSource(const ast::Expr& rhs,
     // sourced" borrows rests on its own stated premise — "the caller-side
     // source outlives the constructed object" — which an `owned` parameter
     // falsifies: *Auto-drop (affine)* disposes it "at the end of the method".
-    // `checkClosureEscapesOnReturn`'s §28.9 leg already reads it that way (it
+    // `checkClosureEscapesOnReturn`'s §28.3 leg already reads it that way (it
     // resolves through `states_`, which holds the `owned` parameters, and has
     // its own `ParameterSymbol` arm), so this is one rule's two channels being
     // made to agree, not a new rule. // per §28.3, §28.8, §28.9, v0.286
@@ -6419,6 +6628,56 @@ bool MethodOwnership::frameSiteStrictlyEncloses(
     if (outer.frameLevel != inner.frameLevel)
         return outer.frameLevel < inner.frameLevel;
     return outer.blockDepth < inner.blockDepth;
+}
+
+// fix #4286 (§28.3 / §28.6, v0.298): answers "is `sym` a local whose OWN
+// declaration is a fresh owned production" — a purely DECLARATION-SITE fact,
+// deliberately NOT the `enclosingFrameOwnedStates_`/`localIsOwnedObligation`
+// seed `enclosingFrameOwnedLocalBorrowSource` below uses. See the
+// declaration (Ownership_impl.hpp) for the full measured reason: that seed's
+// `localIsOwnedObligation` answers "will this declaration need a
+// SYNTHESIZED end-of-scope auto-drop" (`ld->autoDropAtScopeEnd` /
+// `ld->becomesOwnedViaReassign`), and BOTH of those flags are set by
+// Ownership.cpp's OWN dataflow — `autoDropAtScopeEnd` only by the
+// end-of-method auto-drop sweep (Ownership.cpp ~line 921), which runs at the
+// very END of `run()`, and is FALSE outright for a local (like this issue's
+// own repro `a`) that IS later explicitly `.Dispose()`d, since an explicitly-
+// discharged local needs no synthesized auto-drop. This fix's call site
+// (`applyUsingVarBorrowPinInLambdas`, #2166) runs at the TOP of `run()` —
+// MEASURED: reusing that seed here (via `enclosingFrameOwnedLocalBorrowSource`)
+// left every one of this issue's own repro programs compiling clean, because
+// the seed the query consulted was built from a flag that had not been (and,
+// for an explicitly-disposed local, never would be) set to true.
+//
+// `producerState` has no such dependency — it classifies an EXPRESSION
+// (`new T(...)`, an owned-returning call, `move`, …) as Owned/Borrowed purely
+// from its AST shape and static type (Ownership.cpp, used identically by
+// `handleLocalDecl`'s own FIRST-CUT classification of ITS local, `lo.state =
+// producerState(*ld.initializer);`) — available at any point, including this
+// early pre-pass. Restricted to a `LocalSymbol` (an `owned` PARAMETER capture
+// is a deliberately-unclosed sibling gap — see the commit body).
+//
+// LOCALDECL-ONLY, provably (#3591's family, see the marker just below the
+// cast): `ls->decl` for a `const`-declared symbol is an `ast::LocalConstDecl`,
+// never an `ast::LocalDecl`, so it falls through this cast to the `!ld`
+// early-return with no sibling arm. That is correct, not a gap — §21.1
+// (Ownership.cpp ~line 2767, "a `const` LOCAL is NEVER-OWNED") REJECTS a
+// `const` declaration outright when its initializer's `producerState` is
+// Owned ("The initializer must not be an owned production ... any other
+// producerState == Owned form"). So a program that reaches this function
+// with `sym` bound to a `const` can never have had an Owned-producing
+// initializer in the first place: the question this function asks is
+// unconditionally false for it, with or without a `LocalConstDecl` arm — the
+// SAME reasoning `enclosingFrameOwnedLocalBorrowSource` below already carries
+// its own `LOCALDECL-ONLY` marker for.
+bool MethodOwnership::isOwnedTrackedLocalInEnclosingFrame(sema::Symbol* sym) {
+    auto* ls = dynamic_cast<sema::LocalSymbol*>(sym);
+    if (!ls) return false;
+    // LOCALDECL-ONLY: a const's initializer can never be Owned (§21.1) — see
+    // this function's header comment above for the full reasoning.
+    const auto* ld = dynamic_cast<const ast::LocalDecl*>(ls->decl);
+    if (!ld || !ld->initializer) return false;
+    return producerState(*ld->initializer) == OwnershipState::Owned;
 }
 
 sema::Symbol* MethodOwnership::enclosingFrameOwnedLocalBorrowSource(
@@ -8431,6 +8690,67 @@ const ast::IdentifierExpr* MethodOwnership::identifierRoot(const ast::Expr& e) {
     return nullptr;
 }
 
+// fix #4312/#4313 (§28.3, v0.298): the four OwnershipState values that carry
+// a live discharge obligation, a live borrow, or a specific discharge
+// history — as opposed to Uninitialized/PolyNull/Poisoned, which are
+// bookkeeping states `joinInto`'s catch-all is intentionally still allowed
+// to reach (see that catch-all's own comment for why each of those three is
+// safe). Used only by `unhandledCoreOwnershipStateJoin`'s guard, below.
+static bool isCoreOwnershipStateForJoinAudit(OwnershipState s) {
+    return s == OwnershipState::Owned || s == OwnershipState::Borrowed ||
+           s == OwnershipState::MovedFrom || s == OwnershipState::Disposed;
+}
+
+// Loud, UNCONDITIONAL failure (never compiled out by NDEBUG — matching
+// src/common/AwaitScan.cpp's and src/sema/TypeResolution_Names.cpp's
+// `unhandledNullDeclClassConstraintSlot` convention rather than a plain
+// assert(), which release builds strip) for a mismatched pair of CORE
+// ownership states reaching `joinInto`'s generic "other mismatches"
+// catch-all.
+//
+// fix #4312/#4313 (§28.3, v0.298) audited `joinInto`'s full state-pair
+// matrix: of the 21 unordered mismatched pairs among OwnershipState's 7
+// values, every pair drawn from {Owned, Borrowed, MovedFrom, Disposed} now
+// has a named arm (`ownedBorrowedClash`; `ownedDischargedSplit` for
+// Owned⊓{Disposed,MovedFrom}; `borrowedDischargedSplit` for
+// Borrowed⊓Disposed, fix #4247; `borrowedMovedFromSplit` and
+// `movedFromDischargedSplit`, both added by this fix, for Borrowed⊓MovedFrom
+// and MovedFrom⊓Disposed). This is exactly what this fix closed: BEFORE it,
+// both Borrowed⊓MovedFrom and MovedFrom⊓Disposed fell through to the
+// catch-all silently, and were confirmed measured heap-UAF/SEGV crashes
+// (issue 4312) — a "safety check that has never been seen to fire is
+// indistinguishable from one that cannot fire" (this run's LANE_RULES §31),
+// except in the OTHER direction: there was no check at all, just silence.
+//
+// Every remaining pair the catch-all is STILL meant to reach involves
+// Uninitialized, PolyNull, or Poisoned, and each is safe by a DIFFERENT,
+// already-audited mechanism (see the catch-all's own comment), so a
+// mismatch where BOTH sides are core states reaching here can only mean an
+// 8th OwnershipState value was added without a matching `joinInto` arm, or
+// this audit's completeness has silently gone stale under a later edit.
+// Crashing loudly in EVERY build (not just debug) turns that silent-failure
+// mode into an immediate, attributable compiler crash instead of a
+// re-poisoned local that quietly stops being checked — the exact failure
+// shape #4247/#4312/#4313 all are. // per §28.3, v0.298
+[[noreturn]] static void unhandledCoreOwnershipStateJoin(
+        std::string_view symName, OwnershipState a, OwnershipState b,
+        SourceLocation loc) {
+    std::string_view an = ownershipStateName(a);
+    std::string_view bn = ownershipStateName(b);
+    std::fprintf(stderr,
+        "internal compiler error: src/ownership/Ownership_Checks.cpp's "
+        "MethodOwnership::joinInto has no named arm for the mismatched pair "
+        "(%.*s, %.*s) on local `%.*s` at %u:%u -- fix #4312/#4313's audit "
+        "assumed every Owned/Borrowed/MovedFrom/Disposed mismatch is named; "
+        "either a new OwnershipState value was added without a matching "
+        "joinInto arm, or that assumption is now stale (§28.3, v0.298)\n",
+        static_cast<int>(an.size()), an.data(),
+        static_cast<int>(bn.size()), bn.data(),
+        static_cast<int>(symName.size()), symName.data(),
+        loc.line, loc.column);
+    std::abort();
+}
+
 void MethodOwnership::joinInto(std::unordered_map<sema::Symbol*, LocalOwnership>& into,
               const std::unordered_map<sema::Symbol*,
                                        LocalOwnership>& other,
@@ -8441,19 +8761,96 @@ void MethodOwnership::joinInto(std::unordered_map<sema::Symbol*, LocalOwnership>
         const LocalOwnership& o = it->second;
         if (st.state == o.state) {
             // §28.3 (#1626): preserve the maybe-consumed marker across a
-            // same-state Owned ⊓ Owned merge (OR it). The marker is only ever
-            // set on the Owned state (the ownedDischargedSplit rule below, for
-            // the Owned ⊓ MovedFrom split only — see the rework note there), so
-            // this branch is the only same-state case where it is live. OR-ing
+            // same-state Owned ⊓ Owned merge (OR it). The marker was only
+            // ever set on the Owned state (the ownedDischargedSplit rule
+            // below, for the Owned ⊓ MovedFrom split only — see the rework
+            // note there) UNTIL fix #4312/#4313 (§28.3, v0.298) added a
+            // second producer — `borrowedMovedFromSplit` below now sets it on
+            // a surviving BORROWED record too (the alias-rebind mirror of
+            // `borrowedDischargedSplit`'s `disposedOnSomePath`). OR-ing
             // — rather than keeping `st`'s flag — is what makes the marker
-            // survive a loop back-edge: a loop-carried Owned local that became
-            // maybe-consumed (moved on one path in the body) inside the body
-            // must stay maybe-consumed at the header so a use in a later
-            // iteration (flowing around the back edge, which the spec forbids)
-            // is rejected. Keeping only `st`'s flag would let the freshly-owned
-            // incoming path wash the marker out and re-admit the use. // per §28.3
-            if (st.state == OwnershipState::Owned)
+            // survive a loop back-edge: a loop-carried Owned OR Borrowed
+            // local that became maybe-consumed (moved on one path in the
+            // body) inside the body must stay maybe-consumed at the header so
+            // a use in a later iteration (flowing around the back edge, which
+            // the spec forbids) is rejected. Keeping only `st`'s flag would
+            // let the freshly-unmarked incoming path wash the marker out and
+            // re-admit the use — EXACTLY the nested-if outer-join gap
+            // `borrowedDischargedSplit`'s own same-state `disposedOnSomePath`
+            // OR-merge (a few lines below) was widened to close for its flag;
+            // gating this OR-merge to `Owned` alone after `maybeConsumed`
+            // became populate-able on `Borrowed` would silently reopen the
+            // identical gap one flag over. // per §28.3, v0.298, #4312, #4313
+            if (st.state == OwnershipState::Owned ||
+                st.state == OwnershipState::Borrowed)
                 st.maybeConsumed = st.maybeConsumed || o.maybeConsumed;
+            // fix #4236 send-back / §28.3, §28.6 (v0.298): this same-state
+            // early `continue` kept ONLY `st`'s (branchEndStates.front(), the
+            // `if`-branch's — see the IfStmt join call site) `disposeAliasSource`
+            // verbatim, silently discarding `other`'s when both branches land
+            // on Borrowed but only one of them is a recognized alias — e.g.
+            // `if cond then b := Helper.Peek(a); else b := a; end; b.Dispose();`:
+            // the `then` branch's CallExpr producer leaves `disposeAliasSource`
+            // null, the `else` branch's bare-identifier alias sets it to `a`,
+            // and keeping only the front branch's record made the whole
+            // rejection PURE BRANCH-ORDER LUCK — swapping the two arms (an
+            // otherwise-identical program) flipped `.Dispose()` from correctly
+            // rejected to silently accepted and double-freed. `disposeAliasSource`
+            // is populated ONLY when a branch's own producer left it Borrowed
+            // via a recognized bare-identifier alias (OwnershipState.hpp's
+            // header comment; the three setters in Ownership.cpp), so an
+            // OR-style merge here can only ever ADD a genuine alias fact, never
+            // invent one: if EITHER incoming branch is a known alias of a named
+            // owned binding, the merged local is aliased on at least that
+            // reachable path, and §28.6's "Dispose() through a borrow is a
+            // compile error" must still reject it post-join — exactly the
+            // same asymmetric, favor-soundness-over-permissiveness posture
+            // this function's `ownedDischargedSplit` arm below already takes.
+            // // per §28.3, §28.6
+            if (!st.disposeAliasSource && o.disposeAliasSource)
+                st.disposeAliasSource = o.disposeAliasSource;
+            // fix #4246 (§28.3 / §28.6, v0.298): AND (not OR, and not the
+            // implicit "keep `st`'s side" this same-state branch otherwise
+            // does for every field it does not name) the sticky
+            // `explicitDisposeReclaimedSlot` bit across a same-state merge.
+            // Unlike `maybeConsumed` above, where losing precision means
+            // REJECTING a program that is actually fine, losing precision
+            // here in the wrong direction means CODEGEN RECLAIMS A SLOT ONE
+            // INCOMING PATH NEVER MADE RECLAIM-ELIGIBLE — a double-free, not
+            // a false reject. Example: `if c then y := new R(); y.Dispose();
+            // else y.Dispose(); end;` (else leaves `y` a genuine, still-live
+            // borrow — no reassignment on that arm) — both arms end in
+            // `Disposed`, so `st.state == o.state` is exactly this branch,
+            // and keeping only `st`'s flag (whichever operand order the
+            // caller happened to pass) would make a LATER dispose on the
+            // merged `y` reclaim-eligible even on the path that never
+            // reassigned it. AND is the sound choice: the merged local is
+            // reclaim-eligible only where EVERY incoming path already
+            // proved it so — the same "worst case wins" asymmetry
+            // `ownedBorrowedClash` below applies to Owned-vs-Borrowed,
+            // pushed down one field. // per §28.3, §28.6
+            st.explicitDisposeReclaimedSlot =
+                st.explicitDisposeReclaimedSlot && o.explicitDisposeReclaimedSlot;
+            // fix #4247 (§28.3, v0.298): OR `disposedOnSomePath` across a
+            // same-state merge too — the SAME order-dependency #4236 fixed for
+            // `disposeAliasSource` two fields up, one flag over. Before this
+            // fix the flag was untouched here entirely (silently kept only
+            // `st`'s side), which was latent for the pre-existing Owned⊓Disposed
+            // producer of this flag (a nested if / loop back-edge could wash it
+            // out depending on branch order) and became load-bearing the moment
+            // `borrowedDischargedSplit` below also began setting it on a
+            // Borrowed record: a nested-if outer join with one inner arm
+            // producing Borrowed+disposedOnSomePath and the other a fresh,
+            // never-touched Borrowed must still carry the flag forward, or the
+            // outer join's own later read check (`checkRead`) silently loses
+            // the fact this exact bug is about. OR is correct because the
+            // unsafe direction is "disposed on at least one reachable path",
+            // which — once true on either incoming edge — remains true of the
+            // merged local; losing it would let a read through that may
+            // observe freed memory on the reachable disposed-branch path.
+            // // per §28.3, v0.298
+            if (!st.disposedOnSomePath && o.disposedOnSomePath)
+                st.disposedOnSomePath = true;
             continue;
         }
         // PolyNull absorbs: PolyNull ⊓ X = X.
@@ -8640,10 +9037,241 @@ void MethodOwnership::joinInto(std::unordered_map<sema::Symbol*, LocalOwnership>
                 st.disposedOnSomePath = true;
             continue;
         }
-        // Other mismatches (e.g. Uninitialized on one side at a non-loop
-        // merge) — poison. The Owned ⊓ Uninitialized non-loop case retains
-        // the existing O4 treatment (silent poison; a subsequent read
-        // diagnoses), which the O4 branch-join tests pin.
+        // fix #4247 (§28.3 "Ownership state of locals" / branch-join rules,
+        // v0.298): Borrowed ⊓ Disposed split. A plain-identifier alias holder
+        // (`var y := x;`, tracked via `states_[y].source`/`disposeAliasSource`,
+        // NOT an owned local) can be REBOUND to a fresh owned value on one
+        // arm of an if-WITHOUT-else and explicitly disposed there (`y := new
+        // Res(1); y.Dispose();`), while the other arm never touches `y` at
+        // all — it is still the original live borrow of `x`. Before this fix
+        // this mismatch fell all the way through to the generic "other
+        // mismatches" catch-all below, which POISONS SILENTLY (no
+        // diagnostic): `y`'s `disposeAliasSource` (the alias-of-`x` fact) was
+        // discarded along with everything else, so (a) a later `.Dispose()`
+        // on `y` no longer tripped the existing #4236 alias-dispose rejection
+        // (a false ACCEPT — a would-be double-dispose is idempotent at
+        // runtime via the checked-mode disposed-flag, MEASURED harmless via
+        // `agent_check.sh --probe --asan` at 200x loop amplification, so this
+        // half is a missed rejection, not a crash), and (b) a later READ of
+        // `y` (e.g. `y.tag`) was accepted with zero diagnostics and observes
+        // freed memory on the taken-arm path — MEASURED via
+        // `agent_check.sh --probe --asan` on a 200-iteration loop-amplified
+        // repro: `AddressSanitizer: SEGV ... READ memory access` at a
+        // near-null offset, i.e. a genuine use-after-dispose crash, not
+        // merely the 16-byte leak the single-shot (unamplified) repro showed.
+        //
+        // This is NOT treated as `ownedBorrowedClash` (reject unconditionally
+        // at the join): unlike Owned vs Borrowed, which is ALWAYS a leak or a
+        // double-owner regardless of what happens next, a Borrowed ⊓ Disposed
+        // merge that is never touched again is completely sound (§15
+        // accept-side control: "an if-without-else that disposes on the taken
+        // path and never touches the holder again" must keep compiling) — the
+        // disposal on the taken arm discharged a value `y` itself came to own
+        // via the rebind, not the borrowed source, and the not-taken arm's
+        // borrow of `x` remains `x`'s obligation to discharge, not `y`'s.
+        // Rejecting at the join would false-reject that legitimate program.
+        //
+        // So — mirroring `ownedDischargedSplit` above, one field over — KEEP
+        // the BORROWED side's full record (so its `source`/`disposeAliasSource`
+        // survive the join for (a) above) and set `disposedOnSomePath`, the
+        // SAME flag `ownedDischargedSplit` already uses for the analogous
+        // Owned ⊓ Disposed split, widened here to populate on a Borrowed
+        // record for the first time. This is a widening of what the flag is
+        // POPULATED from, not a new question: its documented meaning is "may
+        // have been disposed on some incoming path, so a read may observe
+        // freed memory" (OwnershipState.hpp), which is exactly (b) above; the
+        // existing `state == Owned` guards at its two consuming sites
+        // (`checkRead`, the lambda-capture read check) are an artifact of
+        // `disposedOnSomePath` previously only ever being set on an Owned
+        // record, not a deliberate restriction — every reset site
+        // (`handleAssignment`'s several arms, `markDisposedByName`) already
+        // clears it unconditionally on any reassignment regardless of state,
+        // so nothing downstream relied on an Owned-only invariant. `checkRead`
+        // is widened alongside this join change to actually consult the flag
+        // on a Borrowed record (see its own comment); the lambda-capture
+        // sibling is NOT widened here — deliberately out of scope: a captured
+        // Borrowed+disposedOnSomePath local is a real, reachable
+        // use-after-dispose (confirmed heap-UAF at 200x amplification) left
+        // OPEN as issue 4313, not this join — and neither
+        // is the symmetric Borrowed ⊓ MovedFrom split (a `move`/`owned`-
+        // transfer discharge of the rebound value instead of `.Dispose()`),
+        // which this fix's measured repro does not exercise and which would
+        // need `maybeConsumed`'s own `state == Owned` guard widened too — left
+        // for a follow-up issue to keep this change scoped to the split this
+        // fix actually measured.
+        //
+        // `markDisposedByName` needs no change: a repeat `.Dispose()` on the
+        // merged local is independently caught by the PRE-EXISTING
+        // `disposeAliasSource` alias check (`checkDisposeReceiverOwnership`,
+        // fix #4236) now that this join stops discarding that record — see
+        // (a) above. // per §28.3, v0.298
+        const bool borrowedDischargedSplit =
+            (st.state == OwnershipState::Borrowed &&
+             o.state == OwnershipState::Disposed) ||
+            (st.state == OwnershipState::Disposed &&
+             o.state == OwnershipState::Borrowed);
+        if (borrowedDischargedSplit) {
+            if (st.state != OwnershipState::Borrowed) st = o;
+            st.disposedOnSomePath = true;
+            continue;
+        }
+        // fix #4312 (§28.3, v0.298): MovedFrom ⊓ Disposed split — one
+        // incoming branch transferred the value OUT (`move`, an
+        // `owned`-argument transfer), the other explicitly `.Dispose()`d it.
+        // Filed alongside `borrowedMovedFromSplit` below as the other of the
+        // two remaining reachable cells `fix #4247`'s own audit missed (that
+        // fix closed Borrowed⊓Disposed only). Measured: pre-fix, `var x :=
+        // new Res(5); if cond then x.Dispose(); else Sink.Take(move x); end;
+        // var t := x.tag;` compiled with ZERO diagnostics and, 200x
+        // loop-amplified, crashed `AddressSanitizer: SEGV ... READ memory
+        // access` at a near-null address (issue 4312 repro 1).
+        //
+        // Unlike `ownedDischargedSplit`, NEITHER side here is Owned, so there
+        // is no still-live discharge obligation to retain for the
+        // end-of-scope leak check: both incoming edges already fully
+        // discharged the local, just via different mechanisms (this file's
+        // `checkConsumeFreeze` already treats MovedFrom and Disposed
+        // identically as "already consumed/dead, cannot dangle" — see that
+        // function, above).
+        //
+        // THE MERGE OPERATOR: pick the STRICTER of the two terminal
+        // classifications — an OR over DANGER SEVERITY, not over a boolean
+        // flag, but the same "favor soundness over permissiveness" posture
+        // `ownedBorrowedClash` and `explicitDisposeReclaimedSlot`'s AND-merge
+        // already apply one level up. A subsequent read/dispose/move is
+        // unsafe on BOTH incoming paths, but the two states' existing
+        // consumers diagnose that danger at different severities: the
+        // MovedFrom edge's value may already be PHYSICALLY FREED by its new
+        // owner, and `checkRead`'s `state == MovedFrom` arm reports a hard
+        // §28.3 ERROR unconditionally for exactly that; the Disposed edge's
+        // value was explicitly freed by `.Dispose()`, and `checkRead`'s
+        // `state == Disposed` arm reports only a §28.2 WARNING (the
+        // checked-mode disposed-flag backstop makes a dominating
+        // use-after-dispose merely undefined-in-UNCHECKED-mode, not
+        // definitely-already-freed-by-someone-else). Merging to Disposed
+        // would under-diagnose the MovedFrom edge's read with a mere
+        // WARNING; merging to MovedFrom makes every consumer (`checkRead`,
+        // `markMovedByName`, `markDisposedByName` — none of which gate this
+        // arm on `Owned`/`Borrowed`, so no further widening is needed) reject
+        // with ERROR regardless of which edge is live. The one thing this
+        // costs is a false reject of a post-join repeat-`.Dispose()` that
+        // would have been the Disposed edge's own idempotent no-op — but
+        // that shape is REACHABLE ONLY TOGETHER WITH the MovedFrom edge's
+        // genuine use-after-free danger in the very same program, so
+        // rejecting the whole program is sound, not an over-reject (the
+        // identical asymmetric choice `ownedBorrowedClash` already makes for
+        // Owned-vs-Borrowed). // per §28.3, v0.298, #4312
+        const bool movedFromDischargedSplit =
+            (st.state == OwnershipState::MovedFrom &&
+             o.state == OwnershipState::Disposed) ||
+            (st.state == OwnershipState::Disposed &&
+             o.state == OwnershipState::MovedFrom);
+        if (movedFromDischargedSplit) {
+            st.state = OwnershipState::MovedFrom;
+            continue;
+        }
+        // fix #4312 (§28.3, v0.298): Borrowed ⊓ MovedFrom split — the exact
+        // symmetric case `fix #4247`'s own commit body named and explicitly
+        // deferred ("neither is the symmetric Borrowed ⊓ MovedFrom split ...
+        // left for a follow-up issue to keep this change scoped to the split
+        // this fix actually measured"). Same shape as `borrowedDischargedSplit`
+        // immediately above — a plain-identifier alias holder (`var y := x;`)
+        // rebound to a fresh owned value on one arm, the other arm a live
+        // untouched borrow of `x` — but the rebound value is discharged via
+        // `move`/an owned-argument transfer instead of `.Dispose()`. Measured:
+        // pre-fix, `var y := x; if cond then y := new Res(1); Sink.Take(move
+        // y); end; var t := y.tag;` compiled with ZERO diagnostics and, 200x
+        // loop-amplified, crashed `AddressSanitizer: heap-use-after-free`,
+        // freed inside `Sink.Take` (issue 4312 repro 2).
+        //
+        // THE MERGE OPERATOR: unlike `movedFromDischargedSplit` above, this
+        // is NOT a same-severity-upgrade choice between two terminal states
+        // — per #4312's own suggested fix shape, this needs `maybeConsumed`
+        // (the MOVED-FROM split's use-after-free marker — see
+        // `ownedDischargedSplit` above and OwnershipState.hpp's field
+        // comment), NOT `disposedOnSomePath`: the danger here is the
+        // MovedFrom side's use-after-free (the object may be physically
+        // freed by the receiver the value was moved into), which
+        // `maybeConsumed` already exists to flag; `disposedOnSomePath`'s
+        // semantics carve out an idempotent-Dispose exception that does not
+        // apply to a move. KEEP the BORROWED side's full record (so
+        // `source`/`disposeAliasSource` survive the join, mirroring
+        // `borrowedDischargedSplit`) and OR the flag in (`st.maybeConsumed =
+        // true` — the first time this arm runs on a given pair, `st` is
+        // whichever operand IS Borrowed and has never carried the flag
+        // before, since this is the first `joinInto` arm that ever populates
+        // `maybeConsumed` on a Borrowed record). Making `checkRead`'s
+        // existing `maybeConsumed` arm and `reportMovedFromCapturesIn`'s
+        // `maybeConsumedAtLiteral` gate (Ownership_Checks.cpp) — and this
+        // function's OWN same-state OR-merge for the flag, above — also fire
+        // on `state == Borrowed` is fix #4312/#4313's OTHER half; see those
+        // sites' own comments. `markDisposedByName` and `markMovedByName`
+        // already consult `maybeConsumed` UNCONDITIONALLY on state, so a
+        // post-join Dispose()/move needs no further change.
+        //
+        // Not `ownedBorrowedClash` (unconditional reject): mirroring
+        // `borrowedDischargedSplit`'s own reasoning, a Borrowed⊓MovedFrom
+        // merge NEVER touched again after the join is completely sound (§15
+        // accept-side control) — the move on the taken arm discharged a
+        // value `y` itself came to own via the rebind, and the not-taken
+        // arm's borrow of `x` remains `x`'s own obligation. Rejecting
+        // unconditionally at the join would false-reject that legitimate
+        // program. // per §28.3, v0.298, #4312
+        const bool borrowedMovedFromSplit =
+            (st.state == OwnershipState::Borrowed &&
+             o.state == OwnershipState::MovedFrom) ||
+            (st.state == OwnershipState::MovedFrom &&
+             o.state == OwnershipState::Borrowed);
+        if (borrowedMovedFromSplit) {
+            if (st.state != OwnershipState::Borrowed) st = o;
+            // c4-fix-4312-regression narrowing (§28.3, v0.298, #4068): only
+            // set maybeConsumed when the surviving Borrowed side carries an
+            // actual borrow-source pointer (`source` set by handleLocalDecl's
+            // borrowSourceForExpr path) — a plain alias of a named binding
+            // like `var y := x;`. A fresh-producer local classified Borrowed
+            // (a `var items := seq.Sorted()` on a borrowing-collection return
+            // type) has no `source`, and the field-store slot-nulling makes
+            // its post-move read safe (codegen's nullTransferredOwnedLocalSlot
+            // extension, paired with the null-deference guard, catches the
+            // access). 4068's `while_loop_field_store_spec_28_3` row
+            // continues to compile; 4312 repro 2 and the axis rows that use
+            // `var y := x;` retain the rejection. // per §28.3, v0.298, #4312
+            if (st.source.has_value())
+                st.maybeConsumed = true;
+            continue;
+        }
+        // fix #4312/#4313 (§28.3, v0.298): LOUD, unconditional audit — see
+        // `unhandledCoreOwnershipStateJoin` and `isCoreOwnershipStateForJoinAudit`
+        // above this function — that a mismatch between two CORE states
+        // (Owned, Borrowed, MovedFrom, Disposed) never reaches the silent
+        // catch-all below. Deliberately NOT gated to Uninitialized / PolyNull
+        // / Poisoned — see the catch-all's own comment immediately below for
+        // why those three are still expected here. // per §28.3, v0.298
+        if (isCoreOwnershipStateForJoinAudit(st.state) &&
+            isCoreOwnershipStateForJoinAudit(o.state)) {
+            unhandledCoreOwnershipStateJoin(sym->name, st.state, o.state,
+                                             joinLoc);
+        }
+        // Other mismatches — poison. Every pair that still reaches here is
+        // one of:
+        //   * Uninitialized on one side at a NON-loop merge (loop merges are
+        //     handled by the union-key widening above): the Owned ⊓
+        //     Uninitialized case retains the existing O4 treatment (silent
+        //     poison; a subsequent read diagnoses), which the O4 branch-join
+        //     tests pin. This is NOT an independent soundness hole for any
+        //     Uninitialized pairing — a SEPARATE definite-assignment pass
+        //     independently rejects the read before this silence matters
+        //     (fix #4312's own measurement: `build/bezelc -c` on an
+        //     Uninitialized⊓Disposed program prints the DA "read of
+        //     unassigned local" diagnostic, not a silent accept).
+        //   * Poisoned on one side: "suppress cascades" for a diagnostic
+        //     ALREADY emitted by whatever produced the Poisoned state in the
+        //     first place (`ownedBorrowedClash`'s loud reject, or an earlier
+        //     pass entirely) — neither of this fix's two new arms ever
+        //     poisons, so Poisoned here is never THIS join's own doing — not
+        //     new information loss (fix #4312's own analysis, "What is NOT
+        //     dangerous in the same matrix").
+        // per §28.3, v0.298, #4312, #4313
         st.state = OwnershipState::Poisoned;
     }
     // O3b union-key meet (loop back-edge / zero-trip-skip merges only):
@@ -8676,6 +9304,34 @@ LocalOwnership* MethodOwnership::lookupState(std::string_view name) {
         if (sym->name == name) return &st;
     }
     return nullptr;
+}
+
+// fix #4246 (§28.3 / §28.6, v0.298): see IdentifierExpr::disposeReclaims-
+// ReassignedBorrow's field comment for the full rationale. Reads `states_`
+// (via `lookupState`, non-mutating) for `id`'s CURRENT classification at
+// THIS exact `.Dispose()` call and, when it is Owned, stamps the flag on
+// THIS occurrence only — never on the LocalDecl, which would make every
+// call site on the local share one answer regardless of program order. Must
+// run before the caller's `markDisposedByName`, which mutates the state to
+// Disposed. // per §28.3, §28.6
+void MethodOwnership::markExplicitDisposeReclaimIfReassignedBorrow(
+        const ast::IdentifierExpr& id) {
+    if (LocalOwnership* st = lookupState(id.name)) {
+        // fix #4246 follow-up: `state == Owned` covers the FIRST dispose of
+        // this value-epoch; `explicitDisposeReclaimedSlot` (already true)
+        // covers a REPEATED dispose of the SAME epoch after the first one
+        // already flipped `state` to Disposed — see that field's comment for
+        // why a repeat call must see this too (§28.2 idempotence: the second
+        // call must land on the SAME null-guarded slot the first reclaimed,
+        // not fall to the dispatch-only path that assumes a never-nulled
+        // receiver).
+        if (st->state == OwnershipState::Owned ||
+            st->explicitDisposeReclaimedSlot) {
+            const_cast<ast::IdentifierExpr&>(id).disposeReclaimsReassignedBorrow =
+                true;
+            st->explicitDisposeReclaimedSlot = true;
+        }
+    }
 }
 
 void MethodOwnership::markDisposedByName(std::string_view name, SourceLocation loc) {
@@ -8920,6 +9576,36 @@ void MethodOwnership::recordBorrowUseExpr(const ast::Expr& e,
         if (lam->exprBody) recordBorrowUseExpr(*lam->exprBody, attributeOffset);
         for (const auto& st : lam->stmts)
             if (st) {
+                // issue #4225: a lambda-body statement gets none of
+                // collectBorrowUsesStmt's per-statement dispatch (identifiers
+                // are gathered flatly below instead), so a TOP-LEVEL
+                // declaration or bare-identifier rebind inside a lambda never
+                // opened/closed an aliasBorrowSourceWindows_ window the way
+                // the identical statement would at method scope — the
+                // false-reject this issue reports reproduces identically
+                // inside a lambda body via the pre-existing `move`-RHS
+                // consuming path. Mirror the two window-affecting shapes
+                // collectBorrowUsesStmt already handles, restricted (like its
+                // own depth-0 restriction) to a statement that is a DIRECT,
+                // unconditional statement of the lambda body — a rebind
+                // nested inside an if/while INSIDE the lambda keeps the old,
+                // sound, over-rejecting default. // per §28.3, #4225
+                if (auto* ld = dynamic_cast<const ast::LocalDecl*>(st.get())) {
+                    collectAliasBorrowSource(*ld);
+                } else if (auto* lcd = dynamic_cast<const ast::LocalConstDecl*>(
+                               st.get())) {
+                    collectAliasBorrowSource(*lcd);
+                } else if (auto* as =
+                               dynamic_cast<const ast::AssignmentStmt*>(
+                                   st.get())) {
+                    auto* tid = dynamic_cast<const ast::IdentifierExpr*>(
+                        as->target.get());
+                    if (tid && as->op == ":=" && as->value) {
+                        if (sema::Symbol* lsym = ctx_.exprSymbol(*tid))
+                            recollectAliasBorrowSourceOnReassign(
+                                lsym, *as->value, tid->span.begin.offset);
+                    }
+                }
                 std::vector<const ast::IdentifierExpr*> ids;
                 collectIdentifiersInStmt(*st, ids);
                 for (const ast::IdentifierExpr* id : ids) {
@@ -8961,9 +9647,18 @@ void MethodOwnership::collectBorrowUsesStmt(const ast::Stmt& s) {
                 // not execute, so the old source stays live on the not-taken
                 // paths (windows left open — sound over-rejection).
                 if (borrowUseCondDepth_ == 0 && as->value)
-                    if (sema::Symbol* lsym = ctx_.exprSymbol(*tid))
+                    if (sema::Symbol* lsym = ctx_.exprSymbol(*tid)) {
                         recollectRecordBorrowSourceOnReassign(
                             lsym, *as->value, tid->span.begin.offset);
+                        // issue #4225: sibling re-collection for a PLAIN
+                        // identifier alias holder — see
+                        // aliasBorrowSourceWindows_'s comment. Same depth-0
+                        // gate: a conditional rebind might not execute, so
+                        // the old window must stay open on the not-taken
+                        // path.
+                        recollectAliasBorrowSourceOnReassign(
+                            lsym, *as->value, tid->span.begin.offset);
+                    }
             } else {
                 recordBorrowUseExpr(*as->target);
             }
@@ -8985,6 +9680,10 @@ void MethodOwnership::collectBorrowUsesStmt(const ast::Stmt& s) {
         // plain args, so consuming a contributing source while the result is live
         // must freeze exactly as a live span over that source does.
         collectBareTypeParamCallBorrowSource(*ld);
+        // issue #4225: DISJOINT sibling — a PLAIN identifier alias of a
+        // class/interface-typed source (`var y := x;`) opens its own
+        // rebind-bounded window (aliasBorrowSourceWindows_).
+        collectAliasBorrowSource(*ld);
         return;
     }
     // fix #3591 (§28.3 v0.180 #1741, v0.286): §21.1's runtime `const` is a
@@ -9013,6 +9712,7 @@ void MethodOwnership::collectBorrowUsesStmt(const ast::Stmt& s) {
         if (lcd->value) recordBorrowUseExpr(*lcd->value);
         collectRecordBorrowSource(*lcd);
         collectBareTypeParamCallBorrowSource(*lcd);
+        collectAliasBorrowSource(*lcd);  // issue #4225
         return;
     }
     if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(&s)) {
@@ -9294,6 +9994,164 @@ void MethodOwnership::recollectRecordBorrowSourceOnReassign(
     }
 }
 
+void MethodOwnership::collectAliasBorrowSource(const ast::Node& ld) {
+    // issue #4225 (§28.3/§28.7/§30.14 v0.180): see aliasBorrowSourceWindows_'s
+    // comment.
+    //
+    // ⚠ This runs from the collectBorrowUses PRE-PASS (Ownership.cpp:381),
+    // called ONCE before the forward dataflow walk even starts — states_ has
+    // NO entries at all yet. borrowSourceForExpr is therefore NOT usable
+    // here: its Shape-1 owned-re-borrow arm gates on isOwnedTrackedLocal /
+    // isEscapeBoundLocal, both direct reads of states_, so it would return
+    // null for every ordinary case at this phase and the map would never
+    // populate. (Measured: an earlier draft of this fix called
+    // borrowSourceForExpr here and left the false-reject completely
+    // unfixed — same message, same offset, before and after.)
+    //
+    // No such authority is needed anyway. This map is consulted ONLY from
+    // checkConsumeFreeze's states_-based holder loop, which has ALREADY used
+    // the REAL, live states_[holder].source to confirm `holder` currently
+    // aliases `consumed` at the consume site — this map's only job is to say
+    // WHEN that already-confirmed alias later retires. A plain structural
+    // match (the initializer is a bare identifier naming some symbol S) is
+    // sufficient: recording a window for a harmless non-borrow S (e.g. a
+    // value-typed copy) is inert, because states_[holder].source was never
+    // set for it by the real walk in the first place, so loop 1's own first
+    // gate already skips that holder before this map is ever consulted.
+    // // per §28.3, #4225
+    const ast::Expr* init = nullptr;
+    if (auto* d = dynamic_cast<const ast::LocalDecl*>(&ld)) {
+        if (d->isUsing || d->initializerHasOwnedMarker) return;
+        init = d->initializer.get();
+    } else if (auto* c = dynamic_cast<const ast::LocalConstDecl*>(&ld)) {
+        init = c->value.get();
+    }
+    if (!init) return;
+    auto* id = dynamic_cast<const ast::IdentifierExpr*>(init);
+    if (!id) return;
+    sema::Symbol* rawSrc = ctx_.exprSymbol(*id);
+    if (!rawSrc) return;
+    // issue #4225: resolve THROUGH an intermediate alias holder to its
+    // ultimate root (`var w := x; var y := w;` records `y`'s source as `x`,
+    // not `w`) — see resolveAliasChainRoot's comment for why this is
+    // required for soundness, not just precision.
+    const sema::Symbol* src = resolveAliasChainRoot(rawSrc);
+    sema::LocalSymbol* lsym = findLocalSymbol(ld);
+    if (!lsym || src == lsym) return;
+    aliasBorrowSourceWindows_[lsym].push_back(
+        {src, init->span.begin.offset, UINT32_MAX});
+}
+
+void MethodOwnership::recollectAliasBorrowSourceOnReassign(
+        const sema::Symbol* lsym, const ast::Expr& producer,
+        std::uint32_t reassignOffset) {
+    // issue #4225 / #4250 (send-back — measured heap-use-after-free): examine
+    // the RHS BEFORE deciding whether to retire any open window, rather than
+    // closing unconditionally and only conditionally reopening as the
+    // original #4225 fix did. That unconditional close was unsound in two
+    // ways #4250 measured directly:
+    //
+    //  (a) SELF-ASSIGNMENT (`y := y;`) is a complete no-op for the tracked
+    //      alias — the RHS evaluates `lsym`'s CURRENT value, so whatever
+    //      `lsym` aliased before this statement, it still aliases after it.
+    //      Closing unconditionally retired a genuinely still-open window;
+    //      the reopen check then called resolveAliasChainRoot(lsym), which,
+    //      having JUST been closed, found no `until == UINT32_MAX` entry to
+    //      follow and returned `lsym` itself — `src == lsym` failed the
+    //      reopen guard, so the window stayed closed forever while real
+    //      dataflow kept tracking the alias. Measured as a real
+    //      heap-use-after-free, method AND lambda scope (issue #4250).
+    //
+    //  (b) Any OTHER RHS shape this pre-scan does not structurally recognize
+    //      as a bare identifier (`this.w`, `x.Field`, `w[0]`, `w!`, and any
+    //      future shape) was ALSO closed unconditionally, on the reasoning
+    //      that "the real forward walk resolves those exact shapes to no
+    //      source too". That reasoning is false: `borrowSourceForExpr`'s own
+    //      Shape 1 (~line 5556 above) DOES recognize MemberAccessExpr /
+    //      NullCondMemberExpr / IndexExpr RHS as alias-producing, and this
+    //      state-free pre-pass has no way to evaluate Shape 1's live-states_
+    //      gates to know whether a given instance actually does. Closing
+    //      anyway silently retired a window real dataflow may still consider
+    //      open — measured for `y := x.other;` (compiles rc=0, zero
+    //      diagnostics, while gate 1's live states_ still says the alias
+    //      holds).
+    //
+    // FAIL CLOSED BY DEFAULT fixes both: only self-assignment (a) and a
+    // bare identifier naming a DIFFERENT symbol (unchanged from before) may
+    // close-then-reopen, and only a `new` expression (the one shape this
+    // fix's own regression tests rely on closing without reopening) may
+    // close outright. EVERY OTHER shape — enumerated here or not — leaves
+    // every open window untouched, so the old, conservative, unbounded
+    // query stays in force for that holder/source pair: always sound (it
+    // can only over-reject, never under-reject), and a shape nobody has
+    // written a case for yet is safe by construction rather than by
+    // accident. // per §28.3, #4225, #4250
+    auto closeOpenWindows = [&] {
+        auto it = aliasBorrowSourceWindows_.find(lsym);
+        if (it != aliasBorrowSourceWindows_.end())
+            for (RecordBorrowSource& e : it->second)
+                if (e.until == UINT32_MAX) e.until = reassignOffset;
+    };
+    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&producer)) {
+        if (sema::Symbol* rawSrc = ctx_.exprSymbol(*id)) {
+            if (rawSrc == lsym) return;  // (a) self-assignment: untouched
+            closeOpenWindows();
+            // issue #4225: resolve through an intermediate alias holder, same
+            // as collectAliasBorrowSource — `y := w;` where `w` itself
+            // aliases `x` must record `y`'s new window against `x`, not `w`.
+            const sema::Symbol* src = resolveAliasChainRoot(rawSrc);
+            if (src && src != lsym)
+                aliasBorrowSourceWindows_[lsym].push_back(
+                    {src, reassignOffset, UINT32_MAX});
+            return;
+        }
+        // An identifier with no resolvable symbol: fall through to the
+        // fail-closed default below rather than guessing.
+    }
+    if (dynamic_cast<const ast::NewExpr*>(&producer)) {
+        // issue #4250: the one shape this fix explicitly trusts to close
+        // without reopening (see the function comment above).
+        closeOpenWindows();
+        return;
+    }
+    // issue #4250: fail-closed default — every other RHS shape leaves every
+    // open window exactly as it was.
+}
+
+const sema::Symbol* MethodOwnership::resolveAliasChainRoot(
+        const sema::Symbol* sym) const {
+    std::unordered_set<const sema::Symbol*> seen;
+    while (sym) {
+        if (!seen.insert(sym).second) return sym;  // cycle guard
+        auto it = aliasBorrowSourceWindows_.find(sym);
+        if (it == aliasBorrowSourceWindows_.end()) return sym;
+        const sema::Symbol* next = nullptr;
+        for (const RecordBorrowSource& e : it->second) {
+            if (e.until == UINT32_MAX) { next = e.source; break; }
+        }
+        if (!next) return sym;  // no currently-open tracked alias
+        sym = next;
+    }
+    return sym;
+}
+
+std::optional<std::pair<std::uint32_t, std::uint32_t>>
+MethodOwnership::aliasBorrowConsumedWindow(const sema::Symbol* holder,
+                                           const sema::Symbol* consumed) const {
+    auto it = aliasBorrowSourceWindows_.find(holder);
+    if (it == aliasBorrowSourceWindows_.end()) return std::nullopt;
+    std::optional<std::pair<std::uint32_t, std::uint32_t>> best;
+    for (const RecordBorrowSource& e : it->second) {
+        if (e.source != consumed) continue;
+        if (!best) best = {e.from, e.until};
+        else {
+            best->first = std::min(best->first, e.from);
+            best->second = std::max(best->second, e.until);
+        }
+    }
+    return best;
+}
+
 bool MethodOwnership::recordBorrowAliasesConsumed(
     const sema::Symbol* recLocal, const sema::Symbol* consumed) const {
     // DFS over recordBorrowLocalSource_ following each record local's carried
@@ -9388,8 +10246,25 @@ void MethodOwnership::checkConsumeFreeze(std::string_view consumedName,
         // A `using var` borrow-pin keeps the borrow live to its scope end
         // (§28.10); otherwise the borrow is live iff it has a reachable later
         // use (directly, or through the closure value the holder names).
-        bool live = st.implicitDischarge ||
-                    borrowHolderUsedAfter(holder, consumeLoc.offset);
+        //
+        // issue #4225: bound that "later use" query to the window over which
+        // `holder` actually tracked `consumed` as its source
+        // (aliasBorrowSourceWindows_), when one was recorded — a use of
+        // `holder` after it was REBOUND away from `consumed` (`y := new
+        // Res(1);`) no longer keeps the OLD alias live, exactly as
+        // recordBorrowConsumedWindow already does for the record/span case
+        // below. Falls back to the unbounded whole-body query when no window
+        // was tracked (e.g. a parameter, or an alias shape
+        // collectAliasBorrowSource does not model) — the pre-#4225 sound
+        // over-rejection default.
+        bool live = st.implicitDischarge;
+        if (!live) {
+            if (auto win = aliasBorrowConsumedWindow(holder, consumed))
+                live = borrowHolderUsedAfterInWindow(holder, consumeLoc.offset,
+                                                     win->first, win->second);
+            else
+                live = borrowHolderUsedAfter(holder, consumeLoc.offset);
+        }
         if (!live) continue;
         report(Severity::Error, consumeLoc,
                std::string("cannot consume `") + std::string(consumedName) +

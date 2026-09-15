@@ -336,6 +336,23 @@ static bool isLiteralDerivedExpr(const ast::Expr* e) {
     return false;
 }
 
+// fix #4330 (§9.5/§15.4, v0.298): simple (last-component) name of a Named
+// TypeRef, or empty for non-Named. A file-local copy of ExprTypecheck.cpp's
+// `namedTypeSimpleName`, which is `static` to its own translation unit —
+// `ExprTypecheck_Calls.cpp` carries the identical copy under
+// `callsNamedTypeSimpleName` for the same reason (needed by
+// `reportCollectionLiteralInterfaceTarget`'s call site here, the `with`-
+// expression admissibility gate below).
+static std::string_view exprsNamedTypeSimpleName(const TypeRef* ref) {
+    if (!ref || ref->kind != TypeRef::Kind::Named) return {};
+    if (ref->declaration) return ref->declaration->name;
+    if (!ref->importedName.empty()) return ref->importedName;
+    if (ref->astNode && ref->astNode->name &&
+        !ref->astNode->name->parts.empty())
+        return ref->astNode->name->parts.back();
+    return {};
+}
+
 // #625 / §12 / §31 / fix #2950 / fix #2971: the "does `ts` inherit a built-in
 // exception" wrapper that used to live here is gone. It answered only half the
 // question the unqualified-identifier resolver actually asks — the other half
@@ -384,241 +401,75 @@ bool typeTestTargetMentionsTypeVariable(const TypeRef* t) {
 }  // namespace
 
 // §17.11 (#951): does `default(T)` have no well-defined zero value? See the
-// header declaration. Recurses into a record's positional fields and an inline
+// header declaration. Recurses into a record's storage members and an inline
 // array's element type.
 //
-// fix #3995 (§17.11/§9.7/§3.6 rule 2, v0.294): `incoming` is threaded through
-// EVERY recursive call in this function — the InlineArray element and the
-// Record field walk below — exactly as `common::isBorrowBearingRecordCommon`
-// threads its own `env` parameter through the identically-shaped §9.7
-// recursion (OwnershipFacts.cpp). Without this, a DELEGATING generic record
-// (`record Outer<T>(In: Inner<T>)`) silently escaped substitution: the OUTER
-// frame correctly resolves `In`'s type to the concrete `Inner<T>` TypeRef
-// (its own genericArgs are literal source text, e.g. `Inner<T>` where `T`
-// is Outer's own bare parameter — NOT yet resolved to `WidgetDG1`), but the
-// recursive call used to reseed the INNER frame with `incoming=nullptr`,
-// so `Inner`'s own `T` genericArg — itself a bare mention of Outer's
-// parameter — never got looked up anywhere, and the bare-parameter early
-// return two lines below then fired on the STILL-GENERIC field, silently
-// accepting. MEASURED: `record InnerDG1<T>(V: T); record
-// OuterDG1<T>(In: InnerDG1<T>); default(OuterDG1<WidgetDG1>)` (WidgetDG1 a
-// non-nullable class) compiled at exit 0 and SIGSEGV'd (exit 139) on the
-// arm that fixed #3986/#3982 without this composition.
+// fix #3982/#3986/#3988/#3995 (§17.11/§9.7/§9.3/§3.6 rule 2, v0.294): this
+// function's history — symbol-side (not `TypeSymbol::decl`, null for every
+// imported type) field enumeration; generic-parameter substitution via
+// `common::RecordSubstEnv`; full `recordStorageMembers` coverage (positional
+// + body + auto-properties, not positional-only); and `incoming`-env
+// composition so a DELEGATING generic record's inner frame resolves its own
+// bare-parameter mentions. See git history / #3995's issue for the full
+// per-fix rationale and measured repros — preserved there rather than
+// duplicated here now that the implementation itself has moved.
+//
+// fix #4166 review follow-up (§14.2/§17.11/§35.10, v0.298): the
+// implementation is now the SHARED free function `sema::typeHasNoDefault`
+// (TypeResolution.hpp / TypeResolution_Checks.cpp), which
+// `Resolver::argSatisfiesNew`'s Record arm also calls for the identically-
+// shaped `where T: new()` question — see that declaration's comment for
+// why the two needed unifying (they had drifted: `argSatisfiesNew`'s own
+// port covered only Record-kind recursion, diverging from this function's
+// full per-kind switch on Enum/Choice/InlineArray and the
+// `isValueBuiltin`-aware Class/Interface test — issues #4219, #4223) and
+// what the shared function gained in the process (a cycle guard THIS
+// function itself never had — a self-referential record reached through
+// `default(...)` SIGSEGV'd here identically to the `where T: new()` shape
+// that review caught, on every revision before this one). This wrapper
+// exists so every existing call site of `ExprTC::defaultIllFormed` — there
+// are close to a dozen across this file and ExprTypecheck.cpp — keeps the
+// same signature with the implementation hoisted.
+//
+// TWO deliberate behavior changes survive the hoist, both in
+// `argSatisfiesNew`'s favor because its pre-hoist, categorize()-based leaf
+// test was stricter than this function's own prior text on each:
+//
+//   * a non-nullable `Object`-typed component now ALSO reports
+//     non-defaultable (previously excluded here — "left out... to keep
+//     this consistent with the original #951 scope — a separate
+//     consideration", this function's own prior text). §17.11's
+//     "defaultable" definition is unambiguous regardless of which side
+//     moved: "Not defaultable: non-nullable reference types" includes
+//     `Object`.
+//   * a null-declaration `Named` type naming a stdlib COLLECTION or `Task`
+//     builtin (`Array`, `Dictionary`, `Set`, `OwningTask`, …) now ALSO
+//     reports non-defaultable. This function's prior text returned
+//     `false` unconditionally for the WHOLE null-declaration population
+//     (collections and value builtins like `Guid`/`IntPtr`/`DateTime`
+//     alike); `argSatisfiesNew`'s pre-hoist `categorize()`-based leaf test
+//     inherited a coarser but directionally-correct distinction (every
+//     builtin ⇒ reference) from its own fallback. Review caught the
+//     regression this hoist created (`record Box(A: Array<int>)`: REJECT
+//     on the parent, silent ACCEPT on the un-fixed hoist) — the THIRD
+//     predicate this run caught misclassifying this same ~50-builtin
+//     null-declaration population (issue #4229 tracks two more;
+//     `fix #4199` a fourth). The fix here is narrower than
+//     `categorize()`'s own fallback, BY NAME, scoped to the collection/
+//     `Task` family only — see `typeHasNoDefaultWalk`'s Named-arm comment
+//     (TypeResolution_Checks.cpp) for why the wholesale mirror was tried
+//     and reverted (it broke `default(Guid)` / `default(IntPtr)`,
+//     tests/lit/builtin_closed_ctor_surface_accept_2994.bzl, which this
+//     function's OWN prior text had always accepted).
+//
+// Unifying toward this function's OWN narrower prior text on either would
+// have silently reintroduced a false accept in `argSatisfiesNew` — caught
+// by this fix's own broad regression sweeps. See `typeHasNoDefaultWalk`'s
+// Primitive-arm and Named-arm comments (TypeResolution_Checks.cpp) for the
+// full notes on each.
 bool ExprTC::defaultIllFormed(const TypeRef* t,
                               const common::RecordSubstEnv* incoming) {
-    if (!t || t->nullable) return false;  // nullable defaults to null — OK
-    switch (t->kind) {
-        case TypeRef::Kind::Primitive:
-            // `string` is a runtime-managed reference (§4.6) with no zero. Value
-            // primitives (int/bool/char/…) have a zero. (Non-nullable Object is
-            // also a reference type, but left out here to keep this consistent
-            // with the original #951 scope — a separate consideration.)
-            return t->primitive == PrimitiveType::String;
-        case TypeRef::Kind::Function:
-            return true;  // a function value (§28.9) has no zero
-        case TypeRef::Kind::InlineArray: {
-            // fix #3995: a bare-parameter element (`[N]T`) needs the SAME
-            // substitution a record field does — resolve it through
-            // `incoming` before recursing, threading the substituted
-            // entry's own env (so a `[N]Inner<T>` element composes exactly
-            // as the Record arm's field walk does below).
-            common::RecordSubstEnv::Entry sub =
-                common::resolveRecordFieldSubst(t->arrayElement, incoming);
-            return defaultIllFormed(sub.ty, sub.env);
-        }
-        case TypeRef::Kind::Named: {
-            if (!t->declaration) return false;  // generic param / unresolved
-            auto k = t->declaration->kind;
-            // fix #3108 (§16.3/§16.4, v0.242): `default(Range<T>)` is a compile
-            // error for the COMPILER-INTRINSIC `Range<T>` — §16.4 promises "no
-            // `Range<T>` value with a zero step can exist" and the `default`
-            // form all-zeroes `Range<T>` would yield step=0, falsifying the
-            // invariant. The spec's own enumeration of `Range<T>` producers
-            // (range expressions; the deserialization path for `Range<char>`)
-            // excludes `default`, so the well-formedness check joins §17.11's
-            // rejection set alongside non-nullable references, enums with no
-            // zero-valued constant, and choices. The identity is the builtin
-            // `Range` (range expressions (§16.4) and the §16.3 closure of
-            // constructors), NOT a user-declared class `class Range<T>` — §11.3
-            // reserves no names, so `class Range<T>` is legal, and the builtin
-            // vs user-class distinction is the same `declaration ==
-            // builtinClassSym("Range")` pointer-equality the §5 LINQ receiver
-            // gate uses (ExprTypecheck_Calls.cpp:3872's #3022n precedent). The
-            // check runs BEFORE the Class arm so the builtin isn't admitted
-            // through `!isValueBuiltin` = false (the builtin is a `Class`-
-            // typed `TypeSymbol` with `isValueBuiltin=true`).
-            if (t->declaration == ctx_.builtinClassSym("Range")) return true;
-            if (k == ast::TypeDeclKind::Class ||
-                k == ast::TypeDeclKind::Interface)
-                return !t->declaration->isValueBuiltin;
-            // fix #3044 (§17.11, v0.242): `default(E)` is a compile error for
-            // "an enum type with no declared constant of underlying value 0".
-            // Escalated from a warning by proposal 0078's Q3 rider: it is the
-            // LAST producer of a value equal to no declared constant, and
-            // §5.4's invariant ("there is no value of an enum type that is not
-            // equal to a declared constant") — on which §19.6's restored
-            // exhaustiveness guarantee and §21.7's totality grant both rest —
-            // is only true with it closed. An enum whose declared-value set
-            // cannot be decided (a non-constant initializer, already
-            // diagnosed) is NOT rejected: enumHasZeroConstant returns nullopt
-            // and the default is treated as well-formed, matching the
-            // conservative posture of the record arm below.
-            if (k == ast::TypeDeclKind::Enum) {
-                std::optional<bool> hasZero =
-                    enumHasZeroConstant(*t->declaration);
-                return hasZero && !*hasZero;
-            }
-            // §35.10 (v0.200, #2044): `default(C)` is a compile error for
-            // EVERY choice type — a sum has no principled zero (electing a
-            // case would make meaning depend on declaration order). The
-            // nullable form `default(C?)` is the valid null and stays
-            // accepted (t->nullable returned false above for the non-null
-            // case, which is what reaches here).
-            if (k == ast::TypeDeclKind::Choice) return true;
-            if (k == ast::TypeDeclKind::Record) {
-                // fix #3982 (§17.11, v0.294): this used to cast
-                // `t->declaration->decl` to `ast::TypeDecl*` and walk ITS
-                // `positionalFields`, returning "well-formed" (accept)
-                // whenever that cast failed. `TypeSymbol::decl` is NEVER
-                // assigned for an imported type (Symbol.hpp; the same fact
-                // #3911/#3957/#3970 each independently hit for sibling
-                // AST-side reads), so `default(T)` over ANY imported record
-                // was silently accepted regardless of its fields' types —
-                // including a non-nullable class-typed field, which §17.11
-                // says makes the record non-defaultable. Unlike #3970's
-                // sibling gap this one is a real SIGSEGV, not just a static-
-                // checking hole: codegen's `default(T)` lowering recursively
-                // default-constructs each field, so the non-nullable
-                // reference field's "default" is a null pointer with no
-                // diagnostic ever having fired, and a subsequent member
-                // access null-derefs.
-                //
-                // fix #3986 (§17.11, v0.294): a field's DECLARED type can
-                // still be a bare, declaration-less reference to the
-                // record's OWN generic parameter (`V: T` in `record
-                // Box<T>(V: T)`), which line ~403's `!t->declaration`
-                // early-return treats as an unresolved parameter and
-                // unconditionally accepts, regardless of what `t` (the
-                // CONCRETE instantiation being checked, e.g.
-                // `Box<WidgetGL>`) actually binds T to. Substitute it via
-                // the SAME instantiation-site environment the §9.7
-                // borrow-bearing walk and the §35.4/§35.11 choice-payload
-                // walk already use for identically-shaped generic
-                // substitution (`common::RecordSubstEnv` /
-                // `seedRecordSubstEnv` / `resolveRecordFieldSubst`,
-                // OwnershipFacts.hpp, #2145) — no new predicate. This uses
-                // the SYMBOL-side `seedRecordSubstEnv(TypeSymbol&, ...)`
-                // overload (rather than the AST-side one, which needs a
-                // `td` this arm no longer materializes — re-adding that
-                // cast would silently reintroduce #3982 for every imported
-                // generic record), so it seeds correctly for an imported
-                // generic record too: `TypeSymbol::genericParams` is
-                // populated by ModuleLoader for an imported type
-                // (ModuleLoader.cpp), unlike `decl`.
-                //
-                // fix #3995 (§17.11/§9.7/§3.6 rule 2, v0.294): seed THIS
-                // frame's own environment with `incoming` (the caller's
-                // composed env), not a bare `nullptr` — mirroring
-                // `common::isBorrowBearingRecordCommon`'s own
-                // `seedRecordSubstEnv(*ts, *rt, env, myEnv)` call
-                // (OwnershipFacts.cpp), which passes its CALLER's `env`
-                // through as `incoming` for exactly this reason. Without
-                // it, a DELEGATING generic record
-                // (`record Outer<T>(In: Inner<T>)`) breaks: `In`'s
-                // resolved-but-unsubstituted type is the concrete-looking
-                // Named TypeRef `Inner<T>` (declaration set — NOT a bare
-                // parameter itself, so `resolveRecordFieldSubst` below
-                // passes it through unchanged), but recursing into
-                // `defaultIllFormed(Inner<T>, incoming=nullptr)` would
-                // reseed the INNER frame from a `nullptr` incoming, so
-                // `Inner`'s own `genericArgs[0]` (itself a bare mention of
-                // OUTER's `T`) could never be looked up anywhere, and the
-                // bare-parameter early return (`!t->declaration` above)
-                // would fire on the STILL-GENERIC substituted field,
-                // silently accepting — MEASURED: `record InnerDG1<T>(V: T);
-                // record OuterDG1<T>(In: InnerDG1<T>);
-                // default(OuterDG1<WidgetDG1>)` (WidgetDG1 non-nullable)
-                // compiled clean and SIGSEGV'd without this composition,
-                // reproducing identically against `91e353f` (#3982 alone).
-                // `resolveRecordFieldSubst`'s returned `Entry::env` is
-                // exactly the incoming env to recurse with for EITHER
-                // shape (a substituted bare-parameter leaf, or an
-                // unchanged composite field like `Inner<T>`) — see its own
-                // doc comment and `recordFieldTypeIsBorrowCarryingCommon`'s
-                // identical two-shape dispatch (OwnershipFacts.cpp) for the
-                // established precedent this mirrors.
-                //
-                // fix #3988 (§17.11/§9.3, v0.294): §17.11's opening clause is
-                // "Records all of whose DECLARED FIELDS are defaultable" — for
-                // a combined-form record (§9.3: positional fields AND a body)
-                // that is positional fields UNION body storage (fields and
-                // auto-properties alike), mirroring §9.3's own admissibility
-                // rule ("the positional fields counted as storage components
-                // alongside the body's auto-properties"). The field walk
-                // above used to cover only POSITIONAL fields
-                // (`recordPositionalFieldSymbols`) — empty for EVERY
-                // body-only record and for the body half of EVERY
-                // combined-form record, so a non-nullable reference-typed
-                // body field/auto-property was invisible here and
-                // `default(T)` was silently accepted, then codegen's
-                // recursive per-field default-construction null-derefed the
-                // manufactured null at runtime. `recordStorageMembers`
-                // (sema/Symbol.hpp) is the ONE symbol-side full-storage
-                // enumeration — positional fields, body fields, and
-                // auto-properties together, answering identically for a
-                // local and an imported record — so this reads it instead
-                // of re-deriving a second, narrower walk.
-                common::RecordSubstEnv env;
-                common::seedRecordSubstEnv(*t->declaration, *t, incoming, env);
-                const common::RecordSubstEnv* fieldEnv =
-                    env.map.empty() ? nullptr : &env;
-                // ⚠ #3995 interaction, verified rather than assumed: it is
-                // tempting to pass `fieldEnv` straight into
-                // `recordStorageMembers`'s own `env` parameter and drop the
-                // per-field `resolveRecordFieldSubst` call entirely (that
-                // function DOES apply substitution internally per member,
-                // SymbolCollection.cpp fix #3171) — but it keeps only the
-                // substituted `Entry::ty`, discarding `Entry::env`. For a
-                // DELEGATING field (`In: Inner<T>`), the correct recursive
-                // call is `defaultIllFormed(Inner<T>, thisFramesEnv)` — the
-                // type is unchanged (not a bare parameter itself) but the
-                // ENV to recurse with is still needed so the INNER frame can
-                // resolve ITS OWN bare mention of `T`. Losing `Entry::env`
-                // here would silently reintroduce #3995 for exactly the
-                // shape #3988 exists to cover (a delegating GENERIC record
-                // reached through body/combined-form storage) — measured:
-                // without this, `default(Outer<Widget>)` for an imported
-                // combined-form `Outer<T>(X: int) { public In: Inner<T>; }`
-                // compiles clean and SIGSEGVs, identically to #3995's own
-                // pre-fix repro. So `recordStorageMembers` is called with
-                // `env=nullptr` (yielding the RAW, unsubstituted declared
-                // type per member — identical to what `storageComponentType`
-                // alone would give the old positional-only walk) and this
-                // arm performs its OWN `resolveRecordFieldSubst` +
-                // `Entry::env`-threaded recursion per member, exactly
-                // mirroring the positional-field loop's own pattern above,
-                // just applied to the WIDER enumeration.
-                bool illFormed = false;
-                recordStorageMembers(
-                    t->declaration, ctx_,
-                    [&](const RecordStorageMember& rsm) {
-                        if (!rsm.type) return true;  // unresolved — defer
-                        common::RecordSubstEnv::Entry sub =
-                            common::resolveRecordFieldSubst(rsm.type, fieldEnv);
-                        if (defaultIllFormed(sub.ty, sub.env)) {
-                            illFormed = true;
-                            return false;  // stop
-                        }
-                        return true;
-                    },
-                    /*env=*/nullptr);
-                return illFormed;
-            }
-            return false;
-        }
-        default:
-            return false;  // Unit / Error
-    }
+    return sema::typeHasNoDefault(t, ctx_, incoming);
 }
 
 // per §27.4 (v0.183, #1408) / A.7 LambdaDestructure. See declaration
@@ -1187,6 +1038,115 @@ bool ExprTC::isEnclosingGenericTypeParamName(std::string_view name) const {
 // or (imported) a non-empty `moduleName`; both are excluded before the name is
 // consulted, exactly as in codegen's `unconstructedBuiltinNewName` twin. A user
 // `class Guid` therefore keeps constructing.
+// fix #4170 (§35.1/§35.2/§35.3, v0.295; mirrors #4163's §5.4/§10 enum
+// rejection): the single authority for "does `new` construct a value of
+// this kind" — neither an enum nor a choice has a constructor. See the
+// declaration in ExprTypecheck_impl.hpp for the full rationale; this is
+// the same logic the explicit `new T(...)` NewExpr-typing arm used to
+// spell out inline (moved here so the two §17.7 shorthand call sites in
+// ExprTypecheck.cpp can share it instead of duplicating the predicate a
+// third and fourth time, per this repo's own "duplicated classification
+// predicates" caution, CLAUDE.md / LANE_RULES.md §6).
+bool ExprTC::rejectNewOnEnumOrChoice(const ast::NewExpr& ne,
+                                      const TypeRef* rt) {
+    if (!(rt->kind == TypeRef::Kind::Named && rt->declaration)) return false;
+    if (rt->declaration->kind == ast::TypeDeclKind::Enum) {
+        ctx_.diagnostics().report(
+            Severity::Error, ne.span.begin,
+            "`new` cannot construct an enum — an enum value is "
+            "produced by the cast `" +
+            std::string(rt->declaration->name) +
+            "(n)` from its underlying integer, not with `new` "
+            "(§5.4/§10)");
+        return true;
+    }
+    if (rt->declaration->kind == ast::TypeDeclKind::Choice) {
+        ctx_.diagnostics().report(
+            Severity::Error, ne.span.begin,
+            "`new` cannot construct a choice — a choice has no "
+            "constructors; a choice's construction is case "
+            "selection, written `" +
+            std::string(rt->declaration->name) +
+            ".Case(args)` instead of `new` (§35.1/§35.2/§35.3)");
+        return true;
+    }
+    return false;
+}
+
+// fix #4176 (§3.1/§3.2, §11.7, §12.5, §17.7, v0.298; sibling to
+// `rejectNewOnEnumOrChoice` above, same shape as #4170's own fix): the
+// single authority for "does `new` construct a value of this NAMED
+// CLASS-SHAPED kind" — an abstract class, a `closed` class, a `static`
+// class, and an interface all have no instance for `new` to mint. This
+// logic ("Slice S11") already existed, inline, in the explicit
+// `new T(...)` NewExpr-typing arm below; #4176 found it was NEVER reached
+// from the two §17.7 typeless `new()` shorthand call sites in
+// ExprTypecheck.cpp — their own `rt`-resolution routed straight to
+// `checkNewExprArgs` for `TypeDeclKind::Class` and nothing else — so
+// `using var w: ISomeInterface := new();` with no implementing class in
+// scope reached codegen with no vtable to install and SEGFAULTed on the
+// first virtual dispatch through it (measured, exit 139): the same
+// "unconstructable kind reaches codegen with nothing to construct" defect
+// class #4163/#4170 closed for Enum/Choice, but for the four class-shaped
+// non-instantiable kinds. `new AbstractThing()` through the SAME shorthand
+// path crashes identically (measured, exit 139) — abstract classes are
+// `TypeDeclKind::Class`, not Interface, so #4170's own enum/choice
+// predicate could never have caught either gap. `closed`/`static` class
+// shorthand do not crash the same way (both are otherwise fully concrete
+// — no unresolved vtable slot or missing override — so the mis-
+// construction is silently ACCEPTED rather than fatal), but are folded
+// into this one shared predicate anyway rather than hand-picked out of
+// the block they have always lived in together, per CLAUDE.md /
+// LANE_RULES.md §6 ("prefer feeding the existing authority" over a
+// narrower, second spelling of the same four-way classification).
+// Diagnostic text and citations are copied verbatim from the pre-existing
+// explicit-`new` arm this replaces — not a wording change, a pure
+// factoring, exactly as #4170's own commit did for enum/choice.
+bool ExprTC::rejectNewOnNonInstantiableKind(const ast::NewExpr& ne,
+                                             const TypeRef* rt) {
+    if (!(rt->kind == TypeRef::Kind::Named && rt->declaration)) return false;
+    TypeSymbol* t = rt->declaration;
+    bool isAbstract = false;
+    bool isStatic = false;
+    for (auto mod : t->modifiers) {
+        if (mod == "abstract") isAbstract = true;
+        if (mod == "static") isStatic = true;
+    }
+    // §12.5 (v0.242, #3052), verbatim: "`new` on an abstract
+    // or `closed` class is a compile error." The two spellings
+    // are named separately so the diagnostic points at the
+    // modifier the author actually wrote.
+    const bool isClosed = typeIsClosed(t);
+    if (isAbstract || isClosed) {
+        ctx_.diagnostics().report(
+            Severity::Error, ne.span.begin,
+            std::string("cannot instantiate ") +
+            (isAbstract ? "abstract" : "`closed`") +
+            " class `" +
+            std::string(t->name) + "` with `new` "
+            "(§12.5)");
+        return true;
+    }
+    if (isStatic) {
+        ctx_.diagnostics().report(
+            Severity::Error, ne.span.begin,
+            std::string("cannot instantiate static "
+                        "class `") +
+            std::string(t->name) + "` with `new` "
+            "(§11.7)");
+        return true;
+    }
+    if (t->kind == ast::TypeDeclKind::Interface) {
+        ctx_.diagnostics().report(
+            Severity::Error, ne.span.begin,
+            std::string("cannot instantiate interface `") +
+            std::string(t->name) +
+            "` with `new` (§3.1 / §3.2 / §17.7)");
+        return true;
+    }
+    return false;
+}
+
 void ExprTC::checkBuiltinClosedConstructorSurface(const ast::NewExpr& ne) {
     // Resolved exactly as `lowerNew` resolves it (and as codegen's #2974 twin
     // does): the explicit `ne.type` when present, else the §17.7 `new(...)`
@@ -3845,22 +3805,28 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                 // here; the §17.7 `new()` shorthand is checked at the two
                 // sites that give it its target type (ExprTypecheck.cpp).
                 checkBuiltinClosedConstructorSurface(*ne);
-                // §5.4 / §10 (#960): `new` cannot construct an enum. An enum
-                // value is produced by the int→enum CAST `E(n)` (§5.4), not by
-                // construction — an enum has no constructor (§10). `new E(...)`
-                // (and nested `new Outer.E(...)`) were silently accepted; reject
-                // and point at the cast form. (The correct cast `E(n)` is a
-                // CallExpr, not a NewExpr, and is unaffected.)
-                if (rt->kind == TypeRef::Kind::Named && rt->declaration &&
-                    rt->declaration->kind == ast::TypeDeclKind::Enum) {
-                    ctx_.diagnostics().report(
-                        Severity::Error, ne->span.begin,
-                        "`new` cannot construct an enum — an enum value is "
-                        "produced by the cast `" +
-                        std::string(rt->declaration->name) +
-                        "(n)` from its underlying integer, not with `new` "
-                        "(§5.4/§10)");
-                }
+                // §5.4/§10 (#960) and §35.1/§35.2/§35.3 (#4163): `new`
+                // cannot construct an enum (an enum value comes from the
+                // int→enum CAST `E(n)`, §5.4 — an enum has no constructor,
+                // §10) or a choice (§35.1 "Declaration": "Choices cannot
+                // have destructors, constructors, instance fields,
+                // block-form or storage-backed properties, indexers, or
+                // nested types"; §35.2 "Members": "a choice's construction
+                // *is* case selection", produced only by the qualified
+                // case call `Type.Case(args)`, §35.3). `new E(...)` /
+                // `new ChoiceType(args)` were silently accepted; the
+                // choice case additionally reached codegen with no case
+                // discriminant and crashed the compiler on the first
+                // `case` statement over the result (SIGSEGV, #4163). Both
+                // the qualified case call and the enum cast are CallExprs,
+                // not NewExprs, and are unaffected. fix #4170 (v0.295)
+                // factored this out to `rejectNewOnEnumOrChoice` so the
+                // §17.7 typeless `new()` shorthand sites in
+                // ExprTypecheck.cpp (which reach the same `rt`-resolution
+                // but never ran through this NewExpr-typing block) share
+                // this one authority instead of a third/fourth spelling
+                // of the same two checks.
+                rejectNewOnEnumOrChoice(*ne, rt);
                 // §14.5 Scope (v0.184, #1687): "Class-, record-, and
                 // interface-level type arguments are never inferred from
                 // constructor arguments: `new Pair(1, "x")` against `record
@@ -4575,81 +4541,58 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                 // Slice S11: forbid `new` on abstract or static
                 // class types. Interfaces and (purely declarative)
                 // static-only types are also non-instantiable.
+                //
+                // fix #4176 (v0.298): the four-way abstract/closed/static/
+                // interface classification below now lives in
+                // `rejectNewOnNonInstantiableKind` (defined above, beside
+                // `rejectNewOnEnumOrChoice`) so the two §17.7 shorthand
+                // call sites in ExprTypecheck.cpp can share it instead of
+                // leaving it unreachable from the shorthand path entirely.
+                // Diagnostic text/citations are unchanged — pure factoring.
                 if (rt->kind == TypeRef::Kind::Named && rt->declaration) {
                     TypeSymbol* t = rt->declaration;
-                    bool isAbstract = false;
-                    bool isStatic = false;
-                    for (auto mod : t->modifiers) {
-                        if (mod == "abstract") isAbstract = true;
-                        if (mod == "static") isStatic = true;
-                    }
-                    // §12.5 (v0.242, #3052), verbatim: "`new` on an abstract
-                    // or `closed` class is a compile error." The two spellings
-                    // are named separately so the diagnostic points at the
-                    // modifier the author actually wrote.
-                    const bool isClosed = typeIsClosed(t);
-                    if (isAbstract || isClosed) {
-                        ctx_.diagnostics().report(
-                            Severity::Error, ne->span.begin,
-                            std::string("cannot instantiate ") +
-                            (isAbstract ? "abstract" : "`closed`") +
-                            " class `" +
-                            std::string(t->name) + "` with `new` "
-                            "(§12.5)");
-                    } else if (isStatic) {
-                        ctx_.diagnostics().report(
-                            Severity::Error, ne->span.begin,
-                            std::string("cannot instantiate static "
-                                        "class `") +
-                            std::string(t->name) + "` with `new` "
-                            "(§11.7)");
-                    } else if (t->kind ==
-                               ast::TypeDeclKind::Interface) {
-                        ctx_.diagnostics().report(
-                            Severity::Error, ne->span.begin,
-                            std::string("cannot instantiate interface `") +
-                            std::string(t->name) +
-                            "` with `new` (§11.2)");
-                    } else if (t->kind == ast::TypeDeclKind::Class) {
-                        // Slice T7: constructor arity / arg types.
-                        checkNewExprArgs(*ne, t);
-                    } else if (t->kind == ast::TypeDeclKind::Record) {
-                        // #1105 (§9.1): validate a POSITIONAL record's primary-
-                        // constructor `new` args (count + per-field type). Record
-                        // construction previously skipped all arg checking, so
-                        // too-few / too-many / wrong-typed args were silently
-                        // accepted and miscompiled. Only positional records are
-                        // routed here; checkNewExprArgs validates the positional
-                        // fields and returns (generic records defer to #428).
-                        //
-                        // fix #3141 (family F3 of umbrella #3152, §2.8.3 rule 4):
-                        // this gate used to ask the record's `ast::TypeDecl`.
-                        // `ModuleLoader` never assigns `Symbol::decl` for an
-                        // imported type, so the gate was false for EVERY import
-                        // and #1105's arg check — the one that stopped a
-                        // wrong-typed positional argument from being stored into
-                        // a differently-sized field — never ran across a module
-                        // boundary. `hasPositionalFields` is mirrored onto the
-                        // TypeSymbol on both sides (#501), so read it there.
-                        //
-                        // fix #4059 (§9.1 / §9.2 / §22.7, v0.295): the
-                        // pre-existing `hasPositionalFields` gate ALSO skipped
-                        // any arg check for a body-only record (positional-field
-                        // count is zero), where §9.1 has nothing to validate
-                        // and §9.2 declares no implicit default ctor — until
-                        // §4059 fix's `ctors.empty()` arm rejects the silent
-                        // zero-fill (`new Foo()` type-checked clean and minted
-                        // a 0-valued record; `return f.Bar;` returned 0). The
-                        // fix opens this gate so every record — positional,
-                        // body-only, or combined-form — runs through
-                        // `checkNewExprArgs`. The function already has the
-                        // right arms: `t->hasPositionalFields` routes the
-                        // positional-record binder; the ctors-collection arm
-                        // handles body records with explicit ctors; and the
-                        // new body-record reject (added in the same fix's
-                        // parallel edit to `checkNewExprArgs`) closes the
-                        // zero-fill hole for body records with no ctors.
-                        checkNewExprArgs(*ne, t);
+                    if (!rejectNewOnNonInstantiableKind(*ne, rt)) {
+                        if (t->kind == ast::TypeDeclKind::Class) {
+                            // Slice T7: constructor arity / arg types.
+                            checkNewExprArgs(*ne, t);
+                        } else if (t->kind == ast::TypeDeclKind::Record) {
+                            // #1105 (§9.1): validate a POSITIONAL record's primary-
+                            // constructor `new` args (count + per-field type). Record
+                            // construction previously skipped all arg checking, so
+                            // too-few / too-many / wrong-typed args were silently
+                            // accepted and miscompiled. Only positional records are
+                            // routed here; checkNewExprArgs validates the positional
+                            // fields and returns (generic records defer to #428).
+                            //
+                            // fix #3141 (family F3 of umbrella #3152, §2.8.3 rule 4):
+                            // this gate used to ask the record's `ast::TypeDecl`.
+                            // `ModuleLoader` never assigns `Symbol::decl` for an
+                            // imported type, so the gate was false for EVERY import
+                            // and #1105's arg check — the one that stopped a
+                            // wrong-typed positional argument from being stored into
+                            // a differently-sized field — never ran across a module
+                            // boundary. `hasPositionalFields` is mirrored onto the
+                            // TypeSymbol on both sides (#501), so read it there.
+                            //
+                            // fix #4059 (§9.1 / §9.2 / §22.7, v0.295): the
+                            // pre-existing `hasPositionalFields` gate ALSO skipped
+                            // any arg check for a body-only record (positional-field
+                            // count is zero), where §9.1 has nothing to validate
+                            // and §9.2 declares no implicit default ctor — until
+                            // §4059 fix's `ctors.empty()` arm rejects the silent
+                            // zero-fill (`new Foo()` type-checked clean and minted
+                            // a 0-valued record; `return f.Bar;` returned 0). The
+                            // fix opens this gate so every record — positional,
+                            // body-only, or combined-form — runs through
+                            // `checkNewExprArgs`. The function already has the
+                            // right arms: `t->hasPositionalFields` routes the
+                            // positional-record binder; the ctors-collection arm
+                            // handles body records with explicit ctors; and the
+                            // new body-record reject (added in the same fix's
+                            // parallel edit to `checkNewExprArgs`) closes the
+                            // zero-fill hole for body records with no ctors.
+                            checkNewExprArgs(*ne, t);
+                        }
                     }
                     // fix #3719 (§17.11 / §3.6 rule 2, v0.242): this
                     // construction IS the instantiation site (§3.6 rule 2)
@@ -9362,6 +9305,7 @@ void ExprTC::visitChildren(const ast::Expr& e) {
             // per §15.4 (#3031): the predicate also consults the literal's
             // FORM. The empty literal `[]` is admitted at every §15.4
             // collection target — the empty carve-out is membership-only.
+            const ast::CollectionLiteralExpr* lamBodyAdmittedLiteral = nullptr;
             if (auto* clE = dynamic_cast<const ast::CollectionLiteralExpr*>(
                     lam->exprBody.get())) {
                 const bool isEmpty = !clE->isDict && clE->elements.empty();
@@ -9373,9 +9317,34 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                                                          clE->isDict)));
                 if (admitted) {
                     ctx_.setExprType(lam->exprBody.get(), lamTargetRet);
+                    lamBodyAdmittedLiteral = clE;
                 }
             }
             visitExpr(*lam->exprBody);
+            // fix #4323 (§5.1/§11.2, v0.298): the SEVENTH site fix #4310
+            // missed — an expression-bodied lambda's collection-literal body
+            // typed via an outer (INFERRED, not written) function-type
+            // target `lamTargetRet`. The admissibility gate above only
+            // re-derives "is this target on §15.4's list", exactly like
+            // #4310's other six call sites before that fix — it pre-sets the
+            // literal's own exprType to the target and never descends into
+            // the element expressions, so a class that never lists the
+            // target interface in its inheritance clause was silently
+            // accepted and interface dispatch on it read a null itable slot
+            // (measured SIGSEGV, #4323's own repro: `var f: () -> [1]IHolder
+            // := lambda() => [new Widget3(s)];` for a non-conforming
+            // `Widget3`). Call the SAME shared helper #4310 factored rather
+            // than hand-rolling an eighth element walk (§6/§25) — this is
+            // its seventh caller, not a new authority. Runs AFTER
+            // `visitExpr` above (unlike the other six sites, which visit
+            // their initializer/argument BEFORE this check) because here the
+            // target-threading and the literal's own visit happen in the
+            // opposite order — the elements must already be typed before
+            // `checkCollectionLiteralElementAssignability` reads their
+            // `exprType`.
+            if (lamBodyAdmittedLiteral)
+                checkCollectionLiteralElementAssignability(
+                    *lamBodyAdmittedLiteral, lamTargetRet);
         }
         currentLiteralWideningHint_ = saveLamWideningHint;
         // per §15.4 (#1693): a collection literal has no standalone type — it is
@@ -9464,6 +9433,87 @@ void ExprTC::visitChildren(const ast::Expr& e) {
             checkConcreteSlotLambdaBody(*lam, lamTargetRet,
                                         lamTargetRetOwned,
                                         /*savedCurrentReturnType=*/nullptr);
+        }
+        // fix #4340 (§5.1/§11.2, v0.298): the EIGHTH site fix #4310 missed —
+        // a BLOCK-bodied lambda's `return` statement whose value is a
+        // collection literal, typed via an outer (INFERRED, not written)
+        // function-type target `lamTargetRet`. #4323 fixed the
+        // EXPRESSION-bodied mirror (`lam->exprBody` is a collection literal);
+        // this is its block-bodied twin — `do return [...]; end`. Both have
+        // the identical §5.1/§11.2 element-conformance question, and both
+        // miss the existing `ReturnStmt` site's `returnCtx_ == ValueMethod &&
+        // currentReturnType_` gate: this branch leaves `returnCtx_ = None`
+        // and `currentReturnType_ = nullptr` when `!hasAscription`, so the
+        // site never re-reads the per-element types left behind by
+        // `visitStmt`, the literal stays untyped (`ctx_.exprType(*literal)
+        // == nullptr`), codegen's #2491 backstop silently degrades the
+        // return value to a null/zero slot, and the typed-local caller then
+        // SIGSEGVs on the first interface dispatch (#4323's signature).
+        //
+        // The fix mirrors #4323's pattern exactly — `setExprType` so the
+        // literal is materialisable against `lamTargetRet` at codegen, then
+        // the SAME shared `checkCollectionLiteralElementAssignability`
+        // helper #4310 factored (§6/§25: "is there a fact the compiler
+        // ALREADY COMPUTES that decides this?"; this is its EIGHTH caller,
+        // not a new hand-rolled element walk). Walks every value-carrying
+        // `return e;` in the block body (descending through do/end, if/elif/
+        // else, while, for, try/catch/finally, statement-position case
+        // block arms) via the same `forEachLambdaReturnValue` helper
+        // `checkConcreteSlotLambdaBody` (#1820) uses, so the rejection sees
+        // the same return-path set the inference sees.
+        //
+        // Scoped to the unascribed-but-target-typed form (the exact twin of
+        // #4323's mirror arm): `lam->isBlockBody` (not the expression-body
+        // case `#4323` already patched), `!hasAscription` (the ascription
+        // branch above already sets `returnCtx_ = ValueMethod`/
+        // `currentReturnType_ = ascribedRet` and reaches the same
+        // per-element check through #4310's own first-return twin at
+        // `ExprTypecheck.cpp:14885-14918`), and `lamTargetRet` is on
+        // §15.4's closed collection-target list (the empty carve-out
+        // included — `[]` is admissible at every §15.4 collection target;
+        // the form-vs-target question is carried through unchanged). A
+        // non-collection `lamTargetRet` (the `var f: () -> int := …` body
+        // where every `return e;` happens to be a literal-free expression)
+        // is unaffected, so the broader "every target return checks
+        // returnable values" question (a real but separate defect class)
+        // stays out of scope — its shape differs enough that bundling would
+        // dilute this regression test.
+        if (!hasAscription && !lam->isAsync && lam->isBlockBody &&
+            lamTargetRet && !lamTargetRetOwned &&
+            (isCollectionLiteralAdmissibleTarget(lamTargetRet,
+                                                 /*isDict=*/false) ||
+             isCollectionLiteralEmptyAdmissibleTarget(lamTargetRet))) {
+            forEachLambdaReturnValue(*lam, [&](const ast::Expr* retVal) {
+                if (!retVal) return;
+                auto* clE =
+                    dynamic_cast<const ast::CollectionLiteralExpr*>(retVal);
+                if (!clE) return;
+                // The expression-body arm `lam->exprBody` is non-null
+                // ONLY for #4323's case (an expression-bodied lambda); we
+                // require `isBlockBody` above, so `lam->exprBody` is null
+                // and `forEachLambdaReturnValue` will not visit it here.
+                // The dynamic_cast inside `forEachLambdaReturnValue`'s
+                // expr-body slot would anyway only fire for an expression-
+                // bodied lambda — its visited body is the literal, and the
+                // #4323 fix already threads it; double-checking would
+                // duplicate the same diagnostic if it ever leaked through.
+                // Skip the form-vs-target mismatch (`[k: v]` at a
+                // sequence-shaped target — distinct from the
+                // bad/missing-target question, which `reportCollection-
+                // LiteralBadTarget` would handle at L14885+ when that gate
+                // is reached via the ascribed path; here we just refuse to
+                // materialise the mismatched form against the target).
+                const bool isEmpty =
+                    !clE->isDict && clE->elements.empty();
+                const bool retValAdmitted = isEmpty
+                    ? isCollectionLiteralEmptyAdmissibleTarget(lamTargetRet)
+                    : isCollectionLiteralAdmissibleTarget(lamTargetRet,
+                                                          clE->isDict);
+                if (!retValAdmitted) return;
+                ctx_.setExprType(clE, lamTargetRet);
+                checkCollectionLiteralElementAssignability(
+                    *clE, lamTargetRet);
+            });
         }
         // issue #777 / §30.6: forgotten `await` in an expression-bodied async
         // lambda. The body must produce the element type T threaded in as
@@ -10376,6 +10426,57 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                             "`) instead");
                     }
                 }
+                // fix #4381 (§19.3, v0.298): after the class-head check, detect
+                // the dual: a pattern head that names a choice CASE (e.g.
+                // `Fetched(_)`) but a scrutinee that is NOT a choice. Sema
+                // must reject this rather than letting it through to codegen
+                // which would emit malformed IR (case.end has no terminator).
+                if (ctx_.module()) {
+                    bool isChoiceCaseHead = false;
+                    for (Symbol* child : ctx_.module()->children) {
+                        if (auto* ts = dynamic_cast<TypeSymbol*>(child)) {
+                            if (ts->kind == ast::TypeDeclKind::Choice) {
+                                for (Symbol* m : ts->members) {
+                                    if (auto* cc =
+                                            dynamic_cast<ChoiceCaseSymbol*>(m)) {
+                                        if (cc->name == lastName) {
+                                            isChoiceCaseHead = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                                if (isChoiceCaseHead) break;
+                            }
+                        }
+                    }
+                    if (!isChoiceCaseHead) {
+                        for (Symbol* sym : ctx_.importedSymbols()) {
+                            if (auto* ts = dynamic_cast<TypeSymbol*>(sym)) {
+                                if (ts->kind == ast::TypeDeclKind::Choice) {
+                                    for (Symbol* m : ts->members) {
+                                        if (auto* cc =
+                                                dynamic_cast<ChoiceCaseSymbol*>(m)) {
+                                            if (cc->name == lastName) {
+                                                isChoiceCaseHead = true;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    if (isChoiceCaseHead) break;
+                                }
+                            }
+                        }
+                    }
+                    if (isChoiceCaseHead) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, dp->span.begin,
+                            "case pattern head `" + std::string(lastName) +
+                                "(...)` names a choice case, but the scrutinee "
+                                "type is not a choice — a choice-case pattern is "
+                                "only valid when the scrutinee is that specific "
+                                "choice type (§19.3)");
+                    }
+                }
                 // Search ctx_.symbols() for the record TypeSymbol by name.
                 // This is more robust than searching only module children
                 // since symbols may be nested or added during synthesis.
@@ -10772,6 +10873,62 @@ void ExprTC::visitChildren(const ast::Expr& e) {
             if (!srcTs) continue;
             SourceLocation valLoc =
                 ia.value ? ia.value->span.begin : we->span.begin;
+            // fix #4330 (§9.5/§5.1/§11.2/§15.4, v0.298): a `with`-clause
+            // replacement value is NEVER target-typed at all — unlike every
+            // other #4310-family position (LocalDecl/FieldDecl/PropertyDecl/
+            // ReturnStmt/call-arg/lambda-body), this handler visits
+            // `ia.value` (`visitExpr` a few lines above) BEFORE it even
+            // looks up the target field's type, so there is no
+            // `ctx_.setExprType`, no §15.4 admissibility gate, and
+            // (consequently) #4310's shared per-element walk is never
+            // reached either — measured SIGSEGV: `b1 with(Items :=
+            // [new Widget3Bad(s)])` for a non-conforming `Widget3Bad`
+            // dispatches `.GetV()` through a null itable slot, #4302's
+            // signature.
+            //
+            // Runs the SAME admissibility-gate-then-per-element-walk pattern
+            // #4310's other positions use, called once here rather than
+            // duplicated by hand at the PropertySymbol and FieldSymbol arms
+            // below (LANE_RULES §6/§25 — reuse the existing authorities, not
+            // a ninth hand-rolled element walk). Returns true when it
+            // reported a diagnostic; the caller then `continue`s, mirroring
+            // the other positions' early `return` on a rejected literal.
+            auto gateWithTargetCollectionLiteral =
+                [&](const TypeRef* fieldTyConst) -> bool {
+                if (!ia.value) return false;
+                auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(
+                    ia.value.get());
+                if (!cl) return false;
+                TypeRef* fieldTy = const_cast<TypeRef*>(fieldTyConst);
+                const bool isEmpty = !cl->isDict && cl->elements.empty();
+                const bool admitted =
+                    isEmpty
+                        ? isCollectionLiteralEmptyAdmissibleTarget(fieldTy)
+                        : isCollectionLiteralAdmissibleTarget(fieldTy,
+                                                              cl->isDict);
+                if (fieldTy && fieldTy->kind != TypeRef::Kind::Error &&
+                    !admitted) {
+                    if (isCollectionLiteralInterfaceTarget(fieldTy))
+                        reportCollectionLiteralInterfaceTarget(
+                            ctx_.diagnostics(), valLoc,
+                            exprsNamedTypeSimpleName(fieldTy));
+                    else if (cl->isDict &&
+                             isCollectionLiteralAdmissibleTarget(
+                                 fieldTy, /*isDict=*/false))
+                        reportCollectionLiteralDictFormBadTarget(
+                            ctx_.diagnostics(), valLoc, fieldTy);
+                    else
+                        reportCollectionLiteralBadTarget(
+                            ctx_.diagnostics(), valLoc, fieldTy);
+                    return true;
+                }
+                // per §5.1/§11.2 — #4310's shared per-element interface-
+                // conformance walk, reused rather than a ninth hand-rolled
+                // copy. Closes #4302's exact crash signature at this
+                // position (filed as #4330).
+                checkCollectionLiteralElementAssignability(*cl, fieldTy);
+                return false;
+            };
             Symbol* mem = lookupMember(srcTs, ia.name);
             if (!mem) {
                 // #876: nonexistent field name.
@@ -10840,12 +10997,26 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                 // rejected with the §5.1 diagnostic.
                 if (ia.value) {
                     TypeRef* valTy = ctx_.exprType(*ia.value);
-                    if (const TypeRef* fieldTy = storageComponentType(ps, ctx_))
+                    if (const TypeRef* fieldTy = storageComponentType(ps, ctx_)) {
+                        // fix #4330: §15.4 admissibility gate + #4310's
+                        // per-element interface-conformance walk — see
+                        // `gateWithTargetCollectionLiteral`'s header comment
+                        // above. A rejected literal reports its own
+                        // diagnostic and skips the whole-value
+                        // `checkAssignable` below (its `fromTy` is null for
+                        // a collection literal at every #4310-family
+                        // position, so calling it too would be a harmless
+                        // no-op, not a double diagnostic — skipped anyway
+                        // for symmetry with the other positions' early
+                        // `return`).
+                        if (gateWithTargetCollectionLiteral(fieldTy))
+                            continue;
                         checkAssignable(
                             valTy, const_cast<TypeRef*>(fieldTy), valLoc,
                             "replacement value for `" +
                             std::string(ia.name) + "`",
                             ia.value.get());
+                    }
                 }
                 continue;
             }
@@ -10862,12 +11033,17 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                 // `A=4438432|B=0`.
                 if (ia.value) {
                     TypeRef* valTy = ctx_.exprType(*ia.value);
-                    if (const TypeRef* fieldTy = storageComponentType(fs, ctx_))
+                    if (const TypeRef* fieldTy = storageComponentType(fs, ctx_)) {
+                        // fix #4330: the positional-field twin of the
+                        // auto-property arm's gate above.
+                        if (gateWithTargetCollectionLiteral(fieldTy))
+                            continue;
                         checkAssignable(
                             valTy, const_cast<TypeRef*>(fieldTy), valLoc,
                             "replacement value for `" +
                             std::string(ia.name) + "`",
                             ia.value.get());
+                    }
                 }
                 continue;
             }

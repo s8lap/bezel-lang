@@ -217,7 +217,7 @@ BEZEL_TEST(own_escape, return_reference_user_indexer_on_using_var_diagnosed) {
         "  end Leak; end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(bezel::test::hasErrorMessage(
-        r, "§28.9 / §9.7 borrow-lifetime rule"));
+        r, "§28.3 / §9.7 borrow-lifetime rule"));
 }
 
 // §28.3 / §28.11 GUARD (cardinal risk): a built-in `OwningArray<R>` slot read
@@ -237,7 +237,7 @@ BEZEL_TEST(own_escape, return_owned_array_slot_on_using_var_diagnosed) {
         "end Leak; end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(bezel::test::hasErrorMessage(
-        r, "§28.9 / §9.7 borrow-lifetime rule"));
+        r, "§28.3 / §9.7 borrow-lifetime rule"));
 }
 
 // §28.3 (D15): a VALUE-typed built-in collection indexer `a[0]` (`Array<int>`,
@@ -425,7 +425,7 @@ BEZEL_TEST(own_escape, return_class_field_indirect_from_using_var_still_diagnose
         "end Leak; end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(bezel::test::hasErrorMessage(
-        r, "§28.9 / §9.7 borrow-lifetime rule"));
+        r, "§28.3 / §9.7 borrow-lifetime rule"));
 }
 
 // ── #1136 / §27.7 / §28.3: function-value call result on a `using var` ────────

@@ -12,6 +12,7 @@
 #include "sema/TypeResolution.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <functional>
 #include <set>
@@ -676,6 +677,29 @@ void Resolver::checkTypeMethodBodies(TypeSymbol* t) {
         // runtime instead of a compile-time rejection naming the rule.
         auto* ps = dynamic_cast<PropertySymbol*>(m);
         if (!ps || !ps->isIndexer || isInterface) continue;
+        // fix #4111 (§10.5/§35.1, v0.298): an indexer on an enum or choice
+        // body is already unconditionally rejected regardless of body
+        // presence — checkEnumRestrictions's and checkChoiceRestrictions's
+        // own `PropertySymbol` arms both `bad("an indexer")`/continue on
+        // `ps->isIndexer` before ever looking at body kind. MEASURED on
+        // this HEAD (pre-fix): a BARE (bodyless, non-abstract) indexer on
+        // either kind tripped BOTH that rejection AND this arm's
+        // "non-abstract indexer must have a body" — two diagnostics, same
+        // location, for one member (`enum Color ... public property [i:
+        // int]: int; end Color;` reported both "enum `Color` may not
+        // declare an indexer (§10.5)" and "non-abstract indexer must have a
+        // body (§12.5/§23.4)"; the choice shape reported the analogous
+        // pair). Both are individually correct — no false accept, no false
+        // reject — but this codebase has explicit precedent for treating
+        // that as a defect anyway: #3601's changelog entry records
+        // retiring an earlier duplicate enum loop specifically "to avoid
+        // double-reporting". Short-circuit here rather than weaken either
+        // membership rejection — this function's OWN body-presence rule
+        // has nothing further to add once the member kind itself is
+        // rejected outright.
+        if (t->kind == ast::TypeDeclKind::Enum ||
+            t->kind == ast::TypeDeclKind::Choice)
+            continue;
         // SEAM-ACCESSOR: `ps` is a member of the locally-declared `t`
         // (forEachTypeAndNested, #3574); same declaration-site-only
         // reasoning as the method arm above (#3152).
@@ -725,6 +749,74 @@ void Resolver::checkTypeAbstractPropertyInitializers(TypeSymbol* t) {
             "` may not declare an initializer — an abstract member has no "
             "backing storage for it to write into, so the initializer "
             "could never run (§12.5)");
+    }
+}
+
+void Resolver::checkAbstractPropertyBodies() {
+    // fix #4110 (§12.5/§23.4, v0.298): shared recursive walk (§11.6,
+    // v0.286), matching every other per-member modifier-combination check
+    // in this file.
+    forEachTypeAndNested(
+        [&](TypeSymbol* t) { checkTypeAbstractPropertyBodies(t); });
+}
+
+void Resolver::checkTypeAbstractPropertyBodies(TypeSymbol* t) {
+    for (Symbol* m : t->members) {
+        auto* ps = dynamic_cast<PropertySymbol*>(m);
+        if (!ps) continue;
+        // SEAM-ACCESSOR: `ps` is a member of the locally-declared `t`
+        // (forEachTypeAndNested, #3574); an abstract-member-body check is
+        // declaration-site only (#3152), matching
+        // checkTypeAbstractPropertyInitializers just above.
+        auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
+        if (!pd) continue;
+        if (!hasMod(ps, "abstract")) continue;
+        // §12.5 / §23.4: an `abstract` member has no backing storage and
+        // no reachable call site of its own (dispatch through a base-typed
+        // reference always resolves to the most-derived override, §12.1),
+        // so a body it declares can never run. A `PropertyBodyKind::Auto`
+        // body is out of scope here entirely — checkAbstractPropertyInitializers
+        // (named properties, via `isAbstractPropertyShorthand`) and the
+        // indexer body-presence branch of checkTypeMethodBodies (#4101)
+        // already cover the Auto-body shapes; this check only ever fires
+        // for `Expression` or `Block`.
+        bool hasRealBody = false;
+        if (pd->bodyKind == ast::PropertyBodyKind::Expression) {
+            // `=> expr;` always carries real, unreachable code.
+            hasRealBody = true;
+        } else if (pd->bodyKind == ast::PropertyBodyKind::Block) {
+            // The Block form is ALSO the legitimate way to spell an
+            // abstract member needing more than the Auto shorthand's
+            // implicit get-only accessor (e.g. both `get;` and `set;`
+            // stubs, #4026's own accepted control
+            // `abstract_block_form_accessors_accepted_control_spec_12_5`)
+            // — every accessor there is itself
+            // `PropertyAccessorBodyKind::Abstract` (the bare `;` form).
+            // Only an accessor carrying REAL code (`Expression`/`Block`)
+            // is the #4110 defect.
+            for (const auto& acc : pd->accessors) {
+                if (acc.bodyKind != ast::PropertyAccessorBodyKind::Abstract) {
+                    hasRealBody = true;
+                    break;
+                }
+            }
+        }
+        if (!hasRealBody) continue;
+        if (pd->isIndexer) {
+            ctx_.diagnostics().report(
+                Severity::Error, m->declLoc,
+                "abstract indexer may not have a body — an abstract member "
+                "has no backing storage and no reachable call site of its "
+                "own, so the body could never run (\xC2\xA7"
+                "12.5/\xC2\xA7""23.4)");
+        } else {
+            ctx_.diagnostics().report(
+                Severity::Error, m->declLoc,
+                std::string("abstract property `") + std::string(ps->name) +
+                "` may not have a body — an abstract member has no backing "
+                "storage and no reachable call site of its own, so the "
+                "body could never run (\xC2\xA7""12.5)");
+        }
     }
 }
 
@@ -790,6 +882,39 @@ void Resolver::checkEnumRestrictions() {
                     "it is the compiler-provided static member every enum "
                     "carries, and no user declaration may override or overload "
                     "it (§10.4)");
+                continue;
+            }
+            // fix #4121 (§10.4, §8.7, v0.298): §10.4's positive list of what
+            // an enum "may declare exactly" — instance methods, expression-
+            // bodied read-only instance properties, static methods,
+            // `static readonly` fields, `const` members, operator overloads —
+            // has no destructor entry, and §8.7 states plainly that "Static
+            // classes, records, enums, choices, primitives, and inline
+            // arrays do not implement `IDisposable`" — so an enum has no
+            // Dispose() surface for a destructor to hook. MEASURED on this
+            // HEAD (pre-fix): `enum Color: int Red, Green, Blue; destructor
+            // end destructor; end Color;` compiled at exit 0, zero
+            // diagnostics — this loop had no DestructorSymbol arm at all.
+            // checkChoiceRestrictions already rejects the identical shape on
+            // choices (fix #3869, "choice `Shape` may not declare a
+            // destructor (§35.1 / §35.2)"); the spec's own Appendix A
+            // preamble "Shared-production over-admissions" index (the
+            // unnumbered table immediately before A.1, NOT a numbered
+            // "Appendix A.9" — no such subsection exists, A stops at A.8)
+            // already names this exact enum-side gap in its `Member` in an
+            // enum-or-choice body row: "...destructors by §8.7" — for BOTH
+            // kinds. #3869 explicitly declined to touch the enum side (see
+            // that fix's own comment on checkChoiceRestrictions below), so
+            // choice was the one made correct then; this fix makes enum
+            // agree with choice, not the other way — choice's existing
+            // rejection is the one the spec supports.
+            if (dynamic_cast<DestructorSymbol*>(m)) {
+                ctx_.diagnostics().report(
+                    Severity::Error, m->declLoc,
+                    std::string("enum `") + std::string(t->name) +
+                    "` may not declare a destructor — an enum never "
+                    "implements `IDisposable` (§8.7) and a destructor is "
+                    "not part of §10.4's exhaustive admitted-member list");
                 continue;
             }
             if (auto* fs = dynamic_cast<FieldSymbol*>(m)) {
@@ -1008,7 +1133,8 @@ void Resolver::checkChoiceDispatchModifiers() {
 // have destructors, constructors, instance fields, block-form or
 // storage-backed properties, indexers, or nested types — the same
 // restriction set as enums (§10.5), for the same reasons, plus one: a
-// choice's instance storage IS its cases' payloads." §35.2 independently
+// choice's instance storage IS its cases' payloads, declared in the case
+// list and reachable only through matching." §35.2 independently
 // confirms the admitted-member list ("instance methods, expression-bodied
 // read-only instance properties, static methods, `static readonly`
 // fields..., `const` members, and operator overloads ... this list rejects
@@ -1030,11 +1156,12 @@ void Resolver::checkChoiceDispatchModifiers() {
 // both because §35.1 names a strictly larger reject set than §10.5's enum
 // list:
 //   - `destructor` is ALSO rejected here (§35.1 names it explicitly, cited
-//     under §8.7 by the spec's own Appendix A.9 over-admission-index row
-//     for `Member` in an enum-or-choice body); checkEnumRestrictions has NO
-//     destructor check at all (a separate, pre-existing enum-side gap this
-//     fix does not touch — filed alongside #3840's other enum/choice
-//     over-admission catalog).
+//     under §8.7 by the spec's own Appendix A "Shared-production
+//     over-admissions" index — an unnumbered table in the Appendix A
+//     preamble, before A.1 — in its `Member` in an enum-or-choice body
+//     row); checkEnumRestrictions has NO destructor check at all (a
+//     separate, pre-existing enum-side gap this fix does not touch —
+//     filed alongside #3840's other enum/choice over-admission catalog).
 //   - the `event` rejection is worded from §35.2's admitted-list boundary
 //     ("not part of" the list), not enum's/record's §24.1/§9.7 "not an
 //     owning disposable container" reasoning — an OWNING choice IS a real
@@ -1050,12 +1177,15 @@ void Resolver::checkChoiceDispatchModifiers() {
 // checkEnumRestrictions itself still admits them for enums; #3840 tracks
 // fixing BOTH sides together, not this fix, which only closes the
 // admissible-KIND gap #3869 describes). An `invariant` member is likewise
-// NOT covered — `t->members` never carries one (it is a distinct AST/side-
-// table construct, `TypeSymbol::invariantContracts`, not a `Symbol`
-// subclass at all), so neither this walk nor checkEnumRestrictions's can
-// see it; that gap (named in the spec's own Appendix A.9 row, "invariant by
-// §22.16") is uncovered for BOTH enum and choice bodies today and is
-// out of this fix's scope — filed separately.
+// NOT covered here — `t->members` never carries one (it is a distinct
+// AST/side-table construct, `TypeSymbol::invariantContracts`, not a
+// `Symbol` subclass at all), so neither this walk nor checkEnumRestrictions's
+// can see it; that gap (named in the spec's own Appendix A preamble's
+// "Shared-production over-admissions" index — the unnumbered table before
+// A.1 — in its `Member` in an enum-or-choice body row's "invariant by
+// §22.16" clause) was left uncovered for BOTH enum and choice bodies by
+// this fix — closed separately by fix #4115's checkEnumChoiceInvariantMembers
+// below, which reads the raw AST member list instead of `t->members`.
 void Resolver::checkChoiceRestrictions() {
     if (!ctx_.module()) return;
     forEachTypeAndNested([&](TypeSymbol* t) {
@@ -1110,6 +1240,149 @@ void Resolver::checkChoiceRestrictions() {
                     "`const` members, and operator overloads only)");
                 continue;
             }
+        }
+    });
+}
+
+// fix #4115 (§22.16, Appendix A preamble "Shared-production over-admissions"
+// index, v0.298): an `invariant` member on an enum or choice body compiles
+// with zero diagnostics — MEASURED on this HEAD (pre-fix): both
+//   choice Shape Circle(radius: double), Square(side: double); invariant(true); end Shape;
+// and
+//   enum Color Red, Green, Blue; invariant(true); end Color;
+// compile at exit 0, zero diagnostics. Neither checkEnumRestrictions nor
+// checkChoiceRestrictions (above) can see this: `invariant` clauses are not
+// modeled as a `Symbol` subclass in `TypeSymbol::members` at all —
+// SymbolCollection never creates one for `ast::InvariantDecl` — they live
+// only in `TypeSymbol::invariantContracts`, a side-table `ModuleLoader`
+// populates for an IMPORTED class from the exporting module's already-
+// validated metadata (ModuleLoader.cpp), never for a local declaration
+// (Symbol.hpp's own comment on the field: "Local classes derive these from
+// their AST; imported classes have no AST, so the loader publishes this
+// side-table vector"). A LOCAL enum or choice's invariant member is
+// therefore readable only from the raw AST: `t->decl`'s
+// `ast::TypeDecl::members` (populated because the parser's EnumMember*/
+// ChoiceMember* productions both route through the shared `parseMember()`
+// used for class bodies — Parser_Decls.cpp's own comment there: "We accept
+// the full Member grammar at the parse level and let sema filter" — so an
+// `ast::InvariantDecl` parses into an enum/choice body exactly as it does
+// into a class body; nothing at the grammar layer excludes it).
+//
+// Citation note: the issue that reported this (#4115) titled itself
+// "Appendix A.9" for the admissions-index table; VERIFIED against
+// docs/Bezel_Language_Spec.md that no such subsection exists — Appendix A's
+// numbered subsections run A.1 through A.8 only (grep `^### A\.` — A.1
+// Lexical .. A.8 Constants and literals). The table is the UNNUMBERED one
+// in the Appendix A preamble, introduced "Shared-production over-admissions
+// (index, not a rule)" just before A.1, whose `Member` in an enum-or-choice
+// body row reads (verbatim): "invariant by [§22.16](#sec-contract-clauses),
+// destructors by [§8.7](#sec-dispose-is-not-on-object)". §22.16 itself
+// ("Contract clauses") states the scope directly: "a class body may declare
+// invariant members" — an enum or choice is not a class, so this is the
+// primary authority; the Appendix A table is the index confirming the
+// rejection is deliberate policy, not an oversight.
+//
+// One check for both kinds (unlike the split checkEnumRestrictions /
+// checkChoiceRestrictions pair): the AST-read, the message shape, and the
+// citation are identical for both, and unlike those two functions this one
+// has no other kind-specific rule to carry, so a single small function
+// reading `t->kind` beats two near-duplicate ones.
+void Resolver::checkEnumChoiceInvariantMembers() {
+    if (!ctx_.module()) return;
+    forEachTypeAndNested([&](TypeSymbol* t) {
+        if (t->kind != ast::TypeDeclKind::Enum &&
+            t->kind != ast::TypeDeclKind::Choice) return;
+        // `t` is drawn from forEachTypeAndNested (#3574), which walks only
+        // this module's own local declaration tree — never an imported type
+        // (#3152). An imported enum/choice's invariant member, if the
+        // exporting module's own compile somehow let one through, is out of
+        // this check's reach (it has no AST here) but also out of scope:
+        // the exporting module's compile is where this same check would
+        // have run and rejected it before the artifact interface (§2.8.2)
+        // could ever publish it.
+        // SEAM-ACCESSOR: `t->decl` is always a real `ast::TypeDecl*` here.
+        auto* td = dynamic_cast<const ast::TypeDecl*>(t->decl);
+        if (!td) return;
+        const bool isEnum = t->kind == ast::TypeDeclKind::Enum;
+        for (const auto& mp : td->members) {
+            auto* inv = dynamic_cast<const ast::InvariantDecl*>(mp.get());
+            if (!inv) continue;
+            ctx_.diagnostics().report(
+                Severity::Error, inv->loc,
+                std::string(isEnum ? "enum `" : "choice `") +
+                std::string(t->name) +
+                "` may not declare an `invariant` member — §22.16 scopes "
+                "invariant members to class bodies, and " +
+                std::string(isEnum ? "an enum" : "a choice") +
+                " is not a class (§22.16)");
+        }
+    });
+}
+
+// fix #4186 (§22.16 "Class invariants", Appendix A.4 `InvariantDecl`
+// production comment, v0.298): an `invariant` member on a RECORD body or a
+// `static class` body compiles with zero diagnostics — MEASURED on this
+// HEAD (pre-fix), both
+//   record Point4186 public X: int; public Y: int; invariant(true); end Point4186;
+// and
+//   static class Utils4186 invariant(true); end Utils4186;
+// compile via `runAot` at exit 0, zero diagnostics. Same root cause as fix
+// #4115's checkEnumChoiceInvariantMembers just above (and explicitly left
+// out of that fix's scope — its own trailing "KNOWN GAP" test row cites this
+// issue by number): `invariant` clauses are not modeled as a `Symbol`
+// subclass in `TypeSymbol::members` at all (SymbolCollection never creates
+// one for `ast::InvariantDecl`), so a `t->members`-based walk cannot see
+// one; the raw AST (`t->decl`'s `ast::TypeDecl::members`) is the only place
+// a LOCAL declaration's invariant member is visible.
+//
+// Authority: A.4's `InvariantDecl` grammar production comment states the
+// scope directly — "class bodies only; rejected semantically in records and
+// static classes (§22.16)" — and `ast::InvariantDecl`'s own doc comment
+// (src/ast/Node.hpp) repeats it verbatim ("Class-body-only per A.4;
+// semantically rejected in records, static classes, and outside class
+// bodies"). §22.16's opening sentence independently backs the record half
+// ("a class body may declare invariant members" — a record is not a
+// class), and its "Class invariants" subsection's own "Out of scope in this
+// revision" list backs the static-class half explicitly: "static-class and
+// static-state invariants (an `invariant` in a static class is a compile
+// error — no instance boundary exists)".
+//
+// A record's positional-field constructor and a static class's absent
+// instance boundary are UNRELATED reasons (worth two distinct diagnostics,
+// like the enum/choice split above), so this walks both kinds in one
+// function — mirroring checkEnumChoiceInvariantMembers's own "one function,
+// kind-specific message" shape — rather than duplicating the AST-read loop.
+void Resolver::checkRecordAndStaticClassInvariantMembers() {
+    if (!ctx_.module()) return;
+    forEachTypeAndNested([&](TypeSymbol* t) {
+        const bool isRecord = t->kind == ast::TypeDeclKind::Record;
+        bool isStaticClass = false;
+        if (t->kind == ast::TypeDeclKind::Class) {
+            for (auto mod : t->modifiers)
+                if (mod == "static") { isStaticClass = true; break; }
+        }
+        if (!isRecord && !isStaticClass) return;
+        // `t` is drawn from forEachTypeAndNested (#3574): this module's own
+        // local declaration tree only, never an imported type (#3152) —
+        // same reach argument as checkEnumChoiceInvariantMembers above.
+        // SEAM-ACCESSOR: `t->decl` is always a real `ast::TypeDecl*` here.
+        auto* td = dynamic_cast<const ast::TypeDecl*>(t->decl);
+        if (!td) return;
+        for (const auto& mp : td->members) {
+            auto* inv = dynamic_cast<const ast::InvariantDecl*>(mp.get());
+            if (!inv) continue;
+            ctx_.diagnostics().report(
+                Severity::Error, inv->loc,
+                isRecord
+                    ? (std::string("record `") + std::string(t->name) +
+                       "` may not declare an `invariant` member — §22.16 "
+                       "scopes invariant members to class bodies, and a "
+                       "record is not a class (§22.16)")
+                    : (std::string("static class `") + std::string(t->name) +
+                       "` may not declare an `invariant` member — §22.16 "
+                       "states an `invariant` in a static class is a "
+                       "compile error: no instance boundary exists "
+                       "(§22.16)"));
         }
     });
 }
@@ -1306,7 +1579,84 @@ void Resolver::checkTypeConsts(TypeSymbol* t) {
         // SEAM-ACCESSOR: `cs` is a member of the locally-declared `t` (forEachTypeAndNested,
         // #3574); `t`'s OWN const members are always local (#3152).
         auto* cd = dynamic_cast<const ast::ConstDecl*>(cs->decl);
-        if (!cd || !cd->type) continue;  // inferred — deferred
+        // Build the `resolve` closure once — used by the (type-independent)
+        // div-by-zero probe below AND by the integer-range check further down.
+        //
+        // fix #3635 (§6.1 / Appendix C.11, v0.286): walk `t`'s own members
+        // AND its class base chain, so a bare name naming an INHERITED
+        // const resolves here too. Before this fix the walk covered only
+        // `t->members`; `fix #3619` deliberately DECLINED to fold this
+        // closure into the shared `resolveConstIdentInScope` (which already
+        // has this same walk) because the two differ in what happens on an
+        // unfoldable match — `resolveConstIdentInScope` falls through to
+        // let a same-named symbol further up shadow it, while this closure
+        // returns immediately once ANY level of the chain has a matching
+        // name, foldable or not. That contract is preserved: the widening
+        // is *which levels get searched*, not *what happens on a match*.
+        // Reachable: `Derived : Base` where `Derived`'s own const references
+        // `Base`'s by bare name — measured silently accepting an
+        // overflowing value (and, independently, a division by an inherited
+        // zero const) before this fix, since both `foldIntConst` and
+        // `containsConstDivByZero` share this one `resolve`.
+        std::function<std::optional<long long>(std::string_view, int)>
+            resolve = [&](std::string_view name,
+                          int depth) -> std::optional<long long> {
+            for (TypeSymbol* ts = t; ts;) {
+                for (Symbol* sm : ts->members) {
+                    auto* scs = dynamic_cast<ConstMemberSymbol*>(sm);
+                    if (!scs || scs->name != name) continue;
+                    if (auto* scd =
+                            // SEAM-ACCESSOR: `ts` here walks `t`'s class BASE CHAIN (`ts->baseTypes` below), which
+                            // DOES cross module boundaries, so `scs` can be an imported const. Fix
+                            // #3230 (family M11 of #3152) already covers that: when `scd` (this AST
+                            // cast) is null, the fallback three lines below reads the loader's
+                            // typed `scs->intValue` instead of silently no-opping.
+                            dynamic_cast<const ast::ConstDecl*>(scs->decl))
+                        if (scd->value)
+                            return foldIntConst(*scd->value, resolve,
+                                                 depth + 1);
+                    // fix #3230 (§17.14 / §15.1 / §22.12; family M11 of
+                    // umbrella #3152): an imported sibling const has no AST
+                    // TypeDecl (the symbol is reconstructed from
+                    // metadata), so the `scd->value` arm above returns
+                    // nullopt and the §6.1 / Appendix C.11 range check
+                    // below silently no-ops. Fall back to the typed value
+                    // the loader populated (parseImportedConstIntText in
+                    // ModuleLoader.cpp).
+                    if (scs->intValue) return *scs->intValue;
+                    return std::nullopt;
+                }
+                TypeSymbol* nb = nullptr;
+                for (TypeSymbol* base : ts->baseTypes)
+                    if (base && base->kind == ast::TypeDeclKind::Class) {
+                        nb = base;
+                        break;
+                    }
+                ts = nb;
+            }
+            return std::nullopt;
+        };
+
+        // fix #4391 (§17.14, v0.298): the div-by-zero probe must run even for
+        // inferred-type consts. Without this, `const C := 5 / Z` (where Z:=0)
+        // was silently accepted because the `!cd->type` guard below skipped the
+        // whole block. The probe is type-independent — it needs only the
+        // initializer expression — so it runs before that guard.
+        if (cd->value) {
+            bool hasDivZero = containsConstDivByZero(*cd->value, resolve);
+            if (hasDivZero) {
+                ctx_.diagnostics().report(
+                    Severity::Error, m->declLoc,
+                    std::string("const `") + std::string(cs->name) +
+                    "` initializer contains a division or modulo by "
+                    "zero — a const initializer must fold to a "
+                    "representable compile-time-constant value (§22.12)");
+            }
+        }
+
+        // The remaining checks (type admissibility and integer range) require an
+        // explicit type annotation — inferred types are deferred to ExprTypecheck.
+        if (!cd->type) continue;
         TypeRef* rt = ctx_.resolvedType(*cd->type);
         if (!rt) continue;
         // fix #3879 (§22.12, v0.294): routed through the ONE shared predicate
@@ -1337,66 +1687,9 @@ void Resolver::checkTypeConsts(TypeSymbol* t) {
             p == P::Byte || p == P::SByte || p == P::Short || p == P::UShort ||
             p == P::Int || p == P::UInt || p == P::Long || p == P::ULong;
         if (isIntConst && cd->value) {
-            // §17.14 (v0.184, #1688): fitsConstIntRange / containsConstDivByZero
-            // are shared with the local-`const` fault check (ExprTypecheck.cpp)
-            // so both const forms agree on exactly one "fits"/"div-by-zero"
-            // definition (ConstFold.hpp).
-            //
-            // fix #3635 (§6.1 / Appendix C.11, v0.286): walk `t`'s own members
-            // AND its class base chain, so a bare name naming an INHERITED
-            // const resolves here too. Before this fix the walk covered only
-            // `t->members`; `fix #3619` deliberately DECLINED to fold this
-            // closure into the shared `resolveConstIdentInScope` (which already
-            // has this same walk) because the two differ in what happens on an
-            // unfoldable match — `resolveConstIdentInScope` falls through to
-            // let a same-named symbol further up shadow it, while this closure
-            // (kept here, unchanged) returns immediately once ANY level of the
-            // chain has a matching name, foldable or not. That contract is
-            // preserved: the widening is *which levels get searched*, not
-            // *what happens on a match*. Reachable: `Derived : Base` where
-            // `Derived`'s own const references `Base`'s by bare name — measured
-            // silently accepting an overflowing value (and, independently, a
-            // division by an inherited zero const) before this fix, since both
-            // `foldIntConst` below and `containsConstDivByZero` in the nullopt
-            // arm share this one `resolve`.
-            std::function<std::optional<long long>(std::string_view, int)>
-                resolve = [&](std::string_view name,
-                              int depth) -> std::optional<long long> {
-                for (TypeSymbol* ts = t; ts;) {
-                    for (Symbol* sm : ts->members) {
-                        auto* scs = dynamic_cast<ConstMemberSymbol*>(sm);
-                        if (!scs || scs->name != name) continue;
-                        if (auto* scd =
-                                // SEAM-ACCESSOR: `ts` here walks `t`'s class BASE CHAIN (`ts->baseTypes` below), which
-                                // DOES cross module boundaries, so `scs` can be an imported const. Fix
-                                // #3230 (family M11 of #3152) already covers that: when `scd` (this AST
-                                // cast) is null, the fallback three lines below reads the loader's
-                                // typed `scs->intValue` instead of silently no-opping.
-                                dynamic_cast<const ast::ConstDecl*>(scs->decl))
-                            if (scd->value)
-                                return foldIntConst(*scd->value, resolve,
-                                                     depth + 1);
-                        // fix #3230 (§17.14 / §15.1 / §22.12; family M11 of
-                        // umbrella #3152): an imported sibling const has no AST
-                        // TypeDecl (the symbol is reconstructed from
-                        // metadata), so the `scd->value` arm above returns
-                        // nullopt and the §6.1 / Appendix C.11 range check
-                        // below silently no-ops. Fall back to the typed value
-                        // the loader populated (parseImportedConstIntText in
-                        // ModuleLoader.cpp).
-                        if (scs->intValue) return *scs->intValue;
-                        return std::nullopt;
-                    }
-                    TypeSymbol* nb = nullptr;
-                    for (TypeSymbol* base : ts->baseTypes)
-                        if (base && base->kind == ast::TypeDeclKind::Class) {
-                            nb = base;
-                            break;
-                        }
-                    ts = nb;
-                }
-                return std::nullopt;
-            };
+            // §17.14 (v0.184, #1688): fitsConstIntRange is shared with the
+            // local-`const` fault check (ExprTypecheck.cpp) so both const forms
+            // agree on exactly one "fits" definition (ConstFold.hpp).
             if (auto folded = foldIntConst(*cd->value, resolve)) {
                 if (!fitsConstIntRange(*folded, p)) {
                     ctx_.diagnostics().report(
@@ -1407,29 +1700,16 @@ void Resolver::checkTypeConsts(TypeSymbol* t) {
                         "must be a representable compile-time constant "
                         "(§6.1 / Appendix C.11)");
                 }
-            } else {
-                // per §22.12 (#1211): the initializer is structurally a
-                // constant expression (passed isConstInitExpr) but
-                // foldIntConst returned nullopt — report the specific cause
-                // when it is a division or modulo by zero.
-                if (containsConstDivByZero(*cd->value, resolve)) {
-                    ctx_.diagnostics().report(
-                        Severity::Error, m->declLoc,
-                        std::string("const `") + std::string(cs->name) +
-                        "` initializer contains a division or modulo by "
-                        "zero — a const initializer must fold to a "
-                        "representable compile-time-constant value (§22.12)");
-                }
-                // §6.5 / §17.14 (v0.242, #3045): the OTHER evaluation fault
-                // that leaves an otherwise-constant initializer unfoldable —
-                // "`const F := 1 << 64;` [is] rejected where [it is] written"
-                // (§17.14) — needs no probe here. Unlike a `/ 0`, the const's
-                // initializer expression is visited by ExprTC, whose
-                // checkShiftCountDomain reports the fault at the shift itself
-                // and with the left operand's real type (which this walk can
-                // only infer from the AST shape). A probe here would only
-                // double the diagnostic.
             }
+            // §6.5 / §17.14 (v0.242, #3045): the OTHER evaluation fault
+            // that leaves an otherwise-constant initializer unfoldable —
+            // "`const F := 1 << 64;` [is] rejected where [it is] written"
+            // (§17.14) — needs no probe here. Unlike a `/ 0`, the const's
+            // initializer expression is visited by ExprTC, whose
+            // checkShiftCountDomain reports the fault at the shift itself
+            // and with the left operand's real type (which this walk can
+            // only infer from the AST shape). A probe here would only
+            // double the diagnostic.
         }
     }
 }
@@ -1835,7 +2115,7 @@ void Resolver::checkTopLevelVisibility() {
 
 // fix #3032 (§15.4.1, v0.262): a type declaring a static
 // `FromCollectionLiteral` whose carrier is a recognized form
-// (`ReadOnlySpan<T>` or `owned OwningArray<T>`) must be `public` and must
+// (`ReadOnlyArraySpan<T>` or `owned OwningArray<T>`) must be `public` and must
 // return `owned C<T>` at the enclosing type's own arity; declaring both
 // carriers on the same type is a compile error. #2957 deliberately scoped
 // the recognition predicate to the three mechanically-distinguishable
@@ -1911,12 +2191,32 @@ void Resolver::checkCollectionLiteralFactoryConjuncts() {
                 continue;
             std::string_view carrierName =
                 paramTy->astNode->name->parts.back();
-            // The borrowing form's `ReadOnlySpan<T>` is read by-value into
-            // the factory; the owning form's `OwningArray<T>` is read
+            // The borrowing form's `ReadOnlyArraySpan<T>` is read by-value
+            // into the factory; the owning form's `OwningArray<T>` is read
             // `owned` (the spec example writes `owned elements: OwningArray<T>`).
             // The carrier NAME is the discriminator — the modifier is
             // irrelevant to the §15.4.1 form split.
-            const bool isBorrowForm = (carrierName == "ReadOnlySpan");
+            // fix #3857 (§15.4.1, v0.272): proposal 0115 renamed the
+            // borrowing carrier from `ReadOnlySpan<T>` (the OWNING family's
+            // view, backed by `OwningBuffer<T>`) to `ReadOnlyArraySpan<T>`
+            // (the borrowing family's view, backed by `Array<T>`) — the old
+            // spelling was ownership-incoherent for a protocol whose
+            // elements are borrows. The old spelling is no longer part of
+            // the protocol at all: reject it here with a remedy naming the
+            // current carrier, rather than leaving it silently unrecognized
+            // (which left `isCollectionLiteralAdmissibleTarget` admitting
+            // the literal on name alone and crashed codegen — #3857).
+            if (carrierName == "ReadOnlySpan") {
+                ctx_.diagnostics().report(
+                    Severity::Error, ms->declLoc,
+                    std::string("`FromCollectionLiteral` on type `") +
+                    std::string(t->name) +
+                    "` declares its borrowing carrier as `ReadOnlySpan<T>`, "
+                    "which is no longer recognized; the borrowing carrier "
+                    "is `ReadOnlyArraySpan<T>` as of spec v0.272 (§15.4.1)");
+                continue;
+            }
+            const bool isBorrowForm = (carrierName == "ReadOnlyArraySpan");
             const bool isOwningForm = (carrierName == "OwningArray");
             if (!isBorrowForm && !isOwningForm) continue;
             // Conjunct 1: visibility must be `public`. §15.4.1: "The method
@@ -1999,7 +2299,7 @@ void Resolver::checkCollectionLiteralFactoryConjuncts() {
                     // is `owned C` — no element type exists to compare
                     // against the carrier's element type, and
                     // `retElemTy == nullptr` while `elemTy` is the
-                    // carrier's (e.g. `int` from `ReadOnlySpan<int>`).
+                    // carrier's (e.g. `int` from `ReadOnlyArraySpan<int>`).
                     // Without this carve the conjunct rejected every
                     // non-generic-owning form (with no T to bind, the
                     // carrier's T is whatever the user wrote).
@@ -2023,7 +2323,7 @@ void Resolver::checkCollectionLiteralFactoryConjuncts() {
                         Severity::Error, ms->declLoc,
                         "type `" + std::string(t->name) +
                         "` declares both recognized `FromCollectionLiteral` "
-                        "carriers (`ReadOnlySpan<T>` and `OwningArray<T>" +
+                        "carriers (`ReadOnlyArraySpan<T>` and `OwningArray<T>" +
                         "`); exactly one may be declared on a given type "
                         "(§15.4.1)");
                 }
@@ -2034,7 +2334,7 @@ void Resolver::checkCollectionLiteralFactoryConjuncts() {
                         Severity::Error, ms->declLoc,
                         "type `" + std::string(t->name) +
                         "` declares both recognized `FromCollectionLiteral` "
-                        "carriers (`ReadOnlySpan<T>` and `OwningArray<T>" +
+                        "carriers (`ReadOnlyArraySpan<T>` and `OwningArray<T>" +
                         "`); exactly one may be declared on a given type "
                         "(§15.4.1)");
                 }
@@ -3646,8 +3946,56 @@ static bool staticReadonlyFieldIsReferenceTyped(const TypeRef* rt,
                                                 const SemaContext& ctx);
 static bool isStaticallyNullExpr(const ast::Expr* e);
 static bool isStaticallyDefaultExpr(const ast::Expr* e);
-static void checkStaticReadonlyRecordInit(
+// fix #3973 (§9.7, v0.295): returns true iff a diagnostic was reported (the
+// walk is now recursive — see the definition below).
+// fix #4164 (§9.7, v0.295): `incoming` is the ENCLOSING frame's own
+// `common::RecordSubstEnv*` (null at the top of the recursion) — needed so
+// `declTy` itself, when it is a COMPOUND generic type that mentions the
+// enclosing record's own bare parameter (`InnerCG<T>` as a field of
+// `OuterCG<T>`), resolves its own `genericArgs` through the outer binding
+// before this frame seeds its own environment. See the definition for the
+// full rationale.
+static bool checkStaticReadonlyRecordInit(
     SemaContext& ctx, const ast::NewExpr& nx, const TypeRef* declTy,
+    const common::RecordSubstEnv* incoming, SourceLocation loc,
+    std::string_view what, std::string_view name);
+// fix #3973 (§9.7, v0.295): handles a positional slot (record field or
+// choice payload) that is not ITSELF directly reference-typed but may
+// still carry a nested borrow one or more levels down — see the definition
+// below, just above `checkStaticReadonlyRecordInit`.
+// fix #4164 (§9.7, v0.295): `incoming` is `pft`'s OWN substitution
+// environment (the `.env` half of the `RecordSubstEnv::Entry` the caller
+// already resolved `pft` through) — threaded to the nested frame exactly
+// as `common::isBorrowBearingRecordCommon`'s own walk already does, so a
+// compound nested type's bare mentions of the ENCLOSING generic's own
+// parameter compose instead of resolving to nothing.
+static bool checkNestedBorrowBearingSlot(
+    SemaContext& ctx, const TypeRef* pft, const common::RecordSubstEnv* incoming,
+    const ast::Expr* argExpr, SourceLocation loc, std::string_view what,
+    std::string_view name);
+// fix #4134 (§9.7, v0.295): a choice VALUE is constructed via a case CALL
+// (`Type.Case(args)`, resolved to a ChoiceCaseSymbol) — never a `new`
+// expression (§35.1: "a choice's construction *is* case selection"; spec
+// prose at the field-initializer admission list states this explicitly:
+// "it is not a `new` expression"). `checkStaticReadonlyRecordInit`'s own
+// Choice arm is keyed to a `new`-expression's argument list and can only
+// GUESS which case is intended by matching arity across every declared
+// case; here the callee already resolved to one EXACT case, so there is
+// no ambiguity to guess through. See the definition below, just after
+// `checkStaticReadonlyRecordInit`.
+// fix #4133 (§9.7, v0.295): `choiceTy` is the CONCRETE instantiation TypeRef
+// of the choice being constructed (carries `genericArgs` when the choice is
+// generic) — needed to substitute a bare-type-parameter payload field
+// through the actual instantiation, exactly as the record arm does. See the
+// definition for the full rationale.
+// fix #4164 (§9.7, v0.295): `incoming` is the enclosing frame's substitution
+// environment, threaded down for the identical reason as
+// `checkStaticReadonlyRecordInit`'s own `incoming` — null at the top of the
+// recursion (this choice is the static readonly field's own declared type),
+// `pft`'s own `.env` when reached via `checkNestedBorrowBearingSlot`.
+static bool checkStaticReadonlyChoiceCaseInit(
+    SemaContext& ctx, const ast::CallExpr& ce, const ChoiceCaseSymbol* cs,
+    const TypeRef* choiceTy, const common::RecordSubstEnv* incoming,
     SourceLocation loc, std::string_view what, std::string_view name);
 
 // §22.12 rule 3/4 (v0.262, #3272): classify a CONCRETE substitution at the
@@ -7425,6 +7773,98 @@ bool Resolver::argSatisfiesTypeBound(const TypeRef* arg, const TypeRef* bound) {
     return false;
 }
 
+namespace {
+// fix #4309 (§14.2/§17.11, v0.298; send-back on #4294) — the CLOSED set of
+// builtin, null-declaration INTERFACE names consulted by BOTH
+// `Resolver::argSatisfiesNew` and `typeHasNoDefaultWalk` below, replacing
+// two independent by-name lists (§6: "two spellings of one set is how the
+// next omission happens" — exactly how #4294 itself covered `IGrouping`
+// without covering its 25 siblings).
+//
+// DERIVED, NOT RE-TYPED: every name here is (a) an `I*` head present in
+// `Resolver::builtinTypeArity`'s table (TypeResolution_Names.cpp) — so it
+// resolves as a builtin type at all — and (b) NOT one of the seven names
+// `SemaContext::isSynthesizedBuiltinInterfaceName` mints a REAL synthesized
+// `TypeSymbol` for (IComparable, IEquatable, IEqualityComparer,
+// IReadOnlySpan, INumber, ISteppable, IParsable). Those seven already reach
+// the TypeSymbol-backed `d->kind == ast::TypeDeclKind::Interface` arms
+// directly (both below) and need no entry here.
+//
+// `IGrouping` is DELIBERATELY excluded even though it is a null-declaration
+// interface in `builtinTypeArity`: fix #4294 gave it its own two-line
+// branch (this file, both sites, search "fix #4294") on a considered
+// judgement call — that it is a separate, self-contained addition, not a
+// candidate for folding into a shared list this round. This set should not
+// silently re-merge it; if `IGrouping` is ever folded in, that is its own
+// decision to record, not a side effect of this one.
+//
+// `tests/sema/*4309*` asserts, for every name in this array,
+// `isBuiltinTypeName(name)` is true (still present in `builtinTypeArity`)
+// and `SemaContext::isSynthesizedBuiltinInterfaceName(name)` is false
+// (still absent from the synthesized set) — so a future change to EITHER
+// authoritative table that would silently invalidate this derivation fails
+// that test instead of silently changing what §14.2/§17.11 reject.
+//
+// §14.2 makes every member unconditionally non-constructible ("Interface
+// substitutions never satisfy `new()` — no constructor exists") and §17.11
+// makes every member unconditionally non-defaultable ("Not defaultable:
+// non-nullable reference types" — every interface is one). Both rules are
+// categorical, with no per-type fact to get wrong (unlike DictionaryEntry/
+// DrainedEntry, whose defaultability/constraint checking is instantiation-
+// dependent) — so one closed, enumerable set safely answers BOTH questions.
+//
+// NOT `common::BuiltinRegistry.cpp`'s `kBuiltinInterfaceHeads` (22 names,
+// ~line 424): that table is validated for a DIFFERENT question — "whose
+// runtime value may be a USER class" (the exact complement of
+// `isVtableLessBuiltinClassName`, a runtime-representation/disposal
+// classification), and its own membership proves the mismatch: it
+// deliberately EXCLUDES `IDisposable`/`IAsyncDisposable` (different
+// runtime representation), lacks `IOrderedEnumerable`/`IFormattable`
+// entirely, and INCLUDES `IGrouping` (excluded here, see above). Agreeing
+// on 18 of 22 names is not the same question (§25) — reusing it here would
+// silently drop four names from this fix's coverage and wrongly fold
+// `IGrouping` back in.
+//
+// ANTI-DRIFT ONLY, NOT ANTI-OMISSION (#4327, #4299): this array is the
+// authoritative closed set of non-constructible builtin interface names, and
+// every entry in `builtinTypeArity` that is a null-declaration, non-synthesized
+// interface IS mirrored here — so this set catches names that DRIFT out of
+// sync.  It provides ZERO signal if a 26th such interface is added to
+// `builtinTypeArity` without a corresponding entry here: no test would detect
+// the gap.  The population-growth signal is the per-issue review of
+// `builtinTypeArity`; this array requires manual upkeep and is validated only
+// by human review (CLAUDE.md rule 4: decline-with-reasons, not silently).
+constexpr std::array<std::string_view, 25>
+    kNonConstructibleBuiltinInterfaceNames = {
+        // arity-0 (stdlib §2.14/§2.15/§2.18; builtinTypeArity's first block)
+        "IDisposable", "IAsyncDisposable", "ISerializable",
+        "IDeserializable", "ISerializer", "IDeserializer", "IFormattable",
+        // arity-1 (stdlib §2.8-§2.9/§4/§5/§6.5; builtinTypeArity's arity-1
+        // block)
+        "IEnumerable", "IEnumerator", "IOrderedEnumerable",
+        "IAsyncEnumerable", "IAsyncEnumerator", "IOwningEnumerable",
+        "IOwningEnumerator", "IOwningAsyncEnumerable",
+        "IOwningAsyncEnumerator", "IReadOnlyCollection", "IReadOnlyList",
+        "ICollection", "IList", "IOwningCollection", "IOwningList",
+        "IEvent", "IAsyncEvent", "ISharedEvent",
+};
+
+bool isNonConstructibleBuiltinInterfaceName(std::string_view head) {
+    return std::find(kNonConstructibleBuiltinInterfaceNames.begin(),
+                      kNonConstructibleBuiltinInterfaceNames.end(),
+                      head) != kNonConstructibleBuiltinInterfaceNames.end();
+}
+}  // namespace
+
+// Free-function wrapper exposing `kNonConstructibleBuiltinInterfaceNames`
+// (just above) for `tests/sema/*4309*`'s membership assertion — see that
+// array's own comment, and the header declaration in TypeResolution.hpp,
+// for why this is a `const&` onto the SAME array both call sites below
+// consult, not a second copy.
+const std::array<std::string_view, 25>& nonConstructibleBuiltinInterfaceNames() {
+    return kNonConstructibleBuiltinInterfaceNames;
+}
+
 bool Resolver::argSatisfiesNew(const TypeRef* arg, bool& decided) {
     decided = false;
     if (!arg) return false;
@@ -7511,6 +7951,32 @@ bool Resolver::argSatisfiesNew(const TypeRef* arg, bool& decided) {
             // populated by ModuleLoader, unlike `decl`) and apply
             // `common::resolveRecordFieldSubst` per member before the
             // `nullable`/`categorize` checks.
+            //
+            // fix #4166 (§14.2/§17.11, v0.295): #4002 substituted a BARE
+            // field (`V: T`), but a field that is ITSELF a Record after
+            // substitution (`In: Inner<T>` in a delegating
+            // `record Outer<T>(In: Inner<T>)`) was still only run through
+            // `categorize()`, which answers "Record ⇒ Value" for ANY
+            // record — true of the record AS A TYPE, but silent on whether
+            // ITS OWN fields are defaultable once ITS generic parameters
+            // are bound.
+            //
+            // fix #4166 review follow-up (v0.298): the first version of
+            // this arm called a LOCAL Resolver method
+            // (`recordFieldTypeHasNoDefault`) that ported only the
+            // Record-kind recursion from `ExprTC::defaultIllFormed`,
+            // leaving its own leaf test at the narrower `categorize() ==
+            // Reference` — which diverges from `defaultIllFormed`'s full
+            // per-kind switch on Enum/Choice/InlineArray and
+            // `isValueBuiltin`-aware Class/Interface (issues #4219,
+            // #4223), and initially had no cycle guard for a
+            // self-referential record (review-caught SIGSEGV). This now
+            // calls the SHARED authority, `sema::typeHasNoDefault`
+            // (TypeResolution.hpp), which `ExprTC::defaultIllFormed`
+            // itself now also forwards to — one implementation, the same
+            // cycle guard, for both the `default` operator's own
+            // well-formedness check and this `where T: new()` constraint
+            // check.
             decided = true;
             bool unresolved = false;
             bool nonDefaultable = false;
@@ -7523,13 +7989,12 @@ bool Resolver::argSatisfiesNew(const TypeRef* arg, bool& decided) {
                 [&](const RecordStorageMember& rsm) {
                     const TypeRef* ft = rsm.type;
                     if (!ft) { unresolved = true; return false; }  // can't verify
-                    const TypeRef* subFt =
-                        common::resolveRecordFieldSubst(ft, fieldEnv).ty;
-                    if (!subFt) { unresolved = true; return false; }
-                    if (subFt->nullable) return true;  // nullable → defaults null
-                    if (categorize(subFt) == TypeCategory::Reference) {
+                    common::RecordSubstEnv::Entry sub =
+                        common::resolveRecordFieldSubst(ft, fieldEnv);
+                    if (!sub.ty) { unresolved = true; return false; }
+                    if (typeHasNoDefault(sub.ty, ctx_, sub.env)) {
                         nonDefaultable = true;
-                        return false;  // non-nullable reference: no default
+                        return false;  // no default at this member
                     }
                     return true;
                 },
@@ -7573,11 +8038,653 @@ bool Resolver::argSatisfiesNew(const TypeRef* arg, bool& decided) {
         }
         if (d->kind == ast::TypeDeclKind::Interface) {
             decided = true;
-            return false;  // interfaces are not constructible (§11.2)
+            return false;  // interfaces are not constructible (§14.2: "Interface
+                            // substitutions never satisfy `new()`")
+        }
+    }
+    // fix #4235 (§14.2/§17.11/§31.4/stdlib §3.3, v0.298): a null-declaration
+    // `Named` arg reaching here has no `TypeSymbol`, so none of the
+    // `arg->declaration` arms above ever ran for it — this is the
+    // TOP-LEVEL substitution case (`Holder<T>` instantiated directly at a
+    // builtin name), distinct from a builtin appearing as a RECORD FIELD,
+    // which the Record arm above already recurses into via
+    // `typeHasNoDefault` (see the `recordStorageMembers` loop a few lines
+    // up). Before this fix, no builtin name was ever consulted here at
+    // all, so a substitution straight at one of them fell through to the
+    // unconditional defer below and was silently ACCEPTED.
+    //
+    // MEASURED (issue #4235, parent `ea66776`): `HolderEINF<ExceptionInfo>
+    // .Make()` under `where T: new()` compiled with no §14.2 diagnostic
+    // and SIGSEGV'd at runtime.
+    //
+    // ⚠ FIRST VERSION OF THIS FIX (reverted — see the broad sweep this
+    // commit's body cites) routed EVERY null-declaration `Named` arg
+    // through `typeHasNoDefault`, reasoning that it would also close the
+    // identically-shaped top-level gap for the collection family
+    // (`Holder<Array<int>>.Make()` was ALSO measured silently accepted on
+    // this same parent). That is a REAL, separate gap, but fixing it that
+    // way was WRONG: §14.2 gives a substitution TWO independent routes to
+    // satisfy `where T: new()` — "class types with a public parameterless
+    // constructor" OR "defaultable value types" — and a stdlib
+    // COLLECTION is documented as the FORMER (stdlib §4.4: `Array<T>` is a
+    // `public class` with a `public constructor()`), never evaluated
+    // against defaultability at the top level. `typeHasNoDefault` answers
+    // the SECOND question only; routing every builtin name through it
+    // MEASURABLY regressed two pinned codegen tests —
+    // `codegen_generic_new_builtin_collection_2017`
+    // (`generic_new_builtin_collection_2017_test.cpp`, whose own comment
+    // quotes exactly this §14.2 class-arm reasoning for `Array`/
+    // `Dictionary`) — which this fix's own broad, no-`--area` sweep
+    // (LANE_RULES §2/§15) caught before landing. `ExceptionInfo` and
+    // `ReadOnlyStringSpan`, by contrast, are `record`s — §14.2's
+    // VALUE-type arm is the only one that could ever apply to them (a
+    // record is never "a class type" for this purpose), so evaluating
+    // exactly these two names against defaultability is correct; every
+    // OTHER null-declaration builtin name is left alone here rather than
+    // guessed at. (`CString`/`WString`/`RawBytes` were separately measured
+    // to ALREADY reject correctly at this exact top-level site on this
+    // corrected version, without this arm ever naming them — some other,
+    // pre-existing path resolves them with a real `declaration` at a
+    // generic-argument position and routes them through the ordinary
+    // Class-kind arm above, unlike a plain type annotation. That
+    // mechanism was not traced further — it predates this fix, this fix
+    // does not disturb it, and there is no measured defect in it — so
+    // it is left alone rather than described speculatively.)
+    if (arg->kind == TypeRef::Kind::Named && !arg->declaration) {
+        std::string_view head = arg->headName();
+        // fix #4235 review send-back (#4245, §14.2/§17.11/stdlib
+        // §4.14/§4.15, v0.298): `Span`/`ReadOnlySpan` (stdlib §4.14) and
+        // `ArraySpan`/`ReadOnlyArraySpan` (stdlib §4.15) are the SAME
+        // shape as `ExceptionInfo`/`ReadOnlyStringSpan` above — builtin
+        // records whose declared field composition makes them
+        // non-defaultable for EVERY `T`, not merely some. `Span<T>`/
+        // `ReadOnlySpan<T>` always carry `Buffer: OwningBuffer<T>`
+        // (stdlib §4.14: `public record Span<T>(Buffer: OwningBuffer<T>,
+        // Start: int, Length: int): ...`) and `ArraySpan<T>`/
+        // `ReadOnlyArraySpan<T>` always carry `Source: Array<T>` (stdlib
+        // §4.15) — `OwningBuffer<T>` and `Array<T>` are both `public
+        // class`es, so the field is class-typed (a non-nullable reference
+        // type, §17.11) regardless of what `T` is substituted with. This
+        // is four more names on the SAME by-name list, for the SAME
+        // reason as the two above — not a re-generalization to a
+        // structural predicate (§25): `Array<T>` itself stays OFF this
+        // list and continues to satisfy `where T: new()` via §14.2's
+        // class arm, never via defaultability (see row (7)/the
+        // regression-pin test this file's suite already carries).
+        if ((head == "ExceptionInfo" || head == "ReadOnlyStringSpan" ||
+             head == "Span" || head == "ReadOnlySpan" ||
+             head == "ArraySpan" || head == "ReadOnlyArraySpan") &&
+            typeHasNoDefault(arg, ctx_, /*incoming=*/nullptr)) {
+            decided = true;
+            return false;
+        }
+        // fix #4294 (§14.2, v0.298): `IGrouping<TKey,T>` (stdlib §5: `public
+        // interface IGrouping<TKey, T>: IEnumerable<T>`) is a null-
+        // declaration builtin (TypeResolution_Names.cpp's arity-2 table,
+        // alongside DictionaryEntry/DrainedEntry — no user `TypeSymbol`), so
+        // it never reaches the TypeSymbol-backed `d->kind ==
+        // ast::TypeDeclKind::Interface` arm above (~line 7939), which
+        // already rejects a REAL interface unconditionally: "decided = true;
+        // return false; // interfaces are not constructible (§14.2:
+        // 'Interface substitutions never satisfy `new()`')".
+        //
+        // This is a DELIBERATE new branch, not a fold into the six-name
+        // block immediately above (§25: ask what a check was validated to
+        // answer, not what it happens to agree with). Those six are
+        // RECORDS, which can fail `new()` only via §14.2's value-type/
+        // defaultability route (gated on `typeHasNoDefault` — a record
+        // could in principle satisfy `new()` if every declared field
+        // defaulted). An interface has no such route at all: §14.2
+        // excludes it categorically, the same unconditional rule the real
+        // TypeSymbol-backed arm above applies, independent of
+        // defaultability. Gating IGrouping through `typeHasNoDefault`
+        // instead would reach the same answer only because this commit
+        // ALSO teaches `typeHasNoDefaultWalk`'s null-declaration arm (below)
+        // that IGrouping is non-defaultable — two independently-true facts
+        // that happen to agree, not one fact reused for its validated
+        // question.
+        //
+        // MEASURED (issue #4294, this file's own parent `f3d3a4d`, clean
+        // tree, `bezelc` rebuilt directly): `HolderIG<IGrouping<string,
+        // int>>.Make()` under `where T: new()` compiled with no §14.2
+        // diagnostic (only the pre-existing #2477/#2491 dead-abstract-
+        // template-body backstop notes) and ran (exit 0) — a silent,
+        // degraded-to-zero accept of a non-constructible substitution.
+        if (head == "IGrouping") {
+            decided = true;
+            return false;  // interfaces are not constructible (§14.2), same
+                            // rule as the TypeSymbol-backed Interface arm
+        }
+        // fix #4309 (§14.2, v0.298; send-back on #4294): the 25-name closed
+        // set of every OTHER null-declaration builtin interface — see
+        // `kNonConstructibleBuiltinInterfaceNames`'s own comment above for
+        // the derivation and why `IGrouping` (just above) and the
+        // TypeSymbol-backed seven (IComparable/IEquatable/
+        // IEqualityComparer/IReadOnlySpan/INumber/ISteppable/IParsable)
+        // are not in it. Same rule as the TypeSymbol-backed Interface arm
+        // and the IGrouping branch immediately above: §14.2, "Interface
+        // substitutions never satisfy `new()` — no constructor exists".
+        //
+        // MEASURED (issue #4309, this file's own parent `e0182bc`, clean
+        // tree, `bezelc` rebuilt directly): e.g. `HolderX<IEnumerable<int>>
+        // .Make()`, `HolderY<IDisposable>.Make()`,
+        // `HolderZ<IOrderedEnumerable<int>>.Make()` under `where T: new()`
+        // all compiled with no §14.2 diagnostic (only the pre-existing
+        // #2477/#2491 dead-abstract-template-body backstop notes) and ran
+        // (exit 0) — the identical silent-accept symptom #4294 fixed for
+        // `IGrouping` alone, reproduced on every other name in the set.
+        if (isNonConstructibleBuiltinInterfaceName(head)) {
+            decided = true;
+            return false;  // interfaces are not constructible (§14.2), same
+                            // rule as the TypeSymbol-backed Interface arm
+        }
+        // fix #4245 (§14.2/§17.11/stdlib §4.8, v0.298): `DictionaryEntry<K,V>`
+        // is handled as its OWN branch, not folded into the six-name list
+        // above, because — unlike those six, which are unconditionally
+        // non-defaultable — `DictionaryEntry<K,V>`'s defaultability is
+        // INSTANTIATION-DEPENDENT (see `typeHasNoDefaultWalk`'s own
+        // null-declaration comment, this file, for the full reasoning and the
+        // `t->genericArgs` recursion this shares). The six-name check above
+        // only ever DECIDES the "does not satisfy" outcome (harmless there,
+        // since none of those six is ever defaultable) — `DictionaryEntry`
+        // needs both outcomes decided: `DictionaryEntry<int,int>` DOES
+        // satisfy `where T: new()` (every field defaults), so `decided` must
+        // be set unconditionally here, not only on the non-defaultable path.
+        //
+        // MEASURED (issue #4245, this file's own parent `8ca85ce`, clean
+        // tree): `HolderDE<DictionaryEntry<string,int>>.Make()` under
+        // `where T: new()` compiled with no §14.2 diagnostic (only the
+        // pre-existing #2477/#2491 dead-abstract-template-body backstop
+        // notes) and SIGSEGV'd at runtime (exit 139) reading `.Key.Length`.
+        if (head == "DictionaryEntry") {
+            decided = true;
+            return !typeHasNoDefault(arg, ctx_, /*incoming=*/nullptr);
         }
     }
     // Built-ins, generic params, function/inline-array args: defer.
     return false;
+}
+
+// fix #4166 review follow-up (§14.2/§17.11/§35.10, v0.298): the shared
+// authority declared in TypeResolution.hpp — see that declaration's
+// comment for the full rationale (why this exists, replacing the first
+// version's Resolver-local `recordFieldTypeHasNoDefault`/
+// `recordFieldTypeHasNoDefaultWalk` pair, and what call sites it unifies).
+// `typeHasNoDefaultWalk` below is a port of `ExprTC::defaultIllFormed`'s
+// full per-kind switch (ExprTypecheck_Exprs.cpp), with THREE deliberate
+// changes from that function's exact prior text:
+//
+//   1. The `seen` cycle guard around the Record-kind recursion (PATH
+//      semantics — insert on entry, erase on exit — keyed by
+//      `const TypeRef*` instantiation identity, mirroring
+//      `common::isBorrowBearingRecordCommon`, OwnershipFacts.cpp, and that
+//      file's fix #3933 for why the key is the instantiation and not the
+//      bare `TypeSymbol*` declaration). `defaultIllFormed` itself had no
+//      such guard; a self-referential record
+//      (`record Self<T>(N: Self<int>, V: T)`) reached through an explicit
+//      `default(...)` SIGSEGVs on it identically to the `where T: new()`
+//      shape this fix's own review caught — this closes both at once,
+//      since `ExprTC::defaultIllFormed` now forwards here too.
+//   2. The Primitive arm now also flags a non-nullable `Object` as
+//      non-defaultable (see that arm's own comment below for why:
+//      `defaultIllFormed`'s prior text deliberately excluded it as a
+//      documented, separate #951-era scope decision, but
+//      `Resolver::argSatisfiesNew`'s pre-existing, tested behavior
+//      correctly rejects it, and unifying in `defaultIllFormed`'s
+//      direction would have silently reintroduced a false accept —
+//      MEASURED regression, caught by this fix's own broad sweep against
+//      `xmod_imported_positional_new_args_3141_test.cpp`).
+//   3. The Named arm's `!t->declaration` branch now falls back to
+//      `isBuiltinTypeName` before deferring (see that branch's own
+//      comment below). `defaultIllFormed`'s prior text unconditionally
+//      returned `false` ("defaultable") for EVERY null-declaration Named
+//      type — both a genuine unresolved generic parameter AND every
+//      always-available builtin (`Array`, `Dictionary`, `Set`, `OwningTask`,
+//      …, TypeResolution_Names.cpp's ~50-name Slice-S24 population, which
+//      is represented with a null declaration precisely because it has no
+//      user `TypeSymbol`). `Resolver::categorize` already distinguished
+//      these via an `astNode`/`builtinTypeArity` fallback;
+//      `argSatisfiesNew`'s pre-hoist, categorize()-based leaf test
+//      inherited that distinction and correctly rejected a builtin-
+//      collection-typed record field under `where T: new()` — the naive
+//      port of `defaultIllFormed`'s text (which never had that
+//      distinction) silently dropped it, a REGRESSION relative to
+//      `argSatisfiesNew`'s own prior behavior review caught with a live
+//      A/B measurement (`record Box(A: Array<int>)`: REJECT on parent
+//      `1e6d80f`, silent ACCEPT on the un-fixed hoist). This is the THIRD
+//      predicate in this run caught misclassifying this same ~50-builtin
+//      population — issue #4229 already tracks two others
+//      (`refMentionsTypeVariable`, `refMentionsAnyOf`), and `fix #4199`
+//      was sent back for a fourth; "no declaration" keeps getting
+//      silently read as "generic parameter only", and it never has been.
+//
+// On a detected cycle this returns `false` ("has a default" — defer, not
+// "non-defaultable"): a self-referential record is ALREADY rejected with
+// its own clean §9 diagnostic by `recordValueContainsSelf`
+// (checkRecordRestrictions, this file), independent of this function, so
+// deferring on the cyclic field lets the walk continue to the record's
+// OTHER fields (e.g. a `V: T` field bound to a non-nullable class still
+// correctly triggers rejection) rather than manufacturing a crash.
+//
+// An unresolved field member (`rsm.type == nullptr`, or a substitution
+// that fails to resolve) is likewise treated as defaultable (defer) —
+// matching `defaultIllFormed`'s own established "unresolved — defer"
+// precedent for the identical case, continuing the walk rather than
+// stopping it.
+namespace {
+
+bool typeHasNoDefaultWalk(const TypeRef* t, const common::RecordSubstEnv* incoming,
+                          SemaContext& ctx,
+                          std::unordered_set<const TypeRef*>& seen) {
+    if (!t || t->nullable) return false;  // nullable defaults to null — OK
+    switch (t->kind) {
+        case TypeRef::Kind::Primitive:
+            // `string`/`Object` are runtime-managed/reference primitives
+            // (§4.6) with no zero; every value primitive (int/bool/char/…)
+            // has a zero.
+            //
+            // fix #4166 review follow-up: `ExprTC::defaultIllFormed`'s
+            // pre-unification version deliberately excluded `Object` here
+            // ("left out... to keep this consistent with the original #951
+            // scope — a separate consideration"), but §17.11's own
+            // "defaultable" definition is unambiguous — "Not defaultable:
+            // non-nullable reference types" — and `Object` (non-nullable,
+            // which is what reaches here; the nullable case already
+            // returned above) is one. `Resolver::argSatisfiesNew` already
+            // correctly rejected a non-nullable `Object`-typed record field
+            // via `categorize()` before this unification (MEASURED:
+            // `record RefRec3141(R: Object, N: int)` under
+            // `where T: new()`, tests/module/
+            // xmod_imported_positional_new_args_3141_test.cpp) — including
+            // it here, rather than porting the narrower exclusion, is what
+            // keeps that existing, correct, spec-cited rejection working
+            // under the shared function.
+            return t->primitive == PrimitiveType::String ||
+                   t->primitive == PrimitiveType::Object;
+        case TypeRef::Kind::Function:
+            return true;  // a function value (§28.9) has no zero
+        case TypeRef::Kind::InlineArray: {
+            common::RecordSubstEnv::Entry sub =
+                common::resolveRecordFieldSubst(t->arrayElement, incoming);
+            return typeHasNoDefaultWalk(sub.ty, sub.env, ctx, seen);
+        }
+        case TypeRef::Kind::Named: {
+            if (!t->declaration) {
+                // fix #4166 review follow-up #3 (§2.3/§14.2, v0.298): a
+                // null-declaration Named type is NOT only a generic param
+                // or an unresolved name — it is also how EVERY
+                // always-available builtin (`Array`, `OwningArray`,
+                // `Dictionary`, `Set`, `SortedDictionary`, `OwningTask`,
+                // and the rest of the ~50-name Slice-S24 population,
+                // TypeResolution_Names.cpp) is represented: that file's own
+                // comment says they "have no user TypeSymbol, so we record
+                // a Named ref with a null declaration".
+                //
+                // MEASURED gap this closes: `record BoxArr(A: Array<int>)`
+                // used at a `where T: new()` site — REJECT on parent
+                // `1e6d80f`, silently ACCEPT on this fix before this
+                // change (the unconditional `return false` two lines
+                // below never consulted anything about the builtin name).
+                //
+                // review's literal suggestion — mirror `categorize()`'s
+                // `astNode`/`builtinTypeArity` fallback, which flags EVERY
+                // builtin as a non-defaultable reference type — was TRIED
+                // and REVERTED: `categorize()` does not distinguish
+                // VALUE builtins (`Guid`, `IntPtr`, `DateTime`, …) from
+                // REFERENCE ones (`Array`, `Dictionary`, …) either — a
+                // separate, pre-existing imprecision in `categorize()`
+                // itself, out of scope here — and mirroring it broke
+                // `default(Guid)` / `default(IntPtr)`
+                // (tests/lit/builtin_closed_ctor_surface_accept_2994.bzl),
+                // which `defaultIllFormed`'s ORIGINAL text had always
+                // accepted (ITS null-declaration branch returned `false`
+                // unconditionally, for every null-declaration builtin, not
+                // narrowly — so this was passing by accident of a blanket
+                // accept, not by any deliberate Guid/IntPtr handling).
+                //
+                // So this checks by NAME against the STDLIB COLLECTION
+                // FAMILY specifically (docs/Bezel_For_Code_Generation.md's
+                // collection-family table — the borrowing forms and their
+                // `Owning*` counterparts) plus `Task`/`OwningTask` — the
+                // exact population review's own repro named, and the
+                // ONLY subset this fix's own regression sweep (including
+                // the full 2311-test lit diagnostic track) verifies stays
+                // correct on both the `where T: new()` and `default(...)`
+                // paths. A complete, verified value-vs-reference table for
+                // the FULL null-declaration builtin population (~50 names)
+                // is future work, not attempted here — narrower-but-correct
+                // over broader-but-regressing.
+                //
+                // A leaf that returns unconditionally on the FIRST line of
+                // a branch, with no fallback for the builtin population at
+                // all, is a recurring shape this run has hit before —
+                // #4229 (`refMentionsTypeVariable`, `refMentionsAnyOf`) and
+                // the returned `fix #4199` — so this walk joins that
+                // family; the next predicate over a null-declaration Named
+                // type should check that issue before assuming "no
+                // declaration" means "generic parameter", AND should
+                // verify against `default(...)`-context tests too, not
+                // only `where T: new()` ones — this fix's own first
+                // attempt did not, and it cost a lit-track regression.
+                if (t->astNode && t->astNode->name &&
+                    t->astNode->name->parts.size() == 1) {
+                    std::string_view head = t->headName();
+                    if (head == "Array" || head == "OwningArray" ||
+                        head == "Dictionary" || head == "OwningDictionary" ||
+                        head == "Set" || head == "OwningSet" ||
+                        head == "SortedDictionary" || head == "SortedSet" ||
+                        head == "Stack" || head == "OwningStack" ||
+                        head == "Queue" || head == "OwningQueue" ||
+                        head == "LinkedList" || head == "OwningLinkedList" ||
+                        head == "Task" || head == "OwningTask") {
+                        return true;  // heap collection/task: no default
+                    }
+                    // fix #4166 review follow-up #3b (stdlib §10.1, v0.298):
+                    // `CString`/`WString`/`RawBytes` — the §10 FFI-boundary
+                    // classes, resolved through this SAME null-declaration
+                    // path (TypeResolution_Names.cpp:390, one combined
+                    // check with these three names) — "none has a public
+                    // constructor" (stdlib §10.1/§10.2/§10.3), so like the
+                    // collection family above they are non-nullable
+                    // reference types with no default. MEASURED: `record
+                    // Box(C: CString, N: int)` under `where T: new()` /
+                    // `default(...)` compiled clean (exit 0) and, when
+                    // `.Length` was read on the zero-initialized field,
+                    // SIGSEGV'd (exit 139) — identically reproduced on
+                    // parent `1e6d80f` (this defect predates this whole
+                    // fix chain; it was never introduced or worsened by
+                    // it, only left unmeasured). `WString`/`RawBytes` did
+                    // not crash on the SAME `.Length` probe (their layout
+                    // apparently tolerates a null-initialized internal
+                    // pointer for that one accessor), but the §17.11
+                    // classification is identical for all three — a
+                    // non-nullable reference type with no public
+                    // constructor is not defaultable regardless of
+                    // whether a given accessor happens to fault.
+                    //
+                    // NOT reused: `isFfiBoundaryNamedType` (this file,
+                    // ~8869) groups these three with `IntPtr`/`UIntPtr` —
+                    // correctly, for ITS question ("is this type
+                    // FFI-signature-compatible", §32.5). `IntPtr`/`UIntPtr`
+                    // ARE defaultable (value types; `default(IntPtr)` is
+                    // pinned accepted by
+                    // tests/lit/builtin_closed_ctor_surface_accept_2994.bzl),
+                    // so answering MY question ("is this type
+                    // defaultable") with that predicate would have
+                    // wrongly flagged `IntPtr`/`UIntPtr` too — precisely
+                    // the §25 trap ("what was this predicate validated to
+                    // answer, not what it correlates with") this fix's
+                    // own review already caught once this cycle for
+                    // `categorize()`'s builtin fallback.
+                    if (head == "CString" || head == "WString" ||
+                        head == "RawBytes") {
+                        return true;  // FFI-boundary class: no default
+                    }
+                    // fix #4235 (§17.11/§31.4/stdlib §3.3, v0.298): a
+                    // DIFFERENT reason than the two blocks above — those are
+                    // non-defaultable because they ARE reference types
+                    // (collections) or declare no public constructor (FFI
+                    // classes); `ExceptionInfo` and `ReadOnlyStringSpan` are
+                    // ordinary VALUE-shaped records (§17.11's Record arm
+                    // would apply to them exactly as it does to any local
+                    // record, if they had a real `TypeSymbol` to recurse
+                    // into) whose declared fields happen to include at
+                    // least one non-nullable `string` — a Reference
+                    // primitive (§17.11), hence non-defaultable by the
+                    // SAME per-field rule the Record-kind arm below applies
+                    // to a user record.
+                    //
+                    // `record ExceptionInfo(TypeName: string, Message:
+                    // string, StackTrace: string)` (§31.4) — all three
+                    // fields are non-nullable `string`.
+                    // `record ReadOnlyStringSpan(Source: string, Start:
+                    // int, Length: int): IReadOnlySpan<char>` (stdlib
+                    // §3.3) — `Source` is a non-nullable `string`; `Start`/
+                    // `Length` would default fine alone, but §17.11 needs
+                    // only ONE non-defaultable declared field ("a record
+                    // any of whose declared fields is not defaultable").
+                    // Field names/arities are pinned by
+                    // `BuiltinRegistry.cpp`'s `kBuiltinCtorParamNames`
+                    // (`{"ExceptionInfo", ..., {"TypeName", "Message",
+                    // "StackTrace", ""}}`, `{"ReadOnlyStringSpan", ...,
+                    // {"Source", "Start", "Length", ""}}`) — the same
+                    // fixed, closed shapes §17.7's own closed-constructor-
+                    // surface rule already relies on.
+                    //
+                    // Both are, like the collection/FFI names above,
+                    // resolved through this null-declaration path with no
+                    // real `TypeSymbol` (TypeResolution_Names.cpp), so
+                    // there is no `recordStorageMembers` walk to recurse
+                    // into for them — the field composition is hardcoded
+                    // here rather than walked, since it is fixed and
+                    // spec-declared, not user-editable.
+                    //
+                    // MEASURED on parent `ea66776` (issue #4235): `default(
+                    // ExceptionInfo)` compiled clean and SIGSEGV'd (exit
+                    // 139) on `.TypeName.Length`; `default(
+                    // ReadOnlyStringSpan)` compiled with only the #2491
+                    // degraded-value backstop and silently read `.Length`
+                    // as 0 instead of the expected value — the exact
+                    // null-string-deref class already fixed here for
+                    // `CString`/`WString`/`RawBytes`, just for two names
+                    // outside that scoped list. See
+                    // `Resolver::argSatisfiesNew`'s own comment (this
+                    // file) for the THIRD symptom this issue reported —
+                    // `where T: new()` accepting these two names at a
+                    // TOP-LEVEL substitution never reaches this walk at
+                    // all, and needed its own fix.
+                    // fix #4235 review send-back (#4245, §17.11/stdlib
+                    // §4.14/§4.15, v0.298): `Span`/`ReadOnlySpan` (stdlib
+                    // §4.14) and `ArraySpan`/`ReadOnlyArraySpan` (stdlib
+                    // §4.15) are the SAME shape as `ExceptionInfo`/
+                    // `ReadOnlyStringSpan` immediately above, one level up
+                    // in this same block: builtin records with an
+                    // always-non-defaultable declared field. `Span<T>`/
+                    // `ReadOnlySpan<T>` always carry a non-nullable
+                    // class-typed `Buffer: OwningBuffer<T>` (stdlib §4.14);
+                    // `ArraySpan<T>`/`ReadOnlyArraySpan<T>` always carry a
+                    // non-nullable class-typed `Source: Array<T>` (stdlib
+                    // §4.15) — both fields are class-typed regardless of
+                    // `T`'s category, so all four are non-defaultable for
+                    // EVERY instantiation, exactly like the fixed-shape
+                    // records above; no per-`T` recursion is needed (this
+                    // walker has no `TypeSymbol` to recurse into for a
+                    // null-declaration builtin anyway).
+                    //
+                    // MEASURED (issue #4245; re-verified identically on
+                    // this file's own parent `9ba93e3` before this edit):
+                    // `default(Span<int>)`, `default(ReadOnlySpan<int>)`,
+                    // `default(ArraySpan<int>)`, `default(
+                    // ReadOnlyArraySpan<int>)` all compiled clean (exit 0)
+                    // and ran clean (exit 0), `.Length` silently reading
+                    // back 0 instead of being rejected — the same
+                    // degrade-to-zero symptom already measured above for
+                    // `ReadOnlyStringSpan`. The `where T: new()` top-level
+                    // substitution axis was WORSE: `HolderSpan<Span<int>>
+                    // .Make()` (and the sibling ReadOnlySpan/ArraySpan/
+                    // ReadOnlyArraySpan substitutions) crashed the
+                    // COMPILER ITSELF (SIGSEGV, `Emitter::lowerExprInner`,
+                    // `LlvmBackend_Exprs.cpp:3830`, `CreateExtractValue`
+                    // on a bad aggregate) rather than the generated
+                    // program — see `Resolver::argSatisfiesNew`'s own
+                    // comment (this file) for that axis's fix; rejecting
+                    // here means `default(...)`/the record-field recursion
+                    // never reaches codegen with an unmonomorphized
+                    // builtin type parameter in the first place.
+                    //
+                    if (head == "ExceptionInfo" ||
+                        head == "ReadOnlyStringSpan" ||
+                        head == "Span" || head == "ReadOnlySpan" ||
+                        head == "ArraySpan" || head == "ReadOnlyArraySpan") {
+                        return true;  // non-nullable string/class field(s): no default
+                    }
+                    // fix #4294 (§17.11, v0.298): `IGrouping<TKey,T>` (stdlib
+                    // §5: `public interface IGrouping<TKey, T>: IEnumerable
+                    // <T>`) is, like the six names immediately above,
+                    // unconditionally non-defaultable — but for a DIFFERENT
+                    // reason, so it gets its own check rather than joining
+                    // their list: those six are RECORDS whose declared
+                    // FIELDS happen to include a non-nullable one; IGrouping
+                    // is an INTERFACE, which §17.11 classifies as a non-
+                    // nullable reference type outright, with no field
+                    // composition to inspect at all. This is exactly the
+                    // reasoning the TypeSymbol-backed arm below already
+                    // applies to any REAL interface (`k == Class || k ==
+                    // Interface -> return !t->declaration->isValueBuiltin` —
+                    // true for every interface, since there is no such thing
+                    // as a "value builtin interface"); IGrouping needs the
+                    // identical conclusion because it has no `TypeSymbol` to
+                    // reach that arm through (it is a null-declaration
+                    // builtin, TypeResolution_Names.cpp's arity-2 table,
+                    // alongside DictionaryEntry/DrainedEntry).
+                    //
+                    // MEASURED (issue #4294, this file's own parent
+                    // `f3d3a4d`, clean tree, `bezelc` rebuilt directly):
+                    // `default(IGrouping<string, int>)` compiled clean (exit
+                    // 0) and ran clean (exit 0) — a silent, unrejected
+                    // zero-initialized value where §17.11 ("Not defaultable:
+                    // non-nullable reference types") requires a compile-time
+                    // error.
+                    if (head == "IGrouping") {
+                        return true;  // interface: non-nullable reference
+                                      // type (§17.11), unconditionally
+                    }
+                    // fix #4309 (§17.11, v0.298; send-back on #4294): the
+                    // 25-name closed set of every OTHER null-declaration
+                    // builtin interface — see
+                    // `kNonConstructibleBuiltinInterfaceNames`'s own
+                    // comment (this file, above `Resolver::
+                    // argSatisfiesNew`) for the derivation and why
+                    // `IGrouping` (just above) and the TypeSymbol-backed
+                    // seven are not in it. Same rule as the TypeSymbol-
+                    // backed arm below (`k == Class || k == Interface ->
+                    // return !isValueBuiltin`, unconditionally true for
+                    // every interface): §17.11, "Not defaultable:
+                    // non-nullable reference types".
+                    //
+                    // MEASURED (issue #4309, this file's own parent
+                    // `e0182bc`, clean tree, `bezelc` rebuilt directly):
+                    // e.g. `default(IEnumerable<int>)`,
+                    // `default(IDisposable)`,
+                    // `default(IOrderedEnumerable<int>)` all compiled
+                    // clean (exit 0) and ran clean (exit 0) — the identical
+                    // silent zero-initialized-value symptom #4294 fixed for
+                    // `IGrouping` alone, reproduced on every other name in
+                    // the set.
+                    if (isNonConstructibleBuiltinInterfaceName(head)) {
+                        return true;  // interface: non-nullable reference
+                                      // type (§17.11), unconditionally
+                    }
+                    // fix #4245 (§17.11/stdlib §4.8, v0.298): `DictionaryEntry<K,V>`
+                    // is a DIFFERENT shape from the six names above — those are
+                    // non-defaultable UNCONDITIONALLY (a fixed class/string field
+                    // independent of the substitution). `DictionaryEntry<K,V>`'s
+                    // declared fields ARE its own generic parameters (stdlib §4.8:
+                    // "public record DictionaryEntry<K, V>(Key: K, Value: V);" —
+                    // `Key: K`, `Value: V`, no wrapping), so its defaultability is
+                    // INSTANTIATION-DEPENDENT: `DictionaryEntry<int,int>` IS
+                    // defaultable (every field defaults); `DictionaryEntry<string,
+                    // int>` is NOT (`Key: string` has no default, §17.11) — the
+                    // exact same per-field rule the Record-kind arm below applies
+                    // to a user record, just with no `TypeSymbol` to
+                    // `recordStorageMembers`-walk.
+                    //
+                    // This null-declaration leaf still doesn't need a
+                    // `seedRecordSubstEnv` call (that needs an `ast::TypeDecl`/
+                    // `TypeSymbol`, which `DictionaryEntry` has neither) — because
+                    // unlike an arbitrary generic record, whose fields may compose
+                    // their generic parameters into some other shape entirely,
+                    // `DictionaryEntry`'s two "virtual fields" ARE the identity of
+                    // K/V. `t->genericArgs` is already exactly what a
+                    // `recordStorageMembers` walk would have produced: the
+                    // resolved, substituted-at-THIS-use-site K/V
+                    // (`TypeResolution_Names.cpp`'s builtin-arity branch populates
+                    // `ref.genericArgs` via `resolveType`, same as every other
+                    // null-declaration builtin generic argument). Each is still run
+                    // through `common::resolveRecordFieldSubst(ga, incoming)` —
+                    // the SAME substitution primitive the Record-kind arm below
+                    // uses, not a new mechanism — so a K/V that is itself a bare,
+                    // not-yet-substituted OUTER generic parameter (DictionaryEntry
+                    // appearing as a field of some other generic record, `incoming`
+                    // carrying that record's own env) still resolves correctly.
+                    //
+                    // MEASURED (issue #4245, this file's own parent `8ca85ce`,
+                    // clean tree): `default(DictionaryEntry<string, int>)` compiled
+                    // clean (exit 0) and SIGSEGV'd at runtime (exit 139) reading
+                    // `.Key.Length`.
+                    if (head == "DictionaryEntry" && t->genericArgs.size() == 2) {
+                        for (const TypeRef* ga : t->genericArgs) {
+                            common::RecordSubstEnv::Entry sub =
+                                common::resolveRecordFieldSubst(ga, incoming);
+                            if (typeHasNoDefaultWalk(sub.ty, sub.env, ctx, seen))
+                                return true;
+                        }
+                        return false;  // both Key/Value defaultable
+                    }
+                }
+                return false;  // generic param / unresolved / other builtin — defer
+            }
+            auto k = t->declaration->kind;
+            // fix #3108 (§16.3/§16.4): `default(Range<T>)` is a compile
+            // error — the all-zero default would falsify Range's own "no
+            // zero-step" invariant. Checked before the general Class/
+            // Interface arm so the builtin isn't admitted through
+            // `!isValueBuiltin` (Range IS a value builtin).
+            if (t->declaration == ctx.builtinClassSym("Range")) return true;
+            if (k == ast::TypeDeclKind::Class ||
+                k == ast::TypeDeclKind::Interface)
+                return !t->declaration->isValueBuiltin;
+            // fix #3044 (§17.11): `default(E)` is a compile error for an
+            // enum with no declared constant of underlying value 0. An
+            // enum whose declared-value set cannot be decided is treated
+            // as well-formed (conservative — matches enumHasZeroConstant's
+            // own documented default).
+            if (k == ast::TypeDeclKind::Enum) {
+                std::optional<bool> hasZero =
+                    enumHasZeroConstant(*t->declaration);
+                return hasZero && !*hasZero;
+            }
+            // §35.10 (v0.200, #2044): every choice type is non-defaultable,
+            // independent of substitution.
+            if (k == ast::TypeDeclKind::Choice) return true;
+            if (k == ast::TypeDeclKind::Record) {
+                if (!seen.insert(t).second) return false;  // cycle: defer
+                common::RecordSubstEnv env;
+                common::seedRecordSubstEnv(*t->declaration, *t, incoming, env);
+                const common::RecordSubstEnv* fieldEnv =
+                    env.map.empty() ? nullptr : &env;
+                bool illFormed = false;
+                recordStorageMembers(
+                    t->declaration, ctx,
+                    [&](const RecordStorageMember& rsm) {
+                        if (!rsm.type) return true;  // unresolved — defer
+                        common::RecordSubstEnv::Entry sub =
+                            common::resolveRecordFieldSubst(rsm.type,
+                                                            fieldEnv);
+                        if (typeHasNoDefaultWalk(sub.ty, sub.env, ctx,
+                                                 seen)) {
+                            illFormed = true;
+                            return false;  // stop
+                        }
+                        return true;
+                    },
+                    /*env=*/nullptr);
+                seen.erase(t);  // PATH semantics — see the header comment
+                return illFormed;
+            }
+            return false;
+        }
+        default:
+            return false;  // Unit / Error
+    }
+}
+
+}  // namespace
+
+bool typeHasNoDefault(const TypeRef* t, SemaContext& ctx,
+                      const common::RecordSubstEnv* incoming) {
+    std::unordered_set<const TypeRef*> seen;
+    return typeHasNoDefaultWalk(t, incoming, ctx, seen);
 }
 
 namespace {
@@ -11674,17 +12781,152 @@ bool isStaticallyDefaultExpr(const ast::Expr* e) {
     return dynamic_cast<const ast::DefaultExpr*>(e) != nullptr;
 }
 
+// fix #3973 (§9.7, v0.295): a positional slot (record field / choice
+// payload) whose OWN resolved type `pft` is not directly reference-typed
+// (`staticReadonlyFieldIsReferenceTyped(pft, ctx)` is false) may still
+// carry a nested borrow. Two shapes reach here:
+//
+//   (a) `pft` is a Named type with a REAL TypeSymbol declaration of kind
+//       Record or Choice — an ordinary user-declared (or imported) nested
+//       record/choice. Recurse into its own `new T(...)` initializer via
+//       `checkStaticReadonlyRecordInit` (mutual recursion — forward-
+//       declared above).
+//
+//   (b) `pft` is one of the four builtin span views (`Span<T>`,
+//       `ReadOnlySpan<T>`, `ArraySpan<T>`, `ReadOnlyArraySpan<T>` — stdlib
+//       §4.14/§4.15). MEASURED: despite being ordinary `record`
+//       declarations in the stdlib's own prose, these are represented
+//       internally as declaration-LESS Named TypeRefs (`BuiltinRegistry.cpp`'s
+//       `kNonHeapReservedBuiltins` / `kBuiltinCtorParamNames` — a compiler-
+//       intrinsic `{ptr, i32, i32}` shape with no `TypeSymbol`, the exact
+//       same representation `common::isBorrowBearingRecordOrSpan` documents
+//       and recognizes by NAME rather than by walking fields), so shape (a)'s
+//       `recordPositionalFieldSymbols`/`choiceCasesOf` recursion cannot
+//       descend into one — there is no TypeSymbol to enumerate fields from.
+//       Handled by name instead: each of the four heads' own FIRST
+//       constructor argument (`Buffer` for `Span`/`ReadOnlySpan`, `Source`
+//       for `ArraySpan`/`ReadOnlyArraySpan` — `kBuiltinCtorParamNames`'s
+//       rows for these four heads, all four "lowered by POSITION", so a
+//       reorder via named arguments is independently rejected and index 0
+//       is always the backing reference) is the live borrow of its backing
+//       `Array`/`OwningBuffer`; the trailing `Start`/`Length` arguments are
+//       plain ints, irrelevant to §9.7.
+//
+// Returns true iff a diagnostic was reported.
+//
+// fix #4164 (§9.7, v0.295): `incoming` is `pft`'s OWN substitution
+// environment — the caller already resolved `pft` via
+// `common::resolveRecordFieldSubst(rawPft, callerFieldEnv)`, whose returned
+// `Entry::env` is precisely the environment `pft`'s own bare-parameter
+// mentions resolve through (unchanged to `callerFieldEnv` itself when `pft`
+// is a COMPOUND type such as `InnerCG<T>`, per that function's contract).
+// Threading it into the nested frame's own `seedRecordSubstEnv` call below
+// (instead of the previous hardcoded `nullptr`) is the "one composition
+// hop" `common::RecordSubstEnv::Entry::env` exists for — mirrors
+// `common::isBorrowBearingRecordCommon`'s own walk, the ORIGINAL consumer of
+// `RecordSubstEnv`, which already threads its `env` parameter the same way
+// when recursing into a Record-kind field (`recordFieldTypeIsBorrowCarryingCommon`,
+// src/common/OwnershipFacts.cpp). Before this fix `incoming` did not exist
+// here at all and every nested frame seeded from `nullptr`, so a compound
+// field mentioning the ENCLOSING generic's own bare parameter (`I:
+// InnerCG<T>` as a field of `OuterCG<T>`) recursed with `T` still
+// unresolved, and the leaf field's own bare mention had nothing left to
+// substitute it with (issue #4164's exact diagnosis).
+bool checkNestedBorrowBearingSlot(
+    SemaContext& ctx, const TypeRef* pft, const common::RecordSubstEnv* incoming,
+    const ast::Expr* argExpr, SourceLocation loc, std::string_view what,
+    std::string_view name) {
+    if (!pft || pft->kind != TypeRef::Kind::Named) return false;
+    if (pft->declaration) {
+        if (pft->declaration->kind != ast::TypeDeclKind::Record &&
+            pft->declaration->kind != ast::TypeDeclKind::Choice)
+            return false;
+        if (auto* nestedNew = dynamic_cast<const ast::NewExpr*>(argExpr))
+            return checkStaticReadonlyRecordInit(ctx, *nestedNew, pft,
+                                                 incoming, loc, what, name);
+        // fix #4134 (§9.7, v0.295): a nested slot whose OWN type is a
+        // Choice is never initialized with a `new` expression (choices
+        // have no constructors, §35.1) — its real spelling is a case CALL
+        // (`Type.Case(...)`). Recognize that spelling here too, exactly as
+        // `checkStaticReadonlyNullSource`'s own top-level gate now does,
+        // so a record/choice field of choice type is not silently
+        // skipped just because it is one level down.
+        if (pft->declaration->kind == ast::TypeDeclKind::Choice) {
+            if (auto* nestedCall = dynamic_cast<const ast::CallExpr*>(argExpr)) {
+                Symbol* calleeSym = ctx.exprSymbol(*nestedCall->callee);
+                if (auto* ccs = dynamic_cast<ChoiceCaseSymbol*>(calleeSym))
+                    return checkStaticReadonlyChoiceCaseInit(ctx, *nestedCall,
+                                                             ccs, pft,
+                                                             incoming, loc,
+                                                             what, name);
+            }
+        }
+        return false;
+    }
+    // Declaration-less: only the four builtin span views are handled; every
+    // other declaration-less Named type (Array<T>, Channel<T>, a bare
+    // still-uninstantiated generic parameter, …) is not itself a nested
+    // record/choice and is left alone (unreachable via this predicate's
+    // caller anyway, since `staticReadonlyFieldIsReferenceTyped` already
+    // classifies every OTHER declaration-less builtin as reference-typed —
+    // see its own `Kind::Named, !rt->declaration` arm above — so control
+    // only reaches here when that check already answered false).
+    const std::string_view h = pft->headName();
+    std::string_view backingFieldName;
+    if (h == "Span" || h == "ReadOnlySpan") backingFieldName = "Buffer";
+    else if (h == "ArraySpan" || h == "ReadOnlyArraySpan") backingFieldName = "Source";
+    else return false;
+    auto* nestedNew = dynamic_cast<const ast::NewExpr*>(argExpr);
+    if (!nestedNew || nestedNew->args.empty()) return false;
+    if (isStaticallyNullExpr(nestedNew->args[0].value.get())) return false;
+    ctx.diagnostics().report(
+        Severity::Error, loc,
+        std::string("static readonly ") + std::string(what) + " `" +
+        std::string(name) + "` has record value with non-null "
+        "reference-typed field `" + std::string(backingFieldName) +
+        "`; §9.7 requires the null-source form (every reference-typed "
+        "component must be null) (§22.12 rule 4 residual + \xC2\xA7""9.7, "
+        "v0.265, #3273 / #3290)");
+    return true;
+}
+
 // Walk the positional arguments of a `new Tok(...)` expression against the
 // record/choice's field/payload shape and verify every reference-typed
 // component is null. Named-argument or positional-only mismatches are
 // reported at the call site. `loc` is the `NewExpr` site; the diagnostic
-// uses it as a fallback when argument resolution is impossible.
-void checkStaticReadonlyRecordInit(
+// uses it as a fallback when argument resolution is impossible. Returns
+// true iff a diagnostic was reported — callers (including this function's
+// own recursive calls) use this to stop after the first, preserving the
+// "one diagnostic per site" contract.
+//
+// fix #3973 (§9.7, v0.295): this walk was originally SHALLOW / one level —
+// a positional field/payload slot whose OWN resolved type is itself a
+// record or choice was always treated as value-typed (records and choices
+// of value types are values) and skipped outright, with no look at what
+// that nested record/choice itself contains. So a slot that is ITSELF a
+// borrow-bearing record — the canonical case being any of the span views
+// (`Span<T>` / `ReadOnlySpan<T>` / `ArraySpan<T>` / `ReadOnlyArraySpan<T>`,
+// ordinary user-level records per stdlib §4.14/§4.15) nested as a field,
+// e.g. `SpanHolder(V: ReadOnlyArraySpan<int>)` — got zero §9.7 enforcement
+// no matter what its own constructor argument held. Fixed by recursing:
+// when a slot's type is itself Named with a Record or Choice declaration,
+// and the slot's own initializer expression is statically a `new T(...)`,
+// re-run this same per-slot walk against THAT nested `NewExpr`'s own
+// arguments. The recursion is structurally bounded — no separate depth
+// limit is needed — because neither a record nor a choice may transitively
+// contain itself by value (§9 / #1272 for records; §35.1 / #2208 for
+// choices; both enforced at declaration time by
+// `Resolver::recordValueContainsSelf`, ~line 1716 above). A nested slot's
+// initializer that is NOT statically a `new T(...)` (a variable, a call
+// result, `null`, `default(...)`) is left alone, matching this function's
+// own top-level caller's policy just above (the static analysis cannot
+// disprove null-source for a non-trivial initializer).
+bool checkStaticReadonlyRecordInit(
     SemaContext& ctx, const ast::NewExpr& nx, const TypeRef* declTy,
-    SourceLocation loc, std::string_view what,
-    std::string_view name) {
+    const common::RecordSubstEnv* incoming, SourceLocation loc,
+    std::string_view what, std::string_view name) {
     if (!declTy || declTy->kind != TypeRef::Kind::Named || !declTy->declaration)
-        return;
+        return false;
     const TypeSymbol* ts = declTy->declaration;
     // fix #3970 (§9.7/§22.12 rule 4, v0.294): this used to cast
     // `declTy->declaration->decl` to an `ast::TypeDecl` and walk ITS
@@ -11712,25 +12954,70 @@ void checkStaticReadonlyRecordInit(
         const std::vector<const Symbol*> fields =
             recordPositionalFieldSymbols(ts);
         std::size_t arity = fields.size();
-        if (nx.args.size() != arity) return;  // mismatch — typecheck reports
+        if (nx.args.size() != arity) return false;  // mismatch — typecheck reports
+        // fix #4133 (§9.7, v0.295): `storageComponentType` reads a field's
+        // type off the DECLARATION side, so a generic record's field
+        // declared as a bare type parameter (`V: T` in `record
+        // Box<T>(V: T)`) resolves to the unsubstituted `T` regardless of
+        // what THIS instantiation (`declTy`) actually binds `T` to —
+        // `staticReadonlyFieldIsReferenceTyped` can then never classify it
+        // as reference-typed, no matter how reference-heavy the concrete
+        // instantiation is. Seed a `common::RecordSubstEnv` from `ts`'s own
+        // generic parameters against `declTy`'s concrete `genericArgs` —
+        // the SAME machinery fix #4002 uses for the identically-shaped
+        // `where T: new()` gap (this file's `where T: new()` arm, ~line
+        // 7543) — and substitute each field's type through it before
+        // classifying. `seedRecordSubstEnv`/`resolveRecordFieldSubst` are
+        // no-ops (empty map / unchanged `ft`) for a non-generic record or
+        // an unresolved/uninstantiated use, so this is exactly the prior
+        // behaviour whenever there is nothing to substitute.
+        // fix #4164 (§9.7, v0.295): seed THIS frame's env through `incoming`
+        // (the enclosing frame's env, null at the top of the recursion)
+        // rather than a hardcoded `nullptr` — `declTy`'s own `genericArgs`
+        // may themselves be bare mentions of an ENCLOSING generic's
+        // parameter (`declTy == InnerCG<T>` when `T` is `OuterCG`'s own
+        // parameter), and `seedRecordSubstEnv` already resolves each
+        // argument through its `incoming` param before storing it (see its
+        // header contract's "one composition hop") — the same composition
+        // `common::isBorrowBearingRecordCommon` already performs for the
+        // §9.7 dangling-borrow check.
+        common::RecordSubstEnv env;
+        common::seedRecordSubstEnv(*ts, *declTy, incoming, env);
+        const common::RecordSubstEnv* fieldEnv =
+            env.map.empty() ? nullptr : &env;
         for (std::size_t i = 0; i < arity; ++i) {
-            const TypeRef* pft = storageComponentType(fields[i], ctx);
+            const TypeRef* rawPft = storageComponentType(fields[i], ctx);
+            if (!rawPft) continue;
+            const common::RecordSubstEnv::Entry sub =
+                common::resolveRecordFieldSubst(rawPft, fieldEnv);
+            const TypeRef* pft = sub.ty;
             if (!pft) continue;
-            if (!staticReadonlyFieldIsReferenceTyped(pft, ctx)) continue;
-            if (isStaticallyNullExpr(nx.args[i].value.get())) continue;
-            // Non-null reference-typed field: reject.
-            std::string pname = std::string(fields[i]->name);
-            ctx.diagnostics().report(
-                Severity::Error, loc,
-                std::string("static readonly ") + std::string(what) + " `"
-                + std::string(name) + "` has record value with non-null "
-                "reference-typed field `" + pname + "`; §9.7 requires the "
-                "null-source form (every reference-typed component must be "
-                "null) (§22.12 rule 4 residual + \xC2\xA7""9.7, v0.265, "
-                "#3273 / #3290)");
-            return;  // one diagnostic per site
+            const ast::Expr* argExpr = nx.args[i].value.get();
+            if (staticReadonlyFieldIsReferenceTyped(pft, ctx)) {
+                if (isStaticallyNullExpr(argExpr)) continue;
+                // Non-null reference-typed field: reject.
+                std::string pname = std::string(fields[i]->name);
+                ctx.diagnostics().report(
+                    Severity::Error, loc,
+                    std::string("static readonly ") + std::string(what) + " `"
+                    + std::string(name) + "` has record value with non-null "
+                    "reference-typed field `" + pname + "`; §9.7 requires the "
+                    "null-source form (every reference-typed component must be "
+                    "null) (§22.12 rule 4 residual + \xC2\xA7""9.7, v0.265, "
+                    "#3273 / #3290)");
+                return true;  // one diagnostic per site
+            }
+            // fix #3973: `pft` is not itself reference-typed, but it may be
+            // a NESTED record/choice (or one of the four declaration-less
+            // builtin span views) that carries a reference-typed component
+            // further down. fix #4164: thread `sub.env` — `pft`'s own
+            // substitution environment — down as the nested frame's
+            // `incoming` (see `checkNestedBorrowBearingSlot`'s header).
+            if (checkNestedBorrowBearingSlot(ctx, pft, sub.env, argExpr, loc,
+                                             what, name))
+                return true;
         }
-        return;
+        return false;
     }
     if (ts->kind == ast::TypeDeclKind::Choice) {
         // For a choice, only the case being constructed is null-source at
@@ -11739,6 +13026,15 @@ void checkStaticReadonlyRecordInit(
         // resolution we can only conservatively accept (the constructor's
         // shape must be inspected case by case, which a value-site check
         // before typecheck could not do).
+        // fix #4133 (§9.7, v0.295): same generic-substitution gap as the
+        // record arm above, applied to a choice's payload fields — see that
+        // arm's comment for the full rationale.
+        // fix #4164 (§9.7, v0.295): thread `incoming` here too — see the
+        // record arm's comment just above for the full rationale.
+        common::RecordSubstEnv env;
+        common::seedRecordSubstEnv(*ts, *declTy, incoming, env);
+        const common::RecordSubstEnv* fieldEnv =
+            env.map.empty() ? nullptr : &env;
         for (const ChoiceCaseSymbol* cs : choiceCasesOf(ts)) {
             if (!cs->caseDecl) continue;
             std::size_t arity = cs->caseDecl->payload.size();
@@ -11746,25 +13042,113 @@ void checkStaticReadonlyRecordInit(
             for (std::size_t i = 0; i < arity; ++i) {
                 const ast::Param& pf = cs->caseDecl->payload[i];
                 if (!pf.type) continue;
-                const TypeRef* pft = ctx.resolvedType(*pf.type);
+                const TypeRef* rawPft = ctx.resolvedType(*pf.type);
+                if (!rawPft) continue;
+                const common::RecordSubstEnv::Entry sub =
+                    common::resolveRecordFieldSubst(rawPft, fieldEnv);
+                const TypeRef* pft = sub.ty;
                 if (!pft) continue;
-                if (!staticReadonlyFieldIsReferenceTyped(pft, ctx)) continue;
-                if (isStaticallyNullExpr(nx.args[i].value.get())) continue;
-                std::string pname = std::string(pf.name);
-                ctx.diagnostics().report(
-                    Severity::Error, loc,
-                    std::string("static readonly ") + std::string(what) + " `"
-                    + std::string(name) + "` has choice value with non-null "
-                    "reference-typed payload `" + pname + "`; \xC2\xA7""9.7 "
-                    "requires the null-source form (every reference-typed "
-                    "component must be null) (\xC2\xA7""22.12 rule 4 residual "
-                    "+ \xC2\xA7""9.7, v0.265, #3273 / #3290)");
-                return;  // one diagnostic per site
+                const ast::Expr* argExpr = nx.args[i].value.get();
+                if (staticReadonlyFieldIsReferenceTyped(pft, ctx)) {
+                    if (isStaticallyNullExpr(argExpr)) continue;
+                    std::string pname = std::string(pf.name);
+                    ctx.diagnostics().report(
+                        Severity::Error, loc,
+                        std::string("static readonly ") + std::string(what) + " `"
+                        + std::string(name) + "` has choice value with non-null "
+                        "reference-typed payload `" + pname + "`; \xC2\xA7""9.7 "
+                        "requires the null-source form (every reference-typed "
+                        "component must be null) (\xC2\xA7""22.12 rule 4 residual "
+                        "+ \xC2\xA7""9.7, v0.265, #3273 / #3290)");
+                    return true;  // one diagnostic per site
+                }
+                // fix #3973: same nested-slot handling as the record arm
+                // above (nested record/choice, or a declaration-less
+                // builtin span view). fix #4164: thread `sub.env` down.
+                if (checkNestedBorrowBearingSlot(ctx, pft, sub.env, argExpr,
+                                                 loc, what, name))
+                    return true;
             }
-            return;  // first matching case wins
+            return false;  // first matching case wins
         }
-        return;
+        return false;
     }
+    return false;
+}
+
+// fix #4134 (§9.7, v0.295): the choice-value counterpart of
+// `checkStaticReadonlyRecordInit`, keyed to a SPECIFIC, already-resolved
+// `ChoiceCaseSymbol` rather than a `new`-expression's bare argument list.
+//
+// `checkStaticReadonlyRecordInit`'s own Choice arm (just above) exists to
+// serve a `new Tok(...)` NewExpr, which carries no case identity at all —
+// it has to iterate every declared case and guess by matching arity. That
+// guess is unsound in general (two cases of the same arity are
+// indistinguishable to it) and, per the spec's own field-initializer
+// admission list (§5130-area prose: "it is not a `new` expression … a
+// choice's construction *is* case selection", §35.1), a `new`-expression
+// is not how a choice value is ever legitimately constructed in the first
+// place — the real spelling is a qualified case CALL, `Type.Case(args)`,
+// which resolves through ordinary call typechecking to a `ChoiceCaseSymbol`
+// (`ExprTypecheck_Calls.cpp`'s `ChoiceCaseSymbol` stamp). Every caller of
+// this function already has that resolved symbol in hand, so there is no
+// arity-guessing here: `cs` names the EXACT case, and `ce.args` are its
+// EXACT arguments — the same per-payload null-source walk as the Choice
+// arm above, applied without ambiguity. Returns true iff a diagnostic was
+// reported.
+bool checkStaticReadonlyChoiceCaseInit(
+    SemaContext& ctx, const ast::CallExpr& ce, const ChoiceCaseSymbol* cs,
+    const TypeRef* choiceTy, const common::RecordSubstEnv* incoming,
+    SourceLocation loc, std::string_view what, std::string_view name) {
+    if (!cs || !cs->caseDecl) return false;
+    std::size_t arity = cs->caseDecl->payload.size();
+    if (ce.args.size() != arity) return false;  // mismatch — typecheck reports
+    // fix #4133 (§9.7, v0.295): identical generic-substitution gap as
+    // checkStaticReadonlyRecordInit's record/choice arms — a case payload
+    // declared as a bare type parameter never saw what a concrete
+    // instantiation (`choiceTy`) actually binds it to. `cs->parent` is the
+    // choice's own declaring TypeSymbol (its `genericParams`); `choiceTy`
+    // carries the instantiation's concrete `genericArgs`.
+    // fix #4164 (§9.7, v0.295): seed through `incoming` (the enclosing
+    // frame's env, null at the top of the recursion) rather than a
+    // hardcoded `nullptr` — same composition rationale as
+    // checkStaticReadonlyRecordInit's record arm.
+    common::RecordSubstEnv env;
+    if (auto* choiceTs = dynamic_cast<TypeSymbol*>(cs->parent); choiceTs && choiceTy)
+        common::seedRecordSubstEnv(*choiceTs, *choiceTy, incoming, env);
+    const common::RecordSubstEnv* fieldEnv = env.map.empty() ? nullptr : &env;
+    for (std::size_t i = 0; i < arity; ++i) {
+        const ast::Param& pf = cs->caseDecl->payload[i];
+        if (!pf.type) continue;
+        const TypeRef* rawPft = ctx.resolvedType(*pf.type);
+        if (!rawPft) continue;
+        const common::RecordSubstEnv::Entry sub =
+            common::resolveRecordFieldSubst(rawPft, fieldEnv);
+        const TypeRef* pft = sub.ty;
+        if (!pft) continue;
+        const ast::Expr* argExpr = ce.args[i].value.get();
+        if (!argExpr) continue;  // discard argument: no source to inspect
+        if (staticReadonlyFieldIsReferenceTyped(pft, ctx)) {
+            if (isStaticallyNullExpr(argExpr)) continue;
+            std::string pname = std::string(pf.name);
+            ctx.diagnostics().report(
+                Severity::Error, loc,
+                std::string("static readonly ") + std::string(what) + " `"
+                + std::string(name) + "` has choice value with non-null "
+                "reference-typed payload `" + pname + "`; \xC2\xA7""9.7 "
+                "requires the null-source form (every reference-typed "
+                "component must be null) (\xC2\xA7""22.12 rule 4 residual "
+                "+ \xC2\xA7""9.7, v0.265, #3273 / #3290)");
+            return true;  // one diagnostic per site
+        }
+        // fix #4134: same nested-slot handling as checkStaticReadonlyRecordInit's
+        // record/choice arms (nested record/choice, or a declaration-less
+        // builtin span view). fix #4164: thread `sub.env` down.
+        if (checkNestedBorrowBearingSlot(ctx, pft, sub.env, argExpr, loc,
+                                         what, name))
+            return true;
+    }
+    return false;
 }
 
 void Resolver::checkStaticReadonlyNullSource() {
@@ -11845,25 +13229,30 @@ void Resolver::checkStaticReadonlyNullSource() {
             // arrays that are NOT borrow-bearing take the default warning
             // and are not §9.7-deferred.
             //
-            // ⚠ issue filed (not fixed here): unlike `reportRule4`'s
-            // declaration-site defer test (above, ~line 10829), which ORs
+            // fix #3973 (§9.7, v0.295): unlike `reportRule4`'s
+            // declaration-site defer test (above, ~line 11172), which ORs
             // `common::isBorrowBearingRecordOrSpan` with
-            // `isBorrowBearingRecordForStaticReadonly`, this gate consults
-            // only the narrower predicate. Adding the shared predicate here
-            // was investigated for fix #3970 (§9.7/§22.12 rule 4, v0.294)
-            // and found OBSERVATIONALLY INERT against every shape reachable
-            // through `checkStaticReadonlyRecordInit` below: that walk's own
-            // per-field test (`staticReadonlyFieldIsReferenceTyped`) is
-            // documented as a SHALLOW, one-level check that classifies
-            // every record/choice-typed field as value-typed regardless of
-            // what it recursively contains, so a record field that is
-            // ITSELF a borrow-bearing record (a span-view field being the
-            // measured case: `SpanHolder(V: ReadOnlySpan<int>)`) is never
-            // flagged even once `deferred` is forced true. Closing this
-            // needs `checkStaticReadonlyRecordInit` to recurse into a
-            // nested record/choice field's own constructor arguments — a
-            // real, structural, non-import-specific gap, filed separately.
+            // `isBorrowBearingRecordForStaticReadonly`, this gate used to
+            // consult only the narrower predicate. Adding the shared
+            // predicate here was investigated for fix #3970 (§9.7/§22.12
+            // rule 4, v0.294) and found OBSERVATIONALLY INERT at the time
+            // against every shape reachable through
+            // `checkStaticReadonlyRecordInit` below: that walk's own
+            // per-field test (`staticReadonlyFieldIsReferenceTyped`) was a
+            // SHALLOW, one-level check that classified every
+            // record/choice-typed field as value-typed regardless of what
+            // it recursively contained, so a record field that is ITSELF a
+            // borrow-bearing record (a span-view field being the measured
+            // case: `SpanHolder(V: ReadOnlySpan<int>)`) was never flagged
+            // even with `deferred` forced true. `checkStaticReadonlyRecordInit`
+            // now recurses into a nested record/choice field's own
+            // constructor arguments (fix #3973), so the shared predicate is
+            // added here too — WITHOUT it, a field like `SpanHolder` above
+            // never reaches that recursive walk at all, because `deferred`
+            // stays false and the member is skipped outright (`continue`
+            // below) before `checkStaticReadonlyRecordInit` is ever called.
             bool deferred = isBorrowBearingRecordForStaticReadonly(rt, ctx_) ||
+                            common::isBorrowBearingRecordOrSpan(rt, ctx_) ||
                             isHoldsBorrowsChoice(rt, ctx_) ||
                             isPlainInlineArrayCarryingBorrows(rt, ctx_);
             if (!deferred) continue;
@@ -11889,6 +13278,7 @@ void Resolver::checkStaticReadonlyNullSource() {
                     (rt->declaration->kind == ast::TypeDeclKind::Record ||
                      rt->declaration->kind == ast::TypeDeclKind::Choice)) {
                     checkStaticReadonlyRecordInit(ctx_, *nx, rt,
+                                                  /*incoming=*/nullptr,
                                                   init->span.begin, what,
                                                   memberName);
                 }
@@ -11904,6 +13294,27 @@ void Resolver::checkStaticReadonlyNullSource() {
                 // form the issue explicitly cites, and the negative test
                 // in static_readonly_residual_3290_test.cpp's own record
                 // case pins the spec's wording.
+                continue;
+            }
+            // fix #4134 (§9.7, v0.295): a CHOICE value's real construction
+            // spelling is a case CALL (`Type.Case(args)`), never a `new`
+            // expression — the NewExpr-only branch above therefore never
+            // reached `checkStaticReadonlyRecordInit`'s Choice arm for any
+            // spec-compliant choice-typed static readonly initializer.
+            // Recognize the real spelling: the callee resolves to a
+            // `ChoiceCaseSymbol` exactly when the call constructs a case of
+            // THIS declared choice type (§35.3), the same test
+            // `ExprTypecheck_Calls.cpp`'s own call-typing arm uses.
+            if (auto* ce = dynamic_cast<const ast::CallExpr*>(init)) {
+                if (rt->kind == TypeRef::Kind::Named && rt->declaration &&
+                    rt->declaration->kind == ast::TypeDeclKind::Choice) {
+                    Symbol* calleeSym = ctx_.exprSymbol(*ce->callee);
+                    if (auto* ccs = dynamic_cast<ChoiceCaseSymbol*>(calleeSym))
+                        checkStaticReadonlyChoiceCaseInit(ctx_, *ce, ccs, rt,
+                                                          /*incoming=*/nullptr,
+                                                          init->span.begin,
+                                                          what, memberName);
+                }
                 continue;
             }
             // Any other initializer (call result, captured variable,

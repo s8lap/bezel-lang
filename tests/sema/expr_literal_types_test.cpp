@@ -62,6 +62,7 @@ BEZEL_TEST(sema_expr_lit, float_literal) {
     auto r = parseSemaAll(
         "module M; class C public method M() _ := 3.14; end M; end C;");
     auto* t = firstMethodFirstExprType(r);
+    BEZEL_EXPECT_TRUE(t != nullptr);
     if (t) BEZEL_EXPECT_TRUE(t->primitive == PrimitiveType::Double);
 }
 
@@ -69,6 +70,7 @@ BEZEL_TEST(sema_expr_lit, char_literal) {
     auto r = parseSemaAll(
         "module M; class C public method M() _ := 'x'; end M; end C;");
     auto* t = firstMethodFirstExprType(r);
+    BEZEL_EXPECT_TRUE(t != nullptr);
     if (t) BEZEL_EXPECT_TRUE(t->primitive == PrimitiveType::Char);
 }
 
@@ -76,6 +78,7 @@ BEZEL_TEST(sema_expr_lit, string_literal) {
     auto r = parseSemaAll(
         "module M; class C public method M() _ := \"hi\"; end M; end C;");
     auto* t = firstMethodFirstExprType(r);
+    BEZEL_EXPECT_TRUE(t != nullptr);
     if (t) BEZEL_EXPECT_TRUE(t->primitive == PrimitiveType::String);
 }
 
@@ -83,6 +86,7 @@ BEZEL_TEST(sema_expr_lit, verbatim_string_literal) {
     auto r = parseSemaAll(
         "module M; class C public method M() _ := @\"hi\"; end M; end C;");
     auto* t = firstMethodFirstExprType(r);
+    BEZEL_EXPECT_TRUE(t != nullptr);
     if (t) BEZEL_EXPECT_TRUE(t->primitive == PrimitiveType::String);
 }
 
@@ -90,6 +94,7 @@ BEZEL_TEST(sema_expr_lit, interp_string_literal) {
     auto r = parseSemaAll(
         "module M; class C public method M() _ := $\"hi {name}\"; end M; end C;");
     auto* t = firstMethodFirstExprType(r);
+    BEZEL_EXPECT_TRUE(t != nullptr);
     if (t) BEZEL_EXPECT_TRUE(t->primitive == PrimitiveType::String);
 }
 
@@ -97,6 +102,7 @@ BEZEL_TEST(sema_expr_lit, bool_literal) {
     auto r = parseSemaAll(
         "module M; class C public method M() _ := true; end M; end C;");
     auto* t = firstMethodFirstExprType(r);
+    BEZEL_EXPECT_TRUE(t != nullptr);
     if (t) BEZEL_EXPECT_TRUE(t->primitive == PrimitiveType::Bool);
 }
 
@@ -104,6 +110,7 @@ BEZEL_TEST(sema_expr_lit, null_literal_is_nullable_object) {
     auto r = parseSemaAll(
         "module M; class C public method M() _ := null; end M; end C;");
     auto* t = firstMethodFirstExprType(r);
+    BEZEL_EXPECT_TRUE(t != nullptr);
     if (t) {
         BEZEL_EXPECT_TRUE(t->primitive == PrimitiveType::Object);
         BEZEL_EXPECT_TRUE(t->nullable);
@@ -114,6 +121,7 @@ BEZEL_TEST(sema_expr_lit, unit_value) {
     auto r = parseSemaAll(
         "module M; class C public method M() _ := (); end M; end C;");
     auto* t = firstMethodFirstExprType(r);
+    BEZEL_EXPECT_TRUE(t != nullptr);
     if (t) BEZEL_EXPECT_TRUE(t->kind == TypeRef::Kind::Unit);
 }
 

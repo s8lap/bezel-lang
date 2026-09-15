@@ -12,6 +12,7 @@
 #include "ast/Node.hpp"
 #include "common/BuiltinRegistry.hpp"  // #1414 stage 3: builtin name registry
 #include "common/OwnershipFacts.hpp"   // #1414 stage 4: shared ownership-facts core
+#include "common/PatternAResultCollection.hpp"  // fix #4338: isPatternAResultCollectionHead
 #include "flow/CFG.hpp"
 #include "ownership/OwnershipState.hpp"
 #include "ownership/StmtWalker.hpp"  // fix #3565: forEachNestedStmt — the
@@ -138,6 +139,142 @@ bool ownedParamIsFrameDisposable(const sema::ParameterSymbol& ps,
            (pt->declaration->kind == ast::TypeDeclKind::Class ||
             pt->declaration->kind == ast::TypeDeclKind::Interface) &&
            !pt->declaration->isValueBuiltin;
+}
+
+// §19.6 (v0.295, superseded v0.298 #4139): "can this `case` STATEMENT's
+// no-match fallthrough ever actually be reached?" used to be answered here
+// by a purely SYNTACTIC proxy — an unguarded `_`/untyped-`var` catch-all
+// arm — which is the load-bearing carve-out fix #4116 needed for the
+// CaseStmt arm-join a few hundred lines below: without excluding the
+// no-match operand when it is provably dead, joining the pre-case snapshot
+// into EVERY case's result would falsely mark a local maybe-consumed even
+// when every arm (a catch-all included) definitely consumes it — the
+// direct `case` analogue of #3967's own `ifelse_both_branches_consume_
+// reassign_accepted_28_3` accept-side control.
+//
+// fix #4139 (§19.6, v0.298): that syntactic-only proxy missed the sibling
+// shape — a `case` the compiler proves exhaustive by CLOSED-VALUE-SPACE
+// analysis (every enum constant, both bool literals, every choice case,
+// every closed-hierarchy leaf) with NO wildcard arm — so a legitimate
+// enum/choice/sealed-hierarchy `case` where every leaf arm consumed the
+// same local was falsely rejected on a subsequent reassign/move/read. Fixed
+// by feeding the ownership pass the compiler's REAL §19.6 exhaustiveness
+// verdict instead of re-deriving a narrower one: `ExprTC::caseArmsExhaustive`
+// (sema/ExprTypecheck.cpp) already computes exactly this fact for the
+// expression-position non-exhaustiveness warning, and — per the LANE_RULES
+// duplicated-classification-predicate rule ("is there a fact the compiler
+// ALREADY COMPUTES that decides this?") — its verdict is now cached on the
+// AST as `CaseStmt::noMatchEdgeStaticallyDead` (Node.hpp; full rationale
+// there) by `ExprTC::visitStmt`'s CaseStmt arm, unconditionally (no "every
+// arm diverges" conjunction), and read directly at both join sites below.
+// It is a strict superset of the old syntactic-only predicate (the same
+// catch-all check is `caseArmsExhaustive`'s own first branch), so this
+// removes the syntactic proxy rather than keeping it alongside a second,
+// drifting spelling of the same decision. // per §19.6, v0.298, #4139
+
+bool armNeverFallsThrough(const std::vector<std::unique_ptr<ast::Stmt>>& stmts);
+
+// fix #4138 (§19/§19.6/§28.2/§28.3, v0.295): does the LAST reachable
+// top-level statement of an arm provably divert control away from the
+// point directly after the ENCLOSING case/if/while/for construct, so this
+// arm's (or loop body's) end state must be EXCLUDED from that construct's
+// own join (#4116, #4117) rather than folded into it?
+//
+// ONLY `return` and `throw` are recognized here — NOT `break`/`continue`,
+// despite both being equally "does not fall through to this exact merge
+// point" in the abstract. That asymmetry is deliberate, and was reached by
+// MEASURING a regression this predicate's first draft introduced, not by
+// design up front:
+//
+// `return`/`throw` leave the ENCLOSING CALLABLE outright. Nothing else in
+// the callable can ever observe a state that only exists on a path that
+// already left it, so dropping that operand from a join is always safe —
+// the state has nowhere else it needs to go.
+//
+// `break`/`continue` do NOT leave the callable — they reach a different,
+// but very much still-live, merge point (the nearest enclosing loop's own
+// post-loop merge, or its header, respectively). A first draft of this fix
+// excluded them too, on the theory that "doesn't reach THIS merge" was the
+// right test; measured counter-example: `while cond do if flag then move x;
+// break; end; end; move x;` — the `if`'s own join excluded the `break`-arm
+// (correct: `break` never reaches the `if`'s merge), but excluding it
+// DISCARDED the move information entirely instead of forwarding it to the
+// enclosing `while`'s own join, where it very much still belongs (a
+// `break` inside an `if` inside a `while` is exactly how a real program
+// exits a loop early) — silently un-rejecting a genuine double-move this
+// same batch's #3951/#4117 exists to catch. This walker has no general
+// mechanism to forward a "diverted" operand to a DIFFERENT construct's
+// join several levels up (that would need real inter-procedural plumbing,
+// well beyond this narrow fix), so the safe, correct, and properly-scoped
+// choice is: leave `break`/`continue` OUT of this predicate entirely, and
+// accept that the over-conservative false-reject #4138 filed for
+// `return`/`throw` remains UNFIXED for `break`/`continue` (filed as a
+// follow-up, #4141) — a known limitation, not a silent gap: excluding
+// nothing is exactly the pre-#4138 (safe-direction-only) behavior these
+// two terminators already had.
+//
+// Deliberately NOT `sema::ExprTC::stmtAlwaysExits` (ExprTypecheck.cpp):
+// that helper answers "does control leave the ENCLOSING CALLABLE" for the
+// unrelated §21.7 always-returns-a-value check, which is in fact exactly
+// what THIS predicate ended up needing too (once break/continue were
+// dropped) — but it is a private, `ctx_`-bound member of a different
+// translation unit's sema pass, unreachable from here for the same reason
+// this file's CaseStmt exhaustiveness fix (#4139, a few hundred lines below)
+// reads a cached AST field rather than calling `sema::ExprTC` members
+// directly — `stmtAlwaysExits` is `ctx_`-bound to a different translation
+// unit's pass and not itself cached — and it additionally covers
+// non-terminating `while true` and exhaustive-case/try shapes this narrow
+// fix does not need.
+//
+// A syntactic, non-CFG check only: recurses into a fully-covered nested
+// `if` (every branch, including a required `else`) and a `do … end` block,
+// the two shapes most likely to end an arm written with an early
+// return/throw threaded through nested control flow, but does not attempt
+// a `while`/`for`/`try`/`case` as the arm's OWN last statement —
+// under-approximating "never falls through" is always the SAFE direction
+// (it just leaves the pre-existing over-conservative join as-is for that
+// shape), so an exotic shape this misses degrades to the pre-existing,
+// safe-direction-only false-reject rather than ever masking a real hazard.
+bool stmtNeverFallsThrough(const ast::Stmt& s) {
+    if (dynamic_cast<const ast::ReturnStmt*>(&s)) return true;
+    if (dynamic_cast<const ast::ThrowStmt*>(&s)) return true;
+    // §31.2.2 (mirrors stmtAlwaysExits, ExprTypecheck.cpp ~601): an
+    // expression-form rethrow (`throw;` / `throw expr` with no disambiguating
+    // statement keyword — reachable as a case-arm single-statement body,
+    // Parser_Stmts.cpp parseCaseStmtArm's form-3 fallthrough) parses as an
+    // ExpressionStmt wrapping a ThrowExpr, not a ThrowStmt.
+    if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(&s))
+        return es->expr &&
+               dynamic_cast<const ast::ThrowExpr*>(es->expr.get()) != nullptr;
+    if (auto* dob = dynamic_cast<const ast::DoEndBlock*>(&s))
+        return armNeverFallsThrough(dob->body);
+    if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&s)) {
+        if (!ifs->hasElse) return false;  // the false edge falls through
+        if (!armNeverFallsThrough(ifs->ifBranch.body)) return false;
+        for (const auto& el : ifs->elifBranches)
+            if (!armNeverFallsThrough(el.body)) return false;
+        return armNeverFallsThrough(ifs->elseBody);
+    }
+    return false;
+}
+
+// The arm-level predicate this fix's join sites actually call: does this
+// statement list, taken as a whole, never fall through? An empty body
+// falls through by definition (there is nothing to divert control). Used
+// for a case/if ARM (excluded from that construct's own join) and,
+// identically, for a while/for loop BODY (excluded from the loop's own
+// "ran the body" ∪ "0 iterations" join, this file's While/For arms in
+// `applyUsingVarBorrowPinInLambdaStmt`) — since only return/throw are
+// recognized (see the header comment above), there is no longer any
+// semantic difference between the two call sites that would justify a
+// second, loop-specific spelling of this predicate (an earlier draft had
+// one, keyed on treating `break` differently; it was removed once
+// break/continue stopped being excluded at all).
+bool armNeverFallsThrough(const std::vector<std::unique_ptr<ast::Stmt>>& stmts) {
+    for (auto it = stmts.rbegin(); it != stmts.rend(); ++it) {
+        if (*it) return stmtNeverFallsThrough(**it);
+    }
+    return false;
 }
 
 // fix #3037 / §28.3 (v0.240): the source location of a §28.3 owned-binding
@@ -308,6 +445,28 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
     // method body's dataflow so the FLAG is set before codegen reads it;
     // saves/restores member state per lambda so the method body's state is
     // unmodified. // per §28.10 v0.220, #2166
+    //
+    // fix #4314 (§28.3 / §28.6 / §28.9, v0.298): populate
+    // `reassignedOwnedLocals_` (the "Pattern 2"/reassignment-becomes-owned
+    // sibling of #4286's initializer-only `isOwnedTrackedLocalInEnclosingFrame`)
+    // BEFORE `applyUsingVarBorrowPinInLambdas` runs, so the lambda-body
+    // pre-pass's retry (`isReassignedOwnedLocalInEnclosingFrame`, reached from
+    // the same two #4286 declaration call sites) observes a fully-populated
+    // set rather than the empty one `ld->becomesOwnedViaReassign` would be at
+    // this point (that flag is set by the MAIN dataflow below, not by this
+    // static AST scan). // per §28.3, §28.6, §28.9, v0.298, #4314
+    collectReassignedOwnedLocals(body);
+    // fix #4321 (§28.3 / §28.6 / §28.9, v0.298): the sibling gap #4314 left
+    // open — a captured local's DECLARATION and REASSIGNMENT both live
+    // inside a DIFFERENT (outer) lambda's own body, one frame deeper than
+    // `collectReassignedOwnedLocals(body)`'s method-top-level-only scan
+    // reaches. Also a pure static AST walk (see its declaration,
+    // Ownership_impl.hpp, for the full rationale and the soundness argument
+    // for feeding the SAME flat `reassignedOwnedLocals_` set), so it has the
+    // same no-dataflow-order dependency and must run before
+    // `applyUsingVarBorrowPinInLambdas` for the identical reason.
+    // // per §28.3, §28.6, §28.9, v0.298, #4321
+    collectReassignedOwnedLocalsInLambdaFrames(body);
     applyUsingVarBorrowPinInLambdas(body);
     // fix #2674 / §28.3 / §17.13 / §28.9 (v0.282): the four OWNERSHIP-pass-
     // set end-of-statement reclaim flags (DiscardStmt::disposeOwnedValue /
@@ -1348,6 +1507,12 @@ void MethodOwnership::runExprBodyOwningReturnCheck(
     // rejects `Take(): Cell? => move v;` (the bare-read `=> v;` borrow is
     // legal). // per §28.6
     checkOwnedFieldReturn(exprBody);
+    // fix #4311 (§30.5 Pattern A kind 1, §28.3 Producers, v0.298): the `=>`
+    // expression-body sibling of the handleReturn call — rejects
+    // `GetAsync(h: Box): Task<Cell> => borrowed;` naming a borrowed
+    // local/parameter/implicit field. A no-op outside an async Pattern-A
+    // `Task<T>` body. // per §30.5, §28.3
+    checkAsyncPatternABorrowedIdentifierReturn(exprBody);
     // §28.6 / §28.8 / §28.8.1 (#1995): the `=>` expression-body sibling of the
     // handleReturn call — rejects `Take(b: Cell): owned Cell => move b;` where
     // `b` is a BORROW returned as owned (double-free). A no-op unless the return
@@ -2784,6 +2949,31 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
                     "compiler-recognized `Slice(r)` form) that the binding "
                     "would never dispose, so the value would leak; bind it "
                     "with `using var` (§21.1 / §28.3)");
+            } else if (auto* mue =
+                           dynamic_cast<const ast::UnaryExpr*>(lc->value.get());
+                       mue && mue->op == "move") {
+                // fix #4287 (§21.1, v0.298): §21.1 explicitly rejects a
+                // marked-transfer `move` as a const initializer, with the
+                // spec quote "the marked transfer `const y := move x;`
+                // included — not a form". Reaches here for a `move` whose
+                // operand is a BUILT-IN class (Array<T>, Dictionary<…>, the
+                // FFI buffers, …) or a value type — those the producerState
+                // disjunct above classifies Borrowed, so without this branch
+                // the new `move` predicate disjunct (#4287) would REJECT-BUT-
+                // SAY-NOTHING (falling through to the generic "must not take
+                // an owned production" fallback below, which is the wrong
+                // shape for the move-specific cite). The wording keeps §21.1
+                // and the `using var` remedy the spec mandates, and names the
+                // `move` form so the diagnostic teaches the actual culprit.
+                // // per §21.1 v0.298, #4287
+                ctx_.diagnostics().report(
+                    Severity::Error, lc->value->span.begin,
+                    std::string("a `const` local (`") +
+                    std::string(lc->name) +
+                    "`) must not take an owned production — a `move` is a "
+                    "transfer (§28.3) that the binding cannot take; bind the "
+                    "source with `using var` and read it through the const, "
+                    "or omit the `move` (§21.1 / §28.3)");
             } else if (producerState(*lc->value) == OwnershipState::Owned) {
                 ctx_.diagnostics().report(
                     Severity::Error, lc->value->span.begin,
@@ -2944,13 +3134,65 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
         // directly without consulting this local's own `.state`. // per
         // §21.1, §28.3, #3687
         if (lc->value) {
-            if (sema::Symbol* src = borrowSourceForExpr(*lc->value)) {
+            sema::Symbol* src = borrowSourceForExpr(*lc->value);
+            // fix #4236 send-back / §28.3, §28.6 (v0.298), LANE_RULES §6 sibling
+            // trap: `disposeAliasSource` (OwnershipState.hpp) is the DEDICATED
+            // field `checkDisposeReceiverOwnership` reads to reject `.Dispose()`
+            // through a named alias, and it is written at `handleLocalDecl`
+            // (the `var` twin) and at plain reassignment (`handleAssignment`) —
+            // but never here, because `ast::LocalConstDecl` is a different AST
+            // node from `ast::LocalDecl` and this arm was never given the
+            // parallel write. `fix #3687` immediately above already established
+            // that a `const` is tracked as a borrow "exactly as a plain
+            // unmarked `var` alias" for `.source`; this is the same statement
+            // for `disposeAliasSource`. Recomputed independently of `src`
+            // above (mirroring handleLocalDecl exactly) rather than gated on
+            // it succeeding: `src`/`borrowSourceForExpr` answers null for
+            // every compiler-builtin collection (Array/Dictionary/Set/
+            // LinkedList/...; see disposeAliasSource's header comment for
+            // why), so `const b: Array<int> := a;` would otherwise never even
+            // reach the `states_[lsym] = lo` write below — `b` would stay
+            // absent from `states_` entirely and `b.Dispose()` would fall
+            // through checkDisposeReceiverOwnership's "local absent from
+            // states_" catch-all, uncaught. Measured pre-fix: this exact
+            // program compiled clean and double-freed identically to the
+            // `var` shape #4236 fixed. Narrowly recognizes ONLY a bare
+            // IDENTIFIER read (never member/index/other projection) whose
+            // resolved symbol is, right now, a still-Owned tracked local
+            // (isOwnedTrackedLocal) — sound for the same §28.3 K1.5 reason
+            // handleLocalDecl's comment gives: an identifier read of a
+            // class-/interface-/collection-typed OWNED local is always a
+            // reference alias, never a value copy. // per §21.1, §28.3,
+            // §28.6, #3687, #4236
+            sema::Symbol* aliasSrc = nullptr;
+            if (auto* rid =
+                    dynamic_cast<const ast::IdentifierExpr*>(lc->value.get())) {
+                sema::Symbol* rsym = ctx_.exprSymbol(*rid);
+                if (isOwnedTrackedLocal(rsym)) aliasSrc = rsym;
+            }
+            // fix #4283 (§28.3/§28.6, v0.298): mirrors `handleLocalDecl`'s own
+            // #4283 widening one arm above — see that site's comment for the
+            // full rationale (`isOwnedTrackedLocal` cannot see a FieldSymbol
+            // at all, bare or member-access; `exprIsOwnedFieldRead` is the
+            // existing authority that answers from the leaf field's `owned`
+            // modifier regardless of chain depth or receiver identity).
+            // `const b := this._arr; b.Dispose();` reproduced the identical
+            // `bz_array_free` double-free (measured) as the `var` shape,
+            // exactly as #4236's original identifier-alias bug did for
+            // `const` before the send-back above added this arm's parallel
+            // write at all.
+            if (!aliasSrc && exprIsOwnedFieldRead(*lc->value))
+                aliasSrc = ctx_.exprSymbol(*lc->value);
+            if (src || aliasSrc) {
                 if (sema::LocalSymbol* lsym = findLocalSymbol(*lc)) {
-                    BorrowSource bs;
-                    bs.sym = src;
                     LocalOwnership lo;
                     lo.state = OwnershipState::Borrowed;
-                    lo.source = bs;
+                    if (src) {
+                        BorrowSource bs;
+                        bs.sym = src;
+                        lo.source = bs;
+                    }
+                    if (aliasSrc) lo.disposeAliasSource = aliasSrc;
                     states_[lsym] = lo;
                 }
             }
@@ -2977,8 +3219,57 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
     // argument check) never fire on a call inside a case arm (`Box(a) =>
     // Prog.Sink(a)` handed the borrowed destructure binding `a` to an `owned`
     // sink undetected → double-free). Each arm is a mutually-exclusive branch;
-    // visit it from the pre-case state and restore afterward (conservative — the
-    // arm-local discharge tracking does not leak into the post-case state).
+    // visit it from the pre-case state, then JOIN every arm's end state back
+    // into the post-case state (§28.3, mirroring the real IfStmt join a few
+    // hundred lines below in this same function).
+    //
+    // fix #4116 (§19, §28.3 K1.4, v0.295): this used to restore `saved`
+    // UNCONDITIONALLY after the arm loop, discarding every arm's effect on
+    // `states_` outright — so a `case` arm that consumed (`move`d /
+    // transferred-out) an owned local left that local looking exactly as it
+    // did before the `case`, with no `maybeConsumed` marker and no
+    // diagnostic, while the byte-identical `if`/`while`(`break`)/`try` shapes
+    // were already correctly rejecting a post-join reassignment or read
+    // (`narrow #3967`). Measured: the scrutinee-less repro in #4116 compiled
+    // rc=0 with zero relevant diagnostics and heap-use-after-freed under
+    // `--sanitize=address` on the FIRST outer-loop iteration.
+    //
+    // §19.6 (v0.295): "A `case` with no `_` arm is permitted. In statement
+    // position, an unmatched value falls through with no action" — so the
+    // pre-case `saved` state is folded into the join as an extra operand
+    // standing in for that no-match completion, exactly the role IfStmt's
+    // implicit `entry` fallthrough plays when `!hasElse` — UNLESS
+    // `cs->noMatchEdgeStaticallyDead` is set, in which case the no-match
+    // edge is provably empty and `saved` is left out, so a `case` where
+    // every arm (a catch-all included, or every closed-value-space leaf)
+    // consumes the same outer local still converges to a definite discharge
+    // rather than a spuriously conservative maybe-consumed — the direct
+    // `case` analogue of #3967's own `ifelse_both_branches_consume_
+    // reassign_accepted_28_3` accept-side control. When the field is unset,
+    // including `saved` can only push the joined result to a MORE cautious
+    // lattice state (Owned+maybeConsumed instead of a clean discharge),
+    // never a less-checked one — `joinInto`'s lattice has no direction back
+    // down — so it cannot mask a real hazard.
+    //
+    // fix #4139 (§19.6, v0.298): through v0.295 this carve-out was gated on
+    // a purely SYNTACTIC catch-all check (`caseHasUnguardedCatchAllArm`,
+    // removed) that missed the sibling shape — a `case` the compiler proves
+    // exhaustive by CLOSED-VALUE-SPACE analysis (an exhaustive enum/choice/
+    // sealed-hierarchy `case` with NO wildcard arm) — falsely rejecting a
+    // legitimate reassign/move/read of a local every leaf arm consumed. See
+    // `CaseStmt::noMatchEdgeStaticallyDead`'s doc (Node.hpp) for the full
+    // rationale; it is the same §19.6 verdict `ExprTC::caseArmsExhaustive`
+    // computes for the expression-position non-exhaustiveness warning,
+    // cached on the AST by sema (which runs before this pass) instead of
+    // re-derived here.
+    //
+    // `emitClash` is passed `false` (mirroring the sibling expression-form
+    // join, `joinMarkerFreeArmEnds`, this file's ~line 1408): an
+    // Owned/Borrowed mismatch across case arms is a real §28.3 hazard IfStmt
+    // already diagnoses, but this fix's scope is the maybeConsumed gap only —
+    // turning on a brand-new clash diagnostic for `case` arms is a separate,
+    // larger blast radius left for its own issue if it turns out to matter.
+    // // per §19, §19.6, §28.3 K1.4, v0.295, #4116
     if (auto* cs = dynamic_cast<const ast::CaseStmt*>(&s)) {
         if (cs->scrutinee) checkRead(*cs->scrutinee, /*selfTarget=*/false);
         // K8 full-expression boundary (#1795): the K8 boundary for an
@@ -3006,16 +3297,56 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
                 const_cast<ast::CaseStmt*>(cs)->disposeOwnedScrutinee = true;
         }
         BlockState saved = states_;
+        std::vector<BlockState> armEnds;
+        armEnds.reserve(cs->arms.size());
         for (const auto& arm : cs->arms) {
             states_ = saved;
             if (arm.guard) checkRead(*arm.guard, /*selfTarget=*/false);
+            bool armNeverReachesJoin = false;
             if (arm.bodyKind == ast::CaseArmBodyKind::Expression) {
                 if (arm.exprBody) handleDischarge(*arm.exprBody);
             } else {
                 for (const auto& bs : arm.stmts) if (bs) visitStmt(*bs);
+                // fix #4138 (§19/§28.2/§28.3, v0.295): an arm whose last
+                // reachable statement is `return`/`throw` leaves the
+                // callable outright and so never reaches the point directly
+                // after this `case` -- see `armNeverFallsThrough`'s header
+                // comment a few hundred lines above (including why
+                // `break`/`continue` are deliberately NOT recognized there).
+                // Excluding it here is what #4138 adds on top of #4116's
+                // join: without this, a throwing arm's end state (however it
+                // left `x`) was wrongly folded in alongside a sibling arm
+                // that never touched `x`, poisoning the ONLY reachable path
+                // with a spurious maybe-consumed.
+                armNeverReachesJoin = armNeverFallsThrough(arm.stmts);
             }
+            if (!armNeverReachesJoin) armEnds.push_back(states_);
         }
-        states_ = std::move(saved);
+        // fix #4116: join every arm's end state, plus `saved` for the
+        // statement-`case`'s possible no-match fallthrough (§19.6) UNLESS
+        // the cached §19.6 exhaustiveness verdict proves that edge empty
+        // (fix #4139), instead of discarding all of it back to `saved`. See
+        // the header comment above for the full rationale.
+        std::vector<BlockState> joinOperands = std::move(armEnds);
+        if (!cs->noMatchEdgeStaticallyDead)
+            joinOperands.push_back(saved);
+        if (joinOperands.empty()) {
+            // fix #4138: every arm (a present unguarded catch-all included,
+            // or every closed-value-space leaf) provably never falls
+            // through -- the code after this `case` is unreachable via any
+            // live path. Fall back to `saved` rather
+            // than dereference an empty vector; soundness is moot for
+            // provably-unreachable code (`armNeverFallsThrough` never
+            // over-claims termination, so this branch is only reached when
+            // the fallthrough truly cannot happen).
+            states_ = saved;
+        } else {
+            auto joined = std::move(joinOperands.front());
+            for (std::size_t i = 1; i < joinOperands.size(); ++i)
+                joinInto(joined, joinOperands[i], cs->span.begin,
+                         /*emitClash=*/false, /*unionKeys=*/false);
+            states_ = std::move(joined);
+        }
         return;
     }
     if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(&s)) {
@@ -4107,6 +4438,41 @@ bool MethodOwnership::checkBareBorrowLoopCarriedEscape(
 // retain, no state.
 bool MethodOwnership::constInitializerRejected(const ast::Expr& e) {
     if (producerState(e) == OwnershipState::Owned) return true;
+    // fix #4287 (§21.1, v0.298): §21.1 rejects `a move` outright, independent
+    // of the moved value's type. The producerState disjunct above catches a
+    // `move` whose OPERAND is a user-declared class/interface (#1388 path B,
+    // Ownership.cpp:~5036) or whose RESULT type is an owning-collection head
+    // (`OwningArray`/..., #1107 D, Ownership.cpp:~4628) — but a `move` of a
+    // BUILT-IN class type (`Array<int>`, `Dictionary<...>`, the FFI buffers,
+    // …) has a null declaration on the operand side, so both arms fall through
+    // and producerState returns Borrowed. The `#4287` repro measures exactly
+    // that: `var a := new Array<int>(2); const c := move a;` compiled clean
+    // (zero diagnostics) — the spec's "the marked transfer `const y := move
+    // x;` included — not a form" was unsound. Reject the shape here so the
+    // `LocalConstDecl` arm reports it with §21.1's mandated diagnostic.
+    // narrow #4287 (§21.1, v0.298): the blanket `move`-reject introduced by
+    // #4287 was over-broad — `producerState(*mue->operand)` already returns
+    // Owned for `move` of a user-declared owning class (#1388 path B) and for
+    // `move` of a heap-pointer reference builtin (the #3709 / #4191 / #4196
+    // fix in producerState's `move` arm); the only `move` shapes that fall
+    // through to Borrowed in producerState are (a) value-typed operands
+    // (records, primitives — no disposal, no reject needed) and (b) the
+    // 15-name `isNoDisposalObligationBuiltinName` set (CancellationToken,
+    // DateTime/TimeSpan/DateOnly/TimeOnly/Guid, Range, IntPtr/UIntPtr, the
+    // four *Span views, Boolean — #4191). For (a) and (b) a `const y := move
+    // x;` is a value-binding of a value-typed operand, NOT an owned
+    // production (§28.3's "Move semantics" adopted-state rule keys on the
+    // OPERAND's storage, not on the syntactic `move` form). Rejecting those
+    // is exactly the #4191 false-reject the predicate was added to prevent —
+    // measured: pre-#4191, `const t2 := move tok;` over a CancellationToken
+    // hard-rejected (rc=1) a program that compiled clean before; the
+    // narrowing below restores that accept-side while keeping the
+    // disposal-bearing builtin reject-side (#4287 / #4196's `Buffer`
+    // row, since `Buffer` is NOT a member of the no-disposal set).
+    if (auto* mue = dynamic_cast<const ast::UnaryExpr*>(&e)) {
+        if (mue->op == "move" && producerState(*mue->operand) == OwnershipState::Owned)
+            return true;
+    }
     if (auto* ce = dynamic_cast<const ast::CallExpr*>(&e)) {
         // §29.11 deferred-activation producer (#2146).
         if (common::isOwningCollectionDrainAliasCall(*ce, ctx_)) return true;
@@ -4738,6 +5104,92 @@ OwnershipState MethodOwnership::producerState(const ast::Expr& e) {
                     !opTy->declaration->isValueBuiltin) {
                     return OwnershipState::Owned;
                 }
+                // fix #3709 / #4191 / #4196 (§21.1 / §28.3 "Move semantics for
+                // owned locals" / §28.3 Producers "new T(...) | Owned",
+                // v0.298): the user-declaration arm above requires a user
+                // TypeSymbol (`opTy->declaration`), so a `move` of a
+                // DECLARATION-LESS builtin reference type — `StringBuilder`,
+                // `Random`, `Mutex`, `Array<T>`, `Task`, … (no user TypeDecl,
+                // per TypeResolution_Names.cpp's nullary-builtin registration)
+                // — fell all the way through to this function's Borrowed
+                // default, and §21.1's `const y := move x;` rejection (keyed
+                // on `producerState(e) == Owned`) never fired for one of
+                // these, though it correctly fires for a trivial-dispose USER
+                // class (has a `declaration`, no destructor — the arm above
+                // does not gate on dispose triviality at all) and for a
+                // non-trivial-dispose USER class. Spec: §28.3's own "Move
+                // semantics for owned locals" states a moved-from local
+                // binding "adopts owned state from the marked transfer,
+                // exactly as it would from a fresh producer" — and the
+                // Producers table's `new T(...)` row is unconditionally
+                // **Owned**, with no carve-out for a builtin or a
+                // trivial-dispose class. The `new T(...)` arm above (this
+                // function, the `NewExpr` case) already resolves that exact
+                // declaration-less-builtin question for a FRESH production —
+                // consulting `common::isHeapPointerReferenceBuiltin`, the
+                // SAME authority the codegen rep-layout tables use, to
+                // distinguish a heap-pointer reference builtin (Owned) from a
+                // value-shaped one (Borrowed, e.g. `DateTime`/`Guid`). Reuse
+                // it here so `move` classifies a declaration-less type
+                // exactly as constructing one fresh would — the "exactly as
+                // it would from a fresh producer" parity the spec states.
+                // (A bare, unresolved generic type parameter is ALSO a
+                // declaration-less Named TypeRef, but its head name never
+                // appears in the fixed `kHeapPointerReferenceBuiltins` table,
+                // so it is unaffected — stays Borrowed, no new false-reject.)
+                //
+                // fix #4191 / #4196 (review finding, v0.298):
+                // `common::isHeapPointerReferenceBuiltin` (BuiltinRegistry.cpp)
+                // is a CODEGEN-REPRESENTATION table ("is this declaration-
+                // less builtin's LLVM lowering a pointer"), not an OWNERSHIP
+                // authority, and the two questions diverge for at least one
+                // real stdlib type: `CancellationToken` (stdlib §6.1) is a
+                // `public record` — "a freely-copyable record" that "borrow-
+                // bears" the source — with no `Dispose()` and no disposal
+                // obligation — yet it IS pointer-represented (its record
+                // wraps a reference to shared cancellation-source state) and
+                // so IS listed in `kHeapPointerReferenceBuiltins` for that
+                // representation reason alone. The naive first landing of
+                // this branch used that table as the sole gate and so
+                // classified `move tok` (a `CancellationToken` local) as
+                // Owned — a NEW false-reject: `const t2 := move tok;` (a
+                // value-binding over a value-typed record) hard-rejected a
+                // program that compiled clean before. The correct authority
+                // for "does this declaration-less builtin carry a disposal
+                // obligation when directly held" is the new
+                // `sema::isNoDisposalObligationBuiltinName` predicate
+                // (SemaContext.hpp) — a 15-name list that excludes
+                // `Buffer` (#545 arity-1 compiler-intrinsic primitive,
+                // measured: `const b3 := move b2;` over a `new Buffer<int>(n)`
+                // LEAKS the buffer at scope end — a real disposal-bearing
+                // type that the fed168b narrow-fix attempt wrongly grouped
+                // with `CancellationToken` because it consulted the wider
+                // `isValueBuiltinByName` set, which is the
+                // owning-collection-element-type predicate and admits
+                // `Buffer` for that question's narrower scope). The new
+                // predicate's 15 names — `CancellationToken`, the six
+                // synthetic value-type builtins (`DateTime`/`TimeSpan`/
+                // `DateOnly`/`TimeOnly`/`Guid`), the value-record
+                // `Range`, the FFI value types (`IntPtr`/`UIntPtr`), the
+                // span-view records (`Span`/`ReadOnlySpan`/
+                // `ArraySpan`/`ReadOnlyArraySpan`/`ReadOnlyStringSpan`), and
+                // the trivial primitive `Boolean` — are exactly the names
+                // whose directly-held value carries no disposal obligation.
+                // `Buffer` is intentionally excluded (it owns its backing
+                // buffer). Applied as an EXCLUSION on top of the
+                // representation table, not a replacement:
+                // `isHeapPointerReferenceBuiltin` is still required to
+                // establish reference-SHAPE in the first place, so a bare
+                // unresolved generic type parameter — also declaration-less
+                // Named, but never a member of either fixed table — stays
+                // unaffected either way. // per §21.1, §28.3, v0.298,
+                // #3709, #4191, #4196
+                if (opTy->kind == sema::TypeRef::Kind::Named &&
+                    !opTy->declaration &&
+                    common::isHeapPointerReferenceBuiltin(opTy->headName()) &&
+                    !sema::isNoDisposalObligationBuiltinName(opTy->headName())) {
+                    return OwnershipState::Owned;
+                }
             }
         }
     }
@@ -4826,6 +5278,22 @@ OwnershipState MethodOwnership::producerState(const ast::Expr& e) {
     if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&e))
         if (common::isBuiltinArrayRangeSliceIndex(*ix, ctx_))
             return OwnershipState::Owned;
+    // fix #4338 (v0.298, §15.4 / §28.3 / §28.7): a collection literal whose
+    // backing storage is a heap-collection type (Array, Dictionary, OwningArray,
+    // etc.) is an OWNED producer — the literal allocates fresh heap backing
+    // and the local carries the disposal obligation. The predicate mirrors the
+    // one the NewExpr arm uses for `new Array<int>()`: if the literal's resolved
+    // type's head is in the heap-collection set, the initializer is Owned.
+    // A value-typed collection literal (none exists today) falls through to
+    // Borrowed. // per §15.4, §28.3, §28.7
+    if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(&e)) {
+        if (const sema::TypeRef* rt = ctx_.exprType(e)) {
+            if (rt->kind == sema::TypeRef::Kind::Named &&
+                !rt->headName().empty() &&
+                common::isPatternAResultCollectionHead(rt->headName()))
+                return OwnershipState::Owned;
+        }
+    }
     // Default: Borrowed.
     return OwnershipState::Borrowed;
 }
@@ -5212,7 +5680,8 @@ bool MethodOwnership::usingVarInitIsRecognizedBorrow(const ast::Expr& init) cons
     return false;
 }
 
-void MethodOwnership::handleLocalDecl(const ast::LocalDecl& ld) {
+void MethodOwnership::handleLocalDecl(const ast::LocalDecl& ld,
+                                      bool fromLambdaBody) {
     // #1066 / §9.7 (v0.153): `var b := new Bag([…])` from a temporary is a
     // dangling borrow. Checked before the lsym early-return so it runs for a
     // value-typed (record) binding too, matching the handleReturn/handleAssignment
@@ -5528,16 +5997,202 @@ void MethodOwnership::handleLocalDecl(const ast::LocalDecl& ld) {
         // a closure capturing `r`), record that owned source on this local so
         // a later `return b;` can be diagnosed as a borrow escape. Computed
         // AFTER recordMovesIn so a `move`d-out source (now MovedFrom, not
-        // Owned) is correctly NOT treated as a live borrow source. A `using
-        // var` is itself Owned, not a re-borrow, so it never gets a source.
+        // Owned) is correctly NOT treated as a live borrow source.
         // A §28.3 (v0.180) `owned`-marked binding (`var y := owned x;`) MOVED the
         // source: `y` is a new OWNER, not a borrow of `x`, so it takes no borrow
         // source (a later `return y;` is an owned return, not a borrow escape).
-        if (!ld.isUsing && !ld.initializerHasOwnedMarker) {
-            if (sema::Symbol* src = borrowSourceForExpr(*ld.initializer)) {
-                BorrowSource bs;
-                bs.sym = src;
-                states_[lsym].source = bs;
+        if (!ld.initializerHasOwnedMarker) {
+            // fix #4268 (§28.10, v0.298): `source` (the `return b;`
+            // borrow-escape signal) stays scoped to plain `var`/`const` — a
+            // `using var` borrow-pin's liveness obligation is already
+            // enforced by codegen's separate pin-extension machinery
+            // (§28.10 "using var initialized from a borrow": "the compiler
+            // enforces it by extending the source's required-liveness range
+            // to cover the using-var's scope"), and a `using var` local can
+            // never itself `return` (it is scope-bound), so widening this
+            // borrow-escape source to `using var` would add a predicate with
+            // no reachable consumer. Left exactly as before; only
+            // `disposeAliasSource` below changes.
+            if (!ld.isUsing) {
+                if (sema::Symbol* src = borrowSourceForExpr(*ld.initializer)) {
+                    BorrowSource bs;
+                    bs.sym = src;
+                    states_[lsym].source = bs;
+                }
+            }
+            // fix #4236 / §28.3, §28.6 (v0.298), widened by fix #4268 (§28.10,
+            // v0.298): `disposeAliasSource` — see its header comment
+            // (OwnershipState.hpp) for why this is a dedicated field rather
+            // than a reuse of `source` above.
+            //
+            // #4268: this used to also require `!ld.isUsing`, reasoned (see
+            // the removed comment above) as "a `using var` is itself Owned,
+            // not a re-borrow". §28.10's own dedicated subsection ("using var
+            // initialized from a borrow") contradicts that reasoning by name
+            // for exactly this RHS shape: "[when the RHS is] an *unmarked*
+            // read of a named owned binding[, ...] the `using var` does NOT
+            // assume a disposal obligation ... the value is not owned by
+            // this scope" — and §28.10's *Adopting a named owned binding*
+            // bullet states the SAME thing from the adopt side: "An
+            // unmarked `using var y := x;` where `x` is a named owned
+            // binding does *not* adopt: it is a borrow, pinned per the
+            // subsection below, and `x` retains the obligation." That is the
+            // identical K3.13 "marker economy" rule a plain `var`/`const`
+            // alias is already held to ("An unmarked read of a class-typed
+            // binding never consumes") — `using var` carries no exemption
+            // from it. So a `using var` over a bare identifier read of a
+            // still-owned local is a BORROW exactly like the plain-`var`
+            // case fix #4236 already rejects, and per §28.6 "Who may call
+            // Dispose()" ("Dispose() through a borrow is a compile error")
+            // its explicit `.Dispose()` must be rejected identically. The
+            // `!ld.isUsing` exclusion was therefore the wrong classification,
+            // not a deliberate narrowing — it is what let `.Dispose()`
+            // double-free through the alias (issue #4268).
+            //
+            // Removing the exclusion does not touch either accept-side shape
+            // §28.10 requires to keep working: `using var b := new
+            // Array<int>(2);` (a `NewExpr` initializer, never an
+            // `IdentifierExpr`) and a call-result `using var` (a `CallExpr`
+            // initializer) both fail the `IdentifierExpr` dynamic_cast below
+            // exactly as they did before, so `disposeAliasSource` stays
+            // unset and their `.Dispose()` stays legal — this widens
+            // rejection along exactly one axis (bare-identifier-of-an-owned-
+            // local) and no other.
+            //
+            // Narrowly recognizes ONLY a bare IDENTIFIER read (never a
+            // member/index/other projection — those can be value-typed
+            // copies, and this check intentionally does not consult
+            // isBorrowableType to tell) whose resolved symbol is, right now,
+            // a still-Owned tracked local (isOwnedTrackedLocal — the same
+            // authority borrowSourceForExpr's own Shape 1 uses internally,
+            // just not gated on returnedExprMayBorrow first). This is sound
+            // for a bare identifier specifically: an identifier read of a
+            // class-, interface-, or collection-typed OWNED local is always
+            // a reference alias, never a copy (§28.3 K1.5) — the value/copy
+            // ambiguity the gate exists to resolve cannot arise here.
+            if (auto* rid =
+                    dynamic_cast<const ast::IdentifierExpr*>(
+                        ld.initializer.get())) {
+                sema::Symbol* rsym = ctx_.exprSymbol(*rid);
+                if (isOwnedTrackedLocal(rsym)) {
+                    states_[lsym].disposeAliasSource = rsym;
+                } else if (fromLambdaBody &&
+                           (isOwnedTrackedLocalInEnclosingFrame(rsym) ||
+                            isReassignedOwnedLocalInEnclosingFrame(rsym) ||
+                            isOwnedParameterInEnclosingFrame(rsym))) {
+                    // fix #4304 (§28.3/§28.6/§22.3, v0.298):
+                    // `isOwnedParameterInEnclosingFrame` — sibling of the
+                    // #4286/#4314 retries below, for a captured `owned`
+                    // PARAMETER (rather than a local) — see that predicate's
+                    // declaration (Ownership_impl.hpp) for why it is
+                    // restricted to `symbolIsOwnedObligation`'s
+                    // `ParameterSymbol` arm only.
+                    //
+                    // fix #4314 (§28.3/§28.6/§28.9, v0.298):
+                    // `isReassignedOwnedLocalInEnclosingFrame` — sibling of
+                    // the #4286 retry just below, for a captured local that
+                    // becomes owned via a later plain REASSIGNMENT rather
+                    // than its own declaration initializer (`var a:
+                    // Array<int>; a := new Array<int>(2);` — the spec's own
+                    // "Pattern 2" idiom, §K1.7/K3.11). See that predicate's
+                    // declaration (Ownership_impl.hpp) for why it is a
+                    // separate static AST scan rather than a reuse of
+                    // `ld->becomesOwnedViaReassign`.
+                    //
+                    // fix #4286 (§28.3 "Ownership state of locals" / §28.6
+                    // "Who may call Dispose()", v0.298): LAMBDA-BODY-ONLY
+                    // retry. `isOwnedTrackedLocal` above reads `states_`,
+                    // which `applyUsingVarBorrowPinInLambdas` (#2166) clears
+                    // and rebuilds from scratch for EACH lambda body — a
+                    // CAPTURED owned local from an enclosing frame (the
+                    // method, or an outer lambda) is therefore never a key
+                    // of it, even though §28.9 "Capturing an owned
+                    // class-typed local" makes the capture a borrow exactly
+                    // like the method-level identifier-alias case above.
+                    // Measured (issue #4286): `var a := new Array<int>(2);
+                    // var f := lambda() => do var b := a; b.Dispose(); ...
+                    // end;` — and the `using var` twin — compiled clean and
+                    // double-freed in `bz_array_free`, byte-for-byte the
+                    // #4236 crash signature, one capture hop over.
+                    //
+                    // Gated on `fromLambdaBody` so the method-level call
+                    // site (whose own dataflow has already populated
+                    // `states_` for every local declared earlier in program
+                    // order) never reaches this retry — it would be
+                    // unreachable there anyway (the primary check above is
+                    // already sufficient), but gating keeps that path
+                    // provably byte-identical rather than relying on it.
+                    //
+                    // `isOwnedTrackedLocalInEnclosingFrame`, NOT
+                    // `enclosingFrameOwnedLocalBorrowSource` — see the
+                    // former's declaration comment for why the latter (built
+                    // on `borrowSourceForExpr`, whose Shape 1 gates on
+                    // `returnedExprMayBorrow` and answers false for every
+                    // builtin collection) silently never fires for exactly
+                    // this issue's own `Array<int>` repro. An `owned`
+                    // PARAMETER capture is a deliberately-unclosed sibling
+                    // gap — see this fix's commit body / issue #4286's
+                    // tracking comment for the follow-up.
+                    states_[lsym].disposeAliasSource = rsym;
+                }
+            }
+            // fix #4283 (§28.3 "Ownership state of locals" / §28.6 "Who may
+            // call Dispose()", v0.298): the IdentifierExpr check above can
+            // only ever populate `disposeAliasSource` from a LOCAL/
+            // PARAMETER symbol — `isOwnedTrackedLocal` reads `states_`,
+            // which a FieldSymbol never occupies (fields are object state,
+            // not scope state, per §K9), so it silently answers false for
+            // EVERY field read, bare (`_arr`, implicit `this`) or member-
+            // access (`this._arr`, `p._arr`, `this._a._b`, a qualified
+            // static field) alike — this is true even when the initializer
+            // IS an IdentifierExpr (a bare owned-field read), not only for
+            // the MemberAccessExpr shapes the dynamic_cast above rejects by
+            // construction. §28.6's field-read arm (this function's own
+            // dispose-receiver check, above in checkDisposeReceiverOwnership)
+            // already establishes that a field read is a borrow — disposable
+            // only through the direct `this.<owned>` idiom (§28.7's dispose-
+            // then-assign / #1230 destructor pattern) — so aliasing it into a
+            // local and disposing the LOCAL must be rejected identically to
+            // #4236/#4268's local/parameter alias case; it was not, because
+            // this LocalDecl site never populated `disposeAliasSource` for a
+            // field root at all. Measured (issue #4283): `var b := this._arr;
+            // b.Dispose();` — and the identical `using var` spelling —
+            // compiled clean and double-freed in `bz_array_free`,
+            // byte-for-byte the #4236/#4268 crash signature.
+            //
+            // Fixed by feeding the SAME already-validated authority
+            // `checkDisposeReceiverOwnership`'s own field-read arm uses
+            // (LANE_RULES §6/§25: reuse, don't re-derive) —
+            // `exprIsOwnedFieldRead` (§28.3, issue #398) — which already
+            // treats a bare identifier (implicit `this.f`) and an explicit
+            // `recv.f`/`this.f.g` MemberAccessExpr chain of ANY depth
+            // identically, and answers purely from the LEAF field's `owned`
+            // modifier, so it needs no `states_`-style liveness tracking: an
+            // `owned` field's declared type is always a heap-owning
+            // reference type (never a value type copied by read), so a read
+            // of it is always a reference alias — the same §28.3 K1.5
+            // reasoning the bare-identifier/local case above relies on,
+            // applied to the field axis. This is a SEPARATE `if` (not an
+            // `else`) from the IdentifierExpr branch above: the two can never
+            // both match (a FieldSymbol always fails `isOwnedTrackedLocal`,
+            // and a Local/ParameterSymbol always fails `exprIsOwnedFieldRead`
+            // — disjoint symbol kinds), so this only ever adds coverage,
+            // never overrides the branch above.
+            //
+            // SCOPE (LANE_RULES §6, deliberate): only the DECLARATION sites
+            // (this function and the parallel `LocalConstDecl` arm) are
+            // widened here. `handleAssignment` and the lambda-body
+            // reassignment arm are NOT touched — `fix #4272` (banked this
+            // same batch) added reassignment-axis test rows
+            // (`y := h.item; y.Dispose();`) that deliberately pin the
+            // CURRENT accept-and-runtime-protected reassignment behavior;
+            // widening `handleAssignment` too would flip those rows to a
+            // compile-time rejection and needs its own accept-side sweep —
+            // filed as a follow-up (issue TBD, see commit body) rather than
+            // folded in here.
+            if (exprIsOwnedFieldRead(*ld.initializer)) {
+                if (sema::Symbol* fsym = ctx_.exprSymbol(*ld.initializer))
+                    states_[lsym].disposeAliasSource = fsym;
             }
         }
     }
@@ -5599,8 +6254,25 @@ void MethodOwnership::handleLocalDecl(const ast::LocalDecl& ld) {
     // `const a := xs.ToArray();`, the compiler accepted it, and the array
     // leaked. Routing through one function closes the loop BY CONSTRUCTION for
     // every category, present and future. // per §21.1, §28.10, #2709
+    // fix #4288 (§28.10, v0.298): also exclude a `move`-marked initializer
+    // (initializer-position adoption, §28.3 "Move semantics") from Case A.
+    // Like the binding-position `owned` marker (which the outer guard already
+    // excludes via `!ld.initializerHasOwnedMarker`), a `move`-marked initializer
+    // creates a genuine ownership adoption: `b` becomes the sole owner and
+    // `b.Dispose()` is load-bearing. The static RHS type is unchanged by the
+    // move, so without this exclusion Case A fires on every `using var b :=
+    // move a;` regardless of whether the type carries a disposal obligation.
+    // Mirrors rhsIsVacuousBorrowPin's own reasoning ("the unmarked-adoption
+    // of an owned binding is NOT a borrow, so it stays out of the classifier");
+    // both marked and unmarked adoption must stay out.
+    bool initializerIsMove = false;
+    if (ld.initializer) {
+        if (auto* ue = dynamic_cast<const ast::UnaryExpr*>(ld.initializer.get()))
+            initializerIsMove = (ue->op == "move");
+    }
     if (ld.isUsing && ld.initializer && !ld.initializerHasOwnedMarker &&
-        !isGenericBody_ && !constInitializerRejected(*ld.initializer)) {
+        !initializerIsMove && !isGenericBody_ &&
+        !constInitializerRejected(*ld.initializer)) {
         // Case A: inert RHS. Value-typed or runtime-managed types carry no
         // disposal obligation (§28.9), so the scope-end `Dispose()` a `using
         // var` would call is a no-op; the only effect is the reassignment lock
@@ -6430,6 +7102,20 @@ void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
         // and CLEARED otherwise so a stale source does not linger across a
         // rebind to a non-borrowing value (e.g. `b := null;`).
         sema::Symbol* src = borrowSourceForExpr(*as.value);
+        // fix #4236 (§28.3, §28.6, v0.298): same recompute-before-the-loop
+        // discipline for `disposeAliasSource` (OwnershipState.hpp) — a bare
+        // identifier RHS whose root is, right now, a still-Owned tracked
+        // local. Recomputed on every reassignment so a rebind away from an
+        // alias (`b := a; b := c;`) does not leave a stale alias-source
+        // pointing at `a`, and a rebind ONTO one (`b := someBorrow; b := a;`)
+        // newly records it — mirroring `src` above exactly, just via the
+        // ungated bare-identifier check (see handleLocalDecl's sibling
+        // comment for why this does not go through borrowSourceForExpr).
+        sema::Symbol* aliasSrc = nullptr;
+        if (auto* rid = dynamic_cast<const ast::IdentifierExpr*>(as.value.get())) {
+            sema::Symbol* rsym = ctx_.exprSymbol(*rid);
+            if (isOwnedTrackedLocal(rsym)) aliasSrc = rsym;
+        }
         for (auto& [sym, st] : states_) {
             if (sym->name != id->name) continue;
             // §22.3 + §28.8: assigning an owned value to an `out owned`
@@ -6531,6 +7217,82 @@ void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
             // silently killed).
             if (st.state == OwnershipState::Owned)
                 checkConsumeFreeze(id->name, as.target->span.begin);
+            // fix #4329 (§28.3 / §28.7 / O4 silent-poison design, v0.298): at a
+            // non-loop `if … then` / no-else merge, `joinInto`'s catch-all sets
+            // the local's state to Poisoned while preserving its `obligationOrigin`
+            // (the prior Owned assignment site) — the O4 design's "silent poison;
+            // a subsequent read diagnoses". A *reassignment* of that poisoned
+            // local was NEVER separately covered by O4's design: a read diagnoses,
+            // but the slot is still live with the prior Owned value on at least
+            // one reaching path, and the next reassignment (`st.state =
+            // producerState(*as.value)` immediately below) silently overwrites
+            // the state with the new producer's classification, leaving the prior
+            // Owned undischarged — codegen's `disposeDisplacedOwnedClassLocal`
+            // refuses to fire for a no-init LocalDecl (`unwindOwnedLocalClass`
+            // returns null on `!ld->initializer`), so the O4-poisoned local
+            // becomes a leak the existing scope-end auto-drop doesn't catch
+            // either (state was overwritten to Owned before it reached the
+            // end-of-block Owned-without-discharge check). Measured on r18-c4
+            // base `f99d7c4`, `--sanitize=address` on `var x: Res; if cond then
+            // x := new Res(5); end; x := new Res(9); x.Dispose();` × 50
+            // iterations: `AddressSanitizer: 800 byte(s) leaked in 50
+            // allocation(s)` — exactly the cond=true allocations.
+            //
+            // The fix follows the spec's per-path model (K7 / §28.3): "the
+            // classification each assigning edge adopted is carried per-path —
+            // an owned value live at scope end on an assigning path is disposed
+            // there by K3.14's auto-drop, exactly as on any other path". The
+            // reassignment's drop-on-overwrite (§28.7) is the canonical
+            // per-path disposal point for the displaced value, exactly as
+            // `handleAssignment`'s null-init setter already does at line 7141
+            // below. Mark the LocalDecl for codegen drop-on-overwrite by
+            // setting `becomesOwnedViaReassign` — the existing setter at line
+            // 7141 below is currently gated to null-init locals ONLY (its
+            // comment at 7125-7138 documents that exclusion); we extend it
+            // narrowly to the O4-poisoned-with-obligation case so codegen's
+            // `unwindOwnedLocalClass` admits the local as an owned class
+            // local for `disposeDisplacedOwnedClassLocal` to dispose the
+            // displaced value at THIS reassignment point (null-guarded +
+            // identity-guarded, so a no-prior-value slot is a no-op). The
+            // sticky-once-set semantics (the flag is never cleared) are sound
+            // for the same reason the null-init setter is: once Owned, the
+            // local is never reassigned a borrow (§28.3 state-match rule), so
+            // a stale flag cannot double-dispose a later borrow. The O4
+            // borrow-path (Borrowed ⊓ Uninitialized → Poisoned) is symmetric
+            // and also fires — `obligationOrigin` carries through that join
+            // too — but borrows carry no disposal obligation, so the flag's
+            // drop-on-overwrite pass is null-guarded and disposes nothing.
+            // // per §28.3, §28.7, v0.298, #4329
+            if (st.state == OwnershipState::Poisoned && st.obligationOrigin) {
+                if (auto* lsym = dynamic_cast<sema::LocalSymbol*>(sym)) {
+                    if (auto* ld2 =
+                            // LOCALDECL-ONLY: §21.1 forbids reassignment of a
+                            // `const` local outright, so the bare-identifier
+                            // reassignment target is necessarily a var
+                            // LocalDecl; a LocalConstDecl never reaches this
+                            // site.
+                            dynamic_cast<const ast::LocalDecl*>(lsym->decl)) {
+                        // Mirror the borrow-init exclusion below (line 7134-7138):
+                        // a borrow-INITIALIZED local that becomes Owned via
+                        // reassignment is already classified Borrowed+Owned by
+                        // the existing path; setting `becomesOwnedViaReassign`
+                        // would convert it to a class-disposal-disposed slot,
+                        // double-freeing its BORROW-init predecessor. The O4
+                        // case here is O4-only — the join carries Poisoned,
+                        // never Owned-on-the-Owned-side through
+                        // `ownedDischargedSplit` (which KEEPS Owned, not
+                        // Poison) — so the exclusion above doesn't reach this
+                        // branch, but the predicate is kept for symmetry and
+                        // defense-in-depth.
+                        const bool borrowInit = ld2->initializer &&
+                            !dynamic_cast<const ast::NullLiteralExpr*>(
+                                ld2->initializer.get());
+                        if (!borrowInit)
+                            const_cast<ast::LocalDecl*>(ld2)
+                                ->becomesOwnedViaReassign = true;
+                    }
+                }
+            }
             // fix #3950 (§28.7 v0.294 / §28.3 K1.3 v0.294): record the
             // MOVED-FROM half of §28.7's liveness test for codegen. "[If] the
             // previous value is live (non-null and not moved-from ...), it is
@@ -6578,6 +7340,15 @@ void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
             // definite fresh value, not the conditionally-disposed one.
             st.disposedOnSomePath = false;
             st.awaitSpent = false;  // #1869: fresh value — not an await-spend
+            // fix #4246 (§28.3 / §28.6, v0.298): the reassignment overwrites
+            // the slot's CONTENT, so any earlier "an explicit dispose on
+            // this local already reclaimed" fact is stale — see the field
+            // comment on `explicitDisposeReclaimedSlot`. Cleared UNCONDITIONALLY
+            // here (mirroring maybeConsumed/disposedOnSomePath/awaitSpent
+            // above): if this reassignment's producer is ALSO Owned, the
+            // flag is re-derived from scratch at this local's next explicit
+            // `.Dispose()` call.
+            st.explicitDisposeReclaimedSlot = false;
             // §28.3 (#1900): a reassignment of an owned-value slot restores
             // the slot's "definitely holds a fresh value" status, which the
             // scope-end auto-drop gate uses (alongside `everDischarged_ == 0`)
@@ -6644,6 +7415,9 @@ void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
             } else {
                 st.source.reset();
             }
+            // fix #4236: mirror the reset/set above for disposeAliasSource.
+            st.disposeAliasSource =
+                (aliasSrc && aliasSrc != sym) ? aliasSrc : nullptr;
             return;
         }
         // §28.8.1 / #825: name not found in local states — this bare identifier
@@ -7249,6 +8023,14 @@ void MethodOwnership::handleReturn(const ast::Expr& e) {
     // borrow and is not flagged. Exempt when the return type is `owned` (the
     // legal transfer). // per §28.6
     checkOwnedFieldReturn(e);
+    // fix #4311 (§30.5 Pattern A kind 1, §28.3 Producers, v0.298): reject a
+    // bare-identifier return from a plain `Task<T>` async producer naming a
+    // BORROWED local, a plain (non-`owned`) parameter, or an implicit-`this`
+    // field read — the ownership-pass sibling of `fix #4285`'s codegen
+    // MemberAccessExpr/IndexExpr rejection, needing this pass's own flow
+    // state to tell a borrow apart from a genuinely owned local/parameter.
+    // A no-op outside an async Pattern-A `Task<T>` body. // per §30.5, §28.3
+    checkAsyncPatternABorrowedIdentifierReturn(e);
     // #2175(a) / §28.3 (v0.226) "Returning a deferred-activation frame":
     // `return a.Drain();` (the owning-collection builtin alias) over a
     // SCOPE-BOUND receiver escapes the receiver's scope. §28.3: "A returned
@@ -7301,6 +8083,46 @@ void MethodOwnership::handleReturn(const ast::Expr& e) {
                     "`; a `using var` is scope-bound — it cannot be moved out of "
                     "(only borrowed from, and a borrow of it may not escape its "
                     "scope) (§28.3 / §28.10)");
+                st->state = OwnershipState::Poisoned;
+                return;
+            }
+            // fix #4180 (§28.3, v0.298): a Borrowed binding carries no
+            // discharge obligation for this pessimistic marking to satisfy
+            // — `producerState`'s catch-all default for anything not a
+            // recognized owned producer (a plain value-typed local like
+            // `int`, a genuine borrow, ...) is exactly Borrowed. Calling
+            // markDisposedByName here unconditionally (as before this fix)
+            // clobbers a Borrowed symbol's tracked state to Disposed
+            // regardless — harmless in isolation (`run()`'s leak check
+            // already gates on `state == Owned`, so a Borrowed local was
+            // never at risk of a false leak report either way), but WRONG
+            // once something downstream can observe the bogus Disposed
+            // state and read the binding again: an active `finally` that
+            // re-reads the same plain local after an early `return` — the
+            // exact path #4180 makes reachable and analysed for the first
+            // time. Every OTHER state (Owned/MovedFrom/Disposed/
+            // maybeConsumed/PolyNull/Poisoned/Uninitialized) still falls
+            // through to the call below, unchanged: Owned records the real
+            // discharge; MovedFrom/Disposed/maybeConsumed need their own
+            // correct diagnostic from markDisposedByName's early-return
+            // arms (e.g. `move x; return x;` must still reject — measured
+            // in the #4180 fix commit body).
+            if (st->state == OwnershipState::Borrowed) return;
+        }
+        // fix #4352 (§28.2 / §28.3, v0.298): if the bare identifier is
+        // already in the Disposed state (an explicit `.Dispose()` ran first),
+        // `return x;` returns a null/dangling pointer — a use-after-free.
+        // markDisposedByName warns for a SECOND explicit `.Dispose()` call
+        // (the idempotent §28.2 discharge), but `return x;` is not a second
+        // dispose: it is a USE of the already-disposed variable. Error here,
+        // and poison the state so the rest of the analysis skips this variable.
+        if (auto* st = lookupState(id->name)) {
+            if (st->state == OwnershipState::Disposed) {
+                report(
+                    Severity::Error, id->span.begin,
+                    std::string("local `") + std::string(id->name) +
+                    "` is already disposed — returning it after `.Dispose()` "
+                    "is a use-after-free (§28.2 / §28.3)");
                 st->state = OwnershipState::Poisoned;
                 return;
             }
@@ -7650,12 +8472,136 @@ void MethodOwnership::checkDisposeReceiverOwnership(const ast::Expr& recv,
                 }
                 return;
             }
-            // A plain `var`/`using var` local (LocalDecl decl), or a local
-            // absent from states_ (unreachable / other-block position): NOT
-            // rejected — the recorded gap (a genuine local-held borrow is
-            // indistinguishable from an owned disposable here). A `using var`
-            // is genuinely owned; a plain owned local is genuinely owned; a
-            // borrow local is the unenforced gap.
+            // fix #4236 / §28.6 "Who may call Dispose()" + §28.3 "Ownership
+            // state of locals" (v0.298): the recorded gap above is that a
+            // plain-local `Borrowed` state is indistinguishable from an
+            // owned disposable call result IN GENERAL — but
+            // `states_[sym].disposeAliasSource` (see its header comment,
+            // OwnershipState.hpp) already carries a NARROWER, unambiguous
+            // signal for exactly one shape: a bare IDENTIFIER read whose
+            // root, at THIS local's own declaration, was a still-Owned
+            // tracked local — set at the LocalDecl (handleLocalDecl), never
+            // for a CallExpr initializer. So a local with a recorded
+            // `disposeAliasSource` is a genuine alias of an identifiable
+            // owned binding: `var b: Array<int> := a;` is an unmarked read
+            // of the named owned binding `a`, which §28.3's *Ownership state
+            // of locals* states is ALWAYS a borrow ("A read of a named owned
+            // binding on the right-hand side is a borrow unless it carries
+            // the explicit transfer marker") — so `b.Dispose()` must be
+            // rejected under §28.6's "Dispose() through a borrow is a
+            // compile error", exactly as a borrowed parameter or field read
+            // already is above. Pre-fix, the collection-dispatch codegen
+            // arms (LlvmBackend_Calls2.cpp's emitExplicitDisposeChain, #4221)
+            // freed `a`'s backing through the alias `b` with no diagnostic,
+            // and `a`'s own scope-end auto-drop then freed it again — a
+            // double-free. This narrows the gap by exactly one shape and
+            // leaves the call-result gap (no recorded source) untouched, so
+            // the enumerator/subscription/unwind admissions the gap note
+            // documents are unaffected — this check never fires for them.
+            if (auto it = states_.find(sym); it != states_.end() &&
+                it->second.disposeAliasSource) {
+                sema::Symbol* srcSym = it->second.disposeAliasSource;
+                report(
+                    Severity::Error, loc,
+                    std::string("cannot call `Dispose()` on `") +
+                    std::string(id->name) +
+                    "`: it is a borrow (an alias) of `" +
+                    std::string(srcSym->name) +
+                    "`, which still owns it (§28.6 \"Who may call "
+                    "Dispose()\", §28.3 \"Ownership state of locals\") — an "
+                    "unmarked assignment from a named owned binding is "
+                    "always a borrow; dispose `" +
+                    std::string(srcSym->name) +
+                    "` instead, or bind `" + std::string(id->name) +
+                    "` with `move` to take ownership");
+                return;
+            }
+            // fix #4334 (§28.6 "Who may call Dispose()", v0.298): a plain-
+            // local alias of a NON-OWNED PARAMETER is itself a borrow — the
+            // parameter is a borrow (§28.6: "the caller retains ownership"),
+            // and an unmarked `var b := p;` (or `const b := p;`) is an
+            // alias whose disposal frees a value the parameter's caller
+            // still owns (a double-dispose — the borrowed-axis twin of the
+            // #4236/#4268/#4283/#4286/#4304/#4314/#4321 owned-source family
+            // fixed in v0.298). The ParameterSymbol arm above (line 8193)
+            // already rejects `p.Dispose()` directly — this arm extends the
+            // SAME rule to a one-hop identifier alias of `p`. Distinct from
+            // the whole `disposeAliasSource` family because that field is
+            // populated only for owned-source aliases by design (see
+            // OwnershipState.hpp's `disposeAliasSource` header comment and
+            // #4236's send-back for why a separate field is used); a
+            // non-owned parameter is NEVER an `isOwnedTrackedLocal` and so
+            // is invisible to that path.
+            //
+            // Performed in-place rather than via a new populate field
+            // (issue #4334's alternative (b)) so the change stays as narrow
+            // as the bug: the LocalSymbol carries `decl` directly back to
+            // the LocalDecl/LocalConstDecl node (the §21.1 #3687 sibling
+            // walker pattern), and the AST re-lookup is O(1). Restricted to
+            // a bare IDENTIFIER read (never a member/index/other projection
+            // — those can be value-typed copies, see §28.3 K1.5 in
+            // `disposeAliasSource`'s populate) of a NON-OWNED PARAMETER
+            // (modifier != "owned" and != "out owned"; an `owned`/`out owned`
+            // parameter IS the disposal-responsible owner and its one-hop
+            // alias is already caught by the `disposeAliasSource` arm above
+            // via `isOwnedTrackedLocalInEnclosingFrame`, #4304). Multi-hop
+            // alias chains of a borrow source (`var b := p; var c := b;
+            // c.Dispose()`) are a recorded gap, exactly like the owned-
+            // source chain case #4263 — left unenforced for now to keep
+            // this fix's blast radius narrow.
+            //
+            // Accept-side pin: an alias of a borrow that is NEVER disposed
+            // (the local is read or passed into a sink, never `.Dispose()`-
+            // called) must stay accepted — and does: this check fires only
+            // at the call site, not at the binding.
+            if (locSym->decl) {
+                const ast::Expr* init = nullptr;
+                if (auto* ld =
+                        dynamic_cast<const ast::LocalDecl*>(locSym->decl))
+                    init = ld->initializer.get();
+                else if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(
+                             locSym->decl))
+                    init = lc->value.get();
+                if (init) {
+                    if (auto* rid = dynamic_cast<const ast::IdentifierExpr*>(
+                            init)) {
+                        sema::Symbol* rsym = ctx_.exprSymbol(*rid);
+                        if (auto* ps = dynamic_cast<sema::ParameterSymbol*>(
+                                rsym)) {
+                            if (ps->modifier != "owned" &&
+                                ps->modifier != "out owned") {
+                                report(
+                                    Severity::Error, loc,
+                                    std::string("cannot call `Dispose()` on `") +
+                                    std::string(id->name) +
+                                    "`: it is a borrow (an alias) of parameter `" +
+                                    std::string(ps->name) +
+                                    "`, which is itself a borrow (§28.6 \"Who "
+                                    "may call Dispose()\") — the parameter's "
+                                    "caller still owns it; declare `" +
+                                    std::string(ps->name) +
+                                    "` `owned`, or let the caller dispose it");
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+            // A plain `var`/`using var` local (LocalDecl decl) with no
+            // recorded `disposeAliasSource`, or a local absent from states_
+            // (unreachable / other-block position): NOT rejected — the
+            // recorded gap (a genuine local-held borrow is indistinguishable
+            // from an owned disposable here). fix #4268 (§28.10, v0.298):
+            // this reached the fallback for a `using var` alias of a
+            // still-owned local before this fix (`b.Dispose()` on `using var
+            // b := a;`) because `disposeAliasSource` was never populated for
+            // `using var` at all — that shape is now caught above instead. A
+            // `using var` over a genuine fresh production (`new`/owned-
+            // returning call) or a `move`-adopted binding IS genuinely
+            // owned, and a plain owned local (fresh production or `move`)
+            // is genuinely owned; a plain-local-held borrow (this local's
+            // OWN `Borrowed` state, e.g. from a call result — no identifiable
+            // named-binding source) remains the unenforced gap.
             return;
         }
         // Unresolved / other: conservatively not rejected.
@@ -8075,6 +9021,34 @@ void MethodOwnership::checkLambdaTaskFamilyBorrowReturns(
             if (it != callArgDirect.end()) ownedExpected = it->second;
         }
         checkOneLambdaOwnedReturnDirectBorrow(*lam, ownedExpected);
+        // fix #4349 (§30.5 Pattern A / §28.3 Producers, v0.298): the
+        // lambda-body reach for `fix #4311`'s
+        // `checkAsyncPatternABorrowedIdentifierReturn`. The sibling check
+        // (Ownership.cpp, handleReturn / runExprBodyOwningReturnCheck arm)
+        // only fires for a top-level METHOD's own body — lambda bodies
+        // would otherwise be unreachable for the bare-identifier Pattern-A
+        // shape, leaving the exact heap-UAF the issue measures. Drive the
+        // same check over the lambda's own body with the lambda's own
+        // `isAsync` / return type — driven from this same collected-lambda
+        // set so it reaches a lambda anywhere in this body a lambda can
+        // appear (a local-decl initializer, a direct return, a field/
+        // property/operator position, …), exactly as the sibling calls
+        // above do. A no-op when the lambda is not `async` (its body then
+        // returns a task directly, SB01-B's territory — see the new
+        // function's own header). Pass `ownedExpected` rather than
+        // `expected`: an `async` lambda whose declared return is
+        // `() -> Task<T:class>` (the measured repro: `var f: () -> Task<Cell>
+        // := async lambda() => do … end;`) has its lambda-typed-slot target
+        // in `localDeclDirect` / `callArgDirect`, while the typechecker's
+        // OWN `lamTy->funcReturn` is `OwningTask<T>` (sema auto-wraps a
+        // class-typed async result in `OwningTask` per §30.5 Pattern B, the
+        // inferred-coercion path) — Pattern A's gate is on the
+        // USER-DECLARED `Task<T>`, not the typechecker's auto-derived
+        // `OwningTask<T>`, so the `expectedFnType` parameter must carry
+        // the declared function type's `funcReturn` for the gate to fire.
+        // // per §30.5, §28.3, §28.6
+        checkOneLambdaAsyncPatternABorrowedIdentifierReturn(*lam,
+                                                            ownedExpected);
     }
 }
 
@@ -8734,6 +9708,18 @@ void MethodOwnership::checkLambdaTaskFamilyBorrowReturnsExpr(
             if (it != callArgDirect.end()) ownedExpected = it->second;
         }
         checkOneLambdaOwnedReturnDirectBorrow(*lam, ownedExpected);
+        // fix #4349 (§30.5 Pattern A / §28.3 Producers, v0.298): the
+        // `=>` expression-body sibling of the block-body driver's same
+        // call — see checkOneLambdaAsyncPatternABorrowedIdentifierReturn's
+        // own header comment for the gap #4311 left in lambda bodies and
+        // for why this is a no-op on a non-`async` lambda. The expr-body
+        // sibling uses the same `ownedExpected` resolution
+        // (callArgDirect fallback, mirror of the block body's
+        // localDeclDirect) — see the block-body driver's comment for why
+        // `ownedExpected` and not `expected` carries the user-declared
+        // `Task<T>` return for the gate. // per §30.5, §28.3, §28.6
+        checkOneLambdaAsyncPatternABorrowedIdentifierReturn(*lam,
+                                                            ownedExpected);
     }
 }
 
@@ -8816,11 +9802,91 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdas(
 // (a conservative over-adopt → ASan trip), so completeness is the bar.
 void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
     if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
-        handleLocalDecl(*ld);
+        // fix #4286: `fromLambdaBody=true` — see `handleLocalDecl`'s own
+        // #4286 comment for why this call site needs the retry the
+        // method-level `visitStmt` call site (Ownership.cpp) does not.
+        handleLocalDecl(*ld, /*fromLambdaBody=*/true);
         return;
     }
     if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(&s)) {
         if (lc->value) {
+            // fix #4286 (§28.3 "Ownership state of locals" / §28.6 "Who may
+            // call Dispose()", v0.298): populate `disposeAliasSource` for a
+            // `const` declared INSIDE a lambda body. Unlike the LocalDecl
+            // arm just above (which reuses `handleLocalDecl` — the SAME
+            // function the method-level `visitStmt` LocalDecl arm calls),
+            // this arm previously did nothing but hunt for nested lambdas:
+            // there is no shared "handleLocalConstDecl" this call site could
+            // reuse, because `visitStmt`'s own `LocalConstDecl` arm
+            // (Ownership.cpp, the alias-detection block a few hundred lines
+            // above this file's `handleAssignment`) is written inline there,
+            // never factored into a callable function. So a lambda-body
+            // `const` reached NEITHER the own-frame identifier check NOR the
+            // #4283 field-read check NOR (this fix's addition) the
+            // enclosing-frame capture retry — all three are mirrored here,
+            // narrowly, rather than reused, because there is nothing to
+            // reuse for this call site.
+            //
+            // Measured (issue #4286): `const b := a; b.Dispose();` (`a` a
+            // captured owned local) AND `const b := this._arr;
+            // b.Dispose();` (an owned-field alias) both compiled clean
+            // inside a lambda body and double-freed in `bz_array_free`,
+            // identically to the `var`/`using var` shapes fixed alongside
+            // this arm — the `const` twin of both the capture gap this fix
+            // closes and the #4283 field-alias gap (already closed for
+            // `var`/`using var` because `handleLocalDecl` IS reused for
+            // lambda bodies, via the LocalDecl arm above).
+            //
+            // Mirrors `visitStmt`'s `LocalConstDecl` arm's alias-detection
+            // shape exactly (own-frame identifier check via
+            // `isOwnedTrackedLocal`, then the #4283 `exprIsOwnedFieldRead`
+            // field-read check), PLUS the enclosing-frame retry
+            // `handleLocalDecl`'s own #4286 addition uses — see that
+            // comment for the full authority-reuse rationale
+            // (`enclosingFrameOwnedLocalBorrowSource`, `LocalOnly`).
+            // Deliberately does NOT port the method-level arm's `.source`/
+            // `BorrowSource` population (fix #3687) — that field is
+            // consumed by a DIFFERENT check (the borrow-store-escape
+            // channel), unrelated to this fix's `disposeAliasSource`
+            // double-free, and porting it is untested, out-of-scope blast
+            // radius this fix does not take on.
+            sema::Symbol* aliasSrc = nullptr;
+            if (auto* rid = dynamic_cast<const ast::IdentifierExpr*>(
+                    lc->value.get())) {
+                sema::Symbol* rsym = ctx_.exprSymbol(*rid);
+                if (isOwnedTrackedLocal(rsym)) {
+                    aliasSrc = rsym;
+                } else if (isOwnedTrackedLocalInEnclosingFrame(rsym)) {
+                    // fix #4286: `isOwnedTrackedLocalInEnclosingFrame`, NOT
+                    // `enclosingFrameOwnedLocalBorrowSource` — see that
+                    // function's declaration comment (Ownership_impl.hpp) for
+                    // why the latter silently never fires for a captured
+                    // builtin-collection local (this issue's own repro type).
+                    aliasSrc = rsym;
+                } else if (isReassignedOwnedLocalInEnclosingFrame(rsym)) {
+                    // fix #4314 (§28.3/§28.6/§28.9, v0.298): the
+                    // reassignment-becomes-owned sibling of the #4286 arm
+                    // just above — see that predicate's declaration
+                    // (Ownership_impl.hpp) for the full rationale.
+                    aliasSrc = rsym;
+                } else if (isOwnedParameterInEnclosingFrame(rsym)) {
+                    // fix #4304 (§28.3/§28.6/§22.3, v0.298): the captured-
+                    // `owned`-PARAMETER (rather than local) sibling of the
+                    // two arms just above — see that predicate's declaration
+                    // (Ownership_impl.hpp) for the full rationale.
+                    aliasSrc = rsym;
+                }
+            }
+            if (!aliasSrc && exprIsOwnedFieldRead(*lc->value))
+                aliasSrc = ctx_.exprSymbol(*lc->value);
+            if (aliasSrc) {
+                if (sema::LocalSymbol* lsym = findLocalSymbol(*lc)) {
+                    LocalOwnership lo;
+                    lo.state = OwnershipState::Borrowed;
+                    lo.disposeAliasSource = aliasSrc;
+                    states_[lsym] = lo;
+                }
+            }
             std::vector<const ast::LambdaExpr*> nestedLambdas;
             collectBodyLambdasExpr(*lc->value, nestedLambdas);
             for (const ast::LambdaExpr* nested : nestedLambdas)
@@ -8913,6 +9979,219 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
             !isTopLevelConsumingForm(*as->value))
             checkRead(*as->value, /*selfTarget=*/false);
         if (as->value) recordMovesIn(*as->value);
+        // fix #4187 / #3972 (§28.3 K1.3, v0.295): the TARGET side of a plain
+        // `:=` reassignment inside a lambda body. Everything above this point
+        // in this arm (#3951) only ever touches `states_` for the
+        // assignment's RHS — nothing updates `states_[targetSym]` itself, so
+        // the target's PRE-assignment state (most commonly MovedFrom from an
+        // earlier `move`) survives the rebind unchanged. A later read/dispose
+        // of the freshly-reassigned local is then falsely rejected as
+        // "already moved out" (#4187 — reproduces with a single straight-line
+        // unconditional move, no branching required), and — the leak face,
+        // #3972 — the reverse shape (a stale Owned/live state surviving a
+        // reassignment that should have discharged it) was never at risk
+        // here since nothing discharges without `recordMovesIn` seeing a
+        // `move`, but the *target*'s own moved-from state never clearing
+        // means a legal post-reassignment read is over-rejected exactly as
+        // §28.3 K1, item 3 says it must not be ("unreadable until
+        // reassigned" — the read here IS after the reassignment).
+        //
+        // Mirror `handleAssignment`'s bare-identifier target-state
+        // transition (Ownership.cpp, ~line 6650 on) NARROWLY: only the
+        // `states_`-local bookkeeping — producer-state adoption, the
+        // maybe-consumed / disposed-on-some-path / await-spent clears, the
+        // #3950 `lhsMovedFromAtStore` flag (so codegen's §28.7 drop-on-
+        // overwrite correctly skips disposing a slot that held nothing live
+        // — #3972's own "second consequence": leaving this unset here would
+        // trade the over-rejection for the exact use-after-free #3950 fixed
+        // at method scope), and the #3967 maybe-consumed-owned reject (a
+        // maybe-consumed join, reachable here via #4116/#4117's if/while/for
+        // joins, has no static per-path disposal answer — silently clearing
+        // it would trade the over-rejection for a possible double-free/leak,
+        // the same class of mistake lane-rules §25 warns about). Deliberately
+        // NOT run: `checkConsumeFreeze` (its liveness query is not
+        // exercised for a lambda-body local by any existing lambda-arm call
+        // site — a separate, narrower gap, not this issue's), the §28.9
+        // borrow-source recompute, and the null-init `becomesOwnedViaReassign`
+        // flag (both pre-existing, orthogonal gaps for lambda-body locals,
+        // unrelated to either repro). Scoped to `:=` only — a COMPOUND
+        // assignment (`+=`, …) must NOT reclassify the target, exactly as
+        // `handleAssignment`'s own header comment explains (~line 6253:
+        // "Leaving the target's state untouched is... the right answer").
+        // Run BEFORE the nested-lambda collection below, matching this arm's
+        // existing ordering. // per §28.3 K1.3, §28.7, v0.295, #4187, #3972
+        if (as->op == ":=" && as->target) {
+            if (const auto* tid = dynamic_cast<const ast::IdentifierExpr*>(
+                    as->target.get())) {
+                // fix #4216 / #4217 / #4218 (§28.3/§28.7/§28.9, v0.298):
+                // port the three pieces of `handleAssignment`'s bare-
+                // identifier target transition the original #4187/#3972 fix
+                // deliberately left out, believing (WRONGLY — a claim review
+                // measured false, not asserted false) that they were
+                // unreachable from this arm. All three are real, MEASURED
+                // defects reachable through this exact arm, two of them
+                // heap-use-after-free:
+                //   - `checkConsumeFreeze` already runs from THIS arm's own
+                //     context: the `recordMovesIn` call above (RHS handling)
+                //     routes `move x` through `markMovedByName`, which calls
+                //     `checkConsumeFreeze` (Ownership_Checks.cpp:9620) — so
+                //     its absence HERE (the reassignment-of-a-borrowed-owned-
+                //     local site) was the one call site in the family
+                //     missing it, not a function nothing in this arm ever
+                //     reaches. `var y := x; x := new Res(9); var t := y.tag;`
+                //     inside a lambda body compiled with zero ownership
+                //     errors and read freed memory (#4216).
+                //   - The §28.9 borrow-source recompute's absence left a
+                //     rebound borrow holder's `source` stale, so a later
+                //     `move` of the NEW source froze nothing and the stale-
+                //     sourced holder read freed memory after (#4217).
+                //   - The null-init `becomesOwnedViaReassign` flag's absence
+                //     left a local first adopted as owned inside a lambda
+                //     body unclassified for codegen's disposal ceremony, so
+                //     an explicit `.Dispose()` did not free it (measured 32
+                //     bytes / 2 allocations leaked, #4218).
+                // Computed BEFORE the states_ scan (mirrors handleAssignment,
+                // Ownership.cpp ~6650) so it observes the pre-reassignment
+                // Owned state of any source local.
+                sema::Symbol* src = borrowSourceForExpr(*as->value);
+                // fix #4269 (§28.3/§28.6, v0.298): the `disposeAliasSource`
+                // twin of `src` above — this arm ports `handleAssignment`'s
+                // `st.source` recompute (fix #4217, below) but never got the
+                // sibling `disposeAliasSource` recompute fix #4236 added to
+                // the METHOD-scope arm (Ownership.cpp ~6717-6731,~6955-6957).
+                // Left stale, a lambda-body local's DECLARATION-time alias
+                // fact (set by `handleLocalDecl`, which this pre-pass's
+                // LocalDecl arm already calls — see
+                // `applyUsingVarBorrowPinInLambdaStmt`'s LocalDecl case above)
+                // survives a later reassignment to a FRESH owned value
+                // unchanged, so `checkDisposeReceiverOwnership` still finds
+                // the old alias source and rejects a legal `.Dispose()` on
+                // the new value: `var x := new Res(5); var y := x; y := new
+                // Res(1); y.Dispose();` FALSE-REJECTS inside a lambda body
+                // ("cannot call `Dispose()` on `y`: it is a borrow (an alias)
+                // of `x`") while the byte-identical method-scope spelling is
+                // correctly accepted (#4236's own arm clears it). Mirrors
+                // `handleAssignment`'s aliasSrc computation exactly: a bare
+                // IDENTIFIER RHS whose resolved symbol is, right now, a
+                // still-Owned tracked local. // per §28.3, §28.6, v0.298,
+                // #4269
+                sema::Symbol* aliasSrc = nullptr;
+                if (auto* rid = dynamic_cast<const ast::IdentifierExpr*>(
+                        as->value.get())) {
+                    sema::Symbol* rsym = ctx_.exprSymbol(*rid);
+                    if (isOwnedTrackedLocal(rsym)) aliasSrc = rsym;
+                }
+                for (auto& [sym, st] : states_) {
+                    if (sym->name != tid->name) continue;
+                    if (st.state == OwnershipState::Owned && st.maybeConsumed &&
+                        localDropOnOverwriteCovered(sym)) {
+                        report(Severity::Error, as->target->span.begin,
+                               std::string("cannot reassign `") +
+                                   std::string(tid->name) +
+                                   "`: it may have already been consumed on "
+                                   "another branch (maybe-consumed join, "
+                                   "§28.3 K1.4) — reassigning it here would "
+                                   "silently dispose a value the consuming "
+                                   "branch may already have disposed (a "
+                                   "use-after-free); per-path disposal for "
+                                   "this shape is not yet implemented (§28.3 "
+                                   "K1.4). Discharge `" +
+                                   std::string(tid->name) +
+                                   "` explicitly on every path before this "
+                                   "reassignment, or restructure so the "
+                                   "consume and this reassignment are not "
+                                   "both reachable");
+                        if (!suppressDiag_) st.state = OwnershipState::Poisoned;
+                        break;
+                    }
+                    // fix #4216 (§28.3/§28.7/§30.14, v0.298): the consume-
+                    // site freeze — a live local borrow of the value THIS
+                    // reassignment is about to displace must reject, exactly
+                    // as `handleAssignment` (Ownership.cpp ~6758) does.
+                    if (st.state == OwnershipState::Owned)
+                        checkConsumeFreeze(tid->name, as->target->span.begin);
+                    if (!suppressDiag_ && st.state == OwnershipState::MovedFrom)
+                        const_cast<ast::AssignmentStmt*>(as)
+                            ->lhsMovedFromAtStore = true;
+                    st.state = producerState(*as->value);
+                    st.obligationOrigin = as;
+                    st.maybeConsumed = false;
+                    st.disposedOnSomePath = false;
+                    st.awaitSpent = false;
+                    // fix #4270 (§28.3/§28.6, v0.298): the sibling of fix
+                    // #4269's `disposeAliasSource` clear, one field over —
+                    // this arm ported every OTHER `handleAssignment` reset
+                    // (maybeConsumed/disposedOnSomePath/awaitSpent above,
+                    // disposeAliasSource below via #4269) but never got fix
+                    // #4246's `explicitDisposeReclaimedSlot` reset
+                    // (Ownership.cpp ~6888). Left stale, a lambda-body local
+                    // whose FIRST explicit `.Dispose()` reclaimed a fresh
+                    // owned value keeps that sticky `true` bit across a LATER
+                    // reassignment to a genuine borrow: the checker admits
+                    // the borrow's own `.Dispose()` (no `disposeAliasSource`
+                    // rejection — the RHS was not a bare-identifier-of-an-
+                    // Owned-local), but
+                    // `markExplicitDisposeReclaimIfReassignedBorrow`'s `state
+                    // == Owned || explicitDisposeReclaimedSlot` condition
+                    // fires on the stale flag alone, so codegen frees the
+                    // slot's CURRENT pointer — the borrowed-from object's own
+                    // memory, owned by someone else — a double-free/UAF, not
+                    // a leak. Direction of travel: clearing the flag more
+                    // eagerly can only turn a wrongly-reclaiming dispose into
+                    // a dispatch-only one (a missed reclaim leaks, never
+                    // crashes) — the safe direction per the field's own
+                    // comment (OwnershipState.hpp ~115-123). Measured FAIL-
+                    // WITHOUT/PASS-WITH in
+                    // lambda_reassign_explicit_dispose_reclaimed_slot_4270_
+                    // test.cpp. // per §28.3, §28.6, v0.298, #4270
+                    st.explicitDisposeReclaimedSlot = false;
+                    if (st.state == OwnershipState::Owned)
+                        definitelyRestoredLocals_.insert(sym);
+                    // fix #4218 (§28.7/§28.3, v0.298): mirrors
+                    // handleAssignment's #1625 null-init flag (Ownership.cpp
+                    // ~6844) — a null-initialized plain local's FIRST Owned
+                    // adoption via reassignment must be flagged so codegen's
+                    // unwindOwnedLocalClass classifies it as an owned class
+                    // local (drop-on-overwrite + scope-end/explicit-Dispose
+                    // disposal). LOCALDECL-ONLY: `sym` here is always a var
+                    // LocalDecl — a §21.1 `const` local can never be
+                    // reassigned, so the missing LocalConstDecl arm is
+                    // unreachable, exactly as the mirrored site's own
+                    // comment states. // per §28.7, §28.3, §21.1, #1625,
+                    // #4218
+                    if (st.state == OwnershipState::Owned) {
+                        if (auto* lsym = dynamic_cast<sema::LocalSymbol*>(sym)) {
+                            if (auto* ld2 = dynamic_cast<const ast::LocalDecl*>(
+                                    lsym->decl))
+                                if (ld2->initializer &&
+                                    dynamic_cast<const ast::NullLiteralExpr*>(
+                                        ld2->initializer.get()))
+                                    const_cast<ast::LocalDecl*>(ld2)
+                                        ->becomesOwnedViaReassign = true;
+                        }
+                    }
+                    // fix #4217 (§28.9/§9.7, v0.298): recompute the target's
+                    // borrow source so a LATER consume-site freeze query
+                    // (checkConsumeFreeze, above) sees the CURRENT source
+                    // rather than whatever the target borrowed before this
+                    // reassignment — mirrors handleAssignment (Ownership.cpp
+                    // ~6870).
+                    if (src && src != sym) {
+                        BorrowSource bs;
+                        bs.sym = src;
+                        st.source = bs;
+                    } else {
+                        st.source.reset();
+                    }
+                    // fix #4269: mirror the reset/set above for
+                    // disposeAliasSource — see this arm's own #4269 comment
+                    // above (~line 9364) for why this line was missing.
+                    st.disposeAliasSource =
+                        (aliasSrc && aliasSrc != sym) ? aliasSrc : nullptr;
+                    break;
+                }
+            }
+        }
         if (as->target) {
             std::vector<const ast::LambdaExpr*> nestedLambdas;
             collectBodyLambdasExpr(*as->target, nestedLambdas);
@@ -8944,28 +10223,56 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
                 applyUsingVarBorrowPinInLambdaBody(*nested);
         }
         // fix #3951 (§28.3 K1.3/K7, v0.295): mutually-exclusive-ARM save/
-        // restore, so #3951's new move-recording (handleAssignment /
-        // handleDischarge, added above) does not leak a move recorded on one
-        // arm into a SIBLING arm — this walker is flow-INSENSITIVE (no real
-        // CFG join), so without the restore, `if c then Sink.Take(move x);
-        // else Sink.Take(move x); end;` (each arm independently, and legally,
-        // consuming `x` — accepted at the method level since #3950) would
-        // read the `else` arm's `move x` as a re-move of an already-MovedFrom
-        // `x` and reject it as "already moved out" — a false reject on
-        // working code. Mirrors `handleDischarge`'s own CaseExpr arm
-        // (Ownership_Checks.cpp), which saves/restores `states_` around each
-        // mutually-exclusive arm for the identical reason. Conservative in
-        // the other direction too: nothing an arm records survives past the
-        // whole `if`, matching this pre-pass's existing flow-insensitive
-        // stance elsewhere (`seedLambdaBodyOwnedLocals`'s header comment:
-        // imprecision "cannot admit an escape, only over-reject one" is
-        // accepted; here the equivalent is "cannot admit a false accept,
-        // only under-detect a real one"). // per §28.3 K1.3/K7, v0.295
+        // restore BEFORE each arm, so #3951's new move-recording
+        // (handleAssignment / handleDischarge, added above) does not leak a
+        // move recorded on one arm into a SIBLING arm — this walker is flow-
+        // INSENSITIVE (no real CFG join), so without the restore, `if c then
+        // Sink.Take(move x); else Sink.Take(move x); end;` (each arm
+        // independently, and legally, consuming `x` — accepted at the method
+        // level since #3950) would read the `else` arm's `move x` as a
+        // re-move of an already-MovedFrom `x` and reject it as "already
+        // moved out" — a false reject on working code. That part is
+        // unchanged below.
+        //
+        // fix #4117 (§28.3 K1.3/K7, v0.295): #3951 ALSO restored to the
+        // pre-if snapshot unconditionally AFTER every arm ran, discarding
+        // each arm's exit state instead of joining it — so `x` looked
+        // untouched to whatever followed the whole `if`, and a second `move
+        // x` right after it was silently accepted as a fresh first move.
+        // Measured: `if Sink.Flag(true) then t := t + Sink.Take(move x); end;
+        // t := t + Sink.Take(move x);` inside a lambda body compiled rc=0
+        // with zero relevant diagnostics and heap-use-after-freed under
+        // `--sanitize=address`. Fixed by JOINING every arm's end state
+        // (mirroring the real per-method IfStmt join, this file's ~line
+        // 3447, and `joinInto`'s own §28.3 Owned⊓MovedFrom maybe-consumed
+        // rule) instead of discarding to the snapshot — the no-else case
+        // still folds in the pre-if snapshot itself as the implicit false-
+        // edge fallthrough, exactly as the real join does for `!hasElse`.
+        // `emitClash=false` (as `joinMarkerFreeArmEnds`, Ownership_Checks.cpp
+        // ~1408, already uses for the sibling CaseExpr arm-meet): a genuine
+        // Owned/Borrowed clash across lambda-body if-arms is a real §28.3
+        // hazard, but turning on a brand-new diagnostic for it is a separate,
+        // larger blast radius left for its own issue. // per §28.3 K1.3/K7,
+        // v0.295, #3951, #4117
         BlockState savedIfStates = states_;
+        std::vector<BlockState> armEnds;
         for (const auto& bs : ifs->ifBranch.body)
             if (bs) applyUsingVarBorrowPinInLambdaStmt(*bs);
-        states_ = savedIfStates;
+        // fix #4138 (§19/§28.2/§28.3, v0.295): an arm ending in
+        // return/throw leaves the callable outright and so never reaches
+        // the point directly after this `if`, so it must not be folded into
+        // the join below -- see `armNeverFallsThrough`'s header comment
+        // (this file, ~line 190), including why `break`/`continue` are
+        // deliberately NOT recognized there. Without this, #4117's join
+        // wrongly poisoned the sibling (reachable) arm's clean state with a
+        // throwing/returning arm's own end state. The implicit false-edge
+        // fallthrough (`savedIfStates`, pushed below when there is no
+        // `else`) is NOT a real arm body and is always reachable, so it is
+        // never subject to this check.
+        if (!armNeverFallsThrough(ifs->ifBranch.body))
+            armEnds.push_back(states_);
         for (const auto& el : ifs->elifBranches) {
+            states_ = savedIfStates;
             if (el.condition) {
                 std::vector<const ast::LambdaExpr*> nestedLambdas;
                 collectBodyLambdasExpr(*el.condition, nestedLambdas);
@@ -8974,11 +10281,33 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
             }
             for (const auto& bs : el.body)
                 if (bs) applyUsingVarBorrowPinInLambdaStmt(*bs);
-            states_ = savedIfStates;
+            if (!armNeverFallsThrough(el.body))
+                armEnds.push_back(states_);
         }
-        for (const auto& bs : ifs->elseBody)
-            if (bs) applyUsingVarBorrowPinInLambdaStmt(*bs);
-        states_ = std::move(savedIfStates);
+        if (ifs->hasElse) {
+            states_ = savedIfStates;
+            for (const auto& bs : ifs->elseBody)
+                if (bs) applyUsingVarBorrowPinInLambdaStmt(*bs);
+            if (!armNeverFallsThrough(ifs->elseBody))
+                armEnds.push_back(states_);
+        } else {
+            armEnds.push_back(savedIfStates);
+        }
+        if (armEnds.empty()) {
+            // fix #4138: every arm (a present `else` included) provably
+            // never falls through -- the code after this `if` is
+            // unreachable via any live path. Fall back to the pre-if
+            // snapshot rather than dereference an empty vector; see the
+            // identical CaseStmt fallback (this file, ~line 3255) for why
+            // soundness is moot here.
+            states_ = savedIfStates;
+        } else {
+            auto ifJoined = std::move(armEnds.front());
+            for (std::size_t i = 1; i < armEnds.size(); ++i)
+                joinInto(ifJoined, armEnds[i], ifs->span.begin,
+                         /*emitClash=*/false, /*unionKeys=*/false);
+            states_ = std::move(ifJoined);
+        }
         return;
     }
     if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&s)) {
@@ -8988,20 +10317,48 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
             for (const ast::LambdaExpr* nested : nestedLambdas)
                 applyUsingVarBorrowPinInLambdaBody(*nested);
         }
-        // fix #3951 (§28.3 K1.3, v0.295): save/restore around the loop body —
-        // this walker has no real fixpoint over back edges (unlike the
-        // method-level dataflow), so it cannot know whether the body runs 0,
-        // 1, or N times. Restoring afterward means a move recorded inside the
-        // body never leaks to code after the loop as a false "already moved"
-        // — the same under-detect-not-over-reject stance as the IfStmt arm
-        // above, applied to "maybe executed at all" instead of "mutually
-        // exclusive". A double-move WITHIN one straight-line pass through the
-        // body (this fix's own repro shape) is still caught, since the walk
-        // through the body itself is sequential. // per §28.3 K1.3, v0.295
+        // fix #3951 (§28.3 K1.3, v0.295): save around the loop body — this
+        // walker has no real fixpoint over back edges (unlike the method-
+        // level dataflow), so it cannot know whether the body runs 0, 1, or
+        // N times.
+        //
+        // fix #4117 (§28.3 K1.3, v0.295): #3951 then unconditionally
+        // RESTORED to the pre-loop snapshot, discarding whatever the body
+        // recorded instead of joining the "0 iterations" (skip) and "ran the
+        // body" edges — so a move made inside the loop body was invisible to
+        // code after the loop, and a second `move x` right after it was
+        // silently accepted. Diagnostic-silence confirmed (issue table); not
+        // independently reproduced under ASan for `while` specifically, but
+        // it is the identical mechanism the `if`/`try`/`for` shapes were
+        // measured on. Fixed by joining the body's exit state with the
+        // pre-loop snapshot (standing in for the always-possible 0-iteration
+        // edge) via the same `joinInto` the real per-method dataflow uses,
+        // instead of discarding to the snapshot. A double-move WITHIN one
+        // straight-line pass through the body (this fix's own repro shape)
+        // is still caught, since the walk through the body itself is
+        // sequential; a double-move split ACROSS loop iterations remains
+        // unmodeled by this flow-insensitive walker, as before — this walker
+        // has no back-edge fixpoint to catch that with, and widening it to
+        // one is out of this fix's scope. // per §28.3 K1.3, v0.295, #3951,
+        // #4117
         BlockState savedWhileStates = states_;
         for (const auto& bs : ws->body)
             if (bs) applyUsingVarBorrowPinInLambdaStmt(*bs);
-        states_ = std::move(savedWhileStates);
+        // fix #4138 (§21.5/§28.3, v0.295): a body whose last reachable
+        // statement is return/throw never reaches the point directly after
+        // this loop (it leaves the callable outright), so it must not be
+        // folded into the "ran the body" operand -- see
+        // `armNeverFallsThrough`'s header comment (this file, ~line 190),
+        // including why `break`/`continue` are deliberately NOT recognized
+        // there. When the body never falls through, the ONLY live operand
+        // is the always-possible 0-iteration edge, so `states_` is simply
+        // the pre-loop snapshot -- no join needed.
+        if (armNeverFallsThrough(ws->body)) {
+            states_ = savedWhileStates;
+        } else {
+            joinInto(states_, savedWhileStates, ws->span.begin,
+                     /*emitClash=*/false, /*unionKeys=*/false);
+        }
         return;
     }
     if (auto* fs = dynamic_cast<const ast::ForStmt*>(&s)) {
@@ -9017,13 +10374,24 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
             for (const ast::LambdaExpr* nested : nestedLambdas)
                 applyUsingVarBorrowPinInLambdaBody(*nested);
         }
-        // fix #3951 (§28.3 K1.3, v0.295): same save/restore as the WhileStmt
-        // arm above, and for the same reason (a for-loop body may run 0, 1,
-        // or N times). // per §28.3 K1.3, v0.295
+        // fix #3951 / fix #4117 (§28.3 K1.3, v0.295): same save-then-join as
+        // the WhileStmt arm above, and for the same reason (a for-loop body
+        // may run 0, 1, or N times) — ASan-confirmed for this construct
+        // specifically (issue #4117): `for` inside a lambda body, `move x`
+        // inside the loop then `move x` again right after it, compiled rc=0
+        // with zero diagnostics and heap-use-after-freed. // per §28.3 K1.3,
+        // v0.295, #3951, #4117
         BlockState savedForStates = states_;
         for (const auto& bs : fs->body)
             if (bs) applyUsingVarBorrowPinInLambdaStmt(*bs);
-        states_ = std::move(savedForStates);
+        // fix #4138 (§21.5/§28.3, v0.295): see the identical WhileStmt
+        // exclusion just above.
+        if (armNeverFallsThrough(fs->body)) {
+            states_ = savedForStates;
+        } else {
+            joinInto(states_, savedForStates, fs->span.begin,
+                     /*emitClash=*/false, /*unionKeys=*/false);
+        }
         return;
     }
     if (auto* db = dynamic_cast<const ast::DoEndBlock*>(&s)) {
@@ -9062,18 +10430,69 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
         // fix #3951 (§28.3 K1.3/§28.8.1, v0.295): a `try` body may throw and
         // unwind to a catch arm at ANY statement inside it, so a move
         // recorded partway through the body is not a reliable fact for a
-        // catch arm (or `finally`) to see — each of those must be reachable
-        // from the state as of ENTERING the try, not from wherever the body
-        // walk happened to land. Save before the body, restore before each
-        // catch arm and before `finally`, and restore once more after the
-        // whole statement so nothing the try/catch/finally did leaks past
-        // it — the same conservative, mutually-exclusive-arm stance as the
-        // IfStmt/CaseStmt arms. A double-move straight through the BODY
-        // alone (no intervening throw) is still caught, since the body's own
-        // walk is sequential. // per §28.3 K1.3, §28.8.1, v0.295
+        // catch arm to see — each catch arm must be reachable from the state
+        // as of ENTERING the try, not from wherever the body walk happened to
+        // land. Save before the body, restore before each catch arm. That
+        // part is unchanged below.
+        //
+        // fix #4117 (§28.3 K1.3/§28.8.1, v0.295): #3951 then restored to the
+        // pre-try snapshot AGAIN before `finally` and once more after the
+        // whole statement, discarding the body's and every catch arm's exit
+        // state rather than joining them — so a move made in the try body (or
+        // in a catch arm) was invisible to `finally` and to code after the
+        // whole `try`, and a second `move x` there was silently accepted.
+        // ASan-confirmed (issue #4117): `try`/`catch` inside a lambda body,
+        // `move x` inside the `try` block then `move x` again right after the
+        // whole `try` statement, compiled rc=0 with zero diagnostics and
+        // heap-use-after-freed. Fixed by JOINING the try-body's normal-
+        // completion exit state with every catch arm's exit state (mutually
+        // exclusive: either the body completed with no throw, or exactly one
+        // catch arm ran) into the state `finally` sees and that survives past
+        // the whole statement — mirrors the IfStmt arm's arm-join above,
+        // generalized from 2+ mutually-exclusive arms to
+        // {body-normal-completion} ∪ {catch arms}. An exception that
+        // propagates unmatched (no catch arm applies) is NOT modeled as a
+        // separate edge here, same as before this fix — this walker has no
+        // real exception-edge machinery (unlike the CFG-driven per-method
+        // dataflow), and widening it to one is out of this fix's scope.
+        // // per §28.3 K1.3, §28.8.1, v0.295, #3951, #4117
+        //
+        // #4138 (declined here — see issue #4142): the try-body's normal-
+        // completion path has the identical false-reject shape as the
+        // Case/If joins above when it ends in `return`/`throw` (measured:
+        // `try t := t + Take(move x); return t; catch E => t := 0; end; t
+        // := t + Take(move x);` compiles clean on origin/main, falsely
+        // rejected on this batch's base) — but excluding it here the same
+        // way is UNSOUND, not merely incomplete, because of `finally`.
+        // `finally` ALWAYS runs, on every path including one that is about
+        // to return/throw, so the state fed into `finally`'s own walk below
+        // must be the union of EVERY path, terminated or not — dropping a
+        // terminated operand here is invisible when there is no `finally`,
+        // but reopens a real double-move once one is added: measured, `try
+        // t := t + Take(move x); return t; finally t := t + Take(move x);
+        // end;` (no catch arm at all) correctly rejects "already moved out"
+        // at `102d29f`/`3bdae03` alike (a single-operand join, the body's
+        // own MovedFrom state, feeds `finally` directly) but silently
+        // ACCEPTED once this arm was excluded from `tryEnds` the same way
+        // the Case/If arms are — `finally` was walked from the wrong
+        // (too-optimistic) state. `finally`'s state and "state that
+        // survives past the whole `try`" are the SAME variable in this
+        // walker (`states_`, mutated in place) precisely because `finally`
+        // is walked exactly once, not once per tryEnds operand — so there
+        // is no way to filter one consumer without also filtering the
+        // other with the tools this walker has. A correct fix needs the two
+        // uses separated (an unfiltered union for `finally`'s own walk, and
+        // a further reachability re-filter of ITS OWN result afterward for
+        // what continues past the whole `try`) — a larger, more careful
+        // change than this narrow batch fix-forward should make under time
+        // pressure. Left EXACTLY as #4117 landed it (unconditional), so the
+        // known-safe `finally` behavior is preserved and #4138's Try
+        // sub-case remains a declared, open false-reject (issue #4142).
         BlockState savedTryStates = states_;
         for (const auto& bs : trys->body)
             if (bs) applyUsingVarBorrowPinInLambdaStmt(*bs);
+        std::vector<BlockState> tryEnds;
+        tryEnds.push_back(states_);  // normal completion, no throw
         for (const auto& arm : trys->catches) {
             states_ = savedTryStates;
             if (arm.guard) {
@@ -9083,11 +10502,15 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
                     applyUsingVarBorrowPinInLambdaBody(*nested);
             }
             if (arm.body) applyUsingVarBorrowPinInLambdaStmt(*arm.body);
+            tryEnds.push_back(states_);
         }
-        states_ = savedTryStates;
+        auto tryJoined = std::move(tryEnds.front());
+        for (std::size_t i = 1; i < tryEnds.size(); ++i)
+            joinInto(tryJoined, tryEnds[i], trys->span.begin,
+                     /*emitClash=*/false, /*unionKeys=*/false);
+        states_ = std::move(tryJoined);
         for (const auto& bs : trys->finallyBody)
             if (bs) applyUsingVarBorrowPinInLambdaStmt(*bs);
-        states_ = std::move(savedTryStates);
         return;
     }
     if (auto* cs = dynamic_cast<const ast::CaseStmt*>(&s)) {
@@ -9097,13 +10520,38 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
             for (const ast::LambdaExpr* nested : nestedLambdas)
                 applyUsingVarBorrowPinInLambdaBody(*nested);
         }
-        // fix #3951 (§28.3 K1.3/K7, v0.295): mutually-exclusive-ARM save/
-        // restore, mirroring the IfStmt arm above and `handleDischarge`'s own
-        // CaseExpr arm (Ownership_Checks.cpp) — each `case` arm is a
-        // mutually-exclusive branch, so a move recorded in one arm must not
-        // be visible to a sibling arm or to code after the whole `case`.
-        // // per §28.3 K1.3/K7, v0.295
+        // fix #3951 (§28.3 K1.3/K7, v0.295): mutually-exclusive-ARM save
+        // before each arm, mirroring the IfStmt arm above and
+        // `handleDischarge`'s own CaseExpr arm (Ownership_Checks.cpp) — each
+        // `case` arm is a mutually-exclusive branch, so a move recorded in
+        // one arm must not be visible to a sibling arm. That part is
+        // unchanged below.
+        //
+        // fix #4117 (§28.3 K1.3/K7, v0.295): #3951 then restored to the
+        // pre-case snapshot unconditionally after every arm ran, discarding
+        // each arm's exit state — the identical shape as #4116's fix to the
+        // REAL per-method CaseStmt join (`MethodOwnership::visitStmt`'s own
+        // CaseStmt arm, this file, ~line 3008), just in THIS flow-insensitive
+        // lambda-body pre-pass instead. Not independently reproduced under
+        // ASan for this construct (the issue's own measured table covers
+        // `if`/`try`/`for`, not this walker's `case` arm specifically), but
+        // it is the same save/restore-discards-a-move mechanism, so it is
+        // fixed identically: join every arm's exit state, PLUS the pre-case
+        // snapshot standing in for the statement-`case`'s no-match
+        // fallthrough (§19.6 — "falls through with no action") UNLESS
+        // `cs->noMatchEdgeStaticallyDead` proves that edge empty — see
+        // #4116's fuller rationale at ~line 3008, including why this
+        // carve-out matters: without it, a `case` where every arm (a
+        // catch-all included, or every closed-value-space leaf) consumes
+        // the same captured local would be falsely marked maybe-consumed
+        // instead of definitely-consumed. fix #4139 (§19.6, v0.298) widened
+        // the carve-out from a syntactic catch-all-only check to the
+        // cached, full §19.6 exhaustiveness verdict — see
+        // `CaseStmt::noMatchEdgeStaticallyDead`'s doc (Node.hpp) and the
+        // #4116 join's own updated rationale at ~line 3140. //
+        // per §28.3 K1.3/K7, §19.6, v0.295/v0.298, #3951, #4116, #4117, #4139
         BlockState savedCaseStates = states_;
+        std::vector<BlockState> caseArmEnds;
         for (const auto& arm : cs->arms) {
             states_ = savedCaseStates;
             if (arm.guard) {
@@ -9120,8 +10568,30 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
             }
             for (const auto& bs : arm.stmts)
                 if (bs) applyUsingVarBorrowPinInLambdaStmt(*bs);
+            // fix #4138 (§19/§28.2/§28.3, v0.295): see the identical
+            // exclusion on the real per-method CaseStmt join (this file,
+            // ~line 3180) and on the If arm just above -- an arm ending in
+            // return/throw leaves the callable outright and so never
+            // reaches the point directly after this `case`, so its end
+            // state must not be folded in.
+            if (!armNeverFallsThrough(arm.stmts))
+                caseArmEnds.push_back(states_);
         }
-        states_ = std::move(savedCaseStates);
+        if (!cs->noMatchEdgeStaticallyDead)
+            caseArmEnds.push_back(savedCaseStates);
+        if (caseArmEnds.empty()) {
+            // fix #4138: every arm (a present unguarded catch-all included,
+            // or every closed-value-space leaf) provably never falls
+            // through. See the identical fallback on the real per-method
+            // CaseStmt join (this file, ~line 3255).
+            states_ = savedCaseStates;
+        } else {
+            auto caseJoined = std::move(caseArmEnds.front());
+            for (std::size_t i = 1; i < caseArmEnds.size(); ++i)
+                joinInto(caseJoined, caseArmEnds[i], cs->span.begin,
+                         /*emitClash=*/false, /*unionKeys=*/false);
+            states_ = std::move(caseJoined);
+        }
         return;
     }
     // Break / Continue / etc.: no child expressions reachable.
@@ -9487,6 +10957,138 @@ void MethodOwnership::applyLambdaBodyDiscardStmtFlagsStmt(
     // Break / Continue / etc.: no child expressions reachable.
 }
 
+
+// fix #4314 (§28.3 / §28.6 / §28.9, v0.298): populate `reassignedOwnedLocals_`
+// (see its declaration, Ownership_impl.hpp, for the full rationale). A BOUNDED
+// forward scan of `stmts` — recurses into every nested CONTROL-FLOW statement
+// list (if/elif/else, while, for, do…end, try/catch/finally, case arms), the
+// SAME statement-kind coverage `collectBodyLambdas` just below establishes as
+// this file's completeness bar, but deliberately does NOT descend into any
+// `LambdaExpr`'s own `stmts`/`exprBody` — `AssignmentStmt` is never embedded
+// inside an expression in this grammar (only inside a statement list), so
+// simply never walking into a LambdaExpr's body is sufficient to exclude
+// lambda-interior reassignments from this scan; no separate lambda-detection
+// arm is needed the way `collectBodyLambdas` needs one.
+//
+// Restricted to a bare-identifier `:=` target resolving to a `LocalSymbol`
+// (mirrors `isOwnedTrackedLocalInEnclosingFrame`'s own `LocalSymbol`
+// restriction) — a compound assignment (`+=`, …) never reclassifies its
+// target's producer state (see `handleAssignment`'s own header comment,
+// ~line 6253), so only `:=` is checked, matching the main dataflow's own
+// bare-identifier target-state transition this scan mirrors (Ownership.cpp,
+// the `handleAssignment` bare-identifier arm).
+void MethodOwnership::collectReassignedOwnedLocals(
+        const std::vector<std::unique_ptr<ast::Stmt>>& stmts) {
+    for (const auto& sp : stmts)
+        if (sp) collectReassignedOwnedLocalsStmt(*sp);
+}
+
+// fix #4314: single-statement primitive for `collectReassignedOwnedLocals`
+// above — mirrors `collectBodyLambdas`'s own base-case/loop-wrapper split
+// (that function takes a single `const ast::Stmt&`; its own callers loop).
+// Not declared in the header: only the vector-taking entry point above is a
+// public call site (`run()`'s pre-pass call, and this function's own
+// recursive control-flow arms).
+void MethodOwnership::collectReassignedOwnedLocalsStmt(const ast::Stmt& s) {
+    if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&s)) {
+        if (as->op == ":=" && as->target && as->value) {
+            if (auto* tid = dynamic_cast<const ast::IdentifierExpr*>(
+                    as->target.get())) {
+                sema::Symbol* tsym = ctx_.exprSymbol(*tid);
+                if (auto* lsym = dynamic_cast<sema::LocalSymbol*>(tsym)) {
+                    if (producerState(*as->value) == OwnershipState::Owned)
+                        reassignedOwnedLocals_.insert(lsym);
+                }
+            }
+        }
+        return;
+    }
+    if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&s)) {
+        collectReassignedOwnedLocals(ifs->ifBranch.body);
+        for (const auto& el : ifs->elifBranches)
+            collectReassignedOwnedLocals(el.body);
+        collectReassignedOwnedLocals(ifs->elseBody);
+        return;
+    }
+    if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&s)) {
+        collectReassignedOwnedLocals(ws->body);
+        return;
+    }
+    if (auto* fs = dynamic_cast<const ast::ForStmt*>(&s)) {
+        collectReassignedOwnedLocals(fs->body);
+        return;
+    }
+    if (auto* db = dynamic_cast<const ast::DoEndBlock*>(&s)) {
+        collectReassignedOwnedLocals(db->body);
+        return;
+    }
+    if (auto* trys = dynamic_cast<const ast::TryStmt*>(&s)) {
+        collectReassignedOwnedLocals(trys->body);
+        for (const auto& arm : trys->catches)
+            if (arm.body) collectReassignedOwnedLocalsStmt(*arm.body);
+        collectReassignedOwnedLocals(trys->finallyBody);
+        return;
+    }
+    if (auto* cs = dynamic_cast<const ast::CaseStmt*>(&s)) {
+        for (const auto& arm : cs->arms)
+            collectReassignedOwnedLocals(arm.stmts);
+        return;
+    }
+    // LocalDecl / LocalConstDecl / ReturnStmt / ExpressionStmt / ThrowStmt /
+    // IncrementStmt / DiscardStmt / YieldStmt / Break / Continue: none
+    // contain a nested STATEMENT list an AssignmentStmt could live in
+    // (assignment is a statement, never nested inside an expression in this
+    // grammar), so nothing further to walk.
+}
+
+// fix #4314 (§28.3 / §28.6 / §28.9, v0.298): see the declaration
+// (Ownership_impl.hpp) for the full "why not `ld->becomesOwnedViaReassign`"
+// rationale. A simple membership test against the set
+// `collectReassignedOwnedLocals` populates BEFORE
+// `applyUsingVarBorrowPinInLambdas` runs (see that call site in `run()`).
+bool MethodOwnership::isReassignedOwnedLocalInEnclosingFrame(
+        sema::Symbol* sym) {
+    auto* ls = dynamic_cast<sema::LocalSymbol*>(sym);
+    if (!ls) return false;
+    return reassignedOwnedLocals_.count(ls) != 0;
+}
+
+// fix #4321 (§28.3 / §28.6 / §28.9, v0.298): see the declaration
+// (Ownership_impl.hpp) for the full rationale, including the soundness
+// argument for feeding the SAME flat `reassignedOwnedLocals_` set from every
+// lambda frame rather than a per-frame-keyed map.
+//
+// `collectBodyLambdas` is the SAME flattening authority
+// `applyUsingVarBorrowPinInLambdas` (just below) uses to enumerate every
+// lambda in `body` at EVERY nesting depth — its own `LambdaExpr` case
+// (`collectBodyLambdasExpr`) recurses into a found lambda's body to collect
+// further-nested lambdas too, so this single pass reaches a lambda nested
+// inside another lambda nested inside another, with no depth limit.
+void MethodOwnership::collectReassignedOwnedLocalsInLambdaFrames(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body) {
+    std::vector<const ast::LambdaExpr*> lambdas;
+    for (const auto& s : body)
+        if (s) collectBodyLambdas(*s, lambdas);
+    for (const ast::LambdaExpr* lam : lambdas) {
+        // An expression-bodied lambda's `exprBody` is a single EXPRESSION —
+        // it can never directly contain an `AssignmentStmt` (assignment is a
+        // statement, never nested inside an expression in this grammar), so
+        // nothing to scan there; any LambdaExpr nested within `exprBody` is
+        // already a separate entry in `lambdas` above (collectBodyLambdasExpr
+        // descends into `exprBody` too). Only `stmts` needs scanning.
+        collectReassignedOwnedLocals(lam->stmts);
+    }
+}
+
+// fix #4304 (§28.3 "Captured owned bindings" / §28.6, v0.298): see the
+// declaration (Ownership_impl.hpp) for the full rationale, including why
+// this deliberately calls `symbolIsOwnedObligation` restricted to its
+// `ParameterSymbol` arm only rather than delegating to it unrestricted.
+bool MethodOwnership::isOwnedParameterInEnclosingFrame(sema::Symbol* sym) {
+    auto* ps = dynamic_cast<sema::ParameterSymbol*>(sym);
+    if (!ps) return false;
+    return symbolIsOwnedObligation(ps);
+}
 
 // §28.3 SB01-B (v0.190, #1919): collect every LambdaExpr appearing anywhere in a
 // statement (including nested lambdas — collectBodyLambdasExpr descends into a
@@ -10702,12 +12304,507 @@ void MethodOwnership::checkOwnedFieldReturn(const ast::Expr& e) {
     // remains a leak.)
     if (!exprIsOwnedFieldRead(*lookThroughForceUnwrap(un->operand.get())))
         return;
+    // fix #4319 (§30.5 "Result lifetime and task disposal", Pattern A result
+    // slots kind 1, v0.298): a plain `Task<T>` (class T) async producer's
+    // non-`await` return does NOT hand the caller a `T` with "no owner" the
+    // way this #1005 rule assumes for a sync method — §30.5 kind 1 is
+    // explicit that "a `return` of an owned expression" mints a task that
+    // "owns the result and its destructor disposes it directly." `move
+    // <owned field>` is Owned per §28.3 *Producers* ("`move obj.f` where `f`
+    // is `owned`: Owned"), so it is exactly kind 1's admitted shape: the
+    // freshly-minted TASK becomes the field value's new owner. This #1005
+    // rule was written for the SYNC non-`owned`-return case (the spec's own
+    // `Take(): Cell? => move v;` example, where the caller's bare `Cell?`
+    // really is ownerless) and, pre-fix, had no carve-out for the async
+    // Task-family case — unlike its sibling declaration-site check
+    // (`staticReturnTypeRejected`, ~L12197: "`if (common::isTaskFamilyHead(
+    // head)) return {};  // §28.3 v0.190 carve`").
+    //
+    // fix #4337 (§30.5 Pattern B, v0.298): the SAME reasoning applies to
+    // `OwningTask<T>` (Pattern B). §30.5 kind 1 makes no distinction between
+    // `Task<T>` and `OwningTask<T>` on the producer side — both are async
+    // producers whose non-`await` return of an owned expression establishes
+    // the task as the result's owner. The ownership semantics of the returned
+    // value are identical: both patterns deposit the value in the task's
+    // result slot and the task's teardown disposes it. The consumer-side
+    // difference (`await` on `OwningTask<T>` transfers ownership to the
+    // consumer; `await` on `Task<T>` borrows) does not affect the producer's
+    // disposal obligation. MEASURED (§30-AMENDED, 50x ASan): the same
+    // dispose-exactly-once invariant holds for both patterns. Pattern B's
+    // producer-side carve is therefore identical to Pattern A's.
+    //
+    // Scoped to an `isAsync_` body and a Task-family return-type head
+    // (`Task` or `OwningTask`) only.
+    // // per §30.5, §28.3, §28.6
+    if (isAsync_ && returnType_ &&
+        returnType_->kind == ast::TypeKind::Named && returnType_->name &&
+        !returnType_->name->parts.empty()) {
+        auto& headSv = returnType_->name->parts.front();
+        if (headSv == "Task" || headSv == "OwningTask")
+            return;
+    }
     report(
         Severity::Error, e.span.begin,
         "cannot return an owned field's `move`d value through a non-`owned` "
         "return (§28.6); `move` transfers the field's value out, leaving it with "
         "no owner — declare the return type `owned` (e.g. `: owned T`) to "
         "transfer ownership to the caller");
+}
+
+// fix #4311 (§30.5 "Result lifetime and task disposal", Pattern A result
+// slots kind 1, §28.3 *Producers*, v0.298): the ownership-pass sibling of
+// `fix #4285`'s codegen check (`detectAsyncPatternAKind`,
+// LlvmBackend_Async.cpp), which rejects a Pattern-A `Task<T>` (class T) async
+// producer's non-`await` `return` of a `MemberAccessExpr` /
+// `NullCondMemberExpr` / `IndexExpr` (an unconditional borrow per §28.3
+// Producers) but deliberately did NOT extend to a bare `IdentifierExpr` —
+// that shape may legitimately name a still-owned local or `owned` parameter
+// (§28.3 *Factory methods and sourceless returns*'s admitted-source list),
+// and telling it apart from a BORROWED one needs this pass's own per-local
+// flow state (`states_` / `lookupState`), which codegen does not carry.
+//
+// MEASURED (§30-AMENDED amplification, on the r18-c4 base `f99d7c4`, before
+// this fix): `var borrowed := h.item; return borrowed;` from the SAME
+// Pattern-A producer shape #4285 fixed — 50/50 runs crash identically under
+// ASan, the SAME 3-frame signature (`bz$elemDispose` <- `bz_task_free` <-
+// the async resume frame), freed by the real owner's explicit `.Dispose()`.
+//
+// Rejects a bare identifier naming:
+//   - a LOCAL currently tracked `Borrowed` (`lookupState` — populated for
+//     every LocalDecl, owned or borrowed alike, unconditionally in
+//     `handleLocalDecl`);
+//   - a plain (non-`owned`) PARAMETER (`ParameterSymbol` with no
+//     `owned`/`out owned` modifier — a plain parameter is never seeded into
+//     `states_`, so `lookupState` finds nothing and the symbol lookup below
+//     is the only way to see it; per §25, ONLY the `ParameterSymbol` arm is
+//     consulted here, never a `LocalSymbol` arm reached through a different
+//     table, avoiding the exact stale-ordering hazard that arm is known for
+//     elsewhere in this run);
+//   - an implicit-`this` FIELD read (a bare identifier resolving to a
+//     `FieldSymbol` — the SAME unconditional borrow #4285 rejects via the
+//     explicit `this.f` / `obj.f` spelling, reached here through the
+//     unqualified name `exprIsOwnedFieldRead` also recognizes, §28.6).
+//
+// Admits (does nothing, so the existing accept path is unchanged):
+//   - a local tracked `Owned` (a plain `var` — the genuine kind-1
+//     fresh-owned source; #4285's own
+//     `accept_bare_owned_local_return_unaffected_30_5` row pins this);
+//   - an `owned` / `out owned` parameter (transferred into the callee,
+//     genuinely owned by this frame).
+//
+// Scoped to the PLAIN `Task` head only, never `OwningTask` (Pattern B) —
+// mirrors `checkBorrowReturnedThroughOwningType`'s `plainTaskInSyncBody`
+// gate's documented two-pattern split; Pattern B's producer-side rules for
+// this shape are a separate, unmeasured question (filed alongside this fix).
+// Fires from handleReturn (block bodies) and runExprBodyOwningReturnCheck
+// (`=>` expression bodies). // per §30.5, §28.3, §28.6
+//
+// CLASS-T GATE (send-back during self-testing, TWO rounds):
+//
+// Round 1 — `Work<T>(x: T): Task<T> return x; end Work;`, a GENERIC
+// Pattern-A declaration whose T is later instantiated to
+// `int`/`string`/a value-only record/`CancellationToken` (9 lit-test
+// regressions, e.g. `sema/async_generic_instantiation_1595__param_inferred_
+// int_accepted.bzl`) — false-rejected by an earlier version of this check
+// that gated on the head name alone. §30.5's kind-1/2/3 producer regime is
+// scoped to "`Task<T>` for CLASS T" ("Pattern A"); the sibling row, "`Task`
+// and `Task<T>` for copyable value type, string, or runtime-managed T: …
+// no ownership obligation crosses the await boundary", is a DIFFERENT,
+// no-obligation regime this check must not touch.
+//
+// Round 2 (bigger finding) — `tests/lit/ownership/task_family_borrow_
+// return_1786__accept.bzl` (a pinned #1786/SB01-B ACCEPT control, unrelated
+// to this fix, predating it by 100+ revisions) regressed:
+// `public async method Produce(): Task<Conn> return _c; end Produce;` where
+// `Conn` is a class with NO destructor and no `owned` field
+// (`class Conn public method Use(): int => 1; end Conn;`). A class/interface
+// gate alone (`isClassOrInterfaceResult`) is not enough — `Conn` IS a class,
+// so that gate alone still rejected it. The reason the ACCEPT is correct:
+// with no destructor and no `owned` field, `Conn` carries NO disposal
+// obligation at all (§28.9's non-trivial-dispose classification), so there
+// is nothing for the produced task's teardown to double-free — codegen's own
+// `asyncPatternAResultDisposer_` gate (`patternAResultDisposerFor`,
+// LlvmBackend_Async.cpp — a FREE file) makes exactly this distinction via
+// `elementPolicyFor(...).cat == ClassOwned`, and #4285's own diagnostic
+// text is conditioned on `asyncPatternAResultDisposer_` being non-null for
+// precisely this reason ("a no-op without it, so nothing to mis-attach").
+//
+// The ownership-pass-level equivalent of that question is
+// `common::isNonTrivialDisposeClass` (`src/common/OwnershipFacts.hpp` — a
+// FREE file, not held this cycle): "True when `rt` is a class/interface
+// that carries a real disposal obligation — a non-trivial-dispose USER
+// class (has a destructor or `owned` field anywhere in its base chain,
+// §28.9)". It is ALREADY the predicate `Ownership.cpp`'s own §28.3 auto-drop
+// warning gate consults (this file, ~L6375: `common::isNonTrivialDisposeClass(
+// t, ctx_)`) for the analogous question "does producing this class-typed
+// value create a disposal obligation" — the SAME question this check needs
+// to ask about the Pattern-A result, not a coincidentally-similar one (§25).
+// It subsumes the plain class/interface gate (a non-Class declaration
+// short-circuits to `false` at its own top, `OwnershipFacts.cpp` ~L237), so
+// `isClassOrInterfaceResult` is no longer needed here.
+//
+// `MethodOwnership::rhsIsDisposableClassType` (this file, ~L6379) was
+// considered and REJECTED for this gate: its own header comment documents
+// FIVE axes where it disagrees with `isNonTrivialDisposeClass` (base-chain
+// walk, owning-inline-array, captured primary-ctor param, `static owned`,
+// imported-carried-verdict) and states plainly it "answers a coarser,
+// differently scoped question for the §28.10 vacuous-pin lint" — reusing it
+// here would be exactly the "predicate validated for a different question"
+// hazard §25 names, not a shortcut past it.
+//
+// fix #4338: port `taskResultArgIsClass`'s builtin-collection carve
+// (`Ownership_Checks.cpp` fix #3638, `common::isPatternAResultCollectionHead`)
+// into this gate. `isNonTrivialDisposeClass` returns `false` for null-
+// declaration builtin collections (Array, Dictionary, OwningArray, etc.), so
+// Task<Array<T>> was not classified as Pattern A and the bare-identifier
+// return check did not fire — leaving Task<Array<T>> borrowed returns ungated.
+// The `isPatternAResultCollectionHead` membership test (a closed table of the
+// fifteen builtin collection heads that codegen's `patternAResultCollection-
+// Disposer` frees at task teardown) closes the gap: identical to how
+// `awaitTaskKind` (`Ownership_Checks.cpp`) decides whether to demand the
+// owning-location binding from an `await` site (§30.5).
+namespace {
+bool isAsyncPatternAClassResultType(const sema::TypeRef* rt,
+                                     sema::SemaContext& ctx) {
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->nullable)
+        return false;
+    if (rt->headName() != "Task") return false;
+    if (rt->genericArgs.empty() || !rt->genericArgs.front())
+        return false;  // plain `Task` (unit) — no result to classify
+    const sema::TypeRef* arg = rt->genericArgs.front();
+    // User class with a disposal obligation — the primary arm.
+    if (common::isNonTrivialDisposeClass(arg, ctx)) return true;
+    // fix #4338 / #3638: builtin owning/borrowing collections (Array, Dictionary,
+    // OwningArray, etc.) carry disposal obligations but have null declarations.
+    // `isNonTrivialDisposeClass` returns false for them; close the gap with the
+    // same `isPatternAResultCollectionHead` check `awaitTaskKind` uses.
+    if (arg->kind == sema::TypeRef::Kind::Named && !arg->declaration &&
+        arg->astNode && arg->astNode->name &&
+        arg->astNode->name->parts.size() == 1 &&
+        common::isPatternAResultCollectionHead(arg->headName()))
+        return true;
+    return false;
+}
+}  // namespace
+
+void MethodOwnership::checkAsyncPatternABorrowedIdentifierReturn(
+        const ast::Expr& e) {
+    if (!isAsync_ || !returnType_) return;
+    if (!isAsyncPatternAClassResultType(ctx_.resolvedType(*returnType_), ctx_))
+        return;
+    auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e);
+    if (!id) return;
+    if (auto* st = lookupState(id->name)) {
+        // A tracked local: Owned (plain `var`, genuine kind-1 source) is
+        // admitted; Borrowed is the measured defect. Any other tracked state
+        // (Disposed / MovedFrom / PolyNull / Poisoned) is some OTHER check's
+        // business — stay silent rather than double-diagnose.
+        if (st->state != OwnershipState::Borrowed) return;
+        // fix #4338 (v0.298, §15.4 / §28.3 / §28.7): a heap-collection
+        // LITERAL initializer is an admitted async Pattern A producer — the
+        // literal allocates fresh heap backing (§15.4) and the task owns the
+        // result through its disposer (patternAResultCollectionDisposer).
+        // producerState's CollectionLiteralExpr arm cannot decide this on
+        // exprType alone (the literal carries no own type; the type comes
+        // from the surrounding declaration), so the local's states_ entry
+        // is Borrowed. This does NOT make the return a borrow — it is an
+        // owning transfer — so the Pattern-A gate must admit it.
+        // Narrow: we only admit when the local's DECLARED type is a
+        // heap-collection head AND the method's return type is
+        // Task<heap-collection> (the one async Pattern-A shape the 3
+        // originally-failing tests exercise). All other checks see the
+        // local's true Borrowed state and apply unchanged. // per §15.4,
+        // §28.3, §28.7
+        if (auto* sym = ctx_.exprSymbol(*id)) {
+            if (auto* ls = dynamic_cast<sema::LocalSymbol*>(sym)) {
+                // LOCALDECL-ONLY: a `const X: HeapCollection := [...];` is
+                // rejected by §21.1 before this gate; `using var X` already
+                // has lo.state Owned so the Borrowed early-return admits it.
+                if (auto* ld = dynamic_cast<const ast::LocalDecl*>(ls->decl)) {
+                    if (dynamic_cast<const ast::CollectionLiteralExpr*>(
+                            ld->initializer.get()) &&
+                        ld->type) {
+                        if (const sema::TypeRef* rt =
+                                ctx_.resolvedType(*ld->type)) {
+                            if (rt->kind == sema::TypeRef::Kind::Named &&
+                                !rt->headName().empty() &&
+                                common::isPatternAResultCollectionHead(
+                                    rt->headName())) {
+                                // The local is typed as a heap collection and
+                                // initialized by a heap-collection literal:
+                                // admissible Pattern-A async producer.
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        reportAsyncPatternABorrowedIdentifierReturn(e);
+        return;
+    }
+    auto* sym = ctx_.exprSymbol(*id);
+    if (!sym) return;
+    if (auto* ps = dynamic_cast<sema::ParameterSymbol*>(sym)) {
+        if (ps->modifier == "owned" || ps->modifier == "out owned")
+            return;  // genuinely owned parameter — admitted
+        reportAsyncPatternABorrowedIdentifierReturn(e);
+        return;
+    }
+    if (dynamic_cast<sema::FieldSymbol*>(sym)) {
+        // Implicit-`this` bare field read — unconditionally a borrow per
+        // §28.3 Producers, exactly like the explicit `this.f` spelling
+        // #4285 already rejects (MemberAccessExpr).
+        reportAsyncPatternABorrowedIdentifierReturn(e);
+        return;
+    }
+    // Anything else (an unresolved symbol, a type name in expression
+    // position, …) — not this check's business.
+}
+
+// fix #4311: shared diagnostic for `checkAsyncPatternABorrowedIdentifierReturn`
+// — deliberately WORDED IDENTICALLY to `fix #4285`'s
+// `detectAsyncPatternAKind` diagnostic (LlvmBackend_Async.cpp) so the two
+// AST shapes of the SAME §30.5 kind-1 violation (a direct field/property/
+// indexer read vs. a bare identifier naming a borrowed local/parameter/
+// implicit field) read to the user as ONE rule, not two — including the
+// exact fragment ("§30.5 Pattern A) may only `return` an OWNED expression")
+// #4285's own regression test keys its diagnostic-text assertion on.
+void MethodOwnership::reportAsyncPatternABorrowedIdentifierReturn(
+        const ast::Expr& e) {
+    report(
+        Severity::Error, e.span.begin,
+        "an async method returning a class-typed `Task<T>` (§30.5 "
+        "Pattern A) may only `return` an OWNED expression on a "
+        "non-`await` return path — §30.5 kind 1: \"a `return` of an "
+        "owned expression: the task owns the result and its "
+        "destructor disposes it directly.\" A bare identifier naming a "
+        "BORROWED local, a plain (non-`owned`) parameter, or an "
+        "implicit-`this` field read is a BORROW with no admitted "
+        "producer-side chain (§28.3 *Producers*: a plain field/property/"
+        "indexer read is Borrowed even when the field itself is `owned` — "
+        "only `move obj.f` transfers it), so the task's teardown "
+        "would dispose a value it never owned, a use-after-free once "
+        "the real owner disposes it independently. If the value is "
+        "genuinely owned by this frame, return the owned local/parameter "
+        "directly (or transfer a field with `move`); otherwise return "
+        "`await` an admitted Pattern A source instead");
+}
+
+// fix #4349 (§30.5 Pattern A / §28.3 Producers, v0.298): the LAMBDA-BODY
+// sibling of `checkAsyncPatternABorrowedIdentifierReturn`. The latter is wired
+// only into `handleReturn` / `runExprBodyOwningReturnCheck` (the entry points
+// for a top-level METHOD's own return statements / expression body) and is
+// NEVER invoked for a lambda's own body — lambda bodies are walked by the
+// separate `checkLambdaTaskFamilyBorrowReturns{,Expr}` pre-pass (SB01-B),
+// which answers a DIFFERENT, narrower question (whether the lambda VALUE
+// itself is a borrow of a task-family object, not whether the lambda's OWN
+// async body borrows its produced T). Consequence: an `async lambda` that is
+// itself a Pattern-A `Task<T:class>` producer and returns a bare
+// `IdentifierExpr` naming a borrowed local compiles clean and reproduces the
+// EXACT §30.5 kind-1 heap-use-after-free #4311 exists to close — just reached
+// through a lambda instead of a method. (The codegen sibling from #4285 IS
+// reached correctly for the same lambda body — codegen's `detectAsyncPattern
+// AKind` reaches lambda bodies via the shared `lowerReturnStmt` /
+// `emitAsyncLambda` path. Only the ownership-pass bare-identifier check
+// #4311 added fails to reach lambdas.)
+//
+// Drive the check over each lambda's own body with the LAMBDA's own `isAsync`
+// and effective return type. The lambda's body has NOT been dataflowed by the
+// enclosing method's `run()`, so a fresh `MethodOwnership sub` has no
+// `states_` to consult and the existing check's `lookupState` path is
+// unavailable here — instead, resolve a same-lambda local to its own
+// LocalDecl / LocalConstDecl and classify the initializer via
+// `producerState` (the SAME one the existing check uses for the
+// `MemberAccessExpr` arm via `isBorrowableType`, just exposed via a
+// different lever). This mirrors `checkOneLambdaOwnedReturnDirectBorrow`'s
+// structure (Ownership.cpp, #4005) for the owned-target sibling case.
+//
+// Scoped identically to `checkAsyncPatternABorrowedIdentifierReturn`:
+//   * PLAIN `Task` head only — never `OwningTask` (Pattern B is a separate,
+//     unmeasured question, see the boundary row in the sibling fix's test
+//     file).
+//   * Result T must be a class with a real disposal obligation (§28.9 —
+//     `isNonTrivialDisposeClass`); a value / unit / runtime-managed / no-
+//     dispose class result has nothing for the produced task's teardown to
+//     double-free, so is admitted.
+//   * A non-`async` lambda (or one whose effective return type we cannot
+//     resolve) is OUT — its body returns a task directly, governed by SB01-B
+//     instead. The SB01-B sibling check makes the same observation at its own
+//     `if (lam.isAsync) return;` guard (an `async` lambda auto-satisfies
+//     SB01-B because its body returns T, not a task).
+//
+// Rejects (mirroring the sibling check's arms):
+//   * a LAMBDA parameter that is non-`owned` (a borrow of the caller's
+//     argument);
+//   * an implicit-`this` field read (the bare-identifier spelling of the
+//     SAME unconditional borrow #4285 rejects via the explicit `this.f`
+//     spelling);
+//   * a CAPTURED local from an ENCLOSING scope (always a borrow — the
+//     lambda did not itself produce the value; the enclosing scope's own
+//     discharge / `using var` scope-end auto-drop disposes it);
+//   * a same-lambda local whose initializer classifies `Borrowed` via
+//     `producerState` (a plain field / property / indexer read, a non-`move`
+//     `obj.f`, a borrowed parameter pass-through, a captured value rebind,
+//     … — the measured defect shape: `var borrowed := h.item; return
+//     borrowed;`).
+//
+// Admits:
+//   * a fresh producer (`new T(...)`, an `owned`-returning call, `move` of
+//     an OWNED source);
+//   * a same-lambda local whose initializer is NOT Borrowed (the local
+//     itself is then a genuine kind-1 source);
+//   * an `owned` / `out owned` parameter (genuinely owned, transferred into
+//     the callee);
+//   * anything `producerState` cannot positively classify — conservative,
+//     so a legal kind-1 return is never over-rejected.
+// // per §30.5, §28.3, §28.6
+void MethodOwnership::checkOneLambdaAsyncPatternABorrowedIdentifierReturn(
+        const ast::LambdaExpr& lam,
+        const sema::TypeRef* expectedFnType) {
+    // Same gating the sibling check does at the top
+    // (`if (!isAsync_ || !returnType_) return;`) — applied to the LAMBDA's
+    // own `isAsync` (an `async` lambda's body is its awaited value, T, not
+    // a task frame; only then is the lambda a Pattern-A producer) and the
+    // LAMBDA's own effective return type (resolved exactly as
+    // checkOneLambdaTaskFamilyBorrowReturn does it — `lamTy->funcReturn`
+    // first, falling back to the caller-supplied `expectedFnType` for a
+    // lambda whose type is dictated by its position but left un-inferred
+    // there, see its own header comment). // per §30.1, §30.5
+    if (!lam.isAsync) return;
+    // Pattern A's authority is the USER-DECLARED `Task<T>` slot — Pattern A
+    // is per §30.5 the rule that applies to a `Task<T:class>` async
+    // producer's bare-`return` result lifetime, and codegen uses exactly
+    // this same declared-task-type for its `patternAResultDisposerFor(
+    // declaredTaskTy)` gate (LlvmBackend_Async.cpp:1198 and :1863 — the
+    // two `asyncPatternAResultDisposer_` setters; the per-lambda one at
+    // 1863 receives `declaredTaskTy` straight from
+    // `lowerLambda`'s `lambdaReturnType` resolution). The lambda LITERAL's
+    // own `lamTy->funcReturn`, by contrast, is the typechecker's
+    // auto-coercion — an `async lambda() => do … end;` whose body returns
+    // a class T is INFERRED as `() -> OwningTask<T>` (Pattern B), not
+    // `() -> Task<T>` (Pattern A), per the `if (!hasAscription &&
+    // lam->isAsync && inferredReturn)` arm in sema's LambdaExpr handler
+    // (ExprTypecheck_Exprs.cpp:9610-9626). A user-declared
+    // `() -> Task<T>` slot can carry an inferred `() -> OwningTask<T>`
+    // inside it (Pattern B's auto-wrap of an un-ascribed async result
+    // happens regardless of the target's head name); the runtime's task
+    // is then built as an `OwningTask<T>`, and codegen's
+    // `asyncPatternAResultDisposer_` is set from `declaredTaskTy` (the
+    // user's `Task<T>`, not the inferred `OwningTask<T>`). So this
+    // ownership-pass twin must gate on `expectedFnType` FIRST (the
+    // declared function type, when present), and only fall back to
+    // `lamTy->funcReturn` when no declared type is in scope (the bare
+    // `var f := async lambda() => do … end;` shape, which has no
+    // declared `Task<T>` to gate against anyway, since the inferred
+    // `OwningTask<T>` already implies Pattern B's stricter rule applies
+    // and is governed by `checkOneLambdaOwnedReturnDirectBorrow`).
+    // // per §30.5, §28.3
+    const sema::TypeRef* lamTy = ctx_.exprType(lam);
+    const sema::TypeRef* effRet = nullptr;
+    if (expectedFnType &&
+        expectedFnType->kind == sema::TypeRef::Kind::Function &&
+        expectedFnType->funcReturn) {
+        effRet = expectedFnType->funcReturn;
+    } else if (lamTy && lamTy->kind == sema::TypeRef::Kind::Function &&
+               lamTy->funcReturn) {
+        effRet = lamTy->funcReturn;
+    }
+    if (!effRet) return;
+    // The two-pattern split mirrors
+    // `checkAsyncPatternABorrowedIdentifierReturn` — Pattern A only (plain
+    // `Task` head; Pattern B's producer-side rules for this shape are a
+    // separate, unmeasured question, filed alongside #4311). The class-
+    // with-disposal-obligation gate uses the SAME `isNonTrivialDisposeClass`
+    // predicate the sibling check lives by — "True when `rt` is a
+    // class/interface that carries a real disposal obligation" — so a
+    // no-dispose class (or value / unit / runtime-managed T) does not
+    // mis-fire. // per §30.5, §28.9
+    if (!isAsyncPatternAClassResultType(effRet, ctx_)) return;
+    auto classifyReturn = [&](const ast::Expr& re) {
+        auto* id = dynamic_cast<const ast::IdentifierExpr*>(&re);
+        if (!id) return;  // the sibling check's own first guard
+        sema::Symbol* sym = ctx_.exprSymbol(*id);
+        if (!sym) return;  // the sibling check's own second guard
+        if (auto* ps = dynamic_cast<sema::ParameterSymbol*>(sym)) {
+            // A lambda parameter that is non-`owned` is a borrow of the
+            // caller's argument (§28.3 producers: "Parameter `p` (no
+            // modifier) | Borrowed (source: caller)"). An `owned` /
+            // `out owned` parameter is genuinely owned by this frame
+            // (transferred in) and is admitted. // per §28.3, §30.5
+            if (ps->modifier == "owned" || ps->modifier == "out owned")
+                return;
+            reportAsyncPatternABorrowedIdentifierReturn(re);
+            return;
+        }
+        if (dynamic_cast<sema::FieldSymbol*>(sym)) {
+            // Implicit-`this` bare field read — unconditionally a borrow
+            // per §28.3 Producers, exactly like the explicit `this.f` /
+            // `obj.f` spelling #4285 already rejects (MemberAccessExpr).
+            // // per §28.3, §30.5
+            reportAsyncPatternABorrowedIdentifierReturn(re);
+            return;
+        }
+        if (auto* ls = dynamic_cast<sema::LocalSymbol*>(sym)) {
+            // The lambda body has NOT been dataflowed by the enclosing
+            // method's `run()` — a fresh `MethodOwnership sub` has no
+            // `states_` to consult, so the sibling check's `lookupState`
+            // path is unavailable here. Resolve the local to its own
+            // declaration and classify the initializer via `producerState`
+            // — the SAME classifier `checkOneLambdaOwnedReturnDirectBorrow`
+            // uses for the owned-target sibling case (see that function's
+            // own comment for the rationale: a same-lambda local is
+            // reclassified by its own initializer, not by an enclosing
+            // method's `states_`).
+            //
+            // A CAPTURED local from an enclosing scope is unconditionally a
+            // borrow for this lambda's purposes — the lambda did not itself
+            // produce the value, the enclosing scope's own discharge (a
+            // `using var`'s scope-end auto-drop, or an ordinary owned-
+            // local discharge) is what disposes it. Returning it bare here
+            // would mint a SECOND discharge path (the freshly-produced
+            // task owns it per §30.5 kind 1) for the same object — the
+            // exact `var mk: () -> owned Res := lambda() => b;` shape
+            // #4005 closes for the owned-target case. Distinguish by span
+            // containment exactly as `checkOneLambdaOwnedReturnDirectBorrow`
+            // does. // per §30.5, §28.3, §28.6
+            if (!ls->decl) return;  // no decl reachable — conservative
+            const bool declaredInLambda =
+                ls->decl->span.begin.offset >= lam.span.begin.offset &&
+                ls->decl->span.end.offset <= lam.span.end.offset;
+            if (!declaredInLambda) {
+                reportAsyncPatternABorrowedIdentifierReturn(re);
+                return;
+            }
+            const ast::Expr* init = nullptr;
+            if (auto* ld = dynamic_cast<const ast::LocalDecl*>(ls->decl))
+                init = ld->initializer.get();
+            else if (auto* lc =
+                         dynamic_cast<const ast::LocalConstDecl*>(ls->decl))
+                init = lc->value.get();
+            if (!init) return;  // no initializer reachable — conservative
+            MethodOwnership sub(ctx_);
+            if (sub.producerState(*init) == OwnershipState::Borrowed)
+                reportAsyncPatternABorrowedIdentifierReturn(re);
+            return;
+        }
+        // Anything else (an unresolved symbol, a type name in expression
+        // position, …) — not this check's business. Mirrors the sibling
+        // check's tail.
+    };
+    // Block body: walk every `return EXPR` reachable without crossing a
+    // nested lambda (a nested lambda's returns belong to it and are
+    // checked when the collector reaches it separately — exactly the
+    // contract `scanReturnsIn` documents). Expression body: classify the
+    // single expression directly. Mirrors
+    // `checkOneLambdaTaskFamilyBorrowReturn` / `-OwnedReturnDirectBorrow`'s
+    // own tail structure verbatim. // per §28.3, §30.5
+    if (lam.exprBody) {
+        classifyReturn(*lam.exprBody);
+        return;
+    }
+    for (const auto& s : lam.stmts)
+        if (s) scanReturnsIn(*s, classifyReturn);
 }
 
 // #2175(a) / §28.3 v0.226 (spec "Returning a deferred-activation frame"):

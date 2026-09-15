@@ -1458,9 +1458,18 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         // than one env can share it — see armMutatedSharedCaptureCell. The
         // retain and the envdtor release are then suppressed TOGETHER; keeping
         // the retain alone would merely move the leak.
-        ce.suppressContentRcInEnvdtor = mutatedSharedCaptureCell(
-            static_cast<const void*>(sym), ce.semaTy,
-            /*freshCellPerIteration=*/false);
+        //
+        // fix #4198: OR when the parameter is directly RETURNED BY NAME from
+        // this function — see capturedLocalReturnedByName's declaration for
+        // why that is a second, independent hazard (the return's silent
+        // transfer and the envdtor's content release both claim the same
+        // reference).
+        ce.suppressContentRcInEnvdtor =
+            mutatedSharedCaptureCell(
+                static_cast<const void*>(sym), ce.semaTy,
+                /*freshCellPerIteration=*/false) ||
+            capturedLocalReturnedByName(static_cast<const void*>(sym),
+                                         ce.semaTy);
         if (!ce.suppressContentRcInEnvdtor) {
             if (isStringTypeRefNonNull(ce.semaTy)) {
                 llvm::Value* str =
@@ -1995,9 +2004,20 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         // strings. Note the flag is consulted for EVERY capture of such a
         // variable, not only the `alreadyBoxed` ones, because it is the ENVDTOR
         // release (which the first env also emits) that must go away.
-        ce.suppressContentRcInEnvdtor = mutatedSharedCaptureCell(
-            static_cast<const void*>(decl), ce.semaTy,
-            /*freshCellPerIteration=*/forceFresh);
+        //
+        // fix #4198: OR when `decl` is directly RETURNED BY NAME from this
+        // function — capturedLocalReturnedByName's declaration has the full
+        // argument. Independent of assignedCaptureVars_: a READ-ONLY capture
+        // that is separately returned hits the identical heap-use-after-free
+        // (the return's silent transfer and the envdtor's content release
+        // both claim the frame's one reference), with no write anywhere in
+        // the program.
+        ce.suppressContentRcInEnvdtor =
+            mutatedSharedCaptureCell(
+                static_cast<const void*>(decl), ce.semaTy,
+                /*freshCellPerIteration=*/forceFresh) ||
+            capturedLocalReturnedByName(static_cast<const void*>(decl),
+                                         ce.semaTy);
         // fix #3752 (§28.2 / §27.5 / §28.9, v0.286): THE FIRST capture's
         // envdtor is the captured local's DEFERRED SCOPE-END RELEASE — and a
         // deferred release is only sound when the env dies at or AFTER the
@@ -2527,6 +2547,40 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         // duration of the nested call so the lambda's own completion sites see
         // "no owned-param frame" (a correct no-op).
         asyncOwnedParamFrame_ = nullptr;
+        // fix #4118 (§30.5, v0.295): asyncChainedReturn_ / asyncBorrowedReturn_
+        // are the §30.5 Pattern A return-kind detection flags — deliberately
+        // NOT part of BEZEL_SM_FRAME_MEMBERS (LlvmBackend_impl.hpp's own
+        // comment: "saved where they are needed, by name, because they are
+        // not clearSmFrame()'s business"), so SmFrameSaveScope above does not
+        // touch them. They are a TRANSIENT publish/consume channel: an
+        // enclosing `return await <call>` sets one of them true BEFORE
+        // lowering its operand, and reads it back (read-and-reset) AFTER —
+        // see LlvmBackend_Assign.cpp's NestedBodyScope comment on fix #2731
+        // item 1. When that operand is itself an async-lambda IIFE
+        // (`return await (async lambda() => ...)()`), lowering it reaches
+        // HERE and calls emitAsyncLambda for the NESTED lambda's own
+        // machine — whose own completion (LlvmBackend_Async.cpp) does the
+        // identical unconditional read-and-reset for ITSELF. Without a
+        // save/reset/restore around that nested call, the nested body
+        // inherits the OUTER's already-set flag (misclassifying its OWN
+        // return kind and attaching the wrong runtime disposer call to
+        // itself) and then clears it to false, so the outer's own read-back
+        // sees `false` and ALSO misclassifies (its kind-2 chained return
+        // looks like a plain kind-1 return) — the two kind decisions swap.
+        // This mirrors fix #2747's identical treatment in the SYNC branch
+        // below (the sync branch's own nested body reads/resets the exact
+        // same flags via emitReturn) and NestedBodyScope's by-name handling —
+        // added here by name, NOT by folding into BEZEL_SM_FRAME_MEMBERS,
+        // because these two are DESTRUCTIVE (they select which
+        // bz_task_set_chained / bz_task_set_result_disposer call is emitted,
+        // not a soft hint), and folding them into the macro would also
+        // reshape NestedBodyScope's already-correct-by-name handling of the
+        // identical pair into duplicate macro-generated members — out of
+        // scope here per LANE_RULES coordination with the #4143 lane.
+        bool savedAsyncChainedReturn = asyncChainedReturn_;
+        bool savedAsyncBorrowedReturn = asyncBorrowedReturn_;
+        asyncChainedReturn_ = false;
+        asyncBorrowedReturn_ = false;
         // emitAsyncLambda recomputes closure-release AND capture-cell-free
         // eligibility for the LAMBDA's own body and keys them to the lambda resume
         // fn. The ENCLOSING function's eligibility (which governs whether THIS
@@ -2552,6 +2606,7 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         auto savedBoxCaptureLocals = boxCaptureLocals_;
         auto savedSingleCaptureLocals = singleCaptureLocals_;
         auto savedAssignedCaptureVars = assignedCaptureVars_;  // fix #2706
+        auto savedReturnedCaptureVars = returnedCaptureVars_;  // fix #4198
         llvm::Function* savedBoxCaptureLocalsFn = boxCaptureLocalsFn_;
         auto savedDefinitelyEscaping = definitelyEscapingLambdas_;
         // #2132: emitAsyncLambda now ALSO recomputes the borrowing-array /
@@ -2627,6 +2682,7 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         boxCaptureLocals_ = std::move(savedBoxCaptureLocals);
         singleCaptureLocals_ = std::move(savedSingleCaptureLocals);
         assignedCaptureVars_ = std::move(savedAssignedCaptureVars);  // fix #2706
+        returnedCaptureVars_ = std::move(savedReturnedCaptureVars);  // fix #4198
         boxCaptureLocalsFn_ = savedBoxCaptureLocalsFn;
         definitelyEscapingLambdas_ = std::move(savedDefinitelyEscaping);
         borrowingArrayFreeEligible_ = std::move(savedBorrowingArrayFreeElig);
@@ -2651,9 +2707,13 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         moveOnlyArrayTransferred_ = std::move(savedMoveOnlyArrayTransferred);
         moveOnlyArrayTransferredFn_ = savedMoveOnlyArrayTransferredFn;
         // fix #3505: the whole sm*_/async*_ frame is put back by smFrameSave's
-        // destructor at the end of this block. Only the member that is NOT part
-        // of the retracted frame is restored by hand.
+        // destructor at the end of this block. Only the members that are NOT
+        // part of the retracted frame are restored by hand.
         asyncHandlerSpillSlots_ = std::move(savedAsyncHandlerSpillSlots);
+        // fix #4118: restore the §30.5 Pattern A flags the save/reset above
+        // set aside — see the comment there.
+        asyncChainedReturn_ = savedAsyncChainedReturn;
+        asyncBorrowedReturn_ = savedAsyncBorrowedReturn;
     } else {
     // fix #3237: a SYNC lambda body nested inside an async method also needs
     // the enclosing machine's sm*_/async*_ fields cleared — the sync lambda
@@ -2808,6 +2868,43 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         singleCaptureLocals_.clear();
     }
     assignedCaptureVars_.clear();          // fix #2706
+    // fix #4226 (§27.5 / §28.9, v0.298): snapshot the ANCESTOR scope's
+    // already-computed returnedCaptureVars_ before it is cleared for THIS
+    // nested lambda's own re-scan — see the merge just below (after the
+    // #3804 sharedCellEnvdtorFreeOwner_ merge, same pattern) for the full
+    // argument. Without this, a local declared and returned TWO OR MORE
+    // scopes up (e.g. `f` in a grandparent function, `return f;` there, `f`
+    // captured transitively by an intermediate lambda purely to hand it down
+    // to a lambda nested inside THAT lambda) loses the fact once the
+    // intermediate lambda's own collectBoxCaptureLocals rescan clears and
+    // repopulates returnedCaptureVars_ from ONLY its own top-level `return`
+    // statements (there are none — the intermediate lambda never itself
+    // returns `f`) — so the doubly-nested lambda's own capture-loop entry for
+    // `f` (consulted while currentFn_ == boxCaptureLocalsFn_ == the
+    // INTERMEDIATE lambda's fn) sees an empty set and never suppresses its
+    // own envdtor's content release, freeing `f`'s cell while the value is
+    // still needed by the true caller (issue #4226; #4198 only reached the
+    // one-level case, where the returning function IS the one whose
+    // collectBoxCaptureLocals call sees `f`'s capturer directly).
+    const std::unordered_set<const void*> ancestorReturnedCaptureVars4226 =
+        returnedCaptureVars_;
+    returnedCaptureVars_.clear();          // fix #4198
+    // fix #4240 (§27.5 / §28.9, v0.298): snapshot the ANCESTOR scope's
+    // already-computed multiCaptureLocals_ before collectBoxCaptureLocals
+    // (below) clears+recomputes it for THIS nested lambda's own re-scan — see
+    // the merge just below (after the #4226 returnedCaptureVars_ merge, same
+    // pattern) and multiCaptureLocals_'s own declaration for the full
+    // argument. Without this, a cell shared by an ANCESTOR env (which holds
+    // a reference PURELY to hand it down to a lambda nested inside it,
+    // without itself appearing in `lam.stmts`'s own collectAllLambdas result)
+    // is undercounted by exactly the ancestor's own +1 contribution, so a
+    // truly 2+-env cell looks single-captured from this narrower rescan —
+    // which flips mutatedSharedCaptureCell's verdict on a WRITTEN cell from
+    // "suppress both retain and release" to "suppress neither", unbalancing
+    // the pair (issue #4240: heap-use-after-free, `freed by ... envdtor`, on
+    // a mutated-not-returned two-level-nested capture).
+    const std::unordered_set<const void*> ancestorMultiCaptureLocals4240 =
+        multiCaptureLocals_;
     definitelyEscapingLambdas_.clear();
     boxCaptureLocalsFn_ = fn;
     cellFreeEligible_.clear();
@@ -2888,7 +2985,47 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     // `outer`) reproduce this precisely.
     for (const auto& [k, v] : ancestorSharedCellOwner3804)
         sharedCellEnvdtorFreeOwner_.emplace(k, v);
+    // fix #4226 (§27.5 / §28.9, v0.298): merge the ancestor's
+    // returnedCaptureVars_ back in for any key THIS body's own rescan (just
+    // above, inside collectBoxCaptureLocals for a block body, or left empty
+    // for an expression body — same "applies to BOTH branches" reasoning as
+    // the #3804 merge immediately above) does not know about. A plain
+    // `insert` is correct (not `emplace`-into-a-map): the set is a pure
+    // membership fact ("returned by name somewhere in the enclosing chain"),
+    // so a union is always sound and this lambda's own fresh discoveries
+    // (if it itself directly returns the same decl) are simply ALSO in the
+    // set either way.
+    for (const void* k : ancestorReturnedCaptureVars4226)
+        returnedCaptureVars_.insert(k);
+    // fix #4240 (§27.5 / §28.9, v0.298): merge the ancestor's
+    // multiCaptureLocals_ back in for any key THIS body's own rescan does
+    // not know about (same "applies to BOTH branches" reasoning as the two
+    // merges immediately above — the expr-body branch never touches
+    // multiCaptureLocals_ at all, so the loop below is a harmless self-union
+    // there), AND ERASE those same keys from THIS scan's singleCaptureLocals_.
+    // A plain union alone is not enough: singleCaptureLocals_'s callers
+    // (mutatedSharedCaptureCell, the two #694/#3426 sole-holder cell-free
+    // gates) all read singleCaptureLocals_ directly, so the ancestor's
+    // "known shared by 2+" verdict must overturn a wrong "looks single"
+    // membership THIS rescan produced, not merely coexist with it in a
+    // second set nobody consults. Erasing is sound in only one direction,
+    // and it is the safe one: it can only REMOVE a key from
+    // singleCaptureLocals_, never add one, so it can only make the
+    // sole-holder gates MORE conservative (a bounded leak on the newly
+    // excluded key, never an over-free) — never less.
+    for (const void* k : ancestorMultiCaptureLocals4240) {
+        multiCaptureLocals_.insert(k);
+        singleCaptureLocals_.erase(k);
+    }
     closureReleaseEligibleFn_ = fn;
+    // fix #4174 follow-up: the closure twin of the string parameter retain
+    // above (line ~2479) — see retainAssignedClosureParams' own comment.
+    // Paired with the closureReleaseEligibleFn_ = fn pin just above and the
+    // !lam.exprBody collectClosureReleaseEligible(lam.stmts) call earlier in
+    // this function; an expression body has no assignment statement, so it
+    // is excluded exactly as the string sibling excludes it.
+    if (!lam.exprBody && paramSyms)
+        retainAssignedClosureParams(lam.stmts, *paramSyms);
     // Emit body.
     if (lam.exprBody) {
         llvm::Value* v = nullptr;
@@ -2906,10 +3043,70 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(
                 lam.exprBody.get())) {
             if (sema::TypeRef* rt = ctx_.exprType(*lam.exprBody)) {
-                if (!cl->isDict)
-                    v = materializeHeapCollectionLiteral(cl, rt);
-                else
+                if (!cl->isDict) {
+                    // fix #4331 (§15.1 / §8.6, v0.298): an expression-bodied
+                    // lambda returning an inline array (`() -> [N]T`) was never
+                    // handled here — `materializeHeapCollectionLiteral` returns
+                    // null for inline arrays (they are not heap collections), and
+                    // `lowerExpr` returns null for `CollectionLiteralExpr`, so
+                    // `v` stayed null and the lambda emitted a null/zero inline
+                    // array return. Mirror the inline-array materialization logic
+                    // from `lowerReturnStmt` (LlvmBackend_Stmts.cpp lines ~2139-
+                    // 2190) and `lowerLocalDecl` (LlvmBackend_Setup.cpp lines
+                    // ~14581-14637): build the inline array on the stack and
+                    // return it by value.
+                    if (rt->kind == sema::TypeRef::Kind::InlineArray) {
+                        if (auto* aty = llvm::dyn_cast<llvm::ArrayType>(
+                                lowerTypeRef(rt))) {
+                            llvm::Type* elemTy = aty->getElementType();
+                            llvm::AllocaInst* tmp = entryAlloca(aty);
+                            for (std::size_t i = 0;
+                                 i < cl->elements.size(); ++i) {
+                                if (!cl->elements[i]) continue;
+                                llvm::Value* ev = lowerExpr(*cl->elements[i]);
+                                if (!ev) {
+                                    ev = lowerCollectionLiteralElementOrUnitNull(
+                                        *cl->elements[i], elemTy);
+                                    if (!ev) continue;
+                                }
+                                if (ev->getType() != elemTy &&
+                                    ev->getType()->isIntegerTy() &&
+                                    elemTy->isIntegerTy()) {
+                                    unsigned eb =
+                                        ev->getType()->getIntegerBitWidth();
+                                    unsigned db =
+                                        elemTy->getIntegerBitWidth();
+                                    ev = db > eb
+                                             ? builder_.CreateSExt(ev, elemTy)
+                                             : builder_.CreateTrunc(ev,
+                                                                    elemTy);
+                                }
+                                // fix #4331 / §8.6: box a value-typed (record)
+                                // element into its box representation before the
+                                // nullable-slot wrap below — mirrors the same
+                                // boxForTarget call in `lowerReturnStmt` (#4317)
+                                // and `lowerLocalDecl` (#4335). No-op for a class
+                                // element (already a bare pointer) or a
+                                // non-Object/interface element type.
+                                ev = boxForTarget(ev, rt->arrayElement,
+                                                  cl->elements[i].get());
+                                llvm::Value* gep = builder_.CreateGEP(
+                                    aty, tmp,
+                                    {builder_.getInt32(0),
+                                     builder_.getInt32((int)i)});
+                                // #813 / §15.1: wrap into the nullable-value
+                                // slot struct `{i8, T}` for a `[N]T?` literal.
+                                builder_.CreateStore(
+                                    coerceToNullableSlot(elemTy, ev), gep);
+                            }
+                            v = builder_.CreateLoad(aty, tmp, "lam.inlarr");
+                        }
+                    } else {
+                        v = materializeHeapCollectionLiteral(cl, rt);
+                    }
+                } else {
                     v = materializeHeapDictLiteral(cl, rt);
+                }
             }
         }
         if (!v) v = lowerExpr(*lam.exprBody);
@@ -3245,6 +3442,41 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
                     llvm::Value* box =
                         builder_.CreateLoad(ptrTy(), cell, "box");
                     emitBoxRelease(box);
+                } else if (ce.freeCellInEnvdtor &&
+                           isDictEntryStringKeyTypeRef(ce.semaTy)) {
+                    // fix #4127 (§27.5/§28.9, stdlib §4.8, v0.295): a
+                    // string-keyed `DictionaryEntry<string,V>` local (bound
+                    // directly to `d.First()`/`.Last()`/`.Single()`/
+                    // `.ElementAt(i)`, per isFreshDictEntryKeyReleaseTerminalLocal
+                    // / #3720) captured by the sole, definitely-escaping
+                    // closure this envdtor belongs to (the SAME
+                    // freeCellInEnvdtor proof that makes freeing the cell
+                    // below safe: exactly one holder, and that holder
+                    // outlives the frame — #694). The local's own scope-end
+                    // `dictEntryKeyRelease` disposal was never registered for
+                    // it (StringEscapeWalker treats ANY capture as an escape,
+                    // per that disposal's own eligibility walk), so the
+                    // rebuilt Key's single producer +1 is otherwise never
+                    // discharged — exactly #4127's leak. The cell holds the
+                    // `{ptr Key, V Value}` struct BY VALUE; Key is field 0,
+                    // so loading a `ptr` directly off the cell's base address
+                    // (no GEP needed — field 0 is always at offset 0) reads
+                    // it, identical in shape to the plain-string-capture
+                    // branch above. `entry.Value` is never touched here: a
+                    // Dictionary<K,V> keeps ownership of its values (stdlib
+                    // §4.8) — `Value` is always a borrow, never released.
+                    // NOT extended to a for-loop variable's DictionaryEntry
+                    // capture (`entry` in `for var entry in d`): `!isForVar`
+                    // is a hard precondition of `freeCellInEnvdtor` itself
+                    // (a for-var's cell is fresh per iteration, so no single
+                    // envdtor could be its one reclaim site) — that shape is
+                    // #4129/#4161's territory, unaffected by this branch. No
+                    // retain-balancing concern either: singleCaptureLocals_
+                    // guarantees no OTHER capture of this local exists to
+                    // share the +1 with.
+                    llvm::Value* key =
+                        builder_.CreateLoad(ptrTy(), cell, "dictek.envdtor");
+                    emitStringRelease(key);
                 }
                 // All other capture types (value, class borrow): no action.
                 // §27.5 / #694: free the 8-byte capture CELL itself when this is
@@ -3453,6 +3685,45 @@ llvm::Value* Emitter::lowerWith(const ast::WithExpr& we) {
                                  builder_.getInt32(
                                      static_cast<unsigned>(k))}));
                     }
+                    continue;  // field handled — skip the lowerExpr path below
+                }
+            }
+        }
+        // fix #4346 / §15.4 / §9.5: a `with`-replacement value that is a
+        // collection literal `[e1, …]` targeting a HEAP-COLLECTION field
+        // (`Array<T>`, `Dictionary<K,V>`, etc.). lowerExpr returns null for
+        // CollectionLiteralExpr, so the plain `lowerExpr` + `if (!v) continue`
+        // below hit the #1386 backstop and ICEd. Mirror the LocalDecl /
+        // FieldDecl / ReturnStmt / call-arg paths: materialize a fresh
+        // `bz_array_t*` (or `bz_dict_t*`) and store the pointer into the
+        // field slot. The source record is unmodified and still owns its own
+        // collection — the new record owns the freshly-materialized one —
+        // so no dispose-old is needed here (the new slot's ownership is
+        // established when we store the new pointer; the source's collection
+        // outlives the with-expression because nothing has touched it).
+        if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(
+                a.value.get())) {
+            const sema::TypeRef* fldTy = recordMemberTypeResolved(m);
+            if (fldTy) {
+                if (llvm::Value* heapArr =
+                        materializeCollectionLiteralForArg(cl, fldTy)) {
+                    llvm::Value* fslot =
+                        builder_.CreateStructGEP(st, base, idxIt->second);
+                    // fix #4350 / §28.9 / §21.1: the freshly-materialized heap
+                    // collection is stored into the result record's field. The
+                    // result record is a value type returned by `lowerWith` and
+                    // has no Dispose method (records are borrow-only for heap
+                    // collection fields — §9.7 "no disposer"); without this
+                    // registration the bz_array_t (and its backing for a
+                    // Dictionary) leaks. Register the disposal at the current
+                    // scope: create a shadow alloca holding the pointer so the
+                    // disposeStack_ entry is valid at scope-end emission.
+                    llvm::AllocaInst* shadow = entryAlloca(heapArr->getType());
+                    builder_.CreateStore(heapArr, shadow);
+                    if (!disposeStack_.empty())
+                        disposeStack_.back().push_back(
+                            buildCollectionTempDisposal(shadow, fldTy));
+                    builder_.CreateStore(heapArr, fslot);
                     continue;  // field handled — skip the lowerExpr path below
                 }
             }
@@ -10732,7 +11003,16 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
     // A choice's NamedPattern never resolves through the enum-constant or
     // type-test legs below (choice cases carry no enumValue_ entry and no
     // descriptor), so this early branch is the only path that admits them.
-    if (scrutTy && scrutTy->kind == sema::TypeRef::Kind::Named &&
+    // fix #4399 (v0.298): guard against nullable choice scrutinees — a
+    // `MyEnum?` type has scrutTy->declaration->kind==Choice, but the
+    // non-nullable path extracts field 0 of the LLVM value as the choice tag
+    // (i32). For a nullable scrutinee the LLVM value is {i8, ChoiceStruct},
+    // so field 0 is the i8 hasValue flag, causing "icmp eq i8, i32" IR
+    // verification failure. Route nullable choice scrutinees through the
+    // isNullableVal path below where nullablePrimValue extracts the inner
+    // ChoiceStruct first.
+    if (scrutTy && !scrutTy->nullable &&
+        scrutTy->kind == sema::TypeRef::Kind::Named &&
         scrutTy->declaration &&
         scrutTy->declaration->kind == ast::TypeDeclKind::Choice) {
         const sema::TypeSymbol* choiceTy = scrutTy->declaration;
@@ -10987,7 +11267,7 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
         if (op == "<")  return builder_.CreateICmpSLT(cmp, zero);
         if (op == "<=") return builder_.CreateICmpSLE(cmp, zero);
         if (op == ">")  return builder_.CreateICmpSGT(cmp, zero);
-        /* >= */        return builder_.CreateICmpSGE(cmp, zero);
+        return builder_.CreateICmpSGE(cmp, zero);
     };
     // §19.3 (#1152): lower a comparing-pattern operand (a range bound, a
     // relational bound, or a constant) as a `decimal` struct. A decimal LITERAL
@@ -11049,7 +11329,7 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
     //   DiscardPattern   → true (handled above, no change)
     // The non-nullable path is taken for all other scrutinee kinds.
     bool isNullableVal = scrutTy && isNullableValueTy(scrutTy) &&
-                         scrut->getType()->isStructTy();
+                         scrut && scrut->getType()->isStructTy();
     if (isNullableVal) {
         llvm::Value* hasVal = nullablePrimHasValue(scrut);  // i1
         llvm::Value* innerVal = nullablePrimValue(scrut);   // the T field
@@ -11065,6 +11345,33 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
                         enumConstantByName(enumTy, np->name->parts.back())) {
                     llvm::Value* eq = emitEquals(innerVal, cv, /*isStr=*/false);
                     return builder_.CreateAnd(hasVal, eq, "nv.enum.match");
+                }
+            }
+            // fix #4399 (v0.298, §35.9): a NamedPattern on a nullable CHOICE
+            // scrutinee (e.g. `None` on `Maybe?`) is a choice-case test: hasValue
+            // AND the choice tag matches the case. The existing NamedPattern
+            // handler above only covers enum constants; a bare choice-case name
+            // (which resolves to the CaseDecl, not to an enum constant) fell
+            // through to nullptr → lowerCaseExpr left `case.end` unterminated
+            // (IR-verify crash). Mirror the non-nullable choice NamedPattern
+            // handler above (lines 11011-11024): look up the name as a choice
+            // case, extract the tag from innerVal (the unwrapped choice struct),
+            // compare with the case's i32 tag, AND with hasValue.
+            if (np->name && !np->name->parts.empty() &&
+                scrutTy->kind == sema::TypeRef::Kind::Named &&
+                scrutTy->declaration &&
+                scrutTy->declaration->kind == ast::TypeDeclKind::Choice) {
+                const sema::TypeSymbol* choiceTy = scrutTy->declaration;
+                std::size_t tag = 0;
+                if (auto* cc = choiceCaseByName(
+                        choiceTy, np->name->parts.back(), &tag)) {
+                    (void)cc;
+                    llvm::Value* tagVal =
+                        builder_.CreateExtractValue(innerVal, {0}, "choice.tag");
+                    llvm::Value* matched = builder_.CreateICmpEQ(
+                        tagVal, llvm::ConstantInt::get(i32(), tag),
+                        "choice.tag.eq");
+                    return builder_.CreateAnd(hasVal, matched, "nv.choice.match");
                 }
             }
             // §19.5 (#1128): a bare TYPE-name pattern on a nullable record/enum
@@ -11422,15 +11729,40 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
         // nullable record `T?` matches only when the value is present. Extract
         // the unwrapped record value (nullablePrimValue → element 1) and run the
         // non-nullable destructuring extraction on it — which binds the field
-        // slots from the record's fields — then AND with hasValue. Passing a null
-        // scrutTy on the recursion takes the non-nullable path, reaching the
-        // DestructuringPattern handler below with the record struct as scrutinee.
-        // Without this the pattern fell through to the "deferred" null return
-        // below, and the case lowering then emitted an unterminated basic block
-        // (IR verification failure).
+        // slots from the record's fields — then AND with hasValue.
+        //
+        // fix #4399 (v0.298): when the underlying type IS a choice (e.g.
+        // `Maybe?` with a `Some(var v)` arm), passing scrutTy=null on the
+        // recursion skips the choice handler (which requires scrutTy to identify
+        // the choice type and emit the correct i32 tag constant), and instead
+        // falls through to the record/other handler. The record handler then
+        // extracts field 0 of the inner nullable wrapper `{i8 hasValue;
+        // ChoiceStruct}` as i8 (the hasValue flag) and compares it with i32
+        // 0 — an LLVM IR verification failure ("icmp eq i8, i32").
+        //
+        // The fix: when the nullable scrutinee's underlying type is a Named
+        // choice, construct a non-nullable Named TypeRef pointing to the same
+        // choice declaration and pass it to the recursive call so the choice
+        // path fires with the correct i32 tag constant.
         if (dynamic_cast<const ast::DestructuringPattern*>(pat)) {
+            const sema::TypeRef* recurseScrutTy = nullptr;
+            // fix #3487 ratchet (v0.298): `choiceTy` must be at the same or
+            // shallower scope as `recurseScrutTy` so that `recurseScrutTy = &choiceTy`
+            // does not store the holder's address into a pointer that outlives it.
+            // Previously declared inside the inner `if` (depth 5), causing a
+            // stack-use-after-scope hit.  Hoisted to this outer scope (depth 4).
+            static sema::TypeRef choiceTy;
+            if (scrutTy && scrutTy->kind == sema::TypeRef::Kind::Named &&
+                scrutTy->declaration &&
+                scrutTy->declaration->kind == ast::TypeDeclKind::Choice) {
+                choiceTy.kind = sema::TypeRef::Kind::Named;
+                choiceTy.declaration = scrutTy->declaration;
+                choiceTy.nullable = false;
+                choiceTy.genericArgs = scrutTy->genericArgs;
+                recurseScrutTy = &choiceTy;
+            }
             llvm::Value* sub =
-                patternMatches(pat, innerVal, enumTy, isStr, /*scrutTy=*/nullptr);
+                patternMatches(pat, innerVal, enumTy, isStr, recurseScrutTy);
             if (!sub) return nullptr;
             return builder_.CreateAnd(hasVal, sub, "nv.destr.match");
         }

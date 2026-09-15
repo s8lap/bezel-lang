@@ -5,12 +5,15 @@
 // typed-target declaration; the literal targets `Array<int>` directly.
 // This is the CORRECT form (§15.4) and must NOT produce a diagnostic.
 //
+// NOTE: literal is now Owned per fix #4338 fix-forward; changed `var` to `const`
+// to avoid the auto-drop warning (value-typed Array<int> has no disposal obligation).
+//
 // Clean-compile ACCEPT control: bezelc -c must exit zero and emit no diagnostics.
 //
 // RUN: %bezelc -c -o %t.o %s
 // RUN: %bezelc -c %s 2>&1 | FileCheck --check-prefix=NODIAG --allow-empty %s
 
-module M; class C public static method M() var a: Array<int> := [10, 20, 30]; end M; end C;
+module M; class C public static method M() const a: Array<int> := [10, 20, 30]; end M; end C;
 
 // NODIAG-NOT: error
 // NODIAG-NOT: §

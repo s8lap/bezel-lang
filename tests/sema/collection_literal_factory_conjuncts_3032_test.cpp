@@ -1,7 +1,15 @@
 // fix #3032 — §15.4.1 (v0.262) requires a static `FromCollectionLiteral`
 // factory on a user type to be `public` and to return `owned C<T>` at the
 // enclosing type's own arity, and forbids declaring both the
-// `ReadOnlySpan<T>` and `OwningArray<T>` carriers on the same type. #2957
+// `ReadOnlyArraySpan<T>` and `OwningArray<T>` carriers on the same type. #2957
+//
+// narrow #3857 (test-only, §15.4.1, v0.272): the borrowing carrier every
+// cell below spells was renamed `ReadOnlySpan<T>` → `ReadOnlyArraySpan<T>`
+// by proposal 0115; the old spelling is no longer recognized at all (rejected
+// at the declaration, `TypeResolution_Checks.cpp`), so a cell still spelling
+// it would be rejected at that new check instead of exercising the conjunct
+// the cell is named for. Updated in the same commit as the recognition fix.
+//
 // deliberately scoped the recognition predicate to the three
 // mechanically-distinguishable conjuncts (exact name, `static`, exactly one
 // recognized carrier) and declared these three conjuncts out of scope
@@ -114,7 +122,7 @@ BEZEL_TEST(sema_collection_literal_factory_conjuncts_3032,
     JitResult r = program(
         "class BPriv_Borrow<T> "
         "  static method FromCollectionLiteral("
-        "      elements: ReadOnlySpan<T>): owned BPriv_Borrow<T> "
+        "      elements: ReadOnlyArraySpan<T>): owned BPriv_Borrow<T> "
         "    return new BPriv_Borrow<T>(); "
         "  end FromCollectionLiteral; "
         "end BPriv_Borrow; ",
@@ -146,7 +154,7 @@ BEZEL_TEST(sema_collection_literal_factory_conjuncts_3032,
     JitResult r = program(
         "class BPriv_Explicit<T> "
         "  private static method FromCollectionLiteral("
-        "      elements: ReadOnlySpan<T>): owned BPriv_Explicit<T> "
+        "      elements: ReadOnlyArraySpan<T>): owned BPriv_Explicit<T> "
         "    return new BPriv_Explicit<T>(); "
         "  end FromCollectionLiteral; "
         "end BPriv_Explicit; ",
@@ -174,7 +182,7 @@ BEZEL_TEST(sema_collection_literal_factory_conjuncts_3032,
         "class BorrowOnly_NoOwned<T> "
         "  public Count: int; "
         "  public static method FromCollectionLiteral("
-        "      elements: ReadOnlySpan<T>): BorrowOnly_NoOwned<T> "
+        "      elements: ReadOnlyArraySpan<T>): BorrowOnly_NoOwned<T> "
         "    return new BorrowOnly_NoOwned<T>(); "
         "  end FromCollectionLiteral; "
         "  public constructor() Count := 0; end constructor; "
@@ -192,7 +200,7 @@ BEZEL_TEST(sema_collection_literal_factory_conjuncts_3032,
     JitResult r = program(
         "class WrongHead<T> "
         "  public static method FromCollectionLiteral("
-        "      elements: ReadOnlySpan<T>): owned Object "
+        "      elements: ReadOnlyArraySpan<T>): owned Object "
         "    return new Object(); "
         "  end FromCollectionLiteral; "
         "end WrongHead; ",
@@ -211,7 +219,7 @@ BEZEL_TEST(sema_collection_literal_factory_conjuncts_3032,
     JitResult r = program(
         "class ArityOff "
         "  public static method FromCollectionLiteral("
-        "      elements: ReadOnlySpan<int>): owned ArityOff<int> "
+        "      elements: ReadOnlyArraySpan<int>): owned ArityOff<int> "
         "    return new ArityOff(); "
         "  end FromCollectionLiteral; "
         "end ArityOff; ",
@@ -222,7 +230,7 @@ BEZEL_TEST(sema_collection_literal_factory_conjuncts_3032,
 
 // =====================================================================
 // #3032 — REJECT (conjunct 3: both-forms-declared). Declaring both
-// the borrowing-form carrier (`ReadOnlySpan<T>`) AND the owning-form
+// the borrowing-form carrier (`ReadOnlyArraySpan<T>`) AND the owning-form
 // carrier (`OwningArray<T>`) on the same type is a compile error
 // per §15.4.1 ("the literal's element-expression ownership would not
 // unambiguously select a target"); pre-fix findCollectionLiteralFactory
@@ -238,7 +246,7 @@ BEZEL_TEST(sema_collection_literal_factory_conjuncts_3032,
     JitResult r = program(
         "class BothForms<T> "
         "  public static method FromCollectionLiteral("
-        "      elements: ReadOnlySpan<T>): owned BothForms<T> "
+        "      elements: ReadOnlyArraySpan<T>): owned BothForms<T> "
         "    return new BothForms<T>(); "
         "  end FromCollectionLiteral; "
         "  public static method FromCollectionLiteral("
@@ -253,7 +261,7 @@ BEZEL_TEST(sema_collection_literal_factory_conjuncts_3032,
 
 // =====================================================================
 // #3032 — ACCEPT (canonical happy path). A fully-canonical
-// public-static `FromCollectionLiteral(ReadOnlySpan<T>): owned C<T>`
+// public-static `FromCollectionLiteral(ReadOnlyArraySpan<T>): owned C<T>`
 // still compiles and produces the expected value at the literal site.
 // The AOT path exercises the FULL pipeline (sema + codegen + native
 // exec), so the value-verify is the non-vacuous accept: the cell fails
@@ -273,7 +281,7 @@ BEZEL_TEST(sema_collection_literal_factory_conjuncts_3032,
         "module M; "
         "class C<T> "
         "  public static method FromCollectionLiteral("
-        "      elements: ReadOnlySpan<T>): owned C<T> "
+        "      elements: ReadOnlyArraySpan<T>): owned C<T> "
         "    return new C<T>(); "
         "  end FromCollectionLiteral; "
         "end C; "

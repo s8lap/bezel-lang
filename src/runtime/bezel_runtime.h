@@ -640,6 +640,9 @@ int32_t bz_guid_parse(const void* str, bz_guid_t* out);
 
 // Bytewise equality: returns 1 if *a == *b, 0 otherwise.
 int32_t bz_guid_equals(const bz_guid_t* a, const bz_guid_t* b);
+// fix #4126 / stdlib §2.6 / §8.3 (v0.295): content hash consistent with
+// bz_guid_equals (equal Guids hash identically).
+int32_t bz_guid_hash(const bz_guid_t* g);
 // per stdlib §2.6 / #1357: CompareTo — 16-byte lexicographic (canonical byte order).
 // Returns negative/0/positive like memcmp.
 int32_t bz_guid_compare(const bz_guid_t* a, const bz_guid_t* b);
@@ -883,6 +886,17 @@ void  bz_task_set_chained(void* outer, void* source);
 // completion continuation (§30.5 "the Dispose() call attaches a continuation
 // that disposes the produced result whenever it appears").
 void  bz_task_set_result_disposer(void* task, void (*disposer)(void*));
+
+// fix #4159 (§30.5 "Disposing an unconsumed OwningTask<T>", v0.298): queried
+// by emitAsyncPatternAResultDecision right after bz_task_set_chained, to
+// decide whether the chaining body must ALSO attach its own kind-1 disposer
+// for the value it just extracted from `source`. Returns 1 ("orphaned — the
+// caller must attach its own disposer") iff `source` has settled with
+// NEITHER a chained_source NOR a result_disposer of its own — i.e. nothing
+// else will ever dispose the value about to be extracted from it. Returns 0
+// when either is set: a genuine Pattern A chain already disposes the result
+// transitively, and attaching a second disposer would double-free it.
+int8_t bz_task_needs_caller_disposal(void* source);
 
 // Block the calling thread until the task completes. Returns a pointer to the
 // result buffer (owned by the task; valid until bz_task_free). Returns null on error.

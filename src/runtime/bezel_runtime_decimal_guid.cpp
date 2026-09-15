@@ -1061,6 +1061,29 @@ int32_t bz_guid_equals(const bz_guid_t* a, const bz_guid_t* b) {
     return a->lo == b->lo && a->hi == b->hi ? 1 : 0;
 }
 
+// fix #4126 / stdlib §2.6 / §8.3 (v0.295): content hash consistent with
+// `bz_guid_equals` above — two Guids that compare equal (same `lo`/`hi`) MUST
+// hash identically, and `Guid` has no dedicated `.GetHashCode()` interceptor
+// in `tryLowerBuiltinClassCall` (`.ToString()`/`.Equals()`/`.CompareTo()` are
+// the only three dedicated handlers there, LlvmBackend_Calls.cpp), so the
+// call fell through to `lowerCallDispatch`'s generic universal-Object
+// dispatch and degraded via #2434 (`Guid.NewGuid().GetHashCode()` measured
+// zero-initialized to `0` for every distinct random Guid). Same FNV-style
+// 31-multiplier fold `bz_decimal_hash` above uses, over the two 64-bit halves
+// instead of a 96-bit mantissa.
+extern "C" int32_t bz_guid_hash(const bz_guid_t* g) {
+    uint32_t lo_lo = (uint32_t)(g->lo & 0xFFFFFFFFu);
+    uint32_t lo_hi = (uint32_t)((g->lo >> 32) & 0xFFFFFFFFu);
+    uint32_t hi_lo = (uint32_t)(g->hi & 0xFFFFFFFFu);
+    uint32_t hi_hi = (uint32_t)((g->hi >> 32) & 0xFFFFFFFFu);
+    uint32_t h = 17u;
+    h = h * 31u + lo_lo;
+    h = h * 31u + lo_hi;
+    h = h * 31u + hi_lo;
+    h = h * 31u + hi_hi;
+    return (int32_t)h;
+}
+
 // per stdlib §2.6 / #1357: CompareTo — 16-byte lexicographic on canonical byte
 // order (bytes 0-7 in lo field, 8-15 in hi field; stored little-endian on x86).
 // Per §2.6: ordering is the same as memcmp on the 16 raw bytes.

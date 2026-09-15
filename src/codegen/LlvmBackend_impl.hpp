@@ -161,6 +161,144 @@ inline bool isBuiltinDictionaryTypeRef(const sema::TypeRef* rt) {
     return common::isDictionaryName(rt->headName());
 }
 
+// fix #4322 (§9.7 "Records and disposal" / §28.3 / §28.9, v0.298): does
+// METHOD `ms`'s declared return type provably embed a plain string ARGUMENT
+// unretained — a Named Record/Choice return (the #4254 channel), or an
+// InlineArray return whose element is `string` or a Named Record/Choice
+// (the #4265/#4280 channel)?
+//
+// ONE DEFINITION, TWO CONSUMERS, deliberately in this shared header (same
+// shape as `isBuiltinDictionaryTypeRef` above) rather than duplicated:
+// `StringEscapeWalker::walkCallArgs` (LlvmBackend_Setup.cpp) computed this
+// inline as `calleeReturnMayAliasArgUnretained` to suppress a NAMED-
+// IDENTIFIER argument's own scope-end release, but that walker is a
+// namespace-scope struct, not an `Emitter` member, so it cannot call a
+// PRIVATE `Emitter` method — and `Emitter::lowerCallDispatch`
+// (LlvmBackend_Calls2.cpp) is a different translation unit than the
+// walker's original inline lambda pair. A free `inline` function in this
+// shared header is visible to both without either restriction.
+//
+// WHY lowerCallDispatch NEEDS IT (issue #4322): the #429 "+1 string
+// producer passed directly as a call argument" post-call release
+// (`isPlusOneStringProducer(argExprs[ai])` -> unconditional
+// `emitStringRelease(args[ai])`) ran with NO awareness of whether the
+// callee's return value goes on to alias the very reference it just freed.
+// `Helper.Wrap(s: string): Str return new Str(s); end Wrap;` called as
+// `var outer := Helper.Wrap("he" + "llo" + i.ToString());` — the argument is
+// an UNBOUND temporary (no LocalDecl, so walkCallArgs' `isTargetIdent`-gated
+// suppression never even considers it), `buildRecordValue`'s positional
+// fast path stores it into `Str.V` with a bare `CreateStore` (no
+// `emitStringRetain`, the same raw-store fact #4254 established), and the
+// old unconditional release then freed that same allocation before
+// `outer.V.Length` read it — a measured `AddressSanitizer:
+// heap-use-after-free`. This predicate lets that release site skip exactly
+// the argument positions the #4254/#4265/#4280 record/choice/inline-array
+// suppression already covers for named locals.
+//
+// CALL-WIDE, not per-argument-position: matches walkCallArgs' own
+// documented contract (`isFreshRecordConstructionOfExactType`'s comment
+// below: "widening is sound only paired with the caller-side
+// calleeReturnMayAliasArgUnretained suppression ... which is call-wide, not
+// context-specific"). A call with a SECOND, unrelated +1-producer argument
+// that the callee does NOT embed also has its release suppressed — the
+// pre-existing leak-over-UAF safe default (fix #4280's own comment), not a
+// new one; `record_factory_unbound_temporary_argument_uaf_4322_test.cpp`'s
+// `unrelated_second_argument_no_longer_uaf_but_leaks_call_wide` row pins
+// this (measured: 19890 B / 1000 allocations, a floor per LANE_RULES §30).
+inline bool calleeReturnMayAliasStringArgUnretained(
+        const sema::SemaContext& ctx, const sema::MethodSymbol* ms) {
+    if (!ms) return false;
+    const sema::TypeRef* crt = nullptr;
+    // `md` is lifted to outer scope so the Class-field check below can use
+    // it; it is only non-null for non-imported methods (where `crt` is also
+    // resolved from the body). Imported methods have no body to inspect.
+    const ast::MethodDecl* md = nullptr;
+    if (ctx.isImported(ms)) {
+        crt = ctx.importedReturnType(ms);
+    } else {
+        // SEAM-ACCESSOR: local-path cast; `if (ctx.isImported(ms))` above
+        // returns early for the imported case via ctx.importedReturnType.
+        // #3152
+        md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
+        if (md && md->returnType) {
+            crt = ctx.resolvedType(*md->returnType);
+        }
+    }
+    // fix #4280: shared Record/Choice test — ONE spelling for both the
+    // top-level `crt` arm and the InlineArray-element arm below (§6).
+    auto isRecordOrChoiceDeclared = [](const sema::TypeRef* t) {
+        return t && t->kind == sema::TypeRef::Kind::Named &&
+               t->declaration &&
+               (t->declaration->kind == ast::TypeDeclKind::Record ||
+                t->declaration->kind == ast::TypeDeclKind::Choice);
+    };
+    // fix #4265 / #4280: does an INLINE-ARRAY ELEMENT type embed a plain
+    // string argument via a bare per-slot store with no retain? Two proven
+    // shapes: the element IS `string` (#4265), or the element is a
+    // Record/Choice whose own fast-path constructor store is the identical
+    // raw shape (#4280). Deliberately NOT "any Named" — a CLASS-typed
+    // element retains via `lowerStringFieldStore` when ITS OWN field is
+    // `string`-typed (see the walkCallArgs call site's CLASS-exclusion
+    // history for the send-back that measured the one case where that is
+    // NOT true: a class whose field is Record/Choice-typed one level in).
+    auto elementMayEmbedStringArgUnretained =
+        [&](const sema::TypeRef* elem) {
+            if (!elem) return false;
+            if (elem->kind == sema::TypeRef::Kind::Primitive &&
+                elem->primitive == sema::PrimitiveType::String) {
+                return true;
+            }
+            return isRecordOrChoiceDeclared(elem);
+        };
+    if (isRecordOrChoiceDeclared(crt)) return true;
+    // fix #4300 (§9.7/§28.3, v0.298): the top-level arm above correctly
+    // suppresses the caller-side release when the callee return type IS
+    // Record/Choice-declared, and `elementMayEmbedStringArgUnretained` (applied
+    // to InlineArray elements above) correctly covers Record/Choice element
+    // types.  BUT when the return type is a Class whose own field is
+    // Record/Choice-typed and whose constructor embeds the string argument into
+    // THAT field via `new SomeRecord(arg)`, the string argument is stored
+    // through the record's positional fast path one level in — the identical
+    // raw `CreateStore` shape `fix #4254` found for top-level record returns.
+    // `lowerStringFieldStore` never fires because the class's own field (`W`)
+    // is Record-typed, not `string`-typed.  A Class-typed return that has any
+    // field whose declared type is Record/Choice-declared is therefore also
+    // treated as "may embed the argument unretained" here — accepting the
+    // leak-over-UAF bias (suppressing a safe release is better than allowing
+    // an unsuppressed UAF).  The conservative one-level field walk uses the
+    // same `isRecordOrChoiceDeclared` test the rest of this function uses.
+    // `md` is only available in the non-imported branch (see above), so this
+    // check lives there too — imported class declarations cannot be examined
+    // without their body.
+    if (!ctx.isImported(ms) && md) {
+        if (crt && crt->kind == sema::TypeRef::Kind::Named &&
+            crt->declaration &&
+            crt->declaration->kind == ast::TypeDeclKind::Class) {
+            const sema::TypeSymbol* ts = crt->declaration;
+            for (const sema::Symbol* mem : ts->members) {
+                const auto* fs = dynamic_cast<const sema::FieldSymbol*>(mem);
+                if (!fs) continue;
+                // SEAM-DEBT: #4300 Class-field walk to detect Record/Choice-typed fields requires
+                // the AST; the read is dead for imported Class declarations (fs->decl == nullptr)
+                // and the !fs->decl gate above handles that. To drain, the imported-class case
+                // needs a parallel ctx.importedFieldTypeRef path — same SEAM-ACCESSOR split as
+                // ctx.importedReturnType above.
+                const auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
+                if (!fd || !fd->type) continue;
+                const sema::TypeRef* ftr = ctx.resolvedType(*fd->type);
+                if (isRecordOrChoiceDeclared(ftr)) {
+                    return true;
+                }
+            }
+        }
+    }
+    if (crt && crt->kind == sema::TypeRef::Kind::InlineArray &&
+        elementMayEmbedStringArgUnretained(crt->arrayElement)) {
+        return true;
+    }
+    return false;
+}
+
 // Parse a Bezel integer literal lexeme to its value.
 //
 // fix #2936: the implementation MOVED to common/IntLiteral.hpp and this is a
@@ -1831,6 +1969,87 @@ private:
         // back to for a runtime-managed value it cannot prove non-escaping).
         // Fires on BOTH the normal and unwind exit, mirroring `grouping`.
         bool dictEntryKeyRelease = false;
+        // fix #4129 (§29.12 / §28.3, stdlib §4.8, v0.295): a `for var entry in
+        // dict` entry-iteration's own key/value SNAPSHOT SPINE arrays — the
+        // malloc'd arrays bz_dict_keys_str/bz_dict_keys_gen/bz_dict_values_str/
+        // bz_dict_values_gen hand back before the loop starts
+        // (lowerDictEntryFor's keysOutSlot/lensOutSlot/valsOutSlot/cntSlot) —
+        // plus, for a STRING key, the in-flight iteration's rebuilt
+        // `bz_string*` Key (the loop-var struct's field 0) and any per-key
+        // snapshot boxes at [idxSlot, cnt) the increment block has not yet
+        // freed. lowerDictEntryFor's own manual endBB code reclaims all of
+        // this on every normal-completion and `break` exit — but a
+        // `return`/`throw` FROM INSIDE THE LOOP BODY diverges before reaching
+        // endBB and previously leaked it all (measured: 62 B / 6 allocations
+        // per call for a single-entry string-keyed dict; #4129). Registered as
+        // its OWN disposeStack_ scope, pushed right after the snapshot is
+        // taken and BEFORE loopStack_'s own entry — so `break`/`continue`
+        // (whose emitLoopDisposals only unwinds scopes AT OR ABOVE the loop's
+        // recorded depth) never see it and keep using the existing manual
+        // endBB code exclusively — and popped WITHOUT emission once that
+        // manual code has run (it already did the identical work; emitting
+        // this scope too would double-free). A `return`'s emitAllDisposals /
+        // emitDisposalsInRange and a `throw`'s unwind walk both still hold
+        // this scope open at the point they fire, so both now reclaim it
+        // exactly once. The generic `slot`/`cls` fields are unused — this
+        // kind needs five independent slots, carried below (all entry-block
+        // allocas, so they dominate — and are readable from — any point
+        // later in the function, including deep inside the loop body).
+        bool dictEntryForSnapshot = false;
+        llvm::AllocaInst* dictEntryForKeysOutSlot = nullptr;  // ptr* (char**/void**)
+        llvm::AllocaInst* dictEntryForLensOutSlot = nullptr;  // ptr* (i64*); null unless string key
+        llvm::AllocaInst* dictEntryForValsOutSlot = nullptr;  // ptr* (void**)
+        llvm::AllocaInst* dictEntryForCntSlot     = nullptr;  // i64* — snapshot count
+        llvm::AllocaInst* dictEntryForIdxSlot     = nullptr;  // i64* — current cursor
+        bool dictEntryForIsStringKey = false;
+        bool dictEntryForUseGen = false;
+        // The loop-var struct alloca — consulted ONLY when
+        // dictEntryForReleaseInFlightKey, to release the in-flight
+        // iteration's rebuilt Key at field 0 exactly as endBB's own
+        // isStringKey branch does (its struct type is read back via
+        // getAllocatedType(), mirroring `dictEntryKeyRelease` just above).
+        llvm::AllocaInst* dictEntryForVarSlot = nullptr;
+        // fix #4129 review self-pass (§4.8, v0.295): whether it is SAFE to
+        // release the in-flight rebuilt string Key at dictEntryForVarSlot
+        // field 0 from THIS disposal. Measured true-positive UAF, fixed
+        // before landing: `for var entry in d do return lambda() =>
+        // entry.Key...; end;` — the escaping lambda captures `entry` by
+        // boxing its struct into a heap cell (LlvmBackend_Stmts.cpp's
+        // lowerForBody, forVarCapturedInBody), and that cell holds a COPY of
+        // the SAME `bz_string*` pointer this disposal would release; the
+        // closure reads it after MakeClosure returns, i.e., after the
+        // release — a use-after-free. The identical hazard is PRE-EXISTING
+        // and unrelated to this fix on the normal-completion/`break` path
+        // too (endBB's own isStringKey release has always had it — confirmed
+        // by reproducing it on the unmodified parent commit with a program
+        // that assigns the escaping lambda every iteration and lets the loop
+        // complete normally, no `return`/`break` involved) — but THIS fix
+        // must not open a NEW way to reach it via `return`/`throw` (never
+        // trade a leak for a UAF). So dictEntryForSnapshot's registration
+        // stores `!forVarCapturedEscaping` here (LlvmBackend_Stmts.cpp,
+        // `lowerDictEntryFor`); false leaves the Key on the pre-existing
+        // safe-direction leak, exactly like every other sibling family in
+        // this file that cannot prove non-escape. This flag does NOT gate
+        // freeing the snapshot spine arrays or the remaining per-key raw
+        // byte boxes — `entry.Key`/`entry.Value` are decoded (VALUE) copies
+        // out of those, never aliases of them, so freeing them is
+        // unconditionally safe regardless of capture.
+        //
+        // fix #4161 (§27.5/§28.9/§28.3, stdlib §4.8, v0.295):
+        // `forVarCapturedEscaping` REPLACES the original `forVarCapturedIn-
+        // Body(fs)` here — that predicate was escape-BLIND (true whenever
+        // ANY closure references the loop var, non-escaping ones included),
+        // which was sound but left this same flag ALSO gating incBB/endBB's
+        // own #1058 per-iteration/end-of-loop release too coarse to close
+        // #4161 (a real UAF on normal loop completion, no return/throw
+        // involved) without leaking every merely-referenced, non-escaping
+        // capture. `forVarCapturedEscaping` refines the answer using
+        // `cellFreeEligible_` (see its declaration and
+        // `lowerDictEntryFor`'s own comment for the full derivation) — the
+        // same escape-aware, whole-body authority `lowerForBody` already
+        // consults to decide whether the for-var's boxed capture cell can
+        // be freed per iteration.
+        bool dictEntryForReleaseInFlightKey = false;
         // §35.4 (v0.200, #2045 stage 3): an OWNING-CLASSIFIED choice local
         // (a sum whose classification is Owning, e.g. one with an `owned`
         // payload slot per §35.4.1). At scope end the active case's owned
@@ -2281,6 +2500,27 @@ private:
     // currentEnumMethod_: when we're emitting an enum instance method, set to
     // the enum TypeSymbol so that `case this` knows the scrutinee's enum type.
     const sema::TypeSymbol* currentEnumMethod_ = nullptr;
+    // fix #4113 (§35.2/§35.5, v0.295): the choice-typed twin of
+    // currentEnumMethod_. A genuine choice INSTANCE METHOD body needs no
+    // help — choiceTypeOf's `this` recovery finds it via methodFns_/
+    // currentSpecMethodSymbol_ (fix #2047). But a choice PROPERTY's getter
+    // (expression- or block-bodied, or read as a function value) is never
+    // itself registered there: an expression-bodied getter is INLINED at
+    // each call site (currentFn_ is the CALLER's function, e.g. `main`),
+    // and a block-bodied/thunk accessor function is built by
+    // ensurePropertyAccessorFn/makePropertyThunk, which populate neither
+    // map either. Every one of those three sites already sets
+    // currentEnumMethod_ for an enum receiver (CG30/#2501/#574) around the
+    // getter body's evaluation; this is the same workaround for choice, set
+    // at the same three sites, so choiceTypeOf("this") resolves inside a
+    // choice property exactly as it already does inside a choice method.
+    // fix #4143: also saved+cleared+restored by NestedBodyScope (the guard
+    // wrapping the six lazily-memoized accessor builders below) so a value
+    // set here for ONE property-getter window cannot leak into an unrelated
+    // nested accessor body first-touched from inside it — see that guard's
+    // struct definition for why this member needed it and its enum twin,
+    // deliberately, did not.
+    const sema::TypeSymbol* currentChoiceMethod_ = nullptr;
     // fix #628 / §9.5 / §14.2: when emitting a SPECIALIZED method body via
     // buildSpecializedMethodFn, currentFn_ is set to the freshly-created specFn
     // which is NOT registered in methodFns_.  lowerWith's §575 reverse-lookup
@@ -2656,6 +2896,48 @@ private:
     std::unordered_map<const sema::TypeSymbol*, llvm::Function*> classToStringFns_;
     std::unordered_map<const sema::TypeSymbol*, llvm::Function*> boxToStringFns_;
     std::unordered_map<std::string, llvm::Function*> primBoxToStringFns_;
+    // fix #4234 (§9.1, v0.298): per-INSTANTIATION MEMOIZED helper wrapping
+    // emitRecordToString's UNBOXED field-listing body — see
+    // recordToStringHelperFn's own comment (LlvmBackend_Setup.cpp) for why
+    // this exists (a diamond of shared nested record field types otherwise
+    // re-expands its whole subtree at every occurrence, O(branch^depth) IR
+    // instructions for a program that only declares the types). Distinct
+    // from boxToStringFns_ above: that cache holds the BOXED vtable-slot
+    // thunk (`ptr(ptr box)`, payload two words in); this one takes the
+    // record's raw unboxed struct value by pointer and is used only for the
+    // NESTED (field-level) recursion inside emitValueToString.
+    //
+    // ⚠ Keyed on `llvm::StructType*` (the CONCRETE, already-specialized
+    // struct type — recordStruct's own per-instantiation `specializedStructs_`
+    // key granularity), NOT on `const TypeSymbol*`. A first version of this
+    // fix keyed on the bare TypeSymbol* and re-derived the struct type
+    // in-function via `recordStruct(rec)` under whatever ambient
+    // `genericSubst_` happened to be active at first-build time — review
+    // caught this returning WRONG DATA (not just wasted work) for a
+    // generic record with more than one instantiation reachable
+    // (`Box<Box<int>>`'s outer vs. inner `Box<int>`, tests/codegen/
+    // boxed_generic_record_equals_2176_test.cpp's
+    // nested_generic_record_equal_9_1): the cached function's `CreateLoad`
+    // would reinterpret a DIFFERENT instantiation's bytes using the FIRST
+    // instantiation's layout, since `genericSubst_` is ambient state that
+    // is not re-scoped when recursing into a nested field (mirroring the
+    // pre-fix direct-recursion code, which never re-derived the type
+    // either — it always trusted the VALUE's own already-correct
+    // `l->getType()`). Keying on the caller-supplied concrete StructType*
+    // is the fix: two calls presenting the SAME concrete type share a
+    // helper; two different instantiations (different StructType*) get
+    // separate helpers, exactly mirroring recordStruct's own
+    // specialization granularity.
+    std::unordered_map<llvm::StructType*, llvm::Function*>
+        recordToStringHelperFns_;
+    // fix #4234 (§9.1, v0.298): the equality/hash siblings of
+    // recordToStringHelperFns_ above — same rationale, same memoization
+    // discipline (keyed on the concrete StructType*, not TypeSymbol*), one
+    // cache per synthesized member kind.
+    std::unordered_map<llvm::StructType*, llvm::Function*>
+        recordEqualityHelperFns_;
+    std::unordered_map<llvm::StructType*, llvm::Function*>
+        recordHashCodeHelperFns_;
     // §9.6 (#946/#947/#948): per-class Equals/GetHashCode thunk caches (slot
     // kEqualsSlot / kGetHashCodeSlot) and the shared box-default thunks.
     std::unordered_map<const sema::TypeSymbol*, llvm::Function*> classEqualsFns_;
@@ -4136,6 +4418,37 @@ private:
     // The format specifier depends on the primitive type.
     llvm::Value* emitPrimitiveToString(llvm::Value* val,
                                        sema::PrimitiveType prim);
+
+    // fix #4234 (§9.1, v0.298): a per-INSTANTIATION (keyed on the concrete
+    // `llvm::StructType*`, NOT bare `TypeSymbol*`) MEMOIZED helper function
+    // wrapping emitRecordToString's field-listing body — see
+    // recordToStringHelperFns_'s declaration comment for why this exists
+    // and why the key must be the concrete struct type.
+    // `recTy` is the CALLER's own already-correct type for the value being
+    // formatted (`val->getType()`, cast to StructType) — this function does
+    // NOT re-derive it via `recordStruct(rec)`, because for a generic
+    // record `recordStruct` consults ambient substitution state
+    // (`genericSubst_`) that is NOT re-scoped when recursing into a nested
+    // field (mirroring the pre-fix direct-recursion behaviour, which
+    // trusted the VALUE's own already-correct type rather than
+    // re-deriving it): building/keying off `recordStruct(rec)` instead of
+    // the caller's `recTy` was review-caught as WRONG for a genuinely
+    // generic record with more than one instantiation reachable (e.g.
+    // `Box<Box<int>>`'s outer vs inner `Box<int>` field) — the cached
+    // function's `CreateLoad` would silently reinterpret a `Box<string>`
+    // (or any other instantiation)'s bytes using the FIRST instantiation's
+    // layout. Builds (and caches) a small internal-linkage function
+    // `bz$vtostr$<name>$<n>` of type `ptr(ptr)`: loads the record struct
+    // (as `recTy`) from the incoming pointer and returns
+    // emitRecordToString's fresh +1 string. `emitValueToString`'s
+    // Record-kind arm calls this (a `call` instruction) instead of
+    // re-inlining emitRecordToString directly, so a record type reached
+    // from `branch` sibling FIELD positions AT THE SAME INSTANTIATION
+    // re-uses one function instead of re-expanding its whole recursive
+    // body at every occurrence; a DIFFERENT instantiation (a different
+    // `recTy`) gets its own separate cached helper.
+    llvm::Function* recordToStringHelperFn(const sema::TypeSymbol* rec,
+                                           llvm::StructType* recTy);
 
     // §8 / §9 / §10: compiler-synthesized value-semantics members for records
     // and enums. Each returns the lowered value, or null if the member is not
@@ -9615,14 +9928,54 @@ private:
     // `tcs.Dispose()`.
     void emitTcsRelease(llvm::Value* tcs);
 
+    // fix-forward #4185 (review round 2, §25 / §6): PURE classification —
+    // which `emitVtablelessBuiltinRelease` arm (if any) `bn` names, with
+    // ZERO IR side effects. This is now the ONE place the name population
+    // is spelled; `emitVtablelessBuiltinRelease` below and
+    // `vtablelessBuiltinReleaseIsKnown` are its only two consumers, so there
+    // is exactly one positive list to drift out of sync with — not two.
+    // (Round 1 of #4185 introduced a second, hand-synced 18-name array
+    // specifically to avoid calling the emit function speculatively; round
+    // 2 pointed out that a classify/emit split removes the need for that
+    // second list entirely, since classification alone has nothing to emit.)
+    // `AtomicFamily`/`EventSourceFamily`/`TaskCompletionSourceFamily` each
+    // collapse two builtin names that release identically — see the
+    // definition for which. // per §25, §6
+    enum class VtablelessBuiltinReleaseArm {
+        None, StringBuilder, Random, AtomicFamily, EventSourceFamily,
+        TaskCompletionSourceFamily, Channel, ChannelSender, Stopwatch, Mutex,
+        Lock, Semaphore, SemaphoreToken, CancellationTokenSource, FileStream,
+        Subscription,
+    };
+    static VtablelessBuiltinReleaseArm
+    classifyVtablelessBuiltinRelease(std::string_view bn);
+
     // fix #2921 (spec §28.2 / §28.9 / §8.1, v0.240): emit the release of a
     // VTABLE-LESS BUILT-IN CLASS receiver (`common::isVtableLessBuiltinClass
     // Name(bn)`), returning false when no release is known for `bn`. Callers
     // must NOT fall back to `emitDisposeAndReclaim` on a false return: such a
     // receiver has no vtable at word 0, so the slot-2 dispatch is a wild jump.
     // See the definition for the measured failure and the leak-over-wild-jump
-    // trade a false return deliberately takes.
+    // trade a false return deliberately takes. Dispatches on
+    // `classifyVtablelessBuiltinRelease` above — the name-matching itself
+    // lives there now, not here.
     bool emitVtablelessBuiltinRelease(std::string_view bn, llvm::Value* recv);
+
+    // fix-forward #4185 (review NEEDS-FIX round 1, §25): `common::isVtable
+    // LessBuiltinClassName` answers "does this receiver carry no Bezel
+    // vtable" — a STRICT SUPERSET (47 names) of what
+    // `emitVtablelessBuiltinRelease` above actually handles (18 names). A
+    // caller that gates a NEW `emitDisposeAndReclaim`-reachable code path on
+    // the former alone (as the #4185 DiscardStmt fallback originally did)
+    // admits the 29-name gap — Shared<T>, Weak<T>, the serializer family,
+    // etc. — into the exact wild jump `emitVtablelessBuiltinRelease`'s own
+    // declaration comment forbids. This predicate answers the NARROWER,
+    // correct question — "will `emitVtablelessBuiltinRelease` actually
+    // succeed for `bn`" — by testing `classifyVtablelessBuiltinRelease(bn) !=
+    // None`, the SAME classification `emitVtablelessBuiltinRelease` itself
+    // dispatches on: no second list (round 2 removed it), so nothing here
+    // can drift out of sync with the emitter. // per §25
+    static bool vtablelessBuiltinReleaseIsKnown(std::string_view bn);
 
     // fix #2973 (§28.3 / §28.9, stdlib §6.4, v0.240): if `n` names a built-in
     // whose `using var` SCOPE-EXIT auto-drop routes through
@@ -9680,6 +10033,19 @@ private:
     // stays dispatch-only (#415 conservative fallback).
     llvm::Value* explicitDisposeOwnedReceiverSlot(const ast::Expr& receiver,
                                                   llvm::Type*& slotTy);
+
+    // fix #4221 (spec §28.2/§28.9/§8.1, v0.298): the FULL explicit-Dispose()
+    // dispatch chain — collection/dict/linked-list/list-interface/
+    // collection-interface classification, the vtable-less-builtin release,
+    // and the general user-class fallback — factored out of
+    // `lowerCallDispatch`'s `.Dispose()` arm so `?.Dispose()`
+    // (lowerNullCondCall) shares the SAME classification instead of a
+    // second, partial copy (measured drift: `?.Dispose()` on a collection
+    // receiver read past the collection's runtime header — see the
+    // definition's comment and issue #4221). `target` is the receiver AST
+    // node; `recv` is its already-lowered pointer value. Returns false
+    // (emits nothing) when `recv` is not a non-null pointer value.
+    bool emitExplicitDisposeChain(const ast::Expr& target, llvm::Value* recv);
 
     // ── §28.11 v0.134 element-slot policy ────────────────────────────────
     // #602: a classification of a single collection element type and family
@@ -10691,27 +11057,91 @@ private:
     // reached by the recursion below resolves correctly too (the recursive
     // call passes `mty`, the caller's OWN resolved TypeRef, not just its
     // declaration).
+    //
+    // fix #4232 (§9.7 / §28.9 / §14.1, v0.298): the #2405/#3945 comments'
+    // termination argument ("sema rejects a record that transitively
+    // contains itself by value, so this walk is over a finite DAG") is a
+    // DECLARATION-graph guarantee, not an INSTANTIATION-graph one — it says
+    // nothing about a still-GENERIC method's own rigid (unbound) type
+    // parameter. Measured (gdb, ~43,500 identical frames):
+    // `Util.Rewrap<T>(x: Box<T>)`'s `var y: Box<Box<T>> := new
+    // Box<Box<T>>(x);` calls this with `tr = Box<Box<T>>`. The
+    // RecordSubstGuard binds Box's own param name "T" to `resolveTypeParamRef(
+    // Box<T>)` — and since `Box<T>` is a Named ref WITH a declaration,
+    // `resolveTypeParamRef` returns it unchanged, so `genericSubstSemaTy_["T"]`
+    // becomes the exact `Box<T>` TypeRef node the recursion is about to visit.
+    // One level down, `recordMemberTypeResolved` on the field `Value: T`
+    // (Box's OWN declared field, also bare "T") looks up that SAME binding
+    // and yields the SAME `Box<T>` node again — the recursive call target is
+    // pointer-IDENTICAL to the frame's own `tr`, forever: the substitution's
+    // fixed point is "T ↦ Box<T>", which a ground (fully-monomorphized)
+    // generic record can never reach (sema's self-containment check forbids
+    // it), but an UNRESOLVED method type parameter can, because no ground
+    // type is ever substituted for it here. sema correctly accepts the
+    // program (`T` never needs to resolve until `Rewrap` is itself
+    // instantiated at a call site) — the defect is purely this codegen walk's
+    // failure to detect the resulting instantiation-level cycle.
+    //
+    // Fixed with a PATH guard on the concrete `TypeRef*` being visited,
+    // matching the established shape of `common::isBorrowBearingRecordCommon`'s
+    // own `seen` (OwnershipFacts.cpp) — insert-on-entry / erase-on-exit, not a
+    // permanent visited-set memoization (a sibling field reached through a
+    // DIFFERENT instantiation must still be free to re-classify a TypeRef that
+    // an unrelated, already-completed branch also touched). Keyed on the
+    // TypeRef INSTANTIATION, not the record's TypeSymbol declaration: two
+    // different instantiations of the same generic record (`Box<int>` and
+    // `Box<string>` both siblings under one enclosing record) must not
+    // collide — `TypeSymbol*` is shared by every instantiation, `TypeRef*`
+    // is not (see #3933's identical correction to
+    // `isBorrowBearingRecordCommon`'s own guard key, OwnershipFacts.cpp).
+    // Only `recordHasStringFields`'s OWN self-recursion needs the guard: the
+    // only way to reach a rigid, still-unbound `T` here is through a LOCAL
+    // (method-body) instantiation, and neither `choiceHasStringFields` (bails
+    // outright on any generic choice) nor `inlineArrayElementCarriesString`
+    // (bails on a bare-type-parameter element, never installs a
+    // RecordSubstGuard) can themselves walk a bare type parameter through a
+    // substitution — a fresh, empty `seen` set at each of THEIR calls back
+    // into `recordHasStringFields` is therefore sound; a cross-kind cycle
+    // through a choice/array hop is not reachable here (a top-level Choice
+    // declaration cannot mention an enclosing generic METHOD's type
+    // parameter at all — it would have to be generic itself, and
+    // `choiceHasStringFields` already refuses that case unconditionally).
     bool recordHasStringFields(const sema::TypeRef* tr) {
+        std::unordered_set<const sema::TypeRef*> seen;
+        return recordHasStringFieldsOnPath(tr, seen);
+    }
+    bool recordHasStringFieldsOnPath(
+            const sema::TypeRef* tr,
+            std::unordered_set<const sema::TypeRef*>& seen) {
         if (!tr || tr->kind != sema::TypeRef::Kind::Named || !tr->declaration)
             return false;
         const sema::TypeSymbol* ts = tr->declaration;
         if (ts->kind != ast::TypeDeclKind::Record) return false;
+        // fix #4232: PATH guard — see the header comment above for why this
+        // is keyed on `tr` (the instantiation) rather than `ts` (the shared
+        // declaration), and why it un-marks on exit rather than memoizing.
+        if (!seen.insert(tr).second) return false;
         RecordSubstGuard guard(this, tr);  // fix #3945: see comment above.
         std::vector<const sema::Symbol*> storage;
         collectRecordStorage(ts, storage);
+        bool found = false;
         for (const sema::Symbol* m : storage) {
-            if (isStringStorageMemberResolved(m)) return true;
+            if (isStringStorageMemberResolved(m)) { found = true; break; }
             const sema::TypeRef* mty = recordMemberTypeResolved(m);
             if (mty && !mty->nullable &&
                 mty->kind == sema::TypeRef::Kind::Named && mty->declaration &&
                 mty->declaration->kind == ast::TypeDeclKind::Record &&
-                recordHasStringFields(mty))
-                return true;
+                recordHasStringFieldsOnPath(mty, seen)) {
+                found = true;
+                break;
+            }
             if (mty && !mty->nullable &&
                 mty->kind == sema::TypeRef::Kind::Named && mty->declaration &&
                 mty->declaration->kind == ast::TypeDeclKind::Choice &&
-                choiceHasStringFields(mty->declaration))
-                return true;
+                choiceHasStringFields(mty->declaration)) {
+                found = true;
+                break;
+            }
             // fix #2326 / §9.8 v0.228: a non-nullable INLINE-ARRAY field whose
             // element type (recursively, through nested record/choice/inline-
             // array) carries a string needs the release walker to recurse into
@@ -10728,10 +11158,17 @@ private:
             if (mty && !mty->nullable &&
                 mty->kind == sema::TypeRef::Kind::InlineArray &&
                 mty->arrayElement &&
-                inlineArrayElementCarriesString(mty->arrayElement))
-                return true;
+                inlineArrayElementCarriesString(mty->arrayElement)) {
+                found = true;
+                break;
+            }
         }
-        return false;
+        // PATH semantics, not visited-set memoization — mirrors
+        // isBorrowBearingRecordCommon's identical un-mark-on-exit (#2145):
+        // un-mark on exit so a sibling field reached through a different
+        // branch can still re-classify this same TypeRef.
+        seen.erase(tr);
+        return found;
     }
 
     // fix #2326 / §9.8 v0.228: does the element type of a non-nullable inline
@@ -10909,16 +11346,83 @@ private:
     std::unordered_set<const void*> recordCallResultReleaseEligible_;
     llvm::Function* recordCallResultReleaseEligibleFn_ = nullptr;
 
+    // fix #4266 (§9.7 / §28.9): the "declare, then assign" twin of the set
+    // above — a plain `var outer: P;` (NO initializer) whose SOLE
+    // reassignment anywhere in the body is `outer := <call>;` /
+    // `outer := new P(...);`, independently proven fresh by the same
+    // authorities the `var p := <call>;` shape uses
+    // (isProvablyFreshRecordFactoryMethod / its imported twin /
+    // isSynthesizedRecordDeserializeCall / isFreshRecordConstructionOf
+    // ExactType). Maps the candidate's OWN LocalDecl node (the
+    // `recordCallResultReleaseEligible_` key) to the ONE AssignmentStmt
+    // node that gives it its value, so the escape walker
+    // (StringEscapeWalker::recordDeclareThenAssignSite) can recognize that
+    // ONE store as the non-escaping "initializer" a LocalDeclInitView-based
+    // candidate never needs to special-case (its init is never visited as
+    // a generic statement at all). Populated only by
+    // collectRecordCallResultReleaseEligible; empty for every candidate
+    // admitted the ordinary way.
+    std::unordered_map<const void*, const ast::AssignmentStmt*>
+        recordDeclareThenAssignSite_;
+
     // fix #1747: walk the function body, classifying each plain-`var`
     // record-call-result LocalDecl by escape verdict.
     void collectRecordCallResultReleaseEligible(
         const std::vector<std::unique_ptr<ast::Stmt>>& body);
 
+    // fix #4342 (§9.7 / §28.3 / §28.9, v0.298): the call-wide #429
+    // post-call argument release suppression that #4322 added for the
+    // `var outer := Helper.Wrap("...");` shape is sound ONLY when the
+    // call's result will actually be claimed downstream — i.e., this call
+    // IS the initializer of a LocalDecl/LocalConstDecl in
+    // `recordCallResultReleaseEligible_`. Set to `true` by `lowerLocalDecl`
+    // around the init lowering for such an eligible local; consulted at the
+    // start of `lowerCallDispatch` (and cleared, so nested calls inside
+    // args do not also see it as true) to gate the suppression. For any
+    // call whose result is NOT a record-call-result-eligible init (a
+    // discarded `Helper.Wrap(...);` statement, an inline
+    // `total + Helper.Wrap(...).V.Length` read, an argument to another
+    // call, etc.) the OLD unconditional #429 release fires and reclaims
+    // the +1 producer argument — the pre-#4322 safe behaviour for those
+    // shapes, with no leak.
+    bool recordCallResultInitOutermost_ = false;
+
+    // fix #4300 (§9.7 / §28.3 / §28.9, v0.298): the Class-typed twin of
+    // the record-call-result suppression above. A `var outer: Widget2;`
+    // (Class with a Record field) assigned via `outer := Helper.Wrap(s)`
+    // must also suppress the caller's +1 argument release — the Class's
+    // own vtable-driven disposal (emitOwnedFieldDisposals /
+    // emitRecordStringFieldReleases from the class disposer cascade) is what
+    // reclaims the argument at the class instance's disposal, exactly as
+    // `recordStringFields` does for a record-typed local. Set by
+    // `lowerLocalDecl` for a Class-typed local in
+    // `classCallResultWithRecordFieldEligible_`, and separately by the
+    // AssignmentStmt arm of `collectRecordCallResultReleaseEligible` for a
+    // "declare, then assign" Class local.
+    std::unordered_map<const void*, const ast::AssignmentStmt*>
+        classCallResultWithRecordFieldEligible_;
+    bool recordCallResultInitOutermostClassWithRecordField_ = false;
+
     // fix #2448 / §9.7 / §28.9 (v0.235): is `expr` a provably fresh, alias-
     // free construction of EXACTLY record type `recTs`? See the definition
     // (LlvmBackend_Setup.cpp) for the full rationale.
+    //
+    // fix #4295 (§9.7 / §28.9, v0.298): `enclosingFactory`, defaulted to
+    // null, admits ONE additional STRING-field argument shape — a bare
+    // read of `enclosingFactory`'s OWN plain (unmarked) parameter, used
+    // EXACTLY once across the whole construction — when this call is
+    // reached from isProvablyFreshRecordFactoryMethod's callee-body walk
+    // (the only caller that passes it). Every OTHER call site (the #4237
+    // nested-record recursion immediately below, the #2866/#4253 direct
+    // NewExpr admissions, the boxValueNeedsStringRetain query) omits the
+    // argument and is UNCHANGED — see the definition for why widening is
+    // sound only paired with the caller-side calleeReturnMayAliasArg
+    // Unretained suppression (walkCallArgs), which is call-wide, not
+    // context-specific, so admitting it anywhere else would arm a release
+    // with no matching suppression.
     bool isFreshRecordConstructionOfExactType(
-        const ast::Expr* expr, const sema::TypeSymbol* recTs) const;
+        const ast::Expr* expr, const sema::TypeSymbol* recTs,
+        const sema::MethodSymbol* enclosingFactory = nullptr) const;
 
     // fix #2448 / §9.7 / §28.9 (v0.235): is MethodSymbol `ms` provably a
     // "fresh record factory" for record `recTs`? Consulted by
@@ -11037,6 +11541,50 @@ private:
     void collectValueLikeChoiceCallResultReleaseEligible(
         const std::vector<std::unique_ptr<ast::Stmt>>& body);
 
+    // fix #4296 (§9.7 / §28.3, v0.298): the set of plain `var` INLINE-ARRAY
+    // LocalDecl nodes whose initializer is a CALL returning an inline array
+    // type whose element type carries strings
+    // (inlineArrayElementCarriesString), and which the conservative escape
+    // walk proved never to escape. Mirrors recordCallResultReleaseEligible_
+    // exactly — for the [N]string call-result shape the issue identified as
+    // having no release-eligibility mechanism at all. Consulted in
+    // lowerLocalDecl (LlvmBackend_Setup.cpp). The inlineArrayStringFields
+    // Disposal already exists (LlvmBackend_Disposal.cpp, wired for
+    // Serialize/Deserialize only) and emits bz_string_free on each element
+    // slot at scope end; this fix is the missing WIRING that admits the
+    // ordinary user-local shape into that Disposal.
+    //
+    // Freshness: unlike records (where a callee may return a BORROWED field
+    // already reachable from a longer-lived owner), an inline array is always
+    // returned BY VALUE — the call site receives a freshly constructed array
+    // whose elements may themselves be borrows of the caller's locals, but
+    // the array struct itself is always fresh at the call site. The callee
+    // does not hand back an existing heap allocation the caller must not
+    // reclaim; the caller IS the first/sole owner of the array struct.
+    // No factory-method body walk is needed for the array-level freshness
+    // argument; the string-releasability of the elements is a property of
+    // the element type alone (checked by inlineArrayElementCarriesString).
+    //
+    // Also covers the "declare, then assign" shape
+    // (`var outer: [N]string; ... outer := <call>;`) per the #4266 pattern.
+    std::unordered_set<const void*> inlineArrayStringCallResultReleaseEligible_;
+    llvm::Function* inlineArrayStringCallResultReleaseEligibleFn_ = nullptr;
+
+    // fix #4296 (§9.7 / §28.9): the "declare, then assign" twin of the set
+    // above — a plain `var outer: [N]string;` (NO initializer) whose SOLE
+    // reassignment anywhere in the body is `outer := <call>;`, independently
+    // proven fresh. Maps the candidate's OWN LocalDecl node to the ONE
+    // AssignmentStmt node that gives it its value. Mirrors
+    // recordDeclareThenAssignSite_ exactly. Populated only by
+    // collectInlineArrayStringCallResultReleaseEligible.
+    std::unordered_map<const void*, const ast::AssignmentStmt*>
+        inlineArrayStringDeclareThenAssignSite_;
+
+    // fix #4296: walk the function body, classifying each plain-`var`
+    // inline-array call-result LocalDecl by escape verdict.
+    void collectInlineArrayStringCallResultReleaseEligible(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body);
+
     // #429: is the resolved TypeRef `rt` a (non-nullable) `string`? Used to
     // zero-init a no-initializer `var s: string;` slot so reassignment's
     // release-old is null-safe. Nullable string? is excluded (left untouched).
@@ -11044,6 +11592,27 @@ private:
         return rt && !rt->nullable &&
                rt->kind == sema::TypeRef::Kind::Primitive &&
                rt->primitive == sema::PrimitiveType::String;
+    }
+
+    // fix #4127 (§27.5 / §28.9, stdlib §4.8, v0.295): is `rt` the synthetic
+    // DictionaryEntry<string,V> shape LlvmBackend_Calls.cpp's isDict block
+    // rebuilds a fresh, independently-owned bz_string* Key for (field 0 of
+    // the {K,V} struct)? Same gate as isFreshDictEntryKeyReleaseTerminalLocal
+    // (LlvmBackend_Setup.cpp), reused here rather than re-derived, but tested
+    // on a bare TypeRef — a captured local's `declType` — since a capture
+    // site has no LocalDeclInitView (there is no initializer expression to
+    // read; the local may have been declared anywhere earlier in the body).
+    // Deliberately narrower than #4135's DrainedEntry sibling — that type is
+    // reached through a different lowering path (lowerDictDrainFor) with a
+    // different, larger set of owned fields, and is not this issue's scope.
+    bool isDictEntryStringKeyTypeRef(const sema::TypeRef* rt) const {
+        if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
+            return false;
+        if (rt->headName() != "DictionaryEntry") return false;
+        if (rt->genericArgs.size() < 2 || !rt->genericArgs[0]) return false;
+        const sema::TypeRef* kt = rt->genericArgs[0];
+        return kt->kind == sema::TypeRef::Kind::Primitive &&
+               kt->primitive == sema::PrimitiveType::String && !kt->nullable;
     }
 
     // ====================================================================
@@ -11732,6 +12301,27 @@ private:
     // use-after-free. The scope-end reclaim is later (bounded over-live, not
     // a leak) but never earlier than the loop finishes, since the enclosing
     // block scope necessarily contains the whole for-statement.
+    // drainChainOnTake=true (fix #4189 / §30.5, v0.298): only meaningful when
+    // takeResultAfter is also true. Tells the `bz_task_take_result` call
+    // (below) to ALSO walk `task`'s own §30.5 `chained_source` chain
+    // transitively and null each upstream hop's own `result` — preventing an
+    // upstream hop's still-attached `result_disposer` from firing again when
+    // the chain is eventually reclaimed, on a value this await already
+    // handed to a plain bound local (`using var w := await outer;`). MUST be
+    // false whenever this await's extracted value is instead about to be
+    // re-chained by an ACTIVE enclosing §30.5 chained return (`return await
+    // f()`, `asyncChainedReturn_` true at the call site) — that idiom relies
+    // on the chain's upstream `result` fields staying populated until
+    // `bz_task_needs_caller_disposal` / `bz_task_free` walk them later;
+    // draining here would make that decision wrongly and leak the value
+    // (measured: draining unconditionally regressed
+    // `using_var_direct_closure_chain_double_free_4162_test.cpp`'s own
+    // `routed_through_async_method_control_clean_30_5` control from a clean
+    // disposal to a leak). `lowerAwait` computes this from
+    // `takeResultAfter && !asyncChainedReturn_`. Every other caller (the
+    // `await for` desugaring) leaves it at its default (false; that call
+    // site also always passes takeResultAfter=false, so the flag has no
+    // effect there regardless).
     llvm::Value* emitAwaitSuspend(llvm::Value* task, llvm::Type* resultTy,
                                   bool freeTaskAfter,
                                   bool takeResultAfter = false,
@@ -11739,7 +12329,8 @@ private:
                                   bool deferTaskFree = false,
                                   bool freeOnFault = false,
                                   const std::function<void()>& onFault = {},
-                                  bool deferToScopeOnly = false);
+                                  bool deferToScopeOnly = false,
+                                  bool drainChainOnTake = false);
 
     // §28.12 / §30 (`await using` normal-exit path): call DisposeAsync() on `obj`
     // stdlib §6.10 (v0.175, #808): emit the TaskScope disposal for one scope
@@ -11857,6 +12448,22 @@ private:
     // absent: those are saved where they are needed, by name, because they are
     // not `clearSmFrame()`'s business.
     //
+    // fix #4158 / #4169 (§29.1/§29.7/§30.7, v0.295): iterElemIsRuntimeManagedPrimitive_
+    // and smIterEnumFrameSlot_ were two more members in the #3505 gap — siblings
+    // of iterElemIsOwnedClass_/iterIsOwningIter_/smForInSrcFields_ (already on
+    // this list), written by the exact same emitIteratorMethod /
+    // emitAsyncIteratorMethod entry prologues and read only from inside THAT
+    // same emission (write-before-read within one emitter run, exactly like
+    // their already-listed siblings) — but never folded in, so
+    // `buildSpecializedMethodFn`'s nested emission silently clobbered the
+    // OUTER's copy with the INNER's for the rest of the outer body. UNLIKE the
+    // §30.5 Pattern A return flags two lines up, neither collides with a
+    // hand-declared `NestedBodyScope` member of the same name (verified:
+    // `git grep -n 'iterElemIsRuntimeManagedPrimitive_\|smIterEnumFrameSlot_'
+    // src/codegen/LlvmBackend_Assign.cpp` returns nothing), so folding them in
+    // is a plain, safe addition rather than the duplicate-declaration hazard
+    // that keeps the two flags out.
+    //
     // The aliases exist only so a member type containing a comma can be passed
     // as a single macro argument.
     using SmFrameBlockVec       = std::vector<llvm::BasicBlock*>;
@@ -11873,6 +12480,11 @@ private:
     // order, which is driven by the AST walk and therefore reproducible.
     using SmFrameAllocaFieldMap = llvm::MapVector<llvm::AllocaInst*, unsigned>;
     using SmFrameAllocaSet      = std::unordered_set<llvm::AllocaInst*>;
+    // fix #4169: smIterEnumFrameSlot_'s own declared type (LlvmBackend_impl.hpp
+    // ~L2162) is a plain std::unordered_map, NOT the MapVector SmFrameAllocaFieldMap
+    // above — this fold must not silently change its container (and hence its
+    // iteration-order properties) as a side effect of protecting it.
+    using SmFrameAllocaIndexMap = std::unordered_map<llvm::AllocaInst*, unsigned>;
 
 #define BEZEL_SM_FRAME_MEMBERS(X)                                              \
     /* kind-agnostic frame scaffolding */                                      \
@@ -11891,6 +12503,10 @@ private:
     X(SmFrameNodeFieldMap,    smLocalPreBoxField_,       {}) /* #3484 f/u */   \
     X(SmFrameAllocaSet,       smRestoredParamSlots_,     {}) /* #3484 f/u */   \
     X(llvm::Function*,        smCellFrameFn_,            nullptr)              \
+    /* fix #4169: sibling of smForInSrcFields_ above (same §29.7 #944 tag,     \
+       same "reset per iterator body" contract) -- was not folded in when     \
+       #3505 first built this list. */                                        \
+    X(SmFrameAllocaIndexMap,  smIterEnumFrameSlot_,      {}) /* §29.7 (#944) */\
     /* iterator-specific half */                                               \
     X(unsigned,               iterCurrentValField_,      0)                    \
     X(llvm::Type*,            iterElemTy_,               nullptr)              \
@@ -11898,6 +12514,10 @@ private:
     X(bool,                   iterElemIsOwnedClass_,     false)   /* #1120 */  \
     X(unsigned,               iterCurrentValOwnedField_, 0)       /* #1120 */  \
     X(bool,                   iterIsOwningIter_,         false)   /* #2621 */  \
+    /* fix #4158: sibling of iterElemIsOwnedClass_/iterIsOwningIter_ just      \
+       above -- same exhaustive three-way dispatch, same emitters, was never  \
+       folded in alongside them. */                                           \
+    X(bool,      iterElemIsRuntimeManagedPrimitive_,     false)   /* #2738 */  \
     /* async-specific half */                                                  \
     X(unsigned,               asyncOuterTaskField_,      0)                    \
     X(unsigned,               asyncPendingTaskField_,    0)                    \
@@ -12007,7 +12627,9 @@ private:
               closureBorrowRetainEligible_(e.closureBorrowRetainEligible_),
               boxCaptureLocals_(e.boxCaptureLocals_),
               singleCaptureLocals_(e.singleCaptureLocals_),
+              multiCaptureLocals_(e.multiCaptureLocals_),  // fix #4240
               assignedCaptureVars_(e.assignedCaptureVars_),
+              returnedCaptureVars_(e.returnedCaptureVars_),  // fix #4198
               definitelyEscapingLambdas_(e.definitelyEscapingLambdas_),
               boxCaptureLocalsFn_(e.boxCaptureLocalsFn_),
               cellFreeEligible_(e.cellFreeEligible_),
@@ -12028,7 +12650,10 @@ private:
                 std::move(closureBorrowRetainEligible_);
             e_.boxCaptureLocals_ = std::move(boxCaptureLocals_);
             e_.singleCaptureLocals_ = std::move(singleCaptureLocals_);
+            e_.multiCaptureLocals_ = std::move(multiCaptureLocals_);  // fix #4240
             e_.assignedCaptureVars_ = std::move(assignedCaptureVars_);
+            e_.returnedCaptureVars_ =
+                std::move(returnedCaptureVars_);  // fix #4198
             e_.definitelyEscapingLambdas_ =
                 std::move(definitelyEscapingLambdas_);
             e_.boxCaptureLocalsFn_ = boxCaptureLocalsFn_;
@@ -12065,7 +12690,9 @@ private:
         std::unordered_set<const void*> closureBorrowRetainEligible_;
         std::unordered_set<const void*> boxCaptureLocals_;
         std::unordered_set<const void*> singleCaptureLocals_;
+        std::unordered_set<const void*> multiCaptureLocals_;  // fix #4240
         std::unordered_set<const void*> assignedCaptureVars_;
+        std::unordered_set<const void*> returnedCaptureVars_;  // fix #4198
         std::unordered_set<const void*> definitelyEscapingLambdas_;
         llvm::Function* boxCaptureLocalsFn_;
         std::unordered_set<const void*> cellFreeEligible_;
@@ -12108,6 +12735,11 @@ private:
             : e_(e),
               borrowingArrayFreeEligible_(e.borrowingArrayFreeEligible_),
               borrowingArrayFreeEligibleFn_(e.borrowingArrayFreeEligibleFn_),
+              // fix #4308 sibling: groupByToArrayFreeEligible_ is populated
+              // by the SAME collectBorrowingArrayFreeEligible call this scope
+              // guards, so it needs the identical save/restore protection
+              // (LANE_RULES §8's two-halves-of-one-contract rule).
+              groupByToArrayFreeEligible_(e.groupByToArrayFreeEligible_),
               dictMaterializerFreeEligible_(e.dictMaterializerFreeEligible_),
               dictMaterializerFreeEligibleFn_(e.dictMaterializerFreeEligibleFn_),
               groupingFreeEligible_(e.groupingFreeEligible_),
@@ -12134,6 +12766,9 @@ private:
             e_.borrowingArrayFreeEligible_ =
                 std::move(borrowingArrayFreeEligible_);
             e_.borrowingArrayFreeEligibleFn_ = borrowingArrayFreeEligibleFn_;
+            // fix #4308 sibling
+            e_.groupByToArrayFreeEligible_ =
+                std::move(groupByToArrayFreeEligible_);
             e_.dictMaterializerFreeEligible_ =
                 std::move(dictMaterializerFreeEligible_);
             e_.dictMaterializerFreeEligibleFn_ = dictMaterializerFreeEligibleFn_;
@@ -12162,6 +12797,8 @@ private:
         Emitter& e_;
         std::unordered_set<const void*> borrowingArrayFreeEligible_;
         llvm::Function* borrowingArrayFreeEligibleFn_;
+        // fix #4308 sibling
+        std::unordered_set<const void*> groupByToArrayFreeEligible_;
         std::unordered_set<const void*> dictMaterializerFreeEligible_;
         llvm::Function* dictMaterializerFreeEligibleFn_;
         std::unordered_set<const void*> groupingFreeEligible_;
@@ -12515,6 +13152,31 @@ private:
         // rather than depending on a second mechanism.)
         const ast::Type*     accessorRetNode_;
         llvm::Function*      accessorRetFn_;
+        // --- choice receiver-identity recovery (fix #4143, §35.2/§35.5) ---
+        // currentChoiceMethod_ is saved+cleared+restored here, UNLIKE its
+        // enum twin currentEnumMethod_ (deliberately left inherited three
+        // lines below in the .cpp — see that comment). The two precedents
+        // look identical but are not: enumTypeOf's leaked value only ever
+        // feeds a bare enum-constant NAME lookup alongside a separately
+        // resolved scrutinee TypeRef, so a wrong value there is a soft miss.
+        // choiceTypeOf's leaked value is folded DESTRUCTIVELY into the
+        // CaseExpr's own scrutinee TypeRef (LlvmBackend_Exprs2.cpp, the
+        // "scrutTy not already a Choice" guard) whenever it fires, so a
+        // leaked choice from a caller's property-getter window silently
+        // reclassifies an unrelated `this` (a CLASS or record) as that
+        // caller's choice type — confirmed to make a real `case this of`
+        // fall through to `_` instead of matching its true arms. Clearing
+        // it here is safe: every site that legitimately NEEDS a non-null
+        // value here sets it FOR ITSELF from its own owning type
+        // (ensurePropertyAccessorFn's `cls`-gated set two hundred-odd lines
+        // below runs AFTER this scope's ctor and does not depend on
+        // inheriting a caller's value), and no memoized builder this scope
+        // guards can ever be reached with an owning type of Choice (or
+        // Enum) for its OWN accessor — choices and enums are both
+        // forbidden from declaring block-form/storage-backed properties or
+        // indexers (spec §10.5, and §35 for choices, which cites §10.5's
+        // restriction set directly).
+        const sema::TypeSymbol* choiceMethod_;
         // --- suspend/resume frame (#2170 + #2701 + #2702 + #3505 + #3531 + #3551) ---
         // fix #3551 (§29.3 / §30.1 / §30.7, v0.286): generated from
         // `BEZEL_SM_FRAME_MEMBERS` so adding a member to the macro cannot
@@ -13586,6 +14248,31 @@ private:
         const std::vector<sema::Symbol*>& params,
         const ast::PropertyDecl* setterValueAnchor = nullptr);
 
+    // fix #4174 follow-up (review NEEDS-FIX) / §28.1: the closure twin of
+    // retainAssignedStringParams — see that function's own comment for the
+    // full rationale, which applies here unchanged. lowerClosureLocalReassign's
+    // drop-on-overwrite release (fix #4174) is gated on localSlot(), which
+    // resolves a ParameterSymbol exactly as it resolves a LocalSymbol; a
+    // by-value closure-typed PARAMETER's slot was given NO independent +1 at
+    // bind (§28.1: `owned` is a compile error on a function type — a real,
+    // narrow citation for "this parameter can never own a disposal
+    // obligation", NOT a claim that any section mandates the retain/release
+    // MECHANISM itself; see the regression test file's header for that
+    // discussion — so a closure-typed parameter is ALWAYS an unmodified
+    // borrow whose single reference belongs to the CALLER). The first `:=`
+    // therefore released a reference this frame never owned, freeing the
+    // CALLER's closure under it — a use-after-free, confirmed measured
+    // (review probe: `p(): int` parameter reassigned inside the callee,
+    // caller's own binding read afterward — heap-use-after-free, freed in
+    // the callee, allocated in the caller). Give every such parameter this
+    // frame ASSIGNS TO an independent +1 at bind, exactly as the string
+    // sibling does — call right after bindParameters, paired 1:1 with every
+    // collectClosureReleaseEligible / closureReleaseEligibleFn_ pin (see the
+    // .cpp for the full argument and the CO-GATE rationale).
+    void retainAssignedClosureParams(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body,
+        const std::vector<sema::Symbol*>& params);
+
     // fix #2115 / §28.9 / §35.4: the set of `var` value-like choice LocalDecl
     // nodes whose initializer is a choice construction every string payload arg
     // of which is a +1 producer or a literal, AND a conservative whole-body walk
@@ -13615,6 +14302,19 @@ private:
     // the target LocalDecl identifier), so a returned/moved/aliased/captured
     // local is excluded → never a UAF, never a double-free.
     std::unordered_set<const void*> borrowingArrayFreeEligible_;
+    // fix #4308 sibling: the OWNING-array twin of borrowingArrayFreeEligible_ —
+    // plain `var` locals bound to `xs.GroupBy(...).ToArray()`. The static type
+    // is `Array<IGrouping>` (sema sees the method's normal return type) but the
+    // runtime bz_groupby_to_array result owns its groupings (Calls3.cpp ~2485
+    // short-circuits the normal materializer). The borrowing sibling uses
+    // elementPolicyFor(el, false), which post-#4308 returns ClassBorrow
+    // (null disposer) for the borrowing family — a leak of every grouping.
+    // This set feeds a separate disposal registration that uses
+    // elementPolicyFor(el, true) — the groupingFreeThunk branch. Same
+    // conservative escape-walk key as borrowingArrayFreeEligible_ (so a
+    // returned/captured/aliased local is excluded → never a UAF, never a
+    // double-free).
+    std::unordered_set<const void*> groupByToArrayFreeEligible_;
     // The function for which borrowingArrayFreeEligible_ was computed (mirrors
     // stringReleaseEligibleFn_): a lambda/thunk body lowered mid-function
     // inherits no eligibility, so its array locals just leak (never double-freed).
@@ -13977,6 +14677,17 @@ private:
     // (LocalConstDecl) is recognized identically.
     bool isFreshBorrowingArrayMaterializerLocal(
         const LocalDeclInitView& view) const;
+    // fix #4308 sibling: the OWNING-array twin — a plain `var`/`const` local
+    // bound to `<recv>.GroupBy(sel).ToArray()`. Static-types as `Array<IGrouping>`
+    // (sema sees the method's normal return type) but the runtime is an OWNING
+    // bz_groupby_to_array result that owns its groupings (Calls3.cpp ~2485
+    // short-circuits the normal materializer). The borrowing sibling's
+    // `elementPolicyFor(el, false)` returns ClassBorrow post-#4308 → a null
+    // disposer → leak of every grouping. This predicate feeds a separate
+    // candidates vector + an elementPolicyFor(el, true) disposal registration
+    // that uses the groupingFreeThunk branch (identical to the `using var`
+    // OwningArray<IGrouping> scope-end free).
+    bool isFreshGroupByToArrayLocal(const LocalDeclInitView& view) const;
     // #1004: true if `e` is an EXPRESSION codegen lowers to a FRESH, OWNERLESS
     // borrowing `Array<T>` temporary — a fresh-array materializer CALL
     // (`recv.ToArray()`/`recv.Sorted(...)`/`recv.Reversed()`) whose result no
@@ -14306,6 +15017,31 @@ private:
     // lowerStringFieldStore. Returns true when handled.
     bool lowerClosureFieldStore(const ast::Expr& target, llvm::Value* fieldAddr,
                                 llvm::Value* newVal, const ast::Expr* valueExpr);
+    // fix #4174: REASSIGNMENT `f := newVal` where `f` is a closure
+    // (function-typed) LOCAL/parameter SLOT. Retain-new (transfer a
+    // producer) / store / release-old, so the slot keeps owning an
+    // independent +1 across the reassignment — without this, the DISPLACED
+    // previous closure value (e.g. the `lambda() => 0` a later `f := lambda()
+    // => 42;` overwrites) is never released: a 40-byte-per-reassignment leak
+    // (measured, LSan). Mirrors lowerStringLocalReassign exactly (load-old →
+    // retain-or-transfer-new → store-new → release-old), using the SAME
+    // producer test lowerClosureFieldStore uses (isPlusOneClosureProducer ||
+    // isUserMethodClosureReturnCall). Returns true when handled (caller must
+    // NOT also store); false when `target` is not a closure-typed local slot.
+    // NOTE this admits a closure-typed PARAMETER too (localSlot() resolves a
+    // ParameterSymbol the same way it resolves a LocalSymbol) — a parameter's
+    // slot owns nothing at bind, so this release is only sound when PAIRED
+    // with retainAssignedClosureParams' bind-time retain (below); the two
+    // move together exactly as lowerStringLocalReassign and
+    // retainAssignedStringParams do for `string` (fix #2696). Internal
+    // refcounting-soundness fix, not an implementation of a specific spec
+    // rule — §28.9 declares function values runtime-managed but explicitly
+    // disclaims the reclaim MECHANISM ("reference counting... is not part
+    // of this specification"); see the regression test file's header for
+    // the full citation discussion.
+    bool lowerClosureLocalReassign(const ast::Expr& target, llvm::Value* slotAddr,
+                                   llvm::Type* elemTy, llvm::Value* newVal,
+                                   const ast::Expr* valueExpr);
 
     // #422 / §27.5 / §28.9: the set of `var` closure (function-typed) LocalDecl
     // nodes PROVABLY eligible for scope-end bz_closure_release — initialized
@@ -14512,6 +15248,47 @@ private:
     // ⇒ no double-free; definite escape ⇒ the outer scope is gone before the
     // closure dies ⇒ no UAF.
     std::unordered_set<const void*> singleCaptureLocals_;
+    // fix #4240 (§27.5 / §28.9, v0.298): LOCAL DECL NODES and PARAMETER SYMBOLS
+    // known captured by TWO OR MORE lambda envs (computed alongside
+    // singleCaptureLocals_ in the SAME tally, guarded by boxCaptureLocalsFn_ —
+    // the two sets are mutually exclusive by construction, n==1 vs n>=2 from
+    // one captureCount map).
+    //
+    // WHY A SEPARATE SET, RATHER THAN JUST "NOT IN singleCaptureLocals_".
+    // `collectBoxCaptureLocals` is re-invoked once per lambda, over ONLY that
+    // lambda's OWN `stmts` (lowerLambda), to discover what ITS nested lambdas
+    // capture. That re-scan's `collectAllLambdas` root is `lam.stmts` itself,
+    // so it can never find `lam` AS a capturing env of its own free
+    // variables — an ancestor lambda that captures a cell PURELY to hand it
+    // down to a lambda nested inside it (never referencing the cell in its
+    // own top-level statements) is invisible to this narrower re-scan, the
+    // same "outer doesn't count itself" blind spot #4226 fixed for
+    // returnedCaptureVars_ and #3804 fixed for sharedCellEnvdtorFreeOwner_.
+    // So a TRUE 2+-env cell can come back n==1 from a nested rescan's own
+    // narrower vantage and land in singleCaptureLocals_ WRONGLY unless the
+    // ancestor's already-proven "multi" verdict is preserved and used to
+    // ERASE that wrong membership after the rescan (lowerLambda's
+    // ancestorMultiCaptureLocals4240 merge) — a plain union onto
+    // singleCaptureLocals_ cannot do that (it only ever ADDS members, and
+    // fixing this needs a REMOVAL). multiCaptureLocals_ is therefore the
+    // ancestor-merged, monotonic-OR "known shared by 2+" fact (once true at
+    // any scope level, true at every descendant level too, since a narrower
+    // rescan can only find a SUBSET of the true capturers) — merged forward
+    // exactly like returnedCaptureVars_, and consulted ONLY to correct
+    // singleCaptureLocals_ itself, so every existing consumer
+    // (mutatedSharedCaptureCell, and the two #694/#3426 sole-holder
+    // cell-free gates) needs no change.
+    //
+    // Issue #4240: `mutatedSharedCaptureCell`'s "manyEnvsShareOneCell" check
+    // read singleCaptureLocals_ alone, so a captured-and-MUTATED cell shared
+    // by an ancestor lambda and a lambda nested two levels deep inside it hit
+    // n==1 from the inner lambda's own body-lowering rescan, left its content
+    // release unsuppressed while the ancestor's OWN capture-of-the-same-cell
+    // (correctly suppressed, using the top-level whole-function scan's
+    // n==2 answer) also went unretained — an unbalanced release: heap-use-
+    // after-free, `freed by ... envdtor`, on the very value the inner lambda
+    // itself had just produced.
+    std::unordered_set<const void*> multiCaptureLocals_;
     // fix #2706 / §27.5 / §28.9 (v0.240): LOCAL DECL NODES and PARAMETER SYMBOLS
     // that this function body ASSIGNS TO (`x := e` / `x += e`), including from
     // inside a lambda body. Computed alongside boxCaptureLocals_/
@@ -14557,6 +15334,63 @@ private:
             !singleCaptureLocals_.count(key) ||
             (!loopStack_.empty() && !freshCellPerIteration);
         return manyEnvsShareOneCell;
+    }
+    // fix #4198 / §27.5 / §28.9 (v0.298): LOCAL DECL NODES and PARAMETER
+    // SYMBOLS that this function body directly RETURNS BY NAME (`return x;`,
+    // `x` a bare IdentifierExpr naming the local/parameter — not a call
+    // through it, not a field read off it). Computed alongside
+    // assignedCaptureVars_ by the SAME collectBoxCaptureLocals pass (same key
+    // space, same boxCaptureLocalsFn_ guard) — but that scan's own `scanReturn`
+    // does NOT descend into lambda bodies: a nested lambda's own `return`
+    // escapes THAT lambda's frame, not this function's, so attributing it
+    // here would be a different (and wrong) claim.
+    //
+    // WHY THIS IS A SEPARATE HAZARD FROM assignedCaptureVars_/
+    // mutatedSharedCaptureCell. A captured local's OWN scope-end release is
+    // suppressed whenever it is captured at all — the "first capture
+    // transfers the producer's suppressed release to the envdtor" model (see
+    // the captured-LOCALS loop below). That model assumes the envdtor is the
+    // ONLY remaining consumer of the cell's content. `return x;` is a SECOND,
+    // independent consumer: it hands the raw reference to the caller with no
+    // retain (the ordinary "return a local, transfer, don't release" idiom —
+    // correct in isolation, and the only reason a plain, uncaptured closure
+    // return works at all). When the same local is BOTH captured AND
+    // returned, the envdtor's content release and the return's silent
+    // transfer both claim the SAME single reference: the envdtor frees it
+    // during THIS frame's own scope-end cleanup (which runs after the return
+    // value is computed but before control reaches the caller), so the
+    // caller receives a pointer that is already dangling.
+    //
+    // Measured (issue #4198): `heap-use-after-free ... freed by ... in
+    // bz$lam$N$envdtor ... previously allocated ... in lam$N ... READ ... in
+    // main` — a single call, no loop, 100% reproducible.
+    //
+    // NOT specific to a MUTATED cell. #4198's own repro reassigns the
+    // captured local from inside the capturing lambda, but a READ-ONLY
+    // capture that is independently returned hits the identical UAF
+    // (measured: same crash signature, with assignedCaptureVars_ empty for
+    // that program — see this fix's own regression test's
+    // read_only_capture_returned_no_mutation_fully_clean_spec_27_5 row,
+    // which REFUTES the issue's own "this needs the mutation ... being
+    // exercised" scope note). So this set and its consumer below are
+    // independent of assignedCaptureVars_ / singleCaptureLocals_ /
+    // loopStack_, and every env sharing the cell suppresses its release
+    // uniformly (mirrors mutatedSharedCaptureCell's own "suppress retain and
+    // release together" trade — a bounded leak on the OTHER captures, never
+    // an over-release — rather than trying to pick which one env's release
+    // should "win").
+    std::unordered_set<const void*> returnedCaptureVars_;
+    // fix #4198 / §27.5 / §28.9 (v0.298): does this capture's envdtor content
+    // release need suppressing because the captured local/parameter is ALSO
+    // directly returned by name from the enclosing function? See
+    // returnedCaptureVars_'s declaration just above for the full argument.
+    bool capturedLocalReturnedByName(const void* key,
+                                      const sema::TypeRef* semaTy) {
+        if (currentFn_ != boxCaptureLocalsFn_) return false;
+        if (!isStringTypeRefNonNull(semaTy) &&
+            !(semaTy && semaTy->kind == sema::TypeRef::Kind::Function))
+            return false;
+        return returnedCaptureVars_.count(key) != 0;
     }
     // §27.5 / #694: LambdaExpr nodes that DEFINITELY escape the function (directly
     // returned). Computed once per body by collectDefinitelyEscapingLambdas;
@@ -15712,6 +16546,23 @@ private:
     llvm::Value* emitStructEquality(llvm::Value* l, llvm::Value* r,
                                     llvm::StructType* st,
                                     const sema::TypeSymbol* rec = nullptr);
+    // fix #4234 (§9.1, v0.298): a per-INSTANTIATION (keyed on the concrete
+    // `llvm::StructType*` `recTy` — see recordToStringHelperFn's comment
+    // for why bare `TypeSymbol*` is the WRONG key for a generic record)
+    // MEMOIZED helper wrapping emitStructEquality's field-by-field body —
+    // the equality sibling of recordToStringHelperFn (see its comment for
+    // the exponential-blowup rationale). `emitValueEquality`'s Record-kind
+    // arm calls this instead of re-inlining emitStructEquality for a
+    // nested record field. `recTy` is the CALLER's own already-correct
+    // type for `l`/`r` (both operands share one type by construction).
+    llvm::Function* recordEqualityHelperFn(const sema::TypeSymbol* rec,
+                                           llvm::StructType* recTy);
+    // fix #4234 (§9.1, v0.298): the GetHashCode sibling — wraps
+    // emitRecordHashCode, same per-instantiation `recTy` keying.
+    // `emitValueHashCode`'s Record-kind arm calls this instead of
+    // re-inlining emitRecordHashCode for a nested record field.
+    llvm::Function* recordHashCodeHelperFn(const sema::TypeSymbol* rec,
+                                           llvm::StructType* recTy);
     // §8.3 (equality table) / §15.1.2: element-by-element value equality of two
     // inline-array `[N]T` values. `at` is the LLVM `[N x elem]` type; `elemTy`
     // is the element's declared Bezel type (so string elements compare by
@@ -15889,6 +16740,42 @@ private:
     // try-with-`finally` body scope's unwind pass is emitted after the whole
     // body, so an erasure at the reclaim would lose it.
     void dischargeFreshNewReceiverTempUnwind(llvm::AllocaInst* slot);
+
+    // fix #4320 (§26.1 / §4.6 / §28.9, v0.298): the STRING-RECEIVER sibling of
+    // `disposeFreshNewReceiverTemp`. The class-receiver reclaim only fires for
+    // a heap-CLASS producer (`isFreshOwnedClassProducer`'s TypeDeclKind::Class
+    // gate); a `+1` STRING producer (the §28.9 list — `P.Make()`, `"a"+"b"`,
+    // `s.Trim()`, `i.ToString()`, interpolation, range slice) reaches this path
+    // as a plain `ptr` and never reaches the reclaim, leaking its allocation.
+    //
+    // THE TWO GATES (mirroring CG27a's intrinsic Length/IsAscii path's
+    // implicit precondition):
+    //   1. The receiver is a `+1` string producer — `isPlusOneStringProducer`
+    //      (the same predicate every other §28.9 producer-release in this
+    //      backend keys on; a literal / sentinel receiver is correctly
+    //      released as a no-op via `bz_string_release`'s sentinel-safety).
+    //   2. The PROPERTY RESULT is NOT `string` — the result must not alias
+    //      the receiver. An identity getter `=> this` returns the receiver
+    //      itself; releasing the receiver's +1 there would free the underlying
+    //      string while `v` (= obj) still points at it — a use-after-free.
+    //      Length/IsAscii trivially satisfy this (int/bool ≠ string), and
+    //      every other primitive / enum / unit / class-result extension
+    //      property does too; only a string-typed result is the suspect, and
+    //      this is exactly the documented "an aliased result is NOT
+    //      disposed" soundness stance #1039 documented for the class path.
+    //
+    // `unwindSlot` is the SLOT returned by `registerFreshNewReceiverTempUnwind`
+    // — always null for a string receiver today (the class-only predicate
+    // rejects strings), but threaded through for symmetry with the class twin
+    // and so a future unified eligibility predicate that admits both can plug
+    // in without touching every call site. Throws inside the getter body skip
+    // the inline release (matching CG27a's own behavior on its simpler
+    // intrinsics — `loadStringLen` / `bz_string_is_ascii` are non-throwing;
+    // a throwing-getter edge is out of scope for the issue's repro).
+    void disposeFreshNewStringReceiverTemp(const ast::Expr* recvExpr,
+                                            llvm::Value* recvPtr,
+                                            const sema::TypeRef* resultTy,
+                                            llvm::AllocaInst* unwindSlot);
 
     // fix #3377 / §28.3 / §29.1 / §30.1 (v0.282): the fresh receiver of a
     // deferred-activation call (an iterator / async-task frame whose
@@ -16399,6 +17286,14 @@ private:
     // already reads the two shapes together the same way (`builtinInstName` in
     // ExprTypecheck_Calls.cpp, and #2734's `isFfiBuiltin`).
     static bool isFfiBufferTypeRef(const sema::TypeRef* rt);
+
+    // fix #4126 (stdlib §6.1/§8.1, v0.295): is `rt` `Stopwatch` or
+    // `CancellationToken` — the two builtin heap-pointer classes sharing the
+    // FFI-buffer trio's exact "no vtable, no dedicated Object-contract
+    // interceptor" shape (see `kNoOverrideIdentityBuiltins`,
+    // BuiltinRegistry.cpp, for why they are a separate registry row). Same
+    // dual-TypeRef-shape read as `isFfiBufferTypeRef` above.
+    static bool isNoOverrideIdentityTypeRef(const sema::TypeRef* rt);
 
     // fix #568: is `name` a BUILTIN type name that lowerTypeRef recognizes (a
     // collection / interface / task / FFI / value builtin / exception), as
@@ -17468,6 +18363,46 @@ private:
         // definite "no"), or the block was rewritten underneath us (unknown).
         return since.prev != nullptr;
     }
+
+    // fix issue 4193 (stdlib §8.1/§23.2-§23.3, v0.298): `emittedSideEffectSince
+    // (dispatchEntry)` conflates "the RECEIVER's own evaluation had a side
+    // effect" with "the MEMBER dispatched" whenever the receiver is not a
+    // trivial load. #4171 already found this for a receiver that is itself a
+    // CALL (`Stopwatch.StartNew().Bogus();` — evaluating the receiver emits
+    // `bz_stopwatch_start`/`alloc` before the member name is even compared)
+    // and declined to fix it there, keeping the pre-existing always-warn
+    // behaviour. The SAME hazard exists one hop earlier for a bare
+    // `IdentifierExpr` that resolves to a COMPUTED or BLOCK-FORM property
+    // getter (`property Sw: Stopwatch get => Stopwatch.StartNew(); end;` —
+    // reading bare `Sw` evaluates the getter body, `LlvmBackend_Exprs.cpp`'s
+    // own `IdentifierExpr` handling, ~6369/~6391) — measured to silently drop
+    // BOTH the `ftRecv`/#2935 Error and this file's Shape 1/2 Warning for
+    // `Sw.TotallyBogusMember();` (zero diagnostics), because the getter's own
+    // internal call already satisfies `emittedSideEffectSince(dispatchEntry)`
+    // before `TotallyBogusMember` is ever compared against Stopwatch's known
+    // members.
+    //
+    // Unlike the call-shaped receiver, a bare identifier's getter evaluation
+    // has exactly ONE canonical lowering site — `lowerExprInner`'s
+    // `IdentifierExpr` arm — so that site can record a footprint immediately
+    // AFTER the getter finishes, keyed by the identifier node. Consulting
+    // THAT footprint instead of `dispatchEntry` for a getter-backed receiver
+    // disentangles the two facts precisely: `emittedSideEffectSince(that
+    // footprint)` is true only when something happened AFTER the getter
+    // returned — i.e. the member itself dispatched — not merely because the
+    // getter was non-trivial. Measured: `Sw.Start()` (Start() really
+    // dispatches) leaves a `bz_stopwatch_start` call after this anchor and
+    // correctly stays silent; `Sw.TotallyBogusMember()` leaves nothing after
+    // it and correctly warns. A receiver that IS itself a call (no bare
+    // identifier to key on) has no entry here and keeps #4171's existing
+    // always-warn behaviour, unchanged.
+    //
+    // Populated only in `lowerExprInner`'s `IdentifierExpr`
+    // `computedGetterOf`/`blockGetterOf` arms; every other identifier read
+    // (locals, parameters, plain fields, static fields) never inserts an
+    // entry, so a lookup miss here always falls back to `dispatchEntry`
+    // unchanged.
+    std::unordered_map<const ast::Expr*, IrFootprint> postGetterFootprint_;
 
     // fix #2963: set by `lowerCall` (the wrapper) on EVERY return — true exactly
     // when the call produced no value AND emitted IR, i.e. "an arm lowered it

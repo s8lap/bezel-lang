@@ -809,6 +809,14 @@ bool Emitter::isFfiBufferTypeRef(const sema::TypeRef* rt) {
     return common::isFfiBufferBuiltinName(builtinTypeName(rt));
 }
 
+// fix #4126 (stdlib §6.1/§8.1, v0.295): same dual-shape read as
+// `isFfiBufferTypeRef` above, over the `kNoOverrideIdentityBuiltins` row
+// (Stopwatch, CancellationToken) instead — see the header for why these are
+// a separate registry entry rather than a widened `kFfiBufferBuiltins`.
+bool Emitter::isNoOverrideIdentityTypeRef(const sema::TypeRef* rt) {
+    return common::isNoOverrideIdentityBuiltinName(builtinTypeName(rt));
+}
+
 
 bool Emitter::isCollectionTypeName(const sema::TypeRef* rt) {
     if (!rt || rt->kind != sema::TypeRef::Kind::Named) return false;
@@ -9557,6 +9565,21 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                 auto* fn = declareC("bz_guid_equals", i32(), {ptrTy(), ptrTy()});
                 llvm::Value* r = builder_.CreateCall(fn, {slot, otherSlot}, "guid.eq.r");
                 return builder_.CreateICmpNE(r, builder_.getInt32(0), "guid.eq");
+            }
+            // fix #4126 (stdlib §2.6/§8.3, v0.295): GetHashCode(): int — no
+            // dedicated interceptor existed for this member (only ToString/
+            // Equals/CompareTo did, immediately above/below), so the call
+            // fell through to the generic universal-Object dispatch, whose
+            // `isNamedClassRecv`/`isBuiltinIdentityRecv` (LlvmBackend_Calls2.
+            // cpp) both require a POINTER receiver — a Guid lowers to the
+            // {i64,i64} `guidStructType()` VALUE, so both bailed and the
+            // call degraded via #2434 to a zero-initialized `0`. Measured:
+            // several distinct `Guid.NewGuid()` values all read `0`.
+            // `bz_guid_hash` is content-consistent with `bz_guid_equals`
+            // above (equal Guids hash identically per §8.3).
+            if (mname == "GetHashCode" && call.args.empty()) {
+                auto* fn = declareC("bz_guid_hash", i32(), {ptrTy()});
+                return builder_.CreateCall(fn, {slot}, "guid.hash");
             }
             // per stdlib §2.6 / #1357: CompareTo(other: Guid): int — 16-byte lexicographic.
             if (mname == "CompareTo" && call.args.size() == 1 && call.args[0].value) {

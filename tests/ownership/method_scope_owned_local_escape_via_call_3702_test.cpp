@@ -77,7 +77,7 @@ BEZEL_TEST(method_scope_owned_local_escape, mk_call_returned_method_closure_reje
     BEZEL_EXPECT_TRUE(hasErrorMessage(
         r, "returned closure captures `r` whose source is disposed at scope "
            "end"));
-    BEZEL_EXPECT_TRUE(hasErrorMessage(r, "(§28.9 closure-capture escape"));
+    BEZEL_EXPECT_TRUE(hasErrorMessage(r, "(§28.3 closure-capture escape"));
 }
 
 // POSITIVE (§28.9 / §27.5, #3702): the structurally SIMPLER unsafe case —
@@ -97,7 +97,7 @@ BEZEL_TEST(method_scope_owned_local_escape, mk_exprbody_returns_closure_rejected
     BEZEL_EXPECT_TRUE(hasErrorMessage(
         r, "returned closure captures `r` whose source is disposed at scope "
            "end"));
-    BEZEL_EXPECT_TRUE(hasErrorMessage(r, "(§28.9 closure-capture escape"));
+    BEZEL_EXPECT_TRUE(hasErrorMessage(r, "(§28.3 closure-capture escape"));
 }
 
 // NEGATIVE (§28.9 / §27.5, #3702) — the OBLIGATION boundary. Same shape as
@@ -175,7 +175,7 @@ BEZEL_TEST(method_scope_owned_local_escape, const_mk_call_returned_method_closur
     BEZEL_EXPECT_TRUE(hasErrorMessage(
         r, "returned closure captures `r` whose source is disposed at scope "
            "end"));
-    BEZEL_EXPECT_TRUE(hasErrorMessage(r, "(§28.9 closure-capture escape"));
+    BEZEL_EXPECT_TRUE(hasErrorMessage(r, "(§28.3 closure-capture escape"));
 }
 
 // POSITIVE (§28.9 / §27.5, #3702 + #3591): the §21.1 `const`-binding sibling
@@ -194,5 +194,5 @@ BEZEL_TEST(method_scope_owned_local_escape, const_mk_exprbody_returns_closure_re
     BEZEL_EXPECT_TRUE(hasErrorMessage(
         r, "returned closure captures `r` whose source is disposed at scope "
            "end"));
-    BEZEL_EXPECT_TRUE(hasErrorMessage(r, "(§28.9 closure-capture escape"));
+    BEZEL_EXPECT_TRUE(hasErrorMessage(r, "(§28.3 closure-capture escape"));
 }

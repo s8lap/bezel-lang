@@ -695,22 +695,46 @@ ExprTC::OverloadResult ExprTC::resolveOverload(
         }
     };
     for (const TypeRef* a : argTypes)
-        if (!judgeable(a)) { res.outcome = OverloadOutcome::Undecidable; return res; }
-    for (const auto& pts : paramTypes) {
-        if (pts.size() != nArg) {
-            // arity already filtered upstream; defensively bail.
+        if (!judgeable(a)) {
+            // fix #NNNN (§22.6, v0.298): all candidates are inapplicable when
+            // the argument types themselves can't be judged.
+            res.applicable.assign(nCand, false);
             res.outcome = OverloadOutcome::Undecidable;
             return res;
         }
-        for (const TypeRef* p : pts)
-            if (!judgeable(p)) { res.outcome = OverloadOutcome::Undecidable; return res; }
+    // fix #NNNN (§22.6, v0.298): moved grid/applicable before the per-param
+    // judgeable check so we can mark individual candidates inapplicable rather
+    // than returning early and leaving all applicable[] at true (which caused
+    // arityFallback to select an overload that classifyArg would have rejected).
+    std::vector<std::vector<ArgMatch>> grid(nCand);
+    res.applicable.assign(nCand, true);
+    for (const auto& pts : paramTypes) {
+        if (pts.size() != nArg) {
+            // arity already filtered upstream; defensively bail.
+            res.applicable.assign(nCand, false);
+            res.outcome = OverloadOutcome::Undecidable;
+            return res;
+        }
+    }
+    // Per-candidate: if any parameter is unjudgeable, mark this candidate
+    // inapplicable and skip its classification. This allows other candidates
+    // with judgeable params to still be ranked, while arityFallback will not
+    // select a candidate whose params could not be judged.
+    for (std::size_t c = 0; c < nCand; ++c) {
+        for (std::size_t i = 0; i < nArg; ++i) {
+            if (!judgeable(paramTypes[c][i])) {
+                res.applicable[c] = false;
+                break;
+            }
+        }
     }
 
     // Classify every (candidate, argument) cell. ArgMatch::NotApplicable in
     // any cell removes that candidate from the applicable set (§22.6 step 1).
-    std::vector<std::vector<ArgMatch>> grid(nCand);
-    std::vector<bool> applicable(nCand, true);
+    // Skip classification for candidates already marked inapplicable (unjudgeable
+    // param types above).
     for (std::size_t c = 0; c < nCand; ++c) {
+        if (!res.applicable[c]) continue;  // already marked inapplicable above
         grid[c].resize(nArg);
         for (std::size_t i = 0; i < nArg; ++i) {
             // fix #2985 (§22.6 + §5.1 v0.240 *Constant narrowing*): delegate
@@ -750,13 +774,13 @@ ExprTC::OverloadResult ExprTC::resolveOverload(
             }
             ArgMatch m = classifyArg(argTy, paramTypes[c][i]);
             grid[c][i] = m;
-            if (m == ArgMatch::NotApplicable) applicable[c] = false;
+            if (m == ArgMatch::NotApplicable) res.applicable[c] = false;
         }
     }
 
     std::vector<std::size_t> appl;
     for (std::size_t c = 0; c < nCand; ++c)
-        if (applicable[c]) appl.push_back(c);
+        if (res.applicable[c]) appl.push_back(c);
 
     // §22.6 step 4: no applicable candidate → unreachable, no candidates
     // cited.
@@ -1026,75 +1050,6 @@ bool returnCarriesParametricRecord(
     }
 }
 
-// §14.1 (#785, #850): structurally unify a value parameter's declared type
-// (`pt`, AST) against the call argument's resolved type (`argTy`), binding each
-// method type parameter named in `paramNames` to the matching component of the
-// argument's type. A bare `p: T` binds T; a generic-typed `p: Pair<A, B>`
-// recurses pairwise into the generic args (binding A and B from a
-// `Pair<int, string>` argument). The first binding for a name wins (a later or
-// already-receiver-bound occurrence is left). Mirrors codegen's
-// unifyMethodReturnTypeArg.
-// §14.1 / #850: when the parameter is `T?` (nullable named type-param) and the
-// argument is `int?` (or another nullable type), peel the shared `?` so that T
-// is bound to `int` (non-nullable), not `int?`. This makes `where T: value`
-// hold (int satisfies value, int? does not) and the return type `T` stays
-// non-nullable. A bare `T` parameter (pt->nullable == false) with a nullable
-// argument still binds T = int? and is correctly rejected by the constraint
-// check. ctx is used to allocate a stable non-nullable TypeRef in the peel
-// case. // per §14.1
-// §14.1 / #896: `conflicts` (optional) receives the name of any type parameter
-// whose second-occurrence inferred binding is DIFFERENT from the first-occurrence
-// binding (e.g. T already bound to int, now seeing bool from a second T? arg).
-// The caller emits a §14.1 compile error and aborts the call. Without this
-// detection the first-binding-wins logic silently drops the conflict, and codegen
-// later produces a PHINode mixing int and bool → SIGABRT.
-void unifyArgSubst(
-    const ast::Type* pt, TypeRef* argTy,
-    const std::unordered_set<std::string_view>& paramNames,
-    std::unordered_map<std::string_view, TypeRef*>& argSubst,
-    SemaContext& ctx,
-    std::unordered_set<std::string_view>* conflicts = nullptr) {
-    if (!pt || !argTy) return;
-    if (pt->kind == ast::TypeKind::Named && pt->name &&
-        pt->name->parts.size() == 1 && paramNames.count(pt->name->parts[0])) {
-        std::string_view nm = pt->name->parts[0];
-        // Compute the would-be-bound TypeRef applying the same §14.1/#850
-        // nullable-peeling rule used on the first occurrence.
-        TypeRef* bound = argTy;
-        if (pt->nullable && argTy->nullable) {
-            if (argTy->kind == TypeRef::Kind::Primitive) {
-                bound = ctx.primitiveTypeRef(argTy->primitive, /*nullable=*/false);
-            } else {
-                TypeRef* nn = ctx.makeTypeRef();
-                *nn = *argTy;
-                nn->nullable = false;
-                bound = nn;
-            }
-        }
-        if (!argSubst.count(nm)) {
-            // §14.1 / #850: peel the nullable when the parameter declares `T?`
-            // and the argument is also nullable — infer the non-nullable T so
-            // `where T: value` and the non-nullable return type `T` work
-            // correctly. A bare `T` parameter (pt->nullable == false) with a
-            // nullable argument is left as-is and rejected downstream.
-            argSubst[nm] = bound;
-        } else if (conflicts && !typeRefEqual(argSubst[nm], bound)) {
-            // §14.1 / #896: existing binding for `nm` disagrees with what this
-            // argument would bind — record the conflict so the caller can emit a
-            // clean compile error instead of silently accepting the inconsistency
-            // and letting codegen crash (PHINode type mismatch).
-            conflicts->insert(nm);
-        }
-        return;
-    }
-    if (!pt->genericArgs.empty() &&
-        argTy->kind == TypeRef::Kind::Named &&
-        argTy->genericArgs.size() == pt->genericArgs.size()) {
-        for (std::size_t i = 0; i < pt->genericArgs.size(); ++i)
-            unifyArgSubst(pt->genericArgs[i].get(), argTy->genericArgs[i],
-                          paramNames, argSubst, ctx, conflicts);
-    }
-}
 
 // A printable signature for a method candidate, e.g. "F(int, long)".
 std::string methodSignatureString(std::string_view name,
@@ -1173,6 +1128,186 @@ bool containsMethodTypeParam(
 }
 
 }  // namespace
+
+// §14.1 (#785, #850): structurally unify a value parameter's declared type
+// (`pt`, AST) against the call argument's resolved type (`argTy`), binding each
+// method type parameter named in `paramNames` to the matching component of the
+// argument's type. A bare `p: T` binds T; a generic-typed `p: Pair<A, B>`
+// recurses pairwise into the generic args (binding A and B from a
+// `Pair<int, string>` argument). The first binding for a name wins (a later or
+// already-receiver-bound occurrence is left). Mirrors codegen's
+// unifyMethodReturnTypeArg.
+// §14.1 / #850: when the parameter is `T?` (nullable named type-param) and the
+// argument is `int?` (or another nullable type), peel the shared `?` so that T
+// is bound to `int` (non-nullable), not `int?`. This makes `where T: value`
+// hold (int satisfies value, int? does not) and the return type `T` stays
+// non-nullable. A bare `T` parameter (pt->nullable == false) with a nullable
+// argument still binds T = int? and is correctly rejected by the constraint
+// check. ctx_ is used to allocate a stable non-nullable TypeRef in the peel
+// case. // per §14.1
+//
+// fix #4183: moved from a free function to an ExprTC member (was: a `ctx`
+// parameter plus, briefly on this branch, an `ExprTC& self` parameter) —
+// the constructed-generic-type case below needs the private
+// collectAncestorInstantiationsOf, which only a member function may call.
+// §14.1 / #896: `conflicts` (optional) receives the name of any type parameter
+// whose second-occurrence inferred binding is DIFFERENT from the first-occurrence
+// binding (e.g. T already bound to int, now seeing bool from a second T? arg).
+// The caller emits a §14.1 compile error and aborts the call. Without this
+// detection the first-binding-wins logic silently drops the conflict, and codegen
+// later produces a PHINode mixing int and bool → SIGABRT.
+void ExprTC::unifyArgSubst(
+    const ast::Type* pt, TypeRef* argTy,
+    const std::unordered_set<std::string_view>& paramNames,
+    std::unordered_map<std::string_view, TypeRef*>& argSubst,
+    std::unordered_set<std::string_view>* conflicts) {
+    if (!pt || !argTy) return;
+    if (pt->kind == ast::TypeKind::Named && pt->name &&
+        pt->name->parts.size() == 1 && paramNames.count(pt->name->parts[0])) {
+        std::string_view nm = pt->name->parts[0];
+        // Compute the would-be-bound TypeRef applying the same §14.1/#850
+        // nullable-peeling rule used on the first occurrence.
+        TypeRef* bound = argTy;
+        if (pt->nullable && argTy->nullable) {
+            if (argTy->kind == TypeRef::Kind::Primitive) {
+                bound = ctx_.primitiveTypeRef(argTy->primitive, /*nullable=*/false);
+            } else {
+                TypeRef* nn = ctx_.makeTypeRef();
+                *nn = *argTy;
+                nn->nullable = false;
+                bound = nn;
+            }
+        }
+        if (!argSubst.count(nm)) {
+            // §14.1 / #850: peel the nullable when the parameter declares `T?`
+            // and the argument is also nullable — infer the non-nullable T so
+            // `where T: value` and the non-nullable return type `T` work
+            // correctly. A bare `T` parameter (pt->nullable == false) with a
+            // nullable argument is left as-is and rejected downstream.
+            argSubst[nm] = bound;
+        } else if (conflicts && !typeRefEqual(argSubst[nm], bound)) {
+            // §14.1 / #896: existing binding for `nm` disagrees with what this
+            // argument would bind — record the conflict so the caller can emit a
+            // clean compile error instead of silently accepting the inconsistency
+            // and letting codegen crash (PHINode type mismatch).
+            conflicts->insert(nm);
+        }
+        return;
+    }
+    if (!pt->genericArgs.empty()) {
+        // fix #4183 (§14.5 phase 1, v0.296/v0.298 — full sentence; narrows
+        // #4089's own #7ec92f7 guard, which implemented only the first half):
+        // "a constructed parameter type G<P1,…,Pn> unifies component-wise and
+        // invariantly against an argument of the same generic type, OR
+        // against THE UNIQUE INSTANTIATION OF G THAT THE ARGUMENT'S TYPE
+        // IMPLEMENTS OR EXTENDS (an `Array<int>` argument against
+        // `xs: IEnumerable<T>` binds T to int); an argument whose type
+        // reaches no instantiation of G makes the candidate inapplicable,
+        // and so does one whose type reaches more than one ... a non-unique
+        // instantiation is never resolved by choice."
+        //
+        // #7ec92f7's fix compared `pt`'s raw syntactic head name against
+        // `argTy->headName()` for exact string equality — sound for the
+        // Task<R>-vs-OwningTask<Widget> case it was written to close, but it
+        // silently dropped every legitimate binding through an interface, a
+        // base class, or a generic type ALIAS on the parameter side (#4183:
+        // `Array<int>` against `IReadOnlyList<T>`, a `Derived<T>` against
+        // `Base<T>`, and `Wrapper<T> := Box<T>` all regressed — none of
+        // those three programs even has a function-typed parameter, yet all
+        // were rejected by the (mis-firing) "mentioned only inside a
+        // function-typed parameter's slot" diagnostic).
+        //
+        // Resolve `pt` to find G's declaration — this ALSO resolves a
+        // generic alias on the parameter side transparently: alias
+        // resolution copies the aliased type's `declaration` into the alias
+        // TypeRef (#1462), so `ptResolved->declaration` is already the REAL
+        // underlying type (`Box`, never a synthetic `Wrapper` symbol) per
+        // §27.8's "type aliases ... see through ... for ... overload
+        // resolution".
+        //
+        // `collectAncestorInstantiationsOf` (ExprTypecheck.cpp; #1920) is
+        // the established BFS ancestor/conformance walker §19.3's generic-
+        // instantiation-impossible checks already use for exactly this
+        // "which instantiation of G does this concrete type implement or
+        // extend" question — reused here rather than growing a second,
+        // drifting classification predicate (LANE_RULES §6). It naturally
+        // covers the "same generic type" half of the spec sentence too:
+        // `argTy` itself is the first node its BFS visits, so `d == g`
+        // fires immediately when argTy's OWN declaration already is G — and
+        // it already implements the "implemented-twice" no-choice case (the
+        // spec's "more than one" clause), returning every distinct
+        // instantiation reached rather than merging or picking one.
+        TypeRef* ptResolved = ctx_.resolvedType(*pt);
+        TypeSymbol* g = ptResolved ? ptResolved->declaration : nullptr;
+        std::vector<TypeRef*> insts;
+        // Owns any synthesised builtin-ancestor TypeRefs so `insts`' pointers
+        // into them stay valid through the recursive unifyArgSubst calls
+        // below (collectBuiltinAncestorInstantiationsOf's contract).
+        std::vector<std::unique_ptr<TypeRef>> builtinOwned;
+        if (g && argTy->kind == TypeRef::Kind::Named && argTy->declaration) {
+            // The USER-DECLARED side: G has a real TypeSymbol.
+            collectAncestorInstantiationsOf(argTy, g, insts);
+        } else if (!g && ptResolved &&
+                   ptResolved->kind == TypeRef::Kind::Named) {
+            // fix #4183: G is a BUILTIN (no TypeSymbol — e.g. `IReadOnlyList`,
+            // the spec's own worked example) — collectAncestorInstantiationsOf
+            // finds nothing for it (it requires a TypeSymbol on BOTH sides);
+            // walk the builtin interface hierarchy instead. Handles a builtin
+            // argument (`Array<int>` implements `IList`/`IReadOnlyList`/
+            // `ICollection`/`IReadOnlyCollection`/`IEnumerable` transitively,
+            // §26.5) against a builtin-named G. (A user-declared argument
+            // extending a builtin interface generically is a residual this
+            // does not cover — #4147/#4148-class scope, not required by any
+            // of #4183's three repros.)
+            std::string_view gName = ptResolved->headName();
+            if (!gName.empty())
+                collectBuiltinAncestorInstantiationsOf(argTy, gName, insts,
+                                                       builtinOwned);
+        }
+        // "reaches no instantiation" (insts empty) or "reaches more than
+        // one" (insts.size() > 1 — the implemented-twice shape, or a
+        // diamond in the builtin table reaching the SAME ancestor via two
+        // paths) — both make the candidate inapplicable: no binding,
+        // silently, matching §22.6/§30.6's own "candidate is inapplicable"
+        // wording for the single-candidate inference case below, never an
+        // error reported at THIS point.
+        if (insts.size() == 1 &&
+            insts[0]->genericArgs.size() == pt->genericArgs.size()) {
+            for (std::size_t i = 0; i < pt->genericArgs.size(); ++i)
+                unifyArgSubst(pt->genericArgs[i].get(),
+                              insts[0]->genericArgs[i], paramNames,
+                              argSubst, conflicts);
+        }
+        return;
+    }
+    // fix #4089 (§14.5 phase 1 / §22.6 *Parameter count at a function-typed
+    // position*, v0.296): "a function-typed parameter unifies component-wise
+    // — each parameter slot against the argument's slot in order, the return
+    // slot against the return slot — and only against a function type of the
+    // SAME parameter count: an argument whose function type has a different
+    // number of parameter slots reaches no unification, and the candidate is
+    // inapplicable — an inference failure that drops it out ... never an
+    // error reported at that candidate." Before this arm, `unifyArgSubst` had
+    // no case for `ast::TypeKind::Function` at all, so a function-typed
+    // parameter (a method reference, a lambda already typed, or a plain
+    // function-typed value argument) contributed ZERO bindings — silently,
+    // regardless of whether the argument's own arity matched (§14.5's own
+    // phase-1 bullet is quoted above; this is that bullet, implemented).
+    if (pt->kind == ast::TypeKind::Function) {
+        if (argTy->kind != TypeRef::Kind::Function) return;
+        if (pt->funcParams.size() != argTy->funcParams.size()) return;  // drop out silently
+        for (std::size_t i = 0; i < pt->funcParams.size(); ++i) {
+            if (!pt->funcParams[i].type) continue;
+            TypeRef* argParamTy = argTy->funcParams[i].type;
+            if (argParamTy)
+                unifyArgSubst(pt->funcParams[i].type.get(), argParamTy,
+                              paramNames, argSubst, conflicts);
+        }
+        if (pt->funcReturn && argTy->funcReturn)
+            unifyArgSubst(pt->funcReturn.get(), argTy->funcReturn, paramNames,
+                          argSubst, conflicts);
+    }
+}
 
 // §22.3 / §14.5 (#2266): true when `t` mentions one of `tpNames` ANYWHERE in its
 // structure. It additionally walks function parameter/return slots beyond
@@ -1697,8 +1832,30 @@ MethodSymbol* ExprTC::resolveMethodOverload(MethodSymbol* initial,
             // type is still inferred (keeps downstream typing best-effort);
             // arity fallback gives a deterministic choice.
             return arityFallback();
-        case OverloadOutcome::Undecidable:
-            return arityFallback();
+        case OverloadOutcome::Undecidable: {
+            // fix #NNNN (§22.6, v0.298): when type-based ranking could not
+            // decide (e.g. one overload has a generic parameter type like
+            // IVal<T> that is unjudgeable), arityFallback must not return an
+            // overload that classifyArg found NotApplicable. r.applicable[c]
+            // is indexed by candidate position in cands (not by overloads[]).
+            // cands[c] IS the MethodSymbol* so we can directly use cands[c]
+            // with r.applicable[c].
+            if (!hasNamed) {
+                for (std::size_t c = 0; c < cands.size(); ++c) {
+                    if (sema::formalParamCount(*cands[c]) == ce.args.size() &&
+                        r.applicable[c]) {
+                        return cands[c];
+                    }
+                }
+            } else {
+                if (canBindTo(*initial) && r.applicable[0]) return initial;
+                for (std::size_t c = 0; c < cands.size(); ++c) {
+                    if (canBindTo(*cands[c]) && r.applicable[c])
+                        return cands[c];
+                }
+            }
+            return initial;
+        }
     }
     return arityFallback();
 }
@@ -1816,7 +1973,7 @@ bool ExprTC::checkGenericRefOutExactUnification(const ast::CallExpr& ce,
                 argTy->primitive == PrimitiveType::Object && argTy->nullable)
                 continue;
             unifyArgSubst(md->params[pi].type.get(), argTy, gpNames, subst,
-                          ctx_, &conflicts);
+                          &conflicts);
         }
         if (!conflicts.empty()) {
             for (std::string_view cnm : conflicts) {
@@ -2571,6 +2728,15 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
             return;
         }
     }
+    // fix #4325 (§5.1 / §11.2, v0.298): hoist the explicit type-argument
+    // substitution map out of the generic-method-instantiation block
+    // below so it can be threaded into the per-argument §5.1
+    // assignability check (`checkCallArity` → `checkArgsAgainstParams`)
+    // without rebuilding it from the AST a second time. Stays empty
+    // unless the call wrote `<TypeArg, …>`; `checkCallArity` is told
+    // the address of this map, and `checkArgsAgainstParams` substitutes
+    // it into each parameter's declared type before the §5.1 check.
+    std::unordered_map<std::string_view, TypeRef*> explicitSubst;
     // §22.6: overload resolution. The callee initially resolved to one
     // method of its name (first-in-source); re-select among the same-named
     // overloads. When the name has multiple same-arity all-positional
@@ -2741,7 +2907,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         TypeRef* argTy = ctx_.exprType(*ce.args[pi].value);
                         if (!argTy) continue;
                         unifyArgSubst(md->params[pi].type.get(), argTy,
-                                      paramNames, outSubst, ctx_);
+                                      paramNames, outSubst);
                     }
                 }
                 if (!outSubst.empty()) {
@@ -3186,7 +3352,8 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                         satisfied = false;
                                     } else if (argDecl->kind == ast::TypeDeclKind::Interface) {
                                         decided = true;
-                                        satisfied = false;  // §11.2: not constructible
+                                        satisfied = false;  // §14.2: interface substitutions
+                                                            // never satisfy `new()`
                                     } else if (argDecl->kind == ast::TypeDeclKind::Class) {
                                         // fix #3141 (family F3 of umbrella
                                         // #3152, §2.8.3 rule 4): the primary
@@ -3322,6 +3489,12 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         }
                     };
                 bool hadExplicitTypeArgs = false;
+                // fix #4325 (§5.1 / §11.2, v0.298): the explicit type-
+                // argument substitution map is declared at `typeCall`'s
+                // outer scope (~L2685) so it can be threaded into
+                // `checkCallArity` (the per-argument §5.1 assignability
+                // check) below — see the header comment on
+                // `checkArgsAgainstParams` for the gap it closes.
                 if (!md->genericParams.empty()) {
                     // per §14.1 (issue #509/#561) + §7.5/§1278: explicit type
                     // args may appear on a MemberAccessExpr callee
@@ -3351,8 +3524,6 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         // Build the explicit substitution map:
                         // md->genericParams[i].name → resolved TypeRef for
                         // (*callTypeArgs)[i].
-                        std::unordered_map<std::string_view, TypeRef*>
-                            explicitSubst;
                         for (std::size_t gi = 0;
                              gi < md->genericParams.size() &&
                              gi < callTypeArgs->size(); ++gi) {
@@ -3454,8 +3625,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             argTy->nullable)
                             continue;
                         unifyArgSubst(md->params[pi].type.get(), argTy,
-                                      paramNames, argSubst, ctx_,
-                                      &inferConflicts);
+                                      paramNames, argSubst, &inferConflicts);
                     }
                     // §14.1 / #896: if any type parameter was bound to two
                     // incompatible types across the arguments, emit a compile
@@ -3537,6 +3707,89 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     // Apply substitution to the (possibly compound) return type.
                     if (!argSubst.empty())
                         rt = substituteReturnType(rt, argSubst);
+                    // fix #4089/#4090 (§14.5/§22.6/§30.6, v0.296): a
+                    // function-typed argument's component-wise unification
+                    // (the Function arm above) can legitimately fail to bind
+                    // a type parameter that is mentioned ONLY inside a
+                    // function-typed parameter's slot — e.g. a fresh-owned-
+                    // class async-lambda body infers `OwningTask<C>` against
+                    // a declared `(A) -> Task<R>` slot, and `OwningTask<C>`
+                    // reaches no instantiation of `Task<T>` (siblings under
+                    // `Task`, stdlib §30.3), so R is never bound. Before this
+                    // check the call proceeded anyway: `collectBoundParamNames`
+                    // (consulted only by `inferReturnTargetTypeArgs`, far
+                    // below in this file) treats ANY syntactic mention inside
+                    // a function-typed parameter as "argument-bound" and so
+                    // never invokes target-based completion for it either —
+                    // so nothing ever reported the gap, and the call's result
+                    // type carried the raw, unsubstituted type parameter
+                    // straight through (measured: #4090's probe reached
+                    // codegen and returned a wrong value with no diagnostic
+                    // at all — `r.ToString()` on such a result resolved
+                    // against the bare parameter `R` rather than the actual
+                    // instantiation). This check fires ONLY for a parameter
+                    // genuinely mentioned in some ARGUMENT position (the
+                    // `mentionedInArg` test below) — a parameter that
+                    // appears ONLY in the return type is the existing,
+                    // legitimate "needs a target" case that
+                    // inferReturnTargetTypeArgs/reportNoTargetInferenceIfNeeded
+                    // already own, unchanged, elsewhere.
+                    if (!hadExplicitTypeArgs && !paramNames.empty()) {
+                        std::unordered_set<std::string_view> stillUnbound;
+                        for (const auto& gp : md->genericParams) {
+                            if (argSubst.count(gp.name)) continue;
+                            std::unordered_set<std::string_view> single{gp.name};
+                            // per §22.3/§14.5 #2266: `containsMethodTypeParam`
+                            // does NOT walk function-type param/return slots
+                            // (`refOutParamTypeMentionsTypeParam` is the
+                            // established superset that does — reused here
+                            // rather than growing a fourth private copy).
+                            if (!refOutParamTypeMentionsTypeParam(rt, single))
+                                continue;
+                            bool mentionedInArg = false;
+                            for (const auto& p2 : md->params) {
+                                if (!p2.type) continue;
+                                TypeRef* pty2 = ctx_.resolvedType(*p2.type);
+                                if (pty2 &&
+                                    refOutParamTypeMentionsTypeParam(pty2, single)) {
+                                    mentionedInArg = true;
+                                    break;
+                                }
+                            }
+                            if (mentionedInArg) stillUnbound.insert(gp.name);
+                        }
+                        if (!stillUnbound.empty()) {
+                            // fix #4183: generalized wording — this check
+                            // fires for BOTH a function-typed parameter
+                            // (§22.6 *Parameter count at a function-typed
+                            // position*, #4089's arity-mismatch case) AND a
+                            // constructed-generic-type parameter whose
+                            // argument reaches no instantiation, or more
+                            // than one, of the declared type (§14.5's "or
+                            // against the unique instantiation of G ...").
+                            // The pre-#4183 wording named only the first —
+                            // wrong even in wording for the second, which
+                            // has no function-typed parameter at all.
+                            for (std::string_view nm : stillUnbound) {
+                                ctx_.diagnostics().report(
+                                    Severity::Error, ce.span.begin,
+                                    "cannot infer the type argument `" +
+                                    std::string(nm) + "` of `" +
+                                    std::string(md->name) + "`'s call — it "
+                                    "is mentioned only inside a parameter "
+                                    "whose declared type did not unify with "
+                                    "that argument's actual type (a function-"
+                                    "typed slot of a different arity, or a "
+                                    "constructed generic type reaching no "
+                                    "instantiation — or more than one — of "
+                                    "the declared type) (§14.5, §22.6); "
+                                    "supply an explicit type argument, or "
+                                    "give the argument a type/return-type "
+                                    "ascription that resolves the mismatch");
+                            }
+                            return;
+                        }
+                    }
                 }
                 ctx_.setExprType(&ce, rt);
             }
@@ -5101,6 +5354,32 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     !recvTy->astNode->name->parts.empty() &&
                     recvTy->headName() == "IGrouping" &&
                     recvTy->genericArgs.size() >= 2 && recvTy->genericArgs[1];
+                // issue #4178 investigation note (NOT shipped): an
+                // `isOrderedEnumerableLinqRecv` arm mirroring
+                // `isGroupingLinqRecv` above (admitting an EXPLICITLY-NAMED
+                // `IOrderedEnumerable<T>` receiver into this block, element at
+                // genericArgs[0]) was written and measured, then reverted.
+                // It DOES make sema type a call like `.First()` on such a
+                // receiver — but codegen's own consuming-side dispatch (the
+                // `lowerToLazyEnumerator`/call-lowering machinery this block's
+                // sibling in LlvmBackend_Calls3.cpp drives) has no matching arm
+                // for a NAMED `IOrderedEnumerable` receiver, only the nameless
+                // lazy sentinel / Range / IGrouping shapes. The result: the
+                // call silently degrades through the #2491 zero/null-return
+                // backstop (Severity::Warning, LlvmBackend_Stmts.cpp) instead
+                // of failing to compile — measured on `Foo(xs).First()` with an
+                // explicit `IOrderedEnumerable<int>` return-type annotation:
+                // compiles, links, RUNS, and returns 0 instead of the correct
+                // sorted-first value 1 for `Foo([3,1,2])`. That trade — a clear
+                // compile-time #2457 "no dispatch arm" rejection becoming a
+                // silently wrong RUNTIME answer — is a regression in kind, not
+                // a completion of #4178, so it is not included here. Filed as
+                // the remaining half of issue #4178's own "or say which do
+                // not [work]" ask; the codegen completion (a real
+                // `lowerToLazyEnumerator`/terminal-call arm for a named
+                // `IOrderedEnumerable` receiver, undoing exactly the silent
+                // degrade this note describes) is its own change and belongs
+                // in a follow-up, not stacked onto a name-resolution fix.
                 if (isLazyRecv || isRangeLinqRecv || isGroupingLinqRecv) {
                     TypeRef* srcElem = isGroupingLinqRecv ? recvTy->genericArgs[1]
                                                           : recvTy->genericArgs[0];
@@ -11147,7 +11426,14 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
         // in `resolveMemberAccess` (which sees `currentCallArity_`); the
         // per-arg type check is run below by the new extension branch in
         // `checkCallArity` itself. So this call site is unchanged.
-        checkCallArity(ce, ms);
+        //
+        // fix #4325 (§5.1 / §11.2, v0.298): pass the explicit type-argument
+        // substitution map (built from `M<T: IBar>.Foo(arg)`'s `<IBar>`) so
+        // `checkArgsAgainstParams` can substitute the method's own type
+        // params into each parameter's declared type before the §5.1 check
+        // — see that function's header for why the unsubstituted `T` would
+        // otherwise silently accept a non-conforming argument.
+        checkCallArity(ce, ms, &explicitSubst);
     }
 
     // §7 / stdlib §9.6 (#2315): a primitive `string` instance-method call
@@ -11362,7 +11648,9 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
     }
 }
 
-void ExprTC::checkCallArity(const ast::CallExpr& ce, MethodSymbol* ms) {
+void ExprTC::checkCallArity(
+    const ast::CallExpr& ce, MethodSymbol* ms,
+    const std::unordered_map<std::string_view, TypeRef*>* explicitSubst) {
     auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
     // §2.2 / §2.5 (issue #328 inc 3): an imported method has no ast::MethodDecl;
     // type-check the call against the imported signature (§2.6 step 3) using the
@@ -11390,13 +11678,30 @@ void ExprTC::checkCallArity(const ast::CallExpr& ce, MethodSymbol* ms) {
     // class's own type parameters (extensions don't see them, §26.4).
     if (md && ms->extensionDecl) {
         const ast::Expr* recvTarget = nullptr;
+        // fix #4233 (§26.4/§26.5, v0.298): when this call's callee
+        // MemberAccessExpr carries a recorded free-var binding (set by
+        // `lookupExtensionMember`/`resolveMemberAccess` via
+        // `ctx_.setExprExtBinding` — non-null only when the extension has
+        // free type variables AND the matched ancestor bound them), pass it
+        // through so `checkArgsAgainstParams` can substitute the extension's
+        // free var into each parameter's declared type before the §5.1
+        // assignability check. Without this, `Test(x: W)` checked the
+        // argument against the unresolved `W` itself, which either
+        // false-rejected or (via checkAssignable's permissive
+        // generic-parameter fallback) silently accepted ANY primitive
+        // argument regardless of W's actual binding.
+        const std::vector<std::pair<std::string, TypeRef*>>* extBinding =
+            nullptr;
         if (auto* ma =
-                dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get()))
+                dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get())) {
             recvTarget = ma->target.get();
+            extBinding = ctx_.exprExtBinding(*ma);
+        }
         checkArgsAgainstParams(
             md->params, ce.args, ce.span.begin,
             std::string("call to `") + std::string(ms->name) + "`",
-            recvTarget, /*classParent=*/nullptr, md);
+            recvTarget, /*classParent=*/nullptr, md, extBinding,
+            explicitSubst);
         return;
     }
     if (!md || !ms->parent) return;
@@ -11436,13 +11741,15 @@ void ExprTC::checkCallArity(const ast::CallExpr& ce, MethodSymbol* ms) {
             checkArgsAgainstParams(md->params, ce.args, ce.span.begin,
                                    std::string("call to `") +
                                    std::string(ms->name) + "`",
-                                   recvTarget, ms->parent, md);
+                                   recvTarget, ms->parent, md, /*extBinding=*/nullptr,
+                                   explicitSubst);
         return;
     }
     checkArgsAgainstParams(md->params, ce.args, ce.span.begin,
                            std::string("call to `") +
                            std::string(ms->name) + "`",
-                           recvTarget, ms->parent, md);
+                           recvTarget, ms->parent, md, /*extBinding=*/nullptr,
+                           explicitSubst);
 }
 
 // §2.2 / §2.5 / §2.6 step 3 (issue #328 inc 3): type-check a call to an imported
@@ -11487,6 +11794,19 @@ void ExprTC::checkImportedCallArity(const ast::CallExpr& ce, MethodSymbol* ms) {
     BindResult b = bindArgsToParams(sema::FormalsView::of(*ms), ce.args,
                                     ce.span.begin, desc, /*emit=*/true);
     if (!b.ok) return;  // the binder reported; no cascade
+    // fix #4199 (NEEDS-FIX round 1): the imported method's own generic
+    // parameters, the cross-module sibling of `checkArgsAgainstParams`'s
+    // identical `calleeMethodGenericParamNames` a few hundred lines below.
+    // `MethodSymbol::genericParams` is populated on BOTH the local and
+    // imported side (GenericParams.hpp's header comment) — an imported
+    // generic method's own `T` reaches the per-argument `checkAssignable`
+    // call below exactly as a local one's does, and without this it would
+    // be silently under-checked (never recognised as free at ANY depth,
+    // where a local call's callee-supplied set still recognises it at
+    // depth 1) rather than correctly at every recursion depth.
+    std::unordered_set<std::string_view> calleeMethodGenericParamNames;
+    for (Symbol* gp : ms->genericParams)
+        if (gp) calleeMethodGenericParamNames.insert(gp->name);
     const std::size_t nparams = sema::formalParamCount(*ms);
     for (std::size_t j = 0; j < nparams; ++j) {
         const int ai = b.paramToArg[j];
@@ -11524,7 +11844,8 @@ void ExprTC::checkImportedCallArity(const ast::CallExpr& ce, MethodSymbol* ms) {
         checkAssignable(ctx_.exprType(*a.value), pt,
                         a.value->span.begin,
                         desc + ": argument " + std::to_string(ai + 1),
-                        a.value.get());  // per §7.4 / §27.6 (#1191)
+                        a.value.get(),  // per §7.4 / §27.6 (#1191)
+                        &calleeMethodGenericParamNames);  // fix #4199
     }
 }
 
@@ -12316,14 +12637,14 @@ void ExprTC::checkBuiltinCollectionCallArgs(const ast::CallExpr& ce) {
             m == "PopValue" || m == "TryPopValue"))
             return true;
         // Borrowing-only pos-0 mutators: plain `item: T`. The owning twins
-        // declare `owned item: T` and are gated out by name (the call-site
-        // `owned` modifier carries §22.3, not §7); the name gate also keeps
-        // the diagnostic precise if the caller forgets the marker.
-        // `Dictionary<K,V>.Add(key: K, value: V)` and `OwningDictionary<K,V>.
-        // Add(key: K, owned value: V)` declare a NON-nullable key at pos 0
-        // (the value at pos 1 is handled by isDictValuePosition below). The
-        // owning form's value arg carries the §22.3 `owned` modifier and is
-        // skipped by the modifier guard below.
+        // declare `owned item: T` and go through the same gate below (the
+        // call-site `owned` modifier carries §22.3, not §7 — but conformance
+        // is orthogonal to ownership transfer, and §5.1/§11.2 must still be
+        // checked; the name gate keeps the diagnostic precise if the caller
+        // forgets the marker).
+        // `Dictionary<K,V>.Add(key: K, value: V)` declares a NON-nullable key
+        // at pos 0 (the value at pos 1 is handled by isDictValuePosition
+        // below).
         // fix #3399 / stdlib §4.17 (v0.283): `SortedDictionary<K, V>` joins
         // them. It declares `public method Add(key: K, value: V);`
         // (Bezel_Standard_Library.md:3322) — added at v0.282 by proposal 0119,
@@ -12343,23 +12664,44 @@ void ExprTC::checkBuiltinCollectionCallArgs(const ast::CallExpr& ce) {
         // at run time", which is false for the value slot and would send the
         // next reader hunting a fault that program does not produce.
         if (pos == 0 && (
-            (m == "Add"    && (colName == "Set" || colName == "SortedSet" ||
+            // fix #4310 (§5.1/§11.2): `Array<T>.Add(item: T)` (stdlib §4.4)
+            // is a plain (non-`owned`) parameter exactly like the families
+            // already listed here, but was left out — the header comment a
+            // few screens up ("Two §4.1 slots stay UNcovered … `ICollection
+            // <T>.Add(item: T)` — the pos-0 `Add` block is name-gated to the
+            // concrete families") already named this as a known gap.
+            // Without it, neither the §7 nullability check NOR the §5.1/
+            // §11.2 conformance check (`checkAssignable`, the SAME call this
+            // whole helper feeds) ever ran for `Array<T>.Add()`'s argument,
+            // so a class that does not implement the element interface was
+            // silently accepted (measured, #4310/#4302).
+            // fix #4324: the owning twins (`OwningArray<T>.Add(owned item: T)`
+            // etc.) were excluded here for the same reason — their `owned`
+            // modifier was thought to put them past the modifier guard — but
+            // conformance is orthogonal to ownership transfer: the §5.1/§11.2
+            // check must still run regardless of §22.3, exactly as the general
+            // call path (`checkArgsAgainstParams`) proves by running both.
+            (m == "Add"    && (colName == "Array" ||
+                               colName == "OwningArray" ||
+                               colName == "Set" || colName == "OwningSet" ||
+                               colName == "SortedSet" ||
                                colName == "LinkedList" ||
+                               colName == "OwningLinkedList" ||
                                colName == "Dictionary" ||
                                colName == "OwningDictionary" ||
                                colName == "SortedDictionary")) ||
             // stdlib §4.8/§4.9/§4.17 (v0.282, #3372): the dictionary family's
             // `TryAdd(key: K, ...)` declares the same NON-nullable key at pos 0
             // that its `Add` twin above does.
-            (m == "TryAdd" && (colName == "Set" || colName == "SortedSet" ||
+            (m == "TryAdd" && (colName == "Set" || colName == "OwningSet" ||
+                               colName == "SortedSet" ||
                                colName == "Dictionary" ||
                                colName == "OwningDictionary" ||
                                colName == "SortedDictionary")) ||
-            (m == "Push"      && colName == "Stack") ||
-            (m == "Enqueue"   && colName == "Queue") ||
-            (m == "AddFirst"  && colName == "LinkedList") ||
-            (m == "AddLast"   && colName == "LinkedList")))
-            return true;
+            (m == "Push"      && (colName == "Stack" || colName == "OwningStack")) ||
+            (m == "Enqueue"   && (colName == "Queue" || colName == "OwningQueue")) ||
+            (m == "AddFirst"  && (colName == "LinkedList" || colName == "OwningLinkedList")) ||
+            (m == "AddLast"   && (colName == "LinkedList" || colName == "OwningLinkedList")))) return true;
         // §7 / stdlib §4.14/§4.15 (#2600): span-buffer IndexOf/Contains declare
         // NON-nullable `value: T` at pos 0 for every span-buffer family EXCEPT
         // class-T Span/ReadOnlySpan (whose param is `value: T?` — handled by
@@ -12471,13 +12813,17 @@ void ExprTC::checkBuiltinCollectionCallArgs(const ast::CallExpr& ce) {
     auto isDictValuePosition = [&](std::size_t pos) -> bool {
         // stdlib §4.8/§4.17 (v0.282, #3372): the borrowing `TryAdd(key: K,
         // value: V)` declares the same non-nullable value slot `Add` does.
-        // OwningDictionary is still excluded — its value param is `owned`, so
-        // §22.3 governs it (see the comment block above).
+        // fix #4324: `OwningDictionary<K,V>.Add(key: K, owned value: V)` — the
+        // owned value V (pos 1) goes through here (its param type is valueTy,
+        // not itemTy); the key K (pos 0) goes through isItemPosition(0) with
+        // itemTy = K.
         return pos == 1 && valueTy &&
                ((m == "Add" && (colName == "Dictionary" ||
-                                colName == "SortedDictionary")) ||
+                                colName == "SortedDictionary" ||
+                                colName == "OwningDictionary")) ||
                 (m == "TryAdd" && (colName == "Dictionary" ||
-                                   colName == "SortedDictionary")));
+                                   colName == "SortedDictionary" ||
+                                   colName == "OwningDictionary")));
     };
 
     for (std::size_t i = 0; i < ce.args.size(); ++i) {
@@ -12485,11 +12831,10 @@ void ExprTC::checkBuiltinCollectionCallArgs(const ast::CallExpr& ce) {
         if (!a.value || a.isDiscard) continue;
         // §22.3: a `ref`/`out`/`owned`/`scoped` modifier aliases or transfers
         // the caller slot under its own rule and is not a §7 nullable->non-
-        // nullable conversion; skip. This is what excludes the owning family's
-        // `Add(owned item: T)` / `Push(owned item: T)` / `Insert(index,
-        // owned item: T)` / etc. — the caller writes the `owned` marker, and
-        // the parameter's nullability is governed by the §22.3 transfer rule.
-        if (!a.modifier.empty()) continue;
+        // nullable conversion; skip the nullability check below. (Conformance
+        // via `checkAssignable` is orthogonal to ownership transfer — fix
+        // #4324 adds the owning-family entries to `isItemPosition` so the
+        // conformance check still runs regardless of the modifier.)
         // §7 / stdlib §4.8 (#2592): pick the slot's DECLARED type — the
         // element/key type for every position this helper covered before, and
         // `V` for `Dictionary<K, V>.Add`'s value at pos 1.
@@ -12639,12 +12984,48 @@ void ExprTC::checkArgsAgainstParams(
     const std::vector<ast::CallArgument>& args, SourceLocation loc,
     const std::string& calleeDesc, const ast::Expr* classTarget,
     TypeSymbol* classParent,
-    const ast::MethodDecl* calleeMethodDecl) {
+    const ast::MethodDecl* calleeMethodDecl,
+    const std::vector<std::pair<std::string, TypeRef*>>* extBinding,
+    const std::unordered_map<std::string_view, TypeRef*>* explicitSubst) {
     // per §22.5: bind arguments to parameters. The binding emits its own
     // arity / named-arg diagnostics; on failure there is no consistent
     // per-parameter mapping to type-check, so stop here.
     BindResult b = bindArgsToParams(params, args, loc, calleeDesc, /*emit=*/true);
     if (!b.ok) return;
+    // fix #4233 (§26.4/§26.5, v0.298): flatten the extension's free-var
+    // binding (T -> concrete TypeRef) into the map shape
+    // `substituteReturnType` takes — the same substitution
+    // `ExprTC::typeCall` already runs on the call's RETURN type
+    // (ExprTypecheck_Calls.cpp, `!ms->parent && ms->extensionDecl` gate) for
+    // the identical `exprExtBinding`. Applying it here too closes the
+    // parameter-type half of the same gap: `checkAssignable` has no other
+    // way to know `W` is bound to `int` for this call, so an unsubstituted
+    // `W` either false-rejected a correct argument or (via the "generic-
+    // parameter case: skip" fallback a few hundred lines into
+    // `checkAssignable`) silently accepted a WRONGLY-typed one straight
+    // through to a codegen IR-verifier crash — MEASURED for the latter on
+    // the already-resolving builtin-extension path (`extension
+    // IEnumerable<T> method Echo(x: T): T` called as `xs.Echo("wrong")` on
+    // an `Array<int>` compiled clean pre-fix and crashed codegen).
+    std::unordered_map<std::string_view, TypeRef*> extSubst;
+    if (extBinding)
+        for (const auto& [nm, ty] : *extBinding)
+            if (ty) extSubst[nm] = ty;
+    // fix #4199 (§14.5 phase 1, NEEDS-FIX round 1): the CALLEE method's own
+    // still-being-inferred generic type parameters — the ONLY names this
+    // call's per-argument `checkAssignable` below is entitled to treat as a
+    // free/rigid type variable rather than a concrete type. NOT the
+    // receiver class's own params (`classParent`): those are already
+    // substituted into `paramTy` via `substituteMemberType` below, before
+    // `checkAssignable` ever runs, so a class-level name should never still
+    // be free by that point. Ground truth from `calleeMethodDecl`'s actual
+    // declaration, never inferred from a TypeRef's own shape (a
+    // null-declaration TypeRef is ALSO how ~50 stdlib builtins resolve —
+    // see `isFreeGenericTypeVarRef`'s comment in ExprTypecheck.cpp).
+    std::unordered_set<std::string_view> calleeMethodGenericParamNames;
+    if (calleeMethodDecl)
+        for (const auto& gp : calleeMethodDecl->genericParams)
+            calleeMethodGenericParamNames.insert(gp.name);
     // per §5.1: each bound argument must be assignable to its parameter.
     // Iterate in parameter order so a reordered named-arg call checks each
     // argument against the parameter it actually fills.
@@ -12724,6 +13105,13 @@ void ExprTC::checkArgsAgainstParams(
             if (rparamTy && classTarget && classParent)
                 rparamTy = substituteMemberType(rparamTy, classTarget,
                                                 classParent);
+            // fix #4233 (§26.4/§26.5, v0.298): substitute the extension's
+            // free var into the referent type BEFORE the type-param-mention
+            // skip below, so a fully-bound referent (e.g. `W`->`int`) runs
+            // the ordinary §22.3 exact-match check instead of being treated
+            // as still-unresolved and skipped.
+            if (rparamTy && !extSubst.empty())
+                rparamTy = substituteReturnType(rparamTy, extSubst);
             std::unordered_set<std::string_view> tpNames;
             if (calleeMethodDecl)
                 for (const auto& gp : calleeMethodDecl->genericParams)
@@ -12764,6 +13152,39 @@ void ExprTC::checkArgsAgainstParams(
         // the valid function-type identity case.
         if (paramTy && classTarget && classParent)
             paramTy = substituteMemberType(paramTy, classTarget, classParent);
+        // fix #4233 (§26.4/§26.5, v0.298): substitute the extension's own
+        // free type variable (e.g. `W`->`int`) into the parameter type
+        // before the assignability check below — see this function's
+        // header comment (ExprTypecheck_impl.hpp) for why.
+        if (paramTy && !extSubst.empty())
+            paramTy = substituteReturnType(paramTy, extSubst);
+        // fix #4325 (§5.1 / §11.2, v0.298): substitute the METHOD's own
+        // explicit type-argument binding (e.g. `T`->`IHolder` for
+        // `MakeArr<IHolder>(new Widget3(s))`) into `paramTy` BEFORE the
+        // §5.1 assignability check, so a non-conforming argument to an
+        // interface-typed explicit type argument (`Widget3` does not list
+        // `IHolder` in its inheritance clause) is rejected by the same
+        // `checkAssignable` + `isSubtype` authority that already rejects
+        // the non-generic twin (#4310's
+        // `plain_call_argument_noconform_rejected_control`). Without this
+        // line, the parameter stayed as the bare `T` and the
+        // `calleeMethodGenericParamNames` free-type-var fallback in
+        // `checkAssignable` silently admitted the call — codegen then
+        // dispatched the interface call through a null itable slot and
+        // SIGSEGV'd (measured, identical to #4302's crash signature). The
+        // ORDERING matters: class-level substitution
+        // (`substituteMemberType` above) substitutes CLASS params from
+        // the receiver first; this line substitutes the METHOD's own
+        // type params from the call site. Class and method type-param
+        // namespaces are disjoint by construction (a method's `<T>` is
+        // not the receiver's `<U>`); when a method deliberately shadows a
+        // class-level name, the method's name wins by this ordering —
+        // which is the case #4310's
+        // `plain_call_argument_noconform_rejected_control` already
+        // exercised and which the spec's shadowing-warning policy covers
+        // (the compiler warns; substitution follows the warning).
+        if (paramTy && explicitSubst && !explicitSubst->empty())
+            paramTy = substituteReturnType(paramTy, *explicitSubst);
         // per §15.4 (#1174): a collection literal passed directly to a
         // parameter of interface type (IEnumerable<T>/IList<T>/ICollection<T>/
         // IReadOnly*) is not admissible — the literal has no concrete backing
@@ -12812,13 +13233,26 @@ void ExprTC::checkArgsAgainstParams(
                         ctx_.diagnostics(), a.value->span.begin, paramTy);
                 continue;
             }
+            // fix #4310 (§5.1/§11.2): the general call/constructor-argument
+            // twin of `checkCollectionLiteralElementAssignability`'s other
+            // call sites (LocalDecl/FieldDecl/PropertyDecl/ReturnStmt,
+            // ExprTypecheck.cpp) — this is the path a record's primary-
+            // constructor call goes through, so it is also what makes an
+            // interface element in a record field's initializer conform
+            // (e.g. `new RecordType([new Widget3(s)])` for `record
+            // RecordType(Items: [1]IHolder)`). Same reasoning: the
+            // admissibility gate above sets the literal's own exprType to
+            // `paramTy`, so the `checkAssignable` call just below would
+            // trivially pass without this.
+            checkCollectionLiteralElementAssignability(*cl, paramTy);
         }
         checkAssignable(ctx_.exprType(*a.value),
                         paramTy,
                         a.value->span.begin,
                         std::string("argument `") + std::string(p.name) +
                         "` to " + calleeDesc,
-                        a.value.get());  // per §7.4 / §27.6 (#1191)
+                        a.value.get(),  // per §7.4 / §27.6 (#1191)
+                        &calleeMethodGenericParamNames);  // fix #4199
     }
 }
 
@@ -15581,6 +16015,157 @@ void ExprTC::declineUnsupportedImportedPropertyAccess(PropertySymbol* ips,
             "accessor-body monomorphization lands (#428)");
     }
 }
+
+namespace {
+// fix #4292 (§26.4/§26.5, v0.298): find the `ast::ExtensionDecl` that
+// declares member symbol `m`, scanning the SAME candidate set
+// `ExprTC::lookupExtensionMember` itself scans (this module's own extension
+// blocks plus the imported ones) — an ownership lookup only, not a
+// re-derivation of any applicability decision, so it cannot drift from what
+// `lookupExtensionMember` actually resolved.
+const ast::ExtensionDecl* owningExtensionDeclOf(
+    SemaContext& ctx,
+    const std::vector<ExtensionSymbol*>& importedExtensions,
+    Symbol* m) {
+    if (!m) return nullptr;
+    auto scan = [&](ExtensionSymbol* e) -> const ast::ExtensionDecl* {
+        for (Symbol* cand : e->members)
+            if (cand == m)
+                return dynamic_cast<const ast::ExtensionDecl*>(e->decl);
+        return nullptr;
+    };
+    if (ctx.module()) {
+        for (Symbol* child : ctx.module()->children) {
+            if (auto* e = dynamic_cast<ExtensionSymbol*>(child)) {
+                if (const auto* d = scan(e)) return d;
+            }
+        }
+    }
+    for (ExtensionSymbol* e : importedExtensions) {
+        if (const auto* d = scan(e)) return d;
+    }
+    return nullptr;
+}
+
+// fix #4292 (§26.4/§26.5, v0.298): #4238's self-call receiver synthesis (see
+// the `this`/`currentExtension_` branch inside `ExprTC::resolveMemberAccess`
+// below) feeds `lookupExtensionMember` a receiver whose generic argument is
+// `currentExtension_`'s OWN declared free type variable, still UNRESOLVED
+// (`declaration == nullptr`, no generic args — the same shape #4229
+// catalogues elsewhere). That is the only path that can hand
+// `lookupExtensionMember` a non-ground receiver: an external `b.Method()`
+// call, or a self-call whose target type is non-generic, always supplies a
+// receiver with a real `declaration`.
+// `extWhereClauseProvablyViolated` (ExprTypecheck.cpp §26.4, `fix #3336`)
+// necessarily reads such a free var as `GroundCat::Unknown` via
+// `groundCategorize`, and its own documented "defer on undecidable => keep
+// the candidate" direction then admits a sibling `where`-constrained
+// block's member even when the constraint is unsatisfied for the receiver's
+// real (but, at self-call body-check time, generically UNDETERMINED)
+// instantiation — #4292's traced soundness hole (`Box<int>.Caller()` ->
+// `this.OnlyForClass()`, sibling block `where W: class`, compiled and ran
+// on `int`, while the identical EXTERNAL call was correctly rejected).
+//
+// `currentExtension_`'s own body is typechecked exactly ONCE, generically
+// over its own free var(s), independent of any call site — there is no
+// single "the concrete instantiation" to recover here; the body must be
+// well-typed for EVERY legal instantiation `currentExtension_`'s own
+// `where` clause admits. So the only SOUND basis for admitting `foundDecl`'s
+// member is that `currentExtension_`'s OWN `where` clause, for the free var
+// `lookupExtensionMember`'s binding bound to `foundDecl`'s free var, ALREADY
+// contains every constraint item `foundDecl` requires — i.e. every legal
+// instantiation of `currentExtension_` is guaranteed, by
+// `currentExtension_`'s own declaration, to also satisfy `foundDecl`'s
+// clause. A same-block self-call (`foundDecl == callerDecl`) trivially
+// passes (a block's constraints are, tautologically, contained in
+// themselves), matching #4238's "already worked" control. "Satisfies" for
+// a `type` item (fix #4306, §26.4/§26.5, v0.298) means §14.2 declaration
+// subtyping ENTAILMENT — the caller's own declared bound need not be the
+// literal same declaration as `foundDecl`'s, only a subtype of it (every
+// legal instantiation of a narrower bound is provably an instantiation of
+// the wider one too); every other item kind (`class`/`value`/`notnull`/
+// `new`) still needs literal kind presence, since those carry no further
+// argument to entail against. Anything this function cannot positively
+// match is treated as UNSATISFIED (reject), never as satisfied — the same
+// "provable violation only, never a false exemption" discipline
+// `extConstraintItemProvablyViolated` documents for the ground case.
+bool selfCallSiblingWhereSatisfiedByCaller(
+    SemaContext& ctx,
+    const ast::ExtensionDecl& callerDecl,
+    const ast::ExtensionDecl& foundDecl,
+    const std::vector<std::pair<std::string, TypeRef*>>& binding) {
+    for (const auto& gc : foundDecl.genericConstraints) {
+        // §14.4 modifier form (`where T is owned`), removed at v0.97 —
+        // mirrors extWhereClauseProvablyViolated's own "treat
+        // conservatively" skip (populators already filter this out;
+        // defensive here too).
+        if (!gc.modifierConstraint.empty()) continue;
+        TypeRef* arg = nullptr;
+        for (const auto& kv : binding) {
+            if (kv.first == gc.typeParam) { arg = kv.second; break; }
+        }
+        if (!arg) continue;  // unbound at this call site -- nothing to verify
+        // Only an UNRESOLVED free variable (declaration == nullptr, no
+        // generic args -- the exact shape `lookupExtensionMember`'s own
+        // `scanFreeVars` uses to recognise a free type variable) is the
+        // #4238-synthesis case this function exists for. A GROUND arg here
+        // means the receiver was concrete after all -- trust the
+        // ground-based filter that already ran inside `lookupExtensionMember`.
+        if (arg->kind != TypeRef::Kind::Named || arg->declaration ||
+            !arg->genericArgs.empty())
+            continue;
+        std::string_view argName = arg->headName();
+        if (argName.empty()) return false;  // can't identify -- reject
+        const ast::GenericConstraint* callerGc = nullptr;
+        for (const auto& cgc : callerDecl.genericConstraints) {
+            if (cgc.typeParam == argName) { callerGc = &cgc; break; }
+        }
+        if (!callerGc) return false;  // caller declares no matching constraint
+        for (const auto& item : gc.items) {
+            bool matched = false;
+            for (const auto& citem : callerGc->items) {
+                if (citem.kind != item.kind) continue;
+                if (item.kind == "type") {
+                    TypeRef* want =
+                        item.typeArg ? ctx.resolvedType(*item.typeArg) : nullptr;
+                    TypeRef* have =
+                        citem.typeArg ? ctx.resolvedType(*citem.typeArg) : nullptr;
+                    // fix #4306 (§26.4/§26.5, v0.298): ENTAILMENT, not literal
+                    // declaration identity. Every legal instantiation `have`
+                    // (the caller's OWN declared bound) admits must also
+                    // satisfy `want` (the sibling candidate's declared
+                    // bound) — that holds exactly when `have` is a
+                    // (reflexively-included) §14.2 subtype of `want`, the
+                    // same declaration-based `isSubtype` walk
+                    // `groundSatisfiesTypeBound`'s ground-case `type` arm
+                    // documents as the sound direction for this exact
+                    // question (ExprTypecheck.cpp:1653). Literal identity
+                    // was strictly narrower than sound: it rejected a
+                    // caller bound to an interface's implementer (`where
+                    // W: Base` against a sibling's `where W: IFoo` when
+                    // `Base : IFoo`) even though every admissible `W` is
+                    // provably a `Base`, hence provably an `IFoo`. Either
+                    // side missing a declaration (non-Named / unresolved)
+                    // stays undecidable here -> not matched (reject) —
+                    // `isSubtype` requires a non-null `from`.
+                    if (want && have && want->kind == TypeRef::Kind::Named &&
+                        have->kind == TypeRef::Kind::Named && want->declaration &&
+                        have->declaration &&
+                        ExprTC::isSubtype(have->declaration, want->declaration)) {
+                        matched = true;
+                        break;
+                    }
+                    continue;
+                }
+                matched = true;
+                break;
+            }
+            if (!matched) return false;
+        }
+    }
+    return true;
+}
+}  // namespace
 
 void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
     // per §24.3: the event visibility fence. When the access target resolves
@@ -20479,6 +21064,60 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
     if (!member && ma.target) {
         const TypeRef* recvTy = ctx_.exprType(*ma.target);
         TypeRef synth;
+        // fix #4292 (§26.4/§26.5, v0.298): true only when the #4238 self-call
+        // synthesis below actually fires — scopes the extra applicability
+        // re-check after the lookup to exactly the shape that can hand
+        // `lookupExtensionMember` a non-ground (unresolved-free-var)
+        // receiver. The external-call path (recvTy already set from
+        // ctx_.exprType, or a non-generic target's real declaration) never
+        // sets this, so it is provably unaffected by the re-check below.
+        bool selfCallExtSynth = false;
+        if (!recvTy) {
+            // fix #4238 (§26.4/§26.5, v0.298): a `this.Method(...)` self-call
+            // to a SIBLING member of the SAME generic extension block must
+            // resolve against `this`'s real static type — the extension's own
+            // declared target AS WRITTEN (`Box<W>`, with `W` still the free/
+            // unresolved type variable, since no external receiver has bound
+            // it yet) — not a bare zero-generic-argument `Box` reference.
+            // `this` is deliberately left untyped by the IdentifierExpr arm
+            // for a NAMED-type extension (ExprTypecheck_Exprs.cpp's #456/
+            // #2795 comments: publishing a general exprType for `this` would
+            // turn on every exprType(`this`) reader at once, including
+            // codegen's specialization-aware `indexReceiverDecl` path), so
+            // this fallback used to rebuild a receiver from `targetType`
+            // alone — the raw TypeSymbol pointer, which carries NO generic-
+            // argument list at all. For a NON-generic extension target that
+            // is harmless (0 genericArgs on both the synthesized receiver and
+            // the declared target), which is why `extension Box { ... this.
+            // Test(x) ... }` already worked — but for `extension Box<W>` the
+            // synthesized receiver had 0 args against the declared target's
+            // 1-arg head, so `extensionTargetMatchesReceiver`'s
+            // `target->genericArgs.size() != recv->genericArgs.size()` arity
+            // check always failed and `extensionFindMatchingAncestor` never
+            // matched — every self-call inside a multi-method generic
+            // extension was unresolvable, independent of whether the called
+            // member's own signature mentioned the free variable at all
+            // (distinct from #4233, which is about a member signature
+            // mentioning the free var). Reuse the SAME resolved TypeRef the
+            // per-candidate loop in `lookupExtensionMember` computes for
+            // `target` (`ctx_.resolvedType` caches by AST node, so this is
+            // the identical object, e.g. `Box<W>` with `W` unifying with
+            // itself trivially) — confined to the `this`-inside-its-own-
+            // extension shape, so no other exprType(`this`) reader is
+            // affected, matching #2795's own "resolved locally" precedent.
+            if (auto* tid = dynamic_cast<const ast::IdentifierExpr*>(
+                    ma.target.get())) {
+                if (tid->name == "this" && currentExtension_) {
+                    if (auto* ed = dynamic_cast<const ast::ExtensionDecl*>(
+                            currentExtension_->decl)) {
+                        if (ed->targetType) {
+                            recvTy = ctx_.resolvedType(*ed->targetType);
+                            selfCallExtSynth = recvTy != nullptr;
+                        }
+                    }
+                }
+            }
+        }
         if (!recvTy) {
             synth.kind = TypeRef::Kind::Named;
             synth.declaration = targetType;
@@ -20493,10 +21132,36 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
         if (Symbol* ext = lookupExtensionMember(
                 recvTy, ma.member, &binding, extLoc,
                 /*reportAmbiguity=*/true, currentCallArity_)) {
-            if (!binding.empty())
-                ctx_.setExprExtBinding(&ma, std::move(binding));
-            resolveExtensionMember(ma, ext);
-            return;
+            // fix #4292 (§26.4/§26.5, v0.298): re-verify a #4238 self-call
+            // synthesis result against the ORIGIN extension block's own
+            // where-clause before trusting it — see
+            // `selfCallSiblingWhereSatisfiedByCaller`'s header comment
+            // above for why `lookupExtensionMember`'s ground-only filter
+            // cannot decide this by itself. Unaffected: the external-call
+            // path (`selfCallExtSynth == false`) always takes the `admit`
+            // path unchanged.
+            bool admit = true;
+            if (selfCallExtSynth && currentExtension_) {
+                if (auto* callerDecl = dynamic_cast<const ast::ExtensionDecl*>(
+                        currentExtension_->decl)) {
+                    if (auto* foundDecl = owningExtensionDeclOf(
+                            ctx_, importedExtensions_, ext)) {
+                        admit = selfCallSiblingWhereSatisfiedByCaller(
+                            ctx_, *callerDecl, *foundDecl, binding);
+                    }
+                }
+            }
+            if (admit) {
+                if (!binding.empty())
+                    ctx_.setExprExtBinding(&ma, std::move(binding));
+                resolveExtensionMember(ma, ext);
+                return;
+            }
+            // else: fall through to the rest of resolveMemberAccess, which
+            // reports "no such member" exactly as if lookupExtensionMember
+            // had found nothing — matching the identical EXTERNAL call's
+            // rejection of the same unsatisfied-constraint instantiation
+            // (#4292's Control A).
         }
     }
     // fix #3342 (§26.5 rule 1 / stdlib §4.4, v0.278): for receivers whose
@@ -21234,8 +21899,16 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
         // separate §22.12 "static member must be accessed through the type
         // name" gate, since `lookupMember` finds them as real symbols; §11.8
         // is not otherwise implicated by this widening.)
-        bool importedKnownCompleteUserType =
-            ctx_.isImported(targetType) && targetType->genericParams.empty();
+        // fix #2287 (§2.5 / §11.3 / §12.1, v0.298): remove the `genericParams.empty()`
+        // check. The §2.5 metadata for an imported generic class carries every
+        // exported member, so unknown-member rejection (§11.3 / §12.1) is sound —
+        // the prior carve-out was a hedge against incomplete metadata that is no
+        // longer warranted. With this change an imported generic type is treated as
+        // a known-complete user type, and an unknown member access on it emits the
+        // same "no member" error a local type would, rather than silently
+        // falling through to codegen's permissive-acceptance backstop (which would
+        // degrade the slot to zero-init and produce a garbage runtime value).
+        bool importedKnownCompleteUserType = ctx_.isImported(targetType);
         bool knownCompleteUserType =
             (targetType->decl != nullptr || importedKnownCompleteUserType) &&
             (targetType->kind == ast::TypeDeclKind::Class ||

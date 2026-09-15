@@ -29,12 +29,19 @@
 //   - Constraint-clause resolution (sema slice with constraint handling).
 //   - Variance compatibility checks (typecheck-time).
 
+#include <array>
 #include <string>
 #include <string_view>
 
 #include "ast/Node.hpp"
 #include "sema/SemaContext.hpp"
 #include "sema/TypeRef.hpp"
+
+// Forward-declared rather than `#include "common/OwnershipFacts.hpp"`: used
+// only by-pointer below (`typeHasNoDefault`'s `incoming` parameter).
+namespace bezel::common {
+struct RecordSubstEnv;
+}  // namespace bezel::common
 
 namespace bezel::sema {
 
@@ -164,6 +171,21 @@ bool overrideParamTypeMatches(const TypeRef* derivedTy, const TypeRef* baseTy,
 // delegates to Resolver::isBuiltinTypeName.
 bool isBuiltinTypeName(std::string_view n);
 
+// fix #4309 (§14.2/§17.11, v0.298; send-back on #4294): the closed set of
+// builtin, null-declaration INTERFACE names that `Resolver::argSatisfiesNew`
+// and `typeHasNoDefaultWalk` (TypeResolution_Checks.cpp) both reject
+// unconditionally as non-constructible (§14.2) / non-defaultable (§17.11) —
+// every `I*` name in `Resolver::builtinTypeArity`'s table EXCEPT the seven
+// `SemaContext::isSynthesizedBuiltinInterfaceName` names (which already get
+// a real, TypeSymbol-backed Interface arm) and `IGrouping` (fix #4294's own
+// deliberately separate two-line branch, kept apart — see that fix's commit
+// and TypeResolution_Checks.cpp's own comment beside this array's
+// definition). Exposed as a `const&` — not merely a membership predicate —
+// so `tests/sema/*4309*` can assert the SAME array both call sites consult
+// against the two authoritative tables it was derived from, rather than
+// re-typing a third copy of the name list in test code.
+const std::array<std::string_view, 25>& nonConstructibleBuiltinInterfaceNames();
+
 // §2.8.3 rule 4/§12.7/§19.3 (#1946, #2069): the STRICT runtime-reification oracle. A
 // type argument is runtime-reified — the per-monomorphization descriptor (#1843)
 // distinguishes it from a sibling — iff it is a concrete Named type (resolved
@@ -238,5 +260,71 @@ std::string degenerateAsTargetReason(const TypeRef* target);
 // garbage TypeSymbol*). Callers inherit that same known-open ordering gap;
 // #4047 tracks it, not this function.
 TypeSymbol* resolveAliasToTypeSymbol(SemaContext& ctx, TypeAliasSymbol* aliasSym);
+
+// fix #4166 review follow-up (§14.2/§17.11/§35.10, v0.298): THE shared
+// authority for "does `default(T)` (equivalently, at a value-type
+// substitution, `new T()`) have NO well-defined value?" — the §17.11
+// "defaultable" glossary entry, applied recursively. Two independent
+// copies of this question existed on two different classes:
+// `ExprTC::defaultIllFormed` (ExprTypecheck_Exprs.cpp, the `default`
+// operator's own well-formedness check, fix #3982/#3986/#3988/#3995) and
+// `Resolver::argSatisfiesNew`'s Record arm (TypeResolution_Checks.cpp, the
+// `where T: new()` constraint check, fix #3141/#3988/#4002/#4166) — the
+// SAME mirroring-not-sharing constraint `resolveAliasToTypeSymbol` above
+// already documents applies here too (`Resolver::run` executes before
+// `ExprTC` exists, Driver.cpp), except this time the two copies had
+// drifted: `argSatisfiesNew`'s port (#4166) covered only the Record-kind
+// recursion, leaving Enum/Choice/InlineArray/`isValueBuiltin`-aware-Class
+// divergences from `defaultIllFormed`'s full switch (see #4219, #4223).
+// `ExprTC::defaultIllFormed` now forwards here; `argSatisfiesNew` calls
+// this directly. Both share ONE cycle guard (PATH semantics, keyed by
+// `const TypeRef*` instantiation identity — mirrors
+// `common::isBorrowBearingRecordCommon`, OwnershipFacts.cpp, and that
+// file's own fix #3933 for why the key is the TypeRef instantiation and
+// not the bare TypeSymbol* declaration) — `defaultIllFormed` had none
+// before this, and a self-referential record reached through an explicit
+// `default(...)` SIGSEGV'd identically to the `where T: new()` shape
+// #4166's own review caught.
+//
+// One divergence resolved in `argSatisfiesNew`'s favor rather than
+// `defaultIllFormed`'s: a non-nullable `Object`-typed component IS
+// non-defaultable here (§17.11's own definition: "Not defaultable:
+// non-nullable reference types"), even though `defaultIllFormed`'s
+// pre-unification text deliberately excluded `Object` as a separate,
+// out-of-scope #951-era decision — `argSatisfiesNew`'s existing, tested
+// behavior already rejected it, and porting the narrower exclusion instead
+// would have silently reintroduced a false accept there (measured against
+// `xmod_imported_positional_new_args_3141_test.cpp`).
+//
+// A second such divergence, caught by review after the first landed: a
+// null-declaration `Named` type is not only an unresolved generic
+// parameter — it is also how every always-available builtin (`Array`,
+// `Dictionary`, `Set`, `OwningTask`, …) is represented, and
+// `defaultIllFormed`'s prior text unconditionally treated ALL of them as
+// defaultable, `argSatisfiesNew`'s regression relative to its own
+// pre-hoist `categorize()`-based behavior. Fixed NARROWLY, by builtin
+// NAME, for the stdlib collection family
+// (`Array`/`Dictionary`/`Set`/`Stack`/`Queue`/`LinkedList`/
+// `SortedDictionary`/`SortedSet`, their `Owning*` counterparts, and
+// `Task`/`OwningTask`) rather than by mirroring `Resolver::categorize`'s
+// `astNode`/`builtinTypeArity` fallback wholesale — that fallback does
+// not distinguish these REFERENCE builtins from VALUE ones (`Guid`,
+// `IntPtr`, `DateTime`, …), and a first attempt at the wholesale mirror
+// broke `default(Guid)` / `default(IntPtr)`
+// (tests/lit/builtin_closed_ctor_surface_accept_2994.bzl), which
+// `defaultIllFormed`'s ORIGINAL text had always accepted. See
+// `typeHasNoDefaultWalk`'s Named-arm comment (TypeResolution_Checks.cpp)
+// for the full account. Third occurrence in this run of the same defect
+// class — a predicate over a null-declaration `Named` type that silently
+// drops the ~50-builtin population (issue #4229 tracks two more;
+// `fix #4199` was a fourth) — and a caution for the next one: verify
+// against BOTH the `where T: new()` and `default(...)` call paths before
+// picking a fallback, not just the one the regression report named.
+//
+// `incoming` is the enclosing frame's substitution environment (null/empty
+// at a top-level, non-nested call — every existing call site passes what
+// it already did).
+bool typeHasNoDefault(const TypeRef* t, SemaContext& ctx,
+                      const common::RecordSubstEnv* incoming = nullptr);
 
 } // namespace bezel::sema

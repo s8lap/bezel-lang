@@ -297,6 +297,16 @@ private:
     // §9.8 v0.141 (P6): class-body `polymorphic("disc": Type, ...);` member
     // clause — populates decl.serializedClass->polyCases.
     void parsePolymorphicMember(ast::TypeDecl& decl);
+    // fix #4222 (§26.3, Appendix A.4, v0.298): `parseExtensionDecl`'s member
+    // loop's own variant — an extension body has no `TypeDecl` for
+    // `parsePolymorphicMember` to mutate (`decl.serializedClass`), so a
+    // `polymorphic(...)` clause inside an extension is parsed-and-discarded
+    // here instead, emitting exactly ONE §26.3-citing diagnostic rather than
+    // falling through to `parseMember()`'s generic member-kind dispatch
+    // (which has no arm for a bare `polymorphic` identifier and previously
+    // cascaded one "expected member visibility ... or member-kind keyword"
+    // diagnostic per stray token — measured: 7 for one clause).
+    void parseAndDiscardExtensionPolymorphicMember();
     // §27.3 / A.7 (v0.217, #2101): retired-lambda-spelling diagnostics. The
     // keyword-led form needs NO lookahead (the pre-v0.217
     // `tokensLookLikeLambda` scan-to-`)` — the parser's one unbounded
@@ -354,6 +364,17 @@ private:
     // §18.5: split an interpolated string token into alternating literal
     // and expression parts. Fills `e.parts` in place.
     void splitInterpolation(ast::InterpolatedStringExpr& e);
+
+    // Bounded guard on expression-recursion depth (fix #4348). A
+    // parenthesized sub-expression recurses through `parseExpression()` from
+    // `parsePrimaryExpressionImpl()`'s `(` arm — without a depth bound,
+    // deeply nested but valid source overflows the native call stack and
+    // SIGSEGVs the compiler. Each `parseExpressionImpl()` entry bumps this
+    // counter and bails with a located diagnostic once it exceeds the cap
+    // (no real Bezel program gets anywhere near it). Reset at the start of
+    // `parseCompilationUnit()` so a parse run starts clean.
+    static constexpr std::size_t kMaxExpressionRecursion = 1000;
+    std::size_t expressionRecursionDepth_ = 0;
 
     Lexer& lexer_;
     DiagnosticEngine& diagnostics_;

@@ -66,6 +66,7 @@ BEZEL_TEST(sema_local_infer, new_T_initializer) {
         "class T end T; "
         "class C public method M() var t := new T(); end M; end C;");
     auto* t = findLocal(r, "t");
+    BEZEL_EXPECT_TRUE(t != nullptr);
     if (t) {
         BEZEL_EXPECT_TRUE(t->declType != nullptr);
         if (t->declType)
@@ -81,6 +82,7 @@ BEZEL_TEST(sema_local_infer, explicit_ascription_wins) {
         "class D end D; "
         "class C public method M() var d: D := new D(); end M; end C;");
     auto* d = findLocal(r, "d");
+    BEZEL_EXPECT_TRUE(d != nullptr);
     if (d) {
         BEZEL_EXPECT_TRUE(d->declType != nullptr);
         if (d->declType)
@@ -127,6 +129,7 @@ BEZEL_TEST(sema_local_infer, no_initializer_no_ascription_no_type) {
     // grammar requires `:= Expr` when there's no ascription), so we
     // simply verify ascription-only locals also receive declType.
     auto* x = findLocal(r, "x");
+    BEZEL_EXPECT_TRUE(x != nullptr);
     if (x) {
         BEZEL_EXPECT_TRUE(x->declType != nullptr);
         if (x->declType)

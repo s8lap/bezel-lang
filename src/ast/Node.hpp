@@ -734,10 +734,28 @@ struct DestructorDecl : Member {
 // invariant of C is the conjunction of every InvariantDecl of C and every
 // base class, evaluated base-first, declaration order within each class
 // (§22.16 "Class invariants"). Class-body-only per A.4; semantically
-// rejected in records, static classes, and outside class bodies.
-// `static invariant` parses from day one (the prover fragment, when it
-// lands, gives it meaning); in this revision a `static` invariant is
-// accepted at parse, rejected at sema as out-of-fragment.
+// rejected in records, static classes, and outside class bodies (fix
+// #4115/#4186).
+//
+// fix-forward #4206 (§22.16 "Class invariants", "Out of scope in this
+// revision", v0.298; corrects this comment, no behavior change): the
+// `"static"?` qualifier on an invariant clause INSIDE AN ORDINARY (non-
+// static) class body is NOT rejected at sema in this revision — an earlier
+// revision of this comment claimed it was ("rejected at sema as
+// out-of-fragment"), but no sema check ever existed for it (issue #4206,
+// filed reviewing #4186, whose commit had quoted this comment as supporting
+// authority for a claim it did not make). §22.16's own "Out of scope in
+// this revision" list says only: "`static invariant` parses from day one
+// and is useful when the prover fragment lands" — silent on rejection, and
+// the codegen side (`Emitter::emitInvariantCheck`, `LlvmBackend_Setup.cpp`)
+// confirms the intended reading: it simply excludes `isStatic` invariants
+// from runtime instrumentation (`if (inv->expr && !inv->isStatic)`), i.e.
+// INERT-until-the-prover-lands, not rejected.
+// `checkRecordAndStaticClassInvariantMembers` / `checkEnumChoiceInvariantMembers`
+// (TypeResolution_Checks.cpp) reject the wrong BODY KIND (record / static
+// class / enum / choice); neither reads `isStatic`, and nothing else does
+// either — a `static invariant` in an ordinary class compiles clean today,
+// and per the spec text above, should.
 //
 // Slice 1 carries the parsed member only; instrumentation, instrumentation
 // set, and the checked/unchecked face split land in later slices.
@@ -1049,6 +1067,33 @@ struct NullLiteralExpr : Expr {};
 struct IdentifierExpr : Expr {
     std::string_view name;
     std::vector<std::unique_ptr<Type>> typeArgs;
+    // fix #4246 (§28.3 / §28.6, v0.298): set by the ownership pass on the
+    // RECEIVER occurrence of an explicit `x.Dispose()` / `x?.Dispose()` /
+    // `x!.Dispose()` call whose LOCAL is, at THIS exact program point (per
+    // the checker's `states_` dataflow, read in `markExplicitDisposeReceiver`
+    // just before the call transitions it to Disposed), in the Owned state —
+    // even when the local's DECLARATION is a plain borrow alias
+    // (`var y := x;`) that only became Owned later via a plain reassignment
+    // (`y := new Res(1);`). Codegen's `unwindOwnedLocalClass` classifies
+    // purely from the DECLARATION's initializer form and returns null for a
+    // borrow-initialized local, so `explicitDisposeOwnedReceiverSlot` fell to
+    // dispatch-only — the destructor ran but the heap block LEAKED (the
+    // #4246 finding).
+    //
+    // Deliberately a PER-OCCURRENCE fact (a fresh IdentifierExpr node per
+    // source occurrence), NOT a per-declaration one like
+    // `LocalDecl::becomesOwnedViaReassign`. That distinction is load-bearing:
+    // the SAME local can legally be `.Dispose()`d at a point where it is
+    // STILL a genuine borrow (§28.6's documented "recorded gap" — a plain
+    // local's borrow-dispose is unenforced, e.g. `var y := x; y.Dispose();
+    // y := new Res(1); y.Dispose();` compiles today) as well as later, after
+    // it becomes owned. A per-declaration flag would make the EARLIER
+    // (still-borrow) call ALSO reclaim — freeing a value another owner (`x`)
+    // still holds, a double-free that does not exist today. Reading the
+    // dataflow's OWN Owned/Borrowed classification at the EXACT call site is
+    // sound however many such calls a program contains, in either order.
+    // // per §28.3, §28.6
+    bool disposeReclaimsReassignedBorrow = false;
 };
 
 // Source-level parentheses (`(expr)`) are NOT represented as their own AST
@@ -1414,6 +1459,32 @@ struct CaseStmt : Stmt {
     // by Emitter::lowerCaseStmt, so a single AST-mutable field is sufficient
     // (no need for a SemaContext side table).
     bool totalityGranted = false;
+    // fix #4139 (§19.6, v0.298): true when this CaseStmt's no-match
+    // fallthrough edge is PROVABLY unreachable — either an unguarded
+    // catch-all arm (`_` / untyped `var x`) or full closed-value-space
+    // coverage (every enum constant, both bool literals, every choice
+    // case, every closed-hierarchy leaf, each in its nullable variant) —
+    // the SAME §19.6 exhaustiveness verdict `ExprTC::caseArmsExhaustive`
+    // computes for the expression-position non-exhaustiveness warning.
+    // Deliberately WITHOUT `totalityGranted`'s additional "every arm
+    // diverges" conjunction (§21.7): that conjunction only matters for
+    // `totalityGranted`'s own consumer (does this case STATEMENT return on
+    // every path?); this field answers a narrower, unconditional question
+    // ("is the no-match edge dead?") that stays meaningful even when arms
+    // do NOT all diverge — which is exactly the ownership pass's use: the
+    // CaseStmt arm-join (`MethodOwnership::visitStmt` and the lambda-body
+    // pre-pass `applyUsingVarBorrowPinInLambdaStmt`, both Ownership.cpp)
+    // fold the pre-case snapshot into the join as a stand-in for the
+    // §19.6 no-match fallthrough UNLESS this field is set, in which case
+    // that edge is known-dead and folding it in would only over-reject a
+    // legitimate reassignment/move/read of a local every live arm
+    // consumes. Set unconditionally by ExprTC::visitStmt's CaseStmt arm
+    // (sema runs before ownership, Driver.cpp); read only by the
+    // ownership pass. Supersedes the ownership pass's own prior syntactic-
+    // only `caseHasUnguardedCatchAllArm` predicate, which covered only the
+    // catch-all disjunct — see #4139 for the exhaustive-with-no-wildcard
+    // false-reject that predicate could not catch.
+    bool noMatchEdgeStaticallyDead = false;
     // K8 full-expression boundary flag (#1795): mirrors
     // CaseExpr::disposeOwnedScrutinee for the statement-position form. Set
     // by the ownership pass; read by Emitter::lowerCaseStmt.

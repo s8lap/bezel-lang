@@ -400,6 +400,23 @@ BEZEL_TEST(builtin_registry_snapshot, ffi_buffer_builtin_set) {
         BEZEL_EXPECT_FALSE(isFfiBufferBuiltinName(n));
 }
 
+// --- isNoOverrideIdentityBuiltinName (#4126, stdlib §6.1/§8.1): the two
+// builtin heap-pointer CLASSES (Stopwatch, CancellationToken) sharing the
+// FFI-buffer trio's "no vtable, no dedicated Object-contract interceptor"
+// shape but kept as their own registry row (see BuiltinRegistry.cpp for
+// why a shared boolean with kFfiBufferBuiltins would misstate the two
+// families as interchangeable). ---
+BEZEL_TEST(builtin_registry_snapshot, no_override_identity_builtin_set) {
+    static constexpr std::array<std::string_view, 2> kSnapshot = {
+        "Stopwatch", "CancellationToken",
+    };
+    for (auto n : kSnapshot) BEZEL_EXPECT_TRUE(isNoOverrideIdentityBuiltinName(n));
+    for (std::string_view n : {"CString", "WString", "RawBytes", "Guid",
+                               "Range", "DateTime", "TimeSpan",
+                               "CancellationTokenSource", "Random", ""})
+        BEZEL_EXPECT_FALSE(isNoOverrideIdentityBuiltinName(n));
+}
+
 // --- isIterableInterfaceHead (§28.3/§29.3/§30.7 v0.201, #2048 / proposal 0048):
 // the iterable/enumerator interface heads whose unmarked return type is the
 // iterator convention's announced caller-owned frame. A static signature
@@ -429,7 +446,7 @@ BEZEL_TEST(builtin_registry_snapshot, iterable_interface_head_set) {
 // (imported-only) are deliberately NOT in the shared set — they are the small
 // site-local deltas the two call sites still test explicitly.
 BEZEL_TEST(builtin_registry_snapshot, heap_pointer_reference_builtin_set) {
-    static constexpr std::array<std::string_view, 69> kSnapshot = {
+    static constexpr std::array<std::string_view, 73> kSnapshot = {
         "Array", "OwningArray", "Dictionary", "OwningDictionary",
         // INTENTIONAL addition (stdlib §4.18, #1426): SortedSet — bz_dict_t*
         // rep on both the astNode and imported paths.
@@ -466,6 +483,12 @@ BEZEL_TEST(builtin_registry_snapshot, heap_pointer_reference_builtin_set) {
         "Subscription", "CancellationToken", "CancellationTokenSource",
         "TaskScope",
         "Shared", "Weak", "Channel", "ChannelSender", "IGrouping",
+        // INTENTIONAL addition (issue #4178): IOrderedEnumerable<T> —
+        // same bz_lazy_t* ptr rep as IEnumerable/IGrouping above; without
+        // it, a function whose declared return type is an explicit
+        // `IOrderedEnumerable<T>` annotation IR-verify-fails ("Function
+        // return type does not match operand type of return inst!").
+        "IOrderedEnumerable",
         // INTENTIONAL addition (stdlib §6.5, fix #1536): EventSource<T> /
         // AsyncEventSource<T> — the producer-side event face (§24.3), same
         // ptr rep as IEvent<T>/IAsyncEvent<T>.
@@ -483,6 +506,13 @@ BEZEL_TEST(builtin_registry_snapshot, heap_pointer_reference_builtin_set) {
         "ISerializer", "IDeserializer", "ISerializable", "IDeserializable",
         "BinarySerializer", "BinaryDeserializer", "JsonSerializer",
         "JsonDeserializer",
+        // INTENTIONAL addition (fix #4326, stdlib §2.10/§2.18, §28.2/
+        // §28.12/§18.5): IDisposable, IAsyncDisposable, IFormattable — three
+        // more null-declaration builtin interfaces sharing IOrderedEnumerable's
+        // exact shape (directly above): naming one as a parameter or return
+        // type IR-verifier-crashed because lowerTypeRef's Named case fell
+        // through to the i32 default instead of ptr.
+        "IDisposable", "IAsyncDisposable", "IFormattable",
     };
     for (auto n : kSnapshot) BEZEL_EXPECT_TRUE(isHeapPointerReferenceBuiltin(n));
     // The site-local deltas must NOT be in the shared set. (OwningBuffer was
@@ -553,7 +583,10 @@ BEZEL_TEST(builtin_registry_snapshot, reserved_builtin_type_name_set) {
                                "BinaryDeserializer", "JsonSerializer",
                                "JsonDeserializer",
                                "Array", "Dictionary", "Task", "Shared",
-                               "Mutex", "Buffer", "IGrouping"})
+                               "Mutex", "Buffer", "IGrouping",
+                               // #4178: IOrderedEnumerable<T> joined the heap
+                               // table alongside its sibling IGrouping above.
+                               "IOrderedEnumerable"})
         BEZEL_EXPECT_TRUE(isReservedBuiltinTypeName(n));
     // (c) OUT: ordinary generic type-parameter spellings must stay classifiable
     // as parameters — this is the whole point of the negative test.
@@ -632,13 +665,19 @@ BEZEL_TEST(builtin_registry_snapshot, vtable_less_builtin_class_name_set) {
     // (b) OUT: every reserved INTERFACE head — the receivers that may hold a
     // user class and must keep dispatching through its vtable. This is the
     // whole content of the subtraction, so it is pinned name-for-name.
-    static constexpr std::array<std::string_view, 22> kInterfaceHeads = {
+    static constexpr std::array<std::string_view, 25> kInterfaceHeads = {
         "IEnumerable", "IEnumerator", "IOwningEnumerable", "IOwningEnumerator",
         "IAsyncEnumerable", "IAsyncEnumerator", "IOwningAsyncEnumerable",
         "IOwningAsyncEnumerator", "IReadOnlyCollection", "IReadOnlyList",
         "ICollection", "IList", "IOwningCollection", "IOwningList",
         "IEvent", "IAsyncEvent", "ISharedEvent", "IGrouping",
         "ISerializer", "IDeserializer", "ISerializable", "IDeserializable",
+        // INTENTIONAL addition (fix #4326): IDisposable, IAsyncDisposable,
+        // IFormattable — the necessary companion of that fix's
+        // kHeapPointerReferenceBuiltins addition; see BuiltinRegistry.cpp's
+        // comment on kBuiltinInterfaceHeads for why leaving these out would
+        // have made isVtableLessBuiltinClassName wrongly true for them.
+        "IDisposable", "IAsyncDisposable", "IFormattable",
     };
     for (auto n : kInterfaceHeads) {
         BEZEL_EXPECT_FALSE(isVtableLessBuiltinClassName(n));
@@ -670,13 +709,16 @@ BEZEL_TEST(builtin_registry_snapshot, vtable_less_builtin_class_name_set) {
 // reads, so any drift between this snapshot and the `kBuiltinInterfaceHeads`
 // array it mirrors is the regression shape.
 BEZEL_TEST(builtin_registry_snapshot, builtin_interface_head_set_8_1) {
-    static constexpr std::array<std::string_view, 22> kInterfaceHeads = {
+    static constexpr std::array<std::string_view, 25> kInterfaceHeads = {
         "IEnumerable", "IEnumerator", "IOwningEnumerable", "IOwningEnumerator",
         "IAsyncEnumerable", "IAsyncEnumerator", "IOwningAsyncEnumerable",
         "IOwningAsyncEnumerator", "IReadOnlyCollection", "IReadOnlyList",
         "ICollection", "IList", "IOwningCollection", "IOwningList",
         "IEvent", "IAsyncEvent", "ISharedEvent", "IGrouping",
         "ISerializer", "IDeserializer", "ISerializable", "IDeserializable",
+        // INTENTIONAL addition (fix #4326) — see the companion snapshot
+        // above (vtable_less_builtin_class_name_set) for the full rationale.
+        "IDisposable", "IAsyncDisposable", "IFormattable",
     };
     for (auto n : kInterfaceHeads) {
         BEZEL_EXPECT_TRUE(isBuiltinInterfaceHead(n));
@@ -820,10 +862,13 @@ BEZEL_TEST(builtin_registry_snapshot, disposable_builtin_head_name_set_spec_28_3
 // deliberately does not name them) stay OUT — they render lowercase or
 // not at all, respectively.
 BEZEL_TEST(builtin_registry_snapshot, builtin_class_module_path_set) {
-    static constexpr std::array<std::string_view, 79> kSnapshot = {
+    static constexpr std::array<std::string_view, 82> kSnapshot = {
         // §2 System — §2.5/§2.6 value-builtins whose box thunk renders the
         // type-name literal (fix #3119 (a)).
         "DateTime", "TimeSpan", "DateOnly", "TimeOnly", "Guid",
+        // fix #4120 (stdlib §10.1/§10.2/§10.3, v0.295): the FFI-boundary
+        // buffer classes — §10's preamble states they live in `System`.
+        "CString", "WString", "RawBytes",
         // §2.17 — built-in EXCEPTIONS, all in `System`.
         "Exception", "ArgumentException", "ArgumentNullException",
         "ArgumentOutOfRangeException", "ArithmeticException", "OverflowException",

@@ -408,6 +408,14 @@ void Resolver::run(const ast::SourceFile& src) {
     // kind half checkChoiceDispatchModifiers's own comment deliberately left
     // out of scope, mirroring checkEnumRestrictions above.
     checkChoiceRestrictions();
+    // fix #4115 (§22.16, v0.298): an `invariant` member on an enum or choice
+    // body — invisible to both member-kind walks just above, since
+    // `invariant` clauses are not a `Symbol` subclass at all.
+    checkEnumChoiceInvariantMembers();
+    // fix #4186 (§22.16, Appendix A.4 `InvariantDecl`, v0.298): the same gap
+    // for a record body or a `static class` body — #4115's own scope
+    // deliberately excluded these two shapes.
+    checkRecordAndStaticClassInvariantMembers();
     // §14.2 (#746): contradictory generic constraints (e.g. class + value).
     checkGenericConstraintConsistency();
     // Slice S33: method body-presence rules (§12.5 / §11.2).
@@ -418,6 +426,11 @@ void Resolver::run(const ast::SourceFile& src) {
     // posture for the property/indexer analog of a "body" (the auto
     // initializer).
     checkAbstractPropertyInitializers();
+    // fix #4110 (§12.5/§23.4, v0.298): an abstract NAMED property or
+    // indexer given an explicit `=>`/block body (as opposed to
+    // checkAbstractPropertyInitializers' Auto-shorthand-plus-initializer
+    // shape) has no reachable call site either — the body is dead code.
+    checkAbstractPropertyBodies();
     // Slice S34: static members may not be virtual (§12.1).
     checkStaticNotVirtual();
     // Slice S35: `async abstract` is a compile error (§12.6).

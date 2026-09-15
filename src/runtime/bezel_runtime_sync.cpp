@@ -123,15 +123,21 @@ void* bz_mutex_try_acquire(void* mp, int64_t timeout_ms) {
 }
 
 // §6.2: Lock.Dispose — release the held lock.  Idempotent per §28.2: the
-// first call releases the pthread_mutex; subsequent calls are no-ops.
+// first call releases the pthread_mutex and frees the bz_lock_t struct;
+// subsequent calls are no-ops.
 // Called by the Lock's disposer (scope exit / explicit Dispose()).
+// fix #4354 (stdlib §6.2, v0.298): the prior version only guarded the
+// pthread_mutex_unlock with `released`, but ran `delete lk` and
+// `mutex_core_release(m)` on every call. A second `Dispose()` then
+// dereferenced the freed `lk->released` (UAF) and double-freed both
+// `bz_lock_t` and the underlying mutex core. Move the cleanup inside
+// the guard so the second call is a true no-op.
 void bz_lock_release(void* lkp) {
     if (!lkp) return;
     auto* lk = (bz_lock_t*)lkp;
-    if (!lk->released) {
-        lk->released = true;
-        pthread_mutex_unlock(&lk->mutex->mtx);
-    }
+    if (lk->released) return;          // idempotent (§28.2)
+    lk->released = true;
+    pthread_mutex_unlock(&lk->mutex->mtx);
     // Release the core ref the Lock holds; may destroy the mutex if the Mutex
     // object was already disposed (Lock-outlives-Mutex scenario).
     bz_mutex_t* m = lk->mutex;
