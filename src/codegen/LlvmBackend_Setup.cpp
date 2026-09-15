@@ -26358,6 +26358,42 @@ bool Emitter::lowerClosureLocalReassign(const ast::Expr& target,
 }
 
 
+// fix #4227: reassign a captured closure-typed local with retain-new /
+// release-old, for the captured-cell path that lowerClosureLocalReassign's
+// own localSlot() gate cannot reach (the slot lives in the outer scope,
+// not the current function's locals_). Mirrors lowerClosureLocalReassign's
+// retain-before-release ordering exactly — self-assignment `f := f;` is safe
+// (the count dips +1 then back, never transiently 0). A +1 producer (a
+// lambda, a method reference, or a user-defined closure-returning call) is
+// TRANSFERRED (no retain — its single reference becomes the cell's);
+// anything else is RETAINED. No currentFn_ == closureReleaseEligibleFn_ gate:
+// a captured local is always lowered in the CAPTURING lambda body, which
+// has its own closureReleaseEligibleFn_ (never the outer scope's). The
+// captured-cell path is unconditional, parallel to lowerClosureFieldStore
+// for closure fields. bz_closure_retain/release are null-safe.
+// See the regression test file header for the full citation discussion.
+bool Emitter::lowerCapturedClosureLocalReassign(const ast::Expr& target,
+                                               llvm::Value* cellAddr,
+                                               llvm::Type* elemTy,
+                                               llvm::Value* newVal,
+                                               const ast::Expr* valueExpr) {
+    if (!cellAddr || !newVal) return false;
+    if (!newVal->getType()->isPointerTy()) return false;
+    // Must be a closure-typed captured local's cell.
+    const sema::TypeRef* tt = ctx_.exprType(target);
+    if (!tt || tt->kind != sema::TypeRef::Kind::Function) return false;
+    if (tt->nullable) return false;  // nullable: leave as plain store
+    llvm::Value* oldVal = builder_.CreateLoad(ptrTy(), cellAddr, "clccr.old");
+    bool isProducer = isPlusOneClosureProducer(valueExpr) ||
+                      isUserMethodClosureReturnCall(valueExpr);
+    if (!isProducer)
+        emitClosureRetain(newVal);
+    builder_.CreateStore(newVal, cellAddr);
+    emitClosureRelease(oldVal);
+    return true;
+}
+
+
 // #429 (box RETURN category) / §8.6 / §28.9: see the declaration in
 // LlvmBackend_impl.hpp. Recognize a CallExpr whose resolved callee is a
 // USER-DEFINED, LOCALLY-COMPILED MethodSymbol (backed by an ast::MethodDecl,

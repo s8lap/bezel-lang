@@ -15100,6 +15100,21 @@ private:
                                    llvm::Type* elemTy, llvm::Value* newVal,
                                    const ast::Expr* valueExpr);
 
+    // fix #4227 (captured-cell twin of lowerClosureLocalReassign): reassign
+    // a closure-typed local that IS ITSELF a captured cell (declared in an
+    // outer scope, written from inside the capturing lambda body). Mirrors
+    // lowerClosureLocalReassign but for the captured-cell path — no
+    // localSlot() gate (the cell slot lives in the outer scope, not the
+    // current function's locals_) and no currentFn_ == closureReleaseEligibleFn_
+    // gate (the analyzed function differs from the lowering function). The
+    // cell itself owns a +1 on its current value; reassignment must release
+    // the displaced value before storing the new one.
+    bool lowerCapturedClosureLocalReassign(const ast::Expr& target,
+                                          llvm::Value* cellAddr,
+                                          llvm::Type* elemTy,
+                                          llvm::Value* newVal,
+                                          const ast::Expr* valueExpr);
+
     // #422 / §27.5 / §28.9: the set of `var` closure (function-typed) LocalDecl
     // nodes PROVABLY eligible for scope-end bz_closure_release — initialized
     // once by a codegen-internal +1 producer (a lambda expression or a method

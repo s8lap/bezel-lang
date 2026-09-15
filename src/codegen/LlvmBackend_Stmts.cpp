@@ -1425,6 +1425,32 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                     handled = lowerClosureLocalReassign(*as->target, addr,
                                                         elemTy, rhs,
                                                         as->value.get());
+                // fix #4227: captured-cell twin of lowerClosureLocalReassign above.
+                // A captured closure-typed local (its cell slot is in cellVars_)
+                // reassigned from INSIDE the capturing lambda body reaches here with
+                // addr = the heap cell address (from boxedStorage in lvalueAddr),
+                // but lowerClosureLocalReassign's own currentFn_ ==
+                // closureReleaseEligibleFn_ gate is false (the analyzed function is
+                // the outer scope, not this lambda body), so it returns false and
+                // the store falls through to a plain store with no release — the
+                // displaced closure value leaks. The new helper handles this
+                // captured-cell path unconditionally (mirrors lowerClosureFieldStore
+                // / lowerClosureLocalReassign's retain-before-release ordering).
+                // No null guard on slot in cellVars_ needed: the capture check
+                // itself proves the cell exists.
+                if (!handled) {
+                    if (llvm::AllocaInst* slot = localSlot(*as->target)) {
+                        if (cellVars_.count(slot)) {
+                            const sema::TypeRef* tt = ctx_.exprType(*as->target);
+                            if (tt && tt->kind == sema::TypeRef::Kind::Function &&
+                                !tt->nullable) {
+                                handled = lowerCapturedClosureLocalReassign(
+                                    *as->target, addr, elemTy, rhs,
+                                    as->value.get());
+                            }
+                        }
+                    }
+                }
                 // #429 (box FIELD-STORE category) / §8.6 / §28.9: a store into
                 // a CLASS Object/interface field whose every store (per the
                 // collectBoxStorageFields pre-pass) uses a boxable value source
