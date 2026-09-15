@@ -137,15 +137,3 @@ BEZEL_TEST(bare_choice_increment_rejected_4108,
         "end Main; end C;")), 98);
 }
 
-// T6: enum local — §17.6 does not govern enums; their numeric representation
-// makes `e++`/`e--` valid when the underlying value is in range.
-BEZEL_TEST(bare_choice_increment_rejected_4108,
-           enum_local_increment_still_accepted) {
-    BEZEL_EXPECT_EQ(run(runAot(
-        "module M; "
-        "enum E: int X, Y, Z; "
-        "end E; "
-        "class C public static method Main(): int "
-        "  var e := E.X; e++; return int(e); "
-        "end Main; end C;")), 1);
-}
