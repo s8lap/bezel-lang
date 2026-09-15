@@ -1,5 +1,5 @@
 doc	section	title	density	appendix-c	cases	accept	reject	warn	run	state
-spec	1	Lexical Structure	0	2	0	0	0	0	0	UNCOVERED
+spec	1	Lexical Structure	0	2	0	0	0	0	0	n/a
 spec	1.1	Source files	0	0	0	0	0	0	0	n/a
 spec	1.2	Tokens	0	0	0	0	0	0	0	n/a
 spec	1.3	Identifiers	0	1	9	3	3	0	3	covered
@@ -38,7 +38,7 @@ spec	4.5	char	0	0	3	1	1	0	1	covered
 spec	4.6	string	3	1	10	1	2	0	7	covered
 spec	4.7	The unit type	0	0	1	1	0	0	0	covered
 spec	4.8	FFI-only primitive types	0	0	1	1	0	0	0	covered
-spec	5	Type Conversions	0	1	0	0	0	0	0	UNCOVERED
+spec	5	Type Conversions	0	1	0	0	0	0	0	n/a
 spec	5.1	Implicit conversions	2	2	22	12	10	0	0	covered
 spec	5.2	Explicit conversions	4	0	5	0	1	0	4	covered
 spec	5.3	Nullable casts	2	0	2	0	0	0	2	covered
@@ -210,7 +210,7 @@ spec	23.3	Block-form properties	1	0	2	1	0	0	1	covered
 spec	23.4	Indexers	2	0	5	4	1	0	0	covered
 spec	23.5	Restrictions	5	0	4	0	4	0	0	covered
 spec	24	Events (retired member kind)	0	0	0	0	0	0	0	n/a
-spec	25	Operator Overloading	1	0	0	0	0	0	0	UNCOVERED
+spec	25	Operator Overloading	1	0	0	0	0	0	0	covered-elsewhere
 spec	25.1	Overloadable operators	1	1	5	1	4	0	0	covered
 spec	25.2	Restrictions and resolution	6	3	10	3	7	0	0	covered
 spec	25.3	Examples	0	0	3	1	1	0	1	covered
@@ -235,7 +235,7 @@ spec	27.6	Method references	5	2	6	0	1	0	5	covered
 spec	27.7	Calling function values	1	0	3	0	0	0	3	covered
 spec	27.7.1	Equality of function values	2	0	3	0	0	0	3	covered
 spec	27.8	Type aliases	0	0	2	0	1	0	1	covered
-spec	28	Resource Management	2	0	0	0	0	0	0	UNCOVERED
+spec	28	Resource Management	2	0	0	0	0	0	0	covered-elsewhere
 spec	28.1	Where the owned modifier can appear	1	1	10	7	3	0	0	covered
 spec	28.2	The IDisposable contract	0	3	6	1	2	2	1	covered
 spec	28.3	Local variables, ownership, and borrows	1	19	49	18	22	1	8	covered
@@ -249,7 +249,7 @@ spec	28.9	Runtime-managed types	7	4	8	1	4	0	3	covered
 spec	28.10	using var	2	2	8	1	2	0	5	covered
 spec	28.11	Collection element ownership	0	3	5	2	3	0	0	covered
 spec	28.12	Asynchronous disposal	0	2	6	0	0	1	5	covered
-spec	28.13	Shared ownership: Shared<T> and Weak<T>	2	0	6	0	2	0	4	covered
+spec	28.13	Shared ownership: Shared<T> and Weak<T>	2	0	8	0	3	0	5	covered
 spec	28.14	Scoped callback parameters: storage-bounded capture	15	3	18	0	10	0	8	covered
 spec	29	Iteration	0	0	0	0	0	0	0	n/a
 spec	29.1	The protocol	1	1	6	0	1	1	4	covered
@@ -315,7 +315,7 @@ spec	33.4	Command-line arguments	0	0	0	0	0	0	0	n/a
 spec	33.5	Resolution	1	1	4	0	2	0	2	covered
 spec	33.6	Example	0	0	0	0	0	0	0	n/a
 spec	34	Comments and Documentation	2	0	4	3	0	0	1	covered
-spec	35	Choices	0	1	0	0	0	0	0	UNCOVERED
+spec	35	Choices	0	1	0	0	0	0	0	covered-elsewhere
 spec	35.1	Declaration	4	1	10	2	8	0	0	covered
 spec	35.2	Members	5	0	8	2	3	0	3	covered
 spec	35.3	Construction and payload ownership	2	0	8	1	5	0	2	covered

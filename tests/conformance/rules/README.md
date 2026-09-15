@@ -169,6 +169,17 @@ counts by expectation, and a `state` of `UNCOVERED`, `thin`, `covered` or `n/a`
 is how a wave's real effect is read: a wave that moves case counts without
 moving any section out of `UNCOVERED` went over ground already held.
 
+Two states say a gap is not real, and they are different claims. A **container**
+— a numbered heading whose own body is empty, all of whose text lives in its
+subsections — is `n/a`, decided by measurement: Appendix C rows citing a
+subsection are attributed to the parent as well, so a container otherwise reads
+as a dense uncovered section while stating nothing at all. **`covered-elsewhere`**
+is a judgement, so it is never inferred: it is claimed in `coverage_acks.tsv`,
+one row per section, naming the case that covers the rule and why. The claim is
+checked — an ack naming a case that does not exist is a lint error, because a
+wrong ack hides a real gap permanently, which is worse than the false gap it
+removes.
+
 A section is covered when a case exists for it, which is weaker than every rule
 in it being covered. The stronger question is per-rule, and
 `coverage.py --rules <section>` and `--invariants <section>` are what answer it

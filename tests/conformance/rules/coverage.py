@@ -36,6 +36,16 @@ COLUMNS = ("doc", "section", "title", "density", "appendix-c", "cases",
            "accept", "reject", "warn", "run", "state")
 
 
+# A line that is only an HTML anchor or comment is markup, not prose. The spec
+# emits `<a id="sec-...">` before every heading, so without this every container
+# section looks non-empty and the container rule never fires.
+_MARKUP_ONLY_RE = re.compile(r'^\s*(?:<a\s+id="[^"]*"\s*></a>|<!--.*?-->)\s*$')
+
+
+def _is_prose(line):
+    return bool(line.strip()) and not _MARKUP_ONLY_RE.match(line)
+
+
 def parse_sections(path, doc_tag):
     """Every numbered heading in a document, with its body text."""
     with open(path, encoding="utf-8") as f:
@@ -55,6 +65,12 @@ def parse_sections(path, doc_tag):
     for s in sections:
         text = "\n".join(s["body"])
         s["density"] = len(DENSITY_RE.findall(text))
+        # A *container* section is one whose own body is empty — every word under
+        # it belongs to a subsection. Appendix C rows still cite it (a row citing
+        # §28.3 is attributed to §28 too), so without this it reads as a
+        # permanently uncovered high-value gap, and every wave re-investigates it
+        # and finds nothing. Spec §1 and §5 are both containers.
+        s["container"] = not any(_is_prose(line) for line in s["body"])
         del s["body"]
     return sections
 
@@ -137,6 +153,10 @@ def build(docs_dir, base_dir):
             c_per_section[("spec", ref)] += 1
 
     rows, problems = corpus.load_cases(os.path.join(base_dir, "cases"))
+    acks, ack_problems = parse_acks(
+        os.path.join(base_dir, "coverage_acks.tsv"),
+        {r["case-id"] for r in rows})
+    problems = list(problems) + ack_problems
     cases_per_section = {}
     for case in rows:
         key = (case["doc"], case["section"])
@@ -157,7 +177,9 @@ def build(docs_dir, base_dir):
             "cases": counts["cases"], "accept": counts["accept"],
             "reject": counts["reject"], "warn": counts["warn"],
             "run": counts["run"],
-            "state": state_of(s["density"], c_rows, counts),
+            "state": state_of(s["density"], c_rows, counts,
+                              container=s.get("container", False),
+                              ack=acks.get(key)),
         })
     # Cases in a section the documents do not have: a citation error worth seeing.
     known = {(s["doc"], s["section"]) for s in sections}
@@ -173,17 +195,70 @@ def build(docs_dir, base_dir):
     return out, invariants, c_per_section, problems
 
 
-def state_of(density, c_rows, counts):
+def state_of(density, c_rows, counts, container=False, ack=None):
     """A section's coverage state. `n/a` is the honest answer for a section that
-    states no enforced consequence — prose, a worked example, a rationale aside."""
+    states no enforced consequence — prose, a worked example, a rationale aside.
+
+    Two states exist because a gap can be false in two different ways, and both
+    had every wave re-investigating the same empty sections:
+
+    - `n/a` for a *container* — a numbered heading whose own body is empty, all
+      of whose text is in its subsections. Appendix C rows citing a subsection
+      are attributed to the parent as well, so a container reads as a dense
+      uncovered section while stating nothing at all.
+    - `covered-elsewhere` for a section that does state a rule, where the rule is
+      written down and tested under a *different* section. That is a judgement,
+      not a measurement, so it is never inferred: it is claimed in
+      `coverage_acks.tsv` with the case id that covers it, and the claim is
+      checked — an ack naming a case that does not exist is a lint error."""
     want = density + c_rows
+    if container and counts["cases"] == 0:
+        return "n/a"
     if want == 0 and counts["cases"] == 0:
         return "n/a"
+    if ack and counts["cases"] == 0:
+        return "covered-elsewhere"
     if counts["cases"] == 0:
         return "UNCOVERED"
     if counts["cases"] < max(1, want // 4):
         return "thin"
     return "covered"
+
+
+ACK_COLUMNS = ("doc", "section", "covered-by", "note")
+
+
+def parse_acks(path, known_case_ids):
+    """`coverage_acks.tsv` — sections whose rules are covered under another
+    section. Returns ({(doc, section): row}, [problem, ...])."""
+    acks, problems = {}, []
+    if not os.path.exists(path):
+        return acks, problems
+    with open(path, encoding="utf-8") as f:
+        lines = [ln.rstrip("\n") for ln in f if ln.strip()
+                 and not ln.startswith("#")]
+    if not lines:
+        return acks, problems
+    header = lines[0].split("\t")
+    if tuple(header) != ACK_COLUMNS:
+        problems.append("coverage_acks.tsv: header is {}, expected {}"
+                        .format(header, list(ACK_COLUMNS)))
+        return acks, problems
+    for ln in lines[1:]:
+        parts = ln.split("\t")
+        if len(parts) != len(ACK_COLUMNS):
+            problems.append("coverage_acks.tsv: {} fields in {!r}"
+                            .format(len(parts), ln[:60]))
+            continue
+        row = dict(zip(ACK_COLUMNS, parts))
+        for cid in row["covered-by"].split(","):
+            cid = cid.strip()
+            if cid and cid not in known_case_ids:
+                problems.append(
+                    "coverage_acks.tsv: \u00a7{} is acked to {}, which is not a "
+                    "case".format(row["section"], cid))
+        acks[(row["doc"], row["section"])] = row
+    return acks, problems
 
 
 def render(rows):
@@ -262,7 +337,17 @@ def main(argv, base_dir=None):
         print("{} ORPHAN sections (cases citing a section the documents lack): {}"
               .format(len(orphans), ", ".join(o["section"] for o in orphans)))
 
+    acked = [r for r in rows if r["state"] == "covered-elsewhere"]
+    if acked:
+        print("{} sections covered-elsewhere (see coverage_acks.tsv)"
+              .format(len(acked)))
+
     if args.gaps:
+        if acked:
+            print("\nCovered elsewhere, by claim:")
+            for row in acked:
+                print("  {:<6} {:<9} {}".format(
+                    row["doc"], row["section"], row["title"][:60]))
         print("\nUncovered, densest first:")
         for row in sorted(uncovered,
                           key=lambda r: -(r["density"] + 3 * r["appendix-c"]))[:args.top]:

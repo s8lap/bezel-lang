@@ -13,6 +13,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import corpus
+import coverage
 import runner
 
 
@@ -870,6 +871,120 @@ class TestCommittedCorpus(unittest.TestCase):
             os.path.join(base, "cases"))[0]}
         banked = runner.read_baseline(os.path.join(base, "baseline.tsv"))
         self.assertEqual(sorted(set(banked) - rows), [])
+
+
+class TestCoverageStates(unittest.TestCase):
+    """The two ways a coverage gap can be false. Both existed as prose in the
+    README before they were code, and every wave re-investigated the same empty
+    sections — which is the whole argument for executing a rule rather than
+    writing it down."""
+
+    EMPTY = {"cases": 0, "accept": 0, "reject": 0, "warn": 0, "run": 0}
+    ONE = {"cases": 1, "accept": 1, "reject": 0, "warn": 0, "run": 0}
+
+    def test_a_container_is_not_a_gap(self):
+        # Appendix C rows citing a subsection are attributed to the parent too,
+        # so a container reads as dense while stating nothing at all.
+        self.assertEqual(
+            coverage.state_of(0, 2, self.EMPTY, container=True), "n/a")
+
+    def test_a_container_that_somehow_has_cases_is_still_reported(self):
+        self.assertEqual(
+            coverage.state_of(0, 2, self.ONE, container=True), "covered")
+
+    def test_a_section_that_states_a_rule_and_has_nothing_is_a_gap(self):
+        self.assertEqual(
+            coverage.state_of(2, 2, self.EMPTY), "UNCOVERED")
+
+    def test_an_ack_moves_a_gap_to_covered_elsewhere(self):
+        self.assertEqual(
+            coverage.state_of(2, 1, self.EMPTY, ack={"covered-by": "s1_1_0001"}),
+            "covered-elsewhere")
+
+    def test_an_ack_does_not_override_a_real_case_count(self):
+        self.assertEqual(
+            coverage.state_of(2, 1, self.ONE, ack={"covered-by": "s1_1_0001"}),
+            "covered")
+
+
+class TestCoverageAcks(unittest.TestCase):
+    """An ack is a claim, so it is checked. An ack naming a case that does not
+    exist would silently hide a real gap forever — the one outcome worse than
+    the false gap it removes."""
+
+    HEADER = "\t".join(coverage.ACK_COLUMNS)
+
+    def _write(self, body):
+        d = tempfile.mkdtemp()
+        path = os.path.join(d, "coverage_acks.tsv")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(body)
+        return path
+
+    def test_a_missing_file_is_not_an_error(self):
+        acks, problems = coverage.parse_acks("/nonexistent/acks.tsv", set())
+        self.assertEqual((acks, problems), ({}, []))
+
+    def test_a_good_ack_parses(self):
+        path = self._write(self.HEADER + "\nspec\t25\ts25_1_0004\tbecause\n")
+        acks, problems = coverage.parse_acks(path, {"s25_1_0004"})
+        self.assertEqual(problems, [])
+        self.assertEqual(acks[("spec", "25")]["covered-by"], "s25_1_0004")
+
+    def test_an_ack_naming_no_case_is_a_problem(self):
+        path = self._write(self.HEADER + "\nspec\t25\ts25_1_9999\tbecause\n")
+        _, problems = coverage.parse_acks(path, {"s25_1_0004"})
+        self.assertEqual(len(problems), 1)
+        self.assertIn("s25_1_9999", problems[0])
+
+    def test_every_case_in_a_multi_case_ack_is_checked(self):
+        path = self._write(
+            self.HEADER + "\nspec\t25\ts25_1_0004, s25_1_9999\tbecause\n")
+        _, problems = coverage.parse_acks(path, {"s25_1_0004"})
+        self.assertEqual(len(problems), 1)
+        self.assertIn("s25_1_9999", problems[0])
+
+    def test_a_wrong_header_is_a_problem(self):
+        path = self._write("doc\tsection\n spec\t25\n")
+        acks, problems = coverage.parse_acks(path, set())
+        self.assertEqual(acks, {})
+        self.assertEqual(len(problems), 1)
+
+    def test_comments_and_blank_lines_are_skipped(self):
+        path = self._write("# a note\n\n" + self.HEADER
+                           + "\nspec\t25\ts25_1_0004\tbecause\n")
+        acks, problems = coverage.parse_acks(path, {"s25_1_0004"})
+        self.assertEqual(problems, [])
+        self.assertEqual(len(acks), 1)
+
+    def test_the_committed_acks_all_name_live_cases(self):
+        base = os.path.dirname(os.path.abspath(__file__))
+        ids = {r["case-id"] for r in corpus.load_cases(
+            os.path.join(base, "cases"))[0]}
+        _, problems = coverage.parse_acks(
+            os.path.join(base, "coverage_acks.tsv"), ids)
+        self.assertEqual(problems, [])
+
+
+class TestCoverageMarkup(unittest.TestCase):
+    """The spec emits an `<a id=...>` anchor before every heading. Counting one
+    as prose made every container section look non-empty, which is why the
+    container rule silently did nothing on its first cut."""
+
+    def test_an_anchor_line_is_not_prose(self):
+        self.assertFalse(coverage._is_prose('<a id="sec-source-files"></a>'))
+
+    def test_an_html_comment_is_not_prose(self):
+        self.assertFalse(coverage._is_prose("  <!-- a note -->  "))
+
+    def test_a_blank_line_is_not_prose(self):
+        self.assertFalse(coverage._is_prose("   "))
+
+    def test_a_sentence_is_prose(self):
+        self.assertTrue(coverage._is_prose("A source file is UTF-8."))
+
+    def test_a_sentence_after_an_anchor_is_prose(self):
+        self.assertTrue(coverage._is_prose('<a id="x"></a> and then text'))
 
 
 if __name__ == "__main__":
