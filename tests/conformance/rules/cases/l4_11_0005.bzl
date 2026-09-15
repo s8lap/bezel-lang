@@ -7,12 +7,16 @@
 //!   1, then 2, then 3.
 //! cites: 4.11, 15.4
 //! expect: run
-//! stdout: 1
+//! output: 1
+//!   2
+//!   3
 module Conf;
 
 public class Program
   public static method Main()
     using var q: Queue<int> := [1, 2, 3];
+    Console.WriteLine(q.Dequeue());
+    Console.WriteLine(q.Dequeue());
     Console.WriteLine(q.Dequeue());
   end Main;
 end Program;

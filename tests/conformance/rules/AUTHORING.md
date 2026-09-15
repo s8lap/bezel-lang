@@ -287,6 +287,22 @@ divergences are what make a corpus untrustworthy.
   corpus is for rules with stated consequences.
 - Duplicates of a case you already wrote in another section. The rule's home
   section owns it.
+- **An identity comparison, where the rule is *how* a comparison is computed.**
+  `X = X` is true under the correct rule and true under every wrong one — the
+  spec's own named-and-rejected "zero-property, every-pair-equal" synthesis
+  included. Two cases asserted `IntPtr.Zero = IntPtr.Zero` and
+  `Ptr<int>.Zero = Ptr<int>.Zero` over rules that say the comparison reads the
+  *address representation*, which an identity comparison cannot observe. A case
+  about an equality rule needs a pair the rule separates — something that
+  compares **unequal** — beside any equal pair. The same trap catches `=` on
+  records, choices and enums.
+- **A case for a stdlib type whose semantics live in the spec, cited to the
+  stdlib.** The threading sections in particular *declare* and let spec §30.8 /
+  §30.12 / §30.14 carry the meaning: stdlib §6.2 nowhere says `Mutex` is
+  non-reentrant, and §6.3 states no permit counting. A lane assigned "stdlib §6"
+  that reads only stdlib §6 writes a `rule:` the cited section cannot back —
+  three of twelve cases in one batch. Cross-read the spec chapter before you
+  trust a `rule:` line, and cite whichever document states it.
 
 ## Checking your work
 
@@ -302,6 +318,12 @@ python3 tests/conformance/rules/coverage.py --invariants 28.5   # the C rows for
 `coverage.py --invariants <section>` prints every Appendix C invariant citing
 that section (or any subsection under it). Those rows are the authoritative rule
 index — work through them, and say in your report which you covered.
+
+**Appendix C indexes the spec only.** A stdlib lane has no invariants: running
+`--invariants 6` from one used to answer with *spec* §6 (integer arithmetic)
+where the lane meant *stdlib* §6 (threading) — a wrong answer that looks like a
+right one. It now refuses `--invariants lib:6` and points you at `--rules
+lib:6`, which is what a stdlib lane wants.
 
 `coverage.py --rules <section>` prints the section's rule-stating sentences,
 numbered, as a checklist: every sentence that uses one of the phrases the

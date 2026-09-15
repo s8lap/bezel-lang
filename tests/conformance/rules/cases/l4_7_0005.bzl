@@ -21,7 +21,7 @@ public class Program
     src.Add(new Widget());
     using var dst := new OwningLinkedList<Widget>();
     for var c in src.Drain() do
-      dst.AddLast(move c);
+      _ := dst.AddLast(move c);
     end;
     Console.WriteLine(src.Count);
   end Main;

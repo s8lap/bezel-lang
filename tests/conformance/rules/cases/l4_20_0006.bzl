@@ -6,7 +6,8 @@
 //!   position.
 //! cites: 4.20
 //! expect: run
-//! stdout: a
+//! output: a
+//!   b
 module Conf;
 
 public class Program

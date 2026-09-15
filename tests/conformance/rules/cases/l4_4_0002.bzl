@@ -6,7 +6,9 @@
 //!   fill (v0.165, #1375)
 //! cites: 4.4
 //! expect: run
-//! stdout: 5
+//! output: 5
+//!   5
+//!   5
 module Conf;
 
 public class Program

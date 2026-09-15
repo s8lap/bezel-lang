@@ -21,7 +21,7 @@ public class Program
   public static method Main()
     using var d := new OwningDictionary<string, Widget>();
     d.Add("a", new Widget());
-    d.Remove("a");
+    _ := d.Remove("a");
     Console.WriteLine("after remove");
   end Main;
 end Program;

@@ -11,7 +11,7 @@
 module Conf;
 
 public static class Strings
-  public static method MakeBad(): CString
-    return new CString();
+  public static method MakeBad()
+    using var c := new CString();
   end MakeBad;
 end Strings;

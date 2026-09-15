@@ -16,6 +16,6 @@ end Widget;
 public class Program
   public method Fill()
     using var list := new OwningLinkedList<Widget>();
-    list.AddLast(new Widget());
+    _ := list.AddLast(new Widget());
   end Fill;
 end Program;

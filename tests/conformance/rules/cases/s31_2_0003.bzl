@@ -7,7 +7,7 @@
 //!   completes. Arms after the matched one are not considered.
 //! cites: 31.2
 //! expect: run
-//! stdout: broad
+//! output: broad
 module Conf;
 
 public class BroadException: Exception

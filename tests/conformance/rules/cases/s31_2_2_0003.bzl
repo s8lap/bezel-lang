@@ -6,7 +6,8 @@
 //!   end`, used when the body contains multiple statements.
 //! cites: 31.2.2
 //! expect: run
-//! stdout: step1
+//! output: step1
+//!   step2
 module Conf;
 
 public class BoomException: Exception

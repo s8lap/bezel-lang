@@ -12,6 +12,7 @@ public class Program
   public static method Compute(): int
     try
       DoWork();
+      return 1;
     finally
       return 0;
     end try;

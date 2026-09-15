@@ -23,7 +23,7 @@ public class Program
   public static method Main()
     using var w := new Widget();
     using var list := new LinkedList<Widget>();
-    list.AddLast(w);
+    _ := list.AddLast(w);
     list.RemoveFirst();
     Console.WriteLine("still alive");
   end Main;

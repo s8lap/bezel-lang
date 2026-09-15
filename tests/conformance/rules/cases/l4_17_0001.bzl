@@ -6,7 +6,9 @@
 //!   entries in ascending key order.
 //! cites: 4.17
 //! expect: run
-//! stdout: 1
+//! output: 1
+//!   2
+//!   3
 module Conf;
 
 public class Program

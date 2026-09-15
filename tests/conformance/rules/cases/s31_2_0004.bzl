@@ -7,7 +7,7 @@
 //!   more specific type is first changes which arm is selected.
 //! cites: 31.2
 //! expect: run
-//! stdout: narrow
+//! output: narrow
 module Conf;
 
 public class BroadException: Exception

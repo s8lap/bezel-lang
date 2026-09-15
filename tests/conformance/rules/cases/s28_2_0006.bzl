@@ -1,11 +1,11 @@
 //! case: s28_2_0006
 //! doc: spec
 //! section: 28.2
-//! title: an explicit Dispose discharges the local and needs no further discharge
-//! rule: The program may discharge an owned local's obligation explicitly — disposing
-//!   it by hand at a consume-table position — after which the scope-end pass skips
-//!   it; a further discharge is neither required nor written.
-//! cites: 28.3
+//! title: every class implicitly implements IDisposable via a generated Dispose
+//! rule: Every class implicitly implements `IDisposable` via a compiler-generated
+//!   `Dispose()`; user code declares no `Dispose` member, and the generated one is
+//!   callable on an instance the caller owns.
+//! cites: 28.6
 //! expect: accept
 module Conf;
 

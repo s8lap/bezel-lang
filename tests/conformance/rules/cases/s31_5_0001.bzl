@@ -19,7 +19,7 @@ public class Program
 
   public static method Main()
     try
-      var cfg := LoadConfig() ?? throw new InvalidOperationException("no config");
+      using var cfg := LoadConfig() ?? throw new InvalidOperationException("no config");
       Console.WriteLine("loaded");
     catch
       var ex: InvalidOperationException => Console.WriteLine(ex.Message),

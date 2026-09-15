@@ -11,7 +11,7 @@ module Conf;
 
 public class Program
   public static method Main()
-    using var buf := new OwningBuffer<int>(1);
+    var buf := new OwningBuffer<int>(1);
     using var fa := FrozenArray<int>.From(move buf);
     fa[0] := 9;
   end Main;

@@ -8,7 +8,7 @@
 //!   of an unassigned non-nullable slot.
 //! cites: 28.8.1, 7.9
 //! expect: reject
-//! diagnostic: definitely assigned
+//! diagnostic: definite-assignment
 module Conf;
 
 public class Widget

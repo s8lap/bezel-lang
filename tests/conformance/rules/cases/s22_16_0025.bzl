@@ -22,7 +22,7 @@ end Ops;
 public class Program
   public static method Main()
     try
-      Ops.Div(0);
+      _ := Ops.Div(0);
     catch
       var ex: ContractViolationException => Console.WriteLine("caught"),
     end;

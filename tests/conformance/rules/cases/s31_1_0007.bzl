@@ -1,13 +1,13 @@
 //! case: s31_1_0007
 //! doc: spec
 //! section: 31.1
-//! title: move is rejected as redundant on a throw operand
+//! title: the transfer marker at the marker-free throw position is rejected
 //! rule: `throw` is a marker-free consuming position — `throw x;` — the
 //!   keyword itself is the announcement, so `throw move x;` is rejected at
 //!   the marker-free position, the same no-marker rule as an `owned` return.
 //! cites: 31.1, 28.3
 //! expect: reject
-//! diagnostic: redundant
+//! diagnostic: marker-free
 module Conf;
 
 public class BoomException: Exception

@@ -8,12 +8,16 @@
 //!   then 1.
 //! cites: 4.11, 15.4
 //! expect: run
-//! stdout: 3
+//! output: 3
+//!   2
+//!   1
 module Conf;
 
 public class Program
   public static method Main()
     using var s: Stack<int> := [1, 2, 3];
+    Console.WriteLine(s.Pop());
+    Console.WriteLine(s.Pop());
     Console.WriteLine(s.Pop());
   end Main;
 end Program;

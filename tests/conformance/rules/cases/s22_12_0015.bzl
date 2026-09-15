@@ -21,8 +21,8 @@ end Registry;
 
 public class Program
   public static method Main()
-    Registry<int>.Register();
-    Registry<int>.Register();
+    _ := Registry<int>.Register();
+    _ := Registry<int>.Register();
     Console.WriteLine(Registry<string>.Register());
   end Main;
 end Program;

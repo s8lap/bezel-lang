@@ -14,7 +14,7 @@ public static class Bus
   private static owned readonly _e: SharedEventSource<int> := new();
 
   public static method Listen(threshold: int)
-    _e.Subscribe(lambda(x: int) => do
+    using var _ := _e.Subscribe(lambda(x: int) => do
       Console.WriteLine(x + threshold);
     end);
   end Listen;

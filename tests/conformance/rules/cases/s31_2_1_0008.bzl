@@ -16,7 +16,7 @@ public class Classifier
       action();
       return "no throw";
     catch
-      var ex: TEx => return "caught",
+      var ex: TEx => return "caught";
     end try;
   end Classify;
 end Classifier;

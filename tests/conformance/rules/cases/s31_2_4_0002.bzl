@@ -7,7 +7,8 @@
 //!   where the re-raise is one statement among several.
 //! cites: 31.2.4
 //! expect: run
-//! stdout: logged
+//! output: logged
+//!   original
 module Conf;
 
 public class BoomException: Exception

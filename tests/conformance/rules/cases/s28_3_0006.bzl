@@ -18,6 +18,5 @@ public class Program
     var best := new Widget();
     var next := new Widget();
     best := next;
-    best.Dispose();
   end Demo;
 end Program;

@@ -24,7 +24,7 @@ public class Program
     using var pool := new OwningArray<Widget>();
     var w := new Widget();
     pool.Add(move w);
-    pool.Remove(pool[0]);
+    _ := pool.Remove(pool[0]);
     Console.WriteLine("after remove");
   end Main;
 end Program;

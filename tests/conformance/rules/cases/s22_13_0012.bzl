@@ -7,7 +7,8 @@
 //!   disposal rule.
 //! cites: 22.13, 28.4
 //! expect: run
-//! stdout: second
+//! output: second
+//!   first
 module Conf;
 
 public class Resource

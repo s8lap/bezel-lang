@@ -6,7 +6,7 @@
 //!   exception types should appear first, ahead of a bare `Exception` catch-all.
 //! cites: 31.2.3
 //! expect: run
-//! stdout: retry
+//! output: retry
 module Conf;
 
 public class TimeoutLikeException: Exception

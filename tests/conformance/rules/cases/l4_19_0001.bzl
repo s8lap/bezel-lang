@@ -12,7 +12,7 @@ module Conf;
 
 public class Program
   public static method Main()
-    using var buf := new OwningBuffer<int>(3, lambda(i: int): int => i);
+    var buf := new OwningBuffer<int>(3, lambda(i: int): int => i);
     using var fa := FrozenArray<int>.From(move buf);
     Console.WriteLine(fa[1]);
   end Main;

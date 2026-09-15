@@ -6,7 +6,9 @@
 //!   element.
 //! cites: 4.11, 28.11
 //! expect: run
-//! stdout: widget disposed
+//! output: widget disposed
+//!   widget disposed
+//!   after clear
 module Conf;
 
 public class Widget
@@ -21,6 +23,7 @@ end Widget;
 public class Program
   public static method Main()
     using var queue := new OwningQueue<Widget>();
+    queue.Enqueue(new Widget());
     queue.Enqueue(new Widget());
     queue.Clear();
     Console.WriteLine("after clear");

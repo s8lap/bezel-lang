@@ -2,11 +2,12 @@
 //! doc: spec
 //! section: 22.7
 //! title: a this-chain argument may read the delegating constructor's own parameter
-//! rule: A chain argument may read only the constructor's own parameters,
-//!   constants and statics — never a field of `this`; the chained-to
-//!   constructor runs to completion before control returns to the
-//!   delegating body (§22.8 step 1).
-//! cites: 22.8, 12.8
+//! rule: "The only reads a chaining argument may make are of the
+//!   constructor's own parameters, constants, and statics" (§22.10); and
+//!   "for a `this(...)` chain, the chained-to constructor runs to
+//!   completion (its own steps of this sequence) before control returns
+//!   here" (§22.8 step 1).
+//! cites: 22.8, 22.10, 12.8
 //! expect: run
 //! output: hello
 module Conf;

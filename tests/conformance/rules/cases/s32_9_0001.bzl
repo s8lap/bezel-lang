@@ -9,7 +9,6 @@
 //! expect: accept
 module Conf;
 import System.Interop;
-import System.IO;
 
 extern "libc"
   method open(path: CString, flags: int): int;
@@ -20,7 +19,7 @@ public static class FileOps
     var fd := open(path, 0);
     if fd < 0 then
       var e := Interop.LastErrno();
-      throw new IOException($"open failed: errno={e}");
+      throw new InvalidOperationException($"open failed: errno={e}");
     end;
     return fd;
   end OpenChecked;

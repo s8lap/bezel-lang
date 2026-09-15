@@ -6,7 +6,9 @@
 //!   cascades the same way.
 //! cites: 4.5, 28.11
 //! expect: run
-//! stdout: widget disposed
+//! output: widget disposed
+//!   widget disposed
+//!   after clear
 module Conf;
 
 public class Widget
@@ -21,6 +23,7 @@ end Widget;
 public class Program
   public static method Main()
     using var pool := new OwningArray<Widget>();
+    pool.Add(new Widget());
     pool.Add(new Widget());
     pool.Clear();
     Console.WriteLine("after clear");

@@ -24,7 +24,7 @@ public class Program
     using var w := new Widget();
     using var arr := new Array<Widget>();
     arr.Add(w);
-    arr.Remove(w);
+    _ := arr.Remove(w);
     Console.WriteLine("still alive");
   end Main;
 end Program;

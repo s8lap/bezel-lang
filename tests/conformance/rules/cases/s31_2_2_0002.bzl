@@ -20,7 +20,7 @@ public class Program
     try
       throw new BoomException("x");
     catch
-      BoomException => Console.WriteLine("handled"),
+      BoomException => Console.WriteLine("handled");
     end try;
   end Main;
 end Program;

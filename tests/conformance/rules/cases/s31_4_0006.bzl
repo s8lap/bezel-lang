@@ -8,6 +8,7 @@
 //! cites: 31.4, 31.1
 //! expect: run
 //! stdout: inner
+//! flags: --checked-disposal
 module Conf;
 
 public class CauseException: Exception

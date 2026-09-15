@@ -15,7 +15,7 @@ public class Program
     try
       throw new ArgumentException("boom");
     catch
-      var ex: Exception => Console.WriteLine(ex.SupersededChain.Length),
+      var ex: Exception => Console.WriteLine(ex.SupersededChain.Count),
     end try;
   end Main;
 end Program;

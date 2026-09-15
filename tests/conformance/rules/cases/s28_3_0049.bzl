@@ -2,8 +2,9 @@
 //! doc: spec
 //! section: 28.3
 //! title: a do end block disposes a using var early, before the outer scope continues
-//! rule: To dispose earlier than the method's end, nest a `do … end` block; the block
-//!   ends a scope early and the `using var` is disposed at that end.
+//! rule: A `using var` local is owned and additionally subject to scope-based
+//!   disposal at the end of the enclosing block; a `do … end` block is such a
+//!   block, so the value is disposed at its end, not at the method's.
 //! cites: 28.10
 //! expect: run
 //! output: disposed

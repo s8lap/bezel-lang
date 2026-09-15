@@ -6,12 +6,13 @@
 //!   declaration order.
 //! cites: 22.13
 //! expect: run
-//! stdout: a
+//! output: a
+//!   b
 module Conf;
 
 public class Init
-  private static _a: int := Announce("a");
-  private static _b: int := Announce("b");
+  private static readonly _a: int := Announce("a");
+  private static readonly _b: int := Announce("b");
 
   private static method Announce(name: string): int
     Console.WriteLine(name);

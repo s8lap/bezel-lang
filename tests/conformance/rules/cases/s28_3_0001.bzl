@@ -17,5 +17,8 @@ public class Resource
 end Resource;
 
 public class Picker
-  public static method Pick(a: Resource, b: Resource): Resource => a;
+  // The body supplies no value on any path, so the rejection is the
+  // declaration's alone.
+  public static method Pick(a: Resource, b: Resource): Resource =>
+    throw new InvalidOperationException("unreachable");
 end Picker;

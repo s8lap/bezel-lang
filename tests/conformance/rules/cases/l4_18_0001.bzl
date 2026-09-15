@@ -6,7 +6,9 @@
 //!   iteration in ascending order.
 //! cites: 4.18
 //! expect: run
-//! stdout: 1
+//! output: 1
+//!   2
+//!   3
 module Conf;
 
 public class Program

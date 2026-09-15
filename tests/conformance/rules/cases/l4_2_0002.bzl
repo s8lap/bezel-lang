@@ -6,7 +6,9 @@
 //!   element — the interface-level contract every owning collection shares.
 //! cites: 4.2, 28.11
 //! expect: run
-//! stdout: widget disposed
+//! output: widget disposed
+//!   widget disposed
+//!   after clear
 module Conf;
 
 public class Widget
@@ -27,6 +29,7 @@ end Helpers;
 public class Program
   public static method Main()
     using var pool := new OwningArray<Widget>();
+    pool.Add(new Widget());
     pool.Add(new Widget());
     Helpers.ClearIt(pool);
     Console.WriteLine("after clear");

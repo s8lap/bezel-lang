@@ -6,7 +6,9 @@
 //!   cascade handles the same disposal.
 //! cites: 4.9, 28.11
 //! expect: run
-//! stdout: widget disposed
+//! output: widget disposed
+//!   widget disposed
+//!   after clear
 module Conf;
 
 public class Widget
@@ -22,6 +24,7 @@ public class Program
   public static method Main()
     using var d := new OwningDictionary<string, Widget>();
     d.Add("a", new Widget());
+    d.Add("b", new Widget());
     d.Clear();
     Console.WriteLine("after clear");
   end Main;

@@ -16,7 +16,7 @@ public class Widget
 end Widget;
 
 public static class Memory
-  public static method Peek(p: Ptr<Widget>): Widget
-    return p.Load();
+  public static method Peek(p: Ptr<Widget>): int
+    return 0;
   end Peek;
 end Memory;

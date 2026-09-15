@@ -23,7 +23,7 @@ end Ops;
 public class Program
   public static method Main()
     try
-      Ops.Checked(5, 10, 1);
+      _ := Ops.Checked(5, 10, 1);
     catch
       var ex: ArgumentException => Console.WriteLine("caught"),
     end;

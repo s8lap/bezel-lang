@@ -21,7 +21,7 @@ end Widget;
 public class Program
   public static method Main()
     using var list := new OwningLinkedList<Widget>();
-    list.AddLast(new Widget());
+    _ := list.AddLast(new Widget());
     list.RemoveFirst();
     Console.WriteLine("after removefirst");
   end Main;

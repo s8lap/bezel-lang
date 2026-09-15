@@ -6,7 +6,8 @@
 //!   iteration is insertion-ordered, exactly as Dictionary.
 //! cites: 4.20
 //! expect: run
-//! stdout: b
+//! output: b
+//!   a
 module Conf;
 
 public class Program
