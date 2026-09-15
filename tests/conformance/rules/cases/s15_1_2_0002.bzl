@@ -17,6 +17,6 @@ end Util;
 public class Program
   public static method Main()
     var arr: [3]int := [1, 2, 3];
-    Util.Sum(arr);
+    _ := Util.Sum(arr);
   end Main;
 end Program;

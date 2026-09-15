@@ -7,7 +7,7 @@
 //!   field of every case is transfer-compatible.
 //! cites: 35.12, 30.14
 //! expect: run
-//! stdout: true
+//! stdout: True
 module Conf;
 
 public sealed class Widget

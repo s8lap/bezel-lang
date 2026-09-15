@@ -8,7 +8,8 @@
 //!   subobject's `Dispose()`."
 //! cites: 22.9, 22.8
 //! expect: run
-//! stdout: A disposed
+//! output: A disposed
+//!   caught
 module Conf;
 
 public class A

@@ -8,7 +8,7 @@
 //!   never observable."
 //! cites: 22.9, 22.8
 //! expect: run
-//! stdout: caught
+//! output: caught
 module Conf;
 
 public class Base

@@ -4,10 +4,13 @@
 //! title: whole-value reassignment of an owning inline array disposes the displaced live slot
 //! rule: Whole-value reassignment on a move-only local is drop-on-overwrite
 //!   applied per slot: the RHS is evaluated first, then each live slot of the
-//!   displaced value is disposed, then the new value is stored (§15.3).
+//!   displaced value is disposed, then the new value is stored; the replacement
+//!   is itself auto-disposed at scope end (§15.3, §15.1.1).
 //! cites: 15.3
 //! expect: run
-//! stdout: dispose first
+//! output: dispose first
+//!   done
+//!   dispose second
 module Conf;
 
 public class Connection

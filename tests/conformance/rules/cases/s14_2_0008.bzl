@@ -7,6 +7,7 @@
 //! cites: 14.2
 //! expect: reject
 //! diagnostic: IFoo
+//! issue: 4367
 module Conf;
 
 public interface IFoo

@@ -7,6 +7,7 @@
 //! cites: 14.2
 //! expect: reject
 //! diagnostic: value
+//! issue: 4367
 module Conf;
 
 public class Box<T> where T: value

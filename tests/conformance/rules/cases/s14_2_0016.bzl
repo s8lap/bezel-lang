@@ -7,6 +7,7 @@
 //! cites: 14.2, 30.14
 //! expect: reject
 //! diagnostic: sendable
+//! issue: 4367
 module Conf;
 
 public interface IFoo

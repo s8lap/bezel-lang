@@ -6,7 +6,8 @@
 //!   resizable uses `.Count` (§15.5).
 //! cites: 15.5
 //! expect: run
-//! stdout: 4
+//! output: 4
+//!   0
 module Conf;
 
 public class Program

@@ -8,7 +8,8 @@
 //!   `b` expression first)."
 //! cites: 22.5
 //! expect: run
-//! stdout: B
+//! output: B
+//!   A
 module Conf;
 
 public class Tracker
@@ -22,6 +23,6 @@ end Tracker;
 
 public class Program
   public static method Main()
-    Tracker.Combine(b := Tracker.Next("B"), a := Tracker.Next("A"));
+    _ := Tracker.Combine(b := Tracker.Next("B"), a := Tracker.Next("A"));
   end Main;
 end Program;

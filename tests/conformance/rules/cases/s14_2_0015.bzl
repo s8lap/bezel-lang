@@ -6,6 +6,7 @@
 //!   holds; all primitives are sendable (§14.2, §30.14).
 //! cites: 14.2, 30.14
 //! expect: accept
+//! issue: 4367
 module Conf;
 
 public class Box<T> where T: sendable

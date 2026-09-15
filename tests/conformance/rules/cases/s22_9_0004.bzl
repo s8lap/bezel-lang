@@ -8,7 +8,9 @@
 //!   generated-`Dispose()` path ... before the exception propagates."
 //! cites: 22.9, 22.8
 //! expect: run
-//! stdout: Widget disposed
+//! output: Widget disposed
+//!   A disposed
+//!   caught
 module Conf;
 
 public class A

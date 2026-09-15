@@ -7,7 +7,8 @@
 //!   normally and static initialization is considered successful.
 //! cites: 22.7
 //! expect: run
-//! stdout: caught
+//! output: caught
+//!   True
 module Conf;
 
 public class Config

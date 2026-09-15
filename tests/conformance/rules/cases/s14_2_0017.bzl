@@ -7,6 +7,7 @@
 //!   user equality (§14.2, §3.6).
 //! cites: 14.2, 3.6
 //! expect: accept
+//! issue: 4367
 module Conf;
 
 public class Box<T> where T: hashable

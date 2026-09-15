@@ -7,7 +7,8 @@
 //!   operands have the same active case and every corresponding payload compares
 //!   equal.
 //! expect: run
-//! stdout: true
+//! output: True
+//!   False
 module Conf;
 
 public choice Status

@@ -8,6 +8,7 @@
 //! cites: 14.2, 3.6, 9.2
 //! expect: reject
 //! diagnostic: hashable
+//! issue: 4367
 module Conf;
 
 public record OddRecord

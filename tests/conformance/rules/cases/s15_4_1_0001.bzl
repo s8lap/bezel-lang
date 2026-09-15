@@ -11,7 +11,7 @@
 module Conf;
 
 public class Bag<T>: ICollectionLiteralTarget<Bag<T>, T>
-  private _items: Array<T>;
+  private owned _items: Array<T>;
 
   public constructor(capacity: int)
     _items := new Array<T>(capacity);

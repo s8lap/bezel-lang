@@ -6,6 +6,7 @@
 //!   choices, primitives, inline arrays, the unit type (§14.2).
 //! cites: 14.2
 //! expect: accept
+//! issue: 4367
 module Conf;
 
 public class Box<T> where T: value

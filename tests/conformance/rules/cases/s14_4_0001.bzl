@@ -15,7 +15,7 @@ public class Widget
 end Widget;
 
 public class Holder
-  private _items: Array<owned Widget>;
+  private _items: Array<owned Widget>?;
 
   public constructor()
   end constructor;

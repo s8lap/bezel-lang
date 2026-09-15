@@ -2,24 +2,25 @@
 //! doc: spec
 //! section: 22.7
 //! title: a this-chain argument may not read a field of the not-yet-constructed instance
-//! rule: In the chaining position (`base(...)`/`this(...)` arguments) no
-//!   field of the declaring type is yet assigned, so any observation of
-//!   `this` there is a compile error.
-//! cites: 22.7
+//! rule: A `this(...)` argument may read neither a primary-constructor
+//!   parameter nor any field of `this` — in the chaining position no field
+//!   of the declaring type is yet assigned (§22.8's step-1-before-step-2
+//!   sequence, restated at §22.7's chaining-position clause).
+//! cites: 22.8, 12.8, 7.9
 //! expect: reject
 //! diagnostic: chaining position
 module Conf;
 
-public class Point
-  private _x: int := 1;
-  private _y: int;
+public class Label
+  private _text: string;
+  private _n: int;
 
-  public constructor(x: int, y: int)
-    _x := x;
-    _y := y;
+  public constructor(text: string, n: int)
+    _text := text;
+    _n := n;
   end constructor;
 
   public constructor()
-    this(_x, 0);
+    this(_text, 0);
   end constructor;
-end Point;
+end Label;

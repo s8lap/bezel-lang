@@ -6,6 +6,7 @@
 //!   classes implementing it, directly or by inheritance (§14.2).
 //! cites: 14.2
 //! expect: accept
+//! issue: 4367
 module Conf;
 
 public interface IFoo

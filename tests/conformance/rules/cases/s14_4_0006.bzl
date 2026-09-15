@@ -7,6 +7,7 @@
 //!   independent of the disposal obligation (§14.4).
 //! cites: 14.4
 //! expect: accept
+//! issue: 4367
 module Conf;
 
 public class Widget

@@ -8,6 +8,7 @@
 //! cites: 14.4
 //! expect: reject
 //! diagnostic: class
+//! issue: 4367
 module Conf;
 
 public class Holder

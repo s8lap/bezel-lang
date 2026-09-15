@@ -5,7 +5,8 @@
 //! rule: On a move-only choice, = / <> operands and the Equals(T) parameter bind
 //!   borrows — both operands stay live after the operation.
 //! expect: run
-//! stdout: a still fetched
+//! output: False
+//!   a still fetched
 module Conf;
 
 public class Widget

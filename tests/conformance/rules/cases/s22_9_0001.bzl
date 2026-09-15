@@ -8,7 +8,8 @@
 //!   **never** executed on these edges."
 //! cites: 22.9, 28.4
 //! expect: run
-//! stdout: A disposed
+//! output: A disposed
+//!   caught
 module Conf;
 
 public class A

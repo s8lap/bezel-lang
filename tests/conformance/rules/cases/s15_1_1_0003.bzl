@@ -9,6 +9,7 @@
 //! cites: 15.1.1, 14.2
 //! expect: reject
 //! diagnostic: class or interface
+//! issue: 4367
 module Conf;
 
 public class Pool<T> where T: class
