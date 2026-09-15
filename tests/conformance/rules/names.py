@@ -35,6 +35,7 @@ TYPE_DECL_RE = re.compile(
     r'(?:static\s+|abstract\s+|closed\s+|sealed\s+)*'
     r'(class|interface|record|enum|choice)\s+([A-Za-z_]\w*)')
 ALIAS_RE = re.compile(r'^\s*type\s+([A-Za-z_]\w*)')
+IMPORT_ALIAS_RE = re.compile(r'^\s*import\s+[\w.]+\s+as\s+([A-Za-z_]\w*)\s*;')
 MEMBER_RE = re.compile(
     r'\b(?:method|property|const)\s+(?:operator\s+\S+|([A-Za-z_]\w*))')
 ENUM_CONST_RE = re.compile(r'^\s*([A-Z]\w*)\s*(?:,|;|:=)')
@@ -48,6 +49,14 @@ PRIMITIVES = {
 }
 # Names the language itself provides, outside any stdlib block.
 LANGUAGE = {"Task", "OwningTask", "CancellationToken", "Subscription", "Main"}
+
+# Members the language provides on types that declare them nowhere: Object's
+# virtuals (spec §8), IDisposable's generated Dispose (§28.4), and the members
+# the compiler puts on EVERY enum (§10.4, §5.4, v0.293).
+UNIVERSAL_MEMBERS = {
+    "ToString", "Equals", "GetHashCode", "Dispose",
+    "NameOf", "FromUnderlyingOrNull", "FromNameOrNull",
+}
 
 TYPE_POSITION_RES = (
     re.compile(r':\s*(?:owned\s+|scoped\s+)?\[?\d*\s*(?:owned)?\]?\s*([A-Z]\w*)'),
@@ -94,7 +103,11 @@ def build_index(docs_dir):
                         index[current].add(m.group(1))
                 c = ENUM_CONST_RE.match(line)
                 if c:
-                    index[current].add(c.group(1))
+                    # A constant line lists several: `Low, Medium, High;`
+                    for part in line.split("//")[0].strip(" ;").split(","):
+                        name = part.strip().split(":=")[0].strip()
+                        if re.match(r'^[A-Z]\w*$', name):
+                            index[current].add(name)
     # The exception hierarchy is stated as prose and tables in spec §31.4 rather
     # than as one declaration block, so pick the names up wherever the documents
     # write them in backticks.
@@ -119,6 +132,10 @@ def declared_in(source):
         alias = ALIAS_RE.match(line)
         if alias:
             names.add(alias.group(1))
+    for line in source.split("\n"):
+        alias = IMPORT_ALIAS_RE.match(line)
+        if alias:
+            names.add(alias.group(1))
     for group in GENERIC_PARAM_RE.findall(source):
         for part in group.split(","):
             part = part.strip().replace("in ", "").replace("out ", "").strip()
@@ -127,20 +144,48 @@ def declared_in(source):
     return names
 
 
+STRING_RE = re.compile(r'@?\$?"(?:\\.|""|[^"\\])*"')
+MEMBER_DECL_RE = re.compile(
+    r'\b(?:method|property|const)\s+(?:operator\s+\S+|([A-Za-z_]\w*))')
+
+
+def members_declared_in(source):
+    """Members the case declares for itself — including inside an `extension`
+    block, which is how a case legitimately puts a new member on a documented
+    type. The index cannot know those, so the case's own declarations count."""
+    return {m.group(1) for m in MEMBER_DECL_RE.finditer(source) if m.group(1)}
+
+
 def check_source(source, index):
-    known_types = declared_in(source) | PRIMITIVES | LANGUAGE | set(index)
+    own_types = declared_in(source)
+    known_types = own_types | PRIMITIVES | LANGUAGE | set(index)
+    known_members = UNIVERSAL_MEMBERS | members_declared_in(source)
     unknown_types = set()
     unknown_members = set()
     for line in source.split("\n"):
         code = line.split("//")[0]
+        # A string literal holds prose and format specifiers (`{v:F2}`), not
+        # type names; a module or import line holds a dotted module path.
+        code = STRING_RE.sub('""', code)
+        if re.match(r'\s*(module|import)\b', code):
+            continue
         for rx in TYPE_POSITION_RES:
             for m in rx.finditer(code):
                 name = m.group(1)
-                if name not in known_types:
-                    unknown_types.add(name)
+                if name in known_types:
+                    continue
+                # `method Describe<T>(…)` declares a generic METHOD; the name
+                # before the angle brackets is the member, not a type.
+                if re.search(r'\b(?:method|property|class|record|interface|'
+                             r'choice|enum)\s+' + re.escape(name) + r'\b', code):
+                    continue
+                unknown_types.add(name)
         for m in STATIC_USE_RE.finditer(code):
             owner, member = m.group(1), m.group(2)
-            if owner in index and index[owner] and member not in index[owner]:
+            if owner in index and index[owner] \
+                    and owner not in own_types \
+                    and member not in index[owner] \
+                    and member not in known_members:
                 unknown_members.add(owner + "." + member)
     return sorted(unknown_types), sorted(unknown_members)
 
