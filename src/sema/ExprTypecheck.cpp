@@ -8277,6 +8277,40 @@ bool ExprTC::extConstraintItemProvablyViolated(
         // distinguishes "provably fails" from "can't verify" — only the first
         // is a real violation here (the second must KEEP the candidate, per
         // the soundness direction above).
+        //
+        // fix #4259 (§26.4 / §14.2, v0.300): the `new` arm must DEFER (return
+        // `false`, keep the candidate) on a non-ground `arg` whose OWN
+        // genericArgs name a non-ground element. `groundSatisfiesNew`'s
+        // Record arm (fix #4220, lines 1518-1587) seeds a substitution env
+        // from `arg->genericArgs` and walks `recordStorageMembers` through
+        // it — meaningful ONLY on a ground `arg`. Without this guard, the
+        // Choice arm's `decided = true, return false` and the Class/Record
+        // arms' `decided = true` answers are REPORTED for a non-ground arg
+        // we cannot verify, wrongly EXCLUDING a candidate extension the
+        // sound direction says to KEEP (and the late downstream
+        // `where`-clause checks at §26.4 fire later with better messages
+        // when they can).
+        //
+        // The guard is deliberately narrower than call site 1's
+        // (`leafSolutionViolatesScalarConstraint`'s `violates` lambda, line
+        // 1764) — that predicate's `if (!arg || !isFullyGroundTypeRef(arg))
+        // return false;` also rejects null-declaration `Named` leaves (which
+        // `isFullyGroundTypeRef`'s own header comment marks as non-ground
+        // unconditionally, including builtin interfaces like `IDisposable`).
+        // Those are HANDLED CORRECTLY by `groundSatisfiesNew`'s Categorical
+        // null-decl-interface arm (line 1672, fix #4298) without any
+        // generic-arg dependency — copy-pasting call site 1's guard here
+        // would unground #4298's own §26.4 regression row (3) (the
+        // `Box<IDisposable>` "no extension method" test, tests/sema/
+        // ground_satisfies_new_null_decl_builtin_4298_test.cpp:210). The
+        // narrower check here targets exactly the non-groundness that can
+        // mislead the Record arm's substitution: arg's own genericArgs
+        // naming an unresolved element. A null-decl `Named` leaf with no
+        // genericArgs reaches `groundSatisfiesNew`'s Categorical arm
+        // unchanged.
+        for (const TypeRef* ga : arg->genericArgs) {
+            if (!isFullyGroundTypeRef(ga)) return false;
+        }
         bool decided = false;
         bool ok = groundSatisfiesNew(arg, decided);
         return decided && !ok;
