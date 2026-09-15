@@ -76,7 +76,11 @@ def parse_appendix_c(path):
             group = m.group(1)
             continue
         if line.startswith("- "):
-            refs = sorted(set(SECTION_REF_RE.findall(line)))
+            # `stdlib [§4.14](Bezel_Standard_Library.md#…)` cites the OTHER
+            # document; a bare digit would file it under the spec's §4.14.
+            spec_only = re.sub(r'\[?\u00a7[\d.]+\]?\([^)]*Bezel_Standard_Library[^)]*\)',
+                               ' ', line)
+            refs = sorted(set(SECTION_REF_RE.findall(spec_only)))
             rows.append({"group": group, "text": line[2:].strip(), "refs": refs})
     return rows
 
