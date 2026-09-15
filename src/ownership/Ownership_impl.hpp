@@ -2319,6 +2319,30 @@ private:
         const ast::Stmt& s,
         std::vector<const ast::IdentifierExpr*>& out) const;
 
+    // fix #4271 (§28.3 / §28.6 / §28.7, v0.298): SEED `states_` with entries
+    // from `outerStates` for every LocalSymbol this lambda body CAPTURES
+    // (declared outside the body). The lambda-body pre-pass clears `states_`
+    // on entry so the dataflow it stands in for doesn't leak lambda-local
+    // bookkeeping into the enclosing scope; that clear, however, also
+    // discards the outer-scope state for captured locals, so the
+    // lambda-body AssignmentStmt / .Dispose() arms' `for (auto& [sym, st] :
+    // states_) if (sym->name != tid->name) continue;` and `lookupState(name)`
+    // lookups find NOTHING for them and the bookkeeping (producer-state
+    // adoption, disposeAliasSource clear, becomesOwnedViaReassign flag,
+    // disposeReclaimsReassignedBorrow stamping) silently does not run — a
+    // fresh owned value reassigned to a captured local inside the lambda and
+    // then explicitly `.Dispose()`'d leaks the heap block. Restored to
+    // `outerStates` after the body walk so the enclosing scope's state is
+    // untouched.
+    void seedCapturedOuterLocals(
+        const ast::LambdaExpr& lam,
+        const BlockState& outerStates);
+    // fix #4271: derive the declaration-time `LocalOwnership` of a captured
+    // LocalSymbol from its `LocalDecl` AST and insert into `states_`. See
+    // `seedCapturedOuterLocals`'s declaration for why this runs in the
+    // pre-pass (BEFORE the dataflow populates `outerStates`).
+    void seedCapturedLocalFromDecl(sema::LocalSymbol* ls);
+
     // §9.7 borrow-bearing-record escape (issue #360, D2): a returned
     // expression whose static type is a borrow-bearing record that
     // carries a borrow of a scope-bound (`using var` / owned) local.

@@ -9819,6 +9819,195 @@ void MethodOwnership::checkLambdaTaskFamilyBorrowReturnsExpr(
 // fresh owned/adopt value inside a lambda body still adopts (the predicate
 // stays Borrowed for fresh-owned producers per the #2128 layering), and a
 // borrow RHS pins. // per §28.10 v0.220, #2166
+
+// fix #4271 (§28.3 / §28.6 / §28.7, v0.298): seed `states_` with declaration-
+// time entries for any local the lambda body CAPTURES — a captured local
+// declared OUTSIDE the lambda body must still be tracked inside the body so
+// that (a) a lambda-body reassignment of the captured local to a fresh owned
+// value updates its state (producer-state adoption, disposeAliasSource clear,
+// becomesOwnedViaReassign flag — the same bookkeeping
+// `handleAssignment`/`applyUsingVarBorrowPinInLambdaStmt`'s AssignmentStmt
+// arm runs at method scope), and (b) a following `.Dispose()` in the lambda
+// body reclaims the slot via `markExplicitDisposeReclaimIfReassignedBorrow`.
+// Without this seed, the body's fresh `states_` finds NOTHING for the
+// captured local, the assignment arm's `for (auto& [sym, st] : states_)
+// if (sym->name != tid->name) continue;` loop never matches, none of the
+// bookkeeping runs, and codegen falls back to `unwindOwnedLocalClass(ld)` —
+// which classifies purely from the local's DECLARATION initializer form
+// (here, a borrow-init `var y := x;`) and returns false, leaving the heap
+// block leaked. Measured FAIL-WITHOUT under LSan (16 B / 1 allocation,
+// lam$0 — the `new Res(9)` `y.Dispose()` does not reclaim).
+//
+// The `outerStates` argument is intentionally NOT consulted: this pre-pass
+// runs BEFORE the method-body dataflow, so `outerStates` is empty (it only
+// carries method-scope parameter seeds at this point). Instead, derive the
+// captured local's declaration-time `LocalOwnership` directly from its
+// `LocalDecl` AST — the same `producerState` / `disposeAliasSource` /
+// `implicitDischarge` classification `handleLocalDecl` performs at method
+// scope (Ownership.cpp ~5683-5985), narrowed to the four fields the lambda-
+// body bookkeeping actually reads (`state`, `disposeAliasSource`,
+// `implicitDischarge`, `obligationOrigin`) and without the dataflow-time
+// side effects (`checkRead`, `checkDrainOnTemporary`,
+// `noteMoveOnlyArrayWholeMoveRead`, `checkBareBorrowTempLaunder`) the
+// dataflow will run itself when it walks this same declaration. // per
+// §28.3, §28.6, §28.7, v0.298, #4271
+void MethodOwnership::seedCapturedOuterLocals(
+        const ast::LambdaExpr& lam,
+        const BlockState& outerStates) {
+    (void)outerStates;  // see header — pre-pass runs before the dataflow
+    if (lam.exprBody) {
+        // Expression-bodied lambdas carry no statements to capture locals —
+        // every IdentifierExpr in the body references a captured outer-scope
+        // local (a body-local in an expression-bodied lambda would have to
+        // be a `let`-style binding, which the grammar does not provide).
+        // Still walk for completeness so a future grammar extension (or a
+        // leftover identifier reachable through collectIdentifiersIn's
+        // recurse-into-LambdaExpr arm) is covered.
+        std::vector<const ast::IdentifierExpr*> ids;
+        collectLambdaIdentifiers(lam, ids);
+        for (const auto* id : ids) {
+            sema::Symbol* sym = ctx_.exprSymbol(*id);
+            if (!sym) continue;
+            auto* ls = dynamic_cast<sema::LocalSymbol*>(sym);
+            if (!ls) continue;
+            // For an expression-bodied lambda the body has NO LocalDecl
+            // surface, so any reachable LocalSymbol is captured-from-outer by
+            // construction — no `bodyStmts` check is meaningful.
+            seedCapturedLocalFromDecl(ls);
+        }
+        return;
+    }
+    // Block-bodied lambdas: walk the body to find every reachable Stmt
+    // node — a LocalSymbol whose `decl` is one of these is a BODY-local,
+    // not captured; one whose `decl` is NOT in this set (or is null) is
+    // captured from the enclosing scope. `forEachNestedStmt` reaches
+    // every statement kind via the #3656 single statement grammar.
+    std::unordered_set<const ast::Stmt*> bodyStmts;
+    for (const auto& s : lam.stmts) {
+        if (!s) continue;
+        forEachNestedStmt(*s, [&bodyStmts](const ast::Stmt& cur) {
+            bodyStmts.insert(&cur);
+        });
+    }
+    // Walk the body's identifiers — every reference resolves via sema's
+    // exprSymbol. For each LocalSymbol that is captured (its decl is
+    // outside the body's Stmt set), derive the declaration-time
+    // LocalOwnership from its LocalDecl and seed it into `states_`.
+    // Restricting to LocalSymbol avoids the (rare) `ParameterSymbol`
+    // capture case — parameters do not carry a `LocalOwnership` here;
+    // their classification lives in the dataflow via different predicates
+    // (#2166/#4286 territory).
+    std::vector<const ast::IdentifierExpr*> ids;
+    collectLambdaIdentifiers(lam, ids);
+    for (const auto* id : ids) {
+        sema::Symbol* sym = ctx_.exprSymbol(*id);
+        if (!sym) continue;
+        auto* ls = dynamic_cast<sema::LocalSymbol*>(sym);
+        if (!ls) continue;
+        // A captured local's decl is a Stmt OUTSIDE the lambda body. The
+        // inline `out var x` shape's `decl` is an IdentifierExpr (a call-
+        // arg list position), never a Stmt — also correctly classified as
+        // captured-from-outer. A null `decl` is the conservative case
+        // (treat as captured, skip the seed if there's no decl to derive
+        // from — leaving the prior empty-state behavior intact, never
+        // crashing on null).
+        const bool declInBody =
+            ls->decl &&
+            dynamic_cast<const ast::Stmt*>(ls->decl) &&
+            bodyStmts.count(static_cast<const ast::Stmt*>(ls->decl));
+        if (declInBody) continue;
+        seedCapturedLocalFromDecl(ls);
+    }
+}
+
+// helper for `seedCapturedOuterLocals`: derive the captured local's
+// declaration-time `LocalOwnership` from its `LocalDecl` AST (or skip if
+// the decl is absent / not a `LocalDecl` — the `LocalConstDecl` /
+// for-loop-var / catch-binding / inline-out-var shapes carry their own
+// scope semantics and the lambda-body bookkeeping has no shape-specific
+// gap there, so they fall through unchanged). Mirrors the four fields
+// `handleLocalDecl` sets (`state`, `disposeAliasSource`,
+// `implicitDischarge`, `obligationOrigin`) without the dataflow-time
+// side effects (see `seedCapturedOuterLocals`'s header for the rationale).
+void MethodOwnership::seedCapturedLocalFromDecl(sema::LocalSymbol* ls) {
+    auto* ld = dynamic_cast<const ast::LocalDecl*>(ls->decl);
+    if (!ld) return;
+    // Skip if the local is already seeded (e.g. by a previous iteration
+    // over the same identifier-references list).
+    if (states_.count(ls)) return;
+    LocalOwnership lo;
+    lo.obligationOrigin = ld;
+    // §28.3 binding-position `owned` marker (`var y := owned x;`) — the
+    // SAME divert `handleLocalDecl` (Ownership.cpp ~5762) runs. An owned
+    // marker transfers obligation, so `y` is Owned.
+    if (ld->initializer && ld->initializerHasOwnedMarker) {
+        lo.state = OwnershipState::Owned;
+    } else if (ld->initializer) {
+        // The plain-producer funnel — the SAME `producerState` `handleLocalDecl`
+        // uses (Ownership.cpp ~5779). A `new T(...)` RHS is Owned; a bare-id
+        // read of an Owned-tracked local is also Owned (the bare-id
+        // classifier falls through producerState's many borrow/owned
+        // discriminators); a value-type RHS is Borrowed; etc. The captured
+        // case's most common shape (`var y := x;` — a bare-id read of an
+        // owned-tracked `x`) classifies `y` as Owned here — which is the
+        // spec's K1 row's "borrowed" verdict for the binding (a plain-id
+        // read of an owned source is a BORROW, not an ownership transfer).
+        // That divergence is why we run the `disposeAliasSource` arm below
+        // before falling through — the `producerState` Owned verdict on a
+        // bare-id RHS is the standard "looks-Owned but is actually a borrow"
+        // case `handleLocalDecl` itself documents.
+        lo.state = producerState(*ld->initializer);
+    } else {
+        // No initializer (`var x;` / `var x: T;` plain declaration). Treat
+        // as Uninitialized — the body walk's reassignment will set the
+        // real state.
+        lo.state = OwnershipState::Uninitialized;
+    }
+    // The `using var` borrow-pin classification lives on the LocalDecl's
+    // `isUsing` flag (set by sema); mirror it so a captured `using var`
+    // in a lambda body still carries `implicitDischarge` for the
+    // body-walk's read-check.
+    lo.implicitDischarge = ld->isUsing;
+    // The `disposeAliasSource` twin — the same narrow bare-IDENTIFIER-of-
+    // a-still-Owned-tracked-local test `handleLocalDecl` runs on a plain
+    // local declaration (and the LocalConstDecl arm's #4286 / #4314 /
+    // #4304 extension set, applied here for a captured `var` that
+    // borrows from an outer-scope Owned local — `var y := x;` where `x`
+    // is method-scope Owned, `y` is Borrowed with disposeAliasSource =
+    // x). The captured-from-outer `x` is necessarily an enclosing-frame
+    // symbol (not in this lambda body), so the
+    // `isOwnedTrackedLocalInEnclosingFrame` / `isReassignedOwnedLocalIn-
+    // EnclosingFrame` / `isOwnedParameterInEnclosingFrame` predicates are
+    // the right ones — same predicates the LocalConstDecl arm uses for
+    // its #4286 family.
+    if (ld->initializer) {
+        sema::Symbol* aliasSrc = nullptr;
+        if (auto* rid =
+                dynamic_cast<const ast::IdentifierExpr*>(ld->initializer.get())) {
+            sema::Symbol* rsym = ctx_.exprSymbol(*rid);
+            if (isOwnedTrackedLocal(rsym)) {
+                aliasSrc = rsym;
+            } else if (isOwnedTrackedLocalInEnclosingFrame(rsym)) {
+                aliasSrc = rsym;
+            } else if (isReassignedOwnedLocalInEnclosingFrame(rsym)) {
+                aliasSrc = rsym;
+            } else if (isOwnedParameterInEnclosingFrame(rsym)) {
+                aliasSrc = rsym;
+            }
+        }
+        if (!aliasSrc && exprIsOwnedFieldRead(*ld->initializer))
+            aliasSrc = ctx_.exprSymbol(*ld->initializer);
+        if (aliasSrc) {
+            // The spec's K1 row for `var y := x;` over an Owned-tracked `x`
+            // — `y` is BORROWED with `disposeAliasSource = x`. This is the
+            // override `handleLocalDecl` itself applies for the same shape.
+            lo.state = OwnershipState::Borrowed;
+            lo.disposeAliasSource = aliasSrc;
+        }
+    }
+    states_[ls] = lo;
+}
+
 void MethodOwnership::applyUsingVarBorrowPinInLambdas(
         const std::vector<std::unique_ptr<ast::Stmt>>& body) {
     // Collect every LambdaExpr in the body (collectBodyLambdas already
@@ -9835,8 +10024,21 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdas(
         // decltype saves spelling it out here.
         BlockState savedStates = states_;
         auto savedFieldMovedFrom = fieldMovedFrom_;
+        // fix #4271 (§28.3 / §28.6 / §28.7, v0.298): seed `states_` with the
+        // outer-scope entries for every local this lambda CAPTURES. Runs
+        // AFTER the clear below — the bookkeeping arms in
+        // `applyUsingVarBorrowPinInLambdaStmt` (AssignmentStmt's
+        // `for (auto& [sym, st] : states_) if (sym->name != tid->name)
+        // continue;` loop) and `markExplicitDisposeReclaimIfReassignedBorrow`
+        // (`lookupState(name)`) need the captured local present in
+        // `states_` for the reassignment + `.Dispose()` shape to find its
+        // entry and run producer-state adoption / disposeAliasSource clear /
+        // disposeReclaimsReassignedBorrow stamping — see
+        // `seedCapturedOuterLocals`'s header for the full rationale and the
+        // measured leak signature. // per §28.3, §28.6, §28.7, v0.298, #4271
         states_.clear();
         fieldMovedFrom_.clear();
+        seedCapturedOuterLocals(*lam, savedStates);
         // Walk the lambda's own body. Expression-bodied lambdas carry their
         // body as a single `exprBody`; block-bodied lambdas carry `stmts`.
         // Neither contains a top-level LocalDecl (the lambda is a value, not
@@ -10831,12 +11033,40 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
 // nested-lambda recursion is inlined here so the save/restore is tight
 // (each nested lambda is its own scope). Body walking mirrors the outer
 // `applyUsingVarBorrowPinInLambdas` block/expr-body shape.
+//
+// fix #4271 (§28.3 / §28.6 / §28.7, v0.298): SEED `states_` from the
+// enclosing-scope `savedStates` for every local this nested lambda body
+// CAPTURES — the sibling of the same-named call in
+// `applyUsingVarBorrowPinInLambdas`. A nested lambda's enclosing scope is
+// either the method body (the FIRST-level lambda case, via
+// `applyUsingVarBorrowPinInLambdas`) or an OUTER lambda body mid-walk
+// (this helper's caller). For a captured local declared in the METHOD
+// (and reached only by the outer chain), the FIRST-level seed in
+// `applyUsingVarBorrowPinInLambdas` has already put the entry in the
+// outer-lambda's `states_` — `savedStates` here is that very map, so the
+// seed carries through. For a captured local declared in the OUTER
+// lambda body itself, the outer lambda's own pre-pass is mid-walk; that
+// walk has populated `states_` with the local's declaration-time state
+// (via `handleLocalDecl`'s LocalDecl arm in
+// `applyUsingVarBorrowPinInLambdaStmt`), and that entry is the one
+// `seedCapturedOuterLocals` re-seeds here. // per §28.3, §28.6, §28.7,
+// v0.298, #4271
 void MethodOwnership::applyUsingVarBorrowPinInLambdaBody(
         const ast::LambdaExpr& lam) {
     BlockState savedStates = states_;
     auto savedFieldMovedFrom = fieldMovedFrom_;
+    // See #4271 comment in `applyUsingVarBorrowPinInLambdas` for the full
+    // rationale. The seed runs AFTER the clear so the bookkeeping arms'
+    // state lookups (AssignmentStmt's `for (auto& [sym, st] : states_)`
+    // loop, `markExplicitDisposeReclaimIfReassignedBorrow`'s
+    // `lookupState(name)`) find the captured local present in `states_`
+    // for the reassignment + `.Dispose()` shape to find its entry and run
+    // producer-state adoption / disposeAliasSource clear /
+    // disposeReclaimsReassignedBorrow stamping. // per §28.3, §28.6, §28.7,
+    // v0.298, #4271
     states_.clear();
     fieldMovedFrom_.clear();
+    seedCapturedOuterLocals(lam, savedStates);
     if (lam.exprBody) {
         std::vector<const ast::LambdaExpr*> nestedLambdas;
         collectBodyLambdasExpr(*lam.exprBody, nestedLambdas);
