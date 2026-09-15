@@ -96,6 +96,15 @@ def evaluate(row, compile_rc, compile_log, run_rc, run_out):
         return "fail", conformance._snippet(compile_log, 120, 240)
     if expect == "accept":
         return "pass", ""
+    if expect == "quiet":
+        # Several rules are stated as SUPPRESSIONS — "the warning is suppressed
+        # when the local is declared `using var`, when it is explicitly disposed
+        # or discarded, and when it is moved or returned" (§28.3). `accept`
+        # cannot tell a suppressed warning from an emitted one.
+        if WARNING_RE.search(compile_log or ""):
+            return "fail", "the spec suppresses the diagnostic here, and the " \
+                "compiler emitted one: " + conformance._snippet(compile_log, 90, 200)
+        return "pass", ""
     if expect == "warn":
         # The case compiles AND the compiler says something about it. Which
         # wording is the diagnostic report's business, not the gate's — same

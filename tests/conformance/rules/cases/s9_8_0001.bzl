@@ -1,13 +1,12 @@
 //! case: s9_8_0001
 //! doc: spec
 //! section: 9.8
-//! title: a record with only admissible primitive, string, and enum components is serialization-eligible
+//! title: a record with only admissible primitive and string components is serialization-eligible
 //! rule: A record or enum is serialization-eligible when it satisfies the
 //!   synthesis-eligibility rule; declaring the conformance is the opt-in, and the
 //!   synthesis is automatic when eligible.
 //! expect: accept
 module Conf;
-import System.Serialization;
 
 public record Metric: ISerializable, IDeserializable
   public readonly property Name: string;

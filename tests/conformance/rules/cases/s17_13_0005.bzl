@@ -7,10 +7,14 @@
 //!   obligation once the statement completes."
 //! cites: 17.13, 28.3
 //! expect: run
-//! stdout: disposed
+//! output: disposed
+//!   next
 module Conf;
 
 public class Widget
+  public constructor()
+  end constructor;
+
   destructor
     Console.WriteLine("disposed");
   end destructor;

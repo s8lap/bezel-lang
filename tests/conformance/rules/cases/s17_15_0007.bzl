@@ -4,14 +4,18 @@
 //! title: an owned production undischarged in the atom is disposed at the atom boundary
 //! rule: "an owned production makes its binding a **named unbound owned
 //!   temporary whose boundary is the atom itself**: if still undischarged
-//!   when the atom completes, it is disposed there ... with no must-use
-//!   warning."
+//!   when the atom completes, it is disposed there ... after the body's
+//!   evaluation ... with no must-use warning."
 //! cites: 17.15, 28.3
 //! expect: run
-//! stdout: disposed
+//! output: disposed
+//!   1
 module Conf;
 
 public class Widget
+  public constructor()
+  end constructor;
+
   destructor
     Console.WriteLine("disposed");
   end destructor;

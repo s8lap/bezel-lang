@@ -11,10 +11,7 @@
 module Conf;
 
 public class Worker
-  public constructor()
-  end constructor;
-
-  public async method FailAsync(): Task
+  public static async method FailAsync(): Task
     await Task.Delay(0);
     throw new InvalidOperationException("boom");
   end FailAsync;
@@ -23,7 +20,7 @@ end Worker;
 public class Program
   public static async method Main(): Task
     try
-      await new Worker().FailAsync();
+      await Worker.FailAsync();
     catch
       var ex: InvalidOperationException => Console.WriteLine(ex.Message)
     end try;

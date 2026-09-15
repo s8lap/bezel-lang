@@ -11,5 +11,8 @@ module Conf;
 public record Point(X: int, Y: int);
 
 public class Program
-  public static method Describe(p: Point): int => p.X + p.Y;
+  public static method Describe(): int
+    var p := new Point(3, 4);
+    return p.X + p.Y;
+  end Describe;
 end Program;

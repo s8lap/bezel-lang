@@ -11,10 +11,7 @@
 module Conf;
 
 public class Worker
-  public constructor()
-  end constructor;
-
-  public async method FailFastAsync(): Task
+  public static async method FailFastAsync(): Task
     throw new InvalidOperationException("early");
   end FailFastAsync;
 end Worker;
@@ -22,7 +19,7 @@ end Worker;
 public class Program
   public static async method Main(): Task
     try
-      await new Worker().FailFastAsync();
+      await Worker.FailFastAsync();
     catch
       var ex: InvalidOperationException => Console.WriteLine(ex.Message)
     end try;

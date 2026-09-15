@@ -1,25 +1,24 @@
 //! case: s9_8_0004
 //! doc: spec
 //! section: 9.8
-//! title: serialized optional on a non-defaultable choice component is rejected
+//! title: serialized optional on a non-defaultable enum component is rejected
 //! rule: A serialized optional component whose type is not defaultable is a
 //!   compile error at the conformance declaration; a missing field would have no
 //!   value to supply.
-//! cites: 17.11, 35.10
+//! cites: 17.11
 //! expect: reject
 //! diagnostic: defaultable
 module Conf;
-import System.Serialization;
 
-public choice Flag
-  On,
-  Off;
-end Flag;
+public enum Level
+  Low := 1,
+  High := 2;
+end Level;
 
 public record Setting: ISerializable, IDeserializable
-  public readonly property Mode: Flag serialized optional;
+  public readonly property Mode: Level serialized optional;
 
-  public constructor(mode: Flag)
+  public constructor(mode: Level)
     Mode := mode;
   end constructor;
 end Setting;

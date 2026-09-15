@@ -6,7 +6,7 @@
 //!   boolean negation is `not`."
 //! cites: 17.8
 //! expect: reject
-//! diagnostic: not
+//! diagnostic: prefix
 module Conf;
 
 public class Program

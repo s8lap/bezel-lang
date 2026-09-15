@@ -12,7 +12,6 @@ module Conf;
 
 public class Counter
   public async method BumpAsync(ref n: int): Task
-    n := n + 1;
     await Task.Delay(0);
   end BumpAsync;
 end Counter;

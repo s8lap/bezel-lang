@@ -15,7 +15,7 @@ import System.Threading;
 public class Program
   public static async method ReadAsync(): Task<int>
     using var tcs := new TaskCompletionSource<int>();
-    tcs.TrySetResult(7);
+    tcs.SetResult(7);
     return await tcs.Task;
   end ReadAsync;
 

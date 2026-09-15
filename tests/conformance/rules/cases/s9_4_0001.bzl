@@ -9,8 +9,10 @@ module Conf;
 
 public record Counter
   public property Value: int;
+  public readonly property Name: string;
 
-  public constructor(value: int)
+  public constructor(name: string, value: int)
+    Name := name;
     Value := value;
   end constructor;
 end Counter;

@@ -8,7 +8,6 @@
 //! expect: reject
 //! diagnostic: record-admissible
 module Conf;
-import System.Serialization;
 
 public class Cache
   public constructor()

@@ -27,7 +27,7 @@ end Loader;
 
 public class Program
   public async method LoadAllAsync(): OwningTask<OwningArray<Widget>>
-    var loader := new Loader();
+    using var loader := new Loader();
     var tasks := new OwningArray<OwningTask<Widget>>();
     tasks.Add(loader.LoadAsync());
     return await Task.WhenAll(move tasks);

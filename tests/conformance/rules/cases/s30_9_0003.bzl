@@ -11,10 +11,7 @@
 module Conf;
 
 public class Worker
-  public constructor()
-  end constructor;
-
-  public async method CheckAsync(): Task<bool>
+  public static async method CheckAsync(): Task<bool>
     await Task.Delay(0);
     return true;
   end CheckAsync;
@@ -25,7 +22,7 @@ public class Program
     try
       throw new InvalidOperationException("x");
     catch
-      var ex: InvalidOperationException when await new Worker().CheckAsync() => Console.WriteLine("caught")
+      var ex: InvalidOperationException when await Worker.CheckAsync() => Console.WriteLine("caught")
     end try;
   end RunAsync;
 end Program;

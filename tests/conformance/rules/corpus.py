@@ -47,7 +47,7 @@ KNOWN = REQUIRED + ("cites", "diagnostic", "stdout", "output", "issue", "notes",
 # Compiler switches a case may ask for. An allowlist, not a passthrough: a case
 # is data in a repository, and the runner executes what it says.
 ALLOWED_FLAGS = ("--checked-disposal", "--experimental-scoped-await-bind")
-EXPECTS = ("accept", "reject", "warn", "run")
+EXPECTS = ("accept", "quiet", "reject", "warn", "run")
 DOCS = ("spec", "stdlib")
 
 MANIFEST_COLUMNS = ("case-id", "doc", "section", "expect", "shape",
@@ -198,12 +198,21 @@ def check_case(path, text):
                             .format(stem, key))
 
     body = strip_header(text)
+    # A REJECT case may be about a mismatched label (§1.6 states the rule), so
+    # the check runs only where a typo would make the case fail for the wrong
+    # reason. `corpus.py audit` lists the reject-case hits for a human.
+    if expect != "reject":
+        problems.extend(end_label_problems(stem, body))
+        problems.extend(implicit_constructor_problems(stem, body))
+    if expect == "run" and fields.get("stdout", "").strip() in ("true", "false"):
+        problems.append("{}: a `bool` renders `True`/`False` (§8.5's worked "
+                        "`IsEmpty: False`), not lowercase".format(stem))
     if body.strip() == "":
         problems.append("{}: no source below the header".format(stem))
     shape = shape_of(body)
     if expect == "run" and shape != "program":
         problems.append("{}: a run case needs a `method Main`".format(stem))
-    if expect == "accept" and shape == "program":
+    if expect in ("accept", "quiet") and shape == "program":
         problems.append("{}: this case has a `method Main`, so it can check what it "
                         "prints — use `expect: run` with `stdout:`".format(stem))
     if not re.match(r'^\s*module\s+\w', body):
@@ -245,6 +254,81 @@ def case_entries(cases_dir):
             deps = [n for n in members if n != "main.bzl"]
             entries.append((name, os.path.join(path, "main.bzl"), deps))
     return entries
+
+
+# §1.6: an `end` label that is supplied must match the construct it closes. A
+# mismatched label does not parse — and it is invisible to every other check
+# here, which is how five cases carrying `end Main;` in a class named `Program`
+# with a method named `Run` passed a clean lint. (The rename that produced them
+# was itself made to satisfy the `method Main` shape check, whose regex the
+# `end Main;` does not match. The dodge blinded the check to the typo.)
+_END_LABEL_RE = re.compile(r'^\s*end\s+([A-Za-z_]\w*)\s*;')
+_NAME_DECL_RE = re.compile(
+    r'\b(?:class|record|interface|enum|choice|method|property|extension)\s+'
+    r'([A-Za-z_]\w*)')
+# Labels that name a construct keyword rather than an identifier (§1.6).
+_KEYWORD_LABELS = {"if", "while", "for", "case", "try", "do", "constructor",
+                   "destructor", "extension", "extern", "operator", "lambda"}
+
+
+def end_label_problems(case_id, body):
+    """Every `end X;` whose X names no construct the file declares, and is not a
+    construct keyword or a loop label the file introduces."""
+    names = set(_NAME_DECL_RE.findall(body))
+    # `label: while … end label;` — a loop label is an identifier before a colon.
+    names |= set(re.findall(r'^\s*([A-Za-z_]\w*)\s*:\s*(?:while|for|do)\b',
+                            body, re.MULTILINE))
+    out = []
+    for lineno, line in enumerate(body.split("\n"), 1):
+        m = _END_LABEL_RE.match(line.split("//")[0])
+        if not m:
+            continue
+        label = m.group(1)
+        if label in _KEYWORD_LABELS or label in names:
+            continue
+        out.append("{}: line {}: `end {};` names no construct this file "
+                   "declares (§1.6 — a supplied label must match)"
+                   .format(case_id, lineno, label))
+    return out
+
+
+_CLASS_DECL_RE = re.compile(
+    r'^\s*(?:public\s+|internal\s+|private\s+|protected\s+)?'
+    r'(?:abstract\s+|closed\s+|sealed\s+|static\s+)*class\s+([A-Za-z_]\w*)'
+    r'(?:<[^>]*>)?\s*(\()?', re.MULTILINE)
+_NEW_RE = re.compile(r'\bnew\s+([A-Z]\w*)\s*(?:<[^<>]*>)?\s*\(')
+
+
+def implicit_constructor_problems(case_id, body):
+    """`new C()` where C is declared in this file and declares no constructor.
+
+    AUTHORING rule 3: the spec does not state that a class with no declared
+    constructor has an implicit parameterless one (#4364), so a case that relies
+    on it would be a false divergence the day the corpus runs. Classes the case
+    does NOT declare are the stdlib's and are none of this check's business."""
+    declared, has_ctor = {}, set()
+    current = None
+    for line in body.split("\n"):
+        m = _CLASS_DECL_RE.match(line)
+        if m:
+            current = m.group(1)
+            declared[current] = True
+            if m.group(2):          # a primary constructor
+                has_ctor.add(current)
+            continue
+        if re.match(r'^\s*end\b', line):
+            current = None
+            continue
+        if current and re.search(r'\bconstructor\b', line.split("//")[0]):
+            has_ctor.add(current)
+    out = []
+    for name in sorted(set(_NEW_RE.findall(body))):
+        if name in declared and name not in has_ctor:
+            out.append("{}: `new {}(…)` on a class this file declares with no "
+                       "constructor — declare one (#4364: the spec does not "
+                       "state an implicit parameterless constructor exists)"
+                       .format(case_id, name))
+    return out
 
 
 def load_cases(cases_dir):
@@ -356,7 +440,7 @@ def audit(rows, cases_dir):
     def words(text):
         return set(re.findall(r'[a-z]{3,}', text.lower()))
 
-    orphan_diag, no_cites, long_source, twins = [], [], [], {}
+    orphan_diag, no_cites, long_source, twins, reject_labels = [], [], [], {}, []
     for row in rows:
         if row["expect"] in ("reject", "warn") and row["check"]:
             # The contract says a diagnostic fragment is the RULE's own wording.
@@ -378,6 +462,8 @@ def audit(rows, cases_dir):
             n = len([l for l in body.split("\n") if l.strip()])
             if n > 45:
                 long_source.append((row["case-id"], n))
+            if row["expect"] == "reject":
+                reject_labels.extend(end_label_problems(row["case-id"], body))
 
     print("{} reject/warn cases whose diagnostic shares no word with their rule"
           .format(len(orphan_diag)))
@@ -393,6 +479,10 @@ def audit(rows, cases_dir):
           "is the pairing discipline, not a duplicate)".format(len(dup)))
     for ids in list(dup.values())[:20]:
         print("   " + ", ".join(ids))
+    print("\n{} reject cases carrying an unmatched `end` label — deliberate in a "
+          "case about §1.6, a second ground anywhere else".format(len(reject_labels)))
+    for line in reject_labels[:20]:
+        print("   " + line)
     print("\n{} cases with no `cites:`".format(len(no_cites)))
     print("\n{} cases over 45 non-blank source lines".format(len(long_source)))
     for case_id, n in sorted(long_source, key=lambda t: -t[1])[:15]:

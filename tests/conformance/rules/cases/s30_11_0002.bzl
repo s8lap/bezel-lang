@@ -22,7 +22,7 @@ end Widget;
 public class Program
   public static async method LoadAsync(): OwningTask<Widget>
     using var tcs := new OwningTaskCompletionSource<Widget>();
-    tcs.TrySetResult(new Widget());
+    tcs.SetResult(new Widget());
     return await tcs.Task;
   end LoadAsync;
 

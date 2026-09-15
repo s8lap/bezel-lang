@@ -12,13 +12,16 @@ module Conf;
 public class Program
   private _calls: int := 0;
 
+  public constructor()
+  end constructor;
+
   public method Gen(): IEnumerable<int>
     _calls := _calls + 1;
     yield return 1;
   end Gen;
 
   public static method Main()
-    var p := new Program();
+    using var p := new Program();
     var e := p.Gen();
     using var it1 := e.GetEnumerator();
     _ := it1.MoveNext();

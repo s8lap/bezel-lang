@@ -15,13 +15,7 @@ public class Connection
   end constructor;
 end Connection;
 
-public record Handle
-  public readonly property Conn: Connection;
-
-  public constructor(conn: Connection)
-    Conn := conn;
-  end constructor;
-end Handle;
+public record Handle(Conn: Connection);
 
 public class Program
   public static method Touch()

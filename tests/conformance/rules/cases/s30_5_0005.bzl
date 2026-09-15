@@ -2,9 +2,9 @@
 //! doc: spec
 //! section: 30.5
 //! title: discarding a Task with the bare discard statement is rejected
-//! rule: `_ := someTask` and `using var _ := someTask;` are **rejected** for
-//!   the `Task` family — use `Task.FireAndForget(t)`, or a *named* `using
-//!   var t := ...`.
+//! rule: The only discards that remain errors are `Task`/`Task<T>` (use
+//!   `Task.FireAndForget`, since disposing a task abandons a running
+//!   operation — a semantic, not a leak, concern).
 //! cites: 30.5, 17.13
 //! expect: reject
 //! diagnostic: discard

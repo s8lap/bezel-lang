@@ -16,7 +16,7 @@ import System.Threading;
 public class Program
   public static method GetTask(): Task<int>
     using var tcs := new TaskCompletionSource<int>();
-    tcs.TrySetResult(1);
+    tcs.SetResult(1);
     return tcs.Task;
   end GetTask;
 end Program;

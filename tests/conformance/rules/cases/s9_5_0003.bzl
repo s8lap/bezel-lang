@@ -5,7 +5,7 @@
 //! rule: The source expression must be record-typed; a with expression whose
 //!   source is class-typed is a compile error naming this rule, the retired
 //!   object-initializer reading.
-//! cites: 22.11
+//! cites: 22.11, 28.3
 //! expect: reject
 //! diagnostic: record-typed
 module Conf;
@@ -19,5 +19,5 @@ public class Widget
 end Widget;
 
 public class Program
-  public static method Rename(w: Widget): Widget => w with(Label := "x");
+  public static method Renamed(w: Widget): string => (w with(Label := "x")).Label;
 end Program;

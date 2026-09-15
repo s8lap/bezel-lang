@@ -6,7 +6,7 @@
 //!   non-class T ...; calling it with a class-typed T is a compile error.
 //! cites: 30.5, 30.10
 //! expect: reject
-//! diagnostic: class
+//! diagnostic: non-class
 module Conf;
 
 public class Widget

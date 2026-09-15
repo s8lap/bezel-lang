@@ -8,7 +8,7 @@
 //!   value must outlive the expression."
 //! cites: 17.15, 28.3
 //! expect: reject
-//! diagnostic: outlive
+//! diagnostic: escape the atom
 module Conf;
 
 public class Widget

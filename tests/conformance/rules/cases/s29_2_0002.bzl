@@ -2,9 +2,11 @@
 //! doc: spec
 //! section: 29.2
 //! title: the for variable over string-typed elements is a shared reference
-//! rule: What the `for` variable is, decided by the static type of the
-//!   source: `string`- or function-typed elements are a shared reference.
-//! cites: 29.2
+//! rule: The `for` desugaring binds `var x := __enumerator.Current;`, and for a
+//!   shared-reference slot — a runtime-managed element type such as `string` —
+//!   the element operation *indexer-get / default iteration* is "reference
+//!   out" (§28.11's element slot policy); no ownership transfers.
+//! cites: 29.2, 28.11, 28.9
 //! expect: run
 //! stdout: 5
 module Conf;

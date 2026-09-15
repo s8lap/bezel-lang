@@ -14,18 +14,19 @@ public class Resource: IAsyncDisposable
   public constructor()
   end constructor;
 
+  public method Touch()
+  end Touch;
+
   public async method DisposeAsync(): Task
     await Task.Delay(0);
   end DisposeAsync;
 end Resource;
 
 public class Reader
-  public constructor()
-  end constructor;
-
-  public async method StreamAsync(): owned IAsyncEnumerable<int>
+  public static async method StreamAsync(): owned IAsyncEnumerable<int>
     await using var r := new Resource();
     yield return 1;
+    r.Touch();
     yield return 2;
   end StreamAsync;
 end Reader;

@@ -232,6 +232,35 @@ end Program;
 """
 
 
+class TestQuietTier(unittest.TestCase):
+    """A rule stated as a SUPPRESSION needs an expectation `accept` cannot give:
+    §28.3's warning is suppressed by `using var`, by an explicit dispose or
+    discard, and by a move or a return."""
+
+    def row(self):
+        return {"case-id": "s28_3_0100", "expect": "quiet", "check": "",
+                "shape": "lib", "title": "t", "issue": "", "section": "28.3"}
+
+    def test_a_silent_compile_passes(self):
+        self.assertEqual(runner.evaluate(self.row(), 0, "", None, "")[0], "pass")
+
+    def test_any_diagnostic_fails(self):
+        v, detail = runner.evaluate(self.row(), 0,
+                                    "warning: value of 'r' must be used", None, "")
+        self.assertEqual(v, "fail")
+        self.assertIn("suppresses", detail)
+
+    def test_a_rejected_compile_fails(self):
+        self.assertEqual(runner.evaluate(self.row(), 1, "error", None, "")[0],
+                         "fail")
+
+    def test_quiet_carries_no_diagnostic_field(self):
+        text = ACCEPT.replace("//! expect: accept",
+                              "//! expect: quiet\n//! diagnostic: x")
+        self.assertTrue(any("only on a reject or warn case" in p for p in
+                            corpus.check_case("s28_5_0001.bzl", text)[1]))
+
+
 class TestWarnTier(unittest.TestCase):
     def test_warn_needs_a_diagnostic(self):
         text = WARN.replace("//! diagnostic: must use\n", "")
@@ -466,6 +495,75 @@ class TestDirectoryCases(unittest.TestCase):
             row, bezelc, os.path.join(self.base, "cases"), self.base, run=fake)
         self.assertEqual(verdict, "fail")
         self.assertIn("dependency lib.bzl did not compile", detail)
+
+
+class TestStructuralLints(unittest.TestCase):
+    """Three checks that each earned their place by catching a real defect."""
+
+    def problems(self, text, stem="s28_5_0001"):
+        return corpus.check_case(stem + ".bzl", text)[1]
+
+    def test_an_end_label_naming_nothing_is_caught(self):
+        # Five cases carried `end Main;` in a class named Program with a method
+        # named Run. None of them parsed; nothing else here could see it.
+        text = ACCEPT.replace("end C;", "end Main;")
+        self.assertTrue(any("names no construct" in p for p in self.problems(text)))
+
+    def test_a_reject_case_may_be_about_a_mismatched_label(self):
+        text = REJECT.replace("end Holder;", "end Wrong;")
+        self.assertFalse(any("names no construct" in p for p in
+                             corpus.check_case("s28_5_0002.bzl", text)[1]))
+
+    def test_a_keyword_label_and_a_loop_label_are_both_fine(self):
+        text = ACCEPT.replace("public class C\nend C;",
+                              "public class C\n"
+                              "  public method M()\n"
+                              "    scan: while false do\n"
+                              "    end scan;\n"
+                              "  end M;\n"
+                              "end C;")
+        self.assertEqual([p for p in self.problems(text)
+                          if "names no construct" in p], [])
+
+    def test_new_on_a_declared_class_with_no_constructor_is_caught(self):
+        text = ACCEPT.replace(
+            "public class C\nend C;",
+            "public class C\nend C;\n\n"
+            "public class Program\n"
+            "  public static method Main()\n"
+            "    using var c := new C();\n"
+            "  end Main;\n"
+            "end Program;").replace("//! expect: accept",
+                                    "//! expect: run\n//! stdout: x")
+        self.assertTrue(any("#4364" in p for p in self.problems(text)))
+
+    def test_a_primary_constructor_counts(self):
+        text = ACCEPT.replace(
+            "public class C\nend C;",
+            "public class C(n: int)\nend C;\n\n"
+            "public class Program\n"
+            "  public static method Main()\n"
+            "    using var c := new C(1);\n"
+            "  end Main;\n"
+            "end Program;").replace("//! expect: accept",
+                                    "//! expect: run\n//! stdout: x")
+        self.assertEqual([p for p in self.problems(text) if "#4364" in p], [])
+
+    def test_new_on_an_undeclared_stdlib_class_is_not_this_checks_business(self):
+        text = ACCEPT.replace(
+            "public class C\nend C;",
+            "public class Program\n"
+            "  public static method Main()\n"
+            "    using var a := new Array<int>();\n"
+            "  end Main;\n"
+            "end Program;").replace("//! expect: accept",
+                                    "//! expect: run\n//! stdout: x")
+        self.assertEqual([p for p in self.problems(text) if "#4364" in p], [])
+
+    def test_a_lowercase_bool_expectation_is_caught(self):
+        text = RUN.replace("//! stdout: [null]", "//! stdout: true")
+        self.assertTrue(any("True`/`False" in p for p in
+                            corpus.check_case("s18_5_0001.bzl", text)[1]))
 
 
 class TestManifest(unittest.TestCase):

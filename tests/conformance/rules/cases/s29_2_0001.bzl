@@ -2,10 +2,12 @@
 //! doc: spec
 //! section: 29.2
 //! title: the for variable over value-typed elements is a copy
-//! rule: What the `for` variable is, decided by the static type of the
-//!   source: value elements (`Array<int>`, a range, a string's chars) are a
-//!   copy.
-//! cites: 29.2
+//! rule: The `for` desugaring binds `var x := __enumerator.Current;`, and for a
+//!   copy slot — a value-typed element of a borrowing collection — the element
+//!   operation *indexer-get / default iteration* is "copy out" (§28.11's
+//!   element slot policy), so writing to the loop variable does not reach the
+//!   collection.
+//! cites: 29.2, 28.11
 //! expect: run
 //! stdout: 6
 module Conf;

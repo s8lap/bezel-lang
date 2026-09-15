@@ -11,6 +11,9 @@
 module Conf;
 
 public class Coords
+  public constructor()
+  end constructor;
+
   public property [i: int]: int => (case i of
     0 => 10,
     1 => 20,

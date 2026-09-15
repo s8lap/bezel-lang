@@ -23,6 +23,7 @@ implementation is worse than no case, because it teaches the wrong rule.
 |---|---|---|
 | `accept` | the file compiles as a library (`bezelc -c`) | — |
 | `reject` | the compiler rejects it, per a stated rule | `diagnostic:` |
+| `quiet` | it compiles, and the compiler says **nothing** | — |
 | `warn` | it compiles, and the compiler warns | `diagnostic:` |
 | `run` | the file has a `method Main`, compiles, runs, and prints | `stdout:` or `output:` |
 
@@ -35,6 +36,18 @@ local, the fresh-store warning on a borrowing collection, the use-after-dispose
 warning, the terminal-accessor provenance warning. Those are normative and an
 `accept` case cannot tell them from silence. A `warn` case passes when the
 compile succeeds *and* says something; which wording is reported, not gated.
+
+`quiet` is `accept`'s sharper sibling, for a rule stated as a **suppression**.
+§28.3 has several — "the warning is suppressed when the local is declared
+`using var`, when it is explicitly disposed or discarded, and when it is moved
+or returned" — and `accept` cannot tell a suppressed warning from an emitted
+one, so a case about a suppression written as `accept` proves nothing. `quiet`
+fails if the compiler emits any diagnostic at all.
+
+Beware the confound in the other direction: §28.9 makes a class with no
+destructor and no `owned` field **trivial-dispose**, which suppresses the
+must-use warning by itself. A `warn` case about discharge must give its class a
+destructor, or it is asking for a diagnostic the spec does not require.
 
 `run` is for rules with observable behaviour — evaluation order, disposal order,
 overflow, formatting, what an interpolation hole renders, what a `case` selects.
@@ -227,6 +240,12 @@ For every case, in your head or on paper:
   this file? (The usual culprits: an undischarged owned local, a static method
   returning a class type, a missing visibility keyword, a borrow that outlives
   its source.)
+- **Does my scaffolding contain a line that is illegal only if the rule
+  fails?** The recurring shape is a trailing `x.Dispose();` after the construct
+  under test: inert while the rule holds, and the *actual* reason for rejection
+  the day the rule is missing — which is precisely when the case is meant to
+  fail. Two critique passes found it four times. Delete such a line; the case is
+  stronger without it.
 - **Is my scaffolding fighting me?** When the rule under test is not about
   ownership, scaffold with a runtime-managed type — `string`, a primitive, a
   record — rather than a class. A class-typed local carries an ownership

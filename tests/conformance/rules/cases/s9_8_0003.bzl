@@ -7,7 +7,6 @@
 //!   error, so the remedy uses a nullable class-typed field.
 //! expect: accept
 module Conf;
-import System.Serialization;
 
 public class Cache
   public constructor()

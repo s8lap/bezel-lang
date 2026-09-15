@@ -3,7 +3,7 @@
 //! section: 9.9
 //! title: a constructor-only record does not satisfy where T colon new()
 //! rule: Port at a where T: new() substitution is also rejected.
-//! cites: 14.2, 17.11
+//! cites: 14.2, 17.11, 28.3
 //! expect: reject
 //! diagnostic: constructor-only
 module Conf;
@@ -19,7 +19,7 @@ public record Port
 end Port;
 
 public class Factory
-  public static method Make<T>(): T where T: new() => new T();
+  public static method Make<T>(): owned T where T: new() => new T();
 end Factory;
 
 public class Program

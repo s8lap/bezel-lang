@@ -36,7 +36,7 @@ end Trio;
 
 public class Program
   public static method Main()
-    var source := new Trio();
+    using var source := new Trio();
     using var e := source.GetEnumerator();
     _ := e.MoveNext();
     Console.WriteLine(e.Current);

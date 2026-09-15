@@ -8,12 +8,16 @@
 //!   use-after-dispose regime of §28.2."
 //! cites: 17.13, 28.2, 28.3
 //! expect: warn
-//! diagnostic: used
+//! diagnostic: disposed
 module Conf;
 
 public class Widget
   public constructor()
   end constructor;
+
+  destructor
+    Console.WriteLine("closed");
+  end destructor;
 end Widget;
 
 public class Program

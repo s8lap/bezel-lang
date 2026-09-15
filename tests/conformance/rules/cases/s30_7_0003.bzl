@@ -10,10 +10,7 @@
 module Conf;
 
 public class Reader
-  public constructor()
-  end constructor;
-
-  public async method NumbersAsync(): owned IAsyncEnumerable<int>
+  public static async method NumbersAsync(): owned IAsyncEnumerable<int>
     await Task.Delay(0);
     yield return 1;
   end NumbersAsync;
@@ -21,7 +18,7 @@ end Reader;
 
 public class Program
   public async method RunAsync(token: CancellationToken): Task
-    await for var n in new Reader().NumbersAsync() with token do
+    await for var n in Reader.NumbersAsync() with token do
       Console.WriteLine(n);
     end;
   end RunAsync;

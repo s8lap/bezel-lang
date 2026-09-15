@@ -3,41 +3,50 @@
 //! section: 29.1
 //! title: IEnumerator.Current is non-destructive across repeated reads
 //! rule: `IEnumerator<T>.Current` is non-destructive: it returns a borrow of
-//!   the most-recently-yielded value ... Multiple reads between `MoveNext`
-//!   calls produce additional borrows of the same value.
-//! cites: 29.1
+//!   the most-recently-yielded value, which the enumerator continues to own.
+//!   Multiple reads between `MoveNext` calls produce additional borrows of the
+//!   same value.
+//! cites: 29.1, 23.5
 //! expect: run
-//! stdout: 0-0
+//! output: a-a
+//!   disposed
 module Conf;
 
-public class TrioEnumerator: IEnumerator<int>
-  private _i: int := -1;
+public class Item
+  public readonly property Name: string;
+
+  public constructor(name: string)
+    Name := name;
+  end constructor;
+
+  destructor
+    Console.WriteLine("disposed");
+  end destructor;
+end Item;
+
+public class OneEnumerator: IEnumerator<Item>
+  private owned _item: Item;
+  private _done: bool := false;
 
   public constructor()
+    _item := new Item("a");
   end constructor;
 
   public method MoveNext(): bool
-    _i := _i + 1;
-    return _i < 3;
+    if _done then
+      return false;
+    end;
+    _done := true;
+    return true;
   end MoveNext;
 
-  public property Current: int => _i;
-end TrioEnumerator;
-
-public class Trio: IEnumerable<int>
-  public constructor()
-  end constructor;
-
-  public method GetEnumerator(): owned IEnumerator<int>
-    return new TrioEnumerator();
-  end GetEnumerator;
-end Trio;
+  public property Current: Item => _item;
+end OneEnumerator;
 
 public class Program
   public static method Main()
-    var source := new Trio();
-    using var e := source.GetEnumerator();
+    using var e := new OneEnumerator();
     _ := e.MoveNext();
-    Console.WriteLine($"{e.Current}-{e.Current}");
+    Console.WriteLine($"{e.Current.Name}-{e.Current.Name}");
   end Main;
 end Program;

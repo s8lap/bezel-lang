@@ -12,13 +12,13 @@ module Conf;
 public class Widget
   public constructor()
   end constructor;
+
+  public method Touch()
+  end Touch;
 end Widget;
 
 public class Factory
-  public constructor()
-  end constructor;
-
-  public async method MakeAllAsync(): owned IOwningAsyncEnumerable<Widget>
+  public static async method MakeAllAsync(): owned IOwningAsyncEnumerable<Widget>
     await Task.Delay(0);
     yield return new Widget();
   end MakeAllAsync;
@@ -26,8 +26,9 @@ end Factory;
 
 public class Program
   public async method ProcessAllAsync(): Task
-    await for var w in new Factory().MakeAllAsync() do
+    await for var w in Factory.MakeAllAsync() do
       using var taken := move w;
+      taken.Touch();
     end;
   end ProcessAllAsync;
 end Program;

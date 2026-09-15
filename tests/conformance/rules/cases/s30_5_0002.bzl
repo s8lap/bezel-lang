@@ -15,7 +15,7 @@ public class Widget
 end Widget;
 
 public class Loader
-  public async method LoadAsync(): Task<Widget>
+  public static async method LoadAsync(): Task<Widget>
     await Task.Delay(0);
     return new Widget();
   end LoadAsync;
