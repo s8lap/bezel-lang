@@ -854,7 +854,7 @@ _rc_log="$LOGDIR/${TAG}_rule_corpus.log"
 # Exact-not-a-ceiling, as the deprecated-JIT-oracle baseline is: the floor is
 # the harness's current test count, so headroom cannot accumulate unbanked. It
 # only ever moves up — a lane that deletes a test lowers it deliberately.
-_rc_floor=116
+_rc_floor=122
 if ! python3 -m unittest discover -s tests/conformance/rules -v \
       > "$_rc_log" 2>&1; then
   say "CYCLE FAILURE: the rule-corpus harness self-tests failed — the ratchet"

@@ -92,10 +92,20 @@ def parse_appendix_c(path):
             group = m.group(1)
             continue
         if line.startswith("- "):
-            # `stdlib [§4.14](Bezel_Standard_Library.md#…)` cites the OTHER
-            # document; a bare digit would file it under the spec's §4.14.
-            spec_only = re.sub(r'\[?\u00a7[\d.]+\]?\([^)]*Bezel_Standard_Library[^)]*\)',
-                               ' ', line)
+            # A citation to the OTHER document must not be filed under the
+            # spec. Appendix C writes those two ways and both have to go:
+            #   `stdlib [§4.14](Bezel_Standard_Library.md#…)` — linked, and
+            #   `(stdlib §1)`                                   — bare.
+            # Only the linked form was scrubbed, so the three bare ones in
+            # Appendix C filed themselves under spec §1 and §6.5. §1 is a
+            # *container* — no text of its own — so it then showed up as a gap
+            # with two invariants and no cases, permanently, and lanes kept
+            # going to look at it. The bare form has to be stripped first:
+            # scrubbing the link form leaves the word `stdlib` orphaned.
+            spec_only = re.sub(r'stdlib\s+\u00a7[\d.]+', ' ', line)
+            spec_only = re.sub(
+                r'\[?\u00a7[\d.]+\]?\([^)]*Bezel_Standard_Library[^)]*\)',
+                ' ', spec_only)
             refs = sorted(set(SECTION_REF_RE.findall(spec_only)))
             rows.append({"group": group, "text": line[2:].strip(), "refs": refs})
     return rows
@@ -217,7 +227,12 @@ def state_of(density, c_rows, counts, container=False, ack=None):
     if want == 0 and counts["cases"] == 0:
         return "n/a"
     if ack and counts["cases"] == 0:
-        return "covered-elsewhere"
+        # An empty `covered-by` is the third honest answer: the rule is real and
+        # uncovered, and no case can reach it through this harness (a rule about
+        # two *versions* of one module, or one the runner never asks the
+        # compiler for). Distinct from covered-elsewhere, which claims a case
+        # exists, and from UNCOVERED, which says go and write one.
+        return "covered-elsewhere" if ack["covered-by"].strip() else "out-of-reach"
     if counts["cases"] == 0:
         return "UNCOVERED"
     if counts["cases"] < max(1, want // 4):
@@ -338,14 +353,20 @@ def main(argv, base_dir=None):
               .format(len(orphans), ", ".join(o["section"] for o in orphans)))
 
     acked = [r for r in rows if r["state"] == "covered-elsewhere"]
-    if acked:
-        print("{} sections covered-elsewhere (see coverage_acks.tsv)"
-              .format(len(acked)))
+    out_of_reach = [r for r in rows if r["state"] == "out-of-reach"]
+    if acked or out_of_reach:
+        print("{} sections covered-elsewhere, {} out-of-reach "
+              "(see coverage_acks.tsv)".format(len(acked), len(out_of_reach)))
 
     if args.gaps:
         if acked:
             print("\nCovered elsewhere, by claim:")
             for row in acked:
+                print("  {:<6} {:<9} {}".format(
+                    row["doc"], row["section"], row["title"][:60]))
+        if out_of_reach:
+            print("\nOut of reach of this harness:")
+            for row in out_of_reach:
                 print("  {:<6} {:<9} {}".format(
                     row["doc"], row["section"], row["title"][:60]))
         print("\nUncovered, densest first:")

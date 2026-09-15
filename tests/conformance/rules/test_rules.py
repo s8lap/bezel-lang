@@ -947,10 +947,64 @@ class TestCoverageStates(unittest.TestCase):
             coverage.state_of(2, 1, self.EMPTY, ack={"covered-by": "s1_1_0001"}),
             "covered-elsewhere")
 
+    def test_an_ack_with_no_case_named_is_out_of_reach(self):
+        # The third honest answer: real, uncovered, and unreachable through this
+        # harness. Not the same claim as covered-elsewhere.
+        self.assertEqual(
+            coverage.state_of(2, 1, self.EMPTY, ack={"covered-by": "  "}),
+            "out-of-reach")
+
     def test_an_ack_does_not_override_a_real_case_count(self):
         self.assertEqual(
             coverage.state_of(2, 1, self.ONE, ack={"covered-by": "s1_1_0001"}),
             "covered")
+
+
+class TestAppendixCAttribution(unittest.TestCase):
+    """A citation to the stdlib must not be filed under the spec. Appendix C
+    writes them two ways and only the linked one was being scrubbed, so three
+    bare `(stdlib \u00a7N)` citations filed themselves under spec \u00a71 and \u00a76.5.
+    \u00a71 is a container with no text of its own, so it then sat in the gap list
+    forever with two invariants and no cases, and lanes kept going to look."""
+
+    def parse(self, body):
+        d = tempfile.mkdtemp()
+        path = os.path.join(d, "spec.md")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("## Appendix C\n\n### C.1 Group\n\n" + body + "\n\n## D\n")
+        return coverage.parse_appendix_c(path)
+
+    def test_a_bare_stdlib_citation_is_not_filed_under_the_spec(self):
+        rows = self.parse("- A rule about \u00a728.3 (stdlib \u00a71).")
+        self.assertEqual(rows[0]["refs"], ["28.3"])
+
+    def test_a_linked_stdlib_citation_is_not_filed_under_the_spec(self):
+        rows = self.parse(
+            "- A rule about \u00a728.3, stdlib "
+            "[\u00a74.14](Bezel_Standard_Library.md#sec-spans).")
+        self.assertEqual(rows[0]["refs"], ["28.3"])
+
+    def test_both_forms_in_one_row(self):
+        rows = self.parse(
+            "- \u00a722.12 rule 5; stdlib \u00a76.5; stdlib "
+            "[\u00a74.1](Bezel_Standard_Library.md#x).")
+        self.assertEqual(rows[0]["refs"], ["22.12"])
+
+    def test_an_ordinary_spec_citation_still_lands(self):
+        rows = self.parse("- \u00a79.2 and \u00a79.7 both say so.")
+        self.assertEqual(rows[0]["refs"], ["9.2", "9.7"])
+
+    def test_the_committed_appendix_c_files_nothing_under_a_container(self):
+        # \u00a71 and \u00a75 have no text of their own; an invariant cannot cite them.
+        base = os.path.dirname(os.path.abspath(__file__))
+        repo = os.path.dirname(os.path.dirname(os.path.dirname(base)))
+        rows = coverage.parse_appendix_c(
+            os.path.join(repo, "docs", "Bezel_Language_Spec.md"))
+        self.assertGreater(len(rows), 100)
+        for section in ("1", "5"):
+            citing = [r for r in rows if section in r["refs"]]
+            self.assertEqual(citing, [], "\u00a7{} cited by {}".format(
+                section, [r["group"] for r in citing]))
 
 
 class TestCoverageAcks(unittest.TestCase):
