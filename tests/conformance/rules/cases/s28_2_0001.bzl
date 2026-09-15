@@ -6,10 +6,10 @@
 //!   performs the disposal; subsequent calls are no-ops. That no-op carve-out
 //!   states the **runtime** contract of a repeated call and suppresses no
 //!   diagnostic — a second `Dispose()` on the same binding is a use of it and
-//!   draws §28.2's use-after-dispose warning, which this case observes only as
-//!   a compile that succeeds (the corpus has no runs-and-warns tier).
+//!   draws §28.2's use-after-dispose warning.
 //! cites: 28.2, 28.4
 //! expect: run
+//! warns: yes
 //! output: disposed
 module Conf;
 

@@ -263,6 +263,63 @@ class TestQuietTier(unittest.TestCase):
                             corpus.check_case("s28_5_0001.bzl", text)[1]))
 
 
+class TestRunAndWarnsTier(unittest.TestCase):
+    """`warns:` on a run case. Two rules have halves only one program shows —
+    §28.2's second `Dispose()` is a runtime no-op AND draws the compile-time
+    use-after-dispose warning (v0.299, #4399). `warn` throws away the runtime
+    observation, `run` cannot see the diagnostic, and two cases would duplicate
+    the program and let the halves drift apart."""
+
+    ROW = {"expect": "run", "check": "disposed", "warns": "yes"}
+
+    def test_a_run_case_with_warns_needs_the_diagnostic(self):
+        verdict, detail = runner.evaluate(
+            dict(self.ROW), 0, "", 0, "disposed\n")
+        self.assertEqual(verdict, "fail")
+        self.assertIn("warning", detail)
+
+    def test_it_passes_when_both_halves_hold(self):
+        verdict, _ = runner.evaluate(
+            dict(self.ROW), 0, "x.bzl:3: warning: use after dispose",
+            0, "disposed\n")
+        self.assertEqual(verdict, "pass")
+
+    def test_the_output_is_still_checked(self):
+        # The diagnostic must not become a way to pass without running right.
+        verdict, _ = runner.evaluate(
+            dict(self.ROW), 0, "x.bzl:3: warning: use after dispose",
+            0, "something else\n")
+        self.assertEqual(verdict, "fail")
+
+    def test_a_run_case_without_warns_tolerates_a_diagnostic(self):
+        row = {"expect": "run", "check": "disposed"}
+        verdict, _ = runner.evaluate(
+            row, 0, "x.bzl:3: warning: use after dispose", 0, "disposed\n")
+        self.assertEqual(verdict, "pass")
+
+    def test_warns_is_rejected_on_any_other_tier(self):
+        for tier in ("accept", "reject", "warn", "quiet"):
+            header = ("//! case: s1_1_0001\n//! doc: spec\n//! section: 1.1\n"
+                      "//! title: t\n//! rule: r\n//! expect: {}\n"
+                      "//! warns: yes\n".format(tier))
+            if tier in ("reject", "warn"):
+                header += "//! diagnostic: d\n"
+            _, problems = corpus.check_case(
+                "s1_1_0001.bzl", header + "module Conf;\n\npublic class C\nend C;\n")
+            self.assertTrue(any("`warns:` belongs only on a run case" in p
+                                for p in problems), tier)
+
+    def test_warns_takes_yes_or_nothing(self):
+        header = ("//! case: s1_1_0001\n//! doc: spec\n//! section: 1.1\n"
+                  "//! title: t\n//! rule: r\n//! expect: run\n"
+                  "//! warns: maybe\n//! stdout: x\n")
+        _, problems = corpus.check_case(
+            "s1_1_0001.bzl",
+            header + "module Conf;\n\npublic class P\n"
+            "  public static method Main()\n  end Main;\nend P;\n")
+        self.assertTrue(any("takes `yes` or nothing" in p for p in problems))
+
+
 class TestWarnTier(unittest.TestCase):
     def test_warn_needs_a_diagnostic(self):
         text = WARN.replace("//! diagnostic: must use\n", "")

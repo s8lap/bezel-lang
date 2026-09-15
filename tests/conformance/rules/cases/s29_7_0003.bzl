@@ -8,10 +8,10 @@
 //!   `Dispose()` **is** observable and is a no-op: it is the single member
 //!   §28.2's disposal contract keeps callable. The no-op is the runtime
 //!   contract only: the second call is also a use of the binding and draws
-//!   §28.2's use-after-dispose warning, which a `run` case tolerates (the
-//!   corpus has no runs-and-warns tier).
+//!   §28.2's use-after-dispose warning.
 //! cites: 29.7, 28.2
 //! expect: run
+//! warns: yes
 //! output: cleanup
 //!   done
 module Conf;

@@ -113,7 +113,18 @@ def evaluate(row, compile_rc, compile_log, run_rc, run_out):
             return "pass", ""
         return "fail", "compiled silently; the spec requires a warning here"
 
-    # expect: run
+    # expect: run — optionally ALSO asserting a diagnostic.
+    #
+    # Some rules have two halves that only one program shows: §28.2's second
+    # `Dispose()` is a runtime no-op AND draws the compile-time use-after-
+    # dispose warning (v0.299, #4399). `warn` throws away the runtime
+    # observation; `run` cannot see the diagnostic; two cases would duplicate
+    # the program and let the halves drift apart. A `run` case carrying
+    # `warns:` asserts both.
+    if row.get("warns"):
+        if not WARNING_RE.search(compile_log or ""):
+            return "fail", "compiled silently; the spec requires a warning " \
+                "here as well as the stated output"
     if run_rc is None:
         return "fail", "no runnable artifact was produced"
     if run_rc == 124:
