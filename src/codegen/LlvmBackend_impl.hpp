@@ -257,9 +257,37 @@ inline bool calleeReturnMayAliasStringArgUnretained(
                 return false;
             }
             const auto* ts = static_cast<const sema::TypeSymbol*>(t->declaration);
+            // fix #4422 / §9.7 / §28.9 (v0.300): for a generic choice,
+            // the case payload types are not yet substituted (the substitution
+            // happens at the concrete call site); a bare type parameter in a
+            // payload can never be String, so a generic choice can never have a
+            // direct string field in its payloads.  Guard mirrors
+            // choiceHasStringFields (LlvmBackend_Disposal.cpp) for consistency.
+            if (t->declaration->kind == ast::TypeDeclKind::Choice &&
+                !ts->genericParams.empty()) {
+                return false;
+            }
             for (const sema::Symbol* mem : ts->members) {
                 const auto* fs = dynamic_cast<const sema::FieldSymbol*>(mem);
-                if (!fs) continue;
+                if (!fs) {
+                    // fix #4422: Choice case payloads are ChoiceCaseSymbol, not
+                    // FieldSymbol.  Walk the case's payload for string params.
+                    const auto* cc =
+                        dynamic_cast<const sema::ChoiceCaseSymbol*>(mem);
+                    if (cc && cc->caseDecl) {
+                        for (const ast::Param& pf : cc->caseDecl->payload) {
+                            if (!pf.type) continue;
+                            if (auto* tr = ctx.resolvedType(*pf.type)) {
+                                if (tr->kind == sema::TypeRef::Kind::Primitive &&
+                                    tr->primitive ==
+                                        sema::PrimitiveType::String) {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
                 // Positional parameter (record positional field): type is in posParam
                 if (fs->posParam && fs->posParam->type) {
                     if (auto* tr = ctx.resolvedType(*fs->posParam->type)) {

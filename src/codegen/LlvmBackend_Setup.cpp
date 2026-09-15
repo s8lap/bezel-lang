@@ -14765,24 +14765,6 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
         dynamic_cast<const ast::CallExpr*>(init)) {
         recordCallResultInitOutermostClassWithRecordField_ = true;
     }
-    // fix #4239 (§27.5 / §28.9, v0.300): for a chain-call initializer
-    // (`var w := C.Make()()`), the CG60 arm in lowerCallExpr needs w's
-    // OWN slot so that scope-end disposal registration targets the right storage.
-    // Allocate the slot EARLY (before lowerExpr runs) and wire it to the CG60
-    // arm via pendingChainCallLocalSlot_. Only for CallExpr initializers —
-    // other expressions don't use pendingChainCallLocalSlot_ and must not be
-    // affected. Guard with !locals_.count(declNode) to avoid overriding a
-    // slot already set by smStateStruct_ handling.
-    if (!locals_.count(declNode) && dynamic_cast<const ast::CallExpr*>(init)) {
-        llvm::Type* slotTy = ptrTy();
-        llvm::AllocaInst* earlySlot = entryAlloca(slotTy);
-        locals_[declNode] = earlySlot;
-        pendingChainCallLocalSlot_ = earlySlot;
-    }
-    // fix #4239: also capture whatever slot will be used (may be set by
-    // smStateStruct_ block below). Must happen AFTER early slot assignment
-    // above but BEFORE lowerExpr, so the CG60 arm sees the slot.
-    pendingChainCallLocalSlot_ = locals_[declNode];
     llvm::Value* v = init ? lowerExpr(*init) : nullptr;
     expectedFunctionType_ = savedExpectedForLambdaDecl;
     // fix #4342: restore the flags (saved above) so a subsequent LocalDecl
@@ -15382,8 +15364,6 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
     }
     if (!slot) slot = entryAlloca(slotTy);
     locals_[declNode] = slot;
-    // fix #4239: update to the final slot (after smStateStruct_ reassignment)
-    pendingChainCallLocalSlot_ = slot;
     // CG-generic: record the concrete substitution for this local so that
     // method calls on it (e.g. sp2.GetFirst()) can recover the concrete type
     // args even when the sema type is still generic. Prefer the active
@@ -15816,13 +15796,8 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
     // fix #4261 (§28.3, v0.298): for a lambda-typed local, lowerExpr just called
     // lowerLambda which saved/restored closureReleaseEligible_ (returning it to
     // the outer function's state — empty). The closure arm below needs declNode in
-    // closureReleaseEligible_ to fire. Add it here, after lowerExpr returns,
-    // but ONLY if the escape walk did NOT exclude this local (a reassignment
-    // marks it escaped — lowerClosureLocalReassign's own release already handles
-    // the displaced value, and the scope-end release must NOT fire or it
-    // double-frees alongside the fix #4422 call-site release).
-    if (dynamic_cast<const ast::LambdaExpr*>(init) &&
-        closureReleaseEligible_.count(static_cast<const void*>(declNode)))
+    // closureReleaseEligible_ to fire. Add it here, after lowerExpr returns.
+    if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(init))
         closureReleaseEligible_.insert(static_cast<const void*>(declNode));
     // #422 / #429 / §27.5 / §28.9: if this `var` closure (function-typed) local
     // was proven non-escaping and initialized by a +1 closure producer (a lambda
@@ -16770,23 +16745,6 @@ void Emitter::consumeLastLambdaCapturedCells() {
                     Disposal dcd{ce.newSlot, nullptr};
                     dcd.boxedCellFreeDeferred = true;
                     dcd.skipCellFreeOnUnwind = ce.unwindUnsafe;  // fix #2334
-                    // fix #4165 (§27.5/§28.9, stdlib §4.8, v0.295): if this
-                    // captured local is a string-keyed DictionaryEntry, also set
-                    // dictEntryKeyReleaseDeferred so the SECOND PASS emits the
-                    // key release before the cell free.
-                    // LOCALDECL-DEBT: #4165 — capture key is `const void*`; `const` locals cannot reach this arm.
-                    if (auto* ld = dynamic_cast<const ast::LocalDecl*>(
-                            static_cast<const ast::Node*>(ce.key))) {
-                        if (locals_.count(static_cast<const ast::Node*>(ce.key))) {
-                            const sema::TypeRef* rt =
-                                ld->type ? ctx_.resolvedType(*ld->type)
-                                         : (ld->initializer
-                                                ? ctx_.exprType(*ld->initializer)
-                                                : nullptr);
-                            if (rt && isDictEntryStringKeyTypeRef(rt))
-                                dcd.dictEntryKeyReleaseDeferred = true;
-                        }
-                    }
                     disposeStack_[ownerScopeIdx].push_back(dcd);
                 }
             }
@@ -16881,34 +16839,7 @@ void Emitter::consumeLastLambdaCapturedCells() {
         Disposal dc{ce.newSlot, nullptr};
         dc.boxedCellFree = true;
         dc.skipCellFreeOnUnwind = ce.unwindUnsafe;  // fix #2334
-        // fix #4165 (§27.5/§28.9, stdlib §4.8, v0.295): if this captured
-                        // local is a string-keyed `DictionaryEntry<string,V>` (bound to
-                        // d.First()/...), the local's rebuilt Key's single producer
-                        // +1 was never discharged — the normal-scope dictEntryKeyRelease
-                        // disposal was not registered (StringEscapeWalker treats ANY
-                        // capture as an escape), and the envdtor path requires
-                        // definitelyEscapingLambdas_ so it does not fire for a
-                        // non-escaping closure. Set dictEntryKeyReleaseDeferred: in
-                        // emitDisposals's SECOND PASS, emit the same GEP field 0 +
-                        // bz_string_release as dictEntryKeyRelease before the cell free.
-                        // singleCaptureLocals_ means exactly one holder and exactly
-                        // one +1 to balance — the same safety case as #4127's envdtor
-                        // path. dictEntryForVarSlot stores the original local's
-                        // struct alloca for the GEP.
-                        // LOCALDECL-DEBT: #4165 — twin of FIRST-PASS arm; same `const`-local-unreachability rationale.
-                        if (auto* ld = dynamic_cast<const ast::LocalDecl*>(
-                                static_cast<const ast::Node*>(ce.key))) {
-                            if (locals_.count(static_cast<const ast::Node*>(ce.key))) {
-                                const sema::TypeRef* rt =
-                                    ld->type ? ctx_.resolvedType(*ld->type)
-                                             : (ld->initializer
-                                                    ? ctx_.exprType(*ld->initializer)
-                                                    : nullptr);
-                                if (rt && isDictEntryStringKeyTypeRef(rt))
-                                    dc.dictEntryKeyReleaseDeferred = true;
-                            }
-                        }
-                        disposeStack_.back().push_back(dc);
+        disposeStack_.back().push_back(dc);
         // #782: a captured move-only OWNING inline-array's elements live in the
         // boxed cell. Dispose each non-null element THROUGH the cell, then null
         // the slot — pushed AFTER boxedCellFree so it fires BEFORE it (reverse
@@ -28706,7 +28637,6 @@ void Emitter::collectRecordCallResultReleaseEligible(
         std::function<void(const ast::Stmt*, int)> walkAll =
             [&](const ast::Stmt* s, int depth) {
             if (!s) return;
-            // LOCALDECL-DEBT: #4307 — `const` locals have no `init` slot, so depth-recorder skips them.
             if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s)) {
                 if (noInitDecls.count(s) || noInitClassDecls.count(s))
                     declDepthAtDecl[s] = depth;
