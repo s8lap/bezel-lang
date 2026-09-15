@@ -616,6 +616,22 @@ public:
     // bound to a borrow-carrying field is a temporary (not a named place). Keeps
     // long-lived-borrow construction (`var xs := […]; new Bag(xs)`) legal.
     void checkRecordFromTemporary(const ast::NewExpr& ne);
+    // fix #4344 (§9.7 / §28.3, v0.298): the `with(name := value, …)` non-
+    // destructive-update sibling of `checkRecordFromTemporary`. Same rule, same
+    // reject, but the `WithExpr::assigns` list is name-keyed (`InitAssign{name,
+    // value}`), so each override is matched to its borrow-carrying field by
+    // walking the source record's `members` and matching `name` (not by
+    // positional indexing as `NewExpr::args` does). The sema phase already
+    // validated every `InitAssign.name` against the source record's declared
+    // members (ExprTypecheck_Exprs.cpp:10843-10872), so an unresolvable name
+    // is impossible here. The predicate deliberately OMITS the inline-array
+    // arm of `fieldTypeIsBorrowCarrying`: an inline-array-of-references
+    // literal moves its elements into the new record at the `with(...)`
+    // boundary (the record OWNS the elements), so there is no §9.7 violation
+    // there — see `checkRecordWithFromTemporary`'s implementation comment
+    // for the asymmetry rationale and #4330's
+    // `positional_field_conforming_accepted_control` test pin.
+    void checkRecordWithFromTemporary(const ast::WithExpr& we);
     // True when `ft` is a borrow-carrying field type (a class/interface
     // reference — including the BUILTIN heap collections Array/Dictionary/… that
     // carry no user TypeDecl — an inline array of references, or a transitively

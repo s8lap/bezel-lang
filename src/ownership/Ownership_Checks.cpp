@@ -12744,6 +12744,97 @@ void MethodOwnership::checkRecordFromTemporary(const ast::NewExpr& ne) {
     }
 }
 
+// fix #4344 (§9.7 / §28.3, v0.298): the `with(name := value, …)` non-
+// destructive-update sibling of `checkRecordFromTemporary`. The rule is
+// identical ("a borrow-bearing record may not be constructed from a
+// temporary bound to one of its borrow-carrying fields"), but `WithExpr`
+// carries its overrides as a NAME-keyed list (`InitAssign{name, value}`),
+// not as the positional `NewExpr::args` `checkRecordFromTemporary` walks.
+// Each `InitAssign` is matched to its borrow-carrying field by walking
+// `name`-keyed against the source record's `members` (sema has already
+// validated every `InitAssign.name` against the source record's declared
+// members — ExprTypecheck_Exprs.cpp:10843-10872 — so an unresolvable name
+// is impossible here; a null field symbol means the source's record type
+// did not resolve, which is a no-op for this check).
+//
+// Predicate: reuses `fieldTypeIsBorrowCarrying` from
+// `checkRecordFromTemporary` for the borrow-classification logic
+// (LANE_RULES §6 — "the fastest way to comply is to reuse what already
+// classifies the predicate"). EXCEPT that the inline-array arm is
+// omitted: for an inline-array field like `[1]IHolder`, the literal's
+// elements are STORED INLINE in the array slot and MOVE into the new
+// record's inline-array field at the `with(...)` boundary — the new
+// record OWNS the elements rather than borrowing them, so there is no
+// dangling-borrow hazard at scope end. The `new Record(<inline-array-
+// literal>)` twin (`checkRecordFromTemporary`) is over-eager on this
+// exact shape, but updating that twin to match is a separate concern
+// outside this lane's file fence; this twin is deliberately the minimum
+// change that closes the documented #4344 gap without regressing #4330's
+// `positional_field_conforming_accepted_control` test (which uses
+// `[1]IHolder` with `[new Widget3Ok(s)]` and is accepted by the spec on
+// the inline-array-move semantics).
+//
+// Reuses `exprIsTemporary` unchanged — same non-place predicate the
+// positional twin uses. The §9.7 null-source carve-out (`NullLiteralExpr`
+// is not a temporary store site — the field is null, no dangling borrow)
+// mirrors the positional twin.
+//
+// One diagnostic per `with(...)` mirrors `checkRecordFromTemporary`'s
+// one-per-construction ceiling: a single offender is reported cleanly
+// even when several overrides are temporary. // per §9.7, §28.3, #4344.
+void MethodOwnership::checkRecordWithFromTemporary(const ast::WithExpr& we) {
+    if (!we.source) return;
+    // Resolve the source's static type. For a record `r with(...)`, this
+    // is the record's type. Sema has already rejected class-typed
+    // (`ExprTypecheck_Exprs.cpp:10815-10841`) and enum-typed sources, so
+    // reading `declaration` is safe here.
+    const sema::TypeRef* rt = ctx_.exprType(*we.source);
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || !rt->declaration)
+        return;
+    const sema::TypeSymbol* ts = rt->declaration;
+    if (ts->kind != ast::TypeDeclKind::Record) return;
+    // `we.assigns` is name-keyed; build a one-shot name→symbol lookup
+    // over the source record's members. A `Symbol` whose `name` matches
+    // is the field the override binds to (sema has enforced uniqueness
+    // and visible-member access at ExprTypecheck_Exprs.cpp:10853-10962,
+    // so a duplicate-name or non-existent-name case is already filtered).
+    for (const auto& ia : we.assigns) {
+        if (!ia.value) continue;
+        const sema::Symbol* f = nullptr;
+        for (sema::Symbol* m : ts->members) {
+            if (m && m->name == ia.name) { f = m; break; }
+        }
+        if (!f) continue;  // unresolved (sema error path)
+        const sema::TypeRef* ft = sema::storageComponentType(f, ctx_);
+        if (!ft) continue;
+        // INLINE-ARRAY CARVE-OUT (see header). Inline arrays of references
+        // move their elements into the new record at the `with(...)`
+        // boundary, so the borrow's source is owned by the record — no
+        // §9.7 violation. The `new Record(<inline-array-literal>)` twin
+        // is over-eager on this shape but is left alone here (different
+        // file fence, different lane).
+        if (ft->kind == sema::TypeRef::Kind::InlineArray) continue;
+        if (!fieldTypeIsBorrowCarrying(ft)) continue;
+        if (!exprIsTemporary(*ia.value)) continue;
+        // §9.7 null-source form: a `null` argument stores no borrow (the
+        // field is null), so it is not a dangling borrow and is
+        // explicitly permitted — mirrors the positional arm's null-
+        // literal carve-out at line 12677 above.
+        if (dynamic_cast<const ast::NullLiteralExpr*>(ia.value.get())) continue;
+        report(
+            Severity::Error, we.span.begin,
+            std::string("a borrow-bearing record may not be constructed from a "
+                        "temporary bound to its borrow-carrying field `") +
+            std::string(f->name) +
+            "` via `with(...)` — the temporary's lifetime ends at this "
+            "`with(...)` expression, so the record would immediately outlive "
+            "that borrow's source (a dangling borrow); bind the source to a "
+            "named local whose scope outlives the record and pass that "
+            "(§9.7 / §28.3 borrow-lifetime rule, #4344)");
+        return;  // one diagnostic per `with(...)` is enough
+    }
+}
+
 // §28.11 (issue #780): an owning inline-array slot `a[i]`. See the header for
 // the contract.
 bool MethodOwnership::targetIsOwningInlineArraySlot(

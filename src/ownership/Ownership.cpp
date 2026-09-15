@@ -5752,10 +5752,19 @@ void MethodOwnership::handleLocalDecl(const ast::LocalDecl& ld,
     // dangling borrow. Checked before the lsym early-return so it runs for a
     // value-typed (record) binding too, matching the handleReturn/handleAssignment
     // hooks for the other binding contexts.
-    if (ld.initializer)
+    if (ld.initializer) {
         if (const auto* ne =
                 dynamic_cast<const ast::NewExpr*>(ld.initializer.get()))
             checkRecordFromTemporary(*ne);
+        // fix #4344 (§9.7 / §28.3, v0.298): the `with(...)` non-destructive-
+        // update sibling of the `new Record(...)` check above. Same rule,
+        // same call-site family — a borrow-bearing record built from a
+        // temporary bound to one of its borrow-carrying fields. Pairs with
+        // the matching arms in handleAssignment and handleReturn below.
+        if (const auto* we =
+                dynamic_cast<const ast::WithExpr*>(ld.initializer.get()))
+            checkRecordWithFromTemporary(*we);
+    }
     // Find the LocalSymbol that ExprTypecheck created for this decl.
     sema::LocalSymbol* lsym = findLocalSymbol(ld);
     if (!lsym) return;
@@ -7038,6 +7047,12 @@ void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
     // from a temporary is a dangling borrow.
     if (const auto* ne = dynamic_cast<const ast::NewExpr*>(as.value.get()))
         checkRecordFromTemporary(*ne);
+    // fix #4344 (§9.7 / §28.3, v0.298): the `with(...)` sibling — `x := r
+    // with(...)` / `this.f := r with(...)` from a temporary bound to a
+    // borrow-carrying field is a dangling borrow. Mirrors the local-decl
+    // and return arms exactly.
+    if (const auto* we = dynamic_cast<const ast::WithExpr*>(as.value.get()))
+        checkRecordWithFromTemporary(*we);
     // §28.3 (#386 cases 1+2): storing a borrow of an owned scope-bound local
     // into a field of an object, or writing it through an out/ref parameter,
     // lets the borrow outlive the local (use-after-dispose). Run AFTER
@@ -8041,6 +8056,12 @@ void MethodOwnership::handleReturn(const ast::Expr& e) {
     // dangling borrow exactly as a local-decl initializer is.
     if (const auto* ne = dynamic_cast<const ast::NewExpr*>(&e))
         checkRecordFromTemporary(*ne);
+    // fix #4344 (§9.7 / §28.3, v0.298): the `with(...)` sibling of the
+    // `new Record(...)` check above — `return r with(...)` carries the same
+    // risk when an override value is a temporary bound to a borrow-carrying
+    // field. Mirrors handleLocalDecl's arm exactly.
+    if (const auto* we = dynamic_cast<const ast::WithExpr*>(&e))
+        checkRecordWithFromTemporary(*we);
     checkIndirectEscapeOnReturn(e);       // §28.9/§9.7 indirect-via-local
     // §28.3 *Bare-type-parameter returns* (v0.194, #1801 S3): `return
     // Identity(new C());` launders a fresh owned temporary out through the borrow
