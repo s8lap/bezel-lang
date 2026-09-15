@@ -41,6 +41,31 @@ overflow, formatting, what an interpolation hole renders, what a `case` selects.
 Prefer `run` whenever the rule says what something *does*, not merely that it is
 admitted: an `accept` case proves only that nothing was rejected.
 
+### What a `run` case may assume about rendering
+
+A `run` case compares the **first line of standard output**, so its expected text
+must come from the documents, never from intuition about how a runtime formats
+things. What the documents actually pin:
+
+| Value | Renders as | Where |
+|---|---|---|
+| `bool` | `True` / `False` | §8.5's worked `IsEmpty: False` |
+| `double`, `float` (no format spec) | the **shortest** string that parses back to the identical value — so `10.0` is `10` | stdlib §2.18's round-trip guarantee |
+| a null hole in an interpolated string | the four characters `null`, with no dispatch | §18.5, §8.5 |
+| a class with no `ToString` override | the **qualified** name (`App.Billing.Account`) | §8.5 |
+| a positional record | `Point(X: 10, Y: 20)` — unqualified head | §8.5, §9.1 |
+| a body record that is auto-hashable | `TypeName(Prop1: v1, Prop2: v2)` over its auto-properties | §8.5, §9.2 |
+| a body record that is **not** auto-hashable, and an enum | the qualified type name — *not* the case name | §8.5, §10.5 |
+| an inline array, the unit value | `[3]int`, `()` | §8.5 |
+| `{x:F2}`, `{x:X}`, `{x:P1}` | stdlib §2.18's table, invariant culture, no grouping separators | stdlib §2.18 |
+
+An `int` prints its digits. A `decimal`'s no-format rendering is not pinned by
+either document — prefer an `int` when the case does not need a decimal, and say
+so in your report if you had to assume one.
+
+If you cannot pin the exact first line from the documents, the case is an
+`accept` case, or prints something derived that you *can* pin. Do not guess.
+
 ## The pairing rule
 
 **A reject case wants an accepting twin that differs by the smallest legal
