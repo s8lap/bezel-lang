@@ -3188,61 +3188,144 @@ void Emitter::emitOwningChoiceActiveCaseDisposal(
     auto* sw = builder_.CreateSwitch(
         tag, joinBB, static_cast<unsigned>(cases.size()));
     // Walk every case in declaration order, building one switch arm per
-    // case that has at least one owned payload field.
+    // case that has at least one owning payload field (an `owned`-marked
+    // payload whose instantiated type is a class/interface, or a payload
+    // whose type is itself an owning choice / move-only value type —
+    // §35.4 "and, recursively, any move-only payloads").
     for (std::size_t i = 0; i < cases.size(); ++i) {
         const sema::ChoiceCaseSymbol* cc = cases[i];
         if (!cc || !cc->caseDecl) continue;
-        // §28.1 + §35.4: only `owned`-marked payload fields are owning slots;
-        // plain (unmarked) class payloads are borrows (the borrow-bearing
-        // classification), value payloads are value-typed (no dispose), and
-        // strings are runtime-managed. Walk the AST payload list, collect
-        // indices of owned fields, and emit one dispose site per owned
-        // field, in payload declaration order (§35.4 "in payload
-        // declaration order").
-        std::vector<unsigned> ownedFieldIdxs;
+        // fix #4132 / §35.4 (v0.300, "and, recursively, any move-only
+        // payloads"): collect indices of every OWNING payload — either an
+        // explicit `owned` payload whose instantiated type is a class/interface
+        // (the vtable Dispose path below) OR a payload whose declared type is
+        // itself an owning choice (the recursive per-tag disposal path). The
+        // pre-#4132 walk only saw the `owned` marker, so a non-`owned` field
+        // whose type was itself an owning choice (the rule-1b classification
+        // trigger, `y: D<Widget>` in `Outer.B(y: D<Widget>)`) was silently
+        // skipped — the case emitted zero owning fields, the switch arm was
+        // omitted entirely, and the nested owning choice's own `owned` payload
+        // was never disposed. The kind discriminator drives the disposal arm
+        // below.
+        std::vector<unsigned> owningFieldIdxs;
+        std::vector<bool> fieldIsOwningChoice;
         for (std::size_t j = 0; j < cc->caseDecl->payload.size(); ++j) {
             const ast::Param& pf = cc->caseDecl->payload[j];
-            if (pf.modifier != "owned") continue;
+            const sema::TypeRef* ftInst = common::substitutedChoicePayloadType(
+                pf, choiceDecl, choiceRef, ctx_);
+            // §35.4 rule 1a: `owned` + class/interface → vtable disposal.
             // §28.1 per-instantiation erasure (#2047): an `owned` field whose
             // instantiated type is value-like or runtime-managed (e.g.
             // `Error(owned error: string)` at `Result<C, string>`) does NOT
             // participate in vtable disposal — disposing it would dispatch a
-            // Dispose through a non-object payload. Only fields whose
-            // instantiated type is an owning heap reference are disposed.
-            const sema::TypeRef* ftInst = common::substitutedChoicePayloadType(
-                pf, choiceDecl, choiceRef, ctx_);
-            if (!common::ownedMarkerActiveOnInstantiatedType(ftInst, ctx_))
+            // Dispose through a non-object payload.
+            if (pf.modifier == "owned") {
+                if (common::ownedMarkerActiveOnInstantiatedType(ftInst, ctx_)) {
+                    owningFieldIdxs.push_back(static_cast<unsigned>(j));
+                    // `owned f: D<Widget>` — `owned` is admitted-but-redundant
+                    // (§28.1) on an owning choice; route to the recursive path
+                    // since the field IS the owning choice (not a class ref).
+                    bool isChoice = ftInst && ftInst->kind ==
+                        sema::TypeRef::Kind::Named && ftInst->declaration &&
+                        ftInst->declaration->kind == ast::TypeDeclKind::Choice;
+                    fieldIsOwningChoice.push_back(isChoice);
+                }
                 continue;
-            ownedFieldIdxs.push_back(static_cast<unsigned>(j));
+            }
+            // §35.4 rule 1b: a non-`owned` payload whose TYPE is itself a
+            // move-only value type (an owning inline array or — the issue's
+            // shape — an owning choice) owns heap objects transitively and
+            // must be disposed. Same kind test isMoveOnlyValueType uses
+            // (OwnershipFacts.cpp:1840, #3775): owning choice or owning inline
+            // array. Inline-array payload disposal is not yet wired (filed
+            // separately); the recursive disposal is identical to a class
+            // payload's — a temp alloca holding the choice struct, then the
+            // recursive per-tag switch.
+            const char* mvKind = nullptr;
+            if (ftInst && common::isMoveOnlyValueType(ftInst, ctx_, mvKind)) {
+                bool isChoice = ftInst->kind == sema::TypeRef::Kind::Named &&
+                    ftInst->declaration &&
+                    ftInst->declaration->kind == ast::TypeDeclKind::Choice;
+                if (isChoice) {
+                    owningFieldIdxs.push_back(static_cast<unsigned>(j));
+                    fieldIsOwningChoice.push_back(true);
+                }
+                // Owning inline array in choice payload: deferred (#4132
+                // covers the choice-in-choice case; a future issue tracks the
+                // inline-array variant).
+            }
         }
-        if (ownedFieldIdxs.empty()) continue;  // nothing to dispose — switch
-                                               // arm collapses to join.
+        if (owningFieldIdxs.empty()) continue;  // nothing to dispose — switch
+                                                // arm collapses to join.
         auto* armBB =
             llvm::BasicBlock::Create(llvm_, "ocd.arm", currentFn_);
         sw->addCase(
             llvm::ConstantInt::get(llvm::Type::getInt32Ty(llvm_), i), armBB);
         builder_.SetInsertPoint(armBB);
         // GEP into the case's payload slot (field 1+i) and load the
-        // payload struct value, then extract each owned field and dispose.
+        // payload struct value, then extract each owning field and dispose.
         llvm::Value* casePayload = builder_.CreateExtractValue(
             choiceVal, {1 + (unsigned)i}, "ocd.case.payload");
-        for (unsigned j : ownedFieldIdxs) {
-            llvm::Value* ownedPtr = builder_.CreateExtractValue(
+        for (std::size_t k = 0; k < owningFieldIdxs.size(); ++k) {
+            unsigned j = owningFieldIdxs[k];
+            bool isChoice = fieldIsOwningChoice[k];
+            const ast::Param& pf = cc->caseDecl->payload[j];
+            const sema::TypeRef* ftInst = common::substitutedChoicePayloadType(
+                pf, choiceDecl, choiceRef, ctx_);
+            llvm::Value* fieldVal = builder_.CreateExtractValue(
                 casePayload, {j}, "ocd.owned.field");
+            if (isChoice) {
+                // fix #4132 / §35.4 rule 1b: the nested choice's per-tag
+                // disposal needs an AllocaInst slot to read the value from;
+                // the field is a struct value embedded in casePayload, so
+                // alloca a fresh slot of the choice struct's specialized
+                // type, store the value, and recurse. The temp slot is dead
+                // the moment the recursive disposal completes (no live
+                // alias — the recursive switch reads the tag fresh each
+                // pass), so no NULLing is needed across re-entry.
+                //
+                // §14.1 / §28.1 (#2047): under an OUTER substitution (this
+                // emit's own RecordSubstGuard installed the OUTER choice's
+                // mapping), choiceStruct(ftInst->declaration) would lay out
+                // the bare choice with the OUTER's instantiation context —
+                // e.g. `Outer`'s subst doesn't name `T`, so `D`'s `T`
+                // falls back to the i32 placeholder (a too-small slot for
+                // the 24-byte `D<Widget>` value we already extracted).
+                // `store %D$spec0 into %D` then overruns the alloca's right
+                // redzone by exactly 4 bytes — the measured ASan report.
+                // Install ftInst's own subst for the alloca + the recursive
+                // call (which would otherwise inherit the outer map).
+                llvm::StructType* nestedSt = nullptr;
+                {
+                    RecordSubstGuard nestedSubst(this, ftInst);
+                    nestedSt = choiceStruct(ftInst->declaration);
+                    if (!nestedSt) continue;  // defensive — never fires
+                                              // (substitutedChoicePayloadType
+                                              // already proved it's a choice)
+                    llvm::AllocaInst* nestedSlot =
+                        builder_.CreateAlloca(
+                            nestedSt, nullptr, "ocd.nested.slot");
+                    builder_.CreateStore(fieldVal, nestedSlot);
+                    emitOwningChoiceActiveCaseDisposal(
+                        nestedSlot, ftInst->declaration, ftInst);
+                }
+                continue;
+            }
+            // Class/interface `owned` payload — the pre-#4132 path.
             // Null-guard: a never-bound arm of the active-case match could
             // leave an `owned`-payload slot null (the binding took it out);
             // or a payload-defaulted construction. `emitDisposeAndReclaim`
             // is null-safe (free(null) no-op) but the dispatch on a null
             // vtable would crash — guard explicitly.
             llvm::Value* isNull = builder_.CreateICmpEQ(
-                ownedPtr, llvm::ConstantPointerNull::get(ptrTy()));
+                fieldVal, llvm::ConstantPointerNull::get(ptrTy()));
             auto* dispBB = llvm::BasicBlock::Create(
                 llvm_, "ocd.dispose", currentFn_);
             auto* contBB = llvm::BasicBlock::Create(
                 llvm_, "ocd.cont", currentFn_);
             builder_.CreateCondBr(isNull, contBB, dispBB);
             builder_.SetInsertPoint(dispBB);
-            emitDisposeAndReclaim(ownedPtr);
+            emitDisposeAndReclaim(fieldVal);
             builder_.CreateBr(contBB);
             builder_.SetInsertPoint(contBB);
         }
