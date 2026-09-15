@@ -28656,6 +28656,7 @@ void Emitter::collectRecordCallResultReleaseEligible(
         std::function<void(const ast::Stmt*, int)> walkAll =
             [&](const ast::Stmt* s, int depth) {
             if (!s) return;
+            // LOCALDECL-DEBT: #4307 walkAll tracks no-init `var` decls only (depth-at-decl map for gap-2 multi-assignment); ast::LocalConstDecl cannot be no-init (`const x := y` always has an init) so it correctly skips this arm.
             if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s)) {
                 if (noInitDecls.count(s) || noInitClassDecls.count(s))
                     declDepthAtDecl[s] = depth;
