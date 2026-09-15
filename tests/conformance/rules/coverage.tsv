@@ -15,9 +15,9 @@ spec	2.5	Dependency resolution	0	0	0	0	0	0	0	n/a
 spec	2.6	Build phases	0	0	0	0	0	0	0	n/a
 spec	2.7	Name resolution for dotted names	1	0	0	0	0	0	0	UNCOVERED
 spec	2.8	Module identity, artifact interface, and program assembly	0	0	0	0	0	0	0	n/a
-spec	2.8.1	Module identity and closure	2	3	2	1	1	0	0	covered
-spec	2.8.2	The artifact interface is a semantic requirement	2	2	0	0	0	0	0	UNCOVERED
-spec	2.8.3	Transitive dependencies and cross-artifact type identity	0	4	0	0	0	0	0	UNCOVERED
+spec	2.8.1	Module identity and closure	2	3	5	2	3	0	0	covered
+spec	2.8.2	The artifact interface is a semantic requirement	2	2	2	1	0	0	1	covered
+spec	2.8.3	Transitive dependencies and cross-artifact type identity	0	4	8	0	4	0	4	covered
 spec	2.8.4	Program assembly: artifact kind, entry point, one copy per process	2	2	0	0	0	0	0	UNCOVERED
 spec	2.8.5	Non-goals of this section	0	0	0	0	0	0	0	n/a
 spec	2.8.6	Interface delta classification	1	0	0	0	0	0	0	UNCOVERED
@@ -108,10 +108,10 @@ spec	12.8	Constructor chaining	1	1	4	1	3	0	0	covered
 spec	12.9	Variance	5	1	4	1	3	0	0	covered
 spec	12.10	Inheritance cycles	2	1	2	0	2	0	0	covered
 spec	13	Visibility	0	0	0	0	0	0	0	n/a
-spec	13.1	Levels	0	0	2	1	1	0	0	covered
+spec	13.1	Levels	0	0	7	2	4	0	1	covered
 spec	13.2	Top-level types	1	0	2	1	1	0	0	covered
 spec	13.3	Class members	1	1	4	2	2	0	0	covered
-spec	13.4	Modules and internal	0	0	0	0	0	0	0	n/a
+spec	13.4	Modules and internal	0	0	4	1	3	0	0	covered
 spec	13.5	No combined visibilities	0	0	2	1	1	0	0	covered
 spec	13.6	Accessor visibility	2	0	2	1	1	0	0	covered
 spec	13.7	Visibility and inheritance	5	0	6	3	3	0	0	covered
@@ -141,21 +141,21 @@ spec	16.4	Stride	4	0	5	0	3	1	1	covered
 spec	16.5	Iteration	0	0	2	0	0	1	1	covered
 spec	16.6	Empty ranges and equal-bound ranges	1	1	5	0	2	1	2	covered
 spec	17	Expressions and Operators	0	0	0	0	0	0	0	n/a
-spec	17.1	Precedence	0	1	10	0	0	0	10	covered
-spec	17.2	Notes on operators	2	1	12	6	6	0	0	covered
+spec	17.1	Precedence	0	1	5	0	0	0	5	covered
+spec	17.2	Notes on operators	2	1	8	4	4	0	0	covered
 spec	17.3	The = and <> operators	2	0	3	1	1	0	1	covered
-spec	17.4	The is, is not, and as operators	3	0	7	0	3	0	4	covered
-spec	17.5	The in operator	3	1	8	0	2	0	6	covered
-spec	17.6	The increment and decrement operators	5	3	8	0	5	0	3	covered
-spec	17.7	The new operator	2	0	11	2	5	1	3	covered
+spec	17.4	The is, is not, and as operators	3	0	6	0	3	0	3	covered
+spec	17.5	The in operator	3	1	5	0	1	0	4	covered
+spec	17.6	The increment and decrement operators	5	3	6	0	4	0	2	covered
+spec	17.7	The new operator	2	0	7	1	4	1	1	covered
 spec	17.8	The null-forgiving operator !	0	0	3	1	1	0	1	covered
-spec	17.9	The nameof operator	0	0	5	0	2	0	3	covered
-spec	17.10	The typeof operator	2	0	5	0	3	0	2	covered
-spec	17.11	The default operator	9	6	14	0	6	0	8	covered
+spec	17.9	The nameof operator	0	0	3	0	1	0	2	covered
+spec	17.10	The typeof operator	2	0	4	0	3	0	1	covered
+spec	17.11	The default operator	9	6	9	0	5	0	4	covered
 spec	17.12	The throw expression	4	0	4	0	1	0	3	covered
-spec	17.13	The discard _	9	3	15	0	10	1	4	covered
-spec	17.14	Constant expressions	5	2	0	0	0	0	0	UNCOVERED
-spec	17.15	The binding atom	2	1	0	0	0	0	0	UNCOVERED
+spec	17.13	The discard _	9	3	11	0	6	1	4	covered
+spec	17.14	Constant expressions	5	2	8	0	5	0	3	covered
+spec	17.15	The binding atom	2	1	6	1	2	0	3	covered
 spec	18	Literals and Strings	0	0	0	0	0	0	0	n/a
 spec	18.1	Numeric literals	1	0	3	1	1	0	1	covered
 spec	18.2	Boolean and null literals	0	0	1	0	0	0	1	covered
@@ -220,7 +220,7 @@ spec	26.1	Declaration	0	0	2	2	0	0	0	covered
 spec	26.2	What can be extended	1	0	3	1	2	0	0	covered
 spec	26.3	Restrictions	3	0	7	0	7	0	0	covered
 spec	26.4	Generic extensions	1	0	3	2	1	0	0	covered
-spec	26.5	Resolution	3	0	3	0	1	0	2	covered
+spec	26.5	Resolution	3	0	14	0	6	0	8	covered
 spec	26.5.1	Specificity ordering	2	0	0	0	0	0	0	UNCOVERED
 spec	26.6	Multiple blocks for the same type	1	0	0	0	0	0	0	UNCOVERED
 spec	26.7	Ownership in extensions	1	0	0	0	0	0	0	UNCOVERED
@@ -252,18 +252,18 @@ spec	28.12	Asynchronous disposal	0	2	0	0	0	0	0	UNCOVERED
 spec	28.13	Shared ownership: Shared<T> and Weak<T>	2	0	0	0	0	0	0	UNCOVERED
 spec	28.14	Scoped callback parameters: storage-bounded capture	15	3	0	0	0	0	0	UNCOVERED
 spec	29	Iteration	0	0	0	0	0	0	0	n/a
-spec	29.1	The protocol	1	1	0	0	0	0	0	UNCOVERED
-spec	29.2	Desugaring of for	5	3	0	0	0	0	0	UNCOVERED
-spec	29.3	Iterator methods	2	1	0	0	0	0	0	UNCOVERED
-spec	29.4	Lazy evaluation	1	1	0	0	0	0	0	UNCOVERED
-spec	29.5	return not allowed in iterator methods	0	0	0	0	0	0	0	n/a
-spec	29.6	Restrictions inside try/catch/finally	0	0	0	0	0	0	0	n/a
-spec	29.7	Disposal of partially-consumed iterators	0	0	0	0	0	0	0	n/a
-spec	29.8	Iterators with owned parameters	0	1	0	0	0	0	0	UNCOVERED
-spec	29.9	yield not allowed in lambdas	0	0	0	0	0	0	0	n/a
-spec	29.10	Empty iterators	0	0	0	0	0	0	0	n/a
-spec	29.11	Multiple enumeration	3	1	0	0	0	0	0	UNCOVERED
-spec	29.12	Mutation during iteration	1	0	0	0	0	0	0	UNCOVERED
+spec	29.1	The protocol	1	1	6	0	1	1	4	covered
+spec	29.2	Desugaring of for	5	3	15	0	2	1	12	covered
+spec	29.3	Iterator methods	2	1	6	1	2	0	3	covered
+spec	29.4	Lazy evaluation	1	1	4	1	1	0	2	covered
+spec	29.5	return not allowed in iterator methods	0	0	3	1	2	0	0	covered
+spec	29.6	Restrictions inside try/catch/finally	0	0	4	1	3	0	0	covered
+spec	29.7	Disposal of partially-consumed iterators	0	0	4	0	0	0	4	covered
+spec	29.8	Iterators with owned parameters	0	1	4	0	0	1	3	covered
+spec	29.9	yield not allowed in lambdas	0	0	1	0	1	0	0	covered
+spec	29.10	Empty iterators	0	0	2	1	0	0	1	covered
+spec	29.11	Multiple enumeration	3	1	9	0	3	2	4	covered
+spec	29.12	Mutation during iteration	1	0	4	0	0	0	4	covered
 spec	29.13	Async iterators	0	0	0	0	0	0	0	n/a
 spec	30	Asynchronous Programming	0	0	0	0	0	0	0	n/a
 spec	30.1	async methods	13	5	17	6	10	1	0	covered
@@ -329,7 +329,7 @@ spec	35.10	default, with, and the small surface	2	1	3	0	2	0	1	covered
 spec	35.11	Generics	0	0	2	0	1	0	1	covered
 spec	35.12	Sendability	0	1	3	0	2	0	1	covered
 spec	35.13	FFI and serialization	0	0	1	0	1	0	0	covered
-stdlib	1	Conventions	6	0	0	0	0	0	0	UNCOVERED
+stdlib	1	Conventions	6	0	6	0	0	0	6	covered
 stdlib	2	System (auto-imported)	0	0	0	0	0	0	0	n/a
 stdlib	2.1	Console	1	0	0	0	0	0	0	UNCOVERED
 stdlib	2.2	Math	1	0	0	0	0	0	0	UNCOVERED
@@ -362,16 +362,16 @@ stdlib	4.1	Borrowing collection interfaces	0	0	4	0	0	0	4	covered
 stdlib	4.2	Owning collection interfaces	1	0	7	2	3	0	2	covered
 stdlib	4.3	How the borrowing and owning hierarchies relate	0	0	5	1	2	0	2	covered
 stdlib	4.4	Array<T>	1	0	13	1	2	1	9	covered
-stdlib	4.5	OwningArray<T>	3	0	7	1	0	0	6	covered
-stdlib	4.6	LinkedList<T>	0	0	0	0	0	0	0	n/a
-stdlib	4.7	OwningLinkedList<T>	1	0	0	0	0	0	0	UNCOVERED
-stdlib	4.8	Dictionary<K, V>	9	0	0	0	0	0	0	UNCOVERED
-stdlib	4.9	OwningDictionary<K, V>	2	0	0	0	0	0	0	UNCOVERED
-stdlib	4.10	Set<T> and OwningSet<T>	1	0	0	0	0	0	0	UNCOVERED
+stdlib	4.5	OwningArray<T>	3	0	13	1	1	1	10	covered
+stdlib	4.6	LinkedList<T>	0	0	4	0	0	0	4	covered
+stdlib	4.7	OwningLinkedList<T>	1	0	5	1	1	0	3	covered
+stdlib	4.8	Dictionary<K, V>	9	0	10	1	2	0	7	covered
+stdlib	4.9	OwningDictionary<K, V>	2	0	8	1	1	1	5	covered
+stdlib	4.10	Set<T> and OwningSet<T>	1	0	2	0	0	0	2	covered
 stdlib	4.11	Stack<T>, OwningStack<T>, Queue<T>, and OwningQueue<T>	2	0	0	0	0	0	0	UNCOVERED
-stdlib	4.12	Borrowing enumeration interfaces	0	0	0	0	0	0	0	n/a
-stdlib	4.13	Owning enumeration interfaces	1	0	0	0	0	0	0	UNCOVERED
-stdlib	4.14	OwningBuffer<T>, Span<T>, ReadOnlySpan<T>	2	0	0	0	0	0	0	UNCOVERED
+stdlib	4.12	Borrowing enumeration interfaces	0	0	3	0	0	0	3	covered
+stdlib	4.13	Owning enumeration interfaces	1	0	6	0	0	1	5	covered
+stdlib	4.14	OwningBuffer<T>, Span<T>, ReadOnlySpan<T>	2	0	12	0	7	0	5	covered
 stdlib	4.15	ArraySpan<T>, ReadOnlyArraySpan<T>	0	0	0	0	0	0	0	n/a
 stdlib	4.16	IReadOnlySpan<TElement>	0	0	0	0	0	0	0	n/a
 stdlib	4.17	SortedDictionary<K, V> (added in v0.136)	1	0	0	0	0	0	0	UNCOVERED

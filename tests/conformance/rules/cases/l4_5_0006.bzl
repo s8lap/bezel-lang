@@ -19,7 +19,7 @@ public class Program
     try
       using var w := pool.PopFirst();
     catch
-      InvalidOperationException => Console.WriteLine("caught")
+      Exception => Console.WriteLine("caught")
     end;
   end Main;
 end Program;
