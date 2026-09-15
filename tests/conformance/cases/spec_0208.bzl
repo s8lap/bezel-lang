@@ -11,6 +11,7 @@ public method TakeTransactions(): owned OwningArray<Transaction>
 end TakeTransactions;
 
 public method LeakTransactions(): OwningArray<Transaction>
-  return move _transactions;  // ERROR: a `move`d field through a non-`owned`
-                              //   return escapes with no owner.
+  return new OwningArray<Transaction>();  // ERROR: a freshly-produced owning
+                                          //   value through a non-`owned`
+                                          //   return escapes with no owner.
 end LeakTransactions;
