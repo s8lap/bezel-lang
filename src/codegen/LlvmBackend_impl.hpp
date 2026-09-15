@@ -270,6 +270,12 @@ inline bool calleeReturnMayAliasStringArgUnretained(
                     }
                 }
                 // Body field: type is in the FieldDecl
+                // SEAM-DEBT: #4301 — record/choice with only Class-typed
+                // fields' caller-string-release predicate (cannot read the
+                // class via sema::fieldDeclTypeOf because the *whole point*
+                // is to distinguish "class-typed field" from "string-typed
+                // field", so the canonical accessor would return the same
+                // TypeRef either way — this read is the discrimination).
                 const auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
                 if (!fd || !fd->type) continue;
                 if (auto* tr = ctx.resolvedType(*fd->type)) {

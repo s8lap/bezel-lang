@@ -1181,6 +1181,11 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
             // classifyVtablelessBuiltinRelease.
             const sema::TypeRef* rt = nullptr;
             if (fs->decl) {
+                // SEAM-DEBT: #4290 vtableless-builtin release walker — same
+                // imported-symbol seam as the rest of #3149/#3149; fix #4290
+                // demands this read; canonical accessor (sema::fieldDeclTypeOf)
+                // would still need the FieldDecl decl guard for the
+                // `no user TypeDecl` builtin class case.
                 auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
                 if (fd && fd->type) rt = ctx_.resolvedType(*fd->type);
             } else {

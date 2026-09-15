@@ -9951,6 +9951,7 @@ void MethodOwnership::seedCapturedOuterLocals(
 // `implicitDischarge`, `obligationOrigin`) without the dataflow-time
 // side effects (see `seedCapturedOuterLocals`'s header for the rationale).
 void MethodOwnership::seedCapturedLocalFromDecl(sema::LocalSymbol* ls) {
+    // LOCALDECL-DEBT: #4271 — `const`-annotated captured local has separate LocalConstDecl form; widening drops the init discrimination.
     auto* ld = dynamic_cast<const ast::LocalDecl*>(ls->decl);
     if (!ld) return;
     // Skip if the local is already seeded (e.g. by a previous iteration

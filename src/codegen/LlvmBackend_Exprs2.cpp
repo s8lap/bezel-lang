@@ -2014,6 +2014,7 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
                         // SECOND PASS) now reads the cell's struct type from
                         // cellVars_[d.slot] (set on both boxing paths in
                         // boxLocalSlot), so the field is unused.
+                        // LOCALDECL-DEBT: #4165 — captured-local map is `const void*`-keyed; `const` locals never reach this arm.
                         if (auto* ld = dynamic_cast<const ast::LocalDecl*>(decl)) {
                             if (cellFreeEligible_.count(
                                     static_cast<const void*>(decl))) {
@@ -9941,9 +9942,11 @@ llvm::Value* Emitter::buildRecordValue(
                         static_cast<std::ptrdiff_t>(recPosFieldCount);
              ++it) {
             const sema::Symbol* m = *it;
+            // SEAM-DEBT: #4058 — body-storage predicate widens #4039 to "every member has init"; `m->decl == nullptr` for imported.
             if (auto* fd = dynamic_cast<const ast::FieldDecl*>(m->decl)) {
                 if (fd->initializer) continue;
             }
+            // SEAM-DEBT: #4058 — sibling of the FieldDecl read above.
             if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(m->decl)) {
                 if (pd->autoInitializer) continue;
             }

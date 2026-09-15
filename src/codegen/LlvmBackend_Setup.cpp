@@ -16769,6 +16769,7 @@ void Emitter::consumeLastLambdaCapturedCells() {
                     // captured local is a string-keyed DictionaryEntry, also set
                     // dictEntryKeyReleaseDeferred so the SECOND PASS emits the
                     // key release before the cell free.
+                    // LOCALDECL-DEBT: #4165 — capture key is `const void*`; `const` locals cannot reach this arm.
                     if (auto* ld = dynamic_cast<const ast::LocalDecl*>(
                             static_cast<const ast::Node*>(ce.key))) {
                         if (locals_.count(static_cast<const ast::Node*>(ce.key))) {
@@ -16889,6 +16890,7 @@ void Emitter::consumeLastLambdaCapturedCells() {
                         // one +1 to balance — the same safety case as #4127's envdtor
                         // path. dictEntryForVarSlot stores the original local's
                         // struct alloca for the GEP.
+                        // LOCALDECL-DEBT: #4165 — twin of FIRST-PASS arm; same `const`-local-unreachability rationale.
                         if (auto* ld = dynamic_cast<const ast::LocalDecl*>(
                                 static_cast<const ast::Node*>(ce.key))) {
                             if (locals_.count(static_cast<const ast::Node*>(ce.key))) {
@@ -28699,6 +28701,7 @@ void Emitter::collectRecordCallResultReleaseEligible(
         std::function<void(const ast::Stmt*, int)> walkAll =
             [&](const ast::Stmt* s, int depth) {
             if (!s) return;
+            // LOCALDECL-DEBT: #4307 — `const` locals have no `init` slot, so depth-recorder skips them.
             if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s)) {
                 if (noInitDecls.count(s) || noInitClassDecls.count(s))
                     declDepthAtDecl[s] = depth;
