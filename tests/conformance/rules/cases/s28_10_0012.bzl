@@ -19,6 +19,9 @@ public class Widget
   public constructor()
     Label := "live";
   end constructor;
+
+  destructor
+  end destructor;
 end Widget;
 
 public class Holder

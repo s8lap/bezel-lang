@@ -8,7 +8,7 @@
 //!   obligation for such a value, so an owned element slot has nothing to own.
 //! cites: 28.11, 28.9
 //! expect: reject
-//! diagnostic: owning
+//! diagnostic: instantiation
 //! issue: 4393
 module Conf;
 
