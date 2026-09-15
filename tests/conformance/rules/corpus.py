@@ -451,7 +451,13 @@ ORDER_CLAIM_RE = re.compile(
     r'disposal order|exactly once|exactly twice|more than once|not run again|'
     r'runs again|re-?runs?\b|re-?enumerat\w+|each iteration|per iteration|'
     r'on each|idempotent|twice|both .{0,24}(?:run|dispose|fire|print)|'
-    r'never (?:runs|re-?runs|fires)|\bthen\b.{0,60}\bthen\b)', re.IGNORECASE)
+    r'never (?:runs|re-?runs|fires)|\bthen\b.{0,60}\bthen\b|'
+    # Added after a §31 lane found two claims the vocabulary could not see:
+    # "used when the body contains multiple statements" and "one statement
+    # among several" are count claims with no trigger word above.
+    r'multiple statements|among several|several statements|'
+    r'(?:arms?|clauses?|handlers?) after|not considered|'
+    r'\bfirst\b.{0,40}\bwins\b|stop(?:s|ping)? at the first)', re.IGNORECASE)
 
 
 def audit(rows, cases_dir):
@@ -470,8 +476,12 @@ def audit(rows, cases_dir):
             # A diagnostic that is an identifier the case declares (`Money`,
             # `Lib`) is the unresolved-name shape and is fine as it stands.
             identifierish = re.fullmatch(r'[A-Z]\w*', row["check"].strip())
-            if frag and not identifierish \
-                    and not (frag & words(row["rule"] + " " + row["title"])):
+            # Compare against `rule:` ONLY, never `rule + title`. A case whose
+            # `diagnostic:` invented a word ("redundant", where the rule says
+            # "at a marker-free position") had copied the same word into its
+            # title, and the check passed: an author who is consistently wrong
+            # defeats a check that lets them supply their own vocabulary.
+            if frag and not identifierish and not (frag & words(row["rule"])):
                 orphan_diag.append((row["case-id"], row["check"]))
         if row["expect"] == "run" and not row["check"].startswith("all:") \
                 and ORDER_CLAIM_RE.search(row["rule"] + " " + row["title"]):

@@ -14,6 +14,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import corpus
 import coverage
+import names
 import runner
 
 
@@ -567,6 +568,73 @@ class TestStructuralLints(unittest.TestCase):
                             corpus.check_case("s18_5_0001.bzl", text)[1]))
 
 
+class TestMissingImports(unittest.TestCase):
+    """Two independent critique lanes found the same defect twelve times: a case
+    naming a type from a module it never imports, which fails to resolve before
+    reaching any rule under test. It is mechanical, so it should not have been a
+    reader's job."""
+
+    def setUp(self):
+        base = os.path.dirname(os.path.abspath(__file__))
+        repo = os.path.dirname(os.path.dirname(os.path.dirname(base)))
+        self.module_of_type = names.build_module_index(
+            os.path.join(repo, "docs"))
+
+    def test_the_index_finds_the_explicit_modules(self):
+        for type_name, module in (("Mutex", "System.Threading"),
+                                  ("CancellationTokenSource", "System.Threading"),
+                                  ("FileStream", "System.IO"),
+                                  ("Stopwatch", "System.Diagnostics")):
+            self.assertEqual(self.module_of_type.get(type_name), module)
+
+    def test_a_chapter_that_is_not_a_module_does_not_inherit_the_last_one(self):
+        # "9. Primitive type members" and "10. FFI-boundary types" are chapters,
+        # not modules. Before the heading reset, their types inherited §8's
+        # module and `Ptr<T>` was reported as living in System.Diagnostics.
+        self.assertEqual(self.module_of_type.get("Ptr"), "System.Interop")
+        for auto in ("IntPtr", "RawBytes", "CString"):
+            self.assertIsNone(self.module_of_type.get(auto), auto)
+
+    def test_the_always_available_types_need_no_import(self):
+        # spec §2.3's table: the Task family, CancellationToken, Subscription
+        # and the six event types.
+        for auto in ("Task", "OwningTask", "CancellationToken", "Subscription",
+                     "EventSource", "SharedEventSource", "Console", "Array"):
+            self.assertIsNone(self.module_of_type.get(auto), auto)
+
+    def test_it_reports_a_named_type_whose_module_is_not_imported(self):
+        source = "module Conf;\n\npublic class P\n  private _m: Mutex;\nend P;\n"
+        self.assertEqual(names.missing_imports(source, self.module_of_type),
+                         [("Mutex", "System.Threading")])
+
+    def test_the_import_silences_it(self):
+        source = ("module Conf;\nimport System.Threading;\n\n"
+                  "public class P\n  private _m: Mutex;\nend P;\n")
+        self.assertEqual(names.missing_imports(source, self.module_of_type), [])
+
+    def test_a_type_the_case_declares_itself_is_not_reported(self):
+        source = "module Conf;\n\npublic class Mutex\nend Mutex;\n"
+        self.assertEqual(names.missing_imports(source, self.module_of_type), [])
+
+    def test_the_committed_corpus_is_clean(self):
+        base = os.path.dirname(os.path.abspath(__file__))
+        sections = {r["case-id"]: r["section"] for r in
+                    corpus.read_manifest(os.path.join(base, "manifest.tsv"))}
+        bad = []
+        for name in sorted(os.listdir(os.path.join(base, "cases"))):
+            if not name.endswith(".bzl"):
+                continue
+            case_id = name[:-len(".bzl")]
+            if sections.get(case_id) in names.IMPORT_RULE_SECTIONS:
+                continue
+            with open(os.path.join(base, "cases", name),
+                      encoding="utf-8") as f:
+                source = corpus.strip_header(f.read())
+            for found in names.missing_imports(source, self.module_of_type):
+                bad.append((case_id,) + found)
+        self.assertEqual(bad, [])
+
+
 class TestManifest(unittest.TestCase):
     def test_build_then_check_is_clean(self):
         with tempfile.TemporaryDirectory() as base:
@@ -896,15 +964,32 @@ class TestOrderClaimSignal(unittest.TestCase):
         ):
             self.assertTrue(self.hits(text), text)
 
+    def test_it_catches_the_dispatch_order_phrasings(self):
+        # Added after a §31 lane found claims with no trigger word in the first
+        # vocabulary — "used when the body contains multiple statements" and
+        # "one statement among several" are count claims in plain words.
+        for text in (
+                "used when the body contains multiple statements",
+                "the re-raise is one statement among several",
+                "arms after the matched one are not considered",
+                "the first arm whose type matches wins",
+                "requires clauses evaluate in order and stop at the first false",
+        ):
+            self.assertTrue(self.hits(text), text)
+
     def test_it_ignores_the_incidental_words(self):
         # Every one of these tripped the first, broad vocabulary.
+        # NB "the first matching arm wins" started here and moved to the
+        # positive list: it reads as incidental and is in fact a dispatch-order
+        # claim, which a first-line check cannot verify.
         for text in (
-                "the first matching arm wins",
                 "the last declared member shadows",
                 "an owned field of class type is admitted",
                 "the number of type parameters must match",
                 "a count of zero is admitted",
                 "an escape after the borrow's source is out of scope",
+                "the first parameter must have a default",
+                "every parameter after the first defaulted one needs a default",
         ):
             self.assertFalse(self.hits(text), text)
 

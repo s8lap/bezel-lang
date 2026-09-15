@@ -72,6 +72,110 @@ TYPE_POSITION_RES = (
 STATIC_USE_RE = re.compile(r'\b([A-Z]\w*)\.([A-Za-z_]\w*)')
 
 
+# The stdlib document is organised as `## N. `Module.Name`` headings, and an
+# auto-imported module says so in its own heading. Spec §2.3 then carves out
+# the handful of types that are always available despite living in a module that
+# is not: "Importing `System.Threading` is not required to use `Subscription`,
+# `CancellationToken`, or any of the six event types; it is required for
+# `CancellationTokenSource`, `Mutex`, and the other threading types."
+MODULE_HEADING_RE = re.compile(r'^##\s+\d+\.\s+`([A-Za-z][\w.]*)`(.*)$')
+ANY_TOP_HEADING_RE = re.compile(r'^##\s+\d+\.')
+# `### 10.5 `System.Interop`: `Ptr<T>`` — a subsection that switches module
+# inside a chapter whose own heading is not a module name.
+SUB_MODULE_HEADING_RE = re.compile(r'^###\s+[\d.]+\s+`([A-Za-z][\w.]+\.[\w.]+)`\s*:')
+
+ALWAYS_AVAILABLE_DESPITE_MODULE = frozenset({
+    # spec §2.3, "Events, subscription, cancellation" and "Task family".
+    "Subscription", "CancellationToken",
+    "IEvent", "IAsyncEvent", "EventSource", "AsyncEventSource",
+    "ISharedEvent", "SharedEventSource",
+    "Task", "OwningTask",
+})
+
+# Auto-imported modules whose stdlib heading does not say so. Spec §2.3 and the
+# stdlib's own §5 body both state System.Collections.Linq is auto-imported
+# (v0.278) while its `## 5.` heading omits the marker every other auto-imported
+# chapter carries. Reported as #4412; until the heading is fixed, this list
+# keeps the check from demanding an import the language does not want.
+AUTO_IMPORTED_DESPITE_HEADING = frozenset({"System.Collections.Linq"})
+
+
+def build_module_index(docs_dir):
+    """type name -> the module that declares it, for modules needing an import.
+
+    Six §28.12 cases named `Task` with no `import System.Threading;` and would
+    have failed to resolve it before reaching any rule under test. The check is
+    mechanical, so it should not have been a reader's job."""
+    path = os.path.join(docs_dir, "Bezel_Standard_Library.md")
+    modules, of_type = {}, {}
+    if not os.path.exists(path):
+        return of_type
+    with open(path, encoding="utf-8") as f:
+        lines = f.read().split("\n")
+    current, fenced, block = None, False, []
+    for line in lines:
+        head = MODULE_HEADING_RE.match(line) if not fenced else None
+        if head:
+            current = head.group(1)
+            modules[current] = ("auto-imported" not in head.group(2).lower()
+                                and current not in AUTO_IMPORTED_DESPITE_HEADING)
+            continue
+        if not fenced and ANY_TOP_HEADING_RE.match(line):
+            # A chapter that is not a module ("9. Primitive type members",
+            # "10. FFI-boundary types") must CLEAR the module, or its types
+            # inherit the previous chapter's and the check demands an import
+            # for them. `Ptr<T>` landed in System.Diagnostics this way.
+            current = None
+            continue
+        if not fenced:
+            sub = SUB_MODULE_HEADING_RE.match(line)
+            if sub:
+                current = sub.group(1)
+                modules.setdefault(
+                    current, current not in AUTO_IMPORTED_DESPITE_HEADING)
+                continue
+        if line.startswith("```"):
+            if fenced:
+                for bline in block:
+                    decl = TYPE_DECL_RE.match(bline)
+                    if decl and current and modules.get(current):
+                        of_type.setdefault(decl.group(2), current)
+                block = []
+            fenced = not fenced
+            continue
+        if fenced:
+            block.append(line)
+    for name in ALWAYS_AVAILABLE_DESPITE_MODULE:
+        of_type.pop(name, None)
+    return of_type
+
+
+# The sections that state the import and name-resolution rules. A case there may
+# be *about* naming a type without its import, which is the same shape this
+# check reports — the reserved-name check has the same exception for the same
+# reason.
+IMPORT_RULE_SECTIONS = frozenset({"2.2", "2.3", "2.7", "2.8.3"})
+
+
+def missing_imports(source, module_of_type):
+    """Types the case names whose module it never imports."""
+    imported = set(re.findall(r'^\s*import\s+([A-Za-z][\w.]*)', source,
+                              re.MULTILINE))
+    declared = declared_in(source)
+    missing = {}
+    for line in source.split("\n"):
+        code = STRING_RE.sub('""', line.split("//")[0])
+        if re.match(r'\s*(module|import)\b', code):
+            continue
+        for rx in TYPE_POSITION_RES:
+            for m in rx.finditer(code):
+                name = m.group(1)
+                module = module_of_type.get(name)
+                if module and module not in imported and name not in declared:
+                    missing[name] = module
+    return sorted(missing.items())
+
+
 def build_index(docs_dir):
     """type name -> set of member names, from the documents' bezel blocks."""
     index = {}
@@ -246,12 +350,14 @@ def main(argv, base_dir=None):
     args = ap.parse_args(argv)
 
     index = build_index(args.docs)
+    module_of_type = build_module_index(args.docs)
     cases_dir = os.path.join(base, "cases")
-    expects = {}
+    expects, sections = {}, {}
     manifest = os.path.join(base, "manifest.tsv")
     if os.path.exists(manifest):
         for row in corpus.read_manifest(manifest):
             expects[row["case-id"]] = row["expect"]
+            sections[row["case-id"]] = row["section"]
     findings = 0
     for name in sorted(os.listdir(cases_dir)):
         if not name.endswith(".bzl"):
@@ -262,11 +368,13 @@ def main(argv, base_dir=None):
         with open(os.path.join(cases_dir, name), encoding="utf-8") as f:
             source = corpus.strip_header(f.read())
         types, members = check_source(source, index)
+        imports = [] if sections.get(case_id) in IMPORT_RULE_SECTIONS \
+            else missing_imports(source, module_of_type)
         # A reject case may be ABOUT declaring a reserved name; only a case that
         # expects to compile has a problem here.
         reserved = [] if expects.get(case_id) == "reject" \
             else reserved_declarations(source)
-        if types or members or reserved:
+        if types or members or reserved or imports:
             findings += 1
             print(case_id)
             if types:
@@ -275,8 +383,12 @@ def main(argv, base_dir=None):
                 print("  unknown member: " + ", ".join(members))
             if reserved:
                 print("  reserved name:  " + ", ".join(reserved))
-    print("\n{} documented types indexed; {} cases with findings"
-          .format(len(index), findings))
+            if imports:
+                print("  missing import: " + ", ".join(
+                    "{} (import {};)".format(n, m) for n, m in imports))
+    print("\n{} documented types indexed, {} of them behind an explicit "
+          "import; {} cases with findings"
+          .format(len(index), len(module_of_type), findings))
     return 1 if (args.strict and findings) else 0
 
 
