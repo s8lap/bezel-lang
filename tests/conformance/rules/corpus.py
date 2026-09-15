@@ -329,9 +329,9 @@ def main(argv, base_dir=None):
     for key in sorted(by_section, key=lambda k: _sort_key(by_section[k][0]["case-id"])):
         group = by_section[key]
         counts = {e: sum(1 for r in group if r["expect"] == e) for e in EXPECTS}
-        print("  {:<6} {:<8} {:>3}  (accept {}, reject {}, run {})".format(
+        print("  {:<6} {:<8} {:>3}  (accept {}, reject {}, warn {}, run {})".format(
             key[0], key[1], len(group), counts["accept"], counts["reject"],
-            counts["run"]))
+            counts["warn"], counts["run"]))
     return 0
 
 

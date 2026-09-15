@@ -117,9 +117,13 @@ Hard rules, each of which has cost somebody a day:
    `move` is a use-site marker whose *absence* and whose *presence* are both
    compile errors in the positions §4.2 lists. If your case is not about that
    list, do not stray into it.
-6. **Keep it small.** Ten to thirty lines. A case that needs a paragraph of
+6. **Bind owned locals with `using var`** unless the case is *about* the
+   must-use warning. A plain `var c := new C();` left undischarged compiles, but
+   it emits the must-use warning, and a case carrying a diagnostic it is not
+   about is a case whose next reader has to work out which one mattered.
+7. **Keep it small.** Ten to thirty lines. A case that needs a paragraph of
    scaffolding is testing the scaffolding.
-7. **No `TODO`, no `...`, no placeholder names** — the lint rejects them. A case
+8. **No `TODO`, no `...`, no placeholder names** — the lint rejects them. A case
    is complete code.
 
 ## Tracing before writing
