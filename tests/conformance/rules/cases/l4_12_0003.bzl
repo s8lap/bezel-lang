@@ -33,7 +33,8 @@ end Source;
 public class Program
   public static method Main()
     do
-      using var e := new Source().GetEnumerator();
+      using var src := new Source();
+      using var e := src.GetEnumerator();
     end;
   end Main;
 end Program;

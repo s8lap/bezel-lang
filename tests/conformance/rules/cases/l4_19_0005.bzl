@@ -5,7 +5,8 @@
 //! rule: method ToArray(): owned Array<T>; // fresh mutable copy back out.
 //! cites: 4.19
 //! expect: run
-//! stdout: 99
+//! output: 99
+//!   0
 module Conf;
 
 public class Program
@@ -15,5 +16,6 @@ public class Program
     using var back := fa.ToArray();
     back[0] := 99;
     Console.WriteLine(back[0]);
+    Console.WriteLine(fa[0]);
   end Main;
 end Program;

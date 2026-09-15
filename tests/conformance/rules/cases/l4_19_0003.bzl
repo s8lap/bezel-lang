@@ -6,7 +6,7 @@
 //!   mutating member, so no writer can exist after construction.
 //! cites: 4.19
 //! expect: reject
-//! diagnostic: readonly
+//! diagnostic: no member
 module Conf;
 
 public class Program

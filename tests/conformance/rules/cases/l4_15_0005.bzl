@@ -1,7 +1,7 @@
 //! case: l4_15_0005
 //! doc: stdlib
 //! section: 4.15
-//! title: ArraySpan<T> provides one uniform mutation surface for every T via Fill/CopyFrom/CopyTo
+//! title: ArraySpan<T>.Fill assigns the value to every slot, for class and value T alike
 //! rule: Unlike Span<T> (whose mutation API splits by T's category),
 //!   ArraySpan<T> provides a single uniform mutation surface for all T --
 //!   admissible because Array<T> slots do not own their contents.

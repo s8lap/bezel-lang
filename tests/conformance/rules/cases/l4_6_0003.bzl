@@ -13,6 +13,6 @@ module Conf;
 public class Program
   public static method Main()
     using var l: LinkedList<int> := [10, 20, 30];
-    Console.WriteLine(l.First);
+    Console.WriteLine(l.First!);
   end Main;
 end Program;

@@ -1,7 +1,7 @@
 //! case: l4_7_0005
 //! doc: stdlib
 //! section: 4.7
-//! title: draining a borrowing source into an owning list, one element at a time
+//! title: draining an owning array into an owning list, one element at a time
 //! rule: Build an owning list from owned elements ... or add them one at a
 //!   time, taking them out of the source as you go: for var c in
 //!   src.Drain() do dst.AddLast(move c); end;

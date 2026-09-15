@@ -6,7 +6,8 @@
 //!   assigns null.
 //! cites: 4.5, 1
 //! expect: run
-//! stdout: False
+//! output: False
+//!   True
 module Conf;
 
 public class Widget
@@ -19,5 +20,6 @@ public class Program
     using var pool := new OwningArray<Widget>();
     var ok := pool.TryPopLast(out using var item);
     Console.WriteLine(ok);
+    Console.WriteLine(item = null);
   end Main;
 end Program;

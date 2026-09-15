@@ -32,7 +32,7 @@ public class Program
   public static method Main()
     var f := new Factory();
     case f.Make() of
-      var x: Widget => Console.WriteLine(x.Label())
+      var x => Console.WriteLine(x.Label())
     end case;
   end Main;
 end Program;

@@ -38,7 +38,8 @@ end Source;
 
 public class Program
   public static method Main()
-    using var e := new Source().GetEnumerator();
+    using var src := new Source();
+    using var e := src.GetEnumerator();
     _ := e.MoveNext();
     var first := e.Current;
     var second := e.Current;
