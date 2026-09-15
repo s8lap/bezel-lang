@@ -9,6 +9,8 @@
 //! expect: accept
 module Conf;
 
+import System.IO;
+
 public class Holder(owned resource: Stream)
   public method Touch()
     resource.Flush();

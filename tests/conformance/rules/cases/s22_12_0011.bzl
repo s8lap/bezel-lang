@@ -11,6 +11,8 @@
 //! diagnostic: single-consumer
 module Conf;
 
+import System.Threading;
+
 public class Registry
   private static readonly _inbox: Channel<int> := new Channel<int>();
 end Registry;

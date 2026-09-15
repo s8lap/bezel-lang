@@ -14,6 +14,6 @@ public class Box
   end constructor;
 end Box;
 
-public class Ops
-  public static pure method Make(): owned Box => new Box();
+public abstract class Ops
+  public abstract pure method Make(): owned Box;
 end Ops;

@@ -17,7 +17,7 @@ public class Widget
 end Widget;
 
 public class Registry
-  private _items: Array<Widget>;
+  private owned _items: Array<Widget>;
 
   public constructor()
     _items := new Array<Widget>();

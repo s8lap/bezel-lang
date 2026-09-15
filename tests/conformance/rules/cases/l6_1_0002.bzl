@@ -7,7 +7,8 @@
 //!   calling thread before Register returns.
 //! cites: 6.1
 //! expect: run
-//! stdout: fired
+//! output: fired
+//!   after
 module Conf;
 
 import System.Threading;
@@ -17,5 +18,6 @@ public class Program
     using var cts := new CancellationTokenSource();
     cts.Cancel();
     using var sub := cts.Token.Register(lambda() => Console.WriteLine("fired"));
+    Console.WriteLine("after");
   end Main;
 end Program;

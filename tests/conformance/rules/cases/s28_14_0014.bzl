@@ -4,7 +4,9 @@
 //! title: a scoped class-typed parameter may be stored in a direct non-owned field of the bounding object
 //! rule: On a class- or interface-typed parameter the callee may store the
 //!   borrow in a direct non-owned field of the bounding object; the call
-//!   site writes M(scoped x), an argument modifier.
+//!   site writes M(scoped x), an argument modifier, and the argument's
+//!   borrow source must satisfy the declared-before test against the
+//!   bounding `using var` local the constructor call initializes.
 //! cites: 28.14
 //! expect: run
 //! stdout: read
@@ -33,8 +35,8 @@ end Reader;
 
 public class Program
   public static method Main()
-    var s := new Stream();
-    var r := new Reader(scoped s);
+    using var s := new Stream();
+    using var r := new Reader(scoped s);
     r.Pull();
   end Main;
 end Program;

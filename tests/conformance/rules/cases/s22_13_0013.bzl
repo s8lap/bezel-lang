@@ -11,6 +11,8 @@
 //! expect: accept
 module Conf;
 
+import System.Threading;
+
 public class Registry
   private static readonly _cts: CancellationTokenSource := new CancellationTokenSource();
 end Registry;

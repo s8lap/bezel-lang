@@ -10,6 +10,8 @@
 //! diagnostic: Slice
 module Conf;
 
-public method Describe(s: IReadOnlySpan<int>)
-  var head := s.Slice(0, 1);
-end Describe;
+public static class Helpers
+  public static method Describe(s: IReadOnlySpan<int>)
+    var head := s.Slice(0, 1);
+  end Describe;
+end Helpers;

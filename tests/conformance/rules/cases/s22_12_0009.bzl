@@ -8,6 +8,8 @@
 //! expect: accept
 module Conf;
 
+import System.Threading;
+
 public class Registry
   private static readonly _lock: Mutex := new Mutex();
 end Registry;

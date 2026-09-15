@@ -12,7 +12,7 @@
 module Conf;
 
 public class Base
-  public virtual pure method Get(): int => 1;
+  public pure virtual method Get(): int => 1;
 end Base;
 
 public class Derived: Base

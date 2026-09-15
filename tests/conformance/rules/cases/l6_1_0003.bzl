@@ -2,8 +2,11 @@
 //! doc: stdlib
 //! section: 6.1
 //! title: ThrowIfCancellationRequested raises OperationCanceledException once cancelled
-//! rule: public method ThrowIfCancellationRequested(); — see language
-//!   spec §30.8 cancellation.
+//! rule: Cancellation surfaces as OperationCanceledException (language spec
+//!   §30.8); the generated async iterator's implicit
+//!   token.ThrowIfCancellationRequested() "faults the in-flight
+//!   MoveNextAsync task with OperationCanceledException" on a requested
+//!   cancellation (language spec §29.7), which is the call's own effect.
 //! cites: 6.1
 //! expect: run
 //! stdout: caught

@@ -9,8 +9,12 @@
 //! diagnostic: primitive
 module Conf;
 
-public record Point(X: int, Y: int);
+enum Level
+  Low, Medium, High;
+end Level;
 
 public class Constants
-  public const Origin: Point := new Point(0, 0);
+  // The initializer IS a compile-time constant expression (§17.14 admits an
+  // enum constant), so the only ground for rejection is the type requirement.
+  public const Default: Level := Level.Medium;
 end Constants;

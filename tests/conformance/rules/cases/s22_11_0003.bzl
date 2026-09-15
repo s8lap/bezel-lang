@@ -21,7 +21,7 @@ end Widget;
 
 public class Program
   public static method Main()
-    var w := new Widget(name: "gadget", size: 5);
+    var w := new Widget(name := "gadget", size := 5);
     Console.WriteLine(w.Size);
   end Main;
 end Program;

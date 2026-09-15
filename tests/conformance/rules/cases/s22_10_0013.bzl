@@ -18,5 +18,7 @@ end Base;
 public class Derived(name: string): Base()
   private _name: string := name;
 
-  public constructor() base() end constructor;
+  public constructor()
+    base();
+  end constructor;
 end Derived;

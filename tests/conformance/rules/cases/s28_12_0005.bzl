@@ -12,6 +12,8 @@
 //!   done
 module Conf;
 
+import System.Threading;
+
 public class Inner
   public constructor()
   end constructor;
@@ -32,11 +34,15 @@ public class Resource: IAsyncDisposable
     await Task.Delay(0);
     Console.WriteLine("async cleanup");
   end DisposeAsync;
+
+  destructor
+    Console.WriteLine("sync cleanup");
+  end destructor;
 end Resource;
 
 public class Program
   public static async method Main(): Task
-    var r := new Resource();
+    using var r := new Resource();
     await r.DisposeAsync();
     Console.WriteLine("done");
   end Main;

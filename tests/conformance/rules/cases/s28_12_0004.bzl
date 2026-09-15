@@ -12,6 +12,8 @@
 //!   done
 module Conf;
 
+import System.Threading;
+
 public class Resource: IAsyncDisposable
   public constructor()
   end constructor;

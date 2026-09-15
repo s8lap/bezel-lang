@@ -6,7 +6,8 @@
 //!   object is disposed, after the destructor body runs.
 //! cites: 28.4, 28.5
 //! expect: run
-//! stdout: container destructor
+//! output: container destructor
+//!   widget disposed
 module Conf;
 
 public class Widget

@@ -13,5 +13,7 @@ public class Greeter(name: string, prefix: string)
 
   public method Greet(): string => _label + name;
 
-  public constructor(prefix: string) this("default", prefix) end constructor;
+  public constructor(p: string)
+    this("default", p);
+  end constructor;
 end Greeter;

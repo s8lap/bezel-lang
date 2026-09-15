@@ -919,6 +919,43 @@ class TestOrderClaimSignal(unittest.TestCase):
         self.assertTrue(rows[0]["check"].startswith("all:"))
 
 
+class TestCoverageTiers(unittest.TestCase):
+    """The matrix takes its expectation tiers from corpus.EXPECTS. It used to
+    carry its own five-key literal in three places, so when `quiet` was added to
+    corpus.py the first quiet case anyone wrote crashed the matrix with a
+    KeyError — twice over, once in the counter and once in the row literal. It
+    survived because nothing runs this tool on every commit; a lane found it."""
+
+    def test_every_tier_has_a_counter(self):
+        counts = coverage._empty_counts()
+        for tier in corpus.EXPECTS:
+            self.assertIn(tier, counts)
+        self.assertIn("cases", counts)
+
+    def test_every_tier_is_a_matrix_column(self):
+        for tier in corpus.EXPECTS:
+            self.assertIn(tier, coverage.COLUMNS)
+
+    def test_a_built_row_carries_every_column(self):
+        # render() indexes each row by COLUMNS, so a row missing one is a
+        # KeyError at write time. This is the test that catches the defect at
+        # either of the two places it bit.
+        base = os.path.dirname(os.path.abspath(__file__))
+        repo = os.path.dirname(os.path.dirname(os.path.dirname(base)))
+        rows, _, _, _ = coverage.build(os.path.join(repo, "docs"), base)
+        self.assertGreater(len(rows), 100)
+        for row in rows[:50] + rows[-50:]:
+            for column in coverage.COLUMNS:
+                self.assertIn(column, row, row.get("section"))
+        self.assertTrue(coverage.render(rows).startswith(
+            "\t".join(coverage.COLUMNS)))
+
+    def test_quiet_in_particular(self):
+        # Named, because it is the one that got missed.
+        self.assertIn("quiet", coverage._empty_counts())
+        self.assertIn("quiet", coverage.COLUMNS)
+
+
 class TestCoverageStates(unittest.TestCase):
     """The two ways a coverage gap can be false. Both existed as prose in the
     README before they were code, and every wave re-investigated the same empty

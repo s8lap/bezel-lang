@@ -11,11 +11,11 @@
 module Conf;
 
 public class Base
-  public virtual pure method Get(): int => 1;
+  public pure virtual method Get(): int => 1;
 end Base;
 
 public class Mid: Base
-  public override pure method Get(): int => 2;
+  public pure override method Get(): int => 2;
 end Mid;
 
 public class Leaf: Mid

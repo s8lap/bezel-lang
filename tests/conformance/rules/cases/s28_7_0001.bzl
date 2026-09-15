@@ -7,8 +7,10 @@
 //!   disposed, then the new value is stored.
 //! cites: 28.7
 //! expect: run
-//! output: construct second
+//! output: construct first
+//!   construct second
 //!   dispose first
+//!   dispose second
 module Conf;
 
 public class Widget

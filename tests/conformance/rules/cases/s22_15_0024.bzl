@@ -13,5 +13,5 @@ public class Base
 end Base;
 
 public class Derived: Base
-  public override pure method Get(): int => 2;
+  public pure override method Get(): int => 2;
 end Derived;

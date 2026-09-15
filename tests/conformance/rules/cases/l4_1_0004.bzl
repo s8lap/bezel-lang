@@ -10,14 +10,16 @@
 //! stdout: 1
 module Conf;
 
-public method InsertFirst<T>(items: IList<T>, value: T)
-  items.Insert(0, value);
-end InsertFirst;
+public static class Helpers
+  public static method InsertFirst<T>(items: IList<T>, value: T)
+    items.Insert(0, value);
+  end InsertFirst;
+end Helpers;
 
 public class Program
   public static method Main()
     using var arr: Array<int> := [2, 3];
-    InsertFirst(arr, 1);
+    Helpers.InsertFirst(arr, 1);
     Console.WriteLine(arr[0]);
   end Main;
 end Program;

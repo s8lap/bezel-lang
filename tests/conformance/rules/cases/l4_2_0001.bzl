@@ -14,13 +14,15 @@ public class Widget
   end constructor;
 end Widget;
 
-public method FillOwning<T>(target: IOwningCollection<T>, owned item: T) where T: class
-  target.Add(move item);
-end FillOwning;
+public static class Helpers
+  public static method FillOwning<T>(target: IOwningCollection<T>, owned item: T) where T: class
+    target.Add(move item);
+  end FillOwning;
+end Helpers;
 
 public class Program
   public method Demo()
     using var pool := new OwningArray<Widget>();
-    FillOwning(pool, new Widget());
+    Helpers.FillOwning(pool, new Widget());
   end Demo;
 end Program;

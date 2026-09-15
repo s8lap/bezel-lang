@@ -15,12 +15,15 @@ public class Widget
   end constructor;
 end Widget;
 
-public method AcceptList<T>(items: IList<T>)
-end AcceptList;
+public static class Helpers
+  public static method AcceptList<T>(items: IList<T>)
+    items.Clear();
+  end AcceptList;
+end Helpers;
 
 public class Program
   public method Demo()
     using var pool := new OwningArray<Widget>();
-    AcceptList(pool);
+    Helpers.AcceptList(pool);
   end Demo;
 end Program;

@@ -20,6 +20,6 @@ public choice Basket
   Empty;
 end Basket;
 
-public class Ops
-  public static pure method MakeBasket(): Basket => Basket.Empty;
+public abstract class Ops
+  public abstract pure method MakeBasket(): Basket;
 end Ops;

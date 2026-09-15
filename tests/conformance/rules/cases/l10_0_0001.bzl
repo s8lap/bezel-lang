@@ -8,11 +8,13 @@
 //!   requires.
 //! cites: 10.0
 //! expect: run
-//! stdout: True
+//! output: True
+//!   True
 module Conf;
 
 public class Program
   public static method Main()
     Console.WriteLine(IntPtr.Zero = IntPtr.Zero);
+    Console.WriteLine(IntPtr.Zero <> IntPtr(1L));
   end Main;
 end Program;

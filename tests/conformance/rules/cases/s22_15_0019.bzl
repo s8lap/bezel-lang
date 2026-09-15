@@ -10,7 +10,8 @@
 module Conf;
 
 public class HeavyError: Exception
-  public pure constructor(message: string) base(message)
+  public pure constructor(message: string)
+    base(message);
   end constructor;
 
   destructor

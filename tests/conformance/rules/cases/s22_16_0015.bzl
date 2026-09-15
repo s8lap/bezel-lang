@@ -22,7 +22,7 @@ end Basket;
 
 public class Ops
   public static method Peek(b: Basket): int
-    ensures(case old(b) of Full(_) => true, Empty => false end)
+    ensures((case old(b) of Full(_) => true, Empty => false))
 
     return 0;
   end Peek;

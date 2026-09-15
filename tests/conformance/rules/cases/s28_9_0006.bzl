@@ -21,6 +21,7 @@ public class Program
     var arr: [1 owned]Widget := [new Widget()];
     var taker := lambda() => do
       var w := move arr[0];
+      arr[0] := new Widget();
       w.Dispose();
     end;
     taker();

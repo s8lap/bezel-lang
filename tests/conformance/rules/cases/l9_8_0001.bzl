@@ -11,10 +11,9 @@ module Conf;
 
 public class Program
   public static method Main()
-    var r := 5..;
+    var r: Range<int> := 5..;
     try
-      for var x in r do
-      end;
+      using var e := r.GetEnumerator();
     catch
       InvalidOperationException => Console.WriteLine("caught")
     end;

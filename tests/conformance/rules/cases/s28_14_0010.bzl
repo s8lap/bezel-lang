@@ -7,7 +7,7 @@
 //!   declared-before test.
 //! cites: 28.14
 //! expect: reject
-//! diagnostic: before
+//! diagnostic: declared before
 module Conf;
 
 import System.Threading;

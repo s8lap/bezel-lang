@@ -17,7 +17,7 @@ public class Widget
     _name := name;
   end constructor;
 
-  public readonly property Name: string => _name;
+  public property Name: string => _name;
 end Widget;
 
 public class Holder

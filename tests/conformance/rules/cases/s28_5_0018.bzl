@@ -6,7 +6,7 @@
 //!   field disposes nothing.
 //! cites: 28.5
 //! expect: run
-//! stdout: widget disposed
+//! output: widget disposed
 module Conf;
 
 public class Widget

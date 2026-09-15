@@ -18,13 +18,15 @@ public class Dog: Animal
   end constructor;
 end Dog;
 
-public method CountAnimals(source: IEnumerable<Animal>): int
-  return source.Count();
-end CountAnimals;
+public static class Helpers
+  public static method CountAnimals(source: IEnumerable<Animal>): int
+    return source.Count();
+  end CountAnimals;
+end Helpers;
 
 public class Program
   public static method Main()
     using var dogs: Array<Dog> := [new Dog()];
-    Console.WriteLine(CountAnimals(dogs));
+    Console.WriteLine(Helpers.CountAnimals(dogs));
   end Main;
 end Program;

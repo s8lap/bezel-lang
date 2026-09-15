@@ -32,8 +32,11 @@ DENSITY_RE = re.compile(
     r'are rejected|is forbidden|may not|must not|must be|must have|must match|'
     r'is not admitted|is not permitted|cannot be|raises)\b', re.IGNORECASE)
 
-COLUMNS = ("doc", "section", "title", "density", "appendix-c", "cases",
-           "accept", "reject", "warn", "run", "state")
+# Derived from corpus.EXPECTS so a new expectation tier cannot be added there
+# and silently omitted from the matrix. (`quiet` was, and the first quiet case
+# anyone wrote crashed the build with a KeyError.)
+COLUMNS = (("doc", "section", "title", "density", "appendix-c", "cases")
+           + corpus.EXPECTS + ("state",))
 
 
 # A line that is only an HTML anchor or comment is markup, not prose. The spec
@@ -150,6 +153,16 @@ def parse_sentences(path, prefix):
     return [s for s in out if s["rules"]]
 
 
+# The expectation tiers come from corpus.py, never a hand-copy: `quiet` was
+# added there and this file kept its own five-key literal, so the first quiet
+# case anyone wrote crashed the matrix with a KeyError.
+def _empty_counts():
+    counts = {"cases": 0}
+    for tier in corpus.EXPECTS:
+        counts[tier] = 0
+    return counts
+
+
 def build(docs_dir, base_dir):
     spec = os.path.join(docs_dir, "Bezel_Language_Spec.md")
     stdlib = os.path.join(docs_dir, "Bezel_Standard_Library.md")
@@ -170,8 +183,7 @@ def build(docs_dir, base_dir):
     cases_per_section = {}
     for case in rows:
         key = (case["doc"], case["section"])
-        bucket = cases_per_section.setdefault(
-            key, {"cases": 0, "accept": 0, "reject": 0, "warn": 0, "run": 0})
+        bucket = cases_per_section.setdefault(key, _empty_counts())
         bucket["cases"] += 1
         bucket[case["expect"]] += 1
 
@@ -179,29 +191,25 @@ def build(docs_dir, base_dir):
     for s in sections:
         key = (s["doc"], s["section"])
         counts = cases_per_section.get(
-            key, {"cases": 0, "accept": 0, "reject": 0, "warn": 0, "run": 0})
+            key, _empty_counts())
         c_rows = c_per_section.get(key, 0)
-        out.append({
-            "doc": s["doc"], "section": s["section"], "title": s["title"],
-            "density": s["density"], "appendix-c": c_rows,
-            "cases": counts["cases"], "accept": counts["accept"],
-            "reject": counts["reject"], "warn": counts["warn"],
-            "run": counts["run"],
-            "state": state_of(s["density"], c_rows, counts,
-                              container=s.get("container", False),
-                              ack=acks.get(key)),
-        })
+        row = {"doc": s["doc"], "section": s["section"], "title": s["title"],
+               "density": s["density"], "appendix-c": c_rows,
+               "state": state_of(s["density"], c_rows, counts,
+                                 container=s.get("container", False),
+                                 ack=acks.get(key))}
+        row.update(counts)
+        out.append(row)
     # Cases in a section the documents do not have: a citation error worth seeing.
     known = {(s["doc"], s["section"]) for s in sections}
     for key in sorted(cases_per_section):
         if key not in known:
             counts = cases_per_section[key]
-            out.append({"doc": key[0], "section": key[1],
-                        "title": "(no such section in the document)",
-                        "density": 0, "appendix-c": 0, "cases": counts["cases"],
-                        "accept": counts["accept"], "reject": counts["reject"],
-                        "warn": counts["warn"], "run": counts["run"],
-                        "state": "ORPHAN"})
+            row = {"doc": key[0], "section": key[1],
+                   "title": "(no such section in the document)",
+                   "density": 0, "appendix-c": 0, "state": "ORPHAN"}
+            row.update(counts)
+            out.append(row)
     return out, invariants, c_per_section, problems
 
 
@@ -297,8 +305,10 @@ def main(argv, base_dir=None):
                     help="print the rule-stating sentences of a section (and "
                          "its subsections), numbered, as an authoring checklist")
     ap.add_argument("--invariants", default="",
-                    help="print the Appendix C rows citing sections under this "
-                         "prefix (e.g. 28, or 28.3) and exit")
+                    help="print the Appendix C rows citing SPEC sections under "
+                         "this prefix (e.g. 28, or 28.3) and exit. Appendix C "
+                         "indexes the spec only: a stdlib lane wants "
+                         "--rules lib:<n>")
     args = ap.parse_args(argv)
 
     if args.rules:
@@ -317,6 +327,16 @@ def main(argv, base_dir=None):
 
     if args.invariants:
         want = args.invariants.lstrip("\u00a7")
+        # Appendix C indexes the SPEC. `--invariants 6` from a stdlib lane
+        # silently answered with spec §6 (integer arithmetic) when the lane
+        # meant stdlib §6 (threading) — a wrong answer that looks like a right
+        # one, which is worse than an error.
+        if want.startswith("lib:") or want.startswith("stdlib:"):
+            print("Appendix C indexes the spec only, so there are no invariants "
+                  "for a stdlib section.\nFor the stdlib's own rule-sentences: "
+                  "coverage.py --rules lib:{}"
+                  .format(want.split(":", 1)[1]), file=sys.stderr)
+            return 2
         rows = parse_appendix_c(os.path.join(args.docs, "Bezel_Language_Spec.md"))
         hits = [r for r in rows
                 if any(ref == want or ref.startswith(want + ".")
@@ -324,7 +344,7 @@ def main(argv, base_dir=None):
         for row in hits:
             print("[{}] {}".format(row["group"], row["text"]))
             print()
-        print("{} of {} Appendix C invariants cite \u00a7{}"
+        print("{} of {} Appendix C invariants cite SPEC \u00a7{}"
               .format(len(hits), len(rows), want))
         return 0
 

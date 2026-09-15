@@ -16,15 +16,17 @@ public class Widget
   end constructor;
 end Widget;
 
-public method CountThem<T>(items: IReadOnlyCollection<T>) where T: class
-  Console.WriteLine(items.Count);
-end CountThem;
+public static class Helpers
+  public static method CountThem<T>(items: IReadOnlyCollection<T>) where T: class
+    Console.WriteLine(items.Count);
+  end CountThem;
+end Helpers;
 
 public class Program
   public static method Main()
     using var pool := new OwningArray<Widget>();
     pool.Add(new Widget());
     pool.Add(new Widget());
-    CountThem(pool);
+    Helpers.CountThem(pool);
   end Main;
 end Program;

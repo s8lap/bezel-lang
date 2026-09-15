@@ -6,7 +6,8 @@
 //!   object is disposed, in reverse declaration order.
 //! cites: 28.4, 28.5
 //! expect: run
-//! stdout: dispose second
+//! output: dispose second
+//!   dispose first
 module Conf;
 
 public class Widget

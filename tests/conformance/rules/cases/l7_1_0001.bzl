@@ -15,6 +15,6 @@ import System.IO;
 
 public class Program
   public method Attempt(fs: FileStream, buf: Span<byte>)
-    var t := fs.ReadAsync(buf, 0);
+    using var t := fs.ReadAsync(buf, 0, 16);
   end Attempt;
 end Program;

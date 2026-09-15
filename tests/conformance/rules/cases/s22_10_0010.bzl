@@ -10,6 +10,8 @@
 //! diagnostic: moved-from
 module Conf;
 
+import System.IO;
+
 public class Bad(owned resource: Stream)
   private owned _resource: Stream := resource;
 

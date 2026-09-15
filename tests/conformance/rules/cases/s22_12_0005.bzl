@@ -10,5 +10,9 @@
 module Conf;
 
 public class Constants
-  public const Now: DateTime := DateTime.Now;
+  // The declared type IS a primitive value type, so the only ground for
+  // rejection is that a static-method call is not a constant expression.
+  public const Limit: int := Compute();
+
+  private static method Compute(): int => 5;
 end Constants;

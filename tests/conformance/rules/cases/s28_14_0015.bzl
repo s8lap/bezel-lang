@@ -25,6 +25,6 @@ end Reader;
 
 public class Program
   public static method Main()
-    var r := new Reader(scoped new Stream());
+    using var r := new Reader(scoped new Stream());
   end Main;
 end Program;

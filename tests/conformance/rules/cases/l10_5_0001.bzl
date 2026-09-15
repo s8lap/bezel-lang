@@ -6,7 +6,8 @@
 //!   intrinsic compares the address representation.
 //! cites: 10.5
 //! expect: run
-//! stdout: True
+//! output: True
+//!   True
 module Conf;
 
 import System.Interop;
@@ -14,5 +15,6 @@ import System.Interop;
 public class Program
   public static method Main()
     Console.WriteLine(Ptr<int>.Zero = Ptr<int>.Zero);
+    Console.WriteLine(Ptr<int>.FromIntPtr(IntPtr(1L)) <> Ptr<int>.Zero);
   end Main;
 end Program;

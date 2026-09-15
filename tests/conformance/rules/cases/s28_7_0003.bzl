@@ -7,7 +7,9 @@
 //!   how the move-then-reassign idiom stays single-disposal.
 //! cites: 28.7, 28.8.1
 //! expect: run
-//! stdout: swapped
+//! output: swapped
+//!   dispose first
+//!   dispose second
 module Conf;
 
 public class Widget

@@ -10,11 +10,13 @@
 //! stdout: 7
 module Conf;
 
-public method FirstOf(s: IReadOnlySpan<int>): int => s[0];
+public static class Helpers
+  public static method FirstOf(s: IReadOnlySpan<int>): int => s[0];
+end Helpers;
 
 public class Program
   public static method Main()
     using var buf := new OwningBuffer<int>(1, lambda(i: int): int => 7);
-    Console.WriteLine(FirstOf(buf.AsReadOnlySpan()));
+    Console.WriteLine(Helpers.FirstOf(buf.AsReadOnlySpan()));
   end Main;
 end Program;

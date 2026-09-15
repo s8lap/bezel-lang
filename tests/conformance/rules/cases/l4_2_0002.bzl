@@ -18,15 +18,17 @@ public class Widget
   end destructor;
 end Widget;
 
-public method ClearIt<T>(target: IOwningCollection<T>) where T: class
-  target.Clear();
-end ClearIt;
+public static class Helpers
+  public static method ClearIt<T>(target: IOwningCollection<T>) where T: class
+    target.Clear();
+  end ClearIt;
+end Helpers;
 
 public class Program
   public static method Main()
     using var pool := new OwningArray<Widget>();
     pool.Add(new Widget());
-    ClearIt(pool);
+    Helpers.ClearIt(pool);
     Console.WriteLine("after clear");
   end Main;
 end Program;

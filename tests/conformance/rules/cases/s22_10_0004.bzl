@@ -16,5 +16,7 @@ public class Greeter(name: string, prefix: string)
 
   public method Greet(): string => _label + name;
 
-  public constructor() this(name, "hi") end constructor;
+  public constructor()
+    this(name, "hi");
+  end constructor;
 end Greeter;
