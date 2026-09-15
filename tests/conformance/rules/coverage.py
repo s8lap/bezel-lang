@@ -281,4 +281,11 @@ def main(argv, base_dir=None):
 
 
 if __name__ == "__main__":
+    # `corpus.py summary | head` closes the pipe under us; a traceback there
+    # reads as a tool failure.
+    try:
+        import signal
+        signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+    except (ImportError, AttributeError, ValueError):
+        pass
     sys.exit(main(sys.argv[1:]))
