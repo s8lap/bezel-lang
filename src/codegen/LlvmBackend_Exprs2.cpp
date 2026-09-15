@@ -1531,6 +1531,24 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
             isSharedCellEnvdtorFreeOwner(static_cast<const void*>(sym), &lam)) {
             ce.freeCellInEnvdtor = true;
         }
+        // fix #4261-FORWARD (§28.3 / §27.5 / §28.9, v0.298): the SOLE-
+        // ESCAPING-CAPTURE path for parameters. isSharedCellEnvdtorFreeOwner above
+        // handles SHARED cells (captured by both escaping AND non-escaping lambdas);
+        // it is FALSE for SOLE captures (only one lambda, the escaping one, captures
+        // the parameter). For a sole escaping capture, sharedCellEnvdtorFreeOwner_
+        // is never populated (capturedByNonEscaping is empty), so a parameter like
+        // `n` in `return lambda() => n` never gets ce.freeCellInEnvdtor armed and
+        // its cell leaks. Add the same two guards the captured-LOCALS path uses:
+        // singleCaptureLocals_ (sole holder, no double-free risk) and
+        // definitelyEscapingLambdas_ (the env outlives the frame, so the envdtor
+        // is the cell's only free and is safe from UAF). Params are never for-var.
+        if (!ce.freeCellInEnvdtor &&
+            (!wasGuardedParam || loopStack_.empty()) &&
+            currentFn_ == boxCaptureLocalsFn_ &&
+            definitelyEscapingLambdas_.count(static_cast<const void*>(&lam)) &&
+            singleCaptureLocals_.count(static_cast<const void*>(sym))) {
+            ce.freeCellInEnvdtor = true;
+        }
         // fix #3426 (§27.5 / §28.9, v0.283): the SHARED-cell twin of the branch
         // above. `singleCaptureLocals_` requires this env to be the cell's only
         // holder; when a non-escaping sibling lambda also captures the parameter
