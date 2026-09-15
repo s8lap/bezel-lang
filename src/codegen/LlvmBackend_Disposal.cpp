@@ -1026,6 +1026,15 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
         // libc free(). Mirrors the `rawBytes` flag on the `ffiBuffer` Disposal
         // entry used by the local-scope / parameter paths.
         bool rawBytes = false;
+        // fix #4290: the type name for an `owned` field of a vtableless builtin
+        // type (Mutex, Lock, Semaphore, SemaphoreToken, CancellationTokenSource,
+        // Channel, ChannelSender, Stopwatch, FileStream, TaskCompletionSource,
+        // Atomic, AtomicInteger, etc.).  These have no user TypeDecl and no vtable,
+        // so isOwnedReferenceField returns false and the field would otherwise be
+        // silently skipped.  The name is stored here so emitVtablelessBuiltinRelease
+        // can dispatch to the correct runtime free function.  Empty = not a
+        // vtableless builtin field.
+        std::string vtablelessBuiltin = {};
     };
     std::vector<OwnedField> owned;
     for (const sema::Symbol* m : ts->members) {
@@ -1162,6 +1171,31 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
                 of.rawBytes = isRaw;
                 owned.push_back(of);
             } else {
+            // fix #4290: an `owned` field of a vtableless builtin type (Mutex,
+            // Lock, Semaphore, SemaphoreToken, CancellationTokenSource, Channel,
+            // ChannelSender, Stopwatch, FileStream, TaskCompletionSource, Atomic,
+            // AtomicInteger, etc.).  These have no user TypeDecl
+            // (declaration == nullptr in their TypeRef) and no vtable, so
+            // isOwnedReferenceField returns false and the field would otherwise be
+            // silently skipped.  Classify by name via builtinTypeName +
+            // classifyVtablelessBuiltinRelease.
+            const sema::TypeRef* rt = nullptr;
+            if (fs->decl) {
+                auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
+                if (fd && fd->type) rt = ctx_.resolvedType(*fd->type);
+            } else {
+                rt = ctx_.importedMemberType(fs);
+            }
+            if (rt) {
+                if (auto n = builtinTypeName(rt); !n.empty()) {
+                    if (classifyVtablelessBuiltinRelease(n) !=
+                        VtablelessBuiltinReleaseArm::None) {
+                        OwnedField of{fs, nullptr};
+                        of.vtablelessBuiltin = std::string(n);
+                        owned.push_back(of);
+                    }
+                }
+            }
             // §28.13 / stdlib §2.16 (#620): an `owned` field of Shared<T> or
             // Weak<T> type.  These are compiler-known ref-counted heap objects
             // with no user TypeDecl / no vtable; release via the appropriate
@@ -1444,6 +1478,28 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
             builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), addr);
             builder_.CreateBr(taskContBB);
             builder_.SetInsertPoint(taskContBB);
+            continue;
+        }
+        // fix #4290: an `owned` field of a vtableless builtin type (Mutex, Lock,
+        // Semaphore, SemaphoreToken, CancellationTokenSource, Channel, ChannelSender,
+        // Stopwatch, FileStream, TaskCompletionSource, Atomic, AtomicInteger, etc.).
+        // These have no vtable; dispose via the appropriate runtime free function
+        // (bz_mutex_dispose, bz_lock_release, bz_semaphore_release, etc.) using
+        // the same emitVtablelessBuiltinRelease helper the using-var path uses.
+        // Null the slot after so a re-entrant / second pass is a no-op.
+        if (!it->vtablelessBuiltin.empty()) {
+            llvm::Value* isNull = builder_.CreateICmpEQ(
+                val, llvm::ConstantPointerNull::get(ptrTy()));
+            auto* vbDispBB = llvm::BasicBlock::Create(
+                llvm_, "owned.vb.dispose", currentFn_);
+            auto* vbContBB = llvm::BasicBlock::Create(
+                llvm_, "owned.vb.cont", currentFn_);
+            builder_.CreateCondBr(isNull, vbContBB, vbDispBB);
+            builder_.SetInsertPoint(vbDispBB);
+            emitVtablelessBuiltinRelease(it->vtablelessBuiltin, val);
+            builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), addr);
+            builder_.CreateBr(vbContBB);
+            builder_.SetInsertPoint(vbContBB);
             continue;
         }
         llvm::Value* isNull = builder_.CreateICmpEQ(
