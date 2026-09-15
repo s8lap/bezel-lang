@@ -7,7 +7,8 @@
 //!   which, like any collection, may be enumerated any number of times.
 //! cites: 5, 29.11
 //! expect: run
-//! stdout: 2
+//! output: 2
+//!   3
 module Conf;
 
 public class Program

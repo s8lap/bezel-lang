@@ -8,7 +8,10 @@
 //!   value.
 //! cites: 21.4
 //! expect: run
-//! stdout: 99
+//! output: 99
+//!   99
+//!   99
+//!   done
 module Conf;
 
 public class Program

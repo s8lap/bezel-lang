@@ -498,7 +498,13 @@ ORDER_CLAIM_RE = re.compile(
     r'construction|evaluation|registration)|declaration order|evaluation order|'
     r'disposal order|exactly once|exactly twice|more than once|not run again|'
     r'runs again|re-?runs?\b|re-?enumerat\w+|each iteration|per iteration|'
-    r'on each|idempotent|twice|both .{0,24}(?:run|dispose|fire|print)|'
+    # `on each` must name an OCCASION, not an object. "the other format's
+    # properties are null on each instance" (stdlib §2.15) is a claim about a
+    # value on every instance, which one printed line checks completely; it was
+    # the signal's only object-noun false positive in 1913 cases.
+    r'on each (?:\w+ )?(?:call|invocation|iteration|enumeration|run|pass|'
+    r'attempt|use|request|acquisition)|'
+    r'idempotent|twice|both .{0,24}(?:run|dispose|fire|print)|'
     r'never (?:runs|re-?runs|fires)|\bthen\b.{0,60}\bthen\b|'
     # Added after a §31 lane found two claims the vocabulary could not see:
     # "used when the body contains multiple statements" and "one statement

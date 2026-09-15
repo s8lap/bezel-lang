@@ -6,7 +6,7 @@
 //!   matches and whose guard is true is selected.
 //! cites: 19.4
 //! expect: run
-//! stdout: Hot: 35
+//! output: Hot: 35
 module Conf;
 
 public class Program
