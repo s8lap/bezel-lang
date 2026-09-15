@@ -232,15 +232,65 @@ inline bool calleeReturnMayAliasStringArgUnretained(
                (t->declaration->kind == ast::TypeDeclKind::Record ||
                 t->declaration->kind == ast::TypeDeclKind::Choice);
     };
+    // fix #4301 (§9.7/§28.9, v0.298): `isRecordOrChoiceDeclared` is content-blind —
+    // it fires whenever the callee return type (or InlineArray element) is
+    // Record/Choice-declared, suppressing the caller-side release of a string
+    // argument on the basis that the record/choice's own fast-path constructor
+    // store embeds the string unretained.  That reasoning is only sound when the
+    // record/choice actually HAS a directly string-typed field.  A
+    // Record/Choice whose fields are all Class-typed (or Record/Choice-typed
+    // with no string of their own) does NOT embed the string argument via the
+    // raw fast path — the Class (or inner Record/Choice) retains it separately —
+    // and the caller-side suppression is a pure leak.
+    //
+    // This helper answers "does this Record/Choice have a field whose declared
+    // type is `string`?" by walking the declaration's positional parameters and
+    // body fields.  Record/Choice field types are always locally inspectable
+    // (the declaration is never imported separately from the method), so no
+    // `isImported` guard is needed here — unlike the Class-field walk below.
+    auto recordOrChoiceHasStringField =
+        [&](const sema::TypeRef* t) -> bool {
+            if (!t || t->kind != sema::TypeRef::Kind::Named ||
+                !t->declaration ||
+                (t->declaration->kind != ast::TypeDeclKind::Record &&
+                 t->declaration->kind != ast::TypeDeclKind::Choice)) {
+                return false;
+            }
+            const auto* ts = static_cast<const sema::TypeSymbol*>(t->declaration);
+            for (const sema::Symbol* mem : ts->members) {
+                const auto* fs = dynamic_cast<const sema::FieldSymbol*>(mem);
+                if (!fs) continue;
+                // Positional parameter (record positional field): type is in posParam
+                if (fs->posParam && fs->posParam->type) {
+                    if (auto* tr = ctx.resolvedType(*fs->posParam->type)) {
+                        if (tr->kind == sema::TypeRef::Kind::Primitive &&
+                            tr->primitive == sema::PrimitiveType::String) {
+                            return true;
+                        }
+                    }
+                }
+                // Body field: type is in the FieldDecl
+                const auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
+                if (!fd || !fd->type) continue;
+                if (auto* tr = ctx.resolvedType(*fd->type)) {
+                    if (tr->kind == sema::TypeRef::Kind::Primitive &&
+                        tr->primitive == sema::PrimitiveType::String) {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        };
     // fix #4265 / #4280: does an INLINE-ARRAY ELEMENT type embed a plain
     // string argument via a bare per-slot store with no retain? Two proven
     // shapes: the element IS `string` (#4265), or the element is a
-    // Record/Choice whose own fast-path constructor store is the identical
-    // raw shape (#4280). Deliberately NOT "any Named" — a CLASS-typed
-    // element retains via `lowerStringFieldStore` when ITS OWN field is
-    // `string`-typed (see the walkCallArgs call site's CLASS-exclusion
-    // history for the send-back that measured the one case where that is
-    // NOT true: a class whose field is Record/Choice-typed one level in).
+    // Record/Choice with a direct string field whose constructor uses the
+    // identical raw fast path (#4280, narrowed by fix #4301).  Deliberately
+    // NOT "any Named" — a CLASS-typed element retains via
+    // `lowerStringFieldStore` when ITS OWN field is `string`-typed (see the
+    // walkCallArgs call site's CLASS-exclusion history for the send-back that
+    // measured the one case where that is NOT true: a class whose field is
+    // Record/Choice-typed one level in).
     auto elementMayEmbedStringArgUnretained =
         [&](const sema::TypeRef* elem) {
             if (!elem) return false;
@@ -248,9 +298,16 @@ inline bool calleeReturnMayAliasStringArgUnretained(
                 elem->primitive == sema::PrimitiveType::String) {
                 return true;
             }
-            return isRecordOrChoiceDeclared(elem);
+            return isRecordOrChoiceDeclared(elem) &&
+                   recordOrChoiceHasStringField(elem);
         };
-    if (isRecordOrChoiceDeclared(crt)) return true;
+    // fix #4301: only suppress when the Record/Choice actually has a direct
+    // string field — a Record/Choice whose fields are all Class-typed (or
+    // Record/Choice-typed with no string of their own) does NOT embed the
+    // string via the raw fast path.
+    if (isRecordOrChoiceDeclared(crt) && recordOrChoiceHasStringField(crt)) {
+        return true;
+    }
     // fix #4300 (§9.7/§28.3, v0.298): the top-level arm above correctly
     // suppresses the caller-side release when the callee return type IS
     // Record/Choice-declared, and `elementMayEmbedStringArgUnretained` (applied
