@@ -209,7 +209,7 @@ Every statement shape:
 
 ```bezel
 // declarations
-var balance: decimal;                       // typed, no initializer — `0m` (§7.9); assign before use
+var balance: decimal;                       // typed, no initializer — `0m` (§7.9); the compiler does not yet admit the read — assign before use until it does
 var greeting := "Hello";                    // inferred
 const Pi: double := 3.14159;                // single-assignment binding (§21.1)
 using var _ := mutex.Acquire();             // anonymous owning binding; `await using var` in async bodies
