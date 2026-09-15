@@ -1157,6 +1157,12 @@ private:
         // rebound to the cell holder). Measured on the pre-fix compiler as a
         // SIGSEGV at address 0, not a leak. See consumeLastLambdaCapturedCells.
         bool isParam = false;
+        // fix #4261 (§28.3, v0.298): disposeStack_.size() at the time this
+        // entry was pushed. consumeLastLambdaCapturedCells drains only entries
+        // with pushScopeDepth >= the current disposeStack_.size(), so entries
+        // pushed at a SHALLOWER scope (belonging to an outer lambda) are
+        // PRESERVED and remain for that outer lambda's later consume call.
+        std::size_t pushScopeDepth = 0;
     };
     std::vector<LastCellEntry> lastLambdaCapturedCells_;
     // §27.5 / §28.9 (#969): block-nesting depth (== disposeStack_.size()) of each

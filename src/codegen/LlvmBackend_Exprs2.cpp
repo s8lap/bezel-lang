@@ -1422,6 +1422,7 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
             // parameter (which goes through the cell after boxing) dereferenced
             // a nulled holder: a SIGSEGV, measured on the pre-fix compiler.
             lce.isParam = true;
+            lce.pushScopeDepth = disposeStack_.size();  // fix #4261 §28.3
             lastLambdaCapturedCells_.push_back(lce);
         }
         // #429/#672: resolve sema type for retain/release classification.
@@ -1907,6 +1908,7 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
                 // fix #2334: see the param-capture site above.
                 lce.unwindUnsafe = unwindUnsafeCellFree_.count(
                                        static_cast<const void*>(decl)) != 0;
+                lce.pushScopeDepth = disposeStack_.size();  // fix #4261 §28.3
                 lastLambdaCapturedCells_.push_back(lce);
             }
             // fix #3508 (§27.5 / §28.9, v0.286): the #969/#3403 depth guard
@@ -2397,6 +2399,12 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     // lowerLocalDecl (our caller) sees the outer lambda's cells.
     auto savedLambdaCapturedCells = std::move(lastLambdaCapturedCells_);
     lastLambdaCapturedCells_.clear();
+    // fix #4261 (§28.3, v0.298): sync path save of outer function's closure-
+    // release eligibility. Declared here at outer scope so the restore in the
+    // general restore section (below) is in scope. (Async path saves/restores
+    // its own copy inside the `if (lam.isAsync)` block.)
+    auto savedClosureRelEligOuter = closureReleaseEligible_;
+    llvm::Function* savedClosureRelEligFnOuter = closureReleaseEligibleFn_;
     currentFn_ = fn;
     currentThis_ = nullptr;
     // #2515 / §27.3: a lambda body is NOT a method body — its `return` is an
@@ -3069,6 +3077,20 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         multiCaptureLocals_.insert(k);
         singleCaptureLocals_.erase(k);
     }
+    // fix #4261 (§28.3, v0.298): sync lambda body emission clobbers
+    // closureReleaseEligibleFn_ (set to the lambda's fn just below), which
+    // breaks lowerLocalDecl's `currentFn_ == closureReleaseEligibleFn_` guard
+    // for THIS lambda's own closure cell: the check fails (outer-fn ==
+    // inner-fn) and closureRelease is never registered for this lambda's cell
+    // → deterministic 40 B/invocation leak (lam$2 in the issue's repro).
+    // Save closureReleaseEligibleFn_ (not the set — it is restored at line
+    // 3287 from the save at line 2354, which happened BEFORE lowerBody
+    // populated it with the lambda's own locals).  The set is NOT saved here
+    // because lowerBody's collectClosureReleaseEligible call modifies it in
+    // place; restoring the pre-lowerBody Main state at line 3287 (before
+    // lowerLocalDecl runs for this lambda's own cell) is what makes the guard
+    // pass.  The async path mirrors this pattern (save fn only, not set).
+    savedClosureRelEligFnOuter = closureReleaseEligibleFn_;
     closureReleaseEligibleFn_ = fn;
     // fix #4174 follow-up: the closure twin of the string parameter retain
     // above (line ~2479) — see retainAssignedClosureParams' own comment.
@@ -3316,6 +3338,10 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     currentReturnTypeNode_ = savedCurrentReturnTypeNode;  // #2515
     currentLambdaReturnSemaTy_ = savedLambdaRetSemaTy;    // fix #2688
     lambdaParamTypeHint_ = std::move(savedLambdaParamHints);
+    // fix #4261 (§28.3, v0.298): restore outer function's closure-release
+    // eligibility (sync path; async path restores at its own site, lines 2677).
+    closureReleaseEligible_ = std::move(savedClosureRelEligOuter);
+    closureReleaseEligibleFn_ = savedClosureRelEligFnOuter;
     currentFn_ = savedFn;
     currentThis_ = savedThis;
     locals_ = std::move(savedLocals);

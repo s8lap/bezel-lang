@@ -15793,6 +15793,12 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
     if (slot && v)
         armValueLikeChoiceStrRelease(static_cast<const void*>(declNode), slot,
                                      declNode);
+    // fix #4261 (§28.3, v0.298): for a lambda-typed local, lowerExpr just called
+    // lowerLambda which saved/restored closureReleaseEligible_ (returning it to
+    // the outer function's state — empty). The closure arm below needs declNode in
+    // closureReleaseEligible_ to fire. Add it here, after lowerExpr returns.
+    if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(init))
+        closureReleaseEligible_.insert(static_cast<const void*>(declNode));
     // #422 / #429 / §27.5 / §28.9: if this `var` closure (function-typed) local
     // was proven non-escaping and initialized by a +1 closure producer (a lambda
     // expression, a method reference, or a call to a user-defined closure-
@@ -16672,7 +16678,17 @@ void Emitter::attachOwningTaskResultDisposer(Disposal& d,
 // the only change is the unconditional clear at the end (the caller no longer
 // clears — the helper owns the vector's lifetime).
 void Emitter::consumeLastLambdaCapturedCells() {
+    // fix #4261 (§28.3, v0.298): drain only entries whose push scope depth is at
+    // or below the current scope. Entries pushed at a SHALLOWER scope belong to an
+    // OUTER lambda and must be PRESERVED for that lambda's later consume call.
+    const std::size_t currentScopeDepth = disposeStack_.size();
     for (const auto& ce : lastLambdaCapturedCells_) {
+        if (ce.pushScopeDepth < currentScopeDepth) {
+            // Belongs to an outer lambda; skip processing entirely — it will be
+            // handled by the outer lambda's consumeLastLambdaCapturedCells call.
+            continue;
+        }
+        // This entry is from the current or a nested scope; process it.
         // Check: does this cell's slot have any reads-through-cell disposal?
         // #966: the cell must outlive ANY disposal that reads the captured
         // value THROUGH it — INCLUDING one registered in an ENCLOSING scope
@@ -16780,13 +16796,19 @@ void Emitter::consumeLastLambdaCapturedCells() {
         if (ce.isParam && disposeStack_.size() > 1) continue;
         auto dd = declScopeDepth_.find(ce.key);
         if (dd != declScopeDepth_.end() && dd->second < disposeStack_.size()) {
-            // A pattern binding is established by the case matcher in the
-            // arm's owning scope, while its capturing lambda may be nested
-            // in a `do ... end`. Defer the cell free to that owner scope;
-            // freeing it at the nested lambda scope would leave later arm
-            // reads (or a subsequent loop iteration) with a dangling cell.
-            // Ordinary outer locals retain the conservative leak behavior
-            // here: their cell may still be read after this inner scope.
+            // fix #4261: before deferring, check whether an OUTER scope has
+            // already registered boxedCellFree for this slot...
+            bool hasOuterBoxedCellFree = false;
+            for (std::size_t si = 0; si < disposeStack_.size() - 1; ++si) {
+                for (const auto& existing : disposeStack_[si]) {
+                    if (existing.slot == ce.newSlot && existing.boxedCellFree) {
+                        hasOuterBoxedCellFree = true;
+                        break;
+                    }
+                }
+                if (hasOuterBoxedCellFree) break;
+            }
+            if (hasOuterBoxedCellFree) continue;
             auto* keyNode = static_cast<const ast::Node*>(ce.key);
             bool patternBinding =
                 dynamic_cast<const ast::BindingPattern*>(keyNode) != nullptr;
@@ -16802,7 +16824,7 @@ void Emitter::consumeLastLambdaCapturedCells() {
                 if (!alreadyDeferred) {
                     Disposal dcd{ce.newSlot, nullptr};
                     dcd.boxedCellFreeDeferred = true;
-                    dcd.skipCellFreeOnUnwind = ce.unwindUnsafe;  // fix #2334
+                    dcd.skipCellFreeOnUnwind = ce.unwindUnsafe;
                     disposeStack_[ownerScopeIdx].push_back(dcd);
                     if (ce.inlineArrayN > 0) {
                         Disposal da{ce.newSlot, nullptr};
@@ -16834,9 +16856,24 @@ void Emitter::consumeLastLambdaCapturedCells() {
             disposeStack_.back().push_back(da);
         }
     }
-    // The vector belongs to the most-recent lowerLambda call; clear it so the
-    // next lowerLambda / lowerLocalDecl starts fresh.
-    lastLambdaCapturedCells_.clear();
+    // Erase entries that were processed in this call AND belong to nested lambdas
+    // (deeper scope). Preserve entries from outer lambdas (shallower scope) and
+    // entries from the CURRENT lambda (same scope) — the latter are erased when
+    // THIS lambda's own consume call fires (at the same or a shallower scope depth).
+    //
+    // fix #4261 (§28.3, v0.298): the original `>=` erased entries at the CURRENT
+    // scope too, which erased an OUTER lambda's entry when a MIDDLE lambda's arm
+    // fired — the outer lambda's arm then saw an empty vector and did not register
+    // boxedCellFree for its captured cell, producing the 40 B/invocation leak.
+    // The `>` operator preserves entries at the current scope, which belong to
+    // the current lambda (erased when this lambda's own consume fires at the
+    // same depth) or an outer lambda (preserved for the outer lambda's consume).
+    lastLambdaCapturedCells_.erase(
+        std::remove_if(lastLambdaCapturedCells_.begin(), lastLambdaCapturedCells_.end(),
+                       [currentScopeDepth](const LastCellEntry& ce) {
+                           return ce.pushScopeDepth > currentScopeDepth;
+                       }),
+        lastLambdaCapturedCells_.end());
 }
 
 // fix #2975 (§29.7 / §29.3 / §28.3 / §28.2 / §8.1, v0.240): ANSWER, for a local
