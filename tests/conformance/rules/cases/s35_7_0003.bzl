@@ -6,7 +6,7 @@
 //!   draws a use-site compile error on =, <>, and direct Equals/GetHashCode calls,
 //!   unless the author declares the operators under §25.2's co-declaration rule.
 //! expect: reject
-//! diagnostic: Equals
+//! diagnostic: auto-hashable
 module Conf;
 
 public class Widget

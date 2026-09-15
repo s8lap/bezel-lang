@@ -5,7 +5,8 @@
 //! rule: The generated ToString produces TypeName.CaseName(field1: value1, ...), and
 //!   TypeName.CaseName for a payload-free case.
 //! expect: run
-//! stdout: Status.Active(code: 7)
+//! output: Status.Active(code: 7)
+//!   Status.Inactive
 module Conf;
 
 public choice Status

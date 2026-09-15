@@ -3,7 +3,8 @@
 //! section: 28.3
 //! title: a using var local can never be moved out of
 //! rule: `using var` is never movable out of: `using var fresh := new Buffer(); return
-//!   fresh;` is a compile error.
+//!   fresh;` is a compile error; a factory uses plain `var`.
+//! cites: 28.10
 //! expect: reject
 //! diagnostic: using var
 module Conf;
@@ -11,21 +12,11 @@ module Conf;
 public class Buffer
   public constructor()
   end constructor;
-
-  public method CloneBuffer(): owned Buffer => new Buffer();
 end Buffer;
 
-public class Wrapper
-  private owned _inner: Buffer;
-
-  public constructor(owned inner: Buffer)
-    _inner := inner;
-  end constructor;
-end Wrapper;
-
-public class Program
-  public method Wrap(s: Buffer): owned Wrapper
-    using var copy := s.CloneBuffer();
-    return new Wrapper(move copy);
-  end Wrap;
-end Program;
+public class Factory
+  public method Make(): owned Buffer
+    using var fresh := new Buffer();
+    return fresh;
+  end Make;
+end Factory;

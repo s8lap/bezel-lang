@@ -20,7 +20,8 @@ end Outcome;
 
 public class Program
   public static method Peek(outcome: Outcome)
-    case outcome of     // unmarked scrutinee: a borrowing match, whatever `outcome`'s own state
+    case outcome of     // `outcome` is owned (move-only params pass by value-move, §15.3),
+                        //   but the unmarked scrutinee still makes this a borrowing match
       Fetched(move response = var r) => Console.WriteLine("ok"),   // ERROR: no obligation to transfer
       Failed(_) => Console.WriteLine("failed")
     end case;

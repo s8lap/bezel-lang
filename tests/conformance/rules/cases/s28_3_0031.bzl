@@ -3,7 +3,8 @@
 //! section: 28.3
 //! title: a merge of an owned branch with a borrowed branch is rejected
 //! rule: At a control-flow merge, owned meets borrowed is rejected: the program must
-//!   equalize the branches before the merge.
+//!   equalize the branches before the merge; the compiler never equalizes for it.
+//! cites: C.3
 //! expect: reject
 //! diagnostic: borrowed
 module Conf;
@@ -31,6 +32,5 @@ public class Program
     else
       x := reg.Current;
     end;
-    x.Dispose();
   end Demo;
 end Program;

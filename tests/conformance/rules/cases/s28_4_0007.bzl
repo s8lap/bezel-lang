@@ -3,9 +3,11 @@
 //! section: 28.4
 //! title: a throwing disposer does not skip the remaining disposals in the same cleanup pass
 //! rule: In a multi-value cleanup pass, a throwing disposer does not skip the remaining
-//!   values: every remaining disposal still runs.
+//!   values: every remaining disposal still runs, and the exception then propagates
+//!   from the disposal point.
 //! expect: run
-//! stdout: dispose w
+//! output: dispose w
+//!   caught
 module Conf;
 
 public class Widget

@@ -2,10 +2,13 @@
 //! doc: spec
 //! section: 28.4
 //! title: the destructor body runs on disposal, never on construction unwind
-//! rule: A constructor that throws unwinds instead: already-completed owned fields are
-//!   disposed, and the throwing class's own destructor body is not run.
+//! rule: A constructor that throws unwinds instead: owned fields assigned before the
+//!   throwing statement are disposed, and the throwing class's own destructor body
+//!   is not run.
+//! cites: 22.9
 //! expect: run
-//! stdout: widget disposed
+//! output: widget disposed
+//!   caught
 module Conf;
 
 public class Widget
@@ -33,7 +36,7 @@ end Faulty;
 public class Program
   public static method Main()
     try
-      var f := new Faulty();
+      using var f := new Faulty();
     catch
       var ex: InvalidOperationException => Console.WriteLine("caught")
     end try;

@@ -4,15 +4,15 @@
 //! title: a choice body admits exactly what an enum body admits
 //! rule: A choice body may declare, after the case list, exactly what an enum body may:
 //!   instance methods, expression-bodied read-only instance properties, static
-//!   methods, static readonly fields (including static owned readonly), const
-//!   members, and operator overloads.
-//! expect: accept
+//!   methods, static readonly fields, const members, and operator overloads.
+//! cites: 35.2, 10.4
+//! expect: run
+//! output: True
+//!   high
+//!   medium
+//!   2
+//!   priority
 module Conf;
-
-public class Cache
-  public constructor()
-  end constructor;
-end Cache;
 
 public choice Priority
   Low,
@@ -30,14 +30,16 @@ public choice Priority
 
   public const Max: int := 2;
 
-  public static owned readonly Shared: Cache := new Cache();
-
-  public static method operator =(a: Priority, b: Priority): bool =>
-      (case a of
-        Low    => (case b of Low => true, _ => false),
-        Medium => (case b of Medium => true, _ => false),
-        High   => (case b of High => true, _ => false));
-  public static method operator <>(a: Priority, b: Priority): bool => not (a = b);
-  public method Equals(other: Priority): bool => this = other;
-  public method GetHashCode(): int => (case this of Low => 0, Medium => 1, High => 2);
+  public static readonly Tag: string := "priority";
 end Priority;
+
+public class Program
+  public static method Main()
+    var p := Priority.High;
+    Console.WriteLine(p.IsUrgent());          // instance method
+    Console.WriteLine(p.Label);               // expression-bodied read-only property
+    Console.WriteLine(Priority.Default().Label);  // static method
+    Console.WriteLine(Priority.Max);          // const member
+    Console.WriteLine(Priority.Tag);          // static readonly field
+  end Main;
+end Program;

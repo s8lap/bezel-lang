@@ -14,6 +14,9 @@ public class Widget
 end Widget;
 
 public class Sink
+  public constructor()
+  end constructor;
+
   public method Adopt(owned w: Widget)
     w.Dispose();
   end Adopt;

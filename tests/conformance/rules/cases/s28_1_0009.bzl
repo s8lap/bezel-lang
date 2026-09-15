@@ -2,9 +2,9 @@
 //! doc: spec
 //! section: 28.1
 //! title: owned on a bare unconstrained type parameter is admitted
-//! rule: `owned` on a bare type parameter's meaning is fixed per instantiation: the
-//!   generic body type-checks under the class-or-interface assumption, and marker-
-//!   keyed forms written under that assumption remain admissible.
+//! rule: `owned` requires the declared type, nullability stripped, to be a class type,
+//!   an interface type, or a bare type parameter; at a bare type parameter the
+//!   generic body type-checks under the class-or-interface assumption.
 //! cites: 28.3
 //! expect: accept
 module Conf;

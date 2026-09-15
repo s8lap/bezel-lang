@@ -5,11 +5,17 @@
 //! rule: A named slot may carry the transfer marker on its source: Fetched(move
 //!   response = var r) transfers the payload into r at arm selection, exactly as
 //!   the corresponding positional slot would.
+//! cites: 35.5, 19.3
 //! expect: run
-//! stdout: adopted
+//! output: adopted
+//!   widget disposed
+//!   after
 module Conf;
 
 public class Widget
+  public constructor()
+  end constructor;
+
   destructor
     Console.WriteLine("widget disposed");
   end destructor;
@@ -32,10 +38,11 @@ public class Program
     using var client := new Client();
     case client.Fetch() of
       Fetched(move response = var r) => do
-        using var w := move r;
+        using var w := move r;               // `r` owns the payload: the adopt is admitted
         Console.WriteLine("adopted");
       end,
       Failed(_) => Console.WriteLine("failed")
     end case;
+    Console.WriteLine("after");
   end Main;
 end Program;

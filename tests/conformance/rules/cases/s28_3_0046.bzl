@@ -2,13 +2,18 @@
 //! doc: spec
 //! section: 28.3
 //! title: a case scrutinee's unbound owned temporary survives the selected arm
-//! rule: A case scrutinee extends the disposal boundary to the whole case construct,
-//!   keeping pattern bindings alive through the selected arm.
+//! rule: A `case` scrutinee extends the disposal boundary to the whole `case`
+//!   construct, so pattern bindings survive the selected arm.
+//! cites: C.3
 //! expect: run
-//! stdout: w
+//! output: w
+//!   disposed
 module Conf;
 
 public class Widget
+  public constructor()
+  end constructor;
+
   destructor
     Console.WriteLine("disposed");
   end destructor;
@@ -17,6 +22,9 @@ public class Widget
 end Widget;
 
 public class Factory
+  public constructor()
+  end constructor;
+
   public method Make(): owned Widget => new Widget();
 end Factory;
 

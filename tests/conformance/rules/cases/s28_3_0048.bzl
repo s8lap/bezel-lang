@@ -2,13 +2,19 @@
 //! doc: spec
 //! section: 28.3
 //! title: an owned local live across an exception edge is disposed during unwinding
-//! rule: Edge parity: the exception edge performs the same implicit disposal as the
-//!   normal edge, on the single establishment-ordered cleanup stack.
+//! rule: Edge parity: owned locals live when an exception propagates out of their
+//!   enclosing block are disposed implicitly during stack unwinding, exactly as on
+//!   the normal edge.
+//! cites: C.3
 //! expect: run
-//! stdout: disposed
+//! output: disposed
+//!   caught
 module Conf;
 
 public class Widget
+  public constructor()
+  end constructor;
+
   destructor
     Console.WriteLine("disposed");
   end destructor;

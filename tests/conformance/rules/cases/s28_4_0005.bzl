@@ -4,15 +4,17 @@
 //! title: the destructor body runs exactly once, the first time Dispose is called
 //! rule: A class may declare at most one destructor. Its body runs exactly once, the
 //!   first time `Dispose()` is called.
+//! cites: 28.2
 //! expect: run
-//! stdout: 1
+//! output: disposed
 module Conf;
 
 public class Widget
-  public static Count: int := 0;
+  public constructor()
+  end constructor;
 
   destructor
-    Count := Count + 1;
+    Console.WriteLine("disposed");
   end destructor;
 end Widget;
 
@@ -22,6 +24,5 @@ public class Program
       using var w := new Widget();
       w.Dispose();
     end;
-    Console.WriteLine($"{Widget.Count}");
   end Main;
 end Program;

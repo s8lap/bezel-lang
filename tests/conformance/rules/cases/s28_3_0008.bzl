@@ -17,6 +17,5 @@ public class Program
   public method Demo(useFresh: bool)
     var cached := new Widget();
     var picked := (if useFresh then new Widget() else cached);
-    picked.Dispose();
   end Demo;
 end Program;

@@ -3,12 +3,18 @@
 //! section: 28.3
 //! title: using var y := move x is the adoption spelling
 //! rule: `using var y := move x;` is the standard way to turn an owned local's
-//!   obligation into scope-bound disposal.
+//!   obligation into scope-bound disposal: the value is disposed at the end of the
+//!   adopting block.
+//! cites: 28.10
 //! expect: run
-//! stdout: before end
+//! output: before end
+//!   disposed
 module Conf;
 
 public class Widget
+  public constructor()
+  end constructor;
+
   destructor
     Console.WriteLine("disposed");
   end destructor;

@@ -4,11 +4,16 @@
 //! title: assigning null into an owned-state C? location disposes the displaced value
 //! rule: For an owning C, x := null; on an owned C? location is drop-on-overwrite — the
 //!   displaced value's payloads are disposed.
+//! cites: 35.9, 35.4, 28.7
 //! expect: run
-//! stdout: widget disposed
+//! output: widget disposed
+//!   nulled
 module Conf;
 
 public class Widget
+  public constructor()
+  end constructor;
+
   destructor
     Console.WriteLine("widget disposed");
   end destructor;
@@ -22,7 +27,7 @@ end Outcome;
 public class Program
   public static method Main()
     var o: Outcome? := Outcome.Fetched(new Widget());
-    o := null;             // drop-on-overwrite: the displaced value's payloads are disposed
+    o := null;             // drop-on-overwrite: the displaced value's payloads are disposed here
     Console.WriteLine("nulled");
   end Main;
 end Program;

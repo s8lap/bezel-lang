@@ -3,7 +3,8 @@
 //! section: 28.3
 //! title: an explicit Dispose while a borrow is live is not frozen
 //! rule: Site-announced kills are unfrozen: an explicit `Dispose()` is permitted while
-//!   borrows of the value live.
+//!   a live local borrow of the value exists — a borrow is live when some path from
+//!   the consume site reaches a later use of it.
 //! expect: accept
 module Conf;
 
@@ -17,5 +18,6 @@ public class Program
     var w := new Widget();
     var b := w;
     w.Dispose();
+    var alias := b;
   end Demo;
 end Program;

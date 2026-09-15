@@ -4,14 +4,18 @@
 //! title: a class with a public parameterless constructor satisfies where T: new()
 //! rule: For `where T: new()`, a class substitution satisfies the constraint
 //!   exactly when the class declares a parameterless constructor that is
-//!   `public` (§14.2).
-//! cites: 14.2
+//!   `public`; inside the generic body `new T()` produces an owned reference
+//!   via that constructor (§14.2).
+//! cites: 14.2, 28.1
 //! expect: run
-//! stdout: Conf.Widget
+//! stdout: made
 module Conf;
 
 public class Widget
+  public property Tag: string;
+
   public constructor()
+    Tag := "made";
   end constructor;
 end Widget;
 
@@ -22,6 +26,6 @@ end Factory;
 public class Program
   public static method Main()
     using var w := Factory.Make<Widget>();
-    Console.WriteLine(w);
+    Console.WriteLine(w.Tag);
   end Main;
 end Program;

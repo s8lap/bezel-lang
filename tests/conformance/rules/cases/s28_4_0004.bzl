@@ -2,10 +2,12 @@
 //! doc: spec
 //! section: 28.4
 //! title: an owning-inline-array field disposes only its non-null slots
-//! rule: Disposing all owned-bearing fields covers fields of owning-inline-array type:
-//!   each non-null slot's `Dispose()` is called.
+//! rule: Disposing all owned-bearing fields covers fields of owning-inline-array type
+//!   (`[N owned]T?`): each non-null slot's `Dispose()` is called, and a null slot
+//!   disposes nothing.
+//! cites: 15.1.1
 //! expect: run
-//! stdout: dispose a
+//! output: dispose a
 module Conf;
 
 public class Widget

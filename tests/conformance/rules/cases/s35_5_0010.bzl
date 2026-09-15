@@ -1,18 +1,18 @@
 //! case: s35_5_0010
 //! doc: spec
 //! section: 35.5
-//! title: an unmarked named slot never transfers and is disposed at construct completion
-//! rule: An unmarked named slot never transfers: a getter may not return a fresh owned
-//!   value, so in an owning match an owned payload matched by an unmarked named
-//!   slot is borrowed during the arm and disposed at construct completion.
-//! expect: run
-//! stdout: borrowed
+//! title: an unmarked named slot does not transfer, so its binding cannot be moved
+//! rule: An unmarked named slot never transfers: in an owning match an owned payload
+//!   matched by an unmarked named slot is borrowed during the arm and disposed at
+//!   construct completion, exactly as a discarded slot.
+//! cites: 35.5, 19.3
+//! expect: reject
+//! diagnostic: never transfers
 module Conf;
 
 public class Widget
-  destructor
-    Console.WriteLine("widget disposed");
-  end destructor;
+  public constructor()
+  end constructor;
 end Widget;
 
 public choice Outcome
@@ -30,8 +30,10 @@ end Client;
 public class Program
   public static method Main()
     using var client := new Client();
-    case client.Fetch() of
-      Fetched(response = var r) => Console.WriteLine("borrowed"),  // unmarked: `r` is a borrow, not transferred
+    case client.Fetch() of                     // owning match over the temporary
+      Fetched(response = var r) => do
+        using var w := move r;                 // ERROR: unmarked slot, so `r` is a borrow
+      end,
       Failed(_) => Console.WriteLine("failed")
     end case;
   end Main;

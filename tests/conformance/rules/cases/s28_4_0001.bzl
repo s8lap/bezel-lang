@@ -2,20 +2,28 @@
 //! doc: spec
 //! section: 28.4
 //! title: the generated Dispose runs the destructor body, then owned fields, then the base chain
-//! rule: The compiler generates a public, idempotent `Dispose()` that runs the
-//!   destructor body, disposes owned-bearing fields in reverse declaration order,
-//!   then chains to the base class's `Dispose()`.
+//! rule: The compiler generates a public, idempotent `Dispose()` that (1) runs the
+//!   destructor body, (2) disposes all owned-bearing fields in reverse declaration
+//!   order, (3) chains to the base class's `Dispose()`.
 //! expect: run
-//! stdout: derived disposed
+//! output: derived disposed
+//!   field disposed
+//!   base disposed
 module Conf;
 
 public class Widget
+  public constructor()
+  end constructor;
+
   destructor
     Console.WriteLine("field disposed");
   end destructor;
 end Widget;
 
 public class Base
+  public constructor()
+  end constructor;
+
   destructor
     Console.WriteLine("base disposed");
   end destructor;

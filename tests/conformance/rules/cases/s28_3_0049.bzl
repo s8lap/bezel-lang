@@ -3,12 +3,17 @@
 //! section: 28.3
 //! title: a do end block disposes a using var early, before the outer scope continues
 //! rule: To dispose earlier than the method's end, nest a `do … end` block; the block
-//!   ends a scope early.
+//!   ends a scope early and the `using var` is disposed at that end.
+//! cites: 28.10
 //! expect: run
-//! stdout: disposed
+//! output: disposed
+//!   after block
 module Conf;
 
 public class Widget
+  public constructor()
+  end constructor;
+
   destructor
     Console.WriteLine("disposed");
   end destructor;

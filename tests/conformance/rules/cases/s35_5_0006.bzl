@@ -5,11 +5,17 @@
 //! rule: Payloads not transferred into bindings — discarded slots like Fetched(_) — are
 //!   disposed when the construct completes, by the same unbound-temporary pass
 //!   that disposes the container.
+//! cites: 35.5, 28.3
 //! expect: run
-//! stdout: hit
+//! output: hit
+//!   widget disposed
+//!   after
 module Conf;
 
 public class Widget
+  public constructor()
+  end constructor;
+
   destructor
     Console.WriteLine("widget disposed");
   end destructor;
@@ -34,5 +40,6 @@ public class Program
       Fetched(_) => Console.WriteLine("hit"),   // owned payload never bound
       Failed(_)  => Console.WriteLine("other")
     end case;
+    Console.WriteLine("after");                 // the payload is gone before this line runs
   end Main;
 end Program;

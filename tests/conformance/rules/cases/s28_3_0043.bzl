@@ -4,8 +4,10 @@
 //! title: an unbound owned temporary is disposed at the end of the full expression
 //! rule: An unbound owned temporary is disposed at the end of the full expression in
 //!   which it is produced, after every borrowing use within that expression.
+//! cites: C.3
 //! expect: run
-//! stdout: widget temp
+//! output: widget temp
+//!   dispose temp
 module Conf;
 
 public class Widget

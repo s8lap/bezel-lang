@@ -2,10 +2,9 @@
 //! doc: spec
 //! section: 28.3
 //! title: an undischarged plain-var owned local raises the must-use warning
-//! rule: An owned value reaching its scope's end undischarged is disposed there
-//!   automatically; the only difference between the normal and the exception edge
-//!   is a lint — a plain-`var` implicit drop on normal exit raises the must-use
-//!   warning, and the exception edge is silent.
+//! rule: The compiler emits a warning at the implicit-drop site of a plain-`var` owned
+//!   local, to surface a drop that may have been unintended; the exception edge does
+//!   not carry it.
 //! cites: 28.3, C.3
 //! expect: warn
 //! diagnostic: must use
@@ -14,6 +13,10 @@ module Conf;
 public class Resource
   public constructor()
   end constructor;
+
+  destructor
+    Console.WriteLine("released");
+  end destructor;
 end Resource;
 
 public class Program

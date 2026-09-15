@@ -1,11 +1,13 @@
 //! case: s28_3_0029
 //! doc: spec
 //! section: 28.3
-//! title: returning a borrowed local with no source that outlives the call is rejected
-//! rule: A borrowed local or parameter with no source that outlives the call may not be
-//!   returned.
+//! title: a fresh owned value returned through a plain class-typed return is rejected
+//! rule: An instance method whose declared return type is a plain concrete class type
+//!   may return only a receiver-sourced borrow; a fresh owned value is rejected —
+//!   declare `owned`.
+//! cites: 28.6
 //! expect: reject
-//! diagnostic: outlive
+//! diagnostic: owned
 module Conf;
 
 public class Widget

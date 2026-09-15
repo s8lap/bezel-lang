@@ -6,10 +6,14 @@
 //!   consumes; `var b := a;` is always a borrow of `a`.
 //! cites: C.3
 //! expect: run
-//! stdout: still owns a
+//! output: still owns a
+//!   disposed
 module Conf;
 
 public class Widget
+  public constructor()
+  end constructor;
+
   destructor
     Console.WriteLine("disposed");
   end destructor;
