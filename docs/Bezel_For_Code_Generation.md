@@ -1,6 +1,6 @@
 # Bezel for Code Generation
 
-*Validated against v0.299. Companion to the Bezel Language Specification — a writing reference, not a normative document.*
+*Validated against v0.300. Companion to the Bezel Language Specification — a writing reference, not a normative document.*
 
 A dense reference for writing correct Bezel without reading the spec. It covers the syntax surface, the ownership rules, the standard-library name index, the idioms that work, and the shapes that look right and are rejected.
 
@@ -151,7 +151,7 @@ visibility  static  (async|pure)  (abstract|virtual|override|sealed override)  (
 | Block property | `public property Balance: decimal` / `get => _b;` / `set => do … end;` / `end Balance;` | §23.3 |
 | Owned-taking setter | `set(owned);` or `set(owned x);` — the type is the property's and is never repeated | §23.3 |
 | Indexer | `public property [i: int]: string => _items[i];` — the block form closes with a bare `end;` | §23.4 |
-| Constructor | `public constructor(a: int)` + optional `base(a);`/`this(a);` chain + body + `end constructor;`. A chain argument may read only the constructor's own parameters, constants and statics — never a field of `this` or a primary-constructor parameter | §22.7, §12.8 |
+| Constructor | `public constructor(a: int)` + optional `base(a);`/`this(a);` chain + body + `end constructor;`. A chain argument may read only the constructor's own parameters, constants and statics — never a field of `this` or a primary-constructor parameter. A **class** that declares no instance constructor has an implicit `public` parameterless one, so `new C()` compiles; declaring any instance constructor (a primary parameter list included) removes it, and a **body record** has no such implicit constructor | §22.7, §12.8 |
 | Destructor | `destructor` … `end destructor;` — no visibility, no name, no parameters | §28.4 |
 | Operator | `public static pure method operator +(a: V, b: V): V => …;` closes `end operator +;` | §25.1 |
 | Equality operator | Overloading `=`/`<>` with **both operands the declaring type** obliges `Equals(T)` **and** `GetHashCode` beside them (`override` or plain, on a record, enum, or choice alike — v0.288), and by itself strips the record of auto-`=`/`Equals`/`GetHashCode`/`ToString` — **write all four or none**. A **heterogeneous** `=` (`T = U`) obliges nothing and strips nothing. On a move-only choice, `=`/`<>` operands and the `Equals(T)` parameter bind BORROWS — both operands stay live (v0.286). | §25.2, §9.2 |
@@ -405,9 +405,9 @@ Every class- or interface-typed expression and binding carries exactly one **own
 - **moved-from** — the obligation has left; the binding is unreadable until reassigned.
 - **maybe-consumed** — a join of owned with moved-from or disposed; unreadable.
 
-Records, enums, primitives and inline arrays are **value types**: no disposal, no classification. `string`, boxed values and function values are **runtime-managed**: no disposal, no classification, and `owned` on them is a compile error (§28.1, §28.9).
+Records, enums, primitives and inline arrays are **value types**: no disposal, no classification. `string`, boxed values, function values and `Type` (the `typeof` / `GetType` token) are **runtime-managed**: no disposal, no classification, and `owned` on them is a compile error (§28.1, §28.9).
 
-**You never write `Dispose()` as plumbing.** An owned value reaching its scope's end undischarged is disposed *there*, automatically, on the normal edge **and** the exception edge — no `try`/`finally` for a value, ever, and a written `x.Dispose();` means *release early*. The only difference between the edges is a lint: a plain-`var` implicit drop on normal exit raises the **must-use warning**; the exception edge is silent (§28.3). Disposal has exactly two customization points: a `destructor` (only for native or foreign resources) and `owned` **fields**, auto-disposed with their container in reverse declaration order (§28.4, §28.5). The generated `Dispose()` is public, idempotent and non-overridable — no `disposing` parameter, no `_disposed` flag, no `base.Dispose()` call.
+**You never write `Dispose()` as plumbing.** An owned value reaching its scope's end undischarged is disposed *there*, automatically, on the normal edge **and** the exception edge — no `try`/`finally` for a value, ever, and a written `x.Dispose();` means *release early*. The only difference between the edges is a lint: a plain-`var` implicit drop on normal exit raises the **must-use warning**; the exception edge is silent (§28.3). **Never declare a member named `Dispose`** on a class or a record — at any parameter list, it is a compile error at the declaration (§28.2); disposal has exactly two customization points: a `destructor` (only for native or foreign resources) and `owned` **fields**, auto-disposed with their container in reverse declaration order (§28.4, §28.5). The generated `Dispose()` is public, idempotent and non-overridable — no `disposing` parameter, no `_disposed` flag, no `base.Dispose()` call.
 
 **Trivial-dispose classes** are exempt from ceremony, not from tracking (§28.9): a class with no destructor, no `owned` field of non-trivial type, no owning-inline-array field, on a trivial-dispose base. `Array<T>`, `Set<T>`, `Dictionary<K,V>`, `StringBuilder`, `Random` qualify — no must-use warning anywhere the warning would otherwise attach: a plain `var`, an undischarged `owned` parameter (a method's, an iterator's, an async method's), an owning iteration variable. An **interface**-typed binding is never exempt. `OwningArray<T>` and anything holding a resource do not. **Every borrow rule still applies to trivial-dispose references.**
 
@@ -452,7 +452,7 @@ The declared type, nullability stripped, must be a class type, an interface type
 **`using var`** (§28.10): owned, disposed at the block's end on **every** exit edge, non-reassignable, and **never movable out of**. `using var fresh := new Buffer(); … return fresh;` is a compile error; a factory uses plain `var`.
 
 - `using var y := move x;` — **adoption**: the standard way to turn an owned local, parameter or loop-variable obligation into scope-bound disposal.
-- `using var y := x;` (unmarked, `x` a named owned binding) — **does not adopt**. It is a **borrow-pin**: no obligation is assumed, `x` keeps it, and the pin extends `x`'s required liveness to this block's end — so moving, transferring or reassigning `x` under the pin is rejected, while an explicit `x.Dispose()` is **not** (a site-announced kill; a later read through `y` faults in checked mode).
+- `using var y := x;` (unmarked, `x` a **class- or interface-typed** named owned binding) — **does not adopt**. It is a **borrow-pin**: no obligation is assumed, `x` keeps it, and the pin extends `x`'s required liveness to this block's end — so moving, transferring or reassigning `x` under the pin is rejected, while an explicit `x.Dispose()` is **not** (a site-announced kill; a later read through `y` faults in checked mode).
 - `using var _ := expr;` — the anonymous owning binding (`using var _ := mutex.Acquire();`). Not for a `Task`-family value (§17.13).
 - Admissible over value-typed, runtime-managed and move-only right-hand sides, where disposal is a no-op — safe to use uniformly in generic code.
 - To dispose earlier than the method's end, nest a `do … end` block.
@@ -466,6 +466,8 @@ The declared type, nullability stripped, must be a class type, an interface type
 | `x.Dispose();` | at the call | yes, until disposed | none |
 | `_ := x;` | end of the discard statement | — | none |
 | unbound temporary | end of the full expression | — | none |
+
+Disposing an **owned field** from code of its declaring type (`_resource.Dispose();`) is an early release point and demands nothing afterwards (§28.6): the field keeps its reference, the container's teardown still cascades over it as a no-op, and no restoration is owed — unlike `move obj.f`, which owes one on every exit path. A later read of that field is not diagnosed; it faults in checked disposal mode.
 
 `_ := x;` leaves the binding **explicitly-disposed**: a later straight-line read is a mandatory use-after-dispose warning, and a read after a *conditional* discard is a compile error at the merge. Discarding **the task itself** — `_ := task`, `using var _ := task` — is **rejected** for the `Task` family; use `Task.FireAndForget(t)`, or a *named* `using var t := …` (§17.13, v0.288). Discarding an **awaited result** is a different statement and is legal: `_ := await t;` is a Pattern B owned-consuming position that disposes the result at the statement's end (§30.5).
 
@@ -644,7 +646,10 @@ Exactly four sanctioned shapes; nothing else is a Try (stdlib §1).
 ```bezel
 public static class Console
   public static method Write(value: string);   Write(value: Object);
-  public static method WriteLine();  WriteLine(value: string);  WriteLine(value: Object);
+public static method WriteLine();  WriteLine(value: string);  WriteLine(value: Object);
+  //   WriteLine appends Environment.NewLine; Write appends nothing. Console.Write/WriteLine
+  //   ARE Console.Out.Write/WriteLine (one destination, call order). A null Object argument
+  //   renders as the four characters `null` (§18.5's rendering; no ToString dispatch).
   // + per-type Write/WriteLine overloads for bool and every numeric primitive
   public static method ReadLine(): string?;            // null at EOF
   public static method ReadKey(): char;                // EndOfStreamException at end of input
@@ -669,7 +674,7 @@ public static class Math
 end
 ```
 
-`Min`/`Max`/`Clamp` at a **class** substitution return a **borrow** sourced from the arguments.
+`Min`/`Max`/`Clamp` at a **class** substitution return a **borrow** sourced from the arguments. `Min` returns `a` when `a.CompareTo(b) <= 0` else `b`; `Max` returns `a` when `a.CompareTo(b) >= 0` else `b` — **a tie returns `a`**; `Clamp` returns `low`/`high`/`value`. A **tick is 100 ns**: `TimeSpan.From<Unit>(n)` is *n* of that unit (truncated toward zero to a whole tick; `OverflowException` out of range or on `NaN`) and `Total<Unit>` is the whole span in that unit including its fraction. A **seeded** `Random` replays: same seed + same calls = same values; the algorithm is unspecified, so never assume a sequence across implementations.
 
 ```bezel
 public static class Convert     // string <-> T only; there is no Convert.ToInt32(double)
@@ -693,6 +698,8 @@ end
 **Temporal types — all records (value types).** `DateTime`: constructors `(y,m,d)` and `(y,m,d,h,min,s, millisecond := 0, kind := DateTimeKind.Unspecified)`; `Ticks: long` with `FromTicks`/`ToUnixTimeSeconds`/`FromUnixTimeSeconds`; the `Year/Month/Day/Hour/Minute/Second/Millisecond/DayOfYear: int` components plus `DayOfWeek`, `Kind`, `Date: DateOnly`, `TimeOfDay: TimeOnly`; statics `Now/UtcNow/Today/MinValue/MaxValue`; `AddYears/AddMonths(int)`, `AddDays/AddHours/AddMinutes/AddSeconds/AddMilliseconds(double)`, `Add(span: TimeSpan)`, both `Subtract` forms, `ToUtc()`, `ToLocal()`, `ToString([format])`, `Parse`/`TryParse`/`ParseOrNull`, `CompareTo`, and the `+`/`-` operators over `TimeSpan`. Parse accepts only `yyyy-MM-ddTHH:mm:ss[.fff]` and `yyyy-MM-dd`. `TimeSpan`: `Ticks`/`FromTicks`, the `Days/…/Milliseconds: int` and `TotalDays/…/TotalMilliseconds: double` pairs, statics `FromDays/FromHours/FromMinutes/FromSeconds/FromMilliseconds(double)`, `Zero/MinValue/MaxValue`, `ToString([format])`, `+ - * /` (`*`/`/` take `double`) and unary `-`. `DateOnly` (`(y,m,d)`, `Year/Month/Day`, `ToDateTime(time: TimeOnly)`) and `TimeOnly` (`(hour, minute, second := 0, millisecond := 0)`, `Hour/Minute/Second/Millisecond`) each add `CompareTo`, `Parse`/`TryParse`/`ParseOrNull` and `ToString([format])`. `enum DayOfWeek: byte`; `enum DateTimeKind: byte { Unspecified, Utc, Local }`.
 
 `Guid` (record) — `CompareTo`; `static FromByteArray(bytes: Array<byte>): Guid`; `static readonly Empty`; `static NewGuid(): Guid` (**not cryptographic — never a secret**); `Parse`/`TryParse(out result: Guid)`/`ParseOrNull`; `ToString()`; `ToString(format)` (`"N"`/`"D"` only); `ToByteArray(): owned Array<byte>`. **No constructor** — `new Guid(…)` is a compile error.
+
+The seven temporal format specifiers (`yyyy MM dd HH mm ss fff`) each render a fixed-width zero-padded field of their own letter count — `dd` renders day 5 as `05`, `yyyy` renders year 42 as `0042`; any other run length of those letters is a `FormatException`.
 
 `Random` (class) — `constructor()`, `constructor(seed: long)`; `Next(): int`, `Next(maxValue)`, `Next(minValue, maxValue)`, `NextInt64(): long`, `NextDouble(): double`, `NextBytes(buffer: Array<byte>)`, `NextBoolean(): bool`.
 
@@ -837,7 +844,10 @@ public class OwningArray<T>: IOwningList<T>, IOwningEnumerable<T> where T: class
   method Sort(comparer: (T, T) -> int);   Sort();   Reverse();   // comparer takes borrows;
                                                                 //   bare Sort() is natural order,
                                                                 //   only where T: IComparable<T>
-  method PopAt(index: int): owned T;   PopFirst(): owned T;   PopLast(): owned T;   // raise if empty
+method PopAt(index: int): owned T;   PopFirst(): owned T;   PopLast(): owned T;
+  //   empty → InvalidOperationException (Pop/PopFirst/PopLast/Dequeue/Peek, every family);
+  //   PopAt's index outside 0..<Count → IndexOutOfRangeException. Clear() disposes in
+  //   Dispose()'s order: reverse insertion for the ordered families.
   method TryPopFirst(out owned item: T?): bool;   TryPopLast(out owned item: T?): bool;
   method Drain(): IOwningEnumerable<T>;
 end
@@ -1120,7 +1130,9 @@ Empty source: `Sum` → the zero of its result type; `Min`/`Max`/`Average` → `
 public record CancellationToken                       // auto-imported; borrow-bearing
   public static readonly property None: CancellationToken;
   public readonly property IsCancellationRequested: bool;
-  public method ThrowIfCancellationRequested();
+public method ThrowIfCancellationRequested();   // raises OperationCanceledException when
+                                                  //   cancellation was requested; returns with no
+                                                  //   effect otherwise. None never raises.
   public method Register(scoped callback: () -> ()): owned Subscription;
 end
 public class CancellationTokenSource                   // NOT auto — needs the import
@@ -1134,7 +1146,9 @@ public class CancellationTokenSource                   // NOT auto — needs the
 end
 public class Mutex
   constructor();
-  method Acquire(): owned Lock;                        // BLOCKS: compile error inside an async body
+method Acquire(): owned Lock;                        // BLOCKS: compile error inside an async body
+                                                       // NON-REENTRANT: a holder re-acquiring waits
+                                                       //   on itself, in every acquisition form
   method TryAcquire(timeout: TimeSpan): owned Lock?;
   async method AcquireAsync(token := CancellationToken.None): OwningTask<Lock>;
   async method TryAcquireAsync(timeout: TimeSpan, token := CancellationToken.None): OwningTask<Lock?>;
@@ -1142,7 +1156,9 @@ end
 public class Lock  destructor;  end                    // no public ctor; NOT sendable
 public class Semaphore
   constructor(initialCount: int);   constructor(initialCount: int, maxCount: int);
-  method Acquire(): owned SemaphoreToken;   TryAcquire(timeout): owned SemaphoreToken?;
+method Acquire(): owned SemaphoreToken;   TryAcquire(timeout): owned SemaphoreToken?;
+  //   counts PERMITS: initialCount at construction, one consumed per acquisition, returned by
+  //   disposing the token; a holder re-acquiring consumes a second permit (not a deadlock)
   async method AcquireAsync(token := ...): OwningTask<SemaphoreToken>;
   async method TryAcquireAsync(timeout, token := ...): OwningTask<SemaphoreToken?>;
 end
@@ -1295,12 +1311,12 @@ end
 
 ### 5.9 Primitives
 
-The integer types (`Int32`, `Int64`, `Byte`, `SByte`, `Int16`, `UInt16`, `UInt32`, `UInt64`) carry: `static const MinValue/MaxValue`; `static pure Parse(s: string)`, `static TryParse(s: string, out result: T): bool`, `static pure ParseOrNull(s: string): T?`, `static pure Parse(s: string, radix: int)` (radix ∈ {2,8,10,16}), `static TryParse(s: string, radix: int, out result: T): bool`, `static pure Parse(s: ReadOnlyStringSpan)`, `static TryParse(s: ReadOnlyStringSpan, out result: T): bool`; `pure ToString()`, `pure ToString(format: string)`, `pure ToString(radix: int)`, `pure CompareTo(other)`. **`ParseOrNull` has no radix or span duals.** No whitespace tolerance anywhere.
+The integer types (`Int32`, `Int64`, `Byte`, `SByte`, `Int16`, `UInt16`, `UInt32`, `UInt64`) carry: `static const MinValue/MaxValue`; `static pure Parse(s: string)`, `static TryParse(s: string, out result: T): bool`, `static pure ParseOrNull(s: string): T?`, `static pure Parse(s: string, radix: int)` (radix ∈ {2,8,10,16}), `static TryParse(s: string, radix: int, out result: T): bool`, `static pure Parse(s: ReadOnlyStringSpan)`, `static TryParse(s: ReadOnlyStringSpan, out result: T): bool`; `pure ToString()`, `pure ToString(format: string)`, `pure ToString(radix: int)`, `pure CompareTo(other)`. **`ParseOrNull` has no radix or span duals.** No whitespace tolerance anywhere. **Radix digits** are the first *r* of `0`–`9` then `A`–`Z`; `Parse(s, radix)` accepts **either case** (`int.Parse("ff", 16)` = `int.Parse("FF", 16)` = `255`), and `ToString(radix)` emits **lower case**, sign-and-magnitude — so `T.Parse(n.ToString(r), r) = n`. Input grammar: optional `+`/`-`, then digits; no `0x`, no separators, no whitespace (`FormatException`), out of range `OverflowException`; a radix outside `{2,8,10,16}` is `ArgumentException` from both `Parse` and `ToString`.
 
-`Double`/`Float`: `MinValue MaxValue Epsilon PositiveInfinity NegativeInfinity NaN`; `static pure IsNaN/IsInfinity/IsPositiveInfinity/IsNegativeInfinity/IsFinite`; `Parse`/`TryParse`/`ParseOrNull` (string and `ReadOnlyStringSpan`); `static pure IeeeEquals(a,b)`, `static pure BitwiseEquals(a,b)`; `pure ToString([format])`, `pure CompareTo`. `Epsilon` is the smallest positive subnormal, not machine epsilon.
-`Decimal`: `MinValue MaxValue Zero One`; `Parse`/`TryParse`/`ParseOrNull`; `pure ToString([format])`, `pure CompareTo`, `pure Round(digits: int)` (banker's, 0..28).
+`Double`/`Float`: `MinValue MaxValue Epsilon PositiveInfinity NegativeInfinity NaN`; `static pure IsNaN/IsInfinity/IsPositiveInfinity/IsNegativeInfinity/IsFinite`; `Parse`/`TryParse`/`ParseOrNull` (string and `ReadOnlyStringSpan`); the five `Is*` report the operand's IEEE-754 class exactly (`IsFinite` = neither NaN nor infinity; subnormals and both zeros are finite); `static pure IeeeEquals(a,b)`, `static pure BitwiseEquals(a,b)`; `pure ToString([format])`, `pure CompareTo`. `Epsilon` is the smallest positive subnormal, not machine epsilon.
+`Decimal`: `MinValue` = `-79228162514264337593543950335`, `MaxValue` = `79228162514264337593543950335`, `Zero One`; the no-format `ToString()` (and `G`) is the exact shortest form — no exponent, no grouping, **no trailing zeros** (`1.50m` renders `1.5`, `10m` renders `10`), scale not being part of the value; `Parse`/`TryParse`/`ParseOrNull`; `pure ToString([format])`, `pure CompareTo`, `pure Round(digits: int)` (banker's, 0..28).
 `Boolean`: `static pure Parse(s)` ("true"/"false", case-insensitive), `static TryParse(s, out result: bool)`, `static pure ParseOrNull(s): bool?`, `pure ToString()` → `"True"`/`"False"`.
-`Char`: `MinValue MaxValue`; `static pure IsDigit/IsLetter/IsLetterOrDigit/IsWhiteSpace/IsUpper/IsLower/IsControl/IsPunctuation(c)`; `static pure ToUpper/ToLower(c): char`; `Parse`/`TryParse`/`ParseOrNull`; `pure ToString()`, `pure CompareTo`.
+`Char`: `MinValue MaxValue`; `static pure IsDigit/IsLetter/IsLetterOrDigit/IsWhiteSpace/IsUpper/IsLower/IsControl/IsPunctuation(c)` — Unicode-category tests (`IsDigit` = category `Nd`, **not** the `0`–`9` the parses read; `IsWhiteSpace` = the `White_Space` property), total, never raising; `ToUpper`/`ToLower` are the **simple** Unicode case mappings; `static pure ToUpper/ToLower(c): char`; `Parse`/`TryParse`/`ParseOrNull`; `pure ToString()`, `pure CompareTo`.
 
 ```bezel
 public class String: IEnumerable<char>, IComparable<string>, IEquatable<string>
@@ -1310,7 +1326,8 @@ public class String: IEnumerable<char>, IComparable<string>, IEquatable<string>
   static From(value: CString|WString): string;   static FromCStringPointer/FromWStringPointer(p: IntPtr): string;
   static pure Repeat(c: char, count: int): string;    static pure Repeat(unit: string, count: int): string;
   static Join(separator: string, items: IEnumerable<string>): string;
-  static pure IsNullOrWhiteSpace(value: string?): bool;    // no IsNullOrEmpty — write `s = null or s.IsEmpty` (or `s?.IsEmpty ?? true`)
+static pure IsNullOrWhiteSpace(value: string?): bool;    // true for null, for "", and for all-whitespace
+                                                           // no IsNullOrEmpty — write `s = null or s.IsEmpty` (or `s?.IsEmpty ?? true`)
   pure Contains(string|char): bool;  pure StartsWith(string): bool;  pure EndsWith(string): bool;
   pure IndexOf(char|string, startIndex: int := 0): int;   pure LastIndexOf(char|string): int;
   pure Substring(startIndex[, length]): string;
