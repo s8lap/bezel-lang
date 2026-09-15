@@ -289,12 +289,22 @@ inline bool calleeReturnMayAliasStringArgUnretained(
                     continue;
                 }
                 // Positional parameter (record positional field): type is in posParam
-                if (fs->posParam && fs->posParam->type) {
-                    if (auto* tr = ctx.resolvedType(*fs->posParam->type)) {
-                        if (tr->kind == sema::TypeRef::Kind::Primitive &&
-                            tr->primitive == sema::PrimitiveType::String) {
-                            return true;
-                        }
+                // (local) or in fieldTypes_ (imported). For imported positional
+                // fields, posParam->type is null but the type is stored in
+                // fieldTypes_ and accessed via ctx.importedMemberType(fs).
+                // Check posParam->type first (local path), then fall back to
+                // importedMemberType for the imported case.
+                if (fs->posParam) {
+                    const sema::TypeRef* tr = nullptr;
+                    if (fs->posParam->type) {
+                        tr = ctx.resolvedType(*fs->posParam->type);
+                    } else {
+                        // Imported positional field: type is in fieldTypes_
+                        tr = ctx.importedMemberType(fs);
+                    }
+                    if (tr && tr->kind == sema::TypeRef::Kind::Primitive &&
+                        tr->primitive == sema::PrimitiveType::String) {
+                        return true;
                     }
                 }
                 // Body field: type is in the FieldDecl
