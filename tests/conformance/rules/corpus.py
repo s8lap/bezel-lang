@@ -21,8 +21,8 @@ Header grammar (the leading run of `//!` lines, before any other content):
     //! rule: the normative sentence this case makes executable
     //!   (continuation lines start with `//!` and two or more spaces)
     //! cites: 28.3, C.3                   <- optional extra sections
-    //! expect: reject                     <- accept | reject | run
-    //! diagnostic: disposed on every path <- required iff expect: reject
+    //! expect: reject                     <- accept | reject | warn | run
+    //! diagnostic: disposed on every path <- required iff expect: reject|warn
     //! stdout: 42                         <- required iff expect: run
     //! issue: 4154                        <- optional; a tracker this case pins
 
@@ -42,7 +42,7 @@ MAIN_RE = re.compile(r'\bmethod\s+Main\b')
 
 REQUIRED = ("case", "doc", "section", "title", "rule", "expect")
 KNOWN = REQUIRED + ("cites", "diagnostic", "stdout", "issue", "notes")
-EXPECTS = ("accept", "reject", "run")
+EXPECTS = ("accept", "reject", "warn", "run")
 DOCS = ("spec", "stdlib")
 
 MANIFEST_COLUMNS = ("case-id", "doc", "section", "expect", "shape",
@@ -163,11 +163,12 @@ def check_case(path, text):
     expect = fields.get("expect", "")
     if expect and expect not in EXPECTS:
         problems.append("{}: expect must be one of {}".format(stem, "|".join(EXPECTS)))
-    if expect == "reject" and not fields.get("diagnostic"):
-        problems.append("{}: a reject case must carry `diagnostic:` — the wording "
-                        "the spec uses for the rule it breaks".format(stem))
-    if expect != "reject" and fields.get("diagnostic"):
-        problems.append("{}: `diagnostic:` belongs only on a reject case".format(stem))
+    if expect in ("reject", "warn") and not fields.get("diagnostic"):
+        problems.append("{}: a {} case must carry `diagnostic:` — the wording the "
+                        "spec uses for the rule it names".format(stem, expect))
+    if expect not in ("reject", "warn") and fields.get("diagnostic"):
+        problems.append("{}: `diagnostic:` belongs only on a reject or warn case"
+                        .format(stem))
     if expect == "run" and "stdout" not in fields:
         problems.append("{}: a run case must carry `stdout:`".format(stem))
     if expect != "run" and "stdout" in fields:

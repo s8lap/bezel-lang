@@ -157,7 +157,8 @@ class TestLint(unittest.TestCase):
     def test_accept_may_not_carry_a_diagnostic(self):
         text = ACCEPT.replace("//! expect: accept",
                               "//! expect: accept\n//! diagnostic: owned")
-        self.assertTrue(any("only on a reject case" in p for p in self.check(text)))
+        self.assertTrue(any("only on a reject or warn case" in p
+                            for p in self.check(text)))
 
     def test_run_needs_stdout(self):
         text = RUN.replace("//! stdout: [null]\n", "")
@@ -197,6 +198,65 @@ class TestLint(unittest.TestCase):
             write_corpus(base, [ACCEPT, twin])
             _rows, problems = corpus.load_cases(os.path.join(base, "cases"))
             self.assertTrue(any("title duplicates" in p for p in problems))
+
+
+WARN = """//! case: s28_3_0002
+//! doc: spec
+//! section: 28.3
+//! title: an undischarged plain-var owned local raises the must-use warning
+//! rule: An owned value reaching its scope's end undischarged is disposed there,
+//!   with a must-use warning on the normal edge.
+//! expect: warn
+//! diagnostic: must use
+module Conf;
+
+public class R
+  public constructor()
+  end constructor;
+end R;
+
+public class Program
+  public static method Main()
+    var r := new R();
+  end Main;
+end Program;
+"""
+
+
+class TestWarnTier(unittest.TestCase):
+    def test_warn_needs_a_diagnostic(self):
+        text = WARN.replace("//! diagnostic: must use\n", "")
+        problems = corpus.check_case("s28_3_0002.bzl", text)[1]
+        self.assertTrue(any("must carry `diagnostic:`" in p for p in problems))
+
+    def test_a_warn_case_with_main_is_not_steered_to_run(self):
+        # The must-use warning fires in a body; a Main is the natural place for
+        # one, and nothing is printed, so `run` would be the wrong expectation.
+        self.assertEqual(corpus.check_case("s28_3_0002.bzl", WARN)[1], [])
+
+    def row(self, check="must use"):
+        return {"case-id": "s28_3_0002", "expect": "warn", "check": check,
+                "shape": "program", "title": "t", "issue": "", "section": "28.3"}
+
+    def test_warn_passes_when_the_compiler_warns(self):
+        v, _ = runner.evaluate(self.row(), 0,
+                               "warning: value of 'r' must be used", None, "")
+        self.assertEqual(v, "pass")
+
+    def test_warn_fails_on_a_silent_compile(self):
+        v, detail = runner.evaluate(self.row(), 0, "", None, "")
+        self.assertEqual(v, "fail")
+        self.assertIn("silently", detail)
+
+    def test_warn_fails_when_rejected(self):
+        self.assertEqual(runner.evaluate(self.row(), 1, "error: nope", None, "")[0],
+                         "fail")
+
+    def test_warn_wording_is_reported_not_gated(self):
+        # It warns, so the case passes; the wording mismatch is a finding.
+        v, _ = runner.evaluate(self.row(), 0, "warning: unused local", None, "")
+        self.assertEqual(v, "pass")
+        self.assertFalse(runner.diagnostic_matches(self.row(), "warning: unused local"))
 
 
 class TestManifest(unittest.TestCase):

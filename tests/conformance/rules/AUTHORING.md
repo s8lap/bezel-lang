@@ -23,10 +23,18 @@ implementation is worse than no case, because it teaches the wrong rule.
 |---|---|---|
 | `accept` | the file compiles as a library (`bezelc -c`) | — |
 | `reject` | the compiler rejects it, per a stated rule | `diagnostic:` |
+| `warn` | it compiles, and the compiler warns | `diagnostic:` |
 | `run` | the file has a `method Main`, compiles, runs, and prints | `stdout:` |
 
 `reject` is the workhorse: most of the spec's content is rules about what is
 *not* admitted, and Appendix C is 217 bullets of exactly that.
+
+`warn` is for the handful of rules whose consequence is a diagnostic that does
+not stop the compile: the must-use warning on an undischarged plain-`var` owned
+local, the fresh-store warning on a borrowing collection, the use-after-dispose
+warning, the terminal-accessor provenance warning. Those are normative and an
+`accept` case cannot tell them from silence. A `warn` case passes when the
+compile succeeds *and* says something; which wording is reported, not gated.
 
 `run` is for rules with observable behaviour — evaluation order, disposal order,
 overflow, formatting, what an interpolation hole renders, what a `case` selects.
@@ -73,7 +81,8 @@ document — close enough that a reader can find it. It is what makes the case
 reviewable without a compiler, so it is not optional and not a restatement of
 the title.
 
-`diagnostic:` is **the wording the rule itself uses** (`owned`, `must announce
+`diagnostic:` (on a `reject` or a `warn` case) is **the wording the rule itself
+uses** (`owned`, `must announce
 its classification`, `not disposed on every path`), not a guess at the
 compiler's message. It is reported, never gated: at classification time a
 mismatch means either the diagnostic does not name the rule it enforced, or the

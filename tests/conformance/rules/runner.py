@@ -39,6 +39,8 @@ import corpus  # noqa: E402
 
 BASELINE_COLUMNS = ("case-id", "verdict", "note")
 
+WARNING_RE = __import__("re").compile(r'\bwarn(?:ing)?\b', __import__("re").I)
+
 OK = "OK"
 REGRESSION = "REGRESSION"
 KNOWN = "KNOWN"
@@ -94,6 +96,13 @@ def evaluate(row, compile_rc, compile_log, run_rc, run_out):
         return "fail", conformance._snippet(compile_log, 120, 240)
     if expect == "accept":
         return "pass", ""
+    if expect == "warn":
+        # The case compiles AND the compiler says something about it. Which
+        # wording is the diagnostic report's business, not the gate's — same
+        # tier as a reject case's, and for the same reason.
+        if WARNING_RE.search(compile_log or ""):
+            return "pass", ""
+        return "fail", "compiled silently; the spec requires a warning here"
 
     # expect: run
     if run_rc is None:
@@ -196,7 +205,7 @@ def main(argv, base_dir=None, run=conformance.caged_run):
             status = UNCLASSIFIED if args.classify else \
                 compare(verdict, baseline.get(row["case-id"]))
             results[row["case-id"]] = (row, verdict, detail, status)
-            if row["expect"] == "reject" and verdict == "pass" \
+            if row["expect"] in ("reject", "warn") and verdict == "pass" \
                     and not diagnostic_matches(row, log):
                 diag_misses.append((row["case-id"], row["check"],
                                     conformance._first_line(log)))
@@ -229,8 +238,8 @@ def main(argv, base_dir=None, run=conformance.caged_run):
         print("banked {} verdicts into {}".format(len(banked), args.baseline))
 
     if diag_misses:
-        print("\n{} reject cases rejected on a diagnostic that does not carry "
-              "the rule's wording:".format(len(diag_misses)))
+        print("\n{} reject/warn cases whose diagnostic does not carry the "
+              "rule's wording:".format(len(diag_misses)))
         for case_id, want, got in diag_misses[:40]:
             print("  {}  want ~{!r}  got {!r}".format(case_id, want, got))
 
