@@ -11693,6 +11693,22 @@ private:
                kt->primitive == sema::PrimitiveType::String && !kt->nullable;
     }
 
+    // fix #4135 (§27.5 / §28.9, stdlib §4.9, v0.295): is `rt` a
+    // DrainedEntry<K,V> type from lowerDictDrainFor (the for-loop-variable
+    // capture shape)? Mirrors isDictEntryStringKeyTypeRef for the DrainedEntry
+    // sibling issue. DrainedEntry is a class (stdlib §4.9) with owned Value: V
+    // where V: class (guaranteed by OwningDictionary<K,V>'s constraint), and
+    // Key: K by value. The capture cell holds the {K, V*} struct BY VALUE.
+    // Unlike DictionaryEntry (where only the string Key is owned), BOTH fields
+    // of DrainedEntry are owned: Key (if string) and Value (the V*).
+    bool isDrainedEntryTypeRef(const sema::TypeRef* rt) const {
+        if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
+            return false;
+        if (rt->headName() != "DrainedEntry") return false;
+        return rt->genericArgs.size() >= 2 && rt->genericArgs[0] &&
+               rt->genericArgs[1];
+    }
+
     // ====================================================================
     // Suspend/resume state-machine scaffolding (§29 iterators / §30 async).
     //

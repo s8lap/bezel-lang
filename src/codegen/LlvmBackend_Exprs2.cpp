@@ -3555,6 +3555,49 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
                     llvm::Value* key =
                         builder_.CreateLoad(ptrTy(), cell, "dictek.envdtor");
                     emitStringRelease(key);
+                } else if (ce.freeCellInEnvdtor &&
+                           isDrainedEntryTypeRef(ce.semaTy)) {
+                    // fix #4135 (§27.5/§28.9, stdlib §4.9, v0.295): a
+                    // DrainedEntry<K,V> for-loop variable (from `for var entry
+                    // in d.Drain()`) captured by the sole, definitely-escaping
+                    // closure (freeCellInEnvdtor, the same proof that makes
+                    // freeing the cell below safe: singleCaptureLocals_ ∧
+                    // definitelyEscapingLambdas_ — #694). The local's own
+                    // scope-end DrainedEntry disposal was never registered for it
+                    // (the eligibility walk treats ANY capture as an escape), so
+                    // the owned Key + owned Value are both never discharged —
+                    // exactly #4135's leak. The cell holds the {K, V*} struct
+                    // BY VALUE; release both fields here, mirroring the
+                    // scope-end drainedEntry disposal in LlvmBackend_Disposal.cpp.
+                    const sema::TypeRef* entryTy = ce.semaTy;
+                    const sema::TypeRef* kTy = entryTy->genericArgs[0];
+                    const sema::TypeRef* vTy = entryTy->genericArgs[1];
+                    llvm::Type* kLlvm = lowerTypeRef(kTy);
+                    llvm::Type* vLlvm = lowerTypeRef(vTy);
+                    if (kLlvm && vLlvm) {
+                        llvm::StructType* entStTy =
+                            llvm::StructType::get(llvm_, {kLlvm, vLlvm});
+                        // Step 1: dispose the owned V class at field[1] (V*
+                        // — V is always a class per stdlib §4.9's
+                        // OwningDictionary<K,V> constraint). emitDisposeAndReclaim
+                        // is null-safe so no null check needed.
+                        if (vLlvm->isPointerTy()) {
+                            llvm::Value* valFldPtr =
+                                builder_.CreateStructGEP(entStTy, cell, 1, "dde.val.ptr");
+                            llvm::Value* valPtr =
+                                builder_.CreateLoad(ptrTy(), valFldPtr, "dde.val");
+                            emitDisposeAndReclaim(valPtr);
+                        }
+                        // Step 2: if K is string, release the owned key at field[0].
+                        if (kTy->kind == sema::TypeRef::Kind::Primitive &&
+                            kTy->primitive == sema::PrimitiveType::String) {
+                            llvm::Value* keyFldPtr =
+                                builder_.CreateStructGEP(entStTy, cell, 0, "dde.key.ptr");
+                            llvm::Value* keyPtr =
+                                builder_.CreateLoad(ptrTy(), keyFldPtr, "dde.key");
+                            emitStringRelease(keyPtr);
+                        }
+                    }
                 }
                 // All other capture types (value, class borrow): no action.
                 // §27.5 / #694: free the 8-byte capture CELL itself when this is
