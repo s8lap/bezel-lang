@@ -453,6 +453,7 @@ The declared type, nullability stripped, must be a class type, an interface type
 
 - `using var y := move x;` — **adoption**: the standard way to turn an owned local, parameter or loop-variable obligation into scope-bound disposal.
 - `using var y := x;` (unmarked, `x` a **class- or interface-typed** named owned binding) — **does not adopt**. It is a **borrow-pin**: no obligation is assumed, `x` keeps it, and the pin extends `x`'s required liveness to this block's end — so moving, transferring or reassigning `x` under the pin is rejected, while an explicit `x.Dispose()` is **not** (a site-announced kill; a later read through `y` faults in checked mode).
+- `using var y := x;` (unmarked, `x` a **move-only value** binding — §15.3's owning inline arrays and owning choices) — **adopts**, not pins: the unmarked read *moves*, leaving `x` moved-from (a copy is impossible, so there is nothing for a marker to disambiguate). Scope-end auto-dispose runs under plain `var` too; `using var` adds the reassignment lock, and over an owning **choice** also suppresses the must-use warning on that auto-drop (§15.3, §35.4).
 - `using var _ := expr;` — the anonymous owning binding (`using var _ := mutex.Acquire();`). Not for a `Task`-family value (§17.13).
 - Admissible over value-typed, runtime-managed and move-only right-hand sides, where disposal is a no-op — safe to use uniformly in generic code.
 - To dispose earlier than the method's end, nest a `do … end` block.
@@ -646,7 +647,7 @@ Exactly four sanctioned shapes; nothing else is a Try (stdlib §1).
 ```bezel
 public static class Console
   public static method Write(value: string);   Write(value: Object);
-public static method WriteLine();  WriteLine(value: string);  WriteLine(value: Object);
+  public static method WriteLine();  WriteLine(value: string);  WriteLine(value: Object);
   //   WriteLine appends Environment.NewLine; Write appends nothing. Console.Write/WriteLine
   //   ARE Console.Out.Write/WriteLine (one destination, call order). A null Object argument
   //   renders as the four characters `null` (§18.5's rendering; no ToString dispatch).
@@ -844,7 +845,7 @@ public class OwningArray<T>: IOwningList<T>, IOwningEnumerable<T> where T: class
   method Sort(comparer: (T, T) -> int);   Sort();   Reverse();   // comparer takes borrows;
                                                                 //   bare Sort() is natural order,
                                                                 //   only where T: IComparable<T>
-method PopAt(index: int): owned T;   PopFirst(): owned T;   PopLast(): owned T;
+  method PopAt(index: int): owned T;   PopFirst(): owned T;   PopLast(): owned T;
   //   empty → InvalidOperationException (Pop/PopFirst/PopLast/Dequeue/Peek, every family);
   //   PopAt's index outside 0..<Count → IndexOutOfRangeException. Clear() disposes in
   //   Dispose()'s order: reverse insertion for the ordered families.
@@ -1130,7 +1131,7 @@ Empty source: `Sum` → the zero of its result type; `Min`/`Max`/`Average` → `
 public record CancellationToken                       // auto-imported; borrow-bearing
   public static readonly property None: CancellationToken;
   public readonly property IsCancellationRequested: bool;
-public method ThrowIfCancellationRequested();   // raises OperationCanceledException when
+  public method ThrowIfCancellationRequested();   // raises OperationCanceledException when
                                                   //   cancellation was requested; returns with no
                                                   //   effect otherwise. None never raises.
   public method Register(scoped callback: () -> ()): owned Subscription;
@@ -1146,7 +1147,7 @@ public class CancellationTokenSource                   // NOT auto — needs the
 end
 public class Mutex
   constructor();
-method Acquire(): owned Lock;                        // BLOCKS: compile error inside an async body
+  method Acquire(): owned Lock;                        // BLOCKS: compile error inside an async body
                                                        // NON-REENTRANT: a holder re-acquiring waits
                                                        //   on itself, in every acquisition form
   method TryAcquire(timeout: TimeSpan): owned Lock?;
@@ -1156,7 +1157,7 @@ end
 public class Lock  destructor;  end                    // no public ctor; NOT sendable
 public class Semaphore
   constructor(initialCount: int);   constructor(initialCount: int, maxCount: int);
-method Acquire(): owned SemaphoreToken;   TryAcquire(timeout): owned SemaphoreToken?;
+  method Acquire(): owned SemaphoreToken;   TryAcquire(timeout): owned SemaphoreToken?;
   //   counts PERMITS: initialCount at construction, one consumed per acquisition, returned by
   //   disposing the token; a holder re-acquiring consumes a second permit (not a deadlock)
   async method AcquireAsync(token := ...): OwningTask<SemaphoreToken>;
@@ -1326,7 +1327,7 @@ public class String: IEnumerable<char>, IComparable<string>, IEquatable<string>
   static From(value: CString|WString): string;   static FromCStringPointer/FromWStringPointer(p: IntPtr): string;
   static pure Repeat(c: char, count: int): string;    static pure Repeat(unit: string, count: int): string;
   static Join(separator: string, items: IEnumerable<string>): string;
-static pure IsNullOrWhiteSpace(value: string?): bool;    // true for null, for "", and for all-whitespace
+  static pure IsNullOrWhiteSpace(value: string?): bool;    // true for null, for "", and for all-whitespace
                                                            // no IsNullOrEmpty — write `s = null or s.IsEmpty` (or `s?.IsEmpty ?? true`)
   pure Contains(string|char): bool;  pure StartsWith(string): bool;  pure EndsWith(string): bool;
   pure IndexOf(char|string, startIndex: int := 0): int;   pure LastIndexOf(char|string): int;
@@ -1637,9 +1638,10 @@ var (a, b) := point;                                        // WRONG: destructur
 public method Log(params items: Array<string>);             // WRONG: no `params`
 var c := new Config() with(Timeout := 30);                  // WRONG: `with` needs a RECORD source
 var caller: (a: int, b: int) -> int := Sub;  caller(b := 2, a := 100);   // WRONG: a call through a FUNCTION VALUE admits no named argument (§27.1, v0.295)
+var u := uint(-1);   var b2 := byte(300);   var c2 := char(0xD800);   // WRONG: a CONSTANT operand the conversion would reject is a COMPILE error (§5.2)
 ```
 
-> §21.4/A.6: the loop is `for … in … do … end;`. A.7's `PrimarySuffix` admits `.`, `?.`, `[…]`, `(…)`, `?(…)`, `!`, `with(…)` — and no `?[`. §14.5: class/record/interface type arguments are never inferred; §15.4: a collection literal is well-typed only where a target type is supplied. §20: the conditional is a parenthesized atom. §17.6, §17.2: `++`/`--` and assignments are statements. §4.1: conditions are `bool`. §19.3, §27.4: destructuring lives in patterns and lambda parameters. §22.14: pass an `Array<T>` and write the literal at the call site. §9.5: `with` on a class-typed source is the retired object-initializer reading.
+> §21.4/A.6: the loop is `for … in … do … end;`. A.7's `PrimarySuffix` admits `.`, `?.`, `[…]`, `(…)`, `?(…)`, `!`, `with(…)` — and no `?[`. §14.5: class/record/interface type arguments are never inferred; §15.4: a collection literal is well-typed only where a target type is supplied. §20: the conditional is a parenthesized atom. §17.6, §17.2: `++`/`--` and assignments are statements. §4.1: conditions are `bool`. §19.3, §27.4: destructuring lives in patterns and lambda parameters. §22.14: pass an `Array<T>` and write the literal at the call site. §9.5: `with` on a class-typed source is the retired object-initializer reading. §5.2/§5.4: an explicit conversion whose operand is a **compile-time constant** the conversion would reject — `uint(-1)`, `byte(300)`, `char(0xD800)`, `int(1e30)`, an enum cast matching no declared constant — is a compile error **at the conversion site**, never a deferred `OverflowException`; the runtime fault is for **non-constant** operands, and unreachable code is not exempt (v0.300). A saturating conversion is unaffected: `float(1e300)` is `Infinity`, constant operand or not.
 
 ```bezel
 for var t in transactions do Process(t); end;

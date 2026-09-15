@@ -438,7 +438,7 @@ public record Guid: IComparable<Guid>, IEquatable<Guid>
   // bytes (stated explicitly — .NET's field-group order is a known trap);
   // ordering is CompareTo only — no <,>,<=,>= overloads are declared.
   public method CompareTo(other: Guid): int;
-public static method FromByteArray(bytes: Array<byte>): Guid;   // borrows; raises ArgumentException unless Count = 16
+  public static method FromByteArray(bytes: Array<byte>): Guid;   // borrows; raises ArgumentException unless Count = 16
   public static readonly property Empty: Guid;
 
   public static method NewGuid(): Guid;
@@ -1827,9 +1827,9 @@ public class OwningArray<T>: IOwningList<T>, IOwningEnumerable<T>, IOwningCollec
     using var _ := PopAt(index);                  // dispose at scope end
   end RemoveAt;
 
-public method Clear()
+  public method Clear()
     for var i in 0..<_count do
-      var slot := _count - 1 - i;                  // reverse-insertion order (§28.11)
+      var slot := _count - 1 - i;                  // reverse index order
       var item := move _storage[slot];             // item: T? (owned)
       _storage[slot] := null;                       // restore moved-from slot
       item!.Dispose();                              // slot was non-null
@@ -3580,6 +3580,9 @@ public extension IEnumerable<T>
   public method Average(selector: (T) -> float): float;      // v0.195
   public method Average(selector: (T) -> double): double;
   public method Average(selector: (T) -> decimal): decimal;
+                                               // Min/Max/Average, selector and no-selector forms alike:
+                                               //   InvalidOperationException on an empty source (§5's
+                                               //   empty-source rule); Sum returns zero, Aggregate seed
   public method Aggregate<TAccum>(seed: TAccum, fold: (TAccum, T) -> TAccum): TAccum;
 
   // Ordering
@@ -3660,8 +3663,8 @@ The predicate overloads of `First`, `Last`, and `Single` (and their `*OrNull` fo
 
 ```bezel
 public extension IEnumerable<T> where T: IComparable<T>
-  public method Min(): T;              // throws if empty
-  public method Max(): T;              // throws if empty
+  public method Min(): T;              // InvalidOperationException if empty
+  public method Max(): T;              // InvalidOperationException if empty
   public method MinOrNull(): T?;       // null if empty
   public method MaxOrNull(): T?;       // null if empty
 end;
@@ -3679,7 +3682,7 @@ end;
 
 ```bezel
 public extension IEnumerable<int>
-  public method Average(): double;
+  public method Average(): double;   // InvalidOperationException if empty (every Average form)
 end;
 
 public extension IEnumerable<long>
@@ -5213,7 +5216,7 @@ public record Char: IComparable<char>, IEquatable<char>
 end Char;
 ```
 
-**The classification predicates (v0.300).** Each `Is*` member tests the argument's Unicode character properties; every one is **total** — each `char` gets an answer, and none of them raises. `IsDigit(c)` is `c`'s general category being `Nd` (decimal digit number); `IsLetter(c)` is one of `Lu`, `Ll`, `Lt`, `Lm`, `Lo`; `IsLetterOrDigit(c)` is `IsLetter(c) or IsDigit(c)`; `IsUpper(c)` is `Lu` and `IsLower(c)` is `Ll`; `IsControl(c)` is `Cc`; `IsPunctuation(c)` is one of `Pc`, `Pd`, `Ps`, `Pe`, `Pi`, `Pf`, `Po`; and `IsWhiteSpace(c)` is `c` carrying the Unicode `White_Space` property. `ToUpper`/`ToLower` apply the **simple** case mapping — one code point to one, unconditional, no locale tailoring, the mapping [§9.6](#sec-string)'s `ignoreCase` comparisons fold under — and return the argument unchanged where it has none. `IsDigit` is **not** the alphabet the parses read: [§9.1](#sec-integer-types)'s and [§9.3](#sec-decimal)'s `Parse` families accept the ASCII digits `0`–`9` and nothing else.
+**The classification predicates (v0.300).** Each `Is*` member tests the argument's Unicode character properties; every one is **total** — each `char` gets an answer, and none of them raises. `IsDigit(c)` is `c`'s general category being `Nd` (decimal digit number); `IsLetter(c)` is one of `Lu`, `Ll`, `Lt`, `Lm`, `Lo`; `IsLetterOrDigit(c)` is `IsLetter(c) or IsDigit(c)`; `IsUpper(c)` is `Lu` and `IsLower(c)` is `Ll`; `IsControl(c)` is `Cc`; `IsPunctuation(c)` is one of `Pc`, `Pd`, `Ps`, `Pe`, `Pi`, `Pf`, `Po`; and `IsWhiteSpace(c)` is `c` carrying the Unicode `White_Space` property. `ToUpper`/`ToLower` apply the **simple** case mapping — one code point to one, unconditional, no locale tailoring; a sibling of, not identical to, the simple case *folding* [§9.6](#sec-string)'s `ignoreCase` comparisons apply — and return the argument unchanged where it has none. `IsDigit` is **not** the alphabet the parses read: [§9.1](#sec-integer-types)'s and [§9.3](#sec-decimal)'s `Parse` families accept the ASCII digits `0`–`9` and nothing else.
 
 `Parse` accepts a string containing **exactly one code point** (`s.Length = 1`, [§9.6](#sec-string)'s code-point count) and returns that code point; any other input — the empty string or a multi-code-point string — raises `FormatException`. There is no whitespace tolerance and no recognition of escape sequences: escapes are source-lexical ([language spec §1](Bezel_Language_Spec.md)), so `char.Parse("\u0041")` receives the one-character string `"A"`, while a six-character `\u0041` sequence in runtime data is simply a six-code-point string and raises. (The strict-fault model of [§3.2](#sec-encoding) and `Decimal.Parse`, [§9.3](#sec-decimal).) `TryParse` returns `false` in every case where `Parse` would raise; the out slot gets `'\0'` — `default(char)`, language spec [§17.11](Bezel_Language_Spec.md#sec-the-default-operator) (the shape-(c) `default(T)`, [§1](#sec-conventions)). These are the members [§2.19](#sec-static-abstractions)'s `IParsable<char>` conformance witnesses. (v0.222, #1792.)
 
