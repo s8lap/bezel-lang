@@ -18,7 +18,7 @@ spec	2.8	Module identity, artifact interface, and program assembly	0	0	0	0	0	0	0
 spec	2.8.1	Module identity and closure	2	3	5	2	3	0	0	covered
 spec	2.8.2	The artifact interface is a semantic requirement	2	2	2	1	0	0	1	covered
 spec	2.8.3	Transitive dependencies and cross-artifact type identity	0	4	8	0	4	0	4	covered
-spec	2.8.4	Program assembly: artifact kind, entry point, one copy per process	2	2	0	0	0	0	0	UNCOVERED
+spec	2.8.4	Program assembly: artifact kind, entry point, one copy per process	2	2	1	0	0	0	1	covered
 spec	2.8.5	Non-goals of this section	0	0	0	0	0	0	0	n/a
 spec	2.8.6	Interface delta classification	1	0	0	0	0	0	0	UNCOVERED
 spec	3	Type System	0	0	0	0	0	0	0	n/a

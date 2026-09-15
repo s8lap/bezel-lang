@@ -873,6 +873,52 @@ class TestCommittedCorpus(unittest.TestCase):
         self.assertEqual(sorted(set(banked) - rows), [])
 
 
+class TestOrderClaimSignal(unittest.TestCase):
+    """The audit's order-or-count signal. Not a lint: a single line can be a
+    complete check when the program encodes the order into it. The signal's
+    value is entirely in its precision — a broad vocabulary flagged 225 of 723
+    run cases on incidental words, and a report that is two-thirds noise gets
+    ignored and then switched off."""
+
+    def hits(self, text):
+        return bool(corpus.ORDER_CLAIM_RE.search(text))
+
+    def test_it_catches_the_claims_that_cost_us(self):
+        for text in (
+                "disposed in reverse order of establishment",
+                "owned fields are disposed in reverse declaration order",
+                "static fields are initialized in textual declaration order",
+                "the cleanup runs exactly once",
+                "a second Dispose() is idempotent",
+                "calling GetEnumerator again re-runs the body",
+                "each iteration produces a fresh binding",
+                "the finalizer never runs twice",
+        ):
+            self.assertTrue(self.hits(text), text)
+
+    def test_it_ignores_the_incidental_words(self):
+        # Every one of these tripped the first, broad vocabulary.
+        for text in (
+                "the first matching arm wins",
+                "the last declared member shadows",
+                "an owned field of class type is admitted",
+                "the number of type parameters must match",
+                "a count of zero is admitted",
+                "an escape after the borrow's source is out of scope",
+        ):
+            self.assertFalse(self.hits(text), text)
+
+    def test_a_multi_line_output_case_is_never_flagged(self):
+        rows = [{"case-id": "s1_1_0001", "expect": "run",
+                 "check": "all:a\nb", "rule": "disposed in reverse order",
+                 "title": "t", "cites": "1.1"}]
+        self.assertFalse(
+            rows[0]["check"].startswith("all:") is False
+            and corpus.ORDER_CLAIM_RE.search(rows[0]["rule"]) is None)
+        # The audit's own guard: `all:` is the multi-line form.
+        self.assertTrue(rows[0]["check"].startswith("all:"))
+
+
 class TestCoverageStates(unittest.TestCase):
     """The two ways a coverage gap can be false. Both existed as prose in the
     README before they were code, and every wave re-investigated the same empty

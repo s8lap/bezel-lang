@@ -433,6 +433,27 @@ def read_manifest(path):
     return rows
 
 
+# An order-or-count CLAIM, as the documents phrase one. `stdout:` checks the
+# first line only, so it cannot see a step that ran twice, ran in the wrong
+# order, or never ran at all — a case making one of these claims and checking
+# one line is the corpus's most-repeated defect (one batch had it in 12 of its
+# 15 run cases, two of them unfalsifiable as written).
+#
+# Deliberately narrow. A broad vocabulary ("first", "each", "count") flagged 225
+# of 723 run cases, mostly on incidental words; a report that is two-thirds
+# noise gets ignored and then switched off. This one flags ~34 and most are
+# real. It is a REPORT, not a lint, because it cannot decide the honest
+# exception: a program may encode an order into a single line ("a,b,c", or a sum
+# that only one order produces), and then one line is a complete check.
+ORDER_CLAIM_RE = re.compile(
+    r'(reverse order|in order|order of (?:establishment|declaration|disposal|'
+    r'construction|evaluation|registration)|declaration order|evaluation order|'
+    r'disposal order|exactly once|exactly twice|more than once|not run again|'
+    r'runs again|re-?runs?\b|re-?enumerat\w+|each iteration|per iteration|'
+    r'on each|idempotent|twice|both .{0,24}(?:run|dispose|fire|print)|'
+    r'never (?:runs|re-?runs|fires)|\bthen\b.{0,60}\bthen\b)', re.IGNORECASE)
+
+
 def audit(rows, cases_dir):
     """Quality signals a reader would otherwise have to check by hand. None is a
     lint failure — each is a judgement call the author may have made
@@ -441,6 +462,7 @@ def audit(rows, cases_dir):
         return set(re.findall(r'[a-z]{3,}', text.lower()))
 
     orphan_diag, no_cites, long_source, twins, reject_labels = [], [], [], {}, []
+    order_first_line = []
     for row in rows:
         if row["expect"] in ("reject", "warn") and row["check"]:
             # The contract says a diagnostic fragment is the RULE's own wording.
@@ -451,6 +473,9 @@ def audit(rows, cases_dir):
             if frag and not identifierish \
                     and not (frag & words(row["rule"] + " " + row["title"])):
                 orphan_diag.append((row["case-id"], row["check"]))
+        if row["expect"] == "run" and not row["check"].startswith("all:") \
+                and ORDER_CLAIM_RE.search(row["rule"] + " " + row["title"]):
+            order_first_line.append((row["case-id"], row["title"]))
         if not row["cites"]:
             no_cites.append(row["case-id"])
         key = re.sub(r'[^a-z ]', '', row["rule"].lower())[:120]
@@ -483,6 +508,13 @@ def audit(rows, cases_dir):
           "case about §1.6, a second ground anywhere else".format(len(reject_labels)))
     for line in reject_labels[:20]:
         print("   " + line)
+    print("\n{} run cases making an order-or-count claim but checking only the "
+          "first line".format(len(order_first_line)))
+    print("   Each is either an `output:` conversion or a case whose single "
+          "line already encodes the order.")
+    for case_id, title in order_first_line[:40]:
+        print("   {}  {}".format(case_id, title[:74]))
+
     print("\n{} cases with no `cites:`".format(len(no_cites)))
     print("\n{} cases over 45 non-blank source lines".format(len(long_source)))
     for case_id, n in sorted(long_source, key=lambda t: -t[1])[:15]:
