@@ -24,7 +24,7 @@ implementation is worse than no case, because it teaches the wrong rule.
 | `accept` | the file compiles as a library (`bezelc -c`) | — |
 | `reject` | the compiler rejects it, per a stated rule | `diagnostic:` |
 | `warn` | it compiles, and the compiler warns | `diagnostic:` |
-| `run` | the file has a `method Main`, compiles, runs, and prints | `stdout:` |
+| `run` | the file has a `method Main`, compiles, runs, and prints | `stdout:` or `output:` |
 
 `reject` is the workhorse: most of the spec's content is rules about what is
 *not* admitted, and Appendix C is 217 bullets of exactly that.
@@ -40,6 +40,22 @@ compile succeeds *and* says something; which wording is reported, not gated.
 overflow, formatting, what an interpolation hole renders, what a `case` selects.
 Prefer `run` whenever the rule says what something *does*, not merely that it is
 admitted: an `accept` case proves only that nothing was rejected.
+
+`stdout:` is the expected **first line**. `output:` is every line, and its
+continuations are lines rather than a wrapped sentence:
+
+```
+//! expect: run
+//! output: container destructor
+//!   second field
+//!   first field
+```
+
+Reach for `output:` whenever the rule is about **order** or **how many times**
+something happened — disposal order, evaluation order, how often a selector ran.
+Those are the corpus's most valuable rows and a first-line check cannot see
+them: a case that disposes twice when it should dispose once prints the same
+first line either way.
 
 ### What a `run` case may assume about rendering
 

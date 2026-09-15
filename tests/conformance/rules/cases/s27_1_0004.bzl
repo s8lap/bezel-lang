@@ -21,4 +21,7 @@ end Factory;
 
 public class Registry
   private _maker: (out owned Widget) -> () := Factory.Make;
+
+  public constructor()
+  end constructor;
 end Registry;

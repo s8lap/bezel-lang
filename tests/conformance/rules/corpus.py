@@ -41,7 +41,7 @@ CASE_ID_RE = re.compile(r'^(s|l)(\d+)(?:_(\d+(?:_\d+)?))?_(\d{4})$')
 MAIN_RE = re.compile(r'\bmethod\s+Main\b')
 
 REQUIRED = ("case", "doc", "section", "title", "rule", "expect")
-KNOWN = REQUIRED + ("cites", "diagnostic", "stdout", "issue", "notes")
+KNOWN = REQUIRED + ("cites", "diagnostic", "stdout", "output", "issue", "notes")
 EXPECTS = ("accept", "reject", "warn", "run")
 DOCS = ("spec", "stdlib")
 
@@ -85,7 +85,10 @@ def parse_header(text, where="<case>"):
             if last is None:
                 raise CaseError("{}: line {}: continuation with no field"
                                 .format(where, lineno))
-            fields[last] = (fields[last] + " " + c.group(1).strip()).strip()
+            # `output:` is a multi-LINE expectation, so its continuations are
+            # lines; every other field's continuation is a wrapped sentence.
+            join = "\n" if last == "output" else " "
+            fields[last] = (fields[last] + join + c.group(1).rstrip()).strip()
             continue
         raise CaseError("{}: line {}: malformed header line: {!r}"
                         .format(where, lineno, line))
@@ -172,10 +175,16 @@ def check_case(path, text):
     if expect not in ("reject", "warn") and fields.get("diagnostic"):
         problems.append("{}: `diagnostic:` belongs only on a reject or warn case"
                         .format(stem))
-    if expect == "run" and "stdout" not in fields:
-        problems.append("{}: a run case must carry `stdout:`".format(stem))
-    if expect != "run" and "stdout" in fields:
-        problems.append("{}: `stdout:` belongs only on a run case".format(stem))
+    if expect == "run" and "stdout" not in fields and "output" not in fields:
+        problems.append("{}: a run case must carry `stdout:` (its first line) or "
+                        "`output:` (every line)".format(stem))
+    if "stdout" in fields and "output" in fields:
+        problems.append("{}: carry either `stdout:` or `output:`, not both"
+                        .format(stem))
+    for key in ("stdout", "output"):
+        if expect != "run" and key in fields:
+            problems.append("{}: `{}:` belongs only on a run case"
+                            .format(stem, key))
 
     body = strip_header(text)
     if body.strip() == "":
@@ -261,6 +270,8 @@ def load_cases(cases_dir):
         else:
             titles[key] = fields["case"]
         check = fields.get("diagnostic") or fields.get("stdout", "")
+        if "output" in fields:
+            check = "all:" + fields["output"]
         rows.append({
             "case-id": fields["case"],
             "doc": fields["doc"],
@@ -294,7 +305,7 @@ def render_manifest(rows):
     for row in rows:
         cells = []
         for col in MANIFEST_COLUMNS:
-            value = row[col].replace("\t", " ").replace("\n", " ")
+            value = row[col].replace("\t", " ").replace("\n", "\\n")
             cells.append(value)
         out.append("\t".join(cells))
     return "\n".join(out) + "\n"

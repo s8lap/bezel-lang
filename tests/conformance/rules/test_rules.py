@@ -304,6 +304,73 @@ def write_dir_case(base, case_id, main_text, deps):
             f.write(text)
 
 
+OUTPUT_CASE = """//! case: s28_4_0001
+//! doc: spec
+//! section: 28.4
+//! title: owned fields dispose in reverse declaration order
+//! rule: The generated Dispose runs the destructor body, then disposes owned
+//!   fields in reverse declaration order.
+//! expect: run
+//! output: container
+//!   second
+//!   first
+module Conf;
+
+public class Program
+  public static method Main()
+    Console.WriteLine("container");
+  end Main;
+end Program;
+"""
+
+
+class TestMultiLineOutput(unittest.TestCase):
+    """Disposal ORDER is the corpus's most valuable observation and it takes
+    more than one line to see."""
+
+    def test_continuations_of_output_are_lines(self):
+        f = corpus.parse_header(OUTPUT_CASE)
+        self.assertEqual(f["output"], "container\nsecond\nfirst")
+
+    def test_a_run_case_may_carry_output_instead_of_stdout(self):
+        self.assertEqual(corpus.check_case("s28_4_0001.bzl", OUTPUT_CASE)[1], [])
+
+    def test_not_both(self):
+        text = OUTPUT_CASE.replace("//! output: container",
+                                   "//! stdout: container\n//! output: container")
+        self.assertTrue(any("not both" in p for p in
+                            corpus.check_case("s28_4_0001.bzl", text)[1]))
+
+    def test_output_survives_the_manifest_round_trip(self):
+        with tempfile.TemporaryDirectory() as base:
+            write_corpus(base, [OUTPUT_CASE])
+            corpus.main(["build"], base_dir=base)
+            row = corpus.read_manifest(os.path.join(base, "manifest.tsv"))[0]
+            self.assertEqual(row["check"], "all:container\\nsecond\\nfirst")
+            self.assertEqual(corpus.main(["check"], base_dir=base), 0)
+
+    def row(self):
+        return {"case-id": "s28_4_0001", "expect": "run", "shape": "program",
+                "check": "all:container\\nsecond\\nfirst", "title": "t",
+                "issue": "", "section": "28.4"}
+
+    def test_every_line_must_match(self):
+        good = "container\nsecond\nfirst\n"
+        self.assertEqual(runner.evaluate(self.row(), 0, "", 0, good)[0], "pass")
+
+    def test_a_wrong_order_fails(self):
+        bad = "container\nfirst\nsecond\n"
+        self.assertEqual(runner.evaluate(self.row(), 0, "", 0, bad)[0], "fail")
+
+    def test_a_missing_line_fails(self):
+        self.assertEqual(runner.evaluate(self.row(), 0, "", 0, "container\n")[0],
+                         "fail")
+
+    def test_trailing_newlines_and_carriage_returns_are_tolerated(self):
+        out = "container\r\nsecond\r\nfirst\r\n\n"
+        self.assertEqual(runner.evaluate(self.row(), 0, "", 0, out)[0], "pass")
+
+
 class TestDirectoryCases(unittest.TestCase):
     """The rules that need two compilation units: a case may be a directory of
     `main.bzl` plus its dependencies."""

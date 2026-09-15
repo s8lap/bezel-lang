@@ -17,6 +17,9 @@ end Widget;
 public class Registry
   private _reclaim: (owned Widget) -> () := lambda(owned w) => w.Dispose();
 
+  public constructor()
+  end constructor;
+
   public method Reclaim(owned w: Widget)
     _reclaim(move w);
   end Reclaim;

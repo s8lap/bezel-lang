@@ -111,10 +111,19 @@ def evaluate(row, compile_rc, compile_log, run_rc, run_out):
         return "fail", "run timed out"
     if conformance.is_crash(run_rc):
         return "fail", "program crashed (exit {})".format(run_rc)
+    want = row["check"]
+    if want.startswith("all:"):
+        # `output:` — every line, not just the first. Disposal ORDER is the
+        # corpus's most valuable observation and it takes more than one line.
+        want = want[len("all:"):].replace("\\n", "\n")
+        actual = (run_out or "").replace("\r", "").rstrip("\n")
+        if actual == want:
+            return "pass", ""
+        return "fail", "output: expected {!r}, got {!r}".format(want, actual)
     actual = conformance._first_line(run_out or "")
-    if actual == row["check"]:
+    if actual == want:
         return "pass", ""
-    return "fail", "stdout: expected {!r}, got {!r}".format(row["check"], actual)
+    return "fail", "stdout: expected {!r}, got {!r}".format(want, actual)
 
 
 def diagnostic_matches(row, compile_log):

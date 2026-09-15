@@ -20,7 +20,7 @@ public class Widget
 end Widget;
 
 public class Holder
-  private _cb: () -> ();
+  private _cb: () -> () := lambda() => Console.WriteLine("idle");
 
   public method Capture(w: Widget)
     _cb := lambda() => w.Greet();

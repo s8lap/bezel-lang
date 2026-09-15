@@ -13,7 +13,7 @@ module Conf;
 public class AmountException: Exception
   private _amount: int;
 
-  public readonly property Amount: int => _amount;
+  public property Amount: int => _amount;
 
   public constructor(message: string, amount: int) base(message)
     _amount := amount;

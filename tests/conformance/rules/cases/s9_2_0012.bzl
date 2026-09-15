@@ -1,0 +1,28 @@
+//! case: s9_2_0012
+//! doc: spec
+//! section: 9.2
+//! title: a homogeneous equality overload disqualifies auto-hashable and unreplaced Equals use is rejected
+//! rule: A homogeneous operator =/<> overload disqualifies the record from
+//!   auto-hashable; calling someRecord.Equals(other) on a non-auto-hashable
+//!   record without a user-defined override is a compile error.
+//! cites: 25.2
+//! expect: reject
+//! diagnostic: auto-hashable
+module Conf;
+
+public record Money
+  public readonly property Amount: int;
+
+  public constructor(amount: int)
+    Amount := amount;
+  end constructor;
+
+  public static method operator =(a: Money, b: Money): bool => true;
+  public static method operator <>(a: Money, b: Money): bool => false;
+  public method Equals(other: Money): bool => true;
+  public override method GetHashCode(): int => 0;
+end Money;
+
+public class Program
+  public static method CallsEquals(a: Money, other: Object?): bool => a.Equals(other);
+end Program;
