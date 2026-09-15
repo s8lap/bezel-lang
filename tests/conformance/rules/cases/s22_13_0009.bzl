@@ -7,7 +7,8 @@
 //!   check-then-store race never arises and the work runs exactly once.
 //! cites: 22.13, 22.12
 //! expect: run
-//! stdout: 42
+//! output: computed
+//!   42
 module Conf;
 
 public static class Loader
@@ -18,6 +19,7 @@ public static class Loader
   end Preload;
 
   public static async method Compute(): Task<int>
+    Console.WriteLine("computed");
     return 42;
   end Compute;
 

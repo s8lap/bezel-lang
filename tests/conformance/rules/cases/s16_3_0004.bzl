@@ -8,12 +8,22 @@
 //!   U+E004, U+E008, U+E00C, U+E010. No surrogate is ever yielded."
 //! cites: 16.3
 //! expect: run
-//! stdout: 9
+//! output: 55280
+//!   55284
+//!   55288
+//!   55292
+//!   57344
+//!   57348
+//!   57352
+//!   57356
+//!   57360
 module Conf;
 
 public class Program
   public static method Main()
     var r: Range<char> := 'ퟰ'..'' step 4;
-    Console.WriteLine(r.Count());
+    for var c in r do
+      Console.WriteLine(int(c));
+    end;
   end Main;
 end Program;

@@ -6,7 +6,9 @@
 //!   (which the compiler may optimize into counted loops)."
 //! cites: 21.4
 //! expect: run
-//! stdout: 1
+//! output: 1
+//!   2
+//!   3
 module Conf;
 
 public class Program

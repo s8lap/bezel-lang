@@ -1129,8 +1129,24 @@ class TestOrderClaimSignal(unittest.TestCase):
                 "an escape after the borrow's source is out of scope",
                 "the first parameter must have a default",
                 "every parameter after the first defaulted one needs a default",
+                # `on each <object>` is a universal over instances, not a count
+                # of occasions: stdlib §2.15's "the other format's properties
+                # are null on each instance" is checked completely by the one
+                # line that prints the property.
+                "the other format's properties are null on each instance",
+                "the field is null on each element of the array",
         ):
             self.assertFalse(self.hits(text), text)
+
+    def test_on_each_still_catches_an_occasion(self):
+        # The narrowing above must not cost the occasion phrasings, which ARE
+        # count claims a first-line check cannot see.
+        for text in (
+                "the body runs again on each GetEnumerator call",
+                "the selector is invoked on each iteration",
+                "the factory runs on each invocation",
+        ):
+            self.assertTrue(self.hits(text), text)
 
     def test_a_multi_line_output_case_is_never_flagged(self):
         rows = [{"case-id": "s1_1_0001", "expect": "run",

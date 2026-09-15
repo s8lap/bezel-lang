@@ -6,12 +6,16 @@
 //!   brackets (§15.1).
 //! cites: 15.1
 //! expect: run
-//! stdout: 128
+//! output: 255
+//!   128
+//!   64
 module Conf;
 
 public class Program
   public static method Main()
     var rgb: [3]byte := [255, 128, 64];
+    Console.WriteLine(rgb[0]);
     Console.WriteLine(rgb[1]);
+    Console.WriteLine(rgb[2]);
   end Main;
 end Program;

@@ -9,7 +9,7 @@
 //!   constructor is observable — never executes.
 //! cites: 20
 //! expect: run
-//! stdout: 1
+//! output: 1
 module Conf;
 
 public class Probe

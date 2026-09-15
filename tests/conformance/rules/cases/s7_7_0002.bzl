@@ -6,7 +6,7 @@
 //!   is evaluated only when the left operand's value is `null` — when the
 //!   left is non-null the right operand expression does not run at all.
 //! expect: run
-//! stdout: Alice
+//! output: Alice
 module Conf;
 
 public class Program

@@ -6,7 +6,7 @@
 //!   invoked and the exception propagates out of Raise to the raiser.
 //! cites: 6.5
 //! expect: run
-//! stdout: caught
+//! output: caught
 module Conf;
 
 public class Ticker

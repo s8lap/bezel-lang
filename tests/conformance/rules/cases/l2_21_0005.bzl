@@ -5,7 +5,7 @@
 //! rule: Dismiss() disarms; idempotent — a second call raises nothing.
 //! cites: 2.21
 //! expect: run
-//! stdout: no error
+//! output: no error
 module Conf;
 
 public class Program

@@ -9,7 +9,12 @@
 //!   textual order and the first match wins.
 //! cites: 19.3, 19.4
 //! expect: run
-//! stdout: strongly down
+//! output: strongly down
+//!   down
+//!   flat
+//!   way up
+//!   up
+//!   steady
 module Conf;
 
 public class Program

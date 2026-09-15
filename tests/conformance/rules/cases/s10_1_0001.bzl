@@ -7,7 +7,9 @@
 //!   0, 1, 2 — assigned in declaration order from zero.
 //! cites: 10.1
 //! expect: run
-//! stdout: 1
+//! output: 0
+//!   1
+//!   2
 module Conf;
 
 enum Priority
@@ -16,6 +18,8 @@ end Priority;
 
 public class Program
   public static method Main()
+    Console.WriteLine(int(Priority.Low));
     Console.WriteLine(int(Priority.Medium));
+    Console.WriteLine(int(Priority.High));
   end Main;
 end Program;
