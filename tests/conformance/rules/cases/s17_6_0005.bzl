@@ -11,7 +11,7 @@
 //! diagnostic: nullable
 module Conf;
 
-public class Counter
+public class Gauge
   private _n: int?;
 
   public constructor()
@@ -21,4 +21,4 @@ public class Counter
   public method Bump()
     _n++;
   end Bump;
-end Counter;
+end Gauge;

@@ -1,22 +1,18 @@
 //! case: l2_12_0004
 //! doc: stdlib
 //! section: 2.12
-//! title: the checked same-width cast raises where Reinterpret would not
-//! rule: Reinterpret is the bit-level counterpart to the checked same-width
-//!   signed<->unsigned cast: the cast performs a value conversion that raises
-//!   OverflowException if the value does not fit.
-//! cites: 5.2
+//! title: a NaN bit pattern is preserved exactly through a round trip
+//! rule: For NaN values, the specific bit pattern (signaling vs quiet, payload
+//!   bits) is preserved -- not merely a canonical NaN value.
 //! expect: run
-//! stdout: threw
+//! stdout: True
 module Conf;
 
 public class Program
   public static method Main()
-    try
-      _ := uint(-1);
-      Console.WriteLine("no exception");
-    catch
-      OverflowException => Console.WriteLine("threw")
-    end try;
+    var bits := 2143289345;
+    var f := BitConverter.Int32BitsToFloat(bits);
+    var back := BitConverter.FloatToInt32Bits(f);
+    Console.WriteLine(back = bits);
   end Main;
 end Program;

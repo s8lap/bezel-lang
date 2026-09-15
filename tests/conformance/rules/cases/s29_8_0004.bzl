@@ -6,7 +6,8 @@
 //!   order, mirroring §28.4's destructor rule.
 //! cites: 29.8, 28.4
 //! expect: run
-//! stdout: second
+//! output: second
+//!   first
 module Conf;
 
 public class Tag

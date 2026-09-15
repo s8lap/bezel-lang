@@ -13,7 +13,7 @@ module Conf;
 public class Program
   public static method Main()
     var token := CancellationToken.None;
-    using var sub := token.Register(lambda() => ());
+    using var sub: Subscription := token.Register(lambda() => ());
     Console.WriteLine("registered");
   end Main;
 end Program;

@@ -30,7 +30,7 @@ public class Program
       if t.IsExpired then toRemove.Add(t); end;
     end;
     for var t in toRemove do
-      transactions.Remove(t);
+      _ := transactions.Remove(t);
     end;
     Console.WriteLine(transactions.Count);
   end Main;

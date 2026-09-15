@@ -25,6 +25,10 @@ public class Lines
     _i := _i + 1;
     return _a;
   end ReadLine;
+
+  destructor
+    Console.WriteLine("closed");
+  end destructor;
 end Lines;
 
 public class Program

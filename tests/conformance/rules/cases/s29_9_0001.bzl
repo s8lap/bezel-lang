@@ -10,8 +10,10 @@ module Conf;
 
 public class Program
   public static method Main()
-    var f: () -> int := lambda() => do
+    var f: () -> () := lambda() => do
+      Console.WriteLine("body");
       yield return 1;
     end;
+    f();
   end Main;
 end Program;

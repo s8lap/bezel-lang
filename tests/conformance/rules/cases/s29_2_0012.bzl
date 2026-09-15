@@ -2,9 +2,11 @@
 //! doc: spec
 //! section: 29.2
 //! title: OwningDictionary has no default entry iteration
-//! rule: `OwningDictionary<K,V>` has no default entry iteration — its
-//!   conformance is `IDisposable` only.
-//! cites: 29.2
+//! rule: `for` operates only on a value whose type implements `IEnumerable<T>`;
+//!   `OwningDictionary<K, V>`'s interface conformance is `IDisposable` only, so
+//!   default `for var entry in ownedDict do` iteration is not provided for it
+//!   (stdlib §4.9).
+//! cites: 29.1, 29.2
 //! expect: reject
 //! diagnostic: does not implement
 module Conf;

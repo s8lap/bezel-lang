@@ -3,12 +3,12 @@
 //! section: 29.2
 //! title: a named owned binding yielded from an owning iterator is a marker-free consume
 //! rule: Under the marker discipline the operand read of a **named owned
-//!   binding** is classified by the return type: in an iterator returning
-//!   an **owning** enumeration interface the read is a marker-free
-//!   owned-consuming position — the declared return type is the
-//!   announcement (K3.13), exactly as for `return` under an `owned` return
-//!   type.
-//! cites: 29.2
+//!   binding** is classified by the return type: in an iterator returning an
+//!   **owning** enumeration interface the read is a marker-free
+//!   owned-consuming position — the declared return type is the announcement
+//!   (K3.13), exactly as for `return` under an `owned` return type — and the
+//!   binding is moved-from when the yield resumes.
+//! cites: 29.2, 28.3
 //! expect: run
 //! stdout: x
 module Conf;
@@ -29,7 +29,8 @@ public class Program
 
   public static method Main()
     for var x in Produce() do
-      Console.WriteLine(x.Name);
+      using var u := move x;
+      Console.WriteLine(u.Name);
     end;
   end Main;
 end Program;

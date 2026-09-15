@@ -11,6 +11,7 @@ module Conf;
 
 public class Program
   public async method HandleAsync(token: CancellationToken): Task
+    token.ThrowIfCancellationRequested();
     await Task.Delay(0);
   end HandleAsync;
 end Program;

@@ -11,8 +11,9 @@ module Conf;
 
 public class Program
   public static method Main()
+    var r := 5..;
     try
-      for var x in 5.. do
+      for var x in r do
       end;
     catch
       InvalidOperationException => Console.WriteLine("caught")

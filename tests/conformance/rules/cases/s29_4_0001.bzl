@@ -7,7 +7,8 @@
 //!   runs incrementally as the consumer calls `MoveNext()`.
 //! cites: 29.4
 //! expect: run
-//! stdout: after-call
+//! output: after-call
+//!   inside
 module Conf;
 
 public class Program
@@ -17,7 +18,7 @@ public class Program
   end Gen;
 
   public static method Main()
-    var it := Gen();
+    using var it := Gen();
     Console.WriteLine("after-call");
     for var x in it do
       _ := x;

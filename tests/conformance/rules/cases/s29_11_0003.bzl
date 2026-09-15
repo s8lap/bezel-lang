@@ -14,7 +14,7 @@ module Conf;
 public class Program
   public static method Main()
     var xs: Array<int> := [1, 2, 3];
-    var ys := xs.Where(lambda(x) => x > 1).ToArray();
+    using var ys := xs.Where(lambda(x) => x > 1).ToArray();
     var total := 0;
     for var v in ys do
       total := total + v;

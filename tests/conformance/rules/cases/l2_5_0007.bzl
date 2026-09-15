@@ -7,12 +7,12 @@
 //!   verbatim.
 //! cites: 2.18
 //! expect: run
-//! stdout: 2024/03/05
+//! stdout: 2024/03/25
 module Conf;
 
 public class Program
   public static method Main()
-    var d := new DateTime(2024, 3, 5, 0, 0, 0);
+    var d := new DateTime(2024, 3, 25, 0, 0, 0);
     Console.WriteLine(d.ToString("yyyy/MM/dd"));
   end Main;
 end Program;

@@ -22,7 +22,7 @@ public class Program
 
   public static method Main()
     using var p := new Program();
-    var e := p.Gen();
+    using var e := p.Gen();
     using var it1 := e.GetEnumerator();
     _ := it1.MoveNext();
     using var it2 := e.GetEnumerator();

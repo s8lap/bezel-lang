@@ -17,7 +17,7 @@ public class Program
   public static method Main()
     var xs: Array<int> := [1, 2, 3];
     using var q := xs.Where(lambda(x) => x > 1);
-    var c := CountOf(q);
+    _ := CountOf(q);
     for var v in q do
       _ := v;
     end;

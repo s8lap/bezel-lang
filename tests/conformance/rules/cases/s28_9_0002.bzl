@@ -1,7 +1,7 @@
 //! case: s28_9_0002
 //! doc: spec
 //! section: 28.9
-//! title: a closure capturing a scope-bound borrow that would outlive its source is rejected
+//! title: a closure that would outlive its captured local borrow's source is rejected
 //! rule: Runtime management relaxes nothing about the values a closure
 //!   captures — a captured borrowed class reference is subject to §28.3's
 //!   borrow-escape rules, so a function value that outlives the captured
@@ -19,17 +19,9 @@ public class Widget
   end Ping;
 end Widget;
 
-public class Registry
-  private _cb: () -> ();
-
-  public method Register(cb: () -> ())
-    _cb := cb;
-  end Register;
-end Registry;
-
 public class Program
-  public method Wire(reg: Registry)
+  public method Make(): () -> ()
     var w := new Widget();
-    reg.Register(lambda() => w.Ping());
-  end Wire;
+    return lambda() => w.Ping();
+  end Make;
 end Program;

@@ -2,10 +2,11 @@
 //! doc: spec
 //! section: 29.2
 //! title: an element borrow escaping the loop is admitted over a concrete collection type
-//! rule: Over a **concrete** collection type the chain is slot → collection →
-//!   binding, and keeping the reference past the loop is fine while the
-//!   collection lives.
-//! cites: 29.2
+//! rule: An iteration-variable borrow is admissible where its derived source
+//!   chain reaches the collection under §29.2's desugaring: a collection-backed
+//!   source re-borrows — the chain runs element slot → collection — so the
+//!   reference stays valid past the loop while the collection lives.
+//! cites: 29.2, 28.3, 28.11
 //! expect: run
 //! stdout: b
 module Conf;
@@ -19,20 +20,15 @@ public class Widget
 end Widget;
 
 public class Program
-  public static method FindByName(items: Array<Widget>, target: string): Widget?
+  public static method Main()
+    var widgets: Array<Widget> := [new Widget("a"), new Widget("b")];
     var found: Widget? := null;
-    for var w in items do
-      if w.Name = target then
+    for var w in widgets do
+      if w.Name = "b" then
         found := w;
         break;
       end;
     end;
-    return found;
-  end FindByName;
-
-  public static method Main()
-    var widgets: Array<Widget> := [new Widget("a"), new Widget("b")];
-    var found := FindByName(widgets, "b");
     Console.WriteLine(found!.Name);
   end Main;
 end Program;

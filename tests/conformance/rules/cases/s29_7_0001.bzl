@@ -8,7 +8,8 @@
 //!   suspension.
 //! cites: 29.7
 //! expect: run
-//! stdout: cleanup
+//! output: cleanup
+//!   after
 module Conf;
 
 public class Resource

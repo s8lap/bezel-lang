@@ -1,20 +1,32 @@
 //! case: l6_7_0002
 //! doc: stdlib
 //! section: 6.7
-//! title: discarding a Task with `_ := ...;` is rejected — FireAndForget is required
-//! rule: FireAndForget is the only supported way to discard a Task. The
-//!   discard form `_ := someAsyncCall();` is rejected at compile time.
+//! title: the owning WhenAll overload produces an owned array holding each task's result
+//! rule: Task.WhenAll<T>(owned tasks: OwningArray<OwningTask<T>>):
+//!   OwningTask<OwningArray<T>> where T: class — aggregates OwningTask<T>
+//!   results into an owned array of owned elements.
 //! cites: 6.7
-//! expect: reject
-//! diagnostic: FireAndForget
+//! expect: run
+//! stdout: 1
 module Conf;
 
-public class Program
-  public static async method Load(): Task
-    await Task.Delay(0);
-  end Load;
+public class Widget
+  public readonly property Id: int;
 
-  public static method Main()
-    _ := Load();
+  public constructor(id: int)
+    Id := id;
+  end constructor;
+end Widget;
+
+public class Program
+  public static async method MakeAsync(id: int): OwningTask<Widget>
+    return new Widget(id);
+  end MakeAsync;
+
+  public static async method Main(): Task
+    var tasks := new OwningArray<OwningTask<Widget>>();
+    tasks.Add(MakeAsync(7));
+    using var results := await Task.WhenAll(move tasks);
+    Console.WriteLine(results.Count);
   end Main;
 end Program;

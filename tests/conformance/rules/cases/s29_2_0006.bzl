@@ -7,7 +7,8 @@
 //!   disposed when the loop ends.
 //! cites: 29.2
 //! expect: run
-//! stdout: disposed
+//! output: disposed
+//!   after
 module Conf;
 
 public class LoudEnumerator: IEnumerator<int>

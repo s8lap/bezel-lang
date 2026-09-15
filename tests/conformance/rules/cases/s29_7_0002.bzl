@@ -8,7 +8,8 @@
 //!   point.
 //! cites: 29.7
 //! expect: run
-//! stdout: b
+//! output: b
+//!   a
 module Conf;
 
 public class Tag

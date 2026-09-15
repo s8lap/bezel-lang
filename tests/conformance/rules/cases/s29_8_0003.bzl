@@ -6,7 +6,8 @@
 //!   `owned` parameter that has not been moved out of by the body.
 //! cites: 29.8
 //! expect: run
-//! stdout: closed
+//! output: closed
+//!   after
 module Conf;
 
 public class Lines
