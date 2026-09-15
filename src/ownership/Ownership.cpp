@@ -4810,6 +4810,18 @@ OwnershipState MethodOwnership::producerState(const ast::Expr& e) {
                 return OwnershipState::Owned;
             // Other non-`owned` user returns: fall through.
         }
+        // fix #4360 (§28.3, v0.298): an INSTANCE method whose every return is a
+        // fresh owned producer AND none of the returns are self-derived is an
+        // instance factory — the caller must treat the call as Owned. Without
+        // this, `method Make(): C => new C(); end` classified Borrowed (the
+        // instance-method fallthrough default) and the fresh allocation leaked
+        // at every call site (24 B/call + payload).
+        if (const ast::MethodDecl* md = common::calleeMethodDecl(*ce, ctx_)) {
+            if (common::instanceFactoryReturnsFreshOwned(
+                    *md, ctx_.exprType(e), ctx_,
+                    [](const sema::TypeRef* t) { return t; }))
+                return OwnershipState::Owned;
+        }
         // #1388 / §28.3 / §28.11 / §29.1: builtin owned-TRANSFER calls — Pop /
         // Dequeue on the OWNING stacks/queues, PopLast/PopFirst/PopAt/PopValue,
         // T.Deserialize, and TakeCurrent on the owning enumerators — TRANSFER an

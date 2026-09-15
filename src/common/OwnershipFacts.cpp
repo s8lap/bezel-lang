@@ -1073,6 +1073,125 @@ bool staticFactoryReturnsFreshOwned(const ast::MethodDecl& md,
     return sawReturn && allFresh;
 }
 
+// fix #4360 (§28.3, v0.298): true if `e` is `self` or a chain from `self`
+// (e.g., `self`, `self.field`, `self.field.nested`). Used to exclude
+// instance methods whose return has a structural borrow relationship to the
+// receiver — such a return is a borrow, never an instance factory.
+// Only bare `this` is self-derived. `this.field` reads (even of owned fields)
+// are NOT self-derived: reading an owned field is a move of the owned value,
+// transferring ownership to the caller — the method IS a factory.
+namespace {
+bool isSelfDerived(const ast::Expr* e) {
+    if (!e) return false;
+    // `this` (bare IdentifierExpr) is self-derived — returning the receiver
+    // itself transfers no new allocation; the caller already has the object.
+    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(e))
+        return id->name == "this";
+    // `this.field` / `this.field.nested` reads are NOT self-derived:
+    // reading an owned field moves the owned value out (ownership transfer),
+    // reading a borrow field copies the borrow reference — in either case the
+    // method can be a factory (caller receives owned or borrowed from the
+    // read, not from self directly).
+    return false;
+}
+
+// Scans all return statements in `s` and returns true if any return is
+// self-derived. Mirrors scanReturnsAllFreshOwned's statement-type coverage.
+bool anyReturnIsSelfDerived(const ast::Stmt* s) {
+    if (!s) return false;
+    if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(s)) {
+        return isSelfDerived(rs->value.get());
+    }
+    // Descend using the same statement types scanReturnsAllFreshOwned covers.
+    if (const auto* is = dynamic_cast<const ast::IfStmt*>(s)) {
+        for (auto& b : is->ifBranch.body)
+            if (anyReturnIsSelfDerived(b.get())) return true;
+        for (auto& br : is->elifBranches)
+            for (auto& b : br.body)
+                if (anyReturnIsSelfDerived(b.get())) return true;
+        for (auto& b : is->elseBody)
+            if (anyReturnIsSelfDerived(b.get())) return true;
+        return false;
+    }
+    if (const auto* ws = dynamic_cast<const ast::WhileStmt*>(s)) {
+        for (auto& b : ws->body)
+            if (anyReturnIsSelfDerived(b.get())) return true;
+        return false;
+    }
+    if (const auto* fs = dynamic_cast<const ast::ForStmt*>(s)) {
+        for (auto& b : fs->body)
+            if (anyReturnIsSelfDerived(b.get())) return true;
+        return false;
+    }
+    if (const auto* d = dynamic_cast<const ast::DoEndBlock*>(s)) {
+        for (auto& b : d->body)
+            if (anyReturnIsSelfDerived(b.get())) return true;
+        return false;
+    }
+    if (const auto* ts = dynamic_cast<const ast::TryStmt*>(s)) {
+        for (auto& b : ts->body)
+            if (anyReturnIsSelfDerived(b.get())) return true;
+        for (auto& c : ts->catches)
+            if (anyReturnIsSelfDerived(c.body.get())) return true;
+        for (auto& b : ts->finallyBody)
+            if (anyReturnIsSelfDerived(b.get())) return true;
+        return false;
+    }
+    if (const auto* cs = dynamic_cast<const ast::CaseStmt*>(s)) {
+        for (auto& arm : cs->arms)
+            for (auto& a : arm.stmts)
+                if (anyReturnIsSelfDerived(a.get())) return true;
+        return false;
+    }
+    return false;
+}
+}  // namespace
+
+bool instanceFactoryReturnsFreshOwned(const ast::MethodDecl& md,
+                                    const sema::TypeRef* resultTy,
+                                    const sema::SemaContext& ctx,
+                                    const TypeParamResolver& resolveParam) {
+    // (1) INSTANCE only (non-static). Static methods are handled by
+    // staticFactoryReturnsFreshOwned.
+    bool isStatic = false;
+    for (std::string_view mod : md.modifiers)
+        if (mod == "static") { isStatic = true; break; }
+    if (isStatic) return false;
+    // (2) The resolved result must be a plain class/interface. A value-builtin
+    // carries no disposal obligation; an owning-wrapper/owning-collection head
+    // is excluded separately below.
+    if (!resultTy || resultTy->kind != sema::TypeRef::Kind::Named ||
+        !resultTy->declaration)
+        return false;
+    if (resultTy->declaration->isValueBuiltin) return false;
+    if (resultTy->declaration->kind != ast::TypeDeclKind::Class &&
+        resultTy->declaration->kind != ast::TypeDeclKind::Interface)
+        return false;
+    if (isOwningTypeHead(resultTy->headName())) return false;
+    // (3) Every return path must produce a fresh owned value, AND none of
+    // the returns may be self-derived. A self-derived return
+    // (`return self;`, `return self.field;`) has the receiver as a
+    // structural source and is a borrow — the caller already has a borrow of
+    // the same object, so treating the call as owned would be a double-free.
+    bool sawReturn = false;
+    bool allFresh = true;
+    bool anySelfDerived = false;
+    if (md.bodyKind == ast::MethodBodyKind::Expression) {
+        sawReturn = md.exprBody != nullptr;
+        allFresh = md.exprBody &&
+                   isFreshOwnedClassProducer(md.exprBody.get(), ctx,
+                                             resolveParam);
+        anySelfDerived = isSelfDerived(md.exprBody.get());
+    } else {
+        for (auto& s : md.stmts) {
+            scanReturnsAllFreshOwned(s.get(), ctx, resolveParam, sawReturn,
+                                     allFresh);
+            if (anyReturnIsSelfDerived(s.get())) anySelfDerived = true;
+        }
+    }
+    return sawReturn && allFresh && !anySelfDerived;
+}
+
 namespace {
 
 // The three TypeRef name fallbacks shared by the builtin-type matchers

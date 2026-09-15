@@ -726,6 +726,19 @@ bool staticFactoryReturnsFreshOwned(const ast::MethodDecl& md,
                                     const sema::SemaContext& ctx,
                                     const TypeParamResolver& resolveParam);
 
+// fix #4360 (§28.3, v0.298): the instance-method counterpart of
+// staticFactoryReturnsFreshOwned. An INSTANCE method whose every return path
+// produces a fresh owned value AND none of the returns are self-derived
+// (the receiver has no structural stake in the return value) is an instance
+// factory — the caller must treat the call result as Owned. Without this,
+// `method Make(): C => new C(); end` (instance, no `: owned`) is classified
+// Borrowed (the non-static fallthrough default) and the fresh allocation
+// leaks at every call site (24 B/call + payload).
+bool instanceFactoryReturnsFreshOwned(const ast::MethodDecl& md,
+                                      const sema::TypeRef* resultTy,
+                                      const sema::SemaContext& ctx,
+                                      const TypeParamResolver& resolveParam);
+
 // §30.1 / §9.7 (v0.179, #1438; re-applied post-substitution at a generic
 // method's INSTANTIATION site, #1595): true when `rt` is a borrow-bearing
 // record — a user record (§9.7) carrying at least one borrow-carrying field
