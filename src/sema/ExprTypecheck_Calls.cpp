@@ -5354,33 +5354,25 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     !recvTy->astNode->name->parts.empty() &&
                     recvTy->headName() == "IGrouping" &&
                     recvTy->genericArgs.size() >= 2 && recvTy->genericArgs[1];
-                // issue #4178 investigation note (NOT shipped): an
-                // `isOrderedEnumerableLinqRecv` arm mirroring
-                // `isGroupingLinqRecv` above (admitting an EXPLICITLY-NAMED
-                // `IOrderedEnumerable<T>` receiver into this block, element at
-                // genericArgs[0]) was written and measured, then reverted.
-                // It DOES make sema type a call like `.First()` on such a
-                // receiver — but codegen's own consuming-side dispatch (the
-                // `lowerToLazyEnumerator`/call-lowering machinery this block's
-                // sibling in LlvmBackend_Calls3.cpp drives) has no matching arm
-                // for a NAMED `IOrderedEnumerable` receiver, only the nameless
-                // lazy sentinel / Range / IGrouping shapes. The result: the
-                // call silently degrades through the #2491 zero/null-return
-                // backstop (Severity::Warning, LlvmBackend_Stmts.cpp) instead
-                // of failing to compile — measured on `Foo(xs).First()` with an
-                // explicit `IOrderedEnumerable<int>` return-type annotation:
-                // compiles, links, RUNS, and returns 0 instead of the correct
-                // sorted-first value 1 for `Foo([3,1,2])`. That trade — a clear
-                // compile-time #2457 "no dispatch arm" rejection becoming a
-                // silently wrong RUNTIME answer — is a regression in kind, not
-                // a completion of #4178, so it is not included here. Filed as
-                // the remaining half of issue #4178's own "or say which do
-                // not [work]" ask; the codegen completion (a real
-                // `lowerToLazyEnumerator`/terminal-call arm for a named
-                // `IOrderedEnumerable` receiver, undoing exactly the silent
-                // degrade this note describes) is its own change and belongs
-                // in a follow-up, not stacked onto a name-resolution fix.
-                if (isLazyRecv || isRangeLinqRecv || isGroupingLinqRecv) {
+                // fix #4207 (stdlib §5 / §12.9): an EXPLICITLY-NAMED
+                // `IOrderedEnumerable<T>` receiver (a named local/param/field
+                // with explicit type annotation, or a cross-module
+                // IOrderedEnumerable<T> value) carries the element type at
+                // genericArgs[0], just like the lazy sentinel (isLazyRecv) and
+                // Range.  Without this arm the call is left untyped and codegen
+                // has no matching dispatch arm either — the terminal silently
+                // degrades to zero at runtime (the #2491 null-return backstop).
+                // Recognised by headName() == "IOrderedEnumerable", which resolves
+                // through both the astNode path (local annotation) and the
+                // importedName path (cross-module use), matching
+                // isGroupingLinqRecv's approach.
+                bool isOrderedEnumerableLinqRecv =
+                    recvTy && recvTy->kind == TypeRef::Kind::Named &&
+                    !recvTy->declaration &&
+                    recvTy->headName() == "IOrderedEnumerable" &&
+                    !recvTy->genericArgs.empty() && recvTy->genericArgs[0];
+                if (isLazyRecv || isRangeLinqRecv || isGroupingLinqRecv ||
+                    isOrderedEnumerableLinqRecv) {
                     TypeRef* srcElem = isGroupingLinqRecv ? recvTy->genericArgs[1]
                                                           : recvTy->genericArgs[0];
                     if (m == "Any" || m == "All")

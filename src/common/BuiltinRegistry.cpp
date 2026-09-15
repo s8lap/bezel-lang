@@ -103,8 +103,8 @@ constexpr std::array<std::string_view, 4> kIterFormatEnumerableHeads = {
 
 // The SYNCHRONOUS half — the two heads the §29.2 `for` desugaring and the
 // synchronous wrap creators admit.
-constexpr std::array<std::string_view, 2> kSyncIterFormatEnumerableHeads = {
-    "IEnumerable", "IOwningEnumerable",
+constexpr std::array<std::string_view, 3> kSyncIterFormatEnumerableHeads = {
+    "IEnumerable", "IOwningEnumerable", "IOrderedEnumerable",
 };
 
 // #3419 / §29.2: the four ITERATOR-FORMAT ENUMERATOR heads — the complement

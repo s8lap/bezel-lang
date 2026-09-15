@@ -2256,6 +2256,23 @@ llvm::Value* Emitter::lowerToLazyEnumerator(const ast::Expr& recvExpr,
         elemRef = recvTy->genericArgs[0];
         return recv;
     }
+    // fix #4207 (stdlib §5 / §12.9): an EXPLICITLY-NAMED
+    // `IOrderedEnumerable<T>` receiver — a named local/param/field with explicit
+    // type annotation, or a cross-module value. `IOrderedEnumerable<T> : IEnumerable<T>`
+    // (stdlib §5 line 3592) and the OrderBy/OrderByDescending result interface.
+    // Its runtime representation is the SAME `bz_lazy_t*` as the lazy sentinel
+    // above — it IS a lazy enumerator, just named. Use it directly; element type
+    // is at genericArgs[0].  Not isLazyEnumerableType: that predicate requires
+    // declaration-less (no user TypeDecl, no astNode, no importedName — the exact
+    // shape of the anonymous lazy sentinel), while a named IOrderedEnumerable has
+    // an astNode (from the local annotation) or importedName (cross-module).
+    if (recvTy && recvTy->kind == sema::TypeRef::Kind::Named &&
+        !recvTy->declaration &&
+        builtinTypeName(recvTy) == "IOrderedEnumerable" &&
+        !recvTy->genericArgs.empty() && recvTy->genericArgs[0]) {
+        elemRef = recvTy->genericArgs[0];
+        return recv;
+    }
     // issue #389 / stdlib §5 / §4.10: a dict-backed Set<T> is IEnumerable<T>
     // (Set: ICollection<T>: IEnumerable<T>) but its backing pointer is a
     // bz_dict_t*, not a bz_array_t* — wrap it via the Set lazy source, which
@@ -2446,6 +2463,21 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
     // type from lowerToLazyEnumerator's `elemRef` out-param, which is the
     // grouping's genericArgs[1].
     bool igrpRecv = iGroupingElemTypeRef(recvTy) != nullptr;
+    // fix #4207 (stdlib §5): an explicitly-named `IOrderedEnumerable<T>`
+    // receiver (a named local/param/field with explicit type annotation, or a
+    // cross-module value). `IOrderedEnumerable<T> : IEnumerable<T>` (stdlib
+    // §5 line 3592) — it is a LINQ source with the SAME `bz_lazy_t*` runtime
+    // representation as the lazy sentinel, and the element type is at
+    // genericArgs[0].  lowerToLazyEnumerator handles it in its own arm (it is
+    // NOT isLazyEnumerableType — that predicate requires declaration-less, which
+    // a named IOrderedEnumerable is not), and every LINQ operator/terminal
+    // composes uniformly over it. Without this, a named IOrderedEnumerable
+    // receiver silently fell through to the #2491 zero/null backstop at
+    // runtime, producing wrong values instead of a compile-time diagnostic.
+    bool orderedEnumRecv =
+        recvTy && recvTy->kind == sema::TypeRef::Kind::Named &&
+        !recvTy->declaration &&
+        builtinTypeName(recvTy) == "IOrderedEnumerable";
     // fix #3763 (stdlib §5 / §5's `Reverse` naming note v0.195 / §4.6 / §4.7 /
     // §4.10 / §4.18, v0.287): the receiver heads on which stdlib §5's LAZY
     // `Reverse()` is the only declared meaning — the Set family and the
@@ -2467,7 +2499,7 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
                    common::isLazyReverseDirectReceiverHead(
                        builtinTypeName(recvTy));
     if (!collRecv && !lazyRecv && !llRecv && !rangeRecv && !vtRecv && !strRecv &&
-        !dictRecv && !igrpRecv)
+        !dictRecv && !igrpRecv && !orderedEnumRecv)
         return nullptr;
 
     // Element LLVM type for the receiver's element TypeRef.
