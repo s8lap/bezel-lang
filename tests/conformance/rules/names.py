@@ -207,6 +207,11 @@ def build_index(docs_dir):
                         index[current].add(m.group(1))
                 c = ENUM_CONST_RE.match(line)
                 if c:
+                    # A payload-bearing choice case — `Ok(owned value: T),` —
+                    # is a member of its choice. The comma split below cannot
+                    # see it: the part is `Ok(owned value: T)`, which is not a
+                    # bare identifier, so `Result.Ok` read as an unknown member.
+                    index[current].add(c.group(1))
                     # A constant line lists several: `Low, Medium, High;`
                     for part in line.split("//")[0].strip(" ;").split(","):
                         name = part.strip().split(":=")[0].strip()
@@ -352,12 +357,13 @@ def main(argv, base_dir=None):
     index = build_index(args.docs)
     module_of_type = build_module_index(args.docs)
     cases_dir = os.path.join(base, "cases")
-    expects, sections = {}, {}
+    expects, sections, diagnostics = {}, {}, {}
     manifest = os.path.join(base, "manifest.tsv")
     if os.path.exists(manifest):
         for row in corpus.read_manifest(manifest):
             expects[row["case-id"]] = row["expect"]
             sections[row["case-id"]] = row["section"]
+            diagnostics[row["case-id"]] = row["check"]
     findings = 0
     for name in sorted(os.listdir(cases_dir)):
         if not name.endswith(".bzl"):
@@ -374,6 +380,13 @@ def main(argv, base_dir=None):
         # expects to compile has a problem here.
         reserved = [] if expects.get(case_id) == "reject" \
             else reserved_declarations(source)
+        # …and a reject case may be about an unresolvable NAME, in which case the
+        # unknown type is the rule under test rather than an invented API. The
+        # signature is tight: the case rejects, and its `diagnostic:` — which the
+        # contract requires to be the rule's own wording — names that identifier.
+        if expects.get(case_id) == "reject":
+            frag = diagnostics.get(case_id, "")
+            types = [t for t in types if t not in frag.split()]
         if types or members or reserved or imports:
             findings += 1
             print(case_id)

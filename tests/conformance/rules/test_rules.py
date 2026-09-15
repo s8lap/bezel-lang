@@ -635,6 +635,34 @@ class TestMissingImports(unittest.TestCase):
         self.assertEqual(bad, [])
 
 
+class TestNamesIndexGaps(unittest.TestCase):
+    """Two false findings that were tool gaps, not case defects — both in
+    `reject` cases, where a false finding is worst: the thing the checker calls
+    an invented API is the rule under test."""
+
+    def setUp(self):
+        base = os.path.dirname(os.path.abspath(__file__))
+        repo = os.path.dirname(os.path.dirname(os.path.dirname(base)))
+        self.index = names.build_index(os.path.join(repo, "docs"))
+
+    def test_a_payload_bearing_choice_case_is_a_member(self):
+        # `Ok(owned value: T),` — the comma split saw `Ok(owned value: T)`,
+        # which is not a bare identifier, so `Result.Ok` read as unknown.
+        self.assertIn("Ok", self.index.get("Result", set()))
+        self.assertIn("Error", self.index.get("Result", set()))
+
+    def test_a_bare_enum_constant_list_still_works(self):
+        # The comma-split path must survive the fix.
+        self.assertIn("Read", self.index.get("FileMode", set())
+                      | self.index.get("SeekOrigin", set())
+                      | set(self.index.get("FileAccess", set())))
+
+    def test_the_committed_corpus_reports_nothing(self):
+        base = os.path.dirname(os.path.abspath(__file__))
+        rc = names.main(["--strict"], base_dir=base)
+        self.assertEqual(rc, 0)
+
+
 class TestTopLevelMember(unittest.TestCase):
     """Bezel has no free functions — Appendix A.2's TopDecl has no member
     alternative. Ten cases declared one anyway, every file a parse error, and
