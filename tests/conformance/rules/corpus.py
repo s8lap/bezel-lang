@@ -201,6 +201,10 @@ def check_case(path, text):
     # A REJECT case may be about a mismatched label (§1.6 states the rule), so
     # the check runs only where a typo would make the case fail for the wrong
     # reason. `corpus.py audit` lists the reject-case hits for a human.
+    # Unconditional: Appendix A.2 has no top-level member alternative, so this
+    # is a parse error whatever the case expects, and a REJECT case with one
+    # passes for the wrong reason forever rather than failing loudly.
+    problems.extend(top_level_member_problems(stem, body))
     if expect != "reject":
         problems.extend(end_label_problems(stem, body))
         problems.extend(implicit_constructor_problems(stem, body))
@@ -269,6 +273,38 @@ _NAME_DECL_RE = re.compile(
 # Labels that name a construct keyword rather than an identifier (§1.6).
 _KEYWORD_LABELS = {"if", "while", "for", "case", "try", "do", "constructor",
                    "destructor", "extension", "extern", "operator", "lambda"}
+
+
+# Appendix A.2: `TopDecl ::= ClassDecl | InterfaceDecl | RecordDecl | EnumDecl
+# | ChoiceDecl | ExtensionDecl | TypeAliasDecl | ExternBlock`. `method` is not
+# there — Bezel has no free functions. Ten cases declared one anyway, every one
+# of them a parse error: the authors were copying the documents' illustrative
+# `public method ReportEach<T>(…)` fragments, which are members shown without
+# their enclosing class. A helper goes in a `public static class`.
+TOP_LEVEL_MEMBER_START = re.compile(
+    r'^(?:public |internal |private )?(?:static |pure |async )*'
+    r'(?:method|property|constructor|destructor)\b')
+
+
+def top_level_member_problems(case_id, body):
+    """A member declared at module level, outside any type."""
+    problems, depth = [], 0
+    for line in body.split("\n"):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("//"):
+            continue
+        if depth == 0 and TOP_LEVEL_MEMBER_START.match(line):
+            problems.append(
+                "{}: `{}` is declared at module level — Appendix A.2's TopDecl "
+                "has no member alternative; put it in a class"
+                .format(case_id, stripped[:48]))
+        if re.match(r'^(?:public |internal |private )?(?:static |sealed |'
+                    r'abstract |partial )*'
+                    r'(?:class|interface|record|choice|enum|extension)\b', line):
+            depth += 1
+        elif depth and re.match(r'^end\b', line):
+            depth -= 1
+    return problems
 
 
 def end_label_problems(case_id, body):

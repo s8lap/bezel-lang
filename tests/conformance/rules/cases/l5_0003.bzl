@@ -11,19 +11,21 @@
 //! stdout: caught
 module Conf;
 
-public method Reenumerate(source: IEnumerable<int>)
-  for var v in source do
-  end;
-  for var v2 in source do
-  end;
-end Reenumerate;
+public static class Helpers
+  public static method Reenumerate(source: IEnumerable<int>)
+    for var v in source do
+    end;
+    for var v2 in source do
+    end;
+  end Reenumerate;
+end Helpers;
 
 public class Program
   public static method Main()
     using var xs: Array<int> := [1, 2, 3];
     using var q := xs.Where(lambda(x: int): bool => x > 0);
     try
-      Reenumerate(q);
+      Helpers.Reenumerate(q);
     catch
       InvalidOperationException => Console.WriteLine("caught")
     end;

@@ -635,6 +635,60 @@ class TestMissingImports(unittest.TestCase):
         self.assertEqual(bad, [])
 
 
+class TestTopLevelMember(unittest.TestCase):
+    """Bezel has no free functions — Appendix A.2's TopDecl has no member
+    alternative. Ten cases declared one anyway, every file a parse error, and
+    the two `reject` cases among them would have reported PASS for the wrong
+    rule forever. The authors were copying the documents' illustrative
+    `public method ReportEach<T>(…)` fragments, which are members shown without
+    their enclosing class — so the mistake is structural, not careless."""
+
+    def probs(self, body):
+        return corpus.top_level_member_problems("x", body)
+
+    def test_a_top_level_method_is_a_problem(self):
+        body = "module Conf;\n\npublic method Helper(x: int)\nend Helper;\n"
+        self.assertEqual(len(self.probs(body)), 1)
+        self.assertIn("module level", self.probs(body)[0])
+
+    def test_modifiers_do_not_hide_it(self):
+        for decl in ("public static method H()", "internal pure method H()",
+                     "private async method H()", "public property P: int"):
+            body = "module Conf;\n\n{}\nend H;\n".format(decl)
+            self.assertEqual(len(self.probs(body)), 1, decl)
+
+    def test_a_method_inside_a_class_is_fine(self):
+        body = ("module Conf;\n\npublic static class Helpers\n"
+                "public static method H(x: int)\nend H;\nend Helpers;\n")
+        self.assertEqual(self.probs(body), [])
+
+    def test_a_method_after_a_closed_class_is_caught(self):
+        # The depth counter must come back down, or everything after the first
+        # class is excused.
+        body = ("module Conf;\n\npublic class A\nend A;\n\n"
+                "public method Loose()\nend Loose;\n")
+        self.assertEqual(len(self.probs(body)), 1)
+
+    def test_nested_types_do_not_confuse_the_depth(self):
+        body = ("module Conf;\n\npublic class A\n"
+                "public method M()\nend M;\nend A;\n"
+                "public interface I\nend I;\n"
+                "public record R(X: int);\n")
+        self.assertEqual(self.probs(body), [])
+
+    def test_it_is_a_lint_not_an_audit_signal(self):
+        # Unconditional: a reject case with one passes for the wrong reason.
+        problems = corpus.lint_case(
+            "s1_1_0001",
+            "//! case: s1_1_0001\n//! doc: spec\n//! section: 1.1\n"
+            "//! title: t\n//! rule: r\n//! expect: reject\n"
+            "//! diagnostic: d\nmodule Conf;\n\n"
+            "public method Loose()\nend Loose;\n")[1] \
+            if hasattr(corpus, "lint_case") else self.probs(
+                "module Conf;\n\npublic method Loose()\nend Loose;\n")
+        self.assertTrue(problems)
+
+
 class TestManifest(unittest.TestCase):
     def test_build_then_check_is_clean(self):
         with tempfile.TemporaryDirectory() as base:
