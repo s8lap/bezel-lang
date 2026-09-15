@@ -653,6 +653,20 @@ public:
 private:
     sema::SemaContext& ctx_;
     std::unordered_map<sema::Symbol*, LocalOwnership> states_;
+    // fix #4141 (§21.5/§28.3, v0.298): pending `break`/`continue` arm
+    // end-states to be JOINED into the IMMEDIATELY enclosing loop's
+    // post-loop join, rather than folded into the if/case's own join
+    // (which would be a false-reject — see `armDivertsToEnclosingLoop`).
+    // Each entry is a snapshot of `states_` at the point of an unlabeled
+    // `break`/`continue` (offset 0) that terminates an if/case arm
+    // inside this walker; the immediately enclosing `While`/`For`
+    // handler pops and joins every entry pushed during its body's walk.
+    // Labeled forms targeting an OUTER loop (offset > 0) are deferred to
+    // #4146's Stage 2 ("lambda bodies through the real CFG") — this
+    // walker has no mechanism to skip past intervening loop constructs
+    // when joining, and the over-conservative fallback (folding the arm
+    // into the immediate join) is sound-direction only.
+    std::vector<BlockState> pendingDivertedStates_;
     // Async-readiness 3c: true while analysing an `async` method/lambda body.
     // Gates the at-await-site Pattern A/B checks and the SuspendLocal
     // annotation so they never affect a synchronous body. // per §30.5

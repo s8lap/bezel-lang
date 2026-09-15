@@ -277,6 +277,60 @@ bool armNeverFallsThrough(const std::vector<std::unique_ptr<ast::Stmt>>& stmts) 
     return false;
 }
 
+// fix #4141 (§21.5/§28.3, v0.298): the companion predicate to
+// `armNeverFallsThrough` for `break`/`continue`. Does the LAST reachable
+// top-level statement of an arm divert control away from the point
+// directly after the ENCLOSING construct, and is its target the
+// IMMEDIATELY enclosing loop (offset 0 — an unlabeled `break`/`continue`,
+// or a labeled form naming the innermost enclosing loop)?
+//
+// Unlike `armNeverFallsThrough` (which DROPS the operand, because
+// `return`/`throw` leave the enclosing CALLABLE and so the operand has
+// nowhere else it needs to go), `break`/`continue` reach a DIFFERENT,
+// but still-live, merge point — the enclosing loop's own join. They must
+// be FORWARDED to that join, not folded into the if/case's own join
+// (which would falsely tell code after the if/case that `x` is maybe-
+// consumed when only the unreachable break-arm ever touched it — see
+// issue #4141's repro and the #4138 first-draft history), and not
+// dropped entirely (which would discard the move from the loop's join
+// — see the #4138 first-draft `while cond do if flag then move x; break;
+// end; end; move x;` counter-example, which silently un-rejected a real
+// double-move when `break` was simply excluded from every join).
+//
+// This predicate's callers (the lambda-body pre-pass's `If`/`Case`
+// arms) push the arm's `states_` to `pendingDivertedStates_` instead of
+// `armEnds`/`caseArmEnds`; the immediately enclosing `While`/`For`
+// handler pops every state pushed during its body's walk and JOINS each
+// one into its own post-loop join (the same loop's post-loop merge
+// operand for an unlabeled break, or the loop's header — both reach
+// the same merge point from this walker's one-pass-through-the-body
+// perspective, so offset-0 is the only case that matters for this fix).
+//
+// Labeled forms with `targetLoopOffset > 0` (e.g. `break outer;` from
+// inside a nested `while true do ... end;`) target an OUTER labeled
+// loop's join, not the immediately enclosing one — forwarding them
+// would need a per-offset stack, which is a larger change than this
+// narrow fix attempts (see #4146's Stage 2, "lambda bodies through the
+// real CFG", for the general solution). For now, only offset 0 is
+// recognized; a labeled form is treated as "does not divert at this
+// level", and falls back to the over-conservative pre-fix behavior
+// (fold the arm's end state into the immediate join — a false-reject,
+// not a soundness hole, since `joinInto`'s accumulation is monotonic
+// toward more caution).
+bool armDivertsToEnclosingLoop(
+    const std::vector<std::unique_ptr<ast::Stmt>>& stmts) {
+    for (auto it = stmts.rbegin(); it != stmts.rend(); ++it) {
+        if (!*it) continue;
+        const ast::Stmt& s = **it;
+        if (auto* brk = dynamic_cast<const ast::BreakStmt*>(&s))
+            return brk->targetLoopOffset == 0;
+        if (auto* cnt = dynamic_cast<const ast::ContinueStmt*>(&s))
+            return cnt->targetLoopOffset == 0;
+        return false;
+    }
+    return false;
+}
+
 // fix #3037 / §28.3 (v0.240): the source location of a §28.3 owned-binding
 // diagnostic. Most owned-binding kinds carry `obligationOrigin` populated by the
 // analysis (a back-pointer to the AST node where the obligation was created,
@@ -10370,8 +10424,30 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
         // fallthrough (`savedIfStates`, pushed below when there is no
         // `else`) is NOT a real arm body and is always reachable, so it is
         // never subject to this check.
-        if (!armNeverFallsThrough(ifs->ifBranch.body))
-            armEnds.push_back(states_);
+        //
+        // fix #4141 (§21.5/§28.3, v0.298): an arm ending in an UNLABELED
+        // `break`/`continue` (offset 0 — targeting the immediately
+        // enclosing loop) also never reaches the point directly after
+        // this `if`, BUT it does reach a different live merge point
+        // (the enclosing loop's own post-loop join). It must be
+        // FORWARDED to that join, not dropped, and not folded into this
+        // `if`'s own join (which would tell code after the if that
+        // `x` is maybe-consumed when only the unreachable break-arm
+        // ever touched it). The If/Case push the state to
+        // `pendingDivertedStates_`; the enclosing While/For pops and
+        // joins each one into its own post-loop join — see
+        // `armDivertsToEnclosingLoop`'s header. Labeled forms (offset
+        // > 0) target an outer loop and are NOT yet recognized here;
+        // they fall through to the `else` branch below and fold into
+        // the if's own join (the over-conservative pre-#4141 behavior
+        // for that one shape, sound-direction only).
+        if (!armNeverFallsThrough(ifs->ifBranch.body)) {
+            if (armDivertsToEnclosingLoop(ifs->ifBranch.body)) {
+                pendingDivertedStates_.push_back(states_);
+            } else {
+                armEnds.push_back(states_);
+            }
+        }
         for (const auto& el : ifs->elifBranches) {
             states_ = savedIfStates;
             if (el.condition) {
@@ -10382,15 +10458,25 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
             }
             for (const auto& bs : el.body)
                 if (bs) applyUsingVarBorrowPinInLambdaStmt(*bs);
-            if (!armNeverFallsThrough(el.body))
-                armEnds.push_back(states_);
+            if (!armNeverFallsThrough(el.body)) {
+                if (armDivertsToEnclosingLoop(el.body)) {
+                    pendingDivertedStates_.push_back(states_);
+                } else {
+                    armEnds.push_back(states_);
+                }
+            }
         }
         if (ifs->hasElse) {
             states_ = savedIfStates;
             for (const auto& bs : ifs->elseBody)
                 if (bs) applyUsingVarBorrowPinInLambdaStmt(*bs);
-            if (!armNeverFallsThrough(ifs->elseBody))
-                armEnds.push_back(states_);
+            if (!armNeverFallsThrough(ifs->elseBody)) {
+                if (armDivertsToEnclosingLoop(ifs->elseBody)) {
+                    pendingDivertedStates_.push_back(states_);
+                } else {
+                    armEnds.push_back(states_);
+                }
+            }
         } else {
             armEnds.push_back(savedIfStates);
         }
@@ -10443,8 +10529,16 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
         // one is out of this fix's scope. // per §28.3 K1.3, v0.295, #3951,
         // #4117
         BlockState savedWhileStates = states_;
+        // fix #4141 (§21.5/§28.3, v0.298): bracket the body walk so the
+        // pending `break`/`continue` arm states (pushed by the If/Case
+        // arms inside this body, see `armDivertsToEnclosingLoop`) are
+        // bounded to this loop's contribution to the post-loop join —
+        // any state pushed by a construct OUTSIDE this loop belongs to
+        // an enclosing loop and must not be touched here.
+        const std::size_t pendingStart = pendingDivertedStates_.size();
         for (const auto& bs : ws->body)
             if (bs) applyUsingVarBorrowPinInLambdaStmt(*bs);
+        const std::size_t pendingEnd = pendingDivertedStates_.size();
         // fix #4138 (§21.5/§28.3, v0.295): a body whose last reachable
         // statement is return/throw never reaches the point directly after
         // this loop (it leaves the callable outright), so it must not be
@@ -10460,6 +10554,18 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
             joinInto(states_, savedWhileStates, ws->span.begin,
                      /*emitClash=*/false, /*unionKeys=*/false);
         }
+        // fix #4141: join every break/continue-arm end-state pushed
+        // during this body's walk into the post-loop join. Each one is
+        // a path through the body that EXITED the loop early; together
+        // with the "ran the body to completion" and "0 iterations"
+        // operands above, it forms the complete post-loop join. After
+        // joining, drop the entries from the pending stack so the
+        // enclosing loop sees only ITS body's contributions.
+        for (std::size_t i = pendingStart; i < pendingEnd; ++i) {
+            joinInto(states_, pendingDivertedStates_[i], ws->span.begin,
+                     /*emitClash=*/false, /*unionKeys=*/false);
+        }
+        pendingDivertedStates_.resize(pendingStart);
         return;
     }
     if (auto* fs = dynamic_cast<const ast::ForStmt*>(&s)) {
@@ -10483,8 +10589,14 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
         // with zero diagnostics and heap-use-after-freed. // per §28.3 K1.3,
         // v0.295, #3951, #4117
         BlockState savedForStates = states_;
+        // fix #4141 (§21.5/§28.3, v0.298): same bracket as WhileStmt
+        // just above -- bound the break/continue-arm states pushed
+        // during this body walk to THIS loop's post-loop join, and
+        // include each one in that join.
+        const std::size_t pendingStart = pendingDivertedStates_.size();
         for (const auto& bs : fs->body)
             if (bs) applyUsingVarBorrowPinInLambdaStmt(*bs);
+        const std::size_t pendingEnd = pendingDivertedStates_.size();
         // fix #4138 (§21.5/§28.3, v0.295): see the identical WhileStmt
         // exclusion just above.
         if (armNeverFallsThrough(fs->body)) {
@@ -10493,6 +10605,11 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
             joinInto(states_, savedForStates, fs->span.begin,
                      /*emitClash=*/false, /*unionKeys=*/false);
         }
+        for (std::size_t i = pendingStart; i < pendingEnd; ++i) {
+            joinInto(states_, pendingDivertedStates_[i], fs->span.begin,
+                     /*emitClash=*/false, /*unionKeys=*/false);
+        }
+        pendingDivertedStates_.resize(pendingStart);
         return;
     }
     if (auto* db = dynamic_cast<const ast::DoEndBlock*>(&s)) {
@@ -10675,8 +10792,20 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
             // return/throw leaves the callable outright and so never
             // reaches the point directly after this `case`, so its end
             // state must not be folded in.
-            if (!armNeverFallsThrough(arm.stmts))
-                caseArmEnds.push_back(states_);
+            //
+            // fix #4141 (§21.5/§28.3, v0.298): symmetric with the If arm
+            // just above -- an arm ending in an unlabeled
+            // `break`/`continue` (offset 0) targets the immediately
+            // enclosing loop's own join, so it must be FORWARDED there
+            // (via `pendingDivertedStates_`, popped by the enclosing
+            // While/For), not folded into this `case`'s own join.
+            if (!armNeverFallsThrough(arm.stmts)) {
+                if (armDivertsToEnclosingLoop(arm.stmts)) {
+                    pendingDivertedStates_.push_back(states_);
+                } else {
+                    caseArmEnds.push_back(states_);
+                }
+            }
         }
         if (!cs->noMatchEdgeStaticallyDead)
             caseArmEnds.push_back(savedCaseStates);
