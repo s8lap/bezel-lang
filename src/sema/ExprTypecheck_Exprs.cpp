@@ -368,35 +368,21 @@ static std::string_view exprsNamedTypeSimpleName(const TypeRef* ref) {
 // identifier `Message`" where the identical hierarchy declared in ONE module
 // resolved it.)
 
-// §14.1 (#2006): does `t` mention a free/rigid type variable anywhere — a Named
-// TypeRef with no declaration, no generic arguments, and a non-empty head (a
-// generic type or method parameter)? A local mirror of ExprTypecheck.cpp's
-// file-local `refMentionsTypeVariable` (the two TUs cannot share the static),
-// used by the plain `is`/`as` erasure guard to hold OFF a target that carries a
-// bare parameter (`o is Box<Box<T>>` in a generic body, #1843): T resolves to a
-// concrete argument at monomorphization, so it is not statically erased — the
-// same conservative-accept posture typeTestInterfaceBindAmbiguous takes on the
-// case-binding path.
-bool typeTestTargetMentionsTypeVariable(const TypeRef* t) {
-    if (!t) return false;
-    switch (t->kind) {
-        case TypeRef::Kind::Named:
-            if (!t->declaration && t->genericArgs.empty() &&
-                !t->headName().empty())
-                return true;
-            for (const TypeRef* a : t->genericArgs)
-                if (typeTestTargetMentionsTypeVariable(a)) return true;
-            return false;
-        case TypeRef::Kind::InlineArray:
-            return typeTestTargetMentionsTypeVariable(t->arrayElement);
-        case TypeRef::Kind::Function:
-            for (const auto& p : t->funcParams)
-                if (typeTestTargetMentionsTypeVariable(p.type)) return true;
-            return typeTestTargetMentionsTypeVariable(t->funcReturn);
-        default:
-            return false;
-    }
-}
+// §14.1 (#2006): REMOVED by fix #4229 — replaced by
+// `ExprTC::typeTestTargetMentionsTypeVariable`, a member that threads
+// `currentScopeGenericParamNames()` through `refOutParamTypeMentionsTypeParam`
+// (the same ground truth `mentionsUnsubstitutedTypeParam` and #4199's
+// `variantGenericAssignable` already use). The two static twins in
+// ExprTypecheck.cpp and THIS file were structurally identical and BOTH
+// misclassified the ~50 null-declaration stdlib builtins (`Task`,
+// `Exception`, `IDisposable`, `Mutex`, `Semaphore`, `DateTime`, `TimeSpan`,
+// `Guid`, `StringBuilder`, `Random`, `File`, `Path`, `IntPtr`, `CString`,
+// ... — #4229) as "free type variables" — the structural guess returned
+// TRUE on their shape alone (Named + null decl + no args + non-empty head),
+// silently suppressing the §12.7 / §17.4 / §2.8.3 rule 4 erasure guards
+// (#1939/#2006/#2012/#2018). The plain `is`/`as` (ExprTypecheck_Exprs.cpp
+// ~2400) and value-form `case` binding (~10360) call sites both invoke
+// `ctx_.typeTestTargetMentionsTypeVariable(...)` now.
 
 }  // namespace
 

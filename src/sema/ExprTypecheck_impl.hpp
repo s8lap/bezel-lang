@@ -1606,6 +1606,36 @@ private:
         const ast::Type& target,
         std::unordered_set<std::string_view>& out) const;
 
+    // fix #4229 (§31.2.1 / §12.7 / §2.8.3 rule 4 / §17.4, §19.3, v0.300): does
+    // `t` mention a free/rigid type parameter of the ENCLOSING scope anywhere —
+    // the shape (`Named` + no decl + no args + non-empty head) used as a proxy
+    // by the file-local `refMentionsTypeVariable` (~7448) is ALSO the shape
+    // every null-declaration stdlib builtin (`Task`, `Exception`, `IDisposable`,
+    // `Mutex`, `Semaphore`, `DateTime`, `TimeSpan`, `Guid`, `StringBuilder`,
+    // `Random`, `File`, `Path`, `IntPtr`, `CString`, ~50 names — #4229) takes
+    // after type resolution, so the structural guess returns TRUE for those
+    // builtins and the #1927/#1939/#2006/#2012/#2018 erasure guards silently
+    // admit `MyExc<Task>` arms / `Wrap<Task>` `is` tests / `var x: Wrap<Task>`
+    // case bindings at a non-distinguishable runtime descriptor (the
+    // §2.8.3 rule 4 confusion class). The fix: thread the actual declared
+    // names in via `currentScopeGenericParamNames()` and reuse
+    // `refOutParamTypeMentionsTypeParam`'s exact-match walk — the same authority
+    // `mentionsUnsubstitutedTypeParam` (line ~3805) and
+    // `variantGenericAssignable`'s `freeNames` set (#4199) already trust, so
+    // a null-declaration builtin that isn't one of the enclosing scope's
+    // generic parameters returns FALSE here, and the downstream guard proceeds
+    // to its reification check (#2022's `typeArgRuntimeReified`).
+    //
+    // Used by the catch-arm surface (#1939, ExprTypecheck.cpp ~17400),
+    // `typeTestInterfaceBindAmbiguous` (#1927, ExprTypecheck.cpp ~7691), the
+    // plain `is`/`as` surface (#2006, ExprTypecheck_Exprs.cpp ~2409), and the
+    // value-form case binding (#2018, ExprTypecheck_Exprs.cpp ~10360).
+    bool refMentionsTypeVariable(const TypeRef* t) const;
+    // Sibling of `refMentionsTypeVariable` for the value/expression `case`
+    // handler — was `typeTestTargetMentionsTypeVariable` in
+    // ExprTypecheck_Exprs.cpp's anonymous namespace, identical defect class.
+    bool typeTestTargetMentionsTypeVariable(const TypeRef* t) const;
+
     // Slice S18: a condition must be `bool` (§21.2 if, §21.3 while,
     // §20 if-expression). Only flags when the condition has a resolved
     // primitive type that is not bool — conditions whose type isn't yet

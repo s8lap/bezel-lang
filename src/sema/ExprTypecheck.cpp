@@ -7453,25 +7453,43 @@ bool ExprTC::typeTestInterfaceInstantiationImpossible(const TypeRef* scrutTy,
 // treat as a solve/free variable)? Used to hold #1927's uniqueness check off any
 // scrutinee or pattern carrying a rigid parameter, whose per-instantiation match
 // is undecidable at the declaration (§19.3 v0.182 / §19.6 rigid identity).
-static bool refMentionsTypeVariable(const TypeRef* t) {
+//
+// fix #4229 (§31.2.1 / §12.7 / §2.8.3 rule 4 / §17.4 / §19.3, v0.300): the
+// pre-fix static predicate above matched ANY null-declaration no-args Named
+// (a structural shape `Task`, `Exception`, `IDisposable`, ~50 stdlib builtins
+// satisfy identically), so the erasure guards it underwrote (#1927/#1939/
+// #2006/#2012/#2018) silently admitted `MyExc<Task>` arms / `Wrap<Task>`
+// `is` tests / `var x: Wrap<Task>` case bindings whose runtime descriptor
+// collapses — the same §2.8.3 rule 4 confusion class `fix #4199` measured
+// for the `isFreeGenericTypeVarRef` twin. Converted to a member that consults
+// `currentScopeGenericParamNames()` and delegates the leaf test to
+// `refOutParamTypeMentionsTypeParam` (the same authority
+// `mentionsUnsubstitutedTypeParam` and #4199's `freeNames` set already
+// trust). The shape-only walk is gone; a builtin that is not in the
+// enclosing scope's declared type-parameter names returns FALSE, and the
+// downstream guard proceeds to `typeArgRuntimeReified` (#2022).
+bool ExprTC::refMentionsTypeVariable(const TypeRef* t) const {
     if (!t) return false;
-    switch (t->kind) {
-        case TypeRef::Kind::Named:
-            if (!t->declaration && t->genericArgs.empty() &&
-                !namedTypeSimpleName(t).empty())
-                return true;
-            for (const TypeRef* a : t->genericArgs)
-                if (refMentionsTypeVariable(a)) return true;
-            return false;
-        case TypeRef::Kind::InlineArray:
-            return refMentionsTypeVariable(t->arrayElement);
-        case TypeRef::Kind::Function:
-            for (const auto& p : t->funcParams)
-                if (refMentionsTypeVariable(p.type)) return true;
-            return refMentionsTypeVariable(t->funcReturn);
-        default:
-            return false;
-    }
+    std::unordered_set<std::string_view> tpNames = currentScopeGenericParamNames();
+    if (tpNames.empty()) return false;
+    return refOutParamTypeMentionsTypeParam(t, tpNames);
+}
+
+// §14.1 / #4229 (#2006 / #2018 surface): the value/expression `case` and
+// plain `is`/`as` MIRROR of the static `refMentionsTypeVariable` above — was
+// the file-local `typeTestTargetMentionsTypeVariable` in
+// `ExprTypecheck_Exprs.cpp`'s anonymous namespace, same defect class, same
+// removal of the structural guess. Promoted to a member so it sees
+// `currentScopeGenericParamNames()` and shares the same `refOutParamTypeMentionsTypeParam`
+// authority. The over-rejection guard: a builtin whose name happens to equal
+// a real generic parameter (`class Box<Task>` inside a method body where a
+// type param shadows the builtin) still returns TRUE — exactly mirroring
+// `isEnclosingGenericTypeParamName`'s #2994 priority.
+bool ExprTC::typeTestTargetMentionsTypeVariable(const TypeRef* t) const {
+    if (!t) return false;
+    std::unordered_set<std::string_view> tpNames = currentScopeGenericParamNames();
+    if (tpNames.empty()) return false;
+    return refOutParamTypeMentionsTypeParam(t, tpNames);
 }
 
 // §12.2/§19.3 (#1942): does `t` mention any of `names` as a bare type-variable
