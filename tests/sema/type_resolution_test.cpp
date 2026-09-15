@@ -94,6 +94,7 @@ BEZEL_TEST(sema_types, primitive_nullable_string) {
     auto r = parseAndResolve("module M; class C public x: string?; end C;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     auto* ref = r.ctx->resolvedType(*firstFieldType(r));
+    BEZEL_EXPECT_TRUE(ref != nullptr);
     if (ref) {
         BEZEL_EXPECT_TRUE(ref->kind == TypeRef::Kind::Primitive);
         BEZEL_EXPECT_TRUE(ref->primitive == PrimitiveType::String);
@@ -123,6 +124,7 @@ BEZEL_TEST(sema_types, every_primitive_recognised) {
         auto r = parseAndResolve(src);
         BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
         auto* ref = r.ctx->resolvedType(*firstFieldType(r));
+        BEZEL_EXPECT_TRUE(ref != nullptr);
         if (ref) {
             BEZEL_EXPECT_TRUE(ref->kind == TypeRef::Kind::Primitive);
             BEZEL_EXPECT_TRUE(ref->primitive == prim);
@@ -135,6 +137,7 @@ BEZEL_TEST(sema_types, named_type_resolves_to_local_type_symbol) {
         "module M; class C public x: D; end C; class D end D;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     auto* ref = r.ctx->resolvedType(*firstFieldType(r));
+    BEZEL_EXPECT_TRUE(ref != nullptr);
     if (ref) {
         BEZEL_EXPECT_TRUE(ref->kind == TypeRef::Kind::Named);
         BEZEL_EXPECT_TRUE(ref->declaration != nullptr);
@@ -150,6 +153,7 @@ BEZEL_TEST(sema_types, generic_type_param_resolves_in_class_scope) {
         "module M; class Box<T> public x: T; end Box;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     auto* ref = r.ctx->resolvedType(*firstFieldType(r));
+    BEZEL_EXPECT_TRUE(ref != nullptr);
     if (ref) {
         BEZEL_EXPECT_TRUE(ref->kind == TypeRef::Kind::Named);
         // Generic params resolve to "Named with no declaration" (a sentinel
@@ -164,6 +168,7 @@ BEZEL_TEST(sema_types, unresolved_name_is_diagnosed) {
         "module M; class C public x: UnknownType; end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     auto* ref = r.ctx->resolvedType(*firstFieldType(r));
+    BEZEL_EXPECT_TRUE(ref != nullptr);
     if (ref) {
         BEZEL_EXPECT_TRUE(ref->kind == TypeRef::Kind::Error);
     }
@@ -176,10 +181,29 @@ BEZEL_TEST(sema_types, generic_arity_mismatch_is_diagnosed) {
 }
 
 BEZEL_TEST(sema_types, generic_arity_match_is_clean) {
+    // issue #4106: `firstFieldType` (above) only walks `topDecls[0]`'s
+    // members - a "first field of the FIRST top-level declaration" helper,
+    // not a whole-file search, exactly as every other test in this file
+    // relies on (the exercised class `C` is always declared first). This
+    // fixture declared the dependency `Map` first and `C` - the class
+    // whose field is actually under test - second, so `firstFieldType`
+    // always walked `Map` (no members) and returned null; dereferencing
+    // that null in `*firstFieldType(r)` fed a dangling reference into
+    // `resolvedType`, which then (correctly) found nothing for it. The
+    // `if (ref) { EXPECT... }` anti-pattern masked this since the fixture
+    // was written (same shape #3985 fixed in
+    // member_access_resolution_test.cpp's qualified_field_access_resolves).
+    // Reordering so `C` is declared first - matching every sibling test in
+    // this file - fixes it; VERIFIED against the real gtest binary: with
+    // the unconditional `ref != nullptr` assertion added but the
+    // declaration order left as-is, this test FAILS
+    // (`assertion failed: ref != nullptr`).
     auto r = parseAndResolve(
-        "module M; class Map<K, V> end Map; class C public x: Map<int, string>; end C;");
+        "module M; class C public x: Map<int, string>; end C; "
+        "class Map<K, V> end Map;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     auto* ref = r.ctx->resolvedType(*firstFieldType(r));
+    BEZEL_EXPECT_TRUE(ref != nullptr);
     if (ref) {
         BEZEL_EXPECT_TRUE(ref->kind == TypeRef::Kind::Named);
         BEZEL_EXPECT_EQ(ref->genericArgs.size(), std::size_t(2));
@@ -190,6 +214,7 @@ BEZEL_TEST(sema_types, unit_type) {
     auto r = parseAndResolve("module M; class C public x: (); end C;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     auto* ref = r.ctx->resolvedType(*firstFieldType(r));
+    BEZEL_EXPECT_TRUE(ref != nullptr);
     if (ref) BEZEL_EXPECT_TRUE(ref->kind == TypeRef::Kind::Unit);
 }
 
@@ -197,6 +222,7 @@ BEZEL_TEST(sema_types, inline_array) {
     auto r = parseAndResolve("module M; class C public x: [10]int; end C;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     auto* ref = r.ctx->resolvedType(*firstFieldType(r));
+    BEZEL_EXPECT_TRUE(ref != nullptr);
     if (ref) {
         BEZEL_EXPECT_TRUE(ref->kind == TypeRef::Kind::InlineArray);
         BEZEL_EXPECT_TRUE(ref->arrayElement != nullptr);
@@ -210,11 +236,17 @@ BEZEL_TEST(sema_types, inline_array) {
 }
 
 BEZEL_TEST(sema_types, inline_array_owned_slots) {
+    // issue #4106: same fixture-ordering defect as
+    // generic_arity_match_is_clean above - `Resource` (no members) was
+    // declared before the exercised class `C`, so `firstFieldType`'s
+    // `topDecls[0]` walk found `Resource` instead. Reordered so `C` comes
+    // first, matching every sibling test in this file.
     auto r = parseAndResolve(
-        "module M; class Resource end Resource; "
-        "class C public x: [16 owned]Resource; end C;");
+        "module M; class C public x: [16 owned]Resource; end C; "
+        "class Resource end Resource;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     auto* ref = r.ctx->resolvedType(*firstFieldType(r));
+    BEZEL_EXPECT_TRUE(ref != nullptr);
     if (ref) {
         BEZEL_EXPECT_TRUE(ref->kind == TypeRef::Kind::InlineArray);
         BEZEL_EXPECT_TRUE(ref->arrayOwned);
@@ -226,6 +258,7 @@ BEZEL_TEST(sema_types, function_type_two_param) {
         "module M; class C public x: (int, string) -> bool; end C;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     auto* ref = r.ctx->resolvedType(*firstFieldType(r));
+    BEZEL_EXPECT_TRUE(ref != nullptr);
     if (ref) {
         BEZEL_EXPECT_TRUE(ref->kind == TypeRef::Kind::Function);
         BEZEL_EXPECT_EQ(ref->funcParams.size(), std::size_t(2));
@@ -238,11 +271,17 @@ BEZEL_TEST(sema_types, function_type_two_param) {
 }
 
 BEZEL_TEST(sema_types, function_type_owned_return) {
+    // issue #4106: same fixture-ordering defect as
+    // generic_arity_match_is_clean above - `Resource` (no members) was
+    // declared before the exercised class `C`, so `firstFieldType`'s
+    // `topDecls[0]` walk found `Resource` instead. Reordered so `C` comes
+    // first, matching every sibling test in this file.
     auto r = parseAndResolve(
-        "module M; class Resource end Resource; "
-        "class C public x: () -> owned Resource; end C;");
+        "module M; class C public x: () -> owned Resource; end C; "
+        "class Resource end Resource;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     auto* ref = r.ctx->resolvedType(*firstFieldType(r));
+    BEZEL_EXPECT_TRUE(ref != nullptr);
     if (ref) {
         BEZEL_EXPECT_TRUE(ref->kind == TypeRef::Kind::Function);
         BEZEL_EXPECT_TRUE(ref->funcReturnOwned);

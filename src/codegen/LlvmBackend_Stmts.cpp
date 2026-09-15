@@ -388,7 +388,101 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 // plain lvalue path below.
                 if (auto* ix = dynamic_cast<const ast::IndexExpr*>(
                         as->target.get())) {
-                    llvm::Value* rhsOnce = lowerExpr(*as->value);
+                    llvm::Value* rhsOnce = nullptr;
+                    // fix #4345 (§5.1/§11.2/§15.4, v0.298): the indexer-setter
+                    // RHS lowering had NO case for a CollectionLiteralExpr at
+                    // all — `lowerExpr` returns null for one (§15.4, not a
+                    // general expression value), the assignment silently
+                    // degraded via the pre-existing #3025 backstop, and the
+                    // write never happened (a conforming-element
+                    // `h[0] := [new Widget3Ok(s)]` ran
+                    // `IndexOutOfRangeException` at the read because `_items`
+                    // stayed the constructor-time empty array). `fix #4316`
+                    // (the sema-side gate that admits the conforming program
+                    // and rejects the non-conforming twin with
+                    // "not implicitly convertible to the target type") left
+                    // this codegen arm unchanged, so the materialization gap
+                    // survived — this is the codegen half of that pair, in
+                    // the same file #4316 named in its filing. Mirror the
+                    // local-decl / return-stmt / field-init pattern: a literal
+                    // RHS targeting an INLINE-array property builds the
+                    // `[N x elem]` aggregate by-value; a literal targeting a
+                    // HEAP collection goes through
+                    // `materializeHeapCollectionLiteral` /
+                    // `materializeHeapDictLiteral`. Target type is read from
+                    // `ctx_.exprType(*as->target)` (the indexer element type,
+                    // e.g. `Array<IHolder>`) rather than the literal's own
+                    // `ctx_.exprType(*as->value)` — no #4310-family position
+                    // ever sets a literal's exprType, so it is null here
+                    // exactly as it was at every sibling materialization
+                    // site.
+                    if (auto* cl = dynamic_cast<
+                                const ast::CollectionLiteralExpr*>(
+                            as->value.get())) {
+                        const sema::TypeRef* idxTy =
+                            ctx_.exprType(*as->target);
+                        if (idxTy &&
+                            idxTy->kind == sema::TypeRef::Kind::InlineArray &&
+                            !cl->isDict) {
+                            if (auto* aty = llvm::dyn_cast<llvm::ArrayType>(
+                                    lowerTypeRef(idxTy))) {
+                                llvm::Type* elemTy = aty->getElementType();
+                                llvm::AllocaInst* tmp = entryAlloca(aty);
+                                for (std::size_t i = 0;
+                                     i < cl->elements.size(); ++i) {
+                                    if (!cl->elements[i]) continue;
+                                    llvm::Value* ev =
+                                        lowerExpr(*cl->elements[i]);
+                                    if (!ev) {
+                                        // #1386: a UNIT-typed element is not a
+                                        // lowering failure — same shared
+                                        // helper the local-decl / return-stmt
+                                        // / field-init sites call. Mirrors
+                                        // fix #3712 / #3714 / #4340's identical
+                                        // inline-array-element rescue.
+                                        ev = lowerCollectionLiteralElementOrUnitNull(
+                                            *cl->elements[i], elemTy);
+                                        if (!ev) {
+                                            ctx_.diagnostics().report(
+                                                Severity::Error,
+                                                cl->elements[i]->span.begin,
+                                                "internal: lowerExpr returned "
+                                                "null for indexer-setter "
+                                                "inline-array collection-literal "
+                                                "element — #1386");
+                                            continue;
+                                        }
+                                    }
+                                    if (ev->getType() != elemTy &&
+                                        ev->getType()->isIntegerTy() &&
+                                        elemTy->isIntegerTy()) {
+                                        unsigned eb =
+                                            ev->getType()->getIntegerBitWidth();
+                                        unsigned db =
+                                            elemTy->getIntegerBitWidth();
+                                        ev = db > eb
+                                                 ? builder_.CreateSExt(
+                                                       ev, elemTy)
+                                                 : builder_.CreateTrunc(
+                                                       ev, elemTy);
+                                    }
+                                    llvm::Value* gep = builder_.CreateGEP(
+                                        aty, tmp,
+                                        {builder_.getInt32(0),
+                                         builder_.getInt32((unsigned)i)});
+                                    builder_.CreateStore(ev, gep);
+                                }
+                                rhsOnce = builder_.CreateLoad(
+                                    aty, tmp, "ixset.inlarr");
+                            }
+                        } else if (idxTy && !cl->isDict) {
+                            rhsOnce = materializeHeapCollectionLiteral(
+                                cl, idxTy);
+                        } else if (idxTy && !cl->keys.empty()) {
+                            rhsOnce = materializeHeapDictLiteral(cl, idxTy);
+                        }
+                    }
+                    if (!rhsOnce) rhsOnce = lowerExpr(*as->value);
                     // fix #3025 (§28.9/§28.3, v0.240): this dedicated
                     // indexer-setter arm precedes #2961's generic assignment
                     // fallback, so its null RHS still returned silently. Keep
@@ -463,6 +557,94 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                     llvm::Type* elemTy2 = nullptr;
                     llvm::Value* addr2 = lvalueAddr(*as->target, elemTy2);
                     if (!addr2) return false;
+                    // fix #4336 (§15.1.1 / §15.3 / §28.7, v0.298): a
+                    // SINGLE-INDEX assignment into a plain inline-array slot
+                    // of an OWNING inline array `[N owned]T` / `[N owned]T?`
+                    // was missing the per-slot drop-on-overwrite pass. The
+                    // whole-array reassignment arm at line ~1055 already calls
+                    // `lowerOwningInlineArrayReassign` for that shape
+                    // (v0.260, #1385 / #3263), but this element-write fallback
+                    // overwrote the slot directly with `CreateStore` —
+                    // silently leaking the displaced owner on every iteration
+                    // of `outer[i] := new ...` (measured on the issue's repro
+                    // shape: 200 iterations × 24 B = 4800 B dropped at the
+                    // IndexExpr-arm `outer[0] := new Widget("hello")` site,
+                    // byte-identical to the leak rows the v0.260 whole-array
+                    // pass already closes for `outer := [...]`).
+                    // Dispose the OLD slot value (only for `arrayOwned` —
+                    // a non-owning `[N]IHolder` slot is, per §15.1, a borrow
+                    // whose owner lives elsewhere, and disposing it here
+                    // would double-free that owner's instance on a future
+                    // read through its borrow source). The slot's NEW value
+                    // remains under the local's existing scope-end disposal
+                    // (registered by `registerInlineOwnedArrayDisposal` at
+                    // the local-decl site for `[N owned]T` slots).
+                    //
+                    // The `as->target` here is the IndexExpr `outer[i]` —
+                    // its exprType is `IHolder` (the element), NOT the
+                    // enclosing array. Reach the array's type through the
+                    // IndexExpr's `target` member, which IS the whole-array
+                    // identifier.
+                    const sema::TypeRef* arrRt = nullptr;
+                    if (auto* ix2 = dynamic_cast<const ast::IndexExpr*>(
+                            as->target.get())) {
+                        arrRt = ctx_.exprType(*ix2->target);
+                    }
+                    if (arrRt && arrRt->kind ==
+                            sema::TypeRef::Kind::InlineArray &&
+                        arrRt->arrayOwned &&
+                        elemTy2 == ptrTy()) {
+                        // Element storage is `[N x ptr]`; load the old slot's
+                        // interface pointer. A null ptr (an empty slot) skips;
+                        // anything non-null dispatches via
+                        // `emitDisposeAndReclaim` exactly as the
+                        // whole-array reassignment arm does (§28.7's per-slot
+                        // dispose). We do NOT null the slot here — the
+                        // subsequent `CreateStore` overwrites it with the new
+                        // value, which is the simpler and identical
+                        // post-condition for a fresh non-null rhs (the slot's
+                        // NEW contents are fully replaced; only an rhs that
+                        // *equals* the slot's existing value would observe
+                        // the not-yet-nulled state, and such an rhs is a
+                        // self-assignment where disposal-then-same-store is
+                        // observably a no-op anyway).
+                        llvm::Value* oldSlot = builder_.CreateLoad(
+                            ptrTy(), addr2, "ioaw.old");
+                        llvm::Value* oldIsNull = builder_.CreateICmpEQ(
+                            oldSlot,
+                            llvm::ConstantPointerNull::get(ptrTy()),
+                            "ioaw.oldnull");
+                        auto* dispOldBB = llvm::BasicBlock::Create(
+                            llvm_, "ioaw.dispold", currentFn_);
+                        auto* contOldBB = llvm::BasicBlock::Create(
+                            llvm_, "ioaw.contold", currentFn_);
+                        builder_.CreateCondBr(
+                            oldIsNull, contOldBB, dispOldBB);
+                        builder_.SetInsertPoint(dispOldBB);
+                        emitDisposeAndReclaim(oldSlot);
+                        builder_.CreateBr(contOldBB);
+                        builder_.SetInsertPoint(contOldBB);
+                    }
+                    // fix #4317 (§15.1 / §8.6, v0.298): box a value-typed RHS
+                    // (a conforming RECORD) into its box representation before
+                    // the store below. The generic lvalueAddr fallback further
+                    // down this function (the `boxForTarget` call a few dozen
+                    // lines below, guarding every non-IndexExpr target) already
+                    // does this — this IndexExpr arm `return false`s before
+                    // ever reaching it, so `outer[i] := new RecHolder(...)`
+                    // into an `[N]IHolder` slot never boxed. Measured under
+                    // ASan: `global-buffer-overflow`, READ of size 8, 2 bytes
+                    // past the string global whose 8-byte fat-pointer word
+                    // the record was stored as, and a later `.GetV()` dispatch
+                    // walked off. boxForTarget is a no-op for a CLASS element
+                    // (already a bare pointer, #399/isBoxableValueType false)
+                    // and for a plain (non-interface) element target, so this
+                    // is unaffected for every already-working shape (see the
+                    // `*_class_element_unaffected_control` rows in
+                    // inline_array_interface_record_element_store_boxing_
+                    // 4317_test.cpp).
+                    rhsOnce = boxForTarget(rhsOnce, ctx_.exprType(*as->target),
+                                           as->value.get());
                     // #813 / §15.1: an inline `[N]T?` element slot is a nullable-
                     // value struct `{i8, T}`; wrap the bare inner value so the
                     // hasValue byte is set (this fast path bypasses the general
@@ -636,6 +818,23 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                                 // empty state) and the literal-element read
                                 // of `move a[i]` sees a live slot.
                                 llvm::Type* et = aty->getElementType();
+                                // fix #4317 (§15.1 / §8.6, v0.298): the
+                                // element's DECLARED sema type, used below to
+                                // box a value-typed (record) literal element
+                                // into an Object/interface slot — mirrors
+                                // lowerLocalDecl's inline-array init loop
+                                // (LlvmBackend_Setup.cpp), which needs the
+                                // identical fix (tracked separately: that
+                                // call site is in a held file this lane could
+                                // not edit; see follow-up issue).
+                                const sema::TypeRef* wholeArrTy4317 =
+                                    ctx_.exprType(*as->target);
+                                const sema::TypeRef* elemSemaTy4317 =
+                                    (wholeArrTy4317 &&
+                                     wholeArrTy4317->kind ==
+                                         sema::TypeRef::Kind::InlineArray)
+                                        ? wholeArrTy4317->arrayElement
+                                        : nullptr;
                                 std::vector<llvm::Value*> elemTemps(
                                     cl->elements.size(), nullptr);
                                 for (std::size_t i = 0;
@@ -666,6 +865,16 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                                                  ? builder_.CreateSExt(ev, et)
                                                  : builder_.CreateTrunc(ev, et);
                                     }
+                                    // fix #4317 (§15.1 / §8.6, v0.298): box a
+                                    // value-typed (record) element into its box
+                                    // representation before the nullable-
+                                    // slot wrap below — see the detailed
+                                    // derivation at the sibling IndexExpr-arm
+                                    // fix a few dozen lines above. No-op for a
+                                    // class element (already a bare pointer)
+                                    // or a non-Object/interface element type.
+                                    ev = boxForTarget(ev, elemSemaTy4317,
+                                                      cl->elements[i].get());
                                     // #813 / §15.1: wrap into the nullable-value
                                     // slot struct for an `[N]T?` literal assign
                                     // — same wrapping the post-disposal store
@@ -829,6 +1038,24 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
             } else if (as->op == ":=" &&
                 dynamic_cast<const ast::IdentifierExpr*>(as->target.get()) &&
                 localSlot(*as->target) != nullptr) {
+                // fix #4300: if this assignment targets a Class-with-Record/Choice-field
+                // local in classCallResultWithRecordFieldEligible_ and the RHS is a
+                // CallExpr, arm the suppression flag before lowering the call so
+                // lowerCallDispatch sees it at entry.
+                if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
+                        as->target.get())) {
+                    if (auto* loc = dynamic_cast<sema::LocalSymbol*>(
+                            ctx_.exprSymbol(*id))) {
+                        if (classCallResultWithRecordFieldEligible_.count(
+                                static_cast<const void*>(loc->decl))) {
+                            if (auto* call = dynamic_cast<const ast::CallExpr*>(
+                                    as->value.get())) {
+                                recordCallResultInitOutermostClassWithRecordField_ =
+                                    true;
+                            }
+                        }
+                    }
+                }
                 rhs = lowerExpr(*as->value);
                 rhs = rescueUnitAssignRhs(rhs, *as);
                 // fix #2961 (§28.9/§28.3, v0.240): the `:=` arms of lowerStmt
@@ -894,6 +1121,22 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                             Severity::Warning, as->target->span.begin,
                             "internal: assignment target lvalue address failed to resolve (store dropped — target retains its previous value) — #4045");
                     return false;
+                }
+                // fix #4300: arm suppression for Class-with-Record-field "declare,
+                // then assign" targets before lowering the call.
+                if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
+                        as->target.get())) {
+                    if (auto* loc = dynamic_cast<sema::LocalSymbol*>(
+                            ctx_.exprSymbol(*id))) {
+                        if (classCallResultWithRecordFieldEligible_.count(
+                                static_cast<const void*>(loc->decl))) {
+                            if (auto* call = dynamic_cast<const ast::CallExpr*>(
+                                    as->value.get())) {
+                                recordCallResultInitOutermostClassWithRecordField_ =
+                                    true;
+                            }
+                        }
+                    }
                 }
                 rhs = lowerExpr(*as->value);
                 rhs = rescueUnitAssignRhs(rhs, *as);
@@ -1162,6 +1405,26 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 if (!handled)
                     handled = lowerClosureFieldStore(*as->target, addr, rhs,
                                                      as->value.get());
+                // fix #4174: closure-typed LOCAL/parameter reassignment —
+                // the closure twin of lowerStringLocalReassign just above
+                // (internal refcounting-soundness fix; see that function's
+                // own comment and the regression test file's header for why
+                // no spec section is cited as authority for the mechanism).
+                // Without this, `f := lambda() => 42;` plain-stores the new
+                // closure and the DISPLACED previous value (the producer +1
+                // a prior binding transferred into the slot) is never
+                // released — a 40-byte-per-reassignment leak (issue #4174,
+                // LSan-measured). Gated on the analyzed function
+                // (closureReleaseEligibleFn_) exactly as the string twin is
+                // gated on stringReleaseEligibleFn_. A PARAMETER target is
+                // sound here only because retainAssignedClosureParams (fix
+                // #4174 follow-up, review NEEDS-FIX) gives it its own
+                // independent +1 at bind before this release can ever run
+                // against it — see that function's comment.
+                if (!handled && currentFn_ == closureReleaseEligibleFn_)
+                    handled = lowerClosureLocalReassign(*as->target, addr,
+                                                        elemTy, rhs,
+                                                        as->value.get());
                 // #429 (box FIELD-STORE category) / §8.6 / §28.9: a store into
                 // a CLASS Object/interface field whose every store (per the
                 // collectBoxStorageFields pre-pass) uses a boxable value source
@@ -2160,6 +2423,15 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                                              : builder_.CreateTrunc(ev,
                                                                     elemTy);
                                 }
+                                // fix #4317 (§15.1 / §8.6, v0.298): box a
+                                // value-typed (record) element into its box
+                                // representation before the store — see the
+                                // detailed derivation at the sibling
+                                // IndexExpr-arm fix earlier in this function.
+                                // No-op for a class element (already a bare
+                                // pointer) or a non-Object/interface element.
+                                ev = boxForTarget(ev, rrt->arrayElement,
+                                                  cl->elements[i].get());
                                 llvm::Value* gep = builder_.CreateGEP(
                                     aty, tmp,
                                     {builder_.getInt32(0),
@@ -3196,6 +3468,69 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                     llvm::Type* slotTy = nullptr;
                     llvm::Value* slotAddr =
                         explicitDisposeOwnedReceiverSlot(*ds->value, slotTy);
+                    // fix #4185 (§17.13 / §28.3 / §28.9): `explicitDisposeOwnedReceiverSlot`'s
+                    // LocalSymbol arm only recognizes a plain (non-`using`) `var`
+                    // local as a slot this scope must reclaim via
+                    // `unwindOwnedLocalClass` — which is scoped to a USER class/
+                    // interface with a generated Dispose (a `disposerFns_` entry).
+                    // A vtable-less BUILTIN (StringBuilder, Mutex, Stopwatch, …)
+                    // never has one, so a plain `var y := new StringBuilder();
+                    // _ := y;` found NO slot here and this whole branch emitted
+                    // NOTHING — measured: 568 B leaked under LSan (issue #4185,
+                    // amplified at x200: `var y1 := new StringBuilder(); _ := y1;`
+                    // repeated leaks one per iteration). The `using var` spelling
+                    // of the identical discard was unaffected: `loc->isUsing`
+                    // short-circuits to `lvalueAddr` before
+                    // `unwindOwnedLocalClass` is ever consulted — which is why
+                    // the defect surfaced only for the plain-`var` form.
+                    //
+                    // Recover the slot directly via `lvalueAddr` — bypassing
+                    // `unwindOwnedLocalClass` rather than widening it — when the
+                    // discarded value's TYPE is one `emitVtablelessBuiltinRelease`
+                    // (two lines below) actually KNOWS HOW TO RELEASE.
+                    // `ds->discardOutOwnedVar` is set by the ownership pass only
+                    // for a genuinely Owned named binding (Ownership.cpp ~line
+                    // 3283: `dstate->state == OwnershipState::Owned`), so this
+                    // fallback is never reached for a borrow.
+                    //
+                    // fix-forward (review NEEDS-FIX, §25): the FIRST version of
+                    // this fallback gated on `common::isVtableLessBuiltinClass
+                    // Name` — which proves only "carries no Bezel vtable", a
+                    // STRICT SUPERSET (47 names) of the 18
+                    // `emitVtablelessBuiltinRelease` handles. For a name in the
+                    // gap (`Shared<T>`, `Weak<T>`, `JsonSerializer`, …) that
+                    // predicate is TRUE, `emitVtablelessBuiltinRelease` returns
+                    // false (no arm matches), and the `else` branch below —
+                    // unchanged, pre-existing code — calls
+                    // `emitDisposeAndReclaim(obj)` on the slot THIS fallback
+                    // just newly supplied: the exact wild jump #2675 exists to
+                    // prevent, converting a leak into a SIGSEGV. Measured on
+                    // that version: `var sh := new Shared<Widget>(new Widget());
+                    // _ := sh;` → "SEGV ... Maybe a wild jump?"; `var js := new
+                    // JsonSerializer(); _ := js;` → "SEGV on unknown address
+                    // 0x000000000010". `vtablelessBuiltinReleaseIsKnown` answers
+                    // the NARROWER, correct question ("will the release two
+                    // lines below actually succeed"), so a name in the gap now
+                    // leaves `slotAddr` null and this whole branch emits
+                    // NOTHING for it — a leak, the pre-#4185 (and still safe)
+                    // behaviour — instead of reaching `emitDisposeAndReclaim`.
+                    // Widening `unwindOwnedLocalClass` itself remains rejected
+                    // for the reason already on record: it also drives
+                    // `registerUnwindOwnedLocal`'s EXCEPTION-unwind
+                    // registration, which dispatches through the SAME
+                    // `emitDisposeAndReclaim` vtable call, so making it truthy
+                    // for a vtable-less builtin would reintroduce the #2675
+                    // jump on the unwind edge instead. // per §17.13, §28.3,
+                    // §28.9, §25, #2675, #4185
+                    if (!slotAddr) {
+                        std::string_view fbBn;
+                        if (const sema::TypeRef* fbRt =
+                                ctx_.exprType(*ds->value))
+                            fbBn = builtinTypeName(fbRt);
+                        if (!fbBn.empty() &&
+                            vtablelessBuiltinReleaseIsKnown(fbBn))
+                            slotAddr = lvalueAddr(*ds->value, slotTy);
+                    }
                     if (slotAddr) {
                         llvm::Value* obj =
                             builder_.CreateLoad(ptrTy(), slotAddr);
@@ -3212,8 +3547,37 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                                 ctx_.exprType(*ds->value)) {
                             bn = builtinTypeName(rt);
                         }
-                        if (!bn.empty() &&
-                            common::isVtableLessBuiltinClassName(bn) &&
+                        // fix #4224 (§17.13 / §28.3 / §28.9, v0.298): whether
+                        // `bn` is a vtable-less builtin AT ALL — the SAME
+                        // `common::isVtableLessBuiltinClassName` authority the
+                        // release-arm condition below already consults — must
+                        // be known BEFORE deciding the `else` arm can safely
+                        // call `emitDisposeAndReclaim`. Previously that arm's
+                        // comment read "class/interface (or a vtable-less
+                        // builtin no arm names yet — leak-before-wild-jump,
+                        // #2973)" and called `emitDisposeAndReclaim`
+                        // unconditionally either way. That was safe only while
+                        // `slotAddr` could exclusively come from a genuine
+                        // user-class `unwindOwnedLocalClass` resolution. Once
+                        // `explicitDisposeOwnedReceiverSlot`'s `loc->isUsing`
+                        // short-circuit (LlvmBackend_Calls2.cpp ~line 4622)
+                        // started handing back a real slot for ANY `using var`
+                        // binding regardless of type, an UNCOVERED vtable-less
+                        // builtin (`Shared<T>`, `Weak<T>`, `JsonSerializer`,
+                        // `BinarySerializer`, `SharedEventSource<T>`, the
+                        // Buffer family, …) reaches this `else` with a real
+                        // slot and no #4185 fallback gate in front of it (that
+                        // fallback only fires when `explicitDisposeOwnedReceiverSlot`
+                        // returned null in the first place — moot here, since
+                        // the `using`-short-circuit already returned non-null).
+                        // Measured: `using var sh := new Shared<Widget>(new
+                        // Widget()); _ := sh;` → AddressSanitizer
+                        // heap-buffer-overflow, 16-byte region (`bz_shared_new`'s
+                        // allocation) — the exact #2675 wild jump, one level up.
+                        bool isVtablelessBuiltin =
+                            !bn.empty() &&
+                            common::isVtableLessBuiltinClassName(bn);
+                        if (isVtablelessBuiltin &&
                             emitVtablelessBuiltinRelease(bn, obj)) {
                             // vtable-less path: builtin released; null the
                             // slot so a following scope-exit / unwind
@@ -3227,9 +3591,14 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                             // per §29.8 / §30.1
                             nullStateMachineOwnedParamCapture(
                                 ds->value.get());
-                        } else {
-                            // class/interface (or a vtable-less builtin no
-                            // arm names yet — leak-before-wild-jump, #2973).
+                        } else if (!isVtablelessBuiltin) {
+                            // Genuine user class/interface, OR a reserved
+                            // builtin INTERFACE head (isVtableLessBuiltinClassName
+                            // excludes those by its own contract — they keep
+                            // real dynamic dispatch, per BuiltinRegistry.cpp's
+                            // isBuiltinInterfaceHead comment). Word 0 is a real
+                            // Bezel vtable either way, so the slot-2
+                            // dynamicDispose dispatch is safe.
                             emitDisposeAndReclaim(obj);
                             builder_.CreateStore(nullVal, slotAddr);
                             // #2310 / §29.8 / §30.1 (#973a residual): also null the
@@ -3237,6 +3606,29 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                             // this `_ := p` discard just consumed (no-op outside a
                             // state-machine body, for non-parameter sources, for
                             // non-owned parameters). per §29.8 / §30.1
+                            nullStateMachineOwnedParamCapture(ds->value.get());
+                        } else {
+                            // fix #4224: `bn` IS a vtable-less builtin
+                            // (`isVtableLessBuiltinClassName` true) but
+                            // `emitVtablelessBuiltinRelease` names no arm for
+                            // it — a plain C struct with no Bezel vtable at
+                            // word 0, so `emitDisposeAndReclaim` would be the
+                            // #2675 wild jump. Leak instead (the same
+                            // leak-before-wild-jump trade #2973 / #4185 make
+                            // for this exact gap elsewhere): still null the
+                            // slot so a following scope-exit/unwind auto-drop
+                            // reloads null and no-ops — exactly-once "no
+                            // dispose", never a double free. Collections
+                            // (OwningArray/OwningDictionary/OwningSet/
+                            // OwningStack/OwningQueue/OwningLinkedList) do NOT
+                            // reach this arm — `discardOutOwnedVar`'s
+                            // collection branch above (line ~3134) claims them
+                            // first, for both `using var` and plain `var`; the
+                            // collection gap on the UNRELATED explicit
+                            // `?.Dispose()` path is #4221, open, deliberately
+                            // left untouched here. // per §17.13, §28.3,
+                            // §28.9, #2675, #2973, #4185, #4221
+                            builder_.CreateStore(nullVal, slotAddr);
                             nullStateMachineOwnedParamCapture(ds->value.get());
                         }
                         builder_.CreateBr(contBB);
@@ -4539,6 +4931,59 @@ void Emitter::emitAsyncPatternAResultDecision(bool chainedReturn,
             "bz_task_set_chained", llvm::Type::getVoidTy(llvm_),
             {ptrTy(), ptrTy()});
         builder_.CreateCall(setChainedFn, {outerTask, sourceTask});
+        // fix #4159 (§30.5 "Disposing an unconsumed OwningTask<T>", v0.298):
+        // detectAsyncPatternAKind's CallExpr arm (LlvmBackend_Async.cpp) does
+        // not distinguish a genuine Pattern A `Task<T:class>` chain source
+        // from a Pattern B `OwningTask<T:class>` one — both reach here as
+        // `chainedReturn`. A Pattern A source's own kind-1/kind-2 completion
+        // ALWAYS leaves it with a chained_source or a result_disposer of its
+        // own (transitively reaching a real disposer), so chaining alone
+        // already disposes the result exactly once. A Pattern B source
+        // produced by a genuinely kind-1 body (a bare fresh value, no
+        // further await — e.g. an unannotated `async lambda() => new
+        // Widget()` IIFE, whose own declared/inferred type is OwningTask
+        // per ExprTypecheck_Exprs.cpp's #800-Layer-2 wrap, not Pattern A —
+        // patternAResultDisposerFor's Task-only guard means NOTHING attaches
+        // a disposer to it) leaves NEITHER field set: the value this body
+        // just extracted from it is genuinely orphaned, and THIS body's own
+        // kind-1 disposer (asyncPatternAResultDisposer_, already correct for
+        // OUR OWN declared Pattern A return type) must additionally be
+        // attached to our own task, or nothing ever disposes it — measured
+        // 3200 B / 200 objects leaked without this.
+        //
+        // Which case applies is a RUNTIME fact (the source's chained_source
+        // / result_disposer fields, not a static type), because the source
+        // may be a NAMED local bound to an arbitrary lambda whose own body
+        // codegen cannot inspect from here — so query it via
+        // bz_task_needs_caller_disposal rather than re-deriving a static
+        // guess. Doing so is always SAFE to check unconditionally (a
+        // genuine Pattern A chain source reliably answers "already
+        // handled", a no-op here) and is the one place that can distinguish
+        // the two without risking a double free.
+        if (asyncPatternAResultDisposer_) {
+            auto* needsDisposalFn = declareC(
+                "bz_task_needs_caller_disposal", llvm::Type::getInt8Ty(llvm_),
+                {ptrTy()});
+            llvm::Value* needsDisposal =
+                builder_.CreateCall(needsDisposalFn, {sourceTask});
+            llvm::Value* needsDisposalCond = builder_.CreateICmpNE(
+                needsDisposal,
+                llvm::ConstantInt::get(llvm::Type::getInt8Ty(llvm_), 0));
+            llvm::Function* curFn = builder_.GetInsertBlock()->getParent();
+            auto* attachBB =
+                llvm::BasicBlock::Create(llvm_, "patternb.orphan.attach", curFn);
+            auto* contBB =
+                llvm::BasicBlock::Create(llvm_, "patternb.orphan.cont", curFn);
+            builder_.CreateCondBr(needsDisposalCond, attachBB, contBB);
+            builder_.SetInsertPoint(attachBB);
+            auto* setDisposerFn2 = declareC(
+                "bz_task_set_result_disposer", llvm::Type::getVoidTy(llvm_),
+                {ptrTy(), ptrTy()});
+            builder_.CreateCall(setDisposerFn2,
+                                {outerTask, asyncPatternAResultDisposer_});
+            builder_.CreateBr(contBB);
+            builder_.SetInsertPoint(contBB);
+        }
     } else if (asyncPatternAResultDisposer_) {
         // §30.5 / #1503: Pattern A (Task<T:class>) NON-chained return —
         // the async body produced a FRESH owned value, so the task owns
@@ -7344,6 +7789,80 @@ bool Emitter::lowerDictEntryFor(const ast::ForStmt& fs) {
             builder_.CreateStructGEP(entryStTy, varSlot, 1));
     }
 
+    // fix #4129 (§29.12/§28.3, stdlib §4.8, v0.295): register the snapshot
+    // spine (keysArr/lensArr/valsArr + the in-flight string Key) as its own
+    // disposeStack_ scope BEFORE loopStack_'s own entry, so a `return`/`throw`
+    // from inside the body reclaims it (see the field declarations in
+    // LlvmBackend_impl.hpp for the full derivation). Pushed AFTER the
+    // snapshot's own allocas exist so the registration can carry them; popped
+    // WITHOUT emission once the manual endBB code below has run (see there).
+    //
+    // fix #4129 review self-pass: `forVarCapturedInBody(fs)` is the SAME
+    // static, whole-body AST scan `lowerForBody` (below) uses to decide
+    // whether to box `entry` for a capturing closure — computed once here,
+    // BEFORE lowerForBody runs, so it reflects the body regardless of
+    // whether boxing actually happens for this specific loop. When true, a
+    // captured `entry`'s struct was copied into a heap cell an escaping
+    // closure may read after this disposal fires; releasing the in-flight
+    // string Key here would be a use-after-free on that alias (measured,
+    // fixed before landing — see dictEntryForReleaseInFlightKey's
+    // declaration). The snapshot-array frees themselves are unaffected: no
+    // capture ever aliases them.
+    bool forVarCaptured = forVarCapturedInBody(fs);
+    // fix #4161 (§27.5/§28.9/§28.3, stdlib §4.8, v0.295): #4129 gated ONLY
+    // its own new dictEntryForSnapshot disposal (the return/throw path) on
+    // `forVarCaptured` — a coarse, escape-BLIND predicate, true the instant
+    // ANY closure in the body references the loop var at all, whether or not
+    // that closure outlives the iteration. incBB/endBB's own #1058
+    // per-iteration/end-of-loop release below had the IDENTICAL hazard on
+    // the normal-completion/`break` path (no return/throw needed at all —
+    // #4161's own repro) and was left completely ungated.
+    //
+    // A bare `!forVarCaptured` gate for incBB/endBB would trade the UAF for
+    // a leak on EVERY capture, including the common, provably-safe shape
+    // (`for var e in d do var f := lambda() => e.Key; f(); end;` — a purely
+    // local, non-escaping closure invoked and disposed inside the SAME
+    // iteration's body, before incBB ever runs). `cellFreeEligible_` is the
+    // escape-aware authority that already answers this precisely: it is the
+    // SAME whole-body pre-pass `lowerForBody` (below) consults, keyed by
+    // `&fs` exactly like `forVarCapturedInBody`, to decide whether the
+    // for-var's own boxed capture CELL can be freed at each iteration's body
+    // end (`collectCellFreeEligible`, LlvmBackend_Setup.cpp). It contains
+    // `&fs` iff (a) at least one lambda captures the for-var, AND (b) NO
+    // escaping lambda captures it — condition (b) is exactly "does the
+    // closure actually outlive the iteration". When it holds, EVERY
+    // capturing closure's env — and with it, the boxed cell's own alias of
+    // this same `bz_string*` pointer — is disposed by `lowerForBody`'s own
+    // scope-end/break-unwind handling strictly BEFORE control reaches
+    // incBB/endBB for this iteration (`forVarFreshCell`'s `boxedCellFree`
+    // disposal is pushed INSIDE the body's own scope and fires on both the
+    // fall-through and the loop-unwind-via-`break` edges, both before this
+    // function's incBB/endBB code runs), so releasing the ORIGINAL pointer
+    // here is sound. Falls back to the coarse, always-safe "any capture
+    // leaks" answer when `cellFreeEligible_` was not computed for the
+    // CURRENT function (`currentFn_ != cellFreeEligibleFn_`, e.g. a for-loop
+    // lowered inside a lambda body analyzed separately) — the pre-existing
+    // conservative default every other cellFreeEligible_ consumer in this
+    // file already uses.
+    bool forVarCapturedEscaping = forVarCaptured &&
+        !(currentFn_ == cellFreeEligibleFn_ &&
+          cellFreeEligible_.count(static_cast<const void*>(&fs)));
+    disposeStack_.push_back({});
+    {
+        Disposal d{nullptr, nullptr};
+        d.dictEntryForSnapshot = true;
+        d.dictEntryForKeysOutSlot = keysOutSlot;
+        d.dictEntryForLensOutSlot = isStringKey ? lensOutSlot : nullptr;
+        d.dictEntryForValsOutSlot = valsOutSlot;
+        d.dictEntryForCntSlot = cntSlot;
+        d.dictEntryForIdxSlot = idxSlot;
+        d.dictEntryForIsStringKey = isStringKey;
+        d.dictEntryForUseGen = useGen;
+        d.dictEntryForVarSlot = varSlot;
+        d.dictEntryForReleaseInFlightKey = isStringKey && !forVarCapturedEscaping;
+        disposeStack_.back().push_back(d);
+    }
+
     loopStack_.push_back({incBB, endBB, disposeStack_.size()});
     bool term = lowerForBody(fs);
     loopStack_.pop_back();
@@ -7356,13 +7875,29 @@ bool Emitter::lowerDictEntryFor(const ast::ForStmt& fs) {
             // #1058 / §28/§4.8: release the per-iteration string key object
             // (rc 1→0 → free dataCpy + strObj header).  Null field 0 so the
             // endBB release below is a no-op on normal completion.
-            llvm::Value* so = builder_.CreateLoad(
-                ptrTy(), builder_.CreateStructGEP(entryStTy, varSlot, 0));
-            emitStringRelease(so);
-            builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()),
-                builder_.CreateStructGEP(entryStTy, varSlot, 0));
+            //
+            // fix #4161: gated on !forVarCapturedEscaping (see its
+            // declaration above, at the dictEntryForSnapshot registration).
+            // An escaping closure's boxed cell may still alias this exact
+            // `bz_string*` pointer, so both the release AND the null-out are
+            // skipped together — endBB below carries the SAME gate, so
+            // leaving field 0 non-null here does not risk a double-release
+            // there; the value is simply never released (a bounded leak,
+            // the safe direction, matching dictEntryForReleaseInFlightKey's
+            // return/throw-path fallback).
+            if (!forVarCapturedEscaping) {
+                llvm::Value* so = builder_.CreateLoad(
+                    ptrTy(), builder_.CreateStructGEP(entryStTy, varSlot, 0));
+                emitStringRelease(so);
+                builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()),
+                    builder_.CreateStructGEP(entryStTy, varSlot, 0));
+            }
             // Free the strndup'd char* data for this iteration (mirrors
-            // lowerDictKeysFor's per-slot free in the increment block).
+            // lowerDictKeysFor's per-slot free in the increment block). This
+            // buffer (`kp2`) is decodeDictStringKeyAt's SOURCE bytes — a
+            // malloc'd allocation distinct from the `bz_string*` built from
+            // it (`so` above) — never aliased by a capturing closure, so
+            // freeing it is unconditionally safe regardless of capture.
             llvm::Value* kpPtr2 = builder_.CreateGEP(ptrTy(), keysArr, idxI);
             llvm::Value* kp2    = builder_.CreateLoad(ptrTy(), kpPtr2);
             builder_.CreateCall(freeFn, {kp2});
@@ -7382,7 +7917,16 @@ bool Emitter::lowerDictEntryFor(const ast::ForStmt& fs) {
     // #1058 / §28/§4.8: on `break` incBB is skipped — release the in-progress
     // iteration's strObj now.  On normal completion field 0 was nulled by incBB,
     // so bz_string_release(null) is a no-op (no double-free).
-    if (isStringKey) {
+    //
+    // fix #4161: gated on !forVarCapturedEscaping (see its declaration above,
+    // at the dictEntryForSnapshot registration) — same reasoning as incBB's
+    // own gate. An escaping closure's boxed cell may still alias this
+    // iteration's `so`, whether reached via `break` (field 0 holds the
+    // in-progress iteration's un-nulled value) or via normal completion
+    // (field 0 holds whatever the last incBB left there, un-nulled under
+    // this same gate). Skipping here is the safe-direction leak, not a
+    // use-after-free.
+    if (isStringKey && !forVarCapturedEscaping) {
         llvm::Value* so = builder_.CreateLoad(
             ptrTy(), builder_.CreateStructGEP(entryStTy, varSlot, 0));
         emitStringRelease(so);  // null-safe
@@ -7414,6 +7958,16 @@ bool Emitter::lowerDictEntryFor(const ast::ForStmt& fs) {
     if (isStringKey)
         builder_.CreateCall(freeFn, {lensArr});
     builder_.CreateCall(freeFn, {valsArr});
+    // fix #4129: the manual frees just above did EXACTLY what the
+    // dictEntryForSnapshot scope pushed before loopStack_ would do — pop it
+    // WITHOUT emission (a plain std::vector pop; nothing is emitted) so a
+    // LATER return/throw elsewhere in this method does not walk it a second
+    // time and double-free this snapshot. Every `return`/`throw` reachable
+    // from INSIDE the loop body already fired it (via emitAllDisposals /
+    // emitDisposalsInRange / the unwind walk) before control could reach
+    // here, so this pop is reached only by normal completion or `break` —
+    // the two exits the manual code above already covers.
+    disposeStack_.pop_back();
     // #1055: a fresh `owned Dictionary` materializer iterated directly as the
     // for-in source (`for var e in src.ToDictionary(k) do … end`) is owned by
     // nothing and leaks. Reclaim it here at the loop exit, which both normal

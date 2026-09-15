@@ -669,7 +669,58 @@ private:
     // of return paths the inference sees.
     template <typename F>
     void forEachLambdaReturnValue(
-        const ast::LambdaExpr& lam, F&& fn) const;
+        const ast::LambdaExpr& lam, F&& fn) const {
+        if (lam.exprBody) fn(lam.exprBody.get());
+        std::vector<const ast::Stmt*> stack;
+        for (const auto& s : lam.stmts) stack.push_back(s.get());
+        while (!stack.empty()) {
+            const ast::Stmt* s = stack.back();
+            stack.pop_back();
+            if (!s) continue;
+            if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(s)) {
+                if (rs->value) fn(rs->value.get());
+                continue;
+            }
+            if (auto* bs = dynamic_cast<const ast::DoEndBlock*>(s)) {
+                for (const auto& s2 : bs->body) stack.push_back(s2.get());
+                continue;
+            }
+            if (auto* ifs = dynamic_cast<const ast::IfStmt*>(s)) {
+                for (const auto& s2 : ifs->ifBranch.body)
+                    stack.push_back(s2.get());
+                for (const auto& el : ifs->elifBranches)
+                    for (const auto& s2 : el.body) stack.push_back(s2.get());
+                for (const auto& s2 : ifs->elseBody) stack.push_back(s2.get());
+                continue;
+            }
+            if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s)) {
+                for (const auto& s2 : ws->body) stack.push_back(s2.get());
+                continue;
+            }
+            if (auto* fs = dynamic_cast<const ast::ForStmt*>(s)) {
+                for (const auto& s2 : fs->body) stack.push_back(s2.get());
+                continue;
+            }
+            if (auto* ts = dynamic_cast<const ast::TryStmt*>(s)) {
+                for (const auto& s2 : ts->body) stack.push_back(s2.get());
+                for (const auto& arm : ts->catches)
+                    stack.push_back(arm.body.get());
+                for (const auto& s2 : ts->finallyBody) stack.push_back(s2.get());
+                continue;
+            }
+            if (auto* cs = dynamic_cast<const ast::CaseStmt*>(s)) {
+                for (const auto& arm : cs->arms)
+                    if (arm.bodyKind == ast::CaseArmBodyKind::Block)
+                        for (const auto& s2 : arm.stmts)
+                            stack.push_back(s2.get());
+                continue;
+            }
+            // LocalDecl, AssignmentStmt, ExpressionStmt, BreakStmt,
+            // ContinueStmt, ThrowStmt, YieldStmt, DiscardStmt — carry
+            // expressions, not returns; nested lambdas inside those
+            // expressions have their own callable and are excluded.
+        }
+    }
 
     // fix #1820 (§28.3): Concrete-slot function bodies callee-side check.
     // When a lambda is being type-checked at a function-type target whose
@@ -756,6 +807,26 @@ private:
     // fresh-producer form (nested literal at a non-trivial-dispose target).
     void checkBorrowingFamilyLiteralElements(
         const ast::CollectionLiteralExpr& cl, const TypeRef* target);
+
+    // fix #4310 (§5.1/§11.2): the per-ELEMENT type-conformance sibling of
+    // checkBorrowingFamilyLiteralElements above. `checkAssignable` performs
+    // the §5.1 conversion check (including class→interface §11.2 nominal
+    // conformance via `isSubtype`) for a plain variable declaration or an
+    // ordinary call argument, but has zero handling for
+    // `TypeRef::Kind::InlineArray` — every call site that types a collection
+    // literal pre-sets the literal's OWN exprType to the target type
+    // (`ctx_.setExprType`) before the general `checkAssignable(ctx_.exprType
+    // (*initializer), target, …)` call that follows, so that call trivially
+    // compares the target to itself and never descends into the literal's
+    // element expressions. This walks the literal's elements (and, for a
+    // dict-form literal at a keyed target, its keys) and runs the ordinary
+    // §5.1 check on each one individually — recursing for a nested literal
+    // element (`[1]Array<IHolder>`) so the same gap one level down is closed
+    // too. `target` must already be resolved to the collection's own type
+    // (`[N]T` or a §15.4 builtin-collection head); a non-collection or
+    // unresolved target is a no-op.
+    void checkCollectionLiteralElementAssignability(
+        const ast::CollectionLiteralExpr& cl, TypeRef* target);
 
     // stdlib §5 (D7): the source element type T of a LINQ operator/aggregate
     // call whose lambda argument is `(T) -> …` (Where/Select/Count/Any/All/
@@ -1079,6 +1150,53 @@ private:
                                          TypeSymbol* ifaceDecl,
                                          std::vector<TypeRef*>& out);
 
+    // fix #4183 (§14.5 phase 1, §26.5, v0.296/v0.298): the BUILTIN
+    // counterpart of collectAncestorInstantiationsOf above. A builtin
+    // collection type (`Array<T>`, `IList<T>`, ...) has no TypeSymbol —
+    // `declaration` is null — so collectAncestorInstantiationsOf's
+    // `baseTypeRefs` walk finds nothing for it; its interface hierarchy is
+    // instead modelled by `builtinInterfaceAncestorsOf`
+    // (ExprTypecheck.cpp, §26.5's extension-target matcher) — the SAME
+    // table checkAssignable's own `variantGenericAssignable` already
+    // consults for ordinary `Array<int>` → `IReadOnlyList<int>`
+    // assignability (v0.180/#1180). Exposed as a member here (that helper
+    // has internal linkage, file-local to ExprTypecheck.cpp) purely so
+    // unifyArgSubst's constructed-generic-type case
+    // (ExprTypecheck_Calls.cpp) can reuse it — no second, drifting builtin-
+    // hierarchy table. `classTy` must be a null-declaration Named builtin;
+    // `ifaceName` is the target's simple builtin name (`"IReadOnlyList"`,
+    // never alias- or declaration-bearing — builtins are never aliased).
+    // Appends every reached ancestor whose name matches (`classTy` itself
+    // counts, mirroring collectAncestorInstantiationsOf's "argTy IS the
+    // declaration" case) to `out`; `owned` keeps the synthesised ancestor
+    // TypeRefs alive for the caller's use of `out`.
+    void collectBuiltinAncestorInstantiationsOf(
+        const TypeRef* classTy, std::string_view ifaceName,
+        std::vector<TypeRef*>& out,
+        std::vector<std::unique_ptr<TypeRef>>& owned);
+
+    // §14.1/§14.5 phase 1 (#785, #850, #896, #4089/#4183): structurally
+    // unify a value parameter's declared type (`pt`, AST) against the call
+    // argument's resolved type (`argTy`), binding each method type
+    // parameter named in `paramNames` to the matching component of the
+    // argument's type — a bare `p: T` binds T; a generic-typed
+    // `p: Pair<A, B>` recurses pairwise into the generic args; a
+    // constructed `p: G<...>` also unifies against the UNIQUE instantiation
+    // of G that argTy's declared type implements or extends, via
+    // collectAncestorInstantiationsOf (§14.5's full sentence — see #4183);
+    // a function-typed `p: (...) -> ...` unifies component-wise over equal
+    // parameter counts only (§14.5/§22.6, #4089). A member function (not a
+    // free function) because the constructed-generic-type case needs
+    // collectAncestorInstantiationsOf, which is private. `conflicts`
+    // (optional) receives the name of any type parameter whose second-
+    // occurrence inferred binding is DIFFERENT from the first-occurrence
+    // binding.
+    void unifyArgSubst(
+        const ast::Type* pt, TypeRef* argTy,
+        const std::unordered_set<std::string_view>& paramNames,
+        std::unordered_map<std::string_view, TypeRef*>& argSubst,
+        std::unordered_set<std::string_view>* conflicts = nullptr);
+
     // §19.3/§19.5/§5.1/§12.9 (v0.197, #1920): the INTERFACE-scrutinee
     // counterpart of typeTestGenericInstantiationImpossible. Is the typed
     // binding `var x: patTy` (a class pattern) a type-test that NO runtime value
@@ -1357,7 +1475,21 @@ private:
     // Slice T4: is `from` a subtype of `to` — i.e. does `to` appear in
     // `from`'s transitive base-type chain (base class or implemented
     // interface)? BFS, cycle-guarded.
+    //
+    // fix #4306 (§26.4/§26.5, v0.298): widened from `private` to `public`
+    // (bracketed rather than moved, to keep this declaration beside its
+    // Slice T4 neighbours) so the free function
+    // `selfCallSiblingWhereSatisfiedByCaller` (ExprTypecheck_Calls.cpp,
+    // outside this class, in an anonymous namespace) can reuse this EXACT
+    // authority for its own `type`-item subtype-entailment check, instead
+    // of a second, drifting spelling of the same BFS (§6 in this run's
+    // standing lane rules: "is there a fact the compiler ALREADY COMPUTES
+    // that decides this? Prefer feeding the existing authority"). No other
+    // change — same signature, same body, every existing call site
+    // unaffected by widened (never narrowed) access.
+public:
     static bool isSubtype(TypeSymbol* from, TypeSymbol* to);
+private:
 
     // fix #3559 (stdlib §5, v0.285): the shared REMOVED-at-v0.284 diagnostic
     // text both `OfType<U>()` typing arms raise — unconditionally, since the
@@ -1397,9 +1529,19 @@ private:
     //   - primitive → primitive: identity or §5.1 widening.
     //   - named → named (non-generic): identity or subclass/interface.
     // A non-nullable target accepting a nullable source is rejected.
-    void checkAssignable(TypeRef* from, TypeRef* to,
-                         SourceLocation loc, const std::string& what,
-                         const ast::Expr* fromExpr = nullptr);
+    // `freeTypeParamNames` (#4199): the set of type-parameter names this
+    // specific call is entitled to treat as a FREE/rigid variable rather than
+    // a concrete type — e.g. the callee method's own still-being-inferred
+    // generic parameters at a call-argument check, or the enclosing scope's
+    // rigid parameters at a pattern-exhaustiveness check. Null (the default)
+    // means NONE — the ground-truth-conservative default every call site
+    // that is not explicitly reasoning about a specific free-variable set
+    // gets, matching `isFullyGroundTypeRef`'s existing conservative stance.
+    void checkAssignable(
+        TypeRef* from, TypeRef* to, SourceLocation loc,
+        const std::string& what, const ast::Expr* fromExpr = nullptr,
+        const std::unordered_set<std::string_view>* freeTypeParamNames =
+            nullptr);
 
     // §5.1 "Constant narrowing" (#2925) — the ONE definition of the rule, for
     // every §5.1 conversion site. Verbatim (v0.240):
@@ -1434,6 +1576,35 @@ private:
     // §22.3's ref/out deferral uses for the same reason (#1756: a narrower
     // guard is what made that check false-reject and get reverted four times).
     bool mentionsUnsubstitutedTypeParam(const TypeRef* t) const;
+
+    // §14.1 / §12.9 (#4199): the SET of type-parameter names in scope at the
+    // current position — the enclosing type's (currentType_), the enclosing
+    // method's (currentMethodDecl_), and an enclosing extension's target-type
+    // parameters (§26.4/#3083, the same rule `isExtensionTargetTypeParam`
+    // tests one name at a time). Ground truth for "is a Named TypeRef with a
+    // null declaration a genuinely FREE/rigid type variable, or a
+    // null-declaration stdlib builtin that merely has the same shape" — see
+    // `isFreeGenericTypeVarRef` (ExprTypecheck.cpp): a bare Named TypeRef with
+    // no declaration is NOT sufficient on its own (issue #4199 — ~50 stdlib
+    // builtins, e.g. `Task`, `Exception`, `IDisposable`, resolve to exactly
+    // that shape, per `isFullyGroundTypeRef`'s own comment a few hundred
+    // lines above: "a null-declaration stdlib builtin ... treated as
+    // non-ground" — the SAME ambiguity that function already resolves
+    // conservatively).
+    //
+    // Deliberately a SEPARATE small scan from `mentionsUnsubstitutedTypeParam`
+    // (not a shared refactor of it): that function answers a boolean
+    // "mentions any" question via `refOutParamTypeMentionsTypeParam` and its
+    // existing callers/behaviour are out of this fix's scope; this one needs
+    // to RETURN the set so `variantGenericAssignable`'s recursion can test
+    // membership at arbitrary nesting depth.
+    std::unordered_set<std::string_view> currentScopeGenericParamNames() const;
+    // Sibling of `isExtensionTargetTypeParam` (which tests one name) that
+    // collects EVERY name the same walk would recognize, for
+    // `currentScopeGenericParamNames`'s extension arm.
+    void collectExtensionTargetTypeParamNames(
+        const ast::Type& target,
+        std::unordered_set<std::string_view>& out) const;
 
     // Slice S18: a condition must be `bool` (§21.2 if, §21.3 while,
     // §20 if-expression). Only flags when the condition has a resolved
@@ -1596,6 +1767,18 @@ private:
     // tracking that we don't have yet (and rarely matters in practice).
     void checkReadonlyAssignment(const ast::AssignmentStmt& as);
 
+    // §17.6/§22.8 (v0.298, #4290): the shared readonly-FIELD write-target
+    // check (construction-window carve-out + `readonly` modifier
+    // rejection), factored out of `checkReadonlyAssignment` so BOTH
+    // AssignmentStmt and IncrementStmt consult ONE implementation instead
+    // of IncrementStmt having none at all — the same #2868 shape already
+    // used for `checkPropertyWriteTarget`. `incOp` is null for an
+    // assignment target and the operator token ("++"/"--") for an
+    // increment target.
+    void checkReadonlyFieldWriteTarget(const ast::Expr& target,
+                                        const SourceLocation& loc,
+                                        const char* incOp);
+
     // §6.6 / A.6 (v0.184, #1690): reject an assignment/increment `target`
     // whose lvalue chain bases on a method-call result — grammar A.6
     // restricts an LValue's base to `Identifier | "this"`, and §6.6 states
@@ -1661,7 +1844,7 @@ private:
     // forbids cycles; sema's class-graph validation slice will catch
     // them). First match wins; ambiguity resolution between sibling
     // interfaces is a separate slice.
-    Symbol* lookupMember(TypeSymbol* type, std::string_view name);
+    Symbol* lookupMember(TypeSymbol* type, std::string_view name) const;
 
     // §26.5: extension-member lookup. Consulted ONLY when no instance member
     // matches (instance members win — an extension never shadows a real
@@ -2281,7 +2464,22 @@ private:
     // resolved MethodSymbol.
     void typeCall(const ast::CallExpr& ce);
 
-    void checkCallArity(const ast::CallExpr& ce, MethodSymbol* ms);
+    // fix #4325 (§5.1 / §11.2, v0.298): `explicitSubst` is the METHOD's own
+    // type-parameter → concrete-TypeRef binding for the EXPLICITLY
+    // specified type arguments (`<TypeArg, …>`) at the call site, built by
+    // `typeCall` (see ~L3464–L3490). Non-null only when the call wrote
+    // `<…>`; threaded into `checkArgsAgainstParams` so the per-argument
+    // §5.1 assignability check runs against the substituted parameter
+    // type (e.g. `IHolder` from `MakeArr<IHolder>(new Widget3(s))`), not
+    // the bare type parameter (`T`) — without this, a non-conforming
+    // argument to an interface-typed explicit type argument silently
+    // slipped past `checkAssignable`'s free-type-var fallback and
+    // reached codegen as a SIGSEGV at the interface dispatch
+    // (measured, identical to #4302's signature).
+    void checkCallArity(
+        const ast::CallExpr& ce, MethodSymbol* ms,
+        const std::unordered_map<std::string_view, TypeRef*>* explicitSubst =
+            nullptr);
 
     // §2.2 / §2.5 / §2.6 step 3 (issue #328 inc 3): type-check a call to an
     // IMPORTED method (no ast::MethodDecl) against its reconstructed
@@ -2421,6 +2619,11 @@ private:
     struct OverloadResult {
         OverloadOutcome outcome = OverloadOutcome::Undecidable;
         std::size_t winnerIndex = 0;  // valid only when Resolved
+        // applicable[c] is true when candidate c's arguments were found
+        // applicable by classifyArg (per §22.6 step 1, NotApplicable removes
+        // the candidate). Used by the caller to avoid arityFallback selecting
+        // an overload whose classifyArg result was NotApplicable.
+        std::vector<bool> applicable;
     };
 
     // `paramTypes[i]` holds candidate i's ordered parameter TypeRefs (each
@@ -2486,19 +2689,102 @@ private:
     // total] (optional params lower the minimum), then per-argument
     // assignability. Callers must have already ruled out named args
     // and overload ambiguity.
+    //
+    // fix #4233 (§26.4/§26.5, v0.298): `extBinding` is the extension's own
+    // free-type-variable → concrete-TypeRef binding (the same one
+    // `lookupExtensionMember` computes and `ctx_.setExprExtBinding` records
+    // on the call's MemberAccessExpr, keyed by `ctx_.exprExtBinding`) — non-
+    // null only for a call to an extension method whose signature mentions
+    // the extension's free var. When present, each parameter's declared type
+    // is substituted through it (mirroring the return-type substitution
+    // `ExprTC::typeCall` already runs for the same call) before the
+    // assignability check, so `Test(x: W)` on a `Box<int>` receiver checks
+    // the argument against `int`, not the unresolved `W` — closing both the
+    // #4233 arity-diagnostic-for-a-correct-call defect AND a wrongly-typed
+    // argument silently reaching codegen as a type-mismatched IR crash.
+    //
+    // fix #4325 (§5.1 / §11.2, v0.298): `explicitSubst` is the METHOD's own
+    // type-parameter → concrete-TypeRef binding for the EXPLICITLY
+    // specified type arguments (`M<T: IBar>.Foo(arg)` — `T → IBar`) — non-
+    // null only for a call that wrote `<TypeArg, …>` at the call site. The
+    // `typeCall` slice already substitutes it into the call's RETURN type
+    // (`rt = substituteReturnType(rt, explicitSubst)`, ~L3490), but the
+    // per-argument §5.1 assignability check below ran against the raw,
+    // unsubstituted parameter type — so for `MakeArr<T>(x: T)` called as
+    // `MakeArr<IHolder>(new Widget3(s))` the parameter was typed as the
+    // bare `T`, `checkAssignable`'s free-type-var fallback silently
+    // accepted the non-conforming `Widget3` against `IHolder`'s constraint
+    // (§11.2 nominal-conformance via `isSubtype`), and codegen dispatched
+    // the interface call through a null itable slot — a SIGSEGV
+    // (measured, identical to #4302's crash signature). Substituting the
+    // explicit type args into `paramTy` BEFORE the §5.1 check lets the
+    // same `checkAssignable` authority that already rejects the
+    // non-generic twin (`plain_call_argument_noconform_rejected_control`,
+    // #4310's suite) reject this one too — `IHolder` is a Named with a
+    // declaration, so `Widget3` is not a subtype and the diagnostic
+    // fires.
     void checkArgsAgainstParams(
         const std::vector<ast::Param>& params,
         const std::vector<ast::CallArgument>& args, SourceLocation loc,
         const std::string& calleeDesc,
         const ast::Expr* classTarget = nullptr,
         TypeSymbol* classParent = nullptr,
-        const ast::MethodDecl* calleeMethodDecl = nullptr);
+        const ast::MethodDecl* calleeMethodDecl = nullptr,
+        const std::vector<std::pair<std::string, TypeRef*>>* extBinding =
+            nullptr,
+        const std::unordered_map<std::string_view, TypeRef*>* explicitSubst =
+            nullptr);
 
     // Slice T7: check `new T(args)` against T's sole constructor (if
     // any). Zero declared constructors → the implicit default ctor
     // takes no arguments. Multiple constructors → overload resolution
     // is deferred, so skip.
     void checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t);
+
+    // fix #4170 (§35.1/§35.2/§35.3, v0.295; mirrors #4163's §5.4/§10
+    // enum rejection): neither an enum nor a choice has a constructor
+    // for `new` to resolve to — an enum value comes from the int→enum
+    // cast `E(n)` (§5.4/§10, #960), a choice's construction *is* case
+    // selection, `Type.Case(args)` (§35.1/§35.2/§35.3, #4163). This is
+    // the SINGLE authority both `rt`-resolution sites feed: the
+    // explicit `new T(...)` NewExpr-typing arm (ExprTypecheck_Exprs.cpp)
+    // and the two §17.7 typeless `new()` shorthand call sites in this
+    // file (field-initializer and local-decl) — before #4170 the
+    // shorthand sites had no Enum/Choice arm at all, so `new()`
+    // target-typed to either kind was silently typed and reached
+    // codegen exactly as the (#4163-fixed) explicit spelling once did:
+    // a SIGSEGV for choice (no case discriminant reaches the
+    // `case`-statement lowering) and an IR-verifier backstop for enum.
+    // Reports the appropriate diagnostic and returns true iff `rt`
+    // names an Enum or Choice (i.e. iff it rejected); callers should
+    // treat a `true` return the same way the explicit arm's original
+    // two `if` blocks did — diagnose and continue, since later checks
+    // in the same NewExpr-typing block (e.g. §14.5 generic-arity) still
+    // apply to the same node.
+    bool rejectNewOnEnumOrChoice(const ast::NewExpr& ne, const TypeRef* rt);
+
+    // fix #4176 (§3.1/§3.2, §11.7, §12.5, §17.7, v0.298): sibling of
+    // `rejectNewOnEnumOrChoice` just above, same shape — the single
+    // authority for "does `new` construct a value of this NAMED
+    // CLASS-SHAPED kind": an abstract class, a `closed` class, a `static`
+    // class, and an interface all have no instance to mint. This logic
+    // ("Slice S11") already existed inline in the explicit `new T(...)`
+    // NewExpr-typing arm (ExprTypecheck_Exprs.cpp); #4176 found the two
+    // §17.7 typeless `new()` shorthand call sites in this file
+    // (field-initializer and local-decl) never reached it at all — their
+    // own `rt`-resolution routed straight to `checkNewExprArgs` for
+    // `TypeDeclKind::Class` and nothing else — so `w: ISomeInterface :=
+    // new();` with no implementing class in scope reached codegen with no
+    // vtable to install and SEGFAULTed on first virtual dispatch (exit
+    // 139); `w: AbstractThing := new();` crashes identically through the
+    // same shorthand gap. Reports the appropriate diagnostic and returns
+    // true iff `rt` names one of the four non-instantiable kinds;
+    // callers should treat a `true` return the same way the explicit
+    // arm's original if/else-if chain did — diagnose and skip the
+    // Class/Record constructor-arg check below, since there is no
+    // constructor to check args against.
+    bool rejectNewOnNonInstantiableKind(const ast::NewExpr& ne,
+                                         const TypeRef* rt);
 
     // narrow #4059 further (§9.1 / §9.2 / §9.5, v0.295): true iff
     // `new T()` is permitted on this body record (i.e. NOT the

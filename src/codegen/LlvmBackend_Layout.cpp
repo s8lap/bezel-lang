@@ -1833,6 +1833,26 @@ llvm::StructType* Emitter::classStruct(const sema::TypeSymbol* t) {
     // CG29: a record has no vtable header; route to recordStruct so every
     // classStruct caller (field access, etc.) gets the right layout.
     if (t->kind == ast::TypeDeclKind::Record) return recordStruct(t);
+    // fix #4114 (§35.1/§35.8, v0.295): a choice's instance storage is its
+    // cases' tagged payloads (choiceStruct's `{i32 tag, case0, case1, …}`),
+    // never a class's `{vtable*, disposed-flag, fields…}` shape — a choice
+    // has no instance fields at all (§35.1: "Choices cannot have …
+    // instance fields, block-form or storage-backed properties"). Route
+    // here exactly like Record so that ANY caller reaching classStruct with
+    // a Choice TypeSymbol (setupBoxDescriptors's box-vtable Pass C, added
+    // for choices by fix #3900, is the one that crashed) gets the real
+    // layout instead of building and caching a bogus zero-field class
+    // struct. That bogus struct was cached into the SHARED `structs_` map
+    // keyed on `t` — the same map choiceStruct() itself reads — so a later
+    // choiceStruct(t) call (e.g. boxToStringThunk's default-ToString
+    // synthesis via emitChoiceToString) retrieved the poisoned `{ptr, i8}`
+    // entry instead of the real tag+payload layout. emitChoiceToString's
+    // multi-index `CreateExtractValue(val, {1+ci, pi})` then indexed a
+    // second level into the `i8` field (not a struct), which LLVM's
+    // (non-assertions) release build resolves to a null-typed extract —
+    // SIGSEGV inside llvm::Value::setName on construction, not a bounds
+    // check we could catch here.
+    if (t->kind == ast::TypeDeclKind::Choice) return choiceStruct(t);
 
     // fix #2889 (§14.1 "Generic declarations" / §12 "Inheritance and
     // Dispatch" / §22.8 "Field initializers", v0.240) — the ALLOCATION face of
@@ -5701,6 +5721,26 @@ llvm::Value* Emitter::makePropertyThunk(sema::PropertySymbol* ps,
             const sema::TypeSymbol* savedEnumMethod = currentEnumMethod_;
             if (ps->parent && ps->parent->kind == ast::TypeDeclKind::Enum)
                 currentEnumMethod_ = ps->parent;
+            // fix #4113 (§35.2/§35.5, v0.295): the choice twin of the enum
+            // workaround above — a choice property read as a function value
+            // (`var f: () -> T := s.SomeProperty;`) whose getter body is
+            // `case this of …` needs the identical choiceTypeOf() recovery.
+            //
+            // fix #4143 (§35.2/§35.5, v0.295): SET-FROM-OWNER, not
+            // conditionally-set-else-inherit — this thunk switches
+            // `currentFn_` to a genuinely separate, memoized function
+            // (`pthunk$N`, `propertyThunks_`) via its OWN hand-rolled
+            // save/restore above, NOT the `NestedBodyScope` guard (this
+            // function predates it and is not one of the six builders that
+            // guard wraps), so an unconditional-else-untouched write here
+            // leaks a caller's `currentChoiceMethod_` into this thunk's body
+            // exactly as the inline read site did (LlvmBackend_Exprs.cpp) —
+            // same mechanism, different call site.
+            const sema::TypeSymbol* savedChoiceMethod = currentChoiceMethod_;
+            currentChoiceMethod_ =
+                (ps->parent && ps->parent->kind == ast::TypeDeclKind::Choice)
+                    ? ps->parent
+                    : nullptr;
             result = lowerExpr(*getter);
             // fix #2761 (§8.6 "Boxing" / §27.6, v0.240): the PROPERTY-AS-
             // FUNCTION-VALUE face of the same expression getter. Its `ret` is
@@ -5713,6 +5753,7 @@ llvm::Value* Emitter::makePropertyThunk(sema::PropertySymbol* ps,
                 result = boxForTarget(result, ctx_.resolvedType(*pd->type),
                                       getter);
             currentEnumMethod_ = savedEnumMethod;
+            currentChoiceMethod_ = savedChoiceMethod;
         } else if (const ast::PropertyAccessor* acc = blockGetterOf(ps)) {
             if (llvm::Function* fn = ensurePropertyBlockGetter(pd, acc)) {
                 // fix #2501 (§9.2/§27.6, v0.236): ensurePropertyBlockGetter's
@@ -6193,11 +6234,56 @@ llvm::Value* Emitter::emitValueEquality(llvm::Value* l, llvm::Value* r,
     }
     // Nested record (§9.1 transitivity): recurse with its own type so that
     // record's string fields are likewise compared by content.
+    //
+    // fix #4234 (§9.1, v0.298): route through a per-INSTANTIATION MEMOIZED
+    // helper (a real `call`) instead of re-inlining `emitStructEquality`'s
+    // body here — see recordToStringHelperFn's comment (LlvmBackend_Setup.cpp)
+    // for why the key/load type must be the operand's OWN struct type, not
+    // one re-derived from `fieldTy->declaration` alone. A shared nested
+    // record type reached from `branch` sibling FIELD positions otherwise
+    // re-expands its entire recursive comparison at EVERY occurrence —
+    // O(branch^depth) LLVM IR instructions for a program that only declares
+    // the types (measured: an unfixed depth=8/branch=3 diamond alone cost
+    // 167s once the sibling ToString blowup was fixed, confirming this arm
+    // reproduces the identical defect class one level of nesting later).
+    // `l`/`r` share one type by construction (a well-typed record `=`/
+    // `Equals` never compares across instantiations), so `l`'s type keys
+    // and loads both operands.
     if (fieldTy && fieldTy->kind == K::Named && fieldTy->declaration &&
         fieldTy->declaration->kind == ast::TypeDeclKind::Record &&
         l->getType()->isStructTy()) {
-        if (auto* nested = llvm::dyn_cast<llvm::StructType>(l->getType()))
-            return emitStructEquality(l, r, nested, fieldTy->declaration);
+        // fix #4251 (§9.1/§14.1/§4.6, v0.298): install THIS field's own
+        // generic substitution before the memoized helper's body is (first)
+        // built. Issue #462 installs `RecordSubstGuard` only at the
+        // TOP-LEVEL `=`/`Equals` dispatch (LlvmBackend_Exprs.cpp's
+        // `eqSubst`); a NON-generic outer record whose FIELD is a generic
+        // record (`record SoloStr(BS: Box<string>)`) never gets any guard
+        // for that field's own instantiation, so `recordEqualityHelperFn`'s
+        // body (built via `emitStructEquality` on `Box`'s AST decl) ran
+        // `recordMemberTypeResolved` on Box's `V: T` field under an EMPTY
+        // `genericSubstSemaTy_` — it came back bare, unresolved `T`, which
+        // the string-content-equality arm above never matches, so it fell
+        // to the raw-shape fallback's `ICmpEQ` on the two `bz_string*`
+        // pointers: REFERENCE equality, not §4.6 content equality (measured:
+        // `SoloStr(Box("hi")) = SoloStr(Box("hi"))` was `False`). `fieldTy`
+        // here already carries the CONCRETE `genericArgs` (`Box<string>`),
+        // so a guard keyed on it binds `T` -> `string` for exactly this
+        // (first) build. A no-op for a non-generic nested record (empty
+        // `genericArgs`) or an already-concrete one. `RecordSubstGuard`'s
+        // own ctor resolves each arg through the CURRENTLY active (outer)
+        // substitution before overwriting it, so this also chains correctly
+        // when the outer record is itself generic and this field's arg is
+        // that outer type parameter.
+        RecordSubstGuard fieldSubst(this, fieldTy);
+        auto* recTy = llvm::cast<llvm::StructType>(l->getType());
+        llvm::Function* helper =
+            recordEqualityHelperFn(fieldTy->declaration, recTy);
+        llvm::AllocaInst* lSpill = entryAlloca(recTy);
+        llvm::AllocaInst* rSpill = entryAlloca(recTy);
+        builder_.CreateStore(l, lSpill);
+        builder_.CreateStore(r, rSpill);
+        return builder_.CreateCall(helper->getFunctionType(), helper,
+                                   {lSpill, rSpill});
     }
     // §9.2 v0.210 (#2083) / §35.7: a value-like choice component — the
     // declared type is a Named with declaration's kind == Choice and the

@@ -151,6 +151,7 @@ BEZEL_TEST(sema_member, this_method_resolves_to_method_symbol) {
         "  public method M() _ := this.Helper; end M; "
         "end C;");
     auto* ma = firstMemberAccess(r);
+    BEZEL_EXPECT_TRUE(ma != nullptr);
     if (ma) {
         auto* sym = r.ctx->exprSymbol(*ma);
         BEZEL_EXPECT_TRUE(dynamic_cast<MethodSymbol*>(sym) != nullptr);

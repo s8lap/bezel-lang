@@ -1505,7 +1505,8 @@ bool ExprTC::groundSatisfiesNew(const TypeRef* arg, bool& decided) {
         }
         if (d->kind == ast::TypeDeclKind::Interface) {
             decided = true;
-            return false;  // interfaces are not constructible (§11.2)
+            return false;  // interfaces are not constructible (§14.2: "Interface
+                            // substitutions never satisfy `new()`")
         }
         // §35.10 (v0.200, #2044): "Choices never satisfy the value-type arm:
         // `default(C)` is undefined for every choice type." So `where T: new()`
@@ -1525,15 +1526,65 @@ bool ExprTC::groundSatisfiesNew(const TypeRef* arg, bool& decided) {
             // new()` bound was silently satisfied by an imported record with a
             // non-nullable `Object` field that the byte-identical local record
             // is rejected for (measured both ways).
+            //
+            // fix #4220 (§14.2/§17.11/§19.6, v0.298): this arm never substituted
+            // the record's OWN generic parameter against `arg`'s `genericArgs`
+            // at all — the identical #4002 gap `Resolver::argSatisfiesNew`'s
+            // sibling Record arm had, never ported here. `storageComponentType`
+            // returns the bare, declaration-less field type AS WRITTEN (e.g. `T`
+            // for `record Box<T>(V: T)`), unsubstituted — and the old
+            // `nullable`/`groundCategorize` leaf test never classified a bare
+            // declaration-less Named type as `GroundCat::Reference` (only
+            // `Unknown`), so the loop never tripped regardless of what `T` was
+            // actually ground-bound to: every record with a bare-parameter field
+            // (or one nested inside a delegating record) satisfied `new()`
+            // unconditionally, wrongly keeping a provably-uninhabited leaf as
+            // exhaustiveness-required (§19.6) instead of exempting it.
+            //
+            // §25: is this the SAME question `Resolver::argSatisfiesNew`'s
+            // Record arm (TypeResolution_Checks.cpp) answers for a record type
+            // argument — "is `default(R<ground args>)` well-formed, given
+            // `arg`'s `genericArgs`"? Yes: `groundSatisfiesNew`'s own
+            // precondition ("a FULLY-GROUND solved type", this function's
+            // header comment) makes `arg` exactly that same shape here too —
+            // a Named TypeRef with `declaration == d` and ground `genericArgs`,
+            // nothing left to solve. So this ports the identical composition
+            // fix #4166's review follow-up already unified `argSatisfiesNew`
+            // onto, rather than hand-rolling a fourth spelling (#4229): seed a
+            // `common::RecordSubstEnv` from `d`'s own generic params against
+            // `arg`'s `genericArgs`, walk the FULL `recordStorageMembers`
+            // enumeration (positional + body + auto-property — matching
+            // #3988's widening, so a body-only/combined-form field is not
+            // silently skipped here either), substitute each member through the
+            // env, and test the substituted type with the SAME shared
+            // authority, `sema::typeHasNoDefault` (TypeResolution.hpp) — which
+            // also already closes #4219's class of gap (a Choice- or
+            // zero-less-Enum-typed field) and carries its own cycle guard, so a
+            // self-referential record reached this way cannot SIGSEGV either.
             decided = true;
-            for (const Symbol* pf : recordPositionalFieldSymbols(d)) {
-                const TypeRef* ft = storageComponentType(pf, ctx_);
-                if (!ft) { decided = false; return false; }  // can't verify
-                if (ft->nullable) continue;  // nullable field → defaults null
-                if (groundCategorize(ft) == GroundCat::Reference)
-                    return false;  // non-nullable reference field: no default
-            }
-            return true;
+            bool unresolved = false;
+            bool nonDefaultable = false;
+            common::RecordSubstEnv env;
+            common::seedRecordSubstEnv(*d, *arg, /*incoming=*/nullptr, env);
+            const common::RecordSubstEnv* fieldEnv =
+                env.map.empty() ? nullptr : &env;
+            recordStorageMembers(
+                d, ctx_,
+                [&](const RecordStorageMember& rsm) {
+                    const TypeRef* ft = rsm.type;
+                    if (!ft) { unresolved = true; return false; }  // can't verify
+                    common::RecordSubstEnv::Entry sub =
+                        common::resolveRecordFieldSubst(ft, fieldEnv);
+                    if (!sub.ty) { unresolved = true; return false; }
+                    if (typeHasNoDefault(sub.ty, ctx_, sub.env)) {
+                        nonDefaultable = true;
+                        return false;  // no default at this member
+                    }
+                    return true;
+                },
+                /*env=*/nullptr);
+            if (unresolved) { decided = false; return false; }
+            return !nonDefaultable;
         }
         if (d->kind == ast::TypeDeclKind::Class) {
             // A class satisfies new() iff it has an accessible parameterless
@@ -1563,7 +1614,73 @@ bool ExprTC::groundSatisfiesNew(const TypeRef* arg, bool& decided) {
             return false;
         }
     }
-    // Built-ins / generic-param / function args: defer (decided stays false).
+    // fix #4298 (§14.2/§17.11, v0.298): the null-declaration BUILTIN
+    // population (`DictionaryEntry`/`Span`/`IEnumerable`/etc. — issue 4229's
+    // ~130-name catalogue) has no arm above (every arm above this point
+    // requires `arg->declaration`), so it fell straight through to the
+    // unconditional "defer" below at EITHER of this function's two call
+    // sites — verified exactly two, not "at least one, maybe more":
+    // `leafSolutionViolatesScalarConstraint`'s §19.6 exhaustiveness filter
+    // and `extConstraintItemProvablyViolated`'s §26.4 applicability filter,
+    // both further down this file (`grep -n 'groundSatisfiesNew(arg,
+    // decided)' ExprTypecheck.cpp` finds exactly these two call sites).
+    //
+    // Decide the CATEGORICAL slice only: the closed 25-name set of
+    // null-declaration builtin INTERFACES `Resolver::argSatisfiesNew`
+    // already exposes via `nonConstructibleBuiltinInterfaceNames()`
+    // (TypeResolution_Checks.cpp, fix #4309), plus `IGrouping` (fix #4294's
+    // own deliberately-separate one-off in that same file) — both
+    // provably non-constructible per §14.2 ("Interface substitutions never
+    // satisfy `new()` — no constructor exists"), with NO per-type fact to
+    // get wrong (that array's own comment: "no per-type fact to get wrong
+    // (unlike DictionaryEntry/DrainedEntry, whose defaultability ... is
+    // instantiation-dependent)"). Reusing the SAME exposed authority rather
+    // than re-typing a third copy of the name list (§6/§25).
+    //
+    // The INSTANTIATION-DEPENDENT remainder of the null-declaration
+    // population (`DictionaryEntry`, the `Span` family, `ExceptionInfo`,
+    // `ReadOnlyStringSpan`) is DELIBERATELY left deferred here — routing
+    // those through `typeHasNoDefault` unconditionally is exactly the shape
+    // fix #4235's FIRST attempt tried and had to be REVERTED (it
+    // measurably regressed `Array`/`Dictionary`-typed pinned tests — see
+    // `Resolver::argSatisfiesNew`'s own null-declaration arm comment,
+    // TypeResolution_Checks.cpp, for the full account). Porting that
+    // gating correctly for TWO more, differently-shaped consumers (an
+    // exhaustiveness leaf filter and a block-applicability filter, neither
+    // previously exercised against this population) needs its own
+    // characterization and tests, not a fold-in here — filed as a
+    // follow-up (issue 4333) rather than guessed at silently.
+    //
+    // ⚠ CORRECTION to issue 4298's own "both call sites" framing, measured
+    // while writing this fix's tests (LANE_RULES §1): this arm is reached
+    // from BOTH call sites symmetrically, but its effect is OBSERVABLE
+    // through only ONE of them. `leafSolutionViolatesScalarConstraint`'s
+    // own `violates` lambda gates on `isFullyGroundTypeRef(arg)` BEFORE
+    // ever inspecting `item.kind` — and that predicate's own header
+    // comment (a few hundred lines above) is explicit that a null-
+    // declaration `Named` TypeRef is treated as non-ground
+    // UNCONDITIONALLY, deliberately, "fewer exemptions, never a wrong
+    // one." So a null-declaration-builtin-bound leaf never reaches this
+    // arm through that consumer at all — confirmed by measurement, see
+    // `ground_satisfies_new_null_decl_builtin_4298_test.cpp`'s row (1).
+    // Fixing `groundSatisfiesNew` itself, rather than special-casing only
+    // its §26.4 call site, is still the right shape: it is the general,
+    // correct answer to "does a fully-ground σ satisfy `new()`", available
+    // to a future third consumer or a future loosening of
+    // `isFullyGroundTypeRef` — but do not expect a change here to be
+    // independently observable via the §19.6 exhaustiveness path today.
+    if (arg->kind == TypeRef::Kind::Named && !arg->declaration) {
+        std::string_view head = arg->headName();
+        const auto& nonCtorIfaces = nonConstructibleBuiltinInterfaceNames();
+        if (head == "IGrouping" ||
+            std::find(nonCtorIfaces.begin(), nonCtorIfaces.end(), head) !=
+                nonCtorIfaces.end()) {
+            decided = true;
+            return false;  // interfaces are not constructible (§14.2)
+        }
+    }
+    // Built-ins (remaining) / generic-param / function args: defer (decided
+    // stays false).
     return false;
 }
 
@@ -1817,8 +1934,13 @@ static bool armCoversDeterminedLeaf(
 // Forward declaration (defined below): §12.9 variance-aware generic
 // assignability, reused by checkCaseExhaustiveness's #784/#1874 typed-binding
 // coverage check to make a same-declaration generic binding arg-SENSITIVE.
-static bool variantGenericAssignable(const TypeRef*, const TypeRef*,
-                                     bool (*)(TypeSymbol*, TypeSymbol*));
+// `freeNames` (#4199): the set of names this call is entitled to treat as a
+// free/rigid type variable rather than a concrete type — see
+// `isFreeGenericTypeVarRef`'s comment. Null means none (ground-truth
+// conservative default).
+static bool variantGenericAssignable(
+    const TypeRef*, const TypeRef*, bool (*)(TypeSymbol*, TypeSymbol*),
+    const std::unordered_set<std::string_view>* freeNames);
 
 // §19.6 v0.196 (#1874/#1912): does an unguarded typed binding `var x: bt` cover
 // EVERY non-null value of a scrutinee whose instantiation projected to `bt`'s
@@ -1833,7 +1955,13 @@ static bool variantGenericAssignable(const TypeRef*, const TypeRef*,
 bool ExprTC::typedBindingCoversAllValues(const TypeRef* proj,
                                          const TypeRef* bt) {
     if (!proj || !bt) return false;
-    bool covers = variantGenericAssignable(proj, bt, isSubtype);
+    // fix #4199: the "rigid enclosing-body type parameter" this function's
+    // own comment relies on is `currentScopeGenericParamNames()`'s ground
+    // truth, not any Named TypeRef with a null declaration (which also
+    // matches ~50 null-declaration stdlib builtins — #4199's actual defect).
+    std::unordered_set<std::string_view> freeNames =
+        currentScopeGenericParamNames();
+    bool covers = variantGenericAssignable(proj, bt, isSubtype, &freeNames);
     if (covers && proj->genericArgs.size() == bt->genericArgs.size()) {
         for (std::size_t gi = 0; gi < proj->genericArgs.size(); ++gi) {
             const TypeRef* sa = proj->genericArgs[gi];
@@ -2062,6 +2190,38 @@ bool ExprTC::caseArmsExhaustive(
     TypeSymbol* sub = (scrutTy && scrutTy->kind == TypeRef::Kind::Named)
                           ? scrutTy->declaration
                           : nullptr;
+    // fix #4195 (§19.6, v0.298): an UNSUBSTITUTED generic type parameter
+    // (`where T: Animal`, with `Animal` `closed` and its subclasses `sealed`)
+    // resolves to a `Named` TypeRef whose `declaration` is null (a bare
+    // type-parameter reference, the same shape `isRigidParam` keys on).
+    // The closed-hierarchy/enum/choice bullets below gate on `sub != nullptr`,
+    // so this scrutinee shape fell through and was falsely rejected as
+    // non-exhaustive even when the arms cover every leaf of the parameter's
+    // declared constraint hierarchy. Resolve the constraint bound through the
+    // same `forEachConstraintBound` walk the static-interface-operator lookup
+    // uses (#1425 / #3617-family), so the classification pred-icate does not
+    // drift from a second spelling (§LANE_RULES duplicated-classification-
+    // predicate discipline).
+    if (!sub && scrutTy && scrutTy->kind == TypeRef::Kind::Named &&
+        !scrutTy->declaration) {
+        std::string_view paramName = scrutTy->headName();
+        if (!paramName.empty() && isInScopeTypeParam(paramName)) {
+            forEachConstraintBound(
+                paramName, [&](TypeRef* ctr) -> bool {
+                    if (ctr && ctr->kind == TypeRef::Kind::Named &&
+                        ctr->declaration &&
+                        (ctr->declaration->kind == ast::TypeDeclKind::Enum ||
+                         ctr->declaration->kind ==
+                             ast::TypeDeclKind::Choice ||
+                         ctr->declaration->kind ==
+                             ast::TypeDeclKind::Class)) {
+                        sub = ctr->declaration;
+                        return true;  // accept the first admitted bound
+                    }
+                    return false;
+                });
+        }
+    }
 
     if (sub && sub->kind == ast::TypeDeclKind::Enum) {
         // §19.6: every declared enum constant must have a matching pattern.
@@ -3118,60 +3278,12 @@ bool ExprTC::isFreshOwnedProducerExpr(const ast::Expr& e) const {
 // wrappers, same case-block bodyKind gate, same exclusion of nested
 // lambdas — so the rejection sees the same return-path set the
 // inference sees.
-template <typename F>
-void ExprTC::forEachLambdaReturnValue(
-    const ast::LambdaExpr& lam, F&& fn) const {
-    if (lam.exprBody) fn(lam.exprBody.get());
-    std::vector<const ast::Stmt*> stack;
-    for (const auto& s : lam.stmts) stack.push_back(s.get());
-    while (!stack.empty()) {
-        const ast::Stmt* s = stack.back();
-        stack.pop_back();
-        if (!s) continue;
-        if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(s)) {
-            if (rs->value) fn(rs->value.get());
-            continue;
-        }
-        if (auto* bs = dynamic_cast<const ast::DoEndBlock*>(s)) {
-            for (const auto& s2 : bs->body) stack.push_back(s2.get());
-            continue;
-        }
-        if (auto* ifs = dynamic_cast<const ast::IfStmt*>(s)) {
-            for (const auto& s2 : ifs->ifBranch.body)
-                stack.push_back(s2.get());
-            for (const auto& el : ifs->elifBranches)
-                for (const auto& s2 : el.body) stack.push_back(s2.get());
-            for (const auto& s2 : ifs->elseBody) stack.push_back(s2.get());
-            continue;
-        }
-        if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s)) {
-            for (const auto& s2 : ws->body) stack.push_back(s2.get());
-            continue;
-        }
-        if (auto* fs = dynamic_cast<const ast::ForStmt*>(s)) {
-            for (const auto& s2 : fs->body) stack.push_back(s2.get());
-            continue;
-        }
-        if (auto* ts = dynamic_cast<const ast::TryStmt*>(s)) {
-            for (const auto& s2 : ts->body) stack.push_back(s2.get());
-            for (const auto& arm : ts->catches)
-                stack.push_back(arm.body.get());
-            for (const auto& s2 : ts->finallyBody) stack.push_back(s2.get());
-            continue;
-        }
-        if (auto* cs = dynamic_cast<const ast::CaseStmt*>(s)) {
-            for (const auto& arm : cs->arms)
-                if (arm.bodyKind == ast::CaseArmBodyKind::Block)
-                    for (const auto& s2 : arm.stmts)
-                        stack.push_back(s2.get());
-            continue;
-        }
-        // LocalDecl, AssignmentStmt, ExpressionStmt, BreakStmt,
-        // ContinueStmt, ThrowStmt, YieldStmt, DiscardStmt — carry
-        // expressions, not returns; nested lambdas inside those
-        // expressions have their own callable and are excluded.
-    }
-}
+//
+// (Defined inline in `ExprTypecheck_impl.hpp`, the only translation unit
+// that needs it; previously only `ExprTypecheck.cpp` instantiated it via
+// the `checkConcreteSlotLambdaBody` call site, but `ExprTypecheck_Exprs.cpp`
+// now also needs it for fix #4340.)
+
 
 // fix #1820 (§28.3, v0.223 ruling; carried in v0.282): the callee-side
 // check for the §28.3 "function-value invocation of a concrete class /
@@ -3386,8 +3498,9 @@ bool ExprTC::primitiveWidens(PrimitiveType from, PrimitiveType to) {
 // All are defined after builtinInterfaceAncestorsOf (the §26.5 hierarchy
 // section), which they depend on.
 static std::string_view namedTypeSimpleName(const TypeRef*);
-static bool variantGenericAssignable(const TypeRef*, const TypeRef*,
-                                      bool (*)(TypeSymbol*, TypeSymbol*));
+static bool variantGenericAssignable(
+    const TypeRef*, const TypeRef*, bool (*)(TypeSymbol*, TypeSymbol*),
+    const std::unordered_set<std::string_view>* freeNames);
 
 // Slice T4: is `from` a subtype of `to` — i.e. does `to` appear in
 // `from`'s transitive base-type chain (base class or implemented
@@ -3710,6 +3823,51 @@ bool ExprTC::mentionsUnsubstitutedTypeParam(const TypeRef* t) const {
     return refOutParamTypeMentionsTypeParam(t, tpNames);
 }
 
+// §14.1 / §12.9 (#4199) — see the header comment. The enclosing type's own
+// generic params, the enclosing method's own, and (§26.4/#3083) an enclosing
+// extension's target-type parameter names.
+std::unordered_set<std::string_view> ExprTC::currentScopeGenericParamNames()
+    const {
+    std::unordered_set<std::string_view> names;
+    if (currentType_)
+        for (Symbol* gp : currentType_->genericParams)
+            if (gp) names.insert(gp->name);
+    if (currentMethodDecl_)
+        for (const auto& gp : currentMethodDecl_->genericParams)
+            names.insert(gp.name);
+    if (currentExtension_ && currentExtension_->decl) {
+        if (auto* ed = dynamic_cast<const ast::ExtensionDecl*>(
+                currentExtension_->decl)) {
+            if (ed->targetType)
+                collectExtensionTargetTypeParamNames(*ed->targetType, names);
+        }
+    }
+    return names;
+}
+
+// Sibling of `isExtensionTargetTypeParam` (tests one name) — same walk
+// (§26.4), collecting every bound name instead of testing a single one.
+void ExprTC::collectExtensionTargetTypeParamNames(
+    const ast::Type& target, std::unordered_set<std::string_view>& out)
+    const {
+    for (const auto& ga : target.genericArgs) {
+        if (!ga) continue;
+        if (ga->kind != ast::TypeKind::Named || !ga->name ||
+            ga->name->parts.size() != 1)
+            continue;
+        std::string_view n = ga->name->parts[0];
+        if (!ga->genericArgs.empty()) {
+            // A concrete generic-instantiation head is never itself a free
+            // parameter — recurse to find the params in its own args
+            // (mirrors `isExtensionTargetTypeParam`'s identical recursion).
+            collectExtensionTargetTypeParamNames(*ga, out);
+            continue;
+        }
+        if (ga->nullable) continue;  // `T?` rejects binding (§26.4)
+        out.insert(n);
+    }
+}
+
 // Slices T1/T4: assignability check (§5.1, §7, §12 subtyping).
 // Handles two cases and conservatively skips everything else
 // (mixed primitive/named, generics, null, Object target) so it
@@ -3717,9 +3875,10 @@ bool ExprTC::mentionsUnsubstitutedTypeParam(const TypeRef* t) const {
 //   - primitive → primitive: identity or §5.1 widening.
 //   - named → named (non-generic): identity or subclass/interface.
 // A non-nullable target accepting a nullable source is rejected.
-void ExprTC::checkAssignable(TypeRef* from, TypeRef* to,
-                             SourceLocation loc, const std::string& what,
-                             const ast::Expr* fromExpr) {
+void ExprTC::checkAssignable(
+    TypeRef* from, TypeRef* to, SourceLocation loc, const std::string& what,
+    const ast::Expr* fromExpr,
+    const std::unordered_set<std::string_view>* freeTypeParamNames) {
     if (!from || !to) return;
     // §5.1 "Constant narrowing" (#2925): applied HERE, once, for every §5.1
     // conversion site — see narrowIntConstantToTarget above.
@@ -4066,7 +4225,7 @@ void ExprTC::checkAssignable(TypeRef* from, TypeRef* to,
                 !from->genericArgs.empty() &&
                 from->genericArgs.size() == to->genericArgs.size()) {
                 // Same-declaration: enforce declared variance per §12.9.
-                if (!variantGenericAssignable(from, to, isSubtype)) {
+                if (!variantGenericAssignable(from, to, isSubtype, freeTypeParamNames)) {
                     reportNotConvertible();
                     return;
                 }
@@ -4215,7 +4374,7 @@ void ExprTC::checkAssignable(TypeRef* from, TypeRef* to,
             reportNotConvertible();
             return;
         }
-        if (!variantGenericAssignable(from, to, isSubtype)) {
+        if (!variantGenericAssignable(from, to, isSubtype, freeTypeParamNames)) {
             reportNotConvertible();
             return;
         }
@@ -5113,12 +5272,16 @@ bool ExprTC::isThisRootedLValueTarget(const ast::Expr& target) const {
     // PostfixBangExpr) to find the chain's base — same shape as
     // checkLValueChainNotCallBased above.
     const ast::Expr* e = &target;
+    const ast::Expr* parent = nullptr;
     for (;;) {
         if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(e)) {
+            parent = ma;
             e = ma->target.get();
         } else if (auto* ix = dynamic_cast<const ast::IndexExpr*>(e)) {
+            parent = ix;
             e = ix->target.get();
         } else if (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(e)) {
+            parent = pb;
             e = pb->operand.get();
         } else {
             break;
@@ -5129,7 +5292,22 @@ bool ExprTC::isThisRootedLValueTarget(const ast::Expr& target) const {
     // the bare implicit-this spelling.
     auto* id = dynamic_cast<const ast::IdentifierExpr*>(e);
     if (!id) return false;
-    if (id->name == "this") return true;
+    if (id->name == "this") {
+        // fix #4297 (§22.8/§23.1, v0.298): the bare-identifier branch
+        // already checks `fs->parent == currentType_` (the member's
+        // declaring type). The explicit `this.F` spelling must consult the
+        // SAME fact — but the chain base is the IdentifierExpr "this",
+        // not "F", so we look at the parent MemberAccessExpr to get the
+        // member name and resolve it through the current type.
+        if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(parent)) {
+            Symbol* sym = lookupMember(currentType_, ma->member);
+            if (auto* fs = dynamic_cast<FieldSymbol*>(sym))
+                return fs->parent == currentType_;
+            if (auto* ps = dynamic_cast<PropertySymbol*>(sym))
+                return ps->parent == currentType_;
+        }
+        return true;
+    }
     // Bare implicit-this: the identifier resolves to a FieldSymbol or
     // PropertySymbol whose parent is the current type — the §22.8
     // in-scope spelling. Both spellings are the same store (§2.7);
@@ -5244,8 +5422,11 @@ void ExprTC::checkReadonlyAssignment(const ast::AssignmentStmt& as) {
         // R's own constructor cannot write another R's positional
         // storage through `r.X := e` (a same-instance aliasing write
         // through read-only storage the previous fix left open).
+        //
+        // fix #4297 (§9.1/§22.8, v0.298): `isThisRootedLValueTarget`
+        // now checks `fs->parent == currentType_` internally, so this
+        // call site no longer carries the redundant conjunct.
         bool inDeclaringCtor = inConstructor_ &&
-                               currentType_ == fs->parent &&
                                isThisRootedLValueTarget(*as.target);
         if (!inDeclaringCtor) {
             std::string nm = std::string(fs->name);
@@ -5274,28 +5455,95 @@ void ExprTC::checkReadonlyAssignment(const ast::AssignmentStmt& as) {
     // constructor body writing `c._f` (where `_f` is C's readonly) was
     // also accepted; the same this-rooted check rejects that shape
     // (the chain's base is `c`, not `this`).
+    //
+    // fix #4276 (§22.8, v0.298): `isThisRootedLValueTarget` answers ONLY
+    // "is the chain's base literally `this`" — for the explicit `this.F`
+    // spelling it does not also check the field's OWN declaring type,
+    // unlike its bare-identifier branch (`fs->parent == currentType_`,
+    // see that function). That asymmetry let a DERIVED class's own
+    // constructor reassign a readonly field it INHERITS from a base —
+    // `this` in `Derived::ctor` names the very same instance, so the
+    // this-rooted check alone passed it, while the bare spelling of the
+    // identical store (`F := e` with no `this.`) was ALREADY rejected by
+    // the parent check the sibling branch carries (MEASURED: the two
+    // spellings of the same store disagreed). `currentType_ == fs->parent`
+    // makes the explicit spelling consult the SAME fact the bare spelling
+    // already does, rather than duplicating a second, narrower one.
+    // fix #4297 (§22.8, v0.298) folds `currentType_ == fs->parent` into
+    // `isThisRootedLValueTarget` itself, so this call site no longer
+    // carries the redundant conjunct.
+    // fix #4290 (§17.6/§22.8, v0.298): the carve-out and readonly-modifier
+    // check below are extracted into `checkReadonlyFieldWriteTarget` — the
+    // same shared-authority shape #2868 already used for
+    // `checkPropertyWriteTarget` — so the IncrementStmt arm can run the
+    // SAME check instead of the gap it had. `_f++`/`_f--` on a plain
+    // readonly field resolves a FieldSymbol, not a PropertySymbol, and
+    // `checkPropertyWriteTarget` early-returns for that (`if (!ps)
+    // return;`), so before this fix NO readonly check ran for `++`/`--` on
+    // a plain field: a second assignment through the increment spelling
+    // compiled clean and mutated the field at runtime, while the identical
+    // `:=` and `+=` spellings of the same store were already rejected here.
+    // Passing `nullptr` for `incOp` keeps this call's diagnostic
+    // byte-identical to the pre-extraction message.
+    checkReadonlyFieldWriteTarget(*as.target, as.span.begin, /*incOp=*/nullptr);
+}
+
+// §17.6/§22.8 (v0.298, #4290): the shared readonly-FIELD write-target
+// check — the construction-window carve-out (§22.8/§23.1's v0.270
+// per-instance narrowing, #3299/#3316/#4276) plus the `readonly` modifier
+// rejection. Extracted out of `checkReadonlyAssignment` (see its header
+// comment above for the fuller history of the carve-out's shape) so that
+// BOTH statement forms that write through grammar A.6's `LValue` —
+// AssignmentStmt (`x := e`, `x op= e`, via `checkReadonlyAssignment`) and
+// IncrementStmt (`x++`/`x--`) — consult ONE implementation, exactly the
+// #2868 shape already used for `checkPropertyWriteTarget`. Does NOT
+// handle a positional record's auto-generated property (structurally
+// read-only, no `readonly` modifier of its own — see the comment at the
+// `fs->posParam && Record` branch in `checkReadonlyAssignment`); each
+// statement form keeps its own dedicated diagnostic for that case
+// (`checkReadonlyAssignment`'s early branch above; the IncrementStmt
+// arm's own `fs->posParam && Record` branch), so this helper returns
+// early for it rather than risk a redundant second report.
+//
+// `incOp` is null for an assignment target and the operator token
+// ("++"/"--") for an increment target — the same convention
+// `checkPropertyWriteTarget` uses — and selects the diagnostic's verb and
+// adds the §17.6 citation; with `incOp == nullptr` the message is
+// byte-identical to what `checkReadonlyAssignment` reported inline before
+// this extraction.
+void ExprTC::checkReadonlyFieldWriteTarget(const ast::Expr& target,
+                                            const SourceLocation& loc,
+                                            const char* incOp) {
+    auto* fs = dynamic_cast<FieldSymbol*>(ctx_.exprSymbol(target));
+    if (!fs) return;
+    if (fs->posParam && fs->parent &&
+        fs->parent->kind == ast::TypeDeclKind::Record) {
+        return;
+    }
     if (inConstructor_) {
         bool isStatic = false;
         for (auto mod : fs->modifiers)
             if (mod == "static") { isStatic = true; break; }
-        if (isStatic || isThisRootedLValueTarget(*as.target)) return;
+        if (isStatic ||
+            isThisRootedLValueTarget(target))
+            return;
     }
     // §22.8 (#747 R42): a readonly field may be assigned only in a field
-    // initializer or a constructor body; assignment anywhere else is a compile
-    // error. Resolve the target's field symbol directly so EVERY receiver shape
-    // is covered — `this.f`, `c.f`, `Type.f`, and a bare `f`. The previous check
-    // matched only `this.f`, so an instance- or type-qualified readonly write
-    // (e.g. `Config.MaxSize := 50` in a normal method) slipped through and was
-    // silently dropped at runtime.
-    // Check the readonly modifier on the field's MemberSymbol.
+    // initializer or a constructor body; assignment/increment anywhere
+    // else is a compile error. Resolve the target's field symbol directly
+    // so EVERY receiver shape is covered — `this.f`, `c.f`, `Type.f`, and
+    // a bare `f`.
     for (auto mod : fs->modifiers) {
         if (mod == "readonly") {
+            const std::string verb =
+                incOp ? "increment/decrement " : "assign to ";
+            const std::string cite = incOp ? "§17.6 / " : "";
             ctx_.diagnostics().report(
-                Severity::Error, as.span.begin,
-                std::string("cannot assign to readonly field `") +
+                Severity::Error, loc,
+                "cannot " + verb + "readonly field `" +
                 std::string(fs->name) +
-                "` outside the declaring class's constructor "
-                "(§22.8)");
+                "` outside the declaring class's constructor (" + cite +
+                "§22.8)");
             return;
         }
     }
@@ -5509,6 +5757,24 @@ void ExprTC::checkPropertyWriteTarget(const ast::Expr& target,
         // field branch uses); for a `static readonly` auto-property
         // the carve-out is preserved (per-instance vs per-type does
         // not reach it, v0.270 records the case as open).
+        //
+        // fix #4276 (§23.1, v0.298): `isThisRootedLValueTarget`'s
+        // explicit-`this.P` branch does not check the property's own
+        // declaring type — only its bare-identifier branch does
+        // (`ps->parent == currentType_`). That let a DERIVED class's
+        // constructor reassign a readonly auto-property it INHERITS from
+        // a base via `this.P := e`, while the bare spelling of the exact
+        // same store (`P := e`, no `this.`) was already rejected by the
+        // sibling check (MEASURED: the two spellings disagreed). This
+        // does not reach #4275 (a same-class readonly property re-
+        // assigned over its own declaration initializer): §22.8's own
+        // scope statement, and DECLINED.md's "Extending §22.8's single-
+        // assignment rule to readonly auto-properties" row (v0.271),
+        // record that the ONCE-NESS counting rule deliberately does not
+        // extend to auto-properties — only the WHERE (declaring-type)
+        // rule is fixed here, which #4275's same-class shape already
+        // satisfies. fix #4297 (§23.1, v0.298) folds `ps->parent ==
+        // currentType_` into `isThisRootedLValueTarget` itself.
         bool propIsStatic = false;
         for (auto mod : pd->modifiers)
             if (mod == "static") { propIsStatic = true; break; }
@@ -5836,7 +6102,6 @@ void ExprTC::checkRefOutFieldOperand(FieldSymbol& fs, const ast::Expr& target,
     if (fs.posParam && fs.parent &&
         fs.parent->kind == ast::TypeDeclKind::Record) {
         bool inDeclaringCtor = inConstructor_ &&
-                               currentType_ == fs.parent &&
                                isThisRootedLValueTarget(target);
         if (!inDeclaringCtor) {
             ctx_.diagnostics().report(
@@ -5857,6 +6122,15 @@ void ExprTC::checkRefOutFieldOperand(FieldSymbol& fs, const ast::Expr& target,
     // vs per-type does not reach it, v0.270 records the case as
     // open). `checkRefOutFieldOperand` is the ref/out twin of the
     // `:=`-target `checkReadonlyAssignment` above.
+    //
+    // fix #4276 (§22.3 / §22.8, v0.298): mirrors that same-named fix's
+    // reasoning exactly — `isThisRootedLValueTarget`'s explicit-`this.F`
+    // branch does not check the field's declaring type, so a DERIVED
+    // class's constructor could bind an INHERITED readonly field to a
+    // `ref`/`out` parameter via `this.F` while the bare spelling of the
+    // identical store was already rejected. fix #4297 (§22.3/§22.8, v0.298)
+    // folds `currentType_ == fs.parent` into `isThisRootedLValueTarget`
+    // itself, so this call site no longer carries the redundant conjunct.
     if (isReadonly) {
         bool readonlyAllowed;
         if (isStatic) readonlyAllowed = inConstructor_;
@@ -6064,6 +6338,12 @@ void ExprTC::checkRefOutPropertyOperand(PropertySymbol& ps,
     // a `static readonly` auto-property the carve-out is preserved
     // (per-instance vs per-type does not reach it, v0.270 records the
     // case as open).
+    //
+    // fix #4276 (§22.3 / §23.1, v0.298): the ref/out twin of
+    // `checkPropertyWriteTarget`'s same-numbered fix. fix #4297
+    // (§22.3/§23.1, v0.298) folds `currentType_ == ps.parent` into
+    // `isThisRootedLValueTarget` itself, so this call site no longer
+    // carries the redundant conjunct.
     if (isReadonlyAuto) {
         bool propIsStatic = false;
         for (auto mod : pd->modifiers)
@@ -6117,7 +6397,7 @@ void ExprTC::checkRefOutPropertyOperand(PropertySymbol& ps,
 // forbids cycles; sema's class-graph validation slice will catch
 // them). First match wins; ambiguity resolution between sibling
 // interfaces is a separate slice.
-Symbol* ExprTC::lookupMember(TypeSymbol* type, std::string_view name) {
+Symbol* ExprTC::lookupMember(TypeSymbol* type, std::string_view name) const {
     std::vector<TypeSymbol*> frontier{type};
     std::size_t i = 0;
     while (i < frontier.size()) {
@@ -6208,8 +6488,56 @@ static bool extensionTargetMatchesReceiver(
             }
             return true;
         }
+        // fix #4168 (§26.5 rule 2, v0.298): a Function-kind TypeRef reaches
+        // this switch ONLY through the genericArgs recursion two cases above
+        // (`extensionTargetMatchesReceiver(ta, ra, freeVars)`) — never as the
+        // top-level extension TARGET itself, which §26.2 already forbids
+        // ("Function types" under "What cannot be extended") at the
+        // declaration site, long before this matcher runs. A generic
+        // ARGUMENT that happens to be a function type — `extension
+        // Array<(int) -> int>`, matching a receiver `Array<(int) -> int>` —
+        // is a completely different position §26.2's restriction says
+        // nothing about, and §26.5 rule 2 requires the receiver to unify
+        // against the declared head "exactly and structurally": the
+        // `default` arm below unconditionally answered false for this case
+        // (its own comment's "function/array/unit types are not extensible"
+        // conflated the top-level-target rule with this recursive
+        // argument-position call), so an otherwise-exact function-type
+        // generic argument could never match ANY receiver — the extension's
+        // declaration compiled clean (§26.2 permits the class-typed target
+        // `Array<T>`) but silently never resolved at any call site (#4168).
+        // Structurally compare parameter modifiers/types and the return
+        // type/`owned`-return marker — the same shape `Resolver::
+        // typeRefEqual`'s Function arm (TypeResolution_Checks.cpp) checks
+        // for ordinary type equality — but recurse through THIS function
+        // (not typeRefEqual) so a free type variable nested inside a
+        // parameter or return type (e.g. `extension Array<(T) -> T> where
+        // T: class`) still unifies against the receiver's corresponding
+        // slot, exactly like the Named-kind generic-argument recursion
+        // above. `nullable` is deliberately not compared, matching every
+        // other arm of this function (see the function's own header
+        // comment: "ignoring nullability on both sides").
+        case TypeRef::Kind::Function: {
+            if (target->funcParams.size() != recv->funcParams.size())
+                return false;
+            for (std::size_t i = 0; i < target->funcParams.size(); ++i) {
+                if (target->funcParams[i].modifier !=
+                    recv->funcParams[i].modifier)
+                    return false;
+                if (!extensionTargetMatchesReceiver(
+                        target->funcParams[i].type,
+                        recv->funcParams[i].type, freeVars))
+                    return false;
+            }
+            if (target->funcReturnOwned != recv->funcReturnOwned)
+                return false;
+            return extensionTargetMatchesReceiver(
+                target->funcReturn, recv->funcReturn, freeVars);
+        }
         default:
-            return false;  // function/array/unit types are not extensible
+            return false;  // array/unit/error types are not extensible, and
+                            // never arise as a generic-argument position a
+                            // real receiver's TypeRef would carry either.
     }
 }
 
@@ -6338,6 +6666,40 @@ static std::vector<const TypeRef*> builtinInterfaceAncestorsOf(
         const_cast<std::vector<TypeRef*>&>(recv->genericArgs), owned);
 }
 
+// fix #4183 (§14.5 phase 1, §26.5, v0.296/v0.298): see the header comment
+// (ExprTypecheck_impl.hpp). Exposes builtinInterfaceAncestorsOf (this TU's
+// internal-linkage §26.5 table) to unifyArgSubst (ExprTypecheck_Calls.cpp),
+// filtered to entries matching `ifaceName` — the builtin-hierarchy analogue
+// of collectAncestorInstantiationsOf above, which handles only
+// TypeSymbol-declaration-bearing (user) types.
+void ExprTC::collectBuiltinAncestorInstantiationsOf(
+    const TypeRef* classTy, std::string_view ifaceName,
+    std::vector<TypeRef*>& out, std::vector<std::unique_ptr<TypeRef>>& owned) {
+    if (!classTy || classTy->kind != TypeRef::Kind::Named ||
+        classTy->declaration || ifaceName.empty())
+        return;
+    // `classTy` itself may already BE the target (`Array<T>` queried for
+    // `"Array"`) — mirrors collectAncestorInstantiationsOf's own
+    // `d == ifaceDecl` check on the BFS's starting node.
+    auto pushDeduped = [&](TypeRef* cand) {
+        // The builtin hierarchy table has diamonds (e.g. IList reaches
+        // IReadOnlyCollection via BOTH IReadOnlyList and ICollection) that
+        // its own BFS (builtinInterfaceAncestors) does not dedupe — matching
+        // collectAncestorInstantiationsOf's own "deduplicated only by
+        // structural identity" contract keeps a genuine diamond (the SAME
+        // instantiation reached twice) from spuriously looking like the
+        // spec's "reaches more than one [DISTINCT] instantiation" case.
+        for (TypeRef* existing : out)
+            if (typeRefEqual(existing, cand)) return;
+        out.push_back(cand);
+    };
+    if (namedTypeSimpleName(classTy) == ifaceName)
+        pushDeduped(const_cast<TypeRef*>(classTy));
+    for (const TypeRef* anc : builtinInterfaceAncestorsOf(classTy, owned))
+        if (namedTypeSimpleName(anc) == ifaceName)
+            pushDeduped(const_cast<TypeRef*>(anc));
+}
+
 // §5.1/§12.9 (#1851): the arity-1 BORROWING-collection builtin generics whose
 // COMPLETE generic-interface set is captured by builtinInterfaceAncestors above
 // — the concrete borrowing collections (each implements exactly one collection
@@ -6449,6 +6811,55 @@ static bool typeArgSameBase(const TypeRef* a, const TypeRef* b) {
     return false;
 }
 
+// §14.1 / §14.5 phase 1 (issue #1180, #4199): true when `t` is a FREE generic
+// type-parameter reference IN `freeNames` — a Named TypeRef with no resolved
+// declaration, no generic arguments of its own, a non-empty name, AND that
+// name present in the caller-supplied `freeNames` set.
+//
+// ⚠ NEEDS-FIX correction (review round 1, #4199): an earlier version of this
+// predicate tested SHAPE ALONE (Named + null declaration + no generic args),
+// on the theory that "a bare Named type with a null declaration can only be
+// [a rigid type-parameter reference] — an unresolved ordinary identifier
+// would already have been rejected by name resolution". That reasoning is
+// false, and `isFullyGroundTypeRef`'s own comment a few hundred lines above
+// already says so: "A `Named` TypeRef with `declaration == nullptr` is a
+// rigid type-parameter reference ... OR a null-declaration stdlib builtin;
+// BOTH are treated as non-ground" — `TypeResolution_Names.cpp`'s
+// always-available-builtins table resolves ~50 names (`Task`, `Exception`,
+// `IDisposable`, `Mutex`, `DateTime`, ...) to EXACTLY that shape. The
+// shape-only version silently treated `Box<Box<Task>>`'s `Task` as an
+// unbound method type parameter and accepted it against `Box<Box<int>>` —
+// sema wrongly admits the call, and codegen crashes with an IR verification
+// failure (a real reject became an ICE). MEASURED, `628c4c5` vs the
+// shape-only fix: `TakesBoxBoxTask(b: Box<Box<Task>>)` called with
+// `Box<Box<int>>` correctly rejects pre-fix (clean §5.1 diagnostic) and was
+// wrongly accepted by the shape-only fix.
+//
+// Ground truth instead: `freeNames` is populated by the CALLER from an
+// actual declaration's generic parameters (`ExprTC::currentScopeGenericParamNames`
+// for an enclosing-scope rigid parameter, or the callee method's own
+// `genericParams` at a call-argument check — see `checkArgsAgainstParams`),
+// never inferred from a TypeRef's own shape. A null-declaration builtin
+// never appears in either set, so it is never misclassified as free.
+//
+// Free variables accept any binding without variance or identity restriction
+// here — the only constraint on what they may bind to is enforced at the call
+// site (§14.5's own Agreement rule via `unifyArgSubst`'s conflict detection,
+// and the §14.2 constraint check after inference completes), not by this
+// assignability walk. Extracted so every site that needs this recognition
+// shares ONE definition (LANE_RULES §6) rather than growing a second,
+// drifting spelling — `variantGenericAssignable`'s per-argument loop below
+// used to inline this same test.
+static bool isFreeGenericTypeVarRef(
+    const TypeRef* t, const std::unordered_set<std::string_view>* freeNames) {
+    if (!t || t->kind != TypeRef::Kind::Named || t->declaration ||
+        !t->genericArgs.empty())
+        return false;
+    if (!freeNames) return false;
+    std::string_view nm = namedTypeSimpleName(t);
+    return !nm.empty() && freeNames->count(nm) > 0;
+}
+
 // §12.9: recursive type-argument IDENTITY. Two arguments are identical when
 // their bases match (typeArgSameBase) AND every nested generic argument is
 // identical, component-wise. This is the only relation an INVARIANT position
@@ -6463,20 +6874,44 @@ static bool typeArgSameBase(const TypeRef* a, const TypeRef* b) {
 // Recurse into those components directly so e.g. `Box<[3]Array<int>>` is
 // distinct from `Box<[3]Array<string>>` and `Box<(int)->int>` from
 // `Box<(string)->int>` (per §5.1 identity and §15.1 "size is part of the type").
-static bool typeArgIdentical(const TypeRef* a, const TypeRef* b) {
+//
+// fix #4199 (§14.5 phase 1, v0.298): "a constructed parameter type
+// G<P1,…,Pn> unifies component-wise" is a RECURSIVE rule — a nested
+// constructed argument (`Box<Box<T>>`) unifies its own nested constructed
+// argument (`Box<T>`) the same way, arbitrarily deep. This function is the
+// recursion that carries out that component-wise walk for an INVARIANT
+// (record/class) position, but before this fix it had no knowledge of a free
+// type-parameter reference at any depth past the immediate caller
+// (`variantGenericAssignable`'s own loop, which tested only its OWN
+// `to->genericArgs[i]` slot). So `Box<Box<T>>` vs `Box<Box<int>>` recursed
+// one level structurally (Box vs Box, fine) and then reached THIS function
+// comparing `Box<T>` against `Box<int>` — itself not a free reference (it is
+// a compound type) — which recursed again into `typeArgIdentical(T, int)`,
+// where `typeArgSameBase` rejected on a bare Kind mismatch (Named vs
+// Primitive) before ever asking whether `T` was a free variable. A single
+// level of nesting (`Box<T>` vs `Box<int>`) never reached this function at
+// all — `variantGenericAssignable`'s own top-level loop already saw the bare
+// `T` and skipped it — which is why one level worked and two did not.
+static bool typeArgIdentical(
+    const TypeRef* a, const TypeRef* b,
+    const std::unordered_set<std::string_view>* freeNames) {
     if (!a || !b) return a == b;
+    if (isFreeGenericTypeVarRef(a, freeNames) ||
+        isFreeGenericTypeVarRef(b, freeNames))
+        return true;
     if (!typeArgSameBase(a, b)) return false;
     if (a->kind == TypeRef::Kind::InlineArray)
-        return typeArgIdentical(a->arrayElement, b->arrayElement);
+        return typeArgIdentical(a->arrayElement, b->arrayElement, freeNames);
     if (a->kind == TypeRef::Kind::Function) {
         for (std::size_t i = 0; i < a->funcParams.size(); ++i)
-            if (!typeArgIdentical(a->funcParams[i].type, b->funcParams[i].type))
+            if (!typeArgIdentical(a->funcParams[i].type, b->funcParams[i].type,
+                                  freeNames))
                 return false;
-        return typeArgIdentical(a->funcReturn, b->funcReturn);
+        return typeArgIdentical(a->funcReturn, b->funcReturn, freeNames);
     }
     if (a->genericArgs.size() != b->genericArgs.size()) return false;
     for (std::size_t i = 0; i < a->genericArgs.size(); ++i)
-        if (!typeArgIdentical(a->genericArgs[i], b->genericArgs[i]))
+        if (!typeArgIdentical(a->genericArgs[i], b->genericArgs[i], freeNames))
             return false;
     return true;
 }
@@ -6499,10 +6934,11 @@ static bool typeArgIdentical(const TypeRef* a, const TypeRef* b) {
 // Returns false on a genuine mismatch; the caller reports the §5.1 error.
 static bool typeArgCovariantAssignable(
     const TypeRef* fromArg, const TypeRef* toArg,
-    bool (*isSubtypeFn)(TypeSymbol*, TypeSymbol*)) {
+    bool (*isSubtypeFn)(TypeSymbol*, TypeSymbol*),
+    const std::unordered_set<std::string_view>* freeNames) {
     if (!fromArg || !toArg) return fromArg == toArg;
     // Identity (recursive) is always a legal conversion.
-    if (typeArgIdentical(fromArg, toArg)) return true;
+    if (typeArgIdentical(fromArg, toArg, freeNames)) return true;
     // §12.9 L1592: a value-typed argument admits no variant conversion — only
     // identity (already ruled out). Checked before the Object root so
     // `IEnumerable<int>` is NOT covariantly assignable to `IEnumerable<Object>`.
@@ -6519,7 +6955,7 @@ static bool typeArgCovariantAssignable(
     // variantGenericAssignable, which reads the declared/hardcoded variance and
     // requires argument identity for an invariant base (e.g. Array).
     if (typeArgSameBase(fromArg, toArg))
-        return variantGenericAssignable(fromArg, toArg, isSubtypeFn);
+        return variantGenericAssignable(fromArg, toArg, isSubtypeFn, freeNames);
     // Different base, both builtin: `fromArg`'s base must reference-convert to
     // `toArg`'s base via the builtin interface hierarchy (e.g.
     // Array<Dog>→IEnumerable<Dog>). Find the ancestor whose base matches
@@ -6533,7 +6969,8 @@ static bool typeArgCovariantAssignable(
         std::vector<std::unique_ptr<TypeRef>> owned;
         for (const TypeRef* anc : builtinInterfaceAncestorsOf(fromArg, owned))
             if (namedTypeSimpleName(anc) == toName)
-                return variantGenericAssignable(anc, toArg, isSubtypeFn);
+                return variantGenericAssignable(anc, toArg, isSubtypeFn,
+                                                freeNames);
         return false;
     }
     // Different base, both user-declared: the base must be a subtype. Recursing
@@ -6651,7 +7088,8 @@ bool ExprTC::userTypeImplementsBuiltinIface(TypeRef* from,
 //      conservatively-accepted residual (deferred to the full §12.9 milestone).
 static bool variantGenericAssignable(
     const TypeRef* from, const TypeRef* to,
-    bool (*isSubtypeFn)(TypeSymbol*, TypeSymbol*)) {
+    bool (*isSubtypeFn)(TypeSymbol*, TypeSymbol*),
+    const std::unordered_set<std::string_view>* freeNames) {
     if (!from || !to) return true;
     if (from->kind != TypeRef::Kind::Named ||
         to->kind != TypeRef::Kind::Named) return true;
@@ -6717,21 +7155,17 @@ static bool variantGenericAssignable(
         if (!fromArg || !toArg) continue;  // conservative skip on unresolved
 
         // §14.1 (issue #1180): a Named TypeRef with null declaration and no
-        // genericArgs is a free type variable (generic method/type parameter
-        // like A, B, T). Free variables accept any binding without variance
-        // restriction — the only constraint is the concrete substitution, which
-        // is enforced at the call site, not here.
-        {
-            bool toArgFree = toArg->kind == TypeRef::Kind::Named &&
-                             !toArg->declaration &&
-                             toArg->genericArgs.empty() &&
-                             !namedTypeSimpleName(toArg).empty();
-            bool fromArgFree = fromArg->kind == TypeRef::Kind::Named &&
-                               !fromArg->declaration &&
-                               fromArg->genericArgs.empty() &&
-                               !namedTypeSimpleName(fromArg).empty();
-            if (toArgFree || fromArgFree) continue;
-        }
+        // genericArgs, whose NAME is in `freeNames` (ground truth — see
+        // `isFreeGenericTypeVarRef`'s comment, #4199 NEEDS-FIX round 1), is a
+        // free type variable (generic method/type parameter like A, B, T).
+        // Free variables accept any binding without variance restriction —
+        // the only constraint is the concrete substitution, which is enforced
+        // at the call site, not here. Shared with `typeArgIdentical`'s own
+        // recursion via `isFreeGenericTypeVarRef`, rather than this loop being
+        // the only place that recognised the shape.
+        if (isFreeGenericTypeVarRef(toArg, freeNames) ||
+            isFreeGenericTypeVarRef(fromArg, freeNames))
+            continue;
 
         // Determine variance of `to`'s i-th parameter.
         std::string_view variance;
@@ -6763,16 +7197,18 @@ static bool variantGenericAssignable(
             // recursively through nested generic arguments (§12.9 — a nested
             // invariant base such as Array requires argument identity, so
             // `IEnumerable<Array<Dog>>` does NOT admit `IEnumerable<Array<Animal>>`).
-            ok = typeArgCovariantAssignable(fromArg, toArg, isSubtypeFn);
+            ok = typeArgCovariantAssignable(fromArg, toArg, isSubtypeFn,
+                                            freeNames);
         } else if (variance == "in") {
             // Contravariant: toArg must reference-convert to fromArg (operands
             // swapped), same recursive composition.
-            ok = typeArgCovariantAssignable(toArg, fromArg, isSubtypeFn);
+            ok = typeArgCovariantAssignable(toArg, fromArg, isSubtypeFn,
+                                            freeNames);
         } else {
             // Invariant (or unknown variance): recursive argument identity —
             // NOT a shallow same-base check, which would ignore nested args and
             // treat `Array<Dog>` as identical to `Array<Animal>` (§12.9).
-            ok = typeArgIdentical(fromArg, toArg);
+            ok = typeArgIdentical(fromArg, toArg, freeNames);
         }
 
         if (!ok) return false;
@@ -6859,8 +7295,16 @@ bool ExprTC::typeTestGenericInstantiationImpossible(const TypeRef* scrutTy,
     // contravariance handled by variantGenericAssignable; a rigid/free type
     // parameter is treated as compatible, so a rigid scrutinee is never
     // over-rejected — a type pattern is tested per instantiation, §19.3 v0.182).
-    if (variantGenericAssignable(a, b, isSubtype) ||
-        variantGenericAssignable(b, a, isSubtype))
+    // fix #4199 (NEEDS-FIX round 1): the "rigid/free type parameter" is now
+    // ground-truthed against `currentScopeGenericParamNames()` (this method's
+    // and enclosing type's own declared params), not any Named TypeRef with a
+    // null declaration — the prior shape-only test also matched null-
+    // declaration stdlib builtins (`Task`, `Exception`, ...), which are never
+    // "rigid" here.
+    std::unordered_set<std::string_view> freeNames =
+        currentScopeGenericParamNames();
+    if (variantGenericAssignable(a, b, isSubtype, &freeNames) ||
+        variantGenericAssignable(b, a, isSubtype, &freeNames))
         return false;
     return true;  // provably incompatible instantiation — reject
 }
@@ -6992,9 +7436,13 @@ bool ExprTC::typeTestInterfaceInstantiationImpossible(const TypeRef* scrutTy,
     // Provably impossible iff NONE does: a FINAL class means no subclass can
     // supply another instantiation, so no value of the scrutinee type can be a
     // `patTy`, and the erased test would bind at a wrong static type.
+    // fix #4199 (NEEDS-FIX round 1): ground-truthed free-variable set, see
+    // `typeTestGenericInstantiationImpossible`'s identical note above.
+    std::unordered_set<std::string_view> freeNames =
+        currentScopeGenericParamNames();
     for (TypeRef* impl : impls)
-        if (variantGenericAssignable(impl, scrutTy, isSubtype) ||
-            variantGenericAssignable(scrutTy, impl, isSubtype))
+        if (variantGenericAssignable(impl, scrutTy, isSubtype, &freeNames) ||
+            variantGenericAssignable(scrutTy, impl, isSubtype, &freeNames))
             return false;  // a compatible implementation exists — admit
     return true;  // every implemented instantiation is incompatible — reject
 }
@@ -7356,9 +7804,13 @@ ExprTC::IfaceBindReject ExprTC::typeTestInterfaceBindAmbiguous(
         collectAncestorInstantiationsOf(patTy, sd, concImpls);
         if (concImpls.empty())
             return IfaceBindReject::None;  // doesn't implement `I` — #1920's job.
+        // fix #4199 (NEEDS-FIX round 1): ground-truthed free-variable set, see
+        // `typeTestGenericInstantiationImpossible`'s identical note above.
+        std::unordered_set<std::string_view> freeNames =
+            currentScopeGenericParamNames();
         for (TypeRef* impl : concImpls)
-            if (variantGenericAssignable(impl, scrutTy, isSubtype) ||
-                variantGenericAssignable(scrutTy, impl, isSubtype))
+            if (variantGenericAssignable(impl, scrutTy, isSubtype, &freeNames) ||
+                variantGenericAssignable(scrutTy, impl, isSubtype, &freeNames))
                 return IfaceBindReject::None;  // conforms — LIVE + precise, admit.
         return IfaceBindReject::Unreachable;   // DEAD arm.
     }
@@ -7654,34 +8106,37 @@ static bool typeNamesFreeVar(
     return false;
 }
 
-// §26.5 (#773): true when an extension method's parameter types, return
-// type, or own generic constraints reference a free type variable of the
-// extension — the case whose codegen substitution is deferred for
-// user-declared extension targets (see lookupExtensionMember). For
-// builtin-target extensions (§26.5 #714), the binding-and-codegen path is
-// now implemented, so this check is not applied.
+// §26.5 (#3672; narrowed by fix #4233, §26.4/§26.5, v0.298): true when an
+// extension method's OWN generic constraints (NOT its parameter or return
+// types — see #4233 below) reference a free type variable of the extension.
 //
-// fix #3672 (§26.4/§26.5, v0.286): every Type-shape question here routes
-// through `typeNamesFreeVar` — the single both-sources `ast::Type` walker —
-// rather than re-testing shapes locally; this function only enumerates
-// WHERE in an `ast::MethodDecl` a `Type` can occur. `genericConstraints` is
-// the addition: a method's own type-bound constraint (`where U: T`, §14.2
-// "Type-parameter bounds") can name the extension's free var as the bound
-// even when neither the return type nor any parameter does (e.g. `method
-// Foo<U>(): int where U: T`). Before this fix such a method was NOT
-// deferred — `Foo<Z>()` compiled and ran on a `Bag<W>` receiver with no
-// diagnostic even though `Z` does not satisfy `T`'s receiver-bound
-// instantiation (`W`), because the constraint-satisfaction check has no
-// concrete type to check `Z` against when the bound is an unresolved free
-// var. That is exactly the #773 deferred case, silently NOT deferred: this
-// closes a silent-accept gap, not a LOUD->QUIET regression (see the
-// `ExtSignatureFreeVar3672` sema tests for the FAIL-WITHOUT/PASS-WITH pin).
-static bool extSignatureUsesFreeVar(
+// A method-level type-bound constraint (`where U: T`, §14.2 "Type-parameter
+// bounds") can name the extension's free var as the bound (`method Foo<U>():
+// int where U: T`). Admitting such a candidate needs
+// `checkMethodGenericConstraints` (the call-site §14.2 enforcement,
+// ExprTypecheck_Calls.cpp) to substitute the extension's concrete binding
+// into the bound before checking the call's actual type argument against
+// it — that substitution does not exist, so admitting the candidate would
+// silently skip the constraint check entirely: `b.Foo<Z>()` on a `Bag<W>`
+// receiver, where `Z` does not satisfy `T`'s receiver-bound instantiation
+// (`W`), would compile and run with no diagnostic (#3672's own false-accept;
+// `ExtSignatureFreeVar3672` sema tests pin this deferral).
+//
+// fix #4233: this predicate USED TO also cover a param/return-type mention
+// of the free var (e.g. `Test(x: W): int`) and defer those too, for
+// user-declared extension targets only (`lookupExtensionMember`'s
+// `!targetIsBuiltin` gate) — #773's original scope. That half was stale:
+// #714 already made the free-var BINDING (`exprExtBinding`) drive return-type
+// substitution (`resolveExtensionMember`) and codegen's `genericSubst_`
+// unconditionally, regardless of whether the target is builtin, and #4233
+// completes the picture by substituting the SAME binding into parameter
+// types before the per-argument assignability check
+// (`checkArgsAgainstParams`, ExprTypecheck_Calls.cpp). So a param/return
+// mention is now fully resolved and checked, not deferred; only the
+// genuinely-still-unimplemented own-constraint case above remains.
+static bool extMethodOwnConstraintUsesFreeVar(
     const ast::MethodDecl* md,
     const std::unordered_set<std::string_view>& freeVars) {
-    if (typeNamesFreeVar(md->returnType.get(), freeVars)) return true;
-    for (const auto& p : md->params)
-        if (typeNamesFreeVar(p.type.get(), freeVars)) return true;
     for (const auto& gc : md->genericConstraints)
         for (const auto& item : gc.items)
             if (typeNamesFreeVar(item.typeArg.get(), freeVars)) return true;
@@ -8084,12 +8539,18 @@ Symbol* ExprTC::lookupExtensionMember(
             extWhereClauseProvablyViolated(*decl, binding))
             continue;
         // Determine whether the extension target is a builtin (null-decl) type.
-        // For builtin-target extensions (e.g. `extension IEnumerable<T>`), the
-        // full binding-and-codegen path is implemented (#714). For user-declared
-        // extension targets (e.g. `extension Bag<T> where T: class`), methods
-        // whose SIGNATURES use the free type variable are still deferred (#773):
-        // skip them so the lookup falls through to a clean diagnostic rather than
-        // generating type-mismatched IR.
+        // fix #4233 (§26.4/§26.5, v0.298): a param/return mention of the
+        // extension's free var used to be deferred here too, for
+        // user-declared targets only — #773's original scope, stale since
+        // #714 made the free-var BINDING (not target-builtin-ness) drive
+        // substitution unconditionally (see `extMethodOwnConstraintUsesFreeVar`'s
+        // comment for the measured evidence: the builtin path already both
+        // resolves AND, pre-fix, silently mis-accepted a wrongly-typed
+        // argument into an IR-verifier crash — `checkArgsAgainstParams` below
+        // now substitutes the binding into parameter types for BOTH target
+        // kinds, closing that gap generically). `targetIsBuiltin` is kept only
+        // to scope the one deferral that remains genuine (§3672's own-generic-
+        // constraint case), matching that fix's original, unwidened scope.
         bool targetIsBuiltin =
             target && target->kind == TypeRef::Kind::Named && !target->declaration;
         for (Symbol* m : ext->members) {
@@ -8105,14 +8566,16 @@ Symbol* ExprTC::lookupExtensionMember(
                     continue;
             }
             if (!freeVars.empty() && !targetIsBuiltin) {
-                // User-declared generic extension (#773): skip methods whose
-                // signatures reference a free type variable — that case is
-                // deferred. Methods that do NOT use the free var in their
-                // signatures (e.g. `IsEmpty(): bool` on a `Bag<T>`) are fine.
+                // fix #3672 (§26.4/§26.5, v0.286, UNCHANGED by #4233): a
+                // method whose OWN generic constraint (not its param/return
+                // types — those are handled generically now, see #4233's
+                // comment above) references the extension's free var as a
+                // bound is still deferred.
                 if (auto* ms = dynamic_cast<MethodSymbol*>(m)) {
                     if (auto* md =
                             dynamic_cast<const ast::MethodDecl*>(ms->decl)) {
-                        if (extSignatureUsesFreeVar(md, freeVars)) continue;
+                        if (extMethodOwnConstraintUsesFreeVar(md, freeVars))
+                            continue;
                     }
                 }
             }
@@ -11073,6 +11536,65 @@ void ExprTC::visitTopDecl(const ast::TopDecl& d) {
                     "`operator " + std::string(od->opToken) + "` (§26.3)");
                 continue;
             }
+            // fix #4204 (§22.16 "Contract clauses" / "Scope", Appendix A.4
+            // `ExtensionMember` grammar, v0.298): an extension block may not
+            // declare an `invariant` member — third instance of the bug class
+            // fix #4115 (enum/choice) and fix #4186 (record/static-class)
+            // closed. §22.16 opens by scoping the member to a *class* body
+            // ("a class body may declare invariant members") and its own
+            // "Scope" subsection states directly, in the record/enum-methods
+            // parenthetical, that "the *invariant* member is class-only" — an
+            // extension body is not a class body. Appendix A.4 confirms it
+            // structurally, independent of §22.16's prose:
+            //   ExtensionMember ::= MethodDecl | ExpressionPropertyDecl
+            // `InvariantDecl` is not one of the two alternatives — this is
+            // not a gap the spec left open, unlike the "no invariant" bullet
+            // list in §22.16's "Out of scope in this revision", which never
+            // had occasion to mention extensions at all. `invariant` reaches
+            // this loop only because `Parser::parseExtensionDecl` calls the
+            // general `parseMember()` (the shared-production over-admission
+            // Appendix A's preamble names) instead of a dedicated
+            // extension-only parse function — same over-admission Appendix
+            // A's preamble already indexes for other body kinds, closed here
+            // semantically rather than by narrowing the parser, matching the
+            // project's existing choice for records/static-classes (#4186)
+            // over rewriting `parseExtensionDecl` to a dedicated member
+            // parser mirroring `parseInterfaceMember`'s shape — a
+            // significantly larger, higher-blast-radius change for the same
+            // outcome.
+            //
+            // Placed here — the existing §26.3 per-member restriction loop —
+            // rather than as a new free-standing Resolver pass (the shape
+            // fix #4115/#4186 used): `Resolver::forEachTypeAndNested`
+            // (NestedTypeWalk.hpp) deliberately never visits an
+            // `ExtensionSymbol` (it is not a `TypeSymbol`), so a
+            // `checkExtensionInvariantMembers`-style pass would have to
+            // invent its own `module()->children` walk from scratch — a
+            // THIRD hand-rolled "walk members, dynamic_cast InvariantDecl,
+            // report" spelling of the same decision (CLAUDE.md §6). This
+            // loop already walks `ext->members` and already rejects one
+            // other flat-out-forbidden AST member kind (`OperatorDecl`,
+            // just above) with the identical shape, so extending it is the
+            // one-spelling answer rather than a second walking mechanism.
+            //
+            // `invariant` clauses are not modeled as a `Symbol` subclass at
+            // all (`SymbolCollection::collectMemberImpl` has no
+            // `ast::InvariantDecl` arm and returns null for it — "Unknown
+            // Member kind" — same root cause as #4115/#4186), so
+            // `ExtensionSymbol::members` never carries one either; only the
+            // raw AST (`ext->members`, already in hand here) can see it.
+            // `continue`s before `visitMember` ever sees an AST node with no
+            // backing `Symbol`.
+            if (auto* inv = dynamic_cast<const ast::InvariantDecl*>(m.get())) {
+                ctx_.diagnostics().report(
+                    Severity::Error, inv->loc,
+                    "an extension block may not declare an `invariant` "
+                    "member — §22.16 scopes invariant members to class "
+                    "bodies, and Appendix A.4's `ExtensionMember` grammar "
+                    "admits only methods and expression-bodied properties "
+                    "(§26.3)");
+                continue;
+            }
             // §26.3 (v0.183, #1581): an extension block may not declare a
             // `static` member. An extension block adds receiver-directed
             // members only; statics resolve against the extended type's own
@@ -11105,6 +11627,54 @@ void ExprTC::visitTopDecl(const ast::TopDecl& d) {
                     continue;
                 }
             }
+            // fix #4228 (§26.3, v0.298): "No `virtual`, `override`,
+            // `abstract`, or `sealed` — extensions are statically
+            // dispatched." Same shape as the `static` check just above (and
+            // its own §26.3 rationale bullet a few lines up in the same
+            // section): an extension block has no declaring class and no
+            // inheritance, so a `VirtualKind` modifier denotes nothing
+            // meaningful on an extension member. A.4's shared `MethodDecl`/
+            // `PropertyDecl` productions admit `VirtualKind?` unconditionally
+            // (`Visibility "static"? "async"? VirtualKind? "method" ...` /
+            // `Visibility "static"? VirtualKind? "readonly"? "property" ...`)
+            // — the grammar over-admits and this bullet is rejected
+            // semantically, exactly the split the `static` check above and
+            // `ExtensionMember`'s own A.4 comment already document for
+            // `static`. Before this fix nothing read this slot at all: a
+            // `virtual`/`override`/`abstract`/`sealed override` extension
+            // method or expression-bodied property compiled clean, linked,
+            // and ran (measured: exit 0, zero diagnostics, on all 4
+            // spellings x {method, expression-bodied property} = 8 rows).
+            {
+                const std::vector<std::string_view>* mods = nullptr;
+                SourceLocation loc{};
+                if (auto* md = dynamic_cast<const ast::MethodDecl*>(m.get())) {
+                    mods = &md->modifiers; loc = md->span.begin;
+                } else if (auto* pd =
+                               dynamic_cast<const ast::PropertyDecl*>(m.get())) {
+                    mods = &pd->modifiers; loc = pd->span.begin;
+                }
+                std::string_view virtualKindMod;
+                if (mods) {
+                    for (auto mod : *mods) {
+                        if (mod == "virtual" || mod == "override" ||
+                            mod == "abstract" || mod == "sealed") {
+                            virtualKindMod = mod;
+                            break;
+                        }
+                    }
+                }
+                if (!virtualKindMod.empty()) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, loc,
+                        "an extension member may not be declared `" +
+                        std::string(virtualKindMod) + "` — extensions are "
+                        "statically dispatched; no `virtual`, `override`, "
+                        "`abstract`, or `sealed` modifier is admitted on an "
+                        "extension member (§26.3)");
+                    continue;
+                }
+            }
             // §26.3 (#1346, v0.160): extension members must be `public` or
             // `internal`; `protected` and `private` are compile errors — an
             // extension block has no declaring class and no inheritance, so
@@ -11132,7 +11702,34 @@ void ExprTC::visitTopDecl(const ast::TopDecl& d) {
             // §26.3 (#1346, v0.160): extension properties are expression-bodied
             // only (`property Name: Type => expr;`); the block-accessor and
             // auto-property forms are not admitted in extension blocks.
+            //
+            // fix #4213 (§26.3 "No indexers.", Appendix A.4, v0.298): an
+            // indexer parses as a `PropertyDecl` with `isIndexer` set (the
+            // `[ParamList]`/`this[ParamList]` name-position alternative,
+            // Parser_Decls.cpp's `isKeyword("property")` arm) rather than as
+            // its own AST node — A.4 has no distinct `IndexerDecl` struct.
+            // Checked FIRST, ahead of the body-kind check just below: an
+            // indexer can be expression-bodied (`property [i: int]: int =>
+            // i;`), which would otherwise sail through that check and reach
+            // `visitMember`, where it was measured (this issue's repro) to
+            // fail downstream with a confusing "unresolved identifier `i`"
+            // instead of naming the real §26.3 rule. `ExtensionMember`'s
+            // second alternative is `ExpressionPropertyDecl`, whose own A.4
+            // production (`Visibility "pure"? "readonly"? "property"
+            // Identifier ":" Type "=>" Expression ";"`) takes a plain
+            // `Identifier`, never the indexer's `"[" ParamList "]"` form —
+            // so an indexer is excluded by the grammar independent of
+            // §26.3's explicit "No indexers." bullet.
             if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(m.get())) {
+                if (pd->isIndexer) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, pd->span.begin,
+                        "an extension block may not declare an indexer — "
+                        "§26.3's restriction list is explicit (\"No "
+                        "indexers.\"); declare the indexer on the extended "
+                        "type's own declaration instead (§26.3)");
+                    continue;
+                }
                 if (pd->bodyKind != ast::PropertyBodyKind::Expression) {
                     std::string_view formName =
                         (pd->bodyKind == ast::PropertyBodyKind::Block)
@@ -11145,6 +11742,118 @@ void ExprTC::visitTopDecl(const ast::TopDecl& d) {
                         " form is not admitted in extension blocks (§26.3)");
                     continue;
                 }
+            }
+            // fix #4213 (§26.3, Appendix A.4 `ExtensionMember` grammar,
+            // v0.298): default-deny catch-all for every remaining `Member`
+            // alternative. A.4's `Member` production currently lists eleven
+            // forms (`FieldDecl | MethodDecl | PropertyDecl | IndexerDecl |
+            // ConstructorDecl | DestructorDecl | OperatorDecl |
+            // NestedTypeDecl | ConstDecl | PolymorphicMember |
+            // InvariantDecl`), but `ExtensionMember ::= MethodDecl |
+            // ExpressionPropertyDecl` admits only two. Fix #4204 closed the
+            // `InvariantDecl` gap with a dedicated arm above (its own review
+            // found the loop checked only 4 of the (then-)9 non-
+            // `ExtensionMember` alternatives); this issue's own repro found
+            // FieldDecl and ConstDecl silently admitted with zero
+            // diagnostics, and measuring the rest turned up
+            // ConstructorDecl reaching a SIGSEGV in codegen
+            // (`Emitter::emitImplicitBase`, LlvmBackend_Setup.cpp) rather
+            // than a clean rejection, plus DestructorDecl and
+            // NestedTypeMember (the AST wrapper for `NestedTypeDecl`, A.4:
+            // `NestedTypeDecl ::= ClassDecl | InterfaceDecl | RecordDecl |
+            // EnumDecl`) both silently admitted too — five more per-kind
+            // arms with the identical shape as OperatorDecl/InvariantDecl
+            // above. A sixth near-duplicate arm was written and then
+            // discarded for `PolymorphicMember`: it has no AST `Member`
+            // subclass at all (A.4's `PolymorphicMember` clause mutates the
+            // enclosing `TypeDecl::serializedClass` directly,
+            // Parser_Decls.cpp's `parsePolymorphicMember`) and is reachable
+            // only from `parseTypeDeclBody`'s class/record member loop, never
+            // from the `parseMember()` this extension body's loop calls
+            // (`Parser::parseExtensionDecl`) — so `polymorphic(...)` inside
+            // an extension already fails to parse (measured: cascading
+            // "expected member visibility ... or member-kind keyword"
+            // errors) before any AST `Member` node exists to check here; it
+            // was REFUTED as a silent-admission instance of this bug, though
+            // its cascading parse-error diagnostics are their own quality
+            // gap (issue filed separately). Given a sixth near-duplicate
+            // arm would not even have a node to match against, and the
+            // five that would compile are exactly as `dynamic_cast`-shaped
+            // as the two arms already here, this closes the class instead:
+            // anything that is not a `MethodDecl` and not a (by this point
+            // in the loop, guaranteed non-indexer, expression-bodied)
+            // `PropertyDecl` is inadmissible per the grammar's closed
+            // two-alternative list, independent of which concrete kind it
+            // is — including a future twelfth `Member` alternative, which a
+            // per-kind allowlist would silently admit exactly as it did
+            // here for six releases.
+            if (!dynamic_cast<const ast::MethodDecl*>(m.get()) &&
+                !dynamic_cast<const ast::PropertyDecl*>(m.get())) {
+                // Default label/note for any `Member` kind this arm has no
+                // dedicated case for below (a genuinely unenumerable
+                // fallback — every A.4 alternative this revision defines
+                // DOES have a case: `EventDecl` is the one live example,
+                // handled explicitly just below rather than falling
+                // through to this generic text, since "a `member` member"
+                // reads badly and `EventDecl` is real reachable syntax
+                // (`public event Foo: int;` inside an extension body,
+                // measured admitted with zero diagnostics pre-fix — even
+                // though `EventDecl` is not itself part of A.4's `Member`
+                // production in this spec revision, a separate,
+                // out-of-#4213-scope discrepancy). This text is reached
+                // only for a genuinely future `Member` alternative.
+                std::string_view kind = "unsupported";
+                std::string_view note =
+                    "Appendix A.4's `ExtensionMember` grammar admits only "
+                    "methods and expression-bodied properties";
+                if (dynamic_cast<const ast::FieldDecl*>(m.get())) {
+                    kind = "field";
+                    note = "§26.3's restriction list is explicit (\"No "
+                           "fields, auto-properties, constructors, "
+                           "destructors, or `owned` fields.\")";
+                } else if (dynamic_cast<const ast::ConstructorDecl*>(
+                               m.get())) {
+                    kind = "constructor";
+                    note = "§26.3's restriction list is explicit (\"No "
+                           "fields, auto-properties, constructors, "
+                           "destructors, or `owned` fields.\"); an "
+                           "extension has no storage of its own to "
+                           "initialize";
+                } else if (dynamic_cast<const ast::DestructorDecl*>(
+                               m.get())) {
+                    kind = "destructor";
+                    note = "§26.3's restriction list is explicit (\"No "
+                           "fields, auto-properties, constructors, "
+                           "destructors, or `owned` fields.\"); an "
+                           "extension adds no storage for a destructor to "
+                           "release";
+                } else if (dynamic_cast<const ast::ConstDecl*>(m.get())) {
+                    kind = "const";
+                    note = "§26.3's first bullet is exhaustive (\"Only "
+                           "methods and computed read-only properties.\")";
+                } else if (dynamic_cast<const ast::NestedTypeMember*>(
+                               m.get())) {
+                    kind = "nested type";
+                    note = "§26.3's first bullet is exhaustive (\"Only "
+                           "methods and computed read-only properties.\")";
+                } else if (dynamic_cast<const ast::EventDecl*>(m.get())) {
+                    kind = "event";
+                    note = "§26.3's first bullet is exhaustive (\"Only "
+                           "methods and computed read-only properties.\")";
+                }
+                // "a"/"an" per `kind`'s leading sound — only "event" and
+                // the "unsupported" fallback start with a vowel sound
+                // among the kinds this arm produces.
+                const char* article =
+                    (kind == "event" || kind == "unsupported") ? "an" : "a";
+                ctx_.diagnostics().report(
+                    Severity::Error, m->span.begin,
+                    "an extension block may not declare " +
+                    std::string(article) + " `" + std::string(kind) +
+                    "` member — " + std::string(note) +
+                    "; declare it on the extended type's own declaration "
+                    "or at module scope instead (§26.3)");
+                continue;
             }
             visitMember(*m);
         }
@@ -11524,6 +12233,41 @@ void ExprTC::runMethodBody(
         }
         forwardParamRef_.clear();
         visitExpr(*params[i].defaultValue);
+        // fix #4208 (§17.7, v0.298): a default parameter value is one of the
+        // FOUR written-declared-type positions §17.7 authorises for the
+        // new() shorthand ("field initializers, typed local-variable
+        // declarations, default parameter values, and return statements")
+        // — but unlike the field-initializer and local-decl positions
+        // (§17.7/#987/#979, ~line 12608/13781 below), this one was never
+        // wired: `method M(p: T := new(...))` left the shorthand NewExpr
+        // untyped, so codegen's #2491 backstop silently degraded it to a
+        // zero/null default value instead of constructing T — a silent
+        // wrong-answer, not a false-reject. Wire the SAME authorities the
+        // other two positions already use, in the same order, so it also
+        // inherits #4190's Class/Record `checkNewExprArgs` validation —
+        // same predicates, same diagnostics, no new classification (§6/§25).
+        if (params[i].type) {
+            if (auto* shNe = dynamic_cast<const ast::NewExpr*>(
+                    params[i].defaultValue.get())) {
+                if (!shNe->type) {
+                    if (auto* pty = ctx_.resolvedType(*params[i].type)) {
+                        ctx_.setExprType(params[i].defaultValue.get(), pty);
+                        rejectNewOnEnumOrChoice(*shNe, pty);
+                        bool nonInstantiable =
+                            rejectNewOnNonInstantiableKind(*shNe, pty);
+                        if (!nonInstantiable &&
+                            pty->kind == TypeRef::Kind::Named &&
+                            pty->declaration &&
+                            (pty->declaration->kind ==
+                                 ast::TypeDeclKind::Class ||
+                             pty->declaration->kind ==
+                                 ast::TypeDeclKind::Record))
+                            checkNewExprArgs(*shNe, pty->declaration);
+                        checkBuiltinClosedConstructorSurface(*shNe);
+                    }
+                }
+            }
+        }
         if (!forwardParamRef_.empty()) {
             ctx_.diagnostics().report(
                 Severity::Error, params[i].defaultValue->span.begin,
@@ -11870,6 +12614,47 @@ static bool isSec154BuiltinCollectionNonTrivialDispose(
     return common::isNonTrivialDisposeClass(elem, ctx);
 }
 
+// fix #3857 (§15.4.1 D4, v0.272): does `t` name a user type that opted into
+// the sequence-literal protocol via the BORROWING form — a static, single-
+// parameter `FromCollectionLiteral` whose parameter's carrier is
+// `ReadOnlyArraySpan<T>`? Mirrors the walk `Resolver::
+// checkCollectionLiteralFactoryConjuncts` (TypeResolution_Checks.cpp) and
+// `Emitter::materializeUserTypeCollectionLiteral` (LlvmBackend_Setup.cpp)
+// already do to classify the SAME method, asked here from a third site —
+// `checkBorrowingFamilyLiteralElements` below needs it to answer "is this
+// target ALSO a borrowing-family target for §15.4's fresh-producer
+// rejection", which is D4 of the v0.272 changelog entry and is mandatory,
+// not opportunistic: "landing D1 [the carrier rename] alone would convert
+// an ill-typed program into a well-typed leak". `isCollectionLiteralAdmissibleTarget`
+// (ExprTypecheck_Calls.cpp) is not reused because it answers a broader
+// question — ANY recognized FromCollectionLiteral, either form — not
+// specifically the borrowing one this rejection needs.
+static bool isUserBorrowFormFclTarget(const TypeRef* t,
+                                       const SemaContext& ctx) {
+    if (!t || t->kind != TypeRef::Kind::Named || !t->declaration) return false;
+    for (const Symbol* m : t->declaration->members) {
+        const auto* ms = dynamic_cast<const MethodSymbol*>(m);
+        if (!ms || ms->name != "FromCollectionLiteral" || ms->params.empty())
+            continue;
+        bool isStatic = false;
+        for (auto mod : ms->modifiers)
+            if (mod == "static") { isStatic = true; break; }
+        if (!isStatic) continue;
+        const auto* param =
+            dynamic_cast<const ParameterSymbol*>(ms->params.front());
+        if (!param) continue;
+        const TypeRef* paramTy = param->declType
+                                      ? ctx.resolvedType(*param->declType)
+                                      : param->resolvedDeclType;
+        if (paramTy && paramTy->kind == TypeRef::Kind::Named &&
+            paramTy->astNode && paramTy->astNode->name &&
+            !paramTy->astNode->name->parts.empty() &&
+            paramTy->astNode->name->parts.back() == "ReadOnlyArraySpan")
+            return true;
+    }
+    return false;
+}
+
 // per §15.4 (v0.268, fix #2673): "For **borrowing-family** targets …, each
 // element expression of **non-trivial-dispose class type** (§28.9) must be a
 // **borrow** whose source satisfies the store rule of §28.11; an element
@@ -11921,15 +12706,24 @@ static bool isSec154BuiltinCollectionNonTrivialDispose(
 void ExprTC::checkBorrowingFamilyLiteralElements(
     const ast::CollectionLiteralExpr& cl, const TypeRef* target) {
     if (!target || target->kind != TypeRef::Kind::Named) return;
-    // The borrowing collections are builtin named types with no user TypeDecl;
-    // a user type (including a `FromCollectionLiteral` opt-in, §15.4.1) is not
-    // on §15.4's borrowing-family list and is left alone.
-    if (target->declaration) return;
-    if (!target->astNode || !target->astNode->name ||
-        target->astNode->name->parts.empty())
-        return;
-    const std::string_view head = target->headName();
-    if (!isSec154BorrowingFamilyHead(head)) return;
+    // fix #3857 (§15.4.1 D4, v0.272): a user type that opted into the
+    // sequence-literal protocol via the BORROWING form is ALSO a borrowing-
+    // family target for this rejection (mandatory per D4 — see
+    // `isUserBorrowFormFclTarget` above). It has no §15.4 head name and no
+    // built-in owning-family remedy, so it is handled as its own arm rather
+    // than folded into the builtin-head lookup below.
+    const bool userBorrowTarget = isUserBorrowFormFclTarget(target, ctx_);
+    std::string_view head;
+    if (target->declaration) {
+        if (!userBorrowTarget) return;
+        head = target->declaration->name;
+    } else {
+        if (!target->astNode || !target->astNode->name ||
+            target->astNode->name->parts.empty())
+            return;
+        head = target->headName();
+        if (!isSec154BorrowingFamilyHead(head)) return;
+    }
 
     auto checkOne = [&](const ast::Expr* el, const char* position,
                         bool owningFamilyIsARemedy,
@@ -12033,7 +12827,97 @@ void ExprTC::checkBorrowingFamilyLiteralElements(
         checkOne(k.get(), "key", /*owningFamilyIsARemedy=*/false, elemElementTy);
     for (const auto& v : cl.elements)
         checkOne(v.get(), cl.isDict ? "value" : "element",
-                 /*owningFamilyIsARemedy=*/true, valueElementTy);
+                 // fix #3857 (§15.4.1 D4): a user borrow-form target has no
+                 // built-in "Owning<Head>" alternative to name as a remedy —
+                 // §15.4.1 declares exactly one form per type.
+                 /*owningFamilyIsARemedy=*/!userBorrowTarget, valueElementTy);
+}
+
+// fix #4310 (§5.1 *Implicit conversions* / §11.2 *Interface declaration*,
+// v0.298): the per-ELEMENT sibling of `checkBorrowingFamilyLiteralElements`
+// above. §11.2 states conformance as: "A class implements an interface
+// implicitly: by declaring matching public members" — read together with
+// §11.1's "A class may declare ... any number of interfaces" (the `: I1,
+// I2` inheritance-clause list a conforming class must appear in): the
+// "implicitly" clause waives PER-MEMBER `override`/qualification syntax, it
+// does not waive appearing in that list. This is not a fresh reading
+// introduced by this fix — it is the interpretation `checkAssignable`'s
+// existing `isSubtype` walk (over `TypeSymbol::baseTypes`, populated from
+// the inheritance clause) already enforces, MEASURED correct at a plain
+// variable declaration and an ordinary call argument before this fix
+// touched anything.
+//
+// MEASURED root cause: `checkAssignable` (this file, ~L3828) already
+// performs the §5.1 conversion check — including the class→interface §11.2
+// nominal-conformance test via `isSubtype` — and it correctly fires for a
+// plain variable declaration and an ordinary call argument. But every call
+// site that types a collection literal against a known target
+// (LocalDecl/FieldDecl/PropertyDecl/ReturnStmt below, and the call-argument
+// site in ExprTypecheck_Calls.cpp) sets the literal's OWN `exprType` to the
+// TARGET type via `ctx_.setExprType` before running the general
+// `checkAssignable(ctx_.exprType(*initializer), target, …)` call that
+// follows — so that call compares the target type to itself and trivially
+// passes, never descending into the literal's element expressions. A class
+// that never lists the target interface in its inheritance clause is
+// therefore silently accepted into an interface-typed collection element,
+// and interface dispatch on it reads a null itable slot (SIGSEGV, #4302).
+//
+// `checkAssignable` itself was not the right place to fix this: it has no
+// way to reach a `CollectionLiteralExpr`'s per-element sub-expressions from
+// a bare `TypeRef* from` (the literal's own already-collapsed type), and
+// giving it that reach would require threading the AST node through every
+// one of its ~40 call sites. Reusing it PER ELEMENT here, instead of
+// re-deriving the §5.1/§11.2 judgment, keeps exactly one place that decides
+// "is type A assignable to type B" (per this run's lane rules §6:
+// duplicated classification predicates are the dominant defect generator
+// in this codebase — not a language-spec citation).
+//
+// Scope: an inline array (`[N]T`) checks each element against `arrayElement`,
+// recursing when an element is itself a nested literal (`[1]Array<IHolder>`,
+// §4310's nested case) — the recursive call re-derives the SAME judgment one
+// level down rather than assuming the outer check covers it. A §15.4
+// builtin-collection head (`Array<T>`, `OwningArray<T>`, `Set<T>`, …,
+// `Dictionary<K, V>`, `OwningDictionary<K, V>`) checks each element/key
+// against `genericArgs[0]` and, for the dict form, each value against
+// `genericArgs[1]`. A user type (`declaration != nullptr`, e.g. a
+// `FromCollectionLiteral` opt-in) is out of scope — its element type is not
+// exposed the same way and #4310 did not measure a gap there.
+void ExprTC::checkCollectionLiteralElementAssignability(
+    const ast::CollectionLiteralExpr& cl, TypeRef* target) {
+    if (!target) return;
+    auto checkOne = [&](const ast::Expr* el, TypeRef* elemTarget,
+                        const char* position) {
+        if (!el || !elemTarget) return;
+        if (auto* nestedCl =
+                dynamic_cast<const ast::CollectionLiteralExpr*>(el)) {
+            // Mirrors `checkBorrowingFamilyLiteralElements`'s identical
+            // pre-set: a nested literal's type is set only by a target-
+            // aware caller (LocalDecl/ReturnStmt/…), never by the generic
+            // `visitExpr` walk, so seed it here before recursing.
+            if (!ctx_.exprType(*el))
+                ctx_.setExprType(const_cast<ast::Expr*>(el), elemTarget);
+            checkCollectionLiteralElementAssignability(*nestedCl, elemTarget);
+            return;
+        }
+        checkAssignable(ctx_.exprType(*el), elemTarget, el->span.begin,
+                        std::string("collection-literal ") + position,
+                        el);
+    };
+    if (target->kind == TypeRef::Kind::InlineArray) {
+        if (!target->arrayElement) return;
+        for (const auto& el : cl.elements)
+            checkOne(el.get(), target->arrayElement, "element");
+        return;
+    }
+    if (target->kind != TypeRef::Kind::Named || target->declaration ||
+        target->genericArgs.empty())
+        return;
+    TypeRef* elemTy = target->genericArgs[0];
+    TypeRef* valueTy = (cl.isDict && target->genericArgs.size() >= 2)
+        ? target->genericArgs[1] : elemTy;
+    for (const auto& k : cl.keys) checkOne(k.get(), elemTy, "key");
+    for (const auto& v : cl.elements)
+        checkOne(v.get(), valueTy, cl.isDict ? "value" : "element");
 }
 
 // stdlib §4.13 (v0.196, #1645): the owning-enumeration interfaces
@@ -12182,10 +13066,59 @@ void ExprTC::visitMember(const ast::Member& m) {
                     if (!shNe->type) {
                         if (auto* fty = ctx_.resolvedType(*fd->type)) {
                             ctx_.setExprType(fd->initializer.get(), fty);
-                            if (fty->kind == TypeRef::Kind::Named &&
+                            // fix #4170 (§35.1/§35.2/§35.3, v0.295): the
+                            // explicit `new T(...)` site's Enum/Choice
+                            // rejection (fix #960/#4163) never ran for this
+                            // shorthand node — `ne->type` is null by
+                            // definition of "shorthand" — so a field
+                            // shorthand-`new`'d to a Choice reached codegen
+                            // with no case discriminant and crashed the
+                            // compiler on the first `case` statement over
+                            // it (SIGSEGV); the Enum analogue hit an
+                            // IR-verifier backstop instead. Shares the one
+                            // predicate the explicit site now calls too.
+                            rejectNewOnEnumOrChoice(*shNe, fty);
+                            // fix #4176 (§3.1/§3.2, §11.7, §12.5, §17.7,
+                            // v0.298): the explicit `new T(...)` site's
+                            // abstract/closed/static/interface rejection
+                            // ("Slice S11") never ran for this shorthand
+                            // node either — same gap #4170 closed for
+                            // Enum/Choice above, but for the four
+                            // class-shaped non-instantiable kinds. A field
+                            // shorthand-`new`'d to an interface (or an
+                            // abstract class) reached codegen with no
+                            // vtable to install and crashed on first
+                            // virtual dispatch (SIGSEGV, measured). Shares
+                            // the one predicate the explicit site now calls
+                            // too, instead of a third spelling.
+                            bool nonInstantiable =
+                                rejectNewOnNonInstantiableKind(*shNe, fty);
+                            // fix #4190 (§17.7 / §9.1, v0.298): the sibling
+                            // gap to #4176 immediately above — this guard
+                            // ran `checkNewExprArgs` for
+                            // `TypeDeclKind::Class` only, never for
+                            // `TypeDeclKind::Record`, so a field
+                            // shorthand-`new`'d to a record skipped BOTH
+                            // arity and per-argument type checking (the
+                            // explicit `new T(...)` arm in
+                            // ExprTypecheck_Exprs.cpp runs
+                            // `checkNewExprArgs` for Class AND Record —
+                            // see its #1105/#4059 comments). Measured:
+                            // `private _p: PointF2 := new(3);` against
+                            // `record PointF2(X: int, Y: int)` compiled
+                            // clean and left `X` unbound (read back as 0,
+                            // not 3) — the same silent-miscompilation shape
+                            // #1105/§9.1 closed for the explicit spelling.
+                            // `checkNewExprArgs` already has the Record arm
+                            // (`t->hasPositionalFields`); it just needed to
+                            // be reachable from here too.
+                            if (!nonInstantiable &&
+                                fty->kind == TypeRef::Kind::Named &&
                                 fty->declaration &&
-                                fty->declaration->kind ==
-                                    ast::TypeDeclKind::Class)
+                                (fty->declaration->kind ==
+                                     ast::TypeDeclKind::Class ||
+                                 fty->declaration->kind ==
+                                     ast::TypeDeclKind::Record))
                                 checkNewExprArgs(*shNe, fty->declaration);
                             // fix #2994 (§17.7, v0.241): the shorthand is the
                             // SAME construction with the type taken from the
@@ -12305,6 +13238,16 @@ void ExprTC::visitMember(const ast::Member& m) {
                             return;  // reported; skip the
                                      // assignability check below
                         }
+                        // fix #4310 (§5.1/§11.2): per-element type
+                        // conformance for a collection-literal field
+                        // initializer — see that function's header comment.
+                        // Same `mentionsUnsubstitutedTypeParam` deferral as
+                        // the whole-literal check just below, for the same
+                        // reason (an unsubstituted generic field type is
+                        // judged at instantiation, not declaration).
+                        if (!mentionsUnsubstitutedTypeParam(fty))
+                            checkCollectionLiteralElementAssignability(
+                                *cl, fty);
                     }
                     // The §5.1 / §22.8 / §23.1 assignability check that
                     // #2926 added still defers on `mentionsUnsubstitutedTypeParam`
@@ -12648,6 +13591,12 @@ void ExprTC::visitMember(const ast::Member& m) {
                             return;  // reported; skip the
                                      // assignability check below
                         }
+                        // fix #4310 (§5.1/§11.2): per-element type
+                        // conformance — the auto-property twin of the
+                        // FieldDecl arm's identical check above.
+                        if (!mentionsUnsubstitutedTypeParam(pty))
+                            checkCollectionLiteralElementAssignability(
+                                *cl, pty);
                     }
                     // The assignability half still defers on
                     // `mentionsUnsubstitutedTypeParam` for the same reason
@@ -12860,12 +13809,15 @@ bool ExprTC::isConstInitExpr(const ast::Expr& e) {
         return c->condition && c->thenValue && c->elseValue &&
                isConstInitExpr(*c->condition) && isConstInitExpr(*c->thenValue) &&
                isConstInitExpr(*c->elseValue);
-    // A named reference is constant iff it resolves to another const member or
-    // an enum constant. A (non-const) field, property, or method reference is
-    // not — that is the runtime-dependent case this check rejects.
+    // A named reference is constant iff it resolves to another const member,
+    // an enum constant, or a local const (§21.1). A (non-const) field,
+    // property, or method reference is not — that is the runtime-dependent case
+    // this check rejects.
     if (dynamic_cast<const ast::IdentifierExpr*>(&e) ||
         dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
         Symbol* sym = ctx_.exprSymbol(e);
+        if (auto* ls = dynamic_cast<LocalSymbol*>(sym))
+            return ls->isConst;
         return dynamic_cast<ConstMemberSymbol*>(sym) != nullptr ||
                dynamic_cast<EnumConstantSymbol*>(sym) != nullptr;
     }
@@ -13305,10 +14257,52 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                         if (!shNe->type) {
                             ctx_.setExprType(ld->initializer.get(),
                                              lsym->declType);
-                            if (lsym->declType->kind == TypeRef::Kind::Named &&
+                            // fix #4170 (§35.1/§35.2/§35.3, v0.295): the
+                            // local-declaration twin of the field-
+                            // initializer shorthand check below — the
+                            // explicit `new T(...)` site's Enum/Choice
+                            // rejection (fix #960/#4163) never ran for
+                            // this shorthand node, so `var x: ChoiceType
+                            // := new();` reached codegen with no case
+                            // discriminant and crashed the compiler on
+                            // the first `case` statement over it
+                            // (measured: SIGSEGV, exit 139). Shares the
+                            // one predicate the explicit site now calls
+                            // too, instead of a third spelling.
+                            rejectNewOnEnumOrChoice(*shNe, lsym->declType);
+                            // fix #4176 (§3.1/§3.2, §11.7, §12.5, §17.7,
+                            // v0.298): local-declaration twin of the
+                            // field-initializer check above — the
+                            // explicit `new T(...)` site's abstract/
+                            // closed/static/interface rejection ("Slice
+                            // S11") never ran for this shorthand node
+                            // either, so `var w: ISomeInterface := new();`
+                            // (or an abstract-class target) reached
+                            // codegen with no vtable to install and
+                            // crashed on first virtual dispatch (SIGSEGV,
+                            // measured, exit 139). Shares the one
+                            // predicate the explicit site now calls too.
+                            bool nonInstantiable = rejectNewOnNonInstantiableKind(
+                                *shNe, lsym->declType);
+                            // fix #4190 (§17.7 / §9.1, v0.298): local-
+                            // declaration twin of the field-initializer fix
+                            // above — this guard ran `checkNewExprArgs` for
+                            // `TypeDeclKind::Class` only, never Record, so
+                            // `var p: PointBADARGS4176B := new(3);` against
+                            // a 2-field record compiled clean and bound
+                            // nothing (measured: `p.X` read back as 0, not
+                            // 3 — exit 100 on the issue's own repro). The
+                            // explicit `new T(...)` arm has run
+                            // `checkNewExprArgs` for Record since #1105/
+                            // #4059; this shorthand path just never reached
+                            // it.
+                            if (!nonInstantiable &&
+                                lsym->declType->kind == TypeRef::Kind::Named &&
                                 lsym->declType->declaration &&
-                                lsym->declType->declaration->kind ==
-                                    ast::TypeDeclKind::Class)
+                                (lsym->declType->declaration->kind ==
+                                     ast::TypeDeclKind::Class ||
+                                 lsym->declType->declaration->kind ==
+                                     ast::TypeDeclKind::Record))
                                 checkNewExprArgs(
                                     *shNe, lsym->declType->declaration);
                             // fix #2994 (§17.7, v0.241): the local-declaration
@@ -13436,6 +14430,14 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                     // is a no-op for the owning family — `OwningArray<Conn>
                     // := [new Conn(1)]` takes ownership and stays admissible.
                     checkBorrowingFamilyLiteralElements(*cl, lsym->declType);
+                    // fix #4310 (§5.1/§11.2): the per-element type-
+                    // conformance check the admissibility gate above does
+                    // NOT perform — see that function's header comment.
+                    // Covers both the inline-array target (`[N]IHolder`)
+                    // and the §15.4 builtin-collection target
+                    // (`Array<IHolder>`), including nested inline arrays.
+                    checkCollectionLiteralElementAssignability(
+                        *cl, lsym->declType);
                 }
                 // per §14.1/§14.2 + §A.7 (issue #391): return-target generic
                 // type-argument inference. When the initializer is a call to a
@@ -13595,6 +14597,17 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                         std::string("initializer for `") +
                             std::string(lc->name) + "`",
                         lc->value.get());
+                    // fix #4310 (§5.1/§11.2): the `const` twin of the
+                    // `var` LocalDecl per-element check above.
+                    // `LocalConstDecl` is a DIFFERENT AST node from
+                    // `LocalDecl` (§21.1's runtime const), so the earlier
+                    // fix at the `var` site does not reach it — measured:
+                    // `const arr: Array<IHolder> := [w];` (#4310's own
+                    // case 4) still compiled clean without this call.
+                    if (auto* rcl = dynamic_cast<
+                            const ast::CollectionLiteralExpr*>(
+                            lc->value.get()))
+                        checkCollectionLiteralElementAssignability(*rcl, rt);
                 }
             }
         }
@@ -13765,6 +14778,51 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         pendingLambdaTargetReturnOwned_ = savedLamTargetRetOwned;
         pendingLambdaParamTypes_ = savedLamParams;
         currentLiteralWideningHint_ = savedRetHint;
+        // fix #4208 (§17.7, v0.298): `return e;` is one of the FOUR written-
+        // declared-type positions §17.7 authorises for the new() shorthand
+        // ("field initializers, typed local-variable declarations, default
+        // parameter values, and return statements") — but unlike the
+        // field-initializer and local-decl positions (§17.7/#987/#979,
+        // ~line 12608/13781 above), this one was never wired: `return
+        // new(...);` in a method with a declared return type left the
+        // shorthand NewExpr untyped, so codegen's #2491 backstop silently
+        // degraded it to a zero/null return value instead of constructing
+        // the declared type — a silent wrong-answer, not a false-reject.
+        // §17.7 explicitly excludes a LAMBDA's ascribed return from this
+        // list ("It is not permitted at ... a lambda's ascribed return"),
+        // even though a lambda body's own `return` statements reuse this
+        // same returnCtx_ == ValueMethod machinery (§27.3/#2101, see
+        // ExprTypecheck_Exprs.cpp's lambda-visiting block) — gate on
+        // `!inLambda_` (the existing §29.9/#747 lambda-body marker) so that
+        // carve-out holds; an ordinary member/accessor/operator body (async
+        // included — asyncReturnCtxAndType already peels Task<T> to T
+        // before this point, per §35.3) never sets inLambda_. Wire the SAME
+        // authorities the other two positions already use, in the same
+        // order, so it also inherits #4190's Class/Record
+        // `checkNewExprArgs` validation — same predicates, same
+        // diagnostics, no new classification (§6/§25).
+        if (rs->value && returnCtx_ == ReturnCtx::ValueMethod &&
+            currentReturnType_ && !inLambda_) {
+            if (auto* shNe =
+                    dynamic_cast<const ast::NewExpr*>(rs->value.get())) {
+                if (!shNe->type) {
+                    ctx_.setExprType(rs->value.get(), currentReturnType_);
+                    rejectNewOnEnumOrChoice(*shNe, currentReturnType_);
+                    bool nonInstantiable = rejectNewOnNonInstantiableKind(
+                        *shNe, currentReturnType_);
+                    if (!nonInstantiable &&
+                        currentReturnType_->kind == TypeRef::Kind::Named &&
+                        currentReturnType_->declaration &&
+                        (currentReturnType_->declaration->kind ==
+                             ast::TypeDeclKind::Class ||
+                         currentReturnType_->declaration->kind ==
+                             ast::TypeDeclKind::Record))
+                        checkNewExprArgs(*shNe,
+                                          currentReturnType_->declaration);
+                    checkBuiltinClosedConstructorSurface(*shNe);
+                }
+            }
+        }
         // §22.4 (v0.183, #1585): a `return E;` that may produce a postcondition's
         // stated constant must leave the out parameter provably non-null.
         checkOutPostcondAtReturn(rs->value.get(), rs->span.begin);
@@ -13827,6 +14885,14 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                         currentReturnType_);
                 return;  // skip the assignability check below
             }
+            // fix #4310 (§5.1/§11.2): per-element type conformance — the
+            // `return` twin of the LocalDecl/FieldDecl checks above. See
+            // `checkCollectionLiteralElementAssignability`'s header comment;
+            // this closes the exact shape #4302 measured (a function
+            // returning `[1]IHolder` from a collection literal).
+            if (returnCtx_ == ReturnCtx::ValueMethod)
+                checkCollectionLiteralElementAssignability(
+                    *retCl, currentReturnType_);
         }
         // Slice T3: a returned value must be primitive-assignable to
         // the callable's return type.
@@ -15454,6 +16520,58 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                         }
                     }
                 }
+                // fix #4316 (§5.1/§15.4/§11.2, v0.298): a plain `outer :=
+                // [...]` reassignment had NO admissibility gate and NO
+                // per-element conformance check at all — a strictly LARGER
+                // gap than #4310's six original positions and #4323's
+                // lambda-body seventh, which at least ran
+                // `isCollectionLiteralAdmissibleTarget` before #4310 landed.
+                // Nothing sets a collection literal's own `exprType` at any
+                // of those positions either (see
+                // `checkCollectionLiteralElementAssignability`'s header
+                // comment) — `fromTy` above is simply null for a
+                // `CollectionLiteralExpr` RHS — so the `checkAssignable`
+                // call below silently no-ops on its `if (!from) return`
+                // guard and the RHS reached codegen completely unchecked
+                // (measured SIGSEGV: a non-conforming class stored through
+                // `outer[0].GetV()` dispatches a null itable slot, #4302's
+                // signature). Mirror the ReturnStmt/LocalDecl/FieldDecl
+                // positions: gate on §15.4 membership first (the SAME three
+                // diagnostics those positions report), then run #4310's
+                // shared per-element walk against the RESOLVED TARGET TYPE
+                // directly — not through `ctx_.exprType`, which the literal
+                // never carries at any position.
+                if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(
+                        as->value.get())) {
+                    const bool isEmpty = !cl->isDict && cl->elements.empty();
+                    const bool admitted =
+                        isEmpty ? isCollectionLiteralEmptyAdmissibleTarget(toTy)
+                                : isCollectionLiteralAdmissibleTarget(
+                                      toTy, cl->isDict);
+                    if (toTy && toTy->kind != TypeRef::Kind::Error &&
+                        !admitted) {
+                        if (isCollectionLiteralInterfaceTarget(toTy))
+                            reportCollectionLiteralInterfaceTarget(
+                                ctx_.diagnostics(), as->value->span.begin,
+                                namedTypeSimpleName(toTy));
+                        else if (cl->isDict &&
+                                 isCollectionLiteralAdmissibleTarget(
+                                     toTy, /*isDict=*/false))
+                            reportCollectionLiteralDictFormBadTarget(
+                                ctx_.diagnostics(), as->value->span.begin,
+                                toTy);
+                        else
+                            reportCollectionLiteralBadTarget(
+                                ctx_.diagnostics(), as->value->span.begin,
+                                toTy);
+                    } else {
+                        // per §5.1/§11.2 — #4310's shared per-element walk,
+                        // reused rather than an eighth hand-rolled copy
+                        // (LANE_RULES §6/§25). Closes #4302's exact crash
+                        // signature at this position (filed as #4316).
+                        checkCollectionLiteralElementAssignability(*cl, toTy);
+                    }
+                }
                 // §5.1 "Constant narrowing" (#738, one definition since
                 // #2925): the re-type lives in checkAssignable
                 // (narrowIntConstantToTarget), which this arm's own copy used
@@ -16476,6 +17594,28 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
             checkPropertyWriteTarget(
                 *is->target, is->target->span.begin,
                 /*incOp=*/(is->op == "--" ? "--" : "++"));
+        // fix #4290 (§17.6/§22.8, v0.298): the FIELD sibling of the
+        // `checkPropertyWriteTarget` call directly above — that call's
+        // `dynamic_cast<PropertySymbol*>` fails for a plain
+        // `FieldSymbol` target and it early-returns
+        // (`if (!ps) return;`), so a readonly ORDINARY field's `++`/`--`
+        // reached NO readonly check at all before this: it compiled
+        // clean and mutated the field at runtime, while the identical
+        // `:=`/`+=` stores were already rejected by
+        // `checkReadonlyAssignment` on the AssignmentStmt arm. Calls the
+        // SAME shared helper that arm now uses
+        // (`checkReadonlyFieldWriteTarget`, extracted from it) rather
+        // than a third hand-written copy of the carve-out rules — the
+        // #2868 lesson repeated for fields instead of properties. The
+        // `is->op` argument selects the increment wording and adds the
+        // §17.6 citation; the #2309 positional-record branch above keeps
+        // its own distinct diagnostic (a positional field carries no
+        // `readonly` modifier of its own, so this helper is a no-op for
+        // it — see its own comment — and the two can never both fire).
+        if (is->target)
+            checkReadonlyFieldWriteTarget(
+                *is->target, is->target->span.begin,
+                /*incOp=*/(is->op == "--" ? "--" : "++"));
         // §17.6 (v0.236, #2585 / #2599): the increment/decrement operators
         // are defined on exactly three operand categories — (1) a value-type
         // operand whose type T overloads `operator ++`, (2) a built-in numeric
@@ -16678,6 +17818,19 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         TypeRef* scrutTy =
             cs->scrutinee ? ctx_.exprType(*cs->scrutinee) : nullptr;
         scrutTy = recoverChoiceThisScrutTy(cs->scrutinee.get(), scrutTy);
+        // fix #4139 (§19.6, v0.298): cache the shared exhaustiveness
+        // verdict — "does this case's no-match fallthrough edge provably
+        // never execute" — on the AST for the ownership pass's CaseStmt
+        // arm-join to consult (Node.hpp's CaseStmt::noMatchEdgeStatically-
+        // Dead carries the full rationale). quiet=true: no diagnostic (the
+        // statement-position form is exempt from the §19.6 non-
+        // exhaustiveness warning, unlike CaseExpr's checkCaseExhaustiveness
+        // caller) and the §5.1 pattern-range side-check is skipped here
+        // since checkCasePatternConstantRanges runs it explicitly two lines
+        // below regardless of this verdict. // per §19.6, v0.298, #4139
+        const_cast<ast::CaseStmt*>(cs)->noMatchEdgeStaticallyDead =
+            caseArmsExhaustive(cs->arms, cs->scrutinee.get(), scrutTy,
+                                s.span.begin, /*quiet=*/true);
         // §19.3 / §16.6 / §7.11 (v0.286, #3298): the statement-position form
         // takes the same rule as the CaseExpr site — one shared checker, so
         // the two spellings of `case` cannot drift apart on this verdict.
@@ -17246,6 +18399,57 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                             "` or `var x: " +
                             std::string(lastName) +
                             "`) instead");
+                    }
+                }
+                // fix #4381 (§19.3, v0.298): after the class-head check, detect
+                // the dual: a pattern head that names a choice CASE (e.g.
+                // `Fetched(_)`) but a scrutinee that is NOT a choice. Sema
+                // must reject this rather than letting it through to codegen
+                // which would emit malformed IR (case.end has no terminator).
+                if (ctx_.module()) {
+                    bool isChoiceCaseHead = false;
+                    for (Symbol* child : ctx_.module()->children) {
+                        if (auto* ts = dynamic_cast<TypeSymbol*>(child)) {
+                            if (ts->kind == ast::TypeDeclKind::Choice) {
+                                for (Symbol* m : ts->members) {
+                                    if (auto* cc =
+                                            dynamic_cast<ChoiceCaseSymbol*>(m)) {
+                                        if (cc->name == lastName) {
+                                            isChoiceCaseHead = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                                if (isChoiceCaseHead) break;
+                            }
+                        }
+                    }
+                    if (!isChoiceCaseHead) {
+                        for (Symbol* sym : ctx_.importedSymbols()) {
+                            if (auto* ts = dynamic_cast<TypeSymbol*>(sym)) {
+                                if (ts->kind == ast::TypeDeclKind::Choice) {
+                                    for (Symbol* m : ts->members) {
+                                        if (auto* cc =
+                                                dynamic_cast<ChoiceCaseSymbol*>(m)) {
+                                            if (cc->name == lastName) {
+                                                isChoiceCaseHead = true;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    if (isChoiceCaseHead) break;
+                                }
+                            }
+                        }
+                    }
+                    if (isChoiceCaseHead) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, dp->span.begin,
+                            "case pattern head `" + std::string(lastName) +
+                                "(...)` names a choice case, but the scrutinee "
+                                "type is not a choice — a choice-case pattern is "
+                                "only valid when the scrutinee is that specific "
+                                "choice type (§19.3)");
                     }
                 }
                 // fix #3957 (§19.3/§2.8.3 rule 4, v0.294): fall back to

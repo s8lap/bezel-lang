@@ -1,5 +1,8 @@
 #include "sema/TypeResolution_impl.hpp"
 
+#include <cstdio>   // send-back #4305: unhandledNullDeclClassConstraintSlot
+#include <cstdlib>  // send-back #4305: unhandledNullDeclClassConstraintSlot
+
 #include "common/BuiltinRegistry.hpp"  // isBuiltinExceptionName — §31.4 (#2950)
 #include "common/OwnershipFacts.hpp"   // isMoveOnlyValueType — §14.4 / §15.3 (#3794)
 #include "sema/ConstFold.hpp"
@@ -81,6 +84,30 @@ static std::string_view ownedBareTypeParamOfField(const FieldSymbol& fs,
     // branch rejects it via `parts.size() != 1` and this is the same rejection.
     if (n.empty() || n.find('.') != std::string_view::npos) return {};
     return n;
+}
+
+// Loud, UNCONDITIONAL failure (never compiled out by NDEBUG — matching
+// src/common/AwaitScan.cpp's convention rather than a plain `assert()`,
+// which release builds strip) for a `kNullDeclClassConstraints` table entry
+// (§14.2/§14.4, fix #4305, send-back review) whose recorded slot has fallen
+// out of range for its own name's `builtinTypeArity`. The table is
+// hand-typed and nothing else pins its shape against the arity table it
+// depends on: if a listed name's arity ever changes, the bounds check at
+// the call site (`c.slot < ref.genericArgs.size()`) would otherwise
+// silently stop firing for it — no crash, no failing test, just a quietly
+// disarmed §14.2/§14.4 check. This makes that failure mode loud instead.
+[[noreturn]] static void unhandledNullDeclClassConstraintSlot(
+    std::string_view name, std::size_t slot, int arity) {
+    std::fprintf(stderr,
+        "internal compiler error: src/sema/TypeResolution_Names.cpp's "
+        "kNullDeclClassConstraints table names `%.*s` slot %zu, but "
+        "Resolver::builtinTypeArity(\"%.*s\") now reports arity %d -- the "
+        "table entry is stale relative to the arity table it depends on "
+        "(see fix #4305)\n",
+        static_cast<int>(name.size()), name.data(),
+        static_cast<std::size_t>(slot),
+        static_cast<int>(name.size()), name.data(), arity);
+    std::abort();
 }
 
 int Resolver::builtinTypeArity(std::string_view n) {
@@ -181,6 +208,18 @@ int Resolver::builtinTypeArity(std::string_view n) {
     if (n == "OwningTaskCompletionSource") return 1;
     if (n == "Array" || n == "OwningArray" || n == "OwningTask" ||
         n == "IEnumerable" || n == "IEnumerator" ||
+        // stdlib §5 (issue #4178): IOrderedEnumerable<T> — the OrderBy/
+        // OrderByDescending result interface (`: IEnumerable<T>`, arity 1,
+        // same shape as its sibling IGrouping<TKey,T> below). The type
+        // already flows through sema/codegen as a real lazy-query result
+        // (ExprTypecheck.cpp / LlvmBackend_Calls3.cpp's "lazy sentinel")
+        // whenever it is INFERRED (`var sorted := xs.OrderBy(...)`), but was
+        // missing from this table, so writing it explicitly — a return type,
+        // parameter type, local annotation, or generic argument — failed
+        // "unresolved type name `IOrderedEnumerable`" even though the type
+        // is fully functional. No user TypeDecl; same declaration-less
+        // Named-ref shape as IGrouping/DictionaryEntry/DrainedEntry.
+        n == "IOrderedEnumerable" ||
         n == "IAsyncEnumerable" || n == "IAsyncEnumerator" ||
         n == "IOwningEnumerable" || n == "IOwningEnumerator" ||
         n == "IOwningAsyncEnumerable" || n == "IOwningAsyncEnumerator" ||
@@ -286,6 +325,26 @@ int Resolver::builtinTypeArity(std::string_view n) {
     // already a member of `kHeapPointerReferenceBuiltins`).
     if (n == "DictionaryEntry" || n == "DrainedEntry" ||
         n == "IGrouping") return 2;
+    // stdlib §2.19 / spec §15.4.1 (issue #4178 investigation; NOT registered
+    // here — see issue #4202). `ICollectionLiteralTarget<TSelf, T>` /
+    // `IOwningCollectionLiteralTarget<TSelf, T>` were measured as a sibling
+    // "unresolved type name" gap while fixing #4178's IOrderedEnumerable, and
+    // a `builtinTypeArity` entry identical in shape to the one above was
+    // written and tested — but naming them exposed a REAL, reachable
+    // IR-verifier crash ("Invalid indices for GEP pointer type!"), not just
+    // the expected "structural, not nominal, dispatch" gap #4202 already
+    // tracks: any class with FIELDS that declares
+    // `: ICollectionLiteralTarget<Self, T>` in its base list (the spec's own
+    // §15.4.1 `RingBuffer<T>` worked example, once it has real fields and a
+    // real `Push`/indexer body — the spec's own elided-body example did not
+    // stress this) corrupts class-layout GEP codegen. A minimal
+    // no-fields repro did not reveal it, which is why it was not caught
+    // before the first attempt at this line. Reverted rather than shipped;
+    // see issue #4202 for the measured repro and the GEP crash detail. Do
+    // NOT re-add this line without first fixing whatever in class-layout
+    // codegen treats a builtin interface base as a real, offset-consuming
+    // base — the earlier structural-vs-nominal dispatch gap is the SMALLER
+    // of the two problems here.
     // §30.14 / §30.15 (#600): Channel<T> and ChannelSender<T> (arity 1).
     // Domain is a static class (arity 0); ChannelClosedException is a nullary
     // exception type (§30.15); DomainFaultedException is a nullary exception.
@@ -494,6 +553,109 @@ void Resolver::bindExtensionTargetTypeParams(const ast::Type& target,
     }
 }
 
+// fix #4144 (§26.2, v0.295): the extendable-target list is CLOSED — the
+// section states exactly which kinds may be extended (classes including
+// `Object`, interfaces, records, enums, built-in primitives) and exactly
+// which may not (type parameters, nullable types directly, function types,
+// choices, inline-array types) — but nothing in `src/sema/` gated
+// `ExtensionDecl`'s resolved target kind against that list. A `choice`
+// target reached codegen and crashed with an unterminated basic block
+// (`case this of` lowering has no extension-aware branch, #4144); a nullable
+// target (`extension int?`) reaches a DIFFERENT codegen crash (a
+// call-parameter-type IR-verifier failure), because
+// `extensionTargetMatchesReceiver` (ExprTypecheck.cpp ~6150) explicitly
+// documents "ignoring nullability... because §26.2 forbids `extension
+// int?`" — an invariant nothing was enforcing; a function-type target
+// silently compiles and runs with the extension member's body degraded to
+// a no-op via the #3079 backstop. Inline-array targets are the one kind
+// that does NOT reach a crash today — an unrelated, pre-existing blanket
+// member-lookup gate (ExprTypecheck_Calls.cpp ~15859) already rejects any
+// non-allow-listed member access on an inline-array RECEIVER, citing
+// §26.2 — but the extension DECLARATION itself still compiles clean with
+// dead, uncallable members, which is not what a closed list means. Reject
+// all four live-crash/live-gap kinds here, at the declaration site, right
+// after the target type resolves — before any member of the block is
+// typechecked or reaches codegen.
+//
+// "Type parameters" (`extension T` is meaningless, §26.2) is the fifth
+// listed kind and is deliberately NOT given a case here: an extension's
+// own §26.4 type-parameter binding only auto-binds a bare identifier
+// found in the target type's GENERIC ARGUMENT positions
+// (`bindExtensionTargetTypeParams` above), never the target type's own
+// head, so a bare `extension T` can only ever resolve `T` as an ordinary
+// name lookup — succeeding only if `T` names a real declared type (in
+// which case it extends that concrete type, which is legitimate and not
+// an instance of this rule at all) or failing with the existing, general
+// "unresolved type name" diagnostic. There is no TypeRef shape a live
+// program can produce here that represents "the target IS a type
+// parameter", so there is nothing this gate could observe and reject that
+// current behavior does not already handle correctly.
+void Resolver::rejectDisallowedExtensionTarget(const ast::ExtensionDecl& ext) {
+    if (!ext.targetType) return;
+    const TypeRef* ref = ctx_.resolvedType(*ext.targetType);
+    if (!ref) return;
+    const SourceLocation loc = ext.targetType->span.begin;
+    // §26.2: "Nullable types directly (`extension int?`). Extend the
+    // non-nullable form; callers handle nullability at the call site with
+    // `?.` (§7.5)." — the TOP-LEVEL nullable marker on the target type
+    // itself; a nullable type nested inside a generic argument position
+    // (`extension Array<int?>`) is unaffected — §26.4 already covers that
+    // a bare block-level parameter unifies with nullable arguments.
+    if (ref->nullable) {
+        ctx_.diagnostics().report(
+            Severity::Error, loc,
+            "cannot extend a nullable type directly (\xC2\xA7""26.2): "
+            "extend the non-nullable form instead \xE2\x80\x94 callers "
+            "handle nullability at the call site with `?.` "
+            "(\xC2\xA7""7.5)");
+        return;
+    }
+    switch (ref->kind) {
+        case TypeRef::Kind::Named: {
+            // §26.2: "Choices. The extendable list above is closed against
+            // the choice kind..."
+            if (ref->declaration &&
+                ref->declaration->kind == ast::TypeDeclKind::Choice) {
+                ctx_.diagnostics().report(
+                    Severity::Error, loc,
+                    "cannot extend a choice type `" +
+                    std::string(ref->declaration->name) +
+                    "` (\xC2\xA7""26.2): the extendable list is closed "
+                    "against the choice kind \xE2\x80\x94 no \xC2\xA7""14.2 "
+                    "constraint names the value-like classification bound a "
+                    "payload-generic extension surface would need, and "
+                    "stdlib `Result<T, E>`'s value-payload combinator "
+                    "surface is compiler-provided (\xC2\xA7""35.2), not an "
+                    "extension block");
+            }
+            return;
+        }
+        case TypeRef::Kind::Function:
+            // §26.2: "Function types."
+            ctx_.diagnostics().report(
+                Severity::Error, loc,
+                "cannot extend a function type (\xC2\xA7""26.2)");
+            return;
+        case TypeRef::Kind::InlineArray:
+            // §26.2: "Inline-array types (`extension [N]T`). Inline arrays
+            // are value-typed but their identity is per-size... so an
+            // extension declaration would have to fix N, making the form
+            // rarely useful."
+            ctx_.diagnostics().report(
+                Severity::Error, loc,
+                "cannot extend an inline-array type (\xC2\xA7""26.2): inline "
+                "arrays are value-typed but their identity is per-size "
+                "(`[3]int` and `[4]int` are distinct types), so an "
+                "extension declaration would have to fix N \xE2\x80\x94 "
+                "write a static method that takes a specific inline-array "
+                "type per overload, or a heap-array view (`Array<T>`) the "
+                "caller constructs from the inline array's contents");
+            return;
+        default:
+            return;
+    }
+}
+
 void Resolver::resolveTopDecl(const ast::TopDecl& decl, Scope* parent) {
     if (auto* td = dynamic_cast<const ast::TypeDecl*>(&decl)) {
         resolveTypeDecl(*td, parent);
@@ -541,6 +703,10 @@ void Resolver::resolveTopDecl(const ast::TopDecl& decl, Scope* parent) {
             bindExtensionTargetTypeParams(*ext->targetType, extScope, parent);
         }
         if (ext->targetType) resolveType(*ext->targetType, &extScope);
+        // fix #4144 (§26.2, v0.295): reject a target kind the closed
+        // extendable list excludes, before any member of the block is
+        // resolved further or reaches codegen.
+        rejectDisallowedExtensionTarget(*ext);
         for (const auto& gc : ext->genericConstraints) {
             for (const auto& item : gc.items) {
                 if (item.typeArg) resolveType(*item.typeArg, &extScope);
@@ -1202,11 +1368,7 @@ TypeRef* Resolver::resolveType(const ast::Type& t, Scope* scope) {
                 // literal initialization miscompiled (garbage/OOB reads).
                 if (ref->arrayElement &&
                     ref->arrayElement->kind == TypeRef::Kind::InlineArray) {
-                    ctx_.diagnostics().report(
-                        Severity::Error, t.span.begin,
-                        "an inline array may not be the element of another "
-                        "inline array (`[N][M]T`) — multi-dimensional inline "
-                        "arrays are not admitted (§15.1)");
+                    reportNestedInlineArrayError(t.span.begin);
                 }
             }
             // §15.1 (issue #734): N must be a compile-time integer expression
@@ -1624,6 +1786,112 @@ ConstShiftDomainFault Resolver::findConstShiftDomainFaultInScope(
     return findConstShiftDomainFault(e, resolve);
 }
 
+// fix #4188 (§27.8, v0.298): see the declaration comment in
+// TypeResolution_impl.hpp. `tr` is a node reachable from a generic alias's
+// cached `aliasedType` TypeRef; `subst` maps the alias's OWN generic
+// parameter names to the CONCRETE type arguments supplied at a particular
+// reference site.
+// §15.1 (#953): "an inline array may not be the element of another inline
+// array (`[N][M]T`)". Shared text for both the direct-syntax check
+// (resolveType's InlineArray case, above) and the alias-substitution
+// re-validation (substituteAliasGenericArgs, below) — one spelling, not a
+// drifting second copy (LANE_RULES §6).
+void Resolver::reportNestedInlineArrayError(SourceLocation loc) {
+    ctx_.diagnostics().report(
+        Severity::Error, loc,
+        "an inline array may not be the element of another "
+        "inline array (`[N][M]T`) — multi-dimensional inline "
+        "arrays are not admitted (§15.1)");
+}
+
+TypeRef* Resolver::substituteAliasGenericArgs(
+        TypeRef* tr,
+        const std::unordered_map<std::string_view, TypeRef*>& subst,
+        SourceLocation useLoc) {
+    if (!tr || subst.empty()) return tr;
+    switch (tr->kind) {
+        case TypeRef::Kind::Named: {
+            // A bare, unbound type-parameter reference — the same shape
+            // applyGenericSubst's leaf case recognises (Named, no
+            // declaration, single-part syntactic name).
+            if (!tr->declaration && tr->astNode && tr->astNode->name &&
+                tr->astNode->name->parts.size() == 1) {
+                auto it = subst.find(tr->headName());
+                if (it != subst.end()) {
+                    TypeRef* substituted = it->second;
+                    // Preserve the nullable modifier: `T?` → `int?` when
+                    // T→int, mirroring applyGenericSubst.
+                    if (tr->nullable && substituted && !substituted->nullable) {
+                        TypeRef* nn = ctx_.makeTypeRef(*substituted);
+                        nn->nullable = true;
+                        return nn;
+                    }
+                    return substituted;
+                }
+            }
+            // Not a bare parameter itself (a concrete/builtin head, or a
+            // parameter name not in `subst`) — recurse into its own
+            // generic-argument list, since the parameter may be buried
+            // arbitrarily deep (`Dictionary<K, Array<V>>`, spec §27.8's own
+            // generic-alias example).
+            if (tr->genericArgs.empty()) return tr;
+            bool changed = false;
+            std::vector<TypeRef*> newArgs;
+            newArgs.reserve(tr->genericArgs.size());
+            for (TypeRef* arg : tr->genericArgs) {
+                TypeRef* na = substituteAliasGenericArgs(arg, subst, useLoc);
+                if (na != arg) changed = true;
+                newArgs.push_back(na);
+            }
+            if (!changed) return tr;
+            TypeRef* nn = ctx_.makeTypeRef(*tr);
+            nn->genericArgs = std::move(newArgs);
+            return nn;
+        }
+        case TypeRef::Kind::InlineArray: {
+            if (!tr->arrayElement) return tr;
+            TypeRef* ne =
+                substituteAliasGenericArgs(tr->arrayElement, subst, useLoc);
+            if (ne == tr->arrayElement) return tr;
+            // §15.1 (send-back for fix #4280): resolveType's
+            // direct-syntax check (above, in the InlineArray case) only sees
+            // the alias's own literal body at the ALIAS's declaration site
+            // (`type Nested<T> := [1]T`, where T is still unbound) — it
+            // cannot see that substitution at THIS reference site just
+            // replaced T with an inline array itself
+            // (`Nested<[1]string>`), which builds a genuine `[N][1]string`
+            // with no re-validation anywhere else. Re-run the identical
+            // check at the point substitution actually creates the nested
+            // shape, so the rejection fires "wherever a nested inline array
+            // is formed" rather than only through direct syntax.
+            if (ne->kind == TypeRef::Kind::InlineArray) {
+                reportNestedInlineArrayError(useLoc);
+            }
+            TypeRef* nn = ctx_.makeTypeRef(*tr);
+            nn->arrayElement = ne;
+            return nn;
+        }
+        case TypeRef::Kind::Function: {
+            bool changed = false;
+            std::vector<TypeRef::FuncParam> newParams = tr->funcParams;
+            for (auto& p : newParams) {
+                TypeRef* np = substituteAliasGenericArgs(p.type, subst, useLoc);
+                if (np != p.type) { p.type = np; changed = true; }
+            }
+            TypeRef* newRet =
+                substituteAliasGenericArgs(tr->funcReturn, subst, useLoc);
+            if (newRet != tr->funcReturn) changed = true;
+            if (!changed) return tr;
+            TypeRef* nn = ctx_.makeTypeRef(*tr);
+            nn->funcParams = std::move(newParams);
+            nn->funcReturn = newRet;
+            return nn;
+        }
+        default:
+            return tr;
+    }
+}
+
 void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
     if (!t.name || t.name->parts.empty()) {
         ref.kind = TypeRef::Kind::Error;
@@ -1878,6 +2146,208 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                             // counterpart (e.g. OwningArray → Array).
                             std::string(first.substr(6)) +
                             "<\xE2\x80\xA6>` for value elements.");
+                    }
+                }
+                // §14.2/§14.4 (fix #4305, SHARPENED by send-back review): a
+                // null-declaration builtin generic (this whole
+                // `if (arity != kNotBuiltin)` branch — no synthesized
+                // TypeSymbol) has no `tsym` for `checkGenericConstraints`
+                // below (its `if (tsym && ...)` gate) to run against, so a
+                // `where <slot>: class` constraint declared on the type's OWN
+                // stdlib signature was never verified for any of them.
+                // Measured (issue #4305): `default(DrainedEntry<int,
+                // SomeRecord>)` compiled and ran clean despite `DrainedEntry
+                // <K, V>: IDisposable where V: class` (stdlib §4.9).
+                //
+                // Spec §14.4's "Class-only restriction on owning generics"
+                // paragraph (v0.298; heading "`owned` and generic type
+                // arguments" > "Generic constraints and class types" — NOT
+                // §14.2, which only defines the general `where T: class`
+                // meaning) names THIRTEEN types under one sentence: "Most
+                // standard-library owning types (`OwningArray<T>`,
+                // `OwningLinkedList<T>`, `OwningSet<T>`, `OwningStack<T>`,
+                // `OwningQueue<T>`, `OwningDictionary<K, V>`, `OwningTask<T>`,
+                // `IOwningEnumerable<T>`, `IOwningEnumerator<T>`,
+                // `IOwningAsyncEnumerable<T>`, `IOwningAsyncEnumerator<T>`,
+                // `IOwningCollection<T>`, `IOwningList<T>`) restrict their
+                // element type T to class and interface types. ... the
+                // standard-library owning types are compiler-enforced to
+                // reject the runtime-managed reference types (`string`,
+                // function values)." That is STRICTER than the general
+                // `where T: class` (§14.2: "Non-nullable reference types
+                // only — classes ..., interfaces, `string`, function
+                // types" — string/function ARE admitted generically) and
+                // the very next spec sentence adds a second divergence:
+                // "Nullable class types and interfaces are admitted. The
+                // owning-type instantiation rule checks the *underlying*
+                // type, not the nullable-wrapper" — the opposite of the
+                // general `where T: class`, which requires non-null T.
+                //
+                // This table covers every null-declaration builtin generic
+                // whose stdlib declaration carries a plain `where <slot>:
+                // class` constraint AND is not already enforced by a
+                // different, purpose-built check. The candidate set was
+                // derived MECHANICALLY (send-back review of the original
+                // fix, which re-read the doc by eye and missed two): every
+                // arity>=1 name in `builtinTypeArity` above was
+                // cross-referenced against every TYPE-LEVEL (not
+                // method-level) `where <slot>: ...` declaration clause in
+                // docs/Bezel_Standard_Library.md. That sweep added exactly
+                // two names beyond the eight below: `IOwningCollection<T>`
+                // and `IOwningList<T>` (stdlib §4.2, arity 1, slot 0) — both
+                // named in the identical §14.4 sentence quoted above as
+                // their four already-covered `IOwning*Enumerable/Enumerator`
+                // siblings, in neither this table nor the `ownedSlot`
+                // exclusion below. No other name fell out of the sweep:
+                //   - OwningArray/OwningSet/OwningStack/OwningQueue/
+                //     OwningLinkedList (slot 0) and OwningDictionary (slot 1)
+                //     are DELIBERATELY EXCLUDED: the `ownedSlot` /
+                //     `owningElementBadDesc` check immediately above (stdlib
+                //     §4.2/§14.4, #1327) already enforces their identical
+                //     requirement.
+                //   - `OwningTask<T>` is in `builtinTypeArity` but has no
+                //     standalone type-level `where` clause anywhere in the
+                //     stdlib doc to register — every `where T: class` hit
+                //     naming it (`Task.FromOwnedResult<T>`, `Task.WhenAll<T>`)
+                //     is a constraint on that STATIC METHOD's own T, checked
+                //     via the method's real TypeSymbol/genericParams, not
+                //     this null-declaration-TYPE gap.
+                //   - IComparable/IEquatable/IEqualityComparer/IReadOnlySpan/
+                //     INumber/ISteppable/IParsable (the latter three declare
+                //     a self-referential `where T: <IName><T>` type-bound,
+                //     not a `class`-kind constraint, on their OWN type
+                //     parameter) get a REAL synthesized TypeSymbol
+                //     (`SemaContext::isSynthesizedBuiltinInterfaceName`,
+                //     `ctx_.builtinInterfaceSym` a few lines below) — `tsym`
+                //     is non-null for them, so `checkGenericConstraints`'s
+                //     `if (tsym && ...)` gate below already runs for them;
+                //     they were never part of the null-declaration
+                //     population this fix patches.
+                //   - Atomic/AtomicInteger (`where T: value`), Channel/
+                //     ChannelSender (`where T: sendable`), and
+                //     SortedDictionary/SortedSet (`where K/T:
+                //     IComparable<K/T>`, a self-referential type bound) are a
+                //     DIFFERENT constraint kind each — not `class` — and are
+                //     out of scope for this table; measured still-open and
+                //     filed separately (issue #4318).
+                //
+                // Reuses `owningElementBadDesc` (TypeResolution_Checks.cpp,
+                // NOT modified by this fix — held this cycle) directly,
+                // rather than `checkOneConstraint`'s `kind="class"` arm the
+                // original fix used: `owningElementBadDesc` is the SAME
+                // authority the `ownedSlot` check immediately above calls,
+                // and §14.4 enumerates this table's names in the identical
+                // sentence as the six `ownedSlot` covers — provably the same
+                // question (§6/§25), not a predicate reused on a hunch.
+                // `checkOneConstraint`'s generic `"class"` arm was measured
+                // to answer that question WRONG on both divergences quoted
+                // above: (a) it calls `categorize()`, whose Primitive/
+                // Function arms classify `string`/`Function` as `Reference`
+                // — not `Value` — so it never rejects them (measured:
+                // `IOwningEnumerable<string>` compiled clean on the
+                // original fix's binary); (b) it unconditionally rejects
+                // `arg->nullable`, the OPPOSITE of §14.4's nullable-class-
+                // admitted carve-out. `owningElementBadDesc` gets both
+                // right already: it never inspects `->nullable` (a value
+                // kind is bad whether or not it is nullable; a class/
+                // interface kind is fine either way), and its Primitive/
+                // Function arms reject `string`/function outright. The
+                // deferred-generic-parameter behaviour is unchanged: an
+                // unresolved type parameter reaches `owningElementBadDesc`'s
+                // same "no declaration, not a value builtin" fallthrough
+                // that returns "" (admitted/deferred), matching
+                // `checkOneConstraint`'s `categorize() == Unknown` defer.
+                {
+                    struct NullDeclClassConstraint {
+                        std::string_view name;
+                        std::size_t slot;
+                        std::string_view paramName;
+                    };
+                    static constexpr NullDeclClassConstraint
+                        kNullDeclClassConstraints[] = {
+                            {"DrainedEntry", 1, "V"},               // §4.9
+                            {"Shared", 0, "T"},                     // §2.16
+                            {"Weak", 0, "T"},                       // §2.16
+                            {"IOwningEnumerable", 0, "T"},          // §4.13
+                            {"IOwningEnumerator", 0, "T"},          // §4.13
+                            {"IOwningAsyncEnumerable", 0, "T"},     // §4.13
+                            {"IOwningAsyncEnumerator", 0, "T"},     // §4.13
+                            {"OwningTaskCompletionSource", 0, "T"}, // §6.6
+                            {"IOwningCollection", 0, "T"},          // §4.2
+                            {"IOwningList", 0, "T"},                // §4.2
+                        };
+                    for (const auto& c : kNullDeclClassConstraints) {
+                        if (first != c.name) continue;
+                        // §send-back-#4305 fold-in: the table is hand-typed
+                        // and the bounds check below (`c.slot <
+                        // ref.genericArgs.size()`) would silently stop
+                        // firing — no crash, no failing test — if a listed
+                        // name's arity ever changed underneath it. Validate
+                        // against the SAME authority (`builtinTypeArity`)
+                        // every time this entry matches, so a future arity
+                        // change fails loudly the first time any program
+                        // (including this fix's own regression tests, which
+                        // exercise all ten entries) uses the name.
+                        // Every entry's declared arity must be a plain
+                        // positive count (never `kNotBuiltin` == -1 or
+                        // `kBuiltinTaskLike` == -2 — neither sentinel is
+                        // meaningful for a name this table expects to carry
+                        // a fixed `where <slot>: class` clause), and the
+                        // slot must fall inside it.
+                        int declaredArity = builtinTypeArity(c.name);
+                        bool slotInRange =
+                            declaredArity > 0 &&
+                            c.slot < static_cast<std::size_t>(declaredArity);
+                        if (!slotInRange) {
+                            unhandledNullDeclClassConstraintSlot(
+                                c.name, c.slot, declaredArity);
+                        }
+                        if (c.slot < ref.genericArgs.size() &&
+                            c.slot < t.genericArgs.size()) {
+                            TypeRef* carg = ref.genericArgs[c.slot];
+                            std::string badDesc = owningElementBadDesc(carg);
+                            if (!badDesc.empty()) {
+                                // Render the WRITTEN argument spelling for
+                                // the diagnostic. Mirrors argSpelling()
+                                // (TypeResolution_Checks.cpp, anonymous
+                                // namespace — not externally callable, and
+                                // that file is held this cycle) at a scale
+                                // too small to justify exposing it: this is
+                                // string rendering for a message, not a
+                                // second spelling of a classification
+                                // decision (§6).
+                                const ast::Type* argAst =
+                                    t.genericArgs[c.slot].get();
+                                std::string argName = "<type>";
+                                if (argAst &&
+                                    argAst->kind == ast::TypeKind::Named &&
+                                    argAst->name) {
+                                    argName.clear();
+                                    for (std::size_t i = 0;
+                                         i < argAst->name->parts.size();
+                                         ++i) {
+                                        if (i) argName += '.';
+                                        argName += std::string(
+                                            argAst->name->parts[i]);
+                                    }
+                                    if (argAst->nullable) argName += '?';
+                                }
+                                ctx_.diagnostics().report(
+                                    Severity::Error, t.span.begin,
+                                    std::string("type argument `") +
+                                    argName +
+                                    "` does not satisfy the constraint "
+                                    "`where " + std::string(c.paramName) +
+                                    ": class` (\xC2\xA7""14.2) \xE2\x80\x94 " +
+                                    badDesc + " has no disposal obligation "
+                                    "and cannot satisfy `" +
+                                    std::string(c.name) + "<" +
+                                    std::string(c.paramName) +
+                                    ">`'s class-only owning-generic "
+                                    "restriction (\xC2\xA7""14.4).");
+                            }
+                        }
+                        break;
                     }
                 }
                 // §3.6 / §8.3 (v0.158, #1338): record a hash-container key /
@@ -2292,8 +2762,102 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
             const auto* aliasDecl =
                 dynamic_cast<const ast::TypeAlias*>(aliasSym->decl);
             if (aliasDecl && aliasDecl->aliasedType) {
+                // fix #4167 (§27.8, v0.298): a reference to a GENERIC alias
+                // that does not supply exactly the alias's own declared
+                // number of type arguments has no sound resolution — this
+                // branch below copies the alias's CACHED underlying TypeRef
+                // (resolved once, at the alias's own declaration site, with
+                // the alias's generic params bound as `nullptr` markers in a
+                // throwaway scope) verbatim into every reference site; it
+                // never substitutes `t.genericArgs` into that cached ref, so
+                // an omitted or miscounted argument list is silently
+                // ignored rather than caught. For an alias whose body IS (or
+                // reduces to) one of its own type parameters —
+                // `type IdP11<T> := T;` — a bare reference's cached
+                // underlying TypeRef is `Kind::Named` with
+                // `declaration == nullptr`: exactly the shape §26.2 reserves
+                // for "the target is a type parameter", and nothing
+                // downstream can tell it apart from the legitimate
+                // declaration-less shape locally-resolved builtins use
+                // (`Array<T>`, `IEnumerable<T>`, …) — `extension IdP11`
+                // (bare) reached codegen with a permanently dead, uncallable
+                // member block and zero diagnostics (issue #4167). This
+                // check closes the hole at its root, for every reference
+                // context a bare/miscounted generic-alias name can appear in
+                // (locals, fields, parameters, extension targets, …), not
+                // just extension targets — completing, for aliases, the
+                // same generic-arity check the ordinary-TypeSymbol arm gives
+                // a few lines below (search this file for "Generic-arity
+                // check"). NOTE (narrow #4167, review-caught): no normative
+                // spec section states this reference-site arity rule for
+                // EITHER arm — searched §11.3 "Member body" (member-clash
+                // rules, unrelated), Appendix C.4 "Generics" (entirely
+                // `where`-clause constraint/substitution semantics, no
+                // argument-count rule), §14.1-§14.6 (§14.5 states the
+                // omit-or-supply-in-full rule for a generic METHOD CALL's
+                // type-argument list, a different subject), and Appendix
+                // C.1 "Type system" (no matching bullet); filed as issue
+                // #4181 — a genuine spec gap, not a citation this comment
+                // can correctly make. Unlike the ordinary-TypeSymbol arm, a
+                // wholly bare (zero-argument) reference is
+                // ALSO rejected here when the alias is generic: the
+                // TypeSymbol check tolerates an omitted argument list (a
+                // "raw" reference to the real declared type, which still
+                // carries a genuine declaration downstream); a generic
+                // alias has no such safe fallback; its cached underlying
+                // ref is the ONLY representation available and — as above —
+                // is indistinguishable from a bare type-parameter reference
+                // when the alias's body is one.
+                if (t.genericArgs.size() != aliasDecl->genericParams.size()) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, t.span.begin,
+                        "generic-argument count does not match type "
+                        "alias `" + std::string(aliasDecl->name) +
+                        "`'s generic-parameter count (\xC2\xA7""27.8)");
+                    // Resolve any supplied args anyway so the AST is fully
+                    // visited (matches the primitive-generic-args error
+                    // path above).
+                    for (const auto& ga : t.genericArgs) {
+                        if (ga) resolveType(*ga, scope);
+                    }
+                    ref.kind = TypeRef::Kind::Error;
+                    return;
+                }
                 if (TypeRef* underlying =
                         ctx_.resolvedType(*aliasDecl->aliasedType)) {
+                    // fix #4188 (§27.8, v0.298): `underlying` is the alias's
+                    // CACHED TypeRef, resolved once at the alias's own
+                    // declaration against a throwaway scope that binds the
+                    // alias's own parameters to nullptr markers
+                    // (resolveTopDecl's TypeAlias arm) — so it still carries
+                    // those parameters UNBOUND. Without substituting THIS
+                    // reference site's concrete arguments in, a generic
+                    // alias used as e.g. a call argument's local type
+                    // resolved to `declaration = Box` (correct, #1462) but
+                    // `genericArgs = [T-unbound]` instead of `[int]` — the
+                    // spec's own "each instantiation of the alias is
+                    // interchangeable with the corresponding instantiation
+                    // of the aliased type" (§27.8) requires the latter.
+                    // Downstream, a bare/unbound `T` here is indistinguishable
+                    // from "cannot infer this generic method type parameter
+                    // from this argument", so a call passing such a value
+                    // silently fell back to the UNSPECIALIZED generic-method
+                    // template — an IR-verifier failure (call parameter type
+                    // vs. the concrete argument's specialized struct type).
+                    std::unordered_map<std::string_view, TypeRef*> aliasSubst;
+                    for (std::size_t gi = 0;
+                         gi < aliasDecl->genericParams.size() &&
+                         gi < t.genericArgs.size(); ++gi) {
+                        if (!t.genericArgs[gi]) continue;
+                        TypeRef* concreteArg =
+                            resolveType(*t.genericArgs[gi], scope);
+                        if (!concreteArg) continue;
+                        aliasSubst[aliasDecl->genericParams[gi].name] =
+                            concreteArg;
+                    }
+                    underlying =
+                        substituteAliasGenericArgs(underlying, aliasSubst,
+                                                    t.span.begin);
                     // Copy the underlying kind and payload into ref. The nullable
                     // flag on ref was already set from the syntactic `?` suffix in
                     // resolveType; the underlying type's nullable flag is

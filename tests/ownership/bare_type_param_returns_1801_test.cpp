@@ -271,7 +271,7 @@ BEZEL_TEST(bare_type_param_returns,
 // consume while the result is live; S2 closes the complementary hole where the
 // bare-T borrow ESCAPES its sources: returning the holder, or storing it into
 // an owned field / longer-lived sink, when a carried source is a live owned
-// scope-bound local. §28.9 / §9.7 borrow-lifetime rule, adapted to the union
+// scope-bound local. §28.3 / §9.7 borrow-lifetime rule, adapted to the union
 // source set (§28.3 *Bare-type-parameter returns*, v0.194).
 // ===========================================================================
 

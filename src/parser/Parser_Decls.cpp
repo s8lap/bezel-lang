@@ -25,6 +25,12 @@ NodePtr stampSpan(NodePtr node, const SourceLocation& start,
 } // namespace
 
 std::unique_ptr<ast::SourceFile> Parser::parseCompilationUnit() {
+    // fix #4348: a parse run starts with the expression-recursion depth at
+    // zero (the Parser may be reused if a host calls parseCompilationUnit
+    // twice, though in practice the Driver constructs a fresh one per
+    // file). Resetting here keeps the guard honest without depending on
+    // the Parser being constructed fresh.
+    expressionRecursionDepth_ = 0;
     auto sourceFile = std::make_unique<ast::SourceFile>();
 
     // §2.1: "Every source file declares its module on its first non-comment,
@@ -349,7 +355,27 @@ std::unique_ptr<ast::TypeDecl> Parser::parseTypeOrInterfaceDecl(
                             peekNext().text != ")";
                         int depth = 1;
                         advance();
-                        while (depth > 0 && current_.kind != TokenKind::EndOfFile) {
+                        // fix #4341 (§26.3-analogous discard-loop hardening,
+                        // Appendix A.3, v0.298): bound this discard scan by
+                        // `isKeyword("end")` in addition to depth/EOF, the
+                        // same shape #4257 applied to the extension
+                        // `polymorphic(...)` discard loop. Without this
+                        // bound, an unclosed `(` on a non-first InheritItem
+                        // (e.g. `class Foo(x: int): Base(x), IBar(unclosed`)
+                        // consumed the type's own `end Foo;` terminator and
+                        // every subsequent top-level declaration to EOF —
+                        // measured directly: this exact probe shape produced
+                        // only "expected 'end'" at EOF, swallowing a
+                        // deliberately-malformed following class whole. This
+                        // cannot misfire on well-formed input: `ArgList`
+                        // (Appendix A) admits only expression tokens inside
+                        // the parens, and `end` is a reserved keyword
+                        // (`Lexer.cpp`'s `isReservedKeyword`), so it can
+                        // never be part of a well-formed argument — a
+                        // well-formed list can never be at depth >= 1 when
+                        // the current token is `end`.
+                        while (depth > 0 && current_.kind != TokenKind::EndOfFile &&
+                               !isKeyword("end")) {
                             if (isPunctuator("("))      ++depth;
                             else if (isPunctuator(")")) --depth;
                             advance();
@@ -587,12 +613,47 @@ std::unique_ptr<ast::TypeDecl> Parser::parseTypeOrInterfaceDecl(
         advance();
         // §14: `end TypeName<T>;` — skip generic params in the end label so
         // that generic class declarations can label their end consistently.
+        // fix #4347 (§1.6 / Appendix A.3, v0.298): the discard loop here
+        // tracks only `<`/`>` depth, bounded solely by `depth == 0` or
+        // `EndOfFile`. On a malformed end-label with an unclosed `<` nothing
+        // bounded the scan, so it consumed the rest of the file. Unlike the
+        // three sibling discard-loop instances fixed this run (#4257,
+        // #4341, #4343), this loop runs AFTER the enclosing type's `end`
+        // keyword has already been consumed — there is no single reserved
+        // keyword that universally bounds it the way `end` does for the
+        // others, since the next top-level declaration can start with
+        // several different keywords (`Parser::parseTopDecl`). Bound by:
+        //   - `;` (the end-label's expected terminator; `;` cannot appear
+        //     inside a well-formed generic-parameter spelling — Appendix A.3
+        //     `GenericArgs` admits only `GenericArg` separated by `,`,
+        //     balanced `<`/`>`, no statement-level punctuation); and
+        //   - any TopDecl-starting keyword reachable from this position
+        //     (`type` / `extension` / `extern`, the four visibility
+        //     keywords, the four modifier keywords, the five kind keywords
+        //     `class`/`interface`/`record`/`enum`/`choice`). None of these
+        //     can appear inside a well-formed generic-parameter end-label
+        //     spelling (none is a valid type-parameter identifier; the
+        //     GenericArgs grammar's terminals are `Identifier`, `,`, `<`,
+        //     `>`). The pre-fix bug suppressed every diagnostic that would
+        //     otherwise be reported in the rest of the file.
         if (isPunctuator("<")) {
             advance();  // skip `<`
             int depth = 1;
             while (depth > 0 && current_.kind != TokenKind::EndOfFile) {
                 if (isPunctuator("<")) depth++;
                 else if (isPunctuator(">")) { depth--; if (depth == 0) break; }
+                else if (isPunctuator(";") ||
+                         isKeyword("type") || isKeyword("extension") ||
+                         isKeyword("extern") ||
+                         isKeyword("public") || isKeyword("private") ||
+                         isKeyword("internal") || isKeyword("protected") ||
+                         isKeyword("abstract") || isKeyword("closed") ||
+                         isKeyword("sealed") || isKeyword("static") ||
+                         isKeyword("class") || isKeyword("interface") ||
+                         isKeyword("record") || isKeyword("enum") ||
+                         isKeyword("choice")) {
+                    break;
+                }
                 advance();
             }
             if (isPunctuator(">")) advance();  // consume final `>`
@@ -632,6 +693,21 @@ std::unique_ptr<ast::TopDecl> Parser::parseExtensionDecl(
     ext->genericConstraints = parseGenericConstraints();
     while (!isKeyword("end") &&
            current_.kind != TokenKind::EndOfFile) {
+        // fix #4222 (§26.3, Appendix A.4, v0.298): mirrors
+        // `parseTypeDeclBody`'s class/record special-case peek just above
+        // (`isKeyword("polymorphic") && peekAt(1).text == "("`) — `polymorphic`
+        // is contextual (only a member clause when immediately followed by
+        // `(`; otherwise it is an ordinary identifier, e.g. a field or method
+        // name). Without this peek, `parseMember()` below has no arm for a
+        // bare `polymorphic` identifier and cascades one generic parse-error
+        // diagnostic per stray token instead of the one clean §26.3
+        // rejection this produces.
+        if (current_.kind == TokenKind::Identifier &&
+            current_.text == "polymorphic" &&
+            peekAt(1).text == "(") {
+            parseAndDiscardExtensionPolymorphicMember();
+            continue;
+        }
         auto m = parseMember();
         if (m) {
             ext->members.push_back(std::move(m));
@@ -2220,6 +2296,97 @@ void Parser::parsePolymorphicMember(ast::TypeDecl& decl) {
     }
 }
 
+// fix #4222 (§26.3 "Restrictions" / Appendix A.4 `PolymorphicMember` clause,
+// v0.298): `parseExtensionDecl`'s member loop's own peek-and-discard for a
+// `polymorphic(...)` clause. Deliberately NOT a call to
+// `parsePolymorphicMember(ast::TypeDecl&)` above — that function's token-
+// consumption logic was validated for a context that HAS a `TypeDecl` to
+// mutate (`decl.serializedClass->polyCases`); an extension body has no
+// `TypeDecl` at all, so calling it here would need a `TypeDecl&` to hand it
+// that does not exist (LANE_RULES §25: ask what a helper was validated for,
+// not what it looks like it does). Instead this walks the same token shape
+// — `"polymorphic" "(" (StringLiteral ":" Type)? ("," (StringLiteral ":"
+// Type))* ","? ")" ";"` — tracking only paren depth, and discards every
+// piece: no `PolyCase`, no `Type` AST is built, because nothing here owns a
+// place to put them. `depth` also survives a malformed clause without
+// looping forever: the `!= EndOfFile` guard bounds it even if a `)` is
+// missing, and a missing trailing `;` is simply not consumed (the outer
+// member loop's own `else if (current_.kind != TokenKind::EndOfFile)
+// advance();` fallback still makes progress on whatever comes next).
+void Parser::parseAndDiscardExtensionPolymorphicMember() {
+    const SourceLocation loc = current_.location;  // the `polymorphic` token
+    advance();  // past `polymorphic`
+    // fix #4264 (send-back on #4257, §26.3/A.4, v0.298): remember the `(`
+    // token's own location and whether the discard scan below ever finds
+    // its matching `)`, so an unclosed-paren clause can get a supplementary
+    // note pointing at the unmatched `(` instead of leaving the user to
+    // discover the clause is ALSO malformed only after relocating it.
+    SourceLocation parenLoc{};
+    bool sawOpenParen = false;
+    bool parenMatched = false;
+    if (isPunctuator("(")) {
+        parenLoc = current_.location;
+        sawOpenParen = true;
+    }
+    if (consumePunctuator("(")) {
+        int depth = 1;
+        // fix #4257 (send-back on #4222): also bound the scan by `end`, not
+        // just EOF/depth-0, mirroring this loop's own caller
+        // (`parseExtensionDecl`'s member loop condition is
+        // `!isKeyword("end") && current_.kind != TokenKind::EndOfFile`).
+        // Without this, an unclosed `(` — the single most likely real typo
+        // here — made the depth-tracking scan consume the extension's own
+        // `end extension;` terminator and every subsequent top-level
+        // declaration to EOF (#4257's measured repro).
+        //
+        // This cannot misfire on well-formed input: A.4's
+        // `PolymorphicMember ::= "polymorphic" "(" PolyCase ("," PolyCase)*
+        // ","? ")" ";"` and `PolyCase ::= StringLiteral ":" QualifiedName`
+        // (QualifiedName ::= Identifier ("." Identifier)*) admit only
+        // StringLiteral / ":" / "," / "." / Identifier tokens (and the
+        // closing ")") inside the parens — never a nested "(" and never a
+        // bare `end`, because `end` is in the Lexer's reserved-keyword list
+        // (`Lexer.cpp:113`) and so always lexes as `TokenKind::Keyword`,
+        // never as an `Identifier` a `QualifiedName` could contain. So a
+        // well-formed clause can never be at depth >= 1 when the current
+        // token is the `end` keyword, and this bound is unreachable on the
+        // happy path — verified structurally, not just by the existing
+        // lit test staying green.
+        while (depth > 0 && current_.kind != TokenKind::EndOfFile &&
+               !isKeyword("end")) {
+            if (isPunctuator("(")) {
+                ++depth;
+            } else if (isPunctuator(")")) {
+                --depth;
+                if (depth == 0) {
+                    advance();  // consume the closing ')'
+                    parenMatched = true;
+                    break;
+                }
+            }
+            advance();
+        }
+    }
+    consumePunctuator(";");
+    diagnostics_.report(
+        Severity::Error, loc,
+        "an extension block may not declare a `polymorphic` member "
+        "registry — Appendix A.4's `ExtensionMember` grammar admits only "
+        "methods and expression-bodied properties (§26.3)");
+    // fix #4264: `sawOpenParen && !parenMatched` means the discard scan
+    // above exited via #4257's `isKeyword("end")`/EOF bound rather than by
+    // finding the matching `)` — i.e. the clause's own parens are
+    // unbalanced, independently of the §26.3 placement rejection above. A
+    // user who follows the §26.3 diagnostic's evident fix (move the clause
+    // onto the extended type's own class body, where `polymorphic(...)` is
+    // legal) would otherwise hit this unrelated-looking parse error only
+    // AFTER making that move, with nothing at the original site to hint the
+    // clause itself is also malformed on its own terms.
+    if (sawOpenParen && !parenMatched) {
+        diagnostics_.report(Severity::Note, parenLoc,
+                             "`(` opened here has no matching `)`");
+    }
+}
 
 std::unique_ptr<ast::MethodDecl> Parser::parseMethodDeclBody(
     ast::Visibility visibility, std::vector<std::string_view> modifiers,
@@ -3207,7 +3374,22 @@ std::vector<std::unique_ptr<ast::Type>> Parser::parseInheritance(
             // Skip a balanced parenthesised group without parsing its contents.
             int depth = 1;
             advance();
-            while (depth > 0 && current_.kind != TokenKind::EndOfFile) {
+            // fix #4343 (same §26.3-analogous discard-loop class as #4257 /
+            // #4341, Appendix A.3, v0.298): bound this discard scan by
+            // `isKeyword("end")` in addition to depth/EOF. Without this
+            // bound, an unclosed `(` on a non-first `InheritItem` here (this
+            // function serves record/interface decls and classes with no
+            // primary constructor — the `hasPositionalFields` branch above
+            // has its own, now-identically-hardened copy of this same loop)
+            // consumed the type's own `end TypeName;` terminator and every
+            // subsequent top-level declaration to EOF. Cannot misfire on
+            // well-formed input for the same reason as those two fixes:
+            // Appendix A's `ArgList` grammar admits only expression tokens
+            // inside the parens, and `end` is a reserved keyword
+            // (`Lexer.cpp`'s `isReservedKeyword`), so it can never appear
+            // inside a well-formed argument list.
+            while (depth > 0 && current_.kind != TokenKind::EndOfFile &&
+                   !isKeyword("end")) {
                 if (isPunctuator("("))      ++depth;
                 else if (isPunctuator(")")) --depth;
                 advance();

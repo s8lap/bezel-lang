@@ -1,7 +1,7 @@
-// §28.9 "Runtime-managed types" (v0.286), issue #3564: the owned
+// §28.3 "Captured owned bindings" (v0.286), issue #3564: the owned
 // scope-bound-local half of the lambda-body traversal hole fix #3546 named.
 //
-// §28.9: "Capturing an *owned* class-typed local does **not** transfer
+// §28.9 (restating §28.3's rule): "Capturing an *owned* class-typed local does **not** transfer
 // ownership into the closure: the capture is a borrow whose source is the
 // local's enclosing scope, borrow-state throughout — the closure may not
 // assign to, transfer from, or dispose the captured binding, and may not
@@ -48,6 +48,6 @@ class C
   end Main;
 end C;
 
-// The §28.9 diagnostic is the method-level one, verbatim.
+// The §28.3 diagnostic is the method-level one, verbatim.
 // CHECK: :{{[0-9]+}}:{{[0-9]+}}: returned closure captures `r` whose source is disposed at scope end
-// CHECK-SAME: (§28.9 closure-capture escape
+// CHECK-SAME: (§28.3 closure-capture escape

@@ -260,6 +260,7 @@ void Emitter::emitDisposerCore(const sema::TypeSymbol* ts, llvm::Function* fn) {
         boxCaptureLocals_.clear();
         singleCaptureLocals_.clear();
         assignedCaptureVars_.clear();
+        returnedCaptureVars_.clear();  // fix #4198
         definitelyEscapingLambdas_.clear();
         boxCaptureLocalsFn_ = fn;
         cellFreeEligible_.clear();
@@ -267,6 +268,13 @@ void Emitter::emitDisposerCore(const sema::TypeSymbol* ts, llvm::Function* fn) {
         sharedCellEnvdtorFreeOwner_.clear();  // fix #3426
         cellFreeEligibleFn_ = fn;
         collectClosureReleaseEligible(dd->body);
+        // fix #4174 follow-up: the closure twin of the string parameter
+        // retain above — see retainAssignedClosureParams' own comment. A
+        // destructor takes no parameters (§18), so this is a structural
+        // no-op (mirrors the CO-GATED PARAMETER RETAIN note above for
+        // strings) — called to keep the retain/release invariant checkable
+        // at review, exactly as retainAssignedStringParams(dd->body, {}) is.
+        retainAssignedClosureParams(dd->body, /*params=*/{});
         collectBoxReleaseEligible(dd->body);
         collectBoxCaptureLocals(dd->body);
         collectDefinitelyEscapingLambdas(dd->body);
@@ -909,7 +917,33 @@ void Emitter::emitOwnedParamCaptureDispose(sema::Symbol* p, llvm::Value* obj) {
         emitDisposeAndReclaim(obj);
         return;
     }
-    // (4) Anything unrecognised — LOUD `internal:` warning, do NOT take the
+    // (4) fix #4328 (§28.3 / §28.2 / §28.12, v0.298): an owned PARAMETER whose
+    // declared type is one of the BUILT-IN INTERFACE HEADS `IDisposable` /
+    // `IAsyncDisposable` (both declaration-less, in `kBuiltinInterfaceHeads` —
+    // fix #4326 deliberately KEEPS them out of the vtable-less set, so case
+    // (2) above correctly declines; the runtime value is always a vtable-
+    // bearing user class per §8.1, every class implicitly implements
+    // `IDisposable` and a class may explicitly implement `IAsyncDisposable`).
+    // `emitDisposeAndReclaim` loads vtable slot 2 = Dispose and reclaims —
+    // the SAME path the explicit-Dispose chain takes for an `IDisposable`-
+    // typed owned slot (lowerCall's `emitExplicitDisposeChain` else-branch),
+    // and the same path the explicit-Dispose chain takes when it IS the
+    // declared class. For an async method holding an `owned d: IAsyncDisposable`,
+    // this is a sync fallback (§28.12: "the synchronous-fallback path runs
+    // for an iterator-format `await using`"; the same sync fallback applies
+    // here — the compiler does not yet emit a DisposeAsync+await state
+    // machine for owned-param auto-drop, so the vtable Dispose is the
+    // defined degraded behavior, not a fresh defect).
+    if (pt && pt->kind == sema::TypeRef::Kind::Named && !pt->declaration &&
+        pt->astNode && pt->astNode->name &&
+        !pt->astNode->name->parts.empty()) {
+        std::string_view bn = pt->headName();
+        if (bn == "IDisposable" || bn == "IAsyncDisposable") {
+            emitDisposeAndReclaim(obj);
+            return;
+        }
+    }
+    // (5) Anything unrecognised — LOUD `internal:` warning, do NOT take the
     // silent vtable jump. The fix's premise is that the default must invert:
     // a path the existing classifier can answer takes its answer; a path it
     // cannot answer MUST surface the question, not paper over it.
@@ -1612,6 +1646,135 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
             llvm::Value* val = builder_.CreateLoad(ptrTy(), addr, "boxf.val");
             emitBoxRelease(val);
             builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), addr);
+        }
+    }
+
+    // fix #4253 (§9.7 / §28.9, v0.298): release every RECORD-typed field /
+    // auto-property of THIS class whose declared type owns at least one
+    // `string` field (isRecordWithStringFieldsTypeRef — recurses through
+    // nested records/choices, same authority the LOCAL scope-end release
+    // uses) and whose OWN declaration initializer is provably a fresh,
+    // alias-free construction of exactly that record type
+    // (isFreshRecordConstructionOfExactType — the SAME eligibility proof
+    // #2448/#4237 established for a plain `var` record local; reused
+    // verbatim, not re-derived, per LANE_RULES §6/§25).
+    //
+    // BEFORE THIS FIX there was NO release path for this shape AT ALL:
+    // emitOwnedFieldDisposals (this function) only ever walks `owned`-
+    // annotated fields (reference types) — a record can never carry
+    // `owned` (§9.7 forbids it; records are value types embedded inline)
+    // — so a class field like `public readonly property P: Box := new
+    // Box("s");` (`record Box(Value: string);`) leaked its string
+    // unconditionally, at ONE level of nesting, no generics, no cycle
+    // (issue #4253 — measured 11290 B / 600 allocations at 300 loop
+    // iterations, identical in magnitude to #4237's own local-variable
+    // figures for the analogous shape). Own members only (mirrors the
+    // string/closure/box walks above): an inherited slot is released by
+    // the base CORE disposer via emitBaseDisposeChain.
+    //
+    // DIRECTION / SAFETY: this walk only ever ADDS a release where none
+    // existed (a safe-direction leak becomes balanced). It can turn that
+    // leak into a double-free / UAF only if the field's value at Dispose
+    // time could differ from what the admitted initializer constructed,
+    // or could alias another live binding. Three conditions below close
+    // every reassignment vector found while investigating this issue —
+    // each verified against the REAL compiler, not assumed:
+    //   1. `readonly` — MEASURED: an ordinary (non-constructor) method
+    //      assigning `this.P := ...` to a readonly property is REJECTED
+    //      ("cannot assign to readonly property `P` outside a field
+    //      initializer or constructor (\xC2\xA7 23.1)"). Closes the
+    //      arbitrary-method-reassignment vector.
+    //   2. `!hasAnyConstructor(ts)` — no EXPLICIT constructor exists on
+    //      THIS type, so there is no user-written constructor BODY that
+    //      could reassign the field after its own declaration initializer
+    //      runs. Worth recording because it is NOT redundant with (1):
+    //      MEASURED that a readonly property WITH a declaration
+    //      initializer can currently ALSO be reassigned a second time
+    //      inside an explicit constructor body with NO diagnostic at
+    //      all — sema does not yet enforce §22.8's "at most once,
+    //      counting the field initializer and every constructor body in
+    //      the this(...) chain together" rule when an initializer is
+    //      already present (filed as issue #4275 — a sema gap, out of
+    //      scope for this codegen fix). This condition is the guard
+    //      against it: no constructor body exists to exploit the gap.
+    //   3. `sealed` on `ts` — MEASURED: a DERIVED class's constructor can
+    //      currently reassign a readonly property INHERITED from its
+    //      base with NO diagnostic (a second, broader sema gap than #2 —
+    //      filed as issue #4276). `hasAnyConstructor` only inspects
+    //      `ts`'s OWN members, so it cannot see a subclass's
+    //      constructor; requiring `ts` to be `sealed` closes the vector
+    //      structurally — no subclass can exist to hold such a
+    //      constructor, in this module or any importer.
+    // Together: the field is assigned EXACTLY ONCE, by its own
+    // declaration initializer, for the entire lifetime of every
+    // instance — no other write site exists (own methods barred by (1),
+    // an own constructor body doesn't exist by (2), a derived-class
+    // constructor cannot exist by (3)). The initializer's own
+    // eligibility proof (isFreshRecordConstructionOfExactType) is what
+    // makes that ONE assignment's value provably alias-free.
+    //
+    // A field lacking any of these three properties, or whose
+    // initializer is not a provably-fresh NewExpr of the declared type,
+    // is UNCHANGED — still safe-leaks exactly as before this fix
+    // (deliberately narrow, matching #2866/#4237's own local-binding
+    // admission). The residual — constructor-body-assigned fields,
+    // non-sealed classes — is filed as issue #4277.
+    {
+        llvm::StructType* rst = classStruct(ts);
+        bool tsSealed = false;
+        for (auto tmod : ts->modifiers)
+            if (tmod == "sealed") { tsSealed = true; break; }
+        bool tsHasCtor = hasAnyConstructor(ts);
+        for (const sema::Symbol* m : ts->members) {
+            bool isField = dynamic_cast<const sema::FieldSymbol*>(m) != nullptr;
+            if (!isField && !sema::isAutoPropertyStorageSymbol(m, ctx_))
+                continue;  // fix #3152 — see the string walk above
+            auto idxIt = fieldIndex_.find(m);
+            if (idxIt == fieldIndex_.end()) continue;
+            if (!tsSealed || tsHasCtor) continue;
+            const sema::TypeRef* fieldTr = recordMemberType(m);
+            if (!isRecordWithStringFieldsTypeRef(fieldTr)) continue;
+            bool isReadonly = false;
+            if (auto* ms = dynamic_cast<const sema::MemberSymbol*>(m))
+                for (auto fmod : ms->modifiers)
+                    if (fmod == "readonly") { isReadonly = true; break; }
+            if (!isReadonly) continue;
+            const ast::Expr* init = nullptr;
+            // SEAM-ACCESSOR: `m->decl` is nullptr for an IMPORTED field (no
+            // ast::FieldDecl crosses the module boundary, the #3671 seam) --
+            // the fallback immediately below (ctx_.importedInstanceFieldInitExpr)
+            // is the sanctioned both-sources accessor for exactly this arm,
+            // the same one emitOwnFieldInit (LlvmBackend_Setup.cpp) and the
+            // record-preamble init walk (LlvmBackend_Exprs2.cpp) already use.
+            if (auto* fd = dynamic_cast<const ast::FieldDecl*>(m->decl))
+                init = fd->initializer.get();
+            // SEAM-ACCESSOR: ditto -- see the FieldDecl arm immediately above.
+            else if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(m->decl))
+                init = pd->autoInitializer.get();
+            // fix #4279 (§9.7/§28.9, v0.298): an imported field/property has
+            // no ast::FieldDecl/PropertyDecl at all (m->decl == nullptr), so
+            // the two arms above always miss for it and this walk's release
+            // silently never fired for an imported record-typed field --
+            // narrow relative to the local case, but NOT a wrong answer: it
+            // just never released. `importedInstanceFieldInitExpr` is the
+            // #2874 load-time-reconstructed ast::Expr* for exactly this case
+            // (ModuleLoader re-parses and sema-types the exporting module's
+            // initializer text, then publishes the resolved Expr* here) --
+            // the SAME accessor emitOwnFieldInit and the record-preamble
+            // init walk already consult for the identical m->decl==nullptr
+            // gap, reused verbatim rather than re-derived (LANE_RULES §6/§25).
+            if (!init && m->decl == nullptr) {
+                if (const ast::Expr* parsedInit =
+                        ctx_.importedInstanceFieldInitExpr(m))
+                    init = parsedInit;
+            }
+            if (!init) continue;
+            if (!isFreshRecordConstructionOfExactType(init,
+                                                       fieldTr->declaration))
+                continue;
+            llvm::Value* addr = builder_.CreateStructGEP(
+                rst, currentThis_, idxIt->second, "recf.addr");
+            emitRecordStringFieldReleases(addr, fieldTr);
         }
     }
 
@@ -2634,6 +2797,48 @@ const char* Emitter::usingAutoDropVtablelessBuiltin(std::string_view n) {
 }
 
 
+// fix-forward #4185 (review round 2, §25 / §6): the ONE place `bn` is
+// compared against this builtin-family's names. Pure — no IR emitted, no
+// Emitter state read beyond the argument — so both
+// `emitVtablelessBuiltinRelease` (which switches on the result to decide
+// WHAT to emit) and `vtablelessBuiltinReleaseIsKnown` (which only asks
+// whether a match exists) are downstream of this single classification;
+// there is no second list left to drift out of sync with it. See the
+// declaration in LlvmBackend_impl.hpp for the round-1-vs-round-2 history.
+Emitter::VtablelessBuiltinReleaseArm
+Emitter::classifyVtablelessBuiltinRelease(std::string_view bn) {
+    if (bn == "StringBuilder") return VtablelessBuiltinReleaseArm::StringBuilder;
+    if (bn == "Random") return VtablelessBuiltinReleaseArm::Random;
+    if (bn == "Atomic" || bn == "AtomicInteger")
+        return VtablelessBuiltinReleaseArm::AtomicFamily;
+    if (bn == "EventSource" || bn == "AsyncEventSource")
+        return VtablelessBuiltinReleaseArm::EventSourceFamily;
+    if (bn == "TaskCompletionSource" || bn == "OwningTaskCompletionSource")
+        return VtablelessBuiltinReleaseArm::TaskCompletionSourceFamily;
+    if (bn == "Channel") return VtablelessBuiltinReleaseArm::Channel;
+    if (bn == "ChannelSender") return VtablelessBuiltinReleaseArm::ChannelSender;
+    if (bn == "Stopwatch") return VtablelessBuiltinReleaseArm::Stopwatch;
+    if (bn == "Mutex") return VtablelessBuiltinReleaseArm::Mutex;
+    if (bn == "Lock") return VtablelessBuiltinReleaseArm::Lock;
+    if (bn == "Semaphore") return VtablelessBuiltinReleaseArm::Semaphore;
+    if (bn == "SemaphoreToken")
+        return VtablelessBuiltinReleaseArm::SemaphoreToken;
+    if (bn == "CancellationTokenSource")
+        return VtablelessBuiltinReleaseArm::CancellationTokenSource;
+    if (bn == "FileStream") return VtablelessBuiltinReleaseArm::FileStream;
+    if (bn == "Subscription") return VtablelessBuiltinReleaseArm::Subscription;
+    return VtablelessBuiltinReleaseArm::None;
+}
+
+// fix-forward #4185 (review round 2, §25): "did classification find a
+// match" — no name list of its own (round 1's hand-synced array is gone;
+// this and `emitVtablelessBuiltinRelease` below both ask
+// `classifyVtablelessBuiltinRelease`, the one place names are spelled).
+bool Emitter::vtablelessBuiltinReleaseIsKnown(std::string_view bn) {
+    return classifyVtablelessBuiltinRelease(bn) !=
+           VtablelessBuiltinReleaseArm::None;
+}
+
 bool Emitter::emitVtablelessBuiltinRelease(std::string_view bn,
                                            llvm::Value* recv) {
     if (bn.empty() || !recv || !recv->getType()->isPointerTy()) return false;
@@ -2642,9 +2847,10 @@ bool Emitter::emitVtablelessBuiltinRelease(std::string_view bn,
         builder_.CreateCall(declareC(fn, llvm::Type::getVoidTy(llvm_), ps),
                             args);
     };
+    switch (classifyVtablelessBuiltinRelease(bn)) {
     // stdlib §3.1 / #1185: a StringBuilder IS a `bz_array_t*` of string parts
     // and owns a +1 per part; the string-element release thunk discharges each.
-    if (bn == "StringBuilder") {
+    case VtablelessBuiltinReleaseArm::StringBuilder: {
         llvm::Value* disp = stringElementReleaseThunk();
         builder_.CreateCall(
             declareC("bz_array_free", llvm::Type::getVoidTy(llvm_),
@@ -2662,7 +2868,9 @@ bool Emitter::emitVtablelessBuiltinRelease(std::string_view bn,
     // restates as "A trivial-dispose class's instances are compiler-freed at
     // their owner's release point". `bz_random_alloc` mallocs one and
     // `bz_random_free` is a plain `free`.
-    if (bn == "Random") { callVoid("bz_random_free", {recv}); return true; }
+    case VtablelessBuiltinReleaseArm::Random:
+        callVoid("bz_random_free", {recv});
+        return true;
     // fix #2973 (§28.3 / §28.9, stdlib §6.4, v0.240): `Atomic<T>` /
     // `AtomicInteger<T>`. `bz_atomic_dispose` FREES — verified in the runtime,
     // not inferred: it flips a `disposed.exchange(true)` once and then calls
@@ -2677,21 +2885,18 @@ bool Emitter::emitVtablelessBuiltinRelease(std::string_view bn,
     // `vtablelessBuiltin` scope-exit path null-GUARDS its reload — measured
     // clean here under generated-code ASan for `using var` + explicit
     // `Dispose()` in the same 200-iteration loop.
-    if (bn == "Atomic" || bn == "AtomicInteger") {
+    case VtablelessBuiltinReleaseArm::AtomicFamily:
         callVoid("bz_atomic_dispose", {recv});
         return true;
-    }
     // §24.3 / §6.5 / #2026: sync and async sources share one runtime
     // representation, so both free identically (null-safe).
-    if (bn == "EventSource" || bn == "AsyncEventSource") {
+    case VtablelessBuiltinReleaseArm::EventSourceFamily:
         callVoid("bz_event_source_free", {recv});
         return true;
-    }
     // §6.6 / §30.11 / #974: the four-step TCS release (see emitTcsRelease).
-    if (bn == "TaskCompletionSource" || bn == "OwningTaskCompletionSource") {
+    case VtablelessBuiltinReleaseArm::TaskCompletionSourceFamily:
         emitTcsRelease(recv);
         return true;
-    }
     // §30.15 (#600 phase c): a Channel<T>. Dispose via bz_channel_dispose
     // (closes, faults pending receivers with ChannelClosedException, disposes
     // undelivered items in reverse order per §28.11, frees the struct). The
@@ -2699,7 +2904,7 @@ bool Emitter::emitVtablelessBuiltinRelease(std::string_view bn,
     // setupBuiltinExceptions); may be null if Channel<T> reaches this path
     // before setup — bz_channel_dispose tolerates a null second argument
     // (verified in the runtime).
-    if (bn == "Channel") {
+    case VtablelessBuiltinReleaseArm::Channel: {
         llvm::Value* cceVt = llvm::ConstantPointerNull::get(ptrTy());
         {   auto vit = builtinVtable_.find("ChannelClosedException");
             if (vit != builtinVtable_.end()) cceVt = vit->second;
@@ -2711,65 +2916,59 @@ bool Emitter::emitVtablelessBuiltinRelease(std::string_view bn,
     }
     // §30.15: a ChannelSender<T>. bz_channel_sender_release decrements the
     // sender count (may close the channel if it reaches zero).
-    if (bn == "ChannelSender") {
+    case VtablelessBuiltinReleaseArm::ChannelSender:
         callVoid("bz_channel_sender_release", {recv});
         return true;
-    }
     // §8.1 / #646: a Stopwatch — a `bz_stopwatch_t*` freed via
     // bz_stopwatch_free (null-safe). Same release the `using var` arm emits.
-    if (bn == "Stopwatch") {
+    case VtablelessBuiltinReleaseArm::Stopwatch:
         callVoid("bz_stopwatch_free", {recv});
         return true;
-    }
     // §6.2 / #647: a Mutex. bz_mutex_dispose marks disposed and drops the
     // Mutex object's core ref. Idempotent per §28.2 (the disposed flag
     // prevents double-release). Null-safe (handles Mutex?).
-    if (bn == "Mutex") {
+    case VtablelessBuiltinReleaseArm::Mutex:
         callVoid("bz_mutex_dispose", {recv});
         return true;
-    }
     // §6.2 / #647: a Lock (owned guard returned by Mutex.Acquire /
     // TryAcquire). bz_lock_release checks the released flag, null-safe.
-    if (bn == "Lock") {
+    case VtablelessBuiltinReleaseArm::Lock:
         callVoid("bz_lock_release", {recv});
         return true;
-    }
     // §6.3 / #647: a Semaphore. bz_semaphore_dispose marks disposed and drops
     // the Semaphore object's core ref. Idempotent.
-    if (bn == "Semaphore") {
+    case VtablelessBuiltinReleaseArm::Semaphore:
         callVoid("bz_semaphore_dispose", {recv});
         return true;
-    }
     // §6.3 / #647: a SemaphoreToken (owned permit). bz_semaphore_token_release
     // checks the released flag, null-safe.
-    if (bn == "SemaphoreToken") {
+    case VtablelessBuiltinReleaseArm::SemaphoreToken:
         callVoid("bz_semaphore_token_release", {recv});
         return true;
-    }
     // #463: a CancellationTokenSource. bz_cts_dispose signals all tokens and
     // frees the source. Idempotent (signalled flag prevents double-signal).
-    if (bn == "CancellationTokenSource") {
+    case VtablelessBuiltinReleaseArm::CancellationTokenSource:
         callVoid("bz_cts_dispose", {recv});
         return true;
-    }
     // stdlib §7.2 / #645: a FileStream — a `bz_filestream_t*` disposed via
     // bz_filestream_dispose (flush + close the OS handle, free the wrapper).
     // Null-safe (a failed open stores null).
-    if (bn == "FileStream") {
+    case VtablelessBuiltinReleaseArm::FileStream:
         callVoid("bz_filestream_dispose", {recv});
         return true;
-    }
     // §2.11 / §24.4: disposing a Subscription removes the handler from its
     // event source. The explicit-Dispose chain reaches this only when
     // `isSubscriptionExpr`'s STRUCTURAL detection (the local's initializer is an
     // event `Subscribe(...)` call) did not fire — a Subscription-typed
     // parameter/field, say — where the fall-through was the wild jump. Same
     // release call as that arm.
-    if (bn == "Subscription") {
+    case VtablelessBuiltinReleaseArm::Subscription:
         callVoid("bz_subscription_dispose", {recv});
         return true;
+    case VtablelessBuiltinReleaseArm::None:
+        return false;
     }
-    return false;
+    return false;  // unreachable — every enumerator handled above
 }
 
 
@@ -3969,6 +4168,96 @@ void Emitter::disposeFreshNewReceiverTemp(const ast::Expr* recvExpr,
     emitDisposeAndReclaim(recvPtr);
     builder_.CreateBr(contBB);
     builder_.SetInsertPoint(contBB);
+}
+
+
+// fix #4320 (§26.1 / §4.6 / §28.9, v0.298): the STRING-RECEIVER sibling of
+// `disposeFreshNewReceiverTemp` (above). The class-receiver reclaim fires only
+// for a heap-CLASS producer; a `+1` STRING producer reaches CG33b as a plain
+// `ptr` and was leaking its allocation (the issue's repro: `P.Make().IsBlank`
+// over 500 iterations under ASan/LSan — 18000 B / 1000 allocs from
+// `bz$M.P$Make`, byte-identical to pre-#4243 because the leak is on the CG33b
+// path #4243 left untouched). Releases via `bz_string_release` (refcounted;
+// null- and sentinel-safe so the literal / sentinel / null producers in the
+// §28.9 list release as a no-op) AFTER the getter body's result has been
+// wrapped/boxed — nothing reads the receiver after this point on the normal
+// exit.
+//
+// THE TWO GATES, with their rationale (full version in LlvmBackend_impl.hpp):
+//   1. `isPlusOneStringProducer(recvExpr)` — the same predicate every other
+//      §28.9 producer-release keys on. A literal / sentinel / named-local
+//      receiver is correctly declined here: a literal receiver is an immortal
+//      sentinel (release is a no-op), and a named-local receiver's lifetime
+//      is the scope's, not the property read's.
+//   2. The PROPERTY RESULT must be a NON-REFERENCE value — the same soundness
+//      stance `freshNewReceiverTempEligible` (the class twin's predicate,
+//      immediately above) takes for the class-receiver path: the result must
+//      be provably free of any reference or borrow into the receiver. EXCLUDED
+//      for an alias risk:
+//        • `string` (reference-typed primitive — an identity getter `=> this`
+//          returns the receiver itself, releasing would free the string
+//          `v` (= obj) still points at)
+//        • `object` (reference-typed primitive — a field/method result on the
+//          receiver may borrow)
+//        • any class/interface result (a reference — could embed a borrow)
+//        • any struct/record (could embed a borrow of a receiver sub-object)
+//      ADMITTED: Unit, numeric/bool/char/decimal primitives (Length/IsAscii /
+//      IsBlank's shape), and enum. Mirroring the class predicate's exact
+//      primitive set (PrimitiveType::None / String / Object excluded) keeps
+//      the two paths' accept/reject surface aligned; the borrowed-receiver
+//      `string` shape is excluded identically to the class path's borrowed-
+//      receiver `string`-result shape that `freshNewReceiverTempEligible`'s
+//      comment cites as the reason for the string-primitive exclusion there.
+//
+// `unwindSlot` is the slot returned by the parallel
+// `registerFreshNewReceiverTempUnwind` — today always null for a string
+// receiver (the class-only eligibility predicate rejects strings), but
+// threaded through for symmetry and to leave room for a future unified
+// predicate that admits both without touching call sites. A throw inside the
+// getter body skips this inline release; that matches CG27a's own behavior
+// on its simpler intrinsics (`loadStringLen` / `bz_string_is_ascii` are
+// non-throwing; the issue's IsBlank getter is `=`/`or`/`Length`/`Trim` —
+// none throw — so the repro exercises the inline path exactly once per
+// iteration).
+void Emitter::disposeFreshNewStringReceiverTemp(
+        const ast::Expr* recvExpr, llvm::Value* recvPtr,
+        const sema::TypeRef* resultTy, llvm::AllocaInst* /*unwindSlot*/) {
+    // (unwindSlot is documented above; always null today — the class-only
+    // registerFreshNewReceiverTempUnwind never admits strings.)
+    if (!recvExpr || !recvPtr || !resultTy) return;
+    if (!isPlusOneStringProducer(recvExpr)) return;
+    // The result must be a NON-REFERENCE value (mirror the class twin's gate
+    // at freshNewReceiverTempEligible, with `isPlusOneStringProducer` in the
+    // producer-receiver slot).
+    bool valueResult = false;
+    if (resultTy->kind == sema::TypeRef::Kind::Unit) {
+        valueResult = true;
+    } else if (resultTy->kind == sema::TypeRef::Kind::Primitive &&
+               resultTy->primitive != sema::PrimitiveType::None &&
+               resultTy->primitive != sema::PrimitiveType::String &&
+               resultTy->primitive != sema::PrimitiveType::Object) {
+        // Length/IsAscii / IsBlank / int-valued user-property: a non-
+        // reference primitive. The receiver is provably not aliased by the
+        // result (an `int`/`bool` cannot hold a string).
+        valueResult = true;
+    } else if (resultTy->kind == sema::TypeRef::Kind::Named &&
+               resultTy->declaration &&
+               resultTy->declaration->kind == ast::TypeDeclKind::Enum) {
+        // An enum result is a value type — no alias into the receiver.
+        valueResult = true;
+    }
+    // Records/structs, classes, interfaces, `string`, `Object`: excluded,
+    // because each may alias into the receiver (a class/interface result
+    // could embed a borrow; a string result may be the receiver itself;
+    // a record could embed a borrow of a receiver sub-object). The leak
+    // stays — exactly the conservative stance `freshNewReceiverTempEligible`
+    // documents for the class twin.
+    if (!valueResult) return;
+    // Belt-and-braces: only release a non-null heap pointer. Sentinel /
+    // literal receivers are null-safely released by `bz_string_release`
+    // anyway, but the guard keeps the IR shape identical to the class twin.
+    if (!recvPtr->getType()->isPointerTy()) return;
+    emitStringRelease(recvPtr);
 }
 
 
@@ -5910,6 +6199,83 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
                 builder_.CreateStore(
                     llvm::ConstantPointerNull::get(ptrTy()), keyAddr);
             }
+            continue;
+        }
+        // fix #4129 (§29.12/§28.3, stdlib §4.8, v0.295): a `for var entry in
+        // dict` loop's key/value snapshot spine — see the field declarations
+        // in LlvmBackend_impl.hpp for the full derivation. Mirrors
+        // lowerDictEntryFor's own manual endBB code (LlvmBackend_Stmts.cpp)
+        // exactly, reading every value back through its slot because this
+        // arm fires from a `return`/`throw` reached from an arbitrary point
+        // deep inside the loop body, not from a block dominated by the
+        // original SSA values (only the entry-block allocas are).
+        if (it->dictEntryForSnapshot) {
+            auto* freeFnD =
+                declareC("free", llvm::Type::getVoidTy(llvm_), {ptrTy()});
+            llvm::Value* keysArrD = builder_.CreateLoad(
+                ptrTy(), it->dictEntryForKeysOutSlot, "def.keys");
+            llvm::Value* valsArrD = builder_.CreateLoad(
+                ptrTy(), it->dictEntryForValsOutSlot, "def.vals");
+            llvm::Value* cntD =
+                builder_.CreateLoad(i64(), it->dictEntryForCntSlot, "def.cnt");
+            // String key AND the loop variable is not captured by any
+            // closure in the body: release the in-flight iteration's
+            // rebuilt Key (loop-var struct field 0) — null-safe, mirrors
+            // endBB's own isStringKey branch. Gated on
+            // dictEntryForReleaseInFlightKey (see its declaration,
+            // LlvmBackend_impl.hpp) — a captured loop variable's struct was
+            // boxed into a heap cell holding a COPY of this same pointer,
+            // which an escaping closure may read after this disposal fires;
+            // releasing here would free it out from under that alias (a
+            // measured use-after-free, fixed before landing). The snapshot
+            // spine frees below are unaffected by this gate — they are
+            // never aliased by anything Bezel code can observe.
+            if (it->dictEntryForReleaseInFlightKey && it->dictEntryForVarSlot) {
+                if (auto* st = llvm::dyn_cast_or_null<llvm::StructType>(
+                        it->dictEntryForVarSlot->getAllocatedType())) {
+                    llvm::Value* keyAddr = builder_.CreateStructGEP(
+                        st, it->dictEntryForVarSlot, 0, "def.key.addr");
+                    llvm::Value* keyVal =
+                        builder_.CreateLoad(ptrTy(), keyAddr, "def.key.val");
+                    emitStringRelease(keyVal);
+                }
+            }
+            // Free the remaining per-key snapshot boxes at [idx, cnt) — the
+            // increment block already freed [0, idx); mirrors endBB's own
+            // break-path closing loop verbatim (including mutating the
+            // original idxSlot in place — safe, since this arm only runs on
+            // a path that is about to leave the function/unwind, and no
+            // consumer reads idxSlot again after this point).
+            if (it->dictEntryForIsStringKey || it->dictEntryForUseGen) {
+                auto* clCondBB = llvm::BasicBlock::Create(
+                    llvm_, "def.cl.cond", currentFn_);
+                auto* clBodyBB = llvm::BasicBlock::Create(
+                    llvm_, "def.cl.body", currentFn_);
+                auto* clEndBB = llvm::BasicBlock::Create(
+                    llvm_, "def.cl.end", currentFn_);
+                builder_.CreateBr(clCondBB);
+                builder_.SetInsertPoint(clCondBB);
+                llvm::Value* ci = builder_.CreateLoad(
+                    i64(), it->dictEntryForIdxSlot, "def.cl.idx");
+                builder_.CreateCondBr(
+                    builder_.CreateICmpSLT(ci, cntD), clBodyBB, clEndBB);
+                builder_.SetInsertPoint(clBodyBB);
+                llvm::Value* ckp = builder_.CreateLoad(
+                    ptrTy(), builder_.CreateGEP(ptrTy(), keysArrD, ci));
+                builder_.CreateCall(freeFnD, {ckp});
+                builder_.CreateStore(
+                    builder_.CreateAdd(ci, builder_.getInt64(1)),
+                    it->dictEntryForIdxSlot);
+                builder_.CreateBr(clCondBB);
+                builder_.SetInsertPoint(clEndBB);
+            }
+            builder_.CreateCall(freeFnD, {keysArrD});
+            if (it->dictEntryForIsStringKey) {
+                llvm::Value* lensArrD = builder_.CreateLoad(
+                    ptrTy(), it->dictEntryForLensOutSlot, "def.lens");
+                builder_.CreateCall(freeFnD, {lensArrD});
+            }
+            builder_.CreateCall(freeFnD, {valsArrD});
             continue;
         }
         // #422 / #2960 / §8.6 / §28.9: a provably-non-escaping `var`

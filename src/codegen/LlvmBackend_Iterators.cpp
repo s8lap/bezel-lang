@@ -2123,6 +2123,7 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         boxCaptureLocals_.clear();
         singleCaptureLocals_.clear();          // #694
         assignedCaptureVars_.clear();          // fix #2706
+        returnedCaptureVars_.clear();          // fix #4198
         definitelyEscapingLambdas_.clear();    // #694
         boxCaptureLocalsFn_ = moveNextFn;
         cellFreeEligible_.clear();
@@ -2172,6 +2173,11 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         // and never re-spilled), so retains >= releases on every path: a surplus
         // retain leaks one reference per advance, it can never over-release.
         retainAssignedStringParams(*ci.stmts, ms->params);
+        // fix #4174 follow-up: the closure twin — see
+        // retainAssignedClosureParams' own comment. Paired with the
+        // collectClosureReleaseEligible(*ci.stmts) / closureReleaseEligibleFn_
+        // = moveNextFn pin above.
+        retainAssignedClosureParams(*ci.stmts, ms->params);
 
         // State field GEP — read by the resume dispatch, written at each yield.
         llvm::Value* stateGEP =

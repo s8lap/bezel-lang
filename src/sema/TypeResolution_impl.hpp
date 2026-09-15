@@ -301,6 +301,17 @@ private:
     // Records / enums: treated like classes (their methods are
     // concrete). Operators are always concrete and handled by the
     // parser's body requirement.
+    // fix #4101 (§12.5/§23.4, v0.295): the same body-presence rule also
+    // covers INDEXERS (`PropertySymbol` where `isIndexer`) — a non-abstract
+    // indexer with no accessors/expression body (`PropertyBodyKind::Auto`,
+    // which has no legal indexer meaning: an indexer's Auto form has no
+    // per-instance storage to address) must be rejected the same way a
+    // bodyless non-abstract method is. Interface indexer signatures are
+    // excluded from this arm (like interface methods), and — narrow #4111
+    // (v0.298) — an enum or choice indexer is excluded too, because
+    // checkEnumRestrictions/checkChoiceRestrictions already reject any
+    // indexer on those two kinds outright, regardless of body; running
+    // this arm on them as well would double-report a bare one.
     void checkMethodBodies();
 
     void checkTypeMethodBodies(TypeSymbol* t);
@@ -319,6 +330,26 @@ private:
     void checkAbstractPropertyInitializers();
 
     void checkTypeAbstractPropertyInitializers(TypeSymbol* t);
+
+    // fix #4110 (§12.5/§23.4, v0.298): the sibling gap #4026 and the
+    // indexer body-presence branch of checkTypeMethodBodies (fix #4101)
+    // leave open — an `abstract` NAMED property or indexer given an
+    // EXPLICIT `=>` expression body, or a Block body whose accessors carry
+    // real code (as opposed to every accessor being the bare `;` abstract
+    // stub, #4026's own accepted control), compiles clean with the body
+    // reached by nothing: dispatch through a base-typed reference always
+    // resolves to the most-derived override (§12.1), so an abstract
+    // member's own body — if it had one — could never run. Cannot reuse
+    // `isAbstractPropertyShorthand` (sema/Symbol.hpp): it is deliberately
+    // narrowed to `PropertyBodyKind::Auto` and deliberately excludes
+    // indexers (narrow #4037 measured that a naive substitution for the
+    // indexer domain silently accepts an illegally-added indexer setter),
+    // so this reads the same raw AST facts — bodyKind, the `abstract`
+    // modifier, and each accessor's own `PropertyAccessorBodyKind` — the
+    // same discipline checkTypeMethodBodies uses for methods.
+    void checkAbstractPropertyBodies();
+
+    void checkTypeAbstractPropertyBodies(TypeSymbol* t);
 
     // Slice S32 (§10.5): an enum may not declare instance fields,
     // constructors, nested types, or indexers, and its methods may not
@@ -344,12 +375,33 @@ private:
     // out of scope. §35.1 states plainly: "Choices cannot have destructors,
     // constructors, instance fields, block-form or storage-backed
     // properties, indexers, or nested types — the same restriction set as
-    // enums (§10.5), for the same reasons." Mirrors checkEnumRestrictions's
+    // enums (§10.5), for the same reasons, plus one: a choice's instance
+    // storage IS its cases' payloads, declared in the case list and
+    // reachable only through matching." Mirrors checkEnumRestrictions's
     // non-dispatch-modifier member-kind checks (below) rather than
     // inventing a second spelling of the same decision — the dispatch-
     // modifier sub-rule stays checkChoiceDispatchModifiers's job so this
     // function does not double-report it.
     void checkChoiceRestrictions();
+
+    // fix #4115 (§22.16, Appendix A preamble "Shared-production
+    // over-admissions" index, v0.298): an `invariant` member is not modeled
+    // as a `Symbol` subclass at all (it lives only in
+    // `TypeSymbol::invariantContracts`, a side-table `ModuleLoader`
+    // populates for imported types), so neither checkEnumRestrictions's nor
+    // checkChoiceRestrictions's `t->members` walk (above) can see one. This
+    // reads the raw AST member list (`t->decl`) directly, for both kinds at
+    // once, and rejects any `ast::InvariantDecl` it finds — §22.16 scopes
+    // invariant members to class bodies.
+    void checkEnumChoiceInvariantMembers();
+
+    // fix #4186 (§22.16, Appendix A.4 `InvariantDecl` production comment,
+    // v0.298): same gap as checkEnumChoiceInvariantMembers just above, for
+    // the two other shapes A.4's `InvariantDecl` comment names — a RECORD
+    // body and a `static class` body. Reads the raw AST member list
+    // directly for the same reason (an `invariant` member is not a
+    // `Symbol` subclass, so `t->members` cannot see one).
+    void checkRecordAndStaticClassInvariantMembers();
 
     // §14.2 (#746): a type parameter may not carry contradictory constraints
     // (e.g. both `class` and `value`). Checked once per generic declaration
@@ -702,6 +754,39 @@ private:
         TypeRef* tr,
         const std::unordered_map<std::string_view, TypeRef*>& genericSubst);
 
+    // fix #4188 (§27.8, v0.298): a GENERIC alias's cached underlying TypeRef
+    // (`aliasDecl->aliasedType`, resolved ONCE against a throwaway scope that
+    // binds the alias's own parameters to nullptr markers — see
+    // resolveTopDecl's TypeAlias arm) still carries those parameters
+    // UNBOUND. `applyGenericSubst` above only substitutes a TOP-LEVEL bare
+    // parameter reference, which is not enough here: §27.8's own example
+    // (`type Lookup<K, V> := Dictionary<K, Array<V>>`) buries the
+    // parameters INSIDE the underlying type's own generic-argument tree.
+    // Recursively substitute every bare occurrence of a name bound in
+    // `subst` (Named leaf, InlineArray element, Function param/return, and
+    // any depth of nested Named genericArgs) and return a FRESH TypeRef
+    // whenever anything beneath `tr` changed — the alias's cached
+    // `underlying` TypeRef is shared by every reference site of the alias
+    // and must never be mutated in place. Returns `tr` unchanged (no
+    // allocation) when nothing beneath it needs substitution, which also
+    // covers a non-generic alias (`subst` empty).
+    //
+    // `useLoc` is the ALIAS REFERENCE SITE's own source location (e.g. the
+    // `Nested<[1]string>` mention, not the alias's `type Nested<T> := [1]T`
+    // declaration) — threaded through every recursive call so the §15.1
+    // re-validation below (send-back for fix #4280) can report at the
+    // location that actually produces the illegal shape.
+    TypeRef* substituteAliasGenericArgs(
+        TypeRef* tr,
+        const std::unordered_map<std::string_view, TypeRef*>& subst,
+        SourceLocation useLoc);
+
+    // Shared with resolveType's direct-syntax `[N][M]T` check (§15.1,
+    // issue #953) — factored so the alias-substitution re-validation below
+    // reports the identical diagnostic text rather than a drifting second
+    // copy (LANE_RULES §6).
+    void reportNestedInlineArrayError(SourceLocation loc);
+
     void checkOverrideSignatureMatch(MemberSymbol* derivedSym,
                                      MemberSymbol* baseSym);
 
@@ -805,6 +890,13 @@ private:
     // generic args to find any nested bare identifiers.
     void bindExtensionTargetTypeParams(const ast::Type& target,
                                         Scope& extScope, Scope* parent);
+
+    // fix #4144 (§26.2, v0.295): reject an ExtensionDecl whose resolved
+    // target kind is outside §26.2's closed extendable list (a nullable
+    // type directly, a choice, a function type, or an inline-array type).
+    // Must run after `ext.targetType` has been resolved (its resolved
+    // TypeRef is read via `ctx_.resolvedType`).
+    void rejectDisallowedExtensionTarget(const ast::ExtensionDecl& ext);
 
     void resolveTypeDecl(const ast::TypeDecl& td, Scope* parent);
 
@@ -1030,6 +1122,18 @@ private:
     // can't be classified (built-ins, unresolved, generic param) so the
     // caller defers; otherwise sets `decided=true` and returns the verdict.
     bool argSatisfiesNew(const TypeRef* arg, bool& decided);
+
+    // fix #4166 review follow-up (§14.2/§17.11, v0.298): a storage member's
+    // own defaultability (used by `argSatisfiesNew`'s Record arm) is now
+    // answered by the SHARED free function `sema::typeHasNoDefault`
+    // (TypeResolution.hpp / .cpp — also called by `ExprTC::defaultIllFormed`,
+    // ExprTypecheck_Exprs.cpp), not a Resolver-local method. The first
+    // version of this fix (71dc4ce) added
+    // `recordFieldTypeHasNoDefault`/`recordFieldTypeHasNoDefaultWalk` here;
+    // both were removed once their logic was hoisted to the shared
+    // function, per review's "strongly recommended" direction — see
+    // TypeResolution.hpp's `typeHasNoDefault` declaration for the full
+    // rationale.
 
     // §12.9 / issue #431: for each interface with variant generic parameters
     // (`out T` or `in T`), verify that every direct occurrence of those

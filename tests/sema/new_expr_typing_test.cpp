@@ -92,6 +92,7 @@ BEZEL_TEST(sema_new_expr, field_initializer_new_with_args_typed) {
         "class T public constructor(x: int) end constructor; end T; "
         "class C public _t: T := new T(7); end C;");
     auto* e = firstFieldInitializer(r);
+    BEZEL_EXPECT_TRUE(e != nullptr);
     if (e) {
         auto* t = r.ctx->exprType(*e);
         BEZEL_EXPECT_TRUE(t && t->kind == TypeRef::Kind::Named);
@@ -160,6 +161,7 @@ BEZEL_TEST(sema_new_expr, default_expr_typed) {
         "module M; "
         "class C public method M() _ := default(int); end M; end C;");
     auto* e = firstDiscardValue(r);
+    BEZEL_EXPECT_TRUE(e != nullptr);
     if (e) {
         auto* t = r.ctx->exprType(*e);
         BEZEL_EXPECT_TRUE(t && t->primitive == PrimitiveType::Int);
@@ -172,6 +174,7 @@ BEZEL_TEST(sema_new_expr, new_with_constructor_args) {
         "class T public constructor(x: int) end constructor; end T; "
         "class C public method M() _ := new T(42); end M; end C;");
     auto* e = firstDiscardValue(r);
+    BEZEL_EXPECT_TRUE(e != nullptr);
     if (e) {
         auto* t = r.ctx->exprType(*e);
         BEZEL_EXPECT_TRUE(t && t->kind == TypeRef::Kind::Named);

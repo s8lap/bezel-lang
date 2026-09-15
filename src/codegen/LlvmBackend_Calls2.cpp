@@ -4621,6 +4621,62 @@ llvm::Value* Emitter::explicitDisposeOwnedReceiverSlot(
             // reclaims elsewhere, so reclaiming here would double-free.
             if (loc->isUsing) return lvalueAddr(receiver, slotTy);
             if (unwindOwnedLocalClass(ld)) return lvalueAddr(receiver, slotTy);
+            // fix #4246 (§28.3 / §28.6, v0.298): `unwindOwnedLocalClass`
+            // classifies purely from ld's DECLARATION initializer form and
+            // returns null for a borrow-initialized local (`var y := x;`),
+            // even when a LATER plain reassignment (`y := new Res(1);`) made
+            // y's CURRENT value owned. The ownership pass already proved
+            // exactly that, for exactly THIS call site, via its `states_`
+            // dataflow — see `markExplicitDisposeReclaimIfReassignedBorrow`
+            // and the field comment on `disposeReclaimsReassignedBorrow`.
+            // Deliberately keyed on the RECEIVER OCCURRENCE (`id`), not on
+            // `ld`: the same local may ALSO be legally `.Dispose()`d at an
+            // EARLIER point while still a genuine borrow (§28.6's recorded
+            // gap), and reclaiming there would free a value another owner
+            // still holds — a double-free this per-occurrence flag avoids by
+            // construction, since only the call site(s) the dataflow proved
+            // Owned are stamped.
+            //
+            // EXCEPTION (measured regression, destructor_field_move_runtime_
+            // 763): `var taken := move this._inner;` / `var taken := move
+            // _inner;` INSIDE A DESTRUCTOR BODY is `states_`-Owned exactly
+            // like any other owned local, so the check above alone stamps
+            // this call too — but LlvmBackend_Exprs2.cpp's move-lowering
+            // (#383/#763 design) DELIBERATELY leaves the field slot NON-null
+            // in this one case: "the SOLE disposal site is the owned-field
+            // auto-dispose pass (emitOwnedFieldDisposals) ... nulling the
+            // field here would make that pass skip the still-owned object —
+            // a LEAK." So `taken` and the field are the SAME live pointer,
+            // and the field's OWN auto-dispose cascade — which does NOT
+            // know this call reclaimed anything — is the intended sole
+            // reclaimer. Trusting the flag here freed the block via
+            // `taken.Dispose()` and again via the field cascade: a measured
+            // heap-use-after-free in `Outer$DisposeCore`. Excluded by
+            // checking for the EXACT shape the null-suppression site
+            // guards, so every other reassigned-borrow shape (including a
+            // plain local reassignment inside a destructor unrelated to a
+            // field) is unaffected. // per §28.3, §28.6, §28.8.1, #763
+            bool isDestructorFieldMoveInit = false;
+            if (emittingDisposerBody_ && ld->initializer) {
+                if (auto* mv = dynamic_cast<const ast::UnaryExpr*>(
+                        ld->initializer.get());
+                    mv && mv->op == "move" && mv->operand) {
+                    sema::FieldSymbol* fs = nullptr;
+                    if (dynamic_cast<const ast::IdentifierExpr*>(
+                            mv->operand.get()) ||
+                        dynamic_cast<const ast::MemberAccessExpr*>(
+                            mv->operand.get()))
+                        fs = dynamic_cast<sema::FieldSymbol*>(
+                            ctx_.exprSymbol(*mv->operand));
+                    if (fs && (isOwnedReferenceField(fs) ||
+                               isOwnedIteratorInterfaceField(fs) ||
+                               ownedCollectionFieldType(fs) != nullptr))
+                        isDestructorFieldMoveInit = true;
+                }
+            }
+            if (id->disposeReclaimsReassignedBorrow &&
+                !isDestructorFieldMoveInit)
+                return lvalueAddr(receiver, slotTy);
             // §28.11 / #889: a local that RECEIVED a moved-out owned element via
             // `out owned` (e.g. `s.TryPop(out owned item)`) is the sole owner of
             // that element — recorded in outOwnedRecipients_ at the call site. Its
@@ -4647,6 +4703,610 @@ llvm::Value* Emitter::explicitDisposeOwnedReceiverSlot(
     return nullptr;
 }
 
+
+// fix #4221 (spec §28.2/§28.9/§8.1, v0.298): the FULL explicit-Dispose()
+// dispatch chain, factored out of `lowerCallDispatch`'s `.Dispose()` arm
+// (where every branch below used to live inline) so `.Dispose()`
+// (lowerCallDispatch) and `?.Dispose()` (lowerNullCondCall) share ONE
+// spelling of "what does disposing THIS receiver mean" — the Set-family
+// dict-backed check, `isLinkedListTypeName`, `isListInterfaceName`,
+// `isCollectionInterfaceName`, `isCollectionTypeName`, `isDictTypeName`,
+// the vtable-less-builtin release, and the general user-class fallback —
+// instead of two call sites that can drift. MEASURED drift: `?.Dispose()`
+// on an `Array<int>`/`Dictionary<K,V>`/`Set<T>`/`LinkedList<T>` receiver
+// reads garbage past the collection's runtime header (an ASan
+// heap-buffer-overflow on `Array<int>`, `bz_array_alloc`'s header) —
+// `fix #4209` ported the vtable-less-builtin arm alone and deliberately
+// left this population crashing (see its commit message's SCOPE section
+// and issue #4221).
+//
+// `target` is the receiver AST node — needed by
+// `explicitDisposeOwnedReceiverSlot` / `nullExplicitlyDisposedBuiltinSlot` /
+// `nullStateMachineOwnedParamCapture` / `isFreshOwnedClassProducer`, all of
+// which key off the AST (an lvalue-ness / ownership question), not the
+// lowered value. `recv` is the receiver's ALREADY-LOWERED pointer value;
+// this function does not re-derive or re-null-check it beyond the SAME
+// `recv && recv->getType()->isPointerTy()` guard the original `.` chain
+// always had (preserved verbatim) — a caller whose own control flow
+// already guarantees non-null (e.g. `?.`'s outer `doBB`, only entered when
+// the receiver is non-null) simply satisfies that guard trivially. Returns
+// false when nothing was emitted (matching the original chain's silent
+// no-op for a non-pointer/null `recv`), true when the whole receiver was
+// disposed and the caller should treat the call as a lowered void result.
+bool Emitter::emitExplicitDisposeChain(const ast::Expr& target,
+                                        llvm::Value* recv) {
+    if (!recv || !recv->getType()->isPointerTy()) return false;
+    // fix #2967 (spec §28.2 / §28.3, v0.240): every branch of
+    // the chain below EXCEPT the final `else` performs a
+    // BUILT-IN's release right here, and therefore owes the
+    // §28.2 exactly-once obligation that comes with it — null
+    // the receiver's slot so §28.3's scope-exit / unwind
+    // auto-drop reloads null and discharges nothing. That
+    // obligation used to be a per-arm habit (the
+    // `isDictTypeName` arm wrote it out; the collection,
+    // linked-list and dict-backed-`Set` arms did not), which is
+    // exactly the shape a new arm silently joins on the wrong
+    // side of: MEASURED, twelve receivers double-freed. It is
+    // now discharged ONCE, at the chain's single exit, so a
+    // branch added here inherits it instead of having to
+    // remember it. The final `else` clears the flag because it
+    // is the USER-class path, which reclaims and nulls through
+    // `explicitDisposeOwnedReceiverSlot`'s own ownership test
+    // (a borrow's slot must NOT be nulled there — its real
+    // owner reclaims through it).
+    bool builtinReleasedHere = true;
+    // §3: collection types use bz_array_free / bz_dict_free.
+    auto* recvTy = ctx_.exprType(target);
+    // issues #343 / D8: a Set is dict-backed (records,
+    // primitives, strings — see lowerNew), so it frees with
+    // bz_dict_free, not bz_array_free.
+    // fix #3360 / spec §28.2 (v0.135, #2967), stdlib §4.18
+    // (v0.278, #1426): the Set family headName match must
+    // admit SortedSet — its runtime IS the bz_dict_t* with
+    // sorted-ordering layered on (#1426); bz_dict_free
+    // disposes both equivalently. Without SortedSet in this
+    // predicate, an explicit `s.Dispose()` on a SortedSet
+    // fell past `dictBackedSet` into the vtableless-BuiltinClass
+    // fall-through at line 7429 → `emitVtablelessBuiltinRelease`
+    // had no SortedSet case → emitted NOTHING (a bounded leak
+    // — the trade #2874/#2823 record). Narrow residue of the
+    // broader #2726 SortedSet/family thesis, which stays open
+    // (the Set-family misclassification in lowerToLazyEnumerator
+    // / kArrayBackedCollections is a separate problem with a
+    // different scope of consumer #1426/#2693/#2721 touches).
+    bool isSetName = recvTy && recvTy->astNode &&
+        recvTy->astNode->name &&
+        !recvTy->astNode->name->parts.empty() &&
+        (recvTy->headName() == "Set" ||
+         recvTy->headName() == "OwningSet" ||
+         recvTy->headName() == "SortedSet");
+    bool dictBackedSet = isSetName &&
+        genericBackingType(recvTy, 0, /*isSet=*/true, nullptr)
+            != nullptr;
+    if (dictBackedSet) {
+        auto* fn = declareC("bz_dict_free",
+            llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()});
+        builder_.CreateCall(fn, {recv,
+            llvm::ConstantPointerNull::get(ptrTy())});
+    } else if (isLinkedListTypeName(recvTy)) {
+        // per §4.6/§4.7: LinkedList<T>.Dispose() → bz_llist_free.
+        // OwningLinkedList<T> cascades disposal into class elements.
+        // #602 / §28.11 v0.135: route directly through elementPolicyFor.
+        // fix #2710 (§28.2 / §28.9 / §28.11, v0.240): a borrowing
+        // `string` element is the RuntimeManaged row — its inserter
+        // (the four `.AddFirst`/`.AddLast`/`.AddBefore`/`.AddAfter`
+        // arms in LlvmBackend_Calls3.cpp, #2686) already retains
+        // the list's +1, so the disposer MUST release it too —
+        // `elementPolicyFor` returns a NULL thunk for that row
+        // (no ownable backing, §28.11 v0.135). Without the fallback
+        // every explicit `LinkedList<string>.Dispose()` leaked one
+        // +1 per element (bounded leak, not unsoundness). The same
+        // one-liner `.RemoveFirst`/`.RemoveLast`/`.Clear`/`.Remove`/
+        // `.RemoveNode` already carry at LlvmBackend_Calls3.cpp and
+        // `#2692` family-wide. The `!nullable` guard mirrors Site 3
+        // (`patternAResultCollectionDisposer`'s asymmetry, recorded
+        // in #2710) and the `litIsStrArr`/`llitIsStrElem`
+        // siblings in materializeHeapCollectionLiteral — a nullable
+        // string element is never retained at construction so
+        // releasing here would be a stray double-free direction.
+        {
+            const sema::TypeRef* llElem =
+                (!recvTy->genericArgs.empty())
+                    ? recvTy->genericArgs[0] : nullptr;
+            bool llIsOwning =
+                recvTy->astNode && recvTy->astNode->name &&
+                !recvTy->astNode->name->parts.empty() &&
+                common::isOwningPrefixedName(recvTy->headName());
+            ElementPolicy llElemPol =
+                elementPolicyFor(llElem, llIsOwning);
+            llvm::Function* elemDisp = llElemPol.disposerThunk;
+            // RuntimeManaged + non-nullable string primitive —
+            // verbatim mirror of `llIsStrElem` in
+            // LlvmBackend_Calls3.cpp. The retain path that
+            // paired this release (#2686) uses the same predicate,
+            // so the release is provably paired.
+            bool llIsStringElem =
+                !llIsOwning && llElem && !llElem->nullable &&
+                llElemPol.cat == ElementPolicy::Category::RuntimeManaged &&
+                llElem->kind == sema::TypeRef::Kind::Primitive &&
+                llElem->primitive == sema::PrimitiveType::String;
+            if (!elemDisp && llIsStringElem)
+                elemDisp = stringElementReleaseThunk();
+            llvm::Value* disp = elemDisp
+                ? llvm::cast<llvm::Value>(elemDisp)
+                : llvm::ConstantPointerNull::get(ptrTy());
+            auto* fn = declareC("bz_llist_free",
+                llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()});
+            builder_.CreateCall(fn, {recv, disp});
+        }
+    } else if (isListInterfaceName(recvTy)) {
+        // fix #2970 (spec §28.2 / §28.9 / §8.1, stdlib §4.1–§4.3,
+        // v0.240): the three ARRAY-BACKED list interfaces
+        // (IList<T> / IReadOnlyList<T> / IOwningList<T>) carry
+        // the same bz_array_t* at runtime as the concrete
+        // Array<T> / OwningArray<T> they implement — so an
+        // explicit `e.Dispose()` where `e: IList<T>` routes
+        // through `bz_array_free`, mirroring the concrete-array
+        // arm below. Before this fix the disposal chain had no
+        // arm for the interface head; the chain fell through to
+        // the generic vtable dispatch (emitDisposeAndReclaim →
+        // load word 0 as vtable → call slot 2), but word 0 of
+        // a bz_array_t* is the data pointer, not a vtable —
+        // the indirect call jumped into the middle of the
+        // array's payload and the program SEGFAULTED. MEASURED
+        // on 001a661 (exit 139): `var e: IList<int> :=
+        // new Array<int>(2); e.Dispose();` emitted `mov (%rax),
+        // %rcx ; call *0x10(%rcx)` where %rax was the array
+        // pointer and %rcx became the data buffer address —
+        // a wild jump into the heap.
+        //
+        // The same array-backing assumption the indexer bridge
+        // (LlvmBackend_Assign.cpp, #401) already keys on: the
+        // runtime model is that IList<T>-typed slots hold
+        // bz_array_t* and only that. A user class declaring
+        // `: IList<T>` is a hypothetical not actually served by
+        // the rest of the compiler either (no itable wiring;
+        // #853 stays open for the polymorphic collection
+        // interfaces). Polymorphic collection interfaces
+        // (IReadOnlyCollection<T> / ICollection<T> /
+        // IOwningCollection<T>) span incompatible runtime
+        // representations and need runtime discrimination —
+        // deferred; see the TODO below.
+        //
+        // IOwningList<T> is the OWNING list interface
+        // (stdlib §4.2): its element disposer is the same
+        // `elementPolicyFor` thunk the concrete
+        // OwningArray<T>.Dispose() arm uses, so the
+        // disposing-setter cascade runs for an interface-
+        // typed receiver exactly as it does for the
+        // concrete owning array.
+        {
+            bool listIfaceOwning = false;
+            (void)isListInterfaceName(recvTy, &listIfaceOwning);
+            const sema::TypeRef* arrElem =
+                (!recvTy->genericArgs.empty())
+                    ? recvTy->genericArgs[0] : nullptr;
+            ElementPolicy arrElemPol =
+                elementPolicyFor(arrElem, listIfaceOwning);
+            llvm::Function* elemDisp = arrElemPol.disposerThunk;
+            // fix #2710 (§28.2 / §28.9 / §28.11, v0.240): the
+            // IList<T> / IReadOnlyList<T> arm's runtime is the
+            // same bz_array_t* as the concrete Array<T> arm
+            // above, so the string-element disposer fallback
+            // (#2710's Site 1) applies here verbatim. The
+            // `!nullable` guard mirrors Site 3 and the
+            // `litIsStrArr` / `arrIsStringElem` siblings.
+            bool arrIsStringElem =
+                arrElemPol.cat ==
+                    ElementPolicy::Category::RuntimeManaged &&
+                arrElem &&
+                arrElem->kind == sema::TypeRef::Kind::Primitive &&
+                arrElem->primitive == sema::PrimitiveType::String &&
+                !arrElem->nullable;
+            if (!elemDisp && arrIsStringElem)
+                elemDisp = stringElementReleaseThunk();
+            llvm::Value* disp = elemDisp
+                ? llvm::cast<llvm::Value>(elemDisp)
+                : llvm::ConstantPointerNull::get(ptrTy());
+            const char* freeName = checkedDisposal_
+                ? "bz_array_mark_disposed"
+                : "bz_array_free";
+            auto* fn = declareC(freeName,
+                llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()});
+            builder_.CreateCall(fn, {recv, disp});
+        }
+    } else if (isCollectionInterfaceName(recvTy)) {
+        // fix #3026 (spec §28.2 / §28.9 / §8.1, stdlib §4.1 /
+        // §4.6-§4.9, v0.240): the three POLYMORPHIC collection
+        // interfaces (IReadOnlyCollection<T> / ICollection<T> /
+        // IOwningCollection<T>) are implemented by collections
+        // with INCOMPATIBLE runtime representations —
+        // Array/Stack/Queue/OwningBuffer/OwningStack/OwningQueue
+        // (bz_array_t*), LinkedList/OwningLinkedList
+        // (bz_llist_t*), and Dictionary/Set/OwningSet/SortedSet
+        // (bz_dict_t*). The static type erases which concrete
+        // backing is held, the runtime structs share no kind
+        // header, and a single emit call is unsound — it would
+        // read garbage on the wrong backing's layout. The
+        // #2970 fix extended the chain to the ARRAY-BACKED LIST
+        // interfaces (IList<T> / IReadOnlyList<T> /
+        // IOwningList<T>), whose implementing set is
+        // Array<T> / OwningArray<T> and only that — so the
+        // static assumption is sound there. The polymorphic
+        // collection interfaces have no such restriction.
+        //
+        // The runtime foundation (see
+        // bezel_runtime_internal.hpp's BZ_RUNTIME_KIND_*
+        // constants + the kind field appended to each struct)
+        // is a negative-int64 sentinel at offset 48 for
+        // bz_array_t / bz_llist_t (both structs append the
+        // tag at the same offset so the runtime helper
+        // `bz_runtime_dispose` can probe ONE offset) and at
+        // offset 88 for bz_dict_t. The runtime helper probes
+        // offset 48 first (a bz_dict_t's order_count at
+        // offset 56 is non-negative and cannot collide with
+        // the negative sentinels), then offset 88 for the
+        // dict.
+        // The disposer argument is computed from the STATIC
+        // element type T (the same shape the concrete
+        // Array<T>/LinkedList<T>/Dictionary<K,V> arms use):
+        //   * IReadOnlyCollection<T> / ICollection<T> —
+        //     borrowing; pass null (sound for Array<T>,
+        //     LinkedList<T>, Set<T>, Dictionary<K,V> — every
+        //     borrowing implementing type).
+        //   * IOwningCollection<T> — owning; pass the
+        //     class-element disposer `elementPolicyFor(T,
+        //     /*owning=*/true)` yields (sound for
+        //     OwningArray<T>, OwningLinkedList<T>,
+        //     OwningSet<T> — every owning implementing type).
+        // The null-dispose check in bz_*_free matches the
+        // Set<T> borrowing case (where bz_dict_free does not
+        // dispose values); the class-element disposer matches
+        // the OwningSet<T> case (where bz_dict_free disposes
+        // values, which are the owned keys).
+        {
+            // IOwningCollection<T> is the OWNING polymorphic
+            // collection interface — dispose cascades.
+            // isCollectionInterfaceName returns true for the
+            // three heads (IReadOnlyCollection / ICollection /
+            // IOwningCollection); only IOwningCollection is
+            // owning, the other two are borrowing.
+            std::string_view ifaceHead =
+                builtinTypeName(recvTy);
+            bool ifaceOwning = ifaceHead == "IOwningCollection";
+            const sema::TypeRef* arrElem =
+                (!recvTy->genericArgs.empty())
+                    ? recvTy->genericArgs[0] : nullptr;
+            llvm::Function* elemDisp =
+                ifaceOwning
+                    ? elementPolicyFor(arrElem, /*owning=*/true)
+                          .disposerThunk
+                    : nullptr;
+            llvm::Value* disp = elemDisp
+                ? llvm::cast<llvm::Value>(elemDisp)
+                : llvm::ConstantPointerNull::get(ptrTy());
+            auto* fn = declareC("bz_runtime_dispose",
+                llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()});
+            builder_.CreateCall(fn, {recv, disp});
+        }
+    } else if (isCollectionTypeName(recvTy)) {
+        // #362 / stdlib §4.5: explicit Dispose() on an owning
+        // collection cascades disposal into its class elements;
+        // a borrowing collection frees only the backing.
+        // #602 / §28.11 v0.135: disposer derived from
+        // elementPolicyFor (covers Interface elements, #619).
+        // §28.2 v0.135 / #621: checked-disposal mode quarantines
+        // via bz_array_mark_disposed (flag stays readable for the
+        // indexer guard); unchecked mode frees as before.
+        // fix #2710 (§28.2 / §28.9 / §28.11, v0.240): a borrowing
+        // `string` element is the RuntimeManaged row — its
+        // inserter (`emitArrayRetainStringsIfStringArray` /
+        // `materializeHeapCollectionLiteral`'s `litIsStrArr`)
+        // already retains the array's +1, so the disposer MUST
+        // release it too. `elementPolicyFor` returns a NULL thunk
+        // for that row (no ownable backing, §28.11 v0.135).
+        // Without the fallback every explicit
+        // `Array<string>.Dispose()` leaked one +1 per element
+        // (bounded leak, not unsoundness). The same one-liner
+        // `.RemoveAt`/`.Remove`/`.Clear` already carry at
+        // LlvmBackend_Calls.cpp. The `!nullable` guard mirrors
+        // Site 3 (recorded in #2710) and the `litIsStrArr`
+        // sibling — a nullable string element is never retained
+        // at construction, so releasing here would be a stray
+        // double-free direction.
+        {
+            const sema::TypeRef* arrElem =
+                (!recvTy->genericArgs.empty())
+                    ? recvTy->genericArgs[0] : nullptr;
+            bool arrIsOwning =
+                recvTy->astNode && recvTy->astNode->name &&
+                !recvTy->astNode->name->parts.empty() &&
+                common::isOwningPrefixedName(recvTy->headName());
+            ElementPolicy arrElemPol =
+                elementPolicyFor(arrElem, arrIsOwning);
+            llvm::Function* elemDisp = arrElemPol.disposerThunk;
+            // RuntimeManaged + non-nullable string primitive —
+            // verbatim mirror of `arrIsStringElem` at
+            // LlvmBackend_Calls.cpp (the predicate the existing
+            // retain / `.Remove*` / `.Clear` releases use).
+            bool arrIsStringElem =
+                arrElemPol.cat ==
+                    ElementPolicy::Category::RuntimeManaged &&
+                arrElem &&
+                arrElem->kind == sema::TypeRef::Kind::Primitive &&
+                arrElem->primitive == sema::PrimitiveType::String &&
+                !arrElem->nullable;
+            if (!elemDisp && arrIsStringElem)
+                elemDisp = stringElementReleaseThunk();
+            llvm::Value* disp = elemDisp
+                ? llvm::cast<llvm::Value>(elemDisp)
+                : llvm::ConstantPointerNull::get(ptrTy());
+            const char* freeName = checkedDisposal_
+                ? "bz_array_mark_disposed"
+                : "bz_array_free";
+            auto* fn = declareC(freeName,
+                llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()});
+            builder_.CreateCall(fn, {recv, disp});
+        }
+    } else if (isDictTypeName(recvTy)) {
+        // #396 / stdlib §4.9 + #401 / stdlib §4.8: explicit
+        // Dispose() on a hash-backed dictionary frees the backing
+        // table (and key bytes) and runs the per-value callback,
+        // the same one the #394/#401 scope-end path uses:
+        //   * OwningDictionary<K, class/interface> → dispose+free
+        //     each surviving value (#396/#394).
+        //   * borrowing Dictionary<K, record> → free each
+        //     surviving record value BOX (#401; a record is a
+        //     value type, nothing to dispose, §3.2 / §9).
+        // A scalar/string-valued borrowing Dictionary stores no
+        // box → null disposer (only the backing is freed). The
+        // two value callbacks are mutually exclusive, so no box
+        // is freed twice.
+        // #602 / §28.11 v0.135: derive owning-class disposer
+        // directly from elementPolicyFor (covers Interface too).
+        // §28.2 v0.135 / issue #627: checked-disposal mode
+        // quarantines via bz_dict_mark_disposed (header stays
+        // alive for method-entry guard reads; bz_dict_free is
+        // idempotent w.r.t. disposed flag). In checked mode, the
+        // slot is NOT nulled — the pointer must remain valid so
+        // subsequent method calls can load and test it. The
+        // scope-end bz_dict_free is a no-op when disposed=1.
+        {
+            const sema::TypeRef* dictVal =
+                (recvTy->genericArgs.size() > 1)
+                    ? recvTy->genericArgs[1] : nullptr;
+            bool dictIsOwning =
+                recvTy->astNode && recvTy->astNode->name &&
+                !recvTy->astNode->name->parts.empty() &&
+                recvTy->headName() == "OwningDictionary";
+            llvm::Function* valDisp =
+                elementPolicyFor(dictVal, dictIsOwning).disposerThunk;
+            if (!valDisp) valDisp = dictValueBoxFreer(recvTy);
+            llvm::Value* disp = valDisp
+                ? llvm::cast<llvm::Value>(valDisp)
+                : llvm::ConstantPointerNull::get(ptrTy());
+            const char* freeName = checkedDisposal_
+                ? "bz_dict_mark_disposed"
+                : "bz_dict_free";
+            auto* fn = declareC(freeName,
+                llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()});
+            builder_.CreateCall(fn, {recv, disp});
+            // §28.2 idempotency: in UNCHECKED mode the slot is
+            // nulled so any subsequent bz_dict_free reloads null
+            // and no-ops (bz_dict_free(null) returns
+            // immediately); in CHECKED mode it is deliberately
+            // NOT nulled — the pointer must stay valid for guard
+            // checks, and bz_dict_free is safe there because it
+            // returns early when disposed==1 (#627). Both are
+            // now the chain's single exit below (#2967); this
+            // arm's inline copy of them was the one the
+            // collection arms next door were missing.
+        }
+    } else if (common::isVtableLessBuiltinClassName(
+                   builtinTypeName(recvTy))) {
+        // fix #2921 (spec §28.2 / §28.9 / §8.1, stdlib §1 /
+        // stdlib §3, v0.240): every arm above this `else`
+        // chain names ONE built-in, and the `else` below ends in
+        // the generic vtable dispatch (emitDisposeAndReclaim →
+        // slot 2). That dispatch's precondition is that the
+        // receiver carries a Bezel vtable at word 0 — and a
+        // built-in CLASS never does: it is a plain runtime C
+        // struct whose word 0 is payload data. So the chain's
+        // shape made every built-in it forgot to name fail as a
+        // WILD INDIRECT JUMP with no diagnostic. MEASURED on
+        // f069645: `var sb := new StringBuilder();
+        // sb.Dispose();` emitted `mov (%rax),%rcx ; call
+        // *0x10(%rcx)` and died at address 0 (SIGSEGV, exit
+        // 139); likewise `Random`, `EventSource<T>`,
+        // `AsyncEventSource<T>`, `TaskCompletionSource<T>`,
+        // `OwningTaskCompletionSource<T>`. Both calls are legal:
+        // stdlib §1 says "Every class implicitly
+        // implements `IDisposable`", and stdlib §3 documents
+        // `Random`'s Dispose as a no-op outright.
+        //
+        // Gate on the PROPERTY ("does this receiver carry a
+        // Bezel vtable?", asked once via the registry) rather
+        // than lengthening the name chain, so a built-in this
+        // fix does not name cannot land back in the jump. When
+        // no release is known, emitVtablelessBuiltinRelease
+        // returns false and NOTHING is emitted: a bounded leak
+        // in place of corrupted control flow, the trade recorded
+        // on #2874 and #2823.
+        //
+        // §28.2 exactly-once: the receiver's slot is nulled in
+        // unchecked mode, exactly as the Mutex / Semaphore /
+        // Shared / Channel arms above do, so a following
+        // `using var` scope-exit or unwind auto-drop reloads
+        // null and skips — without which making the explicit
+        // call release would have turned #2921's SIGSEGV into a
+        // double free for the built-ins whose auto-drop already
+        // releases (StringBuilder, EventSource, the TCS family).
+        // That store is now the chain's single exit below
+        // (#2967); it is emitted UNCONDITIONALLY there rather
+        // than only on the non-null path, which is equivalent
+        // (when `recv` is null the slot already holds null) and
+        // keeps one rule for the whole family.
+        auto* nnBB = llvm::BasicBlock::Create(
+            llvm_, "bidisp.nn", currentFn_);
+        auto* ctBB = llvm::BasicBlock::Create(
+            llvm_, "bidisp.cont", currentFn_);
+        builder_.CreateCondBr(
+            builder_.CreateICmpNE(
+                recv,
+                llvm::ConstantPointerNull::get(ptrTy())),
+            nnBB, ctBB);
+        builder_.SetInsertPoint(nnBB);
+        emitVtablelessBuiltinRelease(builtinTypeName(recvTy),
+                                     recv);
+        builder_.CreateBr(ctBB);
+        builder_.SetInsertPoint(ctBB);
+    } else {
+        // fix #2967 (§28.2 / §28.3, v0.240): NOT a built-in
+        // release — this branch owns its own §28.2 bookkeeping
+        // (see explicitDisposeOwnedReceiverSlot below), and its
+        // ownership test is strictly narrower than "is a named
+        // lvalue": a BORROW's slot must not be nulled, because
+        // the borrow's real owner reclaims through it.
+        builtinReleasedHere = false;
+        // #415 / §28.2 / §28.4: an explicit `.Dispose()` on a
+        // class/interface instance. After #411 split dispatch
+        // from reclamation, emitDynamicDispose only DISPATCHES
+        // the idempotent Dispose (destructor + owned fields +
+        // base chain, run AT MOST ONCE per object — §28.12 line
+        // 5624). The block is reclaimed by the OWNING auto-
+        // dispose site (emitDisposeAndReclaim). So when an owned
+        // value's ONLY disposal is an explicit `.Dispose()` (a
+        // plain `var` owned local or `owned` parameter disposed
+        // via `x.Dispose()`, with no auto-dispose follow), the
+        // destructor ran but the heap block LEAKED.
+        //
+        // Fix: when the receiver is a slot/field this scope OWNS
+        // — and thus can NULL to block a second reclaim — RECLAIM
+        // the block here and null that slot, mirroring the auto-
+        // dispose site (LlvmBackend_Setup.cpp). §28.2: "the first
+        // call performs the disposal; subsequent calls are no-
+        // ops" — the run-once flag (§28.12) makes a second
+        // DISPATCH a no-op, but a second RECLAIM (free) would be
+        // a double-free, so only the FIRST disposal frees and the
+        // slot is nulled so a following auto-dispose (using-var
+        // scope-end, owned-field auto-dispose, unwind) reloads
+        // null and skips. The scope-end / field / unwind paths
+        // all null-guard their reload (LlvmBackend_Setup.cpp), so
+        // free happens EXACTLY ONCE across explicit + auto.
+        //
+        // Conservative fallback (per #415): when the receiver is
+        // NOT a slot this scope owns (a temporary like
+        // `new R().Dispose()`, a borrow, or a non-owned field) we
+        // CANNOT null a slot to prevent a second reclaim — a
+        // borrow's real owner reclaims elsewhere via ITS slot —
+        // so reclaiming could double-free. Stay dispatch-only for
+        // those (the destructor still runs idempotently); an
+        // owned TEMPORARY explicitly disposed (no second reclaim
+        // path, but no slot to null either) is the deferred sub-
+        // case noted in #415.
+        llvm::Type* slotTy = nullptr;
+        llvm::Value* slot =
+            explicitDisposeOwnedReceiverSlot(target,
+                                             slotTy);
+        if (slot) {
+            // §28.2: a *repeated* explicit `x.Dispose()` on the
+            // same owned local must be a no-op. The first call
+            // freed the block and nulled the slot (below), so on
+            // the second call `recv` (reloaded from that slot) is
+            // null — dispatching a vtable Dispose through it would
+            // be a use-after-free / null-deref SIGSEGV. Guard the
+            // whole dispatch+reclaim on a non-null receiver so the
+            // second `x.Dispose()` cleanly skips. (Checked mode
+            // does not null the slot — the object is quarantined —
+            // so `recv` stays non-null there and the run-once flag
+            // makes the re-dispatch a no-op.)
+            auto* nn = llvm::BasicBlock::Create(
+                llvm_, "disp.nn", currentFn_);
+            auto* cont = llvm::BasicBlock::Create(
+                llvm_, "disp.cont", currentFn_);
+            builder_.CreateCondBr(
+                builder_.CreateICmpNE(
+                    recv,
+                    llvm::ConstantPointerNull::get(ptrTy())),
+                nn, cont);
+            builder_.SetInsertPoint(nn);
+            emitDisposeAndReclaim(recv);
+            // §28.2 v0.134 / issue #601: in checked-disposal
+            // mode the object is quarantined (not freed), so
+            // the slot must remain valid — the disposed-flag
+            // guard at the next member-entry reads through it.
+            // In unchecked mode, null the slot as usual to
+            // prevent a second reclaim.
+            if (!checkedDisposal_)
+                builder_.CreateStore(
+                    llvm::ConstantPointerNull::get(ptrTy()),
+                    slot);
+            // #2310 / §29.8 / §30.1 (#973a residual): also null
+            // the FRAME capture slot of an `owned` STATE-MACHINE
+            // parameter this discharge just consumed — so the
+            // frame's terminal-state disposal (null-guarded) skips
+            // it on the discharging path. The alloca-null above
+            // is the sync-method / owned-local piece; the frame
+            // slot is the state-machine piece. nullStateMachine-
+            // OwnedParamCapture is self-gating (no-op outside a
+            // state-machine body, for non-parameter sources, for
+            // non-owned parameters). // per §29.8 / §30.1
+            nullStateMachineOwnedParamCapture(&target);
+            builder_.CreateBr(cont);
+            builder_.SetInsertPoint(cont);
+        } else if (isFreshOwnedClassProducer(&target)) {
+            // #1053-case-1 / #415: no owning slot, but the
+            // receiver is a FRESH owned producer (`new X()` or an
+            // `owned`-returning call) — owned by nothing else, so
+            // dispatch-only (below) would leak its block. Reclaim
+            // it exactly once: this IS the sole explicit Dispose
+            // (one destructor run) plus the block free. A BORROW
+            // receiver is NOT a fresh producer (its real owner
+            // reclaims via ITS slot), so it stays dispatch-only.
+            emitDisposeAndReclaim(recv);
+        } else {
+            // fix #4246 follow-up (§28.3 / §28.6, v0.298): null-guard the
+            // dispatch. Every PRE-#4246 shape reaching this arm (a borrow,
+            // a non-owned field, and so on) has `recv` PROVABLY non-null —
+            // nothing before #4246 ever nulled a slot this arm reads from —
+            // so this guard was previously always-true and added nothing
+            // observable. It stopped being always-true once a borrow-
+            // declared local could become reclaim-eligible (this file's
+            // `disposeReclaimsReassignedBorrow`/`explicitDisposeReclaimed-
+            // Slot` machinery): a branch-join can leave `explicitDispose-
+            // ReclaimedSlot` conservatively false (§25's double-free-vs-leak
+            // trade, taken deliberately in `joinInto`'s AND-merge) for a
+            // POST-MERGE dispose call reachable from an arm that DID
+            // reclaim+null this same local's slot on an EARLIER dispose.
+            // That arm's null is a RUNTIME fact the merge's static under-
+            // approximation cannot erase, so the unconditional dispatch
+            // below would read the vtable pointer through a null receiver
+            // — a SIGSEGV, measured before this guard existed. Guarding
+            // costs nothing on the provably-non-null shapes and turns the
+            // ambiguous-merge shape into the pre-#4246 idempotent no-op
+            // instead of a crash.
+            llvm::Value* nonNull = builder_.CreateICmpNE(
+                recv, llvm::ConstantPointerNull::get(ptrTy()));
+            auto* dnn = llvm::BasicBlock::Create(
+                llvm_, "disp.dispatch.nn", currentFn_);
+            auto* dcont = llvm::BasicBlock::Create(
+                llvm_, "disp.dispatch.cont", currentFn_);
+            builder_.CreateCondBr(nonNull, dnn, dcont);
+            builder_.SetInsertPoint(dnn);
+            emitDynamicDispose(recv);
+            builder_.CreateBr(dcont);
+            builder_.SetInsertPoint(dcont);
+        }
+    }
+    // fix #2967 (spec §28.2 / §28.3, v0.240): THE chain's single
+    // exit. Every built-in branch above released the receiver
+    // here, so the slot is nulled here — once, for the whole
+    // family — and §28.3's scope-exit / unwind auto-drop
+    // reloads null and discharges nothing.
+    if (builtinReleasedHere)
+        nullExplicitlyDisposedBuiltinSlot(target);
+    return true;
+}
 
 // fix #2963 (codegen, v0.240): the one place that classifies a null return.
 //
@@ -4687,6 +5347,24 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
 
 llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
     if (!call.callee) return nullptr;
+    // fix #4342 (§9.7 / §28.3 / §28.9, v0.298): capture the
+    // `recordCallResultInitOutermost_` flag at entry. The flag is set true
+    // by `lowerLocalDecl` ONLY when lowering the initializer of a record-
+    // typed LocalDecl/LocalConstDecl in `recordCallResultReleaseEligible_`
+    // (the #1747 set that drives the LocalDecl's own scope-end
+    // `recordStringFields Disposal`). Clearing it here ensures that any
+    // nested calls reached via the argument-lowering loop below — e.g.,
+    // the inner `Foo(s)` of `var p := Wrap(Foo(s))`, where `Wrap` is the
+    // outermost call whose result is bound to `p` — are NOT also seen as
+    // "the init", so their +1 producer arguments are released by the OLD
+    // unconditional #429 loop (they have no LocalDecl to claim them). The
+    // captured value is consumed by the call-wide #429 suppression gate
+    // ~700 lines below — only the OUTERMOST call's suppression is
+    // conditional on `calleeReturnMayAliasStringArgUnretained`, every
+    // nested call's release fires unconditionally like pre-#4322.
+    const bool wasRecordCallResultInitOutermost =
+        recordCallResultInitOutermost_;
+    recordCallResultInitOutermost_ = false;
     // §22.16 (v0.250, #3038): `old(E)` inside an `ensures` clause. The
     // capture slot was allocated by `allocateOldCaptureSlots` and the
     // entry-time value was stored there by `captureOldOperands` (both
@@ -6337,14 +7015,95 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                 // (its own `ast::TypeDecl`), so `builtinTypeName` — which
                 // requires `!declaration->decl` to return a name at all
                 // (LlvmBackend_Calls.cpp:767) — returns "" for every real
-                // class and is a no-op exclusion for them; it returns
-                // "FrozenArray" ONLY for this one synthetic shape.
+                // class and is a no-op exclusion for them.
+                //
+                // fix #4120 (stdlib §10.1/§10.2/§10.3, v0.295): the #3907
+                // exclusion above named exactly ONE synthetic builtin
+                // ("FrozenArray"); `CString`/`WString`/`RawBytes` are three
+                // MORE names `SemaContext::builtinClassSym` stamps
+                // `kind = Class` for unconditionally, with no dedicated
+                // ToString interceptor in `tryLowerBuiltinClassCall`
+                // (LlvmBackend_Calls.cpp — that file's own blocks for these
+                // three cover only `ToBytes`/`CopyTo`), so they match
+                // `cg_isClass` here exactly like FrozenArray did pre-#3907.
+                // Measured live: `CString.From("hi").ToString()` / `WString.
+                // From("hi").ToString()` returned `""` (their receiver's raw
+                // buffer pointer read as a class vtable header, landing on a
+                // null "vtable pointer" -> lowerObjectToString's OWN
+                // null-receiver branch, which renders the SENTINEL "null" for
+                // what is actually a non-null FFI buffer); `RawBytes.From
+                // (arr).ToString()` returned memory-layout-dependent garbage
+                // bytes (its `{ptr,len}` struct's `ptr` field misread as a
+                // vtable pointer, then walked `kToStringSlot` slots further
+                // into whatever happens to be mapped there).
+                //
+                // Excluded via `isFfiBufferTypeRef` (LlvmBackend_Calls.cpp:~809,
+                // `common::isFfiBufferBuiltinName(builtinTypeName(rt))` over
+                // the closed `kFfiBufferBuiltins` = {CString, WString,
+                // RawBytes} registry row, BuiltinRegistry.cpp) rather than a
+                // fourth `builtinTypeName(...) != "X"` literal appended here,
+                // or a fully general `builtinTypeName(...).empty()` that
+                // would ALSO exclude the other `builtinClassSym`-stamped
+                // names (CancellationToken, Range, Guid, Stopwatch, …):
+                // several of THOSE were measured (while verifying this fix)
+                // to have the SAME "wrong value, no crash" defect on this
+                // path today — but excluding them here with no replacement
+                // dispatch turns that into a hard crash (confirmed: excluding
+                // via the fully general predicate alone made
+                // `CancellationToken.None.ToString()` and
+                // `Stopwatch.StartNew().ToString()` SIGSEGV instead of
+                // returning a wrong value). Fixing those correctly needs
+                // per-type work this issue does not cover (filed as issue
+                // 4126); `isFfiBufferTypeRef` scopes the exclusion to
+                // exactly the three names this fix ALSO gives a correct
+                // replacement dispatch below (the qualified-name §8.5
+                // default, via the same literal chain FrozenArray's
+                // `.ToString()` already uses) and via the reference-identity
+                // Equals/GetHashCode default (`isBuiltinIdentityRecv` below)
+                // — so no `builtinClassSym`-stamped receiver is left with
+                // NO dispatch after this change. A genuine user or imported
+                // class is unaffected either way (`isFfiBufferTypeRef` is a
+                // no-op for both, exactly as the single-name form was).
+                //
+                // ⚠ MUST keep the pre-existing `!= "FrozenArray"` test
+                // ALONGSIDE `!isFfiBufferTypeRef` here, not replace it: this
+                // early interceptor is the ONLY occurrence in this function
+                // that fires before `ms`/the ToString literal chain are ever
+                // reached, so FrozenArray's OWN #3907 fix (a qualified-name
+                // rendering further down, reached only via the `ms == null`
+                // path) depends on THIS check still excluding it too, or a
+                // no-arg `.ToString()` on FrozenArray is caught here first
+                // and never reaches its own fix again.
+                // fix #4126 (stdlib §6.1/§8.1, v0.295): Stopwatch and
+                // CancellationToken share #4120's exact shape one line above
+                // — measured: `Stopwatch.StartNew().ToString()` SIGSEGVed in
+                // `bz_string_to_utf8z` (this receiver's raw `bz_stopwatch_t*`
+                // misread as a vtable pointer, the misread "vtable slot"
+                // happening to point at invalid memory); `CancellationToken.
+                // None.ToString()` rendered the null-receiver sentinel
+                // "null" for `.None`, and a NON-null token's `.ToString()`
+                // ALSO SIGSEGVed the same way as Stopwatch (the issue's own
+                // filing measured only `.None`, which is representationally
+                // a null pointer and so happened to hit
+                // `lowerObjectToString`'s dedicated null-receiver branch
+                // instead of the wild vtable jump). Excluded via
+                // `isNoOverrideIdentityTypeRef` (`kNoOverrideIdentityBuiltins`,
+                // BuiltinRegistry.cpp) — kept separate from
+                // `isFfiBufferTypeRef` because that set also drives
+                // FFI-specific malloc/free disposal and member dispatch
+                // (LANE_RULES §6: a shared boolean would misstate the two
+                // families as interchangeable). Given a correct replacement
+                // dispatch below (the qualified-name literal chain and the
+                // reference-identity Equals/GetHashCode default), exactly as
+                // #4120 did for CString/WString/RawBytes.
                 bool cg_isClass =
                     cg_recvTy->kind == CG_K::Named &&
                     cg_recvTy->declaration &&
                     cg_recvTy->declaration->kind ==
                         ast::TypeDeclKind::Class &&
-                    builtinTypeName(cg_recvTy) != "FrozenArray";
+                    builtinTypeName(cg_recvTy) != "FrozenArray" &&
+                    !isFfiBufferTypeRef(cg_recvTy) &&
+                    !isNoOverrideIdentityTypeRef(cg_recvTy);
                 // Built-in exception types: Named with no declaration, AND
                 // the type name is actually in the builtin exception set
                 // (isBuiltinExceptionTypeRef -- see its own doc comment,
@@ -6793,13 +7552,43 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                 // authority `isCollectionTypeName` reads for this identical
                 // two-shape problem — so read it once instead of re-deriving
                 // the shape test here.
+                //
+                // fix #4120 (stdlib §10.1/§10.2/§10.3, v0.295): CString/
+                // WString/RawBytes join this literal chain too. They are
+                // `public class` with NO declared ToString override (stdlib
+                // §10.1-§10.3 list only From/FromBytes/Length/Pointer/
+                // ToBytes/CopyTo/destructor), so the §8.5 no-override default
+                // — the qualified type name this chain already renders for
+                // FrozenArray and the other seven residual names — is the
+                // CORRECT value, not a name-only special case: routing them
+                // here is what makes it SAFE to exclude them from the
+                // `cg_isClass`/`isNamedClassRecv` vtable-misdispatch checks
+                // elsewhere in this function (see `isFfiBufferTypeRef`'s use
+                // there) without leaving them with no dispatch at all.
+                // `common::isFfiBufferBuiltinName` (`kFfiBufferBuiltins` =
+                // {CString, WString, RawBytes}, BuiltinRegistry.cpp) is the
+                // existing authority for exactly this three-name set — used
+                // instead of three more `arn == "X"` literals here.
+                // fix #4126 (stdlib §6.1/§8.1, v0.295): Stopwatch /
+                // CancellationToken join this literal chain too — both are
+                // `public class` (Stopwatch) / `public record` with an
+                // opaque compiler-internal representation (CancellationToken)
+                // with NO declared ToString override, so the §8.5
+                // no-override qualified-name default is correct for both
+                // (`kBuiltinClassModulePaths` already carries "Stopwatch" ->
+                // "System.Diagnostics" and "CancellationToken" ->
+                // "System.Threading" from before this fix). Routing them
+                // here is what makes it safe to exclude them from
+                // `cg_isClass`/`isNamedClassRecv` above/below.
                 if (std::string_view arn = builtinTypeName(recvTy);
                         !arn.empty()) {
                     if (common::isArrayEnumeratorWrapSourceName(arn) ||
                         arn == "Set" || arn == "OwningSet" ||
                         arn == "SortedSet" || arn == "FrozenArray" ||
                         arn == "Dictionary" || arn == "OwningDictionary" ||
-                        arn == "LinkedList" || arn == "OwningLinkedList") {
+                        arn == "LinkedList" || arn == "OwningLinkedList" ||
+                        common::isFfiBufferBuiltinName(arn) ||
+                        common::isNoOverrideIdentityBuiltinName(arn)) {
                         std::string_view mod =
                             common::builtinClassModulePathOf(arn);
                         std::string rendered = mod.empty()
@@ -6839,9 +7628,34 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                 // ms==nullptr. Extend the dispatch to include named Class receivers
                 // so they use the same lowerObjectToString path as Object/interface.
                 // per §8.5 (v0.134).
+                //
+                // fix #4120 (stdlib §10.1/§10.2/§10.3, v0.295): this is the
+                // SECOND occurrence of the exact `cg_isClass` shape fixed a
+                // few thousand lines up in this same function — the early
+                // one intercepts and returns for a no-arg `.ToString()` call
+                // whenever the receiver's pointer form is available; a
+                // `CString`/`WString`/`RawBytes` receiver whose FIRST fix
+                // occurrence above now declines reaches HERE via the `ms ==
+                // null` fallback. Apply the SAME `isFfiBufferTypeRef`
+                // exclusion (see that occurrence's comment for why this is
+                // scoped to the three FFI-buffer names rather than every
+                // `builtinClassSym`-stamped name); the literal chain a few
+                // lines above this (the `builtinTypeName(recvTy)` qualified-
+                // name rendering) now ALSO admits these three names, so a
+                // CString/WString/RawBytes `.ToString()` call resolves THERE
+                // instead of ever reaching this `isNamedClassRecv` (it is
+                // excluded here only as a backstop against a future
+                // reordering). A genuine user or imported class is
+                // unaffected (`isFfiBufferTypeRef` is a no-op for both).
                 bool isNamedClassRecv =
                     recvTy && recvTy->kind == K::Named && recvTy->declaration &&
-                    recvTy->declaration->kind == ast::TypeDeclKind::Class;
+                    recvTy->declaration->kind == ast::TypeDeclKind::Class &&
+                    !isFfiBufferTypeRef(recvTy) &&
+                    // fix #4126: same backstop exclusion as
+                    // `isFfiBufferTypeRef` above — Stopwatch/CancellationToken
+                    // resolve at the literal chain a few lines above this,
+                    // never reaching here in practice.
+                    !isNoOverrideIdentityTypeRef(recvTy);
                 // #608 / §8.5 / §31: built-in exception types (Named with no
                 // declaration) in a GENERIC context (genericSubstSemaTy_ active)
                 // can reach here when the type-param substitution lookup above
@@ -7176,9 +7990,50 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                     residualIdentityName == "OwningDictionary" ||
                     residualIdentityName == "LinkedList" ||
                     residualIdentityName == "OwningLinkedList";
+                // fix #4120 (stdlib §10.1/§10.2/§10.3, v0.295): CString/
+                // WString/RawBytes are ALSO genuine heap-allocated `public
+                // class` receivers with a stable pointer identity and NO
+                // declared Equals/GetHashCode override — the same §8.3
+                // "opaque heap pointer, no vtable" shape the eight residual
+                // collection names above have, just not a collection. Kept
+                // as its own boolean (not folded into
+                // `isBuiltinIdentityResidualCollection`) because that one is
+                // deliberately the #3896 EIGHT-name residual-collection set
+                // (its own comment states the count); a distinct boolean
+                // keeps that invariant checkable and keeps the #3419
+                // class-F enumerable-grid ratchet scoped to array/collection
+                // names only, per `common::isFfiBufferBuiltinName`'s own
+                // three-name registry row (`kFfiBufferBuiltins`,
+                // BuiltinRegistry.cpp) rather than three more literals here.
+                bool isBuiltinIdentityFfiBuffer =
+                    common::isFfiBufferBuiltinName(residualIdentityName);
+                // fix #4126 (stdlib §6.1/§8.1, v0.295): Stopwatch and
+                // CancellationToken are ALSO genuine heap-pointer receivers
+                // with no vtable and no declared Equals/GetHashCode
+                // override — the same shape as the FFI-buffer trio above,
+                // just not an FFI buffer. For CancellationToken specifically
+                // this is not merely "a plausible default": its declared
+                // stdlib §6.1 surface (`None`, `IsCancellationRequested`,
+                // `ThrowIfCancellationRequested`, `Register`) exposes no
+                // stored property for a record auto-equality synthesis to
+                // read, and its ENTIRE runtime state IS the one pointer
+                // `recv` already is (null for `.None`, the shared
+                // cancellation-state pointer otherwise) — so pointer
+                // equality on `recv` IS content equality of that one opaque
+                // field, and `bz_obj_identity_hash(recv)` is stable per
+                // distinct state pointer and 0 for `.None`, exactly
+                // matching Equals. Measured pre-fix: two tokens from
+                // DIFFERENT `CancellationTokenSource`s compared Equal (both
+                // routed through the wild vtable-slot jump this fix
+                // excludes them from) and `.GetHashCode()` was always 0
+                // regardless of receiver.
+                bool isBuiltinIdentityNoOverride =
+                    common::isNoOverrideIdentityBuiltinName(
+                        residualIdentityName);
                 bool isBuiltinIdentityRecv =
                     isBuiltinIdentityIterHead || isBuiltinIdentityArrayFamily ||
-                    isBuiltinIdentityResidualCollection;
+                    isBuiltinIdentityResidualCollection ||
+                    isBuiltinIdentityFfiBuffer || isBuiltinIdentityNoOverride;
                 if (isBuiltinIdentityRecv) {
                     llvm::Value* recv = lowerExpr(*ma->target);
                     if (isEqualsCall) {
@@ -7208,9 +8063,30 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                 // the default Equals/GetHashCode on a class mis-lowered: a bare
                 // field load that returned false and crashed an `if` branch with
                 // `br i32` (defects 1 + 3). Mirrors the ToString gate above.
+                //
+                // fix #4120 (stdlib §10.1/§10.2/§10.3, v0.295): same
+                // `isFfiBufferTypeRef` exclusion as the two ToString
+                // occurrences above (see the first one's comment for the
+                // scoping rationale) — a CString/WString/RawBytes receiver
+                // is NOT "a concrete CLASS receiver" in the sense this
+                // comment means (no vtable, no Object header); it must not
+                // join isNamedClassRecv here either, or Equals/GetHashCode
+                // read the same misinterpreted memory ToString did. Measured:
+                // `RawBytes.From(arr).GetHashCode()` returned a value read
+                // from inside the receiver's OWN byte buffer, not a real
+                // identity hash. These three now get a correct §8.3
+                // reference-identity default via `isBuiltinIdentityRecv`
+                // above instead (this `isNamedClassRecv` is excluded only as
+                // a backstop). A genuine user/imported class is unaffected.
                 bool isNamedClassRecv =
                     recvTy && recvTy->kind == K::Named && recvTy->declaration &&
-                    recvTy->declaration->kind == ast::TypeDeclKind::Class;
+                    recvTy->declaration->kind == ast::TypeDeclKind::Class &&
+                    !isFfiBufferTypeRef(recvTy) &&
+                    // fix #4126: same backstop exclusion as
+                    // `isFfiBufferTypeRef` above — Stopwatch/
+                    // CancellationToken resolve at `isBuiltinIdentityRecv`
+                    // above, never reaching here in practice.
+                    !isNoOverrideIdentityTypeRef(recvTy);
                 if (isObjectRecv || isIfaceRecv || isNamedClassRecv) {
                     llvm::Value* recv = lowerExpr(*ma->target);
                     if (isEqualsCall) {
@@ -8564,11 +9440,33 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                                 llvm::StructType* entStTy =
                                     llvm::StructType::get(
                                         llvm_, {kTyLlvm, vTyLlvm});
+                                // fix #4136 (§27.5 / stdlib §4.9, v0.295):
+                                // same capture-cell-holder-vs-heap-cell defect
+                                // as fix #3876's `.Key`/`.Value` READ
+                                // intercept (LlvmBackend_Exprs.cpp) -- see its
+                                // comment there for the full mechanism. When
+                                // `entry` (a DrainedEntry<K,V> loop variable)
+                                // has been captured by an escaping closure,
+                                // `locals_[entry]`'s `localSlot()` alloca is
+                                // REBOUND (§27.5 capture boxing) to a
+                                // ptr-sized cell-holder, not the `{K,V}`
+                                // struct itself -- GEP'ing `slot` directly (as
+                                // this arm did pre-fix) treats the 8-byte
+                                // holder as if it WERE the wider struct.
+                                // `boxedStorage` is the existing §27.5 funnel:
+                                // it dereferences the holder when `slot` is a
+                                // capture cell and returns `slot` unchanged
+                                // otherwise (an ordinary, non-captured local),
+                                // so the already-working non-captured shape is
+                                // unaffected.
+                                llvm::Type* baseElemTy = nullptr;
+                                llvm::Value* base =
+                                    boxedStorage(slot, baseElemTy);
                                 // Step 1: dispose V (field[1]) and null it.
                                 if (vTyLlvm->isPointerTy()) {
                                     llvm::Value* valFldPtr =
                                         builder_.CreateStructGEP(
-                                            entStTy, slot, 1, "de.val.ptr");
+                                            entStTy, base, 1, "de.val.ptr");
                                     llvm::Value* valPtr =
                                         builder_.CreateLoad(
                                             ptrTy(), valFldPtr, "de.val");
@@ -8600,7 +9498,7 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                                         sema::PrimitiveType::String) {
                                     llvm::Value* keyFldPtr =
                                         builder_.CreateStructGEP(
-                                            entStTy, slot, 0, "de.key.ptr");
+                                            entStTy, base, 0, "de.key.ptr");
                                     llvm::Value* keyPtr =
                                         builder_.CreateLoad(
                                             ptrTy(), keyFldPtr, "de.key");
@@ -8631,547 +9529,17 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                         return nullptr;
                     }
                 }
+                // fix #4221 (§28.2/§28.9/§8.1, v0.298): the whole
+                // classification + cascading-disposal chain now lives in
+                // the shared `emitExplicitDisposeChain` (defined above
+                // `lowerCall`) so `?.Dispose()` (lowerNullCondCall) can call
+                // the SAME authority instead of carrying its own partial
+                // copy. Behaviour here is unchanged: a non-pointer/null
+                // `recv` falls through (returns false) exactly as the
+                // inline `if (recv && recv->getType()->isPointerTy())`
+                // guard used to.
                 llvm::Value* recv = lowerExpr(*ma->target);
-                if (recv && recv->getType()->isPointerTy()) {
-                    // fix #2967 (spec §28.2 / §28.3, v0.240): every branch of
-                    // the chain below EXCEPT the final `else` performs a
-                    // BUILT-IN's release right here, and therefore owes the
-                    // §28.2 exactly-once obligation that comes with it — null
-                    // the receiver's slot so §28.3's scope-exit / unwind
-                    // auto-drop reloads null and discharges nothing. That
-                    // obligation used to be a per-arm habit (the
-                    // `isDictTypeName` arm wrote it out; the collection,
-                    // linked-list and dict-backed-`Set` arms did not), which is
-                    // exactly the shape a new arm silently joins on the wrong
-                    // side of: MEASURED, twelve receivers double-freed. It is
-                    // now discharged ONCE, at the chain's single exit, so a
-                    // branch added here inherits it instead of having to
-                    // remember it. The final `else` clears the flag because it
-                    // is the USER-class path, which reclaims and nulls through
-                    // `explicitDisposeOwnedReceiverSlot`'s own ownership test
-                    // (a borrow's slot must NOT be nulled there — its real
-                    // owner reclaims through it).
-                    bool builtinReleasedHere = true;
-                    // §3: collection types use bz_array_free / bz_dict_free.
-                    auto* recvTy = ctx_.exprType(*ma->target);
-                    // issues #343 / D8: a Set is dict-backed (records,
-                    // primitives, strings — see lowerNew), so it frees with
-                    // bz_dict_free, not bz_array_free.
-                    // fix #3360 / spec §28.2 (v0.135, #2967), stdlib §4.18
-                    // (v0.278, #1426): the Set family headName match must
-                    // admit SortedSet — its runtime IS the bz_dict_t* with
-                    // sorted-ordering layered on (#1426); bz_dict_free
-                    // disposes both equivalently. Without SortedSet in this
-                    // predicate, an explicit `s.Dispose()` on a SortedSet
-                    // fell past `dictBackedSet` into the vtableless-BuiltinClass
-                    // fall-through at line 7429 → `emitVtablelessBuiltinRelease`
-                    // had no SortedSet case → emitted NOTHING (a bounded leak
-                    // — the trade #2874/#2823 record). Narrow residue of the
-                    // broader #2726 SortedSet/family thesis, which stays open
-                    // (the Set-family misclassification in lowerToLazyEnumerator
-                    // / kArrayBackedCollections is a separate problem with a
-                    // different scope of consumer #1426/#2693/#2721 touches).
-                    bool isSetName = recvTy && recvTy->astNode &&
-                        recvTy->astNode->name &&
-                        !recvTy->astNode->name->parts.empty() &&
-                        (recvTy->headName() == "Set" ||
-                         recvTy->headName() == "OwningSet" ||
-                         recvTy->headName() == "SortedSet");
-                    bool dictBackedSet = isSetName &&
-                        genericBackingType(recvTy, 0, /*isSet=*/true, nullptr)
-                            != nullptr;
-                    if (dictBackedSet) {
-                        auto* fn = declareC("bz_dict_free",
-                            llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()});
-                        builder_.CreateCall(fn, {recv,
-                            llvm::ConstantPointerNull::get(ptrTy())});
-                    } else if (isLinkedListTypeName(recvTy)) {
-                        // per §4.6/§4.7: LinkedList<T>.Dispose() → bz_llist_free.
-                        // OwningLinkedList<T> cascades disposal into class elements.
-                        // #602 / §28.11 v0.135: route directly through elementPolicyFor.
-                        // fix #2710 (§28.2 / §28.9 / §28.11, v0.240): a borrowing
-                        // `string` element is the RuntimeManaged row — its inserter
-                        // (the four `.AddFirst`/`.AddLast`/`.AddBefore`/`.AddAfter`
-                        // arms in LlvmBackend_Calls3.cpp, #2686) already retains
-                        // the list's +1, so the disposer MUST release it too —
-                        // `elementPolicyFor` returns a NULL thunk for that row
-                        // (no ownable backing, §28.11 v0.135). Without the fallback
-                        // every explicit `LinkedList<string>.Dispose()` leaked one
-                        // +1 per element (bounded leak, not unsoundness). The same
-                        // one-liner `.RemoveFirst`/`.RemoveLast`/`.Clear`/`.Remove`/
-                        // `.RemoveNode` already carry at LlvmBackend_Calls3.cpp and
-                        // `#2692` family-wide. The `!nullable` guard mirrors Site 3
-                        // (`patternAResultCollectionDisposer`'s asymmetry, recorded
-                        // in #2710) and the `litIsStrArr`/`llitIsStrElem`
-                        // siblings in materializeHeapCollectionLiteral — a nullable
-                        // string element is never retained at construction so
-                        // releasing here would be a stray double-free direction.
-                        {
-                            const sema::TypeRef* llElem =
-                                (!recvTy->genericArgs.empty())
-                                    ? recvTy->genericArgs[0] : nullptr;
-                            bool llIsOwning =
-                                recvTy->astNode && recvTy->astNode->name &&
-                                !recvTy->astNode->name->parts.empty() &&
-                                common::isOwningPrefixedName(recvTy->headName());
-                            ElementPolicy llElemPol =
-                                elementPolicyFor(llElem, llIsOwning);
-                            llvm::Function* elemDisp = llElemPol.disposerThunk;
-                            // RuntimeManaged + non-nullable string primitive —
-                            // verbatim mirror of `llIsStrElem` in
-                            // LlvmBackend_Calls3.cpp. The retain path that
-                            // paired this release (#2686) uses the same predicate,
-                            // so the release is provably paired.
-                            bool llIsStringElem =
-                                !llIsOwning && llElem && !llElem->nullable &&
-                                llElemPol.cat == ElementPolicy::Category::RuntimeManaged &&
-                                llElem->kind == sema::TypeRef::Kind::Primitive &&
-                                llElem->primitive == sema::PrimitiveType::String;
-                            if (!elemDisp && llIsStringElem)
-                                elemDisp = stringElementReleaseThunk();
-                            llvm::Value* disp = elemDisp
-                                ? llvm::cast<llvm::Value>(elemDisp)
-                                : llvm::ConstantPointerNull::get(ptrTy());
-                            auto* fn = declareC("bz_llist_free",
-                                llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()});
-                            builder_.CreateCall(fn, {recv, disp});
-                        }
-                    } else if (isListInterfaceName(recvTy)) {
-                        // fix #2970 (spec §28.2 / §28.9 / §8.1, stdlib §4.1–§4.3,
-                        // v0.240): the three ARRAY-BACKED list interfaces
-                        // (IList<T> / IReadOnlyList<T> / IOwningList<T>) carry
-                        // the same bz_array_t* at runtime as the concrete
-                        // Array<T> / OwningArray<T> they implement — so an
-                        // explicit `e.Dispose()` where `e: IList<T>` routes
-                        // through `bz_array_free`, mirroring the concrete-array
-                        // arm below. Before this fix the disposal chain had no
-                        // arm for the interface head; the chain fell through to
-                        // the generic vtable dispatch (emitDisposeAndReclaim →
-                        // load word 0 as vtable → call slot 2), but word 0 of
-                        // a bz_array_t* is the data pointer, not a vtable —
-                        // the indirect call jumped into the middle of the
-                        // array's payload and the program SEGFAULTED. MEASURED
-                        // on 001a661 (exit 139): `var e: IList<int> :=
-                        // new Array<int>(2); e.Dispose();` emitted `mov (%rax),
-                        // %rcx ; call *0x10(%rcx)` where %rax was the array
-                        // pointer and %rcx became the data buffer address —
-                        // a wild jump into the heap.
-                        //
-                        // The same array-backing assumption the indexer bridge
-                        // (LlvmBackend_Assign.cpp, #401) already keys on: the
-                        // runtime model is that IList<T>-typed slots hold
-                        // bz_array_t* and only that. A user class declaring
-                        // `: IList<T>` is a hypothetical not actually served by
-                        // the rest of the compiler either (no itable wiring;
-                        // #853 stays open for the polymorphic collection
-                        // interfaces). Polymorphic collection interfaces
-                        // (IReadOnlyCollection<T> / ICollection<T> /
-                        // IOwningCollection<T>) span incompatible runtime
-                        // representations and need runtime discrimination —
-                        // deferred; see the TODO below.
-                        //
-                        // IOwningList<T> is the OWNING list interface
-                        // (stdlib §4.2): its element disposer is the same
-                        // `elementPolicyFor` thunk the concrete
-                        // OwningArray<T>.Dispose() arm uses, so the
-                        // disposing-setter cascade runs for an interface-
-                        // typed receiver exactly as it does for the
-                        // concrete owning array.
-                        {
-                            bool listIfaceOwning = false;
-                            (void)isListInterfaceName(recvTy, &listIfaceOwning);
-                            const sema::TypeRef* arrElem =
-                                (!recvTy->genericArgs.empty())
-                                    ? recvTy->genericArgs[0] : nullptr;
-                            ElementPolicy arrElemPol =
-                                elementPolicyFor(arrElem, listIfaceOwning);
-                            llvm::Function* elemDisp = arrElemPol.disposerThunk;
-                            // fix #2710 (§28.2 / §28.9 / §28.11, v0.240): the
-                            // IList<T> / IReadOnlyList<T> arm's runtime is the
-                            // same bz_array_t* as the concrete Array<T> arm
-                            // above, so the string-element disposer fallback
-                            // (#2710's Site 1) applies here verbatim. The
-                            // `!nullable` guard mirrors Site 3 and the
-                            // `litIsStrArr` / `arrIsStringElem` siblings.
-                            bool arrIsStringElem =
-                                arrElemPol.cat ==
-                                    ElementPolicy::Category::RuntimeManaged &&
-                                arrElem &&
-                                arrElem->kind == sema::TypeRef::Kind::Primitive &&
-                                arrElem->primitive == sema::PrimitiveType::String &&
-                                !arrElem->nullable;
-                            if (!elemDisp && arrIsStringElem)
-                                elemDisp = stringElementReleaseThunk();
-                            llvm::Value* disp = elemDisp
-                                ? llvm::cast<llvm::Value>(elemDisp)
-                                : llvm::ConstantPointerNull::get(ptrTy());
-                            const char* freeName = checkedDisposal_
-                                ? "bz_array_mark_disposed"
-                                : "bz_array_free";
-                            auto* fn = declareC(freeName,
-                                llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()});
-                            builder_.CreateCall(fn, {recv, disp});
-                        }
-                    } else if (isCollectionInterfaceName(recvTy)) {
-                        // fix #3026 (spec §28.2 / §28.9 / §8.1, stdlib §4.1 /
-                        // §4.6-§4.9, v0.240): the three POLYMORPHIC collection
-                        // interfaces (IReadOnlyCollection<T> / ICollection<T> /
-                        // IOwningCollection<T>) are implemented by collections
-                        // with INCOMPATIBLE runtime representations —
-                        // Array/Stack/Queue/OwningBuffer/OwningStack/OwningQueue
-                        // (bz_array_t*), LinkedList/OwningLinkedList
-                        // (bz_llist_t*), and Dictionary/Set/OwningSet/SortedSet
-                        // (bz_dict_t*). The static type erases which concrete
-                        // backing is held, the runtime structs share no kind
-                        // header, and a single emit call is unsound — it would
-                        // read garbage on the wrong backing's layout. The
-                        // #2970 fix extended the chain to the ARRAY-BACKED LIST
-                        // interfaces (IList<T> / IReadOnlyList<T> /
-                        // IOwningList<T>), whose implementing set is
-                        // Array<T> / OwningArray<T> and only that — so the
-                        // static assumption is sound there. The polymorphic
-                        // collection interfaces have no such restriction.
-                        //
-                        // The runtime foundation (see
-                        // bezel_runtime_internal.hpp's BZ_RUNTIME_KIND_*
-                        // constants + the kind field appended to each struct)
-                        // is a negative-int64 sentinel at offset 48 for
-                        // bz_array_t / bz_llist_t (both structs append the
-                        // tag at the same offset so the runtime helper
-                        // `bz_runtime_dispose` can probe ONE offset) and at
-                        // offset 88 for bz_dict_t. The runtime helper probes
-                        // offset 48 first (a bz_dict_t's order_count at
-                        // offset 56 is non-negative and cannot collide with
-                        // the negative sentinels), then offset 88 for the
-                        // dict.
-                        // The disposer argument is computed from the STATIC
-                        // element type T (the same shape the concrete
-                        // Array<T>/LinkedList<T>/Dictionary<K,V> arms use):
-                        //   * IReadOnlyCollection<T> / ICollection<T> —
-                        //     borrowing; pass null (sound for Array<T>,
-                        //     LinkedList<T>, Set<T>, Dictionary<K,V> — every
-                        //     borrowing implementing type).
-                        //   * IOwningCollection<T> — owning; pass the
-                        //     class-element disposer `elementPolicyFor(T,
-                        //     /*owning=*/true)` yields (sound for
-                        //     OwningArray<T>, OwningLinkedList<T>,
-                        //     OwningSet<T> — every owning implementing type).
-                        // The null-dispose check in bz_*_free matches the
-                        // Set<T> borrowing case (where bz_dict_free does not
-                        // dispose values); the class-element disposer matches
-                        // the OwningSet<T> case (where bz_dict_free disposes
-                        // values, which are the owned keys).
-                        {
-                            // IOwningCollection<T> is the OWNING polymorphic
-                            // collection interface — dispose cascades.
-                            // isCollectionInterfaceName returns true for the
-                            // three heads (IReadOnlyCollection / ICollection /
-                            // IOwningCollection); only IOwningCollection is
-                            // owning, the other two are borrowing.
-                            std::string_view ifaceHead =
-                                builtinTypeName(recvTy);
-                            bool ifaceOwning = ifaceHead == "IOwningCollection";
-                            const sema::TypeRef* arrElem =
-                                (!recvTy->genericArgs.empty())
-                                    ? recvTy->genericArgs[0] : nullptr;
-                            llvm::Function* elemDisp =
-                                ifaceOwning
-                                    ? elementPolicyFor(arrElem, /*owning=*/true)
-                                          .disposerThunk
-                                    : nullptr;
-                            llvm::Value* disp = elemDisp
-                                ? llvm::cast<llvm::Value>(elemDisp)
-                                : llvm::ConstantPointerNull::get(ptrTy());
-                            auto* fn = declareC("bz_runtime_dispose",
-                                llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()});
-                            builder_.CreateCall(fn, {recv, disp});
-                        }
-                    } else if (isCollectionTypeName(recvTy)) {
-                        // #362 / stdlib §4.5: explicit Dispose() on an owning
-                        // collection cascades disposal into its class elements;
-                        // a borrowing collection frees only the backing.
-                        // #602 / §28.11 v0.135: disposer derived from
-                        // elementPolicyFor (covers Interface elements, #619).
-                        // §28.2 v0.135 / #621: checked-disposal mode quarantines
-                        // via bz_array_mark_disposed (flag stays readable for the
-                        // indexer guard); unchecked mode frees as before.
-                        // fix #2710 (§28.2 / §28.9 / §28.11, v0.240): a borrowing
-                        // `string` element is the RuntimeManaged row — its
-                        // inserter (`emitArrayRetainStringsIfStringArray` /
-                        // `materializeHeapCollectionLiteral`'s `litIsStrArr`)
-                        // already retains the array's +1, so the disposer MUST
-                        // release it too. `elementPolicyFor` returns a NULL thunk
-                        // for that row (no ownable backing, §28.11 v0.135).
-                        // Without the fallback every explicit
-                        // `Array<string>.Dispose()` leaked one +1 per element
-                        // (bounded leak, not unsoundness). The same one-liner
-                        // `.RemoveAt`/`.Remove`/`.Clear` already carry at
-                        // LlvmBackend_Calls.cpp. The `!nullable` guard mirrors
-                        // Site 3 (recorded in #2710) and the `litIsStrArr`
-                        // sibling — a nullable string element is never retained
-                        // at construction, so releasing here would be a stray
-                        // double-free direction.
-                        {
-                            const sema::TypeRef* arrElem =
-                                (!recvTy->genericArgs.empty())
-                                    ? recvTy->genericArgs[0] : nullptr;
-                            bool arrIsOwning =
-                                recvTy->astNode && recvTy->astNode->name &&
-                                !recvTy->astNode->name->parts.empty() &&
-                                common::isOwningPrefixedName(recvTy->headName());
-                            ElementPolicy arrElemPol =
-                                elementPolicyFor(arrElem, arrIsOwning);
-                            llvm::Function* elemDisp = arrElemPol.disposerThunk;
-                            // RuntimeManaged + non-nullable string primitive —
-                            // verbatim mirror of `arrIsStringElem` at
-                            // LlvmBackend_Calls.cpp (the predicate the existing
-                            // retain / `.Remove*` / `.Clear` releases use).
-                            bool arrIsStringElem =
-                                arrElemPol.cat ==
-                                    ElementPolicy::Category::RuntimeManaged &&
-                                arrElem &&
-                                arrElem->kind == sema::TypeRef::Kind::Primitive &&
-                                arrElem->primitive == sema::PrimitiveType::String &&
-                                !arrElem->nullable;
-                            if (!elemDisp && arrIsStringElem)
-                                elemDisp = stringElementReleaseThunk();
-                            llvm::Value* disp = elemDisp
-                                ? llvm::cast<llvm::Value>(elemDisp)
-                                : llvm::ConstantPointerNull::get(ptrTy());
-                            const char* freeName = checkedDisposal_
-                                ? "bz_array_mark_disposed"
-                                : "bz_array_free";
-                            auto* fn = declareC(freeName,
-                                llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()});
-                            builder_.CreateCall(fn, {recv, disp});
-                        }
-                    } else if (isDictTypeName(recvTy)) {
-                        // #396 / stdlib §4.9 + #401 / stdlib §4.8: explicit
-                        // Dispose() on a hash-backed dictionary frees the backing
-                        // table (and key bytes) and runs the per-value callback,
-                        // the same one the #394/#401 scope-end path uses:
-                        //   * OwningDictionary<K, class/interface> → dispose+free
-                        //     each surviving value (#396/#394).
-                        //   * borrowing Dictionary<K, record> → free each
-                        //     surviving record value BOX (#401; a record is a
-                        //     value type, nothing to dispose, §3.2 / §9).
-                        // A scalar/string-valued borrowing Dictionary stores no
-                        // box → null disposer (only the backing is freed). The
-                        // two value callbacks are mutually exclusive, so no box
-                        // is freed twice.
-                        // #602 / §28.11 v0.135: derive owning-class disposer
-                        // directly from elementPolicyFor (covers Interface too).
-                        // §28.2 v0.135 / issue #627: checked-disposal mode
-                        // quarantines via bz_dict_mark_disposed (header stays
-                        // alive for method-entry guard reads; bz_dict_free is
-                        // idempotent w.r.t. disposed flag). In checked mode, the
-                        // slot is NOT nulled — the pointer must remain valid so
-                        // subsequent method calls can load and test it. The
-                        // scope-end bz_dict_free is a no-op when disposed=1.
-                        {
-                            const sema::TypeRef* dictVal =
-                                (recvTy->genericArgs.size() > 1)
-                                    ? recvTy->genericArgs[1] : nullptr;
-                            bool dictIsOwning =
-                                recvTy->astNode && recvTy->astNode->name &&
-                                !recvTy->astNode->name->parts.empty() &&
-                                recvTy->headName() == "OwningDictionary";
-                            llvm::Function* valDisp =
-                                elementPolicyFor(dictVal, dictIsOwning).disposerThunk;
-                            if (!valDisp) valDisp = dictValueBoxFreer(recvTy);
-                            llvm::Value* disp = valDisp
-                                ? llvm::cast<llvm::Value>(valDisp)
-                                : llvm::ConstantPointerNull::get(ptrTy());
-                            const char* freeName = checkedDisposal_
-                                ? "bz_dict_mark_disposed"
-                                : "bz_dict_free";
-                            auto* fn = declareC(freeName,
-                                llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()});
-                            builder_.CreateCall(fn, {recv, disp});
-                            // §28.2 idempotency: in UNCHECKED mode the slot is
-                            // nulled so any subsequent bz_dict_free reloads null
-                            // and no-ops (bz_dict_free(null) returns
-                            // immediately); in CHECKED mode it is deliberately
-                            // NOT nulled — the pointer must stay valid for guard
-                            // checks, and bz_dict_free is safe there because it
-                            // returns early when disposed==1 (#627). Both are
-                            // now the chain's single exit below (#2967); this
-                            // arm's inline copy of them was the one the
-                            // collection arms next door were missing.
-                        }
-                    } else if (common::isVtableLessBuiltinClassName(
-                                   builtinTypeName(recvTy))) {
-                        // fix #2921 (spec §28.2 / §28.9 / §8.1, stdlib §1 /
-                        // stdlib §3, v0.240): every arm above this `else`
-                        // chain names ONE built-in, and the `else` below ends in
-                        // the generic vtable dispatch (emitDisposeAndReclaim →
-                        // slot 2). That dispatch's precondition is that the
-                        // receiver carries a Bezel vtable at word 0 — and a
-                        // built-in CLASS never does: it is a plain runtime C
-                        // struct whose word 0 is payload data. So the chain's
-                        // shape made every built-in it forgot to name fail as a
-                        // WILD INDIRECT JUMP with no diagnostic. MEASURED on
-                        // f069645: `var sb := new StringBuilder();
-                        // sb.Dispose();` emitted `mov (%rax),%rcx ; call
-                        // *0x10(%rcx)` and died at address 0 (SIGSEGV, exit
-                        // 139); likewise `Random`, `EventSource<T>`,
-                        // `AsyncEventSource<T>`, `TaskCompletionSource<T>`,
-                        // `OwningTaskCompletionSource<T>`. Both calls are legal:
-                        // stdlib §1 says "Every class implicitly
-                        // implements `IDisposable`", and stdlib §3 documents
-                        // `Random`'s Dispose as a no-op outright.
-                        //
-                        // Gate on the PROPERTY ("does this receiver carry a
-                        // Bezel vtable?", asked once via the registry) rather
-                        // than lengthening the name chain, so a built-in this
-                        // fix does not name cannot land back in the jump. When
-                        // no release is known, emitVtablelessBuiltinRelease
-                        // returns false and NOTHING is emitted: a bounded leak
-                        // in place of corrupted control flow, the trade recorded
-                        // on #2874 and #2823.
-                        //
-                        // §28.2 exactly-once: the receiver's slot is nulled in
-                        // unchecked mode, exactly as the Mutex / Semaphore /
-                        // Shared / Channel arms above do, so a following
-                        // `using var` scope-exit or unwind auto-drop reloads
-                        // null and skips — without which making the explicit
-                        // call release would have turned #2921's SIGSEGV into a
-                        // double free for the built-ins whose auto-drop already
-                        // releases (StringBuilder, EventSource, the TCS family).
-                        // That store is now the chain's single exit below
-                        // (#2967); it is emitted UNCONDITIONALLY there rather
-                        // than only on the non-null path, which is equivalent
-                        // (when `recv` is null the slot already holds null) and
-                        // keeps one rule for the whole family.
-                        auto* nnBB = llvm::BasicBlock::Create(
-                            llvm_, "bidisp.nn", currentFn_);
-                        auto* ctBB = llvm::BasicBlock::Create(
-                            llvm_, "bidisp.cont", currentFn_);
-                        builder_.CreateCondBr(
-                            builder_.CreateICmpNE(
-                                recv,
-                                llvm::ConstantPointerNull::get(ptrTy())),
-                            nnBB, ctBB);
-                        builder_.SetInsertPoint(nnBB);
-                        emitVtablelessBuiltinRelease(builtinTypeName(recvTy),
-                                                     recv);
-                        builder_.CreateBr(ctBB);
-                        builder_.SetInsertPoint(ctBB);
-                    } else {
-                        // fix #2967 (§28.2 / §28.3, v0.240): NOT a built-in
-                        // release — this branch owns its own §28.2 bookkeeping
-                        // (see explicitDisposeOwnedReceiverSlot below), and its
-                        // ownership test is strictly narrower than "is a named
-                        // lvalue": a BORROW's slot must not be nulled, because
-                        // the borrow's real owner reclaims through it.
-                        builtinReleasedHere = false;
-                        // #415 / §28.2 / §28.4: an explicit `.Dispose()` on a
-                        // class/interface instance. After #411 split dispatch
-                        // from reclamation, emitDynamicDispose only DISPATCHES
-                        // the idempotent Dispose (destructor + owned fields +
-                        // base chain, run AT MOST ONCE per object — §28.12 line
-                        // 5624). The block is reclaimed by the OWNING auto-
-                        // dispose site (emitDisposeAndReclaim). So when an owned
-                        // value's ONLY disposal is an explicit `.Dispose()` (a
-                        // plain `var` owned local or `owned` parameter disposed
-                        // via `x.Dispose()`, with no auto-dispose follow), the
-                        // destructor ran but the heap block LEAKED.
-                        //
-                        // Fix: when the receiver is a slot/field this scope OWNS
-                        // — and thus can NULL to block a second reclaim — RECLAIM
-                        // the block here and null that slot, mirroring the auto-
-                        // dispose site (LlvmBackend_Setup.cpp). §28.2: "the first
-                        // call performs the disposal; subsequent calls are no-
-                        // ops" — the run-once flag (§28.12) makes a second
-                        // DISPATCH a no-op, but a second RECLAIM (free) would be
-                        // a double-free, so only the FIRST disposal frees and the
-                        // slot is nulled so a following auto-dispose (using-var
-                        // scope-end, owned-field auto-dispose, unwind) reloads
-                        // null and skips. The scope-end / field / unwind paths
-                        // all null-guard their reload (LlvmBackend_Setup.cpp), so
-                        // free happens EXACTLY ONCE across explicit + auto.
-                        //
-                        // Conservative fallback (per #415): when the receiver is
-                        // NOT a slot this scope owns (a temporary like
-                        // `new R().Dispose()`, a borrow, or a non-owned field) we
-                        // CANNOT null a slot to prevent a second reclaim — a
-                        // borrow's real owner reclaims elsewhere via ITS slot —
-                        // so reclaiming could double-free. Stay dispatch-only for
-                        // those (the destructor still runs idempotently); an
-                        // owned TEMPORARY explicitly disposed (no second reclaim
-                        // path, but no slot to null either) is the deferred sub-
-                        // case noted in #415.
-                        llvm::Type* slotTy = nullptr;
-                        llvm::Value* slot =
-                            explicitDisposeOwnedReceiverSlot(*ma->target,
-                                                             slotTy);
-                        if (slot) {
-                            // §28.2: a *repeated* explicit `x.Dispose()` on the
-                            // same owned local must be a no-op. The first call
-                            // freed the block and nulled the slot (below), so on
-                            // the second call `recv` (reloaded from that slot) is
-                            // null — dispatching a vtable Dispose through it would
-                            // be a use-after-free / null-deref SIGSEGV. Guard the
-                            // whole dispatch+reclaim on a non-null receiver so the
-                            // second `x.Dispose()` cleanly skips. (Checked mode
-                            // does not null the slot — the object is quarantined —
-                            // so `recv` stays non-null there and the run-once flag
-                            // makes the re-dispatch a no-op.)
-                            auto* nn = llvm::BasicBlock::Create(
-                                llvm_, "disp.nn", currentFn_);
-                            auto* cont = llvm::BasicBlock::Create(
-                                llvm_, "disp.cont", currentFn_);
-                            builder_.CreateCondBr(
-                                builder_.CreateICmpNE(
-                                    recv,
-                                    llvm::ConstantPointerNull::get(ptrTy())),
-                                nn, cont);
-                            builder_.SetInsertPoint(nn);
-                            emitDisposeAndReclaim(recv);
-                            // §28.2 v0.134 / issue #601: in checked-disposal
-                            // mode the object is quarantined (not freed), so
-                            // the slot must remain valid — the disposed-flag
-                            // guard at the next member-entry reads through it.
-                            // In unchecked mode, null the slot as usual to
-                            // prevent a second reclaim.
-                            if (!checkedDisposal_)
-                                builder_.CreateStore(
-                                    llvm::ConstantPointerNull::get(ptrTy()),
-                                    slot);
-                            // #2310 / §29.8 / §30.1 (#973a residual): also null
-                            // the FRAME capture slot of an `owned` STATE-MACHINE
-                            // parameter this discharge just consumed — so the
-                            // frame's terminal-state disposal (null-guarded) skips
-                            // it on the discharging path. The alloca-null above
-                            // is the sync-method / owned-local piece; the frame
-                            // slot is the state-machine piece. nullStateMachine-
-                            // OwnedParamCapture is self-gating (no-op outside a
-                            // state-machine body, for non-parameter sources, for
-                            // non-owned parameters). // per §29.8 / §30.1
-                            nullStateMachineOwnedParamCapture(ma->target.get());
-                            builder_.CreateBr(cont);
-                            builder_.SetInsertPoint(cont);
-                        } else if (isFreshOwnedClassProducer(ma->target.get())) {
-                            // #1053-case-1 / #415: no owning slot, but the
-                            // receiver is a FRESH owned producer (`new X()` or an
-                            // `owned`-returning call) — owned by nothing else, so
-                            // dispatch-only (below) would leak its block. Reclaim
-                            // it exactly once: this IS the sole explicit Dispose
-                            // (one destructor run) plus the block free. A BORROW
-                            // receiver is NOT a fresh producer (its real owner
-                            // reclaims via ITS slot), so it stays dispatch-only.
-                            emitDisposeAndReclaim(recv);
-                        } else {
-                            emitDynamicDispose(recv);
-                        }
-                    }
-                    // fix #2967 (spec §28.2 / §28.3, v0.240): THE chain's single
-                    // exit. Every built-in branch above released the receiver
-                    // here, so the slot is nulled here — once, for the whole
-                    // family — and §28.3's scope-exit / unwind auto-drop
-                    // reloads null and discharges nothing.
-                    if (builtinReleasedHere)
-                        nullExplicitlyDisposedBuiltinSlot(*ma->target);
+                if (emitExplicitDisposeChain(*ma->target, recv)) {
                     return nullptr;
                 }
             }
@@ -9196,6 +9564,27 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                     call.callee.get())) {
                 if (ma->target) {
                     const sema::TypeRef* recvTy = ctx_.exprType(*ma->target);
+                    // fix issue 4193 (stdlib §8.1/§23.2-§23.3, v0.298): when
+                    // `ma->target` is a bare identifier that resolves to a
+                    // computed/block-form property getter,
+                    // `postGetterFootprint_` (populated by
+                    // `lowerExprInner`'s `IdentifierExpr` handling —
+                    // LlvmBackend_Exprs.cpp) carries a footprint taken right
+                    // after THAT getter finished evaluating. Using it instead
+                    // of `dispatchEntry` for both `emittedSideEffectSince`
+                    // reads below excludes the getter's own side effects from
+                    // the "did the MEMBER dispatch" question — see
+                    // `postGetterFootprint_`'s declaration in
+                    // LlvmBackend_impl.hpp for the full derivation. A miss
+                    // (every other identifier shape: locals, parameters,
+                    // fields; and any non-identifier receiver, which keeps
+                    // #4171's existing always-warn behaviour) falls back to
+                    // `dispatchEntry`, unchanged.
+                    const IrFootprint effectiveDispatchEntry = [&]() -> IrFootprint {
+                        auto it = postGetterFootprint_.find(ma->target.get());
+                        return it != postGetterFootprint_.end() ? it->second
+                                                                 : dispatchEntry;
+                    }();
                     using K = sema::TypeRef::Kind;
                     using P = sema::PrimitiveType;
                     // Reaching here means the whole `if (!ms)` dispatch chain
@@ -9485,8 +9874,12 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                         // documented-but-unimplemented (#2457) — are the whole
                         // set.
                         std::string ftMember, ftApplied;
+                        // fix issue 4193: `effectiveDispatchEntry` (see above)
+                        // instead of `dispatchEntry` directly — see that
+                        // declaration for why a getter-backed identifier
+                        // receiver needs the more precise anchor.
                         const std::string ftRecv =
-                            !emittedSideEffectSince(dispatchEntry)
+                            !emittedSideEffectSince(effectiveDispatchEntry)
                                 ? builtinReceiverOfMemberCall(&call, &ftMember,
                                                               &ftApplied)
                                 : std::string();
@@ -9594,8 +9987,122 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                         !recvTy->astNode->name->parts.empty() &&
                         templateGenericParamNames_.count(
                             recvTy->astNode->name->parts.back());
-                    if (isConcreteType ? !isUniversalObjMember
-                                        : isBareTypeParamInDeadTemplate) {
+                    // fix #4171 (stdlib §8.1, v0.298): the same #2963
+                    // discriminator the `ftRecv` check above already applies
+                    // to its own "produced no value" Error belongs HERE too —
+                    // this Shape 1/2 Warning is the OTHER end-of-chain
+                    // fallthrough of the identical `if (auto* v =
+                    // tryLowerBuiltinClassCall(call)) return v;` ambiguity
+                    // (line ~4964): a void-returning arm that DID dispatch the
+                    // call (e.g. `Stopwatch.StartNew()`'s `sw.Stop()`, whose
+                    // dedicated instance-method block in LlvmBackend_Calls.cpp
+                    // ~13121 emits the real `bz_stopwatch_stop` call and
+                    // correctly returns nullptr for its unit result) looks
+                    // identical, from here, to an arm that declined outright.
+                    // `Stopwatch.StartNew()`'s receiver types with a non-null
+                    // `declaration` (ExprTypecheck_Calls.cpp ~8160,
+                    // ~21011 — `builtinClassSym("Stopwatch")`, so that
+                    // `isConcreteType` reads true), while `new Stopwatch()`'s
+                    // receiver resolves through TypeResolution_Names.cpp's
+                    // "nullary stdlib class" list with a NULL declaration —
+                    // an accident of how the two call shapes were typed, not a
+                    // difference in whether the member dispatches — so only
+                    // the `StartNew()` shape ever reached this warning.
+                    //
+                    // `emittedSideEffectSince(dispatchEntry)` is the same fact
+                    // #2963 already established for this ambiguity (see the
+                    // block above) — but MEASURED here to be unsafe on its
+                    // own: `dispatchEntry` is a snapshot from the top of
+                    // `lowerCallDispatch`, and when the RECEIVER expression is
+                    // itself a call (`Stopwatch.StartNew().Bogus();`, no
+                    // intermediate binding), evaluating the receiver — which
+                    // every candidate arm does unconditionally, including the
+                    // Stopwatch block's `lowerExpr(*ma2->target)`, BEFORE it
+                    // even compares the member name — emits `bz_stopwatch_
+                    // alloc`/`bz_stopwatch_start` and makes
+                    // `emittedSideEffectSince` read true regardless of
+                    // whether the MEMBER itself ever dispatched. Trusting it
+                    // there would silently drop the #2963 diagnostic for a
+                    // genuinely-undispatched chained member — measured:
+                    // `Stopwatch.StartNew().TotallyBogus();` went from
+                    // warning to ZERO diagnostics under a footprint-only
+                    // gate. So the footprint is trusted ONLY when the
+                    // receiver is a bare `IdentifierExpr` (a local/parameter
+                    // read — always exactly one non-side-effecting `load`,
+                    // per the #2963 comment above this block) — precisely
+                    // the issue's own repro shape (`using var sw :=
+                    // Stopwatch.StartNew(); sw.Stop();`). A receiver that is
+                    // itself a call keeps the PRE-existing (always-warn)
+                    // behaviour, unchanged. Scope boundary recorded rather
+                    // than silently narrowed, per CLAUDE.md rule 4 — issue
+                    // 4182 tracks the receiver-shape-general fix (e.g. a
+                    // plain field read) should one ever surface as more than
+                    // a hypothetical.
+                    //
+                    // fix issue 4193 (stdlib §8.1/§23.2-§23.3, v0.298): a bare
+                    // `IdentifierExpr` is NOT always "one non-side-effecting
+                    // load" — the paragraph above claims it, but that claim is
+                    // false whenever the identifier resolves to a COMPUTED or
+                    // BLOCK-FORM property getter (`property Sw: Stopwatch get
+                    // => Stopwatch.StartNew(); end;`). Reading a bare `Sw`
+                    // evaluates the getter body against `this`
+                    // (`lowerExprInner`'s own `IdentifierExpr` handling,
+                    // LlvmBackend_Exprs.cpp ~6369/~6391), which can emit a
+                    // real side-effecting call before `ma->member` is ever
+                    // compared — exactly the `Stopwatch.StartNew().Bogus()`
+                    // hazard above, one hop earlier. Measured pre-fix:
+                    // `Sw.TotallyBogusMember();` compiled with ZERO
+                    // diagnostics (`Sw`'s declared type is a declaration-less
+                    // builtin — the SAME accident of typing #4171's own
+                    // comment above records — so `isConcreteType` was already
+                    // false for it and this Warning never had a chance to
+                    // fire; the `ftRecv`/#2935 Error a few dozen lines up is
+                    // what actually diagnoses this repro, gated the same
+                    // `!emittedSideEffectSince` way).
+                    //
+                    // The fix is NOT to exclude getter-backed identifiers from
+                    // `receiverIsPlainLocalRead` (that was tried FIRST and is
+                    // measurably wrong the same way "any instruction" was
+                    // wrong for #2963 above: it also excludes the LEGITIMATE
+                    // dispatches through the identical receiver shape —
+                    // `Sw.Start()`/`Sw.Stop()`/`Sw.Reset()` reach this exact
+                    // fallthrough too, per the `tryLowerBuiltinClassCall` note
+                    // above, and reintroducing the always-warn fallback for
+                    // them regressed EXACTLY the class of spurious warning
+                    // #4171 was filed to fix — MEASURED: `Sw.Start();` under
+                    // that first attempt produced the same "internal: cannot
+                    // dispatch member 'Start'" warning `sw.Start()` used to,
+                    // pre-#4171). `receiverIsPlainLocalRead` therefore stays
+                    // exactly what it was before this fix: true for ANY bare
+                    // `IdentifierExpr`, getter-backed or not.
+                    //
+                    // Instead, `emittedSideEffectSince` below is asked against
+                    // `effectiveDispatchEntry` (computed above, right after
+                    // `recvTy`) rather than `dispatchEntry` directly, for
+                    // whichever receiver TYPE eventually DOES make
+                    // `isConcreteType` true for a getter-backed identifier
+                    // (a computed/block-form property of a PRIMITIVE type, or
+                    // of a declaration-HAVING builtin, should one exist).
+                    // `postGetterFootprint_` anchors the "did anything happen"
+                    // question to AFTER the getter finished, so the getter's
+                    // own side effects no longer masquerade as "the member
+                    // dispatched" — the same discriminator that makes the
+                    // `ftRecv` fix above sound. Every other identifier shape
+                    // (locals, parameters, fields, and a getter-backed
+                    // identifier whose declared type stays declaration-less
+                    // like `Sw` above) has no `postGetterFootprint_` entry, or
+                    // reaches `isConcreteType` == false regardless, so this
+                    // line is unchanged from before this fix for them.
+                    bool receiverIsPlainLocalRead =
+                        ma->target &&
+                        dynamic_cast<const ast::IdentifierExpr*>(
+                            ma->target.get()) != nullptr;
+                    bool memberAlreadyDispatched =
+                        receiverIsPlainLocalRead &&
+                        emittedSideEffectSince(effectiveDispatchEntry);
+                    if (!memberAlreadyDispatched &&
+                        (isConcreteType ? !isUniversalObjMember
+                                        : isBareTypeParamInDeadTemplate)) {
                         // Same derivation the §8.1 reject above uses — one
                         // `receiverName` lambda, not two copies (#2924's
                         // four-way-mirror finding).
@@ -11243,10 +11750,65 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
     // args.  For instance methods args[0] = receiver (argExprs[0] = nullptr);
     // for static methods the args start at index 0.  We scan from argOffset
     // to args.size() and release any argument whose expression is a +1 producer.
+    //
+    // fix #4322 (§9.7/§28.3/§28.9, v0.298): SKIP this release, call-wide,
+    // when `calleeReturnMayAliasStringArgUnretained(ctx_, ms)` — the SAME
+    // fact `StringEscapeWalker::walkCallArgs` uses to suppress a NAMED
+    // local's own scope-end release (fix #4254/#4265/#4280) — says the
+    // callee's return type may embed a plain string argument via a bare,
+    // unretained store (a Record/Choice return, or an InlineArray return of
+    // `string`/Record/Choice elements). Before this fix an UNBOUND
+    // temporary argument (no LocalDecl, so walkCallArgs' `isTargetIdent`
+    // gate never even considered it) had this release fire
+    // UNCONDITIONALLY: `Helper.Wrap(s: string): Str return new Str(s); end
+    // Wrap;` called as `var outer := Helper.Wrap("he"+"llo"+i.ToString());`
+    // freed the argument's allocation here while `outer.V` still aliased it
+    // (`buildRecordValue`'s positional fast path is a bare `CreateStore`,
+    // no `emitStringRetain`) — measured, `AddressSanitizer:
+    // heap-use-after-free`, issue #4322. This is call-wide like its sibling
+    // (a second, unrelated +1-producer argument to the same call ALSO loses
+    // its release — leaking instead of being reclaimed — the pre-existing
+    // leak-over-UAF safe default), not per-argument.
     if (!diverged_ && !args.empty()) {
         std::size_t argOffset = isStaticMethod(ms) ? 0 : 1;
+        bool calleeMayAliasArg =
+            calleeReturnMayAliasStringArgUnretained(ctx_, ms);
+        // fix #4342 (§9.7 / §28.3 / §28.9, v0.298): the call-wide #4322
+        // suppression is sound ONLY when this call IS the initializer of a
+        // record-typed LocalDecl/LocalConstDecl in
+        // `recordCallResultReleaseEligible_` — captured at entry as
+        // `wasRecordCallResultInitOutermost` above. For every other shape
+        // (discarded `Helper.Wrap(...);` statement, inline
+        // `... + Helper.Wrap(...).V.Length` read, an argument passed to
+        // another call, etc.) nothing downstream claims the release, so
+        // suppressing it orphans the +1 producer argument's allocation:
+        // #4342 measured 20390 B / 1000 allocations at 500× loop
+        // amplification on the discarded shape — a regression from the
+        // pre-#4322 unconditional-release behaviour that reclaimed exactly
+        // that temporary. Restoring the unconditional release for those
+        // shapes is the safe default (leak-over-UAF): a UAF here would
+        // require the callee to alias the argument AND the discarded
+        // result to be read after the release — both true for
+        // `var outer := Helper.Wrap(s); outer.V.Length` (where the
+        // LocalDecl IS the init, the suppression stays armed, and the
+        // LocalDecl's scope-end `recordStringFields Disposal` reclaims
+        // the argument), and never true for the discarded/inline/arg
+        // shapes the flag distinguishes.
+        // fix #4300 (§9.7 / §28.3 / §28.9, v0.298): also suppress for
+        // Class-typed locals (var outer: Widget2) whose call-init or
+        // declare-then-assign result is in classCallResultWithRecordFieldEligible_.
+        // The suppression is sound because the Class's own vtable-driven
+        // disposal (emitOwnedFieldDisposals / emitRecordStringFieldReleases
+        // from the class disposer cascade) reclaims the +1 on the string
+        // argument at the class instance's disposal — the Class twin of
+        // recordStringFields for a record-typed local.
+        const bool suppressForCallResultClaim =
+            calleeMayAliasArg &&
+            (wasRecordCallResultInitOutermost ||
+             recordCallResultInitOutermostClassWithRecordField_);
         for (std::size_t ai = argOffset; ai < args.size() && ai < argExprs.size(); ++ai) {
-            if (argExprs[ai] && isPlusOneStringProducer(argExprs[ai]))
+            if (argExprs[ai] && isPlusOneStringProducer(argExprs[ai]) &&
+                !suppressForCallResultClaim)
                 emitStringRelease(args[ai]);
         }
     }
@@ -13163,6 +13725,74 @@ llvm::Function* Emitter::buildSpecializedMethodFn(
     asyncResultSemaType_ = nullptr;
     asyncPatternAResultDisposer_ = nullptr;
     asyncOwnedParamFrame_ = nullptr;  // §30.1 (#1521); emitAsyncMethod republishes it
+    // fix #4157 (§30.5, v0.295): asyncChainedReturn_ / asyncBorrowedReturn_ are
+    // the §30.5 Pattern A return-kind detection flags — deliberately NOT part
+    // of BEZEL_SM_FRAME_MEMBERS (see that macro's own comment: "saved where
+    // they are needed, by name"), so smFrameSave above does not touch them,
+    // and they are NOT write-before-read the way the macro members are: unlike
+    // this function's other by-name saves (savedSmIterCleanup /
+    // savedAsyncHandlerSpill, just above), a genuinely kind-1 inner body never
+    // explicitly sets these to false — detectAsyncPatternAKind only sets them
+    // TRUE for a detected kind-2 chain and otherwise leaves whatever was
+    // already there (LlvmBackend_Async.cpp ~L992). Mirrors fix #4118's
+    // identical treatment in `lowerLambda`'s async branch, the sibling site
+    // for the exact same pair: if an ENCLOSING `return await <call>` has
+    // already set one of these true before lowering its own operand, and that
+    // operand's lowering reaches HERE (a first-time generic async/iterator
+    // method specialization, built lazily mid-emission of the outer body),
+    // the inner specialization's own emit*Method call below would otherwise
+    // inherit the outer's stale flag, misclassify ITS OWN return kind (wrong
+    // runtime disposer attached to the inner's own task), and then clobber the
+    // flag on its way out — so the outer's own post-operand read then
+    // misclassifies too. The two §30.5 kind decisions swap, exactly as #4118
+    // measured (a live heap-use-after-free / double-free), reached through a
+    // generic specialization boundary instead of an inline async-lambda IIFE.
+    // DESTRUCTIVE, not a soft hint: this flag alone selects which runtime
+    // intrinsic emitReturn/lowerAwait emit (bz_task_set_chained vs
+    // bz_task_set_result_disposer), so a leaked value is a miscompile, not a
+    // degraded heuristic — the same classification #4118's own fix recorded.
+    bool savedAsyncChainedReturn = asyncChainedReturn_;
+    bool savedAsyncBorrowedReturn = asyncBorrowedReturn_;
+    asyncChainedReturn_ = false;
+    asyncBorrowedReturn_ = false;
+    // fix #4173 (§28.3 / §30.1, v0.298): pendingOwnedParams_ / pendingArgsDisposal_
+    // are the same §2731-item-3 ROOT-SCOPE REGISTRATION channels NestedBodyScope
+    // already saves/clears/restores by name for the OTHER nested-emission venues
+    // (property/choice-method getter/setter bodies — see that ctor/dtor pair,
+    // LlvmBackend_Assign.cpp ~5140/~5158/~5200, and its own comment's "REACHED by
+    // a `requires` clause" analysis). Neither is folded into BEZEL_SM_FRAME_MEMBERS
+    // for the same reason asyncChainedReturn_/asyncBorrowedReturn_ (fix #4157,
+    // just above) are not: both are ALSO hand-declared members of NestedBodyScope
+    // (LlvmBackend_impl.hpp ~12728-12730), so folding them into the macro would
+    // double-declare there (confirmed the same way #4157 confirmed it — the
+    // macro edit does not compile).
+    //
+    // `bindParameters` (LlvmBackend_Setup.cpp ~13934) unconditionally
+    // `.clear()`s pendingOwnedParams_ as its FIRST statement, before this
+    // function's own save point existed to protect anything. Every path below
+    // (the plain branch's own bindParameters call, and each of
+    // emitIteratorMethod/emitAsyncMethod/emitAsyncIteratorMethod's own internal
+    // bindParameters call) reaches it. A `requires` clause is lowered
+    // (emitRequiresPrologue) strictly between an OUTER method's own
+    // bindParameters and that outer body's own root-scope `lowerScopedBlock` —
+    // exactly the window the sibling NestedBodyScope leak's own repro already
+    // proves reachable — and a `requires` clause may call a first-time generic
+    // `pure` method, which routes through THIS function. Without this save, that
+    // nested call's own bindParameters wipes the OUTER method's still-pending
+    // `owned` parameter registration outright: MEASURED, 800 B / 50 allocations
+    // leaked for an `owned` param + a `requires` clause calling a first-time
+    // generic pure method (issue 4173's review comment; reproduced again below
+    // by this fix's own FAIL-WITHOUT cycle). pendingArgsDisposal_ shares the
+    // exact mechanism (its own producer, the variadic-args-array prologue in
+    // emitAsyncMethod ~1223 and the non-SM prologue in Setup.cpp ~9473, runs
+    // before the SAME root-scope drain) and is protected symmetrically even
+    // though only the pendingOwnedParams_ half was independently measured —
+    // leaving one half of a proven-identical pair unprotected would be exactly
+    // the "two halves of one contract" gap LANE_RULES warns about.
+    auto savedPendingOwnedParams = std::move(pendingOwnedParams_);
+    auto savedPendingArgsDisposal = std::move(pendingArgsDisposal_);
+    pendingOwnedParams_.clear();
+    pendingArgsDisposal_.reset();
 
     currentFn_ = specFn;
     // #1060 / #1061: a STATE-MACHINE method (async / iterator) must have its
@@ -13313,6 +13943,12 @@ llvm::Function* Emitter::buildSpecializedMethodFn(
         // #2854 regression test).
         collectClosureReleaseEligible(*ci.stmts);
         closureReleaseEligibleFn_ = specFn;
+        // fix #4174 follow-up: the closure twin of the string parameter
+        // retain above — see retainAssignedClosureParams' own comment.
+        // Paired with the closureReleaseEligibleFn_ = specFn pin just above,
+        // exactly as retainAssignedStringParams is paired with
+        // stringReleaseEligibleFn_ = specFn above it.
+        retainAssignedClosureParams(*ci.stmts, ms->params);
     }
 
     // Emit the body. fix #580: handle both EXPRESSION and block bodies, so a
@@ -13405,6 +14041,20 @@ llvm::Function* Emitter::buildSpecializedMethodFn(
     // this function returns; only the members outside it are by hand.
     smIterCleanupAtState_ = std::move(savedSmIterCleanup);  // fix #1567
     asyncHandlerSpillSlots_ = std::move(savedAsyncHandlerSpill);
+    // fix #4157: restore the §30.5 Pattern A flags the save/reset above set
+    // aside — see the comment there. This is the ONLY exit path in this
+    // function after the save point (the sole earlier `return`, the cache-hit
+    // `return cit->second;`, is well before smFrameSave/this save), so a
+    // single restore here covers every exit.
+    asyncChainedReturn_ = savedAsyncChainedReturn;
+    asyncBorrowedReturn_ = savedAsyncBorrowedReturn;
+    // fix #4173: restore the root-scope registration channels the save/reset
+    // above set aside — see the comment there. Same single-exit-path argument
+    // #4157 makes just above (the only earlier `return`, the cache-hit
+    // `return cit->second;`, is well before this save), so one restore here
+    // covers every exit.
+    pendingOwnedParams_ = std::move(savedPendingOwnedParams);
+    pendingArgsDisposal_ = std::move(savedPendingArgsDisposal);
 
     return specFn;
 }
@@ -14002,23 +14652,49 @@ llvm::Value* Emitter::lowerNullCondCall(const ast::CallExpr& call,
                     recvD, llvm::ConstantPointerNull::get(ptrTy())),
                 doBB, endBB);
             builder_.SetInsertPoint(doBB);
-            llvm::Type* slotTy = nullptr;
-            llvm::Value* slot =
-                explicitDisposeOwnedReceiverSlot(*nm.target, slotTy);
-            if (slot) {
-                emitDisposeAndReclaim(recvD);
-                if (!checkedDisposal_)
-                    builder_.CreateStore(
-                        llvm::ConstantPointerNull::get(ptrTy()), slot);
-                // #2310 / §29.8 / §30.1 (#973a residual): also null the FRAME
-                // capture slot of an `owned` state-machine parameter this
-                // discharge just consumed (no-op outside a state-machine body,
-                // for non-parameter sources, for non-owned parameters).
-                // per §29.8 / §30.1
-                nullStateMachineOwnedParamCapture(nm.target.get());
-            } else {
-                emitDynamicDispose(recvD);
-            }
+            // fix #4221 (§28.2/§28.9/§8.1, v0.298): route through the SAME
+            // shared dispatch chain the non-`?.` `.Dispose()` arm uses
+            // (`emitExplicitDisposeChain`, defined above `lowerCall` in
+            // this file) instead of a second, partial copy. `fix #4209`
+            // first intercepted only the VTABLE-LESS BUILTIN receiver shape
+            // here (StringBuilder, Mutex, Stopwatch, ...) — mirroring just
+            // one arm of the non-`?.` chain's type-first dispatch — and
+            // deliberately left the COLLECTION population
+            // (Array/Dictionary/Set/LinkedList/the list and collection
+            // interfaces) unported: `isVtableLessBuiltinClassName` is also
+            // true of those names, but `emitVtablelessBuiltinRelease` has
+            // no arm for them, so #4209's own success-gated guard fell
+            // through to `explicitDisposeOwnedReceiverSlot` /
+            // `emitDynamicDispose(recvD)` — the exact wild-jump-on-word-0
+            // #4209 fixed for builtins, still live for collections.
+            // MEASURED (issue #4221, reconfirmed on this lane's base):
+            // `var a := new Array<int>(2); a.Add(1); a?.Dispose();` —
+            // AddressSanitizer heap-buffer-overflow reading 8 bytes past
+            // the array's `bz_array_alloc` header.
+            //
+            // `emitExplicitDisposeChain` is the non-`?.` chain's FULL,
+            // TYPE-FIRST dispatch: the Set-family dict-backed check,
+            // `isLinkedListTypeName`, `isListInterfaceName`,
+            // `isCollectionInterfaceName`, `isCollectionTypeName`,
+            // `isDictTypeName` all run BEFORE the vtable-less-builtin arm
+            // (mirroring the non-`?.` chain's own order, this file's
+            // `if (!ms) ... else if` collection dispatch, ~line 8900) — so
+            // a collection receiver is intercepted by its own element-aware
+            // arm and never reaches the generic vtable-slot dispatch at
+            // all. The vtable-less-builtin arm itself is also a strict
+            // superset of #4209's inline guard: it nulls the slot whenever
+            // `isVtableLessBuiltinClassName` matches regardless of whether
+            // `emitVtablelessBuiltinRelease` actually knows a release (a
+            // BOUNDED LEAK for the ~29-name "classified but unknown" gap
+            // documented at `vtablelessBuiltinReleaseIsKnown`'s declaration,
+            // §2874/§2823's leak-over-wild-jump trade) rather than falling
+            // through to the same wild-jump general path #4209's
+            // success-gate did for that population — closing that gap too.
+            // Guaranteed non-null here (inside `doBB`), so
+            // `emitExplicitDisposeChain`'s own
+            // `recv && recv->getType()->isPointerTy()` guard is trivially
+            // satisfied and it always emits + returns true for this shape.
+            emitExplicitDisposeChain(*nm.target, recvD);
             builder_.CreateBr(endBB);
             builder_.SetInsertPoint(endBB);
         }
@@ -14085,11 +14761,35 @@ llvm::Value* Emitter::lowerNullCondCall(const ast::CallExpr& call,
                     recvTy0->kind == sema::TypeRef::Kind::Named &&
                     recvTy0->declaration &&
                     recvTy0->declaration->kind == ast::TypeDeclKind::Interface;
+                // fix #4137 (stdlib §10.1/§10.2/§10.3, v0.295): the `?.`
+                // sibling of narrow #4120's `.`-form fix, deliberately left
+                // unwidened there (see #4120's own commit body) because this
+                // function had no qualified-name/identity replacement
+                // dispatch to fall back to — a bare exclusion here would risk
+                // the same "wrong value -> crash" regression #4120 measured
+                // and avoided for the `.` form. This fix supplies that
+                // replacement (below), so it is now safe to exclude
+                // CString/WString/RawBytes from the generic `ncoIsClass`
+                // vtable dispatch. `isFfiBufferTypeRef` reads BOTH TypeRef
+                // shapes (LlvmBackend_Calls.cpp:~808): for the ANNOTATION
+                // shape (`c: CString?`, `declaration == nullptr`) `ncoIsClass`
+                // below was ALREADY false (it requires a non-null
+                // `declaration`), so that shape reached no branch in this
+                // function at all and fell through to the #2434
+                // zero-initialized-slot degrade; for the FACTORY shape
+                // (`declaration == builtinClassSym(...)`, `kind == Class`)
+                // `ncoIsClass` WAS true and misdispatched exactly like the
+                // `.` form did pre-#4120. Measured pre-fix (base 2aa5b1d, a
+                // genuinely non-null `CString?` from `extern "c" strdup`):
+                // `c?.ToString()` / `c?.GetHashCode()` / `c?.Equals(c)` all
+                // degraded to "NULL" via #2434 (the annotation-shape path).
+                bool ncoIsFfiBuffer = isFfiBufferTypeRef(recvTy0);
                 bool ncoIsClass =
                     recvTy0->kind == sema::TypeRef::Kind::Named &&
                     recvTy0->declaration &&
-                    recvTy0->declaration->kind == ast::TypeDeclKind::Class;
-                if (ncoIsObj || ncoIsIface || ncoIsClass) {
+                    recvTy0->declaration->kind == ast::TypeDeclKind::Class &&
+                    !ncoIsFfiBuffer;
+                if (ncoIsObj || ncoIsIface || ncoIsClass || ncoIsFfiBuffer) {
                     llvm::Value* recv = lowerExpr(*nm.target);
                     if (recv && recv->getType()->isPointerTy()) {
                         // §7.5 null-receiver short-circuit (a nullable class /
@@ -14108,7 +14808,49 @@ llvm::Value* Emitter::lowerNullCondCall(const ast::CallExpr& call,
                         // for the universal Object surface on a class / Object /
                         // interface receiver with no override.
                         llvm::Value* ncoRes = nullptr;
-                        if (isToString) {
+                        if (ncoIsFfiBuffer) {
+                            // fix #4137: the qualified-name §8.5 no-override
+                            // default for ToString (the SAME rendering the
+                            // `.` form's literal chain gives these three
+                            // names, LlvmBackend_Calls2.cpp ~6871) and the
+                            // §8.3 reference-identity default for
+                            // Equals/GetHashCode (the SAME ops
+                            // `isBuiltinIdentityRecv` gives them, ~7330) —
+                            // reusing `lowerExpr` rather than
+                            // `lowerUniversalEqualsArg` for the Equals
+                            // argument, matching `isBuiltinIdentityRecv`'s own
+                            // choice: a CString/WString/RawBytes argument is
+                            // already reference-shaped (a bare pointer), so
+                            // no §8.6 boxing is needed to compare it by
+                            // identity.
+                            if (isToString) {
+                                std::string_view arn = builtinTypeName(recvTy0);
+                                std::string_view mod =
+                                    common::builtinClassModulePathOf(arn);
+                                std::string rendered =
+                                    mod.empty()
+                                        ? std::string(arn)
+                                        : (std::string(mod) + "." +
+                                           std::string(arn));
+                                ncoRes = lowerStringLiteral(
+                                    std::string("\"") + rendered + "\"",
+                                    false);
+                            } else if (isGetHashCode) {
+                                ncoRes = builder_.CreateCall(
+                                    declareC("bz_obj_identity_hash", i32(),
+                                             {ptrTy()}),
+                                    {recv}, "nco.ffi.hash");
+                            } else {
+                                // §7.5: lowered here, inside the non-null-
+                                // receiver arm, so a null receiver never
+                                // evaluates the argument.
+                                llvm::Value* ncoOther =
+                                    lowerExpr(*call.args[0].value);
+                                if (ncoOther)
+                                    ncoRes = builder_.CreateICmpEQ(
+                                        recv, ncoOther, "nco.ffi.eq");
+                            }
+                        } else if (isToString) {
                             ncoRes = lowerObjectToString(recv);
                         } else if (isGetHashCode) {
                             ncoRes = lowerObjectGetHashCode(recv);

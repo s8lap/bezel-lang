@@ -13,11 +13,11 @@
 // (the same fallback, the same malformed GEP) for the same reason.
 //
 // The fix adds materializeUserTypeCollectionLiteral:
-//   * BORROWING form (`ReadOnlySpan<U>`): materializes a heap-allocated
+//   * BORROWING form (`ReadOnlyArraySpan<U>`): materializes a heap-allocated
 //     bz_array_t<U> as the span's backing storage (the indexer reads via
 //     bz_array_len / bz_array_get, so the source MUST be a real
 //     bz_array_t* — not a raw element buffer), fills it with the n element
-//     values via bz_array_add, wraps it in a ReadOnlySpan<U> value, emits
+//     values via bz_array_add, wraps it in a ReadOnlyArraySpan<U> value, emits
 //     the static call, and releases the backing via bz_array_free
 //     IMMEDIATELY after the call (the factory must not retain the span
 //     beyond its own execution per §15.4.1 "Lowering" Borrowing form).
@@ -41,6 +41,16 @@
 // parser-fix unblock — the disabled sub-test
 // `owning_form_class_elem_materializes_spec_15_4_1` from
 // `tests/codegen/from_collection_literal_local_decl_2957_test.cpp`).
+//
+// narrow #3857 (test-only, §15.4.1, v0.272): `kBagClass`'s borrowing carrier
+// was renamed `ReadOnlySpan<int>` → `ReadOnlyArraySpan<int>` by proposal
+// 0115; the old spelling is no longer recognized (rejected at the
+// declaration as of the same fix), so every borrowing-form cell below would
+// fail to compile instead of exercising the value it names. Updated in the
+// same commit as the recognition fix. `T` stays `int` throughout this file
+// (value-typed), so none of these cells exercise #3857's D4 companion fix
+// (the fresh-producer rejection for class-typed T) — see
+// `collection_literal_borrow_form_readonlyarrayspan_3857_test.cpp`.
 
 #include <cstdio>
 #include <cstdlib>
@@ -163,14 +173,14 @@ void expectValueAndLeakFree(const std::string& source, int expectedExitCode) {
 // ---- Programs --------------------------------------------------------------
 
 // §15.4.1: a user type with a public static `FromCollectionLiteral` factory,
-// BORROWING form (`ReadOnlySpan<int>`). The factory returns `new Bag(sum)`
+// BORROWING form (`ReadOnlyArraySpan<int>`). The factory returns `new Bag(sum)`
 // where sum is the three-element sum. Used at all four positional arms
 // (local-decl, field-init, return, call-arg).
 const std::string kBagClass =
     "class Bag "
     "  public Count: int; "
     "  public static method FromCollectionLiteral("
-    "      items: ReadOnlySpan<int>): owned Bag "
+    "      items: ReadOnlyArraySpan<int>): owned Bag "
     "    if items.Length = 0 then return new Bag(99); end; "
     "    return new Bag(items[0] + items[1] + items[2]); "
     "  end FromCollectionLiteral; "

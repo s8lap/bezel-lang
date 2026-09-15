@@ -995,7 +995,66 @@ void Emitter::detectAsyncPatternAKind(const ast::Expr* valueExpr) {
         !asyncResultTy_ || !asyncResultTy_->isPointerTy())
         return;
     const auto* awaitUE = dynamic_cast<const ast::UnaryExpr*>(valueExpr);
-    if (!awaitUE || awaitUE->op != "await" || !awaitUE->operand) return;
+    if (!awaitUE || awaitUE->op != "await" || !awaitUE->operand) {
+        // fix #4285 (§30.5 "Pattern A result slots are of three kinds", kind
+        // 1, v0.298): a non-`await` return in a Pattern-A `Task<T:class>`
+        // body falls through to `emitAsyncPatternAResultDecision`'s kind-1
+        // arm (LlvmBackend_Stmts.cpp), which attaches the per-T disposer to
+        // EVERY such return UNCONDITIONALLY — nothing upstream ever verified
+        // the operand is actually OWNED. §30.5 kind 1 is explicit that it is
+        // not: "A fresh owned value (a `return` of an owned expression): the
+        // task owns the result and its destructor disposes it directly" —
+        // the parenthetical is the operative word, and neither kind 2 nor
+        // kind 3 admits a bare (non-`await`) return at all.
+        //
+        // Per §28.3 *Producers*, a field/property/indexer read is ALWAYS a
+        // borrow, with no exception for an `owned` field read without
+        // `move`: "Field access `obj.f` where `f` is not `owned`: Borrowed
+        // (source: `obj`)" and "Field access `obj.f` where `f` is `owned`:
+        // Borrowed (source: `obj`)" (only "`move obj.f` where `f` is
+        // `owned`" is Owned) — so `return h.item;` mints a Pattern-A task
+        // whose destructor disposes a value it never owned. MEASURED
+        // (`scripts/agent_check.sh --probe --asan`, #4285's repro, 300
+        // iterations): heap-use-after-free in `bz$elemDispose`, called from
+        // `bz_task_free` (bezel_runtime_concurrency.cpp:1156), freed earlier
+        // by the value's real owner's own explicit `.Dispose()`.
+        //
+        // Reject the shapes the Producers table classifies as an
+        // UNCONDITIONAL borrow (MemberAccessExpr / NullCondMemberExpr /
+        // IndexExpr at the TOP LEVEL of the return value — `move` wraps the
+        // operand in a UnaryExpr, so a genuinely-transferred `move obj.f`
+        // does not match here and is left alone). An IdentifierExpr is
+        // deliberately NOT flagged: it may name a genuinely-owned local or
+        // `owned` parameter (a legitimate kind-1 return per §28.3 *Factory
+        // methods and sourceless returns*'s admitted-source list, "an owned
+        // frame local or `owned` parameter"), and proving that case needs
+        // the ownership pass's own per-local flow state — deliberately out
+        // of scope here to avoid a duplicated, drifting classification
+        // (LANE_RULES §6) and a false-reject regression on that shape.
+        // // per §30.5 kind 1, §28.3 Producers, v0.298
+        if (asyncPatternAResultDisposer_ &&
+            (dynamic_cast<const ast::MemberAccessExpr*>(valueExpr) ||
+             dynamic_cast<const ast::NullCondMemberExpr*>(valueExpr) ||
+             dynamic_cast<const ast::IndexExpr*>(valueExpr))) {
+            ctx_.diagnostics().report(
+                Severity::Error, valueExpr->span.begin,
+                "an async method returning a class-typed `Task<T>` (§30.5 "
+                "Pattern A) may only `return` an OWNED expression on a "
+                "non-`await` return path — §30.5 kind 1: \"a `return` of an "
+                "owned expression: the task owns the result and its "
+                "destructor disposes it directly.\" A field, property, or "
+                "indexer read is a BORROW with no admitted producer-side "
+                "chain (§28.3 *Producers*: a plain field/property/indexer "
+                "read is Borrowed even when the field itself is `owned` — "
+                "only `move obj.f` transfers it), so the task's teardown "
+                "would dispose a value it never owned, a use-after-free once "
+                "the real owner disposes it independently. If the value is "
+                "genuinely owned by this frame, transfer it explicitly "
+                "(`move`); otherwise return `await` an admitted Pattern A "
+                "source instead");
+        }
+        return;
+    }
     // §30.5 kind 2 (chained) — an anonymous producer, an OWNED LOCAL source,
     // or an OWNED PARAMETER source (#3126) transfers the source task into
     // the outer task's chained slot.
@@ -1502,6 +1561,7 @@ void Emitter::emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         boxCaptureLocals_.clear();
         singleCaptureLocals_.clear();
         assignedCaptureVars_.clear();  // fix #2706
+        returnedCaptureVars_.clear();  // fix #4198
         definitelyEscapingLambdas_.clear();
         boxCaptureLocalsFn_ = resumeFn;
         cellFreeEligible_.clear();
@@ -1614,6 +1674,11 @@ void Emitter::emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         // separate, pre-existing async defect this fix neither causes nor
         // fixes; the retain-per-activation is what keeps it leak-safe.)
         retainAssignedStringParams(*ci.stmts, ms->params);
+        // fix #4174 follow-up: the closure twin — see
+        // retainAssignedClosureParams' own comment. Paired with this
+        // function's own collectClosureReleaseEligible(*ci.stmts) /
+        // closureReleaseEligibleFn_ = resumeFn pin above.
+        retainAssignedClosureParams(*ci.stmts, ms->params);
 
         // State field GEP — read by the resume dispatch, written at each await.
         llvm::Value* stateGEP =
@@ -2081,6 +2146,7 @@ void Emitter::emitAsyncLambda(const ast::LambdaExpr& lam, llvm::Function* fn,
         boxCaptureLocals_.clear();
         singleCaptureLocals_.clear();
         assignedCaptureVars_.clear();  // fix #2706
+        returnedCaptureVars_.clear();  // fix #4198
         definitelyEscapingLambdas_.clear();
         boxCaptureLocalsFn_ = resumeFn;
         cellFreeEligible_.clear();
@@ -2274,6 +2340,11 @@ void Emitter::emitAsyncLambda(const ast::LambdaExpr& lam, llvm::Function* fn,
             // retains >= releases on every path: a surplus retain leaks one
             // reference per resume, it can never over-release.
             if (paramSyms) retainAssignedStringParams(lam.stmts, *paramSyms);
+            // fix #4174 follow-up: the closure twin — see
+            // retainAssignedClosureParams' own comment. Paired with this
+            // branch's own collectClosureReleaseEligible(lam.stmts) /
+            // closureReleaseEligibleFn_ = resumeFn pin (below, this venue).
+            if (paramSyms) retainAssignedClosureParams(lam.stmts, *paramSyms);
         } else {
             // fix #4044 (§22.4 / §28.9 / §30.1 / §30.6, v0.295): the
             // EXPRESSION-bodied async lambda arm — `Lam.exprBody` is a single
@@ -3553,6 +3624,7 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
         boxCaptureLocals_.clear();
         singleCaptureLocals_.clear();          // #694
         assignedCaptureVars_.clear();          // fix #2706
+        returnedCaptureVars_.clear();          // fix #4198
         definitelyEscapingLambdas_.clear();    // #694
         boxCaptureLocalsFn_ = resumeFn;
         cellFreeEligible_.clear();
@@ -3587,6 +3659,11 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
         // given activation can release the incoming value at most once — so
         // retains >= releases on every path.
         retainAssignedStringParams(*ci.stmts, ms->params);
+        // fix #4174 follow-up: the closure twin — see
+        // retainAssignedClosureParams' own comment. Paired with this
+        // function's own collectClosureReleaseEligible(*ci.stmts) /
+        // closureReleaseEligibleFn_ = resumeFn pin above.
+        retainAssignedClosureParams(*ci.stmts, ms->params);
 
         // §30.7 (v0.228, #1525): "every MoveNextAsync() performs an implicit
         // token.ThrowIfCancellationRequested() — on entry, and at each resume
@@ -4483,6 +4560,40 @@ llvm::Value* Emitter::lowerAwait(const ast::UnaryExpr& un) {
             }
         }
     }
+    // fix #4189 (§30.5 "Disposing an unconsumed OwningTask<T>", v0.298):
+    // `takeResultAfter` also fires for a §30.5 CHAINED-RETURN's own inner
+    // await (`return await f()` where `f()`'s static type is OwningTask —
+    // `asyncChainedReturn_` is true here PRECISELY because the operand is a
+    // CallExpr and this await sits under an active chained return, per
+    // `freeTaskAfter`'s own `!asyncChainedReturn_` guard above). In THAT
+    // shape the value this await extracts is immediately handed BACK to the
+    // ENCLOSING body's own `emitAsyncPatternAResultDecision`, which chains
+    // the enclosing task onto `f`'s task and asks
+    // `bz_task_needs_caller_disposal` whether IT must attach its own
+    // disposer — a decision that reads `f`'s task's `chained_source` and
+    // (transitively, once the whole tree is freed) that source's own
+    // `result` field. Draining `f`'s WHOLE upstream chain here, before that
+    // decision runs, would silently answer it wrong (every upstream hop's
+    // `result` already null) and leak the value instead of disposing it —
+    // measured: `using_var_direct_closure_chain_double_free_4162_test.cpp`'s
+    // own `routed_through_async_method_control_clean_30_5` control (and
+    // three sibling #4159/#4118/#3960 controls exercising the same
+    // "intermediate async method" idiom) regressed from a clean disposal to
+    // a leak when this fix's chain-drain first shipped unconditionally.
+    //
+    // So: only drain the chain when this await's extracted value is NOT
+    // about to be re-chained by an active enclosing chained return — i.e.
+    // exactly the #4189 shape (`using var w := await outer;`, a plain bound
+    // local with no further task-wrapping of its own). `asyncChainedReturn_`
+    // is exactly that discriminator: true means "my caller is about to
+    // re-chain onto the task I'm awaiting", false means "this extraction is
+    // terminal". Computed here (not read again inside emitAwaitSuspend's
+    // body) because nothing between here and the emitAwaitSuspend call below
+    // writes `asyncChainedReturn_`, and passing it as an explicit parameter
+    // — rather than re-reading emitter state deep inside a shared, nested
+    // emission helper — avoids exactly the "reads possibly-stale emitter
+    // state" hazard CLAUDE.md §6/§7 warn about.
+    bool drainChainOnTake = takeResultAfter && !asyncChainedReturn_;
     // fix #3070 / §30.5 + §28.3 *Unbound owned temporaries* (v0.249): when the
     // anonymous producer's task is Pattern A `Task<T>` for a class (or intrinsic
     // collection) T, the awaited value is a BORROW of the task's result and
@@ -4562,7 +4673,7 @@ llvm::Value* Emitter::lowerAwait(const ast::UnaryExpr& un) {
     }
     return emitAwaitSuspend(task, resultTy, freeTaskAfter, takeResultAfter,
                             markSpentAfter, deferTaskFree, freeOnFault,
-                            /*onFault=*/{}, deferToScopeOnly);
+                            /*onFault=*/{}, deferToScopeOnly, drainChainOnTake);
 }
 
 
@@ -4581,7 +4692,8 @@ llvm::Value* Emitter::emitAwaitSuspend(llvm::Value* task, llvm::Type* resultTy,
                                        bool deferTaskFree,
                                        bool freeOnFault,
                                        const std::function<void()>& onFault,
-                                       bool deferToScopeOnly) {
+                                       bool deferToScopeOnly,
+                                       bool drainChainOnTake) {
     if (!task) return nullptr;
 
     // Store the awaited task into the frame's pending-task slot so the resumed
@@ -4852,9 +4964,12 @@ llvm::Value* Emitter::emitAwaitSuspend(llvm::Value* task, llvm::Type* resultTy,
         // buffer after loading (consumed-tracking). bz_tcs_dispose_owned_result
         // checks task->result; a null here tells it the result was already taken.
         if (takeResultAfter) {
-            auto* takeResultFn = declareC("bz_task_take_result",
-                                          llvm::Type::getVoidTy(llvm_), {ptrTy()});
-            builder_.CreateCall(takeResultFn, {awaitedTask});
+            auto* takeResultFn = declareC(
+                "bz_task_take_result", llvm::Type::getVoidTy(llvm_),
+                {ptrTy(), llvm::Type::getInt8Ty(llvm_)});
+            llvm::Value* drainArg = llvm::ConstantInt::get(
+                llvm::Type::getInt8Ty(llvm_), drainChainOnTake ? 1 : 0);
+            builder_.CreateCall(takeResultFn, {awaitedTask, drainArg});
         }
     }
     // §30.5 (v0.162 / #1352): mark OwningTask spent after successful result

@@ -53,10 +53,12 @@
 // — and `Array<T>.GetHashCode()` is exactly that shape, and works. Only past
 // every dispatch arm is "no lowering exists" a fact.
 
+#include "support/aot_result_asserts.hpp"  // failedAtCompileTimeWithRealLocation
 #include "support/aot_support.hpp"   // runAot — AOT test harness
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
+using bezel::test::failedAtCompileTimeWithRealLocation;
 using bezel::test::runAot;
 
 namespace {
@@ -411,4 +413,167 @@ BEZEL_TEST(builtin_receiver_unlowered_member_2935,
     auto r = runAot(program);
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(4, r.exitCode);
+}
+
+// ── issue 4193: bare-identifier COMPUTED/BLOCK-FORM getter receiver ────────
+//
+// A FOURTH receiver shape this gate must see through, found reviewing #4171's
+// own `Stopwatch.StartNew()`-typed-receiver fix: a bare identifier is not
+// always "one non-side-effecting load". `property Sw: Stopwatch get =>
+// Stopwatch.StartNew(); end;` then `Sw.TotallyBogusMember();` (`Sw` read bare,
+// no intermediate local) compiled with ZERO diagnostics on `389c554` (the
+// #4171-fixed tree) and on its `fbfd7a1` parent alike — evaluating `Sw`
+// (`lowerExprInner`'s `IdentifierExpr` handling, LlvmBackend_Exprs.cpp,
+// `computedGetterOf`/`blockGetterOf`) itself emits `Stopwatch.StartNew()`'s
+// real call BEFORE `TotallyBogusMember` is ever compared against Stopwatch's
+// closed member surface, so `emittedSideEffectSince(dispatchEntry)` read true
+// for the wrong reason and masked the #2935/#2963 gate above exactly the way
+// `Stopwatch.StartNew().Bogus()` (a call-shaped receiver) already does — just
+// one hop earlier, through the property read.
+//
+// The fix anchors the footprint check to right AFTER the getter finishes
+// (`Emitter::postGetterFootprint_`, LlvmBackend_impl.hpp / LlvmBackend_Exprs.cpp)
+// instead of `dispatchEntry`, so the getter's own side effects no longer
+// masquerade as "the member dispatched". Deliberately scoped to ONLY the
+// bare-identifier-getter population (mirrors `receiverIsPlainLocalRead`'s own
+// existing IdentifierExpr restriction): a call/`new`-shaped declaration-less
+// receiver with no intermediate binding (`new Stopwatch().Bogus();`) is
+// UNCHANGED by this fix and stays the pre-existing silent-accept, filed
+// separately as issue 4200 rather than folded in here.
+
+BEZEL_TEST(builtin_receiver_unlowered_member_2935,
+           bogus_member_on_bare_expr_getter_receiver_rejected_issue_4193) {
+    const std::string program =
+        "module M; "
+        "class C "
+        "  public property Sw: Stopwatch get => Stopwatch.StartNew(); end; "
+        "  public method Test(): int "
+        "    Sw.TotallyBogusExprGetterMember4193(); "
+        "    return 0; "
+        "  end Test; "
+        "  public static method Main(): int "
+        "    var c := new C(); "
+        "    return c.Test(); "
+        "  end Main; "
+        "end C;";
+    auto r = runAot(program);
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(
+        hasError(program, "`TotallyBogusExprGetterMember4193` on built-in "
+                          "type `Stopwatch` produced no value, and no "
+                          "dispatch arm emitted any code for this call"));
+}
+
+BEZEL_TEST(builtin_receiver_unlowered_member_2935,
+           bogus_member_on_bare_block_getter_receiver_rejected_issue_4193) {
+    // Same shape, block-form accessor (`get => do … end;`, §23.3) — a
+    // DIFFERENT lowering arm (`blockGetterOf`/`ensurePropertyBlockGetter`)
+    // from the expression-bodied getter above, so this is not just the same
+    // code path exercised twice.
+    const std::string program =
+        "module M; "
+        "class C "
+        "  public property Sw: Stopwatch "
+        "    get => do "
+        "      return Stopwatch.StartNew(); "
+        "    end; "
+        "  end Sw; "
+        "  public method Test(): int "
+        "    Sw.TotallyBogusBlockGetterMember4193(); "
+        "    return 0; "
+        "  end Test; "
+        "  public static method Main(): int "
+        "    var c := new C(); "
+        "    return c.Test(); "
+        "  end Main; "
+        "end C;";
+    auto r = runAot(program);
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(
+        hasError(program, "`TotallyBogusBlockGetterMember4193` on built-in "
+                          "type `Stopwatch` produced no value, and no "
+                          "dispatch arm emitted any code for this call"));
+}
+
+// ── ANTI-OVER-REJECT controls: the getter-backed receiver's REAL API must
+//    keep dispatching (the false positive a first, footprint-only-broadened
+//    attempt at this fix measurably caused — see the commit body) ─────────
+
+BEZEL_TEST(builtin_receiver_unlowered_member_2935,
+           real_stopwatch_api_via_bare_expr_getter_receiver_still_works_4193) {
+    // `Sw`'s expression-bodied getter (`=> Stopwatch.StartNew();`) RE-RUNS on
+    // every bare read — each `Sw` is a DIFFERENT fresh instance — so the
+    // oracle is deliberately a SINGLE access (`Sw.IsRunning` right after
+    // `StartNew()` must read true) rather than state chained across reads.
+    // `Sw.Start()`/`Sw.Stop()`/`Sw.Reset()` each get their OWN fresh instance
+    // too; the thing under test is that none of the three real calls gets
+    // mistaken for the undispatched-member case this fix diagnoses — if any
+    // one of them did, the program would fail to COMPILE at all (the same
+    // Error the two REJECTED tests above assert), not merely return a
+    // different exit code.
+    const std::string program =
+        "module M; "
+        "class C "
+        "  public property Sw: Stopwatch get => Stopwatch.StartNew(); end; "
+        "  public method Test(): int "
+        "    if not Sw.IsRunning then return 1; end; "
+        "    Sw.Start(); "
+        "    Sw.Stop(); "
+        "    Sw.Reset(); "
+        "    return 0; "
+        "  end Test; "
+        "  public static method Main(): int "
+        "    var c := new C(); "
+        "    return c.Test(); "
+        "  end Main; "
+        "end C;";
+    auto r = runAot(program);
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(0, r.exitCode);
+}
+
+BEZEL_TEST(builtin_receiver_unlowered_member_2935,
+           real_stopwatch_api_via_bare_block_getter_receiver_still_works_4193) {
+    // See the expression-getter sibling above for the single-access oracle
+    // rationale — identical here, through the block-form getter instead.
+    const std::string program =
+        "module M; "
+        "class C "
+        "  public property Sw: Stopwatch "
+        "    get => do "
+        "      return Stopwatch.StartNew(); "
+        "    end; "
+        "  end Sw; "
+        "  public method Test(): int "
+        "    if not Sw.IsRunning then return 1; end; "
+        "    Sw.Start(); "
+        "    Sw.Stop(); "
+        "    Sw.Reset(); "
+        "    return 0; "
+        "  end Test; "
+        "  public static method Main(): int "
+        "    var c := new C(); "
+        "    return c.Test(); "
+        "  end Main; "
+        "end C;";
+    auto r = runAot(program);
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(0, r.exitCode);
+}
+
+BEZEL_TEST(builtin_receiver_unlowered_member_2935,
+           new_stopwatch_chained_bogus_member_stays_unaffected_scope_boundary_4193) {
+    // The receiver-shape-general sibling this fix deliberately does NOT
+    // cover — `new Stopwatch()`, chained with no intermediate binding, has no
+    // `IdentifierExpr` to key `postGetterFootprint_` on. Pinned here so a
+    // FUTURE fix to issue 4200 has a control proving it changed something.
+    const std::string program =
+        "module M; "
+        "class C public static method Main(): int "
+        "  new Stopwatch().TotallyBogusNewChainedMember4193(); "
+        "  return 0; "
+        "end Main; end C;";
+    auto r = runAot(program);
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(0, r.exitCode);
 }

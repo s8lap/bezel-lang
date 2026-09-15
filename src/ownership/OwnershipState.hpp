@@ -47,6 +47,38 @@ struct LocalOwnership {
     OwnershipState state = OwnershipState::Uninitialized;
     // Populated when state == Borrowed.
     std::optional<BorrowSource> source;
+    // fix #4236 / §28.3 "Ownership state of locals", §28.6 "Who may call
+    // Dispose()" (v0.298): a DEDICATED, narrower sibling of `source` above,
+    // consumed ONLY by checkDisposeReceiverOwnership. Populated at THREE
+    // sites, all in Ownership.cpp, all applying the same narrow bare-
+    // IDENTIFIER-of-a-still-Owned-tracked-local test: `handleLocalDecl` (a
+    // plain, non-`using`, non-`owned`-marked local declaration), the
+    // LocalConstDecl arm (a `const`, fix #4236 send-back — §21.1/#3687
+    // already established a `const` is tracked exactly as a plain unmarked
+    // `var` alias for `source`; this is that statement for
+    // `disposeAliasSource`), and `handleAssignment`, which RE-DERIVES
+    // (set-or-cleared) it on every plain reassignment of the local so a
+    // rebind away from an alias (`b := a; b := c;`) does not leave a stale
+    // alias-source and a rebind onto one is newly recognized — it is NOT
+    // immune to later state changes, it is recomputed alongside `source` at
+    // every one of them. `joinInto` (Ownership_Checks.cpp, fix #4236
+    // send-back) additionally OR-merges it across a branch join that
+    // converges to the same state, so which arm is listed first cannot
+    // change whether a post-join alias is recognized. Deliberately NOT
+    // reused from `source`
+    // (borrowSourceForExpr's Shape 1): that field's populate gate
+    // (returnedExprMayBorrow -> isBorrowableType) answers FALSE for every
+    // compiler-builtin collection (Array/Dictionary/Set/LinkedList/...) — a
+    // Named TypeRef with a null `declaration` is the same shape
+    // isBorrowableType uses for an unresolved generic parameter, and its
+    // null-declaration branch recognizes only the builtin-exception
+    // hierarchy positively — so `source` is never set for a collection-typed
+    // alias local at all (measured: #4236's repro). Widening `source`
+    // itself would also change every OTHER consumer of it (the borrow-
+    // escape-on-return/-store checks), an unvalidated, unrelated blast
+    // radius this fix does not take on; a separate field keeps the change
+    // exactly as narrow as the bug it fixes.
+    sema::Symbol* disposeAliasSource = nullptr;
     // For Owned: a back-pointer to the AST node where the obligation
     // was created (the `:= EXPR` site), used for diagnostic notes.
     const ast::Node* obligationOrigin = nullptr;
@@ -65,6 +97,31 @@ struct LocalOwnership {
     // markDisposedByName from the checker because the implicit dispose doesn't
     // pass through the ownership-checker code path that reads the state).
     bool explicitlyDisposed = false;
+
+    // fix #4246 (§28.3 / §28.6, v0.298): true once an explicit `.Dispose()`
+    // call, for THIS local's CURRENT value-epoch, was classified as
+    // reclaim-eligible by `markExplicitDisposeReclaimIfReassignedBorrow`
+    // (i.e. `state == Owned` at that call, on a borrow-initialized local
+    // that became owned via reassignment — the shape `unwindOwnedLocalClass`
+    // cannot see because it only reads the DECLARATION). Sticky ACROSS the
+    // Owned -> Disposed transition that same call causes, so a REPEATED
+    // `.Dispose()` on the same value-epoch (§28.2 idempotence) is recognised
+    // too: codegen must return the same slot on the repeat call as it did on
+    // the reclaiming one, or the repeat call's dispatch-only fallback reads
+    // through the pointer the reclaim already nulled — a null-deref SIGSEGV
+    // (measured: `y := new Res(1); y.Dispose(); y.Dispose();` after a
+    // borrow-init `var y := x;`, before this field existed).
+    //
+    // RESET on every plain `:=` reassignment (`handleAssignment`, alongside
+    // `maybeConsumed`/`disposedOnSomePath`/`awaitSpent`) — load-bearing:
+    // the slot's CONTENT changes at a reassignment, so a stale `true` would
+    // make a LATER, unrelated dispose on a freshly-reassigned genuine borrow
+    // also reclaim, double-freeing a value this local never owned. Because
+    // the reset always runs before `state` can become Owned again, a
+    // following reassignment to another owned producer re-derives this flag
+    // from scratch at its own next explicit dispose, and the two owned
+    // "epochs" cannot bleed into each other.
+    bool explicitDisposeReclaimedSlot = false;
 
     // Async-readiness 3c: SuspendLocal annotation (§30.5 / §30.9). True when
     // this owned local's live range crosses at least one `await` suspend
@@ -131,6 +188,22 @@ struct LocalOwnership {
     // (the spec's "diagnostics should point at the offending use, not the
     // declaration"). Reassignment to a fresh owned value clears the flag
     // (the local is then definitely owned again). // per §28.3, §28.2
+    //
+    // fix #4312 (§28.3, v0.298): ALSO set on a surviving BORROWED record by
+    // joinInto's `borrowedMovedFromSplit` — the move-discharge sibling of
+    // `disposedOnSomePath`'s own Borrowed widening below: a plain alias
+    // holder rebound to a fresh owned value and `move`d/transferred-out on
+    // one if-arm, leaving a live untouched borrow on the other. The flag's
+    // MEANING is unchanged ("a read/consume/dispose here may observe
+    // freed-by-someone-else memory on some incoming path"); only the set of
+    // states it is populated on widened. `markMovedByName` and
+    // `markDisposedByName` already consult it unconditionally on state, so
+    // only `checkRead`'s IdentifierExpr arm,
+    // `reportMovedFromCapturesIn`'s `maybeConsumedAtLiteral`
+    // (Ownership_Checks.cpp), and joinInto's OWN same-state OR-merge for
+    // this flag needed widening from `Owned`-only to also cover `Borrowed`
+    // — the same three sites `disposedOnSomePath`'s #4247 widening touched,
+    // one flag over.
     bool maybeConsumed = false;
 
     // #1869 (§30.5 / Appendix C.6): set on a Disposed record produced by a
@@ -159,6 +232,26 @@ struct LocalOwnership {
     // surviving Owned record (reassignment clears it via handleAssignment,
     // exactly like maybeConsumed — the local is then definitely owned again).
     // // per §28.3, §28.2
+    //
+    // fix #4247 (§28.3, v0.298): ALSO set on a surviving BORROWED record by
+    // joinInto's `borrowedDischargedSplit` — a plain alias holder rebound to
+    // a fresh owned value and disposed on one if-arm, left a live untouched
+    // borrow on the other. The flag's MEANING is unchanged ("a read here may
+    // observe freed memory on some incoming path"); only the set of states it
+    // is populated on widened, because every existing consumer/reset site
+    // either already handles both states (`checkRead`, widened alongside
+    // this fix; every reassignment reset in `handleAssignment` and
+    // `markDisposedByName`, all unconditional on state) or was never gated on
+    // Owned in the first place. The lambda-capture read check
+    // (Ownership_Checks.cpp's `disposedOnSomePathAtLiteral`) was DELIBERATELY
+    // left NOT widened by this fix, on the claim that a captured
+    // Borrowed+disposedOnSomePath local's use-after-dispose was
+    // "separately-filed" as issue 4313 — ⚠ THAT CLAIM WAS FALSE: no such
+    // issue existed at the time (confirmed by the #4312/#4313 review that
+    // filed it after the fact). Fixed by fix #4312/#4313 (§28.3, v0.298):
+    // `disposedOnSomePathAtLiteral` is now widened alongside `maybeConsumed`'s
+    // own new `maybeConsumedAtLiteral` gate (see that flag's field comment
+    // above) to also fire on `state == Borrowed`.
     bool disposedOnSomePath = false;
 };
 

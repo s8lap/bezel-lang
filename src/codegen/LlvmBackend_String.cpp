@@ -792,6 +792,22 @@ llvm::Value* Emitter::emitWithFormatSpec(llvm::Value* val,
                     emitIFormattableDispatch(val, rt->declaration, spec))
                 return r;
         }
+        // fix #4328 (§18.5 / stdlib §2.18, v0.298): the BUILT-IN INTERFACE HEAD
+        // `IFormattable` (declaration-less Named ref, in `kBuiltinInterfaceHeads`
+        // since fix #4326 — `rt->declaration == nullptr` so the arm above
+        // correctly rejects, and `isBuiltinInterfaceHead` answers true). §18.5
+        // spec-cites this: "String interpolation dispatches a hole's format
+        // spec here (stdlib §2.18): `$"{money:C2}"` calls `money.ToString("C2")`
+        // when `money`'s type implements `IFormattable`." The proper fix
+        // (synthesizing a MethodSymbol for `IFormattable.ToString(format)` so
+        // Pass D's itable construction populates a per-(class×IFormattable)
+        // itable slot) is the §2.18 follow-up filed alongside this lane
+        // (#4328 ships the IDisposable / IAsyncDisposable arms; IFormattable
+        // format-spec dispatch through the interface head is the same-shape
+        // narrower gap). Pre-fix `#4328` the `M.Money` literal was returned
+        // here — wrong but not a crash; the post-fix regression test for the
+        // IFormattable half is deferred to the follow-up. // per §18.5,
+        // §2.18, fix #4328
     }
     // §18.5 / §9.3 / §2.18 #1412: a decimal value with a format specifier.
     // Dispatches to bz_decimal_to_string_fmt for the full §2.18 decimal vocabulary:
@@ -3245,7 +3261,30 @@ llvm::Value* Emitter::emitValueToString(llvm::Value* val,
                 return lowerStringLiteral(
                     std::string("\"") + spec85QualifiedTypeName(ts) + "\"",
                     false);
-            return emitRecordToString(val, ts);          // §9.1 recurse
+            // fix #4234 (§9.1, v0.298): route the NESTED (field-level)
+            // recursion through a per-INSTANTIATION MEMOIZED helper (a real
+            // `call`) instead of re-inlining `emitRecordToString`'s body —
+            // see `recordToStringHelperFn`'s header comment
+            // (LlvmBackend_Setup.cpp) for the exponential-blowup this fixes
+            // AND for why the key/load type must be `val`'s OWN already-
+            // correct struct type, not one re-derived from `ts` alone.
+            // Spill `val` so the helper can take it by pointer (the same
+            // spill idiom the user-override arm above already uses).
+            //
+            // fix #4251 (§9.1/§14.1/§8.5, v0.298): install THIS field's own
+            // generic substitution before the memoized helper's body is
+            // (first) built — the ToString sibling of the identical
+            // Equals/GetHashCode gap (see emitValueEquality's nested-record
+            // arm, LlvmBackend_Layout.cpp, for the full mechanism). `fieldTy`
+            // already carries the CONCRETE `genericArgs` for this field
+            // (e.g. `Box<string>`); a no-op for a non-generic nested record.
+            RecordSubstGuard fieldSubst(this, fieldTy);
+            auto* recTy = llvm::cast<llvm::StructType>(val->getType());
+            llvm::Function* helper = recordToStringHelperFn(ts, recTy);
+            llvm::AllocaInst* spill = entryAlloca(recTy);
+            builder_.CreateStore(val, spill);
+            return builder_.CreateCall(helper->getFunctionType(), helper,
+                                       {spill});
         }
         if (ts->kind == ast::TypeDeclKind::Enum)
             // per §10.5 (v0.183): a user `ToString(): string` replaces the §8.5
@@ -4076,11 +4115,6 @@ llvm::Value* Emitter::emitRangeToString(llvm::Value* rangeVal,
 llvm::Value* Emitter::emitValueHashCode(llvm::Value* val,
                                         const sema::TypeRef* fieldTy) {
     using K = sema::TypeRef::Kind;
-    // Nested record (§9.1 transitivity): combine its own field hashes.
-    if (fieldTy && fieldTy->kind == K::Named && fieldTy->declaration &&
-        fieldTy->declaration->kind == ast::TypeDeclKind::Record &&
-        val->getType()->isStructTy())
-        return emitRecordHashCode(val, fieldTy->declaration);
     // Inline array (§8.3 / §9.2 v0.158): "Hash combining element hashes in slot
     // order." Fold each slot's hash (h = h*31 + elemHash), the same order and
     // combiner as the record/positional hash — consistent with the element-wise
@@ -4138,6 +4172,48 @@ llvm::Value* Emitter::emitValueHashCode(llvm::Value* val,
     // null-equal pair collapses to, so the hash-equality invariant holds (two
     // both-null fields are equal and hash identically). Mirrors the nullable-ref
     // handling above.
+    //
+    // fix #4281/#4282 (§8.3/§9.1, v0.298): this nullable-value dispatch MUST run
+    // before the "Nested record" arm below — isNullableValueTy already includes
+    // isNullableRecordTy (a `record?` field lowers to the SAME {i8 hasValue; T}
+    // tagged struct as `int?`/an enum, LlvmBackend_impl.hpp's isNullableValueTy),
+    // so a nullable record field is fully unwrapped and recursed with its inner
+    // non-nullable type HERE, and the "Nested record" arm below only ever sees
+    // an already-unwrapped, genuinely non-nullable record value. Previously this
+    // block sat AFTER the "Nested record" arm (the only one of the three
+    // nested-field recursion sites — emitValueEquality / emitValueHashCode /
+    // emitValueToString — ordered that way; the other two already dispatch
+    // nullable-ref/nullable-value before their own "Nested record" arm), so a
+    // nullable record field's WRAPPER struct (`{i8 hasValue, Box$spec0}`) was
+    // itself `isStructTy()` and satisfied the record arm's condition directly,
+    // mis-treating the wrapper as the bare inner record: `recTy` became the
+    // wrapper's struct type instead of the record's own, and the memoized
+    // helper's body extracted the wrapper's `i8 hasValue` tag at field-index 0
+    // believing it was the record's own first storage member.
+    //   - issue 4282 (pre-existing, independent of issue 4251, zero generics
+    //     involved — `record Mid(M: string); record SoloMid(BS: Mid?);`):
+    //     `recordMemberTypeResolved` resolves `Mid.M` to the concrete `string`
+    //     regardless of any substitution (Mid isn't generic), so the
+    //     mis-extracted `i8` was routed into the string-content-hash arm and
+    //     GEP'd as a `bz_string*` — IR-verifier crash, with zero generics
+    //     involved, proving the defect is this ordering bug, not a generic-
+    //     substitution gap.
+    //   - issue 4281 (the issue-4251-era regression, `Box<T>` generic):
+    //     pre-issue-4251, `RecordSubstGuard` was never installed on this path,
+    //     so the mis-extracted tag's declared type (`Box`'s bare `T`) stayed
+    //     unresolved and fell to the safe `isIntegerTy()` catch-all far below —
+    //     wrong VALUE (a content-independent hash derived from the presence
+    //     tag), but well-typed IR. Once issue 4251 started installing
+    //     `RecordSubstGuard` at this same (mis-ordered) arm, `T` resolved to
+    //     the concrete `string`, and the SAME mis-extracted `i8` was routed
+    //     into the string-content-hash arm instead of the integer one —
+    //     upgrading the latent wrong-value bug into the IR-verifier crash
+    //     above. Moving this block ahead of the "Nested record" arm removes
+    //     both: a nullable record field's wrapper is unwrapped by hasValue/
+    //     nullablePrimValue right here, and the recursive call below reaches
+    //     the "Nested record" arm with the record's own true struct value and
+    //     its own true (non-nullable) declared type, matching
+    //     emitValueEquality's already-correct order exactly.
     if (isNullableValueTy(fieldTy) && val->getType()->isStructTy()) {
         llvm::Value* has = nullablePrimHasValue(val);          // i1
         auto* hashBB = llvm::BasicBlock::Create(llvm_, "h.nvlive", currentFn_);
@@ -4158,6 +4234,55 @@ llvm::Value* Emitter::emitValueHashCode(llvm::Value* val,
         phi->addIncoming(builder_.getInt32(0), entryBB);   // null → sentinel 0
         phi->addIncoming(live, hashEnd);
         return phi;
+    }
+    // Nested record (§9.1 transitivity): combine its own field hashes.
+    //
+    // fix #4234 (§9.1, v0.298): route through a per-INSTANTIATION MEMOIZED
+    // helper (a real `call`) instead of re-inlining `emitRecordHashCode`'s
+    // body here — the GetHashCode sibling of the identical ToString/Equals
+    // fix (recordToStringHelperFn / recordEqualityHelperFn,
+    // LlvmBackend_Setup.cpp; see recordToStringHelperFn's comment for why
+    // the key/load type must be `val`'s OWN struct type, not one re-derived
+    // from `fieldTy->declaration` alone): a shared nested record type
+    // reached from `branch` sibling FIELD positions otherwise re-expands
+    // its entire recursive hash combination at EVERY occurrence.
+    //
+    // fix #4281/#4282 (§8.3/§9.1, v0.298): `!fieldTy->nullable` is now
+    // REDUNDANT with the nullable-value dispatch above (which already
+    // intercepts and fully unwraps every nullable record field before this
+    // point — a `record?` is always `isNullableValueTy`, see that arm's
+    // comment) — but it is kept explicit here anyway, as a documented
+    // invariant rather than one a reader must re-derive by tracing the whole
+    // function's control flow: this arm must NEVER again see a nullable
+    // record field's WRAPPER struct, because that is exactly the mis-
+    // dispatch that produced issue 4281 (crash) and issue 4282 (silent wrong
+    // hash) when this arm sat ahead of the nullable checks.
+    if (fieldTy && fieldTy->kind == K::Named && fieldTy->declaration &&
+        fieldTy->declaration->kind == ast::TypeDeclKind::Record &&
+        !fieldTy->nullable &&
+        val->getType()->isStructTy()) {
+        // fix #4251 (§9.1/§14.1/§4.6, v0.298): install THIS field's own
+        // generic substitution before the memoized helper's body is (first)
+        // built — the GetHashCode sibling of the identical Equals gap (see
+        // emitValueEquality's nested-record arm, LlvmBackend_Layout.cpp, for
+        // the full mechanism). Pre-fix, `recordMemberTypeResolved` returned
+        // Box's `V: T` field bare-unresolved under the empty ambient subst,
+        // and NEITHER the string-hash arm (which requires `fieldTy->kind ==
+        // Primitive`) nor any other typed arm matched a bare `Named`/no-decl
+        // `T` — it fell all the way to this function's final catch-all
+        // `return builder_.getInt32(0)`, a CONTENT-INDEPENDENT CONSTANT
+        // (measured: `SoloStr(Box("hi")).GetHashCode() ==
+        // SoloStr(Box("bye")).GetHashCode()`, both hashing to the same
+        // value). `fieldTy` already carries the CONCRETE `genericArgs`
+        // (`Box<string>`); a no-op for a non-generic nested record.
+        RecordSubstGuard fieldSubst(this, fieldTy);
+        auto* recTy = llvm::cast<llvm::StructType>(val->getType());
+        llvm::Function* helper =
+            recordHashCodeHelperFn(fieldTy->declaration, recTy);
+        llvm::AllocaInst* spill = entryAlloca(recTy);
+        builder_.CreateStore(val, spill);
+        return builder_.CreateCall(helper->getFunctionType(), helper,
+                                   {spill});
     }
     bool isString = fieldTy && fieldTy->kind == K::Primitive &&
                     fieldTy->primitive == sema::PrimitiveType::String;
