@@ -10481,7 +10481,34 @@ bool ExprTC::narrowFromTypeTest(const ast::Expr* cond, bool forTrueBranch) {
 // resolvedDeclType for inferred lambda params).
 TypeRef* ExprTC::declaredTypeOf(Symbol* sym) {
     if (auto* loc = dynamic_cast<LocalSymbol*>(sym)) {
-        return loc->declType;
+        TypeRef* t = loc->declType;
+        // fix #4105 (§27.8, v0.300): if the declared type is a
+        // TypeAliasSymbol (set during the first forward pass when the alias
+        // wasn't yet resolved), resolve through the alias chain to get the
+        // underlying type. This handles the case where a local's type
+        // annotation uses a chained alias-of-primitive in the
+        // outer-before-inner declaration order — the binding pattern set
+        // loc->declType to the unresolved TypeAliasSymbol, and
+        // resolveAliasForwardReferences only fixes the alias node's own cache,
+        // not the Type node used in the annotation.
+        for (int iter = 0; iter < 32; ++iter) {
+            if (!t) return t;
+            if (t->kind != TypeRef::Kind::Named) return t;
+            auto* aliasSym =
+                dynamic_cast<TypeAliasSymbol*>(t->declaration);
+            if (!aliasSym) return t;
+            const auto* aliasDecl =
+                dynamic_cast<const ast::TypeAlias*>(aliasSym->decl);
+            if (!aliasDecl || !aliasDecl->aliasedType) return t;
+            TypeRef* next = ctx_.resolvedType(*aliasDecl->aliasedType);
+            if (!next) return t;
+            if (next->kind != TypeRef::Kind::Named) return next;
+            auto* nextAliasSym =
+                dynamic_cast<TypeAliasSymbol*>(next->declaration);
+            if (!nextAliasSym) return next;
+            t = next;
+        }
+        return t;
     }
     if (auto* par = dynamic_cast<ParameterSymbol*>(sym)) {
         if (par->declType) return ctx_.resolvedType(*par->declType);

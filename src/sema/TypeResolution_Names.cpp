@@ -771,6 +771,25 @@ void Resolver::resolveAliasForwardReferences(const ast::SourceFile& src,
             if (!current) continue;
             if (current->kind != TypeRef::Kind::Named) continue;
             if (current->declaration != nullptr) continue;
+            // fix #4105 (§27.8, v0.300): invalidate stale cache entries on
+            // the alias node and its aliasedType node before calling
+            // resolveType. The first forward pass caches the alias's own
+            // TypeRef on the alias node (Kind::Named, TypeAliasSymbol) and
+            // also caches an intermediate Kind::Named result on the
+            // aliasedType node (e.g. for A:=B where B:=int, B's cache is
+            // Kind::Named, B's TypeAliasSymbol from the resolveTopDecl call
+            // for "type B := int" — the alias-transparency arm wrote the
+            // Kind::Named result, not the final resolved type). Without
+            // invalidation, resolveType below hits the stale cache and
+            // returns without re-invoking resolveNamed, so the alias chain
+            // never gets re-resolved through to the underlying type.
+            // Invalidate the stale cache entry for the aliasedType node that
+            // the first forward pass resolved to a Kind::Named / TypeAliasSymbol
+            // entry.  The TypeAlias node itself (alias) is NOT a cache key —
+            // only its aliasedType is.
+            ctx_.setResolvedType(
+                static_cast<const ast::Type*>(alias->aliasedType.get()),
+                nullptr);
             // Rebuild the same per-alias generic-parameter scope that
             // resolveTopDecl used on the first pass, so a generic alias
             // (`type A<T> := B<T>;`) sees its own type parameter `T`
@@ -2824,7 +2843,7 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                     return;
                 }
                 if (TypeRef* underlying =
-                        ctx_.resolvedType(*aliasDecl->aliasedType)) {
+                        resolveType(*aliasDecl->aliasedType, scope)) {
                     // fix #4188 (§27.8, v0.298): `underlying` is the alias's
                     // CACHED TypeRef, resolved once at the alias's own
                     // declaration against a throwaway scope that binds the
@@ -2889,6 +2908,29 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                         else
                             ref.aliasResolvedHead = underlying->importedName;
                     }
+                    // fix #4105 (§27.8, v0.300): update the cache for the
+                    // alias's aliasedType AST node so that subsequent
+                    // ctx_.resolvedType(aliasDecl->aliasedType) calls return the
+                    // fully-resolved underlying type without re-invoking
+                    // resolveNamed.  The alias node itself (aliasDecl) is NOT the
+                    // cache key — only its aliasedType is (the Type node that
+                    // resolveTopDecl and resolveType stored in the cache on the
+                    // first forward pass).  Also update the cache for the Type
+                    // node `t` that was passed to this resolveNamed call — when
+                    // resolveNamed is called with a Type annotation node (e.g.
+                    // the "A" in "var x: A"), `t` points to that Type node and
+                    // its cache entry was set in the first forward pass as
+                    // Kind::Named, TypeAliasSymbol.  This entry is also never
+                    // refreshed by the alias-transparency arm, so every consumer
+                    // that reads ctx_.resolvedType(t) (including binding-pattern
+                    // type annotation resolution) gets the stale entry.
+                    // Updating both entries ensures the Type node's cache is
+                    // refreshed whenever the alias chain is followed.
+                    ctx_.setResolvedType(
+                        static_cast<const ast::Type*>(
+                            aliasDecl->aliasedType.get()),
+                        &ref);
+                    ctx_.setResolvedType(&t, &ref);
                     return;
                 }
             }
