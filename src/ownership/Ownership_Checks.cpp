@@ -4543,6 +4543,16 @@ void MethodOwnership::checkClosureEscapesOnReturn(const ast::Expr& e,
     findLambdas(e);
     if (lambdas.empty()) return;
 
+    // fix #4175 (§28.2 / §28.3, v0.300): save the method-level `states_`
+    // before the lambda loop. `checkOneLambdaBodyEscapes` re-seeds `states_`
+    // with ONLY the lambda body's own owned obligations, so a captured
+    // identifier declared in the ENCLOSING method (not the lambda body) is
+    // absent from `states_` when the CallExpr-indirection path walks a
+    // nested lambda body. The method map still has it — resolve from there
+    // for the Disposed check specifically (the Owned leg needs the
+    // lambda-body map as-is, per the comment below).
+    BlockState savedMethodStates = states_;
+
     for (const ast::LambdaExpr* lam : lambdas) {
         std::vector<const ast::IdentifierExpr*> ids;
         collectLambdaIdentifiers(*lam, ids);
@@ -4713,8 +4723,57 @@ void MethodOwnership::checkClosureEscapesOnReturn(const ast::Expr& e,
             // declared in the lambda body whose closure escapes that body
             // matches and a method-scope local deliberately does not.
             auto it = states_.find(sym);
-            if (it == states_.end()) continue;
-            const LocalOwnership& st = it->second;
+            const LocalOwnership* st = nullptr;
+            if (it != states_.end()) {
+                st = &it->second;
+                // fix #4175 (§28.2 / §28.3, v0.300): if the captured identifier
+                // is Disposed in the current `states_`, report immediately —
+                // this covers BOTH:
+                //   (a) the `scope == Method` path where the for-loop variable
+                //       seeded Disposed into `states_` during the loop itself
+                //       (so `savedMethodStates` holds the pre-loop Owned state)
+                //   (b) the `scope == LambdaBody` path where a nested lambda
+                //       body is checked after `checkOneLambdaBodyEscapes`
+                //       re-seeded `states_` with only the lambda's own locals
+                //       (so `savedMethodStates` holds the enclosing-method state
+                //        and the symbol IS present there — but we want the
+                //        CURRENT state, not the saved one)
+                // The §28.9 Owned leg below handles the non-disposed case.
+                if (st->state == OwnershipState::Disposed) {
+                    report(
+                        Severity::Error, id->span.begin,
+                        std::string("returned closure captures `") +
+                        std::string(sym->name) +
+                        "`, which was explicitly disposed before this return "
+                        "— a closure captures its source by reference, not by "
+                        "value, so every future invocation of the returned "
+                        "closure reads the ALREADY-disposed `" +
+                        std::string(sym->name) +
+                        "` (use-after-dispose). (§28.2 dominating-Dispose "
+                        "rule, extended to a capture-escaping binding per "
+                        "§28.3; keep `" + std::string(sym->name) +
+                        "` alive for as long as the closure may be called, "
+                        "or copy the data the closure needs out of it before "
+                        "disposing)");
+                    return;  // one diagnostic per return is enough
+                }
+            } else if (scope == EscapeScope::Method || scope == EscapeScope::LambdaBody) {
+                // fix #4175: symbol absent from current `states_` but reachable
+                // from the enclosing method scope. This happens in the
+                // `scope == LambdaBody` path when a NESTED lambda (via the
+                // #3702 CallExpr indirection) captures an identifier declared
+                // in the enclosing method. `checkOneLambdaBodyEscapes`
+                // re-seeded `states_` with only the lambda body's own locals,
+                // so the enclosing-method symbol is absent. Check the saved
+                // method-level map; only the Owned state is relevant here
+                // (Disposed is handled above via current `states_`).
+                auto methodIt = savedMethodStates.find(sym);
+                if (methodIt != savedMethodStates.end() &&
+                    methodIt->second.state == OwnershipState::Owned) {
+                    st = &methodIt->second;
+                }
+            }
+            if (!st) continue;
             // §28.9: capturing an *owned* local (a `using var` or an
             // owned-producing local / `owned` parameter) is a borrow whose
             // source is the local's enclosing scope; the returned closure
@@ -4722,30 +4781,7 @@ void MethodOwnership::checkClosureEscapesOnReturn(const ast::Expr& e,
             // scope-bound discharge obligation — a value-typed or
             // runtime-managed (string/function) local is never Owned, so
             // capturing one is not constrained and is not diagnosed here.
-            //
-            // fix #4156 investigation note: a Disposed-state twin of this arm
-            // (mirroring `checkIndirectEscapeOnReturn`'s new arm just above)
-            // was tried here and measured DEAD — for a directly-embedded
-            // literal (`return lambda() => entry.Key.Length;` after
-            // `entry.Dispose();`), the literal's creation point IS this
-            // return statement, so `reportMovedFromCapturesIn`'s own
-            // Disposed leg (fired earlier, per-statement, from
-            // `checkCapturedOwnedConsumeInStmt`) always reports first and at
-            // identical severity; a probe confirmed only ITS Warning printed,
-            // never a second diagnostic from here. The one shape where the
-            // two points could differ (the #3702 `return mk();` CallExpr
-            // indirection, where the inner literal's creation statement
-            // precedes the outer return) was probed too (`var mk := lambda():
-            // () -> int => lambda() => entry.Key.Length; entry.Dispose();
-            // return mk();`) and compiled with NO diagnostic at all on either
-            // side — `checkOneLambdaBodyEscapes`'s per-lambda-body `states_`
-            // reseed (§28.9, fix #3564) appears to make the outer `entry`
-            // unresolvable from within that nested walk, a DIFFERENT,
-            // deeper gap outside this issue's scope (filed separately).
-            // Left as `== Owned` only, unchanged from before this fix — the
-            // real gap #4156 reports is the indirect holder-bound form,
-            // closed above.
-            if (st.state != OwnershipState::Owned) continue;
+            if (st->state != OwnershipState::Owned) continue;
             // Belt-and-braces: confirm the captured local's declared type is
             // a class/interface reference (the only thing a §28.9 borrow can
             // alias). An Owned non-reference would be surprising, but the
