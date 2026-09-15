@@ -16683,10 +16683,23 @@ void Emitter::consumeLastLambdaCapturedCells() {
     // OUTER lambda and must be PRESERVED for that lambda's later consume call.
     const std::size_t currentScopeDepth = disposeStack_.size();
     for (const auto& ce : lastLambdaCapturedCells_) {
+        // fix #4261 (§28.3, v0.300): skip entries from outer lambdas
+        // (shallower pushScopeDepth) and outer LOCAL captures (declared shallower
+        // than the capture site — the #969 deferred path handles the disposal).
+        // Without this, an outer local captured at the CURRENT depth
+        // (pushScopeDepth == currentScopeDepth) would be processed and erased,
+        // freeing the cell before recursive calls complete (self-referential UAF).
+        // Note: uses inline find to avoid redeclaring `dd` (used at line 16806).
         if (ce.pushScopeDepth < currentScopeDepth) {
-            // Belongs to an outer lambda; skip processing entirely — it will be
-            // handled by the outer lambda's consumeLastLambdaCapturedCells call.
+            // Belongs to an outer lambda; skip — it will be handled by that
+            // lambda's own consume call.
             continue;
+        }
+        // Outer-local check: entry is at current depth but was declared shallower
+        // (the #969 deferred path handles it).
+        auto itOuter = declScopeDepth_.find(ce.key);
+        if (itOuter != declScopeDepth_.end() && itOuter->second < currentScopeDepth) {
+            continue;  // skip; #969 defers or outer lambda's consume handles it
         }
         // This entry is from the current or a nested scope; process it.
         // Check: does this cell's slot have any reads-through-cell disposal?
@@ -16856,22 +16869,20 @@ void Emitter::consumeLastLambdaCapturedCells() {
             disposeStack_.back().push_back(da);
         }
     }
-    // Erase entries that were processed in this call AND belong to nested lambdas
-    // (deeper scope). Preserve entries from outer lambdas (shallower scope) and
-    // entries from the CURRENT lambda (same scope) — the latter are erased when
-    // THIS lambda's own consume call fires (at the same or a shallower scope depth).
+    // Erase entries that were processed in this call: nested lambdas (deeper scope)
+    // and entries from the current lambda (same scope — processed above, now erased).
+    // Entries from outer lambdas or outer locals are SKIPPED before this point, so
+    // they survive to be handled by the appropriate outer scope's consume call.
     //
-    // fix #4261 (§28.3, v0.298): the original `>=` erased entries at the CURRENT
-    // scope too, which erased an OUTER lambda's entry when a MIDDLE lambda's arm
-    // fired — the outer lambda's arm then saw an empty vector and did not register
-    // boxedCellFree for its captured cell, producing the 40 B/invocation leak.
-    // The `>` operator preserves entries at the current scope, which belong to
-    // the current lambda (erased when this lambda's own consume fires at the
-    // same depth) or an outer lambda (preserved for the outer lambda's consume).
+    // fix #4261 (§28.3, v0.300): `>=` erases entries at the current scope depth.
+    // The outer-lambda case (pushScopeDepth == currentScopeDepth but entry belongs
+    // to an outer lambda) is handled by the skip block above using declScopeDepth_
+    // (the #969 guard); that entry is NOT erased here — the outer lambda's consume
+    // fires at the same depth and erases it then.
     lastLambdaCapturedCells_.erase(
         std::remove_if(lastLambdaCapturedCells_.begin(), lastLambdaCapturedCells_.end(),
                        [currentScopeDepth](const LastCellEntry& ce) {
-                           return ce.pushScopeDepth > currentScopeDepth;
+                           return ce.pushScopeDepth >= currentScopeDepth;
                        }),
         lastLambdaCapturedCells_.end());
 }
