@@ -2842,8 +2842,17 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                     ref.kind = TypeRef::Kind::Error;
                     return;
                 }
+                // Build a scope that includes the alias's own generic parameters,
+                // so that resolving the aliasedType can see e.g. `T` in
+                // `type Alias<T> := [1]T;` even when the caller's `scope`
+                // (e.g. a method scope) doesn't have `T` bound.
+                Scope aliasScope;
+                aliasScope.parent = scope;
+                for (const auto& g : aliasDecl->genericParams) {
+                    aliasScope.names[g.name] = nullptr;
+                }
                 if (TypeRef* underlying =
-                        resolveType(*aliasDecl->aliasedType, scope)) {
+                        resolveType(*aliasDecl->aliasedType, &aliasScope)) {
                     // fix #4188 (§27.8, v0.298): `underlying` is the alias's
                     // CACHED TypeRef, resolved once at the alias's own
                     // declaration against a throwaway scope that binds the
