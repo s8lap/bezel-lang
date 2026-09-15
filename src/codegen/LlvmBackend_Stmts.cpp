@@ -2016,11 +2016,15 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         return false;
     }
     // CG31: `x++` / `x--` — overflow-checked increment/decrement.
-    // §17.6 / §25: when the target's type is a user-defined record or class
-    // that declares `static method operator ++` (resp. `--`), dispatch to that
-    // operator method and write the result back:
-    //   x++ ≡ x := T.operator++(x)   (per §17.6).
-    // For built-in numeric operands keep the existing x := x + 1 path.
+    // §17.6 / §25.1 (v0.295, #3978): `++`/`--` are NOT user-overloadable. The
+    // only operands this arm ever sees are the built-in numeric primitives of
+    // §6.6's compound form (integer, floating-point, `decimal`, `char`) and
+    // the §17.6 indexer-slot desugaring (`a[i]++`); all class/record/enum/
+    // choice operands are rejected up front by the IncrementStmt handler in
+    // ExprTypecheck.cpp (see #2585/#2599/#3978/#4107/#4108). The pre-#3978
+    // operator-method scan (`opMethod`) and the dispatch arm gated on it are
+    // therefore unreachable from any program that passes sema — retired here
+    // per #4109. For built-in numeric operands keep the x := x ± 1 path.
     //
     // fix #587 / §20.5: `++`/`--` on a computed property or user-defined indexer
     // slot must call the setter to write the incremented value back.
@@ -2042,23 +2046,6 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
     //       reads from.
     if (auto* inc = dynamic_cast<const ast::IncrementStmt*>(&s)) {
         if (inc->target) {
-            // §25: look for a user-defined operator on the target's Named type.
-            const std::string_view opTok = inc->op; // "++" or "--"
-            sema::MethodSymbol* opMethod = nullptr;
-            if (const sema::TypeRef* targetTy = ctx_.exprType(*inc->target)) {
-                if (targetTy->kind == sema::TypeRef::Kind::Named &&
-                    targetTy->declaration) {
-                    for (sema::Symbol* m : targetTy->declaration->members) {
-                        auto* ms = dynamic_cast<sema::MethodSymbol*>(m);
-                        if (ms && ms->isOperator &&
-                            ms->operatorToken == opTok &&
-                            ms->params.size() == 1) {
-                            opMethod = ms;
-                            break;
-                        }
-                    }
-                }
-            }
             // fix #2858 (§17.6/§12.1/§11.2, v0.240): a VIRTUAL / OVERRIDE /
             // ABSTRACT / INTERFACE property increments through its vtable or
             // itable, exactly as `P := v` and `P OP= v` already do (this
@@ -2068,98 +2055,11 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
             // so the direct store below would land in the base's field while
             // every read goes through the dispatched getter to the override's —
             // MEASURED as a silently dropped write (0 where 1 is correct).
-            // Gated on `!opMethod` per §17.6, verbatim: "For a value-type
-            // operand whose type T overloads `operator ++`, the statement `x++`
-            // is equivalent to `x := T.operator++(x)`" — that shape keeps the
-            // operator path below, unchanged.
-            if (!opMethod && lowerVirtualPropertyIncrDecr(*inc)) return false;
+            if (lowerVirtualPropertyIncrDecr(*inc)) return false;
             llvm::Type* elemTy = nullptr;
             llvm::Value* addr = lvalueAddr(*inc->target, elemTy);
             if (addr) {
-                if (opMethod) {
-                    // §17.6 / §25: dispatch to user-defined operator ++/--.
-                    // Load the current value (struct by value, class as pointer),
-                    // call the operator method, store the result back.
-                    llvm::Value* cur = builder_.CreateLoad(elemTy, addr);
-                    std::vector<llvm::Value*> args{cur};
-                    // #1219 (per #1059 / §25.2 / §14 / §9.5): operator ++/-- on a
-                    // GENERIC record is a static method whose parameter and return
-                    // types reference the declaring type's type parameter T.  Set
-                    // up the per-instantiation substitution from the target's
-                    // concrete generic args (e.g. Box<string> → T=string) so
-                    // emitMethodCall specializes the operator, emitting/calling the
-                    // specialized form whose param type matches the already-
-                    // specialized struct (record.Box$spec0).  Without this the
-                    // unspecialized bz$Box$op$++ (param type record.Box) is called
-                    // with a record.Box$spec0 argument → LLVM IR verifier:
-                    // "Call parameter type does not match function signature".
-                    auto savedOpSubst = genericSubst_;
-                    auto savedOpSema  = genericSubstSemaTy_;
-                    if (const sema::TypeRef* tgtTy =
-                            ctx_.exprType(*inc->target)) {
-                        if (tgtTy->kind == sema::TypeRef::Kind::Named &&
-                            tgtTy->declaration == opMethod->parent &&
-                            !tgtTy->genericArgs.empty()) {
-                            // fix #3143 (§14.1 / §2.5, v0.254): parameter names
-                            // through the one both-sources walk — an IMPORTED
-                            // generic record's `operator ++` was called
-                            // unspecialized with a specialized operand.
-                            const std::vector<std::string_view> gpNames =
-                                sema::genericParamNames(tgtTy->declaration);
-                            if (!gpNames.empty() &&
-                                gpNames.size() == tgtTy->genericArgs.size()) {
-                                std::unordered_map<std::string_view,
-                                                   llvm::Type*> ns;
-                                std::unordered_map<std::string_view,
-                                    const sema::TypeRef*> nsem;
-                                for (std::size_t gi = 0;
-                                     gi < gpNames.size(); ++gi) {
-                                    ns[gpNames[gi]] =
-                                        lowerTypeRef(tgtTy->genericArgs[gi]);
-                                    nsem[gpNames[gi]] =
-                                        resolveTypeParamRef(
-                                            tgtTy->genericArgs[gi]);
-                                }
-                                genericSubst_       = std::move(ns);
-                                genericSubstSemaTy_ = std::move(nsem);
-                            }
-                        }
-                    }
-                    llvm::Value* res =
-                        emitMethodCall(opMethod, args, /*baseQualified=*/false);
-                    genericSubst_       = std::move(savedOpSubst);
-                    genericSubstSemaTy_ = std::move(savedOpSema);
-                    if (res) {
-                        // §28.7 / §17.6 (#1702): `c++` ≡ `c := T.operator++(c)` —
-                        // the store must drop-on-overwrite (dispose the displaced
-                        // value). For an owned class/interface FIELD, route through
-                        // lowerOwnedClassFieldStore — the field analog of the local
-                        // disposal below — which self-contains load-old /
-                        // null+identity-guard / dispose-old / store-new (§17.6: the
-                        // operator result is produced first, then the displaced
-                        // previous value is disposed implicitly, then the new value
-                        // is stored). Without this the displaced field value leaked
-                        // (the plain path stored only via the local branch, which is
-                        // a no-op for a field). Returns false for non-owned-field
-                        // targets (locals, ref params, static/record/borrow fields),
-                        // which fall through to the LOCAL path below. Mirrors the
-                        // plain-assignment path's lowerOwnedClassFieldStore call.
-                        if (!lowerOwnedClassFieldStore(*inc->target, addr, res)) {
-                            // §28.7 (#913): reassigning an owned class LOCAL disposes
-                            // the displaced old value first (the operator already
-                            // borrowed `cur` above, so it is safe to dispose now,
-                            // before the store). No-op for a borrow local/param (no
-                            // disposal entry → no double-free).
-                            disposeDisplacedOwnedClassLocal(inc->target.get(), addr,
-                                                            elemTy, res);
-                            builder_.CreateStore(res, addr);
-                        }
-                        // §27.5 / #673: sync to original alloca (a no-op for a field
-                        // target — localSlot returns null for a non-local).
-                        if (llvm::AllocaInst* ns = localSlot(*inc->target))
-                            syncCellToOrigSlot(ns, res);
-                    }
-                } else if (elemTy == decimalStructType()) {
+                if (elemTy == decimalStructType()) {
                     // §6.4 (sweep #6): decimal `d++` / `d--`. decimal is a
                     // Kind::Primitive struct; the integer path below would build
                     // ConstantInt of a struct type and feed it to an integer
