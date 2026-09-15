@@ -741,6 +741,21 @@ void Resolver::checkTypeAbstractPropertyInitializers(TypeSymbol* t) {
         // `autoInitializer` slot at all — the grammar has nowhere to put
         // one there). Only a plain `abstract property Name: T := expr;`
         // reaches this branch.
+        // fix #4100 (§12.5, v0.300): the named-property check below uses
+        // `isAbstractPropertyShorthand`, which explicitly excludes indexers
+        // (SymbolCollection.cpp: the `p.isIndexer` guard). Add the missing
+        // indexer branch here: an abstract Auto-shorthand indexer with an
+        // autoInitializer is the same defect as the named-property case
+        // (#4026) and requires the same diagnostic.
+        if (pd->isIndexer && hasMod(ps, "abstract") &&
+            pd->bodyKind == ast::PropertyBodyKind::Auto && pd->autoInitializer) {
+            ctx_.diagnostics().report(
+                Severity::Error, pd->autoInitializer->span.begin,
+                "abstract indexer may not declare an initializer — an abstract "
+                "member has no backing storage for it to write into, so the "
+                "initializer could never run (§12.5)");
+            continue;
+        }
         if (!isAbstractPropertyShorthand(*pd)) continue;
         if (!pd->autoInitializer) continue;
         ctx_.diagnostics().report(
