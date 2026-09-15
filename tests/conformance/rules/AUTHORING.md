@@ -166,6 +166,13 @@ python3 tests/conformance/rules/coverage.py --invariants 28.5   # the C rows for
 that section (or any subsection under it). Those rows are the authoritative rule
 index — work through them, and say in your report which you covered.
 
+`coverage.py --rules <section>` prints the section's rule-stating sentences,
+numbered, as a checklist: every sentence that uses one of the phrases the
+documents reach for when they state a consequence. It is a checklist, not a rule
+count — one sentence often carries several rules and a few carry none — but
+working down it is how a lane avoids covering only the rules that were easy to
+see. `--rules lib:4.9` reads the stdlib document instead.
+
 `names.py` indexes every type and member the documents declare and reports any
 your cases use that they do not — the mechanical form of rule 1 above. It is a
 report, not a proof: its member tier misses inherited and extension members, so

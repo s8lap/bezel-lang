@@ -81,6 +81,45 @@ def parse_appendix_c(path):
     return rows
 
 
+def parse_sentences(path, prefix):
+    """The rule-stating sentences of a section and its subsections, in order.
+
+    A sentence qualifies when it uses one of the phrases the documents reach for
+    to state a compiler-enforced consequence. It is a checklist, not a rule
+    count: one sentence can carry several rules and a few carry none."""
+    with open(path, encoding="utf-8") as f:
+        lines = f.read().split("\n")
+    out = []
+    current = None
+    for line in lines:
+        m = HEADING_RE.match(line)
+        if m and m.group(2):
+            num = m.group(2)
+            if num == prefix or num.startswith(prefix + "."):
+                current = {"section": num,
+                           "title": m.group(3).strip().replace("`", ""),
+                           "body": []}
+                out.append(current)
+            else:
+                current = None
+            continue
+        if m:
+            current = None
+            continue
+        if current is not None:
+            current["body"].append(line)
+    for sec in out:
+        text = "\n".join(sec["body"])
+        text = re.sub(r'```.*?```', ' [code] ', text, flags=re.DOTALL)
+        text = re.sub(r'\[([^\]]*)\]\([^)]*\)', r'\1', text)   # strip md links
+        text = re.sub(r'\s+', ' ', text)
+        sentences = re.split(r'(?<=[.:;])\s+(?=[A-Z`*(\u00a7])', text)
+        sec["rules"] = [s.strip() for s in sentences
+                        if DENSITY_RE.search(s) and len(s.strip()) > 30]
+        del sec["body"]
+    return [s for s in out if s["rules"]]
+
+
 def build(docs_dir, base_dir):
     spec = os.path.join(docs_dir, "Bezel_Language_Spec.md")
     stdlib = os.path.join(docs_dir, "Bezel_Standard_Library.md")
@@ -158,10 +197,27 @@ def main(argv, base_dir=None):
     ap.add_argument("--gaps", action="store_true",
                     help="list uncovered sections, densest first")
     ap.add_argument("--top", type=int, default=40)
+    ap.add_argument("--rules", default="",
+                    help="print the rule-stating sentences of a section (and "
+                         "its subsections), numbered, as an authoring checklist")
     ap.add_argument("--invariants", default="",
                     help="print the Appendix C rows citing sections under this "
                          "prefix (e.g. 28, or 28.3) and exit")
     args = ap.parse_args(argv)
+
+    if args.rules:
+        want = args.rules.lstrip("\u00a7")
+        doc = "Bezel_Standard_Library.md" if want.startswith("lib:") \
+            else "Bezel_Language_Spec.md"
+        want = want[4:] if want.startswith("lib:") else want
+        n = 0
+        for sec in parse_sentences(os.path.join(args.docs, doc), want):
+            print("\n\u00a7{}  {}".format(sec["section"], sec["title"]))
+            for sentence in sec["rules"]:
+                n += 1
+                print("  {:>3}. {}".format(n, sentence))
+        print("\n{} rule-stating sentences under \u00a7{}".format(n, want))
+        return 0
 
     if args.invariants:
         want = args.invariants.lstrip("\u00a7")
