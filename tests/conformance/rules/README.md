@@ -136,9 +136,51 @@ authoritative rule index, and its 217 rows are the corpus's primary target.
 
 ### Founding — v0.298 (2026-09-15)
 
-Harness, contract, coverage matrix and the first authored batch. Documents at
-spec v0.298. No classification oracle: this session's container has clang/LLVM
-18 and the compiler needs 21, so every case in this batch is written from the
-document, reviewed against it, and lands UNCLASSIFIED. The first dev-box
-`--classify` run is the acceptance pass, and its divergence list is the first
-spec-catch-up docket the corpus produces.
+Harness, contract, coverage matrix and the first authoring run. Documents at
+spec v0.298.
+
+**No classification oracle.** The session's container had clang/LLVM 18 and the
+compiler needs 21, so every case here is written from the document, reviewed
+against it, and lands UNCLASSIFIED. The first dev-box `--classify` run is the
+acceptance pass, and its divergence list is the first spec-catch-up docket the
+corpus produces.
+
+**How it was written.** Roughly twenty authoring lanes, one per spec area, each
+reading its sections and the code-generation reference in full and working down
+`coverage.py --rules <section>` and `--invariants <section>`. Then adversarial
+critique passes over each batch. The critiques found defects at a steady rate —
+7 in the first 49 cases, 11 in the next 46 — and, more usefully, named three
+contract defects present in every lane's output. All three are now in
+`AUTHORING.md`:
+
+1. **the deletion test** — delete a reject case's offending construct and the
+   remainder must compile, or the case has a second, earlier ground and will
+   pass for the wrong reason forever. Every instance found was an ownership rule
+   the case did not mean to touch;
+2. **scaffold with a runtime-managed type** when the rule is not about
+   ownership — `string` carries no classification and cannot manufacture a
+   collateral error, where a class-typed local routinely does;
+3. **non-vacuity** — would the expectation change if the rule were violated?
+   Three positive cases could not have failed for their own rule.
+
+The harness grew twice in response to what lanes hit: `output:` (every line of
+standard output, not just the first) because disposal ORDER is the corpus's most
+valuable observation and a first-line check cannot see it; and directory cases
+because §2.8's artifact rules, §13.4's cross-module visibility and §26.5's
+imported extension blocks are *about* the boundary between compilation units.
+
+**Findings.** Forty-odd questions the documents do not settle, filed as tracker
+issues from #4362, with #4383 as the index. The sharpest are a §7.9
+self-contradiction (a non-nullable local must be assigned before it is read; a
+*defaultable* local may be declared without an initializer — `int` is both),
+§9.2's member list omitting fields that §9.7 and Appendix A both assume, and
+#4384: `bezelc` takes exactly one input file, so the multi-file compilation that
+§2.8.1's visibility rules and §2.5's SCC rules are written against has no
+expression in the compiler's interface at all.
+
+**Known limits of the format.** Some rules cannot be cases: an ABI fact with no
+source-visible consequence (§32.5's two-slot `RawBytes` marshalling), a
+type-level invariant with no accept/reject surface (§7.10's `?` idempotence), a
+build-request property (§2.8.4's artifact kind, `--main-class`), and anything
+needing two *versions* of one module (§2.8.3's staleness clause, §2.8.6's
+interface delta). Each is recorded where a lane hit it rather than approximated.
