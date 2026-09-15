@@ -6,7 +6,7 @@
 //!   owning family a fresh producer is idiomatic and warning-free:
 //!   pool.Add(new Connection("a"));
 //! cites: 4.5, 28.11
-//! expect: accept
+//! expect: quiet
 module Conf;
 
 public class Widget

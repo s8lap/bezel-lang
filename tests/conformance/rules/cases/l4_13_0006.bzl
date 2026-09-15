@@ -7,7 +7,8 @@
 //!   continues draining what remains, never replaying what already left.
 //! cites: 4.13
 //! expect: run
-//! stdout: b
+//! output: a
+//!   b
 module Conf;
 
 public class Widget
@@ -29,6 +30,7 @@ public class Program
     using var it1 := view.GetOwningEnumerator();
     _ := it1.MoveNext();
     using var w1 := it1.TakeCurrent();
+    Console.WriteLine(w1.Name());
     using var it2 := view.GetOwningEnumerator();
     _ := it2.MoveNext();
     using var w2 := it2.TakeCurrent();

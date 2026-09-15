@@ -11,7 +11,10 @@
 module Conf;
 
 public class Holder
-  private _s: IReadOnlySpan<int>;
+  private _s: IReadOnlySpan<int>?;
+
+  public constructor()
+  end constructor;
 
   public method Remember(s: IReadOnlySpan<int>)
     _s := s;
