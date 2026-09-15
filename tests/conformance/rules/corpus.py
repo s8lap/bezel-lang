@@ -41,12 +41,17 @@ CASE_ID_RE = re.compile(r'^(s|l)(\d+)(?:_(\d+(?:_\d+)?))?_(\d{4})$')
 MAIN_RE = re.compile(r'\bmethod\s+Main\b')
 
 REQUIRED = ("case", "doc", "section", "title", "rule", "expect")
-KNOWN = REQUIRED + ("cites", "diagnostic", "stdout", "output", "issue", "notes")
+KNOWN = REQUIRED + ("cites", "diagnostic", "stdout", "output", "issue", "notes",
+                    "flags")
+
+# Compiler switches a case may ask for. An allowlist, not a passthrough: a case
+# is data in a repository, and the runner executes what it says.
+ALLOWED_FLAGS = ("--checked-disposal", "--experimental-scoped-await-bind")
 EXPECTS = ("accept", "reject", "warn", "run")
 DOCS = ("spec", "stdlib")
 
 MANIFEST_COLUMNS = ("case-id", "doc", "section", "expect", "shape",
-                    "title", "rule", "cites", "check", "issue", "deps")
+                    "title", "rule", "cites", "check", "issue", "deps", "flags")
 
 
 class CaseError(Exception):
@@ -208,6 +213,11 @@ def check_case(path, text):
         if marker in body:
             problems.append("{}: source contains {!r} — a case is complete code"
                             .format(stem, marker))
+    for flag in (fields.get("flags", "") or "").split():
+        if flag not in ALLOWED_FLAGS:
+            problems.append("{}: `flags:` admits only {} — {} is not on the "
+                            "allowlist".format(stem, ", ".join(ALLOWED_FLAGS),
+                                               flag))
     title = fields.get("title", "")
     if len(title) > 100:
         problems.append("{}: title is over 100 characters".format(stem))
@@ -294,6 +304,7 @@ def load_cases(cases_dir):
             "check": check,
             "issue": fields.get("issue", ""),
             "deps": ";".join(deps),
+            "flags": fields.get("flags", ""),
         })
     rows.sort(key=lambda r: _sort_key(r["case-id"]))
     return rows, problems

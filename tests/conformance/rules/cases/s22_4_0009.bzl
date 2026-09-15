@@ -28,5 +28,5 @@ public class Runner
     if Factory.TryCreate(out c) then
       using var taken := move c;
     end if;
-  end Main;
-end Program;
+  end Run;
+end Runner;

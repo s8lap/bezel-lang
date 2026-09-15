@@ -29,5 +29,5 @@ public class Runner
   public static method Run()
     using var r := new Registry();
     r.Append(new Widget());
-  end Main;
-end Program;
+  end Run;
+end Runner;

@@ -1,9 +1,10 @@
 //! case: l2_9_0003
 //! doc: stdlib
 //! section: 2.9
-//! title: a class implementing Equals(T) satisfies IEquatable<T>
+//! title: a class implements IEquatable<T> by writing Equals(T) itself
 //! rule: classes may implement IEquatable<T> for type-safe equality without
-//!   boxing, by supplying Equals(other: T): bool.
+//!   boxing -- unlike a record's synthesized member, a class supplies
+//!   Equals(other: T): bool by hand.
 //! expect: run
 //! stdout: True
 module Conf;

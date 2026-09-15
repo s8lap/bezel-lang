@@ -1,22 +1,16 @@
 //! case: l2_9_0002
 //! doc: stdlib
 //! section: 2.9
-//! title: a plain class does not implicitly satisfy IEquatable<T>
-//! rule: Records implement IEquatable<T> implicitly; classes may implement it
-//!   -- but do not implicitly -- for type-safe equality.
-//! expect: reject
-//! diagnostic: IEquatable
+//! title: a record listing IEquatable<T> satisfies it with no written Equals
+//! rule: Records implement this implicitly -- once a record lists IEquatable<T>
+//!   in its inheritance clause, the auto-generated Equals(T) counts as declaring
+//!   the matching member, with no explicit body needed.
+//! cites: 14.2
+//! expect: run
+//! stdout: True
 module Conf;
 
-public class Point
-  public readonly property X: int;
-  public readonly property Y: int;
-
-  public constructor(x: int, y: int)
-    X := x;
-    Y := y;
-  end constructor;
-end Point;
+public record Point(X: int, Y: int): IEquatable<Point>;
 
 public static class Helpers
   public static method AreEqual<T>(a: T, b: T): bool where T: IEquatable<T> => a.Equals(b);

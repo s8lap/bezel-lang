@@ -107,7 +107,14 @@ one of them is fixed.
 //! expect: reject
 //! diagnostic: owned             see below
 //! issue: 4154                   optional: a tracker this case pins
+//! flags: --checked-disposal     optional: a non-default build mode
 ```
+
+`flags:` asks for a compiler switch, from a short allowlist:
+`--checked-disposal` (§28.2's checked disposal mode) and
+`--experimental-scoped-await-bind`. A rule that only holds in a non-default mode
+needs its switch, and a case that does not name one is checked in the default
+build.
 
 Continuation lines start with `//!` and **two or more** spaces. Everything below
 the header is ordinary Bezel.

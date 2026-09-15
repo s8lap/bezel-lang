@@ -503,6 +503,43 @@ class TestManifest(unittest.TestCase):
             self.assertEqual(corpus.main(["build"], base_dir=base), 1)
 
 
+class TestCompilerFlags(unittest.TestCase):
+    """A rule that only holds in a non-default build mode needs its switch."""
+
+    FLAGGED = ACCEPT.replace("//! expect: accept",
+                             "//! flags: --checked-disposal\n//! expect: accept")
+
+    def test_an_allowlisted_flag_is_admitted_and_recorded(self):
+        with tempfile.TemporaryDirectory() as base:
+            write_corpus(base, [self.FLAGGED])
+            rows, problems = corpus.load_cases(os.path.join(base, "cases"))
+            self.assertEqual(problems, [])
+            self.assertEqual(rows[0]["flags"], "--checked-disposal")
+
+    def test_a_flag_off_the_allowlist_is_a_lint_problem(self):
+        text = ACCEPT.replace("//! expect: accept",
+                              "//! flags: --sanitize=address\n//! expect: accept")
+        self.assertTrue(any("allowlist" in p for p in
+                            corpus.check_case("s28_5_0001.bzl", text)[1]))
+
+    def test_the_flag_reaches_the_compile_command(self):
+        seen = []
+
+        def fake(cmd, cwd=None):
+            seen.append(list(cmd))
+            return 0, ""
+
+        row = {"case-id": "s28_5_0001", "expect": "accept", "shape": "lib",
+               "check": "", "title": "t", "issue": "", "section": "28.5",
+               "deps": "", "flags": "--checked-disposal"}
+        with tempfile.TemporaryDirectory() as base:
+            write_corpus(base, [self.FLAGGED])
+            runner.run_case(row, "/bin/true", os.path.join(base, "cases"),
+                            base, run=fake)
+        self.assertIn("--checked-disposal", seen[0])
+        self.assertLess(seen[0].index("--checked-disposal"), seen[0].index("-c"))
+
+
 class TestEvaluate(unittest.TestCase):
     def row(self, expect, check=""):
         return {"case-id": "s1_1_0001", "expect": expect, "check": check,

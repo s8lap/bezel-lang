@@ -1,11 +1,14 @@
 //! case: l2_9_0001
 //! doc: stdlib
 //! section: 2.9
-//! title: records implement IEquatable<T> implicitly
-//! rule: Records implement IEquatable<T> implicitly -- a record satisfies a
-//!   where T: IEquatable<T> constraint without declaring the interface.
-//! expect: run
-//! stdout: True
+//! title: a record's auto-generated equality does not by itself satisfy IEquatable<T>
+//! rule: A record conforms to an interface only when it lists that interface in
+//!   its inheritance clause and declares matching members; a plain record with
+//!   no such clause does not conform to IEquatable<T>, whatever equality
+//!   operators it auto-generates.
+//! cites: 14.2
+//! expect: reject
+//! diagnostic: IEquatable
 module Conf;
 
 public record Point(X: int, Y: int);

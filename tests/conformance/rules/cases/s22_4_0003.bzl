@@ -18,5 +18,5 @@ end Parser;
 public class Runner
   public static method Run()
     var success := Parser.TryParse("x", out _);
-  end Main;
-end Program;
+  end Run;
+end Runner;

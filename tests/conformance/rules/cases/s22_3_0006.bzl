@@ -29,5 +29,5 @@ public class Runner
     using var r := new Registry();
     var w := new Widget();
     r.Append(move w);
-  end Main;
-end Program;
+  end Run;
+end Runner;

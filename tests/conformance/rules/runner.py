@@ -164,8 +164,9 @@ def run_case(row, bezelc, cases_dir, tmpdir, run=conformance.caged_run):
         imports += ["--import", artifact]
 
     out_exe = os.path.join(work, "out")
+    mode = [f for f in (row.get("flags") or "").split() if f]
     flags = ["-c", "-o", out_exe] if row["shape"] == "lib" else ["-o", out_exe]
-    compile_rc, compile_log = run([bezelc] + imports + flags + [src])
+    compile_rc, compile_log = run([bezelc] + mode + imports + flags + [src])
 
     run_rc, run_out = None, ""
     if compile_rc == 0 and row["shape"] == "program" and row["expect"] == "run":

@@ -21,5 +21,5 @@ end BankAccount;
 public class Runner
   public static method Run()
     using var acct := new BankAccount();
-  end Main;
-end Program;
+  end Run;
+end Runner;
