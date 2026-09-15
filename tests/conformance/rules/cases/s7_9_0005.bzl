@@ -1,9 +1,10 @@
 //! case: s7_9_0005
 //! doc: spec
 //! section: 7.9
-//! title: a non-nullable local assigned before its read is admitted
-//! rule: A non-nullable local must be assigned before it is read; once
-//!   assigned, a read is admitted.
+//! title: a non-defaultable local assigned before its read is admitted
+//! rule: A local of non-defaultable type must be assigned before it is read;
+//!   once assigned, a read is admitted.
+//! cites: 7.9, 17.11
 //! expect: run
 //! stdout: assigned
 module Conf;

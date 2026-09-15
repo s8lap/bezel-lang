@@ -3,9 +3,10 @@
 //! section: 9.2
 //! title: overriding Equals(Object?) beside a homogeneous equality overload makes the direct call legal
 //! rule: The compile error on a non-auto-hashable record covers Equals(Object?),
-//!   Equals(T), and GetHashCode; a user-defined override removes it for that
-//!   member.
-//! cites: 25.2
+//!   Equals(T), and GetHashCode; it fires per member and a user-defined
+//!   declaration of that member — the `override` spelling or the plain one —
+//!   removes it for that member.
+//! cites: 25.2, 9.2
 //! expect: run
 //! stdout: True
 module Conf;

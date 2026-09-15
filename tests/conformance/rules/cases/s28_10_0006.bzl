@@ -1,13 +1,17 @@
 //! case: s28_10_0006
 //! doc: spec
 //! section: 28.10
-//! title: a using var borrow-pin's source may not be disposed before the using var's own scope ends
-//! rule: The using var still pins the borrow's source for the duration of
-//!   the scope — the source must remain live, not moved, not disposed,
-//!   until the using-var's scope ends.
-//! cites: 28.10
-//! expect: reject
-//! diagnostic: pin
+//! title: an explicit Dispose of a borrow-pin's source is a site-announced kill the pin leaves unfrozen
+//! rule: The using var still pins the borrow's source for the duration of the
+//!   scope — the borrow stays live until the using-var's scope ends and the
+//!   consume-site freeze then governs every consume of the source in that
+//!   range: the frozen kills (a move, a transfer, a reassignment of the
+//!   binding) are compile errors, and the site-announced kills stay unfrozen
+//!   under their flag backstop — an explicit `Dispose()` of the source is
+//!   permitted, and a read through the pinned binding afterwards raises
+//!   `DisposedAccessException` in checked disposal mode.
+//! cites: 28.10, 28.3, 28.2
+//! expect: accept
 module Conf;
 
 public class Widget
