@@ -6692,6 +6692,113 @@ std::string ExprTC::moveThroughBorrowedMoveOnlyArrayWholeBindingName(
     return std::string(id->name);
 }
 
+// §28.3 / §28.8.1 (issue #4284): a non-`owned` REFERENCE-TYPED FIELD read is a
+// borrow (§28.3's "unmarked read never consumes" rule applies uniformly to
+// fields), so `move` of such a read is rejected here. The leaf field's `owned`
+// modifier is the single authority — the receiver's ownership status is
+// irrelevant: a borrow of a non-`owned` field is still a borrow, and the field
+// slot owns no storage to transfer. Two read shapes are checked:
+//   * explicit MemberAccessExpr `recv.f` — sema attaches the member's
+//     FieldSymbol to the MemberAccessExpr (ExprTypecheck).
+//   * bare-identifier `_f` resolving to a class field — implicit `this.f` per
+//     §28.8.1; sema attaches the field's FieldSymbol to the IdentifierExpr.
+// A field with `owned` in its modifiers is NOT matched (the legal
+// `move recv.f` / `move this.f` / `move _f` / `move recv.f!` / `move _f!` over an
+// `owned` slot — handled by the ownership pass). A PropertySymbol read is
+// deliberately NOT matched: a property getter runs user code and the borrow
+// classification belongs to the ownership pass (#398); this compile-time
+// site-only check keys on the field-shape slot.
+//
+// Value-typed fields (primitives — `int n`, a `bool`, etc. — value-kind records
+// / choices / enums, owning-inline-array fields `[N owned]T` whose borrow kind
+// is settled by the move-only-owning-inline-array rule, §15.1.1) are NOT
+// matched — a value field has no borrow/own distinction (§3: value types carry
+// no storage obligation; reads copy), so the "no slot to take ownership of"
+// rationale does not apply. The legal `move box.n` of an `int` field copies
+// the value through unchanged (#2002 not-a-regression guard).
+//
+// Returns the textual form to embed in the diagnostic (the bare identifier for
+// the implicit-`this` form; the explicit `recv.f` for the MemberAccessExpr).
+// Returns the empty string for any other shape (a borrowed local, an IndexExpr,
+// an interface slot, a pattern-binding array — all handled by sibling
+// helpers, OR a value-typed field, OR an `owned`-tagged field).
+std::string ExprTC::moveOnNonOwnedFieldName(const ast::Expr& operand) const {
+    auto isOwnedField = [](sema::Symbol* sym) -> bool {
+        auto* fs = dynamic_cast<sema::FieldSymbol*>(sym);
+        if (!fs) return false;
+        for (std::string_view m : fs->modifiers)
+            if (m == "owned") return true;
+        return false;
+    };
+    // A field's RESOLVED type is the level-0 read kind: primitive (no
+    // borrow/own distinction), Named class/interface (the reference-shaped
+    // field that §28.3's "unmarked read never consumes" targets), or record /
+    // choice / enum (value-kind — copies through, no slot to move). Reading
+    // the OPERAND's exprType is the simplest path: it's set by the typechecker
+    // on the same pass and is the field's resolved type regardless of whether
+    // the FieldSymbol is local or imported (the imported path's null `decl`
+    // never reaches here, #3149).
+    auto isReferenceFieldType = [](const TypeRef* ft) -> bool {
+        if (!ft) return false;
+        if (ft->kind == TypeRef::Kind::Primitive) return false;
+        if (ft->kind == TypeRef::Kind::Named) {
+            if (ft->declaration) {
+                auto k = ft->declaration->kind;
+                return k == ast::TypeDeclKind::Class ||
+                       k == ast::TypeDeclKind::Interface;
+            }
+            // Built-in / imported named type without a declaration — fall
+            // back to the head-name heuristic for the well-known reference
+            // types. (Conservative: when in doubt, do NOT match — let the
+            // ownership pass handle the residual cases it already covers.)
+            if (ft->astNode && ft->astNode->name &&
+                !ft->astNode->name->parts.empty()) {
+                auto hn = ft->headName();
+                return hn == "string" || hn == "Shared" || hn == "Weak" ||
+                       hn == "Array" || hn == "OwningArray" ||
+                       hn == "OwningDictionary" || hn == "Channel";
+            }
+            return false;
+        }
+        return false;
+    };
+    const TypeRef* operandTy = ctx_.exprType(operand);
+    // Explicit `recv.f` — sema attaches the member's FieldSymbol to the
+    // MemberAccessExpr (ExprTypecheck:3673 et seq.). // per §28.3 / §28.8.1
+    if (dynamic_cast<const ast::MemberAccessExpr*>(&operand)) {
+        sema::Symbol* sym = ctx_.exprSymbol(operand);
+        if (isOwnedField(sym)) return {};
+        auto* fs = dynamic_cast<sema::FieldSymbol*>(sym);
+        if (!fs) return {};
+        if (!isReferenceFieldType(operandTy)) return {};
+        if (const auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&operand)) {
+            std::string recv;
+            if (const auto* rid =
+                    dynamic_cast<const ast::IdentifierExpr*>(ma->target.get()))
+                recv = std::string(rid->name);
+            else
+                recv = "<expr>";
+            return recv + "." + std::string(ma->member);
+        }
+        return "<field>";
+    }
+    // Bare identifier `_f` — implicit `this.f` per §28.8.1; sema attaches the
+    // field's FieldSymbol to the IdentifierExpr when the bare name resolves to
+    // a class field of the enclosing type. A method-scope local/parameter is
+    // not a FieldSymbol, so this matches only a genuine field read.
+    if (dynamic_cast<const ast::IdentifierExpr*>(&operand)) {
+        sema::Symbol* sym = ctx_.exprSymbol(operand);
+        if (isOwnedField(sym)) return {};
+        auto* fs = dynamic_cast<sema::FieldSymbol*>(sym);
+        if (!fs) return {};
+        if (!isReferenceFieldType(operandTy)) return {};
+        if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&operand))
+            return std::string(id->name);
+        return "<field>";
+    }
+    return {};
+}
+
 void ExprTC::typeUnary(const ast::UnaryExpr& ue) {
     const auto& op = ue.op;
     // §25: a user-defined unary operator overload.
@@ -6822,6 +6929,34 @@ void ExprTC::typeUnary(const ast::UnaryExpr& ue) {
                 "the array and there is nothing to take ownership of (§19.3 / "
                 "§15.3 — read slots with the plain indexer, or move from the "
                 "original scrutinee after the match instead)");
+        }
+        // §28.3 / §28.8.1 (issue #4284): `move <field>` on a non-`owned` FIELD
+        // is rejected — a class-typed field with no `owned` annotation holds a
+        // borrow (§28.3's "unmarked read never consumes" rule covers fields
+        // identically), so accepting `move` would classify the read as an owned
+        // transfer; codegen's reclaim-eligibility walk then treats the moved-
+        // from slot as a fresh owned value, and disposing both the `move` result
+        // and the original owner frees the same backing storage twice
+        // (measured heap-use-after-free under `--sanitize=address` in the
+        // issue's `move h.item` repro). The leaf field's `owned` modifier is
+        // the single authority — the receiver's ownership status is irrelevant;
+        // only the field-shape "this slot owns storage" qualifies it for a
+        // `move` transfer. Legal forms `move obj.f` / `move this.f` / `move _f`
+        // (and the `!` null-detach variants) over an `owned`-modified field
+        // are NOT matched (the modifier check excludes them).
+        std::string nonOwnedField = moveOnNonOwnedFieldName(*ue.operand);
+        if (!nonOwnedField.empty()) {
+            ctx_.diagnostics().report(
+                Severity::Error, ue.span.begin,
+                std::string("`move` is not admitted on a non-`owned` field: `") +
+                nonOwnedField +
+                "` is a borrow (§28.3 — a class-typed field with no `owned` "
+                "annotation holds a borrow, not an owning slot), so there is "
+                "no storage to transfer. Read the field plainly (the value is "
+                "already a borrow for the use site), or move the whole "
+                "containing object instead. (§28.3 / §28.8.1 — the `move` "
+                "marker transfers an OWNING slot only: `owned` parameter, "
+                "`owned` field, `using var`, or `move`-adopted local)");
         }
         // §4.14 (#779): `move sp[i]` on a VALUE-typed owning `Span<T>` is not
         // admitted — value elements are read with the plain indexer and copied

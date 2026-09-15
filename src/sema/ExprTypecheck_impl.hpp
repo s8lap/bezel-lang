@@ -3252,6 +3252,28 @@ private:
     std::string moveThroughBorrowedMoveOnlyArrayWholeBindingName(
         const ast::Expr& operand) const;
 
+    // §28.3 / §28.8.1 (issue #4284): if `operand` is a read of a non-`owned`
+    // FIELD (`recv.f` via MemberAccessExpr, or the bare-identifier implicit
+    // `this.f` form), return the field's display name (the bare identifier for
+    // the implicit-`this` form, the textual receiver.field for the explicit
+    // form); otherwise the empty string. A class-typed field with no `owned`
+    // annotation holds a borrow (§28.3: "An unmarked read of a class-typed
+    // binding never consumes…"), so `move <field>` is rejected at compile
+    // time — accepting it would classify the read as an owned transfer, the
+    // program's reclaim-eligibility walk would treat the moved-from slot as a
+    // fresh owned value, and disposing both the `move` result and the original
+    // owner would free the same backing storage twice (a heap-use-after-free
+    // measured in the issue's repro under `--sanitize=address`). The leaf
+    // field's `owned` modifier is the single authority here — the receiver's
+    // ownership status (a borrow of a non-owned field is also a borrow) is
+    // irrelevant; only the field-shape "this slot owns storage" qualifies it
+    // for a `move` transfer. The legal forms `move obj.f` / `move this.f` /
+    // `move _f` / `move obj.f!` / `move this.f!` / `move _f!` over an
+    // `owned`-modified field are NOT matched (the modifier check excludes them),
+    // and `move obj.f!` over a STATIC `owned` field is rejected elsewhere by
+    // the #2021 receiver classification.
+    std::string moveOnNonOwnedFieldName(const ast::Expr& operand) const;
+
     // §30.14 / §3.6 (#600): sendability derived-type property.
     // Returns true iff `rt` satisfies the §30.14 sendable table for a
     // Channel<T> element or Domain.Spawn argument/result.
