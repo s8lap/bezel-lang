@@ -4,7 +4,8 @@
 //! title: a member where clause naming the enclosing type parameter is rejected
 //! rule: A `where` clause on a member declaration may constrain only that
 //!   member's own type parameters; a clause whose constrained parameter is a
-//!   type parameter of the enclosing declaration is a compile error (v0.277).
+//!   type parameter of the enclosing declaration is a compile error naming the
+//!   conditionally-admitted-members subsection (§14.2 rule 1, v0.277).
 //! cites: 14.2
 //! expect: reject
 //! diagnostic: own type parameters

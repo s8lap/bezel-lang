@@ -189,11 +189,11 @@ spec	21.10	Local type declarations	8	1	5	0	4	0	1	covered
 spec	22	Methods and Constructors	0	0	0	0	0	0	0	n/a
 spec	22.1	Method declarations	0	0	2	2	0	0	0	covered
 spec	22.2	Expression-bodied methods	0	0	4	3	1	0	0	covered
-spec	22.3	Parameter modifiers	6	2	14	3	10	0	1	covered
+spec	22.3	Parameter modifiers	6	2	12	3	8	0	1	covered
 spec	22.4	Inline out declarations	6	3	9	2	4	0	3	covered
-spec	22.5	Optional parameters and named arguments	1	0	8	0	5	0	3	covered
+spec	22.5	Optional parameters and named arguments	1	0	7	0	4	0	3	covered
 spec	22.6	Overloading	0	5	17	2	7	0	8	covered
-spec	22.7	Constructors	4	4	7	3	3	0	1	covered
+spec	22.7	Constructors	4	4	8	2	3	0	3	covered
 spec	22.8	Field initializers	4	2	8	3	5	0	0	covered
 spec	22.9	Owned fields and exception safety	0	1	4	0	0	0	4	covered
 spec	22.10	Primary constructors	2	0	15	6	7	0	2	covered
@@ -371,14 +371,14 @@ stdlib	4.10	Set<T> and OwningSet<T>	1	0	5	0	1	0	4	covered
 stdlib	4.11	Stack<T>, OwningStack<T>, Queue<T>, and OwningQueue<T>	2	0	6	0	0	0	6	covered
 stdlib	4.12	Borrowing enumeration interfaces	0	0	3	0	0	0	3	covered
 stdlib	4.13	Owning enumeration interfaces	1	0	6	0	0	1	5	covered
-stdlib	4.14	OwningBuffer<T>, Span<T>, ReadOnlySpan<T>	2	0	12	0	7	0	5	covered
+stdlib	4.14	OwningBuffer<T>, Span<T>, ReadOnlySpan<T>	2	0	13	0	8	0	5	covered
 stdlib	4.15	ArraySpan<T>, ReadOnlyArraySpan<T>	0	0	6	0	3	0	3	covered
 stdlib	4.16	IReadOnlySpan<TElement>	0	0	4	0	2	0	2	covered
-stdlib	4.17	SortedDictionary<K, V> (added in v0.136)	1	0	5	0	0	0	5	covered
+stdlib	4.17	SortedDictionary<K, V> (added in v0.136)	1	0	6	0	0	0	6	covered
 stdlib	4.18	SortedSet<T> (added in v0.136)	0	0	4	0	0	0	4	covered
 stdlib	4.19	FrozenArray<T> (v0.186)	3	0	6	0	2	0	4	covered
 stdlib	4.20	Counter<K> (v0.215)	0	0	6	0	0	0	6	covered
-stdlib	5	System.Collections.Linq	5	0	11	0	3	0	8	covered
+stdlib	5	System.Collections.Linq	5	0	12	0	3	0	9	covered
 stdlib	5.1	No-selector aggregation overloads	0	0	3	0	0	0	3	covered
 stdlib	6	System.Threading	0	0	0	0	0	0	0	n/a
 stdlib	6.1	CancellationToken and CancellationTokenSource	7	0	0	0	0	0	0	UNCOVERED

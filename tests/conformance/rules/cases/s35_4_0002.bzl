@@ -1,15 +1,22 @@
 //! case: s35_4_0002
 //! doc: spec
 //! section: 35.4
-//! title: owning choice local-to-local assignment moves, unmarked
+//! title: owning choice local-to-local assignment moves, unmarked, and `using var` adopts
 //! rule: Owning choices are move-only value types: local-to-local assignment moves
 //!   (unmarked — copies are impossible, so there is nothing for a marker to
-//!   disambiguate).
+//!   disambiguate); `using var` is admitted with pin-only effect.
+//! cites: 35.4, 15.3, 28.10
 //! expect: run
-//! stdout: widget disposed
+//! output: inner
+//!   widget disposed
+//!   outer
+//! issue: 4376
 module Conf;
 
 public class Widget
+  public constructor()
+  end constructor;
+
   destructor
     Console.WriteLine("widget disposed");
   end destructor;
@@ -23,7 +30,10 @@ end Holder;
 public class Program
   public static method Main()
     var a := Holder.Full(new Widget());
-    using var b := a;          // unmarked local-to-local assignment moves; `a` is moved-from
-    Console.WriteLine("before drop");
+    do
+      using var b := a;        // move-only local-to-local: moves; `using var` adds only the pin
+      Console.WriteLine("inner");
+    end;                       // `b` disposed here — proves the obligation left `a`
+    Console.WriteLine("outer");
   end Main;
 end Program;

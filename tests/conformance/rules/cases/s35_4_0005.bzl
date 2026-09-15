@@ -1,11 +1,16 @@
 //! case: s35_4_0005
 //! doc: spec
 //! section: 35.4
-//! title: drop-on-overwrite disposes the displaced owning-choice value automatically
+//! title: drop-on-overwrite disposes the displaced owning-choice value at the store
 //! rule: Drop-on-overwrite is defined and automatic: whole-value reassignment of an
-//!   owning-choice local or field disposes the displaced value per §28.7.
+//!   owning-choice local or field disposes the displaced value per §28.7; the RHS
+//!   is evaluated first, then the displaced value is disposed, then the new value
+//!   is stored.
+//! cites: 35.4, 28.7, 15.3
 //! expect: run
-//! stdout: dispose old
+//! output: dispose old
+//!   reassigned
+//!   dispose new
 module Conf;
 
 public class Resource
@@ -30,5 +35,6 @@ public class Program
     var b := Bundle.Ready(new Resource("old"));
     b := Bundle.Ready(new Resource("new"));   // drop-on-overwrite disposes "old" here
     Console.WriteLine("reassigned");
+    _ := b;                                   // disposes "new" at the end of this statement
   end Main;
 end Program;

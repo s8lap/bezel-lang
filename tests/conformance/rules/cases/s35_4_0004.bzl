@@ -3,9 +3,11 @@
 //! section: 35.4
 //! title: disposing an owning choice disposes the active case's owned payloads in declaration order
 //! rule: Disposal is defined by the active case. Disposing an owning choice value
-//!   disposes the active case's owned payloads in payload declaration order.
+//!   disposes the active case's owned payloads in payload declaration order;
+//!   payload-free and value-payload cases dispose nothing.
 //! expect: run
-//! stdout: dispose first
+//! output: dispose first
+//!   dispose second
 module Conf;
 
 public class Resource

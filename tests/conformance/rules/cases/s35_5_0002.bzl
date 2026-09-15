@@ -4,12 +4,17 @@
 //! title: an owning match is triggered by an unbound owned temporary
 //! rule: The owning match is triggered by an unbound owned temporary of owning-choice
 //!   classification — a fresh construction, an owning-choice-returning call, a
-//!   move result.
+//!   move result; it transfers the selected case's owned payloads into the arm's
+//!   bindings and consumes the scrutinee value.
 //! expect: run
-//! stdout: ping
+//! output: ping
+//!   widget disposed
 module Conf;
 
 public class Widget
+  public constructor()
+  end constructor;
+
   public method Ping() => Console.WriteLine("ping");
 
   destructor
@@ -34,7 +39,7 @@ public class Program
     using var client := new Client();
     case client.Fetch() of                    // owning match over the fresh temporary
       Fetched(var w) => do
-        using var widget := move w;
+        using var widget := move w;           // `w` is an owned local of the arm: adopt it
         widget.Ping();
       end,
       Failed(_) => Console.WriteLine("failed")

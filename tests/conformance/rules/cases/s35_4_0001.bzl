@@ -5,8 +5,10 @@
 //! rule: A value-like choice is an ordinary copyable value type: every payload is a
 //!   value, a string, a runtime-managed type, or (transitively) a value-like
 //!   record or choice.
+//! cites: 35.4, 15.3
 //! expect: run
-//! stdout: b active
+//! output: a active
+//!   b active
 module Conf;
 
 public choice Status
@@ -17,7 +19,11 @@ end Status;
 public class Program
   public static method Main()
     var a := Status.Active;
-    var b := a;               // copy
+    var b := a;               // copy, not a move: `a` stays readable below
+    case a of
+      Active   => Console.WriteLine("a active"),
+      Inactive => Console.WriteLine("a inactive")
+    end case;
     a := Status.Inactive;     // reassigning `a` does not affect `b`
     case b of
       Active   => Console.WriteLine("b active"),

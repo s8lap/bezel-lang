@@ -5,11 +5,17 @@
 //! rule: The owning match is triggered by a named owned binding under an explicit
 //!   scrutinee transfer marker — case move outcome of ...; the consumed binding is
 //!   left moved-from when the construct completes.
+//! cites: 35.5, 28.8.1
 //! expect: run
-//! stdout: adopted
+//! output: adopted
+//!   widget disposed
+//!   after
 module Conf;
 
 public class Widget
+  public constructor()
+  end constructor;
+
   destructor
     Console.WriteLine("widget disposed");
   end destructor;
@@ -30,5 +36,6 @@ public class Program
       end,
       Failed(_) => Console.WriteLine("failed")
     end case;
+    Console.WriteLine("after");              // `outcome` is moved-from: nothing drops at scope end
   end Main;
 end Program;
