@@ -7,7 +7,8 @@
 //!   remains auto-hashable, hashable, and serialization-eligible.
 //! cites: 9.2
 //! expect: run
-//! stdout: True
+//! output: True
+//!   False
 module Conf;
 
 public record Port
@@ -24,6 +25,8 @@ public class Program
   public static method Main()
     var a := new Port(8080);
     var b := new Port(8080);
+    var c := new Port(443);
     Console.WriteLine(a = b);
+    Console.WriteLine(a = c);
   end Main;
 end Program;

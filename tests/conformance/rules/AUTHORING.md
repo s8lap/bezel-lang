@@ -85,12 +85,19 @@ things. What the documents actually pin:
 | a positional record | `Point(X: 10, Y: 20)` — unqualified head | §8.5, §9.1 |
 | a body record that is auto-hashable | `TypeName(Prop1: v1, Prop2: v2)` over its auto-properties | §8.5, §9.2 |
 | a body record that is **not** auto-hashable, and an enum | the qualified type name — *not* the case name | §8.5, §10.5 |
+| `decimal` (no format spec) | the exact decimal form: sign, integer digits, and a `.` with the fractional digits only when there is a fractional part. No exponent, no grouping separator, **no trailing zeros** — scale is not part of the value, so `1.50m` and `1.5m` both render `1.5`, `10m` renders `10`, `0m` renders `0` | stdlib §9.3 *Rendering and range* (v0.300), §2.18 |
 | an inline array, the unit value | `[3]int`, `()` | §8.5 |
 | `{x:F2}`, `{x:X}`, `{x:P1}` | stdlib §2.18's table, invariant culture, no grouping separators | stdlib §2.18 |
 
-An `int` prints its digits. A `decimal`'s no-format rendering is not pinned by
-either document — prefer an `int` when the case does not need a decimal, and say
-so in your report if you had to assume one.
+An `int` prints its digits. A `decimal`'s rendering is pinned as of v0.300 (the
+row above) — it was not when this contract was first written, and the old advice
+to avoid decimals cost the corpus `run` cases. Note the trailing-zero rule in
+particular: a case that expects `1.50` is wrong, because that value renders `1.5`.
+
+A **choice**'s `ToString` head is the one rendering still unpinned: §35.7 fixes the
+shape `TypeName.CaseName(field: value, …)` but neither it nor §8.5 says whether
+`TypeName` is qualified. Do not print a choice in a `run` case; observe the rule
+directly instead, and say so in your report.
 
 If you cannot pin the exact first line from the documents, the case is an
 `accept` case, or prints something derived that you *can* pin. Do not guess.
