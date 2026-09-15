@@ -15796,8 +15796,13 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
     // fix #4261 (§28.3, v0.298): for a lambda-typed local, lowerExpr just called
     // lowerLambda which saved/restored closureReleaseEligible_ (returning it to
     // the outer function's state — empty). The closure arm below needs declNode in
-    // closureReleaseEligible_ to fire. Add it here, after lowerExpr returns.
-    if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(init))
+    // closureReleaseEligible_ to fire. Add it here, after lowerExpr returns,
+    // but ONLY if the escape walk did NOT exclude this local (a reassignment
+    // marks it escaped — lowerClosureLocalReassign's own release already handles
+    // the displaced value, and the scope-end release must NOT fire or it
+    // double-frees alongside the fix #4422 call-site release).
+    if (dynamic_cast<const ast::LambdaExpr*>(init) &&
+        closureReleaseEligible_.count(static_cast<const void*>(declNode)))
         closureReleaseEligible_.insert(static_cast<const void*>(declNode));
     // #422 / #429 / §27.5 / §28.9: if this `var` closure (function-typed) local
     // was proven non-escaping and initialized by a +1 closure producer (a lambda
