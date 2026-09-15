@@ -6874,9 +6874,34 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                             if (ret) retVal = ret->value.get();
                         }
                         if (retVal) {
+                            // fix #4239 (§28.3 / §30.5, v0.298): the
+                            // returnedClosureLocalOwnsPlusOne() predicate
+                            // returns false when called from the chain-call
+                            // site (currentFn_ = C.Main, not MakeClosure),
+                            // so this test was always false for the named-
+                            // local return case. Directly check whether retVal
+                            // is a local-identifier whose initializer is a +1
+                            // closure producer (lambda literal or method ref).
+                            // For `return f;` where `f := lambda() => …`:
+                            //   - f's initializer IS a +1 producer → local
+                            //     owns the +1 → innerMints = false → ONE
+                            //     release (correct, no double-free).
+                            // For `return g();` where g is a closure local:
+                            //   - g's initializer is a lambda (a +1 producer)
+                            //     but the call CONSUMES g (rc(g) goes to 0),
+                            //     and the return mints a new +1 → innerMints
+                            //     = true → TWO releases (correct).
+                            bool localOwnsPlusOne = false;
+                            if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(retVal)) {
+                                if (auto* loc = dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*id))) {
+                                    LocalDeclInitView dv = localDeclInitView(loc->decl);
+                                    if (dv.init && isPlusOneClosureProducer(dv.init))
+                                        localOwnsPlusOne = true;
+                                }
+                            }
                             innerMints = !isPlusOneClosureProducer(retVal) &&
                                          !isUserMethodClosureReturnCall(retVal) &&
-                                         !returnedClosureLocalOwnsPlusOne(retVal);
+                                         !localOwnsPlusOne;
                         }
                     }
                 }
