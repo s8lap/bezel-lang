@@ -10114,6 +10114,24 @@ void MethodOwnership::recollectAliasBorrowSourceOnReassign(
         closeOpenWindows();
         return;
     }
+    // issue #4424 (residual of #4225/#4250): a CallExpr RHS — static factory
+    // `Factory.Make()`, instance `x.Clone()`, etc. — is the SECOND shape this
+    // pre-pass trusts to close without reopening, on the same soundness argument
+    // as NewExpr above. `borrowSourceForExpr` (Ownership_Checks.cpp ~5582) has
+    // NO CallExpr arm at all — its source recognizer matches only
+    // IdentifierExpr / MemberAccessExpr / NullCondMemberExpr / IndexExpr /
+    // UnaryExpr-await / NewExpr / LambdaExpr — so the forward walk sets
+    // `states_[holder].source = null` for ANY CallExpr, static or instance
+    // (an `x.Clone()` whose body returns `self` is structurally identical to
+    // a static `Factory.Make()` from this pre-pass's POV — both fail
+    // `borrowSourceForExpr` and both clear the source in the forward walk).
+    // Closing the pre-pass window too keeps the two passes honest; the
+    // previous fail-closed default over-rejected here. // per §28.3, #4424
+    if (dynamic_cast<const ast::CallExpr*>(&producer) ||
+        dynamic_cast<const ast::NullCondCallExpr*>(&producer)) {
+        closeOpenWindows();
+        return;
+    }
     // issue #4250: fail-closed default — every other RHS shape leaves every
     // open window exactly as it was.
 }
