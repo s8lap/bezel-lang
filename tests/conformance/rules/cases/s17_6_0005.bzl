@@ -11,8 +11,14 @@
 //! diagnostic: nullable
 module Conf;
 
-public class Program
-  public static method Bump(n: int?)
-    n++;
+public class Counter
+  private _n: int?;
+
+  public constructor()
+    _n := 0;
+  end constructor;
+
+  public method Bump()
+    _n++;
   end Bump;
-end Program;
+end Counter;

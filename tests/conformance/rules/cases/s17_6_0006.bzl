@@ -20,7 +20,7 @@ public class Tally
   public property [i: int]: int
     get => _counts[i];
     set => do _counts[i] := value; end;
-  end Tally;
+  end;
 end Tally;
 
 public class Program

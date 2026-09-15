@@ -31,6 +31,7 @@ public choice Priority
   public const Max: int := 2;
 
   public static readonly Tag: string := "priority";
+  // `static owned readonly` is s35_2_0007; operator overloads are s35_2_0008.
 end Priority;
 
 public class Program
