@@ -10204,6 +10204,95 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
                 }
             }
         }
+        // fix #4273 (§28.3/§7.7/§28.7, v0.298): port the `??=` arm from
+        // `handleAssignment` (Ownership.cpp ~line 6768) into the lambda-body
+        // pre-pass. The `:=` arm above handles a null-init plain local's first
+        // Owned adoption when the assignment unconditionally occurs; `??=` is
+        // the same shape when the target is provably null (PolyNull state) —
+        // §7.7's `a ??= b` producers row ("the compound form `a ??= b` assigns
+        // into `a` and follows the same meet rule for the assigned-into
+        // location") collapses the conditional to an unconditional assignment,
+        // exactly as #3980's method-scope arm describes. Without this, a
+        // `var r: Res? := null; r ??= new Res(5);` inside a lambda body leaks:
+        // the target's dataflow state stays PolyNull (the arm never fires),
+        // `becomesOwnedViaReassign` is never set, codegen's
+        // `unwindOwnedLocalClass` never classifies `r` as an owned class local,
+        // §28.7 drop-on-overwrite never fires, and §28.3 scope-end disposal is
+        // never registered — the 16 B allocation leaks with zero diagnostics
+        // and the explicit `.Dispose()` call dispatches to the destructor
+        // without reclaiming the block. Deliberately mirrors `handleAssignment`'s
+        // `??=` arm NARROWLY: only the `states_`-local bookkeeping — the
+        // producer-state adoption, the maybe-consumed/disposedOnSomePath/awaitSpent
+        // clears, the null-init `becomesOwnedViaReassign` flag, the
+        // definitelyRestoredLocals_ insert, and the borrow-source reset. NOT
+        // run: `checkConsumeFreeze` (the lambda pre-pass has no equivalent of
+        // the method-level consume-freeze that `:=`'s #4216 fix ports), and no
+        // `aliasSrc`/`disposeAliasSource` handling (those belong to
+        // LocalConstDecl, which cannot appear in a lambda-body local's
+        // assignment). Run BEFORE the nested-lambda collection below, matching
+        // this arm's existing ordering. // per §28.3, §7.7, §28.7, #1625,
+        // #3980, v0.298, #4273
+        if (as->op == "??=" && as->target) {
+            if (const auto* tid = dynamic_cast<const ast::IdentifierExpr*>(
+                    as->target.get())) {
+                for (auto& [sym, st] : states_) {
+                    if (sym->name != tid->name) continue;
+                    if (st.state == OwnershipState::PolyNull) {
+                        // The assignment provably occurs; mirror the `:=` path's
+                        // bare-identifier arm (§28.3, §28.7). recordMovesIn
+                        // runs first so a `move`d source is no longer Owned
+                        // before the local adopts its producer state (matches
+                        // the order in the `:=` branch).
+                        if (as->value) recordMovesIn(*as->value);
+                        // §28.7 / §28.3 (#1625): the null-init flag, set on
+                        // the first Owned reassignment of a null-init plain
+                        // local so codegen treats it as an owned class local
+                        // (drop-on-overwrite + scope-end disposal). Restricted
+                        // to a null-init LocalDecl — the two "becomes owned
+                        // via reassign" shapes the `:=` path guards against
+                        // (no-init local carrying the §28.3 disposal
+                        // obligation; borrow-init local admitting double-free)
+                        // do not arise here: a `??=` RHS is by §7.7 a producer
+                        // (owned value or borrow), but the borrow-init guard
+                        // is a property of the LocalDecl's initializer, which
+                        // for a PolyNull local is `null` — i.e. exactly the
+                        // case the flag is for. // per §28.7, §28.3, #1625
+                        if (producerState(*as->value) == OwnershipState::Owned) {
+                            if (auto* lsym =
+                                    dynamic_cast<sema::LocalSymbol*>(sym)) {
+                                if (auto* ld2 = dynamic_cast<const ast::LocalDecl*>(
+                                        lsym->decl))
+                                    if (ld2->initializer &&
+                                        dynamic_cast<const ast::NullLiteralExpr*>(
+                                            ld2->initializer.get()))
+                                            const_cast<ast::LocalDecl*>(ld2)
+                                                ->becomesOwnedViaReassign = true;
+                            }
+                        }
+                        // State transition, mirroring the `:=` path's
+                        // bare-identifier arm: the local adopts the RHS's
+                        // ownership state and any conditional-discharge /
+                        // await-spend markers from prior joins are cleared.
+                        // // per §28.3, §7.7 K7, #3980
+                        st.state = producerState(*as->value);
+                        st.obligationOrigin = as;
+                        st.maybeConsumed = false;
+                        st.disposedOnSomePath = false;
+                        st.awaitSpent = false;
+                        // §28.3 (#1900): the scope-end auto-drop's "definitely
+                        // holds a fresh value" marker, used by the
+                        // consume-and-restore idiom. // per §28.3, #1900
+                        if (st.state == OwnershipState::Owned)
+                            definitelyRestoredLocals_.insert(sym);
+                        // §28.9 / §9.7 indirect-escape tracking: `??=` writes
+                        // a fresh value, so any prior borrow source is cleared
+                        // — the local no longer aliases the old referent.
+                        st.source.reset();
+                    }
+                    break;
+                }
+            }
+        }
         if (as->target) {
             std::vector<const ast::LambdaExpr*> nestedLambdas;
             collectBodyLambdasExpr(*as->target, nestedLambdas);
