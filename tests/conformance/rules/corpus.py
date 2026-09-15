@@ -37,7 +37,7 @@ import sys
 
 HEADER_RE = re.compile(r'^//!\s(?!\s)([a-z][a-z0-9_]*):\s?(.*)$')
 CONT_RE = re.compile(r'^//!\s\s+(\S.*)$')
-CASE_ID_RE = re.compile(r'^(s|l)(\d+)_(\d+(?:_\d+)?)_(\d{4})$')
+CASE_ID_RE = re.compile(r'^(s|l)(\d+)(?:_(\d+(?:_\d+)?))?_(\d{4})$')
 MAIN_RE = re.compile(r'\bmethod\s+Main\b')
 
 REQUIRED = ("case", "doc", "section", "title", "rule", "expect")
@@ -95,12 +95,15 @@ def parse_header(text, where="<case>"):
 
 
 def section_of_case_id(case_id):
-    """`s28_3_0010` -> ('spec', '28.3'); `l4_9_0003` -> ('stdlib', '4.9')."""
+    """`s28_3_0010` -> ('spec', '28.3'); `l4_9_0003` -> ('stdlib', '4.9').
+    A section with no subsections takes the short form: `s34_0003` -> '34'."""
     m = CASE_ID_RE.match(case_id)
     if not m:
         return None
     doc = "spec" if m.group(1) == "s" else "stdlib"
-    section = m.group(2) + "." + m.group(3).replace("_", ".")
+    section = m.group(2)
+    if m.group(3):
+        section += "." + m.group(3).replace("_", ".")
     return doc, section
 
 
@@ -240,7 +243,7 @@ def _sort_key(case_id):
     m = CASE_ID_RE.match(case_id)
     if not m:
         return (9, case_id)
-    parts = [int(p) for p in m.group(3).split("_")]
+    parts = [int(p) for p in m.group(3).split("_")] if m.group(3) else [0]
     while len(parts) < 2:
         parts.append(0)
     return (0 if m.group(1) == "s" else 1, int(m.group(2)),

@@ -114,6 +114,15 @@ class TestCaseId(unittest.TestCase):
         self.assertEqual(corpus.section_of_case_id("s22_16_1_0003"),
                          ("spec", "22.16.1"))
 
+    def test_section_with_no_subsections_takes_the_short_form(self):
+        # §34 has no numbered subsections, so a case there is `s34_0003`.
+        self.assertEqual(corpus.section_of_case_id("s34_0003"), ("spec", "34"))
+
+    def test_short_and_long_forms_sort_together(self):
+        self.assertEqual(sorted(["s34_0003", "s33_2_0001", "s34_0001"],
+                                key=corpus._sort_key),
+                         ["s33_2_0001", "s34_0001", "s34_0003"])
+
     def test_stdlib_id(self):
         self.assertEqual(corpus.section_of_case_id("l4_9_0003"), ("stdlib", "4.9"))
 
