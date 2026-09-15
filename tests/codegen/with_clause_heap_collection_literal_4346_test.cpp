@@ -270,3 +270,50 @@ BEZEL_TEST(with_heap_collection_literal_4346,
         "  end Main; "
         "end C;"), 4);
 }
+
+// ── #4350 v2 regression: heap-collection literal local is freed even when
+// passed to a record constructor (the pre-existing #4c33bcd with-clause
+// relaxation is necessary but NOT sufficient) ───────────────────────────────
+//
+// The with-clause half (#4c33bcd) freed the freshly-materialized array
+// inside `lowerWith`'s result-record scope, so the `with(Items := [...])`
+// form is leak-clean. The CONSTRUCTOR half stayed leaky: `var items1:
+// Array<int> := [1, 2, 3]; var b1 := new R(items1);` did not free items1's
+// heap backing at scope end — the constructor call argument was treated as
+// a conservative ESCAPE by the borrowing-Array escape walk
+// (`StringEscapeWalker::walkNewArgs`, gated on `stringReleaseMode` in #2023,
+// before this fix), so items1 was excluded from `borrowingArrayFreeEligible_`
+// and no scope-end `bz_array_free` ever fired. Measured (pre-fix):
+// 120 bytes leaked in 2 allocations (the bz_array_t + its data backing).
+//
+// The fix mirrors walkCallArgs's `borrowingArrayMode` relaxation into
+// walkNewArgs: a plain (no-modifier, no-name, no-discard) constructor
+// parameter at a record or non-`owned` class target admits the argument as
+// a call-bounded borrow (records §9.7 "no disposer", and class fields
+// without `owned` modifier lack field-side disposal of the array, so the
+// plain-parameter copy leaves the local as sole owner).
+//
+// This test amplifies the leak in a `do … end` block repeated 100× via a
+// generated `for i := 0 to 99` loop (per `lsan-one-shot-leak-tests-pass-
+// vacuously.md`, one-shot LSan detection is ~90% flaky; the loop makes the
+// leak deterministic at 12,000 B / 200 allocations per run). Without the fix
+// LSan reports `12000 byte(s) leaked in 200 allocation(s)`; with the fix
+// LSan is clean and the program exits 1.
+BEZEL_TEST(with_heap_collection_literal_4346,
+           ctor_arg_heap_collection_literal_disposed_at_scope_end_4350_amplified) {
+    BEZEL_EXPECT_EQ(runChecked(
+        "module M; "
+        "import System.Collections.Generic; "
+        "record R(Items: Array<int>); "
+        "class C "
+        "  public static method Main(): int "
+        "    var i: int := 0; "
+        "    while i < 100 do "
+        "      var items1: Array<int> := [1, 2, 3]; "
+        "      var b1 := new R(items1); "
+        "      i := i + 1; "
+        "    end while; "
+        "    return 1; "
+        "  end Main; "
+        "end C;"), 1);
+}

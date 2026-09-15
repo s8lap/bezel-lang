@@ -24260,10 +24260,16 @@ struct StringEscapeWalker {
         auto walkAllEscape = [&]() {
             for (auto& a : ne->args) expr(a.value.get(), /*safeRead=*/false);
         };
-        // #2023: relaxation gated on stringReleaseMode (the #1997 narrowing) —
-        // the shared dict/grouping/borrowing-Array walks keep the conservative
-        // NewExpr escape.
-        if (!stringReleaseMode) { walkAllEscape(); return; }
+        // #2023: relaxation gated on stringReleaseMode (the #1997 narrowing).
+        // fix #4350 (round 2): mirror the same gate for borrowingArrayMode so a
+        // plain (no-modifier) constructor parameter at a record target admits a
+        // heap-collection literal local as a call-bounded borrow (§28.3, §28.9,
+        // §9.7). The shared dict-materializer / grouping walks still escape
+        // conservatively (stringReleaseMode=false AND borrowingArrayMode=false).
+        if (!stringReleaseMode && !borrowingArrayMode) {
+            walkAllEscape();
+            return;
+        }
         // Resolve the target TypeSymbol. The explicit `ne->type` (a NewExpr
         // with `new T(...)` form) wins; the shorthand `new(args)` form infers
         // the target from the NewExpr's exprType (the LHS annotation).
@@ -24359,6 +24365,38 @@ struct StringEscapeWalker {
             walkAllEscape();  // builtin/unresolved type — no relaxation
             return;
         }
+        // fix #4350 (round 2, walkNewArgs-RECORD): when borrowingArrayMode is
+        // active and the target is a RECORD declaration (or any other type
+        // whose auto-generated positional constructor is NOT in the
+        // TypeSymbol's `members` list — records have field members, not
+        // explicit ctors), admit the call-bounded-borrow relaxation on
+        // positional plain-arg positions directly. The record's positional
+        // constructor takes fields in declaration order with no parameter
+        // modifiers (records §9.7: "no disposer" — fields are bare pointer
+        // copies; there is no `owned` parameter modifier that could retain),
+        // so a plain positional argument to a record constructor is
+        // structurally a call-bounded borrow. Same for a class without
+        // user-defined ctors (its fields form the implicit constructor).
+        //
+        // Gated on borrowingArrayMode so the shared string/dict/grouping
+        // walks keep their conservative escape — their callee-side discipline
+        // has no matching counterpart retain, and a release on a string local
+        // that's been moved into a record field via the §4254 raw-store path
+        // leaks (#4254 documents exactly this case).
+        //
+        // NARROW: requires `isTargetIdent` (a non-target argument cannot be
+        // scope-end-released in the caller's frame), no modifier, no name, no
+        // discard — mirrors walkCallArgs:24021 exactly.
+        if (borrowingArrayMode &&
+            rt->declaration->kind == ast::TypeDeclKind::Record) {
+            for (std::size_t i = 0; i < ne->args.size(); ++i) {
+                const ast::CallArgument& a = ne->args[i];
+                bool safeArg = a.modifier.empty() && a.name.empty() &&
+                    !a.isDiscard && isTargetIdent(a.value.get());
+                expr(a.value.get(), safeArg);
+            }
+            return;
+        }
         // Find the constructor with the matching arity. Single-ctor only —
         // an overloaded arity is ambiguous at this analysis level (the walker
         // is a free struct without access to ctorForArgs's type-matching), so
@@ -24440,7 +24478,53 @@ struct StringEscapeWalker {
         for (std::size_t i = 0; i < ne->args.size(); ++i) {
             const ast::CallArgument& a = ne->args[i];
             bool safeArg = false;
-            if (a.modifier.empty() && a.name.empty() &&
+            // fix #4350 (round 2): mirror walkCallArgs's borrowingArrayMode
+            // relaxation into walkNewArgs — a plain (no-modifier, no-name)
+            // constructor parameter position of a RESOLVED user/imported
+            // record or class constructor admits a target-identified
+            // heap-collection literal local as a CALL-BOUNDED borrow (§28.3,
+            // §28.9, §9.7). The callee-side discipline is the same as #1430 /
+            // #2023: a plain parameter at a record field adopts the borrow by
+            // a bare pointer copy (§9.7: "no disposer"; records have no
+            // Dispose, fields are bare pointer copies with no independent +1),
+            // and a class field without `owned` modifier is identical (the
+            // `owned` modifier mints its own +1 via the field store; without
+            // it, the slot is a plain pointer copy). Either way the local
+            // retains sole ownership and a scope-end `bz_array_free` is sound.
+            //
+            // Gated on borrowingArrayMode so the shared string/dict/grouping
+            // walks keep their conservative escape (their callee-side
+            // discipline has no matching counterpart retain).
+            //
+            // `isTargetIdent` is required: a non-target argument (a
+            // constructor parameter that is itself an expression, a member
+            // access, a call result, etc.) cannot be scope-end-released in
+            // the caller's frame and stays escaped. Mirrors walkCallArgs:24021.
+            if (borrowingArrayMode &&
+                a.modifier.empty() && a.name.empty() && !a.isDiscard &&
+                i < chosen->params.size() &&
+                isTargetIdent(a.value.get())) {
+                auto* ps = dynamic_cast<sema::ParameterSymbol*>(
+                    chosen->params[i]);
+                if (ps && ps->modifier.empty()) safeArg = true;
+            }
+            // #2023: the original string-local relaxation — a plain (no-
+            // modifier) constructor parameter at a RESOLVED user/imported
+            // constructor position admits a string local as a call-bounded
+            // borrow. Mirrors #1430 / walkCallArgs. The original safeArg
+            // expression did NOT require isTargetIdent — that constraint
+            // arrives for free from the #1430-style "call-bounded borrow"
+            // soundness model but is computed at the safeRead→expr()
+            // boundary, not here, so a non-target string argument still
+            // admits the relaxation (it does not cause a leak either way
+            // because the upstream expr() walk decides per-leaf). Preserved
+            // verbatim from the #2023 commit to avoid disturbing the
+            // existing string-walk soundness. The stringReleaseMode gate
+            // was implicit via the early-return at line 24266 — with
+            // borrowingArrayMode's parallel relaxation now sharing the
+            // function body, gate explicitly here.
+            if (!safeArg && stringReleaseMode &&
+                a.modifier.empty() && a.name.empty() &&
                 i < chosen->params.size()) {
                 auto* ps = dynamic_cast<sema::ParameterSymbol*>(
                     chosen->params[i]);
