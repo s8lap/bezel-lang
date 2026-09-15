@@ -152,6 +152,17 @@ artifacts built before it; `main.bzl` compiles with all of them imported. So
 the rule under test lives in `main.bzl`, so a broken dependency is a broken
 case, never a passing reject.
 
+A dependency is a library and normally may not hold a `method Main`. §2.8.4's
+rules *about* a qualifying `Main` in a dependency artifact — that it is inert,
+and that presenting an executable as a dependency is a build error — are the
+exception, and opt in with `notes: dep-main`.
+
+**One module is one file.** `bezelc` takes exactly one input, so a case cannot
+put two files in one compilation: two dependency files declaring the same module
+name are a duplicate-module-name build error, not a shared compilation. That
+puts §2.8.1 rule 2's positive half and every import-SCC rule out of reach — say
+so in your report rather than approximating them.
+
 Use this form only when the rule is really about the boundary. A rule that can
 be shown in one file belongs in one file.
 

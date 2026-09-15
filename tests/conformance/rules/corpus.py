@@ -97,6 +97,12 @@ def parse_header(text, where="<case>"):
     return fields
 
 
+def note_tokens(notes):
+    """`notes` is a `;`-separated token list, exact-match — the same shape the
+    doc-example harness uses, so prose containing a keyword switches nothing on."""
+    return [t.strip() for t in (notes or "").split(";") if t.strip()]
+
+
 def section_of_case_id(case_id):
     """`s28_3_0010` -> ('spec', '28.3'); `l4_9_0003` -> ('stdlib', '4.9').
     A section with no subsections takes the short form: `s34_0003` -> '34'."""
@@ -257,9 +263,13 @@ def load_cases(cases_dir):
             if not re.match(r'^\s*module\s+\w', dep_text):
                 errs.append("{}/{}: a dependency is a whole source file and "
                             "starts with `module …;`".format(case_id, dep))
-            if MAIN_RE.search(dep_text):
+            if MAIN_RE.search(dep_text) and "dep-main" not in note_tokens(
+                    fields.get("notes")):
                 errs.append("{}/{}: a dependency is a library — the `method "
-                            "Main` belongs in main.bzl".format(case_id, dep))
+                            "Main` belongs in main.bzl. §2.8.4's rules about a "
+                            "qualifying Main IN a dependency are the exception: "
+                            "opt in with `notes: dep-main`."
+                            .format(case_id, dep))
         problems.extend(errs)
         if errs:
             continue

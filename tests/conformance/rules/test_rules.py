@@ -404,6 +404,24 @@ class TestDirectoryCases(unittest.TestCase):
                            "public static method Main() end Main;")})
         self.assertTrue(any("belongs in main.bzl" in p for p in self.rows()[1]))
 
+    def test_a_dependency_may_hold_Main_when_the_case_opts_in(self):
+        # §2.8.4: a qualifying Main in a DEPENDENCY artifact is inert, and
+        # presenting an executable as a dependency is a build error. Both rules
+        # are about a dependency that holds one.
+        main = MULTI_MAIN.replace("//! expect: reject",
+                                  "//! notes: dep-main\n//! expect: reject")
+        write_dir_case(self.base, "s13_4_0001", main,
+                       {"lib.bzl": MULTI_DEP.replace(
+                           "internal static const Secret: int := 1;",
+                           "public static method Main() end Main;")})
+        self.assertEqual(self.rows()[1], [])
+
+    def test_note_tokens_are_exact(self):
+        self.assertEqual(corpus.note_tokens("dep-main; other"),
+                         ["dep-main", "other"])
+        self.assertEqual(corpus.note_tokens(None), [])
+        self.assertNotIn("dep-main", corpus.note_tokens("no dep-mainly here"))
+
     def test_a_directory_without_main_is_a_problem(self):
         os.remove(os.path.join(self.base, "cases", "s13_4_0001", "main.bzl"))
         self.assertTrue(any("needs a main.bzl" in p for p in self.rows()[1]))
