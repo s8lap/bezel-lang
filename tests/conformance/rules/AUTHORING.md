@@ -276,6 +276,7 @@ python3 tests/conformance/rules/corpus.py lint     # structure, ids, bijection
 python3 tests/conformance/rules/corpus.py build    # regenerate manifest.tsv
 python3 tests/conformance/rules/corpus.py summary  # per-section counts
 python3 tests/conformance/rules/names.py           # invented stdlib API
+python3 tests/conformance/rules/corpus.py audit    # quality signals, never fails
 python3 tests/conformance/rules/coverage.py --invariants 28.5   # the C rows for a section
 ```
 

@@ -349,6 +349,57 @@ def read_manifest(path):
     return rows
 
 
+def audit(rows, cases_dir):
+    """Quality signals a reader would otherwise have to check by hand. None is a
+    lint failure — each is a judgement call the author may have made
+    deliberately — so this prints and never fails."""
+    def words(text):
+        return set(re.findall(r'[a-z]{3,}', text.lower()))
+
+    orphan_diag, no_cites, long_source, twins = [], [], [], {}
+    for row in rows:
+        if row["expect"] in ("reject", "warn") and row["check"]:
+            # The contract says a diagnostic fragment is the RULE's own wording.
+            frag = words(row["check"])
+            # A diagnostic that is an identifier the case declares (`Money`,
+            # `Lib`) is the unresolved-name shape and is fine as it stands.
+            identifierish = re.fullmatch(r'[A-Z]\w*', row["check"].strip())
+            if frag and not identifierish \
+                    and not (frag & words(row["rule"] + " " + row["title"])):
+                orphan_diag.append((row["case-id"], row["check"]))
+        if not row["cites"]:
+            no_cites.append(row["case-id"])
+        key = re.sub(r'[^a-z ]', '', row["rule"].lower())[:120]
+        twins.setdefault(key, []).append(row["case-id"])
+        path = os.path.join(cases_dir, row["case-id"] + ".bzl")
+        if os.path.isfile(path):
+            with open(path, encoding="utf-8") as f:
+                body = strip_header(f.read())
+            n = len([l for l in body.split("\n") if l.strip()])
+            if n > 45:
+                long_source.append((row["case-id"], n))
+
+    print("{} reject/warn cases whose diagnostic shares no word with their rule"
+          .format(len(orphan_diag)))
+    for case_id, frag in orphan_diag[:30]:
+        print("   {}  {!r}".format(case_id, frag))
+    # A pair states ONE rule from both sides, so a shared rule text within a
+    # section is the pairing discipline working. Across sections it is a
+    # duplicate, and the rule's home section owns it.
+    dup = {k: v for k, v in twins.items() if len(v) > 1 and k
+           and len({section_of_case_id(i)[1] for i in v
+                    if section_of_case_id(i)}) > 1}
+    print("\n{} rule texts shared ACROSS sections (a pair within one section "
+          "is the pairing discipline, not a duplicate)".format(len(dup)))
+    for ids in list(dup.values())[:20]:
+        print("   " + ", ".join(ids))
+    print("\n{} cases with no `cites:`".format(len(no_cites)))
+    print("\n{} cases over 45 non-blank source lines".format(len(long_source)))
+    for case_id, n in sorted(long_source, key=lambda t: -t[1])[:15]:
+        print("   {}  {} lines".format(case_id, n))
+    return 0
+
+
 def _here():
     return os.path.dirname(os.path.abspath(__file__))
 
@@ -359,8 +410,8 @@ def main(argv, base_dir=None):
     manifest = os.path.join(base, "manifest.tsv")
     cmd = argv[0] if argv else "lint"
 
-    if cmd not in ("lint", "build", "check", "summary"):
-        print("usage: corpus.py [lint|build|check|summary]", file=sys.stderr)
+    if cmd not in ("lint", "build", "check", "summary", "audit"):
+        print("usage: corpus.py [lint|build|check|summary|audit]", file=sys.stderr)
         return 2
 
     rows, problems = load_cases(cases_dir)
@@ -392,6 +443,9 @@ def main(argv, base_dir=None):
             return 1
         print("check: manifest.tsv is up to date ({} rows)".format(len(rows)))
         return 0
+
+    if cmd == "audit":
+        return audit(rows, cases_dir)
 
     by_section = {}
     for row in rows:

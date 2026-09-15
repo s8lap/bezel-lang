@@ -61,6 +61,7 @@ python3 tests/conformance/rules/corpus.py build     # regenerate manifest.tsv
 python3 tests/conformance/rules/corpus.py check     # is the manifest current?
 python3 tests/conformance/rules/corpus.py summary   # per-section counts
 python3 tests/conformance/rules/coverage.py --gaps  # what is not covered yet
+python3 tests/conformance/rules/corpus.py audit     # quality signals (never fails)
 python3 -m unittest discover -s tests/conformance/rules   # harness unit tests
 python3 tests/conformance/rules/runner.py build/bezelc    # run it
 ```
