@@ -12233,6 +12233,52 @@ void ExprTC::runMethodBody(
         }
         forwardParamRef_.clear();
         visitExpr(*params[i].defaultValue);
+        // fix #4332 (§15.4, v0.298): a default-parameter-value collection
+        // literal is one of §17.7's written-declared-type positions, but
+        // unlike the new() shorthand (which #4208 wired), this one was never
+        // wired for collection literals: `method M(p: T := [...])` left the
+        // literal untyped, so checkCollectionLiteralElementAssignability skipped
+        // its element walk and a non-conforming element was silently accepted —
+        // codegen's #2491 backstop degraded the default to a zero/null value.
+        // Wire the SAME authorities the return-position fix (#4310, ~line 14908)
+        // already uses: set the literal's exprType to the parameter's declared
+        // type before visiting, then gate on admissibility and run per-element
+        // assignability checking.
+        if (params[i].type) {
+            if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(
+                    params[i].defaultValue.get())) {
+                if (!ctx_.exprType(*cl)) {
+                    if (auto* pty = ctx_.resolvedType(*params[i].type)) {
+                        ctx_.setExprType(params[i].defaultValue.get(), pty);
+                        const bool isEmpty =
+                            !cl->isDict && cl->elements.empty();
+                        const bool admitted = isEmpty
+                            ? isCollectionLiteralEmptyAdmissibleTarget(pty)
+                            : isCollectionLiteralAdmissibleTarget(pty,
+                                                                  cl->isDict);
+                        if (pty->kind != TypeRef::Kind::Error && !admitted) {
+                            if (isCollectionLiteralInterfaceTarget(pty))
+                                reportCollectionLiteralInterfaceTarget(
+                                    ctx_.diagnostics(),
+                                    params[i].defaultValue->span.begin,
+                                    namedTypeSimpleName(pty));
+                            else if (cl->isDict &&
+                                     isCollectionLiteralAdmissibleTarget(
+                                         pty, /*isDict=*/false))
+                                reportCollectionLiteralDictFormBadTarget(
+                                    ctx_.diagnostics(),
+                                    params[i].defaultValue->span.begin, pty);
+                            else
+                                reportCollectionLiteralBadTarget(
+                                    ctx_.diagnostics(),
+                                    params[i].defaultValue->span.begin, pty);
+                        }
+                        checkBorrowingFamilyLiteralElements(*cl, pty);
+                        checkCollectionLiteralElementAssignability(*cl, pty);
+                    }
+                }
+            }
+        }
         // fix #4208 (§17.7, v0.298): a default parameter value is one of the
         // FOUR written-declared-type positions §17.7 authorises for the
         // new() shorthand ("field initializers, typed local-variable
@@ -17481,7 +17527,47 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 "`yield` is not allowed in a lambda — it is a method-level "
                 "construct only (§29.9)");
         }
-        if (ys->value) visitExpr(*ys->value);
+        if (ys->value) {
+            // fix #4332 (§15.4, v0.298): an iterator method's yield-value
+            // collection literal is not target-typed by the visitor, so
+            // checkCollectionLiteralElementAssignability skips its element walk
+            // and a non-conforming element is silently accepted — codegen's
+            // #2491 backstop degrades the yield to a zero/null value.
+            //
+            // Unlike the return-stmt twin (~line 14908), the yield literal's
+            // CONCRETE collection type is inferred from its elements
+            // (e.g. Array<Widget3Ok>), not from the iterator's IEnumerable<T>
+            // interface. The admissibility gate (§15.4 closed-list) does NOT
+            // apply — the literal targets the concrete form, and the
+            // IEnumerable<T> conversion happens at the yield/iterator level.
+            //
+            // Visit FIRST so NewExpr elements get their types (Widget3), then
+            // check element conformance using the iterator's element type.
+            visitExpr(*ys->value);
+            if (auto* cl =
+                    dynamic_cast<const ast::CollectionLiteralExpr*>(ys->value.get())) {
+                if (!ctx_.exprType(*cl) && currentReturnType_) {
+                    TypeRef* elemTy =
+                        linqSourceElementType(currentReturnType_);
+                    // §5.1: per-element interface-conformance check.  Skip the
+                    // admissibility gate (the literal's concrete form is inferred,
+                    // not target-imposed) and borrowing-family check (not
+                    // applicable to yield-return element conformance).
+                    if (elemTy && elemTy->kind != TypeRef::Kind::Error) {
+                        for (const auto& el : cl->elements) {
+                            if (!el) continue;
+                            TypeRef* elTy = ctx_.exprType(*el);
+                            if (!elTy) continue;
+                            // Direct §5.1 check: does the element type implement
+                            // (or is assignable to) the iterator's element type?
+                            checkAssignable(elTy, elemTy, el->span.begin,
+                                          "yield-value collection-literal element",
+                                          el.get());
+                        }
+                    }
+                }
+            }
+        }
     } else if (auto* is = dynamic_cast<const ast::IncrementStmt*>(&s)) {
         if (is->target) visitExpr(*is->target);
         // §6.6 / A.6 (v0.184, #1690): `IncrementStmt ::= LValue ("++"|"--")`

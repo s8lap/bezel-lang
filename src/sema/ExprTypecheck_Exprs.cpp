@@ -2480,6 +2480,50 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                         break;
                     }
                 }
+                // fix #4332 (§15.4, v0.298): thread the `as` target type onto
+                // a collection-literal operand. The operand was already visited
+                // by visitChildren before this handler ran, without any target —
+                // so the literal has no exprType and its elements were visited
+                // in an untyped context. Set the target now and re-visit the
+                // operand so the §15.4 admissibility gate and per-element
+                // assignability check run with the right context; without this,
+                // codegen's #2434 backstop silently degrades the literal to a
+                // zero-initialised value.
+                if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(
+                        te->operand.get())) {
+                    if (!ctx_.exprType(*cl)) {
+                        ctx_.setExprType(te->operand.get(), tt);
+                        const bool isEmpty =
+                            !cl->isDict && cl->elements.empty();
+                        const bool admitted = isEmpty
+                            ? isCollectionLiteralEmptyAdmissibleTarget(tt)
+                            : isCollectionLiteralAdmissibleTarget(tt,
+                                                                  cl->isDict);
+                        if (tt->kind != TypeRef::Kind::Error && !admitted) {
+                            if (isCollectionLiteralInterfaceTarget(tt))
+                                reportCollectionLiteralInterfaceTarget(
+                                    ctx_.diagnostics(),
+                                    te->operand->span.begin,
+                                    exprsNamedTypeSimpleName(tt));
+                            else if (cl->isDict &&
+                                     isCollectionLiteralAdmissibleTarget(
+                                         tt, /*isDict=*/false))
+                                reportCollectionLiteralDictFormBadTarget(
+                                    ctx_.diagnostics(),
+                                    te->operand->span.begin, tt);
+                            else
+                                reportCollectionLiteralBadTarget(
+                                    ctx_.diagnostics(),
+                                    te->operand->span.begin, tt);
+                        }
+                        checkBorrowingFamilyLiteralElements(*cl, tt);
+                        checkCollectionLiteralElementAssignability(*cl, tt);
+                        // Re-visit the operand now that the target is set, so
+                        // its elements are properly typed under the target
+                        // context (visitChildren already visited them untyped).
+                        visitExpr(*te->operand);
+                    }
+                }
                 if (tt->nullable) {
                     ctx_.setExprType(&e, tt);
                 } else {
