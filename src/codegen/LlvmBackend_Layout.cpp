@@ -6305,8 +6305,20 @@ llvm::Value* Emitter::emitValueEquality(llvm::Value* l, llvm::Value* r,
     // equality; the sema upstream is the canonical enforcement.
     if (fieldTy && fieldTy->kind == K::Named && fieldTy->declaration &&
         fieldTy->declaration->kind == ast::TypeDeclKind::Choice &&
-        l->getType()->isStructTy() && r->getType()->isStructTy())
-        return emitChoiceEquality(l, r, fieldTy->declaration);
+        l->getType()->isStructTy() && r->getType()->isStructTy()) {
+        // fix #4278 (sibling of #4251, same root cause, different code path):
+        // a generic CHOICE field in a non-generic record lost its type-parameter
+        // substitution when recursing into `emitChoiceEquality` — without `instTy`,
+        // the choice's payload fields (e.g. `T` in `Maybe<T>`) were compared
+        // using the bare type parameter resolved through the (empty) outer
+        // substitution, falling back to pointer comparison for the string
+        // payload instead of content equality. Pass `fieldTy` (the concrete
+        // instantiation, e.g. `Maybe<string>`) as `instTy` so that
+        // `substitutedChoicePayloadType` can substitute `T -> string` directly
+        // using `instTy->genericArgs`, bypassing the empty outer substitution.
+        RecordSubstGuard fieldSubst(this, fieldTy);
+        return emitChoiceEquality(l, r, fieldTy->declaration, fieldTy);
+    }
     // Fallback by LLVM shape (covers null fieldTy and primitives/enums/refs).
     // Nested structs recurse; floats use FCmp; everything else (integers,
     // and ptr fields when the declared type is unknown) compares by ICmp —
@@ -6423,7 +6435,8 @@ llvm::Value* Emitter::emitInlineArrayEquality(llvm::Value* l, llvm::Value* r,
 // default (payload-free cases and, defensively, an out-of-range tag) yields
 // true — a payload-free case is equal to itself by tag alone.
 llvm::Value* Emitter::emitChoiceEquality(llvm::Value* l, llvm::Value* r,
-                                         const sema::TypeSymbol* choiceTy) {
+                                         const sema::TypeSymbol* choiceTy,
+                                         const sema::TypeRef* instTy) {
     llvm::Value* lTag = builder_.CreateExtractValue(l, {0u}, "cheq.ltag");
     llvm::Value* rTag = builder_.CreateExtractValue(r, {0u}, "cheq.rtag");
     llvm::Value* tagsEq = builder_.CreateICmpEQ(lTag, rTag, "cheq.tag");
@@ -6466,14 +6479,42 @@ llvm::Value* Emitter::emitChoiceEquality(llvm::Value* l, llvm::Value* r,
                 r, {static_cast<unsigned>(1 + ci),
                     static_cast<unsigned>(pi)}, "cheq.rf");
             sema::TypeRef pTy;  // resolved payload type for emitValueEquality
-            if (pf.type)
-                // §14.1 (#2047): resolve a bare-param payload (`T`) through the
-                // active instantiation subst so a `string`/record payload of a
-                // generic choice compares by its CONCRETE type (content), not the
-                // i32-placeholder. A no-op for a concrete payload type.
-                if (const sema::TypeRef* rt =
-                        resolveTypeParamRef(ctx_.resolvedType(*pf.type)))
-                    pTy = *rt;
+            if (pf.type) {
+                // fix #4278: when `instTy` is provided (the concrete instantiation,
+                // e.g. `Maybe<string>`), directly substitute a bare type-parameter
+                // payload (`T`) using `instTy->genericArgs` — bypassing
+                // `ctx_.resolvedType` which may return null for a type parameter
+                // whose resolution context is not active in codegen. Match by name
+                // against `choiceTy`'s generic params (same mechanism
+                // `substitutedChoicePayloadType` uses). A no-op for a concrete
+                // payload type (the payload TypeRef has a declaration or is not
+                // in `choiceTy`'s generic param list).
+                if (instTy && !instTy->genericArgs.empty()) {
+                    const sema::TypeRef* rawTy = ctx_.resolvedType(*pf.type);
+                    if (rawTy && rawTy->kind == sema::TypeRef::Kind::Named &&
+                        !rawTy->declaration) {
+                        std::string_view head = rawTy->headName();
+                        for (std::size_t i = 0;
+                             i < choiceTy->genericParams.size(); ++i) {
+                            if (choiceTy->genericParams[i] &&
+                                choiceTy->genericParams[i]->name == head &&
+                                i < instTy->genericArgs.size()) {
+                                pTy = *instTy->genericArgs[i];
+                                break;
+                            }
+                        }
+                    }
+                    // If not a type param, fall through to the resolved type.
+                    if (pTy.kind == sema::TypeRef::Kind::Error) {
+                        if (rawTy) pTy = *rawTy;
+                    }
+                } else {
+                    // Top-level call or no instTy: use the prior path.
+                    if (const sema::TypeRef* rt =
+                            resolveTypeParamRef(ctx_.resolvedType(*pf.type)))
+                        pTy = *rt;
+                }
+            }
             caseEq = builder_.CreateAnd(caseEq,
                                         emitValueEquality(lf, rf, &pTy));
         }
@@ -6510,7 +6551,8 @@ llvm::Value* Emitter::emitChoiceEquality(llvm::Value* l, llvm::Value* r,
 // switch default (payload-free cases and, defensively, an out-of-range
 // tag) yields the tag-only hash.
 llvm::Value* Emitter::emitChoiceHashCode(llvm::Value* val,
-                                         const sema::TypeSymbol* choiceTy) {
+                                         const sema::TypeSymbol* choiceTy,
+                                         const sema::TypeRef* instTy) {
     llvm::Value* tag = builder_.CreateExtractValue(val, {0u}, "ch.tag");
     // Seed: hash the tag with a non-zero starting point, so a payload-free
     // choice variant still has a meaningful hash (mirrors the record seed
@@ -6544,13 +6586,32 @@ llvm::Value* Emitter::emitChoiceHashCode(llvm::Value* val,
         for (std::size_t pi = 0; pi < cc->caseDecl->payload.size(); ++pi) {
             const ast::Param& pf = cc->caseDecl->payload[pi];
             sema::TypeRef pTy;
-            if (pf.type)
-                // §14.1 (#2047): resolve a bare-param payload through the active
-                // instantiation subst so a generic choice's `string`/record
-                // payload hashes by its concrete type. A no-op for a concrete type.
-                if (const sema::TypeRef* rt =
-                        resolveTypeParamRef(ctx_.resolvedType(*pf.type)))
-                    pTy = *rt;
+            if (pf.type) {
+                // fix #4278: same substitution logic as emitChoiceEquality.
+                if (instTy && !instTy->genericArgs.empty()) {
+                    const sema::TypeRef* rawTy = ctx_.resolvedType(*pf.type);
+                    if (rawTy && rawTy->kind == sema::TypeRef::Kind::Named &&
+                        !rawTy->declaration) {
+                        std::string_view head = rawTy->headName();
+                        for (std::size_t i = 0;
+                             i < choiceTy->genericParams.size(); ++i) {
+                            if (choiceTy->genericParams[i] &&
+                                choiceTy->genericParams[i]->name == head &&
+                                i < instTy->genericArgs.size()) {
+                                pTy = *instTy->genericArgs[i];
+                                break;
+                            }
+                        }
+                    }
+                    if (pTy.kind == sema::TypeRef::Kind::Error) {
+                        if (rawTy) pTy = *rawTy;
+                    }
+                } else {
+                    if (const sema::TypeRef* rt =
+                            resolveTypeParamRef(ctx_.resolvedType(*pf.type)))
+                        pTy = *rt;
+                }
+            }
             llvm::Value* pfVal = builder_.CreateExtractValue(
                 val, {static_cast<unsigned>(1 + ci),
                       static_cast<unsigned>(pi)}, "ch.pf");

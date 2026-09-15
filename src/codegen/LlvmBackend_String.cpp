@@ -3311,8 +3311,13 @@ llvm::Value* Emitter::emitValueToString(llvm::Value* val,
         // `.ToString()` call is by far the common spelling).
         if (ts->kind == ast::TypeDeclKind::Choice &&
             val->getType()->isStructTy() &&
-            sema::isAutoEqualityBearingChoice(ts, ctx_, fieldTy))
-            return emitChoiceToString(val, ts);
+            sema::isAutoEqualityBearingChoice(ts, ctx_, fieldTy)) {
+            // fix #4278: pass fieldTy (the concrete instantiation) so that
+            // emitChoiceToString can use substitutedChoicePayloadType to resolve
+            // the generic payload type T -> concrete type (e.g. string).
+            RecordSubstGuard fieldSubst(this, fieldTy);
+            return emitChoiceToString(val, ts, fieldTy);
+        }
         if (ts->kind == ast::TypeDeclKind::Class && val->getType()->isPointerTy()) {
             // §8.5: a class field formats via its ToString override if any,
             // else the type name. Walk the class chain for a ToString method.
@@ -3735,7 +3740,8 @@ llvm::Value* Emitter::emitRecordToString(llvm::Value* recVal,
 // switch's default (an out-of-range tag; defensive only, never reachable
 // for a validly-constructed value) yields the bare type name.
 llvm::Value* Emitter::emitChoiceToString(llvm::Value* val,
-                                         const sema::TypeSymbol* choiceTy) {
+                                         const sema::TypeSymbol* choiceTy,
+                                         const sema::TypeRef* instTy) {
     llvm::Value* tag = builder_.CreateExtractValue(val, {0u}, "chts.tag");
     auto* entryBB = builder_.GetInsertBlock();
     auto* endBB = llvm::BasicBlock::Create(llvm_, "chts.end", currentFn_);
@@ -3796,14 +3802,33 @@ llvm::Value* Emitter::emitChoiceToString(llvm::Value* val,
                 val, {static_cast<unsigned>(1 + ci),
                       static_cast<unsigned>(pi)}, "chts.f");
             sema::TypeRef pTy;  // resolved payload type for emitValueToString
-            if (pf.type)
-                // §14.1 (#2047 precedent): resolve a bare-param payload (`T`)
-                // through the active instantiation subst so a `string`/
-                // record/choice payload of a generic choice formats by its
-                // CONCRETE type. A no-op for a concrete payload type.
-                if (const sema::TypeRef* rt =
-                        resolveTypeParamRef(ctx_.resolvedType(*pf.type)))
-                    pTy = *rt;
+            if (pf.type) {
+                // fix #4278: when `instTy` is provided, use substituted
+                // payload type; otherwise fall back to resolveTypeParamRef.
+                if (instTy && !instTy->genericArgs.empty()) {
+                    const sema::TypeRef* rawTy = ctx_.resolvedType(*pf.type);
+                    if (rawTy && rawTy->kind == sema::TypeRef::Kind::Named &&
+                        !rawTy->declaration) {
+                        std::string_view head = rawTy->headName();
+                        for (std::size_t i = 0;
+                             i < choiceTy->genericParams.size(); ++i) {
+                            if (choiceTy->genericParams[i] &&
+                                choiceTy->genericParams[i]->name == head &&
+                                i < instTy->genericArgs.size()) {
+                                pTy = *instTy->genericArgs[i];
+                                break;
+                            }
+                        }
+                    }
+                    if (pTy.kind == sema::TypeRef::Kind::Error) {
+                        if (rawTy) pTy = *rawTy;
+                    }
+                } else {
+                    if (const sema::TypeRef* rt =
+                            resolveTypeParamRef(ctx_.resolvedType(*pf.type)))
+                        pTy = *rt;
+                }
+            }
             llvm::Value* fieldStr = emitValueToString(fieldVal, &pTy);
             {
                 llvm::Value* prev = acc;
@@ -4342,8 +4367,13 @@ llvm::Value* Emitter::emitValueHashCode(llvm::Value* val,
     // mixed in first, then per-payload fields h = h*31 + fieldHash.
     if (fieldTy && fieldTy->kind == K::Named && fieldTy->declaration &&
         fieldTy->declaration->kind == ast::TypeDeclKind::Choice &&
-        val->getType()->isStructTy())
-        return emitChoiceHashCode(val, fieldTy->declaration);
+        val->getType()->isStructTy()) {
+        // fix #4278: pass fieldTy (the concrete instantiation) so that
+        // emitChoiceHashCode can use substitutedChoicePayloadType to resolve
+        // the generic payload type T -> concrete type (e.g. string).
+        RecordSubstGuard fieldSubst(this, fieldTy);
+        return emitChoiceHashCode(val, fieldTy->declaration, fieldTy);
+    }
     if (val->getType()->isDoubleTy())
         return builder_.CreateTrunc(
             builder_.CreateBitCast(val, i64()), i32());

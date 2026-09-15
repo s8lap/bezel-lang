@@ -4533,16 +4533,19 @@ private:
     // type is a Choice, so a record can hold a choice component and the
     // synthesized Equals/GetHashCode remains consistent.
     llvm::Value* emitChoiceEquality(llvm::Value* l, llvm::Value* r,
-                                    const sema::TypeSymbol* choiceTy);
+                                    const sema::TypeSymbol* choiceTy,
+                                    const sema::TypeRef* instTy = nullptr);
     llvm::Value* emitChoiceHashCode(llvm::Value* val,
-                                    const sema::TypeSymbol* choiceTy);
+                                    const sema::TypeSymbol* choiceTy,
+                                    const sema::TypeRef* instTy = nullptr);
     // §35.7 (#2479): "TypeName.CaseName(field1: value1, …)" / "TypeName.
     // CaseName" over the choice struct's active case, mirroring
     // emitChoiceEquality/emitChoiceHashCode's tag-switch shape. Callers must
     // confirm auto-hashable (sema::isAutoEqualityBearingChoice)
     // first — this function does not re-check it.
     llvm::Value* emitChoiceToString(llvm::Value* val,
-                                    const sema::TypeSymbol* choiceTy);
+                                    const sema::TypeSymbol* choiceTy,
+                                    const sema::TypeRef* instTy = nullptr);
     // fix #2661 (spec §8.5, v0.252): the §8.5 POSITIONAL-RECORD default for the
     // standard library's span records — "The defaults above are generated for
     // **every** type of the applicable kind, wherever declared — user modules
