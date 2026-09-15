@@ -9897,22 +9897,51 @@ llvm::Value* Emitter::buildRecordValue(
                         static_cast<std::ptrdiff_t>(recPosFieldCount);
              ++it) {
             const sema::Symbol* m = *it;
-            // SEAM-DEBT: #4058 `m->decl` is nullptr for an IMPORTED body
-            // member (no ast::FieldDecl crosses the module boundary, the
-            // #3671-documented seam) — this reads as "no initializer", the
-            // deliberately conservative answer this fix's own comment above
-            // scopes to, not a silent wrong one (measured cross-module,
-            // T17 in combined_record_secondary_ctor_arity_4039_test.cpp:
-            // still a located Error, never a crash or a wrong value).
             if (auto* fd = dynamic_cast<const ast::FieldDecl*>(m->decl)) {
                 if (fd->initializer) continue;
             }
-            // SEAM-DEBT: #4058 same imported-conservative rationale as the
-            // FieldDecl arm immediately above.
             if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(m->decl)) {
                 if (pd->autoInitializer) continue;
             }
-            return false;  // no initializer (or imported: m->decl == nullptr)
+            // fix #4103 (§9.1/§9.3/§7.9, v0.295): an IMPORTED body member
+            // (`m->decl == nullptr`, no ast::FieldDecl/PropertyDecl crosses
+            // the module boundary — the #3671-documented seam #4058's
+            // SEAM-DEBT block above named) is NOT necessarily
+            // uninitialised. The preamble loop directly above
+            // (`if (!skipPreambleFieldInit) { for (const sema::Symbol* m :
+            // fields) ... }`) runs UNCONDITIONALLY before this gate and
+            // already correctly services an imported body member when the
+            // exporter's wire carried an initializer across the module
+            // boundary — first via `importedInstanceFieldInitExpr` (the
+            // #2874/#3723 widened parsed-AST-expr replay that
+            // `emitOwnFieldInit` also uses), then via
+            // `importedConstValue`/`foldImportedConstText` (the #2467/#328
+            // const-fold replay — which #3723 widened from GENERIC to ALL
+            // imported record fields). #4058 declined this shape with the
+            // comment "deliberately conservative", but the preamble loop's
+            // own logic already gives the same answer the local-decl arms
+            // above give: "the preamble will set this slot correctly, so
+            // the fast path is sound." A member for which neither replay
+            // is available still falls through to the `return false` below
+            // (and the terminal Error arm, unchanged) — this only widens
+            // what the predicate accepts, mirroring the preamble loop's
+            // own success rather than re-deriving a coarser answer from
+            // `m->decl` alone (CLAUDE.md §6 — feed the same fact the
+            // preamble loop already computes, not a second drifting one).
+            // Per §9.3/§9.2/§7.9, accepting a member whose initializer is
+            // not visible would leave the slot at its `ConstantAggregateZero`
+            // default and silently read as zero — but the fold-replay path
+            // (line 9637+ above) guarantees a real value lands in the slot
+            // before construction completes, so admitting the fast path
+            // here is sound. Without this fix, a T8-shape cross-module
+            // call (T17 below, flipped from -999 to 51 by this fix) was
+            // over-rejected by the terminal Error arm.
+            if (m->decl == nullptr) {
+                if (ctx_.importedInstanceFieldInitExpr(m)) continue;
+                const std::string* text = ctx_.importedConstValue(m);
+                if (text && !text->empty()) continue;
+            }
+            return false;  // no initializer (and no imported replay available)
         }
         return true;
     }();

@@ -542,33 +542,87 @@ BEZEL_TEST(codegen_combined_record_secondary_ctor_arity_4039,
         51);
 }
 
-// T17 — CROSS-MODULE negative control: the T8 shape, but the record is
-// IMPORTED. `m->decl` is nullptr for every imported body member (no
-// `ast::FieldDecl`/`PropertyDecl` crosses the module boundary — the same
-// seam #3671's comment documents), so `bodyStorageAdmitsFastPath` cannot see
-// the exporter's initializer and stays conservative BY DESIGN (per the
-// #4058 issue's own scoping — an imported body member's initializer-
-// presence question is #2467/#3671/#3723, not folded in here). This must
-// still be a LOCATED compile-time Error, never a silent wrong value or a
-// crash — the exact hazard #4039 fixed in the first place.
+// T17 — CROSS-MODULE flip (fix #4103, §9.1/§9.3/§7.9, v0.295): the T8 shape
+// is now CORRECT across the module boundary. `bodyStorageAdmitsFastPath`
+// (LlvmBackend_Exprs2.cpp) used to decline every imported body member with
+// `m->decl == nullptr` because no `ast::FieldDecl`/`PropertyDecl` crosses
+// the module boundary — the #3671-documented seam — but the preamble loop
+// that runs UNCONDITIONALLY before this gate ALREADY services an imported
+// body member via `importedInstanceFieldInitExpr` (#2874/#3723 parsed-AST-
+// expr replay) and `importedConstValue`/`foldImportedConstText`
+// (#2467/#328/#3723 const-fold replay). The predicate now mirrors those
+// success paths instead of a coarser `m->decl`-alone answer, so a T8-shape
+// IMPORTED call must construct and run correctly — the runtime value
+// `9 + 42 = 51` proves the imported `extra := 42` was replayed into the
+// slot. Pre-#4103 this cell was a -999 decline (see the git history of
+// the T17 comment block), over-rejecting exactly what the preamble loop
+// could have answered; the fix flips it to the success path the cross-
+// module run already proved in the issue's control shape.
 BEZEL_TEST(codegen_combined_record_secondary_ctor_arity_4039,
-           cross_module_body_field_with_initializer_still_declines_spec_4058) {
+           cross_module_body_field_with_initializer_accepted_spec_4103) {
     const std::string lib =
-        "module Lib4058; "
-        "public record ComboXM4058(x: int) "
+        "module Lib4103; "
+        "public record ComboXM4103(x: int) "
         "  public extra: int := 42; "
         "  public constructor(a: int, b: int) this.x := a + b; end constructor; "
-        "end ComboXM4058;";
+        "end ComboXM4103;";
     const std::string app =
-        "module App4058; import Lib4058; "
-        "class Program4058 public static method Main(): int "
-        "  var r := new ComboXM4058(9); return r.x + r.extra; "
-        "end Main; end Program4058;";
-    // runXmod4039 collapses every compile failure to -999 (see its
-    // definition above) — it cannot distinguish a location from a crash,
-    // so this only pins "still rejected", not "rejected loudly". The LOCAL
-    // twin (T13/T15) already pins the located-not-crashed distinction via
-    // `failedAtCompileTimeWithRealLocation`; this cell shares the same
-    // `buildRecordValue` Error-reporting arm (b), not a separate one.
+        "module App4103; import Lib4103; "
+        "class Program4103 public static method Main(): int "
+        "  var r := new ComboXM4103(9); return r.x + r.extra; "
+        "end Main; end Program4103;";
+    BEZEL_EXPECT_EQ(runXmod4039(lib, app), 51);
+}
+
+// T17b — CROSS-MODULE body AUTO-PROPERTY with initializer (the
+// PropertyDecl/`autoInitializer` arm of the imported-axis fix, mirroring
+// T12's LOCAL twin). The preamble loop's parsed-expr path fires here
+// because `property extra: int := 42;` lowers to the same wire shape a
+// body field does; the `importedConstValue` fallback would also fire.
+BEZEL_TEST(codegen_combined_record_secondary_ctor_arity_4039,
+           cross_module_body_autoproperty_with_initializer_accepted_spec_4103) {
+    const std::string lib =
+        "module Lib4103b; "
+        "public record ComboXM4103b(x: int) "
+        "  public property extra: int := 42; "
+        "  public constructor(a: int, b: int) this.x := a + b; end constructor; "
+        "end ComboXM4103b;";
+    const std::string app =
+        "module App4103b; import Lib4103b; "
+        "class Program4103b public static method Main(): int "
+        "  var r := new ComboXM4103b(9); return r.x + r.extra; "
+        "end Main; end Program4103b;";
+    BEZEL_EXPECT_EQ(runXmod4039(lib, app), 51);
+}
+
+// T17c — CROSS-MODULE, MIXED: one body field WITH initializer + one body
+// field WITHOUT. Mirrors T15's LOCAL twin — the predicate must walk every
+// body-storage member, not just the first, and decline the fast path when
+// any one lacks a replayable initializer (the latter would leave its slot
+// at the `ConstantAggregateZero` default and silently read as zero — the
+// hazard this whole predicate exists to prevent). Soundness: the call
+// must still be a LOCATED compile-time Error, never a silent wrong value
+// or crash — the same hazard #4039 fixed in the first place and that
+// #4058's T15 already pinned on the LOCAL axis.
+BEZEL_TEST(codegen_combined_record_secondary_ctor_arity_4039,
+           cross_module_body_field_mixed_initializers_still_declines_spec_4103) {
+    const std::string lib =
+        "module Lib4103c; "
+        "public record ComboXM4103c(x: int) "
+        "  public extra: int := 42; "
+        "  public uninit: int; "
+        "  public constructor(a: int, b: int) this.x := a + b; end constructor; "
+        "end ComboXM4103c;";
+    const std::string app =
+        "module App4103c; import Lib4103c; "
+        "class Program4103c public static method Main(): int "
+        "  var r := new ComboXM4103c(9); return r.x + r.extra + r.uninit; "
+        "end Main; end Program4103c;";
+    // -999 == compile failure; the LOCAL twin (T15) pins "located not crash"
+    // via `failedAtCompileTimeWithRealLocation`. The `#4103 fix widens what
+    // the predicate ACCEPTS — a member for which neither replay path is
+    // available (no parsed-expr, no const-fold text) still falls through to
+    // `return false` and the terminal Error arm, so this shape is soundly
+    // declined cross-module too.
     BEZEL_EXPECT_EQ(runXmod4039(lib, app), -999);
 }
