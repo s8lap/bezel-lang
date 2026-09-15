@@ -14765,6 +14765,24 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
         dynamic_cast<const ast::CallExpr*>(init)) {
         recordCallResultInitOutermostClassWithRecordField_ = true;
     }
+    // fix #4239 (§27.5 / §28.9, v0.300): for a chain-call initializer
+    // (`var w := C.Make()()`), the CG60 arm in lowerCallExpr needs w's
+    // OWN slot so that scope-end disposal registration targets the right storage.
+    // Allocate the slot EARLY (before lowerExpr runs) and wire it to the CG60
+    // arm via pendingChainCallLocalSlot_. Only for CallExpr initializers —
+    // other expressions don't use pendingChainCallLocalSlot_ and must not be
+    // affected. Guard with !locals_.count(declNode) to avoid overriding a
+    // slot already set by smStateStruct_ handling.
+    if (!locals_.count(declNode) && dynamic_cast<const ast::CallExpr*>(init)) {
+        llvm::Type* slotTy = ptrTy();
+        llvm::AllocaInst* earlySlot = entryAlloca(slotTy);
+        locals_[declNode] = earlySlot;
+        pendingChainCallLocalSlot_ = earlySlot;
+    }
+    // fix #4239: also capture whatever slot will be used (may be set by
+    // smStateStruct_ block below). Must happen AFTER early slot assignment
+    // above but BEFORE lowerExpr, so the CG60 arm sees the slot.
+    pendingChainCallLocalSlot_ = locals_[declNode];
     llvm::Value* v = init ? lowerExpr(*init) : nullptr;
     expectedFunctionType_ = savedExpectedForLambdaDecl;
     // fix #4342: restore the flags (saved above) so a subsequent LocalDecl
@@ -15364,6 +15382,8 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
     }
     if (!slot) slot = entryAlloca(slotTy);
     locals_[declNode] = slot;
+    // fix #4239: update to the final slot (after smStateStruct_ reassignment)
+    pendingChainCallLocalSlot_ = slot;
     // CG-generic: record the concrete substitution for this local so that
     // method calls on it (e.g. sp2.GetFirst()) can recover the concrete type
     // args even when the sema type is still generic. Prefer the active

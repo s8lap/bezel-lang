@@ -2175,6 +2175,12 @@ private:
     // ROOT scope (the first scope it pushes) so they are auto-disposed on an
     // exception unwind out of the whole method. Cleared once registered.
     std::vector<std::pair<sema::Symbol*, llvm::AllocaInst*>> pendingOwnedParams_;
+    // fix #4239 (§27.5 / §28.9, v0.300): a chained call `var w := C.Make()()`
+    // in lowerLocalDecl — lowerExpr (CG60 arm) needs to store the closure-call
+    // result through the local's OWN slot (not a temp), and register disposal on
+    // that slot. Capture the slot BEFORE lowerExpr runs so the CG60 arm can use
+    // it; cleared after the CG60 arm consumes it.
+    llvm::AllocaInst* pendingChainCallLocalSlot_ = nullptr;
     // fix #633 / §33.4: when Main(args: Array<string>) is emitted, the args
     // array is built in the function prolog (before any scope opens) and must be
     // disposed at the function-body root scope exit.  This optional Disposal is

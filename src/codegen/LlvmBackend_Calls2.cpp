@@ -6842,6 +6842,26 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
         if (calleeTy && calleeTy->kind == sema::TypeRef::Kind::Function) {
             llvm::Value* closurePtr = lowerExpr(*call.callee);
             llvm::Value* ccRes = emitClosureCall(closurePtr, calleeTy);
+            // fix #4239 (§27.5 / §28.9, v0.300): when the chain-call result is
+            // a class/record type, store through the local's OWN slot and register
+            // scope-end disposal.  lowerLocalDecl wires the slot to us via
+            // pendingChainCallLocalSlot_ so we use the same slot the disposal
+            // will fire on.
+            if (calleeTy->funcReturn &&
+                calleeTy->funcReturn->kind == sema::TypeRef::Kind::Named &&
+                calleeTy->funcReturn->declaration &&
+                !calleeTy->funcReturn->nullable) {
+                llvm::AllocaInst* ccResSlot = pendingChainCallLocalSlot_;
+                if (!ccResSlot) {
+                    ccResSlot = builder_.CreateAlloca(
+                        ccRes->getType(), nullptr, "ccres.slot");
+                } else {
+                    pendingChainCallLocalSlot_ = nullptr;
+                }
+                builder_.CreateStore(ccRes, ccResSlot);
+                Disposal d{ccResSlot, calleeTy->funcReturn->declaration};
+                disposeStack_.back().push_back(d);
+            }
             // #422 / §28.9: release the transient closure after the call.
             // fix #3704 (narrowed) / §27.5 / §28.9 / §30.5 (v0.287):
             // mirror the Stmts.cpp:2626 mint gate at the chain-call
