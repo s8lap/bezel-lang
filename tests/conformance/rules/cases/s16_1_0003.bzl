@@ -3,8 +3,10 @@
 //! section: 16.1
 //! title: mixing bitwise AND with a range operand requires explicit parenthesization
 //! rule: Range (`..`, `..<`) with bitwise (`&`, `|`, `^`) is a mandatory-
-//!   parenthesization mix: "`mask & 0..n` is a compile error; write `(mask & 0)..n`
-//!   or `mask & (0..n)` to disambiguate."
+//!   parenthesization mix: "`mask & 0..n` is a compile error; write
+//!   `(mask & 0)..n` to disambiguate." The rule is syntactic — it reads the
+//!   operators' categories and whether an operand is parenthesized, never the
+//!   operands' types.
 //! cites: 16.1, 17.2
 //! expect: reject
 //! diagnostic: parenthesization

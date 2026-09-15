@@ -2,10 +2,10 @@
 //! doc: spec
 //! section: 11.7
 //! title: sealed abstract is rejected, the diagnostic naming closed
-//! rule: Through v0.241 the semantics were spelled as the modifier pair
-//!   sealed abstract; that spelling is rejected, the diagnostic naming
-//!   closed.
-//! cites: 11.7
+//! rule: Combining `closed` with `abstract`, `sealed`, or `static` is a
+//!   compile error; the modifier pair `sealed abstract` is rejected too, the
+//!   diagnostic naming `closed`.
+//! cites: 11.7, C.1
 //! expect: reject
 //! diagnostic: closed
 module Conf;

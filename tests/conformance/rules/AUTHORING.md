@@ -95,6 +95,26 @@ so in your report if you had to assume one.
 If you cannot pin the exact first line from the documents, the case is an
 `accept` case, or prints something derived that you *can* pin. Do not guess.
 
+### A `run` case that must also warn
+
+Some rules have two halves that only one program shows. §28.2's second
+`Dispose()` is a runtime no-op **and** draws the compile-time use-after-dispose
+warning (v0.299, #4399); §29.7's is the same shape. `warn` throws away the
+runtime observation that is half the rule, `run` cannot see the diagnostic, and
+two cases would duplicate the program and let the halves drift apart.
+
+A `run` case may therefore carry `warns: yes`, which asserts that the compile
+also said something. It takes `yes` or nothing, it is rejected on any other
+tier, and — as on a `warn` case — *which* diagnostic is the diagnostic report's
+business, not the gate's. The stated output is still checked in full: the
+warning is an additional requirement, never a way to pass without running right.
+
+```
+//! expect: run
+//! warns: yes
+//! output: disposed
+```
+
 ## The pairing rule
 
 **A reject case wants an accepting twin that differs by the smallest legal

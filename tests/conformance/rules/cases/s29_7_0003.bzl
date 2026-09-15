@@ -1,14 +1,17 @@
 //! case: s29_7_0003
 //! doc: spec
 //! section: 29.7
-//! title: a second Dispose() on a partially-consumed iterator is a no-op
-//! rule: When a consumer stops iterating early the iterator is disposed: the
-//!   state machine runs the pending cleanup actions active at the point of
-//!   suspension, transitions to a completed state, and a second `Dispose()` is
-//!   a no-op. `Dispose()` on any class instance is idempotent — the first call
-//!   performs the disposal, subsequent calls are no-ops (§28.2).
+//! title: a second Dispose() on a partially-consumed iterator performs no second disposal
+//! rule: The state machine runs the pending cleanup actions active at the
+//!   point of suspension and transitions to a completed state — the machine's
+//!   own bookkeeping, not a post-disposal guarantee to the consumer. A second
+//!   `Dispose()` **is** observable and is a no-op: it is the single member
+//!   §28.2's disposal contract keeps callable. The no-op is the runtime
+//!   contract only: the second call is also a use of the binding and draws
+//!   §28.2's use-after-dispose warning.
 //! cites: 29.7, 28.2
 //! expect: run
+//! warns: yes
 //! output: cleanup
 //!   done
 module Conf;

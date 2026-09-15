@@ -42,7 +42,7 @@ MAIN_RE = re.compile(r'\bmethod\s+Main\b')
 
 REQUIRED = ("case", "doc", "section", "title", "rule", "expect")
 KNOWN = REQUIRED + ("cites", "diagnostic", "stdout", "output", "issue", "notes",
-                    "flags")
+                    "flags", "warns")
 
 # Compiler switches a case may ask for. An allowlist, not a passthrough: a case
 # is data in a repository, and the runner executes what it says.
@@ -51,7 +51,8 @@ EXPECTS = ("accept", "quiet", "reject", "warn", "run")
 DOCS = ("spec", "stdlib")
 
 MANIFEST_COLUMNS = ("case-id", "doc", "section", "expect", "shape",
-                    "title", "rule", "cites", "check", "issue", "deps", "flags")
+                    "title", "rule", "cites", "check", "issue", "deps",
+                    "flags", "warns")
 
 
 class CaseError(Exception):
@@ -208,6 +209,16 @@ def check_case(path, text):
     if expect != "reject":
         problems.extend(end_label_problems(stem, body))
         problems.extend(implicit_constructor_problems(stem, body))
+    # `warns:` is the run tier's second half — see runner.evaluate. It says
+    # only THAT a diagnostic is required; which one is the diagnostic report's
+    # business, exactly as on a warn case.
+    if "warns" in fields and expect != "run":
+        problems.append("{}: `warns:` belongs only on a run case — a {} case "
+                        "states its diagnostic expectation by its tier"
+                        .format(stem, expect))
+    if fields.get("warns", "").strip() not in ("", "yes"):
+        problems.append("{}: `warns:` takes `yes` or nothing, not {!r}"
+                        .format(stem, fields.get("warns")))
     if expect == "run" and fields.get("stdout", "").strip() in ("true", "false"):
         problems.append("{}: a `bool` renders `True`/`False` (§8.5's worked "
                         "`IsEmpty: False`), not lowercase".format(stem))
@@ -425,6 +436,7 @@ def load_cases(cases_dir):
             "issue": fields.get("issue", ""),
             "deps": ";".join(deps),
             "flags": fields.get("flags", ""),
+            "warns": fields.get("warns", ""),
         })
     rows.sort(key=lambda r: _sort_key(r["case-id"]))
     return rows, problems

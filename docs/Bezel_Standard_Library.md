@@ -1,6 +1,6 @@
 # Bezel Standard Library Specification
 
-**Companion to the Bezel Language Specification, v0.299 — September 2026**
+**Companion to the Bezel Language Specification, v0.300 — September 2026**
 
 This document specifies the standard library types referenced by the language specification. The language spec assumes these types exist and have certain shapes; this document defines those shapes.
 
@@ -120,7 +120,9 @@ public static class Console
 end Console;
 ```
 
-The `Object` overloads invoke `ToString()`. For interpolated strings, the compiler resolves the `string` overload directly. A call to an `Object` overload whose argument is statically of primitive type is lowered without boxing (implementation guidance — not observable, and §1's performance disclaimer applies).
+The `Object` overloads invoke `ToString()`. For interpolated strings, the compiler resolves the `string` overload directly. A call to an `Object` overload whose argument is statically of primitive type is lowered without boxing (implementation guidance — not observable, and §1's performance disclaimer applies). A **`null`** argument to an `Object` overload renders as the four characters `null` — language spec [§18.5](Bezel_Language_Spec.md#sec-interpolated-strings)'s rendering for an absent interpolation hole — and no `ToString()` dispatch occurs, the implicit invocation being defined for present values only.
+
+**Line termination, and the stream properties (v0.300).** `WriteLine` writes its argument followed by `Environment.NewLine` ([§2.4](#sec-environment)); the no-argument `WriteLine()` writes `Environment.NewLine` alone. `Write` writes its argument with no terminator. `Console.Write` and `Console.WriteLine` **are** `Console.Out.Write` and `Console.Out.WriteLine`: one destination, so output written through the two spellings interleaves in call order. `Console.Error` is a separate destination, ordered against `Out` only as the host orders the two streams.
 
 `ReadKey()` blocks until one key (code point) is available and raises `EndOfStreamException` ([§7.5](#sec-io-exception-types); catching it by name requires `import System.IO;`) at end of input, where no key can exist. `ReadKeyOrNull()` (v0.231) is the [§1](#sec-failure-signal-rule) `*OrNull` tier beside it — `null` at end of input, the key otherwise — resolving the misfit the failure-signal rule recorded at v0.229: end of input is band 2's expected absence, and `char?` is exactly the `ReadLine` null-at-EOF analog the v0.195 note said was missing (`char` is a non-nullable value type, so `null` is unambiguous). `ReadKey` remains the assert-shaped throwing tier — end of input is a bug at its call sites. Whether the key is echoed is implementation-defined.
 
@@ -175,6 +177,8 @@ public static class Math
   public static pure method IEEERemainder(x: double, y: double): double;
 end Math;
 ```
+
+**What `Min`, `Max`, and `Clamp` compute (v0.300).** Ordering throughout is `T`'s `CompareTo` ([§2.8](#sec-icomparablet)). `Min(a, b)` returns `a` when `a.CompareTo(b) <= 0` and `b` otherwise; `Max(a, b)` returns `a` when `a.CompareTo(b) >= 0` and `b` otherwise — so a tie returns **`a`** in both, which is what fixes *which object* the call yields at a class or interface substitution, where the two arguments are distinguishable. `Clamp(value, low, high)` returns `low` when `value` compares less than `low`, `high` when it compares greater than `high`, and `value` otherwise.
 
 **Ownership at class-typed substitutions (v0.194).** `Min`, `Max`, and `Clamp` return one of their arguments. Under the bare-type-parameter rule (language spec [§28.3](Bezel_Language_Spec.md#sec-bare-type-parameter-returns)), at a class or interface substitution of `T` the call produces a **borrow** whose sources are the arguments: the caller takes no disposal obligation, and the result is usable only while every argument's source is live. At value and runtime-managed substitutions (the common numeric cases; `string`) no ownership attaches.
 
@@ -244,6 +248,8 @@ public static class Environment
   public static method Exit(exitCode: int);
 end Environment;
 ```
+
+`NewLine` is the host platform's line terminator: the one character U+000A on Unix-family platforms, the two characters U+000D U+000A on Windows. Its value is fixed for the process and does not vary with the destination written to; it is the terminator `WriteLine` appends ([§2.1](#sec-console), [§7.4](#sec-textreader-textwriter-directory-path)) and the one `StringBuilder.AppendLine` appends ([§3.1](#sec-stringbuilder)).
 
 `Variables()` (v0.231) returns a freshly-allocated `owned Dictionary<string, string>` (per the §1 convention for fresh-instance returns).
 
@@ -406,6 +412,8 @@ end TimeOnly;
 
 `DateTime.Date: DateOnly` and `DateTime.TimeOfDay: TimeOnly` accessors decompose a `DateTime`.
 
+**The tick, and the `From`/`Total` pairs (v0.300).** A **tick** is 100 nanoseconds — 10,000,000 to the second, 864,000,000,000 to the day. It is the unit of `Ticks` on both types and the resolution of every value either can hold; the `c` format's `.fffffff` tail ([§2.18](#sec-iformattable)) is that unit spelled out. `TimeSpan.From<Unit>(n)` is the span of `n` of that unit — `FromHours(1.5)` is ninety minutes — computed over ticks in `double` and truncated toward zero to a whole number of ticks, raising `OverflowException` when the result falls outside the tick range or the argument is `NaN` (the `*` operator's contract above). `Total<Unit>` is the whole span measured in that unit, fractional part included, so `Total<Unit>` of `From<Unit>(n)` is `n` up to that truncation; the integer components (`Days`, `Hours`, `Minutes`, `Seconds`, `Milliseconds`) are the span's decomposition, each within its stated range and carrying the span's sign. `(TimeSpan.FromDays(1) - TimeSpan.FromHours(1)).TotalHours` is therefore `23.0`, and that span's `Hours` is `23`.
+
 The `ArgumentOutOfRangeException` these constructors raise is declared here (v0.182), deriving from `ArgumentException` so that an `ArgumentException` catch arm covers the whole argument-validation family (language spec [§31.2.1](Bezel_Language_Spec.md#sec-arm-patterns)); it lives in the auto-imported `System` alongside its producers:
 
 ```bezel
@@ -430,7 +438,7 @@ public record Guid: IComparable<Guid>, IEquatable<Guid>
   // bytes (stated explicitly — .NET's field-group order is a known trap);
   // ordering is CompareTo only — no <,>,<=,>= overloads are declared.
   public method CompareTo(other: Guid): int;
-  public static method FromByteArray(bytes: Array<byte>): Guid;   // borrows; requires Count = 16, ArgumentException otherwise
+  public static method FromByteArray(bytes: Array<byte>): Guid;   // borrows; raises ArgumentException unless Count = 16
   public static readonly property Empty: Guid;
 
   public static method NewGuid(): Guid;
@@ -478,6 +486,8 @@ public class Random
 end Random;
 ```
 
+**Seeded generation is deterministic (v0.300).** A `Random` constructed with an explicit `seed` reads nothing outside the process: the values it produces are a function of that seed and of the sequence of calls made on the instance, so two instances constructed with the same seed and driven with the same calls produce the same values. The parameterless constructor is the one [§1](#sec-conventions) designates a replay-intercept point. The generating algorithm is **not** specified: the sequence a seed names is reproducible within one implementation and is not guaranteed across implementations or revisions, so a program that must reproduce an exact sequence carries its own generator.
+
 For cryptographic randomness, see `System.Security.Cryptography` (a future module).
 
 <a id="sec-icomparablet"></a>
@@ -517,7 +527,7 @@ public interface IAsyncDisposable
 end IAsyncDisposable;
 ```
 
-Every class implicitly implements `IDisposable` (language spec [§28.2](Bezel_Language_Spec.md#sec-the-idisposable-contract)); user code does not implement it directly. The interface is declared here so that generic constraints (`where T: IDisposable`) and explicit interface variables (`var d: IDisposable := someInstance;`) refer to a named declaration in the standard library rather than a language built-in.
+Every class implicitly implements `IDisposable` (language spec [§28.2](Bezel_Language_Spec.md#sec-the-idisposable-contract)); user code does not implement it directly — a class or record declaring a member named `Dispose`, at any parameter list, is a compile error at that declaration (language spec [§28.2](Bezel_Language_Spec.md#sec-the-idisposable-contract)). The interface is declared here so that generic constraints (`where T: IDisposable`) and explicit interface variables (`var d: IDisposable := someInstance;`) refer to a named declaration in the standard library rather than a language built-in.
 
 `IAsyncDisposable` is implemented explicitly by classes that need asynchronous cleanup (language spec [§28.12](Bezel_Language_Spec.md#sec-asynchronous-disposal)). Implementations declare a method matching `DisposeAsync(): Task` and add `async` to the implementation; `async` is an implementation-side modifier and never appears on the interface declaration. A class that implements `IAsyncDisposable` should also declare a `destructor` for the synchronous fallback path.
 
@@ -536,6 +546,8 @@ public class Subscription
   destructor;       // removes the registration
 end Subscription;
 ```
+
+`Subscription` declares no constructor, so `new Subscription(...)` is a compile error at any argument list (language spec [§17.7](Bezel_Language_Spec.md#sec-the-new-operator)'s closed-constructor-surface rule); an instance is obtained only from a registration call.
 
 `Subscription` is returned from `IEvent<T>.Subscribe` ([§6.5](#sec-events-ievent-eventsource)), from `IAsyncEvent<T>.Subscribe` ([§6.5](#sec-events-ievent-eventsource)), from `CancellationToken.Register` ([§6.1](#sec-cancellationtoken-and-cancellationtokensource)), and from analogous register-and-unregister APIs. Methods returning a `Subscription` annotate the return type as `owned Subscription` so that the caller's leak-prevention obligation is explicit.
 
@@ -581,7 +593,7 @@ The method names use the sized record-type names (`Int32`, `Int64`) consistently
 <a id="sec-the-type-class"></a>
 ### 2.13 The `Type` class
 
-`Type` is the runtime type-identity token. A `Type` value is obtained from the `typeof(T)` operator (language spec [§17.10](Bezel_Language_Spec.md#sec-the-typeof-operator)) for a statically named type, or from `value.GetType()` (language spec [§8.2](Bezel_Language_Spec.md#sec-gettype)) for the runtime type of a value. The runtime guarantees exactly one `Type` instance per distinct type, so reference equality and `=` coincide; `Type` is a valid `Dictionary` key.
+`Type` is the runtime type-identity token. A `Type` value is obtained from the `typeof(T)` operator (language spec [§17.10](Bezel_Language_Spec.md#sec-the-typeof-operator)) for a statically named type, or from `value.GetType()` (language spec [§8.2](Bezel_Language_Spec.md#sec-gettype)) for the runtime type of a value. The runtime guarantees exactly one `Type` instance per distinct type, so reference equality and `=` coincide; `Type` is a valid `Dictionary` key. `Type` is **runtime-managed** (language spec [§28.9](Bezel_Language_Spec.md#sec-runtime-managed-types)): a `Type` value carries no ownership classification, `Dispose()` on one is a no-op, `owned Type` is inadmissible in every position, and a `Type`-returning member — instance or `static` — needs no ownership marker.
 
 > ⚠ **Spec-ahead-of-implementation (v0.287, [#3819](https://github.com/s8lap/bezel-lang/issues/3819)):** the lattice members below — `BaseType`, `IsAssignableFrom`, the kind predicates (`IsClass`, `IsEnum`, and their siblings), `EnumNames`, `EnumValues`, and `FullName` — have no compiler support: no sema arm and no codegen arm carries any of their names, and the runtime `Type` token itself is not yet emitted (`typeof(T)` is rejected in codegen, #487; `GetType()` in sema, #511), so no member of this class is reachable from a running program today. The `Name`/`FullName` rendering rules are exercised only through language spec §8.5's default `ToString`. The surface below is the normative contract the implementation will meet.
 
@@ -1068,7 +1080,7 @@ Usage notes:
 
 *(v0.203: `ContractViolationException` — a `requires`/`ensures`/`invariant` clause evaluated `false`; language spec [§22.16](Bezel_Language_Spec.md#sec-contract-clauses), [§31.4](Bezel_Language_Spec.md#sec-standard-exception-types).)*
 
-The built-in exception hierarchy — `Exception` and the types available without `import` — is normative in the language spec ([§31.4](Bezel_Language_Spec.md#sec-standard-exception-types)); this document does not repeat it. Exceptions whose producers live in this document require the producer's `import` and are declared alongside it (e.g. `KeyNotFoundException` in [§4.8](#sec-dictionaryk-v), the IO exceptions in [§7.5](#sec-io-exception-types)).
+The built-in exception hierarchy — `Exception` and the types available without `import` — is normative in the language spec ([§31.4](Bezel_Language_Spec.md#sec-standard-exception-types)); this document does not repeat it. Exceptions whose producers live in this document require the producer's `import` and are declared alongside it (e.g. `KeyNotFoundException` in [§4.8](#sec-dictionaryk-v), the IO exceptions in [§7.5](#sec-io-exception-types)). Their **constructor surface** is the language spec's rule: a type declared here with no constructor shown carries `Exception`'s `()`, `(message)`, and `(message, cause)`; one that shows constructors carries exactly those.
 
 The exception types that carry declared surface beyond `Exception`'s are enumerated by reference rather than counted: the built-ins `ArgumentException` (`ParamName` — language spec [§31.4](Bezel_Language_Spec.md#sec-standard-exception-types)) and `TypeInitializationException` (below), and the producer-local `SerializationException` (`Offset`/`Line`/`Column` — [§2.15](#sec-concrete-serialization-formats)) and `DomainFaultedException` (`FaultStackTrace` — [§6.8](#sec-domain)). Of these, `TypeInitializationException` is recorded here for completeness:
 
@@ -1099,7 +1111,7 @@ Auto-imported. String interpolation dispatches a hole's format spec here (langua
 |---|---|---|
 | Integers (`int`, `long`, `byte`, …) | `D`/`Dn` decimal (n = min digits, zero-padded) · `X`/`x` hex (upper/lower, `Xn` pads) · `B` binary | no grouping separators (no culture) |
 | Floating (`double`, `float`) | `F`/`Fn` fixed-point (n decimals, default 2) · `E`/`En` scientific · `G`/`Gn` general · `P`/`Pn` percent (×100, `%` suffix) · `R` round-trip | `R` and the **no-format `ToString()`** both produce the shortest string that parses back to the identical value (round-trip guarantee, v0.172) |
-| `decimal` | `F`/`Fn`, `E`/`En`, `G`, `P`/`Pn` | exact decimal semantics |
+| `decimal` | `F`/`Fn`, `E`/`En`, `G`, `P`/`Pn` | exact decimal semantics; `G` and the **no-format `ToString()`** both produce the exact shortest form ([§9.3](#sec-decimal)) |
 | `DateTime`, `DateOnly`, `TimeOnly` | pattern strings of `yyyy` `MM` `dd` `HH` `mm` `ss` `fff` plus literal separators | e.g. `yyyy-MM-dd HH:mm:ss`; no-format `ToString()` is ISO 8601 |
 | `TimeSpan` | `c` (constant: `[-][d.]HH:mm:ss[.fffffff]`) | no-format = `c` |
 | `Guid` | `D` (hyphenated, lowercase), `N` (no hyphens) | no-format = `D` |
@@ -1110,6 +1122,8 @@ Auto-imported. String interpolation dispatches a hole's format spec here (langua
 **`decimal` midpoint rule (v0.230).** For a `decimal` operand, digit reduction under `F`/`Fn`, `P`/`Pn`, and `E`/`En` rounds a midpoint **half-to-even** (banker's rounding), agreeing with `Decimal.Round` ([§9.3](#sec-decimal)): `0.125m` under `F2` renders `"0.12"`, and `P`/`E` apply the same rule to their scaled digit strings — the format specifiers and `Round` are two spellings of one rounding operation and never disagree at a midpoint.
 
 **Temporal patterns: non-specifier characters are literals (v0.230).** In a temporal pattern (`DateTime`, `DateOnly`, `TimeOnly`), every character that does not begin one of the specifiers above is a **literal**, copied to the output verbatim — `T`, `Z`, `-`, `:`, space, and any other non-specifier character alike; the unrecognized-specifier fault governs malformed runs of the specifier letters (`y` `M` `d` `H` `m` `s` `f`), not literal characters. The temporal specifier vocabulary grows only by recorded ruling, and never in a way that reinterprets a character that passes through as a literal — a new specifier letter would be a breaking change for every pattern using it as a literal, and this section's default answer to such a proposal is no.
+
+**Temporal field widths (v0.300).** Each of the seven specifiers renders a fixed-width, zero-padded field of exactly its own letter count: `yyyy` four digits (year 42 renders `0042`), `MM`, `dd`, `HH`, `mm`, and `ss` two each (day 5 renders `05`, hour 0 renders `00`), and `fff` three — the millisecond component. A field is never widened, never trimmed, and never grouped; a run of one of the specifier letters at any other length is the malformed run the paragraph above faults.
 
 <a id="sec-static-abstractions"></a>
 ### 2.19 `INumber<T>`, `ISteppable<T>`, `IParsable<T>`, and the collection-literal target pair (v0.176, #807)
@@ -1333,6 +1347,8 @@ end StringBuilder;
 ```
 
 Methods return `this` to allow chaining.
+
+`AppendLine(value)` appends `value` followed by `Environment.NewLine` ([§2.4](#sec-environment)); `AppendLine()` appends the terminator alone. No `Append` overload appends a terminator.
 
 **Contracts (v0.195).** `AppendFormat`'s format string contains literal text and holes `{n}` — `n` a zero-based index into `args` — each hole optionally carrying a format spec after a colon (`{0:F2}`), interpreted per the §2.18 vocabulary against the argument's runtime type; `{{` and `}}` escape literal braces. A malformed format string, a hole index outside `args`, or a spec against a type that accepts none raises `FormatException`. `Insert` and `Remove` raise `IndexOutOfRangeException` when the index or the `(startIndex, length)` window falls outside `0..Length`; `Replace` raises `ArgumentException` when `oldValue` is empty.
 
@@ -1562,6 +1578,10 @@ The two hierarchies do *not* share mutating interfaces. `IList<T>` (borrowing) a
 For draining iteration that transfers ownership, the owning collections expose `Drain()` returning `IOwningEnumerable<T>` (declared in [§4.13](#sec-owning-enumeration-interfaces)).
 
 Every collection's element semantics — what `Add`, `Remove`, `Clear`, the indexer, iteration, and `Dispose` do with the elements — derive from the element slot policy of language spec [§28.11](Bezel_Language_Spec.md#sec-element-slot-policy): the collection's family and the element type's category determine the slot kind, and the slot kind determines every element operation. The per-type sections below present that table for each concrete type; they introduce no element semantics of their own. The storage primitive embodying the owning column is `OwningBuffer<T>` ([§4.14](#sec-owned-buffers-and-spans)).
+
+**Empty-collection egress (v0.300).** On an empty collection, `Pop`, `PopFirst`, `PopLast`, `Dequeue`, and `Peek` raise **`InvalidOperationException`** — that is what *raises if empty* means wherever the per-type sections below write it ([§4.5](#sec-ownedarrayt), [§4.7](#sec-ownedlinkedlistt), [§4.11](#sec-stackt-ownedstackt-queuet-and-ownedqueuet)), and it is the type [§4.17](#sec-sorted-dictionary)'s `FirstKey`/`LastKey`, [§4.18](#sec-sorted-set)'s `First`/`Last`, and [§5](#sec-system-collections-linq)'s `First`/`Last`/`Single` already name for the same condition. Taking from an empty collection is a state violation, [§1](#sec-failure-signal-rule)'s band 1; the `Try` twins (`TryPop`, `TryPopFirst`, `TryPopLast`, `TryDequeue`, `TryPeek`) are the branch-shaped tier and return `false` instead. **`PopAt(index)` is governed by its index rather than by emptiness**: an `index` outside `0..<Count` raises `IndexOutOfRangeException`, the document-wide bounds fault, which on an empty receiver is every index — so the `= PopAt(0)` and `= PopAt(Count - 1)` glosses on `PopFirst`/`PopLast` name the position each selects, not the fault it raises.
+
+**`Clear()`'s disposal order (v0.300).** An owning collection's `Clear()` disposes the elements it holds in the order its own `Dispose()` does — reverse insertion for the ordered families (`OwningArray`, `OwningLinkedList`, `OwningStack`, `OwningQueue`), implementation-defined for the unordered (`OwningDictionary`, `OwningSet`) — and keeps the emptied collection (language spec [§28.11](Bezel_Language_Spec.md#sec-element-slot-policy)). `Remove`, `RemoveAt`, and an indexer-set dispose one element and raise no ordering question. A borrowing collection's `Clear()` disposes nothing ([§4.1](#sec-borrowing-collection-interfaces)).
 
 <a id="sec-arrayt"></a>
 ### 4.4 `Array<T>`
@@ -1809,10 +1829,11 @@ public class OwningArray<T>: IOwningList<T>, IOwningEnumerable<T>, IOwningCollec
 
   public method Clear()
     for var i in 0..<_count do
-      var item := move _storage[i];                // item: T? (owned)
-      _storage[i] := null;                          // restore moved-from slot
+      var slot := _count - 1 - i;                  // reverse index order
+      var item := move _storage[slot];             // item: T? (owned)
+      _storage[slot] := null;                       // restore moved-from slot
       item!.Dispose();                              // slot was non-null
-                                                     //   (i < _count guarantees it)
+                                                     //   (slot < _count guarantees it)
     end;
     _count := 0;
   end Clear;
@@ -3559,6 +3580,9 @@ public extension IEnumerable<T>
   public method Average(selector: (T) -> float): float;      // v0.195
   public method Average(selector: (T) -> double): double;
   public method Average(selector: (T) -> decimal): decimal;
+                                               // Min/Max/Average, selector and no-selector forms alike:
+                                               //   InvalidOperationException on an empty source (§5's
+                                               //   empty-source rule); Sum returns zero, Aggregate seed
   public method Aggregate<TAccum>(seed: TAccum, fold: (TAccum, T) -> TAccum): TAccum;
 
   // Ordering
@@ -3639,8 +3663,8 @@ The predicate overloads of `First`, `Last`, and `Single` (and their `*OrNull` fo
 
 ```bezel
 public extension IEnumerable<T> where T: IComparable<T>
-  public method Min(): T;              // throws if empty
-  public method Max(): T;              // throws if empty
+  public method Min(): T;              // InvalidOperationException if empty
+  public method Max(): T;              // InvalidOperationException if empty
   public method MinOrNull(): T?;       // null if empty
   public method MaxOrNull(): T?;       // null if empty
 end;
@@ -3658,7 +3682,7 @@ end;
 
 ```bezel
 public extension IEnumerable<int>
-  public method Average(): double;
+  public method Average(): double;   // InvalidOperationException if empty (every Average form)
 end;
 
 public extension IEnumerable<long>
@@ -3752,6 +3776,8 @@ using var cts := CancellationTokenSource.CreateLinked(callerToken, timeoutSrc.To
 
 **Timeout-as-a-scope needs no new type.** The RFC's `CancellationScope` sketch is already expressible: the source's destructor *cancels on dispose*, so `using var cts := CancellationTokenSource.WithCancelAfter(delay);` **is** a cancellation scope — auto-cancelled at scope exit or on timeout, whichever first. Disposal performs a **full `Cancel()`** (v0.195): registered callbacks that have not yet run are invoked synchronously on the disposing thread *before* the registration list is severed — `Register`-based cleanup therefore fires at scope exit, and §28.14's quiescence (no callback after disposal completes) holds. Recorded as the idiom rather than a wrapper type (see the v0.173 rationale entry).
 
+**`ThrowIfCancellationRequested()` (v0.300).** Raises `OperationCanceledException` (language spec [§31.4](Bezel_Language_Spec.md#sec-standard-exception-types)) when cancellation has been requested on the token's source, and returns with no effect otherwise — the polling half of the signal-only idiom above, asking the same question `IsCancellationRequested` answers as a value. `CancellationToken.None` has no source and is never in the cancelled state, so it never raises. It is the same raise a compiler-generated async iterator's `MoveNextAsync()` performs implicitly on the enumerator's token (language spec [§30.7](Bezel_Language_Spec.md#sec-async-iterators)).
+
 `Register` invokes the callback when cancellation is requested; the returned `Subscription` removes the registration when disposed. The `callback` parameter is `scoped` (spec [§28.14](Bezel_Language_Spec.md#sec-scoped-callback-parameters)): the registration stores the callback bounded by the returned `Subscription` (the owned-return bounding form — `using var reg := token.Register(...)`), and disposal severs the registration, which is the quiescence guarantee.
 
 If the token is **already in the cancelled state** at the moment `Register` is called, the callback is invoked synchronously on the calling thread before `Register` returns, and the returned `Subscription` is one whose `Dispose()` is a no-op (the registration was never installed because there was nothing to install — cancellation has already happened). Code receiving the `Subscription` should not assume the callback has not yet run.
@@ -3832,6 +3858,8 @@ end;
 
 **Blocking discipline (v0.179; spec §30.12).** `Acquire()` and `TryAcquire(timeout)` block the calling thread. They are rejected at compile time inside `async` methods and `async` lambdas (use `AcquireAsync`/`TryAcquireAsync`); where a non-`async` helper reached from a domain continuation would actually park in them, the runtime raises `InvalidOperationException` instead. They remain fully legal on the startup thread and on FFI foreign threads (outside any domain), and when the mutex is immediately available.
 
+**Non-reentrant (v0.300; language spec [§30.12](Bezel_Language_Spec.md#sec-thread-synchronization)).** A `Mutex` does not track its holder: a holder that acquires it again **waits on itself**, in every acquisition form — the blocking forms park (or hit the runtime guard above where a domain continuation would park), the `Async` forms never complete, and `TryAcquire`/`TryAcquireAsync` return `null` at the timeout. A nested critical section acquires once and passes the guard; it never re-acquires. `Locked<T>` and `RwLocked<T>` ([§6.11](#sec-locked-and-rwlocked)) carry the same posture.
+
 **Cancellation of async acquisition (v0.195; the §30.8 convention made concrete).** Cancelling the token of a pending `AcquireAsync`/`TryAcquireAsync` faults the returned task with `OperationCanceledException`, and a cancelled acquisition **never holds the mutex**: an acquisition racing cancellation is released internally before the fault surfaces — the give-back shape of §6.9's receive abandonment — so `using var g := await m.AcquireAsync(tok);` cannot leak a held lock on the cancellation path. In the `Try*Async` forms, timeout completes the task with `null` and cancellation faults it; a wait that both timed out and was cancelled reports whichever the implementation observed first. The same contract applies verbatim to `Semaphore` ([§6.3](#sec-semaphore)) and to the `Locked<T>`/`RwLocked<T>` acquisition families ([§6.11](#sec-locked-and-rwlocked)).
 
 <a id="sec-semaphore"></a>
@@ -3854,6 +3882,8 @@ end SemaphoreToken;
 ```
 
 `Acquire()` and `TryAcquire(timeout)` follow the same blocking discipline as `Mutex`'s (v0.179; spec §30.12): compile error inside `async` bodies, runtime `InvalidOperationException` where a domain continuation would park in them, legal outside domains. The async forms follow §6.2's cancellation contract (v0.195): fault with `OperationCanceledException`, a cancelled acquisition never holds the permit, null-on-timeout in the `Try` forms.
+
+**Permits (v0.300; language spec [§30.12](Bezel_Language_Spec.md#sec-thread-synchronization)).** A `Semaphore` holds a count of **permits**, `initialCount` of them at construction. Each successful acquisition consumes one and yields the `SemaphoreToken` that holds it; disposing the token returns it. An acquisition attempted while no permit remains waits — `Acquire`/`AcquireAsync` until one is returned, `TryAcquire`/`TryAcquireAsync` until then or until the timeout, whichever comes first. A holder acquiring again is **not** re-entrancy and is not a deadlock: it consumes a second permit and is legal while permits remain (contrast `Mutex`, [§6.2](#sec-mutex-and-lock)).
 
 **Sendability (language spec [§30.14](Bezel_Language_Spec.md#sec-sendable-types)).** `Semaphore` is **sendable** and internally synchronized — like `Mutex` ([§6.2](#sec-mutex-and-lock)) it may be reached by multiple domains simultaneously; that is its purpose (`Shared<Semaphore>` is the cross-domain sharing idiom, language spec §28.13). `SemaphoreToken` is **not** sendable: a held permit is bound to the acquiring domain and released there, like `Lock` ([§6.2](#sec-mutex-and-lock)) — moving a held permit between domains would decouple acquisition from release.
 
@@ -4900,6 +4930,8 @@ public abstract class TextWriter
 end TextWriter;
 ```
 
+`TextWriter`'s `WriteLine` members write the argument followed by `Environment.NewLine` ([§2.4](#sec-environment)), the no-argument form writing the terminator alone, and its `Write` members write no terminator — [§2.1](#sec-console)'s rule, of which `Console.Out` and `Console.Error` are instances; a `null` argument to a `Write`/`WriteLine` `Object` overload renders as the four characters `null`, as it does there.
+
 `TextReader`'s reads and `TextWriter`'s writes are **synchronous** and may block the calling domain for the I/O's duration — the §30.12 pool-starvation hazard, with no compiler/runtime backstop for I/O (the §7.1 v0.184 classification, applied to the text surface; v0.195). The types offer no async counterparts; asynchronous text I/O is deferred to the concrete stream family (proposal 0006).
 
 `Directory` and `Path` (v0.165, #1356):
@@ -5025,6 +5057,8 @@ end Int32;
 
 Records implement `IEquatable<T>` implicitly through the auto-generated equality (language spec [§9.2](Bezel_Language_Spec.md#sec-body-records)): `Equals(other: int): bool` exists on `Int32` and is invoked when calling `someInt.Equals(otherInt)` directly or when an `IEquatable<int>`-constrained generic uses `Equals` through the constraint. The same convention applies to every primitive declaration in [§9.1](#sec-integer-types)–[§9.5](#sec-char).
 
+**The radix alphabet (v0.300).** The digits of radix *r* are the first *r* of `0`–`9` then `A`–`Z`; for the admitted radices that is `0`/`1`, `0`–`7`, `0`–`9`, and `0`–`9` with `A`–`F`. `Parse(s, radix)` and `TryParse(s, radix, …)` accept **either case** of the letter digits — `int.Parse("ff", 16)` and `int.Parse("FF", 16)` are both `255` — under the input grammar the string forms carry throughout: an optional leading `+` or `-`, then one or more digits of that radix, and nothing else; no whitespace, no `0x`/`0b` prefix, no digit separators, and any other input raises `FormatException`, a value outside the type's range raising `OverflowException`. `ToString(radix)` emits the **lower-case** digits — a `-` for a negative value followed by the magnitude's digits most significant first, a single `0` for zero, never a leading zero otherwise — and takes the same radix set, raising `ArgumentException` for any other. The two are therefore inverse: `T.Parse(n.ToString(radix), radix)` is `n` for every value of every integer type and every admitted radix. `Convert.ToString(value, toBase)` ([§2.3](#sec-convert)) emits the same text as `ToString(radix)`.
+
 The span overloads (v0.222, #1810) accept exactly the inputs the string forms accept — same `FormatException`/`OverflowException` contract, no whitespace tolerance (v0.137) — over a `ReadOnlyStringSpan` window without materializing a substring; `TryParse` is shape (c) of the §1 Try convention. `IParsable<T>` (§2.19) is unchanged — the span forms are per-type members, not constraint surface. The `ParseOrNull` members (v0.231) are the §1 `*OrNull` convenience tier's parse form — string input only, no radix or span duals — and share the span forms' per-type, non-constraint status.
 
 <a id="sec-double-and-float"></a>
@@ -5062,6 +5096,8 @@ public record Double: IComparable<double>, IEquatable<double>
   public pure method CompareTo(other: double): int;
 end Double;
 ```
+
+**The classification predicates (v0.300).** Each `Is*` member reports the operand's IEEE 754 class and is **total** — every value gets an answer, and none of them raises. `IsNaN(v)` is `true` exactly when `v` is a NaN, of either sign and any payload, signaling or quiet; `IsPositiveInfinity(v)` and `IsNegativeInfinity(v)` exactly at `+∞` and `−∞`; `IsInfinity(v)` at either; and `IsFinite(v)` exactly when `v` is neither a NaN nor an infinity — every finite value, subnormals and both zeros included. The five are classifications of the operand alone and never consult the `=` operator.
 
 `IeeeEquals` returns `false` for any pair involving `NaN`, including `NaN`-vs-`NaN`. `BitwiseEquals` returns `true` only when the two `double` values have identical bit patterns; it distinguishes `+0.0` from `-0.0` and distinguishes signaling from quiet NaN payloads. The default `=` operator is the reflexive form described in language spec [§4.3.1](Bezel_Language_Spec.md#sec-equality-semantics-for-floating-point-types).
 
@@ -5129,6 +5165,8 @@ public record Decimal: IComparable<decimal>, IEquatable<decimal>
 end Decimal;
 ```
 
+**Rendering and range (v0.300).** The no-format `ToString()` — the rendering an interpolation hole with no specifier uses, and what the `G` specifier produces ([§2.18](#sec-iformattable)) — is the value's exact decimal form and nothing more: a `-` when the value is negative, the integer digits (a single `0` when the magnitude is below one), and, when the value has a fractional part, a `.` followed by the fractional digits. There is no exponent, no grouping separator, and no trailing-zero padding, because **scale is not part of a `decimal`'s value**: `1.50m` and `1.5m` are one value and both render `1.5`, `10m` renders `10`, and `0m` renders `0` — which is what makes `=` on `decimal` plain value equality (language spec [§4.3.1](Bezel_Language_Spec.md#sec-equality-semantics-for-floating-point-types)). `MaxValue` is `79228162514264337593543950335` and `MinValue` is `-79228162514264337593543950335` — the range language spec [§4.4](Bezel_Language_Spec.md#sec-decimal)'s 28–29 significant decimal digits describe; `Zero` is `0m` and `One` is `1m`.
+
 `Parse` accepts an optional leading sign (`+`/`-`) followed by decimal digits with at most one `.`; **surrounding whitespace is not accepted** and raises `FormatException` (specified in v0.137 — the strict-fault model of `Encoding` ([§3.2](#sec-encoding)) applies: silent tolerance hides data problems; a caller that means to accept padded input trims explicitly). A value outside the representable range raises `OverflowException`. `TryParse` returns `false` in every case where `Parse` would raise.
 
 <a id="sec-boolean"></a>
@@ -5177,6 +5215,8 @@ public record Char: IComparable<char>, IEquatable<char>
   public pure method CompareTo(other: char): int;
 end Char;
 ```
+
+**The classification predicates (v0.300).** Each `Is*` member tests the argument's Unicode character properties; every one is **total** — each `char` gets an answer, and none of them raises. `IsDigit(c)` is `c`'s general category being `Nd` (decimal digit number); `IsLetter(c)` is one of `Lu`, `Ll`, `Lt`, `Lm`, `Lo`; `IsLetterOrDigit(c)` is `IsLetter(c) or IsDigit(c)`; `IsUpper(c)` is `Lu` and `IsLower(c)` is `Ll`; `IsControl(c)` is `Cc`; `IsPunctuation(c)` is one of `Pc`, `Pd`, `Ps`, `Pe`, `Pi`, `Pf`, `Po`; and `IsWhiteSpace(c)` is `c` carrying the Unicode `White_Space` property. `ToUpper`/`ToLower` apply the **simple** case mapping — one code point to one, unconditional, no locale tailoring; a sibling of, not identical to, the simple case *folding* [§9.6](#sec-string)'s `ignoreCase` comparisons apply — and return the argument unchanged where it has none. `IsDigit` is **not** the alphabet the parses read: [§9.1](#sec-integer-types)'s and [§9.3](#sec-decimal)'s `Parse` families accept the ASCII digits `0`–`9` and nothing else.
 
 `Parse` accepts a string containing **exactly one code point** (`s.Length = 1`, [§9.6](#sec-string)'s code-point count) and returns that code point; any other input — the empty string or a multi-code-point string — raises `FormatException`. There is no whitespace tolerance and no recognition of escape sequences: escapes are source-lexical ([language spec §1](Bezel_Language_Spec.md)), so `char.Parse("\u0041")` receives the one-character string `"A"`, while a six-character `\u0041` sequence in runtime data is simply a six-code-point string and raises. (The strict-fault model of [§3.2](#sec-encoding) and `Decimal.Parse`, [§9.3](#sec-decimal).) `TryParse` returns `false` in every case where `Parse` would raise; the out slot gets `'\0'` — `default(char)`, language spec [§17.11](Bezel_Language_Spec.md#sec-the-default-operator) (the shape-(c) `default(T)`, [§1](#sec-conventions)). These are the members [§2.19](#sec-static-abstractions)'s `IParsable<char>` conformance witnesses. (v0.222, #1792.)
 
@@ -5292,6 +5332,8 @@ end String;
 ```
 
 `Replace`, `Trim`, `ToUpper`, etc. return new `string` values; `string` is immutable. A `StringBuilder` ([§3.1](#sec-stringbuilder)) is appropriate for accumulation.
+
+**`IsNullOrWhiteSpace` (v0.300).** Returns `true` when `value` is `null`, when it is the empty string, and when every one of its code points satisfies `Char.IsWhiteSpace` ([§9.5](#sec-char)); `false` otherwise. The member is total over `string?` — the nullable parameter admits the null and the member answers it, so no narrowing is needed at the call.
 
 **`Split` contract (v0.195).** Splitting yields every (possibly empty) segment between separator occurrences: adjacent separators yield an empty element between them, and a leading or trailing separator yields a leading or trailing empty element. A separator that never occurs yields the one-element array `[s]`; splitting the empty string yields `[""]`. There is no remove-empty-entries option — tokenizers filter explicitly: `line.Split(seps).Where(lambda(w) => w.Length > 0)` ([§5](#sec-system-collections-linq), auto-imported). The `separators: Array<char>` form splits at any listed code point.
 

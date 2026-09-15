@@ -3,8 +3,12 @@
 //! section: 29.1
 //! title: a plain-var binding of a manually-obtained enumerator auto-drops with the must-use warning
 //! rule: though a plain `var` binding is also legal and auto-drops at scope
-//!   end with the must-use warning.
-//! cites: 29.1, 28.3
+//!   end with the must-use warning. The binding's producer is declared
+//!   `owned IEnumerator<int>`, and §28.9's trivial-dispose ceremony exemption
+//!   — over the obligation at every holder form, keyed on the produced type
+//!   where the drop site has a statically-known producer — never reaches an
+//!   interface-typed binding, whose conformance set is open across modules.
+//! cites: 29.1, 28.3, 28.9
 //! expect: warn
 //! diagnostic: must use
 module Conf;
