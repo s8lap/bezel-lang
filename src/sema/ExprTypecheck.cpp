@@ -17783,6 +17783,21 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                     targetTy->declaration &&
                     targetTy->declaration->kind ==
                         ast::TypeDeclKind::Record;
+                // fix #4108 (§17.6, v0.300): a CHOICE operand. A choice is a
+                // discriminated union value type (§35) that is NOT a built-in
+                // numeric and does not admit user-defined `operator ++` (§25.1),
+                // so like a record it falls in none of §17.6's three admitted
+                // categories. The existing `isRefType`/`isValueTypeRecord`
+                // check never fires for choice (TypeDeclKind::Choice matches
+                // neither branch), so bare `choice++` was silently accepted
+                // and no-opped at runtime. Covered by the same unconditional-
+                // reject as record — a choice typed `x++` is rejected just as
+                // a record typed `x++` is, per §17.6 exhaustion.
+                bool isChoiceType =
+                    targetTy->kind == sema::TypeRef::Kind::Named &&
+                    targetTy->declaration &&
+                    targetTy->declaration->kind ==
+                        ast::TypeDeclKind::Choice;
                 // §17.6 (v0.286) / §7.11 (v0.267, #3298): "An operand whose
                 // static type is a NULLABLE TYPE is a compile error." That is
                 // unconditional, so it is decided BEFORE §17.6's three-category
@@ -17805,7 +17820,7 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                         "- 1` (§17.6), and the arithmetic operators do not lift "
                         "over `T?` (§7.11, v0.267)");
                 }
-                else if (isRefType || isValueTypeRecord) {
+                else if (isRefType || isValueTypeRecord || isChoiceType) {
                     // fix #3978 (§17.6 / §25.1, v0.295): `++`/`--` are NEVER
                     // user-overloadable — retires the v0.236 reading below
                     // ("admit a reference/value-type-record operand IFF its
@@ -17850,14 +17865,18 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                         tyName = std::string(h);
                     else
                         tyName = isValueTypeRecord ? "record"
-                                                   : "reference type";
+                                                   : isChoiceType ? "choice type"
+                                                                  : "reference type";
                     // §17.6 diagnostic: the clause wording is category-
-                    // specific (reference type vs value-type record), both
-                    // cite §17.6 and §25.1.
+                    // specific (reference type vs value-type record vs choice
+                    // type), all cite §17.6 and §25.1.
                     std::string categoryWord =
-                        isValueTypeRecord ? "record type" : "reference type";
+                        isValueTypeRecord ? "record type"
+                        : isChoiceType    ? "choice type"
+                                          : "reference type";
                     std::string clauseWord =
                         isValueTypeRecord ? "on a value-type record"
+                        : isChoiceType    ? "on a choice type"
                                           : "on a reference type";
                     ctx_.diagnostics().report(
                         Severity::Error, is->target->span.begin,
