@@ -141,9 +141,9 @@ spec	16.4	Stride	4	0	5	0	3	1	1	covered
 spec	16.5	Iteration	0	0	2	0	0	1	1	covered
 spec	16.6	Empty ranges and equal-bound ranges	1	1	5	0	2	1	2	covered
 spec	17	Expressions and Operators	0	0	0	0	0	0	0	n/a
-spec	17.1	Precedence	0	1	0	0	0	0	0	UNCOVERED
-spec	17.2	Notes on operators	2	1	0	0	0	0	0	UNCOVERED
-spec	17.3	The = and <> operators	2	0	0	0	0	0	0	UNCOVERED
+spec	17.1	Precedence	0	1	10	0	0	0	10	covered
+spec	17.2	Notes on operators	2	1	12	6	6	0	0	covered
+spec	17.3	The = and <> operators	2	0	3	1	1	0	1	covered
 spec	17.4	The is, is not, and as operators	3	0	0	0	0	0	0	UNCOVERED
 spec	17.5	The in operator	3	1	0	0	0	0	0	UNCOVERED
 spec	17.6	The increment and decrement operators	5	3	0	0	0	0	0	UNCOVERED
@@ -225,14 +225,14 @@ spec	26.5.1	Specificity ordering	2	0	0	0	0	0	0	UNCOVERED
 spec	26.6	Multiple blocks for the same type	1	0	0	0	0	0	0	UNCOVERED
 spec	26.7	Ownership in extensions	1	0	0	0	0	0	0	UNCOVERED
 spec	27	Lambdas and Function Types	0	0	0	0	0	0	0	n/a
-spec	27.1	Function types	1	0	0	0	0	0	0	UNCOVERED
-spec	27.1.1	Function-type assignability	3	1	0	0	0	0	0	UNCOVERED
-spec	27.2	Nullable function types	0	0	0	0	0	0	0	n/a
-spec	27.3	Lambda expressions	5	1	0	0	0	0	0	UNCOVERED
-spec	27.4	Parameter type inference	1	0	0	0	0	0	0	UNCOVERED
-spec	27.5	Closures	1	0	0	0	0	0	0	UNCOVERED
-spec	27.6	Method references	5	2	0	0	0	0	0	UNCOVERED
-spec	27.7	Calling function values	1	0	0	0	0	0	0	UNCOVERED
+spec	27.1	Function types	1	0	7	3	1	0	3	covered
+spec	27.1.1	Function-type assignability	3	1	6	2	4	0	0	covered
+spec	27.2	Nullable function types	0	0	3	0	1	0	2	covered
+spec	27.3	Lambda expressions	5	1	9	0	4	0	5	covered
+spec	27.4	Parameter type inference	1	0	6	0	3	0	3	covered
+spec	27.5	Closures	1	0	10	2	6	0	2	covered
+spec	27.6	Method references	5	2	6	0	1	0	5	covered
+spec	27.7	Calling function values	1	0	3	0	0	0	3	covered
 spec	27.7.1	Equality of function values	2	0	0	0	0	0	0	UNCOVERED
 spec	27.8	Type aliases	0	0	0	0	0	0	0	n/a
 spec	28	Resource Management	2	0	0	0	0	0	0	UNCOVERED
@@ -266,9 +266,9 @@ spec	29.11	Multiple enumeration	3	1	0	0	0	0	0	UNCOVERED
 spec	29.12	Mutation during iteration	1	0	0	0	0	0	0	UNCOVERED
 spec	29.13	Async iterators	0	0	0	0	0	0	0	n/a
 spec	30	Asynchronous Programming	0	0	0	0	0	0	0	n/a
-spec	30.1	async methods	13	5	0	0	0	0	0	UNCOVERED
-spec	30.2	await	3	0	0	0	0	0	0	UNCOVERED
-spec	30.3	The Task, Task<T>, and OwningTask<T> types	7	1	0	0	0	0	0	UNCOVERED
+spec	30.1	async methods	13	5	21	8	12	1	0	covered
+spec	30.2	await	3	0	3	1	1	0	1	covered
+spec	30.3	The Task, Task<T>, and OwningTask<T> types	7	1	6	0	2	0	4	covered
 spec	30.4	Multiple awaiters	2	0	0	0	0	0	0	UNCOVERED
 spec	30.5	Result lifetime and task disposal	0	3	0	0	0	0	0	UNCOVERED
 spec	30.6	Async lambdas	1	0	0	0	0	0	0	UNCOVERED
@@ -282,9 +282,9 @@ spec	30.13	Runtime model	0	0	0	0	0	0	0	n/a
 spec	30.14	Multiple domains and sendable types	0	1	0	0	0	0	0	UNCOVERED
 spec	30.15	Channels	4	0	0	0	0	0	0	UNCOVERED
 spec	31	Exception Handling	0	0	0	0	0	0	0	n/a
-spec	31.1	Throwing	2	1	0	0	0	0	0	UNCOVERED
-spec	31.2	try/catch/finally	5	1	0	0	0	0	0	UNCOVERED
-spec	31.2.1	Arm patterns	4	3	0	0	0	0	0	UNCOVERED
+spec	31.1	Throwing	2	1	11	0	7	0	4	covered
+spec	31.2	try/catch/finally	5	1	12	0	4	0	8	covered
+spec	31.2.1	Arm patterns	4	3	1	0	0	0	1	covered
 spec	31.2.2	Arm bodies	1	0	0	0	0	0	0	UNCOVERED
 spec	31.2.3	Catch ordering and exhaustiveness	0	0	0	0	0	0	0	n/a
 spec	31.2.4	Bare re-raise	1	0	0	0	0	0	0	UNCOVERED
