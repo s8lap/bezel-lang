@@ -18,8 +18,8 @@ end Widget;
 public class Program
   public static method Main()
     var w := new Widget();
-    var ref: () -> string := w.Greet;
+    var methodRef: () -> string := w.Greet;
     var lit: () -> string := lambda() => "hi";
-    Console.WriteLine($"{ref = lit}");
+    Console.WriteLine($"{methodRef = lit}");
   end Main;
 end Program;

@@ -11,7 +11,7 @@ module Conf;
 
 public class Program
   private static method Build()
-    var closed: Range<int> := 2..5;
+    var closedRange: Range<int> := 2..5;
     var lowerOpen: Range<int> := ..5;
     var upperOpen: Range<int> := 10..;
     var fullyOpen: Range<int> := ..;

@@ -38,7 +38,7 @@ ALIAS_RE = re.compile(r'^\s*type\s+([A-Za-z_]\w*)')
 IMPORT_ALIAS_RE = re.compile(r'^\s*import\s+[\w.]+\s+as\s+([A-Za-z_]\w*)\s*;')
 MEMBER_RE = re.compile(
     r'\b(?:method|property|const)\s+(?:operator\s+\S+|([A-Za-z_]\w*))')
-ENUM_CONST_RE = re.compile(r'^\s*([A-Z]\w*)\s*(?:,|;|:=)')
+ENUM_CONST_RE = re.compile(r'^\s*([A-Z]\w*)\s*(?:,|;|:=|\()')
 GENERIC_PARAM_RE = re.compile(r'<([^<>()]*)>')
 
 PRIMITIVES = {
@@ -63,7 +63,7 @@ TYPE_POSITION_RES = (
     re.compile(r'\bnew\s+([A-Z]\w*)'),
     re.compile(r'\b(?:is|as)\s+(?:not\s+)?([A-Z]\w*)'),
     # `Array<int>` binds tight; `a.Kg < b` and `x <> y` are not generics.
-    re.compile(r'\b([A-Z]\w*)<(?![>=])'),
+    re.compile(r'(?<![.\w])([A-Z]\w*)<(?![>=])'),
     re.compile(r'\b(?:typeof|default)\(\s*([A-Z]\w*)'),
     re.compile(r'^\s*(?:public|internal|private|protected)?\s*\w*\s*'
                r'(?:class|interface|record|enum|choice)\s+\w+\s*'
@@ -145,6 +145,29 @@ def declared_in(source):
 
 
 STRING_RE = re.compile(r'@?\$?"(?:\\.|""|[^"\\])*"')
+
+# Appendix B.1's unconditionally reserved words. A parameter named `base` is
+# how spec §32.8's own example acquired doc defect #3067, so this is a real
+# class of mistake, not a hypothetical one.
+RESERVED = set("""
+abstract and as async await base bool break byte case catch char choice class
+closed const constructor continue decimal default destructor do double elif else
+end ensures enum extension extern false finally float for if import in int
+interface internal invariant is lambda long method mod module move nameof new
+not null or out owned override private property protected public readonly record
+ref requires return sbyte sealed short static string then this throw true try
+type typeof uint ulong ushort using var virtual when where while with yield
+""".split())
+
+DECL_RES = (
+    re.compile(r'\bvar\s+([A-Za-z_]\w*)'),
+    re.compile(r'\bconst\s+([A-Za-z_]\w*)\s*:'),
+    re.compile(r'\b(?:method|property|class|record|interface|choice|enum)\s+'
+               r'([A-Za-z_]\w*)'),
+)
+PARAM_LIST_RE = re.compile(r'\(([^()]*)\)')
+PARAM_RE = re.compile(r'^\s*(?:ref\s+|out\s+owned\s+|out\s+|owned\s+|scoped\s+)?'
+                      r'([A-Za-z_]\w*)\s*:')
 MEMBER_DECL_RE = re.compile(
     r'\b(?:method|property|const)\s+(?:operator\s+\S+|([A-Za-z_]\w*))')
 
@@ -154,6 +177,23 @@ def members_declared_in(source):
     block, which is how a case legitimately puts a new member on a documented
     type. The index cannot know those, so the case's own declarations count."""
     return {m.group(1) for m in MEMBER_DECL_RE.finditer(source) if m.group(1)}
+
+
+def reserved_declarations(source):
+    """Declaration-position identifiers that are unconditionally reserved."""
+    found = set()
+    for line in source.split("\n"):
+        code = STRING_RE.sub('""', line.split("//")[0])
+        for rx in DECL_RES:
+            for m in rx.finditer(code):
+                if m.group(1) in RESERVED:
+                    found.add(m.group(1))
+        for group in PARAM_LIST_RE.findall(code):
+            for part in group.split(","):
+                m = PARAM_RE.match(part)
+                if m and m.group(1) in RESERVED:
+                    found.add(m.group(1))
+    return sorted(found)
 
 
 def check_source(source, index):
@@ -179,6 +219,11 @@ def check_source(source, index):
                 if re.search(r'\b(?:method|property|class|record|interface|'
                              r'choice|enum)\s+' + re.escape(name) + r'\b', code):
                     continue
+                # `Classify<int>(x)` is a generic method CALL; `new Array<int>()`
+                # and a bare `Array<int>` annotation are types.
+                if re.search(re.escape(name) + r'<[^<>]*>\s*\(', code) \
+                        and not re.search(r'\bnew\s+' + re.escape(name), code):
+                    continue
                 unknown_types.add(name)
         for m in STATIC_USE_RE.finditer(code):
             owner, member = m.group(1), m.group(2)
@@ -202,6 +247,11 @@ def main(argv, base_dir=None):
 
     index = build_index(args.docs)
     cases_dir = os.path.join(base, "cases")
+    expects = {}
+    manifest = os.path.join(base, "manifest.tsv")
+    if os.path.exists(manifest):
+        for row in corpus.read_manifest(manifest):
+            expects[row["case-id"]] = row["expect"]
     findings = 0
     for name in sorted(os.listdir(cases_dir)):
         if not name.endswith(".bzl"):
@@ -212,13 +262,19 @@ def main(argv, base_dir=None):
         with open(os.path.join(cases_dir, name), encoding="utf-8") as f:
             source = corpus.strip_header(f.read())
         types, members = check_source(source, index)
-        if types or members:
+        # A reject case may be ABOUT declaring a reserved name; only a case that
+        # expects to compile has a problem here.
+        reserved = [] if expects.get(case_id) == "reject" \
+            else reserved_declarations(source)
+        if types or members or reserved:
             findings += 1
             print(case_id)
             if types:
                 print("  unknown type:   " + ", ".join(types))
             if members:
                 print("  unknown member: " + ", ".join(members))
+            if reserved:
+                print("  reserved name:  " + ", ".join(reserved))
     print("\n{} documented types indexed; {} cases with findings"
           .format(len(index), findings))
     return 1 if (args.strict and findings) else 0
