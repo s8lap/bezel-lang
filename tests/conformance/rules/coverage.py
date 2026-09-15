@@ -33,7 +33,7 @@ DENSITY_RE = re.compile(
     r'is not admitted|is not permitted|cannot be|raises)\b', re.IGNORECASE)
 
 COLUMNS = ("doc", "section", "title", "density", "appendix-c", "cases",
-           "accept", "reject", "run", "state")
+           "accept", "reject", "warn", "run", "state")
 
 
 def parse_sections(path, doc_tag):
@@ -137,7 +137,7 @@ def build(docs_dir, base_dir):
     for case in rows:
         key = (case["doc"], case["section"])
         bucket = cases_per_section.setdefault(
-            key, {"cases": 0, "accept": 0, "reject": 0, "run": 0})
+            key, {"cases": 0, "accept": 0, "reject": 0, "warn": 0, "run": 0})
         bucket["cases"] += 1
         bucket[case["expect"]] += 1
 
@@ -145,13 +145,14 @@ def build(docs_dir, base_dir):
     for s in sections:
         key = (s["doc"], s["section"])
         counts = cases_per_section.get(
-            key, {"cases": 0, "accept": 0, "reject": 0, "run": 0})
+            key, {"cases": 0, "accept": 0, "reject": 0, "warn": 0, "run": 0})
         c_rows = c_per_section.get(key, 0)
         out.append({
             "doc": s["doc"], "section": s["section"], "title": s["title"],
             "density": s["density"], "appendix-c": c_rows,
             "cases": counts["cases"], "accept": counts["accept"],
-            "reject": counts["reject"], "run": counts["run"],
+            "reject": counts["reject"], "warn": counts["warn"],
+            "run": counts["run"],
             "state": state_of(s["density"], c_rows, counts),
         })
     # Cases in a section the documents do not have: a citation error worth seeing.
@@ -163,7 +164,8 @@ def build(docs_dir, base_dir):
                         "title": "(no such section in the document)",
                         "density": 0, "appendix-c": 0, "cases": counts["cases"],
                         "accept": counts["accept"], "reject": counts["reject"],
-                        "run": counts["run"], "state": "ORPHAN"})
+                        "warn": counts["warn"], "run": counts["run"],
+                        "state": "ORPHAN"})
     return out, invariants, c_per_section, problems
 
 
@@ -267,9 +269,9 @@ def main(argv, base_dir=None):
         print("\nCovered sections:")
         for row in rows:
             if row["cases"]:
-                print("  {:<6} {:<9} {:>3} cases ({}/{}/{})  {}".format(
+                print("  {:<6} {:<9} {:>3} cases ({}/{}/{}/{})  {}".format(
                     row["doc"], row["section"], row["cases"], row["accept"],
-                    row["reject"], row["run"], row["title"][:50]))
+                    row["reject"], row["warn"], row["run"], row["title"][:50]))
     print("\nmatrix written to " + args.out)
     return 0
 
