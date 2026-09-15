@@ -1023,8 +1023,16 @@ std::string builtinExceptionSurfaceList(std::string_view builtinBase) {
 // `isNonNullableReferenceAutoProp`, TypeResolution_Checks.cpp's per-type BFS)
 // that walk `klass.members` directly and have not (yet, or ever) resolved a
 // PropertySymbol for the member they are looking at.
+// NOTE (#4037, #4100): the prior `p.isIndexer` guard excluded ALL indexers.
+// That is correct for the storage-classification call sites (indexers never
+// get a backing field regardless of abstract-ness), but WRONG for the setter-
+// axis question: an abstract auto-indexer (`abstract property [i: int]: T;`)
+// IS a §12.5 shorthand (get-only, no setter) and must return true here so
+// that callers on the setter axis (e.g. `propertyDeclHasSetter`) do not
+// incorrectly report a setter as present. The guard is removed so that
+// abstract auto-indexers are treated identically to abstract auto-properties.
 bool isAbstractPropertyShorthand(const ast::PropertyDecl& p) {
-    if (p.isIndexer || p.bodyKind != ast::PropertyBodyKind::Auto) return false;
+    if (p.bodyKind != ast::PropertyBodyKind::Auto) return false;
     for (auto mod : p.modifiers)
         if (mod == "abstract") return true;
     return false;

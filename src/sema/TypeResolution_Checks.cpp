@@ -4979,34 +4979,15 @@ static bool propertyDeclHasSetter(const ast::PropertyDecl* pd) {
             if (a.isSet) return true;
         return false;
     }
-    // Auto body. NOTE (#4037, LANE_RULES §6): this deliberately re-derives
-    // the "is this Auto-bodied PropertyDecl the §12.5 abstract shorthand"
-    // answer with its own inline modifier scan instead of calling the
-    // shared `isAbstractPropertyShorthand` (sema/Symbol.hpp) — NOT an
-    // oversight. This function is called for BOTH named properties AND
-    // INDEXERS (see call sites comparing `ipd`/`cpd`->indexerParams a few
-    // hundred lines below, the ifaceIndexerObligations loop), but
-    // `isAbstractPropertyShorthand` unconditionally returns `false` for an
-    // indexer (`p.isIndexer` guard) — its job is storage classification,
-    // where the exclusion is correct because indexers never get storage
-    // regardless of `abstract`-ness, which is a different question from
-    // "does this Auto-bodied declaration's shape carry a setter". A naive
-    // `if (isAbstractPropertyShorthand(pd)) return false;` substitution
-    // here would silently flip an abstract INDEXER shorthand
-    // (`abstract property [i: int]: T;`) from correctly get-only to
-    // (incorrectly) read-write, since the shared predicate would answer
-    // `false` for it. Confirmed set-equal to the shared predicate on the
-    // NAMED-property (non-indexer) domain only; verified no live
-    // behavioral bug from the duplication (reviewing #4018/#4020,
-    // `override_wrong_type_rejected` / `override_adds_setter_not_on_base_
-    // rejected`-style probes still reject correctly for both properties and
-    // indexers). Do not "fix" this by delegating without also covering the
-    // indexer case (e.g. a sibling predicate that answers the same
-    // question for both member kinds) — see #4037.
-    bool isAbstract = false;
-    for (auto mod : pd->modifiers)
-        if (mod == "abstract") { isAbstract = true; break; }
-    if (isAbstract) return false;  // §12.5 shorthand = get-only abstract getter
+    // Auto body. NOTE (#4037, LANE_RULES §6): replaces the prior inline
+    // modifier scan with a call to the shared `isAbstractPropertyShorthand`
+    // (sema/Symbol.hpp). After the #4037 fix to that predicate (removing the
+    // `p.isIndexer` guard), it is set-equal to the prior inline scan on the
+    // NAMED-property domain and also correct on the INDEXER domain (abstract
+    // auto-indexers are now correctly identified as shorthand/get-only). The
+    // abstract-indexer rows in the #4037 and #4100 regression tests pin the
+    // expected outcomes on both domains.
+    if (isAbstractPropertyShorthand(*pd)) return false;  // §12.5 shorthand
     for (auto mod : pd->modifiers)
         if (mod == "readonly") return false;
     return true;
