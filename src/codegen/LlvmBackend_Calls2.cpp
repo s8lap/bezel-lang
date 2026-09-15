@@ -10125,9 +10125,26 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                     bool memberAlreadyDispatched =
                         receiverIsPlainLocalRead &&
                         emittedSideEffectSince(effectiveDispatchEntry);
+                    // fix #4200 (spec §10/§11, v0.298): `new
+                    // Stopwatch().TotallyBogusMember()` is silently accepted
+                    // without warning because `isConcreteType` is false
+                    // (declaration == nullptr for nullary stdlib class
+                    // `Stopwatch`), so the Shape 1/2 condition below never
+                    // fires. Add a third shape: call-shaped receiver
+                    // (CallExpr/NewExpr) whose resolved type has no declaration
+                    // — the same `new Stopwatch()` / `Stopwatch.StartNew()`
+                    // ambiguity the #4171 comment above already analyses.
+                    bool receiverIsCallShapedBuiltin =
+                        (dynamic_cast<const ast::CallExpr*>(
+                             ma->target.get()) ||
+                         dynamic_cast<const ast::NewExpr*>(
+                             ma->target.get())) &&
+                        recvTy && recvTy->kind == K::Named &&
+                        !recvTy->declaration;
                     if (!memberAlreadyDispatched &&
                         (isConcreteType ? !isUniversalObjMember
-                                        : isBareTypeParamInDeadTemplate)) {
+                                        : isBareTypeParamInDeadTemplate ||
+                                            receiverIsCallShapedBuiltin)) {
                         // Same derivation the §8.1 reject above uses — one
                         // `receiverName` lambda, not two copies (#2924's
                         // four-way-mirror finding).
