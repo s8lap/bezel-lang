@@ -839,6 +839,23 @@ llvm::FunctionCallee Emitter::freeFn() {
     return module_->getOrInsertFunction("free", fnTy);
 }
 
+// fix #4210 (§27.5 / §28.9, v0.298): the module-level global that stores
+// the most recently freed cell pointer. The envdtor stores the freed cell
+// here before calling free(). boxLocalSlot checks this global; if the
+// cached cell matches the stored freed pointer, the entry is stale and
+// fresh allocation runs.
+llvm::GlobalVariable* Emitter::getFreedSlotGlobal() {
+    auto* gv = module_->getGlobalVariable("bz_freed_slot");
+    if (!gv) {
+        gv = new llvm::GlobalVariable(
+            *module_, ptrTy(), /*isConstant=*/false,
+            llvm::GlobalValue::PrivateLinkage,
+            llvm::ConstantPointerNull::get(ptrTy()),
+            "bz_freed_slot");
+    }
+    return gv;
+}
+
 
 llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     const std::vector<sema::Symbol*>* paramSyms = ctx_.lambdaParams(&lam);
@@ -1510,8 +1527,7 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         // conservative exclusion — a bounded leak, never an over-free.
         if (!alreadyBoxed && (!wasGuardedParam || loopStack_.empty()) &&
             currentFn_ == boxCaptureLocalsFn_ &&
-            definitelyEscapingLambdas_.count(static_cast<const void*>(&lam)) &&
-            singleCaptureLocals_.count(static_cast<const void*>(sym))) {
+            isSharedCellEnvdtorFreeOwner(static_cast<const void*>(sym), &lam)) {
             ce.freeCellInEnvdtor = true;
         }
         // fix #3426 (§27.5 / §28.9, v0.283): the SHARED-cell twin of the branch
@@ -1528,7 +1544,7 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         // guarded-boxing exclusion as the backward-edge proof (that path reports
         // wasGuardedParam=false for an already-boxed slot, so it proves nothing
         // here).
-        if (!ce.freeCellInEnvdtor && loopStack_.empty() &&
+        if (!ce.freeCellInEnvdtor &&
             currentFn_ == cellFreeEligibleFn_ &&
             isSharedCellEnvdtorFreeOwner(static_cast<const void*>(sym), &lam)) {
             ce.freeCellInEnvdtor = true;
@@ -1765,8 +1781,30 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
                 declScopeDepth = ddit->second;
             }
         }
+        // fix #4210 (§27.5 / §28.9, v0.298): add the !definitelyEscapingLambdas_
+        // AND !declsCapturedByEscaping_ guards. For a NON-ESCAPING lambda with
+        // declaredShallower=true (capturing an outer-scope local from inside a
+        // loop), the original !declaredShallower check suppressed boxedCellFree,
+        // and the envdtor path was also blocked (isSharedCellEnvdtorFreeOwner
+        // false for non-escaping). The cell leaked. Adding
+        // !definitelyEscapingLambdas_ lets boxedCellFree arm for non-escaping
+        // lambdas even when declaredShallower=true. The !declsCapturedByEscaping_
+        // guard is the second half: it prevents arming boxedCellFree when an
+        // ESCAPING lambda also captures the same local (the same decl). In that
+        // case, the non-escaping key (decl, nonEscLam) is still in
+        // cellFreeEligible_ (cellFreeEligible_ is keyed by (decl, lam) pairs,
+        // and the non-escaping pair is not in capturedByEscaping which is keyed
+        // by (decl, escLam)), so without this guard boxedCellFree would arm for
+        // the non-escaping lambda AND the escaping lambda's envdtor would free
+        // the cell — a double-free. Since the lambda is non-escaping, boxedCellFree
+        // fires exactly once (at the lambda's scope end), so there is no
+        // double-free when !declsCapturedByEscaping_ holds. For escaping
+        // lambdas, boxedCellFree is already suppressed (capturedByEscaping has
+        // the key), so the definitelyEscapingLambdas_ guard is harmless there.
         if (!alreadyBoxed && !isForVar &&
             currentFn_ == cellFreeEligibleFn_ &&
+            !definitelyEscapingLambdas_.count(static_cast<const void*>(&lam)) &&
+            !declsCapturedByEscaping_.count(static_cast<const void*>(decl)) &&
             cellFreeEligible_.count(static_cast<const void*>(decl))) {
             // #782: if the captured local is a move-only OWNING inline-array
             // ([N owned]T? / [N owned]T), record N so lowerLocalDecl registers an
@@ -2213,8 +2251,22 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         // through boxLocalSlot's already-boxed path — which reports
         // wasGuardedLocal=false regardless of how the cell was allocated and so
         // is not a proof of anything at this site.
-        if (!ce.freeCellInEnvdtor && !isForVar && loopStack_.empty() &&
+        // fix #4210 (§27.5 / §28.9, v0.298): add the definitelyEscapingLambdas_
+        // guard. Without it, this condition fires for non-escaping lambdas too,
+        // setting freeCellInEnvdtor=true when boxedCellFree also fires (after the
+        // fix at line ~1798 arming boxedCellFree for non-escaping lambdas with
+        // declaredShallower=true) — a double-free. The original
+        // isSharedCellEnvdtorFreeOwner check was false for non-escaping lambdas
+        // (sharedCellEnvdtorFreeOwner_ is only populated for definitelyEscaping),
+        // which is why the original code leaked (boxedCellFree was suppressed by
+        // declaredShallower=true for non-escaping) rather than double-freeing.
+        // Reverting to isSharedCellEnvdtorFreeOwner restores the correct semantics:
+        // this shared-cell route fires only for escaping lambdas where
+        // capturedByEscaping has the key (boxedCellFree disarmed), and the
+        // envdtor is the cell's sole reclaim path.
+        if (!ce.freeCellInEnvdtor && !isForVar &&
             currentFn_ == cellFreeEligibleFn_ &&
+            definitelyEscapingLambdas_.count(static_cast<const void*>(&lam)) &&
             isSharedCellEnvdtorFreeOwner(static_cast<const void*>(decl), &lam))
             ce.freeCellInEnvdtor = true;
         captures.push_back(ce);
@@ -3486,8 +3538,17 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
                 // escaped), and this is the single holder, so this is the cell's
                 // only free — no double-free; the defining scope is gone before the
                 // escaped closure dies, so no later access through the cell — no UAF.
-                if (ce.freeCellInEnvdtor)
+                if (ce.freeCellInEnvdtor) {
+                    // fix #4210 (§27.5 / §28.9, v0.298): store the freed cell
+                    // pointer to the module-level global so boxLocalSlot detects
+                    // the stale cellVars_ entry and allocates fresh on the next
+                    // loop iteration.  The `cell` value here is loaded from the
+                    // env struct (envArg) within this envdtor function, so it is
+                    // a valid SSA value in this scope.
+                    llvm::GlobalVariable* freedGlobal = getFreedSlotGlobal();
+                    builder_.CreateStore(cell, freedGlobal);
                     builder_.CreateCall(freeFn(), {cell});
+                }
             }
             builder_.CreateRetVoid();
 

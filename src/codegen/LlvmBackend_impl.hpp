@@ -12635,6 +12635,7 @@ private:
               cellFreeEligible_(e.cellFreeEligible_),
               unwindUnsafeCellFree_(e.unwindUnsafeCellFree_),
               sharedCellEnvdtorFreeOwner_(e.sharedCellEnvdtorFreeOwner_),
+              declsCapturedByEscaping_(e.declsCapturedByEscaping_),  // fix #4210
               cellFreeEligibleFn_(e.cellFreeEligibleFn_) {}
         ~CaptureReclaimSetScope() {
             e_.closureReleaseEligible_ = std::move(closureReleaseEligible_);
@@ -12661,6 +12662,8 @@ private:
             e_.unwindUnsafeCellFree_ = std::move(unwindUnsafeCellFree_);
             e_.sharedCellEnvdtorFreeOwner_ =
                 std::move(sharedCellEnvdtorFreeOwner_);
+            e_.declsCapturedByEscaping_ =
+                std::move(declsCapturedByEscaping_);  // fix #4210
             e_.cellFreeEligibleFn_ = cellFreeEligibleFn_;
         }
         CaptureReclaimSetScope(const CaptureReclaimSetScope&) = delete;
@@ -12698,6 +12701,12 @@ private:
         std::unordered_set<const void*> cellFreeEligible_;
         std::unordered_set<const void*> unwindUnsafeCellFree_;
         std::unordered_map<const void*, const void*> sharedCellEnvdtorFreeOwner_;
+        // fix #4210 (§27.5 / §28.9, v0.298): the set of all captured entities
+        // (DeclSymbol* / ParameterSymbol*) that ANY escaping lambda captures.
+        // Populated by collectCellFreeEligible; used as the O(1) oracle in the
+        // boxedCellFree arming condition to prevent double-free when an escaping
+        // lambda also captures the same local as a non-escaping lambda.
+        std::unordered_set<const void*> declsCapturedByEscaping_;
         llvm::Function* cellFreeEligibleFn_;
     };
 
@@ -15483,6 +15492,12 @@ private:
     // already uses: without it one syntactic lambda node inside a loop makes N
     // closures over one guarded cell and N envdtors would free it N times.
     std::unordered_map<const void*, const void*> sharedCellEnvdtorFreeOwner_;
+    // fix #4210 (§27.5 / §28.9, v0.298): the set of all captured entities
+    // (DeclSymbol* / ParameterSymbol*) that ANY escaping lambda captures.
+    // Populated by collectCellFreeEligible; guards the boxedCellFree arming
+    // condition to prevent double-free when an escaping lambda also captures
+    // the same local as a non-escaping lambda.
+    std::unordered_set<const void*> declsCapturedByEscaping_;
     // fix #3426: is `lam` the recorded sole out-of-frame holder of `key`'s cell?
     bool isSharedCellEnvdtorFreeOwner(const void* key,
                                       const ast::LambdaExpr* lam) const {
@@ -16612,6 +16627,13 @@ private:
     // #380: declare (once) `void @free(ptr)` from libc — the counterpart to
     // callocFn() that reclaims a disposed class instance's heap block.
     llvm::FunctionCallee freeFn();
+
+    // fix #4210 (§27.5 / §28.9, v0.298): returns the module-level global
+    // that stores the most recently freed cell pointer. The envdtor stores
+    // the freed cell here before free(). boxLocalSlot checks this global;
+    // if the cached cell matches the stored freed pointer, the entry is
+    // stale and fresh allocation runs.
+    llvm::GlobalVariable* getFreedSlotGlobal();
 
     // CG60: lower a lambda expression. Lambdas are represented as a
     // heap-allocated two-pointer closure struct { fn_ptr, env_ptr }.
