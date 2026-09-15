@@ -210,6 +210,14 @@ For every case, in your head or on paper:
   that ran).
 - For a run case: trace every path and say exactly what the first line of
   standard output is.
+- **Would the expectation change if the rule were violated?** This is the
+  question that catches a vacuous case, and it applies to every tier. A `run`
+  case whose expected line is printed on every path — including the path a
+  violating compiler would take — proves nothing; a fault counts as a change, so
+  arrange the program to fault rather than print if the rule does not hold. An
+  `accept` case must **exercise** the admitted operation, not merely declare the
+  shape that admits it: binding the borrow a rule says may be *used*, and then
+  never using it, proves only that the binding form parses.
 
 The third bullet is where most authoring errors live. An accept case that the
 spec rejects for an unrelated reason is a false divergence, and false
