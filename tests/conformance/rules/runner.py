@@ -129,14 +129,34 @@ def diagnostic_matches(row, compile_log):
 
 
 def run_case(row, bezelc, cases_dir, tmpdir, run=conformance.caged_run):
-    src = os.path.join(cases_dir, row["case-id"] + ".bzl")
+    deps = [d for d in (row.get("deps") or "").split(";") if d]
+    if deps:
+        src = os.path.join(cases_dir, row["case-id"], "main.bzl")
+    else:
+        src = os.path.join(cases_dir, row["case-id"] + ".bzl")
     if not os.path.isfile(src):
         return "fail", "source file missing", ""
     work = os.path.join(tmpdir, row["case-id"])
     os.makedirs(work, exist_ok=True)
+
+    # A dependency is compiled to a library artifact and imported by everything
+    # after it. A dependency that does not compile is a broken CASE, never a
+    # passing reject: the rule under test lives in main.bzl.
+    imports = []
+    for dep in deps:
+        artifact = os.path.join(work, dep[:-len(".bzl")] + ".o")
+        dep_rc, dep_log = run([bezelc] + imports + ["-c", "-o", artifact,
+                                                   os.path.join(cases_dir,
+                                                                row["case-id"],
+                                                                dep)])
+        if dep_rc != 0:
+            return "fail", "dependency {} did not compile: {}".format(
+                dep, conformance._snippet(dep_log, 90, 200)), dep_log
+        imports += ["--import", artifact]
+
     out_exe = os.path.join(work, "out")
     flags = ["-c", "-o", out_exe] if row["shape"] == "lib" else ["-o", out_exe]
-    compile_rc, compile_log = run([bezelc] + flags + [src])
+    compile_rc, compile_log = run([bezelc] + imports + flags + [src])
 
     run_rc, run_out = None, ""
     if compile_rc == 0 and row["shape"] == "program" and row["expect"] == "run":

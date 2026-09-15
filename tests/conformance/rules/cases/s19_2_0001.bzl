@@ -14,8 +14,8 @@ public class Program
   public static method FindFirstEven(nums: Array<int>): string
     for var n in nums do
       case n mod 2 of
-        0 => return $"found {n}",
-        _ => Console.WriteLine($"skip {n}")
+        0 => return $"found {n}";,
+        _ => Console.WriteLine($"skip {n}");
       end case;
     end;
     return "none";

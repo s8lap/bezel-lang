@@ -4,14 +4,17 @@
 //! title: assigning null to a nullable local is admitted
 //! rule: Assigning `null` to a non-nullable target is a compile error
 //!   (contrapositive: a nullable target admits it).
-//! cites: 18.5
 //! expect: run
-//! stdout: null
+//! stdout: admitted
 module Conf;
 
 public class Program
   public static method Main()
     var name: string? := null;
-    Console.WriteLine($"{name}");
+    if name = null then
+      Console.WriteLine("admitted");
+    else
+      Console.WriteLine("not admitted");
+    end;
   end Main;
 end Program;

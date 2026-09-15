@@ -16,7 +16,7 @@ public class Program
   public static method Main()
     var t := new Triple(1, 2, 3);
     case t of
-      Triple(x, _, z) => Console.WriteLine($"{x},{z}")
+      Triple(x, _, z) => Console.WriteLine($"{x},{z}");
     end case;
   end Main;
 end Program;

@@ -14,8 +14,8 @@ public class Program
   public static method Main()
     var n := 3;
     case n
-      1 => Console.WriteLine("one"),
-      _ => Console.WriteLine("other")
+      1 => Console.WriteLine("one");,
+      _ => Console.WriteLine("other");
     end case;
   end Main;
 end Program;

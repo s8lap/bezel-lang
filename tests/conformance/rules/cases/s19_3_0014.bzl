@@ -19,8 +19,8 @@ public class Program
   public static method Main()
     var p := new Point(1, 2);
     case p of
-      Point(x, y) => Console.WriteLine($"{x},{y}"),
-      _           => Console.WriteLine("other")
+      Point(x, y) => Console.WriteLine($"{x},{y}");,
+      _           => Console.WriteLine("other");
     end case;
     _ := p;
   end Main;

@@ -13,8 +13,8 @@ public class Program
   public static method Main()
     var month := 1;
     case month of
-      1 => Console.WriteLine("Jan"),
-      _ => Console.WriteLine("Other")
+      1 => Console.WriteLine("Jan");,
+      _ => Console.WriteLine("Other");
     end case;
   end Main;
 end Program;

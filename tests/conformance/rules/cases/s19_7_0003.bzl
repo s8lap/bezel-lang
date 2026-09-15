@@ -17,7 +17,7 @@ public class Program
       1 => do
         Console.WriteLine("one");
       end;,
-      _ => Console.WriteLine("other")
+      _ => Console.WriteLine("other");
     end case;
   end Main;
 end Program;

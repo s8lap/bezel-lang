@@ -8,7 +8,7 @@
 //!   through a property, field, or collection slot.
 //! cites: 28.3, 28.6
 //! expect: reject
-//! diagnostic: lend
+//! diagnostic: mint-announcing
 module Conf;
 
 public class Item

@@ -23,6 +23,6 @@ end Box;
 
 public class Program
   public method Demo()
-    var b: Box<Widget>;
+    using var b := new Box<Widget>(new Widget());
   end Demo;
 end Program;

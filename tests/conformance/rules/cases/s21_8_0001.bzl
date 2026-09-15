@@ -15,7 +15,7 @@ public class Program
     try
       throw new ArgumentException("bad value");
     catch
-      var ex: ArgumentException => Console.WriteLine(ex.Message)
+      var ex: ArgumentException => Console.WriteLine(ex.Message);
     end try;
   end Main;
 end Program;

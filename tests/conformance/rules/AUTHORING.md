@@ -114,6 +114,31 @@ mismatch means either the diagnostic does not name the rule it enforced, or the
 case tripped a different rule than it meant to. Both are findings worth having.
 Keep it short — a distinctive fragment, lowercase, no punctuation to match.
 
+## When one file is not enough
+
+A few rules are *about* the boundary between compilation units and cannot be
+written as one file: §2.8's artifact-set rules, §13.4 and §13.1's cross-module
+visibility rows, §26.5's resolution against an *imported* extension block. For
+those, a case is a **directory**:
+
+```
+cases/s13_4_0001/
+  lib.bzl      a dependency: its own module, no //! header, no `method Main`
+  main.bzl     the case proper: carries the //! header, imports the dependency
+```
+
+Dependencies compile first, in lexicographic order, each one importing the
+artifacts built before it; `main.bzl` compiles with all of them imported. So
+`lib.bzl` sorts before `main.bzl` naturally, and a second dependency named
+`aaa.bzl` would come first — name them for the order you want.
+
+**A dependency that does not compile fails the case**, whatever its expectation:
+the rule under test lives in `main.bzl`, so a broken dependency is a broken
+case, never a passing reject.
+
+Use this form only when the rule is really about the boundary. A rule that can
+be shown in one file belongs in one file.
+
 ## Writing the Bezel
 
 **Read `docs/Bezel_For_Code_Generation.md` first**, all of §3 (syntax surface),
@@ -131,7 +156,8 @@ Hard rules, each of which has cost somebody a day:
 2. **Each case is one whole file.** It starts `module Conf;`. No preamble, no
    ambient bindings, no illustrative names the file does not declare. Every type
    the case mentions is either a primitive, a documented stdlib name, or
-   declared right there.
+   declared right there. (A rule that genuinely needs two compilation units
+   takes the directory form below — do not fake one inside a single file.)
 3. **Declare constructors explicitly.** Write `public constructor() end
    constructor;` rather than relying on an implicit parameterless one: the spec
    does not state that a class with no declared constructor has one.

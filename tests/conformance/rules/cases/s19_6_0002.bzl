@@ -13,8 +13,8 @@ public class Program
   public static method Main()
     var n := 99;
     case n of
-      1 => Console.WriteLine("one"),
-      2 => Console.WriteLine("two")
+      1 => Console.WriteLine("one");,
+      2 => Console.WriteLine("two");
     end case;
     Console.WriteLine("done");
   end Main;

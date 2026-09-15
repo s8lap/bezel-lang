@@ -13,8 +13,8 @@ public class Program
   public static method Main()
     var n := 5;
     case n of
-      _ => Console.WriteLine("any"),
-      1 => Console.WriteLine("one")
+      _ => Console.WriteLine("any");,
+      1 => Console.WriteLine("one");
     end case;
   end Main;
 end Program;

@@ -268,6 +268,121 @@ class TestWarnTier(unittest.TestCase):
         self.assertFalse(runner.diagnostic_matches(self.row(), "warning: unused local"))
 
 
+MULTI_MAIN = """//! case: s13_4_0001
+//! doc: spec
+//! section: 13.4
+//! title: an internal member is not visible from another module
+//! rule: `internal` reaches the declaring module only.
+//! expect: reject
+//! diagnostic: internal
+module Conf;
+
+import Lib;
+
+public class Program
+  public static method Main()
+    Console.WriteLine(Helper.Secret);
+  end Main;
+end Program;
+"""
+
+MULTI_DEP = """module Lib;
+
+public class Helper
+  internal static const Secret: int := 1;
+end Helper;
+"""
+
+
+def write_dir_case(base, case_id, main_text, deps):
+    d = os.path.join(base, "cases", case_id)
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, "main.bzl"), "w", encoding="utf-8") as f:
+        f.write(main_text)
+    for name, text in deps.items():
+        with open(os.path.join(d, name), "w", encoding="utf-8") as f:
+            f.write(text)
+
+
+class TestDirectoryCases(unittest.TestCase):
+    """The rules that need two compilation units: a case may be a directory of
+    `main.bzl` plus its dependencies."""
+
+    def setUp(self):
+        self.base = tempfile.mkdtemp()
+        write_corpus(self.base, [ACCEPT])
+        write_dir_case(self.base, "s13_4_0001", MULTI_MAIN, {"lib.bzl": MULTI_DEP})
+
+    def rows(self):
+        rows, problems = corpus.load_cases(os.path.join(self.base, "cases"))
+        return {r["case-id"]: r for r in rows}, problems
+
+    def test_the_directory_is_one_case_with_its_deps_recorded(self):
+        rows, problems = self.rows()
+        self.assertEqual(problems, [])
+        self.assertEqual(rows["s13_4_0001"]["deps"], "lib.bzl")
+        self.assertEqual(rows["s13_4_0001"]["section"], "13.4")
+        self.assertEqual(rows["s28_5_0001"]["deps"], "")
+
+    def test_a_dependency_may_not_carry_a_header(self):
+        write_dir_case(self.base, "s13_4_0001", MULTI_MAIN,
+                       {"lib.bzl": "//! case: x\n" + MULTI_DEP})
+        self.assertTrue(any("only main.bzl carries" in p
+                            for p in self.rows()[1]))
+
+    def test_a_dependency_may_not_hold_the_entry_point(self):
+        write_dir_case(self.base, "s13_4_0001", MULTI_MAIN,
+                       {"lib.bzl": MULTI_DEP.replace(
+                           "internal static const Secret: int := 1;",
+                           "public static method Main() end Main;")})
+        self.assertTrue(any("belongs in main.bzl" in p for p in self.rows()[1]))
+
+    def test_a_directory_without_main_is_a_problem(self):
+        os.remove(os.path.join(self.base, "cases", "s13_4_0001", "main.bzl"))
+        self.assertTrue(any("needs a main.bzl" in p for p in self.rows()[1]))
+
+    def test_the_dependency_is_compiled_first_and_imported(self):
+        corpus.main(["build"], base_dir=self.base)
+        seen = []
+
+        def fake(cmd, cwd=None):
+            seen.append(list(cmd))
+            if cmd[-1].endswith("main.bzl"):
+                return 1, "error: 'Secret' is internal to module Lib"
+            return 0, ""
+
+        bezelc = os.path.join(self.base, "bezelc")
+        with open(bezelc, "w") as f:
+            f.write("#!/bin/sh\nexit 0\n")
+        os.chmod(bezelc, 0o755)
+        baseline = os.path.join(self.base, "baseline.tsv")
+        rc = runner.main([bezelc, "--classify", "--filter", "s13_4",
+                          "--baseline", baseline],
+                         base_dir=self.base, run=fake)
+        self.assertEqual(rc, 0)
+        self.assertEqual(runner.read_baseline(baseline)["s13_4_0001"]["verdict"],
+                         "pass")
+        self.assertTrue(seen[0][-1].endswith("lib.bzl"))
+        self.assertIn("--import", seen[1])
+
+    def test_a_dependency_that_does_not_compile_is_never_a_passing_reject(self):
+        corpus.main(["build"], base_dir=self.base)
+
+        def fake(cmd, cwd=None):
+            return 1, "error: broken"
+
+        bezelc = os.path.join(self.base, "bezelc")
+        with open(bezelc, "w") as f:
+            f.write("#!/bin/sh\nexit 0\n")
+        os.chmod(bezelc, 0o755)
+        rows = corpus.read_manifest(os.path.join(self.base, "manifest.tsv"))
+        row = [r for r in rows if r["case-id"] == "s13_4_0001"][0]
+        verdict, detail, _log = runner.run_case(
+            row, bezelc, os.path.join(self.base, "cases"), self.base, run=fake)
+        self.assertEqual(verdict, "fail")
+        self.assertIn("dependency lib.bzl did not compile", detail)
+
+
 class TestManifest(unittest.TestCase):
     def test_build_then_check_is_clean(self):
         with tempfile.TemporaryDirectory() as base:

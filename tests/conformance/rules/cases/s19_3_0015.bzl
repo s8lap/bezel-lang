@@ -17,8 +17,8 @@ public class Program
   public static method Main()
     var r := new Rect(3, 4);
     case r of
-      Rect(Width = var w, Depth = var d) => Console.WriteLine(w.ToString()),
-      _                                  => Console.WriteLine("other")
+      Rect(Width = var w, Depth = var d) => Console.WriteLine(w.ToString());,
+      _                                  => Console.WriteLine("other");
     end case;
   end Main;
 end Program;

@@ -17,9 +17,9 @@ public class Program
   public static method Main()
     var p := Priority.High;
     case p of
-      Low    => Console.WriteLine("low"),
-      Medium => Console.WriteLine("medium"),
-      High   => Console.WriteLine("high")
+      Low    => Console.WriteLine("low");,
+      Medium => Console.WriteLine("medium");,
+      High   => Console.WriteLine("high");
     end case;
   end Main;
 end Program;

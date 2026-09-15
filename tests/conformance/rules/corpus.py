@@ -46,7 +46,7 @@ EXPECTS = ("accept", "reject", "warn", "run")
 DOCS = ("spec", "stdlib")
 
 MANIFEST_COLUMNS = ("case-id", "doc", "section", "expect", "shape",
-                    "title", "rule", "cites", "check", "issue")
+                    "title", "rule", "cites", "check", "issue", "deps")
 
 
 class CaseError(Exception):
@@ -199,20 +199,58 @@ def check_case(path, text):
     return fields, problems
 
 
+def case_entries(cases_dir):
+    """Every case in the directory, as (case_id, main_path, dep_names).
+
+    A case is usually one `.bzl` file. The rules that need two compilation
+    units — §2.8's artifact set, §13.4's cross-module visibility, §26.5's
+    imported extension blocks — cannot be one, so a case may instead be a
+    DIRECTORY holding `main.bzl` (which carries the header) beside its
+    dependencies, compiled in lexicographic order and imported by everything
+    after them."""
+    entries = []
+    if not os.path.isdir(cases_dir):
+        return entries
+    for name in sorted(os.listdir(cases_dir)):
+        path = os.path.join(cases_dir, name)
+        if name.endswith(".bzl") and os.path.isfile(path):
+            entries.append((name[:-len(".bzl")], path, []))
+        elif os.path.isdir(path):
+            members = sorted(n for n in os.listdir(path) if n.endswith(".bzl"))
+            deps = [n for n in members if n != "main.bzl"]
+            entries.append((name, os.path.join(path, "main.bzl"), deps))
+    return entries
+
+
 def load_cases(cases_dir):
-    """Read every case file. Returns (rows, problems); rows are dicts in
-    manifest column order, sorted by case id."""
+    """Read every case. Returns (rows, problems); rows are dicts in manifest
+    column order, sorted by case id."""
     rows = []
     problems = []
     if not os.path.isdir(cases_dir):
         return rows, ["cases directory not found: " + cases_dir]
-    names = sorted(n for n in os.listdir(cases_dir) if n.endswith(".bzl"))
     titles = {}
-    for name in names:
-        path = os.path.join(cases_dir, name)
+    for case_id, path, deps in case_entries(cases_dir):
+        if not os.path.isfile(path):
+            problems.append("{}: a directory case needs a main.bzl carrying "
+                            "the header".format(case_id))
+            continue
         with open(path, encoding="utf-8") as f:
             text = f.read()
-        fields, errs = check_case(path, text)
+        fields, errs = check_case(case_id + ".bzl", text)
+        for dep in deps:
+            dep_path = os.path.join(cases_dir, case_id, dep)
+            with open(dep_path, encoding="utf-8") as f:
+                dep_text = f.read()
+            if dep_text.lstrip().startswith("//!"):
+                errs.append("{}/{}: only main.bzl carries the //! header"
+                            .format(case_id, dep))
+            if not re.match(r'^\s*module\s+\w', dep_text):
+                errs.append("{}/{}: a dependency is a whole source file and "
+                            "starts with `module …;`".format(case_id, dep))
+            if MAIN_RE.search(dep_text):
+                errs.append("{}/{}: a dependency is a library — the `method "
+                            "Main` belongs in main.bzl".format(case_id, dep))
         problems.extend(errs)
         if errs:
             continue
@@ -234,6 +272,7 @@ def load_cases(cases_dir):
             "cites": fields.get("cites", ""),
             "check": check,
             "issue": fields.get("issue", ""),
+            "deps": ";".join(deps),
         })
     rows.sort(key=lambda r: _sort_key(r["case-id"]))
     return rows, problems

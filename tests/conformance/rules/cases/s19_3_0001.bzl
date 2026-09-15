@@ -19,8 +19,8 @@ public class Program
   public static method Main()
     var c := Color.Green;
     case c of
-      var x | Color.Blue => Console.WriteLine("matched"),
-      _                  => Console.WriteLine("other")
+      var x | Color.Blue => Console.WriteLine("matched");,
+      _                  => Console.WriteLine("other");
     end case;
   end Main;
 end Program;

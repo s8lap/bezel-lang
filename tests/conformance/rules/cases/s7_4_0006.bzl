@@ -32,7 +32,7 @@ end Holder;
 
 public class Program
   public static method Main()
-    var h := new Holder();
+    using var h := new Holder();
     h.Report();
   end Main;
 end Program;

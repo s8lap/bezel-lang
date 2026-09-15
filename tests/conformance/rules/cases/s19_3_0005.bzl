@@ -13,8 +13,8 @@ public class Program
   public static method Main()
     var n := 5;
     case n of
-      <> 0 => Console.WriteLine("nonzero"),
-      _    => Console.WriteLine("zero")
+      <> 0 => Console.WriteLine("nonzero");,
+      _    => Console.WriteLine("zero");
     end case;
   end Main;
 end Program;

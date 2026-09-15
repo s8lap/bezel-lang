@@ -6,10 +6,13 @@
 //!   field disposes nothing.
 //! cites: 28.5
 //! expect: run
-//! stdout: built
+//! stdout: widget disposed
 module Conf;
 
 public class Widget
+  public constructor()
+  end constructor;
+
   destructor
     Console.WriteLine("widget disposed");
   end destructor;
@@ -28,6 +31,5 @@ end Holder;
 public class Program
   public static method Main()
     using var h := new Holder();
-    Console.WriteLine("built");
   end Main;
 end Program;

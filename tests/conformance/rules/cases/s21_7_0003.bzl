@@ -18,8 +18,8 @@ end Signal;
 public class Program
   public static method React(s: Signal): string
     case s of
-      Go   => return "moving",
-      Stop => return "halted"
+      Go   => return "moving";,
+      Stop => return "halted";
     end case;
   end React;
 

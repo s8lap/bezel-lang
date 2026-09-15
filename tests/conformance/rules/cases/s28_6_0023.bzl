@@ -16,7 +16,7 @@ end Widget;
 public class Program
   public method Cleanup(pool: Array<Widget>)
     for var w in pool do
-      Console.WriteLine("visit");
+      Console.WriteLine(w);
     end;
   end Cleanup;
 end Program;

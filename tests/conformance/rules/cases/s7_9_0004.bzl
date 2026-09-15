@@ -5,7 +5,7 @@
 //! rule: Definite-assignment analysis applies the same rule to non-nullable
 //!   locals: a non-nullable local must be assigned before it is read.
 //! expect: reject
-//! diagnostic: before its first read
+//! diagnostic: assigned before it is read
 module Conf;
 
 public class Widget

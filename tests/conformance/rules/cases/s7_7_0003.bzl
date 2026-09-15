@@ -16,7 +16,7 @@ public class Widget
 end Widget;
 
 public class Program
-  public static method Choose(fallback: Widget?): owned Widget
-    return fallback ?? new Widget();
+  public static method Choose(fallback: Widget?)
+    using var w := fallback ?? new Widget();
   end Choose;
 end Program;

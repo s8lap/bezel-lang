@@ -38,6 +38,7 @@ allowed to fail still catches regressions.
 
 ```
 cases/<case-id>.bzl   one rule, one complete source file, metadata in a //! header
+cases/<case-id>/      a case that needs two compilation units: main.bzl + deps
 manifest.tsv          GENERATED from the case headers by corpus.py build
 baseline.tsv          the verdict the compiler produces today, per case
 coverage.tsv          GENERATED: every documented section against its case count

@@ -24,7 +24,7 @@ public class Holder
 
   public method Inspect()
     case Current() of
-      var w: Widget => Console.WriteLine("found")
+      var w: Widget => Console.WriteLine(w)
     end case;
   end Inspect;
 end Holder;

@@ -18,8 +18,8 @@ public class Program
   public static method Main()
     var c := Color.Green;
     case c of
-      Color.Red | Color.Green => Console.WriteLine("warm-ish"),
-      _                       => Console.WriteLine("other")
+      Color.Red | Color.Green => Console.WriteLine("warm-ish");,
+      _                       => Console.WriteLine("other");
     end case;
   end Main;
 end Program;

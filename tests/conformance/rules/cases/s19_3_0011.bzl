@@ -12,7 +12,7 @@ public class Program
   public static method Main()
     var n := 42;
     case n of
-      var t => Console.WriteLine($"got {t}")
+      var t => Console.WriteLine($"got {t}");
     end case;
   end Main;
 end Program;

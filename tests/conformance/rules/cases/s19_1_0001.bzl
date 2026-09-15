@@ -13,8 +13,8 @@ module Conf;
 public class Program
   public static method Main()
     case of
-      1 => Console.WriteLine("one"),
-      _ => Console.WriteLine("other")
+      1 => Console.WriteLine("one");,
+      _ => Console.WriteLine("other");
     end case;
   end Main;
 end Program;

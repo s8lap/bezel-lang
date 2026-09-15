@@ -22,6 +22,6 @@ end Box;
 
 public class Program
   public method Demo()
-    var b: Box<string>;
+    using var b := new Box<string>("conf");
   end Demo;
 end Program;

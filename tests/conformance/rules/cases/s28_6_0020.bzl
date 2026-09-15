@@ -16,7 +16,7 @@ end Widget;
 
 public class Program
   public method Demo()
-    var w := new Widget();
+    using var w := new Widget();
     var cleanup: () -> () := lambda() => w.Dispose();
     cleanup();
   end Demo;

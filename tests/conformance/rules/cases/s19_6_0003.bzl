@@ -18,7 +18,7 @@ public class Program
         2 => "two");
       Console.WriteLine(label);
     catch
-      var ex: MatchFailureException => Console.WriteLine("no match")
+      var ex: MatchFailureException => Console.WriteLine("no match");
     end try;
   end Main;
 end Program;

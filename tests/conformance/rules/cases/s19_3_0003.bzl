@@ -14,8 +14,8 @@ public class Program
   public static method Main()
     var n: int? := 80;
     case n of
-      > 70 => Console.WriteLine("high"),
-      _    => Console.WriteLine("low")
+      > 70 => Console.WriteLine("high");,
+      _    => Console.WriteLine("low");
     end case;
   end Main;
 end Program;
