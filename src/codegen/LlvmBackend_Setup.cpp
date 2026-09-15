@@ -26366,6 +26366,12 @@ bool Emitter::lowerClosureLocalReassign(const ast::Expr& target,
         emitClosureRetain(newVal);
     builder_.CreateStore(newVal, slotAddr);
     emitClosureRelease(oldVal);
+    // fix #4422: track this local as reassigned so the LocalSymbol arm in
+    // emitClosureCall knows to emit emitClosureRelease after the call
+    // (reassigned locals are excluded from scope-end release).
+    if (auto* loc = dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(target)))
+        if (loc->decl)
+            closureLocalReassigned_.insert(static_cast<const void*>(loc->decl));
     return true;
 }
 

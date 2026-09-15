@@ -15168,6 +15168,14 @@ private:
     // — every entry it holds is, by construction, one of THIS scan's own
     // candidates.
     std::unordered_set<const void*> closureLocalCandidates_;
+    // fix #4422 (§27.5, v0.298): closure-typed locals that were reassigned
+    // via lowerClosureLocalReassign. For these locals, the scope-end release
+    // is suppressed (ClosureEscapeWalker marks any reassigned local as escaped),
+    // so the slot's final value is never released unless the call site emits
+    // a release. Tracked so the LocalSymbol arm in emitClosureCall can emit
+    // emitClosureRelease only for reassigned locals, avoiding a double-release
+    // for non-reassigned locals (whose scope-end release is already correct).
+    std::unordered_set<const void*> closureLocalReassigned_;
     // fix #2714 (§27.5 / §28.9, v0.286): parallel borrow-side sets — see
     // `collectClosureReleaseEligible` (the .cpp) for the rationale. The
     // `closureBorrowAll_` member holds EVERY borrow-initialized closure-typed

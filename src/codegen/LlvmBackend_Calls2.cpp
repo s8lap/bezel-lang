@@ -6512,7 +6512,19 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                     closurePtr = builder_.CreateLoad(ptrTy(), addr);
                 }
             }
-            return emitClosureCall(closurePtr, rt);
+            llvm::Value* r = emitClosureCall(closurePtr, rt);
+            // fix #4422 (§27.5, v0.298): a reassigned closure-typed local's
+            // final value is excluded from scope-end release (ClosureEscapeWalker
+            // marks any reassigned local as escaped), so without an explicit
+            // release here the closure leaks — 40 B per call. Only emit the
+            // release when the local was actually reassigned (tracked in
+            // closureLocalReassigned_): a non-reassigned local's scope-end
+            // release already balances the slot's reference, and emitting a second
+            // release here would double-free it.
+            if (loc->decl &&
+                closureLocalReassigned_.count(static_cast<const void*>(loc->decl)))
+                emitClosureRelease(closurePtr);
+            return r;
         }
     }
     // CG60: call through a function-typed field or auto-property —
