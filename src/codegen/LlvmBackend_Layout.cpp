@@ -3877,7 +3877,6 @@ llvm::Value* Emitter::boxLocalSlot(llvm::AllocaInst* slot,
                                    bool* wasGuardedBoxing) {
     auto it = cellVars_.find(slot);
     if (it != cellVars_.end()) {
-        // Already boxed: the slot is already a ptr-alloca holding the cell.
         //
         // fix #2303 / §27.5: the cell allocation is emitted at the FIRST
         // boxLocalSlot call site, behind a null-check guard. A SUBSEQUENT call
@@ -3918,10 +3917,18 @@ llvm::Value* Emitter::boxLocalSlot(llvm::AllocaInst* slot,
 
         llvm::Value* existingCell = builder_.CreateLoad(
             ptrTy(), newSlot, "cell.existing");
+        // fix #4210 (§27.5 / §28.9, v0.298): check if the cached cell was freed
+        // by boxedCellFree in a previous loop iteration. The envdtor stores the
+        // freed cell pointer to bz_freed_slot before calling free(); if our
+        // cached cell matches, it is stale and fresh allocation runs.
+        llvm::GlobalVariable* freedGlobal = getFreedSlotGlobal();
+        llvm::Value* freedCell = builder_.CreateLoad(ptrTy(), freedGlobal, "freed.cell");
+        llvm::Value* isStale = builder_.CreateICmpEQ(existingCell, freedCell, "cell.isstale");
         llvm::Value* isNull = builder_.CreateICmpEQ(
             existingCell, llvm::ConstantPointerNull::get(ptrTy()),
             "cell.isnull");
-        builder_.CreateCondBr(isNull, allocBB, doneBB);
+        llvm::Value* needsAlloc = builder_.CreateOr(isNull, isStale, "cell.needsalloc");
+        builder_.CreateCondBr(needsAlloc, allocBB, doneBB);
 
         // Allocation branch: first pass (or previous alloc was skipped).
         builder_.SetInsertPoint(allocBB);

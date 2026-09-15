@@ -33681,6 +33681,15 @@ void Emitter::collectCellFreeEligible(
         sharedCellEnvdtorFreeOwner_[key] = owner;
     }
 
+    // fix #4210 (§27.5 / §28.9, v0.298): record every captured entity that any
+    // escaping lambda captures.  This is the O(1) oracle for the boxedCellFree
+    // arming guard: when an escaping lambda also captures a local, none of the
+    // non-escaping co-capturers may arm boxedCellFree — the escaping envdtor
+    // reclaims the cell, and arming boxedCellFree would cause a double-free.
+    // Key space: the same as cellFreeEligible_ (DeclSymbol* / ParameterSymbol*).
+    for (const auto& [decl, _] : escapingCapturersOf)
+        declsCapturedByEscaping_.insert(decl);
+
     // A captured entity qualifies iff:
     //   - it appears in capturedByNonEscaping (at least one non-escaping lambda
     //     captures it → it was boxed and should be freed), AND
