@@ -149,7 +149,13 @@ divergences are what make a corpus untrustworthy.
 python3 tests/conformance/rules/corpus.py lint     # structure, ids, bijection
 python3 tests/conformance/rules/corpus.py build    # regenerate manifest.tsv
 python3 tests/conformance/rules/corpus.py summary  # per-section counts
+python3 tests/conformance/rules/names.py           # invented stdlib API
 ```
+
+`names.py` indexes every type and member the documents declare and reports any
+your cases use that they do not — the mechanical form of rule 1 above. It is a
+report, not a proof: its member tier misses inherited and extension members, so
+check a finding rather than obeying it. A name it flags is nearly always real.
 
 The lint is structural only — it cannot tell you whether the Bezel is right.
 That is what your trace and the critique pass are for.
