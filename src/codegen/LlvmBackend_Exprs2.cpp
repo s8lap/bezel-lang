@@ -1982,6 +1982,50 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
                         dcd.skipCellFreeOnUnwind =
                             unwindUnsafeCellFree_.count(
                                 static_cast<const void*>(decl)) != 0;
+                        // fix #4165 (§27.5/§28.9, stdlib §4.8, v0.295): if the
+                        // captured local is a string-keyed `DictionaryEntry<string,V>`
+                        // (bound to d.First()/... and in cellFreeEligible_), the
+                        // local's rebuilt Key's single producer +1 was never discharged:
+                        // the normal-scope dictEntryKeyRelease disposal was NOT registered
+                        // for it (StringEscapeWalker treats ANY capture as an escape,
+                        // per that predicate's own documented trade-off), and the envdtor
+                        // path (freeCellInEnvdtor) requires definitelyEscapingLambdas_
+                        // so it does not fire for a non-escaping closure either. This
+                        // flag parallels dictEntryKeyReleaseDeferred: in the SECOND
+                        // PASS of emitDisposals, emit the same GEP field 0 +
+                        // bz_string_release before the cell free. The type check
+                        // (isDictEntryStringKeyTypeRef on the LocalDecl's resolved
+                        // type) is identical to the #4127 escaping-case check;
+                        // the safety case is the same: singleCaptureLocals_ means
+                        // exactly one holder and exactly one +1 to balance.
+                        //
+                        // NOTE: we check cellFreeEligible_ (NOT dictEntryKeyReleaseEligible_)
+                        // because StringEscapeWalker's ANY-capture-is-escape rule means
+                        // dictEntryKeyReleaseEligible_ does NOT contain a captured local
+                        // even when the capturing lambda is non-escaping. cellFreeEligible_
+                        // is populated by collectCellFreeEligible's LambdaFinder, which
+                        // correctly distinguishes non-escaping from escaping captures.
+                        //
+                        // Narrow (fix-forward of c1237c9f): drop dictEntryForVarSlot
+                        // — the original fix's `dictEntryForVarSlot = locals_[key]`
+                        // returned the REBOUND cell-holder ptr* alloca (rebound at
+                        // Exprs2.cpp:1664 above) on this path too, not the original
+                        // struct alloca. The emission site (LlvmBackend_Disposal.cpp
+                        // SECOND PASS) now reads the cell's struct type from
+                        // cellVars_[d.slot] (set on both boxing paths in
+                        // boxLocalSlot), so the field is unused.
+                        if (auto* ld = dynamic_cast<const ast::LocalDecl*>(decl)) {
+                            if (cellFreeEligible_.count(
+                                    static_cast<const void*>(decl))) {
+                                const sema::TypeRef* rt =
+                                    ld->type ? ctx_.resolvedType(*ld->type)
+                                             : (ld->initializer
+                                                    ? ctx_.exprType(*ld->initializer)
+                                                    : nullptr);
+                                if (rt && isDictEntryStringKeyTypeRef(rt))
+                                    dcd.dictEntryKeyReleaseDeferred = true;
+                            }
+                        }
                         disposeStack_[ownerScopeIdx].push_back(dcd);
                         if (inlineN > 0) {
                             Disposal da{newSlot, nullptr};

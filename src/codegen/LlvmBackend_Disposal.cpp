@@ -6610,6 +6610,57 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
         // an entry — the cell leaks there instead of a use-after-free.
         if (it->boxedCellFree) {
             if (isUnwind && it->skipCellFreeOnUnwind) continue;
+            // fix #4165 (§27.5/§28.9, stdlib §4.8, v0.295): if this
+            // boxedCellFree entry also carries dictEntryKeyReleaseDeferred
+            // (set in consumeLastLambdaCapturedCells when the captured local
+            // is a string-keyed DictionaryEntry<string,V>), emit the Key
+            // release BEFORE freeing the cell. singleCaptureLocals_ is
+            // required for boxedCellFree registration, so exactly one holder
+            // and exactly one +1 to balance.
+            //
+            // Narrow (fix-forward of c1237c9f): the original fix's
+            // `dictEntryForVarSlot` lookup via `locals_[ce.key]` returned the
+            // REBOUND cell-holder ptr* alloca (lowerLambda's `locals_[decl]
+            // = newSlot` at Exprs2.cpp:1664 rebinds to the boxed cell holder
+            // before consumeLastLambdaCapturedCells reads it), not the
+            // original DictionaryEntry struct alloca — so the GEP type cast
+            // `dyn_cast<StructType>(...->getAllocatedType())` returned null
+            // and the key release was a no-op (17500 B / 1000 allocs leak
+            // unchanged from the pre-fix HEAD). The original struct alloca
+            // is no longer recoverable from locals_[key]; cellVarSyncSlot_
+            // is only populated on the GUARDED boxing path (boxLocalSlot
+            // line 4071), not the FRESH path the inline non-escaping closure
+            // capture takes. cellVars_ (keyed by the cell holder, i.e.
+            // it->slot itself) is populated by BOTH paths in boxLocalSlot
+            // — look up the cell's struct type there for the GEP field 0
+            // load.
+            if (it->dictEntryKeyReleaseDeferred) {
+                if (auto cvIt = cellVars_.find(it->slot);
+                    cvIt != cellVars_.end()) {
+                    if (auto* st = llvm::dyn_cast<llvm::StructType>(cvIt->second)) {
+                        llvm::Value* structPtr;
+                        if (it->slot->getAllocatedType()->isPointerTy()) {
+                            // Guarded: it->slot is cell holder (ptr*). Load
+                            // cell and cast.
+                            llvm::Value* cellTyped = builder_.CreatePointerCast(
+                                builder_.CreateLoad(ptrTy(), it->slot,
+                                                    "dictek.cell.ptr"),
+                                st->getPointerTo(), "dictek.cell.cast");
+                            structPtr = cellTyped;
+                        } else {
+                            // Non-guarded: it->slot IS the struct alloca
+                            // (the cell is the struct itself; no
+                            // indirection).
+                            structPtr = it->slot;
+                        }
+                        llvm::Value* keyAddr = builder_.CreateStructGEP(
+                            st, structPtr, 0, "dictek.addr");
+                        llvm::Value* keyVal = builder_.CreateLoad(
+                            ptrTy(), keyAddr, "dictek.val");
+                        emitStringRelease(keyVal);
+                    }
+                }
+            }
             llvm::Value* cell =
                 builder_.CreateLoad(ptrTy(), it->slot, "cell.ptr");
             builder_.CreateCall(freeFn(), {cell});
@@ -8036,6 +8087,63 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
         if (isUnwind && d.skipCellFreeOnUnwind) continue;
         llvm::Value* cell =
             builder_.CreateLoad(ptrTy(), d.slot, "cell.deferred.ptr");
+        // fix #4165 (§27.5/§28.9, stdlib §4.8, v0.295): if this deferred
+        // entry also carries dictEntryKeyReleaseDeferred, emit the DictionaryEntry
+        // Key release BEFORE freeing the cell — the same GEP field 0 +
+        // bz_string_release as dictEntryKeyRelease (LlvmBackend_Setup.cpp's
+        // emitDisposals arm), firing at the identical point with the identical
+        // safety case: singleCaptureLocals_ is required for boxedCellFreeDeferred
+        // registration, so exactly one holder and exactly one +1 to balance.
+        //
+        // d.dictEntryForVarSlot stores the ORIGINAL local's struct alloca
+        // (NOT the rebound cell holder; set at registration time in Exprs2.cpp).
+        // Use it to get the struct type for the GEP — the slot may be the
+        // struct itself (non-guarded: newSlot == slot) OR a cell holder
+        // (guarded: newSlot != slot). In the guarded case the local's struct
+        // was copied INTO the cell at boxing time and is still readable through
+        // the cell; the SECOND PASS runs after all reads-through-cell disposals,
+        // so the value is provably dead (no UAF). Mutually exclusive with
+        // dictEntryForSnapshot's own use of this field (the for-var snapshot
+        // path is a completely different disposal kind; the two flags never
+        // coincide).
+        if (d.dictEntryKeyReleaseDeferred) {
+            // fix #4165 (§27.5/§28.9, stdlib §4.8, v0.295) — narrow
+            // (fix-forward of c1237c9f): see FIRST PASS note. Look up the
+            // cell's struct type via cellVars_ (keyed by the cell holder
+            // d.slot, set on both boxing paths in boxLocalSlot). The original
+            // struct alloca is no longer recoverable from locals_[key] (it is
+            // rebound to the cell holder by lowerLambda before this consumer
+            // runs), and cellVarSyncSlot_ is only set on the GUARDED boxing
+            // path — so neither maps to the right struct alloca here. The
+            // cell itself holds the DictionaryEntry struct by value, and
+            // cellVars_ records its type.
+            if (auto cvIt = cellVars_.find(d.slot);
+                cvIt != cellVars_.end()) {
+                if (auto* st = llvm::dyn_cast<llvm::StructType>(cvIt->second)) {
+                    // The slot is either the struct itself or a cell holder.
+                    // Check the slot's allocated type: struct = direct
+                    // access, ptr* = load cell and cast.
+                    llvm::Value* structPtr;
+                    if (d.slot->getAllocatedType()->isPointerTy()) {
+                        // Guarded: d.slot is cell holder (ptr*). The cell
+                        // pointer is already loaded into `cell` above
+                        // (before this block, line ~7956). Cast and use.
+                        llvm::Value* cellTyped = builder_.CreatePointerCast(
+                            cell, st->getPointerTo(),
+                            "dictek.deferred.cellcast");
+                        structPtr = cellTyped;
+                    } else {
+                        // Non-guarded: d.slot IS the struct alloca.
+                        structPtr = d.slot;
+                    }
+                    llvm::Value* keyAddr = builder_.CreateStructGEP(
+                        st, structPtr, 0, "dictek.deferred.addr");
+                    llvm::Value* keyVal = builder_.CreateLoad(
+                        ptrTy(), keyAddr, "dictek.deferred.val");
+                    emitStringRelease(keyVal);
+                }
+            }
+        }
         builder_.CreateCall(freeFn(), {cell});
         // Null the guarded holder so a later re-entry allocates a fresh cell.
         builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), d.slot);

@@ -1922,6 +1922,27 @@ private:
         // escaping env holds the cell past scope exit → no UAF). `slot` is the
         // cell-holder ptr-alloca; the cell ptr may be null (free(null) no-op).
         bool boxedCellFreeDeferred = false;
+        // fix #4165 (§27.5/§28.9, stdlib §4.8, v0.295): parallel to
+        // `dictEntryKeyRelease` (LlvmBackend_Setup.cpp) but for a
+        // string-keyed `DictionaryEntry<string,V>` local captured by a
+        // NON-ESCAPING closure (one whose sole capturing closure is proven
+        // non-escaping by cellFreeEligible_ and is therefore registered for
+        // deferred cell-free via `boxedCellFreeDeferred`, above). The local
+        // was NOT registered in `dictEntryKeyReleaseEligible_` by the
+        // isFreshDictEntryKeyReleaseTerminalLocal walk (StringEscapeWalker
+        // treats ANY closure capture as an escape, per that predicate's own
+        // documented trade-off), so the normal-scope `dictEntryKeyRelease`
+        // disposal never fires. This flag is set alongside `boxedCellFreeDeferred`
+        // on the SAME Disposal entry (same slot, same owner-scope depth, same
+        // deferred dedup); in the SECOND PASS (LlvmBackend_Disposal.cpp's
+        // boxedCellFreeDeferred block), the key release is emitted before the
+        // cell free — identical GEP field 0 + bz_string_release as
+        // dictEntryKeyRelease, identical safety case: exactly one holder
+        // (singleCaptureLocals_), the value is provably dead by second-pass
+        // time (all env refs released, all owner reads-through-cell disposals
+        // complete), no UAF or double-free. Fires on BOTH normal and unwind
+        // exits, symmetrically with `dictEntryKeyRelease` itself.
+        bool dictEntryKeyReleaseDeferred = false;
         // fix #3752 (§28.2 / §27.5 / §28.9, v0.286): the CONTENT analogue of
         // `boxedCellFreeDeferred`. A runtime-managed (`string` / function-typed)
         // local captured from a STRICTLY DEEPER scope keeps its single +1 in the

@@ -16765,6 +16765,22 @@ void Emitter::consumeLastLambdaCapturedCells() {
                     Disposal dcd{ce.newSlot, nullptr};
                     dcd.boxedCellFreeDeferred = true;
                     dcd.skipCellFreeOnUnwind = ce.unwindUnsafe;  // fix #2334
+                    // fix #4165 (§27.5/§28.9, stdlib §4.8, v0.295): if this
+                    // captured local is a string-keyed DictionaryEntry, also set
+                    // dictEntryKeyReleaseDeferred so the SECOND PASS emits the
+                    // key release before the cell free.
+                    if (auto* ld = dynamic_cast<const ast::LocalDecl*>(
+                            static_cast<const ast::Node*>(ce.key))) {
+                        if (locals_.count(static_cast<const ast::Node*>(ce.key))) {
+                            const sema::TypeRef* rt =
+                                ld->type ? ctx_.resolvedType(*ld->type)
+                                         : (ld->initializer
+                                                ? ctx_.exprType(*ld->initializer)
+                                                : nullptr);
+                            if (rt && isDictEntryStringKeyTypeRef(rt))
+                                dcd.dictEntryKeyReleaseDeferred = true;
+                        }
+                    }
                     disposeStack_[ownerScopeIdx].push_back(dcd);
                 }
             }
@@ -16859,7 +16875,33 @@ void Emitter::consumeLastLambdaCapturedCells() {
         Disposal dc{ce.newSlot, nullptr};
         dc.boxedCellFree = true;
         dc.skipCellFreeOnUnwind = ce.unwindUnsafe;  // fix #2334
-        disposeStack_.back().push_back(dc);
+        // fix #4165 (§27.5/§28.9, stdlib §4.8, v0.295): if this captured
+                        // local is a string-keyed `DictionaryEntry<string,V>` (bound to
+                        // d.First()/...), the local's rebuilt Key's single producer
+                        // +1 was never discharged — the normal-scope dictEntryKeyRelease
+                        // disposal was not registered (StringEscapeWalker treats ANY
+                        // capture as an escape), and the envdtor path requires
+                        // definitelyEscapingLambdas_ so it does not fire for a
+                        // non-escaping closure. Set dictEntryKeyReleaseDeferred: in
+                        // emitDisposals's SECOND PASS, emit the same GEP field 0 +
+                        // bz_string_release as dictEntryKeyRelease before the cell free.
+                        // singleCaptureLocals_ means exactly one holder and exactly
+                        // one +1 to balance — the same safety case as #4127's envdtor
+                        // path. dictEntryForVarSlot stores the original local's
+                        // struct alloca for the GEP.
+                        if (auto* ld = dynamic_cast<const ast::LocalDecl*>(
+                                static_cast<const ast::Node*>(ce.key))) {
+                            if (locals_.count(static_cast<const ast::Node*>(ce.key))) {
+                                const sema::TypeRef* rt =
+                                    ld->type ? ctx_.resolvedType(*ld->type)
+                                             : (ld->initializer
+                                                    ? ctx_.exprType(*ld->initializer)
+                                                    : nullptr);
+                                if (rt && isDictEntryStringKeyTypeRef(rt))
+                                    dc.dictEntryKeyReleaseDeferred = true;
+                            }
+                        }
+                        disposeStack_.back().push_back(dc);
         // #782: a captured move-only OWNING inline-array's elements live in the
         // boxed cell. Dispose each non-null element THROUGH the cell, then null
         // the slot — pushed AFTER boxedCellFree so it fires BEFORE it (reverse
