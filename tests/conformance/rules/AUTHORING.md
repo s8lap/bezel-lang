@@ -182,12 +182,32 @@ Hard rules, each of which has cost somebody a day:
 For every case, in your head or on paper:
 
 - What does the section actually say? Quote it into `rule:`.
-- Does my code reach that rule, or does it die earlier on something else? A
-  reject case that fails to parse proves nothing about a semantic rule.
+- **For a reject case, apply the deletion test**: delete the offending
+  construct and confirm the remainder compiles. If it does not, the case is not
+  isolated — it has a second, earlier ground for rejection and will pass for the
+  wrong reason, hiding the real gap forever. Failing to parse is the obvious
+  version of this; a *semantic* second ground is the one that actually gets
+  through, and in this language it is almost always an ownership rule the case
+  did not mean to touch.
 - For an accept case: is there any *other* rule in the language that rejects
   this file? (The usual culprits: an undischarged owned local, a static method
   returning a class type, a missing visibility keyword, a borrow that outlives
   its source.)
+- **Is my scaffolding fighting me?** When the rule under test is not about
+  ownership, scaffold with a runtime-managed type — `string`, a primitive, a
+  record — rather than a class. A class-typed local carries an ownership
+  classification and can manufacture a collateral error out of nowhere: a
+  captured binding reassigned inside a closure, a borrow returned under an
+  `owned` return, a merge of an owned arm with a borrowed one. `string` carries
+  no classification at all and cannot do this to you. Three of the first
+  batch's four real defects were exactly this, all in cases about nullability.
+- **Am I observing my own rule?** A case that proves its point by rendering
+  something is leaning on §18.5's and §8.5's rendering rules. That is fine when
+  the rendering is incidental, and wrong when the rendering IS the assertion —
+  then the case passes or fails on another section's behaviour while claiming
+  yours, and a regression there is reported as a divergence here. Observe your
+  rule directly where you can (compare the value, print a marker from the branch
+  that ran).
 - For a run case: trace every path and say exactly what the first line of
   standard output is.
 

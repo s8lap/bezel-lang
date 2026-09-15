@@ -15,9 +15,5 @@ public class Widget
 end Widget;
 
 record Holder
-  private owned _c: Widget;
-
-  public constructor(owned c: Widget)
-    _c := c;
-  end constructor;
+  private owned _c: Widget?;
 end Holder;
