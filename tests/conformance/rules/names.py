@@ -53,7 +53,8 @@ TYPE_POSITION_RES = (
     re.compile(r':\s*(?:owned\s+|scoped\s+)?\[?\d*\s*(?:owned)?\]?\s*([A-Z]\w*)'),
     re.compile(r'\bnew\s+([A-Z]\w*)'),
     re.compile(r'\b(?:is|as)\s+(?:not\s+)?([A-Z]\w*)'),
-    re.compile(r'\b([A-Z]\w*)\s*<'),
+    # `Array<int>` binds tight; `a.Kg < b` and `x <> y` are not generics.
+    re.compile(r'\b([A-Z]\w*)<(?![>=])'),
     re.compile(r'\b(?:typeof|default)\(\s*([A-Z]\w*)'),
     re.compile(r'^\s*(?:public|internal|private|protected)?\s*\w*\s*'
                r'(?:class|interface|record|enum|choice)\s+\w+\s*'
@@ -94,6 +95,17 @@ def build_index(docs_dir):
                 c = ENUM_CONST_RE.match(line)
                 if c:
                     index[current].add(c.group(1))
+    # The exception hierarchy is stated as prose and tables in spec §31.4 rather
+    # than as one declaration block, so pick the names up wherever the documents
+    # write them in backticks.
+    for name in ("Bezel_Language_Spec.md", "Bezel_Standard_Library.md"):
+        path = os.path.join(docs_dir, name)
+        if not os.path.exists(path):
+            continue
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+        for exc in re.findall(r'`([A-Z]\w*Exception)`', text):
+            index.setdefault(exc, set())
     return index
 
 
