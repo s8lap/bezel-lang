@@ -150,7 +150,12 @@ python3 tests/conformance/rules/corpus.py lint     # structure, ids, bijection
 python3 tests/conformance/rules/corpus.py build    # regenerate manifest.tsv
 python3 tests/conformance/rules/corpus.py summary  # per-section counts
 python3 tests/conformance/rules/names.py           # invented stdlib API
+python3 tests/conformance/rules/coverage.py --invariants 28.5   # the C rows for a section
 ```
+
+`coverage.py --invariants <section>` prints every Appendix C invariant citing
+that section (or any subsection under it). Those rows are the authoritative rule
+index — work through them, and say in your report which you covered.
 
 `names.py` indexes every type and member the documents declare and reports any
 your cases use that they do not — the mechanical form of rule 1 above. It is a

@@ -158,7 +158,23 @@ def main(argv, base_dir=None):
     ap.add_argument("--gaps", action="store_true",
                     help="list uncovered sections, densest first")
     ap.add_argument("--top", type=int, default=40)
+    ap.add_argument("--invariants", default="",
+                    help="print the Appendix C rows citing sections under this "
+                         "prefix (e.g. 28, or 28.3) and exit")
     args = ap.parse_args(argv)
+
+    if args.invariants:
+        want = args.invariants.lstrip("\u00a7")
+        rows = parse_appendix_c(os.path.join(args.docs, "Bezel_Language_Spec.md"))
+        hits = [r for r in rows
+                if any(ref == want or ref.startswith(want + ".")
+                       for ref in r["refs"])]
+        for row in hits:
+            print("[{}] {}".format(row["group"], row["text"]))
+            print()
+        print("{} of {} Appendix C invariants cite \u00a7{}"
+              .format(len(hits), len(rows), want))
+        return 0
 
     rows, invariants, c_per_section, problems = build(args.docs, base)
     for p in problems:
