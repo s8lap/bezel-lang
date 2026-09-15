@@ -1496,6 +1496,21 @@ std::unique_ptr<ast::Member> Parser::parseMember() {
         const bool isPure =
             std::find(modifiers.begin(), modifiers.end(),
                       std::string_view("pure")) != modifiers.end();
+        // fix #4414 (§30.1, v0.300): `async` is not admitted on a
+        // constructor — only methods and lambdas carry it (A.4 admits it in
+        // MethodDecl and LambdaExpr only). The shared member-modifier
+        // prefix above over-admits `async`; the ConstructorDecl AST does
+        // not preserve the modifiers vector, so reject here at parse time
+        // rather than in sema (same shape as the `pure`-not-admitted-on-
+        // event check at line ~1300).
+        if (std::find(modifiers.begin(), modifiers.end(),
+                      std::string_view("async")) != modifiers.end()) {
+            diagnostics_.report(
+                Severity::Error, current_.location,
+                "`async` is not admitted on a constructor — `async` is a "
+                "method/lambda modifier (A.4 admits it in MethodDecl and "
+                "LambdaExpr only; §30.1, v0.300)");
+        }
         if (!isStatic && visibility == ast::Visibility::None) {
             diagnostics_.report(Severity::Error, current_.location,
                                 "expected member visibility before "
@@ -1560,6 +1575,18 @@ std::unique_ptr<ast::Member> Parser::parseMember() {
             diagnostics_.report(
                 Severity::Error, current_.location,
                 "destructor has no visibility per §A.4");
+        }
+        // fix #4414 (§30.1, v0.300): same as the constructor branch above
+        // — the shared member-modifier prefix over-admits `async` and the
+        // DestructorDecl AST does not preserve the modifiers vector, so
+        // reject at parse time rather than in sema.
+        if (std::find(modifiers.begin(), modifiers.end(),
+                      std::string_view("async")) != modifiers.end()) {
+            diagnostics_.report(
+                Severity::Error, current_.location,
+                "`async` is not admitted on a destructor — `async` is a "
+                "method/lambda modifier (A.4 admits it in MethodDecl and "
+                "LambdaExpr only; §30.1, v0.300)");
         }
         auto dtor = std::make_unique<ast::DestructorDecl>();
         advance(); // past `destructor`
