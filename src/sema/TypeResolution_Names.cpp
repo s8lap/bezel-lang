@@ -2842,17 +2842,58 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                     ref.kind = TypeRef::Kind::Error;
                     return;
                 }
-                // Build a scope that includes the alias's own generic parameters,
-                // so that resolving the aliasedType can see e.g. `T` in
-                // `type Alias<T> := [1]T;` even when the caller's `scope`
-                // (e.g. a method scope) doesn't have `T` bound.
+                // fix #4105 (aliasScope fallback, narrower): when resolving a
+                // generic alias's aliasedType (e.g. `type Alias<T> := [1]T;`)
+                // at a reference site whose scope does NOT bind `T` (e.g. a
+                // method return type), the inner `T` must still resolve.  Build
+                // a per-alias scope binding the alias's own generic params and
+                // pass it to resolveType.  This is the broad-coverage fallback
+                // for nested non-bare alias bodies.
                 Scope aliasScope;
                 aliasScope.parent = scope;
                 for (const auto& g : aliasDecl->genericParams) {
                     aliasScope.names[g.name] = nullptr;
                 }
-                if (TypeRef* underlying =
-                        resolveType(*aliasDecl->aliasedType, &aliasScope)) {
+                // fix #4447 (§27.8, v0.300): when the alias body is EXACTLY a
+                // bare generic param (`type IdP11<T> := T;`), the bare `T`
+                // must resolve to the CONCRETE type arg (`int`), not an
+                // "unresolved type name" error.  Build the alias-substitution
+                // map first; if the aliased type is a bare generic param
+                // (single-part Named with no generic args and no declaration),
+                // look it up in aliasSubst and use the concrete type directly.
+                std::unordered_map<std::string_view, TypeRef*> aliasSubst;
+                for (std::size_t gi = 0;
+                     gi < aliasDecl->genericParams.size() &&
+                     gi < t.genericArgs.size(); ++gi) {
+                    if (!t.genericArgs[gi]) continue;
+                    TypeRef* concreteArg =
+                        resolveType(*t.genericArgs[gi], scope);
+                    if (!concreteArg) continue;
+                    aliasSubst[aliasDecl->genericParams[gi].name] =
+                        concreteArg;
+                }
+                TypeRef* underlying = nullptr;
+                if (aliasDecl->aliasedType &&
+                    aliasDecl->aliasedType->kind == ast::TypeKind::Named &&
+                    aliasDecl->aliasedType->name &&
+                    aliasDecl->aliasedType->name->parts.size() == 1 &&
+                    aliasDecl->aliasedType->genericArgs.empty()) {
+                    auto it = aliasSubst.find(
+                        aliasDecl->aliasedType->name->parts.front());
+                    if (it != aliasSubst.end()) {
+                        underlying = it->second;
+                    }
+                }
+                if (!underlying) {
+                    if (TypeRef* resolved =
+                            resolveType(*aliasDecl->aliasedType, &aliasScope)) {
+                        underlying = resolved;
+                    } else {
+                        underlying =
+                            resolveType(*aliasDecl->aliasedType, scope);
+                    }
+                }
+                if (underlying) {
                     // fix #4188 (§27.8, v0.298): `underlying` is the alias's
                     // CACHED TypeRef, resolved once at the alias's own
                     // declaration against a throwaway scope that binds the
