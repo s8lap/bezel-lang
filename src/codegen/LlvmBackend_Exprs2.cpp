@@ -1927,6 +1927,46 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
                 lce.unwindUnsafe = unwindUnsafeCellFree_.count(
                                        static_cast<const void*>(decl)) != 0;
                 lce.pushScopeDepth = disposeStack_.size();  // fix #4261 §28.3
+                // fix #4165 (§27.5/§28.9, stdlib §4.8, v0.295): if the captured
+                // local is a string-keyed `DictionaryEntry<string,V>` (bound to
+                // d.First()/.Last()/.Single()/.ElementAt(i), per
+                // isFreshDictEntryKeyReleaseTerminalLocal / #3720), the local's
+                // rebuilt Key's single producer +1 was never discharged: the
+                // normal-scope dictEntryKeyRelease disposal was NOT registered
+                // for it (StringEscapeWalker treats ANY capture as an escape,
+                // per that predicate's own documented trade-off), and the
+                // envdtor path (freeCellInEnvdtor) requires
+                // definitelyEscapingLambdas_ so it does not fire for a
+                // non-escaping closure either. The cell gets freed by
+                // boxedCellFree at scope end, but the cell holds the
+                // DictionaryEntry struct BY VALUE with the rebuilt string Key
+                // at field 0 — that Key leaks (32 B calloc'd `bz_string_t`
+                // header + N B malloc'd payload, one of each per call, 500
+                // calls → 500 × (32 + N) B). Set this flag so
+                // consumeLastLambdaCapturedCells propagates it onto the
+                // boxedCellFree Disposal as `dictEntryKeyReleaseDeferred` —
+                // the FIRST PASS arm in emitDisposals already emits the GEP
+                // field 0 + bz_string_release before the cell free under that
+                // flag (set in #4165's pre-existing the `declaredShallower`
+                // / boxedCellFreeDeferred arm).
+                //
+                // Same SingleDecl-only restriction as the `declaredShallower`
+                // arm's identical check at line 2036 (LOCALDECL-DEBT comment):
+                // captured-local map is `const void*`-keyed; `const` locals
+                // never reach this arm. cellFreeEligible_ gating is preserved
+                // by the surrounding `if (!alreadyBoxed && … &&
+                // cellFreeEligible_.count(decl))` — `cellFreeEligible_` is
+                // populated by collectCellFreeEligible's LambdaFinder, which
+                // correctly distinguishes non-escaping from escaping captures.
+                if (auto* ld = dynamic_cast<const ast::LocalDecl*>(decl)) {
+                    const sema::TypeRef* rt =
+                        ld->type ? ctx_.resolvedType(*ld->type)
+                                 : (ld->initializer
+                                        ? ctx_.exprType(*ld->initializer)
+                                        : nullptr);
+                    if (rt && isDictEntryStringKeyTypeRef(rt))
+                        lce.dictEntryKeyReleaseDeferred = true;
+                }
                 lastLambdaCapturedCells_.push_back(lce);
             }
             // fix #3508 (§27.5 / §28.9, v0.286): the #969/#3403 depth guard
