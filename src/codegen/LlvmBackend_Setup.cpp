@@ -27182,6 +27182,22 @@ struct ClosureEscapeWalker {
     const sema::SemaContext& ctx;
     const void* target;   // the LocalDecl node we are testing
     bool escaped = false;
+    // fix #2107-follow-up (§27.5 / §28.9, v0.298): true when the ONLY escape
+    // observed for `target` came from a direct reassignment to `target`
+    // itself (the AssignmentStmt / IncrementStmt arms at line 27630-27640
+    // below — these mark `escaped = true` because the old reference is
+    // overwritten). When this is the case AND `target` is CALLED in this
+    // body, the call-site release is unsound (would free the cell after the
+    // FIRST call, leaving the SECOND call's read on a freed pointer — exit
+    // 139 SIGSEGV, lambda_divergent_2107's
+    // spec_27_3_divergent_under_reassign_target). The post-walk override in
+    // collectClosureReleaseEligible (line 27846 below) re-arms scope-end
+    // release in that exact shape: the cell stays alive across calls, scope-
+    // end fires once at function exit. NOT an escape through a captured
+    // lambda's body or a `return f` transfer — those still leak the +1
+    // safely (the prior behavior). See the doc comment above
+    // closureLocalReassigned_ for the post-walk override.
+    bool escapedDueToReassign = false;
     // FINDING [1] / §28.9 / §28.3: true while walking inside a lambda body. A
     // captured closure local read inside a nested lambda is held by that
     // lambda's env, which outlives the producing scope, so it must be an ESCAPE
