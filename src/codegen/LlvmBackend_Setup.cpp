@@ -27976,6 +27976,9 @@ void Emitter::collectCapturedCellClosureLocals(
     // walker against the body's statements.
     std::function<void(const ast::Stmt*)> scan = [&](const ast::Stmt* s) {
         if (!s) return;
+        // LOCALDECL-ONLY: const locals can't be reassigned, so the captured-cell
+        // + reassign escape tracking below cannot apply to them — the walker
+        // only ever produces meaningful work for plain `var` LocalDecls.
         if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s)) {
             const sema::TypeRef* lt = nullptr;
             if (ld->type) lt = ctx_.resolvedType(*ld->type);
