@@ -2,10 +2,12 @@
 //! doc: stdlib
 //! section: 6.5
 //! title: a handler capturing a constructor parameter other than this is rejected
-//! rule: Captured constructor parameters other than `this` are not admitted —
-//!   a constructor parameter is a borrow of a caller local and does not
-//!   provably outlive the constructed object.
-//! cites: 6.5
+//! rule: A captured constructor parameter other than `this` is not admitted
+//!   where it contributes a borrow source (spec §28.3) — a class-, interface-
+//!   or plain function-typed parameter, or an `owned` one: such a parameter is
+//!   a borrow of a caller local and does not provably outlive the constructed
+//!   object (v0.301).
+//! cites: 6.5, 28.3, 28.14
 //! expect: reject
 //! diagnostic: capture
 module Conf;

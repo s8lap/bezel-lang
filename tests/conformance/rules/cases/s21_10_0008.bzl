@@ -2,10 +2,11 @@
 //! doc: spec
 //! section: 21.10
 //! title: a local type may not appear in a member signature
-//! rule: The name may not appear in any member signature — parameter, return,
-//!   field/property/indexer, generic-constraint, or base/interface positions —
-//!   which is a compile error naming that rule ("a method-local type may not
-//!   appear in a member signature").
+//! rule: The name may not appear in any member signature of an ENCLOSING or
+//!   SIBLING declaration — parameter, return, field/property/indexer,
+//!   generic-constraint, or base/interface positions — which is a compile error
+//!   naming that rule ("a method-local type may not appear in a member
+//!   signature"), v0.301.
 //! cites: 21.10, C.1
 //! expect: reject
 //! diagnostic: member signature

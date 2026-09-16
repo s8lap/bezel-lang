@@ -2,10 +2,12 @@
 //! doc: spec
 //! section: 29.11
 //! title: a bound lazy query with no consumption point draws the must-use warning
-//! rule: The lazy query is, ownership-wise, an ordinary minted caller-owned frame;
-//!   K3.14's must-use warning is suppressed **where the binding's consumption point
-//!   is statically visible** — so a binding with none carries it.
-//! cites: 29.11, 28.3
+//! rule: A bound lazy query whose enumeration right is never spent draws
+//!   K3.14's must-use warning at its auto-drop (v0.301); the warning is
+//!   suppressed where the binding's consumption point is statically visible.
+//!   §28.9's ceremony exemption does not reach a compiler-synthesized frame,
+//!   so the lint applies on §28.3's ordinary terms.
+//! cites: 29.11, 28.3, 28.9
 //! expect: warn
 //! diagnostic: must use
 module Conf;

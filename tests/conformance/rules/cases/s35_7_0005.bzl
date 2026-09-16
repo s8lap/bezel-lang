@@ -4,9 +4,10 @@
 //! title: direct Equals and GetHashCode calls are admitted on an owning choice that declares them
 //! rule: The exemption for **direct `Equals`/`GetHashCode` calls** is keyed on
 //!   the declared **members**, not on the operators: a choice that declares
-//!   plain `Equals(other: C): bool` and `GetHashCode(): int` admits those calls
+//!   plain `Equals(other: C): bool` or `GetHashCode(): int` admits THAT call
 //!   on **every** classification, owning and borrow-bearing included — they
-//!   resolve statically to the declared members.
+//!   resolve statically to the declared members, so the exemption is per member
+//!   and needs no pair (v0.301).
 //! cites: 35.7, 35.2, 25.2
 //! expect: run
 //! output: False
