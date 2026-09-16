@@ -16688,24 +16688,27 @@ void Emitter::consumeLastLambdaCapturedCells() {
     // OUTER lambda and must be PRESERVED for that lambda's later consume call.
     const std::size_t currentScopeDepth = disposeStack_.size();
     for (const auto& ce : lastLambdaCapturedCells_) {
-        // fix #4261 (§28.3, v0.300): skip entries from outer lambdas
-        // (shallower pushScopeDepth) and outer LOCAL captures (declared shallower
-        // than the capture site — the #969 deferred path handles the disposal).
-        // Without this, an outer local captured at the CURRENT depth
-        // (pushScopeDepth == currentScopeDepth) would be processed and erased,
-        // freeing the cell before recursive calls complete (self-referential UAF).
-        // Note: uses inline find to avoid redeclaring `dd` (used at line 16806).
+        // fix #4261 (§28.3, v0.298): skip entries from outer lambdas
+        // (shallower pushScopeDepth). Entries at the CURRENT scope are
+        // processed below — the #969 deferred path at line ~16808 then
+        // decides whether to free at the current scope or defer to the
+        // owner's scope (the documented read-after-inner-block hazard for
+        // outer locals).
         if (ce.pushScopeDepth < currentScopeDepth) {
             // Belongs to an outer lambda; skip — it will be handled by that
             // lambda's own consume call.
             continue;
         }
-        // Outer-local check: entry is at current depth but was declared shallower
-        // (the #969 deferred path handles it).
-        auto itOuter = declScopeDepth_.find(ce.key);
-        if (itOuter != declScopeDepth_.end() && itOuter->second < currentScopeDepth) {
-            continue;  // skip; #969 defers or outer lambda's consume handles it
-        }
+        // fix #3498 / fix #4210 (narrow forward, §27.5 / §28.9 / §28.14):
+        // REMOVED the early outer-local skip that 45863de7 added.
+        // The intent was to defer to #969's path, but the early `continue`
+        // bypassed the deferral AND the current-scope free, leaking the
+        // cell entirely for in-loop callback / capture-loop shapes whose
+        // capture site sits at a depth > the captured local's depth.
+        // The #969 deferred check later in this loop is the SOUND gate —
+        // extended in this commit to handle non-pattern-binding locals by
+        // deferring to the OWNER scope (the local's declaration scope)
+        // rather than leaking. See the fix #4210 block at line ~16858.
         // This entry is from the current or a nested scope; process it.
         // Check: does this cell's slot have any reads-through-cell disposal?
         // #966: the cell must outlive ANY disposal that reads the captured
@@ -16830,7 +16833,52 @@ void Emitter::consumeLastLambdaCapturedCells() {
             auto* keyNode = static_cast<const ast::Node*>(ce.key);
             bool patternBinding =
                 dynamic_cast<const ast::BindingPattern*>(keyNode) != nullptr;
-            if (patternBinding) {
+            // fix #4210 (narrow forward, §27.5 / §28.9 / §28.14, v0.298):
+            // EXTEND the #969 deferred-cell-free path to ALL outer-scope
+            // captures (not just case-arm `BindingPattern`s). The cell is
+            // held only by non-escaping lambdas — `cellFreeEligible_` is the
+            // gate that admitted the entry to `lastLambdaCapturedCells_`
+            // (LlvmBackend_Exprs2.cpp:1823 / #694 / #3426), so every
+            // closure's env that points at this cell is released by the
+            // owner scope exit (the envdtor's release happens before the
+            // deferred cell free fires via the SECOND PASS in
+            // LlvmBackend_Disposal.cpp). The cell can be safely freed in
+            // the owner scope, not the inner lambda scope.
+            //
+            // Without this, the verbatim reproducer in #4210:
+            //
+            //     var i := 0;
+            //     while i < 500 do
+            //       var f := lambda(): int => do new Res(i); return 1; end;
+            //       _ := f();
+            //       i := i + 1;     /* reads i through the cell */
+            //     end;
+            //
+            // leaks the cell because the cell must persist across iterations
+            // (`i := i + 1` and the loop condition `i < 500` both read
+            // through the cell), so freeing at the inner scope is unsound
+            // AND the previous conservative `continue` (no free registered)
+            // leaks until program end. Deferring to the OWNER scope (Main's
+            // body) preserves cross-iteration reads and frees the cell at
+            // Main's exit — the sound point.
+            //
+            // For #3498 T5 (`for var i in 0..<50 do s.Take(lambda () =>
+            // total := total + i; end); return total;`), the same logic
+            // applies: `total` is captured by an in-loop lambda passed to
+            // a §28.14 call-bounded parameter (`Take`); the cell must
+            // persist across iterations so `total` accumulates, and
+            // deferring to Step's scope fires the free at Step's exit
+            // AFTER `return total` reads the cell — preserving the
+            // `122500` sum.
+            //
+            // Soundness: the deferred free in the owner scope runs in
+            // `emitDisposals`'s SECOND PASS, after every main-loop disposal
+            // (the #1017 ordering). Any disposal that reads through the
+            // cell — including the captured local's own disposal — has
+            // already completed before the deferred cell free fires, so no
+            // UAF is possible.
+            (void)patternBinding;
+            {
                 std::size_t ownerScopeIdx = dd->second - 1;
                 bool alreadyDeferred = false;
                 for (const auto& existing : disposeStack_[ownerScopeIdx])
