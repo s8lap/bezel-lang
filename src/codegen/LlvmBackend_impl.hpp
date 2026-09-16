@@ -248,6 +248,36 @@ inline bool calleeReturnMayAliasStringArgUnretained(
     // body fields.  Record/Choice field types are always locally inspectable
     // (the declaration is never imported separately from the method), so no
     // `isImported` guard is needed here — unlike the Class-field walk below.
+    //
+    // fix #4254 generic-substitution (§9.7 / §28.9, v0.298): the original
+    // check looked ONLY at the declaration's bare field types, so a generic
+    // record `Box<T>(Value: T)` instantiated as `Box<string>` saw `Value: T`
+    // (an unresolved Named ref with no declaration) and answered false —
+    // `calleeReturnMayAliasStringArgUnretained` then declined the relaxation,
+    // `s` stayed armed for its own scope-end release, and
+    // `Helper.MakeInner(s: string): Box<string> return new Box<string>(s)`
+    // called as `var inner := Helper.MakeInner(s)` in a scope narrower than a
+    // later read of `inner.Value` produced a heap-use-after-free
+    // (issue 4254 PIN 2/3 — the issue's own `Box<Box<string>>` shape, measured
+    // by `narrow_scope_helper_returned_nested_generic_record_no_longer_uaf`).
+    //
+    // The substitution map is built from `t->genericArgs` (the caller-side
+    // instantiation) and the declaration's generic-param names
+    // (`sema::genericParamNames`). For each bare type-parameter field type
+    // that resolves through the map, the substituted TypeRef is consulted
+    // instead — exactly the way `isFreshRecordConstructionOfExactType`'s
+    // own `isBareTypeParamRef` arm resolves a bare component through
+    // `nty->genericArgs` (#3964, same shape).
+    //
+    // Deliberately does NOT recurse into a substituted type that is itself a
+    // Record/Choice with a string field (e.g. `Pair<Box<string>>` over a
+    // declaration `record Pair<A>(First: A)`): the `Box<string>` substitution
+    // does not enter the `Pair` walk as a nested field — its own fast-path
+    // constructor is one level DEEPER than the `Pair` constructor's raw
+    // positional store, so the raw-store UAF shape is the same there too,
+    // but admitting it here would extend this predicate beyond what is
+    // measurable for the filed repro. Filed separately, not widened here
+    // (CLAUDE.md "no while we're at it").
     auto recordOrChoiceHasStringField =
         [&](const sema::TypeRef* t) -> bool {
             if (!t || t->kind != sema::TypeRef::Kind::Named ||
@@ -267,6 +297,35 @@ inline bool calleeReturnMayAliasStringArgUnretained(
                 !ts->genericParams.empty()) {
                 return false;
             }
+            // Build the substitution map (declared param-name -> caller-side
+            // generic argument). Empty for a non-generic record or a generic
+            // record instantiated with no / mismatched genericArgs — both
+            // shape the predicate's existing no-substitution behaviour for
+            // the genericParams-empty / genericArgs-mismatch case.
+            std::unordered_map<std::string_view, const sema::TypeRef*> subst;
+            if (!ts->genericParams.empty() && !t->genericArgs.empty()) {
+                const std::vector<std::string_view> gpNames =
+                    sema::genericParamNames(ts);
+                for (std::size_t gi = 0;
+                     gi < gpNames.size() && gi < t->genericArgs.size(); ++gi) {
+                    subst[gpNames[gi]] = t->genericArgs[gi];
+                }
+            }
+            auto substitute = [&](const sema::TypeRef* ft) ->
+                const sema::TypeRef* {
+                if (!ft || subst.empty()) return ft;
+                // A bare type-parameter ref: Named, no declaration, single-part
+                // name. The headName lookup mirrors `recordMemberTypeResolved`'s
+                // own bare-param resolution (LlvmBackend_Layout.cpp:2437-2442).
+                if (ft->kind == sema::TypeRef::Kind::Named && !ft->declaration &&
+                    ft->genericArgs.empty() &&
+                    ft->astNode && ft->astNode->name &&
+                    ft->astNode->name->parts.size() == 1) {
+                    auto it = subst.find(ft->headName());
+                    if (it != subst.end()) return it->second;
+                }
+                return ft;
+            };
             for (const sema::Symbol* mem : ts->members) {
                 const auto* fs = dynamic_cast<const sema::FieldSymbol*>(mem);
                 if (!fs) {
@@ -277,12 +336,11 @@ inline bool calleeReturnMayAliasStringArgUnretained(
                     if (cc && cc->caseDecl) {
                         for (const ast::Param& pf : cc->caseDecl->payload) {
                             if (!pf.type) continue;
-                            if (auto* tr = ctx.resolvedType(*pf.type)) {
-                                if (tr->kind == sema::TypeRef::Kind::Primitive &&
-                                    tr->primitive ==
-                                        sema::PrimitiveType::String) {
-                                    return true;
-                                }
+                            const sema::TypeRef* tr =
+                                substitute(ctx.resolvedType(*pf.type));
+                            if (tr && tr->kind == sema::TypeRef::Kind::Primitive &&
+                                tr->primitive == sema::PrimitiveType::String) {
+                                return true;
                             }
                         }
                     }
@@ -297,10 +355,10 @@ inline bool calleeReturnMayAliasStringArgUnretained(
                 if (fs->posParam) {
                     const sema::TypeRef* tr = nullptr;
                     if (fs->posParam->type) {
-                        tr = ctx.resolvedType(*fs->posParam->type);
+                        tr = substitute(ctx.resolvedType(*fs->posParam->type));
                     } else {
                         // Imported positional field: type is in fieldTypes_
-                        tr = ctx.importedMemberType(fs);
+                        tr = substitute(ctx.importedMemberType(fs));
                     }
                     if (tr && tr->kind == sema::TypeRef::Kind::Primitive &&
                         tr->primitive == sema::PrimitiveType::String) {
@@ -316,11 +374,10 @@ inline bool calleeReturnMayAliasStringArgUnretained(
                 // TypeRef either way — this read is the discrimination).
                 const auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
                 if (!fd || !fd->type) continue;
-                if (auto* tr = ctx.resolvedType(*fd->type)) {
-                    if (tr->kind == sema::TypeRef::Kind::Primitive &&
-                        tr->primitive == sema::PrimitiveType::String) {
-                        return true;
-                    }
+                const sema::TypeRef* tr = substitute(ctx.resolvedType(*fd->type));
+                if (tr && tr->kind == sema::TypeRef::Kind::Primitive &&
+                    tr->primitive == sema::PrimitiveType::String) {
+                    return true;
                 }
             }
             return false;
