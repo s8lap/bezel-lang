@@ -1207,6 +1207,19 @@ private:
         // pushed at a SHALLOWER scope (belonging to an outer lambda) are
         // PRESERVED and remain for that outer lambda's later consume call.
         std::size_t pushScopeDepth = 0;
+        // fix #4165 (§27.5/§28.9, stdlib §4.8, v0.295): true when `key` is a
+        // string-keyed `DictionaryEntry<string,V>` local captured by a
+        // NON-ESCAPING closure. Parallel sibling of #4127 (escaping capture,
+        // envdtor path, freeCellInEnvdtor-gated) and #4135 (DrainedEntry
+        // non-escaping capture). At scope-end (this entry's boxedCellFree arm)
+        // emit the same GEP field 0 + bz_string_release before the cell free;
+        // see `dictEntryKeyReleaseDeferred`'s declaration on Disposal for the
+        // full argument and emission site. Set ONLY for a LocalDecl (params
+        // are never a DictionaryEntry type — they would be a captured
+        // DictionaryEntry local, not a parameter). Compute the type once at
+        // the registration site in lowerLambda; consumeLastLambdaCapturedCells
+        // propagates this flag to the Disposal it builds.
+        bool dictEntryKeyReleaseDeferred = false;
     };
     std::vector<LastCellEntry> lastLambdaCapturedCells_;
     // §27.5 / §28.9 (#969): block-nesting depth (== disposeStack_.size()) of each

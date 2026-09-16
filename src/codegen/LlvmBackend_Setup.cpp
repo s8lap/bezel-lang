@@ -16857,6 +16857,20 @@ void Emitter::consumeLastLambdaCapturedCells() {
         Disposal dc{ce.newSlot, nullptr};
         dc.boxedCellFree = true;
         dc.skipCellFreeOnUnwind = ce.unwindUnsafe;  // fix #2334
+        // fix #4165 (§27.5/§28.9, stdlib §4.8, v0.295): propagate the captured
+        // local's string-keyed `DictionaryEntry<string,V>` flag from the
+        // LastCellEntry (computed at registration in lowerLambda) onto the
+        // boxedCellFree Disposal. The FIRST PASS arm in emitDisposals emits
+        // the GEP field 0 + bz_string_release before the cell free under this
+        // flag — `cellVars_[d.slot]` provides the cell's struct type so the
+        // GEP field 0 load resolves to a `ptr` (the rebuilt string Key). The
+        // safety case is the boxedCellFree requirement itself: every capturing
+        // closure is non-escaping (cellFreeEligible_ gate), singleCaptureLocals_
+        // means exactly one holder, and the local's rebuilt Key's single
+        // producer +1 is discharged exactly once. The escaping case (#4127)
+        // is handled separately in the envdtor body via freeCellInEnvdtor.
+        if (ce.dictEntryKeyReleaseDeferred)
+            dc.dictEntryKeyReleaseDeferred = true;
         disposeStack_.back().push_back(dc);
         // #782: a captured move-only OWNING inline-array's elements live in the
         // boxed cell. Dispose each non-null element THROUGH the cell, then null
