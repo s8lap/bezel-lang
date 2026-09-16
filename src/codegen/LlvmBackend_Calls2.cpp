@@ -6502,6 +6502,19 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
         sema::TypeRef* rt = loc->declType;
         if (rt && rt->kind == sema::TypeRef::Kind::Function) {
             llvm::Value* closurePtr = nullptr;
+            // fix #3727 (§27.5, v0.300): track whether the local's slot is a
+            // boxed-cell HOLDER (the local was captured by a lambda and the
+            // capture cell is shared with the closure env). For a captured
+            // local, mk's envdtor releases the cell contents at mk's disposal
+            // — exactly the one release the cell's producer +1 needs — so the
+            // #4422 call-site release must NOT fire (draining rc on every
+            // call frees the closure while the cell still aliases it; the
+            // next call reads a freed pointer and the envdtor's later release
+            // is a double-free). For an unboxed local, the cell-release path
+            // does NOT exist and the scope-end release is suppressed by
+            // ClosureEscapeWalker — the call-site release is the only way to
+            // balance the producer +1 (issue #4422).
+            bool isCaptured = false;
             if (loc->decl) {
                 auto lit = locals_.find(loc->decl);
                 if (lit != locals_.end()) {
@@ -6510,6 +6523,7 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                     llvm::Type* ety = nullptr;
                     llvm::Value* addr = boxedStorage(lit->second, ety);
                     closurePtr = builder_.CreateLoad(ptrTy(), addr);
+                    isCaptured = cellVars_.count(lit->second) != 0;
                 }
             }
             llvm::Value* r = emitClosureCall(closurePtr, rt);
@@ -6521,7 +6535,16 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
             // closureLocalReassigned_): a non-reassigned local's scope-end
             // release already balances the slot's reference, and emitting a second
             // release here would double-free it.
-            if (loc->decl &&
+            //
+            // fix #3727 (cluster-A3, v0.300): for a CAPTURED local (its slot is
+            // a cell holder, cellVars_ membership non-zero), the call-site
+            // release is INSTEAD of the captured-cell's envdtor release — both
+            // fire would double-free. The envdtor's release is the sole owner
+            // of the closure's lifetime in this case (the cell is shared
+            // between capture site and capture destination, and the envdtor
+            // runs when the capturing closure dies). Skip the call-site release
+            // for captured locals so the envdtor's release is the only one.
+            if (!isCaptured && loc->decl &&
                 closureLocalReassigned_.count(static_cast<const void*>(loc->decl)))
                 emitClosureRelease(closurePtr);
             return r;

@@ -26413,13 +26413,28 @@ bool Emitter::lowerClosureLocalReassign(const ast::Expr& target,
     // closure-local machinery rather than reasoning about a new surface.
     if (tt->nullable) return false;
     llvm::Value* oldVal = builder_.CreateLoad(ptrTy(), slotAddr, "clol.old");
-    // fix #4422 (v0.300): ALWAYS retain the new value even for a +1 producer.
-    // Without this, the call-site emitClosureRelease (in the LocalSymbol arm of
-    // emitClosureCall) consumes the producer's single transferred reference on the
-    // FIRST call and the SECOND call reads a freed closure pointer (UAF crash).
-    // By retaining here the slot always owns an independent +1, regardless of
-    // whether the assigned expression is a producer or a borrow.
-    emitClosureRetain(newVal);
+    // narrow #4422 (cluster-revert, lane-30): CONDITIONAL retain — only retain
+    // when the assigned expression is NOT a +1 producer. The always-retain
+    // discipline (#64a9c41f) was incorrect for the +1 producer case (it added
+    // a spurious +1 that was never released; the slot is excluded from
+    // scope-end release for reassigned locals, so the producer's transferred
+    // +1 leaked — 40 B per reassignment, measured as the r18-c8 attempt-2
+    // gate failure on cluster-A3 rows). Mirrors lowerClosureFieldStore's own
+    // retain-vs-transfer decision and matches lowerCapturedClosureLocalReassign's
+    // same conditional gate (line 26463).
+    //
+    // fix #3727 (cluster-A3, v0.300): for a CAPTURED local (slot in
+    // cellVars_), this function's always-retain path is the wrong owner of the
+    // extra +1 — the captured-cell's envdtor is, and the call-site release in
+    // emitClosureCall's LocalSymbol arm is now suppressed for captured locals
+    // (the sibling gate in LlvmBackend_Calls2.cpp). The conditional discipline
+    // below keeps the +1 producer's transfer semantics intact for both slots
+    // (the captured-cell path will read this same value via boxedStorage,
+    // both routes agree on the producer transfer).
+    bool _isProducer = isPlusOneClosureProducer(valueExpr) ||
+                       isUserMethodClosureReturnCall(valueExpr);
+    if (!_isProducer)
+        emitClosureRetain(newVal);
     builder_.CreateStore(newVal, slotAddr);
     emitClosureRelease(oldVal);
     // fix #4422: track this local as reassigned so the LocalSymbol arm in
