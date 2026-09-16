@@ -26547,13 +26547,19 @@ bool Emitter::lowerClosureLocalReassign(const ast::Expr& target,
     // closure-local machinery rather than reasoning about a new surface.
     if (tt->nullable) return false;
     llvm::Value* oldVal = builder_.CreateLoad(ptrTy(), slotAddr, "clol.old");
-    // fix #4422 (v0.300): ALWAYS retain the new value even for a +1 producer.
-    // Without this, the call-site emitClosureRelease (in the LocalSymbol arm of
-    // emitClosureCall) consumes the producer's single transferred reference on the
-    // FIRST call and the SECOND call reads a freed closure pointer (UAF crash).
-    // By retaining here the slot always owns an independent +1, regardless of
-    // whether the assigned expression is a producer or a borrow.
-    emitClosureRetain(newVal);
+    // fix #4422 / #4174 (v0.300): conditional retain — mirrors
+    // lowerCapturedClosureLocalReassign's discipline exactly (§27.5, §28.9).
+    // A +1 producer (lambda, method reference, user closure-return call) TRANSFERS
+    // its single reference into the slot; the call-site emitClosureRelease in the
+    // LocalSymbol arm of emitClosureCall consumes ONE reference on each call.
+    // Unconditionally retaining the producer DOUBLE-RETAINS it (+2 instead of +1):
+    // emitClosureRelease burns one reference on first call leaving a +1 LEAK.
+    // A non-producer (borrow) has no transferred reference to consume, so the slot
+    // must retain its own independent +1 to keep the closure alive.
+    bool isProducer = isPlusOneClosureProducer(valueExpr) ||
+                      isUserMethodClosureReturnCall(valueExpr);
+    if (!isProducer)
+        emitClosureRetain(newVal);
     builder_.CreateStore(newVal, slotAddr);
     emitClosureRelease(oldVal);
     // fix #4422: track this local as reassigned so the LocalSymbol arm in
