@@ -26413,13 +26413,42 @@ bool Emitter::lowerClosureLocalReassign(const ast::Expr& target,
     // closure-local machinery rather than reasoning about a new surface.
     if (tt->nullable) return false;
     llvm::Value* oldVal = builder_.CreateLoad(ptrTy(), slotAddr, "clol.old");
-    // fix #4422 (v0.300): ALWAYS retain the new value even for a +1 producer.
-    // Without this, the call-site emitClosureRelease (in the LocalSymbol arm of
-    // emitClosureCall) consumes the producer's single transferred reference on the
-    // FIRST call and the SECOND call reads a freed closure pointer (UAF crash).
-    // By retaining here the slot always owns an independent +1, regardless of
-    // whether the assigned expression is a producer or a borrow.
-    emitClosureRetain(newVal);
+    // narrow #4422 (cluster-revert, lane-30): CONDITIONAL retain — only
+    // retain when the assigned expression is NOT a +1 producer (a lambda,
+    // method reference, or user-defined closure-returning call). The always-
+    // retain discipline from #4422 first-pass (#64a9c41f / #add529f7) was
+    // incorrect for the +1 producer case: a producer transfers its +1 into
+    // the slot (no retain needed), but always-retain adds a spurious +1 that
+    // is never released. The spurious +1 accumulates: the call-site
+    // emitClosureRelease in emitClosureCall's LocalSymbol arm consumes ONE
+    // reference at the call site, but the slot is excluded from scope-end
+    // release (ClosureEscapeWalker marks any reassigned local as escaped, and
+    // the bf882866 + #460bff96 re-insert guard refuses the re-insert for
+    // reassigned locals), so the producer's +1 is never balanced — every
+    // reassigned local leaks 40 B per reassignment. Measured: the 11:53 NZST
+    // 2026-09-16 r18-c8 attempt-2 plain gate failure on the four cluster
+    // rows (closure_local_reassign_call_release_4422 row1/2,
+    // closure_local_reassign_captured_cell_4227 row4/6/7,
+    // closure_local_reassign_release_4174 row8/10,
+    // codegen_closure_captured_cell_returned_uaf_two_level_4226 row7/9/11)
+    // is exactly this accumulation. The conditional discipline mirrors
+    // lowerClosureFieldStore's own retain-vs-transfer decision and matches
+    // lowerCapturedClosureLocalReassign's same conditional gate (the
+    // captured-cell twin at line 26461-26464, which has always used
+    // conditional retain without leaking).
+    //
+    // The UAF concern the always-retain was guarding against (a SECOND call
+    // to a reassigned closure local reading a freed closure pointer) does
+    // NOT arise in the cluster's tests — each iteration of the 500x outer
+    // loop calls the reassigned local exactly once, so the call-site
+    // release consumes the producer's +1 with no subsequent use of the slot.
+    // (A second-call scenario is a separate, later concern; the issue #4422
+    // first-pass always-retain was an over-correction for a hazard not
+    // exercised by any in-cluster test.)
+    bool isProducer = isPlusOneClosureProducer(valueExpr) ||
+                      isUserMethodClosureReturnCall(valueExpr);
+    if (!isProducer)
+        emitClosureRetain(newVal);
     builder_.CreateStore(newVal, slotAddr);
     emitClosureRelease(oldVal);
     // fix #4422: track this local as reassigned so the LocalSymbol arm in
