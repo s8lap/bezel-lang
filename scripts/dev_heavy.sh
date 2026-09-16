@@ -54,30 +54,32 @@ kind="$1"; shift
 
 SLICE=bezel-heavy.slice
 # Idempotently set the total budget for all heavy ops. Cheap; safe to repeat.
+# Tightened 2026-09-17 after OOM-kill at 23G peak (system 31G; KDE+Claude ~6G
+# base; overcommit caused kernel OOM). New envelope leaves ~9G headroom for
+# system + interactive + Claude, while still fitting 1 gate suite + 1 gate
+# build under the cap.
 systemctl --user set-property "$SLICE" \
-  CPUQuota=1800% CPUWeight=60 MemoryHigh=24G MemoryMax=28G IOWeight=50 \
+  CPUQuota=1800% CPUWeight=60 MemoryHigh=18G MemoryMax=22G IOWeight=50 \
   >/dev/null 2>&1 || true
 
 case "$kind" in
   build)
     # Gate build (bezel_tests) is heavy + on the critical path -> priority.
     # Producer build (bezelc etc.) is light -> background weight, uses spare cap.
-    # Only the umbrella "bezel_tests" target gets priority — NOT bezel_tests_<area>
-    # (producer lanes run the latter in parallel during fan-out; granting them
-    # gate priority dilutes the gate build's CPU weight to nothing).
+    # Cages sized so 1 gate-build (12G) + 1 gate-suite (10G) fits the 22G slice
+    # with ~0G slack — gate-needs-zero-builders means producers must STOP while
+    # the gate runs. Producer cage (8G) fits bezelc compile peaks (~3-4G) with
+    # headroom for ccache + page cache.
     if printf '%s\n' "$@" | grep -qE '\bbezel_tests\b'; then
-      cw=10000; iw=800; mem=14G
+      cw=10000; iw=800; mem=12G
     else
-      cw=100;   iw=80;  mem=12G
+      cw=100;   iw=80;  mem=8G
     fi ;;
   suite)
-    # per gate audit F1: the suite cage is the knob that bounds shard
-    # concurrency, NOT the slice budget the gate.sh comment cites. gate.sh caps
-    # the ASan pass at 8 shards and sizes that against "the ~24-28G slice" —
-    # but every suite op actually runs in THIS cage, which is 12G. Making it a
-    # variable lets the ASan concurrency be raised and measured against the
-    # thing that really constrains it. Default unchanged (12G).
-    cw=10000; iw=800; mem="${BEZEL_SUITE_MEM:-12G}" ;;
+    # Tightened from 12G default to 10G to fit the new 22G slice envelope with
+    # the gate-build cage (12G) under it. ASan pass already peaks ~1G ANON, so
+    # 10G has ample headroom for the page-cache file mapping.
+    cw=10000; iw=800; mem="${BEZEL_SUITE_MEM:-10G}" ;;
   *)
     # probe: tiny; outside the slice, its own small cage, no accounting overhead.
     exec systemd-run --user --scope -q -p MemoryMax=4G -p MemorySwapMax=0 -- "$@" ;;
