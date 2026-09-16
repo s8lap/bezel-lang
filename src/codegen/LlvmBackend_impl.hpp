@@ -15339,6 +15339,43 @@ private:
     // emitClosureRelease only for reassigned locals, avoiding a double-release
     // for non-reassigned locals (whose scope-end release is already correct).
     std::unordered_set<const void*> closureLocalReassigned_;
+    // fix #4434 (§27.5 / §28.9, v0.298): closure-typed locals whose slot is
+    // captured by a downstream lambda (the slot lives in `cellVars_` — a heap
+    // cell, not a bare ptr). The envdtor's release is the sole owner of the
+    // cell's lifetime for these locals. Three-path release discipline:
+    //   (a) NOT reassigned: existing path (cell-free in scope-end disposal
+    //       registers normally; envdtor's release is what fires).
+    //   (b) reassigned AND captured-cell: SKIP call-site release in
+    //       emitClosureCall's LocalSymbol arm (envdtor's release is sole
+    //       owner — a call-site release here would over-release the cell)
+    //       AND SKIP the scope-end `boxedCellFree` registration in
+    //       consumeLastLambdaCapturedCells (the envdtor is the only owner;
+    //       scope-end would double-free alongside it).
+    //   (c) reassigned AND plain (not captured-cell): existing #4422
+    //       call-site discipline — first call emits release, multi-call
+    //       arms scope-end release and skips call-site (the lane-34 gate).
+    // `closureLocalCapturedCellReassigned_` is the subset of this set whose
+    // decl was ALSO observed reassigned by the walker — that pair is the
+    // condition consumeLastLambdaCapturedCells consults to skip its cell-
+    // free registration (a non-reassigned captured-cell local still needs
+    // its scope-end cell-free — the envdtor is the only OTHER owner, but
+    // without an over-count from the reassign's lowerCapturedClosureLocal
+    // Reassign).
+    std::unordered_set<const void*> closureLocalCapturedCell_;
+    std::unordered_set<const void*> closureLocalCapturedCellReassigned_;
+    // fix #4434 (§27.5 / §28.9, v0.298): per-slot call-counter for the
+    // LocalSymbol arm in `emitClosureCall`. Counts how many times this arm
+    // has fired for a given slot in the CURRENT scope; combined with the
+    // walker's three-path classification (`closureLocalCapturedCell_` +
+    // `closureLocalReassigned_` + `closureReleaseEligible_`) the arm
+    // implements the "call-site release fires at most once" discipline. The
+    // counter is reset at every scope boundary — see the lowerScopedBlock /
+    // lowerLambda save/restore sites — so a closure local called in two
+    // distinct inner scopes still gets exactly one call-site release per
+    // scope (matching the existing pre-#4434 single-release contract for
+    // the captured-cell path: each scope that uses the slot is responsible
+    // for its own +1, the envdtor only handles the OUTER scope's).
+    std::unordered_map<const void*, int> closureLocalCallCounts_;
     // fix #2714 (§27.5 / §28.9, v0.286): parallel borrow-side sets — see
     // `collectClosureReleaseEligible` (the .cpp) for the rationale. The
     // `closureBorrowAll_` member holds EVERY borrow-initialized closure-typed
@@ -15373,6 +15410,15 @@ private:
                                  llvm::AllocaInst* slot, llvm::Value* v);
     // Compute closureReleaseEligible_ for a block body (see the .cpp).
     void collectClosureReleaseEligible(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body);
+    // fix #4434 (§27.5 / §28.9, v0.298): see the .cpp definition for the
+    // full rationale — captured-cell classification runs ONCE per function
+    // body at function entry and is NOT re-run from `lowerLambda` (the way
+    // `collectClosureReleaseEligible` is). The function-entry-only contract
+    // is the load-bearing invariant that lets `consumeLastLambdaCapturedCells`
+    // observe the OWNING scope's verdict when a nested lambda's body lowers
+    // its captures into disposeStack_.
+    void collectCapturedCellClosureLocals(
         const std::vector<std::unique_ptr<ast::Stmt>>& body);
     // True if `init` is a codegen-internal +1 closure producer: a LambdaExpr, or
     // a bare/qualified method reference (an IdentifierExpr / MemberAccessExpr

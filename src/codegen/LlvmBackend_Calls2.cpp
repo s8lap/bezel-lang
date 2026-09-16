@@ -6518,12 +6518,75 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
             // marks any reassigned local as escaped), so without an explicit
             // release here the closure leaks — 40 B per call. Only emit the
             // release when the local was actually reassigned (tracked in
-            // closureLocalReassigned_): a non-reassigned local's scope-end
-            // release already balances the slot's reference, and emitting a second
-            // release here would double-free it.
-            if (loc->decl &&
-                closureLocalReassigned_.count(static_cast<const void*>(loc->decl)))
-                emitClosureRelease(closurePtr);
+            // closureLocalReassigned_) AND its scope-end release is NOT armed
+            // (the slot's +1 isn't consumed elsewhere): a non-reassigned local's
+            // scope-end release already balances the slot's reference, and
+            // emitting a second release here would double-free it.
+            //
+            // fix #2107-follow-up (§27.5 / §28.9, v0.298): the multi-call
+            // discipline. When a reassigned local is CALLED, the call-site
+            // release here would free the cell after the FIRST call, leaving
+            // the SECOND (and later) call to read a freed closure pointer —
+            // exit 139 SIGSEGV (issue #2107's
+            // `spec_27_3_divergent_under_reassign_target`, the same UAF
+            // #64a9c41f's always-retain was originally added to fix). The
+            // walker (collectClosureReleaseEligible, see that function's
+            // #2107-follow-up override) re-includes CALLED reassigned locals
+            // in scope-end release and excludes TRANSEFRRED ones — so when
+            // scope-end release is armed here, SKIP the call-site release
+            // (the cell stays alive across calls, scope-end fires once at
+            // function exit). When scope-end release is NOT armed (e.g. the
+            // reassigned local is transferred via `return f` and the caller
+            // owns its +1), emit the call-site release as before.
+            //
+            // fix #4434 (§27.5 / §28.9, v0.298): the THREE-PATH release
+            // discipline. Track a per-slot call counter here (reset per scope
+            // — see closureLocalCallCounts_'s own declaration for the reset
+            // sites), and gate the call-site release on it:
+            //   (a) NOT reassigned: skip (existing pre-fix behavior — scope-end
+            //       release handles it; emitting here would double-free).
+            //   (b) reassigned AND captured-cell: SKIP, envdtor is sole owner.
+            //       The cell lives in `cellVars_` and the envdtor's release
+            //       decrements its rc, freeing it once when the capturing env
+            //       is destroyed. Adding a call-site release would over-release
+            //       (the env's release fires at call-time, the envdtor's
+            //       release fires when the env is destroyed — both target the
+            //       same +1). Pinned by the canonical regression
+            //       `codegen_closure_captured_cell_returned_uaf_4198.
+            //       single_capture_mutated_not_returned_stays_crash_free_
+            //       spec_28_9`.
+            //   (c) reassigned AND plain (not captured-cell):
+            //       — first call (counter == 0): emit release (the +1 is
+            //         consumed by this call).
+            //       — subsequent calls (counter > 0): skip (multi-call was
+            //         detected by the walker, scope-end release armed, that
+            //         release is the single source of truth for the slot's
+            //         lifetime across calls).
+            // The call counter is local to this arm's gate logic — the
+            // MULTI-CALL VERDICT itself is computed by the walker
+            // (`calleeCallCount > 1 || uncountableCalleeSeen`), which fires
+            // the scope-end override. The counter here is just an
+            // "emit-at-most-once" guard against a redundant first-call
+            // release when the call is inside a loop or repeated control
+            // structure the walker conservatively cannot attribute to a
+            // single point.
+            if (loc->decl) {
+                const void* key = static_cast<const void*>(loc->decl);
+                bool isCapturedCell =
+                    closureLocalCapturedCell_.count(key) != 0;
+                bool isReassigned = closureLocalReassigned_.count(key) != 0;
+                bool scopeEndArmed = closureReleaseEligible_.count(key) != 0;
+                bool isFirstCall =
+                    closureLocalCallCounts_[key]++ == 0;
+                // (b) captured-cell: SKIP — envdtor handles it.
+                // (c) plain reassigned: emit ONLY on first call AND when
+                // scope-end is NOT armed (single-call discipline — lane-35's
+                // override leaves escaped=true for calleeCallCount==1).
+                if (!isCapturedCell && isReassigned && !scopeEndArmed &&
+                    isFirstCall) {
+                    emitClosureRelease(closurePtr);
+                }
+            }
             return r;
         }
     }

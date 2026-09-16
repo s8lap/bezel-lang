@@ -9367,6 +9367,22 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
     // #422 / §27.5 / §28.9: which `var` closure (function-typed) locals may be
     // released at scope end (mirrors stringReleaseEligible_).
     closureReleaseEligible_.clear();
+    // fix #4434 (§27.5 / §28.9, v0.298): the captured-cell sets must clear
+    // alongside closureReleaseEligible_ HERE too — see the
+    // closureLocalCandidates_ comment immediately below for the same
+    // invariant on the sibling set. An EXPRESSION-bodied method that
+    // bypasses collectClosureReleaseEligible must not inherit the previous
+    // body's captured-cell verdict; the envdtor-consumes-the-cell
+    // invariant relies on these sets being correct for the CURRENT function.
+    closureLocalCapturedCell_.clear();
+    closureLocalCapturedCellReassigned_.clear();
+    // fix #4434 (§27.5 / §28.9, v0.298): the per-slot call-counter used by
+    // the LocalSymbol arm in emitClosureCall resets here, so each function's
+    // first call-site release opportunity fires fresh. (LocalDecl pointers
+    // are unique per AST, so cross-function collisions are structurally
+    // impossible — but clearing here matches the sibling sets' contract and
+    // makes the per-function-scope reset explicit.)
+    closureLocalCallCounts_.clear();
     // fix #3757 follow-up (review nit): closureLocalCandidates_ must clear
     // alongside closureReleaseEligible_ HERE too, not only inside
     // collectClosureReleaseEligible below — an EXPRESSION-bodied method
@@ -9454,6 +9470,15 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
         collectInlineArrayStringCallResultReleaseEligible(*ci.stmts);  // fix #4296
         collectValueLikeChoiceCallResultReleaseEligible(*ci.stmts);  // fix #2428
         collectBorrowingArrayFreeEligible(*ci.stmts);  // #1003
+        // fix #4434 (§27.5 / §28.9, v0.298): walk closure-typed locals to
+        // classify captured-cell status BEFORE the recursive
+        // `collectClosureReleaseEligible(lam.stmts)` calls inside lowerLambda
+        // (LlvmBackend_Exprs2.cpp:3045) clobber the outer scope's set. See
+        // `collectCapturedCellClosureLocals` for the full rationale — kept
+        // SEPARATE from `collectClosureReleaseEligible` precisely because
+        // that helper is invoked from BOTH function entry AND every nested
+        // lambda, while this one runs only at function entry.
+        collectCapturedCellClosureLocals(*ci.stmts);
         collectClosureReleaseEligible(*ci.stmts);
         collectBoxReleaseEligible(*ci.stmts);
         collectBoxCaptureLocals(*ci.stmts);
@@ -16900,6 +16925,53 @@ void Emitter::consumeLastLambdaCapturedCells() {
                     }
                 }
             }
+            continue;
+        }
+        // fix #4434 (§27.5 / §28.9, v0.298): for a CAPTURED-CELL local that
+        // is also REASSIGNED, the envdtor's release is the sole owner of the
+        // cell's lifetime. Registering `boxedCellFree` here would fire at the
+        // OWNING scope's end (the function body exit) while the env that
+        // captured the cell is destroyed mid-body (when the capturing lambda
+        // call returns) — the envdtor's release decrements the cell's refcount
+        // and the scope-end `boxedCellFree` frees the same cell again, a
+        // double-free. Canonical crash: `codegen_closure_captured_cell_
+        // returned_uaf_4198.single_capture_mutated_not_returned_stays_crash_
+        // free_spec_28_9` — `f := lambda() => 42;` inside `mutate`'s body,
+        // then `return f();` after `mutate()` returns. The envdtor fires
+        // first (during `mutate()`'s cleanup) and the scope-end `boxedCellFree`
+        // fires second (at One's scope end). Skip the scope-end registration
+        // for this exact pair — the envdtor is enough. Other captured-cell
+        // locals (non-reassigned) still need this registration: the env is
+        // their ONLY OTHER owner of the cell, and without it the cell leaks
+        // (the env's own release still happens, but the cell stays alive past
+        // the cell's own scope-end registration point — the safe leak
+        // direction).
+        //
+        // Gated on `closureLocalCapturedCellReassigned_` (the walker
+        // confirmed target was reassigned AND captured) with `ce.key` matching
+        // the decl node — params are absent from this set (their captures live
+        // in `lastLambdaCapturedCells_` via `LastCellEntry::isParam`, a
+        // separate path). The key is a `const void*` LocalDecl pointer or
+        // ParameterSymbol pointer; set membership uses the same key shape.
+        //
+        // REFINE for #4227 / §27.5: the skip is ONLY correct when the local is
+        // NOT ALSO RETURNED by name. `closure_local_reassign_captured_cell_4227`
+        // shares the same captured-cell + reassigned shape but adds `return f;`,
+        // which transfers the cell content to the caller — the caller now owns
+        // a fresh +1 reference (the `return` is the producer of that +1, per
+        // the same transfer semantic as a non-captured local), and the envdtor
+        // is still the cell content's reclaim path because the env's reference
+        // is what was transferred (the CELL's identity is what the caller now
+        // holds, not the content's identity). For that shape, the scope-end
+        // `boxedCellFree` MUST fire — otherwise the cell leaks per MakeClosure
+        // invocation (pre-fix this was the only free of the cell, since the
+        // envdtor freed the CONTENT closure, not the cell holding it). The
+        // walker does not classify return-vs-not, so we consult
+        // `returnedCaptureVars_` (populated by collectBoxCaptureLocals at
+        // function entry — the same walker that flags `capturedLocalReturnedByName`
+        // for the envdtor's release-path selection).
+        if (ce.key && closureLocalCapturedCellReassigned_.count(ce.key) &&
+            !returnedCaptureVars_.count(ce.key)) {
             continue;
         }
         Disposal dc{ce.newSlot, nullptr};
@@ -27116,6 +27188,17 @@ struct ClosureEscapeWalker {
     // even in an otherwise-safe-read position (a call CALLEE `cap()` or a
     // reference-equality operand). See the String walker for the full rationale.
     bool inLambda = false;
+    // fix #4434 follow-up (lane-41 narrow, §27.5 / §28.9, v0.298): true
+    // while walking inside a ForStmt/WhileStmt body. Mirrors the Emitter's
+    // `loopStack_.empty()` admission gate (#3403 §27.5 / #3435) for the
+    // scope-end free — but the walker is a free struct (no access to the
+    // Emitter's loopStack_), so it tracks its own flag across loop bodies.
+    // Used to EXCLUDE for-loop-context reassignments from
+    // `isCapturedCellSlot_` classification: a for-var slot is owned by the
+    // for-stmt and outlives any single lambda iteration; a lambda that
+    // reassigns it holds a BORROW into the iteration, NOT a captured cell, so
+    // the envdtor must NOT be treated as sole owner of the cell.
+    bool inLoop = false;
     // fix #2481 (consumer 3/3, closures): OPT-IN gate for the SAME
     // case-scrutinee relaxation StringEscapeWalker's `scrutineeBorrowMode`
     // implements (see that flag's comment, above in this file, for the
@@ -27179,6 +27262,20 @@ struct ClosureEscapeWalker {
     // addition to `calleeCallCount == 1`: refusing to claim an uncountable
     // shape is always safe, where guessing a count is not.
     bool uncountableCalleeSeen = false;
+    // fix #4434 (§27.5 / §28.9, v0.298): true when target is REFERENCED
+    // inside a downstream LAMBDA body (inLambda=true). Captures of this
+    // shape box target's slot into a heap cell (§27.5) so mutations inside
+    // the lambda are visible outside and vice versa — the slot lives in
+    // `cellVars_`, and the cell's release is the envdtor's responsibility,
+    // not the scope-end release at the OWNING scope. The three-path release
+    // discipline this commit installs uses `isCapturedCellSlot_` to
+    // distinguish (b) captured-cell + reassigned (envdtor is sole owner;
+    // skip call-site release AND skip scope-end cell-free) from (c) plain
+    // reassigned (call-site release handles single-call, scope-end handles
+    // multi-call). Set whenever a target reference (IdentifierExpr read,
+    // IdentifierExpr callee, AssignmentStmt target, IncrementStmt target,
+    // etc.) is observed while `inLambda` is true.
+    bool isCapturedCellSlot_ = false;
 
     bool isTargetIdent(const ast::Expr* e) const {
         auto* id = dynamic_cast<const ast::IdentifierExpr*>(e);
@@ -27398,11 +27495,37 @@ struct ClosureEscapeWalker {
     }
 
     void expr(const ast::Expr* e, bool safeRead) {
-        if (!e || escaped) return;
+        if (!e) return;
+        // fix #2107-follow-up / lane-35 narrow (#4422, §27.5 / §28.9, v0.298):
+        // same short-circuit relaxation as stmt() above — a reassign-only
+        // escape must NOT prevent subsequent expressions in the SAME or
+        // nested statements from being walked (the call-site counter is
+        // populated by `classify(95)` and `classify(-1)` expressions whose
+        // walker visit depends on crossing the reassign that put
+        // `escaped = true`). Non-reassign escape sources still short-circuit
+        // (a captured lambda read or a return transfer makes any further
+        // walking irrelevant for the post-walk override's classification).
+        if (escaped && !escapedDueToReassign) return;
         if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(e)) {
             // FINDING [1]: inside a lambda body, a captured-local read always
             // escapes — the env outlives the scope (safe-read does not apply).
             if (isTargetIdent(id) && (!safeRead || inLambda)) escaped = true;
+            // fix #4434 (§27.5 / §28.9, v0.298): a target reference observed
+            // while `inLambda` is true proves the slot is captured by a
+            // downstream lambda, so it lives in a heap cell (cellVars_) and the
+            // envdtor's release is the sole owner of the cell's lifetime. A
+            // bare-read (safeRead=false) is the most common shape (an
+            // `r := f;` capture in a lambda body); a callee-position read
+            // (safeRead=true) also counts (`g()` inside `lambda() => g();`
+            // captures g via the lambda's env).
+            //
+            // fix #4434 follow-up (lane-41 narrow, §27.5 / §28.9, v0.298):
+            // EXCLUDE for-loop contexts (`inLoop == true`): a lambda that
+            // references the target from a for-body holds a BORROW into the
+            // iteration, NOT a captured cell — see inLoop's declaration for the
+            // full soundness argument.
+            if (isTargetIdent(id) && inLambda && !inLoop)
+                isCapturedCellSlot_ = true;
             return;
         }
         // Reference equality `f = g` / `f <> g` (§27.7.1): both operands are
@@ -27631,7 +27754,23 @@ struct ClosureEscapeWalker {
     }
 
     void stmt(const ast::Stmt* s) {
-        if (!s || escaped) return;
+        if (!s) return;
+        // fix #2107-follow-up / lane-35 narrow (#4422, §27.5 / §28.9, v0.298):
+        // the stmt() short-circuit MUST NOT fire on a reassign-only escape.
+        // The AssignmentStmt arm (line ~27648 below) sets `escaped = true` AND
+        // `escapedDueToReassign = true` for a reassign target — `escaped` is
+        // what the post-walk override consults to decide
+        // closureReleaseEligible_ membership, but the walker MUST keep going
+        // so `calleeCallCount` accumulates for the override's gate. The
+        // original `if (!s || escaped) return;` short-circuited every
+        // subsequent stmt (including the calls that the multi-call discipline
+        // depends on counting), so the override never saw `calleeCallCount > 1`
+        // and the 2107 SIGSEGV returned. Gating on `(escaped &&
+        // !escapedDueToReassign)` keeps the f0fc51d9 short-circuit intact for
+        // non-reassign escape sources (a captured lambda read, a return
+        // transfer, a field store, etc.) while letting the walker cross
+        // reassign-only escape sources.
+        if (escaped && !escapedDueToReassign) return;
         if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s)) {
             // Binding the target into ANOTHER local escapes it (the new local
             // may itself be returned/stored).
@@ -27655,13 +27794,60 @@ struct ClosureEscapeWalker {
         if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(s)) {
             // Reassigning the local itself → escape (overwrite handling is out of
             // this increment). The RHS escapes.
-            if (isTargetIdent(as->target.get())) { escaped = true; return; }
+            if (isTargetIdent(as->target.get())) {
+                // fix #2107-follow-up / lane-35 narrow (#4422, §27.5 / §28.9,
+                // v0.298): the multi-call / single-call GATE correction. Mark
+                // BOTH the escape (`escaped = true`) and the softer "due to
+                // reassign" flag (`escapedDueToReassign = true`). The post-walk
+                // override below consults `escaped` for the final
+                // closureReleaseEligible_ decision (so reassigned locals are
+                // excluded unless the override clears it), and the outer-loop
+                // break condition / stmt() early-return check consult
+                // `escapedDueToReassign` to decide whether to keep walking (a
+                // reassign-only escape is NOT a reason to short-circuit — the
+                // walker MUST continue so it counts callees).
+                escaped = true;
+                escapedDueToReassign = true;
+                // fix #4434 (§27.5 / §28.9, v0.298): a reassignment target
+                // observed inside a lambda body proves the slot is captured
+                // (a lambda cannot reassign a local it does not capture). The
+                // envdtor owns the cell's release in this case.
+                //
+                // fix #4434 follow-up (lane-41 narrow, §27.5 / §28.9, v0.298):
+                // EXCLUDE for-loop contexts (`inLoop == true`): the for-var
+                // slot is owned by the for-stmt and outlives any single lambda
+                // iteration, so a lambda that reassigns a for-var holds a
+                // BORROW into the loop iteration, NOT a captured cell. The
+                // envdtor must NOT be treated as the sole owner — releasing
+                // the envdtor content would free the iteration's slot, which
+                // the next iteration (and any subsequent for-body statement)
+                // still aliases. Mirrors `lowerLambda`'s own
+                // `loopStack_.empty()` admission gate (#3403 §27.5) and
+                // `cellFreeEligible_`'s loop-aware admit gate (#3435). The
+                // walker is a free struct (no access to the Emitter's
+                // loopStack_), so it tracks its own `inLoop` flag across
+                // ForStmt/WhileStmt bodies.
+                if (inLambda && !inLoop) isCapturedCellSlot_ = true;
+                // Walk the RHS (which escapes) but not the target — the
+                // target is `target` itself, recursing into it would re-mark
+                // the reassign.
+                expr(as->value.get(), /*safeRead=*/false);
+                return;
+            }
             expr(as->target.get(), /*safeRead=*/false);
             expr(as->value.get(), /*safeRead=*/false);
             return;
         }
         if (auto* inc = dynamic_cast<const ast::IncrementStmt*>(s)) {
-            if (isTargetIdent(inc->target.get())) { escaped = true; return; }
+            if (isTargetIdent(inc->target.get())) {
+                // fix #2107-follow-up: same as AssignmentStmt above.
+                escapedDueToReassign = true;
+                // fix #4434: same captured-cell reasoning as the
+                // AssignmentStmt arm above (lane-41: same `!inLoop`
+                // exclusion).
+                if (inLambda && !inLoop) isCapturedCellSlot_ = true;
+                return;
+            }
             expr(inc->target.get(), /*safeRead=*/false); return;
         }
         if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(s)) {
@@ -27682,7 +27868,13 @@ struct ClosureEscapeWalker {
         }
         if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s)) {
             expr(ws->condition.get(), /*safeRead=*/true);
+            // fix #4434 follow-up (lane-41 narrow): set inLoop across the
+            // while-body so an inner reassignment seen under inLambda is NOT
+            // classified as a captured-cell slot.
+            bool savedInLoop = inLoop;
+            inLoop = true;
             for (auto& b : ws->body) stmt(b.get());
+            inLoop = savedInLoop;
             return;
         }
         if (auto* fs = dynamic_cast<const ast::ForStmt*>(s)) {
@@ -27690,7 +27882,15 @@ struct ClosureEscapeWalker {
             // valid, but be conservative: an escape.
             expr(fs->iterable.get(), /*safeRead=*/false);
             expr(fs->withExpr.get(), /*safeRead=*/false);
+            // fix #4434 follow-up (lane-41 narrow): set inLoop across the
+            // for-body so an inner reassignment seen under inLambda is NOT
+            // classified as a captured-cell slot. A for-var slot lives in the
+            // for-stmt, not in a heap cell, so the envdtor of any lambda that
+            // aliases it must not be treated as sole owner.
+            bool savedInLoop = inLoop;
+            inLoop = true;
             for (auto& b : fs->body) stmt(b.get());
+            inLoop = savedInLoop;
             return;
         }
         if (auto* d = dynamic_cast<const ast::DoEndBlock*>(s)) {
@@ -27730,10 +27930,96 @@ struct ClosureEscapeWalker {
 }  // namespace
 
 
+// fix #4434 (§27.5 / §28.9, v0.298): separate walker pass that records, for
+// each closure-typed LocalDecl in the CURRENT FUNCTION'S body, whether its
+// slot is captured by a downstream lambda (`isCapturedCellSlot_`) AND whether
+// the walker also saw a reassignment to that slot. Kept SEPARATE from
+// `collectClosureReleaseEligible` because that helper is called from BOTH
+// function entry (LlvmBackend_Setup.cpp:9473 — the global pre-scan) AND from
+// `lowerLambda` for every nested lambda body
+// (LlvmBackend_Exprs2.cpp:3045 — `collectClosureReleaseEligible(lam.stmts)`,
+// a per-nested-lambda re-scan whose results feed THIS lambda's release
+// discipline, not the enclosing function's). Recursive invocation would
+// clobber the enclosing function's captured-cell verdict before
+// `consumeLastLambdaCapturedCells` reads it (the consumed set must reflect
+// the OWNING scope's walker, not the most-recently-entered lambda's).
+//
+// THIS walker is invoked ONCE per function/method body at function entry —
+// same site as `collectClosureReleaseEligible(*ci.stmts)` at
+// LlvmBackend_Setup.cpp:9473 — and never from `lowerLambda`. That keeps the
+// sets stable across the body's lowering: a nested lambda's collect pass
+// clears and repopulates `closureReleaseEligible_` for its OWN scope, but
+// `closureLocalCapturedCellReassigned_` keeps its function-entry values
+// until the function exit (cleared at line 9369-9378 above).
+void Emitter::collectCapturedCellClosureLocals(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body) {
+    closureLocalCapturedCell_.clear();
+    closureLocalCapturedCellReassigned_.clear();
+    // Walk every closure-typed LocalDecl in this body (mirroring
+    // collectClosureReleaseEligible's candidate scan above) and run the
+    // walker against the body's statements.
+    std::function<void(const ast::Stmt*)> scan = [&](const ast::Stmt* s) {
+        if (!s) return;
+        if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s)) {
+            const sema::TypeRef* lt = nullptr;
+            if (ld->type) lt = ctx_.resolvedType(*ld->type);
+            if (!lt && ld->initializer)
+                lt = ctx_.exprType(*ld->initializer);
+            if (lt && !lt->nullable &&
+                lt->kind == sema::TypeRef::Kind::Function) {
+                ClosureEscapeWalker w{ctx_, static_cast<const void*>(ld)};
+                w.scrutineeBorrowMode = true;
+                for (auto& ss : body) {
+                    w.stmt(ss.get());
+                    if (w.escaped && !w.escapedDueToReassign) break;
+                }
+                if (w.isCapturedCellSlot_) {
+                    closureLocalCapturedCell_.insert(
+                        static_cast<const void*>(ld));
+                    if (w.escapedDueToReassign) {
+                        closureLocalCapturedCellReassigned_.insert(
+                            static_cast<const void*>(ld));
+                    }
+                }
+            }
+        } else if (auto* is = dynamic_cast<const ast::IfStmt*>(s)) {
+            for (auto& b : is->ifBranch.body) scan(b.get());
+            for (auto& br : is->elifBranches)
+                for (auto& b : br.body) scan(b.get());
+            for (auto& b : is->elseBody) scan(b.get());
+        } else if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s)) {
+            for (auto& b : ws->body) scan(b.get());
+        } else if (auto* fs = dynamic_cast<const ast::ForStmt*>(s)) {
+            for (auto& b : fs->body) scan(b.get());
+        } else if (auto* d = dynamic_cast<const ast::DoEndBlock*>(s)) {
+            for (auto& b : d->body) scan(b.get());
+        } else if (auto* ts = dynamic_cast<const ast::TryStmt*>(s)) {
+            for (auto& b : ts->body) scan(b.get());
+            for (auto& c : ts->catches) scan(c.body.get());
+            for (auto& b : ts->finallyBody) scan(b.get());
+        } else if (auto* cs = dynamic_cast<const ast::CaseStmt*>(s)) {
+            for (auto& arm : cs->arms)
+                for (auto& a : arm.stmts) scan(a.get());
+        }
+    };
+    for (auto& s : body) scan(s.get());
+}
+
+
 void Emitter::collectClosureReleaseEligible(
         const std::vector<std::unique_ptr<ast::Stmt>>& body) {
     closureReleaseEligible_.clear();
     closureLocalCandidates_.clear();  // fix #3757 follow-up
+    // fix #4434 (§27.5 / §28.9, v0.298): `closureLocalCapturedCell_` and
+    // `closureLocalCapturedCellReassigned_` are NOT cleared here — those
+    // sets are populated by `collectCapturedCellClosureLocals` (called from
+    // function entry only — see LlvmBackend_Setup.cpp line 9473+1), which
+    // runs once per function and must NOT be reset by the recursive
+    // `collectClosureReleaseEligible(lam.stmts)` from lowerLambda
+    // (LlvmBackend_Exprs2.cpp:3045). consumeLastLambdaCapturedCells reads
+    // these sets when the function body's nested lambdas lower their cells
+    // into disposeStack_; the verdict must reflect the OWNING scope's
+    // walker, not the most-recently-entered nested lambda's.
     // fix #2714 (§27.5 / §28.9, v0.286): parallel borrow-side sets — see the
     // helper declaration in LlvmBackend_impl.hpp. The `closureBorrowAll_`
     // member holds EVERY borrow-initialized closure-typed `var` local (the
@@ -27877,7 +28163,61 @@ void Emitter::collectClosureReleaseEligible(
         // g(), _ => ...`) previously stayed an unconditional escape, so its
         // scope-end release never armed for this shape.
         w.scrutineeBorrowMode = true;
-        for (auto& s : body) { w.stmt(s.get()); if (w.escaped) break; }
+        // fix #2107-follow-up (§27.5 / §28.9, v0.298): the walker MUST
+        // continue past a reassign-only escape source so it can count callees
+        // — the post-walk override clears `escaped` for reassign + called
+        // locals (arming scope-end release to keep the cell alive across
+        // calls). Only break when a NON-reassign escape source fires (lambda
+        // capture, return transfer, field store, etc.).
+        for (auto& s : body) {
+            w.stmt(s.get());
+            if (w.escaped && !w.escapedDueToReassign) break;
+        }
+        // fix #4434 (§27.5 / §28.9, v0.298): captured-cell
+        // classification has moved to `collectCapturedCellClosureLocals`
+        // (above), which runs ONLY at function entry — NOT here. The
+        // captured-cell verdict must reflect the OWNING scope's walker;
+        // the recursive `collectClosureReleaseEligible(lam.stmts)` from
+        // lowerLambda at LlvmBackend_Exprs2.cpp:3045 would otherwise erase
+        // the outer function's verdict before
+        // `consumeLastLambdaCapturedCells` reads it. The post-walk override
+        // gate below consults the SEPARATE `closureLocalCapturedCell_` set
+        // populated at function entry, so the verdict survives the recursive
+        // call.
+        // fix #2107-follow-up / lane-35 narrow + #4434 capture-cell (§27.5 /
+        // §28.9, v0.298): the THREE-PATH release discipline. The walker's
+        // `escaped && escapedDueToReassign` is the "reassigned" gate; the
+        // captured-cell status (`w.isCapturedCellSlot_`) determines whether
+        // scope-end release should be armed.
+        //
+        // (b) reassigned AND captured-cell: KEEP `escaped = true`. The
+        // envdtor is the sole owner of the cell's lifetime (the scope-end
+        // `boxedCellFree` registered by consumeLastLambdaCapturedCells would
+        // double-free alongside the envdtor's release when the env is
+        // destroyed). `closureLocalCapturedCellReassigned_` records this for
+        // the cell-free skip above.
+        //
+        // (c) reassigned AND plain (not captured-cell): the lane-35 multi-
+        // call discipline — `calleeCallCount > 1 || uncountableCalleeSeen`
+        // arms scope-end release (clear `escaped`); otherwise (single call)
+        // KEEP `escaped = true` so call-site release in emitClosureCall's
+        // LocalSymbol arm handles the single +1. Multi-call avoids the
+        // SIGSEGV `lambda_divergent_2107.
+        // spec_27_3_divergent_under_reassign_target` measured with always-
+        // call-site (cell freed after first call, second call reads freed
+        // pointer). Single-call matches `f0fc51d9`'s call-site-only
+        // discipline — the lane-34 `calleeCallCount > 0` gate was too eager
+        // and broke `codegen_nested_lambda_capture_3752.
+        // spec_28_2_backstop_through_nested_lambda_store`.
+        //
+        // (a) NOT reassigned (escapedDueToReassign=false): no override
+        // fires; `escaped` keeps its original value. The pre-existing
+        // escape-walk verdict — non-escaping → scope-end arms normally,
+        // escaping → no scope-end arm — is preserved untouched.
+        if (w.escaped && w.escapedDueToReassign && !w.isCapturedCellSlot_ &&
+            (w.calleeCallCount > 1 || w.uncountableCalleeSeen)) {
+            w.escaped = false;
+        }
         if (!w.escaped)
             closureReleaseEligible_.insert(static_cast<const void*>(ld));
     }
