@@ -5,9 +5,9 @@
 //! rule: Under duplicate constant values (§10.2), the declared-value set is the
 //!   set of distinct values: E(1) where Legacy := 1, Current := 1 yields that
 //!   one value.
-//! cites: 5.4, 10.2
+//! cites: 5.4, 10.2, 5.2
 //! expect: run
-//! stdout: True
+//! stdout: 1
 module Conf;
 
 public enum Tier
@@ -17,6 +17,6 @@ end Tier;
 public class Program
   public static method Main()
     var t := Tier(1);
-    Console.WriteLine(t = Tier.Legacy);
+    Console.WriteLine(int(t));
   end Main;
 end Program;

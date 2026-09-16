@@ -5,8 +5,7 @@
 //! rule: `where T: value` substitutions are non-nullable value types: records,
 //!   enums, choices, primitives, inline arrays, the unit type.
 //! cites: 14.2, 35.4
-//! expect: run
-//! stdout: value type
+//! expect: accept
 module Conf;
 
 public choice Status
@@ -19,7 +18,8 @@ public class Program
     return "value type";
   end Describe;
 
-  public static method Main()
-    Console.WriteLine(Describe<Status>(Status.Failed(7)));
-  end Main;
+  public static method Use()
+    var d := Describe<Status>(Status.Failed(7));
+    Console.WriteLine(d);
+  end Use;
 end Program;

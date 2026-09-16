@@ -485,6 +485,17 @@ ORDER_CLAIM_RE = re.compile(
     r'\bfirst\b.{0,40}\bwins\b|stop(?:s|ping)? at the first)', re.IGNORECASE)
 
 
+_BZL_KEYWORDS = frozenset("""
+module import public private internal class record enum choice interface
+method constructor destructor property indexer operator static readonly const
+var using owned move scoped virtual override abstract sealed closed pure extern
+if then else elif end while for in do return yield break continue case of when
+try catch finally throw new null true false this base default typeof nameof
+async await lambda requires ensures invariant equality serialized skip optional
+rename get set where ref out
+""".split())
+
+
 def audit(rows, cases_dir):
     """Quality signals a reader would otherwise have to check by hand. None is a
     lint failure — each is a judgement call the author may have made
@@ -539,6 +550,52 @@ def audit(rows, cases_dir):
           "is the pairing discipline, not a duplicate)".format(len(dup)))
     for ids in list(dup.values())[:20]:
         print("   " + ", ".join(ids))
+    # Added v0.301. The report above compares rule TEXT, so two lanes writing
+    # the same program under different paraphrases slip through: s15_3_0013 and
+    # s15_1_1_0005 were byte-identical modulo identifier names, in two sections,
+    # and the audit passed them. Seven lanes were authoring in parallel and had
+    # already had one cross-lane collision, so this is a shape to expect, not a
+    # one-off. Hash the NORMALISED SOURCE instead: identifiers and string
+    # literals renamed apart, whitespace collapsed. Two cases that compile to
+    # the same program are a duplicate however their prose differs, and the
+    # rule's home section owns it.
+    import hashlib
+    shapes = {}
+    for row in rows:
+        path = os.path.join(cases_dir, row["case-id"] + ".bzl")
+        if not os.path.isfile(path):
+            continue                      # a directory case; body is multi-file
+        with open(path, encoding="utf-8") as fh:
+            body = strip_header(fh.read())
+        # Rename every identifier and string literal to a positional token, so
+        # only the program's SHAPE survives.
+        body = re.sub(r'"[^"\n]*"', '""', body)
+        names, out = {}, []
+        for tok in re.findall(r'[A-Za-z_]\w*|\S', body):
+            if re.match(r'^[A-Za-z_]', tok) and tok not in _BZL_KEYWORDS:
+                tok = names.setdefault(tok, "n%d" % len(names))
+            out.append(tok)
+        # Shape alone over-fires: renaming type names collapses an `int` case
+        # onto a `double` one. The duplicate signal is the same program AND the
+        # same stated verdict, on a body big enough to be a real case — a
+        # ten-token program is a shape many rules legitimately share.
+        if len(out) < 60:
+            continue
+        h = hashlib.sha1((" ".join(out) + "|" + row["expect"] + "|"
+                          + (row.get("check") or "")).encode()).hexdigest()
+        shapes.setdefault(h, []).append(row["case-id"])
+    shape_dups = [v for v in shapes.values() if len(v) > 1
+                  and len({section_of_case_id(i)[1] for i in v
+                           if section_of_case_id(i)}) > 1]
+    print("\n{} IDENTICAL PROGRAMS across sections (same source modulo names, "
+          "same verdict — a duplicate whatever the rule: text says)"
+          .format(len(shape_dups)))
+    print("   Check before deleting: the same operation on two DIFFERENT stdlib "
+          "types normalises alike (OwningArray.Clear vs OwningQueue.Clear) and "
+          "is not a duplicate. Where it is one, the rule's home section keeps it.")
+    for ids in shape_dups[:20]:
+        print("   " + ", ".join(ids))
+
     print("\n{} reject cases carrying an unmatched `end` label — deliberate in a "
           "case about §1.6, a second ground anywhere else".format(len(reject_labels)))
     for line in reject_labels[:20]:

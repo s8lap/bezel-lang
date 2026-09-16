@@ -5,7 +5,7 @@
 //! rule: Owning choices are move-only value types and every section 15.3 rule
 //!   applies as written: no move-only value may be a record field (records
 //!   support only copy semantics, not move semantics).
-//! cites: 15.3, 9.7
+//! cites: 15.3, 9.7, 9.2
 //! expect: reject
 //! diagnostic: record
 module Conf;
@@ -21,7 +21,7 @@ public choice Holding
 end Holding;
 
 public record Box
-  public readonly property Content: Holding;
+  public Content: Holding;
 
   public constructor(content: Holding)
     Content := content;
