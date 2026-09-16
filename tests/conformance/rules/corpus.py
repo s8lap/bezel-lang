@@ -208,7 +208,17 @@ def check_case(path, text):
     problems.extend(top_level_member_problems(stem, body))
     if expect != "reject":
         problems.extend(end_label_problems(stem, body))
-        problems.extend(implicit_constructor_problems(stem, body))
+    # RETIRED v0.301: implicit_constructor_problems. It rejected `new C()` on a
+    # file-declared class with no constructor, citing "#4364: the spec does not
+    # state an implicit parameterless constructor exists". Spec §22.7 (v0.300)
+    # now states exactly that -- "A class that declares no instance constructor
+    # and no primary-constructor parameter list has an implicit parameterless
+    # constructor ... It is what `new C()` reaches on such a class" -- and §14.2
+    # makes such a class satisfy `where T: new()`. The check therefore rejected
+    # the very program #4364 was written to admit, which is the corpus
+    # contradicting the spec rather than recording it. Found by the lane writing
+    # #4364's own coverage, which had to route around it through `new T()` at a
+    # `where T: new()` substitution because the headline spelling would not lint.
     # `warns:` is the run tier's second half — see runner.evaluate. It says
     # only THAT a diagnostic is required; which one is the diagnostic report's
     # business, exactly as on a warn case.
@@ -336,45 +346,6 @@ def end_label_problems(case_id, body):
         out.append("{}: line {}: `end {};` names no construct this file "
                    "declares (§1.6 — a supplied label must match)"
                    .format(case_id, lineno, label))
-    return out
-
-
-_CLASS_DECL_RE = re.compile(
-    r'^\s*(?:public\s+|internal\s+|private\s+|protected\s+)?'
-    r'(?:abstract\s+|closed\s+|sealed\s+|static\s+)*class\s+([A-Za-z_]\w*)'
-    r'(?:<[^>]*>)?\s*(\()?', re.MULTILINE)
-_NEW_RE = re.compile(r'\bnew\s+([A-Z]\w*)\s*(?:<[^<>]*>)?\s*\(')
-
-
-def implicit_constructor_problems(case_id, body):
-    """`new C()` where C is declared in this file and declares no constructor.
-
-    AUTHORING rule 3: the spec does not state that a class with no declared
-    constructor has an implicit parameterless one (#4364), so a case that relies
-    on it would be a false divergence the day the corpus runs. Classes the case
-    does NOT declare are the stdlib's and are none of this check's business."""
-    declared, has_ctor = {}, set()
-    current = None
-    for line in body.split("\n"):
-        m = _CLASS_DECL_RE.match(line)
-        if m:
-            current = m.group(1)
-            declared[current] = True
-            if m.group(2):          # a primary constructor
-                has_ctor.add(current)
-            continue
-        if re.match(r'^\s*end\b', line):
-            current = None
-            continue
-        if current and re.search(r'\bconstructor\b', line.split("//")[0]):
-            has_ctor.add(current)
-    out = []
-    for name in sorted(set(_NEW_RE.findall(body))):
-        if name in declared and name not in has_ctor:
-            out.append("{}: `new {}(…)` on a class this file declares with no "
-                       "constructor — declare one (#4364: the spec does not "
-                       "state an implicit parameterless constructor exists)"
-                       .format(case_id, name))
     return out
 
 

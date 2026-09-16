@@ -232,9 +232,16 @@ Hard rules, each of which has cost somebody a day:
    the case mentions is either a primitive, a documented stdlib name, or
    declared right there. (A rule that genuinely needs two compilation units
    takes the directory form below — do not fake one inside a single file.)
-3. **Declare constructors explicitly.** Write `public constructor() end
-   constructor;` rather than relying on an implicit parameterless one: the spec
-   does not state that a class with no declared constructor has one.
+3. **Prefer an explicit constructor, but know it is a preference.** Writing
+   `public constructor() end constructor;` keeps a case self-evident. It is no
+   longer a correctness rule: §22.7 (v0.300) states that a class declaring no
+   instance constructor and no primary-constructor parameter list **has** an
+   implicit parameterless constructor, and that it is what `new C()` reaches;
+   §14.2 makes such a class satisfy `where T: new()`. Until v0.301 this rule
+   claimed the opposite and the lint enforced it, which rejected the very
+   program #4364 was written to admit. Rely on the implicit constructor freely
+   where the case is *about* it; declare one where the case is about something
+   else and the reader should not have to think about it.
 4. **Terminators are load-bearing.** Every statement ends `;`; every block ends
    `end …;`; a lambda's `do … end` block takes no `;` of its own. §3.4 of the
    writing reference has the exact closer for every construct.

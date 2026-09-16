@@ -584,7 +584,15 @@ class TestStructuralLints(unittest.TestCase):
         self.assertEqual([p for p in self.problems(text)
                           if "names no construct" in p], [])
 
-    def test_new_on_a_declared_class_with_no_constructor_is_caught(self):
+    def test_new_on_a_declared_class_with_no_constructor_is_admitted(self):
+        """The inverse of a check retired at v0.301, kept as a ratchet.
+
+        Until v0.301 the lint rejected this program, citing "#4364: the spec
+        does not state an implicit parameterless constructor exists". Spec
+        §22.7 (v0.300) now states exactly that, and §14.2 makes such a class
+        satisfy `where T: new()`, so the lint was rejecting the very program
+        #4364 was written to admit. This asserts the retirement holds: if the
+        check is ever reintroduced, this fails and says why."""
         text = ACCEPT.replace(
             "public class C\nend C;",
             "public class C\nend C;\n\n"
@@ -594,7 +602,7 @@ class TestStructuralLints(unittest.TestCase):
             "  end Main;\n"
             "end Program;").replace("//! expect: accept",
                                     "//! expect: run\n//! stdout: x")
-        self.assertTrue(any("#4364" in p for p in self.problems(text)))
+        self.assertEqual([p for p in self.problems(text) if "#4364" in p], [])
 
     def test_a_primary_constructor_counts(self):
         text = ACCEPT.replace(
