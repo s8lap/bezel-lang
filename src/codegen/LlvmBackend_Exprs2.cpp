@@ -1958,6 +1958,7 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
                 // cellFreeEligible_.count(decl))` — `cellFreeEligible_` is
                 // populated by collectCellFreeEligible's LambdaFinder, which
                 // correctly distinguishes non-escaping from escaping captures.
+                // LOCALDECL-DEBT: #4165 (LastCellEntry::dictEntryKeyReleaseDeferred new arm; const locals never carry DictionaryEntry<string,V>)
                 if (auto* ld = dynamic_cast<const ast::LocalDecl*>(decl)) {
                     const sema::TypeRef* rt =
                         ld->type ? ctx_.resolvedType(*ld->type)
