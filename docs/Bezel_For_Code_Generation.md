@@ -1,6 +1,6 @@
 # Bezel for Code Generation
 
-*Validated against v0.301. Companion to the Bezel Language Specification — a writing reference, not a normative document.*
+*Validated against v0.302. Companion to the Bezel Language Specification — a writing reference, not a normative document.*
 
 A dense reference for writing correct Bezel without reading the spec. It covers the syntax surface, the ownership rules, the standard-library name index, the idioms that work, and the shapes that look right and are rejected.
 
@@ -10,7 +10,7 @@ A dense reference for writing correct Bezel without reading the spec. It covers 
 
 **What this is.** Everything needed to emit compiling Bezel: the whole statement and expression grammar, the ownership discipline the compiler enforces, and an index of every standard-library name you are allowed to spell.
 
-**What this is not.** Normative. Where this document and `Bezel_Language_Spec.md` disagree, the spec wins and this document has a defect. Citations (`§17.2`, `stdlib §4.5`) are to spec v0.301 and `Bezel_Standard_Library.md` v0.301 so any claim here can be re-checked at its source.
+**What this is not.** Normative. Where this document and `Bezel_Language_Spec.md` disagree, the spec wins and this document has a defect. Citations (`§17.2`, `stdlib §4.5`) are to spec v0.302 and `Bezel_Standard_Library.md` v0.302 so any claim here can be re-checked at its source.
 
 **The one rule that matters most.** *If a type or member does not appear in section 5 of this document, look it up in `Bezel_Standard_Library.md` — and if it is not there, it does not exist.* **Never guess an API.** Inventing a plausible standard-library name is the single most common failure mode when writing Bezel: `MemoryStream`, `File.Open(path)`, `List<T>`, `string.Format`, `.ToList()`, `Task.Run`, `Option<T>`, `x.Dispose()` on a borrow — all plausible, all absent. Bezel's library is small and deliberately shaped; the shape is not .NET's.
 
@@ -603,7 +603,7 @@ Section 7 lists each with its remedy. In frequency order they are: the **must-us
 
 ## 5. The standard-library index
 
-Everything below is transcribed from `Bezel_Standard_Library.md` v0.282 with its markers intact. **A signature with its markers stripped is worse than no signature**: `owned`, `pure`, `ref`, `out`, `scoped`, nullability and constraints are load-bearing. **If a name is not here, look it up in the stdlib document; if it is not there either, it does not exist.**
+Everything below is transcribed from `Bezel_Standard_Library.md` v0.302 with its markers intact. **A signature with its markers stripped is worse than no signature**: `owned`, `pure`, `ref`, `out`, `scoped`, nullability and constraints are load-bearing. **If a name is not here, look it up in the stdlib document; if it is not there either, it does not exist.**
 
 ### 5.0 Modules and imports
 
@@ -848,7 +848,8 @@ public class OwningArray<T>: IOwningList<T>, IOwningEnumerable<T> where T: class
   method PopAt(index: int): owned T;   PopFirst(): owned T;   PopLast(): owned T;
   //   empty → InvalidOperationException (Pop/PopFirst/PopLast/Dequeue/Peek, every family);
   //   PopAt's index outside 0..<Count → IndexOutOfRangeException. Clear() disposes in
-  //   Dispose()'s order: reverse insertion for the ordered families.
+  //   Dispose()'s order: reverse STORAGE order for the ordered families
+  //   (descending index / tail-to-head / pop / reverse-dequeue, v0.302).
   method TryPopFirst(out owned item: T?): bool;   TryPopLast(out owned item: T?): bool;
   method Drain(): IOwningEnumerable<T>;
 end
@@ -1157,6 +1158,9 @@ end
 public class Lock  destructor;  end                    // no public ctor; NOT sendable
 public class Semaphore
   constructor(initialCount: int);   constructor(initialCount: int, maxCount: int);
+  //   maxCount is a construction-time CEILING only (v0.302): ArgumentException when
+  //   maxCount < 1 or initialCount > maxCount; nothing later can exceed it, because a
+  //   permit returns only by disposing a token that an acquisition produced
   method Acquire(): owned SemaphoreToken;   TryAcquire(timeout): owned SemaphoreToken?;
   //   counts PERMITS: initialCount at construction, one consumed per acquisition, returned by
   //   disposing the token; a holder re-acquiring consumes a second permit (not a deadlock)
@@ -1271,8 +1275,7 @@ public abstract class Stream
 end
 public enum SeekOrigin: byte  Begin, Current, End;  end
 public class FileStream: Stream
-  constructor(path: string, mode: FileMode);            // implies FileAccess.ReadWrite
-  constructor(path: string, mode: FileMode, access: FileAccess);
+  constructor(path: string, mode: FileMode, access: FileAccess := FileAccess.ReadWrite);
   public readonly property Path: string;   destructor;  // flushes + closes
 end
 public enum FileMode: byte    CreateNew, Create, Open, OpenOrCreate, Truncate, Append;  end
