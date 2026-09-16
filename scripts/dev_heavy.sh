@@ -62,7 +62,10 @@ case "$kind" in
   build)
     # Gate build (bezel_tests) is heavy + on the critical path -> priority.
     # Producer build (bezelc etc.) is light -> background weight, uses spare cap.
-    if printf '%s\n' "$@" | grep -q 'bezel_tests'; then
+    # Only the umbrella "bezel_tests" target gets priority — NOT bezel_tests_<area>
+    # (producer lanes run the latter in parallel during fan-out; granting them
+    # gate priority dilutes the gate build's CPU weight to nothing).
+    if printf '%s\n' "$@" | grep -qE '\bbezel_tests\b'; then
       cw=10000; iw=800; mem=14G
     else
       cw=100;   iw=80;  mem=12G
