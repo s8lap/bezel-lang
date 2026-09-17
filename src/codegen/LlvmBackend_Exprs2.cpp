@@ -2249,30 +2249,50 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         //      stay exactly once per reference (one `+1` produced by the
         //      capture-time cell allocation, one release at the owner's
         //      scope end — never both).
+        // fix #4261-FORWARD, narrowed (#3743-regression fix,
+        // §28.3 / §27.5 / §28.9, v0.301): the original widening
+        // fired for ANY captured-cell + reassigned local with
+        // mutatedSharedCaptureCell=true, but #3743's `f` (declared
+        // inside outer's body, reassigned by `mk`, captured by
+        // outer's returned `t + f()`) is registered for content
+        // release by the new arm WHILE the eager
+        // `!isCapturedCell`-gated release at the call use site also
+        // fires (closureLocalCapturedCell_ is populated only by
+        // top-level LocalDecls in collectCapturedCellClosureLocals
+        // — `f` is nested inside outer's body so it is NOT marked,
+        // the eager arm fires, AND the new arm's deferred release
+        // also runs at outer-scope end = double-free / heap
+        // corruption). The discriminator is `closureLocalCapturedCell_`
+        // itself: when populated, the eager arm is suppressed, and
+        // this arm is the SOLE release (the accounting case
+        // described below); when empty, the eager arm already
+        // released and this arm must NOT add a second.
+        //
+        // Accounting proof (preserved from the un-narrowed #4261-FORWARD):
+        // a captured-cell + reassigned local whose envdtor's content
+        // release is SUPPRESSED (mutatedSharedCaptureCell suppresses
+        // for the multi-env-shares-one-cell + body-writes combination)
+        // would otherwise leak its cell content forever: every prior
+        // reassign's old-value release balances the previous new value
+        // via `lowerCapturedClosureLocalReassign`, but the FINAL
+        // reassign's closure value remains held by the cell with no
+        // envdtor decrementing it. The `declaredShallower` /
+        // `inArgumentLambda_` shape fires #3752/#3778 for lifetime
+        // reasons (the envdtor would run too early on the deeper-scope
+        // capture); the SUPPRESSED envdtor case here fires for an
+        // accounting reason (the envs share the cell — every envdtor
+        // release would over-release the single +1). In both cases
+        // exactly ONE release at the owner's scope (this block's
+        // `disposeStack_[ownerScopeIdx]` push) is needed; the cell
+        // holder's lifetime (the local at depth `declScopeDepth`)
+        // ends before its `+1` content would otherwise die.
         if ((contentIsString || contentIsClosure) &&
             !alreadyBoxed && !isForVar && declScopeDepth > 0 &&
             currentFn_ == cellFreeEligibleFn_ &&
             cellFreeEligible_.count(static_cast<const void*>(decl)) &&
             ((declaredShallower || inArgumentLambda_) ||
-             // fix #4261-FORWARD (§28.3 / §27.5 / §28.9, v0.300):
-             // a captured-cell + reassigned local whose envdtor's content
-             // release is SUPPRESSED (mutatedSharedCaptureCell suppresses
-             // for the multi-env-shares-one-cell + body-writes combination)
-             // would otherwise leak its cell content forever: every prior
-             // reassign's old-value release balances the previous new value
-             // via `lowerCapturedClosureLocalReassign`, but the FINAL
-             // reassign's closure value remains held by the cell with no
-             // envdtor decrementing it. The `declaredShallower` /
-             // `inArgumentLambda_` shape fires #3752/#3778 for lifetime
-             // reasons (the envdtor would run too early on the deeper-scope
-             // capture); the SUPPRESSED envdtor case here fires for an
-             // accounting reason (the envs share the cell — every envdtor
-             // release would over-release the single +1). In both cases
-             // exactly ONE release at the owner's scope (this block's
-             // `disposeStack_[ownerScopeIdx]` push) is needed; the cell
-             // holder's lifetime (the local at depth `declScopeDepth`)
-             // ends before its `+1` content would otherwise die.
-             (assignedCaptureVars_.count(static_cast<const void*>(decl)) &&
+             (closureLocalCapturedCell_.count(static_cast<const void*>(decl)) &&
+              assignedCaptureVars_.count(static_cast<const void*>(decl)) &&
               mutatedSharedCaptureCell(static_cast<const void*>(decl),
                                        ce.semaTy,
                                        /*freshCellPerIteration=*/false)))) {
