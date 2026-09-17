@@ -88,6 +88,22 @@ ratchet, even though the compiler will never see it. Issue #3935
 (2026-09-06) names this as a pre-existing, orthogonal limitation -
 the C4 completion item records it here rather than fixing it silently.
 
+⚠ SUPPORT-HEADER HELPERS (C5 COMPLETION ITEM). The `_text_checking_
+helpers()` classifier only sees the file under scan: a helper defined
+in another file - the canonical case is a shared utility in
+`tests/support/*.hpp` that issue #3892 itself recommends using -
+is INVISIBLE to it. Before C5, a test whose only protection was a
+call to such a shared helper was counted; C5 fixes this by ALSO
+collecting helpers from `tests/support/*.hpp` once per `measure()`
+call and unioning them into the per-file helper set (see
+`_support_helpers()`). The same classification rule applies:
+positive-exclusion for the SKIP-literal bail-out idiom, default-
+protective otherwise. Helpers that do NOT match NAME_MARKERS AND do
+NOT live under `tests/support/` (e.g. a per-area shared header like
+`tests/codegen/codegen_helpers.hpp`) are still NOT picked up -
+deliberate scope, mirroring the LOCALDECL-ONLY/DEBT family's
+`tests/`-wide marker search.
+
 THE BASELINE IS EXACT, NOT A CEILING - same rule every ratchet in this file's
 family uses (scripts/check_deprecated_jit_oracle.py, scripts/check_localdecl_
 only_walkers.py, ...). A count BELOW baseline fails as STALE HEADROOM: a sweep
@@ -577,6 +593,48 @@ def _text_checking_helpers(text):
     return out
 
 
+def _support_helpers(root):
+    """Set of helper names defined under `tests/support/*.hpp` whose
+    signature takes a `JitResult`-shaped parameter and whose body reads
+    `.message` (C5 COMPLETION ITEM). Same classification rule as
+    _text_checking_helpers, applied across the support header files -
+    the canonical case is a shared utility in tests/support/ that an
+    ordinary test file `#include`s and calls as its sole protection
+    against the ambiguous-ran-false shape (issue #3892's recommended
+    remedy is to use a shared helper, but the SHARED one was invisible
+    to this ratchet before C5: a call site in `tests/<area>/X_test.cpp`
+    to a helper defined in `tests/support/some_helpers.hpp` would not
+    match NAME_MARKERS (the helper's name might be `expectsCompileError`
+    or similar), AND `_text_checking_helpers` only sees the file under
+    scan, never the included header).
+
+    The same POSITIVE-exclusion rule applies: a helper is denied
+    protective status only when every `.find(...)` call on `.message`
+    in its body can be positively confirmed as the SKIP-literal bail-
+    out shape. Anything this function CANNOT positively confirm as
+    skip-only defaults to PROTECTIVE, matching the per-file rule.
+
+    CAVEAT: this function reads the SUPPORT HEADER as text, not the
+    compiled image. A helper that goes through a templated alias or a
+    macro layer (e.g. `#define EXPECTS_ERROR(x) checkErr(x, "...")`)
+    may not be classified as protective. The narrower `tests/<area>/`
+    -shaped checks in `check_vacuous_tests.py` have the same caveat;
+    the fix there is to write the helper as plain C++, which is the
+    discipline this ratchet enforces by the same mechanism.
+    """
+    out = set()
+    support_dir = root / 'tests' / 'support'
+    if not support_dir.is_dir():
+        return out
+    for p in sorted(support_dir.glob('*.hpp')):
+        try:
+            text = p.read_text(errors='replace')
+        except OSError:
+            continue
+        out.update(_text_checking_helpers(text))
+    return out
+
+
 LOC_LINE = re.compile(r'\.line\b\s*[><=!]=?\s*0')
 LOC_COLUMN = re.compile(r'\.column\b\s*[><=!]=?\s*0')
 
@@ -689,13 +747,16 @@ def _ambiguous_debt_markers(raw):
     return out
 
 
-def scan_file(path, raw):
+def scan_file(path, raw, support_helpers=None):
     """-> list of (test_name, var) unprotected rows in this file's raw
     text. `raw` is the file's actual on-disk text (the marker-attach
     logic reads from it directly, since both AMBIGUOUS-RAN-FALSE-OK and
     AMBIGUOUS-RAN-FALSE-DEBT are comments and would be stripped from the
     comment-stripped copy - check_localdecl_only_walkers.py:160-165 makes
-    the same point)."""
+    the same point). `support_helpers` is the set of helper NAMES
+    collected from `tests/support/*.hpp` by `_support_helpers()` (C5);
+    a call to one of those names in a test body counts as protection
+    exactly like an in-file helper would."""
     if 'BEZEL_TEST' not in raw:
         return []
     # fix #3915: scan a COMMENT-STRIPPED copy, never the raw text - a
@@ -713,6 +774,11 @@ def scan_file(path, raw):
     if not (RAN_FALSE.search(text) or HAS_ERRORS_TRUE.search(text)):
         return []
     text_helpers = _text_checking_helpers(text)
+    # C5: union the in-file helper names with the support-header
+    # helper names collected once per measure() call (avoiding one
+    # glob+read per scan_file invocation; the union is per-call).
+    if support_helpers:
+        text_helpers = text_helpers | support_helpers
     ok_tests = _ambiguous_ok_test_names(raw)  # C1: suppression marker
     marks = [(m.start(), f'{m.group(1)}.{m.group(2)}', m.end())
              for m in BEZEL_TEST.finditer(text)]
@@ -809,12 +875,16 @@ def measure(root):
     tests_dir = root / 'tests'
     if not tests_dir.is_dir():
         return 0, {}, {}
+    # C5: collect helper names from tests/support/*.hpp ONCE per
+    # measure() call (not once per file). See _support_helpers
+    # docstring for the rationale and the same-classification rule.
+    support_helpers = _support_helpers(root)
     for p in sorted(tests_dir.rglob('*_test.cpp')):
         try:
             raw = p.read_text(errors='replace')
         except OSError:
             continue
-        rows = scan_file(p, raw)
+        rows = scan_file(p, raw, support_helpers=support_helpers)
         rel = str(p.relative_to(root))
         if rows:
             per_file[rel] = rows
@@ -1624,6 +1694,96 @@ BEZEL_TEST(fixture_suite, inside_if1) {
         chk('C4 live rows are still counted: inside_iffalse_test.cpp has 1 '
             '(live_above_iffalse, the inside_iffalse body is blanked)',
             len(per_file.get('tests/codegen/inside_iffalse_test.cpp', [])) == 1)
+        # C5 fixtures: a helper defined in tests/support/*.hpp that
+        # takes a JitResult and reads .message must protect a calling
+        # body, even when the helper's name does NOT match NAME_MARKERS
+        # and the file under scan does NOT itself define any local
+        # helpers. Before C5, this case was silently counted as
+        # unprotected (the recommended fix in issue #3892's own
+        # rationale was "use a shared helper", but the shared helper
+        # was invisible to this ratchet).
+        _mk(root, 'tests/support/c5_shared_helper_test.hpp', '''
+#pragma once
+#include <string>
+namespace c5_test_support {
+inline bool hasExpectedRejectionMsg(const bezel::test::JitResult& r,
+                                    const char* needle) {
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find(needle) != std::string::npos) return true;
+    return false;
+}
+}
+''')
+        _mk(root, 'tests/codegen/uses_support_helper_test.cpp', '''
+#include "support/c5_shared_helper_test.hpp"
+BEZEL_TEST(fixture_suite, protected_via_support_helper) {
+    auto r = runAot("module M;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    if (!c5_test_support::hasExpectedRejectionMsg(r, "expected text")) return;
+}
+''')
+        chk('C5 POSITIVE: a test whose only protection is a call to a '
+            'tests/support/*.hpp-defined helper that takes a JitResult '
+            'and reads .message does NOT count (issue #3892\'s '
+            '"use a shared helper" recommendation)',
+            'tests/codegen/uses_support_helper_test.cpp'
+            not in per_file)
+        _mk(root, 'tests/support/c5_skip_only_helper_test.hpp', '''
+#pragma once
+namespace c5_test_support {
+inline bool toolchainWasSkippedShape(const bezel::test::JitResult& r) {
+    if (r.ran) return false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("SKIP") != std::string::npos) return true;
+    return false;
+}
+}
+''')
+        _mk(root, 'tests/codegen/uses_skip_only_helper_test.cpp', '''
+#include "support/c5_skip_only_helper_test.hpp"
+BEZEL_TEST(fixture_suite, protected_via_skip_only_helper) {
+    auto r = runAot("module M;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    if (c5_test_support::toolchainWasSkippedShape(r)) return;
+}
+''')
+        _mk(root, 'tests/support/c5_nonjit_helper_test.hpp', '''
+#pragma once
+namespace c5_test_support {
+inline bool someOtherCheck(const std::string& s) {
+    return s.find("hello") != std::string::npos;
+}
+}
+''')
+        _mk(root, 'tests/codegen/uses_nonjit_helper_test.cpp', '''
+#include "support/c5_nonjit_helper_test.hpp"
+BEZEL_TEST(fixture_suite, protected_via_non_jit_helper) {
+    auto r = runAot("module M;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    if (c5_test_support::someOtherCheck(std::string("hello"))) return;
+}
+''')
+        # Re-measure AFTER the C5 fixtures are added so the post-C5
+        # NEGATIVE assertions below (the SKIP-only and non-JitResult
+        # helper cases both DO count) can reference a `per_file` that
+        # contains the freshly-added fixture files. The earlier
+        # `per_file` captured at line ~1443 did NOT see these
+        # fixtures yet - `in per_file` would vacuously fail for the
+        # same reason the C4 NEGATIVE needed its own re-measure.
+        total, per_file, debt_per_file = measure(root)
+        chk('C5 NEGATIVE: a tests/support/*.hpp-defined helper that '
+            'checks ONLY the SKIP literal is SKIP-only, NOT protective '
+            '(same positive-exclusion rule as in-file helpers)',
+            'tests/codegen/uses_skip_only_helper_test.cpp' in per_file)
+        chk('C5 NEGATIVE: a tests/support/*.hpp-defined helper whose '
+            'parameter is NOT a JitResult is NOT collected by '
+            '_support_helpers (the JitResult signature check is the '
+            'same as _text_checking_helpers\'s), so the row IS counted',
+            'tests/codegen/uses_nonjit_helper_test.cpp' in per_file)
+        chk('C5 POSITIVE (re-measured): real-helper case is still NOT '
+            'counted (the union with support_helpers preserves the '
+            'protection across re-measure)',
+            'tests/codegen/uses_support_helper_test.cpp' not in per_file)
         # C1 fixtures: the suppression marker mechanism.
         chk('C1: an AMBIGUOUS-RAN-FALSE-OK marker on the line before a '
             'BEZEL_TEST body suppresses that row from the count (the '
@@ -1642,14 +1802,19 @@ BEZEL_TEST(fixture_suite, inside_if1) {
             'BEZEL_TEST within 8 lines below (e.g. with too many padded '
             'comment lines) does not exempt anything in this file',
             'tests/codegen/marker_no_match_test.cpp' in per_file)
-        chk('exactly 12 unprotected rows across the fixture tree (6 from '
-            'the existing tree + 3 C1 negative-control fixtures + 0 C3 '
-            'fixtures (the malformed/valid run count is stripped) + 3 '
-            'C4 fixtures: inside_if0 live row, inside_iffalse live row, '
-            'inside_if1 - the #if 0/#if false block bodies are blanked '
-            'by _strip_disabled_preprocessor but the live `live_above*` '
-            'rows + the entire inside_if1_test file remain)',
-            total == 12)
+        chk('exactly 14 unprotected rows across the fixture tree (12 from '
+            'the C4-counted tree + 2 net C5 delta: the positive support-'
+            'helper case is correctly PROTECTED by C5 (its row is removed '
+            'from the count, a non-counting fixture by design), but the '
+            'two negative controls each contribute +1 (the SKIP-only '
+            'helper denial case and the non-JitResult-helper denial case '
+            'are both still counted as unprotected because their '
+            'protection claim is rejected by the SAME positive-exclusion '
+            'rule that applies to in-file helpers)',
+            total == 14)
+        # (Debug prints removed; count was confirmed = 14 via a temp
+        # print during the C5 fix - left the count assertion here as
+        # the tripwire for any future change that lifts the C5 net.)
 
         # C2 fixtures: the grandfather / DEBT marker mechanism. The
         # three malformed-marker / drifted-marker / marker-no-match
