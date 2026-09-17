@@ -33,7 +33,9 @@
 #include <unistd.h>
 #include <vector>
 
-#include "support/scratch_dir.hpp"  // the ONE scratch-root policy
+#include "support/force_sanitize.hpp"   // bezel::test::forceSanitizeAddress() (#3682)
+#include "support/scratch_dir.hpp"      // the ONE scratch-root policy
+#include "test_harness.hpp"             // currentTestFailed() — the #3682 trip
 
 namespace bezel::native_test {
 
@@ -263,8 +265,36 @@ inline const std::string& sanitizerRuntimeMasterUncounted(
 // covered by construction.
 inline const std::string& sanitizerRuntimeMaster(const std::string& san) {
     const std::string& result = sanitizerRuntimeMasterUncounted(san);
-    if (result.empty())
+    if (result.empty()) {
         nativeSanitizerUnavailableSkips().fetch_add(1, std::memory_order_relaxed);
+        // fix #3682: under the suite-wide ASan sweep (`gate.sh --full`,
+        // `agent_check.sh --probe --asan`), an unavailable sanitizer
+        // runtime is a FAILED run, not a silent skip. A counter alone is
+        // not loud enough — the test's own `if (asan == -1) return;`
+        // (~165 sites per `scripts/check_native_asan_leg_skips.py`)
+        // swallows the counter's signal and the row reports a clean PASS
+        // while the ASan leg is broken (the #3653 `detect_leaks` defect
+        // reached the gate unseen for exactly this reason). Mimic
+        // `noteInfraFailure` (`tests/support/aot_support.hpp:608-628`):
+        // mark the current test failed and print a marker, so the test
+        // cannot be observed as green regardless of what its body does
+        // with the empty result. Gated on `forceSanitizeAddress()` so a
+        // plain developer run on a box with no ASan runtime still skips
+        // (and stays silent) the way it always did — this is the
+        // `--full`/ASan-probe sweep demanding the leg, not every run.
+        if (::bezel::test::forceSanitizeAddress()) {
+            std::cout << "    [ INFRA ] sanitizerRuntimeMaster(\"" << san
+                      << "\"): the " << san
+                      << "-instrumented runtime object is unavailable, and "
+                         "BEZEL_AOT_FORCE_SANITIZE=address requires it. "
+                         "Refusing to skip the test vacuously (#3682, "
+                         "spec §2). Without this guard every per-test "
+                         "`if (... < 0) return;` reads a missing leg as "
+                         "clean PASS.\n";
+            std::cout.flush();
+            ::bezel::test::currentTestFailed() = true;
+        }
+    }
     return result;
 }
 
