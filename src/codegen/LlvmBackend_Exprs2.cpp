@@ -2370,7 +2370,22 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         // this shared-cell route fires only for escaping lambdas where
         // capturedByEscaping has the key (boxedCellFree disarmed), and the
         // envdtor is the cell's sole reclaim path.
-        if (!ce.freeCellInEnvdtor && !isForVar &&
+        //
+        // fix #3435 follow-up: RESTORE `loopStack_.empty()` here. The original
+        // #3435/#3426 commit (09132a99) included it, but #4210 (db2386a16)
+        // dropped it in favour of the new `definitelyEscapingLambdas_` guard
+        // — that guard covers a different hazard (non-escaping lambdas
+        // falsely classified as cell owners) but does NOT cover this one. A
+        // lambda captured inside a loop builds N closures over ONE cell
+        // (singleCaptureLocals_ counts syntactic NODES, so the walk records
+        // only the one owner, but iteration N produces N envs that all
+        // release the cell). Without `loopStack_.empty()` each iteration's
+        // envdtor calls `free(cell)` on the same cell — a double-free (the
+        // canonical `field_store_escape_inside_loop_…` OVER-RELEASE GUARD row
+        // of #3426's regression test dies with "AddressSanitizer: attempting
+        // double-free" on the second iteration, measured on this build).
+        // `definitelyEscapingLambdas_` is unchanged from #4210.
+        if (!ce.freeCellInEnvdtor && !isForVar && loopStack_.empty() &&
             currentFn_ == cellFreeEligibleFn_ &&
             definitelyEscapingLambdas_.count(static_cast<const void*>(&lam)) &&
             isSharedCellEnvdtorFreeOwner(static_cast<const void*>(decl), &lam))
