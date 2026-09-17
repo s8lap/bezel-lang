@@ -185,7 +185,7 @@ int runUnderASan3181(const std::string& source) {
     if (std::system(linkCmd.c_str()) != 0) {
         std::remove(objPath.c_str());
         std::remove(exe.c_str());
-        return -1;
+        return -3;
     }
     std::string runCmd =
         "ASAN_OPTIONS=detect_leaks=1:exitcode=99 " + exe + " > /dev/null 2>&1";
@@ -201,6 +201,35 @@ void expectCleanAndEq3181(const std::string& src, int expectedExit) {
     BEZEL_EXPECT_EQ(run(src), expectedExit);
     int san = runUnderASan3181(src);
     if (san != -1) BEZEL_EXPECT_EQ(san, 0);
+}
+
+// fix #3676: the link-failure return code was the OLD conflated `-1`, masking
+// a real ASan link failure as a toolchain-unavailable SKIP. Splitting the link
+// step out into a small inline helper both fixes the contract (link failure
+// is `-3`, per #3633) and exposes the link/run classification to a regression
+// test that can force a link failure without breaking the local toolchain.
+//   -3  link failure under -fsanitize=address       (was -1 — #3676)
+//   -4  system() failure on the run step (fork/exec)
+//    0  clean
+//    1  ASan report (LSan exit code 99)
+inline int linkRunAsan3181(const std::string& rtObj, const std::string& objPath,
+                           const std::string& exe) {
+    std::string linkCmd = "clang++ -fsanitize=address -g " + objPath + " " +
+                          rtObj + " -lm -lpthread -lstdc++ -o " + exe +
+                          " > /dev/null 2>&1";
+    if (std::system(linkCmd.c_str()) != 0) {
+        std::remove(objPath.c_str());
+        std::remove(exe.c_str());
+        return -3;
+    }
+    std::string runCmd =
+        "ASAN_OPTIONS=detect_leaks=1:exitcode=99 " + exe + " > /dev/null 2>&1";
+    int status = std::system(runCmd.c_str());
+    std::remove(objPath.c_str());
+    std::remove(exe.c_str());
+    if (status == -1) return -4;
+    if (WIFEXITED(status) && WEXITSTATUS(status) == 99) return 1;
+    return 0;
 }
 
 }  // namespace
@@ -414,6 +443,73 @@ BEZEL_TEST(domain_spawn_choice_valuearg_3181,
         "  end Main; "
         "end Program;";
     expectCleanAndEq3181(src, 0);
+}
+
+// sharpen #3181: an EXACTLY-8-byte sendable record. The pre-fix sender's
+// `bitcast → i64` happened to PASS the verifier for any 8-byte struct,
+// so a record of exactly two `int` fields (or one `long`) was the
+// canonical "happens to pass the verifier, silently wrong at runtime"
+// shape the original commit message names but does NOT pin. Pre-fix, the
+// bits round-tripped wrongly: the receiver's `ptrtoint` interpreted the
+// pointer as a plain i64, not as a struct value, so the entry observed
+// the 8 bytes of the pointer's bit-pattern-pretending-to-be-a-struct
+// (essentially undefined for any field the entry actually read). Post-
+// sharpen, the heap-copy path means the entry sees the actual struct
+// bytes, both fields correctly. The test returns `x + y * 7` (so a
+// round-trip error in EITHER field shifts the exit code) and pins 7*10+1
+// = 71 as the discriminant.
+
+// ─────────────────────────────────────────────────────────────────────────────
+// fix #3676: a real ASan link failure (e.g. clang++ missing the ASan
+// runtime, disk-full, or a `-l` flag misroute after a runtime change) must
+// NOT be reported as `-1` (toolchain unavailable: SKIP) — that conflates two
+// unrelated failure classes and lets the row report a clean PASS while the
+// ASan leg is broken. The pre-fix helper returned `-1` on link failure; the
+// caller at `:203` then `if (san != -1) BEZEL_EXPECT_EQ(san, 0);` skipped the
+// check, so a broken toolchain read as a SKIP, not a FAIL. Post-fix the link
+// step returns `-3` (per #3633), so any caller that observes a non-zero
+// non-SKIP code fails the test loudly.
+//
+// We force the link failure by pointing the link line at a runtime object
+// path that does not exist — the same command shape runUnderASan3181 uses,
+// minus the run step, which is what `linkRunAsan3181` was extracted for.
+// The link command IS the assertion: any non-zero exit means the linker
+// could not produce an executable, which is exactly the failure class `#3633`
+// reserves `-3` for. Pre-fix, the same body returned `-1`; this test would
+// fail with `BEZEL_EXPECT_EQ(-1, -3)`.
+// ─────────────────────────────────────────────────────────────────────────────
+BEZEL_TEST(domain_spawn_choice_valuearg_3181,
+           link_failure_returns_minus_three_not_minus_one_3676) {
+    auto dir = wtDir3181();
+    std::string stem = unique_stem("bezel_3181_asan_linkfail_");
+    std::string objPath = (dir / (stem + ".o")).string();
+    std::string exe     = (dir / stem).string();
+
+    // A non-empty `.o` file so the link command proceeds past the input
+    // shape check and fails on the runtime object path instead — the same
+    // shape a real `clang++` install with a missing/broken ASan runtime
+    // produces (the linker reports "cannot find -lasan" / "no such file"
+    // depending on version, both non-zero).
+    {
+        std::ofstream f(objPath, std::ios::binary);
+        // ELF magic — a valid enough header to survive a header-only check,
+        // never enough for a real link. Concatenated string literals because
+        // `\x7fELF` would otherwise be one 5-byte hex escape, not `\x7f` +
+        // `"ELF"`.
+        f << "\x7f" "ELF";
+    }
+
+    const std::string bogusRtObj =
+        (dir / "definitely-not-a-runtime-for-3676.o").string();
+    const int rc = linkRunAsan3181(bogusRtObj, objPath, exe);
+
+    std::remove(objPath.c_str());
+    std::remove(exe.c_str());
+
+    // The contract: a link failure under `-fsanitize=address` is `-3`. Pre-fix
+    // this returned `-1` and the caller's `if (san != -1)` silently swallowed
+    // it as a SKIP, so the ASan leg reported clean PASS while broken.
+    BEZEL_EXPECT_EQ(rc, -3);
 }
 
 // sharpen #3181: an EXACTLY-8-byte sendable record. The pre-fix sender's
