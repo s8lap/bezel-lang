@@ -7,7 +7,7 @@
 | **Target module(s)** | `System.IO` (extends stdlib §7.3 `File`; new `FileStatus`/`FileKind` types in a new §7.3b — numbering at docs-editor discretion, the 0009 precedent; 0017 already claims §7.3a) |
 | **Written against** | spec/stdlib **v0.227** |
 | **Gap-review item** | — (not among the [gap review](stdlib-gap-review-2026-07.md)'s 31 items; see §0) |
-| **Currency note** | Refreshed 2026-08-11 to v0.246: §17.11's zero-constant diagnostic is an error since v0.242 (was a warning) — the §8 claim conformed; the design is unaffected (`FileKind` has the zero constant). Written-against pin unchanged. |
+| **Currency note** | Refreshed 2026-08-11 to v0.246: §17.11's zero-constant diagnostic is an error since v0.242 (was a warning) — the §8 claim conformed; the design is unaffected (`FileKind` has the zero constant). Written-against pin unchanged. **2026-09-17 sweep — refreshed to v0.306:** `DateTime` ordering respelled to `CompareTo` at D3's instant-idiom sentence and in §9's `NeedsRebuild` example (`src.ModifiedAt > built.ModifiedAt` → `src.ModifiedAt.CompareTo(built.ModifiedAt) > 0`) — stdlib §2.5 deleted the claimed `<`/`>`/`<=`/`>=` operator group at v0.274 and now states *"Ordering is CompareTo only"*; tick-order semantics and the design are unchanged. No tier-2 flag. Written-against pin unchanged. |
 
 ---
 
@@ -71,7 +71,7 @@ The alternatives, each checked against its source:
 
 - **0016's `Instant`** (monotonic time; draft) is explicitly *not* wall-clock — it has "no conversion to `DateTime`" and answers only elapsed-time questions. An mtime is a wall-clock fact recorded by the filesystem; `Instant` is the wrong type by 0016's own charter.
 - **0012's `DateTimeOffset`** (accepted 2026-07-07, delegated; **not yet landed** in the stdlib) is instant + *civil offset* — but a filesystem timestamp carries no civil offset; the only honest offset would be a constant `+00:00`, adding a field of ceremony and, more decisively, sequencing this proposal behind 0012's landing for zero semantic gain. When 0012 lands, `DateTimeOffset.FromDateTime(st.ModifiedAt)` (well-defined for `Kind = Utc` per 0012 D2) bridges losslessly; a `ModifiedAtOffset` accessor would be a compatible widening.
-- **`DateTime` with `Kind = Utc`** is the stdlib-current instant idiom: §2.5's own `FromUnixTimeSeconds` produces `Kind = Utc`, and `ToUnixTimeSeconds` round-trips it deterministically ("no hidden machine-zone read"). Comparison (`<`, `>`) is tick order — correct for two `Utc` values, which is all this API emits.
+- **`DateTime` with `Kind = Utc`** is the stdlib-current instant idiom: §2.5's own `FromUnixTimeSeconds` produces `Kind = Utc`, and `ToUnixTimeSeconds` round-trips it deterministically ("no hidden machine-zone read"). Comparison is `CompareTo` (tick order) — `DateTime` declares no `<`/`>`/`<=`/`>=` overloads (§2.5, v0.274) — and is correct for two `Utc` values, which is all this API emits.
 
 **Precision pin:** platform timestamps (commonly nanoseconds) are truncated **toward negative infinity** (floor) to the 100 ns tick, so the order of two distinct platform timestamps is never inverted by conversion. (0016's `FromNanoseconds` truncates *toward zero*; the divergence is deliberate and stated — a duration's sign symmetry wants toward-zero, a timeline's ordering wants floor — and is invisible for all post-1970 timestamps, where the two rules coincide.)
 
@@ -199,7 +199,7 @@ public method NeedsRebuild(sourcePath: string, outputPath: string): bool
     return true;                                  // no output yet — expected, not a fault
   end;
   var src := File.GetStatus(sourcePath);          // missing source IS a fault: let it raise
-  return src.ModifiedAt > built.ModifiedAt;       // DateTime tick-order comparison (§2.5)
+  return src.ModifiedAt.CompareTo(built.ModifiedAt) > 0;   // DateTime tick-order comparison (§2.5)
 end NeedsRebuild;
 
 // --- Log rotation (the 0021 sink side) ---
