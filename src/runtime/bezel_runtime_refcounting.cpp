@@ -472,11 +472,30 @@ struct BzBorrowEntry {
 namespace {
 std::mutex g_borrow_mu;
 std::unordered_map<void*, std::unique_ptr<BzBorrowEntry>> g_borrow_table;
+// Lazy atexit-registration flag: set the first time any code calls
+// bz_register_borrow, so a program that never crosses an async-method
+// borrow boundary never installs the exit-time drain. See bz_register_borrow
+// and bz_drain_borrow_table.
+bool g_borrow_atexit_registered = false;
 }  // namespace
+
+// Forward-declared: defined further below (after bz_wait_for_borrows). The
+// forward declaration lets bz_register_borrow install it as an atexit handler
+// at first invocation without a header split.
+static void bz_drain_borrow_table(void);
 
 extern "C" void bz_register_borrow(void* obj) {
     if (!obj) return;
     std::lock_guard<std::mutex> lk(g_borrow_mu);
+    // Lazy atexit registration (matches bz_register_static_owned's pattern):
+    // a process that never crosses an async-method borrow boundary never
+    // installs the drain, never allocates the table, and pays nothing for
+    // #3460 at exit — exit-time behavior is bit-identical to a build that
+    // doesn't link the borrow tracker.
+    if (!g_borrow_atexit_registered) {
+        g_borrow_atexit_registered = true;
+        std::atexit(bz_drain_borrow_table);
+    }
     auto& slot = g_borrow_table[obj];
     if (!slot) slot.reset(new BzBorrowEntry());
     slot->borrow_count.fetch_add(1, std::memory_order_acq_rel);
@@ -514,4 +533,54 @@ extern "C" void bz_wait_for_borrows(void* obj) {
         // to zero.
         return e->borrow_count.load(std::memory_order_acquire) == 0;
     });
+}
+
+// fix #3460 follow-up: process-exit drain for the borrow-tracker side table.
+//
+// The entry-retain-not-erase design (above) keeps BzBorrowEntry instances alive
+// across count==0 so a late register on the same object pointer can find them.
+// For long-running services that capture many objects across many async tasks,
+// the side table therefore GROWS without bound for the process lifetime — at
+// exit every entry's BzBorrowEntry (and its condition variable) is still live,
+// and AddressSanitizer's exit-time leak scan flags the heap allocation per
+// entry as a leak.
+//
+// The drain runs as a process-finalization callback (atexit): at exit every
+// thread is done, so every entry's count must be 0 (any live borrow would be
+// a soundness bug — the bz_wait_for_borrows at the OWNER's free site would
+// still be blocked on the cv, and the OWNER's free(obj) would not have been
+// reached). We therefore drain unconditionally: take the lock, swap the table
+// for an empty local, notify_all any waiters that may be racing the exit
+// (none in a well-formed program; the notify_all is defensive), then release
+// the lock and let the local's destruction free every BzBorrowEntry.
+//
+// The drain does NOT wait for a particular entry's count to drop — by exit
+// the count is 0 by construction (see the argument above), and even if a
+// count were non-zero, waiting at exit would deadlock: the thread that owns
+// the borrow is already gone.
+//
+// Registered as an atexit handler on FIRST bz_register_borrow invocation
+// (matching the static-owned registry's lazy-atexit pattern), so a process
+// that never registers a borrow pays nothing — the handler is never
+// installed, the table is never created, and exit's static destruction
+// order is the same as before #3460.
+static void bz_drain_borrow_table(void) {
+    std::unordered_map<void*, std::unique_ptr<BzBorrowEntry>> drained;
+    {
+        std::lock_guard<std::mutex> lk(g_borrow_mu);
+        // Swap so the table is empty after the drain; a stray register after
+        // the drain (impossible: all threads are done, but defensive) would
+        // find an empty table and allocate a fresh entry, no UAF.
+        drained.swap(g_borrow_table);
+        // Wake any waiters still racing the exit (defensive — see comment).
+        for (auto& kv : drained) {
+            kv.second->cv.notify_all();
+        }
+    }
+    // Release the lock first so the per-entry cv destructors (which can take
+    // their own locks internally on some libstdc++ versions) don't recurse on
+    // g_borrow_mu. Then let `drained` fall out of scope — each unique_ptr
+    // frees its BzBorrowEntry (which destructs the std::condition_variable;
+    // the libstdc++ cv destructor is lock-free).
+    (void)drained.size();
 }
