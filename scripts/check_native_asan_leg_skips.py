@@ -203,7 +203,19 @@ def _is_function_header(header):
 def build_function_index(text):
     """Return [(open_pos, close_pos), ...] for every function/lambda body
     in `text`, properly nested via a brace stack over the stripped text.
-    `open_pos`/`close_pos` are the offsets of the `{` and matching `}`."""
+    `open_pos`/`close_pos` are the offsets of the `{` and matching `}`.
+
+    Pre-fix, this pushed only function-header `{` onto a stack and popped
+    on every `}`, so a nested non-function `}` (e.g. the inline
+    `{ bezel::DiagnosticEngine diags; ... }` block in runUnderASan3181)
+    would pop the outer function's `{` and truncate the body before any
+    `-fsanitize=address` link string — the seed at #3676 was structurally
+    invisible to the ratchet. Now every `{` is pushed with its
+    function-header flag, and a `}` pops the topmost `{` (which is its
+    actual match by brace balance); the block is recorded only if the
+    popped `{` was a function header. Inner non-function `{}` pairs close
+    against themselves, leaving the outer function body intact.
+    """
     blocks, stack = [], []
     n = len(text)
     last_boundary = 0
@@ -216,14 +228,16 @@ def build_function_index(text):
             if paren_depth > 0:
                 paren_depth -= 1
         elif c == '{':
-            if _is_function_header(text[last_boundary:i]):
-                stack.append(i)
+            header = text[last_boundary:i]
+            is_fn = _is_function_header(header)
+            stack.append((i, is_fn))
             last_boundary = i + 1
             paren_depth = 0
         elif c == '}':
             if stack:
-                open_pos = stack.pop()
-                blocks.append((open_pos, i))
+                open_pos, is_fn = stack.pop()
+                if is_fn:
+                    blocks.append((open_pos, i))
             last_boundary = i + 1
             paren_depth = 0
         elif c == ';' and paren_depth == 0:
@@ -774,6 +788,52 @@ FIXTURES_CONFLATE = [
      '    if (std::system(linkCmd.c_str()) != 0) { cleanup(); return -3; }\n'  # fixed
      '    return 0;\n'
      '}\n', 0),  # prose -1 not in code
+    # #3676 / spec §2 SEED: the runUnderASan3181 shape — an inner non-function
+    # `{ bezel::DiagnosticEngine diags; ... }` block followed by a
+    # `-fsanitize=address` link command and a post-link `return -1;`. Pre-fix
+    # `build_function_index` truncated the body at the inner block's `}`, so the
+    # link string was outside the recorded body and the conflating helper was
+    # structurally invisible to the ratchet (the spec's named seed). Post-fix
+    # the body extends to the function's actual closing `}`, so the link
+    # string + post-link `return -1;` are inside the body and the ratchet
+    # reports 1. If this fixture ever reports 0, the brace tracking has
+    # regressed to the buggy shape and the spec's seed is again invisible.
+    ('conflate_inner_block_seed_3682',
+     'int runUnderASan3181_shaped(const std::string& source) {\n'
+     '    const std::string& rtObj = ::bezel::native_test::asanRuntimeObject();\n'
+     '    if (rtObj.empty()) return -1;\n'
+     '    auto dir = wtDir3181();\n'
+     '    std::string stem = unique_stem("bezel_3181_asan_");\n'
+     '    std::string objPath = (dir / (stem + ".o")).string();\n'
+     '    std::string exe     = (dir / stem).string();\n'
+     '    {\n'
+     '        bezel::DiagnosticEngine diags;\n'
+     '        bezel::Lexer lexer(source, diags);\n'
+     '        if (!lexer.ok()) return -2;\n'
+     '    }\n'
+     '    std::string linkCmd = "clang++ -fsanitize=address -g " + objPath;\n'
+     '    if (std::system(linkCmd.c_str()) != 0) {\n'
+     '        std::remove(objPath.c_str());\n'
+     '        std::remove(exe.c_str());\n'
+     '        return -1;\n'  # post-link return -1 — the #3676 bug shape
+     '    }\n'
+     '    return 0;\n'
+     '}\n', 1),
+    # Sibling: same shape, post-link returns -3 (the #3676 fix). Must NOT be
+    # flagged as a conflation helper even with the brace fix — the inner block
+    # is correctly nested now, but the post-link `return -3;` is the fix.
+    ('not_conflate_inner_block_post_fix_3682',
+     'int runUnderASan3181_post_fix(const std::string& source) {\n'
+     '    const std::string& rtObj = ::bezel::native_test::asanRuntimeObject();\n'
+     '    if (rtObj.empty()) return -1;\n'
+     '    {\n'
+     '        bezel::DiagnosticEngine diags;\n'
+     '        if (!diags.ok()) return -2;\n'
+     '    }\n'
+     '    std::string linkCmd = "clang++ -fsanitize=address -g " + objPath;\n'
+     '    if (std::system(linkCmd.c_str()) != 0) { return -3; }\n'  # post-fix
+     '    return 0;\n'
+     '}\n', 0),
 ]
 
 
