@@ -877,6 +877,55 @@ if ! python3 scripts/check_nested_body_scope_coverage.py --strict \
 fi
 say "nested-body-scope phase: GREEN ($(tail -1 "$LOGDIR/${TAG}_nbscope.log"))"
 
+# ── TIMEOUT-NEGATIVES PHASE (#3732) ────────────────────────────────────────
+# The compile / run TIMEOUT is the third member of the #3007 family
+# (#3007 infra, #3733 toolchain-SKIP, #3732 timeout) that surfaced as a
+# Severity::Error diagnostic byte-for-byte indistinguishable from a real
+# compile REJECT. The harness's channel routes it through
+# `aot_detail::markTimeout()` instead — Severity::NOTE, current test failed,
+# `hasErrors()` stays FALSE — so every `BEZEL_EXPECT_TRUE(hasErrors())` and
+# `BEZEL_EXPECT_FALSE(<var>.ran)` site across tests/ is structurally immune
+# to a timeout in one edit per harness. The source half freezes the small
+# residual (~24 hand-rolled `.line > 0 && .column > 0` rows at
+# b57a712e+channel — measured 4 actual bare-location rows today) so the
+# surface cannot grow while the burn-down runs; the channel half retires
+# the SHAPE the script counts, so the script is RETIRED at done criterion
+# (unlike the toolchain-skip / native-asan-leg / ambiguous-ran-false
+# ratchets, which freeze permanent shape hazards — spec §4 burn-down).
+#
+# Phase order: immediately after toolchain-skip, before null-guard-vacuous
+# (spec §0.3 ordering: toolchain-skip, native-asan-leg, timeout-negatives,
+# uninstrumented-emit; this lane lands the third of the four new phases,
+# wired beside the existing ratchet phases that already proved the pattern).
+#
+# --self-test runs first and is not optional, for the reason recorded in
+# every sibling phase above: a green from a matcher that matched nothing
+# is worth nothing, and this detector's own self-test plants the seven
+# fixtures that partition the surface against the sibling
+# check_ambiguous_ran_false ratchet.
+say "timeout-negatives phase: detector self-test + ratchet (#3732)"
+if ! python3 scripts/check_timeout_satisfiable_negatives.py --self-test \
+      > "$LOGDIR/${TAG}_timeoutneg.log" 2>&1; then
+  say "CYCLE FAILURE: check_timeout_satisfiable_negatives SELF-TEST failed"
+  say "  — the detector is broken, so its verdict on the tree means"
+  say "  nothing. See $LOGDIR/${TAG}_timeoutneg.log"
+  sed -n '1,20p' "$LOGDIR/${TAG}_timeoutneg.log" 2>/dev/null | sed 's/^/  | /' \
+    | tee -a "$CYCLE_LOG" >/dev/null
+  exit 1
+fi
+if ! python3 scripts/check_timeout_satisfiable_negatives.py --strict \
+      >> "$LOGDIR/${TAG}_timeoutneg.log" 2>&1; then
+  say "CYCLE FAILURE: a new row pins a compile-time rejection with a"
+  say "  hand-rolled location check that a compile TIMEOUT can satisfy — a"
+  say "  negative test can go green because the harness gave up (#3732)."
+  say "  See $LOGDIR/${TAG}_timeoutneg.log"
+  sed -n '/check_timeout_satisfiable_negatives:/,$p' \
+      "$LOGDIR/${TAG}_timeoutneg.log" 2>/dev/null \
+    | head -40 | sed 's/^/  | /' | tee -a "$CYCLE_LOG" >/dev/null
+  exit 1
+fi
+say "timeout-negatives phase: GREEN ($(tail -1 "$LOGDIR/${TAG}_timeoutneg.log"))"
+
 # ── NULL-GUARD VACUOUS PHASE (#3992) ───────────────────────────────────────
 # A pointer-typed local bound from a lookup/finder call and then guarded with
 # a bare truthy `if (ptr) { ...EXPECT... }` (braced or brace-less) before any
