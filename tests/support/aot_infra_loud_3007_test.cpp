@@ -189,7 +189,22 @@ BEZEL_TEST(aot_infra_loud_3007, legacy_negative_assertion_shape) {
 //     fault injection hook, uid-independent.
 //
 //     WITH the fix   : the child reports [ FAIL ], prints [ INFRA ], exits 1,
-//                      and its exit tally reads `INFRA: 1 failure(s)`.
+//                      and its exit tally reads `INFRA: N failure(s)` where
+//                      N is the number of `BEZEL_TEST(<suite>,
+//                      legacy_negative_assertion_shape)` tests in the tree at
+//                      run time. As of fix #3732 follow-up (commit 14a6f7be,
+//                      2026-09-18) two such tests exist:
+//                          aot_infra_loud_3007.legacy_negative_assertion_shape
+//                          native_timeout_unavailable_loud.legacy_negative_
+//                                              assertion_shape
+//                      both hit the same mkdtemp errno=20 path so both tally
+//                      INFRA — hence N == 2. If a third sibling gets added
+//                      later, bump the literal at line 249 accordingly (the
+//                      `BEZEL_TEST_FILTER` substring matches any test whose
+//                      name contains `legacy_negative_assertion_shape`, so
+//                      suite-prefixed disambiguation is not possible without
+//                      a filter-syntax change; this assertion counts the
+//                      resulting population, so it has to move with it).
 //     WITHOUT the fix: the identical child reports [  OK  ] and exits 0,
 //                      because the infra error is an Error and hasErrors() is
 //                      true — which is precisely the defect.
@@ -246,7 +261,10 @@ BEZEL_TEST(aot_infra_loud_3007, unusable_scratch_base_fails_the_probe_loudly) {
                                "legacy_negative_assertion_shape") !=
                       std::string::npos);
     BEZEL_EXPECT_TRUE(out.find("[ INFRA ]") != std::string::npos);
-    BEZEL_EXPECT_TRUE(out.find("INFRA: 1 failure(s)") != std::string::npos);
+    // See the comment block above: the tally count is the population of
+    // `BEZEL_TEST(<suite>, legacy_negative_assertion_shape)` tests in the
+    // tree at run time (currently 2; see commit 14a6f7be).
+    BEZEL_EXPECT_TRUE(out.find("INFRA: 2 failure(s)") != std::string::npos);
     // And a nonzero process exit, so a runner that only reads rc still sees it.
     BEZEL_EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) != 0);
 
