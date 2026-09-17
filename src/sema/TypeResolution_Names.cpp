@@ -7,6 +7,7 @@
 #include "common/OwnershipFacts.hpp"   // isMoveOnlyValueType — §14.4 / §15.3 (#3794)
 #include "sema/ConstFold.hpp"
 #include "sema/ExprTypecheck_impl.hpp"  // isValidRangeElementType / rangeElementTypeName — fix #3247 / §16.3
+#include "sema/SubstArgs.hpp"  // fix #4212: shared generic-substitution walker (§14.1 / §27.8, v0.298)
 
 namespace bezel::sema {
 
@@ -1823,92 +1824,21 @@ void Resolver::reportNestedInlineArrayError(SourceLocation loc) {
         "arrays are not admitted (§15.1)");
 }
 
+// fix #4212 (Family I1, §14.1 / §27.8, v0.298): thin wrapper over the
+// shared `sema::substituteGenericArgs` authority. The unified walker covers
+// the same recursive kind set (Named with genericArgs, InlineArray element,
+// Function params/return, nullable preservation); the only alias-specific
+// behaviour is the §15.1 nested-inline-array re-validation (fix #4280),
+// keyed on `validateNestedInlineArrays = true` so the diagnostic still
+// reports at the alias reference site, not the alias declaration site.
 TypeRef* Resolver::substituteAliasGenericArgs(
         TypeRef* tr,
         const std::unordered_map<std::string_view, TypeRef*>& subst,
         SourceLocation useLoc) {
-    if (!tr || subst.empty()) return tr;
-    switch (tr->kind) {
-        case TypeRef::Kind::Named: {
-            // A bare, unbound type-parameter reference — the same shape
-            // applyGenericSubst's leaf case recognises (Named, no
-            // declaration, single-part syntactic name).
-            if (!tr->declaration && tr->astNode && tr->astNode->name &&
-                tr->astNode->name->parts.size() == 1) {
-                auto it = subst.find(tr->headName());
-                if (it != subst.end()) {
-                    TypeRef* substituted = it->second;
-                    // Preserve the nullable modifier: `T?` → `int?` when
-                    // T→int, mirroring applyGenericSubst.
-                    if (tr->nullable && substituted && !substituted->nullable) {
-                        TypeRef* nn = ctx_.makeTypeRef(*substituted);
-                        nn->nullable = true;
-                        return nn;
-                    }
-                    return substituted;
-                }
-            }
-            // Not a bare parameter itself (a concrete/builtin head, or a
-            // parameter name not in `subst`) — recurse into its own
-            // generic-argument list, since the parameter may be buried
-            // arbitrarily deep (`Dictionary<K, Array<V>>`, spec §27.8's own
-            // generic-alias example).
-            if (tr->genericArgs.empty()) return tr;
-            bool changed = false;
-            std::vector<TypeRef*> newArgs;
-            newArgs.reserve(tr->genericArgs.size());
-            for (TypeRef* arg : tr->genericArgs) {
-                TypeRef* na = substituteAliasGenericArgs(arg, subst, useLoc);
-                if (na != arg) changed = true;
-                newArgs.push_back(na);
-            }
-            if (!changed) return tr;
-            TypeRef* nn = ctx_.makeTypeRef(*tr);
-            nn->genericArgs = std::move(newArgs);
-            return nn;
-        }
-        case TypeRef::Kind::InlineArray: {
-            if (!tr->arrayElement) return tr;
-            TypeRef* ne =
-                substituteAliasGenericArgs(tr->arrayElement, subst, useLoc);
-            if (ne == tr->arrayElement) return tr;
-            // §15.1 (send-back for fix #4280): resolveType's
-            // direct-syntax check (above, in the InlineArray case) only sees
-            // the alias's own literal body at the ALIAS's declaration site
-            // (`type Nested<T> := [1]T`, where T is still unbound) — it
-            // cannot see that substitution at THIS reference site just
-            // replaced T with an inline array itself
-            // (`Nested<[1]string>`), which builds a genuine `[N][1]string`
-            // with no re-validation anywhere else. Re-run the identical
-            // check at the point substitution actually creates the nested
-            // shape, so the rejection fires "wherever a nested inline array
-            // is formed" rather than only through direct syntax.
-            if (ne->kind == TypeRef::Kind::InlineArray) {
-                reportNestedInlineArrayError(useLoc);
-            }
-            TypeRef* nn = ctx_.makeTypeRef(*tr);
-            nn->arrayElement = ne;
-            return nn;
-        }
-        case TypeRef::Kind::Function: {
-            bool changed = false;
-            std::vector<TypeRef::FuncParam> newParams = tr->funcParams;
-            for (auto& p : newParams) {
-                TypeRef* np = substituteAliasGenericArgs(p.type, subst, useLoc);
-                if (np != p.type) { p.type = np; changed = true; }
-            }
-            TypeRef* newRet =
-                substituteAliasGenericArgs(tr->funcReturn, subst, useLoc);
-            if (newRet != tr->funcReturn) changed = true;
-            if (!changed) return tr;
-            TypeRef* nn = ctx_.makeTypeRef(*tr);
-            nn->funcParams = std::move(newParams);
-            nn->funcReturn = newRet;
-            return nn;
-        }
-        default:
-            return tr;
-    }
+    return sema::substituteGenericArgs(
+        tr,
+        sema::SubstArgs{ctx_, subst, useLoc,
+                        /*validateNestedInlineArrays=*/true});
 }
 
 void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {

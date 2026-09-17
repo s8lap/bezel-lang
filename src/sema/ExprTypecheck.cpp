@@ -18,6 +18,7 @@
 #include "common/BuiltinRegistry.hpp"
 #include "common/OwnershipFacts.hpp"  // §35.4/§35.5 (#2208): substitutedChoicePayloadType
 #include "sema/ConstFold.hpp"
+#include "sema/SubstArgs.hpp"  // fix #4212: shared generic-substitution walker (§14.1 / §27.8, v0.298)
 #include "sema/Symbol.hpp"
 #include "sema/TypeRef.hpp"
 #include "sema/TypeResolution.hpp"
@@ -3007,20 +3008,25 @@ const ChoiceCaseSymbol* ExprTC::findChoiceCaseOnScrutinee(
 // it through the recursion — was a larger, separate change from reusing
 // this walk at one more pair of call sites.
 //
-// Mirrors the field-walk of Resolver::applyGenericSubst + the env-build part
-// of Resolver::buildBaseGenericSubst (TypeResolution_Checks.cpp) — local
-// copy because the ExprTC worker has no Resolver handle (#1621 / §31.2.1
-// split). Per §35.5 "Case patterns" + §14.5 "Type-argument inference"
+// fix #4212 (Family I1, §14.1 / §27.8, v0.298): the field-walk part of
+// Resolver::applyGenericSubst + the env-build part of
+// Resolver::buildBaseGenericSubst (TypeResolution_Checks.cpp) are now both
+// delegated to the shared `sema::substituteGenericArgs` authority — the
+// ExprTC worker has no Resolver handle (#1621 / §31.2.1 split) but does
+// have SemaContext (via ctx_), so the shared header-only walker is callable
+// directly. Per §35.5 "Case patterns" + §14.5 "Type-argument inference"
 // posture (type-level arguments are NEVER inferred; the scrutinee's args are
 // the ones substituted).
+//
+// The scrutinee's choice/record declaration supplies the `subst` map: zip
+// its `genericParams` (filtering to GenericParamSymbol — fix #3898 widened
+// the scrutinee-kind gate to Choice OR Record) against its `genericArgs`.
+// A non-Named scrutinee, a class/interface/enum scrutinee, or an
+// instantiated-without-args candidate carries no substitution (return
+// unchanged).
 TypeRef* ExprTC::substituteGenericFieldType(
         const TypeRef* ty, const TypeRef* scrutTy) {
     if (!ty || !scrutTy) return const_cast<TypeRef*>(ty);
-    // Collect the substitution map from the scrutinee's choice/record
-    // declaration (fix #3898: widened from Choice-only). A non-Named
-    // scrutinee, a class/interface/enum scrutinee, or an
-    // instantiated-without-args candidate carries no substitution (return
-    // unchanged).
     if (scrutTy->kind != TypeRef::Kind::Named || !scrutTy->declaration ||
         (scrutTy->declaration->kind != ast::TypeDeclKind::Choice &&
          scrutTy->declaration->kind != ast::TypeDeclKind::Record)) {
@@ -3030,100 +3036,20 @@ TypeRef* ExprTC::substituteGenericFieldType(
     const auto& args = scrutTy->genericArgs;
     if (params.empty() || args.empty()) return const_cast<TypeRef*>(ty);
     if (params.size() != args.size()) return const_cast<TypeRef*>(ty);
-    // std::function yields a self-referential walker for the recursive kinds
-    // (Named-with-genericArgs, InlineArray element, Function param/return).
-    std::function<TypeRef*(const TypeRef*)> substituteInto =
-        [&](const TypeRef* sub) -> TypeRef* {
-        if (!sub) return nullptr;
-        // A bare-Named TypeRef naming a generic parameter of the scrutinee's
-        // choice — type resolution mints generic params as Named refs with
-        // `declaration == nullptr` (the resolveNamed path at
-        // TypeResolution_Names.cpp:1308 deliberately nulls the declaration so
-        // sema slices distinguish "unresolved-but-parameter" from real Named
-        // types). Match by NAME against the choice's `genericParams`.
-        //
-        // fix #3144 (family F9 of #3152): the bare-parameter HEAD is read from
-        // whichever source the TypeRef has. A locally-resolved payload carries
-        // `astNode`; an IMPORTED one carries `importedName` and no astNode at
-        // all (ModuleLoader has no AST for a dependency's types), so the
-        // astNode-only read below silently declined to substitute and
-        // `case g of Some(x)` bound `x` at the bare `T` — MEASURED as a false
-        // reject, "the arms of a `case` expression have no common type (§20)",
-        // on `Opt<int>.Some(3)` from an imported generic choice whose local
-        // twin compiles. The qualified-name exclusion is preserved on both
-        // legs: only a single-part head can name a type parameter.
-        std::string_view subHead;
-        if (sub->astNode && sub->astNode->name &&
-            sub->astNode->name->parts.size() == 1) {
-            subHead = sub->astNode->name->parts.front();
-        } else if (!sub->astNode && !sub->importedName.empty() &&
-                   sub->importedName.find('.') == std::string_view::npos) {
-            subHead = sub->importedName;
+    // Build the substitution map: zip GenericParamSymbol params by name
+    // against the scrutinee's generic args. We construct it in a local map
+    // and hand it to the shared authority; the authority never mutates its
+    // input, so the local is safe.
+    std::unordered_map<std::string_view, TypeRef*> substMap;
+    substMap.reserve(params.size());
+    for (std::size_t i = 0; i < params.size(); ++i) {
+        if (auto* gp = dynamic_cast<const GenericParamSymbol*>(
+                params[i])) {
+            substMap[gp->name] = args[i];
         }
-        if (sub->kind == TypeRef::Kind::Named && !sub->declaration &&
-            !subHead.empty()) {
-            for (std::size_t i = 0; i < params.size(); ++i) {
-                if (auto* gp = dynamic_cast<const GenericParamSymbol*>(
-                        params[i])) {
-                    if (gp->name == subHead) {
-                        TypeRef* rep = args[i];
-                        if (!rep) return const_cast<TypeRef*>(sub);
-                        if (sub->nullable && !rep->nullable) {
-                            TypeRef* nn = ctx_.makeTypeRef(*rep);
-                            nn->nullable = true;
-                            return nn;
-                        }
-                        return rep;
-                    }
-                }
-            }
-            return const_cast<TypeRef*>(sub);
-        }
-        // Recursive kinds: walk nested positions, copy through when at
-        // least one changed, return the input otherwise.
-        if (sub->kind == TypeRef::Kind::Named &&
-            !sub->genericArgs.empty()) {
-            std::vector<TypeRef*> newArgs;
-            newArgs.reserve(sub->genericArgs.size());
-            bool anyChange = false;
-            for (const auto* arg : sub->genericArgs) {
-                TypeRef* after = substituteInto(arg);
-                newArgs.push_back(after);
-                if (after != arg) anyChange = true;
-            }
-            if (!anyChange) return const_cast<TypeRef*>(sub);
-            TypeRef* out = ctx_.makeTypeRef(*sub);
-            out->genericArgs = std::move(newArgs);
-            return out;
-        }
-        if (sub->kind == TypeRef::Kind::InlineArray) {
-            TypeRef* after = substituteInto(sub->arrayElement);
-            if (after == sub->arrayElement) return const_cast<TypeRef*>(sub);
-            TypeRef* out = ctx_.makeTypeRef(*sub);
-            out->arrayElement = after;
-            return out;
-        }
-        if (sub->kind == TypeRef::Kind::Function) {
-            bool anyChange = false;
-            std::vector<TypeRef::FuncParam> newParams;
-            newParams.reserve(sub->funcParams.size());
-            for (const auto& p : sub->funcParams) {
-                TypeRef* after = substituteInto(p.type);
-                if (after != p.type) anyChange = true;
-                newParams.push_back({p.modifier, p.name, after});
-            }
-            TypeRef* afterRet = substituteInto(sub->funcReturn);
-            if (afterRet != sub->funcReturn) anyChange = true;
-            if (!anyChange) return const_cast<TypeRef*>(sub);
-            TypeRef* out = ctx_.makeTypeRef(*sub);
-            out->funcParams = std::move(newParams);
-            out->funcReturn = afterRet;
-            return out;
-        }
-        // Primitive / Unit / Error — no nested positions to walk.
-        return const_cast<TypeRef*>(sub);
-    };
-    return substituteInto(ty);
+    }
+    return sema::substituteGenericArgs(
+        const_cast<TypeRef*>(ty), sema::SubstArgs{ctx_, substMap});
 }
 
 

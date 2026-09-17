@@ -246,6 +246,7 @@ add_library(bezel_core STATIC
     src/sema/TypeResolution_Names.cpp
     src/sema/TypeResolution_Checks.cpp
     src/sema/ExprTypecheck.cpp
+    src/sema/SubstArgs.cpp
     src/sema/ExprTypecheck_Exprs.cpp
     src/sema/ExprTypecheck_Calls.cpp
     src/sema/DefiniteAssignment.cpp

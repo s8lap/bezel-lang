@@ -9,6 +9,7 @@
 #include "sema/GenericParams.hpp"  // detail::astGenericParams — §14.6 in-scope name set (#3271)
 #include "sema/NestedTypeWalk.hpp"  // fix #3597: promoted so PureChecker.cpp can share it too
 #include "sema/Sendability.hpp"  // isSendableType — §30.14 sendability computation
+#include "sema/SubstArgs.hpp"  // fix #4212: shared generic-substitution walker (§14.1 / §27.8, v0.298)
 #include "sema/TypeResolution.hpp"
 
 #include <algorithm>
@@ -4476,29 +4477,17 @@ bool Resolver::baseMemberOverridable(MemberSymbol* m) {
     return false;
 }
 
+// fix #4212 (Family I1, §14.1 / §27.8, v0.298): thin wrapper over the
+// shared `sema::substituteGenericArgs` authority. The pre-fix body only
+// substituted a TOP-LEVEL bare parameter reference; a buried parameter
+// (`Array<T>`, `Dictionary<K, Array<V>>`) was silently missed — the fix
+// recurses through Named-with-genericArgs / InlineArray element / Function
+// param-and-return, with the same nullable preservation as before.
 TypeRef* Resolver::applyGenericSubst(
         TypeRef* tr,
         const std::unordered_map<std::string_view, TypeRef*>& genericSubst) {
-    if (!tr) return tr;
-    if (tr->kind == TypeRef::Kind::Named && !tr->declaration) {
-        // Unresolved named type — might be a generic param.
-        if (tr->astNode && tr->astNode->name &&
-            tr->astNode->name->parts.size() == 1) {
-            auto it = genericSubst.find(tr->headName());
-            if (it != genericSubst.end()) {
-                TypeRef* substituted = it->second;
-                // Preserve the nullable modifier from the generic type
-                // reference: T? → int? when T→int.
-                if (tr->nullable && substituted && !substituted->nullable) {
-                    TypeRef* nn = ctx_.makeTypeRef(*substituted);
-                    nn->nullable = true;
-                    return nn;
-                }
-                return substituted;
-            }
-        }
-    }
-    return tr;
+    return sema::substituteGenericArgs(
+        tr, sema::SubstArgs{ctx_, genericSubst});
 }
 
 void Resolver::buildBaseGenericSubst(
