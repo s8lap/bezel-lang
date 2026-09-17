@@ -105,6 +105,35 @@
 //     than passing for the wrong reason.
 // The self-tests are tests/support/aot_infra_loud_3007_test.cpp.
 //
+// COMPILE / RUN TIMEOUTS ARE LOUD, AND DISTINGUISHABLE (#3732). The harness
+// has TWO deadlines that, before #3732, surfaced as ordinary Severity::Error
+// diagnostics — byte-for-byte the shape of a legitimate compile REJECT — so
+// the same 272 `hasErrors()` and 205 `!ran` sites that #3007 protects against
+// a disk-full ENOSPC would have gone GREEN on a real hang (a runaway
+// front-end, a wedged clang link, a runaway program):
+//   1. the COMPILE deadline (aotCompileTimeoutSec, 120s default,
+//      BEZEL_AOT_COMPILE_TIMEOUT_SEC overrides) at the CompileOutcome::
+//      TimedOut return in forkedDriverStep;
+//   2. the PROGRAM RUN deadline (aotTimeoutSec, 30s default,
+//      BEZEL_AOT_TIMEOUT_SEC overrides) at the two timedOut sites — one in
+//      runAot, one in runAotCheckedImpl.
+//
+// So every timeout now goes through aot_detail::noteTimeoutFailure():
+//   * it marks the CURRENT TEST FAILED — same belt as noteInfraFailure;
+//   * it prints a `[ TIMEOUT ]` marker naming the stage ("compile did not
+//     finish within" / "program did not terminate within") and the deadline;
+//   * it counts into ITS OWN process-wide tally (NOT the infra tally — a real
+//     compiler hang is a finding, and folding it into the infra floor muddies
+//     exactly the signal that floor is for, spec §4). Printed at exit as
+//     `TIMEOUT: N compile/run timeout(s) ...` next to the `INFRA:` line;
+//   * the returned JitResult carries the reason at Severity::NOTE, never
+//     Error, so `hasErrors()` stays FALSE — the same belt-and-braces as
+//     #3007 — and a legacy negative assertion FAILS rather than reading a
+//     timeout as a rejection. (No `run_parallel.sh` floor of its own: a
+//     timeout already fails its test, so the run fails through the ordinary
+//     path; the tally is for triage.)
+// The self-tests are tests/support/native_timeout_unavailable_loud_test.cpp.
+//
 // TWO SEMANTIC DIFFERENCES FROM runJit (documented, inherent — not bugs here):
 //   1. runJit returns the raw 32-bit int from main(); a process exit status is
 //      8-bit (WEXITSTATUS masks to 0..255). A test whose Main returns a value
@@ -665,6 +694,104 @@ inline void noteInfraFailure(const char* where, const std::string& reason) {
                  "INFRASTRUCTURE failure (disk / fork / exec), NOT a compiler "
                  "rejection. The test is FAILED so no negative assertion can "
                  "read it as green (#3007).\n";
+    std::cout.flush();
+    ::bezel::test::currentTestFailed() = true;
+}
+
+// ── noteTimeoutFailure + ensureTimeoutTallyAtExit (fix #3732) ─────────────
+//
+// WHY THIS CHANNEL EXISTS. forkedDriverStep returns
+// {CompileOutcome::TimedOut, "runAot: compile did not finish within <N>s ..."}
+// at the timeout site below; the run-side sibling is "runAot: program did not
+// terminate within ..." at the program-run timeout site. Before #3732 each of
+// those surfaced as one ordinary `Severity::Error` diagnostic — byte-for-byte
+// indistinguishable from a compile REJECT — so the 272
+// `BEZEL_EXPECT_TRUE(<var>.diagnostics.hasErrors())` and 205
+// `BEZEL_EXPECT_FALSE(<var>.ran)` sites that #3007 measured (the same shape
+// #3007's `INFRA:` channel exists for) would all have gone GREEN on a real
+// timeout: the harness gave up, but every negative assertion in tests/ was
+// designed to pass on a rejection, and "the harness gave up" reads as one.
+//
+// THE LOUD HALF (this channel + the per-process line in tests/test_main.cpp's
+// atexit tally) is the harness side: a compile/run TIMEOUT now fails its own
+// test, marks the diagnostic at Severity::NOTE so `hasErrors()` stays false,
+// and is tallied in its own counter (printed as `TIMEOUT: N compile/run
+// timeout(s)` next to `INFRA: N failure(s)`) so a real hang is observable
+// per-process and the burn-down has a number to count down. The source half
+// (`scripts/check_timeout_satisfiable_negatives.py`) freezes the small (~24)
+// hand-rolled `.line > 0` location-check surface so it cannot grow while the
+// burn-down runs. Both halves are wired into the same gate cycle (spec §4 /
+// issue #3732).
+//
+// Why a SEPARATE channel from `INFRA:` (not folded in there): a real compiler
+// hang — runaway front-end, wedged link — is a FINDING. Folding it into the
+// infra floor muddies exactly the signal that floor is for (disk / fork /
+// exec, see #3007's own wording above). Two counters, two lines.
+//
+// ⚠ COST, recorded per CLAUDE.md rule 4. Under this change a timeout caused
+// by *contention* (CLAUDE.md: a cold `clang` link crossing 120s under 16
+// shards plus lane builds is "not exotic") becomes a loud per-test failure
+// instead of a silent green. That is the over-report class the gate already
+// has a protocol for — re-run the suspect alone with `BEZEL_TEST_FILTER=<name>`
+// (CLAUDE.md, tests/README.md:137-141), never a serial whole-suite pass.
+// Trading a false green for a disambiguable false red is the right trade,
+// but it is a trade.
+
+// Process-wide count of compile/run timeouts. Same discipline as
+// infraFailureCount(): leaked on purpose, the atexit hook below reads it at
+// teardown after ordinary function-local statics would already have been
+// destroyed.
+inline std::atomic<std::uint64_t>& timeoutFailureCount() {
+    static std::atomic<std::uint64_t>* c = new std::atomic<std::uint64_t>(0);
+    return *c;
+}
+
+// One-line summary printed at process exit, unconditionally once the AOT
+// harness has been used at all — so `TIMEOUT: 0 compile/run timeout(s)` is a
+// POSITIVE confirmation the channel was live this process, not merely the
+// absence of a signal. Format, stable and greppable, on stdout (shard logs
+// capture stdout and stderr into one file):
+//
+//     TIMEOUT: <N> compile/run timeout(s) (compile or run deadline exceeded —
+//     see tests/support/aot_support.hpp)
+//
+// The TIMEOUT line does NOT get a `run_parallel.sh` floor of its own — a
+// timeout already fails its test, so the run fails through the ordinary path
+// and the tally is for triage, not gate enforcement. Same shape as INFRA: in
+// this file (see comment above ensureInfraTallyAtExit at :609).
+inline void ensureTimeoutTallyAtExit() {
+    static const bool once = [] {
+        std::atexit([] {
+            std::fprintf(stdout,
+                "TIMEOUT: %llu compile/run timeout(s) (compile or run deadline"
+                " exceeded — see tests/support/aot_support.hpp)\n",
+                static_cast<unsigned long long>(
+                    timeoutFailureCount().load(std::memory_order_relaxed)));
+            std::fflush(stdout);
+        });
+        return true;
+    }();
+    (void)once;
+}
+
+// Record ONE compile/run timeout: count it, print the `[ TIMEOUT ]` marker,
+// and FAIL THE CURRENT TEST. `where` names the harness entry point
+// (runAot / runAotChecked / …), `reason` the stage ("compile did not finish"
+// or "program did not terminate") and the deadline. Modelled line-for-line on
+// noteInfraFailure above; the test-fail is the loud half of #3732, and the
+// severity demotion below in markTimeout is the belt-and-braces that makes
+// every `hasErrors()`/`!ran` site structurally immune.
+inline void noteTimeoutFailure(const char* where, const std::string& reason) {
+    ensureTimeoutTallyAtExit();
+    timeoutFailureCount().fetch_add(1, std::memory_order_relaxed);
+    // Inline with the test's own output (BEZEL_EXPECT_* writes to std::cout),
+    // so the marker lands next to the `[ FAIL ]` line in the shard log.
+    std::cout << "    [ TIMEOUT ] " << (where ? where : "runAot") << ": "
+              << reason << "\n"
+              << "    [ TIMEOUT ] the harness gave up waiting for this "
+                 "program (compile or run deadline exceeded): NOT a compiler "
+                 "rejection. The test is FAILED so no negative assertion can "
+                 "read it as green (#3732).\n";
     std::cout.flush();
     ::bezel::test::currentTestFailed() = true;
 }
@@ -2432,6 +2559,29 @@ inline JitResult& markInfra(JitResult& r, const char* where,
     return r;
 }
 
+// Stamp a TIMEOUT onto a result AND fail the current test (#3732). Modelled
+// on markInfra: it did not run, its exit code is the did-not-run sentinel,
+// and the reason is recorded at Severity::NOTE — never Error — so
+// `r.diagnostics.hasErrors()` stays FALSE and a legacy negative assertion
+// FAILS rather than passing for the wrong reason. The difference from
+// markInfra is the underlying cause (a deadline expired rather than a
+// refused fork), the counter (timeoutFailureCount() rather than
+// infraFailureCount()), the marker ([TIMEOUT] rather than [INFRA]), and the
+// absence of any `run_parallel.sh` floor — the timeout already fails its
+// test, so the run fails through the ordinary path. A real compiler hang is
+// a finding; folding it into the infra tally muddies that signal (spec §4,
+// the rationale for a third channel rather than reusing infra).
+inline JitResult& markTimeout(JitResult& r, const char* where,
+                              const std::string& reason) {
+    noteTimeoutFailure(where, reason);
+    r.ran = false;
+    r.exitCode = -1;
+    r.diagnostics.report(Severity::Note, SourceLocation{},
+                         std::string("[TIMEOUT] ") +
+                             (where ? where : "runAot") + ": " + reason);
+    return r;
+}
+
 }  // namespace aot_detail
 
 // ---------------------------------------------------------------------------
@@ -2486,6 +2636,19 @@ inline JitResult runAot(std::string_view source,
         // Error made it read as a compile reject; route it to the infra channel.
         if (cc.outcome == aot_detail::CompileOutcome::Infra)
             return aot_detail::markInfra(r, "runAot", cc.diag);
+        // fix #3732: CompileOutcome::TimedOut is NOT a verdict on the program
+        // either — it is the harness's compile deadline firing
+        // (aotCompileTimeoutSec, 120s default). Reporting it as an Error made
+        // it read as a compile reject, satisfying 272 `hasErrors()` and 205
+        // `!ran` sites (#3007's own measurement) for the wrong reason. Route
+        // it to the timeout channel: mark the current test failed, leave
+        // `hasErrors()` false, tally into its own counter. The message
+        // continues to carry "did not finish within" verbatim so a row that
+        // already excludes that literal (e.g. tests/sema/catch_multitype_no_
+        // common_base_v182_test.cpp:360-366) still keys on it — verified
+        // 2026-09-17 at e7171c4c.
+        if (cc.outcome == aot_detail::CompileOutcome::TimedOut)
+            return aot_detail::markTimeout(r, "runAot", cc.diag);
         r.diagnostics.report(Severity::Error, SourceLocation{},
                              std::move(cc.diag));
         return r;  // ran stays false — AOT is the stricter oracle (see header)
@@ -2531,15 +2694,23 @@ inline JitResult runAot(std::string_view source,
     r.stdoutText = aot_detail::slurp(outPath);
 
     if (timedOut) {
-        r.exitCode = -1;
+        // fix #3732: route through markTimeout — the harness's PROGRAM run
+        // deadline (aotTimeoutSec, 30s default) fired. Marking Severity::Error
+        // here made every `BEZEL_EXPECT_TRUE(hasErrors())` and
+        // `BEZEL_EXPECT_FALSE(<var>.ran)` row read a hang as a rejection
+        // (#3007's measurement: 272 + 205 sites). The message keeps the
+        // verbatim "did not terminate within" so a row that already excludes
+        // that literal stays sound (the v182 absence test at
+        // tests/sema/catch_multitype_no_common_base_v182_test.cpp:360-366
+        // searches for "did not finish within" + the sibling run-side literal
+        // is matched by the source ratchet's exempt clause).
         std::string runErr = aot_detail::slurp(errPath);
-        r.diagnostics.report(
-            Severity::Error, SourceLocation{},
+        return aot_detail::markTimeout(
+            r, "runAot",
             "runAot: program did not terminate within " +
                 std::to_string(aot_detail::aotTimeoutSec()) +
                 "s; killed (runaway / deadlock)" +
                 (runErr.empty() ? "" : "\n--- program stderr ---\n" + runErr));
-        return r;
     }
     // #1822: surface any ASan report the program printed to its stderr so the
     // whole-suite sweep detects a memory error in ANY program. A clean program
@@ -2748,11 +2919,22 @@ inline JitResult runAotCheckedImpl(std::string_view source,
         // It is infrastructure, so it goes to the infra channel and fails loudly.
         if (cc.outcome == aot_detail::CompileOutcome::Infra)
             return aot_detail::markInfra(r, name, cc.diag);
-        // #2214: prefix a genuine verdict (Rejected / Crashed / TimedOut) with
-        // the harness name so the diagnostic says which harness produced it.
+        // fix #3732: TimedOut gets the same Severity::Note + test-failed
+        // treatment runAot uses (the CompileOutcome::TimedOut case just above
+        // mirrors this one). Marking Error here would satisfy the same 272 +
+        // 205 hasErrors/`!ran` sites that the runAot channel protects; the
+        // runAotChecked surface reaches the same call sites through the
+        // shared helper, so the protection is structural (one edit, two
+        // harnesses).
+        if (cc.outcome == aot_detail::CompileOutcome::TimedOut)
+            return aot_detail::markTimeout(r, name, cc.diag);
+        // #2214: prefix a genuine verdict (Rejected / Crashed) with the
+        // harness name so the diagnostic says which harness produced it.
+        // TimedOut is handled by the branch above (its own prefix-bearing
+        // message); the residual here is Rejected + Crashed only.
         r.diagnostics.report(Severity::Error, SourceLocation{},
                              std::string(name) + ": " + std::move(cc.diag));
-        return r;  // reject / compiler crash / compile timeout — ran=false
+        return r;  // reject / compiler crash — ran=false
     }
 
     // --- Run under (optionally) LeakSanitizer. abort_on_error=0 so a sanitizer
@@ -2789,10 +2971,14 @@ inline JitResult runAotCheckedImpl(std::string_view source,
     std::string sanText = aot_detail::slurp(sanPath);
 
     if (timedOut) {
-        r.exitCode = -1;
-        r.diagnostics.report(Severity::Error, SourceLocation{},
-                             std::string(name) + ": program timed out");
-        return r;
+        // fix #3732: same Severity::Note + test-failed treatment the runAot
+        // sibling uses just above — the runAotChecked program-run timeout
+        // (aotTimeoutSec, 30s default) routes through markTimeout so every
+        // `hasErrors()` / `!ran` site stays structurally immune. Prefixed with
+        // `name` ("runAotChecked" / "runAotCheckedLenient" / …) so the
+        // diagnostic identifies which harness saw the hang.
+        return aot_detail::markTimeout(r, name,
+                                       std::string(name) + ": program timed out");
     }
 
     const bool crashed = WIFSIGNALED(status);
