@@ -137,7 +137,7 @@ int runUnderAsanOpts(const std::string& source, bool detectLeaks = true) {
         " > /dev/null 2>&1";
     int raw = std::system(runCmd.c_str());
     cleanup();
-    if (raw == -1) return -1;
+    if (raw == -1) return -3;
     int code = WIFEXITED(raw) ? WEXITSTATUS(raw) : -1;
     if (code == 99) return 99;
     if (code == 0)  return 0;

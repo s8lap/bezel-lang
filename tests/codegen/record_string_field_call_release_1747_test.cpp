@@ -93,12 +93,12 @@ int runUnderLeakSanitizer(const std::string& source) {
     std::string linkCmd = "clang++ -fsanitize=address -g " + objPath + " " +
                           rtObj + " -lm -lpthread -lstdc++ -o " + exe +
                           " > /dev/null 2>&1";
-    if (std::system(linkCmd.c_str()) != 0) { cleanup(); return -1; }
+    if (std::system(linkCmd.c_str()) != 0) { cleanup(); return -3; }
     std::string runCmd =
         "ASAN_OPTIONS=detect_leaks=1:exitcode=99 " + exe + " 2>" + runErr;
     int status = std::system(runCmd.c_str());
     cleanup();
-    if (status == -1) return -1;
+    if (status == -1) return -3;
     if (!WIFEXITED(status)) return 2;  // signal — ASan hard-error
     int code = WEXITSTATUS(status);
     if (code == 99) return 1;          // LSan leak report

@@ -182,12 +182,12 @@ int runUnderAsanLsan(const std::string& source) {
     if (std::system(linkCmd.c_str()) != 0) {
         std::remove(objPath.c_str());
         std::remove(exe.c_str());
-        return -1;
+        return -3;
     }
     int status = std::system(exe.c_str());
     std::remove(objPath.c_str());
     std::remove(exe.c_str());
-    if (!WIFEXITED(status)) return -1;
+    if (!WIFEXITED(status)) return -3;
     return WEXITSTATUS(status);
 }
 

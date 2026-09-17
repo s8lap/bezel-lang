@@ -157,14 +157,14 @@ int runUnderLeakSanitizer(const std::string& source, int expectedExitCode) {
     std::string linkCmd = "clang++ -fsanitize=address -g " + objPath + " " +
                           rtObj + " -lm -lpthread -lstdc++ -o " + exe +
                           " > /dev/null 2>&1";
-    if (std::system(linkCmd.c_str()) != 0) { cleanup(); return -1; }
+    if (std::system(linkCmd.c_str()) != 0) { cleanup(); return -3; }
 
     // detect_leaks=1: any surviving allocation is a LSan failure (exit 99).
     std::string runCmd =
         "ASAN_OPTIONS=detect_leaks=1:exitcode=99 " + exe + " > /dev/null 2>&1";
     int status = std::system(runCmd.c_str());
     cleanup();
-    if (status == -1) return -1;
+    if (status == -1) return -3;
     if (!WIFEXITED(status)) return 1;                 // signal → failure
     int ec = WEXITSTATUS(status);
     if (ec == 99) return 1;                           // LSan leak → failure

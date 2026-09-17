@@ -190,14 +190,14 @@ static int xmodLsan712(
         aObj + " " + bObjPath + " " + rt +
         " -lm -lpthread -lstdc++ -o " + exePath +
         " > /dev/null 2>&1";
-    if (std::system(linkCmd.c_str()) != 0) { cleanup(); return -1; }
+    if (std::system(linkCmd.c_str()) != 0) { cleanup(); return -3; }
 
     std::string runCmd =
         "ASAN_OPTIONS=detect_leaks=1:exitcode=99:abort_on_error=0 " +
         exePath + " > /dev/null 2>&1";
     int status = std::system(runCmd.c_str());
     cleanup();
-    if (status == -1) return -1;
+    if (status == -1) return -3;
     int code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
     if (code == 99) return 1;        // leak / memory safety error
     if (code == expectedCode) return 0;  // clean + correct exit code
@@ -248,14 +248,14 @@ static int singleModLsan712(const std::string& src, int expectedCode) {
         objPath + " " + rt +
         " -lm -lpthread -lstdc++ -o " + exePath +
         " > /dev/null 2>&1";
-    if (std::system(linkCmd.c_str()) != 0) { cleanup(); return -1; }
+    if (std::system(linkCmd.c_str()) != 0) { cleanup(); return -3; }
 
     std::string runCmd =
         "ASAN_OPTIONS=detect_leaks=1:exitcode=99:abort_on_error=0 " +
         exePath + " > /dev/null 2>&1";
     int status = std::system(runCmd.c_str());
     cleanup();
-    if (status == -1) return -1;
+    if (status == -1) return -3;
     int code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
     if (code == 99) return 1;
     if (code == expectedCode) return 0;

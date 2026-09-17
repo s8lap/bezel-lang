@@ -75,14 +75,14 @@ int probeLsan(const std::string& source) {
                           " > /dev/null 2>&1";
     if (std::system(linkCmd.c_str()) != 0) {
         std::remove(objPath.c_str());
-        return -1;
+        return -3;
     }
     std::string runCmd =
         "ASAN_OPTIONS=detect_leaks=1:exitcode=99 " + exe + " > /dev/null 2>&1";
     int status = std::system(runCmd.c_str());
     std::remove(objPath.c_str());
     std::remove(exe.c_str());
-    if (status == -1) return -1;
+    if (status == -1) return -3;
     if (WIFEXITED(status) && WEXITSTATUS(status) == 99) return 1;  // leak/corruption
     return 0;  // clean
 }

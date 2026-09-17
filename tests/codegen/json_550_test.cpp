@@ -137,14 +137,14 @@ int runUnderLeakSanitizerJson(const std::string& source, bool detectLeaks = true
     std::string linkCmd = "clang++ -fsanitize=address -g " + objPath + " " +
                           rtObj + " -lm -lpthread -lstdc++ -o " + exe +
                           " > /dev/null 2>&1";
-    if (std::system(linkCmd.c_str()) != 0) { cleanup(); return -1; }
+    if (std::system(linkCmd.c_str()) != 0) { cleanup(); return -3; }
     std::string runCmd =
         "ASAN_OPTIONS=detect_leaks=" +
         std::string(detectLeaks ? "1" : "0") + ":exitcode=99 " + exe +
         " > /dev/null 2>&1";
     int raw = std::system(runCmd.c_str());
     cleanup();
-    if (raw == -1) return -1;
+    if (raw == -1) return -3;
     int code = WIFEXITED(raw) ? WEXITSTATUS(raw) : -1;
     if (code == 99) return 99;   // asan/leak
     if (code == 0)  return 0;    // clean

@@ -203,18 +203,18 @@ static int xmodLsan1415(const std::string& aObj, const std::string& bSrc,
                           bObjPath + " " + rt +
                           " -lm -lpthread -lstdc++ -o " + exePath +
                           " > /dev/null 2>&1";
-    if (std::system(linkCmd.c_str()) != 0) { cleanup(); return -1; }
+    if (std::system(linkCmd.c_str()) != 0) { cleanup(); return -3; }
 
     std::string runCmd =
         "ASAN_OPTIONS=detect_leaks=1:exitcode=99:abort_on_error=0 " + exePath +
         " > /dev/null 2>&1";
     int status = std::system(runCmd.c_str());
     cleanup();
-    if (status == -1) return -1;
+    if (status == -1) return -3;
     int code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
     if (code == 99) return 1;
     if (code == expectedCode) return 0;
-    return -1;  // unexpected exit code — skip
+    return -3;  // unexpected exit code — skip
 }
 
 // Module A: a Cell class whose destructor bumps a static counter (readable from
