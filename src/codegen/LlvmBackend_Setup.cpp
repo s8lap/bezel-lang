@@ -16740,22 +16740,24 @@ void Emitter::consumeLastLambdaCapturedCells() {
     const std::size_t currentScopeDepth = disposeStack_.size();
     for (const auto& ce : lastLambdaCapturedCells_) {
         // fix #4261 (§28.3, v0.300): skip entries from outer lambdas
-        // (shallower pushScopeDepth) and outer LOCAL captures (declared shallower
-        // than the capture site — the #969 deferred path handles the disposal).
-        // Without this, an outer local captured at the CURRENT depth
-        // (pushScopeDepth == currentScopeDepth) would be processed and erased,
-        // freeing the cell before recursive calls complete (self-referential UAF).
-        // Note: uses inline find to avoid redeclaring `dd` (used at line 16806).
+        // (shallower pushScopeDepth). Entries at the CURRENT scope are
+        // processed below — the #969 deferred path then decides whether to
+        // free at the current scope or defer to the owner's scope.
+        //
+        // fix #3498 / fix #4210 (narrow forward, §27.5 / §28.9 / §28.14):
+        // REMOVED the early outer-local skip that the cluster-revert
+        // (ce2354fb) added. The intent was to defer to #969's path, but the
+        // early `continue` bypassed BOTH the deferral AND the current-scope
+        // free, leaking the cell entirely for in-loop callback /
+        // capture-loop shapes whose capture site sits at a depth > the
+        // captured local's depth (#3498 T5, #3752 spec_27_5_in_loop, #4210
+        // verbatim, #4261 nested reassign). The #969 deferred check below
+        // is the SOUND gate — extended in d0d5a173 to handle
+        // non-pattern-binding locals by deferring to the OWNER scope.
         if (ce.pushScopeDepth < currentScopeDepth) {
             // Belongs to an outer lambda; skip — it will be handled by that
             // lambda's own consume call.
             continue;
-        }
-        // Outer-local check: entry is at current depth but was declared shallower
-        // (the #969 deferred path handles it).
-        auto itOuter = declScopeDepth_.find(ce.key);
-        if (itOuter != declScopeDepth_.end() && itOuter->second < currentScopeDepth) {
-            continue;  // skip; #969 defers or outer lambda's consume handles it
         }
         // This entry is from the current or a nested scope; process it.
         // Check: does this cell's slot have any reads-through-cell disposal?
@@ -16881,7 +16883,38 @@ void Emitter::consumeLastLambdaCapturedCells() {
             auto* keyNode = static_cast<const ast::Node*>(ce.key);
             bool patternBinding =
                 dynamic_cast<const ast::BindingPattern*>(keyNode) != nullptr;
-            if (patternBinding) {
+            // fix #4210 (narrow forward, §27.5 / §28.9 / §28.14, v0.298,
+            // restored from cluster-revert ce2354fb): EXTEND the #969
+            // deferred-cell-free path to ALL outer-scope captures, not
+            // just case-arm BindingPattern scrutinees. The cell is held
+            // only by non-escaping lambdas — `cellFreeEligible_` is the
+            // gate that admitted the entry to `lastLambdaCapturedCells_`
+            // (LlvmBackend_Exprs2.cpp / #694 / #3426), so every closure's
+            // env that points at this cell is released by the owner scope
+            // exit (the envdtor's release happens before the deferred cell
+            // free fires via the SECOND PASS in LlvmBackend_Disposal.cpp).
+            // The cell can be safely freed in the owner scope, not the
+            // inner lambda scope.
+            //
+            // The cluster-revert (ce2354fb) restored the patternBinding
+            // gate to fix #4422/#4174/#4227/#4226 — but the gate also
+            // re-broke #4210 (verbatim 4 B leak), #3498 (in-loop
+            // callback), #3752 (spec_27_5_in_loop_capture), and #4261
+            // (nested reassign). The cluster fix's gains come from the
+            // OTHER three changes (1/4/5: lowerClosureLocalReassign
+            // conditional retain, ClosureEscapeWalker inLoop removal,
+            // collectClosureReleaseEligible no-init typed scan), not from
+            // this patternBinding gate; restoring d0d5a173's gate removal
+            // is a sound narrowing that keeps the cluster's gains.
+            //
+            // Soundness: the deferred free in the owner scope runs in
+            // `emitDisposals`'s SECOND PASS, after every main-loop disposal
+            // (the #1017 ordering). Any disposal that reads through the
+            // cell — including the captured local's own disposal — has
+            // already completed before the deferred cell free fires, so no
+            // UAF is possible.
+            (void)patternBinding;
+            {
                 std::size_t ownerScopeIdx = dd->second - 1;
                 bool alreadyDeferred = false;
                 for (const auto& existing : disposeStack_[ownerScopeIdx])
