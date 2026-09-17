@@ -1,0 +1,24 @@
+# nested_body_scope_coverage.grandfather - the ceiling for #2702 / Family L.
+#
+# THE CEILING ONLY EVER FALLS. `--update` MAY LOWER a per-file ceiling
+# (to min(existing, measured) - a drain becomes the new ceiling on the
+# very next --update) and MAY NEVER RAISE one; raising a ceiling stays a
+# deliberate, reviewed hand-edit to this file. A path whose tightened
+# ceiling reaches (0, 0) is dropped entirely. See tighten_ceilings() /
+# check_debt_floor() in check_nested_body_scope_coverage.py.
+#
+# Two ints per row: uncovered_emitters first, incomplete_field_saves second.
+#   uncovered_emitters - a function in this file whose name matches the
+#     lazy-emitter patterns (BlockGetter / Indexer*Fn / PropertyAccessorFn /
+#     ExprGetterThunk / PropertyThunk / emitDisposerCore) but whose body
+#     does NOT construct `NestedBodyScope VAR(*this);`. Each bare site is
+#     a memoized function whose body inherits the caller's per-emitter
+#     state and freezes whichever caller was lowered first.
+#   incomplete_field_saves - a `NestedBodyScope` constructor DEFINITION
+#     (a member function of `Emitter::NestedBodyScope`) whose initialization
+#     list is missing a canonical field. The canonical field set is read
+#     from `src/codegen/LlvmBackend_Assign.cpp:5114` (see
+#     CANONICAL_FIELDS in check_nested_body_scope_coverage.py).
+
+1    0    src/codegen/LlvmBackend_Disposal.cpp
+1    0    src/codegen/LlvmBackend_Layout.cpp

@@ -833,6 +833,49 @@ if ! python3 scripts/check_toolchain_skip_surface.py --strict \
   exit 1
 fi
 say "toolchain-skip phase: GREEN ($(tail -1 "$LOGDIR/${TAG}_toolchainskip.log"))"
+# ── NESTED-BODY-SCOPE PHASE (Family L anchor, defect-campaign-2026-09 §2.8)
+# ─────────────────────────────────────────────────────────────────────────
+# Block getters, indexer accessors, property thunks and disposer cores
+# lower a user body into a standalone MEMOIZED function from the middle
+# of expression lowering. Any per-body emitter field they fail to save
+# and reset leaks the caller's context into the callee, and the cached
+# function is baked once - whichever caller was lowered first in
+# `std::unordered_map` pointer-hash order freezes the result for the
+# whole module. #2702 closed six emitters under one RAII guard
+# (`Emitter::NestedBodyScope`); the open members are emitters not on the
+# guard (#3936 emitDisposerCore, #4151 makePropertyThunk, #2748's three
+# unguarded sites) and fields missing from its canonical set.
+#
+# This phase ratchets coverage so a new lazily-memoized emitter cannot
+# ship without the guard. Two banked counts: `uncovered_emitters` (a
+# function in src/codegen matching the seven #2702 + #4151 named
+# patterns whose body lacks `NestedBodyScope VAR(*this);`) and
+# `incomplete_field_saves` (a `NestedBodyScope` constructor DEFINITION
+# whose init list omits a canonical field).
+#
+# --self-test runs first and is not optional, for the reason recorded in
+# every sibling phase above: a green from a matcher that matched
+# nothing is worth nothing.
+say "nested-body-scope phase: detector self-test + LazyBodyEmitter ratchet (Family L, #2702)"
+if ! python3 scripts/check_nested_body_scope_coverage.py --self-test \
+      > "$LOGDIR/${TAG}_nbscope.log" 2>&1; then
+  say "CYCLE FAILURE: check_nested_body_scope_coverage SELF-TEST failed —"
+  say "  the detector is broken, so its verdict means nothing. See $LOGDIR/${TAG}_nbscope.log"
+  sed -n '1,20p' "$LOGDIR/${TAG}_nbscope.log" 2>/dev/null | sed 's/^/  | /' \
+    | tee -a "$CYCLE_LOG" >/dev/null
+  exit 1
+fi
+if ! python3 scripts/check_nested_body_scope_coverage.py --strict \
+      >> "$LOGDIR/${TAG}_nbscope.log" 2>&1; then
+  say "CYCLE FAILURE: a lazily-memoized emitter does not construct"
+  say "  NestedBodyScope, OR constructs it without the canonical field set —"
+  say "  the caller's state leaks module-wide (#3936, #2723, #2628, #4150,"
+  say "  #4151, #2748). See $LOGDIR/${TAG}_nbscope.log"
+  sed -n '/check_nested_body_scope_coverage:/,$p' "$LOGDIR/${TAG}_nbscope.log" 2>/dev/null \
+    | head -40 | sed 's/^/  | /' | tee -a "$CYCLE_LOG" >/dev/null
+  exit 1
+fi
+say "nested-body-scope phase: GREEN ($(tail -1 "$LOGDIR/${TAG}_nbscope.log"))"
 
 # ── NULL-GUARD VACUOUS PHASE (#3992) ───────────────────────────────────────
 # A pointer-typed local bound from a lookup/finder call and then guarded with
