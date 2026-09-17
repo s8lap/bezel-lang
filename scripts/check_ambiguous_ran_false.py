@@ -165,6 +165,37 @@ def _balanced_body(text, open_brace_idx):
 # of them `(`, backslash or whitespace (the C++ grammar's own limit).
 _RAW_STRING_START = re.compile(r'R"([^(\\\s]{0,16})\(')
 
+# Per-test suppression marker - C1 completion item. Mirrors the
+# LOCALDECL-ONLY marker (scripts/check_localdecl_only_walkers.py:75-100
+# and :145), itself ported from #3590 as the family-wide shape: a prose
+# marker on its own line that, with a reason after the colon, exempts the
+# next row the detector would otherwise flag. Used here to drop a row
+# deliberately preserved for some OTHER purpose (the FAIL-WITHOUT
+# vehicle in tests/support/aot_infra_loud_3007_test.cpp is the canonical
+# case: a knowingly-preserved demonstration of exactly the unsafe shape,
+# for #3007's unrelated fix) from the count, so the baseline can reach
+# zero in principle.
+AMBIGUOUS_OK_MARKER = re.compile(r'//\s*AMBIGUOUS-RAN-FALSE-OK:\s*\S')
+
+# Per-site debt marker - C2 completion item. Sibling to AMBIGUOUS-RAN-
+# FALSE-OK: like LOCALDECL-DEBT, it does NOT remove the site from the
+# count (the site is still an offender, still baselined, still meant to
+# be fixed) but justifies a rise ABOVE the per-file ceiling in
+# scripts/ambiguous_ran_false.grandfather. The `#NNNN` must sit
+# immediately after the colon; a marker with a reason but no issue
+# number is malformed and justifies nothing. `--force` alone is not
+# enough - a deliberate rise past the ceiling still needs one of these
+# at every excess site, mirroring check_localdecl_only_walkers.py:80-96.
+AMBIGUOUS_DEBT_MARKER = re.compile(r'//\s*AMBIGUOUS-RAN-FALSE-DEBT:\s*(\S.*)$')
+AMBIGUOUS_DEBT_ISSUE = re.compile(r'^#(\d+)\b')
+
+# A line-scoped BEZEL_TEST regex used by the marker-attach logic to find
+# the body the suppression marker attaches to. The body-identification
+# machinery below (scan_file) uses re.S so it can match a wrapped
+# argument list, but per-line scanning here does not need that, and the
+# `\w` class never spans a newline anyway.
+BEZEL_TEST_LINE = re.compile(r'BEZEL_TEST\s*\(\s*\w+\s*,\s*(\w+)\s*\)')
+
 # An identifier/digit character - used to find the run of characters
 # immediately preceding a `'`, to tell a C++14 digit separator (`1'000`,
 # `0xFF'FF`) apart from a genuine char-literal-opening `'` - fix #3915,
@@ -429,9 +460,77 @@ HAS_ERRORS_TRUE = re.compile(
     r'hasErrors\s*\(\s*\)\s*\)')
 
 
-def scan_file(path, text):
-    """-> list of (test_name, var) unprotected rows in this file's text."""
-    if 'BEZEL_TEST' not in text:
+def _ambiguous_ok_test_names(raw):
+    """Set of test names whose BEZEL_TEST body is exempted by an
+    `// AMBIGUOUS-RAN-FALSE-OK: <reason>` marker (C1). A marker exempts
+    the next BEZEL_TEST body whose opener sits within 8 lines below it
+    (mirrors scripts/check_localdecl_only_walkers.py:75-100 and :145 -
+    same mechanism as every OTHER-ONLY marker in this repo, ported from
+    #3590). A reason after the colon is REQUIRED - a marker with no
+    reason is malformed and does not exempt (mirrors LOCALDECL-ONLY,
+    which uses `\\S` in its own marker regex for the same reason).
+
+    Reads from the RAW text (marker IS a comment, deliberately -
+    check_localdecl_only_walkers.py:160-165 makes the same choice for the
+    same reason: a prose MENTION of a marker-shape in a docstring should
+    not trip the detector). The body-identification machinery below
+    (scan_file) reads the comment-stripped text, but the marker is only
+    consulted to determine which TEST NAME to skip, not as part of body
+    protection; matching by name within a file is unambiguous in practice
+    (every test name is unique within its file, and a marker that
+    exempted a sibling row would still only exempt THAT row's name).
+    """
+    out = set()
+    lines = raw.split('\n')
+    for i, ln in enumerate(lines):
+        if not AMBIGUOUS_OK_MARKER.search(ln):
+            continue
+        # Marker exempts the next BEZEL_TEST body that opens within 8 lines
+        # of it (inclusive of the marker line as the start, exclusive of
+        # the marker's own line so a marker placed AT a BEZEL_TEST does not
+        # also exempt it). Walk forward, stop on the first match.
+        for j in range(i + 1, min(i + 8, len(lines))):
+            tm = BEZEL_TEST_LINE.search(lines[j])
+            if tm:
+                out.add(tm.group(1))
+                break
+    return out
+
+
+def _ambiguous_debt_markers(raw):
+    """[(line, issue_or_None)] for AMBIGUOUS-RAN-FALSE-DEBT markers in the
+    raw text. A marker with a reason but no leading `#NNNN` returns
+    `(line, None)` - well-formed-ness is reported separately so the gate
+    can flag malformed markers as a distinct violation (mirrors
+    scripts/check_localdecl_only_walkers.py:290-304, the same
+    well-formed-vs-malformed split).
+
+    The marker is read from RAW (not the comment-stripped text) for the
+    same reason AMBIGUOUS_OK_MARKER is - it IS a comment. Reads by line
+    number; scan_file's body-attachment uses the same line numbers so
+    attaching a marker to the next row within 8 lines is straightforward.
+    """
+    out = []
+    for i, ln in enumerate(raw.split('\n')):
+        m = AMBIGUOUS_DEBT_MARKER.search(ln)
+        if not m:
+            continue
+        im = AMBIGUOUS_DEBT_ISSUE.match(m.group(1).strip())
+        if im:
+            out.append((i + 1, int(im.group(1))))
+        else:
+            out.append((i + 1, None))
+    return out
+
+
+def scan_file(path, raw):
+    """-> list of (test_name, var) unprotected rows in this file's raw
+    text. `raw` is the file's actual on-disk text (the marker-attach
+    logic reads from it directly, since both AMBIGUOUS-RAN-FALSE-OK and
+    AMBIGUOUS-RAN-FALSE-DEBT are comments and would be stripped from the
+    comment-stripped copy - check_localdecl_only_walkers.py:160-165 makes
+    the same point)."""
+    if 'BEZEL_TEST' not in raw:
         return []
     # fix #3915: scan a COMMENT-STRIPPED copy, never the raw text - a
     # comment quoting `BEZEL_EXPECT_FALSE(r.ran)` is not live code, whether
@@ -440,10 +539,11 @@ def scan_file(path, text):
     # is why a comment in that gap used to bleed into the PRECEDING test's
     # window - stripping it removes the only thing that made it matchable,
     # in every window it could possibly fall into).
-    text = _strip_comments(text)
+    text = _strip_comments(raw)
     if not (RAN_FALSE.search(text) or HAS_ERRORS_TRUE.search(text)):
         return []
     text_helpers = _text_checking_helpers(text)
+    ok_tests = _ambiguous_ok_test_names(raw)  # C1: suppression marker
     marks = [(m.start(), f'{m.group(1)}.{m.group(2)}', m.end())
              for m in BEZEL_TEST.finditer(text)]
     out = []
@@ -466,8 +566,14 @@ def scan_file(path, text):
         # binding (a project helper like `auto r = compileAndRun(src)`) is
         # the safer failure mode for a ratchet than over-counting an entire
         # unrelated test family.
+        # C1: a row carrying an AMBIGUOUS-RAN-FALSE-OK marker is
+        # deliberately preserved for some other purpose (the #3007
+        # demo in tests/support/aot_infra_loud_3007_test.cpp is the
+        # canonical case) and is not an accidental hole in protection.
+        suite, _, test_name = tname.partition('.')
+        test_exempt = test_name in ok_tests
         for var in sorted(claim_vars & bound_vars):
-            if not _protected(body, var, text_helpers):
+            if not _protected(body, var, text_helpers) and not test_exempt:
                 out.append((tname, var))
     return out
 
@@ -777,6 +883,94 @@ BEZEL_TEST(aot_infra_loud_3007, legacy_negative_assertion_shape) {
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
 ''')
+        # C1 fixture: a row carrying an `// AMBIGUOUS-RAN-FALSE-OK:
+        # <reason>` marker on the line before its BEZEL_TEST opener is
+        # suppressed from the count - mirrors the LOCALDECL-ONLY marker
+        # (check_localdecl_only_walkers.py:75-100). Used to exempt the
+        # real demonstration row in tests/support/aot_infra_loud_3007_test.cpp
+        # (the #3007 FAIL-WITHOUT vehicle), so the baseline can reach 0
+        # in principle. Without the marker this fixture WOULD count (it
+        # has bare !ran + hasErrors with no protection); with the marker
+        # it must not.
+        _mk(root, 'tests/codegen/marked_suppression_test.cpp', '''
+// AMBIGUOUS-RAN-FALSE-OK: deliberately preserved as the FAIL-WITHOUT vehicle for issue #3007's fix in tests/support/aot_infra_loud_3007_test.cpp
+BEZEL_TEST(fixture_suite, marked_suppression_demo) {
+    auto r = runAot("module M;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+''')
+        # C1 negative control: a marker with NO reason after the colon is
+        # malformed and does NOT exempt - mirrors LOCALDECL-ONLY's `\S`
+        # requirement (check_localdecl_only_walkers.py:112-113, "a marker
+        # with no reason after the colon does NOT exempt"). Without the
+        # reason this row WOULD count; it must still count.
+        _mk(root, 'tests/codegen/malformed_marker_test.cpp', '''
+// AMBIGUOUS-RAN-FALSE-OK:
+BEZEL_TEST(fixture_suite, malformed_marker_no_reason) {
+    auto r = runAot("module M;");
+    BEZEL_EXPECT_FALSE(r.ran);
+}
+''')
+        # C1 negative control: a marker placed > 8 lines BEFORE the next
+        # BEZEL_TEST does NOT attach - mirrors the LOCALDECL-ONLY 8-line
+        # window (check_localdecl_only_walkers.py:81-82, "a marker cannot
+        # drift away from the cast it describes"). The marker below sits
+        # on its own with the body much further down; the row counts.
+        _mk(root, 'tests/codegen/drifted_marker_test.cpp', '''
+// AMBIGUOUS-RAN-FALSE-OK: too far above the next test - marker window is 8 lines
+
+
+// padding so the BEZEL_TEST below is well outside the 8-line window
+// pad 1
+// pad 2
+// pad 3
+// pad 4
+// pad 5
+// pad 6
+// pad 7
+// pad 8
+// pad 9
+// pad 10
+// pad 11
+// pad 12
+BEZEL_TEST(fixture_suite, drifted_marker_demo) {
+    auto r = runAot("module M;");
+    BEZEL_EXPECT_FALSE(r.ran);
+}
+''')
+        # C1 control: a marker placed on a line whose next BEZEL_TEST is
+        # out of scope (e.g. across files) does not exempt THIS file's
+        # row. This is automatic in this per-file scan but worth a
+        # negative control so future refactors do not break it: a file
+        # with a marker BUT no matching BEZEL_TEST within 8 lines must
+        # still see its bare row counted.
+        _mk(root, 'tests/codegen/marker_no_match_test.cpp', '''
+// AMBIGUOUS-RAN-FALSE-OK: no BEZEL_TEST body opens within 8 lines below
+// pad 1
+// pad 2
+// pad 3
+// pad 4
+// pad 5
+// pad 6
+// pad 7
+// pad 8
+// pad 9
+// pad 10
+// pad 11
+// pad 12
+// pad 13
+// pad 14
+// pad 15
+// pad 16
+// pad 17
+// pad 18
+// pad 19
+BEZEL_TEST(fixture_suite, marker_no_match) {
+    auto r = runAot("module M;");
+    BEZEL_EXPECT_FALSE(r.ran);
+}
+''')
         # A test with EXPECT_TRUE(r.ran) only - not a rejection claim at all.
         _mk(root, 'tests/codegen/positive_only_test.cpp', '''
 BEZEL_TEST(fixture_suite, positive_only) {
@@ -836,7 +1030,7 @@ BEZEL_TEST(fixture_suite, bare_row_near_comment) {
     auto r = runAot("module M;");
     // NOTE: the row below genuinely uses the ambiguous anti-pattern - it
     // must still be flagged as a real unprotected row even though this
-    // very comment also quotes the pattern's literal text.
+    // very comment also quotes the pattern literal text.
     BEZEL_EXPECT_FALSE(r.ran);
 }
 ''')
@@ -850,14 +1044,14 @@ BEZEL_TEST(fixture_suite, bare_row_near_comment) {
         # only asserts the POSITIVE case; the anti-pattern's literal text
         # appears twice, both times inside a same-line trailing comment
         # immediately after a digit separator (decimal, then hex).
-        _mk(root, 'tests/codegen/digit_separator_same_line_comment_test.cpp', '''
+        _mk(root, 'tests/codegen/digit_separator_same_line_comment_test.cpp', """
 BEZEL_TEST(fixture_suite, digit_separator_same_line_comment) {
     auto r = runAot("module M;");
     BEZEL_EXPECT_TRUE(r.ran);
     int decimalWithSeparator = 1'000;  // quoting BEZEL_EXPECT_FALSE(r.ran) right after a decimal digit separator - must still be stripped
     int hexWithSeparator = 0xFF'FF;  // quoting BEZEL_EXPECT_FALSE(r.ran) right after a hex digit separator too
 }
-''')
+""")
 
         # issue #3920: the SAME both-sides-wordchar shape as a digit
         # separator also arises from an identifier immediately abutting a
@@ -874,24 +1068,24 @@ BEZEL_TEST(fixture_suite, digit_separator_same_line_comment) {
         # importing the pre-fix module against this exact fixture pair
         # reports count=2 (both falsely flagged); the fixed module reports
         # 0. Real code here only asserts the POSITIVE case.
-        _mk(root, 'tests/codegen/char_literal_abuts_identifier_test.cpp', '''
+        _mk(root, 'tests/codegen/char_literal_abuts_identifier_test.cpp', """
 BEZEL_TEST(fixture_suite, char_literal_abuts_identifier_return) {
     auto r = runAot("module M;");
     BEZEL_EXPECT_TRUE(r.ran);
     int f() { return'a'; }  // quoting BEZEL_EXPECT_FALSE(r.ran) right after a char literal that abuts an identifier - must still be stripped (issue #3920)
 }
-''')
+""")
         # Sibling shape: a single-letter identifier (not a keyword) abutting
         # a char literal - `x'y'` has the same both-sides-wordchar shape as
         # `return'a'` but with a run of length 1 before the `'`, exercising
         # the _is_digit_separator backward walk's j==i-1 boundary.
-        _mk(root, 'tests/codegen/char_literal_abuts_short_identifier_test.cpp', '''
+        _mk(root, 'tests/codegen/char_literal_abuts_short_identifier_test.cpp', """
 BEZEL_TEST(fixture_suite, char_literal_abuts_identifier_short) {
     auto r = runAot("module M;");
     BEZEL_EXPECT_TRUE(r.ran);
     char c = x'y';  // quoting BEZEL_EXPECT_FALSE(r.ran) right after a single-letter identifier abutting a char literal - must still be stripped (issue #3920)
 }
-''')
+""")
 
         total, per_file = measure(root)
         chk('bare `!ran` flagged', 'tests/codegen/bare_test.cpp' in per_file)
@@ -959,11 +1153,28 @@ BEZEL_TEST(fixture_suite, char_literal_abuts_identifier_short) {
             'separator',
             'tests/codegen/char_literal_abuts_short_identifier_test.cpp'
             not in per_file)
-        chk('exactly 6 unprotected rows across the fixture tree (bare, '
-            'hasErrors-only, the skip-guard-only row, the aliased-skip-only '
-            'row, the support/ demo, the #3915 bare-row-near-comment '
-            'control)',
-            total == 6)
+        # C1 fixtures: the suppression marker mechanism.
+        chk('C1: an AMBIGUOUS-RAN-FALSE-OK marker on the line before a '
+            'BEZEL_TEST body suppresses that row from the count (the '
+            'canonical use is tests/support/aot_infra_loud_3007_test.cpp'
+            '::legacy_negative_assertion_shape)',
+            'tests/codegen/marked_suppression_test.cpp' not in per_file)
+        chk('C1 negative: an AMBIGUOUS-RAN-FALSE-OK marker with NO reason '
+            'after the colon is malformed and does NOT exempt (mirrors '
+            'LOCALDECL-ONLY\'s \\S requirement)',
+            'tests/codegen/malformed_marker_test.cpp' in per_file)
+        chk('C1 negative: an AMBIGUOUS-RAN-FALSE-OK marker whose next '
+            'BEZEL_TEST is more than 8 lines below does NOT attach '
+            '(mirrors the 8-line window)',
+            'tests/codegen/drifted_marker_test.cpp' in per_file)
+        chk('C1 negative: an AMBIGUOUS-RAN-FALSE-OK marker with no '
+            'BEZEL_TEST within 8 lines below (e.g. with too many padded '
+            'comment lines) does not exempt anything in this file',
+            'tests/codegen/marker_no_match_test.cpp' in per_file)
+        chk('exactly 9 unprotected rows across the fixture tree (6 from '
+            'the existing tree + the 3 negative-control C1 fixtures: '
+            'malformed marker, drifted marker, marker-no-match)',
+            total == 9)
 
         bpath = root / 'baseline'
         write_baseline(total, bpath)

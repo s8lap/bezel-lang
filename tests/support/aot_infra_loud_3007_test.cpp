@@ -175,6 +175,7 @@ BEZEL_TEST(aot_infra_loud_3007, write_source_failure_carries_the_errno) {
 //     (Class A for scripts/check_vacuous_tests.py: `hasErrors()` in its
 //     degenerate direct form is reject-only by definition.)
 // ---------------------------------------------------------------------------
+// AMBIGUOUS-RAN-FALSE-OK: this row is deliberately preserved as the FAIL-WITHOUT vehicle for issue #3007's infra-loud fix (see test 4b below). The detector's per-test suppression marker ports #3007 into the ratchet's "not a hole" set without losing the demonstration.
 BEZEL_TEST(aot_infra_loud_3007, legacy_negative_assertion_shape) {
     auto r = bezel::test::runAot(kRejectedProgram);
     BEZEL_EXPECT_FALSE(r.ran);

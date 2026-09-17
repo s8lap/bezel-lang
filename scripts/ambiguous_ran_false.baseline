@@ -13,4 +13,4 @@
 # See the script docstring for the exact counting criteria; this
 # number is NOT expected to equal issue #3892's manually-traced 60
 # (different, explicitly-stated criteria - see docstring).
-count = 30
+count = 29
