@@ -26146,6 +26146,10 @@ bool Emitter::isPlusOneClosureProducer(const ast::Expr* init) const {
             if (ps->isIndexer) return false;
             bool declaredFunc = false;
             if (const auto* pd =
+                    // SEAM-DEBT: #4151 — class-3 read on ps->decl via the
+                    // MemberAccessExpr spelling of the property-reference
+                    // read; the declared-function gate (`pd->type`) requires
+                    // walking the AST through the imported decl.
                     dynamic_cast<const ast::PropertyDecl*>(ps->decl)) {
                 declaredFunc =
                     pd->type && pd->type->kind == ast::TypeKind::Function;
