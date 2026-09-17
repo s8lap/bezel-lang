@@ -1,6 +1,6 @@
 # Bezel: Revision Changelog
 
-**Companion to the Bezel Language Specification, v0.305 — September 2026**
+**Companion to the Bezel Language Specification, v0.306 — September 2026**
 
 This document is the single narrative history of the normative Bezel documents — the language specification, the standard library specification, and the design rationale. One entry per revision, oldest first. Entries are normative for migration (each records what a revision made newly rejected, newly defined, newly warned, or doc-only) but are not part of the language definition: the current rule on any point is always the latest text of the specification itself, never an old entry here.
 
@@ -9243,5 +9243,20 @@ The rulings train: nine issue rulings, seven rulings and clarifications from pro
 - **Method.** The three mechanical passes ran under the same line-for-line artifact check and line-count guard v0.304 established, and it caught four rule defects before any of them reached the file: a `\s+` that spans newlines (**the third time that trap has fired in two revisions** — it is now commented at every rule that could hit it); a trailing-comment rule that left dangling `//` on nine signature lines; and two rules ported from the spec sweep that are **wrong here** — `(?<=\S) v0.NNN)` turned *"; unified v0.258)"* into *"unified)"* and *"shape (d) v0.195)"* into *"shape (d))"*, and a broad `the v0.NNN X` rule turned *"generalizing the v0.148 ruling"* into *"generalizing the ruling"*. Both were dropped rather than narrowed, and what they would have mangled is in the kept-class above. A fenced hand-edit batch failed closed on two non-matching targets and wrote nothing, which is the behaviour that makes a batch safe to run at all.
 
 - **Doc-only: 464 marker removals across three mechanical passes, 27 hand edits, 8 vocabulary edits, the four version headers and the code-generation reference's three pins.** No signature, no rule, no example changes. `check_docs.sh` passes on all eleven checks with `EXTRACT` at the same 514 fragments throughout; the conformance corpus is untouched at 2,148 cases.
+
+---
+
+### v0.306 changelog (v0.305 → v0.306)
+
+**The history and rationale content moves out of the standard library.** Owner-directed, completing what v0.305 identified and deliberately left: the stdlib was carrying design narrative and revision biography inside a normative document. **88 inline revision markers → 10**, and the ten that remain are all one thing — a citation whose target *is* a record.
+
+- **What moved, and where.** Nothing was deleted on the assumption that the record existed elsewhere; each removal was checked against the document that holds it. Three dispositions:
+  1. **Stated as the current rule, with the date dropped.** The large majority. *"As of v0.117, a `serialized` clause customizes…"* → *"A `serialized` clause customizes…"*; *"**Identity tokens (specified in v0.139):**"* → *"**Identity tokens:**"*; *"### 4.18 `SortedSet<T>` (added in v0.136)"* → *"### 4.18 `SortedSet<T>`"*. The rule was never in doubt; only its date was in the sentence.
+  2. **Deleted, because the record lives in a document whose job it is.** `ReadOnlySpan<T>`'s `ToArray()` biography — *"declared … from v0.222 (#1810) until v0.277, which **deleted** it"* — is a `DECLINED.md` row (*`ToArray()` on a span over class-typed or borrow-bearing elements*, with the member's dates). §4.14 and §4.15 now state the current position (neither family materializes) and point at the row. Likewise the editorial note recording that v0.269 rewrote the spec's async examples off a hypothetical `HttpClient`, and *"the category was written at v0.102, before choices existed"*.
+  3. **Moved to the rationale, because the reasoning existed nowhere else.** §4.10's *"The v0.259 rename (`Take`/`TryTake` → `Pop`/`TryPop`)"* paragraph was checked against the rationale and was **not** there. Its content is a real design argument — an instance member blocks a same-named extension **by name** under spec §26.5 rule 1, so an instance `Take(query: T)` made LINQ's `Take(count: int)` permanently unreachable on an `OwningSet<T>` receiver — and it is now **rationale §15.z**, where a reader asking *why is it `Pop`* will look. The stdlib keeps the members and their semantics and loses the migration narrative.
+
+- **The ten kept, and the rule they share.** *"see the changelog, v0.140"*, *"the prior definition and the decision record are in the v0.188 changelog entry"*, *"the v0.174 rationale entry"*, *"Provenance: the v0.186 ruling, rationale §12.8"*, *"declined at v0.274 and the reopening bar its record states (`DECLINED.md`)"*, *"the v0.276 changelog entry's stated cost"*. In every one the revision is **how a reader finds the record**, which is the opposite of a label: delete it and the pointer stops resolving. §3.4's `ReadOnlyAsciiByteSpan` section is kept in full for the same reason it was written — it tells a reader the type does not exist and what to use instead — with only *"(retired v0.188)"* shortened to *"(retired)"* in its heading, the changelog citation in its body left intact.
+
+- **Doc-only: 69 stdlib edits, one paragraph relocated to rationale §15.z, the four version headers and the code-generation reference's three pins.** Applied as two composition-gated sequences (59/59 and 10/10 clean). **No signature, rule, verdict or example changed** — this revision moves prose between documents and states in the present tense what was stated in the past tense. `check_docs.sh` passes on all eleven checks with `EXTRACT` at the same 514 fragments; the conformance corpus is untouched at 2,148 cases.
 
 ---

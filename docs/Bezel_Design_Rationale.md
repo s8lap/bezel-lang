@@ -1,6 +1,6 @@
 # Bezel: Design Rationale
 
-**Companion to the Bezel Language Specification, v0.305 — September 2026**
+**Companion to the Bezel Language Specification, v0.306 — September 2026**
 
 The spec describes the language. This document explains the choices behind it — places where two reasonable designs were possible and one was picked, places where a familiar-looking rule has a less-stated rule behind it, and places where something widely done elsewhere was deliberately left out. The spec says what the language *is*; this document says *why*, and what the alternatives would have cost.
 
@@ -2074,6 +2074,12 @@ PEP 393 hides the choice in the runtime. The user model is "string is a sequence
 Two regularizations ride the same principle from the other side. *Overload pairs for an optional trailing argument* were a second idiom for a shape the document already spelled with §22.5 defaults (`Increment(key, delta := 1)`, `token: CancellationToken := CancellationToken.None` at seventeen sites); nine such pairs — thirteen rows — are one defaulted signature each, and stdlib §1 states the rule so it does not regrow. The shapes that keep a pair are an interface-required member beside its widened twin (`CompareTo`/`Equals` with `ignoreCase`), because §11.2's exact-match conformance fixes the shorter signature, and an omitted argument with no nameable default — the to-the-end window forms, and the JSON facade's `JsonOptions`. *`Counter<K>` spelled key membership `ContainsKey` alone* — a name minted at v0.215 with no .NET antecedent, on the one map-like type on which `key in tally` therefore did not compile; it is `Contains(key)`, and stdlib §1 records that `ContainsKey` is the dictionaries' inherited alias and is not minted on new types.
 
 *`Math.Sign` is one generic.* `Sign<T>(x: T): int where T: INumber<T>` replaces four per-type overloads by the principle that retired `Sum`'s (stdlib §5): the per-type forms predated §2.19's abstraction, and `Sign(decimal)` was added at v0.228 as a symmetry completion fifty-two revisions after `INumber<T>` shipped. The return type is `int` at every substitution, so no call changes meaning and `DECLINED.md`'s result-type block on `Average` does not reach it; the two costs are stated — `pure` is lost until `INumber<T>`'s members are `pure`-declared (recorded as the follow-on, beside `Min`/`Max`/`Clamp`), and a `char` argument, admitted today by §5.1's `char → int` widening, is rejected (0 sites). **`Abs` stays generic-free** for the reason the same trace exposes: `Abs<T>` returns `T`, so `Math.Abs(shortVal)` — today `int` by widening — would infer `T = short` and change its result type at every `var` and every checked follow-on; that is the very mapping the `Average` row records as blocked, and a per-width return-type change with the `pure` loss is not what this evidence earns.
+
+### 15.z `OwningSet<T>` pops rather than takes: an instance member shadows a same-named extension
+
+`OwningSet<T>`'s transfer members are `Pop`/`TryPop`, not `Take`/`TryTake`, and the ground is measured shadowing rather than taste. Under language spec §26.5 rule 1 an instance member blocks a same-named extension **by name**, so an instance `Take(query: T)` on the set made LINQ's `Take(count: int)` unreachable on an `OwningSet<T>` receiver — permanently, for every caller. `Pop`/`TryPop` un-shadow it (`set.Take(2)` resolves to the lazy operator) and put the member in the transfer family the documents already teach: `Get`/`Peek` borrow, `Pop`/`Drain` transfer, which `OwningStack<T>` and `OwningQueue<T>` already spell.
+
+`OwningDictionary<K, V>` keeps `PopValue`/`TryPopValue` with its own reason recorded at stdlib §4.9. `OwningSet<T>` has no such ambiguity — its element and its query are the same type and the same thing — which is why its member can lose the qualifier.
 
 <a id="sec-ffi"></a>
 ## 16. FFI
