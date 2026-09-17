@@ -1282,19 +1282,43 @@ bool isBorrowBearingRecordCommon(
 // The §35.4 choice-classification core (defined below near classifyChoiceType),
 // forward-declared here so the record field walk can consult it for a Choice-
 // kind field (§9.7 transitivity, #2159). Shares the `choiceSeen` path set so the
-// record↔choice mutual recursion terminates. // per §9.7, §35.4, #2159
+// record↔choice mutual recursion terminates.
+//
+// `memo` (fix #4140+#4125+#4145+#4112, family J §2.6, v0.298): an OPTIONAL
+// per-`classifyChoiceType`-call classification cache keyed on the
+// INSTANTIATED `TypeRef*` (not the bare `TypeSymbol*`). Lookup happens BEFORE
+// the cycle guard — a fully-classified `rt` from earlier in the same call
+// returns its cached verdict without re-walking its cases. The cache
+// collapses the residual ~N^2 of #4145's deep linear nesting to O(N)
+// (every nested choice is classified at most once per call) and is the
+// structural fix for #4112's masked bug (the unmarked-payload walk now
+// reaches the §28.1 erasure oracle via the delegation below, and the
+// cache prevents the exponential re-walk the broken-by-design delegation
+// would otherwise produce). The cycle guard (insert on entry, erase on
+// exit, return `ValueLike` on cycle) is the SEPARATE mechanism that bounds
+// the recursion on self-/mutually-referential types — it catches the
+// in-progress case the cache cannot, because the cache only stores FINAL
+// verdicts, never the cycle guard's `ValueLike`.  // per §35.1, §35.4, §28.1
 std::optional<ChoiceClassification> classifyChoiceCore(
     const sema::TypeRef* rt, const sema::SemaContext& ctx,
     const RecordSubstEnv* env,
-    std::unordered_set<const sema::TypeRef*>& choiceSeen);
+    std::unordered_set<const sema::TypeRef*>& choiceSeen,
+    std::unordered_map<const sema::TypeRef*, ChoiceClassification>* memo =
+        nullptr);
 
 // §28.1 (v0.226, #2130): the file-local `owned`-marker erasure oracle impl,
 // forward-declared here so classifyChoiceCore's owning leg can thread its
-// in-flight `choiceSeen` through the choice↔choice recursion an `owned`-
-// typed payload opens. Defined alongside classifyChoiceCore below.
+// in-flight `choiceSeen` AND its per-call `memo` (family J §2.6, v0.298)
+// through the choice↔choice recursion an `owned`-typed payload opens.
+// Defined alongside classifyChoiceCore below. The public
+// `ownedMarkerActiveOnInstantiatedType` entry seeds a fresh `choiceSeen`
+// and passes a null `memo` (its queries are isolated, not nested inside
+// a `classifyChoiceType` call).
 bool ownedMarkerActiveOnInstantiatedTypeImpl(
     const sema::TypeRef* ft, const sema::SemaContext& ctx,
-    std::unordered_set<const sema::TypeRef*>& choiceSeen);
+    std::unordered_set<const sema::TypeRef*>& choiceSeen,
+    std::unordered_map<const sema::TypeRef*, ChoiceClassification>* memo =
+        nullptr);
 
 // §9.7's borrow-carrying-field kinds, applied to one resolved field type in
 // the substitution environment `env` (which governs `ft`'s OWN bare-parameter
@@ -1594,11 +1618,54 @@ namespace {
 // — an owning inline array (`[N owned]T`) or another owning choice (reached
 // transitively). Owns cases is what makes a choice owning; value types that
 // are NOT move-only (records, value-like choices, enums, primitives) do not.
-// `seen` bounds the recursion through a payload type cycle.
+//
+// fix #4140+#4125+#4112 (family J §2.6, v0.298): the choice arm DELEGATES
+// to `classifyChoiceCore` rather than re-walking the nested choice's cases
+// by hand. The two reasons are separate:
+//
+//   (i) §28.1 erasure oracle application (#4112, the still-reproducing
+//       member). The hand-rolled walk below used to check
+//       `pf.modifier == "owned"` unconditionally and return `true` — but
+//       §28.1 erases the marker at value-type instantiations, so a
+//       `D<int>` reached through an unmarked payload of an enclosing
+//       choice wrongly classified as Owning when reached DIRECTLY it
+//       classified as ValueLike (same choice, same instantiation, two
+//       different answers). Delegating to `classifyChoiceCore` routes
+//       the decision through `ownedMarkerActiveOnInstantiatedTypeImpl` /
+//       `substitutedChoicePayloadType`, the SAME machinery the direct
+//       classify path uses, so the two cannot disagree.
+//
+//   (ii) `choiceSeen` threading (#4140). The pre-fix code seeded a fresh
+//        `nestedChoiceSeen` for every recursive classifyChoiceCore call,
+//        severing the path-guard chain the surrounding classifyChoiceCore
+//        call was maintaining. So a choice reached through this unmarked-
+//        payload leg could not detect it was already being classified on
+//        the current path, and a mutually-recursive UNMARKED choice pair
+//        recursed without limit (78,510 frames in the #4140 stack). The
+//        fix threads the AMBIENT `choiceSeen` — mirroring what
+//        `payloadFieldTypeIsBorrowCarrying`'s own Choice-kind arm
+//        (two paragraphs below) already does — so a re-entry on the
+//        current path terminates via the cycle guard with `ValueLike`.
+//
+// `seen` keys on the INSTANTIATION (`const sema::TypeRef*`, fix #4125,
+// mirroring #3933's same re-keying for `classifyChoiceCore`'s own
+// `choiceSeen` guard). The bare-declaration keying used to collide `D<int>`
+// and `D<Widget>` in a SINGLE sibling-loop guard, so the first sibling
+// erased the second's verdict regardless of order (§3.6 rule 1 forbids).
+//
+// `memo` is the optional per-call classification cache on `classifyChoiceCore`.
+// Threaded through so the delegated classify benefits from the same memo
+// (and the cache records the verdict of THIS classify through the same
+// path). Without it the delegation would re-classify the same nested
+// choice at every distinct enclosing site — the structural source of the
+// pre-#4125 exponential #4145. // per §35.1, §35.4, §28.1, v0.298
 bool payloadFieldTypeIsMoveOnly(
     const sema::TypeRef* ft,
     const sema::SemaContext& ctx,
-    std::unordered_set<const sema::TypeSymbol*>& seen) {
+    std::unordered_set<const sema::TypeRef*>& seen,
+    std::unordered_set<const sema::TypeRef*>& choiceSeen,
+    std::unordered_map<const sema::TypeRef*, ChoiceClassification>* memo =
+        nullptr) {
     if (!ft) return false;
     // §15.3: an owning inline array is a move-only value type. We do NOT
     // require `arraySizeValue >= 0` here (unlike MethodOwnership::
@@ -1611,32 +1678,24 @@ bool payloadFieldTypeIsMoveOnly(
         return true;
     if (ft->kind != sema::TypeRef::Kind::Named || !ft->declaration) return false;
     if (ft->declaration->kind != ast::TypeDeclKind::Choice) return false;
-    // Transitively another owning choice — recurse via the public helper's
-    // core (below), seeding `seen` so a choice-value cycle (already
-    // rejected by §35.1 but defended here) terminates.
+    // fix #4140: delegate to the shared, per-instantiation-aware core
+    // (which already threads `choiceSeen` and consults the §28.1 erasure
+    // oracle through `substitutedChoicePayloadType` /
+    // `ownedMarkerActiveOnInstantiatedTypeImpl`). Passing the AMBIENT
+    // `choiceSeen` (NOT a fresh `nestedChoiceSeen`) is what closes the
+    // pre-#4140 stack-overflow — the re-entry on the current path
+    // terminates in the cycle guard at `classifyChoiceCore`'s head with
+    // `ValueLike`, exactly as the existing `payloadFieldTypeIsBorrowCarrying`
+    // Choice arm already does for the borrow leg.
     //
-    // fix #3144 (family F9 of #3152): the case walk is SYMBOL-side. It read
-    // `dynamic_cast<const ast::TypeDecl*>(ft->declaration->decl)`, which is
-    // null for every imported type, so a nested IMPORTED owning-choice payload
-    // answered "not move-only" — the choice above it was then classified
-    // value-like and its owned payloads were never disposed.
-    if (!seen.insert(ft->declaration).second) return false;
-    // Walk the nested choice's cases' payloads.
-    for (const sema::ChoiceCaseSymbol* ccs : sema::choiceCasesOf(ft->declaration)) {
-        if (!ccs->caseDecl) continue;
-        for (const auto& pf : ccs->caseDecl->payload) {
-            if (!pf.type) continue;
-            const sema::TypeRef* pft = ctx.resolvedType(*pf.type);
-            // Owning-marker on a nested payload slot: §28.1 admits `owned`
-            // on class/interface/bare-type-parameter; whatever the element
-            // type, the marker carries owning intent (the §28.1 type-
-            // admissibility check fires separately in sema and rejects an
-            // inadmissible marker; here we trust it).
-            if (pf.modifier == "owned") return true;
-            if (payloadFieldTypeIsMoveOnly(pft, ctx, seen)) return true;
-        }
-    }
-    return false;
+    // fix #3144 (family F9 of #3152): the case walk in
+    // `classifyChoiceCore` is SYMBOL-side, so a nested IMPORTED owning-choice
+    // payload correctly classifies via the exported payload list — the old
+    // hand-rolled `dynamic_cast<const ast::TypeDecl*>` walk here answered
+    // "not move-only" for every imported choice and broke disposal.
+    if (!seen.insert(ft).second) return false;
+    auto verdict = classifyChoiceCore(ft, ctx, /*env=*/nullptr, choiceSeen, memo);
+    return verdict && *verdict == ChoiceClassification::Owning;
 }
 
 // §35.4 / §9.7: a payload field's resolved type is BORROW-CARRYING under
@@ -1645,11 +1704,21 @@ bool payloadFieldTypeIsMoveOnly(
 // or not); an inline array of reference-typed elements; a borrow-bearing
 // record; or transitively a borrow-bearing choice. The caller has already
 // checked the field is NOT `owned`-marked (owning is decided first).
+//
+// `memo` (fix #4140+#4125+#4145+#4112, family J §2.6, v0.298): threaded
+// through the Choice arm's delegated `classifyChoiceCore` so the borrow
+// leg benefits from the SAME per-call classification cache the owning
+// leg now consults. Together they collapse the deep-linear-chain case
+// (#4145) from ~N^2 classifyChoiceCore invocations to O(N), and stop
+// the unmarked-payload walk from re-classifying the same nested choice
+// at every distinct enclosing site.
 bool payloadFieldTypeIsBorrowCarrying(
     const sema::TypeRef* ft,
     const sema::SemaContext& ctx,
     std::unordered_set<const sema::TypeRef*>& choiceSeen,
-    const RecordSubstEnv* env) {
+    const RecordSubstEnv* env,
+    std::unordered_map<const sema::TypeRef*, ChoiceClassification>* memo =
+        nullptr) {
     if (!ft) return false;
     switch (ft->kind) {
         case sema::TypeRef::Kind::Named: {
@@ -1668,7 +1737,8 @@ bool payloadFieldTypeIsBorrowCarrying(
                     resolveRecordFieldSubst(ft, env);
                 if (sub.ty && sub.ty != ft)
                     return payloadFieldTypeIsBorrowCarrying(sub.ty, ctx,
-                                                            choiceSeen, sub.env);
+                                                            choiceSeen, sub.env,
+                                                            memo);
                 return true;  // uninstantiated / still-generic bare param
             }
             if (ft->declaration->isValueBuiltin) return false;
@@ -1689,8 +1759,8 @@ bool payloadFieldTypeIsBorrowCarrying(
                 // §35.4 transitivity: a payload that is itself a borrow-
                 // bearing choice. Classify at THIS instantiation (env-threaded,
                 // #2183) via the shared core, which continues the `choiceSeen`
-                // path guard.
-                auto cls = classifyChoiceCore(ft, ctx, env, choiceSeen);
+                // path guard and consults the per-call memo.
+                auto cls = classifyChoiceCore(ft, ctx, env, choiceSeen, memo);
                 return cls && *cls == ChoiceClassification::BorrowBearing;
             }
             return false;  // enum
@@ -1730,11 +1800,28 @@ bool payloadFieldTypeIsBorrowCarrying(
 std::optional<ChoiceClassification> classifyChoiceCore(
     const sema::TypeRef* rt, const sema::SemaContext& ctx,
     const RecordSubstEnv* env,
-    std::unordered_set<const sema::TypeRef*>& choiceSeen) {
+    std::unordered_set<const sema::TypeRef*>& choiceSeen,
+    std::unordered_map<const sema::TypeRef*, ChoiceClassification>* memo) {
     if (!rt || rt->kind != sema::TypeRef::Kind::Named || !rt->declaration)
         return std::nullopt;
     if (rt->declaration->kind != ast::TypeDeclKind::Choice)
         return std::nullopt;
+    // fix #4140+#4125+#4145+#4112 (family J §2.6, v0.298): per-call
+    // classification cache lookup (BEFORE the cycle guard). A
+    // fully-classified `rt` from earlier in this same `classifyChoiceType`
+    // call returns its cached verdict without re-walking its cases —
+    // collapsing the deep linear nesting (#4145) from ~N^2 to O(N), and
+    // letting `payloadFieldTypeIsMoveOnly`'s Choice arm reach the §28.1
+    // erasure oracle (#4112) without paying a 2^N re-walk (#4145
+    // exponential). The cache stores only FINAL verdicts from completed
+    // classifications — the cycle guard's `ValueLike` (below) is never
+    // cached, so a re-entry from a NEW path that hits the cache gets the
+    // RIGHT answer, not the cycle-edge's conservative stand-in. // per
+    // §35.1, §35.4, §28.1, v0.298
+    if (memo) {
+        auto it = memo->find(rt);
+        if (it != memo->end()) return it->second;
+    }
     const sema::TypeSymbol* decl = rt->declaration;
     const std::vector<const sema::ChoiceCaseSymbol*> cases =
         sema::choiceCasesOf(decl);
@@ -1767,6 +1854,14 @@ std::optional<ChoiceClassification> classifyChoiceCore(
     // `isBorrowBearingRecordCommon` above for the false-cycle this used to
     // produce for a generic choice nested in itself at a DIFFERENT type
     // argument (`Pair<Pair<Box>>`, `Pair<Pair<int>>`).
+    //
+    // fix #4140: the cycle guard is also what closes the §35.1 self-
+    // containment diagnostic's "report the existing diagnostic and stop"
+    // requirement — a re-entry on the current path terminates here with
+    // `ValueLike`, exactly as #4140's body requested, without any further
+    // classification attempt. DO NOT cache this `ValueLike`: a sibling or
+    // follow-up classification from a DIFFERENT path must get the real
+    // verdict, which the memo would otherwise mask. // per §35.1, v0.298
     if (!choiceSeen.insert(rt).second)
         return ChoiceClassification::ValueLike;
 
@@ -1791,8 +1886,23 @@ std::optional<ChoiceClassification> classifyChoiceCore(
         // the recursive descent is gone before the borrow leg runs. The
         // move-only leg keeps its OWN accumulator (`owningSeen` never recurses
         // into a record and shares no path with the borrow leg).
-        std::unordered_set<const sema::TypeSymbol*> owningSeen;
-        owningSeen.insert(decl);
+        //
+        // fix #4125 (v0.295): `owningSeen` keyed on `const sema::TypeRef*`
+        // (instantiation), not `TypeSymbol*` declaration — distinct
+        // instantiations of a shared generic declaration (`D<int>` and
+        // `D<Widget>` both point at the same `D` symbol) must not collide in
+        // a guard whose job is bounding SIBLING deduplication within one
+        // caller's cases loop, not memoizing across unrelated instantiations.
+        //
+        // fix #4140+#4112: `payloadFieldTypeIsMoveOnly`'s Choice arm now
+        // threads the ambient `choiceSeen` (cycle guard continuity) and the
+        // per-call `memo` (cache continuity), and delegates to
+        // `classifyChoiceCore` for the §28.1 erasure-aware decision. The
+        // sibling `seen` parameter is the second cycle guard scoped to THIS
+        // caller's cases loop only, mirroring the pre-existing
+        // `payloadFieldTypeIsBorrowCarrying` Choice-arm threading.
+        std::unordered_set<const sema::TypeRef*> owningSeen;
+        owningSeen.insert(rt);
         for (const sema::ChoiceCaseSymbol* ccs : cases) {
             if (!ccs->caseDecl) continue;
             for (const auto& pf : ccs->caseDecl->payload) {
@@ -1800,12 +1910,12 @@ std::optional<ChoiceClassification> classifyChoiceCore(
                 if (pf.modifier == "owned") {
                     if (ownedMarkerActiveOnInstantiatedTypeImpl(
                             substitutedChoicePayloadType(pf, decl, rt, ctx),
-                            ctx, choiceSeen))
+                            ctx, choiceSeen, memo))
                         return ChoiceClassification::Owning;
                     continue;  // erased → a value / runtime-managed slot.
                 }
                 if (payloadFieldTypeIsMoveOnly(ctx.resolvedType(*pf.type), ctx,
-                                               owningSeen))
+                                               owningSeen, choiceSeen, memo))
                     return ChoiceClassification::Owning;
             }
         }
@@ -1818,7 +1928,8 @@ std::optional<ChoiceClassification> classifyChoiceCore(
                 if (!pf.type) continue;
                 if (pf.modifier == "owned") continue;
                 if (payloadFieldTypeIsBorrowCarrying(ctx.resolvedType(*pf.type),
-                                                     ctx, choiceSeen, fieldEnv))
+                                                     ctx, choiceSeen, fieldEnv,
+                                                     memo))
                     return ChoiceClassification::BorrowBearing;
             }
         }
@@ -1826,6 +1937,12 @@ std::optional<ChoiceClassification> classifyChoiceCore(
         return ChoiceClassification::ValueLike;
     }();
     choiceSeen.erase(rt);
+    // fix #4140+#4125+#4145+#4112 (family J §2.6, v0.298): cache the FINAL
+    // verdict so subsequent classifications of the SAME instantiation in
+    // THIS call return the cached answer instead of re-walking cases. The
+    // cycle guard's `ValueLike` is intentionally NOT cached (handled above,
+    // before this cache write). // per §35.1, §35.4, §28.1, v0.298
+    if (memo) (*memo)[rt] = verdict;
     return verdict;
 }
 
@@ -1845,7 +1962,8 @@ std::optional<ChoiceClassification> classifyChoiceCore(
 // frames re-classify under their own env (the #2145 diamond).
 bool ownedMarkerActiveOnInstantiatedTypeImpl(
     const sema::TypeRef* ft, const sema::SemaContext& ctx,
-    std::unordered_set<const sema::TypeRef*>& choiceSeen) {
+    std::unordered_set<const sema::TypeRef*>& choiceSeen,
+    std::unordered_map<const sema::TypeRef*, ChoiceClassification>* memo) {
     if (!ft) return true;  // unknown → conservative (owning)
     switch (ft->kind) {
         case sema::TypeRef::Kind::InlineArray:
@@ -1873,9 +1991,17 @@ bool ownedMarkerActiveOnInstantiatedTypeImpl(
                     // A nested choice: the marker is active only when that
                     // choice is itself owning at this instantiation. Thread
                     // the in-flight `choiceSeen` so the choice↔choice cycle
-                    // this opens terminates (#2130).
+                    // this opens terminates (#2130). Thread `memo` (null
+                    // from the public isolated query, populated from
+                    // `classifyChoiceCore`'s per-call cache) so a nested
+                    // choice reached through the owned-marker walk shares
+                    // the SAME cache as the surrounding classifyChoiceType
+                    // call — otherwise the same TypeRef would classify
+                    // twice on the same path (#4145's exponential source).
+                    // // per §28.1, #2130, #4140+#4125 (family J §2.6,
+                    // v0.298)
                     auto v = classifyChoiceCore(ft, ctx, /*env=*/nullptr,
-                                                choiceSeen);
+                                                choiceSeen, memo);
                     return v && *v == ChoiceClassification::Owning;
                 }
                 default:  // Record, Enum
@@ -1898,7 +2024,15 @@ bool ownedMarkerActiveOnInstantiatedType(const sema::TypeRef* ft,
     // classification path, so seed a fresh cycle guard. The choice-side
     // recursion (an `owned` payload whose type is a choice) consults the
     // file-local impl directly with the classifier's threaded `choiceSeen`,
-    // which is where the #2130 cycle guard fires. // per §28.1, #2130
+    // which is where the #2130 cycle guard fires. The `memo` parameter is
+    // NOT threaded here — this is a stand-alone isolated query, and
+    // sharing a cache with an unrelated classifyChoiceType call would
+    // conflate scopes.
+    //
+    // fix #4140+#4125+#4145+#4112 (family J §2.6, v0.298): the public
+    // entry's isolated `choiceSeen` means each public call gets its own
+    // cycle guard, which is the right semantics for an isolated query.
+    // // per §28.1, #2130, v0.298
     std::unordered_set<const sema::TypeRef*> choiceSeen;
     return ownedMarkerActiveOnInstantiatedTypeImpl(ft, ctx, choiceSeen);
 }
@@ -1939,14 +2073,22 @@ const sema::TypeRef* substitutedChoicePayloadType(
 std::optional<ChoiceClassification> classifyChoiceType(
     const sema::TypeRef* rt, const sema::SemaContext& ctx,
     const RecordSubstEnv* env) {
-    // Public entry point: seed a fresh CHOICE-decl path guard and delegate to
-    // the shared core (which is also reached from the §9.7 record field walk
-    // for a Choice-kind field, #2159, and from the choice-in-choice payload
-    // recursion). `env` (default null) supplies substitutions for `rt`'s own
-    // bare-parameter arguments when this choice is a component of an enclosing
+    // Public entry point: seed a fresh CHOICE PATH guard AND a fresh
+    // per-call classification memo, then delegate to the shared core.
+    //
+    // `env` (default null) supplies substitutions for `rt`'s own bare-
+    // parameter arguments when this choice is a component of an enclosing
     // generic type (#2183). Concrete `rt->genericArgs` are threaded regardless.
+    //
+    // fix #4140+#4125+#4145+#4112 (family J §2.6, v0.298): the memo is
+    // PER CALL — two back-to-back `classifyChoiceType` calls on the same
+    // TypeRef each get their own scope (no cross-call leakage, no
+    // stale-cache risk if intervening sema mutations re-classify the
+    // type). The memo lives in stack storage; no static/global state.
+    // // per §35.1, §35.4, §28.1, v0.298
     std::unordered_set<const sema::TypeRef*> choiceSeen;
-    return classifyChoiceCore(rt, ctx, env, choiceSeen);
+    std::unordered_map<const sema::TypeRef*, ChoiceClassification> memo;
+    return classifyChoiceCore(rt, ctx, env, choiceSeen, &memo);
 }
 
 // per §15.3 (#3775): see the header comment for the contract. Promoted
