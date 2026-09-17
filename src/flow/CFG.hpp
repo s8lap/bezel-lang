@@ -153,6 +153,34 @@ struct CFGBlock {
     // `visitTry`.
     const ast::Expr* catchGuard = nullptr;
 
+    // fix #4146 (§19, §28.2, §28.3 K1.4, v0.298): for a `case` STATEMENT's
+    // entry block (the block the case's scrutinee is evaluated in, before
+    // the arm Branch blocks fan out), the scrutinee Expr. A `case` has no
+    // condition at the Branch block level — the pattern match itself is
+    // codegen-only and Pattern is not an Expr — so a separate back-pointer
+    // to the scrutinee is needed for the ownership pass's K8 full-
+    // expression boundary mark (`disposeOwnedScrutinee`, §17.13 / #1795)
+    // and the §28.8 borrow→`owned` argument check on the scrutinee itself
+    // (#4116's own commit message names this as the reason the per-method
+    // CaseStmt walker had to walk the scrutinee by hand). Null for every
+    // non-case-statement block, and for a case statement whose scrutinee
+    // is omitted (the `when` statement form, parseWhenStmt in
+    // Parser_Stmts.cpp, parses into CaseStmt with a null scrutinee).
+    // Additive; populated only by the CFG builder's `visitCase`.
+    const ast::Expr* caseScrutinee = nullptr;
+
+    // fix #4146 (§19, §28.2, §28.3 K1.4, v0.298): for a `case` STATEMENT's
+    // expression-form arm Branch block, the arm body's expression
+    // (`case EXPR of P1 => EXPR1, P2 => EXPR2, ... end`). Block-form arms
+    // (`do … end`) hold their stmts as a real CFG block sequence via the
+    // arm-entry→body→merge edges built by `visitCase`; expression-form arms
+    // have no body block sequence and need this back-pointer so the
+    // ownership pass can fire `handleDischarge` on the expression
+    // (mirrors what `visitTry` does for a catch arm with no `body` field).
+    // Null for every non-expression-form-arm block. Additive; populated
+    // only by the CFG builder's `visitCase`.
+    const ast::Expr* caseArmExprBody = nullptr;
+
     // F2 / O11-real: successor targets reached only along an *exception*
     // (stack-unwinding) edge from this block — an explicit `throw`, or the
     // over-approximated "a throwable call inside the try body" edge from a

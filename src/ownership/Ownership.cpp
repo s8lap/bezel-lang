@@ -2602,6 +2602,19 @@ void MethodOwnership::processBlock(const flow::CFGBlock& block) {
     // statement; the if/while/for/do/try branches inside visitStmt are
     // retained but unreachable from a block's statement list (the CFG
     // already extracted that control flow).
+    //
+    // fix #4146 (§19, §28.2, §28.3 K1.4, v0.298): `CaseStmt` is now in the
+    // CFG (visitCase, src/flow/CFG.cpp) — each arm is its own Branch block
+    // with a real fall-through edge into a Merge block. `CaseStmt` itself
+    // does NOT appear in any block's `stmts` list (it is consumed by
+    // visitStmt which now only does the side-band K8 mark + early return;
+    // the per-arm body stmts live in the per-arm Linear blocks). The two
+    // side-band Exprs it owns — the scrutinee and each arm's expression-
+    // form body — are NOT in `stmts` (an Expr is not a Stmt), so the per-
+    // block visitStmt walk above cannot reach them. They are instead
+    // recorded on the block via back-pointers (`CFGBlock::caseScrutinee`
+    // on the entry block, `CFGBlock::caseArmExprBody` on the arm's Branch
+    // block) and fired explicitly below.
     for (const ast::Stmt* s : block.stmts) {
         if (!s) continue;
         // §28.8.1 "Exception paths are not exempt" (#3080): asked at this
@@ -2613,6 +2626,67 @@ void MethodOwnership::processBlock(const flow::CFGBlock& block) {
         // exception out of the RHS precedes the store. // per §28.8.1
         checkThrowableWhileFieldMovedFrom(*s);
         visitStmt(*s);
+    }
+    // fix #4146: case-arm expression-form body discharge. Block-form arms
+    // walk their stmts via `processBlock` on the per-arm Linear blocks the
+    // CFG builds; expression-form arms carry no body stmts and need their
+    // `exprBody` discharged here (`handleDischarge` is the §28.3 owned-
+    // argument-transfer authority — same call as the pre-#4146 CaseStmt
+    // arm used at Ownership.cpp:3361, only now fired from processBlock on
+    // the per-arm Branch block instead of inlined in the per-statement
+    // visitStmt walk). Null on Block-form arms and on every non-case block.
+    if (block.caseArmExprBody) {
+        handleDischarge(*block.caseArmExprBody);
+    }
+    // fix #4146: case-statement side-band Expr checks. The scrutinee lives
+    // on `block.caseScrutinee` (set by flow::CFG.cpp visitCase on the case's
+    // entry block — the block WHERE this construct's `case EXPR of` keyword
+    // is). It is an Expr position and carries the §28.8 borrow→`owned`
+    // argument check; mirror what `visitStmt`'s CaseStmt arm used to do
+    // before the structural arm-join was retired (Ownership.cpp:3328). The
+    // `when` statement form parses into CaseStmt with a null scrutinee, so
+    // `caseScrutinee` is null on those entry blocks — the guard is null too,
+    // so there is no ownership-bearing Expr at the entry to check.
+    //
+    // ORDER: BEFORE the block.stmts loop. The K8 full-expression boundary
+    // mark (`disposeOwnedScrutinee`, #1795) reads `producerState(*scrutinee)`
+    // — a state query that is only meaningful AFTER `checkRead` has
+    // populated the state map from the scrutinee's producers. Running the
+    // side-band checkRead before the stmts loop ensures the K8 mark (fired
+    // here, immediately after, on the same block) sees populated state.
+    // The K8 mark is fired here rather than from visitStmt's CaseStmt arm
+    // because the CFG no longer appends the CaseStmt node to any block's
+    // `stmts` list (visitCase consumes it and emits per-arm blocks), so
+    // visitStmt on the CaseStmt never runs from processBlock on this entry
+    // block — processBlock fires the K8 mark directly off the back-pointer.
+    if (block.caseScrutinee) {
+        checkRead(*block.caseScrutinee, /*selfTarget=*/false);
+        // K8 full-expression boundary mark (#1795). Mirrors what
+        // visitStmt's CaseStmt arm used to do before the structural arm-
+        // join was retired (Ownership.cpp:3329-3352). The gate is the
+        // SAME as DiscardStmt::disposeOwnedValue above: producerState ==
+        // Owned plus a heap class/interface type or an owning-collection
+        // head — the §17.13 / #1009 / #1909 predicate. The CaseStmt AST
+        // node is on `block.sourceStmt` (set by visitCase — see
+        // src/flow/CFG.cpp).
+        const ast::Expr* scrut = block.caseScrutinee;
+        if (!suppressDiag_ && producerState(*scrut) == OwnershipState::Owned) {
+            const sema::TypeRef* rt = ctx_.exprType(*scrut);
+            bool isHeapClass = rt && rt->kind == sema::TypeRef::Kind::Named &&
+                rt->declaration &&
+                (rt->declaration->kind == ast::TypeDeclKind::Class ||
+                 rt->declaration->kind == ast::TypeDeclKind::Interface) &&
+                !rt->declaration->isValueBuiltin &&
+                (rt->declaration->decl != nullptr ||
+                 !rt->declaration->moduleName.empty());
+            bool isOwningCollection = rt && rt->kind == sema::TypeRef::Kind::Named &&
+                isOwningCollectionNameHead(rt->headName());
+            if (isHeapClass || isOwningCollection) {
+                if (auto* cs = dynamic_cast<const ast::CaseStmt*>(block.sourceStmt)) {
+                    const_cast<ast::CaseStmt*>(cs)->disposeOwnedScrutinee = true;
+                }
+            }
+        }
     }
     // #2109 (§30.7 / §28.3): for every for/await-for loop whose iterable and
     // (optional) `with` cancellation-token expression are evaluated in this
@@ -3324,83 +3398,72 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
     // turning on a brand-new clash diagnostic for `case` arms is a separate,
     // larger blast radius left for its own issue if it turns out to matter.
     // // per §19, §19.6, §28.3 K1.4, v0.295, #4116
+    //
+    // fix #4146 (§19, §28.2, §28.3 K1.4, v0.298): the structural arm-join
+    // (`armEnds` collection, `joinInto` at the merge, the
+    // `armNeverFallsThrough` exclusion — #4116, #4138, #4139 in concert)
+    // was RETIRED here in favor of the CFG-driven dataflow. `flow::CFG.cpp`
+    // `visitCase` now emits one Branch block per arm (each carrying the arm
+    // guard) with a real fall-through edge into a fresh Merge block; the
+    // CFG's pre-existing `joinInto` at the merge block (`computeEntry`, this
+    // file ~line 2408) computes the arm-join for free, with the existing
+    // real CFG divert edges (`addEdge` from each arm's terminator to the
+    // function exit / loop afterEnd / header — already in place for if/
+    // while/for/try) handling return/throw/break/continue routing. The
+    // `armNeverFallsThrough` predicate becomes obsolete at this layer: a
+    // return/throw arm simply has NO edge into the merge block in the CFG
+    // (its terminator wires straight to `cfg_.exit()`), so its end state is
+    // already correctly absent from the join. Same for `break`/`continue`,
+    // which `routeExitThroughFinally` (fix #4180, the existing real-CFG
+    // finally routing) and the per-try frame's `loopDepthAtEntry` gate (also
+    // #4180) already forward to the enclosing loop's join — fixing #4141's
+    // open sub-case as a side effect.
+    //
+    // What remains here is the SIDE-BAND work that has no CFG-driven
+    // representation: the §28.8 borrow→`owned` argument check on the
+    // scrutinee (`checkRead`), the K8 full-expression boundary mark
+    // (`disposeOwnedScrutinee`, #1795), and the guard's `checkRead` (the
+    // pattern match itself is a Pattern — not an Expr — so it has no
+    // ownership-bearing expressions to check; only the guard is an Expr
+    // position). The CFG records the scrutinee and each arm's guard as
+    // back-pointers on the corresponding entry/Branch blocks
+    // (`CFGBlock::caseScrutinee`, mirroring `catchGuard`'s shape — see
+    // #1591's rationale, which transfers verbatim to the case-arm guard).
+    // Those side-band checks fire when `processBlock` visits the entry and
+    // arm Branch blocks (this file ~line 2568) via the new
+    // `processCaseScrutinee` / `processCaseArmGuard` helpers below.
+    //
+    // The per-arm body STMT walk is delegated to the CFG-driven
+    // `processBlock` on each arm's Linear block (the CFG already extracts
+    // the per-arm body into its own block sequence; `processBlock` calls
+    // `visitStmt` on each body stmt in turn). The structural arm-join is
+    // computed by `computeEntry`'s `joinInto` at the Merge block. Net line
+    // reduction in the per-method path: ~80 lines deleted, ~30 added (the
+    // two processBlock helpers + the side-band block). Net line reduction
+    // in the lambda-body pre-pass: deferred to a follow-up lane (see the
+    // commit body's "Declined remedy" section — option (A) here is the
+    // anchor for the larger lambda-body descent that #2683 names).
     if (auto* cs = dynamic_cast<const ast::CaseStmt*>(&s)) {
-        if (cs->scrutinee) checkRead(*cs->scrutinee, /*selfTarget=*/false);
-        // K8 full-expression boundary (#1795): the K8 boundary for an
-        // unbound owned temporary minted by the scrutinee is the WHOLE `case`
-        // construct (statement-position and expression-position alike). Mark
-        // the case-statement node so codegen's lowerCaseStmt stores the
-        // scrutinee in an entry alloca and emits a null-guarded dispose at
-        // the construct's endBB. The gate mirrors DiscardStmt::disposeOwned-
-        // Value above: producerState == Owned plus a heap class/interface
-        // type (or an owning-collection head) — the same predicate the
-        // §17.13 / #1009 / #1909 paths consult.
-        if (!suppressDiag_ && cs->scrutinee &&
-            producerState(*cs->scrutinee) == OwnershipState::Owned) {
-            const sema::TypeRef* rt = ctx_.exprType(*cs->scrutinee);
-            bool isHeapClass = rt && rt->kind == sema::TypeRef::Kind::Named &&
-                rt->declaration &&
-                (rt->declaration->kind == ast::TypeDeclKind::Class ||
-                 rt->declaration->kind == ast::TypeDeclKind::Interface) &&
-                !rt->declaration->isValueBuiltin &&
-                (rt->declaration->decl != nullptr ||
-                 !rt->declaration->moduleName.empty());
-            bool isOwningCollection = rt && rt->kind == sema::TypeRef::Kind::Named &&
-                isOwningCollectionNameHead(rt->headName());
-            if (isHeapClass || isOwningCollection)
-                const_cast<ast::CaseStmt*>(cs)->disposeOwnedScrutinee = true;
-        }
-        BlockState saved = states_;
-        std::vector<BlockState> armEnds;
-        armEnds.reserve(cs->arms.size());
-        for (const auto& arm : cs->arms) {
-            states_ = saved;
-            if (arm.guard) checkRead(*arm.guard, /*selfTarget=*/false);
-            bool armNeverReachesJoin = false;
-            if (arm.bodyKind == ast::CaseArmBodyKind::Expression) {
-                if (arm.exprBody) handleDischarge(*arm.exprBody);
-            } else {
-                for (const auto& bs : arm.stmts) if (bs) visitStmt(*bs);
-                // fix #4138 (§19/§28.2/§28.3, v0.295): an arm whose last
-                // reachable statement is `return`/`throw` leaves the
-                // callable outright and so never reaches the point directly
-                // after this `case` -- see `armNeverFallsThrough`'s header
-                // comment a few hundred lines above (including why
-                // `break`/`continue` are deliberately NOT recognized there).
-                // Excluding it here is what #4138 adds on top of #4116's
-                // join: without this, a throwing arm's end state (however it
-                // left `x`) was wrongly folded in alongside a sibling arm
-                // that never touched `x`, poisoning the ONLY reachable path
-                // with a spurious maybe-consumed.
-                armNeverReachesJoin = armNeverFallsThrough(arm.stmts);
-            }
-            if (!armNeverReachesJoin) armEnds.push_back(states_);
-        }
-        // fix #4116: join every arm's end state, plus `saved` for the
-        // statement-`case`'s possible no-match fallthrough (§19.6) UNLESS
-        // the cached §19.6 exhaustiveness verdict proves that edge empty
-        // (fix #4139), instead of discarding all of it back to `saved`. See
-        // the header comment above for the full rationale.
-        std::vector<BlockState> joinOperands = std::move(armEnds);
-        if (!cs->noMatchEdgeStaticallyDead)
-            joinOperands.push_back(saved);
-        if (joinOperands.empty()) {
-            // fix #4138: every arm (a present unguarded catch-all included,
-            // or every closed-value-space leaf) provably never falls
-            // through -- the code after this `case` is unreachable via any
-            // live path. Fall back to `saved` rather
-            // than dereference an empty vector; soundness is moot for
-            // provably-unreachable code (`armNeverFallsThrough` never
-            // over-claims termination, so this branch is only reached when
-            // the fallthrough truly cannot happen).
-            states_ = saved;
-        } else {
-            auto joined = std::move(joinOperands.front());
-            for (std::size_t i = 1; i < joinOperands.size(); ++i)
-                joinInto(joined, joinOperands[i], cs->span.begin,
-                         /*emitClash=*/false, /*unionKeys=*/false);
-            states_ = std::move(joined);
-        }
+        // fix #4146: CaseStmt is now in the CFG (visitCase,
+        // src/flow/CFG.cpp). The CaseStmt node itself is NOT appended to
+        // any block's `stmts` list — visitCase consumes it and emits
+        // per-arm blocks — so visitStmt's CaseStmt arm is unreachable from
+        // processBlock's normal stmts walk. The two side-band actions
+        // (the K8 full-expression boundary mark on the scrutinee, and the
+        // §28.8 borrow→`owned` argument check on the scrutinee) are
+        // therefore fired from processBlock's own case-scrutinee side-band
+        // (above the stmts loop), keyed off `block.caseScrutinee`. The
+        // per-arm guard `checkRead` and the per-arm expression-form body
+        // `handleDischarge` are also fired from processBlock side-bands
+        // (`block.catchGuard` for the guard — #1591's shape reused — and
+        // `block.caseArmExprBody` for the expression body). The structural
+        // arm-join (`armEnds`, `joinInto` at the merge, the
+        // `armNeverFallsThrough` exclusion) is computed by the CFG-driven
+        // dataflow's `computeEntry` `joinInto` at the merge block — no
+        // hand-rolled logic at this layer. This arm returns immediately;
+        // reaching it would mean the CaseStmt leaked through the CFG
+        // (i.e. an unknown-Statement-kind emission in visitStmt), which is
+        // its own regression and should be flagged separately.
         return;
     }
     if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(&s)) {
