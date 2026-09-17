@@ -15,5 +15,3 @@
 # docs/proposals/defect-campaign-2026-09.md §2.8 (Family L) for the six
 # open members.
 
-1    0    src/codegen/LlvmBackend_Disposal.cpp
-1    0    src/codegen/LlvmBackend_Layout.cpp

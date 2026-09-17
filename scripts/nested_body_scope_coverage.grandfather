@@ -20,5 +20,3 @@
 #     from `src/codegen/LlvmBackend_Assign.cpp:5114` (see
 #     CANONICAL_FIELDS in check_nested_body_scope_coverage.py).
 
-1    0    src/codegen/LlvmBackend_Disposal.cpp
-1    0    src/codegen/LlvmBackend_Layout.cpp

@@ -5565,6 +5565,43 @@ llvm::Value* Emitter::makePropertyThunk(sema::PropertySymbol* ps,
     auto* thunk = llvm::Function::Create(
         thunkFnTy, llvm::Function::InternalLinkage, thunkName, module_.get());
 
+    // fix #4151 / #2702 (§27.6 / §27.7.1, v0.290+): the per-body emitter
+    // fields a NESTED body emission must not INHERIT — the
+    // destructor-body pair (emittingDisposerBody_ / disposerEntryExc_),
+    // the catch-arm pair, the accessor-representation pair, the choice
+    // receiver-identity recovery field, the suspend/resume frame, the
+    // narrow per-call channels, and the root-scope registration channels
+    // (see NestedBodyScope's definition in LlvmBackend_Assign.cpp ~5114
+    // for the full list and the members deliberately inherited) — are
+    // saved, neutralised and restored by ONE guard. This is the same
+    // #2702 shape the other six lazy emitters already adopt
+    // (ensurePropertyBlockGetter / ensureIndexerGetterFn /
+    // ensureIndexerSetterFn / ensurePropertyAccessorFn /
+    // emitIteratorMethod / emitAsyncMethod). The hand-rolled save/restore
+    // below covers the per-emit entry state (`currentFn_`, `currentThis_`,
+    // `locals_`, the dispose/loop/finally stacks, the insert point,
+    // `genericSubst_`) that NestedBodyScope deliberately does NOT touch —
+    // those fields are NOT redundant with this guard; this guard covers
+    // the per-body set the hand-rolled block missed.
+    //
+    // WHY IT MATTERS HERE. `propertyThunks_[ps]` is memoized per
+    // `sema::PropertySymbol*` (not per receiver — §27.7.1, "property
+    // references follow the method-reference rule" / #1544), so the
+    // body built here is the cached thunk's body for the LIFETIME of the
+    // module. A `new T<Res>` (or any other emitter that reaches a
+    // destructor's body) anywhere in the surrounding caller's emission
+    // window leaks THAT caller's `emittingDisposerBody_` into the thunk
+    // body. The first caller's surrounding context is frozen module-wide
+    // by the memoization — in `std::unordered_map` pointer-hash order on
+    // `sema::PropertySymbol*`. A second caller with a different
+    // surrounding context therefore reads the FIRST caller's
+    // `currentReturnTypeNode_` / `currentLambdaReturnSemaTy_` /
+    // `currentChoiceMethod_` / etc., and the property getter
+    // `() => b.P` returns a wrong value (the first caller's stored
+    // `Sink.Seen`, not the property's own `_n` — #4151's measured
+    // divergence, two callers in two orders).
+    NestedBodyScope nestedScope(*this);
+
     // Save emitter state (mirror makeMethodThunk).
     llvm::Function* savedFn = currentFn_;
     llvm::Value* savedThis = currentThis_;
