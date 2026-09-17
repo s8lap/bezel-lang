@@ -26112,6 +26112,49 @@ bool Emitter::isPlusOneClosureProducer(const ast::Expr* init) const {
         if (dynamic_cast<const ast::IdentifierExpr*>(init) && isStaticMethod(ms))
             return true;
     }
+    // fix #4151 (§27.6 / §27.7.1, v0.298+): a PROPERTY reference used in
+    // function-value position (`var f: () -> int := o.P;`, §27.6) is a +1
+    // closure-cell producer — `lowerExpr` (LlvmBackend_Exprs.cpp ~5643-5680)
+    // calls `makePropertyThunk` → `buildPropertyClosureCell`, which calloc's a
+    // 40-byte cell with rc=1 and (for a non-null receiver) an 8-byte env
+    // block — exactly the shape the method-reference branch above recognises.
+    // The predicate here deliberately missed the PropertySymbol case ("A
+    // property/field reference … lowers differently" — superseded), so the
+    // cell was NEVER armed for scope-end `bz_closure_release` and leaked on
+    // every `var f := o.P` (96 B / 2 references = 2 cells × 40 B + 2 envs ×
+    // 8 B on the read-twice repro). Mirror the MethodSymbol branch's exact
+    // shape — `MemberAccessExpr` is the only AST node that reaches
+    // `makePropertyThunk` (the property-as-function-value gate is keyed off a
+    // MemberAccessExpr in LlvmBackend_Exprs.cpp:5673) — AND the
+    // producer-emission gates that code applies: the property reference's
+    // exprType must be Function (target-typed promotion, §27.6 — sema
+    // retypes `o.N` to `() -> T` when the bound slot is function-typed; a
+    // value-position read typed as the property's own type does NOT allocate
+    // a cell); a non-indexer property whose declared type is NOT itself a
+    // function (a function-typed declared property's read is an ordinary
+    // value, not a thunk promotion; the cell never allocates). Indexer and
+    // declared-function properties lower differently and stay leaked (safe
+    // direction; same as the prior text). The exprType==Function gate is the
+    // load-bearing line — omitting it over-fires for ordinary value-position
+    // property reads (e.g. `var a := o.N;` where N:int, no thunk allocated)
+    // and arms a `bz_closure_release` on a non-closure local, which crashes
+    // when the local falls out of scope (see #4151 follow-up).
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(init)) {
+        if (auto* ps = dynamic_cast<sema::PropertySymbol*>(ctx_.exprSymbol(*init))) {
+            const sema::TypeRef* et = ctx_.exprType(*init);
+            if (!et || et->kind != sema::TypeRef::Kind::Function) return false;
+            if (ps->isIndexer) return false;
+            bool declaredFunc = false;
+            if (const auto* pd =
+                    dynamic_cast<const ast::PropertyDecl*>(ps->decl)) {
+                declaredFunc =
+                    pd->type && pd->type->kind == ast::TypeKind::Function;
+            } else if (sema::TypeRef* tr = ctx_.importedMemberType(ps)) {
+                declaredFunc = tr->kind == sema::TypeRef::Kind::Function;
+            }
+            if (!declaredFunc) return true;
+        }
+    }
     // §27.6 (v0.184, #1758): a bare reference to a primitive-intrinsic static
     // method (`int.Parse`, `char.IsDigit`, …) ALSO lowers to a fresh calloc'd
     // rc=1 closure cell — via makePrimIntrinsicThunk (the CG60 path,
