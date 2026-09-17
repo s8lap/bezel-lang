@@ -179,22 +179,7 @@ int runUnderASan3181(const std::string& source) {
         if (!bezel::codegen::emitObjectFile(*module, objPath, err)) return -2;
     }
 
-    std::string linkCmd = "clang++ -fsanitize=address -g " + objPath + " " +
-                          rtObj + " -lm -lpthread -lstdc++ -o " + exe +
-                          " > /dev/null 2>&1";
-    if (std::system(linkCmd.c_str()) != 0) {
-        std::remove(objPath.c_str());
-        std::remove(exe.c_str());
-        return -3;
-    }
-    std::string runCmd =
-        "ASAN_OPTIONS=detect_leaks=1:exitcode=99 " + exe + " > /dev/null 2>&1";
-    int status = std::system(runCmd.c_str());
-    std::remove(objPath.c_str());
-    std::remove(exe.c_str());
-    if (status == -1) return -4;
-    if (WIFEXITED(status) && WEXITSTATUS(status) == 99) return 1;
-    return 0;
+    return linkRunAsan3181(rtObj, objPath, exe);
 }
 
 void expectCleanAndEq3181(const std::string& src, int expectedExit) {
@@ -475,8 +460,10 @@ BEZEL_TEST(domain_spawn_choice_valuearg_3181,
 // minus the run step, which is what `linkRunAsan3181` was extracted for.
 // The link command IS the assertion: any non-zero exit means the linker
 // could not produce an executable, which is exactly the failure class `#3633`
-// reserves `-3` for. Pre-fix, the same body returned `-1`; this test would
-// fail with `BEZEL_EXPECT_EQ(-1, -3)`.
+// reserves `-3` for. Post-fix (this commit's linkRunAsan3181 + the line 188
+// delegation in runUnderASan3181), runUnderASan3181 returns -3 for link
+// failure. Pre-fix (line 188 alone), runUnderASan3181 returned -1 for both
+// link failure AND toolchain unavailable (the conflating_helpers shape).
 // ─────────────────────────────────────────────────────────────────────────────
 BEZEL_TEST(domain_spawn_choice_valuearg_3181,
            link_failure_returns_minus_three_not_minus_one_3676) {
