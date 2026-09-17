@@ -1,0 +1,30 @@
+# timeout_satisfiable_negatives.baseline - ratchet for issue #3732:
+# the hand-rolled `.line > 0 && .column > 0` location-check surface
+# that a compile TIMEOUT can satisfy. Freezes the surface so it
+# cannot grow while the burn-down runs.
+#
+# Regenerate with scripts/check_timeout_satisfiable_negatives.py
+# --update after a burn-down step. --update REFUSES to raise the
+# count (it may only fall).
+#
+# EXACT, not a ceiling: a count below baseline fails as STALE
+# HEADROOM (same rule as every sibling ratchet in this family).
+#
+# bare_location_rows : the violation count. Rows that pin a
+#                     compile-time rejection with only a
+#                     hand-rolled `.line > 0 && .column > 0`
+#                     check (NOT via the shared
+#                     `failedAtCompileTimeWithRealLocation(r)`
+#                     helper, which excludes the four timeout /
+#                     crash / signal / ASan literals explicitly).
+#                     Exempt: rows whose body excludes at least
+#                     one timeout literal — those are hand-rolled
+#                     but sound.
+#
+# RETIRED at done criterion (spec §4 burn-down, the shape it
+# counts stops being dangerous once the harness cannot emit a
+# timeout as Severity::Error, so a zero-guard would guard against
+# nothing). The channel's own regression test
+# (tests/support/native_timeout_unavailable_loud_test.cpp) catches
+# regressions after retirement.
+bare_location_rows = 4
